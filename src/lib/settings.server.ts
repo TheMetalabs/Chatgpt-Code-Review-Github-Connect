@@ -9,6 +9,7 @@ import {
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
+import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
 
 function envStr(key: string): string | undefined {
   const v = process.env[key];
@@ -70,6 +71,10 @@ function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   if (key !== undefined && key !== "") o.localLlmApiKey = key;
   const order = envStr("ASHLAR_REVIEW_ORDER");
   if (order) o.reviewOrder = order.split(",").map((s) => s.trim());
+  const chatgptReasoning = envStr("ASHLAR_CHATGPT_REASONING");
+  if (chatgptReasoning) o.chatgptReasoning = chatgptReasoning;
+  const grokReasoning = envStr("ASHLAR_GROK_REASONING");
+  if (grokReasoning) o.grokReasoning = grokReasoning;
   return o;
 }
 
@@ -93,6 +98,8 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_LLM_MODEL: s.localLlmModel,
     ASHLAR_LOCAL_LLM_API_KEY: s.localLlmApiKey,
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
+    ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
+    ASHLAR_GROK_REASONING: s.grokReasoning,
   };
 }
 
@@ -137,6 +144,8 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localLlmApiKey: str(p.localLlmApiKey, DEFAULT_SETTINGS.localLlmApiKey),
     localLlmModel: str(p.localLlmModel, DEFAULT_SETTINGS.localLlmModel).trim(),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
+    chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),
+    grokReasoning: normalizeGrokReasoning(p.grokReasoning),
   };
   if (!providersFromSettings(next).length) next.reviewChatgpt = true;
   return next;

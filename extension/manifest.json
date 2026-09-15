@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ashlar Chat Bridge",
-  "version": "1.0.8",
+  "version": "1.1.0",
   "description": "Runs Ashlar PR reviews in the ChatGPT or Grok tab you are already signed into.",
   "permissions": ["storage", "tabs", "alarms", "scripting", "clipboardWrite"],
   "host_permissions": [
@@ -19,12 +19,12 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["composer.js", "quota.js", "overlay.js", "content-chatgpt.js"],
+      "js": ["composer.js", "quota.js", "overlay.js", "model.js", "content-chatgpt.js"],
       "run_at": "document_idle"
     },
     {
       "matches": ["https://grok.com/*"],
-      "js": ["composer.js", "quota.js", "overlay.js", "content-grok.js"],
+      "js": ["composer.js", "quota.js", "overlay.js", "model.js", "content-grok.js"],
       "run_at": "document_idle"
     }
   ]

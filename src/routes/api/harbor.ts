@@ -19,6 +19,7 @@ import { probeGithub } from "@/lib/github.server";
 import { clearGithubSecrets, patchGithubSecrets } from "@/lib/secrets.server";
 import { isMaskedSecret, normalizeReviewOrder } from "@/lib/types";
 import type { ReviewProvider } from "@/lib/types";
+import { normalizeChatgptReasoning, normalizeGrokReasoning } from "@/lib/reasoning";
 
 function sameOrigin(request: Request) {
   const origin = request.headers.get("origin");
@@ -75,6 +76,8 @@ export const Route = createFileRoute("/api/harbor")({
           localLlmApiKey?: string;
           localLlmModel?: string;
           reviewOrder?: ReviewProvider[];
+          chatgptReasoning?: string;
+          grokReasoning?: string;
           githubAppId?: string;
           githubClientId?: string;
           githubWebhookSecret?: string;
@@ -131,6 +134,8 @@ export const Route = createFileRoute("/api/harbor")({
           const localKey = keepSecret(body.localLlmApiKey);
           if (localKey) patch.localLlmApiKey = localKey.trim();
           if (Array.isArray(body.reviewOrder)) patch.reviewOrder = normalizeReviewOrder(body.reviewOrder);
+          if (typeof body.chatgptReasoning === "string") patch.chatgptReasoning = normalizeChatgptReasoning(body.chatgptReasoning);
+          if (typeof body.grokReasoning === "string") patch.grokReasoning = normalizeGrokReasoning(body.grokReasoning);
           if (Object.keys(patch).length) {
             try {
               patchHarborSettings(patch);

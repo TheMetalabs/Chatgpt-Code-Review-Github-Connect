@@ -65,15 +65,17 @@ function extractJson(text) {
   }
 }
 
-async function runPrompt(prompt) {
+async function runPrompt(prompt, reasoning) {
   await dismissOverlays();
   const el = await startFresh();
+  await dismissOverlays();
+  await selectReasoning("grok", reasoning || "heavy");
   await dismissOverlays();
   if (quotaHit()) throw quotaError();
   await fillComposer(el, prompt);
   await dismissOverlays();
   await clickSend(sendButton, composer);
-  const deadline = Date.now() + 180_000;
+  const deadline = Date.now() + 300_000;
   let stable = "";
   let hits = 0;
   while (Date.now() < deadline) {
@@ -81,14 +83,13 @@ async function runPrompt(prompt) {
     const text = lastAssistant();
     if (!text) continue;
     const json = extractJson(text);
-    if (json) {
-      if (json === stable) hits += 1;
-      else {
-        stable = json;
-        hits = 1;
-      }
-      if (hits >= 2) return json;
+    if (!json || findingsJsonTooThin(json)) continue;
+    if (json === stable) hits += 1;
+    else {
+      stable = json;
+      hits = 1;
     }
+    if (hits >= 2) return json;
   }
   throw new Error("Grok did not return JSON in time");
 }
@@ -101,7 +102,7 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     return true;
   }
   running = true;
-  runPrompt(String(msg.prompt || ""))
+  runPrompt(String(msg.prompt || ""), msg.reasoning)
     .then((raw) => sendResponse({ ok: true, raw }))
     .catch((e) =>
       sendResponse({

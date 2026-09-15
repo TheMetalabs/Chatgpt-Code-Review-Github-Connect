@@ -1,3 +1,5 @@
+import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
+
 export type Severity = "P0" | "P1" | "P2";
 export type FindingStatus = "candidate" | "accepted" | "dropped";
 export type MergeRec = "COMMENT" | "REQUEST_CHANGES" | "APPROVE";
@@ -168,6 +170,8 @@ export interface BotSettings {
   reviewChatgpt: boolean;
   reviewGrok: boolean;
   reviewLocal: boolean;
+  chatgptReasoning: ChatgptReasoning;
+  grokReasoning: GrokReasoning;
   localLlmBaseUrl: string;
   localLlmApiKey: string;
   localLlmModel: string;
@@ -215,6 +219,8 @@ export const DEFAULT_SETTINGS: BotSettings = {
   reviewChatgpt: true,
   reviewGrok: true,
   reviewLocal: false,
+  chatgptReasoning: "pro",
+  grokReasoning: "heavy",
   localLlmBaseUrl: "http://127.0.0.1:11434/v1",
   localLlmApiKey: "",
   localLlmModel: "",

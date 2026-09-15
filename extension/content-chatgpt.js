@@ -55,9 +55,11 @@ function extractJson(text) {
   }
 }
 
-async function runPrompt(prompt) {
+async function runPrompt(prompt, reasoning) {
   await dismissOverlays();
   await waitFor(composer, 45_000, "ChatGPT composer not found");
+  await dismissOverlays();
+  await selectReasoning("chatgpt", reasoning || "pro");
   await dismissOverlays();
   const el = composer();
   if (!el) throw new Error("ChatGPT composer not found");
@@ -65,7 +67,7 @@ async function runPrompt(prompt) {
   await fillComposer(el, prompt);
   await dismissOverlays();
   await clickSend(sendButton, composer);
-  const deadline = Date.now() + 180_000;
+  const deadline = Date.now() + 300_000;
   let stable = "";
   let hits = 0;
   while (Date.now() < deadline) {
@@ -73,14 +75,13 @@ async function runPrompt(prompt) {
     const text = lastAssistant();
     if (!text) continue;
     const json = extractJson(text);
-    if (json) {
-      if (json === stable) hits += 1;
-      else {
-        stable = json;
-        hits = 1;
-      }
-      if (hits >= 2) return json;
+    if (!json || findingsJsonTooThin(json)) continue;
+    if (json === stable) hits += 1;
+    else {
+      stable = json;
+      hits = 1;
     }
+    if (hits >= 2) return json;
   }
   throw new Error("ChatGPT did not return JSON in time");
 }
@@ -93,7 +94,7 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     return true;
   }
   running = true;
-  runPrompt(String(msg.prompt || ""))
+  runPrompt(String(msg.prompt || ""), msg.reasoning)
     .then((raw) => sendResponse({ ok: true, raw }))
     .catch((e) =>
       sendResponse({

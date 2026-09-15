@@ -14,7 +14,7 @@ import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission } from "./chat-prompt";
 import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
-import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
+import { buildOpsComment, llmWorkAllowed, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
   filterPublishable,
@@ -459,6 +459,17 @@ async function playGithub(jobId: string, untrustedBody: string) {
   }
 
   if (current()?.status === "cancelled") return;
+  if (!llmWorkAllowed(gated)) {
+    patchJob(jobId, (j) => ({
+      ...j,
+      status: "skipped",
+      skipReason: "LLM only on explicit @ashlar-bot mention",
+      plan: "No ChatGPT / Local / bridge work without an explicit mention.",
+      updatedAt: Date.now(),
+    }));
+    return;
+  }
+
   const providers = providersFromSettings(state.settings);
   if (!providers.length) {
     patchJob(jobId, (j) => ({

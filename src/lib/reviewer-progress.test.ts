@@ -86,4 +86,36 @@ describe("buildReviewerLanes", () => {
     assert.equal(lanes[0].provider, "chatgpt");
     assert.equal(lanes[0].state, "queued");
   });
+
+
+  it("splits usage limit vs finished without JSON when notes exist", () => {
+    const quota = buildReviewerLanes(
+      job({
+        reviewProviders: ["chatgpt"],
+        generating: { chatgpt: false },
+        assumptions: ["chatgpt usage limit"],
+      }),
+    );
+    assert.equal(quota[0].detail, "usage limit");
+    const empty = buildReviewerLanes(
+      job({
+        reviewProviders: ["chatgpt"],
+        generating: { chatgpt: false },
+        assumptions: ["chatgpt finished without JSON"],
+      }),
+    );
+    assert.equal(empty[0].detail, "finished without JSON");
+  });
+
+  it("labels non-review JSON as extract failed", () => {
+    const lanes = buildReviewerLanes(
+      job({
+        reviewProviders: ["local"],
+        storedLegs: [{ provider: "local", raw: '{"hello":"world"}' }],
+      }),
+    );
+    assert.equal(lanes[0].state, "answered");
+    assert.match(lanes[0].detail, /extract failed/i);
+  });
+
 });

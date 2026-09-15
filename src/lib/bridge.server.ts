@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider } from "./types";
 import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, isChatProvider, providersFromSettings } from "./types";
+import { llmWorkAllowed } from "./ops-comment";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 
@@ -79,8 +80,11 @@ export function bridgeHeartbeat() {
   meta.lastSeen = Date.now();
 }
 
-const STALE_CLAIM = (job: Job) =>
-  Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt > BRIDGE_CLAIM_MS);
+/** Claim stays fresh while any provider is still generating — long queue/generation must not expire. */
+const STALE_CLAIM = (job: Job) => {
+  if (job.generating && Object.values(job.generating).some(Boolean)) return false;
+  return Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt > BRIDGE_CLAIM_MS);
+};
 
 export function nextBridgeJob(): {
   jobId: string;
@@ -98,6 +102,7 @@ export function nextBridgeJob(): {
   const job = harbor.jobs.find(
     (j) =>
       j.status === "awaiting_chat" &&
+      llmWorkAllowed(j) &&
       (Boolean(j.chatPrompt) || Boolean(j.chatPromptByProvider)) &&
       (!j.bridgeClaimedAt || STALE_CLAIM(j)),
   );
@@ -186,7 +191,13 @@ export function claimBridgeJob(jobId: string): { ok: true } | { ok: false; error
 export function releaseBridgeJob(jobId: string) {
   const job = getHarbor().jobs.find((j) => j.id === jobId);
   if (job && job.status === "awaiting_chat") {
-    patchHarborJob(jobId, (j) => ({ ...j, bridgeClaimedAt: undefined, updatedAt: Date.now() }));
+    // Clear attemptedProviders on release so a false empty / busy abort can retry the same providers.
+    patchHarborJob(jobId, (j) => ({
+      ...j,
+      bridgeClaimedAt: undefined,
+      attemptedProviders: [],
+      updatedAt: Date.now(),
+    }));
   }
 }
 

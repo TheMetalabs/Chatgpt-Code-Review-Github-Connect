@@ -80,7 +80,7 @@ describe("decideIngress", () => {
     }
   });
 
-  it("queues a fork when skipForks is off", () => {
+  it("still skips PR open/push for forks even when skipForks is off — LLM needs @ashlar-bot", () => {
     const d = decideIngress({
       ...base,
       settings: { ...DEFAULT_SETTINGS, skipForks: false },
@@ -88,18 +88,25 @@ describe("decideIngress", () => {
       trigger: "pull_request.opened",
     });
     assert.equal(d.ok, true);
-    if (d.ok) assert.ok(d.job);
+    if (d.ok) assert.equal(d.skip, "LLM only on explicit @ashlar-bot mention");
   });
 
-  it("is idempotent on posted (repo, pr, head, trigger)", () => {
-    const d = decideIngress({
-      ...base,
-      sample: SAMPLE_PRS["pay-412"],
-      trigger: "pull_request.opened",
-      existing: [job()],
-    });
-    assert.equal(d.ok, true);
-    if (d.ok) assert.match(d.skip ?? "", /idempotent/);
+  it("skips PR open/push/reopen without an explicit @ashlar-bot mention (no LLM)", () => {
+    for (const trigger of [
+      "pull_request.opened",
+      "pull_request.synchronize",
+      "pull_request.reopened",
+      "pull_request.ready_for_review",
+    ] as const) {
+      const d = decideIngress({
+        ...base,
+        sample: SAMPLE_PRS["pay-418"],
+        trigger,
+        deliveryId: `d-${trigger}`,
+      });
+      assert.equal(d.ok, true, trigger);
+      if (d.ok) assert.equal(d.skip, "LLM only on explicit @ashlar-bot mention", trigger);
+    }
   });
 
   it("dedupes delivery ids from knownDeliveries even when no job exists", () => {
@@ -114,7 +121,7 @@ describe("decideIngress", () => {
     if (d.ok) assert.match(d.skip ?? "", /duplicate delivery_id/);
   });
 
-  it("does not treat a 403 delivery_id as accepted, so a HMAC retry can queue", () => {
+  it("does not treat a 403 delivery_id as accepted, so a HMAC retry can proceed (still mention-gated)", () => {
     const events = [
       { deliveryId: "d-retry", httpStatus: 403 as const },
       { deliveryId: "d-ok", httpStatus: 202 as const },
@@ -129,7 +136,7 @@ describe("decideIngress", () => {
       trigger: "pull_request.opened",
     });
     assert.equal(d.ok, true);
-    if (d.ok) assert.ok(d.job);
+    if (d.ok) assert.equal(d.skip, "LLM only on explicit @ashlar-bot mention");
   });
 
   it("skips mention comments that lack a mention token", () => {

@@ -12,6 +12,13 @@ describe("quotaHitText", () => {
     assert.equal(quotaHitText("You've reached your weekly limit"), true);
   });
 
+  it("does not match bare weekly-limit / 한도 늘리기 alone", () => {
+    assert.equal(quotaHitText("weekly limit"), false);
+    assert.equal(quotaHitText("Increase your limit"), false);
+    assert.equal(quotaHitText("한도 늘리기"), false);
+    assert.equal(quotaHitText("주간 한도"), false);
+  });
+
   it("matches the Grok weekly-limit card (Korean)", () => {
     assert.equal(quotaHitText("주간 한도에 도달했습니다"), true);
     assert.equal(

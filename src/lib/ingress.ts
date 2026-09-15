@@ -72,6 +72,9 @@ export function decideIngress(opts: {
     if (!isBotMention(opts.thread?.userText, opts.settings)) {
       return { ok: true, skip: "not a mention" };
     }
+  } else {
+    // No silent auto-review on PR open/push/reopen — LLM only after explicit @ashlar-bot (or settings mention tokens).
+    return { ok: true, skip: "LLM only on explicit @ashlar-bot mention" };
   }
 
   const sameHead = opts.existing.find(

@@ -23,6 +23,28 @@ function replyStats(raw: string): { jsonChars: number; findingCount?: number; pa
   }
 }
 
+function providerErrorNote(
+  job: Pick<Job, "assumptions" | "githubError" | "skipReason">,
+  provider: ReviewProvider,
+): string | undefined {
+  const rows = [...(job.assumptions ?? []), job.githubError ?? "", job.skipReason ?? ""];
+  const hit = rows.find((a) => new RegExp(`\b${provider}\b`, "i").test(a) || (/quota|usage limit|empty|bridge/i.test(a) && provider !== "local"));
+  return hit?.trim() || undefined;
+}
+
+function emptyProviderDetail(
+  job: Pick<Job, "assumptions" | "githubError" | "skipReason" | "bridgeClaimedAt">,
+  provider: ReviewProvider,
+  now: number,
+): string {
+  const note = providerErrorNote(job, provider) ?? "";
+  if (/quota|usage limit|한도/i.test(note)) return "usage limit";
+  if (/bridge|claim|disconnected|not connected/i.test(note)) return "bridge lost";
+  if (/empty|without (review )?json|no json/i.test(note)) return "finished without JSON";
+  if (!claimed(job, now) && provider !== "local") return "finished without JSON";
+  return "finished without JSON";
+}
+
 function claimed(job: Pick<Job, "bridgeClaimedAt">, now: number): boolean {
   return Boolean(job.bridgeClaimedAt && now - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
 }
@@ -38,6 +60,7 @@ export function buildReviewerLanes(
     | "attemptedProviders"
     | "bridgeClaimedAt"
     | "skipReason"
+    | "githubError"
   >,
   opts?: { localInFlight?: boolean; now?: number; enabled?: readonly ReviewProvider[] },
 ): ReviewerLane[] {
@@ -57,7 +80,7 @@ export function buildReviewerLanes(
         stats.findingCount === undefined
           ? stats.parsed
             ? "JSON back"
-            : "reply received · JSON not parsed"
+            : "reply received · extract failed (not review JSON)"
           : `JSON back · ${stats.findingCount} finding${stats.findingCount === 1 ? "" : "s"}`;
       return {
         provider,
@@ -106,7 +129,13 @@ export function buildReviewerLanes(
         return { provider, state: "generating", label, detail: "calling local LLM", answered: false };
       }
       if (g === false) {
-        return { provider, state: "empty", label, detail: "local finished with no JSON", answered: false };
+        return {
+          provider,
+          state: "empty",
+          label,
+          detail: emptyProviderDetail(job, provider, now),
+          answered: false,
+        };
       }
       return { provider, state: "waiting", label, detail: "local in the race", answered: false };
     }
@@ -115,7 +144,7 @@ export function buildReviewerLanes(
       return { provider, state: "generating", label, detail: "tab is answering", answered: false };
     }
     if (g === false) {
-      return { provider, state: "empty", label, detail: "quota or empty reply", answered: false };
+      return { provider, state: "empty", label, detail: emptyProviderDetail(job, provider, now), answered: false };
     }
     if (job.status === "awaiting_chat" && claimed(job, now)) {
       return { provider, state: "waiting", label, detail: "Chrome claimed · waiting for JSON", answered: false };

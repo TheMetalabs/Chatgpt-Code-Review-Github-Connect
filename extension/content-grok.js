@@ -45,9 +45,27 @@ async function startFresh() {
   return waitUntilComposer();
 }
 
+function generationAllowThin() {
+  return typeof replyDoneVisible === "function"
+    ? replyDoneVisible()
+    : chatGenerationFinished({
+        stopVisible: typeof stopButtonVisible === "function" && stopButtonVisible(),
+        replyActionsVisible: false,
+        sawStop: false,
+      });
+}
+
 async function runPrompt(prompt, reasoning) {
-  const existing = harvestJson({ allowThin: true });
-  if (existing && chatGenerationFinished(true)) return existing;
+  const existing = harvestJson({ allowThin: generationAllowThin() });
+  if (
+    existing &&
+    chatGenerationFinished({
+      stopVisible: typeof stopButtonVisible === "function" && stopButtonVisible(),
+      replyActionsVisible: typeof replyDoneVisible === "function" && replyDoneVisible(),
+      sawStop: false,
+    })
+  )
+    return existing;
   if (assistantCorpus().length && !composer()) return waitUntilReviewOrQuota("Grok");
   await dismissOverlays();
   const el = await startFresh();
@@ -64,14 +82,18 @@ async function runPrompt(prompt, reasoning) {
 let running = false;
 chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
   if (msg?.type === "ashlar-harvest") {
-    const raw = harvestJson({ allowThin: chatGenerationFinished(true) });
+    const raw = harvestJson({ allowThin: generationAllowThin() });
     sendResponse(raw ? { ok: true, raw } : { ok: false, error: "no json" });
     return true;
   }
   if (msg?.type !== "ashlar-run") return;
   if (running) {
-    const raw = harvestJson({ allowThin: chatGenerationFinished(true) });
-    sendResponse(raw ? { ok: true, raw } : { ok: false, error: "already running" });
+    const raw = harvestJson({ allowThin: generationAllowThin() });
+    sendResponse(
+      raw
+        ? { ok: true, raw }
+        : { ok: false, error: "already running", code: "busy", retry: true },
+    );
     return true;
   }
   running = true;

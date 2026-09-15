@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   LOCAL_FALLBACK_CLAIMED_MS,
   LOCAL_FALLBACK_MS,
+  LOCAL_HOLD_MS,
   shouldHoldForChat,
   shouldHoldForLocal,
   shouldStartLocalFallback,
@@ -46,6 +47,9 @@ describe("shouldStartLocalFallback", () => {
 });
 
 describe("shouldHoldForLocal", () => {
+  it("waits longer than a single local completion so queued jobs can finish", () => {
+    assert.ok(LOCAL_HOLD_MS > 210_000);
+  });
   it("holds a ChatGPT-only result while local is still running", () => {
     assert.equal(
       shouldHoldForLocal({

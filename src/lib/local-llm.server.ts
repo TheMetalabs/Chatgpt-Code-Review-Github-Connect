@@ -46,7 +46,7 @@ export async function runLocalLlm(
   prompt: string,
   settings: BotSettings,
 ): Promise<{ ok: true; raw: string } | { ok: false; error: string }> {
-  const ready = localClient(settings, 180_000);
+  const ready = localClient(settings, 600_000);
   if (!ready.ok) return ready;
   try {
     const res = await ready.client.chat.completions.create({

@@ -12,7 +12,7 @@ import {
 import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
-import { buildChatPrompt, buildFpPrompt, parseChatSubmission } from "./chat-prompt";
+import { buildChatPrompt, buildFpPrompt, buildMergePrompt, MERGE_FALLBACK_NOTE, parseChatSubmission } from "./chat-prompt";
 import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
 import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
@@ -278,7 +278,7 @@ async function bridgeSnapshot() {
 }
 
 const WATCH_TICK_MS = 5_000;
-const WATCH_CAP_MS = 8 * 60_000;
+const WATCH_CAP_MS = 14 * 60_000;
 
 async function watchReviewers(jobId: string, token: string) {
   const started = Date.now();
@@ -327,17 +327,10 @@ async function watchReviewers(jobId: string, token: string) {
       !flushed &&
       Date.now() - started >= LOCAL_HOLD_MS &&
       job.status === "awaiting_chat" &&
-      (job.storedLegs ?? []).some((l) => l.raw.trim())
+      (job.storedLegs ?? []).some((l) => l.raw.trim()) &&
+      !localInFlight.has(jobId)
     ) {
       flushed = true;
-      if (localInFlight.has(jobId)) {
-        localInFlight.delete(jobId);
-        patchJob(jobId, (j) => ({
-          ...j,
-          assumptions: [...(j.assumptions ?? []), "Skipped local (timed out waiting)"].slice(0, 12),
-          updatedAt: Date.now(),
-        }));
-      }
       const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
       if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
     }
@@ -362,6 +355,19 @@ async function watchReviewers(jobId: string, token: string) {
     }
 
     await sleep(WATCH_TICK_MS);
+  }
+  const leftover = state.jobs.find((j) => j.id === jobId);
+  if (leftover?.status === "awaiting_chat") {
+    if (localInFlight.has(jobId)) {
+      localInFlight.delete(jobId);
+      patchJob(jobId, (j) => ({
+        ...j,
+        assumptions: [...(j.assumptions ?? []), "Skipped local (still running at watch cap)"].slice(0, 12),
+        updatedAt: Date.now(),
+      }));
+    }
+    const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
+    if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
   }
 }
 
@@ -744,6 +750,27 @@ export async function submitHarborChat(
   }
 
   if (!gates.length) {
+    const localSkipped = (still.assumptions ?? []).some((a) => /^Skipped local/i.test(a));
+    const mergeAsked = (still.assumptions ?? []).some((a) => a.includes(MERGE_FALLBACK_NOTE));
+    const drafts = [...incoming, ...stored].filter((l) => l.raw.trim());
+    if (localSkipped && !mergeAsked && providers.some(isChatProvider)) {
+      const mergePrompt = buildMergePrompt({
+        sample,
+        drafts: drafts.length ? drafts : [{ provider: "chatgpt", raw: raw }],
+      });
+      patchJob(jobId, (j) => ({
+        ...j,
+        status: "awaiting_chat",
+        chatPrompt: mergePrompt,
+        fpProviders: ["chatgpt"],
+        bridgeClaimedAt: undefined,
+        assumptions: [...(j.assumptions ?? []), MERGE_FALLBACK_NOTE].slice(0, 12),
+        plan: "Local LLM skipped. Asking ChatGPT to merge reviewer drafts.",
+        githubError: undefined,
+        updatedAt: Date.now(),
+      }));
+      return { ok: true };
+    }
     const canRetry = providers.some(isChatProvider);
     if (!canRetry) {
       patchJob(jobId, (j) => ({
@@ -807,7 +834,12 @@ export async function submitHarborChat(
   }
 
   const ran = [...byProvider.keys()];
-  const order = normalizeReviewOrder(still.reviewOrder ?? state.settings.reviewOrder).filter((p) => ran.includes(p));
+  const localSkipped = (still.assumptions ?? []).some((a) => /^Skipped local/i.test(a));
+  let order = normalizeReviewOrder(still.reviewOrder ?? state.settings.reviewOrder).filter((p) => ran.includes(p));
+  if (localSkipped) {
+    order = order.filter((p) => p !== "local");
+    if (ran.includes("chatgpt")) order = ["chatgpt", ...order.filter((p) => p !== "chatgpt")];
+  }
   patchJob(jobId, (j) => ({
     ...j,
     chatFpRound: true,

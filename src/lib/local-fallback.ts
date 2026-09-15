@@ -5,8 +5,8 @@ import { isChatProvider } from "./types.ts";
 export const LOCAL_FALLBACK_MS = 90_000;
 /** If Chrome claimed the job but never completed, start local after this. */
 export const LOCAL_FALLBACK_CLAIMED_MS = 6 * 60_000;
-/** Max wait for an in-flight local LLM before posting Chrome-only. */
-export const LOCAL_HOLD_MS = 210_000;
+/** Max wait for an in-flight local LLM before posting Chrome-only. Local can queue. */
+export const LOCAL_HOLD_MS = 12 * 60_000;
 
 export function shouldStartLocalFallback(input: {
   providers: readonly ReviewProvider[];

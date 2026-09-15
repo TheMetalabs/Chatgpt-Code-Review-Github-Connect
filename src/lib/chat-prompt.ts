@@ -36,7 +36,8 @@ export function buildChatPrompt(opts: {
     "Only report concrete failure paths. No formatting, naming, or might/could/consider.",
     "Each finding file+line must exist in the snapshot and be in the changed files.",
     "Findings are posted as GitHub review comments on that file:line with P0/P1/P2 badges.",
-    "If nothing concrete, findings: []. Never APPROVE when findings remain.",
+    "Inspect every changed file. Do not return findings:[] unless investigated_safe lists each file you checked and why it is safe.",
+    "Never APPROVE when findings remain.",
     `Repo: ${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr}`,
     `Head: ${opts.sample.headSha}`,
     `Changed: ${opts.sample.changedPaths.join(", ")}`,
@@ -53,6 +54,29 @@ export function buildChatPrompt(opts: {
     .filter(Boolean)
     .join("\n\n")
     .slice(0, 20_000);
+}
+
+export const MERGE_FALLBACK_NOTE = "Asked ChatGPT to merge after local skip";
+
+export function buildMergePrompt(opts: {
+  sample: SamplePr;
+  drafts: { provider: string; raw: string }[];
+  extra?: string;
+  untrustedBody?: string;
+}): string {
+  const drafts = opts.drafts
+    .map((d) => `<<<DRAFT ${d.provider}>>>\n${String(d.raw || "").slice(0, 4_000)}\n<<<END_DRAFT>>>`)
+    .join("\n\n");
+  const base = buildChatPrompt({
+    sample: opts.sample,
+    extra: opts.extra,
+    untrustedBody: opts.untrustedBody,
+  });
+  return `${base}
+
+The local LLM was unavailable. Merge these reviewer drafts into one JSON object. Drafts may be empty — re-inspect the snapshot. Do not return findings:[] unless investigated_safe lists each changed file.
+
+${drafts}`.slice(0, 20_000);
 }
 
 export function parseChatSubmission(raw: string): Record<string, unknown> | null {

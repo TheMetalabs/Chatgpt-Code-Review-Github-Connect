@@ -2,7 +2,7 @@ const POLL_MS = 2500;
 const PING_MS = 10_000;
 const BUSY_MS = 4 * 60_000;
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
-const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt" };
+const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt", tabs: "tabs" };
 
 function formatRetry(until) {
   if (!until) return "later";
@@ -134,40 +134,51 @@ function contentFiles(provider) {
     : ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-chatgpt.js"];
 }
 
-function providerUrls(provider) {
-  if (provider === "grok") return ["https://grok.com/*"];
-  return ["https://chatgpt.com/*", "https://chat.openai.com/*"];
+async function rememberTab(jobId, provider, tabId) {
+  if (!jobId || !tabId) return;
+  const s = await chrome.storage.session.get([SESSION.tabs]);
+  const tabs = s[SESSION.tabs] && typeof s[SESSION.tabs] === "object" ? { ...s[SESSION.tabs] } : {};
+  tabs[`${jobId}:${provider}`] = tabId;
+  await chrome.storage.session.set({ [SESSION.tabs]: tabs });
 }
 
-async function harvestProvider(provider) {
-  const files = contentFiles(provider);
-  let tabs = [];
+async function tabFor(jobId, provider) {
+  const s = await chrome.storage.session.get([SESSION.tabs]);
+  const tabs = s[SESSION.tabs] && typeof s[SESSION.tabs] === "object" ? s[SESSION.tabs] : {};
+  const id = Number(tabs[`${jobId}:${provider}`] || 0);
+  return id || null;
+}
+
+async function harvestTab(provider, tabId) {
+  if (!tabId) return null;
   try {
-    tabs = await chrome.tabs.query({ url: providerUrls(provider) });
+    const result = await sendToTab(tabId, { type: "ashlar-harvest" }, contentFiles(provider));
+    if (result?.ok && result.raw) return { provider, raw: result.raw, tabId };
   } catch {
-    return null;
-  }
-  for (const tab of tabs) {
-    if (!tab.id) continue;
-    try {
-      const result = await sendToTab(tab.id, { type: "ashlar-harvest" }, files);
-      if (result?.ok && result.raw) return { provider, raw: result.raw, tabId: tab.id };
-    } catch {
-      /* tab not ready */
-    }
+    /* tab not ready */
   }
   return null;
 }
 
 async function runProvider(provider, prompt, jobId, reasoning) {
-  const existing = await harvestProvider(provider);
-  if (existing) return { provider, raw: existing.raw };
-  const tabId = await ensureTab(provider, reasoning);
   const files = contentFiles(provider);
+  const known = await tabFor(jobId, provider);
+  if (known) {
+    const hit = await harvestTab(provider, known);
+    if (hit) return { provider, raw: hit.raw };
+    try {
+      const result = await sendToTab(known, { type: "ashlar-run", prompt, jobId, reasoning }, files);
+      if (result?.ok && result.raw) return { provider, raw: result.raw };
+    } catch {
+      /* fall through to a new tab only if this one is gone */
+    }
+  }
+  const tabId = await ensureTab(provider, reasoning);
+  await rememberTab(jobId, provider, tabId);
   try {
     const result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId, reasoning }, files);
     if (!result?.ok) {
-      const again = await harvestProvider(provider);
+      const again = await harvestTab(provider, tabId);
       if (again) return { provider, raw: again.raw };
       const err = new Error(`${provider}: ${result?.error || "chat tab returned nothing"}`);
       err.code = result?.code;
@@ -175,7 +186,7 @@ async function runProvider(provider, prompt, jobId, reasoning) {
     }
     return { provider, raw: result.raw };
   } catch (e) {
-    const again = await harvestProvider(provider);
+    const again = await harvestTab(provider, tabId);
     if (again) return { provider, raw: again.raw };
     throw e;
   }
@@ -198,7 +209,7 @@ async function harvestAndComplete(jobId, providers) {
   if (!jobId) return false;
   const results = [];
   for (const p of providers) {
-    const hit = await harvestProvider(p);
+    const hit = await harvestTab(p, await tabFor(jobId, p));
     if (hit) results.push({ provider: hit.provider, raw: hit.raw });
   }
   if (!results.length) return false;

@@ -60,7 +60,7 @@ async function waitForReviewJson(ms) {
       stable = json;
       hits = 1;
     }
-    if (hits >= 1) return json;
+    if (hits >= 2) return json;
   }
   return harvestJson();
 }
@@ -68,6 +68,11 @@ async function waitForReviewJson(ms) {
 async function runPrompt(prompt, reasoning) {
   const existing = harvestJson();
   if (existing) return existing;
+  if (assistantCorpus().length) {
+    const json = await waitForReviewJson(300_000);
+    if (json) return json;
+    throw new Error("Grok did not return JSON in time");
+  }
   await dismissOverlays();
   const el = await startFresh();
   await dismissOverlays();

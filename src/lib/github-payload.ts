@@ -1,0 +1,147 @@
+import type { IngressTarget } from "./ingress.ts";
+import type { JobThread, Trigger } from "./types.ts";
+
+const PR_ACTIONS: Record<string, Trigger> = {
+  opened: "pull_request.opened",
+  reopened: "pull_request.reopened",
+  synchronize: "pull_request.synchronize",
+  ready_for_review: "pull_request.ready_for_review",
+};
+
+export type ParsedDelivery =
+  | { ok: true; kind: "ping" }
+  | { ok: true; kind: "ignore"; reason: string }
+  | {
+      ok: true;
+      kind: "review";
+      trigger: Trigger;
+      target: IngressTarget;
+      thread?: JobThread;
+      installationId?: number;
+      untrustedBody: string;
+    }
+  | { ok: false; reason: string };
+
+type Gh = {
+  action?: string;
+  installation?: { id?: number };
+  repository?: { full_name?: string; fork?: boolean };
+  sender?: { login?: string };
+  pull_request?: {
+    number?: number;
+    title?: string;
+    body?: string | null;
+    draft?: boolean;
+    head?: { sha?: string; repo?: { fork?: boolean } | null };
+    base?: { sha?: string };
+    user?: { login?: string };
+  };
+  issue?: { number?: number; pull_request?: unknown; title?: string };
+  comment?: { id?: number; body?: string };
+};
+
+function splitRepo(full: string | undefined): { owner: string; repo: string } | null {
+  if (!full) return null;
+  const [owner, repo] = full.split("/");
+  if (!owner || !repo) return null;
+  return { owner, repo };
+}
+
+export function parseGitHubPayload(event: string, raw: unknown): ParsedDelivery {
+  if (event === "ping") return { ok: true, kind: "ping" };
+  if (typeof raw !== "object" || raw === null) return { ok: false, reason: "malformed payload" };
+  const body = raw as Gh;
+  const installationId = Number.isFinite(body.installation?.id) ? Number(body.installation?.id) : undefined;
+  const repo = splitRepo(body.repository?.full_name);
+  const sender = body.sender?.login ?? "unknown";
+
+  if (event === "pull_request") {
+    const trigger = PR_ACTIONS[body.action ?? ""];
+    if (!trigger) return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"})` };
+    const pr = body.pull_request;
+    if (!repo || !pr?.number || !pr.head?.sha) return { ok: false, reason: "pull_request missing repo or head" };
+    const target: IngressTarget = {
+      owner: repo.owner,
+      repo: repo.repo,
+      pr: pr.number,
+      title: String(pr.title ?? `PR #${pr.number}`).slice(0, 200),
+      headSha: pr.head.sha,
+      baseSha: pr.base?.sha ?? "",
+      sender: pr.user?.login ?? sender,
+      isFork: Boolean(pr.head.repo?.fork ?? body.repository?.fork),
+      isDraft: Boolean(pr.draft),
+    };
+    return {
+      ok: true,
+      kind: "review",
+      trigger,
+      target,
+      installationId,
+      untrustedBody: String(pr.body ?? "").slice(0, 4000),
+    };
+  }
+
+  if (event === "issue_comment") {
+    if (body.action !== "created" && body.action !== "edited") {
+      return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"})` };
+    }
+    if (!body.issue?.pull_request) return { ok: true, kind: "ignore", reason: "not a pull request comment" };
+    if (!repo || !body.issue.number) return { ok: false, reason: "issue_comment missing repo or number" };
+    const target: IngressTarget = {
+      owner: repo.owner,
+      repo: repo.repo,
+      pr: body.issue.number,
+      title: String(body.issue.title ?? `PR #${body.issue.number}`).slice(0, 200),
+      headSha: "",
+      baseSha: "",
+      sender,
+      isFork: Boolean(body.repository?.fork),
+      isDraft: false,
+    };
+    return {
+      ok: true,
+      kind: "review",
+      trigger: "issue_comment.mention",
+      target,
+      installationId,
+      thread: {
+        kind: "mention",
+        commentId: Number(body.comment?.id ?? 0),
+        userText: String(body.comment?.body ?? "").slice(0, 2000),
+      },
+      untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
+    };
+  }
+
+  if (event === "pull_request_review_comment") {
+    if (body.action !== "created") return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"})` };
+    const pr = body.pull_request;
+    if (!repo || !pr?.number || !pr.head?.sha) return { ok: false, reason: "review comment missing pull_request" };
+    const target: IngressTarget = {
+      owner: repo.owner,
+      repo: repo.repo,
+      pr: pr.number,
+      title: String(pr.title ?? `PR #${pr.number}`).slice(0, 200),
+      headSha: pr.head.sha,
+      baseSha: pr.base?.sha ?? "",
+      sender,
+      isFork: Boolean(pr.head.repo?.fork ?? body.repository?.fork),
+      isDraft: Boolean(pr.draft),
+      };
+    return {
+      ok: true,
+      kind: "review",
+      trigger: "pull_request_review_comment.followup",
+      target,
+      installationId,
+      thread: {
+        kind: "followup",
+        commentId: Number(body.comment?.id ?? 0),
+        userText: String(body.comment?.body ?? "").slice(0, 2000),
+      },
+      untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
+    };
+  }
+
+  return { ok: true, kind: "ignore", reason: "event ignored" };
+}

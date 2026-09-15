@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <h1>Ashlar bridge</h1>
+    <p class="muted">Same Chrome where ChatGPT or Grok is signed in. Polls Ashlar and sends the review prompt.</p>
+    <label>Ashlar origin</label>
+    <input id="origin" placeholder="https://…" />
+    <label>Bridge token</label>
+    <input id="token" placeholder="from Ashlar Settings" />
+    <label class="row"><input id="enabled" type="checkbox" checked /> Enabled</label>
+    <button id="save">Save & connect</button>
+    <p id="status" class="muted"></p>
+    <script src="popup.js"></script>
+  </body>
+</html>

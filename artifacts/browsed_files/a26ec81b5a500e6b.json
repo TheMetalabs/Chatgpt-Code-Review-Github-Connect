@@ -1,0 +1,418 @@
+[
+  {
+    "name": ".gitattributes",
+    "path": ".gitattributes",
+    "sha": "bdc117d8b706c2a445fa189f2d51485ee50fbc22",
+    "size": 469,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/.gitattributes?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/.gitattributes",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/bdc117d8b706c2a445fa189f2d51485ee50fbc22",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/.gitattributes",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/.gitattributes?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/bdc117d8b706c2a445fa189f2d51485ee50fbc22",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/.gitattributes"
+    }
+  },
+  {
+    "name": ".githooks",
+    "path": ".githooks",
+    "sha": "15ffba5e6731a197bc6943a969877dc4b3491a53",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/.githooks?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/.githooks",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/15ffba5e6731a197bc6943a969877dc4b3491a53",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/.githooks?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/15ffba5e6731a197bc6943a969877dc4b3491a53",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/.githooks"
+    }
+  },
+  {
+    "name": ".github",
+    "path": ".github",
+    "sha": "a1f28518a6d886e710f509628e80a9c58ad0a6b6",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/.github?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/.github",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/a1f28518a6d886e710f509628e80a9c58ad0a6b6",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/.github?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/a1f28518a6d886e710f509628e80a9c58ad0a6b6",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/.github"
+    }
+  },
+  {
+    "name": ".gitignore",
+    "path": ".gitignore",
+    "sha": "28cd52ac8186c2035b2b981381d145611173606b",
+    "size": 1027,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/.gitignore?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/.gitignore",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/28cd52ac8186c2035b2b981381d145611173606b",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/.gitignore",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/.gitignore?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/28cd52ac8186c2035b2b981381d145611173606b",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/.gitignore"
+    }
+  },
+  {
+    "name": "AGENTS.md",
+    "path": "AGENTS.md",
+    "sha": "d5d2523f3a451773ac5f8755d2c7e2af08985d94",
+    "size": 168894,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/AGENTS.md?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/AGENTS.md",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/d5d2523f3a451773ac5f8755d2c7e2af08985d94",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/AGENTS.md",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/AGENTS.md?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/d5d2523f3a451773ac5f8755d2c7e2af08985d94",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/AGENTS.md"
+    }
+  },
+  {
+    "name": "CHANGELOG.md",
+    "path": "CHANGELOG.md",
+    "sha": "71bf69491c46d5cfe6d0afe544e03cbb5486ec12",
+    "size": 121177,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/CHANGELOG.md?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/CHANGELOG.md",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/71bf69491c46d5cfe6d0afe544e03cbb5486ec12",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/CHANGELOG.md",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/CHANGELOG.md?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/71bf69491c46d5cfe6d0afe544e03cbb5486ec12",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/CHANGELOG.md"
+    }
+  },
+  {
+    "name": "CLAUDE.md",
+    "path": "CLAUDE.md",
+    "sha": "59ef2db7cca920802f031810ef50546243a29556",
+    "size": 1189,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/CLAUDE.md?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/CLAUDE.md",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/59ef2db7cca920802f031810ef50546243a29556",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/CLAUDE.md",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/CLAUDE.md?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/59ef2db7cca920802f031810ef50546243a29556",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/CLAUDE.md"
+    }
+  },
+  {
+    "name": "CONTRIBUTING.md",
+    "path": "CONTRIBUTING.md",
+    "sha": "6801ee1fe639ca321051bd840ad5654025970181",
+    "size": 3091,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/CONTRIBUTING.md?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/CONTRIBUTING.md",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/6801ee1fe639ca321051bd840ad5654025970181",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/CONTRIBUTING.md",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/CONTRIBUTING.md?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/6801ee1fe639ca321051bd840ad5654025970181",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/CONTRIBUTING.md"
+    }
+  },
+  {
+    "name": "CONTRIBUTORS.md",
+    "path": "CONTRIBUTORS.md",
+    "sha": "5ececc606013ec34825bfbb26c9ae0e999e19574",
+    "size": 12792,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/CONTRIBUTORS.md?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/CONTRIBUTORS.md",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/5ececc606013ec34825bfbb26c9ae0e999e19574",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/CONTRIBUTORS.md",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/CONTRIBUTORS.md?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/5ececc606013ec34825bfbb26c9ae0e999e19574",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/CONTRIBUTORS.md"
+    }
+  },
+  {
+    "name": "LICENSE",
+    "path": "LICENSE",
+    "sha": "4863f21719abdc21a635c77b9230c9e734a419a1",
+    "size": 1086,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/LICENSE?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/LICENSE",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/4863f21719abdc21a635c77b9230c9e734a419a1",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/LICENSE",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/LICENSE?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/4863f21719abdc21a635c77b9230c9e734a419a1",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/LICENSE"
+    }
+  },
+  {
+    "name": "README.md",
+    "path": "README.md",
+    "sha": "3d30787da4a5db420b427b01c7a898d3774d87eb",
+    "size": 4833,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/README.md?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/README.md",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/3d30787da4a5db420b427b01c7a898d3774d87eb",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/README.md",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/README.md?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/3d30787da4a5db420b427b01c7a898d3774d87eb",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/README.md"
+    }
+  },
+  {
+    "name": "SECURITY.md",
+    "path": "SECURITY.md",
+    "sha": "54a657d5445f7339b1a6bda06ba3d191db30bf98",
+    "size": 4228,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/SECURITY.md?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/SECURITY.md",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/54a657d5445f7339b1a6bda06ba3d191db30bf98",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/SECURITY.md",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/SECURITY.md?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/54a657d5445f7339b1a6bda06ba3d191db30bf98",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/SECURITY.md"
+    }
+  },
+  {
+    "name": "THIRD-PARTY-NOTICES.txt",
+    "path": "THIRD-PARTY-NOTICES.txt",
+    "sha": "bdf53e030d2c4df4f0bb7f993b0656052fdc850f",
+    "size": 10386967,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/THIRD-PARTY-NOTICES.txt?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/THIRD-PARTY-NOTICES.txt",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/bdf53e030d2c4df4f0bb7f993b0656052fdc850f",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/THIRD-PARTY-NOTICES.txt",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/THIRD-PARTY-NOTICES.txt?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/bdf53e030d2c4df4f0bb7f993b0656052fdc850f",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/THIRD-PARTY-NOTICES.txt"
+    }
+  },
+  {
+    "name": "artwork",
+    "path": "artwork",
+    "sha": "3de0111c6716152d08a1c8ff1c83aa06d0c47beb",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/artwork?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/artwork",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/3de0111c6716152d08a1c8ff1c83aa06d0c47beb",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/artwork?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/3de0111c6716152d08a1c8ff1c83aa06d0c47beb",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/artwork"
+    }
+  },
+  {
+    "name": "docs",
+    "path": "docs",
+    "sha": "303a9217c689ffd60078e88f17eec689b67e0230",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/docs?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/docs",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/303a9217c689ffd60078e88f17eec689b67e0230",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/docs?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/303a9217c689ffd60078e88f17eec689b67e0230",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/docs"
+    }
+  },
+  {
+    "name": "electron-builder.yml",
+    "path": "electron-builder.yml",
+    "sha": "43348a457ce0e7d54486e03dea1db9e4398a9f33",
+    "size": 6174,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/electron-builder.yml?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/electron-builder.yml",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/43348a457ce0e7d54486e03dea1db9e4398a9f33",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/electron-builder.yml",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/electron-builder.yml?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/43348a457ce0e7d54486e03dea1db9e4398a9f33",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/electron-builder.yml"
+    }
+  },
+  {
+    "name": "electron.vite.config.ts",
+    "path": "electron.vite.config.ts",
+    "sha": "6051691262b11842d65a3d22af6604d3eedea767",
+    "size": 730,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/electron.vite.config.ts?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/electron.vite.config.ts",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/6051691262b11842d65a3d22af6604d3eedea767",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/electron.vite.config.ts",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/electron.vite.config.ts?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/6051691262b11842d65a3d22af6604d3eedea767",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/electron.vite.config.ts"
+    }
+  },
+  {
+    "name": "extension",
+    "path": "extension",
+    "sha": "384ef8c0ae27015fa0e1dcb6f7db6002ea40f272",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/extension?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/extension",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/384ef8c0ae27015fa0e1dcb6f7db6002ea40f272",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/extension?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/384ef8c0ae27015fa0e1dcb6f7db6002ea40f272",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/extension"
+    }
+  },
+  {
+    "name": "native",
+    "path": "native",
+    "sha": "a3d4f8e8022d8dab96b61407b33366c4065525f4",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/native?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/native",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/a3d4f8e8022d8dab96b61407b33366c4065525f4",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/native?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/a3d4f8e8022d8dab96b61407b33366c4065525f4",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/native"
+    }
+  },
+  {
+    "name": "package-lock.json",
+    "path": "package-lock.json",
+    "sha": "e34452f58809c4a3609cbb92e4d73b957e800917",
+    "size": 283775,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/package-lock.json?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/package-lock.json",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/e34452f58809c4a3609cbb92e4d73b957e800917",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/package-lock.json",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/package-lock.json?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/e34452f58809c4a3609cbb92e4d73b957e800917",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/package-lock.json"
+    }
+  },
+  {
+    "name": "package.json",
+    "path": "package.json",
+    "sha": "aee11e0fc0fbc723f95a209ba9d1329eca95b81e",
+    "size": 4019,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/package.json?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/package.json",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/aee11e0fc0fbc723f95a209ba9d1329eca95b81e",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/package.json",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/package.json?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/aee11e0fc0fbc723f95a209ba9d1329eca95b81e",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/package.json"
+    }
+  },
+  {
+    "name": "scripts",
+    "path": "scripts",
+    "sha": "183bf9f9ca90da66fe43155ff88eae96352cea9d",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/scripts?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/scripts",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/183bf9f9ca90da66fe43155ff88eae96352cea9d",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/scripts?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/183bf9f9ca90da66fe43155ff88eae96352cea9d",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/scripts"
+    }
+  },
+  {
+    "name": "src",
+    "path": "src",
+    "sha": "89eaaf3a1cf21556c17aa87ebf1195130aaab35c",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/src?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/src",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/89eaaf3a1cf21556c17aa87ebf1195130aaab35c",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/src?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/89eaaf3a1cf21556c17aa87ebf1195130aaab35c",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/src"
+    }
+  },
+  {
+    "name": "test",
+    "path": "test",
+    "sha": "fef014f3645011cc82b06af6b88002648908dbc2",
+    "size": 0,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/test?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/tree/main/test",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/fef014f3645011cc82b06af6b88002648908dbc2",
+    "download_url": null,
+    "type": "dir",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/test?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/trees/fef014f3645011cc82b06af6b88002648908dbc2",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/tree/main/test"
+    }
+  },
+  {
+    "name": "tsconfig.json",
+    "path": "tsconfig.json",
+    "sha": "e096ad4fd47c8dc5ce2217ef3ca155b5117653fe",
+    "size": 661,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/tsconfig.json?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/tsconfig.json",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/e096ad4fd47c8dc5ce2217ef3ca155b5117653fe",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/tsconfig.json",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/tsconfig.json?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/e096ad4fd47c8dc5ce2217ef3ca155b5117653fe",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/tsconfig.json"
+    }
+  },
+  {
+    "name": "vitest.config.ts",
+    "path": "vitest.config.ts",
+    "sha": "de1de021d4fd6d654913e4f3a193879475e1f43f",
+    "size": 919,
+    "url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/vitest.config.ts?ref=main",
+    "html_url": "https://github.com/totec448-spec/chat-on-steroids/blob/main/vitest.config.ts",
+    "git_url": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/de1de021d4fd6d654913e4f3a193879475e1f43f",
+    "download_url": "https://raw.githubusercontent.com/totec448-spec/chat-on-steroids/main/vitest.config.ts",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/totec448-spec/chat-on-steroids/contents/vitest.config.ts?ref=main",
+      "git": "https://api.github.com/repos/totec448-spec/chat-on-steroids/git/blobs/de1de021d4fd6d654913e4f3a193879475e1f43f",
+      "html": "https://github.com/totec448-spec/chat-on-steroids/blob/main/vitest.config.ts"
+    }
+  }
+]

@@ -1,6 +1,7 @@
 import type { BotSettings, Finding, Job, MergeRec, PostedComment, PostedReview, ReviewProvider, SamplePr, Severity } from "./types.ts";
 import { SAMPLE_PRS } from "./samples.ts";
 import { inlineFindingComment, reviewSummaryBody } from "./review-format.ts";
+import { commentableRightLines, snapToCommentableLine } from "./review-diff.ts";
 
 export const SEVERITY_RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2 };
 
@@ -75,6 +76,7 @@ export function publishableFindings(
   const accepted = findings.filter((f) => f.status === "accepted");
   const ranked = [...accepted].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
   const cap = Math.max(0, settings.maxInlineComments);
+  const commentable = sample?.diff ? commentableRightLines(sample.diff) : new Map<string, Set<number>>();
   const out: Finding[] = [];
   for (const f of ranked) {
     if (out.length >= cap) break;
@@ -82,6 +84,12 @@ export function publishableFindings(
     if (!fileExistsOnHead(sample, f.file, f.line)) continue;
     if (!inChangedPaths(sample, f.file)) continue;
     if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[settings.publishMinSeverity]) continue;
+    if (commentable.size) {
+      const snapped = snapToCommentableLine(f.file, f.line, commentable);
+      if (snapped == null) continue;
+      out.push(snapped === f.line ? f : { ...f, line: snapped });
+      continue;
+    }
     out.push(f);
   }
   return out;

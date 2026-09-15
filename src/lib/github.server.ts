@@ -3,6 +3,7 @@ import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
+import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
@@ -473,24 +474,34 @@ export async function createPullReview(
     comments: PostedComment[];
   },
 ): Promise<{ id: number }> {
-  const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      commit_id: opts.headSha,
-      event: opts.event,
-      body: opts.body,
-      comments: opts.comments.map((c) => ({
-        path: c.file,
-        line: c.line,
-        side: c.side,
-        body: c.body,
-      })),
-    }),
-  });
-  if (!out.ok) throw new Error(`GitHub Reviews API ${out.status}: ${out.text}`);
-  if (!out.data.id) throw new Error("review missing id");
-  return { id: out.data.id };
+  let comments = opts.comments;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commit_id: opts.headSha,
+        event: opts.event,
+        body: opts.body,
+        comments: comments.map((c) => ({
+          path: c.file,
+          line: c.line,
+          side: c.side,
+          body: c.body,
+        })),
+      }),
+    });
+    if (out.ok) {
+      if (!out.data.id) throw new Error("review missing id");
+      return { id: out.data.id };
+    }
+    if (comments.length && isReviewLineError(out.text)) {
+      comments = [];
+      continue;
+    }
+    throw new Error(`GitHub Reviews API ${out.status}: ${out.text}`);
+  }
+  throw new Error("GitHub Reviews API failed");
 }
 
 export async function createIssueComment(

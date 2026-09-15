@@ -274,56 +274,53 @@ async function tickBody() {
       return;
     }
     const keepAlive = setInterval(() => void ping(job.jobId), PING_MS);
-    let settled;
+    const results = [];
+    let quotaOnly = true;
     try {
-      settled = await Promise.allSettled(
-        runnable.map((p) =>
-          runProvider(
-            p,
-            (job.prompts && job.prompts[p]) || job.prompt,
-            job.jobId,
-            (job.reasoning && job.reasoning[p]) || (p === "grok" ? "heavy" : "pro"),
-          ),
-        ),
+      const settled = await Promise.allSettled(
+        runnable.map(async (p) => {
+          try {
+            const value = await runProvider(
+              p,
+              (job.prompts && job.prompts[p]) || job.prompt,
+              job.jobId,
+              (job.reasoning && job.reasoning[p]) || (p === "grok" ? "heavy" : "pro"),
+            );
+            results.push(value);
+            quotaOnly = false;
+            try {
+              await api("/api/bridge", {
+                action: "complete",
+                jobId: job.jobId,
+                raw: value.raw,
+                results: results.slice(),
+              });
+            } catch {
+              /* already posted or not awaiting */
+            }
+            return value;
+          } catch (e) {
+            const code = e && typeof e === "object" && "code" in e ? e.code : "";
+            if (code === "quota") await markQuota(p);
+            else quotaOnly = false;
+            throw e;
+          }
+        }),
       );
+      if (results.length) {
+        chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
+        return;
+      }
+      void settled;
+      const next = await quotaMap();
+      const until = Math.max(...runnable.map((p) => Number(next[p] || 0)));
+      chrome.storage.local.set({
+        lastError: quotaOnly ? `usage limit — retry ${formatRetry(until)}` : "chat review failed",
+      });
+      await api("/api/bridge", { action: "release", jobId: job.jobId });
     } finally {
       clearInterval(keepAlive);
     }
-    const results = [];
-    let quotaOnly = true;
-    for (let i = 0; i < settled.length; i += 1) {
-      const row = settled[i];
-      if (row.status === "fulfilled") {
-        results.push(row.value);
-        quotaOnly = false;
-        continue;
-      }
-      const reason = row.reason;
-      const code = reason && typeof reason === "object" ? reason.code : "";
-      if (code === "quota") {
-        await markQuota(runnable[i]);
-      } else {
-        quotaOnly = false;
-      }
-    }
-    if (results.length) {
-      await api("/api/bridge", {
-        action: "complete",
-        jobId: job.jobId,
-        raw: results[0].raw,
-        results,
-      });
-      chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
-      return;
-    }
-    const next = await quotaMap();
-    const until = Math.max(...runnable.map((p) => Number(next[p] || 0)));
-    chrome.storage.local.set({
-      lastError: quotaOnly
-        ? `usage limit — retry ${formatRetry(until)}`
-        : "chat review failed",
-    });
-    await api("/api/bridge", { action: "release", jobId: job.jobId });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const status = e && typeof e === "object" && "status" in e ? e.status : 0;

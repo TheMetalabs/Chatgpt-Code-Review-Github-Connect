@@ -45,11 +45,18 @@ export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" |
 
 ### 💡 Ashlar Review
 
+**Didn't find any major issues.**
+
 **Reviewed commit:** \`${sha}\`
 
-No findings under current policy. ChatGPT and Grok run in parallel; local LLM is optional and never blocks.
+${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
 
-${skipped.map((s) => `- ${s}`).join("\n")}
+<details>
+<summary>ℹ️ About Ashlar</summary>
+
+If Ashlar has suggestions, it comments inline with P0 / P1 / P2 badges. Otherwise it posts this and reacts with 👍.
+
+</details>
 
 — ${username}
 `;

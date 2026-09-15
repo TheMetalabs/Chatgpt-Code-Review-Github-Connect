@@ -43,7 +43,7 @@ function lastReviewJson(text) {
 function extractChatJson(text) {
   const s = String(text || "");
   if (!s.trim()) return null;
-  // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
+  // The last complete object wins, not an older fenced example.
   return lastReviewJson(s);
 }
 
@@ -78,12 +78,13 @@ async function harvestViaCopy() {
     .find((el) => /응답 복사|Copy response/i.test(el.getAttribute("aria-label") || ""));
   if (!btn) return null;
   try {
-    const previous = await navigator.clipboard.readText();
+    // Do not interpret a review left in the clipboard by a previous job as this reply.
+    const marker = `ashlar-copy-${Date.now()}-${Math.random()}`;
+    await navigator.clipboard.writeText(marker);
     btn.click();
     await sleep(250);
     const text = await navigator.clipboard.readText();
-    // A failed copy must not import an older job from the clipboard.
-    if (text === previous) return null;
+    if (text === marker) return null;
     return extractChatJson(text);
   } catch {
     return null;
@@ -112,18 +113,21 @@ async function waitUntilReviewOrQuota(name) {
   let stable = "";
   let hits = 0;
   let emptyTicks = 0;
-  // There is NO duration deadline. Queueing, unknown UI and generation remain pending.
+  // Queue and generation have no duration deadline. Only current-turn UI can end them.
   for (;;) {
-    const done = chatGenerationFinished({stopVisible: stopButtonVisible(), replyActionsVisible: replyDoneVisible()});
-    let json = done ? harvestJson({allowThin: true}) : null;
+    const done = chatGenerationFinished({
+      stopVisible: stopButtonVisible(),
+      replyActionsVisible: replyDoneVisible(),
+    });
+    let json = done ? harvestJson({ allowThin: true }) : null;
     if (done && !json && emptyTicks % 2 === 0) json = await harvestViaCopy();
     if (quotaHit() && !json) {
-      const error = new Error(`${name} usage limit`);
-      error.code = "quota";
-      throw error;
+      const e = new Error(`${name} usage limit`);
+      e.code = "quota";
+      throw e;
     }
     if (done && json) {
-      hits = stable === json ? hits + 1 : 1;
+      hits = json === stable ? hits + 1 : 1;
       stable = json;
       if (hits >= 2) return json;
       emptyTicks = 0;
@@ -131,49 +135,56 @@ async function waitUntilReviewOrQuota(name) {
       hits = 0;
       stable = "";
       emptyTicks = done ? emptyTicks + 1 : 0;
-      // This is completed-DOM settling, not a queue/generation timeout.
       if (emptyTicks >= 6) throw emptyReplyError(name);
     }
     await sleep(800);
   }
 }
 
-/** The page owns the long call. MV3 messages acknowledge immediately and harvest later. */
+/** Short message replies keep MV3 workers recoverable; the page owns the long model call.
+ * State survives script reinjection and retains terminal outcomes for a restarted worker.
+ */
 function installReviewRunner(name, run) {
-  // sessionStorage is scoped to this tab and survives extension reinjection/page restoration.
   let boundJob = "";
-  try {boundJob = sessionStorage.getItem("ashlar:job") || "";} catch { /* storage unavailable */ }
-  const state = globalThis.__ashlarRunner || {running: false, jobId: boundJob, result: null};
-  globalThis.__ashlarRunner = state;
+  try { boundJob = sessionStorage.getItem("ashlar:job") || ""; } catch { /* unavailable storage */ }
+  const state = globalThis.__ashlarRunnerState || globalThis.__ashlarRunner ||
+    { running: false, jobId: boundJob, result: null };
+  globalThis.__ashlarRunnerState = state;
   state.run = run;
   if (state.listener) return;
-  const busy = () => ({ok: false, code: "busy", retry: true, error: "generation pending"});
+  const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending" });
   state.listener = (msg, _sender, reply) => {
     if (msg?.type !== "ashlar-run" && msg?.type !== "ashlar-harvest") return;
     const respond = reply;
     reply = value => respond({...value, jobId: state.jobId});
-    if (msg.jobId && state.jobId && msg.jobId !== state.jobId) {
-      reply({ok: false, code: "job_mismatch", error: "tab belongs to another job"});
+    if (!msg.jobId) {
+      reply({ ok: false, code: "job_mismatch", error: "jobId is required" });
+      return;
+    }
+    if (state.jobId && msg.jobId !== state.jobId) {
+      reply({ ok: false, code: "job_mismatch", error: "tab belongs to another job" });
       return;
     }
     if (state.result) { reply(state.result); return; }
     if (state.running) { reply(busy()); return; }
     if (msg.type === "ashlar-harvest") {
-      reply({ok: false, code: "idle", error: "no active runner in this page"});
+      reply({ ok: false, code: "idle", error: "no active review in this page" });
       return;
     }
     if (msg.resume && !state.jobId && !msg.adoptLegacy) {
-      reply({ok: false, code: "disconnected", error: "original job binding not found in this tab"});
+      reply({ok: false, code: "disconnected", error: "original job binding is unavailable"});
       return;
     }
     const resume = Boolean(msg.resume || state.jobId);
-    state.jobId = String(msg.jobId || "");
-    try {sessionStorage.setItem("ashlar:job", state.jobId);} catch { /* in-memory binding still protects this page */ }
+    state.jobId = String(msg.jobId);
+    try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
     Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
-      .then(raw => {state.result = {ok: true, raw};})
-      .catch(error => {state.result = {ok: false, code: error?.code || "error", error: error?.message || String(error)};})
-      .finally(() => {state.running = false;});
+      .then(raw => { state.result = { ok: true, raw }; })
+      .catch(e => {
+        state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
+      })
+      .finally(() => { state.running = false; });
     reply(busy());
   };
   chrome.runtime.onMessage.addListener(state.listener);

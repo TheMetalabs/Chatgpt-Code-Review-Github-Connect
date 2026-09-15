@@ -195,6 +195,11 @@ export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId
   if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job) || !(job.chatPrompt || job.chatPromptByProvider)) {
     return {ok: false, error: "job is not waiting for chat"};
   }
+  const attempted = new Set(job.attemptedProviders ?? []);
+  if (job.bridgeClientId && job.bridgeClientId !== clientId &&
+      pendingChatProviders(job).some(provider => attempted.has(provider))) {
+    return {ok: false, error: "pending generation belongs to another Chrome profile"};
+  }
   if (job.bridgeClaimedAt && !STALE_CLAIM(job)) {
     if (clientId && job.bridgeClientId === clientId && job.bridgeLeaseId) return {ok: true, leaseId: job.bridgeLeaseId};
     return {ok: false, error: "already claimed"};
@@ -219,16 +224,43 @@ export function releaseBridgeJob(jobId: string, leaseId?: string) {
   }));
 }
 
+/** Explicit terminal outcome; transient disconnection is reported by ping instead. */
+export function failBridgeProvider(jobId: string, provider: ReviewProvider, error: string, leaseId?: string): boolean {
+  if (!isChatProvider(provider)) return false;
+  const job = getHarbor().jobs.find(j => j.id === jobId);
+  if (!job || job.status !== "awaiting_chat") return true;
+  if (!llmWorkAllowed(job) || !ownsLease(job, leaseId)) return false;
+  if (job.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim())) return true;
+  const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? [];
+  if (!enabled.includes(provider)) return false;
+  const prefix = error.split(":", 1)[0];
+  const code: ProviderError["code"] = prefix === "quota" || prefix === "empty" || prefix === "tab_closed" || prefix === "cancelled"
+    ? prefix : "error";
+  patchHarborJob(jobId, current => ({
+    ...current,
+    generating: {...current.generating, [provider]: false},
+    providerErrors: {...current.providerErrors, [provider]: {code, message: error.slice(0, 240)}},
+    attemptedProviders: [...new Set([...(current.attemptedProviders ?? []), provider])],
+    assumptions: [
+      ...(current.assumptions ?? []).filter(note => !note.startsWith(`Skipped ${provider}:`)),
+      `Skipped ${provider}: ${error.replace(/\s+/g, " ").slice(0, 400)}`,
+    ],
+    updatedAt: Date.now(),
+  }));
+  return true;
+}
+
 export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatLeg[], leaseId?: string) {
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job) return {ok: false, error: "job not found"};
-  const incoming = legs?.length ? legs : [{provider: "chatgpt" as const, raw}];
-  // A retry after a lost HTTP acknowledgement is idempotent, not another model call.
-  if (incoming.every(leg => job.storedLegs?.some(stored => stored.provider === leg.provider && stored.raw === leg.raw))) {
+  const incoming = (legs?.length ? legs : raw.trim() ? [{provider: "chatgpt" as const, raw}] : [])
+    .map(leg => ({...leg, raw: extractChatJson(leg.raw) ?? leg.raw}));
+  // Compare normalized payloads as stored, including after posting changed job status.
+  if (incoming.length && incoming.every(leg => job.storedLegs?.some(stored => stored.provider === leg.provider && stored.raw === leg.raw))) {
     return {ok: true};
   }
-  if (job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return {ok: false, error: "job is not claimed by this worker"};
-  const enabled = job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(getHarbor().settings);
+  if (job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return {ok: false, error: "job is not claimed by this worker", code: "lease_conflict"};
+  const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(getHarbor().settings);
   const accepted: ChatLeg[] = [];
   for (const leg of incoming) {
     if (!isChatProvider(leg.provider) || !enabled.includes(leg.provider)) continue;

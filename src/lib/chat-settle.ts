@@ -1,7 +1,7 @@
 /**
  * ChatGPT/Grok finished producing an answer — not a wall clock.
  * Copy/feedback toolbar (응답 작업) is the positive signal.
- * A leftover hidden stop node must not block that.
+ * Hidden controls must be filtered by the DOM caller. A visible Stop means pending.
  * Missing stop before generation starts is NOT "done".
  */
 export function chatGenerationFinished(input: {

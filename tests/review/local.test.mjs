@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {createServer,request as httpRequest} from 'node:http';
 import {request as httpsRequest} from 'node:https';
 import {loadTs,parser,types,json,source} from './load-source.mjs';
-function loadLocal(){return loadTs('src/lib/local-llm.server.ts',{...parser,httpRequest,httpsRequest,AbortSignal});}
+import {requestLocalChat,requestLocalJson} from '../../src/lib/local-chat-request.server.ts';
+function loadLocal(){return loadTs('src/lib/local-llm.server.ts',{...parser,requestLocalChat,requestLocalJson,AbortSignal});}
 async function endpoint(t,handler){
  const server=createServer(handler);server.requestTimeout=0;server.timeout=0;
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));

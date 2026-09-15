@@ -6,6 +6,7 @@ import {
   bridgeTokenOk,
   claimBridgeJob,
   completeBridgeJob,
+  failBridgeProvider,
   getBridgePublic,
   getBridgeStatus,
   promptForJob,
@@ -70,6 +71,8 @@ export const Route = createFileRoute("/api/bridge")({
           token?: string;
           jobId?: string;
           raw?: string;
+          provider?: string;
+          error?: string;
           results?: { provider?: string; raw?: string }[];
           generating?: Partial<Record<"chatgpt" | "grok" | "local", boolean>>;
         };
@@ -121,6 +124,13 @@ export const Route = createFileRoute("/api/bridge")({
           releaseBridgeJob(body.jobId, body.leaseId);
           return Response.json({ ok: true }, { headers });
         }
+        if (body.action === "failure" && body.jobId) {
+          if (body.provider !== "chatgpt" && body.provider !== "grok") {
+            return Response.json({ ok: false, error: "invalid chat provider" }, { status: 400, headers });
+          }
+          const accepted = failBridgeProvider(body.jobId, body.provider, String(body.error || "chat review failed"), body.leaseId);
+          return Response.json({ ok: accepted }, { status: accepted ? 200 : 409, headers });
+        }
         if (body.action === "complete" && body.jobId) {
           const legs = Array.isArray(body.results)
             ? body.results
@@ -128,7 +138,7 @@ export const Route = createFileRoute("/api/bridge")({
                 .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? "") }))
             : undefined;
           const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
-          if (!out.ok) return Response.json(out, { status: 400, headers });
+          if (!out.ok) return Response.json(out, { status: "code" in out && out.code === "lease_conflict" ? 409 : 400, headers });
           return Response.json({ ok: true }, { headers });
         }
         return Response.json({ ok: false, error: "unknown action" }, { status: 400, headers });

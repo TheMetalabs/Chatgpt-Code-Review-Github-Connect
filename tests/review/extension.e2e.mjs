@@ -31,29 +31,30 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  await eventually(()=>app.localRequests.length===1,'local generation not started');
  await worker.evaluate(()=>tick());
  await eventually(()=>context.pages().some(p=>p.url().startsWith('https://chatgpt.com/')),'chat tab missing');
- const page=context.pages().find(p=>p.url().startsWith('https://chatgpt.com/'));await page.waitForLoadState();
- await worker.evaluate(()=>tick());
- await eventually(()=>page.evaluate(()=>sends===1),'prompt was not submitted');
+ const page=context.pages().find(p=>p.url().startsWith('https://chatgpt.com/'));
+ // The tab URL can be visible before its first document script has executed.
+ await page.waitForFunction(()=>typeof window.sends==='number'&&typeof window.reply==='function');
+ await eventually(async()=>{await worker.evaluate(()=>tick());return page.evaluate(()=>window.sends===1);},'prompt was not submitted');
  let job=app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId);
  assert.equal(job.status,'awaiting_chat');assert.equal(job.storedLegs.length,0);
  app.clock.now+=365*24*3600_000;
  await worker.evaluate(()=>tick());
  assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId).status,'awaiting_chat');
- assert.equal(app.localRequests.length,1);assert.equal(await page.evaluate(()=>sends),1);
+ assert.equal(app.localRequests.length,1);assert.equal(await page.evaluate(()=>window.sends),1);
  // Reload the actual extension, not a mocked JS function; persistent task resumes original tab.
  const restarted=context.waitForEvent('serviceworker');
  await worker.evaluate(()=>chrome.runtime.reload()).catch(()=>{});
  worker=await restarted;
  await worker.evaluate(()=>tick());
- await page.evaluate(raw=>reply(raw,false),json);
+ await page.evaluate(raw=>window.reply(raw,false),json);
  await new Promise(resolve=>setTimeout(resolve,1700));
  await worker.evaluate(()=>tick());
  job=app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId);
  assert.equal(job.storedLegs.length,0);assert.equal(job.status,'awaiting_chat');
- assert.equal(await page.evaluate(()=>sends),1);
+ assert.equal(await page.evaluate(()=>window.sends),1);
  // Local headers and partial JSON are not a completed response.
  app.localResponses[0].writeHead(200,{'content-type':'application/json'});app.localResponses[0].write('{"choices":');
- await page.evaluate(raw=>reply(raw,true),json);
+ await page.evaluate(raw=>window.reply(raw,true),json);
  await eventually(async()=>{await worker.evaluate(()=>tick());return app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId).storedLegs.some(l=>l.provider==='chatgpt');},'final chat JSON was not stored');
  job=app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId);
  assert.equal(job.status,'awaiting_chat');assert.equal(job.storedLegs.some(l=>l.provider==='local'),false);
@@ -63,8 +64,8 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  await eventually(()=>app.reviews.length===1,'final review not published to GitHub fixture');
  job=app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId);
  assert.equal(job.status,'posted');assert.equal(job.storedLegs.length,2);
- await worker.evaluate(()=>tick());assert.equal(app.localRequests.length,1);assert.equal(await page.evaluate(()=>sends),1);assert.equal(app.reviews.length,1);
- if(process.env.REVIEW_EVIDENCE_DIR)await writeFile(join(process.env.REVIEW_EVIDENCE_DIR,'mv3-e2e.json'),JSON.stringify({status:job.status,localCalls:app.localRequests.length,promptSends:await page.evaluate(()=>sends),reviews:app.reviews.length,ops:app.ops},null,2));
+ await worker.evaluate(()=>tick());assert.equal(app.localRequests.length,1);assert.equal(await page.evaluate(()=>window.sends),1);assert.equal(app.reviews.length,1);
+ if(process.env.REVIEW_EVIDENCE_DIR)await writeFile(join(process.env.REVIEW_EVIDENCE_DIR,'mv3-e2e.json'),JSON.stringify({status:job.status,localCalls:app.localRequests.length,promptSends:await page.evaluate(()=>window.sends),reviews:app.reviews.length,ops:app.ops},null,2));
 });
 
 test('production ingress E2E: PR open without mention performs no model work',async t=>{

@@ -45,8 +45,8 @@ async function startFresh() {
   return waitUntilComposer();
 }
 
-async function runPrompt(prompt, reasoning, resume) {
-  // Recovery only observes the existing page. It must NEVER submit the prompt again.
+async function runPrompt(prompt, reasoning, resume = false) {
+  // A restarted worker must observe the existing request, never submit it again.
   if (resume) return waitUntilReviewOrQuota("Grok");
   await dismissOverlays();
   const el = await startFresh();

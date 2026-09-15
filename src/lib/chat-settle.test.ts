@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chatGenerationFinished } from "./chat-settle.ts";
 
 describe("chatGenerationFinished", () => {
-  it("waits for visible Stop; a hidden leftover stop is already filtered by DOM", () => {
+  it("requires copy/feedback with no visible stop button", () => {
     assert.equal(chatGenerationFinished({ stopVisible: true, replyActionsVisible: true }), false);
     assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: true }), true);
   });
@@ -17,7 +17,7 @@ describe("chatGenerationFinished", () => {
     assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false, sawStop: false }), false);
   });
 
-  it("does not settle on Stop flicker, even after generation started", () => {
+  it("does not settle on stop flicker without the current reply toolbar", () => {
     assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false, sawStop: true }), false);
   });
 });

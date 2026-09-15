@@ -14,7 +14,7 @@ export async function appFixture(options={}) {
      let text='';for await(const chunk of req)text+=chunk;
      localRequests.push(JSON.parse(text));localResponses.push(res);return;
    }
-   if(req.url==='/api/bridge'&&route){
+   if(req.url.split('?')[0]==='/api/bridge'&&route){
      try{
        let body='';for await(const chunk of req)body+=chunk;
        const request=new Request(`http://127.0.0.1:${server.address().port}${req.url}`,{method:req.method,headers:req.headers,...(body?{body}:{})});

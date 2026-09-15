@@ -14,6 +14,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  review-lifecycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Independent of legacy template tests; requires no npm dependencies or LLM spend.
+      - run: npm run test:review-regressions
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -32,13 +43,19 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci --ignore-scripts
+        id: dependencies
       - run: npm test
+      - name: Run library suites even when legacy script tests fail
+        run: npm run test:lib
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
       - run: npm run typecheck
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
       - run: npm run build:dev
-        if: ${{ !cancelled() }}
-  review-lifecycle:
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+  review-browser:
     runs-on: ubuntu-latest
+    # Fixture execution is bounded; production queue/generation is not.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,12 +66,10 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - name: Install Chromium for controlled browser fixtures
+        id: browser
         run: npx playwright install --with-deps chromium
-      - name: Lifecycle and Local HTTP regressions
-        run: node --test tests/review/lifecycle.test.mjs tests/review/local.test.mjs
       - name: Chromium DOM regressions
-        if: ${{ !cancelled() }}
-        run: node --test tests/review/browser.e2e.mjs
+        run: node --experimental-strip-types --test tests/review/browser.e2e.mjs
       - name: MV3 and application integration fixtures
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.browser.outcome == 'success' }}
         run: node --experimental-vm-modules --test tests/review/extension.e2e.mjs

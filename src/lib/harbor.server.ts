@@ -25,6 +25,7 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
+import { buildReviewerLanes } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import {
@@ -128,7 +129,14 @@ export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
 }
 
 export function publicJobs(jobs: Job[]) {
-  return jobs.map(({ chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, ...rest }) => rest);
+  const enabled = providersFromSettings(state.settings);
+  return jobs.map((j) => {
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, ...rest } = j;
+    return {
+      ...rest,
+      reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
+    };
+  });
 }
 
 export function publicSettings(s: BotSettings) {

@@ -4,12 +4,14 @@ import { Button } from "@/components/ui/button";
 import { DiffView } from "@/components/diff-view";
 import { FindingCard } from "@/components/finding-card";
 import { Pipeline } from "@/components/pipeline";
+import { ReviewerLanes } from "@/components/reviewer-lanes";
 import { MergePill, StatusPill } from "@/components/status-pill";
 import { chatStartUrl } from "@/lib/chat-prompt";
 import { CODE_REVIEW_MD, PAYMENT_AGENTS_MD, ROOT_AGENTS_MD } from "@/lib/policy";
 import { SAMPLE_PRS } from "@/lib/samples";
 import { useAshlar } from "@/lib/store";
 import { LIVE_INFLIGHT_STATUSES, BRIDGE_CLAIM_MS, isChatProvider, providersFromSettings } from "@/lib/types";
+import { buildReviewerLanes } from "@/lib/reviewer-progress";
 import type { ReviewProvider } from "@/lib/types";
 import { formatMs, shortSha } from "@/lib/utils";
 
@@ -136,6 +138,19 @@ function JobPage() {
       <div className="mt-8">
         <Pipeline status={job.status} />
       </div>
+
+      <section className="mt-8">
+        <h2 className="text-sm font-medium text-fg-muted">Reviewers</h2>
+        <div className="mt-3">
+          <ReviewerLanes
+            lanes={
+              job.reviewerLanes?.length
+                ? job.reviewerLanes
+                : buildReviewerLanes(job, { enabled: providersFromSettings(settings) })
+            }
+          />
+        </div>
+      </section>
 
       {job.thread ? (
         <div className="mt-6 rounded-xl border border-line bg-bg-elevated px-4 py-3 text-sm">

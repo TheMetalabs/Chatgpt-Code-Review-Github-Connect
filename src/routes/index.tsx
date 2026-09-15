@@ -4,11 +4,13 @@ import { ArrowUpRight, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Pipeline } from "@/components/pipeline";
+import { ReviewerLaneDots, ReviewerLanes } from "@/components/reviewer-lanes";
 import { MergePill, StatusPill } from "@/components/status-pill";
 import { useAshlar } from "@/lib/store";
 import { formatMs, formatWhen, shortSha } from "@/lib/utils";
-import { LIVE_INFLIGHT_STATUSES } from "@/lib/types";
-import type { Job, JobStatus, Trigger } from "@/lib/types";
+import { LIVE_INFLIGHT_STATUSES, providersFromSettings } from "@/lib/types";
+import { buildReviewerLanes } from "@/lib/reviewer-progress";
+import type { Job, Trigger } from "@/lib/types";
 
 export const Route = createFileRoute("/")({ component: Home });
 
@@ -29,6 +31,10 @@ const TAPES: {
   { label: "Worker crash (DLQ)", sampleKey: "pay-418", trigger: "pull_request.reopened", forceDlq: true },
 ];
 
+function lanesFor(job: Job, enabled: ReturnType<typeof providersFromSettings>) {
+  return job.reviewerLanes?.length ? job.reviewerLanes : buildReviewerLanes(job, { enabled });
+}
+
 function Home() {
   const jobs = useAshlar((s) => s.jobs);
   const events = useAshlar((s) => s.events);
@@ -37,9 +43,9 @@ function Home() {
   const settings = useAshlar((s) => s.settings);
   const [lastFire, setLastFire] = useState<string | null>(null);
   const [firing, setFiring] = useState(false);
+  const enabled = providersFromSettings(settings);
 
   const liveJobs = jobs.filter((j) => LIVE_INFLIGHT_STATUSES.includes(j.status));
-  const live = liveJobs[0];
   const posted = jobs.filter((j) => j.status === "posted" && j.postedReviewId).length;
   const skipped = jobs.filter((j) => j.status === "skipped").length;
   const rejected = events.filter((e) => e.httpStatus === 403).length;
@@ -97,23 +103,26 @@ function Home() {
         <Stat label="Posted" value={String(posted)} hint="Reviews API only" />
         <Stat label="Skipped" value={String(skipped)} hint="fork / draft / poster" />
         <Stat label="Rejected" value={String(rejected)} hint="HMAC 403" />
-        <Stat label="Live" value={String(reviews.filter((r) => !r.dismissed).length)} hint="current reviews" />
+        <Stat label="Live" value={String(liveJobs.length)} hint="in-flight jobs" />
       </dl>
 
       <section className="mt-10">
-        <h2 className="text-sm font-medium text-fg-muted">Live pipeline</h2>
-        <div className="mt-3" aria-busy={Boolean(live)}>
-          <Pipeline status={live?.status as JobStatus | undefined} />
+        <div className="flex items-baseline justify-between gap-3">
+          <h2 className="text-sm font-medium text-fg-muted">Live pipeline</h2>
+          <span className="font-mono text-[11px] tabular-nums text-fg-subtle">
+            {liveJobs.length ? `${liveJobs.length} in flight` : "idle"}
+          </span>
         </div>
-        {liveJobs.length > 1 ? (
-          <p className="mt-3 font-mono text-[12px] text-fg-muted">{liveJobs.length} live · showing newest</p>
-        ) : null}
-        {live ? (
-          <p className="mt-3 font-mono text-[12px] text-fg-muted">
-            {live.owner}/{live.repo}#{live.pr} · {live.status} · {shortSha(live.headSha)}
-          </p>
-        ) : (
+        {liveJobs.length === 0 ? (
           <p className="mt-3 text-sm text-fg-subtle">Idle. Ingress is still accepting.</p>
+        ) : (
+          <ul className="mt-3 grid gap-3">
+            {liveJobs.map((job) => (
+              <li key={job.id}>
+                <LiveJobCard job={job} lanes={lanesFor(job, enabled)} />
+              </li>
+            ))}
+          </ul>
         )}
       </section>
 
@@ -180,13 +189,14 @@ function Home() {
                 <th className="px-4 py-3 font-medium">PR</th>
                 <th className="hidden px-4 py-3 font-medium md:table-cell">Trigger</th>
                 <th className="px-4 py-3 font-medium">Status</th>
+                <th className="hidden px-4 py-3 font-medium lg:table-cell">Reviewers</th>
                 <th className="hidden px-4 py-3 font-medium sm:table-cell">Ingress</th>
                 <th className="px-4 py-3 font-medium" />
               </tr>
             </thead>
             <tbody>
               {jobs.slice(0, 12).map((j) => (
-                <JobRow key={j.id} job={j} />
+                <JobRow key={j.id} job={j} lanes={lanesFor(j, enabled)} />
               ))}
             </tbody>
           </table>
@@ -196,7 +206,45 @@ function Home() {
   );
 }
 
-function JobRow({ job: j }: { job: Job }) {
+function LiveJobCard({ job, lanes }: { job: Job; lanes: ReturnType<typeof lanesFor> }) {
+  return (
+    <article className="rounded-xl border border-line bg-bg-elevated p-4" aria-busy>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-fg-subtle">
+            {job.owner}/{job.repo}#{job.pr}
+            {job.origin === "github" ? " · github" : ""}
+          </p>
+          <h3 className="mt-1 text-base font-medium tracking-tight">{job.title}</h3>
+        </div>
+        <div className="flex items-center gap-2">
+          <StatusPill status={job.status} />
+          <Link
+            to="/jobs/$id"
+            params={{ id: job.id }}
+            className="inline-flex size-11 items-center justify-center text-fg-muted hover:text-fg"
+          >
+            <ArrowUpRight className="size-4" />
+            <span className="sr-only">Open job</span>
+          </Link>
+        </div>
+      </div>
+      <div className="mt-4">
+        <Pipeline status={job.status} size="compact" />
+      </div>
+      <div className="mt-4">
+        <p className="mb-2 font-mono text-[10px] uppercase tracking-[0.14em] text-fg-subtle">Reviewers</p>
+        <ReviewerLanes lanes={lanes} />
+      </div>
+      {job.plan ? <p className="mt-3 text-[13px] leading-relaxed text-fg-muted">{job.plan}</p> : null}
+      <p className="mt-3 font-mono text-[11px] text-fg-subtle">
+        {shortSha(job.headSha)} · {formatWhen(job.updatedAt)}
+      </p>
+    </article>
+  );
+}
+
+function JobRow({ job: j, lanes }: { job: Job; lanes: ReturnType<typeof lanesFor> }) {
   return (
     <tr className="border-t border-line">
       <td className="px-4 py-3">
@@ -215,6 +263,9 @@ function JobRow({ job: j }: { job: Job }) {
           <MergePill event={j.mergeRecommendation} />
         </div>
         {j.skipReason ? <div className="mt-1 text-[12px] text-fg-subtle">{j.skipReason}</div> : null}
+      </td>
+      <td className="hidden px-4 py-3 lg:table-cell">
+        <ReviewerLaneDots lanes={lanes} />
       </td>
       <td className="hidden px-4 py-3 font-mono text-[12px] tabular-nums text-fg-muted sm:table-cell">
         {formatMs(j.ingressMs)} · {formatWhen(j.createdAt)}

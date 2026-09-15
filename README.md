@@ -60,8 +60,10 @@ npm run dev
 | --- | --- |
 | Pull requests | Read & write |
 | Contents | Read-only |
-| Issues | Read-only |
+| Issues | Read & write |
 | Metadata | Read-only |
+
+Issues Write는 웹훅을 읽었을 때 Codex처럼 👀 / 👍 / 😕 리액션을 달기 위한 것입니다.
 
 **Subscribe to events**
 

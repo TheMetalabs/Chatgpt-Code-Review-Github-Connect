@@ -11,7 +11,7 @@ import {
 } from "./samples";
 import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
-import { createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken } from "./github.server";
+import { createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, type GithubReaction } from "./github.server";
 import { buildChatPrompt, buildFpPrompt, parseChatSubmission } from "./chat-prompt";
 import { runLocalLlm } from "./local-llm.server";
 import {
@@ -225,6 +225,14 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
 
 export type ChatLeg = { provider: ReviewProvider; raw: string };
 
+async function reactQuiet(token: string, job: Job, content: GithubReaction) {
+  try {
+    await reactOnDelivery(token, job, content);
+  } catch {
+    /* ack-only; never fail the review on a missing reaction */
+  }
+}
+
 async function playGithub(jobId: string, untrustedBody: string) {
   const current = () => state.jobs.find((j) => j.id === jobId);
   const live0 = current();
@@ -244,9 +252,25 @@ async function playGithub(jobId: string, untrustedBody: string) {
   }
 
   let token: string;
-  let sample: SamplePr;
   try {
     token = await installationToken(live0.installationId);
+  } catch (e) {
+    const msg = formatGithubError(e);
+    patchJob(jobId, (j) => ({
+      ...j,
+      status: "skipped",
+      skipReason: "GitHub snapshot failed",
+      githubError: msg.slice(0, 240),
+      updatedAt: Date.now(),
+    }));
+    return;
+  }
+
+  const acked = current();
+  if (acked) void reactQuiet(token, acked, "eyes");
+
+  let sample: SamplePr;
+  try {
     let target = {
       owner: live0.owner,
       repo: live0.repo,
@@ -287,6 +311,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
       githubError: msg.slice(0, 240),
       updatedAt: Date.now(),
     }));
+    void reactQuiet(token, live0, "confused");
     return;
   }
 
@@ -697,6 +722,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       postedReviewId: undefined,
       updatedAt: Date.now(),
     }));
+    if (token) void reactQuiet(token, after, "+1");
     return;
   }
 
@@ -730,6 +756,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
         postedToGithub: false,
         updatedAt: Date.now(),
       }));
+      void reactQuiet(token, after, "confused");
       return;
     }
   }
@@ -760,6 +787,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
         : j,
     ),
   };
+  if (token) void reactQuiet(token, after, "+1");
 }
 
 function enqueueFromDecision(

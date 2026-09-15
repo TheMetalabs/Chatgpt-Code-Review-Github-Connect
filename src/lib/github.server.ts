@@ -375,3 +375,29 @@ export async function createPullReview(
   if (!out.data.id) throw new Error("review missing id");
   return { id: out.data.id };
 }
+
+export type GithubReaction = "eyes" | "+1" | "confused";
+
+/** Ack on the triggering comment, or on the PR when there isn't one. Failures are non-fatal. */
+export async function reactOnDelivery(
+  token: string,
+  job: { owner: string; repo: string; pr: number; thread?: { kind?: string; commentId?: number } },
+  content: GithubReaction,
+): Promise<void> {
+  const commentId = job.thread?.commentId;
+  const path =
+    commentId && job.thread?.kind === "followup"
+      ? `/repos/${job.owner}/${job.repo}/pulls/comments/${commentId}/reactions`
+      : commentId
+        ? `/repos/${job.owner}/${job.repo}/issues/comments/${commentId}/reactions`
+        : `/repos/${job.owner}/${job.repo}/issues/${job.pr}/reactions`;
+  const out = await gh(token, path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  if (!out.ok && out.status !== 409 && out.status !== 422) {
+    throw new Error(`reaction ${content} ${out.status}: ${out.text}`);
+  }
+}
+

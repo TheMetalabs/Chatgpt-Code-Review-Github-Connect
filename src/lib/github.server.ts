@@ -3,6 +3,7 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, policyPathsFor, snapshotFileRef } from "./github-snapshot";
+import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
 
@@ -60,6 +61,8 @@ export function githubReady(): GithubReady {
     appIdValue: c.appId,
     clientIdValue: c.clientId,
     jwtIssuer: c.clientId || c.appId ? (c.clientId ? "client_id" : "app_id") : "missing",
+    publicHost: ashlarPublicHost() || undefined,
+    webhookUrl: ashlarWebhookUrl() || undefined,
     from: c.from,
   };
 }

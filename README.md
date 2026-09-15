@@ -60,8 +60,8 @@ OAuth App, Fine-grained PAT, 저장소 Webhooks 페이지는 쓰지 않습니다
 ### Webhook
 
 - **Active**: 켜기
-- **Webhook URL**: `https://<터널-호스트>/api/webhook`  
-  `http://127.0.0.1` 은 GitHub가 못 칩니다. 터널 HTTPS여야 합니다.
+- **Webhook URL**: `https://<your-tunnel-host>/api/webhook`  
+  실제 도메인은 이 저장소에 적지 마세요. `http://127.0.0.1` 은 GitHub가 못 칩니다. 터널 HTTPS여야 합니다.
 - **Webhook secret**: 긴 임의 문자열. Ashlar Settings에 **같은 값**을 넣습니다.
 - SSL verification: Enable
 
@@ -134,22 +134,32 @@ Ashlar → Settings → **GitHub App** → **Save GitHub credentials**
 
 저장하면 시크릿은 이 머신 `.data/ashlar-secrets.json` (권한 0600)에만 남고, 화면은 마스크됩니다. GET API로 키가 다시 내려오지 않습니다. 칸을 비워 두면 환경 변수 폴백입니다.
 
+터널 호스트와 자격은 **`.env`에만** 둡니다. `.env`는 gitignore입니다. `.env.example`을 복사하세요.
+
 ```bash
-GITHUB_APP_ID=123456
-GITHUB_APP_CLIENT_ID=Iv23…
-GITHUB_APP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----..."
-GITHUB_WEBHOOK_SECRET=...
+cp .env.example .env
 ```
+
+```
+ASHLAR_PUBLIC_HOST=<your-tunnel-host>
+ASHLAR_ALLOWED_HOSTS=
+GITHUB_APP_ID=
+GITHUB_APP_CLIENT_ID=
+GITHUB_WEBHOOK_SECRET=
+GITHUB_APP_PRIVATE_KEY=
+```
+
+실 도메인·App ID·시크릿을 README나 소스에 적지 마세요.
 
 램프가 `set (ui)` 또는 `set (env)` 이면 자격은 준비된 것입니다. Settings의 **Test GitHub API**가 `ok · <앱이름>` 이어야 스냅샷도 됩니다.
 
-로컬에서 웹훅을 받으려면 터널을 앱 URL과 맞춥니다.
+로컬에서 웹훅을 받으려면 터널을 `ASHLAR_PUBLIC_HOST`와 맞춥니다.
 
 ```bash
 cloudflared tunnel --url http://127.0.0.1:8080
 ```
 
-나온 `https://….trycloudflare.com/api/webhook` 을 GitHub App **Webhook URL**에 넣습니다. Ashlar와 터널을 둘 다 켜 둔 채로 확인합니다.
+나온 호스트를 `.env`의 `ASHLAR_PUBLIC_HOST`에 넣고, GitHub App Webhook URL은 `https://<그-호스트>/api/webhook` 입니다. Ashlar와 터널을 둘 다 켜 둔 채로 확인합니다.
 
 ### 웹훅이 도는지
 
@@ -233,11 +243,19 @@ PR 본문이나 리뷰 코멘트에 `@ashlar-bot` 또는 `/review` 를 쓰면 �
 
 ## 보안
 
-- GitHub private key, 웹훅 시크릿, 로컬 LLM 키는 `.data/`에만 있습니다. 커밋하지 마세요 (`.gitignore`에 포함).
+이 저장소는 퍼블릭입니다. **커밋하지 마세요:**
+
+- 터널 / 실서비스 호스트명
+- GitHub App ID, Client ID, Client secret
+- webhook secret, private key PEM, 설치 토큰
+- `.data/`, `.env`, Inbox·Jobs 덤프 (실제 org/repo·delivery id)
+
+자격 증명은 이 머신 Settings 저장(`.data/ashlar-secrets.json`, gitignore) 또는 환경 변수만 씁니다.
+
 - Settings GET는 시크릿을 돌려주지 않습니다. 빈 칸 저장은 기존 값을 유지합니다.
 - GitHub 자격 저장은 같은 origin POST만 받습니다. PEM이 아니면 거절합니다.
 - PR 본문은 untrusted입니다. 정책 파일(`AGENTS.md`, `code_review.md`)은 **base** ref에서 읽습니다.
-- Ashlar를 공개 웹에 올리지 마세요. 로컬(또는 당신이 통제하는 머신)용입니다.
+- Ashlar를 불특정 공개 웹에 올리지 마세요. 로컬(또는 당신이 통제하는 머신)용입니다.
 
 ---
 

@@ -1,1 +1,24 @@
+# machine-local secrets — never commit
 .data/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# live dumps, screenshots, tunnel scratch
+artifacts/
+attachments/
+screenshots/
+
+# grok runtime (not source)
+.grok/preview.log
+.grok/status
+
+node_modules/
+dist/
+.output/
+
+# grok workspace ids — not product
+.github_repo
+.project_id

@@ -599,6 +599,15 @@ function GitHubApp({ github }: { github: GithubReady }) {
         ))}
       </ul>
       <div className="mt-4 space-y-4">
+        {github.webhookUrl ? (
+          <p className="rounded-md border border-line bg-bg px-3 py-2 font-mono text-[12px] text-fg-muted">
+            GitHub App Webhook URL (from <code>ASHLAR_PUBLIC_HOST</code>): {github.webhookUrl}
+          </p>
+        ) : (
+          <p className="text-[12px] text-fg-subtle">
+            터널 호스트는 <code>.env</code>의 <code>ASHLAR_PUBLIC_HOST</code>에만 둡니다. git에 올리지 마세요.
+          </p>
+        )}
         <Field label="github.app_id">
           <input
             value={appId}

@@ -1,7 +1,7 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Plugin } from "vite";
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import viteReact from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
@@ -11,6 +11,7 @@ import { grokPwaPlugin } from "./scripts/grok-pwa-plugin.mjs";
 // @ts-expect-error JS plugin alongside the TS vite config
 import { appEnvPlugin } from "./scripts/app-env-plugin.mjs";
 import { isMigrationFile } from "./scripts/migration-plan.mjs";
+import { parseHostList } from "./src/lib/ashlar-env";
 
 /** The files `src/lib/db.ts` globs — same directory, same non-recursive scope. */
 function hasGlobbedMigrations(root: string): boolean {
@@ -145,11 +146,18 @@ function authPopupPlugin(): Plugin {
 // `0.0.0.0:8080` is the live-preview contract — don't change host/port.
 // The dev server starts once `src/router.tsx` and `src/routes/` exist — see
 // AGENTS.md § "First scaffold".
-export default defineConfig(({ command, isPreview }) => ({
+export default defineConfig(({ command, isPreview, mode }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+  const tunnelHosts = parseHostList(
+    [env.ASHLAR_ALLOWED_HOSTS, env.ASHLAR_PUBLIC_HOST].filter(Boolean).join(","),
+  );
+  return {
   server: {
     host: "0.0.0.0",
     port: 8080,
     strictPort: true,
+    // Tunnel Host header comes from ASHLAR_PUBLIC_HOST / ASHLAR_ALLOWED_HOSTS in .env
+    allowedHosts: tunnelHosts.length ? tunnelHosts : true,
   },
   preview: {
     host: "127.0.0.1",
@@ -180,4 +188,5 @@ export default defineConfig(({ command, isPreview }) => ({
       : []),
     viteReact(),
   ],
-}));
+  };
+});

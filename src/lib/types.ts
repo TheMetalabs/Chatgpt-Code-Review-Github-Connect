@@ -281,6 +281,8 @@ export type GithubReady = {
   appIdValue?: string;
   clientIdValue?: string;
   jwtIssuer?: "client_id" | "app_id" | "missing";
+  publicHost?: string;
+  webhookUrl?: string;
   from?: {
     webhookSecret: "ui" | "env" | "missing";
     appId: "ui" | "env" | "missing";
@@ -288,3 +290,4 @@ export type GithubReady = {
     privateKey: "ui" | "env" | "missing";
   };
 };
+

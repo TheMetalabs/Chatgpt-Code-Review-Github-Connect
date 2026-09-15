@@ -17,7 +17,7 @@ function localClient(settings: BotSettings, timeout: number) {
   };
 }
 
-/** Cheap liveness check. Prefer /models; some servers only speak chat. */
+/** Cheap liveness check. GET /models only — never enqueue a generate. */
 export async function pingLocalLlm(
   settings: BotSettings,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -26,19 +26,9 @@ export async function pingLocalLlm(
   try {
     await ready.client.models.list();
     return { ok: true };
-  } catch {
-    try {
-      await ready.client.chat.completions.create({
-        model: ready.model,
-        messages: [{ role: "user", content: "ok" }],
-        max_tokens: 1,
-        temperature: 0,
-      });
-      return { ok: true };
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return { ok: false, error: msg.slice(0, 240) };
-    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, error: msg.slice(0, 240) };
   }
 }
 

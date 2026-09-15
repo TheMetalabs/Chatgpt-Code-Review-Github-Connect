@@ -298,28 +298,16 @@ async function watchReviewers(jobId: string, token: string) {
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
     const localSkip = (job.assumptions ?? []).find((a) => a.startsWith("Skipped local"));
     const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "";
-    const localRunning = localInFlight.has(jobId);
     if (
-      prompt &&
       shouldStartLocalRace({
         providers: job.reviewProviders ?? [],
         status: job.status,
         localDone: Boolean(localLeg?.raw.trim() || localSkip),
-        localStarted: localStarted || localRunning,
+        localStarted: localStarted || localInFlight.has(jobId),
       })
     ) {
-      const ping = await pingLocalLlm(state.settings);
-      if (ping.ok) {
-        localStarted = true;
-        localInFlight.add(jobId);
-        void attachLocalLeg(jobId, prompt, { submit: true });
-      } else if (!localSkip) {
-        patchJob(jobId, (j) => ({
-          ...j,
-          assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
-          updatedAt: Date.now(),
-        }));
-      }
+      localStarted = true;
+      void kickLocalRace(jobId, prompt);
     }
     const stored = job.storedLegs ?? [];
     const racing = stillRacing({
@@ -541,18 +529,30 @@ async function playGithub(jobId: string, untrustedBody: string) {
   }));
   void watchReviewers(jobId, token);
   if (providers.includes("local") && chatProviders.length) {
-    const ping = await pingLocalLlm(state.settings);
-    if (!ping.ok) {
-      patchJob(jobId, (j) => ({
-        ...j,
-        assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
-        updatedAt: Date.now(),
-      }));
-    } else {
-      localInFlight.add(jobId);
-      void attachLocalLeg(jobId, prompt, { submit: true });
-    }
+    void kickLocalRace(jobId, prompt);
   }
+}
+
+/** One in-flight generate per job. playGithub + watch both call this. */
+async function kickLocalRace(jobId: string, prompt: string) {
+  if (!prompt.trim()) return;
+  if (localInFlight.has(jobId)) return;
+  const job = state.jobs.find((j) => j.id === jobId);
+  if (!job) return;
+  if ((job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim())) return;
+  if ((job.assumptions ?? []).some((a) => /^Skipped local/i.test(a))) return;
+  localInFlight.add(jobId);
+  const ping = await pingLocalLlm(state.settings);
+  if (!ping.ok) {
+    localInFlight.delete(jobId);
+    patchJob(jobId, (j) => ({
+      ...j,
+      assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
+      updatedAt: Date.now(),
+    }));
+    return;
+  }
+  void attachLocalLeg(jobId, prompt, { submit: true });
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {

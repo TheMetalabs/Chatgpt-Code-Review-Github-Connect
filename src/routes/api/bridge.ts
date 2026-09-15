@@ -76,11 +76,11 @@ export const Route = createFileRoute("/api/bridge")({
           return Response.json({ ok: false, error: "bad token" }, { status: 401, headers });
         }
         bridgeHeartbeat();
-        if (body.jobId) refreshBridgeClaim(body.jobId);
         if (body.action === "rotate") {
           return Response.json({ ok: true, token: rotateBridgeToken().token, bridge: getBridgePublic() }, { headers });
         }
         if (body.action === "ping") {
+          if (body.jobId) refreshBridgeClaim(body.jobId);
           return Response.json({ ok: true, bridge: getBridgePublic() }, { headers });
         }
         if (body.action === "take") {

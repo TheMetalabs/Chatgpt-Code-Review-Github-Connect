@@ -53,9 +53,7 @@ async function startFresh() {
 }
 
 function lastAssistant() {
-  const nodes = [
-    ...document.querySelectorAll("[data-message-author-role='assistant'], [data-message-id], main article"),
-  ];
+  const nodes = [...document.querySelectorAll("[data-message-author-role='assistant']")];
   const last = nodes.at(-1);
   return last ? last.innerText.trim() : "";
 }

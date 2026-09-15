@@ -52,6 +52,11 @@ async function clickSend(findSend, findComposer) {
     const btn = findSend();
     const disabled = !btn || btn.disabled || btn.getAttribute("aria-disabled") === "true";
     if (btn && !disabled) {
+      const label = `${btn.getAttribute("aria-label") || ""} ${btn.getAttribute("data-testid") || ""}`.toLowerCase();
+      if (/stop|abort/.test(label)) {
+        await sleep(200);
+        continue;
+      }
       btn.click();
       return;
     }

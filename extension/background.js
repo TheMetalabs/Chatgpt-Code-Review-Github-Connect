@@ -72,6 +72,11 @@ function waitTab(tabId) {
   });
 }
 
+function noReceiver(err) {
+  const m = err instanceof Error ? err.message : String(err);
+  return /receiving end does not exist|could not establish connection/i.test(m);
+}
+
 async function sendToTab(tabId, msg, files) {
   const once = () =>
     new Promise((resolve, reject) => {
@@ -84,11 +89,10 @@ async function sendToTab(tabId, msg, files) {
     });
   try {
     return await once();
-  } catch {
-    if (files?.length) {
-      await chrome.scripting.executeScript({ target: { tabId }, files });
-      await sleep(400);
-    }
+  } catch (e) {
+    if (!files?.length || !noReceiver(e)) throw e;
+    await chrome.scripting.executeScript({ target: { tabId }, files });
+    await sleep(400);
     return once();
   }
 }
@@ -149,10 +153,10 @@ async function ping(jobId) {
 
 async function recoverDeadWorker() {
   const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId]);
-  const last = await chrome.storage.local.get(["lastJobId"]);
-  const jobId = session[SESSION.jobId] || last.lastJobId;
+  const jobId = session[SESSION.jobId];
+  const wasBusy = Boolean(session[SESSION.busy]);
   await chrome.storage.session.set({ [SESSION.busy]: false, [SESSION.jobId]: "", [SESSION.busyAt]: 0 });
-  if (jobId) {
+  if (wasBusy && jobId) {
     try {
       await api("/api/bridge", { action: "release", jobId });
     } catch {

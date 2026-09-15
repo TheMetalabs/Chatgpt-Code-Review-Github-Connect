@@ -62,3 +62,37 @@ test('real DOM: finished without JSON is detected only after positive completion
  await page.setContent(user+answer('done, but no JSON',true));await page.clock.runFor(6400);
  assert.equal((await page.evaluate(()=>waitResult)).code,'empty');
 });
+
+test('real DOM: only a completed owned run without a new user draft may be closed',async t=>{
+ const page=await fixture(t,user+answer(json,true)+'<textarea id="prompt-textarea"></textarea>');
+ await page.addScriptTag({content:source('extension/content-chatgpt.js')});
+ await page.evaluate(()=>{
+   composer=()=>document.querySelector('textarea');
+   runPrompt=async()=>'{"findings":[]}';
+   handler({type:'ashlar-run',jobId:'A',provider:'chatgpt',runId:'run-A'},null,()=>{});
+ });
+ const inspect=()=>page.evaluate(()=>new Promise(resolve=>handler({type:'ashlar-can-close',jobId:'A',provider:'chatgpt',runId:'run-A'},null,resolve)));
+ assert.equal((await inspect()).canClose,true);
+ await page.locator('textarea').fill('my unsent personal question');
+ assert.equal((await inspect()).canClose,false);
+ await page.locator('textarea').fill('');
+ await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.body.append(u);});
+ assert.equal((await inspect()).reason,'repurposed');
+ const wrong=await page.evaluate(()=>new Promise(resolve=>handler({type:'ashlar-can-close',jobId:'A',provider:'chatgpt',runId:'run-B'},null,resolve)));
+ assert.equal(wrong.code,'job_mismatch');
+});
+
+test('real DOM: simultaneous final responses are extracted without touching the shared clipboard',async t=>{
+ const rawA=JSON.stringify({findings:[],keep:['PR A']}),rawB=JSON.stringify({findings:[],keep:['PR B']});
+ const pages=await Promise.all([fixture(t,user+answer(rawA,true)),fixture(t,user+answer(rawB,true))]);
+ for(const page of pages){
+  await page.evaluate(()=>{
+    window.clipboardReads=0;
+    Object.defineProperty(navigator,'clipboard',{configurable:true,value:{readText:()=>{window.clipboardReads++;throw Error('cross-tab clipboard read');},writeText:()=>{throw Error('clipboard overwrite');}}});
+  });
+  await startWait(page);
+ }
+ await Promise.all(pages.map(page=>page.clock.runFor(3200)));
+ assert.deepEqual(await Promise.all(pages.map(page=>page.evaluate(()=>waitResult.raw))),[rawA,rawB]);
+ assert.deepEqual(await Promise.all(pages.map(page=>page.evaluate(()=>clipboardReads))),[0,0]);
+});

@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {root,json} from './load-source.mjs';
 import {appFixture,eventually} from './app-fixture.mjs';
+import {chatFixtureProxy} from './browser-proxy.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const envelope=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 const html=`<!doctype html><html><body>
@@ -20,14 +21,16 @@ const html=`<!doctype html><html><body>
 test('MV3 E2E: mention → indefinite queue → restart → final JSON → one GitHub review',async t=>{
  const app=await appFixture();t.after(()=>app.close());
  const profile=await mkdtemp(join(tmpdir(),'ashlar-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
+ const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
  const extension=join(root,'extension');
- const context=await chromium.launchPersistentContext(profile,{headless:true,channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
+ const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server},ignoreHTTPSErrors:true,channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
    args:['--no-sandbox',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
  t.after(()=>context.close());
  const diagnostics=[];
  context.on('page',page=>{page.on('pageerror',error=>diagnostics.push(['pageerror',error.message]));page.on('console',msg=>{if(msg.type()==='error')diagnostics.push(['console',msg.text()]);});});
  context.on('requestfailed',request=>diagnostics.push(['requestfailed',request.url(),request.failure()?.errorText]));
- await context.route('https://chatgpt.com/**',route=>{diagnostics.push(['fixture',route.request().url()]);return route.fulfill({status:200,contentType:'text/html',body:html});});
+ // The launch-level local proxy also intercepts the first extension-created tab request.
+ // Default loopback bypass keeps the bridge fixture directly accessible.
  let worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
  await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
  const delivered=app.mention();assert.equal(delivered.queued,true);
@@ -39,7 +42,7 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  try {
    await page.waitForFunction(()=>typeof window.sends==='number'&&typeof window.reply==='function',null,{timeout:8000});
  } catch(error) {
-   console.error('fixture diagnostics',JSON.stringify({events:diagnostics,url:page.url(),html:(await page.content()).slice(0,3000),storage:await worker.evaluate(()=>chrome.storage.local.get(null))}));
+   console.error('fixture diagnostics',JSON.stringify({events:diagnostics,requests:proxy.requests,url:page.url(),html:(await page.content()).slice(0,3000),storage:await worker.evaluate(()=>chrome.storage.local.get(null))}));
    throw error;
  }
  await eventually(async()=>{await worker.evaluate(()=>tick());return page.evaluate(()=>window.sends===1);},'prompt was not submitted');

@@ -182,6 +182,15 @@ export function gateLiveSubmission(
     parsed.push(f);
   });
   const findings = publishableFindings(parsed, settings, snapshot);
+  const rawEmpty = !Array.isArray(submitted.findings) || submitted.findings.length === 0;
+  if (rawEmpty && snapshot.changedPaths.length) {
+    const safe = Array.isArray(submitted.investigated_safe)
+      ? (submitted.investigated_safe as unknown[]).map((x) => String(x).trim()).filter(Boolean)
+      : [];
+    if (!safe.length) {
+      return { ok: false, reason: "empty findings without investigated_safe — Instant-tier skip, not a review" };
+    }
+  }
   for (const f of parsed) {
     if (!findings.includes(f)) dropped.push(`dropped ${f.file}:${f.line} (${f.title})`);
   }

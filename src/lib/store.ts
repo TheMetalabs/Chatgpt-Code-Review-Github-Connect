@@ -296,6 +296,8 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       localLlmBaseUrl: next.localLlmBaseUrl,
       localLlmModel: next.localLlmModel,
       reviewOrder: next.reviewOrder,
+      chatgptReasoning: next.chatgptReasoning,
+      grokReasoning: next.grokReasoning,
     };
     if (next.localLlmApiKey.trim() && !isMaskedSecret(next.localLlmApiKey) && patch.localLlmApiKey && !isMaskedSecret(patch.localLlmApiKey)) {
       body.localLlmApiKey = next.localLlmApiKey;

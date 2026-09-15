@@ -43,13 +43,14 @@ async function api(path, body) {
   return json;
 }
 
-function providerUrl(provider) {
+function providerUrl(provider, reasoning) {
   if (provider === "grok") return "https://grok.com/";
+  if (reasoning === "pro") return "https://chatgpt.com/?temporary-chat=true&model=gpt-6-pro";
   return "https://chatgpt.com/?temporary-chat=true";
 }
 
-async function ensureTab(provider) {
-  const url = providerUrl(provider);
+async function ensureTab(provider, reasoning) {
+  const url = providerUrl(provider, reasoning);
   const tab = await chrome.tabs.create({ url, active: true });
   await waitTab(tab.id);
   await sleep(1500);
@@ -84,7 +85,7 @@ function noReceiver(err) {
 async function sendToTab(tabId, msg, files) {
   const once = () =>
     new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("chat tab timed out")), 200_000);
+      const timer = setTimeout(() => reject(new Error("chat tab timed out")), 330_000);
       chrome.tabs.sendMessage(tabId, msg, (res) => {
         clearTimeout(timer);
         if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
@@ -129,15 +130,15 @@ async function markQuota(provider) {
 
 function contentFiles(provider) {
   return provider === "grok"
-    ? ["composer.js", "quota.js", "content-grok.js"]
-    : ["composer.js", "quota.js", "content-chatgpt.js"];
+    ? ["composer.js", "quota.js", "overlay.js", "model.js", "content-grok.js"]
+    : ["composer.js", "quota.js", "overlay.js", "model.js", "content-chatgpt.js"];
 }
 
-async function runProvider(provider, prompt, jobId) {
-  const tabId = await ensureTab(provider);
+async function runProvider(provider, prompt, jobId, reasoning) {
+  const tabId = await ensureTab(provider, reasoning);
   const files = contentFiles(provider);
   try {
-    const result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId }, files);
+    const result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId, reasoning }, files);
     if (!result?.ok) {
       const err = new Error(`${provider}: ${result?.error || "chat tab returned nothing"}`);
       err.code = result?.code;
@@ -225,7 +226,14 @@ async function tickBody() {
     let settled;
     try {
       settled = await Promise.allSettled(
-        runnable.map((p) => runProvider(p, (job.prompts && job.prompts[p]) || job.prompt, job.jobId)),
+        runnable.map((p) =>
+          runProvider(
+            p,
+            (job.prompts && job.prompts[p]) || job.prompt,
+            job.jobId,
+            (job.reasoning && job.reasoning[p]) || (p === "grok" ? "heavy" : "pro"),
+          ),
+        ),
       );
     } finally {
       clearInterval(keepAlive);

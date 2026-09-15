@@ -179,6 +179,15 @@ describe("gateLiveSubmission", () => {
     }
   });
 
+  it("rejects empty findings that never inspected the snapshot", () => {
+    const gate = gateLiveSubmission(
+      { merge_recommendation: "COMMENT", findings: [] },
+      SAMPLE_PRS["pay-412"],
+      DEFAULT_SETTINGS,
+    );
+    assert.equal(gate.ok, false);
+  });
+
   it("keeps the #421 auth finding and never approves", () => {
     const gate = gateLiveSubmission(
       {

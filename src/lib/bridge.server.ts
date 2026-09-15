@@ -88,6 +88,7 @@ export function nextBridgeJob(): {
   providers: ReviewProvider[];
   prompt: string;
   prompts?: Partial<Record<ReviewProvider, string>>;
+  reasoning: { chatgpt: string; grok: string };
   title: string;
   owner: string;
   repo: string;
@@ -117,6 +118,10 @@ export function nextBridgeJob(): {
     providers,
     prompt,
     prompts,
+    reasoning: {
+      chatgpt: harbor.settings.chatgptReasoning,
+      grok: harbor.settings.grokReasoning,
+    },
     title: job.title,
     owner: job.owner,
     repo: job.repo,

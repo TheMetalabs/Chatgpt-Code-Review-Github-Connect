@@ -4,6 +4,14 @@ import { Button } from "@/components/ui/button";
 import { useAshlar } from "@/lib/store";
 import { DEFAULT_SETTINGS, PROVIDER_LABEL, SECRET_MASK, SECRET_MASK_PEM, isMaskedSecret, normalizeReviewOrder, providersFromSettings } from "@/lib/types";
 import type { BotSettings, GithubReady, ReviewProvider, Severity } from "@/lib/types";
+import {
+  CHATGPT_REASONING,
+  CHATGPT_REASONING_LABEL,
+  GROK_REASONING,
+  GROK_REASONING_LABEL,
+  type ChatgptReasoning,
+  type GrokReasoning,
+} from "@/lib/reasoning";
 
 export const Route = createFileRoute("/settings")({ component: Settings });
 
@@ -67,6 +75,8 @@ function Settings() {
     saved.localLlmApiKeySet,
     saved.webhookSecretSet,
     saved.reviewOrder.join(","),
+    saved.chatgptReasoning,
+    saved.grokReasoning,
   ]);
 
   function patch(p: Partial<typeof draft>) {
@@ -173,6 +183,38 @@ function Settings() {
           <Toggle label="review_grok" checked={draft.reviewGrok} onChange={(v) => toggle("reviewGrok", v)} />
           <Toggle label="review_local" checked={draft.reviewLocal} onChange={(v) => toggle("reviewLocal", v)} />
         </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="chatgpt_reasoning">
+            <select
+              value={draft.chatgptReasoning}
+              onChange={(e) => patch({ chatgptReasoning: e.target.value as ChatgptReasoning })}
+              className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
+            >
+              {CHATGPT_REASONING.map((k) => (
+                <option key={k} value={k}>
+                  {CHATGPT_REASONING_LABEL[k]}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="grok_reasoning">
+            <select
+              value={draft.grokReasoning}
+              onChange={(e) => patch({ grokReasoning: e.target.value as GrokReasoning })}
+              className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
+            >
+              {GROK_REASONING.map((k) => (
+                <option key={k} value={k}>
+                  {GROK_REASONING_LABEL[k]}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+        <p className="-mt-2 text-[12px] text-fg-subtle">
+          Temporary ChatGPT opens Instant; Grok often sits on Fast (빠른). Default is the highest available: 6 Pro and
+          Heavy. The bridge clicks those composer pills before sending the review prompt.
+        </p>
         <p className="-mt-2 text-[12px] text-fg-subtle">
           Up to three reviewers run the same snapshot in parallel. False-positive checks then run in the order
           below (default Local LLM → ChatGPT → Grok), not all-to-all. Save settings writes gitignored
@@ -333,6 +375,8 @@ review:
   chatgpt: ${draft.reviewChatgpt}
   grok: ${draft.reviewGrok}
   local: ${draft.reviewLocal}
+  chatgpt_reasoning: ${draft.chatgptReasoning}
+  grok_reasoning: ${draft.grokReasoning}
   order: [${order.join(", ")}]
 local_llm:
   base_url: ${draft.localLlmBaseUrl || "—"}

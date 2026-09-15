@@ -67,7 +67,6 @@ async function runPrompt(prompt) {
   let hits = 0;
   while (Date.now() < deadline) {
     await sleep(1200);
-    if (quotaHit()) throw quotaError();
     const text = lastAssistant();
     if (!text) continue;
     const json = extractJson(text);

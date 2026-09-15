@@ -24,7 +24,10 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  const context=await chromium.launchPersistentContext(profile,{headless:true,channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
    args:['--no-sandbox',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
  t.after(()=>context.close());
- await context.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',body:html}));
+ const diagnostics=[];
+ context.on('page',page=>{page.on('pageerror',error=>diagnostics.push(['pageerror',error.message]));page.on('console',msg=>{if(msg.type()==='error')diagnostics.push(['console',msg.text()]);});});
+ context.on('requestfailed',request=>diagnostics.push(['requestfailed',request.url(),request.failure()?.errorText]));
+ await context.route('https://chatgpt.com/**',route=>{diagnostics.push(['fixture',route.request().url()]);return route.fulfill({status:200,contentType:'text/html',body:html});});
  let worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
  await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
  const delivered=app.mention();assert.equal(delivered.queued,true);
@@ -33,7 +36,12 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  await eventually(()=>context.pages().some(p=>p.url().startsWith('https://chatgpt.com/')),'chat tab missing');
  const page=context.pages().find(p=>p.url().startsWith('https://chatgpt.com/'));
  // The tab URL can be visible before its first document script has executed.
- await page.waitForFunction(()=>typeof window.sends==='number'&&typeof window.reply==='function');
+ try {
+   await page.waitForFunction(()=>typeof window.sends==='number'&&typeof window.reply==='function',null,{timeout:8000});
+ } catch(error) {
+   console.error('fixture diagnostics',JSON.stringify({events:diagnostics,url:page.url(),html:(await page.content()).slice(0,3000),storage:await worker.evaluate(()=>chrome.storage.local.get(null))}));
+   throw error;
+ }
  await eventually(async()=>{await worker.evaluate(()=>tick());return page.evaluate(()=>window.sends===1);},'prompt was not submitted');
  let job=app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId);
  assert.equal(job.status,'awaiting_chat');assert.equal(job.storedLegs.length,0);

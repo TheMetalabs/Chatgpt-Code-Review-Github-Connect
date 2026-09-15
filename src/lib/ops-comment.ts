@@ -15,6 +15,11 @@ export function opsCommentAllowed(job: { trigger: Trigger }): boolean {
   return job.trigger === "issue_comment.mention" || job.trigger === "pull_request_review_comment.followup";
 }
 
+/** ChatGPT / Local / bridge LLM work only on explicit mention (or documented mention token / follow-up). */
+export function llmWorkAllowed(job: { trigger: Trigger }): boolean {
+  return opsCommentAllowed(job);
+}
+
 export function buildOpsComment(input: OpsCommentInput): string {
   const reviewers = describeEnabledReviewers(input.providers);
   const status =

@@ -1,7 +1,10 @@
 const POLL_MS = 2500;
 const PING_MS = 10_000;
+/** MV3-safe keepalive; chrome.alarms min period is 1 minute — pair with setInterval. */
+const KEEPALIVE_ALARM = "ashlar-keepalive";
+const KEEPALIVE_ALARM_MINUTES = 1;
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
-const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt", tabs: "tabs" };
+const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt", tabs: "tabs", generating: "generating" };
 
 function formatRetry(until) {
   if (!until) return "later";
@@ -157,7 +160,39 @@ async function harvestTab(provider, tabId) {
   return null;
 }
 
-async function runProvider(provider, prompt, jobId, reasoning) {
+function isBusyResult(result) {
+  if (!result || result.ok) return false;
+  if (result.code === "busy" || result.retry === true) return true;
+  return /already running|busy/i.test(String(result.error || ""));
+}
+
+/** Wait without wall-clock cap while the tab is mid-generation. */
+async function waitWhileBusy(provider, tabId, jobId, generating) {
+  for (;;) {
+    if (generating) {
+      generating[provider] = true;
+      void ping(jobId, generating);
+    }
+    await sleep(2000);
+    const hit = await harvestTab(provider, tabId);
+    if (hit) return { provider, raw: hit.raw };
+    try {
+      const again = await sendToTab(tabId, { type: "ashlar-harvest" }, contentFiles(provider));
+      if (again?.ok && again.raw) return { provider, raw: again.raw };
+      if (!isBusyResult(again) && again && again.ok === false && again.code && again.code !== "busy") {
+        const err = new Error(`${provider}: ${again.error || "chat tab returned nothing"}`);
+        err.code = again.code;
+        throw err;
+      }
+    } catch (e) {
+      if (!noReceiver(e)) {
+        /* keep polling while tab exists */
+      }
+    }
+  }
+}
+
+async function runProvider(provider, prompt, jobId, reasoning, generating) {
   const files = contentFiles(provider);
   const known = await tabFor(jobId, provider);
   if (known) {
@@ -166,6 +201,7 @@ async function runProvider(provider, prompt, jobId, reasoning) {
     try {
       const result = await sendToTab(known, { type: "ashlar-run", prompt, jobId, reasoning }, files);
       if (result?.ok && result.raw) return { provider, raw: result.raw };
+      if (isBusyResult(result)) return waitWhileBusy(provider, known, jobId, generating);
     } catch {
       /* fall through to a new tab only if this one is gone */
     }
@@ -174,15 +210,17 @@ async function runProvider(provider, prompt, jobId, reasoning) {
   await rememberTab(jobId, provider, tabId);
   try {
     const result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId, reasoning }, files);
-    if (!result?.ok) {
-      const again = await harvestTab(provider, tabId);
-      if (again) return { provider, raw: again.raw };
-      const err = new Error(`${provider}: ${result?.error || "chat tab returned nothing"}`);
-      err.code = result?.code;
-      throw err;
-    }
-    return { provider, raw: result.raw };
+    if (result?.ok && result.raw) return { provider, raw: result.raw };
+    if (isBusyResult(result)) return waitWhileBusy(provider, tabId, jobId, generating);
+    const again = await harvestTab(provider, tabId);
+    if (again) return { provider, raw: again.raw };
+    const err = new Error(`${provider}: ${result?.error || "chat tab returned nothing"}`);
+    err.code = result?.code;
+    throw err;
   } catch (e) {
+    if (e && typeof e === "object" && e.code === "busy") {
+      return waitWhileBusy(provider, tabId, jobId, generating);
+    }
     const again = await harvestTab(provider, tabId);
     if (again) return { provider, raw: again.raw };
     throw e;
@@ -229,8 +267,13 @@ async function tick() {
 async function tickBody() {
   const cfg = await settings();
   if (!cfg.enabled || !cfg.origin || !cfg.token) return;
-  const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId, SESSION.busyAt]);
-  await ping(session[SESSION.jobId]);
+  const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId, SESSION.busyAt, SESSION.generating]);
+  const liveGenerating =
+    session[SESSION.generating] && typeof session[SESSION.generating] === "object"
+      ? session[SESSION.generating]
+      : undefined;
+  // While busy, always include current generating map so claim stays alive for long jobs.
+  await ping(session[SESSION.jobId], liveGenerating);
   if (session[SESSION.busy]) return;
   const quota = await quotaMap();
   if (!providerOpen(quota, "chatgpt") && !providerOpen(quota, "grok")) {
@@ -260,7 +303,12 @@ async function tickBody() {
     }
     return;
   }
-  await chrome.storage.session.set({ [SESSION.busy]: true, [SESSION.jobId]: job.jobId, [SESSION.busyAt]: Date.now() });
+  await chrome.storage.session.set({
+    [SESSION.busy]: true,
+    [SESSION.jobId]: job.jobId,
+    [SESSION.busyAt]: Date.now(),
+    [SESSION.generating]: {},
+  });
   chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
   let claimed = true;
   try {
@@ -282,24 +330,34 @@ async function tickBody() {
       await api("/api/bridge", { action: "release", jobId: job.jobId });
       return;
     }
-    void ping(job.jobId, generating);
-    const keepAlive = setInterval(() => void ping(job.jobId, generating), PING_MS);
+    const persistGenerating = async () => {
+      await chrome.storage.session.set({ [SESSION.generating]: { ...generating } });
+      await ping(job.jobId, generating);
+    };
+    void persistGenerating();
+    const keepAlive = setInterval(() => void persistGenerating(), PING_MS);
+    try {
+      await chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
+    } catch {
+      /* alarms may be unavailable in some test stubs */
+    }
     const results = [];
     let quotaOnly = true;
     try {
       const settled = await Promise.allSettled(
         runnable.map(async (p) => {
           generating[p] = true;
-          void ping(job.jobId, generating);
+          void persistGenerating();
           try {
             const value = await runProvider(
               p,
               (job.prompts && job.prompts[p]) || job.prompt,
               job.jobId,
               (job.reasoning && job.reasoning[p]) || (p === "grok" ? "heavy" : "pro"),
+              generating,
             );
             generating[p] = false;
-            void ping(job.jobId, generating);
+            void persistGenerating();
             results.push(value);
             quotaOnly = false;
             try {
@@ -314,9 +372,33 @@ async function tickBody() {
             }
             return value;
           } catch (e) {
-            generating[p] = false;
-            void ping(job.jobId, generating);
             const code = e && typeof e === "object" && "code" in e ? e.code : "";
+            if (code === "busy") {
+              // Keep generating=true; poll harvest instead of failing the job.
+              generating[p] = true;
+              void persistGenerating();
+              const tabId = await tabFor(job.jobId, p);
+              if (tabId) {
+                const waited = await waitWhileBusy(p, tabId, job.jobId, generating);
+                generating[p] = false;
+                void persistGenerating();
+                results.push(waited);
+                quotaOnly = false;
+                try {
+                  await api("/api/bridge", {
+                    action: "complete",
+                    jobId: job.jobId,
+                    raw: waited.raw,
+                    results: results.slice(),
+                  });
+                } catch {
+                  /* already posted or not awaiting */
+                }
+                return waited;
+              }
+            }
+            generating[p] = false;
+            void persistGenerating();
             if (code === "quota") await markQuota(p);
             else quotaOnly = false;
             throw e;
@@ -336,6 +418,11 @@ async function tickBody() {
       await api("/api/bridge", { action: "release", jobId: job.jobId });
     } finally {
       clearInterval(keepAlive);
+      try {
+        await chrome.alarms.clear(KEEPALIVE_ALARM);
+      } catch {
+        /* ignore */
+      }
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -349,7 +436,12 @@ async function tickBody() {
       }
     }
   } finally {
-    await chrome.storage.session.set({ [SESSION.busy]: false, [SESSION.jobId]: "", [SESSION.busyAt]: 0 });
+    await chrome.storage.session.set({
+      [SESSION.busy]: false,
+      [SESSION.jobId]: "",
+      [SESSION.busyAt]: 0,
+      [SESSION.generating]: {},
+    });
   }
 }
 
@@ -359,7 +451,7 @@ function loop() {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ashlar-poll") void tick();
+  if (alarm.name === "ashlar-poll" || alarm.name === KEEPALIVE_ALARM) void tick();
 });
 chrome.runtime.onInstalled.addListener(loop);
 chrome.runtime.onStartup.addListener(loop);

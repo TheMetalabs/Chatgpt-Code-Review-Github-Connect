@@ -124,11 +124,18 @@ async function waitUntilReviewOrQuota(name) {
   let emptyTicks = 0;
   let sawStop = false;
   let copied = false;
+  // No wall-clock abort: ChatGPT/Local can sit in queue then generate for 10+ minutes.
+  // Only reliable UI/completion signals end the wait (reply toolbar, valid JSON, real quota).
   for (;;) {
-    if (typeof stopButtonVisible === "function" && stopButtonVisible()) sawStop = true;
-    const done = typeof chatGenerationFinished === "function" ? chatGenerationFinished(sawStop) : sawStop && !stopButtonVisible();
-    let json = harvestJson({ allowThin: done });
-    if (!json && done && !copied) {
+    const stopVisible = typeof stopButtonVisible === "function" && stopButtonVisible();
+    if (stopVisible) sawStop = true;
+    const replyDone = typeof replyDoneVisible === "function" && replyDoneVisible();
+    const done =
+      typeof chatGenerationFinished === "function"
+        ? chatGenerationFinished({ stopVisible, replyActionsVisible: replyDone, sawStop })
+        : replyDone;
+    let json = harvestJson({ allowThin: replyDone });
+    if (!json && replyDone && !copied) {
       copied = true;
       json = await harvestViaCopy();
     }
@@ -144,11 +151,12 @@ async function waitUntilReviewOrQuota(name) {
         hits = 1;
       }
       if (done && hits >= 1) return json;
-      if (hits >= 2 && sawStop && typeof stopButtonVisible === "function" && !stopButtonVisible()) return json;
+      if (hits >= 2 && replyDone) return json;
       emptyTicks = 0;
-    } else if (done) {
+    } else if (replyDone) {
+      // Only count empty after reply toolbar says done — never after sawStop flicker alone.
       emptyTicks += 1;
-      if (emptyTicks >= 3) throw emptyReplyError(name);
+      if (emptyTicks >= 6) throw emptyReplyError(name);
     } else {
       emptyTicks = 0;
     }

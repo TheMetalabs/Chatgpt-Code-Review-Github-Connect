@@ -316,7 +316,8 @@ export function claimedReviewerNote(providers: readonly ReviewProvider[]): strin
   return `Chrome bridge claimed this job. ${chat.map((p) => PROVIDER_LABEL[p]).join(" and ")} run in parallel.`;
 }
 
-export const BRIDGE_CLAIM_MS = 4 * 60_000;
+/** Soft TTL; refreshed by extension ping. Ignored while generating[p]===true (see bridge.server). */
+export const BRIDGE_CLAIM_MS = 20 * 60_000;
 /** Chrome MV3 alarms are ≥1 minute; keep connected across that gap. */
 export const BRIDGE_CONNECTED_MS = 120_000;
 

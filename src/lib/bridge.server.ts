@@ -151,7 +151,7 @@ export function takeNextBridgeJob(): ReturnType<typeof nextBridgeJob> {
 
 export function promptForJob(jobId: string): { prompt: string; prompts?: Partial<Record<ReviewProvider, string>> } | null {
   const job = getHarbor().jobs.find((j) => j.id === jobId);
-  if (!job || job.status !== "awaiting_chat") return null;
+  if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) return null;
   const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok;
   if (!prompt) return null;
   return { prompt, prompts: job.chatPromptByProvider };
@@ -201,17 +201,49 @@ export function releaseBridgeJob(jobId: string) {
   }
 }
 
+/** Terminal provider failures are idempotent and never restart a model request. */
+export function failBridgeProvider(jobId: string, provider: ReviewProvider, error: string) {
+  if (!isChatProvider(provider)) return;
+  patchHarborJob(jobId, (j) => {
+    if (j.status !== "awaiting_chat" || !llmWorkAllowed(j)) return j;
+    if (j.storedLegs?.some((leg) => leg.provider === provider && leg.raw.trim())) return j;
+    const prefix = `Skipped ${provider}:`;
+    return {
+      ...j,
+      generating: { ...(j.generating ?? {}), [provider]: false },
+      attemptedProviders: [...new Set([...(j.attemptedProviders ?? []), provider])],
+      assumptions: [
+        ...(j.assumptions ?? []).filter((note) => !note.startsWith(prefix)),
+        `${prefix} ${error.replace(/\s+/g, " ").slice(0, 400)}`,
+      ],
+      updatedAt: Date.now(),
+    };
+  });
+}
+
 export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatLeg[]) {
-  const done = new Set((legs ?? []).map((l) => l.provider));
-  if (raw.trim() && !legs?.length) done.add("chatgpt");
-  patchHarborJob(jobId, (j) => ({
-    ...j,
-    generating: {
-      ...(j.generating ?? {}),
-      ...Object.fromEntries([...done].map((p) => [p, false])),
-    },
-    updatedAt: Date.now(),
-  }));
+  const incoming: ChatLeg[] = legs?.length ? legs : raw.trim() ? [{ provider: "chatgpt", raw }] : [];
+  patchHarborJob(jobId, (j) => {
+    if (j.status !== "awaiting_chat") return j;
+    const accepted = incoming.filter((leg) => leg.raw.trim() &&
+      (!j.reviewProviders?.length || j.reviewProviders.includes(leg.provider)));
+    const stored = [...(j.storedLegs ?? [])];
+    for (const leg of accepted) {
+      const index = stored.findIndex((old) => old.provider === leg.provider);
+      if (index < 0) stored.push(leg);
+      else stored[index] = leg;
+    }
+    // The watcher must never observe generating=false without the corresponding raw.
+    return {
+      ...j,
+      storedLegs: stored,
+      generating: {
+        ...(j.generating ?? {}),
+        ...Object.fromEntries(accepted.map((leg) => [leg.provider, false])),
+      },
+      updatedAt: Date.now(),
+    };
+  });
   const out = await submitHarborChat(jobId, raw, legs);
   if (!out.ok) {
     releaseBridgeJob(jobId);

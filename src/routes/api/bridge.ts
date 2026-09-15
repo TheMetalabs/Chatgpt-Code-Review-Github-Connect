@@ -4,6 +4,7 @@ import {
   bridgeTokenOk,
   claimBridgeJob,
   completeBridgeJob,
+  failBridgeProvider,
   getBridgePublic,
   getBridgeStatus,
   promptForJob,
@@ -64,6 +65,8 @@ export const Route = createFileRoute("/api/bridge")({
           token?: string;
           jobId?: string;
           raw?: string;
+          provider?: string;
+          error?: string;
           results?: { provider?: string; raw?: string }[];
           generating?: Partial<Record<"chatgpt" | "grok" | "local", boolean>>;
         };
@@ -105,6 +108,13 @@ export const Route = createFileRoute("/api/bridge")({
         }
         if (body.action === "release" && body.jobId) {
           releaseBridgeJob(body.jobId);
+          return Response.json({ ok: true }, { headers });
+        }
+        if (body.action === "failure" && body.jobId) {
+          if (body.provider !== "chatgpt" && body.provider !== "grok") {
+            return Response.json({ ok: false, error: "invalid chat provider" }, { status: 400, headers });
+          }
+          failBridgeProvider(body.jobId, body.provider, String(body.error || "chat review failed"));
           return Response.json({ ok: true }, { headers });
         }
         if (body.action === "complete" && body.jobId) {

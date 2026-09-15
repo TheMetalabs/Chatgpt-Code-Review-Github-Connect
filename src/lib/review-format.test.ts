@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { FINDING_412 } from "./samples.ts";
-import { CODEX_CLEAN_REVIEW, inlineFindingComment, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
+import { CLEAN_REVIEW_BODY, inlineFindingComment, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
 
 describe("review-format", () => {
   it("matches Codex P1 badge markup on inline comments", () => {
@@ -20,8 +20,9 @@ describe("review-format", () => {
 
   it("uses a Codex-style summary for zero and non-zero findings", () => {
     const empty = reviewSummaryBody({ headSha: "bd663b721d", reviewProviders: ["chatgpt", "grok"], assumptions: [] }, [], "ashlar-bot");
-    assert.equal(empty, CODEX_CLEAN_REVIEW);
-    assert.equal(empty, "Codex Review: Didn't find any major issues.");
+    assert.equal(empty, CLEAN_REVIEW_BODY);
+    assert.equal(empty, "Didn't find any major issues.");
+    assert.doesNotMatch(empty, /Codex/);
     const full = reviewSummaryBody({ headSha: "bd663b721d", reviewProviders: ["chatgpt", "grok", "local"], assumptions: [] }, [FINDING_412], "ashlar-bot");
     assert.match(full, /Here are some automated review suggestions/);
     assert.match(full, /\| P1 \| 1 \|/);

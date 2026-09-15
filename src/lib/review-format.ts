@@ -8,8 +8,8 @@ const BADGE: Record<Severity, string> = {
 
 export const REVIEW_SUMMARY_MARK = "<!-- ashlar-review-summary -->";
 
-/** Exact Codex clean-pass copy. Review-loop scripts match this string. */
-export const CODEX_CLEAN_REVIEW = "Codex Review: Didn't find any major issues.";
+/** Clean-pass review body. Loop scripts match this string. */
+export const CLEAN_REVIEW_BODY = "Didn't find any major issues.";
 
 export function severityBadgeMarkdown(severity: Severity): string {
   return `**<sub><sub>![${severity} Badge](${BADGE[severity]})</sub></sub>**`;
@@ -44,7 +44,7 @@ export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" |
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = providers.includes("local");
   if (!findings.length) {
-    return CODEX_CLEAN_REVIEW;
+    return CLEAN_REVIEW_BODY;
   }
   return `${REVIEW_SUMMARY_MARK}
 

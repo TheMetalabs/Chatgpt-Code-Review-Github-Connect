@@ -47,8 +47,12 @@ async function selectReasoning(provider, level) {
   if (!pill) return;
   if (hit(want, pillText(pill))) return;
   pill.click();
-  await sleep(400);
-  const items = [...document.querySelectorAll("[role='menuitem'], [role='option'], [role='menuitemradio']")];
+  await sleep(800);
+  const items = [
+    ...document.querySelectorAll(
+      "[role='menuitem'], [role='option'], [role='menuitemradio'], [data-radix-collection-item], [cmdk-item]",
+    ),
+  ];
   for (const key of fallback) {
     const el = items.find((n) => hit(key, pillText(n)));
     if (el instanceof HTMLElement) {

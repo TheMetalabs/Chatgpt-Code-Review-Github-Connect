@@ -270,6 +270,8 @@ export function providersFromSettings(
 }
 
 export const BRIDGE_CLAIM_MS = 4 * 60_000;
+/** Chrome MV3 alarms are ≥1 minute; keep connected across that gap. */
+export const BRIDGE_CONNECTED_MS = 120_000;
 
 export const LIVE_INFLIGHT_STATUSES: JobStatus[] = [
   "queued",

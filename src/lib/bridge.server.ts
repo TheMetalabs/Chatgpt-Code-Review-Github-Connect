@@ -1,7 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider } from "./types";
-import { BRIDGE_CLAIM_MS, isChatProvider, providersFromSettings } from "./types";
+import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, isChatProvider, providersFromSettings } from "./types";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 
@@ -49,7 +49,7 @@ export type BridgePublic = Omit<BridgeStatus, "token">;
 export function getBridgeStatus(): BridgeStatus {
   return {
     token: meta.token,
-    connected: meta.lastSeen > 0 && Date.now() - meta.lastSeen < 15_000,
+    connected: meta.lastSeen > 0 && Date.now() - meta.lastSeen < BRIDGE_CONNECTED_MS,
     lastSeen: meta.lastSeen,
     lastJobId: meta.lastJobId,
     lastError: meta.lastError,
@@ -138,6 +138,13 @@ export function promptForJob(jobId: string): { prompt: string; prompts?: Partial
   const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok;
   if (!prompt) return null;
   return { prompt, prompts: job.chatPromptByProvider };
+}
+
+export function refreshBridgeClaim(jobId: string) {
+  const job = getHarbor().jobs.find((j) => j.id === jobId);
+  if (!job || job.status !== "awaiting_chat") return;
+  patchHarborJob(jobId, (j) => ({ ...j, bridgeClaimedAt: Date.now(), updatedAt: Date.now() }));
+  meta.lastJobId = jobId;
 }
 
 export function claimBridgeJob(jobId: string): { ok: true } | { ok: false; error: string } {

@@ -7,6 +7,7 @@ import {
   getBridgePublic,
   getBridgeStatus,
   promptForJob,
+  refreshBridgeClaim,
   releaseBridgeJob,
   rotateBridgeToken,
   takeNextBridgeJob,
@@ -54,7 +55,7 @@ export const Route = createFileRoute("/api/bridge")({
           if (!prompt) return Response.json({ ok: false, error: "no prompt" }, { status: 404, headers });
           return Response.json({ ok: true, ...prompt }, { headers });
         }
-        return Response.json({ ok: true, bridge: getBridgePublic(), job: takeNextBridgeJob() }, { headers });
+        return Response.json({ ok: true, bridge: getBridgePublic(), job: null }, { headers });
       },
       POST: async ({ request }) => {
         const headers = corsHeaders(request);
@@ -79,7 +80,11 @@ export const Route = createFileRoute("/api/bridge")({
           return Response.json({ ok: true, token: rotateBridgeToken().token, bridge: getBridgePublic() }, { headers });
         }
         if (body.action === "ping") {
+          if (body.jobId) refreshBridgeClaim(body.jobId);
           return Response.json({ ok: true, bridge: getBridgePublic() }, { headers });
+        }
+        if (body.action === "take") {
+          return Response.json({ ok: true, bridge: getBridgePublic(), job: takeNextBridgeJob() }, { headers });
         }
         if (body.action === "claim" && body.jobId) {
           const out = claimBridgeJob(body.jobId);

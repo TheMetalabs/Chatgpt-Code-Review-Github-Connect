@@ -74,7 +74,7 @@ GitHub App 페이지의 **Permissions** (Repository permissions). Organization p
 | UI 라벨 | Access | 왜 |
 | --- | --- | --- |
 | **Contents** | Read-only | PR 파일 / 정책 파일 스냅샷 |
-| **Issues** | Read & write | `@ashlar-bot` 댓글 읽기 + 👀/👍/😕 리액션 |
+| **Issues** | Read & write | `@ashlar-bot` 댓글 읽기, 👀/👍/😕 리액션, 브릿지 단절 등 운영 상태 코멘트 |
 | **Metadata** | Read-only | 자동. 끌 수 없음 |
 | **Pull requests** | Read & write | diff, 리뷰 게시 |
 

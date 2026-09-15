@@ -492,6 +492,32 @@ export async function createPullReview(
   return { id: out.data.id };
 }
 
+export async function createIssueComment(
+  token: string,
+  opts: { owner: string; repo: string; pr: number; body: string },
+): Promise<{ id: number }> {
+  const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/issues/${opts.pr}/comments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body: opts.body }),
+  });
+  if (!out.ok) throw new Error(`GitHub issue comment ${out.status}: ${out.text}`);
+  if (!out.data.id) throw new Error("comment missing id");
+  return { id: out.data.id };
+}
+
+export async function updateIssueComment(
+  token: string,
+  opts: { owner: string; repo: string; commentId: number; body: string },
+): Promise<void> {
+  const out = await gh(token, `/repos/${opts.owner}/${opts.repo}/issues/comments/${opts.commentId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body: opts.body }),
+  });
+  if (!out.ok) throw new Error(`GitHub issue comment update ${out.status}: ${out.text}`);
+}
+
 export type GithubReaction = "eyes" | "+1" | "confused";
 
 /** Ack on the triggering comment, or on the PR when there isn't one. Failures are non-fatal. */

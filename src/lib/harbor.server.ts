@@ -11,9 +11,10 @@ import {
 } from "./samples";
 import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
-import { createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, type GithubReaction } from "./github.server";
+import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, buildFpPrompt, parseChatSubmission } from "./chat-prompt";
 import { runLocalLlm } from "./local-llm.server";
+import { buildOpsComment, type OpsPhase } from "./ops-comment";
 import {
   applyFpStep,
   buildReview,
@@ -30,6 +31,7 @@ import { sleep } from "./utils";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import {
+  BRIDGE_CLAIM_MS,
   LIVE_INFLIGHT_STATUSES,
   isChatProvider,
   localLlmReady,
@@ -237,6 +239,90 @@ async function reactQuiet(token: string, job: Job, content: GithubReaction) {
   }
 }
 
+async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, notes: string[]) {
+  const job = state.jobs.find((j) => j.id === jobId);
+  if (!job || job.origin !== "github") return;
+  const body = buildOpsComment({
+    phase,
+    providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
+    notes,
+  });
+  try {
+    if (job.opsCommentId) {
+      await updateIssueComment(token, {
+        owner: job.owner,
+        repo: job.repo,
+        commentId: job.opsCommentId,
+        body,
+      });
+      return;
+    }
+    const created = await createIssueComment(token, {
+      owner: job.owner,
+      repo: job.repo,
+      pr: job.pr,
+      body,
+    });
+    patchJob(jobId, (j) => ({ ...j, opsCommentId: created.id, updatedAt: Date.now() }));
+  } catch {
+    /* same as reactions: never fail the review if the status comment cannot post */
+  }
+}
+
+async function bridgeSnapshot() {
+  const { getBridgePublic } = await import("./bridge.server");
+  return getBridgePublic();
+}
+
+const BRIDGE_GRACE_MS = 25_000;
+const WATCH_TICK_MS = 5_000;
+const WATCH_CAP_MS = 8 * 60_000;
+
+async function watchReviewers(jobId: string, token: string) {
+  const started = Date.now();
+  let lastNotes = "";
+  while (Date.now() - started < WATCH_CAP_MS) {
+    const job = state.jobs.find((j) => j.id === jobId);
+    if (!job) return;
+    if (job.status === "cancelled" || job.status === "posted" || job.status === "skipped" || job.status === "dlq") return;
+    if (job.status !== "awaiting_chat" && job.status !== "reviewer") return;
+
+    const bridge = await bridgeSnapshot();
+    const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
+    const chat = (job.reviewProviders ?? []).filter(isChatProvider);
+    const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
+    const localSkip = (job.assumptions ?? []).find((a) => a.startsWith("Skipped local"));
+    const notes: string[] = [];
+    if (chat.length && !bridge.connected && !claimed) {
+      notes.push("Chrome bridge is not connected. ChatGPT/Grok start in parallel when the extension reconnects.");
+    } else if (claimed) {
+      notes.push("Chrome bridge claimed this job. ChatGPT and Grok run in parallel.");
+    }
+    if (localSkip) notes.push(`${localSkip} — skipped, does not block other reviewers.`);
+    else if (localLeg) notes.push("Local LLM finished in the background.");
+    else if ((job.reviewProviders ?? []).includes("local")) notes.push("Local LLM is running in the background and will not block ChatGPT/Grok.");
+
+    const phase: OpsPhase = chat.length && !bridge.connected && !claimed ? "blocked" : "running";
+    const key = `${phase}|${notes.join("|")}`;
+    if (key !== lastNotes) {
+      await upsertOpsComment(token, jobId, phase, notes);
+      lastNotes = key;
+    }
+
+    const waitingChat = job.status === "awaiting_chat" && chat.length && !bridge.connected && !claimed;
+    if (waitingChat && Date.now() - started >= BRIDGE_GRACE_MS && localLeg) {
+      await upsertOpsComment(token, jobId, "running", [
+        ...notes,
+        "Posting from local LLM. ChatGPT/Grok skipped because the bridge stayed disconnected.",
+      ]);
+      await submitHarborChat(jobId, localLeg.raw, [localLeg]);
+      return;
+    }
+
+    await sleep(WATCH_TICK_MS);
+  }
+}
+
 async function playGithub(jobId: string, untrustedBody: string) {
   const current = () => state.jobs.find((j) => j.id === jobId);
   const live0 = current();
@@ -316,6 +402,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
       updatedAt: Date.now(),
     }));
     void reactQuiet(token, live0, "confused");
+    void upsertOpsComment(token, jobId, "failed", ["Could not load the pull snapshot. No review posted."]);
     return;
   }
 
@@ -378,6 +465,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
         githubError: `local LLM: ${local.error}`,
         updatedAt: Date.now(),
       }));
+      void upsertOpsComment(token, jobId, "failed", [`Local LLM failed (${local.error}). No other reviewer is enabled.`]);
       return;
     }
     patchJob(jobId, (j) => ({
@@ -408,6 +496,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     storedLegs: [],
     updatedAt: Date.now(),
   }));
+  void watchReviewers(jobId, token);
   if (providers.includes("local")) void attachLocalLeg(jobId, prompt);
 }
 
@@ -764,6 +853,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       updatedAt: Date.now(),
     }));
     if (token) void reactQuiet(token, after, "+1");
+    if (token) void upsertOpsComment(token, jobId, "skipped", ["No findings passed the precision policy. No review posted."]);
     return;
   }
 
@@ -798,6 +888,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
         updatedAt: Date.now(),
       }));
       void reactQuiet(token, after, "confused");
+      void upsertOpsComment(token, jobId, "failed", ["GitHub Reviews API failed. Findings were not posted."]);
       return;
     }
   }
@@ -829,6 +920,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
     ),
   };
   if (token) void reactQuiet(token, after, "+1");
+  if (token) void upsertOpsComment(token, jobId, "posted", ["Review posted. Reviewers that failed were skipped."]);
 }
 
 function enqueueFromDecision(

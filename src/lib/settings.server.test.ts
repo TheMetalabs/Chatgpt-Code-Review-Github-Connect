@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { sanitizeBotSettings } from "./settings.server.ts";
+import { botSettingsToEnv, sanitizeBotSettings } from "./settings.server.ts";
 import { DEFAULT_SETTINGS } from "./types.ts";
 
 describe("sanitizeBotSettings", () => {
@@ -24,5 +24,18 @@ describe("sanitizeBotSettings", () => {
     const s = sanitizeBotSettings({ reviewChatgpt: false, reviewGrok: false, reviewLocal: false });
     assert.equal(s.reviewChatgpt, true);
     assert.equal(s.username, DEFAULT_SETTINGS.username);
+  });
+
+  it("round-trips reviewer flags into env keys", () => {
+    const env = botSettingsToEnv({
+      ...DEFAULT_SETTINGS,
+      reviewLocal: true,
+      reviewChatgpt: false,
+      reviewGrok: true,
+      localLlmModel: "qwen",
+    });
+    assert.equal(env.ASHLAR_REVIEW_LOCAL, "true");
+    assert.equal(env.ASHLAR_REVIEW_CHATGPT, "false");
+    assert.equal(env.ASHLAR_LOCAL_LLM_MODEL, "qwen");
   });
 });

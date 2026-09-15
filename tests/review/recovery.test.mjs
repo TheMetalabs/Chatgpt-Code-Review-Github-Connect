@@ -84,13 +84,15 @@ test('two provider outcomes stay independent across a restart', async () => {
   assert.equal(s.received.filter(c => c.action === 'complete').length, 1);
   assert.ok(s.received.some(c => c.action === 'failure' && c.provider === 'grok'));
 });
-test('a confirmed cancellation retires state without touching the tab', async () => {
-  const s = server([job('A')]); let cancelled = false;
-  const api = (p, b) => { if (!b && cancelled) throw Object.assign(new Error('no prompt'), { status: 404 }); return s.api(p, b); };
-  const b = background({ api }); await b.tick(); cancelled = true;
+test('a missing prompt alone leaves the original pending tab recoverable', async () => {
+  const s = server([job('A')]); let missing = false;
+  const api = (p, b) => { if (!b && missing) throw Object.assign(new Error('no prompt'), { status: 404 }); return s.api(p, b); };
+  const b = background({ api }); await b.tick(); missing = true;
+  delete b.local.state.pendingReviewJobs.A.prompt; // Migrated job needs to retrieve its prompt.
   const count = b.messages.length; await b.tick();
   assert.equal(b.messages.length, count);
-  assert.equal(Object.keys(b.local.state.pendingReviewJobs).length, 0);
+  assert.ok(b.local.state.pendingReviewJobs.A);
+  assert.equal(b.closedTabs.length, 0);
 });
 test('success is delivered before any generating=false heartbeat', async () => {
   const s = server([job('A')]); let ready = false, completed = false;

@@ -70,27 +70,6 @@ function assistantCorpus() {
   return chunks;
 }
 
-async function harvestViaCopy() {
-  const root = currentAssistantRoot();
-  if (!root) return null;
-  const btn = [...root.querySelectorAll('[data-testid="copy-turn-action-button"]')]
-    .reverse()
-    .find((el) => /응답 복사|Copy response/i.test(el.getAttribute("aria-label") || ""));
-  if (!btn) return null;
-  try {
-    // Do not interpret a review left in the clipboard by a previous job as this reply.
-    const marker = `ashlar-copy-${Date.now()}-${Math.random()}`;
-    await navigator.clipboard.writeText(marker);
-    btn.click();
-    await sleep(250);
-    const text = await navigator.clipboard.readText();
-    if (text === marker) return null;
-    return extractChatJson(text);
-  } catch {
-    return null;
-  }
-}
-
 function harvestJson(opts) {
   const allowThin = Boolean(opts && opts.allowThin);
   const chunks = assistantCorpus();
@@ -120,7 +99,7 @@ async function waitUntilReviewOrQuota(name) {
       replyActionsVisible: replyDoneVisible(),
     });
     let json = done ? harvestJson({ allowThin: true }) : null;
-    if (done && !json && emptyTicks % 2 === 0) json = await harvestViaCopy();
+    // Never use the shared system clipboard: simultaneous tabs can overwrite it.
     if (quotaHit() && !json) {
       const e = new Error(`${name} usage limit`);
       e.code = "quota";
@@ -144,6 +123,13 @@ async function waitUntilReviewOrQuota(name) {
 /** Short message replies keep MV3 workers recoverable; the page owns the long model call.
  * State survives script reinjection and retains terminal outcomes for a restarted worker.
  */
+function reviewPageContext() {
+  const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  const last = users.at(-1);
+  return JSON.stringify([globalThis.location?.href || "", users.length,
+    last?.getAttribute("data-message-id") || "", last?.textContent || ""]);
+}
+
 function installReviewRunner(name, run) {
   let boundJob = "";
   try { boundJob = sessionStorage.getItem("ashlar:job") || ""; } catch { /* unavailable storage */ }
@@ -151,18 +137,43 @@ function installReviewRunner(name, run) {
     { running: false, jobId: boundJob, result: null };
   globalThis.__ashlarRunnerState = state;
   state.run = run;
-  if (state.listener) return;
+  state.provider = name.toLowerCase();
+  if (!state.runId) {
+    try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
+  }
+  if (state.listener && state.protocol === "tab-cleanup-v1") return;
+  if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
+  state.protocol = "tab-cleanup-v1";
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending" });
   state.listener = (msg, _sender, reply) => {
-    if (msg?.type !== "ashlar-run" && msg?.type !== "ashlar-harvest") return;
+    if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close"].includes(msg?.type)) return;
     const respond = reply;
-    reply = value => respond({...value, jobId: state.jobId});
+    reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId});
     if (!msg.jobId) {
       reply({ ok: false, code: "job_mismatch", error: "jobId is required" });
       return;
     }
-    if (state.jobId && msg.jobId !== state.jobId) {
+    if ((state.jobId && msg.jobId !== state.jobId) ||
+        (msg.provider && msg.provider !== state.provider) ||
+        (state.runId && msg.runId && msg.runId !== state.runId)) {
       reply({ ok: false, code: "job_mismatch", error: "tab belongs to another job" });
+      return;
+    }
+    // Upgrade only an already matching job binding; never adopt an unrelated chat.
+    if (state.jobId === msg.jobId && !state.runId && msg.runId) {
+      state.runId = msg.runId;
+      try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
+    }
+    if (msg.type === "ashlar-can-close") {
+      const pending = state.running || !state.result || !state.finishedContext;
+      const unchanged = state.finishedContext === reviewPageContext();
+      const busyNow = typeof stopButtonVisible === "function" && stopButtonVisible();
+      // User follow-ups/navigation transfer the tab back to the user. Do not close it.
+      const draft = typeof composer === "function" && globalThis.document ? composer() : null;
+      const hasDraft = Boolean(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
+      reply({ok: true, canClose: !pending && unchanged && !busyNow && !hasDraft,
+        reason: pending ? "pending" : !unchanged || hasDraft ? "repurposed" : busyNow ? "pending" : "complete",
+        url: globalThis.location?.href || ""});
       return;
     }
     if (state.result) { reply(state.result); return; }
@@ -177,11 +188,14 @@ function installReviewRunner(name, run) {
     }
     const resume = Boolean(msg.resume || state.jobId);
     state.jobId = String(msg.jobId);
+    state.runId = state.runId || String(msg.runId || "");
+    try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
     try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
     Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
-      .then(raw => { state.result = { ok: true, raw }; })
+      .then(raw => { state.finishedContext = reviewPageContext(); state.result = { ok: true, raw }; })
       .catch(e => {
+        state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })
       .finally(() => { state.running = false; });

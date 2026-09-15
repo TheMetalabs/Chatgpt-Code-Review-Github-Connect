@@ -3,6 +3,8 @@ const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
 const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
 const CLOSED_PREFIX = "ashlar:closed:";
+const OWNED_PREFIX = "ashlar:tab:";
+const DEFAULT_MAX_REVIEW_TABS = 4;
 
 async function clientId() {
   const old = (await chrome.storage.local.get([CLIENT_KEY]))[CLIENT_KEY];
@@ -12,9 +14,26 @@ async function clientId() {
   return id;
 }
 
+function closedKey(job, provider) {
+  return `${CLOSED_PREFIX}${job.jobId}:${provider}:${job.states[provider].runId || "legacy"}`;
+}
+
 async function rememberClosedTab(tabId, info) {
-  // A whole browser/window closing can be followed by session restoration.
-  if (!info?.isWindowClosing) await chrome.storage.local.set({[CLOSED_PREFIX + tabId]: true});
+  const key = OWNED_PREFIX + tabId;
+  const owned = (await chrome.storage.session.get([key]))[key];
+  // Only managed tabs; session-scoped records cannot poison a reused ID after restart.
+  if (!owned) return;
+  if (!info?.isWindowClosing && !owned.closing) {
+    await chrome.storage.session.set({[owned.closedKey]: true});
+  }
+  await chrome.storage.session.remove([key]);
+}
+
+async function rememberOwnedTab(job, provider, closing = false) {
+  const state = job.states[provider];
+  if (state.tabId) await chrome.storage.session.set({[OWNED_PREFIX + state.tabId]: {
+    jobId: job.jobId, provider, runId: state.runId, closedKey: closedKey(job, provider), closing,
+  }});
 }
 
 function formatRetry(until) {
@@ -50,7 +69,7 @@ async function api(path, body) {
     signal: AbortSignal.timeout(10_000),
   });
   const json = await res.json().catch(() => ({}));
-  if (!res.ok || json.ok === false) {
+  if (!res.ok || json.ok !== true) {
     const err = new Error(json.error || `http ${res.status}`);
     err.status = res.status;
     throw err;
@@ -72,10 +91,15 @@ function noReceiver(err) {
 async function sendToTab(tabId, msg, files) {
   const once = () =>
     new Promise((resolve, reject) => {
-      chrome.tabs.sendMessage(tabId, msg, (res) => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve(res);
-      });
+      // ACK deadline is transport-only; it never cancels the page's model request.
+      const timer = setTimeout(() => reject(new Error("review tab acknowledgement unavailable")), 10_000);
+      try {
+        chrome.tabs.sendMessage(tabId, msg, (res) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(res);
+        });
+      } catch (error) { clearTimeout(timer); reject(error); }
     });
   try {
     return await once();
@@ -84,15 +108,6 @@ async function sendToTab(tabId, msg, files) {
     await chrome.scripting.executeScript({ target: { tabId }, files });
     await sleep(400);
     return once();
-  }
-}
-
-async function closeTab(tabId) {
-  if (!tabId) return;
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch {
-    /* already gone */
   }
 }
 
@@ -128,7 +143,9 @@ async function saveJobs(jobs) {
 }
 
 async function pendingJobs(origin) {
-  const local = await chrome.storage.local.get([PENDING_JOBS]);
+  const local = await chrome.storage.local.get(null);
+  const obsolete = Object.keys(local).filter(key => key.startsWith(CLOSED_PREFIX));
+  if (obsolete.length) await chrome.storage.local.remove(obsolete);
   if (local[PENDING_JOBS]) return local[PENDING_JOBS];
   // Upgrade from pre-recovery versions: lastJobId alone can already have lost A.
   const old = await chrome.storage.session.get(["tabs"]);
@@ -173,15 +190,115 @@ function failure(code, error) {
   return { ok: false, code, error };
 }
 
+function tabMessage(job, provider, type) {
+  return {type, jobId: job.jobId, provider, runId: job.states[provider].runId};
+}
+
+function matchesJob(result, job, provider) {
+  return result?.jobId === job.jobId && result?.provider === provider &&
+    (!job.states[provider].runId || result.runId === job.states[provider].runId) &&
+    result.code !== "job_mismatch";
+}
+
+function allowedTab(tab, provider) {
+  try {
+    const url = new URL(tab.pendingUrl || tab.url || "about:blank");
+    return url.protocol === "https:" && (provider === "grok" ? url.hostname === "grok.com" :
+      ["chatgpt.com", "chat.openai.com"].includes(url.hostname));
+  } catch { return false; }
+}
+
 async function findOriginalTab(job, provider) {
   const urls = provider === "grok" ? ["https://grok.com/*"] : ["https://chatgpt.com/*", "https://chat.openai.com/*"];
   for (const tab of await chrome.tabs.query({url: urls})) {
+    if (!allowedTab(tab, provider)) continue;
     try {
-      const result = await sendToTab(tab.id, {type: "ashlar-harvest", jobId: job.jobId}, contentFiles(provider));
-      if (result?.jobId === job.jobId) return tab;
+      const result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
+      if (matchesJob(result, job, provider)) return tab;
     } catch { /* A messaging outage is not evidence of completion. */ }
   }
   return null;
+}
+
+async function tabCapacityAvailable(jobs) {
+  const setting = (await chrome.storage.local.get(["maxReviewTabs"])).maxReviewTabs;
+  const limit = Number.isInteger(setting) && setting > 0 ? Math.min(setting, 16) : DEFAULT_MAX_REVIEW_TABS;
+  // Include cleanup-pending tabs and other configured origins, not only running legs.
+  const ids = new Set(Object.values(jobs).flatMap(job => Object.values(job.states)
+    .filter(state => state.tabId && !state.cleanupDone).map(state => state.tabId)));
+  return ids.size < limit;
+}
+
+async function finishTabCleanup(job, provider, jobs, reason) {
+  const state = job.states[provider];
+  state.cleanupDone = true;
+  state.cleanupPending = false;
+  if (reason) state.cleanupNote = reason;
+  delete state.cleanupError;
+  await saveJobs(jobs);
+  await chrome.storage.session.remove([OWNED_PREFIX + state.tabId, closedKey(job, provider)]);
+}
+
+/** Retryable journal: delivered -> cleanupPending -> closed -> cleanupDone.
+ * Never delete the last ownership record before remove() has succeeded.
+ */
+async function cleanupProvider(job, provider, jobs) {
+  const state = job.states[provider];
+  if (!state.delivered || state.cleanupDone) return;
+  state.cleanupPending = true;
+  await saveJobs(jobs);
+  if (!state.tabId && !state.started) return finishTabCleanup(job, provider, jobs);
+  if ((await chrome.storage.session.get([closedKey(job, provider)]))[closedKey(job, provider)]) {
+    return finishTabCleanup(job, provider, jobs, "already closed");
+  }
+  try {
+    let tab;
+    try { tab = await chrome.tabs.get(state.tabId); }
+    catch {
+      tab = await findOriginalTab(job, provider);
+      if (!tab) {
+        // A previous remove may have succeeded just before the worker stopped.
+        if (state.closeRequested) return finishTabCleanup(job, provider, jobs, "close confirmed by absence");
+        state.cleanupError = "original tab unavailable; cleanup waits for reconnection";
+        await saveJobs(jobs);
+        return;
+      }
+      state.tabId = tab.id;
+      await saveJobs(jobs);
+    }
+    if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
+    if (tab.status && tab.status !== "complete") return;
+    const result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider));
+    if (!matchesJob(result, job, provider)) {
+      state.cleanupError = "tab ownership does not match; no tab was closed";
+      await saveJobs(jobs);
+      return;
+    }
+    if (result.reason === "repurposed") return finishTabCleanup(job, provider, jobs, "user continued the conversation; tab preserved");
+    if (!result.canClose) return; // In particular, no deadline for unfinished generations.
+    const current = await chrome.tabs.get(tab.id);
+    if (current.pendingUrl || current.url !== result.url || current.status === "loading") return;
+    state.closeRequested = true;
+    await saveJobs(jobs);
+    await rememberOwnedTab(job, provider, true);
+    await chrome.tabs.remove(tab.id);
+    await finishTabCleanup(job, provider, jobs);
+  } catch (e) {
+    state.cleanupError = String(e.message || e).slice(0, 240);
+    await saveJobs(jobs);
+  }
+}
+
+async function retireCleanJob(job, jobs) {
+  if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
+  const old = await chrome.storage.session.get(["tabs"]);
+  const tabs = {...old.tabs};
+  for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
+  await chrome.storage.session.set({tabs});
+  await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
+  delete jobs[job.jobId];
+  await saveJobs(jobs);
+  return true;
 }
 
 function connectionErrors(job) {
@@ -193,7 +310,12 @@ async function heartbeat(job, jobs) {
   const body = {action: "ping", jobId: job.jobId, leaseId: job.leaseId,
     generating: generatingFor(job), providerErrors: connectionErrors(job)};
   let result = await api("/api/bridge", body);
-  if (result.active === false) { delete jobs[job.jobId]; await saveJobs(jobs); return false; }
+  if (result.active === false) {
+    job.serverStatus = result.status || "unknown";
+    await saveJobs(jobs);
+    return false; // Not equivalent to cancellation, receipt, or permission to close.
+  }
+  delete job.serverStatus;
   if (result.accepted === false || !job.leaseId) {
     const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()});
     job.leaseId = claim.leaseId;
@@ -204,15 +326,17 @@ async function heartbeat(job, jobs) {
   return true;
 }
 
-async function pollProvider(job, provider, jobs) {
+async function pollProvider(job, provider, jobs, observeOnly = false) {
   const state = job.states[provider];
-  if (state.outcome) return;
+  if (state.outcome || state.delivered) return;
+  if (!state.runId) { state.runId = crypto.randomUUID(); await saveJobs(jobs); }
   if (!state.tabId && (state.started || job.resumeProviders?.includes(provider))) {
     const original = await findOriginalTab(job, provider);
     if (original) { state.tabId = original.id; state.started = true; await saveJobs(jobs); }
     else { state.connectionError = "original review tab unavailable; waiting for reconnection"; return; }
   }
   if (!state.tabId) {
+    if (observeOnly || !await tabCapacityAvailable(jobs)) return;
     const quota = await quotaMap();
     if (!providerOpen(quota, provider)) {
       state.outcome = failure("quota", "usage limit — waiting for reset");
@@ -221,10 +345,10 @@ async function pollProvider(job, provider, jobs) {
     }
     const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
     state.tabId = created.id;
-    await chrome.storage.local.remove([CLOSED_PREFIX + created.id]);
+    await rememberOwnedTab(job, provider);
     await saveJobs(jobs); // Persist before any prompt dispatch; readiness is polled on later ticks.
   }
-  if ((await chrome.storage.local.get([CLOSED_PREFIX + state.tabId]))[CLOSED_PREFIX + state.tabId]) {
+  if ((await chrome.storage.session.get([closedKey(job, provider)]))[closedKey(job, provider)]) {
     state.outcome = failure("tab_closed", "review tab was explicitly closed");
     await saveJobs(jobs);
     return;
@@ -237,25 +361,23 @@ async function pollProvider(job, provider, jobs) {
     state.tabId = tab.id; state.started = true; await saveJobs(jobs);
   }
   if (tab.status && tab.status !== "complete") return;
-  const host = new URL(tab.url || tab.pendingUrl || "about:blank").hostname;
-  const allowed = provider === "grok" ? ["grok.com"] : ["chatgpt.com", "chat.openai.com"];
-  if (!allowed.includes(host)) {
+  if (!allowedTab(tab, provider)) {
     state.outcome = failure("context_lost", "review tab navigated away");
     await saveJobs(jobs);
     return;
   }
-  const run = { type: "ashlar-run", jobId: job.jobId,
+  const run = { ...tabMessage(job, provider, "ashlar-run"),
     prompt: job.prompts?.[provider] || job.prompt, reasoning: job.reasoning?.[provider], adoptLegacy: state.adoptLegacy };
   let result;
   try {
-    if (!state.started) {
+    if (!state.started && !observeOnly) {
       // The page runner deduplicates a retried start when its acknowledgement was lost.
       result = await sendToTab(state.tabId, run, contentFiles(provider));
       state.started = true;
       await saveJobs(jobs);
     } else {
-      result = await sendToTab(state.tabId, { type: "ashlar-harvest", jobId: job.jobId }, contentFiles(provider));
-      if (result?.code === "idle") {
+      result = await sendToTab(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
+      if (result?.code === "idle" && !observeOnly) {
         result = await sendToTab(state.tabId, { ...run, resume: true }, contentFiles(provider));
       }
     }
@@ -264,13 +386,14 @@ async function pollProvider(job, provider, jobs) {
     await chrome.storage.local.set({ lastError: String(e.message || e).slice(0, 240) });
     return;
   }
-  if (result?.code === "disconnected" || result?.code === "job_mismatch") {
+  if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
     state.connectionError = "original job binding unavailable; waiting for reconnection";
     const original = await findOriginalTab(job, provider);
     if (original && original.id !== state.tabId) { state.tabId = original.id; state.started = true; }
     await saveJobs(jobs);
     return;
   }
+  await rememberOwnedTab(job, provider);
   delete state.connectionError;
   if (isBusyResult(result)) return;
   if (result?.ok && typeof result.raw === "string" && result.raw.trim()) {
@@ -285,49 +408,63 @@ async function pollProvider(job, provider, jobs) {
   if (state.outcome.code === "quota") await markQuota(provider);
 }
 
-async function advanceJob(job, jobs) {
-  // Reconcile cancellation/completion, and obtain prompts for migrated tab records.
-  // A transport error must retain pending work; only an explicit 404 retires it.
-  try {
-    const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}`);
-    if (!job.prompt) Object.assign(job, { prompt: current.prompt, prompts: current.prompts });
-  } catch (e) {
-    if (e.status === 404) { delete jobs[job.jobId]; await saveJobs(jobs); return; }
+async function deliverOutcome(job, provider, jobs) {
+  const state = job.states[provider], out = state.outcome;
+  if (!out || state.delivered) return;
+  const body = out.ok
+    ? {action: "complete", jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw}]}
+    : {action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}`};
+  try { await api("/api/bridge", body); }
+  catch (e) {
+    if (e.status === 409) { job.leaseId = undefined; await saveJobs(jobs); throw e; }
+    if (e.status === 400 && out.ok && !job.serverStatus) {
+      state.rejectedRaw = out.raw; // Keep diagnostics until the failure is acknowledged.
+      state.outcome = failure("error", `completed review was rejected: ${e.message}`);
+      await saveJobs(jobs);
+      return;
+    }
+    // A 404/unknown response is NOT an acknowledgement. Keep the tab and exact outbox.
     throw e;
   }
-  if (!await heartbeat(job, jobs)) return;
-  for (const provider of job.providers) {
-    await pollProvider(job, provider, jobs);
-    // Heartbeat does not announce completion before the result is acknowledged.
-    if (!await heartbeat(job, jobs)) return;
-    const state = job.states[provider];
-    if (!state.outcome || state.delivered) continue;
-    const out = state.outcome;
-    const body = out.ok
-      ? { action: "complete", jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{ provider, raw: out.raw }] }
-      : { action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}` };
-    try {
-      await api("/api/bridge", body);
-    } catch (e) {
-      // A validation rejection is terminal. Network/5xx errors retain the exact raw.
-      if (e.status === 409) { job.leaseId = undefined; await saveJobs(jobs); throw e; }
-      if (![400, 404].includes(e.status)) throw e;
-      if (e.status === 400 && out.ok) {
-        state.outcome = failure("error", `completed review was rejected: ${e.message}`);
-        await saveJobs(jobs);
-        return; // Next tick reports the explicit rejection, not a false empty heartbeat.
-      }
-      await chrome.storage.local.set({ lastError: String(e.message || e).slice(0, 240) });
+  state.delivered = true;
+  state.cleanupPending = true;
+  await saveJobs(jobs);
+  await cleanupProvider(job, provider, jobs);
+}
+
+async function advanceJob(job, jobs) {
+  // Cleanup is independent of server availability once acknowledgement was persisted.
+  for (const p of job.providers) await cleanupProvider(job, p, jobs);
+  if (await retireCleanJob(job, jobs)) return;
+  const active = await heartbeat(job, jobs);
+  if (!active && job.serverStatus === "cancelled") {
+    for (const p of job.providers) {
+      job.states[p].delivered = true; // Explicit cancellation, never elapsed time or 404.
+      job.states[p].cleanupPending = true;
     }
-    state.delivered = true;
     await saveJobs(jobs);
-    if (!await heartbeat(job, jobs)) return;
-    if (!out.ok) await chrome.storage.local.set({ lastError: out.error });
+    for (const p of job.providers) await cleanupProvider(job, p, jobs);
+    await retireCleanJob(job, jobs);
+    return;
   }
-  if (job.providers.every(p => job.states[p].delivered)) {
-    delete jobs[job.jobId];
+  if (!active && !["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus)) return;
+  if (active && !job.prompt) {
+    const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}`);
+    Object.assign(job, {prompt: current.prompt, prompts: current.prompts});
     await saveJobs(jobs);
   }
+  for (const provider of job.providers) {
+    try {
+      await pollProvider(job, provider, jobs, !active);
+      await deliverOutcome(job, provider, jobs);
+      await cleanupProvider(job, provider, jobs);
+    } catch (e) {
+      // A failing provider must not prevent the others from being collected/closed.
+      await chrome.storage.local.set({lastError: String(e.message || e).slice(0, 240)});
+    }
+  }
+  if (active) await heartbeat(job, jobs);
+  await retireCleanJob(job, jobs);
 }
 
 let tickLock = false;
@@ -349,7 +486,10 @@ async function tickBody() {
   const jobs = await pendingJobs(cfg.origin);
   const recovering = Object.values(jobs).filter(j => j.origin === cfg.origin);
   if (recovering.length) {
-    for (const job of recovering) await advanceJob(job, jobs);
+    for (const job of recovering) {
+      try { await advanceJob(job, jobs); }
+      catch (e) { await chrome.storage.local.set({lastError: String(e.message || e).slice(0, 240)}); }
+    }
     return; // Never let a newly queued B overwrite recovery of A.
   }
   await api("/api/bridge", { action: "ping" });

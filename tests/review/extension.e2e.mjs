@@ -41,11 +41,11 @@ const html=`<!doctype html><html><body>
  <button data-testid="send-button" aria-label="Send prompt" type="button">Send</button></form>
  <script>
  window.sends=0;
- document.querySelector('button').onclick=()=>{window.sends++;const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';const user=document.createElement('div');user.dataset.messageAuthorRole='user';user.textContent=document.querySelector('textarea').value;turn.append(user);document.querySelector('#turns').append(turn);};
+ document.querySelector('button').onclick=()=>{window.sends++;const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';const user=document.createElement('div');user.dataset.messageAuthorRole='user';user.textContent=document.querySelector('textarea').value;turn.append(user);document.querySelector('#turns').append(turn);document.querySelector('textarea').value='';};
  window.reply=(raw,done)=>{document.querySelector('#answer')?.remove();const turn=document.createElement('section');turn.id='answer';turn.dataset.testid='conversation-turn-2';const message=document.createElement('div');message.dataset.messageAuthorRole='assistant';const md=document.createElement('div');md.className='markdown';md.textContent=raw;message.append(md);turn.append(message);if(done){const button=document.createElement('button');button.dataset.testid='copy-turn-action-button';button.ariaLabel='Copy response';button.textContent='copy';turn.append(button);}document.querySelector('#turns').append(turn);};
  </script></body></html>`;
 
-test('MV3 E2E: mention → indefinite queue → restart → final JSON → one GitHub review',async t=>{
+test('MV3 E2E: long queue → restart → final JSON ACK → close chat tab → one review',async t=>{
  const app=await appFixture();t.after(()=>app.close());
  const profile=await mkdtemp(join(tmpdir(),'ashlar-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
@@ -99,7 +99,8 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  // Reload the actual extension, then use a fresh DevTools attachment rather than
  // Playwright's cached Worker execution context (which can survive as a stale handle).
  const workerUrl=worker.url();
- const cdp=await context.newCDPSession(page);
+ const personalTab=await context.newPage();
+ const cdp=await context.newCDPSession(personalTab);
  await worker.evaluate(()=>{globalThis.__fixtureBeforeReload=true;});
  await worker.evaluate(()=>chrome.runtime.reload()).catch(error=>diagnostics.push(['reload',error.message]));
  let lastProbe;
@@ -125,8 +126,11 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  assert.equal(await page.evaluate(()=>window.sends),1);
  // Local headers and partial JSON are not a completed response.
  app.localResponses[0].writeHead(200,{'content-type':'application/json'});app.localResponses[0].write('{"choices":');
+ const promptSends=await page.evaluate(()=>window.sends);
  await page.evaluate(raw=>window.reply(raw,true),json);
  await eventually(async()=>{await worker.evaluate(()=>tick());return app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId).storedLegs.some(l=>l.provider==='chatgpt');},'final chat JSON was not stored');
+ await eventually(async()=>{await worker.evaluate(()=>tick());return page.isClosed();},'acknowledged ChatGPT tab was not closed');
+ assert.equal(personalTab.isClosed(),false,'unrelated user tab was closed');
  job=app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId);
  assert.equal(job.status,'awaiting_chat');assert.equal(job.storedLegs.some(l=>l.provider==='local'),false);
  assert.equal(app.reviews.length,0);
@@ -135,8 +139,8 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  await eventually(()=>app.reviews.length===1,'final review not published to GitHub fixture');
  job=app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId);
  assert.equal(job.status,'posted');assert.equal(job.storedLegs.length,2);
- await worker.evaluate(()=>tick());assert.equal(app.localRequests.length,1);assert.equal(await page.evaluate(()=>window.sends),1);assert.equal(app.reviews.length,1);
- if(process.env.REVIEW_EVIDENCE_DIR)await writeFile(join(process.env.REVIEW_EVIDENCE_DIR,'mv3-e2e.json'),JSON.stringify({status:job.status,localCalls:app.localRequests.length,promptSends:await page.evaluate(()=>window.sends),reviews:app.reviews.length,ops:app.ops},null,2));
+ await worker.evaluate(()=>tick());assert.equal(app.localRequests.length,1);assert.equal(promptSends,1);assert.equal(page.isClosed(),true);assert.equal(app.reviews.length,1);
+ if(process.env.REVIEW_EVIDENCE_DIR)await writeFile(join(process.env.REVIEW_EVIDENCE_DIR,'mv3-e2e.json'),JSON.stringify({status:job.status,localCalls:app.localRequests.length,promptSends,chatTabClosed:page.isClosed(),personalTabOpen:!personalTab.isClosed(),reviews:app.reviews.length,ops:app.ops},null,2));
 });
 
 test('production ingress E2E: PR open without mention performs no model work',async t=>{

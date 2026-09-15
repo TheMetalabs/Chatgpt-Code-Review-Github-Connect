@@ -327,14 +327,22 @@ async function watchReviewers(jobId: string, token: string) {
     }
     if (
       !flushed &&
-      Date.now() - started >= LOCAL_HOLD_MS &&
       job.status === "awaiting_chat" &&
       (job.storedLegs ?? []).some((l) => l.raw.trim()) &&
       !localInFlight.has(jobId)
     ) {
-      flushed = true;
-      const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
-      if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
+      const chatProviders = (job.reviewProviders ?? []).filter(isChatProvider);
+      const attempted = job.attemptedProviders ?? [];
+      const stored = job.storedLegs ?? [];
+      const chatDone =
+        !chatProviders.length ||
+        chatProviders.every((p) => attempted.includes(p) || stored.some((l) => l.provider === p && l.raw.trim()));
+      const timedOut = Date.now() - started >= LOCAL_HOLD_MS;
+      if (timedOut || (chatDone && !claimed)) {
+        flushed = true;
+        const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
+        if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
+      }
     }
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
@@ -674,6 +682,10 @@ export async function submitHarborChat(
     const haveChat = payloads.some((l) => isChatProvider(l.provider));
     const bridge = await bridgeSnapshot();
     const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
+    const chatProviders = providers.filter(isChatProvider);
+    const allChatAttempted =
+      chatProviders.length > 0 &&
+      chatProviders.every((p) => (job.attemptedProviders ?? []).includes(p) || payloads.some((l) => l.provider === p));
     if (
       shouldHoldForLocal({
         providers,
@@ -687,6 +699,7 @@ export async function submitHarborChat(
         chatSkipped: chatSkip,
         claimed,
         connected: bridge.connected,
+        allChatAttempted,
       })
     ) {
       patchJob(jobId, (j) => {

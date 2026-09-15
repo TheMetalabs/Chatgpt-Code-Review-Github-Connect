@@ -30,6 +30,13 @@ describe("parseChatSubmission", () => {
     assert.equal(parseChatSubmission("[1]"), null);
     assert.equal(parseChatSubmission("not json"), null);
   });
+
+  it("pulls the review object out of thinking braces", () => {
+    const raw = `Thinking { "scratch": 1 }\n{"merge_recommendation":"APPROVE","findings":[],"investigated_safe":["ok"]}`;
+    const out = parseChatSubmission(raw);
+    assert.equal(out?.merge_recommendation, "APPROVE");
+    assert.ok(Array.isArray(out?.findings));
+  });
 });
 
 describe("buildChatPrompt", () => {

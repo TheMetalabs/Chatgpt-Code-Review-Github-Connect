@@ -46,9 +46,11 @@ export function shouldHoldForChat(input: {
   claimed: boolean;
   connected: boolean;
   chatFpRound?: boolean;
+  allChatAttempted?: boolean;
 }): boolean {
   if (input.chatFpRound) return false;
   if (!input.providers.some(isChatProvider)) return false;
   if (input.haveChat || input.chatSkipped) return false;
+  if (input.allChatAttempted && !input.claimed) return false;
   return input.claimed || input.connected;
 }

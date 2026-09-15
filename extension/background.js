@@ -2,7 +2,7 @@ const POLL_MS = 2500;
 const PING_MS = 10_000;
 const BUSY_MS = 4 * 60_000;
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
-const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt" };
+const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt", tabs: "tabs" };
 
 function formatRetry(until) {
   if (!until) return "later";
@@ -130,23 +130,65 @@ async function markQuota(provider) {
 
 function contentFiles(provider) {
   return provider === "grok"
-    ? ["composer.js", "quota.js", "overlay.js", "model.js", "content-grok.js"]
-    : ["composer.js", "quota.js", "overlay.js", "model.js", "content-chatgpt.js"];
+    ? ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-grok.js"]
+    : ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-chatgpt.js"];
+}
+
+async function rememberTab(jobId, provider, tabId) {
+  if (!jobId || !tabId) return;
+  const s = await chrome.storage.session.get([SESSION.tabs]);
+  const tabs = s[SESSION.tabs] && typeof s[SESSION.tabs] === "object" ? { ...s[SESSION.tabs] } : {};
+  tabs[`${jobId}:${provider}`] = tabId;
+  await chrome.storage.session.set({ [SESSION.tabs]: tabs });
+}
+
+async function tabFor(jobId, provider) {
+  const s = await chrome.storage.session.get([SESSION.tabs]);
+  const tabs = s[SESSION.tabs] && typeof s[SESSION.tabs] === "object" ? s[SESSION.tabs] : {};
+  const id = Number(tabs[`${jobId}:${provider}`] || 0);
+  return id || null;
+}
+
+async function harvestTab(provider, tabId) {
+  if (!tabId) return null;
+  try {
+    const result = await sendToTab(tabId, { type: "ashlar-harvest" }, contentFiles(provider));
+    if (result?.ok && result.raw) return { provider, raw: result.raw, tabId };
+  } catch {
+    /* tab not ready */
+  }
+  return null;
 }
 
 async function runProvider(provider, prompt, jobId, reasoning) {
-  const tabId = await ensureTab(provider, reasoning);
   const files = contentFiles(provider);
+  const known = await tabFor(jobId, provider);
+  if (known) {
+    const hit = await harvestTab(provider, known);
+    if (hit) return { provider, raw: hit.raw };
+    try {
+      const result = await sendToTab(known, { type: "ashlar-run", prompt, jobId, reasoning }, files);
+      if (result?.ok && result.raw) return { provider, raw: result.raw };
+    } catch {
+      /* fall through to a new tab only if this one is gone */
+    }
+  }
+  const tabId = await ensureTab(provider, reasoning);
+  await rememberTab(jobId, provider, tabId);
   try {
     const result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId, reasoning }, files);
     if (!result?.ok) {
+      const again = await harvestTab(provider, tabId);
+      if (again) return { provider, raw: again.raw };
       const err = new Error(`${provider}: ${result?.error || "chat tab returned nothing"}`);
       err.code = result?.code;
       throw err;
     }
     return { provider, raw: result.raw };
-  } finally {
-    await closeTab(tabId);
+  } catch (e) {
+    const again = await harvestTab(provider, tabId);
+    if (again) return { provider, raw: again.raw };
+    throw e;
   }
 }
 
@@ -160,16 +202,19 @@ async function ping(jobId) {
 
 async function recoverDeadWorker() {
   const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId]);
-  const jobId = session[SESSION.jobId];
-  const wasBusy = Boolean(session[SESSION.busy]);
-  await chrome.storage.session.set({ [SESSION.busy]: false, [SESSION.jobId]: "", [SESSION.busyAt]: 0 });
-  if (wasBusy && jobId) {
-    try {
-      await api("/api/bridge", { action: "release", jobId });
-    } catch {
-      /* job may already be free */
-    }
+  await chrome.storage.session.set({ [SESSION.busy]: false, [SESSION.jobId]: session[SESSION.jobId] || "", [SESSION.busyAt]: 0 });
+}
+
+async function harvestAndComplete(jobId, providers) {
+  if (!jobId) return false;
+  const results = [];
+  for (const p of providers) {
+    const hit = await harvestTab(p, await tabFor(jobId, p));
+    if (hit) results.push({ provider: hit.provider, raw: hit.raw });
   }
+  if (!results.length) return false;
+  await api("/api/bridge", { action: "complete", jobId, raw: results[0].raw, results });
+  return true;
 }
 
 let tickLock = false;
@@ -208,7 +253,17 @@ async function tickBody() {
     return;
   }
   const job = payload.job;
-  if (!job) return;
+  if (!job) {
+    const last = await chrome.storage.local.get(["lastJobId"]);
+    if (last.lastJobId) {
+      try {
+        await harvestAndComplete(String(last.lastJobId), ["chatgpt", "grok"]);
+      } catch {
+        /* still no json */
+      }
+    }
+    return;
+  }
   await chrome.storage.session.set({ [SESSION.busy]: true, [SESSION.jobId]: job.jobId, [SESSION.busyAt]: Date.now() });
   chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
   let claimed = true;

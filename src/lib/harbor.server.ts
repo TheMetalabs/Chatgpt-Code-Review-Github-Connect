@@ -12,8 +12,8 @@ import {
 import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
-import { buildChatPrompt, buildFpPrompt, parseChatSubmission } from "./chat-prompt";
-import { runLocalLlm } from "./local-llm.server";
+import { buildChatPrompt, buildFpPrompt, buildMergePrompt, MERGE_FALLBACK_NOTE, parseChatSubmission } from "./chat-prompt";
+import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
 import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
   applyFpStep,
@@ -25,9 +25,12 @@ import {
   gatePeerSubmission,
   isBotMention,
   partitionMany,
+  schemaMergeProviderGates,
+  SCHEMA_MERGE_NOTE,
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
+import { LOCAL_HOLD_MS, shouldHoldForChat, shouldHoldForLocal, shouldStartLocalFallback } from "./local-fallback";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import {
@@ -41,6 +44,7 @@ import {
 
 let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
+const localInFlight = new Set<string>();
 
 export type HarborState = {
   settings: BotSettings;
@@ -276,11 +280,13 @@ async function bridgeSnapshot() {
 }
 
 const WATCH_TICK_MS = 5_000;
-const WATCH_CAP_MS = 8 * 60_000;
+const WATCH_CAP_MS = 14 * 60_000;
 
 async function watchReviewers(jobId: string, token: string) {
   const started = Date.now();
   let lastNotes = "";
+  let localStarted = false;
+  let flushed = false;
   while (Date.now() - started < WATCH_CAP_MS) {
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
@@ -292,6 +298,44 @@ async function watchReviewers(jobId: string, token: string) {
     const chat = (job.reviewProviders ?? []).filter(isChatProvider);
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
     const localSkip = (job.assumptions ?? []).find((a) => a.startsWith("Skipped local"));
+    const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "";
+    const localRunning = localInFlight.has(jobId);
+    if (
+      prompt &&
+      shouldStartLocalFallback({
+        providers: job.reviewProviders ?? [],
+        status: job.status,
+        connected: bridge.connected,
+        claimed,
+        localDone: Boolean(localLeg?.raw.trim() || localSkip),
+        localStarted: localStarted || localRunning,
+        waitedMs: Date.now() - started,
+      })
+    ) {
+      const ping = await pingLocalLlm(state.settings);
+      if (ping.ok) {
+        localStarted = true;
+        localInFlight.add(jobId);
+        void attachLocalLeg(jobId, prompt, { submit: true });
+      } else if (!localSkip) {
+        patchJob(jobId, (j) => ({
+          ...j,
+          assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
+          updatedAt: Date.now(),
+        }));
+      }
+    }
+    if (
+      !flushed &&
+      Date.now() - started >= LOCAL_HOLD_MS &&
+      job.status === "awaiting_chat" &&
+      (job.storedLegs ?? []).some((l) => l.raw.trim()) &&
+      !localInFlight.has(jobId)
+    ) {
+      flushed = true;
+      const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
+      if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
+    }
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
       notes.push("Chrome bridge is not connected. ChatGPT/Grok start in parallel when the extension reconnects.");
@@ -299,8 +343,11 @@ async function watchReviewers(jobId: string, token: string) {
       notes.push("Chrome bridge claimed this job. ChatGPT and Grok run in parallel.");
     }
     if (localSkip) notes.push(`${localSkip} — skipped, does not block other reviewers.`);
-    else if (localLeg) notes.push("Local LLM finished in the background.");
-    else if ((job.reviewProviders ?? []).includes("local")) notes.push("Local LLM is running in the background and will not block ChatGPT/Grok.");
+    else if (localLeg) notes.push("Local LLM finished.");
+    else if (localStarted || localRunning) notes.push("Waiting for local LLM before posting.");
+    else if ((job.reviewProviders ?? []).includes("local") && chat.length) {
+      notes.push("Local LLM is fallback if Chrome does not return in time.");
+    }
 
     const phase: OpsPhase = chat.length && !bridge.connected && !claimed ? "blocked" : "running";
     const key = `${phase}|${notes.join("|")}`;
@@ -310,6 +357,58 @@ async function watchReviewers(jobId: string, token: string) {
     }
 
     await sleep(WATCH_TICK_MS);
+  }
+  const leftover = state.jobs.find((j) => j.id === jobId);
+  if (leftover?.status === "awaiting_chat") {
+    if (localInFlight.has(jobId)) {
+      localInFlight.delete(jobId);
+      patchJob(jobId, (j) => ({
+        ...j,
+        assumptions: [...(j.assumptions ?? []), "Skipped local (still running at watch cap)"].slice(0, 12),
+        updatedAt: Date.now(),
+      }));
+    }
+    const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
+    if (leftover.chatFpRound && leftover.fpPending) {
+      const merged = finalizeFp(
+        {
+          ...leftover.fpPending,
+          assumptions: [...(leftover.fpPending.assumptions ?? []), SCHEMA_MERGE_NOTE].slice(0, 12),
+        },
+        state.settings,
+      );
+      patchJob(jobId, (j) => ({
+        ...j,
+        status: "validator",
+        findings: merged.findings,
+        candidates: merged.findings,
+        mergeRecommendation: merged.mergeRecommendation,
+        highestRisk: merged.highestRisk,
+        investigatedSafe: merged.investigatedSafe,
+        assumptions: merged.assumptions,
+        plan: "Schema-merged after LLM merge did not finish.",
+        updatedAt: Date.now(),
+      }));
+      try {
+        const token = leftover.installationId ? await installationToken(leftover.installationId) : undefined;
+        const sample = token
+          ? await fetchPullSnapshot(token, {
+              owner: leftover.owner,
+              repo: leftover.repo,
+              pr: leftover.pr,
+              title: leftover.title,
+              headSha: leftover.headSha,
+              baseSha: leftover.baseSha,
+              sender: leftover.sender,
+              isFork: leftover.isFork,
+              isDraft: leftover.isDraft,
+            })
+          : undefined;
+        await finishJob(jobId, sample, token);
+      } catch {
+        /* finishJob records githubError */
+      }
+    } else if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
   }
 }
 
@@ -476,7 +575,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     ...j,
     status: "awaiting_chat",
     plan: providers.includes("local")
-      ? `Snapshot loaded. ${chatProviders.join(" + ")} via Chrome bridge; local LLM is optional and will not block.`
+      ? `Snapshot loaded. ${chatProviders.join(" + ")} via Chrome; local LLM runs if reachable and we wait for it before posting.`
       : providers.length > 1
         ? `Snapshot loaded. ${providers.join(" + ")} review in parallel. False-positive checks run in order: ${order.join(" → ")}.`
         : "Snapshot loaded. The Chrome bridge will send this to ChatGPT or Grok on this machine.",
@@ -487,10 +586,22 @@ async function playGithub(jobId: string, untrustedBody: string) {
     updatedAt: Date.now(),
   }));
   void watchReviewers(jobId, token);
-  if (providers.includes("local")) void attachLocalLeg(jobId, prompt);
+  if (providers.includes("local") && chatProviders.length) {
+    const ping = await pingLocalLlm(state.settings);
+    if (!ping.ok) {
+      patchJob(jobId, (j) => ({
+        ...j,
+        assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
+        updatedAt: Date.now(),
+      }));
+    } else {
+      localInFlight.add(jobId);
+      void attachLocalLeg(jobId, prompt, { submit: true });
+    }
+  }
 }
 
-async function attachLocalLeg(jobId: string, prompt: string) {
+async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
   try {
     const local = await runLocalLlm(prompt, state.settings);
     if (!local.ok) {
@@ -499,13 +610,13 @@ async function attachLocalLeg(jobId: string, prompt: string) {
         assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12),
         updatedAt: Date.now(),
       }));
-      return;
+    } else {
+      patchJob(jobId, (j) => {
+        if (j.status !== "awaiting_chat") return j;
+        const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
+        return { ...j, storedLegs: next, updatedAt: Date.now() };
+      });
     }
-    patchJob(jobId, (j) => {
-      if (j.status !== "awaiting_chat") return j;
-      const stored = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
-      return { ...j, storedLegs: stored, updatedAt: Date.now() };
-    });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     patchJob(jobId, (j) => ({
@@ -513,6 +624,15 @@ async function attachLocalLeg(jobId: string, prompt: string) {
       assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12),
       updatedAt: Date.now(),
     }));
+  } finally {
+    localInFlight.delete(jobId);
+    if (opts?.submit) {
+      const job = state.jobs.find((j) => j.id === jobId);
+      const legs = (job?.storedLegs ?? []).filter((l) => l.raw.trim());
+      if (job?.status === "awaiting_chat" && legs.length) {
+        await submitHarborChat(jobId, legs[0].raw, legs);
+      }
+    }
   }
 }
 
@@ -526,6 +646,7 @@ export async function submitHarborChat(
   jobId: string,
   raw: string,
   legs?: ChatLeg[],
+  opts?: { force?: boolean },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || job.status !== "awaiting_chat") {
@@ -545,6 +666,46 @@ export async function submitHarborChat(
   const payloads = job.chatFpRound ? incoming : [...incoming, ...stored];
   if (!payloads.length) {
     return { ok: false, error: "quota" };
+  }
+  if (!opts?.force && !job.chatFpRound) {
+    const localSkip = (job.assumptions ?? []).some((a) => a.startsWith("Skipped local"));
+    const chatSkip = (job.assumptions ?? []).some((a) => /Skipped (chatgpt|grok)/i.test(a));
+    const haveLocal = payloads.some((l) => l.provider === "local");
+    const haveChat = payloads.some((l) => isChatProvider(l.provider));
+    const bridge = await bridgeSnapshot();
+    const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
+    if (
+      shouldHoldForLocal({
+        providers,
+        haveLocal,
+        localSkipped: localSkip,
+        localInFlight: localInFlight.has(jobId),
+      }) ||
+      shouldHoldForChat({
+        providers,
+        haveChat,
+        chatSkipped: chatSkip,
+        claimed,
+        connected: bridge.connected,
+      })
+    ) {
+      patchJob(jobId, (j) => {
+        if (j.status !== "awaiting_chat") return j;
+        const next = [...(j.storedLegs ?? [])];
+        for (const leg of incoming) {
+          const i = next.findIndex((l) => l.provider === leg.provider);
+          if (i >= 0) next[i] = leg;
+          else next.push(leg);
+        }
+        return {
+          ...j,
+          storedLegs: next,
+          plan: haveChat && !haveLocal ? "Waiting for local LLM before posting." : "Waiting for Chrome reviewers before posting.",
+          updatedAt: Date.now(),
+        };
+      });
+      return { ok: true };
+    }
   }
   const skipped = providers.filter((p) => !payloads.some((l) => l.provider === p) && !(job.chatFpRound && p === "local"));
 
@@ -630,6 +791,39 @@ export async function submitHarborChat(
   }
 
   if (!gates.length) {
+    const localSkipped = (still.assumptions ?? []).some((a) => /^Skipped local/i.test(a));
+    const mergeAsked = (still.assumptions ?? []).some((a) => a.includes(MERGE_FALLBACK_NOTE));
+    const drafts = [...incoming, ...stored].filter((l) => l.raw.trim());
+    if (localSkipped && !mergeAsked && providers.some(isChatProvider)) {
+      const mergePrompt = buildMergePrompt({
+        sample,
+        drafts: drafts.length ? drafts : [{ provider: "chatgpt", raw: raw }],
+      });
+      patchJob(jobId, (j) => ({
+        ...j,
+        status: "awaiting_chat",
+        chatPrompt: mergePrompt,
+        fpProviders: ["chatgpt"],
+        bridgeClaimedAt: undefined,
+        assumptions: [...(j.assumptions ?? []), MERGE_FALLBACK_NOTE].slice(0, 12),
+        plan: "Local LLM skipped. Asking ChatGPT to merge reviewer drafts.",
+        githubError: undefined,
+        updatedAt: Date.now(),
+      }));
+      return { ok: true };
+    }
+    if (mergeAsked || opts?.force) {
+      patchJob(jobId, (j) => ({
+        ...j,
+        status: "skipped",
+        skipReason: invalid.join("; ") || "no valid review JSON after LLM merge",
+        githubError: invalid.join("; ") || "no valid review JSON after LLM merge",
+        assumptions: [...(j.assumptions ?? []), SCHEMA_MERGE_NOTE].slice(0, 12),
+        plan: "Did not post a clean review from empty drafts.",
+        updatedAt: Date.now(),
+      }));
+      return { ok: false, error: invalid.join("; ") || "no valid review JSON after LLM merge" };
+    }
     const canRetry = providers.some(isChatProvider);
     if (!canRetry) {
       patchJob(jobId, (j) => ({
@@ -676,8 +870,16 @@ export async function submitHarborChat(
     ...gates.flatMap((g) => g.assumptions),
   ].filter(Boolean);
   const disputed = disputedFromUnique(part.unique);
-  if (!disputed.length) {
-    const merged = finalizeFp({ agreed: part.agreed, disputed: [], investigatedSafe, assumptions }, state.settings);
+  const localSkipped = (still.assumptions ?? []).some((a) => /^Skipped local/i.test(a));
+  const mergeAsked = (still.assumptions ?? []).some((a) => a.includes(MERGE_FALLBACK_NOTE));
+  const llmMergeUnavailable = localSkipped || Boolean(opts?.force) || mergeAsked;
+  if (!disputed.length || llmMergeUnavailable) {
+    const merged = llmMergeUnavailable
+      ? schemaMergeProviderGates(
+          [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
+          state.settings,
+        )
+      : finalizeFp({ agreed: part.agreed, disputed: [], investigatedSafe, assumptions }, state.settings);
     patchJob(jobId, (j) => ({
       ...j,
       findings: merged.findings,
@@ -685,7 +887,8 @@ export async function submitHarborChat(
       mergeRecommendation: merged.mergeRecommendation,
       highestRisk: merged.highestRisk,
       investigatedSafe: merged.investigatedSafe,
-      assumptions: merged.assumptions,
+      assumptions: [...assumptions, ...merged.assumptions].filter(Boolean).slice(0, 12),
+      plan: llmMergeUnavailable ? "Schema-merged reviewer JSON (LLM merge unavailable)." : j.plan,
       updatedAt: Date.now(),
     }));
     await finishJob(jobId, sample, token);
@@ -693,7 +896,7 @@ export async function submitHarborChat(
   }
 
   const ran = [...byProvider.keys()];
-  const order = normalizeReviewOrder(still.reviewOrder ?? state.settings.reviewOrder).filter((p) => ran.includes(p));
+  let order = normalizeReviewOrder(still.reviewOrder ?? state.settings.reviewOrder).filter((p) => ran.includes(p));
   patchJob(jobId, (j) => ({
     ...j,
     chatFpRound: true,

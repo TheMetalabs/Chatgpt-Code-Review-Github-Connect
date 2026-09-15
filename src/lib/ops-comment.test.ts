@@ -11,7 +11,7 @@ describe("buildOpsComment", () => {
     });
     assert.match(body, new RegExp(OPS_COMMENT_MARK));
     assert.match(body, /chatgpt \+ grok in parallel/);
-    assert.match(body, /optional, never blocks/);
+    assert.match(body, /wait to merge/);
     assert.match(body, /not connected/);
     assert.doesNotMatch(body, /127\.0\.0\.1|jwhy\.net|Qwen|sk-/);
   });

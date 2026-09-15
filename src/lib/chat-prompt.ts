@@ -56,6 +56,29 @@ export function buildChatPrompt(opts: {
     .slice(0, 20_000);
 }
 
+export const MERGE_FALLBACK_NOTE = "Asked ChatGPT to merge after local skip";
+
+export function buildMergePrompt(opts: {
+  sample: SamplePr;
+  drafts: { provider: string; raw: string }[];
+  extra?: string;
+  untrustedBody?: string;
+}): string {
+  const drafts = opts.drafts
+    .map((d) => `<<<DRAFT ${d.provider}>>>\n${String(d.raw || "").slice(0, 4_000)}\n<<<END_DRAFT>>>`)
+    .join("\n\n");
+  const base = buildChatPrompt({
+    sample: opts.sample,
+    extra: opts.extra,
+    untrustedBody: opts.untrustedBody,
+  });
+  return `${base}
+
+The local LLM was unavailable. Merge these reviewer drafts into one JSON object. Drafts may be empty — re-inspect the snapshot. Do not return findings:[] unless investigated_safe lists each changed file.
+
+${drafts}`.slice(0, 20_000);
+}
+
 export function parseChatSubmission(raw: string): Record<string, unknown> | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;

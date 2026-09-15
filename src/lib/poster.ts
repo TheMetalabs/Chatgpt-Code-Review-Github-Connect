@@ -412,6 +412,41 @@ export function gatePeerSubmission(
   return { ok: true, check: { keep, drop } };
 }
 
+export const SCHEMA_MERGE_NOTE = "Schema-merged reviewer JSON (LLM merge unavailable)";
+
+export function schemaMergeProviderGates(
+  rows: ProviderGate[],
+  settings: BotSettings,
+): LiveGateResult {
+  if (!rows.length) {
+    return {
+      ok: true,
+      findings: [],
+      mergeRecommendation: "COMMENT",
+      highestRisk: "",
+      investigatedSafe: [],
+      assumptions: [SCHEMA_MERGE_NOTE],
+      dropped: ["no reviewer results"],
+    };
+  }
+  if (rows.length === 1) {
+    const g = rows[0].gate;
+    return { ...g, assumptions: [...g.assumptions, SCHEMA_MERGE_NOTE].slice(0, 12) };
+  }
+  const part = partitionMany(rows);
+  const unique = Object.values(part.unique).flat();
+  return finalizeFp(
+    {
+      agreed: [...part.agreed, ...unique],
+      disputed: [],
+      investigatedSafe: [...new Set(rows.flatMap((r) => r.gate.investigatedSafe))].slice(0, 8),
+      assumptions: [SCHEMA_MERGE_NOTE, ...rows.flatMap((r) => r.gate.assumptions)].filter(Boolean).slice(0, 12),
+      dropped: rows.flatMap((r) => r.gate.dropped).slice(0, 8),
+    },
+    settings,
+  );
+}
+
 export function consensusFromGates(gates: LiveGateResult[], settings: BotSettings): LiveGateResult {
   if (gates.length === 0) {
     return {

@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseChatSubmission } from "./chat-prompt.ts";
+import { SAMPLE_PRS } from "./samples.ts";
+import { MERGE_FALLBACK_NOTE, buildMergePrompt, parseChatSubmission } from "./chat-prompt.ts";
 
 describe("parseChatSubmission", () => {
   it("reads a bare JSON object", () => {
@@ -19,3 +20,16 @@ describe("parseChatSubmission", () => {
     assert.equal(parseChatSubmission("not json"), null);
   });
 });
+
+describe("buildMergePrompt", () => {
+  it("asks ChatGPT to merge drafts when local is unavailable", () => {
+    const out = buildMergePrompt({
+      sample: SAMPLE_PRS["pay-412"],
+      drafts: [{ provider: "chatgpt", raw: '{"findings":[]}' }],
+    });
+    assert.match(out, /local LLM was unavailable/i);
+    assert.match(out, /DRAFT chatgpt/);
+    assert.match(MERGE_FALLBACK_NOTE, /ChatGPT to merge/);
+  });
+});
+

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractChatJson } from "./extract-chat-json.ts";
+import { extractChatJson, htmlChatToText } from "./extract-chat-json.ts";
 
 const PAYLOAD = `{
 "merge_recommendation": "APPROVE",
@@ -30,5 +30,24 @@ describe("extractChatJson", () => {
 
   it("returns null for unrelated JSON", () => {
     assert.equal(extractChatJson('{"foo":1}'), null);
+  });
+
+  it("pulls review JSON out of ChatGPT markdown <p><br> HTML", () => {
+    const html = `<p dir="auto">{<br>
+"merge_recommendation": "REQUEST_CHANGES",<br>
+"highest_risk": "overlap",<br>
+"investigated_safe": [<br>
+"a.ts: ok <button type="button">cite</button>"<br>
+],<br>
+"assumptions": [],<br>
+"findings": [{"severity":"P2","file":"a.ts","line":1,"title":"t","failure_scenario":"f","root_cause":"r","evidence":"e","recommended_fix":"x","recommended_test":"y"}]<br>
+}</p>`;
+    const text = htmlChatToText(html);
+    const hit = extractChatJson(text);
+    assert.ok(hit);
+    const parsed = JSON.parse(hit);
+    assert.equal(parsed.merge_recommendation, "REQUEST_CHANGES");
+    assert.equal(parsed.findings.length, 1);
+    assert.equal(String(parsed.investigated_safe[0]).includes("cite"), false);
   });
 });

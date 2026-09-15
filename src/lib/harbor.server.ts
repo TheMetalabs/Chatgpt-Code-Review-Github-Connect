@@ -97,12 +97,7 @@ export function githubStatus() {
 export function patchHarborSettings(patch: Partial<BotSettings>) {
   const next = { ...state.settings, ...patch };
   if (!providersFromSettings(next).length) return state.settings;
-  let saved = next;
-  try {
-    saved = saveBotSettings(next);
-  } catch {
-    saved = next;
-  }
+  const saved = saveBotSettings(next);
   state = { ...state, settings: saved };
   return state.settings;
 }

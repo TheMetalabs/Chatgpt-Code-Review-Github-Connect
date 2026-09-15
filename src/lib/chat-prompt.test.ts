@@ -1,7 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { SAMPLE_PRS } from "./samples.ts";
-import { MERGE_FALLBACK_NOTE, buildMergePrompt, parseChatSubmission } from "./chat-prompt.ts";
+import { FINDING_412, SAMPLE_PRS } from "./samples.ts";
+import {
+  CHAT_JSON_HINT,
+  MERGE_FALLBACK_NOTE,
+  REVIEW_OFFLINE_RULE,
+  buildChatParts,
+  buildChatPrompt,
+  buildFpPrompt,
+  buildMergePrompt,
+  isSandboxPolicy,
+  parseChatSubmission,
+  splitChatAttachments,
+} from "./chat-prompt.ts";
 
 describe("parseChatSubmission", () => {
   it("reads a bare JSON object", () => {
@@ -21,6 +32,67 @@ describe("parseChatSubmission", () => {
   });
 });
 
+describe("buildChatPrompt", () => {
+  it("forbids web research and tools so reviewers spend tokens on the snapshot only", () => {
+    const out = buildChatPrompt({ sample: SAMPLE_PRS["pay-412"] });
+    assert.match(out, /Do not search the web/);
+    assert.match(out, /DeepSearch/);
+    assert.match(out, /Do not call tools/);
+    assert.match(REVIEW_OFFLINE_RULE, /only source of truth/i);
+    const fp = buildFpPrompt({ sample: SAMPLE_PRS["pay-412"], findings: [FINDING_412], peer: "grok" });
+    assert.match(fp, /Do not search the web/);
+    const merge = buildMergePrompt({
+      sample: SAMPLE_PRS["pay-412"],
+      drafts: [{ provider: "chatgpt", raw: '{"findings":[]}' }],
+    });
+    assert.match(merge, /Do not search the web/);
+  });
+
+  it("keeps the JSON schema complete and puts large snapshots in attachments", () => {
+    const sample = {
+      ...SAMPLE_PRS["pay-412"],
+      files: [
+        { path: "README.md", language: "md" as const, content: `${"x".repeat(30_000)}\n# App Builder Workspace` },
+        ...SAMPLE_PRS["pay-412"].files,
+      ],
+      changedPaths: ["README.md", ...SAMPLE_PRS["pay-412"].changedPaths],
+      diff: `${SAMPLE_PRS["pay-412"].diff}\n${"y".repeat(12_000)}`,
+    };
+    const { prompt, files } = buildChatParts({ sample });
+    assert.match(prompt, /merge_recommendation/);
+    assert.ok(prompt.includes(CHAT_JSON_HINT.slice(0, 40)));
+    assert.ok(prompt.length < 8_000, "composer text stays short");
+    assert.ok(files.some((f) => f.name === "ashlar-diff.patch"));
+    assert.ok(files.some((f) => f.name === "ashlar-snapshot.md"));
+    const encoded = buildChatPrompt({ sample });
+    assert.match(encoded, /<<<ATTACH:ashlar-diff.patch>>>/);
+    assert.match(encoded, /<<<END_ATTACH>>>/);
+    const split = splitChatAttachments(encoded);
+    assert.equal(split.files.length, 2);
+    assert.match(split.prompt, /Return exactly this JSON shape/);
+    assert.doesNotMatch(split.prompt, /App Builder Workspace/);
+  });
+
+  it("drops sandbox AGENTS.md from the review snapshot", () => {
+    assert.equal(isSandboxPolicy("# App Builder Workspace\nGrok Build, in an isolated Linux sandbox"), true);
+    const sample = {
+      ...SAMPLE_PRS["pay-412"],
+      files: [
+        {
+          path: "AGENTS.md",
+          language: "md" as const,
+          content: "# App Builder Workspace\nGrok Build, in an isolated Linux sandbox\nimagine_*",
+        },
+        ...SAMPLE_PRS["pay-412"].files,
+      ],
+      changedPaths: ["AGENTS.md", ...SAMPLE_PRS["pay-412"].changedPaths],
+    };
+    const out = buildChatPrompt({ sample });
+    assert.doesNotMatch(out, /imagine_\*/);
+    assert.doesNotMatch(out, /web search if helpful/);
+  });
+});
+
 describe("buildMergePrompt", () => {
   it("asks ChatGPT to merge drafts when local is unavailable", () => {
     const out = buildMergePrompt({
@@ -32,4 +104,3 @@ describe("buildMergePrompt", () => {
     assert.match(MERGE_FALLBACK_NOTE, /ChatGPT to merge/);
   });
 });
-

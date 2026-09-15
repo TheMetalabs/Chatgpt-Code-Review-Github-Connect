@@ -22,6 +22,8 @@ Precision over recall. False positives cost more than a missed nit.
 - Findings whose file/line does not exist on the head SHA
 - Secrets, lockfiles, generated code, vendor, dist/
 
+Do not search the web or fetch outside this snapshot. Missing context goes in assumptions.
+
 ## Finding standard
 Each published finding must have:
 1. Concrete failure scenario

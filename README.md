@@ -187,6 +187,8 @@ Settings에서 최대 3개를 켭니다. 하나만 끌 수는 없습니다.
 
 ChatGPT + Grok은 **병렬**입니다. 로컬은 그 경주에 안 넣고, 브릿지가 없거나 쿼타/타임아웃이면 그때 돕니다. 두 모델 이상이 같은 파일·라인(또는 같은 제목)을 말하면 그대로 남깁니다. 한쪽만 말한 항목만 false-positive 파이프라인으로 갑니다.
 
+프롬프트는 **웹 검색 / DeepSearch / URL fetch / 툴 호출을 금지**합니다. 지시문은 짧게 두고, diff와 변경 파일 스냅샷은 `ashlar-diff.patch` / `ashlar-snapshot.md`로 붙입니다. 없는 맥락은 `assumptions`에만 적습니다.
+
 ### FP 순서
 
 기본값: **Local LLM → ChatGPT → Grok**

@@ -1,5 +1,9 @@
+export function isSandboxPolicyFile(content: string): boolean {
+  return /App Builder Workspace|Grok Build, in an isolated Linux sandbox|imagine_\*/.test(String(content || ""));
+}
+
 export function policyPathsFor(changed: string[]): string[] {
-  const policy = new Set<string>(["AGENTS.md", "code_review.md"]);
+  const policy = new Set<string>(["code_review.md"]);
   for (const path of changed) {
     const parts = path.replace(/\\/g, "/").split("/").filter((p) => p && p !== "." && p !== "..");
     while (parts.length > 1) {

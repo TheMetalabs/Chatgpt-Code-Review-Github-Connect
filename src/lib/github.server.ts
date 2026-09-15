@@ -2,7 +2,7 @@ import { createPrivateKey } from "node:crypto";
 import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
-import { isSafeRepoPath, policyPathsFor, snapshotFileRef } from "./github-snapshot";
+import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
 import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
@@ -427,6 +427,7 @@ export async function fetchPullSnapshot(
     const ref = snapshotFileRef(path, policyPaths, target.baseSha, target.headSha);
     const content = await getFile(token, target.owner, target.repo, path, ref);
     if (content == null) continue;
+    if (isSandboxPolicyFile(content)) continue;
     files.push({ path, content, language: langFor(path) });
   }
   const diff = filesOut.data

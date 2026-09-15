@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createPrivateKey } from "node:crypto";
+import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server.ts";
 
 export type StoredSecrets = {
   githubAppId: string;
@@ -38,6 +39,7 @@ function readDisk(): StoredSecrets {
 }
 
 export function getSecrets(): StoredSecrets {
+  loadDotenvFile();
   if (!cache) cache = readDisk();
   return cache;
 }
@@ -47,6 +49,12 @@ function writeDisk(next: StoredSecrets) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   writeFileSync(secretsPath(), `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   cache = next;
+  writeEnvPatch({
+    GITHUB_APP_ID: next.githubAppId,
+    GITHUB_APP_CLIENT_ID: next.githubClientId,
+    GITHUB_WEBHOOK_SECRET: next.githubWebhookSecret || undefined,
+    GITHUB_APP_PRIVATE_KEY: next.githubPrivateKey || undefined,
+  });
 }
 
 export function normalizePem(raw: string): string {

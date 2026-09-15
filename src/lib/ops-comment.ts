@@ -20,7 +20,7 @@ export function buildOpsComment(input: OpsCommentInput): string {
   const local = input.providers.includes("local");
   const reviewers = [
     chat.length ? `${chat.join(" + ")} in parallel (Chrome)` : "",
-    local ? "local in the background (optional, never blocks)" : "",
+    local ? "local if reachable (wait to merge before posting)" : "",
   ]
     .filter(Boolean)
     .join("; ");

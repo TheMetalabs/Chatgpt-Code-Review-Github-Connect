@@ -13,7 +13,7 @@ import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, buildFpPrompt, parseChatSubmission } from "./chat-prompt";
-import { runLocalLlm } from "./local-llm.server";
+import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
 import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
   applyFpStep,
@@ -28,6 +28,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
+import { LOCAL_HOLD_MS, shouldHoldForChat, shouldHoldForLocal, shouldStartLocalFallback } from "./local-fallback";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import {
@@ -41,6 +42,7 @@ import {
 
 let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
+const localInFlight = new Set<string>();
 
 export type HarborState = {
   settings: BotSettings;
@@ -281,6 +283,8 @@ const WATCH_CAP_MS = 8 * 60_000;
 async function watchReviewers(jobId: string, token: string) {
   const started = Date.now();
   let lastNotes = "";
+  let localStarted = false;
+  let flushed = false;
   while (Date.now() - started < WATCH_CAP_MS) {
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
@@ -292,6 +296,51 @@ async function watchReviewers(jobId: string, token: string) {
     const chat = (job.reviewProviders ?? []).filter(isChatProvider);
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
     const localSkip = (job.assumptions ?? []).find((a) => a.startsWith("Skipped local"));
+    const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "";
+    const localRunning = localInFlight.has(jobId);
+    if (
+      prompt &&
+      shouldStartLocalFallback({
+        providers: job.reviewProviders ?? [],
+        status: job.status,
+        connected: bridge.connected,
+        claimed,
+        localDone: Boolean(localLeg?.raw.trim() || localSkip),
+        localStarted: localStarted || localRunning,
+        waitedMs: Date.now() - started,
+      })
+    ) {
+      const ping = await pingLocalLlm(state.settings);
+      if (ping.ok) {
+        localStarted = true;
+        localInFlight.add(jobId);
+        void attachLocalLeg(jobId, prompt, { submit: true });
+      } else if (!localSkip) {
+        patchJob(jobId, (j) => ({
+          ...j,
+          assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
+          updatedAt: Date.now(),
+        }));
+      }
+    }
+    if (
+      !flushed &&
+      Date.now() - started >= LOCAL_HOLD_MS &&
+      job.status === "awaiting_chat" &&
+      (job.storedLegs ?? []).some((l) => l.raw.trim())
+    ) {
+      flushed = true;
+      if (localInFlight.has(jobId)) {
+        localInFlight.delete(jobId);
+        patchJob(jobId, (j) => ({
+          ...j,
+          assumptions: [...(j.assumptions ?? []), "Skipped local (timed out waiting)"].slice(0, 12),
+          updatedAt: Date.now(),
+        }));
+      }
+      const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
+      if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
+    }
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
       notes.push("Chrome bridge is not connected. ChatGPT/Grok start in parallel when the extension reconnects.");
@@ -299,8 +348,11 @@ async function watchReviewers(jobId: string, token: string) {
       notes.push("Chrome bridge claimed this job. ChatGPT and Grok run in parallel.");
     }
     if (localSkip) notes.push(`${localSkip} — skipped, does not block other reviewers.`);
-    else if (localLeg) notes.push("Local LLM finished in the background.");
-    else if ((job.reviewProviders ?? []).includes("local")) notes.push("Local LLM is running in the background and will not block ChatGPT/Grok.");
+    else if (localLeg) notes.push("Local LLM finished.");
+    else if (localStarted || localRunning) notes.push("Waiting for local LLM before posting.");
+    else if ((job.reviewProviders ?? []).includes("local") && chat.length) {
+      notes.push("Local LLM is fallback if Chrome does not return in time.");
+    }
 
     const phase: OpsPhase = chat.length && !bridge.connected && !claimed ? "blocked" : "running";
     const key = `${phase}|${notes.join("|")}`;
@@ -476,7 +528,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     ...j,
     status: "awaiting_chat",
     plan: providers.includes("local")
-      ? `Snapshot loaded. ${chatProviders.join(" + ")} via Chrome bridge; local LLM is optional and will not block.`
+      ? `Snapshot loaded. ${chatProviders.join(" + ")} via Chrome; local LLM runs if reachable and we wait for it before posting.`
       : providers.length > 1
         ? `Snapshot loaded. ${providers.join(" + ")} review in parallel. False-positive checks run in order: ${order.join(" → ")}.`
         : "Snapshot loaded. The Chrome bridge will send this to ChatGPT or Grok on this machine.",
@@ -487,10 +539,22 @@ async function playGithub(jobId: string, untrustedBody: string) {
     updatedAt: Date.now(),
   }));
   void watchReviewers(jobId, token);
-  if (providers.includes("local")) void attachLocalLeg(jobId, prompt);
+  if (providers.includes("local") && chatProviders.length) {
+    const ping = await pingLocalLlm(state.settings);
+    if (!ping.ok) {
+      patchJob(jobId, (j) => ({
+        ...j,
+        assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
+        updatedAt: Date.now(),
+      }));
+    } else {
+      localInFlight.add(jobId);
+      void attachLocalLeg(jobId, prompt, { submit: true });
+    }
+  }
 }
 
-async function attachLocalLeg(jobId: string, prompt: string) {
+async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
   try {
     const local = await runLocalLlm(prompt, state.settings);
     if (!local.ok) {
@@ -499,13 +563,13 @@ async function attachLocalLeg(jobId: string, prompt: string) {
         assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12),
         updatedAt: Date.now(),
       }));
-      return;
+    } else {
+      patchJob(jobId, (j) => {
+        if (j.status !== "awaiting_chat") return j;
+        const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
+        return { ...j, storedLegs: next, updatedAt: Date.now() };
+      });
     }
-    patchJob(jobId, (j) => {
-      if (j.status !== "awaiting_chat") return j;
-      const stored = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
-      return { ...j, storedLegs: stored, updatedAt: Date.now() };
-    });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     patchJob(jobId, (j) => ({
@@ -513,6 +577,15 @@ async function attachLocalLeg(jobId: string, prompt: string) {
       assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12),
       updatedAt: Date.now(),
     }));
+  } finally {
+    localInFlight.delete(jobId);
+    if (opts?.submit) {
+      const job = state.jobs.find((j) => j.id === jobId);
+      const legs = (job?.storedLegs ?? []).filter((l) => l.raw.trim());
+      if (job?.status === "awaiting_chat" && legs.length) {
+        await submitHarborChat(jobId, legs[0].raw, legs);
+      }
+    }
   }
 }
 
@@ -526,6 +599,7 @@ export async function submitHarborChat(
   jobId: string,
   raw: string,
   legs?: ChatLeg[],
+  opts?: { force?: boolean },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || job.status !== "awaiting_chat") {
@@ -545,6 +619,46 @@ export async function submitHarborChat(
   const payloads = job.chatFpRound ? incoming : [...incoming, ...stored];
   if (!payloads.length) {
     return { ok: false, error: "quota" };
+  }
+  if (!opts?.force && !job.chatFpRound) {
+    const localSkip = (job.assumptions ?? []).some((a) => a.startsWith("Skipped local"));
+    const chatSkip = (job.assumptions ?? []).some((a) => /Skipped (chatgpt|grok)/i.test(a));
+    const haveLocal = payloads.some((l) => l.provider === "local");
+    const haveChat = payloads.some((l) => isChatProvider(l.provider));
+    const bridge = await bridgeSnapshot();
+    const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
+    if (
+      shouldHoldForLocal({
+        providers,
+        haveLocal,
+        localSkipped: localSkip,
+        localInFlight: localInFlight.has(jobId),
+      }) ||
+      shouldHoldForChat({
+        providers,
+        haveChat,
+        chatSkipped: chatSkip,
+        claimed,
+        connected: bridge.connected,
+      })
+    ) {
+      patchJob(jobId, (j) => {
+        if (j.status !== "awaiting_chat") return j;
+        const next = [...(j.storedLegs ?? [])];
+        for (const leg of incoming) {
+          const i = next.findIndex((l) => l.provider === leg.provider);
+          if (i >= 0) next[i] = leg;
+          else next.push(leg);
+        }
+        return {
+          ...j,
+          storedLegs: next,
+          plan: haveChat && !haveLocal ? "Waiting for local LLM before posting." : "Waiting for Chrome reviewers before posting.",
+          updatedAt: Date.now(),
+        };
+      });
+      return { ok: true };
+    }
   }
   const skipped = providers.filter((p) => !payloads.some((l) => l.provider === p) && !(job.chatFpRound && p === "local"));
 

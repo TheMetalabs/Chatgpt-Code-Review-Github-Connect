@@ -44,6 +44,14 @@ export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" |
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = providers.includes("local");
   if (!findings.length) {
+    if (skipped.length) {
+      return `${REVIEW_SUMMARY_MARK}
+ChatGPT/Grok did not finish a full review.
+
+${skipped.map((s) => `- ${s}`).join("\n")}
+
+Not a clean pass — remaining reviewers did not run.`;
+    }
     return CLEAN_REVIEW_BODY;
   }
   return `${REVIEW_SUMMARY_MARK}
@@ -60,7 +68,7 @@ Here are some automated review suggestions for this pull request.
 | P1 | ${n.P1} |
 | P2 | ${n.P2} |
 
-${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local ? " Local LLM is optional and never blocks." : ""}
+${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local ? " Local LLM is fallback if Chrome does not return." : ""}
 ${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
 
 <details>

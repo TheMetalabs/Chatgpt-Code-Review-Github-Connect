@@ -23,6 +23,17 @@ describe("review-format", () => {
     assert.equal(empty, CLEAN_REVIEW_BODY);
     assert.equal(empty, "Didn't find any major issues.");
     assert.doesNotMatch(empty, /Codex/);
+    const partial = reviewSummaryBody(
+      {
+        headSha: "bd663b721d",
+        reviewProviders: ["chatgpt", "grok", "local"],
+        assumptions: ["Skipped grok, local (quota or unavailable)"],
+      },
+      [],
+      "ashlar-bot",
+    );
+    assert.notEqual(partial, CLEAN_REVIEW_BODY);
+    assert.match(partial, /Not a clean pass/);
     const full = reviewSummaryBody({ headSha: "bd663b721d", reviewProviders: ["chatgpt", "grok", "local"], assumptions: [] }, [FINDING_412], "ashlar-bot");
     assert.match(full, /Here are some automated review suggestions/);
     assert.match(full, /\| P1 \| 1 \|/);

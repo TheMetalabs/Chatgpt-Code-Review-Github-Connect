@@ -131,7 +131,14 @@ export const Route = createFileRoute("/api/harbor")({
           const localKey = keepSecret(body.localLlmApiKey);
           if (localKey) patch.localLlmApiKey = localKey.trim();
           if (Array.isArray(body.reviewOrder)) patch.reviewOrder = normalizeReviewOrder(body.reviewOrder);
-          if (Object.keys(patch).length) patchHarborSettings(patch);
+          if (Object.keys(patch).length) {
+            try {
+              patchHarborSettings(patch);
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : "could not persist settings";
+              return Response.json({ ok: false, error: msg }, { status: msg.includes("reviewer") ? 400 : 500 });
+            }
+          }
           return Response.json({ ok: true, github: githubStatus(), bridge: getBridgePublic() });
         }
         if (body.action === "github" || body.action === "github-clear") {

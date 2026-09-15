@@ -251,13 +251,20 @@ export function normalizeReviewOrder(order?: ReviewProvider[]): ReviewProvider[]
   return out;
 }
 
+export function localLlmReady(
+  s: Pick<BotSettings, "reviewLocal"> & Partial<Pick<BotSettings, "localLlmBaseUrl" | "localLlmModel">>,
+): boolean {
+  return Boolean(s.reviewLocal && s.localLlmBaseUrl?.trim() && s.localLlmModel?.trim());
+}
+
 export function providersFromSettings(
-  s: Pick<BotSettings, "reviewChatgpt" | "reviewGrok" | "reviewLocal">,
+  s: Pick<BotSettings, "reviewChatgpt" | "reviewGrok" | "reviewLocal"> &
+    Partial<Pick<BotSettings, "localLlmBaseUrl" | "localLlmModel">>,
 ): ReviewProvider[] {
   const out: ReviewProvider[] = [];
   if (s.reviewChatgpt !== false) out.push("chatgpt");
   if (s.reviewGrok !== false) out.push("grok");
-  if (s.reviewLocal) out.push("local");
+  if (localLlmReady(s)) out.push("local");
   return out;
 }
 

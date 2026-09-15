@@ -28,10 +28,11 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
-import { loadBotSettings, saveBotSettings } from "./settings.server";
+import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import {
   LIVE_INFLIGHT_STATUSES,
   isChatProvider,
+  localLlmReady,
   normalizeReviewOrder,
   providersFromSettings,
 } from "./types";
@@ -94,8 +95,10 @@ export function githubStatus() {
 }
 
 export function patchHarborSettings(patch: Partial<BotSettings>) {
-  const next = { ...state.settings, ...patch };
-  if (!providersFromSettings(next).length) return state.settings;
+  const next = sanitizeBotSettings({ ...state.settings, ...patch });
+  if (!providersFromSettings(next).length) {
+    throw new Error("at least one configured reviewer is required");
+  }
   const saved = saveBotSettings(next);
   state = { ...state, settings: saved };
   return state.settings;
@@ -356,30 +359,23 @@ async function playGithub(jobId: string, untrustedBody: string) {
   });
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
-  const storedLegs: ChatLeg[] = [];
-  if (providers.includes("local")) {
+
+  if (providers.includes("local") && !chatProviders.length) {
     patchJob(jobId, (j) => ({
       ...j,
       status: "reviewer",
       plan: "Snapshot loaded. Calling the local OpenAI-compatible LLM.",
+      reviewProviders: providers,
+      reviewOrder: order,
       updatedAt: Date.now(),
     }));
     const local = await runLocalLlm(prompt, state.settings);
-    if (local.ok) storedLegs.push({ provider: "local", raw: local.raw });
-    else {
-      patchJob(jobId, (j) => ({
-        ...j,
-        githubError: `local LLM: ${local.error}`,
-        updatedAt: Date.now(),
-      }));
-    }
-  }
-  if (!chatProviders.length) {
-    if (!storedLegs.length) {
+    if (!local.ok) {
       patchJob(jobId, (j) => ({
         ...j,
         status: "skipped",
         skipReason: "local LLM failed and no chat reviewer is on",
+        githubError: `local LLM: ${local.error}`,
         updatedAt: Date.now(),
       }));
       return;
@@ -391,25 +387,54 @@ async function playGithub(jobId: string, untrustedBody: string) {
       chatPrompt: prompt,
       reviewProviders: providers,
       reviewOrder: order,
-      storedLegs,
+      storedLegs: [{ provider: "local", raw: local.raw }],
       updatedAt: Date.now(),
     }));
-    await submitHarborChat(jobId, storedLegs[0].raw, storedLegs);
+    await submitHarborChat(jobId, local.raw, [{ provider: "local", raw: local.raw }]);
     return;
   }
+
   patchJob(jobId, (j) => ({
     ...j,
     status: "awaiting_chat",
-    plan:
-      providers.length > 1
+    plan: providers.includes("local")
+      ? `Snapshot loaded. ${chatProviders.join(" + ")} via Chrome bridge; local LLM is optional and will not block.`
+      : providers.length > 1
         ? `Snapshot loaded. ${providers.join(" + ")} review in parallel. False-positive checks run in order: ${order.join(" → ")}.`
         : "Snapshot loaded. The Chrome bridge will send this to ChatGPT or Grok on this machine.",
     chatPrompt: prompt,
     reviewProviders: providers,
     reviewOrder: order,
-    storedLegs,
+    storedLegs: [],
     updatedAt: Date.now(),
   }));
+  if (providers.includes("local")) void attachLocalLeg(jobId, prompt);
+}
+
+async function attachLocalLeg(jobId: string, prompt: string) {
+  try {
+    const local = await runLocalLlm(prompt, state.settings);
+    if (!local.ok) {
+      patchJob(jobId, (j) => ({
+        ...j,
+        assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12),
+        updatedAt: Date.now(),
+      }));
+      return;
+    }
+    patchJob(jobId, (j) => {
+      if (j.status !== "awaiting_chat") return j;
+      const stored = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
+      return { ...j, storedLegs: stored, updatedAt: Date.now() };
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    patchJob(jobId, (j) => ({
+      ...j,
+      assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12),
+      updatedAt: Date.now(),
+    }));
+  }
 }
 
 export function previewChatPaste(raw: string) {
@@ -589,9 +614,7 @@ export async function submitHarborChat(
   }
 
   const ran = [...byProvider.keys()];
-  const order = normalizeReviewOrder(still.reviewOrder ?? state.settings.reviewOrder).filter(
-    (p) => ran.includes(p) || (p === "local" && providers.includes("local")),
-  );
+  const order = normalizeReviewOrder(still.reviewOrder ?? state.settings.reviewOrder).filter((p) => ran.includes(p));
   patchJob(jobId, (j) => ({
     ...j,
     chatFpRound: true,
@@ -662,6 +685,23 @@ async function runFpPipeline(
       continue;
     }
     if (checker === "local") {
+      const hadLocal = (job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim());
+      if (!hadLocal || !localLlmReady(state.settings)) {
+        patchJob(jobId, (j) =>
+          j.fpPending
+            ? {
+                ...j,
+                fpPending: {
+                  ...j.fpPending,
+                  fpQueue: j.fpPending.fpQueue.slice(1),
+                  dropped: [...j.fpPending.dropped, "Skipped local (not configured or unavailable)"],
+                },
+                updatedAt: Date.now(),
+              }
+            : j,
+        );
+        continue;
+      }
       const prompt = buildFpPrompt({ sample, findings: toCheck, peer: "parallel reviewers" });
       const out = await runLocalLlm(prompt, state.settings);
       let check = null;

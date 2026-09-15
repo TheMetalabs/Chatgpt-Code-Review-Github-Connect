@@ -146,23 +146,75 @@ function settingsPath() {
   return join(process.cwd(), ".data", "ashlar-settings.json");
 }
 
+/** PR #4 / Studio path — still read so pm2 boxes that already saved here keep their LLM config. */
+function legacySettingsPath() {
+  return join(process.cwd(), ".data", "ashlar-bot-settings.json");
+}
+
+function readJsonObject(path: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeJson(path: string, value: BotSettings) {
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+function readDiskSettings(): Record<string, unknown> {
+  return { ...readJsonObject(legacySettingsPath()), ...readJsonObject(settingsPath()) };
+}
+
+/** Do not copy env-only secrets onto disk. Env remains the source until the operator types a key in Settings. */
+export function persistableSettings(next: BotSettings, env: NodeJS.Dict<string> = process.env, disk: Record<string, unknown> = readDiskSettings()): BotSettings {
+  const out = { ...next };
+  const envKey = env.ASHLAR_LOCAL_LLM_API_KEY;
+  if (envKey && out.localLlmApiKey === envKey && disk.localLlmApiKey !== envKey) {
+    out.localLlmApiKey = typeof disk.localLlmApiKey === "string" ? disk.localLlmApiKey : "";
+  }
+  const envSecret = env.ASHLAR_WEBHOOK_SECRET;
+  if (envSecret && out.webhookSecret === envSecret && disk.webhookSecret !== envSecret) {
+    out.webhookSecret = typeof disk.webhookSecret === "string" ? disk.webhookSecret : DEFAULT_SETTINGS.webhookSecret;
+  }
+  return sanitizeBotSettings(out);
+}
+
 export function loadBotSettings(): BotSettings {
   loadDotenvFile();
-  let disk: Record<string, unknown> = {};
-  try {
-    disk = JSON.parse(readFileSync(settingsPath(), "utf8")) as Record<string, unknown>;
-  } catch {
-    disk = {};
-  }
-  return sanitizeBotSettings(overlayEnv(disk));
+  return sanitizeBotSettings(overlayEnv(readDiskSettings()));
 }
 
 export function saveBotSettings(settings: BotSettings) {
-  const next = sanitizeBotSettings(settings);
-  const dir = dirname(settingsPath());
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(settingsPath(), `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  writeEnvPatch(botSettingsToEnv(next));
-  return next;
+  const runtime = sanitizeBotSettings(settings);
+  const disk = persistableSettings(runtime);
+  let persisted = false;
+  try {
+    writeJson(settingsPath(), disk);
+    writeJson(legacySettingsPath(), disk);
+    persisted = true;
+  } catch {
+    /* env file may still succeed */
+  }
+  try {
+    const envPatch: Record<string, string | undefined> = botSettingsToEnv(disk);
+    if (runtime.localLlmApiKey && runtime.localLlmApiKey === process.env.ASHLAR_LOCAL_LLM_API_KEY) {
+      envPatch.ASHLAR_LOCAL_LLM_API_KEY = undefined;
+    }
+    if (runtime.webhookSecret && runtime.webhookSecret === process.env.ASHLAR_WEBHOOK_SECRET) {
+      envPatch.ASHLAR_WEBHOOK_SECRET = undefined;
+    }
+    writeEnvPatch(envPatch);
+    persisted = true;
+  } catch {
+    /* json may still have been written */
+  }
+  if (!persisted) throw new Error("settings persist failed");
+  return runtime;
 }
+
 

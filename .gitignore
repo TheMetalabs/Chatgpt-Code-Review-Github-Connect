@@ -14,11 +14,9 @@ screenshots/
 # grok runtime (not source)
 .grok/preview.log
 .grok/status
+AGENTS.md
+AGENTS.project.md
 
 node_modules/
 dist/
 .output/
-
-# grok workspace ids — not product
-.github_repo
-.project_id

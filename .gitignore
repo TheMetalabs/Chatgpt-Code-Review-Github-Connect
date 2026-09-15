@@ -20,3 +20,7 @@ AGENTS.project.md
 node_modules/
 dist/
 .output/
+
+# grok workspace ids — not product
+.github_repo
+.project_id

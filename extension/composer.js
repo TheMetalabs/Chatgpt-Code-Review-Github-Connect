@@ -60,8 +60,9 @@ async function attachFiles(files) {
   input.files = dt.files;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  await sleep(200);
-  return input.files && input.files.length > 0;
+  await sleep(400);
+  const hay = `${document.body?.innerText || ""} ${[...document.querySelectorAll("[data-file-name], [title]")].map((n) => n.getAttribute("data-file-name") || n.getAttribute("title") || n.textContent || "").join(" ")}`;
+  return files.every((f) => hay.includes(f.name));
 }
 
 async function fillComposer(el, text) {

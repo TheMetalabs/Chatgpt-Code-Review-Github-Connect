@@ -268,12 +268,21 @@ async function tickBody() {
       (p) => p === "chatgpt" || p === "grok",
     );
     const runnable = wanted.filter((p) => providerOpen(quota, p));
+    const generating = {};
+    wanted.forEach((p) => {
+      generating[p] = runnable.includes(p);
+    });
     if (!runnable.length) {
       chrome.storage.local.set({ lastError: "waiting for chat quota reset" });
+      try {
+        await ping(job.jobId, generating);
+      } catch {
+        /* ignore */
+      }
       await api("/api/bridge", { action: "release", jobId: job.jobId });
       return;
     }
-    const generating = {};
+    void ping(job.jobId, generating);
     const keepAlive = setInterval(() => void ping(job.jobId, generating), PING_MS);
     const results = [];
     let quotaOnly = true;

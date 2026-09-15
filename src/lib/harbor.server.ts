@@ -324,10 +324,20 @@ async function watchReviewers(jobId: string, token: string) {
       claimed,
       connected: bridge.connected,
     });
-    if (!flushed && job.status === "awaiting_chat" && stored.some((l) => l.raw.trim()) && !racing) {
+    if (!flushed && job.status === "awaiting_chat" && !racing) {
       flushed = true;
       const legs = stored.filter((l) => l.raw.trim());
       if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
+      else {
+        patchJob(jobId, (j) => ({
+          ...j,
+          status: "skipped",
+          skipReason: "every enabled reviewer finished with no JSON",
+          plan: "No reviewer JSON to schema-merge.",
+          updatedAt: Date.now(),
+        }));
+        void upsertOpsComment(token, jobId, "skipped", ["Enabled reviewers finished without JSON. Nothing to post."]);
+      }
     }
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {

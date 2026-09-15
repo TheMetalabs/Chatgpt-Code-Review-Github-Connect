@@ -1,12 +1,10 @@
 import { createPrivateKey } from "node:crypto";
-import * as dns from "node:dns";
+import { lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, policyPathsFor, snapshotFileRef } from "./github-snapshot";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
-
-dns.setDefaultResultOrder("ipv4first");
 
 const GH_HOST = "api.github.com";
 const MAX_FILES = 20;
@@ -84,8 +82,20 @@ export function formatGithubError(e: unknown): string {
 
 type GhRes = { status: number; text: string };
 
-/** Bypass Vite/Nitro-patched fetch. Force IPv4 — Mac Node often fails IPv6 while curl works. */
-function ghHttps(
+async function resolveGithubHost(): Promise<{ hostname: string; servername?: string; family?: 4 | 6 }> {
+  for (const family of [undefined, 4, 6] as const) {
+    try {
+      const r = await dnsLookup(GH_HOST, family ? { family } : {});
+      return { hostname: r.address, servername: GH_HOST, family: r.family === 6 ? 6 : 4 };
+    } catch {
+      /* try next lookup mode */
+    }
+  }
+  return { hostname: GH_HOST };
+}
+
+/** Bypass Vite/Nitro-patched fetch. Resolve IPv4 then IPv6; never require A-records only. */
+async function ghHttps(
   method: string,
   path: string,
   headers: Record<string, string>,
@@ -93,14 +103,17 @@ function ghHttps(
   timeoutMs = 20_000,
 ): Promise<GhRes> {
   const p = path.startsWith("/") ? path : `/${path}`;
+  const resolved = await resolveGithubHost();
   return new Promise((resolve, reject) => {
     const req = https.request(
       {
-        hostname: GH_HOST,
+        hostname: resolved.hostname,
+        servername: resolved.servername ?? GH_HOST,
         path: p,
         method,
-        family: 4,
+        ...(resolved.family ? { family: resolved.family } : {}),
         headers: {
+          Host: GH_HOST,
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
           "User-Agent": "ashlar-bot",

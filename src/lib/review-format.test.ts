@@ -22,7 +22,7 @@ describe("review-format", () => {
     const empty = reviewSummaryBody({ headSha: "bd663b721d", reviewProviders: ["chatgpt", "grok"], assumptions: [] }, [], "ashlar-bot");
     assert.match(empty, /### 💡 Ashlar Review/);
     assert.match(empty, /Reviewed commit:\*\* `bd663b7`/);
-    assert.match(empty, /No findings/);
+    assert.match(empty, /Didn't find any major issues/);
     const full = reviewSummaryBody({ headSha: "bd663b721d", reviewProviders: ["chatgpt", "grok", "local"], assumptions: [] }, [FINDING_412], "ashlar-bot");
     assert.match(full, /Here are some automated review suggestions/);
     assert.match(full, /\| P1 \| 1 \|/);

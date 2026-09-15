@@ -1,22 +1,33 @@
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 function composer() {
-  return (
-    document.querySelector("#prompt-textarea") ||
-    document.querySelector('[data-testid="prompt-textarea"]') ||
-    document.querySelector("div.ProseMirror[contenteditable='true']") ||
-    document.querySelector('[contenteditable="true"]')
-  );
+  const selectors = [
+    '#prompt-textarea',
+    '[data-testid="prompt-textarea"]',
+    'form[data-type="unified-composer"] [contenteditable="true"]',
+    'div.ProseMirror[contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+  ];
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (visible(el)) return el;
+  }
+  const all = [...document.querySelectorAll('[contenteditable="true"], textarea')].filter(visible);
+  return all.at(-1) || null;
 }
 
 function sendButton() {
-  return (
-    document.querySelector('[data-testid="send-button"]') ||
-    document.querySelector('button[aria-label="Send prompt"]') ||
-    document.querySelector('button[aria-label="Send"]')
-  );
+  const selectors = [
+    "#composer-submit-button",
+    '[data-testid="send-button"]',
+    'button[data-testid="send-button"]',
+    'button[aria-label="Send prompt"]',
+    'button[aria-label="Send message"]',
+    'button[aria-label*="Send"]',
+  ];
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (el) return el;
+  }
+  return null;
 }
 
 function quotaHit() {
@@ -30,24 +41,6 @@ function quotaError() {
   const e = new Error("ChatGPT usage limit");
   e.code = "quota";
   return e;
-}
-
-async function setComposer(text) {
-  const el = composer();
-  if (!el) throw new Error("ChatGPT composer not found");
-  el.focus();
-  if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
-    const proto = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
-    proto?.set?.call(el, text);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-  } else {
-    document.execCommand("selectAll", false);
-    document.execCommand("insertText", false, text);
-    if (!el.innerText.includes(text.slice(0, 40))) {
-      el.textContent = text;
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
-    }
-  }
 }
 
 function lastAssistant() {
@@ -70,29 +63,11 @@ function extractJson(text) {
   }
 }
 
-async function waitComposer() {
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    if (composer()) return;
-    await sleep(300);
-  }
-  throw new Error("ChatGPT composer not found");
-}
-
 async function runPrompt(prompt) {
-  await waitComposer();
+  const el = await waitFor(composer, 45_000, "ChatGPT composer not found");
   if (quotaHit()) throw quotaError();
-  if (lastAssistant()) {
-    throw new Error("ChatGPT tab was not a fresh session");
-  }
-  await setComposer(prompt);
-  await sleep(200);
-  const btn = sendButton();
-  if (btn && !btn.disabled) btn.click();
-  else {
-    const el = composer();
-    el?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  }
+  await fillComposer(el, prompt);
+  await clickSend(sendButton, composer);
   const deadline = Date.now() + 180_000;
   let stable = "";
   let hits = 0;

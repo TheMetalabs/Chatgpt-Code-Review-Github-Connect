@@ -1,19 +1,22 @@
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 function composer() {
-  return (
-    document.querySelector("textarea") ||
-    document.querySelector('[contenteditable="true"]') ||
-    document.querySelector("div.ProseMirror")
-  );
+  const selectors = [
+    "textarea",
+    '[contenteditable="true"][role="textbox"]',
+    "div.ProseMirror[contenteditable='true']",
+    '[contenteditable="true"]',
+  ];
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (visible(el)) return el;
+  }
+  return null;
 }
 
 function sendButton() {
   return (
     document.querySelector('button[aria-label="Submit"]') ||
     document.querySelector('button[aria-label="Send"]') ||
+    document.querySelector('button[aria-label*="Send"]') ||
     document.querySelector('button[type="submit"]')
   );
 }
@@ -46,26 +49,7 @@ async function startFresh() {
   clickLabel(/temporary|private chat|incognito|ghost/i);
   await sleep(400);
   clickLabel(/new chat|new conversation/i);
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    if (composer()) return;
-    await sleep(300);
-  }
-  throw new Error("Grok composer not found");
-}
-
-async function setComposer(text) {
-  const el = composer();
-  if (!el) throw new Error("Grok composer not found");
-  el.focus();
-  if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
-    const proto = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
-    proto?.set?.call(el, text);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-  } else {
-    document.execCommand("selectAll", false);
-    document.execCommand("insertText", false, text);
-  }
+  return waitFor(composer, 45_000, "Grok composer not found");
 }
 
 function lastAssistant() {
@@ -91,13 +75,10 @@ function extractJson(text) {
 }
 
 async function runPrompt(prompt) {
-  await startFresh();
+  const el = await startFresh();
   if (quotaHit()) throw quotaError();
-  await setComposer(prompt);
-  await sleep(200);
-  const btn = sendButton();
-  if (btn && !btn.disabled) btn.click();
-  else composer()?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await fillComposer(el, prompt);
+  await clickSend(sendButton, composer);
   const deadline = Date.now() + 180_000;
   let stable = "";
   let hits = 0;

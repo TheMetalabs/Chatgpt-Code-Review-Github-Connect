@@ -10,6 +10,10 @@ function formatRetry(until) {
   return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString();
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function settings() {
   const s = await chrome.storage.local.get(["origin", "token", "enabled"]);
   return {
@@ -48,6 +52,7 @@ async function ensureTab(provider) {
   const url = providerUrl(provider);
   const tab = await chrome.tabs.create({ url, active: true });
   await waitTab(tab.id);
+  await sleep(1500);
   return tab.id;
 }
 
@@ -67,15 +72,25 @@ function waitTab(tabId) {
   });
 }
 
-function sendToTab(tabId, msg) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("chat tab timed out")), 200_000);
-    chrome.tabs.sendMessage(tabId, msg, (res) => {
-      clearTimeout(timer);
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve(res);
+async function sendToTab(tabId, msg, files) {
+  const once = () =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("chat tab timed out")), 200_000);
+      chrome.tabs.sendMessage(tabId, msg, (res) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(res);
+      });
     });
-  });
+  try {
+    return await once();
+  } catch {
+    if (files?.length) {
+      await chrome.scripting.executeScript({ target: { tabId }, files });
+      await sleep(400);
+    }
+    return once();
+  }
 }
 
 async function closeTab(tabId) {
@@ -104,19 +119,15 @@ async function markQuota(provider) {
   return quota[provider];
 }
 
+function contentFiles(provider) {
+  return provider === "grok" ? ["composer.js", "content-grok.js"] : ["composer.js", "content-chatgpt.js"];
+}
+
 async function runProvider(provider, prompt, jobId) {
   const tabId = await ensureTab(provider);
+  const files = contentFiles(provider);
   try {
-    let result;
-    try {
-      result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId });
-    } catch {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: [provider === "grok" ? "content-grok.js" : "content-chatgpt.js"],
-      });
-      result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId });
-    }
+    const result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId }, files);
     if (!result?.ok) {
       const err = new Error(`${provider}: ${result?.error || "chat tab returned nothing"}`);
       err.code = result?.code;

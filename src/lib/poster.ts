@@ -1,5 +1,6 @@
 import type { BotSettings, Finding, Job, MergeRec, PostedComment, PostedReview, ReviewProvider, SamplePr, Severity } from "./types.ts";
 import { SAMPLE_PRS } from "./samples.ts";
+import { inlineFindingComment, reviewSummaryBody } from "./review-format.ts";
 
 export const SEVERITY_RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2 };
 
@@ -102,35 +103,10 @@ export function buildReview(job: Job, findings: Finding[], settings: BotSettings
     file: f.file,
     line: f.line,
     side: f.side,
-    body: [
-      `**${f.severity} · ${f.title}**`,
-      "",
-      f.failureScenario,
-      "",
-      `_Evidence._ ${f.evidence}`,
-      "",
-      `_Fix._ ${f.recommendedFix}`,
-      "",
-      `_Test._ ${f.recommendedTest}`,
-    ].join("\n"),
+    body: inlineFindingComment(f, { owner: job.owner, repo: job.repo, headSha: job.headSha }),
   }));
 
-  const body =
-    findings.length === 0
-      ? `Investigated \`${job.headSha.slice(0, 7)}\`. No concrete failure path under current policy.\n\n— ${settings.username}`
-      : [
-          findings.length === 1 ? "1 finding." : `${findings.length} findings.`,
-          (job.reviewProviders?.length ?? 0) > 1 && !job.assumptions.some((a) => a.startsWith("Skipped"))
-            ? "Reviewers ran in parallel. One-sided findings were checked in review order, not all-to-all."
-            : (job.reviewProviders?.length ?? 0) > 1
-              ? "One reviewer was unavailable. Posted from the reviewers that completed."
-              : "",
-          job.highestRisk ? `Highest risk: ${job.highestRisk}` : "",
-          job.investigatedSafe.length ? `Investigated safe: ${job.investigatedSafe.join("; ")}` : "",
-          `— ${settings.username}`,
-        ]
-          .filter(Boolean)
-          .join("\n");
+  const body = reviewSummaryBody(job, findings, settings.username);
 
   return {
     id: `rev-${job.id}`,

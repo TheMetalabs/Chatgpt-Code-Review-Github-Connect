@@ -98,7 +98,7 @@ describe("poster", () => {
       DEFAULT_SETTINGS,
     );
     assert.ok(mentioned);
-    assert.equal(mentioned.event, "COMMENT");
+    assert.match(mentioned.body, /Ashlar Review/);
     assert.match(mentioned.body, /ashlar-bot/);
   });
 

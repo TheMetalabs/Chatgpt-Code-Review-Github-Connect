@@ -274,7 +274,6 @@ async function bridgeSnapshot() {
   return getBridgePublic();
 }
 
-const BRIDGE_GRACE_MS = 25_000;
 const WATCH_TICK_MS = 5_000;
 const WATCH_CAP_MS = 8 * 60_000;
 
@@ -307,16 +306,6 @@ async function watchReviewers(jobId: string, token: string) {
     if (key !== lastNotes) {
       await upsertOpsComment(token, jobId, phase, notes);
       lastNotes = key;
-    }
-
-    const waitingChat = job.status === "awaiting_chat" && chat.length && !bridge.connected && !claimed;
-    if (waitingChat && Date.now() - started >= BRIDGE_GRACE_MS && localLeg) {
-      await upsertOpsComment(token, jobId, "running", [
-        ...notes,
-        "Posting from local LLM. ChatGPT/Grok skipped because the bridge stayed disconnected.",
-      ]);
-      await submitHarborChat(jobId, localLeg.raw, [localLeg]);
-      return;
     }
 
     await sleep(WATCH_TICK_MS);

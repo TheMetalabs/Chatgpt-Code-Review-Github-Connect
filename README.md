@@ -269,7 +269,7 @@ PR 본문이나 리뷰 코멘트에 `@ashlar-bot` 또는 `/review` 를 쓰면 �
 | Recent deliveries에 `issue_comment` 자체가 없음 | 이벤트 미구독 또는 권한 미수락 | Issue comment + Issues Read. 조직 설치 **Accept new permissions** |
 | Inbox는 202, Jobs `not a mention` | Codex 등 다른 봇 댓글 | 본인이 `@ashlar-bot` 또는 `/review` 를 단 댓글인지 |
 | Inbox `ignored event` `pull_request_review` | 리뷰 Submit 이벤트 | 정상. **Pull request review** 구독은 끄세요 |
-| `GitHub snapshot failed` / `ENOTFOUND` | Node가 `api.github.com` 을 못 찾음 | Settings **Test GitHub API**. `curl -I https://api.github.com` 은 호스트 셸 기준이라 프로세스가 Docker면 다를 수 있음 |
+| `GitHub snapshot failed` / `ENOTFOUND` | Node 시스템 DNS가 `api.github.com` 을 못 찾음 | Settings **Test GitHub API**. Ashlar는 실패 시 1.1.1.1/8.8.8.8 DoH로 IP를 받아 SNI로 붙습니다. 그래도 실패면 프로세스에 HTTPS 자체가 막힌 것 |
 | Test GitHub API 401/404 | JWT iss / 키 / 설치 | App ID 또는 Client ID, PEM, Install App, Accept new permissions |
 | 👀 가 안 붙음 | Issues Write 없음 또는 토큰 실패 | Issues **Read & write** + Accept new permissions. 리액션은 토큰이 난 뒤에만 붙음 |
 | Jobs가 안 생김 | skip | Inbox skip 이유: draft / fork / 중복 delivery / not a mention |

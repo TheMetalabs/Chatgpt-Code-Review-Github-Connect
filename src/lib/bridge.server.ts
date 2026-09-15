@@ -2,6 +2,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider } from "./types";
 import { BRIDGE_CLAIM_MS, isChatProvider, providersFromSettings } from "./types";
+import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
+import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 
 type BridgeMeta = {
   token: string;
@@ -10,7 +12,29 @@ type BridgeMeta = {
   lastError?: string;
 };
 
-let meta: BridgeMeta = { token: randomBytes(18).toString("base64url"), lastSeen: 0 };
+function newToken() {
+  return randomBytes(18).toString("base64url");
+}
+
+function persistToken(token: string) {
+  process.env[BRIDGE_TOKEN_ENV] = token;
+  if (process.env.NODE_TEST_CONTEXT) return;
+  try {
+    writeEnvPatch({ [BRIDGE_TOKEN_ENV]: token });
+  } catch {
+    /* .env may be missing or read-only */
+  }
+}
+
+function loadToken(): string {
+  loadDotenvFile();
+  const resolved = resolveBridgeToken(process.env[BRIDGE_TOKEN_ENV], newToken);
+  if (resolved.persist) persistToken(resolved.token);
+  else process.env[BRIDGE_TOKEN_ENV] = resolved.token;
+  return resolved.token;
+}
+
+let meta: BridgeMeta = { token: loadToken(), lastSeen: 0 };
 
 export type BridgeStatus = {
   token: string;
@@ -38,7 +62,9 @@ export function getBridgePublic(): BridgePublic {
 }
 
 export function rotateBridgeToken() {
-  meta = { token: randomBytes(18).toString("base64url"), lastSeen: 0 };
+  const token = newToken();
+  persistToken(token);
+  meta = { token, lastSeen: 0 };
   return getBridgeStatus();
 }
 

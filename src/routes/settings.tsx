@@ -401,7 +401,8 @@ function BridgePanel() {
       <p className="mt-1 text-[13px] leading-relaxed text-fg-muted">
         Download the unpacked Chrome extension, load it in the same profile where ChatGPT or Grok is signed in, then
         paste origin + token into the extension popup. After that, a PR webhook runs the review without Send or
-        paste.
+        paste. The token is stored in <code>.env</code> (<code>ASHLAR_BRIDGE_TOKEN</code>) so a PM2 restart keeps
+        it. Rotate only when you want to mint a new one — then paste it into the popup again.
       </p>
       <dl className="mt-3 space-y-2 font-mono text-[12px]">
         <div className="flex items-center justify-between gap-3">

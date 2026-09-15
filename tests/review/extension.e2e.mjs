@@ -58,9 +58,19 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId).status,'awaiting_chat');
  assert.equal(app.localRequests.length,1);assert.equal(await page.evaluate(()=>window.sends),1);
  // Reload the actual extension, not a mocked JS function; persistent task resumes original tab.
- const restarted=context.waitForEvent('serviceworker');
+ // Playwright can retain the same Worker object across a service-worker restart.
+ // Prove the execution context was replaced instead of requiring a new Worker event.
+ const workerUrl=worker.url();
+ const reattached=next=>{if(next.url()===workerUrl)worker=next;};
+ context.on('serviceworker',reattached);
+ await worker.evaluate(()=>{globalThis.__fixtureBeforeReload=true;});
  await worker.evaluate(()=>chrome.runtime.reload()).catch(()=>{});
- worker=await restarted;
+ await eventually(async()=>{
+  worker=context.serviceWorkers().find(candidate=>candidate.url()===workerUrl)||worker;
+  try { return await worker.evaluate(()=>!globalThis.__fixtureBeforeReload&&typeof tick==='function'); }
+  catch { return false; }
+ },'extension execution context did not restart');
+ context.off('serviceworker',reattached);
  await worker.evaluate(()=>tick());
  await page.evaluate(raw=>window.reply(raw,false),json);
  await new Promise(resolve=>setTimeout(resolve,1700));

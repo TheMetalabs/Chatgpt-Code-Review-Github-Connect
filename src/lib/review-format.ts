@@ -8,6 +8,9 @@ const BADGE: Record<Severity, string> = {
 
 export const REVIEW_SUMMARY_MARK = "<!-- ashlar-review-summary -->";
 
+/** Exact Codex clean-pass copy. Review-loop scripts match this string. */
+export const CODEX_CLEAN_REVIEW = "Codex Review: Didn't find any major issues.";
+
 export function severityBadgeMarkdown(severity: Severity): string {
   return `**<sub><sub>![${severity} Badge](${BADGE[severity]})</sub></sub>**`;
 }
@@ -41,25 +44,7 @@ export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" |
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = providers.includes("local");
   if (!findings.length) {
-    return `${REVIEW_SUMMARY_MARK}
-
-### 💡 Ashlar Review
-
-**Didn't find any major issues.**
-
-**Reviewed commit:** \`${sha}\`
-
-${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
-
-<details>
-<summary>ℹ️ About Ashlar</summary>
-
-If Ashlar has suggestions, it comments inline with P0 / P1 / P2 badges. Otherwise it posts this and reacts with 👍.
-
-</details>
-
-— ${username}
-`;
+    return CODEX_CLEAN_REVIEW;
   }
   return `${REVIEW_SUMMARY_MARK}
 

@@ -21,13 +21,6 @@ function sendButton() {
   );
 }
 
-function quotaHit() {
-  const t = (document.body?.innerText || "").slice(0, 16_000).toLowerCase();
-  return /you've reached (the |your )?(limit|usage)|hit the (free plan )?limit|usage limit|rate limit|too many requests|try again later|limit resets|out of (credits|quota)|come back later|temporarily (unavailable|limited)|quota/.test(
-    t,
-  );
-}
-
 function quotaError() {
   const e = new Error("Grok usage limit");
   e.code = "quota";

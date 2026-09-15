@@ -31,6 +31,7 @@ async function insertPrompt(el, text) {
   document.execCommand("delete", false, null);
   for (let i = 0; i < text.length; i += chunk) {
     document.execCommand("insertText", false, text.slice(i, i + chunk));
+    await sleep(15);
   }
 }
 

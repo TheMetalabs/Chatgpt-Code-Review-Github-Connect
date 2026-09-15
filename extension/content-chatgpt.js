@@ -10,8 +10,7 @@ function composer() {
     const el = document.querySelector(sel);
     if (visible(el)) return el;
   }
-  const all = [...document.querySelectorAll('[contenteditable="true"], textarea')].filter(visible);
-  return all.at(-1) || null;
+  return null;
 }
 
 function sendButton() {
@@ -28,13 +27,6 @@ function sendButton() {
     if (el) return el;
   }
   return null;
-}
-
-function quotaHit() {
-  const t = (document.body?.innerText || "").slice(0, 16_000).toLowerCase();
-  return /you've reached (the |your )?(limit|usage)|hit the (free plan )?limit|usage limit|rate limit|too many requests|try again later|limit resets|out of (credits|quota)|upgrade to (chatgpt|plus)|quota/.test(
-    t,
-  );
 }
 
 function quotaError() {
@@ -64,7 +56,9 @@ function extractJson(text) {
 }
 
 async function runPrompt(prompt) {
-  const el = await waitFor(composer, 45_000, "ChatGPT composer not found");
+  await waitFor(composer, 45_000, "ChatGPT composer not found");
+  const el = composer();
+  if (!el) throw new Error("ChatGPT composer not found");
   if (quotaHit()) throw quotaError();
   await fillComposer(el, prompt);
   await clickSend(sendButton, composer);

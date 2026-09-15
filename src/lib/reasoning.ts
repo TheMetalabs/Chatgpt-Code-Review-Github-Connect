@@ -36,19 +36,19 @@ export function chatgptUrl(reasoning: ChatgptReasoning): string {
 
 export function chatgptReasoningMatches(level: ChatgptReasoning, text: string): boolean {
   const t = String(text || "").replace(/\s+/g, " ").trim();
-  if (level === "pro") return /6\s*pro/i.test(t) || /^pro$/i.test(t);
+  if (level === "pro") return /6\s*pro/i.test(t) || /(?:^|\s)pro(?:\s|$)/i.test(t);
   if (level === "extra_high") return /extra\s*high/i.test(t);
-  if (level === "high") return /^(high|높음)$/i.test(t);
-  if (level === "medium") return /^(medium|보통)$/i.test(t);
-  if (level === "instant") return /^(instant|즉시)$/i.test(t);
+  if (level === "high") return /(?:^|\s)(high|높음)(?:\s|$)/i.test(t) && !/extra/i.test(t);
+  if (level === "medium") return /(?:^|\s)(medium|보통)(?:\s|$)/i.test(t);
+  if (level === "instant") return /(?:^|\s)(instant|즉시)(?:\s|$)/i.test(t);
   return false;
 }
 
 export function grokReasoningMatches(level: GrokReasoning, text: string): boolean {
   const t = String(text || "").replace(/\s+/g, " ").trim();
-  if (level === "heavy") return /^(heavy|헤비)$/i.test(t);
-  if (level === "expert") return /^(expert|전문가)$/i.test(t);
-  if (level === "fast") return /^(fast|빠른)$/i.test(t);
-  if (level === "auto") return /^(auto|자동)$/i.test(t);
+  if (level === "heavy") return /(?:^|\s)(heavy|헤비)(?:\s|$)/i.test(t);
+  if (level === "expert") return /(?:^|\s)(expert|전문가)(?:\s|$)/i.test(t);
+  if (level === "fast") return /(?:^|\s)(fast|빠른)(?:\s|$)/i.test(t);
+  if (level === "auto") return /(?:^|\s)(auto|자동)(?:\s|$)/i.test(t);
   return false;
 }

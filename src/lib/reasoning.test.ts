@@ -25,7 +25,10 @@ describe("reasoning defaults", () => {
     assert.equal(chatgptReasoningMatches("pro", "Instant"), false);
     assert.equal(chatgptReasoningMatches("instant", "Instant"), true);
     assert.equal(grokReasoningMatches("fast", "빠른"), true);
+    assert.equal(grokReasoningMatches("fast", "모델 선택 빠른"), true);
     assert.equal(grokReasoningMatches("heavy", "헤비"), true);
     assert.equal(grokReasoningMatches("heavy", "빠른"), false);
+    assert.equal(chatgptReasoningMatches("high", "High (Thinking-Extended)"), true);
+    assert.equal(chatgptReasoningMatches("high", "Extra High"), false);
   });
 });

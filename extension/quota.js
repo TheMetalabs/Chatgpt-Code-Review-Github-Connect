@@ -37,20 +37,18 @@ function stopButtonVisible() {
   return false;
 }
 
-/** Copy / feedback toolbar after the turn — ChatGPT "응답 작업". */
+/** Assistant-turn copy/feedback only. User "메시지 복사" is not "answer done". */
 function replyDoneVisible() {
-  const sels = [
-    '[data-testid="copy-turn-action-button"]',
-    '[data-testid="feedback-turn-action-button"]',
-    '[aria-label="응답 작업"]',
-    '[aria-label="Response actions"]',
-    '[aria-label="응답 복사"]',
-    '[aria-label="Copy response"]',
-    '[aria-label="Copy"]',
-  ];
-  for (const sel of sels) {
-    const el = document.querySelector(sel);
-    if (elVisible(el)) return true;
+  const assistantTurn = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].find((t) =>
+    t.querySelector('[data-message-author-role="assistant"]'),
+  );
+  const root = assistantTurn || document.querySelector('[data-message-author-role="assistant"]')?.parentElement;
+  if (!root) return false;
+  if (elVisible(root.querySelector('[aria-label="응답 작업"], [aria-label="Response actions"]'))) return true;
+  for (const el of root.querySelectorAll('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]')) {
+    const aria = el.getAttribute("aria-label") || "";
+    if (/메시지 복사|copy message|내 메시지/i.test(aria)) continue;
+    if (elVisible(el) && /응답|copy response|feedback|평가/i.test(aria)) return true;
   }
   return false;
 }

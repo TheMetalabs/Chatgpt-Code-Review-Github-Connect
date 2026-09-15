@@ -66,19 +66,38 @@ function extractChatJson(text) {
   return lastReviewJson(s);
 }
 
+function cleanTurnText(el) {
+  if (!el) return "";
+  const root = el.cloneNode(true);
+  root.querySelectorAll("button, svg, script, [data-testid='copy-turn-action-button']").forEach((n) => n.remove());
+  root.querySelectorAll("br").forEach((br) => br.replaceWith(document.createTextNode("\n")));
+  return (root.innerText || root.textContent || "").replace(/\u00a0/g, " ").trim();
+}
+
 function assistantCorpus() {
-  const nodes = [
-    ...document.querySelectorAll(
-      '[data-message-author-role="assistant"], [data-message-author-role="assistant"] pre, [data-message-author-role="assistant"] code',
-    ),
-  ];
-  const copy = document.querySelector('[data-testid="copy-turn-action-button"], [aria-label="응답 복사"], [aria-label="Copy response"]');
-  let turn = copy ? copy.parentElement : null;
-  for (let i = 0; i < 8 && turn; i += 1) {
-    nodes.push(turn);
-    turn = turn.parentElement;
+  const turns = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+  const chunks = [];
+  for (const turn of turns) {
+    const md = turn.querySelector(".markdown") || turn;
+    const text = cleanTurnText(md);
+    if (text) chunks.push(text);
   }
-  return nodes.map((n) => (n.innerText || n.textContent || "").trim()).filter(Boolean);
+  return chunks;
+}
+
+async function harvestViaCopy() {
+  const btn = [...document.querySelectorAll('[data-testid="copy-turn-action-button"]')]
+    .reverse()
+    .find((el) => /응답 복사|Copy response/i.test(el.getAttribute("aria-label") || ""));
+  if (!btn) return null;
+  try {
+    btn.click();
+    await sleep(250);
+    const text = await navigator.clipboard.readText();
+    return extractChatJson(text);
+  } catch {
+    return null;
+  }
 }
 
 function harvestJson(opts) {
@@ -105,7 +124,7 @@ async function waitUntilReviewOrQuota(name) {
   let emptyTicks = 0;
   for (;;) {
     const done = typeof chatGenerationFinished === "function" ? chatGenerationFinished() : !stopButtonVisible();
-    const json = harvestJson({ allowThin: done });
+    const json = harvestJson({ allowThin: done }) || (done ? await harvestViaCopy() : null);
     if (typeof quotaHit === "function" && quotaHit() && !json) {
       const e = new Error(`${name} usage limit`);
       e.code = "quota";

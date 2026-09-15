@@ -28,7 +28,7 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
-import { loadBotSettings, saveBotSettings } from "./settings.server";
+import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import {
   LIVE_INFLIGHT_STATUSES,
   isChatProvider,
@@ -95,8 +95,10 @@ export function githubStatus() {
 }
 
 export function patchHarborSettings(patch: Partial<BotSettings>) {
-  const next = { ...state.settings, ...patch };
-  if (!providersFromSettings(next).length) return state.settings;
+  const next = sanitizeBotSettings({ ...state.settings, ...patch });
+  if (!providersFromSettings(next).length) {
+    throw new Error("at least one configured reviewer is required");
+  }
   const saved = saveBotSettings(next);
   state = { ...state, settings: saved };
   return state.settings;

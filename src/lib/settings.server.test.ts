@@ -73,4 +73,10 @@ describe("sanitizeBotSettings", () => {
     const disk = persistableSettings(runtime, { ASHLAR_LOCAL_LLM_API_KEY: "env-secret" }, {});
     assert.equal(disk.localLlmApiKey, "");
   });
+
+  it("keeps the disk key when env is rotated, without treating rotation as a UI save", () => {
+    const runtime = sanitizeBotSettings({ ...DEFAULT_SETTINGS, localLlmApiKey: "rotated-B" });
+    const disk = persistableSettings(runtime, { ASHLAR_LOCAL_LLM_API_KEY: "rotated-B" }, { localLlmApiKey: "old-A" });
+    assert.equal(disk.localLlmApiKey, "old-A");
+  });
 });

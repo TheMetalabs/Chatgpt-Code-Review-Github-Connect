@@ -202,8 +202,10 @@ export function saveBotSettings(settings: BotSettings) {
   }
   try {
     const envPatch: Record<string, string | undefined> = botSettingsToEnv(disk);
-    if (!disk.localLlmApiKey && process.env.ASHLAR_LOCAL_LLM_API_KEY) envPatch.ASHLAR_LOCAL_LLM_API_KEY = undefined;
-    if (disk.webhookSecret === DEFAULT_SETTINGS.webhookSecret && process.env.ASHLAR_WEBHOOK_SECRET) {
+    if (runtime.localLlmApiKey && runtime.localLlmApiKey === process.env.ASHLAR_LOCAL_LLM_API_KEY) {
+      envPatch.ASHLAR_LOCAL_LLM_API_KEY = undefined;
+    }
+    if (runtime.webhookSecret && runtime.webhookSecret === process.env.ASHLAR_WEBHOOK_SECRET) {
       envPatch.ASHLAR_WEBHOOK_SECRET = undefined;
     }
     writeEnvPatch(envPatch);

@@ -134,8 +134,9 @@ export const Route = createFileRoute("/api/harbor")({
           if (Object.keys(patch).length) {
             try {
               patchHarborSettings(patch);
-            } catch {
-              return Response.json({ ok: false, error: "could not persist settings" }, { status: 500 });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : "could not persist settings";
+              return Response.json({ ok: false, error: msg }, { status: msg.includes("reviewer") ? 400 : 500 });
             }
           }
           return Response.json({ ok: true, github: githubStatus(), bridge: getBridgePublic() });

@@ -2,7 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { useAshlar } from "@/lib/store";
-import { DEFAULT_SETTINGS, PROVIDER_LABEL, SECRET_MASK, SECRET_MASK_PEM, isMaskedSecret, normalizeReviewOrder } from "@/lib/types";
+import { DEFAULT_SETTINGS, PROVIDER_LABEL, SECRET_MASK, SECRET_MASK_PEM, isMaskedSecret, normalizeReviewOrder, providersFromSettings } from "@/lib/types";
 import type { BotSettings, GithubReady, ReviewProvider, Severity } from "@/lib/types";
 
 export const Route = createFileRoute("/settings")({ component: Settings });
@@ -33,8 +33,6 @@ function Settings() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const order = normalizeReviewOrder(draft.reviewOrder);
-  const enabledCount =
-    Number(draft.reviewChatgpt) + Number(draft.reviewGrok) + Number(draft.reviewLocal);
 
   const secretDirty =
     (!isMaskedSecret(draft.localLlmApiKey) && Boolean(draft.localLlmApiKey.trim())) ||
@@ -78,7 +76,8 @@ function Settings() {
   }
 
   function toggle(key: "reviewChatgpt" | "reviewGrok" | "reviewLocal", on: boolean) {
-    if (!on && enabledCount <= 1) return;
+    const next = { ...draft, [key]: on };
+    if (!on && providersFromSettings(next).length === 0) return;
     patch({ [key]: on });
   }
 
@@ -98,6 +97,10 @@ function Settings() {
       .filter(Boolean);
     if (!mention.length) {
       setNotice("mentions cannot be empty");
+      return;
+    }
+    if (!providersFromSettings(draft).length) {
+      setNotice("enable ChatGPT, Grok, or a local URL+model");
       return;
     }
     setBusy(true);

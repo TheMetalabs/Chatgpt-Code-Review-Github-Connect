@@ -66,9 +66,12 @@ function extractJson(text) {
 }
 
 async function runPrompt(prompt) {
+  await dismissOverlays();
   const el = await startFresh();
+  await dismissOverlays();
   if (quotaHit()) throw quotaError();
   await fillComposer(el, prompt);
+  await dismissOverlays();
   await clickSend(sendButton, composer);
   const deadline = Date.now() + 180_000;
   let stable = "";

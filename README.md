@@ -7,8 +7,8 @@ PR이 오면 이 머신이 diff를 받고, 켜 둔 리뷰어가 **같은 스냅�
 ```
 GitHub webhook
     → Ashlar (이 머신)
-        → Local LLM (OpenAI 호환 API, 선택)
         → Chrome 브릿지 → 이미 로그인된 ChatGPT / Grok 탭
+        → Local LLM (폴백: 브릿지/쿼타가 안 되면. 로컬만 켜면 즉시)
     → 순서대로 FP 검수 (기본: Local → ChatGPT → Grok)
     → GitHub PR 코멘트
 ```
@@ -183,9 +183,9 @@ Settings에서 최대 3개를 켭니다. 하나만 끌 수는 없습니다.
 | --- | --- |
 | `review_chatgpt` | Chrome이 `chatgpt.com` 임시 채팅에 프롬프트만 넣고 Send |
 | `review_grok` | Chrome이 `grok.com` 새 채팅에 넣고 Send |
-| `review_local` | 이 프로세스가 OpenAI SDK로 지정한 엔드포인트를 호출 |
+| `review_local` | 로컬만 켜면 즉시. ChatGPT/Grok이 같이 켜져 있으면 Chrome이 안 올 때만 폴백 |
 
-둘 이상 켜면 **1라운드는 병렬**입니다. 두 모델 이상이 같은 파일·라인(또는 같은 제목)을 말하면 그대로 남깁니다. 한쪽만 말한 항목만 false-positive 파이프라인으로 갑니다.
+ChatGPT + Grok은 **병렬**입니다. 로컬은 그 경주에 안 넣고, 브릿지가 없거나 쿼타/타임아웃이면 그때 돕니다. 두 모델 이상이 같은 파일·라인(또는 같은 제목)을 말하면 그대로 남깁니다. 한쪽만 말한 항목만 false-positive 파이프라인으로 갑니다.
 
 ### FP 순서
 

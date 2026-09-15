@@ -1,459 +1,230 @@
+/** Short, restartable control-plane ticks. The content page owns unbounded generation. */
 const POLL_MS = 2500;
 const PING_MS = 10_000;
-/** MV3-safe keepalive; chrome.alarms min period is 1 minute — pair with setInterval. */
-const KEEPALIVE_ALARM = "ashlar-keepalive";
-const KEEPALIVE_ALARM_MINUTES = 1;
-const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
-const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt", tabs: "tabs", generating: "generating" };
-
-function formatRetry(until) {
-  if (!until) return "later";
-  const d = new Date(until);
-  return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString();
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+const JOB_PREFIX = "ashlar:job:";
+const CLOSED_PREFIX = "ashlar:closed:";
+const CLIENT_KEY = "ashlar:client";
+let tickLock = false;
 
 async function settings() {
-  const s = await chrome.storage.local.get(["origin", "token", "enabled"]);
-  return {
-    origin: String(s.origin || "").replace(/\/$/, ""),
-    token: String(s.token || ""),
-    enabled: s.enabled !== false,
-  };
+  const value = await chrome.storage.local.get(["origin", "token", "enabled"]);
+  return {origin: String(value.origin || "").replace(/\/$/, ""), token: String(value.token || ""), enabled: value.enabled !== false};
 }
 
-async function api(path, body) {
-  const { origin, token } = await settings();
-  if (!origin || !token) throw new Error("set origin and token in the popup");
-  const res = await fetch(`${origin}${path}`, {
-    method: body ? "POST" : "GET",
-    headers: {
-      "content-type": "application/json",
-      "x-ashlar-bridge-token": token,
-    },
-    body: body ? JSON.stringify({ ...body, token }) : undefined,
+async function api(body) {
+  const config = await settings();
+  if (!config.origin || !config.token) throw new Error("set origin and token in the popup");
+  // Only this small bridge RPC is bounded. Failure retains the job/outbox unchanged;
+  // it never cancels, marks empty, or resubmits the underlying model operation.
+  const response = await fetch(`${config.origin}/api/bridge`, {
+    method: "POST", headers: {"content-type": "application/json", "x-ashlar-bridge-token": config.token},
+    body: JSON.stringify(body), signal: AbortSignal.timeout(10_000),
   });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || json.ok === false) {
-    const err = new Error(json.error || `http ${res.status}`);
-    err.status = res.status;
-    throw err;
-  }
-  return json;
+  const value = await response.json();
+  if (!response.ok || value.ok === false) throw new Error(value.error || `bridge HTTP ${response.status}`);
+  return value;
+}
+
+async function clientId() {
+  const current = (await chrome.storage.local.get(CLIENT_KEY))[CLIENT_KEY];
+  if (current) return current;
+  const id = crypto.randomUUID();
+  await chrome.storage.local.set({[CLIENT_KEY]: id});
+  return id;
+}
+
+async function tasks() {
+  const values = await chrome.storage.local.get(null);
+  return Object.entries(values).filter(([key]) => key.startsWith(JOB_PREFIX)).map(([, value]) => value);
+}
+
+async function saveTask(task) {
+  await chrome.storage.local.set({[JOB_PREFIX + task.jobId]: task});
+}
+
+function contentFiles(provider) {
+  return ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", `content-${provider}.js`];
 }
 
 function providerUrl(provider, reasoning) {
   if (provider === "grok") return "https://grok.com/";
-  if (reasoning === "pro") return "https://chatgpt.com/?temporary-chat=true&model=gpt-6-pro";
-  return "https://chatgpt.com/?temporary-chat=true";
+  return reasoning === "pro" ? "https://chatgpt.com/?temporary-chat=true&model=gpt-6-pro" : "https://chatgpt.com/?temporary-chat=true";
 }
 
-async function ensureTab(provider, reasoning) {
-  const url = providerUrl(provider, reasoning);
-  const tab = await chrome.tabs.create({ url, active: true });
-  await waitTab(tab.id);
-  await sleep(1500);
-  return tab.id;
-}
-
-function waitTab(tabId) {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      chrome.tabs.onUpdated.removeListener(ready);
-      resolve();
-    };
-    const ready = (id, info) => {
-      if (id === tabId && info.status === "complete") finish();
-    };
-    chrome.tabs.get(tabId, (tab) => {
-      if (tab?.status === "complete") finish();
-      else chrome.tabs.onUpdated.addListener(ready);
+async function sendToTab(tabId, message, files) {
+  const once = () => new Promise((resolve, reject) => {
+    chrome.tabs.sendMessage(tabId, message, response => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(new Error(error.message)); else resolve(response);
     });
-    setTimeout(finish, 8000);
   });
-}
-
-function noReceiver(err) {
-  const m = err instanceof Error ? err.message : String(err);
-  return /receiving end does not exist|could not establish connection/i.test(m);
-}
-
-async function sendToTab(tabId, msg, files) {
-  const once = () =>
-    new Promise((resolve, reject) => {
-      chrome.tabs.sendMessage(tabId, msg, (res) => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve(res);
-      });
-    });
-  try {
-    return await once();
-  } catch (e) {
-    if (!files?.length || !noReceiver(e)) throw e;
-    await chrome.scripting.executeScript({ target: { tabId }, files });
-    await sleep(400);
+  try { return await once(); }
+  catch (error) {
+    if (!/receiving end does not exist|could not establish connection/i.test(error.message)) throw error;
+    await chrome.scripting.executeScript({target: {tabId}, files});
     return once();
   }
 }
 
-async function closeTab(tabId) {
-  if (!tabId) return;
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch {
-    /* already gone */
-  }
-}
-
-async function quotaMap() {
-  const s = await chrome.storage.local.get(["quota"]);
-  return s.quota && typeof s.quota === "object" ? s.quota : {};
-}
-
-function providerOpen(quota, provider) {
-  const until = Number(quota[provider] || 0);
-  return !until || until < Date.now();
-}
-
-async function markQuota(provider) {
-  const quota = await quotaMap();
-  quota[provider] = Date.now() + (QUOTA_MS[provider] || QUOTA_MS.chatgpt);
-  await chrome.storage.local.set({ quota });
-  return quota[provider];
-}
-
-function contentFiles(provider) {
-  return provider === "grok"
-    ? ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-grok.js"]
-    : ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-chatgpt.js"];
-}
-
-async function rememberTab(jobId, provider, tabId) {
-  if (!jobId || !tabId) return;
-  const s = await chrome.storage.session.get([SESSION.tabs]);
-  const tabs = s[SESSION.tabs] && typeof s[SESSION.tabs] === "object" ? { ...s[SESSION.tabs] } : {};
-  tabs[`${jobId}:${provider}`] = tabId;
-  await chrome.storage.session.set({ [SESSION.tabs]: tabs });
-}
-
-async function tabFor(jobId, provider) {
-  const s = await chrome.storage.session.get([SESSION.tabs]);
-  const tabs = s[SESSION.tabs] && typeof s[SESSION.tabs] === "object" ? s[SESSION.tabs] : {};
-  const id = Number(tabs[`${jobId}:${provider}`] || 0);
-  return id || null;
-}
-
-async function harvestTab(provider, tabId) {
-  if (!tabId) return null;
-  try {
-    const result = await sendToTab(tabId, { type: "ashlar-harvest" }, contentFiles(provider));
-    if (result?.ok && result.raw) return { provider, raw: result.raw, tabId };
-  } catch {
-    /* tab not ready */
+async function findOriginalTab(task, provider) {
+  const urls = provider === "grok" ? ["https://grok.com/*"] : ["https://chatgpt.com/*", "https://chat.openai.com/*"];
+  for (const tab of await chrome.tabs.query({url: urls})) {
+    try {
+      const result = await sendToTab(tab.id, {type: "ashlar-harvest", jobId: task.jobId}, contentFiles(provider));
+      if (result?.jobId === task.jobId) return tab;
+    } catch { /* observe only; never send a prompt during discovery */ }
   }
   return null;
 }
 
-function isBusyResult(result) {
-  if (!result || result.ok) return false;
-  if (result.code === "busy" || result.retry === true) return true;
-  return /already running|busy/i.test(String(result.error || ""));
-}
-
-/** Wait without wall-clock cap while the tab is mid-generation. */
-async function waitWhileBusy(provider, tabId, jobId, generating) {
-  for (;;) {
-    if (generating) {
-      generating[provider] = true;
-      void ping(jobId, generating);
-    }
-    await sleep(2000);
-    const hit = await harvestTab(provider, tabId);
-    if (hit) return { provider, raw: hit.raw };
-    try {
-      const again = await sendToTab(tabId, { type: "ashlar-harvest" }, contentFiles(provider));
-      if (again?.ok && again.raw) return { provider, raw: again.raw };
-      if (!isBusyResult(again) && again && again.ok === false && again.code && again.code !== "busy") {
-        const err = new Error(`${provider}: ${again.error || "chat tab returned nothing"}`);
-        err.code = again.code;
-        throw err;
-      }
-    } catch (e) {
-      if (!noReceiver(e)) {
-        /* keep polling while tab exists */
+async function observeProvider(task, provider) {
+  const slot = task.slots[provider];
+  if (slot.raw || (slot.error && slot.error.code !== "disconnected")) return;
+  const reasoning = task.reasoning?.[provider];
+  if (!slot.tabId) {
+    if (slot.dispatched || slot.creating || task.resumeProviders?.includes(provider)) {
+      const original = await findOriginalTab(task, provider);
+      if (original) {slot.tabId = original.id; slot.dispatched = true; await saveTask(task);}
+      else {
+        slot.error = {code: "disconnected", message: "original review tab unavailable; awaiting reconnection, not restarting generation"};
+        return;
       }
     }
-  }
-}
-
-async function runProvider(provider, prompt, jobId, reasoning, generating) {
-  const files = contentFiles(provider);
-  const known = await tabFor(jobId, provider);
-  if (known) {
-    const hit = await harvestTab(provider, known);
-    if (hit) return { provider, raw: hit.raw };
-    try {
-      const result = await sendToTab(known, { type: "ashlar-run", prompt, jobId, reasoning }, files);
-      if (result?.ok && result.raw) return { provider, raw: result.raw };
-      if (isBusyResult(result)) return waitWhileBusy(provider, known, jobId, generating);
-    } catch {
-      /* fall through to a new tab only if this one is gone */
+    // Persist intent before creating or dispatching. Ambiguous restarts never spend again.
+    if (!slot.tabId) {
+    slot.creating = true;
+    await saveTask(task);
+    const tab = await chrome.tabs.create({url: providerUrl(provider, reasoning), active: true});
+    slot.tabId = tab.id;
+    slot.creating = false;
+    await saveTask(task);
     }
   }
-  const tabId = await ensureTab(provider, reasoning);
-  await rememberTab(jobId, provider, tabId);
+  const removed = (await chrome.storage.local.get(CLOSED_PREFIX + slot.tabId))[CLOSED_PREFIX + slot.tabId];
+  if (removed === "closed") {slot.error = {code: "tab_closed", message: "review tab explicitly closed"}; return;}
+  let tab;
+  try {tab = await chrome.tabs.get(slot.tabId);}
+  catch {
+    // Browser restart may change tab IDs. Absence alone is not proof that generation ended.
+    tab = await findOriginalTab(task, provider);
+    if (tab) {slot.tabId = tab.id; slot.dispatched = true; await saveTask(task);}
+    else {slot.error = {code: "disconnected", message: "original tab not observable; waiting for reconnection"}; return;}
+  }
+  const url = new URL(tab.url || providerUrl(provider, reasoning));
+  const correctHost = provider === "grok" ? url.hostname === "grok.com" : ["chatgpt.com", "chat.openai.com"].includes(url.hostname);
+  if (!correctHost) {slot.error = {code: "disconnected", message: "review tab navigated away; waiting for reconnection"}; return;}
+  if (tab.status === "loading") {slot.error = {code: "disconnected", message: "review tab loading"}; return;}
+  let result;
   try {
-    const result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId, reasoning }, files);
-    if (result?.ok && result.raw) return { provider, raw: result.raw };
-    if (isBusyResult(result)) return waitWhileBusy(provider, tabId, jobId, generating);
-    const again = await harvestTab(provider, tabId);
-    if (again) return { provider, raw: again.raw };
-    const err = new Error(`${provider}: ${result?.error || "chat tab returned nothing"}`);
-    err.code = result?.code;
-    throw err;
-  } catch (e) {
-    if (e && typeof e === "object" && e.code === "busy") {
-      return waitWhileBusy(provider, tabId, jobId, generating);
+    result = await sendToTab(slot.tabId, {type: "ashlar-harvest", jobId: task.jobId}, contentFiles(provider));
+    if (result?.code === "job_mismatch") {
+      const original = await findOriginalTab(task, provider);
+      if (original) {slot.tabId = original.id; slot.dispatched = true;}
+      slot.error = {code: "disconnected", message: "tab identity changed; recovering original job"};
+      return;
     }
-    const again = await harvestTab(provider, tabId);
-    if (again) return { provider, raw: again.raw };
-    throw e;
+    if (result?.code === "idle") {
+      const resume = Boolean(slot.dispatched || task.resumeProviders?.includes(provider));
+      slot.dispatched = true;
+      await saveTask(task);
+      result = await sendToTab(slot.tabId, {
+        type: "ashlar-run", jobId: task.jobId, prompt: task.prompts?.[provider] || task.prompt, reasoning, resume, adoptLegacy: slot.legacy === true,
+      }, contentFiles(provider));
+    }
+  } catch (error) {
+    slot.error = {code: "disconnected", message: error.message.slice(0, 240)};
+    return;
+  }
+  if (result?.ok && typeof result.raw === "string" && result.raw.trim()) {
+    slot.raw = result.raw;
+    delete slot.error;
+  } else if (result?.code === "busy") {
+    delete slot.error;
+  } else if (["quota", "empty", "error", "cancelled", "tab_closed"].includes(result?.code)) {
+    slot.error = {code: result.code, message: String(result.error || result.code).slice(0, 240)};
+  } else {
+    slot.error = {code: "disconnected", message: "review state unknown; waiting for current runner"};
   }
 }
 
-async function ping(jobId, generating) {
-  try {
-    await api("/api/bridge", { action: "ping", jobId: jobId || undefined, generating: generating || undefined });
-  } catch {
-    /* keep trying */
+async function processTask(task, owner) {
+  const status = await api({action: "ping", jobId: task.jobId, leaseId: task.leaseId});
+  if (status.active === false) {await chrome.storage.local.remove(JOB_PREFIX + task.jobId); return;}
+  if (status.accepted === false) {
+    const claim = await api({action: "claim", jobId: task.jobId, clientId: owner});
+    task.leaseId = claim.leaseId;
+    await saveTask(task);
+  }
+  for (const provider of task.providers) {
+    await observeProvider(task, provider);
+    await saveTask(task);
+  }
+  // The persisted raw response is an outbox: repeat delivery, never repeat generation.
+  const results = task.providers.filter(p => task.slots[p].raw && !task.slots[p].acknowledged)
+    .map(provider => ({provider, raw: task.slots[provider].raw}));
+  if (results.length) {
+    await api({action: "complete", jobId: task.jobId, leaseId: task.leaseId, raw: results[0].raw, results});
+    for (const result of results) task.slots[result.provider].acknowledged = true;
+    await saveTask(task);
+  }
+  const generating = {}, providerErrors = {};
+  for (const provider of task.providers) {
+    const slot = task.slots[provider];
+    if (slot.error) providerErrors[provider] = slot.error;
+    // Success is advertised by complete, atomically with its payload, not by this ping.
+    if (!slot.raw) generating[provider] = !slot.error || slot.error.code === "disconnected";
+  }
+  await api({action: "ping", jobId: task.jobId, leaseId: task.leaseId, generating, providerErrors});
+  const done = task.providers.every(p => task.slots[p].acknowledged || (task.slots[p].error && task.slots[p].error.code !== "disconnected"));
+  if (done) {
+    await api({action: "release", jobId: task.jobId, leaseId: task.leaseId});
+    await chrome.storage.local.set({lastJobId: task.jobId, lastError: Object.values(providerErrors).map(e => `${e.code}: ${e.message}`).join("; ")});
+    await chrome.storage.local.remove(JOB_PREFIX + task.jobId);
   }
 }
 
-async function recoverDeadWorker() {
-  const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId]);
-  await chrome.storage.session.set({ [SESSION.busy]: false, [SESSION.jobId]: session[SESSION.jobId] || "", [SESSION.busyAt]: 0 });
+async function heartbeatAll() {
+  const config = await settings();
+  if (!config.enabled || !config.origin || !config.token) return;
+  // Deliberately outside tickLock. A slow bridge RPC must not suppress other heartbeats.
+  await Promise.allSettled((await tasks()).map(task => api({action: "ping", jobId: task.jobId, leaseId: task.leaseId})));
 }
-
-async function harvestAndComplete(jobId, providers) {
-  if (!jobId) return false;
-  const results = [];
-  for (const p of providers) {
-    const hit = await harvestTab(p, await tabFor(jobId, p));
-    if (hit) results.push({ provider: hit.provider, raw: hit.raw });
-  }
-  if (!results.length) return false;
-  await api("/api/bridge", { action: "complete", jobId, raw: results[0].raw, results });
-  return true;
-}
-
-let tickLock = false;
 
 async function tick() {
   if (tickLock) return;
   tickLock = true;
   try {
-    await tickBody();
-  } finally {
-    tickLock = false;
-  }
+    const config = await settings();
+    if (!config.enabled || !config.origin || !config.token) return;
+    const owner = await clientId();
+    for (const task of await tasks()) {
+      try {await processTask(task, owner);}
+      catch (error) {await chrome.storage.local.set({lastError: `reconnecting: ${error.message}`});}
+    }
+    const current = await tasks();
+    const {job} = await api({action: "take", clientId: owner, excludeJobIds: current.map(task => task.jobId)});
+    if (job) {
+      const task = {...job, slots: Object.fromEntries(job.providers.map(p => [p, {}]))};
+      // Adopt pre-v2 known tabs when updating an extension during a running review.
+      const legacy = (await chrome.storage.session.get("tabs")).tabs || {};
+      for (const provider of task.providers) {
+        if (legacy[`${job.jobId}:${provider}`]) task.slots[provider] = {tabId: legacy[`${job.jobId}:${provider}`], dispatched: true, legacy: true};
+      }
+      await saveTask(task);
+      await processTask(task, owner);
+    }
+  } catch (error) {
+    await chrome.storage.local.set({lastError: `reconnecting: ${error.message}`});
+  } finally {tickLock = false;}
 }
 
-async function tickBody() {
-  const cfg = await settings();
-  if (!cfg.enabled || !cfg.origin || !cfg.token) return;
-  const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId, SESSION.busyAt, SESSION.generating]);
-  const liveGenerating =
-    session[SESSION.generating] && typeof session[SESSION.generating] === "object"
-      ? session[SESSION.generating]
-      : undefined;
-  // While busy, always include current generating map so claim stays alive for long jobs.
-  await ping(session[SESSION.jobId], liveGenerating);
-  if (session[SESSION.busy]) return;
-  const quota = await quotaMap();
-  if (!providerOpen(quota, "chatgpt") && !providerOpen(quota, "grok")) {
-    const until = Math.min(Number(quota.chatgpt || 0), Number(quota.grok || 0));
-    chrome.storage.local.set({
-      lastError: `both chats at usage limit — retry ${formatRetry(until)}`,
-    });
-    return;
-  }
-  let payload;
-  try {
-    payload = await api("/api/bridge", { action: "take" });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    chrome.storage.local.set({ lastError: msg.slice(0, 240) });
-    return;
-  }
-  const job = payload.job;
-  if (!job) {
-    const last = await chrome.storage.local.get(["lastJobId"]);
-    if (last.lastJobId) {
-      try {
-        await harvestAndComplete(String(last.lastJobId), ["chatgpt", "grok"]);
-      } catch {
-        /* still no json */
-      }
-    }
-    return;
-  }
-  await chrome.storage.session.set({
-    [SESSION.busy]: true,
-    [SESSION.jobId]: job.jobId,
-    [SESSION.busyAt]: Date.now(),
-    [SESSION.generating]: {},
-  });
-  chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
-  let claimed = true;
-  try {
-    const wanted = (Array.isArray(job.providers) && job.providers.length ? job.providers : [job.provider]).filter(
-      (p) => p === "chatgpt" || p === "grok",
-    );
-    const runnable = wanted.filter((p) => providerOpen(quota, p));
-    const generating = {};
-    wanted.forEach((p) => {
-      generating[p] = runnable.includes(p);
-    });
-    if (!runnable.length) {
-      chrome.storage.local.set({ lastError: "waiting for chat quota reset" });
-      try {
-        await ping(job.jobId, generating);
-      } catch {
-        /* ignore */
-      }
-      await api("/api/bridge", { action: "release", jobId: job.jobId });
-      return;
-    }
-    const persistGenerating = async () => {
-      await chrome.storage.session.set({ [SESSION.generating]: { ...generating } });
-      await ping(job.jobId, generating);
-    };
-    void persistGenerating();
-    const keepAlive = setInterval(() => void persistGenerating(), PING_MS);
-    try {
-      await chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_ALARM_MINUTES });
-    } catch {
-      /* alarms may be unavailable in some test stubs */
-    }
-    const results = [];
-    let quotaOnly = true;
-    try {
-      const settled = await Promise.allSettled(
-        runnable.map(async (p) => {
-          generating[p] = true;
-          void persistGenerating();
-          try {
-            const value = await runProvider(
-              p,
-              (job.prompts && job.prompts[p]) || job.prompt,
-              job.jobId,
-              (job.reasoning && job.reasoning[p]) || (p === "grok" ? "heavy" : "pro"),
-              generating,
-            );
-            generating[p] = false;
-            void persistGenerating();
-            results.push(value);
-            quotaOnly = false;
-            try {
-              await api("/api/bridge", {
-                action: "complete",
-                jobId: job.jobId,
-                raw: value.raw,
-                results: results.slice(),
-              });
-            } catch {
-              /* already posted or not awaiting */
-            }
-            return value;
-          } catch (e) {
-            const code = e && typeof e === "object" && "code" in e ? e.code : "";
-            if (code === "busy") {
-              // Keep generating=true; poll harvest instead of failing the job.
-              generating[p] = true;
-              void persistGenerating();
-              const tabId = await tabFor(job.jobId, p);
-              if (tabId) {
-                const waited = await waitWhileBusy(p, tabId, job.jobId, generating);
-                generating[p] = false;
-                void persistGenerating();
-                results.push(waited);
-                quotaOnly = false;
-                try {
-                  await api("/api/bridge", {
-                    action: "complete",
-                    jobId: job.jobId,
-                    raw: waited.raw,
-                    results: results.slice(),
-                  });
-                } catch {
-                  /* already posted or not awaiting */
-                }
-                return waited;
-              }
-            }
-            generating[p] = false;
-            void persistGenerating();
-            if (code === "quota") await markQuota(p);
-            else quotaOnly = false;
-            throw e;
-          }
-        }),
-      );
-      if (results.length) {
-        chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
-        return;
-      }
-      void settled;
-      const next = await quotaMap();
-      const until = Math.max(...runnable.map((p) => Number(next[p] || 0)));
-      chrome.storage.local.set({
-        lastError: quotaOnly ? `usage limit — retry ${formatRetry(until)}` : "chat review failed",
-      });
-      await api("/api/bridge", { action: "release", jobId: job.jobId });
-    } finally {
-      clearInterval(keepAlive);
-      try {
-        await chrome.alarms.clear(KEEPALIVE_ALARM);
-      } catch {
-        /* ignore */
-      }
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    const status = e && typeof e === "object" && "status" in e ? e.status : 0;
-    chrome.storage.local.set({ lastError: msg.slice(0, 240) });
-    if (claimed && status !== 409) {
-      try {
-        await api("/api/bridge", { action: "release", jobId: job.jobId });
-      } catch {
-        /* ignore */
-      }
-    }
-  } finally {
-    await chrome.storage.session.set({
-      [SESSION.busy]: false,
-      [SESSION.jobId]: "",
-      [SESSION.busyAt]: 0,
-      [SESSION.generating]: {},
-    });
-  }
-}
-
-function loop() {
-  chrome.alarms.create("ashlar-poll", { periodInMinutes: 1 });
-  void recoverDeadWorker().then(() => tick());
-}
-
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ashlar-poll" || alarm.name === KEEPALIVE_ALARM) void tick();
+chrome.tabs.onRemoved.addListener((tabId, info) => {
+  void chrome.storage.local.set({[CLOSED_PREFIX + tabId]: info.isWindowClosing ? "disconnected" : "closed"});
 });
-chrome.runtime.onInstalled.addListener(loop);
-chrome.runtime.onStartup.addListener(loop);
-loop();
+chrome.alarms.onAlarm.addListener(() => {void heartbeatAll(); void tick();});
+function start() {void chrome.alarms.create("ashlar-poll", {periodInMinutes: 1}); void tick();}
+chrome.runtime.onInstalled.addListener(start);
+chrome.runtime.onStartup.addListener(start);
+start();
 setInterval(() => void tick(), POLL_MS);
+setInterval(() => void heartbeatAll(), PING_MS);

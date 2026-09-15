@@ -17,25 +17,15 @@ function lastReviewJson(text) {
   for (let end = s.lastIndexOf("}"); end >= 0; end = s.lastIndexOf("}", end - 1)) {
     let depth = 0;
     let inStr = false;
-    let esc = false;
     for (let i = end; i >= 0; i -= 1) {
       const c = s[i];
-      if (inStr) {
-        if (esc) {
-          esc = false;
-          continue;
-        }
-        if (c === "\\") {
-          esc = true;
-          continue;
-        }
-        if (c === '"') inStr = false;
-        continue;
-      }
       if (c === '"') {
-        inStr = true;
+        let slashes = 0;
+        for (let j = i - 1; j >= 0 && s[j] === "\\"; j -= 1) slashes += 1;
+        if (slashes % 2 === 0) inStr = !inStr;
         continue;
       }
+      if (inStr) continue;
       if (c === "}") depth += 1;
       else if (c === "{") {
         depth -= 1;
@@ -53,16 +43,7 @@ function lastReviewJson(text) {
 function extractChatJson(text) {
   const s = String(text || "");
   if (!s.trim()) return null;
-  const fences = [...s.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
-  for (let i = fences.length - 1; i >= 0; i -= 1) {
-    const hit = lastReviewJson(fences[i][1] || "") || parseReviewSlice((fences[i][1] || "").trim());
-    if (hit) return hit;
-  }
-  const dangling = s.match(/```(?:json)?\s*([\s\S]+)$/i);
-  if (dangling) {
-    const hit = lastReviewJson(dangling[1] || "");
-    if (hit) return hit;
-  }
+  // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
   return lastReviewJson(s);
 }
 
@@ -75,7 +56,11 @@ function cleanTurnText(el) {
 }
 
 function assistantCorpus() {
-  const turns = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+  const root = currentAssistantRoot();
+  if (!root) return [];
+  const turns = root.matches('[data-message-author-role="assistant"]')
+    ? [root]
+    : [...root.querySelectorAll('[data-message-author-role="assistant"]')];
   const chunks = [];
   for (const turn of turns) {
     const md = turn.querySelector(".markdown") || turn;
@@ -86,14 +71,19 @@ function assistantCorpus() {
 }
 
 async function harvestViaCopy() {
-  const btn = [...document.querySelectorAll('[data-testid="copy-turn-action-button"]')]
+  const root = currentAssistantRoot();
+  if (!root) return null;
+  const btn = [...root.querySelectorAll('[data-testid="copy-turn-action-button"]')]
     .reverse()
     .find((el) => /응답 복사|Copy response/i.test(el.getAttribute("aria-label") || ""));
   if (!btn) return null;
   try {
+    const previous = await navigator.clipboard.readText();
     btn.click();
     await sleep(250);
     const text = await navigator.clipboard.readText();
+    // A failed copy must not import an older job from the clipboard.
+    if (text === previous) return null;
     return extractChatJson(text);
   } catch {
     return null;
@@ -122,44 +112,69 @@ async function waitUntilReviewOrQuota(name) {
   let stable = "";
   let hits = 0;
   let emptyTicks = 0;
-  let sawStop = false;
-  let copied = false;
-  // No wall-clock abort: ChatGPT/Local can sit in queue then generate for 10+ minutes.
-  // Only reliable UI/completion signals end the wait (reply toolbar, valid JSON, real quota).
+  // There is NO duration deadline. Queueing, unknown UI and generation remain pending.
   for (;;) {
-    const stopVisible = typeof stopButtonVisible === "function" && stopButtonVisible();
-    if (stopVisible) sawStop = true;
-    const replyDone = typeof replyDoneVisible === "function" && replyDoneVisible();
-    const done =
-      typeof chatGenerationFinished === "function"
-        ? chatGenerationFinished({ stopVisible, replyActionsVisible: replyDone, sawStop })
-        : replyDone;
-    let json = harvestJson({ allowThin: replyDone });
-    if (!json && replyDone && !copied) {
-      copied = true;
-      json = await harvestViaCopy();
+    const done = chatGenerationFinished({stopVisible: stopButtonVisible(), replyActionsVisible: replyDoneVisible()});
+    let json = done ? harvestJson({allowThin: true}) : null;
+    if (done && !json && emptyTicks % 2 === 0) json = await harvestViaCopy();
+    if (quotaHit() && !json) {
+      const error = new Error(`${name} usage limit`);
+      error.code = "quota";
+      throw error;
     }
-    if (typeof quotaHit === "function" && quotaHit() && !json) {
-      const e = new Error(`${name} usage limit`);
-      e.code = "quota";
-      throw e;
-    }
-    if (json) {
-      if (json === stable) hits += 1;
-      else {
-        stable = json;
-        hits = 1;
-      }
-      if (done && hits >= 1) return json;
-      if (hits >= 2 && replyDone) return json;
+    if (done && json) {
+      hits = stable === json ? hits + 1 : 1;
+      stable = json;
+      if (hits >= 2) return json;
       emptyTicks = 0;
-    } else if (replyDone) {
-      // Only count empty after reply toolbar says done — never after sawStop flicker alone.
-      emptyTicks += 1;
-      if (emptyTicks >= 6) throw emptyReplyError(name);
     } else {
-      emptyTicks = 0;
+      hits = 0;
+      stable = "";
+      emptyTicks = done ? emptyTicks + 1 : 0;
+      // This is completed-DOM settling, not a queue/generation timeout.
+      if (emptyTicks >= 6) throw emptyReplyError(name);
     }
     await sleep(800);
   }
+}
+
+/** The page owns the long call. MV3 messages acknowledge immediately and harvest later. */
+function installReviewRunner(name, run) {
+  // sessionStorage is scoped to this tab and survives extension reinjection/page restoration.
+  let boundJob = "";
+  try {boundJob = sessionStorage.getItem("ashlar:job") || "";} catch { /* storage unavailable */ }
+  const state = globalThis.__ashlarRunner || {running: false, jobId: boundJob, result: null};
+  globalThis.__ashlarRunner = state;
+  state.run = run;
+  if (state.listener) return;
+  const busy = () => ({ok: false, code: "busy", retry: true, error: "generation pending"});
+  state.listener = (msg, _sender, reply) => {
+    if (msg?.type !== "ashlar-run" && msg?.type !== "ashlar-harvest") return;
+    const respond = reply;
+    reply = value => respond({...value, jobId: state.jobId});
+    if (msg.jobId && state.jobId && msg.jobId !== state.jobId) {
+      reply({ok: false, code: "job_mismatch", error: "tab belongs to another job"});
+      return;
+    }
+    if (state.result) { reply(state.result); return; }
+    if (state.running) { reply(busy()); return; }
+    if (msg.type === "ashlar-harvest") {
+      reply({ok: false, code: "idle", error: "no active runner in this page"});
+      return;
+    }
+    if (msg.resume && !state.jobId && !msg.adoptLegacy) {
+      reply({ok: false, code: "disconnected", error: "original job binding not found in this tab"});
+      return;
+    }
+    const resume = Boolean(msg.resume || state.jobId);
+    state.jobId = String(msg.jobId || "");
+    try {sessionStorage.setItem("ashlar:job", state.jobId);} catch { /* in-memory binding still protects this page */ }
+    state.running = true;
+    Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
+      .then(raw => {state.result = {ok: true, raw};})
+      .catch(error => {state.result = {ok: false, code: error?.code || "error", error: error?.message || String(error)};})
+      .finally(() => {state.running = false;});
+    reply(busy());
+  };
+  chrome.runtime.onMessage.addListener(state.listener);
 }

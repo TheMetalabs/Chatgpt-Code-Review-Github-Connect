@@ -50,13 +50,14 @@ describe("stillRacing", () => {
     );
   });
 
-  it("treats generating false (quota) as finished, not as a hang", () => {
+  it("treats an explicit quota outcome as finished, not a bare false flag", () => {
     assert.equal(
       stillRacing({
         providers: ["chatgpt", "grok"],
         payloads: ["chatgpt"],
         localInFlight: false,
         generating: { chatgpt: false, grok: false },
+        providerErrors: {grok: {code: "quota", message: "usage limit"}},
       }),
       false,
     );

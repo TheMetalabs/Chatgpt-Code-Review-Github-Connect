@@ -100,6 +100,10 @@ export interface Job {
   chatPrompt?: string;
   chatPromptByProvider?: Partial<Record<ReviewProvider, string>>;
   bridgeClaimedAt?: number;
+  /** Ownership lease only, never a deadline for queueing or generation. */
+  bridgeLeaseId?: string;
+  bridgeClientId?: string;
+  providerErrors?: Partial<Record<ReviewProvider, ProviderError>>;
   reviewProviders?: ReviewProvider[];
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
@@ -119,6 +123,11 @@ export interface Job {
   generating?: Partial<Record<ReviewProvider, boolean>>;
   /** Public snapshot only — never includes reviewer raw JSON. */
   reviewerLanes?: ReviewerLane[];
+}
+
+export interface ProviderError {
+  code: "quota" | "empty" | "error" | "tab_closed" | "cancelled" | "disconnected";
+  message: string;
 }
 
 export type ReviewerLaneState = "queued" | "waiting" | "generating" | "answered" | "skipped" | "empty";
@@ -316,7 +325,7 @@ export function claimedReviewerNote(providers: readonly ReviewProvider[]): strin
   return `Chrome bridge claimed this job. ${chat.map((p) => PROVIDER_LABEL[p]).join(" and ")} run in parallel.`;
 }
 
-/** Soft TTL; refreshed by extension ping. Ignored while generating[p]===true (see bridge.server). */
+/** Heartbeat ownership lease only. Expiry permits resuming, never failing/restarting generation. */
 export const BRIDGE_CLAIM_MS = 20 * 60_000;
 /** Chrome MV3 alarms are ≥1 minute; keep connected across that gap. */
 export const BRIDGE_CONNECTED_MS = 120_000;

@@ -9,18 +9,18 @@ function quotaHitText(text) {
 }
 
 function quotaHit() {
-  const nodes = document.querySelectorAll(
+  const notices = document.querySelectorAll(
     '[role="alert"], [role="status"], [role="dialog"], [data-testid*="quota" i], [class*="toast" i], [class*="banner" i], [class*="notice" i]',
   );
-  for (const el of nodes) {
-    const t = (el.textContent || "").trim();
-    if (!t || t.length > 400) continue;
-    if (quotaHitText(t)) return true;
+  for (const el of notices) {
+    if (!elVisible(el) || el.closest('[data-message-author-role="user"], .markdown, pre, code')) continue;
+    const text = (el.textContent || "").trim();
+    if (text.length <= 400 && quotaHitText(text)) return true;
   }
   for (const el of document.querySelectorAll("span, button, [class*='card']")) {
-    const t = (el.textContent || "").trim();
-    if (!t || t.length > 240) continue;
-    if (quotaHitText(t)) return true;
+    if (!elVisible(el) || el.closest('[data-message-author-role], [data-testid^="conversation-turn-"], pre, code')) continue;
+    const text = (el.textContent || "").trim();
+    if (text.length <= 240 && quotaHitText(text)) return true;
   }
   return false;
 }
@@ -28,9 +28,12 @@ function quotaHit() {
 /** Toolbar icons are 32px; composer.visible() requires >40px and would miss them. */
 function elVisible(el) {
   if (!el) return false;
+  if (el.closest('[hidden], [aria-hidden="true"]')) return false;
   try {
-    const s = window.getComputedStyle(el);
-    if (s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0) return false;
+    for (let node = el; node; node = node.parentElement) {
+      const s = window.getComputedStyle(node);
+      if (s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0) return false;
+    }
   } catch {
     /* computed style can fail on detached nodes */
   }
@@ -50,12 +53,22 @@ function stopButtonVisible() {
   return false;
 }
 
-/** Assistant-turn copy/feedback only. User "메시지 복사" is not "answer done". */
+/** Never reuse completion controls from an answer before the latest user turn. */
+function currentAssistantRoot() {
+  const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
+  if (turns.length) {
+    const last = turns[turns.length - 1];
+    return last.querySelector('[data-message-author-role="assistant"]') ? last : null;
+  }
+  const messages = [...document.querySelectorAll('[data-message-author-role]')];
+  const last = messages[messages.length - 1];
+  if (last?.getAttribute("data-message-author-role") !== "assistant") return null;
+  return last.closest("article, section") || last;
+}
+
+/** Current assistant-turn copy/feedback only, never hidden or previous-turn controls. */
 function replyDoneVisible() {
-  const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].filter((t) =>
-    t.querySelector('[data-message-author-role="assistant"]'),
-  );
-  const root = turns.length ? turns[turns.length - 1] : document.querySelector('[data-message-author-role="assistant"]')?.closest("section") || null;
+  const root = currentAssistantRoot();
   if (!root) return false;
   if (elVisible(root.querySelector('[aria-label="응답 작업"], [aria-label="Response actions"]'))) return true;
   for (const el of root.querySelectorAll('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]')) {
@@ -78,7 +91,6 @@ function chatGenerationFinished(input) {
       sawStop: false,
     });
   }
-  if (input.replyActionsVisible) return true;
   if (input.stopVisible) return false;
-  return Boolean(input.sawStop);
+  return Boolean(input.replyActionsVisible);
 }

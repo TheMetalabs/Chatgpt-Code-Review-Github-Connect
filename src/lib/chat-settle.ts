@@ -9,7 +9,6 @@ export function chatGenerationFinished(input: {
   replyActionsVisible: boolean;
   sawStop?: boolean;
 }): boolean {
-  if (input.replyActionsVisible) return true;
   if (input.stopVisible) return false;
-  return Boolean(input.sawStop);
+  return Boolean(input.replyActionsVisible);
 }

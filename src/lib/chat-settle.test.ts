@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { chatGenerationFinished } from "./chat-settle.ts";
 
 describe("chatGenerationFinished", () => {
-  it("treats the copy/feedback toolbar as done even if a leftover stop node exists", () => {
-    assert.equal(chatGenerationFinished({ stopVisible: true, replyActionsVisible: true }), true);
+  it("waits for visible Stop; a hidden leftover stop is already filtered by DOM", () => {
+    assert.equal(chatGenerationFinished({ stopVisible: true, replyActionsVisible: true }), false);
     assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: true }), true);
   });
 
@@ -17,7 +17,7 @@ describe("chatGenerationFinished", () => {
     assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false, sawStop: false }), false);
   });
 
-  it("settles after stop disappears once generation actually started", () => {
-    assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false, sawStop: true }), true);
+  it("does not settle on Stop flicker, even after generation started", () => {
+    assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false, sawStop: true }), false);
   });
 });

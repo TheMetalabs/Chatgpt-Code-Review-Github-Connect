@@ -64,7 +64,7 @@ describe("buildReviewerLanes", () => {
       }),
     );
     assert.equal(lanes.find((l) => l.provider === "chatgpt")?.state, "generating");
-    assert.equal(lanes.find((l) => l.provider === "grok")?.state, "empty");
+    assert.equal(lanes.find((l) => l.provider === "grok")?.state, "waiting");
   });
 
   it("shows local generating from inFlight, skipped from assumptions", () => {
@@ -114,7 +114,7 @@ describe("buildReviewerLanes", () => {
         storedLegs: [{ provider: "local", raw: '{"hello":"world"}' }],
       }),
     );
-    assert.equal(lanes[0].state, "answered");
+    assert.equal(lanes[0].state, "empty");
     assert.match(lanes[0].detail, /extract failed/i);
   });
 

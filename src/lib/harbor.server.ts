@@ -13,7 +13,7 @@ import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission } from "./chat-prompt";
-import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
+import { runLocalLlm } from "./local-llm.server";
 import { buildOpsComment, llmWorkAllowed, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -39,6 +39,7 @@ import {
 let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
 const localInFlight = new Set<string>();
+const localControllers = new Map<string, AbortController>();
 
 export type HarborState = {
   settings: BotSettings;
@@ -105,10 +106,14 @@ export function patchHarborSettings(patch: Partial<BotSettings>) {
 }
 
 export function resetHarbor() {
+  for (const controller of localControllers.values()) controller.abort();
+  localControllers.clear();
+  localInFlight.clear();
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
 }
 
 export function cancelHarborJob(jobId: string) {
+  localControllers.get(jobId)?.abort();
   state = {
     ...state,
     jobs: state.jobs.map((j) =>
@@ -285,14 +290,13 @@ const WATCH_TICK_MS = 5_000;
 async function watchReviewers(jobId: string, token: string) {
   let lastNotes = "";
   let localStarted = false;
-  let flushed = false;
   for (;;) {
+    const bridge = await bridgeSnapshot();
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
     if (job.status === "cancelled" || job.status === "posted" || job.status === "skipped" || job.status === "dlq") return;
     if (job.status !== "awaiting_chat" && job.status !== "reviewer") return;
 
-    const bridge = await bridgeSnapshot();
     const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
     const chat = (job.reviewProviders ?? []).filter(isChatProvider);
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
@@ -316,13 +320,13 @@ async function watchReviewers(jobId: string, token: string) {
       assumptions: job.assumptions,
       localInFlight: localInFlight.has(jobId),
       generating: job.generating,
+      providerErrors: job.providerErrors,
       claimed,
       connected: bridge.connected,
     });
-    if (!flushed && job.status === "awaiting_chat" && !racing) {
-      flushed = true;
+    if (job.status === "awaiting_chat" && !racing) {
       const legs = stored.filter((l) => l.raw.trim());
-      if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
+      if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
       else {
         patchJob(jobId, (j) => ({
           ...j,
@@ -489,40 +493,6 @@ async function playGithub(jobId: string, untrustedBody: string) {
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
 
-  if (providers.includes("local") && !chatProviders.length) {
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "reviewer",
-      plan: "Snapshot loaded. Calling the local OpenAI-compatible LLM.",
-      reviewProviders: providers,
-      reviewOrder: order,
-      updatedAt: Date.now(),
-    }));
-    const local = await runLocalLlm(prompt, state.settings);
-    if (!local.ok) {
-      patchJob(jobId, (j) => ({
-        ...j,
-        status: "skipped",
-        skipReason: "local LLM failed and no chat reviewer is on",
-        githubError: `local LLM: ${local.error}`,
-        updatedAt: Date.now(),
-      }));
-      void upsertOpsComment(token, jobId, "failed", [`Local LLM failed (${local.error}). No other reviewer is enabled.`]);
-      return;
-    }
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "awaiting_chat",
-      plan: "Local LLM returned. Running poster.",
-      chatPrompt: prompt,
-      reviewProviders: providers,
-      reviewOrder: order,
-      storedLegs: [{ provider: "local", raw: local.raw }],
-      updatedAt: Date.now(),
-    }));
-    await submitHarborChat(jobId, local.raw, [{ provider: "local", raw: local.raw }]);
-    return;
-  }
 
   patchJob(jobId, (j) => ({
     ...j,
@@ -539,7 +509,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     updatedAt: Date.now(),
   }));
   void watchReviewers(jobId, token);
-  if (providers.includes("local") && chatProviders.length) {
+  if (providers.includes("local")) {
     void kickLocalRace(jobId, prompt);
   }
 }
@@ -549,48 +519,43 @@ async function kickLocalRace(jobId: string, prompt: string) {
   if (!prompt.trim()) return;
   if (localInFlight.has(jobId)) return;
   const job = state.jobs.find((j) => j.id === jobId);
-  if (!job) return;
+  if (!job || job.status !== "awaiting_chat") return;
   if ((job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim())) return;
   if ((job.assumptions ?? []).some((a) => /^Skipped local/i.test(a))) return;
   localInFlight.add(jobId);
-  const ping = await pingLocalLlm(state.settings);
-  if (!ping.ok) {
-    localInFlight.delete(jobId);
-    patchJob(jobId, (j) => ({
-      ...j,
-      assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
-      updatedAt: Date.now(),
-    }));
-    return;
-  }
+  // A health probe can be delayed by the model queue. Never gate generation on that timer.
+  const controller = new AbortController();
+  localControllers.set(jobId, controller);
+  patchJob(jobId, j => ({...j, generating: {...j.generating, local: true}, updatedAt: Date.now()}));
   void attachLocalLeg(jobId, prompt, { submit: true });
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
   try {
-    const local = await runLocalLlm(prompt, state.settings);
+    const local = await runLocalLlm(prompt, state.settings, localControllers.get(jobId)?.signal);
     if (!local.ok) {
-      patchJob(jobId, (j) => ({
-        ...j,
-        assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12),
-        updatedAt: Date.now(),
+      patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+        ...j, generating: {...j.generating, local: false},
+        providerErrors: {...j.providerErrors, local: {code: "error", message: local.error}},
+        assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12), updatedAt: Date.now(),
       }));
     } else {
       patchJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
         const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
-        return { ...j, storedLegs: next, updatedAt: Date.now() };
+        return { ...j, storedLegs: next, generating: {...j.generating, local: false}, updatedAt: Date.now() };
       });
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    patchJob(jobId, (j) => ({
-      ...j,
-      assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12),
-      updatedAt: Date.now(),
+    patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+      ...j, generating: {...j.generating, local: false},
+      providerErrors: {...j.providerErrors, local: {code: "error", message: msg.slice(0, 160)}},
+      assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12), updatedAt: Date.now(),
     }));
   } finally {
     localInFlight.delete(jobId);
+    localControllers.delete(jobId);
     if (opts?.submit) {
       const job = state.jobs.find((j) => j.id === jobId);
       const legs = (job?.storedLegs ?? []).filter((l) => l.raw.trim());
@@ -633,8 +598,6 @@ export async function submitHarborChat(
     return { ok: false, error: "quota" };
   }
   if (!opts?.force && !job.chatFpRound) {
-    const bridge = await bridgeSnapshot();
-    const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
     const haveLocal = payloads.some((l) => l.provider === "local");
     const haveChat = payloads.some((l) => isChatProvider(l.provider));
     if (
@@ -644,8 +607,7 @@ export async function submitHarborChat(
         assumptions: job.assumptions,
         localInFlight: localInFlight.has(jobId),
         generating: job.generating,
-        claimed,
-        connected: bridge.connected,
+        providerErrors: job.providerErrors,
       })
     ) {
       patchJob(jobId, (j) => {
@@ -978,6 +940,8 @@ function enqueueFromDecision(
     events: trim([ev, ...state.events]),
   };
 
+  // Supersession is an explicit cancellation, not a timer.
+  for (const previous of state.jobs) if (previous.status === "cancelled") localControllers.get(previous.id)?.abort();
   if (opts.origin === "github") void playGithub(job.id, opts.untrustedBody ?? "");
   else void playTape(job.id, { forceDlq: opts.forceDlq });
   return { httpStatus: 202, jobId: job.id, queued: true };

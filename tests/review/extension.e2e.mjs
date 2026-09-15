@@ -24,7 +24,9 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
  const extension=join(root,'extension');
  const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
-   args:['--no-sandbox',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+   // The disposable, local-fixture-only browser must allow its unpacked extension to reload.
+   // This is a test launch setting; no installed browser profile or managed policy is changed.
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
  t.after(()=>context.close());
  const diagnostics=[];
  context.on('page',page=>{page.on('pageerror',error=>diagnostics.push(['pageerror',error.message]));page.on('console',msg=>{if(msg.type()==='error')diagnostics.push(['console',msg.text()]);});});

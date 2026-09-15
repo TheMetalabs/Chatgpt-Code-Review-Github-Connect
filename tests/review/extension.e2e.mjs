@@ -7,6 +7,33 @@ import {root,json} from './load-source.mjs';
 import {appFixture,eventually} from './app-fixture.mjs';
 import {chatFixtureProxy} from './browser-proxy.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
+// Fresh CDP attachment avoids a Playwright Worker retaining a destroyed context.
+async function evaluateTarget(cdp,url,expression) {
+ const {targetInfos}=await cdp.send('Target.getTargets');
+ const target=targetInfos.find(target=>target.url===url&&['worker','service_worker'].includes(target.type));
+ if(!target)throw new Error('worker target unavailable: '+url);
+ const {sessionId}=await cdp.send('Target.attachToTarget',{targetId:target.targetId,flatten:false});
+ let listener,timer;
+ try {
+  const result=await new Promise((resolve,reject)=>{
+   listener=event=>{
+    if(event.sessionId!==sessionId)return;
+    const response=JSON.parse(event.message);
+    if(response.id!==1)return;
+    if(response.error)reject(new Error(response.error.message));else resolve(response.result);
+   };
+   cdp.on('Target.receivedMessageFromTarget',listener);
+   timer=setTimeout(()=>reject(new Error('fixture CDP evaluation did not respond')),2000);
+   cdp.send('Target.sendMessageToTarget',{sessionId,message:JSON.stringify({id:1,method:'Runtime.evaluate',params:{expression,awaitPromise:true,returnByValue:true}})}).catch(reject);
+  });
+  if(result.exceptionDetails)throw new Error(result.exceptionDetails.exception?.description||result.exceptionDetails.text);
+  return result.result.value;
+ } finally {
+  clearTimeout(timer);cdp.off('Target.receivedMessageFromTarget',listener);
+  await cdp.send('Target.detachFromTarget',{sessionId}).catch(()=>{});
+ }
+}
+
 const envelope=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 const html=`<!doctype html><html><body>
  <div id="turns"></div><form data-type="unified-composer" onsubmit="return false">
@@ -59,20 +86,26 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  await worker.evaluate(()=>tick());
  assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===delivered.jobId).status,'awaiting_chat');
  assert.equal(app.localRequests.length,1);assert.equal(await page.evaluate(()=>window.sends),1);
- // Reload the actual extension, not a mocked JS function; persistent task resumes original tab.
- // Playwright can retain the same Worker object across a service-worker restart.
- // Prove the execution context was replaced instead of requiring a new Worker event.
+ // Reload the actual extension, then use a fresh DevTools attachment rather than
+ // Playwright's cached Worker execution context (which can survive as a stale handle).
  const workerUrl=worker.url();
- const reattached=next=>{if(next.url()===workerUrl)worker=next;};
- context.on('serviceworker',reattached);
+ const cdp=await context.newCDPSession(page);
  await worker.evaluate(()=>{globalThis.__fixtureBeforeReload=true;});
- await worker.evaluate(()=>chrome.runtime.reload()).catch(()=>{});
- await eventually(async()=>{
-  worker=context.serviceWorkers().find(candidate=>candidate.url()===workerUrl)||worker;
-  try { return await worker.evaluate(()=>!globalThis.__fixtureBeforeReload&&typeof tick==='function'); }
-  catch { return false; }
- },'extension execution context did not restart');
- context.off('serviceworker',reattached);
+ await worker.evaluate(()=>chrome.runtime.reload()).catch(error=>diagnostics.push(['reload',error.message]));
+ let lastProbe;
+ try {
+  await eventually(async()=>{
+   try {
+    lastProbe=await evaluateTarget(cdp,workerUrl,'({oldContext:Boolean(globalThis.__fixtureBeforeReload),tick:typeof tick})');
+    return !lastProbe.oldContext&&lastProbe.tick==='function';
+   } catch(error) {lastProbe={error:error.message};return false;}
+  },'extension execution context did not restart');
+ } catch(error) {
+  console.error('reload diagnostics',JSON.stringify({lastProbe,events:diagnostics,targets:await cdp.send('Target.getTargets')}));
+  throw error;
+ }
+ // Drive the real restarted worker, never a test replacement for its job state machine.
+ worker={evaluate:fn=>evaluateTarget(cdp,workerUrl,`(${fn.toString()})()`)};
  await worker.evaluate(()=>tick());
  await page.evaluate(raw=>window.reply(raw,false),json);
  await new Promise(resolve=>setTimeout(resolve,1700));

@@ -14,7 +14,7 @@ import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, buildFpPrompt, parseChatSubmission } from "./chat-prompt";
 import { runLocalLlm } from "./local-llm.server";
-import { buildOpsComment, type OpsPhase } from "./ops-comment";
+import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
   applyFpStep,
   buildReview,
@@ -242,6 +242,7 @@ async function reactQuiet(token: string, job: Job, content: GithubReaction) {
 async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, notes: string[]) {
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || job.origin !== "github") return;
+  if (!opsCommentAllowed(job)) return;
   const body = buildOpsComment({
     phase,
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),

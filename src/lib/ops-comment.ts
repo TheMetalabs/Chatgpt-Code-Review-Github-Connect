@@ -1,4 +1,4 @@
-import type { ReviewProvider } from "./types.ts";
+import type { ReviewProvider, Trigger } from "./types.ts";
 
 export type OpsPhase = "running" | "blocked" | "posted" | "skipped" | "failed";
 
@@ -9,6 +9,11 @@ export type OpsCommentInput = {
 };
 
 export const OPS_COMMENT_MARK = "<!-- ashlar-ops -->";
+
+/** Status comments are only for an explicit @ashlar-bot / follow-up, never for PR open/push. */
+export function opsCommentAllowed(job: { trigger: Trigger }): boolean {
+  return job.trigger === "issue_comment.mention" || job.trigger === "pull_request_review_comment.followup";
+}
 
 export function buildOpsComment(input: OpsCommentInput): string {
   const chat = input.providers.filter((p) => p === "chatgpt" || p === "grok");

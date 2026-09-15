@@ -126,6 +126,19 @@ async function clickSend(findSend, findComposer) {
   );
 }
 
+async function waitUntilComposer() {
+  for (;;) {
+    if (typeof quotaHit === "function" && quotaHit()) {
+      const e = new Error("usage limit");
+      e.code = "quota";
+      throw e;
+    }
+    const el = composer();
+    if (el) return el;
+    await sleep(250);
+  }
+}
+
 async function waitFor(fn, ms, label) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {

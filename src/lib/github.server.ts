@@ -90,6 +90,26 @@ type ResolvedHost = { hostname: string; servername: string; family: 4 | 6 };
 const PUBLIC_DNS = ["1.1.1.1", "8.8.8.8"];
 let resolvedCache: { at: number; value: ResolvedHost } | undefined;
 
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timeout`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
+function clearResolvedCache() {
+  resolvedCache = undefined;
+}
+
 function httpsRaw(opts: {
   hostname: string;
   servername?: string;
@@ -132,7 +152,7 @@ async function resolveViaPublicDns(): Promise<ResolvedHost | undefined> {
   const resolver = new Resolver();
   resolver.setServers(PUBLIC_DNS);
   try {
-    const addrs = await resolver.resolve4(GH_HOST);
+    const addrs = await withTimeout(resolver.resolve4(GH_HOST), 2_000, "public DNS");
     if (addrs[0]) return { hostname: addrs[0], servername: GH_HOST, family: 4 };
   } catch {
     /* DoH next */
@@ -147,7 +167,7 @@ async function resolveViaPublicDns(): Promise<ResolvedHost | undefined> {
         hostname: d.ip,
         servername: d.servername,
         path: d.path,
-        headers: { Accept: "application/dns-json" },
+        headers: { Accept: "application/dns-json", Host: d.servername },
         family: 4,
         timeoutMs: 6_000,
       });
@@ -160,21 +180,27 @@ async function resolveViaPublicDns(): Promise<ResolvedHost | undefined> {
   return undefined;
 }
 
-async function resolveGithubHost(): Promise<ResolvedHost> {
-  if (resolvedCache && Date.now() - resolvedCache.at < 5 * 60_000) return resolvedCache.value;
-  for (const family of [undefined, 4, 6] as const) {
-    try {
-      const r = await dnsLookup(GH_HOST, family ? { family } : {});
-      const value: ResolvedHost = {
-        hostname: r.address,
-        servername: GH_HOST,
-        family: r.family === 6 ? 6 : 4,
-      };
-      resolvedCache = { at: Date.now(), value };
-      return value;
-    } catch {
-      /* system resolver failed — public DNS / DoH next */
-    }
+async function resolveGithubHost(force = false): Promise<ResolvedHost> {
+  if (!force && resolvedCache && Date.now() - resolvedCache.at < 5 * 60_000) return resolvedCache.value;
+  try {
+    const r = await withTimeout(dnsLookup(GH_HOST, { family: 4 }), 2_000, "system DNS");
+    const value: ResolvedHost = { hostname: r.address, servername: GH_HOST, family: 4 };
+    resolvedCache = { at: Date.now(), value };
+    return value;
+  } catch {
+    /* public DNS / DoH */
+  }
+  try {
+    const r = await withTimeout(dnsLookup(GH_HOST), 2_000, "system DNS");
+    const value: ResolvedHost = {
+      hostname: r.address,
+      servername: GH_HOST,
+      family: r.family === 6 ? 6 : 4,
+    };
+    resolvedCache = { at: Date.now(), value };
+    return value;
+  } catch {
+    /* public DNS / DoH */
   }
   const fallback = await resolveViaPublicDns();
   if (fallback) {
@@ -182,6 +208,30 @@ async function resolveGithubHost(): Promise<ResolvedHost> {
     return fallback;
   }
   throw new Error(`getaddrinfo ENOTFOUND ${GH_HOST} (system DNS and DoH both failed)`);
+}
+
+function ghApiHeaders(extra: Record<string, string>, body?: string): Record<string, string> {
+  return {
+    Host: GH_HOST,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "ashlar-bot",
+    ...extra,
+    ...(body ? { "Content-Length": String(Buffer.byteLength(body)) } : {}),
+  };
+}
+
+async function ghCall(resolved: ResolvedHost, method: string, path: string, headers: Record<string, string>, body?: string, timeoutMs = 20_000) {
+  return httpsRaw({
+    hostname: resolved.hostname,
+    servername: resolved.servername,
+    path,
+    method,
+    family: resolved.family,
+    timeoutMs,
+    headers: ghApiHeaders(headers, body),
+    body,
+  });
 }
 
 /** Bypass Vite/Nitro-patched fetch. Connect to a resolved IP with SNI. */
@@ -194,23 +244,14 @@ async function ghHttps(
 ): Promise<GhRes> {
   const p = path.startsWith("/") ? path : `/${path}`;
   const resolved = await resolveGithubHost();
-  return httpsRaw({
-    hostname: resolved.hostname,
-    servername: resolved.servername,
-    path: p,
-    method,
-    family: resolved.family,
-    timeoutMs,
-    headers: {
-      Host: GH_HOST,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "ashlar-bot",
-      ...headers,
-      ...(body ? { "Content-Length": String(Buffer.byteLength(body)) } : {}),
-    },
-    body,
-  });
+  try {
+    return await ghCall(resolved, method, p, headers, body, timeoutMs);
+  } catch (e) {
+    clearResolvedCache();
+    const retry = await resolveGithubHost(true);
+    if (retry.hostname === resolved.hostname) throw e;
+    return ghCall(retry, method, p, headers, body, timeoutMs);
+  }
 }
 
 async function appJwt(): Promise<string> {

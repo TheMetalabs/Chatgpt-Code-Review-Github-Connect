@@ -129,8 +129,8 @@ async function markQuota(provider) {
 
 function contentFiles(provider) {
   return provider === "grok"
-    ? ["composer.js", "quota.js", "content-grok.js"]
-    : ["composer.js", "quota.js", "content-chatgpt.js"];
+    ? ["composer.js", "quota.js", "overlay.js", "content-grok.js"]
+    : ["composer.js", "quota.js", "overlay.js", "content-chatgpt.js"];
 }
 
 async function runProvider(provider, prompt, jobId) {

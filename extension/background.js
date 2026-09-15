@@ -1,4 +1,5 @@
 const POLL_MS = 2500;
+const PING_MS = 10_000;
 const BUSY_MS = 4 * 60_000;
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
 const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt" };
@@ -127,11 +128,34 @@ async function runProvider(provider, prompt, jobId) {
   }
 }
 
+async function ping(jobId) {
+  try {
+    await api("/api/bridge", { action: "ping", jobId: jobId || undefined });
+  } catch {
+    /* keep trying */
+  }
+}
+
+async function recoverDeadWorker() {
+  const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId]);
+  const last = await chrome.storage.local.get(["lastJobId"]);
+  const jobId = session[SESSION.jobId] || last.lastJobId;
+  await chrome.storage.session.set({ [SESSION.busy]: false, [SESSION.jobId]: "", [SESSION.busyAt]: 0 });
+  if (jobId) {
+    try {
+      await api("/api/bridge", { action: "release", jobId });
+    } catch {
+      /* job may already be free */
+    }
+  }
+}
+
 async function tick() {
   const cfg = await settings();
   if (!cfg.enabled || !cfg.origin || !cfg.token) return;
   const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId, SESSION.busyAt]);
   const busyAge = session[SESSION.busyAt] ? Date.now() - Number(session[SESSION.busyAt]) : BUSY_MS;
+  await ping(session[SESSION.jobId]);
   if (session[SESSION.busy] && busyAge < BUSY_MS) return;
   const quota = await quotaMap();
   if (!providerOpen(quota, "chatgpt") && !providerOpen(quota, "grok")) {
@@ -143,7 +167,7 @@ async function tick() {
   }
   let payload;
   try {
-    payload = await api("/api/bridge");
+    payload = await api("/api/bridge", { action: "take" });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     chrome.storage.local.set({ lastError: msg.slice(0, 240) });
@@ -164,9 +188,15 @@ async function tick() {
       await api("/api/bridge", { action: "release", jobId: job.jobId });
       return;
     }
-    const settled = await Promise.allSettled(
-      runnable.map((p) => runProvider(p, (job.prompts && job.prompts[p]) || job.prompt, job.jobId)),
-    );
+    const keepAlive = setInterval(() => void ping(job.jobId), PING_MS);
+    let settled;
+    try {
+      settled = await Promise.allSettled(
+        runnable.map((p) => runProvider(p, (job.prompts && job.prompts[p]) || job.prompt, job.jobId)),
+      );
+    } finally {
+      clearInterval(keepAlive);
+    }
     const results = [];
     let quotaOnly = true;
     for (let i = 0; i < settled.length; i += 1) {
@@ -219,8 +249,8 @@ async function tick() {
 }
 
 function loop() {
-  chrome.alarms.create("ashlar-poll", { periodInMinutes: 0.5 });
-  void tick();
+  chrome.alarms.create("ashlar-poll", { periodInMinutes: 1 });
+  void recoverDeadWorker().then(() => tick());
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {

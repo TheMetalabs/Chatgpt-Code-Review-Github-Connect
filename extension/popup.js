@@ -29,7 +29,9 @@ document.getElementById("save").addEventListener("click", async () => {
   await chrome.storage.local.set({ origin, token, enabled });
   try {
     const res = await fetch(`${origin}/api/bridge`, {
-      headers: { "x-ashlar-bridge-token": token },
+      method: "POST",
+      headers: { "content-type": "application/json", "x-ashlar-bridge-token": token },
+      body: JSON.stringify({ action: "ping", token }),
     });
     const json = await res.json();
     statusEl.textContent = json.ok ? "connected" : json.error || "rejected";

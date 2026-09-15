@@ -56,11 +56,14 @@ function extractJson(text) {
 }
 
 async function runPrompt(prompt) {
+  await dismissOverlays();
   await waitFor(composer, 45_000, "ChatGPT composer not found");
+  await dismissOverlays();
   const el = composer();
   if (!el) throw new Error("ChatGPT composer not found");
   if (quotaHit()) throw quotaError();
   await fillComposer(el, prompt);
+  await dismissOverlays();
   await clickSend(sendButton, composer);
   const deadline = Date.now() + 180_000;
   let stable = "";

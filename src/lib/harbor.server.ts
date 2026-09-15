@@ -391,7 +391,20 @@ async function watchReviewers(jobId: string, token: string) {
       }));
       try {
         const token = leftover.installationId ? await installationToken(leftover.installationId) : undefined;
-        await finishJob(jobId, undefined, token);
+        const sample = token
+          ? await fetchPullSnapshot(token, {
+              owner: leftover.owner,
+              repo: leftover.repo,
+              pr: leftover.pr,
+              title: leftover.title,
+              headSha: leftover.headSha,
+              baseSha: leftover.baseSha,
+              sender: leftover.sender,
+              isFork: leftover.isFork,
+              isDraft: leftover.isDraft,
+            })
+          : undefined;
+        await finishJob(jobId, sample, token);
       } catch {
         /* finishJob records githubError */
       }

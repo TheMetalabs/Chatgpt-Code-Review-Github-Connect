@@ -851,8 +851,15 @@ export async function submitHarborChat(
     return revert(invalid.join("; ") || "no valid review JSON");
   }
 
-  if (gates.length < 2) {
-    const merged = gates[0];
+  const chatReturned = [...byProvider.keys()].filter(isChatProvider);
+  if (gates.length < 2 || chatReturned.length < 2) {
+    const merged =
+      gates.length < 2
+        ? gates[0]
+        : schemaMergeProviderGates(
+            [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
+            state.settings,
+          );
     patchJob(jobId, (j) => ({
       ...j,
       findings: merged.findings,

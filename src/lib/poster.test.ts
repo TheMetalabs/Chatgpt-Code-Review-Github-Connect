@@ -116,6 +116,14 @@ describe("poster", () => {
     assert.equal(out.length, 0);
   });
 
+  it("drops a line that is not in the pull diff even when the file changed", () => {
+    const far: Finding = { ...FINDING_412, id: "f-far", line: 200 };
+    const out = publishableFindings([far], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]);
+    assert.equal(out.length, 0);
+    const ok = publishableFindings([FINDING_412], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]);
+    assert.equal(ok.length, 1);
+  });
+
   it("caps inline comments at maxInlineComments including zero", () => {
     const many = [FINDING_412, { ...FINDING_412, id: "b", severity: "P2" as const }];
     assert.equal(publishableFindings(many, { ...DEFAULT_SETTINGS, maxInlineComments: 0 }, SAMPLE_PRS["pay-412"]).length, 0);

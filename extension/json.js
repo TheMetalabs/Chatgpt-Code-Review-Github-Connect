@@ -69,7 +69,7 @@ function extractChatJson(text) {
 function cleanTurnText(el) {
   if (!el) return "";
   const root = el.cloneNode(true);
-  root.querySelectorAll("button, svg, script, [data-testid='copy-turn-action-button']").forEach((n) => n.remove());
+  root.querySelectorAll("button, svg, script, [data-testid='copy-turn-action-button'], [data-content-reference-start]").forEach((n) => n.remove());
   root.querySelectorAll("br").forEach((br) => br.replaceWith(document.createTextNode("\n")));
   return (root.innerText || root.textContent || "").replace(/\u00a0/g, " ").trim();
 }
@@ -122,9 +122,16 @@ async function waitUntilReviewOrQuota(name) {
   let stable = "";
   let hits = 0;
   let emptyTicks = 0;
+  let sawStop = false;
+  let copied = false;
   for (;;) {
-    const done = typeof chatGenerationFinished === "function" ? chatGenerationFinished() : !stopButtonVisible();
-    const json = harvestJson({ allowThin: done }) || (done ? await harvestViaCopy() : null);
+    if (typeof stopButtonVisible === "function" && stopButtonVisible()) sawStop = true;
+    const done = typeof chatGenerationFinished === "function" ? chatGenerationFinished(sawStop) : sawStop && !stopButtonVisible();
+    let json = harvestJson({ allowThin: done });
+    if (!json && done && !copied) {
+      copied = true;
+      json = await harvestViaCopy();
+    }
     if (typeof quotaHit === "function" && quotaHit() && !json) {
       const e = new Error(`${name} usage limit`);
       e.code = "quota";
@@ -137,7 +144,7 @@ async function waitUntilReviewOrQuota(name) {
         hits = 1;
       }
       if (done && hits >= 1) return json;
-      if (hits >= 2 && typeof stopButtonVisible === "function" && !stopButtonVisible()) return json;
+      if (hits >= 2 && sawStop && typeof stopButtonVisible === "function" && !stopButtonVisible()) return json;
       emptyTicks = 0;
     } else if (done) {
       emptyTicks += 1;

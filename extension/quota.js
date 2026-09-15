@@ -16,11 +16,15 @@ function quotaHit() {
   return false;
 }
 
+/** Toolbar icons are 32px; composer.visible() requires >40px and would miss them. */
 function elVisible(el) {
   if (!el) return false;
-  if (typeof visible === "function") return visible(el);
-  const s = window.getComputedStyle(el);
-  if (s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0) return false;
+  try {
+    const s = window.getComputedStyle(el);
+    if (s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0) return false;
+  } catch {
+    /* computed style can fail on detached nodes */
+  }
   const r = el.getBoundingClientRect();
   return r.width > 0 && r.height > 0;
 }
@@ -30,7 +34,7 @@ function stopButtonVisible() {
   if (elVisible(stop)) return true;
   for (const el of document.querySelectorAll("button, [role='button']")) {
     const t = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${el.textContent || ""}`.toLowerCase();
-    if (!/stop generating|stop streaming|abort|생성 중지|답변 중지|중단/.test(t)) continue;
+    if (!/stop generating|stop streaming|abort|생성 중지|답변 중지/.test(t)) continue;
     if (!elVisible(el)) continue;
     return true;
   }
@@ -39,10 +43,10 @@ function stopButtonVisible() {
 
 /** Assistant-turn copy/feedback only. User "메시지 복사" is not "answer done". */
 function replyDoneVisible() {
-  const assistantTurn = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].find((t) =>
+  const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].filter((t) =>
     t.querySelector('[data-message-author-role="assistant"]'),
   );
-  const root = assistantTurn || document.querySelector('[data-message-author-role="assistant"]')?.parentElement;
+  const root = turns.length ? turns[turns.length - 1] : document.querySelector('[data-message-author-role="assistant"]')?.closest("section") || null;
   if (!root) return false;
   if (elVisible(root.querySelector('[aria-label="응답 작업"], [aria-label="Response actions"]'))) return true;
   for (const el of root.querySelectorAll('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]')) {
@@ -53,7 +57,8 @@ function replyDoneVisible() {
   return false;
 }
 
-function chatGenerationFinished() {
+function chatGenerationFinished(sawStop) {
   if (replyDoneVisible()) return true;
-  return !stopButtonVisible();
+  if (stopButtonVisible()) return false;
+  return Boolean(sawStop);
 }

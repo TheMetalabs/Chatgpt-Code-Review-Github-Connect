@@ -12,7 +12,12 @@ describe("chatGenerationFinished", () => {
     assert.equal(chatGenerationFinished({ stopVisible: true, replyActionsVisible: false }), false);
   });
 
-  it("settles when stop is gone", () => {
-    assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false }), true);
+  it("does not treat pre-generation (no stop yet) as done", () => {
+    assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false }), false);
+    assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false, sawStop: false }), false);
+  });
+
+  it("settles after stop disappears once generation actually started", () => {
+    assert.equal(chatGenerationFinished({ stopVisible: false, replyActionsVisible: false, sawStop: true }), true);
   });
 });

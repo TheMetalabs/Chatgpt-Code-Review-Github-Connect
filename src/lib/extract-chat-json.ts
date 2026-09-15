@@ -72,15 +72,18 @@ export function extractChatJson(text: string): string | null {
 
 /** ChatGPT renders the review as a markdown <p> with <br>, not a JSON API body. */
 export function htmlChatToText(html: string): string {
+  const quot = String.fromCharCode(34);
+  const apos = String.fromCharCode(39);
   return String(html || "")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<button[\s\S]*?<\/button>/gi, "")
     .replace(/<svg[\s\S]*?<\/svg>/gi, "")
     .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<span[^>]*data-content-reference[\s\S]*?<\/span>/gi, "")
     .replace(/<[^>]+>/g, "")
     .replace(/&nbsp;/gi, " ")
-    .replace(/"/gi, '"')
-    .replace(/&#39;/gi, "'")
+    .replace(/"/gi, quot)
+    .replace(/&#39;/gi, apos)
     .replace(/</gi, "<")
     .replace(/>/gi, ">")
     .replace(/&/gi, "&")

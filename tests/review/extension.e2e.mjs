@@ -23,20 +23,25 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
  const profile=await mkdtemp(join(tmpdir(),'ashlar-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
  const extension=join(root,'extension');
- const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server},ignoreHTTPSErrors:true,channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
+ const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
    args:['--no-sandbox',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
  t.after(()=>context.close());
  const diagnostics=[];
  context.on('page',page=>{page.on('pageerror',error=>diagnostics.push(['pageerror',error.message]));page.on('console',msg=>{if(msg.type()==='error')diagnostics.push(['console',msg.text()]);});});
  context.on('requestfailed',request=>diagnostics.push(['requestfailed',request.url(),request.failure()?.errorText]));
  // The launch-level local proxy also intercepts the first extension-created tab request.
- // Default loopback bypass keeps the bridge fixture directly accessible.
+ // Explicit loopback bypass keeps bridge RPCs out of the external-destination proxy.
  let worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
  await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
  const delivered=app.mention();assert.equal(delivered.queued,true);
  await eventually(()=>app.localRequests.length===1,'local generation not started');
  await worker.evaluate(()=>tick());
- await eventually(()=>context.pages().some(p=>p.url().startsWith('https://chatgpt.com/')),'chat tab missing');
+ try {
+  await eventually(()=>context.pages().some(p=>p.url().startsWith('https://chatgpt.com/')),'chat tab missing');
+ } catch(error) {
+  console.error('tab diagnostics',JSON.stringify({events:diagnostics,requests:proxy.requests,pages:context.pages().map(p=>p.url()),storage:await worker.evaluate(()=>chrome.storage.local.get(null))}));
+  throw error;
+ }
  const page=context.pages().find(p=>p.url().startsWith('https://chatgpt.com/'));
  // The tab URL can be visible before its first document script has executed.
  try {

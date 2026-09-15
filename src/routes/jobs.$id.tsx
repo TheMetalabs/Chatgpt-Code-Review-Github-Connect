@@ -317,8 +317,10 @@ function ChatHandoff({
       <p className="mt-1 text-[13px] leading-relaxed text-fg-muted">
         {claimed
           ? dual
-            ? "The Chrome bridge is running ChatGPT and Grok in parallel."
-            : "The Chrome bridge claimed this job and is running it in ChatGPT or Grok."
+            ? `The Chrome bridge is running ${providers.join(" and ")} in parallel.`
+            : providers[0]
+              ? `The Chrome bridge claimed this job and is running ${providers[0]}.`
+              : "The Chrome bridge claimed this job."
           : fpRound
             ? "False-positive check in review order. This step is one reviewer, not a full cross-check."
             : dual

@@ -1,4 +1,4 @@
-import type { ReviewProvider, Trigger } from "./types.ts";
+import { describeEnabledReviewers, type ReviewProvider, type Trigger } from "./types.ts";
 
 export type OpsPhase = "running" | "blocked" | "posted" | "skipped" | "failed";
 
@@ -16,14 +16,7 @@ export function opsCommentAllowed(job: { trigger: Trigger }): boolean {
 }
 
 export function buildOpsComment(input: OpsCommentInput): string {
-  const chat = input.providers.filter((p) => p === "chatgpt" || p === "grok");
-  const local = input.providers.includes("local");
-  const reviewers = [
-    chat.length ? `${chat.join(" + ")} in parallel (Chrome)` : "",
-    local ? "local if reachable (wait to merge before posting)" : "",
-  ]
-    .filter(Boolean)
-    .join("; ");
+  const reviewers = describeEnabledReviewers(input.providers);
   const status =
     input.phase === "blocked"
       ? "blocked — a reviewer is unavailable; others continue"

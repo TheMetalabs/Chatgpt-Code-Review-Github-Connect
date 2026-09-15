@@ -116,6 +116,7 @@ export interface Job {
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;
   attemptedProviders?: ReviewProvider[];
+  generating?: Partial<Record<ReviewProvider, boolean>>;
 }
 
 export interface PostedComment {
@@ -270,10 +271,35 @@ export function providersFromSettings(
     Partial<Pick<BotSettings, "localLlmBaseUrl" | "localLlmModel">>,
 ): ReviewProvider[] {
   const out: ReviewProvider[] = [];
-  if (s.reviewChatgpt !== false) out.push("chatgpt");
-  if (s.reviewGrok !== false) out.push("grok");
+  if (s.reviewChatgpt) out.push("chatgpt");
+  if (s.reviewGrok) out.push("grok");
   if (localLlmReady(s)) out.push("local");
   return out;
+}
+
+export function chatProvidersOf(providers: readonly ReviewProvider[]): Array<"chatgpt" | "grok"> {
+  return providers.filter(isChatProvider);
+}
+
+export function describeEnabledReviewers(providers: readonly ReviewProvider[]): string {
+  const chat = chatProvidersOf(providers as ReviewProvider[]);
+  const local = providers.includes("local");
+  const chatBit = !chat.length
+    ? ""
+    : chat.length === 1
+      ? `${chat[0]} (Chrome)`
+      : `${chat.join(" + ")} in parallel (Chrome)`;
+  const localBit = !local ? "" : chat.length ? "local racing" : "local only";
+  return [chatBit, localBit].filter(Boolean).join("; ") || "none configured";
+}
+
+export function claimedReviewerNote(providers: readonly ReviewProvider[]): string {
+  const chat = chatProvidersOf(providers as ReviewProvider[]);
+  if (!chat.length) return "Chrome bridge claimed this job.";
+  if (chat.length === 1) {
+    return `Chrome bridge claimed this job. ${PROVIDER_LABEL[chat[0]]} is running the review.`;
+  }
+  return `Chrome bridge claimed this job. ${chat.map((p) => PROVIDER_LABEL[p]).join(" and ")} run in parallel.`;
 }
 
 export const BRIDGE_CLAIM_MS = 4 * 60_000;

@@ -193,9 +193,18 @@ export function persistableSettings(next: BotSettings, env: NodeJS.Dict<string> 
   return sanitizeBotSettings(out);
 }
 
+export function diskReviewerFlagsWin(disk: Record<string, unknown>, merged: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...merged };
+  for (const key of ["reviewChatgpt", "reviewGrok", "reviewLocal"] as const) {
+    if (typeof disk[key] === "boolean") out[key] = disk[key];
+  }
+  return out;
+}
+
 export function loadBotSettings(): BotSettings {
   loadDotenvFile();
-  return sanitizeBotSettings(overlayEnv(readDiskSettings()));
+  const disk = readDiskSettings();
+  return sanitizeBotSettings(diskReviewerFlagsWin(disk, overlayEnv(disk)));
 }
 
 export function saveBotSettings(settings: BotSettings) {

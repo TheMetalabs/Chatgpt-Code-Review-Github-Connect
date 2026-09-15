@@ -18,64 +18,27 @@ export function skippedProvider(assumptions: readonly string[] | undefined, prov
   return rows.some((a) => new RegExp(`Skipped ${provider}`, "i").test(a));
 }
 
-/** Wait only while an enabled reviewer is still producing an answer. No wall clock. */
+/**
+ * Wait only while an enabled racer has not finished.
+ * Finished = JSON payload, explicit skip, or generating === false (quota / tab done).
+ * Unknown generating (not yet pinged) counts as still running. No wall clock.
+ */
 export function stillRacing(input: {
   providers: readonly ReviewProvider[];
   payloads: readonly ReviewProvider[];
   assumptions?: readonly string[];
   localInFlight: boolean;
   generating?: Partial<Record<ReviewProvider, boolean>>;
-  claimed: boolean;
-  connected: boolean;
+  claimed?: boolean;
+  connected?: boolean;
 }): boolean {
   for (const p of input.providers) {
     if (input.payloads.includes(p)) continue;
     if (skippedProvider(input.assumptions, p)) continue;
-    if (p === "local") {
-      if (input.localInFlight) return true;
-      continue;
-    }
+    if (p === "local") return true;
     const g = input.generating?.[p];
-    if (g === true) return true;
     if (g === false) continue;
-    if (input.claimed || input.connected) return true;
+    return true;
   }
   return false;
-}
-
-export function shouldHoldForLocal(input: {
-  providers: readonly ReviewProvider[];
-  haveLocal: boolean;
-  localSkipped: boolean;
-  localInFlight: boolean;
-  chatFpRound?: boolean;
-}): boolean {
-  if (input.chatFpRound) return false;
-  if (!input.providers.includes("local")) return false;
-  if (input.haveLocal || input.localSkipped) return false;
-  return input.localInFlight;
-}
-
-export function shouldHoldForChat(input: {
-  providers: readonly ReviewProvider[];
-  haveChat: boolean;
-  chatSkipped: boolean;
-  claimed: boolean;
-  connected: boolean;
-  chatFpRound?: boolean;
-  allChatAttempted?: boolean;
-  generating?: Partial<Record<ReviewProvider, boolean>>;
-  payloads?: readonly ReviewProvider[];
-  assumptions?: readonly string[];
-}): boolean {
-  if (input.chatFpRound) return false;
-  return stillRacing({
-    providers: input.providers.filter(isChatProvider),
-    payloads: input.payloads ?? (input.haveChat ? input.providers.filter(isChatProvider) : []),
-    assumptions: input.assumptions ?? (input.chatSkipped ? input.providers.filter(isChatProvider).map((p) => `Skipped ${p}`) : []),
-    localInFlight: false,
-    generating: input.generating,
-    claimed: input.claimed,
-    connected: input.connected,
-  });
 }

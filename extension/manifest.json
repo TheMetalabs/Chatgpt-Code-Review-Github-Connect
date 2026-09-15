@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ashlar Chat Bridge",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "Runs Ashlar PR reviews in the ChatGPT or Grok tab you are already signed into.",
   "permissions": ["storage", "tabs", "alarms", "scripting", "clipboardWrite"],
   "host_permissions": [

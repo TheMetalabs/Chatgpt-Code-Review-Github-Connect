@@ -1,7 +1,6 @@
-import OpenAI from "openai";
 import type { BotSettings } from "./types";
 import { extractChatJson } from "./extract-chat-json";
-import { requestLocalChat, type LocalChatMessage } from "./local-chat-request.server";
+import { requestLocalJson, requestLocalChat, type LocalChatMessage } from "./local-chat-request.server";
 
 function localConfig(settings: BotSettings) {
   const baseURL = settings.localLlmBaseUrl.trim().replace(/\/$/, "");
@@ -18,8 +17,7 @@ export async function pingLocalLlm(
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
   try {
-    const client = new OpenAI({ apiKey: ready.apiKey, baseURL: ready.baseURL, timeout: 5_000, maxRetries: 0 });
-    await client.models.list();
+    await requestLocalJson(ready.baseURL, ready.apiKey, "models", undefined, AbortSignal.timeout(5_000));
     return { ok: true };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -59,7 +57,9 @@ export async function runLocalLlm(
         content: "Your previous reply was not extractable review JSON. Reply again with ONLY the JSON object (findings/merge_recommendation/keep). No markdown.",
       },
     ]);
-    return { ok: true, raw: extractChatJson(raw2) ?? (raw2.trim() || raw) };
+    const corrected = extractChatJson(raw2);
+    return corrected ? {ok: true, raw: corrected}
+      : {ok: false, error: "local LLM completed without valid review JSON after one correction"};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

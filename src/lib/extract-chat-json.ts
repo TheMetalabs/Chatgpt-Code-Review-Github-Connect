@@ -47,16 +47,7 @@ export function lastReviewJson(text: string): string | null {
 export function extractChatJson(text: string): string | null {
   const s = String(text || "");
   if (!s.trim()) return null;
-  const fences = [...s.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
-  for (let i = fences.length - 1; i >= 0; i -= 1) {
-    const hit = lastReviewJson(fences[i][1] || "") || parseReviewSlice((fences[i][1] || "").trim());
-    if (hit) return hit;
-  }
-  const dangling = s.match(/```(?:json)?\s*([\s\S]+)$/i);
-  if (dangling) {
-    const hit = lastReviewJson(dangling[1] || "");
-    if (hit) return hit;
-  }
+  // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
   return lastReviewJson(s);
 }
 

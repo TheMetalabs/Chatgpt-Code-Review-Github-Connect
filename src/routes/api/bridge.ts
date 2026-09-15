@@ -1,6 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
+import type { ProviderError } from "@/lib/types";
 import {
   bridgeHeartbeat,
+  bridgeJobState,
   bridgeTokenOk,
   claimBridgeJob,
   completeBridgeJob,
@@ -62,6 +64,10 @@ export const Route = createFileRoute("/api/bridge")({
         const headers = corsHeaders(request);
         const body = (await request.json().catch(() => ({}))) as {
           action?: string;
+          clientId?: string;
+          leaseId?: string;
+          excludeJobIds?: string[];
+          providerErrors?: Record<string, {code?: string; message?: string}>;
           token?: string;
           jobId?: string;
           raw?: string;
@@ -94,28 +100,36 @@ export const Route = createFileRoute("/api/bridge")({
                       .map((p) => [p, rawGen[p]]),
                   )
                 : undefined;
-            refreshBridgeClaim(body.jobId, generating);
+            const errors: Partial<Record<"chatgpt" | "grok", ProviderError>> = {};
+            for (const provider of ["chatgpt", "grok"] as const) {
+              const error = body.providerErrors?.[provider];
+              if (error && ["quota", "empty", "error", "tab_closed", "cancelled", "disconnected"].includes(error.code ?? "")) {
+                errors[provider] = {code: error.code as ProviderError["code"], message: String(error.message ?? "").slice(0, 240)};
+              }
+            }
+            const accepted = refreshBridgeClaim(body.jobId, generating, errors, body.leaseId);
+            return Response.json({ok: true, accepted, ...bridgeJobState(body.jobId), bridge: getBridgePublic()}, {headers});
           }
           return Response.json({ ok: true, bridge: getBridgePublic() }, { headers });
         }
         if (body.action === "take") {
-          return Response.json({ ok: true, bridge: getBridgePublic(), job: takeNextBridgeJob() }, { headers });
+          return Response.json({ ok: true, bridge: getBridgePublic(), job: takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : []) }, { headers });
         }
         if (body.action === "claim" && body.jobId) {
-          const out = claimBridgeJob(body.jobId);
+          const out = claimBridgeJob(body.jobId, String(body.clientId ?? ""));
           if (!out.ok) return Response.json(out, { status: 409, headers });
-          return Response.json({ ok: true }, { headers });
+          return Response.json(out, { headers });
         }
         if (body.action === "release" && body.jobId) {
-          releaseBridgeJob(body.jobId);
+          releaseBridgeJob(body.jobId, body.leaseId);
           return Response.json({ ok: true }, { headers });
         }
         if (body.action === "failure" && body.jobId) {
           if (body.provider !== "chatgpt" && body.provider !== "grok") {
             return Response.json({ ok: false, error: "invalid chat provider" }, { status: 400, headers });
           }
-          failBridgeProvider(body.jobId, body.provider, String(body.error || "chat review failed"));
-          return Response.json({ ok: true }, { headers });
+          const accepted = failBridgeProvider(body.jobId, body.provider, String(body.error || "chat review failed"), body.leaseId);
+          return Response.json({ ok: accepted }, { status: accepted ? 200 : 409, headers });
         }
         if (body.action === "complete" && body.jobId) {
           const legs = Array.isArray(body.results)
@@ -123,8 +137,8 @@ export const Route = createFileRoute("/api/bridge")({
                 .filter((r) => r.provider === "chatgpt" || r.provider === "grok")
                 .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? "") }))
             : undefined;
-          const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs);
-          if (!out.ok) return Response.json(out, { status: 400, headers });
+          const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
+          if (!out.ok) return Response.json(out, { status: "code" in out && out.code === "lease_conflict" ? 409 : 400, headers });
           return Response.json({ ok: true }, { headers });
         }
         return Response.json({ ok: false, error: "unknown action" }, { status: 400, headers });

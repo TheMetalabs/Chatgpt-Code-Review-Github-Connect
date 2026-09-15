@@ -1,16 +1,17 @@
 # Review lifecycle recovery
 
-Follow-up to PR #30. Extension version: **1.1.11**. Deploy the bridge server and reload the updated extension together: terminal provider errors use the authenticated `failure` bridge action.
+Integrated follow-ups #31 and #32 to PR #30. Extension version: **1.1.12**. Deploy the bridge server and reload the updated extension together: control requests use client identity and ownership leases, and terminal provider errors use the authenticated `failure` bridge action.
 
 ## Invariants
 
 - Queueing and model generation have no elapsed-time deadline. Stop disappearance alone, streaming JSON and old-turn controls do not establish completion.
 - Both content scripts use `installReviewRunner`. A run returns `busy` immediately; harvest observes the runner's cached terminal result, not partially generated DOM. Job IDs prevent cross-job harvest. Reinjecting the scripts does not add another listener or run.
-- The MV3 worker advances work in short ticks. `chrome.storage.local.pendingReviewJobs` stores each job's origin, prompts, provider tab IDs, start acknowledgements and terminal outcomes. Persisted jobs are reconciled before taking new work. Existing session tab mappings are migrated when still available.
+- The MV3 worker advances work in short ticks. `chrome.storage.local.pendingReviewJobs` stores each job's origin, prompts, provider tab IDs, start acknowledgements and terminal outcomes. Persisted jobs are reconciled before taking new work. Existing session tab mappings and the alternate follow-up outbox format are migrated when still available. A tab-local job binding permits read-only discovery after tab IDs change.
 - A lost start acknowledgement retries the same idempotent page command. A restarted page observer resumes without submitting the prompt again. A completed JSON result is retained until bridge delivery is acknowledged, and replayed only to the bridge, not the model.
-- `quota`, `empty`, `job_mismatch`, tab closure and navigation away are explicit failures. The server records the failed provider without stopping other racers or modifying completed jobs. Transient transport failures do not mean empty/quota and do not trigger model regeneration.
+- `quota`, `empty`, explicit individual tab closure and navigation away are terminal outcomes. The server records the failed provider without stopping other racers or modifying completed jobs. Missing tabs, lost bindings and transport failures are disconnected/pending until reconnection, not inferred empty/quota. A window/browser closing may be followed by session restoration. Ordinary resume cannot adopt an unrelated tab.
+- A client ID identifies the original Chrome profile; lease expiry permits recovery, never ownership theft or model replay. Direct claim and queue selection both enforce ownership. Release preserves execution history. A wrong-lease response retains the outbox and reacquires a lease rather than discarding the final JSON.
 - The server stores successful raw output atomically with `generating=false`, before asynchronous validation. Heartbeats do not announce completion before outcome delivery.
-- Local generation uses native HTTP(S), no SDK/fetch header/body deadline, no automatic network retry, and an optional caller-provided abort signal. The `/models` health check remains bounded to 5 seconds. Exactly one JSON correction request is allowed only after a completed non-JSON answer.
+- Local generation uses native HTTP(S), no SDK/fetch header/body deadline, no automatic network retry, and an optional caller-provided abort signal. The `/models` health check remains bounded to 5 seconds. Health probes never gate generation. Exactly one JSON correction request is allowed only after a completed non-JSON answer; a second invalid response is an explicit parse failure. Cancellation and supersession abort only the explicitly cancelled Local job.
 - Server/extension JSON escape parsing and completion predicates have shared behavioral tests.
 
 Pending prompts and responses are stored locally in the extension while awaiting delivery, then removed from the pending-job records. This does not reconstruct a temporary conversation lost by closing/navigating the tab, nor override timeouts enforced by upstream model servers or proxies. Migration cannot recreate session tab mappings already erased before upgrade.
@@ -25,7 +26,7 @@ npm run test:review-regressions
 
 It loads the real content scripts, background state transitions, bridge error/HTTP handlers and parsers. Chrome and DOM I/O are mocked. Native local transport tests use real loopback HTTP sockets with a virtual clock covering a day before response headers and another day during the body; this is not a live multi-day model test.
 
-The independent `review-lifecycle` CI job runs these regressions even if unrelated template tests fail. `npm test` also runs them first. The existing `verify` job retains the full test suite and runs typecheck/build after dependency installation even when tests fail, so failures stay visible rather than being hidden by `&&`.
+The independent `review-lifecycle` CI job runs both PRs' regressions and cross-component integration tests even if unrelated template tests fail. The `review-browser` job installs Chromium and runs the real DOM and actual MV3 extension fixtures from #31. External model/GitHub endpoints are controlled fixtures, not signed-in live services. `npm test` also runs them first. The existing `verify` job retains the full test suite and runs typecheck/build after dependency installation even when tests fail, so failures stay visible rather than being hidden by `&&`. `npm run test:lib` also runs separately in CI to expose the library test phase when legacy script tests fail.
 
 ## Manual browser smoke test still required
 

@@ -53,7 +53,7 @@ function stopButtonVisible() {
   return false;
 }
 
-/** Never borrow completion controls from an answer before the latest user turn. */
+/** Never reuse completion controls from an answer before the latest user turn. */
 function currentAssistantRoot() {
   const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
   if (turns.length) {
@@ -66,7 +66,7 @@ function currentAssistantRoot() {
   return last.closest("article, section") || last;
 }
 
-/** Current assistant-turn copy/feedback only; hidden controls do not count. */
+/** Current assistant-turn copy/feedback only, never hidden or previous-turn controls. */
 function replyDoneVisible() {
   const root = currentAssistantRoot();
   if (!root) return false;

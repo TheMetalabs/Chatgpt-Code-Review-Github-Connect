@@ -1,6 +1,21 @@
 const POLL_MS = 2500;
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
 const PENDING_JOBS = "pendingReviewJobs";
+const CLIENT_KEY = "ashlar:client";
+const CLOSED_PREFIX = "ashlar:closed:";
+
+async function clientId() {
+  const old = (await chrome.storage.local.get([CLIENT_KEY]))[CLIENT_KEY];
+  if (old) return old;
+  const id = crypto.randomUUID();
+  await chrome.storage.local.set({[CLIENT_KEY]: id});
+  return id;
+}
+
+async function rememberClosedTab(tabId, info) {
+  // A whole browser/window closing can be followed by session restoration.
+  if (!info?.isWindowClosing) await chrome.storage.local.set({[CLOSED_PREFIX + tabId]: true});
+}
 
 function formatRetry(until) {
   if (!until) return "later";
@@ -31,6 +46,8 @@ async function api(path, body) {
       "x-ashlar-bridge-token": token,
     },
     body: body ? JSON.stringify({ ...body, token }) : undefined,
+    // Bound only bridge control RPCs, never the underlying queue or generation.
+    signal: AbortSignal.timeout(10_000),
   });
   const json = await res.json().catch(() => ({}));
   if (!res.ok || json.ok === false) {
@@ -45,34 +62,6 @@ function providerUrl(provider, reasoning) {
   if (provider === "grok") return "https://grok.com/";
   if (reasoning === "pro") return "https://chatgpt.com/?temporary-chat=true&model=gpt-6-pro";
   return "https://chatgpt.com/?temporary-chat=true";
-}
-
-async function ensureTab(provider, reasoning) {
-  const url = providerUrl(provider, reasoning);
-  const tab = await chrome.tabs.create({ url, active: true });
-  await waitTab(tab.id);
-  await sleep(1500);
-  return tab.id;
-}
-
-function waitTab(tabId) {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      chrome.tabs.onUpdated.removeListener(ready);
-      resolve();
-    };
-    const ready = (id, info) => {
-      if (id === tabId && info.status === "complete") finish();
-    };
-    chrome.tabs.get(tabId, (tab) => {
-      if (tab?.status === "complete") finish();
-      else chrome.tabs.onUpdated.addListener(ready);
-    });
-    setTimeout(finish, 8000);
-  });
 }
 
 function noReceiver(err) {
@@ -150,7 +139,19 @@ async function pendingJobs(origin) {
     if (sep < 1 || !["chatgpt", "grok"].includes(provider) || !tabId) continue;
     jobs[jobId] ||= { jobId, origin, providers: [], states: {} };
     jobs[jobId].providers.push(provider);
-    jobs[jobId].states[provider] = { tabId, started: true };
+    jobs[jobId].states[provider] = { tabId, started: true, adoptLegacy: true };
+  }
+  // Also preserve outboxes written by the alternate follow-up implementation.
+  const all = await chrome.storage.local.get(null);
+  for (const [key, oldJob] of Object.entries(all)) {
+    if (!key.startsWith("ashlar:job:") || !oldJob?.jobId || !oldJob.slots) continue;
+    const states = {};
+    for (const [provider, slot] of Object.entries(oldJob.slots)) {
+      const outcome = slot.raw ? {ok: true, raw: slot.raw}
+        : slot.error && slot.error.code !== "disconnected" ? failure(slot.error.code, slot.error.message) : undefined;
+      states[provider] = {tabId: slot.tabId, started: slot.dispatched, outcome};
+    }
+    jobs[oldJob.jobId] = {...oldJob, origin: oldJob.origin || origin, states};
   }
   await saveJobs(jobs);
   return jobs;
@@ -172,9 +173,45 @@ function failure(code, error) {
   return { ok: false, code, error };
 }
 
+async function findOriginalTab(job, provider) {
+  const urls = provider === "grok" ? ["https://grok.com/*"] : ["https://chatgpt.com/*", "https://chat.openai.com/*"];
+  for (const tab of await chrome.tabs.query({url: urls})) {
+    try {
+      const result = await sendToTab(tab.id, {type: "ashlar-harvest", jobId: job.jobId}, contentFiles(provider));
+      if (result?.jobId === job.jobId) return tab;
+    } catch { /* A messaging outage is not evidence of completion. */ }
+  }
+  return null;
+}
+
+function connectionErrors(job) {
+  return Object.fromEntries(job.providers.filter(p => job.states[p].connectionError && !job.states[p].outcome)
+    .map(p => [p, {code: "disconnected", message: job.states[p].connectionError}]));
+}
+
+async function heartbeat(job, jobs) {
+  const body = {action: "ping", jobId: job.jobId, leaseId: job.leaseId,
+    generating: generatingFor(job), providerErrors: connectionErrors(job)};
+  let result = await api("/api/bridge", body);
+  if (result.active === false) { delete jobs[job.jobId]; await saveJobs(jobs); return false; }
+  if (result.accepted === false || !job.leaseId) {
+    const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()});
+    job.leaseId = claim.leaseId;
+    await saveJobs(jobs);
+    result = await api("/api/bridge", {...body, leaseId: job.leaseId});
+    if (result.accepted === false) throw new Error("bridge lease could not be renewed");
+  }
+  return true;
+}
+
 async function pollProvider(job, provider, jobs) {
   const state = job.states[provider];
   if (state.outcome) return;
+  if (!state.tabId && (state.started || job.resumeProviders?.includes(provider))) {
+    const original = await findOriginalTab(job, provider);
+    if (original) { state.tabId = original.id; state.started = true; await saveJobs(jobs); }
+    else { state.connectionError = "original review tab unavailable; waiting for reconnection"; return; }
+  }
   if (!state.tabId) {
     const quota = await quotaMap();
     if (!providerOpen(quota, provider)) {
@@ -182,17 +219,24 @@ async function pollProvider(job, provider, jobs) {
       await saveJobs(jobs);
       return;
     }
-    state.tabId = await ensureTab(provider, job.reasoning?.[provider]);
-    await saveJobs(jobs); // The tab must be recoverable before sending the prompt.
+    const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
+    state.tabId = created.id;
+    await chrome.storage.local.remove([CLOSED_PREFIX + created.id]);
+    await saveJobs(jobs); // Persist before any prompt dispatch; readiness is polled on later ticks.
   }
-  let tab;
-  try {
-    tab = await chrome.tabs.get(state.tabId);
-  } catch {
-    state.outcome = failure("tab_closed", "review tab was closed");
+  if ((await chrome.storage.local.get([CLOSED_PREFIX + state.tabId]))[CLOSED_PREFIX + state.tabId]) {
+    state.outcome = failure("tab_closed", "review tab was explicitly closed");
     await saveJobs(jobs);
     return;
   }
+  let tab;
+  try { tab = await chrome.tabs.get(state.tabId); }
+  catch {
+    tab = await findOriginalTab(job, provider);
+    if (!tab) { state.connectionError = "tab connection unknown; waiting for reconnection"; await saveJobs(jobs); return; }
+    state.tabId = tab.id; state.started = true; await saveJobs(jobs);
+  }
+  if (tab.status && tab.status !== "complete") return;
   const host = new URL(tab.url || tab.pendingUrl || "about:blank").hostname;
   const allowed = provider === "grok" ? ["grok.com"] : ["chatgpt.com", "chat.openai.com"];
   if (!allowed.includes(host)) {
@@ -201,7 +245,7 @@ async function pollProvider(job, provider, jobs) {
     return;
   }
   const run = { type: "ashlar-run", jobId: job.jobId,
-    prompt: job.prompts?.[provider] || job.prompt, reasoning: job.reasoning?.[provider] };
+    prompt: job.prompts?.[provider] || job.prompt, reasoning: job.reasoning?.[provider], adoptLegacy: state.adoptLegacy };
   let result;
   try {
     if (!state.started) {
@@ -220,6 +264,14 @@ async function pollProvider(job, provider, jobs) {
     await chrome.storage.local.set({ lastError: String(e.message || e).slice(0, 240) });
     return;
   }
+  if (result?.code === "disconnected" || result?.code === "job_mismatch") {
+    state.connectionError = "original job binding unavailable; waiting for reconnection";
+    const original = await findOriginalTab(job, provider);
+    if (original && original.id !== state.tabId) { state.tabId = original.id; state.started = true; }
+    await saveJobs(jobs);
+    return;
+  }
+  delete state.connectionError;
   if (isBusyResult(result)) return;
   if (result?.ok && typeof result.raw === "string" && result.raw.trim()) {
     state.outcome = { ok: true, raw: result.raw };
@@ -243,27 +295,33 @@ async function advanceJob(job, jobs) {
     if (e.status === 404) { delete jobs[job.jobId]; await saveJobs(jobs); return; }
     throw e;
   }
-  await api("/api/bridge", { action: "ping", jobId: job.jobId, generating: generatingFor(job) });
+  if (!await heartbeat(job, jobs)) return;
   for (const provider of job.providers) {
     await pollProvider(job, provider, jobs);
     // Heartbeat does not announce completion before the result is acknowledged.
-    await api("/api/bridge", { action: "ping", jobId: job.jobId, generating: generatingFor(job) });
+    if (!await heartbeat(job, jobs)) return;
     const state = job.states[provider];
     if (!state.outcome || state.delivered) continue;
     const out = state.outcome;
     const body = out.ok
-      ? { action: "complete", jobId: job.jobId, raw: out.raw, results: [{ provider, raw: out.raw }] }
-      : { action: "failure", jobId: job.jobId, provider, error: `${out.code}: ${out.error}` };
+      ? { action: "complete", jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{ provider, raw: out.raw }] }
+      : { action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}` };
     try {
       await api("/api/bridge", body);
     } catch (e) {
       // A validation rejection is terminal. Network/5xx errors retain the exact raw.
-      if (![400, 404, 409].includes(e.status)) throw e;
+      if (e.status === 409) { job.leaseId = undefined; await saveJobs(jobs); throw e; }
+      if (![400, 404].includes(e.status)) throw e;
+      if (e.status === 400 && out.ok) {
+        state.outcome = failure("error", `completed review was rejected: ${e.message}`);
+        await saveJobs(jobs);
+        return; // Next tick reports the explicit rejection, not a false empty heartbeat.
+      }
       await chrome.storage.local.set({ lastError: String(e.message || e).slice(0, 240) });
     }
     state.delivered = true;
     await saveJobs(jobs);
-    await api("/api/bridge", { action: "ping", jobId: job.jobId, generating: generatingFor(job) });
+    if (!await heartbeat(job, jobs)) return;
     if (!out.ok) await chrome.storage.local.set({ lastError: out.error });
   }
   if (job.providers.every(p => job.states[p].delivered)) {
@@ -297,7 +355,7 @@ async function tickBody() {
   await api("/api/bridge", { action: "ping" });
   const quota = await quotaMap();
   if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) return;
-  const payload = await api("/api/bridge", { action: "take" });
+  const payload = await api("/api/bridge", { action: "take", clientId: await clientId() });
   if (!payload.job) return;
   const job = { ...payload.job, origin: cfg.origin, states: {} };
   job.providers = (job.providers?.length ? job.providers : [job.provider])
@@ -317,6 +375,7 @@ function loop() {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "ashlar-poll") void tick();
 });
+chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
 chrome.runtime.onInstalled.addListener(loop);
 chrome.runtime.onStartup.addListener(loop);
 loop();

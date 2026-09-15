@@ -43,16 +43,7 @@ function lastReviewJson(text) {
 function extractChatJson(text) {
   const s = String(text || "");
   if (!s.trim()) return null;
-  const fences = [...s.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
-  for (let i = fences.length - 1; i >= 0; i -= 1) {
-    const hit = lastReviewJson(fences[i][1] || "") || parseReviewSlice((fences[i][1] || "").trim());
-    if (hit) return hit;
-  }
-  const dangling = s.match(/```(?:json)?\s*([\s\S]+)$/i);
-  if (dangling) {
-    const hit = lastReviewJson(dangling[1] || "");
-    if (hit) return hit;
-  }
+  // The last complete object wins, not an older fenced example.
   return lastReviewJson(s);
 }
 
@@ -154,13 +145,18 @@ async function waitUntilReviewOrQuota(name) {
  * State survives script reinjection and retains terminal outcomes for a restarted worker.
  */
 function installReviewRunner(name, run) {
-  const state = globalThis.__ashlarRunnerState || { running: false, jobId: "", result: null };
+  let boundJob = "";
+  try { boundJob = sessionStorage.getItem("ashlar:job") || ""; } catch { /* unavailable storage */ }
+  const state = globalThis.__ashlarRunnerState || globalThis.__ashlarRunner ||
+    { running: false, jobId: boundJob, result: null };
   globalThis.__ashlarRunnerState = state;
   state.run = run;
   if (state.listener) return;
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending" });
   state.listener = (msg, _sender, reply) => {
     if (msg?.type !== "ashlar-run" && msg?.type !== "ashlar-harvest") return;
+    const respond = reply;
+    reply = value => respond({...value, jobId: state.jobId});
     if (!msg.jobId) {
       reply({ ok: false, code: "job_mismatch", error: "jobId is required" });
       return;
@@ -175,9 +171,15 @@ function installReviewRunner(name, run) {
       reply({ ok: false, code: "idle", error: "no active review in this page" });
       return;
     }
-    state.jobId = String(msg.jobId || "");
+    if (msg.resume && !state.jobId && !msg.adoptLegacy) {
+      reply({ok: false, code: "disconnected", error: "original job binding is unavailable"});
+      return;
+    }
+    const resume = Boolean(msg.resume || state.jobId);
+    state.jobId = String(msg.jobId);
+    try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
-    Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, Boolean(msg.resume)))
+    Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
       .then(raw => { state.result = { ok: true, raw }; })
       .catch(e => {
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };

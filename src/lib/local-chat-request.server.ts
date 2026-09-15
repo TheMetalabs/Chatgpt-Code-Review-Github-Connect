@@ -4,56 +4,56 @@ import https from "node:https";
 export type LocalChatMessage = { role: "system" | "user" | "assistant"; content: string };
 type ChatRequest = { model: string; messages: LocalChatMessage[]; temperature: number };
 
-/** No SDK, fetch header/body deadline or automatic replay of a costly generation.
- * Only an actual response, connection failure or explicit caller abort settles it.
- * Upstream servers/proxies may still enforce their own limits.
+/** Shared native transport. No SDK/fetch deadline and no automatic network replay.
+ * A caller may explicitly cancel; upstream servers/proxies may impose their own limits.
+ * Health checks pass a bounded signal, generation does not create one.
  */
-export function requestLocalChat(
+export function requestLocalJson(
   baseURL: string,
   apiKey: string,
-  body: ChatRequest,
+  path: string,
+  body?: unknown,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const url = new URL(`${baseURL.replace(/\/$/, "")}/chat/completions`);
+    const url = new URL(`${baseURL.replace(/\/$/, "")}/${path}`);
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       reject(new Error("local LLM endpoint must use HTTP or HTTPS"));
       return;
     }
-    const data = JSON.stringify(body);
+    const data = body === undefined ? undefined : JSON.stringify(body);
     const send = url.protocol === "https:" ? https.request : http.request;
     const req = send(url, {
-      method: "POST",
+      method: data === undefined ? "GET" : "POST",
       agent: false,
       timeout: 0,
       signal,
       headers: {
-        "content-type": "application/json",
-        "content-length": Buffer.byteLength(data),
+        accept: "application/json",
+        "accept-encoding": "identity",
+        ...(data === undefined ? {} : {"content-type": "application/json", "content-length": Buffer.byteLength(data)}),
         authorization: `Bearer ${apiKey || "local"}`,
       },
-    }, (res) => {
-      let text = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk: string) => {
-        text += chunk;
-        // Bound memory, not queue/generation duration.
-        if (text.length > 16 * 1024 * 1024) res.destroy(new Error("local LLM response too large"));
+    }, res => {
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      res.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        // Bound memory, never queue/generation duration; don't store partial reviews.
+        if (bytes > 16 * 1024 * 1024) { res.destroy(new Error("local LLM response too large")); return; }
+        chunks.push(chunk);
       });
       res.on("error", reject);
       res.on("aborted", () => reject(new Error("local LLM response connection closed")));
       res.on("end", () => {
+        if (!res.complete) { reject(new Error("local LLM response was incomplete")); return; }
+        const text = Buffer.concat(chunks).toString("utf8");
         if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
           reject(new Error(`local LLM HTTP ${res.statusCode}: ${text.slice(0, 160)}`));
           return;
         }
-        try {
-          const parsed = JSON.parse(text) as { choices?: { message?: { content?: unknown } }[] };
-          const content = parsed.choices?.[0]?.message?.content;
-          resolve(typeof content === "string" ? content : "");
-        } catch {
-          reject(new Error("local LLM returned an invalid JSON response"));
-        }
+        try { resolve(JSON.parse(text)); }
+        catch { reject(new Error("local LLM returned an invalid JSON response")); }
       });
     });
     req.setTimeout(0);
@@ -61,4 +61,20 @@ export function requestLocalChat(
     req.on("error", reject);
     req.end(data);
   });
+}
+
+export async function requestLocalChat(
+  baseURL: string,
+  apiKey: string,
+  body: ChatRequest,
+  signal?: AbortSignal,
+): Promise<string> {
+  const parsed = await requestLocalJson(baseURL, apiKey, "chat/completions", {...body, stream: false}, signal) as
+    { choices?: { finish_reason?: string; message?: { content?: unknown } }[] };
+  const choice = parsed?.choices?.[0];
+  if (choice?.finish_reason === "length" || choice?.finish_reason === "content_filter") {
+    throw new Error(`local LLM response ended with ${choice.finish_reason}`);
+  }
+  if (typeof choice?.message?.content !== "string") throw new Error("local LLM returned no completed message");
+  return choice.message.content;
 }

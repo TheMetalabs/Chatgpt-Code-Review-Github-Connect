@@ -1,4 +1,4 @@
-import type { Job, ReviewProvider } from "./types.ts";
+import type { Job, ReviewProvider, ProviderError } from "./types.ts";
 import { isChatProvider } from "./types.ts";
 
 export function shouldStartLocalRace(input: {
@@ -20,7 +20,7 @@ export function skippedProvider(assumptions: readonly string[] | undefined, prov
 
 /**
  * Wait only while an enabled racer has not finished.
- * Finished = JSON payload, explicit skip, or generating === false (quota / tab done).
+ * Finished = JSON payload or explicit terminal outcome. A bare false/expired heartbeat is not evidence.
  * Unknown generating (not yet pinged) counts as still running. No wall clock.
  */
 export function stillRacing(input: {
@@ -29,15 +29,15 @@ export function stillRacing(input: {
   assumptions?: readonly string[];
   localInFlight: boolean;
   generating?: Partial<Record<ReviewProvider, boolean>>;
+  providerErrors?: Partial<Record<ReviewProvider, ProviderError>>;
   claimed?: boolean;
   connected?: boolean;
 }): boolean {
   for (const p of input.providers) {
     if (input.payloads.includes(p)) continue;
     if (skippedProvider(input.assumptions, p)) continue;
-    if (p === "local") return true;
-    const g = input.generating?.[p];
-    if (g === false) continue;
+    const error = input.providerErrors?.[p];
+    if (error && error.code !== "disconnected") continue;
     return true;
   }
   return false;

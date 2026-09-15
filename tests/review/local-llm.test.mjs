@@ -6,14 +6,16 @@ import { extractChatJson } from '../../src/lib/extract-chat-json.ts';
 import { source, raw } from './helpers.mjs';
 const settings = { localLlmBaseUrl: 'http://local/v1/', localLlmApiKey: ' secret ', localLlmModel: ' model ' };
 function local(responses) {
-  const calls = [], clients = [];
+  const calls = [], clients = [], probes = [];
   const context = vm.createContext({ console, extractChatJson,
+    AbortSignal: {timeout: ms => ({timeout: ms})},
+    requestLocalJson: async (...args) => {probes.push(args);return {};},
     requestLocalChat: async (...args) => { calls.push(args); const next = responses.shift(); if (next instanceof Error) throw next; return next; },
     OpenAI: class { constructor(options) { clients.push(options); this.models = { list: async () => [] }; this.chat = { completions: { create: async () => { throw new Error('generation used the SDK'); } } }; } },
   });
   const code = source('src/lib/local-llm.server.ts').replace(/^import .*;\n/gm, '').replace(/export /g, '');
   vm.runInContext(stripTypeScriptTypes(code), context);
-  return { context, calls, clients };
+  return { context, calls, clients, probes };
 }
 test('generation bypasses SDK defaults and extracts JSON without a needless retry', async () => {
   const c = local([raw]);
@@ -32,5 +34,6 @@ test('network errors do not replay model requests; health checks retain a finite
   assert.equal((await c.context.runLocalLlm('review', settings)).ok, false);
   assert.equal(c.calls.length, 1);
   await c.context.pingLocalLlm(settings);
-  assert.equal(c.clients[0].timeout, 5000);
+  assert.equal(c.probes[0][2], "models");
+  assert.equal(c.probes[0][4].timeout, 5000);
 });

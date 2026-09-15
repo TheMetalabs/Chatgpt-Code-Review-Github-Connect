@@ -1,8 +1,9 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
-import type { Job, ReviewProvider } from "./types";
+import type { Job, ReviewProvider, ProviderError } from "./types";
 import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
+import { extractChatJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 
@@ -80,177 +81,210 @@ export function bridgeHeartbeat() {
   meta.lastSeen = Date.now();
 }
 
-/** Claim stays fresh while any provider is still generating — long queue/generation must not expire. */
-const STALE_CLAIM = (job: Job) => {
-  if (job.generating && Object.values(job.generating).some(Boolean)) return false;
-  return Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt > BRIDGE_CLAIM_MS);
-};
+/** This is an ownership lease, NOT a generation deadline. Expiry only enables resume. */
+const STALE_CLAIM = (job: Job) => Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt > BRIDGE_CLAIM_MS);
 
-export function nextBridgeJob(): {
+function pendingChatProviders(job: Job): ReviewProvider[] {
+  const providers = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length
+    ? job.reviewProviders : providersFromSettings(getHarbor().settings);
+  return providers.filter(isChatProvider).filter(provider =>
+    !(job.storedLegs ?? []).some(leg => leg.provider === provider && leg.raw.trim()) &&
+    (!job.providerErrors?.[provider] || job.providerErrors[provider]?.code === "disconnected"),
+  );
+}
+
+export function bridgeJobState(jobId: string) {
+  const job = getHarbor().jobs.find(j => j.id === jobId);
+  return {active: job?.status === "awaiting_chat", status: job?.status ?? "missing"};
+}
+
+export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): {
   jobId: string;
   provider: ReviewProvider;
   providers: ReviewProvider[];
+  resumeProviders: ReviewProvider[];
+  leaseId?: string;
   prompt: string;
   prompts?: Partial<Record<ReviewProvider, string>>;
-  reasoning: { chatgpt: string; grok: string };
+  reasoning: {chatgpt: string; grok: string};
   title: string;
   owner: string;
   repo: string;
   pr: number;
 } | null {
   const harbor = getHarbor();
-  const job = harbor.jobs.find(
-    (j) =>
-      j.status === "awaiting_chat" &&
-      llmWorkAllowed(j) &&
-      (Boolean(j.chatPrompt) || Boolean(j.chatPromptByProvider)) &&
-      (!j.bridgeClaimedAt || STALE_CLAIM(j)),
-  );
-  if (!job) return null;
-  const prompts = job.chatPromptByProvider;
-  const rawProviders = job.fpProviders?.length
-    ? job.fpProviders
-    : job.reviewProviders?.length
-      ? job.reviewProviders
-      : providersFromSettings(harbor.settings);
-  const done = new Set((job.storedLegs ?? []).filter((l) => l.raw.trim()).map((l) => l.provider));
-  const attempted = new Set(job.attemptedProviders ?? []);
-  const providers = rawProviders.filter(isChatProvider).filter((p) => !done.has(p) && !attempted.has(p));
-  if (!providers.length) return null;
-  const prompt = job.chatPrompt || prompts?.chatgpt || prompts?.grok || "";
-  if (!prompt) return null;
-  return {
-    jobId: job.id,
-    provider: providers[0],
-    providers,
-    prompt,
-    prompts,
-    reasoning: {
-      chatgpt: harbor.settings.chatgptReasoning,
-      grok: harbor.settings.grokReasoning,
-    },
-    title: job.title,
-    owner: job.owner,
-    repo: job.repo,
-    pr: job.pr,
-  };
+  for (const job of harbor.jobs) {
+    if (excludeJobIds.includes(job.id) || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) continue;
+    if (job.bridgeClaimedAt && !STALE_CLAIM(job)) continue;
+    const providers = pendingChatProviders(job);
+    if (!providers.length) continue;
+    const attempted = job.attemptedProviders ?? [];
+    // Only the owning Chrome profile has the original tab. Never start a replacement
+    // generation from another profile merely because the heartbeat expired.
+    if (attempted.length && job.bridgeClientId && job.bridgeClientId !== clientId) continue;
+    const prompts = job.chatPromptByProvider;
+    const prompt = job.chatPrompt || prompts?.chatgpt || prompts?.grok || "";
+    if (!prompt) continue;
+    return {
+      jobId: job.id, provider: providers[0], providers,
+      resumeProviders: providers.filter(p => attempted.includes(p)),
+      prompt, prompts,
+      reasoning: {chatgpt: harbor.settings.chatgptReasoning, grok: harbor.settings.grokReasoning},
+      title: job.title, owner: job.owner, repo: job.repo, pr: job.pr,
+    };
+  }
+  return null;
 }
 
-export function takeNextBridgeJob(): ReturnType<typeof nextBridgeJob> {
-  const peek = nextBridgeJob();
-  if (!peek) return null;
-  const claimed = claimBridgeJob(peek.jobId);
-  if (!claimed.ok) return null;
-  patchHarborJob(peek.jobId, (j) => ({
-    ...j,
-    attemptedProviders: [...new Set([...(j.attemptedProviders ?? []), ...peek.providers])],
+export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): ReturnType<typeof nextBridgeJob> {
+  const job = nextBridgeJob(clientId, excludeJobIds);
+  if (!job) return null;
+  const claim = claimBridgeJob(job.jobId, clientId);
+  if (!claim.ok) return null;
+  patchHarborJob(job.jobId, current => ({
+    ...current,
+    attemptedProviders: [...new Set([...(current.attemptedProviders ?? []), ...job.providers])],
     updatedAt: Date.now(),
   }));
-  return peek;
+  return {...job, leaseId: claim.leaseId};
 }
 
-export function promptForJob(jobId: string): { prompt: string; prompts?: Partial<Record<ReviewProvider, string>> } | null {
-  const job = getHarbor().jobs.find((j) => j.id === jobId);
+export function promptForJob(jobId: string): {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>} | null {
+  const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) return null;
   const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok;
-  if (!prompt) return null;
-  return { prompt, prompts: job.chatPromptByProvider };
+  return prompt ? {prompt, prompts: job.chatPromptByProvider} : null;
 }
 
-export function refreshBridgeClaim(jobId: string, generating?: Partial<Record<ReviewProvider, boolean>>) {
-  const job = getHarbor().jobs.find((j) => j.id === jobId);
-  if (!job || job.status !== "awaiting_chat") return;
-  patchHarborJob(jobId, (j) => ({
-    ...j,
-    bridgeClaimedAt: Date.now(),
-    generating: generating ? { ...(j.generating ?? {}), ...generating } : j.generating,
-    updatedAt: Date.now(),
-  }));
+function ownsLease(job: Job, leaseId?: string): boolean {
+  return Boolean(job.bridgeClaimedAt) && (!job.bridgeLeaseId || job.bridgeLeaseId === leaseId);
+}
+
+export function refreshBridgeClaim(
+  jobId: string,
+  generating?: Partial<Record<ReviewProvider, boolean>>,
+  errors?: Partial<Record<ReviewProvider, ProviderError>>,
+  leaseId?: string,
+): boolean {
+  const job = getHarbor().jobs.find(j => j.id === jobId);
+  if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return false;
+  patchHarborJob(jobId, current => {
+    const nextGenerating = {...current.generating};
+    const nextErrors = {...current.providerErrors};
+    const enabled = pendingChatProviders(current);
+    for (const provider of enabled) {
+      const error = errors?.[provider];
+      if (error) {
+        nextErrors[provider] = error;
+        nextGenerating[provider] = error.code === "disconnected";
+      } else if (generating?.[provider] === true) {
+        delete nextErrors[provider];
+        nextGenerating[provider] = true;
+      }
+      // A bare false flag says nothing about completion. Final JSON is stored by complete;
+      // terminal failures require their explicit provider-specific outcome.
+    }
+    return {...current, bridgeClaimedAt: Date.now(), generating: nextGenerating, providerErrors: nextErrors, updatedAt: Date.now()};
+  });
   meta.lastJobId = jobId;
+  return true;
 }
 
-export function claimBridgeJob(jobId: string): { ok: true } | { ok: false; error: string } {
-  const job = getHarbor().jobs.find((j) => j.id === jobId);
-  if (!job || job.status !== "awaiting_chat" || !(job.chatPrompt || job.chatPromptByProvider)) {
-    return { ok: false, error: "job is not waiting for chat" };
+export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId: string} | {ok: false; error: string} {
+  const job = getHarbor().jobs.find(j => j.id === jobId);
+  if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job) || !(job.chatPrompt || job.chatPromptByProvider)) {
+    return {ok: false, error: "job is not waiting for chat"};
+  }
+  const attempted = new Set(job.attemptedProviders ?? []);
+  if (job.bridgeClientId && job.bridgeClientId !== clientId &&
+      pendingChatProviders(job).some(provider => attempted.has(provider))) {
+    return {ok: false, error: "pending generation belongs to another Chrome profile"};
   }
   if (job.bridgeClaimedAt && !STALE_CLAIM(job)) {
-    return { ok: false, error: "already claimed" };
+    if (clientId && job.bridgeClientId === clientId && job.bridgeLeaseId) return {ok: true, leaseId: job.bridgeLeaseId};
+    return {ok: false, error: "already claimed"};
   }
-  patchHarborJob(jobId, (j) => ({
-    ...j,
-    bridgeClaimedAt: Date.now(),
-    plan: claimedReviewerNote(job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? []),
+  const leaseId = randomBytes(18).toString("base64url");
+  patchHarborJob(jobId, current => ({
+    ...current, bridgeClaimedAt: Date.now(), bridgeLeaseId: leaseId, bridgeClientId: clientId,
+    plan: claimedReviewerNote(current.fpProviders?.length ? current.fpProviders : current.reviewProviders ?? []),
     updatedAt: Date.now(),
   }));
   meta.lastJobId = jobId;
   meta.lastError = undefined;
-  return { ok: true };
+  return {ok: true, leaseId};
 }
 
-export function releaseBridgeJob(jobId: string) {
-  const job = getHarbor().jobs.find((j) => j.id === jobId);
-  if (job && job.status === "awaiting_chat") {
-    // Clear attemptedProviders on release so a false empty / busy abort can retry the same providers.
-    patchHarborJob(jobId, (j) => ({
-      ...j,
-      bridgeClaimedAt: undefined,
-      attemptedProviders: [],
-      updatedAt: Date.now(),
-    }));
+export function releaseBridgeJob(jobId: string, leaseId?: string) {
+  const job = getHarbor().jobs.find(j => j.id === jobId);
+  if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return;
+  patchHarborJob(jobId, current => ({
+    ...current, bridgeClaimedAt: undefined, bridgeLeaseId: undefined, updatedAt: Date.now(),
+    // Keep attempts and terminal outcomes. Release is not authorization for a new generate.
+  }));
+}
+
+/** Explicit terminal outcome; transient disconnection is reported by ping instead. */
+export function failBridgeProvider(jobId: string, provider: ReviewProvider, error: string, leaseId?: string): boolean {
+  if (!isChatProvider(provider)) return false;
+  const job = getHarbor().jobs.find(j => j.id === jobId);
+  if (!job || job.status !== "awaiting_chat") return true;
+  if (!llmWorkAllowed(job) || !ownsLease(job, leaseId)) return false;
+  if (job.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim())) return true;
+  const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? [];
+  if (!enabled.includes(provider)) return false;
+  const prefix = error.split(":", 1)[0];
+  const code: ProviderError["code"] = prefix === "quota" || prefix === "empty" || prefix === "tab_closed" || prefix === "cancelled"
+    ? prefix : "error";
+  patchHarborJob(jobId, current => ({
+    ...current,
+    generating: {...current.generating, [provider]: false},
+    providerErrors: {...current.providerErrors, [provider]: {code, message: error.slice(0, 240)}},
+    attemptedProviders: [...new Set([...(current.attemptedProviders ?? []), provider])],
+    assumptions: [
+      ...(current.assumptions ?? []).filter(note => !note.startsWith(`Skipped ${provider}:`)),
+      `Skipped ${provider}: ${error.replace(/\s+/g, " ").slice(0, 400)}`,
+    ],
+    updatedAt: Date.now(),
+  }));
+  return true;
+}
+
+export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatLeg[], leaseId?: string) {
+  const job = getHarbor().jobs.find(j => j.id === jobId);
+  if (!job) return {ok: false, error: "job not found"};
+  const incoming = (legs?.length ? legs : raw.trim() ? [{provider: "chatgpt" as const, raw}] : [])
+    .map(leg => ({...leg, raw: extractChatJson(leg.raw) ?? leg.raw}));
+  // Compare normalized payloads as stored, including after posting changed job status.
+  if (incoming.length && incoming.every(leg => job.storedLegs?.some(stored => stored.provider === leg.provider && stored.raw === leg.raw))) {
+    return {ok: true};
   }
-}
-
-/** Terminal provider failures are idempotent and never restart a model request. */
-export function failBridgeProvider(jobId: string, provider: ReviewProvider, error: string) {
-  if (!isChatProvider(provider)) return;
-  patchHarborJob(jobId, (j) => {
-    if (j.status !== "awaiting_chat" || !llmWorkAllowed(j)) return j;
-    if (j.storedLegs?.some((leg) => leg.provider === provider && leg.raw.trim())) return j;
-    const prefix = `Skipped ${provider}:`;
-    return {
-      ...j,
-      generating: { ...(j.generating ?? {}), [provider]: false },
-      attemptedProviders: [...new Set([...(j.attemptedProviders ?? []), provider])],
-      assumptions: [
-        ...(j.assumptions ?? []).filter((note) => !note.startsWith(prefix)),
-        `${prefix} ${error.replace(/\s+/g, " ").slice(0, 400)}`,
-      ],
-      updatedAt: Date.now(),
-    };
-  });
-}
-
-export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatLeg[]) {
-  const incoming: ChatLeg[] = legs?.length ? legs : raw.trim() ? [{ provider: "chatgpt", raw }] : [];
-  patchHarborJob(jobId, (j) => {
-    if (j.status !== "awaiting_chat") return j;
-    const accepted = incoming.filter((leg) => leg.raw.trim() &&
-      (!j.reviewProviders?.length || j.reviewProviders.includes(leg.provider)));
-    const stored = [...(j.storedLegs ?? [])];
+  if (job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return {ok: false, error: "job is not claimed by this worker", code: "lease_conflict"};
+  const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(getHarbor().settings);
+  const accepted: ChatLeg[] = [];
+  for (const leg of incoming) {
+    if (!isChatProvider(leg.provider) || !enabled.includes(leg.provider)) continue;
+    const parsed = extractChatJson(leg.raw);
+    if (!parsed) return {ok: false, error: "completed response is not review JSON"};
+    accepted.push({provider: leg.provider, raw: parsed});
+  }
+  if (!accepted.length) return {ok: false, error: "no enabled reviewer result"};
+  patchHarborJob(jobId, current => {
+    const storedLegs = [...(current.storedLegs ?? [])];
+    const generating = {...current.generating};
+    const providerErrors = {...current.providerErrors};
     for (const leg of accepted) {
-      const index = stored.findIndex((old) => old.provider === leg.provider);
-      if (index < 0) stored.push(leg);
-      else stored[index] = leg;
+      const index = storedLegs.findIndex(stored => stored.provider === leg.provider);
+      if (index < 0) storedLegs.push(leg); else storedLegs[index] = leg;
+      generating[leg.provider] = false;
+      delete providerErrors[leg.provider];
     }
-    // The watcher must never observe generating=false without the corresponding raw.
-    return {
-      ...j,
-      storedLegs: stored,
-      generating: {
-        ...(j.generating ?? {}),
-        ...Object.fromEntries(accepted.map((leg) => [leg.provider, false])),
-      },
-      updatedAt: Date.now(),
-    };
+    // One patch: the watcher can never observe done-without-the-corresponding-payload.
+    return {...current, storedLegs, generating, providerErrors, updatedAt: Date.now()};
   });
-  const out = await submitHarborChat(jobId, raw, legs);
-  if (!out.ok) {
-    releaseBridgeJob(jobId);
-    meta.lastError = out.error;
-    return out;
-  }
+  const out = await submitHarborChat(jobId, accepted[0].raw, accepted);
   meta.lastJobId = jobId;
-  meta.lastError = undefined;
-  return out;
+  meta.lastError = out.ok ? undefined : out.error;
+  // Acknowledge stored results even if posting is currently blocked. The server owns posting.
+  return {ok: true};
 }

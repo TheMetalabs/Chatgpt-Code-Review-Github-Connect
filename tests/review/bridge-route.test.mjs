@@ -8,7 +8,7 @@ function route() {
   const c = vm.createContext({ Response, URL,
     createFileRoute: () => config => config,
     bridgeTokenOk: token => token === 'valid-token', bridgeHeartbeat() {},
-    failBridgeProvider: (...args) => failures.push(args),
+    failBridgeProvider: (...args) => { failures.push(args); return true; },
   });
   const s = source('src/routes/api/bridge.ts').replace(/^import[\s\S]*?;\n/gm, '').replace('export const Route', 'globalThis.Route');
   vm.runInContext(stripTypeScriptTypes(s), c);

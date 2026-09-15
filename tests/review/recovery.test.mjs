@@ -31,7 +31,7 @@ test('terminal quota and closed tabs stop generating rather than looping forever
     const s = server([job('A')]); let done = false;
     const b = background({ api: s.api, handler: () => done ? { ok: false, code: 'quota', error: 'usage limit' } : { ok: false, code: 'busy' } });
     await b.tick(); done = true;
-    if (outcome === 'closed') b.tabs.clear();
+    if (outcome === 'closed') for (const id of [...b.tabs.keys()]) await b.closeTab(id);
     await b.tick(); await b.tick();
     assert.ok(s.received.some(c => c.action === 'failure' && c.jobId === 'A'), outcome);
     assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);

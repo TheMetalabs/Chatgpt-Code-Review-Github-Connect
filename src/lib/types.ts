@@ -112,6 +112,7 @@ export interface Job {
   };
   storedLegs?: { provider: ReviewProvider; raw: string }[];
   reviewOrder?: ReviewProvider[];
+  opsCommentId?: number;
 }
 
 export interface PostedComment {

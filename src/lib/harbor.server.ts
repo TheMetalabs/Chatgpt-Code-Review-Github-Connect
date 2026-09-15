@@ -332,6 +332,11 @@ async function watchReviewers(jobId: string, token: string) {
 
     await sleep(WATCH_TICK_MS);
   }
+  const leftover = state.jobs.find((j) => j.id === jobId);
+  if (leftover?.status === "awaiting_chat") {
+    const legs = (leftover.storedLegs ?? []).filter((l) => l.raw.trim());
+    if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs);
+  }
 }
 
 async function playGithub(jobId: string, untrustedBody: string) {

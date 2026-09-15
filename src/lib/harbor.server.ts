@@ -28,6 +28,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
+import { shouldStartLocalFallback } from "./local-fallback";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import {
@@ -281,6 +282,7 @@ const WATCH_CAP_MS = 8 * 60_000;
 async function watchReviewers(jobId: string, token: string) {
   const started = Date.now();
   let lastNotes = "";
+  let localStarted = false;
   while (Date.now() - started < WATCH_CAP_MS) {
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
@@ -292,6 +294,22 @@ async function watchReviewers(jobId: string, token: string) {
     const chat = (job.reviewProviders ?? []).filter(isChatProvider);
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
     const localSkip = (job.assumptions ?? []).find((a) => a.startsWith("Skipped local"));
+    const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "";
+    if (
+      prompt &&
+      shouldStartLocalFallback({
+        providers: job.reviewProviders ?? [],
+        status: job.status,
+        connected: bridge.connected,
+        claimed,
+        localDone: Boolean(localLeg?.raw.trim() || localSkip),
+        localStarted,
+        waitedMs: Date.now() - started,
+      })
+    ) {
+      localStarted = true;
+      void attachLocalLeg(jobId, prompt, { submit: true });
+    }
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
       notes.push("Chrome bridge is not connected. ChatGPT/Grok start in parallel when the extension reconnects.");
@@ -299,8 +317,11 @@ async function watchReviewers(jobId: string, token: string) {
       notes.push("Chrome bridge claimed this job. ChatGPT and Grok run in parallel.");
     }
     if (localSkip) notes.push(`${localSkip} — skipped, does not block other reviewers.`);
-    else if (localLeg) notes.push("Local LLM finished in the background.");
-    else if ((job.reviewProviders ?? []).includes("local")) notes.push("Local LLM is running in the background and will not block ChatGPT/Grok.");
+    else if (localLeg) notes.push("Local LLM finished.");
+    else if (localStarted) notes.push("Local LLM fallback is running.");
+    else if ((job.reviewProviders ?? []).includes("local") && chat.length) {
+      notes.push("Local LLM is fallback if Chrome does not return in time.");
+    }
 
     const phase: OpsPhase = chat.length && !bridge.connected && !claimed ? "blocked" : "running";
     const key = `${phase}|${notes.join("|")}`;
@@ -476,7 +497,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     ...j,
     status: "awaiting_chat",
     plan: providers.includes("local")
-      ? `Snapshot loaded. ${chatProviders.join(" + ")} via Chrome bridge; local LLM is optional and will not block.`
+      ? `Snapshot loaded. ${chatProviders.join(" + ")} via Chrome first; local LLM is fallback if Chrome does not return.`
       : providers.length > 1
         ? `Snapshot loaded. ${providers.join(" + ")} review in parallel. False-positive checks run in order: ${order.join(" → ")}.`
         : "Snapshot loaded. The Chrome bridge will send this to ChatGPT or Grok on this machine.",
@@ -487,10 +508,9 @@ async function playGithub(jobId: string, untrustedBody: string) {
     updatedAt: Date.now(),
   }));
   void watchReviewers(jobId, token);
-  if (providers.includes("local")) void attachLocalLeg(jobId, prompt);
 }
 
-async function attachLocalLeg(jobId: string, prompt: string) {
+async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
   try {
     const local = await runLocalLlm(prompt, state.settings);
     if (!local.ok) {
@@ -501,11 +521,16 @@ async function attachLocalLeg(jobId: string, prompt: string) {
       }));
       return;
     }
+    let stored = false;
     patchJob(jobId, (j) => {
       if (j.status !== "awaiting_chat") return j;
-      const stored = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
-      return { ...j, storedLegs: stored, updatedAt: Date.now() };
+      stored = true;
+      const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
+      return { ...j, storedLegs: next, updatedAt: Date.now() };
     });
+    if (opts?.submit && stored) {
+      await submitHarborChat(jobId, local.raw, [{ provider: "local", raw: local.raw }]);
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     patchJob(jobId, (j) => ({

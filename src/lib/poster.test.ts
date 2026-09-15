@@ -98,8 +98,9 @@ describe("poster", () => {
       DEFAULT_SETTINGS,
     );
     assert.ok(mentioned);
-    assert.match(mentioned.body, /Ashlar Review/);
-    assert.match(mentioned.body, /ashlar-bot/);
+    assert.ok(mentioned);
+    assert.equal(mentioned.event, "COMMENT");
+    assert.equal(mentioned.body, "Codex Review: Didn't find any major issues.");
   });
 
   it("drops findings whose file is not in changedPaths", () => {

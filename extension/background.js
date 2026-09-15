@@ -58,17 +58,21 @@ async function ensureTab(provider) {
 
 function waitTab(tabId) {
   return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(ready);
+      resolve();
+    };
     const ready = (id, info) => {
-      if (id === tabId && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(ready);
-        resolve();
-      }
+      if (id === tabId && info.status === "complete") finish();
     };
     chrome.tabs.get(tabId, (tab) => {
-      if (tab?.status === "complete") resolve();
+      if (tab?.status === "complete") finish();
       else chrome.tabs.onUpdated.addListener(ready);
     });
-    setTimeout(resolve, 8000);
+    setTimeout(finish, 8000);
   });
 }
 
@@ -165,7 +169,19 @@ async function recoverDeadWorker() {
   }
 }
 
+let tickLock = false;
+
 async function tick() {
+  if (tickLock) return;
+  tickLock = true;
+  try {
+    await tickBody();
+  } finally {
+    tickLock = false;
+  }
+}
+
+async function tickBody() {
   const cfg = await settings();
   if (!cfg.enabled || !cfg.origin || !cfg.token) return;
   const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId, SESSION.busyAt]);

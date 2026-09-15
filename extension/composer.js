@@ -16,8 +16,22 @@ function readComposer(el) {
 
 function composerHas(el, text) {
   const got = readComposer(el).replace(/\s+/g, " ").trim();
-  const needle = String(text || "").replace(/\s+/g, " ").trim().slice(0, 48);
-  return Boolean(needle) && got.includes(needle);
+  const want = String(text || "").replace(/\s+/g, " ").trim();
+  if (!want) return false;
+  if (want.length <= 48) return got.includes(want);
+  return got.includes(want.slice(0, 48)) && got.includes(want.slice(-40)) && got.length >= Math.floor(want.length * 0.85);
+}
+
+async function insertPrompt(el, text) {
+  document.execCommand("selectAll", false, null);
+  document.execCommand("insertText", false, text);
+  if (composerHas(el, text)) return;
+  const chunk = 1500;
+  document.execCommand("selectAll", false, null);
+  document.execCommand("delete", false, null);
+  for (let i = 0; i < text.length; i += chunk) {
+    document.execCommand("insertText", false, text.slice(i, i + chunk));
+  }
 }
 
 async function fillComposer(el, text) {
@@ -25,24 +39,29 @@ async function fillComposer(el, text) {
   el.focus();
   await sleep(50);
   if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
-    const proto = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
+    const proto = Object.getOwnPropertyDescriptor(
+      el instanceof HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype,
+      "value",
+    );
     proto?.set?.call(el, text);
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
     if (composerHas(el, text)) return;
   }
-  document.execCommand("selectAll", false, null);
-  document.execCommand("insertText", false, text);
+  await insertPrompt(el, text);
   if (composerHas(el, text)) return;
   const dt = new DataTransfer();
   dt.setData("text/plain", text);
   el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
   await sleep(50);
   if (composerHas(el, text)) return;
-  el.dispatchEvent(
-    new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text }),
-  );
-  el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
+  try {
+    await navigator.clipboard.writeText(text);
+    document.execCommand("paste");
+    await sleep(50);
+  } catch {
+    /* clipboard may be blocked */
+  }
   if (!composerHas(el, text)) throw new Error("composer did not accept the prompt");
 }
 

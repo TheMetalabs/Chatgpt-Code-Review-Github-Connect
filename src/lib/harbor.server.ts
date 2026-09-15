@@ -31,7 +31,6 @@ import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./setting
 import {
   BRIDGE_CLAIM_MS,
   LIVE_INFLIGHT_STATUSES,
-  claimedReviewerNote,
   isChatProvider,
   normalizeReviewOrder,
   providersFromSettings,
@@ -347,22 +346,16 @@ async function watchReviewers(jobId: string, token: string) {
         void upsertOpsComment(token, jobId, "skipped", ["Enabled reviewers finished without JSON. Nothing to post."]);
       }
     }
+    const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) });
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
       notes.push(
         `Chrome bridge is not connected. ${chat.map((p) => (p === "grok" ? "Grok" : "ChatGPT")).join(" / ")} start when the extension reconnects.`,
       );
-    } else if (claimed) {
-      notes.push(claimedReviewerNote(job.reviewProviders?.length ? job.reviewProviders : chat));
     }
-    if (localSkip) notes.push(`${localSkip} — skipped, does not block other reviewers.`);
-    else if (localLeg) notes.push("Local LLM finished.");
-    else if (localStarted || localRunning) notes.push("Local LLM is racing.");
-    else if ((job.reviewProviders ?? []).includes("local") && chat.length) {
-      notes.push("Local LLM is in the race when reachable.");
-    }
+    for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);
 
-    const phase: OpsPhase = chat.length && !bridge.connected && !claimed ? "blocked" : "running";
+    const phase: OpsPhase = racing ? (chat.length && !bridge.connected && !claimed ? "blocked" : "running") : "running";
     const key = `${phase}|${notes.join("|")}`;
     if (key !== lastNotes) {
       await upsertOpsComment(token, jobId, phase, notes);

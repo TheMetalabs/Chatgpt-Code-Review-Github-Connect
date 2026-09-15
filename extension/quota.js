@@ -16,13 +16,46 @@ function quotaHit() {
   return false;
 }
 
+function elVisible(el) {
+  if (!el) return false;
+  if (typeof visible === "function") return visible(el);
+  const s = window.getComputedStyle(el);
+  if (s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+
 function stopButtonVisible() {
-  if (document.querySelector('[data-testid="stop-button"]')) return true;
+  const stop = document.querySelector('[data-testid="stop-button"]');
+  if (elVisible(stop)) return true;
   for (const el of document.querySelectorAll("button, [role='button']")) {
     const t = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${el.textContent || ""}`.toLowerCase();
-    if (!/stop generating|stop streaming|abort|생성 중지|중단|중지/.test(t)) continue;
-    if (typeof visible === "function" && !visible(el)) continue;
+    if (!/stop generating|stop streaming|abort|생성 중지|답변 중지|중단/.test(t)) continue;
+    if (!elVisible(el)) continue;
     return true;
   }
   return false;
+}
+
+/** Copy / feedback toolbar after the turn — ChatGPT "응답 작업". */
+function replyDoneVisible() {
+  const sels = [
+    '[data-testid="copy-turn-action-button"]',
+    '[data-testid="feedback-turn-action-button"]',
+    '[aria-label="응답 작업"]',
+    '[aria-label="Response actions"]',
+    '[aria-label="응답 복사"]',
+    '[aria-label="Copy response"]',
+    '[aria-label="Copy"]',
+  ];
+  for (const sel of sels) {
+    const el = document.querySelector(sel);
+    if (elVisible(el)) return true;
+  }
+  return false;
+}
+
+function chatGenerationFinished() {
+  if (replyDoneVisible()) return true;
+  return !stopButtonVisible();
 }

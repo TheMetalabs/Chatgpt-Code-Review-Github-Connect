@@ -45,28 +45,10 @@ async function startFresh() {
   return waitUntilComposer();
 }
 
-async function waitUntilReviewOrQuota() {
-  let stable = "";
-  let hits = 0;
-  for (;;) {
-    const json = harvestJson();
-    if (quotaHit() && !json) throw quotaError();
-    if (json) {
-      if (json === stable) hits += 1;
-      else {
-        stable = json;
-        hits = 1;
-      }
-      if (hits >= 2 && !stopButtonVisible()) return json;
-    }
-    await sleep(800);
-  }
-}
-
 async function runPrompt(prompt, reasoning) {
-  const existing = harvestJson();
-  if (existing) return existing;
-  if (assistantCorpus().length) return waitUntilReviewOrQuota();
+  const existing = harvestJson({ allowThin: true });
+  if (existing && chatGenerationFinished()) return existing;
+  if (assistantCorpus().length && !composer()) return waitUntilReviewOrQuota("Grok");
   await dismissOverlays();
   const el = await startFresh();
   await dismissOverlays();
@@ -76,19 +58,19 @@ async function runPrompt(prompt, reasoning) {
   await fillComposer(el, prompt);
   await dismissOverlays();
   await clickSend(sendButton, composer);
-  return waitUntilReviewOrQuota();
+  return waitUntilReviewOrQuota("Grok");
 }
 
 let running = false;
 chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
   if (msg?.type === "ashlar-harvest") {
-    const raw = harvestJson();
+    const raw = harvestJson({ allowThin: chatGenerationFinished() });
     sendResponse(raw ? { ok: true, raw } : { ok: false, error: "no json" });
     return true;
   }
   if (msg?.type !== "ashlar-run") return;
   if (running) {
-    const raw = harvestJson();
+    const raw = harvestJson({ allowThin: chatGenerationFinished() });
     sendResponse(raw ? { ok: true, raw } : { ok: false, error: "already running" });
     return true;
   }
@@ -99,7 +81,7 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
       sendResponse({
         ok: false,
         error: e instanceof Error ? e.message : String(e),
-        code: e && e.code === "quota" ? "quota" : undefined,
+        code: e && e.code === "quota" ? "quota" : e && e.code === "empty" ? "empty" : undefined,
       }),
     )
     .finally(() => {

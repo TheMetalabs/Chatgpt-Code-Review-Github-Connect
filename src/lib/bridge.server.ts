@@ -191,6 +191,16 @@ export function releaseBridgeJob(jobId: string) {
 }
 
 export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatLeg[]) {
+  const done = new Set((legs ?? []).map((l) => l.provider));
+  if (raw.trim() && !legs?.length) done.add("chatgpt");
+  patchHarborJob(jobId, (j) => ({
+    ...j,
+    generating: {
+      ...(j.generating ?? {}),
+      ...Object.fromEntries([...done].map((p) => [p, false])),
+    },
+    updatedAt: Date.now(),
+  }));
   const out = await submitHarborChat(jobId, raw, legs);
   if (!out.ok) {
     releaseBridgeJob(jobId);

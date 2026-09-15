@@ -55,6 +55,16 @@ test('MV3 E2E: mention → indefinite queue → restart → final JSON → one G
    // This is a test launch setting; no installed browser profile or managed policy is changed.
    args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
  t.after(()=>context.close());
+ // Set developer mode through Chrome's own UI in this newly created test profile.
+ // Never alter managed policy or an existing user's browser preferences.
+ const manager=await context.newPage();
+ await manager.goto('chrome://extensions');
+ const developerMode=manager.locator('#devMode');
+ await developerMode.waitFor({state:'visible'});
+ assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
+ if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ assert.equal(await developerMode.evaluate(el=>Boolean(el.checked)),true);
+ await manager.close();
  const diagnostics=[];
  context.on('page',page=>{page.on('pageerror',error=>diagnostics.push(['pageerror',error.message]));page.on('console',msg=>{if(msg.type()==='error')diagnostics.push(['console',msg.text()]);});});
  context.on('requestfailed',request=>diagnostics.push(['requestfailed',request.url(),request.failure()?.errorText]));

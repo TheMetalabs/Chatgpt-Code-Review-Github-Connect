@@ -3,10 +3,16 @@ export const OVERLAY_ACCEPT =
   /^(ok|okay|got it|got it!|continue|continue to chat|confirm|accept|close|dismiss|skip|not now|i understand|알겠습니다|확인|계속하기|계속|닫기|건너뛰기|시작하기)$/i;
 
 export const OVERLAY_PERSONAL =
-  /non-?personal|without personal|don't personalize|개인화 하지|비개인화|개인 정보 없이/i;
+  /non-?personal|without personal|don['’]t personalize|개인화 하지|비개인화|개인 정보 없이/i;
 
 export function overlayLabels(aria: string, text: string): string[] {
-  return [aria, text].map((s) => String(s || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+  const parts = [aria, text].flatMap((s) =>
+    String(s || "")
+      .split(/\n/)
+      .map((x) => x.replace(/\s+/g, " ").trim())
+      .filter(Boolean),
+  );
+  return [...new Set(parts)];
 }
 
 export function overlayButtonKind(label: string): "accept" | "personal" | null {

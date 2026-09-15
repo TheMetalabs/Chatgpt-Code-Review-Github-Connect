@@ -15,6 +15,8 @@ describe("overlayButtonKind", () => {
   it("matches aria-label and text separately so Continue Continue still counts", () => {
     assert.equal(overlayButtonKind("Continue Continue"), null);
     assert.equal(overlayButtonKindFromParts("Continue", "Continue"), "accept");
+    assert.equal(overlayButtonKindFromParts("", "Continue\nThis is a temporary chat"), "accept");
+    assert.equal(overlayButtonKindFromParts("", "Don’t personalize"), "personal");
   });
 });
 

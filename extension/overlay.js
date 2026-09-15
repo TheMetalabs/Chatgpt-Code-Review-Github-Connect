@@ -9,7 +9,11 @@ function overlayIsLive(el) {
 }
 
 function overlayRoot() {
-  const nodes = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')];
+  const nodes = [
+    ...document.querySelectorAll(
+      '[role="dialog"], [role="alertdialog"], [aria-modal="true"], [data-testid*="modal" i], [data-testid*="dialog" i]',
+    ),
+  ];
   return nodes.find(overlayIsLive) || null;
 }
 
@@ -23,14 +27,18 @@ function overlayKind(label) {
   ) {
     return "accept";
   }
-  if (/non-?personal|without personal|don't personalize|개인화 하지|비개인화|개인 정보 없이/i.test(t)) return "personal";
+  if (/non-?personal|without personal|don['’]t personalize|개인화 하지|비개인화|개인 정보 없이/i.test(t)) return "personal";
   return null;
 }
 
 function overlayKindForEl(el) {
-  const labels = [el.getAttribute("aria-label") || "", el.textContent || ""]
-    .map((s) => s.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
+  const raw = [el.getAttribute("aria-label") || "", el.textContent || ""];
+  const labels = raw.flatMap((s) =>
+    s
+      .split(/\n/)
+      .map((x) => x.replace(/\s+/g, " ").trim())
+      .filter(Boolean),
+  );
   for (const t of labels) {
     const kind = overlayKind(t);
     if (kind) return kind;
@@ -61,7 +69,12 @@ async function dismissOverlays() {
       await sleep(400);
       continue;
     }
-    const close = [...root.querySelectorAll("button[aria-label*='Close' i], button[aria-label*='닫기']")].find(overlayIsLive);
+    const close = [...root.querySelectorAll("button")].find((el) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) return false;
+      return /close|닫기/i.test(`${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`);
+    });
     if (close instanceof HTMLElement) {
       close.click();
       await sleep(400);
@@ -71,4 +84,5 @@ async function dismissOverlays() {
     await sleep(400);
     if (!overlayRoot()) return;
   }
+  if (overlayRoot()) throw new Error("chat dialog still open");
 }

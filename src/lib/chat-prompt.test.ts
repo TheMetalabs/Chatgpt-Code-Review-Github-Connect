@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { SAMPLE_PRS } from "./samples.ts";
-import { MERGE_FALLBACK_NOTE, buildMergePrompt, parseChatSubmission } from "./chat-prompt.ts";
+import { FINDING_412, SAMPLE_PRS } from "./samples.ts";
+import { MERGE_FALLBACK_NOTE, REVIEW_OFFLINE_RULE, buildChatPrompt, buildFpPrompt, buildMergePrompt, parseChatSubmission } from "./chat-prompt.ts";
 
 describe("parseChatSubmission", () => {
   it("reads a bare JSON object", () => {
@@ -18,6 +18,22 @@ describe("parseChatSubmission", () => {
     assert.equal(parseChatSubmission(""), null);
     assert.equal(parseChatSubmission("[1]"), null);
     assert.equal(parseChatSubmission("not json"), null);
+  });
+});
+
+describe("buildChatPrompt", () => {
+  it("forbids web research so reviewers spend tokens on the snapshot only", () => {
+    const out = buildChatPrompt({ sample: SAMPLE_PRS["pay-412"] });
+    assert.match(out, /Do not search the web/);
+    assert.match(out, /DeepSearch/);
+    assert.match(REVIEW_OFFLINE_RULE, /only source of truth/i);
+    const fp = buildFpPrompt({ sample: SAMPLE_PRS["pay-412"], findings: [FINDING_412], peer: "grok" });
+    assert.match(fp, /Do not search the web/);
+    const merge = buildMergePrompt({
+      sample: SAMPLE_PRS["pay-412"],
+      drafts: [{ provider: "chatgpt", raw: '{"findings":[]}' }],
+    });
+    assert.match(merge, /Do not search the web/);
   });
 });
 

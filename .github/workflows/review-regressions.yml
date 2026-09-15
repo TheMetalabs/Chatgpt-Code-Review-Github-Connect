@@ -1,0 +1,37 @@
+name: Review regressions
+
+on:
+  pull_request:
+  push:
+    branches: [fix/review-wait-parse-heartbeat]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-regressions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive exact source revision for reproduction
+        run: git archive --format=zip HEAD -o /tmp/review-source.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review-source-${{ github.sha }}
+          path: /tmp/review-source.zip
+          retention-days: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build:dev

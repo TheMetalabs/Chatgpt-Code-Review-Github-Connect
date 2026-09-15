@@ -11,7 +11,7 @@ import {
 } from "./samples";
 import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
-import { createPullReview, fetchPullHead, fetchPullSnapshot, githubReady, installationToken } from "./github.server";
+import { createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken } from "./github.server";
 import { buildChatPrompt, buildFpPrompt, parseChatSubmission } from "./chat-prompt";
 import { runLocalLlm } from "./local-llm.server";
 import {
@@ -82,6 +82,13 @@ export function getHarbor(): HarborState {
   };
 }
 
+export function lastGithubInstallationId(): number | undefined {
+  for (const j of state.jobs) {
+    if (j.origin === "github" && j.installationId) return j.installationId;
+  }
+  return undefined;
+}
+
 export function githubStatus() {
   return githubReady();
 }
@@ -126,6 +133,7 @@ export function publicSettings(s: BotSettings) {
     webhookSecret: "",
     localLlmApiKey: "",
     localLlmApiKeySet: Boolean(s.localLlmApiKey),
+    webhookSecretSet: Boolean(s.webhookSecret),
   };
 }
 
@@ -224,7 +232,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
 
   patchJob(jobId, (j) => ({ ...j, status: "snapshot", updatedAt: Date.now() }));
   const ready = githubReady();
-  if (!ready.appId || !ready.privateKey || !live0.installationId) {
+  if ((!ready.appId && !ready.clientId) || !ready.privateKey || !live0.installationId) {
     patchJob(jobId, (j) => ({
       ...j,
       status: "skipped",
@@ -271,7 +279,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     }
     sample = await fetchPullSnapshot(token, target);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "snapshot failed";
+    const msg = formatGithubError(e);
     patchJob(jobId, (j) => ({
       ...j,
       status: "skipped",
@@ -443,7 +451,7 @@ export async function submitHarborChat(
       isDraft: job.isDraft,
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "snapshot failed";
+    const msg = formatGithubError(e);
     return revert(msg.slice(0, 240));
   }
 
@@ -713,7 +721,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       githubId = posted.id;
       postedToGithub = true;
     } catch (e) {
-      githubError = e instanceof Error ? e.message.slice(0, 240) : "GitHub Reviews API failed";
+      githubError = formatGithubError(e);
       patchJob(jobId, (j) => ({
         ...j,
         status: "dlq",

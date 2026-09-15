@@ -4,11 +4,17 @@ import { createPrivateKey } from "node:crypto";
 
 export type StoredSecrets = {
   githubAppId: string;
+  githubClientId: string;
   githubWebhookSecret: string;
   githubPrivateKey: string;
 };
 
-const EMPTY: StoredSecrets = { githubAppId: "", githubWebhookSecret: "", githubPrivateKey: "" };
+const EMPTY: StoredSecrets = {
+  githubAppId: "",
+  githubClientId: "",
+  githubWebhookSecret: "",
+  githubPrivateKey: "",
+};
 
 function secretsPath() {
   return join(process.cwd(), ".data", "ashlar-secrets.json");
@@ -22,6 +28,7 @@ function readDisk(): StoredSecrets {
     const parsed = JSON.parse(raw) as Partial<StoredSecrets>;
     return {
       githubAppId: String(parsed.githubAppId ?? "").trim(),
+      githubClientId: String(parsed.githubClientId ?? "").trim(),
       githubWebhookSecret: String(parsed.githubWebhookSecret ?? "").trim(),
       githubPrivateKey: String(parsed.githubPrivateKey ?? "").trim(),
     };
@@ -59,12 +66,14 @@ export function pemIsUsable(raw: string): boolean {
 
 export function patchGithubSecrets(patch: {
   githubAppId?: string;
+  githubClientId?: string;
   githubWebhookSecret?: string;
   githubPrivateKey?: string;
 }): { ok: true } | { ok: false; error: string } {
   const current = getSecrets();
   const next: StoredSecrets = { ...current };
   if (typeof patch.githubAppId === "string") next.githubAppId = patch.githubAppId.trim();
+  if (typeof patch.githubClientId === "string") next.githubClientId = patch.githubClientId.trim();
   if (typeof patch.githubWebhookSecret === "string" && patch.githubWebhookSecret.trim()) {
     next.githubWebhookSecret = patch.githubWebhookSecret.trim();
   }

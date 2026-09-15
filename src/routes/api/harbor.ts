@@ -5,6 +5,7 @@ import {
   cancelHarborJob,
   getHarbor,
   githubStatus,
+  lastGithubInstallationId,
   patchHarborSettings,
   previewChatPaste,
   publicJobs,
@@ -14,8 +15,9 @@ import {
 } from "@/lib/harbor.server";
 import { runLocalLlm } from "@/lib/local-llm.server";
 import { SAMPLE_PRS } from "@/lib/samples";
+import { probeGithub } from "@/lib/github.server";
 import { clearGithubSecrets, patchGithubSecrets } from "@/lib/secrets.server";
-import { normalizeReviewOrder } from "@/lib/types";
+import { isMaskedSecret, normalizeReviewOrder } from "@/lib/types";
 import type { ReviewProvider } from "@/lib/types";
 
 function sameOrigin(request: Request) {
@@ -26,6 +28,12 @@ function sameOrigin(request: Request) {
   } catch {
     return false;
   }
+}
+
+function keepSecret(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  if (isMaskedSecret(v)) return undefined;
+  return v;
 }
 
 export const Route = createFileRoute("/api/harbor")({
@@ -49,6 +57,17 @@ export const Route = createFileRoute("/api/harbor")({
           raw?: string;
           extra?: string;
           token?: string;
+          username?: string;
+          mention?: string[];
+          skipForks?: boolean;
+          skipDrafts?: boolean;
+          maxInlineComments?: number;
+          maxTurns?: number;
+          exploreTurns?: number;
+          publishMinSeverity?: "P0" | "P1" | "P2";
+          requestChangesMin?: "P0" | "P1" | "P2";
+          precisionOverRecall?: boolean;
+          webhookSecret?: string;
           reviewChatgpt?: boolean;
           reviewGrok?: boolean;
           reviewLocal?: boolean;
@@ -57,6 +76,7 @@ export const Route = createFileRoute("/api/harbor")({
           localLlmModel?: string;
           reviewOrder?: ReviewProvider[];
           githubAppId?: string;
+          githubClientId?: string;
           githubWebhookSecret?: string;
           githubPrivateKey?: string;
           results?: { provider?: string; raw?: string }[];
@@ -77,15 +97,39 @@ export const Route = createFileRoute("/api/harbor")({
           return Response.json({ ok: true, raw: out.raw });
         }
         if (body.action === "settings") {
+          if (!sameOrigin(request)) {
+            return Response.json({ ok: false, error: "bad origin" }, { status: 401 });
+          }
           const patch: Parameters<typeof patchHarborSettings>[0] = {};
+          if (typeof body.username === "string" && body.username.trim()) patch.username = body.username.trim();
+          if (Array.isArray(body.mention)) {
+            patch.mention = body.mention.map((m) => String(m).trim()).filter(Boolean);
+          }
+          if (typeof body.skipForks === "boolean") patch.skipForks = body.skipForks;
+          if (typeof body.skipDrafts === "boolean") patch.skipDrafts = body.skipDrafts;
+          if (typeof body.precisionOverRecall === "boolean") patch.precisionOverRecall = body.precisionOverRecall;
+          if (typeof body.maxInlineComments === "number" && Number.isFinite(body.maxInlineComments)) {
+            patch.maxInlineComments = Math.max(0, Math.min(20, Math.floor(body.maxInlineComments)));
+          }
+          if (typeof body.maxTurns === "number" && Number.isFinite(body.maxTurns)) patch.maxTurns = body.maxTurns;
+          if (typeof body.exploreTurns === "number" && Number.isFinite(body.exploreTurns)) {
+            patch.exploreTurns = body.exploreTurns;
+          }
+          if (body.publishMinSeverity === "P0" || body.publishMinSeverity === "P1" || body.publishMinSeverity === "P2") {
+            patch.publishMinSeverity = body.publishMinSeverity;
+          }
+          if (body.requestChangesMin === "P0" || body.requestChangesMin === "P1" || body.requestChangesMin === "P2") {
+            patch.requestChangesMin = body.requestChangesMin;
+          }
+          const webhookSecret = keepSecret(body.webhookSecret);
+          if (webhookSecret) patch.webhookSecret = webhookSecret.trim();
           if (typeof body.reviewChatgpt === "boolean") patch.reviewChatgpt = body.reviewChatgpt;
           if (typeof body.reviewGrok === "boolean") patch.reviewGrok = body.reviewGrok;
           if (typeof body.reviewLocal === "boolean") patch.reviewLocal = body.reviewLocal;
           if (typeof body.localLlmBaseUrl === "string") patch.localLlmBaseUrl = body.localLlmBaseUrl.trim();
           if (typeof body.localLlmModel === "string") patch.localLlmModel = body.localLlmModel.trim();
-          if (typeof body.localLlmApiKey === "string" && body.localLlmApiKey.trim()) {
-            patch.localLlmApiKey = body.localLlmApiKey.trim();
-          }
+          const localKey = keepSecret(body.localLlmApiKey);
+          if (localKey) patch.localLlmApiKey = localKey.trim();
           if (Array.isArray(body.reviewOrder)) patch.reviewOrder = normalizeReviewOrder(body.reviewOrder);
           if (Object.keys(patch).length) patchHarborSettings(patch);
           return Response.json({ ok: true, github: githubStatus(), bridge: getBridgePublic() });
@@ -100,11 +144,19 @@ export const Route = createFileRoute("/api/harbor")({
           }
           const out = patchGithubSecrets({
             githubAppId: typeof body.githubAppId === "string" ? body.githubAppId : undefined,
-            githubWebhookSecret: typeof body.githubWebhookSecret === "string" ? body.githubWebhookSecret : undefined,
-            githubPrivateKey: typeof body.githubPrivateKey === "string" ? body.githubPrivateKey : undefined,
+            githubClientId: typeof body.githubClientId === "string" ? body.githubClientId : undefined,
+            githubWebhookSecret: keepSecret(body.githubWebhookSecret),
+            githubPrivateKey: keepSecret(body.githubPrivateKey),
           });
           if (!out.ok) return Response.json({ ok: false, error: out.error }, { status: 400 });
           return Response.json({ ok: true, github: githubStatus() });
+        }
+        if (body.action === "github-test") {
+          if (!sameOrigin(request)) {
+            return Response.json({ ok: false, error: "bad origin" }, { status: 401 });
+          }
+          const probe = await probeGithub(lastGithubInstallationId());
+          return Response.json({ ok: probe.ok, probe, github: githubStatus() }, { status: probe.ok ? 200 : 400 });
         }
         if (body.action === "cancel" && body.jobId) {
           cancelHarborJob(body.jobId);

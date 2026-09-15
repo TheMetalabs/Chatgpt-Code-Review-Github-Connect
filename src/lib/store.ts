@@ -14,7 +14,7 @@ import { decideIngress, acceptedDeliveryIds } from "./ingress";
 import { buildReview, filterPublishable, isBotMention } from "./poster";
 import { sleep } from "./utils";
 import type { BotSettings, GithubReady, Job, PostedReview, Trigger, WebhookLog } from "./types";
-import { DEFAULT_SETTINGS, LIVE_INFLIGHT_STATUSES } from "./types";
+import { DEFAULT_SETTINGS, LIVE_INFLIGHT_STATUSES, isMaskedSecret } from "./types";
 
 let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
@@ -47,14 +47,14 @@ interface AshlarState {
   fire: (opts: FireOpts) => Promise<FireResult>;
   cancel: (jobId: string) => void;
   resetDemo: () => void;
-  setSettings: (patch: Partial<BotSettings>) => void;
+  setSettings: (patch: Partial<BotSettings>) => Promise<void>;
   mergeRemote: (remote: {
     jobs: Job[];
     events: WebhookLog[];
     reviews: PostedReview[];
     github?: GithubReady;
     bridge?: BridgeReady;
-    settings?: Partial<BotSettings> & { localLlmApiKeySet?: boolean };
+    settings?: Partial<BotSettings> & { localLlmApiKeySet?: boolean; webhookSecretSet?: boolean };
   }) => void;
 }
 
@@ -265,11 +265,31 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
   github: { webhookSecret: false, appId: false, privateKey: false },
   bridge: { connected: false, lastSeen: 0 },
   ...seed(),
-  setSettings: (patch) => {
-    set((s) => ({ settings: { ...s.settings, ...patch } }));
-    const next = { ...get().settings, ...patch };
+  setSettings: async (patch) => {
+    const prev = get().settings;
+    const next: BotSettings = { ...prev, ...patch };
+    if (!patch.localLlmApiKey || isMaskedSecret(patch.localLlmApiKey)) {
+      next.localLlmApiKey = prev.localLlmApiKey;
+    } else {
+      next.localLlmApiKeySet = true;
+    }
+    if (!patch.webhookSecret || isMaskedSecret(patch.webhookSecret)) {
+      next.webhookSecret = prev.webhookSecret;
+    } else {
+      next.webhookSecretSet = true;
+    }
     const body: Record<string, unknown> = {
       action: "settings",
+      username: next.username,
+      mention: next.mention,
+      skipForks: next.skipForks,
+      skipDrafts: next.skipDrafts,
+      maxInlineComments: next.maxInlineComments,
+      maxTurns: next.maxTurns,
+      exploreTurns: next.exploreTurns,
+      publishMinSeverity: next.publishMinSeverity,
+      requestChangesMin: next.requestChangesMin,
+      precisionOverRecall: next.precisionOverRecall,
       reviewChatgpt: next.reviewChatgpt,
       reviewGrok: next.reviewGrok,
       reviewLocal: next.reviewLocal,
@@ -277,12 +297,19 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       localLlmModel: next.localLlmModel,
       reviewOrder: next.reviewOrder,
     };
-    if (next.localLlmApiKey.trim()) body.localLlmApiKey = next.localLlmApiKey;
-    void fetch("/api/harbor", {
+    if (next.localLlmApiKey.trim() && !isMaskedSecret(next.localLlmApiKey) && patch.localLlmApiKey && !isMaskedSecret(patch.localLlmApiKey)) {
+      body.localLlmApiKey = next.localLlmApiKey;
+    }
+    if (next.webhookSecret.trim() && !isMaskedSecret(next.webhookSecret) && patch.webhookSecret && !isMaskedSecret(patch.webhookSecret)) {
+      body.webhookSecret = next.webhookSecret;
+    }
+    const res = await fetch("/api/harbor", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (!res.ok) throw new Error("could not save settings");
+    set({ settings: next });
   },
   resetDemo: () => {
     set(() => ({ ...seed(), settings: DEFAULT_SETTINGS }));
@@ -306,6 +333,8 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
             webhookSecret: s.settings.webhookSecret,
             localLlmApiKey: s.settings.localLlmApiKey,
             reviewOrder: remote.settings.reviewOrder ?? s.settings.reviewOrder,
+            localLlmApiKeySet: Boolean(remote.settings.localLlmApiKeySet),
+            webhookSecretSet: Boolean(remote.settings.webhookSecretSet),
           }
         : s.settings,
     })),

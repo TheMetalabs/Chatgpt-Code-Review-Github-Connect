@@ -1,15 +1,20 @@
 import { createPrivateKey } from "node:crypto";
+import * as dns from "node:dns";
+import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, policyPathsFor, snapshotFileRef } from "./github-snapshot";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
 
-const GH = "https://api.github.com";
+dns.setDefaultResultOrder("ipv4first");
+
+const GH_HOST = "api.github.com";
 const MAX_FILES = 20;
 const MAX_FILE_BYTES = 200_000;
 
 export type GithubCreds = {
   appId: string;
+  clientId: string;
   privateKey: string;
   webhookSecret: string;
 };
@@ -26,13 +31,20 @@ function pick(ui: string, envVal: string | undefined): { value: string; from: Cr
 export function githubCreds(): GithubCreds & { from: GithubReady["from"] } {
   const stored = getSecrets();
   const appId = pick(stored.githubAppId, process.env.GITHUB_APP_ID);
+  const clientId = pick(stored.githubClientId, process.env.GITHUB_APP_CLIENT_ID ?? process.env.GITHUB_CLIENT_ID);
   const webhookSecret = pick(stored.githubWebhookSecret, process.env.GITHUB_WEBHOOK_SECRET);
   const key = pick(stored.githubPrivateKey, process.env.GITHUB_APP_PRIVATE_KEY);
   return {
     appId: appId.value,
+    clientId: clientId.value,
     webhookSecret: webhookSecret.value,
     privateKey: normalizePem(key.value),
-    from: { appId: appId.from, webhookSecret: webhookSecret.from, privateKey: key.from },
+    from: {
+      appId: appId.from,
+      clientId: clientId.from,
+      webhookSecret: webhookSecret.from,
+      privateKey: key.from,
+    },
   };
 }
 
@@ -45,61 +57,166 @@ export function githubReady(): GithubReady {
   return {
     webhookSecret: Boolean(c.webhookSecret),
     appId: Boolean(c.appId),
+    clientId: Boolean(c.clientId),
     privateKey: Boolean(c.privateKey),
     appIdValue: c.appId,
+    clientIdValue: c.clientId,
+    jwtIssuer: c.clientId || c.appId ? (c.clientId ? "client_id" : "app_id") : "missing",
     from: c.from,
   };
 }
 
+export function formatGithubError(e: unknown): string {
+  if (!(e instanceof Error)) return String(e).slice(0, 240);
+  const parts = [e.message];
+  const cause = (e as Error & { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    parts.push(cause.message);
+    const code = (cause as NodeJS.ErrnoException).code;
+    if (code) parts.push(String(code));
+  } else if (cause) {
+    parts.push(String(cause));
+  }
+  const code = (e as NodeJS.ErrnoException).code;
+  if (code) parts.push(String(code));
+  return [...new Set(parts.filter(Boolean))].join(" · ").slice(0, 240);
+}
+
+type GhRes = { status: number; text: string };
+
+/** Bypass Vite/Nitro-patched fetch. Force IPv4 — Mac Node often fails IPv6 while curl works. */
+function ghHttps(
+  method: string,
+  path: string,
+  headers: Record<string, string>,
+  body?: string,
+  timeoutMs = 20_000,
+): Promise<GhRes> {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: GH_HOST,
+        path: p,
+        method,
+        family: 4,
+        headers: {
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "ashlar-bot",
+          ...headers,
+          ...(body ? { "Content-Length": String(Buffer.byteLength(body)) } : {}),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c) => chunks.push(c as Buffer));
+        res.on("end", () =>
+          resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }),
+        );
+      },
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error("GitHub API timeout"));
+    });
+    req.on("error", (err) => reject(new Error(formatGithubError(err))));
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
 async function appJwt(): Promise<string> {
   const c = githubCreds();
-  if (!c.appId || !c.privateKey) throw new Error("GitHub App credentials missing");
+  const issuer = c.clientId || c.appId;
+  if (!issuer || !c.privateKey) throw new Error("GitHub App credentials missing");
   const key = createPrivateKey(c.privateKey);
+  const now = Math.floor(Date.now() / 1000);
   return new SignJWT({})
     .setProtectedHeader({ alg: "RS256" })
-    .setIssuedAt()
-    .setIssuer(c.appId)
-    .setExpirationTime("9m")
+    .setIssuedAt(now - 60)
+    .setIssuer(issuer)
+    .setExpirationTime(now + 9 * 60)
     .sign(key);
 }
 
 export async function installationToken(installationId: number): Promise<string> {
-  const jwt = await appJwt();
-  const res = await fetch(`${GH}/app/installations/${installationId}/access_tokens`, {
-    method: "POST",
-    headers: {
+  let jwt: string;
+  try {
+    jwt = await appJwt();
+  } catch (e) {
+    throw new Error(`app jwt: ${formatGithubError(e)}`);
+  }
+  let out: GhRes;
+  try {
+    out = await ghHttps("POST", `/app/installations/${installationId}/access_tokens`, {
       Authorization: `Bearer ${jwt}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "ashlar-bot",
-    },
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) throw new Error(`installation token ${res.status}`);
-  const body = (await res.json()) as { token?: string };
+    });
+  } catch (e) {
+    throw new Error(`installation token fetch: ${formatGithubError(e)}`);
+  }
+  if (out.status < 200 || out.status >= 300) {
+    throw new Error(`installation token ${out.status}: ${out.text.slice(0, 180)}`);
+  }
+  const body = (out.text ? JSON.parse(out.text) : {}) as { token?: string };
   if (!body.token) throw new Error("installation token missing");
   return body.token;
+}
+
+export async function probeGithub(installationId?: number): Promise<{
+  ok: boolean;
+  jwtIssuer: GithubReady["jwtIssuer"];
+  app?: { id?: number; slug?: string; name?: string };
+  installation?: { id: number };
+  error?: string;
+}> {
+  const ready = githubReady();
+  try {
+    const jwt = await appJwt();
+    const app = await ghHttps("GET", "/app", { Authorization: `Bearer ${jwt}` });
+    if (app.status < 200 || app.status >= 300) {
+      return {
+        ok: false,
+        jwtIssuer: ready.jwtIssuer,
+        error: `GET /app ${app.status}: ${app.text.slice(0, 180)}`,
+      };
+    }
+    const data = (app.text ? JSON.parse(app.text) : {}) as { id?: number; slug?: string; name?: string };
+    if (installationId) {
+      await installationToken(installationId);
+      return {
+        ok: true,
+        jwtIssuer: ready.jwtIssuer,
+        app: data,
+        installation: { id: installationId },
+      };
+    }
+    return { ok: true, jwtIssuer: ready.jwtIssuer, app: data };
+  } catch (e) {
+    return { ok: false, jwtIssuer: ready.jwtIssuer, error: formatGithubError(e) };
+  }
 }
 
 async function gh<T>(
   token: string,
   path: string,
-  init?: RequestInit,
+  init?: { method?: string; body?: string; headers?: Record<string, string> },
 ): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string }> {
-  const res = await fetch(`${GH}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "ashlar-bot",
-      ...(init?.headers ?? {}),
-    },
-    signal: AbortSignal.timeout(20_000),
-  });
-  const text = await res.text();
-  if (!res.ok) return { ok: false, status: res.status, text: text.slice(0, 400) };
-  return { ok: true, data: (text ? JSON.parse(text) : {}) as T };
+  let out: GhRes;
+  try {
+    out = await ghHttps(
+      init?.method ?? "GET",
+      path,
+      {
+        Authorization: `Bearer ${token}`,
+        ...(init?.headers ?? {}),
+      },
+      init?.body,
+    );
+  } catch (e) {
+    return { ok: false, status: 0, text: formatGithubError(e) };
+  }
+  if (out.status < 200 || out.status >= 300) return { ok: false, status: out.status, text: out.text.slice(0, 400) };
+  return { ok: true, data: (out.text ? JSON.parse(out.text) : {}) as T };
 }
 
 export async function fetchPullHead(
@@ -115,7 +232,9 @@ export async function fetchPullHead(
     head?: { sha?: string; repo?: { fork?: boolean } | null };
     base?: { sha?: string };
   }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
-  if (!out.ok || !out.data.head?.sha) throw new Error("could not load pull request");
+  if (!out.ok || !out.data.head?.sha) {
+    throw new Error(out.ok ? "could not load pull request" : `could not load pull request (${out.status}): ${out.text}`);
+  }
   if (!out.data.base?.sha) throw new Error("pull request missing base sha");
   return {
     headSha: out.data.head.sha,
@@ -167,7 +286,7 @@ export async function fetchPullSnapshot(
     token,
     `/repos/${target.owner}/${target.repo}/pulls/${target.pr}/files?per_page=100`,
   );
-  if (!filesOut.ok) throw new Error("could not load pull files");
+  if (!filesOut.ok) throw new Error(`could not load pull files (${filesOut.status}): ${filesOut.text}`);
   const changedPaths = filesOut.data
     .map((f) => f.filename)
     .filter((p): p is string => Boolean(p))

@@ -33,7 +33,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const github = useAshlar((s) => s.github);
   const bridge = useAshlar((s) => s.bridge);
   const mergeRemote = useAshlar((s) => s.mergeRemote);
-  const appReady = github.appId && github.privateKey && github.webhookSecret;
+  const appReady = (github.appId || github.clientId) && github.privateKey && github.webhookSecret;
 
   useEffect(() => {
     let timer = 0;

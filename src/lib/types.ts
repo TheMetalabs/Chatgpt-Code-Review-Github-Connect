@@ -171,6 +171,8 @@ export interface BotSettings {
   localLlmApiKey: string;
   localLlmModel: string;
   reviewOrder: ReviewProvider[];
+  localLlmApiKeySet?: boolean;
+  webhookSecretSet?: boolean;
 }
 
 export interface SnapshotFile {
@@ -226,6 +228,17 @@ export const PROVIDER_LABEL: Record<ReviewProvider, string> = {
   grok: "Grok",
 };
 
+export const SECRET_MASK = "••••••••••••";
+export const SECRET_MASK_PEM = `-----BEGIN PRIVATE KEY-----\n${SECRET_MASK}\n${SECRET_MASK}\n-----END PRIVATE KEY-----`;
+
+/** Empty or bullets — do not send as a new secret; keep what is stored. */
+export function isMaskedSecret(v: string | undefined): boolean {
+  const t = (v ?? "").trim();
+  if (!t) return true;
+  if (t === SECRET_MASK || t === SECRET_MASK_PEM) return true;
+  return /^•+$/.test(t) || t.includes(SECRET_MASK);
+}
+
 export function normalizeReviewOrder(order?: ReviewProvider[]): ReviewProvider[] {
   const seen = new Set<ReviewProvider>();
   const out: ReviewProvider[] = [];
@@ -263,12 +276,15 @@ export const LIVE_INFLIGHT_STATUSES: JobStatus[] = [
 export type GithubReady = {
   webhookSecret: boolean;
   appId: boolean;
+  clientId?: boolean;
   privateKey: boolean;
   appIdValue?: string;
+  clientIdValue?: string;
+  jwtIssuer?: "client_id" | "app_id" | "missing";
   from?: {
     webhookSecret: "ui" | "env" | "missing";
     appId: "ui" | "env" | "missing";
+    clientId: "ui" | "env" | "missing";
     privateKey: "ui" | "env" | "missing";
   };
 };
-

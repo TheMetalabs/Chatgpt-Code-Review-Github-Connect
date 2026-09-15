@@ -14,6 +14,8 @@ import {
   partitionConsensus,
   partitionMany,
   publishableFindings,
+  schemaMergeProviderGates,
+  SCHEMA_MERGE_NOTE,
 } from "./poster.ts";
 import { CANDIDATE_412_DROPPED, FINDING_412, FINDING_421, SAMPLE_PRS } from "./samples.ts";
 import { DEFAULT_SETTINGS } from "./types.ts";
@@ -179,6 +181,15 @@ describe("gateLiveSubmission", () => {
     }
   });
 
+  it("rejects empty findings that never inspected the snapshot", () => {
+    const gate = gateLiveSubmission(
+      { merge_recommendation: "COMMENT", findings: [] },
+      SAMPLE_PRS["pay-412"],
+      DEFAULT_SETTINGS,
+    );
+    assert.equal(gate.ok, false);
+  });
+
   it("keeps the #421 auth finding and never approves", () => {
     const gate = gateLiveSubmission(
       {
@@ -205,6 +216,39 @@ describe("gateLiveSubmission", () => {
       assert.equal(gate.findings.length, 1);
       assert.equal(gate.mergeRecommendation, "REQUEST_CHANGES");
     }
+  });
+});
+
+describe("schemaMergeProviderGates", () => {
+  it("schema-merges one-sided findings when LLM merge is unavailable", () => {
+    const left = {
+      ok: true as const,
+      findings: [{ ...FINDING_412, id: "a" }],
+      mergeRecommendation: "REQUEST_CHANGES" as const,
+      highestRisk: FINDING_412.title,
+      investigatedSafe: ["checked auth"],
+      assumptions: [],
+      dropped: [],
+    };
+    const right = {
+      ok: true as const,
+      findings: [{ ...FINDING_421, id: "b", file: "src/auth/session.ts" }],
+      mergeRecommendation: "REQUEST_CHANGES" as const,
+      highestRisk: FINDING_421.title,
+      investigatedSafe: [],
+      assumptions: [],
+      dropped: [],
+    };
+    const merged = schemaMergeProviderGates(
+      [
+        { provider: "chatgpt", gate: left },
+        { provider: "grok", gate: right },
+      ],
+      DEFAULT_SETTINGS,
+    );
+    assert.equal(merged.findings.length, 2);
+    assert.ok(merged.assumptions.some((a) => a.includes("Schema-merged")));
+    assert.match(SCHEMA_MERGE_NOTE, /Schema-merged/);
   });
 });
 

@@ -25,6 +25,8 @@ import {
   gatePeerSubmission,
   isBotMention,
   partitionMany,
+  schemaMergeProviderGates,
+  SCHEMA_MERGE_NOTE,
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
@@ -367,7 +369,33 @@ async function watchReviewers(jobId: string, token: string) {
       }));
     }
     const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
-    if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
+    if (leftover.chatFpRound && leftover.fpPending) {
+      const merged = finalizeFp(
+        {
+          ...leftover.fpPending,
+          assumptions: [...(leftover.fpPending.assumptions ?? []), SCHEMA_MERGE_NOTE].slice(0, 12),
+        },
+        state.settings,
+      );
+      patchJob(jobId, (j) => ({
+        ...j,
+        status: "validator",
+        findings: merged.findings,
+        candidates: merged.findings,
+        mergeRecommendation: merged.mergeRecommendation,
+        highestRisk: merged.highestRisk,
+        investigatedSafe: merged.investigatedSafe,
+        assumptions: merged.assumptions,
+        plan: "Schema-merged after LLM merge did not finish.",
+        updatedAt: Date.now(),
+      }));
+      try {
+        const token = leftover.installationId ? await installationToken(leftover.installationId) : undefined;
+        await finishJob(jobId, undefined, token);
+      } catch {
+        /* finishJob records githubError */
+      }
+    } else if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
   }
 }
 
@@ -771,6 +799,22 @@ export async function submitHarborChat(
       }));
       return { ok: true };
     }
+    if (mergeAsked || opts?.force) {
+      const merged = schemaMergeProviderGates([], state.settings);
+      patchJob(jobId, (j) => ({
+        ...j,
+        findings: merged.findings,
+        candidates: merged.findings,
+        mergeRecommendation: merged.mergeRecommendation,
+        highestRisk: merged.highestRisk,
+        investigatedSafe: merged.investigatedSafe,
+        assumptions: [...(j.assumptions ?? []), SCHEMA_MERGE_NOTE, ...invalid].filter(Boolean).slice(0, 12),
+        plan: "Schema-merged empty drafts after LLM merge did not return findings.",
+        updatedAt: Date.now(),
+      }));
+      await finishJob(jobId, sample, token);
+      return finishResult(jobId);
+    }
     const canRetry = providers.some(isChatProvider);
     if (!canRetry) {
       patchJob(jobId, (j) => ({
@@ -817,8 +861,16 @@ export async function submitHarborChat(
     ...gates.flatMap((g) => g.assumptions),
   ].filter(Boolean);
   const disputed = disputedFromUnique(part.unique);
-  if (!disputed.length) {
-    const merged = finalizeFp({ agreed: part.agreed, disputed: [], investigatedSafe, assumptions }, state.settings);
+  const localSkipped = (still.assumptions ?? []).some((a) => /^Skipped local/i.test(a));
+  const mergeAsked = (still.assumptions ?? []).some((a) => a.includes(MERGE_FALLBACK_NOTE));
+  const llmMergeUnavailable = localSkipped || Boolean(opts?.force) || mergeAsked;
+  if (!disputed.length || llmMergeUnavailable) {
+    const merged = llmMergeUnavailable
+      ? schemaMergeProviderGates(
+          [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
+          state.settings,
+        )
+      : finalizeFp({ agreed: part.agreed, disputed: [], investigatedSafe, assumptions }, state.settings);
     patchJob(jobId, (j) => ({
       ...j,
       findings: merged.findings,
@@ -826,7 +878,8 @@ export async function submitHarborChat(
       mergeRecommendation: merged.mergeRecommendation,
       highestRisk: merged.highestRisk,
       investigatedSafe: merged.investigatedSafe,
-      assumptions: merged.assumptions,
+      assumptions: [...assumptions, ...merged.assumptions].filter(Boolean).slice(0, 12),
+      plan: llmMergeUnavailable ? "Schema-merged reviewer JSON (LLM merge unavailable)." : j.plan,
       updatedAt: Date.now(),
     }));
     await finishJob(jobId, sample, token);
@@ -834,12 +887,7 @@ export async function submitHarborChat(
   }
 
   const ran = [...byProvider.keys()];
-  const localSkipped = (still.assumptions ?? []).some((a) => /^Skipped local/i.test(a));
   let order = normalizeReviewOrder(still.reviewOrder ?? state.settings.reviewOrder).filter((p) => ran.includes(p));
-  if (localSkipped) {
-    order = order.filter((p) => p !== "local");
-    if (ran.includes("chatgpt")) order = ["chatgpt", ...order.filter((p) => p !== "chatgpt")];
-  }
   patchJob(jobId, (j) => ({
     ...j,
     chatFpRound: true,

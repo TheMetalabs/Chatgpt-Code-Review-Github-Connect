@@ -24,18 +24,60 @@ const ORDER: Record<string, number> = {
   posted: 7,
 };
 
-export function Pipeline({ status }: { status?: JobStatus }) {
+export function stageCaption(status?: JobStatus): string | null {
+  if (!status) return null;
+  if (status === "cancelled") return "Cancelled — worker released.";
+  if (status === "dlq") return "Dead letter — validator failed.";
+  if (status === "skipped") return "Skipped — poster or ingress refused.";
+  if (status === "posted") return "Posted.";
+  if (status === "awaiting_chat") return "Chat reviewers racing.";
+  if (status === "reviewer") return "Local reviewer running.";
+  if (status === "snapshot") return "Fetching PR snapshot.";
+  if (status === "explorer") return "Building the prompt.";
+  if (status === "queued") return "Queued.";
+  if (status === "validator") return "Schema-merge.";
+  if (status === "posting") return "Writing GitHub review.";
+  return null;
+}
+
+export function Pipeline({ status, size = "full" }: { status?: JobStatus; size?: "full" | "compact" }) {
   const idx = status ? (ORDER[status] ?? -1) : -1;
   const done = status === "posted";
   const skipped = status === "skipped" || status === "cancelled" || status === "dlq";
-  const caption =
-    status === "cancelled"
-      ? "Cancelled — worker released."
-      : status === "dlq"
-        ? "Dead letter — validator failed."
-        : status === "skipped"
-          ? "Skipped — poster or ingress refused."
-          : null;
+  const caption = stageCaption(status);
+
+  if (size === "compact") {
+    return (
+      <div>
+        <ol className="flex flex-wrap items-center gap-1.5">
+          {STAGES.map((s, i) => {
+            const active = !done && !skipped && idx === i;
+            const complete = done || (!skipped && idx > i);
+            return (
+              <li key={s.id} className="flex items-center gap-1.5">
+                <span
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    skipped ? "bg-line" : active ? "bg-accent" : complete ? "bg-ok" : "bg-line",
+                  )}
+                  aria-hidden
+                />
+                <span
+                  className={cn(
+                    "font-mono text-[10px] uppercase tracking-[0.12em]",
+                    active ? "text-fg" : complete && !skipped ? "text-fg-muted" : "text-fg-subtle",
+                  )}
+                >
+                  {s.label}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+        {caption ? <p className="mt-2 text-[12px] text-fg-muted">{caption}</p> : null}
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -75,7 +117,7 @@ export function Pipeline({ status }: { status?: JobStatus }) {
           );
         })}
       </ol>
-      {caption ? <p className="mt-3 text-sm text-fg-muted">{caption}</p> : null}
+      {caption && skipped ? <p className="mt-3 text-sm text-fg-muted">{caption}</p> : null}
     </div>
   );
 }

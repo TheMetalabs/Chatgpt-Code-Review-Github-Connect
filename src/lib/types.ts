@@ -117,6 +117,20 @@ export interface Job {
   opsCommentId?: number;
   attemptedProviders?: ReviewProvider[];
   generating?: Partial<Record<ReviewProvider, boolean>>;
+  /** Public snapshot only — never includes reviewer raw JSON. */
+  reviewerLanes?: ReviewerLane[];
+}
+
+export type ReviewerLaneState = "queued" | "waiting" | "generating" | "answered" | "skipped" | "empty";
+
+export interface ReviewerLane {
+  provider: ReviewProvider;
+  state: ReviewerLaneState;
+  label: string;
+  detail: string;
+  answered: boolean;
+  jsonChars?: number;
+  findingCount?: number;
 }
 
 export interface PostedComment {

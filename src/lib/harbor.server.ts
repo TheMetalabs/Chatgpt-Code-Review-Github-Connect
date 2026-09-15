@@ -28,78 +28,13 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import { loadBotSettings, saveBotSettings } from "./settings.server";
 import {
-  DEFAULT_SETTINGS,
   LIVE_INFLIGHT_STATUSES,
   isChatProvider,
   normalizeReviewOrder,
   providersFromSettings,
 } from "./types";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-
-const BOT_SETTINGS_FILE = join(process.cwd(), ".data", "ashlar-bot-settings.json");
-
-type PersistedBotSettings = Partial<
-  Pick<
-    BotSettings,
-    | "reviewLocal"
-    | "localLlmBaseUrl"
-    | "localLlmApiKey"
-    | "localLlmModel"
-    | "reviewChatgpt"
-    | "reviewGrok"
-    | "reviewOrder"
-    | "webhookSecret"
-    | "username"
-    | "mention"
-  >
->;
-
-function readPersistedBotSettings(): PersistedBotSettings {
-  try {
-    const parsed = JSON.parse(readFileSync(BOT_SETTINGS_FILE, "utf8")) as PersistedBotSettings;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function envBotSettings(): PersistedBotSettings {
-  const out: PersistedBotSettings = {};
-  const reviewLocal = process.env.ASHLAR_REVIEW_LOCAL?.trim().toLowerCase();
-  if (reviewLocal === "1" || reviewLocal === "true" || reviewLocal === "yes") out.reviewLocal = true;
-  if (reviewLocal === "0" || reviewLocal === "false" || reviewLocal === "no") out.reviewLocal = false;
-  const base = process.env.ASHLAR_LOCAL_LLM_BASE_URL?.trim();
-  if (base) out.localLlmBaseUrl = base;
-  const key = process.env.ASHLAR_LOCAL_LLM_API_KEY?.trim();
-  if (key) out.localLlmApiKey = key;
-  const model = process.env.ASHLAR_LOCAL_LLM_MODEL?.trim();
-  if (model) out.localLlmModel = model;
-  return out;
-}
-
-function initialSettings(): BotSettings {
-  // Disk wins over defaults; env fills gaps / ops override for base+key+model+flag.
-  return { ...DEFAULT_SETTINGS, ...readPersistedBotSettings(), ...envBotSettings() };
-}
-
-function persistBotSettings(settings: BotSettings) {
-  const next: PersistedBotSettings = {
-    reviewLocal: settings.reviewLocal,
-    localLlmBaseUrl: settings.localLlmBaseUrl,
-    localLlmApiKey: settings.localLlmApiKey,
-    localLlmModel: settings.localLlmModel,
-    reviewChatgpt: settings.reviewChatgpt,
-    reviewGrok: settings.reviewGrok,
-    reviewOrder: settings.reviewOrder,
-    webhookSecret: settings.webhookSecret,
-    username: settings.username,
-    mention: settings.mention,
-  };
-  mkdirSync(dirname(BOT_SETTINGS_FILE), { recursive: true, mode: 0o700 });
-  writeFileSync(BOT_SETTINGS_FILE, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-}
 
 let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
@@ -124,7 +59,7 @@ export type HarborFireResult = { httpStatus: 202 | 403; skip?: string; reject?: 
 
 const CAP = 80;
 let state: HarborState = {
-  settings: initialSettings(),
+  settings: loadBotSettings(),
   jobs: [],
   events: [],
   reviews: [],
@@ -161,17 +96,18 @@ export function githubStatus() {
 export function patchHarborSettings(patch: Partial<BotSettings>) {
   const next = { ...state.settings, ...patch };
   if (!providersFromSettings(next).length) return state.settings;
-  state = { ...state, settings: next };
+  let saved = next;
   try {
-    persistBotSettings(state.settings);
+    saved = saveBotSettings(next);
   } catch {
-    // non-fatal: UI update still applies in-memory
+    saved = next;
   }
+  state = { ...state, settings: saved };
   return state.settings;
 }
 
 export function resetHarbor() {
-  state = { settings: { ...DEFAULT_SETTINGS }, jobs: [], events: [], reviews: [] };
+  state = { settings: state.settings, jobs: [], events: [], reviews: [] };
 }
 
 export function cancelHarborJob(jobId: string) {

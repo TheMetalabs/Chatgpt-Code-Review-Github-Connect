@@ -312,7 +312,7 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
     set({ settings: next });
   },
   resetDemo: () => {
-    set(() => ({ ...seed(), settings: DEFAULT_SETTINGS }));
+    set((s) => ({ ...seed(), settings: s.settings }));
     void fetch("/api/harbor", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

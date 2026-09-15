@@ -800,20 +800,16 @@ export async function submitHarborChat(
       return { ok: true };
     }
     if (mergeAsked || opts?.force) {
-      const merged = schemaMergeProviderGates([], state.settings);
       patchJob(jobId, (j) => ({
         ...j,
-        findings: merged.findings,
-        candidates: merged.findings,
-        mergeRecommendation: merged.mergeRecommendation,
-        highestRisk: merged.highestRisk,
-        investigatedSafe: merged.investigatedSafe,
-        assumptions: [...(j.assumptions ?? []), SCHEMA_MERGE_NOTE, ...invalid].filter(Boolean).slice(0, 12),
-        plan: "Schema-merged empty drafts after LLM merge did not return findings.",
+        status: "skipped",
+        skipReason: invalid.join("; ") || "no valid review JSON after LLM merge",
+        githubError: invalid.join("; ") || "no valid review JSON after LLM merge",
+        assumptions: [...(j.assumptions ?? []), SCHEMA_MERGE_NOTE].slice(0, 12),
+        plan: "Did not post a clean review from empty drafts.",
         updatedAt: Date.now(),
       }));
-      await finishJob(jobId, sample, token);
-      return finishResult(jobId);
+      return { ok: false, error: invalid.join("; ") || "no valid review JSON after LLM merge" };
     }
     const canRetry = providers.some(isChatProvider);
     if (!canRetry) {

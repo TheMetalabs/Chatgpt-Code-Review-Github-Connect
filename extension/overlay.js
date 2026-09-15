@@ -1,13 +1,16 @@
-function overlayRoot() {
-  return (
-    document.querySelector('[role="dialog"]') ||
-    document.querySelector('[role="alertdialog"]') ||
-    document.querySelector('[aria-modal="true"]')
-  );
+function overlayIsLive(el) {
+  if (!(el instanceof HTMLElement)) return false;
+  if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
+  if (el.getAttribute("data-state") === "closed") return false;
+  const style = window.getComputedStyle(el);
+  if (style.display === "none" || style.visibility === "hidden") return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 20 && r.height > 20;
 }
 
-function overlayLabel(el) {
-  return `${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`.replace(/\s+/g, " ").trim();
+function overlayRoot() {
+  const nodes = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')];
+  return nodes.find(overlayIsLive) || null;
 }
 
 function overlayKind(label) {
@@ -24,13 +27,24 @@ function overlayKind(label) {
   return null;
 }
 
+function overlayKindForEl(el) {
+  const labels = [el.getAttribute("aria-label") || "", el.textContent || ""]
+    .map((s) => s.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  for (const t of labels) {
+    const kind = overlayKind(t);
+    if (kind) return kind;
+  }
+  return null;
+}
+
 function clickOverlayButton(root, want) {
   const nodes = [...root.querySelectorAll("button, [role='button'], a")];
   for (const el of nodes) {
     if (!(el instanceof HTMLElement)) continue;
     const r = el.getBoundingClientRect();
     if (r.width < 8 || r.height < 8) continue;
-    if (overlayKind(overlayLabel(el)) === want) {
+    if (overlayKindForEl(el) === want) {
       el.click();
       return true;
     }
@@ -47,7 +61,7 @@ async function dismissOverlays() {
       await sleep(400);
       continue;
     }
-    const close = root.querySelector("button[aria-label*='Close' i], button[aria-label*='닫기']");
+    const close = [...root.querySelectorAll("button[aria-label*='Close' i], button[aria-label*='닫기']")].find(overlayIsLive);
     if (close instanceof HTMLElement) {
       close.click();
       await sleep(400);

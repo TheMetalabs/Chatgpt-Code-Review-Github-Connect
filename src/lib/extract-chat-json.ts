@@ -21,25 +21,15 @@ export function lastReviewJson(text: string): string | null {
   for (let end = s.lastIndexOf("}"); end >= 0; end = s.lastIndexOf("}", end - 1)) {
     let depth = 0;
     let inStr = false;
-    let esc = false;
     for (let i = end; i >= 0; i -= 1) {
       const c = s[i];
-      if (inStr) {
-        if (esc) {
-          esc = false;
-          continue;
-        }
-        if (c === "\\") {
-          esc = true;
-          continue;
-        }
-        if (c === '"') inStr = false;
-        continue;
-      }
       if (c === '"') {
-        inStr = true;
+        let slashes = 0;
+        for (let j = i - 1; j >= 0 && s[j] === "\\"; j -= 1) slashes += 1;
+        if (slashes % 2 === 0) inStr = !inStr;
         continue;
       }
+      if (inStr) continue;
       if (c === "}") depth += 1;
       else if (c === "{") {
         depth -= 1;

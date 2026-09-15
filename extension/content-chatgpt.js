@@ -35,28 +35,9 @@ function quotaError() {
   return e;
 }
 
-function generationAllowThin() {
-  return typeof replyDoneVisible === "function"
-    ? replyDoneVisible()
-    : chatGenerationFinished({
-        stopVisible: typeof stopButtonVisible === "function" && stopButtonVisible(),
-        replyActionsVisible: false,
-        sawStop: false,
-      });
-}
-
-async function runPrompt(prompt, reasoning) {
-  const existing = harvestJson({ allowThin: generationAllowThin() });
-  if (
-    existing &&
-    chatGenerationFinished({
-      stopVisible: typeof stopButtonVisible === "function" && stopButtonVisible(),
-      replyActionsVisible: typeof replyDoneVisible === "function" && replyDoneVisible(),
-      sawStop: false,
-    })
-  )
-    return existing;
-  if (assistantCorpus().length && !composer()) return waitUntilReviewOrQuota("ChatGPT");
+async function runPrompt(prompt, reasoning, resume = false) {
+  // A restarted worker must observe the existing request, never submit it again.
+  if (resume) return waitUntilReviewOrQuota("ChatGPT");
   await dismissOverlays();
   await waitUntilComposer();
   await dismissOverlays();
@@ -71,36 +52,4 @@ async function runPrompt(prompt, reasoning) {
   return waitUntilReviewOrQuota("ChatGPT");
 }
 
-let running = false;
-chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
-  if (msg?.type === "ashlar-harvest") {
-    const raw = harvestJson({ allowThin: generationAllowThin() });
-    sendResponse(raw ? { ok: true, raw } : { ok: false, error: "no json" });
-    return true;
-  }
-  if (msg?.type !== "ashlar-run") return;
-  if (running) {
-    // Soft busy — background must keep generating=true and retry harvest (do not clear).
-    const raw = harvestJson({ allowThin: generationAllowThin() });
-    sendResponse(
-      raw
-        ? { ok: true, raw }
-        : { ok: false, error: "already running", code: "busy", retry: true },
-    );
-    return true;
-  }
-  running = true;
-  runPrompt(String(msg.prompt || ""), msg.reasoning)
-    .then((raw) => sendResponse({ ok: true, raw }))
-    .catch((e) =>
-      sendResponse({
-        ok: false,
-        error: e instanceof Error ? e.message : String(e),
-        code: e && e.code === "quota" ? "quota" : e && e.code === "empty" ? "empty" : undefined,
-      }),
-    )
-    .finally(() => {
-      running = false;
-    });
-  return true;
-});
+installReviewRunner("ChatGPT", (...args) => runPrompt(...args));

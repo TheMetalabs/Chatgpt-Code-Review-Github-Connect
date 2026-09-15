@@ -161,7 +161,11 @@ function installReviewRunner(name, run) {
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending" });
   state.listener = (msg, _sender, reply) => {
     if (msg?.type !== "ashlar-run" && msg?.type !== "ashlar-harvest") return;
-    if (msg.jobId && state.jobId && msg.jobId !== state.jobId) {
+    if (!msg.jobId) {
+      reply({ ok: false, code: "job_mismatch", error: "jobId is required" });
+      return;
+    }
+    if (state.jobId && msg.jobId !== state.jobId) {
       reply({ ok: false, code: "job_mismatch", error: "tab belongs to another job" });
       return;
     }

@@ -12,32 +12,26 @@ import {
 import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
-import { buildChatPrompt, buildFpPrompt, buildMergePrompt, MERGE_FALLBACK_NOTE, parseChatSubmission } from "./chat-prompt";
+import { buildChatPrompt, parseChatSubmission } from "./chat-prompt";
 import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
 import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
-  applyFpStep,
   buildReview,
-  disputedFromUnique,
   filterPublishable,
-  finalizeFp,
   gateLiveSubmission,
-  gatePeerSubmission,
   isBotMention,
-  partitionMany,
   schemaMergeProviderGates,
-  SCHEMA_MERGE_NOTE,
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { LOCAL_HOLD_MS, shouldHoldForChat, shouldHoldForLocal, shouldStartLocalFallback } from "./local-fallback";
+import { stillRacing, shouldStartLocalRace } from "./local-fallback";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import {
   BRIDGE_CLAIM_MS,
   LIVE_INFLIGHT_STATUSES,
+  claimedReviewerNote,
   isChatProvider,
-  localLlmReady,
   normalizeReviewOrder,
   providersFromSettings,
 } from "./types";
@@ -280,14 +274,12 @@ async function bridgeSnapshot() {
 }
 
 const WATCH_TICK_MS = 5_000;
-const WATCH_CAP_MS = 14 * 60_000;
 
 async function watchReviewers(jobId: string, token: string) {
-  const started = Date.now();
   let lastNotes = "";
   let localStarted = false;
   let flushed = false;
-  while (Date.now() - started < WATCH_CAP_MS) {
+  for (;;) {
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
     if (job.status === "cancelled" || job.status === "posted" || job.status === "skipped" || job.status === "dlq") return;
@@ -302,14 +294,11 @@ async function watchReviewers(jobId: string, token: string) {
     const localRunning = localInFlight.has(jobId);
     if (
       prompt &&
-      shouldStartLocalFallback({
+      shouldStartLocalRace({
         providers: job.reviewProviders ?? [],
         status: job.status,
-        connected: bridge.connected,
-        claimed,
         localDone: Boolean(localLeg?.raw.trim() || localSkip),
         localStarted: localStarted || localRunning,
-        waitedMs: Date.now() - started,
       })
     ) {
       const ping = await pingLocalLlm(state.settings);
@@ -325,36 +314,34 @@ async function watchReviewers(jobId: string, token: string) {
         }));
       }
     }
-    if (
-      !flushed &&
-      job.status === "awaiting_chat" &&
-      (job.storedLegs ?? []).some((l) => l.raw.trim()) &&
-      !localInFlight.has(jobId)
-    ) {
-      const chatProviders = (job.reviewProviders ?? []).filter(isChatProvider);
-      const attempted = job.attemptedProviders ?? [];
-      const stored = job.storedLegs ?? [];
-      const chatDone =
-        !chatProviders.length ||
-        chatProviders.every((p) => attempted.includes(p) || stored.some((l) => l.provider === p && l.raw.trim()));
-      const timedOut = Date.now() - started >= LOCAL_HOLD_MS;
-      if (timedOut || (chatDone && !claimed)) {
-        flushed = true;
-        const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
-        if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
-      }
+    const stored = job.storedLegs ?? [];
+    const racing = stillRacing({
+      providers: job.reviewProviders ?? [],
+      payloads: stored.filter((l) => l.raw.trim()).map((l) => l.provider),
+      assumptions: job.assumptions,
+      localInFlight: localInFlight.has(jobId),
+      generating: job.generating,
+      claimed,
+      connected: bridge.connected,
+    });
+    if (!flushed && job.status === "awaiting_chat" && stored.some((l) => l.raw.trim()) && !racing) {
+      flushed = true;
+      const legs = stored.filter((l) => l.raw.trim());
+      if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
     }
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
-      notes.push("Chrome bridge is not connected. ChatGPT/Grok start in parallel when the extension reconnects.");
+      notes.push(
+        `Chrome bridge is not connected. ${chat.map((p) => (p === "grok" ? "Grok" : "ChatGPT")).join(" / ")} start when the extension reconnects.`,
+      );
     } else if (claimed) {
-      notes.push("Chrome bridge claimed this job. ChatGPT and Grok run in parallel.");
+      notes.push(claimedReviewerNote(job.reviewProviders?.length ? job.reviewProviders : chat));
     }
     if (localSkip) notes.push(`${localSkip} — skipped, does not block other reviewers.`);
     else if (localLeg) notes.push("Local LLM finished.");
-    else if (localStarted || localRunning) notes.push("Waiting for local LLM before posting.");
+    else if (localStarted || localRunning) notes.push("Local LLM is racing.");
     else if ((job.reviewProviders ?? []).includes("local") && chat.length) {
-      notes.push("Local LLM is fallback if Chrome does not return in time.");
+      notes.push("Local LLM is in the race when reachable.");
     }
 
     const phase: OpsPhase = chat.length && !bridge.connected && !claimed ? "blocked" : "running";
@@ -365,58 +352,6 @@ async function watchReviewers(jobId: string, token: string) {
     }
 
     await sleep(WATCH_TICK_MS);
-  }
-  const leftover = state.jobs.find((j) => j.id === jobId);
-  if (leftover?.status === "awaiting_chat") {
-    if (localInFlight.has(jobId)) {
-      localInFlight.delete(jobId);
-      patchJob(jobId, (j) => ({
-        ...j,
-        assumptions: [...(j.assumptions ?? []), "Skipped local (still running at watch cap)"].slice(0, 12),
-        updatedAt: Date.now(),
-      }));
-    }
-    const legs = (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? []).filter((l) => l.raw.trim());
-    if (leftover.chatFpRound && leftover.fpPending) {
-      const merged = finalizeFp(
-        {
-          ...leftover.fpPending,
-          assumptions: [...(leftover.fpPending.assumptions ?? []), SCHEMA_MERGE_NOTE].slice(0, 12),
-        },
-        state.settings,
-      );
-      patchJob(jobId, (j) => ({
-        ...j,
-        status: "validator",
-        findings: merged.findings,
-        candidates: merged.findings,
-        mergeRecommendation: merged.mergeRecommendation,
-        highestRisk: merged.highestRisk,
-        investigatedSafe: merged.investigatedSafe,
-        assumptions: merged.assumptions,
-        plan: "Schema-merged after LLM merge did not finish.",
-        updatedAt: Date.now(),
-      }));
-      try {
-        const token = leftover.installationId ? await installationToken(leftover.installationId) : undefined;
-        const sample = token
-          ? await fetchPullSnapshot(token, {
-              owner: leftover.owner,
-              repo: leftover.repo,
-              pr: leftover.pr,
-              title: leftover.title,
-              headSha: leftover.headSha,
-              baseSha: leftover.baseSha,
-              sender: leftover.sender,
-              isFork: leftover.isFork,
-              isDraft: leftover.isDraft,
-            })
-          : undefined;
-        await finishJob(jobId, sample, token);
-      } catch {
-        /* finishJob records githubError */
-      }
-    } else if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
   }
 }
 
@@ -583,10 +518,10 @@ async function playGithub(jobId: string, untrustedBody: string) {
     ...j,
     status: "awaiting_chat",
     plan: providers.includes("local")
-      ? `Snapshot loaded. ${chatProviders.join(" + ")} via Chrome; local LLM runs if reachable and we wait for it before posting.`
-      : providers.length > 1
-        ? `Snapshot loaded. ${providers.join(" + ")} review in parallel. False-positive checks run in order: ${order.join(" → ")}.`
-        : "Snapshot loaded. The Chrome bridge will send this to ChatGPT or Grok on this machine.",
+      ? `Snapshot loaded. ${[...chatProviders, "local"].join(" + ")} race in parallel. Schema-merge when each finishes.`
+      : chatProviders.length > 1
+        ? `Snapshot loaded. ${chatProviders.join(" + ")} race in parallel. Schema-merge when each finishes.`
+        : `Snapshot loaded. The Chrome bridge will send this to ${chatProviders[0] ?? "chat"} on this machine.`,
     chatPrompt: prompt,
     reviewProviders: providers,
     reviewOrder: order,
@@ -676,30 +611,19 @@ export async function submitHarborChat(
     return { ok: false, error: "quota" };
   }
   if (!opts?.force && !job.chatFpRound) {
-    const localSkip = (job.assumptions ?? []).some((a) => a.startsWith("Skipped local"));
-    const chatSkip = (job.assumptions ?? []).some((a) => /Skipped (chatgpt|grok)/i.test(a));
-    const haveLocal = payloads.some((l) => l.provider === "local");
-    const haveChat = payloads.some((l) => isChatProvider(l.provider));
     const bridge = await bridgeSnapshot();
     const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
-    const chatProviders = providers.filter(isChatProvider);
-    const allChatAttempted =
-      chatProviders.length > 0 &&
-      chatProviders.every((p) => (job.attemptedProviders ?? []).includes(p) || payloads.some((l) => l.provider === p));
+    const haveLocal = payloads.some((l) => l.provider === "local");
+    const haveChat = payloads.some((l) => isChatProvider(l.provider));
     if (
-      shouldHoldForLocal({
+      stillRacing({
         providers,
-        haveLocal,
-        localSkipped: localSkip,
+        payloads: payloads.map((l) => l.provider),
+        assumptions: job.assumptions,
         localInFlight: localInFlight.has(jobId),
-      }) ||
-      shouldHoldForChat({
-        providers,
-        haveChat,
-        chatSkipped: chatSkip,
+        generating: job.generating,
         claimed,
         connected: bridge.connected,
-        allChatAttempted,
       })
     ) {
       patchJob(jobId, (j) => {
@@ -713,7 +637,7 @@ export async function submitHarborChat(
         return {
           ...j,
           storedLegs: next,
-          plan: haveChat && !haveLocal ? "Waiting for local LLM before posting." : "Waiting for Chrome reviewers before posting.",
+          plan: haveChat && !haveLocal ? "Waiting for remaining racers before schema-merge." : "Waiting for remaining racers before schema-merge.",
           updatedAt: Date.now(),
         };
       });
@@ -764,31 +688,6 @@ export async function submitHarborChat(
     return { ok: false, error: "cancelled" };
   }
 
-  if (still.chatFpRound && still.fpPending) {
-    const checker = (still.fpProviders?.[0] ?? payloads[0]?.provider) as ReviewProvider;
-    const parsed = parseChatSubmission(payloads[0]?.raw ?? "");
-    const gated = gatePeerSubmission(parsed, sample, state.settings);
-    if (!gated.ok) return revert(`${checker}: ${gated.reason}`);
-    const stepped = applyFpStep(still.fpPending, checker, gated.check);
-    patchJob(jobId, (j) =>
-      j.fpPending
-        ? {
-            ...j,
-            fpPending: {
-              ...j.fpPending,
-              agreed: stepped.agreed,
-              disputed: stepped.disputed,
-              fpQueue: j.fpPending.fpQueue.filter((p) => p !== checker),
-              dropped: [...j.fpPending.dropped, ...stepped.dropped],
-            },
-            findings: [...stepped.agreed, ...stepped.disputed.map((d) => d.finding)],
-            updatedAt: Date.now(),
-          }
-        : j,
-    );
-    return runFpPipeline(jobId, sample, token);
-  }
-
   const gates: LiveGateResult[] = [];
   const byProvider = new Map<ReviewProvider, LiveGateResult>();
   const invalid: string[] = [];
@@ -804,140 +703,38 @@ export async function submitHarborChat(
   }
 
   if (!gates.length) {
-    const localSkipped = (still.assumptions ?? []).some((a) => /^Skipped local/i.test(a));
-    const mergeAsked = (still.assumptions ?? []).some((a) => a.includes(MERGE_FALLBACK_NOTE));
-    const drafts = [...incoming, ...stored].filter((l) => l.raw.trim());
-    if (localSkipped && !mergeAsked && providers.some(isChatProvider)) {
-      const mergePrompt = buildMergePrompt({
-        sample,
-        drafts: drafts.length ? drafts : [{ provider: "chatgpt", raw: raw }],
-      });
-      patchJob(jobId, (j) => ({
-        ...j,
-        status: "awaiting_chat",
-        chatPrompt: mergePrompt,
-        fpProviders: ["chatgpt"],
-        bridgeClaimedAt: undefined,
-        assumptions: [...(j.assumptions ?? []), MERGE_FALLBACK_NOTE].slice(0, 12),
-        plan: "Local LLM skipped. Asking ChatGPT to merge reviewer drafts.",
-        githubError: undefined,
-        updatedAt: Date.now(),
-      }));
-      return { ok: true };
-    }
-    if (mergeAsked || opts?.force) {
-      patchJob(jobId, (j) => ({
-        ...j,
-        status: "skipped",
-        skipReason: invalid.join("; ") || "no valid review JSON after LLM merge",
-        githubError: invalid.join("; ") || "no valid review JSON after LLM merge",
-        assumptions: [...(j.assumptions ?? []), SCHEMA_MERGE_NOTE].slice(0, 12),
-        plan: "Did not post a clean review from empty drafts.",
-        updatedAt: Date.now(),
-      }));
-      return { ok: false, error: invalid.join("; ") || "no valid review JSON after LLM merge" };
-    }
-    const canRetry = providers.some(isChatProvider);
-    if (!canRetry) {
-      patchJob(jobId, (j) => ({
-        ...j,
-        status: "skipped",
-        skipReason: invalid.join("; ") || "no valid review JSON",
-        githubError: invalid.join("; ") || "no valid review JSON",
-        updatedAt: Date.now(),
-      }));
-      return { ok: false, error: invalid.join("; ") || "no valid review JSON" };
-    }
-    return revert(invalid.join("; ") || "no valid review JSON");
-  }
-
-  const chatReturned = [...byProvider.keys()].filter(isChatProvider);
-  if (gates.length < 2 || chatReturned.length < 2) {
-    const merged =
-      gates.length < 2
-        ? gates[0]
-        : schemaMergeProviderGates(
-            [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
-            state.settings,
-          );
     patchJob(jobId, (j) => ({
       ...j,
-      findings: merged.findings,
-      candidates: merged.findings,
-      mergeRecommendation: merged.mergeRecommendation,
-      highestRisk: merged.highestRisk,
-      investigatedSafe: merged.investigatedSafe,
-      assumptions: [
-        skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
-        ...invalid,
-        ...merged.assumptions,
-      ].filter(Boolean),
-      plan:
-        skipped.length || invalid.length
-          ? `Posted from ${[...byProvider.keys()].join(" + ")} only.`
-          : j.plan,
+      status: "skipped",
+      skipReason: invalid.join("; ") || "no valid review JSON",
+      githubError: invalid.join("; ") || "no valid review JSON",
+      plan: "Did not post — no reviewer returned valid JSON.",
       updatedAt: Date.now(),
     }));
-    await finishJob(jobId, sample, token);
-    return finishResult(jobId);
+    return { ok: false, error: invalid.join("; ") || "no valid review JSON" };
   }
 
-  const part = partitionMany([...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })));
-  const investigatedSafe = [...new Set([...gates.flatMap((g) => g.investigatedSafe)])].slice(0, 8);
-  const assumptions = [
-    skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
-    ...invalid,
-    ...gates.flatMap((g) => g.assumptions),
-  ].filter(Boolean);
-  const disputed = disputedFromUnique(part.unique);
-  const localSkipped = (still.assumptions ?? []).some((a) => /^Skipped local/i.test(a));
-  const mergeAsked = (still.assumptions ?? []).some((a) => a.includes(MERGE_FALLBACK_NOTE));
-  const llmMergeUnavailable = localSkipped || Boolean(opts?.force) || mergeAsked;
-  if (!disputed.length || llmMergeUnavailable) {
-    const merged = llmMergeUnavailable
-      ? schemaMergeProviderGates(
-          [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
-          state.settings,
-        )
-      : finalizeFp({ agreed: part.agreed, disputed: [], investigatedSafe, assumptions }, state.settings);
-    patchJob(jobId, (j) => ({
-      ...j,
-      findings: merged.findings,
-      candidates: merged.findings,
-      mergeRecommendation: merged.mergeRecommendation,
-      highestRisk: merged.highestRisk,
-      investigatedSafe: merged.investigatedSafe,
-      assumptions: [...assumptions, ...merged.assumptions].filter(Boolean).slice(0, 12),
-      plan: llmMergeUnavailable ? "Schema-merged reviewer JSON (LLM merge unavailable)." : j.plan,
-      updatedAt: Date.now(),
-    }));
-    await finishJob(jobId, sample, token);
-    return finishResult(jobId);
-  }
-
-  const ran = [...byProvider.keys()];
-  let order = normalizeReviewOrder(still.reviewOrder ?? state.settings.reviewOrder).filter((p) => ran.includes(p));
+  const merged = schemaMergeProviderGates(
+    [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
+    state.settings,
+  );
   patchJob(jobId, (j) => ({
     ...j,
-    chatFpRound: true,
-    fpPending: {
-      agreed: part.agreed,
-      disputed,
-      fpQueue: order,
-      investigatedSafe,
-      assumptions,
-      skipped,
-      dropped: [],
-    },
-    reviewOrder: order,
-    findings: [...part.agreed, ...disputed.map((d) => d.finding)],
-    candidates: [...part.agreed, ...disputed.map((d) => d.finding)],
-    investigatedSafe,
-    assumptions,
-    plan: `Ordered false-positive check (${order.join(" → ")}). ${disputed.length} one-sided finding(s).`,
+    findings: merged.findings,
+    candidates: merged.findings,
+    mergeRecommendation: merged.mergeRecommendation,
+    highestRisk: merged.highestRisk,
+    investigatedSafe: merged.investigatedSafe,
+    assumptions: [
+      skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
+      ...invalid,
+      ...merged.assumptions,
+    ].filter(Boolean),
+    plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
     updatedAt: Date.now(),
   }));
-  return runFpPipeline(jobId, sample, token);
+  await finishJob(jobId, sample, token);
+  return finishResult(jobId);
 }
 
 function finishResult(jobId: string): { ok: true } | { ok: false; error: string } {
@@ -949,103 +746,6 @@ function finishResult(jobId: string): { ok: true } | { ok: false; error: string 
     return { ok: false, error: "cancelled" };
   }
   return { ok: true };
-}
-
-async function runFpPipeline(
-  jobId: string,
-  sample: SamplePr,
-  token: string,
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  for (;;) {
-    const job = state.jobs.find((j) => j.id === jobId);
-    if (!job || job.status === "cancelled") return { ok: false, error: "cancelled" };
-    const pending = job.fpPending;
-    if (!pending) return { ok: false, error: "missing fp state" };
-    if (!pending.fpQueue.length) {
-      const merged = finalizeFp(pending, state.settings);
-      patchJob(jobId, (j) => ({
-        ...j,
-        status: "validator",
-        findings: merged.findings,
-        candidates: merged.findings,
-        mergeRecommendation: merged.mergeRecommendation,
-        highestRisk: merged.highestRisk,
-        investigatedSafe: merged.investigatedSafe,
-        assumptions: [...pending.assumptions, ...pending.dropped].filter(Boolean).slice(0, 12),
-        plan: "Posted after parallel reviews and ordered false-positive checks.",
-        updatedAt: Date.now(),
-      }));
-      await finishJob(jobId, sample, token);
-      return finishResult(jobId);
-    }
-    const checker = pending.fpQueue[0];
-    const toCheck = pending.disputed.filter((d) => d.source !== checker).map((d) => d.finding);
-    if (!toCheck.length) {
-      patchJob(jobId, (j) =>
-        j.fpPending ? { ...j, fpPending: { ...j.fpPending, fpQueue: j.fpPending.fpQueue.slice(1) }, updatedAt: Date.now() } : j,
-      );
-      continue;
-    }
-    if (checker === "local") {
-      const hadLocal = (job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim());
-      if (!hadLocal || !localLlmReady(state.settings)) {
-        patchJob(jobId, (j) =>
-          j.fpPending
-            ? {
-                ...j,
-                fpPending: {
-                  ...j.fpPending,
-                  fpQueue: j.fpPending.fpQueue.slice(1),
-                  dropped: [...j.fpPending.dropped, "Skipped local (not configured or unavailable)"],
-                },
-                updatedAt: Date.now(),
-              }
-            : j,
-        );
-        continue;
-      }
-      const prompt = buildFpPrompt({ sample, findings: toCheck, peer: "parallel reviewers" });
-      const out = await runLocalLlm(prompt, state.settings);
-      let check = null;
-      if (out.ok) {
-        const gated = gatePeerSubmission(parseChatSubmission(out.raw), sample, state.settings);
-        if (gated.ok) check = gated.check;
-      }
-      const stepped = applyFpStep(pending, checker, check);
-      patchJob(jobId, (j) =>
-        j.fpPending
-          ? {
-              ...j,
-              fpPending: {
-                ...j.fpPending,
-                agreed: stepped.agreed,
-                disputed: stepped.disputed,
-                fpQueue: j.fpPending.fpQueue.slice(1),
-                dropped: [...j.fpPending.dropped, ...stepped.dropped],
-              },
-              findings: [...stepped.agreed, ...stepped.disputed.map((d) => d.finding)],
-              plan: `False-positive check: local done. Next: ${pending.fpQueue[1] ?? "post"}.`,
-              updatedAt: Date.now(),
-            }
-          : j,
-      );
-      continue;
-    }
-    const prompt = buildFpPrompt({ sample, findings: toCheck, peer: "parallel reviewers" });
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "awaiting_chat",
-      chatFpRound: true,
-      fpProviders: [checker],
-      chatPrompt: prompt,
-      chatPromptByProvider: { [checker]: prompt },
-      bridgeClaimedAt: undefined,
-      plan: `False-positive check via ${checker} (${toCheck.length} remaining). Order: ${pending.fpQueue.join(" → ")}.`,
-      githubError: undefined,
-      updatedAt: Date.now(),
-    }));
-    return { ok: true };
-  }
 }
 
 async function finishJob(jobId: string, sample: SamplePr | undefined, token?: string) {

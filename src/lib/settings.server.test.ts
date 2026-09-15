@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { botSettingsToEnv, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
+import { botSettingsToEnv, diskReviewerFlagsWin, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
 import { DEFAULT_SETTINGS, providersFromSettings } from "./types.ts";
 
 describe("sanitizeBotSettings", () => {
@@ -81,5 +81,14 @@ describe("sanitizeBotSettings", () => {
     const runtime = sanitizeBotSettings({ ...DEFAULT_SETTINGS, localLlmApiKey: "rotated-B" });
     const disk = persistableSettings(runtime, { ASHLAR_LOCAL_LLM_API_KEY: "rotated-B" }, { localLlmApiKey: "old-A" });
     assert.equal(disk.localLlmApiKey, "old-A");
+  });
+
+  it("keeps Settings reviewer toggles over env overlays", () => {
+    const merged = diskReviewerFlagsWin(
+      { reviewGrok: false, reviewChatgpt: true, reviewLocal: true },
+      { reviewGrok: true, reviewChatgpt: true, reviewLocal: true },
+    );
+    assert.equal(merged.reviewGrok, false);
+    assert.equal(merged.reviewChatgpt, true);
   });
 });

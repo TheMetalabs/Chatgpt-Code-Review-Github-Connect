@@ -420,7 +420,7 @@ export function gatePeerSubmission(
   return { ok: true, check: { keep, drop } };
 }
 
-export const SCHEMA_MERGE_NOTE = "Schema-merged reviewer JSON (LLM merge unavailable)";
+export const SCHEMA_MERGE_NOTE = "Schema-merged reviewer JSON";
 
 export function schemaMergeProviderGates(
   rows: ProviderGate[],

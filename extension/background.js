@@ -189,9 +189,9 @@ async function runProvider(provider, prompt, jobId, reasoning) {
   }
 }
 
-async function ping(jobId) {
+async function ping(jobId, generating) {
   try {
-    await api("/api/bridge", { action: "ping", jobId: jobId || undefined });
+    await api("/api/bridge", { action: "ping", jobId: jobId || undefined, generating: generating || undefined });
   } catch {
     /* keep trying */
   }
@@ -273,12 +273,15 @@ async function tickBody() {
       await api("/api/bridge", { action: "release", jobId: job.jobId });
       return;
     }
-    const keepAlive = setInterval(() => void ping(job.jobId), PING_MS);
+    const generating = {};
+    const keepAlive = setInterval(() => void ping(job.jobId, generating), PING_MS);
     const results = [];
     let quotaOnly = true;
     try {
       const settled = await Promise.allSettled(
         runnable.map(async (p) => {
+          generating[p] = true;
+          void ping(job.jobId, generating);
           try {
             const value = await runProvider(
               p,
@@ -286,6 +289,8 @@ async function tickBody() {
               job.jobId,
               (job.reasoning && job.reasoning[p]) || (p === "grok" ? "heavy" : "pro"),
             );
+            generating[p] = false;
+            void ping(job.jobId, generating);
             results.push(value);
             quotaOnly = false;
             try {
@@ -300,6 +305,8 @@ async function tickBody() {
             }
             return value;
           } catch (e) {
+            generating[p] = false;
+            void ping(job.jobId, generating);
             const code = e && typeof e === "object" && "code" in e ? e.code : "";
             if (code === "quota") await markQuota(p);
             else quotaOnly = false;

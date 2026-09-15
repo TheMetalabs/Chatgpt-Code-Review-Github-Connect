@@ -183,19 +183,15 @@ Settings에서 최대 3개를 켭니다. 하나만 끌 수는 없습니다.
 | --- | --- |
 | `review_chatgpt` | Chrome이 `chatgpt.com` 임시 채팅에 프롬프트만 넣고 Send |
 | `review_grok` | Chrome이 `grok.com` 새 채팅에 넣고 Send |
-| `review_local` | 로컬만 켜면 즉시. ChatGPT/Grok이 같이 켜져 있으면 Chrome이 안 올 때만 폴백 |
+| `review_local` | 켜면 ChatGPT/Grok과 **같이 경주**. ping 실패면 즉시 스킵 |
 
-ChatGPT + Grok은 **병렬**입니다. 로컬은 그 경주에 안 넣고, 브릿지가 없거나 쿼타/타임아웃이면 그때 돕니다. 두 모델 이상이 같은 파일·라인(또는 같은 제목)을 말하면 그대로 남깁니다. 한쪽만 말한 항목만 false-positive 파이프라인으로 갑니다.
+ChatGPT / Grok / Local은 Settings에서 켠 것만 병렬로 돕니다. 표현이 달라도 LLM으로 합치지 않습니다. 각 리뷰어 JSON을 **스키마로 합쳐** 인라인 코멘트를 답니다. 아직 답을 쓰는 리뷰어만 기다리고, 벽시계 타임아웃으로 자르지 않습니다.
 
 프롬프트는 **웹 검색 / DeepSearch / URL fetch / 툴 호출을 금지**합니다. 지시문은 짧게 두고, diff와 변경 파일 스냅샷은 `ashlar-diff.patch` / `ashlar-snapshot.md`로 붙입니다. 없는 맥락은 `assumptions`에만 적습니다.
 
-### FP 순서
+### 합산
 
-기본값: **Local LLM → ChatGPT → Grok**
-
-Settings에서 Up/Down으로 바꿉니다. 앞 단계가 keep하면 뒤는 그 항목을 다시 보지 않습니다. drop하면 버립니다. 아무 말도 없으면 다음 검사기가 봅니다. 끝까지 남은 한쪽 지적은 버리지 않고 PR에 올립니다.
-
-교차검증(서로가 서로를 전부 다시 보기)은 하지 않습니다. 토큰을 아끼려고 한 방향 순서입니다.
+LLM merge / false-positive 라운드는 없습니다. 끝난 리뷰어 JSON만 스키마로 합칩니다. 같은 파일·라인이면 하나로, 아니면 둘 다 올립니다.
 
 ### Local LLM
 

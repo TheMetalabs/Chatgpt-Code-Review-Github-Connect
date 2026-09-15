@@ -1,29 +1,46 @@
 import type { Job, ReviewProvider } from "./types.ts";
 import { isChatProvider } from "./types.ts";
 
-/** Wait this long for Chrome when the bridge is not connected / not claimed. */
-export const LOCAL_FALLBACK_MS = 90_000;
-/** If Chrome claimed the job but never completed, start local after this. */
-export const LOCAL_FALLBACK_CLAIMED_MS = 6 * 60_000;
-/** Max wait for an in-flight local LLM before posting Chrome-only. Local can queue. */
-export const LOCAL_HOLD_MS = 12 * 60_000;
-
-export function shouldStartLocalFallback(input: {
+export function shouldStartLocalRace(input: {
   providers: readonly ReviewProvider[];
   status: Job["status"];
-  connected: boolean;
-  claimed: boolean;
   localDone: boolean;
   localStarted: boolean;
-  waitedMs: number;
 }): boolean {
   if (input.localDone || input.localStarted) return false;
-  if (input.status !== "awaiting_chat") return false;
-  if (!input.providers.includes("local")) return false;
-  if (!input.providers.some(isChatProvider)) return false;
-  if (input.claimed) return input.waitedMs >= LOCAL_FALLBACK_CLAIMED_MS;
-  if (input.connected) return input.waitedMs >= LOCAL_FALLBACK_MS;
-  return input.waitedMs >= LOCAL_FALLBACK_MS;
+  if (input.status !== "awaiting_chat" && input.status !== "reviewer") return false;
+  return input.providers.includes("local");
+}
+
+export function skippedProvider(assumptions: readonly string[] | undefined, provider: ReviewProvider): boolean {
+  const rows = assumptions ?? [];
+  if (provider === "local") return rows.some((a) => /^Skipped local/i.test(a));
+  return rows.some((a) => new RegExp(`Skipped ${provider}`, "i").test(a));
+}
+
+/** Wait only while an enabled reviewer is still producing an answer. No wall clock. */
+export function stillRacing(input: {
+  providers: readonly ReviewProvider[];
+  payloads: readonly ReviewProvider[];
+  assumptions?: readonly string[];
+  localInFlight: boolean;
+  generating?: Partial<Record<ReviewProvider, boolean>>;
+  claimed: boolean;
+  connected: boolean;
+}): boolean {
+  for (const p of input.providers) {
+    if (input.payloads.includes(p)) continue;
+    if (skippedProvider(input.assumptions, p)) continue;
+    if (p === "local") {
+      if (input.localInFlight) return true;
+      continue;
+    }
+    const g = input.generating?.[p];
+    if (g === true) return true;
+    if (g === false) continue;
+    if (input.claimed || input.connected) return true;
+  }
+  return false;
 }
 
 export function shouldHoldForLocal(input: {
@@ -47,10 +64,18 @@ export function shouldHoldForChat(input: {
   connected: boolean;
   chatFpRound?: boolean;
   allChatAttempted?: boolean;
+  generating?: Partial<Record<ReviewProvider, boolean>>;
+  payloads?: readonly ReviewProvider[];
+  assumptions?: readonly string[];
 }): boolean {
   if (input.chatFpRound) return false;
-  if (!input.providers.some(isChatProvider)) return false;
-  if (input.haveChat || input.chatSkipped) return false;
-  if (input.allChatAttempted && !input.claimed) return false;
-  return input.claimed || input.connected;
+  return stillRacing({
+    providers: input.providers.filter(isChatProvider),
+    payloads: input.payloads ?? (input.haveChat ? input.providers.filter(isChatProvider) : []),
+    assumptions: input.assumptions ?? (input.chatSkipped ? input.providers.filter(isChatProvider).map((p) => `Skipped ${p}`) : []),
+    localInFlight: false,
+    generating: input.generating,
+    claimed: input.claimed,
+    connected: input.connected,
+  });
 }

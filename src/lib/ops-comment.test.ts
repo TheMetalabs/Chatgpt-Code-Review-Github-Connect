@@ -10,10 +10,20 @@ describe("buildOpsComment", () => {
       notes: ["Chrome bridge is not connected. ChatGPT/Grok start when the extension reconnects."],
     });
     assert.match(body, new RegExp(OPS_COMMENT_MARK));
-    assert.match(body, /chatgpt \+ grok in parallel/);
-    assert.match(body, /wait to merge/);
+    assert.match(body, /chatgpt \+ grok in parallel \(Chrome\)/);
+    assert.match(body, /local racing/);
     assert.match(body, /not connected/);
     assert.doesNotMatch(body, /127\.0\.0\.1|jwhy\.net|Qwen|sk-/);
+  });
+
+  it("does not mention Grok when the setting is off", () => {
+    const body = buildOpsComment({
+      phase: "running",
+      providers: ["chatgpt", "local"],
+      notes: ["Chrome bridge claimed this job. ChatGPT is running the review."],
+    });
+    assert.match(body, /chatgpt \(Chrome\)/);
+    assert.doesNotMatch(body, /grok/i);
   });
 
   it("only posts ops comments on @ashlar-bot mention or inline follow-up", () => {

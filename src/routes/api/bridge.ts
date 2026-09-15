@@ -65,6 +65,7 @@ export const Route = createFileRoute("/api/bridge")({
           jobId?: string;
           raw?: string;
           results?: { provider?: string; raw?: string }[];
+          generating?: Partial<Record<"chatgpt" | "grok" | "local", boolean>>;
         };
         if (body.action === "reveal") {
           if (!sameOrigin(request)) {
@@ -80,7 +81,18 @@ export const Route = createFileRoute("/api/bridge")({
           return Response.json({ ok: true, token: rotateBridgeToken().token, bridge: getBridgePublic() }, { headers });
         }
         if (body.action === "ping") {
-          if (body.jobId) refreshBridgeClaim(body.jobId);
+          if (body.jobId) {
+            const rawGen = body.generating;
+            const generating =
+              rawGen && typeof rawGen === "object" && !Array.isArray(rawGen)
+                ? Object.fromEntries(
+                    (["chatgpt", "grok", "local"] as const)
+                      .filter((p) => typeof rawGen[p] === "boolean")
+                      .map((p) => [p, rawGen[p]]),
+                  )
+                : undefined;
+            refreshBridgeClaim(body.jobId, generating);
+          }
           return Response.json({ ok: true, bridge: getBridgePublic() }, { headers });
         }
         if (body.action === "take") {

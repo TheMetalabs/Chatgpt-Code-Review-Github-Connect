@@ -1,6 +1,5 @@
 const POLL_MS = 2500;
 const PING_MS = 10_000;
-const BUSY_MS = 4 * 60_000;
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
 const SESSION = { busy: "busy", jobId: "jobId", busyAt: "busyAt", tabs: "tabs" };
 
@@ -85,9 +84,7 @@ function noReceiver(err) {
 async function sendToTab(tabId, msg, files) {
   const once = () =>
     new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("chat tab timed out")), 330_000);
       chrome.tabs.sendMessage(tabId, msg, (res) => {
-        clearTimeout(timer);
         if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
         else resolve(res);
       });
@@ -233,9 +230,8 @@ async function tickBody() {
   const cfg = await settings();
   if (!cfg.enabled || !cfg.origin || !cfg.token) return;
   const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId, SESSION.busyAt]);
-  const busyAge = session[SESSION.busyAt] ? Date.now() - Number(session[SESSION.busyAt]) : BUSY_MS;
   await ping(session[SESSION.jobId]);
-  if (session[SESSION.busy] && busyAge < BUSY_MS) return;
+  if (session[SESSION.busy]) return;
   const quota = await quotaMap();
   if (!providerOpen(quota, "chatgpt") && !providerOpen(quota, "grok")) {
     const until = Math.min(Number(quota.chatgpt || 0), Number(quota.grok || 0));

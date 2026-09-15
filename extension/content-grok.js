@@ -42,37 +42,31 @@ async function startFresh() {
   clickLabel(/temporary|private chat|incognito|ghost/i);
   await sleep(400);
   clickLabel(/new chat|new conversation/i);
-  return waitFor(composer, 45_000, "Grok composer not found");
+  return waitUntilComposer();
 }
 
-async function waitForReviewJson(ms) {
-  const first = harvestJson();
-  if (first) return first;
-  const deadline = Date.now() + ms;
+async function waitUntilReviewOrQuota() {
   let stable = "";
   let hits = 0;
-  while (Date.now() < deadline) {
-    await sleep(800);
+  for (;;) {
     const json = harvestJson();
-    if (!json) continue;
-    if (json === stable) hits += 1;
-    else {
-      stable = json;
-      hits = 1;
+    if (quotaHit() && !json) throw quotaError();
+    if (json) {
+      if (json === stable) hits += 1;
+      else {
+        stable = json;
+        hits = 1;
+      }
+      if (hits >= 2 && !stopButtonVisible()) return json;
     }
-    if (hits >= 2) return json;
+    await sleep(800);
   }
-  return harvestJson();
 }
 
 async function runPrompt(prompt, reasoning) {
   const existing = harvestJson();
   if (existing) return existing;
-  if (assistantCorpus().length) {
-    const json = await waitForReviewJson(300_000);
-    if (json) return json;
-    throw new Error("Grok did not return JSON in time");
-  }
+  if (assistantCorpus().length) return waitUntilReviewOrQuota();
   await dismissOverlays();
   const el = await startFresh();
   await dismissOverlays();
@@ -82,9 +76,7 @@ async function runPrompt(prompt, reasoning) {
   await fillComposer(el, prompt);
   await dismissOverlays();
   await clickSend(sendButton, composer);
-  const json = await waitForReviewJson(300_000);
-  if (json) return json;
-  throw new Error("Grok did not return JSON in time");
+  return waitUntilReviewOrQuota();
 }
 
 let running = false;

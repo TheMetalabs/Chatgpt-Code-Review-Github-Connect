@@ -50,4 +50,22 @@ describe("extractChatJson", () => {
     assert.equal(parsed.findings.length, 1);
     assert.equal(String(parsed.investigated_safe[0]).includes("cite"), false);
   });
+
+  it("extracts REQUEST_CHANGES from a live ChatGPT assistant dump", async () => {
+    const { readFile } = await import("node:fs/promises");
+    let html = "";
+    try {
+      html = await readFile("/workspace/attachments/pasted-text.txt", "utf8");
+    } catch {
+      return;
+    }
+    const i = html.indexOf('data-message-author-role="assistant"');
+    assert.ok(i > 0);
+    const slice = html.slice(i, html.indexOf("thread-bottom-container"));
+    const hit = extractChatJson(htmlChatToText(slice));
+    assert.ok(hit);
+    const parsed = JSON.parse(hit);
+    assert.equal(parsed.merge_recommendation, "REQUEST_CHANGES");
+    assert.ok(Array.isArray(parsed.findings) && parsed.findings.length >= 1);
+  });
 });

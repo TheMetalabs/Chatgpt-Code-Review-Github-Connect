@@ -37,7 +37,7 @@ function quotaError() {
 
 async function runPrompt(prompt, reasoning) {
   const existing = harvestJson({ allowThin: true });
-  if (existing && chatGenerationFinished()) return existing;
+  if (existing && chatGenerationFinished(true)) return existing;
   if (assistantCorpus().length && !composer()) return waitUntilReviewOrQuota("ChatGPT");
   await dismissOverlays();
   await waitUntilComposer();
@@ -56,13 +56,13 @@ async function runPrompt(prompt, reasoning) {
 let running = false;
 chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
   if (msg?.type === "ashlar-harvest") {
-    const raw = harvestJson({ allowThin: chatGenerationFinished() });
+    const raw = harvestJson({ allowThin: chatGenerationFinished(true) });
     sendResponse(raw ? { ok: true, raw } : { ok: false, error: "no json" });
     return true;
   }
   if (msg?.type !== "ashlar-run") return;
   if (running) {
-    const raw = harvestJson({ allowThin: chatGenerationFinished() });
+    const raw = harvestJson({ allowThin: chatGenerationFinished(true) });
     sendResponse(raw ? { ok: true, raw } : { ok: false, error: "already running" });
     return true;
   }

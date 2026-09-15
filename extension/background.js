@@ -130,23 +130,54 @@ async function markQuota(provider) {
 
 function contentFiles(provider) {
   return provider === "grok"
-    ? ["composer.js", "quota.js", "overlay.js", "model.js", "content-grok.js"]
-    : ["composer.js", "quota.js", "overlay.js", "model.js", "content-chatgpt.js"];
+    ? ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-grok.js"]
+    : ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-chatgpt.js"];
+}
+
+function providerUrls(provider) {
+  if (provider === "grok") return ["https://grok.com/*"];
+  return ["https://chatgpt.com/*", "https://chat.openai.com/*"];
+}
+
+async function harvestProvider(provider) {
+  const files = contentFiles(provider);
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: providerUrls(provider) });
+  } catch {
+    return null;
+  }
+  for (const tab of tabs) {
+    if (!tab.id) continue;
+    try {
+      const result = await sendToTab(tab.id, { type: "ashlar-harvest" }, files);
+      if (result?.ok && result.raw) return { provider, raw: result.raw, tabId: tab.id };
+    } catch {
+      /* tab not ready */
+    }
+  }
+  return null;
 }
 
 async function runProvider(provider, prompt, jobId, reasoning) {
+  const existing = await harvestProvider(provider);
+  if (existing) return { provider, raw: existing.raw };
   const tabId = await ensureTab(provider, reasoning);
   const files = contentFiles(provider);
   try {
     const result = await sendToTab(tabId, { type: "ashlar-run", prompt, jobId, reasoning }, files);
     if (!result?.ok) {
+      const again = await harvestProvider(provider);
+      if (again) return { provider, raw: again.raw };
       const err = new Error(`${provider}: ${result?.error || "chat tab returned nothing"}`);
       err.code = result?.code;
       throw err;
     }
     return { provider, raw: result.raw };
-  } finally {
-    await closeTab(tabId);
+  } catch (e) {
+    const again = await harvestProvider(provider);
+    if (again) return { provider, raw: again.raw };
+    throw e;
   }
 }
 
@@ -160,16 +191,19 @@ async function ping(jobId) {
 
 async function recoverDeadWorker() {
   const session = await chrome.storage.session.get([SESSION.busy, SESSION.jobId]);
-  const jobId = session[SESSION.jobId];
-  const wasBusy = Boolean(session[SESSION.busy]);
-  await chrome.storage.session.set({ [SESSION.busy]: false, [SESSION.jobId]: "", [SESSION.busyAt]: 0 });
-  if (wasBusy && jobId) {
-    try {
-      await api("/api/bridge", { action: "release", jobId });
-    } catch {
-      /* job may already be free */
-    }
+  await chrome.storage.session.set({ [SESSION.busy]: false, [SESSION.jobId]: session[SESSION.jobId] || "", [SESSION.busyAt]: 0 });
+}
+
+async function harvestAndComplete(jobId, providers) {
+  if (!jobId) return false;
+  const results = [];
+  for (const p of providers) {
+    const hit = await harvestProvider(p);
+    if (hit) results.push({ provider: hit.provider, raw: hit.raw });
   }
+  if (!results.length) return false;
+  await api("/api/bridge", { action: "complete", jobId, raw: results[0].raw, results });
+  return true;
 }
 
 let tickLock = false;
@@ -208,7 +242,17 @@ async function tickBody() {
     return;
   }
   const job = payload.job;
-  if (!job) return;
+  if (!job) {
+    const last = await chrome.storage.local.get(["lastJobId"]);
+    if (last.lastJobId) {
+      try {
+        await harvestAndComplete(String(last.lastJobId), ["chatgpt", "grok"]);
+      } catch {
+        /* still no json */
+      }
+    }
+    return;
+  }
   await chrome.storage.session.set({ [SESSION.busy]: true, [SESSION.jobId]: job.jobId, [SESSION.busyAt]: Date.now() });
   chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
   let claimed = true;

@@ -116,4 +116,29 @@ describe("shouldHoldForChat", () => {
       false,
     );
   });
+
+  it("does not keep waiting after ChatGPT already ran once (no re-prompt)", () => {
+    assert.equal(
+      shouldHoldForChat({
+        providers: ["chatgpt", "local"],
+        haveChat: false,
+        chatSkipped: false,
+        claimed: false,
+        connected: true,
+        allChatAttempted: true,
+      }),
+      false,
+    );
+    assert.equal(
+      shouldHoldForChat({
+        providers: ["chatgpt", "local"],
+        haveChat: false,
+        chatSkipped: false,
+        claimed: true,
+        connected: true,
+        allChatAttempted: true,
+      }),
+      true,
+    );
+  });
 });

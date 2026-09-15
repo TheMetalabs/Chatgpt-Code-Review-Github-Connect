@@ -35,27 +35,29 @@ function quotaError() {
   return e;
 }
 
-function lastAssistant() {
-  const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-  const last = nodes.at(-1);
-  return last ? last.innerText.trim() : "";
-}
-
-function extractJson(text) {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const body = fence ? fence[1] : text;
-  const start = body.indexOf("{");
-  const end = body.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
-  try {
-    JSON.parse(body.slice(start, end + 1));
-    return body.slice(start, end + 1);
-  } catch {
-    return null;
+async function waitForReviewJson(ms) {
+  const first = harvestJson();
+  if (first) return first;
+  const deadline = Date.now() + ms;
+  let stable = "";
+  let hits = 0;
+  while (Date.now() < deadline) {
+    await sleep(800);
+    const json = harvestJson();
+    if (!json) continue;
+    if (json === stable) hits += 1;
+    else {
+      stable = json;
+      hits = 1;
+    }
+    if (hits >= 1) return json;
   }
+  return harvestJson();
 }
 
 async function runPrompt(prompt, reasoning) {
+  const existing = harvestJson();
+  if (existing) return existing;
   await dismissOverlays();
   await waitFor(composer, 45_000, "ChatGPT composer not found");
   await dismissOverlays();
@@ -67,30 +69,22 @@ async function runPrompt(prompt, reasoning) {
   await fillComposer(el, prompt);
   await dismissOverlays();
   await clickSend(sendButton, composer);
-  const deadline = Date.now() + 300_000;
-  let stable = "";
-  let hits = 0;
-  while (Date.now() < deadline) {
-    await sleep(1200);
-    const text = lastAssistant();
-    if (!text) continue;
-    const json = extractJson(text);
-    if (!json || findingsJsonTooThin(json)) continue;
-    if (json === stable) hits += 1;
-    else {
-      stable = json;
-      hits = 1;
-    }
-    if (hits >= 2) return json;
-  }
+  const json = await waitForReviewJson(300_000);
+  if (json) return json;
   throw new Error("ChatGPT did not return JSON in time");
 }
 
 let running = false;
 chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
+  if (msg?.type === "ashlar-harvest") {
+    const raw = harvestJson();
+    sendResponse(raw ? { ok: true, raw } : { ok: false, error: "no json" });
+    return true;
+  }
   if (msg?.type !== "ashlar-run") return;
   if (running) {
-    sendResponse({ ok: false, error: "already running" });
+    const raw = harvestJson();
+    sendResponse(raw ? { ok: true, raw } : { ok: false, error: "already running" });
     return true;
   }
   running = true;

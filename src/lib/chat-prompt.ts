@@ -1,4 +1,5 @@
 import type { Finding, SamplePr, SnapshotFile } from "./types.ts";
+import { extractChatJson } from "./extract-chat-json.ts";
 
 export const CHAT_JSON_HINT = `{
   "merge_recommendation": "REQUEST_CHANGES" | "COMMENT" | "APPROVE",
@@ -135,23 +136,14 @@ export function buildMergePrompt(opts: {
 export function parseChatSubmission(raw: string): Record<string, unknown> | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
-  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const body = fence ? fence[1].trim() : trimmed;
+  const extracted = extractChatJson(trimmed);
+  const body = extracted || trimmed;
   try {
     const parsed = JSON.parse(body) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     return parsed as Record<string, unknown>;
   } catch {
-    const start = body.indexOf("{");
-    const end = body.lastIndexOf("}");
-    if (start < 0 || end <= start) return null;
-    try {
-      const parsed = JSON.parse(body.slice(start, end + 1)) as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-      return parsed as Record<string, unknown>;
-    } catch {
-      return null;
-    }
+    return null;
   }
 }
 

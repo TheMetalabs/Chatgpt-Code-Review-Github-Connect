@@ -108,7 +108,9 @@ export function nextBridgeJob(): {
     : job.reviewProviders?.length
       ? job.reviewProviders
       : providersFromSettings(harbor.settings);
-  const providers = rawProviders.filter(isChatProvider);
+  const done = new Set((job.storedLegs ?? []).filter((l) => l.raw.trim()).map((l) => l.provider));
+  const attempted = new Set(job.attemptedProviders ?? []);
+  const providers = rawProviders.filter(isChatProvider).filter((p) => !done.has(p) && !attempted.has(p));
   if (!providers.length) return null;
   const prompt = job.chatPrompt || prompts?.chatgpt || prompts?.grok || "";
   if (!prompt) return null;
@@ -134,6 +136,11 @@ export function takeNextBridgeJob(): ReturnType<typeof nextBridgeJob> {
   if (!peek) return null;
   const claimed = claimBridgeJob(peek.jobId);
   if (!claimed.ok) return null;
+  patchHarborJob(peek.jobId, (j) => ({
+    ...j,
+    attemptedProviders: [...new Set([...(j.attemptedProviders ?? []), ...peek.providers])],
+    updatedAt: Date.now(),
+  }));
   return peek;
 }
 

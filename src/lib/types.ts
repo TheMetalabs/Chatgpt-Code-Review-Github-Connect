@@ -115,6 +115,7 @@ export interface Job {
   storedLegs?: { provider: ReviewProvider; raw: string }[];
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;
+  attemptedProviders?: ReviewProvider[];
 }
 
 export interface PostedComment {

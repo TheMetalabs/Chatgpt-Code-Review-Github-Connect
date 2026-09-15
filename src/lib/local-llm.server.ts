@@ -1,22 +1,56 @@
 import OpenAI from "openai";
 import type { BotSettings } from "./types";
 
+function localClient(settings: BotSettings, timeout: number) {
+  const baseURL = settings.localLlmBaseUrl.trim().replace(/\/$/, "");
+  const model = settings.localLlmModel.trim();
+  if (!baseURL) return { ok: false as const, error: "local LLM endpoint is empty" };
+  if (!model) return { ok: false as const, error: "local LLM model is empty" };
+  return {
+    ok: true as const,
+    model,
+    client: new OpenAI({
+      apiKey: settings.localLlmApiKey.trim() || "local",
+      baseURL,
+      timeout,
+    }),
+  };
+}
+
+/** Cheap liveness check. Prefer /models; some servers only speak chat. */
+export async function pingLocalLlm(
+  settings: BotSettings,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const ready = localClient(settings, 5_000);
+  if (!ready.ok) return ready;
+  try {
+    await ready.client.models.list();
+    return { ok: true };
+  } catch {
+    try {
+      await ready.client.chat.completions.create({
+        model: ready.model,
+        messages: [{ role: "user", content: "ok" }],
+        max_tokens: 1,
+        temperature: 0,
+      });
+      return { ok: true };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: msg.slice(0, 240) };
+    }
+  }
+}
+
 export async function runLocalLlm(
   prompt: string,
   settings: BotSettings,
 ): Promise<{ ok: true; raw: string } | { ok: false; error: string }> {
-  const baseURL = settings.localLlmBaseUrl.trim().replace(/\/$/, "");
-  if (!baseURL) return { ok: false, error: "local LLM endpoint is empty" };
-  const model = settings.localLlmModel.trim();
-  if (!model) return { ok: false, error: "local LLM model is empty" };
-  const client = new OpenAI({
-    apiKey: settings.localLlmApiKey.trim() || "local",
-    baseURL,
-    timeout: 180_000,
-  });
+  const ready = localClient(settings, 600_000);
+  if (!ready.ok) return ready;
   try {
-    const res = await client.chat.completions.create({
-      model,
+    const res = await ready.client.chat.completions.create({
+      model: ready.model,
       messages: [
         { role: "system", content: "You are Ashlar. Return ONLY a JSON object. No markdown fences." },
         { role: "user", content: prompt },

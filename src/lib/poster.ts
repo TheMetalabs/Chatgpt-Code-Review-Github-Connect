@@ -182,6 +182,15 @@ export function gateLiveSubmission(
     parsed.push(f);
   });
   const findings = publishableFindings(parsed, settings, snapshot);
+  const rawEmpty = !Array.isArray(submitted.findings) || submitted.findings.length === 0;
+  if (rawEmpty && snapshot.changedPaths.length) {
+    const safe = Array.isArray(submitted.investigated_safe)
+      ? (submitted.investigated_safe as unknown[]).map((x) => String(x).trim()).filter(Boolean)
+      : [];
+    if (!safe.length) {
+      return { ok: false, reason: "empty findings without investigated_safe — Instant-tier skip, not a review" };
+    }
+  }
   for (const f of parsed) {
     if (!findings.includes(f)) dropped.push(`dropped ${f.file}:${f.line} (${f.title})`);
   }
@@ -401,6 +410,41 @@ export function gatePeerSubmission(
     drop.push({ file: file.slice(0, 200), line, title: title.slice(0, 160), reason: String(r.reason ?? "").slice(0, 400) });
   }
   return { ok: true, check: { keep, drop } };
+}
+
+export const SCHEMA_MERGE_NOTE = "Schema-merged reviewer JSON (LLM merge unavailable)";
+
+export function schemaMergeProviderGates(
+  rows: ProviderGate[],
+  settings: BotSettings,
+): LiveGateResult {
+  if (!rows.length) {
+    return {
+      ok: true,
+      findings: [],
+      mergeRecommendation: "COMMENT",
+      highestRisk: "",
+      investigatedSafe: [],
+      assumptions: [SCHEMA_MERGE_NOTE],
+      dropped: ["no reviewer results"],
+    };
+  }
+  if (rows.length === 1) {
+    const g = rows[0].gate;
+    return { ...g, assumptions: [...g.assumptions, SCHEMA_MERGE_NOTE].slice(0, 12) };
+  }
+  const part = partitionMany(rows);
+  const unique = Object.values(part.unique).flat();
+  return finalizeFp(
+    {
+      agreed: [...part.agreed, ...unique],
+      disputed: [],
+      investigatedSafe: [...new Set(rows.flatMap((r) => r.gate.investigatedSafe))].slice(0, 8),
+      assumptions: [SCHEMA_MERGE_NOTE, ...rows.flatMap((r) => r.gate.assumptions)].filter(Boolean).slice(0, 12),
+      dropped: rows.flatMap((r) => r.gate.dropped).slice(0, 8),
+    },
+    settings,
+  );
 }
 
 export function consensusFromGates(gates: LiveGateResult[], settings: BotSettings): LiveGateResult {

@@ -134,6 +134,8 @@ Ashlar → Settings → **GitHub App** → **Save GitHub credentials**
 
 저장하면 시크릿은 이 머신 `.data/ashlar-secrets.json` (권한 0600)에만 남고, 화면은 마스크됩니다. GET API로 키가 다시 내려오지 않습니다. 칸을 비워 두면 환경 변수 폴백입니다.
 
+리뷰어 토글·로컬 LLM URL/모델/키는 **Save settings** 후 `.data/ashlar-settings.json` 에 남습니다. 재시작해도 유지됩니다. **Reset demo tape** 는 Inbox 잡만 지우고 이 설정은 건드리지 않습니다.
+
 터널 호스트와 자격은 **`.env`에만** 둡니다. `.env`는 gitignore입니다. `.env.example`을 복사하세요.
 
 ```bash

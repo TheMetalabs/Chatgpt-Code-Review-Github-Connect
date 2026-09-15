@@ -28,8 +28,8 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import { loadBotSettings, saveBotSettings } from "./settings.server";
 import {
-  DEFAULT_SETTINGS,
   LIVE_INFLIGHT_STATUSES,
   isChatProvider,
   normalizeReviewOrder,
@@ -59,7 +59,7 @@ export type HarborFireResult = { httpStatus: 202 | 403; skip?: string; reject?: 
 
 const CAP = 80;
 let state: HarborState = {
-  settings: { ...DEFAULT_SETTINGS },
+  settings: loadBotSettings(),
   jobs: [],
   events: [],
   reviews: [],
@@ -96,12 +96,13 @@ export function githubStatus() {
 export function patchHarborSettings(patch: Partial<BotSettings>) {
   const next = { ...state.settings, ...patch };
   if (!providersFromSettings(next).length) return state.settings;
-  state = { ...state, settings: next };
+  const saved = saveBotSettings(next);
+  state = { ...state, settings: saved };
   return state.settings;
 }
 
 export function resetHarbor() {
-  state = { settings: { ...DEFAULT_SETTINGS }, jobs: [], events: [], reviews: [] };
+  state = { settings: state.settings, jobs: [], events: [], reviews: [] };
 }
 
 export function cancelHarborJob(jobId: string) {

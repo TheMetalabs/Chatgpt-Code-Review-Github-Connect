@@ -172,7 +172,8 @@ function Settings() {
         </div>
         <p className="-mt-2 text-[12px] text-fg-subtle">
           Up to three reviewers run the same snapshot in parallel. False-positive checks then run in the order
-          below (default Local LLM → ChatGPT → Grok), not all-to-all.
+          below (default Local LLM → ChatGPT → Grok), not all-to-all. Save settings writes this machine's
+          gitignored <code>.data/ashlar-settings.json</code> so a restart does not drop Local LLM.
         </p>
         <Field label="false_positive_check_order">
           <ol className="mt-2 space-y-2">
@@ -339,9 +340,6 @@ local_llm:
         className="mt-6"
         onClick={() => {
           resetDemo();
-          setTouched(false);
-          setDraft(hydrateDraft(DEFAULT_SETTINGS));
-          setMentionText(DEFAULT_SETTINGS.mention.join(", "));
           setNotice(null);
         }}
       >

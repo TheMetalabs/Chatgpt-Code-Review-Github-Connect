@@ -1,4 +1,7 @@
 const POLL_MS = 2500;
+const HEARTBEAT_MS = 10_000;
+const HEALTH_KEY = "bridgeHealth";
+const WORKER_STATUS_KEY = "bridgeWorkerStatus";
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
 const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
@@ -55,8 +58,8 @@ async function settings() {
   };
 }
 
-async function api(path, body) {
-  const { origin, token } = await settings();
+async function api(path, body, config) {
+  const { origin, token } = config || await settings();
   if (!origin || !token) throw new Error("set origin and token in the popup");
   const res = await fetch(`${origin}${path}`, {
     method: body ? "POST" : "GET",
@@ -72,9 +75,69 @@ async function api(path, body) {
   if (!res.ok || json.ok !== true) {
     const err = new Error(json.error || `http ${res.status}`);
     err.status = res.status;
+    err.code = json.code;
     throw err;
   }
   return json;
+}
+
+/** Transport liveness is independent of job recovery and never mutates a job/lease.
+ * A 200 ping is NOT evidence that a new job has been claimed.
+ */
+let healthFlight;
+function probeBridge() {
+  if (healthFlight) return healthFlight;
+  healthFlight = (async () => {
+    const cfg = await settings();
+    if (!cfg.enabled || !cfg.origin || !cfg.token) return false;
+    const checkedAt = Date.now();
+    const extensionVersion = chrome.runtime.getManifest?.().version || "unknown";
+    try {
+      const result = await api("/api/bridge", {action: "ping", extensionVersion}, cfg);
+      const bridge = result.bridge || {};
+      // Persist an allowlist, not the whole response (which can contain private prompts).
+      await chrome.storage.local.set({[HEALTH_KEY]: {
+        origin: cfg.origin, checkedAt, ok: true, extensionVersion,
+        serverInstanceId: typeof bridge.serverInstanceId === "string" ? bridge.serverInstanceId.slice(0, 80) : undefined,
+        protocolVersion: Number.isInteger(bridge.protocolVersion) ? bridge.protocolVersion : undefined,
+        pendingJobs: Number.isInteger(bridge.pendingJobs) && bridge.pendingJobs >= 0 ? bridge.pendingJobs : undefined,
+        lastTakeAt: Number.isFinite(bridge.lastTakeAt) ? bridge.lastTakeAt : undefined,
+      }});
+      return true;
+    } catch (e) {
+      await chrome.storage.local.set({[HEALTH_KEY]: {
+        origin: cfg.origin, checkedAt, ok: false, extensionVersion,
+        httpStatus: e.status, error: String(e.message || e).slice(0, 240),
+      }});
+      return false;
+    }
+  })().catch(() => false).finally(() => { healthFlight = undefined; });
+  return healthFlight;
+}
+
+// Preserve sequential scheduling for a healthy generation. Recovery, terminal
+// cleanup and saved outboxes are separate work; none owns the admission lane.
+function activelyReviewing(job) {
+  if (job.serverStatus || job.recoveryError) return false;
+  return job.providers.some(p => {
+    const state = job.states[p];
+    return !state.delivered && !state.outcome && !state.connectionError;
+  });
+}
+
+async function recordWorkerStatus(jobs, origin, phase) {
+  const relevant = Object.values(jobs).filter(job => job.origin === origin);
+  await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
+    origin, checkedAt: Date.now(), phase,
+    activeJobs: relevant.filter(activelyReviewing).length,
+    recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
+    pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
+    savedReplies: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].outcome?.ok && !job.states[p].delivered).length, 0),
+    // Identifiers/status only: never response text, prompts or credentials.
+    recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
+      jobId: job.jobId, status: job.serverStatus || (job.recoveryError ? "connection_error" : "reconnecting_or_cleanup"),
+    })),
+  }});
 }
 
 function providerUrl(provider, reasoning) {
@@ -226,7 +289,17 @@ async function tabCapacityAvailable(jobs) {
   // Include cleanup-pending tabs and other configured origins, not only running legs.
   const ids = new Set(Object.values(jobs).flatMap(job => Object.values(job.states)
     .filter(state => state.tabId && !state.cleanupDone).map(state => state.tabId)));
-  return ids.size < limit;
+  // Closed/absent IDs retained for recovery are not physical tabs. Query failure
+  // propagates: an unknown inventory must not authorize unlimited tab creation.
+  const tabs = await chrome.tabs.query({});
+  const open = new Set(tabs.map(tab => tab.id));
+  const knownOpen = [...ids].filter(id => open.has(id)).length;
+  // Browser restart can change tab IDs. If old bindings are unresolved, reserve
+  // capacity for possible restored provider pages without adopting or closing them.
+  const unresolved = Object.values(jobs).flatMap(job => Object.values(job.states))
+    .filter(state => !state.cleanupDone && (state.tabId ? !open.has(state.tabId) : state.started)).length;
+  const possibleRestored = tabs.filter(tab => !ids.has(tab.id) && (allowedTab(tab, "chatgpt") || allowedTab(tab, "grok"))).length;
+  return knownOpen + Math.min(unresolved, possibleRestored) < limit;
 }
 
 async function finishTabCleanup(job, provider, jobs, reason) {
@@ -323,6 +396,8 @@ async function heartbeat(job, jobs) {
     result = await api("/api/bridge", {...body, leaseId: job.leaseId});
     if (result.accepted === false) throw new Error("bridge lease could not be renewed");
   }
+  delete job.recoveryError;
+  await saveJobs(jobs);
   return true;
 }
 
@@ -333,7 +408,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   if (!state.tabId && (state.started || job.resumeProviders?.includes(provider))) {
     const original = await findOriginalTab(job, provider);
     if (original) { state.tabId = original.id; state.started = true; await saveJobs(jobs); }
-    else { state.connectionError = "original review tab unavailable; waiting for reconnection"; return; }
+    else { state.connectionError = "original review tab unavailable; waiting for reconnection"; await saveJobs(jobs); return; }
   }
   if (!state.tabId) {
     if (observeOnly || !await tabCapacityAvailable(jobs)) return;
@@ -382,8 +457,10 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       }
     }
   } catch (e) {
-    // A messaging outage is not a model failure. Check tab existence on the next tick.
-    await chrome.storage.local.set({ lastError: String(e.message || e).slice(0, 240) });
+    // A messaging outage is not a model failure or a global admission lock.
+    state.connectionError = String(e.message || e).slice(0, 240);
+    await saveJobs(jobs);
+    await chrome.storage.local.set({ lastError: state.connectionError });
     return;
   }
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
@@ -447,7 +524,9 @@ async function advanceJob(job, jobs) {
     await retireCleanJob(job, jobs);
     return;
   }
-  if (!active && !["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus)) return;
+  const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
+  // A missing server job is not permission to delete the tab or generate again.
+  // Observe the original tab and retain its final reply locally while recovering.
   if (active && !job.prompt) {
     const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}`);
     Object.assign(job, {prompt: current.prompt, prompts: current.prompts});
@@ -456,7 +535,7 @@ async function advanceJob(job, jobs) {
   for (const provider of job.providers) {
     try {
       await pollProvider(job, provider, jobs, !active);
-      await deliverOutcome(job, provider, jobs);
+      if (canDeliver) await deliverOutcome(job, provider, jobs);
       await cleanupProvider(job, provider, jobs);
     } catch (e) {
       // A failing provider must not prevent the others from being collected/closed.
@@ -483,20 +562,53 @@ async function tick() {
 async function tickBody() {
   const cfg = await settings();
   if (!cfg.enabled || !cfg.origin || !cfg.token) return;
+  // Start health checking independently; already-acknowledged cleanup must also
+  // work offline, so only new admission is gated by the probe result.
+  const connection = probeBridge();
   const jobs = await pendingJobs(cfg.origin);
   const recovering = Object.values(jobs).filter(j => j.origin === cfg.origin);
-  if (recovering.length) {
-    for (const job of recovering) {
-      try { await advanceJob(job, jobs); }
-      catch (e) { await chrome.storage.local.set({lastError: String(e.message || e).slice(0, 240)}); }
+  for (const job of recovering) {
+    try { await advanceJob(job, jobs); }
+    catch (e) {
+      job.recoveryError = String(e.message || e).slice(0, 240);
+      await saveJobs(jobs);
+      await chrome.storage.local.set({lastError: job.recoveryError});
     }
-    return; // Never let a newly queued B overwrite recovery of A.
   }
-  await api("/api/bridge", { action: "ping" });
+  const current = Object.values(jobs).filter(j => j.origin === cfg.origin);
+  if (!await connection) {
+    await recordWorkerStatus(jobs, cfg.origin, "disconnected");
+    return;
+  }
+  if (current.some(activelyReviewing)) {
+    await recordWorkerStatus(jobs, cfg.origin, "reviewing");
+    return;
+  }
+  // Recovery ran first; completion can yield until the next tick as before.
+  if (recovering.length && !current.length) {
+    await recordWorkerStatus(jobs, cfg.origin, "idle");
+    return;
+  }
+  if (!await tabCapacityAvailable(jobs)) {
+    await recordWorkerStatus(jobs, cfg.origin, "tab_capacity");
+    return;
+  }
   const quota = await quotaMap();
-  if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) return;
-  const payload = await api("/api/bridge", { action: "take", clientId: await clientId() });
-  if (!payload.job) return;
+  if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) {
+    await recordWorkerStatus(jobs, cfg.origin, "provider_quota");
+    return;
+  }
+  // Keep all old jobs/outboxes. Do not re-take them or overwrite their identities.
+  const payload = await api("/api/bridge", {action: "take", clientId: await clientId(), excludeJobIds: Object.keys(jobs)});
+  if (!payload.job) {
+    await recordWorkerStatus(jobs, cfg.origin, current.length ? "recovering" : "idle");
+    return;
+  }
+  if (jobs[payload.job.jobId]) {
+    // Defensive compatibility with a server that ignores excludeJobIds.
+    await recordWorkerStatus(jobs, cfg.origin, "recovering");
+    return;
+  }
   const job = { ...payload.job, origin: cfg.origin, states: {} };
   job.providers = (job.providers?.length ? job.providers : [job.provider])
     .filter(p => ["chatgpt", "grok"].includes(p));
@@ -505,18 +617,29 @@ async function tickBody() {
   await saveJobs(jobs);
   await chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
   await advanceJob(job, jobs);
+  const remaining = Object.values(jobs).filter(j => j.origin === cfg.origin);
+  await recordWorkerStatus(jobs, cfg.origin, remaining.some(activelyReviewing) ? "reviewing" : remaining.length ? "recovering" : "idle");
 }
 
 function loop() {
   chrome.alarms.create("ashlar-poll", { periodInMinutes: 1 });
+  void probeBridge();
   void tick();
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ashlar-poll") void tick();
+  if (alarm.name === "ashlar-poll") { void probeBridge(); void tick(); }
+});
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== "ashlar-poll-now") return;
+  void probeBridge();
+  void tick();
+  sendResponse({ok: true, scheduled: true});
 });
 chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
 chrome.runtime.onInstalled.addListener(loop);
 chrome.runtime.onStartup.addListener(loop);
 loop();
 setInterval(() => void tick(), POLL_MS);
+
+setInterval(() => void probeBridge(), HEARTBEAT_MS);

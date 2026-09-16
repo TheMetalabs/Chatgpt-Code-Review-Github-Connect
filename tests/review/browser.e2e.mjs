@@ -1,6 +1,7 @@
 import {test,before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import {source,json} from './load-source.mjs';
+import {background,storage} from './helpers.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;
 before(async()=>{browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});});
@@ -95,4 +96,49 @@ test('real DOM: simultaneous final responses are extracted without touching the 
  await Promise.all(pages.map(page=>page.clock.runFor(3200)));
  assert.deepEqual(await Promise.all(pages.map(page=>page.evaluate(()=>waitResult.raw))),[rawA,rawB]);
  assert.deepEqual(await Promise.all(pages.map(page=>page.evaluate(()=>clipboardReads))),[0,0]);
+});
+
+test('real DOM recovery: missing job resumes its bound observer without a new prompt',async t=>{
+ const page=await fixture(t,user+answer(json,true));
+ await page.addScriptTag({content:source('extension/content-chatgpt.js')});
+ await page.evaluate(()=>{
+  Object.assign(__ashlarRunnerState,{jobId:'A',runId:'run-A',running:false,result:null});
+  window.freshSends=0;
+  fillComposer=()=>{window.freshSends++;throw Error('observer must not submit a prompt');};
+ });
+ const job={jobId:'A',provider:'chatgpt',providers:['chatgpt'],origin:'http://bridge',prompt:'original prompt',leaseId:'lease-A',
+  states:{chatgpt:{tabId:10,started:true,runId:'run-A'}}};
+ const b=background({local:storage({origin:'http://bridge',token:'fixture-token',pendingReviewJobs:{A:job}}),
+  tabs:new Map([[10,{id:10,url:'https://chatgpt.com/c/A',status:'complete'}]]),
+  api:async(_path,body)=>body?.jobId?{ok:true,active:false,accepted:false,status:'missing'}:{ok:true,job:null}});
+ b.chrome.tabs.sendMessage=(id,msg,callback)=>{
+  b.messages.push({id,...msg});
+  page.evaluate(msg=>new Promise(resolve=>handler(msg,null,resolve)),msg).then(callback,error=>{
+   b.chrome.runtime.lastError={message:error.message};callback();b.chrome.runtime.lastError=null;
+  });
+ };
+ await b.tick();await page.clock.runFor(2400);await b.tick();
+ assert.equal(b.local.state.pendingReviewJobs.A.states.chatgpt.outcome?.raw,json);
+ assert.equal(await page.evaluate(()=>freshSends),0);
+ assert.equal(b.messages.filter(m=>m.type==='ashlar-run').length,1);
+ assert.ok(b.messages.filter(m=>m.type==='ashlar-run').every(m=>m.resume===true&&!m.prompt&&!m.adoptLegacy));
+ assert.equal(b.calls.some(c=>c.action==='complete'||c.action==='failure'),false);
+ assert.equal(b.closedTabs.length,0);
+});
+
+test('real popup: a running review and tab-capacity blocker are shown together',async t=>{
+ const page=await browser.newPage();t.after(()=>page.close());
+ await page.setContent(source('extension/popup.html').replace('<script src="popup.js"></script>',''));
+ await page.evaluate(()=>{
+  window.popupState={origin:'http://bridge',enabled:true,bridgeWorkerStatus:{origin:'http://bridge',phase:'reviewing',
+   admissionPhase:'tab_capacity',activeJobs:1,recoveringJobs:0,pendingCleanup:0,savedReplies:0,checkedAt:1,admissionCheckedAt:1}};
+  window.chrome={runtime:{getManifest:()=>({version:'1.1.17'})},storage:{local:{get:async()=>popupState},onChanged:{addListener(){}}}};
+ });
+ await page.addScriptTag({content:source('extension/popup.js')});
+ await page.evaluate(()=>refreshDiagnostics());
+ assert.match(await page.locator('#worker').textContent(),/Current review in progress/);
+ assert.match(await page.locator('#worker').textContent(),/New requests: New tabs paused: review-tab capacity reached/);
+ await page.evaluate(()=>{popupState.bridgeWorkerStatus.admissionPhase='idle';return refreshDiagnostics();});
+ assert.match(await page.locator('#worker').textContent(),/Current review in progress/);
+ assert.doesNotMatch(await page.locator('#worker').textContent(),/capacity reached/);
 });

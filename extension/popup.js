@@ -31,8 +31,20 @@ async function refreshDiagnostics() {
     idle: "No new job assigned", tab_capacity: "New tabs paused: review-tab capacity reached",
     provider_quota: "New work paused: provider quota",
   };
+  const admissionPhases = {
+    not_checked: "Not checked by this worker yet", polling: "Checking for a new request",
+    admitted: "New review assigned", idle: "No new job assigned at the last poll",
+    tab_capacity: "New tabs paused: review-tab capacity reached",
+    provider_quota: "New work paused: provider quota",
+    disconnected: "Server unavailable; preserving pending work",
+    duplicate_job: "Server repeated an existing job; original work preserved",
+  };
+  const admission = work.admissionPhase
+    ? `\nNew requests: ${admissionPhases[work.admissionPhase] || work.admissionPhase}` +
+      (work.admissionCheckedAt ? ` (checked ${new Date(work.admissionCheckedAt).toLocaleTimeString()})` : "")
+    : ""; // Keep reports from older workers readable during an upgrade.
   const recovery = (work.recovery || []).map(j => `${j.jobId}: ${j.status}`).join("\n");
-  workerEl.textContent = `${phases[work.phase] || work.phase}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}` +
+  workerEl.textContent = `${phases[work.phase] || work.phase}${admission}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}` +
     (recovery ? `\n${recovery}` : "") + (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
 }
 

@@ -1,3 +1,4 @@
+import type { ProviderProgress } from "./review-progress.ts";
 import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
 
 /** null means the head repository provenance is not established. */
@@ -107,6 +108,7 @@ export interface Job {
   /** Ownership lease only, never a deadline for queueing or generation. */
   bridgeLeaseId?: string;
   bridgeClientId?: string;
+  providerProgress?: Partial<Record<ReviewProvider, ProviderProgress>>;
   providerErrors?: Partial<Record<ReviewProvider, ProviderError>>;
   reviewProviders?: ReviewProvider[];
   fpProviders?: ReviewProvider[];
@@ -120,7 +122,7 @@ export interface Job {
     skipped: string[];
     dropped: string[];
   };
-  storedLegs?: { provider: ReviewProvider; raw: string }[];
+  storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string }[];
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;
   attemptedProviders?: ReviewProvider[];

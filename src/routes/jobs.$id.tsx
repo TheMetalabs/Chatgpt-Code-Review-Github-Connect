@@ -24,19 +24,17 @@ function JobPage() {
   const settings = useAshlar((s) => s.settings);
   const fire = useAshlar((s) => s.fire);
   const cancel = useAshlar((s) => s.cancel);
-  const resetDemo = useAshlar((s) => s.resetDemo);
+  const sync = useAshlar(s => s.sync);
 
   if (!job) {
     return (
       <div className="mx-auto max-w-lg px-6 py-16 text-center text-fg-muted">
-        <p>This id is not in the current demo tape. Fired jobs live in this tab until Reset.</p>
+        <p>{sync.status === "loading" ? "Loading this job…" : "This job is not in the current server snapshot. Its persisted timeline may still be available in Job History."}</p>
         <div className="mt-4 flex justify-center gap-2">
           <Button asChild variant="secondary">
             <Link to="/">Back to Operations</Link>
           </Button>
-          <Button variant="ghost" onClick={resetDemo}>
-            Reset demo tape
-          </Button>
+          <a className="rounded border border-line px-3 py-2 text-accent" href={`/history?jobId=${encodeURIComponent(id)}`}>Open persisted Job History</a>
         </div>
       </div>
     );
@@ -85,6 +83,8 @@ function JobPage() {
           ) : null}
         </div>
       </div>
+
+      <a className="mt-4 inline-block text-sm text-accent underline" href={`/history?jobId=${encodeURIComponent(job.id)}`}>History, step logs and original responses</a>
 
       {job.status === "cancelled" ? (
         <p className="mt-4 rounded-xl border border-warn/30 bg-bg-elevated px-4 py-3 text-sm text-warn">

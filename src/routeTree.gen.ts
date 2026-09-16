@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as InboxRouteImport } from './routes/inbox'
+import { Route as HistoryRouteImport } from './routes/history'
 import { Route as PlaygroundRouteImport } from './routes/playground'
 import { Route as PoliciesRouteImport } from './routes/policies'
 import { Route as ReviewsRouteImport } from './routes/reviews'
@@ -18,6 +19,7 @@ import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as ApiBridgeRouteImport } from './routes/api/bridge'
 import { Route as ApiBridgePackRouteImport } from './routes/api/bridge-pack'
 import { Route as ApiHarborRouteImport } from './routes/api/harbor'
+import { Route as ApiHistoryRouteImport } from './routes/api/history'
 import { Route as ApiWebhookRouteImport } from './routes/api/webhook'
 import { Route as JobsIdRouteImport } from './routes/jobs.$id'
 
@@ -29,6 +31,11 @@ const IndexRoute = IndexRouteImport.update({
 const InboxRoute = InboxRouteImport.update({
   id: '/inbox',
   path: '/inbox',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const HistoryRoute = HistoryRouteImport.update({
+  id: '/history',
+  path: '/history',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PlaygroundRoute = PlaygroundRouteImport.update({
@@ -66,6 +73,11 @@ const ApiHarborRoute = ApiHarborRouteImport.update({
   path: '/api/harbor',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiHistoryRoute = ApiHistoryRouteImport.update({
+  id: '/api/history',
+  path: '/api/history',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiWebhookRoute = ApiWebhookRouteImport.update({
   id: '/api/webhook',
   path: '/api/webhook',
@@ -80,6 +92,7 @@ const JobsIdRoute = JobsIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/inbox': typeof InboxRoute
+  '/history': typeof HistoryRoute
   '/playground': typeof PlaygroundRoute
   '/policies': typeof PoliciesRoute
   '/reviews': typeof ReviewsRoute
@@ -87,12 +100,14 @@ export interface FileRoutesByFullPath {
   '/api/bridge': typeof ApiBridgeRoute
   '/api/bridge-pack': typeof ApiBridgePackRoute
   '/api/harbor': typeof ApiHarborRoute
+  '/api/history': typeof ApiHistoryRoute
   '/api/webhook': typeof ApiWebhookRoute
   '/jobs/$id': typeof JobsIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/inbox': typeof InboxRoute
+  '/history': typeof HistoryRoute
   '/playground': typeof PlaygroundRoute
   '/policies': typeof PoliciesRoute
   '/reviews': typeof ReviewsRoute
@@ -100,6 +115,7 @@ export interface FileRoutesByTo {
   '/api/bridge': typeof ApiBridgeRoute
   '/api/bridge-pack': typeof ApiBridgePackRoute
   '/api/harbor': typeof ApiHarborRoute
+  '/api/history': typeof ApiHistoryRoute
   '/api/webhook': typeof ApiWebhookRoute
   '/jobs/$id': typeof JobsIdRoute
 }
@@ -107,6 +123,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/inbox': typeof InboxRoute
+  '/history': typeof HistoryRoute
   '/playground': typeof PlaygroundRoute
   '/policies': typeof PoliciesRoute
   '/reviews': typeof ReviewsRoute
@@ -114,6 +131,7 @@ export interface FileRoutesById {
   '/api/bridge': typeof ApiBridgeRoute
   '/api/bridge-pack': typeof ApiBridgePackRoute
   '/api/harbor': typeof ApiHarborRoute
+  '/api/history': typeof ApiHistoryRoute
   '/api/webhook': typeof ApiWebhookRoute
   '/jobs/$id': typeof JobsIdRoute
 }
@@ -122,6 +140,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/inbox'
+    | '/history'
     | '/playground'
     | '/policies'
     | '/reviews'
@@ -129,12 +148,14 @@ export interface FileRouteTypes {
     | '/api/bridge'
     | '/api/bridge-pack'
     | '/api/harbor'
+    | '/api/history'
     | '/api/webhook'
     | '/jobs/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/inbox'
+    | '/history'
     | '/playground'
     | '/policies'
     | '/reviews'
@@ -142,12 +163,14 @@ export interface FileRouteTypes {
     | '/api/bridge'
     | '/api/bridge-pack'
     | '/api/harbor'
+    | '/api/history'
     | '/api/webhook'
     | '/jobs/$id'
   id:
     | '__root__'
     | '/'
     | '/inbox'
+    | '/history'
     | '/playground'
     | '/policies'
     | '/reviews'
@@ -155,6 +178,7 @@ export interface FileRouteTypes {
     | '/api/bridge'
     | '/api/bridge-pack'
     | '/api/harbor'
+    | '/api/history'
     | '/api/webhook'
     | '/jobs/$id'
   fileRoutesById: FileRoutesById
@@ -162,6 +186,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   InboxRoute: typeof InboxRoute
+  HistoryRoute: typeof HistoryRoute
   PlaygroundRoute: typeof PlaygroundRoute
   PoliciesRoute: typeof PoliciesRoute
   ReviewsRoute: typeof ReviewsRoute
@@ -169,6 +194,7 @@ export interface RootRouteChildren {
   ApiBridgeRoute: typeof ApiBridgeRoute
   ApiBridgePackRoute: typeof ApiBridgePackRoute
   ApiHarborRoute: typeof ApiHarborRoute
+  ApiHistoryRoute: typeof ApiHistoryRoute
   ApiWebhookRoute: typeof ApiWebhookRoute
   JobsIdRoute: typeof JobsIdRoute
 }
@@ -187,6 +213,13 @@ declare module '@tanstack/react-router' {
       path: '/inbox'
       fullPath: '/inbox'
       preLoaderRoute: typeof InboxRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/history': {
+      id: '/history'
+      path: '/history'
+      fullPath: '/history'
+      preLoaderRoute: typeof HistoryRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/playground': {
@@ -238,6 +271,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiHarborRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/history': {
+      id: '/api/history'
+      path: '/api/history'
+      fullPath: '/api/history'
+      preLoaderRoute: typeof ApiHistoryRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/webhook': {
       id: '/api/webhook'
       path: '/api/webhook'
@@ -258,6 +298,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   InboxRoute: InboxRoute,
+  HistoryRoute: HistoryRoute,
   PlaygroundRoute: PlaygroundRoute,
   PoliciesRoute: PoliciesRoute,
   ReviewsRoute: ReviewsRoute,
@@ -265,6 +306,7 @@ const rootRouteChildren: RootRouteChildren = {
   ApiBridgeRoute: ApiBridgeRoute,
   ApiBridgePackRoute: ApiBridgePackRoute,
   ApiHarborRoute: ApiHarborRoute,
+  ApiHistoryRoute: ApiHistoryRoute,
   ApiWebhookRoute: ApiWebhookRoute,
   JobsIdRoute: JobsIdRoute,
 }

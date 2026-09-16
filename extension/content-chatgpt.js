@@ -14,19 +14,7 @@ function composer() {
 }
 
 function sendButton() {
-  const selectors = [
-    "#composer-submit-button",
-    '[data-testid="send-button"]',
-    'button[data-testid="send-button"]',
-    'button[aria-label="Send prompt"]',
-    'button[aria-label="Send message"]',
-    'button[aria-label*="Send"]',
-  ];
-  for (const sel of selectors) {
-    const el = document.querySelector(sel);
-    if (el) return el;
-  }
-  return null;
+  return findEligibleSendButton(["#composer-submit-button", '[data-testid="send-button"]', 'button[aria-label*="Send"]', 'button[aria-label*="보내"]', 'button[aria-label*="전송"]', 'button[type="submit"]']);
 }
 
 function quotaError() {
@@ -37,7 +25,11 @@ function quotaError() {
 
 async function runPrompt(prompt, reasoning, resume = false) {
   // A restarted worker must observe the existing request, never submit it again.
-  if (resume) return waitUntilReviewOrQuota("ChatGPT");
+  if (resume) {
+    await resumeSubmission(sendButton, composer, prompt);
+    return waitUntilReviewOrQuota("ChatGPT");
+  }
+  step("composer_waiting");
   await dismissOverlays();
   await waitUntilComposer();
   await dismissOverlays();
@@ -46,9 +38,10 @@ async function runPrompt(prompt, reasoning, resume = false) {
   const el = composer();
   if (!el) throw new Error("ChatGPT composer not found");
   if (quotaHit()) throw quotaError();
-  await fillComposer(el, prompt);
+  step("attachments_preparing");
+  const submittedText = await fillComposer(el, prompt);
   await dismissOverlays();
-  await clickSend(sendButton, composer);
+  await clickSend(sendButton, composer, submittedText);
   return waitUntilReviewOrQuota("ChatGPT");
 }
 

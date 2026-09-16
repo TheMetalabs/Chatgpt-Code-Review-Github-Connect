@@ -91,11 +91,36 @@ function harvestJson(opts) {
   return null;
 }
 
+/** Metadata only. The browser journal survives reload; raw text is not a step log. */
+function recordReviewStep(stage) {
+  const state = globalThis.__ashlarRunnerState;
+  if (!state?.jobId || !state.runId) return;
+  const key = `ashlar:steps:${state.jobId}:${state.runId}`;
+  if (!state.steps) {
+    try { state.steps = JSON.parse(sessionStorage.getItem(key) || "null"); } catch { /* local journal unavailable */ }
+    if (!state.steps || !Array.isArray(state.steps.events)) state.steps = {sequence: 0, events: []};
+  }
+  if (state.steps.events.at(-1)?.stage === stage) return;
+  const event = {source: "page", sequence: ++state.steps.sequence, stage, at: Date.now()};
+  state.steps.events = [...state.steps.events, event].slice(-128);
+  try { sessionStorage.setItem(key, JSON.stringify(state.steps)); } catch { state.steps.persistenceError = true; }
+}
+
+function reviewProgress() {
+  const state = globalThis.__ashlarRunnerState;
+  return state?.steps ? {runId: state.runId, events: state.steps.events, sequence: state.steps.sequence,
+    observedAt: Date.now(), persistenceError: Boolean(state.steps.persistenceError)} : undefined;
+}
+
 async function waitUntilReviewOrQuota(name) {
   let stable = "", hits = 0;
   // No poll-count/elapsed-time failure. Controls can appear before response text is
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
+    const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
+    if (submission?.phase === "sent" && userTurns().length > submission.submittedUsers) {
+      recordReviewStep("context_changed"); await sleep(800); continue;
+    }
     const done = chatGenerationFinished({stopVisible: stopButtonVisible(), replyActionsVisible: replyDoneVisible()});
     const text = assistantCorpus().join("\n\n");
     const json = done ? harvestJson({allowThin: true}) : null;
@@ -105,13 +130,19 @@ async function waitUntilReviewOrQuota(name) {
       // Diagnostic size bound, NOT a duration bound. Stay local to the bound job.
       text: text.slice(0, 128_000), totalChars: text.length, truncated: text.length > 128_000,
     };
+    recordReviewStep(!done ? (stopButtonVisible() ? "generating" : "waiting_for_response") :
+      json ? "json_observed" : text.trim() ? "waiting_for_json" : "waiting_for_response");
     if (quotaHit() && !json) {
       const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
     }
     if (done && json) {
       const current = JSON.stringify([json, text]);
       hits = stable === current ? hits + 1 : 1; stable = current;
-      if (hits >= 2) return json;
+      if (hits >= 2) {
+        if (runner) runner.responseText = text;
+        recordReviewStep("response_collected");
+        return json;
+      }
     } else { hits = 0; stable = ""; }
     await sleep(800);
   }
@@ -138,14 +169,14 @@ function installReviewRunner(name, run) {
   if (!state.runId) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
-  if (state.listener && state.protocol === "unbounded-review-v1") return;
+  if (state.listener && state.protocol === "observed-submission-v1") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
-  state.protocol = "unbounded-review-v1";
+  state.protocol = "observed-submission-v1";
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation });
   state.listener = (msg, _sender, reply) => {
     if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close"].includes(msg?.type)) return;
     const respond = reply;
-    reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId});
+    reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId, progress: reviewProgress()});
     if (!msg.jobId) {
       reply({ ok: false, code: "job_mismatch", error: "jobId is required" });
       return;
@@ -191,8 +222,9 @@ function installReviewRunner(name, run) {
     state.running = true;
     state.observation = undefined;
     Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
-      .then(raw => { state.finishedContext = reviewPageContext(); state.result = { ok: true, raw }; })
+      .then(raw => { state.finishedContext = reviewPageContext(); state.result = { ok: true, raw, responseText: state.responseText }; })
       .catch(e => {
+        recordReviewStep(e?.code === "quota" ? "quota" : "error");
         state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })

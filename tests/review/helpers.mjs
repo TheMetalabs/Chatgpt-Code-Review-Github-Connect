@@ -19,6 +19,9 @@ export function content(provider = 'chatgpt', persisted = new Map()) {
   for (const file of ['quota.js', 'model.js', 'json.js', `content-${provider}.js`]) {
     vm.runInContext(source(`extension/${file}`), context, { filename: file });
   }
+  // This lightweight runner fixture represents an already accepted legacy request.
+  // Real submission/DOM/journal boundaries are tested in submission.e2e.mjs.
+  context.resumeSubmission = async () => {};
   context.stopButtonVisible = () => true;
   context.replyDoneVisible = () => false;
   context.assistantCorpus = () => [raw];

@@ -9,13 +9,13 @@ import {root,types} from './load-source.mjs';
 export async function appFixture(options={}, githubOptions={}) {
  const ops=[],reviews=[],localResponses=[],localRequests=[];
  const githubCalls={head:0,snapshot:0,reactions:[],timeline:[]};
- let route,webhookRoute;
+ let route,webhookRoute,historyRoute;
  const server=createServer(async(req,res)=>{
    if(req.url==='/v1/chat/completions'){
      let text='';for await(const chunk of req)text+=chunk;
      localRequests.push(JSON.parse(text));localResponses.push(res);return;
    }
-   const selectedRoute=req.url.split('?')[0]==='/api/webhook'?webhookRoute:req.url.split('?')[0]==='/api/bridge'?route:null;
+   const selectedRoute=req.url.split('?')[0]==='/api/webhook'?webhookRoute:req.url.split('?')[0]==='/api/bridge'?route:req.url.split('?')[0]==='/api/history'?historyRoute:null;
    if(selectedRoute){
      try{
        let body='';for await(const chunk of req)body+=chunk;
@@ -35,7 +35,7 @@ export async function appFixture(options={}, githubOptions={}) {
   changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],diff:'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n'};
  const clock={now:Date.now()};class Clock extends Date{static now(){return clock.now;}}
  const context=vm.createContext({console,Buffer,URL,Request,Response,Headers,TextEncoder,TextDecoder,crypto:globalThis.crypto,AbortController,AbortSignal,performance,setTimeout,clearTimeout,Date:Clock,
-   process:{env:{NODE_TEST_CONTEXT:'review-fixture',ASHLAR_BRIDGE_TOKEN:'fixture-token'}}});
+   process:{env:{NODE_TEST_CONTEXT:'review-fixture',ASHLAR_BRIDGE_TOKEN:'fixture-token',ASHLAR_HISTORY_TOKEN:'fixture-history-token-32-characters-long'}}});
  const mocks=new Map([
   [resolve(root,'src/lib/dotenv-file.server.ts'),{loadDotenvFile(){},writeEnvPatch(){}}],
   [resolve(root,'src/lib/settings.server.ts'),{loadBotSettings:()=>settings,saveBotSettings:s=>s,sanitizeBotSettings:s=>s}],
@@ -75,10 +75,12 @@ export async function appFixture(options={}, githubOptions={}) {
  const bridge=await load('src/lib/bridge.server.ts');
  route=(await load('src/routes/api/bridge.ts')).Route;
  webhookRoute=(await load('src/routes/api/webhook.ts')).Route;
+ historyRoute=(await load('src/routes/api/history.ts')).Route;
+ const history=(await load('src/lib/review-history.server.ts')).reviewHistory();
  function mention(deliveryId='fixture-mention'){
   return harbor.ingestGitHubWebhook({hmacOk:true,deliveryId,event:'issue_comment',payload:{action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:1,pull_request:{},title:'fixture'},comment:{id:42,body:'@ashlar-bot review'}}});
  }
- return {harbor,bridge,origin,clock,ops,reviews,localResponses,localRequests,mention,githubCalls,
+ return {harbor,bridge,history,origin,clock,ops,reviews,localResponses,localRequests,mention,githubCalls,
    async close(){harbor.resetHarbor();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));},
  };
 }

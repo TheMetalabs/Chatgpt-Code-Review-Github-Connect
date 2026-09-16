@@ -1,3 +1,5 @@
+import {reviewHistory} from "./review-history.server";
+import {sanitizeProgressEvents} from "./review-progress";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider, ProviderError } from "./types";
@@ -171,6 +173,43 @@ function ownsLease(job: Job, leaseId?: string): boolean {
   return Boolean(job.bridgeClaimedAt) && (!job.bridgeLeaseId || job.bridgeLeaseId === leaseId);
 }
 
+/** Unparsed text is private diagnostic evidence, never a completed reviewer leg. */
+export function recordBridgeObservation(jobId: string, leaseId: string | undefined, provider: string, runId: string, text: string, totalChars: number, truncated: boolean): boolean {
+  const job=getHarbor().jobs.find(j=>j.id===jobId);
+  if(!job || !ownsLease(job,leaseId) || !isChatProvider(provider as ReviewProvider) ||
+     !(job.reviewProviders || []).includes(provider as ReviewProvider) ||
+     job.providerProgress?.[provider as ReviewProvider]?.runId !== runId) return false;
+  reviewHistory().recordJob(job);
+  reviewHistory().recordObservation(jobId,provider as ReviewProvider,runId,text,totalChars,truncated);
+  return true;
+}
+
+export function recordBridgeProgress(jobId: string, leaseId: string | undefined, reports: unknown): boolean {
+  const job=getHarbor().jobs.find(j=>j.id===jobId);
+  if(!job || !ownsLease(job,leaseId) || !reports || typeof reports!=="object" || Array.isArray(reports))return false;
+  // Validate all run identities before recording either provider (no partial batch).
+  for (const provider of ["chatgpt", "grok"] as const) {
+    const report=(reports as Record<string,unknown>)[provider] as {runId?:unknown} | undefined;
+    if (job.providerProgress?.[provider] && report?.runId && job.providerProgress[provider]!.runId !== report.runId) return false;
+  }
+  const next={...job.providerProgress};
+  for(const provider of ["chatgpt","grok"] as const){
+    if(!(job.reviewProviders || []).includes(provider))continue;
+    const value=(reports as Record<string,unknown>)[provider];if(!value || typeof value!=="object")continue;
+    const report=value as Record<string,unknown>;
+    if(typeof report.runId!=="string" || !report.runId || report.runId.length>128)continue;
+    if(next[provider]?.runId && next[provider]!.runId!==report.runId)return false;
+    const events=sanitizeProgressEvents(report.events);if(!events.length)continue;
+    reviewHistory().recordJob(job);
+    reviewHistory().recordProgress(jobId,provider,report.runId,events);
+    const latest=events.reduce((a,b)=>b.at>=a.at?b:a);
+    if(!next[provider] || latest.at>=next[provider]!.observedAt)next[provider]={runId:report.runId,stage:latest.stage,
+      observedAt:latest.at,receivedAt:Date.now(),extensionVersion:typeof report.extensionVersion==="string"?report.extensionVersion.slice(0,40):undefined};
+  }
+  patchHarborJob(jobId,current=>({...current,providerProgress:next}));
+  return true;
+}
+
 export function refreshBridgeClaim(
   jobId: string,
   generating?: Partial<Record<ReviewProvider, boolean>>,
@@ -268,6 +307,10 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
     .map(leg => ({...leg, raw: extractChatJson(leg.raw) ?? leg.raw}));
   // Compare normalized payloads as stored, including after posting changed job status.
   if (incoming.length && incoming.every(leg => job.storedLegs?.some(stored => stored.provider === leg.provider && stored.raw === leg.raw))) {
+    try {
+      reviewHistory().recordJob(job);
+      for (const leg of incoming) reviewHistory().recordResponse(jobId, leg.provider, leg.raw, leg.originalText || "");
+    } catch { return {ok: false, error: "response history storage unavailable; original reply must be retained", code: "history_unavailable"}; }
     return {ok: true};
   }
   if (job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return {ok: false, error: "job is not claimed by this worker", code: "lease_conflict"};
@@ -275,9 +318,13 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
   const accepted: ChatLeg[] = [];
   for (const leg of incoming) {
     if (!isChatProvider(leg.provider) || !enabled.includes(leg.provider)) continue;
+    try {
+      reviewHistory().recordJob(job);
+      reviewHistory().recordResponse(jobId,leg.provider,leg.raw,leg.originalText || "");
+    } catch {return {ok:false,error:"response archive unavailable; original response must be retained",code:"history_unavailable"};}
     const parsed = extractChatJson(leg.raw);
     if (!parsed) return {ok: false, error: "completed response is not review JSON"};
-    accepted.push({provider: leg.provider, raw: parsed});
+    accepted.push({provider: leg.provider, raw: parsed, originalText: leg.originalText});
   }
   if (!accepted.length) return {ok: false, error: "no enabled reviewer result"};
   patchHarborJob(jobId, current => {

@@ -56,11 +56,12 @@ describe("buildReviewerLanes", () => {
     assert.equal(JSON.stringify(lanes).includes("failure_scenario"), false);
   });
 
-  it("shows generating while the tab is answering", () => {
+  it("shows generating only after a page observation, not an undelivered flag", () => {
     const lanes = buildReviewerLanes(
       job({
         reviewProviders: ["chatgpt", "grok"],
         generating: { chatgpt: true, grok: false },
+        providerProgress: {chatgpt: {runId: "run", stage: "generating", observedAt: Date.now(), receivedAt: Date.now()}},
       }),
     );
     assert.equal(lanes.find((l) => l.provider === "chatgpt")?.state, "generating");
@@ -116,6 +117,12 @@ describe("buildReviewerLanes", () => {
     );
     assert.equal(lanes[0].state, "empty");
     assert.match(lanes[0].detail, /extract failed/i);
+  });
+
+  it("keeps an old client's undelivered flag pending without claiming prompt submission", () => {
+    const lane = buildReviewerLanes(job({reviewProviders: ["chatgpt"], generating: {chatgpt: true}}))[0];
+    assert.equal(lane.state, "waiting");
+    assert.match(lane.detail, /submission not confirmed/);
   });
 
 });

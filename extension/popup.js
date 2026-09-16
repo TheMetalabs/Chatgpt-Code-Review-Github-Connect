@@ -31,9 +31,22 @@ async function refreshDiagnostics() {
     idle: "No new job assigned", tab_capacity: "New tabs paused: review-tab capacity reached",
     provider_quota: "New work paused: provider quota",
   };
+  const admissionPhases = {
+    not_checked: "Not checked by this worker yet", polling: "Checking for a new request",
+    admitted: "New review assigned", idle: "No new job assigned at the last poll",
+    tab_capacity: "New tabs paused: review-tab capacity reached",
+    provider_quota: "New work paused: provider quota",
+    disconnected: "Server unavailable; preserving pending work",
+    duplicate_job: "Server repeated an existing job; original work preserved",
+  };
+  const admission = work.admissionPhase
+    ? `\nNew requests: ${admissionPhases[work.admissionPhase] || work.admissionPhase}` +
+      (work.admissionCheckedAt ? ` (checked ${new Date(work.admissionCheckedAt).toLocaleTimeString()})` : "")
+    : ""; // Keep reports from older workers readable during an upgrade.
+  const stages=(work.stages||[]).map(s=>`${s.jobId} / ${s.provider}: ${s.stage}`).join("\n");
   const recovery = (work.recovery || []).map(j => `${j.jobId}: ${j.status}`).join("\n");
-  workerEl.textContent = `${phases[work.phase] || work.phase}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}; JSON pending: ${work.waitingForJson || 0}` +
-    (recovery ? `\n${recovery}` : "") + (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
+  workerEl.textContent = `${phases[work.phase] || work.phase}${admission}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}; JSON pending: ${work.waitingForJson || 0}` +
+    (stages ? `\n${stages}` : "") + (recovery ? `\n${recovery}` : "") + (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
 }
 
 (async () => {
@@ -41,7 +54,7 @@ async function refreshDiagnostics() {
   originEl.value = s.origin || "";
   tokenEl.value = s.token || "";
   enabledEl.checked = s.enabled !== false;
-  if (s.lastError) statusEl.textContent = `Previous work error (not a model completion status): ${s.lastError}`;
+  if (s.lastError) statusEl.textContent = `Previous work error: ${s.lastError}`;
   else if (s.lastJobId) statusEl.textContent = `Last job: ${s.lastJobId}`;
   await refreshDiagnostics();
 })();

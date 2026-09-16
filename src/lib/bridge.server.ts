@@ -12,6 +12,7 @@ type BridgeMeta = {
   lastSeen: number;
   lastJobId?: string;
   lastError?: string;
+  lastTakeAt?: number;
 };
 
 function newToken() {
@@ -37,6 +38,8 @@ function loadToken(): string {
 }
 
 let meta: BridgeMeta = { token: loadToken(), lastSeen: 0 };
+// Diagnostic only, never used as authorization or to cancel a generation.
+const serverInstanceId = randomBytes(12).toString("base64url");
 
 export type BridgeStatus = {
   token: string;
@@ -46,7 +49,12 @@ export type BridgeStatus = {
   lastError?: string;
 };
 
-export type BridgePublic = Omit<BridgeStatus, "token">;
+export type BridgePublic = Omit<BridgeStatus, "token"> & {
+  protocolVersion: 1;
+  serverInstanceId: string;
+  pendingJobs: number;
+  lastTakeAt?: number;
+};
 
 export function getBridgeStatus(): BridgeStatus {
   return {
@@ -60,7 +68,9 @@ export function getBridgeStatus(): BridgeStatus {
 
 export function getBridgePublic(): BridgePublic {
   const { token: _t, ...rest } = getBridgeStatus();
-  return rest;
+  return {...rest, protocolVersion: 1, serverInstanceId, lastTakeAt: meta.lastTakeAt,
+    pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && pendingChatProviders(job).length > 0).length,
+  };
 }
 
 export function rotateBridgeToken() {
@@ -137,6 +147,7 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
 }
 
 export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): ReturnType<typeof nextBridgeJob> {
+  meta.lastTakeAt = Date.now();
   const job = nextBridgeJob(clientId, excludeJobIds);
   if (!job) return null;
   const claim = claimBridgeJob(job.jobId, clientId);

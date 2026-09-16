@@ -29,6 +29,7 @@ export type Trigger =
   | "pull_request.reopened"
   | "pull_request.synchronize"
   | "pull_request.ready_for_review"
+  | "pull_request.body_mention"
   | "issue_comment.mention"
   | "pull_request_review_comment.followup";
 
@@ -59,7 +60,7 @@ export interface ToolTrace {
 }
 
 export interface JobThread {
-  kind: "mention" | "followup";
+  kind: "mention" | "followup" | "pr_body";
   commentId: number;
   userText: string;
 }
@@ -357,4 +358,3 @@ export type GithubReady = {
     privateKey: "ui" | "env" | "missing";
   };
 };
-

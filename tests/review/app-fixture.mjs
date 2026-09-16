@@ -6,19 +6,21 @@ import {resolve,dirname} from 'node:path';
 import {stripTypeScriptTypes} from 'node:module';
 import {createServer} from 'node:http';
 import {root,types} from './load-source.mjs';
-export async function appFixture(options={}) {
+export async function appFixture(options={}, githubOptions={}) {
  const ops=[],reviews=[],localResponses=[],localRequests=[];
- let route;
+ const githubCalls={head:0,snapshot:0,reactions:[],timeline:[]};
+ let route,webhookRoute;
  const server=createServer(async(req,res)=>{
    if(req.url==='/v1/chat/completions'){
      let text='';for await(const chunk of req)text+=chunk;
      localRequests.push(JSON.parse(text));localResponses.push(res);return;
    }
-   if(req.url.split('?')[0]==='/api/bridge'&&route){
+   const selectedRoute=req.url.split('?')[0]==='/api/webhook'?webhookRoute:req.url.split('?')[0]==='/api/bridge'?route:null;
+   if(selectedRoute){
      try{
        let body='';for await(const chunk of req)body+=chunk;
        const request=new Request(`http://127.0.0.1:${server.address().port}${req.url}`,{method:req.method,headers:req.headers,...(body?{body}:{})});
-       const response=await route.server.handlers[req.method]({request});
+       const response=await selectedRoute.server.handlers[req.method]({request});
        res.writeHead(response.status,Object.fromEntries(response.headers));res.end(await response.text());
      }catch(error){res.writeHead(500);res.end(JSON.stringify({ok:false,error:error.message}));}
      return;
@@ -32,7 +34,7 @@ export async function appFixture(options={}) {
  const sample={key:'fixture',owner:'fixture',repo:'fixture',pr:1,title:'Fixture review',headSha:'abc123',baseSha:'def456',sender:'author',isFork:false,isDraft:false,
   changedPaths:['a.ts'],files:[{path:'a.ts',content:'export const answer = 42;\n',language:'ts'}],diff:'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n'};
  const clock={now:Date.now()};class Clock extends Date{static now(){return clock.now;}}
- const context=vm.createContext({console,Buffer,URL,Request,Response,Headers,AbortController,AbortSignal,performance,setTimeout,clearTimeout,Date:Clock,
+ const context=vm.createContext({console,Buffer,URL,Request,Response,Headers,TextEncoder,TextDecoder,crypto:globalThis.crypto,AbortController,AbortSignal,performance,setTimeout,clearTimeout,Date:Clock,
    process:{env:{NODE_TEST_CONTEXT:'review-fixture',ASHLAR_BRIDGE_TOKEN:'fixture-token'}}});
  const mocks=new Map([
   [resolve(root,'src/lib/dotenv-file.server.ts'),{loadDotenvFile(){},writeEnvPatch(){}}],
@@ -40,8 +42,11 @@ export async function appFixture(options={}) {
   [resolve(root,'src/lib/utils.ts'),{sleep:()=>new Promise(resolve=>setTimeout(resolve,25))}],
   [resolve(root,'src/lib/github.server.ts'),{
     githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=> 'fixture-not-a-real-token',
-    fetchPullHead:async()=>({...sample,draft:false,fork:false}),fetchPullSnapshot:async()=>sample,
-    reactOnDelivery:async()=>{},formatGithubError:error=>String(error),
+    githubWebhookSecret:()=> 'fixture-webhook-secret',
+    fetchPullHead:async()=>{githubCalls.head++;githubCalls.timeline.push('head');return {...sample,draft:false,fork:false,...githubOptions.pull};},
+    fetchPullSnapshot:async(_token,target)=>{githubCalls.snapshot++;githubCalls.timeline.push('snapshot');if(githubOptions.snapshotError)throw githubOptions.snapshotError;return {...sample,...target};},
+    reactOnDelivery:async(_token,job,content)=>{githubCalls.reactions.push({jobId:job.id,thread:job.thread,content});githubCalls.timeline.push('reaction:'+content);},
+    formatGithubError:error=>String(error),
     createIssueComment:async(_token,input)=>{ops.push(input.body);return {id:1};},
     updateIssueComment:async(_token,input)=>{ops.push(input.body);},
     createPullReview:async(_token,input)=>{reviews.push(input);return {id:2};},
@@ -69,10 +74,11 @@ export async function appFixture(options={}) {
  const harbor=await load('src/lib/harbor.server.ts');
  const bridge=await load('src/lib/bridge.server.ts');
  route=(await load('src/routes/api/bridge.ts')).Route;
+ webhookRoute=(await load('src/routes/api/webhook.ts')).Route;
  function mention(deliveryId='fixture-mention'){
   return harbor.ingestGitHubWebhook({hmacOk:true,deliveryId,event:'issue_comment',payload:{action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:1,pull_request:{},title:'fixture'},comment:{id:42,body:'@ashlar-bot review'}}});
  }
- return {harbor,bridge,origin,clock,ops,reviews,localResponses,localRequests,mention,
+ return {harbor,bridge,origin,clock,ops,reviews,localResponses,localRequests,mention,githubCalls,
    async close(){harbor.resetHarbor();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));},
  };
 }

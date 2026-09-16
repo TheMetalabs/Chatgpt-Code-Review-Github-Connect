@@ -1,3 +1,4 @@
+import { llmWorkAllowed } from "./ops-comment.ts";
 import { isBotMention } from "./poster.ts";
 import { SAMPLE_PRS } from "./samples.ts";
 import type { BotSettings, Job, Trigger, WebhookLog } from "./types.ts";
@@ -38,7 +39,23 @@ export type IngressDecision =
   | { ok: true; skip: string; job?: undefined }
   | { ok: false; status: 403; reason: string };
 
-const MENTION_TRIGGERS: Trigger[] = ["issue_comment.mention", "pull_request_review_comment.followup"];
+/** Shared by ingress and the worker after comment events resolve the real PR metadata.
+ * PR lifecycle state is not an execution gate for an explicit request. Fork trust
+ * policy, authentication and duplicate-delivery checks remain independent.
+ */
+export function reviewSkipReason(opts: {
+  sample: Pick<IngressTarget, "isDraft" | "isFork">;
+  trigger: Trigger;
+  thread?: Job["thread"];
+  settings: BotSettings;
+}): string | undefined {
+  const mentionTrigger = llmWorkAllowed(opts);
+  const requested = mentionTrigger && isBotMention(opts.thread?.userText, opts.settings);
+  if (opts.settings.skipDrafts && opts.sample.isDraft && !requested) return "draft";
+  if (opts.settings.skipForks && opts.sample.isFork) return "fork (allowlist empty) · PR body not promoted to policy";
+  if (!requested) return mentionTrigger ? "not a mention" : "LLM only on explicit @ashlar-bot mention";
+  return undefined;
+}
 
 export function acceptedDeliveryIds(events: Pick<WebhookLog, "deliveryId" | "httpStatus">[]): string[] {
   return events.filter((e) => e.httpStatus === 202).map((e) => e.deliveryId);
@@ -61,35 +78,10 @@ export function decideIngress(opts: {
     return { ok: true, skip: `duplicate delivery_id ${opts.deliveryId}` };
   }
 
-  if (opts.settings.skipDrafts && opts.sample.isDraft) {
-    return { ok: true, skip: "draft" };
-  }
-  if (opts.settings.skipForks && opts.sample.isFork) {
-    return { ok: true, skip: "fork (allowlist empty) · PR body not promoted to policy" };
-  }
-
-  if (MENTION_TRIGGERS.includes(opts.trigger)) {
-    if (!isBotMention(opts.thread?.userText, opts.settings)) {
-      return { ok: true, skip: "not a mention" };
-    }
-  } else {
-    // No silent auto-review on PR open/push/reopen — LLM only after explicit @ashlar-bot (or settings mention tokens).
-    return { ok: true, skip: "LLM only on explicit @ashlar-bot mention" };
-  }
-
-  const sameHead = opts.existing.find(
-    (j) =>
-      j.owner === opts.sample.owner &&
-      j.repo === opts.sample.repo &&
-      j.pr === opts.sample.pr &&
-      j.headSha === opts.sample.headSha &&
-      Boolean(opts.sample.headSha) &&
-      j.trigger === opts.trigger &&
-      (j.status === "posted" || j.status === "skipped"),
-  );
-  if (sameHead && !MENTION_TRIGGERS.includes(opts.trigger)) {
-    return { ok: true, skip: "idempotent (repo, pr, head_sha, trigger)" };
-  }
+  const skip = reviewSkipReason(opts);
+  if (skip) return { ok: true, skip };
+  // Each explicit request is new work, even at a previously posted/skipped head.
+  // Only redelivery of the same event is suppressed above.
 
   return {
     ok: true,
@@ -105,7 +97,7 @@ export function decideIngress(opts: {
       sender: opts.sample.sender,
       isFork: opts.sample.isFork,
       isDraft: opts.sample.isDraft,
-      thread: MENTION_TRIGGERS.includes(opts.trigger) ? opts.thread : undefined,
+      thread: opts.thread,
       sampleKey: opts.sample.sampleKey ?? opts.sample.key,
     },
   };

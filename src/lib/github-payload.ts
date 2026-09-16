@@ -1,5 +1,6 @@
 import type { IngressTarget } from "./ingress.ts";
-import type { JobThread, Trigger } from "./types.ts";
+import { DEFAULT_SETTINGS, type BotSettings, type JobThread, type Trigger } from "./types.ts";
+import { isBotMention } from "./poster.ts";
 
 const PR_ACTIONS: Record<string, Trigger> = {
   opened: "pull_request.opened",
@@ -24,6 +25,7 @@ export type ParsedDelivery =
 
 type Gh = {
   action?: string;
+  changes?: { body?: { from?: string | null } };
   installation?: { id?: number };
   repository?: { full_name?: string; fork?: boolean };
   sender?: { login?: string };
@@ -47,7 +49,7 @@ function splitRepo(full: string | undefined): { owner: string; repo: string } | 
   return { owner, repo };
 }
 
-export function parseGitHubPayload(event: string, raw: unknown): ParsedDelivery {
+export function parseGitHubPayload(event: string, raw: unknown, settings: BotSettings = DEFAULT_SETTINGS): ParsedDelivery {
   if (event === "ping") return { ok: true, kind: "ping" };
   if (typeof raw !== "object" || raw === null) return { ok: false, reason: "malformed payload" };
   const body = raw as Gh;
@@ -56,9 +58,16 @@ export function parseGitHubPayload(event: string, raw: unknown): ParsedDelivery 
   const sender = body.sender?.login ?? "unknown";
 
   if (event === "pull_request") {
-    const trigger = PR_ACTIONS[body.action ?? ""];
-    if (!trigger) return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"})` };
     const pr = body.pull_request;
+    const text = String(pr?.body ?? "");
+    // Match the full body, not the preview. Retained mentions on push/reopen/ready
+    // and unrelated edits must not turn a one-shot request into auto-review.
+    const previous = body.changes?.body?.from;
+    const newlyMentioned = body.action === "edited" && (typeof previous === "string" || previous === null) &&
+      !isBotMention(previous ?? "", settings) && isBotMention(text, settings);
+    const bodyMention = (body.action === "opened" && isBotMention(text, settings)) || newlyMentioned;
+    const trigger: Trigger | undefined = bodyMention ? "pull_request.body_mention" : PR_ACTIONS[body.action ?? ""];
+    if (!trigger) return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"}; no new body mention)` };
     if (!repo || !pr?.number || !pr.head?.sha) return { ok: false, reason: "pull_request missing repo or head" };
     const target: IngressTarget = {
       owner: repo.owner,
@@ -67,7 +76,7 @@ export function parseGitHubPayload(event: string, raw: unknown): ParsedDelivery 
       title: String(pr.title ?? `PR #${pr.number}`).slice(0, 200),
       headSha: pr.head.sha,
       baseSha: pr.base?.sha ?? "",
-      sender: pr.user?.login ?? sender,
+      sender: bodyMention ? sender : pr.user?.login ?? sender,
       isFork: Boolean(pr.head.repo?.fork ?? body.repository?.fork),
       isDraft: Boolean(pr.draft),
     };
@@ -77,7 +86,9 @@ export function parseGitHubPayload(event: string, raw: unknown): ParsedDelivery 
       trigger,
       target,
       installationId,
-      untrustedBody: String(pr.body ?? "").slice(0, 4000),
+      // A PR-body request has no comment ID: reactions belong on the PR itself.
+      thread: bodyMention ? { kind: "pr_body", commentId: 0, userText: text } : undefined,
+      untrustedBody: text.slice(0, 4000),
     };
   }
 
@@ -107,14 +118,14 @@ export function parseGitHubPayload(event: string, raw: unknown): ParsedDelivery 
       thread: {
         kind: "mention",
         commentId: Number(body.comment?.id ?? 0),
-        userText: String(body.comment?.body ?? "").slice(0, 2000),
+        userText: String(body.comment?.body ?? ""),
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
     };
   }
 
   if (event === "pull_request_review_comment") {
-    if (body.action !== "created") return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"})` };
+    if (body.action !== "created" && body.action !== "edited") return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"})` };
     const pr = body.pull_request;
     if (!repo || !pr?.number || !pr.head?.sha) return { ok: false, reason: "review comment missing pull_request" };
     const target: IngressTarget = {
@@ -137,7 +148,7 @@ export function parseGitHubPayload(event: string, raw: unknown): ParsedDelivery 
       thread: {
         kind: "followup",
         commentId: Number(body.comment?.id ?? 0),
-        userText: String(body.comment?.body ?? "").slice(0, 2000),
+        userText: String(body.comment?.body ?? ""),
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
     };

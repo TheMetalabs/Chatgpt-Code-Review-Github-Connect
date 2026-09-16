@@ -75,3 +75,18 @@ parser, ingress, worker and bridge. GitHub I/O/settings persistence and watcher
 cadence are fixture adapters; no paid model request or production PR mutation is
 performed. It verifies admission, bridge claim, final JSON submission and review
 posting in those fixtures. It is not a live installed-bot test of the user's PR.
+
+## Unknown head-repository provenance
+
+A missing or null `head.repo` (or a missing/non-boolean `fork` flag) is stored as
+`isFork: null`, never inferred from the destination `repository.fork`. Issue
+comments likewise have unknown head provenance until PR metadata is fetched.
+
+Ingress can queue an explicit request for metadata resolution. Even when the
+webhook already supplies both commit SHAs, the worker resolves unknown provenance
+before loading source files, acknowledging with eyes, or exposing reviewer work.
+With `skipForks` enabled, a confirmed fork or still-unknown head is skipped with an
+operational explanation. A confirmed non-fork proceeds normally, including for a
+draft/closed/merged PR. Metadata-only resolution preserves the webhook's pinned
+SHAs. Disabling `skipForks` explicitly allows unresolved provenance; signature
+validation, mention gating, delivery deduplication and access checks still apply.

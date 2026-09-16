@@ -9,7 +9,7 @@ import {
   tracesForDlq,
   tracesForMention,
 } from "./samples";
-import { acceptedDeliveryIds, decideIngress, reviewSkipReason } from "./ingress";
+import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission } from "./chat-prompt";
@@ -404,27 +404,28 @@ async function playGithub(jobId: string, untrustedBody: string) {
       isFork: live0.isFork,
       isDraft: live0.isDraft,
     };
-    if (!target.headSha || !target.baseSha) {
+    if (!target.headSha || !target.baseSha || typeof target.isFork !== "boolean") {
       const pull = await fetchPullHead(token, live0.owner, live0.repo, live0.pr);
       target = {
         ...target,
-        headSha: pull.headSha,
-        baseSha: pull.baseSha,
+        // Resolve provenance without advancing an already-pinned webhook revision.
+        headSha: target.headSha || pull.headSha,
+        baseSha: target.baseSha || pull.baseSha,
         title: pull.title,
         isDraft: pull.draft,
         isFork: pull.fork,
       };
       patchJob(jobId, (j) => ({
         ...j,
-        headSha: pull.headSha,
-        baseSha: pull.baseSha,
+        headSha: target.headSha,
+        baseSha: target.baseSha,
         title: pull.title,
         isDraft: pull.draft,
         isFork: pull.fork,
       }));
     }
-    // Comment payloads do not contain the real draft/fork metadata. Apply the
-    // same policy after resolving it, before loading files or acknowledging work.
+    // Missing head-repository metadata is unknown, not proof of a trusted head.
+    // Fail closed if resolution is still inconclusive, before source I/O or eyes.
     const resolved = current();
     if (!resolved || resolved.status === "cancelled") return;
     const skip = reviewSkipReason({ sample: target, trigger: resolved.trigger, thread: resolved.thread, settings: state.settings });
@@ -813,7 +814,7 @@ function enqueueFromDecision(
   opts: {
     deliveryId: string;
     trigger: Trigger;
-    sample: { owner: string; repo: string; pr: number; title: string; headSha: string; baseSha: string; sender: string; isFork: boolean; isDraft: boolean; key?: string };
+    sample: IngressTarget;
     thread?: Job["thread"];
     origin: Job["origin"];
     installationId?: number;

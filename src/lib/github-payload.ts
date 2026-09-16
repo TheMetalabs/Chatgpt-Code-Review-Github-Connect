@@ -77,7 +77,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
       headSha: pr.head.sha,
       baseSha: pr.base?.sha ?? "",
       sender: bodyMention ? sender : pr.user?.login ?? sender,
-      isFork: Boolean(pr.head.repo?.fork ?? body.repository?.fork),
+      isFork: typeof pr.head.repo?.fork === "boolean" ? pr.head.repo.fork : null,
       isDraft: Boolean(pr.draft),
     };
     return {
@@ -106,7 +106,8 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
       headSha: "",
       baseSha: "",
       sender,
-      isFork: Boolean(body.repository?.fork),
+      // The destination repository says nothing about this PR's head.
+      isFork: null,
       isDraft: false,
     };
     return {
@@ -136,7 +137,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
       headSha: pr.head.sha,
       baseSha: pr.base?.sha ?? "",
       sender,
-      isFork: Boolean(pr.head.repo?.fork ?? body.repository?.fork),
+      isFork: typeof pr.head.repo?.fork === "boolean" ? pr.head.repo.fork : null,
       isDraft: Boolean(pr.draft),
       };
     return {

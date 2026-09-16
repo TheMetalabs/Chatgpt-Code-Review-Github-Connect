@@ -43,7 +43,7 @@ export async function appFixture(options={}, githubOptions={}) {
   [resolve(root,'src/lib/github.server.ts'),{
     githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=> 'fixture-not-a-real-token',
     githubWebhookSecret:()=> 'fixture-webhook-secret',
-    fetchPullHead:async()=>{githubCalls.head++;githubCalls.timeline.push('head');return {...sample,draft:false,fork:false,...githubOptions.pull};},
+    fetchPullHead:async()=>{githubCalls.head++;githubCalls.timeline.push('head');await githubOptions.beforeHead?.();if(githubOptions.headError)throw githubOptions.headError;return {...sample,draft:false,fork:false,...githubOptions.pull};},
     fetchPullSnapshot:async(_token,target)=>{githubCalls.snapshot++;githubCalls.timeline.push('snapshot');if(githubOptions.snapshotError)throw githubOptions.snapshotError;return {...sample,...target};},
     reactOnDelivery:async(_token,job,content)=>{githubCalls.reactions.push({jobId:job.id,thread:job.thread,content});githubCalls.timeline.push('reaction:'+content);},
     formatGithubError:error=>String(error),

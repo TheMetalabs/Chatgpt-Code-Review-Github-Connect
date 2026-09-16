@@ -1,7 +1,7 @@
 import { llmWorkAllowed } from "./ops-comment.ts";
 import { isBotMention } from "./poster.ts";
 import { SAMPLE_PRS } from "./samples.ts";
-import type { BotSettings, Job, Trigger, WebhookLog } from "./types.ts";
+import type { BotSettings, ForkStatus, Job, Trigger, WebhookLog } from "./types.ts";
 
 export type IngressTarget = {
   owner: string;
@@ -11,7 +11,7 @@ export type IngressTarget = {
   headSha: string;
   baseSha: string;
   sender: string;
-  isFork: boolean;
+  isFork: ForkStatus;
   isDraft: boolean;
   key?: string;
   sampleKey?: string;
@@ -48,11 +48,16 @@ export function reviewSkipReason(opts: {
   trigger: Trigger;
   thread?: Job["thread"];
   settings: BotSettings;
+  /** Ingress may queue metadata resolution, never snapshot or reviewer work. */
+  deferUnknownFork?: boolean;
 }): string | undefined {
   const mentionTrigger = llmWorkAllowed(opts);
   const requested = mentionTrigger && isBotMention(opts.thread?.userText, opts.settings);
   if (opts.settings.skipDrafts && opts.sample.isDraft && !requested) return "draft";
-  if (opts.settings.skipForks && opts.sample.isFork) return "fork (allowlist empty) · PR body not promoted to policy";
+  if (opts.settings.skipForks) {
+    if (opts.sample.isFork === true) return "fork (allowlist empty) · PR body not promoted to policy";
+    if (opts.sample.isFork !== false && !opts.deferUnknownFork) return "fork provenance unknown · head repository could not be verified";
+  }
   if (!requested) return mentionTrigger ? "not a mention" : "LLM only on explicit @ashlar-bot mention";
   return undefined;
 }
@@ -78,7 +83,9 @@ export function decideIngress(opts: {
     return { ok: true, skip: `duplicate delivery_id ${opts.deliveryId}` };
   }
 
-  const skip = reviewSkipReason(opts);
+  // An unknown head may enter the metadata queue. The worker must resolve it
+  // and apply the default fail-closed policy before fetching source files.
+  const skip = reviewSkipReason({ ...opts, deferUnknownFork: true });
   if (skip) return { ok: true, skip };
   // Each explicit request is new work, even at a previously posted/skipped head.
   // Only redelivery of the same event is suppressed above.

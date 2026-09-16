@@ -1,5 +1,8 @@
 import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
 
+/** null means the head repository provenance is not established. */
+export type ForkStatus = boolean | null;
+
 export type Severity = "P0" | "P1" | "P2";
 export type FindingStatus = "candidate" | "accepted" | "dropped";
 export type MergeRec = "COMMENT" | "REQUEST_CHANGES" | "APPROVE";
@@ -76,7 +79,7 @@ export interface Job {
   headSha: string;
   baseSha: string;
   sender: string;
-  isFork: boolean;
+  isFork: ForkStatus;
   isDraft: boolean;
   thread?: JobThread;
   status: JobStatus;
@@ -222,7 +225,7 @@ export interface SamplePr {
   sender: string;
   headSha: string;
   baseSha: string;
-  isFork: boolean;
+  isFork: ForkStatus;
   isDraft: boolean;
   labels: string[];
   files: SnapshotFile[];

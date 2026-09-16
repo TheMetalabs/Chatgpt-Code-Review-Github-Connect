@@ -120,3 +120,91 @@ test('new explicit command supersedes running work but retained PR-body text nev
   assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===first.jobId).status,'cancelled');
   assert.notEqual(first.jobId,second.jobId);
 });
+
+for (const event of ['pull_request', 'pull_request_review_comment']) {
+  for (const headRepo of ['null', 'omitted']) {
+    for (const fork of [true, null, false]) {
+      test(`${event}: ${headRepo} head repo resolves provenance=${fork} before snapshot despite populated SHAs`, async t => {
+        const app = await fixture(t, { pull: { fork, headSha: 'newer-head', baseSha: 'newer-base' } });
+        const raw = pr('edited', '@ashlar-bot review', {
+          changes: { body: { from: 'Description' } }, comment: { id: 44, body: '@ashlar-bot review' },
+        });
+        raw.repository.fork = false;
+        if (headRepo === 'null') raw.pull_request.head.repo = null;
+        else delete raw.pull_request.head.repo;
+        const out = await deliver(app, event, raw);
+        const job = await settled(app, out.jobId);
+        assert.equal(app.githubCalls.head, 1, 'unknown provenance must resolve even with both SHAs');
+        assert.equal(job.isFork, fork);
+        assert.equal(job.headSha, 'abc123', 'metadata-only resolution must keep the requested revision');
+        assert.equal(job.baseSha, 'def456');
+        if (fork === false) {
+          assert.equal(job.status, 'awaiting_chat');
+          assert.equal(app.githubCalls.snapshot, 1);
+          assert.ok(app.githubCalls.timeline.indexOf('head') < app.githubCalls.timeline.indexOf('snapshot'));
+          assert.equal(app.bridge.takeNextBridgeJob('fixture-client').jobId, job.id);
+        } else {
+          assert.equal(job.status, 'skipped');
+          assert.match(job.skipReason, fork === null ? /fork.*unknown/i : /fork/);
+          assert.equal(app.githubCalls.snapshot, 0);
+          assert.equal(job.chatPrompt, undefined);
+          assert.equal(app.bridge.takeNextBridgeJob('fixture-client'), null);
+          assert.equal(app.githubCalls.reactions.some(r => r.content === 'eyes'), false);
+          await eventually(() => app.ops.some(body => body.includes(job.id) && /fork/.test(body)), 'missing fork policy explanation');
+        }
+        assert.equal(app.localRequests.length, 0);
+      });
+    }
+  }
+}
+test('unknown head provenance remains reviewable when the operator explicitly disables fork filtering', async t => {
+  const app = await appFixture({ skipForks: false, reviewLocal: false }, { pull: { fork: null } });
+  t.after(() => app.close());
+  const raw = pr(); raw.pull_request.head.repo = null;
+  const out = await deliver(app, 'pull_request', raw);
+  const job = await settled(app, out.jobId);
+  assert.equal(job.isFork, null);
+  assert.equal(job.status, 'awaiting_chat');
+  assert.equal(app.githubCalls.head, 1);
+  assert.equal(app.githubCalls.snapshot, 1);
+});
+test('pending head provenance does not expose a prompt or bridge job before metadata returns', async t => {
+  let release;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const app = await fixture(t, { beforeHead: () => waiting, pull: { fork: false } });
+  t.after(() => release());
+  const raw = pr(); raw.pull_request.head.repo = null;
+  const out = await deliver(app, 'pull_request', raw);
+  assert.equal(out.queued, true);
+  await eventually(() => app.githubCalls.head === 1, 'metadata resolution did not start');
+  const pending = app.harbor.getHarbor().jobs.find(j => j.id === out.jobId);
+  assert.equal(pending.status, 'snapshot');
+  assert.equal(pending.isFork, null);
+  assert.equal(pending.chatPrompt, undefined);
+  assert.equal(app.githubCalls.snapshot, 0);
+  assert.equal(app.bridge.takeNextBridgeJob('fixture-client'), null);
+  assert.equal(app.githubCalls.reactions.length, 0);
+  assert.equal(app.localRequests.length, 0);
+  release();
+  assert.equal((await settled(app, out.jobId)).status, 'awaiting_chat');
+});
+test('failed head provenance lookup never falls through to snapshot or model work', async t => {
+  const app = await fixture(t, { headError: new Error('head metadata unavailable') });
+  const raw = pr(); delete raw.pull_request.head.repo;
+  const out = await deliver(app, 'pull_request', raw);
+  const job = await settled(app, out.jobId);
+  assert.equal(job.status, 'skipped');
+  assert.match(job.githubError, /head metadata unavailable/);
+  assert.equal(app.githubCalls.snapshot, 0);
+  assert.equal(app.bridge.takeNextBridgeJob('fixture-client'), null);
+  assert.equal(app.githubCalls.reactions.some(r => r.content === 'eyes'), false);
+  await eventually(() => app.ops.some(body => body.includes(job.id) && /Status:\*\* failed/.test(body)), 'missing metadata failure explanation');
+});
+test('a comment on a fork destination resolves the actual head instead of being rejected prematurely', async t => {
+  const app = await fixture(t, { pull: { fork: false } });
+  const raw = comment(); raw.repository.fork = true;
+  const out = await deliver(app, 'issue_comment', raw);
+  assert.equal(out.queued, true);
+  assert.equal((await settled(app, out.jobId)).status, 'awaiting_chat');
+  assert.equal(app.githubCalls.head, 1);
+});

@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import test from "node:test";
+import test, { after } from "node:test";
 import {
   appNameFromHost,
-  createHeadInjector,
+  createHeadInjector as createHeadInjectorFromSource,
   grokXCreatorHeadTags,
-  injectGrokPwaHead,
+  injectGrokPwaHead as injectGrokPwaHeadFromSource,
   isDocumentPath,
   isInstallQuery,
   publicAppHost,
@@ -20,6 +20,13 @@ import {
 import { renderInstallPage } from "./grok-pwa-plugin.mjs";
 
 const TEMPLATE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// Unit fixtures must not inherit this application's site.json or public/og.jpg.
+// Individual filesystem tests can still opt into their own workspace via cwd.
+const EMPTY_WORKSPACE = mkdtempSync(join(tmpdir(), "grok-pwa-unit-"));
+after(() => rmSync(EMPTY_WORKSPACE, { recursive: true, force: true }));
+const injectGrokPwaHead = (html, ctx = {}) => injectGrokPwaHeadFromSource(html, { cwd: EMPTY_WORKSPACE, ...ctx });
+const createHeadInjector = (ctx = {}) => createHeadInjectorFromSource({ cwd: EMPTY_WORKSPACE, ...ctx });
 
 test("injects before </head>", () => {
   const out = injectGrokPwaHead("<html><head><title>x</title></head><body></body></html>");
@@ -82,7 +89,7 @@ test("injects x:creator tags when both creator values are set", () => {
 });
 
 test("escapes x:creator values", () => {
-  const tags = grokXCreatorHeadTags('"><script>', '1" onclick="alert(1)');
+  const tags = grokXCreatorHeadTags('\"><script>', '1" onclick="alert(1)');
   assert.equal(
     tags[0],
     '<meta property="x:creator" content="&quot;&gt;&lt;script&gt;">',
@@ -456,7 +463,7 @@ test("names the install page from host slug", () => {
 
 test("rejects hosts that are not plain slugs", () => {
   assert.equal(appNameFromHost("<script>alert(1)</script>"), "Grok App");
-  assert.equal(appNameFromHost('"><img src=x onerror=1>.grok.me'), "Grok App");
+  assert.equal(appNameFromHost('\"><img src=x onerror=1>.grok.me'), "Grok App");
 });
 
 test("renders install page markup", () => {

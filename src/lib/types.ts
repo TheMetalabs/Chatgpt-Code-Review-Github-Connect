@@ -1,5 +1,8 @@
 import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
 
+/** null means the head repository provenance is not established. */
+export type ForkStatus = boolean | null;
+
 export type Severity = "P0" | "P1" | "P2";
 export type FindingStatus = "candidate" | "accepted" | "dropped";
 export type MergeRec = "COMMENT" | "REQUEST_CHANGES" | "APPROVE";
@@ -29,6 +32,7 @@ export type Trigger =
   | "pull_request.reopened"
   | "pull_request.synchronize"
   | "pull_request.ready_for_review"
+  | "pull_request.body_mention"
   | "issue_comment.mention"
   | "pull_request_review_comment.followup";
 
@@ -59,7 +63,7 @@ export interface ToolTrace {
 }
 
 export interface JobThread {
-  kind: "mention" | "followup";
+  kind: "mention" | "followup" | "pr_body";
   commentId: number;
   userText: string;
 }
@@ -75,7 +79,7 @@ export interface Job {
   headSha: string;
   baseSha: string;
   sender: string;
-  isFork: boolean;
+  isFork: ForkStatus;
   isDraft: boolean;
   thread?: JobThread;
   status: JobStatus;
@@ -221,7 +225,7 @@ export interface SamplePr {
   sender: string;
   headSha: string;
   baseSha: string;
-  isFork: boolean;
+  isFork: ForkStatus;
   isDraft: boolean;
   labels: string[];
   files: SnapshotFile[];
@@ -357,4 +361,3 @@ export type GithubReady = {
     privateKey: "ui" | "env" | "missing";
   };
 };
-

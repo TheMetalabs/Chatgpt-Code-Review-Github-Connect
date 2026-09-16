@@ -7,7 +7,7 @@ import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
-import type { GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
+import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
 
 const GH_HOST = "api.github.com";
 const MAX_FILES = 20;
@@ -354,7 +354,7 @@ export async function fetchPullHead(
   owner: string,
   repo: string,
   pr: number,
-): Promise<{ headSha: string; baseSha: string; title: string; draft: boolean; fork: boolean; body: string }> {
+): Promise<{ headSha: string; baseSha: string; title: string; draft: boolean; fork: ForkStatus; body: string }> {
   const out = await gh<{
     title?: string;
     draft?: boolean;
@@ -371,7 +371,7 @@ export async function fetchPullHead(
     baseSha: out.data.base.sha,
     title: String(out.data.title ?? `PR #${pr}`),
     draft: Boolean(out.data.draft),
-    fork: Boolean(out.data.head.repo?.fork),
+    fork: typeof out.data.head.repo?.fork === "boolean" ? out.data.head.repo.fork : null,
     body: String(out.data.body ?? ""),
   };
 }
@@ -408,7 +408,7 @@ export async function fetchPullSnapshot(
     headSha: string;
     baseSha: string;
     sender: string;
-    isFork: boolean;
+    isFork: ForkStatus;
     isDraft: boolean;
   },
 ): Promise<SamplePr> {

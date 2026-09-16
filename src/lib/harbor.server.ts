@@ -9,12 +9,12 @@ import {
   tracesForDlq,
   tracesForMention,
 } from "./samples";
-import { acceptedDeliveryIds, decideIngress } from "./ingress";
+import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission } from "./chat-prompt";
 import { runLocalLlm } from "./local-llm.server";
-import { buildOpsComment, llmWorkAllowed, opsCommentAllowed, type OpsPhase } from "./ops-comment";
+import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
   filterPublishable,
@@ -256,7 +256,7 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   const body = buildOpsComment({
     phase,
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
-    notes,
+    notes: [`Job: ${job.id}`, ...notes],
   });
   try {
     if (job.opsCommentId) {
@@ -391,9 +391,6 @@ async function playGithub(jobId: string, untrustedBody: string) {
     return;
   }
 
-  const acked = current();
-  if (acked) void reactQuiet(token, acked, "eyes");
-
   let sample: SamplePr;
   try {
     let target = {
@@ -407,24 +404,35 @@ async function playGithub(jobId: string, untrustedBody: string) {
       isFork: live0.isFork,
       isDraft: live0.isDraft,
     };
-    if (!target.headSha || !target.baseSha) {
+    if (!target.headSha || !target.baseSha || typeof target.isFork !== "boolean") {
       const pull = await fetchPullHead(token, live0.owner, live0.repo, live0.pr);
       target = {
         ...target,
-        headSha: pull.headSha,
-        baseSha: pull.baseSha,
+        // Resolve provenance without advancing an already-pinned webhook revision.
+        headSha: target.headSha || pull.headSha,
+        baseSha: target.baseSha || pull.baseSha,
         title: pull.title,
         isDraft: pull.draft,
         isFork: pull.fork,
       };
       patchJob(jobId, (j) => ({
         ...j,
-        headSha: pull.headSha,
-        baseSha: pull.baseSha,
+        headSha: target.headSha,
+        baseSha: target.baseSha,
         title: pull.title,
         isDraft: pull.draft,
         isFork: pull.fork,
       }));
+    }
+    // Missing head-repository metadata is unknown, not proof of a trusted head.
+    // Fail closed if resolution is still inconclusive, before source I/O or eyes.
+    const resolved = current();
+    if (!resolved || resolved.status === "cancelled") return;
+    const skip = reviewSkipReason({ sample: target, trigger: resolved.trigger, thread: resolved.thread, settings: state.settings });
+    if (skip) {
+      patchJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
+      await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
+      return;
     }
     sample = await fetchPullSnapshot(token, target);
   } catch (e) {
@@ -443,34 +451,11 @@ async function playGithub(jobId: string, untrustedBody: string) {
 
   const gated = current();
   if (!gated || gated.status === "cancelled") return;
-  if (state.settings.skipForks && gated.isFork) {
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "skipped",
-      skipReason: "fork (allowlist empty) · PR body not promoted to policy",
-      updatedAt: Date.now(),
-    }));
-    return;
-  }
-  if (state.settings.skipDrafts && gated.isDraft) {
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "skipped",
-      skipReason: "draft",
-      updatedAt: Date.now(),
-    }));
-    return;
-  }
-
-  if (current()?.status === "cancelled") return;
-  if (!llmWorkAllowed(gated)) {
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "skipped",
-      skipReason: "LLM only on explicit @ashlar-bot mention",
-      plan: "No ChatGPT / Local / bridge work without an explicit mention.",
-      updatedAt: Date.now(),
-    }));
+  // Settings may have changed while snapshot I/O was in flight.
+  const skip = reviewSkipReason({ sample: gated, trigger: gated.trigger, thread: gated.thread, settings: state.settings });
+  if (skip) {
+    patchJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
+    await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
     return;
   }
 
@@ -508,6 +493,10 @@ async function playGithub(jobId: string, untrustedBody: string) {
     storedLegs: [],
     updatedAt: Date.now(),
   }));
+  // An eyes reaction now means the snapshot passed admission and a job is
+  // available to reviewers, not merely that a webhook was received.
+  const admitted = current();
+  if (admitted) void reactQuiet(token, admitted, "eyes");
   void watchReviewers(jobId, token);
   if (providers.includes("local")) {
     void kickLocalRace(jobId, prompt);
@@ -825,7 +814,7 @@ function enqueueFromDecision(
   opts: {
     deliveryId: string;
     trigger: Trigger;
-    sample: { owner: string; repo: string; pr: number; title: string; headSha: string; baseSha: string; sender: string; isFork: boolean; isDraft: boolean; key?: string };
+    sample: IngressTarget;
     thread?: Job["thread"];
     origin: Job["origin"];
     installationId?: number;
@@ -984,7 +973,7 @@ export function ingestGitHubWebhook(opts: {
   event: string;
   payload: unknown;
 }): HarborFireResult & { pong?: boolean; ignored?: string } {
-  const parsed = parseGitHubPayload(opts.event, opts.payload);
+  const parsed = parseGitHubPayload(opts.event, opts.payload, state.settings);
   const t0 = performance.now();
 
   if (!opts.hmacOk) {

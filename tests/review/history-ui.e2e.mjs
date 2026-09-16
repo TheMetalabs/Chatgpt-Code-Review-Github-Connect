@@ -1,14 +1,30 @@
 // Real React/Chromium component; backend I/O is controlled. Production HTTP is tested separately.
 import {test,before,after} from 'node:test';
 import assert from 'node:assert/strict';
-import {build} from 'esbuild';
+import {build} from 'vite';
+import react from '@vitejs/plugin-react';
+import {mkdtemp,writeFile,rm} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {root} from './helpers.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser,bundle;
 before(async()=>{
- const result=await build({stdin:{contents:`import React from 'react';import {createRoot} from 'react-dom/client';import {HistoryBrowser} from './src/components/history-browser';createRoot(document.getElementById('root')).render(<HistoryBrowser/>);`,loader:'tsx',resolveDir:root},absWorkingDir:root,alias:{'@':resolve(root,'src')},bundle:true,write:false,format:'iife',jsx:'automatic',define:{'process.env.NODE_ENV':'"test"'}});
- bundle=result.outputFiles[0].text;browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});
+ // Use declared repository dependencies; Vite 8 does not supply esbuild.
+ const temporary=await mkdtemp(resolve(root,'.history-fixture-'));
+ try {
+  const entry=resolve(temporary,'entry.jsx');
+  await writeFile(entry,`import {createRoot} from 'react-dom/client';import {HistoryBrowser} from '@/components/history-browser';createRoot(document.getElementById('root')).render(<HistoryBrowser/>);`);
+  const result=await build({
+   root,configFile:false,envFile:false,publicDir:false,logLevel:'warn',
+   plugins:[react()],resolve:{alias:{'@':resolve(root,'src')}},
+   define:{'process.env.NODE_ENV':'"production"'},
+   build:{write:false,minify:false,lib:{entry,name:'HistoryFixture',formats:['iife'],fileName:'history-fixture'}},
+  });
+  const chunks=[].concat(result).flatMap(output=>output.output).filter(output=>output.type==='chunk');
+  assert.equal(chunks.length,1,'fixture must be one self-contained browser bundle');
+  bundle=chunks[0].code;
+ } finally {await rm(temporary,{recursive:true,force:true});}
+ browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});
 });
 after(async()=>{await browser?.close();});
 const record={job:{id:'job-A',owner:'fixture',repo:'repo',pr:219,status:'posted',createdAt:1,deliveryId:'delivery-A',commentId:42,findingCount:0},inCurrentRuntime:false,droppedSteps:0,steps:[{id:'s',stage:'send_unconfirmed',source:'page',at:2,runId:'run-A'}],review:{githubId:55,event:'COMMENT',at:3,body:'Posted review body'}};

@@ -84,7 +84,7 @@ test('navigate-away and reused numeric tab IDs are never auto-closed',async()=>{
 test('manual close tracking ignores unrelated tabs and completed auto-cleanup leaves no markers',async()=>{
   const b=scenario();for(let i=1000;i<1100;i++)await b.closeTab(i);
   assert.equal(Object.keys(b.local.state).filter(k=>k.startsWith('ashlar:closed:')).length,0);
-  await b.tick();assert.equal(Object.keys(b.session.state).filter(k=>k.startsWith('ashlar:closed:')).length,0);
+  await b.tick();assert.equal(Object.keys(b.session.state).filter(k=>k.startsWith('ashlar:')).length,0);
 });
 test('one PR transport error cannot starve result collection for another recovered PR',async()=>{
   const b=scenario([work('A',['chatgpt'],10),work('B',['chatgpt'],20)],{api:async(p,body)=>{
@@ -104,7 +104,9 @@ test('automatic output extraction never reads a shared system clipboard',async()
   c.context.navigator={clipboard:{writeText:async()=>{},readText:async()=>{reads++;return raw;}}};
   c.context.currentAssistantRoot=()=>({querySelectorAll:()=>[{getAttribute:()=> 'Copy response',click(){}}]});
   c.context.harvestJson=()=>null;c.context.stopButtonVisible=()=>false;c.context.replyDoneVisible=()=>true;c.context.sleep=async()=>{};
-  await assert.rejects(c.context.waitUntilReviewOrQuota('ChatGPT'),e=>e.code==='empty');assert.equal(reads,0);
+  const stop = new Error('test cancellation'); let polls = 0;
+  c.context.sleep=async()=>{if(++polls===20)throw stop;};
+  await assert.rejects(c.context.waitUntilReviewOrQuota('ChatGPT'),e=>e===stop);assert.equal(reads,0);
 });
 test('runner close permission rejects a fresh user turn, busy generation, and wrong run',async()=>{
   const c=content();let text='review A';

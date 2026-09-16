@@ -26,7 +26,7 @@ jobs:
       # Independent of legacy template tests; requires no npm dependencies or LLM spend.
       - run: npm run test:review-regressions
       - name: Signed mention admission and lifecycle fixtures
-        run: node --experimental-vm-modules --test tests/review/mentions.e2e.mjs tests/review/parallel.e2e.mjs
+        run: node --experimental-vm-modules --test tests/review/mentions.e2e.mjs tests/review/parallel.e2e.mjs tests/review/long-wait.e2e.mjs
   verify:
     runs-on: ubuntu-latest
     steps:

@@ -10,14 +10,15 @@ function localConfig(settings: BotSettings) {
   return { ok: true as const, baseURL, model, apiKey: settings.localLlmApiKey.trim() || "local" };
 }
 
-/** Cheap liveness check. GET /models only — never enqueue a generate. */
+/** GET /models only. A busy local endpoint may queue this as well. */
 export async function pingLocalLlm(
   settings: BotSettings,
+  signal?: AbortSignal,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
   try {
-    await requestLocalJson(ready.baseURL, ready.apiKey, "models", undefined, AbortSignal.timeout(5_000));
+    await requestLocalJson(ready.baseURL, ready.apiKey, "models", undefined, signal);
     return { ok: true };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

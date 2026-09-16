@@ -13,7 +13,12 @@ export async function chatFixtureProxy(html) {
  try {
   execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',key,'-out',cert,'-days','1','-subj','/CN=chatgpt.com'],{stdio:'ignore'});
   const requests=[],sockets=new Set();
-  const track=socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));};
+  const track=socket=>{
+   sockets.add(socket);socket.on('close',()=>sockets.delete(socket));
+   // Chromium can reset even a denied CONNECT or pre-handshake connection.
+   // Handle errors at registration, not only after the host passes the allowlist.
+   socket.on('error',()=>socket.destroy());
+  };
   const tls=createTlsServer({key:await readFile(key),cert:await readFile(cert)},(req,res)=>{
    requests.push(req.url);
    res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store'});res.end(html);

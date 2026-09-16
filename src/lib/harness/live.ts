@@ -1,3 +1,4 @@
+import { requestLocalJson } from "@/lib/local-chat-request.server";
 import { createServerFn } from "@tanstack/react-start";
 import { createLiveLimiter, liveAdmit, liveRelease } from "@/lib/live-limit";
 import { CODE_REVIEW_MD, closestAgents, ROOT_AGENTS_MD, PAYMENT_AGENTS_MD } from "@/lib/policy";
@@ -180,6 +181,7 @@ export async function runLiveOnSnapshot(opts: {
   settings: BotSettings;
   diff: string;
   extra?: string;
+  signal?: AbortSignal;
 }): Promise<LiveResult> {
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) return { ok: false, error: "Live agent is unavailable in this environment." };
@@ -231,27 +233,11 @@ ${policyBlock(files)}
     const turns = 6;
 
     for (let turn = 0; turn < turns; turn++) {
-      const res = await fetch("https://api.x.ai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: "grok-4.5",
-          temperature: 0.2,
-          max_tokens: 1200,
-          tools: TOOLS,
-          messages,
-        }),
-        signal: AbortSignal.timeout(25_000),
-      });
-      if (!res.ok) {
-        return { ok: false, error: `xAI API error ${res.status}` };
-      }
-      const body = (await res.json()) as {
-        choices: { message: ChatMsg; finish_reason?: string }[];
-      };
+      // The demo tool-agent path follows the same unbounded native transport as
+      // Local reviews. Turn/token budgets remain explicit, never elapsed-time ones.
+      const body = await requestLocalJson("https://api.x.ai/v1", apiKey, "chat/completions", {
+        model: "grok-4.5", temperature: 0.2, max_tokens: 1200, tools: TOOLS, messages,
+      }, opts.signal) as {choices: {message: ChatMsg; finish_reason?: string}[]};
       const msg = body.choices[0]?.message;
       if (!msg) return { ok: false, error: "Empty model response" };
       messages.push(msg);
@@ -318,8 +304,7 @@ ${policyBlock(files)}
       dropped: gate.dropped,
     };
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "Live review failed";
-    if (/abort|timeout/i.test(msg)) return { ok: false, error: "Live agent timed out. No publish." };
+    if (opts.signal?.aborted) return { ok: false, error: "Live agent cancelled by the caller. No publish." };
     return { ok: false, error: "Live review failed. No publish." };
   } finally {
     liveRelease(Date.now(), limiter);

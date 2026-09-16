@@ -56,11 +56,11 @@ test('real DOM: harvest does not expose provisional JSON while the runner is bus
  const result=await page.evaluate(()=>new Promise(resolve=>handler({type:'ashlar-harvest',jobId:'j'},null,resolve)));
  assert.equal(result.ok,false);assert.equal(result.code,'busy');
 });
-test('real DOM: finished without JSON is detected only after positive completion controls',async t=>{
+test('real DOM: even completed-looking prose is not converted to empty after a poll count',async t=>{
  const page=await fixture(t,user+answer('still thinking'));await startWait(page);await page.clock.fastForward(24*3600_000);
  assert.equal((await page.evaluate(()=>waitResult)).pending,true);
  await page.setContent(user+answer('done, but no JSON',true));await page.clock.runFor(6400);
- assert.equal((await page.evaluate(()=>waitResult)).code,'empty');
+ assert.equal((await page.evaluate(()=>waitResult)).pending,true);
 });
 
 test('real DOM: only a completed owned run without a new user draft may be closed',async t=>{
@@ -95,4 +95,53 @@ test('real DOM: simultaneous final responses are extracted without touching the 
  await Promise.all(pages.map(page=>page.clock.runFor(3200)));
  assert.deepEqual(await Promise.all(pages.map(page=>page.evaluate(()=>waitResult.raw))),[rawA,rawB]);
  assert.deepEqual(await Promise.all(pages.map(page=>page.evaluate(()=>clipboardReads))),[0,0]);
+});
+
+test('regression: blank current response with toolbar waits more than six hours, then returns JSON',async t=>{
+ const page=await fixture(t,user+answer('',true));await startWait(page);await page.clock.runFor(8000);
+ assert.equal((await page.evaluate(()=>waitResult)).pending,true);
+ await page.clock.fastForward(8*3600_000);assert.equal((await page.evaluate(()=>waitResult)).pending,true);
+ await page.evaluate(text=>document.querySelector('.markdown').textContent=text,json);await page.clock.runFor(3200);
+ assert.equal((await page.evaluate(()=>waitResult)).raw,json);
+});
+test('regression: an evolving or stable non-JSON UI fragment is not a timer-based terminal failure',async t=>{
+ const page=await fixture(t,user+answer('fragment 0',true));await startWait(page);
+ for(let i=1;i<=9;i++){await page.evaluate(i=>document.querySelector('.markdown').textContent='fragment '+i,i);await page.clock.runFor(800);}
+ await page.clock.fastForward(8*3600_000);assert.equal((await page.evaluate(()=>waitResult)).pending,true);
+ await page.evaluate(text=>document.querySelector('.markdown').textContent=text,json);await page.clock.runFor(3200);
+ assert.equal((await page.evaluate(()=>waitResult)).raw,json);
+});
+test('regression: JSON in a second markdown block is harvested, not marked empty',async t=>{
+ const page=await fixture(t,user+`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant"><div class="markdown">Analysis complete</div><div class="markdown"><pre><code>${json}</code></pre></div></div>${toolbar}</section>`);
+ await startWait(page);await page.clock.runFor(6400);assert.equal((await page.evaluate(()=>waitResult)).raw,json);
+});
+test('regression: hidden duplicate DOM text cannot corrupt visible JSON',async t=>{
+ const page=await fixture(t,user+answer('{<span hidden>hidden duplicate</span>"findings":[],"keep":["checked"]}',true));await startWait(page);await page.clock.runFor(6400);
+ assert.equal((await page.evaluate(()=>waitResult)).raw,'{"findings":[],"keep":["checked"]}');
+});
+
+// Structural regression derived from the operator's pasted response HTML. Paths,
+// file IDs and prose are synthetic; the private example itself is not published.
+function citedParagraphExample(){
+ const citation='<span class="contents" data-content-reference-start="10" data-content-reference-end="20"><span data-file-citation-group-identity="[[&quot;fixture&quot;]]" aria-haspopup="dialog"><button type="button"><svg aria-hidden="true"></svg><p class="not-prose">PRIVATE-CITATION-LABEL +1</p></button></span></span><span class="contents" data-content-reference-start="21"></span>';
+ return `<p dir="auto" data-is-last-node="" data-is-only-node="">{<br>
+"merge_recommendation": "REQUEST_CHANGES",<br>
+"investigated_safe": ["src/<strong data-start="1" data-end="2">tests</strong>/fixture.test.ts: inspected. ${citation}"],<br>
+"findings": [<br>
+{"severity":"P1","file":"src/first.ts","line":4,"side":"RIGHT","title":"First fixture","evidence":"return x =&gt; ({value: x}); ${citation}"},<br>
+{"severity":"P2","file":"src/second.ts","line":8,"side":"RIGHT","title":"Second fixture","evidence":"Array.isArray(payload) ? payload : [] ${citation}"}<br>
+]<br>
+}</p>`;
+}
+for(const leadingProse of [false,true])test(`operator example structure: paragraph/br JSON, nested citation UI, emphasis and entities (${leadingProse?'later markdown':'single markdown'})`,async t=>{
+ const html=citedParagraphExample();
+ const body=user+`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant">${leadingProse?'<div class="markdown"><p>The final review follows.</p></div>':''}<div class="markdown">${html}</div></div>${toolbar}</section>`;
+ const page=await fixture(t,body);await startWait(page);await page.clock.runFor(3200);
+ const result=await page.evaluate(()=>waitResult);
+ const parsed=JSON.parse(result.raw);
+ assert.equal(parsed.merge_recommendation,'REQUEST_CHANGES');assert.equal(parsed.findings.length,2);
+ assert.equal(parsed.investigated_safe[0],'src/tests/fixture.test.ts: inspected. ');
+ assert.equal(parsed.findings[0].evidence,'return x => ({value: x}); ');
+ assert.equal(parsed.findings[1].file,'src/second.ts');
+ assert.doesNotMatch(result.raw,/PRIVATE-CITATION-LABEL|data-content-reference|<strong|&gt;/);
 });

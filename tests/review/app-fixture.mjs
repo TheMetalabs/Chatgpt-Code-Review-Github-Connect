@@ -49,7 +49,7 @@ export async function appFixture(options={}, githubOptions={}) {
     formatGithubError:error=>String(error),
     createIssueComment:async(_token,input)=>{ops.push(input.body);return {id:1};},
     updateIssueComment:async(_token,input)=>{ops.push(input.body);},
-    createPullReview:async(_token,input)=>{reviews.push(input);return {id:2};},
+    createPullReview:async(_token,input)=>{await githubOptions.beforeReview?.();reviews.push(input);return {id:2};},
   }],
   ['@tanstack/react-router',{createFileRoute:()=>config=>config}],
  ]);

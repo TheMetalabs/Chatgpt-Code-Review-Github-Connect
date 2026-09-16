@@ -48,12 +48,11 @@ test('queue, stop flicker and generation can last a simulated day before complet
   assert.equal(await c.waitUntilReviewOrQuota('ChatGPT'), raw);
   assert.equal(polls, 1441);
 });
-test('finished without JSON is retained as a terminal empty error', async () => {
+test('missing JSON remains pending until explicit test cancellation, never an empty result', async () => {
   const c = content().context;
-  c.stopButtonVisible = () => false;
-  c.replyDoneVisible = () => true;
-  c.harvestJson = () => null;
-  c.harvestViaCopy = async () => null;
-  c.sleep = async () => {};
-  await assert.rejects(c.waitUntilReviewOrQuota('ChatGPT'), e => e.code === 'empty');
+  c.stopButtonVisible = () => false; c.replyDoneVisible = () => true; c.harvestJson = () => null;
+  const cancelled = new Error('test owner cancelled the pending wait'); let polls = 0;
+  c.sleep = async () => { if (++polls === 20) throw cancelled; };
+  await assert.rejects(c.waitUntilReviewOrQuota('ChatGPT'), e => e === cancelled);
+  assert.equal(polls, 20);
 });

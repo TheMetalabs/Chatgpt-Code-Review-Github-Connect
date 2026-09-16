@@ -6,6 +6,8 @@ const CLOSED_PREFIX = "ashlar:closed:";
 const OWNED_PREFIX = "ashlar:tab:";
 const DEFAULT_MAX_REVIEW_TABS = 4;
 const HEARTBEAT_MS = 10_000;
+const HEALTH_KEY = "bridgeHealth";
+const WORKER_STATUS_KEY = "bridgeWorkerStatus";
 
 // Locks are ephemeral; identities, replies and allocation intent remain in storage.
 // All lanes share one loaded registry, so concurrent jobs never write stale maps.
@@ -117,9 +119,69 @@ async function api(path, body, expectedOrigin) {
   if (!res.ok || json.ok !== true) {
     const err = new Error(json.error || `http ${res.status}`);
     err.status = res.status;
+    err.code = json.code;
     throw err;
   }
   return json;
+}
+
+/** Transport liveness is independent of job recovery and never mutates a job/lease.
+ * A 200 ping is NOT evidence that a new job has been claimed.
+ */
+let healthFlight;
+function probeBridge() {
+  if (healthFlight) return healthFlight;
+  healthFlight = (async () => {
+    const cfg = await settings();
+    if (!cfg.enabled || !cfg.origin || !cfg.token) return false;
+    const checkedAt = Date.now();
+    const extensionVersion = chrome.runtime.getManifest?.().version || "unknown";
+    try {
+      const result = await api("/api/bridge", {action: "ping", extensionVersion}, cfg.origin);
+      const bridge = result.bridge || {};
+      // Persist an allowlist, not the whole response (which can contain private prompts).
+      await chrome.storage.local.set({[HEALTH_KEY]: {
+        origin: cfg.origin, checkedAt, ok: true, extensionVersion,
+        serverInstanceId: typeof bridge.serverInstanceId === "string" ? bridge.serverInstanceId.slice(0, 80) : undefined,
+        protocolVersion: Number.isInteger(bridge.protocolVersion) ? bridge.protocolVersion : undefined,
+        pendingJobs: Number.isInteger(bridge.pendingJobs) && bridge.pendingJobs >= 0 ? bridge.pendingJobs : undefined,
+        lastTakeAt: Number.isFinite(bridge.lastTakeAt) ? bridge.lastTakeAt : undefined,
+      }});
+      return true;
+    } catch (e) {
+      await chrome.storage.local.set({[HEALTH_KEY]: {
+        origin: cfg.origin, checkedAt, ok: false, extensionVersion,
+        httpStatus: e.status, error: String(e.message || e).slice(0, 240),
+      }});
+      return false;
+    }
+  })().catch(() => false).finally(() => { healthFlight = undefined; });
+  return healthFlight;
+}
+
+// For diagnostics only: an active job is NEVER an admission gate.
+function activelyReviewing(job) {
+  if (job.serverStatus || job.recoveryError) return false;
+  return job.providers.some(p => {
+    const state = job.states[p];
+    return !state.delivered && !state.outcome && !state.connectionError;
+  });
+}
+
+async function recordWorkerStatus(jobs, origin, phase) {
+  const relevant = Object.values(jobs).filter(job => job.origin === origin);
+  phase ||= relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
+  await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
+    origin, checkedAt: Date.now(), phase,
+    activeJobs: relevant.filter(activelyReviewing).length,
+    recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
+    pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
+    savedReplies: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].outcome?.ok && !job.states[p].delivered).length, 0),
+    // Identifiers/status only: never response text, prompts or credentials.
+    recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
+      jobId: job.jobId, status: job.serverStatus || (job.recoveryError ? "connection_error" : "reconnecting_or_cleanup"),
+    })),
+  }});
 }
 
 function providerUrl(provider, reasoning) {
@@ -453,7 +515,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   if (!state.tabId && (state.started || job.resumeProviders?.includes(provider))) {
     const original = await findOriginalTab(job, provider);
     if (original) { state.tabId = original.id; state.started = true; await saveJobs(jobs); }
-    else { state.connectionError = "original review tab unavailable; waiting for reconnection"; return; }
+    else { state.connectionError = "original review tab unavailable; waiting for reconnection"; await saveJobs(jobs); return; }
   }
   if (!state.tabId) {
     if (observeOnly) return;
@@ -500,8 +562,10 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       }
     }
   } catch (e) {
-    // A messaging outage is not a model failure. Check tab existence on the next tick.
-    await chrome.storage.local.set({ lastError: String(e.message || e).slice(0, 240) });
+    // A messaging outage is not a model failure or a global admission lock.
+    state.connectionError = String(e.message || e).slice(0, 240);
+    await saveJobs(jobs);
+    await chrome.storage.local.set({ lastError: state.connectionError });
     return;
   }
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
@@ -565,7 +629,8 @@ async function advanceJob(job, jobs) {
     await retireCleanJob(job, jobs);
     return;
   }
-  if (!active && !["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus)) return;
+  const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
+  // Missing is not ACK: observe and preserve the original response without redelivery.
   if (active && !job.prompt) {
     const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}`, undefined, job.origin);
     Object.assign(job, {prompt: current.prompt, prompts: current.prompts});
@@ -574,7 +639,7 @@ async function advanceJob(job, jobs) {
   await joinLanes(job.providers.map(async provider => {
     try {
       await pollProvider(job, provider, jobs, !active);
-      await deliverOutcome(job, provider, jobs);
+      if (canDeliver) await deliverOutcome(job, provider, jobs);
       await cleanupProvider(job, provider, jobs);
     } catch (e) {
       // A failing provider must not prevent the others from being collected/closed.
@@ -595,18 +660,24 @@ function progressJob(job, jobs) {
       job.recoveryError = String(error.message || error).slice(0, 240);
       await saveJobs(jobs);
       await chrome.storage.local.set({lastError: job.recoveryError});
-    }
+    } finally { await recordWorkerStatus(jobs, job.origin); }
   });
 }
 
 function admitJob(cfg, jobs) {
   return singleFlight(admissionLanes, cfg.origin, async () => {
-    if (!await tabCapacityAvailable(jobs, true)) return null;
+    if (!await tabCapacityAvailable(jobs, true)) {
+      await recordWorkerStatus(jobs, cfg.origin, "tab_capacity"); return null;
+    }
     const quota = await quotaMap();
-    if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) return null;
+    if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) {
+      await recordWorkerStatus(jobs, cfg.origin, "provider_quota"); return null;
+    }
     const payload = await api("/api/bridge", {
       action: "take", clientId: await clientId(), excludeJobIds: Object.keys(jobs),
-    }, cfg.origin);
+    }, cfg.origin).catch(async error => {
+      await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;
+    });
     if (!payload.job || jobs[payload.job.jobId]) return null;
     const job = {...payload.job, origin: cfg.origin, states: {}};
     job.providers = [...new Set(job.providers?.length ? job.providers : [job.provider])]
@@ -628,7 +699,9 @@ async function tick() {
 async function tickBody() {
   const cfg = await settings();
   if (!cfg.enabled || !cfg.origin || !cfg.token) return;
+  void probeBridge();
   const jobs = await workerJobs(cfg.origin);
+  await recordWorkerStatus(jobs, cfg.origin);
   // There is deliberately NO global work lock or "any active job" return. A later
   // wakeup can advance B/admit C even while A's short transport attempt is pending.
   const work = Object.values(jobs)
@@ -645,6 +718,7 @@ async function heartbeatTick() {
   try {
     const cfg = await settings();
     if (!cfg.enabled || !cfg.origin || !cfg.token) return;
+    void probeBridge();
     const jobs = await workerJobs(cfg.origin);
     const current = Object.values(jobs).filter(j => j.origin === cfg.origin);
     // Job-specific lease pings, not just a misleading profile-level connection ping.
@@ -665,6 +739,13 @@ function loop() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); }
+});
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== "ashlar-poll-now") return;
+  void probeBridge();
+  void heartbeatTick();
+  void tick();
+  sendResponse({ok: true, scheduled: true});
 });
 chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
 chrome.runtime.onInstalled.addListener(loop);

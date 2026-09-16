@@ -2,10 +2,12 @@
 
 ## Scope
 
-This is a standalone change based on main `dde552f`. It replaces the extension's
-one-PR-at-a-time scheduler. It does not include the separate, unpublished
-connection-diagnostics popup, server diagnostics, JSON-parser changes, or original
-response dashboard. No backend API or authentication changes are required.
+This is a standalone parallel-processing PR, now integrated with main `16fffe2`
+(PR #35 landed while this work was being tested). It replaces the extension's
+one-PR-at-a-time scheduler while preserving the merged connection-diagnostics
+popup, worker health protocol and missing-job response preservation. It does not
+add JSON-parser changes or the separate original-response dashboard. No backend
+API or authentication changes are required.
 
 A pending A must not prevent a separately mentioned B from starting when a review
 tab slot is free. B may finish, post to B's PR, and close before A finishes. The
@@ -74,9 +76,9 @@ output collection is not reintroduced.
 
 Update the files in the existing unpacked extension directory and reload that
 same extension. The version is `1.1.16`. Keep its origin, token, storage and active
-model tabs; do not remove/reinstall it or clear storage. This PR is independent of
-the earlier local `1.1.15` diagnostics patch and should be installed from its own
-complete extension directory, not by mixing files from unpublished patches.
+model tabs; do not remove/reinstall it or clear storage. This PR preserves the already-merged
+`1.1.15` diagnostics and should be installed from its own complete extension
+directory, not by mixing files from unpublished patches.
 
 No server deployment is needed for this scheduler change on the referenced main
 bridge protocol. A Git merge does not update an already loaded browser extension.

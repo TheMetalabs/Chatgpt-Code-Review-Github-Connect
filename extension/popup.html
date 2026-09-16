@@ -5,15 +5,22 @@
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <h1>Ashlar bridge</h1>
+    <h1>Ashlar bridge <small id="version"></small></h1>
     <p class="muted">Same Chrome where ChatGPT or Grok is signed in. Polls Ashlar and sends the review prompt.</p>
     <label>Ashlar origin</label>
     <input id="origin" placeholder="https://…" />
     <label>Bridge token</label>
-    <input id="token" placeholder="from Ashlar Settings" />
+    <input id="token" type="password" autocomplete="off" placeholder="from Ashlar Settings" />
     <label class="row"><input id="enabled" type="checkbox" checked /> Enabled</label>
     <button id="save">Save & connect</button>
     <p id="status" class="muted"></p>
+    <section aria-label="Bridge diagnostics">
+      <h2>Connection</h2>
+      <p id="connection" class="muted" aria-live="polite"></p>
+      <h2>Job polling</h2>
+      <p id="worker" class="muted" aria-live="polite"></p>
+      <button id="reconnect" type="button">Check connection &amp; poll now</button>
+    </section>
     <script src="popup.js"></script>
   </body>
 </html>

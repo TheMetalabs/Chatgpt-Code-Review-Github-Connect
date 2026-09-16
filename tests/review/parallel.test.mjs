@@ -212,3 +212,27 @@ test('parallel: one failed cleanup never releases the job lock while its sibling
   try {await reached(()=>removing,'sibling cleanup did not start');for(let i=0;i<10;i++)await flush();assert.equal(finished,false,'job lock released before sibling finished');}
   finally {hold.resolve();await first;}
 });
+
+test('parallel: merged connection diagnostics remain available without an active-job gate',async()=>{
+  const b=fixture([pending('A',10)],[request('B')]);
+  assert.equal(typeof b.context.probeBridge,'function','PR35 connection probe was removed');
+  assert.equal(await b.context.probeBridge(),true);await b.tick();
+  assert.equal(b.local.state.bridgeHealth.ok,true);
+  assert.equal(b.local.state.bridgeWorkerStatus.activeJobs,2);
+  assert.ok(b.messages.some(m=>m.jobId==='B'&&m.type==='ashlar-run'));
+});
+
+test('parallel: missing server job still saves its original final response while admitting B',async()=>{
+  const b=fixture([pending('A',10)],[request('B')]);b.done.add('A');const api=b.context.api;
+  b.context.api=(path,body,...args)=>body?.jobId==='A'?Promise.resolve({ok:true,active:false,accepted:false,status:'missing'}):api(path,body,...args);
+  await b.tick();assert.equal(b.local.state.pendingReviewJobs.A.states.chatgpt.outcome?.raw,response('A'));
+  assert.equal(b.calls.some(c=>c.jobId==='A'&&c.action==='complete'),false);
+  assert.ok(b.tabs.has(10));assert.ok(b.messages.some(m=>m.jobId==='B'&&m.type==='ashlar-run'));
+});
+
+test('parallel: health diagnostics pin the origin and never persist response credentials',async()=>{
+  const b=fixture();assert.equal(typeof b.context.probeBridge,'function');
+  b.context.api=async(_path,_body,origin)=>{assert.equal(origin,'http://bridge');return {ok:true,bridge:{pendingJobs:3,token:'must not persist'}};};
+  await b.context.probeBridge();assert.equal(b.local.state.bridgeHealth.pendingJobs,3);
+  assert.equal('token' in b.local.state.bridgeHealth,false);
+});

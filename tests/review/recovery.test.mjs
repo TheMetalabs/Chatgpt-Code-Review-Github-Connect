@@ -11,7 +11,7 @@ function server(jobs) {
     received.push(body); return { ok: true };
   } };
 }
-test('worker restart recovers A before taking B and never submits A twice', async () => {
+test('worker restart recovers A while admitting B and never submits A twice', async () => {
   const s = server([job('A'), job('B')]);
   let done = false;
   const handler = (_id, msg) => msg.type === 'ashlar-run' || !done ? { ok: false, code: 'busy' } : { ok: true, raw };
@@ -19,10 +19,10 @@ test('worker restart recovers A before taking B and never submits A twice', asyn
   await first.tick();
   const second = background({ api: s.api, handler, local: first.local, session: first.session, tabs: first.tabs });
   await second.tick();
-  assert.equal(second.calls.some(c => c.action === 'take'), false, 'B was taken while A was pending');
+  assert.equal(second.calls.some(c => c.action === 'take'), true, 'free slots should admit B while A is pending');
   done = true; await second.tick();
   assert.ok(s.received.some(c => c.action === 'complete' && c.jobId === 'A'));
-  assert.equal(second.messages.some(m => m.type === 'ashlar-run'), false, 'A was resubmitted');
+  assert.equal(second.messages.some(m => m.type === 'ashlar-run' && m.jobId === 'A'), false, 'A was resubmitted');
   await second.tick();
   assert.equal(second.messages.filter(m => m.type === 'ashlar-run' && m.jobId === 'B').length, 1);
 });
@@ -51,7 +51,7 @@ test('unacknowledged completion survives worker restart without a second model c
   assert.ok(s.received.some(c => c.action === 'complete' && c.results[0].raw === raw));
   assert.equal(r.messages.length, 0);
 });
-test('legacy session tab mappings are recovered before the next take', async () => {
+test('legacy session tab mappings remain recoverable alongside the next take', async () => {
   const s = server([job('B')]);
   const b = background({ api: s.api, handler: () => ({ ok: true, raw }),
     session: storage({ busy: true, jobId: 'A', tabs: { 'A:chatgpt': 10 }, generating: { chatgpt: true } }),
@@ -59,7 +59,8 @@ test('legacy session tab mappings are recovered before the next take', async () 
     tabs: new Map([[10, { id: 10, url: 'https://chatgpt.com/c/a' }]]) });
   await b.tick();
   assert.ok(s.received.some(c => c.action === 'complete' && c.jobId === 'A'));
-  assert.equal(b.calls.some(c => c.action === 'take'), false);
+  assert.equal(b.calls.some(c => c.action === 'take'), true);
+  assert.equal(b.messages.some(m => m.type === 'ashlar-run' && m.jobId === 'A' && !m.resume), false);
 });
 test('lost start acknowledgement retries the idempotent run, not observer-only resume', async () => {
   const s = server([job('A')]); let disconnected = true;
@@ -89,10 +90,12 @@ test('a missing prompt alone leaves the original pending tab recoverable', async
   const api = (p, b) => { if (!b && missing) throw Object.assign(new Error('no prompt'), { status: 404 }); return s.api(p, b); };
   const b = background({ api }); await b.tick(); missing = true;
   delete b.local.state.pendingReviewJobs.A.prompt; // Migrated job needs to retrieve its prompt.
-  const count = b.messages.length; await b.tick();
-  assert.equal(b.messages.length, count);
-  assert.ok(b.local.state.pendingReviewJobs.A);
-  assert.equal(b.closedTabs.length, 0);
+  // Migration is loaded on worker startup, not by replacing an active worker's cache.
+  const r = background({ api, local: b.local, session: b.session, tabs: b.tabs });
+  await r.tick();
+  assert.equal(r.messages.length, 0);
+  assert.ok(r.local.state.pendingReviewJobs.A);
+  assert.equal(r.closedTabs.length, 0);
 });
 test('success is delivered before any generating=false heartbeat', async () => {
   const s = server([job('A')]); let ready = false, completed = false;

@@ -157,3 +157,51 @@ test('local-only E2E: pending until response ends, then a single final review',a
  app.localResponses[0].end(envelope(json));await eventually(()=>app.reviews.length===1,'local-only review not published');
  assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId).status,'posted');
 });
+
+test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/closes → C admitted',async t=>{
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-parallel-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
+ const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
+ const extension=join(root,'extension');
+ const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,
+   channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ t.after(()=>context.close());
+ const manager=await context.newPage();await manager.goto('chrome://extensions');
+ const developerMode=manager.locator('#devMode');await developerMode.waitFor({state:'visible'});
+ assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
+ if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ await manager.close();
+ let worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,maxReviewTabs:2}),app.origin);
+ const request=pr=>app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'mv3-parallel-'+pr,event:'issue_comment',payload:{
+   action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},
+   issue:{number:pr,pull_request:{},title:'parallel '+pr},comment:{id:pr,body:'@ashlar-bot review'}}});
+ const a=request(101);assert.equal(a.queued,true);
+ let pageA;
+ await eventually(async()=>{await worker.evaluate(()=>tick());pageA=context.pages().find(p=>p.url().startsWith('https://chatgpt.com/'));return pageA&&pageA.evaluate(()=>window.sends===1).catch(()=>false);},'A did not start');
+ const b=request(202);assert.equal(b.queued,true);
+ let pageB;
+ await eventually(async()=>{await worker.evaluate(()=>tick());pageB=context.pages().find(p=>p!==pageA&&p.url().startsWith('https://chatgpt.com/'));return pageB&&pageB.evaluate(()=>window.sends===1).catch(()=>false);},'B was blocked by unfinished A');
+ assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===a.jobId).status,'awaiting_chat');
+ assert.equal(app.reviews.length,0);app.clock.now+=365*24*3600_000;
+ const personal=await context.newPage(),cdp=await context.newCDPSession(personal),workerUrl=worker.url();
+ await worker.evaluate(()=>{globalThis.__fixtureBeforeReload=true;});
+ await worker.evaluate(()=>chrome.runtime.reload()).catch(()=>{});
+ await eventually(async()=>{
+   try {const state=await evaluateTarget(cdp,workerUrl,'({old:Boolean(globalThis.__fixtureBeforeReload),tick:typeof tick})');return !state.old&&state.tick==='function';}
+   catch{return false;}
+ },'parallel worker failed to restart');
+ worker={evaluate:fn=>evaluateTarget(cdp,workerUrl,`(${fn.toString()})()`)};
+ await worker.evaluate(()=>tick());
+ assert.equal(await pageA.evaluate(()=>window.sends),1);assert.equal(await pageB.evaluate(()=>window.sends),1);
+ await pageB.evaluate(raw=>window.reply(raw,true),JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['B only']}));
+ await eventually(async()=>{await worker.evaluate(()=>tick());return pageB.isClosed()&&app.reviews.length===1;},'B did not post and close independently');
+ assert.equal(app.reviews[0].pr,202);assert.equal(pageA.isClosed(),false);assert.equal(personal.isClosed(),false);
+ assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===a.jobId).storedLegs.length,0);
+ const c=request(303);assert.equal(c.queued,true);
+ let pageC;
+ await eventually(async()=>{await worker.evaluate(()=>tick());pageC=context.pages().find(p=>p!==pageA&&p.url().startsWith('https://chatgpt.com/'));return pageC&&pageC.evaluate(()=>window.sends===1).catch(()=>false);},'freed B slot did not admit C');
+ assert.equal(pageA.isClosed(),false);assert.equal(context.pages().filter(p=>p.url().startsWith('https://chatgpt.com/')).length,2);
+ assert.equal(await pageA.evaluate(()=>window.sends),1);assert.equal(app.reviews.length,1);
+});

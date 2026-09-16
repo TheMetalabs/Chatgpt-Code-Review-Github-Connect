@@ -1,20 +1,63 @@
 const POLL_MS = 2500;
-const HEARTBEAT_MS = 10_000;
-const HEALTH_KEY = "bridgeHealth";
-const WORKER_STATUS_KEY = "bridgeWorkerStatus";
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
 const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
 const CLOSED_PREFIX = "ashlar:closed:";
 const OWNED_PREFIX = "ashlar:tab:";
 const DEFAULT_MAX_REVIEW_TABS = 4;
+const HEARTBEAT_MS = 10_000;
+const HEALTH_KEY = "bridgeHealth";
+const WORKER_STATUS_KEY = "bridgeWorkerStatus";
+
+// Locks are ephemeral; identities, replies and allocation intent remain in storage.
+// All lanes share one loaded registry, so concurrent jobs never write stale maps.
+const jobLanes = new Map();
+const heartbeatLanes = new Map();
+const admissionLanes = new Map();
+let registryPromise;
+let clientPromise;
+let storageTail = Promise.resolve();
+let allocationTail = Promise.resolve();
+
+function singleFlight(lanes, key, operation) {
+  if (lanes.has(key)) return lanes.get(key);
+  const pending = Promise.resolve().then(operation).finally(() => {
+    if (lanes.get(key) === pending) lanes.delete(key);
+  });
+  lanes.set(key, pending);
+  return pending;
+}
+
+async function joinLanes(promises) {
+  // Keep the owning job lock until EVERY sibling settles, including on storage errors.
+  const outcomes = await Promise.allSettled(promises);
+  const failed = outcomes.find(outcome => outcome.status === "rejected");
+  if (failed) throw failed.reason;
+}
+
+function writeInOrder(operation) {
+  const pending = storageTail.then(operation);
+  storageTail = pending.catch(() => {}); // A failed write must not poison later retries.
+  return pending;
+}
+
+function workerJobs(origin) {
+  if (!registryPromise) registryPromise = pendingJobs(origin).catch(error => {
+    registryPromise = undefined;
+    throw error;
+  });
+  return registryPromise;
+}
 
 async function clientId() {
-  const old = (await chrome.storage.local.get([CLIENT_KEY]))[CLIENT_KEY];
-  if (old) return old;
-  const id = crypto.randomUUID();
-  await chrome.storage.local.set({[CLIENT_KEY]: id});
-  return id;
+  if (!clientPromise) clientPromise = (async () => {
+    const old = (await chrome.storage.local.get([CLIENT_KEY]))[CLIENT_KEY];
+    if (old) return old;
+    const id = crypto.randomUUID();
+    await chrome.storage.local.set({[CLIENT_KEY]: id});
+    return id;
+  })().catch(error => { clientPromise = undefined; throw error; });
+  return clientPromise;
 }
 
 function closedKey(job, provider) {
@@ -58,9 +101,10 @@ async function settings() {
   };
 }
 
-async function api(path, body, config) {
-  const { origin, token } = config || await settings();
+async function api(path, body, expectedOrigin) {
+  const { origin, token } = await settings();
   if (!origin || !token) throw new Error("set origin and token in the popup");
+  if (expectedOrigin && expectedOrigin !== origin) throw new Error("bridge origin changed; original job preserved");
   const res = await fetch(`${origin}${path}`, {
     method: body ? "POST" : "GET",
     headers: {
@@ -93,7 +137,7 @@ function probeBridge() {
     const checkedAt = Date.now();
     const extensionVersion = chrome.runtime.getManifest?.().version || "unknown";
     try {
-      const result = await api("/api/bridge", {action: "ping", extensionVersion}, cfg);
+      const result = await api("/api/bridge", {action: "ping", extensionVersion}, cfg.origin);
       const bridge = result.bridge || {};
       // Persist an allowlist, not the whole response (which can contain private prompts).
       await chrome.storage.local.set({[HEALTH_KEY]: {
@@ -115,8 +159,7 @@ function probeBridge() {
   return healthFlight;
 }
 
-// Preserve sequential scheduling for a healthy generation. Recovery, terminal
-// cleanup and saved outboxes are separate work; none owns the admission lane.
+// For diagnostics only: an active job is NEVER an admission gate.
 function activelyReviewing(job) {
   if (job.serverStatus || job.recoveryError) return false;
   return job.providers.some(p => {
@@ -127,6 +170,7 @@ function activelyReviewing(job) {
 
 async function recordWorkerStatus(jobs, origin, phase) {
   const relevant = Object.values(jobs).filter(job => job.origin === origin);
+  phase ||= relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
   await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
     origin, checkedAt: Date.now(), phase,
     activeJobs: relevant.filter(activelyReviewing).length,
@@ -185,10 +229,12 @@ function providerOpen(quota, provider) {
 }
 
 async function markQuota(provider) {
-  const quota = await quotaMap();
-  quota[provider] = Date.now() + (QUOTA_MS[provider] || QUOTA_MS.chatgpt);
-  await chrome.storage.local.set({ quota });
-  return quota[provider];
+  return writeInOrder(async () => {
+    const quota = await quotaMap();
+    quota[provider] = Date.now() + (QUOTA_MS[provider] || QUOTA_MS.chatgpt);
+    await chrome.storage.local.set({ quota });
+    return quota[provider];
+  });
 }
 
 function contentFiles(provider) {
@@ -202,7 +248,10 @@ function contentFiles(provider) {
  * An unacknowledged outcome is replayed to the bridge, never to the model.
  */
 async function saveJobs(jobs) {
-  await chrome.storage.local.set({ [PENDING_JOBS]: jobs });
+  // Snapshot now, write in invocation order. Later snapshots include other lanes'
+  // mutations because they reference the same registry throughout this worker.
+  const snapshot = JSON.parse(JSON.stringify(jobs));
+  await writeInOrder(() => chrome.storage.local.set({ [PENDING_JOBS]: snapshot }));
 }
 
 async function pendingJobs(origin) {
@@ -283,23 +332,58 @@ async function findOriginalTab(job, provider) {
   return null;
 }
 
-async function tabCapacityAvailable(jobs) {
+async function tabCapacityAvailable(jobs, reservePending = false) {
   const setting = (await chrome.storage.local.get(["maxReviewTabs"])).maxReviewTabs;
   const limit = Number.isInteger(setting) && setting > 0 ? Math.min(setting, 16) : DEFAULT_MAX_REVIEW_TABS;
-  // Include cleanup-pending tabs and other configured origins, not only running legs.
-  const ids = new Set(Object.values(jobs).flatMap(job => Object.values(job.states)
-    .filter(state => state.tabId && !state.cleanupDone).map(state => state.tabId)));
-  // Closed/absent IDs retained for recovery are not physical tabs. Query failure
-  // propagates: an unknown inventory must not authorize unlimited tab creation.
   const tabs = await chrome.tabs.query({});
-  const open = new Set(tabs.map(tab => tab.id));
-  const knownOpen = [...ids].filter(id => open.has(id)).length;
-  // Browser restart can change tab IDs. If old bindings are unresolved, reserve
-  // capacity for possible restored provider pages without adopting or closing them.
-  const unresolved = Object.values(jobs).flatMap(job => Object.values(job.states))
-    .filter(state => !state.cleanupDone && (state.tabId ? !open.has(state.tabId) : state.started)).length;
-  const possibleRestored = tabs.filter(tab => !ids.has(tab.id) && (allowedTab(tab, "chatgpt") || allowedTab(tab, "grok"))).length;
-  return knownOpen + Math.min(unresolved, possibleRestored) < limit;
+  const live = new Map(tabs.map(tab => [tab.id, tab]));
+  const session = await chrome.storage.session.get(null);
+  const ids = new Set();
+  const restoring = {chatgpt: 0, grok: 0}, allocating = {chatgpt: 0, grok: 0};
+  let reserved = 0;
+  for (const job of Object.values(jobs)) for (const p of job.providers) {
+    const state = job.states[p];
+    if (state.cleanupDone || session[closedKey(job, p)]) continue;
+    if (state.tabId && live.has(state.tabId) && allowedTab(live.get(state.tabId), p)) {
+      ids.add(state.tabId);
+    } else if (state.allocating) {
+      allocating[p]++;
+    } else if (state.started || job.resumeProviders?.includes(p)) {
+      restoring[p]++; // IDs can change after restart; do not ignore restored tabs.
+    } else if (reservePending && !state.tabId && !state.delivered && !state.outcome &&
+               !job.serverStatus && !job.recoveryError) {
+      reserved++; // An admitted provider awaiting creation already owns admission space.
+    }
+  }
+  let used = ids.size + reserved;
+  for (const p of ["chatgpt", "grok"]) {
+    const unknownTabs = tabs.filter(tab => !ids.has(tab.id) && allowedTab(tab, p)).length;
+    used += allocating[p] + Math.min(restoring[p], Math.max(0, unknownTabs - allocating[p]));
+  }
+  return used < limit;
+}
+
+async function allocateProviderTab(job, provider, jobs) {
+  // Serialize only the short capacity/create boundary, never model or bridge RPCs.
+  const operation = allocationTail.then(async () => {
+    const state = job.states[provider];
+    if (state.tabId || state.allocating || !await tabCapacityAvailable(jobs)) return;
+    state.allocating = true;
+    try { await saveJobs(jobs); }
+    catch (error) { delete state.allocating; throw error; } // No create was attempted.
+    try {
+      const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
+      state.tabId = created.id;
+      await rememberOwnedTab(job, provider);
+      delete state.allocating;
+      await saveJobs(jobs); // Durable binding before any prompt dispatch.
+    } catch (error) {
+      if (!state.tabId) { delete state.allocating; await saveJobs(jobs); }
+      throw error;
+    }
+  });
+  allocationTail = operation.catch(() => {});
+  return operation;
 }
 
 async function finishTabCleanup(job, provider, jobs, reason) {
@@ -364,11 +448,13 @@ async function cleanupProvider(job, provider, jobs) {
 
 async function retireCleanJob(job, jobs) {
   if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
-  const old = await chrome.storage.session.get(["tabs"]);
-  const tabs = {...old.tabs};
-  for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
-  await chrome.storage.session.set({tabs});
-  await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
+  await writeInOrder(async () => {
+    const old = await chrome.storage.session.get(["tabs"]);
+    const tabs = {...old.tabs};
+    for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
+    await chrome.storage.session.set({tabs});
+    await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
+  });
   delete jobs[job.jobId];
   await saveJobs(jobs);
   return true;
@@ -379,10 +465,14 @@ function connectionErrors(job) {
     .map(p => [p, {code: "disconnected", message: job.states[p].connectionError}]));
 }
 
-async function heartbeat(job, jobs) {
+function heartbeat(job, jobs) {
+  return singleFlight(heartbeatLanes, `${job.origin}:${job.jobId}`, () => refreshJobHeartbeat(job, jobs));
+}
+
+async function refreshJobHeartbeat(job, jobs) {
   const body = {action: "ping", jobId: job.jobId, leaseId: job.leaseId,
     generating: generatingFor(job), providerErrors: connectionErrors(job)};
-  let result = await api("/api/bridge", body);
+  let result = await api("/api/bridge", body, job.origin);
   if (result.active === false) {
     job.serverStatus = result.status || "unknown";
     await saveJobs(jobs);
@@ -390,14 +480,12 @@ async function heartbeat(job, jobs) {
   }
   delete job.serverStatus;
   if (result.accepted === false || !job.leaseId) {
-    const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()});
+    const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()}, job.origin);
     job.leaseId = claim.leaseId;
     await saveJobs(jobs);
-    result = await api("/api/bridge", {...body, leaseId: job.leaseId});
+    result = await api("/api/bridge", {...body, leaseId: job.leaseId}, job.origin);
     if (result.accepted === false) throw new Error("bridge lease could not be renewed");
   }
-  delete job.recoveryError;
-  await saveJobs(jobs);
   return true;
 }
 
@@ -405,23 +493,40 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   const state = job.states[provider];
   if (state.outcome || state.delivered) return;
   if (!state.runId) { state.runId = crypto.randomUUID(); await saveJobs(jobs); }
+  if (state.allocating && !state.tabId) {
+    // Creation may have succeeded before a worker restart. Recover a recorded owner;
+    // if none can be established, keep the intent instead of opening another tab.
+    const session = await chrome.storage.session.get(null);
+    const owner = Object.entries(session).find(([key, value]) => key.startsWith(OWNED_PREFIX) &&
+      value?.jobId === job.jobId && value.provider === provider && value.runId === state.runId);
+    if (owner) state.tabId = Number(owner[0].slice(OWNED_PREFIX.length));
+    else {
+      const original = await findOriginalTab(job, provider);
+      if (original) { state.tabId = original.id; state.started = true; }
+    }
+    if (!state.tabId) {
+      state.connectionError = "tab creation outcome unknown; original allocation preserved";
+      await saveJobs(jobs);
+      return;
+    }
+    delete state.allocating;
+    await saveJobs(jobs);
+  }
   if (!state.tabId && (state.started || job.resumeProviders?.includes(provider))) {
     const original = await findOriginalTab(job, provider);
     if (original) { state.tabId = original.id; state.started = true; await saveJobs(jobs); }
     else { state.connectionError = "original review tab unavailable; waiting for reconnection"; await saveJobs(jobs); return; }
   }
   if (!state.tabId) {
-    if (observeOnly || !await tabCapacityAvailable(jobs)) return;
+    if (observeOnly) return;
     const quota = await quotaMap();
     if (!providerOpen(quota, provider)) {
       state.outcome = failure("quota", "usage limit — waiting for reset");
       await saveJobs(jobs);
       return;
     }
-    const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
-    state.tabId = created.id;
-    await rememberOwnedTab(job, provider);
-    await saveJobs(jobs); // Persist before any prompt dispatch; readiness is polled on later ticks.
+    await allocateProviderTab(job, provider, jobs);
+    if (!state.tabId) return;
   }
   if ((await chrome.storage.session.get([closedKey(job, provider)]))[closedKey(job, provider)]) {
     state.outcome = failure("tab_closed", "review tab was explicitly closed");
@@ -491,7 +596,7 @@ async function deliverOutcome(job, provider, jobs) {
   const body = out.ok
     ? {action: "complete", jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw}]}
     : {action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}`};
-  try { await api("/api/bridge", body); }
+  try { await api("/api/bridge", body, job.origin); }
   catch (e) {
     if (e.status === 409) { job.leaseId = undefined; await saveJobs(jobs); throw e; }
     if (e.status === 400 && out.ok && !job.serverStatus) {
@@ -511,7 +616,7 @@ async function deliverOutcome(job, provider, jobs) {
 
 async function advanceJob(job, jobs) {
   // Cleanup is independent of server availability once acknowledgement was persisted.
-  for (const p of job.providers) await cleanupProvider(job, p, jobs);
+  await joinLanes(job.providers.map(p => cleanupProvider(job, p, jobs)));
   if (await retireCleanJob(job, jobs)) return;
   const active = await heartbeat(job, jobs);
   if (!active && job.serverStatus === "cancelled") {
@@ -520,19 +625,18 @@ async function advanceJob(job, jobs) {
       job.states[p].cleanupPending = true;
     }
     await saveJobs(jobs);
-    for (const p of job.providers) await cleanupProvider(job, p, jobs);
+    await joinLanes(job.providers.map(p => cleanupProvider(job, p, jobs)));
     await retireCleanJob(job, jobs);
     return;
   }
   const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
-  // A missing server job is not permission to delete the tab or generate again.
-  // Observe the original tab and retain its final reply locally while recovering.
+  // Missing is not ACK: observe and preserve the original response without redelivery.
   if (active && !job.prompt) {
-    const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}`);
+    const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}`, undefined, job.origin);
     Object.assign(job, {prompt: current.prompt, prompts: current.prompts});
     await saveJobs(jobs);
   }
-  for (const provider of job.providers) {
+  await joinLanes(job.providers.map(async provider => {
     try {
       await pollProvider(job, provider, jobs, !active);
       if (canDeliver) await deliverOutcome(job, provider, jobs);
@@ -541,98 +645,105 @@ async function advanceJob(job, jobs) {
       // A failing provider must not prevent the others from being collected/closed.
       await chrome.storage.local.set({lastError: String(e.message || e).slice(0, 240)});
     }
-  }
+  }));
   if (active) await heartbeat(job, jobs);
   await retireCleanJob(job, jobs);
 }
 
-let tickLock = false;
+function progressJob(job, jobs) {
+  if (jobs[job.jobId] !== job) return Promise.resolve();
+  return singleFlight(jobLanes, `${job.origin}:${job.jobId}`, async () => {
+    try {
+      await advanceJob(job, jobs);
+      if (job.recoveryError) { delete job.recoveryError; await saveJobs(jobs); }
+    } catch (error) {
+      job.recoveryError = String(error.message || error).slice(0, 240);
+      await saveJobs(jobs);
+      await chrome.storage.local.set({lastError: job.recoveryError});
+    } finally { await recordWorkerStatus(jobs, job.origin); }
+  });
+}
+
+function admitJob(cfg, jobs) {
+  return singleFlight(admissionLanes, cfg.origin, async () => {
+    if (!await tabCapacityAvailable(jobs, true)) {
+      await recordWorkerStatus(jobs, cfg.origin, "tab_capacity"); return null;
+    }
+    const quota = await quotaMap();
+    if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) {
+      await recordWorkerStatus(jobs, cfg.origin, "provider_quota"); return null;
+    }
+    const payload = await api("/api/bridge", {
+      action: "take", clientId: await clientId(), excludeJobIds: Object.keys(jobs),
+    }, cfg.origin).catch(async error => {
+      await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;
+    });
+    if (!payload.job || jobs[payload.job.jobId]) return null;
+    const job = {...payload.job, origin: cfg.origin, states: {}};
+    job.providers = [...new Set(job.providers?.length ? job.providers : [job.provider])]
+      .filter(p => ["chatgpt", "grok"].includes(p));
+    if (!job.providers.length) throw new Error("bridge returned no supported review providers");
+    for (const p of job.providers) job.states[p] = {};
+    jobs[job.jobId] = job;
+    await saveJobs(jobs); // Provider intents reserve admission space before this lock opens.
+    await chrome.storage.local.set({lastJobId: job.jobId, lastError: ""});
+    return job;
+  });
+}
+
 async function tick() {
-  if (tickLock) return;
-  tickLock = true;
-  try {
-    await tickBody();
-  } catch (e) {
-    await chrome.storage.local.set({ lastError: String(e.message || e).slice(0, 240) });
-  } finally {
-    tickLock = false;
-  }
+  try { await tickBody(); }
+  catch (error) { await chrome.storage.local.set({lastError: String(error.message || error).slice(0, 240)}); }
 }
 
 async function tickBody() {
   const cfg = await settings();
   if (!cfg.enabled || !cfg.origin || !cfg.token) return;
-  // Start health checking independently; already-acknowledged cleanup must also
-  // work offline, so only new admission is gated by the probe result.
-  const connection = probeBridge();
-  const jobs = await pendingJobs(cfg.origin);
-  const recovering = Object.values(jobs).filter(j => j.origin === cfg.origin);
-  for (const job of recovering) {
-    try { await advanceJob(job, jobs); }
-    catch (e) {
-      job.recoveryError = String(e.message || e).slice(0, 240);
-      await saveJobs(jobs);
-      await chrome.storage.local.set({lastError: job.recoveryError});
+  void probeBridge();
+  const jobs = await workerJobs(cfg.origin);
+  await recordWorkerStatus(jobs, cfg.origin);
+  // There is deliberately NO global work lock or "any active job" return. A later
+  // wakeup can advance B/admit C even while A's short transport attempt is pending.
+  const work = Object.values(jobs)
+    .filter(j => j.origin === cfg.origin && !jobLanes.has(`${j.origin}:${j.jobId}`))
+    .map(job => progressJob(job, jobs));
+  // Do not add another waiter to an already-running lane on every alarm/timer tick.
+  if (!admissionLanes.has(cfg.origin)) {
+    work.push(admitJob(cfg, jobs).then(job => job && progressJob(job, jobs)));
+  }
+  await joinLanes(work);
+}
+
+async function heartbeatTick() {
+  try {
+    const cfg = await settings();
+    if (!cfg.enabled || !cfg.origin || !cfg.token) return;
+    void probeBridge();
+    const jobs = await workerJobs(cfg.origin);
+    const current = Object.values(jobs).filter(j => j.origin === cfg.origin);
+    // Job-specific lease pings, not just a misleading profile-level connection ping.
+    if (current.length) await Promise.allSettled(current
+      .filter(job => !heartbeatLanes.has(`${job.origin}:${job.jobId}`))
+      .map(job => heartbeat(job, jobs)));
+    else if (!heartbeatLanes.has(cfg.origin)) {
+      await singleFlight(heartbeatLanes, cfg.origin, () => api("/api/bridge", {action: "ping"}, cfg.origin));
     }
-  }
-  const current = Object.values(jobs).filter(j => j.origin === cfg.origin);
-  if (!await connection) {
-    await recordWorkerStatus(jobs, cfg.origin, "disconnected");
-    return;
-  }
-  if (current.some(activelyReviewing)) {
-    await recordWorkerStatus(jobs, cfg.origin, "reviewing");
-    return;
-  }
-  // Recovery ran first; completion can yield until the next tick as before.
-  if (recovering.length && !current.length) {
-    await recordWorkerStatus(jobs, cfg.origin, "idle");
-    return;
-  }
-  if (!await tabCapacityAvailable(jobs)) {
-    await recordWorkerStatus(jobs, cfg.origin, "tab_capacity");
-    return;
-  }
-  const quota = await quotaMap();
-  if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) {
-    await recordWorkerStatus(jobs, cfg.origin, "provider_quota");
-    return;
-  }
-  // Keep all old jobs/outboxes. Do not re-take them or overwrite their identities.
-  const payload = await api("/api/bridge", {action: "take", clientId: await clientId(), excludeJobIds: Object.keys(jobs)});
-  if (!payload.job) {
-    await recordWorkerStatus(jobs, cfg.origin, current.length ? "recovering" : "idle");
-    return;
-  }
-  if (jobs[payload.job.jobId]) {
-    // Defensive compatibility with a server that ignores excludeJobIds.
-    await recordWorkerStatus(jobs, cfg.origin, "recovering");
-    return;
-  }
-  const job = { ...payload.job, origin: cfg.origin, states: {} };
-  job.providers = (job.providers?.length ? job.providers : [job.provider])
-    .filter(p => ["chatgpt", "grok"].includes(p));
-  for (const p of job.providers) job.states[p] = {};
-  jobs[job.jobId] = job;
-  await saveJobs(jobs);
-  await chrome.storage.local.set({ lastJobId: job.jobId, lastError: "" });
-  await advanceJob(job, jobs);
-  const remaining = Object.values(jobs).filter(j => j.origin === cfg.origin);
-  await recordWorkerStatus(jobs, cfg.origin, remaining.some(activelyReviewing) ? "reviewing" : remaining.length ? "recovering" : "idle");
+  } catch (error) { await chrome.storage.local.set({lastError: String(error.message || error).slice(0, 240)}); }
 }
 
 function loop() {
   chrome.alarms.create("ashlar-poll", { periodInMinutes: 1 });
-  void probeBridge();
+  void heartbeatTick();
   void tick();
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ashlar-poll") { void probeBridge(); void tick(); }
+  if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); }
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== "ashlar-poll-now") return;
   void probeBridge();
+  void heartbeatTick();
   void tick();
   sendResponse({ok: true, scheduled: true});
 });
@@ -642,4 +753,4 @@ chrome.runtime.onStartup.addListener(loop);
 loop();
 setInterval(() => void tick(), POLL_MS);
 
-setInterval(() => void probeBridge(), HEARTBEAT_MS);
+setInterval(() => void heartbeatTick(), HEARTBEAT_MS);

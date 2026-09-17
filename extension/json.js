@@ -177,21 +177,32 @@ function trackCompletedSource(state, bound, done, text = "") {
 function currentRepairSource() {
   const state = globalThis.__ashlarRunnerState;
   if (!state?.jobId || !state.runId) return null;
+  const unavailable = () => {
+    trackCompletedSource(state, null, false);
+    if (state.repairProbeTracker) trackCompletedSource(state.repairProbeTracker, null, false);
+    return null;
+  };
   let submission;
   try { submission = state.confirmedSubmission?.record || savedSubmission(); }
-  catch { return trackCompletedSource(state, null, false); }
-  if (submission?.phase !== "sent") return trackCompletedSource(state, null, false);
+  catch { return unavailable(); }
+  if (submission?.phase !== "sent") return unavailable();
   const bound = boundReviewResponse(submission);
-  if (!bound.identified || !bound.root || !bound.responseId) return trackCompletedSource(state, null, false);
+  if (!bound.identified || !bound.root || !bound.responseId) return unavailable();
   if (bound.followup) state.tabRepurposed = true;
   const stop = bound.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
   const done = !stop && !responseStreaming(bound.root) && replyDoneVisible(bound.root);
   const text = done ? assistantCorpus(bound.root).join("\n\n") : "";
-  if (!done || !text.trim() || text.length > 500_000) return trackCompletedSource(state, bound, false);
-  // While running, the collector owns stability. A worker probe must not turn
-  // the first changed fragment into a final source by double-counting it.
-  if (!state.running) trackCompletedSource(state, bound, done, text);
-  if (state.completedSource?.text !== text || state.completedSource.responseId !== bound.responseId) return null;
+  if (!done || !text.trim() || text.length > 500_000) return unavailable();
+  // A replaced listener is not a replaced async invocation. Only a collector
+  // which entered the tracking-capable loop can own these observations.
+  const owner = state.sourceTrackingOwner;
+  const tracksSource = owner?.jobId === state.jobId && owner.runId === state.runId && owner.provider === state.provider;
+  // Unknown/legacy running loops may still mutate their old tracking fields.
+  // Keep probe observations separate so two different producers cannot combine
+  // first sightings into a stable source during a listener-only upgrade.
+  const tracker = state.running && !tracksSource ? (state.repairProbeTracker ||= {}) : state;
+  if (!state.running || !tracksSource) trackCompletedSource(tracker, bound, done, text);
+  if (tracker.completedSource?.text !== text || tracker.completedSource.responseId !== bound.responseId) return null;
   return {text, totalChars:text.length, truncated:false, responseId:bound.responseId, completed:true, stable:true};
 }
 
@@ -205,14 +216,32 @@ function preserveRepairContext(state) {
     const submission = state.confirmedSubmission?.record || savedSubmission();
     if (submission?.phase === "sent") bound = boundReviewResponse(submission);
   } catch { /* Unknown identity preserves the tab, not permission to close it. */ }
-  if (!state.tabRepurposed && (!state.repairedContext || state.repairedContext !== reviewPageContext() ||
-      !bound?.identified || bound.followup || bound.responseId !== state.repairedResponseId)) {
+  const receipt = state.repairReceipt;
+  const context = receipt?.context || state.repairedContext;
+  const responseId = receipt?.responseId || state.repairedResponseId;
+  if (!state.tabRepurposed && (!context || context !== reviewPageContext() ||
+      !bound?.identified || !bound.root || bound.followup || bound.responseId !== responseId ||
+      (receipt && assistantCorpus(bound.root).join("\n\n") !== receipt.text))) {
     state.tabRepurposed = true;
     recordReviewStep("context_changed");
   }
+  return bound;
+}
+
+/** A committed receipt is authoritative even if an old invocation later writes
+ * its native result/catch/finally into the retained runner object. These fields
+ * are separate from the mutable fields known to pre-repair collectors.
+ */
+function repairedCollectionResult(state) {
+  const receipt = state.repairReceipt;
+  return receipt && receipt.jobId === state.jobId && receipt.runId === state.runId && receipt.provider === state.provider
+    ? receipt.result : null;
 }
 
 async function waitUntilReviewOrQuota(name) {
+  const owner = globalThis.__ashlarRunnerState;
+  // Stamp the executing loop, never installReviewRunner's listener replacement.
+  if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
   let stable = "", hits = 0;
   // No poll-count/elapsed-time failure. Controls can appear before response text is
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.
@@ -281,9 +310,9 @@ function installReviewRunner(name, run) {
   if (!state.runId) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
-  if (state.listener && state.protocol === "observed-submission-v4") return;
+  if (state.listener && state.protocol === "observed-submission-v5") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
-  state.protocol = "observed-submission-v4";
+  state.protocol = "observed-submission-v5";
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation });
   state.listener = (msg, _sender, reply) => {
     if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close", "ashlar-repair-source", "ashlar-repair-accepted"].includes(msg?.type)) return;
@@ -303,6 +332,14 @@ function installReviewRunner(name, run) {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider) {
         reply({ok:false,code:"job_mismatch"});return;
       }
+      if (msg.type === "ashlar-repair-accepted" && repairedCollectionResult(state)) {
+        const receipt = state.repairReceipt;
+        const same = msg.committed === true && msg.repairId === receipt.repairId &&
+          msg.responseId === receipt.responseId && msg.text === receipt.text && msg.raw === receipt.result.raw;
+        preserveRepairContext(state);
+        reply(same ? {ok:true,accepted:true} : {ok:false,code:"repair_source_changed"});
+        return;
+      }
       const source = currentRepairSource();
       if (!source) { reply({ok:false,code:"repair_source_unavailable"});return; }
       if (msg.type === "ashlar-repair-source") { reply({ok:true,source});return; }
@@ -316,12 +353,15 @@ function installReviewRunner(name, run) {
       state.repairedResponseId ||= source.responseId;
       state.repairedResult = msg.raw;
       state.responseText = source.text;
+      state.repairReceipt = Object.freeze({jobId: state.jobId, runId: state.runId, provider: state.provider,
+        repairId: msg.repairId, context: state.repairedContext, responseId: state.repairedResponseId, text: source.text,
+        result: Object.freeze({ok:true,raw:msg.raw,responseText:source.text})});
       preserveRepairContext(state);
       recordReviewStep("repair_accepted");
-      if (!state.running) {
-        state.finishedContext = state.repairedContext;
-        state.result = {ok:true,raw:msg.raw,responseText:source.text};
-      }
+      // Receipt handoff does not wait for an older collector to understand the
+      // new protocol. Preserve running as invocation liveness, not result state.
+      state.finishedContext = state.repairedContext;
+      state.result = state.repairReceipt.result;
       reply({ok:true,accepted:true});return;
     }
     // Upgrade only an already matching job binding; never adopt an unrelated chat.
@@ -332,9 +372,15 @@ function installReviewRunner(name, run) {
     // Also retry after collection is cached: there may no longer be a polling loop.
     if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();
     if (msg.type === "ashlar-can-close") {
-      const pending = state.running || !state.result || !state.finishedContext || state.submissionPersistencePending;
-      const unchanged = !state.tabRepurposed && state.finishedContext === reviewPageContext();
-      const busyNow = typeof stopButtonVisible === "function" && stopButtonVisible();
+      // Final authorization must recheck the assistant, not just URL/user turns.
+      // A cached result can outlive its collector and the displayed response.
+      const repaired = repairedCollectionResult(state);
+      const bound = (repaired || state.repairedResult) ? preserveRepairContext(state) : undefined;
+      const context = repaired ? state.repairReceipt.context : state.finishedContext;
+      const pending = (!repaired && state.running) || !(repaired || state.result) || !context || state.submissionPersistencePending;
+      const unchanged = !state.tabRepurposed && context === reviewPageContext();
+      const busyNow = (typeof stopButtonVisible === "function" && stopButtonVisible()) ||
+        Boolean(bound?.root && typeof responseStreaming === "function" && responseStreaming(bound.root));
       // User follow-ups/navigation transfer the tab back to the user. Do not close it.
       const draft = typeof composer === "function" && globalThis.document ? composer() : null;
       const hasDraft = Boolean(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
@@ -343,6 +389,8 @@ function installReviewRunner(name, run) {
         url: globalThis.location?.href || ""});
       return;
     }
+    const repaired = repairedCollectionResult(state);
+    if (repaired) { reply(repaired); return; }
     if (state.result) { reply(state.result); return; }
     if (state.running) { reply(busy()); return; }
     if (msg.type === "ashlar-harvest") {
@@ -359,6 +407,9 @@ function installReviewRunner(name, run) {
     try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
     try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
+    state.sourceTrackingOwner = undefined;
+    state.repairProbeTracker = undefined;
+    state.repairReceipt = undefined;
     state.observation = undefined;
     state.completedSource = undefined;
     state.completionTracking = undefined;

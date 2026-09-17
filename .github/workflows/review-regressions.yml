@@ -71,7 +71,18 @@ jobs:
         id: browser
         run: npx playwright install --with-deps chromium
       - name: Chromium DOM regressions
-        run: node --experimental-strip-types --experimental-vm-modules --test tests/review/browser.e2e.mjs tests/review/submission.e2e.mjs tests/review/captured-dom-shapes.e2e.mjs tests/review/history-ui.e2e.mjs tests/review/json-repair-browser.e2e.mjs tests/review/json-repair-ui.e2e.mjs
+        shell: bash
+        run: |
+          set -o pipefail
+          node --experimental-strip-types --experimental-vm-modules --test tests/review/browser.e2e.mjs tests/review/submission.e2e.mjs tests/review/captured-dom-shapes.e2e.mjs tests/review/history-ui.e2e.mjs tests/review/json-repair-browser.e2e.mjs tests/review/json-repair-ui.e2e.mjs 2>&1 | tee /tmp/review-browser-tests.log
+      - name: Preserve browser assertion logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-browser-log-${{ github.sha }}
+          path: /tmp/review-browser-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: MV3 and application integration fixtures
         if: ${{ !cancelled() && steps.browser.outcome == 'success' }}
         run: node --experimental-strip-types --experimental-vm-modules --test tests/review/extension.e2e.mjs

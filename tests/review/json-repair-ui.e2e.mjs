@@ -26,7 +26,7 @@ test('Settings UI: repair defaults ON, saved OFF survives reload and does not ch
   if(url.pathname==='/api/harbor') {submitted=route.request().postDataJSON();flag=submitted.localJsonRepairEnabled;return route.fulfill({contentType:'application/json',body:'{"ok":true}'});}
   return route.fulfill({contentType:'application/json',body:'{"ok":true}'});
  });
- const page=await context.newPage();await page.goto('https://repair.fixture/?settings');const toggle=page.getByRole('button',{name:/파싱 실패 시 Local LLM으로 JSON 복구/});
+ const page=await context.newPage();page.on('pageerror',error=>console.error('Repair UI fixture page error:',error.message));await page.goto('https://repair.fixture/?settings');const toggle=page.getByRole('button',{name:/파싱 실패 시 Local LLM으로 JSON 복구/});
  assert.equal(await toggle.getAttribute('aria-pressed'),'true');await toggle.click();await page.getByRole('button',{name:'Save settings',exact:true}).click();await page.getByText('Saved',{exact:true}).waitFor();
  assert.equal(submitted.localJsonRepairEnabled,false);assert.equal(submitted.reviewChatgpt,true);assert.equal(submitted.reviewLocal,false);
  await page.reload();assert.equal(await toggle.getAttribute('aria-pressed'),'false');
@@ -41,7 +41,7 @@ test('History UI: repair status visible, originals and candidates only after pro
   const details={job,inCurrentRuntime:true,steps:[],droppedSteps:0,repairs:[{...metadata,...(url.searchParams.has('responses')?{original:'PRIVATE ORIGINAL',candidate:'<script>window.injected=true</script>'}:{})}]};
   return route.fulfill({contentType:'application/json',body:JSON.stringify(url.searchParams.has('jobId')?{ok:true,record:details}:{ok:true,items:[job],total:1,health:{ok:true},nextCursor:null})});
  });
- const page=await context.newPage();await page.goto('https://repair.fixture/');await page.getByLabel('History access token').fill('history-fixture');await page.getByRole('button',{name:'Open private history'}).click();await page.getByRole('button',{name:'A',exact:true}).click();
+ const page=await context.newPage();page.on('pageerror',error=>console.error('Repair UI fixture page error:',error.message));await page.goto('https://repair.fixture/');await page.getByLabel('History access token').fill('history-fixture');await page.getByRole('button',{name:'Open private history'}).click();await page.getByRole('button',{name:'A',exact:true}).click();
  await page.getByText('Local JSON repair',{exact:true}).waitFor();assert.equal(await page.getByText('PRIVATE ORIGINAL',{exact:true}).count(),0);
  await page.getByRole('button',{name:'Load original response / JSON'}).click();await page.getByText('PRIVATE ORIGINAL',{exact:true}).waitFor({state:'attached'});
  assert.equal(await page.evaluate(()=>window.injected),undefined);await page.getByRole('button',{name:'Lock history'}).click();assert.equal(await page.getByText('PRIVATE ORIGINAL',{exact:true}).count(),0);

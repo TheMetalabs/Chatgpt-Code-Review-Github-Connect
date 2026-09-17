@@ -293,9 +293,15 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
     // One patch: the watcher can never observe done-without-the-corresponding-payload.
     return {...current, storedLegs, generating, providerErrors, updatedAt: Date.now()};
   });
-  const out = await submitHarborChat(jobId, accepted[0].raw, accepted);
   meta.lastJobId = jobId;
-  meta.lastError = out.ok ? undefined : out.error;
-  // Acknowledge stored results even if posting is currently blocked. The server owns posting.
+  meta.lastError = undefined;
+  // ACK the already stored result now. Snapshot/validation/GitHub posting can be
+  // slow and must not hold the Chrome delivery request open. The existing watcher
+  // and status lock own downstream work; duplicate ACK retries never submit again.
+  void Promise.resolve().then(() => submitHarborChat(jobId, accepted[0].raw, accepted))
+    .then(out => { if (!out.ok && meta.lastJobId === jobId) meta.lastError = out.error; })
+    .catch(error => {
+      if (meta.lastJobId === jobId) meta.lastError = String(error?.message || error).slice(0, 240);
+    });
   return {ok: true};
 }

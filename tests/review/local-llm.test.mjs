@@ -29,11 +29,11 @@ test('only completed non-JSON content gets one semantic retry', async () => {
   assert.equal(c.calls.length, 2);
   assert.equal(c.calls[1][2].messages[2].content, 'prose');
 });
-test('network errors do not replay model requests; health checks retain a finite timeout', async () => {
+test('network errors do not replay model requests; health checks also have no automatic deadline', async () => {
   const c = local([new Error('connection closed')]);
   assert.equal((await c.context.runLocalLlm('review', settings)).ok, false);
   assert.equal(c.calls.length, 1);
   await c.context.pingLocalLlm(settings);
   assert.equal(c.probes[0][2], "models");
-  assert.equal(c.probes[0][4].timeout, 5000);
+  assert.equal(c.probes[0][4], undefined);
 });

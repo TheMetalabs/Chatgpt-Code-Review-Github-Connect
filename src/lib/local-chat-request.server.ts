@@ -6,7 +6,7 @@ type ChatRequest = { model: string; messages: LocalChatMessage[]; temperature: n
 
 /** Shared native transport. No SDK/fetch deadline and no automatic network replay.
  * A caller may explicitly cancel; upstream servers/proxies may impose their own limits.
- * Health checks pass a bounded signal, generation does not create one.
+ * Health checks and generation create no deadline; only explicit cancellation may supply a signal.
  */
 export function requestLocalJson(
   baseURL: string,

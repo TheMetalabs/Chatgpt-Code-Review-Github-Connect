@@ -102,25 +102,36 @@ async function settings() {
   };
 }
 
+function bridgeTransportError(cause, body) {
+  const error = new Error(`Bridge ${body?.action || "read"} (${body?.jobId || "connection"}) transport interrupted; pending work is preserved, model generation was not cancelled (${cause?.name || "network error"}).`);
+  error.transport = true;
+  return error;
+}
+
 async function api(path, body, expectedOrigin) {
   const { origin, token } = await settings();
   if (!origin || !token) throw new Error("set origin and token in the popup");
   if (expectedOrigin && expectedOrigin !== origin) throw new Error("bridge origin changed; original job preserved");
-  const res = await fetch(`${origin}${path}`, {
-    method: body ? "POST" : "GET",
-    headers: {
-      "content-type": "application/json",
-      "x-ashlar-bridge-token": token,
-    },
-    body: body ? JSON.stringify({ ...body, token }) : undefined,
-    // Bound only bridge control RPCs, never the underlying queue or generation.
-    signal: AbortSignal.timeout(10_000),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || json.ok !== true) {
-    const err = new Error(json.error || `http ${res.status}`);
+  let res;
+  try {
+    // Model completion and saved-result delivery have NO application deadline.
+    // Browser/network failures retain the outbox; separate per-job/heartbeat lanes
+    // keep unrelated work moving. Server ACK is independent of publication below.
+    res = await fetch(`${origin}${path}`, {
+      method: body ? "POST" : "GET",
+      headers: {"content-type": "application/json", "x-ashlar-bridge-token": token},
+      body: body ? JSON.stringify({...body, token}) : undefined,
+    });
+  } catch (cause) {
+    throw bridgeTransportError(cause, body);
+  }
+  let json;
+  try { json = await res.json(); }
+  catch (cause) { throw bridgeTransportError(cause, body); }
+  if (!res.ok || json?.ok !== true) {
+    const err = new Error(json?.error || `http ${res.status}`);
     err.status = res.status;
-    err.code = json.code;
+    err.code = json?.code;
     throw err;
   }
   return json;
@@ -184,6 +195,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       activeJobs: relevant.filter(activelyReviewing).length,
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
       pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
+      waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && job.states[p].observation?.state === "waiting_for_json").length, 0),
       savedReplies: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].outcome?.ok && !job.states[p].delivered).length, 0),
       // Identifiers/status only: never response text, prompts or credentials.
       recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
@@ -207,15 +219,12 @@ function noReceiver(err) {
 async function sendToTab(tabId, msg, files) {
   const once = () =>
     new Promise((resolve, reject) => {
-      // ACK deadline is transport-only; it never cancels the page's model request.
-      const timer = setTimeout(() => reject(new Error("review tab acknowledgement unavailable")), 10_000);
-      try {
-        chrome.tabs.sendMessage(tabId, msg, (res) => {
-          clearTimeout(timer);
-          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-          else resolve(res);
-        });
-      } catch (error) { clearTimeout(timer); reject(error); }
+      // Content scripts acknowledge immediately. Do not turn a delayed browser
+      // message into a model failure; runtime disconnection is retried on that tab.
+      chrome.tabs.sendMessage(tabId, msg, (res) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(res);
+      });
     });
   try {
     return await once();
@@ -593,6 +602,14 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await saveJobs(jobs);
     return;
   }
+  if (result.observation && typeof result.observation === "object") {
+    const item = result.observation;
+    const text = typeof item.text === "string" ? item.text.slice(0, 128_000) : "";
+    state.observation = {state: String(item.state || "unknown").slice(0, 80), text,
+      totalChars: Number.isSafeInteger(item.totalChars) ? item.totalChars : text.length,
+      truncated: Boolean(item.truncated)};
+    await saveJobs(jobs);
+  }
   await rememberOwnedTab(job, provider);
   delete state.connectionError;
   if (isBusyResult(result)) return;
@@ -630,6 +647,10 @@ async function deliverOutcome(job, provider, jobs) {
     throw e;
   }
   state.delivered = true;
+  const previousError = (await chrome.storage.local.get(["lastError"])).lastError;
+  if (typeof previousError === "string" && previousError.startsWith(`Bridge ${body.action} (${job.jobId}) transport interrupted`)) {
+    await chrome.storage.local.set({lastError: ""});
+  }
   state.cleanupPending = true;
   await saveJobs(jobs);
   await cleanupProvider(job, provider, jobs);

@@ -44,7 +44,7 @@ async function refreshDiagnostics() {
       (work.admissionCheckedAt ? ` (checked ${new Date(work.admissionCheckedAt).toLocaleTimeString()})` : "")
     : ""; // Keep reports from older workers readable during an upgrade.
   const recovery = (work.recovery || []).map(j => `${j.jobId}: ${j.status}`).join("\n");
-  workerEl.textContent = `${phases[work.phase] || work.phase}${admission}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}` +
+  workerEl.textContent = `${phases[work.phase] || work.phase}${admission}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}; JSON pending: ${work.waitingForJson || 0}` +
     (recovery ? `\n${recovery}` : "") + (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
 }
 
@@ -53,7 +53,7 @@ async function refreshDiagnostics() {
   originEl.value = s.origin || "";
   tokenEl.value = s.token || "";
   enabledEl.checked = s.enabled !== false;
-  if (s.lastError) statusEl.textContent = `Last work error: ${s.lastError}`;
+  if (s.lastError) statusEl.textContent = `Previous work error (not a model completion status): ${s.lastError}`;
   else if (s.lastJobId) statusEl.textContent = `Last job: ${s.lastJobId}`;
   await refreshDiagnostics();
 })();

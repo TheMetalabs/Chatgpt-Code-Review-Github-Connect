@@ -47,12 +47,22 @@ function extractChatJson(text) {
   return lastReviewJson(s);
 }
 
+/** Read all rendered blocks from the current assistant message. A detached clone's
+ * textContent includes hidden duplicate text and the first markdown may be prose.
+ */
 function cleanTurnText(el) {
   if (!el) return "";
-  const root = el.cloneNode(true);
-  root.querySelectorAll("button, svg, script, [data-testid='copy-turn-action-button'], [data-content-reference-start]").forEach((n) => n.remove());
-  root.querySelectorAll("br").forEach((br) => br.replaceWith(document.createTextNode("\n")));
-  return (root.innerText || root.textContent || "").replace(/\u00a0/g, " ").trim();
+  const walk = node => {
+    if (node.nodeType === 3) return node.nodeValue || "";
+    if (node.nodeType !== 1) return "";
+    if (node.matches("button, [role='button'], svg, script, style, template, [hidden], [aria-hidden='true'], [data-content-reference-start]")) return "";
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return "";
+    if (node.tagName === "BR") return "\n";
+    const text = [...node.childNodes].map(walk).join("");
+    return /^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE|TR)$/.test(node.tagName) ? `\n${text}\n` : text;
+  };
+  return walk(el).trim();
 }
 
 function assistantCorpus() {
@@ -63,8 +73,7 @@ function assistantCorpus() {
     : [...root.querySelectorAll('[data-message-author-role="assistant"]')];
   const chunks = [];
   for (const turn of turns) {
-    const md = turn.querySelector(".markdown") || turn;
-    const text = cleanTurnText(md);
+    const text = cleanTurnText(turn);
     if (text) chunks.push(text);
   }
   return chunks;
@@ -82,40 +91,28 @@ function harvestJson(opts) {
   return null;
 }
 
-function emptyReplyError(name) {
-  const e = new Error(`${name} finished without review JSON`);
-  e.code = "empty";
-  return e;
-}
-
 async function waitUntilReviewOrQuota(name) {
-  let stable = "";
-  let hits = 0;
-  let emptyTicks = 0;
-  // Queue and generation have no duration deadline. Only current-turn UI can end them.
+  let stable = "", hits = 0;
+  // No poll-count/elapsed-time failure. Controls can appear before response text is
+  // observable. A missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
-    const done = chatGenerationFinished({
-      stopVisible: stopButtonVisible(),
-      replyActionsVisible: replyDoneVisible(),
-    });
-    let json = done ? harvestJson({ allowThin: true }) : null;
-    // Never use the shared system clipboard: simultaneous tabs can overwrite it.
+    const done = chatGenerationFinished({stopVisible: stopButtonVisible(), replyActionsVisible: replyDoneVisible()});
+    const text = assistantCorpus().join("\n\n");
+    const json = done ? harvestJson({allowThin: true}) : null;
+    const runner = globalThis.__ashlarRunnerState;
+    if (runner?.running) runner.observation = {
+      state: !done ? "generating_or_queued" : json ? "json_observed" : text.trim() ? "waiting_for_json" : "waiting_for_response",
+      // Diagnostic size bound, NOT a duration bound. Stay local to the bound job.
+      text: text.slice(0, 128_000), totalChars: text.length, truncated: text.length > 128_000,
+    };
     if (quotaHit() && !json) {
-      const e = new Error(`${name} usage limit`);
-      e.code = "quota";
-      throw e;
+      const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
     }
     if (done && json) {
-      hits = json === stable ? hits + 1 : 1;
-      stable = json;
+      const current = JSON.stringify([json, text]);
+      hits = stable === current ? hits + 1 : 1; stable = current;
       if (hits >= 2) return json;
-      emptyTicks = 0;
-    } else {
-      hits = 0;
-      stable = "";
-      emptyTicks = done ? emptyTicks + 1 : 0;
-      if (emptyTicks >= 6) throw emptyReplyError(name);
-    }
+    } else { hits = 0; stable = ""; }
     await sleep(800);
   }
 }
@@ -141,10 +138,10 @@ function installReviewRunner(name, run) {
   if (!state.runId) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
-  if (state.listener && state.protocol === "tab-cleanup-v1") return;
+  if (state.listener && state.protocol === "unbounded-review-v1") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
-  state.protocol = "tab-cleanup-v1";
-  const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending" });
+  state.protocol = "unbounded-review-v1";
+  const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation });
   state.listener = (msg, _sender, reply) => {
     if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close"].includes(msg?.type)) return;
     const respond = reply;
@@ -192,6 +189,7 @@ function installReviewRunner(name, run) {
     try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
     try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
+    state.observation = undefined;
     Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
       .then(raw => { state.finishedContext = reviewPageContext(); state.result = { ok: true, raw }; })
       .catch(e => {

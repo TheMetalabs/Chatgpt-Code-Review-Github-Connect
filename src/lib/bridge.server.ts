@@ -315,7 +315,14 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job) return {ok: false, error: "job not found"};
   const incoming = (legs?.length ? legs : raw.trim() ? [{provider: "chatgpt" as const, raw}] : [])
-    .map(leg => ({...leg, raw: extractChatJson(leg.raw) ?? leg.raw}));
+    .map(leg => ({...leg, raw: extractChatJson(leg.raw) ?? leg.raw}))
+    .map(leg => {
+      // An identical replay acknowledges the stored repair, not new provenance.
+      // Canonicalize per provider BEFORE either batch path, archive writes, or
+      // downstream submission: a new peer must not strip the replacement fence.
+      const stored = job.storedLegs?.find(stored => stored.provider === leg.provider && stored.repair && stored.raw === leg.raw);
+      return stored ?? leg;
+    });
   // Compare normalized payloads as stored, including after posting changed job status.
   if (incoming.length && incoming.every(leg => job.storedLegs?.some(stored => stored.provider === leg.provider && stored.raw === leg.raw))) {
     try {

@@ -140,3 +140,106 @@ test('HTTP: terminating ChatGPT repair leaves the ready Grok repair usable',asyn
  const job=app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId);
  assert.deepEqual(Array.from(job.storedLegs,leg=>leg.provider),['grok']);assert.equal(job.providerErrors.chatgpt.code,'tab_closed');assert.equal(app.localRequests.length,2);
 });
+
+// A committed format repair must stay authoritative per provider, not merely
+// when every element of an incoming completion batch happens to be a duplicate.
+const plain=value=>JSON.parse(JSON.stringify(value));
+async function committedRepairFixture(t,provider='chatgpt') {
+ const {app,binding:initial}=await setup(t,{reviewLocal:true,reviewGrok:true});
+ // Keep the independent Local reviewer pending throughout the mixed deliveries.
+ // The second HTTP request is format repair, not a second independent review.
+ await eventually(()=>app.localRequests.length===1,'independent Local review did not start');
+ const binding={...initial,provider,runId:provider===initial.provider?initial.runId:`run-${provider}`,responseId:`response-${provider}`};
+ assert.equal((await post(app,{action:'progress',...binding,progress:{[provider]:{runId:binding.runId,
+  events:[{source:'page',sequence:1,at:Date.now(),stage:'response_completed_json_invalid'}]}}})).ok,true);
+ const started=await post(app,{action:'repair',...binding,source:{text:original,totalChars:original.length,
+  truncated:false,responseId:binding.responseId,completed:true,stable:true}});
+ assert.equal(started.repair.status,'running');
+ await eventually(()=>app.localRequests.length===2,'formatter request did not start');
+ assert.equal(JSON.parse(app.localRequests[1].messages[1].content).original,original);
+ respond(app,raw,1);
+ const repair=action=>post(app,{action,...binding,repairId:started.repair.id});
+ await eventually(async()=>(await repair('repair-status')).repair.status==='ready','formatter candidate not ready');
+ assert.equal((await repair('repair-commit')).repair.status,'accepted');
+ const live=()=>app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId);
+ const stored=()=>live().storedLegs.find(leg=>leg.provider===provider);
+ const expected=plain(stored());
+ assert.equal(expected.repair.id,started.repair.id);
+ assert.equal(expected.originalText,original);
+ assert.equal(live().status,'awaiting_chat');assert.equal(app.reviews.length,0);
+ const peer={provider:provider==='chatgpt'?'grok':'chatgpt',raw:JSON.stringify({findings:[],investigated_safe:['a.ts: peer checked'],merge_recommendation:'COMMENT'}),originalText:'peer original'};
+ const complete=results=>post(app,{action:'complete',...binding,repairProtocol:1,results});
+ const assertPreserved=()=>{
+  assert.deepEqual(plain(stored()),expected,'duplicate delivery replaced the committed repair leg');
+  const archived=app.history.getJob(binding.jobId,true).responses[provider];
+  assert.equal(archived.json,expected.raw);assert.equal(archived.original,expected.originalText,'duplicate delivery changed the archived original');
+  assert.equal(app.history.getRepair(binding.jobId,started.repair.id).status,'accepted');
+  assert.equal(app.localRequests.length,2,'delivery replay started an extra model call');
+ };
+ return {app,binding,provider,peer,repair,live,stored,expected,complete,assertPreserved};
+}
+for(const provider of ['chatgpt','grok'])for(const order of ['first','last'])
+ test(`mixed receipt: ${provider} duplicate ${order} retains complete stored leg and rejects later replacement`,async t=>{
+  const f=await committedRepairFixture(t,provider);
+  const duplicate={provider,raw:order==='first'?raw:`\`\`\`json\n${raw}\n\`\`\``,originalText:'incoming duplicate preview, not the original'};
+  const batch=order==='first'?[duplicate,f.peer]:[f.peer,duplicate];
+  assert.equal((await f.complete(batch)).ok,true);
+  assert.equal(f.live().status,'awaiting_chat');assert.equal(f.app.reviews.length,0,'Local reviewer was not kept pending');
+  f.assertPreserved();
+  assert.deepEqual(plain(f.live().storedLegs.find(leg=>leg.provider===f.peer.provider)),f.peer);
+  const conflicting={provider,raw:JSON.stringify({findings:[],investigated_safe:['replaced after receipt'],merge_recommendation:'COMMENT'})};
+  const denied=await f.complete([conflicting]);assert.equal(denied.http,409);assert.equal(denied.code,'lease_conflict');
+  f.assertPreserved();assert.equal((await f.repair('repair-commit')).repair.status,'accepted');
+  assert.equal((await f.complete(batch)).ok,true);f.assertPreserved();
+  respond(f.app,raw,0);await eventually(()=>f.app.reviews.length===1,'pending Local completion did not publish');
+  f.assertPreserved();assert.deepEqual(Array.from(f.live().storedLegs,leg=>leg.provider).sort(),['chatgpt','grok','local']);
+  assert.equal((await f.complete(batch)).ok,true);f.assertPreserved();assert.equal(f.app.reviews.length,1);
+ });
+for(const provider of ['chatgpt','grok'])test(`mixed receipt: ${provider} raw-only duplicate cannot erase the replacement fence`,async t=>{
+ const f=await committedRepairFixture(t,provider);
+ assert.equal((await f.complete([{provider,raw},f.peer])).ok,true);
+ // Test the second half of the reported failure independently of metadata assertions.
+ const denied=await f.complete([{provider,raw:raw.replace('COMMENT','APPROVE')}]);
+ assert.equal(denied.http,409,'different JSON replaced a repair whose receipt was erased');assert.equal(denied.code,'lease_conflict');
+ f.assertPreserved();assert.equal(f.app.reviews.length,0);
+});
+for(const stage of ['awaiting_chat','posted'])test(`mixed receipt: all-duplicate replay preserves archived original (${stage})`,async t=>{
+ const f=await committedRepairFixture(t);
+ if(stage==='posted'){
+  assert.equal((await f.complete([f.peer])).ok,true);respond(f.app,raw,0);
+  await eventually(()=>f.app.reviews.length===1,'job not posted');assert.equal(f.live().status,'posted');
+ }
+ assert.equal((await f.complete([{provider:f.provider,raw,originalText:'untrusted duplicate text'}])).ok,true);
+ f.assertPreserved();assert.equal(f.app.reviews.length,stage==='posted'?1:0);
+});
+test('mixed receipt: any conflicting repaired provider rejects the whole batch before archiving its new peer',async t=>{
+ const f=await committedRepairFixture(t);const before=plain(f.live());
+ const denied=await f.complete([f.peer,{provider:f.provider,raw:raw.replace('COMMENT','APPROVE')}]);
+ assert.equal(denied.http,409);assert.equal(denied.code,'lease_conflict');
+ assert.deepEqual(plain(f.live()),before);assert.equal(f.app.history.getJob(f.binding.jobId,true).responses[f.peer.provider],undefined);
+ f.assertPreserved();assert.equal(f.app.reviews.length,0);
+});
+for(const failure of ['repaired','peer'])test(`mixed receipt: ${failure} archive failure does not ACK or mutate committed legs; retry never reinfers`,async t=>{
+ const f=await committedRepairFixture(t);const before=plain(f.live().storedLegs);
+ const record=f.app.history.recordResponse.bind(f.app.history);
+ f.app.history.recordResponse=(id,provider,...args)=>{
+  if(provider===(failure==='repaired'?f.provider:f.peer.provider))throw Error('fixture archive offline');
+  return record(id,provider,...args);
+ };
+ const batch=[{provider:f.provider,raw,originalText:'duplicate preview'},f.peer];
+ const denied=await f.complete(batch);assert.equal(denied.http,503);assert.equal(denied.code,'history_unavailable');
+ assert.deepEqual(plain(f.live().storedLegs),before);f.assertPreserved();assert.equal(f.app.reviews.length,0);
+ f.app.history.recordResponse=record;
+ assert.equal((await f.complete(batch)).ok,true);f.assertPreserved();
+ respond(f.app,raw,0);await eventually(()=>f.app.reviews.length===1,'retry did not unblock publication');f.assertPreserved();
+});
+test('mixed receipt: repeated same-provider entries cannot add a vote or replace the stored original',async t=>{
+ const f=await committedRepairFixture(t);
+ assert.equal((await f.complete([{provider:f.provider,raw},f.peer,{provider:f.provider,raw,originalText:'duplicate'}])).ok,true);
+ assert.equal(f.live().storedLegs.length,2);f.assertPreserved();
+});
+test('mixed receipt: turning format fallback OFF does not weaken an already committed receipt',async t=>{
+ const f=await committedRepairFixture(t);f.app.harbor.patchHarborSettings({localJsonRepairEnabled:false});
+ assert.equal((await f.complete([{provider:f.provider,raw},f.peer])).ok,true);f.assertPreserved();
+ assert.equal((await f.complete([{provider:f.provider,raw:raw.replace('COMMENT','APPROVE')}])).http,409);f.assertPreserved();
+});

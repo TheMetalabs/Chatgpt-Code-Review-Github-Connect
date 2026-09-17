@@ -14,6 +14,7 @@ const WORKER_STATUS_KEY = "bridgeWorkerStatus";
 const jobLanes = new Map();
 const heartbeatLanes = new Map();
 const admissionLanes = new Map();
+const admissionReports = new Map();
 let registryPromise;
 let clientPromise;
 let storageTail = Promise.resolve();
@@ -179,21 +180,29 @@ function activelyReviewing(job) {
   });
 }
 
-async function recordWorkerStatus(jobs, origin, phase) {
-  const relevant = Object.values(jobs).filter(job => job.origin === origin);
-  phase ||= relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
-  await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
-    origin, checkedAt: Date.now(), phase,
-    activeJobs: relevant.filter(activelyReviewing).length,
-    recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
-    pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
-    waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && job.states[p].observation?.state === "waiting_for_json").length, 0),
-    savedReplies: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].outcome?.ok && !job.states[p].delivered).length, 0),
-    // Identifiers/status only: never response text, prompts or credentials.
-    recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
-      jobId: job.jobId, status: job.serverStatus || (job.recoveryError ? "connection_error" : "reconnecting_or_cleanup"),
-    })),
-  }});
+async function recordWorkerStatus(jobs, origin, admissionPhase) {
+  // Admission and execution are independent writers. A finishing work lane must
+  // not erase the reason another request is waiting for a slot or connection.
+  if (admissionPhase) admissionReports.set(origin, {phase: admissionPhase, checkedAt: Date.now()});
+  return writeInOrder(async () => {
+    const relevant = Object.values(jobs).filter(job => job.origin === origin);
+    const phase = relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
+    const admission = admissionReports.get(origin);
+    await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
+      origin, checkedAt: Date.now(), phase,
+      admissionPhase: admission?.phase || "not_checked",
+      admissionCheckedAt: admission?.checkedAt,
+      activeJobs: relevant.filter(activelyReviewing).length,
+      recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
+      pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
+      waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && job.states[p].observation?.state === "waiting_for_json").length, 0),
+      savedReplies: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].outcome?.ok && !job.states[p].delivered).length, 0),
+      // Identifiers/status only: never response text, prompts or credentials.
+      recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
+        jobId: job.jobId, status: job.serverStatus || (job.recoveryError ? "connection_error" : "reconnecting_or_cleanup"),
+      })),
+    }});
+  });
 }
 
 function providerUrl(provider, reasoning) {
@@ -501,7 +510,11 @@ async function refreshJobHeartbeat(job, jobs) {
 async function pollProvider(job, provider, jobs, observeOnly = false) {
   const state = job.states[provider];
   if (state.outcome || state.delivered) return;
-  if (!state.runId) { state.runId = crypto.randomUUID(); await saveJobs(jobs); }
+  if (!state.runId) state.runId = crypto.randomUUID();
+  // Memory is not a receipt: a previous write may have failed while leaving the
+  // shared object mutated. Retry persistence before ANY tab can adopt this runId
+  // or use a newly allocated binding, including findOriginalTab's harvest probes.
+  await saveJobs(jobs);
   if (state.allocating && !state.tabId) {
     // Creation may have succeeded before a worker restart. Recover a recorded owner;
     // if none can be established, keep the intent instead of opening another tab.
@@ -566,8 +579,13 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       await saveJobs(jobs);
     } else {
       result = await sendToTab(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
-      if (result?.code === "idle" && !observeOnly) {
-        result = await sendToTab(state.tabId, { ...run, resume: true }, contentFiles(provider));
+      if (result?.code === "idle" && (!observeOnly || matchesJob(result, job, provider))) {
+        // A reloaded bound page has no in-memory collector. Missing server work
+        // may resume observation, never adopt a page or submit another prompt.
+        const resume = observeOnly
+          ? { ...tabMessage(job, provider, "ashlar-run"), resume: true }
+          : { ...run, resume: true };
+        result = await sendToTab(state.tabId, resume, contentFiles(provider));
       }
     }
   } catch (e) {
@@ -610,6 +628,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
 async function deliverOutcome(job, provider, jobs) {
   const state = job.states[provider], out = state.outcome;
   if (!out || state.delivered) return;
+  // A failed outbox write can also leave an outcome in the shared cache. Retry
+  // that save before sending it; only the server ACK permits subsequent cleanup.
+  await saveJobs(jobs);
   const body = out.ok
     ? {action: "complete", jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw}]}
     : {action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}`};
@@ -694,12 +715,16 @@ function admitJob(cfg, jobs) {
     if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) {
       await recordWorkerStatus(jobs, cfg.origin, "provider_quota"); return null;
     }
+    await recordWorkerStatus(jobs, cfg.origin, "polling");
     const payload = await api("/api/bridge", {
       action: "take", clientId: await clientId(), excludeJobIds: Object.keys(jobs),
     }, cfg.origin).catch(async error => {
       await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;
     });
-    if (!payload.job || jobs[payload.job.jobId]) return null;
+    if (!payload.job || jobs[payload.job.jobId]) {
+      await recordWorkerStatus(jobs, cfg.origin, payload.job ? "duplicate_job" : "idle");
+      return null;
+    }
     const job = {...payload.job, origin: cfg.origin, states: {}};
     job.providers = [...new Set(job.providers?.length ? job.providers : [job.provider])]
       .filter(p => ["chatgpt", "grok"].includes(p));
@@ -708,6 +733,7 @@ function admitJob(cfg, jobs) {
     jobs[job.jobId] = job;
     await saveJobs(jobs); // Provider intents reserve admission space before this lock opens.
     await chrome.storage.local.set({lastJobId: job.jobId, lastError: ""});
+    await recordWorkerStatus(jobs, cfg.origin, "admitted");
     return job;
   });
 }

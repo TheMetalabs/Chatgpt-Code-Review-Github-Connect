@@ -13,6 +13,7 @@ const WORKER_STATUS_KEY = "bridgeWorkerStatus";
 // All lanes share one loaded registry, so concurrent jobs never write stale maps.
 const jobLanes = new Map();
 const heartbeatLanes = new Map();
+const observationLanes = new Map();
 const admissionLanes = new Map();
 const admissionReports = new Map();
 let registryPromise;
@@ -195,7 +196,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       activeJobs: relevant.filter(activelyReviewing).length,
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
       pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
-      waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && job.states[p].observation?.state === "waiting_for_json").length, 0),
+      waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && ["waiting_for_json", "response_completed_json_invalid"].includes(job.states[p].observation?.state)).length, 0),
       stages: relevant.slice(0, 8).flatMap(job => job.providers.map(provider => ({jobId:job.jobId,provider,
         stage: progressFor(job)[provider]?.events.at(-1)?.stage || "submission_unknown"}))),
       savedReplies: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].outcome?.ok && !job.states[p].delivered).length, 0),
@@ -335,7 +336,7 @@ async function flushProgress(job) {
 
 async function archiveObservation(job, provider, jobs) {
   const state=job.states[provider], observation=state.observation;
-  if(state.outcome || observation?.state!=="waiting_for_json" || !observation.text) return;
+  if(state.outcome || !["waiting_for_json","response_completed_json_invalid"].includes(observation?.state) || !observation.text) return;
   const digest=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(observation.text))))
     .map(byte=>byte.toString(16).padStart(2,"0")).join("");
   if(state.archivedObservation===digest)return;
@@ -344,6 +345,7 @@ async function archiveObservation(job, provider, jobs) {
   await api("/api/bridge",{action:"observe",jobId:job.jobId,leaseId:job.leaseId,provider,runId:state.runId,
     text:observation.text,totalChars:observation.totalChars,truncated:observation.truncated},job.origin);
   state.archivedObservation=digest;
+  delete state.observationError;
   await saveJobs(jobs);
 }
 
@@ -728,7 +730,7 @@ async function advanceJob(job, jobs) {
   const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
   // Missing is not ACK: observe and preserve the original response without redelivery.
   if (active && !job.prompt) {
-    const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}`, undefined, job.origin);
+    const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}&attachmentProtocol=2`, undefined, job.origin);
     Object.assign(job, {prompt: current.prompt, prompts: current.prompts});
     await saveJobs(jobs);
   }
@@ -736,7 +738,15 @@ async function advanceJob(job, jobs) {
     try {
       await pollProvider(job, provider, jobs, !active);
       if (canDeliver) await deliverOutcome(job, provider, jobs);
-      if (active) await archiveObservation(job, provider, jobs);
+      if (active) {
+        // Diagnostic persistence is independently retryable. A slow observe/progress
+        // RPC must not hold the lane that will harvest the now-completed response.
+        void singleFlight(observationLanes, `${job.origin}:${job.jobId}:${provider}`,
+          () => archiveObservation(job, provider, jobs)).catch(() => {
+            // Do not label a diagnostic transport failure as a model failure.
+            job.states[provider].observationError = "Diagnostic archive pending; original remains in local storage";
+          });
+      }
       await cleanupProvider(job, provider, jobs);
     } catch (e) {
       // A failing provider must not prevent the others from being collected/closed.
@@ -772,7 +782,7 @@ function admitJob(cfg, jobs) {
     }
     await recordWorkerStatus(jobs, cfg.origin, "polling");
     const payload = await api("/api/bridge", {
-      action: "take", clientId: await clientId(), excludeJobIds: Object.keys(jobs),
+      action: "take", attachmentProtocol: 2, clientId: await clientId(), excludeJobIds: Object.keys(jobs),
     }, cfg.origin).catch(async error => {
       await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;
     });

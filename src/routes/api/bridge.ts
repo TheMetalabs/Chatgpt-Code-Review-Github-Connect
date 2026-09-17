@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-import type { ProviderError } from "@/lib/types";
+import { bridgePromptText } from "@/lib/chat-prompt";
+import type { ProviderError, ReviewProvider } from "@/lib/types";
 import {
   recordBridgeProgress,
   recordBridgeObservation,
@@ -17,6 +18,12 @@ import {
   rotateBridgeToken,
   takeNextBridgeJob,
 } from "@/lib/bridge.server";
+
+function promptsForClient<T extends {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>}>(value: T | null, protocol: unknown): T | null {
+  if (!value) return null;
+  return {...value, prompt: bridgePromptText(value.prompt, protocol),
+    ...(value.prompts ? {prompts: Object.fromEntries(Object.entries(value.prompts).map(([provider, text]) => [provider, bridgePromptText(text || "", protocol)]))} : {})};
+}
 
 function corsHeaders(request: Request) {
   const origin = request.headers.get("origin") ?? "";
@@ -56,7 +63,7 @@ export const Route = createFileRoute("/api/bridge")({
         bridgeHeartbeat();
         const jobId = new URL(request.url).searchParams.get("jobId");
         if (jobId) {
-          const prompt = promptForJob(jobId);
+          const prompt = promptsForClient(promptForJob(jobId), new URL(request.url).searchParams.get("attachmentProtocol") === "2" ? 2 : 1);
           if (!prompt) return Response.json({ ok: false, error: "no prompt" }, { status: 404, headers });
           return Response.json({ ok: true, ...prompt }, { headers });
         }
@@ -67,6 +74,7 @@ export const Route = createFileRoute("/api/bridge")({
         const body = (await request.json().catch(() => ({}))) as {
           action?: string;
           clientId?: string;
+          attachmentProtocol?: number;
           leaseId?: string;
           excludeJobIds?: string[];
           progress?: unknown;
@@ -133,7 +141,7 @@ export const Route = createFileRoute("/api/bridge")({
           return Response.json({ ok: true, bridge: getBridgePublic() }, { headers });
         }
         if (body.action === "take") {
-          return Response.json({ ok: true, bridge: getBridgePublic(), job: takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : []) }, { headers });
+          return Response.json({ ok: true, bridge: getBridgePublic(), job: promptsForClient(takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : []), body.attachmentProtocol) }, { headers });
         }
         if (body.action === "claim" && body.jobId) {
           const out = claimBridgeJob(body.jobId, String(body.clientId ?? ""));

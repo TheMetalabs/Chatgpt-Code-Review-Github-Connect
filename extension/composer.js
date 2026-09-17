@@ -2,6 +2,21 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Wake on page changes even when background-tab timer cadence is throttled.
+ * The timer is only a fallback observation cadence, never a failure deadline. */
+function waitForPageChange(ms = 800) {
+  if (typeof MutationObserver !== "function") return sleep(ms);
+  return new Promise(resolve => {
+    let timer;
+    const finish = () => { observer.disconnect(); clearTimeout(timer); document.removeEventListener("visibilitychange", finish); resolve(); };
+    const observer = new MutationObserver(finish);
+    observer.observe(document.documentElement, {subtree: true, childList: true, characterData: true,
+      attributes: true, attributeFilter: ["data-message-id", "disabled", "aria-disabled", "aria-busy", "data-state", "data-streaming-response-status", "style", "class"]});
+    document.addEventListener("visibilitychange", finish, {once: true});
+    timer = setTimeout(finish, ms);
+  });
+}
+
 function visible(el) {
   if (!el || !(el instanceof HTMLElement)) return false;
   const r = el.getBoundingClientRect();
@@ -22,28 +37,48 @@ function composerHas(el, text) {
   return got.includes(want.slice(0, 48)) && got.includes(want.slice(-40)) && got.length >= Math.floor(want.length * 0.85);
 }
 
+function selectComposerContents(el) {
+  el.focus();
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) { el.select(); return; }
+  const range = document.createRange(); range.selectNodeContents(el);
+  const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+}
+
 async function insertPrompt(el, text) {
-  document.execCommand("selectAll", false, null);
+  selectComposerContents(el);
   document.execCommand("insertText", false, text);
   if (composerHas(el, text)) return;
-  const chunk = 1500;
-  document.execCommand("selectAll", false, null);
+  // Keep edits scoped to this input even if another UI element had the selection.
+  selectComposerContents(el);
   document.execCommand("delete", false, null);
-  for (let i = 0; i < text.length; i += chunk) {
-    document.execCommand("insertText", false, text.slice(i, i + chunk));
-    await sleep(15);
+  for (let i = 0; i < text.length; i += 1500) {
+    if (!el.isConnected) return; // caller re-finds a remounted composer
+    document.execCommand("insertText", false, text.slice(i, i + 1500));
+    await Promise.resolve();
   }
 }
 
 function splitAttachments(raw) {
+  const source = String(raw || "");
+  // One JSON line is a transport envelope, NOT model text. JSON escaping prevents
+  // source files (including this parser) from terminating their own attachments.
+  const frame = /(?:^|\r?\n)<<<ASHLAR_ATTACHMENTS_V2>>>\r?\n([^\r\n]*)\r?\n<<<END_ASHLAR_ATTACHMENTS_V2>>>[ \t\r\n]*$/.exec(source);
+  if (frame) {
+    let files;
+    try { files = JSON.parse(frame[1]); } catch { throw new Error("invalid attachment envelope"); }
+    if (!Array.isArray(files) || files.some(file => !file || typeof file.name !== "string" ||
+        !file.name.trim() || /[\r\n]/.test(file.name) || typeof file.body !== "string")) {
+      throw new Error("invalid attachment entries");
+    }
+    return {prompt: source.slice(0, frame.index).trim(), files};
+  }
+  if (/^<<<ASHLAR_ATTACHMENTS_V2>>>/m.test(source)) throw new Error("incomplete attachment envelope");
+  // Read queued legacy prompts too. A quoted marker inside JS/TS is not a line
+  // delimiter; the old unanchored lazy regex leaked entire snapshot tails.
   const files = [];
-  const prompt = String(raw || "")
-    .replace(/<<<ATTACH:([^>\n]+)>>>\r?\n([\s\S]*?)<<<END_ATTACH>>>/g, (_m, name, body) => {
-      files.push({ name: String(name).trim(), body });
-      return "";
-    })
-    .trim();
-  return { prompt, files };
+  const prompt = source.replace(/^<<<ATTACH:([^>\r\n]+)>>>\r?\n([\s\S]*?)^<<<END_ATTACH>>>[ \t]*(?=\r?$)/gm,
+    (_m, name, body) => { files.push({name: name.trim(), body: body.replace(/\r?\n$/, "")}); return ""; }).trim();
+  return {prompt, files};
 }
 
 async function attachFiles(files) {
@@ -60,49 +95,85 @@ async function attachFiles(files) {
   input.files = dt.files;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  await sleep(400);
-  const hay = `${document.body?.innerText || ""} ${[...document.querySelectorAll("[data-file-name], [title]")].map((n) => n.getAttribute("data-file-name") || n.getAttribute("title") || n.textContent || "").join(" ")}`;
-  return files.every((f) => hay.includes(f.name));
+  // Input filling does not depend on upload completion. Send has its own
+  // named-chip + progress + enabled-control gate in the current composer form.
+  return true;
 }
 
 async function fillComposer(el, text) {
   const parts = splitAttachments(text);
-  let body = parts.prompt || text;
+  let body = parts.prompt || (parts.files.length ? "" : text);
+  const state = globalThis.__ashlarRunnerState;
+  if (state) state.pendingAttachments = [];
   if (parts.files.length) {
     const attached = await attachFiles(parts.files);
-    if (!attached) {
-      body = [parts.prompt, ...parts.files.map((f) => `--- ${f.name}\n${f.body}`)].filter(Boolean).join("\n\n");
+    if (attached) {
+      if (state) state.pendingAttachments = parts.files.map(file => file.name);
+    } else {
+      // Only an unavailable upload input authorizes inline fallback. Slow chips
+      // or an in-progress upload must never paste the whole snapshot again.
+      body = [parts.prompt, ...parts.files.map(file => `--- ${file.name}\n${file.body}`)].filter(Boolean).join("\n\n");
     }
   }
-  if (!el) throw new Error("composer not found");
-  el.focus();
-  await sleep(50);
-  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
-    const proto = Object.getOwnPropertyDescriptor(
-      el instanceof HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype,
-      "value",
-    );
-    proto?.set?.call(el, body);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    if (composerHas(el, body)) return body;
+  for (;;) {
+    // Uploading can replace the editor. Never type into a cached detached node.
+    el = typeof composer === "function" ? composer() : el;
+    if (!el?.isConnected) { await waitForPageChange(250); continue; }
+    el.focus();
+    if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+      const proto = Object.getOwnPropertyDescriptor(el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, "value");
+      proto?.set?.call(el, body);
+      el.dispatchEvent(new Event("input", {bubbles: true}));
+      el.dispatchEvent(new Event("change", {bubbles: true}));
+    } else {
+      await insertPrompt(el, body);
+    }
+    if (!el.isConnected) continue;
+    // The send barrier checks the complete text too; do not accept a truncated
+    // draft here using the historical 85-percent heuristic.
+    if (normalizePrompt(readComposer(el)) === normalizePrompt(body)) return body;
+    const dt = new DataTransfer(); dt.setData("text/plain", body);
+    selectComposerContents(el);
+    el.dispatchEvent(new ClipboardEvent("paste", {clipboardData: dt, bubbles: true, cancelable: true}));
+    await Promise.resolve();
+    if (!el.isConnected) continue;
+    if (normalizePrompt(readComposer(el)) === normalizePrompt(body)) return body;
+    step("composer_waiting");
+    await waitForPageChange(250);
   }
-  await insertPrompt(el, body);
-  if (composerHas(el, body)) return body;
-  const dt = new DataTransfer();
-  dt.setData("text/plain", body);
-  el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
-  await sleep(50);
-  if (composerHas(el, body)) return body;
-  try {
-    await navigator.clipboard.writeText(body);
-    document.execCommand("paste");
-    await sleep(50);
-  } catch {
-    /* clipboard may be blocked */
+}
+
+/** textContent drops <br>/<p> boundaries; innerText can omit collapsed text.
+ * Read the message body, not attachment chips, copy controls or hidden UI. */
+function messagePromptText(turn) {
+  const root = turn?.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
+  const walk = node => {
+    if (node.nodeType === 3) return node.nodeValue || "";
+    if (node.nodeType !== 1) return "";
+    if (node.matches('button, svg, script, style, [hidden], [aria-hidden="true"], [data-file-name], [role="group"][aria-label]')) return "";
+    if (node.tagName === "BR") return "\n";
+    const text = [...node.childNodes].map(walk).join("");
+    return /^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE|TR)$/.test(node.tagName) ? `\n${text}\n` : text;
+  };
+  return root?.childNodes ? walk(root).trim() : root?.textContent || root?.innerText || "";
+}
+
+function renderedControl(el) {
+  if (!el?.isConnected) return false;
+  for (let node = el; node; node = node.parentElement) {
+    const style = getComputedStyle(node);
+    if (node.hidden || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
   }
-  if (!composerHas(el, body)) throw new Error("composer did not accept the prompt");
-  return body;
+  const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0;
+}
+
+function attachmentsReady(form, names = []) {
+  if (!form) return names.length === 0;
+  const progress = form.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="uploading"], [class*="animate-spin"]');
+  if ([...progress].some(renderedControl)) return false;
+  const chips = [...form.querySelectorAll('[role="group"][aria-label], [data-file-name], [title]')].filter(renderedControl);
+  return names.every(name => chips.some(chip =>
+    chip.getAttribute("data-file-name") === name || chip.getAttribute("aria-label") === name || chip.getAttribute("title") === name));
 }
 
 function normalizePrompt(text) {
@@ -186,8 +257,7 @@ function step(stage) {
 function actionableSend(button) {
   if (!(button instanceof HTMLElement) || !button.isConnected || button.hidden ||
       button.disabled || button.getAttribute("aria-disabled") === "true") return false;
-  const rect = button.getBoundingClientRect(), style = getComputedStyle(button);
-  if (!rect.width || !rect.height || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+  if (!renderedControl(button)) return false;
   const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("data-testid") || ""}`;
   return !/stop|abort|중지|停止/i.test(label);
 }
@@ -203,7 +273,7 @@ function findEligibleSendButton(selectors) {
 function submissionConfirmed(record) {
   const turns = userTurns();
   // Composer clearing and Stop alone are not proof that THIS request was accepted.
-  const match = turns.slice(record.baseline).find(turn => normalizePrompt(turn.textContent || turn.innerText).includes(record.expected));
+  const match = turns.slice(record.baseline).find(turn => normalizePrompt(messagePromptText(turn)).includes(record.expected));
   if (!record.expected || !match) return false;
   record.phase = "sent";
   record.submittedUsers = turns.indexOf(match) + 1;
@@ -221,7 +291,7 @@ async function clickSend(findSend, findComposer, expectedText) {
   if (!record) {
     const expected = normalizePrompt(expectedText || readComposer(findComposer()));
     if (!expected) throw new Error("cannot submit an empty review prompt");
-    record = {phase: "prepared", expected, baseline: userTurns().length};
+    record = {phase: "prepared", expected, baseline: userTurns().length, attachments: [...(globalThis.__ashlarRunnerState?.pendingAttachments || [])]};
     saveSubmission(record);
     step("prompt_prepared");
   }
@@ -234,11 +304,10 @@ async function clickSend(findSend, findComposer, expectedText) {
       // Delivery is ambiguous. Never automatically replay a possibly accepted prompt.
       step("send_unconfirmed");
     } else {
-      step("send_waiting");
       const editor = findComposer(), button = findSend();
       const form = editor?.closest("form");
-      const uploadBusy = [...(form?.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="uploading"]') || [])]
-        .some(node => node.getClientRects().length > 0);
+      const uploadBusy = !attachmentsReady(form, record.attachments || []);
+      step(uploadBusy ? "attachments_waiting" : "send_waiting");
       const otherTurn = userTurns().length !== record.baseline;
       if (!uploadBusy && !otherTurn && normalizePrompt(readComposer(editor)) === record.expected && actionableSend(button) &&
           !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
@@ -249,7 +318,7 @@ async function clickSend(findSend, findComposer, expectedText) {
       }
     }
     // Cadence only: no upload, send acknowledgement, queue or model deadline.
-    await sleep(250);
+    await waitForPageChange(250);
   }
 }
 
@@ -260,7 +329,7 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   const expected = normalizePrompt(splitAttachments(prompt).prompt);
   for (;;) {
     const turns = userTurns();
-    if (turns.length && (!expected || normalizePrompt(turns.at(-1).textContent || turns.at(-1).innerText).includes(expected))) {
+    if (turns.length && (!expected || normalizePrompt(messagePromptText(turns.at(-1))).includes(expected))) {
       step("legacy_observation"); return;
     }
     step("submission_unknown");

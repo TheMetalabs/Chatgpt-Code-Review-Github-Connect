@@ -149,7 +149,9 @@ test('page-context restart from the durable attempted record recovers the accept
 for(const provider of ['ChatGPT','Grok']) {
  test(`${provider}: a follow-up before the second observation cannot replace the bound review or close its tab`,async t=>{
   const page=await fixture(t);await installCollector(page,provider);await confirmWithId(page);await appendAnswer(page,originalJson);
-  await page.clock.runFor(800);assert.equal((await page.evaluate(()=>message())).code,'busy');
+  // Mutation-driven observation starts immediately; inject the follow-up before
+  // the second stability observation, not after the old fixed 800ms poll.
+  await page.clock.runFor(1);assert.equal((await page.evaluate(()=>message())).code,'busy');
   await appendFollowup(page);await appendAnswer(page,followupJson,'reply-B');
   await page.evaluate(()=>{const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Stop generating';document.body.append(stop);});
   await page.clock.runFor(2400);const result=await page.evaluate(()=>message());assert.equal(result.raw,originalJson);
@@ -169,8 +171,8 @@ test('bound response selection uses message identity even if earlier DOM message
 
 test('missing bound user identity does not fall back to the newest valid JSON or repeat submission',async t=>{
  const page=await fixture(t);await installCollector(page);await confirmWithId(page);await appendAnswer(page,originalJson);
- await page.clock.runFor(800);await appendFollowup(page,{samePrompt:true});await appendAnswer(page,followupJson,'reply-B');
- await page.evaluate(()=>document.querySelector('[data-message-id="user-A"]').remove());await page.clock.fastForward(8*3600_000);
+ await page.clock.runFor(1);await page.evaluate(()=>document.querySelector('[data-message-id="user-A"]').remove());
+ await appendFollowup(page,{samePrompt:true});await appendAnswer(page,followupJson,'reply-B');await page.clock.fastForward(8*3600_000);
  assert.equal((await page.evaluate(()=>message())).code,'busy');assert.equal(await page.evaluate(()=>clicks),1);
 });
 

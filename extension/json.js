@@ -126,8 +126,18 @@ function boundReviewResponse(submission) {
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
     user = users[submission.submittedUsers - 1];
   }
-  if (!user || !submission.expected || !normalizePrompt(user.textContent || user.innerText).includes(submission.expected)) {
+  if (!user || !submission.expected || !normalizePrompt(typeof messagePromptText === "function" ? messagePromptText(user) : user.textContent || user.innerText).includes(submission.expected)) {
     return {root: null, followup: false, identified: false};
+  }
+  // Some renderers assign message IDs after mounting the text. Pin that identity
+  // when it appears rather than staying on the weaker positional fallback.
+  if (!submission.messageId && user.getAttribute("data-message-id")) {
+    submission.messageId = user.getAttribute("data-message-id");
+    const state = globalThis.__ashlarRunnerState;
+    if (state?.confirmedSubmission?.record === submission) {
+      state.submissionPersistencePending = true;
+      if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();
+    }
   }
   const start = messages.indexOf(user) + 1;
   const next = messages.findIndex((node, index) => index >= start && node.getAttribute("data-message-author-role") === "user");
@@ -157,16 +167,17 @@ async function waitUntilReviewOrQuota(name) {
     // A later request's global Stop/quota cannot end or block this older response.
     // Require positive completion controls on the original response itself.
     const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
-    const done = chatGenerationFinished({stopVisible: stop, replyActionsVisible: replyDoneVisible(bound?.root)});
+    const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
+    const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
     const text = assistantCorpus(bound?.root).join("\n\n");
     const json = done ? harvestJson({allowThin: true, root: bound?.root}) : null;
     if (runner?.running) runner.observation = {
-      state: !done ? "generating_or_queued" : json ? "json_observed" : text.trim() ? "waiting_for_json" : "waiting_for_response",
+      state: !done ? "generating_or_queued" : json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response",
       // Diagnostic size bound, NOT a duration bound. Stay local to the bound job.
       text: text.slice(0, 128_000), totalChars: text.length, truncated: text.length > 128_000,
     };
-    recordReviewStep(!done ? (stop ? "generating" : "waiting_for_response") :
-      json ? "json_observed" : text.trim() ? "waiting_for_json" : "waiting_for_response");
+    recordReviewStep(!done ? (stop || streaming ? "generating" : "waiting_for_response") :
+      json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response");
     if ((!bound || (bound.identified && !bound.followup)) && quotaHit() && !json) {
       const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
     }
@@ -179,7 +190,7 @@ async function waitUntilReviewOrQuota(name) {
         return json;
       }
     } else { hits = 0; stable = ""; }
-    await sleep(800);
+    await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
   }
 }
 

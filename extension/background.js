@@ -14,6 +14,7 @@ const WORKER_STATUS_KEY = "bridgeWorkerStatus";
 const jobLanes = new Map();
 const heartbeatLanes = new Map();
 const observationLanes = new Map();
+const repairLanes = new Map();
 const admissionLanes = new Map();
 const admissionReports = new Map();
 let registryPromise;
@@ -460,7 +461,7 @@ async function finishTabCleanup(job, provider, jobs, reason) {
  */
 async function cleanupProvider(job, provider, jobs) {
   const state = job.states[provider];
-  if (!state.delivered || state.cleanupDone) return;
+  if (!state.delivered || state.cleanupDone || state.repairReceiptPending) return;
   state.cleanupPending = true;
   workerStep(job,provider,"cleanup_pending");
   await saveJobs(jobs);
@@ -535,6 +536,7 @@ async function refreshJobHeartbeat(job, jobs) {
   const body = {action: "ping", jobId: job.jobId, leaseId: job.leaseId,
     generating: generatingFor(job), providerErrors: connectionErrors(job), progress: progressFor(job)};
   let result = await api("/api/bridge", body, job.origin);
+  job.localJsonRepairEnabled = result.bridge?.localJsonRepairEnabled === true;
   if (result.active === false) {
     job.serverStatus = result.status || "unknown";
     await saveJobs(jobs);
@@ -687,10 +689,15 @@ async function deliverOutcome(job, provider, jobs) {
   workerStep(job, provider, "delivery_pending");
   await saveJobs(jobs);
   const body = out.ok
-    ? {action: "complete", jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw, originalText: out.originalText}]}
+    ? {action: "complete", repairProtocol: 1, jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw, originalText: out.originalText}]}
     : {action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}`};
   try { await api("/api/bridge", body, job.origin); }
   catch (e) {
+    if (e.status === 422 && e.code === "json_repair_required" && out.ok) {
+      state.formatError = true; // Preserve the original outbox; never turn it into an empty leg.
+      await saveJobs(jobs);
+      return;
+    }
     if (e.status === 409) { job.leaseId = undefined; await saveJobs(jobs); throw e; }
     if (e.status === 400 && out.ok && !job.serverStatus) {
       state.rejectedRaw = out.raw; // Keep diagnostics until the failure is acknowledged.
@@ -702,6 +709,7 @@ async function deliverOutcome(job, provider, jobs) {
     throw e;
   }
   state.delivered = true;
+  delete state.formatError;
   workerStep(job,provider,"result_saved");
   const previousError = (await chrome.storage.local.get(["lastError"])).lastError;
   if (typeof previousError === "string" && previousError.startsWith(`Bridge ${body.action} (${job.jobId}) transport interrupted`)) {
@@ -710,6 +718,109 @@ async function deliverOutcome(job, provider, jobs) {
   state.cleanupPending = true;
   await saveJobs(jobs);
   await cleanupProvider(job, provider, jobs);
+}
+
+function repairBody(job, provider, action, attempt) {
+  return {action, jobId:job.jobId, leaseId:job.leaseId, provider, runId:job.states[provider].runId,
+    repairId:attempt.id, responseId:attempt.responseId, sourceHash:attempt.sourceHash};
+}
+async function readRepairSource(job, provider) {
+  const state=job.states[provider];
+  if(!state.tabId)return null;
+  const result=await sendToTab(state.tabId,tabMessage(job,provider,"ashlar-repair-source"),contentFiles(provider));
+  const source=result?.source;
+  if(!matchesJob(result,job,provider) || !result.ok || !source || typeof source.text!=="string" ||
+     !source.text.trim() || source.text.length>500_000 || source.text.length!==source.totalChars ||
+     source.truncated!==false || source.completed!==true || source.stable!==true ||
+     typeof source.responseId!=="string" || !source.responseId)return null;
+  const sourceHash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(source.text))))
+    .map(byte=>byte.toString(16).padStart(2,"0")).join("");
+  return {...source,sourceHash};
+}
+async function notifyRepairReceipt(job, provider, jobs) {
+  const state=job.states[provider], attempt=state.repairAttempt;
+  if(!state.repairReceiptPending || !attempt?.raw || !attempt.text)return;
+  // A prior outbox write may have failed after mutating the shared registry.
+  // Re-establish durability on EVERY receipt retry, before notifying the page.
+  await saveJobs(jobs);
+  const result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-repair-accepted"),
+    committed:true,repairId:attempt.id,responseId:attempt.responseId,text:attempt.text,raw:attempt.raw},contentFiles(provider));
+  if(!matchesJob(result,job,provider))return;
+  if(!result.accepted) {
+    if(["repair_source_changed","repair_source_unavailable"].includes(result.code)) {
+      // The server already secured this original, but the page can no longer
+      // attest to it. Preserve the page rather than closing an ambiguous tab.
+      state.repairReceiptPending=false;
+      await finishTabCleanup(job,provider,jobs,"repair source changed; tab preserved");
+    }
+    return;
+  }
+  state.repairReceiptPending=false;
+  workerStep(job,provider,"repair_accepted");
+  await saveJobs(jobs);
+  await cleanupProvider(job,provider,jobs);
+}
+async function acceptRepairReceipt(job, provider, jobs, result) {
+  const state=job.states[provider], attempt=state.repairAttempt;
+  if(!attempt?.id || result?.status!=="accepted" || result.id!==attempt.id || result.runId!==state.runId ||
+     result.sourceHash!==attempt.sourceHash || result.responseId!==attempt.responseId || typeof result.raw!=="string" || !result.raw.trim())return;
+  attempt.raw=result.raw;attempt.status="accepted";
+  state.outcome={ok:true,raw:result.raw,originalText:attempt.text};
+  state.delivered=true;state.repairReceiptPending=true;state.cleanupPending=true;
+  delete state.formatError;delete state.repairError;
+  workerStep(job,provider,"result_saved");
+  await saveJobs(jobs); // Real server ACK + local receipt before the page is released.
+  await notifyRepairReceipt(job,provider,jobs);
+}
+/** Independent control lane. Local inference runs server-side; no HTTP request
+ * here waits for model completion. Identity/source are rechecked before commit.
+ */
+async function repairProvider(job, provider, jobs) {
+  const state=job.states[provider];
+  if(state.delivered) {await notifyRepairReceipt(job,provider,jobs);return;}
+  let attempt=state.repairAttempt;
+  if(attempt?.id) {
+    const response=await api("/api/bridge",repairBody(job,provider,"repair-status",attempt),job.origin);
+    const status=response.repair;
+    if(status?.id!==attempt.id || status.sourceHash!==attempt.sourceHash || status.runId!==state.runId || status.responseId!==attempt.responseId)return;
+    attempt.status=status.status;
+    workerStep(job,provider,`repair_${status.status}`);
+    await saveJobs(jobs);
+    if(status.status==="accepted")return acceptRepairReceipt(job,provider,jobs,status);
+    if (["running","ready"].includes(status.status)) {
+      const current=job.localJsonRepairEnabled ? await readRepairSource(job,provider) : null;
+      if (current && (current.sourceHash!==attempt.sourceHash || current.responseId!==attempt.responseId)) {
+        // A later completed source is a new repair identity, not a replay of the
+        // old inference. Starting it below fences/cancels the obsolete request.
+        state.repairAttempt=undefined;
+        attempt=undefined;
+        await saveJobs(jobs);
+      } else {
+        if(status.status==="ready" && current) {
+          if(state.delivered || (state.outcome?.ok && !state.formatError))return;
+          const committed=await api("/api/bridge",repairBody(job,provider,"repair-commit",attempt),job.origin);
+          return acceptRepairReceipt(job,provider,jobs,committed.repair);
+        }
+        return;
+      }
+    }
+  }
+  if(!job.localJsonRepairEnabled || state.delivered || (!state.formatError && state.observation?.state!=="response_completed_json_invalid"))return;
+  const source=await readRepairSource(job,provider);
+  if(!source || (attempt?.sourceHash===source.sourceHash && attempt.responseId===source.responseId && attempt.id))return;
+  state.repairAttempt={sourceHash:source.sourceHash,responseId:source.responseId,text:source.text,status:"prepared"};
+  attempt=state.repairAttempt;
+  await saveJobs(jobs); // Save complete source/intent even when the start reply is lost.
+  await flushProgress(job);
+  if(!job.localJsonRepairEnabled || state.delivered)return;
+  const response=await api("/api/bridge",{...repairBody(job,provider,"repair",attempt),source},job.origin);
+  const status=response.repair;
+  if(status?.id && status.sourceHash===attempt.sourceHash && status.responseId===attempt.responseId && status.runId===state.runId) {
+    attempt.id=status.id;attempt.status=status.status;
+    workerStep(job,provider,`repair_${status.status}`);
+    await saveJobs(jobs);
+    if(status.status==="accepted")await acceptRepairReceipt(job,provider,jobs,status);
+  }
 }
 
 async function advanceJob(job, jobs) {
@@ -738,6 +849,14 @@ async function advanceJob(job, jobs) {
     try {
       await pollProvider(job, provider, jobs, !active);
       if (canDeliver) await deliverOutcome(job, provider, jobs);
+      if (canDeliver || job.states[provider].repairAttempt?.id) {
+        void singleFlight(repairLanes, `${job.origin}:${job.jobId}:${provider}`,
+          () => repairProvider(job, provider, jobs)).catch(() => {
+            // The repair lane owns no model-generation deadline and never marks
+            // the provider failed. Its original/intention stay in durable storage.
+            job.states[provider].repairError = "Local JSON repair transport/archive pending; original retained";
+          });
+      }
       if (active) {
         // Diagnostic persistence is independently retryable. A slow observe/progress
         // RPC must not hold the lane that will harvest the now-completed response.

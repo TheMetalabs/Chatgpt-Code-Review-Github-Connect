@@ -1,3 +1,5 @@
+import {cancelLocalJsonRepairs} from "./json-repair.server";
+import type {RepairReceipt} from "./json-repair-types.ts";
 import {recordJobHistory, recordDeliveryHistory, reviewHistory} from "./review-history.server";
 import {
   CANDIDATE_412_DROPPED,
@@ -108,11 +110,17 @@ export function patchHarborSettings(patch: Partial<BotSettings>) {
     throw new Error("at least one configured reviewer is required");
   }
   const saved = saveBotSettings(next);
+  const previousSettings = state.settings;
   state = { ...state, settings: saved };
+  if (!saved.localJsonRepairEnabled || previousSettings.localLlmBaseUrl !== saved.localLlmBaseUrl ||
+      previousSettings.localLlmModel !== saved.localLlmModel || previousSettings.localLlmApiKey !== saved.localLlmApiKey) {
+    cancelLocalJsonRepairs("disabled");
+  }
   return state.settings;
 }
 
 export function resetHarbor() {
+  cancelLocalJsonRepairs("superseded");
   for (const controller of localControllers.values()) controller.abort();
   localControllers.clear();
   localInFlight.clear();
@@ -122,6 +130,7 @@ export function resetHarbor() {
 }
 
 export function cancelHarborJob(jobId: string) {
+  cancelLocalJsonRepairs("superseded", jobId);
   localControllers.get(jobId)?.abort();
   state = {
     ...state,
@@ -251,7 +260,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
   await finishJob(jobId, sample);
 }
 
-export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string };
+export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt };
 
 async function reactQuiet(token: string, job: Job, content: GithubReaction) {
   try {

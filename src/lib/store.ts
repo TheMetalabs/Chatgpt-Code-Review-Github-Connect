@@ -252,6 +252,7 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       reviewChatgpt: next.reviewChatgpt,
       reviewGrok: next.reviewGrok,
       reviewLocal: next.reviewLocal,
+      localJsonRepairEnabled: next.localJsonRepairEnabled,
       localLlmBaseUrl: next.localLlmBaseUrl,
       localLlmModel: next.localLlmModel,
       reviewOrder: next.reviewOrder,

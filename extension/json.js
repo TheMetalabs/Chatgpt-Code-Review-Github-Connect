@@ -149,7 +149,27 @@ function boundReviewResponse(submission) {
   // is safe only when it contains no user or unrelated response messages.
   const root = container && [...container.querySelectorAll('[data-message-author-role]')].every(node => replies.includes(node))
     ? container : message;
-  return {root, followup: next >= 0, identified: true};
+  return {root, followup: next >= 0, identified: true, responseId: message.getAttribute("data-message-id") || ""};
+}
+
+/** Private full source, requested only by the owning worker's repair lane.
+ * Stable content is additional evidence, NEVER a replacement for completion controls.
+ */
+function currentRepairSource() {
+  const state = globalThis.__ashlarRunnerState;
+  if (!state?.jobId || !state.runId || !state.completedSource) return null;
+  let submission;
+  try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return null; }
+  if (submission?.phase !== "sent") return null;
+  const bound = boundReviewResponse(submission);
+  if (!bound.identified || !bound.root || !bound.responseId) return null;
+  if (bound.followup) state.tabRepurposed = true;
+  const stop = bound.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
+  if (stop || responseStreaming(bound.root) || !replyDoneVisible(bound.root)) return null;
+  const text = assistantCorpus(bound.root).join("\n\n");
+  if (!text.trim() || text.length > 500_000 || state.completedSource.text !== text ||
+      state.completedSource.responseId !== bound.responseId) return null;
+  return {text, totalChars:text.length, truncated:false, responseId:bound.responseId, completed:true, stable:true};
 }
 
 async function waitUntilReviewOrQuota(name) {
@@ -157,6 +177,10 @@ async function waitUntilReviewOrQuota(name) {
   // No poll-count/elapsed-time failure. Controls can appear before response text is
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
+    if (globalThis.__ashlarRunnerState?.repairedResult) {
+      recordReviewStep("repair_accepted");
+      return globalThis.__ashlarRunnerState.repairedResult;
+    }
     const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
     const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : undefined;
     const runner = globalThis.__ashlarRunnerState;
@@ -171,6 +195,17 @@ async function waitUntilReviewOrQuota(name) {
     const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
     const text = assistantCorpus(bound?.root).join("\n\n");
     const json = done ? harvestJson({allowThin: true, root: bound?.root}) : null;
+    if (runner) {
+      if (done && text.trim() && bound?.identified && bound.responseId) {
+        const previous = runner.completionTracking;
+        const count = previous?.text === text && previous.responseId === bound.responseId ? previous.count + 1 : 1;
+        runner.completionTracking = {text, responseId:bound.responseId, count};
+        runner.completedSource = count >= 2 ? {text, responseId:bound.responseId} : undefined;
+      } else {
+        runner.completionTracking = undefined;
+        runner.completedSource = undefined;
+      }
+    }
     if (runner?.running) runner.observation = {
       state: !done ? "generating_or_queued" : json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response",
       // Diagnostic size bound, NOT a duration bound. Stay local to the bound job.
@@ -215,12 +250,12 @@ function installReviewRunner(name, run) {
   if (!state.runId) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
-  if (state.listener && state.protocol === "observed-submission-v2") return;
+  if (state.listener && state.protocol === "observed-submission-v3") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
-  state.protocol = "observed-submission-v2";
+  state.protocol = "observed-submission-v3";
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation });
   state.listener = (msg, _sender, reply) => {
-    if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close"].includes(msg?.type)) return;
+    if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close", "ashlar-repair-source", "ashlar-repair-accepted"].includes(msg?.type)) return;
     const respond = reply;
     reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId, progress: reviewProgress()});
     if (!msg.jobId) {
@@ -232,6 +267,28 @@ function installReviewRunner(name, run) {
         (state.runId && msg.runId && msg.runId !== state.runId)) {
       reply({ ok: false, code: "job_mismatch", error: "tab belongs to another job" });
       return;
+    }
+    if (["ashlar-repair-source", "ashlar-repair-accepted"].includes(msg.type)) {
+      if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider) {
+        reply({ok:false,code:"job_mismatch"});return;
+      }
+      const source = currentRepairSource();
+      if (!source) { reply({ok:false,code:"repair_source_unavailable"});return; }
+      if (msg.type === "ashlar-repair-source") { reply({ok:true,source});return; }
+      if (msg.committed !== true || !msg.repairId || msg.responseId !== source.responseId || msg.text !== source.text ||
+          typeof msg.raw !== "string" || !extractChatJson(msg.raw)) {
+        reply({ok:false,code:"repair_source_changed"});return;
+      }
+      // The server ACK identifies this exact original. This is not another model
+      // response or an extra Local reviewer vote, and never authorizes a send.
+      state.repairedResult = msg.raw;
+      state.responseText = source.text;
+      recordReviewStep("repair_accepted");
+      if (!state.running) {
+        state.finishedContext = reviewPageContext();
+        state.result = {ok:true,raw:msg.raw,responseText:source.text};
+      }
+      reply({ok:true,accepted:true});return;
     }
     // Upgrade only an already matching job binding; never adopt an unrelated chat.
     if (state.jobId === msg.jobId && !state.runId && msg.runId) {
@@ -269,6 +326,9 @@ function installReviewRunner(name, run) {
     try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
     state.observation = undefined;
+    state.completedSource = undefined;
+    state.completionTracking = undefined;
+    state.repairedResult = undefined;
     Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
       .then(raw => { state.finishedContext = reviewPageContext(); state.result = { ok: true, raw, responseText: state.responseText }; })
       .catch(e => {

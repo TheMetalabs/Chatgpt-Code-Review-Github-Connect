@@ -18,6 +18,7 @@ export const Route = createFileRoute("/settings")({ component: Settings });
 function hydrateDraft(saved: BotSettings): BotSettings {
   return {
     ...saved,
+    localJsonRepairEnabled: saved.localJsonRepairEnabled ?? true,
     localLlmApiKey: saved.localLlmApiKeySet ? SECRET_MASK : "",
     webhookSecret: saved.webhookSecretSet ? SECRET_MASK : saved.webhookSecret,
   };
@@ -29,7 +30,7 @@ function replaceMasked(current: string, next: string): string {
   return next.replace(/•/g, "");
 }
 
-function Settings() {
+export function Settings() {
   const saved = useAshlar((s) => s.settings);
   const setSettings = useAshlar((s) => s.setSettings);
   const resetDemo = useAshlar((s) => s.resetDemo);
@@ -70,6 +71,7 @@ function Settings() {
     saved.reviewChatgpt,
     saved.reviewGrok,
     saved.reviewLocal,
+    saved.localJsonRepairEnabled,
     saved.localLlmBaseUrl,
     saved.localLlmModel,
     saved.localLlmApiKeySet,
@@ -270,6 +272,16 @@ function Settings() {
             />
           </Field>
         </div>
+        <Field label="Local JSON repair fallback">
+          <Toggle label="파싱 실패 시 Local LLM으로 JSON 복구 (기본 켜짐)" checked={draft.localJsonRepairEnabled}
+            onChange={(value) => patch({localJsonRepairEnabled: value})} />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            Uses the configured Local endpoint/model only after a completed response fails JSON/schema validation.
+            Works even when review_local is OFF and never enables Local code review.
+            Only this fallback switch controls format repair. Turning it OFF and saving stops new repairs and prevents applying
+            in-flight candidates; normal reviews and original responses are preserved.
+          </p>
+        </Field>
         <Field label="local_llm.api_key">
           <input
             type="password"
@@ -380,7 +392,8 @@ review:
   order: [${order.join(", ")}]
 local_llm:
   base_url: ${draft.localLlmBaseUrl || "—"}
-  model: ${draft.localLlmModel || "—"}`}</pre>
+  model: ${draft.localLlmModel || "—"}
+  json_repair_enabled: ${draft.localJsonRepairEnabled}`}</pre>
 
       <Button
         variant="secondary"

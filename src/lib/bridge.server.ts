@@ -1,3 +1,7 @@
+import {JsonRepairService, localJsonRepairAvailable, cancelLocalJsonRepairs} from "./json-repair.server";
+import type {RepairInput} from "./json-repair.server";
+import {inspectReviewFormat} from "./review-json-repair";
+import type {RepairRecord} from "./json-repair-types";
 import {reviewHistory} from "./review-history.server";
 import {sanitizeProgressEvents} from "./review-progress";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -56,6 +60,8 @@ export type BridgePublic = Omit<BridgeStatus, "token"> & {
   serverInstanceId: string;
   pendingJobs: number;
   lastTakeAt?: number;
+  repairProtocol: 1;
+  localJsonRepairEnabled: boolean;
 };
 
 export function getBridgeStatus(): BridgeStatus {
@@ -71,6 +77,7 @@ export function getBridgeStatus(): BridgeStatus {
 export function getBridgePublic(): BridgePublic {
   const { token: _t, ...rest } = getBridgeStatus();
   return {...rest, protocolVersion: 1, serverInstanceId, lastTakeAt: meta.lastTakeAt,
+    repairProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
     pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && pendingChatProviders(job).length > 0).length,
   };
 }
@@ -313,6 +320,8 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
     } catch { return {ok: false, error: "response history storage unavailable; original reply must be retained", code: "history_unavailable"}; }
     return {ok: true};
   }
+  if (incoming.some(leg => job.storedLegs?.some(stored => stored.provider === leg.provider && stored.repair && stored.raw !== leg.raw)))
+    return {ok:false,error:"the provider result is already committed",code:"lease_conflict"};
   if (job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return {ok: false, error: "job is not claimed by this worker", code: "lease_conflict"};
   const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(getHarbor().settings);
   const accepted: ChatLeg[] = [];
@@ -324,7 +333,7 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
     } catch {return {ok:false,error:"response archive unavailable; original response must be retained",code:"history_unavailable"};}
     const parsed = extractChatJson(leg.raw);
     if (!parsed) return {ok: false, error: "completed response is not review JSON"};
-    accepted.push({provider: leg.provider, raw: parsed, originalText: leg.originalText});
+    accepted.push({...leg, raw: parsed});
   }
   if (!accepted.length) return {ok: false, error: "no enabled reviewer result"};
   patchHarborJob(jobId, current => {
@@ -340,6 +349,7 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
     // One patch: the watcher can never observe done-without-the-corresponding-payload.
     return {...current, storedLegs, generating, providerErrors, updatedAt: Date.now()};
   });
+  for (const leg of accepted) if (!leg.repair) cancelLocalJsonRepairs("superseded", jobId, leg.provider);
   meta.lastJobId = jobId;
   meta.lastError = undefined;
   // ACK the already stored result now. Snapshot/validation/GitHub posting can be
@@ -351,4 +361,71 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
       if (meta.lastJobId === jobId) meta.lastError = String(error?.message || error).slice(0, 240);
     });
   return {ok: true};
+}
+
+
+function currentRepairJob(input: RepairInput) {
+  const job = getHarbor().jobs.find(row => row.id === input.jobId);
+  return Boolean(job && job.status === "awaiting_chat" && llmWorkAllowed(job) &&
+    job.headSha === input.headSha && !job.chatFpRound && !job.fpProviders?.length && input.schema === "review" &&
+    job.reviewProviders?.includes(input.provider) && job.providerProgress?.[input.provider]?.runId === input.runId &&
+    !job.storedLegs?.some(leg => leg.provider === input.provider && leg.raw.trim()));
+}
+let repairService: JsonRepairService | undefined;
+function repairs() {
+  return repairService ||= new JsonRepairService({settings: () => getHarbor().settings, history: reviewHistory,
+    isCurrent: currentRepairJob,
+    isAccepted: record => Boolean(getHarbor().jobs.find(row => row.id === record.jobId)?.storedLegs?.some(leg =>
+      leg.provider === record.provider && leg.repair?.id === record.id && leg.raw === record.raw)),
+    accept: record => {
+      const job = getHarbor().jobs.find(row => row.id === record.jobId);
+      if (!job || !currentRepairJob(record)) return Promise.resolve({ok:false});
+      return completeBridgeJob(record.jobId, record.raw!, [{provider:record.provider,raw:record.raw!,originalText:record.original,
+        repair:{id:record.id,sourceHash:record.sourceHash,responseId:record.responseId,runId:record.runId,normalizedBy:"local"}}],job.bridgeLeaseId);
+    },
+  });
+}
+export function bridgeFormatErrors(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string): string[] {
+  if (!localJsonRepairAvailable(getHarbor().settings)) return [];
+  const job=getHarbor().jobs.find(row=>row.id===jobId);
+  if(!job || job.status!=="awaiting_chat" || !ownsLease(job,leaseId) || job.chatFpRound || job.fpProviders?.length) return [];
+  return (legs?.length ? legs : [{provider:"chatgpt" as const,raw}]).flatMap(leg=>{
+    if(!job.reviewProviders?.includes(leg.provider))return [];
+    const check=inspectReviewFormat(extractChatJson(leg.raw) || leg.raw,"review");
+    return check.ok ? [] : check.errors;
+  }).slice(0,32);
+}
+export type BridgeRepairRequest = {
+  jobId: string; leaseId?: string; provider?: string; runId?: string; responseId?: string; sourceHash?: string; repairId?: string;
+  source?: {text?: unknown; totalChars?: unknown; truncated?: unknown; responseId?: unknown; completed?: unknown; stable?: unknown};
+};
+/** Short control RPC. Candidate readiness is never a final result ACK. */
+export async function handleBridgeRepair(action: string, body: BridgeRepairRequest) {
+  const job=getHarbor().jobs.find(row=>row.id===body.jobId);
+  if(!job || !ownsLease(job,body.leaseId) || !["chatgpt","grok"].includes(body.provider || "") ||
+     !job.reviewProviders?.includes(body.provider as ReviewProvider) || !body.runId ||
+     job.providerProgress?.[body.provider as ReviewProvider]?.runId!==body.runId) return {ok:false as const,error:"repair_binding_mismatch",http:409};
+  if(job.chatFpRound || job.fpProviders?.length) return {ok:false as const,error:"repair_stage_not_supported",http:409};
+  if(action==="repair") {
+    if(!localJsonRepairAvailable(getHarbor().settings))return {ok:true as const,repair:{status:"disabled" as const},http:200};
+    const source=body.source;
+    if(typeof body.responseId!=="string" || !body.responseId || body.responseId.length>200 || typeof body.sourceHash!=="string" ||
+       !source || source.completed!==true || source.stable!==true || source.truncated!==false ||
+       source.responseId!==body.responseId || typeof source.text!=="string" || source.totalChars!==source.text.length || source.text.length>500000)
+      return {ok:false as const,error:"invalid_repair_source",http:400};
+    // Worker delivery/repair steps must not overwrite the last PAGE observation.
+    const pages=reviewHistory().getJob(job.id)?.steps.filter(step=>step.source==="page" && step.provider===body.provider && step.runId===body.runId) || [];
+    const latestPage=pages.reduce<(typeof pages)[number] | undefined>((last,item)=>
+      !last || Number(item.id.split(":").at(-1))>Number(last.id.split(":").at(-1)) ? item : last,undefined);
+    const stage=latestPage?.stage;
+    if(!["response_completed_json_invalid","response_collected","json_observed"].includes(stage || ""))return {ok:false as const,error:"completion_not_observed",http:409};
+    const input:RepairInput={jobId:body.jobId,provider:body.provider as "chatgpt"|"grok",runId:body.runId,
+      responseId:body.responseId,sourceHash:body.sourceHash,original:source.text,headSha:job.headSha,schema:"review"};
+    try{return {ok:true as const,repair:repairs().start(input),http:200};}
+    catch(error){if(error instanceof Error && error.message==="invalid_repair_source")return {ok:false as const,error:error.message,http:400};throw error;}
+  }
+  const record=body.repairId ? reviewHistory().getRepair(body.jobId,body.repairId) : null;
+  if(!record || record.provider!==body.provider || record.runId!==body.runId || record.responseId!==body.responseId ||
+     record.sourceHash!==body.sourceHash || record.headSha!==job.headSha)return {ok:false as const,error:"repair_binding_mismatch",http:409};
+  return {ok:true as const,repair:action==="repair-commit" ? await repairs().commit(body.jobId,record.id) : repairs().status(body.jobId,record.id),http:200};
 }

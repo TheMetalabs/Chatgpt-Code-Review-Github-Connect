@@ -1,3 +1,4 @@
+import type {RepairReceipt} from "./json-repair-types.ts";
 import type { ProviderProgress } from "./review-progress.ts";
 import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
 
@@ -122,7 +123,7 @@ export interface Job {
     skipped: string[];
     dropped: string[];
   };
-  storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string }[];
+  storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt }[];
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;
   attemptedProviders?: ReviewProvider[];
@@ -201,6 +202,8 @@ export interface BotSettings {
   reviewChatgpt: boolean;
   reviewGrok: boolean;
   reviewLocal: boolean;
+  /** Formatting-only recovery; independent of Local reviewer participation. */
+  localJsonRepairEnabled: boolean;
   chatgptReasoning: ChatgptReasoning;
   grokReasoning: GrokReasoning;
   localLlmBaseUrl: string;
@@ -250,6 +253,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   reviewChatgpt: true,
   reviewGrok: true,
   reviewLocal: false,
+  localJsonRepairEnabled: true,
   chatgptReasoning: "pro",
   grokReasoning: "heavy",
   localLlmBaseUrl: "http://127.0.0.1:11434/v1",

@@ -3,6 +3,8 @@ export const PROGRESS_LABELS = {
     tab_created: "Review tab created",
     run_dispatched: "Page runner acknowledged · submission not yet confirmed",
     composer_waiting: "Prompt not sent · waiting for composer",
+    attachments_waiting: "Prompt entered · waiting for named attachments to finish uploading",
+    response_completed_json_invalid: "Response completion controls observed · JSON invalid; inspect original (no automatic resend)",
     attachments_preparing: "Preparing prompt and attachments",
     prompt_prepared: "Prompt entered · not yet sent",
     send_waiting: "Prompt not sent · waiting for enabled send control",

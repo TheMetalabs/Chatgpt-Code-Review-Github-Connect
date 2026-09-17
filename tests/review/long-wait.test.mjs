@@ -1,3 +1,4 @@
+import {bridgePromptText} from "../../src/lib/chat-prompt.ts";
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {background,content,flush,raw,source} from './helpers.mjs';
@@ -48,7 +49,7 @@ test('no JSON observation remains pending after eight hours and never emits empt
 });
 test('local health check is not failed by an implicit five-second signal',async()=>{
  let seen;
- const local=loadTs('src/lib/local-llm.server.ts',{...parser,AbortSignal:{timeout:()=>{throw Error('health request used a timeout');}},
+ const local=loadTs('src/lib/local-llm.server.ts',{...parser,bridgePromptText,AbortSignal:{timeout:()=>{throw Error('health request used a timeout');}},
    requestLocalJson:async(...args)=>{seen=args;return {};},requestLocalChat:async()=>raw});
  const out=await local.pingLocalLlm({localLlmBaseUrl:'http://local/v1',localLlmApiKey:'local',localLlmModel:'m'});
  assert.equal(out.ok,true);assert.equal(seen?.[4],undefined);
@@ -75,7 +76,7 @@ test('busy observation preserves non-JSON text under the matching PR/run and is 
 });
 test('Local review call waits for actual completion rather than an elapsed timeout signal',async()=>{
  const gate=deferred();let passedSignal;
- const local=loadTs('src/lib/local-llm.server.ts',{...parser,
+ const local=loadTs('src/lib/local-llm.server.ts',{...parser,bridgePromptText,
   requestLocalChat:async(...args)=>{passedSignal=args[3];return gate.promise;}});
  let done=false;const pending=local.runLocalLlm('review',{localLlmBaseUrl:'http://local/v1',localLlmApiKey:'key',localLlmModel:'model'}).then(result=>{done=true;return result;});
  await flush();assert.equal(done,false);assert.equal(passedSignal,undefined);

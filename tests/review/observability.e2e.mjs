@@ -56,3 +56,21 @@ test('observability: a bridge automation token alone cannot read the private arc
  const response=await fetch(app.origin+'/api/history',{headers:{'x-ashlar-bridge-token':'fixture-token'}});
  assert.equal(response.status,401,'raw history needs a separate server-only read credential');
 });
+test('observability: completed-invalid JSON is visible and archived without posting or terminating generation by time',async t=>{
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());const job=await ready(app);
+ const stage='response_completed_json_invalid';
+ const progress={chatgpt:{runId:'run-A',events:[{source:'page',sequence:1,stage,at:Date.now()}]}};
+ assert.equal((await post(app,{action:'progress',jobId:job.jobId,leaseId:job.leaseId,progress})).ok,true);
+ assert.equal((await post(app,{action:'observe',jobId:job.jobId,leaseId:job.leaseId,provider:'chatgpt',runId:'run-A',text:'{"findings":[],"evidence":"a "quote""}',totalChars:36})).ok,true);
+ const live=app.harbor.getHarbor().jobs.find(j=>j.id===job.jobId);
+ assert.equal(live.providerProgress.chatgpt.stage,stage);assert.equal(live.status,'awaiting_chat');assert.equal(app.reviews.length,0);
+ assert.ok(app.history.getJob(job.jobId,true).observations.chatgpt.text.includes('"quote"'));
+ assert.equal(JSON.stringify(app.history.getJob(job.jobId)).includes('"quote"'),false);
+});
+test('bridge prompt reads negotiate V2 while old clients keep legacy frames',async t=>{
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());const job=await ready(app);
+ assert.match(job.prompt,/<<<ATTACH:/);assert.doesNotMatch(job.prompt,/<<<ASHLAR_ATTACHMENTS_V2>>>/);
+ const get=protocol=>fetch(`${app.origin}/api/bridge?jobId=${encodeURIComponent(job.jobId)}&attachmentProtocol=${protocol}`,{headers:{'x-ashlar-bridge-token':'fixture-token'}}).then(r=>r.json());
+ assert.match((await get(2)).prompt,/<<<ASHLAR_ATTACHMENTS_V2>>>/);assert.match((await get(1)).prompt,/<<<ATTACH:/);
+ assert.equal(app.reviews.length,0);
+});

@@ -1,3 +1,4 @@
+import { bridgePromptText } from "./chat-prompt";
 import type { BotSettings } from "./types";
 import { extractChatJson } from "./extract-chat-json";
 import { requestLocalJson, requestLocalChat, type LocalChatMessage } from "./local-chat-request.server";
@@ -33,6 +34,7 @@ export async function runLocalLlm(
 ): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
+  prompt = bridgePromptText(prompt); // Native API input remains readable source text, not escaped transport JSON.
   const call = (messages: LocalChatMessage[]) => requestLocalChat(
     ready.baseURL, ready.apiKey, { model: ready.model, messages, temperature: 0 }, signal,
   );

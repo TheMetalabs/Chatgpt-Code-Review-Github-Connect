@@ -78,6 +78,10 @@ function replyDoneVisible(root = currentAssistantRoot()) {
   return false;
 }
 
+function responseStreaming(root = currentAssistantRoot()) {
+  return Boolean(root && [...root.querySelectorAll('[data-streaming-response-status], [data-is-streaming="true"]')].some(elVisible));
+}
+
 /**
  * Match src/lib/chat-settle.ts object form.
  * Legacy boolean arg is ignored as forced sawStop — live DOM decides (migration wrapper).

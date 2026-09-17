@@ -773,6 +773,7 @@ function Toggle({
   return (
     <button
       type="button"
+      aria-label={label}
       aria-pressed={checked}
       onClick={() => onChange(!checked)}
       className="flex h-11 items-center justify-between rounded-md border border-line bg-bg-elevated px-3 text-left text-sm"

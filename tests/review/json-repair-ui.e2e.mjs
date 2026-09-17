@@ -22,7 +22,7 @@ test('Settings UI: repair defaults ON, saved OFF survives reload and does not ch
  const context=await browser.newContext();t.after(()=>context.close());let flag,submitted;
  await context.route('https://repair.fixture/**',async route=>{
   const url=new URL(route.request().url());
-  if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:`<div id="root"></div><script>window.repairFlag=${JSON.stringify(flag) || 'undefined'};</script><script>${bundle.replace(/<\/script/gi,'<\\/script')}</script>`});
+  if(url.pathname==='/')return route.fulfill({contentType:'text/html; charset=utf-8',body:`<div id="root"></div><script>window.repairFlag=${JSON.stringify(flag) || 'undefined'};</script><script>${bundle.replace(/<\/script/gi,'<\\/script')}</script>`});
   if(url.pathname==='/api/harbor') {submitted=route.request().postDataJSON();flag=submitted.localJsonRepairEnabled;return route.fulfill({contentType:'application/json',body:'{"ok":true}'});}
   return route.fulfill({contentType:'application/json',body:'{"ok":true}'});
  });
@@ -36,7 +36,7 @@ test('History UI: repair status visible, originals and candidates only after pro
  const job={id:'A',owner:'fixture',repo:'repo',pr:1,status:'awaiting_chat'};
  await context.route('https://repair.fixture/**',async route=>{
   const req=route.request(),url=new URL(req.url());
-  if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:`<div id="root"></div><script>${bundle.replace(/<\/script/gi,'<\\/script')}</script>`});
+  if(url.pathname==='/')return route.fulfill({contentType:'text/html; charset=utf-8',body:`<div id="root"></div><script>${bundle.replace(/<\/script/gi,'<\\/script')}</script>`});
   assert.equal(req.headers()['x-ashlar-history-token'],'history-fixture');assert.equal(url.searchParams.has('token'),false);
   const details={job,inCurrentRuntime:true,steps:[],droppedSteps:0,repairs:[{...metadata,...(url.searchParams.has('responses')?{original:'PRIVATE ORIGINAL',candidate:'<script>window.injected=true</script>'}:{})}]};
   return route.fulfill({contentType:'application/json',body:JSON.stringify(url.searchParams.has('jobId')?{ok:true,record:details}:{ok:true,items:[job],total:1,health:{ok:true},nextCursor:null})});

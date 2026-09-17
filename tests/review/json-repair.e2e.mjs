@@ -87,3 +87,56 @@ test('HTTP: candidate commit waits for response archive recovery without another
  assert.equal((await post(app,{action:'repair-commit',...binding,repairId:out.repair.id})).repair.status,'accepted');
  await eventually(()=>app.reviews.length===1,'not posted');assert.equal(app.localRequests.length,1);
 });
+
+for(const error of ['tab_closed','cancelled','quota','empty','error'])for(const phase of ['running','ready'])
+ test(`HTTP: terminal ${error} fences ${phase} repair without cancelling pending Grok`,async t=>{
+  const {app,binding,start}=await setup(t,{reviewGrok:true});
+  const out=await start();await eventually(()=>app.localRequests.length===1,'repair not started');
+  const request=action=>post(app,{action,...binding,repairId:out.repair.id});
+  if(phase==='ready'){respond(app);await eventually(async()=>(await request('repair-status')).repair.status==='ready','not ready');}
+  assert.equal((await post(app,{action:'failure',...binding,error:`${error}: explicit provider outcome`})).ok,true);
+  const live=()=>app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId);
+  assert.equal(live().status,'awaiting_chat');
+  assert.equal(app.history.getRepair(binding.jobId,out.repair.id).status,'superseded','provider failure did not retire its pending repair');
+  if(phase==='running')respond(app); // Simulate late HTTP completion; never applied.
+  const committed=await request('repair-commit');
+  assert.equal(committed.repair.status,'superseded');
+  assert.equal(live().providerErrors.chatgpt.code,error);
+  assert.equal(live().storedLegs?.some(leg=>leg.provider==='chatgpt')||false,false);
+  assert.equal(live().providerErrors.grok,undefined);
+  assert.equal((await start()).repair.status,'superseded');
+  assert.equal(app.localRequests.length,1);assert.equal(app.reviews.length,0);
+ });
+test('HTTP: transient disconnected ping does not fence formatting recovery',async t=>{
+ const {app,binding,start}=await setup(t,{reviewGrok:true});const out=await start();await eventually(()=>app.localRequests.length===1,'not started');respond(app);
+ const request=action=>post(app,{action,...binding,repairId:out.repair.id});
+ await eventually(async()=>(await request('repair-status')).repair.status==='ready','not ready');
+ assert.equal((await post(app,{action:'ping',...binding,providerErrors:{chatgpt:{code:'disconnected',message:'temporary connection outage'}}})).accepted,true);
+ assert.equal((await request('repair-commit')).repair.status,'accepted');
+ const live=app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId);
+ assert.equal(live.storedLegs.find(leg=>leg.provider==='chatgpt').raw,raw);assert.equal(live.providerErrors.chatgpt,undefined);
+ assert.equal(app.localRequests.length,1);assert.equal(app.reviews.length,0,'pending Grok must not be skipped');
+});
+test('HTTP: persisted terminal outcome also rejects ready repair when cancellation registry was lost',async t=>{
+ const {app,binding,start}=await setup(t,{reviewGrok:true});const out=await start();await eventually(()=>app.localRequests.length===1,'not started');respond(app);
+ const request=action=>post(app,{action,...binding,repairId:out.repair.id});
+ await eventually(async()=>(await request('repair-status')).repair.status==='ready','not ready');
+ app.harbor.patchHarborJob(binding.jobId,job=>({...job,providerErrors:{chatgpt:{code:'tab_closed',message:'recorded terminal outcome'}}}));
+ assert.equal((await request('repair-commit')).repair.status,'superseded');
+ assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId).storedLegs?.length||0,0);assert.equal(app.localRequests.length,1);
+});
+test('HTTP: terminating ChatGPT repair leaves the ready Grok repair usable',async t=>{
+ const {app,binding,start}=await setup(t,{reviewGrok:true});const a=await start();
+ const grok={...binding,provider:'grok',runId:'run-Grok',responseId:'response-Grok'};
+ assert.equal((await post(app,{action:'progress',...grok,progress:{grok:{runId:grok.runId,events:[{source:'page',sequence:1,at:Date.now(),stage:'response_completed_json_invalid'}]}}})).ok,true);
+ const b=await post(app,{action:'repair',...grok,source:{text:original,totalChars:original.length,truncated:false,responseId:grok.responseId,completed:true,stable:true}});
+ await eventually(()=>app.localRequests.length===2,'parallel repairs not started');respond(app,raw,0);respond(app,raw,1);
+ const get=(identity,id,action='repair-status')=>post(app,{action,...identity,repairId:id});
+ await eventually(async()=>(await get(binding,a.repair.id)).repair.status==='ready' && (await get(grok,b.repair.id)).repair.status==='ready','both candidates not ready');
+ assert.equal((await post(app,{action:'failure',...binding,error:'tab_closed: explicitly closed'})).ok,true);
+ assert.equal((await get(binding,a.repair.id)).repair.status,'superseded');assert.equal((await get(grok,b.repair.id)).repair.status,'ready');
+ assert.equal((await get(grok,b.repair.id,'repair-commit')).repair.status,'accepted');
+ await eventually(()=>app.reviews.length===1,'remaining reviewer did not post');
+ const job=app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId);
+ assert.deepEqual(Array.from(job.storedLegs,leg=>leg.provider),['grok']);assert.equal(job.providerErrors.chatgpt.code,'tab_closed');assert.equal(app.localRequests.length,2);
+});

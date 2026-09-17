@@ -152,24 +152,64 @@ function boundReviewResponse(submission) {
   return {root, followup: next >= 0, identified: true, responseId: message.getAttribute("data-message-id") || ""};
 }
 
+/** Each call is a fresh observation; the tracker also runs after native JSON
+ * collection, when a late response ID or a 422 needs a stable full source.
+ * Missing identity/completion resets evidence rather than reviving a stale cache.
+ */
+function trackCompletedSource(state, bound, done, text = "") {
+  if (!done || !bound?.identified || !bound.root || !bound.responseId ||
+      !text.trim() || text.length > 500_000) {
+    state.completionTracking = undefined;
+    state.completedSource = undefined;
+    return null;
+  }
+  const previous = state.completionTracking;
+  const count = previous?.text === text && previous.responseId === bound.responseId
+    ? Math.min(previous.count + 1, 2) : 1;
+  state.completionTracking = {text, responseId: bound.responseId, count};
+  state.completedSource = count >= 2 ? {text, responseId: bound.responseId} : undefined;
+  return state.completedSource || null;
+}
+
 /** Private full source, requested only by the owning worker's repair lane.
  * Stable content is additional evidence, NEVER a replacement for completion controls.
  */
 function currentRepairSource() {
   const state = globalThis.__ashlarRunnerState;
-  if (!state?.jobId || !state.runId || !state.completedSource) return null;
+  if (!state?.jobId || !state.runId) return null;
   let submission;
-  try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return null; }
-  if (submission?.phase !== "sent") return null;
+  try { submission = state.confirmedSubmission?.record || savedSubmission(); }
+  catch { return trackCompletedSource(state, null, false); }
+  if (submission?.phase !== "sent") return trackCompletedSource(state, null, false);
   const bound = boundReviewResponse(submission);
-  if (!bound.identified || !bound.root || !bound.responseId) return null;
+  if (!bound.identified || !bound.root || !bound.responseId) return trackCompletedSource(state, null, false);
   if (bound.followup) state.tabRepurposed = true;
   const stop = bound.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
-  if (stop || responseStreaming(bound.root) || !replyDoneVisible(bound.root)) return null;
-  const text = assistantCorpus(bound.root).join("\n\n");
-  if (!text.trim() || text.length > 500_000 || state.completedSource.text !== text ||
-      state.completedSource.responseId !== bound.responseId) return null;
+  const done = !stop && !responseStreaming(bound.root) && replyDoneVisible(bound.root);
+  const text = done ? assistantCorpus(bound.root).join("\n\n") : "";
+  if (!done || !text.trim() || text.length > 500_000) return trackCompletedSource(state, bound, false);
+  // While running, the collector owns stability. A worker probe must not turn
+  // the first changed fragment into a final source by double-counting it.
+  if (!state.running) trackCompletedSource(state, bound, done, text);
+  if (state.completedSource?.text !== text || state.completedSource.responseId !== bound.responseId) return null;
   return {text, totalChars:text.length, truncated:false, responseId:bound.responseId, completed:true, stable:true};
+}
+
+/** Repair acceptance does not transfer ownership of a later user conversation.
+ * Preserve the context validated at receipt even across a suspended collector,
+ * its completion microtask, and duplicate acknowledgement delivery.
+ */
+function preserveRepairContext(state) {
+  let bound;
+  try {
+    const submission = state.confirmedSubmission?.record || savedSubmission();
+    if (submission?.phase === "sent") bound = boundReviewResponse(submission);
+  } catch { /* Unknown identity preserves the tab, not permission to close it. */ }
+  if (!state.tabRepurposed && (!state.repairedContext || state.repairedContext !== reviewPageContext() ||
+      !bound?.identified || bound.followup || bound.responseId !== state.repairedResponseId)) {
+    state.tabRepurposed = true;
+    recordReviewStep("context_changed");
+  }
 }
 
 async function waitUntilReviewOrQuota(name) {
@@ -178,6 +218,7 @@ async function waitUntilReviewOrQuota(name) {
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
     if (globalThis.__ashlarRunnerState?.repairedResult) {
+      preserveRepairContext(globalThis.__ashlarRunnerState);
       recordReviewStep("repair_accepted");
       return globalThis.__ashlarRunnerState.repairedResult;
     }
@@ -195,17 +236,7 @@ async function waitUntilReviewOrQuota(name) {
     const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
     const text = assistantCorpus(bound?.root).join("\n\n");
     const json = done ? harvestJson({allowThin: true, root: bound?.root}) : null;
-    if (runner) {
-      if (done && text.trim() && bound?.identified && bound.responseId) {
-        const previous = runner.completionTracking;
-        const count = previous?.text === text && previous.responseId === bound.responseId ? previous.count + 1 : 1;
-        runner.completionTracking = {text, responseId:bound.responseId, count};
-        runner.completedSource = count >= 2 ? {text, responseId:bound.responseId} : undefined;
-      } else {
-        runner.completionTracking = undefined;
-        runner.completedSource = undefined;
-      }
-    }
+    if (runner) trackCompletedSource(runner, bound, done, text);
     if (runner?.running) runner.observation = {
       state: !done ? "generating_or_queued" : json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response",
       // Diagnostic size bound, NOT a duration bound. Stay local to the bound job.
@@ -250,9 +281,9 @@ function installReviewRunner(name, run) {
   if (!state.runId) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
-  if (state.listener && state.protocol === "observed-submission-v3") return;
+  if (state.listener && state.protocol === "observed-submission-v4") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
-  state.protocol = "observed-submission-v3";
+  state.protocol = "observed-submission-v4";
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation });
   state.listener = (msg, _sender, reply) => {
     if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close", "ashlar-repair-source", "ashlar-repair-accepted"].includes(msg?.type)) return;
@@ -281,11 +312,14 @@ function installReviewRunner(name, run) {
       }
       // The server ACK identifies this exact original. This is not another model
       // response or an extra Local reviewer vote, and never authorizes a send.
+      state.repairedContext ||= reviewPageContext();
+      state.repairedResponseId ||= source.responseId;
       state.repairedResult = msg.raw;
       state.responseText = source.text;
+      preserveRepairContext(state);
       recordReviewStep("repair_accepted");
       if (!state.running) {
-        state.finishedContext = reviewPageContext();
+        state.finishedContext = state.repairedContext;
         state.result = {ok:true,raw:msg.raw,responseText:source.text};
       }
       reply({ok:true,accepted:true});return;
@@ -329,8 +363,14 @@ function installReviewRunner(name, run) {
     state.completedSource = undefined;
     state.completionTracking = undefined;
     state.repairedResult = undefined;
+    state.repairedContext = undefined;
+    state.repairedResponseId = undefined;
     Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
-      .then(raw => { state.finishedContext = reviewPageContext(); state.result = { ok: true, raw, responseText: state.responseText }; })
+      .then(raw => {
+        if (state.repairedResult) preserveRepairContext(state);
+        state.finishedContext = state.repairedContext || reviewPageContext();
+        state.result = { ok: true, raw, responseText: state.responseText };
+      })
       .catch(e => {
         recordReviewStep(e?.code === "quota" ? "quota" : "error");
         state.finishedContext = reviewPageContext();

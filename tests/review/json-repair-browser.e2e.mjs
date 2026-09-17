@@ -9,7 +9,7 @@ const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;before(async()=>browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']}));after(async()=>browser?.close());
 const raw=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "condition"'],merge_recommendation:'COMMENT'});
 const original=raw.replace(/\\"/g,'"');
-async function pageFixture(t,{jobId='A',text=original,streaming=false}={}) {
+async function pageFixture(t,{jobId='A',text=original,streaming=false,manual=false,lateId=false}={}) {
  const context=await browser.newContext();t.after(()=>context.close());await context.route('**/*',r=>r.abort());const page=await context.newPage();
  await page.setContent('<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">owned review prompt</div></section><section id="answer" data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"></div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div><button data-testid="send-button" aria-label="Send prompt" disabled>Send</button></form>');
  await page.clock.install();await page.evaluate(({jobId,text,streaming})=>{
@@ -20,7 +20,14 @@ async function pageFixture(t,{jobId='A',text=original,streaming=false}={}) {
  },{jobId,text,streaming});
  for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(jobId=>{window.message=(type,extra={})=>{let out;receiver({type,jobId,runId:'run-A',provider:'chatgpt',...extra},null,value=>out=value);return out || {ok:false,code:'unhandled'};};},jobId);
- await page.evaluate(()=>message('ashlar-run',{resume:true,prompt:'owned review prompt'}));await page.clock.runFor(2400);return page;
+ if(lateId)await page.locator('[data-message-author-role="assistant"]').evaluate(el=>el.removeAttribute('data-message-id'));
+ if(manual)await page.evaluate(()=>{
+  window.observationWaiters=[];
+  window.waitForPageChange=()=>new Promise(resolve=>observationWaiters.push(resolve));
+  window.resumeObservation=()=>observationWaiters.shift()?.();
+ });
+ await page.evaluate(()=>message('ashlar-run',{resume:true,prompt:'owned review prompt'}));
+ if(!manual)await page.clock.runFor(2400);return page;
 }
 test('page offers only a full, stable, bound completed source; invalid JSON is not terminal',async t=>{
  const page=await pageFixture(t);const out=await page.evaluate(()=>message('ashlar-repair-source'));
@@ -47,14 +54,14 @@ test('only a matching committed repair receipt resolves the page runner; no prom
  await page.clock.runFor(1600);assert.equal((await page.evaluate(()=>message('ashlar-harvest'))).raw,raw);
  assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true);
 });
-async function workerFixture(t,{enabled=true,text=original}={}) {
+async function workerFixture(t,{enabled=true,text=original,pageOptions={}}={}) {
  const app=await appFixture({reviewLocal:false,localJsonRepairEnabled:enabled});t.after(()=>app.close());const mention=app.mention();await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===mention.jobId)?.status==='awaiting_chat','not ready');
  const send=async(path,body)=>{
   const res=await fetch(app.origin+path,{method:body?'POST':'GET',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},...(body?{body:JSON.stringify(body)}:{})});const value=await res.json();
   if(!res.ok || !value.ok){const error=Object.assign(Error(value.error||'request failed'),{status:res.status,code:value.code});throw error;}return value;
  };
  const {job}=await send('/api/bridge',{action:'take',clientId:'worker-fixture'});job.origin=app.origin;job.states={chatgpt:{runId:'run-A',tabId:10,started:true}};
- const page=await pageFixture(t,{jobId:job.jobId,text});
+ const page=await pageFixture(t,{jobId:job.jobId,text,...pageOptions});
  const worker=background({local:storage({origin:app.origin,token:'fixture-token',pendingReviewJobs:{[job.jobId]:job}}),tabs:new Map([[10,{id:10,url:'https://chatgpt.com/c/fixture',status:'complete'}]]),api:send});
  worker.context.crypto=webcrypto;worker.context.TextEncoder=TextEncoder;
  worker.chrome.tabs.sendMessage=(id,msg,cb)=>{worker.messages.push({id,...msg});page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/fixture'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});};
@@ -102,4 +109,80 @@ test('worker/HTTP: schema-invalid JSON is reformatted before any finding can be 
  f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'schema recovery failed to finish');
  assert.equal(f.app.reviews.length,1);assert.equal(f.app.reviews[0].comments.length,1);assert.equal(f.app.localRequests.length,1);
+});
+
+// Review regressions: explicitly control the observation boundary, not a timing guess.
+async function observeAgain(page) {
+ await page.evaluate(async()=>{resumeObservation();for(let i=0;i<12;i++)await Promise.resolve();});
+}
+for (const followup of [false,true])test(`repair receipt preserves validated context when suspended collector resumes (follow-up=${followup})`,async t=>{
+ const page=await pageFixture(t,{manual:true});await observeAgain(page);
+ assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,true);
+ const receipt={committed:true,repairId:'repair-A',responseId:'response-A',text:original,raw};
+ const before=await page.evaluate(()=>reviewPageContext());
+ assert.equal((await page.evaluate(receipt=>message('ashlar-repair-accepted',receipt),receipt)).accepted,true);
+ if(followup)await page.evaluate(()=>{
+  const user=document.createElement('div');user.dataset.messageAuthorRole='user';user.dataset.messageId='follow-up';user.textContent='Personal follow-up';document.querySelector('main').append(user);
+ });
+ await observeAgain(page);
+ assert.equal((await page.evaluate(()=>message('ashlar-harvest'))).raw,raw,'the acknowledged result must remain available');
+ assert.equal(await page.evaluate(()=>__ashlarRunnerState.finishedContext),before,'runner overwrote the receipt context');
+ const cleanup=await page.evaluate(()=>message('ashlar-can-close'));
+ assert.equal(cleanup.canClose,!followup);assert.equal(cleanup.reason,followup?'repurposed':'complete');
+ // Replayed delivery acknowledgement must not replace the original close boundary.
+ assert.equal((await page.evaluate(receipt=>message('ashlar-repair-accepted',receipt),receipt)).accepted,true);
+ assert.equal(await page.evaluate(()=>__ashlarRunnerState.finishedContext),before);
+ assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,!followup);
+});
+for (const when of ['second_observation','after_native_collection'])test(`repair source continues identity stability after native collection: ${when}`,async t=>{
+ const invalid=JSON.stringify({findings:[],investigated_safe:'a.ts checked'});
+ const page=await pageFixture(t,{manual:true,lateId:true,text:invalid});
+ const setId=()=>page.locator('[data-message-author-role="assistant"]').evaluate(el=>el.dataset.messageId='response-A');
+ if(when==='second_observation')await setId();
+ await observeAgain(page);
+ assert.equal((await page.evaluate(()=>message('ashlar-harvest'))).raw,invalid);
+ if(when==='after_native_collection'){
+  await setId();assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,false,'one identified observation cannot authorize repair');
+ }
+ const out=await page.evaluate(()=>message('ashlar-repair-source'));
+ assert.equal(out.ok,true,'repair source remained stuck after native collection stopped');assert.equal(out.source.text,invalid);
+ // A new text or identity always needs fresh matching observations.
+ await page.locator('.markdown').evaluate(el=>el.textContent+=' ');
+ assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,true,'whitespace stripped by corpus does not change source');
+ await page.locator('[data-message-author-role="assistant"]').evaluate(el=>el.dataset.messageId='response-new');
+ assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,false);
+ assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).source.responseId,'response-new');
+ await page.evaluate(()=>{const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Stop';document.querySelector('form').append(stop);});
+ assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,false);
+ await page.locator('[data-testid="stop-button"]').evaluate(el=>el.remove());
+ assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,false,'positive evidence before Stop must not survive a generation gap');
+ assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,true);
+});
+test('worker/HTTP: late assistant ID after schema-invalid collection starts exactly one formatting request',async t=>{
+ const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Missing check',failure_scenario:'Duplicate writes',root_cause:'No guard',evidence:'a.ts:1: missing guard',recommended_fix:'Add guard',recommended_test:'Check duplicate'};
+ const valid=JSON.stringify({findings:[finding],merge_recommendation:'REQUEST_CHANGES'});
+ const invalid=JSON.stringify({findings:[{...finding,line:'1'}],merge_recommendation:'REQUEST_CHANGES'});
+ const f=await workerFixture(t,{text:invalid,pageOptions:{manual:true,lateId:true}});
+ await f.page.locator('[data-message-author-role="assistant"]').evaluate(el=>el.dataset.messageId='response-A');await observeAgain(f.page);
+ assert.equal((await f.page.evaluate(()=>message('ashlar-harvest'))).raw,invalid);
+ await f.cycle();await f.cycle();
+ assert.equal(f.worker.calls.some(c=>c.action==='complete'),true,'schema-invalid native reply did not reach server validation');
+ await eventually(()=>f.app.localRequests.length===1,'422 never reached Local repair after late response ID');
+ assert.equal(f.app.reviews.length,0);assert.equal(f.worker.closedTabs.length,0);
+ f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
+ await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'late-ID repair was not acknowledged');
+ assert.equal(f.app.localRequests.length,1);assert.equal(f.app.reviews.length,1);
+ assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'&&!m.resume),false);
+});
+for(const change of ['original_user_removed','response_id_changed'])test(`accepted repair does not close changed context: ${change}`,async t=>{
+ const page=await pageFixture(t,{manual:true});await observeAgain(page);
+ const receipt={committed:true,repairId:'repair-A',responseId:'response-A',text:original,raw};
+ assert.equal((await page.evaluate(receipt=>message('ashlar-repair-accepted',receipt),receipt)).accepted,true);
+ await page.evaluate(change=>{
+  if(change==='original_user_removed')document.querySelector('[data-message-author-role="user"]').remove();
+  else document.querySelector('[data-message-author-role="assistant"]').dataset.messageId='different-response';
+ },change);
+ await observeAgain(page);
+ assert.equal((await page.evaluate(()=>message('ashlar-harvest'))).raw,raw);
+ const out=await page.evaluate(()=>message('ashlar-can-close'));assert.equal(out.canClose,false);assert.equal(out.reason,'repurposed');
 });

@@ -304,6 +304,10 @@ export function failBridgeProvider(jobId: string, provider: ReviewProvider, erro
     ],
     updatedAt: Date.now(),
   }));
+  // The explicit provider outcome wins over any queued/ready formatting work.
+  // Scope cancellation to this leg: other reviewers and transient ping failures
+  // must remain recoverable, irrespective of how long they have been pending.
+  cancelLocalJsonRepairs("superseded", jobId, provider);
   return true;
 }
 
@@ -369,6 +373,7 @@ function currentRepairJob(input: RepairInput) {
   return Boolean(job && job.status === "awaiting_chat" && llmWorkAllowed(job) &&
     job.headSha === input.headSha && !job.chatFpRound && !job.fpProviders?.length && input.schema === "review" &&
     job.reviewProviders?.includes(input.provider) && job.providerProgress?.[input.provider]?.runId === input.runId &&
+    (!job.providerErrors?.[input.provider] || job.providerErrors[input.provider]?.code === "disconnected") &&
     !job.storedLegs?.some(leg => leg.provider === input.provider && leg.raw.trim()));
 }
 let repairService: JsonRepairService | undefined;

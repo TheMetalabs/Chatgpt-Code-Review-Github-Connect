@@ -85,15 +85,15 @@ async function fillComposer(el, text) {
     proto?.set?.call(el, body);
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    if (composerHas(el, body)) return;
+    if (composerHas(el, body)) return body;
   }
   await insertPrompt(el, body);
-  if (composerHas(el, body)) return;
+  if (composerHas(el, body)) return body;
   const dt = new DataTransfer();
   dt.setData("text/plain", body);
   el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
   await sleep(50);
-  if (composerHas(el, body)) return;
+  if (composerHas(el, body)) return body;
   try {
     await navigator.clipboard.writeText(body);
     document.execCommand("paste");
@@ -102,28 +102,173 @@ async function fillComposer(el, text) {
     /* clipboard may be blocked */
   }
   if (!composerHas(el, body)) throw new Error("composer did not accept the prompt");
+  return body;
 }
 
-async function clickSend(findSend, findComposer) {
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    const btn = findSend();
-    const disabled = !btn || btn.disabled || btn.getAttribute("aria-disabled") === "true";
-    if (btn && !disabled) {
-      const label = `${btn.getAttribute("aria-label") || ""} ${btn.getAttribute("data-testid") || ""}`.toLowerCase();
-      if (/stop|abort/.test(label)) {
-        await sleep(200);
-        continue;
-      }
-      btn.click();
-      return;
-    }
-    await sleep(200);
+function normalizePrompt(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function submissionKey() {
+  const state = globalThis.__ashlarRunnerState;
+  if (!state?.jobId || !state.runId) throw new Error("submission requires a persisted job/run binding");
+  return `ashlar:submission:${state.jobId}:${state.runId}`;
+}
+
+function savedSubmission() {
+  const text = sessionStorage.getItem(submissionKey());
+  if (!text) return null;
+  let record;
+  try { record = JSON.parse(text); } catch { throw new Error("submission journal is unreadable; preserve the original tab"); }
+  if (!record || !["prepared", "attempted", "sent"].includes(record.phase) ||
+      typeof record.expected !== "string" || !record.expected || !Number.isSafeInteger(record.baseline) || record.baseline < 0) {
+    throw new Error("submission journal is invalid; no prompt was sent again");
   }
-  const el = findComposer();
-  el?.dispatchEvent(
-    new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }),
-  );
+  return record;
+}
+
+async function readSubmissionJournal() {
+  for (;;) {
+    try {
+      const state = globalThis.__ashlarRunnerState;
+      if (state?.confirmedSubmission?.key === submissionKey()) {
+        retrySubmissionPersistence();
+        return state.confirmedSubmission.record;
+      }
+      const record = savedSubmission();
+      if (record?.phase === "sent" && state) {
+        state.confirmedSubmission = {key: submissionKey(), record};
+        state.submissionPersistencePending = false;
+      }
+      return record;
+    }
+    catch {
+      // Local storage corruption does not establish that the provider failed.
+      step("submission_unknown");
+      await sleep(250);
+    }
+  }
+}
+
+function saveSubmission(record) {
+  // A failed write must prevent the external click, not silently lose its identity.
+  sessionStorage.setItem(submissionKey(), JSON.stringify(record));
+}
+
+/** After provider acceptance, bookkeeping failure must not abandon collection.
+ * The durable attempted record already fences replay; keep the confirmed identity
+ * in this page while retrying only its journal write, never the send operation.
+ */
+function retrySubmissionPersistence() {
+  const state = globalThis.__ashlarRunnerState;
+  if (!state?.submissionPersistencePending) return true;
+  const confirmed = state.confirmedSubmission;
+  if (!confirmed || confirmed.key !== submissionKey()) return false;
+  try {
+    saveSubmission(confirmed.record);
+    state.submissionPersistencePending = false;
+    step("submission_persisted");
+    return true;
+  } catch {
+    step("submission_persistence_pending");
+    return false;
+  }
+}
+
+function userTurns() {
+  return [...document.querySelectorAll('[data-message-author-role="user"]')];
+}
+
+function step(stage) {
+  if (typeof recordReviewStep === "function") recordReviewStep(stage);
+}
+
+function actionableSend(button) {
+  if (!(button instanceof HTMLElement) || !button.isConnected || button.hidden ||
+      button.disabled || button.getAttribute("aria-disabled") === "true") return false;
+  const rect = button.getBoundingClientRect(), style = getComputedStyle(button);
+  if (!rect.width || !rect.height || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+  const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("data-testid") || ""}`;
+  return !/stop|abort|중지|停止/i.test(label);
+}
+
+function findEligibleSendButton(selectors) {
+  const root = typeof composer === "function" ? composer()?.closest("form") || document : document;
+  for (const selector of selectors) for (const button of root.querySelectorAll(selector)) {
+    if (actionableSend(button)) return button;
+  }
+  return null;
+}
+
+function submissionConfirmed(record) {
+  const turns = userTurns();
+  // Composer clearing and Stop alone are not proof that THIS request was accepted.
+  const match = turns.slice(record.baseline).find(turn => normalizePrompt(turn.textContent || turn.innerText).includes(record.expected));
+  if (!record.expected || !match) return false;
+  record.phase = "sent";
+  record.submittedUsers = turns.indexOf(match) + 1;
+  record.messageId = match.getAttribute("data-message-id") || "";
+  const state = globalThis.__ashlarRunnerState;
+  state.confirmedSubmission = {key: submissionKey(), record};
+  state.submissionPersistencePending = true;
+  step("prompt_submitted");
+  retrySubmissionPersistence();
+  return true;
+}
+
+async function clickSend(findSend, findComposer, expectedText) {
+  let record = await readSubmissionJournal();
+  if (!record) {
+    const expected = normalizePrompt(expectedText || readComposer(findComposer()));
+    if (!expected) throw new Error("cannot submit an empty review prompt");
+    record = {phase: "prepared", expected, baseline: userTurns().length};
+    saveSubmission(record);
+    step("prompt_prepared");
+  }
+  for (;;) {
+    if (record.phase === "sent" || submissionConfirmed(record)) return;
+    if (typeof quotaHit === "function" && quotaHit()) {
+      const error = new Error("provider usage limit before submission"); error.code = "quota"; throw error;
+    }
+    if (record.phase === "attempted") {
+      // Delivery is ambiguous. Never automatically replay a possibly accepted prompt.
+      step("send_unconfirmed");
+    } else {
+      step("send_waiting");
+      const editor = findComposer(), button = findSend();
+      const form = editor?.closest("form");
+      const uploadBusy = [...(form?.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="uploading"]') || [])]
+        .some(node => node.getClientRects().length > 0);
+      const otherTurn = userTurns().length !== record.baseline;
+      if (!uploadBusy && !otherTurn && normalizePrompt(readComposer(editor)) === record.expected && actionableSend(button) &&
+          !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
+        record.phase = "attempted";
+        saveSubmission(record); // durable intent BEFORE invoking the site's handler
+        step("send_attempted");
+        try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
+      }
+    }
+    // Cadence only: no upload, send acknowledgement, queue or model deadline.
+    await sleep(250);
+  }
+}
+
+async function resumeSubmission(findSend, findComposer, prompt) {
+  const record = await readSubmissionJournal();
+  if (record) return clickSend(findSend, findComposer, record.expected);
+  // Legacy pages have no durable send journal. Observe, but never guess and re-send.
+  const expected = normalizePrompt(splitAttachments(prompt).prompt);
+  for (;;) {
+    const turns = userTurns();
+    if (turns.length && (!expected || normalizePrompt(turns.at(-1).textContent || turns.at(-1).innerText).includes(expected))) {
+      step("legacy_observation"); return;
+    }
+    step("submission_unknown");
+    if (typeof quotaHit === "function" && quotaHit()) {
+      const error = new Error("provider usage limit"); error.code = "quota"; throw error;
+    }
+    await sleep(250);
+  }
 }
 
 async function waitUntilComposer() {

@@ -1,6 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 import type { ProviderError } from "@/lib/types";
 import {
+  recordBridgeProgress,
+  recordBridgeObservation,
   bridgeHeartbeat,
   bridgeJobState,
   bridgeTokenOk,
@@ -67,13 +69,15 @@ export const Route = createFileRoute("/api/bridge")({
           clientId?: string;
           leaseId?: string;
           excludeJobIds?: string[];
+          progress?: unknown;
+          runId?: string; text?: string; totalChars?: number; truncated?: boolean;
           providerErrors?: Record<string, {code?: string; message?: string}>;
           token?: string;
           jobId?: string;
           raw?: string;
           provider?: string;
           error?: string;
-          results?: { provider?: string; raw?: string }[];
+          results?: { provider?: string; raw?: string; originalText?: string }[];
           generating?: Partial<Record<"chatgpt" | "grok" | "local", boolean>>;
         };
         if (body.action === "reveal") {
@@ -88,6 +92,20 @@ export const Route = createFileRoute("/api/bridge")({
         bridgeHeartbeat();
         if (body.action === "rotate") {
           return Response.json({ ok: true, token: rotateBridgeToken().token, bridge: getBridgePublic() }, { headers });
+        }
+        if (body.action === "observe" && body.jobId) {
+          if(typeof body.text!=="string" || body.text.length>128_000 || typeof body.runId!=="string" || body.runId.length>128)
+            return Response.json({ok:false,error:"invalid observation"},{status:400,headers});
+          try {
+            const accepted=recordBridgeObservation(body.jobId,body.leaseId,String(body.provider||""),body.runId,
+              body.text,Number.isSafeInteger(body.totalChars) && Number(body.totalChars)>=body.text.length ? Number(body.totalChars) : body.text.length,Boolean(body.truncated));
+            return Response.json({ok:accepted},{status:accepted?200:409,headers});
+          } catch {return Response.json({ok:false,error:"history storage unavailable"},{status:503,headers});}
+        }
+        if (body.action === "progress" && body.jobId) {
+          try {const accepted=recordBridgeProgress(body.jobId,body.leaseId,body.progress);
+            return Response.json({ok:accepted},{status:accepted?200:409,headers});
+          } catch {return Response.json({ok:false,error:"history storage unavailable"},{status:503,headers});}
         }
         if (body.action === "ping") {
           if (body.jobId) {
@@ -108,7 +126,9 @@ export const Route = createFileRoute("/api/bridge")({
               }
             }
             const accepted = refreshBridgeClaim(body.jobId, generating, errors, body.leaseId);
-            return Response.json({ok: true, accepted, ...bridgeJobState(body.jobId), bridge: getBridgePublic()}, {headers});
+            let progressAccepted=false;
+            if(accepted && body.progress)try {progressAccepted=recordBridgeProgress(body.jobId,body.leaseId,body.progress);}catch{ /* heartbeat remains separate from telemetry storage */ }
+            return Response.json({ok: true, accepted, progressAccepted, ...bridgeJobState(body.jobId), bridge: getBridgePublic()}, {headers});
           }
           return Response.json({ ok: true, bridge: getBridgePublic() }, { headers });
         }
@@ -135,10 +155,10 @@ export const Route = createFileRoute("/api/bridge")({
           const legs = Array.isArray(body.results)
             ? body.results
                 .filter((r) => r.provider === "chatgpt" || r.provider === "grok")
-                .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? "") }))
+                .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? ""), originalText: typeof r.originalText === "string" ? r.originalText : undefined }))
             : undefined;
           const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
-          if (!out.ok) return Response.json(out, { status: "code" in out && out.code === "lease_conflict" ? 409 : 400, headers });
+          if (!out.ok) return Response.json(out, { status: "code" in out && out.code === "history_unavailable" ? 503 : "code" in out && out.code === "lease_conflict" ? 409 : 400, headers });
           return Response.json({ ok: true }, { headers });
         }
         return Response.json({ ok: false, error: "unknown action" }, { status: 400, headers });

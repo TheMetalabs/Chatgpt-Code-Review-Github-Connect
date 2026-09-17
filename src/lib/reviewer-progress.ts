@@ -1,3 +1,4 @@
+import {PROGRESS_LABELS} from "./review-progress.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { skippedProvider } from "./local-fallback.ts";
 import type { Job, JobStatus, ReviewerLane, ReviewerLaneState, ReviewProvider } from "./types.ts";
@@ -69,6 +70,7 @@ export function buildReviewerLanes(
     | "skipReason"
     | "githubError"
     | "providerErrors"
+    | "providerProgress"
   >,
   opts?: { localInFlight?: boolean; now?: number; enabled?: readonly ReviewProvider[] },
 ): ReviewerLane[] {
@@ -156,8 +158,12 @@ export function buildReviewerLanes(
     if (job.providerErrors?.[provider]?.code === "disconnected" || (g === true && job.bridgeClaimedAt && !claimed(job, now))) {
       return {provider, state: "waiting", label, detail: "connection unknown · waiting for reconnection", answered: false};
     }
+    const progress=job.providerProgress?.[provider];
+    if(progress && Object.hasOwn(PROGRESS_LABELS,progress.stage)) {
+      return {provider,state:progress.stage==="generating"?"generating":"waiting",label,detail:PROGRESS_LABELS[progress.stage],answered:false};
+    }
     if (g === true) {
-      return { provider, state: "generating", label, detail: "tab is answering", answered: false };
+      return { provider, state: "waiting", label, detail: "Chrome task pending · submission not confirmed", answered: false };
     }
     if (g === false) {
       return { provider, state: "empty", label, detail: emptyProviderDetail(job, provider, now), answered: false };

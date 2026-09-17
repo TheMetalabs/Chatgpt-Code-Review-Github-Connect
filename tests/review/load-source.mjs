@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 import * as crypto from 'node:crypto';
+import {ReviewHistoryStore} from '../../src/lib/review-history.server.ts';
+import {sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
 export const root = process.env.REVIEW_SOURCE_ROOT || resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const source = path => readFileSync(resolve(root, path), 'utf8');
 export function loadTs(path, imports = {}) {
@@ -27,8 +29,9 @@ export function job(patch={}) {
 export function bridgeHarness(jobs, extra = {}) {
   const state = {jobs,settings:types.DEFAULT_SETTINGS};
   const snapshots=[];
+  const history=new ReviewHistoryStore(null);
   const bridge=loadTs('src/lib/bridge.server.ts', {
-    ...crypto,...types,...parser,
+    ...crypto,...types,...parser, sanitizeProgressEvents, reviewHistory:()=>history,
     loadDotenvFile(){},writeEnvPatch(){},resolveBridgeToken:()=>({token:'fixture',persist:false}),BRIDGE_TOKEN_ENV:'FIXTURE',
     llmWorkAllowed:j=>['issue_comment.mention','pull_request_review_comment.followup'].includes(j.trigger),
     getHarbor:()=>state,

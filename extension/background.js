@@ -196,6 +196,8 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
       pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
       waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && job.states[p].observation?.state === "waiting_for_json").length, 0),
+      stages: relevant.slice(0, 8).flatMap(job => job.providers.map(provider => ({jobId:job.jobId,provider,
+        stage: progressFor(job)[provider]?.events.at(-1)?.stage || "submission_unknown"}))),
       savedReplies: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].outcome?.ok && !job.states[p].delivered).length, 0),
       // Identifiers/status only: never response text, prompts or credentials.
       recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
@@ -310,6 +312,41 @@ function isBusyResult(result) {
   return result.retry === true || /already running|busy/i.test(String(result.error || ""));
 }
 
+function workerStep(job, provider, stage) {
+  const state=job.states[provider];
+  if(!state.runId || state.workerEvents?.at(-1)?.stage===stage)return;
+  state.workerSequence=(state.workerSequence||0)+1;
+  state.workerEvents=[...(state.workerEvents||[]),{source:"worker",sequence:state.workerSequence,stage,at:Date.now()}].slice(-128);
+}
+
+function progressFor(job) {
+  return Object.fromEntries(job.providers.flatMap(provider=>{
+    const state=job.states[provider];
+    const events=[...(state.pageEvents||[]),...(state.workerEvents||[])].sort((a,b)=>a.at-b.at);
+    return state.runId && events.length ? [[provider,{runId:state.runId,events,
+      extensionVersion:chrome.runtime.getManifest?.().version || "unknown"}]] : [];
+  }));
+}
+
+async function flushProgress(job) {
+  const progress=progressFor(job);
+  if(Object.keys(progress).length)await api("/api/bridge",{action:"progress",jobId:job.jobId,leaseId:job.leaseId,progress},job.origin);
+}
+
+async function archiveObservation(job, provider, jobs) {
+  const state=job.states[provider], observation=state.observation;
+  if(state.outcome || observation?.state!=="waiting_for_json" || !observation.text) return;
+  const digest=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(observation.text))))
+    .map(byte=>byte.toString(16).padStart(2,"0")).join("");
+  if(state.archivedObservation===digest)return;
+  // Establish the authenticated run before sending private, unparsed evidence.
+  await flushProgress(job);
+  await api("/api/bridge",{action:"observe",jobId:job.jobId,leaseId:job.leaseId,provider,runId:state.runId,
+    text:observation.text,totalChars:observation.totalChars,truncated:observation.truncated},job.origin);
+  state.archivedObservation=digest;
+  await saveJobs(jobs);
+}
+
 function generatingFor(job) {
   // Completion/failure endpoints atomically settle the server state. Until acknowledged,
   // keep the leg pending; an early false heartbeat could race the server's watcher.
@@ -392,6 +429,7 @@ async function allocateProviderTab(job, provider, jobs) {
     try {
       const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
       state.tabId = created.id;
+      workerStep(job,provider,"tab_created");
       await rememberOwnedTab(job, provider);
       delete state.allocating;
       await saveJobs(jobs); // Durable binding before any prompt dispatch.
@@ -408,6 +446,7 @@ async function finishTabCleanup(job, provider, jobs, reason) {
   const state = job.states[provider];
   state.cleanupDone = true;
   state.cleanupPending = false;
+  workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : "tab_closed");
   if (reason) state.cleanupNote = reason;
   delete state.cleanupError;
   await saveJobs(jobs);
@@ -421,6 +460,7 @@ async function cleanupProvider(job, provider, jobs) {
   const state = job.states[provider];
   if (!state.delivered || state.cleanupDone) return;
   state.cleanupPending = true;
+  workerStep(job,provider,"cleanup_pending");
   await saveJobs(jobs);
   if (!state.tabId && !state.started) return finishTabCleanup(job, provider, jobs);
   if ((await chrome.storage.session.get([closedKey(job, provider)]))[closedKey(job, provider)]) {
@@ -466,6 +506,8 @@ async function cleanupProvider(job, provider, jobs) {
 
 async function retireCleanJob(job, jobs) {
   if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
+  // Closing the tab frees capacity, but its final trace must be acknowledged before retirement.
+  await flushProgress(job);
   await writeInOrder(async () => {
     const old = await chrome.storage.session.get(["tabs"]);
     const tabs = {...old.tabs};
@@ -489,7 +531,7 @@ function heartbeat(job, jobs) {
 
 async function refreshJobHeartbeat(job, jobs) {
   const body = {action: "ping", jobId: job.jobId, leaseId: job.leaseId,
-    generating: generatingFor(job), providerErrors: connectionErrors(job)};
+    generating: generatingFor(job), providerErrors: connectionErrors(job), progress: progressFor(job)};
   let result = await api("/api/bridge", body, job.origin);
   if (result.active === false) {
     job.serverStatus = result.status || "unknown";
@@ -576,6 +618,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       // The page runner deduplicates a retried start when its acknowledgement was lost.
       result = await sendToTab(state.tabId, run, contentFiles(provider));
       state.started = true;
+      workerStep(job,provider,"run_dispatched");
       await saveJobs(jobs);
     } else {
       result = await sendToTab(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
@@ -591,6 +634,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   } catch (e) {
     // A messaging outage is not a model failure or a global admission lock.
     state.connectionError = String(e.message || e).slice(0, 240);
+    workerStep(job,provider,"disconnected");
     await saveJobs(jobs);
     await chrome.storage.local.set({ lastError: state.connectionError });
     return;
@@ -601,6 +645,13 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     if (original && original.id !== state.tabId) { state.tabId = original.id; state.started = true; }
     await saveJobs(jobs);
     return;
+  }
+  if(result.progress?.runId===state.runId && Array.isArray(result.progress.events)) {
+    // Treat this as untrusted input again at the server; only primitive metadata is sent.
+    state.pageEvents=result.progress.events.slice(-128).filter(e=>e && e.source==="page" &&
+      Number.isSafeInteger(e.sequence) && typeof e.stage==="string" && e.stage.length<80 && Number.isFinite(e.at))
+      .map(e=>({source:"page",sequence:e.sequence,stage:e.stage,at:e.at}));
+    await saveJobs(jobs);
   }
   if (result.observation && typeof result.observation === "object") {
     const item = result.observation;
@@ -614,7 +665,8 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   delete state.connectionError;
   if (isBusyResult(result)) return;
   if (result?.ok && typeof result.raw === "string" && result.raw.trim()) {
-    state.outcome = { ok: true, raw: result.raw };
+    state.outcome = { ok: true, raw: result.raw, originalText:typeof result.responseText==="string"?result.responseText:undefined };
+    workerStep(job,provider,"response_collected");
   } else if (result?.code && result.code !== "idle") {
     state.outcome = failure(result.code, String(result.error || "chat review failed"));
   } else {
@@ -630,9 +682,10 @@ async function deliverOutcome(job, provider, jobs) {
   if (!out || state.delivered) return;
   // A failed outbox write can also leave an outcome in the shared cache. Retry
   // that save before sending it; only the server ACK permits subsequent cleanup.
+  workerStep(job, provider, "delivery_pending");
   await saveJobs(jobs);
   const body = out.ok
-    ? {action: "complete", jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw}]}
+    ? {action: "complete", jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw, originalText: out.originalText}]}
     : {action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}`};
   try { await api("/api/bridge", body, job.origin); }
   catch (e) {
@@ -647,6 +700,7 @@ async function deliverOutcome(job, provider, jobs) {
     throw e;
   }
   state.delivered = true;
+  workerStep(job,provider,"result_saved");
   const previousError = (await chrome.storage.local.get(["lastError"])).lastError;
   if (typeof previousError === "string" && previousError.startsWith(`Bridge ${body.action} (${job.jobId}) transport interrupted`)) {
     await chrome.storage.local.set({lastError: ""});
@@ -682,6 +736,7 @@ async function advanceJob(job, jobs) {
     try {
       await pollProvider(job, provider, jobs, !active);
       if (canDeliver) await deliverOutcome(job, provider, jobs);
+      if (active) await archiveObservation(job, provider, jobs);
       await cleanupProvider(job, provider, jobs);
     } catch (e) {
       // A failing provider must not prevent the others from being collected/closed.

@@ -1,3 +1,4 @@
+import {recordJobHistory, recordDeliveryHistory, reviewHistory} from "./review-history.server";
 import {
   CANDIDATE_412_DROPPED,
   FINDING_412,
@@ -71,6 +72,12 @@ function isLive(status: Job["status"]) {
   return LIVE_INFLIGHT_STATUSES.includes(status);
 }
 
+function trimJobs(jobs: Job[]) {
+  // UI retention may drop completed cache entries, never live queue/generation work.
+  return [...jobs.filter(j => isLive(j.status)), ...jobs.filter(j => !isLive(j.status)).slice(0, CAP)]
+    .sort((a,b) => b.createdAt - a.createdAt);
+}
+
 function trim<T>(xs: T[]) {
   return xs.length > CAP ? xs.slice(0, CAP) : xs;
 }
@@ -109,6 +116,8 @@ export function resetHarbor() {
   for (const controller of localControllers.values()) controller.abort();
   localControllers.clear();
   localInFlight.clear();
+  for (const job of state.jobs) recordJobHistory(isLive(job.status)
+    ? {...job, status: "cancelled", skipReason: "operator reset", updatedAt: Date.now()} : job);
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
 }
 
@@ -122,10 +131,13 @@ export function cancelHarborJob(jobId: string) {
         : j,
     ),
   };
+  const job=state.jobs.find(j=>j.id===jobId);if(job)recordJobHistory(job);
 }
 
 function patchJob(jobId: string, fn: (j: Job) => Job) {
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? fn(j) : j)) };
+  const job = state.jobs.find(j => j.id === jobId);
+  if (job) recordJobHistory(job);
 }
 
 export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
@@ -135,7 +147,7 @@ export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
 export function publicJobs(jobs: Job[]) {
   const enabled = providersFromSettings(state.settings);
   return jobs.map((j) => {
-    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, ...rest } = j;
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, ...rest } = j;
     return {
       ...rest,
       reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
@@ -239,7 +251,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
   await finishJob(jobId, sample);
 }
 
-export type ChatLeg = { provider: ReviewProvider; raw: string };
+export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string };
 
 async function reactQuiet(token: string, job: Job, content: GithubReaction) {
   try {
@@ -338,6 +350,7 @@ async function watchReviewers(jobId: string, token: string) {
         void upsertOpsComment(token, jobId, "skipped", ["Enabled reviewers finished without JSON. Nothing to post."]);
       }
     }
+    if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;
     const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) });
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
@@ -516,12 +529,17 @@ async function kickLocalRace(jobId: string, prompt: string) {
   const controller = new AbortController();
   localControllers.set(jobId, controller);
   patchJob(jobId, j => ({...j, generating: {...j.generating, local: true}, updatedAt: Date.now()}));
+  try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
   void attachLocalLeg(jobId, prompt, { submit: true });
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
   try {
     const local = await runLocalLlm(prompt, state.settings, localControllers.get(jobId)?.signal);
+    try {
+      reviewHistory().recordServerStep(jobId,local.ok?"local.response_received":"local.failed");
+      if(!local.ok && local.originalText)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,local.originalText,local.originalText.length,local.originalText.length>128_000);
+    } catch { /* metadata storage failure is visible without starting another model */ }
     if (!local.ok) {
       patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
         ...j, generating: {...j.generating, local: false},
@@ -531,7 +549,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     } else {
       patchJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
-        const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
+        const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw, originalText: local.originalText }];
         return { ...j, storedLegs: next, generating: {...j.generating, local: false}, updatedAt: Date.now() };
       });
     }
@@ -585,6 +603,14 @@ export async function submitHarborChat(
   const payloads = job.chatFpRound ? incoming : [...incoming, ...stored];
   if (!payloads.length) {
     return { ok: false, error: "quota" };
+  }
+  try {
+    reviewHistory().recordJob(job);
+    for (const leg of incoming) reviewHistory().recordResponse(jobId,leg.provider,leg.raw,leg.originalText || "");
+  } catch {
+    // Stored Local legs remain available to the watcher; never repeat generation.
+    patchJob(jobId,j=>({...j,githubError:"Response history storage unavailable; result retained for retry"}));
+    return {ok:false,error:"Response history storage unavailable; result retained for retry"};
   }
   if (!opts?.force && !job.chatFpRound) {
     const haveLocal = payloads.some((l) => l.provider === "local");
@@ -805,6 +831,8 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
         : j,
     ),
   };
+  const finished=state.jobs.find(j=>j.id===jobId);if(finished)recordJobHistory(finished);
+  try {reviewHistory().recordReview(stored);} catch { /* storage health remains visible */ }
   if (token) void reactQuiet(token, after, "+1");
   if (token) void upsertOpsComment(token, jobId, "posted", ["Review posted. Reviewers that failed were skipped."]);
 }
@@ -838,11 +866,20 @@ function enqueueFromDecision(
       summary: `${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr} rejected`,
       rejectReason: decision.reason,
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 403, reject: decision.reason, queued: false };
   }
 
   if (decision.skip || !decision.job) {
+    // Ordinary/bot comments and duplicate deliveries are not reviewer executions.
+    if (!isBotMention(opts.thread?.userText, state.settings) || /^duplicate delivery_id/.test(decision.skip || "")) {
+      const ev: WebhookLog = {id:nid("ev"),deliveryId:opts.deliveryId,event:opts.eventName,action:"ignored",hmac:"ok",
+        httpStatus:202,at:Date.now(),summary:`${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr} ignored`,skipReason:decision.skip || "filtered"};
+      recordDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
+      state={...state,events:trim([ev,...state.events])};
+      return {httpStatus:202,skip:decision.skip || "filtered",queued:false};
+    }
     const skipJob: Job = {
       deliveryId: opts.deliveryId,
       trigger: opts.trigger,
@@ -884,7 +921,9 @@ function enqueueFromDecision(
       skipReason: decision.skip ?? "filtered",
       jobId: skipJob.id,
     };
-    state = { ...state, jobs: trim([skipJob, ...state.jobs]), events: trim([ev, ...state.events]) };
+    recordJobHistory(skipJob);
+    recordDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
+    state = { ...state, jobs: trimJobs([skipJob, ...state.jobs]), events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: decision.skip ?? "filtered", jobId: skipJob.id, queued: false };
   }
 
@@ -918,7 +957,7 @@ function enqueueFromDecision(
   };
   state = {
     ...state,
-    jobs: trim([
+    jobs: trimJobs([
       job,
       ...state.jobs.map((j) =>
         j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status)
@@ -929,6 +968,8 @@ function enqueueFromDecision(
     events: trim([ev, ...state.events]),
   };
 
+  recordDeliveryHistory(ev,{owner:job.owner,repo:job.repo,pr:job.pr,commentId:job.thread?.commentId});
+  for (const item of state.jobs) if (item.id === job.id || item.skipReason === `superseded by ${job.id}`) recordJobHistory(item);
   // Supersession is an explicit cancellation, not a timer.
   for (const previous of state.jobs) if (previous.status === "cancelled") localControllers.get(previous.id)?.abort();
   if (opts.origin === "github") void playGithub(job.id, opts.untrustedBody ?? "");
@@ -988,6 +1029,7 @@ export function ingestGitHubWebhook(opts: {
       summary: "GitHub delivery rejected",
       rejectReason: "HMAC mismatch",
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 403, reject: "HMAC mismatch", queued: false };
   }
@@ -1004,6 +1046,7 @@ export function ingestGitHubWebhook(opts: {
       summary: "GitHub delivery skipped",
       skipReason: parsed.reason,
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false };
   }
@@ -1019,6 +1062,7 @@ export function ingestGitHubWebhook(opts: {
       at: Date.now(),
       summary: "GitHub ping",
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, queued: false, pong: true };
   }
@@ -1035,6 +1079,7 @@ export function ingestGitHubWebhook(opts: {
       summary: `${opts.event} ignored`,
       skipReason: parsed.reason,
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false, ignored: parsed.reason };
   }

@@ -30,7 +30,7 @@ export async function runLocalLlm(
   prompt: string,
   settings: BotSettings,
   signal?: AbortSignal,
-): Promise<{ ok: true; raw: string } | { ok: false; error: string }> {
+): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
   const call = (messages: LocalChatMessage[]) => requestLocalChat(
@@ -43,7 +43,7 @@ export async function runLocalLlm(
     ]);
     if (!raw.trim()) return { ok: false, error: "local LLM returned empty" };
     const firstJson = extractChatJson(raw);
-    if (firstJson) return { ok: true, raw: firstJson };
+    if (firstJson) return { ok: true, raw: firstJson, originalText: raw };
 
     // Exactly one semantic retry, and only after an actual completed non-JSON reply.
     const raw2 = await call([
@@ -59,8 +59,8 @@ export async function runLocalLlm(
       },
     ]);
     const corrected = extractChatJson(raw2);
-    return corrected ? {ok: true, raw: corrected}
-      : {ok: false, error: "local LLM completed without valid review JSON after one correction"};
+    return corrected ? {ok: true, raw: corrected, originalText: raw2}
+      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

@@ -13,12 +13,7 @@ function composer() {
 }
 
 function sendButton() {
-  return (
-    document.querySelector('button[aria-label="Submit"]') ||
-    document.querySelector('button[aria-label="Send"]') ||
-    document.querySelector('button[aria-label*="Send"]') ||
-    document.querySelector('button[type="submit"]')
-  );
+  return findEligibleSendButton(['button[aria-label="Submit"]', 'button[aria-label*="Send"]', 'button[type="submit"]']);
 }
 
 function quotaError() {
@@ -47,16 +42,21 @@ async function startFresh() {
 
 async function runPrompt(prompt, reasoning, resume = false) {
   // A restarted worker must observe the existing request, never submit it again.
-  if (resume) return waitUntilReviewOrQuota("Grok");
+  if (resume) {
+    await resumeSubmission(sendButton, composer, prompt);
+    return waitUntilReviewOrQuota("Grok");
+  }
+  step("composer_waiting");
   await dismissOverlays();
   const el = await startFresh();
   await dismissOverlays();
   await selectReasoning("grok", reasoning || "heavy");
   await dismissOverlays();
   if (quotaHit()) throw quotaError();
-  await fillComposer(el, prompt);
+  step("attachments_preparing");
+  const submittedText = await fillComposer(el, prompt);
   await dismissOverlays();
-  await clickSend(sendButton, composer);
+  await clickSend(sendButton, composer, submittedText);
   return waitUntilReviewOrQuota("Grok");
 }
 

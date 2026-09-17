@@ -11,12 +11,14 @@ import {
 import { Mark } from "@/components/mark";
 import { cn } from "@/lib/utils";
 import { useAshlar } from "@/lib/store";
+import { validRemoteSnapshot } from "@/lib/remote-snapshot";
 import { LIVE_INFLIGHT_STATUSES } from "@/lib/types";
 import type { ReactNode } from "react";
 
 const NAV = [
   { to: "/", label: "Operations", icon: Activity },
   { to: "/inbox", label: "Inbox", icon: Inbox },
+  { to: "/history", label: "Job History", icon: BookOpen },
   { to: "/reviews", label: "Reviews", icon: MessageSquareCode },
   { to: "/policies", label: "Policies", icon: BookOpen },
   { to: "/playground", label: "Playground", icon: SquareDashedMousePointer },
@@ -33,29 +35,34 @@ export function AppShell({ children }: { children: ReactNode }) {
   const github = useAshlar((s) => s.github);
   const bridge = useAshlar((s) => s.bridge);
   const mergeRemote = useAshlar((s) => s.mergeRemote);
+  const sync = useAshlar(s => s.sync);
+  const historyHealth = useAshlar(s => s.historyHealth);
+  const markSyncError = useAshlar(s => s.markSyncError);
   const appReady = (github.appId || github.clientId) && github.privateKey && github.webhookSecret;
 
   useEffect(() => {
     let timer = 0;
     let alive = true;
+    const controller = new AbortController();
     async function tick() {
       try {
-        const res = await fetch("/api/harbor");
-        if (res.ok && alive) {
-          const json = await res.json();
-          mergeRemote(json);
-        }
-      } catch {
-        /* harbor poll is best-effort */
+        const res = await fetch("/api/harbor", {cache: "no-store", signal: controller.signal});
+        if (!res.ok) throw new Error(`Operations API returned HTTP ${res.status}.`);
+        const json: unknown = await res.json();
+        if (!validRemoteSnapshot(json)) throw new Error("Operations API returned an invalid snapshot.");
+        if (alive) mergeRemote(json);
+      } catch (error) {
+        if (alive) markSyncError(error instanceof Error ? error.message : "Operations data could not be read.");
       }
       if (alive) timer = window.setTimeout(tick, 1200);
     }
     void tick();
     return () => {
       alive = false;
+      controller.abort(); // Stop only this UI read, not an in-flight review.
       window.clearTimeout(timer);
     };
-  }, [mergeRemote]);
+  }, [mergeRemote, markSyncError]);
 
   return (
     <div className="min-h-dvh bg-bg text-fg">
@@ -99,7 +106,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <div className="border-t border-line px-5 py-4">
             <div className="flex items-center gap-2 text-[11px] text-fg-subtle">
               <span className={cn("size-1.5 rounded-full", hmacHot ? "bg-danger" : "bg-ok")} />
-              {hmacHot ? "HMAC rejected" : "Ingress listening"}
+              {hmacHot ? "HMAC rejected" : sync.status === "live" ? "Operations API connected" : "Operations data not current"}
             </div>
             <div className="mt-1 flex items-center gap-2 font-mono text-[11px] text-fg-muted">
               <span className={cn("size-1.5 rounded-full", appReady ? "bg-ok" : "bg-fg-subtle")} />
@@ -124,10 +131,16 @@ export function AppShell({ children }: { children: ReactNode }) {
               <span className="sr-only">Settings</span>
             </Link>
           </header>
+          <div className="border-b border-line px-4 py-2 text-xs text-fg-muted" role={sync.status === "error" ? "alert" : "status"}>
+            {sync.status === "loading" ? "Loading operational data — no sample reviews are shown." : sync.status === "error" ?
+              `Live data unavailable: ${sync.error} Previously loaded rows may be stale.` : "Live operational data loaded."}
+            {sync.lastSuccessAt ? ` Last successful refresh: ${new Date(sync.lastSuccessAt).toLocaleTimeString()}.` : ""}
+            {historyHealth && !historyHealth.ok ? <p className="text-danger">History storage unavailable: {historyHealth.error}. Results are not acknowledged until their archive is saved.</p> : null}
+          </div>
           <main id="main" className="flex-1 pb-20 md:pb-0">
             {children}
           </main>
-          <nav className="fixed inset-x-0 bottom-0 z-20 grid grid-cols-5 border-t border-line bg-bg-elevated md:hidden">
+          <nav className="fixed inset-x-0 bottom-0 z-20 grid grid-cols-6 border-t border-line bg-bg-elevated md:hidden">
             {NAV.filter((n) => n.to !== "/settings").map((item) => {
               const active = item.to === "/" ? pathname === "/" : pathname.startsWith(item.to);
               const Icon = item.icon;

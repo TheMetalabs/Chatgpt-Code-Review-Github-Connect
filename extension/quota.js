@@ -41,10 +41,10 @@ function elVisible(el) {
   return r.width > 0 && r.height > 0;
 }
 
-function stopButtonVisible() {
-  const stop = document.querySelector('[data-testid="stop-button"]');
+function stopButtonVisible(root = document) {
+  const stop = root.querySelector('[data-testid="stop-button"]');
   if (elVisible(stop)) return true;
-  for (const el of document.querySelectorAll("button, [role='button']")) {
+  for (const el of root.querySelectorAll("button, [role='button']")) {
     const t = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${el.textContent || ""}`.toLowerCase();
     if (!/stop generating|stop streaming|abort|생성 중지|답변 중지/.test(t)) continue;
     if (!elVisible(el)) continue;
@@ -67,8 +67,7 @@ function currentAssistantRoot() {
 }
 
 /** Current assistant-turn copy/feedback only, never hidden or previous-turn controls. */
-function replyDoneVisible() {
-  const root = currentAssistantRoot();
+function replyDoneVisible(root = currentAssistantRoot()) {
   if (!root) return false;
   if (elVisible(root.querySelector('[aria-label="응답 작업"], [aria-label="Response actions"]'))) return true;
   for (const el of root.querySelectorAll('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]')) {

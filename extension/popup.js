@@ -43,9 +43,10 @@ async function refreshDiagnostics() {
     ? `\nNew requests: ${admissionPhases[work.admissionPhase] || work.admissionPhase}` +
       (work.admissionCheckedAt ? ` (checked ${new Date(work.admissionCheckedAt).toLocaleTimeString()})` : "")
     : ""; // Keep reports from older workers readable during an upgrade.
+  const stages=(work.stages||[]).map(s=>`${s.jobId} / ${s.provider}: ${s.stage}`).join("\n");
   const recovery = (work.recovery || []).map(j => `${j.jobId}: ${j.status}`).join("\n");
   workerEl.textContent = `${phases[work.phase] || work.phase}${admission}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}; JSON pending: ${work.waitingForJson || 0}` +
-    (recovery ? `\n${recovery}` : "") + (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
+    (stages ? `\n${stages}` : "") + (recovery ? `\n${recovery}` : "") + (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
 }
 
 (async () => {

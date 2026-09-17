@@ -38,6 +38,9 @@ export type BridgeReady = {
 };
 
 interface AshlarState {
+  sync: {status: "loading" | "live" | "error"; lastSuccessAt?: number; error?: string};
+  historyHealth?: {ok: boolean; mode: string; error?: string};
+  markSyncError: (error: string) => void;
   settings: BotSettings;
   jobs: Job[];
   events: WebhookLog[];
@@ -49,6 +52,7 @@ interface AshlarState {
   resetDemo: () => void;
   setSettings: (patch: Partial<BotSettings>) => Promise<void>;
   mergeRemote: (remote: {
+    history?: {ok: boolean; mode: string; error?: string};
     jobs: Job[];
     events: WebhookLog[];
     reviews: PostedReview[];
@@ -58,53 +62,6 @@ interface AshlarState {
   }) => void;
 }
 
-function seed(): Pick<AshlarState, "jobs" | "events" | "reviews"> {
-  const now = Date.now() - 12 * 60_000;
-  const job: Job = {
-    id: "job-seed-412",
-    deliveryId: "d-seed-412",
-    trigger: "pull_request.opened",
-    owner: "acme",
-    repo: "pay",
-    pr: 412,
-    title: SAMPLE_PRS["pay-412"].title,
-    headSha: SAMPLE_PRS["pay-412"].headSha,
-    baseSha: SAMPLE_PRS["pay-412"].baseSha,
-    sender: "alice",
-    isFork: false,
-    isDraft: false,
-    status: "posted",
-    createdAt: now,
-    updatedAt: now + 1800,
-    ingressMs: 42,
-    traces: tracesFor412(now),
-    plan: "Investigate capture + fulfill replay against payment invariants. No findings in Explorer.",
-    candidates: [FINDING_412, CANDIDATE_412_DROPPED],
-    findings: [{ ...FINDING_412, status: "accepted" }],
-    mergeRecommendation: "REQUEST_CHANGES",
-    highestRisk: "double capture on webhook retry",
-    investigatedSafe: [],
-    assumptions: ["Stripe at-least-once delivery"],
-    postedReviewId: "rev-job-seed-412",
-    sampleKey: "pay-412",
-    origin: "tape",
-  };
-  const review = buildReview(job, filterPublishable(job, DEFAULT_SETTINGS), DEFAULT_SETTINGS)!;
-  review.id = "rev-job-seed-412";
-  review.at = now + 1800;
-  const event: WebhookLog = {
-    id: "ev-seed-412",
-    deliveryId: job.deliveryId,
-    event: "pull_request",
-    action: "opened",
-    hmac: "ok",
-    httpStatus: 202,
-    at: now,
-    summary: "acme/pay#412 opened",
-    jobId: job.id,
-  };
-  return { jobs: [job], events: [event], reviews: [review] };
-}
 
 function isLive(status: Job["status"]) {
   return LIVE_INFLIGHT_STATUSES.includes(status);
@@ -264,7 +221,9 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
   settings: DEFAULT_SETTINGS,
   github: { webhookSecret: false, appId: false, privateKey: false },
   bridge: { connected: false, lastSeen: 0 },
-  ...seed(),
+  jobs: [], events: [], reviews: [],
+  sync: {status: "loading"},
+  markSyncError: (error) => set(s => ({sync: {...s.sync, status: "error", error}})),
   setSettings: async (patch) => {
     const prev = get().settings;
     const next: BotSettings = { ...prev, ...patch };
@@ -314,18 +273,23 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
     set({ settings: next });
   },
   resetDemo: () => {
-    set((s) => ({ ...seed(), settings: s.settings }));
-    void fetch("/api/harbor", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "reset" }),
+    // This control is local-only. It must never cancel production jobs on the server.
+    set(s => {
+      const demos = new Set(s.jobs.filter(j => j.origin === "tape").map(j => j.id));
+      return {
+        jobs: s.jobs.filter(j => !demos.has(j.id)),
+        events: s.events.filter(e => !e.jobId || !demos.has(e.jobId)),
+        reviews: s.reviews.filter(review => !demos.has(review.jobId)),
+      };
     });
   },
   mergeRemote: (remote) =>
     set((s) => ({
-      jobs: mergeLists(s.jobs, remote.jobs, (j) => j.origin !== "github").sort((a, b) => b.createdAt - a.createdAt),
-      events: mergeLists(s.events, remote.events, () => true).sort((a, b) => b.at - a.at),
-      reviews: mergeLists(s.reviews, remote.reviews, () => true).sort((a, b) => b.at - a.at),
+      sync: {status: "live", lastSuccessAt: Date.now()},
+      historyHealth: remote.history ?? s.historyHealth,
+      jobs: mergeLists(s.jobs, remote.jobs, (j) => j.origin === "tape").sort((a, b) => b.createdAt - a.createdAt),
+      events: mergeLists(s.events, remote.events, e => s.jobs.some(j => j.origin === "tape" && j.id === e.jobId)).sort((a, b) => b.at - a.at),
+      reviews: mergeLists(s.reviews, remote.reviews, review => s.jobs.some(j => j.origin === "tape" && j.id === review.jobId)).sort((a, b) => b.at - a.at),
       github: remote.github ?? s.github,
       bridge: remote.bridge ?? s.bridge,
       settings: remote.settings

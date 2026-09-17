@@ -149,6 +149,12 @@ for(const leadingProse of [false,true])test(`operator example structure: paragra
 
 test('real DOM recovery: missing job resumes its bound observer without a new prompt',async t=>{
  const page=await fixture(t,user+answer(json,true));
+ // PR39 also restores the accepted-submission journal before its real collector.
+ await page.addScriptTag({content:source('extension/composer.js')});
+ await page.evaluate(()=>{
+  const saved=new Map([['ashlar:submission:A:run-A',JSON.stringify({phase:'sent',expected:'review me',baseline:0,submittedUsers:1,messageId:''})]]);
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:key=>saved.get(key)||null,setItem:(key,value)=>saved.set(key,value)}});
+ });
  await page.addScriptTag({content:source('extension/content-chatgpt.js')});
  await page.evaluate(()=>{
   Object.assign(__ashlarRunnerState,{jobId:'A',runId:'run-A',running:false,result:null});

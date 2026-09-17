@@ -129,7 +129,19 @@ function savedSubmission() {
 
 async function readSubmissionJournal() {
   for (;;) {
-    try { return savedSubmission(); }
+    try {
+      const state = globalThis.__ashlarRunnerState;
+      if (state?.confirmedSubmission?.key === submissionKey()) {
+        retrySubmissionPersistence();
+        return state.confirmedSubmission.record;
+      }
+      const record = savedSubmission();
+      if (record?.phase === "sent" && state) {
+        state.confirmedSubmission = {key: submissionKey(), record};
+        state.submissionPersistencePending = false;
+      }
+      return record;
+    }
     catch {
       // Local storage corruption does not establish that the provider failed.
       step("submission_unknown");
@@ -141,6 +153,26 @@ async function readSubmissionJournal() {
 function saveSubmission(record) {
   // A failed write must prevent the external click, not silently lose its identity.
   sessionStorage.setItem(submissionKey(), JSON.stringify(record));
+}
+
+/** After provider acceptance, bookkeeping failure must not abandon collection.
+ * The durable attempted record already fences replay; keep the confirmed identity
+ * in this page while retrying only its journal write, never the send operation.
+ */
+function retrySubmissionPersistence() {
+  const state = globalThis.__ashlarRunnerState;
+  if (!state?.submissionPersistencePending) return true;
+  const confirmed = state.confirmedSubmission;
+  if (!confirmed || confirmed.key !== submissionKey()) return false;
+  try {
+    saveSubmission(confirmed.record);
+    state.submissionPersistencePending = false;
+    step("submission_persisted");
+    return true;
+  } catch {
+    step("submission_persistence_pending");
+    return false;
+  }
 }
 
 function userTurns() {
@@ -176,8 +208,11 @@ function submissionConfirmed(record) {
   record.phase = "sent";
   record.submittedUsers = turns.indexOf(match) + 1;
   record.messageId = match.getAttribute("data-message-id") || "";
-  saveSubmission(record);
+  const state = globalThis.__ashlarRunnerState;
+  state.confirmedSubmission = {key: submissionKey(), record};
+  state.submissionPersistencePending = true;
   step("prompt_submitted");
+  retrySubmissionPersistence();
   return true;
 }
 

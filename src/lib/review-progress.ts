@@ -9,6 +9,8 @@ export const PROGRESS_LABELS = {
     send_attempted: "Send attempted · waiting for matching user message",
     send_unconfirmed: "Submission unconfirmed · inspect original tab; no automatic resend",
     submission_unknown: "Submission unknown · inspect original draft; no automatic resend",
+    submission_persistence_pending: "Submission confirmed · local journal retry pending; no resend",
+    submission_persisted: "Confirmed submission journal saved",
     prompt_submitted: "Prompt submitted · waiting for provider response",
     legacy_observation: "Restored legacy page · observing original response",
     waiting_for_response: "Waiting for provider response",
@@ -22,7 +24,7 @@ export const PROGRESS_LABELS = {
     tab_closed: "Review tab closed",
     tab_preserved: "User-repurposed tab preserved",
     disconnected: "Tab connection unknown · waiting for reconnection",
-    context_changed: "Conversation changed · automatic collection paused",
+    context_changed: "Conversation changed · collect only the bound review; preserve tab",
     quota: "Provider reported a usage limit",
     error: "Provider or submission reported an explicit error",
 } as const;

@@ -195,7 +195,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       activeJobs: relevant.filter(activelyReviewing).length,
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
       pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
-      waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].observation?.state === "waiting_for_json").length, 0),
+      waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && job.states[p].observation?.state === "waiting_for_json").length, 0),
       stages: relevant.slice(0, 8).flatMap(job => job.providers.map(provider => ({jobId:job.jobId,provider,
         stage: progressFor(job)[provider]?.events.at(-1)?.stage || "submission_unknown"}))),
       savedReplies: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].outcome?.ok && !job.states[p].delivered).length, 0),
@@ -553,7 +553,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   const state = job.states[provider];
   if (state.outcome || state.delivered) return;
   if (!state.runId) state.runId = crypto.randomUUID();
-  // Persist run/binding before sending any page message, even after a failed cache write.
+  // Memory is not a receipt: a previous write may have failed while leaving the
+  // shared object mutated. Retry persistence before ANY tab can adopt this runId
+  // or use a newly allocated binding, including findOriginalTab's harvest probes.
   await saveJobs(jobs);
   if (state.allocating && !state.tabId) {
     // Creation may have succeeded before a worker restart. Recover a recorded owner;
@@ -621,7 +623,11 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     } else {
       result = await sendToTab(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
       if (result?.code === "idle" && (!observeOnly || matchesJob(result, job, provider))) {
-        const resume = observeOnly ? {...tabMessage(job,provider,"ashlar-run"),resume:true} : {...run,resume:true};
+        // A reloaded bound page has no in-memory collector. Missing server work
+        // may resume observation, never adopt a page or submit another prompt.
+        const resume = observeOnly
+          ? { ...tabMessage(job, provider, "ashlar-run"), resume: true }
+          : { ...run, resume: true };
         result = await sendToTab(state.tabId, resume, contentFiles(provider));
       }
     }
@@ -674,6 +680,8 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
 async function deliverOutcome(job, provider, jobs) {
   const state = job.states[provider], out = state.outcome;
   if (!out || state.delivered) return;
+  // A failed outbox write can also leave an outcome in the shared cache. Retry
+  // that save before sending it; only the server ACK permits subsequent cleanup.
   workerStep(job, provider, "delivery_pending");
   await saveJobs(jobs);
   const body = out.ok
@@ -769,7 +777,8 @@ function admitJob(cfg, jobs) {
       await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;
     });
     if (!payload.job || jobs[payload.job.jobId]) {
-      await recordWorkerStatus(jobs,cfg.origin,payload.job ? "duplicate_job" : "idle");return null;
+      await recordWorkerStatus(jobs, cfg.origin, payload.job ? "duplicate_job" : "idle");
+      return null;
     }
     const job = {...payload.job, origin: cfg.origin, states: {}};
     job.providers = [...new Set(job.providers?.length ? job.providers : [job.provider])]
@@ -779,7 +788,7 @@ function admitJob(cfg, jobs) {
     jobs[job.jobId] = job;
     await saveJobs(jobs); // Provider intents reserve admission space before this lock opens.
     await chrome.storage.local.set({lastJobId: job.jobId, lastError: ""});
-    await recordWorkerStatus(jobs,cfg.origin,"admitted");
+    await recordWorkerStatus(jobs, cfg.origin, "admitted");
     return job;
   });
 }

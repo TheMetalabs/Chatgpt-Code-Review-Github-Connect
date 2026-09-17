@@ -118,3 +118,36 @@ controlled external GitHub/model I/O. CI separately runs existing MV3 integratio
 all repository tests, type checking and build. None is a signed-in live provider
 or an actual multi-hour model run; long waits use virtual clocks. Managed local
 browser navigation restrictions were not disabled or bypassed.
+
+## PR #39 review follow-up (1.1.18.1)
+
+The latest main (#38) is merged into this branch without dropping durable
+run/outbox barriers, bound observer-only resume, admission diagnostics, or either
+set of regression tests. Main's JSON-pending counter excludes already-delivered
+legs while this branch retains per-provider history stages.
+
+**After-send journal failure is not a provider failure.** Prepared and attempted
+submission records are still mandatory before the external click. After a matching
+user turn proves acceptance, the page preserves the confirmed identity in memory.
+A failed sent-record write reports `submission_persistence_pending` and continues
+collecting that response; polls and later harvest/cleanup messages retry only the
+write. A cached final response remains available, but the page refuses automatic
+closure until the required sent record is saved. On page-context restart the last
+durable attempted record reconciles against the accepted user turn, without a
+second send. This does not promise recovery if all durable intent was destroyed.
+
+**Follow-ups do not cancel the original collector.** Collection locates the user
+message by the confirmed `messageId`, then scopes response text and completion
+controls to its assistant response before the next user turn. Providers without
+IDs use the recorded position plus expected prompt; ambiguous/missing identity
+waits without falling back to a newer reply. A later follow-up's Stop or quota
+signal cannot replace or terminate the already identified original response.
+The tab is separately marked as user-repurposed so it stays open after delivery.
+No queue/generation deadline or automatic prompt resend is introduced.
+
+The submission Chromium suite covers sent-write quota failures for both providers,
+retry after storage recovery, a completed result waiting for persistence, restart
+from the attempted record, one-click delivery, follow-up before the second stable
+observation, competing follow-up JSON, missing/shifted user IDs, no-ID fallback,
+and original-response Stop controls. These are deterministic DOM/storage fixtures,
+not a claim that signed-in production providers or arbitrary restarts were tested.

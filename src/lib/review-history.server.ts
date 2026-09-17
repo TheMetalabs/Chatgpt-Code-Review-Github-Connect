@@ -1,3 +1,4 @@
+import type {RepairRecord} from "./json-repair-types.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, rmSync, openSync, closeSync, fsyncSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -248,6 +249,27 @@ export class ReviewHistoryStore {
         this.write(this.jobKey(id, `response-${provider}`), response);
         this.append(id, { id: `response:${provider}:${hash(json)}`, source: "server", stage: "response.archived", provider, at: response.at });
     }
+    /** The original and attempted intent are one durable record, never a diagnostic truncation. */
+    putRepair(record: RepairRecord) {
+        if (!this.read<Summary>(this.jobKey(record.jobId))) throw new Error("history_job_missing");
+        if (!/^[a-f0-9]{64}$/.test(record.id) || record.original.length > this.limits.maxResponseChars ||
+            (record.candidate?.length || 0) > this.limits.maxResponseChars) throw new Error("repair_archive_limit");
+        const indexKey = this.jobKey(record.jobId, "repairs"), ids = this.read<string[]>(indexKey) || [];
+        if (!ids.includes(record.id) && ids.length >= 8) throw new Error("repair_attempt_limit");
+        const previous = this.getRepair(record.jobId, record.id);
+        if (previous && previous.original !== record.original) throw new Error("repair_original_is_immutable");
+        this.write(this.jobKey(record.jobId, `repair-${record.id}`), record);
+        if (!ids.includes(record.id)) this.write(indexKey, [...ids, record.id]);
+        this.append(record.jobId, {id:`repair:${record.id}:${record.status}`, stage:`repair.${record.status}`,
+            source:"server", provider:record.provider, runId:record.runId, at:record.updatedAt});
+    }
+    getRepair(jobId: string, id: string): RepairRecord | null {
+        if (!/^[a-f0-9]{64}$/.test(id)) return null;
+        return this.read<RepairRecord>(this.jobKey(jobId, `repair-${id}`));
+    }
+    listRepairs(jobId: string): RepairRecord[] {
+        return (this.read<string[]>(this.jobKey(jobId,"repairs")) || []).map(id=>this.getRepair(jobId,id)).filter((r):r is RepairRecord=>Boolean(r));
+    }
     recordReview(review: PostedReview) {
         if (!this.read<Summary>(this.jobKey(review.jobId)))
             return;
@@ -292,7 +314,11 @@ export class ReviewHistoryStore {
                 if (observed)
                     observations[p] = observed;
             }
-        return { job, steps: log?.items || [], droppedSteps: log?.dropped || 0, review: this.read(this.jobKey(id, "review")),
+        const repairs = this.listRepairs(id).map(record => {
+            const {original, candidate, raw, ...metadata} = record;
+            return includeResponses ? record : metadata;
+        });
+        return { job, repairs, steps: log?.items || [], droppedSteps: log?.dropped || 0, review: this.read(this.jobKey(id, "review")),
             ...(includeResponses ? { responses, observations } : {}), historical: true };
     }
     private page<T extends {

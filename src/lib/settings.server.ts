@@ -63,6 +63,8 @@ function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   if (grok !== undefined) o.reviewGrok = grok;
   const local = envFlag("ASHLAR_REVIEW_LOCAL");
   if (local !== undefined) o.reviewLocal = local;
+  const repair = envFlag("ASHLAR_LOCAL_JSON_REPAIR_ENABLED");
+  if (repair !== undefined) o.localJsonRepairEnabled = repair;
   const baseUrl = envStr("ASHLAR_LOCAL_LLM_BASE_URL");
   if (baseUrl) o.localLlmBaseUrl = baseUrl;
   const model = envStr("ASHLAR_LOCAL_LLM_MODEL");
@@ -94,6 +96,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_REVIEW_CHATGPT: String(s.reviewChatgpt),
     ASHLAR_REVIEW_GROK: String(s.reviewGrok),
     ASHLAR_REVIEW_LOCAL: String(s.reviewLocal),
+    ASHLAR_LOCAL_JSON_REPAIR_ENABLED: String(s.localJsonRepairEnabled),
     ASHLAR_LOCAL_LLM_BASE_URL: s.localLlmBaseUrl,
     ASHLAR_LOCAL_LLM_MODEL: s.localLlmModel,
     ASHLAR_LOCAL_LLM_API_KEY: s.localLlmApiKey,
@@ -140,6 +143,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     reviewChatgpt: bool(p.reviewChatgpt, DEFAULT_SETTINGS.reviewChatgpt),
     reviewGrok: bool(p.reviewGrok, DEFAULT_SETTINGS.reviewGrok),
     reviewLocal: bool(p.reviewLocal, DEFAULT_SETTINGS.reviewLocal),
+    localJsonRepairEnabled: bool(p.localJsonRepairEnabled, DEFAULT_SETTINGS.localJsonRepairEnabled),
     localLlmBaseUrl: str(p.localLlmBaseUrl, DEFAULT_SETTINGS.localLlmBaseUrl).trim(),
     localLlmApiKey: str(p.localLlmApiKey, DEFAULT_SETTINGS.localLlmApiKey),
     localLlmModel: str(p.localLlmModel, DEFAULT_SETTINGS.localLlmModel).trim(),
@@ -195,7 +199,7 @@ export function persistableSettings(next: BotSettings, env: NodeJS.Dict<string> 
 
 export function diskReviewerFlagsWin(disk: Record<string, unknown>, merged: Record<string, unknown>): Record<string, unknown> {
   const out = { ...merged };
-  for (const key of ["reviewChatgpt", "reviewGrok", "reviewLocal"] as const) {
+  for (const key of ["reviewChatgpt", "reviewGrok", "reviewLocal", "localJsonRepairEnabled"] as const) {
     if (typeof disk[key] === "boolean") out[key] = disk[key];
   }
   return out;

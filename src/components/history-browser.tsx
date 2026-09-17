@@ -1,3 +1,4 @@
+import {RepairHistory, type RepairHistoryRow} from "@/components/repair-history";
 import { useEffect, useRef, useState } from "react";
 import { PROGRESS_LABELS } from "@/lib/review-progress";
 type Row = {
@@ -18,6 +19,7 @@ type Row = {
     findingCount?: number;
 };
 type Detail = {
+    repairs?: RepairHistoryRow[];
     job: Row;
     inCurrentRuntime: boolean;
     droppedSteps: number;
@@ -170,6 +172,7 @@ export function HistoryBrowser({ initialKind = "jobs" }: {
         <pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs">{detail.review.body}</pre>
         {detail.review.comments?.map((comment, index) => <div className="mt-3" key={index}><p className="text-xs font-mono">{comment.file}:{comment.line}</p><pre className="whitespace-pre-wrap break-words text-xs">{comment.body}</pre></div>)}
       </details> : null}
+      <RepairHistory repairs={detail.repairs || []} />
       {detail.droppedSteps > 0 ? <p>{detail.droppedSteps} older steps were removed by the per-job log bound.</p> : null}
       <ol className="space-y-3">{detail.steps.map(item => <li key={item.id} className="border-l-2 border-line pl-3"><div className="text-sm">{PROGRESS_LABELS[item.stage as keyof typeof PROGRESS_LABELS] || item.stage}</div><div className="font-mono text-xs text-fg-muted">Received: {time(item.at)} · {item.source} {item.provider || ""}{item.observedAt ? ` · observed: ${time(item.observedAt)}` : ""}<br />{item.runId ? `Run: ${item.runId} · ` : ""}{item.id}</div></li>)}</ol>
       {detail.observations ? Object.entries(detail.observations).map(([provider, observation]) => <details key={provider} className="rounded border border-line p-3"><summary>{provider} · observed but NOT parsed/completed · {time(observation.at)}{observation.truncated ? " · TRUNCATED" : ""}</summary>

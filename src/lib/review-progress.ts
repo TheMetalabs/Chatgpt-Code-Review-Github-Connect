@@ -1,5 +1,12 @@
 /** Observations only. None of these stages authorizes completion or another prompt. */
 export const PROGRESS_LABELS = {
+    repair_running: "Original response secured · Local JSON repair queued or running",
+    repair_ready: "Local repair candidate validated · waiting for original-page recheck",
+    repair_accepted: "Local format repair accepted for the original reviewer",
+    repair_disabled: "Local JSON repair disabled · original retained",
+    repair_superseded: "Local repair superseded · no candidate applied",
+    repair_interrupted: "Local repair outcome unknown after restart · no automatic replay",
+    repair_needs_attention: "Local JSON repair needs attention · inspect original and candidate",
     tab_created: "Review tab created",
     run_dispatched: "Page runner acknowledged · submission not yet confirmed",
     composer_waiting: "Prompt not sent · waiting for composer",

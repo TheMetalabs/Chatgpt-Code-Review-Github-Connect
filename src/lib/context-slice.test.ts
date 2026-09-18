@@ -101,3 +101,41 @@ describe("sliceContext budget + modes", () => {
     assert.doesNotThrow(() => sliceContext({ path: "x.ts", content: "one line no newline", hunks: [{ newStart: 1, newLines: 1 }], padLines: 0, maxChars: 0 }));
   });
 });
+
+describe("sliceContext 1-hop and scale", () => {
+  it("includes same-file definitions of helpers the added lines call", () => {
+    const src = ["export class S {", "  run() {", "    return this.helper();", "  }", "", "  helper(): number {", "    return 1;", "  }", "}"].join("\n");
+    const patch = "@@ -2,2 +2,3 @@\n   run() {\n+    return this.helper();\n   }";
+    const out = sliceContext({ path: "s.ts", content: src, hunks: parseHunks(patch), padLines: 1, maxChars: 0, patch });
+    assert.ok(out.ranges.some((r) => r.reason.includes("def:helper")), "helper definition pulled in");
+    assert.ok(out.text.includes("6| ") && out.text.includes("helper(): number"));
+  });
+
+  it("does not pull cross-file (undefined-in-file) callees", () => {
+    const src = ["export function run() {", "  return externalThing();", "}"].join("\n");
+    const patch = "@@ -1,2 +1,3 @@\n export function run() {\n+  return externalThing();\n }";
+    const out = sliceContext({ path: "s.ts", content: src, hunks: parseHunks(patch), padLines: 1, maxChars: 0, patch });
+    assert.ok(!out.ranges.some((r) => r.reason.includes("def:externalThing")));
+  });
+
+  it("includes readers of an added property", () => {
+    const src = ["export interface Doc {", "  title: string;", "}", "", "export function render(d: Doc) {", "  return d.title.trim();", "}"].join("\n");
+    const patch = "@@ -1,2 +1,3 @@\n export interface Doc {\n+  title: string;\n }";
+    const out = sliceContext({ path: "d.ts", content: src, hunks: parseHunks(patch), padLines: 1, maxChars: 0, patch });
+    assert.ok(out.ranges.some((r) => r.reason.includes("reader:title")), "reader of .title pulled in");
+    assert.ok(out.text.includes("d.title"));
+  });
+
+  it("on a 300KB+ file, captures the tail hunk's function and not the head", () => {
+    const N = 8000;
+    const methods: string[] = [];
+    for (let i = 0; i < N; i += 1) methods.push(`  m${i}(): number {`, `    return ${i};`, "  }");
+    const bigLines = ["export class Big {", ...methods, "}"];
+    const bigSrc = bigLines.join("\n");
+    assert.ok(bigSrc.length > 300_000, `synthetic file is ${bigSrc.length} bytes`);
+    const hunkLine = bigLines.lastIndexOf(`    return ${N - 1};`) + 1;
+    const out = sliceContext({ path: "big.ts", content: bigSrc, hunks: [{ newStart: hunkLine, newLines: 1 }], padLines: 2, maxChars: 0 });
+    assert.ok(out.text.includes(`m${N - 1}(`), "last method captured");
+    assert.ok(!out.text.includes("m0("), "first method NOT included (proves hunk-anchored, not head slice)");
+  });
+});

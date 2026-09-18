@@ -15,6 +15,65 @@ const CLASS_MEMBER = /^ {2}(?:(?:private|protected|public|static|async|readonly|
 const TOP_FN = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/;
 const TOP_VAR = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+/;
 const CLASS_DECL = /^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\b/;
+const CALL_RE = /(?:this\.)?([A-Za-z_$][\w$]*)\s*\(/g;
+const PROP_DECL_RE = /^\s*([A-Za-z_$][\w$]*)\??\s*:/;
+const IGNORE_1HOP = new Set([
+  ...KEYWORDS,
+  "function", "constructor", "super", "require", "import", "typeof", "await", "new", "void", "yield", "delete", "in", "of",
+  "Number", "String", "Boolean", "Array", "Object", "Set", "Map", "Promise", "JSON", "Math", "console", "RegExp", "Error", "Date",
+]);
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractAddedLines(patch: string): string[] {
+  return String(patch || "")
+    .split("\n")
+    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+    .map((l) => l.slice(1));
+}
+
+/** Collect identifiers matched by `re` (global or not) across added lines, minus builtins. */
+function collectNames(added: string[], re: RegExp, group: number): string[] {
+  const names = new Set<string>();
+  for (const line of added) {
+    if (re.global) {
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(line)) !== null) {
+        if (m[group] && !IGNORE_1HOP.has(m[group])) names.add(m[group]);
+      }
+    } else {
+      const m = re.exec(line);
+      if (m && m[group] && !IGNORE_1HOP.has(m[group])) names.add(m[group]);
+    }
+  }
+  return [...names];
+}
+
+/** First line (1-based) that DEFINES `name` in this file (member sig / function / const), else 0. */
+function findDefinitionLine(lines: string[], name: string): number {
+  const n = escapeRe(name);
+  const memberRe = new RegExp(`^ {2}(?:(?:private|protected|public|static|async|readonly|get|set|override|abstract)\\s+)*${n}\\s*(?:<[^>]*>)?\\s*\\(`);
+  const fnRe = new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${n}\\b`);
+  const varRe = new RegExp(`^(?:export\\s+)?(?:const|let|var)\\s+${n}\\b`);
+  for (let i = 1; i <= lines.length; i += 1) {
+    const l = lines[i - 1] ?? "";
+    if (memberRe.test(l) || fnRe.test(l) || varRe.test(l)) return i;
+  }
+  return 0;
+}
+
+/** Lines (1-based) that reference `.name`, capped. */
+function findReferenceLines(lines: string[], name: string, cap: number): number[] {
+  const re = new RegExp(`\\.${escapeRe(name)}\\b`);
+  const out: number[] = [];
+  for (let i = 1; i <= lines.length && out.length < cap; i += 1) {
+    if (re.test(lines[i - 1] ?? "")) out.push(i);
+  }
+  return out;
+}
 
 /** Parse `@@ -a,b +c,d @@` headers from a single file's patch → RIGHT-side ranges. */
 export function parseHunks(patch: string): HunkRange[] {
@@ -138,6 +197,7 @@ export function sliceContext(opts: {
   padLines: number;
   maxChars: number;
   mode?: "hunks" | "head";
+  patch?: string;
 }): SliceResult {
   const lines = String(opts.content ?? "").split("\n");
   const total = lines.length;
@@ -161,6 +221,31 @@ export function sliceContext(opts: {
         reason: "heuristic fallback",
         priority: 1,
       });
+    }
+  }
+  // 1-hop (same file only): helpers the added lines call, and readers of added properties.
+  // Cross-file symbols are skipped (no repo clone) — recorded by neither, to avoid noise.
+  if (opts.patch) {
+    const added = extractAddedLines(opts.patch);
+    const callees = collectNames(added, CALL_RE, 1).slice(0, 40);
+    let defs = 0;
+    for (const name of callees) {
+      if (defs >= 12) break;
+      const defLine = findDefinitionLine(lines, name);
+      if (defLine > 0) {
+        collected.push({ ...enclosingRange(lines, defLine, defLine, 0), priority: 3, reason: `def:${name}` });
+        defs += 1;
+      }
+    }
+    const props = collectNames(added, PROP_DECL_RE, 1).slice(0, 20);
+    let readers = 0;
+    for (const name of props) {
+      if (readers >= 12) break;
+      for (const refLine of findReferenceLines(lines, name, 12)) {
+        collected.push({ ...enclosingRange(lines, refLine, refLine, 0), priority: 4, reason: `reader:${name}` });
+        readers += 1;
+        if (readers >= 12) break;
+      }
     }
   }
   if (!collected.length) return { ranges: [], text: "" };

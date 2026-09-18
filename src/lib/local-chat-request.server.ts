@@ -22,40 +22,105 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function tryStealStaleSlot(lockPath: string): void {
+/**
+ * Ownership-safe stale recovery: rename(claim) → verify payload unchanged + pid dead → unlink.
+ * If another process replaced the lock between read and rename, claimed content differs and we restore.
+ */
+export function tryStealStaleSlot(lockPath: string): void {
+  let raw: string;
   try {
-    const raw = fs.readFileSync(lockPath, "utf8");
-    let pid = 0;
-    try { pid = Number(JSON.parse(raw)?.pid || 0); } catch { fs.unlinkSync(lockPath); return; }
-    if (!pidAlive(pid)) fs.unlinkSync(lockPath);
+    raw = fs.readFileSync(lockPath, "utf8");
   } catch (e: unknown) {
     const err = e as NodeJS.ErrnoException;
     if (err?.code === "ENOENT") return;
-    try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+    return;
   }
+
+  let pid = 0;
+  let parsedOk = false;
+  try {
+    pid = Number(JSON.parse(raw)?.pid || 0);
+    parsedOk = true;
+  } catch {
+    parsedOk = false;
+  }
+
+  if (parsedOk && pidAlive(pid)) return;
+
+  const claimPath = `${lockPath}.steal.${process.pid}.${Date.now()}`;
+  try {
+    fs.renameSync(lockPath, claimPath);
+  } catch (e: unknown) {
+    const err = e as NodeJS.ErrnoException;
+    if (err?.code === "ENOENT") return;
+    return;
+  }
+
+  let claimed: string;
+  try {
+    claimed = fs.readFileSync(claimPath, "utf8");
+  } catch {
+    try { fs.unlinkSync(claimPath); } catch { /* ignore */ }
+    return;
+  }
+
+  let claimedPid = 0;
+  try {
+    claimedPid = Number(JSON.parse(claimed)?.pid || 0);
+  } catch {
+    try { fs.unlinkSync(claimPath); } catch { /* ignore */ }
+    return;
+  }
+
+  // Not the payload we inspected, or holder is alive → put it back.
+  if (claimed !== raw || pidAlive(claimedPid)) {
+    try {
+      fs.renameSync(claimPath, lockPath);
+    } catch {
+      try { fs.unlinkSync(claimPath); } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  try { fs.unlinkSync(claimPath); } catch { /* ignore */ }
+}
+
+function releaseIfOwner(lockPath: string, ownerPid: number): void {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8");
+    const pid = Number(JSON.parse(raw)?.pid || 0);
+    if (pid === ownerPid) fs.unlinkSync(lockPath);
+  } catch { /* ignore */ }
 }
 
 /** Block until this process holds the single local-LLM slot. Returns release(). */
-export async function acquireLocalLlmSlot(label = "ashlar-local"): Promise<() => void> {
-  fs.mkdirSync(path.dirname(LOCAL_LLM_SLOT_LOCK), { recursive: true });
+export async function acquireLocalLlmSlot(
+  label = "ashlar-local",
+  lockPath = LOCAL_LLM_SLOT_LOCK,
+): Promise<() => void> {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
   const started = Date.now();
   let lastLog = 0;
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   for (;;) {
     try {
-      const fd = fs.openSync(LOCAL_LLM_SLOT_LOCK, "wx");
-      fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, label, at: Date.now() / 1000 })}\n`);
+      const fd = fs.openSync(lockPath, "wx");
+      fs.writeFileSync(
+        fd,
+        `${JSON.stringify({ pid: process.pid, label, at: Date.now() / 1000, token })}\n`,
+      );
       fs.closeSync(fd);
       const waited = Date.now() - started;
       if (waited >= 1000) console.info(`[qwen-llm-slot] acquired after ${(waited / 1000).toFixed(1)}s label=${label}`);
-      return () => { try { fs.unlinkSync(LOCAL_LLM_SLOT_LOCK); } catch { /* ignore */ } };
+      return () => releaseIfOwner(lockPath, process.pid);
     } catch (e: unknown) {
       const err = e as NodeJS.ErrnoException;
       if (err?.code !== "EEXIST") throw e;
-      tryStealStaleSlot(LOCAL_LLM_SLOT_LOCK);
+      tryStealStaleSlot(lockPath);
       const waited = Date.now() - started;
       if (waited - lastLog >= SLOT_LOG_EVERY_MS) {
         let holder = "?";
-        try { holder = fs.readFileSync(LOCAL_LLM_SLOT_LOCK, "utf8").trim().replace(/\n/g, " "); } catch { /* ignore */ }
+        try { holder = fs.readFileSync(lockPath, "utf8").trim().replace(/\n/g, " "); } catch { /* ignore */ }
         console.info(`[qwen-llm-slot] waiting ${(waited / 1000).toFixed(0)}s label=${label} holder=${holder}`);
         lastLog = waited;
       }

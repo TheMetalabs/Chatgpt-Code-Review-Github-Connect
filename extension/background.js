@@ -448,10 +448,10 @@ async function refreshTabInventory() {
   }
 }
 function sourceArchiveDurable(state) {
-  return state.sourceCapture?.archiveDurable === true || sourceArchiveDurable(state) === true;
+  return state.sourceCapture?.archiveDurable === true || state.sourceCapture?.confirmed === true;
 }
 function sourceCleanupProofConfirmed(state) {
-  return state.sourceCapture?.cleanupProofConfirmed === true || sourceArchiveDurable(state) === true;
+  return state.sourceCapture?.cleanupProofConfirmed === true || state.sourceCapture?.confirmed === true;
 }
 
 function slotReason(state) {

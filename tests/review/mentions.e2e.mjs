@@ -119,6 +119,7 @@ test('new explicit command supersedes running work but retained PR-body text nev
   assert.equal((await settled(app,second.jobId)).status,'awaiting_chat');
   assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===first.jobId).status,'cancelled');
   assert.notEqual(first.jobId,second.jobId);
+  await eventually(()=>app.ops.some(b=>b.includes(first.jobId)&&/Superseded by a newer review request/.test(b)),'superseded job ops comment marked terminal, not left running');
 });
 
 for (const event of ['pull_request', 'pull_request_review_comment']) {

@@ -46,3 +46,16 @@ test('unverified existing provider tabs reserve physical space until read-only o
  const out=await b.context.tabCapacityReport({},true);assert.equal(out.used,1);assert.equal(out.unverifiedTabs,1);
  assert.equal(await b.context.tabCapacityAvailable({},true),false);
 });
+
+
+test('released matching job tab does not consume managed capacity while server-side work remains',async()=>{
+ const job=makeJob('A',10);
+ const tabs=new Map([[10,{id:10,url:'https://chatgpt.com/c/A',status:'complete'}]]);
+ const b=background({local:storage({origin:'http://bridge',token:'token',maxReviewTabs:1,pendingReviewJobs:{A:job}}),tabs,
+  handler:(_id,msg)=>msg.type==='ashlar-tab-status'?{ok:true,ownershipProtocol:1,jobId:'A',provider:'chatgpt',runId:'run-A',released:true,url:tabs.get(10).url}:{ok:false,code:'job_mismatch'}});
+ await b.context.refreshTabInventory();await flush();await flush();
+ const out=await b.context.tabCapacityReport({A:job},true);
+ assert.equal(out.managedTabs,0);assert.equal(out.used,0);
+ assert.equal(await b.context.tabCapacityAvailable({A:job},true),true);
+ assert.equal(b.closedTabs.length,0,'released user tab must remain open');
+});

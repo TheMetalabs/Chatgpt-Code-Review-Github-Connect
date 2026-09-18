@@ -44,12 +44,14 @@ test('completed malformed source frees the only tab slot before Local finishes, 
  assert.equal(f.app.reviews.length,0);assert.equal(f.app.localRequests.length,1);assert.equal(await f.page.evaluate(()=>clicks),0);
  assert.equal(f.app.history.getJob(f.job.jobId,true).captures[0].text,invalid);
  assert.equal(f.worker.local.state.pendingReviewJobs[f.job.jobId].prompt,undefined,'browserless backlog must not retain full review prompts');
- assert.equal(f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.sourceCapture.text,undefined,'closed-tab backlog must not retain duplicate full sources in Chrome storage');
+ assert.equal(f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.sourceCapture.text,invalid,'unresolved archived repair must retain an exact local fallback until final acknowledgement');
  assert.equal(f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.delivered,undefined,'archive must not claim final result');
  await eventually(async()=>{await f.cycle();return Boolean(f.worker.local.state.pendingReviewJobs[next.jobId]);},'new job not admitted after cleanup');
  assert.equal(f.worker.tabs.size,1,'hard managed-tab limit must remain in force');
  f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
  await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'archived source could not finish formatting');
+ const completedState=f.worker.local.state.pendingReviewJobs[f.job.jobId]?.states?.chatgpt;
+ if(completedState)assert.equal(completedState.sourceCapture?.text,undefined,'final result acknowledgement may compact the local fallback');
  assert.equal(f.app.localRequests.length,1);assert.equal(f.worker.messages.some(m=>m.id===10&&m.type==='ashlar-run'),false);
 });
 

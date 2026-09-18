@@ -58,7 +58,8 @@ test('heartbeat reports a capacity block without claiming progress or exposing o
  assert.equal(JSON.stringify(out).includes('DO NOT LEAK'),false);
  assert.equal(f.app.localRequests.length,0);
  const old=await f.post({action:'ping',extensionVersion:'1.1.21',workerStatus:{...report,checkedAt:Date.now()-86_400_000}});
- assert.equal(old.bridge.connected,true);assert.equal(old.bridge.workerStatusFresh,false,'fresh ping must not relabel an old work report as current');
+ assert.equal(old.bridge.connected,true);
+ assert.equal(old.bridge.workerStatusFresh,true,'client wall-clock age is informational; a newly received observation starts its server freshness window');
 });
 
 test('recovery-only claim returns an existing bound run without admitting unrelated queued work',async t=>{

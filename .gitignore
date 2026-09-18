@@ -24,6 +24,3 @@ dist/
 # grok workspace ids — not product
 .github_repo
 .project_id
-extension.ashlar-backup/
-.ashlar-extension-stage-*
-extension.ashlar-swap-*

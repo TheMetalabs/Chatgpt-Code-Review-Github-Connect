@@ -225,36 +225,3 @@ test('popup displays capacity breakdown and persists only an explicit valid tab 
  await page.locator('#maxReviewTabs').fill('6');await page.locator('#save').click();assert.equal(await page.evaluate(()=>saved.maxReviewTabs),6);
  assert.equal(await page.evaluate(()=>saved.enabled),true);
 });
-
-
-test('popup one-click updater reloads only at zero managed capacity and supports disk-newer recovery',async t=>{
- const page=await browser.newPage();t.after(()=>page.close());
- await page.setContent(source('extension/popup.html').replace('<script src="popup.js"></script>',''));
- await page.evaluate(()=>{
-  window.saved={origin:'https://fixture.test',token:'private',enabled:true,maxReviewTabs:4,
-    bridgeWorkerStatus:{origin:'https://fixture.test',checkedAt:Date.now(),phase:'idle',admissionPhase:'idle',activeJobs:0,recoveringJobs:0,pendingCleanup:0,sourceCaptured:0,
-      capacity:{limit:4,used:0,managedTabs:0,providerTabs:2,reserved:0,restorationReserved:0,unknownReserved:0,unverifiedTabs:0,orphanTabs:0,blockers:[]}}};
-  window.reloads=0;window.updates=0;
-  window.fetch=async(url,options={})=>{
-    const path=new URL(url).pathname;
-    if(path==='/status')return {ok:true,status:200,json:async()=>({ok:true,installedVersion:'1.1.22',availableVersion:'1.1.22',availableCommit:'commit-new',updateAvailable:false,backupAvailable:true,backupVersion:'1.1.21'})};
-    if(path==='/update'){updates++;return {ok:true,status:200,json:async()=>({ok:true,updated:true,fromVersion:'1.1.21',toVersion:'1.1.22'})};}
-    if(path==='/rollback')return {ok:true,status:200,json:async()=>({ok:true,rolledBack:true,fromVersion:'1.1.22',toVersion:'1.1.21'})};
-    throw Error('unexpected updater path '+path);
-  };
-  window.chrome={runtime:{getManifest:()=>({version:'1.1.21'}),sendMessage:async()=>({ok:true}),reload:()=>reloads++},
-    permissions:{request:async()=>true},
-    storage:{local:{get:async keys=>Object.fromEntries((Array.isArray(keys)?keys:Object.keys(saved)).filter(k=>k in saved).map(k=>[k,saved[k]])),set:async value=>Object.assign(saved,value)},onChanged:{addListener(){}}}};
- });
- await page.addScriptTag({content:source('extension/popup.js')});
- await page.waitForTimeout(20);
- assert.match(await page.locator('#updateStatus').textContent(),/reload is required/i);
- assert.equal(await page.locator('#applyUpdate').isDisabled(),false);
- await page.locator('#applyUpdate').click();await page.waitForTimeout(180);
- assert.equal(await page.evaluate(()=>reloads),1);assert.equal(await page.evaluate(()=>updates),0,'disk-newer state must reload without fetching another update');
-
- await page.evaluate(()=>{reloads=0;saved.bridgeWorkerStatus.capacity.used=1;});
- await page.locator('#checkUpdate').click();await page.waitForTimeout(20);
- assert.equal(await page.locator('#applyUpdate').isDisabled(),true);
- assert.match(await page.locator('#updateStatus').textContent(),/currently 1\/4/);
-});

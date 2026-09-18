@@ -24,16 +24,6 @@
       <p id="worker" class="muted" aria-live="polite"></p>
       <button id="reconnect" type="button">Check connection &amp; poll now</button>
     </section>
-    <section aria-label="Extension updater">
-      <h2>Extension update</h2>
-      <p id="updateStatus" class="muted" aria-live="polite"></p>
-      <div class="buttonRow">
-        <button id="checkUpdate" type="button">Check update</button>
-        <button id="applyUpdate" type="button" disabled>Update &amp; Reload</button>
-      </div>
-      <button id="rollbackUpdate" type="button" disabled>Rollback &amp; Reload</button>
-      <p class="muted">Run <code>npm run extension:update-helper</code> once on this machine. Future merged main versions can update this same unpacked folder without opening chrome://extensions.</p>
-    </section>
     <script src="popup.js"></script>
   </body>
 </html>

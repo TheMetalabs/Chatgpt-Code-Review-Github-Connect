@@ -1,15 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Ashlar Chat Bridge",
-  "version": "1.1.22",
+  "version": "1.1.21",
   "description": "Runs Ashlar PR reviews in the ChatGPT or Grok tab you are already signed into.",
-  "permissions": [
-    "storage",
-    "tabs",
-    "alarms",
-    "scripting",
-    "clipboardWrite"
-  ],
+  "permissions": ["storage", "tabs", "alarms", "scripting", "clipboardWrite"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
@@ -19,45 +13,18 @@
     "https://*.grok-sandbox.com/*",
     "https://*.grok.me/*"
   ],
-  "optional_host_permissions": [
-    "https://*/*",
-    "http://*/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "action": {
-    "default_popup": "popup.html",
-    "default_title": "Ashlar bridge"
-  },
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Ashlar bridge" },
   "content_scripts": [
     {
-      "matches": [
-        "https://chatgpt.com/*",
-        "https://chat.openai.com/*"
-      ],
-      "js": [
-        "composer.js",
-        "quota.js",
-        "overlay.js",
-        "model.js",
-        "json.js",
-        "content-chatgpt.js"
-      ],
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-chatgpt.js"],
       "run_at": "document_idle"
     },
     {
-      "matches": [
-        "https://grok.com/*"
-      ],
-      "js": [
-        "composer.js",
-        "quota.js",
-        "overlay.js",
-        "model.js",
-        "json.js",
-        "content-grok.js"
-      ],
+      "matches": ["https://grok.com/*"],
+      "js": ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-grok.js"],
       "run_at": "document_idle"
     }
   ]

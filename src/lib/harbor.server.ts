@@ -12,7 +12,8 @@ import {
 import { acceptedDeliveryIds, decideIngress } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
-import { buildChatPrompt, parseChatSubmission } from "./chat-prompt";
+import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
+import { rankChangedFile } from "./review-budget";
 import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
 import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
 import {
@@ -130,7 +131,7 @@ export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
 export function publicJobs(jobs: Job[]) {
   const enabled = providersFromSettings(state.settings);
   return jobs.map((j) => {
-    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, ...rest } = j;
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, ...rest } = j;
     return {
       ...rest,
       reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
@@ -146,6 +147,33 @@ export function publicSettings(s: BotSettings) {
     localLlmApiKeySet: Boolean(s.localLlmApiKey),
     webhookSecretSet: Boolean(s.webhookSecret),
   };
+}
+
+// WHY: record attachment sizes + deterministic coverage on the job at the single
+// prompt-assembly point, measured by attachment name so it stays correct as later
+// PRs change the snapshot/policy attachments. Never affects the verdict.
+function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
+  const parts = splitChatAttachments(prompt);
+  const body = (name: string) => parts.files.find((f) => f.name === name)?.body ?? "";
+  const diffBody = body("ashlar-diff.patch");
+  const contextBody = body("ashlar-snapshot.md");
+  const policyBody = body("ashlar-policy.md");
+  const dropped = new Set(sample.diffDroppedPaths ?? []);
+  const codePaths = sample.changedPaths.filter((p) => rankChangedFile(p) === 0);
+  const coverageDeterministic = codePaths.map((path) => ({
+    path,
+    inDiff: !dropped.has(path),
+    inContext: contextBody.includes(`--- ${path} (`) || contextBody.includes(`--- ${path}\n`),
+    reason: dropped.has(path) ? "dropped from diff by prompt budget" : "",
+  }));
+  const promptStats = {
+    diffChars: diffBody.length,
+    contextChars: contextBody.length,
+    policyChars: policyBody.length,
+    diffFilesFull: sample.changedPaths.length - (sample.diffDroppedPaths?.length ?? 0),
+    diffFilesTotal: sample.changedPaths.length,
+  };
+  patchJob(jobId, (j) => ({ ...j, promptStats, coverageDeterministic, updatedAt: Date.now() }));
 }
 
 async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
@@ -422,7 +450,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
         isFork: pull.fork,
       }));
     }
-    sample = await fetchPullSnapshot(token, target);
+    sample = await fetchPullSnapshot(token, target, { diffMaxChars: state.settings.promptDiffMaxChars });
   } catch (e) {
     const msg = formatGithubError(e);
     patchJob(jobId, (j) => ({
@@ -475,6 +503,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     extra,
     untrustedBody,
   });
+  recordReviewCoverage(jobId, prompt, sample);
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
 
@@ -688,7 +717,7 @@ export async function submitHarborChat(
       sender: job.sender,
       isFork: job.isFork,
       isDraft: job.isDraft,
-    });
+    }, { diffMaxChars: state.settings.promptDiffMaxChars });
   } catch (e) {
     const msg = formatGithubError(e);
     return revert(msg.slice(0, 240));

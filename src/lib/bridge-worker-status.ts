@@ -49,3 +49,39 @@ export function workerStatusLabel(status: WorkerStatus | undefined, fresh: boole
   if (status.admissionPhase === "disconnected") return `${prefix}Admission transport unavailable · originals preserved`;
   return `${prefix}Admission: ${status.admissionPhase} · managed capacity ${slots}`;
 }
+
+function sameWorkerObservation(a: WorkerStatus, b: WorkerStatus): boolean {
+  return a.observedAt === b.observedAt &&
+    a.extensionVersion === b.extensionVersion &&
+    a.admissionPhase === b.admissionPhase &&
+    a.activeJobs === b.activeJobs &&
+    a.pendingCleanup === b.pendingCleanup &&
+    a.sourceCaptured === b.sourceCaptured &&
+    a.waitingForJson === b.waitingForJson &&
+    a.capacity.limit === b.capacity.limit &&
+    a.capacity.used === b.capacity.used &&
+    a.capacity.managedTabs === b.capacity.managedTabs &&
+    a.capacity.reserved === b.capacity.reserved &&
+    a.capacity.restorationReserved === b.capacity.restorationReserved &&
+    a.capacity.providerTabs === b.capacity.providerTabs &&
+    a.capacity.unverifiedTabs === b.capacity.unverifiedTabs &&
+    a.capacity.orphanTabs === b.capacity.orphanTabs &&
+    a.capacity.unknownReserved === b.capacity.unknownReserved;
+}
+
+/** Server receipt time advances only for a genuinely new sanitized observation.
+ * Browser wall-clock time is informational and never extends freshness by itself.
+ */
+export function mergeWorkerStatus(previous: WorkerStatus | undefined, value: unknown, version: unknown, receivedAt: number): WorkerStatus | undefined {
+  const next = sanitizeWorkerStatus(value, version, receivedAt);
+  if (!next) return previous;
+  if (previous && sameWorkerObservation(previous, next)) {
+    return {...next, receivedAt: previous.receivedAt};
+  }
+  return next;
+}
+
+export function workerStatusIsFresh(status: WorkerStatus | undefined, now: number, maxAge: number): boolean {
+  return Boolean(status && Number.isFinite(now) && Number.isFinite(maxAge) && maxAge >= 0 &&
+    now >= status.receivedAt && now - status.receivedAt < maxAge);
+}

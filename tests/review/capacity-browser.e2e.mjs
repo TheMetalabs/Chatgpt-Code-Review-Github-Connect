@@ -134,7 +134,7 @@ test('source change after durable archive preserves the receipt, releases capaci
  await eventually(async()=>{await f.cycle();return f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.cleanupDone;},'changed source did not release the managed slot');
  const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
  assert.equal(state.sourceCapture?.archiveDurable,true);assert.notEqual(state.sourceCapture?.cleanupProofConfirmed,true);assert.ok(state.sourceCapture?.id);
- assert.equal(state.sourceCapture.text,undefined,'compacted receipt should not duplicate the full archived original');
+ assert.equal(state.sourceCapture.text,invalid,'unresolved repair must retain the exact local archived-source fallback');
  assert.equal(f.worker.closedTabs.length,0,'repurposed page must be preserved');
  assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true);
  await f.cycle();assert.equal(f.worker.local.state.bridgeWorkerStatus.capacity.used,0);
@@ -206,6 +206,43 @@ test('durable archive survives navigation before cleanup proof without closing r
  f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
  await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'navigated archived repair did not finalize');
  assert.equal(f.worker.closedTabs.length,0,'replacement user page must stay open');
+});
+
+
+
+test('capture-read failure after tab loss falls back to the durable local source copy',async t=>{
+ const f=await fixture(t,{fallback:true});
+ const originalApi=f.worker.context.api;let readFailures=0,removed=false;const send=f.worker.chrome.tabs.sendMessage;
+ f.worker.context.api=async(path,body,...args)=>{
+  if(body?.action==='capture-read'){readFailures++;throw Error('archive read temporarily unavailable');}
+  return originalApi(path,body,...args);
+ };
+ f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
+  if(msg.type==='ashlar-capture-accepted') {
+   if(!removed) {
+    removed=true;
+    void f.worker.closeTab(id).then(()=>{
+      f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
+    });
+    return;
+   }
+   f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
+   return;
+  }
+  send(id,msg,cb);
+ };
+ await eventually(async()=>{await f.cycle();return f.app.localRequests.length===1;},'local fallback did not recover a failed capture-read');
+ const pending=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
+ assert.ok(readFailures>0,'repair should prefer the immutable server archive first');
+ assert.equal(pending.sourceCapture?.archiveDurable,true);
+ assert.equal(pending.sourceCapture?.text,invalid,'local fallback must remain until final repair acknowledgement');
+ assert.equal(JSON.parse(f.app.localRequests[0].messages[1].content).original,invalid);
+ assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false,'fallback must not regenerate the provider response');
+ f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'local archived-source fallback did not finalize');
+ const finalState=f.worker.local.state.pendingReviewJobs[f.job.jobId]?.states?.chatgpt;
+ if(finalState) assert.equal(finalState.sourceCapture?.text,undefined,'final ACK + cleanup may compact the local fallback');
+ assert.equal(f.app.localRequests.length,1);
 });
 
 test('failed local source-receipt persistence cannot authorize tab cleanup',async t=>{

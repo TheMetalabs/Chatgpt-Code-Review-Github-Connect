@@ -29,6 +29,7 @@ let registryPromise;
 let clientPromise;
 let storageTail = Promise.resolve();
 let allocationTail = Promise.resolve();
+let maintenanceTail = Promise.resolve();
 
 function singleFlight(lanes, key, operation) {
   if (lanes.has(key)) return lanes.get(key);
@@ -49,6 +50,12 @@ async function joinLanes(promises) {
 function writeInOrder(operation) {
   const pending = storageTail.then(operation);
   storageTail = pending.catch(() => {}); // A failed write must not poison later retries.
+  return pending;
+}
+
+function maintenanceInOrder(operation) {
+  const pending = maintenanceTail.then(operation);
+  maintenanceTail = pending.catch(() => {}); // Keep later maintenance transitions usable after a failure.
   return pending;
 }
 
@@ -1312,27 +1319,41 @@ async function maintenanceSnapshot(id) {
 }
 async function acquireMaintenance(id,mode) {
   if(typeof id!=="string" || !id || !["update","rollback","reload"].includes(mode))return {ok:false,error:"invalid maintenance request"};
-  const existing=await maintenanceState();
-  if(existing && existing.id!==id)return {ok:false,error:"another extension maintenance operation is active"};
-  await chrome.storage.local.set({[MAINTENANCE_KEY]:{active:true,id,mode,phase:"locked",requestedAt:Date.now()}});
+  const acquired=await maintenanceInOrder(async()=>{
+    const existing=await maintenanceState();
+    if(existing && existing.id!==id)return {ok:false,error:"another extension maintenance operation is active"};
+    if(!existing)await chrome.storage.local.set({[MAINTENANCE_KEY]:{active:true,id,mode,phase:"locked",requestedAt:Date.now()}});
+    return {ok:true};
+  });
+  if(!acquired.ok)return acquired;
   return maintenanceSnapshot(id);
 }
 async function releaseMaintenance(id) {
-  const current=await maintenanceState();
-  if(current?.id===id)await chrome.storage.local.remove([MAINTENANCE_KEY]);
-  return {ok:true};
+  return maintenanceInOrder(async()=>{
+    const current=await maintenanceState();
+    if(current?.id===id)await chrome.storage.local.remove([MAINTENANCE_KEY]);
+    return {ok:true};
+  });
 }
 async function commitMaintenanceReload(id) {
   const current=await maintenanceState();
   if(!current || current.id!==id)return {ok:false,error:"maintenance lock lost"};
   const snapshot=await maintenanceSnapshot(id);
   if(!snapshot.safe)return snapshot;
-  await chrome.storage.local.set({[MAINTENANCE_KEY]:{...current,phase:"reload_ready",committedAt:Date.now()}});
+  const committed=await maintenanceInOrder(async()=>{
+    const latest=await maintenanceState();
+    if(!latest || latest.id!==id)return {ok:false,error:"maintenance lock lost"};
+    await chrome.storage.local.set({[MAINTENANCE_KEY]:{...latest,phase:"reload_ready",committedAt:Date.now()}});
+    return {ok:true};
+  });
+  if(!committed.ok)return committed;
   return {...snapshot,committed:true};
 }
 async function clearCommittedMaintenanceOnWorkerStart() {
-  const current=await maintenanceState();
-  if(current?.phase==="reload_ready")await chrome.storage.local.remove([MAINTENANCE_KEY]);
+  await maintenanceInOrder(async()=>{
+    const current=await maintenanceState();
+    if(current?.phase==="reload_ready")await chrome.storage.local.remove([MAINTENANCE_KEY]);
+  });
 }
 
 function loop() {

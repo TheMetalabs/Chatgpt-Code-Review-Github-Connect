@@ -19,6 +19,7 @@ type Row = {
     findingCount?: number;
 };
 type Detail = {
+    captures?: {id: string; provider: string; runId: string; responseId: string; sourceHash: string; totalChars: number; at: number; text?: string}[];
     repairs?: RepairHistoryRow[];
     job: Row;
     inCurrentRuntime: boolean;
@@ -175,6 +176,7 @@ export function HistoryBrowser({ initialKind = "jobs" }: {
       <RepairHistory repairs={detail.repairs || []} />
       {detail.droppedSteps > 0 ? <p>{detail.droppedSteps} older steps were removed by the per-job log bound.</p> : null}
       <ol className="space-y-3">{detail.steps.map(item => <li key={item.id} className="border-l-2 border-line pl-3"><div className="text-sm">{PROGRESS_LABELS[item.stage as keyof typeof PROGRESS_LABELS] || item.stage}</div><div className="font-mono text-xs text-fg-muted">Received: {time(item.at)} · {item.source} {item.provider || ""}{item.observedAt ? ` · observed: ${time(item.observedAt)}` : ""}<br />{item.runId ? `Run: ${item.runId} · ` : ""}{item.id}</div></li>)}</ol>
+      {detail.captures?.map(item => <details key={item.id} className="rounded border border-line p-3"><summary>{item.provider} · full source secured · {item.totalChars} characters · {time(item.at)}</summary><p className="text-xs">Source archive is not a parsed review or publication receipt. Run {item.runId} · response {item.responseId} · SHA-256 {item.sourceHash}</p>{item.text !== undefined ? <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs">{item.text}</pre> : <p>Use Load original response / JSON to read the protected source.</p>}</details>)}
       {detail.observations ? Object.entries(detail.observations).map(([provider, observation]) => <details key={provider} className="rounded border border-line p-3"><summary>{provider} · observed but NOT parsed/completed · {time(observation.at)}{observation.truncated ? " · TRUNCATED" : ""}</summary>
         <p className="text-xs">Run {observation.runId} · {observation.totalChars} characters. This diagnostic snapshot is not submitted as a review.</p><pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs">{observation.text}</pre>
       </details>) : null}

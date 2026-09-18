@@ -49,7 +49,7 @@ test('unacknowledged completion survives worker restart without a second model c
   const r = background({ api, handler, local: b.local, session: storage(), tabs: new Map() });
   await r.tick();
   assert.ok(s.received.some(c => c.action === 'complete' && c.results[0].raw === raw));
-  assert.equal(r.messages.length, 0);
+  assert.equal(r.messages.filter(m=>m.type!=='ashlar-tab-status').length, 0); // Inventory is read-only, never prompt adoption.
 });
 test('legacy session tab mappings remain recoverable alongside the next take', async () => {
   const s = server([job('B')]);
@@ -93,7 +93,7 @@ test('a missing prompt alone leaves the original pending tab recoverable', async
   // Migration is loaded on worker startup, not by replacing an active worker's cache.
   const r = background({ api, local: b.local, session: b.session, tabs: b.tabs });
   await r.tick();
-  assert.equal(r.messages.length, 0);
+  assert.equal(r.messages.filter(m=>m.type!=='ashlar-tab-status').length, 0); // Inventory is read-only, never prompt adoption.
   assert.ok(r.local.state.pendingReviewJobs.A);
   assert.equal(r.closedTabs.length, 0);
 });

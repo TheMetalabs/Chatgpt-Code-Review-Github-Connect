@@ -60,7 +60,12 @@ async function workerFixture(t,{enabled=true,text=original,pageOptions={}}={}) {
  const app=await appFixture({reviewLocal:false,localJsonRepairEnabled:enabled});t.after(()=>app.close());const mention=app.mention();await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===mention.jobId)?.status==='awaiting_chat','not ready');
  const send=async(path,body)=>{
   const res=await fetch(app.origin+path,{method:body?'POST':'GET',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},...(body?{body:JSON.stringify(body)}:{})});const value=await res.json();
-  if(!res.ok || !value.ok){const error=Object.assign(Error(value.error||'request failed'),{status:res.status,code:value.code});throw error;}return value;
+  if(!res.ok || !value.ok){const error=Object.assign(Error(value.error||'request failed'),{status:res.status,code:value.code});throw error;}
+  // Preserve the 1.1.20.2 server contract in these repair-receipt regressions.
+  // The new archive-before-format path is exercised with an unmodified server
+  // and the same worker/page in capacity-browser.e2e.mjs.
+  if(value.bridge)delete value.bridge.captureProtocol;
+  return value;
  };
  const {job}=await send('/api/bridge',{action:'take',clientId:'worker-fixture'});job.origin=app.origin;job.states={chatgpt:{runId:'run-A',tabId:10,started:true}};
  const page=await pageFixture(t,{jobId:job.jobId,text,...pageOptions});

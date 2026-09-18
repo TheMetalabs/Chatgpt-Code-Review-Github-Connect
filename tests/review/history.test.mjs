@@ -51,3 +51,25 @@ test('history: untrusted identifiers cannot escape the private directory',async 
 test('history: disk failure is visible and response storage does not acknowledge success',async t=>{
  const {h,dir}=await store(t);h.recordJob(job('A'));rmSync(join(dir,'jobs'),{recursive:true});writeFileSync(join(dir,'jobs'),'blocked');assert.throws(()=>h.recordResponse('A','chatgpt','{}','reply'));assert.equal(h.health().ok,false);
 });
+
+test('history: complete source escrow survives filesystem restart, is immutable and private by default',async t=>{
+ const {h,Store,dir}=await store(t);const {createHash}=await import('node:crypto');h.recordJob(job('capture-A'));
+ const text='PRIVATE captured original "literal"',digest=value=>createHash('sha256').update(value).digest('hex');
+ const capture={id:digest('capture-key'),jobId:'capture-A',headSha:'abc',provider:'chatgpt',runId:'run-A',responseId:'response-A',sourceHash:digest(text),text,at:100};
+ h.putCapture(capture);const reopened=new Store(dir);
+ assert.equal(reopened.getCapture('capture-A',capture.id).text,text);
+ assert.equal(JSON.stringify(reopened.getJob('capture-A')).includes('PRIVATE'),false);
+ assert.equal(reopened.getJob('capture-A',true).captures[0].totalChars,text.length);
+ assert.equal(reopened.getJob('capture-A',true).captures[0].text,text);
+ assert.throws(()=>reopened.putCapture({...capture,text:'changed',sourceHash:digest('changed')}),/immutable/);
+ reopened.prune(365*86_400_000);assert.equal(reopened.getCapture('capture-A',capture.id).text,text,'nonterminal captured source must not expire by age');
+});
+
+test('history: capture size/count and path guards fail closed without truncating a source',async t=>{
+ const {h}=await store(t,{maxResponseChars:100});const {createHash}=await import('node:crypto');h.recordJob(job('A'));
+ const digest=value=>createHash('sha256').update(value).digest('hex');
+ const entry=text=>({id:digest('id-'+text),jobId:'A',headSha:'abc',provider:'chatgpt',runId:'run-A',responseId:'response-A',sourceHash:digest(text),text,at:100});
+ assert.throws(()=>h.putCapture(entry('x'.repeat(101))),/limit/);assert.equal(h.listCaptures('A').length,0);
+ for(let i=0;i<8;i++)h.putCapture(entry('source '+i));assert.throws(()=>h.putCapture(entry('source ninth')),/attempt_limit/);
+ assert.equal(h.getCapture('A','../secret'),null);assert.equal(h.getJob('A',true).captures[7].text,'source 7');
+});

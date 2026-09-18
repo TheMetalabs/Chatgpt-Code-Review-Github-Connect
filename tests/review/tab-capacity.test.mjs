@@ -1,0 +1,48 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {background,storage,flush,raw} from './helpers.mjs';
+const makeJob=(id,tabId)=>({jobId:id,origin:'http://bridge',leaseId:'lease-'+id,prompt:'review',providers:['chatgpt'],states:{chatgpt:{started:true,runId:'run-'+id,tabId}}});
+
+test('capacity distinguishes seven personal tabs from four missing restoration bindings',async()=>{
+ const jobs=Object.fromEntries(['A','B','C','D'].map((id,i)=>[id,makeJob(id,10+i)]));
+ const tabs=new Map(Array.from({length:7},(_,i)=>[100+i,{id:100+i,url:'https://chatgpt.com/c/personal-'+i,status:'complete'}]));
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:jobs}),tabs,
+  handler:(id,msg)=>msg.type==='ashlar-tab-status'?{ok:true,ownershipProtocol:1,jobId:'',runId:'',provider:'chatgpt',url:tabs.get(id).url}:{ok:false,code:'job_mismatch',jobId:'',runId:''},
+  api:async()=>({ok:true,active:false,status:'missing',job:null})});
+ for(let i=0;i<4;i++){await b.tick();await flush();}
+ assert.ok(b.calls.some(c=>c.action==='take'),'proven unbound tabs must not keep missing work at capacity');
+ assert.equal(b.closedTabs.length,0);assert.equal(b.tabs.size,7);
+ assert.equal(Object.keys(b.local.state.pendingReviewJobs).length,4,'missing work must not be discarded');
+ assert.equal(b.local.state.bridgeWorkerStatus.capacity.used,0);
+ assert.equal(b.local.state.bridgeWorkerStatus.capacity.providerTabs,7);
+});
+
+test('a pending job transport cannot block acknowledged peer cleanup at the capacity gate',async t=>{
+ const a=makeJob('A',10);a.providers.push('grok');a.states.grok={tabId:11,started:true,runId:'run-G'};
+ const b=background({local:storage({origin:'http://bridge',token:'token',maxReviewTabs:2,pendingReviewJobs:{A:a}}),tabs:new Map([[10,{id:10,url:'https://chatgpt.com/c/A'}],[11,{id:11,url:'https://grok.com/c/A'}]]),
+  handler:(id)=>({ok:true,canClose:true,raw,url:id===10?'https://chatgpt.com/c/A':'https://grok.com/c/A'})});
+ let release;const pending=new Promise(resolve=>release=resolve);t.after(()=>release({ok:true,accepted:true,active:true}));
+ b.context.heartbeat=()=>pending;
+ const jobs=await b.context.workerJobs('http://bridge');void b.context.progressJob(jobs.A,jobs);await flush();
+ // A repair lane can acknowledge G while the main A lane is suspended in transport.
+ Object.assign(jobs.A.states.grok,{delivered:true,cleanupPending:true,outcome:{ok:true,raw}});
+ void b.tick();for(let i=0;i<8;i++)await flush();
+ assert.deepEqual(b.closedTabs,[11],'cleanup must have its own lane independent of progressJob');
+});
+
+for(const released of [false,true])test(`positively bound orphan tab is protected and counted unless explicitly released (${released})`,async()=>{
+ const tabs=new Map([[10,{id:10,url:'https://chatgpt.com/c/original',status:'complete'}]]);
+ const b=background({local:storage({origin:'http://bridge',token:'token',maxReviewTabs:1,pendingReviewJobs:{}}),tabs,
+  handler:(_id,msg)=>msg.type==='ashlar-tab-status'?{ok:true,ownershipProtocol:1,jobId:'orphan',provider:'chatgpt',runId:'old-run',released,url:tabs.get(10).url}:{ok:false,code:'job_mismatch'},
+  api:async()=>({ok:true,job:null})});
+ await b.context.refreshTabInventory();await flush();await flush();
+ const out=await b.context.tabCapacityReport({},true);
+ assert.equal(out.used,released?0:1);assert.equal(out.orphanTabs,released?0:1);
+ assert.equal(b.closedTabs.length,0,'orphan or user-owned tabs cannot be arbitrarily closed');
+});
+
+test('unverified existing provider tabs reserve physical space until read-only ownership is established',async()=>{
+ const b=background({local:storage({origin:'http://bridge',token:'token',maxReviewTabs:1,pendingReviewJobs:{}}),tabs:new Map([[10,{id:10,url:'https://chatgpt.com/c/unknown'}]])});
+ const out=await b.context.tabCapacityReport({},true);assert.equal(out.used,1);assert.equal(out.unverifiedTabs,1);
+ assert.equal(await b.context.tabCapacityAvailable({},true),false);
+});

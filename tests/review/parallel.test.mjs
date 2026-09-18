@@ -149,9 +149,9 @@ test('parallel: server ignoring exclusions cannot replace an existing job identi
 
 test('parallel: independent heartbeat renews the actual jobs during slow DOM work',async()=>{
   const b=fixture([pending('A',10),pending('B',20)]);const send=b.chrome.tabs.sendMessage,held=[];
-  b.chrome.tabs.sendMessage=(id,msg,cb)=>held.push(()=>send(id,msg,cb));
+  b.chrome.tabs.sendMessage=(id,msg,cb)=>held.push(Object.assign(()=>send(id,msg,cb),{message:msg}));
   const running=b.tick();try {
-    await reached(()=>held.length===2,'both jobs must be independently observed');
+    await reached(()=>held.filter(r=>r.message.type!=='ashlar-tab-status').length===2,'both jobs must be independently observed');
     assert.equal(typeof b.context.heartbeatTick,'function');const before=b.calls.length;
     await b.context.heartbeatTick();
     const pings=b.calls.slice(before).filter(c=>c.action==='ping'&&c.jobId);
@@ -172,12 +172,13 @@ test('parallel: failed pre-create persistence retries safely instead of strandin
 
 test('parallel: new wakeups do not accumulate waiters behind an already running lane',async()=>{
   const b=fixture([pending('A',10)]);const send=b.chrome.tabs.sendMessage,held=[];
-  b.chrome.tabs.sendMessage=(id,msg,cb)=>held.push(()=>send(id,msg,cb));
+  b.chrome.tabs.sendMessage=(id,msg,cb)=>held.push(Object.assign(()=>send(id,msg,cb),{message:msg}));
   const first=b.tick();let later;
   try {
-    await reached(()=>held.length===1,'A did not start');let done=false;
+    await reached(()=>held.filter(r=>r.message.type!=='ashlar-tab-status').length===1,'A did not start');let done=false;
     later=b.tick().then(()=>{done=true;});await reached(()=>done,'later wakeup joined a blocked old lane');
-    assert.equal(held.length,1);
+    assert.equal(held.filter(r=>r.message.type!=='ashlar-tab-status').length,1);
+    assert.ok(held.filter(r=>r.message.type==='ashlar-tab-status').length<=1,'inventory probes also stay single-flight');
   } finally {b.chrome.tabs.sendMessage=send;for(const release of held)release();await Promise.all([first,later]);}
 });
 

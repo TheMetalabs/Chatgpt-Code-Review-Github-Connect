@@ -1,10 +1,11 @@
+import {sanitizeWorkerStatus, type WorkerStatus} from "./bridge-worker-status";
 import {JsonRepairService, localJsonRepairAvailable, cancelLocalJsonRepairs} from "./json-repair.server";
 import type {RepairInput} from "./json-repair.server";
 import {inspectReviewFormat} from "./review-json-repair";
 import type {RepairRecord} from "./json-repair-types";
 import {reviewHistory} from "./review-history.server";
 import {sanitizeProgressEvents} from "./review-progress";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider, ProviderError } from "./types";
 import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, isChatProvider, providersFromSettings } from "./types";
@@ -19,6 +20,7 @@ type BridgeMeta = {
   lastJobId?: string;
   lastError?: string;
   lastTakeAt?: number;
+  workerStatus?: WorkerStatus;
 };
 
 function newToken() {
@@ -61,6 +63,10 @@ export type BridgePublic = Omit<BridgeStatus, "token"> & {
   pendingJobs: number;
   lastTakeAt?: number;
   repairProtocol: 1;
+  captureProtocol: 1;
+  recoveryProtocol: 1;
+  workerStatus?: WorkerStatus;
+  workerStatusFresh: boolean;
   localJsonRepairEnabled: boolean;
 };
 
@@ -77,7 +83,9 @@ export function getBridgeStatus(): BridgeStatus {
 export function getBridgePublic(): BridgePublic {
   const { token: _t, ...rest } = getBridgeStatus();
   return {...rest, protocolVersion: 1, serverInstanceId, lastTakeAt: meta.lastTakeAt,
-    repairProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
+    workerStatus: meta.workerStatus,
+    workerStatusFresh: Boolean(meta.workerStatus && Date.now() - meta.workerStatus.observedAt < BRIDGE_CONNECTED_MS && Date.now() - meta.workerStatus.receivedAt < BRIDGE_CONNECTED_MS),
+    repairProtocol: 1, captureProtocol: 1, recoveryProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
     pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && pendingChatProviders(job).length > 0).length,
   };
 }
@@ -96,8 +104,13 @@ export function bridgeTokenOk(provided: string | null | undefined) {
   return timingSafeEqual(a, b);
 }
 
-export function bridgeHeartbeat() {
+export function bridgeHeartbeat(report?: unknown, extensionVersion?: unknown) {
   meta.lastSeen = Date.now();
+  if (report !== undefined) {
+    // Malformed reports cannot turn a stale/blocked worker into a healthy one.
+    const clean = sanitizeWorkerStatus(report, extensionVersion, meta.lastSeen);
+    if (clean) meta.workerStatus = clean;
+  }
 }
 
 /** This is an ownership lease, NOT a generation deadline. Expiry only enables resume. */
@@ -167,6 +180,35 @@ export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[
     updatedAt: Date.now(),
   }));
   return {...job, leaseId: claim.leaseId};
+}
+
+/** Recover only the original profile's already-attempted, positively bound run.
+ * This is NOT a capacity bypass for take/new generation and never widens providers.
+ */
+export function recoverBridgeJob(clientId: string, values: unknown) {
+  if (!clientId || !Array.isArray(values) || values.length > 16) return null;
+  const bindings = values.filter((item): item is {jobId:string;provider:"chatgpt"|"grok";runId:string} =>
+    Boolean(item && typeof item === "object" && typeof item.jobId === "string" && item.jobId.length <= 160 &&
+      isChatProvider(item.provider) && typeof item.runId === "string" && item.runId.length > 0 && item.runId.length <= 128));
+  const harbor=getHarbor();
+  for (const id of new Set(bindings.map(item=>item.jobId))) {
+    const job=harbor.jobs.find(row=>row.id===id);
+    if (!job || job.status!=="awaiting_chat" || !llmWorkAllowed(job) || job.bridgeClientId!==clientId ||
+        job.chatFpRound || job.fpProviders?.length) continue;
+    const pending=pendingChatProviders(job);
+    const matched=bindings.filter(item=>item.jobId===id && pending.includes(item.provider) &&
+      job.attemptedProviders?.includes(item.provider) && job.providerProgress?.[item.provider]?.runId===item.runId);
+    if (!matched.length) continue;
+    const claim=claimBridgeJob(id,clientId);
+    if (!claim.ok) continue;
+    const providers=[...new Set(matched.map(item=>item.provider))];
+    return {jobId:id,leaseId:claim.leaseId,provider:providers[0],providers,resumeProviders:providers,
+      bindings:providers.map(provider=>({jobId:id,provider,runId:matched.find(item=>item.provider===provider)!.runId})),
+      prompt:job.chatPrompt || job.chatPromptByProvider?.[providers[0]] || "",prompts:job.chatPromptByProvider,
+      reasoning:{chatgpt:harbor.settings.chatgptReasoning,grok:harbor.settings.grokReasoning},
+      title:job.title,owner:job.owner,repo:job.repo,pr:job.pr};
+  }
+  return null;
 }
 
 export function promptForJob(jobId: string): {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>} | null {
@@ -397,8 +439,8 @@ function repairs() {
     },
   });
 }
-export function bridgeFormatErrors(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string): string[] {
-  if (!localJsonRepairAvailable(getHarbor().settings)) return [];
+export function bridgeFormatErrors(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string, captureProtocol = false): string[] {
+  if (!captureProtocol && !localJsonRepairAvailable(getHarbor().settings)) return [];
   const job=getHarbor().jobs.find(row=>row.id===jobId);
   if(!job || job.status!=="awaiting_chat" || !ownsLease(job,leaseId) || job.chatFpRound || job.fpProviders?.length) return [];
   return (legs?.length ? legs : [{provider:"chatgpt" as const,raw}]).flatMap(leg=>{
@@ -408,9 +450,55 @@ export function bridgeFormatErrors(jobId: string, raw: string, legs: ChatLeg[] |
   }).slice(0,32);
 }
 export type BridgeRepairRequest = {
-  jobId: string; leaseId?: string; provider?: string; runId?: string; responseId?: string; sourceHash?: string; repairId?: string;
-  source?: {text?: unknown; totalChars?: unknown; truncated?: unknown; responseId?: unknown; completed?: unknown; stable?: unknown};
+  jobId: string; leaseId?: string; provider?: string; runId?: string; responseId?: string; sourceHash?: string; repairId?: string; captureId?: string;
+  source?: {captureId?: unknown; text?: unknown; totalChars?: unknown; truncated?: unknown; responseId?: unknown; completed?: unknown; stable?: unknown};
 };
+const sourceDigest = (text: string) => createHash("sha256").update(text).digest("hex");
+function completedPageStage(jobId: string, provider: string, runId: string) {
+  const pages = reviewHistory().getJob(jobId)?.steps.filter(step => step.source === "page" && step.provider === provider && step.runId === runId) || [];
+  const latest = pages.reduce<(typeof pages)[number] | undefined>((last, item) =>
+    !last || Number(item.id.split(":").at(-1)) > Number(last.id.split(":").at(-1)) ? item : last, undefined);
+  return ["response_completed_json_invalid", "response_collected", "json_observed"].includes(latest?.stage || "");
+}
+/** Capture acknowledgement frees a browser resource, never settles the reviewer.
+ * It does not depend on the formatter toggle. Full source is persisted, not the
+ * truncated diagnostic preview. The owning page must revalidate before closing.
+ */
+export function captureBridgeSource(body: BridgeRepairRequest) {
+  const job = getHarbor().jobs.find(row => row.id === body.jobId);
+  if (!job || !ownsLease(job, body.leaseId) || !["chatgpt", "grok"].includes(body.provider || "") ||
+      !job.reviewProviders?.includes(body.provider as ReviewProvider) || !body.runId ||
+      job.providerProgress?.[body.provider as ReviewProvider]?.runId !== body.runId)
+    return {ok:false as const, error:"capture_binding_mismatch", http:409};
+  const source = body.source;
+  if (!source || source.completed !== true || source.stable !== true || source.truncated !== false ||
+      typeof source.text !== "string" || !source.text.trim() || source.text.length > 500000 ||
+      source.totalChars !== source.text.length || typeof body.responseId !== "string" || !body.responseId ||
+      body.responseId.length > 200 || source.responseId !== body.responseId || sourceDigest(source.text) !== body.sourceHash)
+    return {ok:false as const, error:"invalid_capture_source", http:400};
+  const id = sourceDigest(JSON.stringify(["source-v1",job.id,job.headSha,body.provider,body.runId,body.responseId,body.sourceHash]));
+  const old = reviewHistory().getCapture(job.id,id);
+  if (!old && (job.status !== "awaiting_chat" || !llmWorkAllowed(job) || job.chatFpRound || job.fpProviders?.length ||
+      (job.providerErrors?.[body.provider as ReviewProvider] && job.providerErrors[body.provider as ReviewProvider]?.code !== "disconnected") ||
+      job.storedLegs?.some(leg => leg.provider === body.provider && leg.raw.trim()) ||
+      !completedPageStage(job.id,body.provider!,body.runId)))
+    return {ok:false as const, error:"capture_not_current_or_complete", http:409};
+  const record = reviewHistory().putCapture(old || {id,jobId:job.id,headSha:job.headSha,provider:body.provider as "chatgpt"|"grok",
+    runId:body.runId,responseId:body.responseId,sourceHash:body.sourceHash!,text:source.text,at:Date.now()});
+  const {text, ...capture} = record;
+  return {ok:true as const, capture:{...capture,totalChars:text.length}, http:200};
+}
+/** Authenticated source read for a browserless pending formatter. The opaque
+ * receipt is checked against every binding field; no inference is started here.
+ */
+export function readBridgeCapture(body: BridgeRepairRequest) {
+  const job=getHarbor().jobs.find(row=>row.id===body.jobId);
+  const record=typeof body.captureId === "string" ? reviewHistory().getCapture(body.jobId,body.captureId) : null;
+  if(!record || record.provider!==body.provider || record.runId!==body.runId || record.responseId!==body.responseId ||
+      record.sourceHash!==body.sourceHash || (job && (!ownsLease(job,body.leaseId) || job.headSha!==record.headSha)))
+    return {ok:false as const,error:"capture_binding_mismatch",http:409};
+  return {ok:true as const,capture:{...record,totalChars:record.text.length},http:200};
+}
 /** Short control RPC. Candidate readiness is never a final result ACK. */
 export async function handleBridgeRepair(action: string, body: BridgeRepairRequest) {
   const job=getHarbor().jobs.find(row=>row.id===body.jobId);
@@ -425,12 +513,15 @@ export async function handleBridgeRepair(action: string, body: BridgeRepairReque
        !source || source.completed!==true || source.stable!==true || source.truncated!==false ||
        source.responseId!==body.responseId || typeof source.text!=="string" || source.totalChars!==source.text.length || source.text.length>500000)
       return {ok:false as const,error:"invalid_repair_source",http:400};
-    // Worker delivery/repair steps must not overwrite the last PAGE observation.
-    const pages=reviewHistory().getJob(job.id)?.steps.filter(step=>step.source==="page" && step.provider===body.provider && step.runId===body.runId) || [];
-    const latestPage=pages.reduce<(typeof pages)[number] | undefined>((last,item)=>
-      !last || Number(item.id.split(":").at(-1))>Number(last.id.split(":").at(-1)) ? item : last,undefined);
-    const stage=latestPage?.stage;
-    if(!["response_completed_json_invalid","response_collected","json_observed"].includes(stage || ""))return {ok:false as const,error:"completion_not_observed",http:409};
+    // Once the exact completed source has been escrowed and released by the
+    // page, formatting no longer needs a live tab. A supplied archive identity
+    // must match every source field; it is not permission to substitute content.
+    const captured = typeof source.captureId === "string" ? reviewHistory().getCapture(job.id,source.captureId) : null;
+    if (source.captureId !== undefined && (!captured || captured.provider !== body.provider || captured.runId !== body.runId ||
+        captured.headSha !== job.headSha || captured.responseId !== body.responseId || captured.sourceHash !== body.sourceHash || captured.text !== source.text))
+      return {ok:false as const,error:"capture_binding_mismatch",http:409};
+    if (!captured && !completedPageStage(job.id,body.provider!,body.runId))
+      return {ok:false as const,error:"completion_not_observed",http:409};
     const input:RepairInput={jobId:body.jobId,provider:body.provider as "chatgpt"|"grok",runId:body.runId,
       responseId:body.responseId,sourceHash:body.sourceHash,original:source.text,headSha:job.headSha,schema:"review"};
     try{return {ok:true as const,repair:repairs().start(input),http:200};}

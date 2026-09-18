@@ -15,6 +15,12 @@ const jobLanes = new Map();
 const heartbeatLanes = new Map();
 const observationLanes = new Map();
 const repairLanes = new Map();
+const captureLanes = new Map();
+const cleanupLanes = new Map();
+const inventoryLanes = new Map();
+const tabOwners = new Map();
+const tabEpochs = new Map();
+const inventoryUpgrades = new Map();
 const admissionLanes = new Map();
 const admissionReports = new Map();
 let registryPromise;
@@ -68,6 +74,7 @@ function closedKey(job, provider) {
 }
 
 async function rememberClosedTab(tabId, info) {
+  invalidateTabInventory(tabId);
   const key = OWNED_PREFIX + tabId;
   const owned = (await chrome.storage.session.get([key]))[key];
   // Only managed tabs; session-scoped records cannot poison a reused ID after restart.
@@ -151,13 +158,23 @@ function probeBridge() {
     const checkedAt = Date.now();
     const extensionVersion = chrome.runtime.getManifest?.().version || "unknown";
     try {
-      const result = await api("/api/bridge", {action: "ping", extensionVersion}, cfg.origin);
+      const local = (await chrome.storage.local.get([WORKER_STATUS_KEY]))[WORKER_STATUS_KEY];
+      // Never forward local blockers, raw observations, prompts, token or URLs.
+      const capacity = local?.origin === cfg.origin ? local.capacity : undefined;
+      const workerStatus = capacity ? {
+        checkedAt: local.checkedAt, admissionPhase: local.admissionPhase,
+        activeJobs: local.activeJobs, pendingCleanup: local.pendingCleanup,
+        sourceCaptured: local.sourceCaptured, waitingForJson: local.waitingForJson,
+        capacity: Object.fromEntries(["limit","used","managedTabs","reserved","restorationReserved","providerTabs","unverifiedTabs","orphanTabs","unknownReserved"].map(key=>[key,capacity[key]])),
+      } : undefined;
+      const result = await api("/api/bridge", {action: "ping", extensionVersion, workerStatus}, cfg.origin);
       const bridge = result.bridge || {};
       // Persist an allowlist, not the whole response (which can contain private prompts).
       await chrome.storage.local.set({[HEALTH_KEY]: {
         origin: cfg.origin, checkedAt, ok: true, extensionVersion,
         serverInstanceId: typeof bridge.serverInstanceId === "string" ? bridge.serverInstanceId.slice(0, 80) : undefined,
         protocolVersion: Number.isInteger(bridge.protocolVersion) ? bridge.protocolVersion : undefined,
+        recoveryProtocol: bridge.recoveryProtocol===1 ? 1 : undefined,
         pendingJobs: Number.isInteger(bridge.pendingJobs) && bridge.pendingJobs >= 0 ? bridge.pendingJobs : undefined,
         lastTakeAt: Number.isFinite(bridge.lastTakeAt) ? bridge.lastTakeAt : undefined,
       }});
@@ -183,6 +200,7 @@ function activelyReviewing(job) {
 }
 
 async function recordWorkerStatus(jobs, origin, admissionPhase) {
+  const capacity = await tabCapacityReport(jobs, true);
   // Admission and execution are independent writers. A finishing work lane must
   // not erase the reason another request is waiting for a slot or connection.
   if (admissionPhase) admissionReports.set(origin, {phase: admissionPhase, checkedAt: Date.now()});
@@ -191,12 +209,13 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
     const phase = relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
     const admission = admissionReports.get(origin);
     await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
-      origin, checkedAt: Date.now(), phase,
+      origin, checkedAt: Date.now(), phase, capacity,
       admissionPhase: admission?.phase || "not_checked",
       admissionCheckedAt: admission?.checkedAt,
+      sourceCaptured: relevant.reduce((n,job)=>n+job.providers.filter(p=>job.states[p].sourceCapture?.confirmed && !job.states[p].delivered).length,0),
       activeJobs: relevant.filter(activelyReviewing).length,
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
-      pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => job.states[p].delivered && !job.states[p].cleanupDone).length, 0),
+      pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => (job.states[p].delivered || job.states[p].sourceCapture?.confirmed) && !job.states[p].cleanupDone).length, 0),
       waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && ["waiting_for_json", "response_completed_json_invalid"].includes(job.states[p].observation?.state)).length, 0),
       stages: relevant.slice(0, 8).flatMap(job => job.providers.map(provider => ({jobId:job.jobId,provider,
         stage: progressFor(job)[provider]?.events.at(-1)?.stage || "submission_unknown"}))),
@@ -310,7 +329,7 @@ async function pendingJobs(origin) {
 
 function isBusyResult(result) {
   if (!result || result.ok) return false;
-  if (result.code) return result.code === "busy";
+  if (result.code) return result.code === "busy" || result.code === "captured";
   return result.retry === true || /already running|busy/i.test(String(result.error || ""));
 }
 
@@ -390,35 +409,99 @@ async function findOriginalTab(job, provider) {
   return null;
 }
 
+function invalidateTabInventory(tabId) {
+  tabOwners.delete(tabId);
+  inventoryUpgrades.delete(tabId);
+  tabEpochs.set(tabId,(tabEpochs.get(tabId) || 0)+1);
+}
+function knownTabOwner(tab) {
+  const known=tabOwners.get(tab.id);
+  return known?.url === tab.url && !tab.pendingUrl && tab.status !== "loading" ? known : undefined;
+}
+/** Ownership-only probes have independent lanes. An unresponsive tab remains
+ * uncertain; it cannot hold the admission/cleanup scheduler or cause fan-out.
+ */
+async function refreshTabInventory() {
+  const tabs=await chrome.tabs.query({});
+  const live=new Set(tabs.map(tab=>tab.id));
+  for(const id of tabOwners.keys())if(!live.has(id))invalidateTabInventory(id);
+  // Removed IDs need no permanent tombstone once their single-flight probe ended.
+  for(const id of tabEpochs.keys())if(!live.has(id) && !inventoryLanes.has(id)){tabEpochs.delete(id);inventoryUpgrades.delete(id);}
+  for(const tab of tabs) {
+    const provider=["chatgpt","grok"].find(p=>allowedTab(tab,p));
+    if(!provider || tab.status === "loading" || tab.pendingUrl || inventoryLanes.has(tab.id))continue;
+    const epoch=tabEpochs.get(tab.id) || 0;
+    void singleFlight(inventoryLanes,tab.id,async()=>{
+      let result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
+      if(result?.ownershipProtocol!==1 && inventoryUpgrades.get(tab.id)!==epoch) {
+        inventoryUpgrades.set(tab.id,epoch);
+        await chrome.scripting.executeScript({target:{tabId:tab.id},files:contentFiles(provider)});
+        result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
+      }
+      const current=await chrome.tabs.get(tab.id);
+      if((tabEpochs.get(tab.id) || 0)!==epoch || current.status==="loading" || current.pendingUrl ||
+          current.url!==tab.url || result?.url!==tab.url || result?.ownershipProtocol!==1 || result.provider!==provider ||
+          typeof result.jobId!=="string" || typeof result.runId!=="string")return;
+      tabOwners.set(tab.id,{url:tab.url,jobId:result.jobId,provider,runId:result.runId,released:result.released === true});
+    }).catch(()=>{tabOwners.delete(tab.id);});
+  }
+}
+function slotReason(state) {
+  if(state.cleanupDone)return "released";
+  if(state.delivered || state.sourceCapture?.confirmed)return state.cleanupWaitReason || "cleanup_pending";
+  if(state.captureError)return "source_archive_pending";
+  if(state.sourceCapture?.id)return "source_receipt_pending";
+  if(state.formatError || state.observation?.state === "response_completed_json_invalid")return "completed_json_invalid";
+  if(state.outcome)return "result_delivery_pending";
+  if(state.connectionError)return "ownership_or_connection_unknown";
+  return state.started ? "generation_or_observation_pending" : "allocation_pending";
+}
+async function tabCapacityReport(jobs, reservePending = false) {
+  const setting=(await chrome.storage.local.get(["maxReviewTabs"])).maxReviewTabs;
+  const limit=Number.isInteger(setting) && setting>0 ? Math.min(setting,16) : DEFAULT_MAX_REVIEW_TABS;
+  const tabs=await chrome.tabs.query({}), live=new Map(tabs.map(tab=>[tab.id,tab]));
+  const session=await chrome.storage.session.get(null), ids=new Set();
+  const restoring={chatgpt:0,grok:0};let allocating=0,reserved=0;
+  const slots=Object.values(jobs).flatMap(job=>job.providers.map(provider=>({job,provider,state:job.states[provider]})))
+    .filter(({job,provider,state})=>!state.cleanupDone && !session[closedKey(job,provider)]);
+  for(const {job,provider,state} of slots) {
+    const found=tabs.filter(tab=>{const owner=knownTabOwner(tab);return allowedTab(tab,provider) && owner?.jobId===job.jobId && owner.provider===provider &&
+      (!state.runId || !owner.runId || owner.runId===state.runId);});
+    if(found.length){for(const tab of found)ids.add(tab.id);continue;}
+    const tab=live.get(state.tabId);
+    // An allocated-but-not-dispatched tab is still owned even before page binding.
+    if(tab && allowedTab(tab,provider) && (!state.started || !knownTabOwner(tab))){ids.add(tab.id);continue;}
+    if(state.allocating)allocating++;
+    else if(state.started || job.resumeProviders?.includes(provider))restoring[provider]++;
+    else if(reservePending && !state.tabId && !state.delivered && !state.outcome && !job.serverStatus && !job.recoveryError)reserved++;
+  }
+  // An identified but untracked managed tab is NOT a personal tab. Protect/count
+  // it until its matching job is recovered or a secured cleanup releases it.
+  const orphanTabs = tabs.filter(tab=>{
+    const owner=knownTabOwner(tab);
+    if(!owner?.jobId || owner.released || ids.has(tab.id))return false;
+    const registered=jobs[owner.jobId]?.states?.[owner.provider];
+    return !registered?.cleanupDone;
+  });
+  for(const tab of orphanTabs)ids.add(tab.id);
+  let restorationReserved=0;
+  for(const provider of ["chatgpt","grok"]) {
+    const uncertain=tabs.filter(tab=>!ids.has(tab.id) && allowedTab(tab,provider) && !knownTabOwner(tab)).length;
+    restorationReserved+=Math.min(restoring[provider],uncertain);
+  }
+  const unknownReserved=tabs.filter(tab=>!ids.has(tab.id) && (allowedTab(tab,"chatgpt") || allowedTab(tab,"grok")) && !knownTabOwner(tab)).length;
+  // Census uncertainty cannot silently overbook an already running orphan. This
+  // reservation is released by positive unbound/released evidence, never age.
+  const used=ids.size+allocating+reserved+unknownReserved;
+  return {limit,used,unknownReserved,orphanTabs:orphanTabs.length,available:Math.max(0,limit-used),managedTabs:ids.size,reserved:allocating+reserved,
+    restorationReserved,providerTabs:tabs.filter(tab=>allowedTab(tab,"chatgpt") || allowedTab(tab,"grok")).length,
+    unverifiedTabs:tabs.filter(tab=>(allowedTab(tab,"chatgpt") || allowedTab(tab,"grok")) && !knownTabOwner(tab)).length,
+    blockers:[...slots.map(({job,provider,state})=>({jobId:job.jobId,provider,tabId:state.tabId,reason:slotReason(state)})),
+      ...orphanTabs.map(tab=>({jobId:knownTabOwner(tab).jobId,provider:knownTabOwner(tab).provider,tabId:tab.id,reason:"untracked_binding_requires_recovery"}))].slice(0,32)};
+}
 async function tabCapacityAvailable(jobs, reservePending = false) {
-  const setting = (await chrome.storage.local.get(["maxReviewTabs"])).maxReviewTabs;
-  const limit = Number.isInteger(setting) && setting > 0 ? Math.min(setting, 16) : DEFAULT_MAX_REVIEW_TABS;
-  const tabs = await chrome.tabs.query({});
-  const live = new Map(tabs.map(tab => [tab.id, tab]));
-  const session = await chrome.storage.session.get(null);
-  const ids = new Set();
-  const restoring = {chatgpt: 0, grok: 0}, allocating = {chatgpt: 0, grok: 0};
-  let reserved = 0;
-  for (const job of Object.values(jobs)) for (const p of job.providers) {
-    const state = job.states[p];
-    if (state.cleanupDone || session[closedKey(job, p)]) continue;
-    if (state.tabId && live.has(state.tabId) && allowedTab(live.get(state.tabId), p)) {
-      ids.add(state.tabId);
-    } else if (state.allocating) {
-      allocating[p]++;
-    } else if (state.started || job.resumeProviders?.includes(p)) {
-      restoring[p]++; // IDs can change after restart; do not ignore restored tabs.
-    } else if (reservePending && !state.tabId && !state.delivered && !state.outcome &&
-               !job.serverStatus && !job.recoveryError) {
-      reserved++; // An admitted provider awaiting creation already owns admission space.
-    }
-  }
-  let used = ids.size + reserved;
-  for (const p of ["chatgpt", "grok"]) {
-    const unknownTabs = tabs.filter(tab => !ids.has(tab.id) && allowedTab(tab, p)).length;
-    used += allocating[p] + Math.min(restoring[p], Math.max(0, unknownTabs - allocating[p]));
-  }
-  return used < limit;
+  const report=await tabCapacityReport(jobs,reservePending);
+  return report.used < report.limit;
 }
 
 async function allocateProviderTab(job, provider, jobs) {
@@ -453,15 +536,29 @@ async function finishTabCleanup(job, provider, jobs, reason) {
   if (reason) state.cleanupNote = reason;
   delete state.cleanupError;
   await saveJobs(jobs);
+  if(state.sourceCapture?.confirmed) {
+    delete state.sourceCapture.text;
+    delete state.sourceCapture.context;
+    if(state.observation)delete state.observation.text;
+    if(state.formatError && !state.delivered)delete state.outcome;
+    if(state.repairAttempt?.sourceHash===state.sourceCapture.sourceHash)delete state.repairAttempt.text;
+    if(job.providers.every(p=>job.states[p].delivered || job.states[p].sourceCapture?.confirmed)) {
+      delete job.prompt;delete job.prompts;
+    }
+    await saveJobs(jobs); // Only metadata is needed after the full source is secured.
+  }
   await chrome.storage.session.remove([OWNED_PREFIX + state.tabId, closedKey(job, provider)]);
 }
 
 /** Retryable journal: delivered -> cleanupPending -> closed -> cleanupDone.
  * Never delete the last ownership record before remove() has succeeded.
  */
-async function cleanupProvider(job, provider, jobs) {
+function cleanupProvider(job, provider, jobs) {
+  return singleFlight(cleanupLanes,`${job.origin}:${job.jobId}:${provider}`,()=>cleanupProviderBody(job,provider,jobs));
+}
+async function cleanupProviderBody(job, provider, jobs) {
   const state = job.states[provider];
-  if (!state.delivered || state.cleanupDone || state.repairReceiptPending) return;
+  if ((!state.delivered && !state.sourceCapture?.confirmed) || state.cleanupDone || state.repairReceiptPending) return;
   state.cleanupPending = true;
   workerStep(job,provider,"cleanup_pending");
   await saveJobs(jobs);
@@ -486,14 +583,37 @@ async function cleanupProvider(job, provider, jobs) {
     }
     if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
     if (tab.status && tab.status !== "complete") return;
-    const result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider));
+    let result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider));
+    if (matchesJob(result,job,provider) && !result.canClose && result.reason === "pending" && state.sourceCapture?.confirmed) {
+      const saved=state.sourceCapture;
+      // A page reload can lose its in-memory source receipt after the ACK. The
+      // worker still holds the exact full source/context until cleanup completes.
+      const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
+        captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
+      if(matchesJob(restored,job,provider) && restored.code==="capture_source_changed")
+        return finishTabCleanup(job,provider,jobs,"archived response changed; tab preserved");
+      if(matchesJob(restored,job,provider) && restored.accepted)
+        result=await sendToTab(tab.id,tabMessage(job,provider,"ashlar-can-close"),contentFiles(provider));
+    }
+    if (matchesJob(result,job,provider) && !result.canClose && result.reason === "pending" && state.delivered && state.outcome?.ok && state.outcome.completion) {
+      const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-result-saved"),committed:true,
+        raw:state.outcome.raw,text:state.outcome.originalText,completion:state.outcome.completion},contentFiles(provider));
+      if(matchesJob(restored,job,provider) && restored.code === "completion_changed")
+        return finishTabCleanup(job,provider,jobs,"acknowledged response changed; tab preserved");
+      if(matchesJob(restored,job,provider) && restored.accepted)
+        result=await sendToTab(tab.id,tabMessage(job,provider,"ashlar-can-close"),contentFiles(provider));
+    }
     if (!matchesJob(result, job, provider)) {
       state.cleanupError = "tab ownership does not match; no tab was closed";
       await saveJobs(jobs);
       return;
     }
     if (result.reason === "repurposed") return finishTabCleanup(job, provider, jobs, "user continued the conversation; tab preserved");
-    if (!result.canClose) return; // In particular, no deadline for unfinished generations.
+    if (!result.canClose) {
+      state.cleanupWaitReason="page_completion_or_journal_pending";
+      await saveJobs(jobs);return; // No deadline or forced eviction.
+    }
+    delete state.cleanupWaitReason;
     const current = await chrome.tabs.get(tab.id);
     if (current.pendingUrl || current.url !== result.url || current.status === "loading") return;
     state.closeRequested = true;
@@ -537,6 +657,7 @@ async function refreshJobHeartbeat(job, jobs) {
     generating: generatingFor(job), providerErrors: connectionErrors(job), progress: progressFor(job)};
   let result = await api("/api/bridge", body, job.origin);
   job.localJsonRepairEnabled = result.bridge?.localJsonRepairEnabled === true;
+  job.captureProtocol = result.bridge?.captureProtocol === 1 ? 1 : 0;
   if (result.active === false) {
     job.serverStatus = result.status || "unknown";
     await saveJobs(jobs);
@@ -555,7 +676,7 @@ async function refreshJobHeartbeat(job, jobs) {
 
 async function pollProvider(job, provider, jobs, observeOnly = false) {
   const state = job.states[provider];
-  if (state.outcome || state.delivered) return;
+  if (state.outcome || state.delivered || state.sourceCapture?.confirmed) return;
   if (!state.runId) state.runId = crypto.randomUUID();
   // Memory is not a receipt: a previous write may have failed while leaving the
   // shared object mutated. Retry persistence before ANY tab can adopt this runId
@@ -669,7 +790,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   delete state.connectionError;
   if (isBusyResult(result)) return;
   if (result?.ok && typeof result.raw === "string" && result.raw.trim()) {
-    state.outcome = { ok: true, raw: result.raw, originalText:typeof result.responseText==="string"?result.responseText:undefined };
+    state.outcome = { ok: true, raw: result.raw, originalText:typeof result.responseText==="string"?result.responseText:undefined,
+      completion:typeof result.completion?.responseId === "string" && typeof result.completion?.context === "string"
+        ? {responseId:result.completion.responseId,context:result.completion.context} : undefined };
     workerStep(job,provider,"response_collected");
   } else if (result?.code && result.code !== "idle") {
     state.outcome = failure(result.code, String(result.error || "chat review failed"));
@@ -683,13 +806,13 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
 
 async function deliverOutcome(job, provider, jobs) {
   const state = job.states[provider], out = state.outcome;
-  if (!out || state.delivered) return;
+  if (!out || state.delivered || state.sourceCapture?.confirmed) return;
   // A failed outbox write can also leave an outcome in the shared cache. Retry
   // that save before sending it; only the server ACK permits subsequent cleanup.
   workerStep(job, provider, "delivery_pending");
   await saveJobs(jobs);
   const body = out.ok
-    ? {action: "complete", repairProtocol: 1, jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw, originalText: out.originalText}]}
+    ? {action: "complete", repairProtocol: 1, captureProtocol:job.captureProtocol, jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw, originalText: out.originalText}]}
     : {action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}`};
   try { await api("/api/bridge", body, job.origin); }
   catch (e) {
@@ -724,8 +847,26 @@ function repairBody(job, provider, action, attempt) {
   return {action, jobId:job.jobId, leaseId:job.leaseId, provider, runId:job.states[provider].runId,
     repairId:attempt.id, responseId:attempt.responseId, sourceHash:attempt.sourceHash};
 }
-async function readRepairSource(job, provider) {
+async function readRepairSource(job, provider, full = true) {
   const state=job.states[provider];
+  if(state.sourceCapture?.confirmed) {
+    const saved=state.sourceCapture;
+    let text=saved.text;
+    if(full && typeof text!=="string") {
+      const response=await api("/api/bridge",{action:"capture-read",jobId:job.jobId,leaseId:job.leaseId,provider,
+        runId:state.runId,captureId:saved.id,responseId:saved.responseId,sourceHash:saved.sourceHash},job.origin);
+      const item=response.capture;
+      if(item?.id!==saved.id || item.jobId!==job.jobId || item.provider!==provider || item.runId!==state.runId ||
+          item.responseId!==saved.responseId || item.sourceHash!==saved.sourceHash || item.headSha!==saved.headSha ||
+          typeof item.text!=="string" || item.text.length!==saved.totalChars || item.text.length>500_000)return null;
+      const hash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(item.text))))
+        .map(byte=>byte.toString(16).padStart(2,"0")).join("");
+      if(hash!==saved.sourceHash)return null;
+      text=item.text;
+    }
+    return {text,totalChars:saved.totalChars,truncated:false,completed:true,stable:true,
+      responseId:saved.responseId,sourceHash:saved.sourceHash,captureId:saved.id,context:saved.context};
+  }
   if(!state.tabId)return null;
   const result=await sendToTab(state.tabId,tabMessage(job,provider,"ashlar-repair-source"),contentFiles(provider));
   const source=result?.source;
@@ -736,6 +877,45 @@ async function readRepairSource(job, provider) {
   const sourceHash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(source.text))))
     .map(byte=>byte.toString(16).padStart(2,"0")).join("");
   return {...source,sourceHash};
+}
+/** Source-only acknowledgement and final-result acknowledgement are distinct.
+ * Capturing releases a browser resource; it never marks delivered or posts JSON.
+ */
+async function captureProvider(job, provider, jobs) {
+  const state=job.states[provider];
+  if(state.delivered || state.sourceCapture?.confirmed || job.captureProtocol!==1)return;
+  let saved=state.sourceCapture;
+  if(!saved?.id) {
+    if(!state.formatError && state.observation?.state!=="response_completed_json_invalid")return;
+    const source=await readRepairSource(job,provider);
+    if(!source || typeof source.context!=="string")return;
+    await flushProgress(job);
+    if(state.delivered || (state.outcome?.ok && !state.formatError))return;
+    const response=await api("/api/bridge",{action:"capture",jobId:job.jobId,leaseId:job.leaseId,provider,
+      runId:state.runId,responseId:source.responseId,sourceHash:source.sourceHash,source},job.origin);
+    const receipt=response.capture;
+    if(!receipt?.id || receipt.jobId!==job.jobId || receipt.provider!==provider || receipt.runId!==state.runId ||
+        receipt.responseId!==source.responseId || receipt.sourceHash!==source.sourceHash || receipt.totalChars!==source.text.length)return;
+    saved={...source,...receipt,confirmed:false};
+    state.sourceCapture=saved;
+    workerStep(job,provider,"source_archive_saved");
+  }
+  // Retry this durability barrier even when an earlier failure left memory changed.
+  await saveJobs(jobs);
+  if(state.delivered || (state.outcome?.ok && !state.formatError))return;
+  const result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
+    captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
+  if(!matchesJob(result,job,provider))return;
+  if(result.code==="capture_source_changed") {
+    delete state.sourceCapture;await saveJobs(jobs);return; // Old server archive stays immutable.
+  }
+  if(!result.accepted)return;
+  saved.confirmed=true;
+  state.cleanupPending=true;
+  delete state.captureError;
+  workerStep(job,provider,"source_archived");
+  await saveJobs(jobs);
+  await cleanupProvider(job,provider,jobs);
 }
 async function notifyRepairReceipt(job, provider, jobs) {
   const state=job.states[provider], attempt=state.repairAttempt;
@@ -766,7 +946,8 @@ async function acceptRepairReceipt(job, provider, jobs, result) {
      result.sourceHash!==attempt.sourceHash || result.responseId!==attempt.responseId || typeof result.raw!=="string" || !result.raw.trim())return;
   attempt.raw=result.raw;attempt.status="accepted";
   state.outcome={ok:true,raw:result.raw,originalText:attempt.text};
-  state.delivered=true;state.repairReceiptPending=true;state.cleanupPending=true;
+  state.delivered=true;state.repairReceiptPending=!state.sourceCapture?.confirmed;
+  state.cleanupPending=!state.cleanupDone;
   delete state.formatError;delete state.repairError;
   workerStep(job,provider,"result_saved");
   await saveJobs(jobs); // Real server ACK + local receipt before the page is released.
@@ -778,6 +959,9 @@ async function acceptRepairReceipt(job, provider, jobs, result) {
 async function repairProvider(job, provider, jobs) {
   const state=job.states[provider];
   if(state.delivered) {await notifyRepairReceipt(job,provider,jobs);return;}
+  // Capable servers escrow completed sources before formatting, so Local queue
+  // latency or a disabled formatter cannot monopolize browser slots.
+  if(job.captureProtocol===1 && !state.sourceCapture?.confirmed)return;
   let attempt=state.repairAttempt;
   if(attempt?.id) {
     const response=await api("/api/bridge",repairBody(job,provider,"repair-status",attempt),job.origin);
@@ -788,7 +972,7 @@ async function repairProvider(job, provider, jobs) {
     await saveJobs(jobs);
     if(status.status==="accepted")return acceptRepairReceipt(job,provider,jobs,status);
     if (["running","ready"].includes(status.status)) {
-      const current=job.localJsonRepairEnabled ? await readRepairSource(job,provider) : null;
+      const current=job.localJsonRepairEnabled ? await readRepairSource(job,provider,false) : null;
       if (current && (current.sourceHash!==attempt.sourceHash || current.responseId!==attempt.responseId)) {
         // A later completed source is a new repair identity, not a replay of the
         // old inference. Starting it below fences/cancels the obsolete request.
@@ -808,7 +992,8 @@ async function repairProvider(job, provider, jobs) {
   if(!job.localJsonRepairEnabled || state.delivered || (!state.formatError && state.observation?.state!=="response_completed_json_invalid"))return;
   const source=await readRepairSource(job,provider);
   if(!source || (attempt?.sourceHash===source.sourceHash && attempt.responseId===source.responseId && attempt.id))return;
-  state.repairAttempt={sourceHash:source.sourceHash,responseId:source.responseId,text:source.text,status:"prepared"};
+  state.repairAttempt={sourceHash:source.sourceHash,responseId:source.responseId,
+    ...(state.sourceCapture?.confirmed ? {captureId:source.captureId} : {text:source.text}),status:"prepared"};
   attempt=state.repairAttempt;
   await saveJobs(jobs); // Save complete source/intent even when the start reply is lost.
   await flushProgress(job);
@@ -840,7 +1025,7 @@ async function advanceJob(job, jobs) {
   }
   const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
   // Missing is not ACK: observe and preserve the original response without redelivery.
-  if (active && !job.prompt) {
+  if (active && !job.prompt && job.providers.some(p=>!job.states[p].delivered && !job.states[p].sourceCapture?.confirmed)) {
     const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}&attachmentProtocol=2`, undefined, job.origin);
     Object.assign(job, {prompt: current.prompt, prompts: current.prompts});
     await saveJobs(jobs);
@@ -849,6 +1034,11 @@ async function advanceJob(job, jobs) {
     try {
       await pollProvider(job, provider, jobs, !active);
       if (canDeliver) await deliverOutcome(job, provider, jobs);
+      if (job.captureProtocol===1 && !captureLanes.has(`${job.origin}:${job.jobId}:${provider}`)) {
+        void singleFlight(captureLanes,`${job.origin}:${job.jobId}:${provider}`,()=>captureProvider(job,provider,jobs)).catch(()=>{
+          job.states[provider].captureError="Full source archive or receipt pending; tab and original preserved";
+        });
+      }
       if (canDeliver || job.states[provider].repairAttempt?.id) {
         void singleFlight(repairLanes, `${job.origin}:${job.jobId}:${provider}`,
           () => repairProvider(job, provider, jobs)).catch(() => {
@@ -890,8 +1080,41 @@ function progressJob(job, jobs) {
   });
 }
 
+/** Capacity may block new tabs, never recovery of proven existing ones. */
+async function recoverOwnedJob(cfg,jobs) {
+  const health=(await chrome.storage.local.get([HEALTH_KEY]))[HEALTH_KEY];
+  if(health?.origin!==cfg.origin || health.recoveryProtocol!==1)return null;
+  const tabs=await chrome.tabs.query({});
+  const candidates=tabs.flatMap(tab=>{
+    const owner=knownTabOwner(tab);
+    return owner?.jobId && owner.runId && !owner.released && !jobs[owner.jobId]
+      ? [{jobId:owner.jobId,provider:owner.provider,runId:owner.runId,tabId:tab.id}] : [];
+  }).slice(0,16);
+  if(!candidates.length)return null;
+  const result=await api("/api/bridge",{action:"recover",clientId:await clientId(),attachmentProtocol:2,
+    bindings:candidates.map(({jobId,provider,runId})=>({jobId,provider,runId}))},cfg.origin);
+  const incoming=result.job;
+  if(!incoming || jobs[incoming.jobId] || !Array.isArray(incoming.bindings) || !incoming.bindings.length)return null;
+  const bindings=incoming.bindings.filter(binding=>binding.jobId===incoming.jobId &&
+    candidates.some(item=>item.jobId===binding.jobId && item.provider===binding.provider && item.runId===binding.runId));
+  if(bindings.length!==incoming.bindings.length)return null;
+  const providers=[...new Set(bindings.map(item=>item.provider))];
+  const job={...incoming,origin:cfg.origin,providers,resumeProviders:providers,states:{}};
+  for(const binding of bindings) {
+    const candidate=candidates.find(item=>item.jobId===binding.jobId && item.provider===binding.provider && item.runId===binding.runId);
+    // The durable started marker forbids allocate/re-send even if this tab moves.
+    job.states[binding.provider]={runId:binding.runId,tabId:candidate.tabId,started:true};
+  }
+  jobs[job.jobId]=job;
+  await saveJobs(jobs);
+  await recordWorkerStatus(jobs,cfg.origin,"recovered");
+  return job;
+}
+
 function admitJob(cfg, jobs) {
   return singleFlight(admissionLanes, cfg.origin, async () => {
+    const recovered=await recoverOwnedJob(cfg,jobs);
+    if(recovered)return recovered;
     if (!await tabCapacityAvailable(jobs, true)) {
       await recordWorkerStatus(jobs, cfg.origin, "tab_capacity"); return null;
     }
@@ -932,12 +1155,17 @@ async function tickBody() {
   if (!cfg.enabled || !cfg.origin || !cfg.token) return;
   void probeBridge();
   const jobs = await workerJobs(cfg.origin);
+  void refreshTabInventory().catch(()=>{});
   await recordWorkerStatus(jobs, cfg.origin);
   // There is deliberately NO global work lock or "any active job" return. A later
   // wakeup can advance B/admit C even while A's short transport attempt is pending.
-  const work = Object.values(jobs)
+  const work = Object.values(jobs).filter(job=>job.origin===cfg.origin).flatMap(job=>job.providers
+    .filter(provider=>(job.states[provider].delivered || job.states[provider].sourceCapture?.confirmed) && !job.states[provider].cleanupDone &&
+      !cleanupLanes.has(`${job.origin}:${job.jobId}:${provider}`))
+    .map(provider=>cleanupProvider(job,provider,jobs)));
+  work.push(...Object.values(jobs)
     .filter(j => j.origin === cfg.origin && !jobLanes.has(`${j.origin}:${j.jobId}`))
-    .map(job => progressJob(job, jobs));
+    .map(job => progressJob(job, jobs)));
   // Do not add another waiter to an already-running lane on every alarm/timer tick.
   if (!admissionLanes.has(cfg.origin)) {
     work.push(admitJob(cfg, jobs).then(job => job && progressJob(job, jobs)));
@@ -977,6 +1205,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   void heartbeatTick();
   void tick();
   sendResponse({ok: true, scheduled: true});
+});
+chrome.tabs.onUpdated?.addListener((id, change) => {
+  if(change.url || change.status)invalidateTabInventory(id);
 });
 chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
 chrome.runtime.onInstalled.addListener(loop);

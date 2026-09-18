@@ -203,7 +203,7 @@ function currentRepairSource() {
   const tracker = state.running && !tracksSource ? (state.repairProbeTracker ||= {}) : state;
   if (!state.running || !tracksSource) trackCompletedSource(tracker, bound, done, text);
   if (tracker.completedSource?.text !== text || tracker.completedSource.responseId !== bound.responseId) return null;
-  return {text, totalChars:text.length, truncated:false, responseId:bound.responseId, completed:true, stable:true};
+  return {text, totalChars:text.length, truncated:false, responseId:bound.responseId, context:reviewPageContext(), completed:true, stable:true};
 }
 
 /** Repair acceptance does not transfer ownership of a later user conversation.
@@ -228,6 +228,33 @@ function preserveRepairContext(state) {
   return bound;
 }
 
+/** A source archive receipt or native completion proof pins the original
+ * response separately from mutable collector fields. Capture is NOT parsed JSON.
+ */
+function sourceReceiptFor(state) {
+  const value = state?.captureReceipt;
+  return value && value.jobId === state.jobId && value.runId === state.runId && value.provider === state.provider ? value : null;
+}
+function preserveSourceContext(state, receipt) {
+  let bound;
+  try {
+    const submission = state.confirmedSubmission?.record || savedSubmission();
+    if (submission?.phase === "sent") bound = boundReviewResponse(submission);
+  } catch { /* Unknown ownership never authorizes closure. */ }
+  if (!state.tabRepurposed && (!bound?.identified || !bound.root || bound.followup ||
+      bound.responseId !== receipt.responseId || receipt.context !== reviewPageContext() ||
+      assistantCorpus(bound.root).join("\n\n") !== receipt.text)) {
+    state.tabRepurposed = true;
+    recordReviewStep("context_changed");
+  }
+  return bound;
+}
+function nativeCleanupProof(state) {
+  const proof = state.nativeCompletion;
+  return proof?.responseId && proof.jobId === state.jobId && proof.runId === state.runId && proof.provider === state.provider
+    ? {responseId:proof.responseId,context:proof.context} : undefined;
+}
+
 /** A committed receipt is authoritative even if an old invocation later writes
  * its native result/catch/finally into the retained runner object. These fields
  * are separate from the mutable fields known to pre-repair collectors.
@@ -246,6 +273,9 @@ async function waitUntilReviewOrQuota(name) {
   // No poll-count/elapsed-time failure. Controls can appear before response text is
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
+    // The full original was secured, not accepted as a review. The worker owns
+    // further formatting; no page loop or new model request is needed.
+    if (sourceReceiptFor(globalThis.__ashlarRunnerState)) return null;
     if (globalThis.__ashlarRunnerState?.repairedResult) {
       preserveRepairContext(globalThis.__ashlarRunnerState);
       recordReviewStep("repair_accepted");
@@ -280,7 +310,13 @@ async function waitUntilReviewOrQuota(name) {
       const current = JSON.stringify([json, text]);
       hits = stable === current ? hits + 1 : 1; stable = current;
       if (hits >= 2) {
-        if (runner) runner.responseText = text;
+        if (runner) {
+          runner.responseText = text;
+          if (bound?.identified && bound.responseId) runner.nativeCompletion = Object.freeze({
+            jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
+            responseId:bound.responseId,context:reviewPageContext(),text,raw:json,
+          });
+        }
         recordReviewStep("response_collected");
         return json;
       }
@@ -299,6 +335,11 @@ function reviewPageContext() {
     last?.getAttribute("data-message-id") || "", last?.textContent || ""]);
 }
 
+function releaseManagedSlot(state) {
+  state.slotReleased = true;
+  try { sessionStorage.setItem(`ashlar:released:${state.jobId}:${state.runId}`, "true"); } catch { /* Only causes conservative recount on reload. */ }
+}
+
 function installReviewRunner(name, run) {
   let boundJob = "";
   try { boundJob = sessionStorage.getItem("ashlar:job") || ""; } catch { /* unavailable storage */ }
@@ -310,12 +351,19 @@ function installReviewRunner(name, run) {
   if (!state.runId) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
-  if (state.listener && state.protocol === "observed-submission-v5") return;
+  try { state.slotReleased ||= sessionStorage.getItem(`ashlar:released:${state.jobId}:${state.runId}`) === "true"; } catch { /* Unknown remains managed. */ }
+  if (state.listener && state.protocol === "observed-submission-v6") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
-  state.protocol = "observed-submission-v5";
+  state.protocol = "observed-submission-v6";
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation });
   state.listener = (msg, _sender, reply) => {
-    if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close", "ashlar-repair-source", "ashlar-repair-accepted"].includes(msg?.type)) return;
+    // Read-only inventory: never adopt a page, collect a prompt, or start a run.
+    if (msg?.type === "ashlar-tab-status") {
+      reply({ok:true,ownershipProtocol:1,jobId:state.jobId || "",runId:state.runId || "",provider:state.provider,
+        released:Boolean(state.slotReleased),url:globalThis.location?.href || ""});return;
+    }
+    if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close", "ashlar-repair-source", "ashlar-repair-accepted",
+      "ashlar-capture-accepted", "ashlar-result-saved"].includes(msg?.type)) return;
     const respond = reply;
     reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId, progress: reviewProgress()});
     if (!msg.jobId) {
@@ -327,6 +375,53 @@ function installReviewRunner(name, run) {
         (state.runId && msg.runId && msg.runId !== state.runId)) {
       reply({ ok: false, code: "job_mismatch", error: "tab belongs to another job" });
       return;
+    }
+    if (["ashlar-capture-accepted", "ashlar-result-saved"].includes(msg.type)) {
+      if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider || msg.committed !== true) {
+        reply({ok:false,code:"job_mismatch"});return;
+      }
+      if (msg.type === "ashlar-capture-accepted") {
+        const receipt = sourceReceiptFor(state);
+        if (receipt) {
+          preserveSourceContext(state,receipt);
+          reply(receipt.id === msg.captureId && receipt.responseId === msg.responseId && receipt.text === msg.text && receipt.context === msg.context
+            ? {ok:true,accepted:true} : {ok:false,code:"capture_source_changed"});return;
+        }
+        const source = currentRepairSource();
+        if (!source) {reply({ok:false,code:"capture_source_unavailable"});return;}
+        if (!msg.captureId || typeof msg.context !== "string") {reply({ok:false,code:"capture_source_changed"});return;}
+        if (source.responseId !== msg.responseId || source.text !== msg.text) {
+          // The worker secured its original elsewhere. The replacement is user-owned.
+          releaseManagedSlot(state);
+          reply({ok:false,code:"capture_source_changed"});return;
+        }
+        state.captureReceipt = Object.freeze({id:msg.captureId,jobId:state.jobId,runId:state.runId,provider:state.provider,
+          responseId:source.responseId,text:source.text,context:msg.context});
+        preserveSourceContext(state,state.captureReceipt);
+        recordReviewStep("source_archived");
+        reply({ok:true,accepted:true});return;
+      }
+      // Restore only a previously collected+ACKed exact response, not another run
+      // or a new DOM result selected just because it happens to be the newest.
+      let submission;
+      try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { /* preserved */ }
+      const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : null;
+      if (!bound?.identified || !bound.root || !replyDoneVisible(bound.root) || stopButtonVisible() || responseStreaming(bound.root)) {
+        reply({ok:false,code:"completion_unavailable"});return;
+      }
+      const proof=msg.completion;
+      if (!proof?.responseId || typeof proof.context !== "string" || typeof msg.text !== "string" ||
+          typeof msg.raw !== "string" || !extractChatJson(msg.raw) || extractChatJson(msg.raw) !== extractChatJson(msg.text) || bound.followup ||
+          bound.responseId !== proof.responseId || proof.context !== reviewPageContext() || assistantCorpus(bound.root).join("\n\n") !== msg.text) {
+        releaseManagedSlot(state);
+        reply({ok:false,code:"completion_changed"});return;
+      }
+      state.nativeCompletion = Object.freeze({jobId:state.jobId,provider:state.provider,runId:state.runId,
+        responseId:proof.responseId,context:proof.context,text:msg.text,raw:msg.raw});
+      state.restoredCompletion = true;
+      state.finishedContext = proof.context;
+      state.result = {ok:true,raw:msg.raw,responseText:msg.text,completion:nativeCleanupProof(state)};
+      recordReviewStep("cleanup_restored");reply({ok:true,accepted:true});return;
     }
     if (["ashlar-repair-source", "ashlar-repair-accepted"].includes(msg.type)) {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider) {
@@ -375,15 +470,21 @@ function installReviewRunner(name, run) {
       // Final authorization must recheck the assistant, not just URL/user turns.
       // A cached result can outlive its collector and the displayed response.
       const repaired = repairedCollectionResult(state);
-      const bound = (repaired || state.repairedResult) ? preserveRepairContext(state) : undefined;
-      const context = repaired ? state.repairReceipt.context : state.finishedContext;
-      const pending = (!repaired && state.running) || !(repaired || state.result) || !context || state.submissionPersistencePending;
+      const captured = sourceReceiptFor(state);
+      const native = nativeCleanupProof(state) ? state.nativeCompletion : undefined;
+      const bound = (repaired || state.repairedResult) ? preserveRepairContext(state)
+        : captured || native ? preserveSourceContext(state,captured || native) : undefined;
+      const context = repaired ? state.repairReceipt.context : captured?.context || native?.context || state.finishedContext;
+      const pending = (!repaired && !captured && !state.restoredCompletion && state.running) ||
+        !(repaired || captured || state.result) || !context || state.submissionPersistencePending;
       const unchanged = !state.tabRepurposed && context === reviewPageContext();
       const busyNow = (typeof stopButtonVisible === "function" && stopButtonVisible()) ||
-        Boolean(bound?.root && typeof responseStreaming === "function" && responseStreaming(bound.root));
+        Boolean(bound?.root && typeof responseStreaming === "function" && responseStreaming(bound.root)) ||
+        Boolean((captured || native) && bound?.root && !replyDoneVisible(bound.root));
       // User follow-ups/navigation transfer the tab back to the user. Do not close it.
       const draft = typeof composer === "function" && globalThis.document ? composer() : null;
       const hasDraft = Boolean(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
+      if (!pending && (!unchanged || hasDraft)) releaseManagedSlot(state);
       reply({ok: true, canClose: !pending && unchanged && !busyNow && !hasDraft,
         reason: pending ? "pending" : !unchanged || hasDraft ? "repurposed" : busyNow ? "pending" : "complete",
         url: globalThis.location?.href || ""});
@@ -391,6 +492,10 @@ function installReviewRunner(name, run) {
     }
     const repaired = repairedCollectionResult(state);
     if (repaired) { reply(repaired); return; }
+    if (sourceReceiptFor(state)) {reply({ok:false,code:"captured",observation:{state:"source_archived"}});return;}
+    if (state.restoredCompletion && state.nativeCompletion) {
+      reply({ok:true,raw:state.nativeCompletion.raw,responseText:state.nativeCompletion.text,completion:nativeCleanupProof(state)});return;
+    }
     if (state.result) { reply(state.result); return; }
     if (state.running) { reply(busy()); return; }
     if (msg.type === "ashlar-harvest") {
@@ -407,6 +512,8 @@ function installReviewRunner(name, run) {
     try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
     try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
+    state.nativeCompletion = undefined;
+    state.restoredCompletion = false;
     state.sourceTrackingOwner = undefined;
     state.repairProbeTracker = undefined;
     state.repairReceipt = undefined;
@@ -418,9 +525,10 @@ function installReviewRunner(name, run) {
     state.repairedResponseId = undefined;
     Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
       .then(raw => {
+        if (sourceReceiptFor(state)) return; // Captured original is not parsed JSON.
         if (state.repairedResult) preserveRepairContext(state);
-        state.finishedContext = state.repairedContext || reviewPageContext();
-        state.result = { ok: true, raw, responseText: state.responseText };
+        state.finishedContext = state.repairedContext || state.nativeCompletion?.context || reviewPageContext();
+        state.result = { ok: true, raw, responseText: state.responseText, completion:nativeCleanupProof(state) };
       })
       .catch(e => {
         recordReviewStep(e?.code === "quota" ? "quota" : "error");

@@ -1,3 +1,4 @@
+import type {WorkerStatus} from "./bridge-worker-status";
 import { create } from "zustand";
 import {
   CANDIDATE_412_DROPPED,
@@ -31,6 +32,8 @@ type FireOpts = {
 export type FireResult = { httpStatus: 202 | 403; skip?: string; reject?: string; jobId?: string };
 
 export type BridgeReady = {
+  workerStatus?: WorkerStatus;
+  workerStatusFresh?: boolean;
   connected: boolean;
   lastSeen: number;
   lastJobId?: string;

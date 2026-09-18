@@ -57,7 +57,7 @@ Not a clean pass — remaining reviewers did not run.`;
     const cov = job.coverage ?? [];
     const clearedCount = cov.filter((c) => c.status === "cleared").length;
     const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
-    return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->`;
+    return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->`;
   }
   const unanchoredBlock = unanchored.length
     ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored
@@ -95,5 +95,6 @@ Inline comments use P0 / P1 / P2 badges. Failures in one reviewer are skipped; r
 </details>
 
 — ${username}
+<!-- ashlar-findings total=${findings.length} inline=${findings.length - unanchored.length} body=${unanchored.length} p0=${n.P0} p1=${n.P1} p2=${n.P2} -->
 `;
 }

@@ -107,6 +107,7 @@ describe("poster", () => {
     assert.equal(mentioned.body.split("\n")[0], "Didn't find any major issues.");
     assert.match(mentioned.body, /Didn.t find any major issues/);
     assert.match(mentioned.body, /Reviewed commit:/);
+    assert.match(mentioned.body, /ashlar-findings total=0/);
   });
 
   it("drops findings whose file is not in changedPaths", () => {
@@ -150,6 +151,8 @@ describe("poster", () => {
     assert.doesNotMatch(review.body, /Didn.t find any major issues/);
     assert.match(review.body, /without an inline anchor/i);
     assert.match(review.body, new RegExp(far.title));
+    // Machine-readable marker so a consumer that only counts inline comments still sees the finding.
+    assert.match(review.body, /ashlar-findings total=1 inline=0 body=1/);
   });
 
   it("caps inline comments at maxInlineComments including zero", () => {

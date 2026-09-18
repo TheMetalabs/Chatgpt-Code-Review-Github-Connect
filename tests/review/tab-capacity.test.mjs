@@ -59,3 +59,48 @@ test('released matching job tab does not consume managed capacity while server-s
  assert.equal(await b.context.tabCapacityAvailable({A:job},true),true);
  assert.equal(b.closedTabs.length,0,'released user tab must remain open');
 });
+
+
+test('late sibling binding merges into an already recovered job without replacement generation',async()=>{
+ const tabs=new Map([[10,{id:10,url:'https://chatgpt.com/c/A',status:'complete'}]]);
+ let recoveries=0;
+ const b=background({local:storage({origin:'http://bridge',token:'token','ashlar:client':'client-A',
+   bridgeHealth:{origin:'http://bridge',ok:true,recoveryProtocol:1},pendingReviewJobs:{}}),tabs,
+  handler:(id,msg)=>{
+   const tab=tabs.get(id);
+   if(msg.type==='ashlar-tab-status')return {ok:true,ownershipProtocol:1,jobId:'A',provider:id===10?'chatgpt':'grok',
+     runId:id===10?'run-chat':'run-grok',released:false,url:tab.url};
+   if(msg.type==='ashlar-harvest')return {ok:false,code:'busy',retry:true,observation:{state:'generating_or_queued'}};
+   return {ok:false,code:'busy',retry:true};
+  },
+  api:async(_path,body)=>{
+   if(body.action==='recover'){
+    recoveries++;
+    const bindings=body.bindings.filter(x=>x.jobId==='A');
+    const providers=bindings.map(x=>x.provider);
+    return {ok:true,job:{jobId:'A',leaseId:'lease-'+recoveries,provider:providers[0],providers,resumeProviders:providers,
+      bindings,prompt:'review',reasoning:{chatgpt:'standard',grok:'standard'},title:'A',owner:'o',repo:'r',pr:1}};
+   }
+   if(body.action==='ping')return {ok:true,accepted:true,active:true,bridge:{captureProtocol:1,localJsonRepairEnabled:false}};
+   return {ok:true,active:true,accepted:true};
+  }});
+ const jobs=await b.context.workerJobs('http://bridge');
+ await b.context.refreshTabInventory();for(let i=0;i<4;i++)await flush();
+ const first=await b.context.recoverOwnedJob({origin:'http://bridge',token:'token',enabled:true},jobs);
+ assert.deepEqual([...first.providers],['chatgpt']);assert.equal(first.states.chatgpt.tabId,10);
+
+ tabs.set(11,{id:11,url:'https://grok.com/c/A',status:'complete'});
+ await b.context.refreshTabInventory();for(let i=0;i<4;i++)await flush();
+ const second=await b.context.recoverOwnedJob({origin:'http://bridge',token:'token',enabled:true},jobs);
+ assert.equal(second,first,'late binding should merge into the existing local job object');
+ assert.deepEqual([...second.providers].sort(),['chatgpt','grok']);
+ assert.equal(second.states.grok.runId,'run-grok');assert.equal(second.states.grok.tabId,11);
+ assert.equal(second.leaseId,'lease-2','all recovered legs must use the renewed server lease');
+ assert.equal(recoveries,2);
+
+ await b.context.progressJob(second,jobs);await flush();
+ assert.ok(b.messages.some(m=>m.id===10&&m.type==='ashlar-harvest'));
+ assert.ok(b.messages.some(m=>m.id===11&&m.type==='ashlar-harvest'));
+ assert.equal(b.messages.some(m=>m.type==='ashlar-run'&&!m.resume),false);
+ assert.equal(b.tabs.size,2,'recovery must not allocate a replacement tab');
+});

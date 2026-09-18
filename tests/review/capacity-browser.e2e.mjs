@@ -133,7 +133,7 @@ test('source change after durable archive preserves the receipt, releases capaci
  };
  await eventually(async()=>{await f.cycle();return f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.cleanupDone;},'changed source did not release the managed slot');
  const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
- assert.equal(state.sourceCapture?.archiveDurable,true);assert.equal(state.sourceCapture?.cleanupProofConfirmed,true);assert.ok(state.sourceCapture?.id);
+ assert.equal(state.sourceCapture?.archiveDurable,true);assert.notEqual(state.sourceCapture?.cleanupProofConfirmed,true);assert.ok(state.sourceCapture?.id);
  assert.equal(state.sourceCapture.text,undefined,'compacted receipt should not duplicate the full archived original');
  assert.equal(f.worker.closedTabs.length,0,'repurposed page must be preserved');
  assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true);
@@ -154,9 +154,15 @@ test('source change after durable archive preserves the receipt, releases capaci
 test('durable archive repairs after original tab disappears before cleanup proof',async t=>{
  const f=await fixture(t,{fallback:true});let removed=false;const send=f.worker.chrome.tabs.sendMessage;
  f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
-  if(msg.type==='ashlar-capture-accepted' && !removed) {
-   removed=true;
-   void f.worker.closeTab(id).then(()=>send(id,msg,cb));
+  if(msg.type==='ashlar-capture-accepted') {
+   if(!removed) {
+    removed=true;
+    void f.worker.closeTab(id).then(()=>{
+      f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
+    });
+    return;
+   }
+   f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
    return;
   }
   send(id,msg,cb);

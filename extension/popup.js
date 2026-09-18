@@ -98,7 +98,7 @@ async function updaterRequest(path,options={}) {
   return body;
 }
 async function acquireMaintenance(mode) {
-  const id=crypto.randomUUID();
+  const id=globalThis.crypto?.randomUUID?.() || `maintenance-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const result=await chrome.runtime.sendMessage({type:"ashlar-maintenance-acquire",id,mode});
   if(!result?.ok)throw new Error(result?.error||"Could not acquire extension maintenance lock");
   if(!result.safe){await chrome.runtime.sendMessage({type:"ashlar-maintenance-release",id}).catch(()=>{});throw new Error(result.reason||"Review work is still active");}

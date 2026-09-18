@@ -19,9 +19,10 @@ describe("review-format", () => {
   });
 
   it("uses a Codex-style summary for zero and non-zero findings", () => {
-    const empty = reviewSummaryBody({ headSha: "bd663b721d", reviewProviders: ["chatgpt", "grok"], assumptions: [] }, [], "ashlar-bot");
-    assert.equal(empty, CLEAN_REVIEW_BODY);
-    assert.equal(empty, "Didn't find any major issues.");
+    const empty = reviewSummaryBody({ headSha: "bd663b721d", reviewProviders: ["chatgpt", "grok"], assumptions: [], coverage: [] }, [], "ashlar-bot");
+    assert.equal(empty.split("\n")[0], CLEAN_REVIEW_BODY);
+    assert.match(empty, /Didn.t find any major issues/);
+    assert.match(empty, /Reviewed commit: `bd663b7`/);
     assert.doesNotMatch(empty, /Codex/);
     const partial = reviewSummaryBody(
       {
@@ -37,5 +38,23 @@ describe("review-format", () => {
     const full = reviewSummaryBody({ headSha: "bd663b721d", reviewProviders: ["chatgpt", "grok", "local"], assumptions: [] }, [FINDING_412], "ashlar-bot");
     assert.match(full, /Here are some automated review suggestions/);
     assert.match(full, /\| P1 \| 1 \|/);
+  });
+
+  it("clean body keeps the first line, adds reviewed sha and a coverage comment", () => {
+    const clean = reviewSummaryBody(
+      {
+        headSha: "abcdef012345",
+        reviewProviders: ["chatgpt"],
+        assumptions: [],
+        coverage: [{ file: "a.ts", status: "cleared", reason: "" }, { file: "b.ts", status: "not_cleared", reason: "unverified" }],
+      },
+      [],
+      "ashlar-bot",
+    );
+    // Loop poller does a partial match on the first line — must stay byte-identical.
+    assert.equal(clean.split("\n")[0], CLEAN_REVIEW_BODY);
+    assert.match(clean, /Didn.t find any major issues/);
+    assert.match(clean, /Reviewed commit: `abcdef0`/);
+    assert.match(clean, /<!-- ashlar-coverage cleared=1\/2 not_cleared=b\.ts -->/);
   });
 });

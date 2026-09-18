@@ -8,6 +8,7 @@ const DEFAULT_MAX_REVIEW_TABS = 4;
 const HEARTBEAT_MS = 10_000;
 const HEALTH_KEY = "bridgeHealth";
 const WORKER_STATUS_KEY = "bridgeWorkerStatus";
+const MAINTENANCE_KEY = "extensionMaintenance";
 
 // Locks are ephemeral; identities, replies and allocation intent remain in storage.
 // All lanes share one loaded registry, so concurrent jobs never write stale maps.
@@ -28,6 +29,7 @@ let registryPromise;
 let clientPromise;
 let storageTail = Promise.resolve();
 let allocationTail = Promise.resolve();
+let maintenanceTail = Promise.resolve();
 
 function singleFlight(lanes, key, operation) {
   if (lanes.has(key)) return lanes.get(key);
@@ -48,6 +50,12 @@ async function joinLanes(promises) {
 function writeInOrder(operation) {
   const pending = storageTail.then(operation);
   storageTail = pending.catch(() => {}); // A failed write must not poison later retries.
+  return pending;
+}
+
+function maintenanceInOrder(operation) {
+  const pending = maintenanceTail.then(operation);
+  maintenanceTail = pending.catch(() => {}); // Keep later maintenance transitions usable after a failure.
   return pending;
 }
 
@@ -512,11 +520,17 @@ async function tabCapacityAvailable(jobs, reservePending = false) {
   return report.used < report.limit;
 }
 
+async function maintenanceState() {
+  const state=(await chrome.storage.local.get([MAINTENANCE_KEY]))[MAINTENANCE_KEY];
+  return state?.active===true && typeof state.id==="string" ? state : null;
+}
+async function maintenanceHeld() { return Boolean(await maintenanceState()); }
+
 async function allocateProviderTab(job, provider, jobs) {
   // Serialize only the short capacity/create boundary, never model or bridge RPCs.
   const operation = allocationTail.then(async () => {
     const state = job.states[provider];
-    if (state.tabId || state.allocating || !await tabCapacityAvailable(jobs)) return;
+    if (state.tabId || state.allocating || await maintenanceHeld() || !await tabCapacityAvailable(jobs)) return;
     state.allocating = true;
     try { await saveJobs(jobs); }
     catch (error) { delete state.allocating; throw error; } // No create was attempted.
@@ -1208,6 +1222,10 @@ async function recoverOwnedJob(cfg,jobs) {
 
 function admitJob(cfg, jobs) {
   return singleFlight(admissionLanes, cfg.origin, async () => {
+    if (await maintenanceHeld()) {
+      await recordWorkerStatus(jobs, cfg.origin, "maintenance");
+      return null;
+    }
     const recovered=await recoverOwnedJob(cfg,jobs);
     if(recovered)return recovered;
     if (!await tabCapacityAvailable(jobs, true)) {
@@ -1285,6 +1303,59 @@ async function heartbeatTick() {
   } catch (error) { await chrome.storage.local.set({lastError: String(error.message || error).slice(0, 240)}); }
 }
 
+async function maintenanceSnapshot(id) {
+  const cfg=await settings();
+  const jobs=cfg.origin ? await workerJobs(cfg.origin) : {};
+  await Promise.allSettled([...admissionLanes.values(), allocationTail]);
+  const current=await maintenanceState();
+  if(!current || current.id!==id)return {ok:false,error:"maintenance lock lost"};
+  const capacity=await tabCapacityReport(jobs,true);
+  const pendingCleanup=Object.values(jobs).filter(job=>!cfg.origin || job.origin===cfg.origin)
+    .reduce((n,job)=>n+job.providers.filter(p=>(job.states[p].delivered || sourceArchiveDurable(job.states[p])) && !job.states[p].cleanupDone).length,0);
+  if(cfg.origin)await recordWorkerStatus(jobs,cfg.origin,"maintenance");
+  const safe=capacity.used===0 && pendingCleanup===0;
+  return {ok:true,safe,capacity,pendingCleanup,reason:safe?"safe to reload":
+    capacity.used>0?`managed review capacity is ${capacity.used}/${capacity.limit}`:`${pendingCleanup} cleanup operation(s) still pending`};
+}
+async function acquireMaintenance(id,mode) {
+  if(typeof id!=="string" || !id || !["update","rollback","reload"].includes(mode))return {ok:false,error:"invalid maintenance request"};
+  const acquired=await maintenanceInOrder(async()=>{
+    const existing=await maintenanceState();
+    if(existing && existing.id!==id)return {ok:false,error:"another extension maintenance operation is active"};
+    if(!existing)await chrome.storage.local.set({[MAINTENANCE_KEY]:{active:true,id,mode,phase:"locked",requestedAt:Date.now()}});
+    return {ok:true};
+  });
+  if(!acquired.ok)return acquired;
+  return maintenanceSnapshot(id);
+}
+async function releaseMaintenance(id) {
+  return maintenanceInOrder(async()=>{
+    const current=await maintenanceState();
+    if(current?.id===id)await chrome.storage.local.remove([MAINTENANCE_KEY]);
+    return {ok:true};
+  });
+}
+async function commitMaintenanceReload(id) {
+  const current=await maintenanceState();
+  if(!current || current.id!==id)return {ok:false,error:"maintenance lock lost"};
+  const snapshot=await maintenanceSnapshot(id);
+  if(!snapshot.safe)return snapshot;
+  const committed=await maintenanceInOrder(async()=>{
+    const latest=await maintenanceState();
+    if(!latest || latest.id!==id)return {ok:false,error:"maintenance lock lost"};
+    await chrome.storage.local.set({[MAINTENANCE_KEY]:{...latest,phase:"reload_ready",committedAt:Date.now()}});
+    return {ok:true};
+  });
+  if(!committed.ok)return committed;
+  return {...snapshot,committed:true};
+}
+async function clearCommittedMaintenanceOnWorkerStart() {
+  await maintenanceInOrder(async()=>{
+    const current=await maintenanceState();
+    if(current?.phase==="reload_ready")await chrome.storage.local.remove([MAINTENANCE_KEY]);
+  });
+}
+
 function loop() {
   chrome.alarms.create("ashlar-poll", { periodInMinutes: 1 });
   void heartbeatTick();
@@ -1295,11 +1366,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); }
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== "ashlar-poll-now") return;
-  void probeBridge();
-  void heartbeatTick();
-  void tick();
-  sendResponse({ok: true, scheduled: true});
+  if (message?.type === "ashlar-poll-now") {
+    void probeBridge(); void heartbeatTick(); void tick();
+    sendResponse({ok:true,scheduled:true}); return;
+  }
+  if (message?.type === "ashlar-maintenance-acquire") {
+    void acquireMaintenance(message.id,message.mode).then(sendResponse,error=>sendResponse({ok:false,error:String(error?.message||error)})); return true;
+  }
+  if (message?.type === "ashlar-maintenance-release") {
+    void releaseMaintenance(message.id).then(sendResponse,error=>sendResponse({ok:false,error:String(error?.message||error)})); return true;
+  }
+  if (message?.type === "ashlar-maintenance-commit") {
+    void commitMaintenanceReload(message.id).then(sendResponse,error=>sendResponse({ok:false,error:String(error?.message||error)})); return true;
+  }
 });
 chrome.tabs.onUpdated?.addListener((id, change) => {
   if(change.url || change.status)invalidateTabInventory(id);
@@ -1307,6 +1386,7 @@ chrome.tabs.onUpdated?.addListener((id, change) => {
 chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
 chrome.runtime.onInstalled.addListener(loop);
 chrome.runtime.onStartup.addListener(loop);
+void clearCommittedMaintenanceOnWorkerStart();
 loop();
 setInterval(() => void tick(), POLL_MS);
 

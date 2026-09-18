@@ -41,6 +41,7 @@ async function fixture(t,{fallback=true,text=invalid}={}){
 test('completed malformed source frees the only tab slot before Local finishes, then repairs without a tab',async t=>{
  const f=await fixture(t);const next=f.app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'next-pr',event:'issue_comment',payload:{action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:2,pull_request:{},title:'second PR'},comment:{id:43,body:'@ashlar-bot review'}}});await eventually(()=>f.app.harbor.getHarbor().jobs.find(j=>j.id===next.jobId)?.status==='awaiting_chat','next not ready');
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.includes(10);},'completed source held a tab while Local is pending');
+ await eventually(async()=>{await f.cycle();return f.app.localRequests.length===1;},'archived source did not start Local repair after releasing the tab');
  assert.equal(f.app.reviews.length,0);assert.equal(f.app.localRequests.length,1);assert.equal(await f.page.evaluate(()=>clicks),0);
  assert.equal(f.app.history.getJob(f.job.jobId,true).captures[0].text,invalid);
  assert.equal(f.worker.local.state.pendingReviewJobs[f.job.jobId].prompt,undefined,'browserless backlog must not retain full review prompts');
@@ -322,4 +323,65 @@ test('popup displays capacity breakdown and persists only an explicit valid tab 
  await page.locator('#maxReviewTabs').fill('0');await page.locator('#save').click();assert.equal(await page.evaluate(()=>writes),0);
  await page.locator('#maxReviewTabs').fill('6');await page.locator('#save').click();assert.equal(await page.evaluate(()=>saved.maxReviewTabs),6);
  assert.equal(await page.evaluate(()=>saved.enabled),true);
+});
+
+
+test('popup updater uses configured port and maintenance lock through reload',async t=>{
+ const page=await browser.newPage();t.after(()=>page.close());
+ await page.setContent(source('extension/popup.html').replace('<script src="popup.js"></script>',''));
+ await page.evaluate(()=>{
+  window.saved={origin:'https://fixture.test',token:'private',enabled:true,maxReviewTabs:4,extensionUpdaterPort:19090,
+    bridgeWorkerStatus:{origin:'https://fixture.test',checkedAt:Date.now(),phase:'idle',admissionPhase:'idle',activeJobs:0,pendingCleanup:0,sourceCaptured:0,
+      capacity:{limit:4,used:0,managedTabs:0,providerTabs:0,reserved:0,restorationReserved:0,unknownReserved:0,unverifiedTabs:0,orphanTabs:0,blockers:[]}}};
+  window.events=[];window.reloads=0;
+  window.fetch=async url=>{
+    events.push('fetch:'+url);
+    const pathname=new URL(url).pathname;
+    if(pathname==='/status')return {ok:true,status:200,json:async()=>({ok:true,installedVersion:'1.1.21',availableVersion:'1.1.22',availableCommit:'new-commit',updateAvailable:true,backupAvailable:false})};
+    if(pathname==='/update')return {ok:true,status:200,json:async()=>({ok:true,updated:true,fromVersion:'1.1.21',toVersion:'1.1.22',commit:'new-commit'})};
+    throw Error('unexpected '+pathname);
+  };
+  window.chrome={runtime:{getManifest:()=>({version:'1.1.21'}),reload:()=>{events.push('reload');reloads++;},
+    sendMessage:async msg=>{events.push('msg:'+msg.type);if(msg.type==='ashlar-maintenance-acquire')return {ok:true,safe:true,capacity:{used:0,limit:4},pendingCleanup:0};if(msg.type==='ashlar-maintenance-commit')return {ok:true,safe:true,committed:true};return {ok:true};}},
+    permissions:{request:async()=>true},
+    storage:{local:{get:async keys=>Object.fromEntries((Array.isArray(keys)?keys:Object.keys(saved)).filter(k=>k in saved).map(k=>[k,saved[k]])),set:async value=>Object.assign(saved,value)},onChanged:{addListener(){}}}};
+ });
+ await page.addScriptTag({content:source('extension/popup.js')});await page.waitForTimeout(30);
+ assert.match(await page.locator('#updateStatus').textContent(),/19090/);
+ await page.locator('#applyUpdate').click();await page.waitForTimeout(180);
+ const events=await page.evaluate(()=>window.events);
+ assert.ok(events.includes('fetch:http://127.0.0.1:19090/update'));
+ assert.ok(events.indexOf('msg:ashlar-maintenance-acquire')<events.indexOf('fetch:http://127.0.0.1:19090/update'));
+ assert.ok(events.indexOf('msg:ashlar-maintenance-commit')<events.indexOf('reload'));
+ assert.equal(await page.evaluate(()=>reloads),1);
+});
+
+
+test('fresh popup recovers an abandoned interrupted maintenance operation without clearing storage manually',async t=>{
+ const page=await browser.newPage();t.after(()=>page.close());
+ await page.setContent(source('extension/popup.html').replace('<script src="popup.js"></script>',''));
+ await page.evaluate(()=>{
+  window.saved={origin:'https://fixture.test',token:'private',enabled:true,maxReviewTabs:4,extensionUpdaterPort:19090,
+   extensionMaintenance:{active:true,id:'lost-maint',mode:'update',phase:'locked'},
+   bridgeWorkerStatus:{origin:'https://fixture.test',checkedAt:Date.now(),phase:'idle',admissionPhase:'maintenance',activeJobs:0,pendingCleanup:0,sourceCaptured:0,
+    capacity:{limit:4,used:0,managedTabs:0,providerTabs:0,reserved:0,restorationReserved:0,unknownReserved:0,unverifiedTabs:0,orphanTabs:0,blockers:[]}}};
+  window.events=[];window.reloads=0;
+  window.fetch=async url=>{
+   events.push('fetch:'+url);
+   const parsed=new URL(url);
+   if(parsed.pathname==='/operation')return {ok:true,status:200,json:async()=>({ok:true,operation:{id:'lost-maint',mode:'update',phase:'interrupted',ok:false,error:'helper restarted'}})};
+   if(parsed.pathname==='/status')return {ok:true,status:200,json:async()=>({ok:true,installedVersion:'1.1.21',availableVersion:'1.1.22',availableCommit:'new-commit',updateAvailable:true,backupAvailable:false})};
+   throw Error('unexpected '+parsed.pathname);
+  };
+  window.chrome={runtime:{id:'abcdefghijklmnopabcdefghijklmnop',getManifest:()=>({version:'1.1.21'}),reload:()=>{reloads++;},
+   sendMessage:async msg=>{events.push('msg:'+msg.type);if(msg.type==='ashlar-maintenance-release'){delete saved.extensionMaintenance;return {ok:true};}return {ok:true};}},
+   permissions:{request:async()=>true},
+   storage:{local:{get:async keys=>Object.fromEntries((Array.isArray(keys)?keys:Object.keys(saved)).filter(k=>k in saved).map(k=>[k,saved[k]])),set:async value=>Object.assign(saved,value)},onChanged:{addListener(){}}}};
+ });
+ await page.addScriptTag({content:source('extension/popup.js')});await page.waitForTimeout(80);
+ const state=await page.evaluate(()=>({events,saved,reloads}));
+ assert.ok(state.events.some(e=>e.includes('/operation?id=lost-maint')));
+ assert.ok(state.events.includes('msg:ashlar-maintenance-release'));
+ assert.equal(state.saved.extensionMaintenance,undefined);
+ assert.equal(state.reloads,0);
 });

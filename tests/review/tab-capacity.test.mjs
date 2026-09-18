@@ -104,3 +104,39 @@ test('late sibling binding merges into an already recovered job without replacem
  assert.equal(b.messages.some(m=>m.type==='ashlar-run'&&!m.resume),false);
  assert.equal(b.tabs.size,2,'recovery must not allocate a replacement tab');
 });
+
+
+test('maintenance lock blocks new admission and tab allocation until released',async()=>{
+ const job={jobId:'A',origin:'http://bridge',leaseId:'lease-A',prompt:'review',providers:['chatgpt'],states:{chatgpt:{}}};
+ let takes=0;
+ const local=storage({origin:'http://bridge',token:'token',maxReviewTabs:1,
+   extensionMaintenance:{active:true,id:'maint-1',mode:'update',phase:'locked'},pendingReviewJobs:{A:job}});
+ const b=background({local,tabs:new Map(),api:async(_path,body)=>{
+   if(body.action==='take'){takes++;return {ok:true,job:{jobId:'NEW',provider:'chatgpt',providers:['chatgpt'],leaseId:'L'}};}
+   return {ok:true,active:true,accepted:true,bridge:{captureProtocol:1,localJsonRepairEnabled:false}};
+ }});
+ const jobs=await b.context.workerJobs('http://bridge');
+ assert.equal(await b.context.admitJob({origin:'http://bridge',token:'token',enabled:true},jobs),null);
+ await b.context.allocateProviderTab(job,'chatgpt',jobs);
+ assert.equal(takes,0);
+ assert.equal(b.tabs.size,0);
+ assert.equal(b.local.state.bridgeWorkerStatus.admissionPhase,'maintenance');
+ await b.context.releaseMaintenance('maint-1');
+ assert.equal(b.local.state.extensionMaintenance,undefined,'supported release must clear the durable maintenance lock');
+ await b.context.allocateProviderTab(job,'chatgpt',jobs);
+ assert.equal(b.tabs.size,1);
+});
+
+
+test('concurrent maintenance acquisition grants exactly one owner',async()=>{
+ const local=storage({origin:'http://bridge',token:'token',maxReviewTabs:1,pendingReviewJobs:{}});
+ const b=background({local,tabs:new Map()});
+ const [a,bid]=await Promise.all([
+   b.context.acquireMaintenance('maint-A','update'),
+   b.context.acquireMaintenance('maint-B','rollback'),
+ ]);
+ assert.equal([a,bid].filter(result=>result.ok).length,1);
+ assert.equal([a,bid].filter(result=>!result.ok && /another extension maintenance operation is active/.test(result.error)).length,1);
+ const winner=a.ok?'maint-A':'maint-B';
+ assert.equal(local.state.extensionMaintenance.id,winner);
+});

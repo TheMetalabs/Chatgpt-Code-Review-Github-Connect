@@ -15,6 +15,9 @@
     <label for="maxReviewTabs">Managed review tab limit (1–16)</label>
     <input id="maxReviewTabs" type="number" min="1" max="16" step="1" value="4" />
     <p class="muted">Limits managed browser resources, not total personal ChatGPT/Grok tabs. Completed sources can be archived before formatting finishes. Increasing this does not fix unsaved responses.</p>
+    <label for="extensionUpdaterPort">Local updater port</label>
+    <input id="extensionUpdaterPort" type="number" min="1" max="65535" step="1" value="17373" />
+    <p class="muted">Must match ASHLAR_EXTENSION_UPDATE_PORT used by the local updater helper.</p>
     <button id="save">Save & connect</button>
     <p id="status" class="muted"></p>
     <section aria-label="Bridge diagnostics">
@@ -23,6 +26,13 @@
       <h2>Job polling</h2>
       <p id="worker" class="muted" aria-live="polite"></p>
       <button id="reconnect" type="button">Check connection &amp; poll now</button>
+    </section>
+    <section aria-label="Extension updater">
+      <h2>Extension update</h2>
+      <p id="updateStatus" class="muted" aria-live="polite"></p>
+      <div class="buttonRow"><button id="checkUpdate" type="button">Check update</button><button id="applyUpdate" type="button" disabled>Update &amp; Reload</button></div>
+      <button id="rollbackUpdate" type="button" disabled>Rollback &amp; Reload</button>
+      <p class="muted">A durable maintenance lock freezes new admission and tab allocation before files are changed.</p>
     </section>
     <script src="popup.js"></script>
   </body>

@@ -565,8 +565,8 @@ function cleanupProvider(job, provider, jobs) {
   return singleFlight(cleanupLanes,`${job.origin}:${job.jobId}:${provider}`,()=>cleanupProviderBody(job,provider,jobs));
 }
 async function cleanupProviderBody(job, provider, jobs) {
-  const state = job.states[provider];
-  if ((!state.delivered && !sourceArchiveDurable(state)) || state.cleanupDone || state.repairReceiptPending) return;
+  const state = job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`;
+  if (capturePersistence.has(key) || (!state.delivered && !sourceArchiveDurable(state)) || state.cleanupDone || state.repairReceiptPending) return;
   state.cleanupPending = true;
   workerStep(job,provider,"cleanup_pending");
   await saveJobs(jobs);
@@ -930,11 +930,20 @@ async function captureProvider(job, provider, jobs) {
   // Server archive success and local receipt persistence are the durability
   // barrier for repair. Page revalidation is only cleanup authorization.
   if(!sourceArchiveDurable(state)) {
-    saved.archiveDurable=true;
     capturePersistence.add(key);
-    try { await saveJobs(jobs); }
-    catch (error) { saved.archiveDurable=false; throw error; }
-    finally { capturePersistence.delete(key); }
+    try {
+      // First persist the exact server receipt while it is still marked pending.
+      // Then persist the durable marker. Other lanes are fenced until both writes
+      // succeed, so a tab cannot be released on memory-only state.
+      await saveJobs(jobs);
+      saved.archiveDurable=true;
+      await saveJobs(jobs);
+    } catch (error) {
+      saved.archiveDurable=false;
+      throw error;
+    } finally {
+      capturePersistence.delete(key);
+    }
     workerStep(job,provider,"source_archived");
     await saveJobs(jobs);
   } else {

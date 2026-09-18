@@ -187,11 +187,26 @@ Settings에서 최대 3개를 켭니다. 하나만 끌 수는 없습니다.
 
 ChatGPT / Grok / Local은 Settings에서 켠 것만 병렬로 돕니다. 표현이 달라도 LLM으로 합치지 않습니다. 각 리뷰어 JSON을 **스키마로 합쳐** 인라인 코멘트를 답니다. 아직 답을 쓰는 리뷰어만 기다리고, 벽시계 타임아웃으로 자르지 않습니다.
 
-프롬프트는 **웹 검색 / DeepSearch / URL fetch / 툴 호출을 금지**합니다. 지시문은 짧게 두고, diff와 변경 파일 스냅샷은 `ashlar-diff.patch` / `ashlar-snapshot.md`로 붙입니다. 없는 맥락은 `assumptions`에만 적습니다.
+프롬프트는 **웹 검색 / DeepSearch / URL fetch / 툴 호출을 금지**합니다. 지시문은 짧게 두고, 세 첨부로 붙입니다: `ashlar-diff.patch`(base…head diff), `ashlar-snapshot.md`(변경 hunk를 감싸는 head 코드 + 호출 헬퍼 정의, 라인 번호 포함), `ashlar-policy.md`(리포 리뷰 규칙). 없는 맥락은 `assumptions`에만 적습니다.
 
 ### 합산
 
 LLM merge / false-positive 라운드는 없습니다. 끝난 리뷰어 JSON만 스키마로 합칩니다. 같은 파일·라인이면 하나로, 아니면 둘 다 올립니다.
+
+### 첨부 & 예산 (env)
+
+리뷰 입력은 세 첨부로 구성되며, 크기 예산은 env로 조절합니다(기본값):
+
+| env | 기본 | 대상 |
+| --- | --- | --- |
+| `ASHLAR_PROMPT_DIFF_MAX_CHARS` | 300000 | `ashlar-diff.patch` — 초과 시 낮은 등급 파일부터 통째로 제외(hunk 중간 절단 없음) |
+| `ASHLAR_PROMPT_CONTEXT_MAX_CHARS` | 200000 | `ashlar-snapshot.md` — hunk 컨텍스트 총량 |
+| `ASHLAR_PROMPT_POLICY_MAX_CHARS` | 32768 | `ashlar-policy.md` — 리뷰 규칙 절 |
+| `ASHLAR_CONTEXT_PAD_LINES` | 20 | 경계 탐지 실패 시 hunk 앞뒤 여유 줄 |
+
+롤백 플래그: `ASHLAR_CONTEXT_MODE=head` 는 스냅샷을 예전(파일 앞부분) 방식으로 되돌리고, `ASHLAR_POLICY_ATTACH=0` 은 정책 첨부를 끕니다.
+
+판정은 이진(지적 있음 / `Didn't find any major issues.`)으로 유지됩니다. 커버리지(어떤 변경 파일을 실제로 검토했는지)는 판정을 바꾸지 않고 «review posted» ops 코멘트와 clean 본문의 HTML 코멘트로만 노출됩니다. 정책은 base sha에서 읽어 PR이 자기 리뷰 규칙을 바꾸지 못하게 합니다.
 
 ### Local LLM
 

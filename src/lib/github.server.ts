@@ -8,10 +8,12 @@ import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
+import { DEFAULT_SETTINGS } from "./types";
+import { applyBudget } from "./review-budget";
 
 const GH_HOST = "api.github.com";
-const MAX_FILES = 20;
-const MAX_FILE_BYTES = 200_000;
+const MAX_FILES = 50;
+const MAX_FILE_BYTES = 1_000_000;
 
 export type GithubCreds = {
   appId: string;
@@ -411,13 +413,28 @@ export async function fetchPullSnapshot(
     isFork: ForkStatus;
     isDraft: boolean;
   },
+  opts?: { diffMaxChars?: number },
 ): Promise<SamplePr> {
-  const filesOut = await gh<Array<{ filename?: string; status?: string; patch?: string }>>(
+  type DiffRow = { filename?: string; status?: string; patch?: string };
+  // Pin the diff to base...head so patches match the file contents fetched at headSha.
+  // pulls/{pr}/files returns the diff at the live HEAD, which drifts when the PR moves.
+  let rows: DiffRow[];
+  const cmp = await gh<{ files?: DiffRow[] }>(
     token,
-    `/repos/${target.owner}/${target.repo}/pulls/${target.pr}/files?per_page=100`,
+    `/repos/${target.owner}/${target.repo}/compare/${target.baseSha}...${target.headSha}?per_page=100`,
   );
-  if (!filesOut.ok) throw new Error(`could not load pull files (${filesOut.status}): ${filesOut.text}`);
-  const changedPaths = filesOut.data
+  if (cmp.ok && Array.isArray(cmp.data.files)) {
+    rows = cmp.data.files;
+  } else {
+    // Fallback: compare unavailable (>300 files, force-push, etc.) — use live PR files.
+    const filesOut = await gh<DiffRow[]>(
+      token,
+      `/repos/${target.owner}/${target.repo}/pulls/${target.pr}/files?per_page=100`,
+    );
+    if (!filesOut.ok) throw new Error(`could not load pull files (${filesOut.status}): ${filesOut.text}`);
+    rows = filesOut.data;
+  }
+  const changedPaths = rows
     .map((f) => f.filename)
     .filter((p): p is string => Boolean(p))
     .slice(0, MAX_FILES);
@@ -431,11 +448,12 @@ export async function fetchPullSnapshot(
     if (isSandboxPolicyFile(content)) continue;
     files.push({ path, content, language: langFor(path) });
   }
-  const diff = filesOut.data
+  const diffBlocks = rows
     .filter((f) => f.filename && changedPaths.includes(f.filename))
-    .map((f) => `--- ${f.filename}\n${f.patch ?? ""}`)
-    .join("\n\n")
-    .slice(0, 80_000);
+    .map((f) => ({ path: f.filename as string, size: (f.patch ?? "").length + (f.filename ?? "").length + 5, patch: `--- ${f.filename}\n${f.patch ?? ""}` }));
+  const budgeted = applyBudget(diffBlocks, opts?.diffMaxChars ?? DEFAULT_SETTINGS.promptDiffMaxChars);
+  const diff = budgeted.kept.map((b) => b.patch).join("\n\n");
+  const diffDroppedPaths = budgeted.dropped.map((b) => b.path);
   let body = "";
   try {
     const pull = await fetchPullHead(token, target.owner, target.repo, target.pr);
@@ -459,6 +477,7 @@ export async function fetchPullSnapshot(
     files,
     diff,
     changedPaths,
+    diffDroppedPaths,
   };
 }
 

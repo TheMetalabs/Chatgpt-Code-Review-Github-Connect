@@ -77,6 +77,14 @@ function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   if (chatgptReasoning) o.chatgptReasoning = chatgptReasoning;
   const grokReasoning = envStr("ASHLAR_GROK_REASONING");
   if (grokReasoning) o.grokReasoning = grokReasoning;
+  const promptDiffMax = envNum("ASHLAR_PROMPT_DIFF_MAX_CHARS");
+  if (promptDiffMax !== undefined) o.promptDiffMaxChars = promptDiffMax;
+  const promptContextMax = envNum("ASHLAR_PROMPT_CONTEXT_MAX_CHARS");
+  if (promptContextMax !== undefined) o.promptContextMaxChars = promptContextMax;
+  const promptPolicyMax = envNum("ASHLAR_PROMPT_POLICY_MAX_CHARS");
+  if (promptPolicyMax !== undefined) o.promptPolicyMaxChars = promptPolicyMax;
+  const contextPad = envNum("ASHLAR_CONTEXT_PAD_LINES");
+  if (contextPad !== undefined) o.contextPadLines = contextPad;
   return o;
 }
 
@@ -103,6 +111,10 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
     ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
     ASHLAR_GROK_REASONING: s.grokReasoning,
+    ASHLAR_PROMPT_DIFF_MAX_CHARS: String(s.promptDiffMaxChars),
+    ASHLAR_PROMPT_CONTEXT_MAX_CHARS: String(s.promptContextMaxChars),
+    ASHLAR_PROMPT_POLICY_MAX_CHARS: String(s.promptPolicyMaxChars),
+    ASHLAR_CONTEXT_PAD_LINES: String(s.contextPadLines),
   };
 }
 
@@ -150,6 +162,10 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),
     grokReasoning: normalizeGrokReasoning(p.grokReasoning),
+    promptDiffMaxChars: Math.max(0, Math.floor(num(p.promptDiffMaxChars, DEFAULT_SETTINGS.promptDiffMaxChars))),
+    promptContextMaxChars: Math.max(0, Math.floor(num(p.promptContextMaxChars, DEFAULT_SETTINGS.promptContextMaxChars))),
+    promptPolicyMaxChars: Math.max(0, Math.floor(num(p.promptPolicyMaxChars, DEFAULT_SETTINGS.promptPolicyMaxChars))),
+    contextPadLines: Math.max(0, Math.floor(num(p.contextPadLines, DEFAULT_SETTINGS.contextPadLines))),
   };
   if (!providersFromSettings(next).length) next.reviewChatgpt = true;
   return next;

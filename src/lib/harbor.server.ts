@@ -15,9 +15,10 @@ import {
 import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
-import { buildChatPrompt, parseChatSubmission } from "./chat-prompt";
+import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
+import { rankChangedFile } from "./review-budget";
 import { runLocalLlm } from "./local-llm.server";
-import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
+import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
   filterPublishable,
@@ -156,7 +157,7 @@ export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
 export function publicJobs(jobs: Job[]) {
   const enabled = providersFromSettings(state.settings);
   return jobs.map((j) => {
-    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, ...rest } = j;
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, ...rest } = j;
     return {
       ...rest,
       reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
@@ -172,6 +173,33 @@ export function publicSettings(s: BotSettings) {
     localLlmApiKeySet: Boolean(s.localLlmApiKey),
     webhookSecretSet: Boolean(s.webhookSecret),
   };
+}
+
+// WHY: record attachment sizes + deterministic coverage on the job at the single
+// prompt-assembly point, measured by attachment name so it stays correct as later
+// PRs change the snapshot/policy attachments. Never affects the verdict.
+function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
+  const parts = splitChatAttachments(prompt);
+  const body = (name: string) => parts.files.find((f) => f.name === name)?.body ?? "";
+  const diffBody = body("ashlar-diff.patch");
+  const contextBody = body("ashlar-snapshot.md");
+  const policyBody = body("ashlar-policy.md");
+  const dropped = new Set(sample.diffDroppedPaths ?? []);
+  const codePaths = sample.changedPaths.filter((p) => rankChangedFile(p) === 0);
+  const coverageDeterministic = codePaths.map((path) => ({
+    path,
+    inDiff: !dropped.has(path),
+    inContext: contextBody.includes(`--- ${path} (`) || contextBody.includes(`--- ${path}\n`),
+    reason: dropped.has(path) ? "dropped from diff by prompt budget" : "",
+  }));
+  const promptStats = {
+    diffChars: diffBody.length,
+    contextChars: contextBody.length,
+    policyChars: policyBody.length,
+    diffFilesFull: sample.changedPaths.length - (sample.diffDroppedPaths?.length ?? 0),
+    diffFilesTotal: sample.changedPaths.length,
+  };
+  patchJob(jobId, (j) => ({ ...j, promptStats, coverageDeterministic, updatedAt: Date.now() }));
 }
 
 async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
@@ -456,7 +484,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
       await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
       return;
     }
-    sample = await fetchPullSnapshot(token, target);
+    sample = await fetchPullSnapshot(token, target, { diffMaxChars: state.settings.promptDiffMaxChars });
   } catch (e) {
     const msg = formatGithubError(e);
     patchJob(jobId, (j) => ({
@@ -496,7 +524,11 @@ async function playGithub(jobId: string, untrustedBody: string) {
     sample,
     extra,
     untrustedBody,
+    contextMaxChars: state.settings.promptContextMaxChars,
+    contextPadLines: state.settings.contextPadLines,
+    policyMaxChars: state.settings.promptPolicyMaxChars,
   });
+  recordReviewCoverage(jobId, prompt, sample);
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
 
@@ -685,7 +717,7 @@ export async function submitHarborChat(
       sender: job.sender,
       isFork: job.isFork,
       isDraft: job.isDraft,
-    });
+    }, { diffMaxChars: state.settings.promptDiffMaxChars });
   } catch (e) {
     const msg = formatGithubError(e);
     return revert(msg.slice(0, 240));
@@ -726,6 +758,15 @@ export async function submitHarborChat(
     [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
     state.settings,
   );
+  // Union model coverage across providers (a file is not_cleared if any provider says so).
+  // Coverage + droppedCount never affect the verdict — recorded for the ops comment only.
+  const coverageByFile = new Map<string, { file: string; status: "cleared" | "not_cleared"; reason: string }>();
+  for (const g of gates) {
+    for (const c of g.coverage ?? []) {
+      const prev = coverageByFile.get(c.file);
+      if (!prev || (prev.status === "cleared" && c.status === "not_cleared")) coverageByFile.set(c.file, c);
+    }
+  }
   patchJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,
@@ -738,6 +779,8 @@ export async function submitHarborChat(
       ...invalid,
       ...merged.assumptions,
     ].filter(Boolean),
+    coverage: [...coverageByFile.values()],
+    droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
     plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
     updatedAt: Date.now(),
   }));
@@ -843,7 +886,21 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const finished=state.jobs.find(j=>j.id===jobId);if(finished)recordJobHistory(finished);
   try {reviewHistory().recordReview(stored);} catch { /* storage health remains visible */ }
   if (token) void reactQuiet(token, after, "+1");
-  if (token) void upsertOpsComment(token, jobId, "posted", ["Review posted. Reviewers that failed were skipped."]);
+  let headMovedTo: string | undefined;
+  if (token && after.origin === "github") {
+    try {
+      const head = await fetchPullHead(token, after.owner, after.repo, after.pr);
+      if (head.headSha.slice(0, 7) !== after.headSha.slice(0, 7)) {
+        headMovedTo = head.headSha;
+        patchJob(jobId, (j) => ({ ...j, headMovedTo: head.headSha, updatedAt: Date.now() }));
+      }
+    } catch {
+      /* ops note is best-effort — never fail the posted review over a HEAD check */
+    }
+  }
+  const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
+  const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, publishable.length);
+  if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
 }
 
 function enqueueFromDecision(

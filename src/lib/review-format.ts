@@ -36,7 +36,7 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions">, findings: Finding[], username: string): string {
+export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage">, findings: Finding[], username: string): string {
   const sha = job.headSha.slice(0, 7);
   const n = countBySeverity(findings);
   const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4);
@@ -52,7 +52,12 @@ ${skipped.map((s) => `- ${s}`).join("\n")}
 
 Not a clean pass — remaining reviewers did not run.`;
     }
-    return CLEAN_REVIEW_BODY;
+    // First line stays exactly CLEAN_REVIEW_BODY so the loop poller's partial match
+    // still detects a clean pass; the appended sha lets it catch stale-clean reviews.
+    const cov = job.coverage ?? [];
+    const clearedCount = cov.filter((c) => c.status === "cleared").length;
+    const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
+    return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->`;
   }
   return `${REVIEW_SUMMARY_MARK}
 

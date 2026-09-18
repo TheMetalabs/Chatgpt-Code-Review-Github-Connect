@@ -162,6 +162,8 @@ function asFinding(row: unknown, i: number): Finding | null {
   };
 }
 
+export type ModelCoverage = { file: string; status: "cleared" | "not_cleared"; reason: string };
+
 export type LiveGateResult = {
   ok: true;
   findings: Finding[];
@@ -169,8 +171,23 @@ export type LiveGateResult = {
   highestRisk: string;
   investigatedSafe: string[];
   assumptions: string[];
+  coverage?: ModelCoverage[];
   dropped: string[];
 };
+
+/** Lenient parse of the optional `coverage` array. Never fails the review. */
+function parseCoverage(raw: unknown): ModelCoverage[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ModelCoverage[] = [];
+  for (const row of raw.slice(0, 200)) {
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    const file = String(r.file ?? "").trim().slice(0, 200);
+    if (!file) continue;
+    out.push({ file, status: r.status === "cleared" ? "cleared" : "not_cleared", reason: String(r.reason ?? "").slice(0, 400) });
+  }
+  return out;
+}
 
 export function gateLiveSubmission(
   submitted: Record<string, unknown> | null,
@@ -212,11 +229,12 @@ export function gateLiveSubmission(
     mergeRecommendation: mergeEvent(findings, settings),
     highestRisk: String(submitted.highest_risk ?? "").slice(0, 240),
     investigatedSafe: Array.isArray(submitted.investigated_safe)
-      ? (submitted.investigated_safe as unknown[]).map((x) => String(x).slice(0, 160)).slice(0, 8)
+      ? (submitted.investigated_safe as unknown[]).map((x) => String(x).slice(0, 400)).slice(0, 12)
       : [],
     assumptions: Array.isArray(submitted.assumptions)
-      ? (submitted.assumptions as unknown[]).map((x) => String(x).slice(0, 160)).slice(0, 8)
+      ? (submitted.assumptions as unknown[]).map((x) => String(x).slice(0, 400)).slice(0, 12)
       : [],
+    coverage: parseCoverage(submitted.coverage),
     dropped,
   };
 }

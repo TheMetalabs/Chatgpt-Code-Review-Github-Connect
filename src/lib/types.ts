@@ -106,6 +106,8 @@ export interface Job {
   chatPrompt?: string;
   chatPromptByProvider?: Partial<Record<ReviewProvider, string>>;
   bridgeClaimedAt?: number;
+  /** Foreground-submission start; NOT refreshed by keepalive. Serializes the tab-focus window. */
+  bridgeSubmitAt?: number;
   /** Ownership lease only, never a deadline for queueing or generation. */
   bridgeLeaseId?: string;
   bridgeClientId?: string;

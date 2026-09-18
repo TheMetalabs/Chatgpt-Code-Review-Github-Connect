@@ -115,6 +115,29 @@ export function bridgeHeartbeat(report?: unknown, extensionVersion?: unknown) {
 /** This is an ownership lease, NOT a generation deadline. Expiry only enables resume. */
 const STALE_CLAIM = (job: Job) => Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt > BRIDGE_CLAIM_MS);
 
+// Foreground-submission serialization. A review tab is opened active:true (steals focus)
+// and prompt insertion (execCommand) needs the foreground, so a second tab opened while
+// the first is still submitting clobbers it ("Submission unconfirmed · no automatic
+// resend"). Do not hand a Chrome profile a new job while it is still submitting one
+// (claimed, not yet generating). Bounded so a stuck submission never blocks forever.
+const SUBMIT_WINDOW_MS = 3 * 60_000;
+function isGenerating(job: Job): boolean {
+  return Object.values(job.generating ?? {}).some((v) => v === true);
+}
+function submissionInFlightForClient(jobs: readonly Job[], clientId: string): boolean {
+  if (!clientId) return false;
+  return jobs.some(
+    (j) =>
+      j.bridgeClientId === clientId &&
+      j.status === "awaiting_chat" &&
+      Boolean(j.bridgeClaimedAt) &&
+      !STALE_CLAIM(j) &&
+      !isGenerating(j) &&
+      j.bridgeSubmitAt !== undefined &&
+      Date.now() - j.bridgeSubmitAt < SUBMIT_WINDOW_MS,
+  );
+}
+
 function pendingChatProviders(job: Job): ReviewProvider[] {
   const providers = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length
     ? job.reviewProviders : providersFromSettings(getHarbor().settings);
@@ -144,6 +167,8 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
   pr: number;
 } | null {
   const harbor = getHarbor();
+  // Only one foreground submission at a time per Chrome profile (see SUBMIT_WINDOW_MS).
+  if (submissionInFlightForClient(harbor.jobs, clientId)) return null;
   for (const job of harbor.jobs) {
     if (excludeJobIds.includes(job.id) || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) continue;
     if (job.bridgeClaimedAt && !STALE_CLAIM(job)) continue;
@@ -304,7 +329,7 @@ export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId
   }
   const leaseId = randomBytes(18).toString("base64url");
   patchHarborJob(jobId, current => ({
-    ...current, bridgeClaimedAt: Date.now(), bridgeLeaseId: leaseId, bridgeClientId: clientId,
+    ...current, bridgeClaimedAt: Date.now(), bridgeSubmitAt: Date.now(), bridgeLeaseId: leaseId, bridgeClientId: clientId,
     plan: claimedReviewerNote(current.fpProviders?.length ? current.fpProviders : current.reviewProviders ?? []),
     updatedAt: Date.now(),
   }));
@@ -317,7 +342,7 @@ export function releaseBridgeJob(jobId: string, leaseId?: string) {
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return;
   patchHarborJob(jobId, current => ({
-    ...current, bridgeClaimedAt: undefined, bridgeLeaseId: undefined, updatedAt: Date.now(),
+    ...current, bridgeClaimedAt: undefined, bridgeSubmitAt: undefined, bridgeLeaseId: undefined, updatedAt: Date.now(),
     // Keep attempts and terminal outcomes. Release is not authorization for a new generate.
   }));
 }

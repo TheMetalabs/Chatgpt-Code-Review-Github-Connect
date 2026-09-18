@@ -195,7 +195,7 @@ function activelyReviewing(job) {
   if (job.serverStatus || job.recoveryError) return false;
   return job.providers.some(p => {
     const state = job.states[p];
-    return !state.delivered && !state.outcome && !state.connectionError;
+    return !state.delivered && !state.outcome && !state.connectionError && !state.sourceCapture?.confirmed;
   });
 }
 
@@ -1096,20 +1096,36 @@ async function recoverOwnedJob(cfg,jobs) {
   const tabs=await chrome.tabs.query({});
   const candidates=tabs.flatMap(tab=>{
     const owner=knownTabOwner(tab);
-    return owner?.jobId && owner.runId && !owner.released && !jobs[owner.jobId]
-      ? [{jobId:owner.jobId,provider:owner.provider,runId:owner.runId,tabId:tab.id}] : [];
+    if(!owner?.jobId || !owner.runId || owner.released)return [];
+    const existing=jobs[owner.jobId];
+    // Inventory is asynchronous: one provider can be recovered before its sibling
+    // tab is positively identified. Job existence therefore cannot suppress a
+    // newly discovered provider binding for that same original run.
+    if(existing?.states?.[owner.provider])return [];
+    return [{jobId:owner.jobId,provider:owner.provider,runId:owner.runId,tabId:tab.id}];
   }).slice(0,16);
   if(!candidates.length)return null;
   const result=await api("/api/bridge",{action:"recover",clientId:await clientId(),attachmentProtocol:2,
     bindings:candidates.map(({jobId,provider,runId})=>({jobId,provider,runId}))},cfg.origin);
   const incoming=result.job;
-  if(!incoming || jobs[incoming.jobId] || !Array.isArray(incoming.bindings) || !incoming.bindings.length)return null;
+  if(!incoming || !Array.isArray(incoming.bindings) || !incoming.bindings.length)return null;
   const bindings=incoming.bindings.filter(binding=>binding.jobId===incoming.jobId &&
     candidates.some(item=>item.jobId===binding.jobId && item.provider===binding.provider && item.runId===binding.runId));
   if(bindings.length!==incoming.bindings.length)return null;
   const providers=[...new Set(bindings.map(item=>item.provider))];
-  const job={...incoming,origin:cfg.origin,providers,resumeProviders:providers,states:{}};
+  const existing=jobs[incoming.jobId];
+  if(existing && existing.origin!==cfg.origin)return null;
+  const job=existing || {...incoming,origin:cfg.origin,providers:[],resumeProviders:[],states:{}};
+  // recoverBridgeJob renews the server lease. Existing recovered providers must
+  // use the renewed lease too, otherwise the sibling merge can strand both legs.
+  job.leaseId=incoming.leaseId;
+  job.providers=[...new Set([...(job.providers || []),...providers])];
+  job.resumeProviders=[...new Set([...(job.resumeProviders || []),...providers])];
+  if(!job.prompt && incoming.prompt)job.prompt=incoming.prompt;
+  if(!job.prompts && incoming.prompts)job.prompts=incoming.prompts;
+  if(!job.reasoning && incoming.reasoning)job.reasoning=incoming.reasoning;
   for(const binding of bindings) {
+    if(job.states[binding.provider])continue;
     const candidate=candidates.find(item=>item.jobId===binding.jobId && item.provider===binding.provider && item.runId===binding.runId);
     // The durable started marker forbids allocate/re-send even if this tab moves.
     job.states[binding.provider]={runId:binding.runId,tabId:candidate.tabId,started:true};

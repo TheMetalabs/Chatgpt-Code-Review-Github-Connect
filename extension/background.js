@@ -16,6 +16,7 @@ const heartbeatLanes = new Map();
 const observationLanes = new Map();
 const repairLanes = new Map();
 const captureLanes = new Map();
+const capturePersistence = new Set();
 const cleanupLanes = new Map();
 const inventoryLanes = new Map();
 const tabOwners = new Map();
@@ -195,7 +196,7 @@ function activelyReviewing(job) {
   if (job.serverStatus || job.recoveryError) return false;
   return job.providers.some(p => {
     const state = job.states[p];
-    return !state.delivered && !state.outcome && !state.connectionError && !state.sourceCapture?.confirmed;
+    return !state.delivered && !state.outcome && !state.connectionError && !sourceArchiveDurable(state);
   });
 }
 
@@ -212,10 +213,10 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       origin, checkedAt: Date.now(), phase, capacity,
       admissionPhase: admission?.phase || "not_checked",
       admissionCheckedAt: admission?.checkedAt,
-      sourceCaptured: relevant.reduce((n,job)=>n+job.providers.filter(p=>job.states[p].sourceCapture?.confirmed && !job.states[p].delivered).length,0),
+      sourceCaptured: relevant.reduce((n,job)=>n+job.providers.filter(p=>sourceArchiveDurable(job.states[p]) && !job.states[p].delivered).length,0),
       activeJobs: relevant.filter(activelyReviewing).length,
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
-      pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => (job.states[p].delivered || job.states[p].sourceCapture?.confirmed) && !job.states[p].cleanupDone).length, 0),
+      pendingCleanup: relevant.reduce((n, job) => n + job.providers.filter(p => (job.states[p].delivered || sourceArchiveDurable(job.states[p])) && !job.states[p].cleanupDone).length, 0),
       waitingForJson: relevant.reduce((n, job) => n + job.providers.filter(p => !job.states[p].delivered && ["waiting_for_json", "response_completed_json_invalid"].includes(job.states[p].observation?.state)).length, 0),
       stages: relevant.slice(0, 8).flatMap(job => job.providers.map(provider => ({jobId:job.jobId,provider,
         stage: progressFor(job)[provider]?.events.at(-1)?.stage || "submission_unknown"}))),
@@ -446,9 +447,16 @@ async function refreshTabInventory() {
     }).catch(()=>{tabOwners.delete(tab.id);});
   }
 }
+function sourceArchiveDurable(state) {
+  return state.sourceCapture?.archiveDurable === true || sourceArchiveDurable(state) === true;
+}
+function sourceCleanupProofConfirmed(state) {
+  return state.sourceCapture?.cleanupProofConfirmed === true || sourceArchiveDurable(state) === true;
+}
+
 function slotReason(state) {
   if(state.cleanupDone)return "released";
-  if(state.delivered || state.sourceCapture?.confirmed)return state.cleanupWaitReason || "cleanup_pending";
+  if(state.delivered || sourceArchiveDurable(state))return state.cleanupWaitReason || "cleanup_pending";
   if(state.captureError)return "source_archive_pending";
   if(state.sourceCapture?.id)return "source_receipt_pending";
   if(state.formatError || state.observation?.state === "response_completed_json_invalid")return "completed_json_invalid";
@@ -536,13 +544,13 @@ async function finishTabCleanup(job, provider, jobs, reason) {
   if (reason) state.cleanupNote = reason;
   delete state.cleanupError;
   await saveJobs(jobs);
-  if(state.sourceCapture?.confirmed) {
+  if(sourceArchiveDurable(state)) {
     delete state.sourceCapture.text;
     delete state.sourceCapture.context;
     if(state.observation)delete state.observation.text;
     if(state.formatError && !state.delivered)delete state.outcome;
     if(state.repairAttempt?.sourceHash===state.sourceCapture.sourceHash)delete state.repairAttempt.text;
-    if(job.providers.every(p=>job.states[p].delivered || job.states[p].sourceCapture?.confirmed)) {
+    if(job.providers.every(p=>job.states[p].delivered || sourceArchiveDurable(job.states[p]))) {
       delete job.prompt;delete job.prompts;
     }
     await saveJobs(jobs); // Only metadata is needed after the full source is secured.
@@ -558,7 +566,7 @@ function cleanupProvider(job, provider, jobs) {
 }
 async function cleanupProviderBody(job, provider, jobs) {
   const state = job.states[provider];
-  if ((!state.delivered && !state.sourceCapture?.confirmed) || state.cleanupDone || state.repairReceiptPending) return;
+  if ((!state.delivered && !sourceArchiveDurable(state)) || state.cleanupDone || state.repairReceiptPending) return;
   state.cleanupPending = true;
   workerStep(job,provider,"cleanup_pending");
   await saveJobs(jobs);
@@ -572,6 +580,9 @@ async function cleanupProviderBody(job, provider, jobs) {
     catch {
       tab = await findOriginalTab(job, provider);
       if (!tab) {
+        // Once the full source receipt is durably local+server stored, tab absence
+        // cannot strand repair. It also cannot authorize closing a replacement.
+        if (sourceArchiveDurable(state)) return finishTabCleanup(job, provider, jobs, "archived source durable; original tab absent");
         // A previous remove may have succeeded just before the worker stopped.
         if (state.closeRequested) return finishTabCleanup(job, provider, jobs, "close confirmed by absence");
         state.cleanupError = "original tab unavailable; cleanup waits for reconnection";
@@ -583,17 +594,33 @@ async function cleanupProviderBody(job, provider, jobs) {
     }
     if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
     if (tab.status && tab.status !== "complete") return;
+    if (sourceArchiveDurable(state) && !sourceCleanupProofConfirmed(state)) {
+      const saved=state.sourceCapture;
+      const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
+        captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
+      if(matchesJob(restored,job,provider) && ["capture_source_changed","capture_source_unavailable"].includes(restored.code))
+        return finishTabCleanup(job,provider,jobs,"archived response unavailable or changed; tab preserved");
+      if(!matchesJob(restored,job,provider) || !restored.accepted) {
+        state.cleanupError="archived source cleanup proof unavailable; tab preserved pending positive ownership";
+        await saveJobs(jobs);return;
+      }
+      saved.cleanupProofConfirmed=true;
+      saved.confirmed=true;
+      await saveJobs(jobs);
+    }
     let result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider));
-    if (matchesJob(result,job,provider) && !result.canClose && result.reason === "pending" && state.sourceCapture?.confirmed) {
+    if (matchesJob(result,job,provider) && !result.canClose && result.reason === "pending" && sourceArchiveDurable(state)) {
       const saved=state.sourceCapture;
       // A page reload can lose its in-memory source receipt after the ACK. The
       // worker still holds the exact full source/context until cleanup completes.
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
         captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
-      if(matchesJob(restored,job,provider) && restored.code==="capture_source_changed")
-        return finishTabCleanup(job,provider,jobs,"archived response changed; tab preserved");
-      if(matchesJob(restored,job,provider) && restored.accepted)
+      if(matchesJob(restored,job,provider) && ["capture_source_changed","capture_source_unavailable"].includes(restored.code))
+        return finishTabCleanup(job,provider,jobs,"archived response unavailable or changed; tab preserved");
+      if(matchesJob(restored,job,provider) && restored.accepted) {
+        saved.cleanupProofConfirmed=true;saved.confirmed=true;await saveJobs(jobs);
         result=await sendToTab(tab.id,tabMessage(job,provider,"ashlar-can-close"),contentFiles(provider));
+      }
     }
     if (matchesJob(result,job,provider) && !result.canClose && result.reason === "pending" && state.delivered && state.outcome?.ok && state.outcome.completion) {
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-result-saved"),committed:true,
@@ -676,7 +703,7 @@ async function refreshJobHeartbeat(job, jobs) {
 
 async function pollProvider(job, provider, jobs, observeOnly = false) {
   const state = job.states[provider];
-  if (state.outcome || state.delivered || state.sourceCapture?.confirmed) return;
+  if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
   if (!state.runId) state.runId = crypto.randomUUID();
   // Memory is not a receipt: a previous write may have failed while leaving the
   // shared object mutated. Retry persistence before ANY tab can adopt this runId
@@ -806,7 +833,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
 
 async function deliverOutcome(job, provider, jobs) {
   const state = job.states[provider], out = state.outcome;
-  if (!out || state.delivered || state.sourceCapture?.confirmed) return;
+  if (!out || state.delivered || sourceArchiveDurable(state)) return;
   // A failed outbox write can also leave an outcome in the shared cache. Retry
   // that save before sending it; only the server ACK permits subsequent cleanup.
   workerStep(job, provider, "delivery_pending");
@@ -849,7 +876,7 @@ function repairBody(job, provider, action, attempt) {
 }
 async function readRepairSource(job, provider, full = true) {
   const state=job.states[provider];
-  if(state.sourceCapture?.confirmed) {
+  if(sourceArchiveDurable(state)) {
     const saved=state.sourceCapture;
     let text=saved.text;
     if(full && typeof text!=="string") {
@@ -882,8 +909,8 @@ async function readRepairSource(job, provider, full = true) {
  * Capturing releases a browser resource; it never marks delivered or posts JSON.
  */
 async function captureProvider(job, provider, jobs) {
-  const state=job.states[provider];
-  if(state.delivered || state.sourceCapture?.confirmed || job.captureProtocol!==1)return;
+  const state=job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`;
+  if(state.delivered || state.cleanupDone || sourceCleanupProofConfirmed(state) || job.captureProtocol!==1)return;
   let saved=state.sourceCapture;
   if(!saved?.id) {
     if(!state.formatError && state.observation?.state!=="response_completed_json_invalid")return;
@@ -896,33 +923,44 @@ async function captureProvider(job, provider, jobs) {
     const receipt=response.capture;
     if(!receipt?.id || receipt.jobId!==job.jobId || receipt.provider!==provider || receipt.runId!==state.runId ||
         receipt.responseId!==source.responseId || receipt.sourceHash!==source.sourceHash || receipt.totalChars!==source.text.length)return;
-    saved={...source,...receipt,confirmed:false};
+    saved={...source,...receipt,archiveDurable:false,cleanupProofConfirmed:false};
     state.sourceCapture=saved;
     workerStep(job,provider,"source_archive_saved");
   }
-  // Retry this durability barrier even when an earlier failure left memory changed.
-  await saveJobs(jobs);
-  if(state.delivered || (state.outcome?.ok && !state.formatError))return;
-  const result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
-    captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
-  if(!matchesJob(result,job,provider))return;
-  if(result.code==="capture_source_changed") {
-    // The archive is already committed. A changed page only means this browser
-    // document cannot accept cleanup proof for the archived response. Keep the
-    // immutable receipt, release/preserve the repurposed page, and repair from
-    // capture-read instead of recapturing a replacement DOM response.
-    saved.confirmed=true;
-    state.cleanupPending=true;
-    delete state.captureError;
+  // Server archive success and local receipt persistence are the durability
+  // barrier for repair. Page revalidation is only cleanup authorization.
+  if(!sourceArchiveDurable(state)) {
+    saved.archiveDurable=true;
+    capturePersistence.add(key);
+    try { await saveJobs(jobs); }
+    catch (error) { saved.archiveDurable=false; throw error; }
+    finally { capturePersistence.delete(key); }
     workerStep(job,provider,"source_archived");
     await saveJobs(jobs);
-    return finishTabCleanup(job,provider,jobs,"archived response changed; tab preserved");
+  } else {
+    await saveJobs(jobs);
+  }
+  if(state.delivered || (state.outcome?.ok && !state.formatError) || state.cleanupDone)return;
+  if(!state.tabId) return finishTabCleanup(job,provider,jobs,"archived source durable; original tab absent");
+  let result;
+  try {
+    result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
+      captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
+  } catch {
+    return; // Repair can proceed from archive; cleanup retries independently.
+  }
+  if(!matchesJob(result,job,provider))return;
+  if(["capture_source_changed","capture_source_unavailable"].includes(result.code)) {
+    state.cleanupPending=true;
+    delete state.captureError;
+    await saveJobs(jobs);
+    return finishTabCleanup(job,provider,jobs,"archived response unavailable or changed; tab preserved");
   }
   if(!result.accepted)return;
-  saved.confirmed=true;
+  saved.cleanupProofConfirmed=true;
+  saved.confirmed=true; // Backward-compatible alias for pre-split persisted states.
   state.cleanupPending=true;
   delete state.captureError;
-  workerStep(job,provider,"source_archived");
   await saveJobs(jobs);
   await cleanupProvider(job,provider,jobs);
 }
@@ -955,7 +993,7 @@ async function acceptRepairReceipt(job, provider, jobs, result) {
      result.sourceHash!==attempt.sourceHash || result.responseId!==attempt.responseId || typeof result.raw!=="string" || !result.raw.trim())return;
   attempt.raw=result.raw;attempt.status="accepted";
   state.outcome={ok:true,raw:result.raw,originalText:attempt.text};
-  state.delivered=true;state.repairReceiptPending=!state.sourceCapture?.confirmed;
+  state.delivered=true;state.repairReceiptPending=!sourceArchiveDurable(state);
   state.cleanupPending=!state.cleanupDone;
   delete state.formatError;delete state.repairError;
   workerStep(job,provider,"result_saved");
@@ -970,7 +1008,7 @@ async function repairProvider(job, provider, jobs) {
   if(state.delivered) {await notifyRepairReceipt(job,provider,jobs);return;}
   // Capable servers escrow completed sources before formatting, so Local queue
   // latency or a disabled formatter cannot monopolize browser slots.
-  if(job.captureProtocol===1 && !state.sourceCapture?.confirmed)return;
+  if(job.captureProtocol===1 && (!sourceArchiveDurable(state) || capturePersistence.has(`${job.origin}:${job.jobId}:${provider}`)))return;
   let attempt=state.repairAttempt;
   if(attempt?.id) {
     const response=await api("/api/bridge",repairBody(job,provider,"repair-status",attempt),job.origin);
@@ -1002,7 +1040,7 @@ async function repairProvider(job, provider, jobs) {
   const source=await readRepairSource(job,provider);
   if(!source || (attempt?.sourceHash===source.sourceHash && attempt.responseId===source.responseId && attempt.id))return;
   state.repairAttempt={sourceHash:source.sourceHash,responseId:source.responseId,
-    ...(state.sourceCapture?.confirmed ? {captureId:source.captureId} : {text:source.text}),status:"prepared"};
+    ...(sourceArchiveDurable(state) ? {captureId:source.captureId} : {text:source.text}),status:"prepared"};
   attempt=state.repairAttempt;
   await saveJobs(jobs); // Save complete source/intent even when the start reply is lost.
   await flushProgress(job);
@@ -1034,7 +1072,7 @@ async function advanceJob(job, jobs) {
   }
   const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
   // Missing is not ACK: observe and preserve the original response without redelivery.
-  if (active && !job.prompt && job.providers.some(p=>!job.states[p].delivered && !job.states[p].sourceCapture?.confirmed)) {
+  if (active && !job.prompt && job.providers.some(p=>!job.states[p].delivered && !sourceArchiveDurable(job.states[p]))) {
     const current = await api(`/api/bridge?jobId=${encodeURIComponent(job.jobId)}&attachmentProtocol=2`, undefined, job.origin);
     Object.assign(job, {prompt: current.prompt, prompts: current.prompts});
     await saveJobs(jobs);

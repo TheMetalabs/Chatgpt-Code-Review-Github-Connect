@@ -121,6 +121,34 @@ for(const change of ['followup','draft'])test(`source receipt releases managed o
  assert.equal(f.app.history.getJob(f.job.jobId,true).captures[0].text,invalid);assert.equal(f.app.localRequests.length,0);
 });
 
+
+
+test('source change after durable archive preserves the receipt, releases capacity, and repairs from capture-read',async t=>{
+ const f=await fixture(t,{fallback:false});let changed=false;const send=f.worker.chrome.tabs.sendMessage;
+ f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
+  if(msg.type==='ashlar-capture-accepted' && !changed) {
+   changed=true;void f.page.evaluate(()=>{document.querySelector('.markdown').textContent='personal replacement response';}).then(()=>send(id,msg,cb));return;
+  }
+  send(id,msg,cb);
+ };
+ await eventually(async()=>{await f.cycle();return f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.cleanupDone;},'changed source did not release the managed slot');
+ const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
+ assert.equal(state.sourceCapture?.confirmed,true);assert.ok(state.sourceCapture?.id);
+ assert.equal(state.sourceCapture.text,undefined,'compacted receipt should not duplicate the full archived original');
+ assert.equal(f.worker.closedTabs.length,0,'repurposed page must be preserved');
+ assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true);
+ await f.cycle();assert.equal(f.worker.local.state.bridgeWorkerStatus.capacity.used,0);
+ assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1,'replacement DOM must not be archived as the original run');
+ f.app.harbor.patchHarborSettings({localJsonRepairEnabled:true});
+ await eventually(async()=>{await f.cycle();return f.app.localRequests.length===1;},'repair did not resume from the archived receipt');
+ assert.equal(f.worker.calls.some(c=>c.action==='capture-read'),true,'repair must reload the immutable archived original');
+ assert.equal(JSON.parse(f.app.localRequests[0].messages[1].content).original,invalid);
+ f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'archived original did not finish repair');
+ assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false,'source change must not trigger another model generation');
+ assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1);
+});
+
 test('failed local source-receipt persistence cannot authorize tab cleanup',async t=>{
  const f=await fixture(t,{fallback:false}), originalSet=f.worker.local.set;
  let rejected=0;

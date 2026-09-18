@@ -536,6 +536,15 @@ async function allocateProviderTab(job, provider, jobs) {
   return operation;
 }
 
+function compactFinalCapturedSource(state) {
+  if(!state.delivered || !state.cleanupDone || !sourceArchiveDurable(state))return false;
+  delete state.sourceCapture.text;
+  delete state.sourceCapture.context;
+  if(state.observation)delete state.observation.text;
+  if(state.repairAttempt?.sourceHash===state.sourceCapture.sourceHash)delete state.repairAttempt.text;
+  return true;
+}
+
 async function finishTabCleanup(job, provider, jobs, reason) {
   const state = job.states[provider];
   state.cleanupDone = true;
@@ -545,15 +554,17 @@ async function finishTabCleanup(job, provider, jobs, reason) {
   delete state.cleanupError;
   await saveJobs(jobs);
   if(sourceArchiveDurable(state)) {
-    delete state.sourceCapture.text;
-    delete state.sourceCapture.context;
+    // Browser ownership can be released before JSON repair finishes, but the
+    // exact local source fallback must survive until the repaired/final result
+    // is durably acknowledged. Only then is metadata-only compaction safe.
     if(state.observation)delete state.observation.text;
     if(state.formatError && !state.delivered)delete state.outcome;
     if(state.repairAttempt?.sourceHash===state.sourceCapture.sourceHash)delete state.repairAttempt.text;
+    compactFinalCapturedSource(state);
     if(job.providers.every(p=>job.states[p].delivered || sourceArchiveDurable(job.states[p]))) {
       delete job.prompt;delete job.prompts;
     }
-    await saveJobs(jobs); // Only metadata is needed after the full source is secured.
+    await saveJobs(jobs);
   }
   await chrome.storage.session.remove([OWNED_PREFIX + state.tabId, closedKey(job, provider)]);
 }
@@ -878,18 +889,29 @@ async function readRepairSource(job, provider, full = true) {
   const state=job.states[provider];
   if(sourceArchiveDurable(state)) {
     const saved=state.sourceCapture;
-    let text=saved.text;
-    if(full && typeof text!=="string") {
-      const response=await api("/api/bridge",{action:"capture-read",jobId:job.jobId,leaseId:job.leaseId,provider,
-        runId:state.runId,captureId:saved.id,responseId:saved.responseId,sourceHash:saved.sourceHash},job.origin);
-      const item=response.capture;
-      if(item?.id!==saved.id || item.jobId!==job.jobId || item.provider!==provider || item.runId!==state.runId ||
-          item.responseId!==saved.responseId || item.sourceHash!==saved.sourceHash || item.headSha!==saved.headSha ||
-          typeof item.text!=="string" || item.text.length!==saved.totalChars || item.text.length>500_000)return null;
-      const hash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(item.text))))
-        .map(byte=>byte.toString(16).padStart(2,"0")).join("");
-      if(hash!==saved.sourceHash)return null;
-      text=item.text;
+    let text=full ? undefined : saved.text;
+    if(full) {
+      // Prefer the immutable server archive even while a local fallback copy is
+      // retained. If that read is temporarily unavailable or fails validation,
+      // the exact locally persisted capture can still keep repair recoverable.
+      try {
+        const response=await api("/api/bridge",{action:"capture-read",jobId:job.jobId,leaseId:job.leaseId,provider,
+          runId:state.runId,captureId:saved.id,responseId:saved.responseId,sourceHash:saved.sourceHash},job.origin);
+        const item=response.capture;
+        if(item?.id===saved.id && item.jobId===job.jobId && item.provider===provider && item.runId===state.runId &&
+            item.responseId===saved.responseId && item.sourceHash===saved.sourceHash && item.headSha===saved.headSha &&
+            typeof item.text==="string" && item.text.length===saved.totalChars && item.text.length<=500_000) {
+          const hash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(item.text))))
+            .map(byte=>byte.toString(16).padStart(2,"0")).join("");
+          if(hash===saved.sourceHash) text=item.text;
+        }
+      } catch { /* fall back to the exact locally persisted capture below */ }
+      if(typeof text!=="string" && typeof saved.text==="string") {
+        const hash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(saved.text))))
+          .map(byte=>byte.toString(16).padStart(2,"0")).join("");
+        if(saved.text.length===saved.totalChars && saved.text.length<=500_000 && hash===saved.sourceHash) text=saved.text;
+      }
+      if(typeof text!=="string")return null;
     }
     return {text,totalChars:saved.totalChars,truncated:false,completed:true,stable:true,
       responseId:saved.responseId,sourceHash:saved.sourceHash,captureId:saved.id,context:saved.context};
@@ -1006,6 +1028,7 @@ async function acceptRepairReceipt(job, provider, jobs, result) {
   state.cleanupPending=!state.cleanupDone;
   delete state.formatError;delete state.repairError;
   workerStep(job,provider,"result_saved");
+  compactFinalCapturedSource(state);
   await saveJobs(jobs); // Real server ACK + local receipt before the page is released.
   await notifyRepairReceipt(job,provider,jobs);
 }

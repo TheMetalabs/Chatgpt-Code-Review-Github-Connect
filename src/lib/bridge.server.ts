@@ -1,4 +1,4 @@
-import {sanitizeWorkerStatus, type WorkerStatus} from "./bridge-worker-status";
+import {mergeWorkerStatus, workerStatusIsFresh, type WorkerStatus} from "./bridge-worker-status";
 import {JsonRepairService, localJsonRepairAvailable, cancelLocalJsonRepairs} from "./json-repair.server";
 import type {RepairInput} from "./json-repair.server";
 import {inspectReviewFormat} from "./review-json-repair";
@@ -84,7 +84,7 @@ export function getBridgePublic(): BridgePublic {
   const { token: _t, ...rest } = getBridgeStatus();
   return {...rest, protocolVersion: 1, serverInstanceId, lastTakeAt: meta.lastTakeAt,
     workerStatus: meta.workerStatus,
-    workerStatusFresh: Boolean(meta.workerStatus && Date.now() - meta.workerStatus.observedAt < BRIDGE_CONNECTED_MS && Date.now() - meta.workerStatus.receivedAt < BRIDGE_CONNECTED_MS),
+    workerStatusFresh: workerStatusIsFresh(meta.workerStatus, Date.now(), BRIDGE_CONNECTED_MS),
     repairProtocol: 1, captureProtocol: 1, recoveryProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
     pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && pendingChatProviders(job).length > 0).length,
   };
@@ -108,8 +108,7 @@ export function bridgeHeartbeat(report?: unknown, extensionVersion?: unknown) {
   meta.lastSeen = Date.now();
   if (report !== undefined) {
     // Malformed reports cannot turn a stale/blocked worker into a healthy one.
-    const clean = sanitizeWorkerStatus(report, extensionVersion, meta.lastSeen);
-    if (clean) meta.workerStatus = clean;
+    meta.workerStatus = mergeWorkerStatus(meta.workerStatus, report, extensionVersion, meta.lastSeen);
   }
 }
 

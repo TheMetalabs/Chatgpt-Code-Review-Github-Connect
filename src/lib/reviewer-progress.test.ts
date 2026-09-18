@@ -56,15 +56,16 @@ describe("buildReviewerLanes", () => {
     assert.equal(JSON.stringify(lanes).includes("failure_scenario"), false);
   });
 
-  it("shows generating while the tab is answering", () => {
+  it("shows generating only after a page observation, not an undelivered flag", () => {
     const lanes = buildReviewerLanes(
       job({
         reviewProviders: ["chatgpt", "grok"],
         generating: { chatgpt: true, grok: false },
+        providerProgress: {chatgpt: {runId: "run", stage: "generating", observedAt: Date.now(), receivedAt: Date.now()}},
       }),
     );
     assert.equal(lanes.find((l) => l.provider === "chatgpt")?.state, "generating");
-    assert.equal(lanes.find((l) => l.provider === "grok")?.state, "empty");
+    assert.equal(lanes.find((l) => l.provider === "grok")?.state, "waiting");
   });
 
   it("shows local generating from inFlight, skipped from assumptions", () => {
@@ -86,4 +87,42 @@ describe("buildReviewerLanes", () => {
     assert.equal(lanes[0].provider, "chatgpt");
     assert.equal(lanes[0].state, "queued");
   });
+
+
+  it("splits usage limit vs finished without JSON when notes exist", () => {
+    const quota = buildReviewerLanes(
+      job({
+        reviewProviders: ["chatgpt"],
+        generating: { chatgpt: false },
+        assumptions: ["chatgpt usage limit"],
+      }),
+    );
+    assert.equal(quota[0].detail, "usage limit");
+    const empty = buildReviewerLanes(
+      job({
+        reviewProviders: ["chatgpt"],
+        generating: { chatgpt: false },
+        assumptions: ["chatgpt finished without JSON"],
+      }),
+    );
+    assert.equal(empty[0].detail, "finished without JSON");
+  });
+
+  it("labels non-review JSON as extract failed", () => {
+    const lanes = buildReviewerLanes(
+      job({
+        reviewProviders: ["local"],
+        storedLegs: [{ provider: "local", raw: '{"hello":"world"}' }],
+      }),
+    );
+    assert.equal(lanes[0].state, "empty");
+    assert.match(lanes[0].detail, /extract failed/i);
+  });
+
+  it("keeps an old client's undelivered flag pending without claiming prompt submission", () => {
+    const lane = buildReviewerLanes(job({reviewProviders: ["chatgpt"], generating: {chatgpt: true}}))[0];
+    assert.equal(lane.state, "waiting");
+    assert.match(lane.detail, /submission not confirmed/);
+  });
+
 });

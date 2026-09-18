@@ -73,8 +73,8 @@ describe("buildChatPrompt", () => {
     assert.ok(files.some((f) => f.name === "ashlar-diff.patch"));
     assert.ok(files.some((f) => f.name === "ashlar-snapshot.md"));
     const encoded = buildChatPrompt({ sample });
-    assert.match(encoded, /<<<ATTACH:ashlar-diff.patch>>>/);
-    assert.match(encoded, /<<<END_ATTACH>>>/);
+    assert.match(encoded, /<<<ASHLAR_ATTACHMENTS_V2>>>/);
+    assert.match(encoded, /<<<END_ASHLAR_ATTACHMENTS_V2>>>/);
     const split = splitChatAttachments(encoded);
     assert.equal(split.files.length, 2);
     assert.match(split.prompt, /Return exactly this JSON shape/);

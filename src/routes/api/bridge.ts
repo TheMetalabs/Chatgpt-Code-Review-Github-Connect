@@ -1,9 +1,17 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { bridgePromptText } from "@/lib/chat-prompt";
+import type { ProviderError, ReviewProvider } from "@/lib/types";
 import {
+  handleBridgeRepair,
+  bridgeFormatErrors,
+  recordBridgeProgress,
+  recordBridgeObservation,
   bridgeHeartbeat,
+  bridgeJobState,
   bridgeTokenOk,
   claimBridgeJob,
   completeBridgeJob,
+  failBridgeProvider,
   getBridgePublic,
   getBridgeStatus,
   promptForJob,
@@ -12,6 +20,12 @@ import {
   rotateBridgeToken,
   takeNextBridgeJob,
 } from "@/lib/bridge.server";
+
+function promptsForClient<T extends {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>}>(value: T | null, protocol: unknown): T | null {
+  if (!value) return null;
+  return {...value, prompt: bridgePromptText(value.prompt, protocol),
+    ...(value.prompts ? {prompts: Object.fromEntries(Object.entries(value.prompts).map(([provider, text]) => [provider, bridgePromptText(text || "", protocol)]))} : {})};
+}
 
 function corsHeaders(request: Request) {
   const origin = request.headers.get("origin") ?? "";
@@ -51,7 +65,7 @@ export const Route = createFileRoute("/api/bridge")({
         bridgeHeartbeat();
         const jobId = new URL(request.url).searchParams.get("jobId");
         if (jobId) {
-          const prompt = promptForJob(jobId);
+          const prompt = promptsForClient(promptForJob(jobId), new URL(request.url).searchParams.get("attachmentProtocol") === "2" ? 2 : 1);
           if (!prompt) return Response.json({ ok: false, error: "no prompt" }, { status: 404, headers });
           return Response.json({ ok: true, ...prompt }, { headers });
         }
@@ -61,10 +75,22 @@ export const Route = createFileRoute("/api/bridge")({
         const headers = corsHeaders(request);
         const body = (await request.json().catch(() => ({}))) as {
           action?: string;
+          clientId?: string;
+          attachmentProtocol?: number;
+          repairProtocol?: number;
+          repairId?: string; responseId?: string; sourceHash?: string;
+          source?: {text?: unknown; totalChars?: unknown; truncated?: unknown; responseId?: unknown; completed?: unknown; stable?: unknown};
+          leaseId?: string;
+          excludeJobIds?: string[];
+          progress?: unknown;
+          runId?: string; text?: string; totalChars?: number; truncated?: boolean;
+          providerErrors?: Record<string, {code?: string; message?: string}>;
           token?: string;
           jobId?: string;
           raw?: string;
-          results?: { provider?: string; raw?: string }[];
+          provider?: string;
+          error?: string;
+          results?: { provider?: string; raw?: string; originalText?: string }[];
           generating?: Partial<Record<"chatgpt" | "grok" | "local", boolean>>;
         };
         if (body.action === "reveal") {
@@ -80,6 +106,27 @@ export const Route = createFileRoute("/api/bridge")({
         if (body.action === "rotate") {
           return Response.json({ ok: true, token: rotateBridgeToken().token, bridge: getBridgePublic() }, { headers });
         }
+        if (["repair", "repair-status", "repair-commit"].includes(body.action || "") && body.jobId) {
+          try {
+            const out = await handleBridgeRepair(body.action!, {...body, jobId:body.jobId});
+            const {http, ...result} = out;
+            return Response.json(result, {status:http,headers});
+          } catch { return Response.json({ok:false,error:"repair archive unavailable; original retained"},{status:503,headers}); }
+        }
+        if (body.action === "observe" && body.jobId) {
+          if(typeof body.text!=="string" || body.text.length>128_000 || typeof body.runId!=="string" || body.runId.length>128)
+            return Response.json({ok:false,error:"invalid observation"},{status:400,headers});
+          try {
+            const accepted=recordBridgeObservation(body.jobId,body.leaseId,String(body.provider||""),body.runId,
+              body.text,Number.isSafeInteger(body.totalChars) && Number(body.totalChars)>=body.text.length ? Number(body.totalChars) : body.text.length,Boolean(body.truncated));
+            return Response.json({ok:accepted},{status:accepted?200:409,headers});
+          } catch {return Response.json({ok:false,error:"history storage unavailable"},{status:503,headers});}
+        }
+        if (body.action === "progress" && body.jobId) {
+          try {const accepted=recordBridgeProgress(body.jobId,body.leaseId,body.progress);
+            return Response.json({ok:accepted},{status:accepted?200:409,headers});
+          } catch {return Response.json({ok:false,error:"history storage unavailable"},{status:503,headers});}
+        }
         if (body.action === "ping") {
           if (body.jobId) {
             const rawGen = body.generating;
@@ -91,30 +138,51 @@ export const Route = createFileRoute("/api/bridge")({
                       .map((p) => [p, rawGen[p]]),
                   )
                 : undefined;
-            refreshBridgeClaim(body.jobId, generating);
+            const errors: Partial<Record<"chatgpt" | "grok", ProviderError>> = {};
+            for (const provider of ["chatgpt", "grok"] as const) {
+              const error = body.providerErrors?.[provider];
+              if (error && ["quota", "empty", "error", "tab_closed", "cancelled", "disconnected"].includes(error.code ?? "")) {
+                errors[provider] = {code: error.code as ProviderError["code"], message: String(error.message ?? "").slice(0, 240)};
+              }
+            }
+            const accepted = refreshBridgeClaim(body.jobId, generating, errors, body.leaseId);
+            let progressAccepted=false;
+            if(accepted && body.progress)try {progressAccepted=recordBridgeProgress(body.jobId,body.leaseId,body.progress);}catch{ /* heartbeat remains separate from telemetry storage */ }
+            return Response.json({ok: true, accepted, progressAccepted, ...bridgeJobState(body.jobId), bridge: getBridgePublic()}, {headers});
           }
           return Response.json({ ok: true, bridge: getBridgePublic() }, { headers });
         }
         if (body.action === "take") {
-          return Response.json({ ok: true, bridge: getBridgePublic(), job: takeNextBridgeJob() }, { headers });
+          return Response.json({ ok: true, bridge: getBridgePublic(), job: promptsForClient(takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : []), body.attachmentProtocol) }, { headers });
         }
         if (body.action === "claim" && body.jobId) {
-          const out = claimBridgeJob(body.jobId);
+          const out = claimBridgeJob(body.jobId, String(body.clientId ?? ""));
           if (!out.ok) return Response.json(out, { status: 409, headers });
-          return Response.json({ ok: true }, { headers });
+          return Response.json(out, { headers });
         }
         if (body.action === "release" && body.jobId) {
-          releaseBridgeJob(body.jobId);
+          releaseBridgeJob(body.jobId, body.leaseId);
           return Response.json({ ok: true }, { headers });
+        }
+        if (body.action === "failure" && body.jobId) {
+          if (body.provider !== "chatgpt" && body.provider !== "grok") {
+            return Response.json({ ok: false, error: "invalid chat provider" }, { status: 400, headers });
+          }
+          const accepted = failBridgeProvider(body.jobId, body.provider, String(body.error || "chat review failed"), body.leaseId);
+          return Response.json({ ok: accepted }, { status: accepted ? 200 : 409, headers });
         }
         if (body.action === "complete" && body.jobId) {
           const legs = Array.isArray(body.results)
             ? body.results
                 .filter((r) => r.provider === "chatgpt" || r.provider === "grok")
-                .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? "") }))
+                .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? ""), originalText: typeof r.originalText === "string" ? r.originalText : undefined }))
             : undefined;
-          const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs);
-          if (!out.ok) return Response.json(out, { status: 400, headers });
+          if (body.repairProtocol === 1) {
+            const errors = bridgeFormatErrors(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
+            if (errors.length) return Response.json({ok:false,code:"json_repair_required",error:"completed response requires format repair",errors},{status:422,headers});
+          }
+          const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
+          if (!out.ok) return Response.json(out, { status: "code" in out && out.code === "history_unavailable" ? 503 : "code" in out && out.code === "lease_conflict" ? 409 : 400, headers });
           return Response.json({ ok: true }, { headers });
         }
         return Response.json({ ok: false, error: "unknown action" }, { status: 400, headers });

@@ -10,9 +10,15 @@ export type OpsCommentInput = {
 
 export const OPS_COMMENT_MARK = "<!-- ashlar-ops -->";
 
-/** Status comments are only for an explicit @ashlar-bot / follow-up, never for PR open/push. */
+/** Only admitted explicit requests, including PR-body mentions, get status comments. */
 export function opsCommentAllowed(job: { trigger: Trigger }): boolean {
-  return job.trigger === "issue_comment.mention" || job.trigger === "pull_request_review_comment.followup";
+  return job.trigger === "issue_comment.mention" || job.trigger === "pull_request_review_comment.followup" ||
+    job.trigger === "pull_request.body_mention";
+}
+
+/** ChatGPT / Local / bridge LLM work only on explicit mention (or documented mention token / follow-up). */
+export function llmWorkAllowed(job: { trigger: Trigger }): boolean {
+  return opsCommentAllowed(job);
 }
 
 export function buildOpsComment(input: OpsCommentInput): string {

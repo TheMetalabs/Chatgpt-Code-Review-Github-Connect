@@ -1,3 +1,4 @@
+import {PROGRESS_LABELS} from "./review-progress.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { skippedProvider } from "./local-fallback.ts";
 import type { Job, JobStatus, ReviewerLane, ReviewerLaneState, ReviewProvider } from "./types.ts";
@@ -23,6 +24,35 @@ function replyStats(raw: string): { jsonChars: number; findingCount?: number; pa
   }
 }
 
+function providerErrorNote(
+  job: Pick<Job, "assumptions" | "githubError" | "skipReason" | "providerErrors">,
+  provider: ReviewProvider,
+): string | undefined {
+  const rows = [...(job.assumptions ?? []), job.githubError ?? "", job.skipReason ?? ""];
+  const structured = job.providerErrors?.[provider];
+  if (structured) return `${structured.code}: ${structured.message}`;
+  const own = rows.find(row => new RegExp(`\\b${provider}\\b`, "i").test(row));
+  if (own) return own.trim();
+  // Common bridge notes may be shared, but never another provider's diagnostic.
+  return rows.find(row => !/\b(chatgpt|grok|local)\b/i.test(row) && /bridge|disconnected/i.test(row))?.trim();
+}
+
+function emptyProviderDetail(
+  job: Pick<Job, "assumptions" | "githubError" | "skipReason" | "bridgeClaimedAt" | "providerErrors">,
+  provider: ReviewProvider,
+  now: number,
+): string {
+  const note = providerErrorNote(job, provider) ?? "";
+  if (/quota|usage limit|한도/i.test(note)) return "usage limit";
+  if (/disconnected|bridge|claim|not connected/i.test(note)) return "connection unknown · waiting for reconnection";
+  if (/tab_closed/i.test(note)) return "review tab closed";
+  if (/cancelled/i.test(note)) return "cancelled";
+  if (/^error:/i.test(note)) return note;
+  if (/empty|without (review )?json|no json/i.test(note)) return "finished without JSON";
+  if (!claimed(job, now) && provider !== "local") return "finished without JSON";
+  return "finished without JSON";
+}
+
 function claimed(job: Pick<Job, "bridgeClaimedAt">, now: number): boolean {
   return Boolean(job.bridgeClaimedAt && now - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
 }
@@ -38,6 +68,9 @@ export function buildReviewerLanes(
     | "attemptedProviders"
     | "bridgeClaimedAt"
     | "skipReason"
+    | "githubError"
+    | "providerErrors"
+    | "providerProgress"
   >,
   opts?: { localInFlight?: boolean; now?: number; enabled?: readonly ReviewProvider[] },
 ): ReviewerLane[] {
@@ -51,20 +84,22 @@ export function buildReviewerLanes(
       provider === "local" ? /^Skipped local/i.test(a) : new RegExp(`Skipped ${provider}`, "i").test(a),
     );
 
+    const pendingLocal = provider === "local" && Boolean(opts?.localInFlight || job.generating?.local === true);
+    if (pendingLocal) return {provider, state: "generating", label, detail: "calling local LLM", answered: false};
     if (raw) {
       const stats = replyStats(raw);
       const findings =
         stats.findingCount === undefined
           ? stats.parsed
             ? "JSON back"
-            : "reply received · JSON not parsed"
+            : "reply received · extract failed (not review JSON)"
           : `JSON back · ${stats.findingCount} finding${stats.findingCount === 1 ? "" : "s"}`;
       return {
         provider,
-        state: "answered" as const,
+        state: stats.parsed ? "answered" as const : "empty" as const,
         label,
         detail: findings,
-        answered: true,
+        answered: stats.parsed,
         jsonChars: stats.jsonChars,
         findingCount: stats.findingCount,
       };
@@ -101,21 +136,37 @@ export function buildReviewerLanes(
     }
 
     const g = job.generating?.[provider];
+    if (g === false && !providerErrorNote(job, provider)) {
+      return {provider, state: "waiting", label, detail: "waiting for completion confirmation", answered: false};
+    }
     if (provider === "local") {
       if (opts?.localInFlight || g === true || job.status === "reviewer") {
         return { provider, state: "generating", label, detail: "calling local LLM", answered: false };
       }
       if (g === false) {
-        return { provider, state: "empty", label, detail: "local finished with no JSON", answered: false };
+        return {
+          provider,
+          state: "empty",
+          label,
+          detail: emptyProviderDetail(job, provider, now),
+          answered: false,
+        };
       }
       return { provider, state: "waiting", label, detail: "local in the race", answered: false };
     }
 
+    if (job.providerErrors?.[provider]?.code === "disconnected" || (g === true && job.bridgeClaimedAt && !claimed(job, now))) {
+      return {provider, state: "waiting", label, detail: "connection unknown · waiting for reconnection", answered: false};
+    }
+    const progress=job.providerProgress?.[provider];
+    if(progress && Object.hasOwn(PROGRESS_LABELS,progress.stage)) {
+      return {provider,state:progress.stage==="generating"?"generating":"waiting",label,detail:PROGRESS_LABELS[progress.stage],answered:false};
+    }
     if (g === true) {
-      return { provider, state: "generating", label, detail: "tab is answering", answered: false };
+      return { provider, state: "waiting", label, detail: "Chrome task pending · submission not confirmed", answered: false };
     }
     if (g === false) {
-      return { provider, state: "empty", label, detail: "quota or empty reply", answered: false };
+      return { provider, state: "empty", label, detail: emptyProviderDetail(job, provider, now), answered: false };
     }
     if (job.status === "awaiting_chat" && claimed(job, now)) {
       return { provider, state: "waiting", label, detail: "Chrome claimed · waiting for JSON", answered: false };

@@ -1,3 +1,6 @@
+import {cancelLocalJsonRepairs} from "./json-repair.server";
+import type {RepairReceipt} from "./json-repair-types.ts";
+import {recordJobHistory, recordDeliveryHistory, reviewHistory} from "./review-history.server";
 import {
   CANDIDATE_412_DROPPED,
   FINDING_412,
@@ -9,12 +12,12 @@ import {
   tracesForDlq,
   tracesForMention,
 } from "./samples";
-import { acceptedDeliveryIds, decideIngress } from "./ingress";
+import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { rankChangedFile } from "./review-budget";
-import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
+import { runLocalLlm } from "./local-llm.server";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -40,6 +43,7 @@ import {
 let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
 const localInFlight = new Set<string>();
+const localControllers = new Map<string, AbortController>();
 
 export type HarborState = {
   settings: BotSettings;
@@ -69,6 +73,12 @@ let state: HarborState = {
 
 function isLive(status: Job["status"]) {
   return LIVE_INFLIGHT_STATUSES.includes(status);
+}
+
+function trimJobs(jobs: Job[]) {
+  // UI retention may drop completed cache entries, never live queue/generation work.
+  return [...jobs.filter(j => isLive(j.status)), ...jobs.filter(j => !isLive(j.status)).slice(0, CAP)]
+    .sort((a,b) => b.createdAt - a.createdAt);
 }
 
 function trim<T>(xs: T[]) {
@@ -101,15 +111,28 @@ export function patchHarborSettings(patch: Partial<BotSettings>) {
     throw new Error("at least one configured reviewer is required");
   }
   const saved = saveBotSettings(next);
+  const previousSettings = state.settings;
   state = { ...state, settings: saved };
+  if (!saved.localJsonRepairEnabled || previousSettings.localLlmBaseUrl !== saved.localLlmBaseUrl ||
+      previousSettings.localLlmModel !== saved.localLlmModel || previousSettings.localLlmApiKey !== saved.localLlmApiKey) {
+    cancelLocalJsonRepairs("disabled");
+  }
   return state.settings;
 }
 
 export function resetHarbor() {
+  cancelLocalJsonRepairs("superseded");
+  for (const controller of localControllers.values()) controller.abort();
+  localControllers.clear();
+  localInFlight.clear();
+  for (const job of state.jobs) recordJobHistory(isLive(job.status)
+    ? {...job, status: "cancelled", skipReason: "operator reset", updatedAt: Date.now()} : job);
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
 }
 
 export function cancelHarborJob(jobId: string) {
+  cancelLocalJsonRepairs("superseded", jobId);
+  localControllers.get(jobId)?.abort();
   state = {
     ...state,
     jobs: state.jobs.map((j) =>
@@ -118,10 +141,13 @@ export function cancelHarborJob(jobId: string) {
         : j,
     ),
   };
+  const job=state.jobs.find(j=>j.id===jobId);if(job)recordJobHistory(job);
 }
 
 function patchJob(jobId: string, fn: (j: Job) => Job) {
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? fn(j) : j)) };
+  const job = state.jobs.find(j => j.id === jobId);
+  if (job) recordJobHistory(job);
 }
 
 export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
@@ -131,7 +157,7 @@ export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
 export function publicJobs(jobs: Job[]) {
   const enabled = providersFromSettings(state.settings);
   return jobs.map((j) => {
-    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, ...rest } = j;
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, ...rest } = j;
     return {
       ...rest,
       reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
@@ -262,7 +288,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
   await finishJob(jobId, sample);
 }
 
-export type ChatLeg = { provider: ReviewProvider; raw: string };
+export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt };
 
 async function reactQuiet(token: string, job: Job, content: GithubReaction) {
   try {
@@ -279,7 +305,7 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   const body = buildOpsComment({
     phase,
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
-    notes,
+    notes: [`Job: ${job.id}`, ...notes],
   });
   try {
     if (job.opsCommentId) {
@@ -313,14 +339,13 @@ const WATCH_TICK_MS = 5_000;
 async function watchReviewers(jobId: string, token: string) {
   let lastNotes = "";
   let localStarted = false;
-  let flushed = false;
   for (;;) {
+    const bridge = await bridgeSnapshot();
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
     if (job.status === "cancelled" || job.status === "posted" || job.status === "skipped" || job.status === "dlq") return;
     if (job.status !== "awaiting_chat" && job.status !== "reviewer") return;
 
-    const bridge = await bridgeSnapshot();
     const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
     const chat = (job.reviewProviders ?? []).filter(isChatProvider);
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
@@ -344,13 +369,13 @@ async function watchReviewers(jobId: string, token: string) {
       assumptions: job.assumptions,
       localInFlight: localInFlight.has(jobId),
       generating: job.generating,
+      providerErrors: job.providerErrors,
       claimed,
       connected: bridge.connected,
     });
-    if (!flushed && job.status === "awaiting_chat" && !racing) {
-      flushed = true;
+    if (job.status === "awaiting_chat" && !racing) {
       const legs = stored.filter((l) => l.raw.trim());
-      if (legs.length) void submitHarborChat(jobId, legs[0].raw, legs, { force: true });
+      if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
       else {
         patchJob(jobId, (j) => ({
           ...j,
@@ -362,6 +387,7 @@ async function watchReviewers(jobId: string, token: string) {
         void upsertOpsComment(token, jobId, "skipped", ["Enabled reviewers finished without JSON. Nothing to post."]);
       }
     }
+    if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;
     const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) });
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
@@ -415,9 +441,6 @@ async function playGithub(jobId: string, untrustedBody: string) {
     return;
   }
 
-  const acked = current();
-  if (acked) void reactQuiet(token, acked, "eyes");
-
   let sample: SamplePr;
   try {
     let target = {
@@ -431,24 +454,35 @@ async function playGithub(jobId: string, untrustedBody: string) {
       isFork: live0.isFork,
       isDraft: live0.isDraft,
     };
-    if (!target.headSha || !target.baseSha) {
+    if (!target.headSha || !target.baseSha || typeof target.isFork !== "boolean") {
       const pull = await fetchPullHead(token, live0.owner, live0.repo, live0.pr);
       target = {
         ...target,
-        headSha: pull.headSha,
-        baseSha: pull.baseSha,
+        // Resolve provenance without advancing an already-pinned webhook revision.
+        headSha: target.headSha || pull.headSha,
+        baseSha: target.baseSha || pull.baseSha,
         title: pull.title,
         isDraft: pull.draft,
         isFork: pull.fork,
       };
       patchJob(jobId, (j) => ({
         ...j,
-        headSha: pull.headSha,
-        baseSha: pull.baseSha,
+        headSha: target.headSha,
+        baseSha: target.baseSha,
         title: pull.title,
         isDraft: pull.draft,
         isFork: pull.fork,
       }));
+    }
+    // Missing head-repository metadata is unknown, not proof of a trusted head.
+    // Fail closed if resolution is still inconclusive, before source I/O or eyes.
+    const resolved = current();
+    if (!resolved || resolved.status === "cancelled") return;
+    const skip = reviewSkipReason({ sample: target, trigger: resolved.trigger, thread: resolved.thread, settings: state.settings });
+    if (skip) {
+      patchJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
+      await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
+      return;
     }
     sample = await fetchPullSnapshot(token, target, { diffMaxChars: state.settings.promptDiffMaxChars });
   } catch (e) {
@@ -467,26 +501,14 @@ async function playGithub(jobId: string, untrustedBody: string) {
 
   const gated = current();
   if (!gated || gated.status === "cancelled") return;
-  if (state.settings.skipForks && gated.isFork) {
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "skipped",
-      skipReason: "fork (allowlist empty) · PR body not promoted to policy",
-      updatedAt: Date.now(),
-    }));
-    return;
-  }
-  if (state.settings.skipDrafts && gated.isDraft) {
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "skipped",
-      skipReason: "draft",
-      updatedAt: Date.now(),
-    }));
+  // Settings may have changed while snapshot I/O was in flight.
+  const skip = reviewSkipReason({ sample: gated, trigger: gated.trigger, thread: gated.thread, settings: state.settings });
+  if (skip) {
+    patchJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
+    await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
     return;
   }
 
-  if (current()?.status === "cancelled") return;
   const providers = providersFromSettings(state.settings);
   if (!providers.length) {
     patchJob(jobId, (j) => ({
@@ -510,40 +532,6 @@ async function playGithub(jobId: string, untrustedBody: string) {
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
 
-  if (providers.includes("local") && !chatProviders.length) {
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "reviewer",
-      plan: "Snapshot loaded. Calling the local OpenAI-compatible LLM.",
-      reviewProviders: providers,
-      reviewOrder: order,
-      updatedAt: Date.now(),
-    }));
-    const local = await runLocalLlm(prompt, state.settings);
-    if (!local.ok) {
-      patchJob(jobId, (j) => ({
-        ...j,
-        status: "skipped",
-        skipReason: "local LLM failed and no chat reviewer is on",
-        githubError: `local LLM: ${local.error}`,
-        updatedAt: Date.now(),
-      }));
-      void upsertOpsComment(token, jobId, "failed", [`Local LLM failed (${local.error}). No other reviewer is enabled.`]);
-      return;
-    }
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "awaiting_chat",
-      plan: "Local LLM returned. Running poster.",
-      chatPrompt: prompt,
-      reviewProviders: providers,
-      reviewOrder: order,
-      storedLegs: [{ provider: "local", raw: local.raw }],
-      updatedAt: Date.now(),
-    }));
-    await submitHarborChat(jobId, local.raw, [{ provider: "local", raw: local.raw }]);
-    return;
-  }
 
   patchJob(jobId, (j) => ({
     ...j,
@@ -559,8 +547,12 @@ async function playGithub(jobId: string, untrustedBody: string) {
     storedLegs: [],
     updatedAt: Date.now(),
   }));
+  // An eyes reaction now means the snapshot passed admission and a job is
+  // available to reviewers, not merely that a webhook was received.
+  const admitted = current();
+  if (admitted) void reactQuiet(token, admitted, "eyes");
   void watchReviewers(jobId, token);
-  if (providers.includes("local") && chatProviders.length) {
+  if (providers.includes("local")) {
     void kickLocalRace(jobId, prompt);
   }
 }
@@ -570,48 +562,48 @@ async function kickLocalRace(jobId: string, prompt: string) {
   if (!prompt.trim()) return;
   if (localInFlight.has(jobId)) return;
   const job = state.jobs.find((j) => j.id === jobId);
-  if (!job) return;
+  if (!job || job.status !== "awaiting_chat") return;
   if ((job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim())) return;
   if ((job.assumptions ?? []).some((a) => /^Skipped local/i.test(a))) return;
   localInFlight.add(jobId);
-  const ping = await pingLocalLlm(state.settings);
-  if (!ping.ok) {
-    localInFlight.delete(jobId);
-    patchJob(jobId, (j) => ({
-      ...j,
-      assumptions: [...(j.assumptions ?? []), `Skipped local (${ping.error})`].slice(0, 12),
-      updatedAt: Date.now(),
-    }));
-    return;
-  }
+  // A health probe can be delayed by the model queue. Never gate generation on that timer.
+  const controller = new AbortController();
+  localControllers.set(jobId, controller);
+  patchJob(jobId, j => ({...j, generating: {...j.generating, local: true}, updatedAt: Date.now()}));
+  try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
   void attachLocalLeg(jobId, prompt, { submit: true });
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
   try {
-    const local = await runLocalLlm(prompt, state.settings);
+    const local = await runLocalLlm(prompt, state.settings, localControllers.get(jobId)?.signal);
+    try {
+      reviewHistory().recordServerStep(jobId,local.ok?"local.response_received":"local.failed");
+      if(!local.ok && local.originalText)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,local.originalText,local.originalText.length,local.originalText.length>128_000);
+    } catch { /* metadata storage failure is visible without starting another model */ }
     if (!local.ok) {
-      patchJob(jobId, (j) => ({
-        ...j,
-        assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12),
-        updatedAt: Date.now(),
+      patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+        ...j, generating: {...j.generating, local: false},
+        providerErrors: {...j.providerErrors, local: {code: "error", message: local.error}},
+        assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12), updatedAt: Date.now(),
       }));
     } else {
       patchJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
-        const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw }];
-        return { ...j, storedLegs: next, updatedAt: Date.now() };
+        const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw, originalText: local.originalText }];
+        return { ...j, storedLegs: next, generating: {...j.generating, local: false}, updatedAt: Date.now() };
       });
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    patchJob(jobId, (j) => ({
-      ...j,
-      assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12),
-      updatedAt: Date.now(),
+    patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+      ...j, generating: {...j.generating, local: false},
+      providerErrors: {...j.providerErrors, local: {code: "error", message: msg.slice(0, 160)}},
+      assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12), updatedAt: Date.now(),
     }));
   } finally {
     localInFlight.delete(jobId);
+    localControllers.delete(jobId);
     if (opts?.submit) {
       const job = state.jobs.find((j) => j.id === jobId);
       const legs = (job?.storedLegs ?? []).filter((l) => l.raw.trim());
@@ -653,9 +645,15 @@ export async function submitHarborChat(
   if (!payloads.length) {
     return { ok: false, error: "quota" };
   }
+  try {
+    reviewHistory().recordJob(job);
+    for (const leg of incoming) reviewHistory().recordResponse(jobId,leg.provider,leg.raw,leg.originalText || "");
+  } catch {
+    // Stored Local legs remain available to the watcher; never repeat generation.
+    patchJob(jobId,j=>({...j,githubError:"Response history storage unavailable; result retained for retry"}));
+    return {ok:false,error:"Response history storage unavailable; result retained for retry"};
+  }
   if (!opts?.force && !job.chatFpRound) {
-    const bridge = await bridgeSnapshot();
-    const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
     const haveLocal = payloads.some((l) => l.provider === "local");
     const haveChat = payloads.some((l) => isChatProvider(l.provider));
     if (
@@ -665,8 +663,7 @@ export async function submitHarborChat(
         assumptions: job.assumptions,
         localInFlight: localInFlight.has(jobId),
         generating: job.generating,
-        claimed,
-        connected: bridge.connected,
+        providerErrors: job.providerErrors,
       })
     ) {
       patchJob(jobId, (j) => {
@@ -886,6 +883,8 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
         : j,
     ),
   };
+  const finished=state.jobs.find(j=>j.id===jobId);if(finished)recordJobHistory(finished);
+  try {reviewHistory().recordReview(stored);} catch { /* storage health remains visible */ }
   if (token) void reactQuiet(token, after, "+1");
   let headMovedTo: string | undefined;
   if (token && after.origin === "github") {
@@ -909,7 +908,7 @@ function enqueueFromDecision(
   opts: {
     deliveryId: string;
     trigger: Trigger;
-    sample: { owner: string; repo: string; pr: number; title: string; headSha: string; baseSha: string; sender: string; isFork: boolean; isDraft: boolean; key?: string };
+    sample: IngressTarget;
     thread?: Job["thread"];
     origin: Job["origin"];
     installationId?: number;
@@ -933,11 +932,20 @@ function enqueueFromDecision(
       summary: `${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr} rejected`,
       rejectReason: decision.reason,
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 403, reject: decision.reason, queued: false };
   }
 
   if (decision.skip || !decision.job) {
+    // Ordinary/bot comments and duplicate deliveries are not reviewer executions.
+    if (!isBotMention(opts.thread?.userText, state.settings) || /^duplicate delivery_id/.test(decision.skip || "")) {
+      const ev: WebhookLog = {id:nid("ev"),deliveryId:opts.deliveryId,event:opts.eventName,action:"ignored",hmac:"ok",
+        httpStatus:202,at:Date.now(),summary:`${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr} ignored`,skipReason:decision.skip || "filtered"};
+      recordDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
+      state={...state,events:trim([ev,...state.events])};
+      return {httpStatus:202,skip:decision.skip || "filtered",queued:false};
+    }
     const skipJob: Job = {
       deliveryId: opts.deliveryId,
       trigger: opts.trigger,
@@ -979,7 +987,9 @@ function enqueueFromDecision(
       skipReason: decision.skip ?? "filtered",
       jobId: skipJob.id,
     };
-    state = { ...state, jobs: trim([skipJob, ...state.jobs]), events: trim([ev, ...state.events]) };
+    recordJobHistory(skipJob);
+    recordDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
+    state = { ...state, jobs: trimJobs([skipJob, ...state.jobs]), events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: decision.skip ?? "filtered", jobId: skipJob.id, queued: false };
   }
 
@@ -1013,7 +1023,7 @@ function enqueueFromDecision(
   };
   state = {
     ...state,
-    jobs: trim([
+    jobs: trimJobs([
       job,
       ...state.jobs.map((j) =>
         j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status)
@@ -1024,6 +1034,10 @@ function enqueueFromDecision(
     events: trim([ev, ...state.events]),
   };
 
+  recordDeliveryHistory(ev,{owner:job.owner,repo:job.repo,pr:job.pr,commentId:job.thread?.commentId});
+  for (const item of state.jobs) if (item.id === job.id || item.skipReason === `superseded by ${job.id}`) recordJobHistory(item);
+  // Supersession is an explicit cancellation, not a timer.
+  for (const previous of state.jobs) if (previous.status === "cancelled") localControllers.get(previous.id)?.abort();
   if (opts.origin === "github") void playGithub(job.id, opts.untrustedBody ?? "");
   else void playTape(job.id, { forceDlq: opts.forceDlq });
   return { httpStatus: 202, jobId: job.id, queued: true };
@@ -1066,7 +1080,7 @@ export function ingestGitHubWebhook(opts: {
   event: string;
   payload: unknown;
 }): HarborFireResult & { pong?: boolean; ignored?: string } {
-  const parsed = parseGitHubPayload(opts.event, opts.payload);
+  const parsed = parseGitHubPayload(opts.event, opts.payload, state.settings);
   const t0 = performance.now();
 
   if (!opts.hmacOk) {
@@ -1081,6 +1095,7 @@ export function ingestGitHubWebhook(opts: {
       summary: "GitHub delivery rejected",
       rejectReason: "HMAC mismatch",
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 403, reject: "HMAC mismatch", queued: false };
   }
@@ -1097,6 +1112,7 @@ export function ingestGitHubWebhook(opts: {
       summary: "GitHub delivery skipped",
       skipReason: parsed.reason,
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false };
   }
@@ -1112,6 +1128,7 @@ export function ingestGitHubWebhook(opts: {
       at: Date.now(),
       summary: "GitHub ping",
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, queued: false, pong: true };
   }
@@ -1128,6 +1145,7 @@ export function ingestGitHubWebhook(opts: {
       summary: `${opts.event} ignored`,
       skipReason: parsed.reason,
     };
+    recordDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false, ignored: parsed.reason };
   }

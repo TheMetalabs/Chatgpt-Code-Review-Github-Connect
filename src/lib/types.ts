@@ -1,4 +1,9 @@
+import type {RepairReceipt} from "./json-repair-types.ts";
+import type { ProviderProgress } from "./review-progress.ts";
 import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
+
+/** null means the head repository provenance is not established. */
+export type ForkStatus = boolean | null;
 
 export type Severity = "P0" | "P1" | "P2";
 export type FindingStatus = "candidate" | "accepted" | "dropped";
@@ -29,6 +34,7 @@ export type Trigger =
   | "pull_request.reopened"
   | "pull_request.synchronize"
   | "pull_request.ready_for_review"
+  | "pull_request.body_mention"
   | "issue_comment.mention"
   | "pull_request_review_comment.followup";
 
@@ -59,7 +65,7 @@ export interface ToolTrace {
 }
 
 export interface JobThread {
-  kind: "mention" | "followup";
+  kind: "mention" | "followup" | "pr_body";
   commentId: number;
   userText: string;
 }
@@ -75,7 +81,7 @@ export interface Job {
   headSha: string;
   baseSha: string;
   sender: string;
-  isFork: boolean;
+  isFork: ForkStatus;
   isDraft: boolean;
   thread?: JobThread;
   status: JobStatus;
@@ -100,6 +106,11 @@ export interface Job {
   chatPrompt?: string;
   chatPromptByProvider?: Partial<Record<ReviewProvider, string>>;
   bridgeClaimedAt?: number;
+  /** Ownership lease only, never a deadline for queueing or generation. */
+  bridgeLeaseId?: string;
+  bridgeClientId?: string;
+  providerProgress?: Partial<Record<ReviewProvider, ProviderProgress>>;
+  providerErrors?: Partial<Record<ReviewProvider, ProviderError>>;
   reviewProviders?: ReviewProvider[];
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
@@ -112,7 +123,7 @@ export interface Job {
     skipped: string[];
     dropped: string[];
   };
-  storedLegs?: { provider: ReviewProvider; raw: string }[];
+  storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt }[];
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;
   attemptedProviders?: ReviewProvider[];
@@ -129,6 +140,11 @@ export interface Job {
   headMovedTo?: string;
   /** Public snapshot only — never includes reviewer raw JSON. */
   reviewerLanes?: ReviewerLane[];
+}
+
+export interface ProviderError {
+  code: "quota" | "empty" | "error" | "tab_closed" | "cancelled" | "disconnected";
+  message: string;
 }
 
 export type ReviewerLaneState = "queued" | "waiting" | "generating" | "answered" | "skipped" | "empty";
@@ -196,6 +212,8 @@ export interface BotSettings {
   reviewChatgpt: boolean;
   reviewGrok: boolean;
   reviewLocal: boolean;
+  /** Formatting-only recovery; independent of Local reviewer participation. */
+  localJsonRepairEnabled: boolean;
   chatgptReasoning: ChatgptReasoning;
   grokReasoning: GrokReasoning;
   localLlmBaseUrl: string;
@@ -227,7 +245,7 @@ export interface SamplePr {
   sender: string;
   headSha: string;
   baseSha: string;
-  isFork: boolean;
+  isFork: ForkStatus;
   isDraft: boolean;
   labels: string[];
   files: SnapshotFile[];
@@ -252,6 +270,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   reviewChatgpt: true,
   reviewGrok: true,
   reviewLocal: false,
+  localJsonRepairEnabled: true,
   chatgptReasoning: "pro",
   grokReasoning: "heavy",
   localLlmBaseUrl: "http://127.0.0.1:11434/v1",
@@ -337,7 +356,8 @@ export function claimedReviewerNote(providers: readonly ReviewProvider[]): strin
   return `Chrome bridge claimed this job. ${chat.map((p) => PROVIDER_LABEL[p]).join(" and ")} run in parallel.`;
 }
 
-export const BRIDGE_CLAIM_MS = 4 * 60_000;
+/** Heartbeat ownership lease only. Expiry permits resuming, never failing/restarting generation. */
+export const BRIDGE_CLAIM_MS = 20 * 60_000;
 /** Chrome MV3 alarms are ≥1 minute; keep connected across that gap. */
 export const BRIDGE_CONNECTED_MS = 120_000;
 
@@ -368,4 +388,3 @@ export type GithubReady = {
     privateKey: "ui" | "env" | "missing";
   };
 };
-

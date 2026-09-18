@@ -13,12 +13,7 @@ function composer() {
 }
 
 function sendButton() {
-  return (
-    document.querySelector('button[aria-label="Submit"]') ||
-    document.querySelector('button[aria-label="Send"]') ||
-    document.querySelector('button[aria-label*="Send"]') ||
-    document.querySelector('button[type="submit"]')
-  );
+  return findEligibleSendButton(['button[aria-label="Submit"]', 'button[aria-label*="Send"]', 'button[type="submit"]']);
 }
 
 function quotaError() {
@@ -45,47 +40,24 @@ async function startFresh() {
   return waitUntilComposer();
 }
 
-async function runPrompt(prompt, reasoning) {
-  const existing = harvestJson({ allowThin: true });
-  if (existing && chatGenerationFinished(true)) return existing;
-  if (assistantCorpus().length && !composer()) return waitUntilReviewOrQuota("Grok");
+async function runPrompt(prompt, reasoning, resume = false) {
+  // A restarted worker must observe the existing request, never submit it again.
+  if (resume) {
+    await resumeSubmission(sendButton, composer, prompt);
+    return waitUntilReviewOrQuota("Grok");
+  }
+  step("composer_waiting");
   await dismissOverlays();
   const el = await startFresh();
   await dismissOverlays();
   await selectReasoning("grok", reasoning || "heavy");
   await dismissOverlays();
   if (quotaHit()) throw quotaError();
-  await fillComposer(el, prompt);
+  step("attachments_preparing");
+  const submittedText = await fillComposer(el, prompt);
   await dismissOverlays();
-  await clickSend(sendButton, composer);
+  await clickSend(sendButton, composer, submittedText);
   return waitUntilReviewOrQuota("Grok");
 }
 
-let running = false;
-chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
-  if (msg?.type === "ashlar-harvest") {
-    const raw = harvestJson({ allowThin: chatGenerationFinished(true) });
-    sendResponse(raw ? { ok: true, raw } : { ok: false, error: "no json" });
-    return true;
-  }
-  if (msg?.type !== "ashlar-run") return;
-  if (running) {
-    const raw = harvestJson({ allowThin: chatGenerationFinished(true) });
-    sendResponse(raw ? { ok: true, raw } : { ok: false, error: "already running" });
-    return true;
-  }
-  running = true;
-  runPrompt(String(msg.prompt || ""), msg.reasoning)
-    .then((raw) => sendResponse({ ok: true, raw }))
-    .catch((e) =>
-      sendResponse({
-        ok: false,
-        error: e instanceof Error ? e.message : String(e),
-        code: e && e.code === "quota" ? "quota" : e && e.code === "empty" ? "empty" : undefined,
-      }),
-    )
-    .finally(() => {
-      running = false;
-    });
-  return true;
-});
+installReviewRunner("Grok", (...args) => runPrompt(...args));

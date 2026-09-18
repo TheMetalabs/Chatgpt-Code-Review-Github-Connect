@@ -1,3 +1,4 @@
+import {reviewHistory} from "@/lib/review-history.server";
 import { createFileRoute } from "@tanstack/react-router";
 import { getBridgePublic, bridgeTokenOk } from "@/lib/bridge.server";
 import { buildChatPrompt } from "@/lib/chat-prompt";
@@ -49,7 +50,8 @@ export const Route = createFileRoute("/api/harbor")({
           settings: publicSettings(harbor.settings),
           github: githubStatus(),
           bridge: getBridgePublic(),
-        });
+          history: reviewHistory().health(),
+        }, {headers:{"Cache-Control":"no-store"}});
       },
       POST: async ({ request }) => {
         const body = (await request.json()) as {
@@ -72,6 +74,7 @@ export const Route = createFileRoute("/api/harbor")({
           reviewChatgpt?: boolean;
           reviewGrok?: boolean;
           reviewLocal?: boolean;
+          localJsonRepairEnabled?: boolean;
           localLlmBaseUrl?: string;
           localLlmApiKey?: string;
           localLlmModel?: string;
@@ -129,6 +132,7 @@ export const Route = createFileRoute("/api/harbor")({
           if (typeof body.reviewChatgpt === "boolean") patch.reviewChatgpt = body.reviewChatgpt;
           if (typeof body.reviewGrok === "boolean") patch.reviewGrok = body.reviewGrok;
           if (typeof body.reviewLocal === "boolean") patch.reviewLocal = body.reviewLocal;
+          if (typeof body.localJsonRepairEnabled === "boolean") patch.localJsonRepairEnabled = body.localJsonRepairEnabled;
           if (typeof body.localLlmBaseUrl === "string") patch.localLlmBaseUrl = body.localLlmBaseUrl.trim();
           if (typeof body.localLlmModel === "string") patch.localLlmModel = body.localLlmModel.trim();
           const localKey = keepSecret(body.localLlmApiKey);

@@ -117,6 +117,16 @@ export interface Job {
   opsCommentId?: number;
   attemptedProviders?: ReviewProvider[];
   generating?: Partial<Record<ReviewProvider, boolean>>;
+  /** Review-coverage: prompt attachment sizes, measured at prompt assembly. */
+  promptStats?: { diffChars: number; contextChars: number; policyChars: number; diffFilesFull: number; diffFilesTotal: number };
+  /** Review-coverage: model-reported per-file coverage. Never affects the verdict. */
+  coverage?: { file: string; status: "cleared" | "not_cleared"; reason: string }[];
+  /** Review-coverage: deterministic (harness) coverage per changed code file. */
+  coverageDeterministic?: { path: string; inDiff: boolean; inContext: boolean; reason?: string }[];
+  /** Review-coverage: findings dropped by the precision gate. */
+  droppedCount?: number;
+  /** Review-coverage: PR head sha at post time when it moved from the reviewed sha. */
+  headMovedTo?: string;
   /** Public snapshot only — never includes reviewer raw JSON. */
   reviewerLanes?: ReviewerLane[];
 }
@@ -192,6 +202,11 @@ export interface BotSettings {
   localLlmApiKey: string;
   localLlmModel: string;
   reviewOrder: ReviewProvider[];
+  /** Review-coverage: char budgets for the three reviewer attachments + context pad. */
+  promptDiffMaxChars: number;
+  promptContextMaxChars: number;
+  promptPolicyMaxChars: number;
+  contextPadLines: number;
   localLlmApiKeySet?: boolean;
   webhookSecretSet?: boolean;
 }
@@ -218,6 +233,8 @@ export interface SamplePr {
   files: SnapshotFile[];
   diff: string;
   changedPaths: string[];
+  /** Review-coverage: changed files dropped from the diff by the prompt budget. */
+  diffDroppedPaths?: string[];
 }
 
 export const DEFAULT_SETTINGS: BotSettings = {
@@ -241,6 +258,10 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localLlmApiKey: "",
   localLlmModel: "",
   reviewOrder: ["local", "chatgpt", "grok"],
+  promptDiffMaxChars: 300_000,
+  promptContextMaxChars: 200_000,
+  promptPolicyMaxChars: 32_768,
+  contextPadLines: 20,
 };
 
 export const DEFAULT_REVIEW_ORDER: ReviewProvider[] = ["local", "chatgpt", "grok"];

@@ -92,3 +92,19 @@ describe("sanitizeBotSettings", () => {
     assert.equal(merged.reviewChatgpt, true);
   });
 });
+
+describe("prompt budgets", () => {
+  it("applies budget defaults and honors validated overrides", () => {
+    assert.equal(sanitizeBotSettings({}).promptDiffMaxChars, DEFAULT_SETTINGS.promptDiffMaxChars);
+    const s = sanitizeBotSettings({ promptDiffMaxChars: 123456, contextPadLines: 5 });
+    assert.equal(s.promptDiffMaxChars, 123456);
+    assert.equal(s.contextPadLines, 5);
+    assert.equal(sanitizeBotSettings({ promptContextMaxChars: -1 }).promptContextMaxChars, 0);
+  });
+
+  it("round-trips prompt budgets into env keys", () => {
+    const env = botSettingsToEnv(DEFAULT_SETTINGS);
+    assert.equal(env.ASHLAR_PROMPT_DIFF_MAX_CHARS, "300000");
+    assert.equal(env.ASHLAR_CONTEXT_PAD_LINES, "20");
+  });
+});

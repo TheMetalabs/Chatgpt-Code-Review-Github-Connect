@@ -162,7 +162,8 @@ async function refreshExtensionUpdate() {
     rollbackUpdateEl.disabled=!safety.safe||!snapshot.backupAvailable;
   } catch(error) {
     updaterSnapshot=null;
-    updateStatusEl.textContent=`Local updater unavailable on 127.0.0.1:${updaterPortEl?.value||17373}: ${error instanceof Error?error.message:String(error)}. Run npm run extension:update-helper with the same port.`;
+    const extensionId=chrome.runtime.id||"<Ashlar extension ID>";
+    updateStatusEl.textContent=`Local updater unavailable on 127.0.0.1:${updaterPortEl?.value||17373}: ${error instanceof Error?error.message:String(error)}. Start it with ASHLAR_EXTENSION_UPDATER_EXTENSION_ID=${extensionId} and the same port.`;
   }
 }
 async function applyExtensionUpdate() {

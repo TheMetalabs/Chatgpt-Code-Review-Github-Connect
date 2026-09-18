@@ -69,15 +69,18 @@ export function mergeEvent(findings: Finding[], settings: BotSettings): MergeRec
 }
 
 /**
- * Split real, in-scope findings into inline-anchorable vs `unanchored`.
+ * Split findings into inline comments vs `unanchored` (surfaced in the review body).
  *
- * A finding is filtered out ONLY by deliberate precision knobs: a hedge under
- * `precisionOverRecall`, an out-of-scope file, or a severity below `publishMinSeverity`.
- * A finding that clears those gates is NEVER discarded — it is either an inline comment
- * (when its line maps to a commentable diff line and we are under the inline cap) or it is
- * surfaced in the review body (`unanchored`). This stops a real finding whose reported line
- * is off (e.g. a line number past the end of the file) or that overflows the inline cap from
- * silently turning a review "clean".
+ * A finding on the PR's changed code is NEVER dropped — the model reviewed that code, so a found
+ * issue must reach the review and let the fixing agent judge it (recall over precision, owner
+ * policy 2026-09-18). It is shown inline only when high-confidence AND anchorable (not a hedge
+ * under `precisionOverRecall`, its line maps to a commentable diff line, under the inline cap); a
+ * hedge, an un-anchorable line (e.g. a line past the end of the file), or cap overflow is surfaced
+ * in the review body (`unanchored`) instead of being discarded.
+ *
+ * Excluded (not surfaced): a finding whose file is NOT one the PR changed — a PR review only speaks
+ * to the PR's own changed code, and surfacing an off-scope / hallucinated file would let noise block
+ * convergence. Below-`publishMinSeverity` findings are excluded likewise.
  */
 export function partitionFindings(
   findings: Finding[],
@@ -91,10 +94,11 @@ export function partitionFindings(
   const inline: Finding[] = [];
   const unanchored: Finding[] = [];
   for (const f of ranked) {
-    if (settings.precisionOverRecall && isHedge(f)) continue;
     if (!inChangedPaths(sample, f.file)) continue;
     if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[settings.publishMinSeverity]) continue;
-    const anchored = inline.length < cap ? anchorInline(f, sample, commentable) : null;
+    // A hedge stays out of the inline comments but is still surfaced in the body — never dropped.
+    const inlineWorthy = !(settings.precisionOverRecall && isHedge(f));
+    const anchored = inlineWorthy && inline.length < cap ? anchorInline(f, sample, commentable) : null;
     if (anchored) inline.push(anchored);
     else unanchored.push(f);
   }

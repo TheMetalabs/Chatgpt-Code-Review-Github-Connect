@@ -54,7 +54,7 @@ export function buildChatParts(opts: {
 }): { prompt: string; files: ReviewAttach[] } {
   const snapshots = reviewSnapshotFiles(opts.sample);
   const files: ReviewAttach[] = [
-    { name: "ashlar-diff.patch", body: String(opts.sample.diff || "").slice(0, 80_000) },
+    { name: "ashlar-diff.patch", body: String(opts.sample.diff || "") },
     {
       name: "ashlar-snapshot.md",
       body: snapshots

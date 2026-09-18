@@ -74,7 +74,7 @@ Archived sources awaiting processing: ${work.sourceCaptured || 0}.` : "\nCapacit
   if (s.lastError) statusEl.textContent = `Previous work error (not a model completion status): ${s.lastError}`;
   else if (s.lastJobId) statusEl.textContent = `Last job: ${s.lastJobId}`;
   await refreshDiagnostics();
-  await refreshExtensionUpdate();
+  if (!await recoverExtensionMaintenance()) await refreshExtensionUpdate();
 })();
 
 
@@ -109,6 +109,40 @@ async function commitMaintenance(id){
   const result=await chrome.runtime.sendMessage({type:"ashlar-maintenance-commit",id});
   if(!result?.ok||!result.safe||!result.committed)throw new Error(result?.reason||result?.error||"Maintenance safety changed before reload");
 }
+async function recoverExtensionMaintenance() {
+  const stored=await chrome.storage.local.get(["extensionMaintenance"]);
+  const lock=stored.extensionMaintenance;
+  if(!lock?.active || lock.phase!=="locked" || !lock.id)return false;
+  applyUpdateEl.disabled=true; rollbackUpdateEl.disabled=true;
+  try {
+    const status=await updaterRequest(`/operation?id=${encodeURIComponent(lock.id)}`);
+    const operation=status.operation;
+    if(!operation) {
+      await releaseMaintenance(lock.id);
+      updateStatusEl.textContent="Recovered an abandoned maintenance lock before any file mutation started.";
+      return false;
+    }
+    if(operation.phase==="running") {
+      updateStatusEl.textContent=`Extension ${operation.mode} is still running in the local helper. Reopen or check again after it finishes; new review admission remains frozen safely.`;
+      return true;
+    }
+    if(operation.phase==="done" && operation.ok===true) {
+      if(operation.result)await chrome.storage.local.set({lastExtensionUpdate:{
+        from:operation.result.fromVersion,to:operation.result.toVersion,rollback:operation.mode==="rollback",at:Date.now()
+      }});
+      await commitMaintenance(lock.id);
+      updateStatusEl.textContent="Recovered the completed extension file operation. Reloading Ashlar bridge…";
+      setTimeout(()=>chrome.runtime.reload(),120);
+      return true;
+    }
+    await releaseMaintenance(lock.id);
+    updateStatusEl.textContent=`Recovered an interrupted extension ${lock.mode || "maintenance"} operation; no helper mutation remains active.`;
+    return false;
+  } catch(error) {
+    updateStatusEl.textContent=`Maintenance recovery is waiting for the original local helper on port ${updaterPort()}: ${error instanceof Error?error.message:String(error)}. The lock is intentionally kept until mutation state can be verified.`;
+    return true;
+  }
+}
 async function refreshExtensionUpdate() {
   if(!updateStatusEl)return;
   applyUpdateEl.disabled=true; rollbackUpdateEl.disabled=true;
@@ -138,7 +172,7 @@ async function applyExtensionUpdate() {
     lockId=await acquireMaintenance("update");
     const running=chrome.runtime.getManifest().version;
     if(updaterSnapshot.installedVersion===running&&updaterSnapshot.updateAvailable) {
-      const result=await updaterRequest("/update",{method:"POST",body:JSON.stringify({expectedCommit:updaterSnapshot.availableCommit})});
+      const result=await updaterRequest("/update",{method:"POST",body:JSON.stringify({operationId:lockId,expectedCommit:updaterSnapshot.availableCommit})});
       await chrome.storage.local.set({lastExtensionUpdate:{from:result.fromVersion,to:result.toVersion,at:Date.now()}});
     }
     await commitMaintenance(lockId);
@@ -154,7 +188,7 @@ async function rollbackExtensionUpdate() {
   let lockId;
   try {
     lockId=await acquireMaintenance("rollback");
-    const result=await updaterRequest("/rollback",{method:"POST",body:"{}"});
+    const result=await updaterRequest("/rollback",{method:"POST",body:JSON.stringify({operationId:lockId})});
     await chrome.storage.local.set({lastExtensionUpdate:{from:result.fromVersion,to:result.toVersion,rollback:true,at:Date.now()}});
     await commitMaintenance(lockId);
     updateStatusEl.textContent="Previous extension files restored and admission is frozen. Reloading…";

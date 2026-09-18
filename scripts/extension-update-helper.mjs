@@ -77,11 +77,53 @@ export class ExtensionUpdater {
     this.sourceRef = sourceRef;
     this.fetchRemote = fetchRemote;
     this.stateFile = path.resolve(stateFile);
+    this.operationFile = `${this.stateFile}.operation`;
+  }
+
+  async operationStatus(id) {
+    const value = await readState(this.operationFile);
+    if (!value?.id || (id && value.id !== id)) return null;
+    return value;
+  }
+
+  async interruptRunningOperation() {
+    const current = await this.operationStatus();
+    if (!current || current.phase !== "running") return current;
+    const interrupted = {...current, phase:"interrupted", ok:false, error:"updater helper restarted before operation completed", finishedAt:Date.now()};
+    await writeState(this.operationFile, interrupted);
+    return interrupted;
+  }
+
+  async beginOperation(id, mode) {
+    if (typeof id !== "string" || !id || !["update","rollback"].includes(mode)) {
+      const error = new Error("valid updater operationId and mode are required");
+      error.statusCode = 400; throw error;
+    }
+    const current = await this.operationStatus();
+    if (current?.phase === "running" && current.id !== id) {
+      const error = new Error("another updater mutation is active");
+      error.statusCode = 409; throw error;
+    }
+    const next = {id, mode, phase:"running", ok:null, startedAt:Date.now()};
+    await writeState(this.operationFile, next);
+    return next;
+  }
+
+  async finishOperation(id, {result, error} = {}) {
+    const current = await this.operationStatus(id);
+    if (!current) return null;
+    const next = error
+      ? {...current, phase:"failed", ok:false, error:String(error?.message || error), statusCode:Number(error?.statusCode) || 500, finishedAt:Date.now()}
+      : {...current, phase:"done", ok:true, result, finishedAt:Date.now()};
+    await writeState(this.operationFile, next);
+    return next;
   }
 
   async resolveSource({fetch = true} = {}) {
-    if (fetch && this.fetchRemote) await git(this.repoRoot, ["fetch", "--quiet", "origin", this.branch]);
-    const ref = this.sourceRef || `origin/${this.branch}`;
+    const ref = this.sourceRef || `refs/remotes/origin/${this.branch}`;
+    if (fetch && this.fetchRemote && !this.sourceRef) {
+      await git(this.repoRoot, ["fetch", "--quiet", "origin", `refs/heads/${this.branch}:refs/remotes/origin/${this.branch}`]);
+    }
     const commit = await git(this.repoRoot, ["rev-parse", ref]);
     const manifest = JSON.parse(await git(this.repoRoot, ["show", `${ref}:extension/manifest.json`]));
     if (manifest?.manifest_version !== 3 || typeof manifest.version !== "string") throw new Error("source extension manifest is invalid");
@@ -201,10 +243,13 @@ export class ExtensionUpdater {
   }
 }
 
+function validExtensionId(extensionId) {
+  return typeof extensionId === "string" && /^[a-p]{32}$/.test(extensionId);
+}
+
 function allowedOrigin(origin, extensionId) {
-  if (!origin) return false;
-  if (extensionId) return origin === `chrome-extension://${extensionId}`;
-  return /^chrome-extension:\/\/[a-p]{32}$/.test(origin);
+  if (!validExtensionId(extensionId)) return false;
+  return origin === `chrome-extension://${extensionId}`;
 }
 
 function sendJson(res, status, body, origin) {
@@ -225,6 +270,35 @@ async function readBody(req) {
 }
 
 export async function startUpdaterServer({updater, port = DEFAULT_PORT, extensionId} = {}) {
+  if (!validExtensionId(extensionId)) throw new Error("ASHLAR_EXTENSION_UPDATER_EXTENSION_ID must be the exact 32-character Ashlar extension ID");
+  await updater.interruptRunningOperation();
+  let activeMutation = null;
+  const runMutation = async (operationId, mode, operation) => {
+    if (activeMutation) {
+      if (activeMutation.id === operationId && activeMutation.mode === mode) return activeMutation.promise;
+      const error = new Error("another updater mutation is active"); error.statusCode = 409; throw error;
+    }
+    const previous = await updater.operationStatus(operationId);
+    if (previous?.mode === mode && previous.phase === "done" && previous.ok === true) return previous.result;
+    if (previous?.mode === mode && ["failed","interrupted"].includes(previous.phase)) {
+      const error = new Error(previous.error || "previous updater operation did not complete"); error.statusCode = previous.statusCode || 409; throw error;
+    }
+    await updater.beginOperation(operationId, mode);
+    const promise = (async () => {
+      try {
+        const result = await operation();
+        await updater.finishOperation(operationId, {result});
+        return result;
+      } catch (error) {
+        await updater.finishOperation(operationId, {error}).catch(()=>{});
+        throw error;
+      } finally {
+        if (activeMutation?.id === operationId) activeMutation = null;
+      }
+    })();
+    activeMutation = {id:operationId, mode, promise};
+    return promise;
+  };
   const server = createServer(async (req, res) => {
     const origin = String(req.headers.origin || "");
     if (!allowedOrigin(origin, extensionId)) return sendJson(res, 403, {ok:false,error:"extension origin required"});
@@ -239,13 +313,17 @@ export async function startUpdaterServer({updater, port = DEFAULT_PORT, extensio
     }
     try {
       if (req.method === "GET" && req.url === "/status") return sendJson(res, 200, await updater.status({fetch:true}), origin);
+      if (req.method === "GET" && req.url?.startsWith("/operation")) {
+        const id = new URL(req.url, "http://127.0.0.1").searchParams.get("id") || "";
+        return sendJson(res, 200, {ok:true, operation:await updater.operationStatus(id)}, origin);
+      }
       if (req.method === "POST" && req.url === "/update") {
         const body = await readBody(req);
-        return sendJson(res, 200, await updater.update({expectedCommit:body.expectedCommit}), origin);
+        return sendJson(res, 200, await runMutation(body.operationId, "update", () => updater.update({expectedCommit:body.expectedCommit})), origin);
       }
       if (req.method === "POST" && req.url === "/rollback") {
-        await readBody(req);
-        return sendJson(res, 200, await updater.rollback(), origin);
+        const body = await readBody(req);
+        return sendJson(res, 200, await runMutation(body.operationId, "rollback", () => updater.rollback()), origin);
       }
       return sendJson(res, 404, {ok:false,error:"not found"}, origin);
     } catch (error) {
@@ -272,7 +350,7 @@ async function main() {
   const branch = arg("--branch") || process.env.ASHLAR_EXTENSION_UPDATE_BRANCH || "main";
   const port = Number(arg("--port") || process.env.ASHLAR_EXTENSION_UPDATE_PORT || DEFAULT_PORT);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("invalid updater port");
-  const extensionId = process.env.ASHLAR_EXTENSION_UPDATER_EXTENSION_ID || undefined;
+  const extensionId = arg("--extension-id") || process.env.ASHLAR_EXTENSION_UPDATER_EXTENSION_ID || "";
   const updater = new ExtensionUpdater({repoRoot,targetDir,branch});
   if (process.argv.includes("--status")) {
     process.stdout.write(JSON.stringify(await updater.status({fetch:true}), null, 2) + "\n");
@@ -282,8 +360,7 @@ async function main() {
   console.log(`Ashlar extension updater listening on ${url}`);
   console.log(`Target: ${targetDir}`);
   console.log(`Source: origin/${branch} (extension/ only)`);
-  if (extensionId) console.log(`Allowed extension ID: ${extensionId}`);
-  else console.log("Allowed origin: any local Chrome extension; set ASHLAR_EXTENSION_UPDATER_EXTENSION_ID to pin one ID.");
+  console.log(`Allowed extension ID: ${extensionId}`);
 }
 
 const entry = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : "";

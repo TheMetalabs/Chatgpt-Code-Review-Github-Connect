@@ -61,10 +61,19 @@ describe("poster", () => {
     assert.equal(isBotMention("@ashlar-bot focus on fulfillOrder", DEFAULT_SETTINGS), true);
     assert.equal(isBotMention("Thanks @ashlar-bot.", DEFAULT_SETTINGS), true);
   });
-  it("drops hedges when precisionOverRecall is on", () => {
-    const out = filterPublishable(job([FINDING_412, { ...CANDIDATE_412_DROPPED, status: "accepted" }]), DEFAULT_SETTINGS);
-    assert.equal(out.length, 1);
-    assert.equal(out[0].id, FINDING_412.id);
+  it("keeps a hedge out of inline comments but surfaces it in the body (never drops it)", () => {
+    const hedge = { ...CANDIDATE_412_DROPPED, status: "accepted" as const };
+    const { inline, unanchored } = partitionFindings([FINDING_412, hedge], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]);
+    assert.deepEqual(
+      inline.map((f) => f.id),
+      [FINDING_412.id],
+    ); // the confident finding stays inline
+    assert.deepEqual(
+      unanchored.map((f) => f.id),
+      [hedge.id],
+    ); // the hedge is surfaced in the review body, not dropped
+    // filterPublishable is inline-only, so the hedge is still excluded from inline comments.
+    assert.equal(filterPublishable(job([FINDING_412, hedge]), DEFAULT_SETTINGS).length, 1);
   });
 
   it("keeps a hedge when precisionOverRecall is off", () => {

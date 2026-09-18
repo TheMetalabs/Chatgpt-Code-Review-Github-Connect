@@ -125,3 +125,17 @@ test('maintenance lock blocks new admission and tab allocation until released',a
  await b.context.allocateProviderTab(job,'chatgpt',jobs);
  assert.equal(b.tabs.size,1);
 });
+
+
+test('concurrent maintenance acquisition grants exactly one owner',async()=>{
+ const local=storage({origin:'http://bridge',token:'token',maxReviewTabs:1,pendingReviewJobs:{}});
+ const b=background({local,tabs:new Map()});
+ const [a,bid]=await Promise.all([
+   b.context.acquireMaintenance('maint-A','update'),
+   b.context.acquireMaintenance('maint-B','rollback'),
+ ]);
+ assert.equal([a,bid].filter(result=>result.ok).length,1);
+ assert.equal([a,bid].filter(result=>!result.ok && /another extension maintenance operation is active/.test(result.error)).length,1);
+ const winner=a.ok?'maint-A':'maint-B';
+ assert.equal(local.state.extensionMaintenance.id,winner);
+});

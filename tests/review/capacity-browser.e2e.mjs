@@ -133,7 +133,7 @@ test('source change after durable archive preserves the receipt, releases capaci
  };
  await eventually(async()=>{await f.cycle();return f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.cleanupDone;},'changed source did not release the managed slot');
  const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
- assert.equal(state.sourceCapture?.confirmed,true);assert.ok(state.sourceCapture?.id);
+ assert.equal(state.sourceCapture?.archiveDurable,true);assert.equal(state.sourceCapture?.cleanupProofConfirmed,true);assert.ok(state.sourceCapture?.id);
  assert.equal(state.sourceCapture.text,undefined,'compacted receipt should not duplicate the full archived original');
  assert.equal(f.worker.closedTabs.length,0,'repurposed page must be preserved');
  assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true);
@@ -147,6 +147,57 @@ test('source change after durable archive preserves the receipt, releases capaci
  await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'archived original did not finish repair');
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false,'source change must not trigger another model generation');
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1);
+});
+
+
+
+test('durable archive repairs after original tab disappears before cleanup proof',async t=>{
+ const f=await fixture(t,{fallback:true});let removed=false;const send=f.worker.chrome.tabs.sendMessage;
+ f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
+  if(msg.type==='ashlar-capture-accepted' && !removed) {
+   removed=true;
+   void f.worker.closeTab(id).then(()=>send(id,msg,cb));
+   return;
+  }
+  send(id,msg,cb);
+ };
+ await eventually(async()=>{await f.cycle();return f.app.localRequests.length===1;},'durable archive was stranded after tab loss');
+ const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
+ assert.equal(state.sourceCapture?.archiveDurable,true);
+ assert.notEqual(state.sourceCapture?.cleanupProofConfirmed,true,'closed tab cannot grant cleanup proof');
+ assert.equal(state.cleanupDone,true,'absent original tab should release managed ownership after archive durability');
+ assert.equal(f.worker.tabs.size,0);assert.equal(f.worker.closedTabs.includes(10),false,'user/external tab loss is not our close action');
+ assert.equal(f.worker.calls.some(c=>c.action==='capture-read'),true,'repair must consume the immutable server archive');
+ assert.equal(JSON.parse(f.app.localRequests[0].messages[1].content).original,invalid);
+ assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false,'tab loss must not trigger another model generation');
+ f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'tabless archived repair did not finalize');
+ assert.equal(f.app.localRequests.length,1);
+});
+
+test('durable archive survives navigation before cleanup proof without closing replacement page',async t=>{
+ const f=await fixture(t,{fallback:true});let changed=false;const send=f.worker.chrome.tabs.sendMessage;
+ f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
+  if(msg.type==='ashlar-capture-accepted' && !changed) {
+   changed=true;
+   const tab=f.worker.tabs.get(id);tab.url='https://chatgpt.com/c/personal-replacement';
+   cb({ok:false,code:'capture_source_unavailable',jobId:msg.jobId,provider:msg.provider,runId:msg.runId});
+   return;
+  }
+  send(id,msg,cb);
+ };
+ await eventually(async()=>{await f.cycle();return f.app.localRequests.length===1;},'navigated durable archive did not reach formatter');
+ const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
+ assert.equal(state.sourceCapture?.archiveDurable,true);
+ assert.notEqual(state.sourceCapture?.cleanupProofConfirmed,true);
+ assert.equal(state.cleanupDone,true);assert.equal(f.worker.closedTabs.length,0);
+ assert.equal(f.worker.tabs.get(10).url,'https://chatgpt.com/c/personal-replacement');
+ assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1);
+ assert.equal(f.worker.calls.some(c=>c.action==='capture-read'),true);
+ assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
+ f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'navigated archived repair did not finalize');
+ assert.equal(f.worker.closedTabs.length,0,'replacement user page must stay open');
 });
 
 test('failed local source-receipt persistence cannot authorize tab cleanup',async t=>{

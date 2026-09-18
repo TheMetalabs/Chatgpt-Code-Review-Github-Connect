@@ -15,7 +15,7 @@ import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot,
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { rankChangedFile } from "./review-budget";
 import { pingLocalLlm, runLocalLlm } from "./local-llm.server";
-import { buildOpsComment, opsCommentAllowed, type OpsPhase } from "./ops-comment";
+import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
   filterPublishable,
@@ -887,7 +887,21 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
     ),
   };
   if (token) void reactQuiet(token, after, "+1");
-  if (token) void upsertOpsComment(token, jobId, "posted", ["Review posted. Reviewers that failed were skipped."]);
+  let headMovedTo: string | undefined;
+  if (token && after.origin === "github") {
+    try {
+      const head = await fetchPullHead(token, after.owner, after.repo, after.pr);
+      if (head.headSha.slice(0, 7) !== after.headSha.slice(0, 7)) {
+        headMovedTo = head.headSha;
+        patchJob(jobId, (j) => ({ ...j, headMovedTo: head.headSha, updatedAt: Date.now() }));
+      }
+    } catch {
+      /* ops note is best-effort — never fail the posted review over a HEAD check */
+    }
+  }
+  const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
+  const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, publishable.length);
+  if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
 }
 
 function enqueueFromDecision(

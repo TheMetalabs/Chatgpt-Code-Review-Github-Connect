@@ -184,10 +184,12 @@ test('durable archive repairs after original tab disappears before cleanup proof
 test('durable archive survives navigation before cleanup proof without closing replacement page',async t=>{
  const f=await fixture(t,{fallback:true});let changed=false;const send=f.worker.chrome.tabs.sendMessage;
  f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
-  if(msg.type==='ashlar-capture-accepted' && !changed) {
-   changed=true;
-   const tab=f.worker.tabs.get(id);tab.url='https://chatgpt.com/c/personal-replacement';
-   cb({ok:false,code:'capture_source_unavailable',jobId:msg.jobId,provider:msg.provider,runId:msg.runId});
+  if(msg.type==='ashlar-capture-accepted') {
+   if(!changed) {
+    changed=true;
+    const tab=f.worker.tabs.get(id);tab.url='https://chatgpt.com/c/personal-replacement';
+   }
+   cb({ok:false,code:'capture_source_changed',jobId:msg.jobId,provider:msg.provider,runId:msg.runId});
    return;
   }
   send(id,msg,cb);

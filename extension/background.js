@@ -598,7 +598,7 @@ async function cleanupProviderBody(job, provider, jobs) {
       const saved=state.sourceCapture;
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
         captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
-      if(matchesJob(restored,job,provider) && ["capture_source_changed","capture_source_unavailable"].includes(restored.code))
+      if(matchesJob(restored,job,provider) && restored.code==="capture_source_changed")
         return finishTabCleanup(job,provider,jobs,"archived response unavailable or changed; tab preserved");
       if(!matchesJob(restored,job,provider) || !restored.accepted) {
         state.cleanupError="archived source cleanup proof unavailable; tab preserved pending positive ownership";
@@ -615,7 +615,7 @@ async function cleanupProviderBody(job, provider, jobs) {
       // worker still holds the exact full source/context until cleanup completes.
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
         captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
-      if(matchesJob(restored,job,provider) && ["capture_source_changed","capture_source_unavailable"].includes(restored.code))
+      if(matchesJob(restored,job,provider) && restored.code==="capture_source_changed")
         return finishTabCleanup(job,provider,jobs,"archived response unavailable or changed; tab preserved");
       if(matchesJob(restored,job,provider) && restored.accepted) {
         saved.cleanupProofConfirmed=true;saved.confirmed=true;await saveJobs(jobs);
@@ -959,7 +959,7 @@ async function captureProvider(job, provider, jobs) {
     return; // Repair can proceed from archive; cleanup retries independently.
   }
   if(!matchesJob(result,job,provider))return;
-  if(["capture_source_changed","capture_source_unavailable"].includes(result.code)) {
+  if(result.code==="capture_source_changed") {
     state.cleanupPending=true;
     delete state.captureError;
     await saveJobs(jobs);
@@ -1232,7 +1232,7 @@ async function tickBody() {
   // There is deliberately NO global work lock or "any active job" return. A later
   // wakeup can advance B/admit C even while A's short transport attempt is pending.
   const work = Object.values(jobs).filter(job=>job.origin===cfg.origin).flatMap(job=>job.providers
-    .filter(provider=>(job.states[provider].delivered || job.states[provider].sourceCapture?.confirmed) && !job.states[provider].cleanupDone &&
+    .filter(provider=>(job.states[provider].delivered || sourceArchiveDurable(job.states[provider])) && !job.states[provider].cleanupDone &&
       !cleanupLanes.has(`${job.origin}:${job.jobId}:${provider}`))
     .map(provider=>cleanupProvider(job,provider,jobs)));
   work.push(...Object.values(jobs)

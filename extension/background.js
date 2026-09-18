@@ -466,7 +466,7 @@ async function tabCapacityReport(jobs, reservePending = false) {
     .filter(({job,provider,state})=>!state.cleanupDone && !session[closedKey(job,provider)]);
   for(const {job,provider,state} of slots) {
     const found=tabs.filter(tab=>{const owner=knownTabOwner(tab);return allowedTab(tab,provider) && owner?.jobId===job.jobId && owner.provider===provider &&
-      (!state.runId || !owner.runId || owner.runId===state.runId);});
+      owner.released !== true && (!state.runId || !owner.runId || owner.runId===state.runId);});
     if(found.length){for(const tab of found)ids.add(tab.id);continue;}
     const tab=live.get(state.tabId);
     // An allocated-but-not-dispatched tab is still owned even before page binding.
@@ -907,7 +907,16 @@ async function captureProvider(job, provider, jobs) {
     captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
   if(!matchesJob(result,job,provider))return;
   if(result.code==="capture_source_changed") {
-    delete state.sourceCapture;await saveJobs(jobs);return; // Old server archive stays immutable.
+    // The archive is already committed. A changed page only means this browser
+    // document cannot accept cleanup proof for the archived response. Keep the
+    // immutable receipt, release/preserve the repurposed page, and repair from
+    // capture-read instead of recapturing a replacement DOM response.
+    saved.confirmed=true;
+    state.cleanupPending=true;
+    delete state.captureError;
+    workerStep(job,provider,"source_archived");
+    await saveJobs(jobs);
+    return finishTabCleanup(job,provider,jobs,"archived response changed; tab preserved");
   }
   if(!result.accepted)return;
   saved.confirmed=true;

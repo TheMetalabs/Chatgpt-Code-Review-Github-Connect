@@ -61,7 +61,13 @@ Not a clean pass — remaining reviewers did not run.`;
   }
   const unanchoredBlock = unanchored.length
     ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored
-        .map((f) => `- ${severityBadgeMarkdown(f.severity)} \`${f.file}:${f.line}\` — **${f.title}**${f.failureScenario ? `\n  ${f.failureScenario}` : ""}`)
+        .map((f) => {
+          const detail = [f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .join(" — ");
+          return `- ${severityBadgeMarkdown(f.severity)} \`${f.file}:${f.line}\` — **${f.title}**${detail ? `\n  ${detail}` : ""}`;
+        })
         .join("\n")}\n`
     : "";
   return `${REVIEW_SUMMARY_MARK}

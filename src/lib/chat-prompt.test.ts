@@ -15,6 +15,16 @@ import {
   splitChatAttachments,
 } from "./chat-prompt.ts";
 
+describe("REVIEW_INSTRUCTIONS recall guidance", () => {
+  it("does not let an uncleared helper suppress a finding", () => {
+    assert.match(REVIEW_INSTRUCTIONS, /never justifies withholding a finding/);
+    assert.match(REVIEW_INSTRUCTIONS, /name the unverified helper\/dependency in evidence/);
+  });
+  it("keeps a far-from-hunk finding reportable instead of anchor-only", () => {
+    assert.match(REVIEW_INSTRUCTIONS, /still report it: set line to the nearest changed line/);
+  });
+});
+
 describe("parseChatSubmission", () => {
   it("reads a bare JSON object", () => {
     const out = parseChatSubmission(`{"merge_recommendation":"COMMENT","findings":[]}`);

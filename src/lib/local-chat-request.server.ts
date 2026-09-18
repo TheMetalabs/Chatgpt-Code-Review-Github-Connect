@@ -1,14 +1,102 @@
 import http from "node:http";
 import https from "node:https";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 export type LocalChatMessage = { role: "system" | "user" | "assistant"; content: string };
 type ChatRequest = { model: string; messages: LocalChatMessage[]; temperature: number };
+
+/** Same path/protocol as /Users/ai/work/tools/qwen_local_llm_queue.py (omlx concurrent=1). */
+const LOCAL_LLM_SLOT_LOCK = path.join(os.homedir(), ".cache/qwen38/llm.slot.lock");
+const SLOT_POLL_MS = 350;
+const SLOT_LOG_EVERY_MS = 15_000;
+
+function pidAlive(pid: number): boolean {
+  if (!pid || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e: unknown) {
+    const err = e as NodeJS.ErrnoException;
+    if (err?.code === "EPERM") return true;
+    return false;
+  }
+}
+
+function tryStealStaleSlot(lockPath: string): void {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8");
+    let pid = 0;
+    try { pid = Number(JSON.parse(raw)?.pid || 0); } catch { fs.unlinkSync(lockPath); return; }
+    if (!pidAlive(pid)) fs.unlinkSync(lockPath);
+  } catch (e: unknown) {
+    const err = e as NodeJS.ErrnoException;
+    if (err?.code === "ENOENT") return;
+    try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+  }
+}
+
+/** Block until this process holds the single local-LLM slot. Returns release(). */
+export async function acquireLocalLlmSlot(label = "ashlar-local"): Promise<() => void> {
+  fs.mkdirSync(path.dirname(LOCAL_LLM_SLOT_LOCK), { recursive: true });
+  const started = Date.now();
+  let lastLog = 0;
+  for (;;) {
+    try {
+      const fd = fs.openSync(LOCAL_LLM_SLOT_LOCK, "wx");
+      fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, label, at: Date.now() / 1000 })}\n`);
+      fs.closeSync(fd);
+      const waited = Date.now() - started;
+      if (waited >= 1000) console.info(`[qwen-llm-slot] acquired after ${(waited / 1000).toFixed(1)}s label=${label}`);
+      return () => { try { fs.unlinkSync(LOCAL_LLM_SLOT_LOCK); } catch { /* ignore */ } };
+    } catch (e: unknown) {
+      const err = e as NodeJS.ErrnoException;
+      if (err?.code !== "EEXIST") throw e;
+      tryStealStaleSlot(LOCAL_LLM_SLOT_LOCK);
+      const waited = Date.now() - started;
+      if (waited - lastLog >= SLOT_LOG_EVERY_MS) {
+        let holder = "?";
+        try { holder = fs.readFileSync(LOCAL_LLM_SLOT_LOCK, "utf8").trim().replace(/\n/g, " "); } catch { /* ignore */ }
+        console.info(`[qwen-llm-slot] waiting ${(waited / 1000).toFixed(0)}s label=${label} holder=${holder}`);
+        lastLog = waited;
+      }
+      await new Promise(r => setTimeout(r, SLOT_POLL_MS));
+    }
+  }
+}
 
 /** Shared native transport. No SDK/fetch deadline and no automatic network replay.
  * A caller may explicitly cancel; upstream servers/proxies may impose their own limits.
  * Health checks and generation create no deadline; only explicit cancellation may supply a signal.
  */
-export function requestLocalJson(
+function isLocalLlmBase(baseURL: string): boolean {
+  try {
+    const host = new URL(baseURL).hostname;
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
+  } catch {
+    return false;
+  }
+}
+
+export async function requestLocalJson(
+  baseURL: string,
+  apiKey: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  // Shared omlx slot only for local endpoint. xAI/other hosts (e.g. harness live) must not block on it.
+  if (!isLocalLlmBase(baseURL)) {
+    return requestLocalJsonUnlocked(baseURL, apiKey, path, body, signal);
+  }
+  const release = await acquireLocalLlmSlot(`ashlar:${path}`);
+  try {
+    return await requestLocalJsonUnlocked(baseURL, apiKey, path, body, signal);
+  } finally {
+    release();
+  }
+}
+
+function requestLocalJsonUnlocked(
   baseURL: string,
   apiKey: string,
   path: string,

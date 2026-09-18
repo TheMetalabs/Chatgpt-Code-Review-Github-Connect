@@ -36,7 +36,7 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage">, findings: Finding[], username: string): string {
+export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage">, findings: Finding[], username: string, unanchored: Finding[] = []): string {
   const sha = job.headSha.slice(0, 7);
   const n = countBySeverity(findings);
   const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4);
@@ -59,6 +59,11 @@ Not a clean pass — remaining reviewers did not run.`;
     const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
     return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->`;
   }
+  const unanchoredBlock = unanchored.length
+    ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored
+        .map((f) => `- ${severityBadgeMarkdown(f.severity)} \`${f.file}:${f.line}\` — **${f.title}**${f.failureScenario ? `\n  ${f.failureScenario}` : ""}`)
+        .join("\n")}\n`
+    : "";
   return `${REVIEW_SUMMARY_MARK}
 
 ### 💡 Ashlar Review
@@ -75,7 +80,7 @@ Here are some automated review suggestions for this pull request.
 
 ${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local ? " Local LLM is fallback if Chrome does not return." : ""}
 ${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
-
+${unanchoredBlock}
 <details>
 <summary>ℹ️ About Ashlar</summary>
 

@@ -12,6 +12,7 @@ import {
   isBotMention,
   mergeEvent,
   partitionConsensus,
+  partitionFindings,
   partitionMany,
   publishableFindings,
   schemaMergeProviderGates,
@@ -92,10 +93,11 @@ describe("poster", () => {
   });
 
   it("does not post a review on zero findings unless mentioned", () => {
-    const silent = buildReview(job([]), [], DEFAULT_SETTINGS);
+    const silent = buildReview(job([]), [], [], DEFAULT_SETTINGS);
     assert.equal(silent, null);
     const mentioned = buildReview(
       job([], { thread: { kind: "mention", commentId: 1, userText: "@ashlar-bot ping" } }),
+      [],
       [],
       DEFAULT_SETTINGS,
     );
@@ -118,12 +120,36 @@ describe("poster", () => {
     assert.equal(out.length, 0);
   });
 
-  it("drops a line that is not in the pull diff even when the file changed", () => {
+  it("surfaces a line that is not in the pull diff as unanchored instead of dropping it", () => {
     const far: Finding = { ...FINDING_412, id: "f-far", line: 200 };
-    const out = publishableFindings([far], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]);
-    assert.equal(out.length, 0);
-    const ok = publishableFindings([FINDING_412], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]);
-    assert.equal(ok.length, 1);
+    const split = partitionFindings([far], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]);
+    // Not inline-anchorable (line 200 is not a commentable diff line) — but never dropped.
+    assert.equal(split.inline.length, 0);
+    assert.deepEqual(
+      split.unanchored.map((f) => f.id),
+      ["f-far"],
+    );
+    // publishableFindings still returns only the inline set, so it stays 0 here.
+    assert.equal(publishableFindings([far], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]).length, 0);
+    const ok = partitionFindings([FINDING_412], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]);
+    assert.equal(ok.inline.length, 1);
+    assert.equal(ok.unanchored.length, 0);
+  });
+
+  it("a lone unanchored finding still makes the review REQUEST_CHANGES, not clean", () => {
+    // Regression for aicc-center #259: the model returned a real P1 whose reported line did not
+    // exist on head; the old pipeline dropped it and posted "Didn't find any major issues".
+    const far: Finding = { ...FINDING_412, id: "f-far", severity: "P1", line: 900 };
+    const { inline, unanchored } = partitionFindings([far], DEFAULT_SETTINGS, SAMPLE_PRS["pay-412"]);
+    assert.equal(inline.length, 0);
+    assert.equal(unanchored.length, 1);
+    const review = buildReview(job([far]), inline, unanchored, DEFAULT_SETTINGS);
+    assert.ok(review);
+    assert.equal(review.event, "REQUEST_CHANGES");
+    assert.equal(review.comments.length, 0); // no inline comment on a nonexistent line
+    assert.doesNotMatch(review.body, /Didn.t find any major issues/);
+    assert.match(review.body, /without an inline anchor/i);
+    assert.match(review.body, new RegExp(far.title));
   });
 
   it("caps inline comments at maxInlineComments including zero", () => {

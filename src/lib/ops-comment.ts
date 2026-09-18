@@ -53,6 +53,7 @@ ${noteLines}
 export function reviewPostedNotes(
   job: Pick<Job, "headSha" | "headMovedTo" | "promptStats" | "coverage" | "coverageDeterministic" | "droppedCount">,
   returnedFindings: number,
+  unanchoredInBody = 0,
 ): string[] {
   const notes: string[] = [];
   const sha = job.headSha.slice(0, 7);
@@ -74,7 +75,7 @@ export function reviewPostedNotes(
     notes.push(`Coverage (model): not_cleared = ${nc.join(", ") || "none"}`);
   }
   if (typeof job.droppedCount === "number") {
-    notes.push(`Findings: ${returnedFindings} returned, ${job.droppedCount} dropped by precision policy`);
+    notes.push(`Findings: ${returnedFindings} returned${unanchoredInBody ? ` (${unanchoredInBody} in body — no inline anchor)` : ""}, ${job.droppedCount} dropped by precision policy`);
   }
   return notes.map((n) => n.slice(0, 200)).slice(0, 8);
 }

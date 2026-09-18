@@ -21,7 +21,7 @@ import { runLocalLlm } from "./local-llm.server";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
-  filterPublishable,
+  partitionPublishable,
   gateLiveSubmission,
   isBotMention,
   schemaMergeProviderGates,
@@ -804,8 +804,8 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   if (!after || after.status === "cancelled" || after.status === "posted") return;
   if (after.origin === "github" && after.status !== "validator" && after.status !== "posting") return;
   const policy = state.settings;
-  const publishable = filterPublishable(after, policy, sample);
-  const review = buildReview(after, publishable, policy);
+  const { inline, unanchored } = partitionPublishable(after, policy, sample);
+  const review = buildReview(after, inline, unanchored, policy);
 
   if (!review) {
     patchJob(jobId, (j) => ({
@@ -878,7 +878,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
             githubError,
             updatedAt: Date.now(),
             mergeRecommendation: review.event,
-            findings: publishable.length ? publishable : j.findings,
+            findings: j.findings,
           }
         : j,
     ),
@@ -899,7 +899,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
     }
   }
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
-  const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, publishable.length);
+  const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
 }
 

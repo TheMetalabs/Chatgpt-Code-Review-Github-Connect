@@ -68,44 +68,74 @@ export function mergeEvent(findings: Finding[], settings: BotSettings): MergeRec
   return SEVERITY_RANK[highest] <= SEVERITY_RANK[settings.requestChangesMin] ? "REQUEST_CHANGES" : "COMMENT";
 }
 
-export function publishableFindings(
+/**
+ * Split real, in-scope findings into inline-anchorable vs `unanchored`.
+ *
+ * A finding is filtered out ONLY by deliberate precision knobs: a hedge under
+ * `precisionOverRecall`, an out-of-scope file, or a severity below `publishMinSeverity`.
+ * A finding that clears those gates is NEVER discarded — it is either an inline comment
+ * (when its line maps to a commentable diff line and we are under the inline cap) or it is
+ * surfaced in the review body (`unanchored`). This stops a real finding whose reported line
+ * is off (e.g. a line number past the end of the file) or that overflows the inline cap from
+ * silently turning a review "clean".
+ */
+export function partitionFindings(
   findings: Finding[],
   settings: BotSettings,
   sample?: SamplePr,
-): Finding[] {
+): { inline: Finding[]; unanchored: Finding[] } {
   const accepted = findings.filter((f) => f.status === "accepted");
   const ranked = [...accepted].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
   const cap = Math.max(0, settings.maxInlineComments);
   const commentable = sample?.diff ? commentableRightLines(sample.diff) : new Map<string, Set<number>>();
-  const out: Finding[] = [];
+  const inline: Finding[] = [];
+  const unanchored: Finding[] = [];
   for (const f of ranked) {
-    if (out.length >= cap) break;
     if (settings.precisionOverRecall && isHedge(f)) continue;
-    if (!fileExistsOnHead(sample, f.file, f.line)) continue;
     if (!inChangedPaths(sample, f.file)) continue;
     if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[settings.publishMinSeverity]) continue;
-    if (commentable.size) {
-      const snapped = snapToCommentableLine(f.file, f.line, commentable);
-      if (snapped == null) continue;
-      out.push(snapped === f.line ? f : { ...f, line: snapped });
-      continue;
-    }
-    out.push(f);
+    const anchored = inline.length < cap ? anchorInline(f, sample, commentable) : null;
+    if (anchored) inline.push(anchored);
+    else unanchored.push(f);
   }
-  return out;
+  return { inline, unanchored };
+}
+
+/** The finding re-lined to a commentable diff line, or null if it cannot anchor an inline comment. */
+function anchorInline(f: Finding, sample: SamplePr | undefined, commentable: Map<string, Set<number>>): Finding | null {
+  if (!fileExistsOnHead(sample, f.file, f.line)) return null;
+  if (!commentable.size) return f; // no diff context (sample/test path) — keep inline as-is
+  const snapped = snapToCommentableLine(f.file, f.line, commentable);
+  if (snapped == null) return null;
+  return snapped === f.line ? f : { ...f, line: snapped };
+}
+
+export function publishableFindings(findings: Finding[], settings: BotSettings, sample?: SamplePr): Finding[] {
+  return partitionFindings(findings, settings, sample).inline;
+}
+
+export function partitionPublishable(
+  job: Job,
+  settings: BotSettings,
+  sample?: SamplePr,
+): { inline: Finding[]; unanchored: Finding[] } {
+  return partitionFindings(job.findings, settings, sample ?? SAMPLE_PRS[job.sampleKey ?? ""]);
 }
 
 export function filterPublishable(job: Job, settings: BotSettings, sample?: SamplePr): Finding[] {
-  return publishableFindings(job.findings, settings, sample ?? SAMPLE_PRS[job.sampleKey ?? ""]);
+  return partitionPublishable(job, settings, sample).inline;
 }
 
-export function buildReview(job: Job, findings: Finding[], settings: BotSettings): PostedReview | null {
+export function buildReview(job: Job, inline: Finding[], unanchored: Finding[], settings: BotSettings): PostedReview | null {
+  const all = [...inline, ...unanchored];
   const mentioned = isBotMention(job.thread?.userText, settings);
-  if (findings.length === 0 && !mentioned) return null;
+  if (all.length === 0 && !mentioned) return null;
 
-  const event = mergeEvent(findings, settings);
+  // Verdict reflects every real finding, not just the ones that got an inline anchor —
+  // an unanchored P1 must still make the review REQUEST_CHANGES, never "clean".
+  const event = mergeEvent(all, settings);
 
-  const comments: PostedComment[] = findings.map((f) => ({
+  const comments: PostedComment[] = inline.map((f) => ({
     id: `c-${f.id}`,
     findingId: f.id,
     file: f.file,
@@ -114,7 +144,7 @@ export function buildReview(job: Job, findings: Finding[], settings: BotSettings
     body: inlineFindingComment(f, { owner: job.owner, repo: job.repo, headSha: job.headSha }),
   }));
 
-  const body = reviewSummaryBody(job, findings, settings.username);
+  const body = reviewSummaryBody(job, all, settings.username, unanchored);
 
   return {
     id: `rev-${job.id}`,
@@ -206,7 +236,8 @@ export function gateLiveSubmission(
     }
     parsed.push(f);
   });
-  const findings = publishableFindings(parsed, settings, snapshot);
+  const { inline, unanchored } = partitionFindings(parsed, settings, snapshot);
+  const findings = [...inline, ...unanchored];
   const rawEmpty = !Array.isArray(submitted.findings) || submitted.findings.length === 0;
   if (rawEmpty && snapshot.changedPaths.length) {
     const safe = Array.isArray(submitted.investigated_safe)
@@ -216,8 +247,9 @@ export function gateLiveSubmission(
       return { ok: false, reason: "empty findings without investigated_safe — Instant-tier skip, not a review" };
     }
   }
+  const keptIds = new Set(findings.map((f) => f.id));
   for (const f of parsed) {
-    if (!findings.includes(f)) dropped.push(`dropped ${f.file}:${f.line} (${f.title})`);
+    if (!keptIds.has(f.id)) dropped.push(`dropped ${f.file}:${f.line} (${f.title})`);
   }
   const claimed = submitted.merge_recommendation;
   if (claimed === "APPROVE" && findings.length > 0) {
@@ -423,7 +455,8 @@ export function gatePeerSubmission(
     const f = asFinding(row, i);
     if (f) keepParsed.push(f);
   });
-  const keep = publishableFindings(keepParsed, settings, snapshot);
+  const keepSplit = partitionFindings(keepParsed, settings, snapshot);
+  const keep = [...keepSplit.inline, ...keepSplit.unanchored];
   const dropRaw = Array.isArray(submitted.drop) ? submitted.drop : [];
   const drop: PeerCheck["drop"] = [];
   for (const row of dropRaw.slice(0, 8)) {

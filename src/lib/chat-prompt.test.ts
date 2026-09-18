@@ -111,3 +111,33 @@ describe("buildMergePrompt", () => {
     assert.match(MERGE_FALLBACK_NOTE, /ChatGPT to merge/);
   });
 });
+
+describe("buildChatParts hunk context", () => {
+  const sample = {
+    key: "k", owner: "o", repo: "r", pr: 1, title: "t", body: "", sender: "s",
+    headSha: "abc1234", baseSha: "def5678", isFork: false, isDraft: false, labels: [],
+    changedPaths: ["src/x.ts"],
+    files: [{ path: "src/x.ts", language: "ts" as const, content: ["export function f() {", "  const a = 1;", "  return a;", "}"].join("\n") }],
+    diff: "--- src/x.ts\n@@ -1,3 +1,4 @@\n export function f() {\n+  const a = 1;\n   return a;\n }",
+  };
+
+  it("emits line-numbered hunk context, not a raw head slice", () => {
+    const { files } = buildChatParts({ sample });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap, "snapshot attachment present");
+    assert.match(snap!.body, /--- src\/x\.ts \(L\d+-L\d+\)/);
+    assert.ok(snap!.body.includes("1| "), "line-number gutter present");
+  });
+
+  it("ASHLAR_CONTEXT_MODE=head restores the raw head format", () => {
+    process.env.ASHLAR_CONTEXT_MODE = "head";
+    try {
+      const { files } = buildChatParts({ sample });
+      const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+      assert.ok(snap!.body.startsWith("--- src/x.ts\n"), "raw head format");
+      assert.doesNotMatch(snap!.body, /\(L1-/);
+    } finally {
+      delete process.env.ASHLAR_CONTEXT_MODE;
+    }
+  });
+});

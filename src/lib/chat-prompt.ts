@@ -1,5 +1,8 @@
 import type { Finding, SamplePr, SnapshotFile } from "./types.ts";
+import { DEFAULT_SETTINGS } from "./types.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
+import { orderFiles, rankChangedFile } from "./review-budget.ts";
+import { parseHunks, sliceContext } from "./context-slice.ts";
 
 export const CHAT_JSON_HINT = `{
   "merge_recommendation": "REQUEST_CHANGES" | "COMMENT" | "APPROVE",
@@ -47,21 +50,78 @@ export function reviewSnapshotFiles(sample: SamplePr): SnapshotFile[] {
 
 export type ReviewAttach = { name: string; body: string };
 
+// Recover each file's patch from the diff. Handles both ashlar's own
+// "--- {path}\n@@..." blocks and full "git diff" output ("--- a/path\n+++ b/path").
+// A "--- " line is a file marker only when followed by "@@" or "+++ " so that
+// removed content lines beginning with "--- " inside a hunk are not misread.
+function patchesByPath(diff: string): Map<string, string> {
+  const lines = String(diff || "").split("\n");
+  const out = new Map<string, string>();
+  let path: string | null = null;
+  let buf: string[] = [];
+  const flush = () => {
+    if (path !== null) out.set(path, (out.has(path) ? `${out.get(path)}\n` : "") + buf.join("\n"));
+    buf = [];
+  };
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const next = lines[i + 1] ?? "";
+    const m = /^--- (.+)$/.exec(line);
+    if (m && (next.startsWith("@@") || next.startsWith("+++ "))) {
+      flush();
+      path = m[1].replace(/^a\//, "").replace(/\t.*$/, "").trim();
+      continue;
+    }
+    if (path !== null) buf.push(line);
+  }
+  flush();
+  return out;
+}
+
+// WHY: replace the "first 20K chars of each changed file" snapshot with the head
+// text enclosing every changed hunk (+ same-file helper defs), so large files'
+// changed functions actually reach the reviewer.
+function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines: number, maxChars: number): string {
+  const patchByPath = patchesByPath(sample.diff);
+  const codeFiles = orderFiles(snapshots.filter((f) => rankChangedFile(f.path) === 0));
+  const blocks: string[] = [];
+  let remaining = maxChars;
+  for (const f of codeFiles) {
+    if (remaining <= 0) break;
+    const patch = patchByPath.get(f.path) ?? "";
+    const hunks = parseHunks(patch);
+    if (!hunks.length) continue;
+    const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: remaining, patch });
+    if (sliced.text) {
+      blocks.push(sliced.text);
+      remaining -= sliced.text.length + 2;
+    }
+  }
+  return blocks.join("\n\n");
+}
+
 export function buildChatParts(opts: {
   sample: SamplePr;
   extra?: string;
   untrustedBody?: string;
+  contextMaxChars?: number;
+  contextPadLines?: number;
 }): { prompt: string; files: ReviewAttach[] } {
   const snapshots = reviewSnapshotFiles(opts.sample);
+  // ASHLAR_CONTEXT_MODE=head restores the pre-change behavior (file-head slices).
+  const mode = process.env.ASHLAR_CONTEXT_MODE === "head" ? "head" : "hunks";
+  const contextBody =
+    mode === "head"
+      ? snapshots.map((f) => `--- ${f.path}\n${f.content.slice(0, 20_000)}`).join("\n\n").slice(0, 120_000)
+      : buildHunkContext(
+          opts.sample,
+          snapshots,
+          opts.contextPadLines ?? DEFAULT_SETTINGS.contextPadLines,
+          opts.contextMaxChars ?? DEFAULT_SETTINGS.promptContextMaxChars,
+        );
   const files: ReviewAttach[] = [
     { name: "ashlar-diff.patch", body: String(opts.sample.diff || "") },
-    {
-      name: "ashlar-snapshot.md",
-      body: snapshots
-        .map((f) => `--- ${f.path}\n${f.content.slice(0, 20_000)}`)
-        .join("\n\n")
-        .slice(0, 120_000),
-    },
+    { name: "ashlar-snapshot.md", body: contextBody },
   ].filter((f) => f.body.trim());
   const prompt = [
     REVIEW_INSTRUCTIONS,
@@ -71,7 +131,7 @@ export function buildChatParts(opts: {
     opts.extra ? `<<<UNTRUSTED_USER_LINE>>>\n${opts.extra.slice(0, 500)}\n<<<END>>>` : "",
     opts.untrustedBody ? `<<<UNTRUSTED_PR_BODY>>>\n${opts.untrustedBody.slice(0, 800)}\n<<<END>>>` : "",
     files.length
-      ? "Attached files: ashlar-diff.patch (the PR diff) and ashlar-snapshot.md (head text of changed files). Review those attachments. Do not ask for more files."
+      ? "Attached files: ashlar-diff.patch (the PR diff) and ashlar-snapshot.md (head text around every changed hunk with line numbers, plus same-file definitions of the helpers they call). Review those attachments. Do not ask for more files."
       : "",
     "Return exactly this JSON shape:",
     CHAT_JSON_HINT,
@@ -100,6 +160,8 @@ export function buildChatPrompt(opts: {
   sample: SamplePr;
   extra?: string;
   untrustedBody?: string;
+  contextMaxChars?: number;
+  contextPadLines?: number;
 }): string {
   const { prompt, files } = buildChatParts(opts);
   const encoded = encodeChatAttachments(files);

@@ -41,6 +41,7 @@ async function fixture(t,{fallback=true,text=invalid}={}){
 test('completed malformed source frees the only tab slot before Local finishes, then repairs without a tab',async t=>{
  const f=await fixture(t);const next=f.app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'next-pr',event:'issue_comment',payload:{action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:2,pull_request:{},title:'second PR'},comment:{id:43,body:'@ashlar-bot review'}}});await eventually(()=>f.app.harbor.getHarbor().jobs.find(j=>j.id===next.jobId)?.status==='awaiting_chat','next not ready');
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.includes(10);},'completed source held a tab while Local is pending');
+ await eventually(async()=>{await f.cycle();return f.app.localRequests.length===1;},'archived source did not start Local repair after releasing the tab');
  assert.equal(f.app.reviews.length,0);assert.equal(f.app.localRequests.length,1);assert.equal(await f.page.evaluate(()=>clicks),0);
  assert.equal(f.app.history.getJob(f.job.jobId,true).captures[0].text,invalid);
  assert.equal(f.worker.local.state.pendingReviewJobs[f.job.jobId].prompt,undefined,'browserless backlog must not retain full review prompts');

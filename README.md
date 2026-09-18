@@ -233,6 +233,21 @@ ChatGPT나 Grok을 켜 두면 Ashlar가 이 머신 Chrome에 이미 로그인된
 
 램프가 `connected`이면 PR 웹훅이 들어올 때 확장이 잡을 가져갑니다. 잡은 탭을 닫고 다음 리뷰는 새 채팅에서 시작합니다.
 
+### 압축해제 확장 프로그램 업데이트 helper
+
+확장 팝업의 **Update & Reload**를 쓰려면 로컬 helper를 별도로 실행합니다. helper는 임의의 Chrome 확장을 신뢰하지 않으며, 현재 Ashlar 확장의 정확한 ID로 고정해야 합니다.
+
+1. `chrome://extensions`에서 **Ashlar Chat Bridge**의 확장 프로그램 ID를 확인합니다.
+2. 같은 ID를 환경 변수로 지정해 helper를 시작합니다.
+
+```bash
+ASHLAR_EXTENSION_UPDATER_EXTENSION_ID=<32-character-extension-id> npm run extension:update-helper
+```
+
+포트를 바꾸려면 helper의 `ASHLAR_EXTENSION_UPDATE_PORT`와 팝업의 **Local updater port**를 같은 값으로 설정합니다. helper는 `127.0.0.1`에만 바인딩되며, 설정된 Ashlar 확장 ID가 아닌 다른 `chrome-extension://` origin의 status/update/rollback 요청은 거절합니다.
+
+업데이트/롤백 중 팝업을 닫아도 maintenance lock을 시간 만료로 풀지 않습니다. helper가 operation ID와 완료 상태를 저장하므로, 팝업을 다시 열면 기존 작업이 완료됐는지 확인한 뒤 reload를 이어가거나, mutation이 중단됐음이 확인된 경우에만 lock을 해제합니다.
+
 쿼타가 떨어지면 되는 쪽만 쓰고, 둘 다 안 되면 ChatGPT는 약 5시간, Grok(SuperGrok 채팅)은 약 일주일 주기로 다시 시도합니다.
 
 확장이 없거나 실패하면 Jobs 화면에서 JSON을 직접 붙여 넣을 수 있습니다.

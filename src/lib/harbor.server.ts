@@ -504,6 +504,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     untrustedBody,
     contextMaxChars: state.settings.promptContextMaxChars,
     contextPadLines: state.settings.contextPadLines,
+    policyMaxChars: state.settings.promptPolicyMaxChars,
   });
   recordReviewCoverage(jobId, prompt, sample);
   const order = normalizeReviewOrder(state.settings.reviewOrder);

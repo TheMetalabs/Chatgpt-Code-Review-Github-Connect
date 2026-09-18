@@ -4,6 +4,7 @@ import { FINDING_412, SAMPLE_PRS } from "./samples.ts";
 import {
   CHAT_JSON_HINT,
   MERGE_FALLBACK_NOTE,
+  REVIEW_INSTRUCTIONS,
   REVIEW_OFFLINE_RULE,
   buildChatParts,
   buildChatPrompt,
@@ -139,5 +140,52 @@ describe("buildChatParts hunk context", () => {
     } finally {
       delete process.env.ASHLAR_CONTEXT_MODE;
     }
+  });
+});
+
+describe("ashlar-policy.md attachment", () => {
+  const base = { key: "k", owner: "o", repo: "r", pr: 1, title: "t", body: "", sender: "s", headSha: "abc1234", baseSha: "def5678", isFork: false, isDraft: false, labels: [] as string[] };
+  const withPolicy = {
+    ...base,
+    changedPaths: ["src/x.ts"],
+    files: [
+      { path: "AGENTS.md", language: "md" as const, content: "# Repo\n\n## Code Review Rules\n\n- always check nulls\n\n## Other\n\nnoise" },
+      { path: "src/x.ts", language: "ts" as const, content: ["export function f() {", "  return 1;", "}"].join("\n") },
+    ],
+    diff: "--- src/x.ts\n@@ -1,2 +1,3 @@\n export function f() {\n+  return 1;\n }",
+  };
+
+  it("delivers unchanged repo policy despite the changed-file snapshot filter", () => {
+    const { files } = buildChatParts({ sample: withPolicy });
+    const policy = files.find((f) => f.name === "ashlar-policy.md");
+    assert.ok(policy, "policy attachment present");
+    assert.match(policy!.body, /Code Review Rules/);
+    assert.match(policy!.body, /always check nulls/);
+    assert.doesNotMatch(policy!.body, /noise/);
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(!snap || !snap.body.includes("AGENTS.md"), "unchanged policy not in the snapshot attachment");
+  });
+
+  it("excludes sandbox policy content", () => {
+    const sandbox = { ...withPolicy, files: [{ path: "AGENTS.md", language: "md" as const, content: "# App Builder Workspace\nimagine_*" }, withPolicy.files[1]] };
+    const { files } = buildChatParts({ sample: sandbox });
+    assert.ok(!files.some((f) => f.name === "ashlar-policy.md"), "sandbox policy produces no attachment");
+  });
+
+  it("honors ASHLAR_POLICY_ATTACH=0", () => {
+    process.env.ASHLAR_POLICY_ATTACH = "0";
+    try {
+      const { files } = buildChatParts({ sample: withPolicy });
+      assert.ok(!files.some((f) => f.name === "ashlar-policy.md"));
+    } finally {
+      delete process.env.ASHLAR_POLICY_ATTACH;
+    }
+  });
+
+  it("instructions allow unchanged-code evidence and require coverage; schema has coverage", () => {
+    assert.match(REVIEW_INSTRUCTIONS, /may run through unchanged code/);
+    assert.match(REVIEW_INSTRUCTIONS, /ashlar-policy\.md \(repository review rules\)/);
+    assert.match(REVIEW_INSTRUCTIONS, /coverage: one entry per changed code file/);
+    assert.match(CHAT_JSON_HINT, /"coverage"/);
   });
 });

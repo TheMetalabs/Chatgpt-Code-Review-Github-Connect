@@ -388,7 +388,24 @@ function installReviewRunner(name, run) {
             ? {ok:true,accepted:true} : {ok:false,code:"capture_source_changed"});return;
         }
         const source = currentRepairSource();
-        if (!source) {reply({ok:false,code:"capture_source_unavailable"});return;}
+        if (!source) {
+          // A fresh/reloaded page can need another identical observation before
+          // source stability is established. Distinguish that from a genuinely
+          // repurposed or regenerated response so cleanup can safely preserve it.
+          let submission, bound, currentText = "";
+          try {
+            submission = state.confirmedSubmission?.record || savedSubmission();
+            if (submission?.phase === "sent") bound = boundReviewResponse(submission);
+            if (bound?.root && !bound.followup && replyDoneVisible(bound.root) && !stopButtonVisible() && !responseStreaming(bound.root))
+              currentText = assistantCorpus(bound.root).join("\n\n");
+          } catch { /* unavailable remains retryable */ }
+          if (typeof msg.context === "string" && (msg.context !== reviewPageContext() || bound?.followup ||
+              (currentText && currentText !== msg.text))) {
+            releaseManagedSlot(state);
+            reply({ok:false,code:"capture_source_changed"});return;
+          }
+          reply({ok:false,code:"capture_source_unavailable"});return;
+        }
         if (!msg.captureId || typeof msg.context !== "string") {reply({ok:false,code:"capture_source_changed"});return;}
         if (source.responseId !== msg.responseId || source.text !== msg.text) {
           // The worker secured its original elsewhere. The replacement is user-owned.

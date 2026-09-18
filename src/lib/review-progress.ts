@@ -1,7 +1,10 @@
 /** Observations only. None of these stages authorizes completion or another prompt. */
 export const PROGRESS_LABELS = {
+    source_archive_saved: "Full completed source stored · verifying page receipt",
+    source_archived: "Full source secured · formatting no longer requires the tab",
+    cleanup_restored: "Stored result matches restored page · cleanup state recovered",
     repair_running: "Original response secured · Local JSON repair queued or running",
-    repair_ready: "Local repair candidate validated · waiting for original-page recheck",
+    repair_ready: "Local repair candidate validated · waiting for source/receipt check",
     repair_accepted: "Local format repair accepted for the original reviewer",
     repair_disabled: "Local JSON repair disabled · original retained",
     repair_superseded: "Local repair superseded · no candidate applied",

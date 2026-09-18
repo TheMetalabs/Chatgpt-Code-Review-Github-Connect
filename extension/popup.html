@@ -12,6 +12,9 @@
     <label>Bridge token</label>
     <input id="token" type="password" autocomplete="off" placeholder="from Ashlar Settings" />
     <label class="row"><input id="enabled" type="checkbox" checked /> Enabled</label>
+    <label for="maxReviewTabs">Managed review tab limit (1–16)</label>
+    <input id="maxReviewTabs" type="number" min="1" max="16" step="1" value="4" />
+    <p class="muted">Limits managed browser resources, not total personal ChatGPT/Grok tabs. Completed sources can be archived before formatting finishes. Increasing this does not fix unsaved responses.</p>
     <button id="save">Save & connect</button>
     <p id="status" class="muted"></p>
     <section aria-label="Bridge diagnostics">

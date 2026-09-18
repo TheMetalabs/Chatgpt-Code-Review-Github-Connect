@@ -2,6 +2,9 @@ import { createFileRoute } from "@tanstack/react-router";
 import { bridgePromptText } from "@/lib/chat-prompt";
 import type { ProviderError, ReviewProvider } from "@/lib/types";
 import {
+  recoverBridgeJob,
+  captureBridgeSource,
+  readBridgeCapture,
   handleBridgeRepair,
   bridgeFormatErrors,
   recordBridgeProgress,
@@ -76,10 +79,14 @@ export const Route = createFileRoute("/api/bridge")({
         const body = (await request.json().catch(() => ({}))) as {
           action?: string;
           clientId?: string;
+          bindings?: unknown;
+          workerStatus?: unknown;
+          extensionVersion?: unknown;
           attachmentProtocol?: number;
           repairProtocol?: number;
-          repairId?: string; responseId?: string; sourceHash?: string;
-          source?: {text?: unknown; totalChars?: unknown; truncated?: unknown; responseId?: unknown; completed?: unknown; stable?: unknown};
+          captureProtocol?: number;
+          captureId?: string; repairId?: string; responseId?: string; sourceHash?: string;
+          source?: {captureId?: unknown; text?: unknown; totalChars?: unknown; truncated?: unknown; responseId?: unknown; completed?: unknown; stable?: unknown};
           leaseId?: string;
           excludeJobIds?: string[];
           progress?: unknown;
@@ -102,9 +109,15 @@ export const Route = createFileRoute("/api/bridge")({
         if (!bridgeTokenOk(tokenFrom(request, body.token))) {
           return Response.json({ ok: false, error: "bad token" }, { status: 401, headers });
         }
-        bridgeHeartbeat();
+        bridgeHeartbeat(body.workerStatus, body.extensionVersion);
         if (body.action === "rotate") {
           return Response.json({ ok: true, token: rotateBridgeToken().token, bridge: getBridgePublic() }, { headers });
+        }
+        if (["capture", "capture-read"].includes(body.action || "") && body.jobId) {
+          try {
+            const {http, ...result} = (body.action === "capture-read" ? readBridgeCapture : captureBridgeSource)({...body,jobId:body.jobId});
+            return Response.json(result,{status:http,headers});
+          } catch {return Response.json({ok:false,error:"full source archive unavailable; tab must be retained"},{status:503,headers});}
         }
         if (["repair", "repair-status", "repair-commit"].includes(body.action || "") && body.jobId) {
           try {
@@ -152,6 +165,10 @@ export const Route = createFileRoute("/api/bridge")({
           }
           return Response.json({ ok: true, bridge: getBridgePublic() }, { headers });
         }
+        if (body.action === "recover") {
+          return Response.json({ok:true,bridge:getBridgePublic(),job:promptsForClient(
+            recoverBridgeJob(String(body.clientId || ""),body.bindings),body.attachmentProtocol)}, {headers});
+        }
         if (body.action === "take") {
           return Response.json({ ok: true, bridge: getBridgePublic(), job: promptsForClient(takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : []), body.attachmentProtocol) }, { headers });
         }
@@ -178,7 +195,7 @@ export const Route = createFileRoute("/api/bridge")({
                 .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? ""), originalText: typeof r.originalText === "string" ? r.originalText : undefined }))
             : undefined;
           if (body.repairProtocol === 1) {
-            const errors = bridgeFormatErrors(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
+            const errors = bridgeFormatErrors(body.jobId, String(body.raw ?? ""), legs, body.leaseId, body.captureProtocol === 1);
             if (errors.length) return Response.json({ok:false,code:"json_repair_required",error:"completed response requires format repair",errors},{status:422,headers});
           }
           const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId);

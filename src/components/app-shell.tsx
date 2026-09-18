@@ -1,3 +1,4 @@
+import {workerStatusLabel} from "@/lib/bridge-worker-status";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useEffect } from "react";
 import {
@@ -114,8 +115,12 @@ export function AppShell({ children }: { children: ReactNode }) {
             </div>
             <div className="mt-1 flex items-center gap-2 font-mono text-[11px] text-fg-muted">
               <span className={cn("size-1.5 rounded-full", bridge.connected ? "bg-ok" : "bg-fg-subtle")} />
-              {bridge.connected ? "Chat bridge live" : "Chat bridge idle"}
+              {bridge.connected ? "Chat heartbeat connected" : "Chat heartbeat disconnected"}
             </div>
+            <p className="mt-1 text-xs text-fg-muted" aria-live="polite">
+              {workerStatusLabel(bridge.workerStatus, Boolean(bridge.connected && bridge.workerStatusFresh))}
+              {bridge.workerStatus ? ` · extension ${bridge.workerStatus.extensionVersion} · source backlog ${bridge.workerStatus.sourceCaptured} · cleanup ${bridge.workerStatus.pendingCleanup}` : ""}
+            </p>
           </div>
         </aside>
 
@@ -135,6 +140,10 @@ export function AppShell({ children }: { children: ReactNode }) {
             {sync.status === "loading" ? "Loading operational data — no sample reviews are shown." : sync.status === "error" ?
               `Live data unavailable: ${sync.error} Previously loaded rows may be stale.` : "Live operational data loaded."}
             {sync.lastSuccessAt ? ` Last successful refresh: ${new Date(sync.lastSuccessAt).toLocaleTimeString()}.` : ""}
+              <p aria-label="Browser worker status">{bridge.connected ? "Chrome heartbeat connected. " : "Chrome heartbeat disconnected. "}
+                {workerStatusLabel(bridge.workerStatus, Boolean(bridge.connected && bridge.workerStatusFresh))}
+                {bridge.workerStatus ? ` · source backlog ${bridge.workerStatus.sourceCaptured} · cleanup ${bridge.workerStatus.pendingCleanup} · extension ${bridge.workerStatus.extensionVersion}` : ""}
+              </p>
             {historyHealth && !historyHealth.ok ? <p className="text-danger">History storage unavailable: {historyHealth.error}. Results are not acknowledged until their archive is saved.</p> : null}
           </div>
           <main id="main" className="flex-1 pb-20 md:pb-0">

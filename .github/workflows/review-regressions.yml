@@ -26,7 +26,7 @@ jobs:
       # Independent of legacy template tests; requires no npm dependencies or LLM spend.
       - run: npm run test:review-regressions
       - name: Signed mention admission and lifecycle fixtures
-        run: node --experimental-strip-types --experimental-vm-modules --test tests/review/mentions.e2e.mjs tests/review/parallel.e2e.mjs tests/review/long-wait.e2e.mjs tests/review/observability.e2e.mjs tests/review/json-repair.e2e.mjs
+        run: node --experimental-strip-types --experimental-vm-modules --test tests/review/mentions.e2e.mjs tests/review/parallel.e2e.mjs tests/review/long-wait.e2e.mjs tests/review/observability.e2e.mjs tests/review/json-repair.e2e.mjs tests/review/source-capture.e2e.mjs
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -74,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          node --experimental-strip-types --experimental-vm-modules --test tests/review/browser.e2e.mjs tests/review/submission.e2e.mjs tests/review/captured-dom-shapes.e2e.mjs tests/review/history-ui.e2e.mjs tests/review/json-repair-browser.e2e.mjs tests/review/json-repair-ui.e2e.mjs 2>&1 | tee /tmp/review-browser-tests.log
+          node --experimental-strip-types --experimental-vm-modules --test tests/review/browser.e2e.mjs tests/review/submission.e2e.mjs tests/review/captured-dom-shapes.e2e.mjs tests/review/history-ui.e2e.mjs tests/review/json-repair-browser.e2e.mjs tests/review/capacity-browser.e2e.mjs tests/review/json-repair-ui.e2e.mjs 2>&1 | tee /tmp/review-browser-tests.log
       - name: Preserve browser assertion logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4

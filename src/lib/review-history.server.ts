@@ -34,6 +34,10 @@ type Step = {
     provider?: string;
     runId?: string;
 };
+export type CapturedResponse = {
+    id: string; jobId: string; provider: "chatgpt" | "grok"; runId: string;
+    responseId: string; sourceHash: string; headSha: string; text: string; at: number;
+};
 type StoredResponse = {
     json: string;
     original: string;
@@ -270,6 +274,33 @@ export class ReviewHistoryStore {
     listRepairs(jobId: string): RepairRecord[] {
         return (this.read<string[]>(this.jobKey(jobId,"repairs")) || []).map(id=>this.getRepair(jobId,id)).filter((r):r is RepairRecord=>Boolean(r));
     }
+    /** Full immutable source escrow. This is NOT a parsed result or a review vote. */
+    putCapture(record: CapturedResponse) {
+        if (!this.read<Summary>(this.jobKey(record.jobId))) throw new Error("history_job_missing");
+        if (!/^[a-f0-9]{64}$/.test(record.id) || !record.text.trim() ||
+            record.text.length > this.limits.maxResponseChars || hash(record.text) !== record.sourceHash)
+            throw new Error("capture_archive_limit_or_hash");
+        const key = this.jobKey(record.jobId, "captures"), ids = this.read<string[]>(key) || [];
+        if (!ids.includes(record.id) && ids.length >= 8) throw new Error("capture_attempt_limit");
+        const previous = this.getCapture(record.jobId, record.id);
+        if (previous && JSON.stringify({...previous, at:0}) !== JSON.stringify({...record, at:0}))
+            throw new Error("capture_is_immutable");
+        const stored = previous || record;
+        if (!previous) this.write(this.jobKey(record.jobId, `capture-${record.id}`), stored);
+        if (!ids.includes(record.id)) this.write(key, [...ids, record.id]);
+        // A failed index/step write must be retried before granting the receipt.
+        this.append(record.jobId, {id:`capture:${record.id}`, stage:"response.source_archived", source:"server",
+            provider:record.provider, runId:record.runId, at:stored.at});
+        return stored;
+    }
+    getCapture(jobId: string, id: string): CapturedResponse | null {
+        if (!/^[a-f0-9]{64}$/.test(id)) return null;
+        return this.read<CapturedResponse>(this.jobKey(jobId, `capture-${id}`));
+    }
+    listCaptures(jobId: string): CapturedResponse[] {
+        return (this.read<string[]>(this.jobKey(jobId,"captures")) || []).map(id=>this.getCapture(jobId,id))
+            .filter((record):record is CapturedResponse=>Boolean(record));
+    }
     recordReview(review: PostedReview) {
         if (!this.read<Summary>(this.jobKey(review.jobId)))
             return;
@@ -318,7 +349,11 @@ export class ReviewHistoryStore {
             const {original, candidate, raw, ...metadata} = record;
             return includeResponses ? record : metadata;
         });
-        return { job, repairs, steps: log?.items || [], droppedSteps: log?.dropped || 0, review: this.read(this.jobKey(id, "review")),
+        const captures = this.listCaptures(id).map(record => {
+            const {text, ...metadata} = record;
+            return includeResponses ? {...record,totalChars:text.length} : {...metadata, totalChars:text.length};
+        });
+        return { job, repairs, captures, steps: log?.items || [], droppedSteps: log?.dropped || 0, review: this.read(this.jobKey(id, "review")),
             ...(includeResponses ? { responses, observations } : {}), historical: true };
     }
     private page<T extends {

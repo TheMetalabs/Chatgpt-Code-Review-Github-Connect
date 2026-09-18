@@ -102,7 +102,9 @@ describe("poster", () => {
     assert.ok(mentioned);
     assert.ok(mentioned);
     assert.equal(mentioned.event, "COMMENT");
-    assert.equal(mentioned.body, "Didn't find any major issues.");
+    assert.equal(mentioned.body.split("\n")[0], "Didn't find any major issues.");
+    assert.match(mentioned.body, /Didn.t find any major issues/);
+    assert.match(mentioned.body, /Reviewed commit:/);
   });
 
   it("drops findings whose file is not in changedPaths", () => {

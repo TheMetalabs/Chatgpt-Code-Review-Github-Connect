@@ -1038,6 +1038,27 @@ function enqueueFromDecision(
   for (const item of state.jobs) if (item.id === job.id || item.skipReason === `superseded by ${job.id}`) recordJobHistory(item);
   // Supersession is an explicit cancellation, not a timer.
   for (const previous of state.jobs) if (previous.status === "cancelled") localControllers.get(previous.id)?.abort();
+  // A superseded job's ops comment keeps its last "running" state and looks stuck
+  // forever. Mark those comments terminal so a re-trigger doesn't leave a phantom
+  // in-flight review. Best-effort — never blocks or fails the newly enqueued job.
+  if (opts.origin === "github" && opts.installationId !== undefined) {
+    const installationId = opts.installationId;
+    const supersededOps = state.jobs.filter(
+      (j) => j.skipReason === `superseded by ${job.id}` && j.origin === "github" && j.opsCommentId,
+    );
+    if (supersededOps.length) {
+      void (async () => {
+        try {
+          const token = await installationToken(installationId);
+          for (const s of supersededOps) {
+            await upsertOpsComment(token, s.id, "skipped", ["Superseded by a newer review request."]);
+          }
+        } catch {
+          /* ops comment is best-effort — a stale comment must never fail the new review */
+        }
+      })();
+    }
+  }
   if (opts.origin === "github") void playGithub(job.id, opts.untrustedBody ?? "");
   else void playTape(job.id, { forceDlq: opts.forceDlq });
   return { httpStatus: 202, jobId: job.id, queued: true };

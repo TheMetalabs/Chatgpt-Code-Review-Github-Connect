@@ -12,7 +12,7 @@ import {
   tracesForMention,
 } from "./samples";
 import { decideIngress, acceptedDeliveryIds } from "./ingress";
-import { buildReview, filterPublishable, isBotMention } from "./poster";
+import { buildReview, partitionPublishable, isBotMention } from "./poster";
 import { sleep } from "./utils";
 import type { BotSettings, GithubReady, Job, PostedReview, Trigger, WebhookLog } from "./types";
 import { DEFAULT_SETTINGS, LIVE_INFLIGHT_STATUSES, isMaskedSecret } from "./types";
@@ -169,8 +169,8 @@ async function playJob(
   const after = current();
   if (!after) return;
   const liveSettings = get().settings;
-  const publishable = filterPublishable(after, liveSettings, sample);
-  const review = buildReview(after, publishable, liveSettings);
+  const { inline, unanchored } = partitionPublishable(after, liveSettings, sample);
+  const review = buildReview(after, inline, unanchored, liveSettings);
 
   if (!review) {
     set((s) => ({
@@ -207,7 +207,7 @@ async function playJob(
             postedReviewId: review.id,
             updatedAt: Date.now(),
             mergeRecommendation: review.event,
-            findings: publishable.length ? publishable : j.findings,
+            findings: j.findings,
           }
         : j,
     ),

@@ -121,7 +121,8 @@ test('maintenance lock blocks new admission and tab allocation until released',a
  assert.equal(takes,0);
  assert.equal(b.tabs.size,0);
  assert.equal(b.local.state.bridgeWorkerStatus.admissionPhase,'maintenance');
- await b.local.remove(['extensionMaintenance']);
+ await b.context.releaseMaintenance('maint-1');
+ assert.equal(b.local.state.extensionMaintenance,undefined,'supported release must clear the durable maintenance lock');
  await b.context.allocateProviderTab(job,'chatgpt',jobs);
  assert.equal(b.tabs.size,1);
 });

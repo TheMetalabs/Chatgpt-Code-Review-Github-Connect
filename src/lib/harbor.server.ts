@@ -761,6 +761,15 @@ export async function submitHarborChat(
     [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
     state.settings,
   );
+  // Union model coverage across providers (a file is not_cleared if any provider says so).
+  // Coverage + droppedCount never affect the verdict — recorded for the ops comment only.
+  const coverageByFile = new Map<string, { file: string; status: "cleared" | "not_cleared"; reason: string }>();
+  for (const g of gates) {
+    for (const c of g.coverage ?? []) {
+      const prev = coverageByFile.get(c.file);
+      if (!prev || (prev.status === "cleared" && c.status === "not_cleared")) coverageByFile.set(c.file, c);
+    }
+  }
   patchJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,
@@ -773,6 +782,8 @@ export async function submitHarborChat(
       ...invalid,
       ...merged.assumptions,
     ].filter(Boolean),
+    coverage: [...coverageByFile.values()],
+    droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
     plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
     updatedAt: Date.now(),
   }));

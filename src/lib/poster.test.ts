@@ -360,3 +360,48 @@ describe("consensusFromGates", () => {
   });
 });
 
+describe("gateLiveSubmission coverage", () => {
+  const sample = SAMPLE_PRS["pay-412"];
+  const okBase = { merge_recommendation: "COMMENT", findings: [] as unknown[], investigated_safe: ["all changed files reviewed"] };
+
+  it("defaults to [] when coverage is absent or not an array", () => {
+    const g1 = gateLiveSubmission(okBase, sample, DEFAULT_SETTINGS);
+    assert.ok(g1.ok);
+    if (!g1.ok) return;
+    assert.deepEqual(g1.coverage, []);
+    const g2 = gateLiveSubmission({ ...okBase, coverage: "nope" }, sample, DEFAULT_SETTINGS);
+    assert.ok(g2.ok);
+    if (!g2.ok) return;
+    assert.deepEqual(g2.coverage, []);
+  });
+
+  it("parses entries and coerces an unknown status to not_cleared", () => {
+    const g = gateLiveSubmission(
+      { ...okBase, coverage: [{ file: "src/ledger.ts", status: "cleared", reason: "ok" }, { file: "src/payment/webhook.ts", status: "weird" }] },
+      sample,
+      DEFAULT_SETTINGS,
+    );
+    assert.ok(g.ok);
+    if (!g.ok) return;
+    assert.equal(g.coverage?.length, 2);
+    assert.equal(g.coverage?.find((c) => c.file === "src/payment/webhook.ts")?.status, "not_cleared");
+  });
+
+  it("never changes the verdict: coverage with zero findings stays a clean pass", () => {
+    const g = gateLiveSubmission({ ...okBase, coverage: [{ file: "src/ledger.ts", status: "not_cleared", reason: "x" }] }, sample, DEFAULT_SETTINGS);
+    assert.ok(g.ok);
+    if (!g.ok) return;
+    assert.equal(g.findings.length, 0);
+  });
+
+  it("widens investigated_safe/assumptions truncation to 400 chars x 12", () => {
+    const many = Array.from({ length: 20 }, (_, i) => `${i}-${"z".repeat(500)}`);
+    const g = gateLiveSubmission({ ...okBase, investigated_safe: many, assumptions: many }, sample, DEFAULT_SETTINGS);
+    assert.ok(g.ok);
+    if (!g.ok) return;
+    assert.equal(g.investigatedSafe.length, 12);
+    assert.ok(g.investigatedSafe.every((s) => s.length <= 400));
+    assert.equal(g.assumptions.length, 12);
+  });
+});
+

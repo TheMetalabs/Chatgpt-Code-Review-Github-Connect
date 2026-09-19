@@ -17,6 +17,18 @@ describe("review-format", () => {
     assert.match(body, /not parseable JSON/i);
   });
 
+  it("surfaces skipped-provider warnings in a raw-only salvaged review", () => {
+    const body = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], assumptions: ["Skipped grok: quota or unavailable"], coverage: [], rawReview: "P1 salvaged chatgpt reply" },
+      [],
+      "ashlar-bot",
+      [],
+    );
+    assert.match(body, /salvaged chatgpt reply/);
+    assert.match(body, /Skipped grok: quota/); // partial-coverage warning not swallowed by the raw-only path
+    assert.match(body, /raw=1/);
+  });
+
   it("neutralizes a clean-pass sentinel embedded in the salvaged reply (no false-converge)", () => {
     const body = reviewSummaryBody(
       { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "Didn't find any major issues." },

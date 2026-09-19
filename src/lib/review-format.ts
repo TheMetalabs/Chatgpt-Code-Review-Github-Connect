@@ -53,8 +53,11 @@ export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" |
   // A salvaged verbatim review is NOT a clean pass: keep the clean marker/string out so the loop
   // poller does not converge, and surface the raw text for the agent.
   if (rawReview && !findings.length) {
+    // Surface skipped-provider warnings here too, so a raw-only body is not mistaken for complete
+    // multi-provider coverage when another enabled reviewer failed or hit quota.
+    const skipNote = skipped.length ? `\n${skipped.map((s) => `- ${s}`).join("\n")}\n` : "";
     return `${REVIEW_SUMMARY_MARK}
-${rawBlock}
+${rawBlock}${skipNote}
 **Reviewed commit:** \`${sha}\`
 <!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->`;
   }

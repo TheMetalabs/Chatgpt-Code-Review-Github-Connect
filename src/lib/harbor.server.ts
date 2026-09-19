@@ -158,9 +158,12 @@ export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
 export function publicJobs(jobs: Job[]) {
   const enabled = providersFromSettings(state.settings);
   return jobs.map((j) => {
-    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, ...rest } = j;
+    // rawReview is verbatim model output that can echo private PR source — treat it like storedLegs
+    // and never expose it on the unauthenticated /api/harbor; surface only a bounded boolean.
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, rawReview: _raw, ...rest } = j;
     return {
       ...rest,
+      hasRawReview: Boolean(j.rawReview),
       reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
     };
   });
@@ -336,6 +339,9 @@ async function bridgeSnapshot() {
 }
 
 const WATCH_TICK_MS = 5_000;
+// Ceiling for the salvaged verbatim review posted in the body, under GitHub's 65,535-char review
+// limit with room for the summary scaffolding. Full originals are retained in review history.
+const MAX_RAW_REVIEW_BODY = 60_000;
 
 async function watchReviewers(jobId: string, token: string) {
   let lastNotes = "";
@@ -772,9 +778,16 @@ export async function submitHarborChat(
   // the review body so the fixing agent can act instead of the job pending forever. Combine every
   // provider's salvaged reply (labeled when more than one) so no review is silently discarded.
   const salvaged = [...byProvider.entries()].filter(([, g]) => g.rawReview);
-  const rawReview = salvaged.length
-    ? salvaged.map(([provider, g]) => (salvaged.length > 1 ? `**${PROVIDER_LABEL[provider]}:**\n\n${g.rawReview}` : g.rawReview)).join("\n\n---\n\n")
-    : undefined;
+  const combinedRaw = salvaged
+    .map(([provider, g]) => (salvaged.length > 1 ? `**${PROVIDER_LABEL[provider]}:**\n\n${g.rawReview}` : g.rawReview))
+    .join("\n\n---\n\n");
+  // Keep the posted review body under GitHub's 65,535-char limit (each leg alone can be ~60 KB, so a
+  // multi-provider concatenation can overflow and DLQ the job); the full originals stay in history.
+  const rawReview = !combinedRaw
+    ? undefined
+    : combinedRaw.length > MAX_RAW_REVIEW_BODY
+      ? `${combinedRaw.slice(0, MAX_RAW_REVIEW_BODY)}\n\n…(truncated to fit GitHub's review body limit; full original responses retained in review history)`
+      : combinedRaw;
   patchJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,

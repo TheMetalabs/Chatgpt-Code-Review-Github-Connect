@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { runLocalReviewLoop, groupChangedFiles, chooseLocalReviewMode } from "../../src/lib/local-review-loop.server.ts";
+import { samplingRequestFields } from "../../src/lib/local-llm.server.ts";
 import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
 
 const settings = { ...DEFAULT_SETTINGS, reviewLocal: true, localLlmBaseUrl: "http://local/v1/", localLlmModel: "m", localLlmApiKey: "k" };
@@ -111,6 +112,25 @@ test("auto mode picks single for a small PR and multiturn for a large one", () =
 test("explicit mode overrides size-based auto selection", () => {
   assert.equal(chooseLocalReviewMode("single", 999_999, 30_000), "single");
   assert.equal(chooseLocalReviewMode("multiturn", 1, 30_000), "multiturn");
+});
+
+test("grouping keeps a changed code file that is missing from the snapshot", () => {
+  // A changed .ts whose content failed to fetch (not in sample.files) must still be grouped so it is
+  // reviewed from its diff, not silently dropped from every group.
+  const sample = sampleWith(["src/a.ts", "src/b.ts"]);
+  sample.files = sample.files.filter((f) => f.path !== "src/b.ts"); // b.ts changed but unfetched
+  const groups = groupChangedFiles(sample, { groupMaxChars: 1_000_000, maxFilesPerGroup: 6, toolIterCap: 8, ctxCapTokens: 24_000 });
+  assert.ok(groups.flat().includes("src/b.ts"), "missing-from-snapshot changed file is still grouped");
+});
+
+test("top_k is sent only when positive so strict OpenAI endpoints do not reject it", () => {
+  const base = { maxTokens: 100, temperature: 0.6, top_p: 0.95, presence_penalty: 1.0 };
+  const withK = samplingRequestFields({ ...base, top_k: 20 });
+  assert.equal(withK.top_k, 20);
+  assert.equal(withK.max_tokens, 100);
+  const noK = samplingRequestFields({ ...base, top_k: 0 });
+  assert.equal("top_k" in noK, false, "top_k omitted when 0 (non-standard OpenAI field)");
+  assert.equal(noK.temperature, 0.6); // standard fields still present
 });
 
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {

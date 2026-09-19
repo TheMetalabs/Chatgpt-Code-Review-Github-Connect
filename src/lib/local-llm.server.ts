@@ -46,6 +46,19 @@ export function localGenerationParams(settings: BotSettings): LocalGenerationPar
   };
 }
 
+// The request body's sampling fields. top_k is a vLLM/omlx extension, NOT a standard OpenAI param, so
+// it is sent only when positive — a strict OpenAI-compatible endpoint would 400 on an unknown field.
+// Set ASHLAR_LOCAL_REVIEW_TOP_K=0 to omit it. temperature/top_p/presence_penalty/max_tokens are standard.
+export function samplingRequestFields(params: LocalGenerationParams): Record<string, number> {
+  return {
+    temperature: params.temperature,
+    top_p: params.top_p,
+    presence_penalty: params.presence_penalty,
+    max_tokens: params.maxTokens,
+    ...(params.top_k > 0 ? { top_k: params.top_k } : {}),
+  };
+}
+
 /** GET /models only. A busy local endpoint may queue this as well. */
 export async function pingLocalLlm(
   settings: BotSettings,
@@ -73,11 +86,7 @@ export async function runLocalLlm(
   const params = localGenerationParams(settings);
   const call = (messages: LocalChatMessage[]) => requestLocalChat(
     ready.baseURL, ready.apiKey,
-    {
-      model: ready.model, messages,
-      temperature: params.temperature, top_p: params.top_p, top_k: params.top_k,
-      presence_penalty: params.presence_penalty, max_tokens: params.maxTokens,
-    },
+    { model: ready.model, messages, ...samplingRequestFields(params) },
     signal,
   );
   try {

@@ -50,10 +50,17 @@ function git(args) {
 }
 
 const changed = new Set();
-// Committed on this branch + all tracked working-tree changes vs the base.
-for (const f of git(["diff", "--name-only", BASE])) changed.add(f);
-// Untracked files.
-for (const f of git(["ls-files", "--others", "--exclude-standard"])) changed.add(f);
+try {
+  // Committed on this branch + all tracked working-tree changes vs the base.
+  for (const f of git(["diff", "--name-only", BASE])) changed.add(f);
+  // Untracked files.
+  for (const f of git(["ls-files", "--others", "--exclude-standard"])) changed.add(f);
+} catch (e) {
+  // A missing/unfetched base ref must fail the check cleanly, not crash with a stack trace.
+  console.error(`✗ boundary check could not diff against "${BASE}": ${e instanceof Error ? e.message : e}`);
+  console.error("Fetch the base ref (e.g. git fetch origin main) or set BOUNDARY_BASE to a resolvable ref.");
+  process.exit(1);
+}
 
 const offenders = [...changed].filter((f) => !ALLOW.has(f) && !IGNORE.has(f));
 

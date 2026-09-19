@@ -11,7 +11,7 @@
 import { buildChatParts } from "./chat-prompt.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
-import { localGenerationParams } from "./local-llm.server.ts";
+import { localGenerationParams, samplingRequestFields } from "./local-llm.server.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, LocalReviewMode, ReviewProvider, SamplePr } from "./types.ts";
 
@@ -73,6 +73,10 @@ function tuning(): LoopTuning {
 
 // --- diff → per-file patch text (for file_read_diff). Mirrors chat-prompt's marker rule: a "--- "
 // line is a file boundary only when followed by "@@" or "+++ ", so removed hunk lines are not misread.
+// Known narrow edge (shared with the frozen chat-prompt twin): a removed source line "-- x" renders
+// as "--- x" and, if it sits immediately before the next hunk header, is misread as a boundary. Left
+// as-is deliberately — hardening only this copy would diverge from chat-prompt's identical parser;
+// any fix should change both together.
 function patchesByPath(diff: string): Map<string, string> {
   const lines = String(diff || "").split("\n");
   const out = new Map<string, string>();
@@ -102,9 +106,16 @@ function patchesByPath(diff: string): Map<string, string> {
 // keeps peak KV-cache memory in check when other processes share the host.
 export function groupChangedFiles(sample: SamplePr, t: LoopTuning): string[][] {
   const contentByPath = new Map(sample.files.map((f) => [f.path, f.content]));
-  const codePaths = orderFiles(
+  const present = new Set(sample.files.map((f) => f.path));
+  // Order the files whose content we have (review-budget order keeps same-dir siblings adjacent),
+  // then append any changed code file MISSING from the snapshot (fetch returned null: too large,
+  // binary, API error). Without this they fall out of every group and are silently unreviewed; kept
+  // here they are still grouped and reviewed from their diff (file_read_diff) even with no full body.
+  const orderedPresent = orderFiles(
     sample.files.filter((f) => sample.changedPaths.includes(f.path) && rankChangedFile(f.path) === 0),
   ).map((f) => f.path);
+  const missingCode = sample.changedPaths.filter((p) => rankChangedFile(p) === 0 && !present.has(p));
+  const codePaths = [...orderedPresent, ...missingCode];
   const targets = codePaths.length ? codePaths : sample.changedPaths.slice();
   const groups: string[][] = [];
   let cur: string[] = [];
@@ -234,11 +245,7 @@ async function reviewGroup(
     const body: Record<string, unknown> = {
       model: settings.localLlmModel.trim(),
       messages,
-      temperature: params.temperature,
-      top_p: params.top_p,
-      top_k: params.top_k,
-      presence_penalty: params.presence_penalty,
-      max_tokens: params.maxTokens,
+      ...samplingRequestFields(params),
       stream: false,
       ...(forceFinal ? {} : { tools: toolDefs(), tool_choice: "auto" }),
     };

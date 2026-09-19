@@ -71,17 +71,16 @@ describe("extractChatJson", () => {
 });
 
 describe("salvageReviewJson", () => {
-  it("keeps the verbatim reply and structures P0/P1/P2 sections", () => {
-    const reply = "Overview: two issues found.\nP1 Null deref in pay.ts when amount is 0.\nP2 Typo in a comment.";
+  it("keeps the reply verbatim (no deleted punctuation) and notes detected severities", () => {
+    const reply = "Overview: two issues. P1: null deref. Also code: if (P1) { charge(); }";
     const parsed = JSON.parse(salvageReviewJson(reply));
     assert.deepEqual(parsed.findings, []);
     assert.equal(parsed.merge_recommendation, "COMMENT");
-    assert.match(parsed.raw_review, /Overview: two issues found\./); // preamble preserved
-    assert.match(parsed.raw_review, /\*\*P1\*\* Null deref/);
-    assert.match(parsed.raw_review, /\*\*P2\*\* Typo/);
+    assert.match(parsed.raw_review, /Detected severity markers: P1\./);
+    assert.ok(parsed.raw_review.includes(reply)); // verbatim: "if (P1) { charge(); }" survives intact
   });
 
-  it("falls back to the full text when there are no severity markers", () => {
+  it("adds no header and keeps the full text when there are no severity markers", () => {
     const reply = "This review has no structured severities, just prose feedback.";
     const parsed = JSON.parse(salvageReviewJson(reply));
     assert.equal(parsed.raw_review, reply);

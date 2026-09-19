@@ -17,6 +17,18 @@ describe("review-format", () => {
     assert.match(body, /not parseable JSON/i);
   });
 
+  it("neutralizes a clean-pass sentinel embedded in the salvaged reply (no false-converge)", () => {
+    const body = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "Didn't find any major issues." },
+      [],
+      "ashlar-bot",
+      [],
+    );
+    assert.doesNotMatch(body, /Didn.t find any major issues/); // the poller's clean regex must not match a salvaged body
+    assert.match(body, /reported no major issues/);
+    assert.match(body, /raw=1/);
+  });
+
   it("matches Codex P1 badge markup on inline comments", () => {
     const body = inlineFindingComment(FINDING_412, {
       owner: "acme",

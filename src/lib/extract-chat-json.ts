@@ -51,37 +51,19 @@ export function extractChatJson(text: string): string | null {
   return lastReviewJson(s);
 }
 
-/** Matches a P0/P1/P2 severity marker written as a shields badge (`![P1 Badge]`), bold, or bare. */
-const SEVERITY_MARKER = /(?:!\[\s*)?\b(P[0-2])\b(?:\s*Badge\s*\])?/g;
-
 /**
- * Build a postable review JSON when the model's reply is NOT parseable review JSON and local JSON
- * repair is unavailable — so the job resolves instead of pending forever. Recall over precision: the
- * verbatim reply is preserved in `raw_review` (surfaced in the review body) for the fixing agent to
- * interpret. When P0/P1/P2 markers are present the text is split into per-severity sections so the
- * salvaged findings stay legible; otherwise the whole reply is kept as-is. Never throws; always
- * returns a valid review-JSON string with zero structured findings (COMMENT, non-blocking).
+ * Build a postable review JSON when the model's reply is NOT parseable/valid review JSON and local
+ * JSON repair is unavailable — so the job resolves instead of pending forever. Recall over precision:
+ * the reply is kept **verbatim** in `raw_review` (it is the only evidence from an unparseable review,
+ * so no character is deleted or reflowed) and surfaced in the review body for the fixing agent. A
+ * non-destructive scan notes which P0/P1/P2 severity markers appear, without altering the text.
+ * Never throws; always returns valid review JSON with zero structured findings (COMMENT, non-blocking).
  */
 export function salvageReviewJson(text: string): string {
   const s = String(text || "").trim();
-  const matches = [...s.matchAll(SEVERITY_MARKER)];
-  let body: string;
-  if (matches.length) {
-    const parts: string[] = [];
-    const preamble = s.slice(0, matches[0].index ?? 0).trim();
-    if (preamble) parts.push(preamble);
-    for (let i = 0; i < matches.length; i += 1) {
-      const m = matches[i];
-      const start = (m.index ?? 0) + m[0].length;
-      const end = i + 1 < matches.length ? matches[i + 1].index ?? s.length : s.length;
-      const chunk = s.slice(start, end).replace(/^[\s:.)\]-]+/, "").trim();
-      parts.push(`**${m[1]}** ${chunk}`.trim());
-    }
-    body = parts.join("\n\n");
-  } else {
-    body = s;
-  }
-  return JSON.stringify({ findings: [], merge_recommendation: "COMMENT", raw_review: body.slice(0, 60_000) });
+  const severities = [...new Set(s.match(/\bP[0-2]\b/g) ?? [])].sort();
+  const header = severities.length ? `Detected severity markers: ${severities.join(", ")}.\n\n` : "";
+  return JSON.stringify({ findings: [], merge_recommendation: "COMMENT", raw_review: (header + s).slice(0, 60_000) });
 }
 
 /** ChatGPT renders the review as a markdown <p> with <br>, not a JSON API body. */

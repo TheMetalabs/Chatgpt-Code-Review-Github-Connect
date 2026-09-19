@@ -3,7 +3,9 @@ import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 export const root = fileURLToPath(new URL('../../', import.meta.url));
 export const source = name => fs.readFileSync(new URL(name, `file://${root}`), 'utf8');
-export const raw = JSON.stringify({ findings: [{ severity: 'P1', file: 'x.ts', line: 1, title: 'Bug', failure_scenario: 'a real finding' }], merge_recommendation: 'REQUEST_CHANGES' });
+// A schema-VALID review payload: completeBridgeJob accepts it as-is (no salvage/repair), so ACK-flow
+// tests can assert the stored leg equals it. (A finding missing required fields would now be salvaged.)
+export const raw = JSON.stringify({ findings: [{ severity: 'P1', file: 'x.ts', line: 1, side: 'RIGHT', title: 'Bug', failure_scenario: 'a real finding', root_cause: 'missing lock', evidence: 'x.ts:1: commit()', recommended_fix: 'hold the lock', recommended_test: 'two concurrent writes' }], merge_recommendation: 'REQUEST_CHANGES' });
 export function storage(initial = {}) {
   const state = structuredClone(initial);
   return { state,

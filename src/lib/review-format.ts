@@ -43,7 +43,10 @@ export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" |
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = providers.includes("local");
-  const rawReview = (job.rawReview ?? "").trim();
+  // Neutralize any clean-pass sentinel embedded in the verbatim reply (e.g. the model's whole answer
+  // was "Didn't find any major issues.") so a body consumer matching CLEAN_REVIEW_BODY — including the
+  // loop poller's `Didn.t find any major issues` regex — cannot converge on a deliberately non-clean body.
+  const rawReview = (job.rawReview ?? "").trim().replace(/didn['’]t find any major issues\.?/gi, "(the model reported no major issues)");
   const rawBlock = rawReview
     ? `\n**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.** Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${rawReview}\n`
     : "";

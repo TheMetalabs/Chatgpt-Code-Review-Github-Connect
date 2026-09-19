@@ -45,3 +45,16 @@ test('unparseable reply + local repair off is salvaged into a raw_review leg, ne
  // or the extension holds for a repair that never runs (the infinite-pending bug).
  assert.equal(bridge.bridgeFormatErrors('A',reply,[{provider:'chatgpt',raw:reply}],undefined,true).length,0);
 });
+test('schema-invalid (not just syntactically broken) JSON is salvaged, keeps originalText, dedups retries',async()=>{
+ const {bridge,state}=bridgeHarness([makeJob({id:'A',bridgeClaimedAt:Date.now(),reviewProviders:['chatgpt'],generating:{chatgpt:true}})]);
+ // Valid JSON, but the finding is missing recommended_test -> schema-invalid. Repair is off in the harness.
+ const reply=JSON.stringify({merge_recommendation:'REQUEST_CHANGES',findings:[{severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'t',failure_scenario:'f',root_cause:'r',evidence:'e',recommended_fix:'x'}]});
+ const out=await bridge.completeBridgeJob('A',reply,[{provider:'chatgpt',raw:reply}]); // client omits originalText
+ assert.equal(out.ok,true);
+ const leg=state.jobs[0].storedLegs.find(l=>l.provider==='chatgpt');
+ assert.deepEqual(JSON.parse(leg.raw).findings,[]); // salvaged, not accepted as a "complete" review that drops the bad finding
+ assert.match(JSON.parse(leg.raw).raw_review,/"recommended_fix":"x"/); // verbatim reply preserved
+ assert.equal(leg.originalText,reply); // exact prose kept for the archive (recordResponse cannot blank it)
+ // A lost-ack retry of the same prose normalizes to the stored salvage -> idempotent, not lease_conflict.
+ assert.equal((await bridge.completeBridgeJob('A',reply,[{provider:'chatgpt',raw:reply}])).ok,true);
+});

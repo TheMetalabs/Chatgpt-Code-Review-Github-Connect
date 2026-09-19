@@ -35,6 +35,7 @@ import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./setting
 import {
   BRIDGE_CLAIM_MS,
   LIVE_INFLIGHT_STATUSES,
+  PROVIDER_LABEL,
   isChatProvider,
   normalizeReviewOrder,
   providersFromSettings,
@@ -767,15 +768,20 @@ export async function submitHarborChat(
       if (!prev || (prev.status === "cleared" && c.status === "not_cleared")) coverageByFile.set(c.file, c);
     }
   }
+  // Verbatim reply(ies) from any leg whose JSON could not be parsed (local repair off) — surfaced in
+  // the review body so the fixing agent can act instead of the job pending forever. Combine every
+  // provider's salvaged reply (labeled when more than one) so no review is silently discarded.
+  const salvaged = [...byProvider.entries()].filter(([, g]) => g.rawReview);
+  const rawReview = salvaged.length
+    ? salvaged.map(([provider, g]) => (salvaged.length > 1 ? `**${PROVIDER_LABEL[provider]}:**\n\n${g.rawReview}` : g.rawReview)).join("\n\n---\n\n")
+    : undefined;
   patchJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,
     candidates: merged.findings,
     mergeRecommendation: merged.mergeRecommendation,
     highestRisk: merged.highestRisk,
-    // Verbatim reply from any leg whose JSON could not be parsed (local repair off) — surfaced in
-    // the review body so the fixing agent can act on it instead of the job pending forever.
-    rawReview: gates.map((g) => g.rawReview).find(Boolean),
+    rawReview,
     investigatedSafe: merged.investigatedSafe,
     assumptions: [
       skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",

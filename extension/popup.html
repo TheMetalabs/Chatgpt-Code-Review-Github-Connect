@@ -26,6 +26,8 @@
       <h2>Job polling</h2>
       <p id="worker" class="muted" aria-live="polite"></p>
       <button id="reconnect" type="button">Check connection &amp; poll now</button>
+      <button id="clearStuck" type="button">Clear stuck jobs</button>
+      <p class="muted">Retires jobs the server has forgotten (after a restart) whose review tabs are already gone. Never touches a job with a live tab or one the server still owns.</p>
     </section>
     <section aria-label="Extension updater">
       <h2>Extension update</h2>

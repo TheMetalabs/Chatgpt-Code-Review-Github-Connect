@@ -210,7 +210,19 @@ async function requestPoll() {
   }
 }
 
+async function requestClearStuck() {
+  try {
+    const res = await chrome.runtime.sendMessage({type: "ashlar-clear-stuck"});
+    statusEl.textContent = res?.ok
+      ? `Cleared ${res.cleared} stuck job(s) the server had forgotten (${res.kept} kept). Live tabs and server-owned jobs were untouched.`
+      : `Could not clear stuck jobs: ${res?.error || "unknown error"}`;
+  } catch (e) {
+    statusEl.textContent = `Worker could not be reached: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 document.getElementById("reconnect").addEventListener("click", requestPoll);
+document.getElementById("clearStuck")?.addEventListener("click", requestClearStuck);
 checkUpdateEl?.addEventListener("click", refreshExtensionUpdate);
 applyUpdateEl?.addEventListener("click", applyExtensionUpdate);
 rollbackUpdateEl?.addEventListener("click", rollbackExtensionUpdate);

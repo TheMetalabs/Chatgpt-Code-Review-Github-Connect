@@ -681,12 +681,16 @@ async function cleanupProviderBody(job, provider, jobs) {
   }
 }
 
-async function retireCleanJob(job, jobs) {
+async function retireCleanJob(job, jobs, forgotten = false) {
   if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
-  // Best-effort final trace, detached: a server that has forgotten this job can no longer acknowledge
-  // it, and its bridge fetch is deliberately unbounded — awaiting it would let a stalled bridge hang
-  // retirement (and the "Clear stuck jobs" sweep that awaits it). Fire-and-forget instead.
-  void flushProgress(job).catch(() => {});
+  // Final trace uploading terminal events (result_saved, tab_closed) to review history. For an ORDINARY
+  // retirement this is the only attempt — advanceJob retires on its early return before the next
+  // heartbeat — so AWAIT it; detaching would let those events vanish if the MV3 worker suspends before
+  // the fetch lands. For a FORGOTTEN/cancelled job the server can no longer accept the trace and the
+  // bridge fetch is deliberately unbounded, so awaiting would hang retirement and the "Clear stuck jobs"
+  // sweep; fire-and-forget there instead.
+  if (forgotten) void flushProgress(job).catch(() => {});
+  else await flushProgress(job).catch(() => {});
   await writeInOrder(async () => {
     const old = await chrome.storage.session.get(["tabs"]);
     const tabs = {...old.tabs};
@@ -1156,7 +1160,7 @@ async function abandonForgottenJob(job, jobs, explicit) {
   }
   await saveJobs(jobs);
   await joinLanes(abandon.map(provider => cleanupProvider(job, provider, jobs)));
-  return retireCleanJob(job, jobs);
+  return retireCleanJob(job, jobs, true); // forgotten/cancelled: server can't accept the final trace
 }
 
 /** Popup-triggered sweep for jobs the server has forgotten (missing/unknown) or cancelled whose tabs
@@ -1216,7 +1220,7 @@ async function advanceJob(job, jobs) {
     }
     await saveJobs(jobs);
     await joinLanes(job.providers.map(p => cleanupProvider(job, p, jobs)));
-    await retireCleanJob(job, jobs);
+    await retireCleanJob(job, jobs, true); // explicit cancellation: detach the trace like a forgotten job
     return;
   }
   // A "missing"/"unknown" status is deliberately NOT auto-retired: after a worker restart the

@@ -135,3 +135,28 @@ test('clearStuckJobs returns when storage init stalls before the sweep (deadline
   assert.equal(res.ok, true);
   assert.equal(res.timedOut, true, 'the deadline fired even though setup stalled');
 });
+
+test('retireCleanJob awaits the final trace for a normal job but detaches it for a forgotten one', { timeout: 5000 }, async () => {
+  // The final flushProgress is the only durable upload of terminal events (result_saved/tab_closed) for
+  // an ORDINARY retirement, so it must be awaited (persisted before the job is deleted). For a forgotten
+  // job the server can't accept it and the bridge fetch is unbounded, so it must be detached (never
+  // blocks the sweep). A wedged "progress" upload separates the two behaviors.
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token' }),
+    api: async (_p, body) => (body?.action === 'progress' ? new Promise(() => {}) : { ok: true }),
+  });
+  const cleanJob = () => ({
+    jobId: 'J', origin: 'http://bridge', leaseId: 'l', providers: ['chatgpt'],
+    states: { chatgpt: { delivered: true, cleanupDone: true, runId: 'r', workerEvents: [{ stage: 'result_saved', at: 1 }] } },
+  });
+  const jf = { J: cleanJob() }; // forgotten → detached: retires despite the hung upload
+  assert.equal(await b.context.retireCleanJob(jf.J, jf, true), true);
+  assert.equal('J' in jf, false, 'a forgotten job retires without waiting on the hung trace');
+  const jn = { J: cleanJob() }; // normal → awaited: must not resolve while the upload hangs
+  const race = await Promise.race([
+    b.context.retireCleanJob(jn.J, jn, false).then(() => 'resolved'),
+    new Promise((r) => setTimeout(() => r('pending'), 100)),
+  ]);
+  assert.equal(race, 'pending', 'a normal retirement waits for the durable trace upload');
+  assert.ok('J' in jn, 'the normal job is not deleted until its trace is uploaded');
+});

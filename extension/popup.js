@@ -214,7 +214,9 @@ async function requestClearStuck() {
   try {
     const res = await chrome.runtime.sendMessage({type: "ashlar-clear-stuck"});
     statusEl.textContent = res?.ok
-      ? `Cleared ${res.cleared} stuck job(s) the server had forgotten (${res.kept} kept). Live tabs and server-owned jobs were untouched.`
+      ? (res.timedOut
+          ? `Cleared ${res.cleared} so far — the sweep timed out (bridge or a tab is slow). Click again to finish the rest.`
+          : `Cleared ${res.cleared} stuck job(s) the server had forgotten (${res.kept} kept). Live tabs and server-owned jobs were untouched.`)
       : !res
         ? "No response from the worker (it may be busy or restarting). Wait a moment and try again."
         : `Could not clear stuck jobs: ${res.error || "no eligible jobs"}`;

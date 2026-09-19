@@ -683,9 +683,10 @@ async function cleanupProviderBody(job, provider, jobs) {
 
 async function retireCleanJob(job, jobs) {
   if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
-  // Best-effort final trace: a server that has forgotten this job (missing/unknown) can no
-  // longer acknowledge it, so retirement must not hinge on this diagnostics RPC succeeding.
-  await flushProgress(job).catch(() => {});
+  // Best-effort final trace, detached: a server that has forgotten this job can no longer acknowledge
+  // it, and its bridge fetch is deliberately unbounded — awaiting it would let a stalled bridge hang
+  // retirement (and the "Clear stuck jobs" sweep that awaits it). Fire-and-forget instead.
+  void flushProgress(job).catch(() => {});
   await writeInOrder(async () => {
     const old = await chrome.storage.session.get(["tabs"]);
     const tabs = {...old.tabs};
@@ -1172,12 +1173,17 @@ async function clearStuckJobs() {
     // 20+ jobs is slow enough that the popup's message response is lost ("unknown error"). Abandon
     // concurrently, isolate per-job failures, and never throw so the popup always gets a result.
     const targets = mine.filter(job => ["cancelled", "missing", "unknown"].includes(job.serverStatus));
-    const outcomes = await Promise.allSettled(
-      targets.map(job => abandonForgottenJob(job, jobs, job.serverStatus === "cancelled")),
+    let cleared = 0, timer;
+    const sweep = Promise.allSettled(
+      targets.map(async job => { if (await abandonForgottenJob(job, jobs, job.serverStatus === "cancelled") === true) cleared += 1; }),
     );
-    const cleared = outcomes.filter(o => o.status === "fulfilled" && o.value === true).length;
+    // Hard ceiling so a slow tab probe or any other unbounded wait can never strand the popup's
+    // response: report whatever finished and leave the rest for a re-click.
+    const deadline = new Promise(resolve => { timer = setTimeout(() => resolve("timeout"), 15_000); });
+    const timedOut = (await Promise.race([sweep.then(() => "done"), deadline])) === "timeout";
+    clearTimeout(timer);
     await recordWorkerStatus(jobs, cfg.origin).catch(() => {});
-    return { ok: true, cleared, kept: mine.length - cleared };
+    return { ok: true, cleared, kept: mine.length - cleared, timedOut };
   } catch (error) {
     return { ok: false, error: String(error?.message || error || "clear failed") };
   }

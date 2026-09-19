@@ -54,13 +54,17 @@ test('clearStuckJobs never touches a job the server still owns', async () => {
   assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 1);
 });
 
-test('clearStuckJobs isolates a failing job and still reports a result', async () => {
-  // A job whose cleanup throws must not abort the sweep or drop the popup response.
+test('clearStuckJobs isolates a failing job and still clears the healthy ones', async () => {
+  // Inject a real rejection on a path clearStuckJobs actually executes for one target: retiring B
+  // removes its own "ashlar:job:B" key, so failing that storage remove rejects B's abandon only.
   const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing' }), makeJob('B', { tabId: 11, serverStatus: 'missing' })]);
-  const realRemove = b.chrome.tabs.remove;
-  b.chrome.tabs.remove = async () => { throw new Error('tab dragging'); };
+  const realRemove = b.local.remove;
+  b.local.remove = async (keys) => {
+    if ([].concat(keys).some((k) => String(k).includes('ashlar:job:B'))) throw new Error('storage failure retiring B');
+    return realRemove(keys);
+  };
   const res = await b.context.clearStuckJobs();
-  b.chrome.tabs.remove = realRemove;
-  assert.equal(res.ok, true, 'sweep still returns a result despite a per-job failure');
-  assert.equal(typeof res.cleared, 'number');
+  b.local.remove = realRemove;
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 1, 'the healthy job (A) is still cleared even though B fails at storage');
 });

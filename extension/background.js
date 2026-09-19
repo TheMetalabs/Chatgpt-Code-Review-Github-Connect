@@ -1162,18 +1162,25 @@ async function abandonForgottenJob(job, jobs, explicit) {
  * or cancelled whose tabs are gone. Never touches a job with a live tab or one the server
  * still owns. Returns how many were cleared so the operator gets a definite result. */
 async function clearStuckJobs() {
-  const cfg = await settings();
-  if (!cfg.enabled || !cfg.origin || !cfg.token) return { ok: false, error: "set the Ashlar origin and token first" };
-  const jobs = await workerJobs(cfg.origin);
-  let cleared = 0, kept = 0;
-  for (const job of Object.values(jobs).filter(j => j.origin === cfg.origin)) {
-    // A probe failure is not proof the server forgot the job; only retire on a definite verdict.
-    const active = await heartbeat(job, jobs).catch(() => true);
-    if (active || !["cancelled", "missing", "unknown"].includes(job.serverStatus)) { kept += 1; continue; }
-    if (await abandonForgottenJob(job, jobs, job.serverStatus === "cancelled")) cleared += 1; else kept += 1;
+  try {
+    const cfg = await settings();
+    if (!cfg.enabled || !cfg.origin || !cfg.token) return { ok: false, error: "set the Ashlar origin and token first" };
+    const jobs = await workerJobs(cfg.origin);
+    const mine = Object.values(jobs).filter(job => job.origin === cfg.origin);
+    // Retire on the missing/unknown/cancelled verdict the heartbeat loop already established (exactly
+    // what this popup shows as "missing"). Do NOT re-probe every job here: a serial HTTP sweep over
+    // 20+ jobs is slow enough that the popup's message response is lost ("unknown error"). Abandon
+    // concurrently, isolate per-job failures, and never throw so the popup always gets a result.
+    const targets = mine.filter(job => ["cancelled", "missing", "unknown"].includes(job.serverStatus));
+    const outcomes = await Promise.allSettled(
+      targets.map(job => abandonForgottenJob(job, jobs, job.serverStatus === "cancelled")),
+    );
+    const cleared = outcomes.filter(o => o.status === "fulfilled" && o.value === true).length;
+    await recordWorkerStatus(jobs, cfg.origin).catch(() => {});
+    return { ok: true, cleared, kept: mine.length - cleared };
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error || "clear failed") };
   }
-  await recordWorkerStatus(jobs, cfg.origin);
-  return { ok: true, cleared, kept };
 }
 
 async function advanceJob(job, jobs) {

@@ -8,7 +8,7 @@
 // "do not repeat" line. Missing peers are simply not used — the loop never waits. Duplicate findings
 // are acceptable (they collapse in the schema-merge or get fixed in code); no cross-check drops
 // anyone's finding.
-import { buildChatParts } from "./chat-prompt.ts";
+import { buildChatParts, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
 import { localGenerationParams, samplingRequestFields } from "./local-llm.server.ts";
@@ -194,7 +194,7 @@ async function reviewGroup(
 ): Promise<string | null> {
   const groupSet = new Set(groupPaths);
   const sub = subsetSample(sample, groupSet);
-  const { prompt: instructions, files: attachments } = buildChatParts({
+  const built = buildChatParts({
     sample: sub,
     extra: deps.extra ?? "",
     untrustedBody: sample.body ?? "",
@@ -202,6 +202,16 @@ async function reviewGroup(
     contextPadLines: settings.contextPadLines,
     policyMaxChars: settings.promptPolicyMaxChars,
   });
+  const attachments = built.files;
+  // buildChatParts embeds REVIEW_OFFLINE_RULE, which forbids tool use ("do not call tools, open extra
+  // files") — correct for the one-shot browser reviewers but the exact opposite of this multi-turn
+  // loop, whose whole point is to read files/helpers with tools. Swap that one line for a tool-
+  // permitting rule that still bans web/DeepSearch/URL/skills, so a model obeying the user message
+  // uses the tools instead of reviewing only the initial attachment.
+  const instructions = built.prompt.replace(
+    REVIEW_OFFLINE_RULE,
+    "Do not search the web, use DeepSearch, browse URLs, fetch GitHub/npm/CVE/docs, or load skills. You DO have local tools — file_read, file_read_diff, code_search — use them to read the changed files and the helpers they call before reporting. The attachments are a starting point, not the only source. If context is still missing, list it in assumptions.",
+  );
   const others = sample.changedPaths.filter((p) => !groupSet.has(p));
   const attachText = attachments.map((f) => `<<<ATTACH:${f.name}>>>\n${f.body}\n<<<END_ATTACH>>>`).join("\n\n");
   const userParts = [
@@ -283,7 +293,10 @@ async function reviewGroup(
     lastPromptTokens = Number(res.usage?.prompt_tokens) || lastPromptTokens;
     const calls = msg.tool_calls ?? [];
     deps.log?.(`group[${groupPaths[0]}] iter ${iter}: finish=${choice?.finish_reason} tools=${calls.length} promptTokens=${lastPromptTokens}`);
-    const json = extractChatJson(msg.content || "");
+    // Only accept JSON from a COMPLETED terminal turn: a turn that still carries tool calls has not
+    // read its requested evidence yet (provisional), and a truncated (finish_reason=length) reply is
+    // partial. Capturing those would let stale/unconfirmed findings survive if a later turn degrades.
+    const json = calls.length === 0 && choice?.finish_reason !== "length" ? extractChatJson(msg.content || "") : null;
     if (json) finalRaw = json;
     messages.push({ role: "assistant", content: msg.content ?? "", ...(calls.length ? { tool_calls: calls } : {}) });
     if (choice?.finish_reason === "length") break;
@@ -423,11 +436,19 @@ export async function runLocalReviewLoop(
       try {
         const raw = await reviewGroup(sample, group, settings, { ...deps, request }, t);
         if (raw) raws.push(raw);
+        // A null return (the group completed with prose/truncated/non-extractable output, no throw)
+        // is a failure too: without this it would be silently dropped — no not_cleared coverage, no
+        // assumption — and a sibling group's empty-but-safe result could pass as a clean review.
+        else failedGroups.push(group);
       } catch (e) {
         deps.log?.(`group ${group[0]} failed: ${e instanceof Error ? e.message : String(e)}`);
         failedGroups.push(group);
       }
     }
+    // No group produced JSON at all → nothing to post; the leg is skipped. When at least one group
+    // DID produce JSON, merge: failed/null groups are marked not_cleared and (if the surviving groups
+    // are empty) investigated_safe is forced [], so the frozen gate rejects a partial run as
+    // incomplete rather than accepting it as a false clean pass.
     if (!raws.length) return { ok: false, error: "local loop produced no review JSON" };
     return { ok: true, raw: mergeGroupResults(raws, failedGroups) };
   } catch (e) {

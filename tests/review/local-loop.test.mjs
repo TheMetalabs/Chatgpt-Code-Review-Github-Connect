@@ -171,6 +171,45 @@ test("a failed group does not discard groups already reviewed", async () => {
   }
 });
 
+test("the loop prompt permits tools (strips the one-shot no-tools rule)", async () => {
+  const { request, bodies } = mock([assistant(REVIEW_JSON)]);
+  await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  const userMsg = bodies[0].messages.find((m) => m.role === "user").content;
+  assert.doesNotMatch(userMsg, /do not call tools/i, "the no-tools rule must be removed for the loop");
+  assert.match(userMsg, /file_read|local tools/i, "the loop prompt tells the model it has tools");
+});
+
+test("a group that completes with non-JSON is marked not_cleared, not silently dropped", async () => {
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    let call = 0;
+    const request = async (_b, _k, path) => {
+      if (path === "models") return { data: [] };
+      call += 1;
+      return call === 1 ? assistant("some prose, no JSON here") : assistant(REVIEW_JSON);
+    };
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
+    assert.equal(out.ok, true);
+    const cov = JSON.parse(out.raw).coverage;
+    assert.ok(cov.some((c) => c.file === "src/a.ts" && c.status === "not_cleared"), "non-JSON group's file is not_cleared");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
+test("provisional JSON on a tool-call turn is not accepted when the final turn has none", async () => {
+  // The model emits review JSON while still requesting a tool (provisional), then the terminal turn
+  // returns prose. The provisional findings must NOT become the group's result — the lone group then
+  // yields no valid JSON, so the leg fails rather than posting unconfirmed findings.
+  const { request } = mock([
+    assistant(REVIEW_JSON, [toolCall("file_read", { file_path: "src/pay.ts" })]),
+    assistant("actually I could not verify anything"),
+  ]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, false, "provisional findings from a tool-call turn are not posted");
+  assert.match(out.error, /no review JSON/i);
+});
+
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {
   const { request } = mock([assistant("I could not find the file, sorry.")]);
   const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });

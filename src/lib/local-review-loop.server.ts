@@ -396,8 +396,12 @@ const SEVERITY_ORDER: Record<string, number> = { P0: 0, P1: 1, P2: 2 };
 // it here (rather than a hand-rolled proxy like "findings.length > 0") means a group whose findings
 // would all be dropped, or that is empty with no safe justification, is treated as not reviewed —
 // one authoritative check, so no weaker predicate can let an unreviewed group pass as clean.
-function groupReviewValid(raw: string, sample: SamplePr, settings: BotSettings): boolean {
-  const gate = gateLiveSubmission(parseChatSubmission(raw), sample, settings);
+function groupReviewValid(raw: string, groupPaths: string[], sample: SamplePr, settings: BotSettings): boolean {
+  // Validate against THIS group's subset (a finding in another group's file must not count here) and
+  // with publishMinSeverity forced to P2 (a group that found only lower-severity issues still did
+  // review them — the publish threshold governs posting, not whether the group was reviewed).
+  const subset = subsetSample(sample, new Set(groupPaths));
+  const gate = gateLiveSubmission(parseChatSubmission(raw), subset, { ...settings, publishMinSeverity: "P2" });
   return gate.ok === true && (gate.findings.length > 0 || gate.investigatedSafe.length > 0);
 }
 
@@ -428,7 +432,9 @@ function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPath
   // Dedup findings by file|line|normalizedTitle, then sort by severity most-severe-first. When the
   // same key appears twice, keep the MORE COMPLETE copy — the one carrying more of the gate-required
   // fields — so a duplicate that would survive the downstream gate is not shadowed by a sparser one.
-  const GATE_FIELDS = ["file", "line", "severity", "title", "failure_scenario", "evidence", "recommended_fix"];
+  // Every field asFinding requires, so completeness scoring exactly matches gate survival (no field
+  // it checks is missing here, which would let a sparser duplicate tie a complete one).
+  const GATE_FIELDS = ["file", "line", "severity", "title", "failure_scenario", "root_cause", "evidence", "recommended_fix", "recommended_test"];
   const completeness = (f: unknown): number => {
     const r = f as Record<string, unknown>;
     return GATE_FIELDS.reduce((n, k) => n + (r[k] != null && r[k] !== "" ? 1 : 0), 0);
@@ -515,7 +521,7 @@ export async function runLocalReviewLoop(
         // applies. A null return (prose/truncated) or an empty `{"findings":[]}` with no
         // investigated_safe is a failure (→ not_cleared), so a sibling group's empty-but-safe result
         // can never make the leg look like a clean full pass. One authoritative check, not per-shape.
-        if (raw && groupReviewValid(raw, sample, settings)) raws.push(raw);
+        if (raw && groupReviewValid(raw, group, sample, settings)) raws.push(raw);
         else failedGroups.push(group);
       } catch (e) {
         deps.log?.(`group ${group[0]} failed: ${e instanceof Error ? e.message : String(e)}`);

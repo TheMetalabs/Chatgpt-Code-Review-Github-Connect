@@ -301,11 +301,12 @@ test("no reviewer JSON across groups is an explicit failure, not an empty pass",
 });
 
 test("D1: findings are deduped and sorted by severity before the downstream 8-cap", async () => {
-  // 8 P2 findings then 1 P1 — the P1 must be in the top 8 after dedup+sort.
-  const p2s = Array.from({ length: 8 }, (_, i) => F({ severity: "P2", file: "src/a.ts", line: i + 1, title: `p2-${i}` }));
-  const p1 = F({ severity: "P1", file: "src/b.ts", line: 1, title: "p1" });
-  const group1 = JSON.stringify({ merge_recommendation: "COMMENT", findings: p2s.slice(0, 4), investigated_safe: [], coverage: [] });
-  const group2 = JSON.stringify({ merge_recommendation: "COMMENT", findings: [...p2s.slice(4), p1], investigated_safe: [], coverage: [] });
+  // 8 P2 findings then 1 P1 — the P1 must be in the top 8 after dedup+sort. Each group reports only
+  // its own files (group1=[a,b], group2=[c,d]) so both pass per-group gate validation.
+  const p2s = Array.from({ length: 8 }, (_, i) => F({ severity: "P2", file: i < 4 ? "src/a.ts" : "src/b.ts", line: i + 1, title: `p2-${i}` }));
+  const p1 = F({ severity: "P1", file: "src/c.ts", line: 1, title: "p1" });
+  const group1 = JSON.stringify({ merge_recommendation: "COMMENT", findings: p2s, investigated_safe: [], coverage: [] });
+  const group2 = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", findings: [p1], investigated_safe: [], coverage: [] });
   process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "2";
   try {
     let call = 0;

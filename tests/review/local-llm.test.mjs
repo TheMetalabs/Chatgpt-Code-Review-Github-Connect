@@ -24,11 +24,25 @@ test('generation bypasses SDK defaults and extracts JSON without a needless retr
   assert.equal(c.clients.length, 0); assert.equal(c.calls.length, 1);
   assert.equal(c.calls[0][0], 'http://local/v1'); assert.equal(c.calls[0][1], 'secret');
 });
+test('generation sends a completion budget and non-greedy sampling', async () => {
+  // Regression: an unset max_tokens lets the server default the budget to ~8K, which a reasoning
+  // model spends entirely on thinking (finish_reason=length) before it emits any JSON. Greedy
+  // decoding (temperature 0) sends thinking models into verbatim repetition loops.
+  const c = local([raw]);
+  await c.context.runLocalLlm('review', settings);
+  const body = c.calls[0][2];
+  assert.ok(body.max_tokens >= 8192, `max_tokens must clear thinking+JSON, got ${body.max_tokens}`);
+  assert.ok(body.temperature > 0, 'temperature must be non-greedy to avoid repetition loops');
+});
 test('only completed non-JSON content gets one semantic retry', async () => {
   const c = local(['prose', raw]);
   assert.equal((await c.context.runLocalLlm('review', settings)).raw, raw);
   assert.equal(c.calls.length, 2);
-  assert.equal(c.calls[1][2].messages[2].content, 'prose');
+  // The retry does NOT echo the prior reply back (that could overflow the context window); it is the
+  // original prompt plus a JSON-only nudge, never larger than the first call.
+  const retryMsgs = c.calls[1][2].messages;
+  assert.equal(retryMsgs.every((m) => m.content !== 'prose'), true, 'prior non-JSON reply is not echoed into the retry');
+  assert.match(retryMsgs[retryMsgs.length - 1].content, /ONLY the JSON object/);
 });
 test('network errors do not replay model requests; health checks also have no automatic deadline', async () => {
   const c = local([new Error('connection closed')]);

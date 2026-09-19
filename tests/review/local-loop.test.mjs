@@ -235,6 +235,41 @@ test("task_done with state FAILED fails the group instead of accepting stale JSO
   assert.equal(out.ok, false, "a FAILED task_done does not post the group as reviewed");
 });
 
+test("a content-filtered completion fails the group instead of being accepted", async () => {
+  const filtered = { choices: [{ finish_reason: "content_filter", message: { content: "" } }], usage: { prompt_tokens: 100 } };
+  const { request } = mock([filtered]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, false, "content_filter is treated as partial/failed, not a clean review");
+});
+
+test("file_read_diff caps the number of files it returns", async () => {
+  const many = Array.from({ length: 50 }, (_, i) => `src/f${i}.ts`);
+  const { request, bodies } = mock([
+    assistant("", [toolCall("file_read_diff", { path_array: many })]),
+    assistant(REVIEW_JSON),
+  ]);
+  await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  const toolMsg = bodies[1].messages.find((m) => m.role === "tool");
+  const blocks = (toolMsg.content.match(/==== FILE:/g) || []).length;
+  assert.ok(blocks <= 20, `file_read_diff returns at most 20 files, got ${blocks}`);
+});
+
+test("deduplication keeps the well-formed copy of a repeated finding", async () => {
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    const malformed = JSON.stringify({ findings: [{ file: "src/x.ts", line: 5, title: "same bug" }], merge_recommendation: "COMMENT" });
+    const valid = JSON.stringify({ findings: [{ severity: "P1", file: "src/x.ts", line: 5, title: "same bug", failure_scenario: "s", evidence: "e" }], merge_recommendation: "REQUEST_CHANGES" });
+    let call = 0;
+    const request = async (_b, _k, path) => { if (path === "models") return { data: [] }; call += 1; return call === 1 ? assistant(malformed) : assistant(valid); };
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
+    const merged = JSON.parse(out.raw);
+    const f = merged.findings.find((x) => x.file === "src/x.ts" && x.line === 5);
+    assert.ok(f && f.severity === "P1", "the well-formed (severity-bearing) copy is kept over the malformed one");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {
   const { request } = mock([assistant("I could not find the file, sorry.")]);
   const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });

@@ -178,6 +178,9 @@ const SYSTEM = [
   "Not being able to read a helper never justifies withholding a finding: report the suspected defect and name the unverified helper in evidence so a downstream agent confirms it. A symbol having no visible definition in the tools is NOT itself a defect — the definition may live in an unchanged file the tools do not expose.",
 ].join("\n");
 
+const FORCE_FINAL_MSG =
+  "Tool access has ended. Using only what you have read, return the final review JSON object now (raw JSON only).";
+
 function toolDefs() {
   return [
     { type: "function", function: { name: "file_read", description: "Read a file at the PR head. Use hunk headers (@@ -x,y +m,n @@) to pick ranges; at most 400 lines per call.", parameters: { type: "object", properties: { file_path: { type: "string" }, start_line: { type: "integer" }, end_line: { type: "integer" } }, required: ["file_path"] } } },
@@ -245,8 +248,18 @@ async function reviewGroup(
       return `File: ${a.file_path} (Total lines: ${lines.length})\nLINE_RANGE: ${s}-${e}\n` + lines.slice(s - 1, e).map((l, i) => `${s + i}| ${l}`).join("\n");
     }
     if (name === "file_read_diff") {
-      const arr = Array.isArray(a.path_array) ? (a.path_array as unknown[]).map(String) : [];
-      return arr.map((p) => `==== FILE: ${p} ====\n${patches.get(p) ?? "(no diff for this path)"}`).join("\n\n");
+      // Bound the output: a model can pass many paths (or a single huge patch); cap per-file and
+      // total so one tool call cannot blow the context/memory.
+      const arr = (Array.isArray(a.path_array) ? (a.path_array as unknown[]).map(String) : []).slice(0, 20);
+      const PER_FILE = 8_000;
+      const TOTAL = 40_000;
+      let acc = "";
+      for (const p of arr) {
+        const block = `==== FILE: ${p} ====\n${(patches.get(p) ?? "(no diff for this path)").slice(0, PER_FILE)}`;
+        if (acc.length + block.length + 2 > TOTAL) { acc += `${acc ? "\n\n" : ""}(output truncated)`; break; }
+        acc += (acc ? "\n\n" : "") + block;
+      }
+      return acc || "(no paths requested)";
     }
     if (name === "code_search") {
       const needle = String(a.search_text || "");
@@ -278,8 +291,11 @@ async function reviewGroup(
   for (let iter = 1; iter <= t.toolIterCap + 1; iter += 1) {
     injectNewPeers(messages, deps, injectedPeers);
     const forceFinal = iter > t.toolIterCap || (t.ctxCapTokens > 0 && lastPromptTokens > t.ctxCapTokens);
-    if (forceFinal && messages[messages.length - 1].role !== "user") {
-      messages.push({ role: "user", content: "Tool access has ended. Using only what you have read, return the final review JSON object now (raw JSON only)." });
+    // Append the forced-final instruction whenever it isn't already the last message. The old
+    // "last role !== user" guard skipped it when peer data (a user message) had just been injected,
+    // leaving the model with no instruction to stop and emit JSON.
+    if (forceFinal && messages[messages.length - 1].content !== FORCE_FINAL_MSG) {
+      messages.push({ role: "user", content: FORCE_FINAL_MSG });
     }
     const body: Record<string, unknown> = {
       model: settings.localLlmModel.trim(),
@@ -298,16 +314,18 @@ async function reviewGroup(
     const calls = msg.tool_calls ?? [];
     deps.log?.(`group[${groupPaths[0]}] iter ${iter}: finish=${choice?.finish_reason} tools=${calls.length} promptTokens=${lastPromptTokens}`);
     // Only accept JSON from a COMPLETED terminal turn: a turn that still carries tool calls has not
-    // read its requested evidence yet (provisional), and a truncated (finish_reason=length) reply is
-    // partial. Capturing those would let stale/unconfirmed findings survive if a later turn degrades.
-    const json = calls.length === 0 && choice?.finish_reason !== "length" ? extractChatJson(msg.content || "") : null;
+    // read its requested evidence yet (provisional), and a truncated (length) or filtered
+    // (content_filter) reply is partial. Capturing those would let stale/unconfirmed findings survive.
+    const partialFinish = choice?.finish_reason === "length" || choice?.finish_reason === "content_filter";
+    const json = calls.length === 0 && !partialFinish ? extractChatJson(msg.content || "") : null;
     if (json) finalRaw = json;
     messages.push({ role: "assistant", content: msg.content ?? "", ...(calls.length ? { tool_calls: calls } : {}) });
-    if (choice?.finish_reason === "length") break;
+    if (partialFinish) break;
     if (!calls.length) break;
     if (forceFinal) break; // tool_choice:"none" is ignored by some servers; never execute post-final calls.
     let done = false;
     let taskFailed = false;
+    let pendingChars = 0;
     for (const c of calls) {
       let args: Record<string, unknown> = {};
       try { args = JSON.parse(c.function?.arguments || "{}"); } catch { /* malformed args → empty */ }
@@ -316,8 +334,14 @@ async function reviewGroup(
         done = true;
         if (args.state === "FAILED") taskFailed = true;
       }
-      messages.push({ role: "tool", tool_call_id: c.id, content: String(out).slice(0, 40_000) });
+      const served = String(out).slice(0, 40_000);
+      pendingChars += served.length;
+      messages.push({ role: "tool", tool_call_id: c.id, content: served });
     }
+    // The next iteration's context-cap check runs before the model re-reads these tool outputs, and
+    // usage.prompt_tokens won't include them until the following response. Fold their size into the
+    // running estimate so a large tool result forces the final turn promptly instead of one turn late.
+    lastPromptTokens += Math.ceil(pendingChars / CHARS_PER_TOKEN);
     // The model explicitly could not finish this group — fail it (→ not_cleared) rather than
     // accepting whatever JSON is around as a completed review.
     if (taskFailed) return null;
@@ -380,17 +404,27 @@ function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPath
     if (obj.merge_recommendation === "REQUEST_CHANGES") merge = "REQUEST_CHANGES";
     if (!highest && typeof obj.highest_risk === "string") highest = obj.highest_risk;
   }
-  // Dedup findings by file|line|normalizedTitle, then sort by severity most-severe-first.
-  const seen = new Set<string>();
-  const deduped: unknown[] = [];
+  // Dedup findings by file|line|normalizedTitle, then sort by severity most-severe-first. When the
+  // same key appears twice, prefer a well-formed finding (has file/severity/title) over a malformed
+  // earlier one, so a valid duplicate is not shadowed by a junk first occurrence.
+  const wellFormed = (f: unknown): boolean => {
+    const r = f as FindingLike;
+    return Boolean(r.file && r.severity && r.title);
+  };
+  const byKey = new Map<string, unknown>();
+  const order: string[] = [];
   for (const f of findings) {
     const rec = f as FindingLike;
     const key = `${rec.file ?? ""}|${rec.line ?? ""}|${normalizeTitle(rec.title)}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      deduped.push(f);
+    const existing = byKey.get(key);
+    if (existing === undefined) {
+      byKey.set(key, f);
+      order.push(key);
+    } else if (!wellFormed(existing) && wellFormed(f)) {
+      byKey.set(key, f);
     }
   }
+  const deduped: unknown[] = order.map((k) => byKey.get(k));
   const sorted = deduped.sort((a, b) => {
     const aSev = String((a as FindingLike).severity ?? "");
     const bSev = String((b as FindingLike).severity ?? "");

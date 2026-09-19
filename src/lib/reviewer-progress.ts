@@ -85,7 +85,17 @@ export function buildReviewerLanes(
     );
 
     const pendingLocal = provider === "local" && Boolean(opts?.localInFlight || job.generating?.local === true);
-    if (pendingLocal) return {provider, state: "generating", label, detail: "calling local LLM", answered: false};
+    if (pendingLocal) {
+      // Surface heartbeat freshness so the local lane can tell healthy generating from a stall — the
+      // same per-step visibility the chat providers already have. observedAt is seeded when the leg
+      // starts and refreshed each multiturn turn; its absence just means no heartbeat has landed yet.
+      const observedAt = job.providerProgress?.local?.observedAt;
+      const detail =
+        observedAt !== undefined
+          ? `calling local LLM · ${Math.max(0, Math.round((now - observedAt) / 1000))}s since last progress`
+          : "calling local LLM";
+      return { provider, state: "generating", label, detail, answered: false };
+    }
     if (raw) {
       const stats = replyStats(raw);
       const findings =

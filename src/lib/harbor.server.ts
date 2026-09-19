@@ -612,7 +612,11 @@ async function kickLocalRace(jobId: string, prompt: string) {
   // A health probe can be delayed by the model queue. Never gate generation on that timer.
   const controller = new AbortController();
   localControllers.set(jobId, controller);
-  patchJob(jobId, j => ({...j, generating: {...j.generating, local: true}, updatedAt: Date.now()}));
+  // Seed the heartbeat when the leg starts so the staleness note can fire even for a hung single-turn
+  // request (multiturn refreshes observedAt each turn; single-turn has no mid-request progress signal).
+  patchJob(jobId, j => ({...j, generating: {...j.generating, local: true},
+    providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "generating", observedAt: Date.now(), receivedAt: Date.now()}},
+    updatedAt: Date.now()}));
   try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
   void attachLocalLeg(jobId, prompt, { submit: true });
 }

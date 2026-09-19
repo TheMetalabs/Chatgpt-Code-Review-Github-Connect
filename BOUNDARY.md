@@ -13,6 +13,12 @@ ChatGPT/Grok build prompts, submit through the bridge, settle, de-quota, or how 
 JSON is schema-merged and posted. Those are a separate, already-shipped concern and are
 being changed by other sessions in parallel.
 
+The heartbeat follow-up (`ai/feat/local-llm-heartbeat`) extends the allowlist by exactly one
+shared file, `reviewer-progress.ts`, and touches **only** its local-provider in-flight branch
+so the local lane can surface heartbeat freshness the way the chat lanes already surface
+per-step progress. The chat/Grok branches of `buildReviewerLanes` are unchanged; the existing
+chat-lane cases in `reviewer-progress.test.ts` are the regression net that proves it.
+
 ## Editable (local-LLM only) — the allowlist
 
 | File | Allowed change |
@@ -22,6 +28,8 @@ being changed by other sessions in parallel.
 | `src/lib/local-review-loop.server.ts` | **new** — the multi-turn tool loop |
 | `src/lib/local-fallback.ts` | local race/skip predicates (no chat semantics) |
 | `src/lib/harbor.server.ts` | **only** `kickLocalRace` / `attachLocalLeg` and local settings plumbing |
+| `src/lib/reviewer-progress.ts` | **only** the local provider's in-flight lane (heartbeat freshness); chat/Grok branches stay frozen |
+| `src/lib/reviewer-progress.test.ts` | local-lane rendering tests (chat-lane cases are the frozen-behavior guard) |
 | `src/lib/settings.server.ts` | **only** local-LLM settings (`localLlm*`, `reviewLocal`) |
 | `src/lib/types.ts` | **only** local-LLM settings fields + `DEFAULT_SETTINGS` local values |
 | `src/lib/json-repair.server.ts` | **only** the transport call options (`max_tokens`) |

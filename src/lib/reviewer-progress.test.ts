@@ -80,6 +80,30 @@ describe("buildReviewerLanes", () => {
     assert.equal(skipped[0].state, "skipped");
   });
 
+  it("local in-flight lane surfaces heartbeat freshness (seconds since last progress)", () => {
+    // The staleness signal the UI needs: observedAt is seeded at leg start and refreshed each
+    // multiturn turn, so the lane detail must reflect its age, not a static "calling local LLM".
+    const now = 1_000_000;
+    const lanes = buildReviewerLanes(
+      job({
+        reviewProviders: ["local"],
+        providerProgress: {
+          local: { runId: "local:j1", stage: "generating", observedAt: now - 7_000, receivedAt: now - 7_000 },
+        },
+      }),
+      { localInFlight: true, now },
+    );
+    const lane = lanes.find((l) => l.provider === "local");
+    assert.equal(lane?.state, "generating");
+    assert.match(lane?.detail ?? "", /7s since last progress/);
+  });
+
+  it("local in-flight lane falls back to the plain label when no heartbeat has landed yet", () => {
+    const lanes = buildReviewerLanes(job({ reviewProviders: ["local"] }), { localInFlight: true });
+    const lane = lanes.find((l) => l.provider === "local");
+    assert.equal(lane?.detail, "calling local LLM");
+  });
+
   it("uses settings-enabled list before reviewProviders is stored", () => {
     const lanes = buildReviewerLanes(job({ status: "snapshot", reviewProviders: undefined }), {
       enabled: ["chatgpt"],

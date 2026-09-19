@@ -4,7 +4,17 @@
 // local reviewer leg is reworked. See BOUNDARY.md.
 import { execFileSync } from "node:child_process";
 
-const BASE = process.env.BOUNDARY_BASE || "origin/main";
+// Measure this branch's own changes, not main's forward progress: diff from the merge-base so an
+// advancing origin/main (other sessions merging ChatGPT-path fixes) never looks like a violation.
+const REF = process.env.BOUNDARY_BASE || "origin/main";
+function mergeBase(ref) {
+  try {
+    return execFileSync("git", ["merge-base", ref, "HEAD"], { encoding: "utf8" }).trim();
+  } catch {
+    return ref;
+  }
+}
+const BASE = mergeBase(REF);
 
 // Allowlist: only these paths may change on this branch.
 const ALLOW = new Set([

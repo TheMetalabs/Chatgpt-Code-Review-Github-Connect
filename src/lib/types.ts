@@ -23,6 +23,13 @@ export type JobStatus =
 
 export type ReviewProvider = "chatgpt" | "grok" | "local";
 
+/** How the local reviewer leg runs. "single" is the one-shot prompt (browser-parity, rollback);
+ * "multiturn" runs the SDK tool loop that reads files and iterates. Only the local leg has an SDK,
+ * so only it can do this — ChatGPT/Grok stay one-shot browser tabs. */
+export type LocalReviewMode = "single" | "multiturn";
+
+export const LOCAL_REVIEW_MODES: LocalReviewMode[] = ["single", "multiturn"];
+
 export const CHAT_PROVIDERS: ReviewProvider[] = ["chatgpt", "grok"];
 
 export function isChatProvider(p: ReviewProvider): p is "chatgpt" | "grok" {
@@ -221,6 +228,10 @@ export interface BotSettings {
   localLlmBaseUrl: string;
   localLlmApiKey: string;
   localLlmModel: string;
+  /** Completion-token budget for a local generation; must clear a reasoning model's thinking + JSON. */
+  localReviewMaxTokens: number;
+  /** "single" = one-shot prompt; "multiturn" = SDK tool loop. Only the local leg supports the loop. */
+  localReviewMode: LocalReviewMode;
   reviewOrder: ReviewProvider[];
   /** Review-coverage: char budgets for the three reviewer attachments + context pad. */
   promptDiffMaxChars: number;
@@ -278,6 +289,8 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localLlmBaseUrl: "http://127.0.0.1:11434/v1",
   localLlmApiKey: "",
   localLlmModel: "",
+  localReviewMaxTokens: 32_768,
+  localReviewMode: "multiturn",
   reviewOrder: ["local", "chatgpt", "grok"],
   promptDiffMaxChars: 300_000,
   promptContextMaxChars: 200_000,

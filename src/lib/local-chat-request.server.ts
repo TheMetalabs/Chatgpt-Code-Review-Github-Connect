@@ -2,7 +2,20 @@ import http from "node:http";
 import https from "node:https";
 
 export type LocalChatMessage = { role: "system" | "user" | "assistant"; content: string };
-type ChatRequest = { model: string; messages: LocalChatMessage[]; temperature: number };
+// max_tokens is REQUIRED in practice: omlx/vLLM-style servers default the completion budget
+// to ~8K, which a reasoning model burns entirely on thinking for any real diff, ending the
+// response with finish_reason=length before it ever emits review JSON. Callers set it from the
+// context budget. Sampling fields carry the model's recommended (non-greedy) values; greedy
+// decoding sends thinking models into verbatim repetition loops.
+type ChatRequest = {
+  model: string;
+  messages: LocalChatMessage[];
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  presence_penalty?: number;
+  max_tokens?: number;
+};
 
 /** Shared native transport. No SDK/fetch deadline and no automatic network replay.
  * A caller may explicitly cancel; upstream servers/proxies may impose their own limits.

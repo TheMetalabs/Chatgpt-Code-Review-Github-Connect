@@ -11,6 +11,41 @@ function localConfig(settings: BotSettings) {
   return { ok: true as const, baseURL, model, apiKey: settings.localLlmApiKey.trim() || "local" };
 }
 
+export type LocalGenerationParams = {
+  maxTokens: number;
+  temperature: number;
+  top_p: number;
+  top_k: number;
+  presence_penalty: number;
+};
+
+function envNum(key: string, dflt: number): number {
+  const env = typeof process !== "undefined" ? process.env : undefined;
+  const raw = env?.[key];
+  if (raw == null || raw === "") return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : dflt;
+}
+
+// maxTokens is the whole reason the local leg failed on real diffs: without it the server
+// defaults the budget to ~8K, which a reasoning model spends on thinking before emitting any
+// JSON (finish_reason=length). It comes from settings so it can clear thinking + JSON. Sampling
+// is the model's recommended non-greedy set — greedy (t=0) sends thinking models into repetition
+// loops — tunable via env without a settings migration.
+export function localGenerationParams(settings: BotSettings): LocalGenerationParams {
+  const configured = Number(settings.localReviewMaxTokens);
+  return {
+    maxTokens:
+      Number.isFinite(configured) && configured > 0
+        ? configured
+        : envNum("ASHLAR_LOCAL_REVIEW_MAX_TOKENS", 32_768),
+    temperature: envNum("ASHLAR_LOCAL_REVIEW_TEMPERATURE", 0.6),
+    top_p: envNum("ASHLAR_LOCAL_REVIEW_TOP_P", 0.95),
+    top_k: envNum("ASHLAR_LOCAL_REVIEW_TOP_K", 20),
+    presence_penalty: envNum("ASHLAR_LOCAL_REVIEW_PRESENCE_PENALTY", 1.0),
+  };
+}
+
 /** GET /models only. A busy local endpoint may queue this as well. */
 export async function pingLocalLlm(
   settings: BotSettings,
@@ -35,8 +70,15 @@ export async function runLocalLlm(
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
   prompt = bridgePromptText(prompt); // Native API input remains readable source text, not escaped transport JSON.
+  const params = localGenerationParams(settings);
   const call = (messages: LocalChatMessage[]) => requestLocalChat(
-    ready.baseURL, ready.apiKey, { model: ready.model, messages, temperature: 0 }, signal,
+    ready.baseURL, ready.apiKey,
+    {
+      model: ready.model, messages,
+      temperature: params.temperature, top_p: params.top_p, top_k: params.top_k,
+      presence_penalty: params.presence_penalty, max_tokens: params.maxTokens,
+    },
+    signal,
   );
   try {
     const raw = await call([

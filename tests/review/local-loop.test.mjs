@@ -133,6 +133,25 @@ test("top_k is sent only when positive so strict OpenAI endpoints do not reject 
   assert.equal(noK.temperature, 0.6); // standard fields still present
 });
 
+test("a failed group does not discard groups already reviewed", async () => {
+  // A transient request/tool failure in one group must not throw away the whole multi-group run.
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    let call = 0;
+    const request = async (_b, _k, path) => {
+      if (path === "models") return { data: [] };
+      call += 1;
+      if (call === 1) throw new Error("transient failure"); // first group's first request
+      return assistant(REVIEW_JSON); // later groups succeed
+    };
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
+    assert.equal(out.ok, true, "one group failing still yields the other group's findings");
+    assert.match(out.raw, /"findings"/);
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {
   const { request } = mock([assistant("I could not find the file, sorry.")]);
   const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });

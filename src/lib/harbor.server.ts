@@ -604,6 +604,12 @@ async function generateLocalLeg(
           .map((l) => ({ provider: l.provider, raw: l.raw })),
     });
   }
+  // multiturn was chosen (a large PR) but the snapshot is gone (e.g. a late bridge-fallback kick
+  // after a restart). Falling back to single-turn would send the whole large prompt in one completion
+  // and spike memory — exactly what auto-mode routes away from. Skip local instead.
+  if (mode === "multiturn") {
+    return { ok: false, error: "local skipped: no snapshot for multiturn and prompt too large for single-turn" };
+  }
   return runLocalLlm(prompt, state.settings, signal);
 }
 

@@ -11,6 +11,10 @@ function mergeBase(ref) {
   try {
     return execFileSync("git", ["merge-base", ref, "HEAD"], { encoding: "utf8" }).trim();
   } catch {
+    // No common ancestor (or an unfetched ref). Diffing against the ref TIP would count the ref's own
+    // forward progress as this branch's changes — the very false positive merge-base avoids — so warn
+    // loudly rather than fail silently. The diff itself is still guarded below.
+    console.error(`⚠ merge-base(${ref}, HEAD) failed; comparing against "${ref}" directly may over-report. Fetch the ref or set BOUNDARY_BASE.`);
     return ref;
   }
 }

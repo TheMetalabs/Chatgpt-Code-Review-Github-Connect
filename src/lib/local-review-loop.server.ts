@@ -218,9 +218,13 @@ async function reviewGroup(
       const re = a.use_regexp ? safeRegExp(needle) : null;
       const hits: string[] = [];
       for (const [p, text] of cache) {
+        if (typeof text !== "string") continue; // defensive: a null/absent content entry must not throw
         const ls = text.split("\n");
         for (let i = 0; i < ls.length && hits.length < 60; i += 1) {
-          const hit = re ? re.test(ls[i]) : ls[i].toLowerCase().includes(needle.toLowerCase());
+          // Bound the tested slice: a model-supplied regex can backtrack catastrophically on a very
+          // long line and hang the host. 2000 chars is well past any real code line.
+          const line = ls[i].length > 2000 ? ls[i].slice(0, 2000) : ls[i];
+          const hit = re ? re.test(line) : line.toLowerCase().includes(needle.toLowerCase());
           if (hit) hits.push(`${p}:${i + 1}| ${ls[i].trim().slice(0, 200)}`);
         }
       }
@@ -344,9 +348,16 @@ export async function runLocalReviewLoop(
     deps.log?.(`local review loop: ${groups.length} group(s) over ${sample.changedPaths.length} changed file(s)`);
     const raws: string[] = [];
     for (const group of groups) {
-      // Sequential — one generation at a time bounds peak memory on a shared host.
-      const raw = await reviewGroup(sample, group, settings, { ...deps, request }, t);
-      if (raw) raws.push(raw);
+      if (deps.signal?.aborted) break;
+      // Sequential — one generation at a time bounds peak memory on a shared host. Isolate each group:
+      // a transient request/tool failure late in a long multi-group run must not discard the groups
+      // already reviewed. Keep their findings and move on; only an all-empty run is a failure.
+      try {
+        const raw = await reviewGroup(sample, group, settings, { ...deps, request }, t);
+        if (raw) raws.push(raw);
+      } catch (e) {
+        deps.log?.(`group ${group[0]} failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
     if (!raws.length) return { ok: false, error: "local loop produced no review JSON" };
     return { ok: true, raw: mergeGroupResults(raws) };

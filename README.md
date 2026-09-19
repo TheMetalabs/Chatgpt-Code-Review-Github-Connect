@@ -220,6 +220,25 @@ api_key   (없으면 아무 문자열)
 
 Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 
+로컬 레그만 SDK/HTTP 전송이라 **멀티턴 툴 루프**를 돕니다. ChatGPT/Grok은 브라우저 탭이라 계속 1회성입니다.
+루프는 파일을 읽고(`file_read`), 다른 변경 파일 diff를 보고(`file_read_diff`), 검색(`code_search`)한 뒤
+지적을 근거와 함께 확정합니다. **다른 리뷰어를 막거나 교차 검수하지 않습니다** — 실패하면 기존처럼
+`Skipped local` 로 끝나고, 마지막 스키마 합산은 그대로입니다. 이미 도착한 챗봇 결과는 턴 경계에서
+«반복 금지» 데이터로 주입하고, 안 왔으면 기다리지 않습니다.
+
+| 설정 / env | 기본 | 뜻 |
+| --- | --- | --- |
+| `localReviewMode` / `ASHLAR_LOCAL_REVIEW_MODE` | `multiturn` | `single` = 1회성 프롬프트(롤백), `multiturn` = 툴 루프 |
+| `localReviewMaxTokens` / `ASHLAR_LOCAL_REVIEW_MAX_TOKENS` | 32768 | 생성 토큰 예산. **필수** — 없으면 서버 기본(~8K)에 추론이 다 차 JSON 전에 잘립니다 |
+| `ASHLAR_LOCAL_REVIEW_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_PRESENCE_PENALTY` | 0.6 / 0.95 / 20 / 1.0 | 비-greedy 샘플링. greedy(0)는 추론 모델을 반복 루프에 빠뜨립니다 |
+| `ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS` | 40000 | 그룹당 파일 묶음 크기 상한(피크 KV 캐시 메모리 경계) |
+| `ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP` | 6 | 그룹당 최대 파일 수 |
+| `ASHLAR_LOCAL_REVIEW_TOOL_ITERS` | 8 | 그룹당 최대 툴 라운드. 초과하면 툴을 빼고 최종 JSON 강제 |
+| `ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS` | 24000 | 프롬프트가 이 토큰을 넘으면 다음 턴에 최종 JSON 강제 |
+
+변경 파일은 크기로 묶어 **순차** 검토합니다(공유 머신에서 동시 생성 1개로 메모리 경계 유지). thinking은
+켜 둡니다(끄면 리뷰가 고무도장이 됩니다). 롤백은 `ASHLAR_LOCAL_REVIEW_MODE=single`.
+
 ---
 
 ## 3. Chrome 브릿지 (ChatGPT / Grok)

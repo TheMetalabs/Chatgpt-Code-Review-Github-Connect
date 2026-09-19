@@ -1,7 +1,7 @@
-import { bridgePromptText } from "./chat-prompt";
-import type { BotSettings } from "./types";
-import { extractChatJson } from "./extract-chat-json";
-import { requestLocalJson, requestLocalChat, type LocalChatMessage } from "./local-chat-request.server";
+import { bridgePromptText } from "./chat-prompt.ts";
+import type { BotSettings } from "./types.ts";
+import { extractChatJson } from "./extract-chat-json.ts";
+import { requestLocalJson, requestLocalChat, type LocalChatMessage } from "./local-chat-request.server.ts";
 
 function localConfig(settings: BotSettings) {
   const baseURL = settings.localLlmBaseUrl.trim().replace(/\/$/, "");

@@ -28,7 +28,7 @@ const ALLOW = new Set([
   "src/lib/json-repair.server.ts",
   "src/routes/api/harbor.ts",
   "src/lib/local-llm.test.ts",
-  "src/lib/local-review-loop.test.ts",
+  "tests/review/local-loop.test.mjs",
   "src/lib/settings.server.test.ts",
   "tests/review/local.test.mjs",
   "tests/review/local-http.test.mjs",

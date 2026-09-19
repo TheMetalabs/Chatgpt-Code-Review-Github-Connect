@@ -26,7 +26,7 @@ being changed by other sessions in parallel.
 | `src/lib/types.ts` | **only** local-LLM settings fields + `DEFAULT_SETTINGS` local values |
 | `src/lib/json-repair.server.ts` | **only** the transport call options (`max_tokens`) |
 | `src/routes/api/harbor.ts` | **only** the Playground `local` action |
-| tests: `src/lib/local-llm.test.ts`, `src/lib/local-review-loop.test.ts`, `tests/review/local*.test.mjs`, `src/lib/settings.server.test.ts` | local-leg tests |
+| tests: `src/lib/local-llm.test.ts`, `tests/review/local-loop.test.mjs`, `tests/review/local*.test.mjs`, `src/lib/settings.server.test.ts` | local-leg tests |
 | `BOUNDARY.md`, `scripts/check-local-llm-boundary.mjs`, `package.json`, `README.md` | boundary infra + docs |
 
 ## Frozen — must not change (guard fails if touched)

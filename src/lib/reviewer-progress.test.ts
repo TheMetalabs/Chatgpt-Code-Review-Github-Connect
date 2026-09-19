@@ -80,22 +80,37 @@ describe("buildReviewerLanes", () => {
     assert.equal(skipped[0].state, "skipped");
   });
 
-  it("local in-flight lane surfaces heartbeat freshness (seconds since last progress)", () => {
-    // The staleness signal the UI needs: observedAt is seeded at leg start and refreshed each
-    // multiturn turn, so the lane detail must reflect its age, not a static "calling local LLM".
+  it("local in-flight lane flags a stalled heartbeat (older than the stale window)", () => {
+    // Binary, not a live counter: the detail feeds the ops-comment change key, so it must flip at
+    // most once (fresh -> stale) rather than change every tick with the elapsed age.
     const now = 1_000_000;
     const lanes = buildReviewerLanes(
       job({
         reviewProviders: ["local"],
         providerProgress: {
-          local: { runId: "local:j1", stage: "generating", observedAt: now - 7_000, receivedAt: now - 7_000 },
+          local: { runId: "local:j1", stage: "generating", observedAt: now - 400_000, receivedAt: now - 400_000 },
         },
       }),
-      { localInFlight: true, now },
+      { localInFlight: true, now, staleMs: 300_000 },
     );
     const lane = lanes.find((l) => l.provider === "local");
     assert.equal(lane?.state, "generating");
-    assert.match(lane?.detail ?? "", /7s since last progress/);
+    assert.equal(lane?.detail, "calling local LLM · no recent progress");
+  });
+
+  it("local in-flight lane stays plain while the heartbeat is fresh", () => {
+    const now = 1_000_000;
+    const lanes = buildReviewerLanes(
+      job({
+        reviewProviders: ["local"],
+        providerProgress: {
+          local: { runId: "local:j1", stage: "generating", observedAt: now - 3_000, receivedAt: now - 3_000 },
+        },
+      }),
+      { localInFlight: true, now, staleMs: 300_000 },
+    );
+    const lane = lanes.find((l) => l.provider === "local");
+    assert.equal(lane?.detail, "calling local LLM");
   });
 
   it("local in-flight lane falls back to the plain label when no heartbeat has landed yet", () => {

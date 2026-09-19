@@ -172,7 +172,7 @@ export function publicJobs(jobs: Job[]) {
     return {
       ...rest,
       hasRawReview: Boolean(j.rawReview),
-      reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
+      reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled, staleMs: localStaleNoteMs() }),
     };
   });
 }
@@ -420,7 +420,7 @@ async function watchReviewers(jobId: string, token: string) {
       }
     }
     if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;
-    const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) });
+    const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId), staleMs: localStaleNoteMs() });
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
       notes.push(
@@ -432,8 +432,10 @@ async function watchReviewers(jobId: string, token: string) {
       const age = Date.now() - job.providerProgress.local.observedAt;
       const threshold = localStaleNoteMs();
       if (age > threshold) {
-        const ageMin = Math.floor(age / 60_000);
-        notes.push(`local reviewer: no progress for ${ageMin}m (still waiting; cancel manually if stalled)`);
+        // Fixed message keyed to the threshold, NOT the live age: the ops comment tracks state
+        // changes, so a continuously increasing minute count would rewrite it every tick/minute.
+        const thresholdMin = Math.max(1, Math.floor(threshold / 60_000));
+        notes.push(`local reviewer: no progress for over ${thresholdMin}m (still waiting; cancel manually if stalled)`);
       }
     }
     for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);

@@ -1159,39 +1159,49 @@ async function abandonForgottenJob(job, jobs, explicit) {
   return retireCleanJob(job, jobs);
 }
 
-/** Popup-triggered sweep for jobs the server has permanently forgotten (missing/unknown)
- * or cancelled whose tabs are gone. Never touches a job with a live tab or one the server
- * still owns. Returns how many were cleared so the operator gets a definite result. */
+/** Popup-triggered sweep for jobs the server has forgotten (missing/unknown) or cancelled whose tabs
+ * are gone. Never touches a job with a live tab or one the server still owns. The ENTIRE operation —
+ * storage init, the concurrent re-probe, and the abandon sweep — is raced against one deadline, so a
+ * stalled chrome.storage.get, bridge ping, or tab probe can never strand the popup's runtime message.
+ * Returns how many were cleared so the operator gets a definite result. */
 async function clearStuckJobs(deadlineMs = 15_000) {
-  try {
+  const TIMED_OUT = Symbol("clear-timeout");
+  let timer, cleared = 0, total = 0;
+  // Create the deadline BEFORE any await: settings()/workerJobs() read chrome.storage, and a stalled
+  // get would otherwise hang before the race even begins — the same lost-response failure as a stalled
+  // sweep. Race the whole body (setup included) against it.
+  const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(TIMED_OUT), deadlineMs); });
+  const work = (async () => {
     const cfg = await settings();
     if (!cfg.enabled || !cfg.origin || !cfg.token) return { ok: false, error: "set the Ashlar origin and token first" };
     const jobs = await workerJobs(cfg.origin);
     const mine = Object.values(jobs).filter(job => job.origin === cfg.origin);
-    // Retire on the missing/unknown/cancelled verdict the heartbeat loop already established (exactly
-    // what this popup shows as "missing"). Do NOT re-probe every job here: a serial HTTP sweep over
-    // 20+ jobs is slow enough that the popup's message response is lost ("unknown error"). Abandon
-    // concurrently, isolate per-job failures, and never throw so the popup always gets a result.
-    const targets = mine.filter(job => ["cancelled", "missing", "unknown"].includes(job.serverStatus));
-    let cleared = 0, timer;
-    const sweep = Promise.allSettled(
-      targets.map(async job => { if (await abandonForgottenJob(job, jobs, job.serverStatus === "cancelled") === true) cleared += 1; }),
-    );
-    // Hard ceiling so a slow tab probe or any other unbounded wait can never strand the popup's
-    // response: report whatever finished and leave the rest for a re-click.
-    const deadline = new Promise(resolve => { timer = setTimeout(() => resolve("timeout"), deadlineMs); });
-    const timedOut = (await Promise.race([sweep.then(() => "done"), deadline])) === "timeout";
-    clearTimeout(timer);
-    // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops
-    // that no deadline covers once the sweep's has been cleared (a wedged chrome.storage.local.set
-    // here, or a writeInOrder queued behind a still-stalled storageTail after a timeout). Awaiting it —
-    // even on the zero-target / all-settled path — could strand the popup response, the very failure
-    // the deadline exists to prevent. Fire-and-forget; the popup polls worker status separately.
+    total = mine.length;
+    // Candidates are what the popup shows as forgotten (missing/unknown) or cancelled — but that verdict
+    // is a CACHED heartbeat result and can be stale: the bridge may have restored the job since. Retiring
+    // on the stale status would mark a saved-but-undelivered outcome delivered and delete it instead of
+    // handing it to the restored server job. Re-probe each candidate CONCURRENTLY (a fresh ping deletes
+    // serverStatus when the server owns the job again) and only abandon jobs the server STILL disowns.
+    // A failed probe (server unreachable) is treated as "keep" — we cannot rule out a restore. Concurrent
+    // + deadline-bounded, so this is not the old serial HTTP sweep that lost the popup response.
+    const candidates = mine.filter(job => ["cancelled", "missing", "unknown"].includes(job.serverStatus));
+    await Promise.allSettled(candidates.map(async job => {
+      const forgotten = await heartbeat(job, jobs).then(active => active === false, () => false);
+      if (!forgotten) return;
+      if (await abandonForgottenJob(job, jobs, job.serverStatus === "cancelled") === true) cleared += 1;
+    }));
+    // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops that
+    // no deadline covers, so awaiting it could strand the response. Fire-and-forget; the popup polls
+    // worker status separately.
     void recordWorkerStatus(jobs, cfg.origin).catch(() => {});
-    return { ok: true, cleared, kept: mine.length - cleared, timedOut };
-  } catch (error) {
-    return { ok: false, error: String(error?.message || error || "clear failed") };
-  }
+    return { ok: true };
+  })().catch(error => ({ ok: false, error: String(error?.message || error || "clear failed") }));
+
+  const result = await Promise.race([work, deadline]);
+  clearTimeout(timer);
+  if (result === TIMED_OUT) return { ok: true, cleared, kept: Math.max(0, total - cleared), timedOut: true };
+  if (result.ok === false) return result;
+  return { ok: true, cleared, kept: Math.max(0, total - cleared), timedOut: false };
 }
 
 async function advanceJob(job, jobs) {

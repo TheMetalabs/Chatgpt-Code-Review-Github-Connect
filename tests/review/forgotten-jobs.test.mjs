@@ -3,21 +3,32 @@ import assert from 'node:assert/strict';
 import { background, storage } from './helpers.mjs';
 
 // clearStuckJobs retires jobs the server has forgotten (missing/unknown/cancelled) whose tabs are
-// gone — the operator escape hatch for the "recovery" pile-up after a server restart. It reads the
-// serverStatus the heartbeat loop already established (exactly what the popup shows as "missing"),
-// abandons concurrently, and never re-probes every job: a serial HTTP sweep over 20+ jobs is slow
-// enough that the popup's message response is lost ("Could not clear stuck jobs: unknown error").
+// gone — the operator escape hatch for the "recovery" pile-up after a server restart. Candidates come
+// from the cached serverStatus the popup shows as "missing", but each is RE-PROBED concurrently before
+// being abandoned (a stale cached status can hide a job the bridge restored, whose saved outcome must
+// not be discarded). The whole operation is raced against one deadline, so a stalled storage read,
+// ping, or tab probe can never lose the popup's response ("Could not clear stuck jobs: unknown error").
 const makeJob = (id, { tabId, serverStatus } = {}) => ({
   jobId: id, origin: 'http://bridge', leaseId: 'lease-' + id, prompt: 'review ' + id, serverStatus,
   providers: ['chatgpt'], states: { chatgpt: { started: true, runId: 'run-' + id, tabId } },
 });
 
-function harness(jobs, tabs = new Map()) {
+function harness(jobs, tabs = new Map(), serverStates = {}) {
   return background({
     local: storage({ origin: 'http://bridge', token: 'token', pendingReviewJobs: Object.fromEntries(jobs.map((j) => [j.jobId, j])) }),
     tabs,
     handler: () => ({ ok: false, code: 'job_mismatch' }),
-    api: async (_path, body) => (body?.action === 'claim' ? { ok: true, leaseId: 'lease-x' } : { ok: true }),
+    api: async (_path, body) => {
+      if (body?.action === 'claim') return { ok: true, leaseId: 'lease-x' };
+      if (body?.action === 'ping') {
+        // The server's FRESH verdict for this job on the re-probe. Default: still forgotten with its
+        // cached status (what clearStuckJobs re-confirms before abandoning). Override via serverStates
+        // to simulate a job the bridge restored (active) between the cached heartbeat and the sweep.
+        const fresh = serverStates[body.jobId] ?? jobs.find((j) => j.jobId === body.jobId)?.serverStatus;
+        return ['missing', 'unknown', 'cancelled'].includes(fresh) ? { ok: true, active: false, status: fresh } : { ok: true, active: true };
+      }
+      return { ok: true };
+    },
   });
 }
 
@@ -95,4 +106,32 @@ test('clearStuckJobs returns even when the post-sweep status refresh stalls (no-
   assert.equal(res.ok, true, 'the popup gets a result even though the status refresh is wedged');
   assert.equal(res.cleared, 0);
   assert.equal(res.kept, 1);
+});
+
+test('clearStuckJobs re-probes and KEEPS a job the bridge restored since the last heartbeat', async () => {
+  // Cached status says missing, but a fresh ping shows the server owns the job again (active). Retiring
+  // on the stale status would mark its saved outcome delivered and delete it; the re-probe must keep the
+  // job so the normal recovery flow delivers the cached result. (recovery-boundaries.test.mjs covers the
+  // missing→active→deliver path itself.)
+  const b = harness(
+    [makeJob('A', { tabId: 10, serverStatus: 'missing' })], // tab 10 gone (no entry in the tabs map)
+    new Map(),
+    { A: 'active' }, // the bridge restored A between the cached heartbeat and this sweep
+  );
+  const res = await b.context.clearStuckJobs();
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 0, 'a restored job is not abandoned (its outcome is not discarded)');
+  assert.equal(res.kept, 1);
+  assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}), 'the restored job is preserved');
+});
+
+test('clearStuckJobs returns when storage init stalls before the sweep (deadline covers setup)', { timeout: 5000 }, async () => {
+  // settings()/workerJobs() read chrome.storage.local.get up front. The deadline is created before any
+  // await, so a wedged initial read must still trip it and hand the popup a result — not hang before
+  // the race even begins.
+  const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing' })]);
+  b.local.get = () => new Promise(() => {}); // wedge the very first storage read
+  const res = await b.context.clearStuckJobs(60);
+  assert.equal(res.ok, true);
+  assert.equal(res.timedOut, true, 'the deadline fired even though setup stalled');
 });

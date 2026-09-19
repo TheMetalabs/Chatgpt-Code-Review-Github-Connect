@@ -144,4 +144,14 @@ describe("buildReviewerLanes", () => {
     assert.equal(empty.ops[0], "Enabled reviewers finished without JSON. Nothing to post.");
   });
 
+  it("emptyReviewSkip reports non-quota infra failures (tab closed/connection) as 'could not complete', not empty JSON", () => {
+    for (const detail of ["review tab closed", "connection unknown · waiting for reconnection", "error: bridge dropped"]) {
+      const r = emptyReviewSkip([{ provider: "chatgpt", label: "ChatGPT", state: "empty", detail, answered: false }]);
+      assert.equal(r.usageLimited, false);
+      assert.match(r.skipReason, /could not complete/i);
+      assert.doesNotMatch(r.ops[0], /finished without JSON/i);
+      assert.match(r.ops.join("\n"), new RegExp(`ChatGPT: ${detail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    }
+  });
+
 });

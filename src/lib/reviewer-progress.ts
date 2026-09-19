@@ -216,17 +216,20 @@ export function emptyReviewSkip(lanes: readonly ReviewerLane[]): {
   ops: string[];
 } {
   const usageLimited = lanes.some((lane) => /usage limit|quota|한도/i.test(lane.detail));
+  // Other terminal INFRA failures (tab closed, cancelled, connection/reconnection, generic error)
+  // must not be reported as "finished without JSON" either — that misclassifies an infra failure as
+  // a model that reviewed and found nothing. Reserve the generic message for genuinely empty replies.
+  const infraFailed = lanes.some((lane) => /tab closed|cancell|connection|reconnect|error:/i.test(lane.detail));
   const details = lanes.map((lane) => `${lane.label}: ${lane.detail}`);
-  return {
-    usageLimited,
-    skipReason: usageLimited
-      ? "reviewers could not complete — usage limit reached"
-      : "every enabled reviewer finished with no JSON",
-    ops: [
-      usageLimited
-        ? "No review posted — a reviewer hit its usage limit before returning JSON."
-        : "Enabled reviewers finished without JSON. Nothing to post.",
-      ...details,
-    ],
-  };
+  const skipReason = usageLimited
+    ? "reviewers could not complete — usage limit reached"
+    : infraFailed
+      ? "reviewers could not complete — see per-reviewer details"
+      : "every enabled reviewer finished with no JSON";
+  const headline = usageLimited
+    ? "No review posted — a reviewer hit its usage limit before returning JSON."
+    : infraFailed
+      ? "No review posted — reviewers could not complete (see per-reviewer details)."
+      : "Enabled reviewers finished without JSON. Nothing to post.";
+  return { usageLimited, skipReason, ops: [headline, ...details] };
 }

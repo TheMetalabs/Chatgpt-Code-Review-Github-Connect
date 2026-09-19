@@ -1182,11 +1182,12 @@ async function clearStuckJobs(deadlineMs = 15_000) {
     const deadline = new Promise(resolve => { timer = setTimeout(() => resolve("timeout"), deadlineMs); });
     const timedOut = (await Promise.race([sweep.then(() => "done"), deadline])) === "timeout";
     clearTimeout(timer);
-    // A timeout means a storage write may still own the global storageTail; recordWorkerStatus queues
-    // its own writeInOrder behind that same unresolved tail, so awaiting it here would hang the
-    // response anyway — the very failure the deadline exists to prevent. Only refresh the status when
-    // the sweep actually finished (then the tail is settled). A re-click refreshes it after timeout.
-    if (!timedOut) await recordWorkerStatus(jobs, cfg.origin).catch(() => {});
+    // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops
+    // that no deadline covers once the sweep's has been cleared (a wedged chrome.storage.local.set
+    // here, or a writeInOrder queued behind a still-stalled storageTail after a timeout). Awaiting it —
+    // even on the zero-target / all-settled path — could strand the popup response, the very failure
+    // the deadline exists to prevent. Fire-and-forget; the popup polls worker status separately.
+    void recordWorkerStatus(jobs, cfg.origin).catch(() => {});
     return { ok: true, cleared, kept: mine.length - cleared, timedOut };
   } catch (error) {
     return { ok: false, error: String(error?.message || error || "clear failed") };

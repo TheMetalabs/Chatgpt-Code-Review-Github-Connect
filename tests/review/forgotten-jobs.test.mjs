@@ -69,11 +69,10 @@ test('clearStuckJobs isolates a failing job and still clears the healthy ones', 
   assert.equal(res.cleared, 1, 'the healthy job (A) is still cleared even though B fails at storage');
 });
 
-test('clearStuckJobs returns (does not rejoin the stalled queue) when the sweep times out', { timeout: 5000 }, async () => {
+test('clearStuckJobs returns when the sweep stalls (deadline backstop)', { timeout: 5000 }, async () => {
   // Wedge the storage write the sweep performs: saveJobs' chrome.storage.local.set never resolves, so
-  // the abandon hangs and the 60ms deadline fires. That wedged write still owns the global storageTail,
-  // so awaiting recordWorkerStatus (which queues its own writeInOrder behind that tail) would hang the
-  // popup response — the exact lost-response failure. clearStuckJobs must skip it after a timeout.
+  // the abandon hangs. The 60ms deadline must still resolve the race and hand the popup a definite
+  // result instead of hanging on the wedged sweep.
   const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing' })]);
   const realSet = b.local.set;
   b.local.set = () => new Promise(() => {});
@@ -82,4 +81,18 @@ test('clearStuckJobs returns (does not rejoin the stalled queue) when the sweep 
   assert.equal(res.ok, true, 'the popup still gets a definite result');
   assert.equal(res.timedOut, true, 'the wedged write tripped the deadline');
   assert.equal(res.cleared, 0);
+});
+
+test('clearStuckJobs returns even when the post-sweep status refresh stalls (no-target path)', { timeout: 5000 }, async () => {
+  // No forgotten targets → the sweep settles instantly and the deadline never fires, so the only
+  // unbounded wait left is recordWorkerStatus's FRESH status write. Wedging just that write must not
+  // strand the popup response: the refresh is detached (fire-and-forget), never awaited.
+  const b = harness([makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat' })]); // server-owned, not a target
+  const realSet = b.local.set;
+  b.local.set = (items) => ('bridgeWorkerStatus' in (items || {}) ? new Promise(() => {}) : realSet(items));
+  const res = await b.context.clearStuckJobs();
+  b.local.set = realSet;
+  assert.equal(res.ok, true, 'the popup gets a result even though the status refresh is wedged');
+  assert.equal(res.cleared, 0);
+  assert.equal(res.kept, 1);
 });

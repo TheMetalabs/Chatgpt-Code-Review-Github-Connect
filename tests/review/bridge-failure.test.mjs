@@ -32,3 +32,16 @@ test('a success is stored atomically with generating=false before async validati
  await h.bridge.completeBridgeJob('A',raw,[{provider:'chatgpt',raw}]);
  assert.equal(validated,true);
 });
+test('unparseable reply + local repair off is salvaged into a raw_review leg, never pending forever',async()=>{
+ const {bridge,state}=bridgeHarness([makeJob({id:'A',bridgeClaimedAt:Date.now(),reviewProviders:['chatgpt'],generating:{chatgpt:true}})]);
+ const reply='This reply is not JSON. P1 real bug in pay.ts when amount is 0.';
+ const out=await bridge.completeBridgeJob('A',reply,[{provider:'chatgpt',raw:reply}]);
+ assert.equal(out.ok,true); // accepted (not rejected) so the job resolves instead of pending
+ const leg=state.jobs[0].storedLegs.find(l=>l.provider==='chatgpt');
+ const parsed=JSON.parse(leg.raw);
+ assert.deepEqual(parsed.findings,[]);
+ assert.match(parsed.raw_review,/real bug in pay\.ts/);
+ // With repair unavailable, bridgeFormatErrors must NOT demand a 422 even under captureProtocol,
+ // or the extension holds for a repair that never runs (the infinite-pending bug).
+ assert.equal(bridge.bridgeFormatErrors('A',reply,[{provider:'chatgpt',raw:reply}],undefined,true).length,0);
+});

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractChatJson, htmlChatToText } from "./extract-chat-json.ts";
+import { extractChatJson, htmlChatToText, salvageReviewJson } from "./extract-chat-json.ts";
 
 const PAYLOAD = `{
 "merge_recommendation": "APPROVE",
@@ -67,5 +67,33 @@ describe("extractChatJson", () => {
     const parsed = JSON.parse(hit);
     assert.equal(parsed.merge_recommendation, "REQUEST_CHANGES");
     assert.ok(Array.isArray(parsed.findings) && parsed.findings.length >= 1);
+  });
+});
+
+describe("salvageReviewJson", () => {
+  it("keeps the verbatim reply and structures P0/P1/P2 sections", () => {
+    const reply = "Overview: two issues found.\nP1 Null deref in pay.ts when amount is 0.\nP2 Typo in a comment.";
+    const parsed = JSON.parse(salvageReviewJson(reply));
+    assert.deepEqual(parsed.findings, []);
+    assert.equal(parsed.merge_recommendation, "COMMENT");
+    assert.match(parsed.raw_review, /Overview: two issues found\./); // preamble preserved
+    assert.match(parsed.raw_review, /\*\*P1\*\* Null deref/);
+    assert.match(parsed.raw_review, /\*\*P2\*\* Typo/);
+  });
+
+  it("falls back to the full text when there are no severity markers", () => {
+    const reply = "This review has no structured severities, just prose feedback.";
+    const parsed = JSON.parse(salvageReviewJson(reply));
+    assert.equal(parsed.raw_review, reply);
+    assert.deepEqual(parsed.findings, []);
+  });
+
+  it("always returns parseable review JSON, even for junk", () => {
+    for (const t of ["", "   ", "not json {", "```\n{bad\n```", "no markers here"]) {
+      const parsed = JSON.parse(salvageReviewJson(t));
+      assert.ok(Array.isArray(parsed.findings));
+      assert.equal(typeof parsed.raw_review, "string");
+      assert.equal(parsed.merge_recommendation, "COMMENT");
+    }
   });
 });

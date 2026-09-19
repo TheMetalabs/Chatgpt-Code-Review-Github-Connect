@@ -36,13 +36,25 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage">, findings: Finding[], username: string, unanchored: Finding[] = []): string {
+export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage" | "rawReview">, findings: Finding[], username: string, unanchored: Finding[] = []): string {
   const sha = job.headSha.slice(0, 7);
   const n = countBySeverity(findings);
   const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4);
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = providers.includes("local");
+  const rawReview = (job.rawReview ?? "").trim();
+  const rawBlock = rawReview
+    ? `\n**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.** Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${rawReview}\n`
+    : "";
+  // A salvaged verbatim review is NOT a clean pass: keep the clean marker/string out so the loop
+  // poller does not converge, and surface the raw text for the agent.
+  if (rawReview && !findings.length) {
+    return `${REVIEW_SUMMARY_MARK}
+${rawBlock}
+**Reviewed commit:** \`${sha}\`
+<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->`;
+  }
   if (!findings.length) {
     if (skipped.length) {
       return `${REVIEW_SUMMARY_MARK}
@@ -86,7 +98,7 @@ Here are some automated review suggestions for this pull request.
 
 ${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local ? " Local LLM is fallback if Chrome does not return." : ""}
 ${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
-${unanchoredBlock}
+${unanchoredBlock}${rawBlock}
 <details>
 <summary>ℹ️ About Ashlar</summary>
 

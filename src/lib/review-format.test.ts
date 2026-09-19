@@ -4,6 +4,19 @@ import { FINDING_412 } from "./samples.ts";
 import { CLEAN_REVIEW_BODY, inlineFindingComment, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
 
 describe("review-format", () => {
+  it("surfaces a salvaged raw review in the body and is not a clean pass", () => {
+    const body = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "P1 real bug in pay.ts when amount is 0" },
+      [],
+      "ashlar-bot",
+      [],
+    );
+    assert.doesNotMatch(body, new RegExp(CLEAN_REVIEW_BODY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(body, /P1 real bug in pay\.ts/);
+    assert.match(body, /raw=1/);
+    assert.match(body, /not parseable JSON/i);
+  });
+
   it("matches Codex P1 badge markup on inline comments", () => {
     const body = inlineFindingComment(FINDING_412, {
       owner: "acme",

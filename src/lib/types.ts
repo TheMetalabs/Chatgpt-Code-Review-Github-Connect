@@ -95,6 +95,9 @@ export interface Job {
   findings: Finding[];
   mergeRecommendation?: MergeRec;
   highestRisk?: string;
+  // Verbatim model reply kept when it was not parseable review JSON and local repair was off;
+  // surfaced in the review body for the fixing agent (see salvageReviewJson).
+  rawReview?: string;
   investigatedSafe: string[];
   assumptions: string[];
   postedReviewId?: string;

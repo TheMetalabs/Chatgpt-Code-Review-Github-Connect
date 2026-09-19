@@ -10,7 +10,7 @@ import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./har
 import type { Job, ReviewProvider, ProviderError } from "./types";
 import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
-import { extractChatJson } from "./extract-chat-json";
+import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 
@@ -409,8 +409,12 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
       reviewHistory().recordResponse(jobId,leg.provider,leg.raw,leg.originalText || "");
     } catch {return {ok:false,error:"response archive unavailable; original response must be retained",code:"history_unavailable"};}
     const parsed = extractChatJson(leg.raw);
-    if (!parsed) return {ok: false, error: "completed response is not review JSON"};
-    accepted.push({...leg, raw: parsed});
+    // Unparseable + no repair to fall back on → salvage into a postable review (verbatim reply in
+    // raw_review) so the job resolves instead of pending forever. If repair IS available the route
+    // returned 422 before reaching here, so we never pre-empt a real repair.
+    const finalRaw = parsed ?? (localJsonRepairAvailable(getHarbor().settings) ? null : salvageReviewJson(leg.raw));
+    if (!finalRaw) return {ok: false, error: "completed response is not review JSON"};
+    accepted.push({...leg, raw: finalRaw});
   }
   if (!accepted.length) return {ok: false, error: "no enabled reviewer result"};
   patchHarborJob(jobId, current => {
@@ -463,8 +467,11 @@ function repairs() {
     },
   });
 }
-export function bridgeFormatErrors(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string, captureProtocol = false): string[] {
-  if (!captureProtocol && !localJsonRepairAvailable(getHarbor().settings)) return [];
+export function bridgeFormatErrors(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string, _captureProtocol = false): string[] {
+  // Never demand a repair that cannot run: with local JSON repair off, a 422 makes the extension
+  // hold for a repair that never happens (infinite pending). completeBridgeJob salvages instead.
+  // (Independent of the capture protocol — capture only matters while a real repair can consume it.)
+  if (!localJsonRepairAvailable(getHarbor().settings)) return [];
   const job=getHarbor().jobs.find(row=>row.id===jobId);
   if(!job || job.status!=="awaiting_chat" || !ownsLease(job,leaseId) || job.chatFpRound || job.fpProviders?.length) return [];
   return (legs?.length ? legs : [{provider:"chatgpt" as const,raw}]).flatMap(leg=>{

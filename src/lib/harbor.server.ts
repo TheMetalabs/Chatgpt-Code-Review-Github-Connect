@@ -773,6 +773,9 @@ export async function submitHarborChat(
     candidates: merged.findings,
     mergeRecommendation: merged.mergeRecommendation,
     highestRisk: merged.highestRisk,
+    // Verbatim reply from any leg whose JSON could not be parsed (local repair off) — surfaced in
+    // the review body so the fixing agent can act on it instead of the job pending forever.
+    rawReview: gates.map((g) => g.rawReview).find(Boolean),
     investigatedSafe: merged.investigatedSafe,
     assumptions: [
       skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",

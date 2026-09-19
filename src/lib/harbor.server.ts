@@ -594,10 +594,12 @@ async function generateLocalLeg(
 ): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
+  const job = state.jobs.find((j) => j.id === jobId);
   const mode = chooseLocalReviewMode(state.settings.localReviewMode, prompt.length, state.settings.localReviewSingleTurnMaxTokens);
   if (mode === "multiturn" && sample) {
     return runLocalReviewLoop(sample, state.settings, {
       signal,
+      extra: job?.thread?.userText ?? "",
       peerReported: () =>
         (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? [])
           .filter((l) => l.provider !== "local" && l.raw.trim())

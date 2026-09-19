@@ -861,7 +861,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
 
 async function deliverOutcome(job, provider, jobs) {
   const state = job.states[provider], out = state.outcome;
-  if (!out || state.delivered || sourceArchiveDurable(state)) return;
+  // A durable archive normally settles via the repair-commit path, so it is not re-delivered here —
+  // EXCEPT a no-repair salvage outcome, whose only delivery path is this complete request.
+  if (!out || state.delivered || (sourceArchiveDurable(state) && !out.salvaged)) return;
   // A failed outbox write can also leave an outcome in the shared cache. Retry
   // that save before sending it; only the server ACK permits subsequent cleanup.
   workerStep(job, provider, "delivery_pending");
@@ -1065,7 +1067,7 @@ async function repairProvider(job, provider, jobs) {
      (state.formatError || state.observation?.state==="response_completed_json_invalid")) {
     const salvage=await readRepairSource(job,provider);
     if(salvage?.text) {
-      state.outcome={ok:true,raw:salvage.text,originalText:salvage.text};
+      state.outcome={ok:true,raw:salvage.text,originalText:salvage.text,salvaged:true};
       delete state.formatError;
       workerStep(job,provider,"salvaged_no_repair");
       await saveJobs(jobs);

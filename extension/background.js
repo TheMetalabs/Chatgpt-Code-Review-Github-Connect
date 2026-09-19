@@ -1162,7 +1162,7 @@ async function abandonForgottenJob(job, jobs, explicit) {
 /** Popup-triggered sweep for jobs the server has permanently forgotten (missing/unknown)
  * or cancelled whose tabs are gone. Never touches a job with a live tab or one the server
  * still owns. Returns how many were cleared so the operator gets a definite result. */
-async function clearStuckJobs() {
+async function clearStuckJobs(deadlineMs = 15_000) {
   try {
     const cfg = await settings();
     if (!cfg.enabled || !cfg.origin || !cfg.token) return { ok: false, error: "set the Ashlar origin and token first" };
@@ -1179,10 +1179,14 @@ async function clearStuckJobs() {
     );
     // Hard ceiling so a slow tab probe or any other unbounded wait can never strand the popup's
     // response: report whatever finished and leave the rest for a re-click.
-    const deadline = new Promise(resolve => { timer = setTimeout(() => resolve("timeout"), 15_000); });
+    const deadline = new Promise(resolve => { timer = setTimeout(() => resolve("timeout"), deadlineMs); });
     const timedOut = (await Promise.race([sweep.then(() => "done"), deadline])) === "timeout";
     clearTimeout(timer);
-    await recordWorkerStatus(jobs, cfg.origin).catch(() => {});
+    // A timeout means a storage write may still own the global storageTail; recordWorkerStatus queues
+    // its own writeInOrder behind that same unresolved tail, so awaiting it here would hang the
+    // response anyway — the very failure the deadline exists to prevent. Only refresh the status when
+    // the sweep actually finished (then the tail is settled). A re-click refreshes it after timeout.
+    if (!timedOut) await recordWorkerStatus(jobs, cfg.origin).catch(() => {});
     return { ok: true, cleared, kept: mine.length - cleared, timedOut };
   } catch (error) {
     return { ok: false, error: String(error?.message || error || "clear failed") };

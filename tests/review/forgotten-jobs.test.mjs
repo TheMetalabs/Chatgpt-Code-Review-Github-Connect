@@ -68,3 +68,18 @@ test('clearStuckJobs isolates a failing job and still clears the healthy ones', 
   assert.equal(res.ok, true);
   assert.equal(res.cleared, 1, 'the healthy job (A) is still cleared even though B fails at storage');
 });
+
+test('clearStuckJobs returns (does not rejoin the stalled queue) when the sweep times out', { timeout: 5000 }, async () => {
+  // Wedge the storage write the sweep performs: saveJobs' chrome.storage.local.set never resolves, so
+  // the abandon hangs and the 60ms deadline fires. That wedged write still owns the global storageTail,
+  // so awaiting recordWorkerStatus (which queues its own writeInOrder behind that tail) would hang the
+  // popup response — the exact lost-response failure. clearStuckJobs must skip it after a timeout.
+  const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing' })]);
+  const realSet = b.local.set;
+  b.local.set = () => new Promise(() => {});
+  const res = await b.context.clearStuckJobs(60);
+  b.local.set = realSet;
+  assert.equal(res.ok, true, 'the popup still gets a definite result');
+  assert.equal(res.timedOut, true, 'the wedged write tripped the deadline');
+  assert.equal(res.cleared, 0);
+});

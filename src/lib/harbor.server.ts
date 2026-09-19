@@ -29,7 +29,7 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
-import { buildReviewerLanes } from "./reviewer-progress";
+import { buildReviewerLanes, emptyReviewSkip } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { redactSalvagedReviewBody } from "./review-format";
@@ -391,14 +391,17 @@ async function watchReviewers(jobId: string, token: string) {
       const legs = stored.filter((l) => l.raw.trim());
       if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
       else {
+        // Report the real per-reviewer reason (usage limit / connection / genuinely empty) rather
+        // than a blanket "finished without JSON" that hid infra causes like a quota block.
+        const skip = emptyReviewSkip(buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) }));
         patchJob(jobId, (j) => ({
           ...j,
           status: "skipped",
-          skipReason: "every enabled reviewer finished with no JSON",
+          skipReason: skip.skipReason,
           plan: "No reviewer JSON to schema-merge.",
           updatedAt: Date.now(),
         }));
-        void upsertOpsComment(token, jobId, "skipped", ["Enabled reviewers finished without JSON. Nothing to post."]);
+        void upsertOpsComment(token, jobId, "skipped", skip.ops);
       }
     }
     if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;

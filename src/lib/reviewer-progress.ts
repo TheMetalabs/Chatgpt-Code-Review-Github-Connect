@@ -203,3 +203,30 @@ export function laneVerb(state: ReviewerLaneState): string {
   if (state === "empty") return "no JSON";
   return "queued";
 }
+
+/**
+ * When a review ends with no reviewer JSON, report WHY from the per-reviewer lanes instead of a
+ * blanket "finished without JSON" — that message hid usage-limit and connection causes and made an
+ * infra failure look like a model that reviewed and found nothing. The ops note lists each lane so
+ * the operator sees the real reason (e.g. "ChatGPT: usage limit").
+ */
+export function emptyReviewSkip(lanes: readonly ReviewerLane[]): {
+  usageLimited: boolean;
+  skipReason: string;
+  ops: string[];
+} {
+  const usageLimited = lanes.some((lane) => /usage limit|quota|한도/i.test(lane.detail));
+  const details = lanes.map((lane) => `${lane.label}: ${lane.detail}`);
+  return {
+    usageLimited,
+    skipReason: usageLimited
+      ? "reviewers could not complete — usage limit reached"
+      : "every enabled reviewer finished with no JSON",
+    ops: [
+      usageLimited
+        ? "No review posted — a reviewer hit its usage limit before returning JSON."
+        : "Enabled reviewers finished without JSON. Nothing to post.",
+      ...details,
+    ],
+  };
+}

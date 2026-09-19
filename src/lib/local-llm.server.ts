@@ -41,7 +41,7 @@ export function localGenerationParams(settings: BotSettings): LocalGenerationPar
         : envNum("ASHLAR_LOCAL_REVIEW_MAX_TOKENS", 32_768),
     temperature: envNum("ASHLAR_LOCAL_REVIEW_TEMPERATURE", 0.6),
     top_p: envNum("ASHLAR_LOCAL_REVIEW_TOP_P", 0.95),
-    top_k: envNum("ASHLAR_LOCAL_REVIEW_TOP_K", 20),
+    top_k: envNum("ASHLAR_LOCAL_REVIEW_TOP_K", 0),
     presence_penalty: envNum("ASHLAR_LOCAL_REVIEW_PRESENCE_PENALTY", 1.0),
   };
 }

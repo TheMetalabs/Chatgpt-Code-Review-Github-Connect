@@ -45,6 +45,8 @@ export type LocalReviewDeps = {
   peerReported?: () => PeerLeg[];
   /** User's mention text (e.g. "focus on migration rollback") from a comment thread. */
   extra?: string;
+  /** Optional: heartbeat callback at each turn boundary with group/iteration/stage info. */
+  onProgress?: (p: { group: number; groups: number; iter: number; stage: string }) => void;
   signal?: AbortSignal;
   log?: (line: string) => void;
   now?: () => number;
@@ -208,6 +210,7 @@ async function reviewGroup(
   settings: BotSettings,
   deps: Required<Pick<LocalReviewDeps, "request">> & LocalReviewDeps,
   t: LoopTuning,
+  groupMeta: { group: number; groups: number },
 ): Promise<string | null> {
   const groupSet = new Set(groupPaths);
   const sub = subsetSample(sample, groupSet);
@@ -307,6 +310,7 @@ async function reviewGroup(
     Math.max(lastPromptTokens, Math.ceil(messages.reduce((n, m) => n + msgSize(m), 0) / CHARS_PER_TOKEN));
 
   for (let iter = 1; iter <= t.toolIterCap + 1; iter += 1) {
+    deps.onProgress?.({ ...groupMeta, iter, stage: "generating" });
     injectNewPeers(messages, deps, injectedPeers);
     const forceFinal = iter > t.toolIterCap || (t.ctxCapTokens > 0 && contextTokens() > t.ctxCapTokens);
     // Append the forced-final instruction whenever it isn't already the last message. The old
@@ -365,6 +369,9 @@ async function reviewGroup(
       }
       messages.push({ role: "tool", tool_call_id: c.id, content: served });
     }
+    // A tool round completed; refresh the heartbeat so ops can tell healthy progress from a stall.
+    // calls.length is guaranteed ≥ 1 here (we break above when it is empty), so no guard is needed.
+    deps.onProgress?.({ ...groupMeta, iter, stage: "tool" });
     // The model explicitly could not finish this group — fail it (→ not_cleared) rather than
     // accepting whatever JSON is around as a completed review.
     if (taskFailed) return null;
@@ -546,13 +553,14 @@ export async function runLocalReviewLoop(
     deps.log?.(`local review loop: ${groups.length} group(s) over ${sample.changedPaths.length} changed file(s)`);
     const raws: string[] = [];
     const failedGroups: string[][] = [];
-    for (const group of groups) {
+    for (let i = 0; i < groups.length; i += 1) {
       if (deps.signal?.aborted) break;
+      const group = groups[i];
       // Sequential — one generation at a time bounds peak memory on a shared host. Isolate each group:
       // a transient request/tool failure late in a long multi-group run must not discard the groups
       // already reviewed. Keep their findings and move on; track failed groups for coverage reporting.
       try {
-        const raw = await reviewGroup(sample, group, settings, { ...deps, request }, t);
+        const raw = await reviewGroup(sample, group, settings, { ...deps, request }, t, { group: i + 1, groups: groups.length });
         // A group counts as reviewed only if its result is a valid review — it must actually say
         // something (findings, or investigated_safe for its files), the same rule the downstream gate
         // applies. A null return (prose/truncated) or an empty `{"findings":[]}` with no

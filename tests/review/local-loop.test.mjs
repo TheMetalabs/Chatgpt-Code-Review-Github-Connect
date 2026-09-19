@@ -417,3 +417,25 @@ test("D6: user mention text (extra) is threaded into the loop and appears in the
   const userMsg = bodies[0].messages.find(m => m.role === "user");
   assert.ok(userMsg && /focus on migration rollback/.test(userMsg.content), "extra text must appear in the prompt");
 });
+
+test("onProgress callback fires at each turn boundary with group/iter metadata", async () => {
+  const { request } = mock([
+    assistant("", [toolCall("file_read", { file_path: "src/pay.ts" })]), // iter 1
+    assistant(REVIEW_JSON), // iter 2
+  ]);
+  const progress = [];
+  await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, {
+    request,
+    onProgress: (p) => progress.push({ ...p }),
+  });
+  // At least one progress call per iteration. For two iterations we expect at least two calls.
+  assert.ok(progress.length >= 2, `expected >= 2 progress calls, got ${progress.length}`);
+  // First call should be group 1 of 1, iter 1.
+  assert.equal(progress[0].group, 1);
+  assert.equal(progress[0].groups, 1);
+  assert.equal(progress[0].iter, 1);
+  assert.equal(progress[0].stage, "generating");
+  // Later iterations should have increasing iter values.
+  const iters = progress.map((p) => p.iter);
+  assert.ok(iters.includes(2), "iter 2 should be reported");
+});

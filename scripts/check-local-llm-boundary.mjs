@@ -27,6 +27,10 @@ const ALLOW = new Set([
   "src/lib/local-review-loop.server.ts",
   "src/lib/local-fallback.ts",
   "src/lib/harbor.server.ts",
+  // Local-lane rendering only: the local provider's in-flight branch surfaces heartbeat freshness.
+  // The chat/Grok branches stay frozen (guarded by reviewer-progress.test.ts chat-lane cases).
+  "src/lib/reviewer-progress.ts",
+  "src/lib/reviewer-progress.test.ts",
   "src/lib/settings.server.ts",
   "src/lib/types.ts",
   "src/lib/json-repair.server.ts",

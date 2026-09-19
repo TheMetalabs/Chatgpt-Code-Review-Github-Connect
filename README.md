@@ -236,6 +236,14 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 | `ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP` | 6 | 그룹당 최대 파일 수 |
 | `ASHLAR_LOCAL_REVIEW_TOOL_ITERS` | 8 | 그룹당 최대 툴 라운드. 초과하면 툴을 빼고 최종 JSON 강제 |
 | `ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS` | 24000 | 프롬프트가 이 토큰을 넘으면 다음 턴에 최종 JSON 강제 |
+| `ASHLAR_LOCAL_REVIEW_STALE_NOTE_MS` | 300000 | 로컬 리뷰어 하트비트 오래된 판정 시간(ms). 초과 시 ops 노트에 경고 표시만(자동 취소 없음) |
+
+로컬 레그는 이제 `providerProgress.local`로 **하트비트 + 진행상황 신호**를 내보냅니다. `observedAt`은
+레그가 시작할 때 심어지고 멀티턴에서는 각 턴 경계마다 갱신됩니다(단일턴은 시작 시점 한 번 — 그래서
+멈춘 단일턴 요청도 stale 판정에 걸립니다). 리뷰어 레인과 ops 노트가 이 신호를 읽어 "정상 생성 중"과
+"멈춤"을 구분합니다. 구성한 `ASHLAR_LOCAL_REVIEW_STALE_NOTE_MS` 시간(기본 5분) 이상 하트비트가 안 오면
+**가시성 노트만** 출력하며, **자동 타임아웃/중단은 없습니다**. 대기/실패 판정 자체는 기존대로 레그 종료
+(성공 레그 저장 또는 `Skipped local`)로 이뤄지고, 하트비트는 사람이 취소 여부를 판단할 근거일 뿐입니다.
 
 기본 `auto`는 작은 PR(프롬프트 ≤ 30K 토큰)은 **단일턴**으로 빠르게 전체를 보고, 큰 PR은 **멀티턴**으로
 돌립니다. 단일턴은 한 완성 창에 다 담기고 재현율이 높으며, 큰 PR은 단일 호출 KV 캐시가 치솟으니

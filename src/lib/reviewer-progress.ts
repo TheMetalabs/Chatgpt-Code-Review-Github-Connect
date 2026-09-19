@@ -72,9 +72,10 @@ export function buildReviewerLanes(
     | "providerErrors"
     | "providerProgress"
   >,
-  opts?: { localInFlight?: boolean; now?: number; enabled?: readonly ReviewProvider[] },
+  opts?: { localInFlight?: boolean; now?: number; enabled?: readonly ReviewProvider[]; staleMs?: number },
 ): ReviewerLane[] {
   const now = opts?.now ?? Date.now();
+  const staleMs = opts?.staleMs ?? 300_000;
   const providers = (job.reviewProviders?.length ? job.reviewProviders : opts?.enabled ?? []) as ReviewProvider[];
   return providers.map((provider) => {
     const label = PROVIDER_LABEL[provider];
@@ -85,7 +86,16 @@ export function buildReviewerLanes(
     );
 
     const pendingLocal = provider === "local" && Boolean(opts?.localInFlight || job.generating?.local === true);
-    if (pendingLocal) return {provider, state: "generating", label, detail: "calling local LLM", answered: false};
+    if (pendingLocal) {
+      // Tell healthy generating from a stall — the per-step visibility the chat providers have.
+      // observedAt is seeded when the leg starts and refreshed each multiturn turn. Report only the
+      // BINARY state (fresh vs stale), never the live elapsed age: this detail feeds the ops-comment
+      // change key, so a continuously changing value would rewrite the GitHub comment every tick.
+      const observedAt = job.providerProgress?.local?.observedAt;
+      const stale = observedAt !== undefined && now - observedAt > staleMs;
+      const detail = stale ? "calling local LLM · no recent progress" : "calling local LLM";
+      return { provider, state: "generating", label, detail, answered: false };
+    }
     if (raw) {
       const stats = replyStats(raw);
       const findings =

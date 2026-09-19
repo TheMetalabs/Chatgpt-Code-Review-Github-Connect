@@ -172,7 +172,7 @@ export function publicJobs(jobs: Job[]) {
     return {
       ...rest,
       hasRawReview: Boolean(j.rawReview),
-      reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
+      reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled, staleMs: localStaleNoteMs() }),
     };
   });
 }
@@ -357,6 +357,14 @@ const WATCH_TICK_MS = 5_000;
 // limit with room for the summary scaffolding. Full originals are retained in review history.
 const MAX_RAW_REVIEW_BODY = 60_000;
 
+function localStaleNoteMs(): number {
+  const env = typeof process !== "undefined" ? process.env : undefined;
+  const raw = env?.ASHLAR_LOCAL_REVIEW_STALE_NOTE_MS;
+  if (raw == null || raw === "") return 300_000; // 5 minutes default
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 300_000;
+}
+
 async function watchReviewers(jobId: string, token: string) {
   let lastNotes = "";
   let localStarted = false;
@@ -412,12 +420,23 @@ async function watchReviewers(jobId: string, token: string) {
       }
     }
     if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;
-    const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) });
+    const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId), staleMs: localStaleNoteMs() });
     const notes: string[] = [];
     if (chat.length && !bridge.connected && !claimed) {
       notes.push(
         `Chrome bridge is not connected. ${chat.map((p) => (p === "grok" ? "Grok" : "ChatGPT")).join(" / ")} start when the extension reconnects.`,
       );
+    }
+    // Local staleness note (visibility only; never auto-abort).
+    if ((localInFlight.has(jobId) || job.generating?.local === true) && job.providerProgress?.local?.observedAt) {
+      const age = Date.now() - job.providerProgress.local.observedAt;
+      const threshold = localStaleNoteMs();
+      if (age > threshold) {
+        // No duration at all: a live age churns the ops comment every tick, and a threshold-rounded
+        // duration misreports sub-minute windows. The ops comment tracks state, so a stable, accurate
+        // "no recent progress" (matching the lane) is the honest signal; the operator decides.
+        notes.push(`local reviewer: no recent progress (still waiting; cancel manually if stalled)`);
+      }
     }
     for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);
 
@@ -595,7 +614,11 @@ async function kickLocalRace(jobId: string, prompt: string) {
   // A health probe can be delayed by the model queue. Never gate generation on that timer.
   const controller = new AbortController();
   localControllers.set(jobId, controller);
-  patchJob(jobId, j => ({...j, generating: {...j.generating, local: true}, updatedAt: Date.now()}));
+  // Seed the heartbeat when the leg starts so the staleness note can fire even for a hung single-turn
+  // request (multiturn refreshes observedAt each turn; single-turn has no mid-request progress signal).
+  patchJob(jobId, j => ({...j, generating: {...j.generating, local: true},
+    providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "generating", observedAt: Date.now(), receivedAt: Date.now()}},
+    updatedAt: Date.now()}));
   try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
   void attachLocalLeg(jobId, prompt, { submit: true });
 }
@@ -621,6 +644,23 @@ async function generateLocalLeg(
         (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? [])
           .filter((l) => l.provider !== "local" && l.raw.trim())
           .map((l) => ({ provider: l.provider, raw: l.raw })),
+      onProgress: (p) => {
+        patchJob(jobId, (j) => {
+          if (j.status !== "awaiting_chat") return j;
+          return {
+            ...j,
+            providerProgress: {
+              ...j.providerProgress,
+              local: {
+                runId: `local:${jobId}`,
+                stage: "generating",
+                observedAt: Date.now(),
+                receivedAt: Date.now(),
+              },
+            },
+          };
+        });
+      },
     });
   }
   // multiturn was chosen (a large PR) but the snapshot is gone (e.g. a late bridge-fallback kick
@@ -643,13 +683,14 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
         ...j, generating: {...j.generating, local: false},
         providerErrors: {...j.providerErrors, local: {code: "error", message: local.error}},
+        providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now()}},
         assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12), updatedAt: Date.now(),
       }));
     } else {
       patchJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
         const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw, originalText: local.originalText }];
-        return { ...j, storedLegs: next, generating: {...j.generating, local: false}, updatedAt: Date.now() };
+        return { ...j, storedLegs: next, generating: {...j.generating, local: false}, providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "response_collected", observedAt: Date.now(), receivedAt: Date.now()}}, updatedAt: Date.now() };
       });
     }
   } catch (e) {
@@ -657,6 +698,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
       ...j, generating: {...j.generating, local: false},
       providerErrors: {...j.providerErrors, local: {code: "error", message: msg.slice(0, 160)}},
+      providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now()}},
       assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12), updatedAt: Date.now(),
     }));
   } finally {

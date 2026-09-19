@@ -33,7 +33,7 @@ async function runPrompt(prompt, reasoning, resume = false) {
   await dismissOverlays();
   await waitUntilComposer();
   await dismissOverlays();
-  await selectReasoning("chatgpt", reasoning || "pro");
+  await selectReasoning("chatgpt", reasoning || "extra_high");
   await dismissOverlays();
   const el = composer();
   if (!el) throw new Error("ChatGPT composer not found");

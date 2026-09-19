@@ -237,9 +237,11 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
   });
 }
 
-function providerUrl(provider, reasoning) {
+function providerUrl(provider, _reasoning) {
   if (provider === "grok") return "https://grok.com/";
-  if (reasoning === "pro") return "https://chatgpt.com/?temporary-chat=true&model=gpt-6-pro";
+  // Never pin a model slug in the URL. The effort/model is chosen from the composer pill after load
+  // (selectReasoning). A stale slug that no longer exists (e.g. gpt-6-pro) makes ChatGPT serve a
+  // logged-out-looking landing page with no composer, so the runner hangs even while signed in.
   return "https://chatgpt.com/?temporary-chat=true";
 }
 

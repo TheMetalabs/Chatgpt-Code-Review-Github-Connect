@@ -42,6 +42,8 @@ export type LocalReviewDeps = {
   readFileAtHead?: (path: string) => Promise<string | null>;
   /** Current non-local legs already stored on the job; polled each turn so late peers get used. */
   peerReported?: () => PeerLeg[];
+  /** User's mention text (e.g. "focus on migration rollback") from a comment thread. */
+  extra?: string;
   signal?: AbortSignal;
   log?: (line: string) => void;
   now?: () => number;
@@ -101,22 +103,22 @@ function patchesByPath(diff: string): Map<string, string> {
   return out;
 }
 
-// Greedy grouping: pack changed code files (in review-budget order, so same-dir siblings stay
-// adjacent) into groups bounded by char size and file count. Bounding the per-group prompt is what
-// keeps peak KV-cache memory in check when other processes share the host.
+// Greedy grouping: pack changed files (in review-budget order for code files, so same-dir siblings
+// stay adjacent) into groups bounded by char size and file count. Bounding the per-group prompt is
+// what keeps peak KV-cache memory in check when other processes share the host.
 export function groupChangedFiles(sample: SamplePr, t: LoopTuning): string[][] {
   const contentByPath = new Map(sample.files.map((f) => [f.path, f.content]));
   const present = new Set(sample.files.map((f) => f.path));
-  // Order the files whose content we have (review-budget order keeps same-dir siblings adjacent),
-  // then append any changed code file MISSING from the snapshot (fetch returned null: too large,
-  // binary, API error). Without this they fall out of every group and are silently unreviewed; kept
-  // here they are still grouped and reviewed from their diff (file_read_diff) even with no full body.
-  const orderedPresent = orderFiles(
+  // Start with rank-0 code files (ordered by review-budget so same-dir siblings stay adjacent).
+  const orderedCodePresent = orderFiles(
     sample.files.filter((f) => sample.changedPaths.includes(f.path) && rankChangedFile(f.path) === 0),
   ).map((f) => f.path);
   const missingCode = sample.changedPaths.filter((p) => rankChangedFile(p) === 0 && !present.has(p));
-  const codePaths = [...orderedPresent, ...missingCode];
-  const targets = codePaths.length ? codePaths : sample.changedPaths.slice();
+  // Then append all other changed paths (non-code, tests, config, docs) not already included.
+  const alreadyIncluded = new Set([...orderedCodePresent, ...missingCode]);
+  const remaining = sample.changedPaths.filter((p) => !alreadyIncluded.has(p));
+  const targets = [...orderedCodePresent, ...missingCode, ...remaining];
+  if (!targets.length) return [sample.changedPaths.slice(0, 1)];
   const groups: string[][] = [];
   let cur: string[] = [];
   let curChars = 0;
@@ -157,7 +159,7 @@ function toolDefs() {
   return [
     { type: "function", function: { name: "file_read", description: "Read a file at the PR head. Use hunk headers (@@ -x,y +m,n @@) to pick ranges; at most 400 lines per call.", parameters: { type: "object", properties: { file_path: { type: "string" }, start_line: { type: "integer" }, end_line: { type: "integer" } }, required: ["file_path"] } } },
     { type: "function", function: { name: "file_read_diff", description: "Show the PR diff of other changed files.", parameters: { type: "object", properties: { path_array: { type: "array", items: { type: "string" } } }, required: ["path_array"] } } },
-    { type: "function", function: { name: "code_search", description: "Search changed files and any file already read (case-insensitive substring, or regex). Up to 60 matches.", parameters: { type: "object", properties: { search_text: { type: "string" }, use_regexp: { type: "boolean" } }, required: ["search_text"] } } },
+    { type: "function", function: { name: "code_search", description: "Search changed files and any file already read (case-insensitive substring). Up to 60 matches.", parameters: { type: "object", properties: { search_text: { type: "string" } }, required: ["search_text"] } } },
     { type: "function", function: { name: "task_done", description: "Call when the review is complete, then return the final review JSON.", parameters: { type: "object", properties: { state: { type: "string", enum: ["DONE", "FAILED"] } }, required: ["state"] } } },
   ];
 }
@@ -175,7 +177,7 @@ async function reviewGroup(
   const sub = subsetSample(sample, groupSet);
   const { prompt: instructions, files: attachments } = buildChatParts({
     sample: sub,
-    extra: "",
+    extra: deps.extra ?? "",
     untrustedBody: sample.body ?? "",
     contextMaxChars: settings.promptContextMaxChars,
     contextPadLines: settings.contextPadLines,
@@ -215,17 +217,17 @@ async function reviewGroup(
     }
     if (name === "code_search") {
       const needle = String(a.search_text || "");
-      const re = a.use_regexp ? safeRegExp(needle) : null;
+      const needleLower = needle.toLowerCase();
       const hits: string[] = [];
       for (const [p, text] of cache) {
         if (typeof text !== "string") continue; // defensive: a null/absent content entry must not throw
         const ls = text.split("\n");
         for (let i = 0; i < ls.length && hits.length < 60; i += 1) {
-          // Bound the tested slice: a model-supplied regex can backtrack catastrophically on a very
-          // long line and hang the host. 2000 chars is well past any real code line.
+          // Bound the tested slice to prevent resource exhaustion. 2000 chars is well past any real code line.
           const line = ls[i].length > 2000 ? ls[i].slice(0, 2000) : ls[i];
-          const hit = re ? re.test(line) : line.toLowerCase().includes(needle.toLowerCase());
-          if (hit) hits.push(`${p}:${i + 1}| ${ls[i].trim().slice(0, 200)}`);
+          if (line.toLowerCase().includes(needleLower)) {
+            hits.push(`${p}:${i + 1}| ${ls[i].trim().slice(0, 200)}`);
+          }
         }
       }
       return hits.length ? hits.join("\n") : "no matches (search covers changed files and files read so far only)";
@@ -282,10 +284,6 @@ async function reviewGroup(
   return finalRaw;
 }
 
-function safeRegExp(src: string): RegExp | null {
-  try { return new RegExp(src, "i"); } catch { return null; }
-}
-
 function injectNewPeers(messages: Msg[], deps: LocalReviewDeps, injected: Set<string>): void {
   const peers = deps.peerReported?.() ?? [];
   for (const peer of peers) {
@@ -307,9 +305,22 @@ type ReviewObj = Record<string, unknown> & {
   highest_risk?: string;
 };
 
+type FindingLike = { file?: unknown; line?: unknown; title?: unknown; severity?: unknown; [key: string]: unknown };
+
+function normalizeTitle(title: unknown): string {
+  return String(title ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+const SEVERITY_ORDER: Record<string, number> = { P0: 0, P1: 1, P2: 2 };
+
 // Union the per-group JSON objects into one review JSON for the single local leg. The final
 // schema-merge across providers is unchanged; this only stitches the groups the loop split.
-function mergeGroupResults(raws: string[]): string {
+// Before returning, dedup findings (by file|line|normalizedTitle) and sort by severity
+// (most-severe-first) so the downstream 8-cap in gateLiveSubmission keeps the highest-priority items.
+// For partial failures (some groups threw): add not_cleared coverage for failed groups' files,
+// add an assumptions entry, and force investigated_safe to [] when findings are empty (so the
+// frozen gate does NOT treat an empty result as a clean pass).
+function mergeGroupResults(raws: string[], failedGroups: string[][]): string {
   const findings: unknown[] = [];
   const coverage: unknown[] = [];
   const safe: unknown[] = [];
@@ -326,13 +337,50 @@ function mergeGroupResults(raws: string[]): string {
     if (obj.merge_recommendation === "REQUEST_CHANGES") merge = "REQUEST_CHANGES";
     if (!highest && typeof obj.highest_risk === "string") highest = obj.highest_risk;
   }
+  // Dedup findings by file|line|normalizedTitle, then sort by severity most-severe-first.
+  const seen = new Set<string>();
+  const deduped: unknown[] = [];
+  for (const f of findings) {
+    const rec = f as FindingLike;
+    const key = `${rec.file ?? ""}|${rec.line ?? ""}|${normalizeTitle(rec.title)}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(f);
+    }
+  }
+  const sorted = deduped.sort((a, b) => {
+    const aSev = String((a as FindingLike).severity ?? "");
+    const bSev = String((b as FindingLike).severity ?? "");
+    const aRank = SEVERITY_ORDER[aSev] ?? 999;
+    const bRank = SEVERITY_ORDER[bSev] ?? 999;
+    return aRank - bRank;
+  });
+  // For partial failures: add not_cleared coverage for each file in failed groups, add an
+  // assumptions entry, and force investigated_safe to [] when findings are empty so the frozen
+  // gate does NOT treat an empty result as a clean pass.
+  const finalCoverage = [...coverage];
+  const finalAssumptions = [...assumptions];
+  let finalSafe = safe;
+  if (failedGroups.length > 0) {
+    const failedFiles = failedGroups.flat();
+    for (const file of failedFiles) {
+      finalCoverage.push({ file, status: "not_cleared", reason: "group review failed" });
+    }
+    finalAssumptions.push(`Local review incomplete: ${failedGroups.length} group(s) failed (${failedFiles.join(", ")})`);
+    // If findings is empty AND at least one group failed, force investigated_safe to [] so the
+    // frozen gate does NOT treat it as a clean pass (it will reject as "empty findings without
+    // investigated_safe").
+    if (sorted.length === 0) {
+      finalSafe = [];
+    }
+  }
   return JSON.stringify({
-    merge_recommendation: findings.length ? merge : "COMMENT",
+    merge_recommendation: sorted.length ? merge : "COMMENT",
     highest_risk: highest,
-    investigated_safe: safe,
-    assumptions,
-    findings,
-    coverage,
+    investigated_safe: finalSafe,
+    assumptions: finalAssumptions,
+    findings: sorted,
+    coverage: finalCoverage,
   });
 }
 
@@ -347,20 +395,22 @@ export async function runLocalReviewLoop(
     const groups = groupChangedFiles(sample, t);
     deps.log?.(`local review loop: ${groups.length} group(s) over ${sample.changedPaths.length} changed file(s)`);
     const raws: string[] = [];
+    const failedGroups: string[][] = [];
     for (const group of groups) {
       if (deps.signal?.aborted) break;
       // Sequential — one generation at a time bounds peak memory on a shared host. Isolate each group:
       // a transient request/tool failure late in a long multi-group run must not discard the groups
-      // already reviewed. Keep their findings and move on; only an all-empty run is a failure.
+      // already reviewed. Keep their findings and move on; track failed groups for coverage reporting.
       try {
         const raw = await reviewGroup(sample, group, settings, { ...deps, request }, t);
         if (raw) raws.push(raw);
       } catch (e) {
         deps.log?.(`group ${group[0]} failed: ${e instanceof Error ? e.message : String(e)}`);
+        failedGroups.push(group);
       }
     }
     if (!raws.length) return { ok: false, error: "local loop produced no review JSON" };
-    return { ok: true, raw: mergeGroupResults(raws) };
+    return { ok: true, raw: mergeGroupResults(raws, failedGroups) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

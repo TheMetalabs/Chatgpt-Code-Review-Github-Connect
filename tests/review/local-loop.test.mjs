@@ -270,6 +270,29 @@ test("deduplication keeps the well-formed copy of a repeated finding", async () 
   }
 });
 
+test("a group with empty findings and no investigated_safe is not counted as reviewed", async () => {
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    const emptyNoSafe = JSON.stringify({ findings: [], merge_recommendation: "COMMENT" });
+    const valid = JSON.stringify({ findings: [{ severity: "P1", file: "src/b.ts", line: 2, title: "bug", failure_scenario: "s", evidence: "e" }], merge_recommendation: "REQUEST_CHANGES" });
+    let call = 0;
+    const request = async (_b, _k, path) => { if (path === "models") return { data: [] }; call += 1; return call === 1 ? assistant(emptyNoSafe) : assistant(valid); };
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
+    assert.equal(out.ok, true);
+    const cov = JSON.parse(out.raw).coverage;
+    assert.ok(cov.some((c) => c.file === "src/a.ts" && c.status === "not_cleared"), "empty-no-safe group is not_cleared, not a silent clean pass");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
+test("an unparseable peer result is not injected as already-reported", async () => {
+  const { request, bodies } = mock([assistant(REVIEW_JSON)]);
+  await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request, peerReported: () => [{ provider: "chatgpt", raw: "sorry, I could not review (no json)" }] });
+  const injected = bodies.flatMap((b) => b.messages).some((m) => typeof m.content === "string" && m.content.includes("ALREADY_REPORTED_BY_PEER"));
+  assert.equal(injected, false, "a peer with no parseable validated findings is not injected");
+});
+
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {
   const { request } = mock([assistant("I could not find the file, sorry.")]);
   const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });

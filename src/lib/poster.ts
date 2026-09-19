@@ -1,7 +1,7 @@
 import type { BotSettings, Finding, Job, MergeRec, PostedComment, PostedReview, ReviewProvider, SamplePr, Severity } from "./types.ts";
 import { SAMPLE_PRS } from "./samples.ts";
 import { inlineFindingComment, reviewSummaryBody } from "./review-format.ts";
-import { commentableRightLines, snapToCommentableLine } from "./review-diff.ts";
+import { commentableRightLines, resolveLineFromSnippet, rightSideLines, snapToCommentableLine, type RightLine } from "./review-diff.ts";
 
 export const SEVERITY_RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2 };
 
@@ -90,6 +90,7 @@ export function partitionFindings(
   const accepted = findings.filter((f) => f.status === "accepted");
   const ranked = [...accepted].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
   const cap = Math.max(0, settings.maxInlineComments);
+  const rightLines = sample?.diff ? rightSideLines(sample.diff) : new Map<string, RightLine[]>();
   const commentable = sample?.diff ? commentableRightLines(sample.diff) : new Map<string, Set<number>>();
   const inline: Finding[] = [];
   const unanchored: Finding[] = [];
@@ -98,7 +99,7 @@ export function partitionFindings(
     if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[settings.publishMinSeverity]) continue;
     // A hedge stays out of the inline comments but is still surfaced in the body — never dropped.
     const inlineWorthy = !(settings.precisionOverRecall && isHedge(f));
-    const anchored = inlineWorthy && inline.length < cap ? anchorInline(f, sample, commentable) : null;
+    const anchored = inlineWorthy && inline.length < cap ? anchorInline(f, sample, commentable, rightLines) : null;
     if (anchored) inline.push(anchored);
     else unanchored.push(f);
   }
@@ -106,9 +107,38 @@ export function partitionFindings(
 }
 
 /** The finding re-lined to a commentable diff line, or null if it cannot anchor an inline comment. */
-function anchorInline(f: Finding, sample: SamplePr | undefined, commentable: Map<string, Set<number>>): Finding | null {
+// The verbatim code the model cites for a finding, stripped of a leading "file:line" locator and
+// any surrounding quote/backtick pair, so it can be matched against the diff. The model's line
+// number drifts (it counts against the assembled snapshot, not the file); its quoted code does not.
+export function evidenceSnippet(evidence: string): string {
+  let s = String(evidence || "").trim();
+  if (!s) return "";
+  s = s.replace(/^[\w./\\@-]+:\d+(?:-\d+)?\s*/, ""); // drop a leading "path:line" / "path:line-line"
+  const q = s[0];
+  if ((q === '"' || q === "'" || q === "`") && s.length > 1 && s[s.length - 1] === q) {
+    s = s.slice(1, -1); // unwrap a surrounding quote pair
+  }
+  return s.trim();
+}
+
+function anchorInline(
+  f: Finding,
+  sample: SamplePr | undefined,
+  commentable: Map<string, Set<number>>,
+  rightLines: Map<string, RightLine[]>,
+): Finding | null {
+  if (!commentable.size) {
+    // No diff available (sample/test path) — keep inline as-is when the line is in file bounds.
+    return fileExistsOnHead(sample, f.file, f.line) ? f : null;
+  }
+  // Prefer the model's verbatim evidence over its line number: compute the line from the quoted
+  // code. Only a single, specific, unambiguous match wins — otherwise fall back to the line number.
+  const snippet = evidenceSnippet(f.evidence);
+  if (snippet) {
+    const resolved = resolveLineFromSnippet(f.file, snippet, rightLines);
+    if (resolved != null) return resolved === f.line ? f : { ...f, line: resolved, side: "RIGHT" };
+  }
   if (!fileExistsOnHead(sample, f.file, f.line)) return null;
-  if (!commentable.size) return f; // no diff context (sample/test path) — keep inline as-is
   const snapped = snapToCommentableLine(f.file, f.line, commentable);
   if (snapped == null) return null;
   return snapped === f.line ? f : { ...f, line: snapped };

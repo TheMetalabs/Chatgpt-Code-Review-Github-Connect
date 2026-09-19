@@ -164,6 +164,53 @@ describe("poster", () => {
     assert.match(review.body, /ashlar-findings total=1 inline=0 body=1/);
   });
 
+  const SNIP_DIFF = `--- src/foo.ts
+@@ -10,2 +10,3 @@
+ keep1
++const unique = compute(alpha, beta);
++return null;
+@@ -40,1 +80,4 @@
+ keep2
++return null;
++another(gamma);
++}
+`;
+  const snipSample = () => ({
+    ...SAMPLE_PRS["pay-412"],
+    diff: SNIP_DIFF,
+    changedPaths: ["src/foo.ts"],
+    files: [{ path: "src/foo.ts", language: "ts" as const, content: "" }],
+  });
+
+  it("anchors a finding by its verbatim evidence snippet, not its drifted line number", () => {
+    const f = {
+      ...FINDING_412,
+      status: "accepted" as const,
+      id: "snip-1",
+      file: "src/foo.ts",
+      line: 999, // drifted / out of file bounds — must be ignored in favor of the snippet
+      evidence: 'src/foo.ts:999 "const unique = compute(alpha, beta);"',
+    };
+    const { inline, unanchored } = partitionFindings([f], DEFAULT_SETTINGS, snipSample());
+    assert.equal(inline.length, 1);
+    assert.equal(inline[0].line, 11); // resolved from the quoted code, not 999
+    assert.equal(unanchored.length, 0);
+  });
+
+  it("surfaces — never drops or mislocates — a finding whose snippet is ambiguous", () => {
+    const f = {
+      ...FINDING_412,
+      status: "accepted" as const,
+      id: "amb-1",
+      file: "src/foo.ts",
+      line: 999,
+      evidence: 'src/foo.ts:999 "return null;"', // appears twice in the diff → cannot pin
+    };
+    const { inline, unanchored } = partitionFindings([f], DEFAULT_SETTINGS, snipSample());
+    assert.equal(inline.length, 0); // ambiguous snippet + out-of-bounds line → not anchored inline
+    assert.equal(unanchored.length, 1); // but still surfaced in the body — not dropped
+  });
+
   it("caps inline comments at maxInlineComments including zero", () => {
     const many = [FINDING_412, { ...FINDING_412, id: "b", severity: "P2" as const }];
     assert.equal(publishableFindings(many, { ...DEFAULT_SETTINGS, maxInlineComments: 0 }, SAMPLE_PRS["pay-412"]).length, 0);

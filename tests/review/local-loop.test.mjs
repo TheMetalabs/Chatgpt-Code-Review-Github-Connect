@@ -115,6 +115,24 @@ test("explicit mode overrides size-based auto selection", () => {
   assert.equal(chooseLocalReviewMode("multiturn", 1, 30_000), "multiturn");
 });
 
+test("a file larger than the group budget gets its own group", () => {
+  // Oversized single file must be isolated so its opening prompt does not blow a finite context.
+  const sample = sampleWith(["src/small.ts", "src/huge.ts"]);
+  sample.files = sample.files.map((f) => (f.path === "src/huge.ts" ? { ...f, content: "x".repeat(50_000) } : f));
+  const groups = groupChangedFiles(sample, { groupMaxChars: 40_000, maxFilesPerGroup: 6, toolIterCap: 8, ctxCapTokens: 24_000, groupContextMaxChars: 60_000 });
+  const hugeGroup = groups.find((g) => g.includes("src/huge.ts"));
+  assert.deepEqual(hugeGroup, ["src/huge.ts"], "oversized file is alone in its group");
+});
+
+test("a path whose diff was dropped by the prompt budget is excluded from groups", () => {
+  // With no patch a group cannot see what changed, so grouping it would only fake coverage.
+  const sample = sampleWith(["src/a.ts", "src/b.ts"]);
+  sample.diffDroppedPaths = ["src/b.ts"];
+  const groups = groupChangedFiles(sample, { groupMaxChars: 1_000_000, maxFilesPerGroup: 6, toolIterCap: 8, ctxCapTokens: 24_000, groupContextMaxChars: 60_000 });
+  assert.equal(groups.flat().includes("src/b.ts"), false, "dropped-diff path is not grouped");
+  assert.equal(groups.flat().includes("src/a.ts"), true, "normal changed path is still grouped");
+});
+
 test("grouping keeps a changed code file that is missing from the snapshot", () => {
   // A changed .ts whose content failed to fetch (not in sample.files) must still be grouped so it is
   // reviewed from its diff, not silently dropped from every group.

@@ -127,7 +127,7 @@ export function groupChangedFiles(sample: SamplePr, t: LoopTuning): string[][] {
   // not_cleared instead of grouping them.
   const dropped = new Set(sample.diffDroppedPaths ?? []);
   const targets = [...orderedCodePresent, ...missingCode, ...remaining].filter((p) => !dropped.has(p));
-  if (!targets.length) return targets.length ? [] : [];
+  if (!targets.length) return []; // nothing reviewable (empty PR or every diff dropped) — caller marks not_cleared
   const groups: string[][] = [];
   let cur: string[] = [];
   let curChars = 0;

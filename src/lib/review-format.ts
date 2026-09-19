@@ -71,7 +71,15 @@ export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" |
   // Neutralize any clean-pass sentinel embedded in the verbatim reply (e.g. the model's whole answer
   // was "Didn't find any major issues.") so a body consumer matching CLEAN_REVIEW_BODY — including the
   // loop poller's `Didn.t find any major issues` regex — cannot converge on a deliberately non-clean body.
-  const rawReview = (job.rawReview ?? "").trim().replace(/didn['’]t find any major issues\.?/gi, "(the model reported no major issues)");
+  const rawReview = (job.rawReview ?? "")
+    .trim()
+    // Neutralize the loop poller's clean-pass sentinel (so a salvaged body can't read as clean)…
+    .replace(/didn['’]t find any major issues\.?/gi, "(the model reported no major issues)")
+    // …and HTML-comment markers, so model-controlled text cannot forge/break the raw delimiters or
+    // the findings marker (which would let injected text escape the public redaction). Entities still
+    // render as `<!--` / `-->` in the GitHub body but are inert to the delimiter/marker parsers.
+    .replace(/<!--/g, "&lt;!--")
+    .replace(/-->/g, "--&gt;");
   const rawBlock = rawReview
     ? `\n**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.** Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${REVIEW_RAW_START}\n${rawReview}\n${REVIEW_RAW_END}\n`
     : "";

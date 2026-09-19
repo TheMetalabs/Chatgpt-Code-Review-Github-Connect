@@ -54,6 +54,7 @@ type LoopTuning = {
   toolIterCap: number;
   ctxCapTokens: number;
   maxFilesPerGroup: number;
+  groupContextMaxChars: number;
 };
 
 function envNum(key: string, dflt: number): number {
@@ -70,6 +71,10 @@ function tuning(): LoopTuning {
     toolIterCap: envNum("ASHLAR_LOCAL_REVIEW_TOOL_ITERS", 8),
     ctxCapTokens: envNum("ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS", 24_000),
     maxFilesPerGroup: envNum("ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP", 6),
+    // Per-group snapshot-context cap. The first request carries the diff + this much head context;
+    // capping it (below the full promptContextMaxChars) keeps even a lone oversized file's opening
+    // prompt within a finite endpoint's window instead of 400-ing and failing that group.
+    groupContextMaxChars: envNum("ASHLAR_LOCAL_REVIEW_GROUP_CONTEXT_MAX_CHARS", 60_000),
   };
 }
 
@@ -117,13 +122,27 @@ export function groupChangedFiles(sample: SamplePr, t: LoopTuning): string[][] {
   // Then append all other changed paths (non-code, tests, config, docs) not already included.
   const alreadyIncluded = new Set([...orderedCodePresent, ...missingCode]);
   const remaining = sample.changedPaths.filter((p) => !alreadyIncluded.has(p));
-  const targets = [...orderedCodePresent, ...missingCode, ...remaining];
-  if (!targets.length) return [sample.changedPaths.slice(0, 1)];
+  // Exclude paths whose diff the one-shot budget dropped: with no patch, a group cannot see what
+  // changed, so reviewing it would only manufacture false coverage. The caller marks these
+  // not_cleared instead of grouping them.
+  const dropped = new Set(sample.diffDroppedPaths ?? []);
+  const targets = [...orderedCodePresent, ...missingCode, ...remaining].filter((p) => !dropped.has(p));
+  if (!targets.length) return targets.length ? [] : [];
   const groups: string[][] = [];
   let cur: string[] = [];
   let curChars = 0;
   for (const path of targets) {
     const size = (contentByPath.get(path)?.length ?? 0) + 200;
+    // If a single file exceeds groupMaxChars, flush current group and place oversized file alone.
+    if (size > t.groupMaxChars) {
+      if (cur.length) {
+        groups.push(cur);
+        cur = [];
+        curChars = 0;
+      }
+      groups.push([path]);
+      continue;
+    }
     if (cur.length && (cur.length >= t.maxFilesPerGroup || curChars + size > t.groupMaxChars)) {
       groups.push(cur);
       cur = [];
@@ -145,7 +164,7 @@ function subsetSample(sample: SamplePr, groupPaths: Set<string>): SamplePr {
       .filter(([p]) => groupPaths.has(p))
       .map(([p, body]) => (body.startsWith("--- ") ? body : `--- ${p}\n${body}`))
       .join("\n\n"),
-    diffDroppedPaths: [],
+    diffDroppedPaths: (sample.diffDroppedPaths ?? []).filter((p) => groupPaths.has(p)),
   };
 }
 
@@ -179,7 +198,7 @@ async function reviewGroup(
     sample: sub,
     extra: deps.extra ?? "",
     untrustedBody: sample.body ?? "",
-    contextMaxChars: settings.promptContextMaxChars,
+    contextMaxChars: Math.min(settings.promptContextMaxChars, t.groupContextMaxChars),
     contextPadLines: settings.contextPadLines,
     policyMaxChars: settings.promptPolicyMaxChars,
   });

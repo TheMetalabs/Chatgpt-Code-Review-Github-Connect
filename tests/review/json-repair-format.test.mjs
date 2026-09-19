@@ -20,6 +20,22 @@ test('valid review formats need no Local call and malformed fields are not silen
  assert.equal(inspectReviewFormat(malformed,'review').ok,false);
  assert.equal(typeof REPAIR_SCHEMA_VERSION,'string');
 });
+test('coverage is an accepted review field (real prompt output), not an unknown_field',()=>{
+ // Regression for PR #52 attempt 1: a valid review carrying the prompt-requested `coverage` array
+ // tripped "review:unknown_field" -> a 422 repair request -> stranded when local repair was off,
+ // dropping a real P1 finding. coverage never affects the verdict and is parsed leniently.
+ const withCoverage={...value,coverage:[
+  {file:'src/lib/review-diff.ts',status:'not_cleared',reason:'helpers not in the provided snapshot'},
+  {file:'src/lib/poster.ts',status:'cleared',reason:'every changed hunk reviewed'},
+ ]};
+ const ok=inspectReviewFormat(JSON.stringify(withCoverage),'review');
+ assert.equal(ok.ok,true);
+ assert.deepEqual(JSON.parse(ok.raw).findings,value.findings); // finding survives, not dropped
+ // coverage must still be an array when present
+ assert.equal(inspectReviewFormat(JSON.stringify({...value,coverage:{}}),'review').ok,false);
+ // an unrelated unknown field is still rejected
+ assert.equal(inspectReviewFormat(JSON.stringify({...value,bogus:1}),'review').ok,false);
+});
 test('formatting-only repair preserves all content including internal code quotes',()=>{
  const out=validateRepairCandidate(malformed,raw,'review');assert.equal(out.ok,true);assert.deepEqual(JSON.parse(out.raw),value);
 });

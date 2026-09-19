@@ -84,10 +84,13 @@ test('worker/HTTP: malformed original repaired once, committed as ChatGPT, safel
  assert.equal(f.worker.calls.filter(x=>x.action==='repair-commit').length,1);
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'&&!m.resume),false);
 });
-test('worker/HTTP: disabled fallback never requests a repair or emits empty/failure',async t=>{
- const f=await workerFixture(t,{enabled:false});await f.cycle();await f.cycle();
- assert.equal(f.app.localRequests.length,0);assert.equal(f.worker.calls.some(x=>x.action==='repair'||x.action==='failure'),false);assert.equal(f.worker.closedTabs.length,0);
- assert.equal(f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId).status,'awaiting_chat');
+test('worker/HTTP: disabled fallback salvages the reply into a posted review, without repair or failure',async t=>{
+ const f=await workerFixture(t,{enabled:false});
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'disabled fallback did not salvage the reply into a review');
+ assert.equal(f.app.localRequests.length,0,'salvage must not call the repair formatter');
+ assert.equal(f.worker.calls.some(x=>x.action==='repair'||x.action==='failure'),false,'salvage is a complete, never a repair or failure');
+ assert.equal(f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId).status,'posted');
+ assert.match(f.app.reviews[0].body,/not parseable JSON/i,'posted body carries the verbatim salvaged reply');
 });
 test('worker/HTTP: current valid JSON wins over a pending repair without a duplicate post',async t=>{
  const f=await workerFixture(t);await f.cycle();await eventually(()=>f.app.localRequests.length===1,'repair not started');

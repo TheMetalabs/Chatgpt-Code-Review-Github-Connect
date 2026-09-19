@@ -11,6 +11,33 @@ export const REVIEW_SUMMARY_MARK = "<!-- ashlar-review-summary -->";
 /** Clean-pass review body. Loop scripts match this string. */
 export const CLEAN_REVIEW_BODY = "Didn't find any major issues.";
 
+// Delimiters bracketing the verbatim salvaged reply inside a review body, so the public snapshot can
+// strip it (it may echo private PR source) while the full body still posts to the auth-gated PR.
+export const REVIEW_RAW_START = "<!-- ashlar-raw:start -->";
+export const REVIEW_RAW_END = "<!-- ashlar-raw:end -->";
+const MAX_REVIEW_BODY = 65_000; // under GitHub's 65,535-char review-body limit, with room for scaffolding
+
+/** Remove the verbatim salvaged block from a review body for the UNAUTHENTICATED public snapshot.
+ * The real wrapper is emitted last (after any structured findings), so anchor on the LAST start
+ * marker — a finding rendered earlier cannot forge a decoy pair that hides the genuine block. */
+export function redactSalvagedReviewBody(body: string): string {
+  const s = String(body || "");
+  const start = s.lastIndexOf(REVIEW_RAW_START);
+  if (start < 0) return s;
+  const endMark = s.indexOf(REVIEW_RAW_END, start);
+  const end = endMark < 0 ? s.length : endMark + REVIEW_RAW_END.length;
+  return `${s.slice(0, start)}_(verbatim salvaged review redacted from the public snapshot; posted to the PR)_${s.slice(end)}`;
+}
+
+/** Keep the rendered body under GitHub's limit, preserving the trailing findings marker. */
+function capReviewBody(body: string): string {
+  if (body.length <= MAX_REVIEW_BODY) return body;
+  const markerAt = body.lastIndexOf("<!-- ashlar-findings");
+  const marker = markerAt >= 0 ? body.slice(markerAt) : "";
+  const note = "\n\n…(review body truncated to fit GitHub's limit; full details in review history)\n";
+  return body.slice(0, Math.max(0, MAX_REVIEW_BODY - marker.length - note.length)) + note + marker;
+}
+
 export function severityBadgeMarkdown(severity: Severity): string {
   return `**<sub><sub>![${severity} Badge](${BADGE[severity]})</sub></sub>**`;
 }
@@ -36,13 +63,41 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage">, findings: Finding[], username: string, unanchored: Finding[] = []): string {
+/** Render model/operator-controlled text inert to the body's HTML-comment delimiters and markers so
+ * it cannot forge or break the raw wrapper or the findings marker. Entities still display as `<!--` /
+ * `-->` in the GitHub body. Applied to EVERY interpolated field (never to the literal wrapper the code
+ * emits), so exactly one genuine raw pair exists and public redaction is unambiguous. */
+function neutralizeMarkers(s: string): string {
+  return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
+}
+
+export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage" | "rawReview">, findings: Finding[], username: string, unanchored: Finding[] = []): string {
   const sha = job.headSha.slice(0, 7);
   const n = countBySeverity(findings);
-  const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4);
+  const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4).map(neutralizeMarkers);
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = providers.includes("local");
+  // Neutralize the loop poller's clean-pass sentinel (matching the SAME separator set it accepts,
+  // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
+  // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
+  const rawReview = neutralizeMarkers(
+    (job.rawReview ?? "").trim().replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)"),
+  );
+  const rawBlock = rawReview
+    ? `\n**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.** Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${REVIEW_RAW_START}\n${rawReview}\n${REVIEW_RAW_END}\n`
+    : "";
+  // A salvaged verbatim review is NOT a clean pass: keep the clean marker/string out so the loop
+  // poller does not converge, and surface the raw text for the agent.
+  if (rawReview && !findings.length) {
+    // Surface skipped-provider warnings here too, so a raw-only body is not mistaken for complete
+    // multi-provider coverage when another enabled reviewer failed or hit quota.
+    const skipNote = skipped.length ? `\n${skipped.map((s) => `- ${s}`).join("\n")}\n` : "";
+    return capReviewBody(`${REVIEW_SUMMARY_MARK}
+${rawBlock}${skipNote}
+**Reviewed commit:** \`${sha}\`
+<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->`);
+  }
   if (!findings.length) {
     if (skipped.length) {
       return `${REVIEW_SUMMARY_MARK}
@@ -62,15 +117,15 @@ Not a clean pass — remaining reviewers did not run.`;
   const unanchoredBlock = unanchored.length
     ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored
         .map((f) => {
-          const detail = [f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
+          const detail = neutralizeMarkers([f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
             .map((s) => s.trim())
             .filter(Boolean)
-            .join(" — ");
-          return `- ${severityBadgeMarkdown(f.severity)} \`${f.file}:${f.line}\` — **${f.title}**${detail ? `\n  ${detail}` : ""}`;
+            .join(" — "));
+          return `- ${severityBadgeMarkdown(f.severity)} \`${neutralizeMarkers(f.file)}:${f.line}\` — **${neutralizeMarkers(f.title)}**${detail ? `\n  ${detail}` : ""}`;
         })
         .join("\n")}\n`
     : "";
-  return `${REVIEW_SUMMARY_MARK}
+  return capReviewBody(`${REVIEW_SUMMARY_MARK}
 
 ### 💡 Ashlar Review
 
@@ -86,7 +141,7 @@ Here are some automated review suggestions for this pull request.
 
 ${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local ? " Local LLM is fallback if Chrome does not return." : ""}
 ${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
-${unanchoredBlock}
+${unanchoredBlock}${rawBlock}
 <details>
 <summary>ℹ️ About Ashlar</summary>
 
@@ -94,7 +149,7 @@ Inline comments use P0 / P1 / P2 badges. Failures in one reviewer are skipped; r
 
 </details>
 
-— ${username}
+— ${neutralizeMarkers(username)}
 <!-- ashlar-findings total=${findings.length} inline=${findings.length - unanchored.length} body=${unanchored.length} p0=${n.P0} p1=${n.P1} p2=${n.P2} -->
-`;
+`);
 }

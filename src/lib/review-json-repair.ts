@@ -19,7 +19,8 @@ export function repairSchemaDefinition(kind: RepairSchema) {
     properties:{...Object.fromEntries(findingStrings.map(key=>[key,string])),severity:{enum:["P0","P1","P2"]},line:{type:"integer",minimum:1},side:{enum:["LEFT","RIGHT"]}}};
   return kind === "review" ? {type:"object",additionalProperties:false,required:["findings"],properties:{
     findings:{type:"array",items:finding},merge_recommendation:{enum:["REQUEST_CHANGES","COMMENT","APPROVE"]},highest_risk:{type:"string"},
-    investigated_safe:{type:"array",items:{type:"string"}},assumptions:{type:"array",items:{type:"string"}}}} :
+    investigated_safe:{type:"array",items:{type:"string"}},assumptions:{type:"array",items:{type:"string"}},
+    coverage:{type:"array",items:{type:"object",properties:{file:{type:"string"},status:{enum:["cleared","not_cleared"]},reason:{type:"string"}}}}}} :
     {type:"object",additionalProperties:false,required:["keep","drop"],properties:{keep:{type:"array",items:finding},drop:{type:"array",items:{type:"object",additionalProperties:false,
       required:["file","line","title","reason"],properties:{file:string,line:{type:"integer",minimum:1},title:string,reason:string}}}}};
 }
@@ -79,11 +80,15 @@ export function inspectReviewFormat(raw: string, kind: RepairSchema): FormatChec
     });
   };
   if (kind === "review") {
-    keys(value,["findings","merge_recommendation","highest_risk","investigated_safe","assumptions"],"review");
+    // `coverage` is a legitimate, prompt-requested field (self-reported model coverage). It never
+    // affects the verdict and is parsed leniently downstream, so it must be allowed here — otherwise
+    // every review that follows the prompt trips "unknown_field" → a spurious repair request.
+    keys(value,["findings","merge_recommendation","highest_risk","investigated_safe","assumptions","coverage"],"review");
     findings(value.findings,"findings");
     if (value.merge_recommendation !== undefined && (typeof value.merge_recommendation!=="string" || !["REQUEST_CHANGES","COMMENT","APPROVE"].includes(value.merge_recommendation))) errors.push("merge_recommendation:invalid_enum");
     if (value.highest_risk !== undefined && typeof value.highest_risk !== "string") errors.push("highest_risk:string_required");
     for (const key of ["investigated_safe","assumptions"]) if (value[key] !== undefined && (!Array.isArray(value[key]) || !(value[key] as unknown[]).every(v=>typeof v === "string"))) errors.push(`${key}:string_array_required`);
+    if (value.coverage !== undefined && !Array.isArray(value.coverage)) errors.push("coverage:array_required");
   } else {
     keys(value,["keep","drop"],"fp");findings(value.keep,"keep");
     if (!Array.isArray(value.drop)) errors.push("drop:required_array");

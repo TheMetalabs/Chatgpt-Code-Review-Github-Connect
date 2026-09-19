@@ -10,7 +10,7 @@ import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./har
 import type { Job, ReviewProvider, ProviderError } from "./types";
 import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
-import { extractChatJson } from "./extract-chat-json";
+import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 
@@ -380,12 +380,27 @@ export function failBridgeProvider(jobId: string, provider: ReviewProvider, erro
 export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatLeg[], leaseId?: string) {
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job) return {ok: false, error: "job not found"};
+  const repairAvailable = localJsonRepairAvailable(getHarbor().settings);
+  // Canonicalize a leg once: prefer extracted review JSON; when it is not schema-valid AND no repair
+  // can fix it, salvage into a raw_review review. Doing this BEFORE the replay/dup check makes a
+  // lost-ack retry of the same prose normalize identically to the stored salvage (idempotent), and
+  // catches schema-invalid (not only syntactically broken) replies so none is silently dropped.
+  const canonicalLegRaw = (text: string): string => {
+    const parsed = extractChatJson(text);
+    if (repairAvailable) return parsed ?? text; // route 422s schema errors for a real repair
+    return parsed && inspectReviewFormat(parsed, "review").ok ? parsed : salvageReviewJson(text);
+  };
   const incoming = (legs?.length ? legs : raw.trim() ? [{provider: "chatgpt" as const, raw}] : [])
-    .map(leg => ({...leg, raw: extractChatJson(leg.raw) ?? leg.raw}))
+    .map(leg => {
+      const canonical = canonicalLegRaw(leg.raw);
+      // Keep the exact model prose for the archive even if the client omitted originalText and we
+      // transformed raw (extract/salvage), so the async recordResponse cannot later overwrite the
+      // first archive entry with an empty original.
+      const originalText = leg.originalText || (canonical !== leg.raw ? leg.raw : undefined);
+      return {...leg, raw: canonical, originalText};
+    })
     .map(leg => {
       // An identical replay acknowledges the stored repair, not new provenance.
-      // Canonicalize per provider BEFORE either batch path, archive writes, or
-      // downstream submission: a new peer must not strip the replacement fence.
       const stored = job.storedLegs?.find(stored => stored.provider === leg.provider && stored.repair && stored.raw === leg.raw);
       return stored ?? leg;
     });
@@ -408,7 +423,7 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
       reviewHistory().recordJob(job);
       reviewHistory().recordResponse(jobId,leg.provider,leg.raw,leg.originalText || "");
     } catch {return {ok:false,error:"response archive unavailable; original response must be retained",code:"history_unavailable"};}
-    const parsed = extractChatJson(leg.raw);
+    const parsed = extractChatJson(leg.raw); // leg.raw is already canonical (valid review JSON, incl. salvage)
     if (!parsed) return {ok: false, error: "completed response is not review JSON"};
     accepted.push({...leg, raw: parsed});
   }
@@ -463,8 +478,11 @@ function repairs() {
     },
   });
 }
-export function bridgeFormatErrors(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string, captureProtocol = false): string[] {
-  if (!captureProtocol && !localJsonRepairAvailable(getHarbor().settings)) return [];
+export function bridgeFormatErrors(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string, _captureProtocol = false): string[] {
+  // Never demand a repair that cannot run: with local JSON repair off, a 422 makes the extension
+  // hold for a repair that never happens (infinite pending). completeBridgeJob salvages instead.
+  // (Independent of the capture protocol — capture only matters while a real repair can consume it.)
+  if (!localJsonRepairAvailable(getHarbor().settings)) return [];
   const job=getHarbor().jobs.find(row=>row.id===jobId);
   if(!job || job.status!=="awaiting_chat" || !ownsLease(job,leaseId) || job.chatFpRound || job.fpProviders?.length) return [];
   return (legs?.length ? legs : [{provider:"chatgpt" as const,raw}]).flatMap(leg=>{

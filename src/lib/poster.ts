@@ -163,7 +163,9 @@ export function filterPublishable(job: Job, settings: BotSettings, sample?: Samp
 export function buildReview(job: Job, inline: Finding[], unanchored: Finding[], settings: BotSettings): PostedReview | null {
   const all = [...inline, ...unanchored];
   const mentioned = isBotMention(job.thread?.userText, settings);
-  if (all.length === 0 && !mentioned) return null;
+  // A salvaged verbatim reply must always post, even with zero structured findings and no mention,
+  // so an unparseable review is surfaced for the fixing agent instead of silently skipped.
+  if (all.length === 0 && !mentioned && !job.rawReview) return null;
 
   // Verdict reflects every real finding, not just the ones that got an inline anchor —
   // an unanchored P1 must still make the review REQUEST_CHANGES, never "clean".
@@ -237,6 +239,9 @@ export type LiveGateResult = {
   assumptions: string[];
   coverage?: ModelCoverage[];
   dropped: string[];
+  // Verbatim reply preserved when it was not parseable review JSON and local repair was off.
+  // Surfaced in the review body so the fixing agent can interpret it (never dropped).
+  rawReview?: string;
 };
 
 /** Lenient parse of the optional `coverage` array. Never fails the review. */
@@ -272,8 +277,11 @@ export function gateLiveSubmission(
   });
   const { inline, unanchored } = partitionFindings(parsed, settings, snapshot);
   const findings = [...inline, ...unanchored];
+  // A salvaged reply carries its verbatim text here (parse failed + local repair off). It is a
+  // real review to surface, not an Instant-tier skip, so it bypasses the empty-findings guard.
+  const rawReview = typeof submitted.raw_review === "string" ? submitted.raw_review.trim().slice(0, 60_000) : "";
   const rawEmpty = !Array.isArray(submitted.findings) || submitted.findings.length === 0;
-  if (rawEmpty && snapshot.changedPaths.length) {
+  if (rawEmpty && !rawReview && snapshot.changedPaths.length) {
     const safe = Array.isArray(submitted.investigated_safe)
       ? (submitted.investigated_safe as unknown[]).map((x) => String(x).trim()).filter(Boolean)
       : [];
@@ -302,6 +310,7 @@ export function gateLiveSubmission(
       : [],
     coverage: parseCoverage(submitted.coverage),
     dropped,
+    rawReview: rawReview || undefined,
   };
 }
 

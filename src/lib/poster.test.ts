@@ -119,6 +119,25 @@ describe("poster", () => {
     assert.match(mentioned.body, /ashlar-findings total=0/);
   });
 
+  it("salvages a raw_review reply (parse failed, repair off) and posts it as a non-clean COMMENT", () => {
+    const sample = SAMPLE_PRS["pay-412"];
+    const gate = gateLiveSubmission(
+      { findings: [], merge_recommendation: "COMMENT", raw_review: "P1 verbatim salvaged review text" },
+      sample,
+      DEFAULT_SETTINGS,
+    );
+    assert.equal(gate.ok, true);
+    if (!gate.ok) return;
+    assert.equal(gate.findings.length, 0); // bypassed the empty-findings skip
+    assert.equal(gate.rawReview, "P1 verbatim salvaged review text");
+    // Zero findings + no mention normally skips; rawReview forces the review to post.
+    const review = buildReview(job([], { rawReview: gate.rawReview }), [], [], DEFAULT_SETTINGS);
+    assert.ok(review);
+    assert.equal(review.event, "COMMENT");
+    assert.match(review.body, /verbatim salvaged review text/);
+    assert.doesNotMatch(review.body, /Didn.t find any major issues/); // not a clean pass
+  });
+
   it("drops findings whose file is not in changedPaths", () => {
     const fulfill: Finding = {
       ...FINDING_412,

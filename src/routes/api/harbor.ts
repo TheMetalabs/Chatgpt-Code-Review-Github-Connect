@@ -10,6 +10,7 @@ import {
   patchHarborSettings,
   previewChatPaste,
   publicJobs,
+  publicReviews,
   publicSettings,
   resetHarbor,
   submitHarborChat,
@@ -46,7 +47,7 @@ export const Route = createFileRoute("/api/harbor")({
         return Response.json({
           jobs: publicJobs(harbor.jobs),
           events: harbor.events,
-          reviews: harbor.reviews,
+          reviews: publicReviews(harbor.reviews),
           settings: publicSettings(harbor.settings),
           github: githubStatus(),
           bridge: getBridgePublic(),

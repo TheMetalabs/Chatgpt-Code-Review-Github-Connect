@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { FINDING_412 } from "./samples.ts";
-import { CLEAN_REVIEW_BODY, inlineFindingComment, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
+import { CLEAN_REVIEW_BODY, REVIEW_RAW_END, REVIEW_RAW_START, inlineFindingComment, redactSalvagedReviewBody, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
 
 describe("review-format", () => {
   it("surfaces a salvaged raw review in the body and is not a clean pass", () => {
@@ -15,6 +15,33 @@ describe("review-format", () => {
     assert.match(body, /P1 real bug in pay\.ts/);
     assert.match(body, /raw=1/);
     assert.match(body, /not parseable JSON/i);
+  });
+
+  it("delimits the salvaged block and redacts it from the public snapshot (keeps it in the posted body)", () => {
+    const body = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "SECRET private source: const key = process.env.SECRET;" },
+      [],
+      "ashlar-bot",
+      [],
+    );
+    assert.ok(body.includes(REVIEW_RAW_START) && body.includes(REVIEW_RAW_END));
+    assert.match(body, /SECRET private source/); // full body (posted to the auth-gated PR) keeps it
+    const pub = redactSalvagedReviewBody(body);
+    assert.doesNotMatch(pub, /SECRET private source/); // stripped from the unauthenticated snapshot
+    assert.match(pub, /redacted from the public snapshot/);
+    assert.match(pub, /raw=1/); // marker (after the block) survives
+  });
+
+  it("caps an oversized salvaged body under GitHub's limit while preserving the marker", () => {
+    const body = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "x".repeat(200_000) },
+      [],
+      "ashlar-bot",
+      [],
+    );
+    assert.ok(body.length <= 65_000, `body too long: ${body.length}`);
+    assert.match(body, /ashlar-findings total=1/);
+    assert.match(body, /truncated to fit/);
   });
 
   it("surfaces skipped-provider warnings in a raw-only salvaged review", () => {

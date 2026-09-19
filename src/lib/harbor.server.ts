@@ -32,6 +32,7 @@ import { stillRacing, shouldStartLocalRace } from "./local-fallback";
 import { buildReviewerLanes } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
+import { redactSalvagedReviewBody } from "./review-format";
 import {
   BRIDGE_CLAIM_MS,
   LIVE_INFLIGHT_STATUSES,
@@ -167,6 +168,12 @@ export function publicJobs(jobs: Job[]) {
       reviewerLanes: buildReviewerLanes(j, { localInFlight: localInFlight.has(j.id), enabled }),
     };
   });
+}
+
+/** Reviews for the UNAUTHENTICATED /api/harbor snapshot: strip the verbatim salvaged block from each
+ * body (it can echo private PR source). The full body was still posted to the auth-gated GitHub PR. */
+export function publicReviews(reviews: PostedReview[]) {
+  return reviews.map((r) => ({ ...r, body: redactSalvagedReviewBody(r.body) }));
 }
 
 export function publicSettings(s: BotSettings) {

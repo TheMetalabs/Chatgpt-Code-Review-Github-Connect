@@ -231,7 +231,7 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 | `localReviewMode` / `ASHLAR_LOCAL_REVIEW_MODE` | `auto` | `auto` = PR 크기로 자동 선택, `single` = 1회성(롤백), `multiturn` = 툴 루프 |
 | `localReviewSingleTurnMaxTokens` / `ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS` | 30000 | `auto`에서 이 토큰 이하 프롬프트는 단일턴 유지, 초과는 멀티턴 |
 | `localReviewMaxTokens` / `ASHLAR_LOCAL_REVIEW_MAX_TOKENS` | 32768 | 생성 토큰 예산. **필수** — 없으면 서버 기본(~8K)에 추론이 다 차 JSON 전에 잘립니다 |
-| `ASHLAR_LOCAL_REVIEW_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_PRESENCE_PENALTY` | 0.6 / 0.95 / 20 / 1.0 | 비-greedy 샘플링. greedy(0)는 추론 모델을 반복 루프에 빠뜨립니다 |
+| `ASHLAR_LOCAL_REVIEW_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_PRESENCE_PENALTY` | 0.6 / 0.95 / **0** / 1.0 | 비-greedy 샘플링. greedy(0)는 추론 모델을 반복 루프에 빠뜨립니다. `top_k=0`은 요청에서 생략(표준 OpenAI 엔드포인트 호환). vLLM/omlx 등 지원 서버는 `ASHLAR_LOCAL_REVIEW_TOP_K=20` 설정 가능 |
 | `ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS` | 40000 | 그룹당 파일 묶음 크기 상한(피크 KV 캐시 메모리 경계) |
 | `ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP` | 6 | 그룹당 최대 파일 수 |
 | `ASHLAR_LOCAL_REVIEW_TOOL_ITERS` | 8 | 그룹당 최대 툴 라운드. 초과하면 툴을 빼고 최종 JSON 강제 |
@@ -242,6 +242,8 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 그룹으로 나눠 피크 메모리를 낮춥니다. 멀티턴의 변경 파일은 크기로 묶어 **순차** 검토합니다(공유 머신에서
 동시 생성 1개로 메모리 경계 유지). thinking은 켜 둡니다(끄면 리뷰가 고무도장이 됩니다). 강제 롤백은
 `ASHLAR_LOCAL_REVIEW_MODE=single`.
+
+**향후 개선**: `file_read` 툴의 교차 파일 head 읽기는 별도 후속 작업입니다(github.server.ts 경계 결정 필요). 현재는 스냅샷 파일만 읽습니다.
 
 ---
 

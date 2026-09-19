@@ -56,12 +56,13 @@ test('completed malformed source frees the only tab slot before Local finishes, 
  assert.equal(f.app.localRequests.length,1);assert.equal(f.worker.messages.some(m=>m.id===10&&m.type==='ashlar-run'),false);
 });
 
-test('fallback OFF still archives completed original and releases capacity without false success',async t=>{
- const f=await fixture(t,{fallback:false});await eventually(async()=>{await f.cycle();return f.worker.closedTabs.includes(10);},'disabled formatter must not pin a completed tab');
- assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,0);
- assert.equal(f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId).status,'awaiting_chat');
- f.app.harbor.patchHarborSettings({localJsonRepairEnabled:true});
- await eventually(async()=>{await f.cycle();return f.app.localRequests.length===1;},'enabling independent formatter did not use captured source');
+test('fallback OFF salvages the completed original into a posted review and releases capacity',async t=>{
+ const f=await fixture(t,{fallback:false});
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'disabled formatter did not salvage the captured original into a review');
+ assert.equal(f.app.localRequests.length,0,'salvage must not call the repair formatter');
+ assert.ok(f.worker.closedTabs.includes(10),'completed tab must be released after salvage');
+ assert.equal(f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId).status,'posted');
+ assert.match(f.app.reviews[0].body,/not parseable JSON/i,'posted body carries the verbatim salvaged reply');
  assert.equal(f.worker.tabs.size,0);assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
 });
 
@@ -102,7 +103,7 @@ test('captured-source cleanup restores a freshly reloaded page from the saved re
    .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{})}));
  };
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'capture ACK lost its cleanup state across page reload');
- assert.ok(reloaded);assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,0);
+ assert.ok(reloaded);assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,1,'salvage posts the captured original after the reload-restored cleanup');
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1);assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
 });
 
@@ -126,7 +127,7 @@ for(const change of ['followup','draft'])test(`source receipt releases managed o
 
 
 
-test('source change after durable archive preserves the receipt, releases capacity, and repairs from capture-read',async t=>{
+test('source change after durable archive preserves the receipt, releases capacity, and salvages the archived original',async t=>{
  const f=await fixture(t,{fallback:false});let changed=false;const send=f.worker.chrome.tabs.sendMessage;
  f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
   if(msg.type==='ashlar-capture-accepted' && !changed) {
@@ -142,12 +143,9 @@ test('source change after durable archive preserves the receipt, releases capaci
  assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true);
  await f.cycle();assert.equal(f.worker.local.state.bridgeWorkerStatus.capacity.used,0);
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1,'replacement DOM must not be archived as the original run');
- f.app.harbor.patchHarborSettings({localJsonRepairEnabled:true});
- await eventually(async()=>{await f.cycle();return f.app.localRequests.length===1;},'repair did not resume from the archived receipt');
- assert.equal(f.worker.calls.some(c=>c.action==='capture-read'),true,'repair must reload the immutable archived original');
- assert.equal(JSON.parse(f.app.localRequests[0].messages[1].content).original,invalid);
- f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
- await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'archived original did not finish repair');
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'archived original was not salvaged into a review with repair off');
+ assert.equal(f.app.localRequests.length,0,'repair off: salvage must not call the formatter');
+ assert.match(f.app.reviews[0].body,/not parseable JSON/i,'salvaged body carries the archived original, not the replacement DOM');
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false,'source change must not trigger another model generation');
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1);
 });
@@ -262,7 +260,7 @@ test('failed local source-receipt persistence cannot authorize tab cleanup',asyn
  assert.equal(f.app.history.getJob(f.job.jobId,true).captures.length,1);assert.equal(f.app.localRequests.length,0);
 });
 
-test('lost server source ACK retries the same archive, not model generation or false completion',async t=>{
+test('lost server source ACK retries the same archive, then salvages it without a second model generation',async t=>{
  const f=await fixture(t,{fallback:false}), api=f.worker.context.api;let dropped=false;
  f.worker.context.api=async(path,body,...args)=>{
   const out=await api(path,body,...args);
@@ -271,20 +269,20 @@ test('lost server source ACK retries the same archive, not model generation or f
  };
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'idempotent source ACK retry did not finish');
  assert.ok(dropped);assert.equal(f.app.history.getJob(f.job.jobId,true).captures.length,1);
- assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,0);
+ assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,1,'archive is salvaged into a review with repair off');
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
 });
 
-test('worker restart uses compact capture receipt to repair without restoring a closed tab',async t=>{
- const f=await fixture(t,{fallback:false});await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'initial archive not released');
+test('salvage posts the archived original once; a worker restart never re-posts it',async t=>{
+ const f=await fixture(t,{fallback:false});
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'first worker did not salvage the archived source');
+ assert.equal(f.app.localRequests.length,0);assert.ok(f.worker.closedTabs.includes(10));
+ // A restarted worker inheriting the same storage must not salvage or post a second time.
  const local=storage(structuredClone(f.worker.local.state));
  const resumed=background({local,tabs:new Map(),api:f.api});resumed.context.crypto=webcrypto;resumed.context.TextEncoder=TextEncoder;
- f.app.harbor.patchHarborSettings({localJsonRepairEnabled:true});
- await eventually(async()=>{await resumed.tick();await flush();return f.app.localRequests.length===1;},'new worker did not retrieve the archived source');
- assert.equal(resumed.calls.some(c=>c.action==='capture-read'),true);assert.equal(resumed.tabs.size,0);
- f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:valid}}]}));
- await eventually(async()=>{await resumed.tick();await flush();return f.app.reviews.length===1;},'tabless restart did not finalize');
- assert.equal(f.app.localRequests.length,1);assert.equal(resumed.messages.some(m=>m.type==='ashlar-run'),false);
+ await resumed.tick();await flush();await resumed.tick();await flush();
+ assert.equal(f.app.reviews.length,1,'restart must not duplicate the salvaged review');
+ assert.equal(resumed.messages.some(m=>m.type==='ashlar-run'),false);
 });
 
 test('orphaned registry is recovered at full capacity only for the same client/run, without new tabs',async t=>{

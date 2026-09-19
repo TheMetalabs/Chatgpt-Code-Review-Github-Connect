@@ -210,6 +210,31 @@ test("provisional JSON on a tool-call turn is not accepted when the final turn h
   assert.match(out.error, /no review JSON/i);
 });
 
+test("a path whose diff was dropped is marked not_cleared in the merged result", async () => {
+  const sample = sampleWith(["src/a.ts", "src/b.ts"]);
+  sample.diffDroppedPaths = ["src/b.ts"];
+  const emptySafe = JSON.stringify({ findings: [], merge_recommendation: "COMMENT", investigated_safe: ["a checked"], coverage: [] });
+  const { request } = mock([assistant(emptySafe)]);
+  const out = await runLocalReviewLoop(sample, settings, { request });
+  assert.equal(out.ok, true);
+  const merged = JSON.parse(out.raw);
+  assert.ok(merged.coverage.some((c) => c.file === "src/b.ts" && c.status === "not_cleared"), "dropped path is not_cleared");
+  assert.deepEqual(merged.investigated_safe, [], "empty findings + a dropped path → safe forced empty (not a clean pass)");
+});
+
+test("a changed path that literally begins with a/ keeps its diff", async () => {
+  const { request, bodies } = mock([assistant(REVIEW_JSON)]);
+  await runLocalReviewLoop(sampleWith(["a/foo.ts"]), settings, { request });
+  const userMsg = bodies[0].messages.find((m) => m.role === "user").content;
+  assert.match(userMsg, /changed\(\)/, "the a/foo.ts patch reaches the prompt (a/ not wrongly stripped)");
+});
+
+test("task_done with state FAILED fails the group instead of accepting stale JSON", async () => {
+  const { request } = mock([assistant(REVIEW_JSON, [toolCall("task_done", { state: "FAILED" })])]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, false, "a FAILED task_done does not post the group as reviewed");
+});
+
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {
   const { request } = mock([assistant("I could not find the file, sorry.")]);
   const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });

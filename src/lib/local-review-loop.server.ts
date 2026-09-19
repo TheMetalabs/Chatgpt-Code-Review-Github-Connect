@@ -99,7 +99,11 @@ function patchesByPath(diff: string): Map<string, string> {
     const m = /^--- (.+)$/.exec(line);
     if (m && (next.startsWith("@@") || next.startsWith("+++ "))) {
       flush();
-      path = m[1].replace(/^a\//, "").replace(/\t.*$/, "").trim();
+      // The a/ prefix belongs only to git-format markers ("--- a/path" then "+++ b/path"); the
+      // ashlar format is "--- realpath" then "@@", so stripping a/ there would corrupt a real path
+      // that genuinely begins with "a/".
+      const rawPath = m[1].replace(/\t.*$/, "").trim();
+      path = next.startsWith("+++ ") ? rawPath.replace(/^a\//, "") : rawPath;
       continue;
     }
     if (path !== null) buf.push(line);
@@ -303,13 +307,20 @@ async function reviewGroup(
     if (!calls.length) break;
     if (forceFinal) break; // tool_choice:"none" is ignored by some servers; never execute post-final calls.
     let done = false;
+    let taskFailed = false;
     for (const c of calls) {
       let args: Record<string, unknown> = {};
       try { args = JSON.parse(c.function?.arguments || "{}"); } catch { /* malformed args → empty */ }
       const out = await runTool(c.function?.name || "", args);
-      if (c.function?.name === "task_done") done = true;
+      if (c.function?.name === "task_done") {
+        done = true;
+        if (args.state === "FAILED") taskFailed = true;
+      }
       messages.push({ role: "tool", tool_call_id: c.id, content: String(out).slice(0, 40_000) });
     }
+    // The model explicitly could not finish this group — fail it (→ not_cleared) rather than
+    // accepting whatever JSON is around as a completed review.
+    if (taskFailed) return null;
     if (done && finalRaw) break;
     if (done && !finalRaw) messages.push({ role: "user", content: "Now return the final review JSON object only." });
   }
@@ -352,7 +363,7 @@ const SEVERITY_ORDER: Record<string, number> = { P0: 0, P1: 1, P2: 2 };
 // For partial failures (some groups threw): add not_cleared coverage for failed groups' files,
 // add an assumptions entry, and force investigated_safe to [] when findings are empty (so the
 // frozen gate does NOT treat an empty result as a clean pass).
-function mergeGroupResults(raws: string[], failedGroups: string[][]): string {
+function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPaths: string[] = []): string {
   const findings: unknown[] = [];
   const coverage: unknown[] = [];
   const safe: unknown[] = [];
@@ -393,18 +404,26 @@ function mergeGroupResults(raws: string[], failedGroups: string[][]): string {
   const finalCoverage = [...coverage];
   const finalAssumptions = [...assumptions];
   let finalSafe = safe;
-  if (failedGroups.length > 0) {
-    const failedFiles = failedGroups.flat();
-    for (const file of failedFiles) {
-      finalCoverage.push({ file, status: "not_cleared", reason: "group review failed" });
-    }
+  const failedFiles = failedGroups.flat();
+  for (const file of failedFiles) {
+    finalCoverage.push({ file, status: "not_cleared", reason: "group review failed" });
+  }
+  // Paths whose diff the one-shot budget dropped were never reviewable (no patch); mark them
+  // not_cleared too so a surviving empty group cannot make the leg look like a clean full pass.
+  for (const file of droppedPaths) {
+    finalCoverage.push({ file, status: "not_cleared", reason: "diff dropped by prompt budget" });
+  }
+  if (failedFiles.length) {
     finalAssumptions.push(`Local review incomplete: ${failedGroups.length} group(s) failed (${failedFiles.join(", ")})`);
-    // If findings is empty AND at least one group failed, force investigated_safe to [] so the
-    // frozen gate does NOT treat it as a clean pass (it will reject as "empty findings without
-    // investigated_safe").
-    if (sorted.length === 0) {
-      finalSafe = [];
-    }
+  }
+  if (droppedPaths.length) {
+    finalAssumptions.push(`Local review incomplete: ${droppedPaths.length} path(s) had their diff dropped by budget (${droppedPaths.join(", ")})`);
+  }
+  // If findings is empty AND anything went unreviewed (a failed group or a budget-dropped path),
+  // force investigated_safe to [] so the frozen gate does NOT treat the empty result as a clean pass
+  // (it rejects "empty findings without investigated_safe").
+  if (sorted.length === 0 && (failedFiles.length > 0 || droppedPaths.length > 0)) {
+    finalSafe = [];
   }
   return JSON.stringify({
     merge_recommendation: sorted.length ? merge : "COMMENT",
@@ -450,7 +469,7 @@ export async function runLocalReviewLoop(
     // are empty) investigated_safe is forced [], so the frozen gate rejects a partial run as
     // incomplete rather than accepting it as a false clean pass.
     if (!raws.length) return { ok: false, error: "local loop produced no review JSON" };
-    return { ok: true, raw: mergeGroupResults(raws, failedGroups) };
+    return { ok: true, raw: mergeGroupResults(raws, failedGroups, sample.diffDroppedPaths ?? []) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

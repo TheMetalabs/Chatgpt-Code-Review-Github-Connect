@@ -21,7 +21,10 @@ function assistant(content, tools = []) {
   return { choices: [{ finish_reason: tools.length ? "tool_calls" : "stop", message: { content, tool_calls: tools.length ? tools : undefined } }], usage: { prompt_tokens: 100 } };
 }
 const toolCall = (name, args, id = "c1") => ({ id, function: { name, arguments: JSON.stringify(args) } });
-const REVIEW_JSON = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", findings: [{ severity: "P1", file: "src/pay.ts", line: 2, title: "bug", failure_scenario: "x", evidence: "y" }], investigated_safe: [], coverage: [] });
+// A finding carrying every field the downstream gate (asFinding) requires, so it survives per-group
+// gate validation. Override only what a test cares about.
+const F = (o = {}) => ({ severity: "P1", file: "src/pay.ts", line: 2, side: "RIGHT", title: "bug", failure_scenario: "x", root_cause: "rc", evidence: "y", recommended_fix: "fix", recommended_test: "t", ...o });
+const REVIEW_JSON = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", findings: [F()], investigated_safe: [], coverage: [] });
 
 function mock(script) {
   const bodies = [];
@@ -163,7 +166,7 @@ test("a failed group does not discard groups already reviewed", async () => {
       if (call === 1) throw new Error("transient failure"); // first group's first request
       return assistant(REVIEW_JSON); // later groups succeed
     };
-    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/pay.ts"]), settings, { request });
     assert.equal(out.ok, true, "one group failing still yields the other group's findings");
     assert.match(out.raw, /"findings"/);
   } finally {
@@ -188,7 +191,7 @@ test("a group that completes with non-JSON is marked not_cleared, not silently d
       call += 1;
       return call === 1 ? assistant("some prose, no JSON here") : assistant(REVIEW_JSON);
     };
-    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/pay.ts"]), settings, { request });
     assert.equal(out.ok, true);
     const cov = JSON.parse(out.raw).coverage;
     assert.ok(cov.some((c) => c.file === "src/a.ts" && c.status === "not_cleared"), "non-JSON group's file is not_cleared");
@@ -254,27 +257,24 @@ test("file_read_diff caps the number of files it returns", async () => {
   assert.ok(blocks <= 20, `file_read_diff returns at most 20 files, got ${blocks}`);
 });
 
-test("deduplication keeps the well-formed copy of a repeated finding", async () => {
-  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
-  try {
-    const malformed = JSON.stringify({ findings: [{ file: "src/x.ts", line: 5, title: "same bug" }], merge_recommendation: "COMMENT" });
-    const valid = JSON.stringify({ findings: [{ severity: "P1", file: "src/x.ts", line: 5, title: "same bug", failure_scenario: "s", evidence: "e" }], merge_recommendation: "REQUEST_CHANGES" });
-    let call = 0;
-    const request = async (_b, _k, path) => { if (path === "models") return { data: [] }; call += 1; return call === 1 ? assistant(malformed) : assistant(valid); };
-    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
-    const merged = JSON.parse(out.raw);
-    const f = merged.findings.find((x) => x.file === "src/x.ts" && x.line === 5);
-    assert.ok(f && f.severity === "P1", "the well-formed (severity-bearing) copy is kept over the malformed one");
-  } finally {
-    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
-  }
+test("deduplication keeps the more complete copy of a repeated finding", async () => {
+  // One valid group carries both a sparse and a complete copy of the same finding key; merge keeps
+  // the complete one so it survives the final gate.
+  const sparse = { severity: "P1", file: "src/pay.ts", line: 5, title: "same bug", failure_scenario: "s", evidence: "e" };
+  const complete = F({ line: 5, title: "same bug" });
+  const raw = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", findings: [sparse, complete], investigated_safe: [], coverage: [] });
+  const { request } = mock([assistant(raw)]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  const dupes = JSON.parse(out.raw).findings.filter((x) => x.file === "src/pay.ts" && x.line === 5);
+  assert.equal(dupes.length, 1, "duplicate deduped to one");
+  assert.ok(dupes[0].recommended_fix, "the more complete copy (with recommended_fix) is kept");
 });
 
 test("a group with empty findings and no investigated_safe is not counted as reviewed", async () => {
   process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
   try {
     const emptyNoSafe = JSON.stringify({ findings: [], merge_recommendation: "COMMENT" });
-    const valid = JSON.stringify({ findings: [{ severity: "P1", file: "src/b.ts", line: 2, title: "bug", failure_scenario: "s", evidence: "e" }], merge_recommendation: "REQUEST_CHANGES" });
+    const valid = JSON.stringify({ findings: [F({ file: "src/b.ts", line: 2 })], merge_recommendation: "REQUEST_CHANGES" });
     let call = 0;
     const request = async (_b, _k, path) => { if (path === "models") return { data: [] }; call += 1; return call === 1 ? assistant(emptyNoSafe) : assistant(valid); };
     const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
@@ -302,11 +302,8 @@ test("no reviewer JSON across groups is an explicit failure, not an empty pass",
 
 test("D1: findings are deduped and sorted by severity before the downstream 8-cap", async () => {
   // 8 P2 findings then 1 P1 — the P1 must be in the top 8 after dedup+sort.
-  const p2s = Array.from({ length: 8 }, (_, i) => ({
-    severity: "P2", file: "src/a.ts", line: i + 1, title: `p2-${i}`,
-    failure_scenario: "x", evidence: "y"
-  }));
-  const p1 = { severity: "P1", file: "src/b.ts", line: 1, title: "p1", failure_scenario: "x", evidence: "y" };
+  const p2s = Array.from({ length: 8 }, (_, i) => F({ severity: "P2", file: "src/a.ts", line: i + 1, title: `p2-${i}` }));
+  const p1 = F({ severity: "P1", file: "src/b.ts", line: 1, title: "p1" });
   const group1 = JSON.stringify({ merge_recommendation: "COMMENT", findings: p2s.slice(0, 4), investigated_safe: [], coverage: [] });
   const group2 = JSON.stringify({ merge_recommendation: "COMMENT", findings: [...p2s.slice(4), p1], investigated_safe: [], coverage: [] });
   process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "2";
@@ -327,8 +324,8 @@ test("D1: findings are deduped and sorted by severity before the downstream 8-ca
 });
 
 test("D1: duplicate findings (same file|line|normalizedTitle) are deduped", async () => {
-  const dup = { severity: "P1", file: "src/a.ts", line: 5, title: "Bug Here!", failure_scenario: "x", evidence: "y" };
-  const dup2 = { severity: "P1", file: "src/a.ts", line: 5, title: "Bug  here", failure_scenario: "different", evidence: "z" }; // normalized same
+  const dup = F({ file: "src/a.ts", line: 5, title: "Bug Here!" });
+  const dup2 = F({ file: "src/a.ts", line: 5, title: "Bug  here", failure_scenario: "different" }); // normalized same key
   const group1 = JSON.stringify({ merge_recommendation: "COMMENT", findings: [dup], investigated_safe: [], coverage: [] });
   const group2 = JSON.stringify({ merge_recommendation: "COMMENT", findings: [dup2], investigated_safe: [], coverage: [] });
   process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";

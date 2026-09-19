@@ -12,6 +12,7 @@ import { buildChatParts, parseChatSubmission, REVIEW_OFFLINE_RULE } from "./chat
 import { extractChatJson } from "./extract-chat-json.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
 import { localGenerationParams, samplingRequestFields } from "./local-llm.server.ts";
+import { gateLiveSubmission } from "./poster.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, LocalReviewMode, ReviewProvider, SamplePr } from "./types.ts";
 
@@ -288,10 +289,13 @@ async function reviewGroup(
   let finalRaw: string | null = null;
   let lastPromptTokens = 0;
   // Measure the cap from the ACTUAL current messages (after peer injection and every prior tool
-  // output), not a lagging incremental estimate. This single measurement is what any content
-  // appended since the last response must be counted by — tool results, peer data, anything.
+  // output). Count tool-call arguments too (they are not in `content`), and floor the estimate at the
+  // real prompt_tokens the server last reported — token-dense source can pack more than 3.5 chars/
+  // token, so the char estimate alone can undercount. Whichever is larger drives the cap.
+  const msgSize = (m: Msg) =>
+    (typeof m.content === "string" ? m.content.length : 0) + (Array.isArray(m.tool_calls) ? JSON.stringify(m.tool_calls).length : 0);
   const contextTokens = () =>
-    Math.ceil(messages.reduce((n, m) => n + (typeof m.content === "string" ? m.content.length : 0), 0) / CHARS_PER_TOKEN);
+    Math.max(lastPromptTokens, Math.ceil(messages.reduce((n, m) => n + msgSize(m), 0) / CHARS_PER_TOKEN));
 
   for (let iter = 1; iter <= t.toolIterCap + 1; iter += 1) {
     injectNewPeers(messages, deps, injectedPeers);
@@ -387,16 +391,14 @@ function normalizeTitle(title: unknown): string {
 
 const SEVERITY_ORDER: Record<string, number> = { P0: 0, P1: 1, P2: 2 };
 
-// A group's raw counts as a genuine review only if it actually says something: at least one finding,
-// or at least one investigated_safe entry (a clean pass must justify itself). This mirrors the
-// downstream gate's rule so an empty `{"findings":[]}` group cannot be scored as reviewed.
-function groupReviewValid(raw: string): boolean {
-  try {
-    const o = JSON.parse(raw) as ReviewObj;
-    return (Array.isArray(o.findings) && o.findings.length > 0) || (Array.isArray(o.investigated_safe) && o.investigated_safe.length > 0);
-  } catch {
-    return false;
-  }
+// A group counts as reviewed only if it passes the SAME gate the leg will face downstream:
+// gateLiveSubmission drops incomplete findings and rejects empty-without-investigated_safe. Running
+// it here (rather than a hand-rolled proxy like "findings.length > 0") means a group whose findings
+// would all be dropped, or that is empty with no safe justification, is treated as not reviewed —
+// one authoritative check, so no weaker predicate can let an unreviewed group pass as clean.
+function groupReviewValid(raw: string, sample: SamplePr, settings: BotSettings): boolean {
+  const gate = gateLiveSubmission(parseChatSubmission(raw), sample, settings);
+  return gate.ok === true && (gate.findings.length > 0 || gate.investigatedSafe.length > 0);
 }
 
 // Union the per-group JSON objects into one review JSON for the single local leg. The final
@@ -513,7 +515,7 @@ export async function runLocalReviewLoop(
         // applies. A null return (prose/truncated) or an empty `{"findings":[]}` with no
         // investigated_safe is a failure (→ not_cleared), so a sibling group's empty-but-safe result
         // can never make the leg look like a clean full pass. One authoritative check, not per-shape.
-        if (raw && groupReviewValid(raw)) raws.push(raw);
+        if (raw && groupReviewValid(raw, sample, settings)) raws.push(raw);
         else failedGroups.push(group);
       } catch (e) {
         deps.log?.(`group ${group[0]} failed: ${e instanceof Error ? e.message : String(e)}`);

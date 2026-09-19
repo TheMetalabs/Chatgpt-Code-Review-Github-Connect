@@ -13,7 +13,25 @@ import { extractChatJson } from "./extract-chat-json.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
 import { localGenerationParams } from "./local-llm.server.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
-import type { BotSettings, ReviewProvider, SamplePr } from "./types.ts";
+import type { BotSettings, LocalReviewMode, ReviewProvider, SamplePr } from "./types.ts";
+
+// Rough char→token ratio for this transport's prompts (English + code + diff markers). Only used to
+// route auto mode; the real budget lives in max_tokens.
+const CHARS_PER_TOKEN = 3.5;
+
+// Which local path to run. "auto" keeps a small PR on the faster, higher-recall single-turn pass and
+// routes a large one to the grouped loop — where the whole diff would not fit one completion window
+// and a single call's KV cache would spike. Bounding single-turn to singleTurnMaxTokens keeps its
+// peak memory (prompt + max_tokens) safe; above it the grouped loop caps per-call memory instead.
+export function chooseLocalReviewMode(
+  configured: LocalReviewMode,
+  singleTurnPromptChars: number,
+  singleTurnMaxTokens: number,
+): "single" | "multiturn" {
+  if (configured !== "auto") return configured;
+  const estTokens = Math.ceil(singleTurnPromptChars / CHARS_PER_TOKEN);
+  return estTokens <= singleTurnMaxTokens ? "single" : "multiturn";
+}
 
 export type PeerLeg = { provider: ReviewProvider; raw: string };
 

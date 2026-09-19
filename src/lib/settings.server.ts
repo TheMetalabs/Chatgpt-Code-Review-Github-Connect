@@ -77,6 +77,8 @@ function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   if (localMaxTokens !== undefined) o.localReviewMaxTokens = localMaxTokens;
   const localMode = envStr("ASHLAR_LOCAL_REVIEW_MODE");
   if (localMode) o.localReviewMode = localMode as LocalReviewMode;
+  const localSingleTurnMax = envNum("ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS");
+  if (localSingleTurnMax !== undefined) o.localReviewSingleTurnMaxTokens = localSingleTurnMax;
   const order = envStr("ASHLAR_REVIEW_ORDER");
   if (order) o.reviewOrder = order.split(",").map((s) => s.trim());
   const chatgptReasoning = envStr("ASHLAR_CHATGPT_REASONING");
@@ -116,6 +118,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_LLM_API_KEY: s.localLlmApiKey,
     ASHLAR_LOCAL_REVIEW_MAX_TOKENS: String(s.localReviewMaxTokens),
     ASHLAR_LOCAL_REVIEW_MODE: s.localReviewMode,
+    ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS: String(s.localReviewSingleTurnMaxTokens),
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
     ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
     ASHLAR_GROK_REASONING: s.grokReasoning,
@@ -171,6 +174,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localReviewMode: LOCAL_REVIEW_MODES.includes(p.localReviewMode as LocalReviewMode)
       ? (p.localReviewMode as LocalReviewMode)
       : DEFAULT_SETTINGS.localReviewMode,
+    localReviewSingleTurnMaxTokens: Math.max(1, Math.floor(num(p.localReviewSingleTurnMaxTokens, DEFAULT_SETTINGS.localReviewSingleTurnMaxTokens))),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),
     grokReasoning: normalizeGrokReasoning(p.grokReasoning),

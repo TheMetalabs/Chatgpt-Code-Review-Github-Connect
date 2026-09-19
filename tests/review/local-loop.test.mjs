@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runLocalReviewLoop, groupChangedFiles } from "../../src/lib/local-review-loop.server.ts";
+import { runLocalReviewLoop, groupChangedFiles, chooseLocalReviewMode } from "../../src/lib/local-review-loop.server.ts";
 import { DEFAULT_SETTINGS } from "../../src/lib/types.ts";
 
 const settings = { ...DEFAULT_SETTINGS, reviewLocal: true, localLlmBaseUrl: "http://local/v1/", localLlmModel: "m", localLlmApiKey: "k" };
@@ -95,6 +95,22 @@ test("grouping splits changed files into size-bounded groups", () => {
   const many = groupChangedFiles(sample, { groupMaxChars: 10, maxFilesPerGroup: 1, toolIterCap: 8, ctxCapTokens: 24_000 });
   assert.equal(many.length, 3, "a one-file cap splits into one group per file");
   assert.deepEqual([...new Set(many.flat())].sort(), ["a/one.ts", "a/three.ts", "a/two.ts"]);
+});
+
+test("auto mode picks single for a small PR and multiturn for a large one", () => {
+  const max = 30_000; // tokens; ~3.5 chars/token
+  // A small PR (well under the budget) stays single-turn: faster, whole-PR view, higher recall.
+  assert.equal(chooseLocalReviewMode("auto", 57_000, max), "single"); // ~16K tokens, like #261
+  // A large PR (over the budget) goes multiturn: it would not fit one completion window and a single
+  // call's KV cache would spike.
+  assert.equal(chooseLocalReviewMode("auto", 160_000, max), "multiturn"); // ~46K tokens
+  // Exact boundary stays single (<=).
+  assert.equal(chooseLocalReviewMode("auto", max * 3.5, max), "single");
+});
+
+test("explicit mode overrides size-based auto selection", () => {
+  assert.equal(chooseLocalReviewMode("single", 999_999, 30_000), "single");
+  assert.equal(chooseLocalReviewMode("multiturn", 1, 30_000), "multiturn");
 });
 
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {

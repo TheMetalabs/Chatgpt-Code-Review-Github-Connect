@@ -228,7 +228,8 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 
 | 설정 / env | 기본 | 뜻 |
 | --- | --- | --- |
-| `localReviewMode` / `ASHLAR_LOCAL_REVIEW_MODE` | `multiturn` | `single` = 1회성 프롬프트(롤백), `multiturn` = 툴 루프 |
+| `localReviewMode` / `ASHLAR_LOCAL_REVIEW_MODE` | `auto` | `auto` = PR 크기로 자동 선택, `single` = 1회성(롤백), `multiturn` = 툴 루프 |
+| `localReviewSingleTurnMaxTokens` / `ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS` | 30000 | `auto`에서 이 토큰 이하 프롬프트는 단일턴 유지, 초과는 멀티턴 |
 | `localReviewMaxTokens` / `ASHLAR_LOCAL_REVIEW_MAX_TOKENS` | 32768 | 생성 토큰 예산. **필수** — 없으면 서버 기본(~8K)에 추론이 다 차 JSON 전에 잘립니다 |
 | `ASHLAR_LOCAL_REVIEW_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_PRESENCE_PENALTY` | 0.6 / 0.95 / 20 / 1.0 | 비-greedy 샘플링. greedy(0)는 추론 모델을 반복 루프에 빠뜨립니다 |
 | `ASHLAR_LOCAL_REVIEW_GROUP_MAX_CHARS` | 40000 | 그룹당 파일 묶음 크기 상한(피크 KV 캐시 메모리 경계) |
@@ -236,8 +237,11 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 | `ASHLAR_LOCAL_REVIEW_TOOL_ITERS` | 8 | 그룹당 최대 툴 라운드. 초과하면 툴을 빼고 최종 JSON 강제 |
 | `ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS` | 24000 | 프롬프트가 이 토큰을 넘으면 다음 턴에 최종 JSON 강제 |
 
-변경 파일은 크기로 묶어 **순차** 검토합니다(공유 머신에서 동시 생성 1개로 메모리 경계 유지). thinking은
-켜 둡니다(끄면 리뷰가 고무도장이 됩니다). 롤백은 `ASHLAR_LOCAL_REVIEW_MODE=single`.
+기본 `auto`는 작은 PR(프롬프트 ≤ 30K 토큰)은 **단일턴**으로 빠르게 전체를 보고, 큰 PR은 **멀티턴**으로
+돌립니다. 단일턴은 한 완성 창에 다 담기고 재현율이 높으며, 큰 PR은 단일 호출 KV 캐시가 치솟으니
+그룹으로 나눠 피크 메모리를 낮춥니다. 멀티턴의 변경 파일은 크기로 묶어 **순차** 검토합니다(공유 머신에서
+동시 생성 1개로 메모리 경계 유지). thinking은 켜 둡니다(끄면 리뷰가 고무도장이 됩니다). 강제 롤백은
+`ASHLAR_LOCAL_REVIEW_MODE=single`.
 
 ---
 

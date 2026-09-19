@@ -18,7 +18,7 @@ import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot,
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm } from "./local-llm.server";
-import { runLocalReviewLoop } from "./local-review-loop.server";
+import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -583,17 +583,19 @@ async function kickLocalRace(jobId: string, prompt: string) {
   void attachLocalLeg(jobId, prompt, { submit: true });
 }
 
-// "multiturn" runs the SDK tool loop over the fetched snapshot; peers already stored on the job are
-// injected as data each turn (never waited on). "single" (or a missing snapshot, e.g. a late
-// bridge-fallback kick after restart) uses the one-shot prompt. Either way the result is one local
-// leg for the unchanged schema-merge.
+// Picks the local path by settings: multiturn runs the SDK tool loop over the fetched snapshot
+// (peers already stored on the job are injected as data each turn, never waited on); single and auto
+// (auto = single for a PR that fits one completion window) use the one-shot prompt. A missing
+// snapshot (e.g. a late bridge-fallback kick after restart) also falls back to single. Either way the
+// result is one local leg for the unchanged schema-merge.
 async function generateLocalLeg(
   jobId: string,
   prompt: string,
 ): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
-  if (state.settings.localReviewMode === "multiturn" && sample) {
+  const mode = chooseLocalReviewMode(state.settings.localReviewMode, prompt.length, state.settings.localReviewSingleTurnMaxTokens);
+  if (mode === "multiturn" && sample) {
     return runLocalReviewLoop(sample, state.settings, {
       signal,
       peerReported: () =>

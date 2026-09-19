@@ -432,10 +432,10 @@ async function watchReviewers(jobId: string, token: string) {
       const age = Date.now() - job.providerProgress.local.observedAt;
       const threshold = localStaleNoteMs();
       if (age > threshold) {
-        // Fixed message keyed to the threshold, NOT the live age: the ops comment tracks state
-        // changes, so a continuously increasing minute count would rewrite it every tick/minute.
-        const thresholdMin = Math.max(1, Math.floor(threshold / 60_000));
-        notes.push(`local reviewer: no progress for over ${thresholdMin}m (still waiting; cancel manually if stalled)`);
+        // No duration at all: a live age churns the ops comment every tick, and a threshold-rounded
+        // duration misreports sub-minute windows. The ops comment tracks state, so a stable, accurate
+        // "no recent progress" (matching the lane) is the honest signal; the operator decides.
+        notes.push(`local reviewer: no recent progress (still waiting; cancel manually if stalled)`);
       }
     }
     for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);

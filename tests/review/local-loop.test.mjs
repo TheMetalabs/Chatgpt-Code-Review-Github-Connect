@@ -118,22 +118,23 @@ test("explicit mode overrides size-based auto selection", () => {
   assert.equal(chooseLocalReviewMode("multiturn", 1, 30_000), "multiturn");
 });
 
-test("a file larger than the group budget gets its own group", () => {
+test("a file with a patch larger than the group budget gets its own group", () => {
   // Oversized single file must be isolated so its opening prompt does not blow a finite context.
+  // Grouping sizes by the PATCH payload (what is sent), so give huge.ts a huge patch.
   const sample = sampleWith(["src/small.ts", "src/huge.ts"]);
-  sample.files = sample.files.map((f) => (f.path === "src/huge.ts" ? { ...f, content: "x".repeat(50_000) } : f));
+  sample.diff = `--- src/small.ts\n@@ -1,1 +1,2 @@\n a\n+b\n\n--- src/huge.ts\n@@ -1,1 +1,2 @@\n a\n` + "+x\n".repeat(20_000);
   const groups = groupChangedFiles(sample, { groupMaxChars: 40_000, maxFilesPerGroup: 6, toolIterCap: 8, ctxCapTokens: 24_000, groupContextMaxChars: 60_000 });
   const hugeGroup = groups.find((g) => g.includes("src/huge.ts"));
-  assert.deepEqual(hugeGroup, ["src/huge.ts"], "oversized file is alone in its group");
+  assert.deepEqual(hugeGroup, ["src/huge.ts"], "oversized-patch file is alone in its group");
 });
 
-test("a path whose diff was dropped by the prompt budget is excluded from groups", () => {
-  // With no patch a group cannot see what changed, so grouping it would only fake coverage.
+test("a changed path with no usable patch is excluded from groups", () => {
+  // Without a parseable patch a group cannot see what changed, so grouping it would only fake coverage.
   const sample = sampleWith(["src/a.ts", "src/b.ts"]);
-  sample.diffDroppedPaths = ["src/b.ts"];
+  sample.diff = "--- src/a.ts\n@@ -1,1 +1,2 @@\n a\n+b"; // only a.ts has a patch; b.ts has none
   const groups = groupChangedFiles(sample, { groupMaxChars: 1_000_000, maxFilesPerGroup: 6, toolIterCap: 8, ctxCapTokens: 24_000, groupContextMaxChars: 60_000 });
-  assert.equal(groups.flat().includes("src/b.ts"), false, "dropped-diff path is not grouped");
-  assert.equal(groups.flat().includes("src/a.ts"), true, "normal changed path is still grouped");
+  assert.equal(groups.flat().includes("src/b.ts"), false, "path with no patch is not grouped");
+  assert.equal(groups.flat().includes("src/a.ts"), true, "path with a patch is grouped");
 });
 
 test("grouping keeps a changed code file that is missing from the snapshot", () => {
@@ -213,16 +214,16 @@ test("provisional JSON on a tool-call turn is not accepted when the final turn h
   assert.match(out.error, /no review JSON/i);
 });
 
-test("a path whose diff was dropped is marked not_cleared in the merged result", async () => {
+test("a path with no usable patch is marked not_cleared in the merged result", async () => {
   const sample = sampleWith(["src/a.ts", "src/b.ts"]);
-  sample.diffDroppedPaths = ["src/b.ts"];
+  sample.diff = "--- src/a.ts\n@@ -1,1 +1,2 @@\n a\n+b"; // b.ts has no patch → unreviewable
   const emptySafe = JSON.stringify({ findings: [], merge_recommendation: "COMMENT", investigated_safe: ["a checked"], coverage: [] });
   const { request } = mock([assistant(emptySafe)]);
   const out = await runLocalReviewLoop(sample, settings, { request });
   assert.equal(out.ok, true);
   const merged = JSON.parse(out.raw);
-  assert.ok(merged.coverage.some((c) => c.file === "src/b.ts" && c.status === "not_cleared"), "dropped path is not_cleared");
-  assert.deepEqual(merged.investigated_safe, [], "empty findings + a dropped path → safe forced empty (not a clean pass)");
+  assert.ok(merged.coverage.some((c) => c.file === "src/b.ts" && c.status === "not_cleared"), "unpatched path is not_cleared");
+  assert.deepEqual(merged.investigated_safe, [], "empty findings + an unreviewed path → safe forced empty (not a clean pass)");
 });
 
 test("a changed path that literally begins with a/ keeps its diff", async () => {
@@ -291,6 +292,17 @@ test("an unparseable peer result is not injected as already-reported", async () 
   await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request, peerReported: () => [{ provider: "chatgpt", raw: "sorry, I could not review (no json)" }] });
   const injected = bodies.flatMap((b) => b.messages).some((m) => typeof m.content === "string" && m.content.includes("ALREADY_REPORTED_BY_PEER"));
   assert.equal(injected, false, "a peer with no parseable validated findings is not injected");
+});
+
+test("merge keeps only findings that will survive the downstream gate", async () => {
+  const complete = F({ file: "src/pay.ts", line: 2, title: "real" });
+  const incomplete = { severity: "P1", file: "src/pay.ts", line: 9, title: "sparse" }; // missing root_cause/recommended_* etc.
+  const raw = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", findings: [complete, incomplete], investigated_safe: [], coverage: [] });
+  const { request } = mock([assistant(raw)]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  const merged = JSON.parse(out.raw);
+  assert.ok(merged.findings.some((f) => f.line === 2), "gate-passing finding is kept");
+  assert.equal(merged.findings.some((f) => f.line === 9), false, "gate-failing incomplete finding is dropped from the merge");
 });
 
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {

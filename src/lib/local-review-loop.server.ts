@@ -113,12 +113,23 @@ function patchesByPath(diff: string): Map<string, string> {
   return out;
 }
 
+// Changed paths with no usable patch (budget-dropped, binary, rename-only, unparsed). They cannot be
+// reviewed from a diff, so grouping excludes them and the merge marks them not_cleared.
+function unreviewablePaths(sample: SamplePr): string[] {
+  const patchMap = patchesByPath(sample.diff);
+  return sample.changedPaths.filter((p) => !patchMap.has(p));
+}
+
 // Greedy grouping: pack changed files (in review-budget order for code files, so same-dir siblings
 // stay adjacent) into groups bounded by char size and file count. Bounding the per-group prompt is
 // what keeps peak KV-cache memory in check when other processes share the host.
 export function groupChangedFiles(sample: SamplePr, t: LoopTuning): string[][] {
-  const contentByPath = new Map(sample.files.map((f) => [f.path, f.content]));
   const present = new Set(sample.files.map((f) => f.path));
+  // A path is reviewable only if a usable patch was parsed for it. This covers budget-dropped diffs
+  // AND any changed path with no parseable patch (binary, rename-only, unparsed) — without a diff a
+  // group cannot see what changed, so grouping it would only manufacture false coverage. The caller
+  // marks these not_cleared instead.
+  const patchMap = patchesByPath(sample.diff);
   // Start with rank-0 code files (ordered by review-budget so same-dir siblings stay adjacent).
   const orderedCodePresent = orderFiles(
     sample.files.filter((f) => sample.changedPaths.includes(f.path) && rankChangedFile(f.path) === 0),
@@ -127,17 +138,15 @@ export function groupChangedFiles(sample: SamplePr, t: LoopTuning): string[][] {
   // Then append all other changed paths (non-code, tests, config, docs) not already included.
   const alreadyIncluded = new Set([...orderedCodePresent, ...missingCode]);
   const remaining = sample.changedPaths.filter((p) => !alreadyIncluded.has(p));
-  // Exclude paths whose diff the one-shot budget dropped: with no patch, a group cannot see what
-  // changed, so reviewing it would only manufacture false coverage. The caller marks these
-  // not_cleared instead of grouping them.
-  const dropped = new Set(sample.diffDroppedPaths ?? []);
-  const targets = [...orderedCodePresent, ...missingCode, ...remaining].filter((p) => !dropped.has(p));
-  if (!targets.length) return []; // nothing reviewable (empty PR or every diff dropped) — caller marks not_cleared
+  const targets = [...orderedCodePresent, ...missingCode, ...remaining].filter((p) => patchMap.has(p));
+  if (!targets.length) return []; // nothing reviewable (empty PR or no usable patch) — caller marks not_cleared
   const groups: string[][] = [];
   let cur: string[] = [];
   let curChars = 0;
   for (const path of targets) {
-    const size = (contentByPath.get(path)?.length ?? 0) + 200;
+    // Size by the patch payload — that is what actually goes into the prompt (context is separately
+    // capped by groupContextMaxChars). A file with a huge diff must be bounded even if its head is small.
+    const size = (patchMap.get(path)?.length ?? 0) + 200;
     // If a single file exceeds groupMaxChars, flush current group and place oversized file alone.
     if (size > t.groupMaxChars) {
       if (cur.length) {
@@ -391,6 +400,20 @@ function normalizeTitle(title: unknown): string {
 
 const SEVERITY_ORDER: Record<string, number> = { P0: 0, P1: 1, P2: 2 };
 
+// Mirrors poster.asFinding's required-field check so the merge keeps only findings that will survive
+// the downstream gate (accepts snake_case or camelCase, like the gate).
+function gatePasses(f: unknown): boolean {
+  if (!f || typeof f !== "object") return false;
+  const r = f as Record<string, unknown>;
+  const s = (a: string, b: string) => String((r[a] ?? r[b]) ?? "").trim();
+  const line = Number(r.line);
+  return Boolean(
+    s("title", "title") && s("failure_scenario", "failureScenario") && s("root_cause", "rootCause") &&
+    s("evidence", "evidence") && s("recommended_fix", "recommendedFix") && s("recommended_test", "recommendedTest") &&
+    s("file", "file"),
+  ) && Number.isFinite(line) && line >= 1;
+}
+
 // A group counts as reviewed only if it passes the SAME gate the leg will face downstream:
 // gateLiveSubmission drops incomplete findings and rejects empty-without-investigated_safe. Running
 // it here (rather than a hand-rolled proxy like "findings.length > 0") means a group whose findings
@@ -422,7 +445,10 @@ function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPath
   for (const raw of raws) {
     let obj: ReviewObj;
     try { obj = JSON.parse(raw) as ReviewObj; } catch { continue; }
-    if (Array.isArray(obj.findings)) findings.push(...obj.findings);
+    // Merge only findings that will survive the downstream gate (asFinding's required fields). A
+    // finding missing e.g. root_cause or recommended_test is dropped there anyway; keeping it in the
+    // merged output only inflates the count against the 8-cap and misrepresents coverage.
+    if (Array.isArray(obj.findings)) findings.push(...obj.findings.filter(gatePasses));
     if (Array.isArray(obj.coverage)) coverage.push(...obj.coverage);
     if (Array.isArray(obj.investigated_safe)) safe.push(...obj.investigated_safe);
     if (Array.isArray(obj.assumptions)) assumptions.push(...obj.assumptions);
@@ -473,13 +499,13 @@ function mergeGroupResults(raws: string[], failedGroups: string[][], droppedPath
   // Paths whose diff the one-shot budget dropped were never reviewable (no patch); mark them
   // not_cleared too so a surviving empty group cannot make the leg look like a clean full pass.
   for (const file of droppedPaths) {
-    finalCoverage.push({ file, status: "not_cleared", reason: "diff dropped by prompt budget" });
+    finalCoverage.push({ file, status: "not_cleared", reason: "no usable diff (dropped by budget or unparsable)" });
   }
   if (failedFiles.length) {
     finalAssumptions.push(`Local review incomplete: ${failedGroups.length} group(s) failed (${failedFiles.join(", ")})`);
   }
   if (droppedPaths.length) {
-    finalAssumptions.push(`Local review incomplete: ${droppedPaths.length} path(s) had their diff dropped by budget (${droppedPaths.join(", ")})`);
+    finalAssumptions.push(`Local review incomplete: ${droppedPaths.length} path(s) had no usable diff (${droppedPaths.join(", ")})`);
   }
   // If findings is empty AND anything went unreviewed (a failed group or a budget-dropped path),
   // force investigated_safe to [] so the frozen gate does NOT treat the empty result as a clean pass
@@ -533,7 +559,7 @@ export async function runLocalReviewLoop(
     // are empty) investigated_safe is forced [], so the frozen gate rejects a partial run as
     // incomplete rather than accepting it as a false clean pass.
     if (!raws.length) return { ok: false, error: "local loop produced no review JSON" };
-    return { ok: true, raw: mergeGroupResults(raws, failedGroups, sample.diffDroppedPaths ?? []) };
+    return { ok: true, raw: mergeGroupResults(raws, failedGroups, unreviewablePaths(sample)) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

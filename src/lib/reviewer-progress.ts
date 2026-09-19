@@ -216,10 +216,12 @@ export function emptyReviewSkip(lanes: readonly ReviewerLane[]): {
   ops: string[];
 } {
   const usageLimited = lanes.some((lane) => /usage limit|quota|한도/i.test(lane.detail));
-  // Other terminal INFRA failures (tab closed, cancelled, connection/reconnection, generic error)
-  // must not be reported as "finished without JSON" either — that misclassifies an infra failure as
-  // a model that reviewed and found nothing. Reserve the generic message for genuinely empty replies.
-  const infraFailed = lanes.some((lane) => /tab closed|cancell|connection|reconnect|error:/i.test(lane.detail));
+  // Reserve "finished without JSON" for a genuinely empty reply. Any lane whose detail is NOT that
+  // explicit empty signal is some other terminal failure — a skip note in raw code form
+  // (`tab_closed`, `cancelled`, `context_lost`, …) or a humanized detail — so bias toward "could not
+  // complete" and never misreport an infra failure as a model that reviewed and found nothing.
+  const EMPTY_REPLY = /without (review )?json|no json|finished without|no reviewer json/i;
+  const infraFailed = !usageLimited && lanes.some((lane) => !EMPTY_REPLY.test(lane.detail));
   const details = lanes.map((lane) => `${lane.label}: ${lane.detail}`);
   const skipReason = usageLimited
     ? "reviewers could not complete — usage limit reached"

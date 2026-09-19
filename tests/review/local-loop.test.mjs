@@ -54,7 +54,8 @@ test("every generation sends a completion budget and non-greedy sampling", async
   await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
   assert.ok(bodies[0].max_tokens >= 8192, "max_tokens must clear thinking + JSON");
   assert.ok(bodies[0].temperature > 0, "non-greedy to avoid repetition loops");
-  assert.ok(bodies[0].top_p > 0 && bodies[0].top_k > 0, "nucleus + top-k sampling set");
+  assert.ok(bodies[0].top_p > 0, "nucleus sampling set");
+  assert.equal("top_k" in bodies[0], false, "top_k omitted by default for OpenAI compatibility");
 });
 
 test("already-arrived peer results are injected once as do-not-repeat data", async () => {
@@ -157,4 +158,101 @@ test("no reviewer JSON across groups is an explicit failure, not an empty pass",
   const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
   assert.equal(out.ok, false);
   assert.match(out.error, /no review JSON/i);
+});
+
+test("D1: findings are deduped and sorted by severity before the downstream 8-cap", async () => {
+  // 8 P2 findings then 1 P1 — the P1 must be in the top 8 after dedup+sort.
+  const p2s = Array.from({ length: 8 }, (_, i) => ({
+    severity: "P2", file: "src/a.ts", line: i + 1, title: `p2-${i}`,
+    failure_scenario: "x", evidence: "y"
+  }));
+  const p1 = { severity: "P1", file: "src/b.ts", line: 1, title: "p1", failure_scenario: "x", evidence: "y" };
+  const group1 = JSON.stringify({ merge_recommendation: "COMMENT", findings: p2s.slice(0, 4), investigated_safe: [], coverage: [] });
+  const group2 = JSON.stringify({ merge_recommendation: "COMMENT", findings: [...p2s.slice(4), p1], investigated_safe: [], coverage: [] });
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "2";
+  try {
+    let call = 0;
+    const request = async () => {
+      call += 1;
+      return assistant(call === 1 ? group1 : group2);
+    };
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"]), settings, { request });
+    assert.equal(out.ok, true);
+    const merged = JSON.parse(out.raw);
+    assert.equal(merged.findings[0].severity, "P1", "P1 must be first after sort");
+    assert.ok(merged.findings.slice(0, 8).some(f => f.severity === "P1"), "P1 must be in top 8");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
+test("D1: duplicate findings (same file|line|normalizedTitle) are deduped", async () => {
+  const dup = { severity: "P1", file: "src/a.ts", line: 5, title: "Bug Here!", failure_scenario: "x", evidence: "y" };
+  const dup2 = { severity: "P1", file: "src/a.ts", line: 5, title: "Bug  here", failure_scenario: "different", evidence: "z" }; // normalized same
+  const group1 = JSON.stringify({ merge_recommendation: "COMMENT", findings: [dup], investigated_safe: [], coverage: [] });
+  const group2 = JSON.stringify({ merge_recommendation: "COMMENT", findings: [dup2], investigated_safe: [], coverage: [] });
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    let call = 0;
+    const request = async () => {
+      call += 1;
+      return assistant(call === 1 ? group1 : group2);
+    };
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
+    assert.equal(out.ok, true);
+    const merged = JSON.parse(out.raw);
+    assert.equal(merged.findings.length, 1, "duplicate findings must be deduped");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
+test("D2: partial group failure adds not_cleared coverage and forces empty investigated_safe", async () => {
+  // 2 groups: group 2 throws, group 1 returns findings:[] + investigated_safe:["something"].
+  // The merged result must have investigated_safe:[] and a not_cleared coverage entry for group 2's file.
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    let call = 0;
+    const request = async (_b, _k, path) => {
+      if (path === "models") return { data: [] };
+      call += 1;
+      if (call === 2) throw new Error("group 2 failed"); // second group throws
+      return assistant(JSON.stringify({ merge_recommendation: "COMMENT", findings: [], investigated_safe: ["something"], coverage: [] }));
+    };
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request });
+    assert.equal(out.ok, true);
+    const merged = JSON.parse(out.raw);
+    assert.equal(merged.investigated_safe.length, 0, "investigated_safe must be forced to [] when findings empty + group failed");
+    const notCleared = merged.coverage.find(c => c.status === "not_cleared");
+    assert.ok(notCleared, "coverage must have a not_cleared entry for the failed group's file");
+    assert.equal(notCleared.file, "src/b.ts");
+    assert.ok(merged.assumptions.some(a => /Local review incomplete/.test(a)), "assumptions must note the failure");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
+test("D3: grouping includes all changedPaths (code, non-code, missing-snapshot)", async () => {
+  const sample = sampleWith(["src/a.ts", ".github/workflows/ci.yml"]);
+  const groups = groupChangedFiles(sample, { groupMaxChars: 1_000_000, maxFilesPerGroup: 6, toolIterCap: 8, ctxCapTokens: 24_000 });
+  const flat = groups.flat();
+  assert.ok(flat.includes("src/a.ts"), "code file must be included");
+  assert.ok(flat.includes(".github/workflows/ci.yml"), "non-code changed file must be included");
+});
+
+test("D4: top_k defaults to 0 (omitted from request) for portable OpenAI-compatible requests", async () => {
+  const { request, bodies } = mock([assistant(REVIEW_JSON)]);
+  await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal("top_k" in bodies[0], false, "top_k must be omitted when default (0)");
+  assert.ok(bodies[0].temperature > 0, "temperature still present");
+  assert.ok(bodies[0].top_p > 0, "top_p still present");
+});
+
+test("D6: user mention text (extra) is threaded into the loop and appears in the prompt", async () => {
+  const { request, bodies } = mock([assistant(REVIEW_JSON)]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request, extra: "focus on migration rollback" });
+  assert.equal(out.ok, true);
+  // The extra text must appear in the first request's user message.
+  const userMsg = bodies[0].messages.find(m => m.role === "user");
+  assert.ok(userMsg && /focus on migration rollback/.test(userMsg.content), "extra text must appear in the prompt");
 });

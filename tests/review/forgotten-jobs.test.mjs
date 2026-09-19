@@ -25,7 +25,10 @@ function harness(jobs, tabs = new Map(), serverStates = {}) {
         // cached status (what clearStuckJobs re-confirms before abandoning). Override via serverStates
         // to simulate a job the bridge restored (active) between the cached heartbeat and the sweep.
         const fresh = serverStates[body.jobId] ?? jobs.find((j) => j.jobId === body.jobId)?.serverStatus;
-        return ['missing', 'unknown', 'cancelled'].includes(fresh) ? { ok: true, active: false, status: fresh } : { ok: true, active: true };
+        // The server reports active only for a genuinely-active (awaiting_chat) job; every other status —
+        // missing/unknown (forgotten) AND tracked non-active ones (validator/posting/…) — comes back
+        // active:false with the status, which refreshJobHeartbeat stores in job.serverStatus.
+        return fresh && fresh !== 'active' ? { ok: true, active: false, status: fresh } : { ok: true, active: true };
       }
       return { ok: true };
     },
@@ -125,6 +128,22 @@ test('clearStuckJobs re-probes and KEEPS a job the bridge restored since the las
   assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}), 'the restored job is preserved');
 });
 
+test('clearStuckJobs KEEPS a job the server advanced to a tracked non-active status (validator)', async () => {
+  // Cached missing, but the bridge restored the job and it is now in validator. The fresh ping returns
+  // active:false with status:validator — the server STILL tracks it. Keying off the active:false boolean
+  // alone would delete its outbox; the sweep must re-check the status string and keep it.
+  const b = harness(
+    [makeJob('A', { tabId: 10, serverStatus: 'missing' })], // tab gone
+    new Map(),
+    { A: 'validator' },
+  );
+  const res = await b.context.clearStuckJobs();
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 0, 'a job the server still tracks (validator) is not abandoned');
+  assert.equal(res.kept, 1);
+  assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}), 'the still-tracked job is preserved');
+});
+
 test('clearStuckJobs returns when storage init stalls before the sweep (deadline covers setup)', { timeout: 5000 }, async () => {
   // settings()/workerJobs() read chrome.storage.local.get up front. The deadline is created before any
   // await, so a wedged initial read must still trip it and hand the popup a result — not hang before
@@ -136,27 +155,28 @@ test('clearStuckJobs returns when storage init stalls before the sweep (deadline
   assert.equal(res.timedOut, true, 'the deadline fired even though setup stalled');
 });
 
-test('retireCleanJob awaits the final trace for a normal job but detaches it for a forgotten one', { timeout: 5000 }, async () => {
-  // The final flushProgress is the only durable upload of terminal events (result_saved/tab_closed) for
-  // an ORDINARY retirement, so it must be awaited (persisted before the job is deleted). For a forgotten
-  // job the server can't accept it and the bridge fetch is unbounded, so it must be detached (never
-  // blocks the sweep). A wedged "progress" upload separates the two behaviors.
+test('retireCleanJob detaches the final trace for missing/unknown jobs but awaits it otherwise', { timeout: 5000 }, async () => {
+  // The final flushProgress is the only durable upload of terminal events (result_saved/tab_closed). The
+  // server evicts missing/unknown jobs, so that upload is rejected and its unbounded fetch must be
+  // detached (never blocks the sweep). A cancelled job keeps its lease — recordBridgeProgress still
+  // records the trace — so it (like any tracked job) must AWAIT the upload before deletion. A wedged
+  // "progress" upload separates the two, keyed off serverStatus.
   const b = background({
     local: storage({ origin: 'http://bridge', token: 'token' }),
     api: async (_p, body) => (body?.action === 'progress' ? new Promise(() => {}) : { ok: true }),
   });
-  const cleanJob = () => ({
-    jobId: 'J', origin: 'http://bridge', leaseId: 'l', providers: ['chatgpt'],
+  const cleanJob = (serverStatus) => ({
+    jobId: 'J', origin: 'http://bridge', leaseId: 'l', providers: ['chatgpt'], serverStatus,
     states: { chatgpt: { delivered: true, cleanupDone: true, runId: 'r', workerEvents: [{ stage: 'result_saved', at: 1 }] } },
   });
-  const jf = { J: cleanJob() }; // forgotten → detached: retires despite the hung upload
-  assert.equal(await b.context.retireCleanJob(jf.J, jf, true), true);
-  assert.equal('J' in jf, false, 'a forgotten job retires without waiting on the hung trace');
-  const jn = { J: cleanJob() }; // normal → awaited: must not resolve while the upload hangs
+  const jf = { J: cleanJob('missing') }; // forgotten → detached: retires despite the hung upload
+  assert.equal(await b.context.retireCleanJob(jf.J, jf), true);
+  assert.equal('J' in jf, false, 'a missing job retires without waiting on the (rejected) hung trace');
+  const jc = { J: cleanJob('cancelled') }; // cancelled keeps its lease → awaited: must not resolve while hung
   const race = await Promise.race([
-    b.context.retireCleanJob(jn.J, jn, false).then(() => 'resolved'),
+    b.context.retireCleanJob(jc.J, jc).then(() => 'resolved'),
     new Promise((r) => setTimeout(() => r('pending'), 100)),
   ]);
-  assert.equal(race, 'pending', 'a normal retirement waits for the durable trace upload');
-  assert.ok('J' in jn, 'the normal job is not deleted until its trace is uploaded');
+  assert.equal(race, 'pending', 'a cancelled retirement waits for the durable trace upload');
+  assert.ok('J' in jc, 'the cancelled job is not deleted until its trace is uploaded');
 });

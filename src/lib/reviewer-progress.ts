@@ -203,3 +203,35 @@ export function laneVerb(state: ReviewerLaneState): string {
   if (state === "empty") return "no JSON";
   return "queued";
 }
+
+/**
+ * When a review ends with no reviewer JSON, report WHY from the per-reviewer lanes instead of a
+ * blanket "finished without JSON" — that message hid usage-limit and connection causes and made an
+ * infra failure look like a model that reviewed and found nothing. The ops note lists each lane so
+ * the operator sees the real reason (e.g. "ChatGPT: usage limit").
+ */
+export function emptyReviewSkip(lanes: readonly ReviewerLane[]): {
+  usageLimited: boolean;
+  skipReason: string;
+  ops: string[];
+} {
+  const usageLimited = lanes.some((lane) => /usage limit|quota|한도/i.test(lane.detail));
+  // Reserve "finished without JSON" for a genuinely empty reply. Any lane whose detail is NOT that
+  // explicit empty signal is some other terminal failure — a skip note in raw code form
+  // (`tab_closed`, `cancelled`, `context_lost`, …) or a humanized detail — so bias toward "could not
+  // complete" and never misreport an infra failure as a model that reviewed and found nothing.
+  const EMPTY_REPLY = /without (review )?json|no json|finished without|no reviewer json/i;
+  const infraFailed = !usageLimited && lanes.some((lane) => !EMPTY_REPLY.test(lane.detail));
+  const details = lanes.map((lane) => `${lane.label}: ${lane.detail}`);
+  const skipReason = usageLimited
+    ? "reviewers could not complete — usage limit reached"
+    : infraFailed
+      ? "reviewers could not complete — see per-reviewer details"
+      : "every enabled reviewer finished with no JSON";
+  const headline = usageLimited
+    ? "No review posted — a reviewer hit its usage limit before returning JSON."
+    : infraFailed
+      ? "No review posted — reviewers could not complete (see per-reviewer details)."
+      : "Enabled reviewers finished without JSON. Nothing to post.";
+  return { usageLimited, skipReason, ops: [headline, ...details] };
+}

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildReviewerLanes } from "./reviewer-progress.ts";
+import { buildReviewerLanes, emptyReviewSkip } from "./reviewer-progress.ts";
 import type { Job } from "./types.ts";
 
 function job(partial: Partial<Job>): Job {
@@ -123,6 +123,42 @@ describe("buildReviewerLanes", () => {
     const lane = buildReviewerLanes(job({reviewProviders: ["chatgpt"], generating: {chatgpt: true}}))[0];
     assert.equal(lane.state, "waiting");
     assert.match(lane.detail, /submission not confirmed/);
+  });
+
+  it("emptyReviewSkip names the usage limit instead of blaming empty JSON", () => {
+    const quota = emptyReviewSkip(
+      buildReviewerLanes(job({ reviewProviders: ["chatgpt"], generating: { chatgpt: false }, assumptions: ["chatgpt usage limit"] })),
+    );
+    assert.equal(quota.usageLimited, true);
+    assert.match(quota.skipReason, /usage limit/i);
+    assert.match(quota.ops[0], /usage limit/i);
+    assert.match(quota.ops.join("\n"), /ChatGPT: usage limit/);
+  });
+
+  it("emptyReviewSkip keeps the generic message when a reviewer genuinely returned no JSON", () => {
+    const empty = emptyReviewSkip(
+      buildReviewerLanes(job({ reviewProviders: ["chatgpt"], generating: { chatgpt: false }, assumptions: ["chatgpt finished without JSON"] })),
+    );
+    assert.equal(empty.usageLimited, false);
+    assert.equal(empty.skipReason, "every enabled reviewer finished with no JSON");
+    assert.equal(empty.ops[0], "Enabled reviewers finished without JSON. Nothing to post.");
+  });
+
+  it("emptyReviewSkip reports non-quota terminal failures as 'could not complete' via the real skip-note form", () => {
+    // Real producer path: failBridgeProvider records "Skipped chatgpt: tab_closed: …" (underscore),
+    // which buildReviewerLanes returns verbatim as the lane detail.
+    const viaLanes = emptyReviewSkip(
+      buildReviewerLanes(job({ reviewProviders: ["chatgpt"], generating: { chatgpt: false }, assumptions: ["Skipped chatgpt: tab_closed: review tab was explicitly closed"] })),
+    );
+    assert.equal(viaLanes.usageLimited, false);
+    assert.match(viaLanes.skipReason, /could not complete/i);
+    assert.doesNotMatch(viaLanes.ops[0], /finished without JSON/i);
+    // Humanized details are covered too.
+    for (const detail of ["review tab closed", "connection unknown · waiting for reconnection", "error: bridge dropped"]) {
+      const r = emptyReviewSkip([{ provider: "chatgpt", label: "ChatGPT", state: "empty", detail, answered: false }]);
+      assert.match(r.skipReason, /could not complete/i);
+      assert.doesNotMatch(r.ops[0], /finished without JSON/i);
+    }
   });
 
 });

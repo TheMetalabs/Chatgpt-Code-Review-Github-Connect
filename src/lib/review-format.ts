@@ -17,10 +17,12 @@ export const REVIEW_RAW_START = "<!-- ashlar-raw:start -->";
 export const REVIEW_RAW_END = "<!-- ashlar-raw:end -->";
 const MAX_REVIEW_BODY = 65_000; // under GitHub's 65,535-char review-body limit, with room for scaffolding
 
-/** Remove the verbatim salvaged block from a review body for the UNAUTHENTICATED public snapshot. */
+/** Remove the verbatim salvaged block from a review body for the UNAUTHENTICATED public snapshot.
+ * The real wrapper is emitted last (after any structured findings), so anchor on the LAST start
+ * marker — a finding rendered earlier cannot forge a decoy pair that hides the genuine block. */
 export function redactSalvagedReviewBody(body: string): string {
   const s = String(body || "");
-  const start = s.indexOf(REVIEW_RAW_START);
+  const start = s.lastIndexOf(REVIEW_RAW_START);
   if (start < 0) return s;
   const endMark = s.indexOf(REVIEW_RAW_END, start);
   const end = endMark < 0 ? s.length : endMark + REVIEW_RAW_END.length;
@@ -73,8 +75,10 @@ export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" |
   // loop poller's `Didn.t find any major issues` regex — cannot converge on a deliberately non-clean body.
   const rawReview = (job.rawReview ?? "")
     .trim()
-    // Neutralize the loop poller's clean-pass sentinel (so a salvaged body can't read as clean)…
-    .replace(/didn['’]t find any major issues\.?/gi, "(the model reported no major issues)")
+    // Neutralize the loop poller's clean-pass sentinel (so a salvaged body can't read as clean).
+    // Match the SAME separator set the poller accepts (`Didn.t …` — any single char, not just
+    // apostrophes), so variants like `Didnʼt` or a backtick are neutralized too…
+    .replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)")
     // …and HTML-comment markers, so model-controlled text cannot forge/break the raw delimiters or
     // the findings marker (which would let injected text escape the public redaction). Entities still
     // render as `<!--` / `-->` in the GitHub body but are inert to the delimiter/marker parsers.

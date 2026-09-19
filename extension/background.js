@@ -1058,6 +1058,21 @@ async function repairProvider(job, provider, jobs) {
   // Capable servers escrow completed sources before formatting, so Local queue
   // latency or a disabled formatter cannot monopolize browser slots.
   if(job.captureProtocol===1 && (!sourceArchiveDurable(state) || capturePersistence.has(`${job.origin}:${job.jobId}:${provider}`)))return;
+  // Local repair is off but the reply was captured non-JSON/invalid: deliver the durable source
+  // verbatim so the server salvages it (raw_review) instead of leaving a genuinely unparseable
+  // (not merely schema-invalid) reply pending forever. Repair, when enabled, still runs below.
+  if(!job.localJsonRepairEnabled && !state.delivered &&
+     (state.formatError || state.observation?.state==="response_completed_json_invalid")) {
+    const salvage=await readRepairSource(job,provider);
+    if(salvage?.text) {
+      state.outcome={ok:true,raw:salvage.text,originalText:salvage.text};
+      delete state.formatError;
+      workerStep(job,provider,"salvaged_no_repair");
+      await saveJobs(jobs);
+      await deliverOutcome(job,provider,jobs);
+    }
+    return;
+  }
   let attempt=state.repairAttempt;
   if(attempt?.id) {
     const response=await api("/api/bridge",repairBody(job,provider,"repair-status",attempt),job.origin);

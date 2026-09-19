@@ -63,27 +63,27 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
+/** Render model/operator-controlled text inert to the body's HTML-comment delimiters and markers so
+ * it cannot forge or break the raw wrapper or the findings marker. Entities still display as `<!--` /
+ * `-->` in the GitHub body. Applied to EVERY interpolated field (never to the literal wrapper the code
+ * emits), so exactly one genuine raw pair exists and public redaction is unambiguous. */
+function neutralizeMarkers(s: string): string {
+  return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
+}
+
 export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage" | "rawReview">, findings: Finding[], username: string, unanchored: Finding[] = []): string {
   const sha = job.headSha.slice(0, 7);
   const n = countBySeverity(findings);
-  const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4);
+  const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4).map(neutralizeMarkers);
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = providers.includes("local");
-  // Neutralize any clean-pass sentinel embedded in the verbatim reply (e.g. the model's whole answer
-  // was "Didn't find any major issues.") so a body consumer matching CLEAN_REVIEW_BODY — including the
-  // loop poller's `Didn.t find any major issues` regex — cannot converge on a deliberately non-clean body.
-  const rawReview = (job.rawReview ?? "")
-    .trim()
-    // Neutralize the loop poller's clean-pass sentinel (so a salvaged body can't read as clean).
-    // Match the SAME separator set the poller accepts (`Didn.t …` — any single char, not just
-    // apostrophes), so variants like `Didnʼt` or a backtick are neutralized too…
-    .replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)")
-    // …and HTML-comment markers, so model-controlled text cannot forge/break the raw delimiters or
-    // the findings marker (which would let injected text escape the public redaction). Entities still
-    // render as `<!--` / `-->` in the GitHub body but are inert to the delimiter/marker parsers.
-    .replace(/<!--/g, "&lt;!--")
-    .replace(/-->/g, "--&gt;");
+  // Neutralize the loop poller's clean-pass sentinel (matching the SAME separator set it accepts,
+  // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
+  // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
+  const rawReview = neutralizeMarkers(
+    (job.rawReview ?? "").trim().replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)"),
+  );
   const rawBlock = rawReview
     ? `\n**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.** Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${REVIEW_RAW_START}\n${rawReview}\n${REVIEW_RAW_END}\n`
     : "";
@@ -117,11 +117,11 @@ Not a clean pass — remaining reviewers did not run.`;
   const unanchoredBlock = unanchored.length
     ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored
         .map((f) => {
-          const detail = [f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
+          const detail = neutralizeMarkers([f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
             .map((s) => s.trim())
             .filter(Boolean)
-            .join(" — ");
-          return `- ${severityBadgeMarkdown(f.severity)} \`${f.file}:${f.line}\` — **${f.title}**${detail ? `\n  ${detail}` : ""}`;
+            .join(" — "));
+          return `- ${severityBadgeMarkdown(f.severity)} \`${neutralizeMarkers(f.file)}:${f.line}\` — **${neutralizeMarkers(f.title)}**${detail ? `\n  ${detail}` : ""}`;
         })
         .join("\n")}\n`
     : "";
@@ -149,7 +149,7 @@ Inline comments use P0 / P1 / P2 badges. Failures in one reviewer are skipped; r
 
 </details>
 
-— ${username}
+— ${neutralizeMarkers(username)}
 <!-- ashlar-findings total=${findings.length} inline=${findings.length - unanchored.length} body=${unanchored.length} p0=${n.P0} p1=${n.P1} p2=${n.P2} -->
 `);
 }

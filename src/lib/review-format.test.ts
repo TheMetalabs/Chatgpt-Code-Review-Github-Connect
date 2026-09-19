@@ -72,6 +72,17 @@ describe("review-format", () => {
     assert.doesNotMatch(pub, /REAL private source echo/); // the genuine (last) wrapper is redacted despite the decoy
   });
 
+  it("redacts the real raw block even when a decoy wrapper is injected via a field rendered after it (username)", () => {
+    const body = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "REAL private source echo" },
+      [FINDING_412],
+      `evil ${REVIEW_RAW_START} junk ${REVIEW_RAW_END}`,
+      [FINDING_412],
+    );
+    const pub = redactSalvagedReviewBody(body);
+    assert.doesNotMatch(pub, /REAL private source echo/); // username decoy neutralized; genuine block redacted
+  });
+
   it("caps an oversized salvaged body under GitHub's limit while preserving the marker", () => {
     const body = reviewSummaryBody(
       { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "x".repeat(200_000) },

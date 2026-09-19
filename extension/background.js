@@ -681,15 +681,16 @@ async function cleanupProviderBody(job, provider, jobs) {
   }
 }
 
-async function retireCleanJob(job, jobs) {
+async function retireCleanJob(job, jobs, forgotten = false) {
   if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
   // Final trace uploading terminal events (result_saved, tab_closed) to review history. Detach it ONLY
-  // when the server has genuinely forgotten the job (missing/unknown): recordBridgeProgress can't find
-  // the evicted job so the upload is rejected, and the bridge fetch is unbounded — awaiting it would
-  // hang retirement and the "Clear stuck jobs" sweep. For every other terminal state — including explicit
-  // cancellation, where cancelHarborJob keeps the lease and recordBridgeProgress still accepts the trace
-  // (no awaiting_chat requirement) — AWAIT so those events reach history before the job is deleted.
-  if (["missing", "unknown"].includes(job.serverStatus)) void flushProgress(job).catch(() => {});
+  // for a job the caller FRESHLY confirmed the server has forgotten (missing/unknown): recordBridgeProgress
+  // can't find the evicted job so the upload is rejected, and the bridge fetch is unbounded — awaiting it
+  // would hang retirement and the "Clear stuck jobs" sweep. Otherwise AWAIT, so the events reach history
+  // before deletion. The flag must come from a fresh probe (the clear sweep), NOT from job.serverStatus:
+  // advanceJob retires on its early return BEFORE its next heartbeat, so that cached status can be a stale
+  // "missing" for a job the bridge already restored — detaching there would drop a live job's history.
+  if (forgotten) void flushProgress(job).catch(() => {});
   else await flushProgress(job).catch(() => {});
   await writeInOrder(async () => {
     const old = await chrome.storage.session.get(["tabs"]);
@@ -1146,7 +1147,10 @@ async function providerTabGone(job, provider) {
  * starve admission. Explicit cancellation force-closes every leg; a forgotten job only
  * abandons legs whose tab is truly gone, so an open tab still holding an unharvested
  * answer is preserved. Returns true when the whole job was retired. */
-async function abandonForgottenJob(job, jobs, explicit) {
+async function abandonForgottenJob(job, jobs, status) {
+  // status is the FRESH probe verdict from the clear sweep. Cancellation force-closes every leg (the
+  // operator meant to stop it); a missing/unknown job only abandons legs whose tab is truly gone.
+  const explicit = status === "cancelled";
   const abandon = [];
   for (const provider of job.providers) {
     if (explicit || await providerTabGone(job, provider)) abandon.push(provider);
@@ -1160,7 +1164,9 @@ async function abandonForgottenJob(job, jobs, explicit) {
   }
   await saveJobs(jobs);
   await joinLanes(abandon.map(provider => cleanupProvider(job, provider, jobs)));
-  return retireCleanJob(job, jobs); // detach vs await is derived from serverStatus (missing/unknown → detach)
+  // Detach the final trace only for a freshly-confirmed missing/unknown job (server evicted it → upload
+  // rejected and the fetch may hang); a cancelled job keeps its lease, so its trace is awaited.
+  return retireCleanJob(job, jobs, ["missing", "unknown"].includes(status));
 }
 
 /** Popup-triggered sweep for jobs the server has forgotten (missing/unknown) or cancelled whose tabs
@@ -1199,7 +1205,9 @@ async function clearStuckJobs(deadlineMs = 15_000) {
       if (!probed) return;
       const status = job.serverStatus;
       if (!["cancelled", "missing", "unknown"].includes(status)) return;
-      if (await abandonForgottenJob(job, jobs, status === "cancelled") === true) cleared += 1;
+      // Pass the FRESH status: abandonForgottenJob derives both force-close (cancelled) and trace-detach
+      // (missing/unknown) from it — the detach flag must come from this probe, never stale serverStatus.
+      if (await abandonForgottenJob(job, jobs, status) === true) cleared += 1;
     }));
     // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops that
     // no deadline covers, so awaiting it could strand the response. Fire-and-forget; the popup polls
@@ -1227,7 +1235,7 @@ async function advanceJob(job, jobs) {
     }
     await saveJobs(jobs);
     await joinLanes(job.providers.map(p => cleanupProvider(job, p, jobs)));
-    await retireCleanJob(job, jobs); // cancelled keeps its lease → the trace is awaited (serverStatus-derived)
+    await retireCleanJob(job, jobs); // default (await): cancelled keeps its lease, so its trace still uploads
     return;
   }
   // A "missing"/"unknown" status is deliberately NOT auto-retired: after a worker restart the

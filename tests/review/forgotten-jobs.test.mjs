@@ -155,28 +155,45 @@ test('clearStuckJobs returns when storage init stalls before the sweep (deadline
   assert.equal(res.timedOut, true, 'the deadline fired even though setup stalled');
 });
 
-test('retireCleanJob detaches the final trace for missing/unknown jobs but awaits it otherwise', { timeout: 5000 }, async () => {
-  // The final flushProgress is the only durable upload of terminal events (result_saved/tab_closed). The
-  // server evicts missing/unknown jobs, so that upload is rejected and its unbounded fetch must be
-  // detached (never blocks the sweep). A cancelled job keeps its lease — recordBridgeProgress still
-  // records the trace — so it (like any tracked job) must AWAIT the upload before deletion. A wedged
-  // "progress" upload separates the two, keyed off serverStatus.
-  const b = background({
-    local: storage({ origin: 'http://bridge', token: 'token' }),
-    api: async (_p, body) => (body?.action === 'progress' ? new Promise(() => {}) : { ok: true }),
-  });
-  const cleanJob = (serverStatus) => ({
-    jobId: 'J', origin: 'http://bridge', leaseId: 'l', providers: ['chatgpt'], serverStatus,
-    states: { chatgpt: { delivered: true, cleanupDone: true, runId: 'r', workerEvents: [{ stage: 'result_saved', at: 1 }] } },
-  });
-  const jf = { J: cleanJob('missing') }; // forgotten → detached: retires despite the hung upload
-  assert.equal(await b.context.retireCleanJob(jf.J, jf), true);
-  assert.equal('J' in jf, false, 'a missing job retires without waiting on the (rejected) hung trace');
-  const jc = { J: cleanJob('cancelled') }; // cancelled keeps its lease → awaited: must not resolve while hung
+const traceHarness = () => background({
+  local: storage({ origin: 'http://bridge', token: 'token' }),
+  api: async (_p, body) => (body?.action === 'progress' ? new Promise(() => {}) : { ok: true }), // wedge the trace upload
+});
+const cleanTraceJob = (serverStatus, tabId) => ({
+  jobId: 'J', origin: 'http://bridge', leaseId: 'l', providers: ['chatgpt'], serverStatus,
+  states: { chatgpt: { delivered: true, cleanupDone: true, tabId, started: true, runId: 'r', workerEvents: [{ stage: 'result_saved', at: 1 }] } },
+});
+
+test('retireCleanJob detaches only when told forgotten, never from a stale serverStatus', { timeout: 5000 }, async () => {
+  // The final flushProgress is the only durable upload of terminal events (result_saved/tab_closed).
+  // Detachment must come from a FRESH confirmed-forgotten flag (the clear sweep), NOT job.serverStatus:
+  // advanceJob retires on its early return before its next heartbeat, so a cached "missing" can be stale
+  // for a job the bridge already restored — awaiting there keeps that live job's history durable.
+  const b = traceHarness();
+  const jf = { J: cleanTraceJob('missing') }; // confirmed forgotten (flag) → detached: retires despite the hung upload
+  assert.equal(await b.context.retireCleanJob(jf.J, jf, true), true);
+  assert.equal('J' in jf, false, 'a confirmed-forgotten job retires without waiting on the (doomed) trace');
+  const js = { J: cleanTraceJob('missing') }; // DEFAULT path with a stale cached "missing" → must still await
   const race = await Promise.race([
-    b.context.retireCleanJob(jc.J, jc).then(() => 'resolved'),
+    b.context.retireCleanJob(js.J, js).then(() => 'resolved'),
     new Promise((r) => setTimeout(() => r('pending'), 100)),
   ]);
-  assert.equal(race, 'pending', 'a cancelled retirement waits for the durable trace upload');
-  assert.ok('J' in jc, 'the cancelled job is not deleted until its trace is uploaded');
+  assert.equal(race, 'pending', 'the default (advanceJob) path awaits even when serverStatus is a stale missing');
+  assert.ok('J' in js, 'the possibly-restored job is not deleted until its trace uploads');
+});
+
+test('abandonForgottenJob detaches a missing job but awaits a cancelled one (sweep derivation)', { timeout: 5000 }, async () => {
+  // The sweep passes the fresh status; abandonForgottenJob detaches only missing/unknown (server evicted
+  // → upload doomed) and AWAITS cancelled (lease retained → recordBridgeProgress still records it).
+  const b = traceHarness();
+  const jm = { J: cleanTraceJob('missing', 99) }; // tab 99 absent → leg is gone
+  assert.equal(await b.context.abandonForgottenJob(jm.J, jm, 'missing'), true);
+  assert.equal('J' in jm, false, 'a missing job retires without waiting on the (rejected) trace');
+  const jc = { J: cleanTraceJob('cancelled', 99) };
+  const race = await Promise.race([
+    b.context.abandonForgottenJob(jc.J, jc, 'cancelled').then(() => 'resolved'),
+    new Promise((r) => setTimeout(() => r('pending'), 100)),
+  ]);
+  assert.equal(race, 'pending', 'a swept cancelled job awaits its trace upload before retiring');
+  assert.ok('J' in jc, 'the cancelled job is not deleted until its trace uploads');
 });

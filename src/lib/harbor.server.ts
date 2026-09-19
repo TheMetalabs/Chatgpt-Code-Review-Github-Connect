@@ -18,6 +18,7 @@ import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot,
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm } from "./local-llm.server";
+import { runLocalReviewLoop } from "./local-review-loop.server";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -44,6 +45,10 @@ let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
 const localInFlight = new Set<string>();
 const localControllers = new Map<string, AbortController>();
+// In-memory only (never persisted): the snapshot the local multi-turn loop reads files from.
+// Kept just for the life of the local leg so the loop's tools serve changed-file content without
+// re-fetching the PR. Chat legs never touch this.
+const localSamples = new Map<string, SamplePr>();
 
 export type HarborState = {
   settings: BotSettings;
@@ -125,6 +130,7 @@ export function resetHarbor() {
   for (const controller of localControllers.values()) controller.abort();
   localControllers.clear();
   localInFlight.clear();
+  localSamples.clear();
   for (const job of state.jobs) recordJobHistory(isLive(job.status)
     ? {...job, status: "cancelled", skipReason: "operator reset", updatedAt: Date.now()} : job);
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
@@ -133,6 +139,7 @@ export function resetHarbor() {
 export function cancelHarborJob(jobId: string) {
   cancelLocalJsonRepairs("superseded", jobId);
   localControllers.get(jobId)?.abort();
+  localSamples.delete(jobId);
   state = {
     ...state,
     jobs: state.jobs.map((j) =>
@@ -553,6 +560,8 @@ async function playGithub(jobId: string, untrustedBody: string) {
   if (admitted) void reactQuiet(token, admitted, "eyes");
   void watchReviewers(jobId, token);
   if (providers.includes("local")) {
+    // The loop reads files from this snapshot; harmless for single-turn mode (unused there).
+    localSamples.set(jobId, sample);
     void kickLocalRace(jobId, prompt);
   }
 }
@@ -574,9 +583,31 @@ async function kickLocalRace(jobId: string, prompt: string) {
   void attachLocalLeg(jobId, prompt, { submit: true });
 }
 
+// "multiturn" runs the SDK tool loop over the fetched snapshot; peers already stored on the job are
+// injected as data each turn (never waited on). "single" (or a missing snapshot, e.g. a late
+// bridge-fallback kick after restart) uses the one-shot prompt. Either way the result is one local
+// leg for the unchanged schema-merge.
+async function generateLocalLeg(
+  jobId: string,
+  prompt: string,
+): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
+  const signal = localControllers.get(jobId)?.signal;
+  const sample = localSamples.get(jobId);
+  if (state.settings.localReviewMode === "multiturn" && sample) {
+    return runLocalReviewLoop(sample, state.settings, {
+      signal,
+      peerReported: () =>
+        (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? [])
+          .filter((l) => l.provider !== "local" && l.raw.trim())
+          .map((l) => ({ provider: l.provider, raw: l.raw })),
+    });
+  }
+  return runLocalLlm(prompt, state.settings, signal);
+}
+
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
   try {
-    const local = await runLocalLlm(prompt, state.settings, localControllers.get(jobId)?.signal);
+    const local = await generateLocalLeg(jobId, prompt);
     try {
       reviewHistory().recordServerStep(jobId,local.ok?"local.response_received":"local.failed");
       if(!local.ok && local.originalText)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,local.originalText,local.originalText.length,local.originalText.length>128_000);
@@ -604,6 +635,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
   } finally {
     localInFlight.delete(jobId);
     localControllers.delete(jobId);
+    localSamples.delete(jobId);
     if (opts?.submit) {
       const job = state.jobs.find((j) => j.id === jobId);
       const legs = (job?.storedLegs ?? []).filter((l) => l.raw.trim());

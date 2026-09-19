@@ -683,8 +683,9 @@ async function cleanupProviderBody(job, provider, jobs) {
 
 async function retireCleanJob(job, jobs) {
   if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
-  // Closing the tab frees capacity, but its final trace must be acknowledged before retirement.
-  await flushProgress(job);
+  // Best-effort final trace: a server that has forgotten this job (missing/unknown) can no
+  // longer acknowledge it, so retirement must not hinge on this diagnostics RPC succeeding.
+  await flushProgress(job).catch(() => {});
   await writeInOrder(async () => {
     const old = await chrome.storage.session.get(["tabs"]);
     const tabs = {...old.tabs};
@@ -1103,6 +1104,61 @@ async function repairProvider(job, provider, jobs) {
   }
 }
 
+/** A server-forgotten job must not wait forever for a tab that is already gone.
+ * True only when neither the recorded tab nor any owned provider tab is still live. */
+async function providerTabGone(job, provider) {
+  const state = job.states[provider];
+  if (!state.tabId && !state.started) return true;
+  if (state.tabId) {
+    try {
+      const tab = await chrome.tabs.get(state.tabId);
+      if (allowedTab(tab, provider)) return false;
+    } catch { /* recorded tab is gone; fall through to a full owned-tab search */ }
+  }
+  return !(await findOriginalTab(job, provider));
+}
+
+/** The bridge job registry is in-memory only, so a job the server used to own that now
+ * reports missing/unknown (typically after a restart) is gone for good — its legs can
+ * never be delivered again and must be retired, or they pile up in recovery/cleanup and
+ * starve admission. Explicit cancellation force-closes every leg; a forgotten job only
+ * abandons legs whose tab is truly gone, so an open tab still holding an unharvested
+ * answer is preserved. Returns true when the whole job was retired. */
+async function abandonForgottenJob(job, jobs, explicit) {
+  const abandon = [];
+  for (const provider of job.providers) {
+    if (explicit || await providerTabGone(job, provider)) abandon.push(provider);
+  }
+  if (!abandon.length) return false;
+  for (const provider of abandon) {
+    const state = job.states[provider];
+    state.delivered = true;      // terminal: the server can never accept this leg again
+    state.cleanupPending = true;
+    state.closeRequested = true; // a confirmed-absent tab finishes cleanup instead of waiting for a reconnection that never comes
+  }
+  await saveJobs(jobs);
+  await joinLanes(abandon.map(provider => cleanupProvider(job, provider, jobs)));
+  return retireCleanJob(job, jobs);
+}
+
+/** Popup-triggered sweep for jobs the server has permanently forgotten (missing/unknown)
+ * or cancelled whose tabs are gone. Never touches a job with a live tab or one the server
+ * still owns. Returns how many were cleared so the operator gets a definite result. */
+async function clearStuckJobs() {
+  const cfg = await settings();
+  if (!cfg.enabled || !cfg.origin || !cfg.token) return { ok: false, error: "set the Ashlar origin and token first" };
+  const jobs = await workerJobs(cfg.origin);
+  let cleared = 0, kept = 0;
+  for (const job of Object.values(jobs).filter(j => j.origin === cfg.origin)) {
+    // A probe failure is not proof the server forgot the job; only retire on a definite verdict.
+    const active = await heartbeat(job, jobs).catch(() => true);
+    if (active || !["cancelled", "missing", "unknown"].includes(job.serverStatus)) { kept += 1; continue; }
+    if (await abandonForgottenJob(job, jobs, job.serverStatus === "cancelled")) cleared += 1; else kept += 1;
+  }
+  await recordWorkerStatus(jobs, cfg.origin);
+  return { ok: true, cleared, kept };
+}
+
 async function advanceJob(job, jobs) {
   // Cleanup is independent of server availability once acknowledgement was persisted.
   await joinLanes(job.providers.map(p => cleanupProvider(job, p, jobs)));
@@ -1118,6 +1174,10 @@ async function advanceJob(job, jobs) {
     await retireCleanJob(job, jobs);
     return;
   }
+  // A "missing"/"unknown" status is deliberately NOT auto-retired: after a worker restart the
+  // tab can re-bind, so such work must not be discarded (and it is already kept out of the
+  // capacity count). An operator clears provably-dead forgotten jobs on demand via the popup
+  // ("Clear stuck jobs" → clearStuckJobs), which only abandons legs whose tab is truly gone.
   const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
   // Missing is not ACK: observe and preserve the original response without redelivery.
   if (active && !job.prompt && job.providers.some(p=>!job.states[p].delivered && !sourceArchiveDurable(job.states[p]))) {
@@ -1371,6 +1431,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "ashlar-poll-now") {
     void probeBridge(); void heartbeatTick(); void tick();
     sendResponse({ok:true,scheduled:true}); return;
+  }
+  if (message?.type === "ashlar-clear-stuck") {
+    clearStuckJobs().then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
+    return true;
   }
   if (message?.type === "ashlar-maintenance-acquire") {
     void acquireMaintenance(message.id,message.mode).then(sendResponse,error=>sendResponse({ok:false,error:String(error?.message||error)})); return true;

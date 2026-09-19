@@ -38,7 +38,11 @@ test('only completed non-JSON content gets one semantic retry', async () => {
   const c = local(['prose', raw]);
   assert.equal((await c.context.runLocalLlm('review', settings)).raw, raw);
   assert.equal(c.calls.length, 2);
-  assert.equal(c.calls[1][2].messages[2].content, 'prose');
+  // The retry does NOT echo the prior reply back (that could overflow the context window); it is the
+  // original prompt plus a JSON-only nudge, never larger than the first call.
+  const retryMsgs = c.calls[1][2].messages;
+  assert.equal(retryMsgs.every((m) => m.content !== 'prose'), true, 'prior non-JSON reply is not echoed into the retry');
+  assert.match(retryMsgs[retryMsgs.length - 1].content, /ONLY the JSON object/);
 });
 test('network errors do not replay model requests; health checks also have no automatic deadline', async () => {
   const c = local([new Error('connection closed')]);

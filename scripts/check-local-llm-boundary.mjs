@@ -56,7 +56,9 @@ function git(args) {
 const changed = new Set();
 try {
   // Committed on this branch + all tracked working-tree changes vs the base.
-  for (const f of git(["diff", "--name-only", BASE])) changed.add(f);
+  // --no-renames: a rename is reported as delete(old)+add(new), so a frozen file renamed onto an
+  // allowlisted path still surfaces its (forbidden) source path instead of hiding behind the destination.
+  for (const f of git(["diff", "--name-only", "--no-renames", BASE])) changed.add(f);
   // Untracked files.
   for (const f of git(["ls-files", "--others", "--exclude-standard"])) changed.add(f);
 } catch (e) {

@@ -343,16 +343,27 @@ async function reviewGroup(
     if (forceFinal) break; // tool_choice:"none" is ignored by some servers; never execute post-final calls.
     let done = false;
     let taskFailed = false;
+    // Bound BOTH each result and the aggregate across a parallel tool_calls array, so a batch of
+    // calls cannot each add 40K before the next context check runs.
+    const PER_TOOL_CAP = 40_000;
+    const TURN_TOOL_CAP = 80_000;
+    let turnToolChars = 0;
     for (const c of calls) {
       let args: Record<string, unknown> = {};
       try { args = JSON.parse(c.function?.arguments || "{}"); } catch { /* malformed args → empty */ }
-      const out = await runTool(c.function?.name || "", args);
       if (c.function?.name === "task_done") {
         done = true;
         if (args.state === "FAILED") taskFailed = true;
       }
-      // Cap each tool result so one call cannot blow memory; contextTokens() counts it for the cap.
-      messages.push({ role: "tool", tool_call_id: c.id, content: String(out).slice(0, 40_000) });
+      let served: string;
+      if (turnToolChars >= TURN_TOOL_CAP) {
+        served = "(tool output omitted: per-turn output budget reached)";
+      } else {
+        const out = String(await runTool(c.function?.name || "", args)).slice(0, Math.min(PER_TOOL_CAP, TURN_TOOL_CAP - turnToolChars));
+        served = out;
+        turnToolChars += out.length;
+      }
+      messages.push({ role: "tool", tool_call_id: c.id, content: served });
     }
     // The model explicitly could not finish this group — fail it (→ not_cleared) rather than
     // accepting whatever JSON is around as a completed review.

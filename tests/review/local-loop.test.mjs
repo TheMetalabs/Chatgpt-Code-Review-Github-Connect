@@ -305,6 +305,17 @@ test("merge keeps only findings that will survive the downstream gate", async ()
   assert.equal(merged.findings.some((f) => f.line === 9), false, "gate-failing incomplete finding is dropped from the merge");
 });
 
+test("aggregate tool output across a parallel batch is bounded", async () => {
+  const big = { path: "src/big.ts", content: Array.from({ length: 400 }, () => "x".repeat(300)).join("\n"), language: "ts" };
+  const sample = sampleWith(["src/big.ts"]);
+  sample.files = [big];
+  const calls = Array.from({ length: 5 }, (_, i) => toolCall("file_read", { file_path: "src/big.ts" }, `c${i}`));
+  const { request, bodies } = mock([assistant("", calls), assistant(REVIEW_JSON)]);
+  await runLocalReviewLoop(sample, settings, { request });
+  const toolChars = bodies[1].messages.filter((m) => m.role === "tool").reduce((n, m) => n + m.content.length, 0);
+  assert.ok(toolChars <= 81_000, `aggregate tool output bounded per turn, got ${toolChars}`);
+});
+
 test("no reviewer JSON across groups is an explicit failure, not an empty pass", async () => {
   const { request } = mock([assistant("I could not find the file, sorry.")]);
   const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });

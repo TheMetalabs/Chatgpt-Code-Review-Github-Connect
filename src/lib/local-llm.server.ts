@@ -98,16 +98,16 @@ export async function runLocalLlm(
     const firstJson = extractChatJson(raw);
     if (firstJson) return { ok: true, raw: firstJson, originalText: raw };
 
-    // Exactly one semantic retry, and only after an actual completed non-JSON reply. Bound the prior
-    // reply echoed back: a huge first response plus the full prompt and the same max_tokens budget
-    // could otherwise overflow a finite context window on the correction call.
+    // Exactly one semantic retry, and only after an actual completed non-JSON reply. Do NOT echo the
+    // prior reply back: adding it on top of the full prompt and the same max_tokens budget could
+    // overflow a finite context window. The retry is the original prompt plus a JSON-only nudge, so
+    // it is never larger than the first call (which already fit).
     const raw2 = await call([
       {
         role: "system",
         content: "You are Ashlar. Return ONLY a single JSON object with keys findings, merge_recommendation, keep. No prose, no markdown fences.",
       },
       { role: "user", content: prompt },
-      { role: "assistant", content: raw.slice(0, 12_000) },
       {
         role: "user",
         content: "Your previous reply was not extractable review JSON. Reply again with ONLY the JSON object (findings/merge_recommendation/keep). No markdown.",

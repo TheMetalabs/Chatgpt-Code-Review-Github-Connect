@@ -403,3 +403,27 @@ test('autoSweepStuckJobs releases its lock even when a storage read hangs (watch
   await b.context.autoSweepStuckJobs(60); // 60ms watchdog; returns here or the test times out
   assert.ok(true, 'autoSweepStuckJobs returned (lock released) despite a wedged storage read');
 });
+
+test('an aborted sweep stops mutating after a storage op resumes past the watchdog (generation fence)', { timeout: 5000 }, async () => {
+  // The watchdog can release the lock while a chrome.storage op (unabortable) is still pending; when it
+  // later resolves, the detached sweep must NOT resume and deliver concurrently with the next sweep. The
+  // signal-aborted fence before each post-await mutation stops it: here the saveJobs after stamping the
+  // stalled outcome hangs; we abort during the hang, release it, and assert deliverOutcome is never reached.
+  const controller = new AbortController();
+  let releaseSet;
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token',
+      pendingReviewJobs: { A: makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE }) } }),
+    tabs: new Map(),
+    handler: () => ({ ok: false, code: 'job_mismatch' }),
+    api: async () => ({ ok: true }),
+  });
+  const realSet = b.local.set;
+  b.local.set = (items) => new Promise((resolve) => { releaseSet = () => resolve(realSet(items)); }); // hang the first set
+  const sweep = b.context.runStuckSweep({ includeStalled: true, signal: controller.signal });
+  while (!releaseSet) await new Promise((r) => setTimeout(r, 5)); // wait until the sweep is wedged in saveJobs
+  controller.abort(); // watchdog fires during the storage hang
+  releaseSet();       // the storage op finally resolves → the sweep resumes
+  await sweep;
+  assert.ok(!b.calls.some((c) => c.action === 'failure'), 'the aborted sweep did not deliver after its storage op resumed');
+});

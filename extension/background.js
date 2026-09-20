@@ -1149,7 +1149,7 @@ async function providerTabGone(job, provider) {
  * starve admission. Explicit cancellation force-closes every leg; a forgotten job only
  * abandons legs whose tab is truly gone, so an open tab still holding an unharvested
  * answer is preserved. Returns true when the whole job was retired. */
-async function abandonForgottenJob(job, jobs, status) {
+async function abandonForgottenJob(job, jobs, status, signal) {
   // status is the FRESH probe verdict from the clear sweep. Cancellation force-closes every leg (the
   // operator meant to stop it); a missing/unknown job only abandons legs whose tab is truly gone.
   const explicit = status === "cancelled";
@@ -1158,6 +1158,9 @@ async function abandonForgottenJob(job, jobs, status) {
     if (explicit || await providerTabGone(job, provider)) abandon.push(provider);
   }
   if (!abandon.length) return false;
+  // Generation fence: providerTabGone above may have outlived the sweep's watchdog. Bail before mutating
+  // so an abandoned sweep never marks legs delivered under a newer sweep's ownership.
+  if (signal?.aborted) return false;
   for (const provider of abandon) {
     const state = job.states[provider];
     state.delivered = true;      // terminal: the server can never accept this leg again
@@ -1168,7 +1171,7 @@ async function abandonForgottenJob(job, jobs, status) {
   await joinLanes(abandon.map(provider => cleanupProvider(job, provider, jobs)));
   // Detach the final trace only for a freshly-confirmed missing/unknown job (server evicted it → upload
   // rejected and the fetch may hang); a cancelled job keeps its lease, so its trace is awaited.
-  return retireCleanJob(job, jobs, ["missing", "unknown"].includes(status));
+  return retireCleanJob(job, jobs, ["missing", "unknown"].includes(status), signal);
 }
 
 // A job counts as "stalled" once it made progress (has a worker/page event) but has gone quiet past
@@ -1226,6 +1229,11 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
   const isForgotten = job => ["cancelled", "missing", "unknown"].includes(job.serverStatus);
   const candidates = mine.filter(job => isForgotten(job) || (includeStalled && jobStale(job, staleMs)));
   await Promise.allSettled(candidates.map(async job => {
+    // Generation fence: if the watchdog aborted this sweep (a chrome.storage/tabs op outlived it), a newer
+    // sweep now owns the registry. Bail before every post-await mutation so the abandoned sweep can never
+    // resume and mutate/re-send concurrently. signal is per-sweep, so a fresh (or manual, undefined) sweep
+    // never trips this.
+    if (signal?.aborted) return;
     if (isForgotten(job)) {
       // Abandon only on a FRESH, reachable confirmation the job is STILL forgotten. heartbeat reports
       // active:false for ANY non-active status (validator/posting/…) and stores it in job.serverStatus —
@@ -1243,7 +1251,8 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
       if (!probed) return;
       const status = job.serverStatus;
       if (!["cancelled", "missing", "unknown"].includes(status)) return;
-      if (await abandonForgottenJob(job, jobs, status) === true) counter.cleared += 1;
+      if (signal?.aborted) return;
+      if (await abandonForgottenJob(job, jobs, status, signal) === true) counter.cleared += 1;
     } else {
       // Stalled + tab-gone: the chat tab is gone, so the leg can never produce a result — but the server
       // may STILL own the job (awaiting_chat). A bare local delete would leave the server's leg pending
@@ -1286,7 +1295,9 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
           state.closeRequested = true;
         }
       }
+      if (signal?.aborted) return; // a slow providerTabGone/storage read may have outlived the watchdog
       await saveJobs(jobs);
+      if (signal?.aborted) return;
       // Deliver a newly-stamped failure (deliverOutcome sends it + cleans up on ACK); for an
       // already-delivered leg whose closeRequested we just set, deliverOutcome early-returns, so finish its
       // cleanup with a direct call. Both are idempotent and no-op a leg we deliberately left alone.
@@ -1294,6 +1305,7 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
         (job.states[provider].delivered
           ? cleanupProvider(job, provider, jobs)
           : deliverOutcome(job, provider, jobs, signal)).catch(() => {})));
+      if (signal?.aborted) return;
       if (await retireCleanJob(job, jobs, false, signal) === true) counter.cleared += 1;
     }
   }));

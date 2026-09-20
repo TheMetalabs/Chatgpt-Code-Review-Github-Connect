@@ -1244,7 +1244,7 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}
       // retained if the server is unreachable. A live-tab provider is left alone (may still answer).
       for (const provider of job.providers) {
         const state = job.states[provider];
-        if (state.delivered || state.outcome) continue;
+        if (state.delivered) continue;
         // A leg with a durably-archived source is owned by the repair/salvage pipeline, not the tab:
         // cleanupProvider closes its tab ON PURPOSE and the server-side JSON repair may run arbitrarily
         // long without appending events. Its tab-absence + quiet is EXPECTED, not a stall — a fabricated
@@ -1257,7 +1257,15 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}
         // different leg's old events, so the per-leg guard is essential.)
         if (!state.started && !state.tabId) continue;
         if (!(await providerTabGone(job, provider))) continue;
+        // A NORMAL saved outcome (a valid response, or an explicit failure) is handled by the delivery
+        // flow — never fabricate a tab_closed over a valid saved review. But a formatError outcome (the
+        // server returned 422 json_repair_required) whose source never became durable and whose tab is
+        // now gone can NEVER be repaired or delivered — readRepairSource has no tab and delivery loops on
+        // 422 — so a sole-provider job would sit awaiting_chat forever. Settle it (and any no-outcome leg)
+        // with a terminal failure.
+        if (state.outcome && !state.formatError) continue;
         state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
+        delete state.formatError;
         state.closeRequested = true; // tab confirmed gone → cleanup finishes on absence, not a reconnection that never comes
       }
       await saveJobs(jobs);

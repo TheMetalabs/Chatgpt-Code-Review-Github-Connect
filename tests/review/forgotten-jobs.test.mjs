@@ -315,3 +315,19 @@ test('clearStuckJobs({includeStalled}) never fails a leg whose source is durably
   assert.equal(b.calls.filter((c) => c.action === 'failure').length, 0, 'no tab_closed failure is sent for a durable-source leg');
   assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}), 'the repairing job is kept for the repair pipeline to finish');
 });
+
+test('clearStuckJobs({includeStalled}) settles a stuck 422 format-error leg once its tab is gone', async () => {
+  // A saved response was rejected 422 json_repair_required (outcome + formatError, not durable). If the
+  // tab then disappears, repair can't recover (no tab for readRepairSource) and delivery loops on 422, so
+  // a sole-provider job sits awaiting_chat forever. The sweep must NOT skip it on "has an outcome" —
+  // it replaces the un-repairable outcome with a terminal failure so the job can terminate.
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.outcome = { ok: true, raw: '{"findings":[]}' };
+  job.states.chatgpt.formatError = true; // 422 json_repair_required, source not durable
+  const b = harness([job]); // tab 10 gone
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 1, 'the un-repairable format-error leg is settled and the job retired');
+  assert.ok(b.calls.some((c) => c.action === 'failure' && c.jobId === 'A'), 'a terminal failure was reported');
+  assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
+});

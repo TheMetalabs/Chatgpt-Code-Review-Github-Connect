@@ -516,3 +516,19 @@ test('retireCleanJob does not delete when aborted DURING its retirement writes (
   assert.equal(await retire, false, 'retireCleanJob bailed at the fence after the retirement writes');
   assert.ok('J' in jobs, 'the job was NOT deleted');
 });
+
+test("the sweep's worker-status refresh is single-flighted (no per-minute accumulation)", { timeout: 5000 }, async () => {
+  // recordWorkerStatus is fire-and-forget at the end of the sweep. If it stalls in an unbounded tab/storage
+  // op, running it again every alarm would pile up pending refreshes. Single-flighting means a second sweep
+  // started while the first refresh is still pending launches no new one.
+  let refreshes = 0;
+  const b = harness([]); // no candidates → the sweep goes straight to the status refresh
+  // recordWorkerStatus → tabCapacityReport → chrome.tabs.query, which runs BEFORE the (serialized)
+  // status write. Wedge + count it to count how many refreshes are actually launched.
+  b.chrome.tabs.query = () => { refreshes += 1; return new Promise(() => {}); };
+  await b.context.runStuckSweep({ includeStalled: true });
+  await new Promise((r) => setTimeout(r, 15)); // let the first refresh reach the wedged query
+  await b.context.runStuckSweep({ includeStalled: true });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(refreshes, 1, 'only one worker-status refresh is launched despite two sweeps');
+});

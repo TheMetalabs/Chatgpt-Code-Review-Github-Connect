@@ -19,6 +19,7 @@ const repairLanes = new Map();
 const captureLanes = new Map();
 const capturePersistence = new Set();
 const cleanupLanes = new Map();
+const statusLanes = new Map();
 const inventoryLanes = new Map();
 const tabOwners = new Map();
 const tabEpochs = new Map();
@@ -1349,8 +1350,10 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
     }
   }));
   // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops, so
-  // awaiting it could strand the wrapper's response. Fire-and-forget; the popup polls status separately.
-  void recordWorkerStatus(jobs, cfg.origin).catch(() => {});
+  // awaiting it could strand the wrapper's response. Fire-and-forget, but SINGLE-FLIGHTED: if a prior
+  // refresh is still pending (stalled in an unbounded tab/storage op), the per-minute alarm must not stack
+  // another — singleFlight hands back the in-flight promise so at most one is ever outstanding.
+  void singleFlight(statusLanes, cfg.origin, () => recordWorkerStatus(jobs, cfg.origin)).catch(() => {});
   return { ok: true };
 }
 

@@ -448,3 +448,56 @@ test('retireCleanJob does not delete after an aborted final flush (post-flush wr
   assert.equal(await retire, false, 'retireCleanJob bailed rather than delete');
   assert.ok('J' in jobs, 'the job was NOT deleted under the aborted sweep');
 });
+
+test('clearStuckJobs({includeStalled}) salvages a durable-source leg whose repair terminally failed', async () => {
+  // A durable-source leg whose repair reached a terminal non-accepted state (needs_attention) is past the
+  // active-repair exemption, but repairProvider won't retry or settle it — the job would sit forever. The
+  // sweep salvages the archived original (delivers it verbatim as a raw_review "complete") so it terminates.
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.sourceCapture = { archiveDurable: true, text: '{"findings":[]}', totalChars: 15, sourceHash: 'h', responseId: 'r', id: 'cap' };
+  job.states.chatgpt.repairAttempt = { id: 'ra', status: 'needs_attention', sourceHash: 'h', responseId: 'r' };
+  const b = harness([job]); // tab gone
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 1, 'the terminally-failed-repair leg is salvaged and retired');
+  assert.ok(b.calls.some((c) => c.action === 'complete' && c.jobId === 'A'), 'the archived source is delivered as a salvage (complete)');
+  assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
+});
+
+test('clearStuckJobs({includeStalled}) leaves a durable-source leg with an ACTIVE repair alone', async () => {
+  // While a repair is running/committable the durable leg belongs to the repair pipeline — never salvage
+  // or fail it, or a live repair would be cancelled.
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.sourceCapture = { archiveDurable: true, text: '{"findings":[]}', totalChars: 15 };
+  job.states.chatgpt.repairAttempt = { id: 'ra', status: 'running' };
+  const b = harness([job]);
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 0, 'an active-repair durable leg is left for the repair pipeline');
+  assert.equal(b.calls.filter((c) => c.action === 'complete' || c.action === 'failure').length, 0, 'no settle attempt while repair runs');
+  assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}));
+});
+
+test('retireCleanJob does not delete when aborted DURING its retirement writes (second fence)', { timeout: 5000 }, async () => {
+  // The abort can fire after the post-flush check but while the (unabortable) session/local deletions run.
+  // A second fence AFTER those writes must stop the registry delete/persist. Here the session.get inside
+  // writeInOrder hangs; we abort during it, release it, and assert the job is not deleted.
+  const controller = new AbortController();
+  let releaseGet;
+  const session = storage();
+  const realGet = session.get;
+  session.get = (keys) => new Promise((resolve) => { releaseGet = () => resolve(realGet(keys)); }); // hang the first session read
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token' }),
+    session,
+    api: async () => ({ ok: true }),
+  });
+  const jobs = { J: { jobId: 'J', origin: 'http://bridge', leaseId: 'l', providers: ['chatgpt'],
+    states: { chatgpt: { delivered: true, cleanupDone: true, runId: 'r', workerEvents: [{ source: 'worker', sequence: 1, stage: 'result_saved', at: 1 }] } } } };
+  const retire = b.context.retireCleanJob(jobs.J, jobs, false, controller.signal);
+  while (!releaseGet) await new Promise((r) => setTimeout(r, 5)); // wait until writeInOrder's session.get is wedged (past the first fence)
+  controller.abort();
+  releaseGet();
+  assert.equal(await retire, false, 'retireCleanJob bailed at the fence after the retirement writes');
+  assert.ok('J' in jobs, 'the job was NOT deleted');
+});

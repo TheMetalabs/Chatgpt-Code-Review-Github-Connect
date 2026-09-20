@@ -705,6 +705,11 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
     await chrome.storage.session.set({tabs});
     await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
   });
+  // writeInOrder above is itself an unabortable storage sequence that can outlive the sweep watchdog.
+  // Recheck before the registry delete/persist so an abandoned sweep can't delete jobs[jobId] and rewrite
+  // pendingReviewJobs concurrently with the next alarm's sweep. (delete + saveJobs is sync-then-await, so
+  // no abort can interleave between them once we pass this fence.)
+  if (signal?.aborted) return false;
   delete jobs[job.jobId];
   await saveJobs(jobs);
   return true;
@@ -1268,11 +1273,26 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
         const state = job.states[provider];
         // Fully done — the server ACKed AND tab cleanup finished. Nothing to do.
         if (state.delivered && state.cleanupDone) continue;
-        // A leg with a durably-archived source is owned by the repair/salvage pipeline, not the tab:
-        // cleanupProvider closes its tab ON PURPOSE and the server-side JSON repair may run arbitrarily
-        // long without appending events. Its tab-absence + quiet is EXPECTED, not a stall — a fabricated
-        // tab_closed failure would cancel a valid in-flight repair and drop that provider's review.
-        if (sourceArchiveDurable(state)) continue;
+        // A durably-archived source is owned by the repair pipeline ONLY while a repair is actively
+        // running or committable (prepared/running/ready): its tab was closed ON PURPOSE and repair may
+        // run arbitrarily long without events, so settling would cancel a live repair. But a repair in a
+        // terminal non-accepted state (needs_attention/interrupted/disabled/superseded), or a durable leg
+        // with no active repair, is dead — repairProvider won't retry or settle it, so the job would sit
+        // forever. Salvage the archived original instead (deliver it verbatim as raw_review, the same
+        // terminal path as repair-off); a fabricated tab_closed failure would be dropped by deliverOutcome's
+        // durable guard anyway.
+        if (sourceArchiveDurable(state)) {
+          if (["prepared", "running", "ready"].includes(state.repairAttempt?.status)) continue;
+          if (!state.outcome) {
+            const salvage = await readRepairSource(job, provider, false); // local archived copy — no fetch, no hang
+            if (salvage?.text) {
+              state.outcome = { ok: true, raw: salvage.text, originalText: salvage.text, salvaged: true };
+              delete state.formatError;
+              workerStep(job, provider, "salvaged_no_repair");
+            }
+          }
+          continue; // salvaged (delivered in the post-loop) or nothing local to salvage — never fabricate a failure
+        }
         // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
         // stalled one — providerTabGone reports it "gone", but touching it would misreport a reviewer that
         // never ran. Only act on a leg that actually started or held a tab that is now gone. (Job-level

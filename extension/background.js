@@ -1183,6 +1183,19 @@ async function abandonForgottenJob(job, jobs, status, signal) {
   return retireCleanJob(job, jobs, ["missing", "unknown"].includes(status), signal);
 }
 
+// Canonicalize an invalid/unparseable model response into a VALID raw_review review JSON — the exact
+// envelope the server's salvageReviewJson (src/lib/extract-chat-json.ts) produces. A durable leg whose
+// repair terminally failed must be delivered with repairProtocol:1 (repair is enabled), and the bridge
+// route re-validates that raw as review JSON — sending the original invalid text would 422 forever. Wrap
+// it here so completeBridgeJob (which does NOT salvage when repair is available) stores a valid review.
+// Keep this in sync with the server's salvageReviewJson.
+function salvageReviewEnvelope(text) {
+  const s = String(text || "").trim();
+  const severities = [...new Set(s.match(/\bP[0-2]\b/g) ?? [])].sort();
+  const header = severities.length ? `Detected severity markers: ${severities.join(", ")}.\n\n` : "";
+  return JSON.stringify({ findings: [], merge_recommendation: "COMMENT", raw_review: (header + s).slice(0, 60_000) });
+}
+
 // A job counts as "stalled" once it made progress (has a worker/page event) but has gone quiet past
 // STALL_MS. Keying off an OLD event — never the ABSENCE of events — means a brand-new or still-allocating
 // job (no events yet) is never flagged, so periodic cleanup can't race admission. Generous window: a
@@ -1286,7 +1299,9 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
           if (!state.outcome) {
             const salvage = await readRepairSource(job, provider, false); // local archived copy — no fetch, no hang
             if (salvage?.text) {
-              state.outcome = { ok: true, raw: salvage.text, originalText: salvage.text, salvaged: true };
+              // Repair is enabled here (the leg had a repair attempt), so the server would re-demand
+              // repair on the raw text. Deliver the canonicalized raw_review envelope instead.
+              state.outcome = { ok: true, raw: salvageReviewEnvelope(salvage.text), originalText: salvage.text, salvaged: true };
               delete state.formatError;
               workerStep(job, provider, "salvaged_no_repair");
             }

@@ -450,17 +450,32 @@ test('retireCleanJob does not delete after an aborted final flush (post-flush wr
 });
 
 test('clearStuckJobs({includeStalled}) salvages a durable-source leg whose repair terminally failed', async () => {
-  // A durable-source leg whose repair reached a terminal non-accepted state (needs_attention) is past the
-  // active-repair exemption, but repairProvider won't retry or settle it — the job would sit forever. The
-  // sweep salvages the archived original (delivers it verbatim as a raw_review "complete") so it terminates.
+  // A durable-source leg whose repair reached a terminal state (needs_attention) is past the active-repair
+  // exemption, but repairProvider won't settle it. The sweep salvages the archived original — and because
+  // repair is enabled, the bridge route re-validates a repairProtocol:1 complete and 422s invalid JSON, so
+  // the salvage must be CANONICALIZED into a raw_review envelope; the raw prose would loop on 422 forever.
   const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
-  job.states.chatgpt.sourceCapture = { archiveDurable: true, text: '{"findings":[]}', totalChars: 15, sourceHash: 'h', responseId: 'r', id: 'cap' };
+  job.states.chatgpt.sourceCapture = { archiveDurable: true, text: 'prose, not JSON', totalChars: 15, sourceHash: 'h', responseId: 'r', id: 'cap' };
   job.states.chatgpt.repairAttempt = { id: 'ra', status: 'needs_attention', sourceHash: 'h', responseId: 'r' };
-  const b = harness([job]); // tab gone
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token', pendingReviewJobs: { A: job } }),
+    tabs: new Map(), // tab gone
+    handler: () => ({ ok: false, code: 'job_mismatch' }),
+    api: async (_p, body) => {
+      // Mirror the bridge route: a repairProtocol:1 complete whose raw is not valid review JSON is 422'd.
+      if (body?.action === 'complete' && body.repairProtocol === 1) {
+        let valid = false;
+        try { const p = JSON.parse(String(body.raw ?? '')); valid = p && Array.isArray(p.findings); } catch { /* invalid */ }
+        if (!valid) { const e = new Error('completed response requires format repair'); e.status = 422; e.code = 'json_repair_required'; throw e; }
+      }
+      return { ok: true };
+    },
+  });
   const res = await b.context.clearStuckJobs({ includeStalled: true });
   assert.equal(res.ok, true);
-  assert.equal(res.cleared, 1, 'the terminally-failed-repair leg is salvaged and retired');
-  assert.ok(b.calls.some((c) => c.action === 'complete' && c.jobId === 'A'), 'the archived source is delivered as a salvage (complete)');
+  assert.equal(res.cleared, 1, 'the terminally-failed-repair leg is salvaged (canonicalized) and retired — not looping on 422');
+  const complete = b.calls.find((c) => c.action === 'complete' && c.jobId === 'A');
+  assert.ok(complete && JSON.parse(complete.raw).raw_review.includes('prose, not JSON'), 'the original is delivered inside a valid raw_review envelope');
   assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
 });
 

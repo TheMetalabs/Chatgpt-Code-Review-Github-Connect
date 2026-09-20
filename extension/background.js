@@ -1244,32 +1244,47 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}
       // retained if the server is unreachable. A live-tab provider is left alone (may still answer).
       for (const provider of job.providers) {
         const state = job.states[provider];
-        if (state.delivered) continue;
+        // Fully done — the server ACKed AND tab cleanup finished. Nothing to do.
+        if (state.delivered && state.cleanupDone) continue;
         // A leg with a durably-archived source is owned by the repair/salvage pipeline, not the tab:
         // cleanupProvider closes its tab ON PURPOSE and the server-side JSON repair may run arbitrarily
         // long without appending events. Its tab-absence + quiet is EXPECTED, not a stall — a fabricated
         // tab_closed failure would cancel a valid in-flight repair and drop that provider's review.
         if (sourceArchiveDurable(state)) continue;
         // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
-        // stalled one — providerTabGone reports it "gone", but fabricating a tab_closed failure would tell
-        // the server that reviewer attempted and let it publish without ever running it. Only fail a leg
-        // that actually started or held a tab that is now gone. (Job-level staleness can trip on a
-        // different leg's old events, so the per-leg guard is essential.)
+        // stalled one — providerTabGone reports it "gone", but touching it would misreport a reviewer that
+        // never ran. Only act on a leg that actually started or held a tab that is now gone. (Job-level
+        // staleness can trip on a different leg's old events, so the per-leg guard is essential.)
         if (!state.started && !state.tabId) continue;
         if (!(await providerTabGone(job, provider))) continue;
-        // A NORMAL saved outcome (a valid response, or an explicit failure) is handled by the delivery
-        // flow — never fabricate a tab_closed over a valid saved review. But a formatError outcome (the
-        // server returned 422 json_repair_required) whose source never became durable and whose tab is
-        // now gone can NEVER be repaired or delivered — readRepairSource has no tab and delivery loops on
-        // 422 — so a sole-provider job would sit awaiting_chat forever. Settle it (and any no-outcome leg)
-        // with a terminal failure.
-        if (state.outcome && !state.formatError) continue;
-        state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
-        delete state.formatError;
-        state.closeRequested = true; // tab confirmed gone → cleanup finishes on absence, not a reconnection that never comes
+        if (state.delivered) {
+          // Result already ACKed, but cleanup stalled: the tab closed before closeRequested was persisted,
+          // so cleanupProviderBody loops on "original tab unavailable" and retireCleanJob never releases
+          // the job — it keeps consuming tab capacity. Confirm tab absence so cleanup can finish; the
+          // outcome is already delivered, so leave it untouched (never re-report it as a failure).
+          state.closeRequested = true;
+        } else if (state.outcome && !state.formatError) {
+          // A NORMAL saved outcome (a valid response, or an explicit failure) is handled by the delivery
+          // flow — never fabricate a tab_closed over a valid saved review.
+          continue;
+        } else {
+          // No outcome, or a formatError outcome (server returned 422 json_repair_required) whose source
+          // never became durable and whose tab is now gone — it can NEVER be repaired or delivered
+          // (readRepairSource has no tab, delivery loops on 422), so a sole-provider job would sit
+          // awaiting_chat forever. Settle it with a terminal failure.
+          state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
+          delete state.formatError;
+          state.closeRequested = true;
+        }
       }
       await saveJobs(jobs);
-      await joinLanes(job.providers.map(provider => deliverOutcome(job, provider, jobs).catch(() => {})));
+      // Deliver a newly-stamped failure (deliverOutcome sends it + cleans up on ACK); for an
+      // already-delivered leg whose closeRequested we just set, deliverOutcome early-returns, so finish its
+      // cleanup with a direct call. Both are idempotent and no-op a leg we deliberately left alone.
+      await joinLanes(job.providers.map(async provider =>
+        (job.states[provider].delivered
+          ? cleanupProvider(job, provider, jobs)
+          : deliverOutcome(job, provider, jobs)).catch(() => {})));
       if (await retireCleanJob(job, jobs) === true) counter.cleared += 1;
     }
   }));

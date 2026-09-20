@@ -331,3 +331,19 @@ test('clearStuckJobs({includeStalled}) settles a stuck 422 format-error leg once
   assert.ok(b.calls.some((c) => c.action === 'failure' && c.jobId === 'A'), 'a terminal failure was reported');
   assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
 });
+
+test('clearStuckJobs({includeStalled}) completes cleanup for a delivered leg whose tab vanished', async () => {
+  // The server ACKed the result (delivered) but the tab closed before closeRequested was persisted, so
+  // cleanupProviderBody loops on "original tab unavailable" and retireCleanJob never releases the job — it
+  // keeps consuming tab capacity. The sweep must confirm tab absence and finish cleanup, NOT skip it and
+  // NOT re-report the delivered result as a failure.
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.delivered = true;
+  job.states.chatgpt.cleanupPending = true; // cleanup started but stuck (closeRequested not persisted)
+  const b = harness([job]); // tab 10 gone
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 1, 'the delivered, tab-gone job is cleaned up and released');
+  assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0, 'no longer consuming tab capacity');
+  assert.ok(!b.calls.some((c) => c.action === 'failure'), 'a delivered leg is NOT re-reported as a failure');
+});

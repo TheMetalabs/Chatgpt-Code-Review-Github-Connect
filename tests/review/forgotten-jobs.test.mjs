@@ -373,3 +373,23 @@ test('runStuckSweep settles when its signal aborts, so the auto-sweep lock can r
   await sweep; // must settle now that the signal aborted (times out here if the signal never reached the fetch)
   assert.ok(true, 'runStuckSweep settled after its signal aborted');
 });
+
+test('runStuckSweep bails on an unabortable (shared-lane) heartbeat via the signal race', { timeout: 5000 }, async () => {
+  // heartbeatTick can occupy a job's heartbeat lane before the sweep runs; singleFlight then hands the
+  // sweep that in-flight ping, whose fetch never got the sweep's signal, so the watchdog cannot abort it.
+  // The sweep must race the shared probe against its signal and bail on abort rather than hang forever.
+  const controller = new AbortController();
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token',
+      pendingReviewJobs: { A: makeJob('A', { tabId: 10, serverStatus: 'missing', lastEventAt: STALE }) } }),
+    tabs: new Map(),
+    handler: () => ({ ok: false, code: 'job_mismatch' }),
+    api: async (_p, body) => (body?.action === 'ping' ? new Promise(() => {}) : { ok: true }), // ping hangs, IGNORES the signal
+  });
+  const sweep = b.context.runStuckSweep({ includeStalled: true, signal: controller.signal });
+  const before = await Promise.race([sweep.then(() => 'settled'), new Promise((r) => setTimeout(() => r('pending'), 80))]);
+  assert.equal(before, 'pending', 'the sweep is blocked on the unabortable heartbeat');
+  controller.abort();
+  await sweep; // must settle via the race even though the ping ignores the signal
+  assert.ok(true, 'runStuckSweep settled by racing the shared probe against its signal');
+});

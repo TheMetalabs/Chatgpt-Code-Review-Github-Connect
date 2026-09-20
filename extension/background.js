@@ -1232,7 +1232,14 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
       // the server still tracks those, so re-check the status STRING, not the boolean. A restored job
       // clears serverStatus; an unreachable probe (threw) leaves the stale status. Keep those. The server
       // has already evicted a forgotten job, so abandonForgottenJob's force-local retire is safe.
-      const probed = await heartbeat(job, jobs, signal).then(() => true, () => false);
+      // heartbeat de-dupes via heartbeatLanes, so if heartbeatTick already started this job's ping the
+      // sweep receives that in-flight promise whose fetch never got this signal — the watchdog can't
+      // abort it. Race the (possibly shared, unabortable) probe against the signal: on abort, bail on this
+      // job (keep it) rather than hang, and let the shared heartbeat finish under the tick's ownership.
+      const probed = await Promise.race([
+        heartbeat(job, jobs, signal).then(() => true, () => false),
+        new Promise((resolve) => { signal?.addEventListener("abort", () => resolve(false), { once: true }); }),
+      ]);
       if (!probed) return;
       const status = job.serverStatus;
       if (!["cancelled", "missing", "unknown"].includes(status)) return;

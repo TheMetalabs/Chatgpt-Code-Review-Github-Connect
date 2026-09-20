@@ -1225,10 +1225,15 @@ async function clearStuckJobs(opts = {}) {
   // shared with the still-running work so a timeout still reports partial progress. Never throws.
   const { deadlineMs = 15_000, includeStalled = false, staleMs = STALL_MS } = opts;
   const TIMED_OUT = Symbol("clear-timeout");
+  const controller = new AbortController();
   let timer;
   const counter = { cleared: 0, total: 0 };
-  const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(TIMED_OUT), deadlineMs); });
-  const work = runStuckSweep({ includeStalled, staleMs }, counter)
+  // On timeout, ABORT the work — don't just return. Otherwise the detached runStuckSweep keeps running
+  // unfenced and the "click again" the popup suggests starts another sweep over the same registry, so
+  // repeated attempts accumulate pending ops that later resume concurrently. Aborting fences it (its
+  // fetches reject, its per-mutation signal checks bail), so a re-click never overlaps the timed-out sweep.
+  const deadline = new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve(TIMED_OUT); }, deadlineMs); });
+  const work = runStuckSweep({ includeStalled, staleMs, signal: controller.signal }, counter)
     .catch(error => ({ ok: false, error: String(error?.message || error || "clear failed") }));
   const result = await Promise.race([work, deadline]);
   clearTimeout(timer);
@@ -1296,7 +1301,10 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
         // terminal path as repair-off); a fabricated tab_closed failure would be dropped by deliverOutcome's
         // durable guard anyway.
         if (sourceArchiveDurable(state)) {
-          if (["prepared", "running", "ready"].includes(state.repairAttempt?.status)) continue;
+          // accepted is a resumable SUCCESS (the commit landed; acceptRepairReceipt records the receipt on
+          // the next tick even if the worker stopped before it did). Salvaging it would collide with the
+          // server's already-stored repaired leg (lease_conflict) and clear the lease. Exempt it too.
+          if (["prepared", "running", "ready", "accepted"].includes(state.repairAttempt?.status)) continue;
           if (!state.outcome) {
             const salvage = await readRepairSource(job, provider, false); // local archived copy — no fetch, no hang
             if (salvage?.text) {

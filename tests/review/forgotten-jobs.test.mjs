@@ -532,3 +532,37 @@ test("the sweep's worker-status refresh is single-flighted (no per-minute accumu
   await new Promise((r) => setTimeout(r, 15));
   assert.equal(refreshes, 1, 'only one worker-status refresh is launched despite two sweeps');
 });
+
+test('a timed-out manual clearStuckJobs aborts its in-flight work (re-click cannot overlap)', { timeout: 5000 }, async () => {
+  // The popup's "click again" would start another sweep over the same registry, so the timed-out one must
+  // be fenced. clearStuckJobs now aborts its work on timeout; here the failure send hangs until aborted,
+  // proving the signal reaches the in-flight bridge fetch so the detached work can settle instead of overlap.
+  let sawAbort = false;
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token',
+      pendingReviewJobs: { A: makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE }) } }),
+    tabs: new Map(), // tab gone → stalled branch reports a failure
+    handler: () => ({ ok: false, code: 'job_mismatch' }),
+    api: async (_p, body, _o, signal) => (body?.action === 'failure'
+      ? new Promise((_r, reject) => { signal?.addEventListener('abort', () => { sawAbort = true; reject(new Error('aborted')); }, { once: true }); })
+      : { ok: true }),
+  });
+  const res = await b.context.clearStuckJobs({ deadlineMs: 60, includeStalled: true });
+  assert.equal(res.timedOut, true, 'the manual sweep reports the timeout');
+  assert.ok(sawAbort, 'the timed-out manual sweep aborted its in-flight bridge fetch');
+});
+
+test('clearStuckJobs({includeStalled}) leaves an ACCEPTED durable repair for repairProvider to record', async () => {
+  // accepted is a resumable SUCCESS — the commit landed but acceptRepairReceipt may not have recorded it
+  // yet (worker stopped in between). Salvaging it would collide with the server's stored repaired leg
+  // (lease_conflict) and clear the lease. Leave it so repairProvider records the receipt on the next tick.
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.sourceCapture = { archiveDurable: true, text: 'prose', totalChars: 5 };
+  job.states.chatgpt.repairAttempt = { id: 'ra', status: 'accepted' };
+  const b = harness([job]);
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 0, 'an accepted durable repair is left for repairProvider');
+  assert.equal(b.calls.filter((c) => c.action === 'complete' || c.action === 'failure').length, 0, 'no settle over an accepted repair');
+  assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}));
+});

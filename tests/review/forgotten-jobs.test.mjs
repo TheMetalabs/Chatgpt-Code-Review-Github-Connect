@@ -277,3 +277,25 @@ test('clearStuckJobs({includeStalled}) RETAINS a stalled job when the failure re
   assert.equal(res.cleared, 0, 'not retired while the server has not settled the leg');
   assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}), 'the job is retained for a later sweep');
 });
+
+test('clearStuckJobs({includeStalled}) never fabricates a failure for an unstarted sibling leg', async () => {
+  // A 2-provider job goes stale because chatgpt stalled (old event, tab gone), but grok is still WAITING
+  // for capacity (not started, no tabId). providerTabGone reports the unstarted leg "gone", but failing it
+  // would tell the server that reviewer ran and let it publish without it — so only the started, tab-gone
+  // leg is failed; the unstarted sibling is preserved and the job is kept until grok can run.
+  const job = {
+    jobId: 'A', origin: 'http://bridge', leaseId: 'lease-A', prompt: 'review A', serverStatus: 'awaiting_chat',
+    providers: ['chatgpt', 'grok'],
+    states: {
+      chatgpt: { started: true, runId: 'run-A-c', tabId: 10, workerEvents: [{ source: 'worker', sequence: 1, stage: 'submitted', at: STALE }] },
+      grok: { started: false }, // waiting for capacity — no tabId, never started
+    },
+  };
+  const b = harness([job]); // tab 10 gone (empty tabs map)
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.deepEqual(b.calls.filter((c) => c.action === 'failure').map((c) => c.provider).sort(), ['chatgpt'], 'only the started, tab-gone leg is failed');
+  const kept = b.local.state.pendingReviewJobs ?? {};
+  assert.ok('A' in kept, 'the job is kept while grok still waits for capacity');
+  assert.equal(kept.A.states.grok.outcome, undefined, 'the unstarted grok leg gets no fabricated failure');
+});

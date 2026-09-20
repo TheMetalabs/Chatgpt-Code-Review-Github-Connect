@@ -1245,6 +1245,12 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}
       for (const provider of job.providers) {
         const state = job.states[provider];
         if (state.delivered || state.outcome) continue;
+        // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
+        // stalled one — providerTabGone reports it "gone", but fabricating a tab_closed failure would tell
+        // the server that reviewer attempted and let it publish without ever running it. Only fail a leg
+        // that actually started or held a tab that is now gone. (Job-level staleness can trip on a
+        // different leg's old events, so the per-leg guard is essential.)
+        if (!state.started && !state.tabId) continue;
         if (!(await providerTabGone(job, provider))) continue;
         state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
         state.closeRequested = true; // tab confirmed gone → cleanup finishes on absence, not a reconnection that never comes

@@ -299,3 +299,19 @@ test('clearStuckJobs({includeStalled}) never fabricates a failure for an unstart
   assert.ok('A' in kept, 'the job is kept while grok still waits for capacity');
   assert.equal(kept.A.states.grok.outcome, undefined, 'the unstarted grok leg gets no fabricated failure');
 });
+
+test('clearStuckJobs({includeStalled}) never fails a leg whose source is durably archived (repair in flight)', async () => {
+  // cleanupProvider closes a durable-source leg's tab ON PURPOSE while the server-side JSON repair runs
+  // (arbitrarily long, no fresh events). Its tab-absence + quiet is expected, not a stall — a fabricated
+  // tab_closed failure would cancel a valid repair and drop that provider's review.
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.sourceCapture = { archiveDurable: true }; // durable source → owned by the repair pipeline
+  const b = harness([job]); // tab 10 gone
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  // The sweep must not even FABRICATE an outcome on the leg (deliverOutcome separately guards the send,
+  // but a stamped tab_closed outcome would still corrupt the leg the repair pipeline owns).
+  assert.equal(b.local.state.pendingReviewJobs?.A?.states.chatgpt.outcome, undefined, 'no fabricated outcome on the durable-source leg');
+  assert.equal(b.calls.filter((c) => c.action === 'failure').length, 0, 'no tab_closed failure is sent for a durable-source leg');
+  assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}), 'the repairing job is kept for the repair pipeline to finish');
+});

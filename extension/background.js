@@ -1245,6 +1245,11 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}
       for (const provider of job.providers) {
         const state = job.states[provider];
         if (state.delivered || state.outcome) continue;
+        // A leg with a durably-archived source is owned by the repair/salvage pipeline, not the tab:
+        // cleanupProvider closes its tab ON PURPOSE and the server-side JSON repair may run arbitrarily
+        // long without appending events. Its tab-absence + quiet is EXPECTED, not a stall — a fabricated
+        // tab_closed failure would cancel a valid in-flight repair and drop that provider's review.
+        if (sourceArchiveDurable(state)) continue;
         // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
         // stalled one — providerTabGone reports it "gone", but fabricating a tab_closed failure would tell
         // the server that reviewer attempted and let it publish without ever running it. Only fail a leg

@@ -1169,12 +1169,29 @@ async function abandonForgottenJob(job, jobs, status) {
   return retireCleanJob(job, jobs, ["missing", "unknown"].includes(status));
 }
 
-/** Popup-triggered sweep for jobs the server has forgotten (missing/unknown) or cancelled whose tabs
- * are gone. Never touches a job with a live tab or one the server still owns. The ENTIRE operation —
- * storage init, the concurrent re-probe, and the abandon sweep — is raced against one deadline, so a
- * stalled chrome.storage.get, bridge ping, or tab probe can never strand the popup's runtime message.
- * Returns how many were cleared so the operator gets a definite result. */
-async function clearStuckJobs(deadlineMs = 15_000) {
+// A job counts as "stalled" once it made progress (has a worker/page event) but has gone quiet past
+// STALL_MS. Keying off an OLD event — never the ABSENCE of events — means a brand-new or still-allocating
+// job (no events yet) is never flagged, so periodic cleanup can't race admission. Generous window: a
+// live ChatGPT generation can legitimately run several minutes, and the tab-gone gate below is the real
+// safety (a stall with a live tab is always kept). Tunable.
+const STALL_MS = 15 * 60_000;
+function jobStale(job, staleMs, now = Date.now()) {
+  let latest = 0;
+  for (const provider of job.providers) {
+    const state = job.states[provider] || {};
+    for (const event of [...(state.workerEvents || []), ...(state.pageEvents || [])]) if (event.at > latest) latest = event.at;
+  }
+  return latest > 0 && now - latest > staleMs;
+}
+
+/** Sweep for jobs whose tabs are gone: those the server has forgotten (missing/unknown) or cancelled,
+ * and — when includeStalled — those that progressed then went quiet past staleMs (a wedged
+ * generating/repair leg that can never finish). Runs both from the popup button and the periodic alarm.
+ * Never touches a job with a live tab (a harvestable answer) or one the server still owns/tracks. The
+ * ENTIRE operation — storage init, the concurrent re-probe, and the abandon sweep — is raced against one
+ * deadline, so a stalled chrome.storage.get, bridge ping, or tab probe can never strand the popup's
+ * runtime message. Returns how many were cleared. */
+async function clearStuckJobs({ deadlineMs = 15_000, includeStalled = false, staleMs = STALL_MS } = {}) {
   const TIMED_OUT = Symbol("clear-timeout");
   let timer, cleared = 0, total = 0;
   // Create the deadline BEFORE any await: settings()/workerJobs() read chrome.storage, and a stalled
@@ -1194,20 +1211,28 @@ async function clearStuckJobs(deadlineMs = 15_000) {
     // serverStatus when the server owns the job again) and only abandon jobs the server STILL disowns.
     // A failed probe (server unreachable) is treated as "keep" — we cannot rule out a restore. Concurrent
     // + deadline-bounded, so this is not the old serial HTTP sweep that lost the popup response.
-    const candidates = mine.filter(job => ["cancelled", "missing", "unknown"].includes(job.serverStatus));
+    const isForgotten = job => ["cancelled", "missing", "unknown"].includes(job.serverStatus);
+    const candidates = mine.filter(job => isForgotten(job) || (includeStalled && jobStale(job, staleMs)));
     await Promise.allSettled(candidates.map(async job => {
-      const probed = await heartbeat(job, jobs).then(() => true, () => false);
-      // Abandon only on a FRESH, reachable confirmation that the job is STILL forgotten. heartbeat reports
-      // active:false for ANY non-active status (validator/posting/posted/skipped/dlq) and stores it in
-      // job.serverStatus — the server still tracks those, so re-check the status STRING, not just the
-      // boolean. A restored job clears serverStatus; an unreachable probe (threw) leaves the stale cached
-      // status untouched. Keep the job in all of those cases.
-      if (!probed) return;
-      const status = job.serverStatus;
-      if (!["cancelled", "missing", "unknown"].includes(status)) return;
-      // Pass the FRESH status: abandonForgottenJob derives both force-close (cancelled) and trace-detach
-      // (missing/unknown) from it — the detach flag must come from this probe, never stale serverStatus.
-      if (await abandonForgottenJob(job, jobs, status) === true) cleared += 1;
+      if (isForgotten(job)) {
+        // Abandon only on a FRESH, reachable confirmation that the job is STILL forgotten. heartbeat reports
+        // active:false for ANY non-active status (validator/posting/posted/skipped/dlq) and stores it in
+        // job.serverStatus — the server still tracks those, so re-check the status STRING, not just the
+        // boolean. A restored job clears serverStatus; an unreachable probe (threw) leaves the stale cached
+        // status untouched. Keep the job in all of those cases.
+        const probed = await heartbeat(job, jobs).then(() => true, () => false);
+        if (!probed) return;
+        const status = job.serverStatus;
+        if (!["cancelled", "missing", "unknown"].includes(status)) return;
+        // Pass the FRESH status: abandonForgottenJob derives both force-close (cancelled) and trace-detach
+        // (missing/unknown) from it — the detach flag must come from this probe, never stale serverStatus.
+        if (await abandonForgottenJob(job, jobs, status) === true) cleared += 1;
+      } else {
+        // Stalled (includeStalled): went quiet past staleMs. Do NOT re-probe — it is not a forgotten-status
+        // question. abandonForgottenJob abandons only legs whose TAB IS GONE (a live tab may still yield an
+        // answer, so a live-tab stall is kept) and awaits the trace (the server may still hold the job).
+        if (await abandonForgottenJob(job, jobs, job.serverStatus ?? "stalled") === true) cleared += 1;
+      }
     }));
     // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops that
     // no deadline covers, so awaiting it could strand the response. Fire-and-forget; the popup polls
@@ -1221,6 +1246,19 @@ async function clearStuckJobs(deadlineMs = 15_000) {
   if (result === TIMED_OUT) return { ok: true, cleared, kept: Math.max(0, total - cleared), timedOut: true };
   if (result.ok === false) return result;
   return { ok: true, cleared, kept: Math.max(0, total - cleared), timedOut: false };
+}
+
+// Periodic hygiene, driven by the "ashlar-poll" alarm (which reliably wakes even a suspended worker, so
+// the pile-up is cleared without depending on the popup message path). Includes stalled jobs and uses a
+// shorter deadline than the manual button so it never overruns into the next minute's tick. Guarded so
+// two ticks can't sweep concurrently; clearStuckJobs never throws, but stay defensive.
+let autoSweepInFlight = false;
+async function autoSweepStuckJobs() {
+  if (autoSweepInFlight) return;
+  autoSweepInFlight = true;
+  try { await clearStuckJobs({ includeStalled: true, deadlineMs: 12_000 }); }
+  catch { /* never let hygiene crash the worker */ }
+  finally { autoSweepInFlight = false; }
 }
 
 async function advanceJob(job, jobs) {
@@ -1486,10 +1524,11 @@ function loop() {
   chrome.alarms.create("ashlar-poll", { periodInMinutes: 1 });
   void heartbeatTick();
   void tick();
+  void autoSweepStuckJobs();
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); }
+  if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); void autoSweepStuckJobs(); }
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "ashlar-poll-now") {
@@ -1497,7 +1536,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendResponse({ok:true,scheduled:true}); return;
   }
   if (message?.type === "ashlar-clear-stuck") {
-    clearStuckJobs().then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
+    // The button clears the same set the periodic sweep does, including stalled tab-gone jobs.
+    clearStuckJobs({ includeStalled: true }).then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
     return true;
   }
   if (message?.type === "ashlar-maintenance-acquire") {

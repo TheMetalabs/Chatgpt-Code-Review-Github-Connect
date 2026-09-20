@@ -8,9 +8,13 @@ import { background, storage } from './helpers.mjs';
 // being abandoned (a stale cached status can hide a job the bridge restored, whose saved outcome must
 // not be discarded). The whole operation is raced against one deadline, so a stalled storage read,
 // ping, or tab probe can never lose the popup's response ("Could not clear stuck jobs: unknown error").
-const makeJob = (id, { tabId, serverStatus } = {}) => ({
+const makeJob = (id, { tabId, serverStatus, lastEventAt } = {}) => ({
   jobId: id, origin: 'http://bridge', leaseId: 'lease-' + id, prompt: 'review ' + id, serverStatus,
-  providers: ['chatgpt'], states: { chatgpt: { started: true, runId: 'run-' + id, tabId } },
+  providers: ['chatgpt'],
+  states: { chatgpt: { started: true, runId: 'run-' + id, tabId,
+    // lastEventAt drives the "stalled" signal (jobStale reads the latest worker/page event). Omitting it
+    // means NO events — a brand-new/allocating job, which must never be swept as stalled.
+    ...(lastEventAt ? { workerEvents: [{ source: 'worker', sequence: 1, stage: 'submitted', at: lastEventAt }] } : {}) } },
 });
 
 function harness(jobs, tabs = new Map(), serverStates = {}) {
@@ -90,7 +94,7 @@ test('clearStuckJobs returns when the sweep stalls (deadline backstop)', { timeo
   const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing' })]);
   const realSet = b.local.set;
   b.local.set = () => new Promise(() => {});
-  const res = await b.context.clearStuckJobs(60);
+  const res = await b.context.clearStuckJobs({ deadlineMs: 60 });
   b.local.set = realSet;
   assert.equal(res.ok, true, 'the popup still gets a definite result');
   assert.equal(res.timedOut, true, 'the wedged write tripped the deadline');
@@ -150,7 +154,7 @@ test('clearStuckJobs returns when storage init stalls before the sweep (deadline
   // the race even begins.
   const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing' })]);
   b.local.get = () => new Promise(() => {}); // wedge the very first storage read
-  const res = await b.context.clearStuckJobs(60);
+  const res = await b.context.clearStuckJobs({ deadlineMs: 60 });
   assert.equal(res.ok, true);
   assert.equal(res.timedOut, true, 'the deadline fired even though setup stalled');
 });
@@ -196,4 +200,52 @@ test('abandonForgottenJob detaches a missing job but awaits a cancelled one (swe
   ]);
   assert.equal(race, 'pending', 'a swept cancelled job awaits its trace upload before retiring');
   assert.ok('J' in jc, 'the cancelled job is not deleted until its trace uploads');
+});
+
+const STALE = Date.now() - 20 * 60_000; // older than STALL_MS (15min)
+const FRESH = Date.now();
+
+test('clearStuckJobs({includeStalled}) retires a stalled, tab-gone job the server still tracks', async () => {
+  // Not forgotten (awaiting_chat), but progressed then went quiet past the stall window and its tab is
+  // gone → it can never finish. The periodic/auto sweep retires it; the manual button does too.
+  const b = harness([makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE })]); // tab gone
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 1, 'a stalled tab-gone job is retired');
+  assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
+});
+
+test('clearStuckJobs({includeStalled}) KEEPS a stalled job whose tab is still open', async () => {
+  // A live tab may still hold an unharvested answer — never discard it, even when stale.
+  const b = harness(
+    [makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE })],
+    new Map([[10, { id: 10, url: 'https://chatgpt.com/c/A', status: 'complete' }]]),
+  );
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 0, 'a stall with a live tab is preserved');
+  assert.equal(res.kept, 1);
+  assert.ok(b.tabs.has(10));
+});
+
+test('clearStuckJobs({includeStalled}) never sweeps a brand-new (no-event) or recently-active job', async () => {
+  // The stall signal keys off an OLD event, never the ABSENCE of events, so an allocating job (no events)
+  // and a job that just progressed are both kept — periodic cleanup can't race admission or live work.
+  const b = harness([
+    makeJob('A', { tabId: 10 }), // no events → brand-new/allocating, tab gone
+    makeJob('B', { tabId: 11, serverStatus: 'awaiting_chat', lastEventAt: FRESH }), // just progressed, tab gone
+  ]);
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 0, 'neither a new nor a freshly-active job is swept');
+  assert.equal(res.kept, 2);
+});
+
+test('clearStuckJobs default (button off / includeStalled=false) ignores stalled jobs', async () => {
+  // The forgotten-only default is preserved: without includeStalled a stalled tab-gone job is not touched.
+  const b = harness([makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE })]);
+  const res = await b.context.clearStuckJobs();
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 0, 'stalled jobs are only swept when includeStalled is set');
+  assert.equal(res.kept, 1);
 });

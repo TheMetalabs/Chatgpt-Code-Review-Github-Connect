@@ -427,3 +427,24 @@ test('an aborted sweep stops mutating after a storage op resumes past the watchd
   await sweep;
   assert.ok(!b.calls.some((c) => c.action === 'failure'), 'the aborted sweep did not deliver after its storage op resumed');
 });
+
+test('retireCleanJob does not delete after an aborted final flush (post-flush write fence)', { timeout: 5000 }, async () => {
+  // The watchdog can abort the final flushProgress and release the sweep's lock while retirement is still
+  // pending; the session/local deletions that follow are not signal-abortable, so they would overlap the
+  // next sweep. retireCleanJob must recheck the signal after the (swallowed) aborted flush and NOT delete.
+  const controller = new AbortController();
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token' }),
+    api: async (_p, body, _o, signal) => (body?.action === 'progress'
+      ? new Promise((_r, reject) => { signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }); }) // flush hangs until aborted
+      : { ok: true }),
+  });
+  const jobs = { J: { jobId: 'J', origin: 'http://bridge', leaseId: 'l', providers: ['chatgpt'],
+    states: { chatgpt: { delivered: true, cleanupDone: true, runId: 'r', workerEvents: [{ source: 'worker', sequence: 1, stage: 'result_saved', at: 1 }] } } } };
+  const retire = b.context.retireCleanJob(jobs.J, jobs, false, controller.signal);
+  const before = await Promise.race([retire.then((v) => `done:${v}`), new Promise((r) => setTimeout(() => r('pending'), 80))]);
+  assert.equal(before, 'pending', 'retirement is blocked on the pending final flush');
+  controller.abort();
+  assert.equal(await retire, false, 'retireCleanJob bailed rather than delete');
+  assert.ok('J' in jobs, 'the job was NOT deleted under the aborted sweep');
+});

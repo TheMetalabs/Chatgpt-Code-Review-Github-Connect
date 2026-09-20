@@ -694,6 +694,10 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
   // "missing" for a job the bridge already restored — detaching there would drop a live job's history.
   if (forgotten) void flushProgress(job).catch(() => {});
   else await flushProgress(job, signal).catch(() => {});
+  // The awaited flush can be aborted by the sweep watchdog, which has already released the sweep's lock;
+  // the session/local deletions below are NOT signal-abortable, so run them here and they would overlap
+  // the next alarm's sweep. Recheck the signal and bail before deleting under a newer sweep's ownership.
+  if (signal?.aborted) return false;
   await writeInOrder(async () => {
     const old = await chrome.storage.session.get(["tabs"]);
     const tabs = {...old.tabs};

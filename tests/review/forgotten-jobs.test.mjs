@@ -249,3 +249,31 @@ test('clearStuckJobs default (button off / includeStalled=false) ignores stalled
   assert.equal(res.cleared, 0, 'stalled jobs are only swept when includeStalled is set');
   assert.equal(res.kept, 1);
 });
+
+test('clearStuckJobs({includeStalled}) REPORTS a terminal failure so the server settles a stalled leg', async () => {
+  // A stalled tab-gone job the server STILL owns (awaiting_chat) must not be silently deleted: the server
+  // ignores a bare generating:false and would re-offer the leg after the lease expires, re-sticking it.
+  // The sweep must send action:"failure" so the server settles the leg, then retire on the ACK.
+  const b = harness([makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE })]); // tab gone
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 1);
+  assert.ok(b.calls.some((c) => c.action === 'failure' && c.jobId === 'A'), 'a terminal failure was reported to the server');
+  assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0, 'retired only after the server ACKed the failure');
+});
+
+test('clearStuckJobs({includeStalled}) RETAINS a stalled job when the failure report is rejected', async () => {
+  // If the server does not ACK the failure (unreachable/404), the leg is not settled, so the job must be
+  // RETAINED for a later sweep — never a silent local delete that leaves the server re-offering it.
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token',
+      pendingReviewJobs: { A: makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE }) } }),
+    tabs: new Map(), // tab gone
+    handler: () => ({ ok: false, code: 'job_mismatch' }),
+    api: async (_p, body) => { if (body?.action === 'failure') throw new Error('server unreachable'); return { ok: true }; },
+  });
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 0, 'not retired while the server has not settled the leg');
+  assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}), 'the job is retained for a later sweep');
+});

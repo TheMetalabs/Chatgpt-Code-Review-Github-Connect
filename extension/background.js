@@ -1191,72 +1191,84 @@ function jobStale(job, staleMs, now = Date.now()) {
  * ENTIRE operation — storage init, the concurrent re-probe, and the abandon sweep — is raced against one
  * deadline, so a stalled chrome.storage.get, bridge ping, or tab probe can never strand the popup's
  * runtime message. Returns how many were cleared. */
-async function clearStuckJobs({ deadlineMs = 15_000, includeStalled = false, staleMs = STALL_MS } = {}) {
+async function clearStuckJobs(opts = {}) {
+  // Deadline-bounded wrapper for the popup button: race the sweep WORK against a timer so a stalled
+  // chrome.storage.get, bridge ping, or tab probe can never strand the runtime message. The counter is
+  // shared with the still-running work so a timeout still reports partial progress. Never throws.
+  const { deadlineMs = 15_000, includeStalled = false, staleMs = STALL_MS } = opts;
   const TIMED_OUT = Symbol("clear-timeout");
-  let timer, cleared = 0, total = 0;
-  // Create the deadline BEFORE any await: settings()/workerJobs() read chrome.storage, and a stalled
-  // get would otherwise hang before the race even begins — the same lost-response failure as a stalled
-  // sweep. Race the whole body (setup included) against it.
+  let timer;
+  const counter = { cleared: 0, total: 0 };
   const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(TIMED_OUT), deadlineMs); });
-  const work = (async () => {
-    const cfg = await settings();
-    if (!cfg.enabled || !cfg.origin || !cfg.token) return { ok: false, error: "set the Ashlar origin and token first" };
-    const jobs = await workerJobs(cfg.origin);
-    const mine = Object.values(jobs).filter(job => job.origin === cfg.origin);
-    total = mine.length;
-    // Candidates are what the popup shows as forgotten (missing/unknown) or cancelled — but that verdict
-    // is a CACHED heartbeat result and can be stale: the bridge may have restored the job since. Retiring
-    // on the stale status would mark a saved-but-undelivered outcome delivered and delete it instead of
-    // handing it to the restored server job. Re-probe each candidate CONCURRENTLY (a fresh ping deletes
-    // serverStatus when the server owns the job again) and only abandon jobs the server STILL disowns.
-    // A failed probe (server unreachable) is treated as "keep" — we cannot rule out a restore. Concurrent
-    // + deadline-bounded, so this is not the old serial HTTP sweep that lost the popup response.
-    const isForgotten = job => ["cancelled", "missing", "unknown"].includes(job.serverStatus);
-    const candidates = mine.filter(job => isForgotten(job) || (includeStalled && jobStale(job, staleMs)));
-    await Promise.allSettled(candidates.map(async job => {
-      if (isForgotten(job)) {
-        // Abandon only on a FRESH, reachable confirmation that the job is STILL forgotten. heartbeat reports
-        // active:false for ANY non-active status (validator/posting/posted/skipped/dlq) and stores it in
-        // job.serverStatus — the server still tracks those, so re-check the status STRING, not just the
-        // boolean. A restored job clears serverStatus; an unreachable probe (threw) leaves the stale cached
-        // status untouched. Keep the job in all of those cases.
-        const probed = await heartbeat(job, jobs).then(() => true, () => false);
-        if (!probed) return;
-        const status = job.serverStatus;
-        if (!["cancelled", "missing", "unknown"].includes(status)) return;
-        // Pass the FRESH status: abandonForgottenJob derives both force-close (cancelled) and trace-detach
-        // (missing/unknown) from it — the detach flag must come from this probe, never stale serverStatus.
-        if (await abandonForgottenJob(job, jobs, status) === true) cleared += 1;
-      } else {
-        // Stalled (includeStalled): went quiet past staleMs. Do NOT re-probe — it is not a forgotten-status
-        // question. abandonForgottenJob abandons only legs whose TAB IS GONE (a live tab may still yield an
-        // answer, so a live-tab stall is kept) and awaits the trace (the server may still hold the job).
-        if (await abandonForgottenJob(job, jobs, job.serverStatus ?? "stalled") === true) cleared += 1;
-      }
-    }));
-    // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops that
-    // no deadline covers, so awaiting it could strand the response. Fire-and-forget; the popup polls
-    // worker status separately.
-    void recordWorkerStatus(jobs, cfg.origin).catch(() => {});
-    return { ok: true };
-  })().catch(error => ({ ok: false, error: String(error?.message || error || "clear failed") }));
-
+  const work = runStuckSweep({ includeStalled, staleMs }, counter)
+    .catch(error => ({ ok: false, error: String(error?.message || error || "clear failed") }));
   const result = await Promise.race([work, deadline]);
   clearTimeout(timer);
-  if (result === TIMED_OUT) return { ok: true, cleared, kept: Math.max(0, total - cleared), timedOut: true };
+  const kept = Math.max(0, counter.total - counter.cleared);
+  if (result === TIMED_OUT) return { ok: true, cleared: counter.cleared, kept, timedOut: true };
   if (result.ok === false) return result;
-  return { ok: true, cleared, kept: Math.max(0, total - cleared), timedOut: false };
+  return { ok: true, cleared: counter.cleared, kept, timedOut: false };
+}
+
+/** The actual sweep (NO response deadline). Retires jobs whose tabs are gone: those the server has
+ * forgotten (missing/unknown) or cancelled, and — when includeStalled — those that progressed then went
+ * quiet past staleMs. Never touches a job with a live tab (a harvestable answer). `counter` is mutated
+ * live so the deadline wrapper can report partial progress on timeout. Resolves only when the work truly
+ * ends, so the auto-sweep can hold its lock until then. */
+async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}, counter = { cleared: 0, total: 0 }) {
+  const cfg = await settings();
+  if (!cfg.enabled || !cfg.origin || !cfg.token) return { ok: false, error: "set the Ashlar origin and token first" };
+  const jobs = await workerJobs(cfg.origin);
+  const mine = Object.values(jobs).filter(job => job.origin === cfg.origin);
+  counter.total = mine.length;
+  const isForgotten = job => ["cancelled", "missing", "unknown"].includes(job.serverStatus);
+  const candidates = mine.filter(job => isForgotten(job) || (includeStalled && jobStale(job, staleMs)));
+  await Promise.allSettled(candidates.map(async job => {
+    if (isForgotten(job)) {
+      // Abandon only on a FRESH, reachable confirmation the job is STILL forgotten. heartbeat reports
+      // active:false for ANY non-active status (validator/posting/…) and stores it in job.serverStatus —
+      // the server still tracks those, so re-check the status STRING, not the boolean. A restored job
+      // clears serverStatus; an unreachable probe (threw) leaves the stale status. Keep those. The server
+      // has already evicted a forgotten job, so abandonForgottenJob's force-local retire is safe.
+      const probed = await heartbeat(job, jobs).then(() => true, () => false);
+      if (!probed) return;
+      const status = job.serverStatus;
+      if (!["cancelled", "missing", "unknown"].includes(status)) return;
+      if (await abandonForgottenJob(job, jobs, status) === true) counter.cleared += 1;
+    } else {
+      // Stalled + tab-gone: the chat tab is gone, so the leg can never produce a result — but the server
+      // may STILL own the job (awaiting_chat). A bare local delete would leave the server's leg pending
+      // (refreshBridgeClaim ignores generating:false), so after the lease expires it re-offers the job and
+      // it re-sticks. REPORT a terminal failure instead (deliverOutcome sends action:"failure"), which
+      // settles the server leg; the record is retired only once every leg is delivered (ACKed), and
+      // retained if the server is unreachable. A live-tab provider is left alone (may still answer).
+      for (const provider of job.providers) {
+        const state = job.states[provider];
+        if (state.delivered || state.outcome) continue;
+        if (!(await providerTabGone(job, provider))) continue;
+        state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
+        state.closeRequested = true; // tab confirmed gone → cleanup finishes on absence, not a reconnection that never comes
+      }
+      await saveJobs(jobs);
+      await joinLanes(job.providers.map(provider => deliverOutcome(job, provider, jobs).catch(() => {})));
+      if (await retireCleanJob(job, jobs) === true) counter.cleared += 1;
+    }
+  }));
+  // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops, so
+  // awaiting it could strand the wrapper's response. Fire-and-forget; the popup polls status separately.
+  void recordWorkerStatus(jobs, cfg.origin).catch(() => {});
+  return { ok: true };
 }
 
 // Periodic hygiene, driven by the "ashlar-poll" alarm (which reliably wakes even a suspended worker, so
-// the pile-up is cleared without depending on the popup message path). Includes stalled jobs and uses a
-// shorter deadline than the manual button so it never overruns into the next minute's tick. Guarded so
-// two ticks can't sweep concurrently; clearStuckJobs never throws, but stay defensive.
+// the pile-up is cleared without depending on the popup message path). Awaits the actual WORK to
+// completion — not a deadline-bounded response — so the lock is held until the sweep truly ends and the
+// next alarm can never start an overlapping sweep over the same registry. No popup waits on this.
 let autoSweepInFlight = false;
 async function autoSweepStuckJobs() {
   if (autoSweepInFlight) return;
   autoSweepInFlight = true;
-  try { await clearStuckJobs({ includeStalled: true, deadlineMs: 12_000 }); }
+  try { await runStuckSweep({ includeStalled: true }); }
   catch { /* never let hygiene crash the worker */ }
   finally { autoSweepInFlight = false; }
 }

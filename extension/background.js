@@ -126,7 +126,7 @@ function bridgeTransportError(cause, body) {
   return error;
 }
 
-async function api(path, body, expectedOrigin) {
+async function api(path, body, expectedOrigin, signal) {
   const { origin, token } = await settings();
   if (!origin || !token) throw new Error("set origin and token in the popup");
   if (expectedOrigin && expectedOrigin !== origin) throw new Error("bridge origin changed; original job preserved");
@@ -135,10 +135,12 @@ async function api(path, body, expectedOrigin) {
     // Model completion and saved-result delivery have NO application deadline.
     // Browser/network failures retain the outbox; separate per-job/heartbeat lanes
     // keep unrelated work moving. Server ACK is independent of publication below.
+    // A caller MAY pass a signal to cancel (e.g. the periodic sweep's watchdog); normal callers omit it.
     res = await fetch(`${origin}${path}`, {
       method: body ? "POST" : "GET",
       headers: {"content-type": "application/json", "x-ashlar-bridge-token": token},
       body: body ? JSON.stringify({...body, token}) : undefined,
+      signal,
     });
   } catch (cause) {
     throw bridgeTransportError(cause, body);
@@ -360,9 +362,9 @@ function progressFor(job) {
   }));
 }
 
-async function flushProgress(job) {
+async function flushProgress(job, signal) {
   const progress=progressFor(job);
-  if(Object.keys(progress).length)await api("/api/bridge",{action:"progress",jobId:job.jobId,leaseId:job.leaseId,progress},job.origin);
+  if(Object.keys(progress).length)await api("/api/bridge",{action:"progress",jobId:job.jobId,leaseId:job.leaseId,progress},job.origin,signal);
 }
 
 async function archiveObservation(job, provider, jobs) {
@@ -681,7 +683,7 @@ async function cleanupProviderBody(job, provider, jobs) {
   }
 }
 
-async function retireCleanJob(job, jobs, forgotten = false) {
+async function retireCleanJob(job, jobs, forgotten = false, signal) {
   if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
   // Final trace uploading terminal events (result_saved, tab_closed) to review history. Detach it ONLY
   // for a job the caller FRESHLY confirmed the server has forgotten (missing/unknown): recordBridgeProgress
@@ -691,7 +693,7 @@ async function retireCleanJob(job, jobs, forgotten = false) {
   // advanceJob retires on its early return BEFORE its next heartbeat, so that cached status can be a stale
   // "missing" for a job the bridge already restored — detaching there would drop a live job's history.
   if (forgotten) void flushProgress(job).catch(() => {});
-  else await flushProgress(job).catch(() => {});
+  else await flushProgress(job, signal).catch(() => {});
   await writeInOrder(async () => {
     const old = await chrome.storage.session.get(["tabs"]);
     const tabs = {...old.tabs};
@@ -709,14 +711,14 @@ function connectionErrors(job) {
     .map(p => [p, {code: "disconnected", message: job.states[p].connectionError}]));
 }
 
-function heartbeat(job, jobs) {
-  return singleFlight(heartbeatLanes, `${job.origin}:${job.jobId}`, () => refreshJobHeartbeat(job, jobs));
+function heartbeat(job, jobs, signal) {
+  return singleFlight(heartbeatLanes, `${job.origin}:${job.jobId}`, () => refreshJobHeartbeat(job, jobs, signal));
 }
 
-async function refreshJobHeartbeat(job, jobs) {
+async function refreshJobHeartbeat(job, jobs, signal) {
   const body = {action: "ping", jobId: job.jobId, leaseId: job.leaseId,
     generating: generatingFor(job), providerErrors: connectionErrors(job), progress: progressFor(job)};
-  let result = await api("/api/bridge", body, job.origin);
+  let result = await api("/api/bridge", body, job.origin, signal);
   job.localJsonRepairEnabled = result.bridge?.localJsonRepairEnabled === true;
   job.captureProtocol = result.bridge?.captureProtocol === 1 ? 1 : 0;
   if (result.active === false) {
@@ -726,10 +728,10 @@ async function refreshJobHeartbeat(job, jobs) {
   }
   delete job.serverStatus;
   if (result.accepted === false || !job.leaseId) {
-    const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()}, job.origin);
+    const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()}, job.origin, signal);
     job.leaseId = claim.leaseId;
     await saveJobs(jobs);
-    result = await api("/api/bridge", {...body, leaseId: job.leaseId}, job.origin);
+    result = await api("/api/bridge", {...body, leaseId: job.leaseId}, job.origin, signal);
     if (result.accepted === false) throw new Error("bridge lease could not be renewed");
   }
   return true;
@@ -865,7 +867,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   if (state.outcome.code === "quota") await markQuota(provider);
 }
 
-async function deliverOutcome(job, provider, jobs) {
+async function deliverOutcome(job, provider, jobs, signal) {
   const state = job.states[provider], out = state.outcome;
   // A durable archive normally settles via the repair-commit path, so it is not re-delivered here —
   // EXCEPT a no-repair salvage outcome, whose only delivery path is this complete request.
@@ -877,7 +879,7 @@ async function deliverOutcome(job, provider, jobs) {
   const body = out.ok
     ? {action: "complete", repairProtocol: 1, captureProtocol:job.captureProtocol, jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw, originalText: out.originalText}]}
     : {action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}`};
-  try { await api("/api/bridge", body, job.origin); }
+  try { await api("/api/bridge", body, job.origin, signal); }
   catch (e) {
     if (e.status === 422 && e.code === "json_repair_required" && out.ok) {
       state.formatError = true; // Preserve the original outbox; never turn it into an empty leg.
@@ -1215,7 +1217,7 @@ async function clearStuckJobs(opts = {}) {
  * quiet past staleMs. Never touches a job with a live tab (a harvestable answer). `counter` is mutated
  * live so the deadline wrapper can report partial progress on timeout. Resolves only when the work truly
  * ends, so the auto-sweep can hold its lock until then. */
-async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}, counter = { cleared: 0, total: 0 }) {
+async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signal } = {}, counter = { cleared: 0, total: 0 }) {
   const cfg = await settings();
   if (!cfg.enabled || !cfg.origin || !cfg.token) return { ok: false, error: "set the Ashlar origin and token first" };
   const jobs = await workerJobs(cfg.origin);
@@ -1230,7 +1232,7 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}
       // the server still tracks those, so re-check the status STRING, not the boolean. A restored job
       // clears serverStatus; an unreachable probe (threw) leaves the stale status. Keep those. The server
       // has already evicted a forgotten job, so abandonForgottenJob's force-local retire is safe.
-      const probed = await heartbeat(job, jobs).then(() => true, () => false);
+      const probed = await heartbeat(job, jobs, signal).then(() => true, () => false);
       if (!probed) return;
       const status = job.serverStatus;
       if (!["cancelled", "missing", "unknown"].includes(status)) return;
@@ -1284,8 +1286,8 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}
       await joinLanes(job.providers.map(async provider =>
         (job.states[provider].delivered
           ? cleanupProvider(job, provider, jobs)
-          : deliverOutcome(job, provider, jobs)).catch(() => {})));
-      if (await retireCleanJob(job, jobs) === true) counter.cleared += 1;
+          : deliverOutcome(job, provider, jobs, signal)).catch(() => {})));
+      if (await retireCleanJob(job, jobs, false, signal) === true) counter.cleared += 1;
     }
   }));
   // Best-effort status refresh, detached: recordWorkerStatus runs FRESH unbounded tab/storage ops, so
@@ -1295,16 +1297,21 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS } = {}
 }
 
 // Periodic hygiene, driven by the "ashlar-poll" alarm (which reliably wakes even a suspended worker, so
-// the pile-up is cleared without depending on the popup message path). Awaits the actual WORK to
-// completion — not a deadline-bounded response — so the lock is held until the sweep truly ends and the
-// next alarm can never start an overlapping sweep over the same registry. No popup waits on this.
+// the pile-up is cleared without depending on the popup message path). The lock is held until the sweep
+// truly ends, so the next alarm can never start an overlapping sweep over the same registry. A watchdog
+// ABORTS the in-flight bridge fetch if the sweep runs long: runStuckSweep's awaited fetches reject on the
+// signal, so the sweep unwinds and settles — releasing the lock only once the cancellation lands (never
+// leaving it wedged for the worker's lifetime, and never overlapping the next run). No popup waits on it.
+const AUTO_SWEEP_WATCHDOG_MS = 45_000;
 let autoSweepInFlight = false;
 async function autoSweepStuckJobs() {
   if (autoSweepInFlight) return;
   autoSweepInFlight = true;
-  try { await runStuckSweep({ includeStalled: true }); }
-  catch { /* never let hygiene crash the worker */ }
-  finally { autoSweepInFlight = false; }
+  const controller = new AbortController();
+  const watchdog = setTimeout(() => controller.abort(), AUTO_SWEEP_WATCHDOG_MS);
+  try { await runStuckSweep({ includeStalled: true, signal: controller.signal }); }
+  catch { /* aborted or errored — never let hygiene crash the worker */ }
+  finally { clearTimeout(watchdog); autoSweepInFlight = false; }
 }
 
 async function advanceJob(job, jobs) {

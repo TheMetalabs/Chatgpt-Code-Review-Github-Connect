@@ -64,6 +64,6 @@ export function background({ local = storage({ origin: 'http://bridge', token: '
   let sleeps = 0;
   context.sleep = async () => { if (++sleeps > 8) throw new Error("test-only polling guard: tick did not return"); };
   const rpc = context.api;
-  context.api = async (path, body) => { calls.push({ path, ...body }); return api ? api(path, body) : { ok: true, job: null }; };
+  context.api = async (path, body, origin, signal) => { calls.push({ path, ...body }); return api ? api(path, body, origin, signal) : { ok: true, job: null }; };
   return { context, rpc, local, session, tabs, messages, calls, closedTabs, chrome, closeTab: async id => { tabs.delete(id); for (const fn of removed) await fn(id, {isWindowClosing:false}); }, tick: () => context.tick() };
 }

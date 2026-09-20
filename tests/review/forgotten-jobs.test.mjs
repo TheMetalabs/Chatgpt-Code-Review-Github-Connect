@@ -347,3 +347,29 @@ test('clearStuckJobs({includeStalled}) completes cleanup for a delivered leg who
   assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0, 'no longer consuming tab capacity');
   assert.ok(!b.calls.some((c) => c.action === 'failure'), 'a delivered leg is NOT re-reported as a failure');
 });
+
+test('runStuckSweep settles when its signal aborts, so the auto-sweep lock can release', { timeout: 5000 }, async () => {
+  // The periodic sweep holds a lock until the work settles, so a hung bridge fetch would wedge cleanup for
+  // the worker's lifetime. The watchdog aborts the signal; runStuckSweep's fetches reject on it, so the
+  // sweep unwinds and settles — releasing the lock. Here a wedged failure-send is freed by the abort.
+  const controller = new AbortController();
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token',
+      pendingReviewJobs: { A: makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE }) } }),
+    tabs: new Map(), // tab gone → stalled branch reports a failure
+    handler: () => ({ ok: false, code: 'job_mismatch' }),
+    api: async (_p, body, _o, signal) => {
+      if (body?.action === 'failure') return new Promise((_resolve, reject) => { // hang until aborted
+        if (signal?.aborted) reject(new Error('aborted'));
+        else signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+      return { ok: true };
+    },
+  });
+  const sweep = b.context.runStuckSweep({ includeStalled: true, signal: controller.signal });
+  const before = await Promise.race([sweep.then(() => 'settled'), new Promise((r) => setTimeout(() => r('pending'), 80))]);
+  assert.equal(before, 'pending', 'the sweep is blocked on the hung failure send');
+  controller.abort();
+  await sweep; // must settle now that the signal aborted (times out here if the signal never reached the fetch)
+  assert.ok(true, 'runStuckSweep settled after its signal aborted');
+});

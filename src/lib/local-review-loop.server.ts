@@ -577,6 +577,14 @@ export async function runLocalReviewLoop(
     // DID produce JSON, merge: failed/null groups are marked not_cleared and (if the surviving groups
     // are empty) investigated_safe is forced [], so the frozen gate rejects a partial run as
     // incomplete rather than accepting it as a false clean pass.
+    // An abort at ANY point (the deadline in attachLocalLeg, or cancellation) means the review is
+    // incomplete — the loop may have broken with un-started groups, OR the abort threw the FINAL group's
+    // request into the per-group catch (which the loop's exit-by-condition would otherwise let through as
+    // a partial ok:true). Either way a partial merge would omit un-reviewed changed files (not even
+    // not_cleared), publishing part of a review as the whole. Fail the leg. Checking the signal itself
+    // (not a break-only flag) is race-free: a run that finished every group cannot have an aborted signal,
+    // since a completed final group's request did not throw on abort.
+    if (deps.signal?.aborted) return { ok: false, error: "local review aborted before completion (deadline or cancellation)" };
     if (!raws.length) return { ok: false, error: "local loop produced no review JSON" };
     return { ok: true, raw: mergeGroupResults(raws, failedGroups, unreviewablePaths(sample)) };
   } catch (e) {

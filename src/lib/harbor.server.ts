@@ -47,6 +47,12 @@ let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
 const localInFlight = new Set<string>();
 const localControllers = new Map<string, AbortController>();
+// Wall-clock ceiling for one local review. requestLocalJson sets timeout:0 by design (a caller may
+// cancel; upstream imposes no limit), so without this a hung Qwen request pends FOREVER — the leg
+// never settles, localInFlight/controllers never clear, and the popup shows "calling local LLM"
+// indefinitely. Generous enough for a legit long multiturn (~12min observed for a 32K review) with
+// headroom; a genuinely stuck request is aborted and the leg fails cleanly instead of pending.
+const LOCAL_REVIEW_DEADLINE_MS = 20 * 60_000;
 // In-memory only (never persisted): the snapshot the local multi-turn loop reads files from.
 // Kept just for the life of the local leg so the loop's tools serve changed-file content without
 // re-fetching the PR. Chat legs never touch this.
@@ -673,6 +679,13 @@ async function generateLocalLeg(
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
+  // Arm the wall-clock deadline: abort the in-flight request if the review runs past the ceiling. The
+  // transport honours the signal (rejects the request), so the leg falls into the catch below and fails
+  // cleanly instead of pending forever. Cleared in finally the moment the leg settles on its own.
+  const deadline = setTimeout(
+    () => localControllers.get(jobId)?.abort(new Error(`local review exceeded ${Math.round(LOCAL_REVIEW_DEADLINE_MS / 60_000)} min deadline`)),
+    LOCAL_REVIEW_DEADLINE_MS,
+  );
   try {
     const local = await generateLocalLeg(jobId, prompt);
     try {
@@ -702,6 +715,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12), updatedAt: Date.now(),
     }));
   } finally {
+    clearTimeout(deadline);
     localInFlight.delete(jobId);
     localControllers.delete(jobId);
     localSamples.delete(jobId);

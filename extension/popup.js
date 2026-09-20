@@ -210,19 +210,29 @@ async function requestPoll() {
   }
 }
 
-async function requestClearStuck() {
-  try {
-    const res = await chrome.runtime.sendMessage({type: "ashlar-clear-stuck"});
-    statusEl.textContent = res?.ok
-      ? (res.timedOut
-          ? `Cleared ${res.cleared} so far — the sweep timed out (bridge or a tab is slow). Click again to finish the rest.`
-          : `Cleared ${res.cleared} stuck job(s) the server had forgotten (${res.kept} kept). Live tabs and server-owned jobs were untouched.`)
-      : !res
-        ? "No response from the worker (it may be busy or restarting). Wait a moment and try again."
-        : `Could not clear stuck jobs: ${res.error || "no eligible jobs"}`;
-  } catch (e) {
-    statusEl.textContent = `Worker could not be reached: ${e instanceof Error ? e.message : String(e)}`;
+// MV3: the first message to an idle service worker can resolve undefined (or reject) while it is still
+// spinning up — "no response ... it may be busy or restarting". Retry a few times with a short backoff;
+// the wake completes and a later attempt reaches the live worker. Re-running clearStuckJobs is harmless
+// (it only retires already-dead jobs), so a lost-response-after-it-ran does not double-clear anything.
+async function sendWithWake(message, attempts = 4) {
+  for (let i = 0; i < attempts; i += 1) {
+    const res = await chrome.runtime.sendMessage(message).catch(() => undefined);
+    if (res !== undefined) return res;
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 400));
   }
+  return undefined;
+}
+
+async function requestClearStuck() {
+  statusEl.textContent = "Clearing stuck jobs…";
+  const res = await sendWithWake({type: "ashlar-clear-stuck"});
+  statusEl.textContent = res?.ok
+    ? (res.timedOut
+        ? `Cleared ${res.cleared} so far — the sweep timed out (bridge or a tab is slow). Click again to finish the rest.`
+        : `Cleared ${res.cleared} stuck/stalled job(s) (${res.kept} kept). Jobs with a live tab were left alone; long-stalled tab-gone legs (including server-owned ones) were reported failed.`)
+    : !res
+      ? "No response from the worker after several tries — reload the extension from chrome://extensions, then retry."
+      : `Could not clear stuck jobs: ${res.error || "no eligible jobs"}`;
 }
 
 document.getElementById("reconnect").addEventListener("click", requestPoll);

@@ -393,3 +393,13 @@ test('runStuckSweep bails on an unabortable (shared-lane) heartbeat via the sign
   await sweep; // must settle via the race even though the ping ignores the signal
   assert.ok(true, 'runStuckSweep settled by racing the shared probe against its signal');
 });
+
+test('autoSweepStuckJobs releases its lock even when a storage read hangs (watchdog covers setup)', { timeout: 5000 }, async () => {
+  // settings()/workerJobs() read chrome.storage BEFORE any fetch and observe no signal, so a wedged get
+  // would keep runStuckSweep pending forever. autoSweepStuckJobs races the whole sweep against the
+  // watchdog's abort, so it still returns (lock released) — otherwise cleanup is disabled for the SW's life.
+  const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing', lastEventAt: STALE })]);
+  b.local.get = () => new Promise(() => {}); // wedge the initial storage read
+  await b.context.autoSweepStuckJobs(60); // 60ms watchdog; returns here or the test times out
+  assert.ok(true, 'autoSweepStuckJobs returned (lock released) despite a wedged storage read');
+});

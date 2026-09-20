@@ -56,7 +56,7 @@ export function background({ local = storage({ origin: 'http://bridge', token: '
     },
     scripting: { executeScript: async () => {} },
   };
-  const context = vm.createContext({ console, chrome, setInterval: () => 1, clearInterval() {}, setTimeout, clearTimeout, URL, AbortSignal, crypto: {randomUUID: () => "fixture-client"} });
+  const context = vm.createContext({ console, chrome, setInterval: () => 1, clearInterval() {}, setTimeout, clearTimeout, URL, AbortSignal, AbortController, crypto: {randomUUID: () => "fixture-client"} });
   const code = source('extension/background.js');
   vm.runInContext(code.slice(0, code.indexOf('\nchrome.alarms.onAlarm.addListener')), context, { filename: 'background.js' });
   if (context.rememberClosedTab) chrome.tabs.onRemoved.addListener(context.rememberClosedTab);

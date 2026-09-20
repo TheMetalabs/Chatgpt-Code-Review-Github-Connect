@@ -1311,14 +1311,22 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
 // leaving it wedged for the worker's lifetime, and never overlapping the next run). No popup waits on it.
 const AUTO_SWEEP_WATCHDOG_MS = 45_000;
 let autoSweepInFlight = false;
-async function autoSweepStuckJobs() {
+async function autoSweepStuckJobs(watchdogMs = AUTO_SWEEP_WATCHDOG_MS) {
   if (autoSweepInFlight) return;
   autoSweepInFlight = true;
   const controller = new AbortController();
-  const watchdog = setTimeout(() => controller.abort(), AUTO_SWEEP_WATCHDOG_MS);
-  try { await runStuckSweep({ includeStalled: true, signal: controller.signal }); }
-  catch { /* aborted or errored — never let hygiene crash the worker */ }
-  finally { clearTimeout(watchdog); autoSweepInFlight = false; }
+  const watchdog = setTimeout(() => controller.abort(), watchdogMs);
+  try {
+    // Race the WHOLE sweep against the watchdog's abort so the lock always releases — even when the hang
+    // is in a chrome.storage/tabs op that no signal can cancel (settings()/workerJobs() run before any
+    // fetch). On abort the sweep is abandoned, but its signal-aware bridge fetches all reject, so the
+    // detached remainder can no longer mutate the registry: no overlap with the next sweep, no wedge for
+    // the worker's lifetime.
+    await Promise.race([
+      runStuckSweep({ includeStalled: true, signal: controller.signal }).catch(() => {}),
+      new Promise((resolve) => { controller.signal.addEventListener("abort", () => resolve(), { once: true }); }),
+    ]);
+  } finally { clearTimeout(watchdog); autoSweepInFlight = false; }
 }
 
 async function advanceJob(job, jobs) {

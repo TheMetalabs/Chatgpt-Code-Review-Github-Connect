@@ -161,3 +161,12 @@ describe("import parsing edges (comments, namespace re-export)", () => {
     assert.ok(re.some((r) => r.name === "*" && r.candidates.includes("src/all.ts")), "plain star still recorded");
   });
 });
+
+describe("import-shaped strings", () => {
+  it("ignores import-shaped text inside a string (only line-start statements bind)", () => {
+    const src = ["import { real } from './real';", "const sample = \"import { real } from './fake';\";"].join("\n");
+    const real = importGraph("src/a.ts", src).filter((b) => b.local === "real");
+    assert.equal(real.length, 1, "only the real statement binds");
+    assert.ok(real[0].candidates.includes("src/real.ts"));
+  });
+});

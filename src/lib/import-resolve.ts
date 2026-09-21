@@ -4,21 +4,27 @@
 const IMPORT_FROM_RE = /^\s*(?:import|export)\b[^'"]*?\bfrom\s*['"]([^'"]+)['"]/gm;
 const REQUIRE_RE = /\brequire\(\s*['"]([^'"]+)['"]\s*\)/g;
 
-const NAMED_IMPORT_RE = /import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
-const DEFAULT_IMPORT_RE = /import\s+([A-Za-z_$][\w$]*)\s*(?:,\s*(?:\{[^}]*\}|\*\s+as\s+[A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
-const NAMESPACE_IMPORT_RE = /\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]([^'"]+)['"]/g;
-const CJS_DESTRUCTURE_RE = /(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g;
-const CJS_WHOLE_RE = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g;
-const REEXPORT_NAMED_RE = /export\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
-const REEXPORT_STAR_RE = /export\s*\*\s*(?:as\s+([A-Za-z_$][\w$]*)\s+)?from\s*['"]([^'"]+)['"]/g;
+// All line-anchored (^[ \t]* with /m): an import/export/require is a statement at the start of a line,
+// so import-shaped text mid-line (inside a one-line string) does not match.
+const NAMED_IMPORT_RE = /^[ \t]*import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/gm;
+const DEFAULT_IMPORT_RE = /^[ \t]*import\s+([A-Za-z_$][\w$]*)\s*(?:,\s*(?:\{[^}]*\}|\*\s+as\s+[A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/gm;
+const NAMESPACE_IMPORT_RE = /^[ \t]*import\s+(?:[A-Za-z_$][\w$]*\s*,\s*)?\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]([^'"]+)['"]/gm;
+const CJS_DESTRUCTURE_RE = /^[ \t]*(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/gm;
+const CJS_WHOLE_RE = /^[ \t]*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/gm;
+const REEXPORT_NAMED_RE = /^[ \t]*export\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/gm;
+const REEXPORT_STAR_RE = /^[ \t]*export\s*\*\s*(?:as\s+([A-Za-z_$][\w$]*)\s+)?from\s*['"]([^'"]+)['"]/gm;
 const BINDING_RE = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/;
 const CJS_BINDING_RE = /^([A-Za-z_$][\w$]*)(?:\s*:\s*([A-Za-z_$][\w$]*))?$/;
 
-/** Strip block and line comments before import parsing, so a commented-out import (or a real import
- * followed by a commented one) is not treated as a live binding. `//` after `:` or a quote is left
- * alone to avoid eating `http://` or a `//` inside a short string on an import line. */
+/** Blank out non-code text before import parsing so import-shaped text inside a comment or string is
+ * not treated as a live binding: template literals (which can span lines and contain import-shaped
+ * lines) are emptied, then block and line comments are removed. `//` after `:` or a quote is kept to
+ * avoid eating `http://`. Single/double-quoted string bodies are left intact (their specifier is the
+ * one real imports use); the import regexes are line-anchored, so an import inside a one-line string
+ * (not at statement position) still does not match. */
 function withoutComments(text: string): string {
   return String(text || "")
+    .replace(/`(?:\\.|[^`])*`/g, "``")
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
 }

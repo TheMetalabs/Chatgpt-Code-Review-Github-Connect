@@ -64,14 +64,18 @@ function collectNames(added: string[], re: RegExp, group: number): string[] {
 }
 
 /** First line (1-based) that DEFINES `name` in this file (member sig / function / const), else 0. */
-function findDefinitionLine(lines: string[], name: string): number {
+function findDefinitionLine(lines: string[], name: string, requireExport = false): number {
   const n = escapeRe(name);
+  // requireExport (cross-file lookup): the requested name must be an EXPORTED top-level declaration —
+  // a private same-named declaration must not shadow a re-export of that name. Members are never a
+  // direct named import, so they are excluded in that mode.
+  const exp = requireExport ? "export\\s+" : "(?:export\\s+)?";
   const memberRe = new RegExp(`^ {2}(?:(?:private|protected|public|static|async|readonly|get|set|override|abstract)\\s+)*${n}\\s*(?:<[^>]*>)?\\s*\\(`);
-  const fnRe = new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${n}\\b`);
-  const varRe = new RegExp(`^(?:export\\s+)?(?:const|let|var)\\s+${n}\\b`);
+  const fnRe = new RegExp(`^${exp}(?:default\\s+)?(?:async\\s+)?function\\s+${n}\\b`);
+  const varRe = new RegExp(`^${exp}(?:const|let|var)\\s+${n}\\b`);
   for (let i = 1; i <= lines.length; i += 1) {
     const l = lines[i - 1] ?? "";
-    if (memberRe.test(l) || fnRe.test(l) || varRe.test(l)) return i;
+    if ((!requireExport && memberRe.test(l)) || fnRe.test(l) || varRe.test(l)) return i;
   }
   return 0;
 }
@@ -289,8 +293,9 @@ export function sliceContext(opts: {
 /** Line (1-based) of a top-level class/enum/interface/type declaration named `name`, else 0.
  * findDefinitionLine only knows functions/vars/members, so a `new X()` whose X is a class/entity
  * needs this to reach its definition across files. */
-function findTypeDeclLine(lines: string[], name: string): number {
-  const re = new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:abstract\\s+)?(?:class|enum|interface|type)\\s+${escapeRe(name)}\\b`);
+function findTypeDeclLine(lines: string[], name: string, requireExport = false): number {
+  const exp = requireExport ? "export\\s+" : "(?:export\\s+)?";
+  const re = new RegExp(`^${exp}(?:default\\s+)?(?:abstract\\s+)?(?:class|enum|interface|type)\\s+${escapeRe(name)}\\b`);
   for (let i = 0; i < lines.length; i += 1) if (re.test(lines[i] ?? "")) return i + 1;
   return 0;
 }
@@ -327,7 +332,7 @@ function findLocalDefaultAliasName(lines: string[]): string {
 
 /** Definition range of an exported symbol in a module's lines, or null if not found. `exported` may be
  * DEFAULT_EXPORT to locate the module's default export. */
-function definitionRange(lines: string[], exported: string): SliceRange | null {
+function definitionRange(lines: string[], exported: string, requireExport = false): SliceRange | null {
   if (exported === DEFAULT_EXPORT) {
     const dl = findDefaultExportLine(lines);
     if (dl > 0) {
@@ -344,9 +349,9 @@ function definitionRange(lines: string[], exported: string): SliceRange | null {
     const localDefault = findLocalDefaultAliasName(lines);
     return localDefault ? definitionRange(lines, localDefault) : null;
   }
-  const defLine = findDefinitionLine(lines, exported);
+  const defLine = findDefinitionLine(lines, exported, requireExport);
   if (defLine > 0) return enclosingRange(lines, defLine, defLine, 0);
-  const declLine = findTypeDeclLine(lines, exported);
+  const declLine = findTypeDeclLine(lines, exported, requireExport);
   return declLine > 0 ? declBlockRange(lines, declLine) : null;
 }
 
@@ -378,7 +383,7 @@ function lookupCrossDef(
   for (const path of candidates) {
     if (path === excludePath || !corpus.has(path)) continue;
     const content = corpus.get(path) ?? "";
-    const range = definitionRange(content.split("\n"), exported);
+    const range = definitionRange(content.split("\n"), exported, true);
     if (range) return { path, range };
     if (exported === NAMESPACE_EXPORT) continue; // a namespace object has no single declaration to follow
     // Barrel: the module re-exports the name from elsewhere — follow to the defining module. A default

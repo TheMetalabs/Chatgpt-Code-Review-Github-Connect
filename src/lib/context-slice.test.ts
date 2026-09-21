@@ -451,6 +451,17 @@ describe("crossFileDefs", () => {
     assert.match(crossFileDefs(changed, [widget], 10_000), /jsx component def/);
   });
 
+  it("does not attach a private (non-exported) declaration for a named import", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { helper } from './m';", "function issue() {", "  return helper();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return helper();\n }",
+    }];
+    // './m' has a PRIVATE helper (not exported) — it is not what `import { helper }` refers to.
+    const m = { path: "src/m.ts", content: ["function helper() {", "  return 0; // private not exported", "}", "export const other = 1;"].join("\n") };
+    assert.doesNotMatch(crossFileDefs(changed, [m], 10_000), /private not exported/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

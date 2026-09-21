@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_EXPORT, importGraph, importSpecifiers, reExportsOf, resolveRelativeImport } from "./import-resolve.ts";
+import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, importSpecifiers, reExportsOf, resolveRelativeImport } from "./import-resolve.ts";
 
 describe("importSpecifiers", () => {
   it("collects import and re-export module specifiers", () => {
@@ -130,5 +130,14 @@ describe("importGraph mixed + asset edges", () => {
     const dotted = resolveRelativeImport("src/a.ts", "./my.util"); // unknown suffix → extensionless
     assert.ok(dotted.includes("src/my.util.ts"));
     assert.ok(!dotted.some((c) => /\.css\./.test(c)), "no impossible styles.css.ts paths");
+  });
+});
+
+describe("hunkReferencedNames", () => {
+  it("collects identifiers from added and context hunk lines", () => {
+    const patch = "@@ -1,2 +1,3 @@\n unchangedCall(\n+  changedArg,\n )";
+    const names = hunkReferencedNames(patch);
+    assert.ok(names.has("unchangedCall"), "context-line identifier");
+    assert.ok(names.has("changedArg"), "added-line identifier");
   });
 });

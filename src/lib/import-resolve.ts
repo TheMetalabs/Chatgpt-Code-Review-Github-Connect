@@ -83,6 +83,20 @@ export function reExportsOf(fromPath: string, content: string): ReExport[] {
   return out;
 }
 
+const IDENT_RE = /[A-Za-z_$][\w$]*/g;
+/** Identifiers appearing in a patch's hunk body (added + context lines). Used to prioritize fetching
+ * the modules whose bindings the changed hunk actually references. */
+export function hunkReferencedNames(patch: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of String(patch || "").split("\n")) {
+    if (!((line.startsWith("+") && !line.startsWith("+++")) || line.startsWith(" "))) continue;
+    IDENT_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = IDENT_RE.exec(line.slice(1))) !== null) out.add(m[0]);
+  }
+  return out;
+}
+
 /** Module specifiers a source file imports/re-exports from — ESM `... from '...'` and CJS
  * `require('...')` — so both dependency styles are fetched. */
 export function importSpecifiers(content: string): string[] {

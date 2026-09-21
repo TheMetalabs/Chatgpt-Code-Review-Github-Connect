@@ -3,7 +3,7 @@ import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
-import { importSpecifiers, reExportsOf, resolveRelativeImport } from "./import-resolve";
+import { hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
@@ -417,6 +417,7 @@ async function fetchReferenceFiles(
   headSha: string,
   changedPaths: string[],
   changedContent: Map<string, string>,
+  patchByPath: Map<string, string>,
   alreadyFetched: Set<string>,
 ): Promise<SnapshotFile[]> {
   if (process.env.ASHLAR_CROSS_FILE_REFS === "0") return [];
@@ -445,10 +446,20 @@ async function fetchReferenceFiles(
     if (!REFERENCE_CODE_RE.test(changed)) continue;
     const content = changedContent.get(changed);
     if (!content) continue;
+    const hunkNames = hunkReferencedNames(patchByPath.get(changed) ?? "");
+    // Fetch modules for bindings the changed hunk actually references first, so the per-file cap never
+    // drops a helper the change calls in favor of an unrelated import earlier in source order.
+    const bindings = importGraph(changed, content).sort(
+      (a, b) => Number(hunkNames.has(b.local)) - Number(hunkNames.has(a.local)),
+    );
     const beforeFile = out.length;
-    for (const spec of importSpecifiers(content)) {
+    const fetchedSpecs = new Set<string>();
+    for (const b of bindings) {
       if (capped() || out.length - beforeFile >= PER_FILE_REF_CAP) break;
-      await fetchFirst(resolveRelativeImport(changed, spec));
+      const specKey = b.candidates.join("|");
+      if (fetchedSpecs.has(specKey)) continue; // one fetch per module, not per binding
+      fetchedSpecs.add(specKey);
+      await fetchFirst(b.candidates);
     }
   }
   // Pass 2: follow barrels across levels — a symbol may be re-exported through several index files
@@ -521,6 +532,9 @@ export async function fetchPullSnapshot(
     if (isSandboxPolicyFile(content)) continue;
     files.push({ path, content, language: langFor(path) });
   }
+  const patchByPath = new Map(
+    rows.filter((f) => f.filename).map((f) => [f.filename as string, f.patch ?? ""]),
+  );
   const referenceFiles = await fetchReferenceFiles(
     token,
     target.owner,
@@ -528,6 +542,7 @@ export async function fetchPullSnapshot(
     target.headSha,
     changedPaths,
     new Map(files.map((f) => [f.path, f.content])),
+    patchByPath,
     new Set(toFetch),
   );
   const diffBlocks = rows

@@ -290,8 +290,11 @@ function findTypeDeclLine(lines: string[], name: string): number {
   return 0;
 }
 
-/** Range of a top-level declaration: from its line to the line that closes it at column 0, bounded. */
+/** Range of a top-level declaration: from its line to the line that closes it at column 0, bounded.
+ * A one-line declaration ending in a semicolon (e.g. `export default () => 1;`, `export type T = X;`)
+ * has no later column-zero closing delimiter, so it is captured as a single line. */
 function declBlockRange(lines: string[], start: number): SliceRange {
+  if (/;\s*(?:\/\/[^\n]*)?$/.test(lines[start - 1] ?? "")) return { start, end: start, reason: "decl" };
   for (let j = start; j <= lines.length; j += 1) {
     if (/^[})\]]/.test(lines[j - 1] ?? "")) return { start, end: j, reason: "decl" };
   }
@@ -355,10 +358,13 @@ function lookupCrossDef(
     const content = corpus.get(path) ?? "";
     const range = definitionRange(content.split("\n"), exported);
     if (range) return { path, range };
-    if (exported === DEFAULT_EXPORT || exported === NAMESPACE_EXPORT) continue;
-    // Barrel: the module re-exports the name from elsewhere — follow to the defining module.
+    if (exported === NAMESPACE_EXPORT) continue; // a namespace object has no single declaration to follow
+    // Barrel: the module re-exports the name from elsewhere — follow to the defining module. A default
+    // import follows a `{ default }` / `{ X as default }` re-export (recorded under the name "default");
+    // `export *` re-exports named symbols but never the default, so it cannot satisfy a default import.
+    const wantName = exported === DEFAULT_EXPORT ? "default" : exported;
     for (const re of reExportsOf(path, content)) {
-      if (re.name !== "*" && re.name !== exported) continue;
+      if (re.name === "*" ? exported === DEFAULT_EXPORT : re.name !== wantName) continue;
       const nextName = re.name === "*" ? exported : re.source;
       const hit = lookupCrossDef(corpus, re.candidates, nextName, path, depth + 1);
       if (hit) return hit;

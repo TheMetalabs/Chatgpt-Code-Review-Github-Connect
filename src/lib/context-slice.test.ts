@@ -337,6 +337,29 @@ describe("crossFileDefs", () => {
     assert.match(crossFileDefs(changed, [impl], 10_000), /via changed barrel/);
   });
 
+  it("follows a `export { default } from` re-export through a barrel for a default import", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import W from './ui';", "function issue() {", "  return new W();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return new W();\n }",
+    }];
+    const barrel = { path: "src/ui/index.ts", content: "export { default } from './widget';" };
+    const widget = { path: "src/ui/widget.ts", content: ["export default class Widget {", "  render() { return 1; } // default re-export via barrel", "}"].join("\n") };
+    assert.match(crossFileDefs(changed, [barrel, widget], 10_000), /default re-export via barrel/);
+  });
+
+  it("captures a one-line anonymous default export without over-capturing", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import make from './factory';", "function issue() {", "  return make();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return make();\n }",
+    }];
+    const factory = { path: "src/factory.ts", content: ["export default () => 1; // anon default", "export const leftover = 2; // not swallowed"].join("\n") };
+    const out = crossFileDefs(changed, [factory], 10_000);
+    assert.match(out, /anon default/);
+    assert.doesNotMatch(out, /not swallowed/); // the anonymous default did not run to EOF
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

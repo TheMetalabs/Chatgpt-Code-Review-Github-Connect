@@ -310,6 +310,33 @@ describe("crossFileDefs", () => {
     assert.match(crossFileDefs(changed, [barrel, widget], 10_000), /default export class/);
   });
 
+  it("follows an indirect default export to the real declaration", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import makeFee from './fee';", "function issue() {", "  return makeFee();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return makeFee();\n }",
+    }];
+    const fee = { path: "src/fee.ts", content: ["const computeFee = () => 7; // indirect default target", "export default computeFee;"].join("\n") };
+    assert.match(crossFileDefs(changed, [fee], 10_000), /indirect default target/);
+  });
+
+  it("follows a re-export from a CHANGED barrel file", () => {
+    const changed = [
+      {
+        path: "src/consumer.ts",
+        content: ["import { helper } from './index';", "function run() {", "  return helper();", "}"].join("\n"),
+        patch: "--- src/consumer.ts\n@@ -1,2 +1,3 @@\n function run() {\n+  return helper();\n }",
+      },
+      {
+        path: "src/index.ts",
+        content: "export { helper } from './impl';",
+        patch: "--- src/index.ts\n@@ -1 +1 @@\n+export { helper } from './impl';",
+      },
+    ];
+    const impl = { path: "src/impl.ts", content: ["export function helper() {", "  return 3; // via changed barrel", "}"].join("\n") };
+    assert.match(crossFileDefs(changed, [impl], 10_000), /via changed barrel/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

@@ -437,21 +437,28 @@ async function fetchReferenceFiles(
       return; // first resolving candidate for this specifier wins
     }
   };
-  // Pass 1: direct relative imports/requires of changed code files.
+  // Pass 1: direct relative imports/requires of changed code files. Cap references per changed file so
+  // one early file with many imports cannot exhaust the global budget before later files are examined.
+  const PER_FILE_REF_CAP = 8;
   for (const changed of changedPaths) {
     if (capped()) break;
     if (!REFERENCE_CODE_RE.test(changed)) continue;
     const content = changedContent.get(changed);
     if (!content) continue;
+    const beforeFile = out.length;
     for (const spec of importSpecifiers(content)) {
-      if (capped()) break;
+      if (capped() || out.length - beforeFile >= PER_FILE_REF_CAP) break;
       await fetchFirst(resolveRelativeImport(changed, spec));
     }
   }
   // Pass 2: follow barrels across levels — a symbol may be re-exported through several index files
   // (index -> mid -> real). BFS over the re-export targets of each newly fetched module, bounded by
-  // hop count and the shared fetch caps, so every barrel level reaches the corpus.
-  let frontier = [...out];
+  // hop count and the shared fetch caps, so every barrel level reaches the corpus. Seed with the
+  // changed code files too, so a CHANGED barrel's re-export targets are fetched (it is never in `out`).
+  const changedRefs = changedPaths
+    .filter((p) => REFERENCE_CODE_RE.test(p) && changedContent.has(p))
+    .map((p) => ({ path: p, content: changedContent.get(p) as string }));
+  let frontier: { path: string; content: string }[] = [...changedRefs, ...out];
   for (let hop = 0; hop < 3 && frontier.length && !capped(); hop += 1) {
     const before = out.length;
     for (const ref of frontier) {

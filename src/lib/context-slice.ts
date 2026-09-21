@@ -309,7 +309,15 @@ function findDefaultExportLine(lines: string[]): number {
 function definitionRange(lines: string[], exported: string): SliceRange | null {
   if (exported === DEFAULT_EXPORT) {
     const dl = findDefaultExportLine(lines);
-    return dl > 0 ? declBlockRange(lines, dl) : null;
+    if (dl <= 0) return null;
+    // Indirect default (`const helper = ...; export default helper;`): follow the identifier to its
+    // real declaration rather than attaching the bare `export default X;` line.
+    const indirect = /^export\s+default\s+([A-Za-z_$][\w$]*)\s*;?\s*$/.exec(lines[dl - 1] ?? "");
+    if (indirect) {
+      const inner = definitionRange(lines, indirect[1]);
+      if (inner) return inner;
+    }
+    return declBlockRange(lines, dl); // inline `export default function/class/{...}`
   }
   const defLine = findDefinitionLine(lines, exported);
   if (defLine > 0) return enclosingRange(lines, defLine, defLine, 0);

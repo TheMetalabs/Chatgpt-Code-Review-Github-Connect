@@ -494,10 +494,13 @@ async function fetchReferenceFiles(
   const changedRefs = changedPaths
     .filter((p) => REFERENCE_CODE_RE.test(p) && changedContent.has(p))
     .map((p) => ({ path: p, content: changedContent.get(p) as string }));
-  let frontier: { path: string; content: string }[] = [...changedRefs, ...out];
-  for (let hop = 0; hop < 3 && frontier.length && !capped(); hop += 1) {
-    const before = out.length;
-    for (const ref of frontier) {
+  // Iterate to a fixpoint: re-scan every known module each round (fetchFirst de-dupes, so this is
+  // cheap) so a barrel already fetched is revisited when a later alias hop propagates another wanted
+  // name to it. Stop when neither the corpus nor any wanted-set grew, or when the caps are hit.
+  const wantedSize = () => [...wantedByModule.values()].reduce((n, s) => n + s.size, 0);
+  let prevSig = -1;
+  for (let hop = 0; hop < 6 && !capped(); hop += 1) {
+    for (const ref of [...changedRefs, ...out]) {
       if (capped()) break;
       const want = wantedByModule.get(ref.path);
       if (!want || !want.size) continue; // nothing wanted from this module
@@ -511,7 +514,9 @@ async function fetchReferenceFiles(
         await fetchFirst(re.candidates);
       }
     }
-    frontier = out.slice(before); // only modules fetched this hop feed the next
+    const sig = out.length + wantedSize();
+    if (sig === prevSig) break; // fixpoint: no new module fetched and no wanted-set grew
+    prevSig = sig;
   }
   return out;
 }

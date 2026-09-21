@@ -429,6 +429,18 @@ describe("crossFileDefs", () => {
     assert.match(crossFileDefs(changed, [index, mid, real], 10_000), /aliased across barrels/);
   });
 
+  it("captures an inline one-line function without over-capturing", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { quick } from './q';", "function issue() {", "  return quick();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return quick();\n }",
+    }];
+    const q = { path: "src/q.ts", content: ["export function quick() { return 1; } // inline fn", "export function later() { return 2; } // sibling kept out"].join("\n") };
+    const out = crossFileDefs(changed, [q], 10_000);
+    assert.match(out, /inline fn/);
+    assert.doesNotMatch(out, /sibling kept out/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

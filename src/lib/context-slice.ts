@@ -138,17 +138,19 @@ function enclosingRange(lines: string[], hunkStart: number, hunkEnd: number, pad
     if (CLASS_DECL.test(line)) return window();
     const cm = CLASS_MEMBER.exec(line);
     if (cm && !KEYWORDS.has(cm[1])) {
+      // One-line member (`foo() { return 1; }`) closes on its own line — capture just that line.
+      if (/[;}]\s*(?:\/\/[^\n]*)?$/.test(line)) return { start: i, end: i, reason: "member" };
       for (let j = Math.max(i, hunkEnd); j <= lines.length; j += 1) {
         if (/^ {2}\}/.test(lines[j - 1] ?? "")) return { start: i, end: j, reason: "member" };
       }
       return { start: i, end: lines.length, reason: "member" };
     }
     if (TOP_FN.test(line) || TOP_VAR.test(line)) {
-      // A statement that ends on its own line (expression-bodied `export const f = () => 1;`, or any
-      // one-line declaration) has no later column-zero closing delimiter — capture just that line
-      // instead of scanning to EOF. Match a trailing `;` (with an optional line comment) only at the
-      // line's end, so a `//` inside a string does not trigger a false multi-line scan.
-      if (/;\s*(?:\/\/[^\n]*)?$/.test(line)) return { start: i, end: i, reason: "toplevel" };
+      // A statement that ends on its own line (expression-bodied `export const f = () => 1;`, inline
+      // `export function f() { return 1; }`, or any one-line declaration) has no later column-zero
+      // closing delimiter — capture just that line. Match a trailing `;` or `}` (with an optional line
+      // comment) only at the line's end, so a `//` inside a string does not trigger a false scan.
+      if (/[;}]\s*(?:\/\/[^\n]*)?$/.test(line)) return { start: i, end: i, reason: "toplevel" };
       for (let j = Math.max(i, hunkEnd); j <= lines.length; j += 1) {
         const l = lines[j - 1] ?? "";
         // Stop at a column-zero closing delimiter, but not one that immediately re-opens a block

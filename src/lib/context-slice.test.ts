@@ -385,6 +385,26 @@ describe("crossFileDefs", () => {
     assert.match(crossFileDefs(changed, [calc], 10_000), /multiline arrow body/);
   });
 
+  it("attaches a named import's definition when a static member is called (Parser.parse())", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { Parser } from './parser';", "function issue() {", "  return Parser.parse('x');", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return Parser.parse('x');\n }",
+    }];
+    const parser = { path: "src/parser.ts", content: ["export class Parser {", "  static parse(s) { return s; } // named receiver def", "}"].join("\n") };
+    assert.match(crossFileDefs(changed, [parser], 10_000), /named receiver def/);
+  });
+
+  it("resolves a default exported via a local export list (export { x as default })", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import thing from './thing';", "function issue() {", "  return thing();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return thing();\n }",
+    }];
+    const thing = { path: "src/thing.ts", content: ["function makeThing() {", "  return 1; // local default via export list", "}", "export { makeThing as default };"].join("\n") };
+    assert.match(crossFileDefs(changed, [thing], 10_000), /local default via export list/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

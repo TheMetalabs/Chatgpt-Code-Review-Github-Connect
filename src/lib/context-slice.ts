@@ -310,20 +310,35 @@ function findDefaultExportLine(lines: string[]): number {
   return 0;
 }
 
+/** Local name mapped to the default via an export list (`export { helper as default };`), or "".
+ * A `... from '...'` clause is a re-export (handled by reExportsOf), not a local default. */
+function findLocalDefaultAliasName(lines: string[]): string {
+  for (const line of lines) {
+    if (/\bfrom\b/.test(line)) continue;
+    const m = /export\s*\{[^}]*\b([A-Za-z_$][\w$]*)\s+as\s+default\b/.exec(line);
+    if (m) return m[1];
+  }
+  return "";
+}
+
 /** Definition range of an exported symbol in a module's lines, or null if not found. `exported` may be
  * DEFAULT_EXPORT to locate the module's default export. */
 function definitionRange(lines: string[], exported: string): SliceRange | null {
   if (exported === DEFAULT_EXPORT) {
     const dl = findDefaultExportLine(lines);
-    if (dl <= 0) return null;
-    // Indirect default (`const helper = ...; export default helper;`): follow the identifier to its
-    // real declaration rather than attaching the bare `export default X;` line.
-    const indirect = /^export\s+default\s+([A-Za-z_$][\w$]*)\s*;?\s*$/.exec(lines[dl - 1] ?? "");
-    if (indirect) {
-      const inner = definitionRange(lines, indirect[1]);
-      if (inner) return inner;
+    if (dl > 0) {
+      // Indirect default (`const helper = ...; export default helper;`): follow the identifier to its
+      // real declaration rather than attaching the bare `export default X;` line.
+      const indirect = /^export\s+default\s+([A-Za-z_$][\w$]*)\s*;?\s*$/.exec(lines[dl - 1] ?? "");
+      if (indirect) {
+        const inner = definitionRange(lines, indirect[1]);
+        if (inner) return inner;
+      }
+      return declBlockRange(lines, dl); // inline `export default function/class/{...}`
     }
-    return declBlockRange(lines, dl); // inline `export default function/class/{...}`
+    // Default via a local export list (`const helper = ...; export { helper as default };`).
+    const localDefault = findLocalDefaultAliasName(lines);
+    return localDefault ? definitionRange(lines, localDefault) : null;
   }
   const defLine = findDefinitionLine(lines, exported);
   if (defLine > 0) return enclosingRange(lines, defLine, defLine, 0);
@@ -422,12 +437,17 @@ export function crossFileDefs(
       const hit = lookupCrossDef(corpus, b.candidates, b.exported, origin.path, 0);
       if (hit) emit(hit);
     }
-    // Namespace member calls: `ns.member(` after `import * as ns` / `const ns = require(...)`.
+    // Qualified calls `X.member(`: a namespace member (`import * as ns; ns.member()`) looks the member
+    // up in the namespace module; a static/object member on a named or default import
+    // (`import { Parser }; Parser.parse()`) attaches the receiver's own definition (the class/object).
     for (const q of hunkText.matchAll(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(/g)) {
       if (remaining <= 0 || count >= MAX_DEFS) break;
       const b = bindings.get(q[1]);
-      if (!b || b.kind !== "namespace") continue;
-      const hit = lookupCrossDef(corpus, b.candidates, q[2], origin.path, 0);
+      if (!b) continue;
+      const hit =
+        b.kind === "namespace"
+          ? lookupCrossDef(corpus, b.candidates, q[2], origin.path, 0)
+          : lookupCrossDef(corpus, b.candidates, b.exported, origin.path, 0);
       if (hit) emit(hit);
     }
   }

@@ -253,4 +253,35 @@ describe("crossFileDefs", () => {
     assert.match(out, /money format/);
     assert.doesNotMatch(out, /date format/); // unrelated same-named export not attached
   });
+
+  it("attaches a namespace member call's definition (import * as ns; ns.member())", () => {
+    const changedNs = [{
+      path: "src/pay.ts",
+      content: ["import * as dates from './dates';", "function issue() {", "  return dates.addMonths(1);", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return dates.addMonths(1);\n }",
+    }];
+    const dates = { path: "src/dates.ts", content: ["export function addMonths(n) {", "  return n; // ns member body", "}"].join("\n") };
+    assert.match(crossFileDefs(changedNs, [dates], 10_000), /ns member body/);
+  });
+
+  it("follows a barrel re-export to the defining module", () => {
+    const changedBarrel = [{
+      path: "src/pay.ts",
+      content: ["import { helper } from './lib';", "function issue() {", "  return helper();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return helper();\n }",
+    }];
+    const barrel = { path: "src/lib/index.ts", content: "export { helper } from './helper';" };
+    const real = { path: "src/lib/helper.ts", content: ["export function helper() {", "  return 1; // real def via barrel", "}"].join("\n") };
+    assert.match(crossFileDefs(changedBarrel, [barrel, real], 10_000), /real def via barrel/);
+  });
+
+  it("resolves a CommonJS require destructure", () => {
+    const changedCjs = [{
+      path: "src/pay.cjs",
+      content: ["const { compute } = require('./calc');", "function issue() {", "  return compute();", "}"].join("\n"),
+      patch: "--- src/pay.cjs\n@@ -1,2 +1,3 @@\n function issue() {\n+  return compute();\n }",
+    }];
+    const calc = { path: "src/calc.ts", content: ["export function compute() {", "  return 2; // cjs required def", "}"].join("\n") };
+    assert.match(crossFileDefs(changedCjs, [calc], 10_000), /cjs required def/);
+  });
 });

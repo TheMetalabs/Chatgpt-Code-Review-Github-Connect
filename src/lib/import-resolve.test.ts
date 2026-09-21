@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_EXPORT, importGraph, importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
+import { DEFAULT_EXPORT, importGraph, importSpecifiers, reExportsOf, resolveRelativeImport } from "./import-resolve.ts";
 
 describe("importSpecifiers", () => {
   it("collects import and re-export module specifiers", () => {
@@ -10,14 +10,14 @@ describe("importSpecifiers", () => {
       "export { C } from './c';",
       "import type { T } from '../types';",
       "import './side-effect';",
-      "const x = require('./nope');", // not from-syntax → ignored
+      "const x = require('./cjs-dep');", // CommonJS require is captured too
     ].join("\n");
     const specs = importSpecifiers(src);
     assert.ok(specs.includes("../a/thing"));
     assert.ok(specs.includes("./b"));
     assert.ok(specs.includes("./c"));
     assert.ok(specs.includes("../types"));
-    assert.ok(!specs.includes("./nope"), "require() is not an ESM from-specifier");
+    assert.ok(specs.includes("./cjs-dep"), "CommonJS require specifier is captured");
   });
 });
 
@@ -81,5 +81,36 @@ describe("importGraph", () => {
     assert.equal(def?.exported, DEFAULT_EXPORT); // default import
     assert.ok(def?.candidates.includes("src/entities/membership.ts"));
     assert.ok(!g.some((b) => b.local === "X"), "package import is skipped");
+  });
+});
+
+describe("importGraph namespace + CommonJS", () => {
+  it("binds namespace imports and CJS require (destructured + whole)", () => {
+    const src = [
+      "import * as utils from './utils';",
+      "const { helper, other: o } = require('./cjs');",
+      "const whole = require('./whole');",
+    ].join("\n");
+    const g = importGraph("src/a.ts", src);
+    const ns = g.find((b) => b.local === "utils");
+    assert.equal(ns?.kind, "namespace");
+    assert.ok(ns?.candidates.includes("src/utils.ts"));
+    const helper = g.find((b) => b.local === "helper");
+    assert.equal(helper?.kind, "named");
+    assert.equal(helper?.exported, "helper");
+    assert.equal(g.find((b) => b.local === "o")?.exported, "other"); // { other: o } → local o, exported other
+    assert.equal(g.find((b) => b.local === "whole")?.kind, "namespace");
+  });
+});
+
+describe("reExportsOf", () => {
+  it("parses named and star re-exports with resolved candidates", () => {
+    const src = "export { A, B as C } from './real';\nexport * from './more';";
+    const re = reExportsOf("src/index.ts", src);
+    const a = re.find((r) => r.name === "A");
+    assert.equal(a?.source, "A");
+    assert.ok(a?.candidates.includes("src/real.ts"));
+    assert.equal(re.find((r) => r.name === "C")?.source, "B"); // `B as C` → exported-as C, defined-as B
+    assert.ok(re.some((r) => r.name === "*" && r.candidates.includes("src/more.ts")));
   });
 });

@@ -4,7 +4,7 @@
 // *encloses* every changed hunk (plus the import block) with line-number gutters
 // so the model can cite exact RIGHT-side lines. Boundaries are detected by
 // Prettier-style indentation, never by brace counting (strings/regex break that).
-import { DEFAULT_EXPORT, importGraph } from "./import-resolve.ts";
+import { DEFAULT_EXPORT, NAMESPACE_EXPORT, importGraph, reExportsOf } from "./import-resolve.ts";
 
 export type HunkRange = { newStart: number; newLines: number };
 export type SliceRange = { start: number; end: number; reason: string };
@@ -326,6 +326,34 @@ function definitionRange(lines: string[], exported: string): SliceRange | null {
  * (no worse than before this feature), and the LOCAL reviewer's on-demand pull (readFileAtHead) is the
  * complete-coverage path for anything this static approximation does not resolve.
  */
+/** Find an exported symbol's definition across candidate modules, following barrel re-exports
+ * (`export { X } from './real'`, `export * from './real'`) to the module that actually declares it.
+ * Depth-capped so a re-export cycle cannot loop. */
+function lookupCrossDef(
+  corpus: Map<string, string>,
+  candidates: string[],
+  exported: string,
+  excludePath: string,
+  depth: number,
+): { path: string; range: SliceRange } | null {
+  if (depth > 2) return null;
+  for (const path of candidates) {
+    if (path === excludePath || !corpus.has(path)) continue;
+    const content = corpus.get(path) ?? "";
+    const range = definitionRange(content.split("\n"), exported);
+    if (range) return { path, range };
+    if (exported === DEFAULT_EXPORT || exported === NAMESPACE_EXPORT) continue;
+    // Barrel: the module re-exports the name from elsewhere — follow to the defining module.
+    for (const re of reExportsOf(path, content)) {
+      if (re.name !== "*" && re.name !== exported) continue;
+      const nextName = re.name === "*" ? exported : re.source;
+      const hit = lookupCrossDef(corpus, re.candidates, nextName, path, depth + 1);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
 export function crossFileDefs(
   changed: { path: string; content: string; patch: string }[],
   referenceFiles: { path: string; content: string }[],
@@ -342,34 +370,42 @@ export function crossFileDefs(
   let remaining = maxChars;
   let count = 0;
   const MAX_DEFS = 24;
+  const emit = (hit: { path: string; range: SliceRange }): void => {
+    const key = `${hit.path}:${hit.range.start}`;
+    if (seen.has(key)) return;
+    const text = rangeText(hit.path, hit.range, String(corpus.get(hit.path) ?? "").split("\n"));
+    if (text.length + 2 > remaining) return;
+    seen.add(key);
+    blocks.push(text);
+    remaining -= text.length + 2;
+    count += 1;
+  };
   // Attribute called names to the file they are called FROM, follow the exact import that binds each
-  // name to its module (resolving aliases and default imports), and look the def up ONLY in that
-  // module — never every module that happens to export the same name. The origin file is skipped
-  // (its own defs are already in the hunk snapshot's same-file 1-hop).
+  // name to its module (resolving aliases, default, namespace, and CJS require; following barrels),
+  // and look the def up ONLY in that module. The origin file is skipped (its own defs are already in
+  // the hunk snapshot's same-file 1-hop).
   for (const origin of changed) {
     if (remaining <= 0 || count >= MAX_DEFS) break;
-    const hunk = extractHunkLines(origin.patch);
-    const called = new Set<string>(collectNames(hunk, CALL_RE, 1));
-    for (const n of collectNames(hunk, /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) called.add(n);
-    if (!called.size) continue;
     const bindings = new Map(importGraph(origin.path, origin.content).map((b) => [b.local, b]));
-    for (const name of called) {
+    if (!bindings.size) continue;
+    const hunkText = extractHunkLines(origin.patch).join("\n");
+    // Plain calls / constructions: `helper(`, `new Entity(`.
+    const plain = new Set<string>(collectNames([hunkText], CALL_RE, 1));
+    for (const n of collectNames([hunkText], /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) plain.add(n);
+    for (const name of plain) {
       if (remaining <= 0 || count >= MAX_DEFS) break;
-      const binding = bindings.get(name);
-      if (!binding) continue; // not an import → same-file/global, not a cross-file dependency
-      const targetPath = binding.candidates.find((p) => corpus.has(p) && p !== origin.path);
-      if (!targetPath) continue;
-      const lines = String(corpus.get(targetPath) ?? "").split("\n");
-      const r = definitionRange(lines, binding.exported);
-      if (!r) continue;
-      const key = `${targetPath}:${r.start}`;
-      if (seen.has(key)) continue;
-      const text = rangeText(targetPath, r, lines);
-      if (text.length + 2 > remaining) continue;
-      seen.add(key);
-      blocks.push(text);
-      remaining -= text.length + 2;
-      count += 1;
+      const b = bindings.get(name);
+      if (!b || b.kind === "namespace") continue; // namespace members handled via qualified calls below
+      const hit = lookupCrossDef(corpus, b.candidates, b.exported, origin.path, 0);
+      if (hit) emit(hit);
+    }
+    // Namespace member calls: `ns.member(` after `import * as ns` / `const ns = require(...)`.
+    for (const q of hunkText.matchAll(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(/g)) {
+      if (remaining <= 0 || count >= MAX_DEFS) break;
+      const b = bindings.get(q[1]);
+      if (!b || b.kind !== "namespace") continue;
+      const hit = lookupCrossDef(corpus, b.candidates, q[2], origin.path, 0);
+      if (hit) emit(hit);
     }
   }
   return blocks.join("\n\n");

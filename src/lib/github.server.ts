@@ -3,7 +3,7 @@ import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
-import { importSpecifiers, resolveRelativeImport } from "./import-resolve";
+import { importSpecifiers, reExportsOf, resolveRelativeImport } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
@@ -423,22 +423,38 @@ async function fetchReferenceFiles(
   const out: SnapshotFile[] = [];
   const tried = new Set(alreadyFetched);
   let attempts = 0;
+  const capped = () => out.length >= REFERENCE_FILE_CAP || attempts >= REFERENCE_FETCH_CAP;
+  // Fetch the first candidate path that exists (a specifier maps to several extension/index candidates).
+  const fetchFirst = async (candidates: string[]): Promise<void> => {
+    for (const cand of candidates) {
+      if (capped()) return;
+      if (tried.has(cand)) continue;
+      tried.add(cand);
+      attempts += 1;
+      const c = await getFile(token, owner, repo, cand, headSha);
+      if (c == null) continue; // wrong extension candidate; try the next
+      if (!isSandboxPolicyFile(c)) out.push({ path: cand, content: c, language: langFor(cand) });
+      return; // first resolving candidate for this specifier wins
+    }
+  };
+  // Pass 1: direct relative imports/requires of changed code files.
   for (const changed of changedPaths) {
-    if (out.length >= REFERENCE_FILE_CAP || attempts >= REFERENCE_FETCH_CAP) break;
+    if (capped()) break;
     if (!REFERENCE_CODE_RE.test(changed)) continue;
     const content = changedContent.get(changed);
     if (!content) continue;
     for (const spec of importSpecifiers(content)) {
-      if (out.length >= REFERENCE_FILE_CAP || attempts >= REFERENCE_FETCH_CAP) break;
-      for (const cand of resolveRelativeImport(changed, spec)) {
-        if (tried.has(cand)) continue;
-        tried.add(cand);
-        attempts += 1;
-        const c = await getFile(token, owner, repo, cand, headSha);
-        if (c == null) continue; // wrong extension candidate; try the next
-        if (!isSandboxPolicyFile(c)) out.push({ path: cand, content: c, language: langFor(cand) });
-        break; // first resolving candidate for this specifier wins
-      }
+      if (capped()) break;
+      await fetchFirst(resolveRelativeImport(changed, spec));
+    }
+  }
+  // Pass 2: follow barrels — the re-export targets of the modules just fetched — so a symbol
+  // re-exported through an index (`export { X } from './real'`) reaches the corpus for lookup.
+  for (const ref of [...out]) {
+    if (capped()) break;
+    for (const re of reExportsOf(ref.path, ref.content)) {
+      if (capped()) break;
+      await fetchFirst(re.candidates);
     }
   }
   return out;

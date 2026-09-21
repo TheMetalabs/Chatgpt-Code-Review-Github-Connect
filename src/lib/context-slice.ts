@@ -150,7 +150,10 @@ function enclosingRange(lines: string[], hunkStart: number, hunkEnd: number, pad
       // line's end, so a `//` inside a string does not trigger a false multi-line scan.
       if (/;\s*(?:\/\/[^\n]*)?$/.test(line)) return { start: i, end: i, reason: "toplevel" };
       for (let j = Math.max(i, hunkEnd); j <= lines.length; j += 1) {
-        if (/^[\])}]/.test(lines[j - 1] ?? "")) return { start: i, end: j, reason: "toplevel" };
+        const l = lines[j - 1] ?? "";
+        // Stop at a column-zero closing delimiter, but not one that immediately re-opens a block
+        // (e.g. `) => {` closing multi-line params before the arrow body) — keep scanning to the body.
+        if (/^[\])}]/.test(l) && !/[([{]\s*$/.test(l)) return { start: i, end: j, reason: "toplevel" };
       }
       return { start: i, end: lines.length, reason: "toplevel" };
     }

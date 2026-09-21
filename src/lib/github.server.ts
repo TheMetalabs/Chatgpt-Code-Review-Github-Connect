@@ -422,18 +422,23 @@ async function fetchReferenceFiles(
 ): Promise<SnapshotFile[]> {
   if (process.env.ASHLAR_CROSS_FILE_REFS === "0") return [];
   const out: SnapshotFile[] = [];
-  const tried = new Set(alreadyFetched);
+  const tried = new Set(alreadyFetched); // paths already attempted (may have failed)
+  const exists = new Set(alreadyFetched); // paths already in the corpus: changed + policy, then refs
   let attempts = 0;
   const capped = () => out.length >= REFERENCE_FILE_CAP || attempts >= REFERENCE_FETCH_CAP;
   // Fetch the first candidate path that exists (a specifier maps to several extension/index candidates).
   const fetchFirst = async (candidates: string[]): Promise<void> => {
     for (const cand of candidates) {
+      // Already in the corpus (a changed/policy file, or a ref fetched earlier): the specifier is
+      // resolved — do not keep trying other extensions or fetch a wrong sibling.
+      if (exists.has(cand)) return;
       if (capped()) return;
       if (tried.has(cand)) continue;
       tried.add(cand);
       attempts += 1;
       const c = await getFile(token, owner, repo, cand, headSha);
       if (c == null) continue; // wrong extension candidate; try the next
+      exists.add(cand);
       if (!isSandboxPolicyFile(c)) out.push({ path: cand, content: c, language: langFor(cand) });
       return; // first resolving candidate for this specifier wins
     }

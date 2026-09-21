@@ -371,6 +371,20 @@ describe("crossFileDefs", () => {
     assert.doesNotMatch(crossFileDefs(changed, [helpers], 10_000), /not the array method/);
   });
 
+  it("captures the body of a multiline arrow helper", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { calc } from './calc';", "function issue() {", "  return calc(1, 2);", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return calc(1, 2);\n }",
+    }];
+    const calc = {
+      path: "src/calc.ts",
+      content: ["export const calc = (", "  a,", "  b,", ") => {", "  return a + b; // multiline arrow body", "};"].join("\n"),
+    };
+    // The `) => {` closing the params must not end the range before the arrow body.
+    assert.match(crossFileDefs(changed, [calc], 10_000), /multiline arrow body/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

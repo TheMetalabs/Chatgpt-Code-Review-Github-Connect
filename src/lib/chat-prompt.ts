@@ -157,11 +157,15 @@ export function buildChatParts(opts: {
   // helpers the changed hunks call from imported (unchanged) modules — the "file attachment" analog of
   // the multi-turn loop's on-demand file_read. Fill only the snapshot budget left after the hunk
   // context, capped so it never crowds out the changed code itself.
+  const crossPatchByPath = patchesByPath(opts.sample.diff);
+  const changedForDefs = opts.sample.files
+    .filter((f) => opts.sample.changedPaths.includes(f.path))
+    .map((f) => ({ path: f.path, content: f.content, patch: crossPatchByPath.get(f.path) ?? "" }));
   const crossBody =
     mode === "head"
       ? ""
       : crossFileDefs(
-          [...patchesByPath(opts.sample.diff).values()],
+          changedForDefs,
           opts.sample.referenceFiles ?? [],
           Math.min(Math.max(0, contextMaxChars - hunkBody.length), 40_000),
         );

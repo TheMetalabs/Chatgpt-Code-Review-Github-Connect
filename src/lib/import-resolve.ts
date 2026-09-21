@@ -3,6 +3,27 @@
 
 const IMPORT_FROM_RE = /^\s*(?:import|export)\b[^'"]*?\bfrom\s*['"]([^'"]+)['"]/gm;
 
+const NAMED_IMPORT_RE = /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"][^'"]+['"]/g;
+const BINDING_RE = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/;
+
+/**
+ * Named-import bindings as [localName, exportedName] pairs. `import { addCalendarMonths as addMonths }`
+ * yields ["addMonths", "addCalendarMonths"], so a lookup by the local name a hunk calls can find the
+ * declaration under its exported name. Plain `import { X }` yields ["X", "X"].
+ */
+export function importBindings(content: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  NAMED_IMPORT_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = NAMED_IMPORT_RE.exec(String(content || ""))) !== null) {
+    for (const raw of m[1].split(",")) {
+      const b = BINDING_RE.exec(raw.trim());
+      if (b) out.push([b[2] || b[1], b[1]]); // [local, exported]
+    }
+  }
+  return out;
+}
+
 /** Module specifiers a source file imports/re-exports from (ESM `... from '...'` only). */
 export function importSpecifiers(content: string): string[] {
   const out = new Set<string>();

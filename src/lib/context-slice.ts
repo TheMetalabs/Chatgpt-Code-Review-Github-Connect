@@ -4,6 +4,7 @@
 // *encloses* every changed hunk (plus the import block) with line-number gutters
 // so the model can cite exact RIGHT-side lines. Boundaries are detected by
 // Prettier-style indentation, never by brace counting (strings/regex break that).
+import { importBindings } from "./import-resolve.ts";
 
 export type HunkRange = { newStart: number; newLines: number };
 export type SliceRange = { start: number; end: number; reason: string };
@@ -283,39 +284,53 @@ function declBlockRange(lines: string[], start: number): SliceRange {
 }
 
 export function crossFileDefs(
-  changedPatches: string[],
+  changed: { path: string; content: string; patch: string }[],
   referenceFiles: { path: string; content: string }[],
   maxChars: number,
 ): string {
-  if (maxChars <= 0 || !referenceFiles?.length) return "";
-  const added = changedPatches.flatMap(extractAddedLines);
-  const names = new Set<string>(collectNames(added, CALL_RE, 1));
-  for (const n of collectNames(added, /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) names.add(n);
-  if (!names.size) return "";
+  if (maxChars <= 0 || !changed?.length) return "";
+  // Search corpus: unchanged imported modules AND the changed files themselves — a changed file can
+  // define a helper another changed file calls whose definition sits outside its own hunk slice.
+  const corpus = [...referenceFiles, ...changed.map((c) => ({ path: c.path, content: c.content }))];
   const blocks: string[] = [];
   const seen = new Set<string>(); // path:defLine — never emit the same definition twice
   let remaining = maxChars;
   let count = 0;
   const MAX_DEFS = 24;
-  for (const f of referenceFiles) {
+  // Attribute called names to the file they are called FROM, so per-file import aliases resolve and the
+  // origin file is skipped (its own defs are already in the hunk snapshot's same-file 1-hop).
+  for (const origin of changed) {
     if (remaining <= 0 || count >= MAX_DEFS) break;
-    const lines = String(f.content ?? "").split("\n");
-    for (const name of names) {
+    const added = extractAddedLines(origin.patch);
+    const names = new Set<string>(collectNames(added, CALL_RE, 1));
+    for (const n of collectNames(added, /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) names.add(n);
+    if (!names.size) continue;
+    // Aliased imports: a hunk may call the LOCAL name (`import { addCalendarMonths as addMonths }`),
+    // but the module declares the EXPORTED name. Map local -> exported so the lookup finds the def.
+    const exported = new Map<string, string>();
+    for (const [local, exp] of importBindings(origin.content)) if (local !== exp) exported.set(local, exp);
+    for (const f of corpus) {
+      if (f.path === origin.path) continue; // same-file defs are already in the snapshot
       if (remaining <= 0 || count >= MAX_DEFS) break;
-      // Functions/vars/members via findDefinitionLine; classes/enums/interfaces (constructed or
-      // referenced) via findTypeDeclLine so `new Membership(...)` reaches the entity definition.
-      const defLine = findDefinitionLine(lines, name);
-      const declLine = defLine > 0 ? 0 : findTypeDeclLine(lines, name);
-      if (defLine <= 0 && declLine <= 0) continue;
-      const r = defLine > 0 ? enclosingRange(lines, defLine, defLine, 0) : declBlockRange(lines, declLine);
-      const key = `${f.path}:${r.start}`;
-      if (seen.has(key)) continue;
-      const text = rangeText(f.path, r, lines);
-      if (text.length + 2 > remaining) continue;
-      seen.add(key);
-      blocks.push(text);
-      remaining -= text.length + 2;
-      count += 1;
+      const lines = String(f.content ?? "").split("\n");
+      for (const name of names) {
+        if (remaining <= 0 || count >= MAX_DEFS) break;
+        const lookup = exported.get(name) ?? name;
+        // Functions/vars/members via findDefinitionLine; classes/enums/interfaces (constructed or
+        // referenced) via findTypeDeclLine so `new Membership(...)` reaches the entity definition.
+        const defLine = findDefinitionLine(lines, lookup);
+        const declLine = defLine > 0 ? 0 : findTypeDeclLine(lines, lookup);
+        if (defLine <= 0 && declLine <= 0) continue;
+        const r = defLine > 0 ? enclosingRange(lines, defLine, defLine, 0) : declBlockRange(lines, declLine);
+        const key = `${f.path}:${r.start}`;
+        if (seen.has(key)) continue;
+        const text = rangeText(f.path, r, lines);
+        if (text.length + 2 > remaining) continue;
+        seen.add(key);
+        blocks.push(text);
+        remaining -= text.length + 2;
+        count += 1;
+      }
     }
   }
   return blocks.join("\n\n");

@@ -401,7 +401,9 @@ export async function getFile(token: string, owner: string, repo: string, path: 
   return null;
 }
 
-const REFERENCE_CODE_RE = /\.(?:ts|tsx|js|jsx)$/;
+// Same module-extension set resolveRelativeImport understands, so a changed .mts/.cts/.mjs/.cjs file's
+// imports are traversed too (not silently skipped).
+const REFERENCE_CODE_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const REFERENCE_FILE_CAP = 24; // resolved reference modules kept
 const REFERENCE_FETCH_CAP = 80; // total getFile attempts for references (bounds API cost per review)
 

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
+import { importBindings, importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
 
 describe("importSpecifiers", () => {
   it("collects import and re-export module specifiers", () => {
@@ -54,5 +54,15 @@ describe("resolveRelativeImport", () => {
     assert.ok(cands.length > 0);
     assert.ok(cands.every((c) => !c.includes("..")), "resolved candidates are plain repo paths");
     assert.ok(cands.includes("src/util.ts"));
+  });
+});
+
+describe("importBindings", () => {
+  it("maps aliased named imports to [local, exported]", () => {
+    const src = "import { addCalendarMonths as addMonths, Foo } from './date';\nimport type { T as U } from './t';";
+    const b = importBindings(src);
+    assert.deepEqual(b.find(([l]) => l === "addMonths"), ["addMonths", "addCalendarMonths"]);
+    assert.deepEqual(b.find(([l]) => l === "Foo"), ["Foo", "Foo"]);
+    assert.deepEqual(b.find(([l]) => l === "U"), ["U", "T"]);
   });
 });

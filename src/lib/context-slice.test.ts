@@ -141,48 +141,78 @@ describe("sliceContext 1-hop and scale", () => {
 });
 
 describe("crossFileDefs", () => {
-  const changedPatch =
-    "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  const e = addCalendarMonths(start, 12);\n   return e;";
+  const changed = [{
+    path: "src/pay.ts",
+    content: ["import { addCalendarMonths } from './date';", "export function issue() {", "  const e = addCalendarMonths(start, 12);", "  return e;", "}"].join("\n"),
+    patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  const e = addCalendarMonths(start, 12);\n   return e;",
+  }];
   const dateUtil = {
     path: "src/date.ts",
-    content: [
-      "export function addCalendarMonths(ymd, months) {", // 1
-      "  return ymd; // ... clamps to last day", // 2
-      "}", // 3
-      "export function unrelatedHelper() {", // 4
-      "  return 0;", // 5
-      "}", // 6
-    ].join("\n"),
+    content: ["export function addCalendarMonths(ymd, months) {", "  return ymd; // clamps to last day", "}", "export function unrelatedHelper() {", "  return 0;", "}"].join("\n"),
   };
 
   it("pulls the definition of a cross-file helper the changed hunk calls", () => {
-    const out = crossFileDefs([changedPatch], [dateUtil], 10_000);
+    const out = crossFileDefs(changed, [dateUtil], 10_000);
     assert.match(out, /addCalendarMonths/);
     assert.match(out, /src\/date\.ts/);
-    assert.match(out, /clamps to last day/); // the body came through, not just the signature line
+    assert.match(out, /clamps to last day/); // the body came through, not just the signature
   });
 
   it("does not pull definitions the change never references", () => {
-    const out = crossFileDefs([changedPatch], [dateUtil], 10_000);
-    assert.doesNotMatch(out, /unrelatedHelper/);
+    assert.doesNotMatch(crossFileDefs(changed, [dateUtil], 10_000), /unrelatedHelper/);
   });
 
-  it("returns empty with no reference files or no budget", () => {
-    assert.equal(crossFileDefs([changedPatch], [], 10_000), "");
-    assert.equal(crossFileDefs([changedPatch], [dateUtil], 0), "");
+  it("returns empty with no changed files or no budget", () => {
+    assert.equal(crossFileDefs([], [dateUtil], 10_000), "");
+    assert.equal(crossFileDefs(changed, [dateUtil], 0), "");
   });
 
   it("pulls a constructed imported class definition (new X resolves class X)", () => {
     // Regression: crossFileDefs collected `new Membership` but findDefinitionLine could not find a
     // top-level `export class Membership`, so the entity definition was silently omitted.
-    const patch = "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return new Membership(1);\n }";
+    const changedNew = [{
+      path: "src/pay.ts",
+      content: ["import { Membership } from './membership';", "function issue() {", "  return new Membership(1);", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return new Membership(1);\n }",
+    }];
     const entity = {
       path: "src/membership.ts",
       content: ["export class Membership {", "  isUsableOn(d) {", "    return d <= this.expiresAt; // inclusive", "  }", "}"].join("\n"),
     };
-    const out = crossFileDefs([patch], [entity], 10_000);
+    const out = crossFileDefs(changedNew, [entity], 10_000);
     assert.match(out, /class Membership/);
     assert.match(out, /isUsableOn/);
     assert.match(out, /inclusive/); // the class body came through, so its semantics are visible
+  });
+
+  it("resolves an aliased import to the exported declaration name", () => {
+    // `import { addCalendarMonths as addMonths }` — the hunk calls addMonths, the module declares
+    // addCalendarMonths; the lookup must follow the alias.
+    const changedAlias = [{
+      path: "src/pay.ts",
+      content: ["import { addCalendarMonths as addMonths } from './date';", "function issue() {", "  return addMonths(1);", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return addMonths(1);\n }",
+    }];
+    assert.match(crossFileDefs(changedAlias, [dateUtil], 10_000), /addCalendarMonths/);
+  });
+
+  it("finds a helper defined in ANOTHER changed file, skipping the origin file", () => {
+    // A calls a helper from changed file B (not a referenceFile); B's def sits outside its own hunk.
+    // crossFileDefs must search changed files too, and skip A's own defs (already in the snapshot).
+    const two = [
+      {
+        path: "src/a.ts",
+        content: ["import { sharedHelper } from './b';", "function run() {", "  return sharedHelper();", "}"].join("\n"),
+        patch: "--- src/a.ts\n@@ -1,2 +1,3 @@\n function run() {\n+  return sharedHelper();\n }",
+      },
+      {
+        path: "src/b.ts",
+        content: ["export function sharedHelper() {", "  return 42; // cross-changed contract", "}"].join("\n"),
+        patch: "--- src/b.ts\n@@ -9,1 +9,1 @@\n unrelated line",
+      },
+    ];
+    const out = crossFileDefs(two, [], 10_000);
+    assert.match(out, /sharedHelper/);
+    assert.match(out, /cross-changed contract/);
   });
 });

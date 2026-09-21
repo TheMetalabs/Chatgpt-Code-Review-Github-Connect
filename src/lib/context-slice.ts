@@ -144,6 +144,11 @@ function enclosingRange(lines: string[], hunkStart: number, hunkEnd: number, pad
       return { start: i, end: lines.length, reason: "member" };
     }
     if (TOP_FN.test(line) || TOP_VAR.test(line)) {
+      // A statement that ends on its own line (expression-bodied `export const f = () => 1;`, or any
+      // one-line declaration) has no later column-zero closing delimiter — capture just that line
+      // instead of scanning to EOF. Match a trailing `;` (with an optional line comment) only at the
+      // line's end, so a `//` inside a string does not trigger a false multi-line scan.
+      if (/;\s*(?:\/\/[^\n]*)?$/.test(line)) return { start: i, end: i, reason: "toplevel" };
       for (let j = Math.max(i, hunkEnd); j <= lines.length; j += 1) {
         if (/^[\])}]/.test(lines[j - 1] ?? "")) return { start: i, end: j, reason: "toplevel" };
       }

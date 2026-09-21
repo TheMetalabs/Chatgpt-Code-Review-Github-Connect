@@ -70,7 +70,9 @@ export function reExportsOf(fromPath: string, content: string): ReExport[] {
     if (!candidates.length) continue;
     for (const raw of m[1].split(",")) {
       const b = BINDING_RE.exec(raw.trim());
-      if (b) out.push({ name: b[2] || b[1], source: b[1], candidates }); // exported-as, defined-as
+      // `export { default as Widget } from './w'` re-exports the target's DEFAULT under the name
+      // Widget, so a follow-through must look up the default export, not a symbol named "default".
+      if (b) out.push({ name: b[2] || b[1], source: b[1] === "default" ? DEFAULT_EXPORT : b[1], candidates });
     }
   }
   REEXPORT_STAR_RE.lastIndex = 0;

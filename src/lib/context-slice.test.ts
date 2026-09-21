@@ -287,6 +287,29 @@ describe("crossFileDefs", () => {
     assert.match(crossFileDefs(changed, [index, mid, real], 10_000), /two-level barrel def/);
   });
 
+  it("attaches an expression-bodied const helper without over-capturing to EOF", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { fee } from './calc';", "function issue() {", "  return fee();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return fee();\n }",
+    }];
+    const calc = { path: "src/calc.ts", content: ["export const fee = () => 42; // one-line def", "export const other = () => 0; // not swallowed"].join("\n") };
+    const out = crossFileDefs(changed, [calc], 10_000);
+    assert.match(out, /one-line def/);
+    assert.doesNotMatch(out, /not swallowed/); // fee's range did not run to EOF
+  });
+
+  it("follows a barrel `export { default as X }` to the module's default export", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { Widget } from './ui';", "function issue() {", "  return new Widget();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return new Widget();\n }",
+    }];
+    const barrel = { path: "src/ui/index.ts", content: "export { default as Widget } from './widget';" };
+    const widget = { path: "src/ui/widget.ts", content: ["export default class W {", "  render() { return 1; } // default export class", "}"].join("\n") };
+    assert.match(crossFileDefs(changed, [barrel, widget], 10_000), /default export class/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

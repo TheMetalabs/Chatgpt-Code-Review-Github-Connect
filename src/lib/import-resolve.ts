@@ -10,9 +10,18 @@ const NAMESPACE_IMPORT_RE = /\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]([^'"]+)[
 const CJS_DESTRUCTURE_RE = /(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g;
 const CJS_WHOLE_RE = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g;
 const REEXPORT_NAMED_RE = /export\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
-const REEXPORT_STAR_RE = /export\s*\*\s*(?:as\s+[A-Za-z_$][\w$]*\s+)?from\s*['"]([^'"]+)['"]/g;
+const REEXPORT_STAR_RE = /export\s*\*\s*(?:as\s+([A-Za-z_$][\w$]*)\s+)?from\s*['"]([^'"]+)['"]/g;
 const BINDING_RE = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/;
 const CJS_BINDING_RE = /^([A-Za-z_$][\w$]*)(?:\s*:\s*([A-Za-z_$][\w$]*))?$/;
+
+/** Strip block and line comments before import parsing, so a commented-out import (or a real import
+ * followed by a commented one) is not treated as a live binding. `//` after `:` or a quote is left
+ * alone to avoid eating `http://` or a `//` inside a short string on an import line. */
+function withoutComments(text: string): string {
+  return String(text || "")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+}
 
 /** DEFAULT for a default import's exported name — the module declares it under an arbitrary name. */
 export const DEFAULT_EXPORT = "\0default";
@@ -30,7 +39,7 @@ export type ImportBinding = { local: string; exported: string; candidates: strin
  */
 export function importGraph(fromPath: string, content: string): ImportBinding[] {
   const out: ImportBinding[] = [];
-  const text = String(content || "");
+  const text = withoutComments(content);
   const add = (local: string, exported: string, spec: string, kind: ImportKind) => {
     const candidates = resolveRelativeImport(fromPath, spec);
     if (candidates.length) out.push({ local, exported, candidates, kind });
@@ -62,7 +71,7 @@ export function importGraph(fromPath: string, content: string): ImportBinding[] 
 export type ReExport = { name: string; source: string; candidates: string[] };
 export function reExportsOf(fromPath: string, content: string): ReExport[] {
   const out: ReExport[] = [];
-  const text = String(content || "");
+  const text = withoutComments(content);
   let m: RegExpExecArray | null;
   REEXPORT_NAMED_RE.lastIndex = 0;
   while ((m = REEXPORT_NAMED_RE.exec(text)) !== null) {
@@ -77,8 +86,11 @@ export function reExportsOf(fromPath: string, content: string): ReExport[] {
   }
   REEXPORT_STAR_RE.lastIndex = 0;
   while ((m = REEXPORT_STAR_RE.exec(text)) !== null) {
-    const candidates = resolveRelativeImport(fromPath, m[1]);
-    if (candidates.length) out.push({ name: "*", source: "*", candidates });
+    const candidates = resolveRelativeImport(fromPath, m[2]);
+    if (!candidates.length) continue;
+    // `export * as ns from './m'` is a NAMED re-export (of the namespace) — record its name so it is
+    // only followed for that name, not treated as a blanket star that satisfies every wanted name.
+    out.push(m[1] ? { name: m[1], source: m[1], candidates } : { name: "*", source: "*", candidates });
   }
   return out;
 }
@@ -101,7 +113,7 @@ export function hunkReferencedNames(patch: string): Set<string> {
  * `require('...')` — so both dependency styles are fetched. */
 export function importSpecifiers(content: string): string[] {
   const out = new Set<string>();
-  const text = String(content || "");
+  const text = withoutComments(content);
   IMPORT_FROM_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = IMPORT_FROM_RE.exec(text)) !== null) out.add(m[1]);

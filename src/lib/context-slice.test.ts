@@ -441,6 +441,16 @@ describe("crossFileDefs", () => {
     assert.doesNotMatch(out, /sibling kept out/);
   });
 
+  it("attaches a JSX component's definition (<Widget />)", () => {
+    const changed = [{
+      path: "src/App.tsx",
+      content: ["import { Widget } from './widget';", "function App() {", "  return <Widget />;", "}"].join("\n"),
+      patch: "--- src/App.tsx\n@@ -1,2 +1,3 @@\n function App() {\n+  return <Widget />;\n }",
+    }];
+    const widget = { path: "src/widget.tsx", content: ["export function Widget() {", "  return null; // jsx component def", "}"].join("\n") };
+    assert.match(crossFileDefs(changed, [widget], 10_000), /jsx component def/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

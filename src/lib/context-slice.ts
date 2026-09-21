@@ -434,6 +434,7 @@ export function crossFileDefs(
     // calls (`items.map(`, `this.run(`) so a receiver method is not mistaken for a same-named import.
     const plain = new Set<string>(collectNames([hunkText], /(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(/g, 1));
     for (const n of collectNames([hunkText], /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) plain.add(n);
+    for (const n of collectNames([hunkText], /<([A-Z][\w$]*)/g, 1)) plain.add(n); // JSX component invocation
     for (const name of plain) {
       if (remaining <= 0 || count >= MAX_DEFS) break;
       const b = bindings.get(name);

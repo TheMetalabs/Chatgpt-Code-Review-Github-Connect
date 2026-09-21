@@ -141,3 +141,23 @@ describe("hunkReferencedNames", () => {
     assert.ok(names.has("changedArg"), "added-line identifier");
   });
 });
+
+describe("import parsing edges (comments, namespace re-export)", () => {
+  it("ignores imports inside comments", () => {
+    const src = [
+      "import { real } from './real';",
+      "// import { real } from './old';",
+      "/* import { real } from './blockold'; */",
+    ].join("\n");
+    const real = importGraph("src/a.ts", src).filter((b) => b.local === "real");
+    assert.equal(real.length, 1, "only the live import is bound");
+    assert.ok(real[0].candidates.includes("src/real.ts"));
+  });
+
+  it("preserves the name in `export * as ns` re-exports (not a blanket star)", () => {
+    const re = reExportsOf("src/index.ts", "export * as utils from './utils';\nexport * from './all';");
+    const ns = re.find((r) => r.name === "utils");
+    assert.ok(ns && ns.candidates.includes("src/utils.ts"), "namespace re-export keeps its name");
+    assert.ok(re.some((r) => r.name === "*" && r.candidates.includes("src/all.ts")), "plain star still recorded");
+  });
+});

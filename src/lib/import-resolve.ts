@@ -83,14 +83,9 @@ export function resolveRelativeImport(fromPath: string, spec: string): string[] 
     };
     return [...new Set([base, ...(alt[ext[1]] ?? []).map((e) => noExt + e)])];
   }
-  return [
-    `${base}.ts`,
-    `${base}.tsx`,
-    `${base}/index.ts`,
-    `${base}/index.tsx`,
-    `${base}.js`,
-    `${base}.jsx`,
-    `${base}/index.js`,
-    `${base}/index.jsx`,
-  ];
+  // Extensionless specifier: try every supported module extension as a file, then as a directory
+  // index. Common (.ts) first so the usual case resolves on the first fetch; the caller breaks on the
+  // first candidate that exists, so rarer extensions add cost only for genuinely unresolved imports.
+  const exts = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+  return [...exts.map((e) => `${base}.${e}`), ...exts.map((e) => `${base}/index.${e}`)];
 }

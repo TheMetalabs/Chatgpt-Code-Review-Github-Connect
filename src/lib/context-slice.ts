@@ -35,6 +35,16 @@ function extractAddedLines(patch: string): string[] {
     .map((l) => l.slice(1));
 }
 
+/** All hunk body lines (added + surrounding context), stripped of the +/space marker; diff/hunk
+ * headers excluded. Cross-file lookup uses this so a multi-line call whose NAME sits on a context
+ * line (only an argument changed) still contributes its callee identifier. */
+function extractHunkLines(patch: string): string[] {
+  return String(patch || "")
+    .split("\n")
+    .filter((l) => ((l.startsWith("+") && !l.startsWith("+++")) || l.startsWith(" ")) && !l.startsWith("@@"))
+    .map((l) => l.slice(1));
+}
+
 /** Collect identifiers matched by `re` (global or not) across added lines, minus builtins. */
 function collectNames(added: string[], re: RegExp, group: number): string[] {
   const names = new Set<string>();
@@ -324,9 +334,9 @@ export function crossFileDefs(
   // (its own defs are already in the hunk snapshot's same-file 1-hop).
   for (const origin of changed) {
     if (remaining <= 0 || count >= MAX_DEFS) break;
-    const added = extractAddedLines(origin.patch);
-    const called = new Set<string>(collectNames(added, CALL_RE, 1));
-    for (const n of collectNames(added, /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) called.add(n);
+    const hunk = extractHunkLines(origin.patch);
+    const called = new Set<string>(collectNames(hunk, CALL_RE, 1));
+    for (const n of collectNames(hunk, /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) called.add(n);
     if (!called.size) continue;
     const bindings = new Map(importGraph(origin.path, origin.content).map((b) => [b.local, b]));
     for (const name of called) {

@@ -31,6 +31,14 @@ describe("resolveRelativeImport", () => {
     assert.ok(cands.some((c) => c.endsWith("/index.ts")));
   });
 
+  it("offers every supported module extension and directory index for an extensionless import", () => {
+    const c = resolveRelativeImport("src/a.ts", "./worker");
+    for (const e of ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]) {
+      assert.ok(c.includes(`src/worker.${e}`), `has .${e} candidate`);
+      assert.ok(c.includes(`src/worker/index.${e}`), `has index.${e} candidate`);
+    }
+  });
+
   it("ignores package (non-relative) imports — no node_modules is fetched", () => {
     assert.deepEqual(resolveRelativeImport("src/x.ts", "@nestjs/common"), []);
     assert.deepEqual(resolveRelativeImport("src/x.ts", "typeorm"), []);

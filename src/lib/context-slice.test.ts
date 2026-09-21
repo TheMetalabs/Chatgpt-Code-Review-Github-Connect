@@ -216,6 +216,20 @@ describe("crossFileDefs", () => {
     assert.match(out, /cross-changed contract/);
   });
 
+  it("attaches a helper whose call name is on a context line (only its argument changed)", () => {
+    // A multi-line call: the callee name sits on an unchanged context line; only an argument changed.
+    // Scanning the whole hunk (not just added lines) still contributes the callee identifier.
+    const changedMulti = [{
+      path: "src/pay.ts",
+      content: ["import { calcExpiry } from './expiry';", "function issue() {", "  return calcExpiry(", "    newValue,", "  );", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -2,3 +2,3 @@\n   return calcExpiry(\n-    oldValue,\n+    newValue,\n   );",
+    }];
+    const expiry = { path: "src/expiry.ts", content: ["export function calcExpiry(v) {", "  return v; // expiry contract", "}"].join("\n") };
+    const out = crossFileDefs(changedMulti, [expiry], 10_000);
+    assert.match(out, /calcExpiry/);
+    assert.match(out, /expiry contract/);
+  });
+
   it("resolves a default import to the module's default export", () => {
     const changedDef = [{
       path: "src/pay.ts",

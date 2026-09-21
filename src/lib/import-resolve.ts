@@ -31,5 +31,19 @@ export function resolveRelativeImport(fromPath: string, spec: string): string[] 
   }
   const base = dir.join("/");
   if (!base) return [];
+  // Explicit-extension specifier (NodeNext / explicit ESM): the extension is already in `base`, so
+  // appending ".ts" would fetch a nonexistent "foo.ts.ts". Use the path as-is. A ".js"/".jsx"/".mjs"/
+  // ".cjs" specifier in a TS project resolves to the TS source, so try those too.
+  const ext = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.exec(base);
+  if (ext) {
+    const noExt = base.slice(0, -ext[0].length);
+    const alt: Record<string, string[]> = {
+      js: [".ts", ".tsx"],
+      jsx: [".tsx"],
+      mjs: [".mts", ".ts"],
+      cjs: [".cts", ".ts"],
+    };
+    return [...new Set([base, ...(alt[ext[1]] ?? []).map((e) => noExt + e)])];
+  }
   return [`${base}.ts`, `${base}.tsx`, `${base}/index.ts`, `${base}/index.tsx`, `${base}.js`, `${base}.jsx`];
 }

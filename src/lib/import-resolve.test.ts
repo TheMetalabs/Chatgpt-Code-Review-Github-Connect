@@ -40,6 +40,15 @@ describe("resolveRelativeImport", () => {
     assert.deepEqual(resolveRelativeImport("a.ts", "../../../etc/passwd"), []);
   });
 
+  it("uses the exact path for explicit-extension specifiers, mapping .js to the TS source", () => {
+    // Regression: appending ".ts" to "./helper.ts" produced "helper.ts.ts" and fetched nothing.
+    assert.deepEqual(resolveRelativeImport("src/a.ts", "./helper.ts"), ["src/helper.ts"]);
+    const js = resolveRelativeImport("src/a.ts", "./helper.js");
+    assert.ok(js.includes("src/helper.js"), "keeps the literal .js path");
+    assert.ok(js.includes("src/helper.ts"), "also tries the .ts source (NodeNext .js specifier)");
+    assert.ok(!js.some((c) => /\.(?:ts|js)\.(?:ts|js)$/.test(c)), "no doubled extensions");
+  });
+
   it("never yields a candidate containing a parent traversal segment", () => {
     const cands = resolveRelativeImport("src/a/b/c.ts", "../../util");
     assert.ok(cands.length > 0);

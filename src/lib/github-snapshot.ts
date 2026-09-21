@@ -50,8 +50,8 @@ function reviewRulesSection(text: string): string {
  * way to know existed. Only when a policy file exceeds the budget do we prioritize: keep the
  * review-rules section wherever it sits, and fill the rest from the top, where domain invariants live.
  */
-export function extractReviewPolicy(content: string): string {
-  const CAP = 32 * 1024;
+export function extractReviewPolicy(content: string, maxChars = 32 * 1024): string {
+  const CAP = Math.max(0, maxChars);
   const text = String(content || "");
   if (text.length <= CAP) return text;
   const section = reviewRulesSection(text).slice(0, CAP);

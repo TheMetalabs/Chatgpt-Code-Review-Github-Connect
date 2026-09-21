@@ -44,6 +44,15 @@ describe("github snapshot refs", () => {
     assert.match(out, /top domain contract/);
   });
 
+  it("respects the caller's smaller budget and still keeps the review-rules section", () => {
+    // Regression: a file that fits 32 KiB but not the caller's remaining budget must not be returned
+    // whole and then blindly prefix-sliced (which drops a review-rules section near the end).
+    const md = "top domain\n" + "z".repeat(5000) + "\n## Code Review Rules\n- keep me under a tight budget\n";
+    const out = extractReviewPolicy(md, 2000);
+    assert.ok(out.length <= 2000, `respects caller budget, got ${out.length}`);
+    assert.match(out, /keep me under a tight budget/);
+  });
+
   it("rejects path traversal", () => {
     assert.equal(isSafeRepoPath("../secrets"), false);
     assert.equal(isSafeRepoPath("src/./x"), false);

@@ -121,7 +121,9 @@ function buildPolicyAttachment(sample: SamplePr, maxChars: number): string {
   let remaining = maxChars;
   for (const f of files) {
     if (remaining <= 0) break;
-    const rules = extractReviewPolicy(f.content).trim();
+    // Pass the caller's REMAINING budget (minus the "--- path" header) so a small remaining budget
+    // routes an oversized file through the section-preserving path instead of a blind prefix slice.
+    const rules = extractReviewPolicy(f.content, Math.max(0, remaining - f.path.length - 8)).trim();
     if (!rules) continue;
     const block = `--- ${f.path}\n${rules}`.slice(0, remaining);
     blocks.push(block);

@@ -171,4 +171,18 @@ describe("crossFileDefs", () => {
     assert.equal(crossFileDefs([changedPatch], [], 10_000), "");
     assert.equal(crossFileDefs([changedPatch], [dateUtil], 0), "");
   });
+
+  it("pulls a constructed imported class definition (new X resolves class X)", () => {
+    // Regression: crossFileDefs collected `new Membership` but findDefinitionLine could not find a
+    // top-level `export class Membership`, so the entity definition was silently omitted.
+    const patch = "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return new Membership(1);\n }";
+    const entity = {
+      path: "src/membership.ts",
+      content: ["export class Membership {", "  isUsableOn(d) {", "    return d <= this.expiresAt; // inclusive", "  }", "}"].join("\n"),
+    };
+    const out = crossFileDefs([patch], [entity], 10_000);
+    assert.match(out, /class Membership/);
+    assert.match(out, /isUsableOn/);
+    assert.match(out, /inclusive/); // the class body came through, so its semantics are visible
+  });
 });

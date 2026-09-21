@@ -265,6 +265,23 @@ export function sliceContext(opts: {
  * same-file 1-hop rule in sliceContext across files; the multi-turn loop still goes further by pulling
  * definitions it only reasons about (not just ones it syntactically calls).
  */
+/** Line (1-based) of a top-level class/enum/interface/type declaration named `name`, else 0.
+ * findDefinitionLine only knows functions/vars/members, so a `new X()` whose X is a class/entity
+ * needs this to reach its definition across files. */
+function findTypeDeclLine(lines: string[], name: string): number {
+  const re = new RegExp(`^(?:export\\s+)?(?:default\\s+)?(?:abstract\\s+)?(?:class|enum|interface|type)\\s+${escapeRe(name)}\\b`);
+  for (let i = 0; i < lines.length; i += 1) if (re.test(lines[i] ?? "")) return i + 1;
+  return 0;
+}
+
+/** Range of a top-level declaration: from its line to the line that closes it at column 0, bounded. */
+function declBlockRange(lines: string[], start: number): SliceRange {
+  for (let j = start; j <= lines.length; j += 1) {
+    if (/^[})\]]/.test(lines[j - 1] ?? "")) return { start, end: j, reason: "decl" };
+  }
+  return { start, end: Math.min(lines.length, start + 200), reason: "decl" };
+}
+
 export function crossFileDefs(
   changedPatches: string[],
   referenceFiles: { path: string; content: string }[],
@@ -285,11 +302,14 @@ export function crossFileDefs(
     const lines = String(f.content ?? "").split("\n");
     for (const name of names) {
       if (remaining <= 0 || count >= MAX_DEFS) break;
+      // Functions/vars/members via findDefinitionLine; classes/enums/interfaces (constructed or
+      // referenced) via findTypeDeclLine so `new Membership(...)` reaches the entity definition.
       const defLine = findDefinitionLine(lines, name);
-      if (defLine <= 0) continue;
-      const key = `${f.path}:${defLine}`;
+      const declLine = defLine > 0 ? 0 : findTypeDeclLine(lines, name);
+      if (defLine <= 0 && declLine <= 0) continue;
+      const r = defLine > 0 ? enclosingRange(lines, defLine, defLine, 0) : declBlockRange(lines, declLine);
+      const key = `${f.path}:${r.start}`;
       if (seen.has(key)) continue;
-      const r = enclosingRange(lines, defLine, defLine, 0);
       const text = rangeText(f.path, r, lines);
       if (text.length + 2 > remaining) continue;
       seen.add(key);

@@ -408,8 +408,9 @@ export function crossFileDefs(
     const bindings = new Map(importGraph(origin.path, origin.content).map((b) => [b.local, b]));
     if (!bindings.size) continue;
     const hunkText = extractHunkLines(origin.patch).join("\n");
-    // Plain calls / constructions: `helper(`, `new Entity(`.
-    const plain = new Set<string>(collectNames([hunkText], CALL_RE, 1));
+    // Plain calls / constructions: `helper(`, `new Entity(`. The negative lookbehind excludes member
+    // calls (`items.map(`, `this.run(`) so a receiver method is not mistaken for a same-named import.
+    const plain = new Set<string>(collectNames([hunkText], /(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(/g, 1));
     for (const n of collectNames([hunkText], /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) plain.add(n);
     for (const name of plain) {
       if (remaining <= 0 || count >= MAX_DEFS) break;

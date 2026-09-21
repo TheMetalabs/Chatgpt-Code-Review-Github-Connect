@@ -3,7 +3,7 @@ import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
-import { hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
+import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
@@ -466,6 +466,15 @@ async function fetchReferenceFiles(
   // (index -> mid -> real). BFS over the re-export targets of each newly fetched module, bounded by
   // hop count and the shared fetch caps, so every barrel level reaches the corpus. Seed with the
   // changed code files too, so a CHANGED barrel's re-export targets are fetched (it is never in `out`).
+  // Only follow barrel re-exports for names the changed files actually import or reference, so a large
+  // index (many re-exports) does not exhaust the fetch budget on symbols nothing needs.
+  const wantedExports = new Set<string>();
+  for (const p of changedPaths) {
+    const content = changedContent.get(p);
+    if (!content || !REFERENCE_CODE_RE.test(p)) continue;
+    for (const b of importGraph(p, content)) wantedExports.add(b.exported === DEFAULT_EXPORT ? "default" : b.exported);
+    for (const n of hunkReferencedNames(patchByPath.get(p) ?? "")) wantedExports.add(n);
+  }
   const changedRefs = changedPaths
     .filter((p) => REFERENCE_CODE_RE.test(p) && changedContent.has(p))
     .map((p) => ({ path: p, content: changedContent.get(p) as string }));
@@ -476,6 +485,7 @@ async function fetchReferenceFiles(
       if (capped()) break;
       for (const re of reExportsOf(ref.path, ref.content)) {
         if (capped()) break;
+        if (re.name !== "*" && !wantedExports.has(re.name)) continue; // skip re-exports of unwanted names
         await fetchFirst(re.candidates);
       }
     }

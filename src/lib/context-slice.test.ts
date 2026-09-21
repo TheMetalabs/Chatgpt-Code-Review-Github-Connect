@@ -360,6 +360,17 @@ describe("crossFileDefs", () => {
     assert.doesNotMatch(out, /not swallowed/); // the anonymous default did not run to EOF
   });
 
+  it("does not mistake a receiver member call for a same-named import", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { map } from './helpers';", "function issue(items) {", "  return items.map((x) => x);", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue(items) {\n+  return items.map((x) => x);\n }",
+    }];
+    const helpers = { path: "src/helpers.ts", content: ["export function map() {", "  return 0; // imported map, not the array method", "}"].join("\n") };
+    // items.map is Array.prototype.map, not the imported `map` — its definition must not be attached.
+    assert.doesNotMatch(crossFileDefs(changed, [helpers], 10_000), /not the array method/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

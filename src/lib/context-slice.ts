@@ -312,6 +312,20 @@ function definitionRange(lines: string[], exported: string): SliceRange | null {
   return declLine > 0 ? declBlockRange(lines, declLine) : null;
 }
 
+/**
+ * Cross-file helper definitions for the one-shot chat reviewer: for symbols the changed hunks call or
+ * construct, attach the definitions from the modules they are imported from — the file-attachment
+ * analog of the multi-turn loop's on-demand file_read.
+ *
+ * SCOPE (deliberate, best-effort, strictly ADDITIVE): covers RELATIVE ESM imports — named, aliased,
+ * and default — of functions/vars/members and class/enum/interface/type declarations. That is the
+ * overwhelming common case in this codebase. Intentionally OUT OF SCOPE, because fully reimplementing
+ * TS/JS module resolution here is an unbounded long tail: barrel/`export … from` re-exports, namespace
+ * imports (`import * as ns` + `ns.member()`), CommonJS `require()`, dynamic `import()`, and tsconfig
+ * path aliases. A miss is not a defect — the reviewer simply falls back to the diff + hunk snapshot
+ * (no worse than before this feature), and the LOCAL reviewer's on-demand pull (readFileAtHead) is the
+ * complete-coverage path for anything this static approximation does not resolve.
+ */
 export function crossFileDefs(
   changed: { path: string; content: string; patch: string }[],
   referenceFiles: { path: string; content: string }[],

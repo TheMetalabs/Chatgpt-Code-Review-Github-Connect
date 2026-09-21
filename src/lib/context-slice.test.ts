@@ -405,6 +405,30 @@ describe("crossFileDefs", () => {
     assert.match(crossFileDefs(changed, [thing], 10_000), /local default via export list/);
   });
 
+  it("captures an inline one-line class without over-capturing", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { Tiny } from './tiny';", "function issue() {", "  return new Tiny();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return new Tiny();\n }",
+    }];
+    const tiny = { path: "src/tiny.ts", content: ["export class Tiny {} // inline class", "export class Other {} // sibling not swallowed"].join("\n") };
+    const out = crossFileDefs(changed, [tiny], 10_000);
+    assert.match(out, /inline class/);
+    assert.doesNotMatch(out, /sibling not swallowed/);
+  });
+
+  it("follows aliases across nested barrels to the defining module", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { A } from './lib';", "function issue() {", "  return A();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return A();\n }",
+    }];
+    const index = { path: "src/lib/index.ts", content: "export { B as A } from './mid';" };
+    const mid = { path: "src/lib/mid.ts", content: "export { C as B } from './real';" };
+    const real = { path: "src/lib/real.ts", content: ["export function C() {", "  return 1; // aliased across barrels", "}"].join("\n") };
+    assert.match(crossFileDefs(changed, [index, mid, real], 10_000), /aliased across barrels/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

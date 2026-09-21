@@ -471,14 +471,25 @@ async function fetchReferenceFiles(
   // (index -> mid -> real). BFS over the re-export targets of each newly fetched module, bounded by
   // hop count and the shared fetch caps, so every barrel level reaches the corpus. Seed with the
   // changed code files too, so a CHANGED barrel's re-export targets are fetched (it is never in `out`).
-  // Only follow barrel re-exports for names the changed files actually import or reference, so a large
-  // index (many re-exports) does not exhaust the fetch budget on symbols nothing needs.
-  const wantedExports = new Set<string>();
+  // Follow barrel re-exports only for the names the changed files actually import/reference, so a large
+  // index does not exhaust the budget on symbols nothing needs. Track the wanted names PER module and
+  // propagate them through aliases (`export { B as A } from './b'` means the target is wanted for B),
+  // so a symbol renamed at each barrel level is still followed.
+  const wantedByModule = new Map<string, Set<string>>();
+  const addWanted = (path: string, name: string) => {
+    const s = wantedByModule.get(path) ?? new Set<string>();
+    s.add(name);
+    wantedByModule.set(path, s);
+  };
   for (const p of changedPaths) {
     const content = changedContent.get(p);
     if (!content || !REFERENCE_CODE_RE.test(p)) continue;
-    for (const b of importGraph(p, content)) wantedExports.add(b.exported === DEFAULT_EXPORT ? "default" : b.exported);
-    for (const n of hunkReferencedNames(patchByPath.get(p) ?? "")) wantedExports.add(n);
+    const names = hunkReferencedNames(patchByPath.get(p) ?? "");
+    for (const b of importGraph(p, content)) {
+      // namespace: any member could be used → seed all hunk names; otherwise the imported exported name.
+      const wanted = b.kind === "namespace" ? [...names] : names.has(b.local) ? [b.exported === DEFAULT_EXPORT ? "default" : b.exported] : [];
+      for (const cand of b.candidates) for (const w of wanted) addWanted(cand, w);
+    }
   }
   const changedRefs = changedPaths
     .filter((p) => REFERENCE_CODE_RE.test(p) && changedContent.has(p))
@@ -488,9 +499,15 @@ async function fetchReferenceFiles(
     const before = out.length;
     for (const ref of frontier) {
       if (capped()) break;
+      const want = wantedByModule.get(ref.path);
+      if (!want || !want.size) continue; // nothing wanted from this module
       for (const re of reExportsOf(ref.path, ref.content)) {
         if (capped()) break;
-        if (re.name !== "*" && !wantedExports.has(re.name)) continue; // skip re-exports of unwanted names
+        if (re.name !== "*" && !want.has(re.name)) continue; // this re-export is not a wanted name
+        // Propagate the wanted name to the target under its defined-as name (aliases), or all wanted
+        // names for a star re-export (which could define any of them).
+        const nextNames = re.name === "*" ? [...want] : [re.source === DEFAULT_EXPORT ? "default" : re.source];
+        for (const cand of re.candidates) for (const n of nextNames) addWanted(cand, n);
         await fetchFirst(re.candidates);
       }
     }

@@ -297,7 +297,9 @@ function findTypeDeclLine(lines: string[], name: string): number {
  * A one-line declaration ending in a semicolon (e.g. `export default () => 1;`, `export type T = X;`)
  * has no later column-zero closing delimiter, so it is captured as a single line. */
 function declBlockRange(lines: string[], start: number): SliceRange {
-  if (/;\s*(?:\/\/[^\n]*)?$/.test(lines[start - 1] ?? "")) return { start, end: start, reason: "decl" };
+  // Self-closing one-liner: ends in `;` (type alias, expr default) or `}` (inline `class X {}`), with
+  // an optional trailing comment. Matched only at the line tail so a `//` in a string does not misfire.
+  if (/[;}]\s*(?:\/\/[^\n]*)?$/.test(lines[start - 1] ?? "")) return { start, end: start, reason: "decl" };
   for (let j = start; j <= lines.length; j += 1) {
     if (/^[})\]]/.test(lines[j - 1] ?? "")) return { start, end: j, reason: "decl" };
   }

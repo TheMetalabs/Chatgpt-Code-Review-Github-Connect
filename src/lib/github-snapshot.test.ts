@@ -22,13 +22,26 @@ describe("github snapshot refs", () => {
     assert.equal(snapshotFileRef("src/invoices/routes.ts", policy, "base", "head"), "head");
   });
 
-  it("extractReviewPolicy pulls the review-rules section, else the first 32 KiB", () => {
-    const md = "# Repo\n\nintro\n\n## Code Review Rules\n\n- rule A\n- rule B\n\n## Other\n\nignore me";
+  it("extractReviewPolicy keeps the whole policy file when it fits (domain contracts survive)", () => {
+    // Regression: the old behavior sliced to the review-rules heading and dropped the domain
+    // sections above it. A reviewer must see domain invariants/contracts, not only "Code Review".
+    const md = "# Repo\n\n## Domain\n\n- invariant X\n\n## Code Review Rules\n\n- rule A\n\n## Other\n\ndetail";
     const out = extractReviewPolicy(md);
+    assert.match(out, /invariant X/); // domain section is no longer dropped
     assert.match(out, /Code Review Rules/);
     assert.match(out, /rule A/);
-    assert.doesNotMatch(out, /ignore me/);
-    assert.equal(extractReviewPolicy("x".repeat(40_000)).length, 32 * 1024);
+    assert.match(out, /detail/);
+  });
+
+  it("extractReviewPolicy caps oversized files at 32 KiB but keeps the review-rules section", () => {
+    assert.equal(extractReviewPolicy("x".repeat(40_000)).length, 32 * 1024); // no heading → first 32 KiB
+    // Oversized file whose review-rules section sits PAST the 32 KiB mark: the section is still kept,
+    // and the top of the file (where domain contracts live) is retained too.
+    const md = "top domain contract\n" + "y".repeat(40_000) + "\n## Code Review Rules\n- keep this rule\n";
+    const out = extractReviewPolicy(md);
+    assert.ok(out.length <= 32 * 1024);
+    assert.match(out, /keep this rule/);
+    assert.match(out, /top domain contract/);
   });
 
   it("rejects path traversal", () => {

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseHunks, sliceContext } from "./context-slice.ts";
+import { crossFileDefs, parseHunks, sliceContext } from "./context-slice.ts";
 
 const CLASS_SRC = [
   'import { A } from "./a";', // 1
@@ -137,5 +137,38 @@ describe("sliceContext 1-hop and scale", () => {
     const out = sliceContext({ path: "big.ts", content: bigSrc, hunks: [{ newStart: hunkLine, newLines: 1 }], padLines: 2, maxChars: 0 });
     assert.ok(out.text.includes(`m${N - 1}(`), "last method captured");
     assert.ok(!out.text.includes("m0("), "first method NOT included (proves hunk-anchored, not head slice)");
+  });
+});
+
+describe("crossFileDefs", () => {
+  const changedPatch =
+    "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  const e = addCalendarMonths(start, 12);\n   return e;";
+  const dateUtil = {
+    path: "src/date.ts",
+    content: [
+      "export function addCalendarMonths(ymd, months) {", // 1
+      "  return ymd; // ... clamps to last day", // 2
+      "}", // 3
+      "export function unrelatedHelper() {", // 4
+      "  return 0;", // 5
+      "}", // 6
+    ].join("\n"),
+  };
+
+  it("pulls the definition of a cross-file helper the changed hunk calls", () => {
+    const out = crossFileDefs([changedPatch], [dateUtil], 10_000);
+    assert.match(out, /addCalendarMonths/);
+    assert.match(out, /src\/date\.ts/);
+    assert.match(out, /clamps to last day/); // the body came through, not just the signature line
+  });
+
+  it("does not pull definitions the change never references", () => {
+    const out = crossFileDefs([changedPatch], [dateUtil], 10_000);
+    assert.doesNotMatch(out, /unrelatedHelper/);
+  });
+
+  it("returns empty with no reference files or no budget", () => {
+    assert.equal(crossFileDefs([changedPatch], [], 10_000), "");
+    assert.equal(crossFileDefs([changedPatch], [dateUtil], 0), "");
   });
 });

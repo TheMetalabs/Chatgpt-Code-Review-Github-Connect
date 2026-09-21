@@ -256,3 +256,47 @@ export function sliceContext(opts: {
     text: budgeted.map((r) => rangeText(opts.path, r, lines)).join("\n\n"),
   };
 }
+
+/**
+ * Cross-file helper definitions for the one-shot reviewer. For symbols the changed hunks CALL or
+ * construct, pull their definitions out of the fetched reference files (imported modules that are not
+ * themselves changed) with line-number gutters. This gives the browser reviewer the "read the helper
+ * it calls" reach the multi-turn loop gets from tools — bounded by budget and count. It extends the
+ * same-file 1-hop rule in sliceContext across files; the multi-turn loop still goes further by pulling
+ * definitions it only reasons about (not just ones it syntactically calls).
+ */
+export function crossFileDefs(
+  changedPatches: string[],
+  referenceFiles: { path: string; content: string }[],
+  maxChars: number,
+): string {
+  if (maxChars <= 0 || !referenceFiles?.length) return "";
+  const added = changedPatches.flatMap(extractAddedLines);
+  const names = new Set<string>(collectNames(added, CALL_RE, 1));
+  for (const n of collectNames(added, /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) names.add(n);
+  if (!names.size) return "";
+  const blocks: string[] = [];
+  const seen = new Set<string>(); // path:defLine — never emit the same definition twice
+  let remaining = maxChars;
+  let count = 0;
+  const MAX_DEFS = 24;
+  for (const f of referenceFiles) {
+    if (remaining <= 0 || count >= MAX_DEFS) break;
+    const lines = String(f.content ?? "").split("\n");
+    for (const name of names) {
+      if (remaining <= 0 || count >= MAX_DEFS) break;
+      const defLine = findDefinitionLine(lines, name);
+      if (defLine <= 0) continue;
+      const key = `${f.path}:${defLine}`;
+      if (seen.has(key)) continue;
+      const r = enclosingRange(lines, defLine, defLine, 0);
+      const text = rangeText(f.path, r, lines);
+      if (text.length + 2 > remaining) continue;
+      seen.add(key);
+      blocks.push(text);
+      remaining -= text.length + 2;
+      count += 1;
+    }
+  }
+  return blocks.join("\n\n");
+}

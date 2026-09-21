@@ -31,6 +31,20 @@ const ALLOW = new Set([
   // The chat/Grok branches stay frozen (guarded by reviewer-progress.test.ts chat-lane cases).
   "src/lib/reviewer-progress.ts",
   "src/lib/reviewer-progress.test.ts",
+  // Context-assembly for BOTH reviewers (per-reviewer context tailoring). These build what each
+  // reviewer SEES — snapshot slicing, cross-file definitions, repo-policy extraction, and the
+  // head-file fetch. They are editable here to close the cross-file / domain-contract context gaps.
+  // The bridge/merge/posting/extension path (bridge.server, poster, chat-settle, review-diff/format,
+  // extension/**) stays FROZEN; the full npm test suite is the behavioral net for it.
+  "src/lib/context-slice.ts",
+  "src/lib/context-slice.test.ts",
+  "src/lib/chat-prompt.ts",
+  "src/lib/chat-prompt.test.ts",
+  "src/lib/github-snapshot.ts",
+  "src/lib/github-snapshot.test.ts",
+  "src/lib/github.server.ts",
+  "src/lib/import-resolve.ts",
+  "src/lib/import-resolve.test.ts",
   "src/lib/settings.server.ts",
   "src/lib/types.ts",
   "src/lib/json-repair.server.ts",

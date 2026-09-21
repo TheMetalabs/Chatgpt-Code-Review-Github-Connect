@@ -153,25 +153,55 @@ describe("buildChatParts hunk context", () => {
   });
 });
 
+describe("buildChatParts cross-file definitions", () => {
+  const sample = {
+    key: "k", owner: "o", repo: "r", pr: 1, title: "t", body: "", sender: "s",
+    headSha: "abc1234", baseSha: "def5678", isFork: false, isDraft: false, labels: [] as string[],
+    changedPaths: ["src/pay.ts"],
+    files: [{ path: "src/pay.ts", language: "ts" as const, content: ["import { addMonths } from './date';", "export function issue() {", "  return addMonths(1);", "}"].join("\n") }],
+    diff: "--- src/pay.ts\n@@ -1,3 +1,4 @@\n export function issue() {\n+  return addMonths(1);\n }",
+    referenceFiles: [{ path: "src/date.ts", language: "ts" as const, content: ["export function addMonths(n) {", "  return n; // inclusive boundary note", "}"].join("\n") }],
+  };
+
+  it("attaches definitions of imported helpers the changed hunk calls (file-attachment analog of the loop's file_read)", () => {
+    const { files, prompt } = buildChatParts({ sample });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap, "snapshot present");
+    assert.match(snap!.body, /CROSS_FILE_DEFINITIONS/);
+    assert.match(snap!.body, /addMonths/);
+    assert.match(snap!.body, /inclusive boundary note/); // the cross-file body, not just a signature
+    assert.match(prompt, /CROSS_FILE_DEFINITIONS/); // the attachment description names the section
+  });
+
+  it("omits the cross-file section when there are no reference files", () => {
+    const { files } = buildChatParts({ sample: { ...sample, referenceFiles: [] } });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap, "snapshot present");
+    assert.doesNotMatch(snap!.body, /CROSS_FILE_DEFINITIONS/);
+  });
+});
+
 describe("ashlar-policy.md attachment", () => {
   const base = { key: "k", owner: "o", repo: "r", pr: 1, title: "t", body: "", sender: "s", headSha: "abc1234", baseSha: "def5678", isFork: false, isDraft: false, labels: [] as string[] };
   const withPolicy = {
     ...base,
     changedPaths: ["src/x.ts"],
     files: [
-      { path: "AGENTS.md", language: "md" as const, content: "# Repo\n\n## Code Review Rules\n\n- always check nulls\n\n## Other\n\nnoise" },
+      { path: "AGENTS.md", language: "md" as const, content: "# Repo\n\n## Domain\n\n- money is integer won\n\n## Code Review Rules\n\n- always check nulls" },
       { path: "src/x.ts", language: "ts" as const, content: ["export function f() {", "  return 1;", "}"].join("\n") },
     ],
     diff: "--- src/x.ts\n@@ -1,2 +1,3 @@\n export function f() {\n+  return 1;\n }",
   };
 
-  it("delivers unchanged repo policy despite the changed-file snapshot filter", () => {
+  it("delivers unchanged repo policy INCLUDING domain contracts, despite the changed-file snapshot filter", () => {
     const { files } = buildChatParts({ sample: withPolicy });
     const policy = files.find((f) => f.name === "ashlar-policy.md");
     assert.ok(policy, "policy attachment present");
     assert.match(policy!.body, /Code Review Rules/);
     assert.match(policy!.body, /always check nulls/);
-    assert.doesNotMatch(policy!.body, /noise/);
+    // Regression: a small policy file is delivered whole, so DOMAIN invariants above the review-rules
+    // heading are no longer sliced away (they are exactly what contract-compliance findings need).
+    assert.match(policy!.body, /money is integer won/);
     const snap = files.find((f) => f.name === "ashlar-snapshot.md");
     assert.ok(!snap || !snap.body.includes("AGENTS.md"), "unchanged policy not in the snapshot attachment");
   });

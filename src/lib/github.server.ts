@@ -3,6 +3,7 @@ import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
+import { importSpecifiers, resolveRelativeImport } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
@@ -384,7 +385,7 @@ function langFor(path: string): SnapshotFile["language"] {
   return "ts";
 }
 
-async function getFile(token: string, owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+export async function getFile(token: string, owner: string, repo: string, path: string, ref: string): Promise<string | null> {
   const safe = isSafeRepoPath(path);
   if (!safe) return null;
   const out = await gh<{ content?: string; encoding?: string; size?: number; type?: string }>(
@@ -398,6 +399,47 @@ async function getFile(token: string, owner: string, repo: string, path: string,
     return Buffer.from(out.data.content.replace(/\n/g, ""), "base64").toString("utf8");
   }
   return null;
+}
+
+const REFERENCE_CODE_RE = /\.(?:ts|tsx|js|jsx)$/;
+const REFERENCE_FILE_CAP = 24; // resolved reference modules kept
+const REFERENCE_FETCH_CAP = 80; // total getFile attempts for references (bounds API cost per review)
+
+/** Fetch the unchanged modules that changed CODE files import from (relative imports only), at head,
+ * so cross-file helper/entity definitions can be attached for the reviewer. Bounded by count and by
+ * total fetch attempts; disabled with ASHLAR_CROSS_FILE_REFS=0. */
+async function fetchReferenceFiles(
+  token: string,
+  owner: string,
+  repo: string,
+  headSha: string,
+  changedPaths: string[],
+  changedContent: Map<string, string>,
+  alreadyFetched: Set<string>,
+): Promise<SnapshotFile[]> {
+  if (process.env.ASHLAR_CROSS_FILE_REFS === "0") return [];
+  const out: SnapshotFile[] = [];
+  const tried = new Set(alreadyFetched);
+  let attempts = 0;
+  for (const changed of changedPaths) {
+    if (out.length >= REFERENCE_FILE_CAP || attempts >= REFERENCE_FETCH_CAP) break;
+    if (!REFERENCE_CODE_RE.test(changed)) continue;
+    const content = changedContent.get(changed);
+    if (!content) continue;
+    for (const spec of importSpecifiers(content)) {
+      if (out.length >= REFERENCE_FILE_CAP || attempts >= REFERENCE_FETCH_CAP) break;
+      for (const cand of resolveRelativeImport(changed, spec)) {
+        if (tried.has(cand)) continue;
+        tried.add(cand);
+        attempts += 1;
+        const c = await getFile(token, owner, repo, cand, headSha);
+        if (c == null) continue; // wrong extension candidate; try the next
+        if (!isSandboxPolicyFile(c)) out.push({ path: cand, content: c, language: langFor(cand) });
+        break; // first resolving candidate for this specifier wins
+      }
+    }
+  }
+  return out;
 }
 
 export async function fetchPullSnapshot(
@@ -448,6 +490,15 @@ export async function fetchPullSnapshot(
     if (isSandboxPolicyFile(content)) continue;
     files.push({ path, content, language: langFor(path) });
   }
+  const referenceFiles = await fetchReferenceFiles(
+    token,
+    target.owner,
+    target.repo,
+    target.headSha,
+    changedPaths,
+    new Map(files.map((f) => [f.path, f.content])),
+    new Set(toFetch),
+  );
   const diffBlocks = rows
     .filter((f) => f.filename && changedPaths.includes(f.filename))
     .map((f) => ({ path: f.filename as string, size: (f.patch ?? "").length + (f.filename ?? "").length + 5, patch: `--- ${f.filename}\n${f.patch ?? ""}` }));
@@ -478,6 +529,7 @@ export async function fetchPullSnapshot(
     diff,
     changedPaths,
     diffDroppedPaths,
+    referenceFiles,
   };
 }
 

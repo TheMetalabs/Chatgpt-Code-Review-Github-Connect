@@ -2,7 +2,7 @@ import type { Finding, SamplePr, SnapshotFile } from "./types.ts";
 import { DEFAULT_SETTINGS } from "./types.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
-import { parseHunks, sliceContext } from "./context-slice.ts";
+import { crossFileDefs, parseHunks, sliceContext } from "./context-slice.ts";
 import { extractReviewPolicy, policyPathsFor } from "./github-snapshot.ts";
 
 export const CHAT_JSON_HINT = `{
@@ -141,15 +141,31 @@ export function buildChatParts(opts: {
   const snapshots = reviewSnapshotFiles(opts.sample);
   // ASHLAR_CONTEXT_MODE=head restores the pre-change behavior (file-head slices).
   const mode = process.env.ASHLAR_CONTEXT_MODE === "head" ? "head" : "hunks";
-  const contextBody =
+  const contextMaxChars = opts.contextMaxChars ?? DEFAULT_SETTINGS.promptContextMaxChars;
+  const hunkBody =
     mode === "head"
       ? snapshots.map((f) => `--- ${f.path}\n${f.content.slice(0, 20_000)}`).join("\n\n").slice(0, 120_000)
       : buildHunkContext(
           opts.sample,
           snapshots,
           opts.contextPadLines ?? DEFAULT_SETTINGS.contextPadLines,
-          opts.contextMaxChars ?? DEFAULT_SETTINGS.promptContextMaxChars,
+          contextMaxChars,
         );
+  // Cross-file helper definitions: the one-shot reviewer cannot open files, so pre-attach the defs of
+  // helpers the changed hunks call from imported (unchanged) modules — the "file attachment" analog of
+  // the multi-turn loop's on-demand file_read. Fill only the snapshot budget left after the hunk
+  // context, capped so it never crowds out the changed code itself.
+  const crossBody =
+    mode === "head"
+      ? ""
+      : crossFileDefs(
+          [...patchesByPath(opts.sample.diff).values()],
+          opts.sample.referenceFiles ?? [],
+          Math.min(Math.max(0, contextMaxChars - hunkBody.length), 40_000),
+        );
+  const contextBody = crossBody
+    ? `${hunkBody}\n\n<<<CROSS_FILE_DEFINITIONS>>>\n${crossBody}\n<<<END>>>`
+    : hunkBody;
   const policyBody =
     process.env.ASHLAR_POLICY_ATTACH === "0"
       ? ""
@@ -167,7 +183,7 @@ export function buildChatParts(opts: {
     opts.extra ? `<<<UNTRUSTED_USER_LINE>>>\n${opts.extra.slice(0, 500)}\n<<<END>>>` : "",
     opts.untrustedBody ? `<<<UNTRUSTED_PR_BODY>>>\n${opts.untrustedBody.slice(0, 800)}\n<<<END>>>` : "",
     files.length
-      ? "Attached files: ashlar-diff.patch (the PR diff), ashlar-snapshot.md (head text around every changed hunk with line numbers, plus same-file definitions of the helpers they call), and ashlar-policy.md (repository review rules, when present). Review those attachments. Do not ask for more files."
+      ? "Attached files: ashlar-diff.patch (the PR diff), ashlar-snapshot.md (head text around every changed hunk with line numbers, plus same-file definitions and a CROSS_FILE_DEFINITIONS section with definitions of imported helpers the changed code calls), and ashlar-policy.md (repository review rules and domain invariants, when present). Review those attachments. Do not ask for more files."
       : "",
     "Return exactly this JSON shape:",
     CHAT_JSON_HINT,

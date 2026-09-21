@@ -52,6 +52,41 @@ test("tool loop serves file_read from the snapshot and returns gate-shaped JSON"
   assert.ok(toolMsg && /File: src\/pay\.ts/.test(toolMsg.content), "file_read output fed back to the model");
 });
 
+test("file_read pulls a non-snapshot path at head via readFileAtHead (multi-turn cross-file)", async () => {
+  // The local reviewer's edge: it can fetch an imported definition in an UNCHANGED module (not in the
+  // snapshot) to verify a semantic assumption (e.g. whether expiresAt is inclusive) before reporting.
+  const { request, bodies } = mock([
+    assistant("", [toolCall("file_read", { file_path: "src/entities/membership.ts" })]),
+    assistant(REVIEW_JSON),
+  ]);
+  const reads = [];
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, {
+    request,
+    readFileAtHead: async (p) => {
+      reads.push(p);
+      return p === "src/entities/membership.ts" ? "isUsableOn(d) { return d <= this.expiresAt } // inclusive" : null;
+    },
+  });
+  assert.equal(out.ok, true);
+  assert.ok(reads.includes("src/entities/membership.ts"), "readFileAtHead was called for the cross-file path");
+  const toolMsg = bodies[1].messages.find((m) => m.role === "tool");
+  assert.ok(
+    toolMsg && /inclusive/.test(toolMsg.content) && !/NOT_IN_SNAPSHOT/.test(toolMsg.content),
+    "fetched cross-file definition was fed back to the model, not a NOT_IN_SNAPSHOT stub",
+  );
+});
+
+test("file_read on an unfetchable path returns NOT_IN_SNAPSHOT when no reader is wired", async () => {
+  const { request, bodies } = mock([
+    assistant("", [toolCall("file_read", { file_path: "src/nope.ts" })]),
+    assistant(REVIEW_JSON),
+  ]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, true);
+  const toolMsg = bodies[1].messages.find((m) => m.role === "tool");
+  assert.ok(toolMsg && /NOT_IN_SNAPSHOT/.test(toolMsg.content), "unfetchable path yields NOT_IN_SNAPSHOT");
+});
+
 test("every generation sends a completion budget and non-greedy sampling", async () => {
   const { request, bodies } = mock([assistant(REVIEW_JSON)]);
   await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });

@@ -114,3 +114,21 @@ describe("reExportsOf", () => {
     assert.ok(re.some((r) => r.name === "*" && r.candidates.includes("src/more.ts")));
   });
 });
+
+describe("importGraph mixed + asset edges", () => {
+  it("binds the named part of a mixed default+named import", () => {
+    const g = importGraph("src/a.ts", "import api, { helper as h } from './util';");
+    assert.equal(g.find((b) => b.local === "api")?.exported, DEFAULT_EXPORT);
+    const h = g.find((b) => b.local === "h");
+    assert.equal(h?.exported, "helper"); // the named part is bound too, not just the default
+    assert.ok(h?.candidates.includes("src/util.ts"));
+  });
+
+  it("returns [] for explicit non-code assets but resolves unknown-suffix dotted names", () => {
+    assert.deepEqual(resolveRelativeImport("src/a.ts", "./styles.css"), []);
+    assert.deepEqual(resolveRelativeImport("src/a.ts", "./config.json"), []);
+    const dotted = resolveRelativeImport("src/a.ts", "./my.util"); // unknown suffix → extensionless
+    assert.ok(dotted.includes("src/my.util.ts"));
+    assert.ok(!dotted.some((c) => /\.css\./.test(c)), "no impossible styles.css.ts paths");
+  });
+});

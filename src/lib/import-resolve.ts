@@ -4,7 +4,7 @@
 const IMPORT_FROM_RE = /^\s*(?:import|export)\b[^'"]*?\bfrom\s*['"]([^'"]+)['"]/gm;
 const REQUIRE_RE = /\brequire\(\s*['"]([^'"]+)['"]\s*\)/g;
 
-const NAMED_IMPORT_RE = /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
+const NAMED_IMPORT_RE = /import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
 const DEFAULT_IMPORT_RE = /import\s+([A-Za-z_$][\w$]*)\s*(?:,\s*(?:\{[^}]*\}|\*\s+as\s+[A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
 const NAMESPACE_IMPORT_RE = /\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*['"]([^'"]+)['"]/g;
 const CJS_DESTRUCTURE_RE = /(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g;
@@ -127,9 +127,15 @@ export function resolveRelativeImport(fromPath: string, spec: string): string[] 
     };
     return [...new Set([base, ...(alt[ext[1]] ?? []).map((e) => noExt + e)])];
   }
-  // Extensionless specifier: try every supported module extension as a file, then as a directory
-  // index. Common (.ts) first so the usual case resolves on the first fetch; the caller breaks on the
-  // first candidate that exists, so rarer extensions add cost only for genuinely unresolved imports.
+  // Explicit NON-code asset (./styles.css, ./config.json, ...) — no code definition to extract, and
+  // treating the suffix as part of an extensionless name would fetch impossible paths (styles.css.ts).
+  if (/\.(?:css|scss|sass|less|json|svg|png|jpe?g|gif|webp|avif|md|mdx|txt|ya?ml|graphql|gql|wasm|node|html)$/i.test(base)) {
+    return [];
+  }
+  // Extensionless specifier (including unknown-suffix dotted names like ./my.util -> my.util.ts): try
+  // every supported module extension as a file, then as a directory index. Common (.ts) first so the
+  // usual case resolves on the first fetch; the caller breaks on the first candidate that exists, so
+  // rarer extensions add cost only for genuinely unresolved imports.
   const exts = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
   return [...exts.map((e) => `${base}.${e}`), ...exts.map((e) => `${base}/index.${e}`)];
 }

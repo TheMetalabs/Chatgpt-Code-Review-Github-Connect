@@ -275,6 +275,18 @@ describe("crossFileDefs", () => {
     assert.match(crossFileDefs(changedBarrel, [barrel, real], 10_000), /real def via barrel/);
   });
 
+  it("follows a two-level barrel to the defining module", () => {
+    const changed = [{
+      path: "src/pay.ts",
+      content: ["import { helper } from './lib';", "function issue() {", "  return helper();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return helper();\n }",
+    }];
+    const index = { path: "src/lib/index.ts", content: "export { helper } from './mid';" };
+    const mid = { path: "src/lib/mid.ts", content: "export { helper } from './real';" };
+    const real = { path: "src/lib/real.ts", content: ["export function helper() {", "  return 1; // two-level barrel def", "}"].join("\n") };
+    assert.match(crossFileDefs(changed, [index, mid, real], 10_000), /two-level barrel def/);
+  });
+
   it("resolves a CommonJS require destructure", () => {
     const changedCjs = [{
       path: "src/pay.cjs",

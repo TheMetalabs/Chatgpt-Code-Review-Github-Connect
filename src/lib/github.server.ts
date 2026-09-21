@@ -448,14 +448,20 @@ async function fetchReferenceFiles(
       await fetchFirst(resolveRelativeImport(changed, spec));
     }
   }
-  // Pass 2: follow barrels — the re-export targets of the modules just fetched — so a symbol
-  // re-exported through an index (`export { X } from './real'`) reaches the corpus for lookup.
-  for (const ref of [...out]) {
-    if (capped()) break;
-    for (const re of reExportsOf(ref.path, ref.content)) {
+  // Pass 2: follow barrels across levels — a symbol may be re-exported through several index files
+  // (index -> mid -> real). BFS over the re-export targets of each newly fetched module, bounded by
+  // hop count and the shared fetch caps, so every barrel level reaches the corpus.
+  let frontier = [...out];
+  for (let hop = 0; hop < 3 && frontier.length && !capped(); hop += 1) {
+    const before = out.length;
+    for (const ref of frontier) {
       if (capped()) break;
-      await fetchFirst(re.candidates);
+      for (const re of reExportsOf(ref.path, ref.content)) {
+        if (capped()) break;
+        await fetchFirst(re.candidates);
+      }
     }
+    frontier = out.slice(before); // only modules fetched this hop feed the next
   }
   return out;
 }

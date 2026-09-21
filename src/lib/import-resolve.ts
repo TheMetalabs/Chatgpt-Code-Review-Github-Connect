@@ -3,23 +3,40 @@
 
 const IMPORT_FROM_RE = /^\s*(?:import|export)\b[^'"]*?\bfrom\s*['"]([^'"]+)['"]/gm;
 
-const NAMED_IMPORT_RE = /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"][^'"]+['"]/g;
+const NAMED_IMPORT_RE = /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g;
+const DEFAULT_IMPORT_RE = /import\s+([A-Za-z_$][\w$]*)\s*(?:,\s*(?:\{[^}]*\}|\*\s+as\s+[A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
 const BINDING_RE = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/;
 
+/** DEFAULT for a default import's exported name — the module declares it under an arbitrary name. */
+export const DEFAULT_EXPORT = "\0default";
+
+export type ImportBinding = { local: string; exported: string; candidates: string[] };
+
 /**
- * Named-import bindings as [localName, exportedName] pairs. `import { addCalendarMonths as addMonths }`
- * yields ["addMonths", "addCalendarMonths"], so a lookup by the local name a hunk calls can find the
- * declaration under its exported name. Plain `import { X }` yields ["X", "X"].
+ * Per-name import graph for a file: each imported LOCAL name mapped to its EXPORTED name and the
+ * candidate repo paths of the module it comes from. This lets a cross-file lookup follow the exact
+ * import that binds a called name — resolving aliases (`X as Y`) and default imports, and looking a
+ * name up ONLY in its own module (not every module that happens to export the same name). Package
+ * imports (no leading ".") are skipped. `exported` is DEFAULT_EXPORT for a default import.
  */
-export function importBindings(content: string): Array<[string, string]> {
-  const out: Array<[string, string]> = [];
+export function importGraph(fromPath: string, content: string): ImportBinding[] {
+  const out: ImportBinding[] = [];
+  const text = String(content || "");
   NAMED_IMPORT_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
-  while ((m = NAMED_IMPORT_RE.exec(String(content || ""))) !== null) {
+  while ((m = NAMED_IMPORT_RE.exec(text)) !== null) {
+    const candidates = resolveRelativeImport(fromPath, m[2]);
+    if (!candidates.length) continue;
     for (const raw of m[1].split(",")) {
       const b = BINDING_RE.exec(raw.trim());
-      if (b) out.push([b[2] || b[1], b[1]]); // [local, exported]
+      if (b) out.push({ local: b[2] || b[1], exported: b[1], candidates });
     }
+  }
+  DEFAULT_IMPORT_RE.lastIndex = 0;
+  while ((m = DEFAULT_IMPORT_RE.exec(text)) !== null) {
+    if (m[1] === "type") continue; // `import type { X }` is not a default binding
+    const candidates = resolveRelativeImport(fromPath, m[2]);
+    if (candidates.length) out.push({ local: m[1], exported: DEFAULT_EXPORT, candidates });
   }
   return out;
 }
@@ -66,5 +83,14 @@ export function resolveRelativeImport(fromPath: string, spec: string): string[] 
     };
     return [...new Set([base, ...(alt[ext[1]] ?? []).map((e) => noExt + e)])];
   }
-  return [`${base}.ts`, `${base}.tsx`, `${base}/index.ts`, `${base}/index.tsx`, `${base}.js`, `${base}.jsx`];
+  return [
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}/index.ts`,
+    `${base}/index.tsx`,
+    `${base}.js`,
+    `${base}.jsx`,
+    `${base}/index.js`,
+    `${base}/index.jsx`,
+  ];
 }

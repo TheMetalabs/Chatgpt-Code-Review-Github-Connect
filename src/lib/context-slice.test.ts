@@ -215,4 +215,28 @@ describe("crossFileDefs", () => {
     assert.match(out, /sharedHelper/);
     assert.match(out, /cross-changed contract/);
   });
+
+  it("resolves a default import to the module's default export", () => {
+    const changedDef = [{
+      path: "src/pay.ts",
+      content: ["import makeId from './id';", "function issue() {", "  return makeId();", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return makeId();\n }",
+    }];
+    const idMod = { path: "src/id.ts", content: ["export default function newTransferId() {", "  return 'x'; // default export body", "}"].join("\n") };
+    assert.match(crossFileDefs(changedDef, [idMod], 10_000), /default export body/);
+  });
+
+  it("looks a name up only in its imported module, not every module exporting that name", () => {
+    // Precision: two modules export `format`; only the imported one's definition is attached.
+    const changedSpec = [{
+      path: "src/pay.ts",
+      content: ["import { format } from './money';", "function issue() {", "  return format(1);", "}"].join("\n"),
+      patch: "--- src/pay.ts\n@@ -1,2 +1,3 @@\n function issue() {\n+  return format(1);\n }",
+    }];
+    const money = { path: "src/money.ts", content: ["export function format(n) {", "  return `won ${n}`; // money format", "}"].join("\n") };
+    const dates = { path: "src/dates.ts", content: ["export function format(d) {", "  return `date ${d}`; // date format", "}"].join("\n") };
+    const out = crossFileDefs(changedSpec, [money, dates], 10_000);
+    assert.match(out, /money format/);
+    assert.doesNotMatch(out, /date format/); // unrelated same-named export not attached
+  });
 });

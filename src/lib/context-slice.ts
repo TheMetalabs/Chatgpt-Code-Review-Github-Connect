@@ -4,7 +4,7 @@
 // *encloses* every changed hunk (plus the import block) with line-number gutters
 // so the model can cite exact RIGHT-side lines. Boundaries are detected by
 // Prettier-style indentation, never by brace counting (strings/regex break that).
-import { importBindings } from "./import-resolve.ts";
+import { DEFAULT_EXPORT, importGraph } from "./import-resolve.ts";
 
 export type HunkRange = { newStart: number; newLines: number };
 export type SliceRange = { start: number; end: number; reason: string };
@@ -283,54 +283,69 @@ function declBlockRange(lines: string[], start: number): SliceRange {
   return { start, end: Math.min(lines.length, start + 200), reason: "decl" };
 }
 
+/** Line (1-based) of a module's `export default ...` declaration, else 0. */
+function findDefaultExportLine(lines: string[]): number {
+  for (let i = 0; i < lines.length; i += 1) if (/^export\s+default\b/.test(lines[i] ?? "")) return i + 1;
+  return 0;
+}
+
+/** Definition range of an exported symbol in a module's lines, or null if not found. `exported` may be
+ * DEFAULT_EXPORT to locate the module's default export. */
+function definitionRange(lines: string[], exported: string): SliceRange | null {
+  if (exported === DEFAULT_EXPORT) {
+    const dl = findDefaultExportLine(lines);
+    return dl > 0 ? declBlockRange(lines, dl) : null;
+  }
+  const defLine = findDefinitionLine(lines, exported);
+  if (defLine > 0) return enclosingRange(lines, defLine, defLine, 0);
+  const declLine = findTypeDeclLine(lines, exported);
+  return declLine > 0 ? declBlockRange(lines, declLine) : null;
+}
+
 export function crossFileDefs(
   changed: { path: string; content: string; patch: string }[],
   referenceFiles: { path: string; content: string }[],
   maxChars: number,
 ): string {
   if (maxChars <= 0 || !changed?.length) return "";
-  // Search corpus: unchanged imported modules AND the changed files themselves — a changed file can
-  // define a helper another changed file calls whose definition sits outside its own hunk slice.
-  const corpus = [...referenceFiles, ...changed.map((c) => ({ path: c.path, content: c.content }))];
+  // Corpus keyed by path: unchanged imported modules AND the changed files themselves (a changed file
+  // can define a helper another changed file calls whose def sits outside its own hunk slice).
+  const corpus = new Map<string, string>();
+  for (const f of referenceFiles) corpus.set(f.path, f.content);
+  for (const c of changed) if (!corpus.has(c.path)) corpus.set(c.path, c.content);
   const blocks: string[] = [];
   const seen = new Set<string>(); // path:defLine — never emit the same definition twice
   let remaining = maxChars;
   let count = 0;
   const MAX_DEFS = 24;
-  // Attribute called names to the file they are called FROM, so per-file import aliases resolve and the
-  // origin file is skipped (its own defs are already in the hunk snapshot's same-file 1-hop).
+  // Attribute called names to the file they are called FROM, follow the exact import that binds each
+  // name to its module (resolving aliases and default imports), and look the def up ONLY in that
+  // module — never every module that happens to export the same name. The origin file is skipped
+  // (its own defs are already in the hunk snapshot's same-file 1-hop).
   for (const origin of changed) {
     if (remaining <= 0 || count >= MAX_DEFS) break;
     const added = extractAddedLines(origin.patch);
-    const names = new Set<string>(collectNames(added, CALL_RE, 1));
-    for (const n of collectNames(added, /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) names.add(n);
-    if (!names.size) continue;
-    // Aliased imports: a hunk may call the LOCAL name (`import { addCalendarMonths as addMonths }`),
-    // but the module declares the EXPORTED name. Map local -> exported so the lookup finds the def.
-    const exported = new Map<string, string>();
-    for (const [local, exp] of importBindings(origin.content)) if (local !== exp) exported.set(local, exp);
-    for (const f of corpus) {
-      if (f.path === origin.path) continue; // same-file defs are already in the snapshot
+    const called = new Set<string>(collectNames(added, CALL_RE, 1));
+    for (const n of collectNames(added, /\bnew\s+([A-Za-z_$][\w$]*)/g, 1)) called.add(n);
+    if (!called.size) continue;
+    const bindings = new Map(importGraph(origin.path, origin.content).map((b) => [b.local, b]));
+    for (const name of called) {
       if (remaining <= 0 || count >= MAX_DEFS) break;
-      const lines = String(f.content ?? "").split("\n");
-      for (const name of names) {
-        if (remaining <= 0 || count >= MAX_DEFS) break;
-        const lookup = exported.get(name) ?? name;
-        // Functions/vars/members via findDefinitionLine; classes/enums/interfaces (constructed or
-        // referenced) via findTypeDeclLine so `new Membership(...)` reaches the entity definition.
-        const defLine = findDefinitionLine(lines, lookup);
-        const declLine = defLine > 0 ? 0 : findTypeDeclLine(lines, lookup);
-        if (defLine <= 0 && declLine <= 0) continue;
-        const r = defLine > 0 ? enclosingRange(lines, defLine, defLine, 0) : declBlockRange(lines, declLine);
-        const key = `${f.path}:${r.start}`;
-        if (seen.has(key)) continue;
-        const text = rangeText(f.path, r, lines);
-        if (text.length + 2 > remaining) continue;
-        seen.add(key);
-        blocks.push(text);
-        remaining -= text.length + 2;
-        count += 1;
-      }
+      const binding = bindings.get(name);
+      if (!binding) continue; // not an import → same-file/global, not a cross-file dependency
+      const targetPath = binding.candidates.find((p) => corpus.has(p) && p !== origin.path);
+      if (!targetPath) continue;
+      const lines = String(corpus.get(targetPath) ?? "").split("\n");
+      const r = definitionRange(lines, binding.exported);
+      if (!r) continue;
+      const key = `${targetPath}:${r.start}`;
+      if (seen.has(key)) continue;
+      const text = rangeText(targetPath, r, lines);
+      if (text.length + 2 > remaining) continue;
+      seen.add(key);
+      blocks.push(text);
+      remaining -= text.length + 2;
+      count += 1;
     }
   }
   return blocks.join("\n\n");

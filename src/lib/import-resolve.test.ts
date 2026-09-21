@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { importBindings, importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
+import { DEFAULT_EXPORT, importGraph, importSpecifiers, resolveRelativeImport } from "./import-resolve.ts";
 
 describe("importSpecifiers", () => {
   it("collects import and re-export module specifiers", () => {
@@ -57,12 +57,21 @@ describe("resolveRelativeImport", () => {
   });
 });
 
-describe("importBindings", () => {
-  it("maps aliased named imports to [local, exported]", () => {
-    const src = "import { addCalendarMonths as addMonths, Foo } from './date';\nimport type { T as U } from './t';";
-    const b = importBindings(src);
-    assert.deepEqual(b.find(([l]) => l === "addMonths"), ["addMonths", "addCalendarMonths"]);
-    assert.deepEqual(b.find(([l]) => l === "Foo"), ["Foo", "Foo"]);
-    assert.deepEqual(b.find(([l]) => l === "U"), ["U", "T"]);
+describe("importGraph", () => {
+  it("binds named, aliased, and default imports to their module candidates; skips packages", () => {
+    const src = [
+      "import { addCalendarMonths as addMonths, Foo } from './date';",
+      "import Membership from '../entities/membership';",
+      "import { X } from 'typeorm';",
+    ].join("\n");
+    const g = importGraph("src/svc/pay.ts", src);
+    const addMonths = g.find((b) => b.local === "addMonths");
+    assert.equal(addMonths?.exported, "addCalendarMonths"); // alias resolved to exported name
+    assert.ok(addMonths?.candidates.includes("src/svc/date.ts"));
+    assert.equal(g.find((b) => b.local === "Foo")?.exported, "Foo");
+    const def = g.find((b) => b.local === "Membership");
+    assert.equal(def?.exported, DEFAULT_EXPORT); // default import
+    assert.ok(def?.candidates.includes("src/entities/membership.ts"));
+    assert.ok(!g.some((b) => b.local === "X"), "package import is skipped");
   });
 });

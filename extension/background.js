@@ -1670,6 +1670,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     clearStuckJobs({ includeStalled: true }).then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
     return true;
   }
+  if (message?.type === "ashlar-hard-reset") {
+    // Last-resort escape hatch for leftover jobs that clearStuckJobs cannot retire (the server never gives a
+    // fresh "forgotten" confirmation because the origin changed or is gone) and that survive a bare storage
+    // edit (the live worker keeps this in-memory registry and re-persists it on the next tick). Drop the
+    // cached registry AND persist an empty one so any tick that races the reload writes {} rather than the
+    // stale 30, then reload the extension so all in-flight lane closures holding the old jobs object are torn
+    // down. Never throws: reload runs after the reply regardless.
+    (async () => {
+      try {
+        registryPromise = Promise.resolve({});
+        await writeInOrder(() => chrome.storage.local.set({ [PENDING_JOBS]: {} }));
+        sendResponse({ ok: true });
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error?.message || error) });
+      } finally {
+        setTimeout(() => chrome.runtime.reload(), 150);
+      }
+    })();
+    return true;
+  }
   if (message?.type === "ashlar-maintenance-acquire") {
     void acquireMaintenance(message.id,message.mode).then(sendResponse,error=>sendResponse({ok:false,error:String(error?.message||error)})); return true;
   }

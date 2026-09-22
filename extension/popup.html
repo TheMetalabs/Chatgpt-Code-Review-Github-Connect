@@ -28,6 +28,8 @@
       <button id="reconnect" type="button">Check connection &amp; poll now</button>
       <button id="clearStuck" type="button">Clear stuck jobs</button>
       <p class="muted">Retires jobs the server has forgotten (after a restart) whose review tabs are already gone. Never touches a job with a live tab or one the server still owns.</p>
+      <button id="hardReset" type="button">Force clear all jobs &amp; reload</button>
+      <p class="muted">Last resort: drops every tracked job (recovery, cleanup, saved replies, pending JSON) and reloads the bridge so the in-memory registry is discarded. Use when "Clear stuck jobs" cannot remove leftover jobs whose tabs are already closed. Settings are kept.</p>
     </section>
     <section aria-label="Extension updater">
       <h2>Extension update</h2>

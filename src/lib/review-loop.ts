@@ -20,8 +20,18 @@ export const STOPPED_MARKER = "<!-- ashlar-loop-stopped -->";
 /** total=0 on the findings marker is the machine side of CONVERGED (§3). */
 const ZERO_FINDINGS_RE = /<!--\s*ashlar-findings\s+total=0\b/;
 
-export function isZeroFindings(body: string | null | undefined): boolean {
-  return ZERO_FINDINGS_RE.test(body || "");
+/**
+ * Terminal-signal detectors trust ONLY bot-authored comments. WHY: the markers are
+ * fixed, user-writable HTML comments (design §3); a driver that scanned arbitrary
+ * comments could be spoofed into converging / stopping / escalating a loop by anyone
+ * who posts the literal. Callers must prove the comment was authored by the bot.
+ */
+export interface CommentSource {
+  authoredByBot: boolean;
+}
+
+export function isZeroFindings(body: string | null | undefined, source: CommentSource): boolean {
+  return source.authoredByBot && ZERO_FINDINGS_RE.test(body || "");
 }
 
 // ── ESCALATE reason → directive (§8) ─────────────────────────────────────────
@@ -144,23 +154,28 @@ export function stoppedComment(): string {
 
 const ESCALATE_MARKER_RE = /<!--\s*ashlar-loop-escalate\s+([^>]*?)-->/;
 
-export function isEscalateComment(body: string | null | undefined): boolean {
-  return ESCALATE_MARKER_RE.test(body || "");
+export function isEscalateComment(body: string | null | undefined, source: CommentSource): boolean {
+  return source.authoredByBot && ESCALATE_MARKER_RE.test(body || "");
 }
 
-export function isStoppedComment(body: string | null | undefined): boolean {
-  return (body || "").includes(STOPPED_MARKER);
+export function isStoppedComment(body: string | null | undefined, source: CommentSource): boolean {
+  return source.authoredByBot && (body || "").includes(STOPPED_MARKER);
 }
 
 export interface ParsedEscalate {
-  reason: string;
+  reason: EscalateReason;
   round: number;
   pr: number;
   head: string;
 }
 
-/** Parse the machine marker's attributes. Returns null when absent/malformed. */
-export function parseEscalateMarker(body: string | null | undefined): ParsedEscalate | null {
+/**
+ * Parse the machine marker's attributes from a bot-authored comment. Returns null
+ * when the source is untrusted, the marker is absent/malformed, or `reason` is not a
+ * known EscalateReason (an unknown reason would index ESCALATE_DIRECTIVE as undefined).
+ */
+export function parseEscalateMarker(body: string | null | undefined, source: CommentSource): ParsedEscalate | null {
+  if (!source.authoredByBot) return null;
   const m = ESCALATE_MARKER_RE.exec(body || "");
   if (!m) return null;
   const attrs = m[1];
@@ -172,7 +187,7 @@ export function parseEscalateMarker(body: string | null | undefined): ParsedEsca
   const round = Number(get("round"));
   const pr = Number(get("pr"));
   const head = get("head");
-  if (!reason || !head || Number.isNaN(round) || Number.isNaN(pr)) return null;
+  if (!reason || !isEscalateReason(reason) || !head || Number.isNaN(round) || Number.isNaN(pr)) return null;
   return { reason, round, pr, head };
 }
 
@@ -187,18 +202,26 @@ export type ReviewLoopDirective =
   | { kind: "start"; mode: ReviewLoopMode }
   | { kind: "stop" };
 
-const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?:\s+(apply|stop))?\b/i;
+// Capture the immediate next word (if any) so a mistyped control word ("stopx") or
+// unrelated trailing prose ("don't /review-loop yet") is NOT silently accepted as a
+// bare start. Only exact `apply` / `stop` are options; a newline-separated tail is
+// fine because `[ \t]` does not cross a line break.
+const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?:[ \t]+(\w+))?/i;
 
 /**
  * Recognize `/review-loop`, `/review-loop apply`, `/review-loop stop`, and the
- * `@ashlar-bot review-loop …` variants. Returns null when the body is not a
- * loop directive (leaving plain `/review` to the existing parser). Default mode
- * is `suggest` (auto-commit only on explicit `apply`) per §2.
+ * `@ashlar-bot review-loop …` variants. Returns null when the body is not a loop
+ * directive — including when the token is immediately followed by an unrecognized
+ * word — leaving plain `/review` to the existing parser. Default mode is `suggest`
+ * (auto-commit only on explicit `apply`) per §2.
  */
 export function parseReviewLoopDirective(body: string | null | undefined): ReviewLoopDirective | null {
   const m = LOOP_RE.exec(body || "");
   if (!m) return null;
   const opt = (m[1] || "").toLowerCase();
   if (opt === "stop") return { kind: "stop" };
-  return { kind: "start", mode: opt === "apply" ? "apply" : "suggest" };
+  if (opt === "apply") return { kind: "start", mode: "apply" };
+  if (opt === "") return { kind: "start", mode: "suggest" };
+  // A word other than apply/stop follows the token: ambiguous intent, not a directive.
+  return null;
 }

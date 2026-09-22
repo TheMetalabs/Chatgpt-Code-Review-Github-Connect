@@ -66,8 +66,15 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
     const previous = body.changes?.body?.from;
     const newlyMentioned = body.action === "edited" && (typeof previous === "string" || previous === null) &&
       !isBotMention(previous ?? "", settings) && isBotMention(text, settings);
-    const bodyMention = (body.action === "opened" && isBotMention(text, settings)) || newlyMentioned;
-    const trigger: Trigger | undefined = bodyMention ? "pull_request.body_mention" : PR_ACTIONS[body.action ?? ""];
+    // A /review-loop directive in the PR body is a fixed trigger (design §2), like a
+    // mention: honor it on open, or when it was newly added on edit — never re-review an
+    // unrelated edit to a PR whose body already carried the directive.
+    const bodyLoop = parseReviewLoopDirective(text);
+    const newlyLoop = body.action === "edited" && (typeof previous === "string" || previous === null) &&
+      parseReviewLoopDirective(previous ?? "") == null && bodyLoop != null;
+    const bodyRequest =
+      (body.action === "opened" && (isBotMention(text, settings) || bodyLoop != null)) || newlyMentioned || newlyLoop;
+    const trigger: Trigger | undefined = bodyRequest ? "pull_request.body_mention" : PR_ACTIONS[body.action ?? ""];
     if (!trigger) return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"}; no new body mention)` };
     if (!repo || !pr?.number || !pr.head?.sha) return { ok: false, reason: "pull_request missing repo or head" };
     const target: IngressTarget = {
@@ -77,7 +84,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
       title: String(pr.title ?? `PR #${pr.number}`).slice(0, 200),
       headSha: pr.head.sha,
       baseSha: pr.base?.sha ?? "",
-      sender: bodyMention ? sender : pr.user?.login ?? sender,
+      sender: bodyRequest ? sender : pr.user?.login ?? sender,
       isFork: typeof pr.head.repo?.fork === "boolean" ? pr.head.repo.fork : null,
       isDraft: Boolean(pr.draft),
     };
@@ -88,7 +95,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
       target,
       installationId,
       // A PR-body request has no comment ID: reactions belong on the PR itself.
-      thread: bodyMention ? { kind: "pr_body", commentId: 0, userText: text, loop: parseReviewLoopDirective(text) ?? undefined } : undefined,
+      thread: bodyRequest ? { kind: "pr_body", commentId: 0, userText: text, loop: bodyLoop ?? undefined } : undefined,
       untrustedBody: text.slice(0, 4000),
     };
   }

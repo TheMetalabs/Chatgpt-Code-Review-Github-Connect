@@ -16,9 +16,12 @@ import {
   type EscalateReason,
 } from "./review-loop.ts";
 
+const BOT = { authoredByBot: true } as const;
+const USER = { authoredByBot: false } as const;
+
 describe("parseReviewLoopDirective", () => {
   it("recognizes the slash and mention start forms as suggest mode", () => {
-    for (const body of ["/review-loop", "please /review-loop now", "@ashlar-bot review-loop", "@ashlar review-loop"]) {
+    for (const body of ["/review-loop", "please /review-loop", "@ashlar-bot review-loop", "@ashlar review-loop"]) {
       assert.deepEqual(parseReviewLoopDirective(body), { kind: "start", mode: "suggest" }, body);
     }
   });
@@ -45,6 +48,15 @@ describe("parseReviewLoopDirective", () => {
     // `/review-loop` must be matched by the loop parser, `/review` must fall through to the plain parser.
     assert.equal(parseReviewLoopDirective("/review the code"), null);
   });
+
+  it("rejects an unrecognized word right after the token (typo'd control word, mid-prose)", () => {
+    assert.equal(parseReviewLoopDirective("/review-loop stopx"), null); // typo'd stop must not run a review
+    assert.equal(parseReviewLoopDirective("/review-loop now"), null);
+    assert.equal(parseReviewLoopDirective("don't /review-loop yet"), null);
+    // a newline-separated tail is fine — the token stands alone on its line
+    assert.deepEqual(parseReviewLoopDirective("/review-loop\nthanks"), { kind: "start", mode: "suggest" });
+    assert.deepEqual(parseReviewLoopDirective("/review-loop apply please"), { kind: "start", mode: "apply" });
+  });
 });
 
 describe("terminal signals are fixed literals", () => {
@@ -58,8 +70,10 @@ describe("terminal signals are fixed literals", () => {
     const body = stoppedComment();
     assert.ok(body.includes(STOPPED_MARKER));
     assert.ok(body.includes(REVIEW_LOOP_STOPPED_HUMAN));
-    assert.equal(isStoppedComment(body), true);
-    assert.equal(isStoppedComment("nothing here"), false);
+    assert.equal(isStoppedComment(body, BOT), true);
+    assert.equal(isStoppedComment("nothing here", BOT), false);
+    // A user who posts the literal must NOT be able to spoof a stop (untrusted source).
+    assert.equal(isStoppedComment(body, USER), false);
   });
 
   it("has a directive for every escalate reason", () => {
@@ -82,7 +96,7 @@ describe("escalate marker + composer", () => {
   it("emits a machine marker whose attributes round-trip", () => {
     const marker = escalateMarker({ reason: "oscillation", round: 6, pr: 63, head: "20c85f6" });
     assert.equal(marker, "<!-- ashlar-loop-escalate reason=oscillation round=6 pr=63 head=20c85f6 -->");
-    const parsed = parseEscalateMarker(marker);
+    const parsed = parseEscalateMarker(marker, BOT);
     assert.deepEqual(parsed, { reason: "oscillation", round: 6, pr: 63, head: "20c85f6" });
   });
 
@@ -103,7 +117,7 @@ describe("escalate marker + composer", () => {
       diffLines: 320,
       ledger: { declines: 1, defers: 2, pushbacks: 0 },
     });
-    assert.ok(isEscalateComment(body));
+    assert.ok(isEscalateComment(body, BOT));
     assert.ok(body.includes(REVIEW_LOOP_ESCALATE_HUMAN));
     assert.ok(body.includes("(round 3/10)"));
     assert.ok(body.includes(ESCALATE_DIRECTIVE["whack-a-mole"]));
@@ -112,29 +126,35 @@ describe("escalate marker + composer", () => {
     // The re-derive-from-API commands are baked in so a stale narrative can't mislead.
     assert.ok(body.includes("gh pr view 42 --repo TheMetalabs/Chatgpt-Code-Review-Github-Connect"));
     assert.ok(body.includes("audit-unaddressed.py 42 --head deadbee"));
-    const parsed = parseEscalateMarker(body);
+    const parsed = parseEscalateMarker(body, BOT);
     assert.equal(parsed?.reason, "whack-a-mole");
     assert.equal(parsed?.round, 3);
   });
 
   it("tolerates missing optional state fields", () => {
     const body = escalateComment({ reason: "round-cap", round: 10, roundCap: 10, pr: 1, head: "abc", repo: "a/b" });
-    assert.ok(isEscalateComment(body));
+    assert.ok(isEscalateComment(body, BOT));
     assert.ok(body.includes("(unknown)"));
     assert.ok(body.includes("(none)"));
   });
 
-  it("parseEscalateMarker rejects non-markers and malformed markers", () => {
-    assert.equal(parseEscalateMarker("no marker"), null);
-    assert.equal(parseEscalateMarker("<!-- ashlar-loop-escalate round=1 -->"), null); // missing reason/head
+  it("parseEscalateMarker rejects non-markers, malformed markers, and unknown reasons", () => {
+    assert.equal(parseEscalateMarker("no marker", BOT), null);
+    assert.equal(parseEscalateMarker("<!-- ashlar-loop-escalate round=1 -->", BOT), null); // missing reason/head
+    // an unknown/tampered reason must not parse (would index ESCALATE_DIRECTIVE as undefined)
+    assert.equal(parseEscalateMarker("<!-- ashlar-loop-escalate reason=malicious round=1 pr=1 head=abc -->", BOT), null);
+    // untrusted source never parses, even with a well-formed marker
+    assert.equal(parseEscalateMarker("<!-- ashlar-loop-escalate reason=oscillation round=1 pr=1 head=abc -->", USER), null);
   });
 });
 
 describe("isZeroFindings (CONVERGED machine side)", () => {
   it("matches the total=0 findings marker only", () => {
-    assert.equal(isZeroFindings("<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->"), true);
-    assert.equal(isZeroFindings("<!-- ashlar-findings total=3 inline=3 body=0 -->"), false);
-    assert.equal(isZeroFindings("<!-- ashlar-findings total=10 -->"), false);
-    assert.equal(isZeroFindings(""), false);
+    assert.equal(isZeroFindings("<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->", BOT), true);
+    assert.equal(isZeroFindings("<!-- ashlar-findings total=3 inline=3 body=0 -->", BOT), false);
+    assert.equal(isZeroFindings("<!-- ashlar-findings total=10 -->", BOT), false);
+    assert.equal(isZeroFindings("", BOT), false);
+    // a user-authored comment carrying the marker is not a convergence signal
+    assert.equal(isZeroFindings("<!-- ashlar-findings total=0 -->", USER), false);
   });
 });

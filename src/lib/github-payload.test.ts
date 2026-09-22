@@ -89,6 +89,50 @@ describe("parseGitHubPayload", () => {
     }
   });
 
+  it("treats a /review-loop directive in a PR body as a review trigger without a mention token", () => {
+    const d = parseGitHubPayload("pull_request", {
+      action: "opened",
+      installation: { id: 7 },
+      repository: { full_name: "acme/pay", fork: false },
+      sender: { login: "alice" },
+      pull_request: {
+        number: 500,
+        title: "Add retries",
+        body: "/review-loop apply",
+        draft: false,
+        head: { sha: "h1", repo: { fork: false } },
+        base: { sha: "b1" },
+        user: { login: "alice" },
+      },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") {
+      assert.equal(d.trigger, "pull_request.body_mention");
+      assert.equal(d.thread?.loop?.kind, "start");
+      assert.equal(d.thread?.loop?.mode, "apply");
+    }
+  });
+
+  it("does not re-trigger on an unrelated edit to a PR body that already carried /review-loop", () => {
+    const d = parseGitHubPayload("pull_request", {
+      action: "edited",
+      repository: { full_name: "acme/pay", fork: false },
+      sender: { login: "alice" },
+      changes: { body: { from: "/review-loop\n\nold" } },
+      pull_request: {
+        number: 500,
+        title: "Add retries",
+        body: "/review-loop\n\nnew text",
+        draft: false,
+        head: { sha: "h1", repo: { fork: false } },
+        base: { sha: "b1" },
+        user: { login: "alice" },
+      },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.equal(d.kind, "ignore");
+  });
+
   it("ignores unknown events", () => {
     const d = parseGitHubPayload("star", {});
     assert.equal(d.ok, true);

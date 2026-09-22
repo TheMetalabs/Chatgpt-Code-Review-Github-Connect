@@ -2,7 +2,7 @@ import type { Finding, SamplePr, SnapshotFile } from "./types.ts";
 import { DEFAULT_SETTINGS } from "./types.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
-import { crossFileDefs, parseHunks, sliceContext } from "./context-slice.ts";
+import { crossFileDefs, fullFileContext, parseHunks, sliceContext } from "./context-slice.ts";
 import { extractReviewPolicy, policyPathsFor } from "./github-snapshot.ts";
 
 export const CHAT_JSON_HINT = `{
@@ -88,10 +88,15 @@ function patchesByPath(diff: string): Map<string, string> {
 
 // WHY: replace the "first 20K chars of each changed file" snapshot with the head
 // text enclosing every changed hunk (+ same-file helper defs), so large files'
-// changed functions actually reach the reviewer.
+// changed functions actually reach the reviewer. When a changed file fits the remaining
+// budget, attach its WHOLE body instead of just the hunk windows (ASHLAR_CONTEXT_FULL_FILES,
+// default on): the windows omit code far from any changed line, hiding same-file helpers the
+// changed code relies on — a measured false-positive source. Files too large to fit fall back to
+// the hunk windows, so large PRs degrade exactly as before.
 function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines: number, maxChars: number): string {
   const patchByPath = patchesByPath(sample.diff);
   const codeFiles = orderFiles(snapshots.filter((f) => rankChangedFile(f.path) === 0));
+  const fullFiles = process.env.ASHLAR_CONTEXT_FULL_FILES !== "0";
   const blocks: string[] = [];
   let remaining = maxChars;
   for (const f of codeFiles) {
@@ -99,6 +104,15 @@ function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines:
     const patch = patchByPath.get(f.path) ?? "";
     const hunks = parseHunks(patch);
     if (!hunks.length) continue;
+    if (fullFiles) {
+      const full = fullFileContext(f.path, f.content);
+      // +2 accounts for the "\n\n" join separator, so the whole block is genuinely within budget.
+      if (full.length + 2 <= remaining) {
+        blocks.push(full);
+        remaining -= full.length + 2;
+        continue;
+      }
+    }
     const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: remaining, patch });
     if (sliced.text) {
       blocks.push(sliced.text);
@@ -189,7 +203,7 @@ export function buildChatParts(opts: {
     opts.extra ? `<<<UNTRUSTED_USER_LINE>>>\n${opts.extra.slice(0, 500)}\n<<<END>>>` : "",
     opts.untrustedBody ? `<<<UNTRUSTED_PR_BODY>>>\n${opts.untrustedBody.slice(0, 800)}\n<<<END>>>` : "",
     files.length
-      ? "Attached files: ashlar-diff.patch (the PR diff), ashlar-snapshot.md (head text around every changed hunk with line numbers, plus same-file definitions and a CROSS_FILE_DEFINITIONS section with definitions of imported helpers the changed code calls), and ashlar-policy.md (repository review rules and domain invariants, when present). Review those attachments. Do not ask for more files."
+      ? "Attached files: ashlar-diff.patch (the PR diff), ashlar-snapshot.md (each changed file's head text with line numbers — the whole file when it fits, otherwise the text around every changed hunk plus same-file definitions — and a CROSS_FILE_DEFINITIONS section with definitions of imported helpers the changed code calls), and ashlar-policy.md (repository review rules and domain invariants, when present). Review those attachments. Do not ask for more files."
       : "",
     "Return exactly this JSON shape:",
     CHAT_JSON_HINT,

@@ -153,6 +153,45 @@ describe("buildChatParts hunk context", () => {
   });
 });
 
+describe("buildChatParts full changed-file body (P1)", () => {
+  // A change at the TOP of the file plus a helper far below it, beyond the hunk-window pad. The
+  // hunk windows omit the helper; attaching the whole file (when it fits) makes it visible — the
+  // fix for the same-file-helper false positive.
+  const far = ["export function changed() {", "  return 1;", "}", ...Array.from({ length: 60 }, (_, i) => `// filler line ${i}`), "export function farHelper() {", "  return 'FAR_HELPER_MARKER';", "}"].join("\n");
+  const sample = {
+    key: "k", owner: "o", repo: "r", pr: 1, title: "t", body: "", sender: "s",
+    headSha: "abc1234", baseSha: "def5678", isFork: false, isDraft: false, labels: [] as string[],
+    changedPaths: ["src/big.ts"],
+    files: [{ path: "src/big.ts", language: "ts" as const, content: far }],
+    diff: "--- src/big.ts\n@@ -1,2 +1,3 @@\n export function changed() {\n+  return 1;\n }",
+  };
+
+  it("attaches the whole file when it fits, so a helper far from the hunk is visible", () => {
+    const { files } = buildChatParts({ sample });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap!.body.includes("FAR_HELPER_MARKER"), "far same-file helper is in the snapshot");
+    assert.match(snap!.body, /--- src\/big\.ts \(L1-L\d+\)/, "emitted as a full-file block with gutters");
+  });
+
+  it("falls back to hunk windows when the file is too large for the budget", () => {
+    const { files } = buildChatParts({ sample, contextMaxChars: 500 });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(!snap!.body.includes("FAR_HELPER_MARKER"), "over-budget file degrades — far helper omitted");
+    assert.ok(snap!.body.includes("changed()"), "the changed region is still present");
+  });
+
+  it("ASHLAR_CONTEXT_FULL_FILES=0 keeps the hunk-window behavior even when the file fits", () => {
+    process.env.ASHLAR_CONTEXT_FULL_FILES = "0";
+    try {
+      const { files } = buildChatParts({ sample });
+      const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+      assert.ok(!snap!.body.includes("FAR_HELPER_MARKER"), "opt-out restores hunk-window slices");
+    } finally {
+      delete process.env.ASHLAR_CONTEXT_FULL_FILES;
+    }
+  });
+});
+
 describe("buildChatParts cross-file definitions", () => {
   const sample = {
     key: "k", owner: "o", repo: "r", pr: 1, title: "t", body: "", sender: "s",

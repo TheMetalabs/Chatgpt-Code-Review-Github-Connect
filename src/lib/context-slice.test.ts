@@ -1,6 +1,17 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { crossFileDefs, parseHunks, sliceContext } from "./context-slice.ts";
+import { crossFileDefs, fullFileContext, parseHunks, sliceContext } from "./context-slice.ts";
+
+describe("fullFileContext", () => {
+  it("emits every line with a 1-based gutter under a full-range header", () => {
+    const out = fullFileContext("src/x.ts", ["a();", "b();", "c();"].join("\n"));
+    assert.equal(out, "--- src/x.ts (L1-L3)\n1| a();\n2| b();\n3| c();");
+  });
+  it("keeps the header format the coverage check and hunk slices use", () => {
+    const out = fullFileContext("src/x.ts", "only();");
+    assert.match(out, /^--- src\/x\.ts \(L1-L1\)\n/);
+  });
+});
 
 const CLASS_SRC = [
   'import { A } from "./a";', // 1

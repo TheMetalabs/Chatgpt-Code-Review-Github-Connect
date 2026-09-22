@@ -86,56 +86,70 @@ function patchesByPath(diff: string): Map<string, string> {
   return out;
 }
 
-// WHY: replace the "first 20K chars of each changed file" snapshot with the head text enclosing
-// every changed hunk (+ same-file helper defs), so large files' changed functions actually reach the
-// reviewer. Two passes:
-//   1. Baseline — every changed file gets a hunk-window slice, each capped to a DYNAMIC fair share
-//      (remaining / files-still-to-place) so a hunk-heavy early file can never starve a later one and
-//      unused budget rolls forward.
-//   2. Upgrade — spend the leftover promoting files to their WHOLE body (ASHLAR_CONTEXT_FULL_FILES,
-//      default on; the windows hide same-file helpers far from a hunk, a measured false-positive
-//      source). The upgrade spends the TOTAL leftover, so budget a later file did not need can still
-//      restore an earlier file's full body. A file is upgraded whenever its full block fits the
-//      leftover (delta may be zero or negative — the whole file is always a superset of its slice, so
-//      an equal/shorter full render still adds coverage). Full bodies are built lazily behind a raw-
-//      length prefilter so an oversized file never materializes a copy just to reject it.
+// WHY: replace the "first 20K chars of each changed file" snapshot with the head text enclosing every
+// changed hunk (+ same-file helper defs), so large files' changed functions reach the reviewer. The
+// windows hide same-file helpers far from a hunk (a measured false-positive source), so we prefer the
+// WHOLE body (ASHLAR_CONTEXT_FULL_FILES, default on) within a char budget:
+//   - Fast path: if every changed file's whole body fits together, show them all — optimal, no packing.
+//   - Constrained path (bodies don't all fit): give every file a baseline hunk-window slice, dynamic
+//     fair share so no file starves; retry any file whose share was too small for even one range using
+//     the actual remaining budget, so a file is never dropped while budget remains; then upgrade files
+//     to their whole body from the TOTAL leftover, priority order, repeating to a fixpoint so budget a
+//     shorter/earlier render frees is reused. A whole body is always a superset of its slice, so any
+//     upgrade that fits is a coverage win.
 const BLOCK_SEP = 2; // "\n\n" joined between snapshot blocks
+function joinLen(parts: readonly string[]): number {
+  const body = parts.reduce((n, s) => n + s.length, 0);
+  return parts.length > 1 ? body + BLOCK_SEP * (parts.length - 1) : body;
+}
 function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines: number, maxChars: number): string {
   const patchByPath = patchesByPath(sample.diff);
   const codeFiles = orderFiles(snapshots.filter((f) => rankChangedFile(f.path) === 0));
   const fullFiles = process.env.ASHLAR_CONTEXT_FULL_FILES !== "0";
-  const withHunks = codeFiles
+  const files = codeFiles
     .map((f) => ({ f, hunks: parseHunks(patchByPath.get(f.path) ?? ""), patch: patchByPath.get(f.path) ?? "" }))
     .filter((x) => x.hunks.length);
-  const entries: { slice: string; path: string; content: string | null }[] = [];
-  let used = 0;
-  // Pass 1 — baseline slice per file, dynamic fair share of what's left.
-  for (let i = 0; i < withHunks.length; i += 1) {
-    const { f, hunks, patch } = withHunks[i];
-    const remaining = maxChars - used - (entries.length ? BLOCK_SEP : 0);
-    if (remaining <= 0) break;
-    const cap = Math.max(1, Math.floor(remaining / (withHunks.length - i)));
-    const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: cap, patch });
-    if (!sliced.text) continue;
-    used += sliced.text.length + (entries.length ? BLOCK_SEP : 0);
-    entries.push({ slice: sliced.text, path: f.path, content: fullFiles ? f.content : null });
-  }
-  // Pass 2 — upgrade to the whole body from the total leftover (priority order).
+  if (!files.length) return "";
+
+  // Fast path: every whole body fits together.
   if (fullFiles) {
-    for (const e of entries) {
-      if (e.content == null) continue;
-      const leftover = maxChars - used;
-      // Raw body ≤ guttered form: if even the raw delta can't fit, the full block can't either.
-      if (e.content.length - e.slice.length > leftover) continue;
-      const full = fullFileContext(e.path, e.content);
-      const delta = full.length - e.slice.length; // the whole file is a superset; delta may be ≤ 0
-      if (delta <= leftover) {
-        used += delta;
-        e.slice = full;
+    const fulls = files.map((x) => fullFileContext(x.f.path, x.f.content));
+    if (joinLen(fulls) <= maxChars) return fulls.join("\n\n");
+  }
+
+  // Constrained path. Baseline slice per file at a dynamic fair share of what's left.
+  const rows = files.map((x) => ({ block: "", x }));
+  const usedLen = () => joinLen(rows.filter((r) => r.block).map((r) => r.block));
+  for (let i = 0; i < rows.length; i += 1) {
+    const { f, hunks, patch } = rows[i].x;
+    const remaining = maxChars - usedLen() - (rows.some((r) => r.block) ? BLOCK_SEP : 0);
+    if (remaining <= 0) break;
+    const cap = Math.max(1, Math.floor(remaining / (rows.length - i)));
+    rows[i].block = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: cap, patch }).text;
+  }
+  // Never drop a file while budget remains: retry any empty row with the actual remaining budget.
+  for (const r of rows) {
+    if (r.block) continue;
+    const remaining = maxChars - usedLen() - (rows.some((x) => x.block) ? BLOCK_SEP : 0);
+    if (remaining <= 0) break;
+    r.block = sliceContext({ path: r.x.f.path, content: r.x.f.content, hunks: r.x.hunks, padLines, maxChars: remaining, patch: r.x.patch }).text;
+  }
+  // Upgrade to whole bodies from the total leftover (priority order), to a fixpoint.
+  if (fullFiles) {
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const r of rows) {
+        if (!r.block) continue;
+        const full = fullFileContext(r.x.f.path, r.x.f.content);
+        if (full === r.block) continue;
+        if (full.length - r.block.length <= maxChars - usedLen()) {
+          r.block = full;
+          changed = true;
+        }
       }
     }
   }
-  return entries.map((e) => e.slice).join("\n\n");
+  return rows.filter((r) => r.block).map((r) => r.block).join("\n\n");
 }
 
 // WHY: deliver repository review rules (root/nested AGENTS.md, code_review.md) as a

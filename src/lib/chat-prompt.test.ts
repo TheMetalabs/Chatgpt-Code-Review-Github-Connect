@@ -266,6 +266,38 @@ describe("buildChatParts full changed-file body (P1)", () => {
     const snap = files.find((f) => f.name === "ashlar-snapshot.md");
     assert.ok(snap!.body.includes("A_FAR_MARKER"), "A's far helper is present — leftover restored A's whole body");
   });
+
+  it("no changed file is dropped while budget remains (many-file fair shares retried from the remainder)", () => {
+    // Four files with a budget whose per-file fair share (~budget/4) is too small for one file's hunk
+    // window, yet the whole budget comfortably holds every file's slice. None may be dropped.
+    const body = (marker: string) => ["export function fn() {", ...Array.from({ length: 12 }, (_, i) => `  const ${marker}${i} = ${i};`), `  return '${marker}';`, "}"].join("\n");
+    const paths = ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"];
+    const markers = ["AA", "BB", "CC", "DD"];
+    const many = {
+      ...sample,
+      changedPaths: paths,
+      files: paths.map((p, i) => ({ path: p, language: "ts" as const, content: body(markers[i]) })),
+      diff: paths.map((p) => `--- ${p}\n@@ -1,1 +1,2 @@\n export function fn() {\n+  const x = 0;`).join("\n\n"),
+    };
+    const { files } = buildChatParts({ sample: many, contextMaxChars: 4000, contextPadLines: 20 });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    for (const p of paths) assert.ok(snap!.body.includes(p), `${p} is present — no file dropped while budget remains`);
+  });
+
+  it("fast path: when every whole body fits together, all changed files are shown whole", () => {
+    const twoFile = {
+      ...sample,
+      changedPaths: ["src/a.ts", "src/b.ts"],
+      files: [
+        { path: "src/a.ts", language: "ts" as const, content: ["export function a() {", "  return 1;", "}", "export function aHelper() { return 'AH'; }"].join("\n") },
+        { path: "src/b.ts", language: "ts" as const, content: ["export function b() {", "  return 2;", "}", "export function bHelper() { return 'BH'; }"].join("\n") },
+      ],
+      diff: "--- src/a.ts\n@@ -1,2 +1,3 @@\n export function a() {\n+  return 1;\n }\n\n--- src/b.ts\n@@ -1,2 +1,3 @@\n export function b() {\n+  return 2;\n }",
+    };
+    const { files } = buildChatParts({ sample: twoFile });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap!.body.includes("aHelper") && snap!.body.includes("bHelper"), "both files' helpers present — all shown whole");
+  });
 });
 
 describe("buildChatParts cross-file definitions", () => {

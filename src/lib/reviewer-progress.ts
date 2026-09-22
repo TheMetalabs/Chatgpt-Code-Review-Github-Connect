@@ -57,34 +57,49 @@ function claimed(job: Pick<Job, "bridgeClaimedAt">, now: number): boolean {
   return Boolean(job.bridgeClaimedAt && now - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
 }
 
-/** The in-flight local leg, told apart into the three states an operator needs: queued at the model
- * server (alive, nothing generated for us yet — normal on a concurrency-1 server with other jobs
- * ahead), generating, or no sign of life. Only BINARY freshness (fresh vs stale) is reported, never
- * the live elapsed age: this text feeds the ops-comment change key, so a continuously changing value
- * would rewrite the GitHub comment every tick. */
-export function localLegDetail(progress: ProviderProgress | undefined, now: number, staleMs: number): string {
+/** The four states an in-flight local leg can be in, from its progress record. This is the single
+ * discriminant both the lane detail and the ops note map from, so the two strings can never drift:
+ *  - `generating`   — output is flowing (fresh)
+ *  - `stale`        — was generating, but no token for staleMs
+ *  - `queued`       — accepted, waiting behind other jobs (server alive, no output yet — normal on a
+ *                     concurrency-1 server); keepaliveAt is fresh
+ *  - `no-response`  — queued/accepted but no sign of life for staleMs (server may be wedged)
+ * Only BINARY freshness (fresh vs stale) is derived, never the live elapsed age: these feed the
+ * ops-comment change key, and a continuously changing value would rewrite the GitHub comment each tick. */
+export type LocalLegView = "generating" | "stale" | "queued" | "no-response";
+
+export function localLegView(progress: ProviderProgress | undefined, now: number, staleMs: number): LocalLegView {
   if (progress?.stage === "local_queued") {
     const aliveAt = progress.keepaliveAt ?? progress.observedAt;
-    return now - aliveAt > staleMs
-      ? "waiting for local LLM · no response from server"
-      : "queued at local LLM · server alive, no output yet";
+    return now - aliveAt > staleMs ? "no-response" : "queued";
   }
   const observedAt = progress?.observedAt;
-  const stale = observedAt !== undefined && now - observedAt > staleMs;
-  return stale ? "calling local LLM · no recent progress" : "calling local LLM";
+  return observedAt !== undefined && now - observedAt > staleMs ? "stale" : "generating";
+}
+
+const LOCAL_LEG_DETAIL: Record<LocalLegView, string> = {
+  generating: "calling local LLM",
+  stale: "calling local LLM · no recent progress",
+  queued: "queued at local LLM · server alive, no output yet",
+  "no-response": "waiting for local LLM · no response from server",
+};
+
+// null = generating normally, no ops note needed.
+const LOCAL_LEG_NOTE: Record<LocalLegView, string | null> = {
+  generating: null,
+  stale: "local reviewer: no recent progress (still waiting; cancel manually if stalled)",
+  queued: "local reviewer: queued at the local LLM (server alive, no output yet — a concurrency-1 server serves earlier jobs first)",
+  "no-response": "local reviewer: no response from the local LLM server (still waiting; cancel manually if stalled)",
+};
+
+/** Reviewer-lane text for the in-flight local leg. */
+export function localLegDetail(progress: ProviderProgress | undefined, now: number, staleMs: number): string {
+  return LOCAL_LEG_DETAIL[localLegView(progress, now, staleMs)];
 }
 
 /** Ops-comment note for an in-flight local leg, or null when it is generating normally. */
 export function localLegNote(progress: ProviderProgress | undefined, now: number, staleMs: number): string | null {
-  const detail = localLegDetail(progress, now, staleMs);
-  if (detail === "calling local LLM") return null;
-  if (detail === "queued at local LLM · server alive, no output yet") {
-    return "local reviewer: queued at the local LLM (server alive, no output yet — a concurrency-1 server serves earlier jobs first)";
-  }
-  if (detail === "waiting for local LLM · no response from server") {
-    return "local reviewer: no response from the local LLM server (still waiting; cancel manually if stalled)";
-  }
-  return "local reviewer: no recent progress (still waiting; cancel manually if stalled)";
+  return LOCAL_LEG_NOTE[localLegView(progress, now, staleMs)];
 }
 
 export function buildReviewerLanes(

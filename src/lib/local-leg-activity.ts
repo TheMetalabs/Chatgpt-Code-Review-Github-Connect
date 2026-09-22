@@ -14,6 +14,24 @@ export function localReviewDeadlineMs(env: Record<string, string | undefined> | 
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
+/** Silence window before a streaming local leg is aborted as hung, from ASHLAR_LOCAL_REVIEW_LIVENESS_MS.
+ * 0 = off.
+ *
+ * This is what restores the liveness guarantee the fixed deadline used to give, WITHOUT the false
+ * skips: the abort is reset by ANY sign of life (headers, a keepalive chunk, or output), and the
+ * model server emits a keepalive roughly every 10s while a request is queued or generating. So a
+ * request that waits hours behind other jobs stays alive and is never aborted, while one whose server
+ * has genuinely wedged (no bytes at all for the whole window) is released — which also unblocks a
+ * finished peer review that would otherwise never post (stillRacing waits on the in-flight local leg).
+ * Only meaningful while streaming: a buffered response has no incremental signal, so the caller arms
+ * this only when localStreamingDefault() is on. Default 10 min (≈60 missed 10s keepalives). */
+export function localLivenessMs(env: Record<string, string | undefined> | undefined = typeof process !== "undefined" ? process.env : undefined): number {
+  const raw = env?.ASHLAR_LOCAL_REVIEW_LIVENESS_MS;
+  if (raw == null || raw.trim() === "") return 10 * 60_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 10 * 60_000;
+}
+
 export type LocalLegPhase = "queued" | "generating";
 
 /** Per-leg activity tracker. `aliveAt` is the last sign the server is alive for this request

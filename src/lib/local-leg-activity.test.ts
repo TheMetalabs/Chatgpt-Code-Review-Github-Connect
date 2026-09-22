@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { applyLocalActivity, localLegProgress, localReviewDeadlineMs, startLocalLeg } from "./local-leg-activity.ts";
+import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg } from "./local-leg-activity.ts";
 
 describe("localReviewDeadlineMs", () => {
   it("defaults to no ceiling: a queued multi-turn review may legitimately take hours", () => {
@@ -13,6 +13,19 @@ describe("localReviewDeadlineMs", () => {
     assert.equal(localReviewDeadlineMs({ ASHLAR_LOCAL_REVIEW_DEADLINE_MS: "7200000" }), 7_200_000);
     assert.equal(localReviewDeadlineMs({ ASHLAR_LOCAL_REVIEW_DEADLINE_MS: "abc" }), 0);
     assert.equal(localReviewDeadlineMs({ ASHLAR_LOCAL_REVIEW_DEADLINE_MS: "-5" }), 0);
+  });
+});
+
+describe("localLivenessMs", () => {
+  it("defaults to a 10-min silence window (reset by ~10s keepalives, so a queue never trips it)", () => {
+    assert.equal(localLivenessMs({}), 600_000);
+    assert.equal(localLivenessMs({ ASHLAR_LOCAL_REVIEW_LIVENESS_MS: "" }), 600_000);
+  });
+
+  it("can be disabled with 0 and honours an explicit window; garbage falls back to the default", () => {
+    assert.equal(localLivenessMs({ ASHLAR_LOCAL_REVIEW_LIVENESS_MS: "0" }), 0);
+    assert.equal(localLivenessMs({ ASHLAR_LOCAL_REVIEW_LIVENESS_MS: "120000" }), 120_000);
+    assert.equal(localLivenessMs({ ASHLAR_LOCAL_REVIEW_LIVENESS_MS: "abc" }), 600_000);
   });
 });
 

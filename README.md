@@ -237,8 +237,9 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 | `ASHLAR_LOCAL_REVIEW_TOOL_ITERS` | 8 | 그룹당 최대 툴 라운드. 초과하면 툴을 빼고 최종 JSON 강제 |
 | `ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS` | 24000 | 프롬프트가 이 토큰을 넘으면 다음 턴에 최종 JSON 강제 |
 | `ASHLAR_LOCAL_REVIEW_STALE_NOTE_MS` | 300000 | 로컬 리뷰어 하트비트 오래된 판정 시간(ms). 초과 시 ops 노트에 경고 표시만(자동 취소 없음) |
-| `ASHLAR_LOCAL_REVIEW_DEADLINE_MS` | **0 (없음)** | 로컬 레그 벽시계 상한(ms). 동시성 1 서버에서 멀티턴 리뷰는 30~40분이 보통이고 앞선 잡에 밀리면 몇 시간도 걸리므로 기본은 상한 없음. 값을 주면 초과 시 레그를 중단하고 `Skipped local` 처리 |
-| `ASHLAR_LOCAL_LLM_STREAM` | true | chat/completions 를 SSE 스트리밍으로 받아 토큰 단위 하트비트를 얻습니다. 응답은 비스트리밍 형태로 재조립되므로 동작은 같습니다. `false` 면 예전처럼 단일 JSON 응답 |
+| `ASHLAR_LOCAL_REVIEW_DEADLINE_MS` | **0 (없음)** | 로컬 레그 **하드** 벽시계 상한(ms). 활동과 무관한 총 실행 상한. 동시성 1 서버에서 멀티턴 리뷰는 30~40분이 보통이고 앞선 잡에 밀리면 몇 시간도 걸리므로 기본은 없음. 값을 주면 초과 시 중단하고 `Skipped local` 처리 |
+| `ASHLAR_LOCAL_REVIEW_LIVENESS_MS` | 600000 (10분) | 스트리밍 레그가 **완전 무신호**(헤더·keepalive·토큰 중 아무것도 없음)로 이 시간을 넘기면 중단. 신호가 하나라도 오면 리셋되고 서버가 ~10초마다 keepalive 를 보내므로, 몇 시간 큐 대기하는 정상 리뷰는 절대 걸리지 않고 **진짜 멈춘 서버만** 풀립니다(이때 끝난 다른 리뷰어 결과도 함께 게시됨). 0=끔. 비스트리밍 레그엔 증분 신호가 없어 적용 안 함(하드 상한만) |
+| `ASHLAR_LOCAL_LLM_STREAM` | true | chat/completions 를 SSE 스트리밍으로 받아 토큰 단위 하트비트를 얻습니다. 응답은 비스트리밍 형태로 재조립되므로 동작은 같습니다. `false` 면 예전처럼 단일 JSON 응답(이 경우 큐/생성 구분·liveness 중단 없음) |
 
 로컬 레그는 `providerProgress.local`로 **하트비트 + 진행상황 신호**를 내보냅니다. 스트리밍 전송이
 서버의 응답 헤더·빈 keepalive 청크·토큰을 관찰해 레그를 세 상태로 구분합니다.
@@ -253,9 +254,13 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 `observedAt`은 마지막 **실제 진행**(토큰 또는 완료된 턴), `keepaliveAt`은 마지막 **생존 신호**입니다.
 둘이 벌어지는 구간이 곧 "큐 대기"입니다. 히스토리 steps 에는 `local.requested → local.accepted(서버 수락)
 → local.generating(첫 토큰) → local.response_received | local.failed` 가 남아 사후 진단이 됩니다.
-어느 상태든 **자동 타임아웃/중단은 없습니다**(`ASHLAR_LOCAL_REVIEW_DEADLINE_MS` 를 명시한 경우만 예외).
-대기/실패 판정 자체는 기존대로 레그 종료(성공 레그 저장 또는 `Skipped local`)로 이뤄지고, 신호는
-사람이 취소 여부를 판단할 근거일 뿐입니다.
+
+중단 정책은 **활동 기반**입니다. 정상 리뷰(생성 중이거나 큐 대기 중 — 어느 쪽이든 keepalive/토큰이
+흐름)는 절대 자동 중단되지 않습니다. `ASHLAR_LOCAL_REVIEW_LIVENESS_MS`(기본 10분) 동안 **아무 신호도
+없을 때만** 서버가 멈춘 것으로 보고 레그를 풀어 `Skipped local` 처리하며, 이때 이미 끝난 다른 리뷰어의
+리뷰가 로컬 레그에 막혀 영영 게시되지 못하던 문제도 함께 해소됩니다. 별도로
+`ASHLAR_LOCAL_REVIEW_DEADLINE_MS`(기본 없음)를 주면 활동과 무관한 하드 상한도 걸 수 있습니다.
+`no response`/liveness 판정은 **토큰 생성 중에는 발생하지 않습니다** — 토큰이 곧 신호이기 때문입니다.
 
 기본 `auto`는 작은 PR(프롬프트 ≤ 30K 토큰)은 **단일턴**으로 빠르게 전체를 보고, 큰 PR은 **멀티턴**으로
 돌립니다. 단일턴은 한 완성 창에 다 담기고 재현율이 높으며, 큰 PR은 단일 호출 KV 캐시가 치솟으니

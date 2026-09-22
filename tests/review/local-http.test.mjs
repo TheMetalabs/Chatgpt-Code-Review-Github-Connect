@@ -140,6 +140,30 @@ test('streaming chat: a truncated reply and a stream cut before completion are e
   await assert.rejects(requestLocalChat(cut, '', payload), /ended before completion/);
 });
 
+test('streaming chat: [DONE] with no finish_reason is incomplete, not a resolved partial reply', async t => {
+  const requestLocalChat = await transport();
+  // A truncating proxy appends [DONE] but no chunk ever carried finish_reason; resolving here would
+  // hand a partial reply to the caller as if it were complete.
+  const base = await listen(t, (req, res) => { req.resume(); req.on('end', () => sse(res, [chunk({ content: 'partial answer' }), 'data: [DONE]'])); });
+  await assert.rejects(requestLocalChat(base, '', payload), /ended before completion/);
+});
+
+test('buffered chat (stream off, or server ignores stream) reports output activity so the lane is not stuck at queued', async t => {
+  const requestLocalChat = await transport();
+  const reply = '{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}';
+  // Non-stream request: the buffered branch must still emit an `output` signal, otherwise the leg
+  // shows "queued · server alive, no output yet" for the whole generation.
+  const nonStream = await listen(t, (req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end(reply); });
+  const seenOff = [];
+  assert.equal(await requestLocalChat(nonStream, '', payload, undefined, { stream: false, onActivity: a => seenOff.push(a.kind) }), 'ok');
+  assert.ok(seenOff.includes('output'), 'buffered response must report output activity');
+  // Streaming requested but the server answered plain JSON: same buffered path, same signal.
+  const ignoresStream = await listen(t, (req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end(reply); });
+  const seenOn = [];
+  assert.equal(await requestLocalChat(ignoresStream, '', payload, undefined, { onActivity: a => seenOn.push(a.kind) }), 'ok');
+  assert.ok(seenOn.includes('output'), 'a JSON reply to a stream request must still report output');
+});
+
 test('streaming chat: a server that ignores stream and answers plain JSON still works; ASHLAR_LOCAL_LLM_STREAM=false sends a non-stream request', async t => {
   const requestLocalChat = await transport();
   const plain = await listen(t, (req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"choices":[{"finish_reason":"stop","message":{"content":"plain"}}]}'); });

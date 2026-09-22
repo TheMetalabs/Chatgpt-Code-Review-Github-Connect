@@ -18,9 +18,9 @@ import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot,
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm } from "./local-llm.server";
-import { requestLocalJson } from "./local-chat-request.server";
+import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
-import { applyLocalActivity, localLegProgress, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
+import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -54,6 +54,10 @@ const localControllers = new Map<string, AbortController>();
 // the job's providerProgress.local so lanes and the ops comment can tell "waiting behind other jobs"
 // from "no sign of life". There is no wall-clock ceiling by default — see localReviewDeadlineMs.
 const localActivity = new Map<string, LocalLegState>();
+// Per-leg liveness watchdog: reset on every sign of life, fires only after total silence (see
+// localLivenessMs). Armed only for streaming legs, which get ~10s keepalives; a buffered leg has no
+// incremental signal so it relies on the optional total ceiling instead.
+const localLiveness = new Map<string, { reset: () => void; clear: () => void }>();
 // In-memory only (never persisted): the snapshot the local multi-turn loop reads files from.
 // Kept just for the life of the local leg so the loop's tools serve changed-file content without
 // re-fetching the PR. Chat legs never touch this.
@@ -141,6 +145,8 @@ export function resetHarbor() {
   localInFlight.clear();
   localSamples.clear();
   localActivity.clear();
+  for (const l of localLiveness.values()) l.clear();
+  localLiveness.clear();
   for (const job of state.jobs) recordJobHistory(isLive(job.status)
     ? {...job, status: "cancelled", skipReason: "operator reset", updatedAt: Date.now()} : job);
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
@@ -151,6 +157,8 @@ export function cancelHarborJob(jobId: string) {
   localControllers.get(jobId)?.abort();
   localSamples.delete(jobId);
   localActivity.delete(jobId);
+  localLiveness.get(jobId)?.clear();
+  localLiveness.delete(jobId);
   state = {
     ...state,
     jobs: state.jobs.map((j) =>
@@ -635,6 +643,7 @@ async function kickLocalRace(jobId: string, prompt: string) {
  * first server acceptance and the first output token are also recorded as history steps, so a
  * post-mortem can tell "never accepted", "accepted but never generated" and "generated" apart. */
 function noteLocalActivity(jobId: string, kind: LocalLegActivityKind) {
+  localLiveness.get(jobId)?.reset(); // any sign of life defers the hung-server abort
   const prev = localActivity.get(jobId);
   if (!prev) return;
   const now = Date.now();
@@ -719,9 +728,25 @@ async function generateLocalLeg(
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
-  // Optional wall-clock ceiling (ASHLAR_LOCAL_REVIEW_DEADLINE_MS; off by default — a queued review on
-  // a concurrency-1 server legitimately takes hours). When armed, the transport honours the abort and
-  // the leg fails cleanly below. Cleared in finally the moment the leg settles on its own.
+  // Two independent, both-optional aborts; neither fires for a healthy long review. Both honour the
+  // signal, so the leg falls into the catch below and fails cleanly. Cleared in finally on settle.
+  //
+  // 1. Liveness (default 10 min, streaming only): abort after TOTAL silence — no headers, no keepalive,
+  //    no token — for the window. Reset by noteLocalActivity on every sign of life, and the server
+  //    keepalives ~every 10s while queued or generating, so an hours-long queue is never touched; only
+  //    a genuinely wedged server trips it. This is what unblocks a finished peer review that would
+  //    otherwise wait forever on the in-flight local leg (stillRacing). A buffered leg has no
+  //    incremental signal, so liveness is armed only when streaming is on; it relies on the ceiling.
+  // 2. Total ceiling (ASHLAR_LOCAL_REVIEW_DEADLINE_MS; off by default): a hard wall-clock cap for
+  //    operators who want one, independent of activity.
+  const livenessMs = localStreamingDefault() ? localLivenessMs() : 0;
+  if (livenessMs > 0) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const fire = () => localControllers.get(jobId)?.abort(new Error(`local review: no response from the model server for ${Math.round(livenessMs / 60_000)} min (ASHLAR_LOCAL_REVIEW_LIVENESS_MS)`));
+    const arm = () => { timer = setTimeout(fire, livenessMs); };
+    arm();
+    localLiveness.set(jobId, { reset: () => { if (timer) clearTimeout(timer); arm(); }, clear: () => { if (timer) clearTimeout(timer); } });
+  }
   const deadlineMs = localReviewDeadlineMs();
   const deadline = deadlineMs > 0
     ? setTimeout(
@@ -759,6 +784,8 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     }));
   } finally {
     if (deadline) clearTimeout(deadline);
+    localLiveness.get(jobId)?.clear();
+    localLiveness.delete(jobId);
     localInFlight.delete(jobId);
     localControllers.delete(jobId);
     localSamples.delete(jobId);

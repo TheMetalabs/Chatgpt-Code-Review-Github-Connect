@@ -31,10 +31,18 @@ export type LocalRequestOptions = {
   stream?: boolean;
 };
 
+/** The env-configured streaming default (on unless ASHLAR_LOCAL_LLM_STREAM="false"). Exported so the
+ * caller can match its liveness policy to the transport: incremental keepalives only exist while
+ * streaming, so a silence-based abort is only meaningful then. */
+export function localStreamingDefault(
+  env: Record<string, string | undefined> | undefined = typeof process !== "undefined" ? process.env : undefined,
+): boolean {
+  return env?.ASHLAR_LOCAL_LLM_STREAM !== "false";
+}
+
 function streamingEnabled(opts?: LocalRequestOptions): boolean {
   if (opts?.stream !== undefined) return opts.stream;
-  const env = typeof process !== "undefined" ? process.env : undefined;
-  return env?.ASHLAR_LOCAL_LLM_STREAM !== "false";
+  return localStreamingDefault();
 }
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -160,17 +168,21 @@ export function requestLocalJson(
       const ok = Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 300);
       const sse = ok && stream && /^text\/event-stream/i.test(String(res.headers["content-type"] || ""));
       if (ok) activity("keepalive");
+      // A buffered chat response (streaming off, or the server ignored `stream` and answered JSON)
+      // holds the socket open while it generates and emits no incremental tokens, so there is no later
+      // signal to distinguish. Report it as generating from headers — the honest label for "the server
+      // accepted and is now producing this reply" — rather than leaving it stuck at "queued".
+      if (ok && chat && !sse) activity("output");
       const chunks: Buffer[] = [];
       let bytes = 0;
       const assembler = sse ? new StreamAssembler() : null;
-      let done = false;
       let pending = "";
       let failed: Error | null = null;
       const onLine = (line: string) => {
         if (!assembler || !line.startsWith("data:")) return; // comments / event: / blank lines carry nothing
         const text = line.slice(5).trim();
         if (!text) return;
-        if (text === "[DONE]") { done = true; return; }
+        if (text === "[DONE]") return; // terminal marker; completion is decided by finish_reason
         let chunk: StreamChunk;
         try { chunk = JSON.parse(text) as StreamChunk; }
         catch { failed ??= new Error("local LLM returned an invalid stream chunk"); return; }
@@ -196,7 +208,10 @@ export function requestLocalJson(
         if (assembler) {
           if (pending.trim()) onLine(pending.replace(/\r$/, ""));
           if (failed) { reject(failed); return; }
-          if (!done && !assembler.finished) { reject(new Error("local LLM stream ended before completion")); return; }
+          // A complete chat response always carries a finish_reason. Treat its absence as incomplete
+          // whether or not a [DONE] arrived: a stream that reaches [DONE] with no finish_reason (a
+          // truncating proxy, an interrupted server) must not resolve a partial reply as if finished.
+          if (!assembler.finished) { reject(new Error("local LLM stream ended before completion")); return; }
           resolve(assembler.result());
           return;
         }

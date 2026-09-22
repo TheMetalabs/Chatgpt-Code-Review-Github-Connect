@@ -202,11 +202,12 @@ export type ReviewLoopDirective =
   | { kind: "start"; mode: ReviewLoopMode }
   | { kind: "stop" };
 
-// The token must be bounded: `(?![\w-])` rejects glued suffixes (`/review-loopx`,
-// `/review-loop-stop`) that would otherwise match the base alternative. Then capture
-// the immediate next word (if any); only exact `apply` / `stop` are options. `g` so a
-// leading invalid occurrence ("don't /review-loop yet") cannot mask a later valid one.
-const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?![\w-])(?:[ \t]+(\w+))?/gi;
+// The token is bounded by `(?![\w-])` (rejects glued suffixes like `/review-loopx`,
+// `/review-loop-stop`). The option capture is `[\w-]+` — the WHOLE next token — so a
+// hyphen-suffixed option (`apply-later`, `stop-now`) is captured in full and fails the
+// exact `apply`/`stop` comparison instead of being truncated to a valid command. `g` so
+// a leading invalid occurrence ("don't /review-loop yet") cannot mask a later valid one.
+const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?![\w-])(?:[ \t]+([\w-]+))?/gi;
 
 /**
  * Recognize `/review-loop`, `/review-loop apply`, `/review-loop stop`, and the
@@ -229,6 +230,18 @@ export function parseReviewLoopDirective(body: string | null | undefined): Revie
     // for a later valid directive rather than accepting or rejecting outright.
   }
   return null;
+}
+
+/**
+ * Remove every `/review-loop…` / `@ashlar-bot review-loop…` directive span from a body,
+ * so a caller can test whether an INDEPENDENT bot mention remains (design: a mention that
+ * is part of the loop directive itself, e.g. `@ashlar-bot review-loop stop`, is not a
+ * separate review request). Replaces each match with a space to preserve token spacing.
+ */
+export function stripLoopDirectives(body: string | null | undefined): string {
+  if (!body) return "";
+  LOOP_RE.lastIndex = 0;
+  return body.replace(LOOP_RE, " ");
 }
 
 /** True when two parsed directives are the same command (kind + start mode). */

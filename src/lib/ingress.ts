@@ -1,6 +1,6 @@
 import { llmWorkAllowed } from "./ops-comment.ts";
 import { isBotMention } from "./poster.ts";
-import { parseReviewLoopDirective } from "./review-loop.ts";
+import { parseReviewLoopDirective, stripLoopDirectives } from "./review-loop.ts";
 import { SAMPLE_PRS } from "./samples.ts";
 import type { BotSettings, ForkStatus, Job, Trigger, WebhookLog } from "./types.ts";
 
@@ -57,13 +57,15 @@ export function reviewSkipReason(opts: {
   // configurable @-mention tokens. A start directive is an explicit request; a stop
   // directive is a control command, not a review (the loop engine handles it later).
   const loop = opts.thread?.loop ?? parseReviewLoopDirective(opts.thread?.userText);
-  // Gate the stop skip on the body NOT being a mention request: LOOP_RE is unanchored,
-  // so a trailing "/review-loop stop" must not suppress an explicit @ashlar-bot/review in
-  // the same comment. A directive-only stop body still skips.
-  if (mentionTrigger && loop?.kind === "stop" && !isBotMention(opts.thread?.userText, opts.settings))
+  // An INDEPENDENT mention is one that survives after the loop-directive spans are removed:
+  // `@ashlar-bot review-loop stop` has none (the mention is part of the directive), while
+  // `@ashlar-bot review … /review-loop stop` still has the explicit `@ashlar-bot review`.
+  const independentMention = isBotMention(stripLoopDirectives(opts.thread?.userText), opts.settings);
+  // A stop directive is control-only unless the body ALSO carries an independent mention,
+  // which must still queue its own review.
+  if (mentionTrigger && loop?.kind === "stop" && !independentMention)
     return "review-loop stop (no active loop engine)";
-  const requested =
-    mentionTrigger && (loop?.kind === "start" || isBotMention(opts.thread?.userText, opts.settings));
+  const requested = mentionTrigger && (loop?.kind === "start" || independentMention);
   if (opts.settings.skipDrafts && opts.sample.isDraft && !requested) return "draft";
   if (opts.settings.skipForks) {
     if (opts.sample.isFork === true) return "fork (allowlist empty) · PR body not promoted to policy";

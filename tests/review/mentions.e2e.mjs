@@ -236,3 +236,13 @@ test('an explicit @ashlar-bot review is not suppressed by a trailing /review-loo
   assert.equal(out.status,202);assert.equal(out.queued,true);
   assert.equal((await settled(app,out.jobId)).status,'awaiting_chat');
 });
+
+test('@ashlar-bot review-loop stop is control-only: recognized as a skip, no reviewer work',async t=>{
+  const app=await fixture(t);
+  const raw=comment(); raw.comment.body='@ashlar-bot review-loop stop';
+  const out=await deliver(app,'issue_comment',raw);
+  const job=app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  assert.equal(job?.status,'skipped');
+  assert.equal(job?.skipReason,'review-loop stop (no active loop engine)');
+  assert.equal(app.localRequests.length,0,'no reviewer leg runs for a stop');
+});

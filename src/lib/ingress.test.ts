@@ -197,6 +197,17 @@ describe("decideIngress", () => {
     if (d.ok) assert.ok(d.job);
   });
 
+  it("treats @ashlar-bot review-loop stop as control-only (no review queued)", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "issue_comment.mention",
+      thread: { kind: "mention", commentId: 1, userText: "@ashlar-bot review-loop stop" },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.equal(d.skip, "review-loop stop (no active loop engine)");
+  });
+
   it("does not let a trailing /review-loop stop suppress an explicit mention in the same body", () => {
     const d = decideIngress({
       ...base,

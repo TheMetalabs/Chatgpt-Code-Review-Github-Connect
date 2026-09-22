@@ -14,6 +14,7 @@ import {
   REVIEW_LOOP_STOPPED_HUMAN,
   STOPPED_MARKER,
   sameDirective,
+  stripLoopDirectives,
   type EscalateReason,
 } from "./review-loop.ts";
 
@@ -56,6 +57,13 @@ describe("parseReviewLoopDirective", () => {
     }
   });
 
+  it("rejects a hyphen-suffixed option (only the exact apply/stop token is valid)", () => {
+    for (const body of ["/review-loop apply-later", "@ashlar-bot review-loop stop-now", "/review-loop apply_later"]) {
+      assert.equal(parseReviewLoopDirective(body), null, body);
+    }
+    assert.deepEqual(parseReviewLoopDirective("/review-loop apply"), { kind: "start", mode: "apply" });
+  });
+
   it("returns a later valid directive even if an earlier occurrence is invalid", () => {
     assert.deepEqual(parseReviewLoopDirective("don't /review-loop yet\n/review-loop apply"), { kind: "start", mode: "apply" });
     assert.deepEqual(parseReviewLoopDirective("nope /review-loop maybe\n/review-loop"), { kind: "start", mode: "suggest" });
@@ -69,6 +77,15 @@ describe("parseReviewLoopDirective", () => {
     // a newline-separated tail is fine — the token stands alone on its line
     assert.deepEqual(parseReviewLoopDirective("/review-loop\nthanks"), { kind: "start", mode: "suggest" });
     assert.deepEqual(parseReviewLoopDirective("/review-loop apply please"), { kind: "start", mode: "apply" });
+  });
+});
+
+describe("stripLoopDirectives", () => {
+  it("removes loop directive spans, leaving an independent mention detectable", () => {
+    // the mention IS the directive -> nothing independent remains
+    assert.equal(/@ashlar-bot\b/.test(stripLoopDirectives("@ashlar-bot review-loop stop")), false);
+    // an independent @ashlar-bot review survives the strip of a trailing /review-loop stop
+    assert.equal(/@ashlar-bot review\b/.test(stripLoopDirectives("@ashlar-bot review — then /review-loop stop")), true);
   });
 });
 

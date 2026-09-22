@@ -86,40 +86,46 @@ function patchesByPath(diff: string): Map<string, string> {
   return out;
 }
 
-// WHY: replace the "first 20K chars of each changed file" snapshot with the head
-// text enclosing every changed hunk (+ same-file helper defs), so large files'
-// changed functions actually reach the reviewer. When a changed file fits the remaining
-// budget, attach its WHOLE body instead of just the hunk windows (ASHLAR_CONTEXT_FULL_FILES,
-// default on): the windows omit code far from any changed line, hiding same-file helpers the
-// changed code relies on — a measured false-positive source. Files too large to fit fall back to
-// the hunk windows, so large PRs degrade exactly as before.
+// WHY: replace the "first 20K chars of each changed file" snapshot with the head text enclosing
+// every changed hunk (+ same-file helper defs), so large files' changed functions actually reach the
+// reviewer. Two passes so full-file context never costs another file its baseline:
+//   1. every changed file gets at least its hunk-window slice (the pre-P1 guarantee),
+//   2. leftover budget upgrades files to their WHOLE body (ASHLAR_CONTEXT_FULL_FILES, default on) —
+//      the windows omit code far from any changed line, hiding same-file helpers the changed code
+//      relies on, a measured false-positive source.
+// A single greedy full file could otherwise eat the whole budget and starve later changed files of
+// all context. The join separator (2 chars) is only counted BETWEEN blocks, not before the first.
+const BLOCK_SEP = 2; // "\n\n" joined between snapshot blocks
 function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines: number, maxChars: number): string {
   const patchByPath = patchesByPath(sample.diff);
   const codeFiles = orderFiles(snapshots.filter((f) => rankChangedFile(f.path) === 0));
   const fullFiles = process.env.ASHLAR_CONTEXT_FULL_FILES !== "0";
-  const blocks: string[] = [];
-  let remaining = maxChars;
+  const entries: { slice: string; full: string | null }[] = [];
+  let used = 0;
+  // Pass 1 — baseline: a hunk-window slice for every changed file, within budget.
   for (const f of codeFiles) {
-    if (remaining <= 0) break;
     const patch = patchByPath.get(f.path) ?? "";
     const hunks = parseHunks(patch);
     if (!hunks.length) continue;
-    if (fullFiles) {
-      const full = fullFileContext(f.path, f.content);
-      // +2 accounts for the "\n\n" join separator, so the whole block is genuinely within budget.
-      if (full.length + 2 <= remaining) {
-        blocks.push(full);
-        remaining -= full.length + 2;
-        continue;
+    const remaining = maxChars - used - (entries.length ? BLOCK_SEP : 0);
+    if (remaining <= 0) break;
+    const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: remaining, patch });
+    if (!sliced.text) continue;
+    used += sliced.text.length + (entries.length ? BLOCK_SEP : 0);
+    entries.push({ slice: sliced.text, full: fullFiles ? fullFileContext(f.path, f.content) : null });
+  }
+  // Pass 2 — upgrade to full body with leftover budget (priority order), never starving a baseline.
+  if (fullFiles) {
+    for (const e of entries) {
+      if (!e.full || e.full.length <= e.slice.length) continue;
+      const delta = e.full.length - e.slice.length;
+      if (delta <= maxChars - used) {
+        used += delta;
+        e.slice = e.full;
       }
     }
-    const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: remaining, patch });
-    if (sliced.text) {
-      blocks.push(sliced.text);
-      remaining -= sliced.text.length + 2;
-    }
   }
-  return blocks.join("\n\n");
+  return entries.map((e) => e.slice).join("\n\n");
 }
 
 // WHY: deliver repository review rules (root/nested AGENTS.md, code_review.md) as a
@@ -190,6 +196,14 @@ export function buildChatParts(opts: {
     process.env.ASHLAR_POLICY_ATTACH === "0"
       ? ""
       : buildPolicyAttachment(opts.sample, opts.policyMaxChars ?? DEFAULT_SETTINGS.promptPolicyMaxChars);
+  // Describe the snapshot as it was actually built, so the opt-out (ASHLAR_CONTEXT_FULL_FILES=0) and
+  // head mode are not misdescribed as whole-file context.
+  const snapshotDesc =
+    mode === "head"
+      ? "each changed file's head text"
+      : process.env.ASHLAR_CONTEXT_FULL_FILES !== "0"
+        ? "each changed file's head text with line numbers — the whole file when it fits, otherwise the text around every changed hunk plus same-file definitions"
+        : "head text around every changed hunk with line numbers, plus same-file definitions";
   const files: ReviewAttach[] = [
     { name: "ashlar-diff.patch", body: String(opts.sample.diff || "") },
     { name: "ashlar-snapshot.md", body: contextBody },
@@ -203,7 +217,7 @@ export function buildChatParts(opts: {
     opts.extra ? `<<<UNTRUSTED_USER_LINE>>>\n${opts.extra.slice(0, 500)}\n<<<END>>>` : "",
     opts.untrustedBody ? `<<<UNTRUSTED_PR_BODY>>>\n${opts.untrustedBody.slice(0, 800)}\n<<<END>>>` : "",
     files.length
-      ? "Attached files: ashlar-diff.patch (the PR diff), ashlar-snapshot.md (each changed file's head text with line numbers — the whole file when it fits, otherwise the text around every changed hunk plus same-file definitions — and a CROSS_FILE_DEFINITIONS section with definitions of imported helpers the changed code calls), and ashlar-policy.md (repository review rules and domain invariants, when present). Review those attachments. Do not ask for more files."
+      ? `Attached files: ashlar-diff.patch (the PR diff), ashlar-snapshot.md (${snapshotDesc}, and a CROSS_FILE_DEFINITIONS section with definitions of imported helpers the changed code calls), and ashlar-policy.md (repository review rules and domain invariants, when present). Review those attachments. Do not ask for more files.`
       : "",
     "Return exactly this JSON shape:",
     CHAT_JSON_HINT,

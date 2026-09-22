@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { FINDING_412, SAMPLE_PRS } from "./samples.ts";
+import { fullFileContext } from "./context-slice.ts";
 import {
   CHAT_JSON_HINT,
   MERGE_FALLBACK_NOTE,
@@ -181,14 +182,44 @@ describe("buildChatParts full changed-file body (P1)", () => {
   });
 
   it("ASHLAR_CONTEXT_FULL_FILES=0 keeps the hunk-window behavior even when the file fits", () => {
+    const prev = process.env.ASHLAR_CONTEXT_FULL_FILES;
     process.env.ASHLAR_CONTEXT_FULL_FILES = "0";
     try {
       const { files } = buildChatParts({ sample });
       const snap = files.find((f) => f.name === "ashlar-snapshot.md");
       assert.ok(!snap!.body.includes("FAR_HELPER_MARKER"), "opt-out restores hunk-window slices");
     } finally {
-      delete process.env.ASHLAR_CONTEXT_FULL_FILES;
+      if (prev === undefined) delete process.env.ASHLAR_CONTEXT_FULL_FILES;
+      else process.env.ASHLAR_CONTEXT_FULL_FILES = prev;
     }
+  });
+
+  it("attaches the whole file when it is exactly at the budget (no phantom separator before the first block)", () => {
+    // Regression for the off-by-2: a single/first block needs no join separator, so a file whose
+    // full block length equals the budget must still be attached whole, not degraded to hunk windows.
+    const exact = fullFileContext("src/big.ts", sample.files[0].content).length;
+    const { files } = buildChatParts({ sample, contextMaxChars: exact });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap!.body.includes("FAR_HELPER_MARKER"), "exact-fit first file is attached whole");
+  });
+
+  it("a large first file does not starve a later changed file of its baseline context", () => {
+    // Regression: the full-file branch must not consume the whole budget. Two changed files where
+    // file A's full body is huge; B must still receive at least its hunk window.
+    const bigA = ["export function a() {", "  return 1;", "}", ...Array.from({ length: 400 }, (_, i) => `// A filler ${i}`)].join("\n");
+    const twoFile = {
+      ...sample,
+      changedPaths: ["src/a.ts", "src/b.ts"],
+      files: [
+        { path: "src/a.ts", language: "ts" as const, content: bigA },
+        { path: "src/b.ts", language: "ts" as const, content: ["export function bbb() {", "  return 'B_MARKER';", "}"].join("\n") },
+      ],
+      diff: "--- src/a.ts\n@@ -1,2 +1,3 @@\n export function a() {\n+  return 1;\n }\n\n--- src/b.ts\n@@ -1,2 +1,3 @@\n export function bbb() {\n+  return 'B_MARKER';\n }",
+    };
+    // Budget fits A's full body but would leave nothing for B if A were greedy.
+    const { files } = buildChatParts({ sample: twoFile, contextMaxChars: fullFileContext("src/a.ts", bigA).length + 40 });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap!.body.includes("B_MARKER"), "file B keeps its baseline context — not starved by A's full body");
   });
 });
 

@@ -235,8 +235,26 @@ async function requestClearStuck() {
       : `Could not clear stuck jobs: ${res.error || "no eligible jobs"}`;
 }
 
+async function requestHardReset() {
+  // Leftover jobs whose tabs are already closed cannot be retired by "Clear stuck jobs" (it needs a fresh
+  // server confirmation that the job is forgotten, which an unreachable/changed origin never gives). They
+  // also survive a bare storage edit because the worker keeps an in-memory job registry and re-persists it
+  // on the next poll. The only reliable escape is to empty the registry AND reload the worker so that cache
+  // is discarded — which is exactly what the background handler does.
+  if (!confirm("Force clear ALL tracked jobs and reload the bridge?\n\nThis drops recovery, cleanup, saved replies and pending JSON, and discards any in-progress managed review. Your origin/token settings are kept.")) return;
+  statusEl.textContent = "Clearing all jobs and reloading the bridge…";
+  const res = await sendWithWake({type: "ashlar-hard-reset"});
+  // The worker reloads itself just after replying, which also closes this popup; report only if we linger.
+  statusEl.textContent = res?.ok
+    ? "All jobs cleared. Reloading the bridge…"
+    : !res
+      ? "No response from the worker after several tries — reload the extension from chrome://extensions, then retry."
+      : `Could not clear jobs: ${res.error || "unknown error"}`;
+}
+
 document.getElementById("reconnect").addEventListener("click", requestPoll);
 document.getElementById("clearStuck")?.addEventListener("click", requestClearStuck);
+document.getElementById("hardReset")?.addEventListener("click", requestHardReset);
 checkUpdateEl?.addEventListener("click", refreshExtensionUpdate);
 applyUpdateEl?.addEventListener("click", applyExtensionUpdate);
 rollbackUpdateEl?.addEventListener("click", rollbackExtensionUpdate);

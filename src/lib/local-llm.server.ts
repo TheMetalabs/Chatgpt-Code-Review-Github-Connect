@@ -1,7 +1,7 @@
 import { bridgePromptText } from "./chat-prompt.ts";
 import type { BotSettings } from "./types.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
-import { requestLocalJson, requestLocalChat, type LocalChatMessage } from "./local-chat-request.server.ts";
+import { requestLocalJson, requestLocalChat, type LocalChatMessage, type LocalRequestOptions } from "./local-chat-request.server.ts";
 
 function localConfig(settings: BotSettings) {
   const baseURL = settings.localLlmBaseUrl.trim().replace(/\/$/, "");
@@ -79,6 +79,7 @@ export async function runLocalLlm(
   prompt: string,
   settings: BotSettings,
   signal?: AbortSignal,
+  opts?: LocalRequestOptions,
 ): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
@@ -88,6 +89,7 @@ export async function runLocalLlm(
     ready.baseURL, ready.apiKey,
     { model: ready.model, messages, ...samplingRequestFields(params) },
     signal,
+    opts,
   );
   try {
     const raw = await call([

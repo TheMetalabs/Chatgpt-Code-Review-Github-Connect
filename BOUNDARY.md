@@ -31,6 +31,15 @@ so the local lane can surface heartbeat freshness the way the chat lanes already
 per-step progress. The chat/Grok branches of `buildReviewerLanes` are unchanged; the existing
 chat-lane cases in `reviewer-progress.test.ts` are the regression net that proves it.
 
+The queue-aware follow-up (`ai/fix/local-leg-queue-aware-no-deadline`) removes the fixed
+20-minute local deadline (a queued multi-turn review on a concurrency-1 server legitimately takes
+hours) and replaces it with visibility: the transport streams `chat/completions` and reports
+keepalive vs output, a new local-only tracker (`local-leg-activity.ts`) turns that into
+`local_queued` / `local_generating` progress, and lanes / ops notes tell "queued at the server"
+from "no response". It adds exactly two local stage labels and the optional `keepaliveAt` stamp
+to `review-progress.ts`, and two `local.*` server steps to `review-history.server.ts`; chat/bridge
+stages and step recording are unchanged.
+
 ## Editable (local-LLM only) — the allowlist
 
 | File | Allowed change |
@@ -42,6 +51,9 @@ chat-lane cases in `reviewer-progress.test.ts` are the regression net that prove
 | `src/lib/harbor.server.ts` | **only** `kickLocalRace` / `attachLocalLeg` and local settings plumbing |
 | `src/lib/reviewer-progress.ts` | **only** the local provider's in-flight lane (heartbeat freshness); chat/Grok branches stay frozen |
 | `src/lib/reviewer-progress.test.ts` | local-lane rendering tests (chat-lane cases are the frozen-behavior guard) |
+| `src/lib/local-leg-activity.ts` (+ test) | **new** — local-leg liveness tracker + `ASHLAR_LOCAL_REVIEW_DEADLINE_MS` |
+| `src/lib/review-progress.ts` | **only** the `local_queued` / `local_generating` labels and the optional `keepaliveAt` field |
+| `src/lib/review-history.server.ts` | **only** the `local.accepted` / `local.generating` server-step names |
 | `src/lib/settings.server.ts` | **only** local-LLM settings (`localLlm*`, `reviewLocal`) |
 | `src/lib/types.ts` | **only** local-LLM settings fields + `DEFAULT_SETTINGS` local values |
 | `src/lib/json-repair.server.ts` | **only** the transport call options (`max_tokens`) |

@@ -31,6 +31,15 @@ const ALLOW = new Set([
   // The chat/Grok branches stay frozen (guarded by reviewer-progress.test.ts chat-lane cases).
   "src/lib/reviewer-progress.ts",
   "src/lib/reviewer-progress.test.ts",
+  // Local-leg liveness (queued at the model server vs generating vs no response). The tracker is a
+  // new local-only module; review-progress.ts gains two local_* stage labels + the optional
+  // keepaliveAt stamp, review-history.server.ts gains two local.* server steps. Chat/bridge stages
+  // and step recording are untouched.
+  "src/lib/local-leg-activity.ts",
+  "src/lib/local-leg-activity.test.ts",
+  "src/lib/review-progress.ts",
+  "src/lib/review-history.server.ts",
+  ".env.example",
   // Context-assembly for BOTH reviewers (per-reviewer context tailoring). These build what each
   // reviewer SEES — snapshot slicing, cross-file definitions, repo-policy extraction, and the
   // head-file fetch. They are editable here to close the cross-file / domain-contract context gaps.

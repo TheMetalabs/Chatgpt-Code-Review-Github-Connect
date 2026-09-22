@@ -18,7 +18,9 @@ import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot,
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm } from "./local-llm.server";
+import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
+import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -30,7 +32,7 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
-import { buildReviewerLanes, emptyReviewSkip } from "./reviewer-progress";
+import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { redactSalvagedReviewBody } from "./review-format";
@@ -47,12 +49,15 @@ let seq = 1;
 const nid = (p: string) => `${p}-${Date.now().toString(36)}-${seq++}`;
 const localInFlight = new Set<string>();
 const localControllers = new Map<string, AbortController>();
-// Wall-clock ceiling for one local review. requestLocalJson sets timeout:0 by design (a caller may
-// cancel; upstream imposes no limit), so without this a hung Qwen request pends FOREVER — the leg
-// never settles, localInFlight/controllers never clear, and the popup shows "calling local LLM"
-// indefinitely. Generous enough for a legit long multiturn (~12min observed for a 32K review) with
-// headroom; a genuinely stuck request is aborted and the leg fails cleanly instead of pending.
-const LOCAL_REVIEW_DEADLINE_MS = 20 * 60_000;
+// Live activity of each in-flight local leg (queued at the server vs generating). Fed by the
+// transport's streaming heartbeat and the multi-turn loop's turn boundaries; flushed (throttled) into
+// the job's providerProgress.local so lanes and the ops comment can tell "waiting behind other jobs"
+// from "no sign of life". There is no wall-clock ceiling by default — see localReviewDeadlineMs.
+const localActivity = new Map<string, LocalLegState>();
+// Per-leg liveness watchdog: reset on every sign of life, fires only after total silence (see
+// localLivenessMs). Armed only for streaming legs, which get ~10s keepalives; a buffered leg has no
+// incremental signal so it relies on the optional total ceiling instead.
+const localLiveness = new Map<string, { reset: () => void; clear: () => void }>();
 // In-memory only (never persisted): the snapshot the local multi-turn loop reads files from.
 // Kept just for the life of the local leg so the loop's tools serve changed-file content without
 // re-fetching the PR. Chat legs never touch this.
@@ -139,6 +144,9 @@ export function resetHarbor() {
   localControllers.clear();
   localInFlight.clear();
   localSamples.clear();
+  localActivity.clear();
+  for (const l of localLiveness.values()) l.clear();
+  localLiveness.clear();
   for (const job of state.jobs) recordJobHistory(isLive(job.status)
     ? {...job, status: "cancelled", skipReason: "operator reset", updatedAt: Date.now()} : job);
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
@@ -148,6 +156,9 @@ export function cancelHarborJob(jobId: string) {
   cancelLocalJsonRepairs("superseded", jobId);
   localControllers.get(jobId)?.abort();
   localSamples.delete(jobId);
+  localActivity.delete(jobId);
+  localLiveness.get(jobId)?.clear();
+  localLiveness.delete(jobId);
   state = {
     ...state,
     jobs: state.jobs.map((j) =>
@@ -433,16 +444,11 @@ async function watchReviewers(jobId: string, token: string) {
         `Chrome bridge is not connected. ${chat.map((p) => (p === "grok" ? "Grok" : "ChatGPT")).join(" / ")} start when the extension reconnects.`,
       );
     }
-    // Local staleness note (visibility only; never auto-abort).
-    if ((localInFlight.has(jobId) || job.generating?.local === true) && job.providerProgress?.local?.observedAt) {
-      const age = Date.now() - job.providerProgress.local.observedAt;
-      const threshold = localStaleNoteMs();
-      if (age > threshold) {
-        // No duration at all: a live age churns the ops comment every tick, and a threshold-rounded
-        // duration misreports sub-minute windows. The ops comment tracks state, so a stable, accurate
-        // "no recent progress" (matching the lane) is the honest signal; the operator decides.
-        notes.push(`local reviewer: no recent progress (still waiting; cancel manually if stalled)`);
-      }
+    // Local leg visibility (never auto-abort): queued at the server vs generating vs no sign of
+    // life. Stable state text only — a live age would rewrite the GitHub ops comment every tick.
+    if (localInFlight.has(jobId) || job.generating?.local === true) {
+      const note = localLegNote(job.providerProgress?.local, Date.now(), localStaleNoteMs());
+      if (note) notes.push(note);
     }
     for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);
 
@@ -620,13 +626,36 @@ async function kickLocalRace(jobId: string, prompt: string) {
   // A health probe can be delayed by the model queue. Never gate generation on that timer.
   const controller = new AbortController();
   localControllers.set(jobId, controller);
-  // Seed the heartbeat when the leg starts so the staleness note can fire even for a hung single-turn
-  // request (multiturn refreshes observedAt each turn; single-turn has no mid-request progress signal).
+  // The leg starts "queued": nothing has been sent yet, and on a concurrency-1 server the request
+  // then waits behind other jobs. The transport's heartbeat (headers / empty chunks) keeps it alive
+  // in that state; the first output token flips it to generating (see noteLocalActivity).
+  const startedAt = Date.now();
+  const leg = startLocalLeg(startedAt);
+  localActivity.set(jobId, leg);
   patchJob(jobId, j => ({...j, generating: {...j.generating, local: true},
-    providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "generating", observedAt: Date.now(), receivedAt: Date.now()}},
-    updatedAt: Date.now()}));
+    providerProgress: {...j.providerProgress, local: localLegProgress(leg, `local:${jobId}`, startedAt)},
+    updatedAt: startedAt}));
   try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
   void attachLocalLeg(jobId, prompt, { submit: true });
+}
+
+/** Feed one activity observation into the leg's tracker and flush it (throttled) to the job. The
+ * first server acceptance and the first output token are also recorded as history steps, so a
+ * post-mortem can tell "never accepted", "accepted but never generated" and "generated" apart. */
+function noteLocalActivity(jobId: string, kind: LocalLegActivityKind) {
+  localLiveness.get(jobId)?.reset(); // any sign of life defers the hung-server abort
+  const prev = localActivity.get(jobId);
+  if (!prev) return;
+  const now = Date.now();
+  const next = applyLocalActivity(prev, kind, now);
+  localActivity.set(jobId, next.state);
+  if (next.accepted) { try { reviewHistory().recordServerStep(jobId, "local.accepted"); } catch { /* visible history health */ } }
+  if (next.generated) { try { reviewHistory().recordServerStep(jobId, "local.generating"); } catch { /* visible history health */ } }
+  if (!next.flush) return;
+  patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+    ...j,
+    providerProgress: { ...j.providerProgress, local: localLegProgress(next.state, `local:${jobId}`, now) },
+  }));
 }
 
 // Bounds on-demand cross-file reads by the multi-turn loop, per leg. Generous enough to walk a few
@@ -682,23 +711,11 @@ async function generateLocalLeg(
         (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? [])
           .filter((l) => l.provider !== "local" && l.raw.trim())
           .map((l) => ({ provider: l.provider, raw: l.raw })),
-      onProgress: (p) => {
-        patchJob(jobId, (j) => {
-          if (j.status !== "awaiting_chat") return j;
-          return {
-            ...j,
-            providerProgress: {
-              ...j.providerProgress,
-              local: {
-                runId: `local:${jobId}`,
-                stage: "generating",
-                observedAt: Date.now(),
-                receivedAt: Date.now(),
-              },
-            },
-          };
-        });
-      },
+      // Per-token heartbeat from the wire: queued (server alive, nothing for us yet) vs generating.
+      request: (base, key, path, body, sig) =>
+        requestLocalJson(base, key, path, body, sig, { onActivity: (a) => noteLocalActivity(jobId, a.kind) }),
+      // Turn boundaries: a completed tool round is real progress; the next request starts queued again.
+      onProgress: (p) => noteLocalActivity(jobId, p.stage === "tool" ? "output" : "turn"),
     });
   }
   // multiturn was chosen (a large PR) but the snapshot is gone (e.g. a late bridge-fallback kick
@@ -707,17 +724,36 @@ async function generateLocalLeg(
   if (mode === "multiturn") {
     return { ok: false, error: "local skipped: no snapshot for multiturn and prompt too large for single-turn" };
   }
-  return runLocalLlm(prompt, state.settings, signal);
+  return runLocalLlm(prompt, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
-  // Arm the wall-clock deadline: abort the in-flight request if the review runs past the ceiling. The
-  // transport honours the signal (rejects the request), so the leg falls into the catch below and fails
-  // cleanly instead of pending forever. Cleared in finally the moment the leg settles on its own.
-  const deadline = setTimeout(
-    () => localControllers.get(jobId)?.abort(new Error(`local review exceeded ${Math.round(LOCAL_REVIEW_DEADLINE_MS / 60_000)} min deadline`)),
-    LOCAL_REVIEW_DEADLINE_MS,
-  );
+  // Two independent, both-optional aborts; neither fires for a healthy long review. Both honour the
+  // signal, so the leg falls into the catch below and fails cleanly. Cleared in finally on settle.
+  //
+  // 1. Liveness (default 10 min, streaming only): abort after TOTAL silence — no headers, no keepalive,
+  //    no token — for the window. Reset by noteLocalActivity on every sign of life, and the server
+  //    keepalives ~every 10s while queued or generating, so an hours-long queue is never touched; only
+  //    a genuinely wedged server trips it. This is what unblocks a finished peer review that would
+  //    otherwise wait forever on the in-flight local leg (stillRacing). A buffered leg has no
+  //    incremental signal, so liveness is armed only when streaming is on; it relies on the ceiling.
+  // 2. Total ceiling (ASHLAR_LOCAL_REVIEW_DEADLINE_MS; off by default): a hard wall-clock cap for
+  //    operators who want one, independent of activity.
+  const livenessMs = localStreamingDefault() ? localLivenessMs() : 0;
+  if (livenessMs > 0) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const fire = () => localControllers.get(jobId)?.abort(new Error(`local review: no response from the model server for ${Math.round(livenessMs / 60_000)} min (ASHLAR_LOCAL_REVIEW_LIVENESS_MS)`));
+    const arm = () => { timer = setTimeout(fire, livenessMs); };
+    arm();
+    localLiveness.set(jobId, { reset: () => { if (timer) clearTimeout(timer); arm(); }, clear: () => { if (timer) clearTimeout(timer); } });
+  }
+  const deadlineMs = localReviewDeadlineMs();
+  const deadline = deadlineMs > 0
+    ? setTimeout(
+      () => localControllers.get(jobId)?.abort(new Error(`local review exceeded the ${Math.round(deadlineMs / 60_000)} min ASHLAR_LOCAL_REVIEW_DEADLINE_MS ceiling`)),
+      deadlineMs,
+    )
+    : undefined;
   try {
     const local = await generateLocalLeg(jobId, prompt);
     try {
@@ -747,10 +783,13 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12), updatedAt: Date.now(),
     }));
   } finally {
-    clearTimeout(deadline);
+    if (deadline) clearTimeout(deadline);
+    localLiveness.get(jobId)?.clear();
+    localLiveness.delete(jobId);
     localInFlight.delete(jobId);
     localControllers.delete(jobId);
     localSamples.delete(jobId);
+    localActivity.delete(jobId);
     if (opts?.submit) {
       const job = state.jobs.find((j) => j.id === jobId);
       const legs = (job?.storedLegs ?? []).filter((l) => l.raw.trim());

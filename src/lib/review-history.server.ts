@@ -194,7 +194,7 @@ export class ReviewHistoryStore {
         }
         this.write(key, old);
     }
-    recordServerStep(id: string, stage: "local.requested" | "local.response_received" | "local.failed") {
+    recordServerStep(id: string, stage: "local.requested" | "local.accepted" | "local.generating" | "local.response_received" | "local.failed") {
         if (!this.read<Summary>(this.jobKey(id)))
             return;
         this.append(id, { id: `server:${stage}`, source: "server", stage, provider: "local", at: Date.now() });

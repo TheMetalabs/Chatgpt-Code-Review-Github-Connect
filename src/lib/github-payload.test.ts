@@ -133,7 +133,7 @@ describe("parseGitHubPayload", () => {
     if (d.ok) assert.equal(d.kind, "ignore");
   });
 
-  it("delivers a changed PR-body directive on edit (start -> stop, suggest -> apply)", () => {
+  it("delivers a changed PR-body START directive on edit; a stop is a no-op on PR lifecycle", () => {
     const mk = (from: string, to: string) => parseGitHubPayload("pull_request", {
       action: "edited",
       repository: { full_name: "acme/pay", fork: false },
@@ -141,15 +141,63 @@ describe("parseGitHubPayload", () => {
       changes: { body: { from } },
       pull_request: { number: 500, title: "t", body: to, draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
     });
-    for (const [from, to] of [["/review-loop", "/review-loop stop"], ["/review-loop", "/review-loop apply"], ["/review-loop stop", "/review-loop"]]) {
+    // suggest -> apply and stop -> start are fresh START requests: delivered
+    for (const [from, to] of [["/review-loop", "/review-loop apply"], ["/review-loop stop", "/review-loop"]]) {
       const d = mk(from, to);
       assert.equal(d.ok, true, `${from} -> ${to}`);
       if (d.ok) assert.equal(d.kind, "review", `${from} -> ${to} should be delivered`);
     }
+    // a change to stop is control-only on PR lifecycle -> not a review request
+    const toStop = mk("/review-loop", "/review-loop stop");
+    assert.equal(toStop.ok, true);
+    if (toStop.ok) assert.equal(toStop.kind, "ignore");
     // an unchanged retained directive is an unrelated edit
     const same = mk("/review-loop\n\nold", "/review-loop\n\nnew");
     assert.equal(same.ok, true);
     if (same.ok) assert.equal(same.kind, "ignore");
+  });
+
+  it("does not promote a PR opened with only /review-loop stop into an explicit body request", () => {
+    // A stop is control-only on PR lifecycle: the open is a plain lifecycle delivery
+    // (pull_request.opened, gated by ingress) with NO loop directive attached — not a
+    // body_mention request, so no spurious stop-reason job is created.
+    const d = parseGitHubPayload("pull_request", {
+      action: "opened",
+      repository: { full_name: "acme/pay", fork: false },
+      sender: { login: "alice" },
+      pull_request: { number: 501, title: "t", body: "/review-loop stop", draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") {
+      assert.equal(d.trigger, "pull_request.opened");
+      assert.equal(d.thread, undefined);
+    }
+  });
+
+  it("does not re-attach a retained loop directive on an unrelated issue_comment edit", () => {
+    const d = parseGitHubPayload("issue_comment", {
+      action: "edited",
+      repository: { full_name: "acme/pay" },
+      sender: { login: "bob" },
+      changes: { body: { from: "/review-loop\n\nplease" } },
+      issue: { number: 412, pull_request: {}, title: "t" },
+      comment: { id: 88, body: "/review-loop\n\nplease (typo fix)" },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") assert.equal(d.thread?.loop, undefined);
+  });
+
+  it("attaches a changed loop directive on an issue_comment edit (suggest -> apply)", () => {
+    const d = parseGitHubPayload("issue_comment", {
+      action: "edited",
+      repository: { full_name: "acme/pay" },
+      sender: { login: "bob" },
+      changes: { body: { from: "/review-loop" } },
+      issue: { number: 412, pull_request: {}, title: "t" },
+      comment: { id: 88, body: "/review-loop apply" },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") { assert.equal(d.thread?.loop?.kind, "start"); assert.equal(d.thread?.loop?.mode, "apply"); }
   });
 
   it("ignores unknown events", () => {

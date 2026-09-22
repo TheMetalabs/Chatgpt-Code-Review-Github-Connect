@@ -64,6 +64,12 @@ describe("parseReviewLoopDirective", () => {
     assert.deepEqual(parseReviewLoopDirective("/review-loop apply"), { kind: "start", mode: "apply" });
   });
 
+  it("rejects Unicode-glued suffixes on the token and option (Unicode-aware boundary)", () => {
+    for (const body of ["/review-loop한글", "/review-loopé", "/review-loop apply한글", "/review-loop stop停止", "@ashlar-bot review-loop applyé"]) {
+      assert.equal(parseReviewLoopDirective(body), null, body);
+    }
+  });
+
   it("returns a later valid directive even if an earlier occurrence is invalid", () => {
     assert.deepEqual(parseReviewLoopDirective("don't /review-loop yet\n/review-loop apply"), { kind: "start", mode: "apply" });
     assert.deepEqual(parseReviewLoopDirective("nope /review-loop maybe\n/review-loop"), { kind: "start", mode: "suggest" });

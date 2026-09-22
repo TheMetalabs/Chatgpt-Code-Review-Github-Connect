@@ -25,6 +25,14 @@ const ZERO_FINDINGS_RE = /<!--\s*ashlar-findings\s+total=0\b/;
  * fixed, user-writable HTML comments (design §3); a driver that scanned arbitrary
  * comments could be spoofed into converging / stopping / escalating a loop by anyone
  * who posts the literal. Callers must prove the comment was authored by the bot.
+ *
+ * Provenance beyond authorship: terminal markers are emitted ONLY by the deterministic
+ * driver in its own control/review comments, never composed by a reviewer model. A bot
+ * review body that merely QUOTES a marker in model-derived text is already defanged by
+ * neutralizeMarkers() (review-format.ts), which escapes every `<!--`/`-->`. A per-comment
+ * nonce is deliberately NOT used: design §3 requires terminal signals to be FIXED literals
+ * detected by substring (like "didn\'t find any major issues"); a nonce would break that
+ * contract. Callers therefore scan only the driver\'s own control comments.
  */
 export interface CommentSource {
   authoredByBot: boolean;
@@ -202,12 +210,13 @@ export type ReviewLoopDirective =
   | { kind: "start"; mode: ReviewLoopMode }
   | { kind: "stop" };
 
-// The token is bounded by `(?![\w-])` (rejects glued suffixes like `/review-loopx`,
-// `/review-loop-stop`). The option capture is `[\w-]+` — the WHOLE next token — so a
-// hyphen-suffixed option (`apply-later`, `stop-now`) is captured in full and fails the
-// exact `apply`/`stop` comparison instead of being truncated to a valid command. `g` so
-// a leading invalid occurrence ("don't /review-loop yet") cannot mask a later valid one.
-const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?![\w-])(?:[ \t]+([\w-]+))?/gi;
+// The token is bounded by a Unicode-aware negative lookahead (rejects glued suffixes
+// like `/review-loopx`, `/review-loop-stop`, and non-ASCII `/review-loop한글`). The option
+// capture is the WHOLE next token `[\p{L}\p{N}_-]+`, so a suffixed option (`apply-later`,
+// `applyé`) is captured in full and fails the exact `apply`/`stop` comparison instead of
+// being truncated. `u` makes \p{…} legal and ASCII \w-only classes Unicode-correct; `g`
+// so a leading invalid occurrence ("don't /review-loop yet") cannot mask a later valid one.
+const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?![\p{L}\p{N}_-])(?:[ \t]+([\p{L}\p{N}_-]+))?/giu;
 
 /**
  * Recognize `/review-loop`, `/review-loop apply`, `/review-loop stop`, and the
@@ -242,6 +251,26 @@ export function stripLoopDirectives(body: string | null | undefined): string {
   if (!body) return "";
   LOOP_RE.lastIndex = 0;
   return body.replace(LOOP_RE, " ");
+}
+
+/**
+ * The loop directive to attach for a webhook, or undefined. On `created`/`opened` it is
+ * the parsed directive; on `edited` it is fresh only when newly added OR changed vs the
+ * previous body — an unchanged directive left in place during an unrelated prose edit must
+ * not re-trigger the loop or supersede running work. When the previous body is unavailable
+ * (the edit did not touch the body) the directive is treated as retained (undefined).
+ */
+export function freshLoopDirective(
+  action: string | undefined,
+  currentBody: string | null | undefined,
+  previousBody: string | null | undefined,
+): ReviewLoopDirective | undefined {
+  const cur = parseReviewLoopDirective(currentBody);
+  if (cur == null) return undefined;
+  if (action !== "edited") return cur;
+  if (typeof previousBody !== "string" && previousBody !== null) return undefined;
+  const prev = parseReviewLoopDirective(previousBody ?? "");
+  return sameDirective(prev, cur) ? undefined : cur;
 }
 
 /** True when two parsed directives are the same command (kind + start mode). */

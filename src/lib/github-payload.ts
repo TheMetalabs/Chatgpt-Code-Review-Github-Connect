@@ -1,6 +1,6 @@
 import type { IngressTarget } from "./ingress.ts";
 import { DEFAULT_SETTINGS, type BotSettings, type JobThread, type Trigger } from "./types.ts";
-import { parseReviewLoopDirective, sameDirective } from "./review-loop.ts";
+import { freshLoopDirective } from "./review-loop.ts";
 import { isBotMention } from "./poster.ts";
 
 const PR_ACTIONS: Record<string, Trigger> = {
@@ -69,13 +69,13 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
     // A /review-loop directive in the PR body is a fixed trigger (design §2), like a
     // mention: honor it on open, or when it was newly added on edit — never re-review an
     // unrelated edit to a PR whose body already carried the directive.
-    const bodyLoop = parseReviewLoopDirective(text);
-    // A newly added OR changed directive on edit is a fresh request (start↔stop,
-    // suggest→apply); an unchanged retained directive is an unrelated edit, ignored.
-    const newlyLoop = body.action === "edited" && (typeof previous === "string" || previous === null) &&
-      bodyLoop != null && !sameDirective(parseReviewLoopDirective(previous ?? ""), bodyLoop);
-    const bodyRequest =
-      (body.action === "opened" && (isBotMention(text, settings) || bodyLoop != null)) || newlyMentioned || newlyLoop;
+    const bodyMention = (body.action === "opened" && isBotMention(text, settings)) || newlyMentioned;
+    // Only a START directive (suggest/apply) is a review request on PR lifecycle events; a
+    // stop is a no-op here (avoids a spurious skipped job on PR open/edit). freshLoopDirective
+    // also drops a directive left unchanged during an unrelated body edit.
+    const freshLoop = freshLoopDirective(body.action, text, previous);
+    const bodyLoopStart = freshLoop?.kind === "start" ? freshLoop : undefined;
+    const bodyRequest = bodyMention || bodyLoopStart != null;
     const trigger: Trigger | undefined = bodyRequest ? "pull_request.body_mention" : PR_ACTIONS[body.action ?? ""];
     if (!trigger) return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"}; no new body mention)` };
     if (!repo || !pr?.number || !pr.head?.sha) return { ok: false, reason: "pull_request missing repo or head" };
@@ -97,7 +97,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
       target,
       installationId,
       // A PR-body request has no comment ID: reactions belong on the PR itself.
-      thread: bodyRequest ? { kind: "pr_body", commentId: 0, userText: text, loop: bodyLoop ?? undefined } : undefined,
+      thread: bodyRequest ? { kind: "pr_body", commentId: 0, userText: text, loop: bodyLoopStart } : undefined,
       untrustedBody: text.slice(0, 4000),
     };
   }
@@ -130,7 +130,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
         kind: "mention",
         commentId: Number(body.comment?.id ?? 0),
         userText: String(body.comment?.body ?? ""),
-        loop: parseReviewLoopDirective(String(body.comment?.body ?? "")) ?? undefined,
+        loop: freshLoopDirective(body.action, body.comment?.body, body.changes?.body?.from),
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
     };
@@ -161,7 +161,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
         kind: "followup",
         commentId: Number(body.comment?.id ?? 0),
         userText: String(body.comment?.body ?? ""),
-        loop: parseReviewLoopDirective(String(body.comment?.body ?? "")) ?? undefined,
+        loop: freshLoopDirective(body.action, body.comment?.body, body.changes?.body?.from),
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
     };

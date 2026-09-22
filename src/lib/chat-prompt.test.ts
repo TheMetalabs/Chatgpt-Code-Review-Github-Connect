@@ -221,6 +221,31 @@ describe("buildChatParts full changed-file body (P1)", () => {
     const snap = files.find((f) => f.name === "ashlar-snapshot.md");
     assert.ok(snap!.body.includes("B_MARKER"), "file B keeps its baseline context — not starved by A's full body");
   });
+
+  it("a hunk-heavy first file does not consume the whole baseline budget (fair-share pass 1)", () => {
+    // File A has MANY scattered hunks whose windows alone could fill the budget; B must still get
+    // its baseline slice. This exercises the pass-1 greedy-slice path, not just the full-body path.
+    const aLines: string[] = [];
+    const aDiffHunks: string[] = [];
+    for (let i = 0; i < 15; i += 1) {
+      const base = i * 6;
+      aLines.push(`export function a_marker_${i}() {`, `  return ${i};`, "}", "", "", "");
+      aDiffHunks.push(`@@ -${base + 1},1 +${base + 1},2 @@\n export function a_marker_${i}() {\n+  return ${i};`);
+    }
+    const twoFile = {
+      ...sample,
+      changedPaths: ["src/a.ts", "src/b.ts"],
+      files: [
+        { path: "src/a.ts", language: "ts" as const, content: aLines.join("\n") },
+        { path: "src/b.ts", language: "ts" as const, content: ["export function bbb() {", "  return 'B_BASELINE';", "}"].join("\n") },
+      ],
+      diff: `--- src/a.ts\n${aDiffHunks.join("\n")}\n\n--- src/b.ts\n@@ -1,2 +1,3 @@\n export function bbb() {\n+  return 'B_BASELINE';\n }`,
+    };
+    // Budget is small enough that A's hunk windows would fill it if A were not capped to its share.
+    const { files } = buildChatParts({ sample: twoFile, contextMaxChars: 900, contextPadLines: 3 });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap!.body.includes("B_BASELINE"), "file B keeps a baseline slice despite A's many hunks");
+  });
 });
 
 describe("buildChatParts cross-file definitions", () => {

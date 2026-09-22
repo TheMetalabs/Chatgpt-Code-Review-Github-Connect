@@ -89,39 +89,49 @@ function patchesByPath(diff: string): Map<string, string> {
 // WHY: replace the "first 20K chars of each changed file" snapshot with the head text enclosing
 // every changed hunk (+ same-file helper defs), so large files' changed functions actually reach the
 // reviewer. Two passes so full-file context never costs another file its baseline:
-//   1. every changed file gets at least its hunk-window slice (the pre-P1 guarantee),
-//   2. leftover budget upgrades files to their WHOLE body (ASHLAR_CONTEXT_FULL_FILES, default on) —
-//      the windows omit code far from any changed line, hiding same-file helpers the changed code
-//      relies on, a measured false-positive source.
-// A single greedy full file could otherwise eat the whole budget and starve later changed files of
-// all context. The join separator (2 chars) is only counted BETWEEN blocks, not before the first.
+//   1. baseline — every changed file gets a hunk-window slice, each capped to its FAIR SHARE of the
+//      budget (maxChars / files) so a hunk-heavy early file cannot consume the whole budget and
+//      starve later files; a file that uses less than its share leaves the remainder for pass 2,
+//   2. upgrade — leftover budget promotes files to their WHOLE body (ASHLAR_CONTEXT_FULL_FILES,
+//      default on), highest priority first, since the windows omit code far from any changed line and
+//      hide same-file helpers the changed code relies on (a measured false-positive source).
+// The full body is built lazily in pass 2 (with a cheap raw-length prefilter) so many large files
+// under a small budget don't each materialize a full guttered copy that pass 2 would discard.
+// The join separator (2 chars) is only counted BETWEEN blocks, not before the first.
 const BLOCK_SEP = 2; // "\n\n" joined between snapshot blocks
 function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines: number, maxChars: number): string {
   const patchByPath = patchesByPath(sample.diff);
   const codeFiles = orderFiles(snapshots.filter((f) => rankChangedFile(f.path) === 0));
   const fullFiles = process.env.ASHLAR_CONTEXT_FULL_FILES !== "0";
-  const entries: { slice: string; full: string | null }[] = [];
+  const withHunks = codeFiles
+    .map((f) => ({ f, hunks: parseHunks(patchByPath.get(f.path) ?? ""), patch: patchByPath.get(f.path) ?? "" }))
+    .filter((x) => x.hunks.length);
+  const fairShare = withHunks.length ? Math.floor(maxChars / withHunks.length) : maxChars;
+  const entries: { slice: string; path: string; content: string | null }[] = [];
   let used = 0;
-  // Pass 1 — baseline: a hunk-window slice for every changed file, within budget.
-  for (const f of codeFiles) {
-    const patch = patchByPath.get(f.path) ?? "";
-    const hunks = parseHunks(patch);
-    if (!hunks.length) continue;
+  // Pass 1 — baseline slice per file, capped to its fair share (never more than the global remainder).
+  for (const { f, hunks, patch } of withHunks) {
     const remaining = maxChars - used - (entries.length ? BLOCK_SEP : 0);
     if (remaining <= 0) break;
-    const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: remaining, patch });
+    const cap = Math.min(fairShare, remaining);
+    const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: cap, patch });
     if (!sliced.text) continue;
     used += sliced.text.length + (entries.length ? BLOCK_SEP : 0);
-    entries.push({ slice: sliced.text, full: fullFiles ? fullFileContext(f.path, f.content) : null });
+    entries.push({ slice: sliced.text, path: f.path, content: fullFiles ? f.content : null });
   }
   // Pass 2 — upgrade to full body with leftover budget (priority order), never starving a baseline.
   if (fullFiles) {
     for (const e of entries) {
-      if (!e.full || e.full.length <= e.slice.length) continue;
-      const delta = e.full.length - e.slice.length;
+      if (e.content == null) continue;
+      // Cheap prefilter: raw body is shorter than its guttered form, so if even the raw delta cannot
+      // fit the leftover, neither can the full block — skip without materializing it.
+      if (e.content.length - e.slice.length > maxChars - used) continue;
+      const full = fullFileContext(e.path, e.content);
+      if (full.length <= e.slice.length) continue;
+      const delta = full.length - e.slice.length;
       if (delta <= maxChars - used) {
         used += delta;
-        e.slice = e.full;
+        e.slice = full;
       }
     }
   }
@@ -202,7 +212,7 @@ export function buildChatParts(opts: {
     mode === "head"
       ? "each changed file's head text"
       : process.env.ASHLAR_CONTEXT_FULL_FILES !== "0"
-        ? "each changed file's head text with line numbers — the whole file when it fits, otherwise the text around every changed hunk plus same-file definitions"
+        ? "each changed file's head text with line numbers — the whole file for as many changed files as the budget allows (highest-priority first), otherwise the text around every changed hunk plus same-file definitions; a file shown only around its hunks may still contain other code, so do not assume an unshown helper is absent"
         : "head text around every changed hunk with line numbers, plus same-file definitions";
   const files: ReviewAttach[] = [
     { name: "ashlar-diff.patch", body: String(opts.sample.diff || "") },

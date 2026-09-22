@@ -60,6 +60,10 @@ const ALLOW = new Set([
   "src/routes/api/harbor.ts",
   "src/lib/local-llm.test.ts",
   "tests/review/local-loop.test.mjs",
+  // Shared e2e fixture: #61 added getFile to harbor's import graph but not to this fixture's
+  // github.server stub, so every appFixture test threw and hung the browser-e2e CI job. Fixing the
+  // stub is test-infra, not a chat/bridge/merge behavior change.
+  "tests/review/app-fixture.mjs",
   "src/lib/settings.server.test.ts",
   "tests/review/local.test.mjs",
   "tests/review/local-http.test.mjs",

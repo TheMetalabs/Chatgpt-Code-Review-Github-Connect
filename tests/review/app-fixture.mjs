@@ -50,6 +50,11 @@ export async function appFixture(options={}, githubOptions={}) {
     createIssueComment:async(_token,input)=>{ops.push(input.body);return {id:1};},
     updateIssueComment:async(_token,input)=>{ops.push(input.body);},
     createPullReview:async(_token,input)=>{await githubOptions.beforeReview?.();reviews.push(input);return {id:2};},
+    // #61 added a cross-file head reader (harbor's makeHeadReader → getFile) to the import graph the
+    // fixture links. Without this export the vm linker fails ("does not provide an export named
+    // 'getFile'"), every appFixture test throws, and the leaked Chromium handle hangs the process to
+    // the CI 10-min timeout. Fixtures are snapshot-only, so head reads return null.
+    getFile:async()=>githubOptions.getFile?githubOptions.getFile():null,
   }],
   ['@tanstack/react-router',{createFileRoute:()=>config=>config}],
  ]);

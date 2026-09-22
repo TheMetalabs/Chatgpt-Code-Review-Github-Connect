@@ -5,6 +5,18 @@ The ChatGPT / Grok / Chrome-bridge path and the shared merge/posting path are **
 `npm run check:boundary` enforces this mechanically (default-deny): the run fails if any
 changed file is outside the allowlist below.
 
+> **Scope extension — reviewer-context tailoring (`ai/feat/reviewer-context-tailoring`).**
+> A later change deliberately improves the **context each reviewer sees**, tailored to its
+> mechanism: the multi-turn local loop now pulls any head file on demand (`readFileAtHead`), and
+> the one-shot chat legs get pre-attached cross-file definitions plus whole-file (not over-sliced)
+> repo policy. That necessarily edits the shared **context-assembly** files
+> (`context-slice.ts`, `chat-prompt.ts`, `github-snapshot.ts`, `github.server.ts`,
+> `import-resolve.ts`), now on the allowlist. What stays **frozen**: the bridge/submission path
+> (`bridge*.ts`, `chat-settle.ts`, `quota-hit.ts`, `composer-has.ts`), the merge/posting path
+> (`poster.ts`, `review-diff.ts`, `review-format.ts`, `findings-thin.ts`), and `extension/**`.
+> Prompt *semantics*, submission, settlement, and schema-merge are unchanged — only what context
+> is gathered/attached. The full `npm test` suite is the behavioral net for the frozen path.
+
 ## Why
 
 The local leg runs through the OpenAI-compatible SDK/HTTP transport, so it can do a

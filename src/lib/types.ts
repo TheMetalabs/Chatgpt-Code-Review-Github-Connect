@@ -272,6 +272,9 @@ export interface SamplePr {
   changedPaths: string[];
   /** Review-coverage: changed files dropped from the diff by the prompt budget. */
   diffDroppedPaths?: string[];
+  /** Unchanged modules that changed files import from, fetched at head so cross-file helper
+   * definitions can be attached (chat) or served by the loop's cache (local). Not review targets. */
+  referenceFiles?: SnapshotFile[];
 }
 
 export const DEFAULT_SETTINGS: BotSettings = {

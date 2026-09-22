@@ -186,8 +186,9 @@ function subsetSample(sample: SamplePr, groupPaths: Set<string>): SamplePr {
 
 const SYSTEM = [
   "You are Ashlar, an automated code reviewer called through an API. When you are done, reply with the raw review JSON object only — no markdown fences, no prose. Ignore any mention of a browser mode in the instructions below; use the API output rule.",
-  "You have tools: read a file at the PR head, read another changed file's diff, and search. Use them to CONFIRM every suspected defect and the helpers a changed hunk calls before reporting; do not guess about code you have not read.",
-  "Not being able to read a helper never justifies withholding a finding: report the suspected defect and name the unverified helper in evidence so a downstream agent confirms it. A symbol having no visible definition in the tools is NOT itself a defect — the definition may live in an unchanged file the tools do not expose.",
+  "You have tools: file_read reads ANY file at the PR head — not only the changed files, but also an unchanged module that defines an imported helper, entity, or enum. file_read_diff shows other changed files' diffs; code_search scans what you have read. Use them to CONFIRM every suspected defect before reporting; do not guess about code you have not read.",
+  "When a finding depends on how an imported symbol behaves — e.g. whether an expiry/boundary is inclusive, what unit a value carries, or what a helper returns — resolve its import path and file_read its definition before you report OR dismiss the finding. Do not assume a convention; verify it against the definition.",
+  "If a file genuinely cannot be fetched (file_read returns NOT_IN_SNAPSHOT), that is not itself a defect: report the suspected defect anyway and name the unverified dependency in evidence so a downstream agent confirms it.",
 ].join("\n");
 
 const FORCE_FINAL_MSG =
@@ -243,7 +244,12 @@ async function reviewGroup(
 
   // Tool backends: changed-file content comes from the head snapshot already fetched; other paths
   // fall back to readFileAtHead when the host provides it. No new PR fetch here.
-  const cache = new Map(sample.files.map((f) => [f.path, f.content]));
+  // Cache changed files AND any pre-fetched reference modules (imported by changed files). file_read
+  // and code_search serve these without a network hop; readFileAtHead still fetches anything else.
+  const cache = new Map<string, string>([
+    ...sample.files.map((f) => [f.path, f.content] as const),
+    ...(sample.referenceFiles ?? []).map((f) => [f.path, f.content] as const),
+  ]);
   const patches = patchesByPath(sample.diff);
   async function readAtHead(path: string): Promise<string | null> {
     if (cache.has(path)) return cache.get(path) as string;
@@ -254,7 +260,7 @@ async function reviewGroup(
   async function runTool(name: string, a: Record<string, unknown>): Promise<string> {
     if (name === "file_read") {
       const text = await readAtHead(String(a.file_path || ""));
-      if (text == null) return `NOT_IN_SNAPSHOT: ${a.file_path} was not fetched. Cite it as an unverified dependency in evidence; do not treat its absence as a defect.`;
+      if (text == null) return `NOT_IN_SNAPSHOT: ${a.file_path} could not be fetched (check the repo-relative path, or it may exceed the size/fetch limit). Cite it as an unverified dependency in evidence; its absence is not itself a defect.`;
       const lines = text.split("\n");
       const s = Math.max(1, Number(a.start_line) || 1);
       const e = Math.min(lines.length, Number(a.end_line) || lines.length, s + 399);

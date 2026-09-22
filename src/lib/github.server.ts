@@ -3,6 +3,7 @@ import { Resolver, lookup as dnsLookup } from "node:dns/promises";
 import * as https from "node:https";
 import { SignJWT } from "jose";
 import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } from "./github-snapshot";
+import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
@@ -384,7 +385,7 @@ function langFor(path: string): SnapshotFile["language"] {
   return "ts";
 }
 
-async function getFile(token: string, owner: string, repo: string, path: string, ref: string): Promise<string | null> {
+export async function getFile(token: string, owner: string, repo: string, path: string, ref: string): Promise<string | null> {
   const safe = isSafeRepoPath(path);
   if (!safe) return null;
   const out = await gh<{ content?: string; encoding?: string; size?: number; type?: string }>(
@@ -398,6 +399,126 @@ async function getFile(token: string, owner: string, repo: string, path: string,
     return Buffer.from(out.data.content.replace(/\n/g, ""), "base64").toString("utf8");
   }
   return null;
+}
+
+// Same module-extension set resolveRelativeImport understands, so a changed .mts/.cts/.mjs/.cjs file's
+// imports are traversed too (not silently skipped).
+const REFERENCE_CODE_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+const REFERENCE_FILE_CAP = 24; // resolved reference modules kept
+const REFERENCE_FETCH_CAP = 80; // total getFile attempts for references (bounds API cost per review)
+
+/** Fetch the unchanged modules that changed CODE files import from (relative imports only), at head,
+ * so cross-file helper/entity definitions can be attached for the reviewer. Bounded by count and by
+ * total fetch attempts; disabled with ASHLAR_CROSS_FILE_REFS=0. */
+async function fetchReferenceFiles(
+  token: string,
+  owner: string,
+  repo: string,
+  headSha: string,
+  changedPaths: string[],
+  changedContent: Map<string, string>,
+  patchByPath: Map<string, string>,
+  alreadyFetched: Set<string>,
+): Promise<SnapshotFile[]> {
+  if (process.env.ASHLAR_CROSS_FILE_REFS === "0") return [];
+  const out: SnapshotFile[] = [];
+  const tried = new Set(alreadyFetched); // paths already attempted (may have failed)
+  const exists = new Set(alreadyFetched); // paths already in the corpus: changed + policy, then refs
+  let attempts = 0;
+  const capped = () => out.length >= REFERENCE_FILE_CAP || attempts >= REFERENCE_FETCH_CAP;
+  // Fetch the first candidate path that exists (a specifier maps to several extension/index candidates).
+  const fetchFirst = async (candidates: string[]): Promise<void> => {
+    for (const cand of candidates) {
+      // Already in the corpus (a changed/policy file, or a ref fetched earlier): the specifier is
+      // resolved — do not keep trying other extensions or fetch a wrong sibling.
+      if (exists.has(cand)) return;
+      if (capped()) return;
+      if (tried.has(cand)) continue;
+      tried.add(cand);
+      attempts += 1;
+      const c = await getFile(token, owner, repo, cand, headSha);
+      if (c == null) continue; // wrong extension candidate; try the next
+      exists.add(cand);
+      if (!isSandboxPolicyFile(c)) out.push({ path: cand, content: c, language: langFor(cand) });
+      return; // first resolving candidate for this specifier wins
+    }
+  };
+  // Pass 1: direct relative imports/requires of changed code files. Cap references per changed file so
+  // one early file with many imports cannot exhaust the global budget before later files are examined.
+  const PER_FILE_REF_CAP = 8;
+  for (const changed of changedPaths) {
+    if (capped()) break;
+    if (!REFERENCE_CODE_RE.test(changed)) continue;
+    const content = changedContent.get(changed);
+    if (!content) continue;
+    const hunkNames = hunkReferencedNames(patchByPath.get(changed) ?? "");
+    // Fetch modules for bindings the changed hunk actually references first, so the per-file cap never
+    // drops a helper the change calls in favor of an unrelated import earlier in source order.
+    const bindings = importGraph(changed, content).sort(
+      (a, b) => Number(hunkNames.has(b.local)) - Number(hunkNames.has(a.local)),
+    );
+    const beforeFile = out.length;
+    const fetchedSpecs = new Set<string>();
+    for (const b of bindings) {
+      if (capped() || out.length - beforeFile >= PER_FILE_REF_CAP) break;
+      const specKey = b.candidates.join("|");
+      if (fetchedSpecs.has(specKey)) continue; // one fetch per module, not per binding
+      fetchedSpecs.add(specKey);
+      await fetchFirst(b.candidates);
+    }
+  }
+  // Pass 2: follow barrels across levels — a symbol may be re-exported through several index files
+  // (index -> mid -> real). BFS over the re-export targets of each newly fetched module, bounded by
+  // hop count and the shared fetch caps, so every barrel level reaches the corpus. Seed with the
+  // changed code files too, so a CHANGED barrel's re-export targets are fetched (it is never in `out`).
+  // Follow barrel re-exports only for the names the changed files actually import/reference, so a large
+  // index does not exhaust the budget on symbols nothing needs. Track the wanted names PER module and
+  // propagate them through aliases (`export { B as A } from './b'` means the target is wanted for B),
+  // so a symbol renamed at each barrel level is still followed.
+  const wantedByModule = new Map<string, Set<string>>();
+  const addWanted = (path: string, name: string) => {
+    const s = wantedByModule.get(path) ?? new Set<string>();
+    s.add(name);
+    wantedByModule.set(path, s);
+  };
+  for (const p of changedPaths) {
+    const content = changedContent.get(p);
+    if (!content || !REFERENCE_CODE_RE.test(p)) continue;
+    const names = hunkReferencedNames(patchByPath.get(p) ?? "");
+    for (const b of importGraph(p, content)) {
+      // namespace: any member could be used → seed all hunk names; otherwise the imported exported name.
+      const wanted = b.kind === "namespace" ? [...names] : names.has(b.local) ? [b.exported === DEFAULT_EXPORT ? "default" : b.exported] : [];
+      for (const cand of b.candidates) for (const w of wanted) addWanted(cand, w);
+    }
+  }
+  const changedRefs = changedPaths
+    .filter((p) => REFERENCE_CODE_RE.test(p) && changedContent.has(p))
+    .map((p) => ({ path: p, content: changedContent.get(p) as string }));
+  // Iterate to a fixpoint: re-scan every known module each round (fetchFirst de-dupes, so this is
+  // cheap) so a barrel already fetched is revisited when a later alias hop propagates another wanted
+  // name to it. Stop when neither the corpus nor any wanted-set grew, or when the caps are hit.
+  const wantedSize = () => [...wantedByModule.values()].reduce((n, s) => n + s.size, 0);
+  let prevSig = -1;
+  for (let hop = 0; hop < 6 && !capped(); hop += 1) {
+    for (const ref of [...changedRefs, ...out]) {
+      if (capped()) break;
+      const want = wantedByModule.get(ref.path);
+      if (!want || !want.size) continue; // nothing wanted from this module
+      for (const re of reExportsOf(ref.path, ref.content)) {
+        if (capped()) break;
+        if (re.name !== "*" && !want.has(re.name)) continue; // this re-export is not a wanted name
+        // Propagate the wanted name to the target under its defined-as name (aliases), or all wanted
+        // names for a star re-export (which could define any of them).
+        const nextNames = re.name === "*" ? [...want] : [re.source === DEFAULT_EXPORT ? "default" : re.source];
+        for (const cand of re.candidates) for (const n of nextNames) addWanted(cand, n);
+        await fetchFirst(re.candidates);
+      }
+    }
+    const sig = out.length + wantedSize();
+    if (sig === prevSig) break; // fixpoint: no new module fetched and no wanted-set grew
+    prevSig = sig;
+  }
+  return out;
 }
 
 export async function fetchPullSnapshot(
@@ -448,6 +569,19 @@ export async function fetchPullSnapshot(
     if (isSandboxPolicyFile(content)) continue;
     files.push({ path, content, language: langFor(path) });
   }
+  const patchByPath = new Map(
+    rows.filter((f) => f.filename).map((f) => [f.filename as string, f.patch ?? ""]),
+  );
+  const referenceFiles = await fetchReferenceFiles(
+    token,
+    target.owner,
+    target.repo,
+    target.headSha,
+    changedPaths,
+    new Map(files.map((f) => [f.path, f.content])),
+    patchByPath,
+    new Set(toFetch),
+  );
   const diffBlocks = rows
     .filter((f) => f.filename && changedPaths.includes(f.filename))
     .map((f) => ({ path: f.filename as string, size: (f.patch ?? "").length + (f.filename ?? "").length + 5, patch: `--- ${f.filename}\n${f.patch ?? ""}` }));
@@ -478,6 +612,7 @@ export async function fetchPullSnapshot(
     diff,
     changedPaths,
     diffDroppedPaths,
+    referenceFiles,
   };
 }
 

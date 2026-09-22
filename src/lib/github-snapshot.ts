@@ -20,14 +20,9 @@ export function snapshotFileRef(path: string, policyPaths: Iterable<string>, bas
   return new Set(policyPaths).has(path) ? baseSha : headSha;
 }
 
-/**
- * Extract the review-rules section of a policy file: from a heading matching
- * code review / review rules / severity / reviewer until the next same-or-higher
- * heading. If no such heading, return the first 32 KiB. Cap the result at 32 KiB.
- */
-export function extractReviewPolicy(content: string): string {
-  const CAP = 32 * 1024;
-  const text = String(content || "");
+/** The explicit review-rules section (heading matching code review / review rules / severity /
+ * reviewer, until the next same-or-higher heading), or "" if the file has no such heading. */
+function reviewRulesSection(text: string): string {
   const lines = text.split("\n");
   const headingRe = /^(#{2,})\s+.*(?:code review|review rules|severity|reviewer)/i;
   for (let i = 0; i < lines.length; i += 1) {
@@ -40,9 +35,31 @@ export function extractReviewPolicy(content: string): string {
       if (h && h[1].length <= level) break;
       out.push(lines[j]);
     }
-    return out.join("\n").slice(0, CAP);
+    return out.join("\n");
   }
-  return text.slice(0, CAP);
+  return "";
+}
+
+/**
+ * Policy text for the reviewer, capped at 32 KiB.
+ *
+ * Curated policy files (AGENTS.md / code_review.md) are small, so return the WHOLE file when it fits:
+ * a reviewer must check DOMAIN invariants/contracts (e.g. an expiry/revenue rule), not only a section
+ * titled "Code Review". The old behavior sliced to the review-rules heading and silently DROPPED the
+ * domain contracts above it — the reviewer then could not detect contract-compliance bugs it had no
+ * way to know existed. Only when a policy file exceeds the budget do we prioritize: keep the
+ * review-rules section wherever it sits, and fill the rest from the top, where domain invariants live.
+ */
+export function extractReviewPolicy(content: string, maxChars = 32 * 1024): string {
+  const CAP = Math.max(0, maxChars);
+  const text = String(content || "");
+  if (text.length <= CAP) return text;
+  const section = reviewRulesSection(text).slice(0, CAP);
+  if (!section) return text.slice(0, CAP);
+  const headBudget = Math.max(0, CAP - section.length - 1);
+  const head = text.slice(0, headBudget);
+  // Avoid duplicating the section when it already falls within the retained head.
+  return head.includes(section) ? head.slice(0, CAP) : `${head}\n${section}`.slice(0, CAP);
 }
 
 export function isSafeRepoPath(path: string) {

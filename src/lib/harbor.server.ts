@@ -14,7 +14,7 @@ import {
 } from "./samples";
 import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
-import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
+import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm } from "./local-llm.server";
@@ -629,6 +629,34 @@ async function kickLocalRace(jobId: string, prompt: string) {
   void attachLocalLeg(jobId, prompt, { submit: true });
 }
 
+// Bounds on-demand cross-file reads by the multi-turn loop, per leg. Generous enough to walk a few
+// import hops (helper + entity + enum) while preventing a runaway model from fanning out over the repo.
+const HEAD_FETCH_CAP = 40;
+// A per-leg reader the loop's file_read tool uses for paths outside the snapshot. Returns undefined for
+// non-GitHub jobs (demo/sample) so those stay snapshot-only. The installation token is minted at most
+// once per leg (lazily), results are cached, and the fetch count is capped.
+function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string | null>) | undefined {
+  if (!job || job.origin !== "github" || job.installationId == null || !job.headSha) return undefined;
+  const { owner, repo, headSha, installationId } = job;
+  const cache = new Map<string, string | null>();
+  let tokenPromise: Promise<string> | null = null;
+  let fetched = 0;
+  return async (path: string): Promise<string | null> => {
+    if (cache.has(path)) return cache.get(path) ?? null;
+    if (fetched >= HEAD_FETCH_CAP) return null;
+    fetched += 1;
+    try {
+      tokenPromise ??= installationToken(installationId);
+      const content = await getFile(await tokenPromise, owner, repo, path, headSha);
+      cache.set(path, content);
+      return content;
+    } catch {
+      cache.set(path, null); // a failed fetch is cached as absent so one bad path is not retried
+      return null;
+    }
+  };
+}
+
 // Picks the local path by settings: multiturn runs the SDK tool loop over the fetched snapshot
 // (peers already stored on the job are injected as data each turn, never waited on); single and auto
 // (auto = single for a PR that fits one completion window) use the one-shot prompt. A missing
@@ -645,6 +673,10 @@ async function generateLocalLeg(
   if (mode === "multiturn" && sample) {
     return runLocalReviewLoop(sample, state.settings, {
       signal,
+      // The multi-turn loop's edge over the one-shot chat legs: it can pull ANY file at the PR head
+      // on demand (an imported helper/entity in an unchanged module the snapshot never captured) to
+      // verify a semantic assumption before reporting. Bounded per leg (see makeHeadReader).
+      readFileAtHead: makeHeadReader(job),
       extra: job?.thread?.userText ?? "",
       peerReported: () =>
         (state.jobs.find((j) => j.id === jobId)?.storedLegs ?? [])

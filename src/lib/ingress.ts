@@ -57,7 +57,11 @@ export function reviewSkipReason(opts: {
   // configurable @-mention tokens. A start directive is an explicit request; a stop
   // directive is a control command, not a review (the loop engine handles it later).
   const loop = opts.thread?.loop ?? parseReviewLoopDirective(opts.thread?.userText);
-  if (mentionTrigger && loop?.kind === "stop") return "review-loop stop (no active loop engine)";
+  // Gate the stop skip on the body NOT being a mention request: LOOP_RE is unanchored,
+  // so a trailing "/review-loop stop" must not suppress an explicit @ashlar-bot/review in
+  // the same comment. A directive-only stop body still skips.
+  if (mentionTrigger && loop?.kind === "stop" && !isBotMention(opts.thread?.userText, opts.settings))
+    return "review-loop stop (no active loop engine)";
   const requested =
     mentionTrigger && (loop?.kind === "start" || isBotMention(opts.thread?.userText, opts.settings));
   if (opts.settings.skipDrafts && opts.sample.isDraft && !requested) return "draft";

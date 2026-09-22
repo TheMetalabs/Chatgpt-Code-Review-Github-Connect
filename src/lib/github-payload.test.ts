@@ -133,6 +133,25 @@ describe("parseGitHubPayload", () => {
     if (d.ok) assert.equal(d.kind, "ignore");
   });
 
+  it("delivers a changed PR-body directive on edit (start -> stop, suggest -> apply)", () => {
+    const mk = (from: string, to: string) => parseGitHubPayload("pull_request", {
+      action: "edited",
+      repository: { full_name: "acme/pay", fork: false },
+      sender: { login: "alice" },
+      changes: { body: { from } },
+      pull_request: { number: 500, title: "t", body: to, draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
+    });
+    for (const [from, to] of [["/review-loop", "/review-loop stop"], ["/review-loop", "/review-loop apply"], ["/review-loop stop", "/review-loop"]]) {
+      const d = mk(from, to);
+      assert.equal(d.ok, true, `${from} -> ${to}`);
+      if (d.ok) assert.equal(d.kind, "review", `${from} -> ${to} should be delivered`);
+    }
+    // an unchanged retained directive is an unrelated edit
+    const same = mk("/review-loop\n\nold", "/review-loop\n\nnew");
+    assert.equal(same.ok, true);
+    if (same.ok) assert.equal(same.kind, "ignore");
+  });
+
   it("ignores unknown events", () => {
     const d = parseGitHubPayload("star", {});
     assert.equal(d.ok, true);

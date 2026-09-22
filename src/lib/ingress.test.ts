@@ -197,6 +197,17 @@ describe("decideIngress", () => {
     if (d.ok) assert.ok(d.job);
   });
 
+  it("does not let a trailing /review-loop stop suppress an explicit mention in the same body", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "issue_comment.mention",
+      thread: { kind: "mention", commentId: 1, userText: "@ashlar-bot review — if it flaps, /review-loop stop" },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.ok(d.job, "explicit mention still queues despite the trailing stop literal");
+  });
+
   it("does not run a review for a review-loop stop directive", () => {
     const d = decideIngress({
       ...base,

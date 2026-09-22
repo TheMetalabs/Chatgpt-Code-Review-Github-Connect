@@ -228,3 +228,11 @@ test('a /review-loop stop directive is recognized but runs no review',async t=>{
   assert.equal(job,undefined,'stop directive does not enqueue a review job');
   assert.equal(out.queued,false);
 });
+
+test('an explicit @ashlar-bot review is not suppressed by a trailing /review-loop stop in the same comment',async t=>{
+  const app=await fixture(t);
+  const raw=comment(); raw.comment.body='@ashlar-bot review — if it flaps, /review-loop stop';
+  const out=await deliver(app,'issue_comment',raw);
+  assert.equal(out.status,202);assert.equal(out.queued,true);
+  assert.equal((await settled(app,out.jobId)).status,'awaiting_chat');
+});

@@ -1,6 +1,6 @@
 import type { IngressTarget } from "./ingress.ts";
 import { DEFAULT_SETTINGS, type BotSettings, type JobThread, type Trigger } from "./types.ts";
-import { parseReviewLoopDirective } from "./review-loop.ts";
+import { parseReviewLoopDirective, sameDirective } from "./review-loop.ts";
 import { isBotMention } from "./poster.ts";
 
 const PR_ACTIONS: Record<string, Trigger> = {
@@ -70,8 +70,10 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
     // mention: honor it on open, or when it was newly added on edit — never re-review an
     // unrelated edit to a PR whose body already carried the directive.
     const bodyLoop = parseReviewLoopDirective(text);
+    // A newly added OR changed directive on edit is a fresh request (start↔stop,
+    // suggest→apply); an unchanged retained directive is an unrelated edit, ignored.
     const newlyLoop = body.action === "edited" && (typeof previous === "string" || previous === null) &&
-      parseReviewLoopDirective(previous ?? "") == null && bodyLoop != null;
+      bodyLoop != null && !sameDirective(parseReviewLoopDirective(previous ?? ""), bodyLoop);
     const bodyRequest =
       (body.action === "opened" && (isBotMention(text, settings) || bodyLoop != null)) || newlyMentioned || newlyLoop;
     const trigger: Trigger | undefined = bodyRequest ? "pull_request.body_mention" : PR_ACTIONS[body.action ?? ""];

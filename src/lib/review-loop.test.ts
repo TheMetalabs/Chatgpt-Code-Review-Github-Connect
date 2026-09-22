@@ -13,6 +13,7 @@ import {
   REVIEW_LOOP_ESCALATE_HUMAN,
   REVIEW_LOOP_STOPPED_HUMAN,
   STOPPED_MARKER,
+  sameDirective,
   type EscalateReason,
 } from "./review-loop.ts";
 
@@ -49,6 +50,18 @@ describe("parseReviewLoopDirective", () => {
     assert.equal(parseReviewLoopDirective("/review the code"), null);
   });
 
+  it("rejects glued suffixes on the token (no word boundary bypass)", () => {
+    for (const body of ["/review-loopx", "/review-looping", "/review-loop-stop", "@ashlar-bot review-loopx"]) {
+      assert.equal(parseReviewLoopDirective(body), null, body);
+    }
+  });
+
+  it("returns a later valid directive even if an earlier occurrence is invalid", () => {
+    assert.deepEqual(parseReviewLoopDirective("don't /review-loop yet\n/review-loop apply"), { kind: "start", mode: "apply" });
+    assert.deepEqual(parseReviewLoopDirective("nope /review-loop maybe\n/review-loop"), { kind: "start", mode: "suggest" });
+    assert.deepEqual(parseReviewLoopDirective("skip /review-loop later\n/review-loop stop"), { kind: "stop" });
+  });
+
   it("rejects an unrecognized word right after the token (typo'd control word, mid-prose)", () => {
     assert.equal(parseReviewLoopDirective("/review-loop stopx"), null); // typo'd stop must not run a review
     assert.equal(parseReviewLoopDirective("/review-loop now"), null);
@@ -56,6 +69,26 @@ describe("parseReviewLoopDirective", () => {
     // a newline-separated tail is fine — the token stands alone on its line
     assert.deepEqual(parseReviewLoopDirective("/review-loop\nthanks"), { kind: "start", mode: "suggest" });
     assert.deepEqual(parseReviewLoopDirective("/review-loop apply please"), { kind: "start", mode: "apply" });
+  });
+});
+
+describe("sameDirective", () => {
+  it("compares kind and start mode; null only equals null", () => {
+    assert.equal(sameDirective({ kind: "start", mode: "suggest" }, { kind: "start", mode: "suggest" }), true);
+    assert.equal(sameDirective({ kind: "start", mode: "suggest" }, { kind: "start", mode: "apply" }), false);
+    assert.equal(sameDirective({ kind: "stop" }, { kind: "stop" }), true);
+    assert.equal(sameDirective({ kind: "start", mode: "suggest" }, { kind: "stop" }), false);
+    assert.equal(sameDirective(null, null), true);
+    assert.equal(sameDirective(null, { kind: "stop" }), false);
+  });
+});
+
+describe("parseReviewLoopDirective is not stateful across calls", () => {
+  it("returns the same result on repeated calls (global regex lastIndex reset)", () => {
+    for (let i = 0; i < 3; i++) {
+      assert.deepEqual(parseReviewLoopDirective("/review-loop apply"), { kind: "start", mode: "apply" });
+      assert.equal(parseReviewLoopDirective("/review-loopx"), null);
+    }
   });
 });
 

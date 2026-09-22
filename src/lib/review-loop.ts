@@ -202,26 +202,39 @@ export type ReviewLoopDirective =
   | { kind: "start"; mode: ReviewLoopMode }
   | { kind: "stop" };
 
-// Capture the immediate next word (if any) so a mistyped control word ("stopx") or
-// unrelated trailing prose ("don't /review-loop yet") is NOT silently accepted as a
-// bare start. Only exact `apply` / `stop` are options; a newline-separated tail is
-// fine because `[ \t]` does not cross a line break.
-const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?:[ \t]+(\w+))?/i;
+// The token must be bounded: `(?![\w-])` rejects glued suffixes (`/review-loopx`,
+// `/review-loop-stop`) that would otherwise match the base alternative. Then capture
+// the immediate next word (if any); only exact `apply` / `stop` are options. `g` so a
+// leading invalid occurrence ("don't /review-loop yet") cannot mask a later valid one.
+const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?![\w-])(?:[ \t]+(\w+))?/gi;
 
 /**
  * Recognize `/review-loop`, `/review-loop apply`, `/review-loop stop`, and the
- * `@ashlar-bot review-loop …` variants. Returns null when the body is not a loop
- * directive — including when the token is immediately followed by an unrecognized
- * word — leaving plain `/review` to the existing parser. Default mode is `suggest`
- * (auto-commit only on explicit `apply`) per §2.
+ * `@ashlar-bot review-loop …` variants. Scans every occurrence and returns the first
+ * syntactically valid directive; an occurrence followed by an unrecognized word (or a
+ * glued suffix) is skipped, not accepted as a bare start. Returns null when the body
+ * carries no valid directive, leaving plain `/review` to the existing parser. Default
+ * mode is `suggest` (auto-commit only on explicit `apply`) per §2.
  */
 export function parseReviewLoopDirective(body: string | null | undefined): ReviewLoopDirective | null {
-  const m = LOOP_RE.exec(body || "");
-  if (!m) return null;
-  const opt = (m[1] || "").toLowerCase();
-  if (opt === "stop") return { kind: "stop" };
-  if (opt === "apply") return { kind: "start", mode: "apply" };
-  if (opt === "") return { kind: "start", mode: "suggest" };
-  // A word other than apply/stop follows the token: ambiguous intent, not a directive.
+  if (!body) return null;
+  LOOP_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = LOOP_RE.exec(body)) !== null) {
+    const opt = (m[1] || "").toLowerCase();
+    if (opt === "") return { kind: "start", mode: "suggest" };
+    if (opt === "apply") return { kind: "start", mode: "apply" };
+    if (opt === "stop") return { kind: "stop" };
+    // An unrecognized word follows this occurrence: ambiguous intent — keep scanning
+    // for a later valid directive rather than accepting or rejecting outright.
+  }
   return null;
+}
+
+/** True when two parsed directives are the same command (kind + start mode). */
+export function sameDirective(a: ReviewLoopDirective | null, b: ReviewLoopDirective | null): boolean {
+  if (a === null || b === null) return a === b;
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "start" && b.kind === "start") return a.mode === b.mode;
+  return true;
 }

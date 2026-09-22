@@ -88,16 +88,15 @@ function patchesByPath(diff: string): Map<string, string> {
 
 // WHY: replace the "first 20K chars of each changed file" snapshot with the head text enclosing
 // every changed hunk (+ same-file helper defs), so large files' changed functions actually reach the
-// reviewer. Two passes so full-file context never costs another file its baseline:
-//   1. baseline — every changed file gets a hunk-window slice, each capped to its FAIR SHARE of the
-//      budget (maxChars / files) so a hunk-heavy early file cannot consume the whole budget and
-//      starve later files; a file that uses less than its share leaves the remainder for pass 2,
-//   2. upgrade — leftover budget promotes files to their WHOLE body (ASHLAR_CONTEXT_FULL_FILES,
-//      default on), highest priority first, since the windows omit code far from any changed line and
-//      hide same-file helpers the changed code relies on (a measured false-positive source).
-// The full body is built lazily in pass 2 (with a cheap raw-length prefilter) so many large files
-// under a small budget don't each materialize a full guttered copy that pass 2 would discard.
-// The join separator (2 chars) is only counted BETWEEN blocks, not before the first.
+// reviewer. One pass, priority order, with a DYNAMIC fair share: at each file the cap is what's left
+// divided by the files still to place, so a hunk-heavy early file can never take more than its share
+// (no starvation), unused budget from small files rolls forward, and the last file gets all of it.
+// Within its share each file prefers its WHOLE body (ASHLAR_CONTEXT_FULL_FILES, default on) — the
+// hunk windows omit code far from any changed line and hide same-file helpers the changed code relies
+// on, a measured false-positive source — and falls back to the hunk windows when the full body does
+// not fit that share. The join separator (2 chars) is only counted BETWEEN blocks, not before the
+// first. A single length-based decision per file (does the whole body fit this share?) — no
+// cross-file delta accounting, which repeatedly mis-handled equal/shorter whole-file renders.
 const BLOCK_SEP = 2; // "\n\n" joined between snapshot blocks
 function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines: number, maxChars: number): string {
   const patchByPath = patchesByPath(sample.diff);
@@ -106,36 +105,27 @@ function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines:
   const withHunks = codeFiles
     .map((f) => ({ f, hunks: parseHunks(patchByPath.get(f.path) ?? ""), patch: patchByPath.get(f.path) ?? "" }))
     .filter((x) => x.hunks.length);
-  const fairShare = withHunks.length ? Math.floor(maxChars / withHunks.length) : maxChars;
-  const entries: { slice: string; path: string; content: string | null }[] = [];
+  const blocks: string[] = [];
   let used = 0;
-  // Pass 1 — baseline slice per file, capped to its fair share (never more than the global remainder).
-  for (const { f, hunks, patch } of withHunks) {
-    const remaining = maxChars - used - (entries.length ? BLOCK_SEP : 0);
+  for (let i = 0; i < withHunks.length; i += 1) {
+    const { f, hunks, patch } = withHunks[i];
+    const sep = blocks.length ? BLOCK_SEP : 0;
+    const remaining = maxChars - used - sep;
     if (remaining <= 0) break;
-    const cap = Math.min(fairShare, remaining);
-    const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: cap, patch });
-    if (!sliced.text) continue;
-    used += sliced.text.length + (entries.length ? BLOCK_SEP : 0);
-    entries.push({ slice: sliced.text, path: f.path, content: fullFiles ? f.content : null });
-  }
-  // Pass 2 — upgrade to full body with leftover budget (priority order), never starving a baseline.
-  if (fullFiles) {
-    for (const e of entries) {
-      if (e.content == null) continue;
-      // Cheap prefilter: raw body is shorter than its guttered form, so if even the raw delta cannot
-      // fit the leftover, neither can the full block — skip without materializing it.
-      if (e.content.length - e.slice.length > maxChars - used) continue;
-      const full = fullFileContext(e.path, e.content);
-      if (full.length <= e.slice.length) continue;
-      const delta = full.length - e.slice.length;
-      if (delta <= maxChars - used) {
-        used += delta;
-        e.slice = full;
-      }
+    const cap = Math.max(1, Math.floor(remaining / (withHunks.length - i)));
+    let block = "";
+    // Prefer the whole file when it fits this file's share. Prefilter on the raw length (always ≤ the
+    // guttered length) so an oversized file never materializes a full copy just to reject it.
+    if (fullFiles && f.content.length <= cap) {
+      const full = fullFileContext(f.path, f.content);
+      if (full.length <= cap) block = full;
     }
+    if (!block) block = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: cap, patch }).text;
+    if (!block) continue;
+    used += block.length + sep;
+    blocks.push(block);
   }
-  return entries.map((e) => e.slice).join("\n\n");
+  return blocks.join("\n\n");
 }
 
 // WHY: deliver repository review rules (root/nested AGENTS.md, code_review.md) as a

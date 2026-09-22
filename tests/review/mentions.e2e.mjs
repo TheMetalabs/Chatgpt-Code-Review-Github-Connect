@@ -246,3 +246,10 @@ test('@ashlar-bot review-loop stop is control-only: recognized as a skip, no rev
   assert.equal(job?.skipReason,'review-loop stop (no active loop engine)');
   assert.equal(app.localRequests.length,0,'no reviewer leg runs for a stop');
 });
+
+test('a retained /review-loop in the PR body does not re-trigger on push (synchronize)',async t=>{
+  const app=await fixture(t);
+  // PR body carries a one-shot /review-loop; a later push (synchronize) with the same body must NOT re-review.
+  const out=await deliver(app,'pull_request',pr('synchronize','/review-loop'));
+  assert.equal(out.queued,false,'synchronize with a retained loop directive is not a fresh request');
+});

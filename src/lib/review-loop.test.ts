@@ -14,6 +14,7 @@ import {
   REVIEW_LOOP_STOPPED_HUMAN,
   STOPPED_MARKER,
   sameDirective,
+  freshLoopDirective,
   stripLoopDirectives,
   type EscalateReason,
 } from "./review-loop.ts";
@@ -83,6 +84,27 @@ describe("parseReviewLoopDirective", () => {
     // a newline-separated tail is fine — the token stands alone on its line
     assert.deepEqual(parseReviewLoopDirective("/review-loop\nthanks"), { kind: "start", mode: "suggest" });
     assert.deepEqual(parseReviewLoopDirective("/review-loop apply please"), { kind: "start", mode: "apply" });
+  });
+});
+
+describe("freshLoopDirective", () => {
+  it("is fresh on opened/created; parsed directive returned", () => {
+    assert.deepEqual(freshLoopDirective("opened", "/review-loop", undefined), { kind: "start", mode: "suggest" });
+    assert.deepEqual(freshLoopDirective("created", "/review-loop apply", undefined), { kind: "start", mode: "apply" });
+  });
+  it("is NOT fresh on synchronize/reopened/ready_for_review (retained one-shot, no push re-trigger)", () => {
+    for (const action of ["synchronize", "reopened", "ready_for_review"]) {
+      assert.equal(freshLoopDirective(action, "/review-loop", undefined), undefined, action);
+    }
+  });
+  it("on edit, fresh only when added or changed vs the previous body", () => {
+    assert.equal(freshLoopDirective("edited", "/review-loop\n\nnew", "/review-loop\n\nold"), undefined); // retained
+    assert.deepEqual(freshLoopDirective("edited", "/review-loop apply", "/review-loop"), { kind: "start", mode: "apply" }); // changed
+    assert.deepEqual(freshLoopDirective("edited", "/review-loop", "no directive here"), { kind: "start", mode: "suggest" }); // added
+    assert.equal(freshLoopDirective("edited", "/review-loop", undefined), undefined); // body did not change
+  });
+  it("returns undefined when there is no directive", () => {
+    assert.equal(freshLoopDirective("opened", "just a normal PR body", undefined), undefined);
   });
 });
 

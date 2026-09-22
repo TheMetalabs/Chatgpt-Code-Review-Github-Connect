@@ -1,6 +1,6 @@
 import { llmWorkAllowed } from "./ops-comment.ts";
 import { isBotMention } from "./poster.ts";
-import { parseReviewLoopDirective, stripLoopDirectives } from "./review-loop.ts";
+import { stripLoopDirectives } from "./review-loop.ts";
 import { SAMPLE_PRS } from "./samples.ts";
 import type { BotSettings, ForkStatus, Job, Trigger, WebhookLog } from "./types.ts";
 
@@ -56,7 +56,10 @@ export function reviewSkipReason(opts: {
   // The `/review-loop*` triggers are fixed literals (design §2), independent of the
   // configurable @-mention tokens. A start directive is an explicit request; a stop
   // directive is a control command, not a review (the loop engine handles it later).
-  const loop = opts.thread?.loop ?? parseReviewLoopDirective(opts.thread?.userText);
+  // Trust the freshness decision the webhook parser already made (freshLoopDirective):
+  // a retained-directive edit deliberately leaves thread.loop undefined, and reparsing the
+  // raw userText here would reconstruct a start and re-trigger / supersede running work.
+  const loop = opts.thread?.loop;
   // An INDEPENDENT mention is one that survives after the loop-directive spans are removed:
   // `@ashlar-bot review-loop stop` has none (the mention is part of the directive), while
   // `@ashlar-bot review … /review-loop stop` still has the explicit `@ashlar-bot review`.

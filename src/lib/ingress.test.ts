@@ -186,15 +186,17 @@ describe("decideIngress", () => {
     if (d.ok) assert.ok(d.job);
   });
 
-  it("recognizes a review-loop start from the raw body when loop was not pre-parsed", () => {
+  it("trusts the webhook freshness decision: a retained-edit thread (loop undefined) is not requested", () => {
+    // freshLoopDirective left loop undefined because an unrelated edit retained /review-loop;
+    // ingress must NOT reparse userText and reconstruct a start, or it would supersede work.
     const d = decideIngress({
       ...base,
       sample: SAMPLE_PRS["pay-412"],
       trigger: "issue_comment.mention",
-      thread: { kind: "mention", commentId: 1, userText: "/review-loop apply" },
+      thread: { kind: "mention", commentId: 1, userText: "/review-loop\n\nunrelated prose edit" },
     });
     assert.equal(d.ok, true);
-    if (d.ok) assert.ok(d.job);
+    if (d.ok) assert.equal(d.skip, "not a mention");
   });
 
   it("treats @ashlar-bot review-loop stop as control-only (no review queued)", () => {
@@ -202,7 +204,7 @@ describe("decideIngress", () => {
       ...base,
       sample: SAMPLE_PRS["pay-412"],
       trigger: "issue_comment.mention",
-      thread: { kind: "mention", commentId: 1, userText: "@ashlar-bot review-loop stop" },
+      thread: { kind: "mention", commentId: 1, userText: "@ashlar-bot review-loop stop", loop: { kind: "stop" } },
     });
     assert.equal(d.ok, true);
     if (d.ok) assert.equal(d.skip, "review-loop stop (no active loop engine)");
@@ -224,7 +226,7 @@ describe("decideIngress", () => {
       ...base,
       sample: SAMPLE_PRS["pay-412"],
       trigger: "issue_comment.mention",
-      thread: { kind: "mention", commentId: 1, userText: "/review-loop stop" },
+      thread: { kind: "mention", commentId: 1, userText: "/review-loop stop", loop: { kind: "stop" } },
     });
     assert.equal(d.ok, true);
     if (d.ok) assert.equal(d.skip, "review-loop stop (no active loop engine)");

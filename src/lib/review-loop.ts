@@ -267,10 +267,18 @@ export function freshLoopDirective(
 ): ReviewLoopDirective | undefined {
   const cur = parseReviewLoopDirective(currentBody);
   if (cur == null) return undefined;
-  if (action !== "edited") return cur;
-  if (typeof previousBody !== "string" && previousBody !== null) return undefined;
-  const prev = parseReviewLoopDirective(previousBody ?? "");
-  return sameDirective(prev, cur) ? undefined : cur;
+  // New content: a directive in a newly created comment / opened PR is fresh.
+  if (action === "created" || action === "opened") return cur;
+  // Edit: fresh only when newly added or changed vs the previous body.
+  if (action === "edited") {
+    if (typeof previousBody !== "string" && previousBody !== null) return undefined;
+    const prev = parseReviewLoopDirective(previousBody ?? "");
+    return sameDirective(prev, cur) ? undefined : cur;
+  }
+  // synchronize / reopened / ready_for_review / anything else: a directive RETAINED in an
+  // unchanged body is not a fresh request — mirrors the mention path, so a one-shot
+  // /review-loop does not degrade into auto-review on every push.
+  return undefined;
 }
 
 /** True when two parsed directives are the same command (kind + start mode). */

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildReviewerLanes, emptyReviewSkip } from "./reviewer-progress.ts";
+import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress.ts";
 import type { Job } from "./types.ts";
 
 function job(partial: Partial<Job>): Job {
@@ -117,6 +117,42 @@ describe("buildReviewerLanes", () => {
     const lanes = buildReviewerLanes(job({ reviewProviders: ["local"] }), { localInFlight: true });
     const lane = lanes.find((l) => l.provider === "local");
     assert.equal(lane?.detail, "calling local LLM");
+  });
+
+  it("a queued local leg whose server is alive is reported as queued, not stalled, however old its progress", () => {
+    // Regression: a concurrency-1 server serves other jobs first. An hour in the queue with fresh
+    // keepalives is normal and must not read as "no recent progress" (nor be aborted).
+    const now = 10_000_000;
+    const lanes = buildReviewerLanes(
+      job({
+        reviewProviders: ["local"],
+        providerProgress: {
+          local: { runId: "local:j1", stage: "local_queued", observedAt: now - 3_600_000, keepaliveAt: now - 2_000, receivedAt: now - 2_000 },
+        },
+      }),
+      { localInFlight: true, now, staleMs: 300_000 },
+    );
+    const lane = lanes.find((l) => l.provider === "local");
+    assert.equal(lane?.state, "generating");
+    assert.equal(lane?.detail, "queued at local LLM · server alive, no output yet");
+    assert.equal(localLegNote({ runId: "local:j1", stage: "local_queued", observedAt: now - 3_600_000, keepaliveAt: now - 2_000, receivedAt: now }, now, 300_000),
+      "local reviewer: queued at the local LLM (server alive, no output yet — a concurrency-1 server serves earlier jobs first)");
+  });
+
+  it("a queued local leg with no sign of life past the stale window reads as no response from the server", () => {
+    const now = 10_000_000;
+    const progress = { runId: "local:j1", stage: "local_queued" as const, observedAt: now - 400_000, keepaliveAt: now - 400_000, receivedAt: now - 400_000 };
+    const lanes = buildReviewerLanes(job({ reviewProviders: ["local"], providerProgress: { local: progress } }), { localInFlight: true, now, staleMs: 300_000 });
+    assert.equal(lanes.find((l) => l.provider === "local")?.detail, "waiting for local LLM · no response from server");
+    assert.equal(localLegNote(progress, now, 300_000), "local reviewer: no response from the local LLM server (still waiting; cancel manually if stalled)");
+  });
+
+  it("a generating local leg with fresh output needs no ops note; stale output keeps the original note", () => {
+    const now = 10_000_000;
+    const fresh = { runId: "local:j1", stage: "local_generating" as const, observedAt: now - 1_000, keepaliveAt: now - 1_000, receivedAt: now };
+    assert.equal(localLegNote(fresh, now, 300_000), null);
+    const stale = { ...fresh, observedAt: now - 400_000 };
+    assert.equal(localLegNote(stale, now, 300_000), "local reviewer: no recent progress (still waiting; cancel manually if stalled)");
   });
 
   it("uses settings-enabled list before reviewProviders is stored", () => {

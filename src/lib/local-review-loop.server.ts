@@ -329,7 +329,8 @@ async function reviewGroup(
       model: settings.localLlmModel.trim(),
       messages,
       ...samplingRequestFields(params),
-      stream: false,
+      // Wire-level streaming (and its activity signal) is the transport's decision; the reply comes
+      // back in the non-streaming shape either way.
       ...(forceFinal ? {} : { tools: toolDefs(), tool_choice: "auto" }),
     };
     const res = (await deps.request(settings.localLlmBaseUrl.trim().replace(/\/$/, ""), settings.localLlmApiKey.trim() || "local", "chat/completions", body, deps.signal)) as {

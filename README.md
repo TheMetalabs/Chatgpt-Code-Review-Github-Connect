@@ -237,13 +237,25 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 | `ASHLAR_LOCAL_REVIEW_TOOL_ITERS` | 8 | 그룹당 최대 툴 라운드. 초과하면 툴을 빼고 최종 JSON 강제 |
 | `ASHLAR_LOCAL_REVIEW_CTX_CAP_TOKENS` | 24000 | 프롬프트가 이 토큰을 넘으면 다음 턴에 최종 JSON 강제 |
 | `ASHLAR_LOCAL_REVIEW_STALE_NOTE_MS` | 300000 | 로컬 리뷰어 하트비트 오래된 판정 시간(ms). 초과 시 ops 노트에 경고 표시만(자동 취소 없음) |
+| `ASHLAR_LOCAL_REVIEW_DEADLINE_MS` | **0 (없음)** | 로컬 레그 벽시계 상한(ms). 동시성 1 서버에서 멀티턴 리뷰는 30~40분이 보통이고 앞선 잡에 밀리면 몇 시간도 걸리므로 기본은 상한 없음. 값을 주면 초과 시 레그를 중단하고 `Skipped local` 처리 |
+| `ASHLAR_LOCAL_LLM_STREAM` | true | chat/completions 를 SSE 스트리밍으로 받아 토큰 단위 하트비트를 얻습니다. 응답은 비스트리밍 형태로 재조립되므로 동작은 같습니다. `false` 면 예전처럼 단일 JSON 응답 |
 
-로컬 레그는 이제 `providerProgress.local`로 **하트비트 + 진행상황 신호**를 내보냅니다. `observedAt`은
-레그가 시작할 때 심어지고 멀티턴에서는 각 턴 경계마다 갱신됩니다(단일턴은 시작 시점 한 번 — 그래서
-멈춘 단일턴 요청도 stale 판정에 걸립니다). 리뷰어 레인과 ops 노트가 이 신호를 읽어 "정상 생성 중"과
-"멈춤"을 구분합니다. 구성한 `ASHLAR_LOCAL_REVIEW_STALE_NOTE_MS` 시간(기본 5분) 이상 하트비트가 안 오면
-**가시성 노트만** 출력하며, **자동 타임아웃/중단은 없습니다**. 대기/실패 판정 자체는 기존대로 레그 종료
-(성공 레그 저장 또는 `Skipped local`)로 이뤄지고, 하트비트는 사람이 취소 여부를 판단할 근거일 뿐입니다.
+로컬 레그는 `providerProgress.local`로 **하트비트 + 진행상황 신호**를 내보냅니다. 스트리밍 전송이
+서버의 응답 헤더·빈 keepalive 청크·토큰을 관찰해 레그를 세 상태로 구분합니다.
+
+| 레인 문구 | 뜻 |
+| --- | --- |
+| `queued at local LLM · server alive, no output yet` | 요청은 보냈고 서버는 살아 있지만 아직 우리 요청의 토큰이 없음 — 동시성 1 서버에서 앞선 잡 뒤에 줄 서 있거나 prefill 중. **정상** |
+| `calling local LLM` | 토큰이 흐르는 중(생성 중) |
+| `waiting for local LLM · no response from server` | `ASHLAR_LOCAL_REVIEW_STALE_NOTE_MS`(기본 5분) 동안 서버로부터 아무 신호도 없음 — 서버가 멈췄을 가능성 |
+| `calling local LLM · no recent progress` | 생성이 시작됐는데 5분 이상 토큰이 없음 |
+
+`observedAt`은 마지막 **실제 진행**(토큰 또는 완료된 턴), `keepaliveAt`은 마지막 **생존 신호**입니다.
+둘이 벌어지는 구간이 곧 "큐 대기"입니다. 히스토리 steps 에는 `local.requested → local.accepted(서버 수락)
+→ local.generating(첫 토큰) → local.response_received | local.failed` 가 남아 사후 진단이 됩니다.
+어느 상태든 **자동 타임아웃/중단은 없습니다**(`ASHLAR_LOCAL_REVIEW_DEADLINE_MS` 를 명시한 경우만 예외).
+대기/실패 판정 자체는 기존대로 레그 종료(성공 레그 저장 또는 `Skipped local`)로 이뤄지고, 신호는
+사람이 취소 여부를 판단할 근거일 뿐입니다.
 
 기본 `auto`는 작은 PR(프롬프트 ≤ 30K 토큰)은 **단일턴**으로 빠르게 전체를 보고, 큰 PR은 **멀티턴**으로
 돌립니다. 단일턴은 한 완성 창에 다 담기고 재현율이 높으며, 큰 PR은 단일 호출 KV 캐시가 치솟으니

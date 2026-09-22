@@ -99,7 +99,9 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
       target,
       installationId,
       // A PR-body request has no comment ID: reactions belong on the PR itself.
-      thread: bodyRequest ? { kind: "pr_body", commentId: 0, userText: text, loop: bodyLoopStart } : undefined,
+      // Preserve the full directive (incl. a coexisting stop) as metadata when a review is
+      // requested, matching the issue_comment path; bodyLoopStart only gates promotion above.
+      thread: bodyRequest ? { kind: "pr_body", commentId: 0, userText: text, loop: freshLoop } : undefined,
       untrustedBody: text.slice(0, 4000),
     };
   }

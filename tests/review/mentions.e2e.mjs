@@ -220,6 +220,9 @@ test('a /review-loop directive on a draft is an explicit request and reaches the
   assert.equal(job.thread?.loop?.kind,'start');
   assert.equal(job.thread?.loop?.mode,'suggest');
 });
+// WHY two stop tests with different outcomes: harbor persists a visible skipped job (for ops
+// feedback) ONLY when the full body is a bot mention. A bare '/review-loop stop' is not a
+// mention -> silently dropped (no job); '@ashlar-bot review-loop stop' is -> a skipped job.
 test('a /review-loop stop directive is recognized but runs no review',async t=>{
   const app=await fixture(t);
   const raw=comment(); raw.comment.body='/review-loop stop';

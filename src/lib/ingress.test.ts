@@ -199,6 +199,50 @@ describe("decideIngress", () => {
     if (d.ok) assert.equal(d.skip, "not a mention");
   });
 
+  it("queues a PR-body loop start (pull_request.body_mention path)", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "pull_request.body_mention",
+      thread: { kind: "pr_body", commentId: 0, userText: "/review-loop apply", loop: { kind: "start", mode: "apply" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.ok(d.job);
+  });
+
+  it("an explicit PR-body loop start bypasses the draft gate (explicit request, like a mention)", () => {
+    const d = decideIngress({
+      ...base,
+      sample: { ...SAMPLE_PRS["pay-412"], isDraft: true },
+      trigger: "pull_request.body_mention",
+      thread: { kind: "pr_body", commentId: 0, userText: "/review-loop", loop: { kind: "start", mode: "suggest" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.ok(d.job, "explicit loop start is honored on a draft");
+  });
+
+  it("a PR-body stop with no independent mention is control-only", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "pull_request.body_mention",
+      thread: { kind: "pr_body", commentId: 0, userText: "/review-loop stop", loop: { kind: "stop" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.equal(d.skip, "review-loop stop (no active loop engine)");
+  });
+
+  it("a PR-body independent mention plus a trailing stop still queues the review", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "pull_request.body_mention",
+      thread: { kind: "pr_body", commentId: 0, userText: "@ashlar-bot review\nthen /review-loop stop", loop: { kind: "stop" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.ok(d.job, "the independent review mention still runs; stop is preserved as metadata");
+  });
+
   it("treats @ashlar-bot review-loop stop as control-only (no review queued)", () => {
     const d = decideIngress({
       ...base,

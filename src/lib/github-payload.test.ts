@@ -222,6 +222,17 @@ describe("parseGitHubPayload", () => {
     if (d.ok && d.kind === "review") assert.equal(d.trigger, "pull_request.body_mention");
   });
 
+  it("preserves a coexisting stop as thread metadata on a mention-driven PR-body review (F: mixed stop)", () => {
+    const d = parseGitHubPayload("pull_request", {
+      action: "opened",
+      repository: { full_name: "acme/pay", fork: false },
+      sender: { login: "alice" },
+      pull_request: { number: 504, title: "t", body: "@ashlar-bot review\nthen /review-loop stop", draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") { assert.equal(d.trigger, "pull_request.body_mention"); assert.equal(d.thread?.loop?.kind, "stop"); }
+  });
+
   it("ignores unknown events", () => {
     const d = parseGitHubPayload("star", {});
     assert.equal(d.ok, true);

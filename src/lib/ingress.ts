@@ -1,5 +1,6 @@
 import { llmWorkAllowed } from "./ops-comment.ts";
 import { isBotMention } from "./poster.ts";
+import { stripLoopDirectives } from "./review-loop.ts";
 import { SAMPLE_PRS } from "./samples.ts";
 import type { BotSettings, ForkStatus, Job, Trigger, WebhookLog } from "./types.ts";
 
@@ -52,7 +53,22 @@ export function reviewSkipReason(opts: {
   deferUnknownFork?: boolean;
 }): string | undefined {
   const mentionTrigger = llmWorkAllowed(opts);
-  const requested = mentionTrigger && isBotMention(opts.thread?.userText, opts.settings);
+  // The `/review-loop*` triggers are fixed literals (design §2), independent of the
+  // configurable @-mention tokens. A start directive is an explicit request; a stop
+  // directive is a control command, not a review (the loop engine handles it later).
+  // Trust the freshness decision the webhook parser already made (freshLoopDirective):
+  // a retained-directive edit deliberately leaves thread.loop undefined, and reparsing the
+  // raw userText here would reconstruct a start and re-trigger / supersede running work.
+  const loop = opts.thread?.loop;
+  // An INDEPENDENT mention is one that survives after the loop-directive spans are removed:
+  // `@ashlar-bot review-loop stop` has none (the mention is part of the directive), while
+  // `@ashlar-bot review … /review-loop stop` still has the explicit `@ashlar-bot review`.
+  const independentMention = isBotMention(stripLoopDirectives(opts.thread?.userText), opts.settings);
+  // A stop directive is control-only unless the body ALSO carries an independent mention,
+  // which must still queue its own review.
+  if (mentionTrigger && loop?.kind === "stop" && !independentMention)
+    return "review-loop stop (no active loop engine)";
+  const requested = mentionTrigger && (loop?.kind === "start" || independentMention);
   if (opts.settings.skipDrafts && opts.sample.isDraft && !requested) return "draft";
   if (opts.settings.skipForks) {
     if (opts.sample.isFork === true) return "fork (allowlist empty) · PR body not promoted to policy";

@@ -209,3 +209,50 @@ test('a comment on a fork destination resolves the actual head instead of being 
   assert.equal((await settled(app, out.jobId)).status, 'awaiting_chat');
   assert.equal(app.githubCalls.head, 1);
 });
+
+test('a /review-loop directive on a draft is an explicit request and reaches the queue',async t=>{
+  const app=await fixture(t,{pull:{draft:true}});
+  const raw=comment(); raw.comment.body='/review-loop';
+  const out=await deliver(app,'issue_comment',raw);
+  assert.equal(out.status,202);assert.equal(out.queued,true);
+  const job=await settled(app,out.jobId);
+  assert.equal(job.status,'awaiting_chat','loop start overrides the draft skip like a mention');
+  assert.equal(job.thread?.loop?.kind,'start');
+  assert.equal(job.thread?.loop?.mode,'suggest');
+});
+// WHY two stop tests with different outcomes: harbor persists a visible skipped job (for ops
+// feedback) ONLY when the full body is a bot mention. A bare '/review-loop stop' is not a
+// mention -> silently dropped (no job); '@ashlar-bot review-loop stop' is -> a skipped job.
+test('a /review-loop stop directive is recognized but runs no review',async t=>{
+  const app=await fixture(t);
+  const raw=comment(); raw.comment.body='/review-loop stop';
+  const out=await deliver(app,'issue_comment',raw);
+  const job=app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  assert.equal(job,undefined,'stop directive does not enqueue a review job');
+  assert.equal(out.queued,false);
+});
+
+test('an explicit @ashlar-bot review is not suppressed by a trailing /review-loop stop in the same comment',async t=>{
+  const app=await fixture(t);
+  const raw=comment(); raw.comment.body='@ashlar-bot review — if it flaps, /review-loop stop';
+  const out=await deliver(app,'issue_comment',raw);
+  assert.equal(out.status,202);assert.equal(out.queued,true);
+  assert.equal((await settled(app,out.jobId)).status,'awaiting_chat');
+});
+
+test('@ashlar-bot review-loop stop is control-only: recognized as a skip, no reviewer work',async t=>{
+  const app=await fixture(t);
+  const raw=comment(); raw.comment.body='@ashlar-bot review-loop stop';
+  const out=await deliver(app,'issue_comment',raw);
+  const job=app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  assert.equal(job?.status,'skipped');
+  assert.equal(job?.skipReason,'review-loop stop (no active loop engine)');
+  assert.equal(app.localRequests.length,0,'no reviewer leg runs for a stop');
+});
+
+test('a retained /review-loop in the PR body does not re-trigger on push (synchronize)',async t=>{
+  const app=await fixture(t);
+  // PR body carries a one-shot /review-loop; a later push (synchronize) with the same body must NOT re-review.
+  const out=await deliver(app,'pull_request',pr('synchronize','/review-loop'));
+  assert.equal(out.queued,false,'synchronize with a retained loop directive is not a fresh request');
+});

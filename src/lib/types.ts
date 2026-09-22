@@ -1,6 +1,7 @@
 import type {RepairReceipt} from "./json-repair-types.ts";
 import type { ProviderProgress } from "./review-progress.ts";
 import type { ChatgptReasoning, GrokReasoning } from "./reasoning.ts";
+import type { ReviewLoopDirective } from "./review-loop.ts";
 
 /** null means the head repository provenance is not established. */
 export type ForkStatus = boolean | null;
@@ -76,6 +77,8 @@ export interface JobThread {
   kind: "mention" | "followup" | "pr_body";
   commentId: number;
   userText: string;
+  /** Parsed `/review-loop*` directive when the trigger body carried one (design §2). */
+  loop?: ReviewLoopDirective;
 }
 
 export interface Job {

@@ -475,24 +475,30 @@ test("onProgress callback fires at each turn boundary with group/iter metadata",
   assert.ok(iters.includes(2), "iter 2 should be reported");
 });
 
-test("abort after some groups completed salvages their findings; un-reviewed groups stay not_cleared", async () => {
+test("abort after a group fully completes salvages its findings; the aborted and un-started groups stay not_cleared", async () => {
   // Recall-over-precision: a review that already found real issues must post them even if the leg is
-  // aborted (liveness/deadline/cancel) before the remaining groups run. The un-reviewed group is
-  // marked not_cleared so coverage never claims a full pass it did not do.
+  // aborted (liveness/deadline) before the remaining groups run. The boundary this pins, precisely:
+  // group 1 completes NORMALLY (its request returns before any abort), THEN the abort fires during
+  // group 2's request (in-flight → per-group catch), and group 3 never starts (top-of-loop salvage).
+  // Every un-reviewed group is not_cleared; nothing is silently omitted and group 1's finding survives.
   process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
   try {
     const controller = new AbortController();
     const groupOne = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", findings: [F({ file: "src/a.ts", line: 2 })], investigated_safe: [], coverage: [] });
+    let generation = 0;
     const request = async (_b, _k, path) => {
       if (path === "models") return { data: [] };
-      controller.abort(); // group 1's request returns, then the leg is aborted before group 2 starts
-      return assistant(groupOne);
+      generation += 1;
+      if (generation === 1) return assistant(groupOne); // group 1 returns cleanly, signal NOT yet aborted
+      controller.abort(); // group 2 is in-flight when the leg is aborted → its request rejects
+      throw Object.assign(new Error("aborted"), { name: "AbortError" });
     };
-    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request, signal: controller.signal });
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts", "src/c.ts"]), settings, { request, signal: controller.signal });
     assert.equal(out.ok, true, "the completed group's findings are salvaged, not discarded");
     const merged = JSON.parse(out.raw);
-    assert.ok(merged.findings.some((f) => f.file === "src/a.ts"), "group 1's finding is posted");
-    assert.ok(merged.coverage.some((c) => c.file === "src/b.ts" && c.status === "not_cleared"), "the un-reviewed group is not_cleared, not silently omitted");
+    assert.ok(merged.findings.some((f) => f.file === "src/a.ts"), "group 1 completed before the abort and its finding is posted");
+    assert.ok(merged.coverage.some((c) => c.file === "src/b.ts" && c.status === "not_cleared"), "the group aborted in-flight is not_cleared");
+    assert.ok(merged.coverage.some((c) => c.file === "src/c.ts" && c.status === "not_cleared"), "the group never started after the abort is not_cleared, not silently omitted");
   } finally {
     delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
   }

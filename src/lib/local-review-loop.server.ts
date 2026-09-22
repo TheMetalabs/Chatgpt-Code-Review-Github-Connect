@@ -560,8 +560,18 @@ export async function runLocalReviewLoop(
     deps.log?.(`local review loop: ${groups.length} group(s) over ${sample.changedPaths.length} changed file(s)`);
     const raws: string[] = [];
     const failedGroups: string[][] = [];
+    let aborted = false;
     for (let i = 0; i < groups.length; i += 1) {
-      if (deps.signal?.aborted) break;
+      if (deps.signal?.aborted) {
+        // Aborted (liveness/deadline/cancel) with groups still un-started. Do NOT discard the groups
+        // already reviewed — those findings are real and worth posting. Mark every group not yet
+        // reviewed as failed so the merge records them not_cleared, keeping coverage honest: an
+        // un-reviewed file is never silently omitted, so a partial run cannot masquerade as a full
+        // clean pass. Downstream false-positive checking happens when each finding is acted on.
+        aborted = true;
+        for (let j = i; j < groups.length; j += 1) failedGroups.push(groups[j]);
+        break;
+      }
       const group = groups[i];
       // Sequential — one generation at a time bounds peak memory on a shared host. Isolate each group:
       // a transient request/tool failure late in a long multi-group run must not discard the groups
@@ -580,19 +590,18 @@ export async function runLocalReviewLoop(
         failedGroups.push(group);
       }
     }
-    // No group produced JSON at all → nothing to post; the leg is skipped. When at least one group
-    // DID produce JSON, merge: failed/null groups are marked not_cleared and (if the surviving groups
-    // are empty) investigated_safe is forced [], so the frozen gate rejects a partial run as
-    // incomplete rather than accepting it as a false clean pass.
-    // An abort at ANY point (the deadline in attachLocalLeg, or cancellation) means the review is
-    // incomplete — the loop may have broken with un-started groups, OR the abort threw the FINAL group's
-    // request into the per-group catch (which the loop's exit-by-condition would otherwise let through as
-    // a partial ok:true). Either way a partial merge would omit un-reviewed changed files (not even
-    // not_cleared), publishing part of a review as the whole. Fail the leg. Checking the signal itself
-    // (not a break-only flag) is race-free: a run that finished every group cannot have an aborted signal,
-    // since a completed final group's request did not throw on abort.
-    if (deps.signal?.aborted) return { ok: false, error: "local review aborted before completion (deadline or cancellation)" };
-    if (!raws.length) return { ok: false, error: "local loop produced no review JSON" };
+    // Post whatever was found. Every group is accounted for: completed ones in `raws`, and every
+    // un-reviewed group (a null/failed result, a group whose request threw the abort, and — via the
+    // loop above — the groups never started after an abort) in `failedGroups`, which the merge marks
+    // not_cleared. So a partial run is published as partial (explicit not_cleared coverage; and the
+    // gate forces investigated_safe to [] when findings are empty), never as a false clean pass.
+    // Only when NOTHING was produced at all is the leg skipped — distinguishing an abort-before-any-
+    // -result from a genuine no-JSON run for the operator.
+    if (!raws.length) {
+      return { ok: false, error: aborted || deps.signal?.aborted
+        ? "local review aborted before any group completed (deadline or cancellation)"
+        : "local loop produced no review JSON" };
+    }
     return { ok: true, raw: mergeGroupResults(raws, failedGroups, unreviewablePaths(sample)) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

@@ -2,7 +2,7 @@ import type { Finding, SamplePr, SnapshotFile } from "./types.ts";
 import { DEFAULT_SETTINGS } from "./types.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
-import { crossFileDefs, parseHunks, sliceContext } from "./context-slice.ts";
+import { crossFileDefs, fullFileContext, parseHunks, sliceContext } from "./context-slice.ts";
 import { extractReviewPolicy, policyPathsFor } from "./github-snapshot.ts";
 
 export const CHAT_JSON_HINT = `{
@@ -86,26 +86,70 @@ function patchesByPath(diff: string): Map<string, string> {
   return out;
 }
 
-// WHY: replace the "first 20K chars of each changed file" snapshot with the head
-// text enclosing every changed hunk (+ same-file helper defs), so large files'
-// changed functions actually reach the reviewer.
+// WHY: replace the "first 20K chars of each changed file" snapshot with the head text enclosing every
+// changed hunk (+ same-file helper defs), so large files' changed functions reach the reviewer. The
+// windows hide same-file helpers far from a hunk (a measured false-positive source), so we prefer the
+// WHOLE body (ASHLAR_CONTEXT_FULL_FILES, default on) within a char budget:
+//   - Fast path: if every changed file's whole body fits together, show them all — optimal, no packing.
+//   - Constrained path (bodies don't all fit): give every file a baseline hunk-window slice, dynamic
+//     fair share so no file starves; retry any file whose share was too small for even one range using
+//     the actual remaining budget, so a file is never dropped while budget remains; then upgrade files
+//     to their whole body from the TOTAL leftover, priority order, repeating to a fixpoint so budget a
+//     shorter/earlier render frees is reused. A whole body is always a superset of its slice, so any
+//     upgrade that fits is a coverage win.
+const BLOCK_SEP = 2; // "\n\n" joined between snapshot blocks
+function joinLen(parts: readonly string[]): number {
+  const body = parts.reduce((n, s) => n + s.length, 0);
+  return parts.length > 1 ? body + BLOCK_SEP * (parts.length - 1) : body;
+}
 function buildHunkContext(sample: SamplePr, snapshots: SnapshotFile[], padLines: number, maxChars: number): string {
   const patchByPath = patchesByPath(sample.diff);
   const codeFiles = orderFiles(snapshots.filter((f) => rankChangedFile(f.path) === 0));
-  const blocks: string[] = [];
-  let remaining = maxChars;
-  for (const f of codeFiles) {
+  const fullFiles = process.env.ASHLAR_CONTEXT_FULL_FILES !== "0";
+  const files = codeFiles
+    .map((f) => ({ f, hunks: parseHunks(patchByPath.get(f.path) ?? ""), patch: patchByPath.get(f.path) ?? "" }))
+    .filter((x) => x.hunks.length);
+  if (!files.length) return "";
+
+  // Fast path: every whole body fits together.
+  if (fullFiles) {
+    const fulls = files.map((x) => fullFileContext(x.f.path, x.f.content));
+    if (joinLen(fulls) <= maxChars) return fulls.join("\n\n");
+  }
+
+  // Constrained path. Baseline slice per file at a dynamic fair share of what's left.
+  const rows = files.map((x) => ({ block: "", x }));
+  const usedLen = () => joinLen(rows.filter((r) => r.block).map((r) => r.block));
+  for (let i = 0; i < rows.length; i += 1) {
+    const { f, hunks, patch } = rows[i].x;
+    const remaining = maxChars - usedLen() - (rows.some((r) => r.block) ? BLOCK_SEP : 0);
     if (remaining <= 0) break;
-    const patch = patchByPath.get(f.path) ?? "";
-    const hunks = parseHunks(patch);
-    if (!hunks.length) continue;
-    const sliced = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: remaining, patch });
-    if (sliced.text) {
-      blocks.push(sliced.text);
-      remaining -= sliced.text.length + 2;
+    const cap = Math.max(1, Math.floor(remaining / (rows.length - i)));
+    rows[i].block = sliceContext({ path: f.path, content: f.content, hunks, padLines, maxChars: cap, patch }).text;
+  }
+  // Never drop a file while budget remains: retry any empty row with the actual remaining budget.
+  for (const r of rows) {
+    if (r.block) continue;
+    const remaining = maxChars - usedLen() - (rows.some((x) => x.block) ? BLOCK_SEP : 0);
+    if (remaining <= 0) break;
+    r.block = sliceContext({ path: r.x.f.path, content: r.x.f.content, hunks: r.x.hunks, padLines, maxChars: remaining, patch: r.x.patch }).text;
+  }
+  // Upgrade to whole bodies from the total leftover (priority order), to a fixpoint.
+  if (fullFiles) {
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const r of rows) {
+        if (!r.block) continue;
+        const full = fullFileContext(r.x.f.path, r.x.f.content);
+        if (full === r.block) continue;
+        if (full.length - r.block.length <= maxChars - usedLen()) {
+          r.block = full;
+          changed = true;
+        }
+      }
     }
   }
-  return blocks.join("\n\n");
+  return rows.filter((r) => r.block).map((r) => r.block).join("\n\n");
 }
 
 // WHY: deliver repository review rules (root/nested AGENTS.md, code_review.md) as a
@@ -176,6 +220,14 @@ export function buildChatParts(opts: {
     process.env.ASHLAR_POLICY_ATTACH === "0"
       ? ""
       : buildPolicyAttachment(opts.sample, opts.policyMaxChars ?? DEFAULT_SETTINGS.promptPolicyMaxChars);
+  // Describe the snapshot as it was actually built, so the opt-out (ASHLAR_CONTEXT_FULL_FILES=0) and
+  // head mode are not misdescribed as whole-file context.
+  const snapshotDesc =
+    mode === "head"
+      ? "each changed file's head text"
+      : process.env.ASHLAR_CONTEXT_FULL_FILES !== "0"
+        ? "each changed file's head text with line numbers — the whole file for as many changed files as the budget allows (highest-priority first), otherwise the text around every changed hunk plus same-file definitions; a file shown only around its hunks may still contain other code, so do not assume an unshown helper is absent"
+        : "head text around every changed hunk with line numbers, plus same-file definitions";
   const files: ReviewAttach[] = [
     { name: "ashlar-diff.patch", body: String(opts.sample.diff || "") },
     { name: "ashlar-snapshot.md", body: contextBody },
@@ -189,7 +241,7 @@ export function buildChatParts(opts: {
     opts.extra ? `<<<UNTRUSTED_USER_LINE>>>\n${opts.extra.slice(0, 500)}\n<<<END>>>` : "",
     opts.untrustedBody ? `<<<UNTRUSTED_PR_BODY>>>\n${opts.untrustedBody.slice(0, 800)}\n<<<END>>>` : "",
     files.length
-      ? "Attached files: ashlar-diff.patch (the PR diff), ashlar-snapshot.md (head text around every changed hunk with line numbers, plus same-file definitions and a CROSS_FILE_DEFINITIONS section with definitions of imported helpers the changed code calls), and ashlar-policy.md (repository review rules and domain invariants, when present). Review those attachments. Do not ask for more files."
+      ? `Attached files: ashlar-diff.patch (the PR diff), ashlar-snapshot.md (${snapshotDesc}, and a CROSS_FILE_DEFINITIONS section with definitions of imported helpers the changed code calls), and ashlar-policy.md (repository review rules and domain invariants, when present). Review those attachments. Do not ask for more files.`
       : "",
     "Return exactly this JSON shape:",
     CHAT_JSON_HINT,

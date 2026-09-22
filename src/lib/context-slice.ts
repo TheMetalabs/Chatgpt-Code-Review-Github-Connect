@@ -283,6 +283,20 @@ export function sliceContext(opts: {
 }
 
 /**
+ * The entire file with line-number gutters, in the exact shape sliceContext emits for a range. Used
+ * when a changed file fits the snapshot budget: the hunk-window slices deliberately omit code far
+ * from any changed line, which hides a same-file helper the changed code relies on (a real
+ * false-positive source — a reviewer flagged a missing guard that a same-file helper already
+ * enforced, because that helper was outside every hunk window). Attaching the whole small file makes
+ * such helpers visible; large files still degrade to the hunk windows.
+ */
+export function fullFileContext(path: string, content: string): string {
+  const lines = String(content ?? "").split("\n");
+  const body = lines.map((line, i) => `${i + 1}| ${line}`).join("\n");
+  return `--- ${path} (L1-L${lines.length})\n${body}`;
+}
+
+/**
  * Cross-file helper definitions for the one-shot reviewer. For symbols the changed hunks CALL or
  * construct, pull their definitions out of the fetched reference files (imported modules that are not
  * themselves changed) with line-number gutters. This gives the browser reviewer the "read the helper

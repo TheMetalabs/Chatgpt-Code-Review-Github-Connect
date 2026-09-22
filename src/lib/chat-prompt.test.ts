@@ -246,6 +246,26 @@ describe("buildChatParts full changed-file body (P1)", () => {
     const snap = files.find((f) => f.name === "ashlar-snapshot.md");
     assert.ok(snap!.body.includes("B_BASELINE"), "file B keeps a baseline slice despite A's many hunks");
   });
+
+  it("budget a later file did not need still restores an earlier file's whole body", () => {
+    // A (higher priority) is large with a far helper; B (lower priority) is tiny. Both full bodies fit
+    // the budget together, so A must be shown whole — a forward-only allocator that reserved a share
+    // for B and never revisited A would wrongly leave A's helper out (the round-4 regression).
+    const bigA = ["export function aa() {", "  return 1;", "}", ...Array.from({ length: 40 }, (_, i) => `// A ${i}`), "export function aFar() {", "  return 'A_FAR_MARKER';", "}"].join("\n");
+    const twoFile = {
+      ...sample,
+      changedPaths: ["src/a.ts", "src/b.ts"],
+      files: [
+        { path: "src/a.ts", language: "ts" as const, content: bigA },
+        { path: "src/b.ts", language: "ts" as const, content: "export function b() { return 2; }" },
+      ],
+      diff: "--- src/a.ts\n@@ -1,2 +1,3 @@\n export function aa() {\n+  return 1;\n }\n\n--- src/b.ts\n@@ -1,1 +1,1 @@\n-export function b() { return 1; }\n+export function b() { return 2; }",
+    };
+    const budget = fullFileContext("src/a.ts", bigA).length + fullFileContext("src/b.ts", twoFile.files[1].content).length + 10;
+    const { files } = buildChatParts({ sample: twoFile, contextMaxChars: budget });
+    const snap = files.find((f) => f.name === "ashlar-snapshot.md");
+    assert.ok(snap!.body.includes("A_FAR_MARKER"), "A's far helper is present — leftover restored A's whole body");
+  });
 });
 
 describe("buildChatParts cross-file definitions", () => {

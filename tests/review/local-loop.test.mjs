@@ -474,3 +474,35 @@ test("onProgress callback fires at each turn boundary with group/iter metadata",
   const iters = progress.map((p) => p.iter);
   assert.ok(iters.includes(2), "iter 2 should be reported");
 });
+
+test("abort after some groups completed salvages their findings; un-reviewed groups stay not_cleared", async () => {
+  // Recall-over-precision: a review that already found real issues must post them even if the leg is
+  // aborted (liveness/deadline/cancel) before the remaining groups run. The un-reviewed group is
+  // marked not_cleared so coverage never claims a full pass it did not do.
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    const controller = new AbortController();
+    const groupOne = JSON.stringify({ merge_recommendation: "REQUEST_CHANGES", findings: [F({ file: "src/a.ts", line: 2 })], investigated_safe: [], coverage: [] });
+    const request = async (_b, _k, path) => {
+      if (path === "models") return { data: [] };
+      controller.abort(); // group 1's request returns, then the leg is aborted before group 2 starts
+      return assistant(groupOne);
+    };
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/b.ts"]), settings, { request, signal: controller.signal });
+    assert.equal(out.ok, true, "the completed group's findings are salvaged, not discarded");
+    const merged = JSON.parse(out.raw);
+    assert.ok(merged.findings.some((f) => f.file === "src/a.ts"), "group 1's finding is posted");
+    assert.ok(merged.coverage.some((c) => c.file === "src/b.ts" && c.status === "not_cleared"), "the un-reviewed group is not_cleared, not silently omitted");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
+test("abort before any group completes skips the leg with an abort-specific reason", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const request = async (_b, _k, path) => { if (path === "models") return { data: [] }; return assistant(REVIEW_JSON); };
+  const out = await runLocalReviewLoop(sampleWith(["src/a.ts"]), settings, { request, signal: controller.signal });
+  assert.equal(out.ok, false, "nothing was produced, so there is nothing to salvage");
+  assert.match(out.error, /aborted before any group completed/);
+});

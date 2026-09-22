@@ -1,5 +1,6 @@
 import type { IngressTarget } from "./ingress.ts";
 import { DEFAULT_SETTINGS, type BotSettings, type JobThread, type Trigger } from "./types.ts";
+import { parseReviewLoopDirective } from "./review-loop.ts";
 import { isBotMention } from "./poster.ts";
 
 const PR_ACTIONS: Record<string, Trigger> = {
@@ -87,7 +88,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
       target,
       installationId,
       // A PR-body request has no comment ID: reactions belong on the PR itself.
-      thread: bodyMention ? { kind: "pr_body", commentId: 0, userText: text } : undefined,
+      thread: bodyMention ? { kind: "pr_body", commentId: 0, userText: text, loop: parseReviewLoopDirective(text) ?? undefined } : undefined,
       untrustedBody: text.slice(0, 4000),
     };
   }
@@ -120,6 +121,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
         kind: "mention",
         commentId: Number(body.comment?.id ?? 0),
         userText: String(body.comment?.body ?? ""),
+        loop: parseReviewLoopDirective(String(body.comment?.body ?? "")) ?? undefined,
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
     };
@@ -150,6 +152,7 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
         kind: "followup",
         commentId: Number(body.comment?.id ?? 0),
         userText: String(body.comment?.body ?? ""),
+        loop: parseReviewLoopDirective(String(body.comment?.body ?? "")) ?? undefined,
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
     };

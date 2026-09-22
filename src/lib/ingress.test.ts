@@ -174,4 +174,38 @@ describe("decideIngress", () => {
     assert.equal(d.ok, true);
     if (d.ok) assert.ok(d.job);
   });
+
+  it("queues a review-loop start directive even without an @-mention token", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "issue_comment.mention",
+      thread: { kind: "mention", commentId: 1, userText: "/review-loop", loop: { kind: "start", mode: "suggest" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.ok(d.job);
+  });
+
+  it("recognizes a review-loop start from the raw body when loop was not pre-parsed", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "issue_comment.mention",
+      thread: { kind: "mention", commentId: 1, userText: "/review-loop apply" },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.ok(d.job);
+  });
+
+  it("does not run a review for a review-loop stop directive", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "issue_comment.mention",
+      thread: { kind: "mention", commentId: 1, userText: "/review-loop stop" },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.equal(d.skip, "review-loop stop (no active loop engine)");
+  });
+
 });

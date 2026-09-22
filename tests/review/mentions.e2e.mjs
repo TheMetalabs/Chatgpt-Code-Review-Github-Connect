@@ -209,3 +209,22 @@ test('a comment on a fork destination resolves the actual head instead of being 
   assert.equal((await settled(app, out.jobId)).status, 'awaiting_chat');
   assert.equal(app.githubCalls.head, 1);
 });
+
+test('a /review-loop directive on a draft is an explicit request and reaches the queue',async t=>{
+  const app=await fixture(t,{pull:{draft:true}});
+  const raw=comment(); raw.comment.body='/review-loop';
+  const out=await deliver(app,'issue_comment',raw);
+  assert.equal(out.status,202);assert.equal(out.queued,true);
+  const job=await settled(app,out.jobId);
+  assert.equal(job.status,'awaiting_chat','loop start overrides the draft skip like a mention');
+  assert.equal(job.thread?.loop?.kind,'start');
+  assert.equal(job.thread?.loop?.mode,'suggest');
+});
+test('a /review-loop stop directive is recognized but runs no review',async t=>{
+  const app=await fixture(t);
+  const raw=comment(); raw.comment.body='/review-loop stop';
+  const out=await deliver(app,'issue_comment',raw);
+  const job=app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  assert.equal(job,undefined,'stop directive does not enqueue a review job');
+  assert.equal(out.queued,false);
+});

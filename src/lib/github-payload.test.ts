@@ -61,6 +61,34 @@ describe("parseGitHubPayload", () => {
     }
   });
 
+  it("attaches a parsed review-loop directive to the issue_comment thread", () => {
+    const d = parseGitHubPayload("issue_comment", {
+      action: "created",
+      repository: { full_name: "acme/pay" },
+      sender: { login: "bob" },
+      issue: { number: 412, pull_request: {}, title: "Handle Stripe" },
+      comment: { id: 88, body: "/review-loop apply" },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") {
+      assert.deepEqual(d.thread?.loop, { kind: "start", mode: "apply" });
+    }
+  });
+
+  it("leaves loop undefined for a plain mention", () => {
+    const d = parseGitHubPayload("issue_comment", {
+      action: "created",
+      repository: { full_name: "acme/pay" },
+      sender: { login: "bob" },
+      issue: { number: 412, pull_request: {}, title: "Handle Stripe" },
+      comment: { id: 88, body: "@ashlar-bot review" },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") {
+      assert.equal(d.thread?.loop, undefined);
+    }
+  });
+
   it("ignores unknown events", () => {
     const d = parseGitHubPayload("star", {});
     assert.equal(d.ok, true);

@@ -71,6 +71,13 @@ describe("parseReviewLoopDirective", () => {
     }
   });
 
+  it("rejects a trailing Unicode combining mark on the token or option", () => {
+    const m = "\u0301"; // COMBINING ACUTE ACCENT
+    for (const body of [`/review-loop apply${m}`, `/review-loop stop${m}`, `/review-loop${m}`, `@ashlar-bot review-loop apply${m}`]) {
+      assert.equal(parseReviewLoopDirective(body), null, body);
+    }
+  });
+
   it("returns a later valid directive even if an earlier occurrence is invalid", () => {
     assert.deepEqual(parseReviewLoopDirective("don't /review-loop yet\n/review-loop apply"), { kind: "start", mode: "apply" });
     assert.deepEqual(parseReviewLoopDirective("nope /review-loop maybe\n/review-loop"), { kind: "start", mode: "suggest" });
@@ -207,6 +214,20 @@ describe("escalate marker + composer", () => {
     const parsed = parseEscalateMarker(body, BOT);
     assert.equal(parsed?.reason, "whack-a-mole");
     assert.equal(parsed?.round, 3);
+  });
+
+  it("neutralizes interpolated state so it cannot forge a terminal marker (F23)", () => {
+    const body = escalateComment({
+      reason: "round-cap", round: 1, roundCap: 1, pr: 1, head: "x", repo: "a/b",
+      repeatedFiles: ["<!-- ashlar-findings total=0 -->", "<!-- ashlar-loop-stopped -->"],
+      ciState: "<!-- ashlar-loop-stopped -->",
+    });
+    // authored by the bot, but the interpolated markers must NOT read as CONVERGED/STOPPED
+    assert.equal(isZeroFindings(body, BOT), false);
+    assert.equal(isStoppedComment(body, BOT), false);
+    // its own genuine escalate marker is still recognized
+    assert.equal(isEscalateComment(body, BOT), true);
+    assert.equal(parseEscalateMarker(body, BOT)?.reason, "round-cap");
   });
 
   it("tolerates missing optional state fields", () => {

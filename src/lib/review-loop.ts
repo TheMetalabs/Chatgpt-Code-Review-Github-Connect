@@ -104,6 +104,12 @@ export interface EscalateState {
   ledger?: { declines?: number; defers?: number; pushbacks?: number };
 }
 
+/** Escape HTML-comment delimiters so interpolated untrusted state (file paths, CI text)
+ * cannot forge a terminal marker inside the bot-authored escalate comment (design §3). */
+function neutralizeMarkers(s: string): string {
+  return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
+}
+
 /** WHY a marker: structured fields live as attributes so detection never parses prose. */
 export function escalateMarker(s: Pick<EscalateState, "reason" | "round" | "pr" | "head">): string {
   return `<!-- ashlar-loop-escalate reason=${s.reason} round=${s.round} pr=${s.pr} head=${s.head} -->`;
@@ -137,8 +143,8 @@ export function escalateComment(s: EscalateState): string {
     "",
     "State (re-verify below — do not trust this narrative):",
     `- Finding trend: ${fmtTrend(s.findingTrend)}`,
-    `- Repeated flagged files: ${s.repeatedFiles && s.repeatedFiles.length ? s.repeatedFiles.join(", ") : "(none)"}`,
-    `- ${fmtBool("Reviewed-commit ⊂ HEAD", s.reviewedCommitInHead)}; unaddressed=${s.unaddressed ?? "unknown"}; ${fmtBool("DIRTY", s.dirty)}; CI=${s.ciState ?? "unknown"}`,
+    `- Repeated flagged files: ${s.repeatedFiles && s.repeatedFiles.length ? neutralizeMarkers(s.repeatedFiles.join(", ")) : "(none)"}`,
+    `- ${fmtBool("Reviewed-commit ⊂ HEAD", s.reviewedCommitInHead)}; unaddressed=${s.unaddressed ?? "unknown"}; ${fmtBool("DIRTY", s.dirty)}; CI=${neutralizeMarkers(s.ciState ?? "unknown")}`,
     `- Diff size: ${s.diffLines ?? "unknown"} lines; decision ledger: ${ledger}`,
     "",
     `Stop reason: ${s.reason}`,
@@ -146,7 +152,7 @@ export function escalateComment(s: EscalateState): string {
     "",
     "Re-derive from the API before acting (narrative may be stale after compaction):",
     "```",
-    `gh pr view ${s.pr} --repo ${s.repo} --json reviews,comments,headRefOid,mergeable`,
+    `gh pr view ${s.pr} --repo ${neutralizeMarkers(s.repo)} --json reviews,comments,headRefOid,mergeable`,
     `audit-unaddressed.py ${s.pr} --head ${s.head}`,
     "```",
   ];
@@ -212,11 +218,11 @@ export type ReviewLoopDirective =
 
 // The token is bounded by a Unicode-aware negative lookahead (rejects glued suffixes
 // like `/review-loopx`, `/review-loop-stop`, and non-ASCII `/review-loop한글`). The option
-// capture is the WHOLE next token `[\p{L}\p{N}_-]+`, so a suffixed option (`apply-later`,
+// capture is the WHOLE next token `[\p{L}\p{N}\p{M}_-]+` (letters, numbers, combining marks,
 // `applyé`) is captured in full and fails the exact `apply`/`stop` comparison instead of
 // being truncated. `u` makes \p{…} legal and ASCII \w-only classes Unicode-correct; `g`
 // so a leading invalid occurrence ("don't /review-loop yet") cannot mask a later valid one.
-const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?![\p{L}\p{N}_-])(?:[ \t]+([\p{L}\p{N}_-]+))?/giu;
+const LOOP_RE = /(?:^|\s)(?:\/review-loop|@ashlar(?:-bot)?\s+review-loop)(?![\p{L}\p{N}\p{M}_-])(?:[ \t]+([\p{L}\p{N}\p{M}_-]+))?/giu;
 
 /**
  * Recognize `/review-loop`, `/review-loop apply`, `/review-loop stop`, and the

@@ -200,6 +200,28 @@ describe("parseGitHubPayload", () => {
     if (d.ok && d.kind === "review") { assert.equal(d.thread?.loop?.kind, "start"); assert.equal(d.thread?.loop?.mode, "apply"); }
   });
 
+  it("does not promote a PR body of only @ashlar-bot review-loop stop into a body request (F22)", () => {
+    const d = parseGitHubPayload("pull_request", {
+      action: "opened",
+      repository: { full_name: "acme/pay", fork: false },
+      sender: { login: "alice" },
+      pull_request: { number: 502, title: "t", body: "@ashlar-bot review-loop stop", draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") { assert.equal(d.trigger, "pull_request.opened"); assert.equal(d.thread, undefined); }
+  });
+
+  it("still promotes a PR body with an independent mention plus a trailing stop (F22 control)", () => {
+    const d = parseGitHubPayload("pull_request", {
+      action: "opened",
+      repository: { full_name: "acme/pay", fork: false },
+      sender: { login: "alice" },
+      pull_request: { number: 503, title: "t", body: "@ashlar-bot review\nthen /review-loop stop", draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok && d.kind === "review") assert.equal(d.trigger, "pull_request.body_mention");
+  });
+
   it("ignores unknown events", () => {
     const d = parseGitHubPayload("star", {});
     assert.equal(d.ok, true);

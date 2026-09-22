@@ -1,6 +1,6 @@
 import type { IngressTarget } from "./ingress.ts";
 import { DEFAULT_SETTINGS, type BotSettings, type JobThread, type Trigger } from "./types.ts";
-import { freshLoopDirective } from "./review-loop.ts";
+import { freshLoopDirective, stripLoopDirectives } from "./review-loop.ts";
 import { isBotMention } from "./poster.ts";
 
 const PR_ACTIONS: Record<string, Trigger> = {
@@ -64,12 +64,14 @@ export function parseGitHubPayload(event: string, raw: unknown, settings: BotSet
     // Match the full body, not the preview. Retained mentions on push/reopen/ready
     // and unrelated edits must not turn a one-shot request into auto-review.
     const previous = body.changes?.body?.from;
+    // Detect an INDEPENDENT mention from the body with loop-directive spans removed, so a
+    // mention that is part of the directive itself (@ashlar-bot review-loop stop) is not
+    // promoted to a body request — mirrors ingress's independentMention (design §2).
+    const strippedText = stripLoopDirectives(text);
+    const strippedPrev = stripLoopDirectives(previous ?? "");
     const newlyMentioned = body.action === "edited" && (typeof previous === "string" || previous === null) &&
-      !isBotMention(previous ?? "", settings) && isBotMention(text, settings);
-    // A /review-loop directive in the PR body is a fixed trigger (design §2), like a
-    // mention: honor it on open, or when it was newly added on edit — never re-review an
-    // unrelated edit to a PR whose body already carried the directive.
-    const bodyMention = (body.action === "opened" && isBotMention(text, settings)) || newlyMentioned;
+      !isBotMention(strippedPrev, settings) && isBotMention(strippedText, settings);
+    const bodyMention = (body.action === "opened" && isBotMention(strippedText, settings)) || newlyMentioned;
     // Only a START directive (suggest/apply) is a review request on PR lifecycle events; a
     // stop is a no-op here (avoids a spurious skipped job on PR open/edit). freshLoopDirective
     // also drops a directive left unchanged during an unrelated body edit.

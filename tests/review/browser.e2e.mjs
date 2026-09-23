@@ -181,6 +181,54 @@ test('real DOM recovery: missing job resumes its bound observer without a new pr
  assert.equal(b.closedTabs.length,0);
 });
 
+// Review-loop FIX items: plain-text answers (no review JSON), and the ownership proof a cancelled
+// fix tab must give before the worker may force-close it.
+test('real DOM: a fix item harvests its full plain-text answer (no review JSON) only after completion',async t=>{
+ const fixAnswer='I guarded the null path.\n{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
+ const page=await fixture(t,user+answer(`<p>${fixAnswer.replace(/\n/g,'<br>')}</p>`)+stop);
+ await page.evaluate(()=>{window.__ashlarRunnerState={kind:'fix'};});
+ await startWait(page);await page.clock.runFor(3200);
+ assert.equal((await page.evaluate(()=>waitResult)).pending,true,'Stop is visible: still generating');
+ await page.evaluate(toolbar=>{document.querySelector('[data-testid="stop-button"]').remove();document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('beforeend',toolbar);},toolbar);
+ await page.clock.runFor(3200);
+ assert.equal((await page.evaluate(()=>waitResult)).raw,fixAnswer);
+});
+test('real DOM: a cancelled fix tab is Ashlar-owned only until the user takes it over',async t=>{
+ const page=await browser.newPage();t.after(()=>page.close());
+ await page.setContent('<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">answer</div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div><button data-testid="send-button" aria-label="Send prompt">Send</button></form>');
+ await page.evaluate(()=>{
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'})]]);
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+ });
+ for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ const cancel=(extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type:'ashlar-fix-cancel',jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix',...extra});
+ assert.equal((await cancel({jobId:'fix-B'})).code,'job_mismatch');
+ assert.equal((await cancel()).owned,true,'the bound answer with no user activity is Ashlar-owned');
+ await page.locator('#prompt-textarea').evaluate(el=>{el.textContent='my own question';});
+ assert.equal((await cancel()).owned,false,'an unsent user draft preserves the tab');
+ await page.locator('#prompt-textarea').evaluate(el=>{el.textContent='';});
+ assert.equal((await cancel()).owned,true);
+ await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);});
+ assert.equal((await cancel()).owned,false,'a follow-up turn preserves the tab');
+});
+test('real DOM: before its send is confirmed, a fix tab is owned only with no turn or just its own prompt',async t=>{
+ const page=await browser.newPage();t.after(()=>page.close());
+ await page.setContent('<main></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px">fix prompt</div></form>');
+ await page.evaluate(()=>{
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'attempted',expected:'fix prompt',baseline:0})]]);
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+ });
+ for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ const cancel=()=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type:'ashlar-fix-cancel',jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix'});
+ assert.equal((await cancel()).owned,true,'only Ashlar\'s own half-sent prompt is in the tab');
+ await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='fix prompt';document.querySelector('main').append(u);});
+ assert.equal((await cancel()).owned,true,'the just-clicked, not yet confirmed turn is Ashlar\'s');
+ await page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').textContent='someone else asked this';});
+ assert.equal((await cancel()).owned,false,'a turn that is not Ashlar\'s prompt preserves the tab');
+});
+
 test('real popup: a running review and tab-capacity blocker are shown together',async t=>{
  const page=await browser.newPage();t.after(()=>page.close());
  await page.setContent(source('extension/popup.html').replace('<script src="popup.js"></script>',''));

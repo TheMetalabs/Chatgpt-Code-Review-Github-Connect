@@ -205,3 +205,50 @@ test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/
  assert.equal(pageA.isClosed(),false);assert.equal(context.pages().filter(p=>p.url().startsWith('https://chatgpt.com/')).length,2);
  assert.equal(await pageA.evaluate(()=>window.sends),1);assert.equal(app.reviews.length,1);
 });
+
+test('MV3 fix E2E: a fix prompt is answered as plain text in a chat tab; a superseded fix tab is force-closed',async t=>{
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-fix-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
+ const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
+ const extension=join(root,'extension');
+ const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,
+   channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ t.after(()=>context.close());
+ const manager=await context.newPage();await manager.goto('chrome://extensions');
+ const developerMode=manager.locator('#devMode');await developerMode.waitFor({state:'visible'});
+ assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
+ if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ await manager.close();
+ const worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
+ const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
+ const userText=p=>p.evaluate(()=>document.querySelector('[data-message-author-role="user"]')?.textContent||'');
+ const request=(pr,prompt)=>app.bridge.requestBridgeFix({owner:'fixture',repo:'fixture',pr,provider:'chatgpt',prompt});
+ // 1) The fix prompt reaches a chat tab; the answer is plain text, not review JSON.
+ const answer='Guarded the null path.\n{"summary":"guard","files":[{"path":"a.ts","content":"export const answer = 43;\\n"}],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
+ let result;
+ request(1,'FIX PROMPT for fixture#1: return the JSON object').then(value=>{result={value};},error=>{result={error};});
+ assert.equal(app.bridge.getBridgePublic().pendingFixes,1);
+ let page;
+ await eventually(async()=>{await worker.evaluate(()=>tick());page=chatPages()[0];return page&&page.evaluate(()=>window.sends===1).catch(()=>false);},'fix prompt was not submitted');
+ assert.match(await userText(page),/FIX PROMPT for fixture#1/);
+ await page.evaluate(raw=>window.reply(raw,true),answer);
+ await eventually(async()=>{await worker.evaluate(()=>tick());return result!==undefined;},'fix answer was not delivered');
+ assert.equal(result.error,undefined);assert.equal(result.value,answer);
+ await eventually(async()=>{await worker.evaluate(()=>tick());return page.isClosed();},'answered fix tab was not closed');
+ assert.equal(app.bridge.getBridgePublic().pendingFixes,0);
+ assert.equal(app.reviews.length,0);assert.equal(app.harbor.getHarbor().jobs.length,0,'a fix is never a harbor review job');
+ // 2) A newer request for the same PR supersedes a still-generating fix: that tab is force-closed.
+ let firstError;
+ request(2,'FIX PROMPT A for fixture#2').catch(error=>{firstError=error;});
+ let pageA;
+ await eventually(async()=>{await worker.evaluate(()=>tick());pageA=chatPages()[0];return pageA&&pageA.evaluate(()=>window.sends===1).catch(()=>false);},'first fix prompt was not submitted');
+ request(2,'FIX PROMPT B for fixture#2').catch(()=>{});
+ await eventually(()=>firstError!==undefined,'the older fix was not superseded');
+ assert.match(firstError.message,/superseded by a newer request for the same PR/);
+ await eventually(async()=>{await worker.evaluate(()=>tick());return pageA.isClosed();},'superseded fix tab was not force-closed');
+ let pageB;
+ await eventually(async()=>{await worker.evaluate(()=>tick());pageB=chatPages()[0];return pageB&&pageB.evaluate(()=>window.sends===1).catch(()=>false);},'the newer fix did not start');
+ assert.match(await userText(pageB),/FIX PROMPT B for fixture#2/);
+});

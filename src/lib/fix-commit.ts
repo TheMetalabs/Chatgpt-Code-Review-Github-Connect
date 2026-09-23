@@ -11,6 +11,9 @@
  * whole operation and the branch ref is NEVER moved — a partial failure leaves only orphan
  * blobs, which GitHub garbage-collects. The commit is atomic from the ref's point of view.
  * NON-GOALS: pushing to a fork's branch (the installation token can't); the caller gates forks.
+ * BOUNDARY: GitHub's REST ref update has no compare-and-swap. updateBranchRef narrows the window
+ * to one API round-trip (read ref → compare → write); the residual race is documented, and the
+ * next review re-verifies head lineage. A true CAS would need a different write path.
  */
 import type { FixFile } from "./fix-apply.ts";
 
@@ -23,8 +26,10 @@ export interface GitDataApi {
   createTree(baseTreeSha: string, entries: Array<{ path: string; sha: string }>): Promise<string>;
   /** Create a commit; returns its sha. */
   createCommit(message: string, treeSha: string, parentSha: string): Promise<string>;
-  /** Fast-forward-or-move the branch ref to the commit. */
-  updateBranchRef(branch: string, commitSha: string): Promise<void>;
+  /** Move the branch ref to the commit ONLY if it still points at expectedOldSha (the reviewed
+   * base). Implementations must check-then-write as tightly as the backend allows and throw on
+   * a mismatch, so a backward force-push is never fast-forwarded over. */
+  updateBranchRef(branch: string, commitSha: string, expectedOldSha: string): Promise<void>;
 }
 
 export type CommitResult = { ok: true; commitSha: string } | { ok: false; error: string };
@@ -42,7 +47,7 @@ export async function commitFiles(
     }
     const tree = await api.createTree(baseTree, entries);
     const commit = await api.createCommit(opts.message, tree, opts.baseCommitSha);
-    await api.updateBranchRef(opts.branch, commit);
+    await api.updateBranchRef(opts.branch, commit, opts.baseCommitSha);
     return { ok: true, commitSha: commit };
   } catch (e) {
     return { ok: false, error: (e as Error)?.message ?? String(e) };

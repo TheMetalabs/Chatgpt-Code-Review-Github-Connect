@@ -782,7 +782,17 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
       if (!out.ok || !out.data.sha) throw new Error(out.ok ? "commit has no sha" : `create commit failed (${out.status}): ${out.text}`);
       return out.data.sha;
     },
-    async updateBranchRef(branch: string, commitSha: string): Promise<void> {
+    async updateBranchRef(branch: string, commitSha: string, expectedOldSha: string): Promise<void> {
+      // No ref CAS in the REST API: read the ref immediately before the write and refuse unless
+      // it is exactly the reviewed base. force:false alone would still fast-forward over a
+      // contributor's backward force-push (our commit descends from the reviewed SHA).
+      const cur = await gh<{ object?: { sha?: string } }>(token, `${base}/ref/heads/${branch}`);
+      if (!cur.ok || !cur.data.object?.sha) {
+        throw new Error(cur.ok ? "branch ref has no sha" : `read ref failed (${cur.status}): ${cur.text}`);
+      }
+      if (cur.data.object.sha !== expectedOldSha) {
+        throw new Error(`branch moved (${expectedOldSha.slice(0, 7)} → ${cur.data.object.sha.slice(0, 7)}); refusing to update`);
+      }
       const out = await gh(token, `${base}/refs/heads/${branch}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },

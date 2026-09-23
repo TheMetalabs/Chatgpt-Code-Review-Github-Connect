@@ -74,7 +74,7 @@ function settings(mode: "suggest" | "apply" = "suggest"): BotSettings {
 }
 
 /** Fake deps: configurable review history (for the escalate engine) + fix reply + push spy. */
-function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean; liveSha?: string; movedDuringFix?: boolean } = {}) {
+function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean; liveSha?: string; movedDuringFix?: boolean; refMovedAtWrite?: boolean } = {}) {
   const posted: string[] = [];
   let committed = false;
   let headReads = 0;
@@ -125,7 +125,10 @@ function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolea
           async createCommit() {
             return "newsha";
           },
-          async updateBranchRef() {
+          async updateBranchRef(_branch: string, _sha: string, expectedOldSha: string) {
+            // the real impl reads the ref right before the write and refuses on mismatch
+            const current = opts.refMovedAtWrite ? "a".repeat(40) : HEAD;
+            if (current !== expectedOldSha) throw new Error("branch moved; refusing to update");
             committed = true;
           },
         };
@@ -161,11 +164,13 @@ describe("runPostReviewLoop gates", () => {
     assert.equal(f.posted.length, 0);
   });
 
-  it("is a no-op on a fork and on a converged (0 findings) review", async () => {
+  it("a converged review is silent; a fork is a reported halt (the user asked for a loop)", async () => {
     const f = fakeDeps();
-    assert.equal((await runPostReviewLoop("t", job({ isFork: true }), sample, settings(), [], f.deps, ENV_ON)).ran, false);
     assert.equal((await runPostReviewLoop("t", job({ findings: [] }), sample, settings(), [], f.deps, ENV_ON)).ran, false);
-    assert.equal(f.posted.length, 0);
+    assert.equal(f.posted.length, 0, "converged: nothing to report");
+    assert.equal((await runPostReviewLoop("t", job({ isFork: true }), sample, settings(), [], f.deps, ENV_ON)).ran, false);
+    assert.equal(f.posted.length, 1);
+    assert.match(f.posted[0], /halted before fix[\s\S]*fork/);
   });
 });
 
@@ -217,7 +222,8 @@ describe("runPostReviewLoop steps", () => {
     assert.equal(r.ran, false);
     if (!r.ran) assert.match(r.reason, /head moved/);
     assert.equal(f.committed, false);
-    assert.equal(f.posted.length, 0);
+    assert.equal(f.posted.length, 1, "the halt is reported in-thread (L4)");
+    assert.match(f.posted[0], /halted before fix[\s\S]*head moved/);
   });
 
   it("K1: a head move DURING the fix is caught by the pre-commit re-check (no push)", async () => {
@@ -266,6 +272,40 @@ describe("runPostReviewLoop steps", () => {
     const r = await runPostReviewLoop("t", job(), sample, settings(), [job()], f.deps, ENV_ON);
     assert.equal(r.ran, false);
     if (!r.ran) assert.match(r.reason, /boom/);
+    assert.ok(f.posted.some((b) => /halted before fix[\s\S]*boom/.test(b)), "the failure is observable in-thread (L4)");
+  });
+
+  it("L1: a backward force-push between validation and the ref write is refused (no restore)", async () => {
+    const f = fakeDeps({ rounds: [3], refMovedAtWrite: true });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    if (r.ran && r.step === "fix") {
+      assert.equal(r.outcome, "commit-failed");
+      assert.match(r.error ?? "", /branch moved/);
+      assert.equal(r.continued, false);
+    }
+    assert.equal(f.committed, false);
+  });
+
+  it("L3: an applied round continues the loop with a bot-issued directive on the new head", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    if (r.ran && r.step === "fix") assert.equal(r.continued, true);
+    assert.ok(f.posted.includes("@ashlar-bot review-loop apply"), "continuation trigger posted");
+    assert.match(f.posted[0], /Loop continues/);
+  });
+
+  it("L3: at the round cap an applied round does NOT continue (bounded)", async () => {
+    const f = fakeDeps({ rounds: [5, 4, 3] }); // strictly improving → not stuck, but 3 rounds reach cap 3
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, { ...ENV_ON, ASHLAR_LOOP_ROUND_CAP: "3" } as NodeJS.ProcessEnv);
+    if (r.ran && r.step === "fix") {
+      assert.equal(r.outcome, "applied");
+      assert.equal(r.continued, false);
+    }
+    assert.ok(!f.posted.some((b) => b.startsWith("@ashlar-bot")), "no continuation at the cap");
+    assert.match(f.posted[0], /Loop paused/);
   });
 });
 
@@ -279,6 +319,12 @@ describe("helpers", () => {
     assert.equal(loopSinceIso(job({ thread: { kind: "mention", commentId: 1, userText: "x" } }), []), undefined);
   });
 
+  it("L3: bot continuation starts stay in the human-started session", () => {
+    const human = job({ createdAt: 1000, sender: "alice" });
+    const cont = job({ createdAt: 2000, sender: "ashlar-bot-review-loop[bot]" });
+    assert.equal(loopSinceIso(cont, [human, cont], "ashlar-bot"), new Date(1000).toISOString());
+  });
+
   it("effectiveFixMode: apply only when command AND setting allow it", () => {
     assert.equal(effectiveFixMode(job({}, "apply"), settings("apply")), "apply");
     assert.equal(effectiveFixMode(job({}, "apply"), settings("suggest")), "suggest");
@@ -290,6 +336,17 @@ describe("helpers", () => {
     const s = renderFindings([finding("src/a.ts", "T")]);
     assert.match(s, /\[P1\] src\/a\.ts:3 — T/);
     assert.match(s, /root cause: missing guard/);
+  });
+
+  it("L2: builtinValidate rejects syntactically invalid TS/JS and refuses apply for unvalidated types", async () => {
+    const bad = await builtinValidate([{ path: "src/a.ts", content: "export const = 1" }]);
+    assert.equal(bad.ok, false);
+    assert.match(bad.error ?? "", /syntax error/);
+    assert.equal((await builtinValidate([{ path: "src/C.tsx", content: "export const C = () => <div />;\n" }])).ok, true);
+    assert.equal((await builtinValidate([{ path: "x.js", content: "function (" }])).ok, false);
+    const md = await builtinValidate([{ path: "README.md", content: "# hi" }]);
+    assert.equal(md.ok, false);
+    assert.match(md.error ?? "", /no deterministic validator/);
   });
 
   it("builtinValidate rejects empty content and invalid JSON files", async () => {

@@ -32,7 +32,16 @@ export interface LoopRuntimeDeps {
 export type LoopStepResult =
   | { ran: false; reason: string }
   | { ran: true; step: "escalated"; reason: string }
-  | { ran: true; step: "fix"; outcome: string; commitSha?: string; error?: string };
+  | { ran: true; step: "fix"; outcome: string; commitSha?: string; error?: string; continued?: boolean };
+
+/** Benign non-run reasons: the default off-path. Anything else is a halt the user should see. */
+export const SILENT_REASONS: readonly string[] = ["disabled", "not a /review-loop review", "not a github job", "no findings (converged)"];
+
+/** A GitHub App login ends in "[bot]"; the bot's own continuation comments carry it. */
+function isBotSender(sender: string | undefined, botUsername?: string): boolean {
+  if (!sender) return false;
+  return /\[bot\]$/i.test(sender) || (!!botUsername && sender === botUsername);
+}
 
 const DEFAULT_ROUND_CAP = 8;
 
@@ -52,13 +61,15 @@ function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
 }
 
 /** Loop session start = the CURRENT explicit /review-loop start for this PR: the most recent
- * start job at/before this job (in-memory). An older, finished session's start must not widen
- * the window, or its rounds would make a fresh session look stuck on its first review. */
-export function loopSinceIso(job: Job, allJobs: readonly Job[]): string | undefined {
+ * HUMAN-initiated start job at/before this job (in-memory). The bot's own continuation
+ * triggers (posted after an applied round) belong to the same session and never reset the
+ * window; an older, finished session's start must not widen it either. */
+export function loopSinceIso(job: Job, allJobs: readonly Job[], botUsername?: string): string | undefined {
   const starts = allJobs
     .filter(
       (j) =>
         j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && j.thread?.loop?.kind === "start" &&
+        !isBotSender(j.sender, botUsername) &&
         Number.isFinite(j.createdAt) && j.createdAt <= job.createdAt,
     )
     .map((j) => j.createdAt);
@@ -84,27 +95,60 @@ export function renderFindings(findings: readonly Finding[]): string {
     .join("\n\n");
 }
 
-/** Built-in deterministic pre-push gate for apply mode: non-empty, and JSON files must parse.
- * A typecheck-in-worktree validator is the stronger follow-up; this is the floor. */
+const SYNTAX_EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+
+function extOf(path: string): string {
+  const i = path.lastIndexOf(".");
+  return i < 0 ? "" : path.slice(i).toLowerCase();
+}
+
+type TsModule = typeof import("typescript");
+let tsModule: Promise<TsModule | null> | undefined;
+/** typescript is a devDependency present in the dev deployment; if it is not loadable, apply is
+ * refused for syntax-validated types rather than pushing unchecked source. */
+function loadTypescript(): Promise<TsModule | null> {
+  tsModule ??= import("typescript").then((m) => (m.default ?? m) as TsModule).catch(() => null);
+  return tsModule;
+}
+
+/** Built-in deterministic pre-push gate for apply mode. Every candidate file type must have an
+ * adequate validator: JSON must parse; TS/JS must have zero syntax diagnostics (TypeScript
+ * parser); any other type has no deterministic validator here and REFUSES apply (suggest still
+ * works). Non-empty content alone is never sufficient for an auto-push. */
 export const builtinValidate: FixValidate = async (files: FixFile[]) => {
   for (const f of files) {
     if (!f.content.trim()) return { ok: false, error: `${f.path}: empty content` };
-    if (f.path.endsWith(".json")) {
+    const ext = extOf(f.path);
+    if (ext === ".json") {
       try {
         JSON.parse(f.content);
       } catch (e) {
         return { ok: false, error: `${f.path}: invalid JSON (${(e as Error).message})` };
       }
+      continue;
     }
+    if (SYNTAX_EXTS.has(ext)) {
+      const ts = await loadTypescript();
+      if (!ts) return { ok: false, error: `${f.path}: no syntax validator available (typescript not loadable) — apply refused, use suggest` };
+      const kind =
+        ext === ".tsx" ? ts.ScriptKind.TSX : ext === ".jsx" ? ts.ScriptKind.JSX : ext === ".ts" ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+      const sf = ts.createSourceFile(f.path, f.content, ts.ScriptTarget.Latest, true, kind);
+      const diags = (sf as unknown as { parseDiagnostics?: readonly { messageText: string | import("typescript").DiagnosticMessageChain }[] }).parseDiagnostics ?? [];
+      if (diags.length > 0) {
+        return { ok: false, error: `${f.path}: syntax error — ${ts.flattenDiagnosticMessageText(diags[0].messageText, "\n")}` };
+      }
+      continue;
+    }
+    return { ok: false, error: `${f.path}: no deterministic validator for '${ext || "(no extension)"}' — apply refused, use suggest` };
   }
   return { ok: true };
 };
 
-function renderFixReport(res: Awaited<ReturnType<typeof runFixRound>>, mode: string): string {
+function renderFixReport(res: Awaited<ReturnType<typeof runFixRound>>, mode: string, continued = false): string {
   const files = (res.files ?? []).map((f) => `- \`${f.path}\``).join("\n");
   switch (res.outcome) {
     case "applied":
-      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha}\` (mode: ${mode}).\n\n${res.summary ?? ""}\n\nChanged:\n${files}`;
+      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha}\` (mode: ${mode}).\n\n${res.summary ?? ""}\n\nChanged:\n${files}\n\n${continued ? "Loop continues: next review requested on the new head." : "Loop paused: round cap reached — review the trend before continuing."}`;
     case "suggested":
       return `### Ashlar fix agent — suggestion (mode: ${mode})\n\n${res.summary ?? ""}\n\nProposed changes (not pushed):\n${files}\n\nApply via \`/review-loop apply\` to auto-commit.`;
     case "no-change":
@@ -158,39 +202,47 @@ export async function runPostReviewLoop(
   env: NodeJS.ProcessEnv | undefined = envOf(),
 ): Promise<LoopStepResult> {
   try {
+    // Silent gates: the default off-path (no user asked for a loop here, or nothing to do).
     if (!loopEnabled(settings, env)) return { ran: false, reason: "disabled" };
     if (job.thread?.loop?.kind !== "start") return { ran: false, reason: "not a /review-loop review" };
     if (job.origin !== "github") return { ran: false, reason: "not a github job" };
-    if (job.isFork) return { ran: false, reason: "fork PR (cannot push)" };
     const findings = job.findings ?? [];
     if (findings.length === 0) return { ran: false, reason: "no findings (converged)" };
-    if (!sample) return { ran: false, reason: "no snapshot" };
 
+    // From here the user asked for a loop: every halt is reported in-thread, never swallowed.
     const d = deps ?? (await productionDeps(settings));
     const { owner, repo, pr, headSha } = job;
+    const halt = async (reason: string): Promise<LoopStepResult> => {
+      await d.gh.createIssueComment(token, { owner, repo, pr, body: `### Ashlar review-loop — halted before fix\n\n${reason}` }).catch(() => {});
+      return { ran: false, reason };
+    };
+    if (job.isFork) return halt("fork PR: the installation token cannot push to a fork");
+    if (!sample) return halt("no head-pinned snapshot for this review");
 
     // 1) Stuck? Hand off with the fixed ESCALATE signal and stop (no fix attempt).
+    const cap = roundCap(env);
     const esc = await maybeEscalate(d.gh, token, {
       owner,
       repo,
       pr,
       head: headSha,
-      roundCap: roundCap(env),
-      sinceIso: loopSinceIso(job, allJobs),
+      roundCap: cap,
+      sinceIso: loopSinceIso(job, allJobs, settings.username),
     });
     if (esc.escalated) return { ran: true, step: "escalated", reason: esc.reason ?? "stuck" };
+    if (esc.error) return halt(`could not reconstruct the loop history: ${esc.error}`);
 
     // 2) Otherwise run ONE fix round on the head-pinned snapshot.
     const head = await d.gh.fetchPullHeadRef(token, owner, repo, pr);
-    if (head.fork) return { ran: false, reason: "fork PR (cannot push)" };
+    if (head.fork) return halt("fork PR: the installation token cannot push to a fork");
     // The live branch must still point at the reviewed SHA: a commit parented on a stale SHA
     // would fast-forward over a contributor's backward force-push. Fail closed.
-    if (head.sha !== headSha) return { ran: false, reason: `head moved (${headSha.slice(0, 7)} → ${head.sha.slice(0, 7)})` };
+    if (head.sha !== headSha) return halt(`head moved (${headSha.slice(0, 7)} → ${head.sha.slice(0, 7)}); re-run /review-loop on the new head`);
     // Editable set = the PR's CHANGED files only. sample.files also carries policy/reference
     // context fetched for the review; those stay read-only and never enter allowedPaths.
     const changed = new Set(sample.changedPaths ?? []);
     const files = (sample.files ?? []).filter((f) => changed.has(f.path)).map((f) => ({ path: f.path, content: f.content }));
-    if (files.length === 0) return { ran: false, reason: "no editable changed files in snapshot" };
+    if (files.length === 0) return halt("no editable changed files in the snapshot");
     const mode = effectiveFixMode(job, settings);
     const prompt = buildFixPrompt({
       findings: renderFindings(findings),
@@ -215,9 +267,27 @@ export async function runPostReviewLoop(
         allowedPaths: files.map((f) => f.path),
       },
     );
-    await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode) });
-    return { ran: true, step: "fix", outcome: res.outcome, commitSha: res.commitSha, error: res.error };
+    // 3) Continue the loop after an APPLIED round (the commit triggers no loop by itself — the
+    // phase-1 parser deliberately ignores a retained directive on synchronize). A fresh explicit
+    // start from the bot re-enters the loop on the new head; loopSinceIso keeps it in this
+    // session. Bounded: stop at the round cap (a strictly-improving loop reaches 0 = converged).
+    const continued = res.outcome === "applied" && esc.rounds.length < cap;
+    await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, continued) });
+    if (continued) {
+      await d.gh.createIssueComment(token, { owner, repo, pr, body: `@${settings.username} review-loop ${mode}` });
+    }
+    return { ran: true, step: "fix", outcome: res.outcome, commitSha: res.commitSha, error: res.error, continued };
   } catch (e) {
-    return { ran: false, reason: `loop step failed: ${(e as Error)?.message ?? String(e)}` };
+    const reason = `loop step failed: ${(e as Error)?.message ?? String(e)}`;
+    // Report when the user asked for a loop (deps exist past the silent gates); never throw.
+    if (deps || job.thread?.loop?.kind === "start") {
+      try {
+        const d = deps ?? (await productionDeps(settings));
+        await d.gh.createIssueComment(token, { owner: job.owner, repo: job.repo, pr: job.pr, body: `### Ashlar review-loop — halted before fix\n\n${reason}` });
+      } catch {
+        /* reporting is best-effort */
+      }
+    }
+    return { ran: false, reason };
   }
 }

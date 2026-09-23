@@ -21,8 +21,8 @@ function fakeApi(): { api: GitDataApi; calls: string[] } {
       calls.push(`commit("${message}";${treeSha};${parentSha})`);
       return "new-commit";
     },
-    async updateBranchRef(branch, commitSha) {
-      calls.push(`ref(${branch}->${commitSha})`);
+    async updateBranchRef(branch, commitSha, expectedOldSha) {
+      calls.push(`ref(${branch}:${expectedOldSha}->${commitSha})`);
     },
   };
   return { api, calls };
@@ -47,7 +47,7 @@ describe("commitFiles", () => {
       "blob(4b)",
       "tree(tree-of-base1;src/a.ts=blob-aaa,src/b.ts=blob-bbb)",
       'commit("fix: apply review";new-tree;base1)',
-      "ref(feature->new-commit)",
+      "ref(feature:base1->new-commit)", // conditional on the reviewed base
     ]);
   });
 

@@ -34,7 +34,7 @@ import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
-import { runPostReviewLoop } from "./review-loop-runtime.server.ts";
+import { runPostReviewLoop, SILENT_REASONS } from "./review-loop-runtime.server.ts";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { redactSalvagedReviewBody } from "./review-format";
 import {
@@ -1108,7 +1108,14 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   // Never start a fix round on a stale head: a commit parented on the reviewed SHA would
   // fast-forward over (and undo) a contributor's backward force-push. The runtime re-checks
   // the live head right before committing as well.
-  if (token && postedToGithub && !headMovedTo) void runPostReviewLoop(token, postedJob, sample, state.settings, state.jobs);
+  if (token && postedToGithub && !headMovedTo) {
+    void runPostReviewLoop(token, postedJob, sample, state.settings, state.jobs).then((r) => {
+      // The runtime reports halts in-thread; also leave a server-side trace so nothing is lost.
+      if (!r.ran && !SILENT_REASONS.includes(r.reason)) {
+        console.warn(`[review-loop] ${jobId}: ${r.reason}`);
+      }
+    });
+  }
 }
 
 function enqueueFromDecision(

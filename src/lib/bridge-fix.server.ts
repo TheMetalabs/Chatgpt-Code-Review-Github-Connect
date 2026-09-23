@@ -13,14 +13,16 @@
  * per-id bridge handler here for `fix-` ids.
  *
  * STATES: queued → claimed → done (resolve) | failed (reject); claimed → queued (explicit
- * release); queued | claimed → cancelled (deadline "timeout" | newer request "superseded").
+ * release); queued | claimed → cancelled (deadline "timeout" | newer request "superseded" |
+ * the caller's abort "aborted" — the loop no longer wants the fix).
  * INVARIANTS:
  *   - ONE live (queued | claimed) item per PR: a newer request for the same PR cancels the older
  *     one (its promise rejects "superseded"; the extension force-closes that tab);
  *   - at most parallelLimit() (fixAgent.parallelPrs) items are claimed at once; the rest wait
  *     queued (the cap is enforced at claim, so neither take nor a direct claim can exceed it);
  *   - every request settles exactly once: resolve on complete, reject on failure / timeout /
- *     supersede. The deadline (default 30 min, ASHLAR_FIX_CHAT_TIMEOUT_MS) spans queue AND
+ *     supersede / abort (an aborted item is cancelled like a superseded one, so the extension
+ *     force-closes its tab instead of generating an answer nobody reads). The deadline (default 30 min, ASHLAR_FIX_CHAT_TIMEOUT_MS) spans queue AND
  *     generation, so a fix is never awaited forever (fail closed → the runtime ESCALATEs);
  *   - leases mirror review items: only the lease holder refreshes / completes / fails; only the
  *     claiming Chrome profile may re-claim (its tab owns the generation); release requeues;
@@ -64,6 +66,9 @@ export interface FixRequest {
   prompt: string;
   /** Deadline override (clamped like the env value); default deps.timeoutMs(). */
   timeoutMs?: number;
+  /** The caller's cancellation (head moved, loop stopped, its own deadline): cancels the item.
+   * Already aborted → rejected up front, never queued. */
+  signal?: AbortSignal;
 }
 
 /** The `take` payload of a fix item. Review payloads omit `kind`. */
@@ -205,6 +210,12 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     settle(item, "cancelled", "timeout", { error });
   }
 
+  function abort(id: string) {
+    const item = items.get(id);
+    if (!item || !live(item)) return;
+    settle(item, "cancelled", "aborted", { error: new Error(`fix request for ${labelOf(item)} was cancelled by the review loop`) });
+  }
+
   /** Lazy deadline backstop (a late timer) + forgetting settled items. Never drops a live item. */
   function prune() {
     const now = deps.now();
@@ -224,6 +235,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     prune();
     const problem = requestProblem(req, deps.maxPromptChars());
     if (problem) return Promise.reject(new Error(problem));
+    if (req.signal?.aborted) return Promise.reject(new Error(`fix request for ${labelOf(req)} was cancelled before it was queued`));
     const key = `${req.owner.toLowerCase()}/${req.repo.toLowerCase()}#${req.pr}`;
     for (const item of items.values()) {
       if (!live(item) || item.key !== key) continue;
@@ -246,9 +258,11 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       state: "queued",
     };
     items.set(item.id, item);
-    return new Promise<string>((resolve, reject) => {
+    const answer = new Promise<string>((resolve, reject) => {
       waiters.set(item.id, { resolve, reject, timer: deps.setTimer(() => expire(item.id), timeoutMs) });
     });
+    req.signal?.addEventListener("abort", () => abort(item.id), { once: true });
+    return answer;
   }
 
   /** The oldest queued item a client may take now (none while parallelLimit() are claimed). */

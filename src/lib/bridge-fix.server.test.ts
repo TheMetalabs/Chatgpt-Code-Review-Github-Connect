@@ -207,6 +207,43 @@ describe("bridge fix registry: deadline and supersession", () => {
   });
 });
 
+describe("bridge fix registry: the caller's abort", () => {
+  it("an abort cancels a claimed item ('aborted'): rejects, reports cancelled, voids the lease", async () => {
+    const h = harness();
+    const ac = new AbortController();
+    const { promise, offer } = queueAndTake(h, { signal: ac.signal });
+    ac.abort();
+    await assert.rejects(promise, /fix request for o\/r#7 was cancelled by the review loop/);
+    assert.deepEqual(h.reg.state(offer.jobId), { active: false, status: "cancelled" });
+    assert.equal(h.timers[0].cleared, true);
+    assert.equal(h.reg.prompt(offer.jobId), null);
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "late answer", offer.leaseId), {
+      ok: false,
+      code: "lease_conflict",
+      error: "fix item was cancelled (aborted)",
+    });
+  });
+
+  it("an already-aborted signal rejects up front and never queues", async () => {
+    const h = harness();
+    const ac = new AbortController();
+    ac.abort();
+    await assert.rejects(h.reg.request({ ...REQ, signal: ac.signal }), /cancelled before it was queued/);
+    assert.equal(h.reg.peek(), undefined);
+    assert.equal(h.timers.length, 0);
+  });
+
+  it("an abort after the item settled is a no-op", async () => {
+    const h = harness();
+    const ac = new AbortController();
+    const { promise, offer } = queueAndTake(h, { signal: ac.signal });
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "ANSWER", offer.leaseId), { ok: true });
+    assert.equal(await promise, "ANSWER");
+    ac.abort();
+    assert.deepEqual(h.reg.state(offer.jobId), { active: false, status: "posted" });
+  });
+});
+
 describe("bridge fix registry: parallelPrs and ownership", () => {
   it("at most parallelPrs items are claimed at once; the rest wait queued", async () => {
     const h = harness();

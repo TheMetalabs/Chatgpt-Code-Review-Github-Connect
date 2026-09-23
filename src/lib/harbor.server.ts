@@ -1122,7 +1122,12 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   // fast-forward over (and undo) a contributor's backward force-push. The runtime re-checks
   // the live head right before committing as well.
   if (token && postedToGithub && !headMovedTo) {
-    void runPostReviewLoop(token, postedJob, sample, state.settings).then((r) => {
+    const posted = {
+      githubId,
+      comments: review.comments.map((c) => ({ findingId: c.findingId, file: c.file, body: c.body })),
+      published: [...inline, ...unanchored].map((f) => f.id),
+    };
+    void runPostReviewLoop(token, postedJob, sample, state.settings, undefined, undefined, posted).then((r) => {
       // The runtime reports halts in-thread; also leave a server-side trace so nothing is lost.
       if (!r.ran && !SILENT_REASONS.includes(r.reason)) {
         console.warn(`[review-loop] ${jobId}: ${r.reason}`);

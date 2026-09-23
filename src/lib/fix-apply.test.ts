@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isSafeFixPath, parseFixResponse } from "./fix-apply.ts";
+import { isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
 
 const ok = (raw: string) => {
   const r = parseFixResponse(raw);
@@ -90,5 +90,45 @@ describe("isSafeFixPath", () => {
     for (const p of bad) assert.equal(isSafeFixPath(p), false, JSON.stringify(p));
     assert.equal(isSafeFixPath(undefined), false);
     assert.equal(isSafeFixPath("x".repeat(401)), false);
+  });
+});
+
+describe("dispositions (advisory per-finding verdicts for the thread replies)", () => {
+  it("are parsed alongside files and on a no-change round", () => {
+    const withFiles = parseFixResponse(
+      '{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":[{"finding":"F1","action":"fixed","note":"  guarded  "}]}',
+    );
+    assert.ok(withFiles.ok);
+    if (withFiles.ok) assert.deepEqual(withFiles.fix.dispositions, [{ finding: "F1", action: "fixed", note: "guarded" }]);
+    const none = parseFixResponse('{"summary":"all false positives","files":[],"dispositions":[{"finding":"F2","action":"pushback","note":"n"}]}');
+    assert.ok(none.ok);
+    if (none.ok) assert.equal(none.fix.dispositions[0].action, "pushback");
+  });
+
+  it("malformed entries are DROPPED, never a parse failure (they cannot gate a push)", () => {
+    assert.deepEqual(parseDispositions("nope"), []);
+    assert.deepEqual(
+      parseDispositions([
+        { finding: "F1", action: "fixed", note: "ok" },
+        { finding: "F1", action: "decline", note: "dup (first wins)" },
+        { finding: "f2", action: "fixed" }, // bad id
+        { finding: "F0", action: "fixed" }, // bad id
+        { finding: "F3", action: "rewrite" }, // unknown action
+        { finding: "F4", action: "defer" }, // note missing → ""
+        null,
+      ]),
+      [
+        { finding: "F1", action: "fixed", note: "ok" },
+        { finding: "F4", action: "defer", note: "" },
+      ],
+    );
+    const r = parseFixResponse('{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":"garbage"}');
+    assert.ok(r.ok, "a garbage dispositions field does not fail the parse");
+    if (r.ok) assert.deepEqual(r.fix.dispositions, []);
+  });
+
+  it("notes are capped", () => {
+    const [d] = parseDispositions([{ finding: "F1", action: "fixed", note: "x".repeat(5000) }]);
+    assert.equal(d.note.length, 1000);
   });
 });

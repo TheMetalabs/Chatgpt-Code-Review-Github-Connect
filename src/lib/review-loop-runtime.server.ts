@@ -39,7 +39,7 @@
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import type { GitDataApi } from "./fix-commit.ts";
-import { isSafeFixPath, type FixFile } from "./fix-apply.ts";
+import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
 import {
@@ -91,6 +91,19 @@ export interface LoopRuntimeGithub extends ReviewLoopGithub {
   gitDataApi(token: string, owner: string, repo: string): GitDataApi;
   /** Repository permission of a user (admin | write | read | none). Throws on lookup failure. */
   fetchUserPermission(token: string, owner: string, repo: string, login: string): Promise<string>;
+  /** Top-level inline comments (finding threads) of one posted review. Throws on failure. */
+  listReviewThreadRoots(token: string, owner: string, repo: string, pr: number, reviewId: number): Promise<Array<{ id: number; path: string; body: string }>>;
+  /** Reply inside an inline review thread. Throws on failure. */
+  replyToReviewComment(token: string, owner: string, repo: string, pr: number, commentId: number, body: string): Promise<void>;
+}
+
+/** What harbor posted for this job: the GitHub review id, the inline comments it sent (with the
+ * finding each carries), and the PUBLISHED finding ids (inline + unanchored) — the fix acts on
+ * exactly what the humans were shown, and each posted finding thread gets its disposition. */
+export interface PostedLoopReview {
+  githubId?: number;
+  comments: Array<{ findingId: string; file: string; body: string }>;
+  published?: string[];
 }
 
 export interface LoopRuntimeDeps {
@@ -250,14 +263,60 @@ export function effectiveLoopMode(sessionMode: ReviewLoopMode | undefined, setti
   return sessionMode === "apply" && settings.fixAgent.mode === "apply" ? "apply" : "suggest";
 }
 
-/** Deterministic, model-free rendering of the posted findings for the fix prompt. */
+/** Deterministic, model-free rendering of the posted findings for the fix prompt. Each finding
+ * carries a stable prompt ID (F1…Fn, in order) that the agent's dispositions refer back to. */
 export function renderFindings(findings: readonly Finding[]): string {
   return findings
     .map(
-      (f) =>
-        `[${f.severity}] ${f.file}:${f.line} — ${f.title}\n  scenario: ${f.failureScenario}\n  root cause: ${f.rootCause}\n  fix: ${f.recommendedFix}`,
+      (f, i) =>
+        `[F${i + 1}] [${f.severity}] ${f.file}:${f.line} — ${f.title}\n  scenario: ${f.failureScenario}\n  root cause: ${f.rootCause}\n  fix: ${f.recommendedFix}`,
     )
     .join("\n\n");
+}
+
+// ── Per-finding thread replies (design §5 step 6) ─────────────────────────────
+// WHY: a summary comment leaves every inline finding UNADDRESSED, so a driver that requires
+// "clean review + 0 unaddressed" can never see CONVERGED. Each posted finding thread gets one
+// deterministic reply with the agent's disposition. Notes are model text: markers are
+// neutralized and @-mentions defanged (a reply must never ping a user or forge a signal).
+
+const REPLY_NOTE_MAX = 600;
+
+const ACTION_LABEL: Record<FixDisposition["action"], string> = {
+  fixed: "Fixed",
+  pushback: "Pushed back",
+  decline: "Declined",
+  defer: "Deferred",
+};
+
+/** One fixed-format reply per finding. `commitSha` is set when this round's commit landed. */
+export function threadReplyBody(d: FixDisposition | undefined, round: number, commitSha?: string): string {
+  const where = commitSha ? ` in \`${commitSha.slice(0, 7)}\`` : "";
+  if (!d) {
+    return commitSha
+      ? `Processed by the Ashlar fix agent${where} (round ${round}); no per-finding note — the next review re-checks it.`
+      : `No change by the Ashlar fix agent (round ${round}); no per-finding note — see the loop handoff.`;
+  }
+  const verb = d.action === "fixed" && !commitSha ? "Marked fixed (no commit)" : ACTION_LABEL[d.action];
+  const note = sanitizeUntrusted(d.note, { oneLine: true, max: REPLY_NOTE_MAX });
+  return `${verb} by the Ashlar fix agent${d.action === "fixed" ? where : ""} (round ${round})${note ? `: ${note}` : "."}`;
+}
+
+/** Map each posted finding to its live thread root: exact (path, body) match against the review's
+ * actual comments (GitHub may drop comments it cannot anchor — those get no reply). */
+function mapFindingThreads(
+  posted: PostedLoopReview["comments"],
+  roots: ReadonlyArray<{ id: number; path: string; body: string }>,
+): Map<string, number> {
+  const used = new Set<number>();
+  const out = new Map<string, number>();
+  for (const c of posted) {
+    const root = roots.find((r) => !used.has(r.id) && r.path === c.file && r.body === c.body);
+    if (!root) continue;
+    used.add(root.id);
+    out.set(c.findingId, root.id);
+  }
+  return out;
 }
 
 const SYNTAX_EXTS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -345,10 +404,17 @@ function endedWhy(s: LoopSession): Exclude<Moot, "head" | "newer"> {
  * next review could not be requested. */
 type ContinuationStatus = { ok: true } | { ok: false; ended: Exclude<Moot, "head"> } | { ok: false; error: string };
 
-function renderFixReport(res: FixRoundResult, mode: string, attempts: number, continuation?: ContinuationStatus): string {
+function renderFixReport(
+  res: FixRoundResult,
+  mode: string,
+  attempts: number,
+  continuation?: ContinuationStatus,
+  replies?: { ok: number; failed: number },
+): string {
   const files = (res.files ?? []).map((f) => `- \`${sanitizeModelText(f.path, { oneLine: true, max: 300 })}\``).join("\n");
   const tries = attempts > 1 ? `, attempt ${attempts}` : "";
   const summary = sanitizeModelText(res.summary);
+  const threads = replies && replies.failed > 0 ? `\n\nThread replies: ${replies.ok} posted, ${replies.failed} failed.` : "";
   switch (res.outcome) {
     case "applied": {
       const tail = !continuation || continuation.ok
@@ -358,12 +424,12 @@ function renderFixReport(res: FixRoundResult, mode: string, attempts: number, co
             ? "Loop stopped by the operator: no further review is requested."
             : `The loop ended meanwhile (${MOOT_TEXT[continuation.ended]}): no further review is requested.`
           : `The next review could not be requested (${sanitizeModelText(continuation.error, { oneLine: true, max: 300 })}); see the loop handoff.`;
-      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha ?? "(unknown)"}\` (mode: ${mode}${tries}).\n\n${summary}\n\nChanged:\n${files}\n\n${tail}`;
+      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha ?? "(unknown)"}\` (mode: ${mode}${tries}).\n\n${summary}\n\nChanged:\n${files}\n\n${tail}${threads}`;
     }
     case "suggested":
       return `### Ashlar fix agent — suggestion (mode: ${mode}${tries})\n\n${summary}\n\nProposed changes (not pushed):\n${files}\n\nApply them and push — the loop continues on your push (use apply mode to auto-commit).`;
     case "no-change":
-      return `### Ashlar fix agent — no change\n\n${summary || "All findings were pushed back / declined / deferred."}`;
+      return `### Ashlar fix agent — no change\n\n${summary || "All findings were pushed back / declined / deferred."}${threads}`;
     default:
       return `### Ashlar fix agent — ${res.outcome}\n\n${sanitizeModelText(res.error, { oneLine: true, max: 500 })}`;
   }
@@ -387,6 +453,8 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
     fetchPullHeadRef: github.fetchPullHeadRef,
     gitDataApi: github.gitDataApi,
     fetchUserPermission: github.fetchUserPermission,
+    listReviewThreadRoots: github.listReviewThreadRoots,
+    replyToReviewComment: github.replyToReviewComment,
   };
   const gh = productionGh;
   // First provider: local (a plain request/response). chatgpt/grok ride the bridge's
@@ -523,12 +591,16 @@ export async function runPostReviewLoop(
   settings: BotSettings,
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
+  posted?: PostedLoopReview,
 ): Promise<LoopStepResult> {
   // Silent gates: the default off-path (no fix agent) or nothing to do. A zero-finding review
   // is CONVERGED — its clean review (total=0) is the terminal signal and ends the session.
   if (!loopEnabled(settings, env)) return { ran: false, reason: "disabled" };
   if (job.origin !== "github") return { ran: false, reason: "not a github job" };
-  const findings = job.findings ?? [];
+  // Fix exactly what was PUBLISHED: findings the precision policy withheld were never shown to
+  // a human, and "fixing" them would chase possible false positives in unreviewable commits.
+  const published = posted?.published ? new Set(posted.published) : undefined;
+  const findings = (job.findings ?? []).filter((f) => !published || published.has(f.id));
   if (findings.length === 0) return { ran: false, reason: "no findings (converged)" };
 
   const { owner, repo, pr, headSha } = job;
@@ -742,6 +814,30 @@ export async function runPostReviewLoop(
       }
       return { ok: true };
     };
+    // Per-finding thread replies: best effort (a failed reply never fails the round), counted.
+    const replyToThreads = async (dispositions: FixDisposition[] | undefined, commitSha?: string): Promise<{ ok: number; failed: number }> => {
+      const tally = { ok: 0, failed: 0 };
+      if (!posted?.githubId || posted.comments.length === 0) return tally;
+      let threads: Map<string, number>;
+      try {
+        threads = mapFindingThreads(posted.comments, await gh.listReviewThreadRoots(token, owner, repo, pr, posted.githubId));
+      } catch {
+        tally.failed = posted.comments.length;
+        return tally;
+      }
+      const byId = new Map((dispositions ?? []).map((x) => [x.finding, x]));
+      for (const [i, f] of findings.entries()) {
+        const threadId = threads.get(f.id);
+        if (threadId === undefined) continue;
+        try {
+          await gh.replyToReviewComment(token, owner, repo, pr, threadId, threadReplyBody(byId.get(`F${i + 1}`), rounds.length, commitSha));
+          tally.ok += 1;
+        } catch {
+          tally.failed += 1;
+        }
+      }
+      return tally;
+    };
     const maxAttempts = fixAttempts(env);
     const deps2 = d;
     // The provider call runs under the watcher: the deadline excludes queue time, and a queued (or
@@ -814,7 +910,9 @@ export async function runPostReviewLoop(
         const c = await ensureContinuation(gh, token, ref, { head: newHead, mode, sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, round: rounds.length + 1, sleep });
         status = c.posted || c.exists ? { ok: true } : { ok: false, error: c.error ?? "the continuation was not posted" };
       }
-      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status) }).catch(() => {
+      // The commit landed: every posted finding thread gets its disposition (addressed).
+      const replies = await replyToThreads(done.dispositions, newHead ?? done.commitSha);
+      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status, replies) }).catch(() => {
         /* the report is informational; the continuation / handoff carries the signal */
       });
       if (status.ok) trace(job.id, "continued", { commit: newHead?.slice(0, 7), round: rounds.length + 1 });
@@ -835,8 +933,10 @@ export async function runPostReviewLoop(
       return { ran: true, step: "fix", outcome: res.outcome, continued: false, attempts };
     }
     if (res.outcome === "no-change") {
-      // The agent's full rationale stays visible (sanitized); the handoff carries the signal.
-      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts) });
+      // Each thread gets the agent's push-back / decline / defer; the full rationale stays
+      // visible (sanitized) in the report; the handoff carries the fixed signal.
+      const replies = await replyToThreads(res.dispositions);
+      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts, undefined, replies) });
       return await escalate("fix-declined", `no-change: ${sanitizeModelText(res.summary ?? "every finding was pushed back / declined / deferred", { oneLine: true, max: 500 })}`);
     }
     return await escalate("fix-failed", `${res.outcome} after ${attempts} attempt(s): ${sanitizeModelText(res.error ?? "no error detail", { oneLine: true, max: 500 })}`);

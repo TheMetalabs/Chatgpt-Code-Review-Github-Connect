@@ -13,6 +13,8 @@
  * truncated content, or content over the size cap. It never partially accepts.
  * NON-GOALS (owned elsewhere): semantic correctness of the fix (the validate/CI gate, §7);
  * choosing script-apply vs the coding-agent fallback for oversized files (the caller/§6).
+ * Per-finding `dispositions` are ADVISORY metadata for the thread replies (design §5 step 6):
+ * malformed entries are dropped, never a parse failure — they cannot gate or change a push.
  */
 import { lastJsonObject } from "./extract-chat-json.ts";
 
@@ -21,9 +23,41 @@ export interface FixFile {
   content: string; // the COMPLETE new file content (overwrite), never a diff
 }
 
+export type DispositionAction = "fixed" | "pushback" | "decline" | "defer";
+
+/** The agent's verdict on one finding (by its prompt ID "F<n>"), for the in-thread reply. */
+export interface FixDisposition {
+  finding: string;
+  action: DispositionAction;
+  note: string;
+}
+
 export interface FixResponse {
   summary: string;
   files: FixFile[];
+  dispositions: FixDisposition[];
+}
+
+const DISPOSITION_ACTIONS: readonly DispositionAction[] = ["fixed", "pushback", "decline", "defer"];
+const FINDING_ID_RE = /^F[1-9]\d{0,3}$/;
+const NOTE_MAX = 1000;
+
+/** Keep well-formed entries only (first per finding); anything else is dropped, not fatal. */
+export function parseDispositions(raw: unknown): FixDisposition[] {
+  if (!Array.isArray(raw)) return [];
+  const out: FixDisposition[] = [];
+  const seen = new Set<string>();
+  for (const e of raw) {
+    if (!e || typeof e !== "object") continue;
+    const finding = (e as { finding?: unknown }).finding;
+    const action = (e as { action?: unknown }).action;
+    const note = (e as { note?: unknown }).note;
+    if (typeof finding !== "string" || !FINDING_ID_RE.test(finding) || seen.has(finding)) continue;
+    if (typeof action !== "string" || !(DISPOSITION_ACTIONS as readonly string[]).includes(action)) continue;
+    seen.add(finding);
+    out.push({ finding, action: action as DispositionAction, note: typeof note === "string" ? note.trim().slice(0, NOTE_MAX) : "" });
+  }
+  return out;
 }
 
 export type FixParse = { ok: true; fix: FixResponse } | { ok: false; error: string };
@@ -100,11 +134,12 @@ export function parseFixResponse(raw: string): FixParse {
     return { ok: false, error: "no files array in fix response" };
   }
   const summaryRaw = typeof (parsed as { summary?: unknown }).summary === "string" ? (parsed as { summary: string }).summary : "";
+  const dispositions = parseDispositions((parsed as { dispositions?: unknown }).dispositions);
   if (filesRaw.length === 0) {
     // A no-change round is valid ONLY when the agent gave a rationale (push-back/decline/defer of
     // every finding); a bare empty response with no summary is malformed → fail closed.
     if (summaryRaw.trim().length === 0) return { ok: false, error: "empty response (no files, no rationale)" };
-    return { ok: true, fix: { summary: summaryRaw, files: [] } };
+    return { ok: true, fix: { summary: summaryRaw, files: [], dispositions } };
   }
   const seen = new Set<string>();
   const files: FixFile[] = [];
@@ -131,6 +166,5 @@ export function parseFixResponse(raw: string): FixParse {
   if (totalBytes > MAX_TOTAL_BYTES) {
     return { ok: false, error: `change set exceeds ${MAX_TOTAL_BYTES} bytes total` };
   }
-  const summary = typeof (parsed as { summary?: unknown }).summary === "string" ? (parsed as { summary: string }).summary : "";
-  return { ok: true, fix: { summary, files } };
+  return { ok: true, fix: { summary: summaryRaw, files, dispositions } };
 }

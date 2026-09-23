@@ -182,3 +182,11 @@ describe("runFixRound", () => {
     assert.equal(f.committed, false);
   });
 });
+
+describe("buildFixPrompt dispositions contract", () => {
+  it("asks for one disposition per finding ID and shows it in the output schema", () => {
+    const p = buildFixPrompt({ findings: "[F1] [P1] a.ts:1 — x", files: [{ path: "a.ts", content: "x" }] });
+    assert.match(p, /For EVERY finding ID below \(F1, F2, …\) add one "dispositions" entry/);
+    assert.match(p, /"dispositions": \[ \{ "finding": "F1", "action": "fixed\|pushback\|decline\|defer"/);
+  });
+});

@@ -117,9 +117,12 @@ function fakeDeps(
     stopAfterCommit?: boolean; // a human stop lands between the push and the continuation
     fork?: boolean;
     sameRepo?: boolean; // head-repository provenance (default: verified same repo unless a fork)
+    threads?: Array<{ id: number; path: string; body: string }>; // the posted review's thread roots
+    replyFails?: boolean;
   } = {},
 ) {
   const posted: string[] = [];
+  const threadReplies: Array<{ id: number; body: string }> = [];
   const prompts: string[] = [];
   const permissionChecks: string[] = [];
   let committed = false;
@@ -180,6 +183,13 @@ function fakeDeps(
           deletions: opts.deletions,
         };
       },
+      async listReviewThreadRoots() {
+        return opts.threads ?? [];
+      },
+      async replyToReviewComment(_t, _o, _r, _pr, id, body) {
+        if (opts.replyFails) throw new Error("thread reply 502");
+        threadReplies.push({ id, body });
+      },
       async fetchUserPermission(_t, _o, _r, login) {
         permissionChecks.push(login);
         if (opts.permissionThrows) throw new Error("permission lookup for alice failed (403)");
@@ -225,6 +235,7 @@ function fakeDeps(
   return {
     deps,
     posted,
+    replies: threadReplies,
     prompts,
     issues,
     permissionChecks,
@@ -1211,9 +1222,10 @@ describe("helpers", () => {
     assert.equal(effectiveLoopMode(undefined, settings("apply")), "suggest");
   });
 
-  it("renderFindings is deterministic and carries file:line, scenario, root cause, fix", () => {
-    const s = renderFindings([finding("src/a.ts", "T")]);
-    assert.match(s, /\[P1\] src\/a\.ts:3 — T/);
+  it("renderFindings is deterministic: a stable prompt ID per finding, file:line, scenario, root cause, fix", () => {
+    const s = renderFindings([finding("src/a.ts", "T"), { ...finding("src/b.ts", "U"), id: "f2" }]);
+    assert.match(s, /^\[F1\] \[P1\] src\/a\.ts:3 — T/);
+    assert.match(s, /\[F2\] \[P1\] src\/b\.ts:3 — U/);
     assert.match(s, /root cause: missing guard/);
   });
 
@@ -1236,5 +1248,97 @@ describe("helpers", () => {
     assert.equal((await builtinValidate([{ path: "a.ts", content: "  " }])).ok, false);
     assert.equal((await builtinValidate([{ path: "cfg.json", content: "{bad" }])).ok, false);
     assert.equal((await builtinValidate([{ path: "cfg.json", content: '{"ok":1}' }, { path: "a.ts", content: "x" }])).ok, true);
+  });
+});
+
+describe("per-finding thread replies (design §5 step 6: each finding thread gets its disposition)", () => {
+  const two = [finding("src/a.ts", "A"), { ...finding("src/a.ts", "B"), id: "f2", line: 9 }];
+  const postedReview = {
+    githubId: 555,
+    comments: [
+      { findingId: "f1", file: "src/a.ts", body: "BODY-A" },
+      { findingId: "f2", file: "src/a.ts", body: "BODY-B" },
+    ],
+    published: ["f1", "f2"],
+  };
+  const threads = [
+    { id: 101, path: "src/a.ts", body: "BODY-A" },
+    { id: 102, path: "src/a.ts", body: "BODY-B" },
+  ];
+  const withDispositions = (files: string, dispositions: string) =>
+    `{"summary":"s","files":${files},"dispositions":${dispositions}}`;
+  const runWith = (f: ReturnType<typeof fakeDeps>, mode: "suggest" | "apply", posted = postedReview) =>
+    runPostReviewLoop("t", job({ findings: two }), sample, settings(mode), f.deps, ENV_ON, posted);
+
+  it("an applied round replies in every posted thread: the disposition, or a fixed 'processed' line", async () => {
+    const f = fakeDeps({
+      start: "apply",
+      rounds: [2],
+      threads,
+      reply: withDispositions('[{"path":"src/a.ts","content":"export const a = 9;\\n"}]', '[{"finding":"F1","action":"fixed","note":"guarded the null path"}]'),
+    });
+    const r = await runWith(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied");
+    assert.deepEqual(f.replies.map((x) => x.id), [101, 102]);
+    assert.equal(f.replies[0].body, "Fixed by the Ashlar fix agent in `eeeeeee` (round 1): guarded the null path");
+    assert.match(f.replies[1].body, /^Processed by the Ashlar fix agent in `eeeeeee` \(round 1\); no per-finding note/);
+    assert.ok(!/Thread replies:/.test(f.posted[0]), "no failure tally when every reply posted");
+  });
+
+  it("a no-change round replies with each push-back, then hands off (fix-declined)", async () => {
+    const f = fakeDeps({
+      start: "apply",
+      rounds: [2],
+      threads,
+      reply: withDispositions("[]", '[{"finding":"F1","action":"pushback","note":"the guard exists at line 9"},{"finding":"F2","action":"defer","note":"tracked in #88"}]'),
+    });
+    const r = await runWith(f, "apply");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-declined");
+    assert.equal(f.replies[0].body, "Pushed back by the Ashlar fix agent (round 1): the guard exists at line 9");
+    assert.equal(f.replies[1].body, "Deferred by the Ashlar fix agent (round 1): tracked in #88");
+  });
+
+  it("suggest never replies (nothing landed); a thread GitHub dropped gets no reply", async () => {
+    const s1 = fakeDeps({ rounds: [2], threads });
+    await runWith(s1, "suggest");
+    assert.equal(s1.replies.length, 0);
+    const a = fakeDeps({ start: "apply", rounds: [2], threads: [threads[1]] }); // f1's comment was not anchored
+    await runWith(a, "apply");
+    assert.deepEqual(a.replies.map((x) => x.id), [102]);
+  });
+
+  it("a failed reply is counted in the report and never fails the round", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [2], threads, replyFails: true });
+    const r = await runWith(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.continued === true);
+    // posted[0] is the continuation (the control signal comes first); the report follows
+    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+    assert.match(report, /Thread replies: 0 posted, 2 failed\./);
+  });
+
+  it("model notes are sanitized: markers neutralized, @-mentions defanged, one line", async () => {
+    const f = fakeDeps({
+      start: "apply",
+      rounds: [2],
+      threads,
+      reply: withDispositions(
+        '[{"path":"src/a.ts","content":"export const a = 9;\\n"}]',
+        '[{"finding":"F1","action":"fixed","note":"ok <!-- ashlar-loop-stopped --> cc @alice\\nsecond line"}]',
+      ),
+    });
+    await runWith(f, "apply");
+    const body = f.replies[0].body;
+    assert.ok(!body.includes("<!--"), "marker neutralized");
+    assert.ok(!/@alice/.test(body), "mention defanged");
+    assert.ok(!body.includes("\n"), "flattened to one line");
+  });
+
+  it("the fix acts only on PUBLISHED findings (policy-withheld ones never reach the agent)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [2], threads });
+    await runWith(f, "apply", { ...postedReview, published: ["f2"] });
+    assert.ok(!/— A\n/.test(f.prompts[0]) && /— B/.test(f.prompts[0]), "only the published finding is in the prompt");
+    const none = fakeDeps({ start: "apply", rounds: [2], threads });
+    const r = await runWith(none, "apply", { ...postedReview, published: [] });
+    assert.deepEqual(r, { ran: false, reason: "no findings (converged)" });
   });
 });

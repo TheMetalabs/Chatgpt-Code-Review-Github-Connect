@@ -1,6 +1,31 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { parseGitHubPayload } from "./github-payload.ts";
+import { continueComment } from "./review-loop.ts";
+
+const BOT = "ashlar-bot-review-loop[bot]";
+const SHA40 = "0123456789abcdef0123456789abcdef01234567";
+
+function issueComment(sender: string, body: string, over: Record<string, unknown> = {}) {
+  return {
+    action: "created",
+    repository: { full_name: "acme/pay" },
+    sender: { login: sender },
+    issue: { number: 412, pull_request: {}, title: "Handle Stripe" },
+    comment: { id: 88, body },
+    ...over,
+  };
+}
+
+function reviewComment(sender: string, body: string) {
+  return {
+    action: "created",
+    repository: { full_name: "acme/pay" },
+    sender: { login: sender },
+    pull_request: { number: 412, title: "t", head: { sha: SHA40, repo: { fork: false } }, base: { sha: "b" } },
+    comment: { id: 99, body },
+  };
+}
 
 describe("parseGitHubPayload", () => {
   it("parses ping", () => {
@@ -237,5 +262,75 @@ describe("parseGitHubPayload", () => {
     const d = parseGitHubPayload("star", {});
     assert.equal(d.ok, true);
     if (d.ok) assert.equal(d.kind, "ignore");
+  });
+
+  describe("self-trigger guard (a comment authored by the App is never a command)", () => {
+    it("ignores the bot's own inline finding that QUOTES a loop directive (the #72 incident)", () => {
+      const body = "**Honor the /review-loop command mode**\n\nWith /review-loop apply enabled, the fix pr…";
+      const d = parseGitHubPayload("pull_request_review_comment", reviewComment(BOT, body));
+      assert.equal(d.ok, true);
+      if (d.ok) assert.equal(d.kind, "ignore");
+      // the same text from a human is still a directive (the guard is identity-based, not text-based)
+      const human = parseGitHubPayload("pull_request_review_comment", reviewComment("alice", body));
+      assert.ok(human.ok && human.kind === "review" && human.thread?.loop?.kind === "start");
+    });
+
+    it("ignores the bot's own issue comments, including @-mentions and edits (ops updates)", () => {
+      for (const payload of [
+        issueComment(BOT, "@ashlar-bot review"),
+        issueComment(BOT, "Apply via /review-loop apply to auto-commit."),
+        issueComment(BOT, "@ashlar-bot review", { action: "edited", changes: { body: { from: "x" } } }),
+      ]) {
+        const d = parseGitHubPayload("issue_comment", payload);
+        assert.equal(d.ok, true);
+        if (d.ok) assert.equal(d.kind, "ignore");
+      }
+    });
+
+    it("accepts ONLY the driver's continuation marker as a loop start (created, same PR)", () => {
+      const body = continueComment({ mode: "apply", round: 2, pr: 412, head: SHA40 });
+      const d = parseGitHubPayload("issue_comment", issueComment(BOT, body));
+      assert.ok(d.ok && d.kind === "review");
+      if (d.ok && d.kind === "review") {
+        assert.equal(d.trigger, "issue_comment.mention");
+        assert.deepEqual(d.thread?.loop, { kind: "start", mode: "apply" });
+        assert.equal(d.thread?.commentId, 88);
+      }
+      // another PR's marker, or an edit of the continuation, is not a trigger
+      const otherPr = continueComment({ mode: "apply", round: 2, pr: 999, head: SHA40 });
+      const wrong = parseGitHubPayload("issue_comment", issueComment(BOT, otherPr));
+      assert.ok(wrong.ok && wrong.kind === "ignore");
+      const edited = parseGitHubPayload("issue_comment", issueComment(BOT, body, { action: "edited", changes: { body: { from: "" } } }));
+      assert.ok(edited.ok && edited.kind === "ignore");
+    });
+
+    it("a human comment carrying a continuation marker gets no loop start from the marker", () => {
+      const body = continueComment({ mode: "apply", round: 2, pr: 412, head: SHA40 });
+      const d = parseGitHubPayload("issue_comment", issueComment("mallory", body));
+      assert.ok(d.ok && d.kind === "review");
+      if (d.ok && d.kind === "review") assert.equal(d.thread?.loop, undefined);
+    });
+
+    it("a self-authored PR body edit is not a command; the bot's push still parses as synchronize", () => {
+      const pr = (action: string, bodyText: string, from?: string) => ({
+        action,
+        repository: { full_name: "acme/pay" },
+        sender: { login: BOT },
+        ...(from !== undefined ? { changes: { body: { from } } } : {}),
+        pull_request: { number: 412, title: "t", body: bodyText, head: { sha: SHA40, repo: { fork: false } }, base: { sha: "b" }, user: { login: "alice" } },
+      });
+      const edit = parseGitHubPayload("pull_request", pr("edited", "/review-loop apply", ""));
+      assert.ok(edit.ok && edit.kind === "ignore");
+      const push = parseGitHubPayload("pull_request", pr("synchronize", "/review-loop apply"));
+      assert.ok(push.ok && push.kind === "review" && push.trigger === "pull_request.synchronize");
+    });
+
+    it("honors a configured bot login (and only that login is self)", () => {
+      const q = "@ashlar-bot review";
+      const custom = parseGitHubPayload("issue_comment", issueComment("other-app[bot]", q), undefined, { botLogin: "other-app[bot]" });
+      assert.ok(custom.ok && custom.kind === "ignore");
+      const notSelf = parseGitHubPayload("issue_comment", issueComment(BOT, q), undefined, { botLogin: "other-app[bot]" });
+      assert.ok(notSelf.ok && notSelf.kind === "review");
+    });
   });
 });

@@ -17,11 +17,17 @@
  */
 import {
   classifyStuck,
+  DEFAULT_ASHLAR_BOT_LOGIN,
   escalateFromRounds,
+  isSelfLogin,
   parseEscalateMarker,
   type EscalateReason,
   type RoundSummary,
 } from "./review-loop.ts";
+
+// Single source of the App identity lives in review-loop.ts (shared with the webhook parser's
+// self-trigger guard); re-exported here for existing engine callers.
+export { DEFAULT_ASHLAR_BOT_LOGIN };
 
 export interface ReviewLoopGithub {
   listPullReviews(
@@ -53,12 +59,8 @@ export interface ReviewLoopGithub {
 
 const FINDINGS_RE = /<!--\s*ashlar-findings\s+(.+?)\s*-->/;
 
-/** The exact GitHub App bot login. Substring matching is unsafe — an account like
- * "ashlar-fan" could forge findings / suppress an escalation. */
-export const DEFAULT_ASHLAR_BOT_LOGIN = "ashlar-bot-review-loop[bot]";
-
 function isBot(login: string, botLogin: string): boolean {
-  return login.toLowerCase() === botLogin.toLowerCase();
+  return isSelfLogin(login, botLogin);
 }
 
 

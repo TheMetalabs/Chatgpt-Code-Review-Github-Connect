@@ -19,6 +19,13 @@ import {
   classifyStuck,
   escalateFromRounds,
   repeatedRoundFiles,
+  DEFAULT_ASHLAR_BOT_LOGIN,
+  resolveBotLogin,
+  isSelfLogin,
+  continueComment,
+  continueMarker,
+  parseContinueMarker,
+  REVIEW_LOOP_CONTINUE_HUMAN,
   type RoundSummary,
   type EscalateReason,
 } from "./review-loop.ts";
@@ -324,5 +331,54 @@ describe("classifyStuck", () => {
     assert.ok(body.includes(ESCALATE_DIRECTIVE["whack-a-mole"]));
     assert.ok(body.includes("R1=6 R2=4 R3=3 R4=4 R5=3 R6=3 (decreasing)"));
     assert.deepEqual(repeatedRoundFiles(pr68), ["src/lib/github-payload.ts", "src/lib/ingress.ts", "src/lib/review-loop.ts"]);
+  });
+});
+
+describe("self identity + loop continuation (the bot never commands itself)", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+
+  it("resolveBotLogin honors only the App-reserved <slug>[bot] shape", () => {
+    assert.equal(resolveBotLogin("other-app[bot]"), "other-app[bot]");
+    assert.equal(resolveBotLogin("  other-app[bot]  "), "other-app[bot]");
+    // a human-shaped login must never be treated as the bot (would silence + let them forge)
+    assert.equal(resolveBotLogin("ashlar-bot"), DEFAULT_ASHLAR_BOT_LOGIN);
+    assert.equal(resolveBotLogin("evil[bot] x"), DEFAULT_ASHLAR_BOT_LOGIN);
+    assert.equal(resolveBotLogin(""), DEFAULT_ASHLAR_BOT_LOGIN);
+    assert.equal(resolveBotLogin(undefined), DEFAULT_ASHLAR_BOT_LOGIN);
+  });
+
+  it("isSelfLogin is exact (case-insensitive), never a substring match", () => {
+    assert.equal(isSelfLogin("Ashlar-Bot-Review-Loop[bot]"), true);
+    assert.equal(isSelfLogin("ashlar-bot-review-loop"), false);
+    assert.equal(isSelfLogin("ashlar-fan"), false);
+    assert.equal(isSelfLogin(undefined), false);
+    assert.equal(isSelfLogin("other-app[bot]", "other-app[bot]"), true);
+  });
+
+  it("continuation round-trips through the fixed marker and carries no prose trigger", () => {
+    const c = { mode: "apply" as const, round: 3, pr: 72, head: SHA };
+    const body = continueComment(c);
+    assert.ok(body.startsWith(continueMarker(c)));
+    assert.ok(body.includes(REVIEW_LOOP_CONTINUE_HUMAN));
+    assert.deepEqual(parseContinueMarker(body, { authoredByBot: true }), c);
+    // the comment itself is not a directive/mention — only the marker (bot-authored) continues
+    assert.equal(parseReviewLoopDirective(body), null);
+    assert.equal(/@ashlar/i.test(body), false);
+  });
+
+  it("parseContinueMarker trusts only bot-authored, well-formed markers", () => {
+    const body = continueComment({ mode: "suggest", round: 1, pr: 5, head: SHA });
+    assert.equal(parseContinueMarker(body, { authoredByBot: false }), null);
+    assert.equal(parseContinueMarker(body.replace(SHA, SHA.slice(0, 7)), { authoredByBot: true }), null);
+    assert.equal(parseContinueMarker(body.replace(SHA, SHA.toUpperCase()), { authoredByBot: true }), null);
+    assert.equal(parseContinueMarker(body.replace("mode=suggest", "mode=stop"), { authoredByBot: true }), null);
+    assert.equal(parseContinueMarker(body.replace("round=1", "round=0"), { authoredByBot: true }), null);
+    assert.equal(parseContinueMarker("no marker here", { authoredByBot: true }), null);
+  });
+
+  it("continueComment refuses to compose a marker the parser would reject", () => {
+    assert.throws(() => continueComment({ mode: "apply", round: 2, pr: 7, head: "newsha" }), /invalid loop continuation/);
+    assert.throws(() => continueComment({ mode: "apply", round: 0, pr: 7, head: SHA }), /invalid loop continuation/);
+    assert.throws(() => continueComment({ mode: "apply", round: 2, pr: 0, head: SHA }), /invalid loop continuation/);
   });
 });

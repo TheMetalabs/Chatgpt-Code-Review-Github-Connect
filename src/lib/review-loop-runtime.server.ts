@@ -1,8 +1,11 @@
 /**
  * Review-loop runtime: the post-review step that makes the loop real (design §5 steps 4–8).
  *
- * After a loop-triggered review is posted, either ESCALATE (stuck) or run one fix round and
- * report it in-thread. Everything is gated OFF by default:
+ * Each call is ONE loop step for one posted review: either ESCALATE (stuck) or run one fix
+ * round and report it in-thread. The loop REPEATS because an applied round posts the fixed
+ * continuation marker (review-loop.ts continueComment); its webhook starts the next review on
+ * the new head, whose post-review step runs again — until CONVERGED (a clean review), an
+ * ESCALATE handoff, or the round cap. Everything is gated OFF by default:
  *   - env ASHLAR_FIX_AGENT=1 AND settings.fixAgent.provider != null (design §6b), AND
  *   - the review was triggered by `/review-loop` (job.thread.loop is a start directive), AND
  *   - github origin, same-repo (not a fork — the installation token cannot push to a fork),
@@ -16,6 +19,7 @@ import { buildFixPrompt, runFixRound, type FixValidate, type RequestFix } from "
 import type { GitDataApi } from "./fix-commit.ts";
 import type { FixFile } from "./fix-apply.ts";
 import { maybeEscalate, type ReviewLoopGithub } from "./review-loop-engine.server.ts";
+import { continueComment, resolveBotLogin } from "./review-loop.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface LoopRuntimeGithub extends ReviewLoopGithub {
@@ -53,6 +57,13 @@ function envOf(): NodeJS.ProcessEnv | undefined {
 export function loopEnabled(settings: BotSettings, env: NodeJS.ProcessEnv | undefined = envOf()): boolean {
   if (env?.ASHLAR_FIX_AGENT !== "1") return false;
   return settings.fixAgent?.provider != null;
+}
+
+/** The App's own login (for self-recognition): ASHLAR_BOT_LOGIN when it has the "<slug>[bot]"
+ * shape GitHub reserves for Apps, else the default. Shared by the webhook parser's self-trigger
+ * guard and the engine's round attribution, so the two can never disagree. */
+export function ashlarBotLogin(env: NodeJS.ProcessEnv | undefined = envOf()): string {
+  return resolveBotLogin(env?.ASHLAR_BOT_LOGIN);
 }
 
 function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
@@ -227,6 +238,7 @@ export async function runPostReviewLoop(
       pr,
       head: headSha,
       roundCap: cap,
+      botLogin: ashlarBotLogin(env),
       sinceIso: loopSinceIso(job, allJobs, settings.username),
     });
     if (esc.escalated) return { ran: true, step: "escalated", reason: esc.reason ?? "stuck" };
@@ -268,13 +280,19 @@ export async function runPostReviewLoop(
       },
     );
     // 3) Continue the loop after an APPLIED round (the commit triggers no loop by itself — the
-    // phase-1 parser deliberately ignores a retained directive on synchronize). A fresh explicit
-    // start from the bot re-enters the loop on the new head; loopSinceIso keeps it in this
-    // session. Bounded: stop at the round cap (a strictly-improving loop reaches 0 = converged).
+    // phase-1 parser deliberately ignores a retained directive on synchronize). The driver posts
+    // the FIXED continuation marker (never an @-mention / directive in prose: the webhook parser
+    // ignores every other self-authored comment); loopSinceIso keeps it in this session.
+    // Bounded: stop at the round cap (a strictly-improving loop reaches 0 = converged).
     const continued = res.outcome === "applied" && esc.rounds.length < cap;
+    // Compose BEFORE posting the report: a malformed continuation throws here (→ in-thread halt)
+    // instead of announcing "Loop continues" and then stalling.
+    const continuation = continued
+      ? continueComment({ mode, round: esc.rounds.length + 1, pr, head: res.commitSha ?? "" })
+      : undefined;
     await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, continued) });
-    if (continued) {
-      await d.gh.createIssueComment(token, { owner, repo, pr, body: `@${settings.username} review-loop ${mode}` });
+    if (continuation) {
+      await d.gh.createIssueComment(token, { owner, repo, pr, body: continuation });
     }
     return { ran: true, step: "fix", outcome: res.outcome, commitSha: res.commitSha, error: res.error, continued };
   } catch (e) {

@@ -34,7 +34,7 @@ import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
-import { runPostReviewLoop, SILENT_REASONS } from "./review-loop-runtime.server.ts";
+import { ashlarBotLogin, runPostReviewLoop, SILENT_REASONS } from "./review-loop-runtime.server.ts";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { redactSalvagedReviewBody } from "./review-format";
 import {
@@ -1316,7 +1316,7 @@ export function ingestGitHubWebhook(opts: {
   event: string;
   payload: unknown;
 }): HarborFireResult & { pong?: boolean; ignored?: string } {
-  const parsed = parseGitHubPayload(opts.event, opts.payload, state.settings);
+  const parsed = parseGitHubPayload(opts.event, opts.payload, state.settings, { botLogin: ashlarBotLogin() });
   const t0 = performance.now();
 
   if (!opts.hmacOk) {

@@ -266,6 +266,8 @@ function repairedCollectionResult(state) {
 }
 
 async function waitUntilReviewOrQuota(name) {
+  // A review-loop fix item is harvested as plain text; everything below is review-only.
+  if (globalThis.__ashlarRunnerState?.kind === "fix") return waitUntilFixOrQuota(name);
   const owner = globalThis.__ashlarRunnerState;
   // Stamp the executing loop, never installReviewRunner's listener replacement.
   if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
@@ -325,6 +327,81 @@ async function waitUntilReviewOrQuota(name) {
   }
 }
 
+/** A review-loop FIX answer is plain text for the server's deterministic fix parser: harvest
+ * the FULL bound response after the same positive completion controls and two identical stable
+ * observations as a review, with no review-JSON requirement and no capture/repair evidence (a
+ * fix item has neither lane). No page timer ends it: the server's fix deadline cancels the item
+ * and the worker's ashlar-fix-cancel stops this collector.
+ */
+async function waitUntilFixOrQuota(name) {
+  let stable = "", hits = 0;
+  for (;;) {
+    const runner = globalThis.__ashlarRunnerState;
+    if (runner?.fixCancelled) {
+      const error = new Error("fix request cancelled by the server"); error.code = "cancelled"; throw error;
+    }
+    const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
+    const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : undefined;
+    if (bound?.followup && runner && !runner.tabRepurposed) {
+      runner.tabRepurposed = true;
+      recordReviewStep("context_changed");
+    }
+    // Same completion evidence as a review: a later request's Stop/quota never ends this answer.
+    const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
+    const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
+    const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
+    const text = done ? assistantCorpus(bound?.root).join("\n\n") : "";
+    const answered = done && Boolean(text.trim());
+    // Local diagnostics only: the answer text is never copied into an observation.
+    if (runner?.running) runner.observation = {
+      state: !done ? "generating_or_queued" : answered ? "answer_observed" : "waiting_for_response",
+      text: "", totalChars: text.length, truncated: false,
+    };
+    if (!answered) recordReviewStep(!done && (stop || streaming) ? "generating" : "waiting_for_response");
+    if ((!bound || (bound.identified && !bound.followup)) && quotaHit() && !answered) {
+      const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
+    }
+    if (answered) {
+      hits = stable === text ? hits + 1 : 1; stable = text;
+      if (hits >= 2) {
+        if (runner) {
+          runner.responseText = text;
+          if (bound?.identified && bound.responseId) runner.nativeCompletion = Object.freeze({
+            jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
+            responseId:bound.responseId,context:reviewPageContext(),text,raw:text,
+          });
+        }
+        recordReviewStep("response_collected");
+        return text;
+      }
+    } else { hits = 0; stable = ""; }
+    await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
+  }
+}
+
+/** May a cancelled fix item's tab be force-closed? Only while it shows nothing but Ashlar's own
+ * work. Before the prompt is confirmed sent, the fresh chat Ashlar opened holds at most Ashlar's
+ * own prompt: in the composer (a draft then is Ashlar's half-typed prompt) or as the just-clicked,
+ * not yet confirmed turn. After confirmation the bound response is identified, no follow-up turn
+ * exists and the composer holds no user draft. Anything unknown preserves the tab — a user's
+ * conversation is never closed.
+ */
+function fixTabOwned(state) {
+  if (state.tabRepurposed) return false;
+  let submission;
+  try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return false; }
+  const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  if (submission?.phase !== "sent") {
+    if (!users.length) return true;
+    return Boolean(submission?.expected) && submission.baseline === 0 && users.length === 1 &&
+      normalizePrompt(messagePromptText(users[0])).includes(submission.expected);
+  }
+  const bound = boundReviewResponse(submission);
+  if (!bound.identified || bound.followup) return false;
+  const draft = typeof composer === "function" && globalThis.document ? composer() : null;
+  return !(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
+}
+
 /** Short message replies keep MV3 workers recoverable; the page owns the long model call.
  * State survives script reinjection and retains terminal outcomes for a restarted worker.
  */
@@ -363,7 +440,7 @@ function installReviewRunner(name, run) {
         released:Boolean(state.slotReleased),url:globalThis.location?.href || ""});return;
     }
     if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close", "ashlar-repair-source", "ashlar-repair-accepted",
-      "ashlar-capture-accepted", "ashlar-result-saved"].includes(msg?.type)) return;
+      "ashlar-capture-accepted", "ashlar-result-saved", "ashlar-fix-cancel"].includes(msg?.type)) return;
     const respond = reply;
     reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId, progress: reviewProgress()});
     if (!msg.jobId) {
@@ -375,6 +452,14 @@ function installReviewRunner(name, run) {
         (state.runId && msg.runId && msg.runId !== state.runId)) {
       reply({ ok: false, code: "job_mismatch", error: "tab belongs to another job" });
       return;
+    }
+    if (msg.type === "ashlar-fix-cancel") {
+      // Positive binding only: an unbound page is never evidence that this tab is Ashlar's.
+      if (!state.jobId || msg.jobId !== state.jobId || !state.runId || msg.runId !== state.runId) {
+        reply({ok:false,code:"job_mismatch"});return;
+      }
+      state.fixCancelled = true; // The server settled this fix; stop collecting an answer for it.
+      reply({ok:true,owned:fixTabOwned(state),url:globalThis.location?.href || ""});return;
     }
     if (["ashlar-capture-accepted", "ashlar-result-saved"].includes(msg.type)) {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider || msg.committed !== true) {
@@ -427,8 +512,9 @@ function installReviewRunner(name, run) {
         reply({ok:false,code:"completion_unavailable"});return;
       }
       const proof=msg.completion;
-      if (!proof?.responseId || typeof proof.context !== "string" || typeof msg.text !== "string" ||
-          typeof msg.raw !== "string" || !extractChatJson(msg.raw) || extractChatJson(msg.raw) !== extractChatJson(msg.text) || bound.followup ||
+      // A fix answer is its own plain text; a review result must be the JSON of that text.
+      if (!proof?.responseId || typeof proof.context !== "string" || typeof msg.text !== "string" || typeof msg.raw !== "string" ||
+          !(msg.kind === "fix" ? msg.raw === msg.text : extractChatJson(msg.raw) && extractChatJson(msg.raw) === extractChatJson(msg.text)) || bound.followup ||
           bound.responseId !== proof.responseId || proof.context !== reviewPageContext() || assistantCorpus(bound.root).join("\n\n") !== msg.text) {
         releaseManagedSlot(state);
         reply({ok:false,code:"completion_changed"});return;
@@ -529,6 +615,9 @@ function installReviewRunner(name, run) {
     try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
     try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
+    // Only a fix item's run message carries its kind; review runs keep kind undefined.
+    state.kind = msg.kind === "fix" ? "fix" : undefined;
+    state.fixCancelled = false;
     state.nativeCompletion = undefined;
     state.restoredCompletion = false;
     state.sourceTrackingOwner = undefined;

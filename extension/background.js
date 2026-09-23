@@ -394,7 +394,10 @@ function failure(code, error) {
 }
 
 function tabMessage(job, provider, type) {
-  return {type, jobId: job.jobId, provider, runId: job.states[provider].runId};
+  const message = {type, jobId: job.jobId, provider, runId: job.states[provider].runId};
+  // Only review-loop fix items carry their kind; review messages stay exactly as before.
+  if (job.kind === "fix") message.kind = "fix";
+  return message;
 }
 
 function matchesJob(result, job, provider) {
@@ -624,6 +627,7 @@ async function cleanupProviderBody(job, provider, jobs) {
     }
     if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
     if (tab.status && tab.status !== "complete") return;
+    if (job.kind === "fix" && job.serverStatus === "cancelled") return forceCloseFixTab(job, provider, jobs, tab);
     if (sourceArchiveDurable(state) && !sourceCleanupProofConfirmed(state)) {
       const saved=state.sourceCapture;
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
@@ -682,6 +686,30 @@ async function cleanupProviderBody(job, provider, jobs) {
     state.cleanupError = String(e.message || e).slice(0, 240);
     await saveJobs(jobs);
   }
+}
+
+/** The server cancelled a review-loop FIX item (its deadline passed, a newer request for the PR
+ * superseded it, or a restart forgot it): no answer can be delivered, so waiting for completion
+ * (as a review does, with no deadline) would hold the tab slot forever. This is the one managed
+ * close without an acknowledged answer. It still requires the page's positive binding, and a tab
+ * the user took over (follow-up, unsent draft, other conversation) is preserved.
+ */
+async function forceCloseFixTab(job, provider, jobs, tab) {
+  const state = job.states[provider];
+  const result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-fix-cancel"), contentFiles(provider));
+  if (!matchesJob(result, job, provider) || result.ok !== true) {
+    state.cleanupError = "tab ownership does not match; no tab was closed";
+    await saveJobs(jobs);
+    return;
+  }
+  if (result.owned !== true) return finishTabCleanup(job, provider, jobs, "user took over the fix tab; tab preserved");
+  const current = await chrome.tabs.get(tab.id);
+  if (current.pendingUrl || current.url !== result.url || current.status === "loading") return;
+  state.closeRequested = true;
+  await saveJobs(jobs);
+  await rememberOwnedTab(job, provider, true);
+  await chrome.tabs.remove(tab.id);
+  await finishTabCleanup(job, provider, jobs, "fix cancelled; tab closed");
 }
 
 async function retireCleanJob(job, jobs, forgotten = false, signal) {
@@ -1421,12 +1449,14 @@ async function advanceJob(job, jobs) {
     try {
       await pollProvider(job, provider, jobs, !active);
       if (canDeliver) await deliverOutcome(job, provider, jobs);
-      if (job.captureProtocol===1 && !captureLanes.has(`${job.origin}:${job.jobId}:${provider}`)) {
+      // Capture, JSON repair and the observation archive are review-JSON machinery. A fix answer
+      // is plain text delivered by complete, so none of those lanes run for a fix item.
+      if (job.kind !== "fix" && job.captureProtocol===1 && !captureLanes.has(`${job.origin}:${job.jobId}:${provider}`)) {
         void singleFlight(captureLanes,`${job.origin}:${job.jobId}:${provider}`,()=>captureProvider(job,provider,jobs)).catch(()=>{
           job.states[provider].captureError="Full source archive or receipt pending; tab and original preserved";
         });
       }
-      if (canDeliver || job.states[provider].repairAttempt?.id) {
+      if (job.kind !== "fix" && (canDeliver || job.states[provider].repairAttempt?.id)) {
         void singleFlight(repairLanes, `${job.origin}:${job.jobId}:${provider}`,
           () => repairProvider(job, provider, jobs)).catch(() => {
             // The repair lane owns no model-generation deadline and never marks
@@ -1434,7 +1464,7 @@ async function advanceJob(job, jobs) {
             job.states[provider].repairError = "Local JSON repair transport/archive pending; original retained";
           });
       }
-      if (active) {
+      if (active && job.kind !== "fix") {
         // Diagnostic persistence is independently retryable. A slow observe/progress
         // RPC must not hold the lane that will harvest the now-completed response.
         void singleFlight(observationLanes, `${job.origin}:${job.jobId}:${provider}`,
@@ -1530,8 +1560,9 @@ function admitJob(cfg, jobs) {
       await recordWorkerStatus(jobs, cfg.origin, "provider_quota"); return null;
     }
     await recordWorkerStatus(jobs, cfg.origin, "polling");
+    // fixProtocol:1 opts this worker into review-loop fix items (an older worker is never offered one).
     const payload = await api("/api/bridge", {
-      action: "take", attachmentProtocol: 2, clientId: await clientId(), excludeJobIds: Object.keys(jobs),
+      action: "take", attachmentProtocol: 2, fixProtocol: 1, clientId: await clientId(), excludeJobIds: Object.keys(jobs),
     }, cfg.origin).catch(async error => {
       await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;
     });

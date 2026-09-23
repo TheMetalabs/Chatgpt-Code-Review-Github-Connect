@@ -200,6 +200,10 @@ export interface LoopContinuation {
 }
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+/** ONE contract for the continuation's numeric fields, shared by the composer and the parser
+ * (the parser's digit limits mirror these): anything the composer emits, the parser accepts. */
+export const MAX_CONTINUE_ROUND = 9999;
+export const MAX_CONTINUE_PR = 999_999_999;
 
 /** Machine marker: structured fields as attributes, so recognition never parses prose. */
 export function continueMarker(c: LoopContinuation): string {
@@ -210,7 +214,8 @@ export function continueMarker(c: LoopContinuation): string {
  * reject must never be posted (the loop would stall silently waiting for a review). */
 export function continueComment(c: LoopContinuation): string {
   if ((c.mode !== "apply" && c.mode !== "suggest") || !Number.isInteger(c.round) || c.round < 1 ||
-    !Number.isInteger(c.pr) || c.pr < 1 || !FULL_SHA_RE.test(c.head)) {
+    c.round > MAX_CONTINUE_ROUND || !Number.isInteger(c.pr) || c.pr < 1 || c.pr > MAX_CONTINUE_PR ||
+    !FULL_SHA_RE.test(c.head)) {
     throw new Error(`invalid loop continuation (mode=${c.mode} round=${c.round} pr=${c.pr} head=${c.head})`);
   }
   return `${continueMarker(c)}\n\n${REVIEW_LOOP_CONTINUE_HUMAN} (round ${c.round} on \`${c.head.slice(0, 7)}\`).`;
@@ -229,7 +234,7 @@ export function parseContinueMarker(body: string | null | undefined, source: Com
   if (!m) return null;
   const round = Number(m[2]);
   const pr = Number(m[3]);
-  if (round < 1 || pr < 1) return null;
+  if (round < 1 || round > MAX_CONTINUE_ROUND || pr < 1 || pr > MAX_CONTINUE_PR) return null;
   return { mode: m[1] as ReviewLoopMode, round, pr, head: m[4] };
 }
 

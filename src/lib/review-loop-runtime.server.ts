@@ -19,7 +19,7 @@ import { buildFixPrompt, runFixRound, type FixValidate, type RequestFix } from "
 import type { GitDataApi } from "./fix-commit.ts";
 import type { FixFile } from "./fix-apply.ts";
 import { maybeEscalate, type ReviewLoopGithub } from "./review-loop-engine.server.ts";
-import { continueComment, neutralizeMarkers, resolveBotLogin } from "./review-loop.ts";
+import { continueComment, isSelfLogin, MAX_CONTINUE_ROUND, neutralizeMarkers, resolveBotLogin } from "./review-loop.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface LoopRuntimeGithub extends ReviewLoopGithub {
@@ -41,12 +41,6 @@ export type LoopStepResult =
 /** Benign non-run reasons: the default off-path. Anything else is a halt the user should see. */
 export const SILENT_REASONS: readonly string[] = ["disabled", "not a /review-loop review", "not a github job", "no findings (converged)"];
 
-/** A GitHub App login ends in "[bot]"; the bot's own continuation comments carry it. */
-function isBotSender(sender: string | undefined, botUsername?: string): boolean {
-  if (!sender) return false;
-  return /\[bot\]$/i.test(sender) || (!!botUsername && sender === botUsername);
-}
-
 const DEFAULT_ROUND_CAP = 8;
 
 function envOf(): NodeJS.ProcessEnv | undefined {
@@ -66,21 +60,25 @@ export function ashlarBotLogin(env: NodeJS.ProcessEnv | undefined = envOf()): st
   return resolveBotLogin(env?.ASHLAR_BOT_LOGIN);
 }
 
+/** ASHLAR_LOOP_ROUND_CAP, bounded so every continuation round the loop can request stays
+ * inside the continuation marker's contract (MAX_CONTINUE_ROUND). */
 function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   const n = Number(env?.ASHLAR_LOOP_ROUND_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ROUND_CAP;
+  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), MAX_CONTINUE_ROUND - 1) : DEFAULT_ROUND_CAP;
 }
 
 /** Loop session start = the CURRENT explicit /review-loop start for this PR: the most recent
- * HUMAN-initiated start job at/before this job (in-memory). The bot's own continuation
- * triggers (posted after an applied round) belong to the same session and never reset the
- * window; an older, finished session's start must not widen it either. */
-export function loopSinceIso(job: Job, allJobs: readonly Job[], botUsername?: string): string | undefined {
+ * start job at/before this job (in-memory) that the App itself did NOT post. The App's own
+ * continuation triggers belong to the same session and never reset the window; an older,
+ * finished session's start must not widen it either. Identity is the EXACT resolved App login
+ * (the same one the webhook parser and round attribution use) — a human whose login happens to
+ * equal the mention handle, or another App, still starts a session. */
+export function loopSinceIso(job: Job, allJobs: readonly Job[], botLogin: string = ashlarBotLogin()): string | undefined {
   const starts = allJobs
     .filter(
       (j) =>
         j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && j.thread?.loop?.kind === "start" &&
-        !isBotSender(j.sender, botUsername) &&
+        !isSelfLogin(j.sender, botLogin) &&
         Number.isFinite(j.createdAt) && j.createdAt <= job.createdAt,
     )
     .map((j) => j.createdAt);
@@ -168,12 +166,18 @@ export function sanitizeModelText(text: string | undefined, opts: { oneLine?: bo
   return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
-function renderFixReport(res: Awaited<ReturnType<typeof runFixRound>>, mode: string, continued = false): string {
+function renderFixReport(res: Awaited<ReturnType<typeof runFixRound>>, mode: string, continued = false, continueError?: string): string {
   const files = (res.files ?? []).map((f) => `- \`${sanitizeModelText(f.path, { oneLine: true, max: 300 })}\``).join("\n");
   const summary = sanitizeModelText(res.summary);
   switch (res.outcome) {
     case "applied":
-      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha}\` (mode: ${mode}).\n\n${summary}\n\nChanged:\n${files}\n\n${continued ? "Loop continues: next review requested on the new head." : "Loop paused: round cap reached — review the trend before continuing."}`;
+      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha}\` (mode: ${mode}).\n\n${summary}\n\nChanged:\n${files}\n\n${
+        continued
+          ? "Loop continues: next review requested on the new head."
+          : continueError
+            ? `The next review could not be requested (${sanitizeModelText(continueError, { oneLine: true, max: 300 })}).`
+            : "Loop paused: round cap reached — review the trend before continuing."
+      }`;
     case "suggested":
       return `### Ashlar fix agent — suggestion (mode: ${mode})\n\n${summary}\n\nProposed changes (not pushed):\n${files}\n\nApply via \`/review-loop apply\` to auto-commit.`;
     case "no-change":
@@ -253,7 +257,7 @@ export async function runPostReviewLoop(
       head: headSha,
       roundCap: cap,
       botLogin: ashlarBotLogin(env),
-      sinceIso: loopSinceIso(job, allJobs, settings.username),
+      sinceIso: loopSinceIso(job, allJobs, ashlarBotLogin(env)),
     });
     if (esc.escalated) return { ran: true, step: "escalated", reason: esc.reason ?? "stuck" };
     if (esc.error) return halt(`could not reconstruct the loop history: ${esc.error}`);
@@ -298,16 +302,22 @@ export async function runPostReviewLoop(
     // the FIXED continuation marker (never an @-mention / directive in prose: the webhook parser
     // ignores every other self-authored comment); loopSinceIso keeps it in this session.
     // Bounded: stop at the round cap (a strictly-improving loop reaches 0 = converged).
-    const continued = res.outcome === "applied" && esc.rounds.length < cap;
-    // Compose BEFORE posting the report: a malformed continuation throws here (→ in-thread halt)
-    // instead of announcing "Loop continues" and then stalling.
-    const continuation = continued
-      ? continueComment({ mode, round: esc.rounds.length + 1, pr, head: res.commitSha ?? "" })
-      : undefined;
-    await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, continued) });
-    if (continuation) {
-      await d.gh.createIssueComment(token, { owner, repo, pr, body: continuation });
+    const wantContinue = res.outcome === "applied" && esc.rounds.length < cap;
+    // The continuation (the control signal) is posted FIRST; the report then states what
+    // actually happened — it never announces "Loop continues" before the trigger exists.
+    let continued = false;
+    let continueError: string | undefined;
+    if (wantContinue) {
+      try {
+        const continuation = continueComment({ mode, round: esc.rounds.length + 1, pr, head: res.commitSha ?? "" });
+        await d.gh.createIssueComment(token, { owner, repo, pr, body: continuation });
+        continued = true;
+      } catch (e) {
+        continueError = (e as Error)?.message ?? String(e);
+      }
     }
+    await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, continued, continueError) });
+    if (continueError) return halt(`the fix was committed (${res.commitSha ?? "unknown sha"}) but the next review could not be requested: ${continueError}`);
     return { ran: true, step: "fix", outcome: res.outcome, commitSha: res.commitSha, error: res.error, continued };
   } catch (e) {
     const reason = `loop step failed: ${(e as Error)?.message ?? String(e)}`;

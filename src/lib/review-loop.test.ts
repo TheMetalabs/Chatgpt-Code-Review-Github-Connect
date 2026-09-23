@@ -26,6 +26,8 @@ import {
   continueMarker,
   parseContinueMarker,
   canonicalContinuation,
+  MAX_CONTINUE_ROUND,
+  MAX_CONTINUE_PR,
   REVIEW_LOOP_CONTINUE_HUMAN,
   neutralizeMarkers,
   type RoundSummary,
@@ -405,5 +407,21 @@ describe("canonicalContinuation (the only bot comment that may trigger)", () => 
 
   it("neutralizeMarkers defangs every comment delimiter", () => {
     assert.equal(neutralizeMarkers("a <!-- x --> b"), "a &lt;!-- x --&gt; b");
+  });
+});
+
+describe("continuation composer and parser share ONE contract", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  it("every value the composer accepts, the canonical parser accepts (boundaries)", () => {
+    for (const c of [
+      { mode: "apply" as const, round: 1, pr: 1, head: SHA },
+      { mode: "suggest" as const, round: MAX_CONTINUE_ROUND, pr: MAX_CONTINUE_PR, head: SHA },
+    ]) {
+      assert.deepEqual(canonicalContinuation(continueComment(c), { authoredByBot: true }), c);
+    }
+  });
+  it("the composer refuses values past the parser's contract instead of posting an ignored marker", () => {
+    assert.throws(() => continueComment({ mode: "apply", round: MAX_CONTINUE_ROUND + 1, pr: 7, head: SHA }), /invalid loop continuation/);
+    assert.throws(() => continueComment({ mode: "apply", round: 2, pr: MAX_CONTINUE_PR + 1, head: SHA }), /invalid loop continuation/);
   });
 });

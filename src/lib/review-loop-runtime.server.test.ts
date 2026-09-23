@@ -77,7 +77,7 @@ function settings(mode: "suggest" | "apply" = "suggest"): BotSettings {
 }
 
 /** Fake deps: configurable review history (for the escalate engine) + fix reply + push spy. */
-function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean; liveSha?: string; movedDuringFix?: boolean; refMovedAtWrite?: boolean; commitSha?: string } = {}) {
+function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean; liveSha?: string; movedDuringFix?: boolean; refMovedAtWrite?: boolean; commitSha?: string; failContinuation?: boolean } = {}) {
   const posted: string[] = [];
   let committed = false;
   let headReads = 0;
@@ -105,6 +105,7 @@ function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolea
         return [];
       },
       async createIssueComment(_t, o) {
+        if (opts.failContinuation && o.body.includes("ashlar-loop-continue")) throw new Error("comment POST 502");
         posted.push(o.body);
         return { id: posted.length };
       },
@@ -295,11 +296,25 @@ describe("runPostReviewLoop steps", () => {
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
     if (r.ran && r.step === "fix") assert.equal(r.continued, true);
-    assert.match(f.posted[0], /Loop continues/);
+    // the control signal first, then the report that states it
+    assert.ok(parseContinueMarker(f.posted[0], { authoredByBot: true }), "continuation posted first");
+    assert.match(f.posted[1], /Loop continues/);
     const cont = f.posted.map((b) => parseContinueMarker(b, { authoredByBot: true })).find(Boolean);
     assert.deepEqual(cont, { mode: "apply", round: 2, pr: 7, head: NEW_SHA }, "marker names the next round + new head");
     // never an @-mention / prose directive: the webhook parser ignores those from the bot
     assert.ok(!f.posted.some((b) => /@ashlar/i.test(b)), "no bot @-mention posted");
+  });
+
+  it("a failed continuation POST: the report never claims 'Loop continues'; the commit is reported and the stop is visible", async () => {
+    const f = fakeDeps({ rounds: [3], failContinuation: true });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.equal(r.ran, false);
+    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+    assert.ok(report.includes(NEW_SHA), "the applied commit is reported");
+    assert.ok(!/Loop continues/.test(report));
+    assert.match(report, /could not be requested \(comment POST 502\)/);
+    assert.ok(f.posted.some((b) => /halted before fix[\s\S]*could not be requested/.test(b)), "the stop is observable");
   });
 
   it("model text in a fix report cannot carry a live control marker (neutralized, mentions defanged)", async () => {
@@ -345,10 +360,16 @@ describe("helpers", () => {
     assert.equal(loopSinceIso(job({ thread: { kind: "mention", commentId: 1, userText: "x" } }), []), undefined);
   });
 
-  it("L3: bot continuation starts stay in the human-started session", () => {
+  it("L3: bot continuation starts stay in the human-started session (exact App identity)", () => {
     const human = job({ createdAt: 1000, sender: "alice" });
-    const cont = job({ createdAt: 2000, sender: "ashlar-bot-review-loop[bot]" });
-    assert.equal(loopSinceIso(cont, [human, cont], "ashlar-bot"), new Date(1000).toISOString());
+    const cont = job({ createdAt: 2000, sender: BOT });
+    assert.equal(loopSinceIso(cont, [human, cont], BOT), new Date(1000).toISOString());
+    // a human whose login equals the mention handle, or ANOTHER App, still starts a session —
+    // only the exact resolved App login is excluded
+    const handleNamedHuman = job({ createdAt: 3000, sender: "ashlar-bot" });
+    assert.equal(loopSinceIso(handleNamedHuman, [human, handleNamedHuman], BOT), new Date(3000).toISOString());
+    const otherApp = job({ createdAt: 4000, sender: "other-app[bot]" });
+    assert.equal(loopSinceIso(otherApp, [human, otherApp], BOT), new Date(4000).toISOString());
   });
 
   it("ashlarBotLogin: ASHLAR_BOT_LOGIN only in the App-reserved <slug>[bot] shape", () => {

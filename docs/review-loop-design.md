@@ -247,6 +247,20 @@ fixAgent: {
   `script-apply`(grokbot `qwen_openai_edit.py` 재사용). `coding-agent`는 `coding-agent`.
 - **권한:** 어떤 provider든 push하려면 §2의 write-권한 게이트를 통과해야 한다. `apply` 모드는 명시적으로만.
 
+**채팅 fix 전송(구현, `bridge-fix.server.ts`):** `chatgpt`/`grok` + `script-apply`는 harbor Job이 아니라 bridge의
+**fix 항목**으로 간다(harbor Job은 PR별 supersede·리뷰 JSON 검증을 하므로 fix 답변을 거부/재작성한다). 확장이
+채팅 탭에 프롬프트를 붙여 넣고 **답변 전문(텍스트)**을 돌려주면, 파싱은 서버가 결정적으로 한다(`fix-apply`).
+- **PR당 live 항목 1개:** 같은 PR의 새 요청이 이전 항목을 취소(`superseded`)하고, 확장은 그 탭을 강제로 닫는다.
+- **데드라인:** 대기+생성 합산 기본 30분(`ASHLAR_FIX_CHAT_TIMEOUT_MS`, 1분~6시간). 만료 → 취소 → 탭 강제 종료 →
+  런타임 재시도 후 `fix-failed` ESCALATE. 리뷰와 달리 fix 탭만 "답변 없이" 닫히며, 사용자가 탭을 넘겨받았으면
+  (후속 턴·미전송 초안·다른 대화) 보존한다.
+- **동시성:** `parallelPrs`개까지만 claim, 나머지는 대기. 리뷰와는 요청 시각이 빠른 쪽이 먼저(서로 굶기지 않음).
+- **호환:** `take`에 `fixProtocol:1`을 보내는 확장(1.1.23+)에만 fix 항목을 준다 — 확장 재로드 필요.
+- **프롬프트 한도:** 프롬프트 전체를 composer에 입력하고 전송 확인도 그 텍스트로 하므로, 파일 내용을 첨부
+  봉투(`<<<ASHLAR_ATTACHMENTS_V2>>>`)로 빼지 않는다(첨부는 부분 열람될 수 있어 full-file 재작성이 틀어진다).
+  대신 기본 10만 자(`ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS`, 1만~100만) 초과는 즉시 실패 → ESCALATE. 큰 PR은 `local`.
+- `chat-push`(탭 자율 push)는 미구현 — 설정돼 있으면 fail-closed로 ESCALATE.
+
 ## 7. 2단계 검증 (비용 최적화 — 정본 스킬의 핵심 추가)
 
 concurrency-1 local 때문에 라운드마다 비싼 검증은 불가능하다. 정본처럼 분리한다.

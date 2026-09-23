@@ -36,9 +36,19 @@
  * Static imports are pure/DI-only modules; the production GitHub + provider transport are
  * loaded by DYNAMIC import inside the gate, so the harbor test fixture (which links a strict
  * github.server stub) is untouched and the fix path never runs in tests unless injected.
+ *
+ * FIX TRANSPORT (requestFix → the answer TEXT; this module parses it via runFixRound):
+ *   - local: one OpenAI-compatible chat request;
+ *   - chatgpt / grok: one Chrome-bridge fix item per PR (bridge-fix.server.ts) — the extension
+ *     types the prompt into a chat tab and hands back the full answer. A newer request for the
+ *     PR supersedes the older; a deadline (ASHLAR_FIX_CHAT_TIMEOUT_MS, default 30 min) and an
+ *     inline-prompt ceiling (ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS, default 100k chars) turn a stuck
+ *     tab or an oversized PR into a rejected request → retry, then ESCALATE fix-failed (never a
+ *     hang). Only delivery "script-apply" is wired; "chat-push" fails closed.
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import type { GitDataApi } from "./fix-commit.ts";
+import type { FixRequest } from "./bridge-fix.server.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
@@ -105,6 +115,8 @@ export interface PostedLoopReview {
   comments: Array<{ findingId: string; file: string; body: string }>;
   published?: string[];
 }
+
+type PrRef = { owner: string; repo: string; pr: number };
 
 export interface LoopRuntimeDeps {
   gh: LoopRuntimeGithub;
@@ -439,8 +451,32 @@ function renderFixReport(
 // stops) must span loop steps, webhook handlers and harbor calls.
 let productionGh: LoopRuntimeGithub | undefined;
 
-/** Production dependencies, loaded lazily so the static graph stays pure. */
-async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
+/** The bridge transport surface requestChatFix needs (injected in tests). */
+export type BridgeFixLoader = () => Promise<{ requestBridgeFix(request: FixRequest): Promise<string> }>;
+
+/**
+ * chatgpt / grok fix transport: one Chrome-bridge fix item for this PR. Resolves with the chat's
+ * full answer text; rejects (→ request-failed → retry → ESCALATE) on failure, deadline,
+ * supersession or an oversized prompt. Only script-apply is wired: a "chat-push" configuration
+ * (the tab commits by itself) must not silently become a server-side apply.
+ */
+export async function requestChatFix(
+  settings: BotSettings,
+  ref: PrRef,
+  provider: "chatgpt" | "grok",
+  prompt: string,
+  loadBridge: BridgeFixLoader = () => import("./bridge.server.ts"),
+): Promise<string> {
+  if (settings.fixAgent.delivery !== "script-apply") {
+    throw new Error(`fix delivery ${settings.fixAgent.delivery} is not wired for ${provider} (script-apply only)`);
+  }
+  const bridge = await loadBridge();
+  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt });
+}
+
+/** Production dependencies, loaded lazily so the static graph stays pure. `ref` is the PR a
+ * chat fix item is keyed by (one live item per PR). */
+async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRuntimeDeps> {
   // The GitHub client is the loop's only channel: if it cannot load, nothing can be posted (the
   // ONE unobservable failure — logged server-side by harbor). Provider transports load LAZILY
   // inside requestFix, so their failure is an ordinary request-failed → retry → fix-failed.
@@ -457,11 +493,13 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
     replyToReviewComment: github.replyToReviewComment,
   };
   const gh = productionGh;
-  // First provider: local (a plain request/response). chatgpt/grok ride the bridge's
-  // awaiting_chat lifecycle and are wired separately.
+  // local is a plain request/response; chatgpt/grok go through the Chrome bridge's fix registry
+  // (NOT the review awaiting_chat lifecycle) and come back as the same kind of answer text.
   const requestFix: RequestFix = async (prompt, ctl) => {
-    if (settings.fixAgent.provider !== "local") {
-      throw new Error(`fix provider ${settings.fixAgent.provider} not wired yet (local only)`);
+    const provider = settings.fixAgent.provider;
+    if (provider === "chatgpt" || provider === "grok") return requestChatFix(settings, ref, provider, prompt);
+    if (provider !== "local") {
+      throw new Error(`fix provider ${provider} not wired yet (local, chatgpt, grok)`);
     }
     const local = await import("./local-chat-request.server.ts");
     const llm = await import("./local-llm.server.ts");
@@ -491,8 +529,6 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
     (await import("./local-chat-request.server.ts").then((m) => m.localStreamingDefault(), () => false));
   return { gh, requestFix, validate: builtinValidate, fixReportsActivity: streaming };
 }
-
-type PrRef = { owner: string; repo: string; pr: number };
 
 const prKey = (ref: PrRef) => `${ref.owner}/${ref.repo}#${ref.pr}`.toLowerCase();
 
@@ -644,7 +680,7 @@ export async function runPostReviewLoop(
   if (inFlightSteps.has(stepKey)) return { ran: false, reason: STEP_IN_FLIGHT };
   inFlightSteps.add(stepKey);
   try {
-    d = deps ?? (await productionDeps(settings));
+    d = deps ?? (await productionDeps(settings, ref));
     const gh = d.gh;
     // A moved head supersedes this review: the LIVE head's review drives the loop. The push handler
     // (or the round that pushed) normally requested it already; asking again is idempotent, so a
@@ -970,7 +1006,7 @@ export async function continueLoopOnPush(
   try {
     if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
     const botLogin = ashlarBotLogin(env);
-    const d = deps ?? (await productionDeps(settings));
+    const d = deps ?? (await productionDeps(settings, { owner: push.owner, repo: push.repo, pr: push.pr }));
     const head = await d.gh.fetchPullHeadRef(token, push.owner, push.repo, push.pr);
     // A later push will continue with its own head; never request a review of a stale one.
     if (head.sha !== push.headSha) return { posted: false, reason: SUPERSEDED };
@@ -1028,7 +1064,7 @@ export async function startLoop(
     if (isSelfLogin(start.actor, botLogin)) return { posted: false, reason: "bot-authored start ignored" };
     const record = { mode: start.mode, by: start.actor, at: start.at };
     const body = startComment(record); // throws on a malformed field → "start failed"
-    const d = deps ?? (await productionDeps(settings));
+    const d = deps ?? (await productionDeps(settings, { owner: start.owner, repo: start.repo, pr: start.pr }));
     const key = `start:${prKey(start)}:${record.by.toLowerCase()}:${isoMs(record.at)}:${record.mode}`;
     let error = "the start record was not posted";
     for (const wait of POST_RETRY_DELAYS_MS) {
@@ -1129,7 +1165,7 @@ export async function stopLoop(
   const event: LoopEvent = { at, kind: "stop", actor: stop.actor };
   let d: LoopRuntimeDeps | undefined;
   try {
-    d = deps ?? (await productionDeps(settings));
+    d = deps ?? (await productionDeps(settings, { owner: stop.owner, repo: stop.repo, pr: stop.pr }));
     // Honored in this process from the first moment, before any read that could fail.
     setPendingStop(d.gh, stop, event, true);
     const head = await d.gh.fetchPullHeadRef(token, stop.owner, stop.repo, stop.pr);

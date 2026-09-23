@@ -11,6 +11,8 @@ import { getSecrets, normalizePem } from "./secrets.server";
 import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { applyBudget } from "./review-budget";
+import { commitFiles, type GitDataApi } from "./fix-commit.ts";
+import type { FixFile } from "./fix-apply.ts";
 
 const GH_HOST = "api.github.com";
 const MAX_FILES = 50;
@@ -707,6 +709,64 @@ export async function listIssueComments(
   );
   if (!out.ok) return [];
   return (out.data ?? []).map((c) => ({ userLogin: String(c.user?.login ?? ""), body: String(c.body ?? "") }));
+}
+
+export function gitDataApi(token: string, owner: string, repo: string): GitDataApi {
+  const base = `/repos/${owner}/${repo}/git`;
+  return {
+    async baseTreeSha(commitSha: string): Promise<string> {
+      const out = await gh<{ tree?: { sha?: string } }>(token, `${base}/commits/${commitSha}`);
+      if (!out.ok || !out.data.tree?.sha) {
+        throw new Error(out.ok ? "commit has no tree" : `get commit failed (${out.status}): ${out.text}`);
+      }
+      return out.data.tree.sha;
+    },
+    async createBlob(content: string): Promise<string> {
+      const out = await gh<{ sha?: string }>(token, `${base}/blobs`, {
+        method: "POST",
+        body: JSON.stringify({ content, encoding: "utf-8" }),
+      });
+      if (!out.ok || !out.data.sha) throw new Error(out.ok ? "blob has no sha" : `create blob failed (${out.status}): ${out.text}`);
+      return out.data.sha;
+    },
+    async createTree(baseTreeSha: string, entries: Array<{ path: string; sha: string }>): Promise<string> {
+      const tree = entries.map((e) => ({ path: e.path, mode: "100644", type: "blob", sha: e.sha }));
+      const out = await gh<{ sha?: string }>(token, `${base}/trees`, {
+        method: "POST",
+        body: JSON.stringify({ base_tree: baseTreeSha, tree }),
+      });
+      if (!out.ok || !out.data.sha) throw new Error(out.ok ? "tree has no sha" : `create tree failed (${out.status}): ${out.text}`);
+      return out.data.sha;
+    },
+    async createCommit(message: string, treeSha: string, parentSha: string): Promise<string> {
+      const out = await gh<{ sha?: string }>(token, `${base}/commits`, {
+        method: "POST",
+        body: JSON.stringify({ message, tree: treeSha, parents: [parentSha] }),
+      });
+      if (!out.ok || !out.data.sha) throw new Error(out.ok ? "commit has no sha" : `create commit failed (${out.status}): ${out.text}`);
+      return out.data.sha;
+    },
+    async updateBranchRef(branch: string, commitSha: string): Promise<void> {
+      const out = await gh(token, `${base}/refs/heads/${branch}`, {
+        method: "PATCH",
+        body: JSON.stringify({ sha: commitSha, force: false }),
+      });
+      if (!out.ok) throw new Error(`update ref failed (${out.status}): ${out.text}`);
+    },
+  };
+}
+
+/** Push a full-file change set as one atomic commit on `branch` (design §6 mechanism A). */
+export async function commitFilesToBranch(
+  token: string,
+  opts: { owner: string; repo: string; branch: string; baseCommitSha: string; message: string; files: FixFile[] },
+) {
+  return commitFiles(gitDataApi(token, opts.owner, opts.repo), {
+    branch: opts.branch,
+    baseCommitSha: opts.baseCommitSha,
+    message: opts.message,
+    files: opts.files,
+  });
 }
 
 export async function createIssueComment(

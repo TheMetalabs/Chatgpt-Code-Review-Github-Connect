@@ -155,6 +155,11 @@ export interface EscalateResult {
   error?: string;
 }
 
+/** The reviewed head is not the latest reconstructed round: the history does not (yet) show
+ * this review — a lagging read, or reviews not attributable to the bot login. The budget can
+ * only be enforced from an attributable history, so a strict caller must not fix blind. */
+export const CURRENT_ROUND_MISSING = "the current review is not the latest round in the loop history";
+
 /**
  * Reconstruct the loop, classify, and — if stuck and not already escalated on this head —
  * emit the fixed ESCALATE handoff. Safe to call after every loop review: a non-stuck loop
@@ -164,6 +169,9 @@ export interface EscalateResult {
 // both pass the check-then-post idempotency window and double-emit. (Cross-process dedup still
 // relies on the alreadyEscalated marker scan; note that in a multi-instance deploy.)
 const inFlightEscalate = new Set<string>();
+
+/** Another loop step for this PR/head holds the escalation guard; the caller backs off quietly. */
+export const ESCALATE_IN_FLIGHT = "escalate already in flight for this head";
 
 export async function maybeEscalate(
   gh: ReviewLoopGithub,
@@ -177,11 +185,13 @@ export async function maybeEscalate(
     diffLines?: number;
     botLogin?: string;
     sinceIso?: string;
+    /** Fail closed (error CURRENT_ROUND_MISSING) unless the reviewed head IS the latest round. */
+    requireCurrentRound?: boolean;
   },
 ): Promise<EscalateResult> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
-  if (inFlightEscalate.has(key)) return { escalated: false, rounds: [], error: "escalate already in flight for this head" };
+  if (inFlightEscalate.has(key)) return { escalated: false, rounds: [], error: ESCALATE_IN_FLIGHT };
   inFlightEscalate.add(key);
   try {
     return await maybeEscalateInner(gh, token, opts, botLogin);
@@ -193,7 +203,7 @@ export async function maybeEscalate(
 async function maybeEscalateInner(
   gh: ReviewLoopGithub,
   token: string,
-  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number; sinceIso?: string },
+  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number; sinceIso?: string; requireCurrentRound?: boolean },
   botLogin: string,
 ): Promise<EscalateResult> {
   // Fail closed on an incomplete/failed history read: never classify or (dup-)post from
@@ -205,8 +215,9 @@ async function maybeEscalateInner(
     // Only classify when the most recent reconstructed round IS the current head. Otherwise the
     // history is stale or the branch was force-pushed onto a divergent lineage, and those rounds
     // do not belong to this head — never attribute their trend to it.
-    if (rounds.length > 0 && rounds[rounds.length - 1].head !== opts.head) {
-      return { escalated: false, rounds };
+    if (rounds.length === 0 || rounds[rounds.length - 1].head !== opts.head) {
+      if (opts.requireCurrentRound) return { escalated: false, rounds, error: CURRENT_ROUND_MISSING };
+      if (rounds.length > 0) return { escalated: false, rounds };
     }
     const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
     if (!reasonPeek) return { escalated: false, rounds };
@@ -228,4 +239,56 @@ async function maybeEscalateInner(
   });
   await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
   return { escalated: true, reason, rounds };
+}
+
+/**
+ * Emit the fixed ESCALATE handoff for a NON-stuck terminal failure (fix-failed / fix-declined /
+ * loop-error) on this head. One handoff per head: shares the in-flight guard and the marker
+ * idempotency with maybeEscalate. Unlike classification, a failed idempotency READ does not
+ * suppress the post — the failure itself is the signal, and a duplicate handoff is harmless
+ * next to a loop that stops silently.
+ */
+export async function escalateNow(
+  gh: ReviewLoopGithub,
+  token: string,
+  opts: {
+    owner: string;
+    repo: string;
+    pr: number;
+    head: string;
+    reason: EscalateReason;
+    detail?: string;
+    rounds: RoundSummary[];
+    roundCap: number;
+    diffLines?: number;
+    botLogin?: string;
+  },
+): Promise<{ escalated: boolean; error?: string }> {
+  const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
+  const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
+  if (inFlightEscalate.has(key)) return { escalated: false, error: ESCALATE_IN_FLIGHT };
+  inFlightEscalate.add(key);
+  try {
+    let before = false;
+    try {
+      before = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin);
+    } catch {
+      before = false; // unreadable history: post anyway (see above)
+    }
+    if (before) return { escalated: false };
+    const body = escalateFromRounds(opts.reason, opts.rounds, {
+      pr: opts.pr,
+      head: opts.head,
+      repo: `${opts.owner}/${opts.repo}`,
+      roundCap: opts.roundCap,
+      diffLines: opts.diffLines,
+      detail: opts.detail,
+    });
+    await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
+    return { escalated: true };
+  } catch (e) {
+    return { escalated: false, error: (e as Error)?.message ?? String(e) };
+  } finally {
+    inFlightEscalate.delete(key);
+  }
 }

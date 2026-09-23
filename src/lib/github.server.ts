@@ -823,12 +823,24 @@ export async function fetchPullHeadRef(
   owner: string,
   repo: string,
   pr: number,
-): Promise<{ ref: string; sha: string; fork: boolean }> {
-  const out = await gh<{ head?: { ref?: string; sha?: string; repo?: { fork?: boolean } | null } }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
+): Promise<{ ref: string; sha: string; fork: boolean; additions?: number; deletions?: number }> {
+  const out = await gh<{
+    head?: { ref?: string; sha?: string; repo?: { fork?: boolean } | null };
+    additions?: number;
+    deletions?: number;
+  }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
   if (!out.ok || !out.data.head?.ref || !out.data.head.sha) {
     throw new Error(out.ok ? "pull request has no head ref/sha" : `could not load pull request (${out.status}): ${out.text}`);
   }
-  return { ref: out.data.head.ref, sha: out.data.head.sha, fork: Boolean(out.data.head.repo?.fork) };
+  // additions/deletions size the diff-too-large gate; absent/invalid → the gate is skipped.
+  const n = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined);
+  return {
+    ref: out.data.head.ref,
+    sha: out.data.head.sha,
+    fork: Boolean(out.data.head.repo?.fork),
+    additions: n(out.data.additions),
+    deletions: n(out.data.deletions),
+  };
 }
 
 export async function createIssueComment(

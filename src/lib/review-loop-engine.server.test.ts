@@ -1,6 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { maybeEscalate, reconstructRounds, type ReviewLoopGithub } from "./review-loop-engine.server.ts";
+import {
+  CURRENT_ROUND_MISSING,
+  escalateNow,
+  maybeEscalate,
+  reconstructRounds,
+  type ReviewLoopGithub,
+} from "./review-loop-engine.server.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 
@@ -143,8 +149,14 @@ describe("maybeEscalate — provenance, session boundary, fail-closed (round-1 f
 
   it("F6: an incomplete/failed history read fails closed (no classify, no post)", async () => {
     const gh = {
-      async listPullReviews() { return [{ userLogin: bot, body: "<!-- ashlar-findings total=6 -->", commitId: "h0000000", submittedAt: "2026-01-01T00:00:00Z" }]; },
-      async listReviewComments() { return [{ userLogin: bot, path: files[0], commitId: "h0000000", createdAt: "2026-01-01T00:00:00Z" }]; },
+      // two reviewed heads with the budget (cap 1) spent → a stuck reason → the idempotency read runs
+      async listPullReviews() {
+        return [
+          { userLogin: bot, body: "<!-- ashlar-findings total=6 -->", commitId: "g0000000", submittedAt: "2026-01-01T00:00:00Z" },
+          { userLogin: bot, body: "<!-- ashlar-findings total=5 -->", commitId: "h0000000", submittedAt: "2026-01-02T00:00:00Z" },
+        ];
+      },
+      async listReviewComments() { return [{ userLogin: bot, path: files[0], commitId: "h0000000", createdAt: "2026-01-02T00:00:00Z" }]; },
       async listIssueComments() { throw new Error("list issues failed (502)"); },
       async createIssueComment() { throw new Error("must not post on incomplete history"); },
     };
@@ -227,5 +239,59 @@ describe("engine round-2 fixes", () => {
     };
     const res = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "newDivergentHead".padEnd(40, "n"), roundCap: 3 });
     assert.equal(res.escalated, false);
+  });
+});
+
+describe("engine: termination contract (budget + failure handoffs)", () => {
+  const bot = "ashlar-bot-review-loop[bot]";
+  const review = (total: number, head: string, at: string) => ({ userLogin: bot, body: `<!-- ashlar-findings total=${total} -->`, commitId: head, submittedAt: at });
+
+  it("requireCurrentRound fails closed when the reviewed head is not the latest attributable round", async () => {
+    const posted: string[] = [];
+    const gh = {
+      async listPullReviews() { return [review(3, "a".repeat(40), "2026-01-01T00:00:00Z")]; },
+      async listReviewComments() { return []; },
+      async listIssueComments() { return []; },
+      async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
+    };
+    const head = "b".repeat(40);
+    const strict = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head, roundCap: 5, requireCurrentRound: true });
+    assert.equal(strict.error, CURRENT_ROUND_MISSING);
+    const empty = { ...gh, async listPullReviews() { return []; } };
+    const none = await maybeEscalate(empty as never, "t", { owner: "o", repo: "r", pr: 1, head, roundCap: 5, requireCurrentRound: true });
+    assert.equal(none.error, CURRENT_ROUND_MISSING, "no attributable history (e.g. wrong bot login) never fixes blind");
+    const lax = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head, roundCap: 5 });
+    assert.equal(lax.error, undefined);
+    assert.deepEqual(posted, []);
+  });
+
+  it("escalateNow posts one fixed handoff per head with the detail, and is idempotent", async () => {
+    const issues: Array<{ userLogin: string; body: string }> = [];
+    const gh = {
+      async listPullReviews() { return []; },
+      async listReviewComments() { return []; },
+      async listIssueComments() { return issues; },
+      async createIssueComment(_t: string, o: { body: string }) { issues.push({ userLogin: bot, body: o.body }); return { id: issues.length }; },
+    };
+    const head = "c".repeat(40);
+    const opts = { owner: "o", repo: "r", pr: 3, head, reason: "fix-failed" as const, detail: "parse-failed after 2 attempt(s): bad json", rounds: [], roundCap: 5 };
+    assert.deepEqual(await escalateNow(gh as never, "t", opts), { escalated: true });
+    assert.match(issues[0].body, /reason=fix-failed/);
+    assert.match(issues[0].body, /Detail: parse-failed after 2 attempt\(s\): bad json/);
+    assert.deepEqual(await escalateNow(gh as never, "t", { ...opts, reason: "loop-error" }), { escalated: false });
+    assert.equal(issues.length, 1, "one handoff per head");
+  });
+
+  it("escalateNow still posts when the idempotency read fails (the failure is the signal)", async () => {
+    const posted: string[] = [];
+    const gh = {
+      async listPullReviews() { return []; },
+      async listReviewComments() { return []; },
+      async listIssueComments() { throw new Error("502"); },
+      async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
+    };
+    const r = await escalateNow(gh as never, "t", { owner: "o", repo: "r", pr: 3, head: "d".repeat(40), reason: "loop-error", detail: "x", rounds: [], roundCap: 5 });
+    assert.equal(r.escalated, true);
+    assert.equal(posted.length, 1);
   });
 });

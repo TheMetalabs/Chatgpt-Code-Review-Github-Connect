@@ -95,6 +95,21 @@ CONVERGED를 남긴다(슬래시 형식·연속 마커도 동일).
 
 불변식: `@ashlar review` 는 0-UNADDRESSED 일 때만 / 라운드당 in-flight 1개 / push 1개 / DIRTY SHA에 요청 금지.
 
+**종료 계약(구현, `review-loop-runtime.server.ts`):** apply 루프는 반드시 고정 신호 하나로 끝난다 —
+CONVERGED(clean 리뷰 `total=0`) 또는 ESCALATE(reason 코드). 조용한 정지·자유 문장 종료는 없다. suggest 모드의
+라운드는 고정 "suggestion" 리포트로 사람에게 넘긴다(설계상 핸드오프 — push가 없으니 다음 head가 없다; 사람이
+적용·push 후 루프를 재실행).
+
+- **수정 라운드 예산** `ASHLAR_LOOP_ROUND_CAP`(기본 **5**): 리뷰 라운드 k(≤5) 뒤에 수정 라운드 k. 리뷰 라운드
+  6은 5번째 수정의 **검증 리뷰** — clean이면 CONVERGED, 지적이 남으면 `round-cap` ESCALATE(추세와 무관한 하드 상한).
+- applied 라운드는 **항상** 다음 리뷰를 요청한다(연속 마커). 예산 판정은 다음 리뷰에서 한다.
+- 수정 라운드 실패는 라운드 안에서 재시도(`ASHLAR_FIX_ATTEMPTS`, 기본 2 — request/parse/scope/validation 실패,
+  거절 사유를 프롬프트에 되먹임) 후 `fix-failed`; 변경 없음은 `fix-declined`; 그 밖의 진행 불가는 `loop-error`.
+- 조용한 종료는 둘뿐: **supersede**(리뷰 후 head가 움직임 — 새 head의 리뷰가 루프를 이어받음)와 **이 head에 이미
+  ESCALATE가 있음**(핸드오프를 넘어서 수정하지 않음).
+- 라운드 이력은 봇 로그인으로 귀속 가능해야 한다: 현재 리뷰가 이력의 마지막 라운드로 보이지 않으면(API 지연 1회
+  재조회 후) 수정하지 않고 `loop-error` — 예산을 우회하는 "맹목 수정"을 막는다.
+
 ## 6. Fix 에이전트 (루프를 실제로 수렴시키는 엔진)
 
 fix 주체는 **설정 가능**하다(§6b). 채팅 리뷰어(ChatGPT/Grok)도 **GitHub 플러그인/커넥터를 설치하면 탭에서 직접
@@ -186,7 +201,10 @@ Ashlar review-loop halted — human review required (round N/M)
 | `wrong-scope` | 맞는 수정·틀린 범위 반복 | 진짜 근본(예: O(N²) 실제 원인) 찾아 거기서 |
 | `re-flag-deferred` | 봇이 defer/pushback 재litigate | 오탐/설계 판단 — deferral load-bearing화 또는 방향 결정 |
 | `diff-too-large` | >5k/멀티도메인 | 수렴 불가 — 의존순서 스택 split, 루프 재개 금지 (**설계 변경**) |
-| `round-cap` | 상한 도달, 신호 불명확 | 추이·반복파일로 분류 후 방향 결정 |
+| `round-cap` | 수정 예산(기본 5) 소진 후 검증 리뷰에도 지적 | 추이·반복파일로 분류 후 방향 결정 |
+| `fix-failed` | fix 에이전트 응답이 재시도 후에도 적용 불가(요청·파싱·범위·검증·커밋 실패) | 수동 수정 또는 원인 해결 후 재실행 |
+| `fix-declined` | fix 에이전트가 모든 지적을 pushback/decline/defer(변경 없음) | 지적별 판정 — pushback 수용 시 스레드 resolve, 아니면 수동 수정 |
+| `loop-error` | 수정 라운드 자체를 못 돌림(fork에 apply, 편집 가능 파일 없음, 스냅샷·이력 불가 등) | 원인 해결 후 재실행 |
 
 **핵심 주의:** 상태값은 힌트일 뿐. 받는 에이전트는 컴팩션/세션교체로 요약이 stale일 수 있으니 **반드시 API에서
 round/findings/gates를 재도출**하고 착수. 그래서 재확인 명령을 페이로드에 박아둔다.

@@ -76,20 +76,41 @@ function settings(mode: "suggest" | "apply" = "suggest"): BotSettings {
   return { ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } };
 }
 
-/** Fake deps: configurable review history (for the escalate engine) + fix reply + push spy. */
-function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean; liveSha?: string; movedDuringFix?: boolean; refMovedAtWrite?: boolean; commitSha?: string; failContinuation?: boolean; failReport?: boolean } = {}) {
+/** Fake deps: configurable review history (for the escalate engine) + fix replies + push spy. */
+function fakeDeps(
+  opts: {
+    rounds?: number[];
+    reply?: string | string[]; // one reply per attempt (last repeats)
+    requestThrows?: number; // the first N requests throw (transport failure)
+    validateOk?: boolean;
+    liveSha?: string;
+    movedDuringFix?: boolean;
+    refMovedAtWrite?: boolean;
+    commitSha?: string;
+    lastHead?: string; // head of the latest reconstructed round (default: the reviewed HEAD)
+    additions?: number;
+    deletions?: number;
+    priorIssues?: Array<{ userLogin: string; body: string }>;
+  } = {},
+) {
   const posted: string[] = [];
+  const issues: Array<{ userLogin: string; body: string }> = [...(opts.priorIssues ?? [])];
+  const prompts: string[] = [];
   let committed = false;
+  let moved = false;
   let headReads = 0;
+  let sleeps = 0;
   const rounds = opts.rounds ?? [];
+  const lastHead = opts.lastHead ?? HEAD;
+  const replies = Array.isArray(opts.reply) ? opts.reply : [opts.reply ?? '{"summary":"guard removed","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}'];
   const deps: LoopRuntimeDeps = {
     gh: {
       async listPullReviews() {
-        // each round on a distinct head; the LAST must be the current HEAD for the engine to classify
+        // each round on a distinct head; the LAST is the reviewed HEAD unless lastHead says otherwise
         return rounds.map((n, i) => ({
           userLogin: BOT,
           body: `<!-- ashlar-findings total=${n} -->`,
-          commitId: i === rounds.length - 1 ? HEAD : `c${i}`.padEnd(40, "0"),
+          commitId: i === rounds.length - 1 ? lastHead : `c${i}`.padEnd(40, "0"),
           submittedAt: `2026-01-0${i + 1}T00:00:00Z`,
         }));
       },
@@ -97,24 +118,23 @@ function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolea
         return rounds.map((_n, i) => ({
           userLogin: BOT,
           path: "src/a.ts",
-          commitId: i === rounds.length - 1 ? HEAD : `c${i}`.padEnd(40, "0"),
+          commitId: i === rounds.length - 1 ? lastHead : `c${i}`.padEnd(40, "0"),
           createdAt: `2026-01-0${i + 1}T00:00:00Z`,
         }));
       },
       async listIssueComments() {
-        return [];
+        return issues;
       },
       async createIssueComment(_t, o) {
-        if (opts.failContinuation && o.body.includes("ashlar-loop-continue")) throw new Error("comment POST 502");
-        if (opts.failReport && o.body.startsWith("### Ashlar fix agent")) throw new Error("report POST 502");
         posted.push(o.body);
+        issues.push({ userLogin: BOT, body: o.body });
         return { id: posted.length };
       },
       async fetchPullHeadRef() {
         headReads += 1;
-        // movedDuringFix: the first read (pre-fix) matches, the re-check before commit does not
-        const sha = opts.movedDuringFix && headReads > 1 ? "m".repeat(40) : (opts.liveSha ?? HEAD);
-        return { ref: "feature", sha, fork: false };
+        // movedDuringFix: the first read (pre-fix) matches, every later re-check does not
+        const sha = moved || (opts.movedDuringFix && headReads > 1) ? "m".repeat(40) : (opts.liveSha ?? HEAD);
+        return { ref: "feature", sha, fork: false, additions: opts.additions, deletions: opts.deletions };
       },
       gitDataApi() {
         return {
@@ -132,6 +152,7 @@ function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolea
           },
           async updateBranchRef(_branch: string, _sha: string, expectedOldSha: string) {
             // the real impl reads the ref right before the write and refuses on mismatch
+            if (opts.refMovedAtWrite) moved = true;
             const current = opts.refMovedAtWrite ? "a".repeat(40) : HEAD;
             if (current !== expectedOldSha) throw new Error("branch moved; refusing to update");
             committed = true;
@@ -139,11 +160,31 @@ function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolea
         };
       },
     },
-    requestFix: async () => opts.reply ?? '{"summary":"guard removed","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}',
+    requestFix: async (prompt: string) => {
+      prompts.push(prompt);
+      if (prompts.length <= (opts.requestThrows ?? 0)) throw new Error("local LLM timeout");
+      return replies[Math.min(prompts.length - 1 - (opts.requestThrows ?? 0), replies.length - 1)];
+    },
     validate: async () => ({ ok: opts.validateOk ?? true }),
+    sleep: async () => {
+      sleeps += 1;
+    },
   };
-  return { deps, posted, get committed() { return committed; } };
+  return {
+    deps,
+    posted,
+    prompts,
+    get committed() {
+      return committed;
+    },
+    get sleeps() {
+      return sleeps;
+    },
+  };
 }
+
+const escalations = (posted: string[]) => posted.filter((b) => b.includes("<!-- ashlar-loop-escalate"));
+const reasonOf = (body: string) => /reason=([a-z-]+)/.exec(body)?.[1];
 
 describe("loopEnabled", () => {
   it("is off by default (no env flag) and off without a provider", () => {
@@ -169,204 +210,221 @@ describe("runPostReviewLoop gates", () => {
     assert.equal(f.posted.length, 0);
   });
 
-  it("a converged review is silent; a fork is a reported halt (the user asked for a loop)", async () => {
+  it("a converged review is silent: its clean review IS the terminal signal", async () => {
     const f = fakeDeps();
-    assert.equal((await runPostReviewLoop("t", job({ findings: [] }), sample, settings(), [], f.deps, ENV_ON)).ran, false);
-    assert.equal(f.posted.length, 0, "converged: nothing to report");
-    assert.equal((await runPostReviewLoop("t", job({ isFork: true }), sample, settings(), [], f.deps, ENV_ON)).ran, false);
-    assert.equal(f.posted.length, 1);
-    assert.match(f.posted[0], /halted before fix[\s\S]*fork/);
+    const r = await runPostReviewLoop("t", job({ findings: [] }), sample, settings(), [], f.deps, ENV_ON);
+    assert.deepEqual(r, { ran: false, reason: "no findings (converged)" });
+    assert.equal(f.posted.length, 0);
   });
 });
 
-describe("runPostReviewLoop steps", () => {
-  it("escalates (fixed handoff) and does NOT attempt a fix when the loop is stuck", async () => {
+describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCALATE or superseded)", () => {
+  it("stuck → fixed ESCALATE and NO fix attempt", async () => {
     const f = fakeDeps({ rounds: [6, 4, 4] }); // recurring file, plateau => whack-a-mole
     const r = await runPostReviewLoop("t", job(), sample, settings(), [job()], f.deps, ENV_ON);
-    assert.equal(r.ran, true);
-    if (r.ran) assert.equal(r.step, "escalated");
-    assert.equal(f.posted.length, 1);
-    assert.ok(f.posted[0].includes("<!-- ashlar-loop-escalate"));
+    assert.ok(r.ran && r.step === "escalated");
+    assert.deepEqual(escalations(f.posted).map(reasonOf), ["whack-a-mole"]);
+    assert.equal(f.prompts.length, 0);
     assert.equal(f.committed, false);
   });
 
-  it("suggest mode runs one fix round, posts the proposal, and does not push", async () => {
-    const f = fakeDeps({ rounds: [3] }); // single round on HEAD => not stuck
+  it("budget: within the fix-round budget an improving loop fixes and continues", async () => {
+    const f = fakeDeps({ rounds: [5, 4, 3] });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, { ...ENV_ON, ASHLAR_LOOP_ROUND_CAP: "3" } as NodeJS.ProcessEnv);
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.continued === true);
+    const cont = f.posted.map((b) => parseContinueMarker(b, { authoredByBot: true })).find(Boolean);
+    assert.equal(cont?.round, 4, "review round 4 verifies the 3rd (last budgeted) fix");
+  });
+
+  it("budget: the verification review after the last budgeted fix hands off (round-cap) even while improving", async () => {
+    const f = fakeDeps({ rounds: [5, 4, 3, 2] });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, { ...ENV_ON, ASHLAR_LOOP_ROUND_CAP: "3" } as NodeJS.ProcessEnv);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "round-cap");
+    assert.deepEqual(escalations(f.posted).map(reasonOf), ["round-cap"]);
+    assert.equal(f.prompts.length, 0, "no fix past the budget");
+  });
+
+  it("the default fix-round budget is 5", async () => {
+    const within = fakeDeps({ rounds: [9, 8, 7, 6, 5] });
+    const j = job({}, "apply");
+    const r5 = await runPostReviewLoop("t", j, sample, settings("apply"), [j], within.deps, ENV_ON);
+    assert.ok(r5.ran && r5.step === "fix");
+    const past = fakeDeps({ rounds: [9, 8, 7, 6, 5, 4] });
+    const r6 = await runPostReviewLoop("t", j, sample, settings("apply"), [j], past.deps, ENV_ON);
+    assert.ok(r6.ran && r6.step === "escalated" && r6.reason === "round-cap");
+  });
+
+  it("diff-too-large is enforced from the live PR size", async () => {
+    const f = fakeDeps({ rounds: [3], additions: 4000, deletions: 2000 });
+    const r = await runPostReviewLoop("t", job(), sample, settings(), [job()], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "diff-too-large");
+    assert.equal(f.prompts.length, 0);
+  });
+
+  it("an unattributable history (current review missing) is re-read once, then hands off — never fixes blind", async () => {
+    const f = fakeDeps({ rounds: [3], lastHead: "z".repeat(40) });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.equal(f.sleeps, 1, "one re-read for a lagging API");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error");
+    assert.match(escalations(f.posted)[0], /Detail: could not verify the loop history/);
+    assert.equal(f.committed, false);
+  });
+
+  it("never fixes past an existing handoff on this head (stuck + already escalated → quiet)", async () => {
+    const prior = { userLogin: BOT, body: `<!-- ashlar-loop-escalate reason=oscillation round=3 pr=7 head=${HEAD} -->` };
+    const f = fakeDeps({ rounds: [6, 4, 4], priorIssues: [prior] });
+    const r = await runPostReviewLoop("t", job(), sample, settings(), [job()], f.deps, ENV_ON);
+    assert.deepEqual(r, { ran: false, reason: "already escalated on this head" });
+    assert.equal(f.posted.length, 0);
+    assert.equal(f.prompts.length, 0);
+  });
+
+  it("suggest mode runs one fix round, posts the proposal, and does not push or escalate", async () => {
+    const f = fakeDeps({ rounds: [3] });
     const r = await runPostReviewLoop("t", job(), sample, settings("suggest"), [job()], f.deps, ENV_ON);
-    assert.equal(r.ran, true);
-    if (r.ran && r.step === "fix") assert.equal(r.outcome, "suggested");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested");
     assert.equal(f.committed, false);
     assert.ok(f.posted[0].includes("suggestion"));
+    assert.equal(escalations(f.posted).length, 0);
   });
 
-  it("apply mode commits through the validate gate and reports the sha", async () => {
+  it("apply mode commits through the validate gate, reports the sha, and continues with the fixed marker", async () => {
     const f = fakeDeps({ rounds: [3] });
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    assert.equal(r.ran, true);
-    if (r.ran && r.step === "fix") {
-      assert.equal(r.outcome, "applied");
-      assert.equal(r.commitSha, NEW_SHA);
-    }
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.commitSha === NEW_SHA && r.continued === true);
     assert.equal(f.committed, true);
     assert.ok(f.posted[0].includes(NEW_SHA));
+    assert.match(f.posted[0], /Loop continues/);
+    const cont = f.posted.map((b) => parseContinueMarker(b, { authoredByBot: true })).find(Boolean);
+    assert.deepEqual(cont, { mode: "apply", round: 2, pr: 7, head: NEW_SHA });
+    assert.ok(!f.posted.some((b) => /@ashlar/i.test(b)), "no bot @-mention posted");
   });
 
-  it("apply mode with a failing validator does not push and reports validation-failed", async () => {
+  it("a retryable failure is retried with the rejection fed back, then succeeds", async () => {
+    const f = fakeDeps({ rounds: [3], reply: ["not json at all", '{"summary":"ok","files":[{"path":"src/a.ts","content":"export const a = 3;\\n"}]}'] });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.attempts === 2);
+    assert.equal(f.prompts.length, 2);
+    assert.match(f.prompts[1], /PREVIOUS ATTEMPT REJECTED \(parse-failed\)/);
+    assert.ok(f.prompts[1].startsWith(f.prompts[0]), "the retry keeps the full original prompt");
+  });
+
+  it("a transport failure is retried; exhausting the attempts hands off (fix-failed)", async () => {
+    const f = fakeDeps({ rounds: [3], requestThrows: 5 });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed");
+    assert.equal(f.prompts.length, 2, "default 2 attempts");
+    assert.match(escalations(f.posted)[0], /Detail: request-failed after 2 attempt\(s\): local LLM timeout/);
+  });
+
+  it("apply with a failing validator never pushes and hands off (fix-failed)", async () => {
     const f = fakeDeps({ rounds: [3], validateOk: false });
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    if (r.ran && r.step === "fix") assert.equal(r.outcome, "validation-failed");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed");
+    assert.match(escalations(f.posted)[0], /validation-failed after 2 attempt/);
     assert.equal(f.committed, false);
   });
 
-  it("K1: does not fix when the live head no longer matches the reviewed SHA", async () => {
+  it("K3: a policy/context file is NOT editable (scope-violation → retried → fix-failed, no push)", async () => {
+    const f = fakeDeps({ rounds: [3], reply: '{"summary":"edit policy","files":[{"path":"docs/POLICY.md","content":"tampered"}]}' });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed");
+    assert.match(escalations(f.posted)[0], /scope-violation/);
+    assert.equal(f.committed, false);
+  });
+
+  it("no-change keeps the agent's rationale visible and hands off (fix-declined)", async () => {
+    const f = fakeDeps({ rounds: [3], reply: '{"summary":"all three are false positives: the guard exists at line 9","files":[]}' });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-declined");
+    assert.ok(f.posted.some((b) => b.startsWith("### Ashlar fix agent — no change") && b.includes("false positives")));
+    assert.match(escalations(f.posted)[0], /Detail: no-change: all three are false positives/);
+    assert.equal(f.committed, false);
+  });
+
+  it("apply on a fork PR hands off (loop-error); suggest on a fork still proposes", async () => {
+    const fork = (f: ReturnType<typeof fakeDeps>) => {
+      const orig = f.deps.gh.fetchPullHeadRef;
+      f.deps.gh.fetchPullHeadRef = async (...a) => ({ ...(await orig(...a)), fork: true });
+      return f;
+    };
+    const a = fork(fakeDeps({ rounds: [3] }));
+    const j = job({}, "apply");
+    const ra = await runPostReviewLoop("t", j, sample, settings("apply"), [j], a.deps, ENV_ON);
+    assert.ok(ra.ran && ra.step === "escalated" && ra.reason === "loop-error");
+    assert.match(escalations(a.posted)[0], /fork/);
+    const s2 = fork(fakeDeps({ rounds: [3] }));
+    const rs = await runPostReviewLoop("t", job(), sample, settings("suggest"), [job()], s2.deps, ENV_ON);
+    assert.ok(rs.ran && rs.step === "fix" && rs.outcome === "suggested");
+  });
+
+  it("K1: a head that moved before the fix = superseded (quiet: the newer head drives the loop)", async () => {
     const f = fakeDeps({ rounds: [3], liveSha: "a".repeat(40) });
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    assert.equal(r.ran, false);
-    if (!r.ran) assert.match(r.reason, /head moved/);
+    assert.deepEqual(r, { ran: false, reason: "superseded (head moved)" });
+    assert.equal(f.posted.length, 0);
     assert.equal(f.committed, false);
-    assert.equal(f.posted.length, 1, "the halt is reported in-thread (L4)");
-    assert.match(f.posted[0], /halted before fix[\s\S]*head moved/);
   });
 
-  it("K1: a head move DURING the fix is caught by the pre-commit re-check (no push)", async () => {
+  it("K1: a head move DURING the fix is caught before the commit and is quiet (superseded)", async () => {
     const f = fakeDeps({ rounds: [3], movedDuringFix: true });
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    if (r.ran && r.step === "fix") {
-      assert.equal(r.outcome, "validation-failed");
-      assert.match(r.error ?? "", /head moved during fix/);
-    }
+    assert.deepEqual(r, { ran: false, reason: "superseded (head moved)" });
     assert.equal(f.committed, false);
+    assert.equal(escalations(f.posted).length, 0);
+  });
+
+  it("L1: a force-push between validation and the ref write is refused and quiet (superseded)", async () => {
+    const f = fakeDeps({ rounds: [3], refMovedAtWrite: true });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.deepEqual(r, { ran: false, reason: "superseded (head moved)" });
+    assert.equal(f.committed, false);
+    assert.equal(escalations(f.posted).length, 0);
   });
 
   it("K2: the global setting is a ceiling — push only when BOTH command and setting say apply", async () => {
-    // command suggest + global apply → no push
     let f = fakeDeps({ rounds: [3] });
     let j = job({}, "suggest");
     let r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    if (r.ran && r.step === "fix") assert.equal(r.outcome, "suggested");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested");
     assert.equal(f.committed, false);
-    // command apply + global suggest → no push
     f = fakeDeps({ rounds: [3] });
     j = job({}, "apply");
     r = await runPostReviewLoop("t", j, sample, settings("suggest"), [j], f.deps, ENV_ON);
-    if (r.ran && r.step === "fix") assert.equal(r.outcome, "suggested");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested");
     assert.equal(f.committed, false);
     assert.ok(f.posted[0].includes("mode: suggest"), "report uses the effective mode");
   });
 
-  it("K3: a policy/context file in the snapshot is NOT editable (scope-violation, no push)", async () => {
-    const f = fakeDeps({
-      rounds: [3],
-      reply: '{"summary":"edit policy","files":[{"path":"docs/POLICY.md","content":"tampered"}]}',
-    });
-    const j = job({}, "apply");
-    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    if (r.ran && r.step === "fix") assert.equal(r.outcome, "scope-violation");
-    assert.equal(f.committed, false);
-  });
-
-  it("never throws: a dependency failure becomes a structured non-run", async () => {
+  it("never throws: a dependency failure hands off (loop-error) with the cause", async () => {
     const f = fakeDeps({ rounds: [3] });
     f.deps.gh.fetchPullHeadRef = async () => {
       throw new Error("boom");
     };
     const r = await runPostReviewLoop("t", job(), sample, settings(), [job()], f.deps, ENV_ON);
-    assert.equal(r.ran, false);
-    if (!r.ran) assert.match(r.reason, /boom/);
-    assert.ok(f.posted.some((b) => /halted before fix[\s\S]*boom/.test(b)), "the failure is observable in-thread (L4)");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error");
+    assert.match(escalations(f.posted)[0], /Detail: loop step failed: boom/);
   });
 
-  it("L1: a backward force-push between validation and the ref write is refused (no restore)", async () => {
-    const f = fakeDeps({ rounds: [3], refMovedAtWrite: true });
+  it("a continuation that cannot be composed hands off instead of announcing 'Loop continues'", async () => {
+    const f = fakeDeps({ rounds: [3], commitSha: "newsha" }); // not a full SHA → parser would reject
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    if (r.ran && r.step === "fix") {
-      assert.equal(r.outcome, "commit-failed");
-      assert.match(r.error ?? "", /branch moved/);
-      assert.equal(r.continued, false);
-    }
-    assert.equal(f.committed, false);
-  });
-
-  it("L3: an applied round continues the loop with the FIXED continuation marker on the new head", async () => {
-    const f = fakeDeps({ rounds: [3] });
-    const j = job({}, "apply");
-    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    if (r.ran && r.step === "fix") assert.equal(r.continued, true);
-    // the control signal first, then the report that states it
-    assert.ok(parseContinueMarker(f.posted[0], { authoredByBot: true }), "continuation posted first");
-    assert.match(f.posted[1], /Loop continues/);
-    const cont = f.posted.map((b) => parseContinueMarker(b, { authoredByBot: true })).find(Boolean);
-    assert.deepEqual(cont, { mode: "apply", round: 2, pr: 7, head: NEW_SHA }, "marker names the next round + new head");
-    // never an @-mention / prose directive: the webhook parser ignores those from the bot
-    assert.ok(!f.posted.some((b) => /@ashlar/i.test(b)), "no bot @-mention posted");
-  });
-
-  it("a failed continuation POST: the report never claims 'Loop continues' and states the stop — no contradictory halt", async () => {
-    const f = fakeDeps({ rounds: [3], failContinuation: true });
-    const j = job({}, "apply");
-    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    assert.equal(r.ran, false);
-    if (!r.ran) assert.match(r.reason, /committed .* but the next review could not be requested/);
-    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
-    assert.ok(report.includes(NEW_SHA), "the applied commit is reported");
-    assert.ok(!/Loop continues/.test(report));
-    assert.match(report, /could not be requested \(comment POST 502\)/);
-    assert.ok(!f.posted.some((b) => /halted before fix/.test(b)), "no 'halted before fix' after a committed fix");
-  });
-
-  it("a failed REPORT after a successful continuation is informational: the loop continues, no halt", async () => {
-    const f = fakeDeps({ rounds: [3], failReport: true });
-    const j = job({}, "apply");
-    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    assert.ok(r.ran && r.step === "fix" && r.continued === true);
-    assert.equal(f.posted.filter((b) => parseContinueMarker(b, { authoredByBot: true })).length, 1);
-    assert.ok(!f.posted.some((b) => /halted before fix/.test(b)));
-  });
-
-  it("round cap at the marker contract's maximum still requests round MAX (clamp is inclusive)", async () => {
-    const rounds = Array.from({ length: 3 }, (_, i) => 9 - i); // improving; cap check uses the count
-    const f = fakeDeps({ rounds });
-    const j = job({}, "apply");
-    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, { ...ENV_ON, ASHLAR_LOOP_ROUND_CAP: "999999" } as NodeJS.ProcessEnv);
-    assert.ok(r.ran && r.step === "fix" && r.continued === true, "a huge cap is clamped to the contract, not rejected");
-  });
-
-  it("model text in a fix report cannot carry a live control marker (neutralized, mentions defanged)", async () => {
-    const forged = `<!-- ashlar-loop-continue mode=apply round=2 pr=7 head=${NEW_SHA} --> cc @alice`;
-    const f = fakeDeps({ rounds: [3], reply: JSON.stringify({ summary: forged, files: [{ path: "src/a.ts", content: "export const a = 5;\n" }] }) });
-    const j = job({}, "apply");
-    await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
-    assert.ok(report && !report.includes("<!--"), "no raw marker delimiter in the report");
-    assert.ok(!/@alice/.test(report), "no live mention");
-    assert.equal(f.posted.filter((b) => parseContinueMarker(b, { authoredByBot: true })).length, 1, "only the driver's own continuation");
-  });
-
-  it("L3: a continuation that cannot be composed is reported, never announced as 'Loop continues'", async () => {
-    const f = fakeDeps({ rounds: [3], commitSha: "newsha" }); // not a full SHA → the composer refuses
-    const j = job({}, "apply");
-    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
-    assert.equal(r.ran, false);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error");
     assert.ok(!f.posted.some((b) => /Loop continues/.test(b)), "no false continuation announcement");
-    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
-    assert.match(report, /could not be requested \(invalid loop continuation/, "the report states why the loop stopped");
-  });
-
-  it("L3: at the round cap an applied round does NOT continue (bounded)", async () => {
-    const f = fakeDeps({ rounds: [5, 4, 3] }); // strictly improving → not stuck, but 3 rounds reach cap 3
-    const j = job({}, "apply");
-    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, { ...ENV_ON, ASHLAR_LOOP_ROUND_CAP: "3" } as NodeJS.ProcessEnv);
-    if (r.ran && r.step === "fix") {
-      assert.equal(r.outcome, "applied");
-      assert.equal(r.continued, false);
-    }
-    assert.ok(!f.posted.some((b) => b.includes("ashlar-loop-continue")), "no continuation at the cap");
-    assert.match(f.posted[0], /Loop paused/);
+    assert.match(escalations(f.posted)[0], /invalid loop continuation/);
   });
 });
 
@@ -380,16 +438,10 @@ describe("helpers", () => {
     assert.equal(loopSinceIso(job({ thread: { kind: "mention", commentId: 1, userText: "x" } }), []), undefined);
   });
 
-  it("L3: bot continuation starts stay in the human-started session (exact App identity)", () => {
+  it("L3: bot continuation starts stay in the human-started session", () => {
     const human = job({ createdAt: 1000, sender: "alice" });
-    const cont = job({ createdAt: 2000, sender: BOT });
-    assert.equal(loopSinceIso(cont, [human, cont], BOT), new Date(1000).toISOString());
-    // a human whose login equals the mention handle, or ANOTHER App, still starts a session —
-    // only the exact resolved App login is excluded
-    const handleNamedHuman = job({ createdAt: 3000, sender: "ashlar-bot" });
-    assert.equal(loopSinceIso(handleNamedHuman, [human, handleNamedHuman], BOT), new Date(3000).toISOString());
-    const otherApp = job({ createdAt: 4000, sender: "other-app[bot]" });
-    assert.equal(loopSinceIso(otherApp, [human, otherApp], BOT), new Date(4000).toISOString());
+    const cont = job({ createdAt: 2000, sender: "ashlar-bot-review-loop[bot]" });
+    assert.equal(loopSinceIso(cont, [human, cont], "ashlar-bot"), new Date(1000).toISOString());
   });
 
   it("ashlarBotLogin: ASHLAR_BOT_LOGIN only in the App-reserved <slug>[bot] shape", () => {

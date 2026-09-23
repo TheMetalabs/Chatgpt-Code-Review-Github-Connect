@@ -51,7 +51,12 @@ export type EscalateReason =
   | "wrong-scope"
   | "re-flag-deferred"
   | "diff-too-large"
-  | "round-cap";
+  | "round-cap"
+  // Fix-round terminal failures (the loop cannot progress without a human): every way a
+  // requested loop can stop maps to exactly one fixed reason — never to free text.
+  | "fix-failed"
+  | "fix-declined"
+  | "loop-error";
 
 const REASONS: readonly EscalateReason[] = [
   "whack-a-mole",
@@ -61,6 +66,9 @@ const REASONS: readonly EscalateReason[] = [
   "re-flag-deferred",
   "diff-too-large",
   "round-cap",
+  "fix-failed",
+  "fix-declined",
+  "loop-error",
 ];
 
 export function isEscalateReason(x: string): x is EscalateReason {
@@ -82,7 +90,13 @@ export const ESCALATE_DIRECTIVE: Record<EscalateReason, string> = {
   "diff-too-large":
     "Diff is too large / multi-domain to converge. Do not resume the loop — split into a dependency-ordered stack (design change).",
   "round-cap":
-    "Round cap reached without a clear signal. Classify by finding-count trend and repeated files, then decide direction.",
+    "Fix-round budget exhausted and the verification review still has findings. Classify by finding-count trend and repeated files, then decide direction.",
+  "fix-failed":
+    "The fix agent could not produce an applicable fix within its retries (see Detail). Fix these findings manually, or resolve the cause and re-run the loop.",
+  "fix-declined":
+    "The fix agent changed nothing: it pushed back on, declined or deferred every finding (see Detail). Adjudicate each one — accept the push-back and resolve the thread, or fix it manually.",
+  "loop-error":
+    "The loop could not run a fix round on this PR (see Detail), e.g. apply on a fork, no editable changed files, a missing snapshot or unreadable loop history. Resolve the cause, then re-run the loop.",
 };
 
 // ── ESCALATE payload composer (§8) ───────────────────────────────────────────
@@ -102,6 +116,16 @@ export interface EscalateState {
   ciState?: string;
   diffLines?: number;
   ledger?: { declines?: number; defers?: number; pushbacks?: number };
+  /** Deterministic failure detail (outcome + error). Untrusted (error text may quote model
+   * output): neutralized, flattened to one line and truncated before it is rendered. */
+  detail?: string;
+}
+
+const DETAIL_MAX = 500;
+
+function renderDetail(detail: string): string {
+  const one = neutralizeMarkers(detail).replace(/\s+/g, " ").trim();
+  return one.length > DETAIL_MAX ? `${one.slice(0, DETAIL_MAX)}…` : one;
 }
 
 /** Escape HTML-comment delimiters so interpolated untrusted text (model output, file paths, CI
@@ -140,7 +164,7 @@ export function escalateComment(s: EscalateState): string {
   const lines = [
     escalateMarker(s),
     "",
-    `${REVIEW_LOOP_ESCALATE_HUMAN} (round ${s.round}/${s.roundCap})`,
+    `${REVIEW_LOOP_ESCALATE_HUMAN} (review round ${s.round}; fix-round budget ${s.roundCap})`,
     "",
     "State (re-verify below — do not trust this narrative):",
     `- Finding trend: ${fmtTrend(s.findingTrend)}`,
@@ -149,6 +173,7 @@ export function escalateComment(s: EscalateState): string {
     `- Diff size: ${s.diffLines ?? "unknown"} lines; decision ledger: ${ledger}`,
     "",
     `Stop reason: ${s.reason}`,
+    ...(s.detail ? [`Detail: ${renderDetail(s.detail)}`] : []),
     `Directive: ${ESCALATE_DIRECTIVE[s.reason]}`,
     "",
     "Re-derive from the API before acting (narrative may be stale after compaction):",
@@ -407,13 +432,16 @@ const WHACK_MIN_REPEAT = 2; // a file flagged in >= this many of the window => w
  * Classify why a loop is stuck, or null when it is converged / still making progress.
  *
  * CONTRACT (single source of the stuck-definition — do not patch case-by-case):
+ * - A ROUND is one reviewed head; review round k may be followed by fix round k.
+ * - `roundCap` is the FIX-ROUND BUDGET (design: at most N review→fix rounds, default 5). Review
+ *   round N+1 is the verification review of the N-th fix: clean → CONVERGED, else round-cap.
  * - Converged: last round has 0 findings → null.
- * - Still improving: the recent window is STRICTLY decreasing → null, even at the cap or with
- *   a recurring file (that is healthy progress, not stuck).
- * - Otherwise, in precedence order: diff-too-large (structural, never converges) >
- *   whack-a-mole (>=3 rounds, a file recurs in the window, trend not strictly improving) >
- *   oscillation (>=3 rounds, window not trending down, all non-zero) > round-cap (cap hit,
- *   trend not strictly improving).
+ * - diff-too-large (structural, never converges) first.
+ * - Patterns need >=3 rounds and a window that is NOT strictly decreasing (a strictly
+ *   decreasing window is healthy progress, even with a recurring file): whack-a-mole (a file
+ *   recurs in the window) > oscillation (all non-zero).
+ * - Budget: rounds > roundCap → round-cap REGARDLESS of trend (a hard bound — the loop must
+ *   end in a fixed terminal signal, never a silent pause).
  * The semantic reasons (guard-accretion, wrong-scope, re-flag-deferred) need diff/semantic
  * context the finding trend cannot supply and are left to the human.
  */
@@ -446,8 +474,8 @@ export function classifyStuck(
     return "oscillation";
   }
 
-  // round-cap: reached the cap AND not still improving (a converging loop keeps running).
-  if (rounds.length >= opts.roundCap && !strictlyImproving) return "round-cap";
+  // round-cap: the fix-round budget is spent and the verification review still has findings.
+  if (rounds.length > opts.roundCap) return "round-cap";
   return null;
 }
 
@@ -462,9 +490,10 @@ export function repeatedRoundFiles(rounds: RoundSummary[], window = WHACK_WINDOW
 export function escalateFromRounds(
   reason: EscalateReason,
   rounds: RoundSummary[],
-  ctx: { pr: number; head: string; repo: string; roundCap: number; diffLines?: number },
+  ctx: { pr: number; head: string; repo: string; roundCap: number; diffLines?: number; detail?: string },
 ): string {
   return escalateComment({
+    detail: ctx.detail,
     reason,
     round: rounds.length ? rounds[rounds.length - 1].index : 0,
     roundCap: ctx.roundCap,

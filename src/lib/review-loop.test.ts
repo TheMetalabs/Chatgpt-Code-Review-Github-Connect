@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   parseReviewLoopDirective,
+  isEscalateReason,
   escalateComment,
   escalateMarker,
   parseEscalateMarker,
@@ -219,7 +220,8 @@ describe("escalate marker + composer", () => {
     });
     assert.ok(isEscalateComment(body, BOT));
     assert.ok(body.includes(REVIEW_LOOP_ESCALATE_HUMAN));
-    assert.ok(body.includes("(round 3/10)"));
+    assert.ok(body.includes("(review round 3; fix-round budget 10)"));
+    assert.ok(!body.includes("Detail:"), "no detail line unless a failure detail is given");
     assert.ok(body.includes(ESCALATE_DIRECTIVE["whack-a-mole"]));
     assert.ok(body.includes("R1=4 R2=4 R3=5 (increasing)"));
     assert.ok(body.includes("src/lib/harbor.server.ts"));
@@ -302,9 +304,11 @@ describe("classifyStuck", () => {
     assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 3, ["c"])], { roundCap: 8 }), null); // still improving
   });
 
-  it("round-cap fires for a short (<3 round) non-improving history at the cap (J7)", () => {
-    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 5, ["b"])], { roundCap: 2 }), "round-cap");
-    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 3, ["b"])], { roundCap: 2 }), null); // improving at the cap
+  it("roundCap is the FIX-ROUND budget: review N+1 (the verification review) with findings is round-cap", () => {
+    // cap 2: reviews 1..2 may each be followed by a fix; review 3 verifies the 2nd fix
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 5, ["b"])], { roundCap: 2 }), null); // budget not spent yet
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 3, ["b"]), R(3, 1, ["c"])], { roundCap: 2 }), "round-cap");
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 3, ["b"]), R(3, 0, [])], { roundCap: 2 }), null); // CONVERGED
   });
 
   it("diff-too-large overrides everything", () => {
@@ -312,14 +316,33 @@ describe("classifyStuck", () => {
     assert.equal(classifyStuck(prog, { roundCap: 8, diffLines: 6000 }), "diff-too-large");
   });
 
-  it("does NOT escalate a strictly-decreasing loop even at the round cap (H4)", () => {
+  it("a strictly-decreasing loop keeps running within the budget, but the budget is a HARD bound", () => {
     const converging = [R(1, 10, ["a"]), R(2, 8, ["b"]), R(3, 6, ["c"]), R(4, 4, ["d"]), R(5, 2, ["e"])];
-    assert.equal(classifyStuck(converging, { roundCap: 5 }), null);
+    assert.equal(classifyStuck(converging, { roundCap: 5 }), null); // 5th fix still allowed
+    // the verification review of the 5th fix still has findings: hand off, even though improving
+    assert.equal(classifyStuck([...converging, R(6, 1, ["f"])], { roundCap: 5 }), "round-cap");
   });
 
-  it("round-cap fires on a short non-improving history at the cap; a >=3 non-improving window is oscillation (H4/J5)", () => {
-    assert.equal(classifyStuck([R(1, 4, ["a"]), R(2, 4, ["b"])], { roundCap: 2 }), "round-cap"); // 2 rounds, plateau, cap
-    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 3 }), "oscillation"); // >=3 non-improving
+  it("specific patterns take precedence over the budget; a >=3 non-improving window is oscillation (J5)", () => {
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 2 }), "oscillation");
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["a"]), R(3, 4, ["c"])], { roundCap: 2 }), "whack-a-mole");
+  });
+
+  it("failure reasons are fixed vocabulary with directives, and the detail line is neutralized", () => {
+    for (const r of ["fix-failed", "fix-declined", "loop-error"] as const) {
+      assert.ok(isEscalateReason(r));
+      assert.ok(ESCALATE_DIRECTIVE[r].length > 20);
+    }
+    const body = escalateComment({
+      reason: "fix-failed", round: 2, roundCap: 5, pr: 9, head: "abc", repo: "a/b",
+      detail: "parse-failed after 2 attempt(s): <!-- ashlar-loop-stopped -->\n" + "x".repeat(900),
+    });
+    const detail = body.split("\n").find((l) => l.startsWith("Detail: ")) ?? "";
+    assert.ok(detail, "detail rendered on one line");
+    assert.ok(!detail.includes("<!--"), "a quoted marker in the detail is defanged");
+    assert.ok(detail.length < 560, "detail is truncated");
+    assert.equal(isStoppedComment(body, BOT), false);
+    assert.equal(parseEscalateMarker(body, BOT)?.reason, "fix-failed");
   });
 
   it("does NOT classify two improving rounds on the same file as whack-a-mole (H2)", () => {

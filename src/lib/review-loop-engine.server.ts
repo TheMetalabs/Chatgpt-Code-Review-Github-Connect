@@ -27,7 +27,7 @@ export interface ReviewLoopGithub {
     owner: string,
     repo: string,
     pr: number,
-  ): Promise<Array<{ userLogin: string; path: string; commitId: string }>>;
+  ): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string }>>;
   listIssueComments(
     token: string,
     owner: string,
@@ -53,9 +53,6 @@ function isBot(login: string, botLogin: string): boolean {
   return login.toLowerCase() === botLogin.toLowerCase();
 }
 
-function short(sha: string): string {
-  return (sha || "").slice(0, 7);
-}
 
 function parseFindingsTotal(body: string): number | null {
   const m = FINDINGS_RE.exec(body || "");
@@ -89,24 +86,27 @@ export async function reconstructRounds(
     gh.listReviewComments(token, owner, repo, pr),
   ]);
 
+  // Full commit SHA is identity everywhere (a 7-char prefix can collide); short() is display-only.
+  // G6: a comment counts only if it is in-session (created at/after sinceIso), so a pre-loop
+  // comment on a head cannot leak into the current loop's file history.
   const filesByHead = new Map<string, Set<string>>();
   for (const c of comments) {
     if (!isBot(c.userLogin, botLogin) || !c.commitId || !c.path) continue;
-    const head = short(c.commitId);
+    if (opts.sinceIso && (c.createdAt || "") < opts.sinceIso) continue;
+    const head = c.commitId;
     (filesByHead.get(head) ?? filesByHead.set(head, new Set()).get(head)!).add(c.path);
   }
 
   const byHead = new Map<string, number>();
   const order: string[] = [];
-  // Bound to the CURRENT loop session: only reviews at/after the loop start (sinceIso) count,
-  // so historical reviews from before this loop cannot be misread as whack-a-mole rounds.
   const ashlarReviews = reviews
     .filter((r) => isBot(r.userLogin, botLogin) && (!opts.sinceIso || (r.submittedAt || "") >= opts.sinceIso))
     .sort((a, b) => (a.submittedAt || "").localeCompare(b.submittedAt || ""));
   for (const rv of ashlarReviews) {
     const total = parseFindingsTotal(rv.body);
     if (total === null) continue; // ops / non-summary review row
-    const head = short(rv.commitId);
+    const head = rv.commitId;
+    if (!head) continue;
     if (!byHead.has(head)) order.push(head);
     byHead.set(head, total);
   }
@@ -132,7 +132,7 @@ async function alreadyEscalated(
   const issues = await gh.listIssueComments(token, owner, repo, pr);
   for (const c of issues) {
     const parsed = parseEscalateMarker(c.body, { authoredByBot: isBot(c.userLogin, botLogin) });
-    if (parsed && short(parsed.head) === short(head)) return true;
+    if (parsed && parsed.head === head) return true; // full-SHA equality
   }
   return false;
 }
@@ -150,6 +150,11 @@ export interface EscalateResult {
  * emit the fixed ESCALATE handoff. Safe to call after every loop review: a non-stuck loop
  * (converged or still making progress) returns without posting.
  */
+// In-process serialization so two concurrent maybeEscalate calls for the same PR/head cannot
+// both pass the check-then-post idempotency window and double-emit. (Cross-process dedup still
+// relies on the alreadyEscalated marker scan; note that in a multi-instance deploy.)
+const inFlightEscalate = new Set<string>();
+
 export async function maybeEscalate(
   gh: ReviewLoopGithub,
   token: string,
@@ -165,6 +170,22 @@ export async function maybeEscalate(
   },
 ): Promise<EscalateResult> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
+  const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
+  if (inFlightEscalate.has(key)) return { escalated: false, rounds: [], error: "escalate already in flight for this head" };
+  inFlightEscalate.add(key);
+  try {
+    return await maybeEscalateInner(gh, token, opts, botLogin);
+  } finally {
+    inFlightEscalate.delete(key);
+  }
+}
+
+async function maybeEscalateInner(
+  gh: ReviewLoopGithub,
+  token: string,
+  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number; sinceIso?: string },
+  botLogin: string,
+): Promise<EscalateResult> {
   // Fail closed on an incomplete/failed history read: never classify or (dup-)post from
   // partial data — the list helpers throw rather than return a truncated list.
   let rounds: RoundSummary[];
@@ -184,7 +205,7 @@ export async function maybeEscalate(
   }
   const body = escalateFromRounds(reason, rounds, {
     pr: opts.pr,
-    head: short(opts.head),
+    head: opts.head, // full SHA — the marker is the idempotency key
     repo: `${opts.owner}/${opts.repo}`,
     roundCap: opts.roundCap,
     diffLines: opts.diffLines,

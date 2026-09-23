@@ -663,14 +663,19 @@ export async function createPullReview(
 // Paginate to exhaustion and THROW on any page error, so an incomplete history is never
 // mistaken for a complete one (an idempotency-sensitive caller must abort, not assume empty).
 async function ghListAll<T>(token: string, pathBase: string): Promise<T[]> {
+  const MAX_PAGES = 50;
   const all: T[] = [];
-  for (let page = 1; page <= 50; page += 1) {
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
     const sep = pathBase.includes("?") ? "&" : "?";
     const out = await gh<T[]>(token, `${pathBase}${sep}per_page=100&page=${page}`);
     if (!out.ok) throw new Error(`list ${pathBase} failed (${out.status}): ${out.text}`);
     const batch = out.data ?? [];
     all.push(...batch);
-    if (batch.length < 100) break;
+    if (batch.length < 100) return all; // exhausted
+    if (page === MAX_PAGES) {
+      // a full final page means more rows exist — fail closed rather than truncate silently
+      throw new Error(`list ${pathBase} exceeded ${MAX_PAGES * 100} rows (incomplete history)`);
+    }
   }
   return all;
 }
@@ -698,8 +703,8 @@ export async function listReviewComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; path: string; commitId: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null }>(
+): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string }>> {
+  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null }>(
     token,
     `/repos/${owner}/${repo}/pulls/${pr}/comments`,
   );
@@ -707,6 +712,7 @@ export async function listReviewComments(
     userLogin: String(c.user?.login ?? ""),
     path: String(c.path ?? ""),
     commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
+    createdAt: String(c.created_at ?? ""),
   }));
 }
 
@@ -746,15 +752,17 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
       // Preserve each existing path's file mode (executable 100755, symlink 120000); a
       // genuinely new file defaults to a regular 100644 blob. Without this the fix commit
       // would silently drop the +x bit or turn a symlink into a regular file.
-      const baseOut = await gh<{ tree?: Array<{ path?: string; mode?: string; type?: string }> }>(
+      const baseOut = await gh<{ tree?: Array<{ path?: string; mode?: string; type?: string }>; truncated?: boolean }>(
         token,
         `${base}/trees/${baseTreeSha}?recursive=1`,
       );
+      // Fail closed: without the base tree we cannot preserve executable/symlink modes, and
+      // defaulting to 100644 would silently strip the +x bit — refuse rather than corrupt modes.
+      if (!baseOut.ok) throw new Error(`base tree read failed (${baseOut.status}): ${baseOut.text}`);
+      if (baseOut.data.truncated) throw new Error("base tree truncated; cannot preserve file modes safely");
       const modeByPath = new Map<string, string>();
-      if (baseOut.ok) {
-        for (const e of baseOut.data.tree ?? []) {
-          if (e.path && e.mode && e.type === "blob") modeByPath.set(e.path, e.mode);
-        }
+      for (const e of baseOut.data.tree ?? []) {
+        if (e.path && e.mode && e.type === "blob") modeByPath.set(e.path, e.mode);
       }
       const tree = entries.map((e) => ({ path: e.path, mode: modeByPath.get(e.path) ?? "100644", type: "blob", sha: e.sha }));
       const out = await gh<{ sha?: string }>(token, `${base}/trees`, {

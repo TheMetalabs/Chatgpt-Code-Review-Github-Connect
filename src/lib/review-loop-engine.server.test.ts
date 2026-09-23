@@ -24,7 +24,7 @@ function fakeGh(
     },
     async listReviewComments() {
       return rounds.flatMap((r) =>
-        r.files.map((f) => ({ userLogin: BOT, path: f, commitId: r.head + "0000000" })),
+        r.files.map((f) => ({ userLogin: BOT, path: f, commitId: r.head + "0000000", createdAt: r.at })),
       );
     },
     async listIssueComments() {
@@ -47,8 +47,8 @@ describe("reconstructRounds", () => {
     const rounds = await reconstructRounds(gh, "t", "o", "r", 1);
     assert.equal(rounds.length, 2);
     assert.deepEqual(rounds.map((r) => [r.index, r.findings, r.head]), [
-      [1, 6, "aaaaaaa"],
-      [2, 3, "bbbbbbb"],
+      [1, 6, "aaaaaaa0000000"],
+      [2, 3, "bbbbbbb0000000"],
     ]);
     assert.deepEqual(rounds[0].files, ["x.ts"]);
   });
@@ -93,9 +93,9 @@ describe("maybeEscalate", () => {
   });
 
   it("is idempotent: does not re-emit when an escalate for this head already exists", async () => {
-    const existing = [{ userLogin: BOT, body: "<!-- ashlar-loop-escalate reason=whack-a-mole round=6 pr=68 head=h500000 -->" }];
+    const existing = [{ userLogin: BOT, body: "<!-- ashlar-loop-escalate reason=whack-a-mole round=6 pr=68 head=h5000000full -->" }];
     const { gh, posted } = fakeGh(pr68, existing);
-    const res = await maybeEscalate(gh, "t", { owner: "o", repo: "r", pr: 68, head: "h500000", roundCap: 8 });
+    const res = await maybeEscalate(gh, "t", { owner: "o", repo: "r", pr: 68, head: "h5000000full", roundCap: 8 });
     assert.equal(res.escalated, false);
     assert.equal(res.reason, "whack-a-mole"); // still classified, just not re-posted
     assert.equal(posted.length, 0);
@@ -130,7 +130,7 @@ describe("maybeEscalate — provenance, session boundary, fail-closed (round-1 f
           { userLogin: bot, body: "<!-- ashlar-findings total=4 -->", commitId: "new0000" + "0", submittedAt: "2026-06-01T00:00:00Z" },
         ];
       },
-      async listReviewComments() { return [{ userLogin: bot, path: files[0], commitId: "old00000" }, { userLogin: bot, path: files[0], commitId: "new00000" }]; },
+      async listReviewComments() { return [{ userLogin: bot, path: files[0], commitId: "old00000", createdAt: "2026-01-01T00:00:00Z" }, { userLogin: bot, path: files[0], commitId: "new00000", createdAt: "2026-06-01T00:00:00Z" }]; },
       async listIssueComments() { return []; },
       async createIssueComment() { return { id: 1 }; },
     };
@@ -143,12 +143,74 @@ describe("maybeEscalate — provenance, session boundary, fail-closed (round-1 f
   it("F6: an incomplete/failed history read fails closed (no classify, no post)", async () => {
     const gh = {
       async listPullReviews() { return [{ userLogin: bot, body: "<!-- ashlar-findings total=6 -->", commitId: "h0000000", submittedAt: "2026-01-01T00:00:00Z" }]; },
-      async listReviewComments() { return [{ userLogin: bot, path: files[0], commitId: "h000000" }]; },
+      async listReviewComments() { return [{ userLogin: bot, path: files[0], commitId: "h0000000", createdAt: "2026-01-01T00:00:00Z" }]; },
       async listIssueComments() { throw new Error("list issues failed (502)"); },
       async createIssueComment() { throw new Error("must not post on incomplete history"); },
     };
     const res = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "h000000", roundCap: 1 });
     assert.equal(res.escalated, false);
     assert.match(res.error ?? "", /list issues failed/);
+  });
+});
+
+describe("engine round-2 fixes", () => {
+  const bot = "ashlar-bot-review-loop[bot]";
+
+  it("G8: two full SHAs sharing a 7-char prefix are distinct rounds", async () => {
+    const a = "abcdef1" + "1".repeat(33);
+    const b = "abcdef2" + "2".repeat(33); // same first 6, differ at char 7
+    const gh = {
+      async listPullReviews() {
+        return [
+          { userLogin: bot, body: "<!-- ashlar-findings total=3 -->", commitId: a, submittedAt: "2026-01-01T00:00:00Z" },
+          { userLogin: bot, body: "<!-- ashlar-findings total=2 -->", commitId: b, submittedAt: "2026-01-02T00:00:00Z" },
+        ];
+      },
+      async listReviewComments() { return []; },
+      async listIssueComments() { return []; },
+      async createIssueComment() { return { id: 1 }; },
+    };
+    const res = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: b, roundCap: 8 });
+    assert.equal(res.rounds.length, 2, "distinct full SHAs must not collapse");
+  });
+
+  it("G6: a pre-session inline comment does not leak into the current loop's file history", async () => {
+    const head = "h".repeat(40);
+    const gh = {
+      async listPullReviews() {
+        // in-session review of head with NO x.ts finding
+        return [{ userLogin: bot, body: "<!-- ashlar-findings total=1 -->", commitId: head, submittedAt: "2026-06-01T00:00:00Z" }];
+      },
+      async listReviewComments() {
+        // an OLD (pre-session) comment on the same head flagging x.ts
+        return [{ userLogin: bot, path: "x.ts", commitId: head, createdAt: "2026-01-01T00:00:00Z" }];
+      },
+      async listIssueComments() { return []; },
+      async createIssueComment() { return { id: 1 }; },
+    };
+    const rounds = await reconstructRounds(gh as never, "t", "o", "r", 1, { sinceIso: "2026-05-01T00:00:00Z" });
+    assert.equal(rounds.length, 1);
+    assert.deepEqual(rounds[0].files, [], "pre-session comment must not attach to the in-session round");
+  });
+
+  it("G7: concurrent maybeEscalate for the same head posts at most once", async () => {
+    const pr68 = [6, 4, 3, 4, 3, 3];
+    let posts = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const gh = {
+      async listPullReviews() {
+        return pr68.map((n, i) => ({ userLogin: bot, body: `<!-- ashlar-findings total=${n} -->`, commitId: `c${i}`.padEnd(40, "0"), submittedAt: `2026-01-0${i + 1}T00:00:00Z` }));
+      },
+      async listReviewComments() { return pr68.map((_n, i) => ({ userLogin: bot, path: "src/a.ts", commitId: `c${i}`.padEnd(40, "0"), createdAt: `2026-01-0${i + 1}T00:00:00Z` })); },
+      async listIssueComments() { await gate; return []; }, // hold both past the idempotency check
+      async createIssueComment() { posts += 1; return { id: posts }; },
+    };
+    const head = "c5".padEnd(40, "0");
+    const p1 = maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 68, head, roundCap: 8 });
+    const p2 = maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 68, head, roundCap: 8 });
+    release();
+    await Promise.all([p1, p2]);
+    assert.equal(posts, 1, "the in-process guard serializes same-head escalation");
   });
 });

@@ -7,7 +7,7 @@
  * a full-file schema parsed deterministically (fix-apply); `suggest` mode returns the change
  * set for a proposal, `apply` mode commits it atomically (fix-commit).
  */
-import { parseFixResponse, type FixFile } from "./fix-apply.ts";
+import { isSensitivePath, parseFixResponse, type FixFile } from "./fix-apply.ts";
 import { commitFiles, type GitDataApi } from "./fix-commit.ts";
 
 export type FixMode = "suggest" | "apply";
@@ -108,23 +108,26 @@ export async function runFixRound(
   if (!parsed.ok) return { ok: false, outcome: "parse-failed", error: parsed.error };
 
   const allowed = new Set(opts.allowedPaths);
-  const outOfScope = parsed.fix.files.filter((f) => !allowed.has(f.path)).map((f) => f.path);
-  if (outOfScope.length > 0) {
-    return { ok: false, outcome: "scope-violation", error: `out-of-scope paths: ${outOfScope.join(", ")}`, files: parsed.fix.files, summary: parsed.fix.summary };
+  // A sensitive repo-control path (e.g. .github/workflows/*) is denied even if the caller put
+  // it in allowedPaths — allowlist membership is not write-safety for these paths.
+  const denied = parsed.fix.files.map((f) => f.path).filter((p) => !allowed.has(p) || isSensitivePath(p));
+  if (denied.length > 0) {
+    return { ok: false, outcome: "scope-violation", error: `out-of-scope or sensitive paths: ${denied.join(", ")}`, files: parsed.fix.files, summary: parsed.fix.summary };
   }
 
   if (opts.mode === "suggest") {
     return { ok: true, outcome: "suggested", files: parsed.fix.files, summary: parsed.fix.summary };
   }
 
-  // Apply mode: run the caller's deterministic gate (e.g. parse/typecheck the candidate) BEFORE
-  // the branch ref moves, so broken content is not pushed. The post-push CI/test gate (§7)
-  // remains the loop-level net for anything the deterministic check can't catch.
-  if (deps.validate) {
-    const v = await deps.validate(parsed.fix.files);
-    if (!v.ok) {
-      return { ok: false, outcome: "validation-failed", error: v.error ?? "candidate failed validation", files: parsed.fix.files, summary: parsed.fix.summary };
-    }
+  // Apply mode REQUIRES a deterministic pre-push validator — its absence is a config error,
+  // not a pass. The candidate is checked BEFORE the branch ref moves; the post-push CI/test
+  // gate (§7) remains the loop-level net for anything the deterministic check can't catch.
+  if (!deps.validate) {
+    return { ok: false, outcome: "validation-failed", error: "apply mode requires a validator", files: parsed.fix.files, summary: parsed.fix.summary };
+  }
+  const v = await deps.validate(parsed.fix.files);
+  if (!v.ok) {
+    return { ok: false, outcome: "validation-failed", error: v.error ?? "candidate failed validation", files: parsed.fix.files, summary: parsed.fix.summary };
   }
 
   const commit = await commitFiles(deps.api, {

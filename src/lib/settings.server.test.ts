@@ -110,6 +110,17 @@ describe("sanitizeBotSettings", () => {
     assert.equal(bad.fixAgent.parallelPrs, 20); // clamped
   });
 
+  it("serializes fixAgent to env keys so it survives the env-only persistence fallback (H6)", () => {
+    const s = sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push", mode: "apply", parallelPrs: 4 } });
+    const env = botSettingsToEnv(s);
+    assert.equal(env.ASHLAR_FIX_PROVIDER, "chatgpt");
+    assert.equal(env.ASHLAR_FIX_DELIVERY, "chat-push");
+    assert.equal(env.ASHLAR_FIX_MODE, "apply");
+    assert.equal(env.ASHLAR_FIX_PARALLEL_PRS, "4");
+    // a disabled fix agent serializes provider as "" (round-trips to null)
+    assert.equal(botSettingsToEnv(sanitizeBotSettings({})).ASHLAR_FIX_PROVIDER, "");
+  });
+
   it("enforces the provider→delivery matrix, disabling incompatible pairs (F7)", () => {
     // chatgpt/grok support script-apply | chat-push
     assert.equal(sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push" } }).fixAgent.provider, "chatgpt");

@@ -192,6 +192,12 @@ async function maybeEscalateInner(
   let escalatedBefore: boolean;
   try {
     rounds = await reconstructRounds(gh, token, opts.owner, opts.repo, opts.pr, { botLogin, sinceIso: opts.sinceIso });
+    // Only classify when the most recent reconstructed round IS the current head. Otherwise the
+    // history is stale or the branch was force-pushed onto a divergent lineage, and those rounds
+    // do not belong to this head — never attribute their trend to it.
+    if (rounds.length > 0 && rounds[rounds.length - 1].head !== opts.head) {
+      return { escalated: false, rounds };
+    }
     const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
     if (!reasonPeek) return { escalated: false, rounds };
     escalatedBefore = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin);

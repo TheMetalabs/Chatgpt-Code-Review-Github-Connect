@@ -18,13 +18,13 @@ function fakeGh(
     async listPullReviews() {
       // two reviews per head (explicit + synchronize) to prove dedup-by-head
       return rounds.flatMap((r) => [
-        { userLogin: BOT, body: findingsBody(r.findings), commitId: r.head + "0000000", submittedAt: r.at },
-        { userLogin: BOT, body: findingsBody(r.findings), commitId: r.head + "0000000", submittedAt: r.at + "1" },
+        { userLogin: BOT, body: findingsBody(r.findings), commitId: r.head, submittedAt: r.at },
+        { userLogin: BOT, body: findingsBody(r.findings), commitId: r.head, submittedAt: r.at + "1" },
       ]);
     },
     async listReviewComments() {
       return rounds.flatMap((r) =>
-        r.files.map((f) => ({ userLogin: BOT, path: f, commitId: r.head + "0000000", createdAt: r.at })),
+        r.files.map((f) => ({ userLogin: BOT, path: f, commitId: r.head, createdAt: r.at })),
       );
     },
     async listIssueComments() {
@@ -47,8 +47,8 @@ describe("reconstructRounds", () => {
     const rounds = await reconstructRounds(gh, "t", "o", "r", 1);
     assert.equal(rounds.length, 2);
     assert.deepEqual(rounds.map((r) => [r.index, r.findings, r.head]), [
-      [1, 6, "aaaaaaa0000000"],
-      [2, 3, "bbbbbbb0000000"],
+      [1, 6, "aaaaaaa"],
+      [2, 3, "bbbbbbb"],
     ]);
     assert.deepEqual(rounds[0].files, ["x.ts"]);
   });
@@ -57,15 +57,16 @@ describe("reconstructRounds", () => {
 describe("maybeEscalate", () => {
   const files = ["src/lib/review-loop.ts"];
   const pr68 = [6, 4, 3, 4, 3, 3].map((n, i) => ({
-    head: `h${i}`.padEnd(7, "0"),
+    head: `head${i}`.padEnd(40, `${i}`),
     findings: n,
     files,
     at: `2026-01-0${i + 1}T00:00:00Z`,
   }));
+  const pr68Head = pr68[pr68.length - 1].head;
 
   it("emits a fixed ESCALATE handoff on a stuck (whack-a-mole) loop", async () => {
     const { gh, posted } = fakeGh(pr68);
-    const res = await maybeEscalate(gh, "t", { owner: "o", repo: "r", pr: 68, head: "h5000000", roundCap: 8 });
+    const res = await maybeEscalate(gh, "t", { owner: "o", repo: "r", pr: 68, head: pr68Head, roundCap: 8 });
     assert.equal(res.escalated, true);
     assert.equal(res.reason, "whack-a-mole");
     assert.equal(posted.length, 1);
@@ -93,9 +94,9 @@ describe("maybeEscalate", () => {
   });
 
   it("is idempotent: does not re-emit when an escalate for this head already exists", async () => {
-    const existing = [{ userLogin: BOT, body: "<!-- ashlar-loop-escalate reason=whack-a-mole round=6 pr=68 head=h5000000full -->" }];
+    const existing = [{ userLogin: BOT, body: `<!-- ashlar-loop-escalate reason=whack-a-mole round=6 pr=68 head=${pr68Head} -->` }];
     const { gh, posted } = fakeGh(pr68, existing);
-    const res = await maybeEscalate(gh, "t", { owner: "o", repo: "r", pr: 68, head: "h5000000full", roundCap: 8 });
+    const res = await maybeEscalate(gh, "t", { owner: "o", repo: "r", pr: 68, head: pr68Head, roundCap: 8 });
     assert.equal(res.escalated, false);
     assert.equal(res.reason, "whack-a-mole"); // still classified, just not re-posted
     assert.equal(posted.length, 0);
@@ -147,7 +148,7 @@ describe("maybeEscalate — provenance, session boundary, fail-closed (round-1 f
       async listIssueComments() { throw new Error("list issues failed (502)"); },
       async createIssueComment() { throw new Error("must not post on incomplete history"); },
     };
-    const res = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "h000000", roundCap: 1 });
+    const res = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "h0000000", roundCap: 1 });
     assert.equal(res.escalated, false);
     assert.match(res.error ?? "", /list issues failed/);
   });
@@ -212,5 +213,19 @@ describe("engine round-2 fixes", () => {
     release();
     await Promise.all([p1, p2]);
     assert.equal(posts, 1, "the in-process guard serializes same-head escalation");
+  });
+
+  it("H5: does not classify when the latest reconstructed head is not the requested head (force-push)", async () => {
+    // stuck rounds on an OLD lineage; the current head is a divergent replacement not yet reviewed
+    const gh = {
+      async listPullReviews() {
+        return [4, 4, 4].map((n, i) => ({ userLogin: bot, body: `<!-- ashlar-findings total=${n} -->`, commitId: `old${i}`.padEnd(40, "o"), submittedAt: `2026-01-0${i + 1}T00:00:00Z` }));
+      },
+      async listReviewComments() { return [4, 4, 4].map((_n, i) => ({ userLogin: bot, path: "a.ts", commitId: `old${i}`.padEnd(40, "o"), createdAt: `2026-01-0${i + 1}T00:00:00Z` })); },
+      async listIssueComments() { return []; },
+      async createIssueComment() { throw new Error("must not escalate for a divergent head"); },
+    };
+    const res = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "newDivergentHead".padEnd(40, "n"), roundCap: 3 });
+    assert.equal(res.escalated, false);
   });
 });

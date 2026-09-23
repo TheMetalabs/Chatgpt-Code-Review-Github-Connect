@@ -49,6 +49,19 @@ describe("parseFixResponse", () => {
     assert.match(err('{"files":[{"path":"a.ts","content":"line\\n..."}]}'), /truncated|elided/);
   });
 
+  it("H7: allows consecutive dots in a filename but still rejects traversal segments", () => {
+    ok('{"files":[{"path":"src/archive..old.ts","content":"x"}]}');
+    assert.match(err('{"files":[{"path":"../../etc/passwd","content":"x"}]}'), /unsafe or missing path/);
+    assert.match(err('{"files":[{"path":"src/../secret","content":"x"}]}'), /unsafe or missing path/);
+  });
+
+  it("H8: does not flag a legit trailing '...' string or a mid-file elision comment", () => {
+    ok('{"files":[{"path":"a.ts","content":"console.log(\\"Loading...\\")\\n"}]}');
+    ok('{"files":[{"path":"a.ts","content":"// remaining work in #42\\nexport const x = 1;\\n"}]}');
+    // a genuine trailing truncation is still caught
+    assert.match(err('{"files":[{"path":"a.ts","content":"const y = 1;\\n// ... rest unchanged"}]}'), /truncated|elided/);
+  });
+
   it("rejects duplicate paths", () => {
     assert.match(err('{"files":[{"path":"a.ts","content":"1"},{"path":"a.ts","content":"2"}]}'), /duplicate/);
   });

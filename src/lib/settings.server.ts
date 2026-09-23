@@ -97,6 +97,21 @@ function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   if (promptContextMax !== undefined) o.promptContextMaxChars = promptContextMax;
   const promptPolicyMax = envNum("ASHLAR_PROMPT_POLICY_MAX_CHARS");
   if (promptPolicyMax !== undefined) o.promptPolicyMaxChars = promptPolicyMax;
+  const fixProvider = envStr("ASHLAR_FIX_PROVIDER");
+  const fixDelivery = envStr("ASHLAR_FIX_DELIVERY");
+  const fixMode = envStr("ASHLAR_FIX_MODE");
+  const fixParallel = envNum("ASHLAR_FIX_PARALLEL_PRS");
+  if (fixProvider !== undefined || fixDelivery || fixMode || fixParallel !== undefined) {
+    const baseFix = (o.fixAgent as Record<string, unknown> | undefined) ?? {};
+    o.fixAgent = {
+      ...baseFix,
+      // empty ASHLAR_FIX_PROVIDER means "disabled"; normalizeFixAgent maps unknown -> null
+      provider: fixProvider !== undefined ? (fixProvider === "" ? null : fixProvider) : baseFix.provider,
+      ...(fixDelivery ? { delivery: fixDelivery } : {}),
+      ...(fixMode ? { mode: fixMode } : {}),
+      ...(fixParallel !== undefined ? { parallelPrs: fixParallel } : {}),
+    };
+  }
   const contextPad = envNum("ASHLAR_CONTEXT_PAD_LINES");
   if (contextPad !== undefined) o.contextPadLines = contextPad;
   return o;
@@ -132,6 +147,10 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_PROMPT_CONTEXT_MAX_CHARS: String(s.promptContextMaxChars),
     ASHLAR_PROMPT_POLICY_MAX_CHARS: String(s.promptPolicyMaxChars),
     ASHLAR_CONTEXT_PAD_LINES: String(s.contextPadLines),
+    ASHLAR_FIX_PROVIDER: s.fixAgent.provider ?? "",
+    ASHLAR_FIX_DELIVERY: s.fixAgent.delivery,
+    ASHLAR_FIX_MODE: s.fixAgent.mode,
+    ASHLAR_FIX_PARALLEL_PRS: String(s.fixAgent.parallelPrs),
   };
 }
 

@@ -31,20 +31,37 @@ function isFixObject(value: unknown): boolean {
   );
 }
 
+/** Repository-control paths a fix must NEVER edit, independent of the caller's allowlist
+ * (a workflow rewrite = CI takeover). Enforced before any commit. */
+const SENSITIVE_PATH_RE = /^\.github\/(workflows|actions)\//i;
+
+export function isSensitivePath(p: string): boolean {
+  return SENSITIVE_PATH_RE.test(p);
+}
+
 /** Reject anything that could escape the repo tree or is obviously not a repo-relative path. */
 function isSafeRepoPath(p: unknown): p is string {
   if (typeof p !== "string" || p.length === 0 || p.length > 400) return false;
   if (p.startsWith("/") || p.startsWith("~") || p.startsWith("\\")) return false;
   if (p.includes("\\")) return false; // POSIX repo paths only
-  if (p.includes("..")) return false; // no parent traversal
+  // Reject `..` only as a whole path SEGMENT (traversal), not inside a filename like archive..old.ts
+  if (p === ".." || p.split("/").includes("..")) return false;
   if (p.includes("\0") || /[\n\r]/.test(p)) return false;
   if (/^[a-zA-Z]:/.test(p)) return false; // no Windows drive letters
   return true;
 }
 
-// A model that ran out of tokens often ends mid-token; these are cheap, deterministic
-// truncation smells. They cannot catch every truncation — the CI/test gate is the real net.
-const TRUNCATION_MARKERS = [/\.\.\.$/, /\/\/[^\n]*\b(rest|remaining|unchanged|truncated|elided|snip)\b/i, /<truncated>/i, /\/\*\s*\.\.\./];
+// A model that ran out of tokens ends mid-token — truncation shows up on the FINAL line.
+// Check only the last non-empty line so a legit mid-file `console.log("Loading...")` or a
+// `// remaining work in #42` comment is not a false positive. Cheap heuristic; the validate/
+// CI gate is the real net.
+const LAST_LINE_TRUNCATION = [/\.\.\.$/, /^\s*\/\/[^\n]*\b(rest|remaining|unchanged|truncated|elided|snip)\b/i, /<truncated>\s*$/i];
+
+function looksTruncated(content: string): boolean {
+  const lines = content.replace(/[ \t]+$/gm, "").split("\n").filter((l) => l.trim() !== "");
+  const last = lines.length ? lines[lines.length - 1] : "";
+  return LAST_LINE_TRUNCATION.some((re) => re.test(last));
+}
 
 /**
  * Parse a fix provider's reply into a validated full-file change set, LLM-free. Returns
@@ -73,7 +90,7 @@ export function parseFixResponse(raw: string): FixParse {
     if (typeof content !== "string" || content.length === 0) {
       return { ok: false, error: `empty/non-string content for ${path} (possible truncation)` };
     }
-    if (TRUNCATION_MARKERS.some((re) => re.test(content.trimEnd()))) {
+    if (looksTruncated(content)) {
       return { ok: false, error: `content for ${path} looks truncated/elided` };
     }
     seen.add(path);

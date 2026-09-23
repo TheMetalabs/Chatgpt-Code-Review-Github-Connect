@@ -54,7 +54,7 @@ describe("runFixRound", () => {
   it("apply mode commits the parsed change set and returns the commit sha", async () => {
     const { api, committed } = fakeApi();
     void committed;
-    const res = await runFixRound({ requestFix: async () => FIX_JSON, api }, { ...base, mode: "apply" });
+    const res = await runFixRound({ requestFix: async () => FIX_JSON, api, validate: async () => ({ ok: true }) }, { ...base, mode: "apply" });
     assert.equal(res.ok, true);
     assert.equal(res.outcome, "applied");
     assert.equal(res.commitSha, "commit-sha");
@@ -120,12 +120,32 @@ describe("runFixRound", () => {
     assert.equal(f.committed, false);
   });
 
+  it("H1: apply mode without a validator is a config error (validation-failed, no commit)", async () => {
+    const f = fakeApi();
+    const res = await runFixRound({ requestFix: async () => FIX_JSON, api: f.api }, { ...base, mode: "apply" });
+    assert.equal(res.ok, false);
+    assert.equal(res.outcome, "validation-failed");
+    assert.equal(f.committed, false);
+  });
+
+  it("H3: a sensitive path is denied even when the caller allows it", async () => {
+    const f = fakeApi();
+    const wf = '{"summary":"x","files":[{"path":".github/workflows/ci.yml","content":"pwn"}]}';
+    const res = await runFixRound(
+      { requestFix: async () => wf, api: f.api, validate: async () => ({ ok: true }) },
+      { ...base, mode: "apply", allowedPaths: [".github/workflows/ci.yml"] },
+    );
+    assert.equal(res.ok, false);
+    assert.equal(res.outcome, "scope-violation");
+    assert.equal(f.committed, false);
+  });
+
   it("reports commit-failed without a partial success when the push throws", async () => {
     const f = fakeApi();
     f.api.createTree = async () => {
       throw new Error("422 tree");
     };
-    const res = await runFixRound({ requestFix: async () => FIX_JSON, api: f.api }, { ...base, mode: "apply" });
+    const res = await runFixRound({ requestFix: async () => FIX_JSON, api: f.api, validate: async () => ({ ok: true }) }, { ...base, mode: "apply" });
     assert.equal(res.ok, false);
     assert.equal(res.outcome, "commit-failed");
     assert.match(res.error ?? "", /422 tree/);

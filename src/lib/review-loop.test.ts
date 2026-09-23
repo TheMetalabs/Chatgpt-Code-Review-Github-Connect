@@ -290,9 +290,19 @@ describe("classifyStuck", () => {
     assert.equal(classifyStuck(prog, { roundCap: 8, diffLines: 6000 }), "diff-too-large");
   });
 
-  it("falls back to round-cap when decreasing on distinct files but the cap is hit", () => {
-    const capd = [R(1, 4, ["a"]), R(2, 3, ["b"]), R(3, 2, ["c"]), R(4, 1, ["d"])];
-    assert.equal(classifyStuck(capd, { roundCap: 4 }), "round-cap");
+  it("does NOT escalate a strictly-decreasing loop even at the round cap (H4)", () => {
+    const converging = [R(1, 10, ["a"]), R(2, 8, ["b"]), R(3, 6, ["c"]), R(4, 4, ["d"]), R(5, 2, ["e"])];
+    assert.equal(classifyStuck(converging, { roundCap: 5 }), null);
+  });
+
+  it("round-cap fires when the cap is hit and the trend is NOT still improving (H4)", () => {
+    const capd = [R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])]; // plateau at the end, distinct files
+    assert.equal(classifyStuck(capd, { roundCap: 3 }), "round-cap");
+  });
+
+  it("does NOT classify two improving rounds on the same file as whack-a-mole (H2)", () => {
+    assert.equal(classifyStuck([R(1, 6), R(2, 4)], { roundCap: 8 }), null); // [6,4] same file, improving
+    assert.equal(classifyStuck([R(1, 6), R(2, 4), R(3, 3)], { roundCap: 8 }), null); // [6,4,3] improving
   });
 
   it("escalateFromRounds reuses the phase-1 composer: fixed marker + directive + trend", () => {

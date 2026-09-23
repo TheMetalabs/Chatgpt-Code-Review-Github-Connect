@@ -327,18 +327,27 @@ export function classifyStuck(
   if (opts.diffLines !== undefined && opts.diffLines > DIFF_TOO_LARGE_LINES) return "diff-too-large";
 
   const window = rounds.slice(-WHACK_WINDOW);
-  if (window.length >= 2) {
+  // A loop whose recent findings are STRICTLY decreasing is still converging — never escalate
+  // it (a recurring file or hitting the cap while improving is healthy progress, not stuck).
+  const strictlyImproving =
+    window.length >= 2 && window.every((r, i) => i === 0 || r.findings < window[i - 1].findings);
+
+  // whack-a-mole: enough history (>=3 rounds), a file recurs across the window, and the trend
+  // is NOT still improving (stalled or rebounding on the same file).
+  if (rounds.length >= 3 && !strictlyImproving) {
     const counts = new Map<string, number>();
     for (const r of window) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
     for (const v of counts.values()) if (v >= WHACK_MIN_REPEAT) return "whack-a-mole";
   }
 
+  // oscillation: >=3 rounds, counts not trending down across the window, all non-zero.
   if (rounds.length >= 3) {
     const w = rounds.slice(-3);
     if (w[2].findings >= w[0].findings && w.every((r) => r.findings > 0)) return "oscillation";
   }
 
-  if (rounds.length >= opts.roundCap) return "round-cap";
+  // round-cap: reached the cap AND not still improving (a converging loop keeps running).
+  if (rounds.length >= opts.roundCap && !strictlyImproving) return "round-cap";
   return null;
 }
 

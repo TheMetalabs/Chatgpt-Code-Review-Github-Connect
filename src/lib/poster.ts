@@ -162,10 +162,13 @@ export function filterPublishable(job: Job, settings: BotSettings, sample?: Samp
 
 export function buildReview(job: Job, inline: Finding[], unanchored: Finding[], settings: BotSettings): PostedReview | null {
   const all = [...inline, ...unanchored];
-  const mentioned = isBotMention(job.thread?.userText, settings);
+  // An explicit request (an @-mention, or a `/review-loop` start — slash form or the driver's
+  // continuation marker, neither of which is an @-mention) always gets a verdict: for the loop,
+  // the clean review's `ashlar-findings total=0` IS the CONVERGED signal (design §3).
+  const requested = isBotMention(job.thread?.userText, settings) || job.thread?.loop?.kind === "start";
   // A salvaged verbatim reply must always post, even with zero structured findings and no mention,
   // so an unparseable review is surfaced for the fixing agent instead of silently skipped.
-  if (all.length === 0 && !mentioned && !job.rawReview) return null;
+  if (all.length === 0 && !requested && !job.rawReview) return null;
 
   // Verdict reflects every real finding, not just the ones that got an inline anchor —
   // an unanchored P1 must still make the review REQUEST_CHANGES, never "clean".

@@ -32,6 +32,10 @@
 | `/review-loop apply` | 자동 커밋·push 모드(고위험, 명시할 때만) |
 | `/review-loop stop` | 정지 스위치 |
 
+- **봇은 자기 자신에게 명령하지 않는다(불변식):** 봇(App 로그인 `<slug>[bot]`, `ASHLAR_BOT_LOGIN`)이 쓴
+  코멘트·인라인 지적·리포트·답글·ops 갱신은 문구와 무관하게 **절대 트리거가 아니다**(지적 본문이 `/review-loop apply`
+  를 인용해 봇이 스스로 재트리거된 #72 사례). 유일한 예외는 루프 드라이버가 applied 라운드 뒤 의도적으로 다는
+  **연속 요청 마커**(§3 CONTINUE, 새 이슈 코멘트, 같은 PR)뿐이다.
 - **권한:** 루프는 코드를 write하므로 **호출자(mention 작성자)의 write 권한을 확인**. 없으면 거절.
 - **기본 `suggest` 모드:** 수정안을 PR suggestion/초안 커밋으로 올려 사람이 1클릭 적용. auto-commit은 `apply`
   옵션에만. (근거: #66 오탐 2건·회귀 위험.)
@@ -48,6 +52,16 @@
 | **CONVERGED** | `<!-- ashlar-findings total=0 ... -->` | (지정 리뷰어의 clean verdict) | substring/마커 |
 | **ESCALATE** | `<!-- ashlar-loop-escalate reason=<code> round=<N> -->` | `Ashlar review-loop halted — human review required` | substring/마커 |
 | **STOPPED** | `<!-- ashlar-loop-stopped -->` | `Ashlar review-loop stopped by operator` | 마커 |
+
+연속(비종착) 제어 신호 — 루프가 다음 라운드로 넘어갈 때 드라이버가 방출:
+
+| 신호 | 고정 마커(머신) | 고정 문구(사람) | 감지 |
+|---|---|---|---|
+| **CONTINUE** | `<!-- ashlar-loop-continue mode=<apply\|suggest> round=<N> pr=<PR> head=<40hex> -->` | `Ashlar review-loop continues — requesting the next review` | 마커(봇 작성분만) |
+
+CONTINUE 코멘트에는 멘션·지시어 산문이 없다. 봇이 작성한 이 마커만 다음 리뷰를 연다(head는 감사용이며, 리뷰는
+그 시점 PR 최신 head를 본다). 0건 라운드는 명시 요청과 같이 clean 리뷰(`ashlar-findings total=0`)를 올려
+CONVERGED를 남긴다(슬래시 형식·연속 마커도 동일).
 
 원칙(스킬의 교훈):
 - **마커·문구는 드라이버가 방출**한다. reason/round 같은 구조 데이터는 **머신 마커의 속성**으로, 사람용 문구는

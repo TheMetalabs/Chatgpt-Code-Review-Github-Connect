@@ -104,9 +104,10 @@ export interface EscalateState {
   ledger?: { declines?: number; defers?: number; pushbacks?: number };
 }
 
-/** Escape HTML-comment delimiters so interpolated untrusted state (file paths, CI text)
- * cannot forge a terminal marker inside the bot-authored escalate comment (design §3). */
-function neutralizeMarkers(s: string): string {
+/** Escape HTML-comment delimiters so interpolated untrusted text (model output, file paths, CI
+ * text, error messages) cannot forge a control marker inside ANY bot-authored comment (design
+ * §3). Every emitter that embeds untrusted text in a bot comment must pass it through this. */
+export function neutralizeMarkers(s: string): string {
   return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
 }
 
@@ -162,6 +163,97 @@ export function escalateComment(s: EscalateState): string {
 /** STOPPED handoff — operator-requested stop. Fixed marker + immutable sentence. */
 export function stoppedComment(): string {
   return `${STOPPED_MARKER}\n\n${REVIEW_LOOP_STOPPED_HUMAN}`;
+}
+
+// ── Self identity + loop continuation (§2 invariant: the bot never commands itself) ──
+// WHY: the bot's own comments (inline findings, fix reports, ops updates, replies) routinely
+// QUOTE trigger phrases such as `/review-loop apply`. Parsed as commands they made the bot
+// re-trigger itself (duplicate reviews; in apply mode, parallel fix rounds on one PR).
+// INVARIANT: a comment authored by this App is never a command. The ONE exception is the
+// continuation comment the loop driver posts on purpose after an applied round, recognized
+// only by the fixed machine marker below (never by prose), only when the App authored it.
+
+/** The exact GitHub App bot login ("<app-slug>[bot]"). Substring matching is unsafe: an
+ * account like "ashlar-fan" could forge findings, suppress an escalation or pose as the bot. */
+export const DEFAULT_ASHLAR_BOT_LOGIN = "ashlar-bot-review-loop[bot]";
+
+/** A configured login is honored only in the "<slug>[bot]" shape GitHub reserves for Apps, so
+ * a misconfiguration can never make a HUMAN account's comments read as the bot's own (which
+ * would both silence that human's commands and let them forge bot-only signals). */
+export function resolveBotLogin(configured: string | null | undefined): string {
+  const v = String(configured ?? "").trim();
+  return /^[A-Za-z0-9][A-Za-z0-9-]*\[bot\]$/.test(v) ? v : DEFAULT_ASHLAR_BOT_LOGIN;
+}
+
+/** Exact (case-insensitive) login equality — GitHub logins are case-insensitive. */
+export function isSelfLogin(login: string | null | undefined, botLogin: string = DEFAULT_ASHLAR_BOT_LOGIN): boolean {
+  return !!login && login.toLowerCase() === botLogin.toLowerCase();
+}
+
+export const REVIEW_LOOP_CONTINUE_HUMAN = "Ashlar review-loop continues — requesting the next review";
+
+export interface LoopContinuation {
+  mode: ReviewLoopMode;
+  round: number; // the review round being requested (1-based, within the session)
+  pr: number;
+  head: string; // full 40-hex commit SHA the next review is for
+}
+
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+/** ONE contract for the continuation's numeric fields, shared by the composer and the parser
+ * (the parser's digit limits mirror these): anything the composer emits, the parser accepts. */
+export const MAX_CONTINUE_ROUND = 9999;
+export const MAX_CONTINUE_PR = 999_999_999;
+
+/** Machine marker: structured fields as attributes, so recognition never parses prose. */
+export function continueMarker(c: LoopContinuation): string {
+  return `<!-- ashlar-loop-continue mode=${c.mode} round=${c.round} pr=${c.pr} head=${c.head} -->`;
+}
+
+/** The driver's continuation comment. Throws on a malformed field: a marker the parser would
+ * reject must never be posted (the loop would stall silently waiting for a review). */
+export function continueComment(c: LoopContinuation): string {
+  if ((c.mode !== "apply" && c.mode !== "suggest") || !Number.isInteger(c.round) || c.round < 1 ||
+    c.round > MAX_CONTINUE_ROUND || !Number.isInteger(c.pr) || c.pr < 1 || c.pr > MAX_CONTINUE_PR ||
+    !FULL_SHA_RE.test(c.head)) {
+    throw new Error(`invalid loop continuation (mode=${c.mode} round=${c.round} pr=${c.pr} head=${c.head})`);
+  }
+  return `${continueMarker(c)}\n\n${REVIEW_LOOP_CONTINUE_HUMAN} (round ${c.round} on \`${c.head.slice(0, 7)}\`).`;
+}
+
+// Anchored: the marker must OPEN the comment (where the driver emits it) — a marker quoted
+// later in a bot comment, e.g. model text inside a fix report, is prose, never a signal.
+const CONTINUE_MARKER_RE =
+  /^\s*<!--\s*ashlar-loop-continue\s+mode=(apply|suggest)\s+round=(\d{1,4})\s+pr=(\d{1,9})\s+head=([0-9a-f]{40})\s*-->/;
+
+/** Parse the continuation marker from a comment the caller has proven the App authored.
+ * Returns null for any other author, or a missing / malformed marker. */
+export function parseContinueMarker(body: string | null | undefined, source: CommentSource): LoopContinuation | null {
+  if (!source.authoredByBot) return null;
+  const m = CONTINUE_MARKER_RE.exec(body || "");
+  if (!m) return null;
+  const round = Number(m[2]);
+  const pr = Number(m[3]);
+  if (round < 1 || round > MAX_CONTINUE_ROUND || pr < 1 || pr > MAX_CONTINUE_PR) return null;
+  return { mode: m[1] as ReviewLoopMode, round, pr, head: m[4] };
+}
+
+/**
+ * The ONLY bot-authored comment that may act as a trigger: byte-for-byte the driver's canonical
+ * continuation (continueComment of its own parsed fields; trailing whitespace tolerated). Any
+ * other text around or after the marker — a fix report quoting model output, say — disqualifies
+ * it, so an embedded marker can never promote a report into a loop start.
+ */
+export function canonicalContinuation(body: string | null | undefined, source: CommentSource): LoopContinuation | null {
+  const parsed = parseContinueMarker(body, source);
+  if (!parsed) return null;
+  let canonical: string;
+  try {
+    canonical = continueComment(parsed);
+  } catch {
+    return null;
+  }
+  return String(body ?? "").replace(/\s+$/, "") === canonical ? parsed : null;
 }
 
 // ── Substring detectors (the driver / poller mirror these) ───────────────────

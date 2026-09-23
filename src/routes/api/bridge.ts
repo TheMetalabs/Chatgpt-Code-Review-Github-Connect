@@ -13,10 +13,12 @@ import {
   bridgeJobState,
   bridgeTokenOk,
   claimBridgeJob,
+  completeBridgeFix,
   completeBridgeJob,
   failBridgeProvider,
   getBridgePublic,
   getBridgeStatus,
+  isBridgeFixId,
   promptForJob,
   refreshBridgeClaim,
   releaseBridgeJob,
@@ -83,6 +85,7 @@ export const Route = createFileRoute("/api/bridge")({
           workerStatus?: unknown;
           extensionVersion?: unknown;
           attachmentProtocol?: number;
+          fixProtocol?: number;
           repairProtocol?: number;
           captureProtocol?: number;
           captureId?: string; repairId?: string; responseId?: string; sourceHash?: string;
@@ -170,7 +173,7 @@ export const Route = createFileRoute("/api/bridge")({
             recoverBridgeJob(String(body.clientId || ""),body.bindings),body.attachmentProtocol)}, {headers});
         }
         if (body.action === "take") {
-          return Response.json({ ok: true, bridge: getBridgePublic(), job: promptsForClient(takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : []), body.attachmentProtocol) }, { headers });
+          return Response.json({ ok: true, bridge: getBridgePublic(), job: promptsForClient(takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : [], { fixes: body.fixProtocol === 1 }), body.attachmentProtocol) }, { headers });
         }
         if (body.action === "claim" && body.jobId) {
           const out = claimBridgeJob(body.jobId, String(body.clientId ?? ""));
@@ -194,6 +197,14 @@ export const Route = createFileRoute("/api/bridge")({
                 .filter((r) => r.provider === "chatgpt" || r.provider === "grok")
                 .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? ""), originalText: typeof r.originalText === "string" ? r.originalText : undefined }))
             : undefined;
+          // A review-loop fix answer is plain TEXT for the runtime's deterministic parser. Branch
+          // BEFORE any review validation: the 422 format gate, review-JSON extraction and salvage
+          // would reject or rewrite it.
+          if (isBridgeFixId(body.jobId)) {
+            const out = completeBridgeFix(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
+            if (!out.ok) return Response.json(out, { status: out.code === "lease_conflict" ? 409 : 400, headers });
+            return Response.json({ ok: true }, { headers });
+          }
           if (body.repairProtocol === 1) {
             const errors = bridgeFormatErrors(body.jobId, String(body.raw ?? ""), legs, body.leaseId, body.captureProtocol === 1);
             if (errors.length) return Response.json({ok:false,code:"json_repair_required",error:"completed response requires format repair",errors},{status:422,headers});

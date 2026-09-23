@@ -291,7 +291,7 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     const r = await runPostReviewLoop("t", job(), sample, settings("suggest"), [job()], f.deps, ENV_ON);
     assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested");
     assert.equal(f.committed, false);
-    assert.ok(f.posted[0].includes("suggestion"));
+    assert.ok(f.posted.some((b) => b.startsWith("### Ashlar fix agent — suggestion")));
     assert.equal(escalations(f.posted).length, 0);
   });
 
@@ -301,11 +301,12 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
     assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.commitSha === NEW_SHA && r.continued === true);
     assert.equal(f.committed, true);
-    // the control signal first, then the report whose last line states what happened
-    assert.deepEqual(parseContinueMarker(f.posted[0], { authoredByBot: true }), { mode: "apply", round: 2, pr: 7, head: NEW_SHA });
-    assert.ok(f.posted[1].startsWith("### Ashlar fix agent — applied"));
-    assert.ok(f.posted[1].includes(NEW_SHA));
-    assert.match(f.posted[1], /Loop continues/);
+    // progress signal, then the control signal, then the report that states what happened
+    assert.ok(f.posted[0].startsWith("<!-- ashlar-loop-fixing round=1 pr=7 "));
+    assert.deepEqual(parseContinueMarker(f.posted[1], { authoredByBot: true }), { mode: "apply", round: 2, pr: 7, head: NEW_SHA });
+    assert.ok(f.posted[2].startsWith("### Ashlar fix agent — applied"));
+    assert.ok(f.posted[2].includes(NEW_SHA));
+    assert.match(f.posted[2], /Loop continues/);
     assert.ok(!f.posted.some((b) => /@ashlar/i.test(b)), "no bot @-mention posted");
   });
 
@@ -410,7 +411,7 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     r = await runPostReviewLoop("t", j, sample, settings("suggest"), [j], f.deps, ENV_ON);
     assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested");
     assert.equal(f.committed, false);
-    assert.ok(f.posted[0].includes("mode: suggest"), "report uses the effective mode");
+    assert.ok(f.posted.some((b) => b.startsWith("### Ashlar fix agent") && b.includes("mode: suggest")), "report uses the effective mode");
   });
 
   it("never throws: a dependency failure hands off (loop-error) with the cause", async () => {
@@ -497,7 +498,34 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     const f = fakeDeps({ rounds: [3], movedDuringFix: true });
     const r = await runPostReviewLoop("t", job(), sample, settings("suggest"), [job()], f.deps, ENV_ON);
     assert.deepEqual(r, { ran: false, reason: "superseded (head moved)" });
-    assert.equal(f.posted.length, 0);
+    assert.ok(!f.posted.some((b) => b.startsWith("### Ashlar fix agent")), "no suggestion for a stale head");
+  });
+
+  it("a fix round announces itself first with the fixed progress marker (never a trigger)", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    await runPostReviewLoop("t", job(), sample, settings("suggest"), [job()], f.deps, ENV_ON);
+    const fixing = f.posted[0];
+    assert.match(fixing, /^<!-- ashlar-loop-fixing round=1 pr=7 head=h{40} -->/);
+    assert.ok(fixing.includes("Ashlar review-loop — fix round in progress"));
+    assert.equal(parseContinueMarker(fixing, { authoredByBot: true }), null, "not a continuation");
+  });
+
+  it("a fix request past its deadline is aborted, retried, then handed off (fix-failed) — never a silent wait", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    let aborted = 0;
+    f.deps.requestFix = (_p, signal) =>
+      new Promise<string>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted += 1;
+          reject(new Error("aborted"));
+        });
+      });
+    f.deps.fixTimeoutMs = 10;
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed");
+    assert.equal(aborted, 2, "each attempt's provider call is aborted at the deadline");
+    assert.match(escalations(f.posted)[0], /request-failed after 2 attempt\(s\): fix request exceeded its/);
   });
 });
 

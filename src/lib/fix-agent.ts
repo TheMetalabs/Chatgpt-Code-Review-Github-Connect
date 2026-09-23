@@ -21,7 +21,7 @@ import { commitFiles, type GitDataApi } from "./fix-commit.ts";
 export type FixMode = "suggest" | "apply";
 
 /** Provider transport: given the fix prompt, return the raw model reply. Injected. */
-export type RequestFix = (prompt: string) => Promise<string>;
+export type RequestFix = (prompt: string, signal?: AbortSignal) => Promise<string>;
 
 export interface FixRoundResult {
   ok: boolean;

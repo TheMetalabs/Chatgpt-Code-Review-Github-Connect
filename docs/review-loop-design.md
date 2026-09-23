@@ -59,6 +59,12 @@
 |---|---|---|---|
 | **CONTINUE** | `<!-- ashlar-loop-continue mode=<apply\|suggest> round=<N> pr=<PR> head=<40hex> -->` | `Ashlar review-loop continues — requesting the next review` | 마커(봇 작성분만) |
 
+| **FIXING**(진행 신호) | `<!-- ashlar-loop-fixing round=<N> pr=<PR> head=<sha> -->` | `Ashlar review-loop — fix round in progress` | 마커(정보용 — 트리거·종료 아님) |
+
+FIXING은 수정 요청 직전에 단다(수정은 바쁜 provider 큐에서 오래 기다릴 수 있다 — 드라이버가 "진행 중"과
+"죽음"을 구분하게). 그 뒤에는 반드시 fix 리포트+연속 또는 핸드오프가 온다. 수정 요청에는 deadline이 있다
+(`ASHLAR_FIX_TIMEOUT_MS`, 기본 60분, 큐+생성 포함) — 넘기면 요청을 abort하고 재시도 후 `fix-failed`.
+
 CONTINUE 코멘트에는 멘션·지시어 산문이 없다. 봇이 작성한 이 마커만 다음 리뷰를 연다(head는 감사용이며, 리뷰는
 그 시점 PR 최신 head를 본다). 0건 라운드는 명시 요청과 같이 clean 리뷰(`ashlar-findings total=0`)를 올려
 CONVERGED를 남긴다(슬래시 형식·연속 마커도 동일).

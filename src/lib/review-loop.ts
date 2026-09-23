@@ -216,6 +216,14 @@ export function isSelfLogin(login: string | null | undefined, botLogin: string =
 }
 
 export const REVIEW_LOOP_CONTINUE_HUMAN = "Ashlar review-loop continues — requesting the next review";
+export const REVIEW_LOOP_FIXING_HUMAN = "Ashlar review-loop — fix round in progress";
+
+/** Progress signal (informational, NEVER a trigger or a terminal event): posted right before the
+ * fix request so a driver can tell "the fix is queued/generating" from "the loop died" — the fix
+ * can wait long behind a busy provider. It ends in the fix report + continuation, or a handoff. */
+export function fixingComment(c: { round: number; pr: number; head: string }): string {
+  return `<!-- ashlar-loop-fixing round=${c.round} pr=${c.pr} head=${c.head} -->\n\n${REVIEW_LOOP_FIXING_HUMAN} (round ${c.round} on \`${c.head.slice(0, 7)}\`).`;
+}
 
 export interface LoopContinuation {
   mode: ReviewLoopMode;

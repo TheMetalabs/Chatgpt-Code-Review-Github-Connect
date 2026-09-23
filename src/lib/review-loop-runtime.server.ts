@@ -39,6 +39,7 @@ import {
 } from "./review-loop-engine.server.ts";
 import {
   continueComment,
+  fixingComment,
   isSelfLogin,
   MAX_CONTINUE_ROUND,
   neutralizeMarkers,
@@ -66,6 +67,8 @@ export interface LoopRuntimeDeps {
   gh: LoopRuntimeGithub;
   requestFix: RequestFix;
   validate: FixValidate;
+  /** Per-attempt fix-request deadline override (tests); production reads ASHLAR_FIX_TIMEOUT_MS. */
+  fixTimeoutMs?: number;
   /** Delay before the single loop-history re-read (injected so tests do not wait). */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -128,6 +131,36 @@ export function ashlarBotLogin(env: NodeJS.ProcessEnv | undefined = envOf()): st
 function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   const n = Number(env?.ASHLAR_LOOP_ROUND_CAP);
   return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), MAX_CONTINUE_ROUND - 1) : DEFAULT_ROUND_CAP;
+}
+
+/** Deadline per fix request, covering the provider QUEUE and generation (the local LLM serializes
+ * reviews and fixes): ASHLAR_FIX_TIMEOUT_MS, clamped to [1 min, 6 h], default 60 min. A request
+ * past it is aborted and becomes request-failed → retry → a fixed fix-failed handoff — never a
+ * silent wait forever. */
+const DEFAULT_FIX_TIMEOUT_MS = 60 * 60_000;
+function fixTimeoutMs(env: NodeJS.ProcessEnv | undefined = envOf()): number {
+  const n = Number(env?.ASHLAR_FIX_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? Math.min(6 * 60 * 60_000, Math.max(60_000, Math.floor(n))) : DEFAULT_FIX_TIMEOUT_MS;
+}
+
+/** Run one fix request under a deadline; on expiry the provider call is aborted. */
+async function requestWithDeadline(requestFix: RequestFix, prompt: string, ms: number): Promise<string> {
+  const ac = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      // Settle with the deadline FIRST, then abort: the provider's own abort rejection must not
+      // win the race and hide why the request ended.
+      reject(new Error(`fix request exceeded its ${Math.round(ms / 60_000) || "<1"} min deadline (provider queue or generation)`));
+      ac.abort();
+    }, ms);
+    (timer as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([requestFix(prompt, ac.signal), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function fixAttempts(env: NodeJS.ProcessEnv | undefined = envOf()): number {
@@ -284,7 +317,7 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
   };
   // First provider: local (a plain request/response). chatgpt/grok ride the bridge's
   // awaiting_chat lifecycle and are wired separately.
-  const requestFix: RequestFix = async (prompt) => {
+  const requestFix: RequestFix = async (prompt, signal) => {
     if (settings.fixAgent.provider !== "local") {
       throw new Error(`fix provider ${settings.fixAgent.provider} not wired yet (local only)`);
     }
@@ -296,7 +329,7 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
         { role: "user", content: prompt },
       ],
       max_tokens: settings.localReviewMaxTokens,
-    });
+    }, signal);
   };
   return { gh, requestFix, validate: builtinValidate };
 }
@@ -402,13 +435,18 @@ export async function runPostReviewLoop(
       return (await superseded()) ? { ok: false, error: "head moved during fix" } : { ok: true };
     };
     const maxAttempts = fixAttempts(env);
+    const deadlineMs = d.fixTimeoutMs ?? fixTimeoutMs(env);
+    const requestFix: RequestFix = (p) => requestWithDeadline(d!.requestFix, p, deadlineMs);
+    // Progress signal: the fix can wait long in a busy provider queue — a driver must be able to
+    // tell "in progress" from "dead". Best effort: it never blocks or fails the round.
+    await gh.createIssueComment(token, { owner, repo, pr, body: fixingComment({ round: rounds.length, pr, head: headSha }) }).catch(() => {});
     let prompt = basePrompt;
     let attempts = 0;
     let res: FixRoundResult;
     for (;;) {
       attempts += 1;
       res = await runFixRound(
-        { requestFix: d.requestFix, api: gh.gitDataApi(token, owner, repo), validate },
+        { requestFix, api: gh.gitDataApi(token, owner, repo), validate },
         {
           prompt,
           mode,

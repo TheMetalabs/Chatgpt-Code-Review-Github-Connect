@@ -20,6 +20,7 @@ import {
   DEFAULT_ASHLAR_BOT_LOGIN,
   escalateFromRounds,
   isSelfLogin,
+  stuckPattern,
   parseEscalateMarker,
   type EscalateReason,
   type RoundSummary,
@@ -230,12 +231,15 @@ async function maybeEscalateInner(
   if (escalatedBefore) {
     return { escalated: false, reason, rounds }; // one handoff per head
   }
+  // The budget is authoritative (round-cap), but the trend pattern still guides the human.
+  const pattern = reason === "round-cap" ? stuckPattern(rounds) : null;
   const body = escalateFromRounds(reason, rounds, {
     pr: opts.pr,
     head: opts.head, // full SHA — the marker is the idempotency key
     repo: `${opts.owner}/${opts.repo}`,
     roundCap: opts.roundCap,
     diffLines: opts.diffLines,
+    detail: pattern ? `fix-round budget spent; the finding trend also shows ${pattern}` : undefined,
   });
   await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
   return { escalated: true, reason, rounds };

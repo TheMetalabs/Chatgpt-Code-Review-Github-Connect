@@ -18,6 +18,7 @@ import {
   freshLoopDirective,
   stripLoopDirectives,
   classifyStuck,
+  stuckPattern,
   escalateFromRounds,
   repeatedRoundFiles,
   DEFAULT_ASHLAR_BOT_LOGIN,
@@ -323,9 +324,23 @@ describe("classifyStuck", () => {
     assert.equal(classifyStuck([...converging, R(6, 1, ["f"])], { roundCap: 5 }), "round-cap");
   });
 
-  it("specific patterns take precedence over the budget; a >=3 non-improving window is oscillation (J5)", () => {
-    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 2 }), "oscillation");
-    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["a"]), R(3, 4, ["c"])], { roundCap: 2 }), "whack-a-mole");
+  it("the budget is AUTHORITATIVE: review N+1 with findings is round-cap whatever the trend", () => {
+    for (const hist of [
+      [R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], // plateau (oscillation pattern)
+      [R(1, 5, ["a"]), R(2, 4, ["a"]), R(3, 4, ["c"])], // repeated file (whack-a-mole pattern)
+      [R(1, 5, ["a"]), R(2, 3, ["b"]), R(3, 1, ["c"])], // decreasing
+      [R(1, 5, ["a"]), R(2, 1, ["b"]), R(3, 4, ["c"])], // rebound
+    ]) {
+      assert.equal(classifyStuck(hist, { roundCap: 2 }), "round-cap");
+    }
+  });
+
+  it("within the budget, a >=3 non-improving window is a pattern (J5); stuckPattern is budget-free", () => {
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 5 }), "oscillation");
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["a"]), R(3, 4, ["c"])], { roundCap: 5 }), "whack-a-mole");
+    assert.equal(stuckPattern([R(1, 5, ["a"]), R(2, 4, ["a"]), R(3, 4, ["c"])]), "whack-a-mole");
+    assert.equal(stuckPattern([R(1, 5, ["a"]), R(2, 3, ["a"]), R(3, 1, ["a"])]), null, "improving is never a pattern");
+    assert.equal(stuckPattern([R(1, 5), R(2, 5)]), null, "too short");
   });
 
   it("failure reasons are fixed vocabulary with directives, and the detail line is neutralized", () => {
@@ -431,6 +446,24 @@ describe("canonicalContinuation (the only bot comment that may trigger)", () => 
   it("neutralizeMarkers defangs every comment delimiter", () => {
     assert.equal(neutralizeMarkers("a <!-- x --> b"), "a &lt;!-- x --&gt; b");
   });
+});
+
+describe("control markers are recognized only where the driver emits them (opening the comment)", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  it("a marker quoted later in a bot comment (e.g. model text in a report) is never a signal", () => {
+    const esc = "<!-- ashlar-loop-escalate reason=oscillation round=1 pr=7 head=abc -->";
+    const cont = continueComment({ mode: "apply", round: 2, pr: 7, head: SHA });
+    const prose = (m: string) => `### Ashlar fix agent — no change\n\nthe agent said: ${m}`;
+    assert.equal(parseEscalateMarker(prose(esc), BOT), null);
+    assert.equal(isEscalateComment(prose(esc), BOT), false);
+    assert.equal(isStoppedComment(prose(STOPPED_MARKER), BOT), false);
+    assert.equal(parseContinueMarker(prose(cont), { authoredByBot: true }), null);
+    // the driver's own comments open with the marker (leading whitespace tolerated)
+    assert.equal(parseEscalateMarker(`\n  ${esc}\n\nbody`, BOT)?.reason, "oscillation");
+    assert.equal(isStoppedComment(stoppedComment(), BOT), true);
+    assert.ok(parseContinueMarker(cont, { authoredByBot: true }));
+  });
+
 });
 
 describe("continuation composer and parser share ONE contract", () => {

@@ -37,7 +37,13 @@ import {
   maybeEscalate,
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
-import { continueComment, resolveBotLogin, type EscalateReason, type RoundSummary } from "./review-loop.ts";
+import {
+  continueComment,
+  neutralizeMarkers,
+  resolveBotLogin,
+  type EscalateReason,
+  type RoundSummary,
+} from "./review-loop.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface PullHead {
@@ -67,6 +73,12 @@ export type LoopStepResult =
   | { ran: true; step: "escalated"; reason: string; detail?: string }
   | { ran: true; step: "fix"; outcome: string; commitSha?: string; error?: string; continued?: boolean; attempts?: number };
 
+// One loop step per PR head at a time (in-process): a second posted review of the same head
+// (re-request, redelivery) must not run a parallel fix round. Different heads never block each
+// other — the older one is superseded at its head checks. Cross-process coordination is a
+// NON-GOAL (single harbor instance; see the engine header).
+const inFlightSteps = new Set<string>();
+
 const SUPERSEDED = "superseded (head moved)";
 const ALREADY_ESCALATED = "already escalated on this head";
 const STEP_IN_FLIGHT = "another loop step is in flight for this head";
@@ -95,6 +107,7 @@ const DEFAULT_ROUND_CAP = 5;
 const DEFAULT_FIX_ATTEMPTS = 2;
 const RETRYABLE = new Set<FixRoundResult["outcome"]>(["request-failed", "parse-failed", "scope-violation", "validation-failed"]);
 const HISTORY_RETRY_MS = 3000;
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
 function envOf(): NodeJS.ProcessEnv | undefined {
   return typeof process !== "undefined" ? process.env : undefined;
@@ -219,25 +232,48 @@ export const builtinValidate: FixValidate = async (files: FixFile[]) => {
   return { ok: true };
 };
 
-function renderFixReport(res: FixRoundResult, mode: string, attempts: number): string {
-  const files = (res.files ?? []).map((f) => `- \`${f.path}\``).join("\n");
+/**
+ * Untrusted text (the fix agent's summary, paths it returned, error messages) embedded in a
+ * BOT-authored comment. The bot's comments are trusted by the loop's own detectors, so model text
+ * must never be able to forge a control marker there: markers are neutralized, @-mentions are
+ * defanged (a report must never ping a user) and length is bounded.
+ */
+export function sanitizeModelText(text: string | undefined, opts: { oneLine?: boolean; max?: number } = {}): string {
+  let t = neutralizeMarkers(String(text ?? "")).replace(/@(?=[A-Za-z0-9])/g, "@\u200b");
+  if (opts.oneLine) t = t.replace(/\s+/g, " ").trim();
+  const max = opts.max ?? 4000;
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
+/** How an applied round's report ends: the continuation was requested, or why it was not. */
+type ContinuationStatus = { ok: true } | { ok: false; error: string };
+
+function renderFixReport(res: FixRoundResult, mode: string, attempts: number, continuation?: ContinuationStatus): string {
+  const files = (res.files ?? []).map((f) => `- \`${sanitizeModelText(f.path, { oneLine: true, max: 300 })}\``).join("\n");
   const tries = attempts > 1 ? `, attempt ${attempts}` : "";
+  const summary = sanitizeModelText(res.summary);
   switch (res.outcome) {
-    case "applied":
-      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha}\` (mode: ${mode}${tries}).\n\n${res.summary ?? ""}\n\nChanged:\n${files}\n\nLoop continues: the next review is requested on the new head.`;
+    case "applied": {
+      const tail = !continuation || continuation.ok
+        ? "Loop continues: the next review is requested on the new head."
+        : `The next review could not be requested (${sanitizeModelText(continuation.error, { oneLine: true, max: 300 })}); see the loop handoff.`;
+      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha ?? "(unknown)"}\` (mode: ${mode}${tries}).\n\n${summary}\n\nChanged:\n${files}\n\n${tail}`;
+    }
     case "suggested":
-      return `### Ashlar fix agent — suggestion (mode: ${mode}${tries})\n\n${res.summary ?? ""}\n\nProposed changes (not pushed):\n${files}\n\nApply them and push, then re-run the loop — or use apply mode to auto-commit.`;
+      return `### Ashlar fix agent — suggestion (mode: ${mode}${tries})\n\n${summary}\n\nProposed changes (not pushed):\n${files}\n\nApply them and push, then re-run the loop — or use apply mode to auto-commit.`;
     case "no-change":
-      return `### Ashlar fix agent — no change\n\n${res.summary ?? "All findings were pushed back / declined / deferred."}`;
+      return `### Ashlar fix agent — no change\n\n${summary || "All findings were pushed back / declined / deferred."}`;
     default:
-      return `### Ashlar fix agent — ${res.outcome}\n\n${res.error ?? ""}`;
+      return `### Ashlar fix agent — ${res.outcome}\n\n${sanitizeModelText(res.error, { oneLine: true, max: 500 })}`;
   }
 }
 
 /** Production dependencies, loaded lazily so the static graph stays pure. */
 async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
+  // The GitHub client is the loop's only channel: if it cannot load, nothing can be posted (the
+  // ONE unobservable failure — logged server-side by harbor). Provider transports load LAZILY
+  // inside requestFix, so their failure is an ordinary request-failed → retry → fix-failed.
   const github = await import("./github.server.ts");
-  const local = await import("./local-chat-request.server.ts");
   const gh: LoopRuntimeGithub = {
     listPullReviews: github.listPullReviews,
     listReviewComments: github.listReviewComments,
@@ -252,6 +288,7 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
     if (settings.fixAgent.provider !== "local") {
       throw new Error(`fix provider ${settings.fixAgent.provider} not wired yet (local only)`);
     }
+    const local = await import("./local-chat-request.server.ts");
     return local.requestLocalChat(settings.localLlmBaseUrl, settings.localLlmApiKey, {
       model: settings.localLlmModel,
       messages: [
@@ -292,16 +329,20 @@ export async function runPostReviewLoop(
   let rounds: RoundSummary[] = [];
   let diffLines: number | undefined;
   // Past the gates the user asked for a loop: every stop that is not a supersession is ONE
-  // fixed ESCALATE (reason code + deterministic detail), never free text.
-  const escalate = async (reason: EscalateReason, detail: string): Promise<LoopStepResult> => {
+  // fixed ESCALATE (reason code + deterministic detail), never free text. `head` is the commit
+  // the handoff is about: the reviewed head — or, once this round pushed, the NEW head.
+  const escalate = async (reason: EscalateReason, detail: string, head: string = headSha): Promise<LoopStepResult> => {
     if (!d) return { ran: false, reason: `ESCALATE ${reason} not posted (no GitHub client): ${detail}` };
-    const r = await escalateNow(d.gh, token, { owner, repo, pr, head: headSha, reason, detail, rounds, roundCap: cap, diffLines, botLogin });
+    const r = await escalateNow(d.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin });
     if (r.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: STEP_IN_FLIGHT };
     if (r.error) return { ran: false, reason: `ESCALATE ${reason} failed to post: ${r.error} (detail: ${detail})` };
     if (!r.escalated) return { ran: false, reason: ALREADY_ESCALATED };
     return { ran: true, step: "escalated", reason, detail };
   };
 
+  const stepKey = `${owner}/${repo}#${pr}@${headSha}`;
+  if (inFlightSteps.has(stepKey)) return { ran: false, reason: STEP_IN_FLIGHT };
+  inFlightSteps.add(stepKey);
   try {
     d = deps ?? (await productionDeps(settings));
     const gh = d.gh;
@@ -382,29 +423,50 @@ export async function runPostReviewLoop(
       prompt = `${basePrompt}\n\n${retryFeedback(res)}`;
     }
 
-    if (res.outcome === "applied") {
-      // 3) Continue: ALWAYS after an applied round — the next review is either CONVERGED, the
-      //    next fix round, or (past the budget) the round-cap handoff. Compose the marker BEFORE
-      //    announcing, so a malformed continuation escalates instead of stalling after
-      //    "Loop continues".
-      const continuation = continueComment({ mode, round: rounds.length + 1, pr, head: res.commitSha ?? "" });
-      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts) });
-      await gh.createIssueComment(token, { owner, repo, pr, body: continuation });
-      return { ran: true, step: "fix", outcome: res.outcome, commitSha: res.commitSha, continued: true, attempts };
-    }
+    // 3) POST-COMMIT PHASE — the branch already moved, so from here every handoff names the NEW
+    //    head. Order: the continuation (the control signal) FIRST, then the report, whose last
+    //    line states what actually happened; a failure to continue is a loop-error handoff.
+    const afterCommit = async (done: FixRoundResult, tries: number): Promise<LoopStepResult> => {
+      const newHead = done.commitSha && FULL_SHA_RE.test(done.commitSha) ? done.commitSha : undefined;
+      let status: ContinuationStatus;
+      if (!newHead) {
+        status = { ok: false, error: "the commit sha was not returned" };
+      } else {
+        try {
+          // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
+          // budget — the round-cap handoff.
+          await gh.createIssueComment(token, { owner, repo, pr, body: continueComment({ mode, round: rounds.length + 1, pr, head: newHead }) });
+          status = { ok: true };
+        } catch (e) {
+          status = { ok: false, error: (e as Error)?.message ?? String(e) };
+        }
+      }
+      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status) }).catch(() => {
+        /* the report is informational; the continuation / handoff carries the signal */
+      });
+      if (status.ok) return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead, continued: true, attempts: tries };
+      const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
+      return await escalate("loop-error", `the fix was committed but the next review could not be requested: ${status.error}`, live);
+    };
+
+    if (res.outcome === "applied") return await afterCommit(res, attempts);
+    // Nothing was pushed: a moved head makes ANY result moot — a suggestion for a stale head
+    // included — so the newer head's review drives the loop (quiet).
+    if (await superseded()) return { ran: false, reason: SUPERSEDED };
     if (res.outcome === "suggested") {
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts) });
       return { ran: true, step: "fix", outcome: res.outcome, continued: false, attempts };
     }
-    // Every other end: a moved head means superseded (the fix is moot); otherwise ONE handoff.
-    if (await superseded()) return { ran: false, reason: SUPERSEDED };
     if (res.outcome === "no-change") {
-      // The agent's full rationale stays visible; the handoff carries the fixed signal.
+      // The agent's full rationale stays visible (sanitized); the handoff carries the signal.
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts) });
       return await escalate("fix-declined", `no-change: ${res.summary ?? "every finding was pushed back / declined / deferred"}`);
     }
     return await escalate("fix-failed", `${res.outcome} after ${attempts} attempt(s): ${res.error ?? "no error detail"}`);
+
   } catch (e) {
     return await escalate("loop-error", `loop step failed: ${(e as Error)?.message ?? String(e)}`);
+  } finally {
+    inFlightSteps.delete(stepKey);
   }
 }

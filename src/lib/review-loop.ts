@@ -281,16 +281,23 @@ export function canonicalContinuation(body: string | null | undefined, source: C
   return String(body ?? "").replace(/\s+$/, "") === canonical ? parsed : null;
 }
 
-// ── Substring detectors (the driver / poller mirror these) ───────────────────
+// ── Control-marker detectors ─────────────────────────────────────────────────
+// ashlar's own trust decisions (idempotency, the durable session, the continuation) accept a
+// control marker ONLY where the driver emits it: OPENING a dedicated control comment. A marker
+// that appears later in a bot comment is prose — e.g. model text quoted in a fix report — and is
+// never a signal, even if an emitter forgot to neutralize it (defense in depth; every emitter
+// also neutralizes untrusted text). External substring detectors stay compatible: the driver's
+// real markers are always at the start.
 
-const ESCALATE_MARKER_RE = /<!--\s*ashlar-loop-escalate\s+([^>]*?)-->/;
+const ESCALATE_MARKER_RE = /^\s*<!--\s*ashlar-loop-escalate\s+([^>]*?)-->/;
+const STOPPED_MARKER_RE = /^\s*<!--\s*ashlar-loop-stopped\s*-->/;
 
 export function isEscalateComment(body: string | null | undefined, source: CommentSource): boolean {
   return source.authoredByBot && ESCALATE_MARKER_RE.test(body || "");
 }
 
 export function isStoppedComment(body: string | null | undefined, source: CommentSource): boolean {
-  return source.authoredByBot && (body || "").includes(STOPPED_MARKER);
+  return source.authoredByBot && STOPPED_MARKER_RE.test(body || "");
 }
 
 export interface ParsedEscalate {
@@ -437,11 +444,11 @@ const WHACK_MIN_REPEAT = 2; // a file flagged in >= this many of the window => w
  *   round N+1 is the verification review of the N-th fix: clean → CONVERGED, else round-cap.
  * - Converged: last round has 0 findings → null.
  * - diff-too-large (structural, never converges) first.
- * - Patterns need >=3 rounds and a window that is NOT strictly decreasing (a strictly
- *   decreasing window is healthy progress, even with a recurring file): whack-a-mole (a file
- *   recurs in the window) > oscillation (all non-zero).
- * - Budget: rounds > roundCap → round-cap REGARDLESS of trend (a hard bound — the loop must
- *   end in a fixed terminal signal, never a silent pause).
+ * - Budget: rounds > roundCap → round-cap, AUTHORITATIVE and REGARDLESS of trend (a hard bound —
+ *   the loop ends in one fixed terminal reason; the trend pattern goes into the detail).
+ * - Within the budget, patterns need >=3 rounds and a window that is NOT strictly decreasing (a
+ *   strictly decreasing window is healthy progress, even with a recurring file): whack-a-mole
+ *   (a file recurs in the window) > oscillation (all non-zero). See stuckPattern.
  * The semantic reasons (guard-accretion, wrong-scope, re-flag-deferred) need diff/semantic
  * context the finding trend cannot supply and are left to the human.
  */
@@ -453,29 +460,30 @@ export function classifyStuck(
   if (rounds[rounds.length - 1].findings === 0) return null; // converged (CONVERGED, not stuck)
   if (opts.diffLines !== undefined && opts.diffLines > DIFF_TOO_LARGE_LINES) return "diff-too-large";
 
-  const window = rounds.slice(-WHACK_WINDOW);
-  // A loop whose recent findings are STRICTLY decreasing is still converging — never escalate
-  // it (a recurring file or hitting the cap while improving is healthy progress, not stuck).
-  const strictlyImproving =
-    window.length >= 2 && window.every((r, i) => i === 0 || r.findings < window[i - 1].findings);
-
-  // whack-a-mole: enough history (>=3 rounds), a file recurs across the window, and the trend
-  // is NOT still improving (stalled or rebounding on the same file).
-  if (rounds.length >= 3 && !strictlyImproving) {
-    const counts = new Map<string, number>();
-    for (const r of window) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
-    for (const v of counts.values()) if (v >= WHACK_MIN_REPEAT) return "whack-a-mole";
-  }
-
-  // oscillation: >=3 rounds, the window is NOT strictly improving (plateau or rebound), all
-  // non-zero. Uses the same strict-improvement test as the guard above (not just endpoints), so
-  // [5,4,4] and [5,1,4] are caught, while [5,4,3] stays improving → null.
-  if (rounds.length >= 3 && !strictlyImproving && window.every((r) => r.findings > 0)) {
-    return "oscillation";
-  }
-
-  // round-cap: the fix-round budget is spent and the verification review still has findings.
+  // round-cap FIRST: the fix-round budget is a hard, authoritative bound — review N+1 with
+  // findings ends as round-cap whatever the trend, so a driver keys "budget spent" on ONE reason.
+  // (The trend pattern, if any, is still reported in the handoff's detail — stuckPattern.)
   if (rounds.length > opts.roundCap) return "round-cap";
+  return stuckPattern(rounds);
+}
+
+/**
+ * The stuck PATTERN of a non-converged history, independent of the budget (null when still
+ * improving / too short). A loop whose recent findings are STRICTLY decreasing is still
+ * converging — a recurring file there is healthy progress, not stuck.
+ */
+export function stuckPattern(rounds: RoundSummary[]): "whack-a-mole" | "oscillation" | null {
+  if (rounds.length < 3) return null;
+  const window = rounds.slice(-WHACK_WINDOW);
+  const strictlyImproving = window.every((r, i) => i === 0 || r.findings < window[i - 1].findings);
+  if (strictlyImproving) return null;
+  // whack-a-mole: a file recurs across the window while the trend stalls or rebounds.
+  const counts = new Map<string, number>();
+  for (const r of window) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
+  for (const v of counts.values()) if (v >= WHACK_MIN_REPEAT) return "whack-a-mole";
+  // oscillation: plateau or rebound with every round non-zero (same strict test, so [5,4,4] and
+  // [5,1,4] are caught while [5,4,3] stays improving).
+  if (window.every((r) => r.findings > 0)) return "oscillation";
   return null;
 }
 

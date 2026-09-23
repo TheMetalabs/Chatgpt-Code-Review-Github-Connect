@@ -295,3 +295,25 @@ describe("engine: termination contract (budget + failure handoffs)", () => {
     assert.equal(posted.length, 1);
   });
 });
+
+describe("round-cap handoff keeps the trend pattern in its detail", () => {
+  const bot = "ashlar-bot-review-loop[bot]";
+  it("budget spent on a whack-a-mole history → reason round-cap, detail names the pattern", async () => {
+    const heads = ["a", "b", "c"].map((c) => c.repeat(40));
+    const posted: string[] = [];
+    const gh = {
+      async listPullReviews() {
+        return [6, 4, 4].map((n, i) => ({ userLogin: bot, body: `<!-- ashlar-findings total=${n} -->`, commitId: heads[i], submittedAt: `2026-01-0${i + 1}T00:00:00Z` }));
+      },
+      async listReviewComments() {
+        return heads.map((h, i) => ({ userLogin: bot, path: "src/x.ts", commitId: h, createdAt: `2026-01-0${i + 1}T00:00:00Z` }));
+      },
+      async listIssueComments() { return []; },
+      async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
+    };
+    const r = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: heads[2], roundCap: 2 });
+    assert.equal(r.reason, "round-cap");
+    assert.match(posted[0], /reason=round-cap/);
+    assert.match(posted[0], /Detail: fix-round budget spent; the finding trend also shows whack-a-mole/);
+  });
+});

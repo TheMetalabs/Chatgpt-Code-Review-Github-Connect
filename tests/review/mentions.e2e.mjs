@@ -270,3 +270,17 @@ test('self-trigger guard is wired end-to-end with the configured App login (ASHL
   const other=await deliver(app,'issue_comment',from('ashlar-bot-review-loop[bot]'),'d-other-app');
   assert.equal(other.queued,true,'not self under the configured identity');
 });
+
+test('an operator-listed repository is reviewed without the local leg; other repositories keep it',async t=>{
+  const app=await appFixture();t.after(()=>app.close()); // chatgpt + local enabled globally
+  const snapshot=async id=>{await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===id)?.status==='awaiting_chat','snapshot not ready');return app.harbor.getHarbor().jobs.find(j=>j.id===id);};
+  app.env.ASHLAR_LOCAL_REVIEW_SKIP_REPOS='Fixture/Fixture'; // the app realm's env (read per job)
+  const skipped=app.mention('skip-local');assert.equal(skipped.queued,true);
+  assert.deepEqual([...(await snapshot(skipped.jobId)).reviewProviders],['chatgpt'],'chat only for the listed repository'); // copy: vm-realm array
+  await new Promise(resolve=>setTimeout(resolve,150));
+  assert.equal(app.localRequests.length,0,'no local generation for the listed repository');
+  app.env.ASHLAR_LOCAL_REVIEW_SKIP_REPOS='someone/else';
+  const kept=app.mention('keep-local');assert.equal(kept.queued,true);
+  assert.deepEqual([...(await snapshot(kept.jobId)).reviewProviders],['chatgpt','local']);
+  await eventually(()=>app.localRequests.length===1,'the local leg still runs for unlisted repositories');
+});

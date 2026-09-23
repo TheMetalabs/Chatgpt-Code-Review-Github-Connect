@@ -32,6 +32,7 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
+import { providersForRepo } from "./local-review-scope.server";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import { ashlarBotLogin, runPostReviewLoop, SILENT_REASONS } from "./review-loop-runtime.server.ts";
@@ -182,8 +183,8 @@ export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
 }
 
 export function publicJobs(jobs: Job[]) {
-  const enabled = providersFromSettings(state.settings);
   return jobs.map((j) => {
+    const enabled = providersForRepo(state.settings, j.owner, j.repo);
     // rawReview is verbatim model output that can echo private PR source — treat it like storedLegs
     // and never expose it on the unauthenticated /api/harbor; surface only a bounded boolean.
     const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, rawReview: _raw, ...rest } = j;
@@ -340,7 +341,7 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   if (!opsCommentAllowed(job)) return;
   const body = buildOpsComment({
     phase,
-    providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
+    providers: job.reviewProviders?.length ? job.reviewProviders : providersForRepo(state.settings, job.owner, job.repo),
     notes: [`Job: ${job.id}`, ...notes],
   });
   try {
@@ -565,7 +566,8 @@ async function playGithub(jobId: string, untrustedBody: string) {
     return;
   }
 
-  const providers = providersFromSettings(state.settings);
+  // Fixed on the job here (reviewProviders): every later decision reads the job, not settings.
+  const providers = providersForRepo(state.settings, gated.owner, gated.repo);
   if (!providers.length) {
     patchJob(jobId, (j) => ({
       ...j,
@@ -820,7 +822,7 @@ export async function submitHarborChat(
   if (job.origin !== "github" || !job.installationId) {
     return { ok: false, error: "not a GitHub job" };
   }
-  const providers = job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings);
+  const providers = job.reviewProviders?.length ? job.reviewProviders : providersForRepo(state.settings, job.owner, job.repo);
   const incoming: ChatLeg[] =
     legs && legs.length
       ? legs.filter((l) => providers.includes(l.provider) && l.raw.trim())

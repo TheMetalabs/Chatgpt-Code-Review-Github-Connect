@@ -127,3 +127,17 @@ describe("deriveLoopSession: a clean review ends the session only for the head t
     assert.equal(s.active, false, "the new session waits on no head yet: its clean review ends it");
   });
 });
+
+describe("deriveLoopSession: events are ordered as instants", () => {
+  it("a millisecond start just after a second-precision handoff opens a session (lexically it sorts first)", () => {
+    const s = deriveLoopSession([
+      ev("2026-01-01T00:00:00Z", "escalate"),
+      ev("2026-01-01T00:00:00.500Z", "start", { mode: "apply", actor: "alice" }),
+    ]);
+    assert.deepEqual(s, { active: true, startIso: "2026-01-01T00:00:00.500Z", mode: "apply", starter: "alice" });
+  });
+
+  it("an unparseable timestamp is ignored like a missing one", () => {
+    assert.equal(deriveLoopSession([ev("yesterday", "start", { mode: "apply" })]).active, false);
+  });
+});

@@ -21,8 +21,11 @@
  *   - STOPPED: the operator's stop (acknowledged once by stopLoop; in-flight steps go quiet).
  * The fix-round budget (ASHLAR_LOOP_ROUND_CAP, default 5) is enforced at the next review: review
  * round N+1 verifies the N-th fix (clean → CONVERGED, else round-cap). The ONLY quiet exits are
- * supersession (a newer head drives the loop), an operator stop, and an existing handoff on
- * this head. Apply also requires the session starter's write permission (design §2).
+ * supersession (a newer head drives the loop — its review is requested once, idempotently), an
+ * operator stop, a newer loop request (a new session, or apply downgraded to suggest), and an
+ * existing handoff on this head. One relevance check guards every checkpoint of a round, and a
+ * round that went moot is never retried. Apply also requires the session starter's write
+ * permission (design §2).
  * Everything is gated OFF by default:
  *   - env ASHLAR_FIX_AGENT=1 AND settings.fixAgent.provider != null (design §6b), AND
  *   - the PR has an ACTIVE loop session (durable: a human start after the last terminal), AND
@@ -35,7 +38,7 @@
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import type { GitDataApi } from "./fix-commit.ts";
-import type { FixFile } from "./fix-apply.ts";
+import { isSafeFixPath, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
 import {
@@ -49,8 +52,10 @@ import {
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
 import {
+  canonicalContinuation,
   continueComment,
   fixingComment,
+  isoMs,
   isSelfLogin,
   MAX_CONTINUE_ROUND,
   resolveBotLogin,
@@ -106,7 +111,10 @@ const ALREADY_ESCALATED = "already escalated on this head";
 const STEP_IN_FLIGHT = "another loop step is in flight for this head";
 const NO_SESSION = "no active loop session";
 const STOPPED_QUIET = "loop stopped by operator";
+const NEWER_REQUEST = "superseded by a newer loop request (a new session, or apply downgraded to suggest)";
 const OWN_PUSH = "own push (the fix round continues the loop)";
+/** NOT silent (logged): a concurrent handoff for this head outlived one backoff. */
+const HANDOFF_IN_FLIGHT = "a handoff for this head is still being posted by another loop step; this step did not run";
 
 /** Benign non-run reasons: the default off-path and the designed quiet exits (a newer head
  * drives the loop / a handoff or the operator already ended it). Anything else is logged. */
@@ -119,6 +127,7 @@ export const SILENT_REASONS: readonly string[] = [
   STEP_IN_FLIGHT,
   NO_SESSION,
   STOPPED_QUIET,
+  NEWER_REQUEST,
   OWN_PUSH,
 ];
 
@@ -130,8 +139,11 @@ const DEFAULT_ROUND_CAP = 5;
 /** Attempts per fix round for retryable outcomes (the reply was unusable, not the finding). */
 const DEFAULT_FIX_ATTEMPTS = 2;
 const RETRYABLE = new Set<FixRoundResult["outcome"]>(["request-failed", "parse-failed", "scope-violation", "validation-failed"]);
-const HISTORY_RETRY_MS = 3000;
+/** Re-reads for a history that does not show this review yet (a lagging list API), with backoff,
+ * before the history counts as unverifiable (a loop-error handoff). */
+const HISTORY_RETRY_DELAYS_MS = [3_000, 6_000, 12_000];
 const ESCALATE_BACKOFF_MS = 1500;
+const realSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
 // One loop step per PR head at a time (in-process): a second posted review of the same head
@@ -229,7 +241,7 @@ export function renderFindings(findings: readonly Finding[]): string {
     .join("\n\n");
 }
 
-const SYNTAX_EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+const SYNTAX_EXTS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
 
 function extOf(path: string): string {
   const i = path.lastIndexOf(".");
@@ -265,7 +277,13 @@ export const builtinValidate: FixValidate = async (files: FixFile[]) => {
       const ts = await loadTypescript();
       if (!ts) return { ok: false, error: `${f.path}: no syntax validator available (typescript not loadable) — apply refused, use suggest` };
       const kind =
-        ext === ".tsx" ? ts.ScriptKind.TSX : ext === ".jsx" ? ts.ScriptKind.JSX : ext === ".ts" ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+        ext === ".tsx"
+          ? ts.ScriptKind.TSX
+          : ext === ".jsx"
+            ? ts.ScriptKind.JSX
+            : ext === ".ts" || ext === ".mts" || ext === ".cts"
+              ? ts.ScriptKind.TS
+              : ts.ScriptKind.JS;
       const sf = ts.createSourceFile(f.path, f.content, ts.ScriptTarget.Latest, true, kind);
       const diags = (sf as unknown as { parseDiagnostics?: readonly { messageText: string | import("typescript").DiagnosticMessageChain }[] }).parseDiagnostics ?? [];
       if (diags.length > 0) {
@@ -287,6 +305,15 @@ export const builtinValidate: FixValidate = async (files: FixFile[]) => {
 export function sanitizeModelText(text: string | undefined, opts: { oneLine?: boolean; max?: number } = {}): string {
   return sanitizeUntrusted(text, opts);
 }
+
+/** Why a round became moot mid-flight: the head moved, the session ended, or a newer request
+ * (a new session, or apply downgraded to suggest) took over. */
+type Moot = "head" | "stopped" | "newer";
+const MOOT_TEXT: Record<Moot, string> = {
+  head: "the PR head moved",
+  stopped: "the loop was stopped",
+  newer: "a newer loop request took over",
+};
 
 /** How an applied round's report ends: continued, stopped by the operator, or why it could not. */
 type ContinuationStatus = { ok: true } | { ok: false; stopped: true } | { ok: false; error: string };
@@ -354,8 +381,13 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
     );
   };
   // Streaming (the default) reports queued vs generating, so the fix deadline can exclude queue time.
-  const streaming = envOf()?.ASHLAR_LOCAL_LLM_STREAM !== "false";
-  return { gh, requestFix, validate: builtinValidate, fixReportsActivity: settings.fixAgent.provider === "local" && streaming };
+  // The transport's own streaming default (what requestLocalChat will actually do): a streamed
+  // reply reports queued vs generating; a buffered one reports "generating" from its headers.
+  // Transport unloadable → no activity (timed from send); requestFix then fails on its own import.
+  const streaming =
+    settings.fixAgent.provider === "local" &&
+    (await import("./local-chat-request.server.ts").then((m) => m.localStreamingDefault(), () => false));
+  return { gh, requestFix, validate: builtinValidate, fixReportsActivity: streaming };
 }
 
 type PrRef = { owner: string; repo: string; pr: number };
@@ -363,6 +395,53 @@ type PrRef = { owner: string; repo: string; pr: number };
 /** The PR's current loop session from durable GitHub history (fresh read). */
 function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullHead, botLogin: string): Promise<LoopSession> {
   return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head });
+}
+
+type ContinueOutcome = { posted: boolean; exists?: boolean; error?: string };
+
+// ONE continuation per (PR, head, session). The push handler, a step whose head moved and an
+// applied round can each ask for the live head's review: concurrent callers share one post
+// (single flight), and a later caller finds the durable one and posts nothing.
+const continuing = new Map<string, Promise<ContinueOutcome>>();
+
+/** Request the next review of `head` with the fixed continuation marker — once per session. An
+ * unreadable history fails toward posting: a duplicate request is only superseded by harbor,
+ * while a missing one would stall the loop. Never throws. */
+function ensureContinuation(
+  gh: LoopRuntimeGithub,
+  token: string,
+  ref: PrRef,
+  c: { head: string; mode: ReviewLoopMode; sinceIso?: string; botLogin: string; round?: number },
+): Promise<ContinueOutcome> {
+  if (!FULL_SHA_RE.test(c.head)) return Promise.resolve({ posted: false, error: "the head is not a full commit SHA" });
+  const key = `${ref.owner}/${ref.repo}#${ref.pr}@${c.head}#${c.sinceIso ?? ""}`;
+  const running = continuing.get(key);
+  if (running) return running;
+  const run = (async (): Promise<ContinueOutcome> => {
+    const sinceMs = isoMs(c.sinceIso);
+    const exists = await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).then(
+      (rows) =>
+        rows.some((r) => {
+          if (!isSelfLogin(r.userLogin, c.botLogin)) return false;
+          const k = canonicalContinuation(r.body, { authoredByBot: true });
+          return k?.pr === ref.pr && k.head === c.head && (Number.isNaN(sinceMs) || isoMs(r.createdAt) >= sinceMs);
+        }),
+      () => false,
+    );
+    if (exists) return { posted: false, exists: true };
+    try {
+      const round =
+        c.round ??
+        (await reconstructRounds(gh, token, ref.owner, ref.repo, ref.pr, { botLogin: c.botLogin, sinceIso: c.sinceIso }).catch(() => [])).length + 1;
+      const body = continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head });
+      await gh.createIssueComment(token, { owner: ref.owner, repo: ref.repo, pr: ref.pr, body });
+      return { posted: true };
+    } catch (e) {
+      return { posted: false, error: (e as Error)?.message ?? String(e) };
+    }
+  })().finally(() => continuing.delete(key));
+  continuing.set(key, run);
+  return run;
 }
 
 /**
@@ -397,6 +476,7 @@ export async function runPostReviewLoop(
   let diffLines: number | undefined;
   let requested = false; // true once the durable session says a loop is active
   let sinceIso: string | undefined; // the session anchor (scopes rounds + handoff idempotency)
+  const sleep = (ms: number) => (d?.sleep ?? realSleep)(ms);
   // Past the session gate the user asked for a loop: every stop that is not a supersession /
   // operator stop is ONE fixed ESCALATE (reason code + deterministic detail), never free text.
   // `head` is the commit the handoff is about: the reviewed head — or, once this round pushed,
@@ -404,18 +484,23 @@ export async function runPostReviewLoop(
   const escalate = async (reason: EscalateReason, detail: string, head: string = headSha): Promise<LoopStepResult> => {
     if (!d) return { ran: false, reason: `ESCALATE ${reason} not posted (no GitHub client): ${detail}` };
     const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, sinceIso });
-    let r = await post();
-    if (r.error === ESCALATE_IN_FLIGHT) {
-      // A terminal handoff has no other poster: wait for the concurrent one once, then retry (its
-      // marker, if any, makes this a no-op). Still blocked → a LOGGED non-silent reason.
-      await (d.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms))))(ESCALATE_BACKOFF_MS);
-      r = await post();
-      if (r.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: `ESCALATE ${reason} not posted: another handoff for this head is in flight (detail: ${detail})` };
+    try {
+      let r = await post();
+      if (r.error === ESCALATE_IN_FLIGHT) {
+        // A terminal handoff has no other poster: wait for the concurrent one once, then retry (its
+        // marker, if any, makes this a no-op). Still blocked → a LOGGED non-silent reason.
+        await sleep(ESCALATE_BACKOFF_MS);
+        r = await post();
+        if (r.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: `ESCALATE ${reason} not posted: another handoff for this head is in flight (detail: ${detail})` };
+      }
+      if (r.error) return { ran: false, reason: `ESCALATE ${reason} failed to post: ${r.error} (detail: ${detail})` };
+      if (!r.escalated) return { ran: false, reason: ALREADY_ESCALATED };
+      trace(job.id, "handoff", { reason, head: head.slice(0, 7) });
+      return { ran: true, step: "escalated", reason, detail };
+    } catch (e) {
+      // escalateNow reports failures as {error}; even so a rejection never escapes (never throws).
+      return { ran: false, reason: `ESCALATE ${reason} failed to post: ${(e as Error)?.message ?? String(e)} (detail: ${detail})` };
     }
-    if (r.error) return { ran: false, reason: `ESCALATE ${reason} failed to post: ${r.error} (detail: ${detail})` };
-    if (!r.escalated) return { ran: false, reason: ALREADY_ESCALATED };
-    trace(job.id, "handoff", { reason, head: head.slice(0, 7) });
-    return { ran: true, step: "escalated", reason, detail };
   };
 
   const stepKey = `${owner}/${repo}#${pr}@${headSha}`;
@@ -424,11 +509,23 @@ export async function runPostReviewLoop(
   try {
     d = deps ?? (await productionDeps(settings));
     const gh = d.gh;
+    // A moved head supersedes this review: the LIVE head's review drives the loop. The push handler
+    // (or the round that pushed) normally requested it already; asking again is idempotent, so a
+    // missed push event can never stall an active loop.
+    const continueOn = async (live: PullHead): Promise<void> => {
+      if (live.sha === headSha) return;
+      const now = await sessionOf(gh, token, ref, live, botLogin).catch(() => null);
+      if (!now?.active) return;
+      const r = await ensureContinuation(gh, token, ref, { head: live.sha, mode: now.mode ?? "suggest", sinceIso: now.startIso, botLogin });
+      trace(job.id, "superseded", { live: live.sha.slice(0, 7), continuation: r.posted ? "posted" : r.exists ? "exists" : `failed: ${r.error}` });
+    };
     const head = await gh.fetchPullHeadRef(token, owner, repo, pr);
-    // A newer commit superseded this round (a push, or another round's fix): that head's own
-    // review drives the loop from here. Also the fork-push guard: a commit parented on a stale
-    // SHA would fast-forward over a contributor's backward force-push.
-    if (head.sha !== headSha) return { ran: false, reason: SUPERSEDED };
+    // Also the fork-push guard: a commit parented on a stale SHA would fast-forward over a
+    // contributor's backward force-push.
+    if (head.sha !== headSha) {
+      await continueOn(head);
+      return { ran: false, reason: SUPERSEDED };
+    }
     const session = await sessionOf(gh, token, ref, head, botLogin);
     if (!session.active) return { ran: false, reason: NO_SESSION };
     requested = true;
@@ -439,7 +536,7 @@ export async function runPostReviewLoop(
 
     // 1) Stuck or budget spent? Rounds are counted from the durable session anchor, so a
     //    re-issued start never resets the budget. The history must SHOW this review as the
-    //    latest round (one re-read for a lagging API).
+    //    latest round (re-read with backoff for a lagging API).
     const escOpts = {
       owner,
       repo,
@@ -452,13 +549,20 @@ export async function runPostReviewLoop(
       sinceIso: session.startIso,
     };
     let esc = await maybeEscalate(gh, token, escOpts);
-    if (esc.error === CURRENT_ROUND_MISSING) {
-      await (d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(HISTORY_RETRY_MS);
+    for (const wait of HISTORY_RETRY_DELAYS_MS) {
+      if (esc.error !== CURRENT_ROUND_MISSING) break;
+      await sleep(wait);
       esc = await maybeEscalate(gh, token, escOpts);
+    }
+    // A concurrent handoff for this head: wait once for it to land (its marker then ends the
+    // session — the pre-fix checkpoint below sees that). Still in flight → a LOGGED reason.
+    if (esc.error === ESCALATE_IN_FLIGHT) {
+      await sleep(ESCALATE_BACKOFF_MS);
+      esc = await maybeEscalate(gh, token, escOpts);
+      if (esc.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: HANDOFF_IN_FLIGHT };
     }
     rounds = esc.rounds;
     if (esc.escalated) return { ran: true, step: "escalated", reason: esc.reason ?? "stuck" };
-    if (esc.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: STEP_IN_FLIGHT };
     // Stuck, but a handoff for this head already exists: never fix past an ESCALATE.
     if (esc.reason) return { ran: false, reason: ALREADY_ESCALATED };
     if (esc.error) return await escalate("loop-error", `could not verify the loop history: ${esc.error}`);
@@ -492,24 +596,52 @@ export async function runPostReviewLoop(
     }
     // Editable set = the PR's CHANGED files only. sample.files also carries policy/reference
     // context fetched for the review; those stay read-only and never enter allowedPaths.
+    // A path the fix could never write (control characters, traversal) is not editable either.
     const changed = new Set(sample.changedPaths ?? []);
-    const files = (sample.files ?? []).filter((f) => changed.has(f.path)).map((f) => ({ path: f.path, content: f.content }));
+    const files = (sample.files ?? [])
+      .filter((f) => changed.has(f.path) && isSafeFixPath(f.path))
+      .map((f) => ({ path: f.path, content: f.content }));
     if (files.length === 0) return await escalate("loop-error", "no editable changed files in the snapshot");
     const basePrompt = buildFixPrompt({
       findings: renderFindings(findings),
       files,
       reviewer: settings.fixAgent.provider ?? undefined,
     });
-    // Fresh reads (never cached): the world may move while the (slow) fix request runs.
-    const superseded = async (): Promise<boolean> => (await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha;
-    const stopped = async (): Promise<boolean> => !(await sessionOf(gh, token, ref, head, botLogin)).active;
-    // Re-verify the live head AND the session immediately before the commit path.
+    // ONE relevance predicate for every checkpoint of the round — before it starts, while queued,
+    // at generation start, before a retry, before the commit and before a report: the PR head,
+    // the session and (for apply) the session's mode must still be the ones this step started
+    // from. Fresh reads, never cached: the world moves while a slow fix request runs.
+    const relevance = async (): Promise<Moot | null> => {
+      if ((await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha) return "head";
+      const now = await sessionOf(gh, token, ref, head, botLogin);
+      if (!now.active) return "stopped";
+      if (now.startIso !== session.startIso) return "newer";
+      if (mode === "apply" && effectiveLoopMode(now.mode, settings) !== "apply") return "newer";
+      return null;
+    };
+    let moot: Moot | undefined; // once a checkpoint finds the round moot it is never retried
+    const checkpoint = async (): Promise<Moot | null> => {
+      const why = await relevance();
+      if (why) moot ??= why;
+      return why;
+    };
+    // A moot round ends quietly: a moved head continues on the live head (idempotent); a stop or
+    // a newer request already decides what comes next.
+    const quietExit = async (why: Moot): Promise<LoopStepResult> => {
+      if (why === "stopped") return { ran: false, reason: STOPPED_QUIET };
+      if (why === "newer") return { ran: false, reason: NEWER_REQUEST };
+      const live = await gh.fetchPullHeadRef(token, owner, repo, pr).catch(() => null);
+      if (live) await continueOn(live);
+      return { ran: false, reason: SUPERSEDED };
+    };
+    const before = await checkpoint();
+    if (before) return await quietExit(before);
+    // Re-verify relevance immediately before the commit path.
     const validate: FixValidate = async (candidate) => {
       const v = await d!.validate(candidate);
       if (!v.ok) return v;
-      if (await superseded()) return { ok: false, error: "head moved during fix" };
-      if (await stopped()) return { ok: false, error: "loop stopped during fix" };
-      return { ok: true };
+      const why = await checkpoint();
+      return why ? { ok: false, error: `${MOOT_TEXT[why]} during the fix` } : { ok: true };
     };
     const maxAttempts = fixAttempts(env);
     const deps2 = d;
@@ -524,7 +656,10 @@ export async function runPostReviewLoop(
         checkEveryMs: deps2.fixWatch?.checkEveryMs ?? FIX_RELEVANCE_CHECK_MS,
         tickMs: deps2.fixWatch?.tickMs ?? FIX_WATCH_TICK_MS,
         reportsActivity: deps2.fixReportsActivity ?? false,
-        stillWanted: async () => ((await superseded()) ? "the PR head moved" : (await stopped()) ? "loop stopped" : null),
+        stillWanted: async () => {
+          const why = await checkpoint();
+          return why ? MOOT_TEXT[why] : null;
+        },
       });
     // Progress signal: the fix can wait long in a busy provider queue — a driver must be able to
     // tell "in progress" from "dead". Best effort: it never blocks or fails the round.
@@ -548,9 +683,11 @@ export async function runPostReviewLoop(
         },
       );
       trace(job.id, "fix-result", { attempt: attempts, outcome: res.outcome, ms: Date.now() - t0, error: res.error });
+      // A cancelled request or a refused commit (the round went moot) is never retried.
+      if (moot && res.outcome !== "applied") return await quietExit(moot);
       if (!RETRYABLE.has(res.outcome) || attempts >= maxAttempts) break;
-      if (await superseded()) return { ran: false, reason: SUPERSEDED };
-      if (await stopped()) return { ran: false, reason: STOPPED_QUIET };
+      const why = await checkpoint();
+      if (why) return await quietExit(why);
       prompt = `${basePrompt}\n\n${retryFeedback(res)}`;
     }
 
@@ -560,20 +697,19 @@ export async function runPostReviewLoop(
     //    operator stop that landed meanwhile means no continuation at all.
     const afterCommit = async (done: FixRoundResult, tries: number): Promise<LoopStepResult> => {
       const newHead = done.commitSha && FULL_SHA_RE.test(done.commitSha) ? done.commitSha : undefined;
+      // Our own commit moved the head, so only the SESSION decides here (an unreadable one does
+      // not block: the next review re-checks it).
+      const now = await sessionOf(gh, token, ref, newHead ? { ...head, sha: newHead } : head, botLogin).catch(() => null);
       let status: ContinuationStatus;
-      if (await stopped()) {
+      if (now && (!now.active || now.startIso !== session.startIso)) {
         status = { ok: false, stopped: true };
       } else if (!newHead) {
         status = { ok: false, error: "the commit sha was not returned" };
       } else {
-        try {
-          // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
-          // budget — the round-cap handoff.
-          await gh.createIssueComment(token, { owner, repo, pr, body: continueComment({ mode, round: rounds.length + 1, pr, head: newHead }) });
-          status = { ok: true };
-        } catch (e) {
-          status = { ok: false, error: (e as Error)?.message ?? String(e) };
-        }
+        // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
+        // budget — the round-cap handoff.
+        const c = await ensureContinuation(gh, token, ref, { head: newHead, mode, sinceIso: session.startIso, botLogin, round: rounds.length + 1 });
+        status = c.posted || c.exists ? { ok: true } : { ok: false, error: c.error ?? "the continuation was not posted" };
       }
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status) }).catch(() => {
         /* the report is informational; the continuation / handoff carries the signal */
@@ -587,10 +723,10 @@ export async function runPostReviewLoop(
     };
 
     if (res.outcome === "applied") return await afterCommit(res, attempts);
-    // Nothing was pushed: a moved head (superseded) or an operator stop makes ANY result moot —
+    // Nothing was pushed: a moot round (moved head, stop, newer request) makes ANY result moot —
     // a suggestion for a stale head included — so nothing is posted.
-    if (await superseded()) return { ran: false, reason: SUPERSEDED };
-    if (await stopped()) return { ran: false, reason: STOPPED_QUIET };
+    const after = await checkpoint();
+    if (after) return await quietExit(after);
     if (res.outcome === "suggested") {
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts) });
       return { ran: true, step: "fix", outcome: res.outcome, continued: false, attempts };
@@ -639,10 +775,9 @@ export async function continueLoopOnPush(
     const moved = push.pushedAt ? [{ at: push.pushedAt, kind: "push" as const, head: push.headSha }] : [];
     const session = await readLoopSession(d.gh, token, push.owner, push.repo, push.pr, { botLogin, pr: head, extra: moved });
     if (!session.active) return { posted: false, reason: NO_SESSION };
-    const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso });
-    const body = continueComment({ mode: session.mode ?? "suggest", round: rounds.length + 1, pr: push.pr, head: push.headSha });
-    await d.gh.createIssueComment(token, { owner: push.owner, repo: push.repo, pr: push.pr, body });
-    return { posted: true, reason: "continued" };
+    const c = await ensureContinuation(d.gh, token, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, botLogin });
+    if (c.error) return { posted: false, reason: `continue on push failed: ${c.error}` };
+    return { posted: c.posted, reason: c.posted ? "continued" : "already continued" };
   } catch (e) {
     return { posted: false, reason: `continue on push failed: ${(e as Error)?.message ?? String(e)}` };
   }

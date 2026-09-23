@@ -17,8 +17,27 @@ export const REVIEW_LOOP_STOPPED_HUMAN = "Ashlar review-loop stopped by operator
 
 export const STOPPED_MARKER = "<!-- ashlar-loop-stopped -->";
 
-/** total=0 on the findings marker is the machine side of CONVERGED (§3). */
-const ZERO_FINDINGS_RE = /<!--\s*ashlar-findings\s+total=0\b/;
+/** The findings marker is the TRAILING line of every ashlar review body (review-format.ts ends
+ * each body with it, and capReviewBody preserves it when truncating). Only a marker at the very
+ * end counts: one quoted earlier in a body — even one an emitter forgot to neutralize — is prose,
+ * never a count, exactly like the control markers that must OPEN their comment. */
+const FINDINGS_TRAILER_RE = /<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/;
+
+/** The review's finding total from its trailing marker; null when there is none (an ops or
+ * non-summary review) or it carries no total. total=0 is the machine side of CONVERGED (§3). */
+export function parseFindingsTotal(body: string | null | undefined): number | null {
+  const m = FINDINGS_TRAILER_RE.exec(body || "");
+  if (!m) return null;
+  const t = /(?:^|\s)total=(\d{1,6})(?=\s|$)/.exec(m[1]);
+  return t ? Number(t[1]) : null;
+}
+
+/** Epoch ms of an ISO-8601 timestamp; NaN when absent or unparseable. Session boundaries are
+ * compared as instants, never as strings: GitHub timestamps are second-precision ("…00Z") while
+ * Date#toISOString carries milliseconds ("…00.500Z"), and lexically "…00Z" sorts after "…00.500Z". */
+export function isoMs(iso: string | null | undefined): number {
+  return iso ? Date.parse(iso) : NaN;
+}
 
 /**
  * Terminal-signal detectors trust ONLY bot-authored comments. WHY: the markers are
@@ -39,7 +58,7 @@ export interface CommentSource {
 }
 
 export function isZeroFindings(body: string | null | undefined, source: CommentSource): boolean {
-  return source.authoredByBot && ZERO_FINDINGS_RE.test(body || "");
+  return source.authoredByBot && parseFindingsTotal(body) === 0;
 }
 
 // ── ESCALATE reason → directive (§8) ─────────────────────────────────────────

@@ -20,10 +20,12 @@ import {
   classifyStuck,
   DEFAULT_ASHLAR_BOT_LOGIN,
   escalateFromRounds,
+  isoMs,
   isSelfLogin,
   isStoppedComment,
   stuckPattern,
   parseEscalateMarker,
+  parseFindingsTotal,
   parseReviewLoopDirective,
   type EscalateReason,
   type RoundSummary,
@@ -62,23 +64,16 @@ export interface ReviewLoopGithub {
 // The real github.server binding lives at the harbor call site (harbor already imports
 // github.server); keeping this module DI-only lets it unit-test without the server graph.
 
-const FINDINGS_RE = /<!--\s*ashlar-findings\s+(.+?)\s*-->/;
-
 function isBot(login: string, botLogin: string): boolean {
   return isSelfLogin(login, botLogin);
 }
 
-
-function parseFindingsTotal(body: string): number | null {
-  const m = FINDINGS_RE.exec(body || "");
-  if (!m) return null;
-  for (const pair of m[1].split(/\s+/)) {
-    if (pair.startsWith("total=")) {
-      const n = Number(pair.slice("total=".length));
-      return Number.isNaN(n) ? null : n;
-    }
-  }
-  return null;
+/** In-session test for a history row: compared as instants (isoMs). With a session anchor, a row
+ * whose timestamp is missing or unparseable cannot be proven in-session and is excluded. */
+function inSession(at: string | null | undefined, sinceMs: number): boolean {
+  if (Number.isNaN(sinceMs)) return true; // no anchor: the whole history
+  const t = isoMs(at);
+  return !Number.isNaN(t) && t >= sinceMs;
 }
 
 /**
@@ -104,19 +99,21 @@ export async function reconstructRounds(
   // Full commit SHA is identity everywhere (a 7-char prefix can collide); short() is display-only.
   // G6: a comment counts only if it is in-session (created at/after sinceIso), so a pre-loop
   // comment on a head cannot leak into the current loop's file history.
+  const sinceMs = isoMs(opts.sinceIso);
   const filesByHead = new Map<string, Set<string>>();
   for (const c of comments) {
     if (!isBot(c.userLogin, botLogin) || !c.commitId || !c.path) continue;
-    if (opts.sinceIso && (c.createdAt || "") < opts.sinceIso) continue;
+    if (!inSession(c.createdAt, sinceMs)) continue;
     const head = c.commitId;
     (filesByHead.get(head) ?? filesByHead.set(head, new Set()).get(head)!).add(c.path);
   }
 
   const byHead = new Map<string, number>();
   const order: string[] = [];
+  const at = (iso: string | undefined) => isoMs(iso) || 0; // unparseable (no anchor only): oldest
   const ashlarReviews = reviews
-    .filter((r) => isBot(r.userLogin, botLogin) && (!opts.sinceIso || (r.submittedAt || "") >= opts.sinceIso))
-    .sort((a, b) => (a.submittedAt || "").localeCompare(b.submittedAt || ""));
+    .filter((r) => isBot(r.userLogin, botLogin) && inSession(r.submittedAt, sinceMs))
+    .sort((a, b) => at(a.submittedAt) - at(b.submittedAt));
   for (const rv of ashlarReviews) {
     const total = parseFindingsTotal(rv.body);
     if (total === null) continue; // ops / non-summary review row
@@ -148,8 +145,9 @@ async function alreadyEscalated(
   sinceIso?: string,
 ): Promise<boolean> {
   const issues = await gh.listIssueComments(token, owner, repo, pr);
+  const sinceMs = isoMs(sinceIso);
   for (const c of issues) {
-    if (sinceIso && c.createdAt && c.createdAt < sinceIso) continue;
+    if (!inSession(c.createdAt, sinceMs)) continue;
     const parsed = parseEscalateMarker(c.body, { authoredByBot: isBot(c.userLogin, botLogin) });
     if (parsed && parsed.head === head) return true; // full-SHA equality
   }
@@ -210,7 +208,10 @@ export async function maybeEscalate(
     diffLines?: number;
     botLogin?: string;
     sinceIso?: string;
-    /** Fail closed (error CURRENT_ROUND_MISSING) unless the reviewed head IS the latest round. */
+    /** Fail closed (error CURRENT_ROUND_MISSING) unless the reviewed head IS the latest round —
+     * including a history with ZERO attributable rounds, which then can never "pass" the budget.
+     * The loop runtime always sets it; a lenient caller only classifies a history it can see and
+     * gets no budget guarantee for an unattributable one (classifyStuck([]) is null). */
     requireCurrentRound?: boolean;
   },
 ): Promise<EscalateResult> {

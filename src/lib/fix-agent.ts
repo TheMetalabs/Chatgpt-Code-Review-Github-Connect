@@ -74,7 +74,8 @@ export function buildFixPrompt(input: {
     "   reconstruct from memory. Only the paths shown below may be changed; any other path is",
     "   rejected. Unsafe/absolute/`..` paths are rejected.",
     "",
-    `Editable files in scope: ${paths.join(", ") || "(none)"}`,
+    // JSON array, never raw text: a repository-controlled path must stay data in this section.
+    `Editable files in scope (JSON): ${JSON.stringify(paths)}`,
     "",
     "Output schema (return exactly this shape, no prose outside the JSON):",
     '{ "summary": "<what you changed and why>", "files": [ { "path": "<one of the paths above>", "content": "<full new file>" } ] }',

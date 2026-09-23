@@ -409,3 +409,36 @@ describe("durable loop events: authorship is enforced when reading history", () 
     assert.equal(stopped.endedBy, "stop");
   });
 });
+
+describe("round-3: instants, not strings; the trailing findings marker only", () => {
+  const A = "a".repeat(40);
+  it("a second-precision row just before a millisecond session anchor is OUT of the session", async () => {
+    const { gh } = fakeGh([{ head: A, findings: 3, files: ["x.ts"], at: "2026-01-01T00:00:00Z" }]);
+    assert.equal((await reconstructRounds(gh, "t", "o", "r", 1, { sinceIso: "2026-01-01T00:00:00.500Z" })).length, 0);
+    assert.equal((await reconstructRounds(gh, "t", "o", "r", 1, { sinceIso: "2025-12-31T23:59:59.500Z" })).length, 1);
+  });
+
+  it("an older handoff never silences a new session anchored a fraction of a second later", async () => {
+    const marker = `<!-- ashlar-loop-escalate reason=fix-failed round=1 pr=1 head=${A} -->`;
+    const { gh, posted } = fakeGh([], []);
+    gh.listIssueComments = async () => [{ userLogin: BOT, body: marker, createdAt: "2026-01-01T00:00:00Z" }];
+    const r = await escalateNow(gh, "t", { owner: "o", repo: "r", pr: 1, head: A, reason: "fix-failed", rounds: [], roundCap: 5, sinceIso: "2026-01-01T00:00:00.500Z" });
+    assert.equal(r.escalated, true, "the pre-session handoff is out of scope");
+    assert.equal(posted.length, 1);
+  });
+
+  it("a review that QUOTES a zero marker before its trailing count is not a clean round", async () => {
+    const body = "### Ashlar Review\n- finding quoting <!-- ashlar-findings total=0 --> in prose\n<!-- ashlar-findings total=2 inline=2 -->";
+    const gh = {
+      async listIssueComments() { return [{ userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-01T00:00:00Z" }]; },
+      async listReviewComments() { return []; },
+      async listPullReviews() { return [{ userLogin: BOT, body, commitId: A, submittedAt: "2026-01-02T00:00:00Z" }]; },
+      async createIssueComment() { return { id: 1 }; },
+    };
+    const rounds = await reconstructRounds(gh, "t", "o", "r", 1);
+    assert.deepEqual(rounds.map((r) => r.findings), [2]);
+    const events = await readLoopEvents(gh, "t", "o", "r", 1);
+    assert.equal(events.some((e) => e.kind === "converged"), false);
+    assert.equal((await readLoopSession(gh, "t", "o", "r", 1)).active, true);
+  });
+});

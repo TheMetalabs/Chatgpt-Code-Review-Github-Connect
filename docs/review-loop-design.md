@@ -59,7 +59,9 @@ GitHub가 영속하는 이벤트(코멘트·리뷰·PR 본문)를 접어서 세�
 - **작성자 강제:** start/stop은 사람만, 마커·CONVERGED는 봇(App 로그인)만. 봇 산문·사람이 쓴 마커는 무시.
 - **활성 세션의 모든 리뷰가 루프 라운드**다(명시 start, 연속 마커, push 연속, 세션 중 요청한 일반 리뷰).
 - **push = 다음 라운드:** 활성 세션에서 사람이 push하면 드라이버가 연속 마커를 달아 새 head를 리뷰한다(봇 자신의 push는
-  수정 라운드가 직접 연속 마커를 단다). 리뷰 중 head가 움직이면 옛 라운드는 조용히 supersede된다.
+  수정 라운드가 직접 연속 마커를 단다). 리뷰 중·수정 중 head가 움직이면 옛 라운드는 조용히 supersede되고, live head의
+  리뷰를 (다시) 요청한다 — 연속 마커는 **(PR, head, 세션)마다 하나**(동시 호출은 한 번의 게시를 공유, 이후 호출은 기존
+  마커를 찾아 게시하지 않음)라서 push 이벤트를 놓쳐도 루프가 멈추지 않고, 중복 트리거도 없다.
 - **정지:** 사람의 `/review-loop stop` 은 세션을 끝내고, 진행 중인 루프 리뷰를 취소하며, 고정 STOPPED 마커를 **한 번**
   남긴다(웹훅의 작성 시각을 주입해 목록 API 지연과 무관). 수정 중이면 커밋 직전 재확인에서 멈추고, 커밋 후였다면
   연속 요청을 하지 않는다.
@@ -75,7 +77,7 @@ GitHub가 영속하는 이벤트(코멘트·리뷰·PR 본문)를 접어서 세�
 
 | 종착 상태 | 고정 마커(머신) | 고정 문구(사람) | 감지 |
 |---|---|---|---|
-| **CONVERGED** | `<!-- ashlar-findings total=0 ... -->` | (지정 리뷰어의 clean verdict) | substring/마커 |
+| **CONVERGED** | `<!-- ashlar-findings total=0 ... -->` (리뷰 본문의 **마지막 줄**) | (지정 리뷰어의 clean verdict) | substring/마커 — ashlar 내부는 끝에 있는 마커만 센다 |
 | **ESCALATE** | `<!-- ashlar-loop-escalate reason=<code> round=<N> -->` | `Ashlar review-loop halted — human review required` | substring/마커 |
 | **STOPPED** | `<!-- ashlar-loop-stopped -->` | `Ashlar review-loop stopped by operator` | 마커 |
 
@@ -94,8 +96,9 @@ FIXING은 수정 요청 직전에 단다(수정은 바쁜 provider 큐에서 오
 기다릴 수 있다. 스트리밍 신호로 "대기(keepalive)"와 "생성(첫 출력)"을 구분해:
 - 생성 deadline(`ASHLAR_FIX_TIMEOUT_MS`, 기본 60분)은 **첫 출력부터** 센다 — 대기 시간 제외(부하 중 거짓
   `fix-failed` 방지). 대기 상한은 별도(`ASHLAR_FIX_QUEUE_MAX_MS`, 기본 6시간), 신호 두절(liveness)도 중단.
-- 대기 중 2분마다 + 생성 시작 순간에 **여전히 필요한지** 확인(head 이동·세션 종료) — 아니면 abort(대기열 자리
-  반환·생성 조기 차단), 결과는 조용한 superseded / stopped.
+- **관련성 검사는 하나**(head 이동 · 세션 종료 · 새 세션 · apply→suggest 강등)이고, 라운드 시작 직전, 대기 중 2분마다,
+  생성 시작 순간, 재시도 전, 커밋 직전, 리포트 전에 같은 검사를 쓴다 — 해당하면 abort(대기열 자리 반환·생성 조기 차단)하고
+  조용히 끝난다(superseded / stopped / newer request). 이렇게 무의미해진 라운드는 **재시도하지 않는다.**
 - 수정 요청은 리뷰 경로와 같은 샘플링·예산(temperature 0.6 등)을 쓴다 — 없으면 추론 모델이 반복 루프로 상한까지
   생성하다 `length`로 끝난다.
 - 서버 로그 `[review-loop] <job> step|fix-request|fix-result|continued|handoff` 로 활성 세션의 각 단계를
@@ -160,8 +163,10 @@ suggest 모드의 라운드는 고정 "suggestion" 리포트로 사람에게 넘
   달고, 그다음 리포트(마지막 줄이 실제 결과를 말함)를 단다. 연속 요청 실패는 새 head에 대한 `loop-error`.
 - 예산은 **권위적**이다: 검증 리뷰(N+1)에 지적이 남으면 추세 패턴과 무관하게 `round-cap`이고, 패턴(whack-a-mole·
   oscillation)은 Detail에 남는다. 패턴 사유는 예산 안에서만 발동한다.
-- 라운드 이력은 봇 로그인으로 귀속 가능해야 한다: 현재 리뷰가 이력의 마지막 라운드로 보이지 않으면(API 지연 1회
-  재조회 후) 수정하지 않고 `loop-error` — 예산을 우회하는 "맹목 수정"을 막는다.
+- 라운드 이력은 봇 로그인으로 귀속 가능해야 한다: 현재 리뷰가 이력의 마지막 라운드로 보이지 않으면(API 지연 대비
+  3·6·12초 백오프 재조회 후) 수정하지 않고 `loop-error` — 예산을 우회하는 "맹목 수정"을 막는다. 같은 head의 다른
+  핸드오프가 게시 중이면 한 번 기다렸다가 다시 보고, 여전히 게시 중이면 **로그에 남는** 사유로 끝낸다(조용한 no-op 없음).
+- 세션 경계·이력 순서는 **시각(epoch ms)으로** 비교한다(문자열 비교 금지: `…00Z` 가 `…00.500Z` 보다 사전순으로 뒤).
 
 ## 6. Fix 에이전트 (루프를 실제로 수렴시키는 엔진)
 

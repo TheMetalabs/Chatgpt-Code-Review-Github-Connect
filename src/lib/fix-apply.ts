@@ -46,13 +46,24 @@ export function isSensitivePath(p: string): boolean {
 }
 
 /** Reject anything that could escape the repo tree or is obviously not a repo-relative path. */
-function isSafeRepoPath(p: unknown): p is string {
+/** C0 / DEL / C1 controls and the Unicode line/paragraph separators. */
+function hasControlChar(p: string): boolean {
+  for (let i = 0; i < p.length; i += 1) {
+    const c = p.charCodeAt(i);
+    if (c <= 0x1f || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029) return true;
+  }
+  return false;
+}
+
+/** A repository path the fix may write: relative POSIX, no traversal, and no control or line
+ * separator characters (a path is also quoted into the fix prompt; it must never break a line). */
+export function isSafeFixPath(p: unknown): p is string {
   if (typeof p !== "string" || p.length === 0 || p.length > 400) return false;
   if (p.startsWith("/") || p.startsWith("~") || p.startsWith("\\")) return false;
   if (p.includes("\\")) return false; // POSIX repo paths only
   // Reject `..` only as a whole path SEGMENT (traversal), not inside a filename like archive..old.ts
   if (p === ".." || p.split("/").includes("..")) return false;
-  if (p.includes("\0") || /[\n\r]/.test(p)) return false;
+  if (hasControlChar(p)) return false;
   if (/^[a-zA-Z]:/.test(p)) return false; // no Windows drive letters
   return true;
 }
@@ -101,7 +112,7 @@ export function parseFixResponse(raw: string): FixParse {
     if (!entry || typeof entry !== "object") return { ok: false, error: "file entry is not an object" };
     const path = (entry as { path?: unknown }).path;
     const content = (entry as { content?: unknown }).content;
-    if (!isSafeRepoPath(path)) return { ok: false, error: `unsafe or missing path: ${String(path).slice(0, 80)}` };
+    if (!isSafeFixPath(path)) return { ok: false, error: `unsafe or missing path: ${JSON.stringify(String(path).slice(0, 80))}` };
     if (isSensitivePath(path)) return { ok: false, error: `sensitive repo-control path: ${path}` };
     if (seen.has(path)) return { ok: false, error: `duplicate path: ${path}` };
     if (typeof content !== "string" || content.length === 0) {

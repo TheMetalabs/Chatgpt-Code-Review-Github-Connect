@@ -23,13 +23,14 @@
  *   was stale (the driver decided to continue before it landed): the session resumes with its
  *   anchor, mode and starter. A clean review of the live head always ends the session, and a
  *   push never resumes one (a human push after a real convergence starts nothing).
+ * - Events are ordered as INSTANTS (isoMs), never as strings; an undatable event is ignored.
  * - Same-timestamp ties (GitHub timestamps are 1s resolution) order head moves first, then
  *   terminal events, then starts: a start posted in the same second as a handoff begins a new
  *   session, and a head move in a clean review's second marks it stale.
  * Authorship is the CALLER's job: only bot-authored markers/reviews may become escalate /
  * stopped / converged / continue events, and bot-authored comments never become start/stop events.
  */
-import type { ReviewLoopMode } from "./review-loop.ts";
+import { isoMs, type ReviewLoopMode } from "./review-loop.ts";
 
 export type LoopEventKind = "start" | "stop" | "escalate" | "stopped" | "converged" | "continue" | "push";
 
@@ -64,9 +65,11 @@ function staleClean(head: string | undefined, awaited: string | undefined, live:
 }
 
 export function deriveLoopSession(events: readonly LoopEvent[], opts: { liveHead?: string } = {}): LoopSession {
-  const sorted = [...events]
-    .filter((e) => typeof e.at === "string" && e.at.length > 0)
-    .sort((a, b) => (a.at === b.at ? ORDER[a.kind] - ORDER[b.kind] : a.at < b.at ? -1 : 1));
+  const sorted = events
+    .map((e) => ({ e, t: isoMs(e.at) }))
+    .filter((x) => !Number.isNaN(x.t))
+    .sort((a, b) => a.t - b.t || ORDER[a.e.kind] - ORDER[b.e.kind])
+    .map((x) => x.e);
   let s: LoopSession = { active: false };
   let awaited: string | undefined; // the head the active session waits on (latest continue / push)
   // A converged end that a later continuation may prove stale: the session it ended + its head.

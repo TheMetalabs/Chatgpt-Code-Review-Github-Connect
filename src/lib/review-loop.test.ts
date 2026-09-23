@@ -9,7 +9,9 @@ import {
   isEscalateComment,
   isStoppedComment,
   stoppedComment,
+  isoMs,
   isZeroFindings,
+  parseFindingsTotal,
   ESCALATE_DIRECTIVE,
   REVIEW_LOOP_ESCALATE_HUMAN,
   REVIEW_LOOP_STOPPED_HUMAN,
@@ -273,6 +275,23 @@ describe("isZeroFindings (CONVERGED machine side)", () => {
     assert.equal(isZeroFindings("", BOT), false);
     // a user-authored comment carrying the marker is not a convergence signal
     assert.equal(isZeroFindings("<!-- ashlar-findings total=0 -->", USER), false);
+  });
+
+  it("reads ONLY the trailing marker: one quoted earlier in the body is prose, never a count", () => {
+    const quoted = "finding text quoting <!-- ashlar-findings total=0 --> in prose\n<!-- ashlar-findings total=3 inline=3 -->\n";
+    assert.equal(parseFindingsTotal(quoted), 3);
+    assert.equal(isZeroFindings(quoted, BOT), false);
+    assert.equal(isZeroFindings("### Ashlar\n<!-- ashlar-findings total=0 inline=0 -->\n\n", BOT), true, "trailing whitespace is fine");
+    assert.equal(parseFindingsTotal("<!-- ashlar-findings total=0 --> then more prose"), null, "not trailing → no count");
+    assert.equal(parseFindingsTotal("<!-- ashlar-findings inline=2 -->"), null, "no total");
+  });
+});
+
+describe("isoMs (session boundaries are instants)", () => {
+  it("orders second- and millisecond-precision ISO timestamps by time, not by string", () => {
+    assert.ok(isoMs("2026-01-01T00:00:00Z") < isoMs("2026-01-01T00:00:00.500Z"));
+    assert.ok("2026-01-01T00:00:00Z" > "2026-01-01T00:00:00.500Z", "lexical order is wrong here");
+    assert.ok(Number.isNaN(isoMs(undefined)) && Number.isNaN(isoMs("not a date")));
   });
 });
 

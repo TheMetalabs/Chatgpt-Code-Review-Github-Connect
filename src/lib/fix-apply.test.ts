@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseFixResponse } from "./fix-apply.ts";
+import { isSafeFixPath, parseFixResponse } from "./fix-apply.ts";
 
 const ok = (raw: string) => {
   const r = parseFixResponse(raw);
@@ -77,5 +77,18 @@ describe("parseFixResponse", () => {
 
   it("rejects duplicate paths", () => {
     assert.match(err('{"files":[{"path":"a.ts","content":"1"},{"path":"a.ts","content":"2"}]}'), /duplicate/);
+  });
+});
+
+describe("isSafeFixPath", () => {
+  it("accepts relative POSIX repo paths", () => {
+    for (const ok of ["src/a.ts", "a.b..c/x.ts", "docs/archive..old.md", "ünïcode/ファイル.ts"]) assert.equal(isSafeFixPath(ok), true, ok);
+  });
+
+  it("rejects traversal, absolute, Windows and every control or line-separator character", () => {
+    const bad = ["", "/etc/passwd", "~/x", "a/../b", "..", "a\\b", "C:/x", "a\nb", "a\rb", "a\tb", "a\u0000b", "a\u007fb", "a\u0085b", "a\u2028b", "a\u2029b"];
+    for (const p of bad) assert.equal(isSafeFixPath(p), false, JSON.stringify(p));
+    assert.equal(isSafeFixPath(undefined), false);
+    assert.equal(isSafeFixPath("x".repeat(401)), false);
   });
 });

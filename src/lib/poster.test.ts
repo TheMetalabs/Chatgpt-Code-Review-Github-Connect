@@ -119,6 +119,28 @@ describe("poster", () => {
     assert.match(mentioned.body, /ashlar-findings total=0/);
   });
 
+  it("posts the clean verdict (CONVERGED) for a /review-loop start even without an @-mention", () => {
+    // slash form and the driver's continuation marker are loop starts but not @-mentions
+    for (const userText of ["/review-loop apply", "<!-- ashlar-loop-continue mode=apply round=2 pr=1 head=x -->"]) {
+      const clean = buildReview(
+        job([], { thread: { kind: "mention", commentId: 1, userText, loop: { kind: "start", mode: "apply" } } }),
+        [],
+        [],
+        DEFAULT_SETTINGS,
+      );
+      assert.ok(clean, `clean verdict posted for ${userText}`);
+      assert.match(clean.body, /ashlar-findings total=0/);
+    }
+    // a stop directive is not a review request: still silent on zero findings
+    const stop = buildReview(
+      job([], { thread: { kind: "mention", commentId: 1, userText: "/review-loop stop", loop: { kind: "stop" } } }),
+      [],
+      [],
+      DEFAULT_SETTINGS,
+    );
+    assert.equal(stop, null);
+  });
+
   it("salvages a raw_review reply (parse failed, repair off) and posts it as a non-clean COMMENT", () => {
     const sample = SAMPLE_PRS["pay-412"];
     const gate = gateLiveSubmission(

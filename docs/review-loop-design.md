@@ -60,7 +60,8 @@
 | **CONTINUE** | `<!-- ashlar-loop-continue mode=<apply\|suggest> round=<N> pr=<PR> head=<40hex> -->` | `Ashlar review-loop continues — requesting the next review` | 마커(봇 작성분만) |
 
 CONTINUE 코멘트에는 멘션·지시어 산문이 없다. 봇이 작성한 이 마커만 다음 리뷰를 연다(head는 감사용이며, 리뷰는
-그 시점 PR 최신 head를 본다).
+그 시점 PR 최신 head를 본다). 0건 라운드는 명시 요청과 같이 clean 리뷰(`ashlar-findings total=0`)를 올려
+CONVERGED를 남긴다(슬래시 형식·연속 마커도 동일).
 
 원칙(스킬의 교훈):
 - **마커·문구는 드라이버가 방출**한다. reason/round 같은 구조 데이터는 **머신 마커의 속성**으로, 사람용 문구는

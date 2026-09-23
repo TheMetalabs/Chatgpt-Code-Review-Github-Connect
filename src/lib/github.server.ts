@@ -806,6 +806,21 @@ export async function commitFilesToBranch(
   });
 }
 
+/** Head branch name + fork flag for the fix agent's push (a fork branch can't be pushed with the
+ * installation token). Reads /pulls/{pr}; loaded only via dynamic import from the loop runtime. */
+export async function fetchPullHeadRef(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+): Promise<{ ref: string; fork: boolean }> {
+  const out = await gh<{ head?: { ref?: string; repo?: { fork?: boolean } | null } }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
+  if (!out.ok || !out.data.head?.ref) {
+    throw new Error(out.ok ? "pull request has no head ref" : `could not load pull request (${out.status}): ${out.text}`);
+  }
+  return { ref: out.data.head.ref, fork: Boolean(out.data.head.repo?.fork) };
+}
+
 export async function createIssueComment(
   token: string,
   opts: { owner: string; repo: string; pr: number; body: string },

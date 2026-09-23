@@ -34,6 +34,7 @@ import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import { runPostReviewLoop } from "./review-loop-runtime.server.ts";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { redactSalvagedReviewBody } from "./review-format";
 import {
@@ -1102,6 +1103,9 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
+  // Review-loop step (design §5 4–8): gated OFF by default (ASHLAR_FIX_AGENT + fixAgent.provider,
+  // and only for /review-loop-triggered reviews). Best-effort — never un-posts the review.
+  if (token && postedToGithub) void runPostReviewLoop(token, postedJob, sample, state.settings, state.jobs);
 }
 
 function enqueueFromDecision(

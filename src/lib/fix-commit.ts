@@ -6,6 +6,11 @@
  *
  * WHY full-file blobs (not a patch): a blob is the complete new file, so the resulting
  * tree is exactly what the fix agent produced — no fragile diff-context apply.
+ *
+ * INVARIANTS (fail-closed): any step (base tree / blob / tree / commit) that throws aborts the
+ * whole operation and the branch ref is NEVER moved — a partial failure leaves only orphan
+ * blobs, which GitHub garbage-collects. The commit is atomic from the ref's point of view.
+ * NON-GOALS: pushing to a fork's branch (the installation token can't); the caller gates forks.
  */
 import type { FixFile } from "./fix-apply.ts";
 

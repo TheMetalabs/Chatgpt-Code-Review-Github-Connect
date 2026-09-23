@@ -62,6 +62,11 @@ describe("parseFixResponse", () => {
     assert.match(err('{"files":[{"path":"a.ts","content":"const y = 1;\\n// ... rest unchanged"}]}'), /truncated|elided/);
   });
 
+  it("rejects content over the per-file size cap (bounded resource use)", () => {
+    const huge = "x".repeat(1_000_001);
+    assert.match(err(JSON.stringify({ files: [{ path: "a.ts", content: huge }] })), /exceeds .* bytes/);
+  });
+
   it("rejects duplicate paths", () => {
     assert.match(err('{"files":[{"path":"a.ts","content":"1"},{"path":"a.ts","content":"2"}]}'), /duplicate/);
   });

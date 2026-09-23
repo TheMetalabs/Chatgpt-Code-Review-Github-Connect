@@ -7,6 +7,12 @@
  * the caller falls back (json-repair → another provider → coding agent → ESCALATE) when
  * this returns { ok: false }. Parsing is deterministic; the §7 CI/test gate is what
  * catches a well-formed-but-wrong fix — this only guarantees mechanical fidelity.
+ *
+ * INVARIANTS (fail-closed): parse returns { ok:false } on ANY anomaly — unparseable JSON,
+ * no files, unsafe/traversal/absolute path, a sensitive repo-control path, empty/duplicate/
+ * truncated content, or content over the size cap. It never partially accepts.
+ * NON-GOALS (owned elsewhere): semantic correctness of the fix (the validate/CI gate, §7);
+ * choosing script-apply vs the coding-agent fallback for oversized files (the caller/§6).
  */
 import { lastJsonObject } from "./extract-chat-json.ts";
 
@@ -51,6 +57,9 @@ function isSafeRepoPath(p: unknown): p is string {
   return true;
 }
 
+const MAX_FILE_BYTES = 1_000_000;
+const MAX_TOTAL_BYTES = 4_000_000;
+
 // A model that ran out of tokens ends mid-token — truncation shows up on the FINAL line.
 // Check only the last non-empty line so a legit mid-file `console.log("Loading...")` or a
 // `// remaining work in #42` comment is not a false positive. Cheap heuristic; the validate/
@@ -93,8 +102,15 @@ export function parseFixResponse(raw: string): FixParse {
     if (looksTruncated(content)) {
       return { ok: false, error: `content for ${path} looks truncated/elided` };
     }
+    if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
+      return { ok: false, error: `content for ${path} exceeds ${MAX_FILE_BYTES} bytes` };
+    }
     seen.add(path);
     files.push({ path, content });
+  }
+  const totalBytes = files.reduce((n, f) => n + Buffer.byteLength(f.content, "utf8"), 0);
+  if (totalBytes > MAX_TOTAL_BYTES) {
+    return { ok: false, error: `change set exceeds ${MAX_TOTAL_BYTES} bytes total` };
   }
   const summary = typeof (parsed as { summary?: unknown }).summary === "string" ? (parsed as { summary: string }).summary : "";
   return { ok: true, fix: { summary, files } };

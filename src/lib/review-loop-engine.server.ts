@@ -6,6 +6,14 @@
  *
  * Dependency-injected GitHub access (ReviewLoopGithub) so it unit-tests with fakes and
  * never forces the harbor test fixture to stub new methods.
+ *
+ * INVARIANTS: reviews/comments are attributed by EXACT bot login and FULL commit SHA, scoped to
+ * the current loop session (sinceIso) and the current head; history reads fail closed (throw →
+ * maybeEscalate aborts, never dup-posts); an in-process per-head guard serializes concurrent calls.
+ * NON-GOALS (owned by the orchestrator): durable cross-PROCESS escalation dedup (needs a shared
+ * store — here it is in-process + the marker scan); full commit-ancestry verification across a
+ * force-push (here it is a proportionate latest-head-must-match-requested-head guard, not a
+ * compare-API ancestry walk).
  */
 import {
   classifyStuck,

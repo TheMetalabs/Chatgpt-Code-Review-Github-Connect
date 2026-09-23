@@ -6,6 +6,14 @@
  * the transport/wiring is chosen by the caller (harbor) per `fixAgent` settings. The fix is
  * a full-file schema parsed deterministically (fix-apply); `suggest` mode returns the change
  * set for a proposal, `apply` mode commits it atomically (fix-commit).
+ *
+ * INVARIANTS (fail-closed, apply mode): request-failed on transport error; parse-failed on a
+ * bad reply; scope-violation on an out-of-scope OR sensitive path (independent of allowedPaths);
+ * validation-failed if no validator is supplied or the candidate fails it; commit-failed if the
+ * atomic push throws. The branch ref moves ONLY on a fully validated candidate.
+ * NON-GOALS (owned elsewhere): the post-push CI/test gate (§7) is the real correctness net;
+ * fork PRs and choosing the coding-agent fallback for oversized files are the caller's gate;
+ * provider-output *correctness* is not guaranteed — only mechanical fidelity + the gates above.
  */
 import { isSensitivePath, parseFixResponse, type FixFile } from "./fix-apply.ts";
 import { commitFiles, type GitDataApi } from "./fix-commit.ts";

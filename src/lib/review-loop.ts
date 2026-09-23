@@ -313,10 +313,17 @@ const WHACK_MIN_REPEAT = 2; // a file flagged in >= this many of the window => w
 
 /**
  * Classify why a loop is stuck, or null when it is converged / still making progress.
- * Precedence: diff-too-large (structural) > whack-a-mole (recurring file) > oscillation
- * (counts not trending down) > round-cap. The semantic reasons (guard-accretion,
- * wrong-scope, re-flag-deferred) need diff/semantic context the trend can't supply and
- * are left to the human.
+ *
+ * CONTRACT (single source of the stuck-definition — do not patch case-by-case):
+ * - Converged: last round has 0 findings → null.
+ * - Still improving: the recent window is STRICTLY decreasing → null, even at the cap or with
+ *   a recurring file (that is healthy progress, not stuck).
+ * - Otherwise, in precedence order: diff-too-large (structural, never converges) >
+ *   whack-a-mole (>=3 rounds, a file recurs in the window, trend not strictly improving) >
+ *   oscillation (>=3 rounds, window not trending down, all non-zero) > round-cap (cap hit,
+ *   trend not strictly improving).
+ * The semantic reasons (guard-accretion, wrong-scope, re-flag-deferred) need diff/semantic
+ * context the finding trend cannot supply and are left to the human.
  */
 export function classifyStuck(
   rounds: RoundSummary[],

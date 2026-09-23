@@ -16,6 +16,7 @@
  * compare-API ancestry walk).
  */
 import {
+  canonicalContinuation,
   classifyStuck,
   DEFAULT_ASHLAR_BOT_LOGIN,
   escalateFromRounds,
@@ -329,11 +330,13 @@ export async function escalateNow(
 
 // ── Durable loop session (review-loop-session.ts) ─────────────────────────────
 
-/** The PR fields a start directive in the PR body needs (from GET /pulls/{pr}). */
+/** The PR fields the session needs (from GET /pulls/{pr}): the body's start directive, and the
+ * live head (a clean review of any other head cannot end the session unless the loop waits on it). */
 export interface LoopPrInfo {
   body?: string | null;
   createdAt?: string;
   author?: string;
+  sha?: string;
 }
 
 function pushDirective(events: LoopEvent[], body: string | null | undefined, at: string, actor: string): void {
@@ -345,7 +348,8 @@ function pushDirective(events: LoopEvent[], body: string | null | undefined, at:
 /**
  * Collect the PR's loop events from durable history. Authorship is enforced HERE: a human (any
  * non-App author) contributes start/stop directives from issue comments, inline comments and the
- * PR body; ONLY the App contributes escalate / stopped markers and converged (total=0) reviews.
+ * PR body; ONLY the App contributes escalate / stopped markers, its canonical continuation for
+ * THIS PR (the head the loop moved to), and converged (total=0) reviews with their commit.
  * A comment's event time is its creation time — a directive added later by EDITING an old
  * comment is not a session start (the webhook path may still run a review for it).
  * Reads fail closed: a list error throws (the caller must not act on a partial history).
@@ -368,8 +372,10 @@ export async function readLoopEvents(
   for (const c of issues) {
     if (!c.createdAt) continue;
     if (isSelfLogin(c.userLogin, botLogin)) {
+      const cont = canonicalContinuation(c.body, { authoredByBot: true });
       if (parseEscalateMarker(c.body, { authoredByBot: true })) events.push({ at: c.createdAt, kind: "escalate" });
       else if (isStoppedComment(c.body, { authoredByBot: true })) events.push({ at: c.createdAt, kind: "stopped" });
+      else if (cont && cont.pr === pr) events.push({ at: c.createdAt, kind: "continue", head: cont.head });
     } else {
       pushDirective(events, c.body, c.createdAt, c.userLogin);
     }
@@ -383,7 +389,7 @@ export async function readLoopEvents(
   }
   for (const r of reviews) {
     if (isSelfLogin(r.userLogin, botLogin) && r.submittedAt && parseFindingsTotal(r.body) === 0) {
-      events.push({ at: r.submittedAt, kind: "converged" });
+      events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
     }
   }
   return events;
@@ -399,5 +405,5 @@ export async function readLoopSession(
   opts: { botLogin?: string; pr?: LoopPrInfo; extra?: LoopEvent[] } = {},
 ): Promise<LoopSession> {
   const events = await readLoopEvents(gh, token, owner, repo, pr, opts);
-  return deriveLoopSession([...events, ...(opts.extra ?? [])]);
+  return deriveLoopSession([...events, ...(opts.extra ?? [])], { liveHead: opts.pr?.sha });
 }

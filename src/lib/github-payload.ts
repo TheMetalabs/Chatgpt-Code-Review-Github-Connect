@@ -25,7 +25,8 @@ export type ParsedDelivery =
        * author on lifecycle events). The loop engine keys "own push" / stop authorship on it. */
       actor: string;
       /** The triggering comment's created_at (comment events), so the loop engine can place a
-       * stop directive in the session even before the list API has caught up. */
+       * stop directive in the session even before the list API has caught up; for a push
+       * (synchronize), the PR's updated_at — when the loop moved to the pushed head. */
       eventAt?: string;
     }
   | { ok: false; reason: string };
@@ -44,6 +45,7 @@ type Gh = {
     head?: { sha?: string; repo?: { fork?: boolean } | null };
     base?: { sha?: string };
     user?: { login?: string };
+    updated_at?: string;
   };
   issue?: { number?: number; pull_request?: unknown; title?: string };
   comment?: { id?: number; body?: string; created_at?: string };
@@ -123,6 +125,7 @@ export function parseGitHubPayload(
       thread: bodyRequest ? { kind: "pr_body", commentId: 0, userText: text, loop: freshLoop } : undefined,
       untrustedBody: text.slice(0, 4000),
       actor: sender,
+      eventAt: trigger === "pull_request.synchronize" && typeof pr.updated_at === "string" ? pr.updated_at : undefined,
     };
   }
 

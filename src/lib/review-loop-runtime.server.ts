@@ -615,11 +615,13 @@ export async function runPostReviewLoop(
  * A push to a PR whose loop session is ACTIVE continues the loop: the driver posts the fixed
  * continuation marker so the next review runs on the pushed head (design §5 — the loop runs
  * until CONVERGED / ESCALATE / STOPPED, not one round per command). The App's own push is
- * skipped: its fix round posts the continuation itself. Never throws.
+ * skipped: its fix round posts the continuation itself. `pushedAt` (the webhook's PR updated_at)
+ * places the push in the session, so a stale clean review of the previous head cannot end it.
+ * Never throws.
  */
 export async function continueLoopOnPush(
   token: string,
-  push: { owner: string; repo: string; pr: number; headSha: string; actor: string },
+  push: { owner: string; repo: string; pr: number; headSha: string; actor: string; pushedAt?: string },
   settings: BotSettings,
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
@@ -632,7 +634,10 @@ export async function continueLoopOnPush(
     const head = await d.gh.fetchPullHeadRef(token, push.owner, push.repo, push.pr);
     // A later push will continue with its own head; never request a review of a stale one.
     if (head.sha !== push.headSha) return { posted: false, reason: SUPERSEDED };
-    const session = await sessionOf(d.gh, token, push, head, botLogin);
+    // The push itself is a session event: a clean review of the OLD head that lands after it
+    // (before the continuation below exists) is stale and must not end the session.
+    const moved = push.pushedAt ? [{ at: push.pushedAt, kind: "push" as const, head: push.headSha }] : [];
+    const session = await readLoopSession(d.gh, token, push.owner, push.repo, push.pr, { botLogin, pr: head, extra: moved });
     if (!session.active) return { posted: false, reason: NO_SESSION };
     const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso });
     const body = continueComment({ mode: session.mode ?? "suggest", round: rounds.length + 1, pr: push.pr, head: push.headSha });

@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
-import { parseContinueMarker, STOPPED_MARKER } from "./review-loop.ts";
+import { continueComment, parseContinueMarker, STOPPED_MARKER } from "./review-loop.ts";
 import {
   ashlarBotLogin,
   builtinValidate,
@@ -595,6 +595,28 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
   });
 });
 
+describe("a stale clean review never ends the session", () => {
+  // round 0: a clean review of an OLD commit (c0); round 1: the live head with findings
+  const LIVE = "d".repeat(40);
+  const cont = (at: string) => ({ userLogin: BOT, body: continueComment({ mode: "suggest", round: 2, pr: 7, head: LIVE }), createdAt: at });
+  const history = (issues: IssueRow[] = []) => fakeDeps({ rounds: [0, 3], lastHead: LIVE, liveSha: LIVE, issues });
+  const onLive = job({ headSha: LIVE });
+
+  it("the loop waited on the live head before the stale review landed: the round runs", async () => {
+    const r = await run(history([cont("2025-12-31T12:00:00Z")]), "suggest", ENV_ON, onLive);
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested", JSON.stringify(r));
+  });
+
+  it("the continuation was posted just after the stale review landed: the session resumes", async () => {
+    const r = await run(history([cont("2026-01-01T12:00:00Z")]), "suggest", ENV_ON, onLive);
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested", JSON.stringify(r));
+  });
+
+  it("control: with no evidence the loop moved on, a clean review is a real convergence", async () => {
+    assert.deepEqual(await run(history(), "suggest", ENV_ON, onLive), { ran: false, reason: "no active loop session" });
+  });
+});
+
 describe("apply write-permission gate (design §2)", () => {
   it("a starter without write access hands off (loop-error) and nothing is pushed", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3], permission: "read" });
@@ -697,7 +719,7 @@ describe("round-2 hardening: provenance, queue-aware fix requests", () => {
 });
 
 describe("continueLoopOnPush (a push continues an active session)", () => {
-  const push = (over: Partial<{ headSha: string; actor: string }> = {}) => ({ owner: "o", repo: "r", pr: 7, headSha: HEAD, actor: "alice", ...over });
+  const push = (over: Partial<{ headSha: string; actor: string; pushedAt: string }> = {}) => ({ owner: "o", repo: "r", pr: 7, headSha: HEAD, actor: "alice", ...over });
 
   it("is off when the fix agent is disabled, and skips the App's own push", async () => {
     const f = fakeDeps({ rounds: [3] });
@@ -714,6 +736,23 @@ describe("continueLoopOnPush (a push continues an active session)", () => {
     const none = fakeDeps({ start: null, rounds: [3] });
     assert.deepEqual(await continueLoopOnPush("t", push(), settings(), none.deps, ENV_ON), { posted: false, reason: "no active loop session" });
     assert.equal(stale.posted.length + none.posted.length, 0);
+  });
+
+  it("a clean review of the OLD head that lands after the push is stale: the push still continues", async () => {
+    const pushed = "b".repeat(40);
+    // round 1 (c0) had findings; the clean review of the previous head (HEAD) lands AFTER the push
+    const stale = () => fakeDeps({ start: "apply", rounds: [4, 0], liveSha: pushed });
+    const f = stale();
+    const r = await continueLoopOnPush("t", push({ headSha: pushed, pushedAt: "2026-01-01T12:00:00Z" }), settings("apply"), f.deps, ENV_ON);
+    assert.deepEqual(r, { posted: true, reason: "continued" });
+    assert.equal(parseContinueMarker(f.posted[0], { authoredByBot: true })?.head, pushed);
+    // without the push time the stale clean review would look like a real convergence
+    const blind = stale();
+    assert.deepEqual(await continueLoopOnPush("t", push({ headSha: pushed }), settings("apply"), blind.deps, ENV_ON), { posted: false, reason: "no active loop session" });
+    // a push AFTER a real convergence starts nothing (a human must start a new loop)
+    const after = stale();
+    const late = await continueLoopOnPush("t", push({ headSha: pushed, pushedAt: "2026-01-03T00:00:00Z" }), settings("apply"), after.deps, ENV_ON);
+    assert.deepEqual(late, { posted: false, reason: "no active loop session" });
   });
 
   it("an active session gets the fixed continuation for the pushed head (session mode, next round)", async () => {

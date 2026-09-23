@@ -69,3 +69,61 @@ describe("deriveLoopSession (durable session fold)", () => {
     assert.equal(deriveLoopSession([ev("", "start", { mode: "apply" })]).active, false);
   });
 });
+
+describe("deriveLoopSession: a clean review ends the session only for the head the loop waits on", () => {
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  const t = (i: number) => `2026-01-0${i}T00:00:00Z`;
+  const start = ev(t(1), "start", { mode: "apply", actor: "alice" });
+  const ACTIVE = { active: true, startIso: t(1), mode: "apply", starter: "alice" };
+
+  it("a clean review of a head the loop already moved past (continue / push) is stale and ignored", () => {
+    for (const kind of ["continue", "push"] as const) {
+      const s = deriveLoopSession([start, ev(t(2), kind, { head: B }), ev(t(3), "converged", { head: A })], { liveHead: B });
+      assert.deepEqual(s, ACTIVE, kind);
+    }
+  });
+
+  it("a clean review of the LIVE head always ends the session", () => {
+    const s = deriveLoopSession([start, ev(t(2), "continue", { head: B }), ev(t(3), "converged", { head: A })], { liveHead: A });
+    assert.deepEqual(s, { active: false, endedBy: "converged", endedAt: t(3) });
+  });
+
+  it("a continuation posted AFTER a stale clean review resumes the session (anchor, mode, starter kept)", () => {
+    const s = deriveLoopSession([start, ev(t(2), "converged", { head: A }), ev(t(3), "continue", { head: B })], { liveHead: B });
+    assert.deepEqual(s, ACTIVE);
+    const dup = deriveLoopSession(
+      [start, ev(t(2), "converged", { head: A }), ev("2026-01-02T00:00:01Z", "converged", { head: A }), ev(t(3), "continue", { head: B })],
+      { liveHead: B },
+    );
+    assert.deepEqual(dup, ACTIVE, "a duplicate clean review of the old head does not block the resume");
+  });
+
+  it("never resumes: the converged head is live, a stop or handoff followed it, the same head, or a mere push", () => {
+    const ended = (events: LoopEvent[], liveHead?: string) => deriveLoopSession([start, ...events], { liveHead }).active;
+    assert.equal(ended([ev(t(2), "converged", { head: A }), ev(t(3), "continue", { head: B })], A), false, "the live head is clean");
+    assert.equal(ended([ev(t(2), "converged", { head: A }), ev(t(3), "stop", { actor: "bob" }), ev(t(4), "continue", { head: B })], B), false);
+    assert.equal(ended([ev(t(2), "converged", { head: A }), ev(t(3), "escalate"), ev(t(4), "continue", { head: B })], B), false);
+    assert.equal(ended([ev(t(2), "converged", { head: A }), ev(t(3), "continue", { head: A })], B), false, "same head");
+    assert.equal(ended([ev(t(2), "converged", { head: A }), ev(t(3), "push", { head: B })], B), false, "a push after a real convergence starts nothing");
+  });
+
+  it("an unknown reviewed commit keeps the verdict (fails toward ending the loop)", () => {
+    const s = deriveLoopSession([start, ev(t(2), "continue", { head: B }), ev(t(3), "converged")], { liveHead: B });
+    assert.equal(s.active, false);
+  });
+
+  it("same second: the head move orders before the clean review (marks it stale)", () => {
+    const s = deriveLoopSession([start, ev(t(2), "converged", { head: A }), ev(t(2), "continue", { head: B })], { liveHead: B });
+    assert.deepEqual(s, ACTIVE);
+  });
+
+  it("a head move with no active session is a no-op; a new start forgets the old session's head", () => {
+    assert.deepEqual(deriveLoopSession([ev(t(1), "continue", { head: B }), ev(t(2), "push", { head: B })]), { active: false });
+    const s = deriveLoopSession(
+      [start, ev(t(2), "continue", { head: B }), ev(t(3), "escalate"), ev(t(4), "start", { mode: "suggest", actor: "c" }), ev(t(5), "converged", { head: A })],
+      { liveHead: B },
+    );
+    assert.equal(s.active, false, "the new session waits on no head yet: its clean review ends it");
+  });
+});

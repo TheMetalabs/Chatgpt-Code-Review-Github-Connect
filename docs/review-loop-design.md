@@ -50,7 +50,12 @@ GitHub가 영속하는 이벤트(코멘트·리뷰·PR 본문)를 접어서 세�
 - **시작:** 마지막 종료 이벤트 이후 **첫 사람 start 지시어**(이슈 코멘트·인라인 코멘트·PR 본문, 작성 시각 기준).
   세션 안에서 start를 다시 걸어도 **앵커는 유지**되고 모드·시작자만 갱신된다 → 라운드 예산이 리셋되지 않는다.
 - **종료 이벤트:** 사람의 stop 지시어, 봇의 ESCALATE 마커, 봇의 STOPPED 마커, 봇의 clean 리뷰(`total=0`, CONVERGED).
-  같은 초의 동률은 종료가 먼저(핸드오프와 같은 초의 start는 새 세션).
+  같은 초의 동률은 head 이동 → 종료 → start 순(핸드오프와 같은 초의 start는 새 세션).
+- **stale clean 리뷰는 종료가 아니다:** clean 리뷰는 루프가 **기다리는 head** 에 대해서만 CONVERGED다. 루프가 봇의
+  연속 마커나 push(웹훅의 `updated_at`)로 이미 다른 head로 넘어간 뒤 도착한 옛 head의 clean 리뷰는, 그 head가 PR의
+  live head가 아니면 무시한다. clean 리뷰 **직후** 다른 head의 연속 마커가 달렸다면(드라이버가 그 리뷰 도착 전에
+  연속을 결정) 세션은 앵커·모드·시작자를 유지한 채 재개된다. live head의 clean 리뷰는 항상 종료이고, push는 끝난
+  세션을 재개하지 않는다(수렴 후의 사람 push는 새 루프를 열지 않는다).
 - **작성자 강제:** start/stop은 사람만, 마커·CONVERGED는 봇(App 로그인)만. 봇 산문·사람이 쓴 마커는 무시.
 - **활성 세션의 모든 리뷰가 루프 라운드**다(명시 start, 연속 마커, push 연속, 세션 중 요청한 일반 리뷰).
 - **push = 다음 라운드:** 활성 세션에서 사람이 push하면 드라이버가 연속 마커를 달아 새 head를 리뷰한다(봇 자신의 push는
@@ -89,12 +94,12 @@ FIXING은 수정 요청 직전에 단다(수정은 바쁜 provider 큐에서 오
 기다릴 수 있다. 스트리밍 신호로 "대기(keepalive)"와 "생성(첫 출력)"을 구분해:
 - 생성 deadline(`ASHLAR_FIX_TIMEOUT_MS`, 기본 60분)은 **첫 출력부터** 센다 — 대기 시간 제외(부하 중 거짓
   `fix-failed` 방지). 대기 상한은 별도(`ASHLAR_FIX_QUEUE_MAX_MS`, 기본 6시간), 신호 두절(liveness)도 중단.
-- 대기 중 2분마다 + 생성 시작 순간에 **여전히 필요한지** 확인(head 이동 등) — 아니면 abort(대기열 자리 반환·
-  생성 조기 차단), 결과는 조용한 superseded.
+- 대기 중 2분마다 + 생성 시작 순간에 **여전히 필요한지** 확인(head 이동·세션 종료) — 아니면 abort(대기열 자리
+  반환·생성 조기 차단), 결과는 조용한 superseded / stopped.
 - 수정 요청은 리뷰 경로와 같은 샘플링·예산(temperature 0.6 등)을 쓴다 — 없으면 추론 모델이 반복 루프로 상한까지
   생성하다 `length`로 끝난다.
-- 서버 로그 `[review-loop] <job> step|fix-request|fix-result|continued|handoff|superseded|converged` 로 각
-  단계를 추적한다.
+- 서버 로그 `[review-loop] <job> step|fix-request|fix-result|continued|handoff` 로 활성 세션의 각 단계를
+  추적한다(세션 밖 PR의 리뷰는 로그를 남기지 않는다).
 - 커밋은 전송 수준에서 1회 재시도하고(모델 재요청 없음), 응답이 유실된 ref 갱신은 "이미 목표 커밋"으로 인식한다.
 - apply는 head 저장소가 **이 저장소임이 확인될 때만** 쓴다(fork·삭제된 head 저장소 등 출처 불명은 거절).
 

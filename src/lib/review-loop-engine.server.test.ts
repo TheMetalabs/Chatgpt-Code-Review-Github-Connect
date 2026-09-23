@@ -9,6 +9,7 @@ import {
   reconstructRounds,
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
+import { continueComment } from "./review-loop.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 
@@ -375,6 +376,30 @@ describe("durable loop events: authorship is enforced when reading history", () 
       "start@2026-01-04T00:00:00Z:carol:suggest",
       "stop@2026-01-03T00:00:00Z:bob",
     ]);
+  });
+
+  it("the App's canonical continuation for THIS PR is a head move; a clean review carries its commit", async () => {
+    const live = "b".repeat(40);
+    const cont = (pr: number, head = live) => continueComment({ mode: "apply", round: 2, pr, head });
+    const g = gh(
+      [
+        { userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-01T00:00:00Z" },
+        { userLogin: bot, body: cont(1), createdAt: "2026-01-02T00:00:00Z" },
+        { userLogin: bot, body: cont(2, "c".repeat(40)), createdAt: "2026-01-02T00:00:01Z" }, // another PR: NOT a head move here
+        { userLogin: bot, body: `${cont(1, "d".repeat(40))}\n\nquoted in a report`, createdAt: "2026-01-02T00:00:02Z" }, // not canonical
+        { userLogin: "mallory", body: cont(1, "e".repeat(40)), createdAt: "2026-01-02T00:00:03Z" }, // human copy: NOT a head move
+      ],
+      [],
+      [{ userLogin: bot, body: "<!-- ashlar-findings total=0 -->", submittedAt: "2026-01-03T00:00:00Z" }],
+    );
+    const events = await readLoopEvents(g as never, "t", "o", "r", 1);
+    assert.deepEqual(
+      events.filter((e) => e.kind === "continue" || e.kind === "converged").map((e) => `${e.kind}:${e.head}`),
+      [`continue:${live}`, "converged:c"],
+    );
+    // the stale clean review (commit "c") does not end the session: the loop waits on the live head
+    assert.equal((await readLoopSession(g as never, "t", "o", "r", 1, { pr: { sha: live } })).active, true);
+    assert.equal((await readLoopSession(g as never, "t", "o", "r", 1, { pr: { sha: "c" } })).active, false, "clean on the live head");
   });
 
   it("readLoopSession folds history + injected events (a stop the list API has not caught up with)", async () => {

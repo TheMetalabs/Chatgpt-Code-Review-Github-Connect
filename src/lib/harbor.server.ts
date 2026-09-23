@@ -1342,7 +1342,7 @@ function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>,
   };
   if (parsed.trigger === "pull_request.synchronize") {
     run(`continue ${owner}/${repo}#${pr}`, (token) =>
-      continueLoopOnPush(token, { owner, repo, pr, headSha, actor: parsed.actor }, state.settings));
+      continueLoopOnPush(token, { owner, repo, pr, headSha, actor: parsed.actor, pushedAt: parsed.eventAt }, state.settings));
   } else if (parsed.thread?.loop?.kind === "stop") {
     for (const j of state.jobs) {
       if (j.owner === owner && j.repo === repo && j.pr === pr && isLive(j.status) && j.thread?.loop?.kind === "start") {

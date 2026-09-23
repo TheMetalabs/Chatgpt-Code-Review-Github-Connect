@@ -332,6 +332,19 @@ describe("parseGitHubPayload", () => {
       }
     });
 
+    it("a push (synchronize) carries the PR's updated_at as its event time; other PR actions do not", () => {
+      const pr = (action: string) => ({
+        action,
+        repository: { full_name: "acme/pay" },
+        sender: { login: "alice" },
+        pull_request: { number: 412, title: "t", body: "", head: { sha: SHA40, repo: { fork: false } }, base: { sha: "b" }, user: { login: "alice" }, updated_at: "2026-01-02T03:04:05Z" },
+      });
+      const push = parseGitHubPayload("pull_request", pr("synchronize"));
+      assert.ok(push.ok && push.kind === "review" && push.eventAt === "2026-01-02T03:04:05Z");
+      const opened = parseGitHubPayload("pull_request", pr("opened"));
+      assert.ok(opened.ok && opened.kind === "review" && opened.eventAt === undefined);
+    });
+
     it("a human comment carrying a continuation marker gets no loop start from the marker", () => {
       const body = continueComment({ mode: "apply", round: 2, pr: 412, head: SHA40 });
       const d = parseGitHubPayload("issue_comment", issueComment("mallory", body));

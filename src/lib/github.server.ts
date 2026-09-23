@@ -813,12 +813,12 @@ export async function fetchPullHeadRef(
   owner: string,
   repo: string,
   pr: number,
-): Promise<{ ref: string; fork: boolean }> {
-  const out = await gh<{ head?: { ref?: string; repo?: { fork?: boolean } | null } }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
-  if (!out.ok || !out.data.head?.ref) {
-    throw new Error(out.ok ? "pull request has no head ref" : `could not load pull request (${out.status}): ${out.text}`);
+): Promise<{ ref: string; sha: string; fork: boolean }> {
+  const out = await gh<{ head?: { ref?: string; sha?: string; repo?: { fork?: boolean } | null } }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
+  if (!out.ok || !out.data.head?.ref || !out.data.head.sha) {
+    throw new Error(out.ok ? "pull request has no head ref/sha" : `could not load pull request (${out.status}): ${out.text}`);
   }
-  return { ref: out.data.head.ref, fork: Boolean(out.data.head.repo?.fork) };
+  return { ref: out.data.head.ref, sha: out.data.head.sha, fork: Boolean(out.data.head.repo?.fork) };
 }
 
 export async function createIssueComment(

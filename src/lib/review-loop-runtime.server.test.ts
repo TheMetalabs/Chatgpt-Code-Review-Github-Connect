@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
 import {
   builtinValidate,
+  effectiveFixMode,
   loopEnabled,
   loopSinceIso,
   renderFindings,
@@ -30,7 +31,7 @@ const finding = (file: string, title = "null deref"): Finding => ({
   recommendedTest: "add a test",
 });
 
-function job(over: Partial<Job> = {}): Job {
+function job(over: Partial<Job> = {}, loopMode: "suggest" | "apply" = "suggest"): Job {
   return {
     deliveryId: "d",
     trigger: "issue_comment.mention",
@@ -44,7 +45,7 @@ function job(over: Partial<Job> = {}): Job {
     isFork: false,
     isDraft: false,
     origin: "github",
-    thread: { kind: "mention", commentId: 1, userText: "/review-loop", loop: { kind: "start", mode: "suggest" } },
+    thread: { kind: "mention", commentId: 1, userText: "/review-loop", loop: { kind: "start", mode: loopMode } },
     id: "job-1",
     status: "posted",
     createdAt: 1_700_000_000_000,
@@ -60,16 +61,23 @@ function job(over: Partial<Job> = {}): Job {
   } as Job;
 }
 
-const sample = { files: [{ path: "src/a.ts", content: "export const a = 1;\n", language: "ts" }] } as unknown as SamplePr;
+const sample = {
+  changedPaths: ["src/a.ts"],
+  files: [
+    { path: "src/a.ts", content: "export const a = 1;\n", language: "ts" },
+    { path: "docs/POLICY.md", content: "read-only review context", language: "md" }, // policy context, NOT editable
+  ],
+} as unknown as SamplePr;
 
 function settings(mode: "suggest" | "apply" = "suggest"): BotSettings {
   return { ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } };
 }
 
 /** Fake deps: configurable review history (for the escalate engine) + fix reply + push spy. */
-function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean } = {}) {
+function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean; liveSha?: string; movedDuringFix?: boolean } = {}) {
   const posted: string[] = [];
   let committed = false;
+  let headReads = 0;
   const rounds = opts.rounds ?? [];
   const deps: LoopRuntimeDeps = {
     gh: {
@@ -98,7 +106,10 @@ function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolea
         return { id: posted.length };
       },
       async fetchPullHeadRef() {
-        return { ref: "feature", fork: false };
+        headReads += 1;
+        // movedDuringFix: the first read (pre-fix) matches, the re-check before commit does not
+        const sha = opts.movedDuringFix && headReads > 1 ? "m".repeat(40) : (opts.liveSha ?? HEAD);
+        return { ref: "feature", sha, fork: false };
       },
       gitDataApi() {
         return {
@@ -180,7 +191,8 @@ describe("runPostReviewLoop steps", () => {
 
   it("apply mode commits through the validate gate and reports the sha", async () => {
     const f = fakeDeps({ rounds: [3] });
-    const r = await runPostReviewLoop("t", job(), sample, settings("apply"), [job()], f.deps, ENV_ON);
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
     assert.equal(r.ran, true);
     if (r.ran && r.step === "fix") {
       assert.equal(r.outcome, "applied");
@@ -192,8 +204,57 @@ describe("runPostReviewLoop steps", () => {
 
   it("apply mode with a failing validator does not push and reports validation-failed", async () => {
     const f = fakeDeps({ rounds: [3], validateOk: false });
-    const r = await runPostReviewLoop("t", job(), sample, settings("apply"), [job()], f.deps, ENV_ON);
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
     if (r.ran && r.step === "fix") assert.equal(r.outcome, "validation-failed");
+    assert.equal(f.committed, false);
+  });
+
+  it("K1: does not fix when the live head no longer matches the reviewed SHA", async () => {
+    const f = fakeDeps({ rounds: [3], liveSha: "a".repeat(40) });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.equal(r.ran, false);
+    if (!r.ran) assert.match(r.reason, /head moved/);
+    assert.equal(f.committed, false);
+    assert.equal(f.posted.length, 0);
+  });
+
+  it("K1: a head move DURING the fix is caught by the pre-commit re-check (no push)", async () => {
+    const f = fakeDeps({ rounds: [3], movedDuringFix: true });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    if (r.ran && r.step === "fix") {
+      assert.equal(r.outcome, "validation-failed");
+      assert.match(r.error ?? "", /head moved during fix/);
+    }
+    assert.equal(f.committed, false);
+  });
+
+  it("K2: the global setting is a ceiling — push only when BOTH command and setting say apply", async () => {
+    // command suggest + global apply → no push
+    let f = fakeDeps({ rounds: [3] });
+    let j = job({}, "suggest");
+    let r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    if (r.ran && r.step === "fix") assert.equal(r.outcome, "suggested");
+    assert.equal(f.committed, false);
+    // command apply + global suggest → no push
+    f = fakeDeps({ rounds: [3] });
+    j = job({}, "apply");
+    r = await runPostReviewLoop("t", j, sample, settings("suggest"), [j], f.deps, ENV_ON);
+    if (r.ran && r.step === "fix") assert.equal(r.outcome, "suggested");
+    assert.equal(f.committed, false);
+    assert.ok(f.posted[0].includes("mode: suggest"), "report uses the effective mode");
+  });
+
+  it("K3: a policy/context file in the snapshot is NOT editable (scope-violation, no push)", async () => {
+    const f = fakeDeps({
+      rounds: [3],
+      reply: '{"summary":"edit policy","files":[{"path":"docs/POLICY.md","content":"tampered"}]}',
+    });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    if (r.ran && r.step === "fix") assert.equal(r.outcome, "scope-violation");
     assert.equal(f.committed, false);
   });
 
@@ -209,12 +270,20 @@ describe("runPostReviewLoop steps", () => {
 });
 
 describe("helpers", () => {
-  it("loopSinceIso is the earliest loop-triggered job for the PR", () => {
-    const a = job({ createdAt: 2000 });
-    const b = job({ createdAt: 1000 });
+  it("loopSinceIso is the CURRENT session start (latest start at/before this job), not the earliest ever (K4)", () => {
+    const old = job({ createdAt: 1000 }); // a finished earlier session
+    const cur = job({ createdAt: 2000 }); // this session's explicit start
+    const future = job({ createdAt: 3000 }); // a later start must not count for cur
     const other = job({ pr: 99, createdAt: 1 });
-    assert.equal(loopSinceIso(a, [a, b, other]), new Date(1000).toISOString());
+    assert.equal(loopSinceIso(cur, [old, cur, future, other]), new Date(2000).toISOString());
     assert.equal(loopSinceIso(job({ thread: { kind: "mention", commentId: 1, userText: "x" } }), []), undefined);
+  });
+
+  it("effectiveFixMode: apply only when command AND setting allow it", () => {
+    assert.equal(effectiveFixMode(job({}, "apply"), settings("apply")), "apply");
+    assert.equal(effectiveFixMode(job({}, "apply"), settings("suggest")), "suggest");
+    assert.equal(effectiveFixMode(job({}, "suggest"), settings("apply")), "suggest");
+    assert.equal(effectiveFixMode(job({ thread: { kind: "mention", commentId: 1, userText: "x" } }), settings("apply")), "suggest");
   });
 
   it("renderFindings is deterministic and carries file:line, scenario, root cause, fix", () => {

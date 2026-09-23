@@ -19,7 +19,7 @@ import { maybeEscalate, type ReviewLoopGithub } from "./review-loop-engine.serve
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface LoopRuntimeGithub extends ReviewLoopGithub {
-  fetchPullHeadRef(token: string, owner: string, repo: string, pr: number): Promise<{ ref: string; fork: boolean }>;
+  fetchPullHeadRef(token: string, owner: string, repo: string, pr: number): Promise<{ ref: string; sha: string; fork: boolean }>;
   gitDataApi(token: string, owner: string, repo: string): GitDataApi;
 }
 
@@ -51,15 +51,27 @@ function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ROUND_CAP;
 }
 
-/** Loop session start = the earliest loop-triggered job for this PR (in-memory; bounds the
- * escalate engine's round history to this loop, per review-loop-engine's sinceIso). */
+/** Loop session start = the CURRENT explicit /review-loop start for this PR: the most recent
+ * start job at/before this job (in-memory). An older, finished session's start must not widen
+ * the window, or its rounds would make a fresh session look stuck on its first review. */
 export function loopSinceIso(job: Job, allJobs: readonly Job[]): string | undefined {
   const starts = allJobs
-    .filter((j) => j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && j.thread?.loop?.kind === "start")
-    .map((j) => j.createdAt)
-    .filter((t) => Number.isFinite(t));
+    .filter(
+      (j) =>
+        j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && j.thread?.loop?.kind === "start" &&
+        Number.isFinite(j.createdAt) && j.createdAt <= job.createdAt,
+    )
+    .map((j) => j.createdAt);
   if (starts.length === 0) return undefined;
-  return new Date(Math.min(...starts)).toISOString();
+  return new Date(Math.max(...starts)).toISOString();
+}
+
+/** Effective mode: the /review-loop command's mode, with the operator's global setting as a
+ * permission CEILING — auto-push happens only when the command says `apply` AND the setting
+ * allows `apply`. `suggest` anywhere means no push. */
+export function effectiveFixMode(job: Job, settings: BotSettings): "suggest" | "apply" {
+  const commanded = job.thread?.loop?.kind === "start" ? job.thread.loop.mode : "suggest";
+  return commanded === "apply" && settings.fixAgent.mode === "apply" ? "apply" : "suggest";
 }
 
 /** Deterministic, model-free rendering of the posted findings for the fix prompt. */
@@ -171,24 +183,39 @@ export async function runPostReviewLoop(
     // 2) Otherwise run ONE fix round on the head-pinned snapshot.
     const head = await d.gh.fetchPullHeadRef(token, owner, repo, pr);
     if (head.fork) return { ran: false, reason: "fork PR (cannot push)" };
-    const files = (sample.files ?? []).map((f) => ({ path: f.path, content: f.content }));
+    // The live branch must still point at the reviewed SHA: a commit parented on a stale SHA
+    // would fast-forward over a contributor's backward force-push. Fail closed.
+    if (head.sha !== headSha) return { ran: false, reason: `head moved (${headSha.slice(0, 7)} → ${head.sha.slice(0, 7)})` };
+    // Editable set = the PR's CHANGED files only. sample.files also carries policy/reference
+    // context fetched for the review; those stay read-only and never enter allowedPaths.
+    const changed = new Set(sample.changedPaths ?? []);
+    const files = (sample.files ?? []).filter((f) => changed.has(f.path)).map((f) => ({ path: f.path, content: f.content }));
+    if (files.length === 0) return { ran: false, reason: "no editable changed files in snapshot" };
+    const mode = effectiveFixMode(job, settings);
     const prompt = buildFixPrompt({
       findings: renderFindings(findings),
       files,
       reviewer: settings.fixAgent.provider ?? undefined,
     });
+    // Re-verify the live head immediately before the commit path (the fix request can be slow).
+    const validate: FixValidate = async (candidate) => {
+      const v = await d.validate(candidate);
+      if (!v.ok) return v;
+      const live = await d.gh.fetchPullHeadRef(token, owner, repo, pr);
+      return live.sha === headSha ? { ok: true } : { ok: false, error: `head moved during fix (${headSha.slice(0, 7)} → ${live.sha.slice(0, 7)})` };
+    };
     const res = await runFixRound(
-      { requestFix: d.requestFix, api: d.gh.gitDataApi(token, owner, repo), validate: d.validate },
+      { requestFix: d.requestFix, api: d.gh.gitDataApi(token, owner, repo), validate },
       {
         prompt,
-        mode: settings.fixAgent.mode,
+        mode,
         branch: head.ref,
         baseCommitSha: headSha,
         message: `fix: apply ashlar review (PR #${pr}, ${headSha.slice(0, 7)})`,
         allowedPaths: files.map((f) => f.path),
       },
     );
-    await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, settings.fixAgent.mode) });
+    await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode) });
     return { ran: true, step: "fix", outcome: res.outcome, commitSha: res.commitSha, error: res.error };
   } catch (e) {
     return { ran: false, reason: `loop step failed: ${(e as Error)?.message ?? String(e)}` };

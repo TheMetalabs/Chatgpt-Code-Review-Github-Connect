@@ -1,6 +1,6 @@
 import type { IngressTarget } from "./ingress.ts";
 import { DEFAULT_SETTINGS, type BotSettings, type JobThread, type Trigger } from "./types.ts";
-import { DEFAULT_ASHLAR_BOT_LOGIN, freshLoopDirective, isSelfLogin, parseContinueMarker, stripLoopDirectives } from "./review-loop.ts";
+import { canonicalContinuation, DEFAULT_ASHLAR_BOT_LOGIN, freshLoopDirective, isSelfLogin, stripLoopDirectives } from "./review-loop.ts";
 import { isBotMention } from "./poster.ts";
 
 const PR_ACTIONS: Record<string, Trigger> = {
@@ -125,10 +125,11 @@ export function parseGitHubPayload(
     }
     if (!body.issue?.pull_request) return { ok: true, kind: "ignore", reason: "not a pull request comment" };
     if (!repo || !body.issue.number) return { ok: false, reason: "issue_comment missing repo or number" };
-    // The continuation is honored only as a NEW comment carrying the exact marker for THIS PR;
-    // any other self-authored comment (or an edit of one) is ignored outright.
+    // The continuation is honored only as a NEW comment that IS the driver's canonical
+    // continuation for THIS PR (exact text, marker first); any other self-authored comment — a
+    // report quoting a marker in model text included — or an edit of one is ignored outright.
     const continuation = selfAuthored && body.action === "created"
-      ? parseContinueMarker(body.comment?.body, { authoredByBot: true })
+      ? canonicalContinuation(body.comment?.body, { authoredByBot: true })
       : null;
     if (selfAuthored && (!continuation || continuation.pr !== body.issue.number)) {
       return { ok: true, kind: "ignore", reason: "bot-authored comment (never a trigger)" };

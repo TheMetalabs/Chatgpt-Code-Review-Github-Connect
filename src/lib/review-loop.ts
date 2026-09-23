@@ -104,9 +104,10 @@ export interface EscalateState {
   ledger?: { declines?: number; defers?: number; pushbacks?: number };
 }
 
-/** Escape HTML-comment delimiters so interpolated untrusted state (file paths, CI text)
- * cannot forge a terminal marker inside the bot-authored escalate comment (design §3). */
-function neutralizeMarkers(s: string): string {
+/** Escape HTML-comment delimiters so interpolated untrusted text (model output, file paths, CI
+ * text, error messages) cannot forge a control marker inside ANY bot-authored comment (design
+ * §3). Every emitter that embeds untrusted text in a bot comment must pass it through this. */
+export function neutralizeMarkers(s: string): string {
   return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
 }
 
@@ -215,8 +216,10 @@ export function continueComment(c: LoopContinuation): string {
   return `${continueMarker(c)}\n\n${REVIEW_LOOP_CONTINUE_HUMAN} (round ${c.round} on \`${c.head.slice(0, 7)}\`).`;
 }
 
+// Anchored: the marker must OPEN the comment (where the driver emits it) — a marker quoted
+// later in a bot comment, e.g. model text inside a fix report, is prose, never a signal.
 const CONTINUE_MARKER_RE =
-  /<!--\s*ashlar-loop-continue\s+mode=(apply|suggest)\s+round=(\d{1,4})\s+pr=(\d{1,9})\s+head=([0-9a-f]{40})\s*-->/;
+  /^\s*<!--\s*ashlar-loop-continue\s+mode=(apply|suggest)\s+round=(\d{1,4})\s+pr=(\d{1,9})\s+head=([0-9a-f]{40})\s*-->/;
 
 /** Parse the continuation marker from a comment the caller has proven the App authored.
  * Returns null for any other author, or a missing / malformed marker. */
@@ -228,6 +231,24 @@ export function parseContinueMarker(body: string | null | undefined, source: Com
   const pr = Number(m[3]);
   if (round < 1 || pr < 1) return null;
   return { mode: m[1] as ReviewLoopMode, round, pr, head: m[4] };
+}
+
+/**
+ * The ONLY bot-authored comment that may act as a trigger: byte-for-byte the driver's canonical
+ * continuation (continueComment of its own parsed fields; trailing whitespace tolerated). Any
+ * other text around or after the marker — a fix report quoting model output, say — disqualifies
+ * it, so an embedded marker can never promote a report into a loop start.
+ */
+export function canonicalContinuation(body: string | null | undefined, source: CommentSource): LoopContinuation | null {
+  const parsed = parseContinueMarker(body, source);
+  if (!parsed) return null;
+  let canonical: string;
+  try {
+    canonical = continueComment(parsed);
+  } catch {
+    return null;
+  }
+  return String(body ?? "").replace(/\s+$/, "") === canonical ? parsed : null;
 }
 
 // ── Substring detectors (the driver / poller mirror these) ───────────────────

@@ -25,7 +25,9 @@ import {
   continueComment,
   continueMarker,
   parseContinueMarker,
+  canonicalContinuation,
   REVIEW_LOOP_CONTINUE_HUMAN,
+  neutralizeMarkers,
   type RoundSummary,
   type EscalateReason,
 } from "./review-loop.ts";
@@ -380,5 +382,28 @@ describe("self identity + loop continuation (the bot never commands itself)", ()
     assert.throws(() => continueComment({ mode: "apply", round: 2, pr: 7, head: "newsha" }), /invalid loop continuation/);
     assert.throws(() => continueComment({ mode: "apply", round: 0, pr: 7, head: SHA }), /invalid loop continuation/);
     assert.throws(() => continueComment({ mode: "apply", round: 2, pr: 0, head: SHA }), /invalid loop continuation/);
+  });
+});
+
+describe("canonicalContinuation (the only bot comment that may trigger)", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  const c = { mode: "apply" as const, round: 2, pr: 7, head: SHA };
+  const exact = continueComment(c);
+
+  it("accepts exactly the driver's continuation (trailing whitespace tolerated)", () => {
+    assert.deepEqual(canonicalContinuation(exact, { authoredByBot: true }), c);
+    assert.deepEqual(canonicalContinuation(`${exact}\n`, { authoredByBot: true }), c);
+    assert.equal(canonicalContinuation(exact, { authoredByBot: false }), null);
+  });
+
+  it("rejects a valid marker embedded in any other text (e.g. a fix report quoting model output)", () => {
+    const report = `### Ashlar fix agent — applied\n\nsummary: ${exact}`;
+    assert.equal(canonicalContinuation(report, { authoredByBot: true }), null, "marker after text");
+    assert.equal(canonicalContinuation(`${exact}\n\nand more text`, { authoredByBot: true }), null, "text after the canonical body");
+    assert.equal(parseContinueMarker(report, { authoredByBot: true }), null, "the parser itself is anchored");
+  });
+
+  it("neutralizeMarkers defangs every comment delimiter", () => {
+    assert.equal(neutralizeMarkers("a <!-- x --> b"), "a &lt;!-- x --&gt; b");
   });
 });

@@ -19,7 +19,7 @@ import { buildFixPrompt, runFixRound, type FixValidate, type RequestFix } from "
 import type { GitDataApi } from "./fix-commit.ts";
 import type { FixFile } from "./fix-apply.ts";
 import { maybeEscalate, type ReviewLoopGithub } from "./review-loop-engine.server.ts";
-import { continueComment, resolveBotLogin } from "./review-loop.ts";
+import { continueComment, neutralizeMarkers, resolveBotLogin } from "./review-loop.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface LoopRuntimeGithub extends ReviewLoopGithub {
@@ -155,17 +155,31 @@ export const builtinValidate: FixValidate = async (files: FixFile[]) => {
   return { ok: true };
 };
 
+/**
+ * Untrusted text (the fix agent's summary, paths it returned, error messages) embedded in a
+ * BOT-authored comment. Bot comments are trusted by the loop's own detectors, so model text must
+ * never be able to forge a control marker there: markers are neutralized, @-mentions are defanged
+ * (a report must never ping a user) and length is bounded.
+ */
+export function sanitizeModelText(text: string | undefined, opts: { oneLine?: boolean; max?: number } = {}): string {
+  let t = neutralizeMarkers(String(text ?? "")).replace(/@(?=[A-Za-z0-9])/g, "@\u200b");
+  if (opts.oneLine) t = t.replace(/\s+/g, " ").trim();
+  const max = opts.max ?? 4000;
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
 function renderFixReport(res: Awaited<ReturnType<typeof runFixRound>>, mode: string, continued = false): string {
-  const files = (res.files ?? []).map((f) => `- \`${f.path}\``).join("\n");
+  const files = (res.files ?? []).map((f) => `- \`${sanitizeModelText(f.path, { oneLine: true, max: 300 })}\``).join("\n");
+  const summary = sanitizeModelText(res.summary);
   switch (res.outcome) {
     case "applied":
-      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha}\` (mode: ${mode}).\n\n${res.summary ?? ""}\n\nChanged:\n${files}\n\n${continued ? "Loop continues: next review requested on the new head." : "Loop paused: round cap reached — review the trend before continuing."}`;
+      return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha}\` (mode: ${mode}).\n\n${summary}\n\nChanged:\n${files}\n\n${continued ? "Loop continues: next review requested on the new head." : "Loop paused: round cap reached — review the trend before continuing."}`;
     case "suggested":
-      return `### Ashlar fix agent — suggestion (mode: ${mode})\n\n${res.summary ?? ""}\n\nProposed changes (not pushed):\n${files}\n\nApply via \`/review-loop apply\` to auto-commit.`;
+      return `### Ashlar fix agent — suggestion (mode: ${mode})\n\n${summary}\n\nProposed changes (not pushed):\n${files}\n\nApply via \`/review-loop apply\` to auto-commit.`;
     case "no-change":
-      return `### Ashlar fix agent — no change\n\n${res.summary ?? "All findings were pushed back / declined / deferred."}`;
+      return `### Ashlar fix agent — no change\n\n${summary || "All findings were pushed back / declined / deferred."}`;
     default:
-      return `### Ashlar fix agent — ${res.outcome}\n\n${res.error ?? ""}`;
+      return `### Ashlar fix agent — ${res.outcome}\n\n${sanitizeModelText(res.error, { oneLine: true, max: 500 })}`;
   }
 }
 
@@ -224,7 +238,7 @@ export async function runPostReviewLoop(
     const d = deps ?? (await productionDeps(settings));
     const { owner, repo, pr, headSha } = job;
     const halt = async (reason: string): Promise<LoopStepResult> => {
-      await d.gh.createIssueComment(token, { owner, repo, pr, body: `### Ashlar review-loop — halted before fix\n\n${reason}` }).catch(() => {});
+      await d.gh.createIssueComment(token, { owner, repo, pr, body: `### Ashlar review-loop — halted before fix\n\n${sanitizeModelText(reason, { oneLine: true, max: 500 })}` }).catch(() => {});
       return { ran: false, reason };
     };
     if (job.isFork) return halt("fork PR: the installation token cannot push to a fork");
@@ -301,7 +315,7 @@ export async function runPostReviewLoop(
     if (deps || job.thread?.loop?.kind === "start") {
       try {
         const d = deps ?? (await productionDeps(settings));
-        await d.gh.createIssueComment(token, { owner: job.owner, repo: job.repo, pr: job.pr, body: `### Ashlar review-loop — halted before fix\n\n${reason}` });
+        await d.gh.createIssueComment(token, { owner: job.owner, repo: job.repo, pr: job.pr, body: `### Ashlar review-loop — halted before fix\n\n${sanitizeModelText(reason, { oneLine: true, max: 500 })}` });
       } catch {
         /* reporting is best-effort */
       }

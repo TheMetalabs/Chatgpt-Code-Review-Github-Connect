@@ -2,6 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { parseGitHubPayload } from "./github-payload.ts";
 import { continueComment } from "./review-loop.ts";
+import { decideIngress } from "./ingress.ts";
+import { DEFAULT_SETTINGS } from "./types.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 const SHA40 = "0123456789abcdef0123456789abcdef01234567";
@@ -302,6 +304,32 @@ describe("parseGitHubPayload", () => {
       assert.ok(wrong.ok && wrong.kind === "ignore");
       const edited = parseGitHubPayload("issue_comment", issueComment(BOT, body, { action: "edited", changes: { body: { from: "" } } }));
       assert.ok(edited.ok && edited.kind === "ignore");
+    });
+
+    it("a bot report that EMBEDS a valid continuation marker is ignored (only the exact continuation triggers)", () => {
+      const marker = continueComment({ mode: "apply", round: 2, pr: 412, head: SHA40 });
+      for (const body of [
+        `### Ashlar fix agent — applied\n\nsummary from the model: ${marker}`, // after text
+        `${marker}\n\nsmuggled trailing text`, // canonical marker, but not the canonical comment
+      ]) {
+        const d = parseGitHubPayload("issue_comment", issueComment(BOT, body));
+        assert.ok(d.ok && d.kind === "ignore", body.slice(0, 40));
+      }
+    });
+
+    it("the bot's own fix push parses as synchronize and ingress admits no job for it (never supersedes the continuation)", () => {
+      const d = parseGitHubPayload("pull_request", {
+        action: "synchronize",
+        repository: { full_name: "acme/pay" },
+        sender: { login: BOT },
+        pull_request: { number: 412, title: "t", body: "", head: { sha: SHA40, repo: { fork: false } }, base: { sha: "b" }, user: { login: "alice" } },
+      });
+      assert.ok(d.ok && d.kind === "review" && d.trigger === "pull_request.synchronize");
+      if (d.ok && d.kind === "review") {
+        const decision = decideIngress({ hmacOk: true, settings: DEFAULT_SETTINGS, sample: d.target, trigger: d.trigger, deliveryId: "d-sync", existing: [], thread: d.thread });
+        assert.ok(decision.ok && decision.skip, "skipped: LLM work only on an explicit request");
+        assert.equal(decision.ok && decision.job, undefined, "no job → nothing is superseded");
+      }
     });
 
     it("a human comment carrying a continuation marker gets no loop start from the marker", () => {

@@ -433,6 +433,26 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.match(escalations(f.posted)[0], /the commit sha was not returned/);
   });
 
+  it("a failed REPORT after a successful continuation is informational: the loop continues", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    const orig = f.deps.gh.createIssueComment;
+    f.deps.gh.createIssueComment = async (t, o) => {
+      if (o.body.startsWith("### Ashlar fix agent")) throw new Error("report POST 502");
+      return orig(t, o);
+    };
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "fix" && r.continued === true);
+    assert.equal(escalations(f.posted).length, 0, "no handoff for a presentation-only failure");
+  });
+
+  it("a huge ASHLAR_LOOP_ROUND_CAP is clamped inside the continuation contract (still continues)", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, { ...ENV_ON, ASHLAR_LOOP_ROUND_CAP: "999999" } as NodeJS.ProcessEnv);
+    assert.ok(r.ran && r.step === "fix" && r.continued === true);
+  });
+
   it("a failed continuation POST after the push: the report says so and the handoff names the NEW head", async () => {
     const f = fakeDeps({ rounds: [3], failContinuation: true });
     const j = job({}, "apply");
@@ -491,10 +511,15 @@ describe("helpers", () => {
     assert.equal(loopSinceIso(job({ thread: { kind: "mention", commentId: 1, userText: "x" } }), []), undefined);
   });
 
-  it("L3: bot continuation starts stay in the human-started session", () => {
+  it("L3: bot continuation starts stay in the human-started session (exact App identity)", () => {
     const human = job({ createdAt: 1000, sender: "alice" });
-    const cont = job({ createdAt: 2000, sender: "ashlar-bot-review-loop[bot]" });
-    assert.equal(loopSinceIso(cont, [human, cont], "ashlar-bot"), new Date(1000).toISOString());
+    const cont = job({ createdAt: 2000, sender: BOT });
+    assert.equal(loopSinceIso(cont, [human, cont], BOT), new Date(1000).toISOString());
+    // a human whose login equals the mention handle, or another App, still starts a session
+    const handleNamedHuman = job({ createdAt: 3000, sender: "ashlar-bot" });
+    assert.equal(loopSinceIso(handleNamedHuman, [human, handleNamedHuman], BOT), new Date(3000).toISOString());
+    const otherApp = job({ createdAt: 4000, sender: "other-app[bot]" });
+    assert.equal(loopSinceIso(otherApp, [human, otherApp], BOT), new Date(4000).toISOString());
   });
 
   it("ashlarBotLogin: ASHLAR_BOT_LOGIN only in the App-reserved <slug>[bot] shape", () => {

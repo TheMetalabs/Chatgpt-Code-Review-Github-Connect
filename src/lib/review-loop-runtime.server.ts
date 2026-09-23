@@ -39,6 +39,8 @@ import {
 } from "./review-loop-engine.server.ts";
 import {
   continueComment,
+  isSelfLogin,
+  MAX_CONTINUE_ROUND,
   neutralizeMarkers,
   resolveBotLogin,
   type EscalateReason,
@@ -95,11 +97,6 @@ export const SILENT_REASONS: readonly string[] = [
   STEP_IN_FLIGHT,
 ];
 
-/** A GitHub App login ends in "[bot]"; the bot's own continuation comments carry it. */
-function isBotSender(sender: string | undefined, botUsername?: string): boolean {
-  if (!sender) return false;
-  return /\[bot\]$/i.test(sender) || (!!botUsername && sender === botUsername);
-}
 
 /** Fix-round budget (design: at most 5 review→fix rounds, then a human decides). */
 const DEFAULT_ROUND_CAP = 5;
@@ -126,9 +123,11 @@ export function ashlarBotLogin(env: NodeJS.ProcessEnv | undefined = envOf()): st
   return resolveBotLogin(env?.ASHLAR_BOT_LOGIN);
 }
 
+/** ASHLAR_LOOP_ROUND_CAP, bounded inside the continuation marker's contract: review N+1 is
+ * requested after the N-th fix, so the largest requested round is cap + 1 ≤ MAX_CONTINUE_ROUND. */
 function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   const n = Number(env?.ASHLAR_LOOP_ROUND_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ROUND_CAP;
+  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), MAX_CONTINUE_ROUND - 1) : DEFAULT_ROUND_CAP;
 }
 
 function fixAttempts(env: NodeJS.ProcessEnv | undefined = envOf()): number {
@@ -149,15 +148,16 @@ function diffLinesOf(head: PullHead): number | undefined {
 }
 
 /** Loop session start = the CURRENT explicit /review-loop start for this PR: the most recent
- * HUMAN-initiated start job at/before this job (in-memory). The bot's own continuation
- * triggers (posted after an applied round) belong to the same session and never reset the
- * window; an older, finished session's start must not widen it either. */
-export function loopSinceIso(job: Job, allJobs: readonly Job[], botUsername?: string): string | undefined {
+ * start job at/before this job (in-memory) that the App itself did NOT post. The App's own
+ * continuation triggers belong to the same session and never reset the window; an older,
+ * finished session's start must not widen it either. Identity is the EXACT resolved App login
+ * (the same one the webhook parser and round attribution use). */
+export function loopSinceIso(job: Job, allJobs: readonly Job[], botLogin: string = ashlarBotLogin()): string | undefined {
   const starts = allJobs
     .filter(
       (j) =>
         j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && j.thread?.loop?.kind === "start" &&
-        !isBotSender(j.sender, botUsername) &&
+        !isSelfLogin(j.sender, botLogin) &&
         Number.isFinite(j.createdAt) && j.createdAt <= job.createdAt,
     )
     .map((j) => j.createdAt);
@@ -365,7 +365,7 @@ export async function runPostReviewLoop(
       diffLines,
       botLogin,
       requireCurrentRound: true,
-      sinceIso: loopSinceIso(job, allJobs, settings.username),
+      sinceIso: loopSinceIso(job, allJobs, botLogin),
     };
     let esc = await maybeEscalate(gh, token, escOpts);
     if (esc.error === CURRENT_ROUND_MISSING) {

@@ -64,7 +64,9 @@ export function ashlarBotLogin(env: NodeJS.ProcessEnv | undefined = envOf()): st
  * inside the continuation marker's contract (MAX_CONTINUE_ROUND). */
 function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   const n = Number(env?.ASHLAR_LOOP_ROUND_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), MAX_CONTINUE_ROUND - 1) : DEFAULT_ROUND_CAP;
+  // Continuation is emitted while rounds < cap, so the largest requested round equals the cap —
+  // which the marker contract accepts up to MAX_CONTINUE_ROUND inclusive.
+  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), MAX_CONTINUE_ROUND) : DEFAULT_ROUND_CAP;
 }
 
 /** Loop session start = the CURRENT explicit /review-loop start for this PR: the most recent
@@ -316,8 +318,18 @@ export async function runPostReviewLoop(
         continueError = (e as Error)?.message ?? String(e);
       }
     }
-    await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, continued, continueError) });
-    if (continueError) return halt(`the fix was committed (${res.commitSha ?? "unknown sha"}) but the next review could not be requested: ${continueError}`);
+    try {
+      await d.gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, continued, continueError) });
+    } catch (e) {
+      // Once the continuation exists the report is informational: the next round already runs, so
+      // a failed report must never be turned into a halt. Otherwise it is the only signal.
+      if (!continued) throw e;
+    }
+    // The fix is committed and the report already states that the next review could not be
+    // requested — no second, contradictory "halted before fix" comment; the reason is logged.
+    if (continueError) {
+      return { ran: false, reason: `the fix was committed (${res.commitSha ?? "unknown sha"}) but the next review could not be requested: ${continueError}` };
+    }
     return { ran: true, step: "fix", outcome: res.outcome, commitSha: res.commitSha, error: res.error, continued };
   } catch (e) {
     const reason = `loop step failed: ${(e as Error)?.message ?? String(e)}`;

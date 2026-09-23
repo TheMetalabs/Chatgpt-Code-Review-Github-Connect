@@ -77,7 +77,7 @@ function settings(mode: "suggest" | "apply" = "suggest"): BotSettings {
 }
 
 /** Fake deps: configurable review history (for the escalate engine) + fix reply + push spy. */
-function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean; liveSha?: string; movedDuringFix?: boolean; refMovedAtWrite?: boolean; commitSha?: string; failContinuation?: boolean } = {}) {
+function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolean; liveSha?: string; movedDuringFix?: boolean; refMovedAtWrite?: boolean; commitSha?: string; failContinuation?: boolean; failReport?: boolean } = {}) {
   const posted: string[] = [];
   let committed = false;
   let headReads = 0;
@@ -106,6 +106,7 @@ function fakeDeps(opts: { rounds?: number[]; reply?: string; validateOk?: boolea
       },
       async createIssueComment(_t, o) {
         if (opts.failContinuation && o.body.includes("ashlar-loop-continue")) throw new Error("comment POST 502");
+        if (opts.failReport && o.body.startsWith("### Ashlar fix agent")) throw new Error("report POST 502");
         posted.push(o.body);
         return { id: posted.length };
       },
@@ -305,16 +306,34 @@ describe("runPostReviewLoop steps", () => {
     assert.ok(!f.posted.some((b) => /@ashlar/i.test(b)), "no bot @-mention posted");
   });
 
-  it("a failed continuation POST: the report never claims 'Loop continues'; the commit is reported and the stop is visible", async () => {
+  it("a failed continuation POST: the report never claims 'Loop continues' and states the stop — no contradictory halt", async () => {
     const f = fakeDeps({ rounds: [3], failContinuation: true });
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
     assert.equal(r.ran, false);
+    if (!r.ran) assert.match(r.reason, /committed .* but the next review could not be requested/);
     const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
     assert.ok(report.includes(NEW_SHA), "the applied commit is reported");
     assert.ok(!/Loop continues/.test(report));
     assert.match(report, /could not be requested \(comment POST 502\)/);
-    assert.ok(f.posted.some((b) => /halted before fix[\s\S]*could not be requested/.test(b)), "the stop is observable");
+    assert.ok(!f.posted.some((b) => /halted before fix/.test(b)), "no 'halted before fix' after a committed fix");
+  });
+
+  it("a failed REPORT after a successful continuation is informational: the loop continues, no halt", async () => {
+    const f = fakeDeps({ rounds: [3], failReport: true });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "fix" && r.continued === true);
+    assert.equal(f.posted.filter((b) => parseContinueMarker(b, { authoredByBot: true })).length, 1);
+    assert.ok(!f.posted.some((b) => /halted before fix/.test(b)));
+  });
+
+  it("round cap at the marker contract's maximum still requests round MAX (clamp is inclusive)", async () => {
+    const rounds = Array.from({ length: 3 }, (_, i) => 9 - i); // improving; cap check uses the count
+    const f = fakeDeps({ rounds });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, { ...ENV_ON, ASHLAR_LOOP_ROUND_CAP: "999999" } as NodeJS.ProcessEnv);
+    assert.ok(r.ran && r.step === "fix" && r.continued === true, "a huge cap is clamped to the contract, not rejected");
   });
 
   it("model text in a fix report cannot carry a live control marker (neutralized, mentions defanged)", async () => {
@@ -328,13 +347,14 @@ describe("runPostReviewLoop steps", () => {
     assert.equal(f.posted.filter((b) => parseContinueMarker(b, { authoredByBot: true })).length, 1, "only the driver's own continuation");
   });
 
-  it("L3: a continuation that cannot be composed halts instead of announcing 'Loop continues'", async () => {
-    const f = fakeDeps({ rounds: [3], commitSha: "newsha" }); // not a full SHA → parser would reject
+  it("L3: a continuation that cannot be composed is reported, never announced as 'Loop continues'", async () => {
+    const f = fakeDeps({ rounds: [3], commitSha: "newsha" }); // not a full SHA → the composer refuses
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
     assert.equal(r.ran, false);
     assert.ok(!f.posted.some((b) => /Loop continues/.test(b)), "no false continuation announcement");
-    assert.ok(f.posted.some((b) => /halted before fix[\s\S]*invalid loop continuation/.test(b)), "halt is observable");
+    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+    assert.match(report, /could not be requested \(invalid loop continuation/, "the report states why the loop stopped");
   });
 
   it("L3: at the round cap an applied round does NOT continue (bounded)", async () => {

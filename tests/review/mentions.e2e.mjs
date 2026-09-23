@@ -256,3 +256,17 @@ test('a retained /review-loop in the PR body does not re-trigger on push (synchr
   const out=await deliver(app,'pull_request',pr('synchronize','/review-loop'));
   assert.equal(out.queued,false,'synchronize with a retained loop directive is not a fresh request');
 });
+
+test('self-trigger guard is wired end-to-end with the configured App login (ASHLAR_BOT_LOGIN)',async t=>{
+  const app=await fixture(t);
+  const from=login=>{const raw=comment(); raw.sender={login}; return raw;};
+  // default identity: the App's own comment is never a trigger
+  const own=await deliver(app,'issue_comment',from('ashlar-bot-review-loop[bot]'),'d-self-default');
+  assert.equal(own.queued,false);assert.match(String(own.ignored||own.skip),/bot-authored/);
+  // configured identity: the configured App is self; the default login is then just another sender
+  app.env.ASHLAR_BOT_LOGIN='my-app[bot]'; // the app realm's env (read live by ashlarBotLogin)
+  const custom=await deliver(app,'issue_comment',from('my-app[bot]'),'d-self-custom');
+  assert.equal(custom.queued,false);assert.match(String(custom.ignored||custom.skip),/bot-authored/);
+  const other=await deliver(app,'issue_comment',from('ashlar-bot-review-loop[bot]'),'d-other-app');
+  assert.equal(other.queued,true,'not self under the configured identity');
+});

@@ -85,7 +85,8 @@ export async function appFixture(options={}, githubOptions={}) {
  function mention(deliveryId='fixture-mention'){
   return harbor.ingestGitHubWebhook({hmacOk:true,deliveryId,event:'issue_comment',payload:{action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:1,pull_request:{},title:'fixture'},comment:{id:42,body:'@ashlar-bot review'}}});
  }
- return {harbor,bridge,history,origin,clock,ops,reviews,localResponses,localRequests,mention,githubCalls,
+ // env: the app realm's process.env (per fixture), so a test can set server env the code reads live.
+ return {harbor,bridge,history,origin,clock,ops,reviews,localResponses,localRequests,mention,githubCalls,env:context.process.env,
    async close(){harbor.resetHarbor();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));},
  };
 }

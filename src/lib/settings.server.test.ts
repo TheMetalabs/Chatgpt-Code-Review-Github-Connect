@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { botSettingsToEnv, diskReviewerFlagsWin, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
+import { botSettingsToEnv, diskReviewerFlagsWin, overlayEnv, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
 import { DEFAULT_SETTINGS, providersFromSettings } from "./types.ts";
 
 describe("sanitizeBotSettings", () => {
@@ -90,6 +90,56 @@ describe("sanitizeBotSettings", () => {
     );
     assert.equal(merged.reviewGrok, false);
     assert.equal(merged.reviewChatgpt, true);
+  });
+
+  it("defaults the fix agent to disabled (no auto-fix) with safe delivery/mode", () => {
+    const s = sanitizeBotSettings({});
+    assert.equal(s.fixAgent.provider, null);
+    assert.equal(s.fixAgent.delivery, "script-apply");
+    assert.equal(s.fixAgent.mode, "suggest");
+    assert.ok(s.fixAgent.parallelPrs >= 1);
+  });
+
+  it("normalizes fix agent config and rejects unknown values", () => {
+    const ok = sanitizeBotSettings({ fixAgent: { provider: "local", delivery: "script-apply", mode: "apply", parallelPrs: 5 } });
+    assert.deepEqual(ok.fixAgent, { provider: "local", delivery: "script-apply", mode: "apply", parallelPrs: 5 });
+    const bad = sanitizeBotSettings({ fixAgent: { provider: "bogus", delivery: "diff", mode: "yolo", parallelPrs: 999 } });
+    assert.equal(bad.fixAgent.provider, null); // unknown provider -> default (disabled)
+    assert.equal(bad.fixAgent.delivery, "script-apply");
+    assert.equal(bad.fixAgent.mode, "suggest");
+    assert.equal(bad.fixAgent.parallelPrs, 20); // clamped
+  });
+
+  it("serializes fixAgent to env keys so it survives the env-only persistence fallback (H6)", () => {
+    const s = sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push", mode: "apply", parallelPrs: 4 } });
+    const env = botSettingsToEnv(s);
+    assert.equal(env.ASHLAR_FIX_PROVIDER, "chatgpt");
+    assert.equal(env.ASHLAR_FIX_DELIVERY, "chat-push");
+    assert.equal(env.ASHLAR_FIX_MODE, "apply");
+    assert.equal(env.ASHLAR_FIX_PARALLEL_PRS, "4");
+    // a disabled fix agent serializes provider as "" AND round-trips to null through the read
+    // path (an explicit empty ASHLAR_FIX_PROVIDER disables a persisted provider) (J2/J8)
+    assert.equal(botSettingsToEnv(sanitizeBotSettings({})).ASHLAR_FIX_PROVIDER, "");
+    const prev = process.env.ASHLAR_FIX_PROVIDER;
+    try {
+      process.env.ASHLAR_FIX_PROVIDER = "";
+      const base = sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push", mode: "suggest", parallelPrs: 3 } }) as unknown as Record<string, unknown>;
+      const disabled = sanitizeBotSettings(overlayEnv(base));
+      assert.equal(disabled.fixAgent.provider, null, "empty env provider disables the persisted one");
+    } finally {
+      if (prev === undefined) delete process.env.ASHLAR_FIX_PROVIDER; else process.env.ASHLAR_FIX_PROVIDER = prev;
+    }
+  });
+
+  it("enforces the provider→delivery matrix, disabling incompatible pairs (F7)", () => {
+    // chatgpt/grok support script-apply | chat-push
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push" } }).fixAgent.provider, "chatgpt");
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "grok", delivery: "script-apply" } }).fixAgent.provider, "grok");
+    // local => script-apply only; chat-push is invalid => disabled
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "local", delivery: "chat-push" } }).fixAgent.provider, null);
+    // coding-agent => coding-agent only; script-apply is invalid => disabled
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "coding-agent", delivery: "script-apply" } }).fixAgent.provider, null);
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "coding-agent", delivery: "coding-agent" } }).fixAgent.provider, "coding-agent");
   });
 });
 

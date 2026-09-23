@@ -294,3 +294,93 @@ export function sameDirective(a: ReviewLoopDirective | null, b: ReviewLoopDirect
   if (a.kind === "start" && b.kind === "start") return a.mode === b.mode;
   return true;
 }
+
+// ── Stuck classification (§8) — pure; drives the ESCALATE emission in-repo ────
+// WHY here: reuses escalateComment above so the fixed literals + directives have ONE
+// source (design §3 no-drift). ashlar reconstructs rounds from the API and emits; the
+// external driver only DETECTS the marker. See review-loop-engine.server.ts.
+
+export interface RoundSummary {
+  index: number; // 1-based round number
+  findings: number; // total findings that round
+  files: string[]; // files flagged that round
+  head: string; // reviewed commit (short sha)
+}
+
+const DIFF_TOO_LARGE_LINES = 5000;
+const WHACK_WINDOW = 3; // inspect the last N rounds for a recurring file
+const WHACK_MIN_REPEAT = 2; // a file flagged in >= this many of the window => whack-a-mole
+
+/**
+ * Classify why a loop is stuck, or null when it is converged / still making progress.
+ *
+ * CONTRACT (single source of the stuck-definition — do not patch case-by-case):
+ * - Converged: last round has 0 findings → null.
+ * - Still improving: the recent window is STRICTLY decreasing → null, even at the cap or with
+ *   a recurring file (that is healthy progress, not stuck).
+ * - Otherwise, in precedence order: diff-too-large (structural, never converges) >
+ *   whack-a-mole (>=3 rounds, a file recurs in the window, trend not strictly improving) >
+ *   oscillation (>=3 rounds, window not trending down, all non-zero) > round-cap (cap hit,
+ *   trend not strictly improving).
+ * The semantic reasons (guard-accretion, wrong-scope, re-flag-deferred) need diff/semantic
+ * context the finding trend cannot supply and are left to the human.
+ */
+export function classifyStuck(
+  rounds: RoundSummary[],
+  opts: { roundCap: number; diffLines?: number },
+): EscalateReason | null {
+  if (rounds.length === 0) return null;
+  if (rounds[rounds.length - 1].findings === 0) return null; // converged (CONVERGED, not stuck)
+  if (opts.diffLines !== undefined && opts.diffLines > DIFF_TOO_LARGE_LINES) return "diff-too-large";
+
+  const window = rounds.slice(-WHACK_WINDOW);
+  // A loop whose recent findings are STRICTLY decreasing is still converging — never escalate
+  // it (a recurring file or hitting the cap while improving is healthy progress, not stuck).
+  const strictlyImproving =
+    window.length >= 2 && window.every((r, i) => i === 0 || r.findings < window[i - 1].findings);
+
+  // whack-a-mole: enough history (>=3 rounds), a file recurs across the window, and the trend
+  // is NOT still improving (stalled or rebounding on the same file).
+  if (rounds.length >= 3 && !strictlyImproving) {
+    const counts = new Map<string, number>();
+    for (const r of window) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
+    for (const v of counts.values()) if (v >= WHACK_MIN_REPEAT) return "whack-a-mole";
+  }
+
+  // oscillation: >=3 rounds, the window is NOT strictly improving (plateau or rebound), all
+  // non-zero. Uses the same strict-improvement test as the guard above (not just endpoints), so
+  // [5,4,4] and [5,1,4] are caught, while [5,4,3] stays improving → null.
+  if (rounds.length >= 3 && !strictlyImproving && window.every((r) => r.findings > 0)) {
+    return "oscillation";
+  }
+
+  // round-cap: reached the cap AND not still improving (a converging loop keeps running).
+  if (rounds.length >= opts.roundCap && !strictlyImproving) return "round-cap";
+  return null;
+}
+
+export function repeatedRoundFiles(rounds: RoundSummary[], window = WHACK_WINDOW): string[] {
+  const counts = new Map<string, number>();
+  for (const r of rounds.slice(-window)) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
+  return [...counts.entries()].filter(([, v]) => v >= WHACK_MIN_REPEAT).map(([f]) => f).sort();
+}
+
+/** Compose the ESCALATE handoff from a stuck loop's reconstructed round history (reuses
+ * escalateComment — the single source of the fixed literals + directives). */
+export function escalateFromRounds(
+  reason: EscalateReason,
+  rounds: RoundSummary[],
+  ctx: { pr: number; head: string; repo: string; roundCap: number; diffLines?: number },
+): string {
+  return escalateComment({
+    reason,
+    round: rounds.length ? rounds[rounds.length - 1].index : 0,
+    roundCap: ctx.roundCap,
+    pr: ctx.pr,
+    head: ctx.head,
+    repo: ctx.repo,
+    findingTrend: rounds.map((r) => r.findings),
+    repeatedFiles: repeatedRoundFiles(rounds),
+    diffLines: ctx.diffLines,
+  });
+}

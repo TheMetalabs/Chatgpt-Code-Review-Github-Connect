@@ -11,6 +11,8 @@ import { getSecrets, normalizePem } from "./secrets.server";
 import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { applyBudget } from "./review-budget";
+import { commitFiles, type GitDataApi } from "./fix-commit.ts";
+import type { FixFile } from "./fix-apply.ts";
 
 const GH_HOST = "api.github.com";
 const MAX_FILES = 50;
@@ -656,6 +658,152 @@ export async function createPullReview(
     throw new Error(`GitHub Reviews API ${out.status}: ${out.text}`);
   }
   throw new Error("GitHub Reviews API failed");
+}
+
+// Paginate to exhaustion and THROW on any page error, so an incomplete history is never
+// mistaken for a complete one (an idempotency-sensitive caller must abort, not assume empty).
+async function ghListAll<T>(token: string, pathBase: string): Promise<T[]> {
+  const MAX_PAGES = 50;
+  const all: T[] = [];
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const sep = pathBase.includes("?") ? "&" : "?";
+    const out = await gh<T[]>(token, `${pathBase}${sep}per_page=100&page=${page}`);
+    if (!out.ok) throw new Error(`list ${pathBase} failed (${out.status}): ${out.text}`);
+    const batch = out.data ?? [];
+    all.push(...batch);
+    if (batch.length < 100) return all; // exhausted
+    if (page === MAX_PAGES) {
+      // a full final page means more rows exist — fail closed rather than truncate silently
+      throw new Error(`list ${pathBase} exceeded ${MAX_PAGES * 100} rows (incomplete history)`);
+    }
+  }
+  return all;
+}
+
+export async function listPullReviews(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+): Promise<Array<{ userLogin: string; body: string; commitId: string; submittedAt: string }>> {
+  const rows = await ghListAll<{ user?: { login?: string }; body?: string | null; commit_id?: string | null; submitted_at?: string | null }>(
+    token,
+    `/repos/${owner}/${repo}/pulls/${pr}/reviews`,
+  );
+  return rows.map((r) => ({
+    userLogin: String(r.user?.login ?? ""),
+    body: String(r.body ?? ""),
+    commitId: String(r.commit_id ?? ""),
+    submittedAt: String(r.submitted_at ?? ""),
+  }));
+}
+
+export async function listReviewComments(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string }>> {
+  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null }>(
+    token,
+    `/repos/${owner}/${repo}/pulls/${pr}/comments`,
+  );
+  return rows.map((c) => ({
+    userLogin: String(c.user?.login ?? ""),
+    path: String(c.path ?? ""),
+    commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
+    createdAt: String(c.created_at ?? ""),
+  }));
+}
+
+export async function listIssueComments(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+): Promise<Array<{ userLogin: string; body: string }>> {
+  const rows = await ghListAll<{ user?: { login?: string }; body?: string | null }>(
+    token,
+    `/repos/${owner}/${repo}/issues/${pr}/comments`,
+  );
+  return rows.map((c) => ({ userLogin: String(c.user?.login ?? ""), body: String(c.body ?? "") }));
+}
+
+export function gitDataApi(token: string, owner: string, repo: string): GitDataApi {
+  const base = `/repos/${owner}/${repo}/git`;
+  return {
+    async baseTreeSha(commitSha: string): Promise<string> {
+      const out = await gh<{ tree?: { sha?: string } }>(token, `${base}/commits/${commitSha}`);
+      if (!out.ok || !out.data.tree?.sha) {
+        throw new Error(out.ok ? "commit has no tree" : `get commit failed (${out.status}): ${out.text}`);
+      }
+      return out.data.tree.sha;
+    },
+    async createBlob(content: string): Promise<string> {
+      const out = await gh<{ sha?: string }>(token, `${base}/blobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, encoding: "utf-8" }),
+      });
+      if (!out.ok || !out.data.sha) throw new Error(out.ok ? "blob has no sha" : `create blob failed (${out.status}): ${out.text}`);
+      return out.data.sha;
+    },
+    async createTree(baseTreeSha: string, entries: Array<{ path: string; sha: string }>): Promise<string> {
+      // Preserve each existing path's file mode (executable 100755, symlink 120000); a
+      // genuinely new file defaults to a regular 100644 blob. Without this the fix commit
+      // would silently drop the +x bit or turn a symlink into a regular file.
+      const baseOut = await gh<{ tree?: Array<{ path?: string; mode?: string; type?: string }>; truncated?: boolean }>(
+        token,
+        `${base}/trees/${baseTreeSha}?recursive=1`,
+      );
+      // Fail closed: without the base tree we cannot preserve executable/symlink modes, and
+      // defaulting to 100644 would silently strip the +x bit — refuse rather than corrupt modes.
+      if (!baseOut.ok) throw new Error(`base tree read failed (${baseOut.status}): ${baseOut.text}`);
+      if (baseOut.data.truncated) throw new Error("base tree truncated; cannot preserve file modes safely");
+      const modeByPath = new Map<string, string>();
+      for (const e of baseOut.data.tree ?? []) {
+        if (e.path && e.mode && e.type === "blob") modeByPath.set(e.path, e.mode);
+      }
+      const tree = entries.map((e) => ({ path: e.path, mode: modeByPath.get(e.path) ?? "100644", type: "blob", sha: e.sha }));
+      const out = await gh<{ sha?: string }>(token, `${base}/trees`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base_tree: baseTreeSha, tree }),
+      });
+      if (!out.ok || !out.data.sha) throw new Error(out.ok ? "tree has no sha" : `create tree failed (${out.status}): ${out.text}`);
+      return out.data.sha;
+    },
+    async createCommit(message: string, treeSha: string, parentSha: string): Promise<string> {
+      const out = await gh<{ sha?: string }>(token, `${base}/commits`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, tree: treeSha, parents: [parentSha] }),
+      });
+      if (!out.ok || !out.data.sha) throw new Error(out.ok ? "commit has no sha" : `create commit failed (${out.status}): ${out.text}`);
+      return out.data.sha;
+    },
+    async updateBranchRef(branch: string, commitSha: string): Promise<void> {
+      const out = await gh(token, `${base}/refs/heads/${branch}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sha: commitSha, force: false }),
+      });
+      if (!out.ok) throw new Error(`update ref failed (${out.status}): ${out.text}`);
+    },
+  };
+}
+
+/** Push a full-file change set as one atomic commit on `branch` (design §6 mechanism A). */
+export async function commitFilesToBranch(
+  token: string,
+  opts: { owner: string; repo: string; branch: string; baseCommitSha: string; message: string; files: FixFile[] },
+) {
+  return commitFiles(gitDataApi(token, opts.owner, opts.repo), {
+    branch: opts.branch,
+    baseCommitSha: opts.baseCommitSha,
+    message: opts.message,
+    files: opts.files,
+  });
 }
 
 export async function createIssueComment(

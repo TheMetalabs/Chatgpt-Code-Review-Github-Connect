@@ -3,10 +3,16 @@ import { dirname, join } from "node:path";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server.ts";
 import {
   DEFAULT_SETTINGS,
+  FIX_AGENT_PROVIDERS,
+  FIX_DELIVERIES,
+  FIX_MODES,
   LOCAL_REVIEW_MODES,
   normalizeReviewOrder,
   providersFromSettings,
   type BotSettings,
+  type FixAgentProvider,
+  type FixDelivery,
+  type FixMode,
   type LocalReviewMode,
   type ReviewProvider,
   type Severity,
@@ -35,7 +41,7 @@ function envNum(key: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
+export function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   const o = { ...base };
   const username = envStr("ASHLAR_USERNAME");
   if (username) o.username = username;
@@ -91,6 +97,23 @@ function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   if (promptContextMax !== undefined) o.promptContextMaxChars = promptContextMax;
   const promptPolicyMax = envNum("ASHLAR_PROMPT_POLICY_MAX_CHARS");
   if (promptPolicyMax !== undefined) o.promptPolicyMaxChars = promptPolicyMax;
+  // Read the provider EMPTY-PRESERVING (not via envStr, which collapses "" -> undefined): an
+  // explicit ASHLAR_FIX_PROVIDER="" is the disable sentinel and must override a persisted provider.
+  const fixProviderRaw = process.env.ASHLAR_FIX_PROVIDER;
+  const fixDelivery = envStr("ASHLAR_FIX_DELIVERY");
+  const fixMode = envStr("ASHLAR_FIX_MODE");
+  const fixParallel = envNum("ASHLAR_FIX_PARALLEL_PRS");
+  if (fixProviderRaw !== undefined || fixDelivery || fixMode || fixParallel !== undefined) {
+    const baseFix = (o.fixAgent as Record<string, unknown> | undefined) ?? {};
+    o.fixAgent = {
+      ...baseFix,
+      provider:
+        fixProviderRaw !== undefined ? (fixProviderRaw.trim() === "" ? null : fixProviderRaw.trim()) : baseFix.provider,
+      ...(fixDelivery ? { delivery: fixDelivery } : {}),
+      ...(fixMode ? { mode: fixMode } : {}),
+      ...(fixParallel !== undefined ? { parallelPrs: fixParallel } : {}),
+    };
+  }
   const contextPad = envNum("ASHLAR_CONTEXT_PAD_LINES");
   if (contextPad !== undefined) o.contextPadLines = contextPad;
   return o;
@@ -126,6 +149,10 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_PROMPT_CONTEXT_MAX_CHARS: String(s.promptContextMaxChars),
     ASHLAR_PROMPT_POLICY_MAX_CHARS: String(s.promptPolicyMaxChars),
     ASHLAR_CONTEXT_PAD_LINES: String(s.contextPadLines),
+    ASHLAR_FIX_PROVIDER: s.fixAgent.provider ?? "",
+    ASHLAR_FIX_DELIVERY: s.fixAgent.delivery,
+    ASHLAR_FIX_MODE: s.fixAgent.mode,
+    ASHLAR_FIX_PARALLEL_PRS: String(s.fixAgent.parallelPrs),
   };
 }
 
@@ -143,6 +170,31 @@ function num(v: unknown, fallback: number): number {
 
 function severity(v: unknown, fallback: Severity): Severity {
   return v === "P0" || v === "P1" || v === "P2" ? v : fallback;
+}
+
+// design §6b: which delivery each provider supports. An incompatible pair has no valid
+// execution path, so we DISABLE the fix agent (provider=null) rather than persist a config
+// that would silently never run — a visible, safe rejection of operator misconfiguration.
+const FIX_DELIVERY_BY_PROVIDER: Record<FixAgentProvider, readonly FixDelivery[]> = {
+  chatgpt: ["script-apply", "chat-push"],
+  grok: ["script-apply", "chat-push"],
+  local: ["script-apply"],
+  "coding-agent": ["coding-agent"],
+};
+
+function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
+  const d = DEFAULT_SETTINGS.fixAgent;
+  const p = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  let provider = FIX_AGENT_PROVIDERS.includes(p.provider as FixAgentProvider) ? (p.provider as FixAgentProvider) : d.provider;
+  let delivery = FIX_DELIVERIES.includes(p.delivery as FixDelivery) ? (p.delivery as FixDelivery) : d.delivery;
+  const mode = FIX_MODES.includes(p.mode as FixMode) ? (p.mode as FixMode) : d.mode;
+  const parallelPrs = Math.max(1, Math.min(20, Math.floor(num(p.parallelPrs, d.parallelPrs))));
+  // Enforce the provider→delivery matrix: an incompatible pair disables the fix agent.
+  if (provider !== null && !FIX_DELIVERY_BY_PROVIDER[provider].includes(delivery)) {
+    provider = null;
+    delivery = d.delivery;
+  }
+  return { provider, delivery, mode, parallelPrs };
 }
 
 export function sanitizeBotSettings(raw: unknown): BotSettings {
@@ -166,6 +218,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     reviewChatgpt: bool(p.reviewChatgpt, DEFAULT_SETTINGS.reviewChatgpt),
     reviewGrok: bool(p.reviewGrok, DEFAULT_SETTINGS.reviewGrok),
     reviewLocal: bool(p.reviewLocal, DEFAULT_SETTINGS.reviewLocal),
+    fixAgent: normalizeFixAgent(p.fixAgent),
     localJsonRepairEnabled: bool(p.localJsonRepairEnabled, DEFAULT_SETTINGS.localJsonRepairEnabled),
     localLlmBaseUrl: str(p.localLlmBaseUrl, DEFAULT_SETTINGS.localLlmBaseUrl).trim(),
     localLlmApiKey: str(p.localLlmApiKey, DEFAULT_SETTINGS.localLlmApiKey),

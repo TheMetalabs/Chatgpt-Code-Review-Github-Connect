@@ -15,8 +15,12 @@ function parseReviewSlice(slice: string): string | null {
   }
 }
 
-/** Walk backward from each closing brace so thinking traces with extra `{` cannot swallow the payload. */
-export function lastReviewJson(text: string): string | null {
+/**
+ * Walk backward from each closing brace so thinking traces with extra `{` cannot swallow
+ * the payload, returning the last balanced JSON object slice that `accept` validates.
+ * Shared by the review extractor and the fix-agent extractor (design §6 mechanism A).
+ */
+export function lastJsonObject(text: string, accept: (value: unknown) => boolean): string | null {
   const s = String(text || "");
   for (let end = s.lastIndexOf("}"); end >= 0; end = s.lastIndexOf("}", end - 1)) {
     let depth = 0;
@@ -34,14 +38,23 @@ export function lastReviewJson(text: string): string | null {
       else if (c === "{") {
         depth -= 1;
         if (depth === 0) {
-          const hit = parseReviewSlice(s.slice(i, end + 1));
-          if (hit) return hit;
+          const slice = s.slice(i, end + 1);
+          try {
+            if (accept(JSON.parse(slice))) return slice;
+          } catch {
+            /* not valid JSON at this slice; keep walking */
+          }
           break;
         }
       }
     }
   }
   return null;
+}
+
+/** Walk backward from each closing brace so thinking traces with extra `{` cannot swallow the payload. */
+export function lastReviewJson(text: string): string | null {
+  return lastJsonObject(text, isReviewObject);
 }
 
 export function extractChatJson(text: string): string | null {

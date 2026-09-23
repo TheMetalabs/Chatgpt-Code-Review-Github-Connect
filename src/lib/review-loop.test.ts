@@ -16,6 +16,10 @@ import {
   sameDirective,
   freshLoopDirective,
   stripLoopDirectives,
+  classifyStuck,
+  escalateFromRounds,
+  repeatedRoundFiles,
+  type RoundSummary,
   type EscalateReason,
 } from "./review-loop.ts";
 
@@ -255,5 +259,70 @@ describe("isZeroFindings (CONVERGED machine side)", () => {
     assert.equal(isZeroFindings("", BOT), false);
     // a user-authored comment carrying the marker is not a convergence signal
     assert.equal(isZeroFindings("<!-- ashlar-findings total=0 -->", USER), false);
+  });
+});
+
+describe("classifyStuck", () => {
+  const files = ["src/lib/review-loop.ts", "src/lib/github-payload.ts", "src/lib/ingress.ts"];
+  const R = (index: number, findings: number, f: string[] = files): RoundSummary => ({ index, findings, files: f, head: "h" });
+
+  it("classifies a recurring-file loop as whack-a-mole (this feature's own #68 loop)", () => {
+    const pr68 = [6, 4, 3, 4, 3, 3].map((n, i) => R(i + 1, n));
+    assert.equal(classifyStuck(pr68, { roundCap: 8 }), "whack-a-mole");
+  });
+
+  it("returns null on convergence (last round 0 findings)", () => {
+    assert.equal(classifyStuck([R(1, 3), R(2, 0, [])], { roundCap: 8 }), null);
+  });
+
+  it("returns null for genuine progress on distinct files (decreasing)", () => {
+    const prog = [R(1, 5, ["a.ts"]), R(2, 3, ["b.ts"]), R(3, 1, ["c.ts"])];
+    assert.equal(classifyStuck(prog, { roundCap: 8 }), null);
+  });
+
+  it("classifies non-decreasing counts on distinct files as oscillation", () => {
+    const osc = [R(1, 3, ["a.ts"]), R(2, 4, ["b.ts"]), R(3, 4, ["c.ts"])];
+    assert.equal(classifyStuck(osc, { roundCap: 8 }), "oscillation");
+  });
+
+  it("classifies a plateau/rebound window as oscillation, not null (J5)", () => {
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 8 }), "oscillation"); // plateau
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 1, ["b"]), R(3, 4, ["c"])], { roundCap: 8 }), "oscillation"); // rebound
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 3, ["c"])], { roundCap: 8 }), null); // still improving
+  });
+
+  it("round-cap fires for a short (<3 round) non-improving history at the cap (J7)", () => {
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 5, ["b"])], { roundCap: 2 }), "round-cap");
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 3, ["b"])], { roundCap: 2 }), null); // improving at the cap
+  });
+
+  it("diff-too-large overrides everything", () => {
+    const prog = [R(1, 5, ["a.ts"]), R(2, 3, ["b.ts"]), R(3, 1, ["c.ts"])];
+    assert.equal(classifyStuck(prog, { roundCap: 8, diffLines: 6000 }), "diff-too-large");
+  });
+
+  it("does NOT escalate a strictly-decreasing loop even at the round cap (H4)", () => {
+    const converging = [R(1, 10, ["a"]), R(2, 8, ["b"]), R(3, 6, ["c"]), R(4, 4, ["d"]), R(5, 2, ["e"])];
+    assert.equal(classifyStuck(converging, { roundCap: 5 }), null);
+  });
+
+  it("round-cap fires on a short non-improving history at the cap; a >=3 non-improving window is oscillation (H4/J5)", () => {
+    assert.equal(classifyStuck([R(1, 4, ["a"]), R(2, 4, ["b"])], { roundCap: 2 }), "round-cap"); // 2 rounds, plateau, cap
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 3 }), "oscillation"); // >=3 non-improving
+  });
+
+  it("does NOT classify two improving rounds on the same file as whack-a-mole (H2)", () => {
+    assert.equal(classifyStuck([R(1, 6), R(2, 4)], { roundCap: 8 }), null); // [6,4] same file, improving
+    assert.equal(classifyStuck([R(1, 6), R(2, 4), R(3, 3)], { roundCap: 8 }), null); // [6,4,3] improving
+  });
+
+  it("escalateFromRounds reuses the phase-1 composer: fixed marker + directive + trend", () => {
+    const pr68 = [6, 4, 3, 4, 3, 3].map((n, i) => R(i + 1, n));
+    const body = escalateFromRounds("whack-a-mole", pr68, { pr: 68, head: "fb52057", repo: "a/b", roundCap: 8 });
+    assert.ok(body.includes("<!-- ashlar-loop-escalate reason=whack-a-mole round=6 pr=68 head=fb52057 -->"));
+    assert.ok(body.includes(REVIEW_LOOP_ESCALATE_HUMAN));
+    assert.ok(body.includes(ESCALATE_DIRECTIVE["whack-a-mole"]));
+    assert.ok(body.includes("R1=6 R2=4 R3=3 R4=4 R5=3 R6=3 (decreasing)"));
+    assert.deepEqual(repeatedRoundFiles(pr68), ["src/lib/github-payload.ts", "src/lib/ingress.ts", "src/lib/review-loop.ts"]);
   });
 });

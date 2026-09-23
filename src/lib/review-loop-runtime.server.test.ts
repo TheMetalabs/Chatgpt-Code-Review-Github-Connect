@@ -1159,7 +1159,7 @@ describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per 
       },
     });
     for (const provider of ["chatgpt", "grok"] as const) {
-      assert.equal(await requestChatFix(chat(provider), { owner: "o", repo: "r", pr: 7 }, provider, "FIX PROMPT", loader), "ANSWER TEXT");
+      assert.equal(await requestChatFix(chat(provider), { owner: "o", repo: "r", pr: 7 }, provider, "FIX PROMPT", { loadBridge: loader }), "ANSWER TEXT");
     }
     assert.deepEqual(calls, [
       { owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: "FIX PROMPT" },
@@ -1169,7 +1169,20 @@ describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per 
 
   it("a bridge rejection surfaces as a thrown Error (the round's request-failed path)", async () => {
     const loader = async () => ({ requestBridgeFix: async () => Promise.reject(new Error("fix request for o/r#7 timed out after 30 min")) });
-    await assert.rejects(requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", "p", loader), /timed out after 30 min/);
+    await assert.rejects(requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", "p", { loadBridge: loader }), /timed out after 30 min/);
+  });
+
+  it("forwards the watcher's abort signal, so a cancelled fix releases its chat tab", async () => {
+    const seen: Array<AbortSignal | undefined> = [];
+    const loader = async () => ({
+      requestBridgeFix: async (request: { signal?: AbortSignal }) => {
+        seen.push(request.signal);
+        return "ANSWER TEXT";
+      },
+    });
+    const ac = new AbortController();
+    await requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", "p", { loadBridge: loader, signal: ac.signal });
+    assert.equal(seen[0], ac.signal);
   });
 
   it("delivery chat-push fails closed instead of silently becoming a server-side apply", async () => {
@@ -1179,7 +1192,7 @@ describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per 
       return { requestBridgeFix: async () => "never" };
     };
     await assert.rejects(
-      requestChatFix(chat("grok", "chat-push"), { owner: "o", repo: "r", pr: 7 }, "grok", "p", loader),
+      requestChatFix(chat("grok", "chat-push"), { owner: "o", repo: "r", pr: 7 }, "grok", "p", { loadBridge: loader }),
       /fix delivery chat-push is not wired for grok \(script-apply only\)/,
     );
     assert.equal(loaded, false);

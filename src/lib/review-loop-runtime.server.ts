@@ -44,7 +44,9 @@
  *     PR supersedes the older; a deadline (ASHLAR_FIX_CHAT_TIMEOUT_MS, default 30 min) and an
  *     inline-prompt ceiling (ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS, default 100k chars) turn a stuck
  *     tab or an oversized PR into a rejected request → retry, then ESCALATE fix-failed (never a
- *     hang). Only delivery "script-apply" is wired; "chat-push" fails closed.
+ *     hang). The watcher's abort (head moved, loop stopped, its deadline) cancels the item, so
+ *     the extension closes the tab instead of generating an answer nobody reads. Only delivery
+ *     "script-apply" is wired; "chat-push" fails closed.
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import type { GitDataApi } from "./fix-commit.ts";
@@ -465,13 +467,13 @@ export async function requestChatFix(
   ref: PrRef,
   provider: "chatgpt" | "grok",
   prompt: string,
-  loadBridge: BridgeFixLoader = () => import("./bridge.server.ts"),
+  opts: { signal?: AbortSignal; loadBridge?: BridgeFixLoader } = {},
 ): Promise<string> {
   if (settings.fixAgent.delivery !== "script-apply") {
     throw new Error(`fix delivery ${settings.fixAgent.delivery} is not wired for ${provider} (script-apply only)`);
   }
-  const bridge = await loadBridge();
-  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt });
+  const bridge = await (opts.loadBridge ?? (() => import("./bridge.server.ts")))();
+  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt, ...(opts.signal ? { signal: opts.signal } : {}) });
 }
 
 /** Production dependencies, loaded lazily so the static graph stays pure. `ref` is the PR a
@@ -497,7 +499,7 @@ async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRu
   // (NOT the review awaiting_chat lifecycle) and come back as the same kind of answer text.
   const requestFix: RequestFix = async (prompt, ctl) => {
     const provider = settings.fixAgent.provider;
-    if (provider === "chatgpt" || provider === "grok") return requestChatFix(settings, ref, provider, prompt);
+    if (provider === "chatgpt" || provider === "grok") return requestChatFix(settings, ref, provider, prompt, { signal: ctl?.signal });
     if (provider !== "local") {
       throw new Error(`fix provider ${provider} not wired yet (local, chatgpt, grok)`);
     }

@@ -872,6 +872,41 @@ export async function fetchPullHeadRef(
   };
 }
 
+/** The top-level inline comments of ONE posted review — the finding threads the loop replies to.
+ * Paginated; throws on a page error (a partial list would silently skip replies). */
+export async function listReviewThreadRoots(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  reviewId: number,
+): Promise<Array<{ id: number; path: string; body: string }>> {
+  const rows = await ghListAll<{ id?: number; path?: string | null; body?: string | null; in_reply_to_id?: number | null }>(
+    token,
+    `/repos/${owner}/${repo}/pulls/${pr}/reviews/${reviewId}/comments`,
+  );
+  return rows
+    .filter((c) => Number.isFinite(c.id) && !c.in_reply_to_id)
+    .map((c) => ({ id: Number(c.id), path: String(c.path ?? ""), body: String(c.body ?? "") }));
+}
+
+/** Reply inside an inline review thread (the per-finding disposition, design §5 step 6). */
+export async function replyToReviewComment(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  commentId: number,
+  body: string,
+): Promise<void> {
+  const out = await gh(token, `/repos/${owner}/${repo}/pulls/${pr}/comments/${commentId}/replies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+  if (!out.ok) throw new Error(`thread reply ${out.status}: ${out.text.slice(0, 160)}`);
+}
+
 /** A user's repository permission (legacy `permission` field: admin | write | read | none —
  * `maintain` reports as write). Throws on a lookup failure: the apply gate fails closed. */
 export async function fetchUserPermission(token: string, owner: string, repo: string, login: string): Promise<string> {

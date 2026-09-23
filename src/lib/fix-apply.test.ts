@@ -30,8 +30,16 @@ describe("parseFixResponse", () => {
     assert.match(err("not json at all"), /no fix JSON object|unparseable|empty/);
   });
 
-  it("rejects a response with no files", () => {
-    assert.match(err('{"summary":"nothing","files":[]}'), /no files/);
+  it("accepts a no-change round (files:[] WITH a rationale) but rejects a bare empty response (J3)", () => {
+    const fix = ok('{"summary":"all findings are false positives; pushed back","files":[]}');
+    assert.deepEqual(fix.files, []);
+    assert.match(err('{"summary":"","files":[]}'), /no rationale/);
+    assert.match(err('{"files":[]}'), /no rationale/);
+  });
+
+  it("rejects a sensitive repo-control path at the parser boundary (J6)", () => {
+    assert.match(err('{"files":[{"path":".github/workflows/ci.yml","content":"x"}]}'), /sensitive/);
+    assert.match(err('{"files":[{"path":".github/actions/x/action.yml","content":"x"}]}'), /sensitive/);
   });
 
   it("rejects unsafe paths (traversal, absolute, drive, backslash)", () => {

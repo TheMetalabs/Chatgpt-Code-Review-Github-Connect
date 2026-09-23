@@ -347,10 +347,11 @@ export function classifyStuck(
     for (const v of counts.values()) if (v >= WHACK_MIN_REPEAT) return "whack-a-mole";
   }
 
-  // oscillation: >=3 rounds, counts not trending down across the window, all non-zero.
-  if (rounds.length >= 3) {
-    const w = rounds.slice(-3);
-    if (w[2].findings >= w[0].findings && w.every((r) => r.findings > 0)) return "oscillation";
+  // oscillation: >=3 rounds, the window is NOT strictly improving (plateau or rebound), all
+  // non-zero. Uses the same strict-improvement test as the guard above (not just endpoints), so
+  // [5,4,4] and [5,1,4] are caught, while [5,4,3] stays improving → null.
+  if (rounds.length >= 3 && !strictlyImproving && window.every((r) => r.findings > 0)) {
+    return "oscillation";
   }
 
   // round-cap: reached the cap AND not still improving (a converging loop keeps running).

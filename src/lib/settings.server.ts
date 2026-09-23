@@ -41,7 +41,7 @@ function envNum(key: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
+export function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   const o = { ...base };
   const username = envStr("ASHLAR_USERNAME");
   if (username) o.username = username;
@@ -97,16 +97,18 @@ function overlayEnv(base: Record<string, unknown>): Record<string, unknown> {
   if (promptContextMax !== undefined) o.promptContextMaxChars = promptContextMax;
   const promptPolicyMax = envNum("ASHLAR_PROMPT_POLICY_MAX_CHARS");
   if (promptPolicyMax !== undefined) o.promptPolicyMaxChars = promptPolicyMax;
-  const fixProvider = envStr("ASHLAR_FIX_PROVIDER");
+  // Read the provider EMPTY-PRESERVING (not via envStr, which collapses "" -> undefined): an
+  // explicit ASHLAR_FIX_PROVIDER="" is the disable sentinel and must override a persisted provider.
+  const fixProviderRaw = process.env.ASHLAR_FIX_PROVIDER;
   const fixDelivery = envStr("ASHLAR_FIX_DELIVERY");
   const fixMode = envStr("ASHLAR_FIX_MODE");
   const fixParallel = envNum("ASHLAR_FIX_PARALLEL_PRS");
-  if (fixProvider !== undefined || fixDelivery || fixMode || fixParallel !== undefined) {
+  if (fixProviderRaw !== undefined || fixDelivery || fixMode || fixParallel !== undefined) {
     const baseFix = (o.fixAgent as Record<string, unknown> | undefined) ?? {};
     o.fixAgent = {
       ...baseFix,
-      // empty ASHLAR_FIX_PROVIDER means "disabled"; normalizeFixAgent maps unknown -> null
-      provider: fixProvider !== undefined ? (fixProvider === "" ? null : fixProvider) : baseFix.provider,
+      provider:
+        fixProviderRaw !== undefined ? (fixProviderRaw.trim() === "" ? null : fixProviderRaw.trim()) : baseFix.provider,
       ...(fixDelivery ? { delivery: fixDelivery } : {}),
       ...(fixMode ? { mode: fixMode } : {}),
       ...(fixParallel !== undefined ? { parallelPrs: fixParallel } : {}),

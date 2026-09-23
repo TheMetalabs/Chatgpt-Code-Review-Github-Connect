@@ -85,8 +85,15 @@ export function parseFixResponse(raw: string): FixParse {
     return { ok: false, error: "response is not a JSON object" };
   }
   const filesRaw = (parsed as { files?: unknown }).files;
-  if (!Array.isArray(filesRaw) || filesRaw.length === 0) {
-    return { ok: false, error: "no files in fix response" };
+  if (!Array.isArray(filesRaw)) {
+    return { ok: false, error: "no files array in fix response" };
+  }
+  const summaryRaw = typeof (parsed as { summary?: unknown }).summary === "string" ? (parsed as { summary: string }).summary : "";
+  if (filesRaw.length === 0) {
+    // A no-change round is valid ONLY when the agent gave a rationale (push-back/decline/defer of
+    // every finding); a bare empty response with no summary is malformed → fail closed.
+    if (summaryRaw.trim().length === 0) return { ok: false, error: "empty response (no files, no rationale)" };
+    return { ok: true, fix: { summary: summaryRaw, files: [] } };
   }
   const seen = new Set<string>();
   const files: FixFile[] = [];
@@ -95,6 +102,7 @@ export function parseFixResponse(raw: string): FixParse {
     const path = (entry as { path?: unknown }).path;
     const content = (entry as { content?: unknown }).content;
     if (!isSafeRepoPath(path)) return { ok: false, error: `unsafe or missing path: ${String(path).slice(0, 80)}` };
+    if (isSensitivePath(path)) return { ok: false, error: `sensitive repo-control path: ${path}` };
     if (seen.has(path)) return { ok: false, error: `duplicate path: ${path}` };
     if (typeof content !== "string" || content.length === 0) {
       return { ok: false, error: `empty/non-string content for ${path} (possible truncation)` };

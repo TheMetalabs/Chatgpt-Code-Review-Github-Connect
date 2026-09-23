@@ -285,6 +285,17 @@ describe("classifyStuck", () => {
     assert.equal(classifyStuck(osc, { roundCap: 8 }), "oscillation");
   });
 
+  it("classifies a plateau/rebound window as oscillation, not null (J5)", () => {
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 8 }), "oscillation"); // plateau
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 1, ["b"]), R(3, 4, ["c"])], { roundCap: 8 }), "oscillation"); // rebound
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 3, ["c"])], { roundCap: 8 }), null); // still improving
+  });
+
+  it("round-cap fires for a short (<3 round) non-improving history at the cap (J7)", () => {
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 5, ["b"])], { roundCap: 2 }), "round-cap");
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 3, ["b"])], { roundCap: 2 }), null); // improving at the cap
+  });
+
   it("diff-too-large overrides everything", () => {
     const prog = [R(1, 5, ["a.ts"]), R(2, 3, ["b.ts"]), R(3, 1, ["c.ts"])];
     assert.equal(classifyStuck(prog, { roundCap: 8, diffLines: 6000 }), "diff-too-large");
@@ -295,9 +306,9 @@ describe("classifyStuck", () => {
     assert.equal(classifyStuck(converging, { roundCap: 5 }), null);
   });
 
-  it("round-cap fires when the cap is hit and the trend is NOT still improving (H4)", () => {
-    const capd = [R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])]; // plateau at the end, distinct files
-    assert.equal(classifyStuck(capd, { roundCap: 3 }), "round-cap");
+  it("round-cap fires on a short non-improving history at the cap; a >=3 non-improving window is oscillation (H4/J5)", () => {
+    assert.equal(classifyStuck([R(1, 4, ["a"]), R(2, 4, ["b"])], { roundCap: 2 }), "round-cap"); // 2 rounds, plateau, cap
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 3 }), "oscillation"); // >=3 non-improving
   });
 
   it("does NOT classify two improving rounds on the same file as whack-a-mole (H2)", () => {

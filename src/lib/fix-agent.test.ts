@@ -79,11 +79,11 @@ describe("runFixRound", () => {
 
   it("rejects an out-of-scope path before any commit (scope containment)", async () => {
     const f = fakeApi();
-    const evil = '{"summary":"x","files":[{"path":".github/workflows/ci.yml","content":"pwn"}]}';
-    const res = await runFixRound({ requestFix: async () => evil, api: f.api }, { ...base, mode: "apply" });
+    const oos = '{"summary":"x","files":[{"path":"src/other.ts","content":"pwn"}]}';
+    const res = await runFixRound({ requestFix: async () => oos, api: f.api, validate: async () => ({ ok: true }) }, { ...base, mode: "apply" });
     assert.equal(res.ok, false);
     assert.equal(res.outcome, "scope-violation");
-    assert.match(res.error ?? "", /\.github\/workflows/);
+    assert.match(res.error ?? "", /src\/other\.ts/);
     assert.equal(f.committed, false, "out-of-scope fix must not push");
   });
 
@@ -128,15 +128,37 @@ describe("runFixRound", () => {
     assert.equal(f.committed, false);
   });
 
-  it("H3: a sensitive path is denied even when the caller allows it", async () => {
+  it("H3: a sensitive path is denied even when the caller allows it (rejected at the parser)", async () => {
     const f = fakeApi();
     const wf = '{"summary":"x","files":[{"path":".github/workflows/ci.yml","content":"pwn"}]}';
     const res = await runFixRound(
       { requestFix: async () => wf, api: f.api, validate: async () => ({ ok: true }) },
       { ...base, mode: "apply", allowedPaths: [".github/workflows/ci.yml"] },
     );
+    assert.equal(res.ok, false); // parse-failed (sensitive rejected at parser) — never committed
+    assert.equal(f.committed, false);
+  });
+
+  it("J3: a no-change round (files:[] with rationale) succeeds without committing", async () => {
+    const f = fakeApi();
+    const res = await runFixRound(
+      { requestFix: async () => '{"summary":"pushed back all findings","files":[]}', api: f.api, validate: async () => ({ ok: true }) },
+      { ...base, mode: "apply" },
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.outcome, "no-change");
+    assert.equal(f.committed, false);
+  });
+
+  it("J4: a throwing validator returns validation-failed, not an unhandled rejection", async () => {
+    const f = fakeApi();
+    const res = await runFixRound(
+      { requestFix: async () => FIX_JSON, api: f.api, validate: async () => { throw new Error("tsc spawn failed"); } },
+      { ...base, mode: "apply" },
+    );
     assert.equal(res.ok, false);
-    assert.equal(res.outcome, "scope-violation");
+    assert.equal(res.outcome, "validation-failed");
+    assert.match(res.error ?? "", /tsc spawn failed/);
     assert.equal(f.committed, false);
   });
 

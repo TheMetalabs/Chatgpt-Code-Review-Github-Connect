@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { botSettingsToEnv, diskReviewerFlagsWin, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
+import { botSettingsToEnv, diskReviewerFlagsWin, overlayEnv, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
 import { DEFAULT_SETTINGS, providersFromSettings } from "./types.ts";
 
 describe("sanitizeBotSettings", () => {
@@ -117,8 +117,18 @@ describe("sanitizeBotSettings", () => {
     assert.equal(env.ASHLAR_FIX_DELIVERY, "chat-push");
     assert.equal(env.ASHLAR_FIX_MODE, "apply");
     assert.equal(env.ASHLAR_FIX_PARALLEL_PRS, "4");
-    // a disabled fix agent serializes provider as "" (round-trips to null)
+    // a disabled fix agent serializes provider as "" AND round-trips to null through the read
+    // path (an explicit empty ASHLAR_FIX_PROVIDER disables a persisted provider) (J2/J8)
     assert.equal(botSettingsToEnv(sanitizeBotSettings({})).ASHLAR_FIX_PROVIDER, "");
+    const prev = process.env.ASHLAR_FIX_PROVIDER;
+    try {
+      process.env.ASHLAR_FIX_PROVIDER = "";
+      const base = sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push", mode: "suggest", parallelPrs: 3 } }) as unknown as Record<string, unknown>;
+      const disabled = sanitizeBotSettings(overlayEnv(base));
+      assert.equal(disabled.fixAgent.provider, null, "empty env provider disables the persisted one");
+    } finally {
+      if (prev === undefined) delete process.env.ASHLAR_FIX_PROVIDER; else process.env.ASHLAR_FIX_PROVIDER = prev;
+    }
   });
 
   it("enforces the provider→delivery matrix, disabling incompatible pairs (F7)", () => {

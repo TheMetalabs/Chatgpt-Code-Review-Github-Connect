@@ -31,7 +31,7 @@ export interface FixRoundResult {
   /** Set in apply mode on a successful push. */
   commitSha?: string;
   /** How the round ended, for logs / the loop driver. */
-  outcome: "applied" | "suggested" | "parse-failed" | "commit-failed" | "scope-violation" | "request-failed" | "validation-failed";
+  outcome: "applied" | "suggested" | "no-change" | "parse-failed" | "commit-failed" | "scope-violation" | "request-failed" | "validation-failed";
   error?: string;
 }
 
@@ -115,6 +115,11 @@ export async function runFixRound(
   const parsed = parseFixResponse(raw);
   if (!parsed.ok) return { ok: false, outcome: "parse-failed", error: parsed.error };
 
+  // A valid no-change round (every finding pushed-back / declined / deferred): nothing to commit.
+  if (parsed.fix.files.length === 0) {
+    return { ok: true, outcome: "no-change", files: [], summary: parsed.fix.summary };
+  }
+
   const allowed = new Set(opts.allowedPaths);
   // A sensitive repo-control path (e.g. .github/workflows/*) is denied even if the caller put
   // it in allowedPaths — allowlist membership is not write-safety for these paths.
@@ -133,7 +138,14 @@ export async function runFixRound(
   if (!deps.validate) {
     return { ok: false, outcome: "validation-failed", error: "apply mode requires a validator", files: parsed.fix.files, summary: parsed.fix.summary };
   }
-  const v = await deps.validate(parsed.fix.files);
+  let v: { ok: boolean; error?: string };
+  try {
+    v = await deps.validate(parsed.fix.files);
+  } catch (e) {
+    // A throwing validator (compiler/subprocess failure) is a structured failure, not an
+    // unhandled rejection — the branch must not move.
+    return { ok: false, outcome: "validation-failed", error: (e as Error)?.message ?? String(e), files: parsed.fix.files, summary: parsed.fix.summary };
+  }
   if (!v.ok) {
     return { ok: false, outcome: "validation-failed", error: v.error ?? "candidate failed validation", files: parsed.fix.files, summary: parsed.fix.summary };
   }

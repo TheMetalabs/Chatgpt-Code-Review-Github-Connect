@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
-import { continueComment, parseContinueMarker, STOPPED_MARKER } from "./review-loop.ts";
+import { continueComment, parseContinueMarker, parseStartMarker, startComment, STOPPED_MARKER } from "./review-loop.ts";
 import { escalateNow } from "./review-loop-engine.server.ts";
 import {
   ashlarBotLogin,
@@ -12,6 +12,7 @@ import {
   renderFindings,
   runPostReviewLoop,
   SILENT_REASONS,
+  startLoop,
   stopLoop,
   type LoopRuntimeDeps,
 } from "./review-loop-runtime.server.ts";
@@ -84,7 +85,9 @@ function settings(mode: "suggest" | "apply" = "suggest"): BotSettings {
   return { ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } };
 }
 
-type IssueRow = { userLogin: string; body: string; createdAt: string };
+type IssueRow = { userLogin: string; body: string; createdAt: string; updatedAt?: string };
+/** The App's start record (the only thing that starts a session) for a human's directive. */
+const recorded = (mode: "suggest" | "apply", by: string, at: string): IssueRow => ({ userLogin: BOT, body: startComment({ mode, by, at }), createdAt: at });
 
 /** Fake GitHub with a durable history: a human start (the session), review rounds on distinct
  * heads (the reviewed HEAD last), optional extra issue events, and spies for every write. */
@@ -122,7 +125,7 @@ function fakeDeps(
   let clock = 0;
   const start = opts.start === undefined ? "suggest" : opts.start;
   const issues: IssueRow[] = [
-    ...(start ? [{ userLogin: "alice", body: start === "apply" ? "/review-loop apply" : "/review-loop", createdAt: START_AT }] : []),
+    ...(start ? [recorded(start, "alice", START_AT)] : []),
     ...(opts.issues ?? []),
   ];
   const stop = () => issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2026-01-31T00:00:00Z" });
@@ -170,9 +173,6 @@ function fakeDeps(
           sameRepo: opts.sameRepo ?? !(opts.fork ?? false),
           additions: opts.additions,
           deletions: opts.deletions,
-          body: "",
-          createdAt: "2025-12-30T00:00:00Z",
-          author: "alice",
         };
       },
       async fetchUserPermission(_t, _o, _r, login) {
@@ -233,6 +233,7 @@ function fakeDeps(
 }
 
 const escalations = (posted: string[]) => posted.filter((b) => b.includes("<!-- ashlar-loop-escalate"));
+const NEWER = "superseded by a newer loop request (a new session, another starter, or apply downgraded to suggest)";
 const reasonOf = (body: string) => /reason=([a-z-]+)/.exec(body)?.[1];
 const run = (f: ReturnType<typeof fakeDeps>, mode: "suggest" | "apply" = "suggest", env: NodeJS.ProcessEnv = ENV_ON, j: Job = job()) =>
   runPostReviewLoop("t", j, sample, settings(mode), f.deps, env);
@@ -284,7 +285,7 @@ describe("session: durable, restart-proof, never reset by a re-issued start", ()
     const f = fakeDeps({
       start: "apply",
       rounds: [5, 4, 3, 2],
-      issues: [{ userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-03T12:00:00Z" }], // re-issue
+      issues: [recorded("apply", "alice", "2026-01-03T12:00:00Z")], // re-issue
     });
     const r = await run(f, "apply", capEnv(3));
     assert.ok(r.ran && r.step === "escalated" && r.reason === "round-cap", "4 rounds > budget 3 despite the re-issue");
@@ -297,7 +298,7 @@ describe("session: durable, restart-proof, never reset by a re-issued start", ()
       rounds: [5, 4, 3, 2],
       issues: [
         { userLogin: BOT, body: `<!-- ashlar-loop-escalate reason=fix-failed round=2 pr=7 head=${"c1".padEnd(40, "0")} -->`, createdAt: "2026-01-02T12:00:00Z" },
-        { userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-02T13:00:00Z" },
+        recorded("apply", "alice", "2026-01-02T13:00:00Z"),
       ],
     });
     const r = await run(f, "apply", capEnv(3));
@@ -307,7 +308,7 @@ describe("session: durable, restart-proof, never reset by a re-issued start", ()
   });
 
   it("the latest start sets the mode (a suggest session upgraded to apply)", async () => {
-    const f = fakeDeps({ start: "suggest", rounds: [3], issues: [{ userLogin: "alice", body: "/review-loop apply", createdAt: "2025-12-31T06:00:00Z" }] });
+    const f = fakeDeps({ start: "suggest", rounds: [3], issues: [recorded("apply", "alice", "2025-12-31T06:00:00Z")] });
     const r = await run(f, "apply");
     assert.ok(r.ran && r.step === "fix" && r.outcome === "applied");
     assert.equal(f.committed, true);
@@ -623,6 +624,59 @@ describe("a stale clean review never ends the session", () => {
   });
 });
 
+describe("round-4: authorization at the commit, recorded starts", () => {
+  it("another starter re-issuing apply mid-fix takes the round over: no commit", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const orig = f.deps.requestFix;
+    f.deps.requestFix = async (p, ctl) => {
+      f.issues.push(recorded("apply", "bob", "2026-01-30T00:00:00Z")); // bob becomes the latest starter
+      return orig(p, ctl);
+    };
+    assert.deepEqual(await run(f, "apply"), { ran: false, reason: NEWER });
+    assert.equal(f.committed, false);
+    assert.equal(f.prompts.length, 1);
+  });
+
+  it("write access lost while the fix waited: no commit, no retry, a loop-error handoff", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    let checks = 0;
+    f.deps.gh.fetchUserPermission = async () => (++checks === 1 ? "write" : "read"); // revoked after the start gate
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    assert.match(escalations(f.posted)[0], /apply requires write access; alice has 'read'/);
+    assert.equal(f.committed, false);
+    assert.equal(f.prompts.length, 1, "never retried");
+    assert.equal(checks, 2, "checked at the start gate and again right before the commit");
+  });
+
+  it("startLoop records a start once per (requester, time, mode), retries, and ignores the App itself", async () => {
+    const f = fakeDeps({ start: null });
+    const req = { owner: "o", repo: "r", pr: 7, actor: "alice", mode: "apply" as const, at: "2026-01-01T00:00:00Z" };
+    assert.deepEqual(await startLoop("t", req, settings(), f.deps, ENV_OFF), { posted: false, reason: "disabled" });
+    assert.deepEqual(await startLoop("t", req, settings(), f.deps, ENV_ON), { posted: true, reason: "started" });
+    assert.deepEqual(await startLoop("t", req, settings(), f.deps, ENV_ON), { posted: false, reason: "start already recorded" });
+    assert.deepEqual(await startLoop("t", { ...req, actor: BOT }, settings(), f.deps, ENV_ON), { posted: false, reason: "bot-authored start ignored" });
+    assert.match((await startLoop("t", { ...req, actor: "not a login" }, settings(), f.deps, ENV_ON)).reason, /start failed: invalid loop start/);
+    assert.equal(f.posted.length, 1);
+    assert.deepEqual(parseStartMarker(f.posted[0], { authoredByBot: true }), { mode: "apply", by: "alice", at: "2026-01-01T00:00:00Z" });
+  });
+
+  it("a review requested by a start whose record was never posted records it, then runs as a loop round", async () => {
+    const f = fakeDeps({ start: null, rounds: [3] });
+    const j = job({ thread: { kind: "mention", commentId: 5, userText: "/review-loop", loop: { kind: "start", mode: "suggest" }, eventAt: "2025-12-31T00:00:00Z" } });
+    const r = await run(f, "suggest", ENV_ON, j);
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested", JSON.stringify(r));
+    assert.deepEqual(parseStartMarker(f.posted[0], { authoredByBot: true }), { mode: "suggest", by: "alice", at: "2025-12-31T00:00:00Z" });
+  });
+
+  it("the self-heal never re-opens a session a later stop ended (the record exists)", async () => {
+    const f = fakeDeps({ rounds: [3], issues: [{ userLogin: "bob", body: "/review-loop stop", createdAt: "2026-01-01T12:00:00Z" }] });
+    const j = job({ thread: { kind: "mention", commentId: 5, userText: "/review-loop", loop: { kind: "start", mode: "suggest" }, eventAt: START_AT } });
+    assert.deepEqual(await run(f, "suggest", ENV_ON, j), { ran: false, reason: "no active loop session" });
+    assert.equal(f.posted.length, 0, "nothing re-posted");
+  });
+});
+
 describe("apply write-permission gate (design §2)", () => {
   it("a starter without write access hands off (loop-error) and nothing is pushed", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3], permission: "read" });
@@ -696,10 +750,10 @@ describe("round-3: one relevance check, moot rounds never retried, one continuat
     const f = fakeDeps({ start: "apply", rounds: [3] });
     const orig = f.deps.requestFix;
     f.deps.requestFix = async (p, ctl) => {
-      f.issues.push({ userLogin: "alice", body: "/review-loop", createdAt: "2026-01-30T00:00:00Z" }); // re-issued, suggest
+      f.issues.push(recorded("suggest", "alice", "2026-01-30T00:00:00Z")); // re-issued, suggest
       return orig(p, ctl);
     };
-    assert.deepEqual(await run(f, "apply"), { ran: false, reason: "superseded by a newer loop request (a new session, or apply downgraded to suggest)" });
+    assert.deepEqual(await run(f, "apply"), { ran: false, reason: NEWER });
     assert.equal(f.committed, false);
     assert.equal(f.prompts.length, 1);
   });
@@ -736,6 +790,22 @@ describe("round-3: one relevance check, moot rounds never retried, one continuat
     f.deps.sleep = async () => {
       release();
       await pending; // the concurrent handoff lands while this step backs off
+    };
+    assert.deepEqual(await run(f, "apply"), { ran: false, reason: "the loop session ended with a handoff" }, "a handoff, not an operator stop");
+    assert.equal(f.prompts.length, 0);
+    assert.ok(!f.posted.some((b) => b.includes(STOPPED_MARKER)));
+  });
+
+  it("an operator stop that lands during the backoff is reported as the operator's stop", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    let release!: () => void;
+    const held = new Promise<void>((res) => (release = res));
+    const slowGh = { ...f.deps.gh, createIssueComment: async () => (await held, { id: 99 }) };
+    const pending = escalateNow(slowGh, "t", { owner: "o", repo: "r", pr: 7, head: HEAD, reason: "fix-failed", rounds: [], roundCap: 5, botLogin: BOT });
+    f.deps.sleep = async () => {
+      f.issues.push({ userLogin: "bob", body: "/review-loop stop", createdAt: "2026-01-31T00:00:00Z" });
+      release();
+      await pending;
     };
     assert.deepEqual(await run(f, "apply"), { ran: false, reason: "loop stopped by operator" });
     assert.equal(f.prompts.length, 0);
@@ -819,13 +889,31 @@ describe("round-2 hardening: provenance, queue-aware fix requests", () => {
 describe("continueLoopOnPush (a push continues an active session)", () => {
   const push = (over: Partial<{ headSha: string; actor: string; pushedAt: string }> = {}) => ({ owner: "o", repo: "r", pr: 7, headSha: HEAD, actor: "alice", ...over });
 
-  it("is off when the fix agent is disabled, and skips the App's own push", async () => {
+  it("is off when the fix agent is disabled", async () => {
     const f = fakeDeps({ rounds: [3] });
     assert.deepEqual(await continueLoopOnPush("t", push(), settings(), f.deps, ENV_OFF), { posted: false, reason: "disabled" });
-    const own = await continueLoopOnPush("t", push({ actor: BOT }), settings(), f.deps, ENV_ON);
-    assert.equal(own.posted, false);
-    assert.match(own.reason, /own push/);
     assert.equal(f.posted.length, 0);
+  });
+
+  it("the App's own push repairs a missing continuation (a crash after the commit) and never duplicates one", async () => {
+    const pushed = "b".repeat(40);
+    const f = fakeDeps({ start: "apply", rounds: [3], liveSha: pushed });
+    const own = push({ actor: BOT, headSha: pushed });
+    assert.deepEqual(await continueLoopOnPush("t", own, settings("apply"), f.deps, ENV_ON), { posted: true, reason: "continued" });
+    assert.deepEqual(await continueLoopOnPush("t", own, settings("apply"), f.deps, ENV_ON), { posted: false, reason: "already continued" });
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 1);
+  });
+
+  it("a continuation that cannot be posted is retried, then ends in a fixed loop-error handoff — never a stall", async () => {
+    const pushed = "b".repeat(40);
+    const f = fakeDeps({ start: "apply", rounds: [3], liveSha: pushed, failContinuation: true });
+    const r = await continueLoopOnPush("t", push({ headSha: pushed }), settings("apply"), f.deps, ENV_ON);
+    assert.equal(r.posted, false);
+    assert.match(r.reason, /continue on push failed: comment POST 502; handoff posted/);
+    assert.equal(f.sleeps, 2, "two backed-off retries");
+    const handoff = escalations(f.posted);
+    assert.equal(handoff.length, 1);
+    assert.ok(handoff[0].includes(`reason=loop-error`) && handoff[0].includes(`head=${pushed}`));
   });
 
   it("never continues a stale push, or a PR without an active session", async () => {
@@ -881,6 +969,20 @@ describe("stopLoop (the fixed STOPPED acknowledgement)", () => {
       ],
     });
     assert.equal((await stopLoop("t", stopReq(), settings(), f.deps, ENV_ON)).posted, false);
+    assert.equal(f.posted.length, 0);
+  });
+
+  it("a second stop after the acknowledgement posts nothing (the ack settles the ended session)", async () => {
+    const f = fakeDeps({
+      rounds: [3],
+      issues: [
+        { userLogin: "bob", body: "/review-loop stop", createdAt: "2026-01-20T00:00:00Z" },
+        { userLogin: BOT, body: `${STOPPED_MARKER}\n\nAshlar review-loop stopped by operator`, createdAt: "2026-01-20T00:00:05Z" },
+        { userLogin: "carol", body: "/review-loop stop", createdAt: "2026-01-21T00:00:00Z" },
+      ],
+    });
+    const again = await stopLoop("t", stopReq({ actor: "carol", stopAt: "2026-01-21T00:00:00Z" }), settings(), f.deps, ENV_ON);
+    assert.deepEqual(again, { posted: false, reason: "no active loop session" });
     assert.equal(f.posted.length, 0);
   });
 

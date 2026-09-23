@@ -248,6 +248,43 @@ export function isSelfLogin(login: string | null | undefined, botLogin: string =
 
 export const REVIEW_LOOP_CONTINUE_HUMAN = "Ashlar review-loop continues — requesting the next review";
 export const REVIEW_LOOP_FIXING_HUMAN = "Ashlar review-loop — fix round in progress";
+export const REVIEW_LOOP_START_HUMAN = "Ashlar review-loop start recorded";
+
+// ── Recorded loop start (the durable start event) ───────────────────────────────
+// WHY: human comment bodies and the PR body are MUTABLE — rebuilding a session from their
+// current text at their creation time lets a later edit plant a backdated start. The start is
+// therefore recorded once, by the App, when harbor accepts a FRESH start directive for a review
+// it admits: the marker carries the requester and the directive's own event time (a comment's
+// creation or edit time, a PR body's update time), and only this record starts a session.
+
+export interface LoopStart {
+  mode: ReviewLoopMode;
+  by: string; // the human who issued the directive (the apply write-permission subject)
+  at: string; // the directive's event time (ISO-8601 UTC)
+}
+
+const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const START_MARKER_RE =
+  /^\s*<!--\s*ashlar-loop-start\s+mode=(apply|suggest)\s+by=([A-Za-z0-9-]{1,39})\s+at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)\s*-->/;
+
+/** The App's start record. Throws on a malformed field: a record the parser would reject must
+ * never be posted (the loop would silently not start). */
+export function startComment(s: LoopStart): string {
+  if ((s.mode !== "apply" && s.mode !== "suggest") || !LOGIN_RE.test(s.by) || !ISO_UTC_RE.test(s.at) || Number.isNaN(Date.parse(s.at))) {
+    throw new Error(`invalid loop start (mode=${s.mode} by=${s.by} at=${s.at})`);
+  }
+  return `<!-- ashlar-loop-start mode=${s.mode} by=${s.by} at=${s.at} -->\n\n${REVIEW_LOOP_START_HUMAN} — mode ${s.mode}, requested by ${s.by}.`;
+}
+
+/** Parse the start record from a comment the caller has proven the App authored (anchored: the
+ * record OPENS the comment). Null for any other author, or a missing / malformed record. */
+export function parseStartMarker(body: string | null | undefined, source: CommentSource): LoopStart | null {
+  if (!source.authoredByBot) return null;
+  const m = START_MARKER_RE.exec(body || "");
+  if (!m || !LOGIN_RE.test(m[2]) || Number.isNaN(Date.parse(m[3]))) return null;
+  return { mode: m[1] as ReviewLoopMode, by: m[2], at: m[3] };
+}
 
 /** Progress signal (informational, NEVER a trigger or a terminal event): posted right before the
  * fix request so a driver can tell "the fix is queued/generating" from "the loop died" — the fix

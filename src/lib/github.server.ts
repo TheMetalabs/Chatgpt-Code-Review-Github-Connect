@@ -703,8 +703,8 @@ export async function listReviewComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; body: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null; body?: string | null }>(
+): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; updatedAt: string; body: string }>> {
+  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null; updated_at?: string | null; body?: string | null }>(
     token,
     `/repos/${owner}/${repo}/pulls/${pr}/comments`,
   );
@@ -713,6 +713,7 @@ export async function listReviewComments(
     path: String(c.path ?? ""),
     commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
     createdAt: String(c.created_at ?? ""),
+    updatedAt: String(c.updated_at ?? ""),
     body: String(c.body ?? ""),
   }));
 }
@@ -722,12 +723,18 @@ export async function listIssueComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; body: string; createdAt: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; body?: string | null; created_at?: string }>(
+): Promise<Array<{ userLogin: string; body: string; createdAt: string; updatedAt: string }>> {
+  const rows = await ghListAll<{ user?: { login?: string }; body?: string | null; created_at?: string; updated_at?: string }>(
     token,
     `/repos/${owner}/${repo}/issues/${pr}/comments`,
   );
-  return rows.map((c) => ({ userLogin: String(c.user?.login ?? ""), body: String(c.body ?? ""), createdAt: String(c.created_at ?? "") }));
+  // updatedAt tells an edited comment apart: its current text cannot be placed at its creation.
+  return rows.map((c) => ({
+    userLogin: String(c.user?.login ?? ""),
+    body: String(c.body ?? ""),
+    createdAt: String(c.created_at ?? ""),
+    updatedAt: String(c.updated_at ?? ""),
+  }));
 }
 
 export function gitDataApi(token: string, owner: string, repo: string): GitDataApi {
@@ -838,17 +845,11 @@ export async function fetchPullHeadRef(
   sameRepo: boolean;
   additions?: number;
   deletions?: number;
-  body?: string | null;
-  createdAt?: string;
-  author?: string;
 }> {
   const out = await gh<{
     head?: { ref?: string; sha?: string; repo?: { fork?: boolean; full_name?: string } | null };
     additions?: number;
     deletions?: number;
-    body?: string | null;
-    created_at?: string;
-    user?: { login?: string } | null;
   }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
   if (!out.ok || !out.data.head?.ref || !out.data.head.sha) {
     throw new Error(out.ok ? "pull request has no head ref/sha" : `could not load pull request (${out.status}): ${out.text}`);
@@ -866,10 +867,6 @@ export async function fetchPullHeadRef(
     sameRepo: typeof headRepo === "string" && headRepo.toLowerCase() === `${owner}/${repo}`.toLowerCase(),
     additions: n(out.data.additions),
     deletions: n(out.data.deletions),
-    // PR-body directives are loop events too (at the PR's creation time, by its author).
-    body: out.data.body ?? null,
-    createdAt: typeof out.data.created_at === "string" ? out.data.created_at : undefined,
-    author: out.data.user?.login ?? undefined,
   };
 }
 

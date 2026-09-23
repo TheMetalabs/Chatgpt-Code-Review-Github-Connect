@@ -4,10 +4,12 @@
  * WHY: harbor jobs live in memory (a restart loses them), and a loop that re-anchored on every
  * re-issued `/review-loop` would see one round forever — the stuck classifier and the fix-round
  * budget could never fire. The session is therefore a pure fold over PR events that GitHub
- * persists (comments, reviews, the PR body), so every process and every restart agrees on it.
+ * persists (the App's records and markers, human stop comments, reviews), so every process and
+ * every restart agrees on it. Starts are the App's START RECORDS (placed at the directive's own
+ * time), never mutable human text — see readLoopEvents.
  *
  * CONTRACT
- * - A session STARTS at the first human start directive after the last terminal event, and
+ * - A session STARTS at the first recorded start after the last terminal event, and
  *   stays anchored there: re-issuing a start inside an active session only updates the mode and
  *   the starter (the apply-permission subject) — it never resets the round count.
  * - Terminal events END an active session: a human stop directive, the bot's ESCALATE marker,

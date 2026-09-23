@@ -27,6 +27,7 @@ import {
   parseEscalateMarker,
   parseFindingsTotal,
   parseReviewLoopDirective,
+  parseStartMarker,
   type EscalateReason,
   type RoundSummary,
 } from "./review-loop.ts";
@@ -48,13 +49,13 @@ export interface ReviewLoopGithub {
     owner: string,
     repo: string,
     pr: number,
-  ): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; body?: string }>>;
+  ): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; body?: string; updatedAt?: string }>>;
   listIssueComments(
     token: string,
     owner: string,
     repo: string,
     pr: number,
-  ): Promise<Array<{ userLogin: string; body: string; createdAt?: string }>>;
+  ): Promise<Array<{ userLogin: string; body: string; createdAt?: string; updatedAt?: string }>>;
   createIssueComment(
     token: string,
     opts: { owner: string; repo: string; pr: number; body: string },
@@ -331,28 +332,34 @@ export async function escalateNow(
 
 // ── Durable loop session (review-loop-session.ts) ─────────────────────────────
 
-/** The PR fields the session needs (from GET /pulls/{pr}): the body's start directive, and the
- * live head (a clean review of any other head cannot end the session unless the loop waits on it). */
+/** The PR fields the session needs (from GET /pulls/{pr}): the live head (a clean review of any
+ * other head cannot end the session unless the loop waits on it). */
 export interface LoopPrInfo {
-  body?: string | null;
-  createdAt?: string;
-  author?: string;
   sha?: string;
 }
 
-function pushDirective(events: LoopEvent[], body: string | null | undefined, at: string, actor: string): void {
-  const d = parseReviewLoopDirective(body);
-  if (d?.kind === "start") events.push({ at, kind: "start", mode: d.mode, actor });
-  else if (d?.kind === "stop") events.push({ at, kind: "stop", actor });
+/** A comment edited after it was created: its CURRENT text says nothing about what it said at
+ * creation, so it cannot place a directive in time (the webhook handles edits as they happen). */
+function edited(c: { createdAt?: string; updatedAt?: string }): boolean {
+  return isoMs(c.updatedAt) > isoMs(c.createdAt);
+}
+
+/** A human STOP directive in an unedited comment (a start is never read from human text). */
+function pushStop(events: LoopEvent[], c: { body?: string; createdAt?: string; updatedAt?: string; userLogin: string }): void {
+  if (!c.createdAt || edited(c)) return;
+  if (parseReviewLoopDirective(c.body)?.kind === "stop") events.push({ at: c.createdAt, kind: "stop", actor: c.userLogin });
 }
 
 /**
- * Collect the PR's loop events from durable history. Authorship is enforced HERE: a human (any
- * non-App author) contributes start/stop directives from issue comments, inline comments and the
- * PR body; ONLY the App contributes escalate / stopped markers, its canonical continuation for
- * THIS PR (the head the loop moved to), and converged (total=0) reviews with their commit.
- * A comment's event time is its creation time — a directive added later by EDITING an old
- * comment is not a session start (the webhook path may still run a review for it).
+ * Collect the PR's loop events from durable history. Authorship is enforced HERE:
+ * - STARTS come only from the App's start record (review-loop.ts startComment), posted when harbor
+ *   accepts a fresh start directive, at the directive's own event time. Mutable human text — a
+ *   comment body, the PR body — is never replayed as a start: an edit cannot plant a backdated one.
+ * - A human contributes STOP directives from UNEDITED issue and inline comments (at creation).
+ *   An edited stop, and a stop added to the PR body, reach the loop through the webhook at their
+ *   edit time; the App's STOPPED marker then makes them durable.
+ * - ONLY the App contributes escalate / stopped markers, its canonical continuation for THIS PR
+ *   (the head the loop moved to), and converged (total=0) reviews with their commit.
  * Reads fail closed: a list error throws (the caller must not act on a partial history).
  */
 export async function readLoopEvents(
@@ -373,20 +380,19 @@ export async function readLoopEvents(
   for (const c of issues) {
     if (!c.createdAt) continue;
     if (isSelfLogin(c.userLogin, botLogin)) {
-      const cont = canonicalContinuation(c.body, { authoredByBot: true });
-      if (parseEscalateMarker(c.body, { authoredByBot: true })) events.push({ at: c.createdAt, kind: "escalate" });
-      else if (isStoppedComment(c.body, { authoredByBot: true })) events.push({ at: c.createdAt, kind: "stopped" });
+      const bot = { authoredByBot: true };
+      const start = parseStartMarker(c.body, bot);
+      const cont = canonicalContinuation(c.body, bot);
+      if (start) events.push({ at: start.at, kind: "start", mode: start.mode, actor: start.by });
+      else if (parseEscalateMarker(c.body, bot)) events.push({ at: c.createdAt, kind: "escalate" });
+      else if (isStoppedComment(c.body, bot)) events.push({ at: c.createdAt, kind: "stopped" });
       else if (cont && cont.pr === pr) events.push({ at: c.createdAt, kind: "continue", head: cont.head });
     } else {
-      pushDirective(events, c.body, c.createdAt, c.userLogin);
+      pushStop(events, c);
     }
   }
   for (const c of inline) {
-    if (c.createdAt && !isSelfLogin(c.userLogin, botLogin)) pushDirective(events, c.body, c.createdAt, c.userLogin);
-  }
-  const prInfo = opts.pr;
-  if (prInfo?.createdAt && prInfo.author && !isSelfLogin(prInfo.author, botLogin)) {
-    pushDirective(events, prInfo.body, prInfo.createdAt, prInfo.author);
+    if (!isSelfLogin(c.userLogin, botLogin)) pushStop(events, c);
   }
   for (const r of reviews) {
     if (isSelfLogin(r.userLogin, botLogin) && r.submittedAt && parseFindingsTotal(r.body) === 0) {

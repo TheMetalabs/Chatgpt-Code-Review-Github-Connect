@@ -3,8 +3,9 @@
  *
  * Each call is ONE loop step for one posted review: either ESCALATE (stuck / budget spent) or
  * run one fix round and report it in-thread. The loop is PR STATE, derived from durable GitHub
- * history (review-loop-session.ts): a session starts at the first human start after the last
- * terminal signal and survives restarts and re-issued starts. The loop REPEATS because every
+ * history (review-loop-session.ts): a session starts at the first recorded start (the App's start
+ * record for a fresh human directive — startLoop) after the last terminal signal and survives
+ * restarts and re-issued starts. The loop REPEATS because every
  * new head in an active session gets a review — an applied round posts the fixed continuation
  * marker itself (review-loop.ts continueComment); a human push gets one from
  * continueLoopOnPush. A human stop directive ends the session (stopLoop acknowledges it with the
@@ -28,7 +29,7 @@
  * permission (design §2).
  * Everything is gated OFF by default:
  *   - env ASHLAR_FIX_AGENT=1 AND settings.fixAgent.provider != null (design §6b), AND
- *   - the PR has an ACTIVE loop session (durable: a human start after the last terminal), AND
+ *   - the PR has an ACTIVE loop session (durable: a recorded start after the last terminal), AND
  *   - github origin, same-repo (not a fork — the installation token cannot push to a fork),
  *     with findings on HEAD.
  *
@@ -58,8 +59,10 @@ import {
   isoMs,
   isSelfLogin,
   MAX_CONTINUE_ROUND,
+  parseStartMarker,
   resolveBotLogin,
   sanitizeUntrusted,
+  startComment,
   stoppedComment,
   type EscalateReason,
   type ReviewLoopMode,
@@ -111,8 +114,9 @@ const ALREADY_ESCALATED = "already escalated on this head";
 const STEP_IN_FLIGHT = "another loop step is in flight for this head";
 const NO_SESSION = "no active loop session";
 const STOPPED_QUIET = "loop stopped by operator";
-const NEWER_REQUEST = "superseded by a newer loop request (a new session, or apply downgraded to suggest)";
-const OWN_PUSH = "own push (the fix round continues the loop)";
+const ENDED_BY_HANDOFF = "the loop session ended with a handoff";
+const ENDED_CONVERGED = "the loop session converged";
+const NEWER_REQUEST = "superseded by a newer loop request (a new session, another starter, or apply downgraded to suggest)";
 /** NOT silent (logged): a concurrent handoff for this head outlived one backoff. */
 const HANDOFF_IN_FLIGHT = "a handoff for this head is still being posted by another loop step; this step did not run";
 
@@ -127,8 +131,9 @@ export const SILENT_REASONS: readonly string[] = [
   STEP_IN_FLIGHT,
   NO_SESSION,
   STOPPED_QUIET,
+  ENDED_BY_HANDOFF,
+  ENDED_CONVERGED,
   NEWER_REQUEST,
-  OWN_PUSH,
 ];
 
 /** Write-capable repository permissions (legacy field; `maintain` reports as `write`). */
@@ -143,6 +148,9 @@ const RETRYABLE = new Set<FixRoundResult["outcome"]>(["request-failed", "parse-f
  * before the history counts as unverifiable (a loop-error handoff). */
 const HISTORY_RETRY_DELAYS_MS = [3_000, 6_000, 12_000];
 const ESCALATE_BACKOFF_MS = 1500;
+/** Attempts for a control post (the continuation, the start record): a transient failure must
+ * not stall the loop. Each retry first re-scans, so a lost response never duplicates the post. */
+const POST_RETRY_DELAYS_MS = [0, 2_000, 5_000];
 const realSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -308,15 +316,23 @@ export function sanitizeModelText(text: string | undefined, opts: { oneLine?: bo
 
 /** Why a round became moot mid-flight: the head moved, the session ended, or a newer request
  * (a new session, or apply downgraded to suggest) took over. */
-type Moot = "head" | "stopped" | "newer";
+type Moot = "head" | "stopped" | "handoff" | "converged" | "newer";
 const MOOT_TEXT: Record<Moot, string> = {
   head: "the PR head moved",
   stopped: "the loop was stopped",
+  handoff: "the loop session ended with a handoff",
+  converged: "the loop session converged",
   newer: "a newer loop request took over",
 };
 
-/** How an applied round's report ends: continued, stopped by the operator, or why it could not. */
-type ContinuationStatus = { ok: true } | { ok: false; stopped: true } | { ok: false; error: string };
+/** Why an inactive session ended, as a moot reason (never guess "stopped" for a handoff). */
+function endedWhy(s: LoopSession): Exclude<Moot, "head" | "newer"> {
+  return s.endedBy === "escalate" ? "handoff" : s.endedBy === "converged" ? "converged" : "stopped";
+}
+
+/** How an applied round's report ends: continued, the session ended meanwhile (why), or why the
+ * next review could not be requested. */
+type ContinuationStatus = { ok: true } | { ok: false; ended: Exclude<Moot, "head"> } | { ok: false; error: string };
 
 function renderFixReport(res: FixRoundResult, mode: string, attempts: number, continuation?: ContinuationStatus): string {
   const files = (res.files ?? []).map((f) => `- \`${sanitizeModelText(f.path, { oneLine: true, max: 300 })}\``).join("\n");
@@ -326,8 +342,10 @@ function renderFixReport(res: FixRoundResult, mode: string, attempts: number, co
     case "applied": {
       const tail = !continuation || continuation.ok
         ? "Loop continues: the next review is requested on the new head."
-        : "stopped" in continuation
-          ? "Loop stopped by the operator: no further review is requested."
+        : "ended" in continuation
+          ? continuation.ended === "stopped"
+            ? "Loop stopped by the operator: no further review is requested."
+            : `The loop ended meanwhile (${MOOT_TEXT[continuation.ended]}): no further review is requested.`
           : `The next review could not be requested (${sanitizeModelText(continuation.error, { oneLine: true, max: 300 })}); see the loop handoff.`;
       return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha ?? "(unknown)"}\` (mode: ${mode}${tries}).\n\n${summary}\n\nChanged:\n${files}\n\n${tail}`;
     }
@@ -411,7 +429,7 @@ function ensureContinuation(
   gh: LoopRuntimeGithub,
   token: string,
   ref: PrRef,
-  c: { head: string; mode: ReviewLoopMode; sinceIso?: string; botLogin: string; round?: number },
+  c: { head: string; mode: ReviewLoopMode; sinceIso?: string; botLogin: string; round?: number; sleep?: (ms: number) => Promise<void> },
 ): Promise<ContinueOutcome> {
   if (!FULL_SHA_RE.test(c.head)) return Promise.resolve({ posted: false, error: "the head is not a full commit SHA" });
   const key = `${ref.owner}/${ref.repo}#${ref.pr}@${c.head}#${c.sinceIso ?? ""}`;
@@ -419,26 +437,32 @@ function ensureContinuation(
   if (running) return running;
   const run = (async (): Promise<ContinueOutcome> => {
     const sinceMs = isoMs(c.sinceIso);
-    const exists = await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).then(
-      (rows) =>
-        rows.some((r) => {
-          if (!isSelfLogin(r.userLogin, c.botLogin)) return false;
-          const k = canonicalContinuation(r.body, { authoredByBot: true });
-          return k?.pr === ref.pr && k.head === c.head && (Number.isNaN(sinceMs) || isoMs(r.createdAt) >= sinceMs);
-        }),
-      () => false,
-    );
-    if (exists) return { posted: false, exists: true };
-    try {
-      const round =
-        c.round ??
-        (await reconstructRounds(gh, token, ref.owner, ref.repo, ref.pr, { botLogin: c.botLogin, sinceIso: c.sinceIso }).catch(() => [])).length + 1;
-      const body = continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head });
-      await gh.createIssueComment(token, { owner: ref.owner, repo: ref.repo, pr: ref.pr, body });
-      return { posted: true };
-    } catch (e) {
-      return { posted: false, error: (e as Error)?.message ?? String(e) };
+    const exists = () =>
+      gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).then(
+        (rows) =>
+          rows.some((r) => {
+            if (!isSelfLogin(r.userLogin, c.botLogin)) return false;
+            const k = canonicalContinuation(r.body, { authoredByBot: true });
+            return k?.pr === ref.pr && k.head === c.head && (Number.isNaN(sinceMs) || isoMs(r.createdAt) >= sinceMs);
+          }),
+        () => false,
+      );
+    let error = "the continuation was not posted";
+    for (const wait of POST_RETRY_DELAYS_MS) {
+      if (wait) await (c.sleep ?? realSleep)(wait);
+      if (await exists()) return { posted: false, exists: true };
+      try {
+        const round =
+          c.round ??
+          (await reconstructRounds(gh, token, ref.owner, ref.repo, ref.pr, { botLogin: c.botLogin, sinceIso: c.sinceIso }).catch(() => [])).length + 1;
+        const body = continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head });
+        await gh.createIssueComment(token, { owner: ref.owner, repo: ref.repo, pr: ref.pr, body });
+        return { posted: true };
+      } catch (e) {
+        error = (e as Error)?.message ?? String(e);
+      }
     }
+    return { posted: false, error };
   })().finally(() => continuing.delete(key));
   continuing.set(key, run);
   return run;
@@ -516,7 +540,7 @@ export async function runPostReviewLoop(
       if (live.sha === headSha) return;
       const now = await sessionOf(gh, token, ref, live, botLogin).catch(() => null);
       if (!now?.active) return;
-      const r = await ensureContinuation(gh, token, ref, { head: live.sha, mode: now.mode ?? "suggest", sinceIso: now.startIso, botLogin });
+      const r = await ensureContinuation(gh, token, ref, { head: live.sha, mode: now.mode ?? "suggest", sinceIso: now.startIso, botLogin, sleep });
       trace(job.id, "superseded", { live: live.sha.slice(0, 7), continuation: r.posted ? "posted" : r.exists ? "exists" : `failed: ${r.error}` });
     };
     const head = await gh.fetchPullHeadRef(token, owner, repo, pr);
@@ -526,7 +550,14 @@ export async function runPostReviewLoop(
       await continueOn(head);
       return { ran: false, reason: SUPERSEDED };
     }
-    const session = await sessionOf(gh, token, ref, head, botLogin);
+    let session = await sessionOf(gh, token, ref, head, botLogin);
+    // This review was requested by a fresh human start whose record harbor could not post at
+    // admission: record it now (idempotent — an existing record, e.g. one a later stop ended,
+    // is never re-posted) and re-read.
+    if (!session.active && job.thread?.loop?.kind === "start") {
+      const started = await startLoop(token, { owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }, settings, d, env);
+      if (started.posted) session = await sessionOf(gh, token, ref, head, botLogin);
+    }
     if (!session.active) return { ran: false, reason: NO_SESSION };
     requested = true;
     sinceIso = session.startIso;
@@ -569,6 +600,19 @@ export async function runPostReviewLoop(
 
     // 2) One fix round on the head-pinned snapshot.
     const mode = effectiveLoopMode(session.mode, settings);
+    const starter = session.starter ?? "";
+    // Fail closed on a lookup failure; null = the starter may write.
+    const applyPermissionProblem = async (): Promise<string | null> => {
+      let permission: string;
+      try {
+        permission = await gh.fetchUserPermission(token, owner, repo, starter);
+      } catch (e) {
+        return `could not verify write permission for ${starter || "(unknown)"}: ${(e as Error)?.message ?? String(e)}`;
+      }
+      return WRITE_PERMISSIONS.has(permission)
+        ? null
+        : `apply requires write access; ${starter || "(unknown)"} has '${permission}' (re-run in suggest mode or by a maintainer)`;
+    };
     if (mode === "apply") {
       // Apply writes the head branch through THIS repository's API: only a POSITIVELY verified
       // same-repository head may be written (a fork, or unknown provenance such as a deleted head
@@ -582,17 +626,9 @@ export async function runPostReviewLoop(
         );
       }
       // Design §2: the loop WRITES code, so apply requires the session's starter (the latest
-      // human start) to hold write access. Fail closed on a lookup failure.
-      const starter = session.starter ?? "";
-      let permission: string;
-      try {
-        permission = await gh.fetchUserPermission(token, owner, repo, starter);
-      } catch (e) {
-        return await escalate("loop-error", `could not verify write permission for ${starter || "(unknown)"}: ${(e as Error)?.message ?? String(e)}`);
-      }
-      if (!WRITE_PERMISSIONS.has(permission)) {
-        return await escalate("loop-error", `apply requires write access; ${starter || "(unknown)"} has '${permission}' (re-run in suggest mode or by a maintainer)`);
-      }
+      // human start) to hold write access — checked here and again right before the commit.
+      const problem = await applyPermissionProblem();
+      if (problem) return await escalate("loop-error", problem);
     }
     // Editable set = the PR's CHANGED files only. sample.files also carries policy/reference
     // context fetched for the review; those stay read-only and never enter allowedPaths.
@@ -614,9 +650,11 @@ export async function runPostReviewLoop(
     const relevance = async (): Promise<Moot | null> => {
       if ((await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha) return "head";
       const now = await sessionOf(gh, token, ref, head, botLogin);
-      if (!now.active) return "stopped";
+      if (!now.active) return endedWhy(now);
       if (now.startIso !== session.startIso) return "newer";
-      if (mode === "apply" && effectiveLoopMode(now.mode, settings) !== "apply") return "newer";
+      // apply acts on the starter's authority: a re-issued start by someone else, or a downgrade
+      // to suggest, takes the round over
+      if (mode === "apply" && (effectiveLoopMode(now.mode, settings) !== "apply" || (now.starter ?? "") !== starter)) return "newer";
       return null;
     };
     let moot: Moot | undefined; // once a checkpoint finds the round moot it is never retried
@@ -629,6 +667,8 @@ export async function runPostReviewLoop(
     // a newer request already decides what comes next.
     const quietExit = async (why: Moot): Promise<LoopStepResult> => {
       if (why === "stopped") return { ran: false, reason: STOPPED_QUIET };
+      if (why === "handoff") return { ran: false, reason: ENDED_BY_HANDOFF };
+      if (why === "converged") return { ran: false, reason: ENDED_CONVERGED };
       if (why === "newer") return { ran: false, reason: NEWER_REQUEST };
       const live = await gh.fetchPullHeadRef(token, owner, repo, pr).catch(() => null);
       if (live) await continueOn(live);
@@ -637,11 +677,17 @@ export async function runPostReviewLoop(
     const before = await checkpoint();
     if (before) return await quietExit(before);
     // Re-verify relevance immediately before the commit path.
+    let authFailure: string | undefined; // write permission lost before the commit: a handoff
     const validate: FixValidate = async (candidate) => {
       const v = await d!.validate(candidate);
       if (!v.ok) return v;
       const why = await checkpoint();
-      return why ? { ok: false, error: `${MOOT_TEXT[why]} during the fix` } : { ok: true };
+      if (why) return { ok: false, error: `${MOOT_TEXT[why]} during the fix` };
+      if (mode === "apply") {
+        authFailure = (await applyPermissionProblem()) ?? undefined;
+        if (authFailure) return { ok: false, error: authFailure };
+      }
+      return { ok: true };
     };
     const maxAttempts = fixAttempts(env);
     const deps2 = d;
@@ -683,8 +729,10 @@ export async function runPostReviewLoop(
         },
       );
       trace(job.id, "fix-result", { attempt: attempts, outcome: res.outcome, ms: Date.now() - t0, error: res.error });
-      // A cancelled request or a refused commit (the round went moot) is never retried.
+      // A cancelled request or a refused commit (the round went moot) is never retried; neither is
+      // a commit refused because the starter lost write access.
       if (moot && res.outcome !== "applied") return await quietExit(moot);
+      if (authFailure && res.outcome !== "applied") return await escalate("loop-error", authFailure);
       if (!RETRYABLE.has(res.outcome) || attempts >= maxAttempts) break;
       const why = await checkpoint();
       if (why) return await quietExit(why);
@@ -701,21 +749,23 @@ export async function runPostReviewLoop(
       // not block: the next review re-checks it).
       const now = await sessionOf(gh, token, ref, newHead ? { ...head, sha: newHead } : head, botLogin).catch(() => null);
       let status: ContinuationStatus;
-      if (now && (!now.active || now.startIso !== session.startIso)) {
-        status = { ok: false, stopped: true };
+      if (now && !now.active) {
+        status = { ok: false, ended: endedWhy(now) };
+      } else if (now && now.startIso !== session.startIso) {
+        status = { ok: false, ended: "newer" };
       } else if (!newHead) {
         status = { ok: false, error: "the commit sha was not returned" };
       } else {
         // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
         // budget — the round-cap handoff.
-        const c = await ensureContinuation(gh, token, ref, { head: newHead, mode, sinceIso: session.startIso, botLogin, round: rounds.length + 1 });
+        const c = await ensureContinuation(gh, token, ref, { head: newHead, mode, sinceIso: session.startIso, botLogin, round: rounds.length + 1, sleep });
         status = c.posted || c.exists ? { ok: true } : { ok: false, error: c.error ?? "the continuation was not posted" };
       }
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status) }).catch(() => {
         /* the report is informational; the continuation / handoff carries the signal */
       });
       if (status.ok) trace(job.id, "continued", { commit: newHead?.slice(0, 7), round: rounds.length + 1 });
-      if (status.ok || "stopped" in status) {
+      if (status.ok || "ended" in status) {
         return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead ?? done.commitSha, continued: status.ok, attempts: tries };
       }
       const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
@@ -750,10 +800,13 @@ export async function runPostReviewLoop(
 /**
  * A push to a PR whose loop session is ACTIVE continues the loop: the driver posts the fixed
  * continuation marker so the next review runs on the pushed head (design §5 — the loop runs
- * until CONVERGED / ESCALATE / STOPPED, not one round per command). The App's own push is
- * skipped: its fix round posts the continuation itself. `pushedAt` (the webhook's PR updated_at)
- * places the push in the session, so a stale clean review of the previous head cannot end it.
- * Never throws.
+ * until CONVERGED / ESCALATE / STOPPED, not one round per command). The App's OWN push (a fix
+ * round's commit) goes the same way: that round normally posted the continuation already (then
+ * this is a no-op), and if it could not — a crash between the commit and the post — this repairs
+ * it. Posting retries with backoff; if the next review still cannot be requested, the loop ends
+ * in a fixed loop-error handoff for the pushed head, never a silent stall. `pushedAt` (the
+ * webhook's PR updated_at) places the push in the session, so a stale clean review of the
+ * previous head cannot end it. Never throws.
  */
 export async function continueLoopOnPush(
   token: string,
@@ -765,7 +818,6 @@ export async function continueLoopOnPush(
   try {
     if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
     const botLogin = ashlarBotLogin(env);
-    if (isSelfLogin(push.actor, botLogin)) return { posted: false, reason: OWN_PUSH };
     const d = deps ?? (await productionDeps(settings));
     const head = await d.gh.fetchPullHeadRef(token, push.owner, push.repo, push.pr);
     // A later push will continue with its own head; never request a review of a stale one.
@@ -775,12 +827,79 @@ export async function continueLoopOnPush(
     const moved = push.pushedAt ? [{ at: push.pushedAt, kind: "push" as const, head: push.headSha }] : [];
     const session = await readLoopSession(d.gh, token, push.owner, push.repo, push.pr, { botLogin, pr: head, extra: moved });
     if (!session.active) return { posted: false, reason: NO_SESSION };
-    const c = await ensureContinuation(d.gh, token, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, botLogin });
-    if (c.error) return { posted: false, reason: `continue on push failed: ${c.error}` };
-    return { posted: c.posted, reason: c.posted ? "continued" : "already continued" };
+    const c = await ensureContinuation(d.gh, token, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, botLogin, sleep: d.sleep });
+    if (!c.error) return { posted: c.posted, reason: c.posted ? "continued" : "already continued" };
+    // The next review cannot be requested: end the loop with the fixed handoff instead of stalling.
+    const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso }).catch(() => []);
+    const handoff = await escalateNow(d.gh, token, {
+      owner: push.owner,
+      repo: push.repo,
+      pr: push.pr,
+      head: push.headSha,
+      reason: "loop-error",
+      detail: `the pushed head's review could not be requested: ${c.error}`,
+      rounds,
+      roundCap: roundCap(env),
+      botLogin,
+      sinceIso: session.startIso,
+    });
+    const tail = handoff.escalated ? "; handoff posted" : handoff.error ? `; handoff failed: ${handoff.error}` : "";
+    return { posted: false, reason: `continue on push failed: ${c.error}${tail}` };
   } catch (e) {
     return { posted: false, reason: `continue on push failed: ${(e as Error)?.message ?? String(e)}` };
   }
+}
+
+/** Same recorded start: requester, directive time (as an instant) and mode. */
+function sameStart(a: { mode: string; by: string; at: string } | null, b: { mode: string; by: string; at: string }): boolean {
+  return !!a && a.mode === b.mode && a.by.toLowerCase() === b.by.toLowerCase() && isoMs(a.at) === isoMs(b.at);
+}
+
+/**
+ * Record a loop START (the durable start event, review-loop.ts startComment): harbor calls this
+ * when it ADMITS a review for a fresh human start directive, and a loop step for that review
+ * repairs a record that could not be posted then. The record carries the requester and the
+ * directive's own event time, is posted at most once per (requester, time, mode) — every retry
+ * re-scans first — and retries with backoff. Never throws.
+ */
+export async function startLoop(
+  token: string,
+  start: { owner: string; repo: string; pr: number; actor: string; mode: ReviewLoopMode; at: string },
+  settings: BotSettings,
+  deps?: LoopRuntimeDeps,
+  env: NodeJS.ProcessEnv | undefined = envOf(),
+): Promise<{ posted: boolean; reason: string }> {
+  try {
+    if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
+    const botLogin = ashlarBotLogin(env);
+    if (isSelfLogin(start.actor, botLogin)) return { posted: false, reason: "bot-authored start ignored" };
+    const record = { mode: start.mode, by: start.actor, at: start.at };
+    const body = startComment(record); // throws on a malformed field → "start failed"
+    const d = deps ?? (await productionDeps(settings));
+    let error = "the start record was not posted";
+    for (const wait of POST_RETRY_DELAYS_MS) {
+      if (wait) await (d.sleep ?? realSleep)(wait);
+      const rows = await d.gh.listIssueComments(token, start.owner, start.repo, start.pr).catch(() => null);
+      if (rows?.some((r) => isSelfLogin(r.userLogin, botLogin) && sameStart(parseStartMarker(r.body, { authoredByBot: true }), record))) {
+        return { posted: false, reason: "start already recorded" };
+      }
+      try {
+        await d.gh.createIssueComment(token, { owner: start.owner, repo: start.repo, pr: start.pr, body });
+        return { posted: true, reason: "started" };
+      } catch (e) {
+        error = (e as Error)?.message ?? String(e);
+      }
+    }
+    return { posted: false, reason: `start failed: ${error}` };
+  } catch (e) {
+    return { posted: false, reason: `start failed: ${(e as Error)?.message ?? String(e)}` };
+  }
+}
+
+/** The directive time a job's start record carries: the webhook's event time, else the job's
+ * ingest time (both precede the review the start requested). */
+export function loopStartAt(job: Pick<Job, "thread" | "createdAt">): string {
+  return job.thread?.eventAt ?? new Date(job.createdAt).toISOString();
 }
 
 // In-process serialization so concurrent stop deliveries for one PR post STOPPED at most once

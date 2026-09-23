@@ -9,7 +9,7 @@ import {
   reconstructRounds,
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
-import { continueComment } from "./review-loop.ts";
+import { continueComment, startComment } from "./review-loop.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 
@@ -344,38 +344,59 @@ describe("escalateNow: one handoff per head per session, even when the history i
 
 describe("durable loop events: authorship is enforced when reading history", () => {
   const bot = "ashlar-bot-review-loop[bot]";
-  const gh = (issues: Array<{ userLogin: string; body: string; createdAt: string }>, inline: Array<{ userLogin: string; body: string; createdAt: string }> = [], reviews: Array<{ userLogin: string; body: string; submittedAt: string }> = []) => ({
+  type Row = { userLogin: string; body: string; createdAt: string; updatedAt?: string };
+  const recorded = (mode: "apply" | "suggest", by: string, at: string) => ({ userLogin: bot, body: startComment({ mode, by, at }), createdAt: at });
+  const gh = (issues: Row[], inline: Row[] = [], reviews: Array<{ userLogin: string; body: string; submittedAt: string }> = []) => ({
     async listIssueComments() { return issues; },
     async listReviewComments() { return inline.map((c) => ({ ...c, path: "a.ts", commitId: "c" })); },
     async listPullReviews() { return reviews.map((r) => ({ ...r, commitId: "c" })); },
     async createIssueComment() { return { id: 1 }; },
   });
 
-  it("humans contribute start/stop (issue + inline + PR body); only the App contributes markers and CONVERGED", async () => {
+  it("starts come ONLY from the App's start record; humans contribute stops; the App contributes markers and CONVERGED", async () => {
     const g = gh(
       [
-        { userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-01T00:00:00Z" },
+        recorded("apply", "alice", "2026-01-01T00:00:00Z"),
+        { userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-01T00:00:00Z" }, // human text: NOT a start
+        { userLogin: "mallory", body: startComment({ mode: "apply", by: "mallory", at: "2025-01-01T00:00:00Z" }), createdAt: "2026-01-01T00:30:00Z" }, // human copy: NOT a start
         { userLogin: bot, body: "quoting /review-loop apply in a report", createdAt: "2026-01-01T01:00:00Z" }, // bot prose: NOT a start
         { userLogin: bot, body: "<!-- ashlar-loop-escalate reason=round-cap round=6 pr=1 head=x -->", createdAt: "2026-01-02T00:00:00Z" },
         { userLogin: "mallory", body: "<!-- ashlar-loop-stopped -->", createdAt: "2026-01-02T01:00:00Z" }, // human marker: NOT stopped
         { userLogin: "bob", body: "/review-loop stop", createdAt: "2026-01-03T00:00:00Z" },
       ],
-      [{ userLogin: "carol", body: "looks good, please run /review-loop", createdAt: "2026-01-04T00:00:00Z" }],
+      [{ userLogin: "carol", body: "please /review-loop stop", createdAt: "2026-01-04T00:00:00Z" }],
       [
         { userLogin: bot, body: "<!-- ashlar-findings total=0 -->", submittedAt: "2026-01-05T00:00:00Z" },
         { userLogin: "mallory", body: "<!-- ashlar-findings total=0 -->", submittedAt: "2026-01-05T01:00:00Z" }, // spoof: NOT converged
       ],
     );
-    const events = await readLoopEvents(g as never, "t", "o", "r", 1, { pr: { body: "/review-loop", createdAt: "2025-12-31T00:00:00Z", author: "dave" } });
+    const events = await readLoopEvents(g as never, "t", "o", "r", 1);
     const kinds = events.map((e) => `${e.kind}@${e.at}${e.actor ? `:${e.actor}` : ""}${e.mode ? `:${e.mode}` : ""}`).sort();
     assert.deepEqual(kinds, [
       "converged@2026-01-05T00:00:00Z",
       "escalate@2026-01-02T00:00:00Z",
-      "start@2025-12-31T00:00:00Z:dave:suggest",
       "start@2026-01-01T00:00:00Z:alice:apply",
-      "start@2026-01-04T00:00:00Z:carol:suggest",
       "stop@2026-01-03T00:00:00Z:bob",
+      "stop@2026-01-04T00:00:00Z:carol",
     ]);
+  });
+
+  it("an EDITED comment is never replayed at its creation time (it cannot backdate a stop or a start)", async () => {
+    const g = gh(
+      [
+        recorded("apply", "alice", "2026-01-02T00:00:00Z"),
+        // a benign comment from before the session, edited later to a stop / a start
+        { userLogin: "bob", body: "/review-loop stop", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-03T00:00:00Z" },
+        { userLogin: "bob", body: "/review-loop apply", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-03T00:00:00Z" },
+      ],
+      [{ userLogin: "carol", body: "/review-loop stop", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-04T00:00:00Z" }],
+    );
+    const events = await readLoopEvents(g as never, "t", "o", "r", 1);
+    assert.deepEqual(events.map((e) => e.kind), ["start"], "only the recorded start");
+    assert.equal((await readLoopSession(g as never, "t", "o", "r", 1)).active, true);
+    // an unedited stop (updated_at equal to created_at) still counts
+    const plain = gh([recorded("apply", "alice", "2026-01-02T00:00:00Z"), { userLogin: "bob", body: "/review-loop stop", createdAt: "2026-01-03T00:00:00Z", updatedAt: "2026-01-03T00:00:00Z" }]);
+    assert.equal((await readLoopSession(plain as never, "t", "o", "r", 1)).endedBy, "stop");
   });
 
   it("the App's canonical continuation for THIS PR is a head move; a clean review carries its commit", async () => {
@@ -383,7 +404,7 @@ describe("durable loop events: authorship is enforced when reading history", () 
     const cont = (pr: number, head = live) => continueComment({ mode: "apply", round: 2, pr, head });
     const g = gh(
       [
-        { userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-01T00:00:00Z" },
+        recorded("apply", "alice", "2026-01-01T00:00:00Z"),
         { userLogin: bot, body: cont(1), createdAt: "2026-01-02T00:00:00Z" },
         { userLogin: bot, body: cont(2, "c".repeat(40)), createdAt: "2026-01-02T00:00:01Z" }, // another PR: NOT a head move here
         { userLogin: bot, body: `${cont(1, "d".repeat(40))}\n\nquoted in a report`, createdAt: "2026-01-02T00:00:02Z" }, // not canonical
@@ -403,7 +424,7 @@ describe("durable loop events: authorship is enforced when reading history", () 
   });
 
   it("readLoopSession folds history + injected events (a stop the list API has not caught up with)", async () => {
-    const g = gh([{ userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-01T00:00:00Z" }]);
+    const g = gh([recorded("apply", "alice", "2026-01-01T00:00:00Z")]);
     assert.equal((await readLoopSession(g as never, "t", "o", "r", 1)).active, true);
     const stopped = await readLoopSession(g as never, "t", "o", "r", 1, { extra: [{ at: "2026-01-02T00:00:00Z", kind: "stop", actor: "bob" }] });
     assert.equal(stopped.endedBy, "stop");
@@ -430,7 +451,9 @@ describe("round-3: instants, not strings; the trailing findings marker only", ()
   it("a review that QUOTES a zero marker before its trailing count is not a clean round", async () => {
     const body = "### Ashlar Review\n- finding quoting <!-- ashlar-findings total=0 --> in prose\n<!-- ashlar-findings total=2 inline=2 -->";
     const gh = {
-      async listIssueComments() { return [{ userLogin: "alice", body: "/review-loop apply", createdAt: "2026-01-01T00:00:00Z" }]; },
+      async listIssueComments() {
+        return [{ userLogin: BOT, body: startComment({ mode: "apply", by: "alice", at: "2026-01-01T00:00:00Z" }), createdAt: "2026-01-01T00:00:00Z" }];
+      },
       async listReviewComments() { return []; },
       async listPullReviews() { return [{ userLogin: BOT, body, commitId: A, submittedAt: "2026-01-02T00:00:00Z" }]; },
       async createIssueComment() { return { id: 1 }; },

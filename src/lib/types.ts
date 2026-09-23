@@ -79,6 +79,8 @@ export interface JobThread {
   userText: string;
   /** Parsed `/review-loop*` directive when the trigger body carried one (design §2). */
   loop?: ReviewLoopDirective;
+  /** When the directive happened (the webhook's event time): a recorded loop start carries it. */
+  eventAt?: string;
 }
 
 export interface Job {

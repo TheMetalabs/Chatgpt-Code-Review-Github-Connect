@@ -37,6 +37,8 @@ import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger,
 import {
   ashlarBotLogin,
   continueLoopOnPush,
+  loopStartAt,
+  startLoop,
   loopEnabled,
   runPostReviewLoop,
   SILENT_REASONS,
@@ -614,6 +616,9 @@ async function playGithub(jobId: string, untrustedBody: string) {
   // available to reviewers, not merely that a webhook was received.
   const admitted = current();
   if (admitted) void reactQuiet(token, admitted, "eyes");
+  // A fresh human start directive whose review is ADMITTED is recorded as the loop start (the
+  // durable start event — review-loop.ts startComment), long before its review can finish.
+  if (admitted?.origin === "github" && admitted.thread?.loop?.kind === "start") recordLoopStart(token, admitted);
   void watchReviewers(jobId, token);
   if (providers.includes("local")) {
     // The loop reads files from this snapshot; harmless for single-turn mode (unused there).
@@ -1323,6 +1328,17 @@ export function fireHarbor(opts: HarborFireOpts): HarborFireResult {
  * stop directive ends it — live loop reviews are cancelled and the fixed STOPPED marker is
  * posted once. Fire-and-forget; a redelivered webhook never repeats the side effect.
  */
+function recordLoopStart(token: string, job: Job): void {
+  if (job.thread?.loop?.kind !== "start") return;
+  const start = { owner: job.owner, repo: job.repo, pr: job.pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) };
+  void startLoop(token, start, state.settings).then(
+    (r) => {
+      if (!r.posted && /failed/.test(r.reason)) console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${r.reason}`);
+    },
+    (e) => console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${formatGithubError(e)}`),
+  );
+}
+
 function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>, { kind: "review" }>, deliveryId: string) {
   if (!loopEnabled(state.settings) || parsed.installationId === undefined) return;
   const redelivery =
@@ -1344,6 +1360,9 @@ function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>,
     run(`continue ${owner}/${repo}#${pr}`, (token) =>
       continueLoopOnPush(token, { owner, repo, pr, headSha, actor: parsed.actor, pushedAt: parsed.eventAt }, state.settings));
   } else if (parsed.thread?.loop?.kind === "stop") {
+    // Cancel the LOOP's own review work: jobs a loop directive or the driver's continuation
+    // requested. A plain review a human explicitly asked for still runs and posts — it cannot fix
+    // or continue anything, since its loop step finds the session ended by this stop.
     for (const j of state.jobs) {
       if (j.owner === owner && j.repo === repo && j.pr === pr && isLive(j.status) && j.thread?.loop?.kind === "start") {
         cancelHarborJob(j.id);

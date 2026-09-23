@@ -317,3 +317,24 @@ describe("round-cap handoff keeps the trend pattern in its detail", () => {
     assert.match(posted[0], /Detail: fix-round budget spent; the finding trend also shows whack-a-mole/);
   });
 });
+
+describe("escalateNow: one handoff per head per session, even when the history is unreadable", () => {
+  const bot = "ashlar-bot-review-loop[bot]";
+  it("a sequential redelivery with a failing history read does not post a duplicate", async () => {
+    const posted: string[] = [];
+    const gh = {
+      async listPullReviews() { return []; },
+      async listReviewComments() { return []; },
+      async listIssueComments(): Promise<Array<{ userLogin: string; body: string }>> { throw new Error("502"); },
+      async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
+    };
+    const opts = { owner: "o", repo: "r", pr: 9, head: "e".repeat(40), reason: "fix-failed" as const, detail: "x", rounds: [], roundCap: 5, sinceIso: "2026-01-01T00:00:00Z" };
+    assert.equal((await escalateNow(gh as never, "t", opts)).escalated, true);
+    assert.equal((await escalateNow(gh as never, "t", opts)).escalated, false);
+    assert.equal(posted.length, 1);
+    // a NEW session (a later anchor) on the same head may hand off again
+    assert.equal((await escalateNow(gh as never, "t", { ...opts, sinceIso: "2026-02-01T00:00:00Z" })).escalated, true);
+    assert.equal(posted.length, 2);
+    void bot;
+  });
+});

@@ -20,8 +20,13 @@ import { commitFiles, type GitDataApi } from "./fix-commit.ts";
 
 export type FixMode = "suggest" | "apply";
 
-/** Provider transport: given the fix prompt, return the raw model reply. Injected. */
-export type RequestFix = (prompt: string, signal?: AbortSignal) => Promise<string>;
+/** Provider transport: given the fix prompt, return the raw model reply. Injected. `ctl` lets the
+ * caller abort the call and observe the provider's phase (queued vs generating), so deadlines can
+ * exclude queue time and a stale request can be cancelled (fix-request-watch.ts). */
+export type RequestFix = (
+  prompt: string,
+  ctl?: { signal?: AbortSignal; onActivity?: (phase: "queued" | "generating") => void },
+) => Promise<string>;
 
 export interface FixRoundResult {
   ok: boolean;

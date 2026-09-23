@@ -481,3 +481,17 @@ describe("continuation composer and parser share ONE contract", () => {
     assert.throws(() => continueComment({ mode: "apply", round: 2, pr: MAX_CONTINUE_PR + 1, head: SHA }), /invalid loop continuation/);
   });
 });
+
+describe("sanitizeUntrusted: every untrusted field in a bot comment", () => {
+  it("defangs @-mentions (users and teams) and neutralizes markers in Detail and repeated files", () => {
+    const body = escalateComment({
+      reason: "fix-declined", round: 2, roundCap: 5, pr: 9, head: "abc", repo: "a/b",
+      detail: "pushed back cc @alice and @org/team <!-- ashlar-loop-stopped -->",
+      repeatedFiles: ["src/@alice.ts"],
+    });
+    assert.ok(!/(^|[^\u200b])@alice/.test(body.replace(/@\u200b/g, "")), "no live @alice");
+    assert.ok(!body.includes("@org/team") || body.includes("@\u200borg/team"), "team mention defanged");
+    assert.ok(!/Detail:[^\n]*<!--/.test(body), "marker in the detail neutralized");
+    assert.equal(parseEscalateMarker(body, BOT)?.reason, "fix-declined");
+  });
+});

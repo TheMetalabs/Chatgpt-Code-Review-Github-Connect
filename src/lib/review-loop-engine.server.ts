@@ -48,7 +48,7 @@ export interface ReviewLoopGithub {
     owner: string,
     repo: string,
     pr: number,
-  ): Promise<Array<{ userLogin: string; body: string }>>;
+  ): Promise<Array<{ userLogin: string; body: string; createdAt?: string }>>;
   createIssueComment(
     token: string,
     opts: { owner: string; repo: string; pr: number; body: string },
@@ -130,7 +130,9 @@ export async function reconstructRounds(
   }));
 }
 
-/** True if a bot-authored escalate handoff for this head already exists (idempotency). */
+/** True if a bot-authored escalate handoff for this head already exists IN THIS SESSION
+ * (idempotency). A handoff from an earlier, finished session must not silence a new one: a
+ * human who re-runs the loop on the same head after an ESCALATE gets a fresh handoff. */
 async function alreadyEscalated(
   gh: ReviewLoopGithub,
   token: string,
@@ -139,13 +141,31 @@ async function alreadyEscalated(
   pr: number,
   head: string,
   botLogin: string,
+  sinceIso?: string,
 ): Promise<boolean> {
   const issues = await gh.listIssueComments(token, owner, repo, pr);
   for (const c of issues) {
+    if (sinceIso && c.createdAt && c.createdAt < sinceIso) continue;
     const parsed = parseEscalateMarker(c.body, { authoredByBot: isBot(c.userLogin, botLogin) });
     if (parsed && parsed.head === head) return true; // full-SHA equality
   }
   return false;
+}
+
+// Handoffs THIS process posted (key includes the session anchor), consulted ONLY when the GitHub
+// history cannot be read: a sequential redelivery for the same head and session is then a no-op.
+// Bounded and pruned by age. Cross-process dedup stays a documented NON-GOAL (single instance).
+const postedHandoffs = new Map<string, number>();
+const POSTED_HANDOFF_TTL_MS = 24 * 60 * 60_000;
+const POSTED_HANDOFF_MAX = 500;
+
+function rememberHandoff(key: string, now: number): void {
+  postedHandoffs.set(key, now);
+  if (postedHandoffs.size <= POSTED_HANDOFF_MAX) return;
+  for (const [k, at] of postedHandoffs) {
+    if (now - at > POSTED_HANDOFF_TTL_MS || postedHandoffs.size > POSTED_HANDOFF_MAX) postedHandoffs.delete(k);
+    else break;
+  }
 }
 
 export interface EscalateResult {
@@ -222,7 +242,7 @@ async function maybeEscalateInner(
     }
     const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
     if (!reasonPeek) return { escalated: false, rounds };
-    escalatedBefore = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin);
+    escalatedBefore = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso);
   } catch (e) {
     return { escalated: false, rounds: [], error: (e as Error)?.message ?? String(e) };
   }
@@ -266,18 +286,24 @@ export async function escalateNow(
     roundCap: number;
     diffLines?: number;
     botLogin?: string;
+    /** Session anchor: only handoffs posted in this session count for idempotency. */
+    sinceIso?: string;
   },
 ): Promise<{ escalated: boolean; error?: string }> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
+  const sessionKey = `${key}#${opts.sinceIso ?? ""}`;
   if (inFlightEscalate.has(key)) return { escalated: false, error: ESCALATE_IN_FLIGHT };
   inFlightEscalate.add(key);
   try {
     let before = false;
     try {
-      before = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin);
+      before = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso);
     } catch {
-      before = false; // unreadable history: post anyway (see above)
+      // Unreadable history: fall back to what THIS process posted for this head + session (a
+      // sequential redelivery is then a no-op); otherwise post rather than end the loop without
+      // its signal. The GitHub marker scan stays the source of truth whenever it is readable.
+      before = postedHandoffs.has(sessionKey);
     }
     if (before) return { escalated: false };
     const body = escalateFromRounds(opts.reason, opts.rounds, {
@@ -289,6 +315,7 @@ export async function escalateNow(
       detail: opts.detail,
     });
     await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
+    rememberHandoff(sessionKey, Date.now());
     return { escalated: true };
   } catch (e) {
     return { escalated: false, error: (e as Error)?.message ?? String(e) };

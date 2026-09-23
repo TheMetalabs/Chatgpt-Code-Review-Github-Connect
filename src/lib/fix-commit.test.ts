@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { commitFiles, type GitDataApi } from "./fix-commit.ts";
+import { BranchMovedError, commitFiles, type GitDataApi } from "./fix-commit.ts";
 
 function fakeApi(): { api: GitDataApi; calls: string[] } {
   const calls: string[] = [];
@@ -72,5 +72,51 @@ describe("commitFiles", () => {
     assert.equal(res.ok, false);
     if (!res.ok) assert.match(res.error, /tree API 422/);
     assert.ok(!calls.some((c) => c.startsWith("ref(")), "branch ref must not move on failure");
+  });
+});
+
+describe("commitFiles retry (transport-level, never re-requests the model)", () => {
+  const files = [{ path: "a.ts", content: "x" }];
+  const opts = { branch: "feature", baseCommitSha: "base1", message: "m", files };
+  function api(opts2: { failFirstRef?: boolean; lostResponse?: boolean; moved?: boolean }) {
+    let refCalls = 0;
+    let ref = "base1";
+    let n = 0;
+    return {
+      get refCalls() { return refCalls; },
+      api: {
+        async baseTreeSha() { return "tree"; },
+        async createBlob() { return "blob"; },
+        async createTree() { return "tree2"; },
+        async createCommit() { n += 1; return `commit${n}`; },
+        async updateBranchRef(_b: string, sha: string, expected: string) {
+          refCalls += 1;
+          if (opts2.moved) throw new BranchMovedError("branch moved (someone else)");
+          if (ref !== expected) throw new BranchMovedError("branch moved");
+          if (opts2.lostResponse && refCalls === 1) { ref = sha; throw new Error("socket hang up"); }
+          if (opts2.failFirstRef && refCalls === 1) throw new Error("502 bad gateway");
+          ref = sha;
+        },
+        async readBranchRef() { return ref; },
+      },
+    };
+  }
+  it("a transient failure is retried once and lands", async () => {
+    const a = api({ failFirstRef: true });
+    const r = await commitFiles(a.api, opts);
+    assert.deepEqual(r, { ok: true, commitSha: "commit2" });
+    assert.equal(a.refCalls, 2);
+  });
+  it("a ref update whose response was LOST is recognized, not repeated", async () => {
+    const a = api({ lostResponse: true });
+    const r = await commitFiles(a.api, opts);
+    assert.deepEqual(r, { ok: true, commitSha: "commit1" });
+    assert.equal(a.refCalls, 1, "no second write");
+  });
+  it("a real branch move is never retried over", async () => {
+    const a = api({ moved: true });
+    const r = await commitFiles(a.api, opts);
+    assert.equal(r.ok, false);
+    assert.equal(a.refCalls, 1);
   });
 });

@@ -80,6 +80,7 @@ function settings(mode: "suggest" | "apply" = "suggest"): BotSettings {
 function fakeDeps(
   opts: {
     failContinuation?: boolean; // the continuation comment POST fails
+    sameRepo?: boolean; // head-repository provenance (default: verified same repo)
     requestDelayMs?: number; // the fix request takes this long (concurrency tests)
     rounds?: number[];
     reply?: string | string[]; // one reply per attempt (last repeats)
@@ -137,7 +138,7 @@ function fakeDeps(
         headReads += 1;
         // movedDuringFix: the first read (pre-fix) matches, every later re-check does not
         const sha = moved || (opts.movedDuringFix && headReads > 1) ? "m".repeat(40) : (opts.liveSha ?? HEAD);
-        return { ref: "feature", sha, fork: false, additions: opts.additions, deletions: opts.deletions };
+        return { ref: "feature", sha, fork: false, sameRepo: opts.sameRepo ?? true, additions: opts.additions, deletions: opts.deletions };
       },
       gitDataApi() {
         return {
@@ -360,7 +361,7 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
   it("apply on a fork PR hands off (loop-error); suggest on a fork still proposes", async () => {
     const fork = (f: ReturnType<typeof fakeDeps>) => {
       const orig = f.deps.gh.fetchPullHeadRef;
-      f.deps.gh.fetchPullHeadRef = async (...a) => ({ ...(await orig(...a)), fork: true });
+      f.deps.gh.fetchPullHeadRef = async (...a) => ({ ...(await orig(...a)), fork: true, sameRepo: false });
       return f;
     };
     const a = fork(fakeDeps({ rounds: [3] }));
@@ -373,13 +374,16 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.ok(rs.ran && rs.step === "fix" && rs.outcome === "suggested");
   });
 
-  it("K1: a head that moved before the fix = superseded (quiet: the newer head drives the loop)", async () => {
-    const f = fakeDeps({ rounds: [3], liveSha: "a".repeat(40) });
+  it("K1: a head that moved before the fix = superseded; the loop continues on the LIVE head", async () => {
+    const live = "a".repeat(40);
+    const f = fakeDeps({ rounds: [3], liveSha: live });
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
     assert.deepEqual(r, { ran: false, reason: "superseded (head moved)" });
-    assert.equal(f.posted.length, 0);
+    assert.equal(f.posted.length, 1, "only the continuation for the live head");
+    assert.equal(parseContinueMarker(f.posted[0], { authoredByBot: true })?.head, live);
     assert.equal(f.committed, false);
+    assert.equal(f.prompts.length, 0, "no fix for a stale head");
   });
 
   it("K1: a head move DURING the fix is caught before the commit and is quiet (superseded)", async () => {
@@ -513,19 +517,20 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
   it("a fix request past its deadline is aborted, retried, then handed off (fix-failed) — never a silent wait", async () => {
     const f = fakeDeps({ rounds: [3] });
     let aborted = 0;
-    f.deps.requestFix = (_p, signal) =>
+    f.deps.requestFix = (_p, ctl) =>
       new Promise<string>((_resolve, reject) => {
-        signal?.addEventListener("abort", () => {
+        ctl?.signal?.addEventListener("abort", () => {
           aborted += 1;
           reject(new Error("aborted"));
         });
       });
     f.deps.fixTimeoutMs = 10;
+    f.deps.fixWatch = { tickMs: 5 };
     const j = job({}, "apply");
     const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
     assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed");
     assert.equal(aborted, 2, "each attempt's provider call is aborted at the deadline");
-    assert.match(escalations(f.posted)[0], /request-failed after 2 attempt\(s\): fix request exceeded its/);
+    assert.match(escalations(f.posted)[0], /request-failed after 2 attempt\(s\): fix generation exceeded its/);
   });
 });
 
@@ -584,5 +589,65 @@ describe("helpers", () => {
     assert.equal((await builtinValidate([{ path: "a.ts", content: "  " }])).ok, false);
     assert.equal((await builtinValidate([{ path: "cfg.json", content: "{bad" }])).ok, false);
     assert.equal((await builtinValidate([{ path: "cfg.json", content: '{"ok":1}' }, { path: "a.ts", content: "x" }])).ok, true);
+  });
+});
+
+describe("round-2 hardening: provenance, stale heads, queue-aware fix requests", () => {
+  it("apply refuses a head whose repository is not POSITIVELY the same repo (unknown provenance)", async () => {
+    const f = fakeDeps({ rounds: [3], sameRepo: false });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error");
+    assert.match(escalations(f.posted)[0], /verified same-repository head/);
+    assert.equal(f.prompts.length, 0);
+    assert.equal(f.committed, false);
+    // suggest never writes: provenance does not gate it
+    const s2 = fakeDeps({ rounds: [3], sameRepo: false });
+    const rs = await runPostReviewLoop("t", job(), sample, settings("suggest"), [job()], s2.deps, ENV_ON);
+    assert.ok(rs.ran && rs.step === "fix" && rs.outcome === "suggested");
+  });
+
+  it("a STALE clean review never ends the loop: the live head's review is requested", async () => {
+    const live = "b".repeat(40);
+    const f = fakeDeps({ rounds: [2, 0], liveSha: live });
+    const j = job({ findings: [] }, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.deepEqual(r, { ran: false, reason: "superseded (head moved)" });
+    const cont = f.posted.map((b) => parseContinueMarker(b, { authoredByBot: true })).find(Boolean);
+    assert.equal(cont?.head, live, "continuation targets the live head");
+  });
+
+  it("a clean review of the LIVE head is CONVERGED (quiet)", async () => {
+    const f = fakeDeps({ rounds: [2, 0] });
+    const r = await runPostReviewLoop("t", job({ findings: [] }), sample, settings(), [job()], f.deps, ENV_ON);
+    assert.deepEqual(r, { ran: false, reason: "no findings (converged)" });
+    assert.equal(f.posted.length, 0);
+  });
+
+  it("a queued fix request whose head moved is cancelled (no generation wasted, quiet superseded)", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    let aborted = false;
+    let reads = 0;
+    const orig = f.deps.gh.fetchPullHeadRef;
+    f.deps.gh.fetchPullHeadRef = async (...a) => {
+      reads += 1;
+      const h = await orig(...a);
+      return reads >= 3 ? { ...h, sha: "c".repeat(40) } : h; // the head moves while the fix is queued
+    };
+    f.deps.fixReportsActivity = true;
+    f.deps.fixWatch = { tickMs: 5, checkEveryMs: 10 };
+    f.deps.requestFix = (_p, ctl) =>
+      new Promise<string>((_resolve, reject) => {
+        ctl?.onActivity?.("queued");
+        ctl?.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("aborted"));
+        });
+      });
+    const j = job({}, "apply");
+    const r = await runPostReviewLoop("t", j, sample, settings("apply"), [j], f.deps, ENV_ON);
+    assert.deepEqual(r, { ran: false, reason: "superseded (head moved)" });
+    assert.equal(aborted, true, "the queued provider call was aborted");
+    assert.equal(escalations(f.posted).length, 0);
   });
 });

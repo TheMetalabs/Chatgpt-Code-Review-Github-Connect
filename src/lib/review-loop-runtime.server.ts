@@ -30,11 +30,14 @@
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import type { GitDataApi } from "./fix-commit.ts";
 import type { FixFile } from "./fix-apply.ts";
+import { watchFixRequest } from "./fix-request-watch.ts";
+import { localLivenessMs } from "./local-leg-activity.ts";
 import {
   CURRENT_ROUND_MISSING,
   ESCALATE_IN_FLIGHT,
   escalateNow,
   maybeEscalate,
+  reconstructRounds,
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
 import {
@@ -42,8 +45,8 @@ import {
   fixingComment,
   isSelfLogin,
   MAX_CONTINUE_ROUND,
-  neutralizeMarkers,
   resolveBotLogin,
+  sanitizeUntrusted,
   type EscalateReason,
   type RoundSummary,
 } from "./review-loop.ts";
@@ -53,6 +56,8 @@ export interface PullHead {
   ref: string;
   sha: string;
   fork: boolean;
+  /** POSITIVE provenance: the head repository IS this repository (apply may write only then). */
+  sameRepo?: boolean;
   /** PR size for the diff-too-large gate (additions + deletions); absent → gate skipped. */
   additions?: number;
   deletions?: number;
@@ -67,8 +72,13 @@ export interface LoopRuntimeDeps {
   gh: LoopRuntimeGithub;
   requestFix: RequestFix;
   validate: FixValidate;
-  /** Per-attempt fix-request deadline override (tests); production reads ASHLAR_FIX_TIMEOUT_MS. */
+  /** Generation-deadline override (tests); production reads ASHLAR_FIX_TIMEOUT_MS. */
   fixTimeoutMs?: number;
+  /** The provider reports queued/generating activity (streaming local LLM): the deadline then
+   * excludes queue time. Absent/false → timed from send. */
+  fixReportsActivity?: boolean;
+  /** Watcher overrides (tests). */
+  fixWatch?: { queueMaxMs?: number; livenessMs?: number; checkEveryMs?: number; tickMs?: number };
   /** Delay before the single loop-history re-read (injected so tests do not wait). */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -107,6 +117,7 @@ const DEFAULT_ROUND_CAP = 5;
 const DEFAULT_FIX_ATTEMPTS = 2;
 const RETRYABLE = new Set<FixRoundResult["outcome"]>(["request-failed", "parse-failed", "scope-violation", "validation-failed"]);
 const HISTORY_RETRY_MS = 3000;
+const ESCALATE_BACKOFF_MS = 1500;
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
 function envOf(): NodeJS.ProcessEnv | undefined {
@@ -133,34 +144,35 @@ function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), MAX_CONTINUE_ROUND - 1) : DEFAULT_ROUND_CAP;
 }
 
-/** Deadline per fix request, covering the provider QUEUE and generation (the local LLM serializes
- * reviews and fixes): ASHLAR_FIX_TIMEOUT_MS, clamped to [1 min, 6 h], default 60 min. A request
- * past it is aborted and becomes request-failed → retry → a fixed fix-failed handoff — never a
- * silent wait forever. */
+/** Generation deadline per fix request, counted from the provider's FIRST output (queue time
+ * excluded — the local LLM serializes reviews and fixes): ASHLAR_FIX_TIMEOUT_MS, clamped to
+ * [1 min, 6 h], default 60 min. Past it the provider call is aborted: request-failed → retry → a
+ * fixed fix-failed handoff, never a silent wait. */
 const DEFAULT_FIX_TIMEOUT_MS = 60 * 60_000;
 function fixTimeoutMs(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   const n = Number(env?.ASHLAR_FIX_TIMEOUT_MS);
   return Number.isFinite(n) && n > 0 ? Math.min(6 * 60 * 60_000, Math.max(60_000, Math.floor(n))) : DEFAULT_FIX_TIMEOUT_MS;
 }
 
-/** Run one fix request under a deadline; on expiry the provider call is aborted. */
-async function requestWithDeadline(requestFix: RequestFix, prompt: string, ms: number): Promise<string> {
-  const ac = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      // Settle with the deadline FIRST, then abort: the provider's own abort rejection must not
-      // win the race and hide why the request ended.
-      reject(new Error(`fix request exceeded its ${Math.round(ms / 60_000) || "<1"} min deadline (provider queue or generation)`));
-      ac.abort();
-    }, ms);
-    (timer as { unref?: () => void }).unref?.();
-  });
-  try {
-    return await Promise.race([requestFix(prompt, ac.signal), expired]);
-  } finally {
-    clearTimeout(timer);
-  }
+/** Backstop for the provider QUEUE (a request still queued past it is abandoned):
+ * ASHLAR_FIX_QUEUE_MAX_MS, clamped to [10 min, 24 h], default 6 h. */
+const DEFAULT_FIX_QUEUE_MAX_MS = 6 * 60 * 60_000;
+function fixQueueMaxMs(env: NodeJS.ProcessEnv | undefined = envOf()): number {
+  const n = Number(env?.ASHLAR_FIX_QUEUE_MAX_MS);
+  return Number.isFinite(n) && n > 0 ? Math.min(24 * 60 * 60_000, Math.max(10 * 60_000, Math.floor(n))) : DEFAULT_FIX_QUEUE_MAX_MS;
+}
+
+/** How often a queued fix request re-checks that it is still wanted (head / session). */
+const FIX_RELEVANCE_CHECK_MS = 2 * 60_000;
+const FIX_WATCH_TICK_MS = 5_000;
+
+/** One server-side trace line per loop-step event, so a step is observable end to end. */
+function trace(jobId: string, event: string, fields: Record<string, string | number | boolean | undefined> = {}): void {
+  const kv = Object.entries(fields)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => `${k}=${String(v).replace(/\s+/g, " ").slice(0, 200)}`)
+    .join(" ");
+  console.info(`[review-loop] ${jobId} ${event}${kv ? ` ${kv}` : ""}`);
 }
 
 function fixAttempts(env: NodeJS.ProcessEnv | undefined = envOf()): number {
@@ -272,10 +284,7 @@ export const builtinValidate: FixValidate = async (files: FixFile[]) => {
  * defanged (a report must never ping a user) and length is bounded.
  */
 export function sanitizeModelText(text: string | undefined, opts: { oneLine?: boolean; max?: number } = {}): string {
-  let t = neutralizeMarkers(String(text ?? "")).replace(/@(?=[A-Za-z0-9])/g, "@\u200b");
-  if (opts.oneLine) t = t.replace(/\s+/g, " ").trim();
-  const max = opts.max ?? 4000;
-  return t.length > max ? `${t.slice(0, max)}…` : t;
+  return sanitizeUntrusted(text, opts);
 }
 
 /** How an applied round's report ends: the continuation was requested, or why it was not. */
@@ -317,21 +326,32 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
   };
   // First provider: local (a plain request/response). chatgpt/grok ride the bridge's
   // awaiting_chat lifecycle and are wired separately.
-  const requestFix: RequestFix = async (prompt, signal) => {
+  const requestFix: RequestFix = async (prompt, ctl) => {
     if (settings.fixAgent.provider !== "local") {
       throw new Error(`fix provider ${settings.fixAgent.provider} not wired yet (local only)`);
     }
     const local = await import("./local-chat-request.server.ts");
-    return local.requestLocalChat(settings.localLlmBaseUrl, settings.localLlmApiKey, {
-      model: settings.localLlmModel,
-      messages: [
-        { role: "system", content: "You are the Ashlar fix agent. Return ONLY the JSON object described in the prompt." },
-        { role: "user", content: prompt },
-      ],
-      max_tokens: settings.localReviewMaxTokens,
-    }, signal);
+    const llm = await import("./local-llm.server.ts");
+    return local.requestLocalChat(
+      settings.localLlmBaseUrl,
+      settings.localLlmApiKey,
+      {
+        model: settings.localLlmModel,
+        messages: [
+          { role: "system", content: "You are the Ashlar fix agent. Return ONLY the JSON object described in the prompt." },
+          { role: "user", content: prompt },
+        ],
+        // The review path's tuned sampling + budget: without it a reasoning model decodes greedily,
+        // loops, and ends at the token cap (finish_reason=length) before emitting the JSON.
+        ...llm.samplingRequestFields(llm.localGenerationParams(settings)),
+      },
+      ctl?.signal,
+      { onActivity: (a) => ctl?.onActivity?.(a.kind === "output" ? "generating" : "queued") },
+    );
   };
-  return { gh, requestFix, validate: builtinValidate };
+  // Streaming (the default) reports queued vs generating, so the fix deadline can exclude queue time.
+  const streaming = envOf()?.ASHLAR_LOCAL_LLM_STREAM !== "false";
+  return { gh, requestFix, validate: builtinValidate, fixReportsActivity: settings.fixAgent.provider === "local" && streaming };
 }
 
 /**
@@ -353,7 +373,6 @@ export async function runPostReviewLoop(
   if (job.thread?.loop?.kind !== "start") return { ran: false, reason: "not a /review-loop review" };
   if (job.origin !== "github") return { ran: false, reason: "not a github job" };
   const findings = job.findings ?? [];
-  if (findings.length === 0) return { ran: false, reason: "no findings (converged)" };
 
   const { owner, repo, pr, headSha } = job;
   const botLogin = ashlarBotLogin(env);
@@ -364,12 +383,21 @@ export async function runPostReviewLoop(
   // Past the gates the user asked for a loop: every stop that is not a supersession is ONE
   // fixed ESCALATE (reason code + deterministic detail), never free text. `head` is the commit
   // the handoff is about: the reviewed head — or, once this round pushed, the NEW head.
+  let sinceIso: string | undefined;
   const escalate = async (reason: EscalateReason, detail: string, head: string = headSha): Promise<LoopStepResult> => {
     if (!d) return { ran: false, reason: `ESCALATE ${reason} not posted (no GitHub client): ${detail}` };
-    const r = await escalateNow(d.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin });
-    if (r.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: STEP_IN_FLIGHT };
+    const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, sinceIso });
+    let r = await post();
+    if (r.error === ESCALATE_IN_FLIGHT) {
+      // A terminal handoff has no other poster: wait for the concurrent one once, then retry (its
+      // marker, if any, makes this a no-op). Still blocked → a LOGGED non-silent reason.
+      await (d.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms))))(ESCALATE_BACKOFF_MS);
+      r = await post();
+      if (r.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: `ESCALATE ${reason} not posted: another handoff for this head is in flight (detail: ${detail})` };
+    }
     if (r.error) return { ran: false, reason: `ESCALATE ${reason} failed to post: ${r.error} (detail: ${detail})` };
     if (!r.escalated) return { ran: false, reason: ALREADY_ESCALATED };
+    trace(job.id, "handoff", { reason, head: head.slice(0, 7) });
     return { ran: true, step: "escalated", reason, detail };
   };
 
@@ -379,11 +407,29 @@ export async function runPostReviewLoop(
   try {
     d = deps ?? (await productionDeps(settings));
     const gh = d.gh;
+    sinceIso = loopSinceIso(job, allJobs, botLogin);
+    trace(job.id, "step", { pr, head: headSha.slice(0, 7), findings: findings.length });
     const head = await gh.fetchPullHeadRef(token, owner, repo, pr);
-    // A newer commit superseded this round (a push, or another round's fix): that head's own
-    // review drives the loop from here. Also the fork-push guard: a commit parented on a stale
-    // SHA would fast-forward over a contributor's backward force-push.
-    if (head.sha !== headSha) return { ran: false, reason: SUPERSEDED };
+    // The reviewed head is STALE (a push landed after the review started): neither a clean
+    // verdict nor a fix applies to the live head. Request the live head's review so the loop
+    // goes on there — a stale review never ends or stalls the loop. Also the fork-push guard: a
+    // commit parented on a stale SHA would fast-forward over a contributor's backward force-push.
+    if (head.sha !== headSha) {
+      trace(job.id, "superseded", { live: head.sha.slice(0, 7) });
+      if (FULL_SHA_RE.test(head.sha)) {
+        const hist = await reconstructRounds(gh, token, owner, repo, pr, { botLogin, sinceIso }).catch(() => [] as RoundSummary[]);
+        const mode = effectiveFixMode(job, settings);
+        await gh
+          .createIssueComment(token, { owner, repo, pr, body: continueComment({ mode, round: Math.min(hist.length + 1, MAX_CONTINUE_ROUND), pr, head: head.sha }) })
+          .catch(() => {});
+      }
+      return { ran: false, reason: SUPERSEDED };
+    }
+    // CONVERGED on the LIVE head: its clean review (total=0) is the terminal signal.
+    if (findings.length === 0) {
+      trace(job.id, "converged");
+      return { ran: false, reason: "no findings (converged)" };
+    }
     diffLines = diffLinesOf(head);
     if (!sample) return await escalate("loop-error", "no head-pinned snapshot for this review");
 
@@ -398,7 +444,7 @@ export async function runPostReviewLoop(
       diffLines,
       botLogin,
       requireCurrentRound: true,
-      sinceIso: loopSinceIso(job, allJobs, botLogin),
+      sinceIso,
     };
     let esc = await maybeEscalate(gh, token, escOpts);
     if (esc.error === CURRENT_ROUND_MISSING) {
@@ -414,8 +460,16 @@ export async function runPostReviewLoop(
 
     // 2) One fix round on the head-pinned snapshot.
     const mode = effectiveFixMode(job, settings);
-    if (mode === "apply" && head.fork) {
-      return await escalate("loop-error", "apply on a fork PR: the installation token cannot push to a fork (use suggest mode)");
+    // Apply writes the head branch through THIS repository's API: only a POSITIVELY verified
+    // same-repository head may be written (a fork, or unknown provenance such as a deleted head
+    // repository, is refused — never coerced into "safe").
+    if (mode === "apply" && head.sameRepo !== true) {
+      return await escalate(
+        "loop-error",
+        head.fork
+          ? "apply on a fork PR: the installation token cannot push to a fork (use suggest mode)"
+          : "apply needs a verified same-repository head; the PR's head repository is unknown or different (use suggest mode)",
+      );
     }
     // Editable set = the PR's CHANGED files only. sample.files also carries policy/reference
     // context fetched for the review; those stay read-only and never enter allowedPaths.
@@ -435,8 +489,19 @@ export async function runPostReviewLoop(
       return (await superseded()) ? { ok: false, error: "head moved during fix" } : { ok: true };
     };
     const maxAttempts = fixAttempts(env);
-    const deadlineMs = d.fixTimeoutMs ?? fixTimeoutMs(env);
-    const requestFix: RequestFix = (p) => requestWithDeadline(d!.requestFix, p, deadlineMs);
+    const deps2 = d;
+    // The provider call runs under the watcher: the deadline excludes queue time, a queued (or
+    // just-started) request whose head moved is cancelled instead of generated in full.
+    const requestFix: RequestFix = (p) =>
+      watchFixRequest((prompt, ctl) => deps2.requestFix(prompt, ctl), p, {
+        generationMs: deps2.fixTimeoutMs ?? fixTimeoutMs(env),
+        queueMaxMs: deps2.fixWatch?.queueMaxMs ?? fixQueueMaxMs(env),
+        livenessMs: deps2.fixWatch?.livenessMs ?? localLivenessMs(env),
+        checkEveryMs: deps2.fixWatch?.checkEveryMs ?? FIX_RELEVANCE_CHECK_MS,
+        tickMs: deps2.fixWatch?.tickMs ?? FIX_WATCH_TICK_MS,
+        reportsActivity: deps2.fixReportsActivity ?? false,
+        stillWanted: async () => ((await superseded()) ? "the PR head moved" : null),
+      });
     // Progress signal: the fix can wait long in a busy provider queue — a driver must be able to
     // tell "in progress" from "dead". Best effort: it never blocks or fails the round.
     await gh.createIssueComment(token, { owner, repo, pr, body: fixingComment({ round: rounds.length, pr, head: headSha }) }).catch(() => {});
@@ -445,6 +510,8 @@ export async function runPostReviewLoop(
     let res: FixRoundResult;
     for (;;) {
       attempts += 1;
+      const t0 = Date.now();
+      trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, provider: settings.fixAgent.provider ?? "none" });
       res = await runFixRound(
         { requestFix, api: gh.gitDataApi(token, owner, repo), validate },
         {
@@ -456,6 +523,7 @@ export async function runPostReviewLoop(
           allowedPaths: files.map((f) => f.path),
         },
       );
+      trace(job.id, "fix-result", { attempt: attempts, outcome: res.outcome, ms: Date.now() - t0, error: res.error });
       if (!RETRYABLE.has(res.outcome) || attempts >= maxAttempts) break;
       if (await superseded()) return { ran: false, reason: SUPERSEDED };
       prompt = `${basePrompt}\n\n${retryFeedback(res)}`;
@@ -482,7 +550,10 @@ export async function runPostReviewLoop(
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status) }).catch(() => {
         /* the report is informational; the continuation / handoff carries the signal */
       });
-      if (status.ok) return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead, continued: true, attempts: tries };
+      if (status.ok) {
+        trace(job.id, "continued", { commit: newHead?.slice(0, 7), round: rounds.length + 1 });
+        return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead, continued: true, attempts: tries };
+      }
       const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
       return await escalate("loop-error", `the fix was committed but the next review could not be requested: ${status.error}`, live);
     };

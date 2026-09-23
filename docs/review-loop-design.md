@@ -62,8 +62,20 @@
 | **FIXING**(진행 신호) | `<!-- ashlar-loop-fixing round=<N> pr=<PR> head=<sha> -->` | `Ashlar review-loop — fix round in progress` | 마커(정보용 — 트리거·종료 아님) |
 
 FIXING은 수정 요청 직전에 단다(수정은 바쁜 provider 큐에서 오래 기다릴 수 있다 — 드라이버가 "진행 중"과
-"죽음"을 구분하게). 그 뒤에는 반드시 fix 리포트+연속 또는 핸드오프가 온다. 수정 요청에는 deadline이 있다
-(`ASHLAR_FIX_TIMEOUT_MS`, 기본 60분, 큐+생성 포함) — 넘기면 요청을 abort하고 재시도 후 `fix-failed`.
+"죽음"을 구분하게). 그 뒤에는 반드시 fix 리포트+연속 또는 핸드오프가 온다.
+
+**수정 요청 감시(`fix-request-watch.ts`):** 로컬 LLM은 리뷰와 수정을 한 줄로 처리하므로 수정 요청은 큐에서 오래
+기다릴 수 있다. 스트리밍 신호로 "대기(keepalive)"와 "생성(첫 출력)"을 구분해:
+- 생성 deadline(`ASHLAR_FIX_TIMEOUT_MS`, 기본 60분)은 **첫 출력부터** 센다 — 대기 시간 제외(부하 중 거짓
+  `fix-failed` 방지). 대기 상한은 별도(`ASHLAR_FIX_QUEUE_MAX_MS`, 기본 6시간), 신호 두절(liveness)도 중단.
+- 대기 중 2분마다 + 생성 시작 순간에 **여전히 필요한지** 확인(head 이동 등) — 아니면 abort(대기열 자리 반환·
+  생성 조기 차단), 결과는 조용한 superseded.
+- 수정 요청은 리뷰 경로와 같은 샘플링·예산(temperature 0.6 등)을 쓴다 — 없으면 추론 모델이 반복 루프로 상한까지
+  생성하다 `length`로 끝난다.
+- 서버 로그 `[review-loop] <job> step|fix-request|fix-result|continued|handoff|superseded|converged` 로 각
+  단계를 추적한다.
+- 커밋은 전송 수준에서 1회 재시도하고(모델 재요청 없음), 응답이 유실된 ref 갱신은 "이미 목표 커밋"으로 인식한다.
+- apply는 head 저장소가 **이 저장소임이 확인될 때만** 쓴다(fork·삭제된 head 저장소 등 출처 불명은 거절).
 
 CONTINUE 코멘트에는 멘션·지시어 산문이 없다. 봇이 작성한 이 마커만 다음 리뷰를 연다(head는 감사용이며, 리뷰는
 그 시점 PR 최신 head를 본다). 0건 라운드는 명시 요청과 같이 clean 리뷰(`ashlar-findings total=0`)를 올려

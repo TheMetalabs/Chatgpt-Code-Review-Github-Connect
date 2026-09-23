@@ -124,8 +124,7 @@ export interface EscalateState {
 const DETAIL_MAX = 500;
 
 function renderDetail(detail: string): string {
-  const one = neutralizeMarkers(detail).replace(/\s+/g, " ").trim();
-  return one.length > DETAIL_MAX ? `${one.slice(0, DETAIL_MAX)}…` : one;
+  return sanitizeUntrusted(detail, { oneLine: true, max: DETAIL_MAX });
 }
 
 /** Escape HTML-comment delimiters so interpolated untrusted text (model output, file paths, CI
@@ -133,6 +132,19 @@ function renderDetail(detail: string): string {
  * §3). Every emitter that embeds untrusted text in a bot comment must pass it through this. */
 export function neutralizeMarkers(s: string): string {
   return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
+}
+
+/**
+ * THE sanitizer for untrusted text inside ANY bot-authored comment (model output, file paths,
+ * error / CI text): control markers neutralized, @-mentions defanged (a bot comment must never
+ * ping a user or team from untrusted text), optionally flattened to one line and bounded. One
+ * function for every emitter, so no field can be sanitized "partially".
+ */
+export function sanitizeUntrusted(text: string | null | undefined, opts: { oneLine?: boolean; max?: number } = {}): string {
+  let t = neutralizeMarkers(String(text ?? "")).replace(/@(?=[A-Za-z0-9])/g, "@\u200b");
+  if (opts.oneLine) t = t.replace(/\s+/g, " ").trim();
+  const max = opts.max ?? 4000;
+  return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
 /** WHY a marker: structured fields live as attributes so detection never parses prose. */
@@ -168,8 +180,8 @@ export function escalateComment(s: EscalateState): string {
     "",
     "State (re-verify below — do not trust this narrative):",
     `- Finding trend: ${fmtTrend(s.findingTrend)}`,
-    `- Repeated flagged files: ${s.repeatedFiles && s.repeatedFiles.length ? neutralizeMarkers(s.repeatedFiles.join(", ")) : "(none)"}`,
-    `- ${fmtBool("Reviewed-commit ⊂ HEAD", s.reviewedCommitInHead)}; unaddressed=${s.unaddressed ?? "unknown"}; ${fmtBool("DIRTY", s.dirty)}; CI=${neutralizeMarkers(s.ciState ?? "unknown")}`,
+    `- Repeated flagged files: ${s.repeatedFiles && s.repeatedFiles.length ? sanitizeUntrusted(s.repeatedFiles.join(", "), { oneLine: true, max: 600 }) : "(none)"}`,
+    `- ${fmtBool("Reviewed-commit ⊂ HEAD", s.reviewedCommitInHead)}; unaddressed=${s.unaddressed ?? "unknown"}; ${fmtBool("DIRTY", s.dirty)}; CI=${sanitizeUntrusted(s.ciState ?? "unknown", { oneLine: true, max: 200 })}`,
     `- Diff size: ${s.diffLines ?? "unknown"} lines; decision ledger: ${ledger}`,
     "",
     `Stop reason: ${s.reason}`,
@@ -178,7 +190,7 @@ export function escalateComment(s: EscalateState): string {
     "",
     "Re-derive from the API before acting (narrative may be stale after compaction):",
     "```",
-    `gh pr view ${s.pr} --repo ${neutralizeMarkers(s.repo)} --json reviews,comments,headRefOid,mergeable`,
+    `gh pr view ${s.pr} --repo ${sanitizeUntrusted(s.repo, { oneLine: true, max: 200 })} --json reviews,comments,headRefOid,mergeable`,
     `audit-unaddressed.py ${s.pr} --head ${s.head}`,
     "```",
   ];

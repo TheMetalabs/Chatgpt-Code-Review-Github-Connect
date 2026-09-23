@@ -101,3 +101,54 @@ describe("maybeEscalate", () => {
     assert.equal(posted.length, 0);
   });
 });
+
+describe("maybeEscalate — provenance, session boundary, fail-closed (round-1 fixes)", () => {
+  const files = ["src/lib/review-loop.ts"];
+  const bot = "ashlar-bot-review-loop[bot]";
+
+  it("F3: a non-bot login containing 'ashlar' does not contribute rounds", async () => {
+    // all reviews authored by 'ashlar-fan' (not the exact bot) → no rounds → no escalate
+    const rounds = [6, 4, 3].map((n, i) => ({ head: `h${i}`.padEnd(7, "0"), findings: n, files, at: `2026-01-0${i + 1}T00:00:00Z` }));
+    const gh = {
+      async listPullReviews() {
+        return rounds.map((r) => ({ userLogin: "ashlar-fan", body: `<!-- ashlar-findings total=${r.findings} -->`, commitId: r.head + "0000000", submittedAt: r.at }));
+      },
+      async listReviewComments() { return []; },
+      async listIssueComments() { return []; },
+      async createIssueComment() { return { id: 1 }; },
+    };
+    const res = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "h2000000", roundCap: 8 });
+    assert.equal(res.rounds.length, 0);
+    assert.equal(res.escalated, false);
+  });
+
+  it("F4: reviews before the loop's sinceIso are excluded from round history", async () => {
+    const gh = {
+      async listPullReviews() {
+        return [
+          { userLogin: bot, body: "<!-- ashlar-findings total=5 -->", commitId: "old0000" + "0", submittedAt: "2026-01-01T00:00:00Z" },
+          { userLogin: bot, body: "<!-- ashlar-findings total=4 -->", commitId: "new0000" + "0", submittedAt: "2026-06-01T00:00:00Z" },
+        ];
+      },
+      async listReviewComments() { return [{ userLogin: bot, path: files[0], commitId: "old00000" }, { userLogin: bot, path: files[0], commitId: "new00000" }]; },
+      async listIssueComments() { return []; },
+      async createIssueComment() { return { id: 1 }; },
+    };
+    const all = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "new0000", roundCap: 8 });
+    assert.equal(all.rounds.length, 2);
+    const scoped = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "new0000", roundCap: 8, sinceIso: "2026-05-01T00:00:00Z" });
+    assert.equal(scoped.rounds.length, 1, "only the in-session review counts");
+  });
+
+  it("F6: an incomplete/failed history read fails closed (no classify, no post)", async () => {
+    const gh = {
+      async listPullReviews() { return [{ userLogin: bot, body: "<!-- ashlar-findings total=6 -->", commitId: "h0000000", submittedAt: "2026-01-01T00:00:00Z" }]; },
+      async listReviewComments() { return [{ userLogin: bot, path: files[0], commitId: "h000000" }]; },
+      async listIssueComments() { throw new Error("list issues failed (502)"); },
+      async createIssueComment() { throw new Error("must not post on incomplete history"); },
+    };
+    const res = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "h000000", roundCap: 1 });
+    assert.equal(res.escalated, false);
+    assert.match(res.error ?? "", /list issues failed/);
+  });
+});

@@ -45,8 +45,12 @@ export interface ReviewLoopGithub {
 
 const FINDINGS_RE = /<!--\s*ashlar-findings\s+(.+?)\s*-->/;
 
-function isAshlar(login: string): boolean {
-  return login.toLowerCase().includes("ashlar");
+/** The exact GitHub App bot login. Substring matching is unsafe — an account like
+ * "ashlar-fan" could forge findings / suppress an escalation. */
+export const DEFAULT_ASHLAR_BOT_LOGIN = "ashlar-bot-review-loop[bot]";
+
+function isBot(login: string, botLogin: string): boolean {
+  return login.toLowerCase() === botLogin.toLowerCase();
 }
 
 function short(sha: string): string {
@@ -77,7 +81,9 @@ export async function reconstructRounds(
   owner: string,
   repo: string,
   pr: number,
+  opts: { botLogin?: string; sinceIso?: string } = {},
 ): Promise<RoundSummary[]> {
+  const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const [reviews, comments] = await Promise.all([
     gh.listPullReviews(token, owner, repo, pr),
     gh.listReviewComments(token, owner, repo, pr),
@@ -85,15 +91,17 @@ export async function reconstructRounds(
 
   const filesByHead = new Map<string, Set<string>>();
   for (const c of comments) {
-    if (!isAshlar(c.userLogin) || !c.commitId || !c.path) continue;
+    if (!isBot(c.userLogin, botLogin) || !c.commitId || !c.path) continue;
     const head = short(c.commitId);
     (filesByHead.get(head) ?? filesByHead.set(head, new Set()).get(head)!).add(c.path);
   }
 
   const byHead = new Map<string, number>();
   const order: string[] = [];
+  // Bound to the CURRENT loop session: only reviews at/after the loop start (sinceIso) count,
+  // so historical reviews from before this loop cannot be misread as whack-a-mole rounds.
   const ashlarReviews = reviews
-    .filter((r) => isAshlar(r.userLogin))
+    .filter((r) => isBot(r.userLogin, botLogin) && (!opts.sinceIso || (r.submittedAt || "") >= opts.sinceIso))
     .sort((a, b) => (a.submittedAt || "").localeCompare(b.submittedAt || ""));
   for (const rv of ashlarReviews) {
     const total = parseFindingsTotal(rv.body);
@@ -119,10 +127,11 @@ async function alreadyEscalated(
   repo: string,
   pr: number,
   head: string,
+  botLogin: string,
 ): Promise<boolean> {
   const issues = await gh.listIssueComments(token, owner, repo, pr);
   for (const c of issues) {
-    const parsed = parseEscalateMarker(c.body, { authoredByBot: isAshlar(c.userLogin) });
+    const parsed = parseEscalateMarker(c.body, { authoredByBot: isBot(c.userLogin, botLogin) });
     if (parsed && short(parsed.head) === short(head)) return true;
   }
   return false;
@@ -132,6 +141,8 @@ export interface EscalateResult {
   escalated: boolean;
   reason?: EscalateReason;
   rounds: RoundSummary[];
+  /** Set when history was incomplete/failed and escalation was skipped fail-closed. */
+  error?: string;
 }
 
 /**
@@ -142,12 +153,33 @@ export interface EscalateResult {
 export async function maybeEscalate(
   gh: ReviewLoopGithub,
   token: string,
-  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number },
+  opts: {
+    owner: string;
+    repo: string;
+    pr: number;
+    head: string;
+    roundCap: number;
+    diffLines?: number;
+    botLogin?: string;
+    sinceIso?: string;
+  },
 ): Promise<EscalateResult> {
-  const rounds = await reconstructRounds(gh, token, opts.owner, opts.repo, opts.pr);
+  const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
+  // Fail closed on an incomplete/failed history read: never classify or (dup-)post from
+  // partial data — the list helpers throw rather than return a truncated list.
+  let rounds: RoundSummary[];
+  let escalatedBefore: boolean;
+  try {
+    rounds = await reconstructRounds(gh, token, opts.owner, opts.repo, opts.pr, { botLogin, sinceIso: opts.sinceIso });
+    const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
+    if (!reasonPeek) return { escalated: false, rounds };
+    escalatedBefore = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin);
+  } catch (e) {
+    return { escalated: false, rounds: [], error: (e as Error)?.message ?? String(e) };
+  }
   const reason = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
   if (!reason) return { escalated: false, rounds };
-  if (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head)) {
+  if (escalatedBefore) {
     return { escalated: false, reason, rounds }; // one handoff per head
   }
   const body = escalateFromRounds(reason, rounds, {

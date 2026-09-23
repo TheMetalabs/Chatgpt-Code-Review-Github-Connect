@@ -151,13 +151,28 @@ function severity(v: unknown, fallback: Severity): Severity {
   return v === "P0" || v === "P1" || v === "P2" ? v : fallback;
 }
 
+// design §6b: which delivery each provider supports. An incompatible pair has no valid
+// execution path, so we DISABLE the fix agent (provider=null) rather than persist a config
+// that would silently never run — a visible, safe rejection of operator misconfiguration.
+const FIX_DELIVERY_BY_PROVIDER: Record<FixAgentProvider, readonly FixDelivery[]> = {
+  chatgpt: ["script-apply", "chat-push"],
+  grok: ["script-apply", "chat-push"],
+  local: ["script-apply"],
+  "coding-agent": ["coding-agent"],
+};
+
 function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
   const d = DEFAULT_SETTINGS.fixAgent;
   const p = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
-  const provider = FIX_AGENT_PROVIDERS.includes(p.provider as FixAgentProvider) ? (p.provider as FixAgentProvider) : d.provider;
-  const delivery = FIX_DELIVERIES.includes(p.delivery as FixDelivery) ? (p.delivery as FixDelivery) : d.delivery;
+  let provider = FIX_AGENT_PROVIDERS.includes(p.provider as FixAgentProvider) ? (p.provider as FixAgentProvider) : d.provider;
+  let delivery = FIX_DELIVERIES.includes(p.delivery as FixDelivery) ? (p.delivery as FixDelivery) : d.delivery;
   const mode = FIX_MODES.includes(p.mode as FixMode) ? (p.mode as FixMode) : d.mode;
   const parallelPrs = Math.max(1, Math.min(20, Math.floor(num(p.parallelPrs, d.parallelPrs))));
+  // Enforce the provider→delivery matrix: an incompatible pair disables the fix agent.
+  if (provider !== null && !FIX_DELIVERY_BY_PROVIDER[provider].includes(delivery)) {
+    provider = null;
+    delivery = d.delivery;
+  }
   return { provider, delivery, mode, parallelPrs };
 }
 

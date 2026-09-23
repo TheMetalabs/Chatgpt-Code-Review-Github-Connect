@@ -660,18 +660,32 @@ export async function createPullReview(
   throw new Error("GitHub Reviews API failed");
 }
 
+// Paginate to exhaustion and THROW on any page error, so an incomplete history is never
+// mistaken for a complete one (an idempotency-sensitive caller must abort, not assume empty).
+async function ghListAll<T>(token: string, pathBase: string): Promise<T[]> {
+  const all: T[] = [];
+  for (let page = 1; page <= 50; page += 1) {
+    const sep = pathBase.includes("?") ? "&" : "?";
+    const out = await gh<T[]>(token, `${pathBase}${sep}per_page=100&page=${page}`);
+    if (!out.ok) throw new Error(`list ${pathBase} failed (${out.status}): ${out.text}`);
+    const batch = out.data ?? [];
+    all.push(...batch);
+    if (batch.length < 100) break;
+  }
+  return all;
+}
+
 export async function listPullReviews(
   token: string,
   owner: string,
   repo: string,
   pr: number,
 ): Promise<Array<{ userLogin: string; body: string; commitId: string; submittedAt: string }>> {
-  const out = await gh<Array<{ user?: { login?: string }; body?: string | null; commit_id?: string | null; submitted_at?: string | null }>>(
+  const rows = await ghListAll<{ user?: { login?: string }; body?: string | null; commit_id?: string | null; submitted_at?: string | null }>(
     token,
-    `/repos/${owner}/${repo}/pulls/${pr}/reviews?per_page=100`,
+    `/repos/${owner}/${repo}/pulls/${pr}/reviews`,
   );
-  if (!out.ok) return [];
-  return (out.data ?? []).map((r) => ({
+  return rows.map((r) => ({
     userLogin: String(r.user?.login ?? ""),
     body: String(r.body ?? ""),
     commitId: String(r.commit_id ?? ""),
@@ -685,12 +699,11 @@ export async function listReviewComments(
   repo: string,
   pr: number,
 ): Promise<Array<{ userLogin: string; path: string; commitId: string }>> {
-  const out = await gh<Array<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null }>>(
+  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null }>(
     token,
-    `/repos/${owner}/${repo}/pulls/${pr}/comments?per_page=100`,
+    `/repos/${owner}/${repo}/pulls/${pr}/comments`,
   );
-  if (!out.ok) return [];
-  return (out.data ?? []).map((c) => ({
+  return rows.map((c) => ({
     userLogin: String(c.user?.login ?? ""),
     path: String(c.path ?? ""),
     commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
@@ -703,12 +716,11 @@ export async function listIssueComments(
   repo: string,
   pr: number,
 ): Promise<Array<{ userLogin: string; body: string }>> {
-  const out = await gh<Array<{ user?: { login?: string }; body?: string | null }>>(
+  const rows = await ghListAll<{ user?: { login?: string }; body?: string | null }>(
     token,
-    `/repos/${owner}/${repo}/issues/${pr}/comments?per_page=100`,
+    `/repos/${owner}/${repo}/issues/${pr}/comments`,
   );
-  if (!out.ok) return [];
-  return (out.data ?? []).map((c) => ({ userLogin: String(c.user?.login ?? ""), body: String(c.body ?? "") }));
+  return rows.map((c) => ({ userLogin: String(c.user?.login ?? ""), body: String(c.body ?? "") }));
 }
 
 export function gitDataApi(token: string, owner: string, repo: string): GitDataApi {
@@ -724,15 +736,30 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
     async createBlob(content: string): Promise<string> {
       const out = await gh<{ sha?: string }>(token, `${base}/blobs`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content, encoding: "utf-8" }),
       });
       if (!out.ok || !out.data.sha) throw new Error(out.ok ? "blob has no sha" : `create blob failed (${out.status}): ${out.text}`);
       return out.data.sha;
     },
     async createTree(baseTreeSha: string, entries: Array<{ path: string; sha: string }>): Promise<string> {
-      const tree = entries.map((e) => ({ path: e.path, mode: "100644", type: "blob", sha: e.sha }));
+      // Preserve each existing path's file mode (executable 100755, symlink 120000); a
+      // genuinely new file defaults to a regular 100644 blob. Without this the fix commit
+      // would silently drop the +x bit or turn a symlink into a regular file.
+      const baseOut = await gh<{ tree?: Array<{ path?: string; mode?: string; type?: string }> }>(
+        token,
+        `${base}/trees/${baseTreeSha}?recursive=1`,
+      );
+      const modeByPath = new Map<string, string>();
+      if (baseOut.ok) {
+        for (const e of baseOut.data.tree ?? []) {
+          if (e.path && e.mode && e.type === "blob") modeByPath.set(e.path, e.mode);
+        }
+      }
+      const tree = entries.map((e) => ({ path: e.path, mode: modeByPath.get(e.path) ?? "100644", type: "blob", sha: e.sha }));
       const out = await gh<{ sha?: string }>(token, `${base}/trees`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ base_tree: baseTreeSha, tree }),
       });
       if (!out.ok || !out.data.sha) throw new Error(out.ok ? "tree has no sha" : `create tree failed (${out.status}): ${out.text}`);
@@ -741,6 +768,7 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
     async createCommit(message: string, treeSha: string, parentSha: string): Promise<string> {
       const out = await gh<{ sha?: string }>(token, `${base}/commits`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, tree: treeSha, parents: [parentSha] }),
       });
       if (!out.ok || !out.data.sha) throw new Error(out.ok ? "commit has no sha" : `create commit failed (${out.status}): ${out.text}`);
@@ -749,6 +777,7 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
     async updateBranchRef(branch: string, commitSha: string): Promise<void> {
       const out = await gh(token, `${base}/refs/heads/${branch}`, {
         method: "PATCH",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sha: commitSha, force: false }),
       });
       if (!out.ok) throw new Error(`update ref failed (${out.status}): ${out.text}`);

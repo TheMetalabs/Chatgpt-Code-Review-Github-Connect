@@ -29,17 +29,18 @@ const FIX_JSON = '{"summary":"remove bad state","files":[{"path":"src/a.ts","con
 
 describe("buildFixPrompt", () => {
   it("embeds the findings, the schema, and the §6 rules", () => {
-    const p = buildFixPrompt({ findings: "P1: null deref at a.ts:3", changedPaths: ["src/a.ts"], reviewer: "chatgpt" });
+    const p = buildFixPrompt({ findings: "P1: null deref at a.ts:3", files: [{ path: "src/a.ts", content: "export const a = 1;\n" }], reviewer: "chatgpt" });
     assert.match(p, /null deref at a\.ts:3/);
     assert.match(p, /"files": \[ \{ "path"/);
     assert.match(p, /never a diff/);
     assert.match(p, /src\/a\.ts/);
+    assert.match(p, /export const a = 1;/); // head-pinned content embedded
     assert.match(p, /\(chatgpt\)/);
   });
 });
 
 describe("runFixRound", () => {
-  const base = { prompt: "p", branch: "feat", baseCommitSha: "base1", message: "fix: x" };
+  const base = { prompt: "p", branch: "feat", baseCommitSha: "base1", message: "fix: x", allowedPaths: ["src/a.ts"] };
 
   it("apply mode commits the parsed change set and returns the commit sha", async () => {
     const { api, committed } = fakeApi();
@@ -65,6 +66,16 @@ describe("runFixRound", () => {
     assert.equal(res.ok, false);
     assert.equal(res.outcome, "parse-failed");
     assert.equal(f.committed, false);
+  });
+
+  it("rejects an out-of-scope path before any commit (scope containment)", async () => {
+    const f = fakeApi();
+    const evil = '{"summary":"x","files":[{"path":".github/workflows/ci.yml","content":"pwn"}]}';
+    const res = await runFixRound({ requestFix: async () => evil, api: f.api }, { ...base, mode: "apply" });
+    assert.equal(res.ok, false);
+    assert.equal(res.outcome, "scope-violation");
+    assert.match(res.error ?? "", /\.github\/workflows/);
+    assert.equal(f.committed, false, "out-of-scope fix must not push");
   });
 
   it("reports commit-failed without a partial success when the push throws", async () => {

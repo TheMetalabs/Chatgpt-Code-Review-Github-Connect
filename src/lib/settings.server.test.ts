@@ -101,13 +101,24 @@ describe("sanitizeBotSettings", () => {
   });
 
   it("normalizes fix agent config and rejects unknown values", () => {
-    const ok = sanitizeBotSettings({ fixAgent: { provider: "local", delivery: "chat-push", mode: "apply", parallelPrs: 5 } });
-    assert.deepEqual(ok.fixAgent, { provider: "local", delivery: "chat-push", mode: "apply", parallelPrs: 5 });
+    const ok = sanitizeBotSettings({ fixAgent: { provider: "local", delivery: "script-apply", mode: "apply", parallelPrs: 5 } });
+    assert.deepEqual(ok.fixAgent, { provider: "local", delivery: "script-apply", mode: "apply", parallelPrs: 5 });
     const bad = sanitizeBotSettings({ fixAgent: { provider: "bogus", delivery: "diff", mode: "yolo", parallelPrs: 999 } });
     assert.equal(bad.fixAgent.provider, null); // unknown provider -> default (disabled)
     assert.equal(bad.fixAgent.delivery, "script-apply");
     assert.equal(bad.fixAgent.mode, "suggest");
     assert.equal(bad.fixAgent.parallelPrs, 20); // clamped
+  });
+
+  it("enforces the provider→delivery matrix, disabling incompatible pairs (F7)", () => {
+    // chatgpt/grok support script-apply | chat-push
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push" } }).fixAgent.provider, "chatgpt");
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "grok", delivery: "script-apply" } }).fixAgent.provider, "grok");
+    // local => script-apply only; chat-push is invalid => disabled
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "local", delivery: "chat-push" } }).fixAgent.provider, null);
+    // coding-agent => coding-agent only; script-apply is invalid => disabled
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "coding-agent", delivery: "script-apply" } }).fixAgent.provider, null);
+    assert.equal(sanitizeBotSettings({ fixAgent: { provider: "coding-agent", delivery: "coding-agent" } }).fixAgent.provider, "coding-agent");
   });
 });
 

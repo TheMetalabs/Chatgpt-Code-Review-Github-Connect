@@ -20,11 +20,14 @@ import {
   DEFAULT_ASHLAR_BOT_LOGIN,
   escalateFromRounds,
   isSelfLogin,
+  isStoppedComment,
   stuckPattern,
   parseEscalateMarker,
+  parseReviewLoopDirective,
   type EscalateReason,
   type RoundSummary,
 } from "./review-loop.ts";
+import { deriveLoopSession, type LoopEvent, type LoopSession } from "./review-loop-session.ts";
 
 // Single source of the App identity lives in review-loop.ts (shared with the webhook parser's
 // self-trigger guard); re-exported here for existing engine callers.
@@ -42,7 +45,7 @@ export interface ReviewLoopGithub {
     owner: string,
     repo: string,
     pr: number,
-  ): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string }>>;
+  ): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; body?: string }>>;
   listIssueComments(
     token: string,
     owner: string,
@@ -322,4 +325,79 @@ export async function escalateNow(
   } finally {
     inFlightEscalate.delete(key);
   }
+}
+
+// ── Durable loop session (review-loop-session.ts) ─────────────────────────────
+
+/** The PR fields a start directive in the PR body needs (from GET /pulls/{pr}). */
+export interface LoopPrInfo {
+  body?: string | null;
+  createdAt?: string;
+  author?: string;
+}
+
+function pushDirective(events: LoopEvent[], body: string | null | undefined, at: string, actor: string): void {
+  const d = parseReviewLoopDirective(body);
+  if (d?.kind === "start") events.push({ at, kind: "start", mode: d.mode, actor });
+  else if (d?.kind === "stop") events.push({ at, kind: "stop", actor });
+}
+
+/**
+ * Collect the PR's loop events from durable history. Authorship is enforced HERE: a human (any
+ * non-App author) contributes start/stop directives from issue comments, inline comments and the
+ * PR body; ONLY the App contributes escalate / stopped markers and converged (total=0) reviews.
+ * A comment's event time is its creation time — a directive added later by EDITING an old
+ * comment is not a session start (the webhook path may still run a review for it).
+ * Reads fail closed: a list error throws (the caller must not act on a partial history).
+ */
+export async function readLoopEvents(
+  gh: ReviewLoopGithub,
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  opts: { botLogin?: string; pr?: LoopPrInfo } = {},
+): Promise<LoopEvent[]> {
+  const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
+  const [issues, inline, reviews] = await Promise.all([
+    gh.listIssueComments(token, owner, repo, pr),
+    gh.listReviewComments(token, owner, repo, pr),
+    gh.listPullReviews(token, owner, repo, pr),
+  ]);
+  const events: LoopEvent[] = [];
+  for (const c of issues) {
+    if (!c.createdAt) continue;
+    if (isSelfLogin(c.userLogin, botLogin)) {
+      if (parseEscalateMarker(c.body, { authoredByBot: true })) events.push({ at: c.createdAt, kind: "escalate" });
+      else if (isStoppedComment(c.body, { authoredByBot: true })) events.push({ at: c.createdAt, kind: "stopped" });
+    } else {
+      pushDirective(events, c.body, c.createdAt, c.userLogin);
+    }
+  }
+  for (const c of inline) {
+    if (c.createdAt && !isSelfLogin(c.userLogin, botLogin)) pushDirective(events, c.body, c.createdAt, c.userLogin);
+  }
+  const prInfo = opts.pr;
+  if (prInfo?.createdAt && prInfo.author && !isSelfLogin(prInfo.author, botLogin)) {
+    pushDirective(events, prInfo.body, prInfo.createdAt, prInfo.author);
+  }
+  for (const r of reviews) {
+    if (isSelfLogin(r.userLogin, botLogin) && r.submittedAt && parseFindingsTotal(r.body) === 0) {
+      events.push({ at: r.submittedAt, kind: "converged" });
+    }
+  }
+  return events;
+}
+
+/** The PR's current loop session (pure fold over readLoopEvents). */
+export async function readLoopSession(
+  gh: ReviewLoopGithub,
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  opts: { botLogin?: string; pr?: LoopPrInfo; extra?: LoopEvent[] } = {},
+): Promise<LoopSession> {
+  const events = await readLoopEvents(gh, token, owner, repo, pr, opts);
+  return deriveLoopSession([...events, ...(opts.extra ?? [])]);
 }

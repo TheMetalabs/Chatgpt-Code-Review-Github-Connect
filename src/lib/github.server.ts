@@ -703,8 +703,8 @@ export async function listReviewComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null }>(
+): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; body: string }>> {
+  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null; body?: string | null }>(
     token,
     `/repos/${owner}/${repo}/pulls/${pr}/comments`,
   );
@@ -713,6 +713,7 @@ export async function listReviewComments(
     path: String(c.path ?? ""),
     commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
     createdAt: String(c.created_at ?? ""),
+    body: String(c.body ?? ""),
   }));
 }
 
@@ -830,11 +831,24 @@ export async function fetchPullHeadRef(
   owner: string,
   repo: string,
   pr: number,
-): Promise<{ ref: string; sha: string; fork: boolean; sameRepo: boolean; additions?: number; deletions?: number }> {
+): Promise<{
+  ref: string;
+  sha: string;
+  fork: boolean;
+  sameRepo: boolean;
+  additions?: number;
+  deletions?: number;
+  body?: string | null;
+  createdAt?: string;
+  author?: string;
+}> {
   const out = await gh<{
     head?: { ref?: string; sha?: string; repo?: { fork?: boolean; full_name?: string } | null };
     additions?: number;
     deletions?: number;
+    body?: string | null;
+    created_at?: string;
+    user?: { login?: string } | null;
   }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
   if (!out.ok || !out.data.head?.ref || !out.data.head.sha) {
     throw new Error(out.ok ? "pull request has no head ref/sha" : `could not load pull request (${out.status}): ${out.text}`);
@@ -852,7 +866,23 @@ export async function fetchPullHeadRef(
     sameRepo: typeof headRepo === "string" && headRepo.toLowerCase() === `${owner}/${repo}`.toLowerCase(),
     additions: n(out.data.additions),
     deletions: n(out.data.deletions),
+    // PR-body directives are loop events too (at the PR's creation time, by its author).
+    body: out.data.body ?? null,
+    createdAt: typeof out.data.created_at === "string" ? out.data.created_at : undefined,
+    author: out.data.user?.login ?? undefined,
   };
+}
+
+/** A user's repository permission (legacy `permission` field: admin | write | read | none —
+ * `maintain` reports as write). Throws on a lookup failure: the apply gate fails closed. */
+export async function fetchUserPermission(token: string, owner: string, repo: string, login: string): Promise<string> {
+  if (!login) throw new Error("no user to check");
+  const out = await gh<{ permission?: string }>(
+    token,
+    `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`,
+  );
+  if (!out.ok) throw new Error(`permission lookup for ${login} failed (${out.status})`);
+  return String(out.data.permission ?? "none");
 }
 
 export async function createIssueComment(

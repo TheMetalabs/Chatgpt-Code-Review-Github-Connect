@@ -67,7 +67,7 @@ export function reviewSkipReason(opts: {
   // A stop directive is control-only unless the body ALSO carries an independent mention,
   // which must still queue its own review.
   if (mentionTrigger && loop?.kind === "stop" && !independentMention)
-    return "review-loop stop (no active loop engine)";
+    return "review-loop stop (control command — handled by the loop engine)";
   const requested = mentionTrigger && (loop?.kind === "start" || independentMention);
   if (opts.settings.skipDrafts && opts.sample.isDraft && !requested) return "draft";
   if (opts.settings.skipForks) {

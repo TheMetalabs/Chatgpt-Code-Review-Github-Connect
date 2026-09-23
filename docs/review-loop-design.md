@@ -42,6 +42,27 @@
 - **동시성:** 한 PR 내부는 deliveryId 디둡으로 "루프 1개/PR"(재진입·중복 차단). 서로 다른 PR은 **병렬**(§6 병렬성).
 - **fix 에이전트는 설정으로 지정**(§6b): 어느 provider가 어떤 방식으로 수정할지. 기본은 미설정(수정 안 함).
 
+### 2b. 루프 세션 — PR 상태, GitHub에서 도출 (구현: `review-loop-session.ts`)
+
+루프는 **잡 상태가 아니라 PR 상태**다. harbor 잡은 메모리에만 있어(재시작 시 소실) 세션 근거가 될 수 없다.
+GitHub가 영속하는 이벤트(코멘트·리뷰·PR 본문)를 접어서 세션을 도출한다 — 모든 프로세스·재시작이 같은 답을 낸다.
+
+- **시작:** 마지막 종료 이벤트 이후 **첫 사람 start 지시어**(이슈 코멘트·인라인 코멘트·PR 본문, 작성 시각 기준).
+  세션 안에서 start를 다시 걸어도 **앵커는 유지**되고 모드·시작자만 갱신된다 → 라운드 예산이 리셋되지 않는다.
+- **종료 이벤트:** 사람의 stop 지시어, 봇의 ESCALATE 마커, 봇의 STOPPED 마커, 봇의 clean 리뷰(`total=0`, CONVERGED).
+  같은 초의 동률은 종료가 먼저(핸드오프와 같은 초의 start는 새 세션).
+- **작성자 강제:** start/stop은 사람만, 마커·CONVERGED는 봇(App 로그인)만. 봇 산문·사람이 쓴 마커는 무시.
+- **활성 세션의 모든 리뷰가 루프 라운드**다(명시 start, 연속 마커, push 연속, 세션 중 요청한 일반 리뷰).
+- **push = 다음 라운드:** 활성 세션에서 사람이 push하면 드라이버가 연속 마커를 달아 새 head를 리뷰한다(봇 자신의 push는
+  수정 라운드가 직접 연속 마커를 단다). 리뷰 중 head가 움직이면 옛 라운드는 조용히 supersede된다.
+- **정지:** 사람의 `/review-loop stop` 은 세션을 끝내고, 진행 중인 루프 리뷰를 취소하며, 고정 STOPPED 마커를 **한 번**
+  남긴다(웹훅의 작성 시각을 주입해 목록 API 지연과 무관). 수정 중이면 커밋 직전 재확인에서 멈추고, 커밋 후였다면
+  연속 요청을 하지 않는다.
+- **apply 권한:** 세션 시작자(마지막 사람 start)의 저장소 권한이 write/admin이어야 apply한다. 조회 실패는 fail-closed
+  (`loop-error`). suggest는 쓰지 않으므로 권한 확인이 없다.
+- 경계: 기존 코멘트를 **편집**해 넣은 지시어는 세션 시작이 아니다(작성 시각 기준). 웹훅 경로는 리뷰를 돌릴 수 있으나
+  세션이 없으면 수정 라운드는 돌지 않는다.
+
 ## 3. ⛔ 종료 신호는 고정·명시 리터럴 — 절대 LLM이 짓지 않는다 (핵심)
 
 수렴 판정 `"didn't find any major issues"` 가 substring 매칭으로 안정적인 것처럼, **루프의 모든 종착 신호는
@@ -118,10 +139,9 @@ ashlar 자신의 파서는 마커가 **코멘트 맨 앞**에 있을 때만 신�
 
 불변식: `@ashlar review` 는 0-UNADDRESSED 일 때만 / 라운드당 in-flight 1개 / push 1개 / DIRTY SHA에 요청 금지.
 
-**종료 계약(구현, `review-loop-runtime.server.ts`):** apply 루프는 반드시 고정 신호 하나로 끝난다 —
-CONVERGED(clean 리뷰 `total=0`) 또는 ESCALATE(reason 코드). 조용한 정지·자유 문장 종료는 없다. suggest 모드의
-라운드는 고정 "suggestion" 리포트로 사람에게 넘긴다(설계상 핸드오프 — push가 없으니 다음 head가 없다; 사람이
-적용·push 후 루프를 재실행).
+**종료 계약(구현, `review-loop-runtime.server.ts`):** 루프 세션은 반드시 고정 신호 하나로 끝난다 —
+CONVERGED(clean 리뷰 `total=0`), ESCALATE(reason 코드), STOPPED(운영자 정지). 조용한 정지·자유 문장 종료는 없다.
+suggest 모드의 라운드는 고정 "suggestion" 리포트로 사람에게 넘기고, 사람이 적용·push하면 세션이 이어진다(§2b).
 
 - **수정 라운드 예산** `ASHLAR_LOOP_ROUND_CAP`(기본 **5**): 리뷰 라운드 k(≤5) 뒤에 수정 라운드 k. 리뷰 라운드
   6은 5번째 수정의 **검증 리뷰** — clean이면 CONVERGED, 지적이 남으면 `round-cap` ESCALATE(추세와 무관한 하드 상한).

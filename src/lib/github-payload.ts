@@ -21,6 +21,12 @@ export type ParsedDelivery =
       thread?: JobThread;
       installationId?: number;
       untrustedBody: string;
+      /** The webhook ACTOR (sender.login) — for synchronize, the pusher (target.sender is the PR
+       * author on lifecycle events). The loop engine keys "own push" / stop authorship on it. */
+      actor: string;
+      /** The triggering comment's created_at (comment events), so the loop engine can place a
+       * stop directive in the session even before the list API has caught up. */
+      eventAt?: string;
     }
   | { ok: false; reason: string };
 
@@ -40,7 +46,7 @@ type Gh = {
     user?: { login?: string };
   };
   issue?: { number?: number; pull_request?: unknown; title?: string };
-  comment?: { id?: number; body?: string };
+  comment?: { id?: number; body?: string; created_at?: string };
 };
 
 function splitRepo(full: string | undefined): { owner: string; repo: string } | null {
@@ -116,6 +122,7 @@ export function parseGitHubPayload(
       // requested, matching the issue_comment path; bodyLoopStart only gates promotion above.
       thread: bodyRequest ? { kind: "pr_body", commentId: 0, userText: text, loop: freshLoop } : undefined,
       untrustedBody: text.slice(0, 4000),
+      actor: sender,
     };
   }
 
@@ -161,6 +168,8 @@ export function parseGitHubPayload(
           : freshLoopDirective(body.action, body.comment?.body, body.changes?.body?.from),
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
+      actor: sender,
+      eventAt: typeof body.comment?.created_at === "string" ? body.comment.created_at : undefined,
     };
   }
 
@@ -194,6 +203,8 @@ export function parseGitHubPayload(
         loop: freshLoopDirective(body.action, body.comment?.body, body.changes?.body?.from),
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
+      actor: sender,
+      eventAt: typeof body.comment?.created_at === "string" ? body.comment.created_at : undefined,
     };
   }
 

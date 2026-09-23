@@ -2,9 +2,13 @@
  * Review-loop runtime: the post-review step that makes the loop real (design §5 steps 4–8).
  *
  * Each call is ONE loop step for one posted review: either ESCALATE (stuck / budget spent) or
- * run one fix round and report it in-thread. The loop REPEATS because an applied round posts
- * the fixed continuation marker (review-loop.ts continueComment); its webhook starts the next
- * review on the new head, whose post-review step runs again.
+ * run one fix round and report it in-thread. The loop is PR STATE, derived from durable GitHub
+ * history (review-loop-session.ts): a session starts at the first human start after the last
+ * terminal signal and survives restarts and re-issued starts. The loop REPEATS because every
+ * new head in an active session gets a review — an applied round posts the fixed continuation
+ * marker itself (review-loop.ts continueComment); a human push gets one from
+ * continueLoopOnPush. A human stop directive ends the session (stopLoop acknowledges it with the
+ * fixed STOPPED marker).
  *
  * TERMINATION CONTRACT (design §3/§5/§8): every loop step past the gates ends in a FIXED,
  * deterministic outcome — never a silent pause or free text:
@@ -13,13 +17,15 @@
  *     (fix-failed / fix-declined / loop-error);
  *   - apply: the fixed "applied" report + continuation marker (the next review follows);
  *   - suggest: the fixed "suggestion" report — the designed hand-off (a human applies it and
- *     re-runs the loop; suggest never pushes, so there is no next head to review).
+ *     pushes; the push continues the session).
+ *   - STOPPED: the operator's stop (acknowledged once by stopLoop; in-flight steps go quiet).
  * The fix-round budget (ASHLAR_LOOP_ROUND_CAP, default 5) is enforced at the next review: review
  * round N+1 verifies the N-th fix (clean → CONVERGED, else round-cap). The ONLY quiet exits are
- * supersession (a newer head drives the loop) and an existing handoff on this head.
+ * supersession (a newer head drives the loop), an operator stop, and an existing handoff on
+ * this head. Apply also requires the session starter's write permission (design §2).
  * Everything is gated OFF by default:
  *   - env ASHLAR_FIX_AGENT=1 AND settings.fixAgent.provider != null (design §6b), AND
- *   - the review was triggered by `/review-loop` (job.thread.loop is a start directive), AND
+ *   - the PR has an ACTIVE loop session (durable: a human start after the last terminal), AND
  *   - github origin, same-repo (not a fork — the installation token cannot push to a fork),
  *     with findings on HEAD.
  *
@@ -37,7 +43,9 @@ import {
   ESCALATE_IN_FLIGHT,
   escalateNow,
   maybeEscalate,
+  readLoopSession,
   reconstructRounds,
+  type LoopPrInfo,
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
 import {
@@ -47,12 +55,15 @@ import {
   MAX_CONTINUE_ROUND,
   resolveBotLogin,
   sanitizeUntrusted,
+  stoppedComment,
   type EscalateReason,
+  type ReviewLoopMode,
   type RoundSummary,
 } from "./review-loop.ts";
+import type { LoopSession } from "./review-loop-session.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
-export interface PullHead {
+export interface PullHead extends LoopPrInfo {
   ref: string;
   sha: string;
   fork: boolean;
@@ -66,6 +77,8 @@ export interface PullHead {
 export interface LoopRuntimeGithub extends ReviewLoopGithub {
   fetchPullHeadRef(token: string, owner: string, repo: string, pr: number): Promise<PullHead>;
   gitDataApi(token: string, owner: string, repo: string): GitDataApi;
+  /** Repository permission of a user (admin | write | read | none). Throws on lookup failure. */
+  fetchUserPermission(token: string, owner: string, repo: string, login: string): Promise<string>;
 }
 
 export interface LoopRuntimeDeps {
@@ -88,28 +101,29 @@ export type LoopStepResult =
   | { ran: true; step: "escalated"; reason: string; detail?: string }
   | { ran: true; step: "fix"; outcome: string; commitSha?: string; error?: string; continued?: boolean; attempts?: number };
 
-// One loop step per PR head at a time (in-process): a second posted review of the same head
-// (re-request, redelivery) must not run a parallel fix round. Different heads never block each
-// other — the older one is superseded at its head checks. Cross-process coordination is a
-// NON-GOAL (single harbor instance; see the engine header).
-const inFlightSteps = new Set<string>();
-
 const SUPERSEDED = "superseded (head moved)";
 const ALREADY_ESCALATED = "already escalated on this head";
 const STEP_IN_FLIGHT = "another loop step is in flight for this head";
+const NO_SESSION = "no active loop session";
+const STOPPED_QUIET = "loop stopped by operator";
+const OWN_PUSH = "own push (the fix round continues the loop)";
 
 /** Benign non-run reasons: the default off-path and the designed quiet exits (a newer head
- * drives the loop / a handoff already ended it). Anything else is logged server-side. */
+ * drives the loop / a handoff or the operator already ended it). Anything else is logged. */
 export const SILENT_REASONS: readonly string[] = [
   "disabled",
-  "not a /review-loop review",
   "not a github job",
   "no findings (converged)",
   SUPERSEDED,
   ALREADY_ESCALATED,
   STEP_IN_FLIGHT,
+  NO_SESSION,
+  STOPPED_QUIET,
+  OWN_PUSH,
 ];
 
+/** Write-capable repository permissions (legacy field; `maintain` reports as `write`). */
+const WRITE_PERMISSIONS = new Set(["admin", "write"]);
 
 /** Fix-round budget (design: at most 5 review→fix rounds, then a human decides). */
 const DEFAULT_ROUND_CAP = 5;
@@ -119,6 +133,12 @@ const RETRYABLE = new Set<FixRoundResult["outcome"]>(["request-failed", "parse-f
 const HISTORY_RETRY_MS = 3000;
 const ESCALATE_BACKOFF_MS = 1500;
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+// One loop step per PR head at a time (in-process): a second posted review of the same head
+// (re-request, redelivery) must not run a parallel fix round. Different heads never block each
+// other — the older one is superseded at its head checks. Cross-process coordination is a
+// NON-GOAL (single harbor instance; see the engine header).
+const inFlightSteps = new Set<string>();
 
 function envOf(): NodeJS.ProcessEnv | undefined {
   return typeof process !== "undefined" ? process.env : undefined;
@@ -192,30 +212,11 @@ function diffLinesOf(head: PullHead): number | undefined {
     : undefined;
 }
 
-/** Loop session start = the CURRENT explicit /review-loop start for this PR: the most recent
- * start job at/before this job (in-memory) that the App itself did NOT post. The App's own
- * continuation triggers belong to the same session and never reset the window; an older,
- * finished session's start must not widen it either. Identity is the EXACT resolved App login
- * (the same one the webhook parser and round attribution use). */
-export function loopSinceIso(job: Job, allJobs: readonly Job[], botLogin: string = ashlarBotLogin()): string | undefined {
-  const starts = allJobs
-    .filter(
-      (j) =>
-        j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && j.thread?.loop?.kind === "start" &&
-        !isSelfLogin(j.sender, botLogin) &&
-        Number.isFinite(j.createdAt) && j.createdAt <= job.createdAt,
-    )
-    .map((j) => j.createdAt);
-  if (starts.length === 0) return undefined;
-  return new Date(Math.max(...starts)).toISOString();
-}
-
-/** Effective mode: the /review-loop command's mode, with the operator's global setting as a
- * permission CEILING — auto-push happens only when the command says `apply` AND the setting
- * allows `apply`. `suggest` anywhere means no push. */
-export function effectiveFixMode(job: Job, settings: BotSettings): "suggest" | "apply" {
-  const commanded = job.thread?.loop?.kind === "start" ? job.thread.loop.mode : "suggest";
-  return commanded === "apply" && settings.fixAgent.mode === "apply" ? "apply" : "suggest";
+/** Effective mode: the SESSION's mode (the latest human start), with the operator's global
+ * setting as a permission CEILING — auto-push happens only when the session says `apply` AND
+ * the setting allows `apply`. `suggest` anywhere means no push. */
+export function effectiveLoopMode(sessionMode: ReviewLoopMode | undefined, settings: BotSettings): ReviewLoopMode {
+  return sessionMode === "apply" && settings.fixAgent.mode === "apply" ? "apply" : "suggest";
 }
 
 /** Deterministic, model-free rendering of the posted findings for the fix prompt. */
@@ -287,8 +288,8 @@ export function sanitizeModelText(text: string | undefined, opts: { oneLine?: bo
   return sanitizeUntrusted(text, opts);
 }
 
-/** How an applied round's report ends: the continuation was requested, or why it was not. */
-type ContinuationStatus = { ok: true } | { ok: false; error: string };
+/** How an applied round's report ends: continued, stopped by the operator, or why it could not. */
+type ContinuationStatus = { ok: true } | { ok: false; stopped: true } | { ok: false; error: string };
 
 function renderFixReport(res: FixRoundResult, mode: string, attempts: number, continuation?: ContinuationStatus): string {
   const files = (res.files ?? []).map((f) => `- \`${sanitizeModelText(f.path, { oneLine: true, max: 300 })}\``).join("\n");
@@ -298,11 +299,13 @@ function renderFixReport(res: FixRoundResult, mode: string, attempts: number, co
     case "applied": {
       const tail = !continuation || continuation.ok
         ? "Loop continues: the next review is requested on the new head."
-        : `The next review could not be requested (${sanitizeModelText(continuation.error, { oneLine: true, max: 300 })}); see the loop handoff.`;
+        : "stopped" in continuation
+          ? "Loop stopped by the operator: no further review is requested."
+          : `The next review could not be requested (${sanitizeModelText(continuation.error, { oneLine: true, max: 300 })}); see the loop handoff.`;
       return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha ?? "(unknown)"}\` (mode: ${mode}${tries}).\n\n${summary}\n\nChanged:\n${files}\n\n${tail}`;
     }
     case "suggested":
-      return `### Ashlar fix agent — suggestion (mode: ${mode}${tries})\n\n${summary}\n\nProposed changes (not pushed):\n${files}\n\nApply them and push, then re-run the loop — or use apply mode to auto-commit.`;
+      return `### Ashlar fix agent — suggestion (mode: ${mode}${tries})\n\n${summary}\n\nProposed changes (not pushed):\n${files}\n\nApply them and push — the loop continues on your push (use apply mode to auto-commit).`;
     case "no-change":
       return `### Ashlar fix agent — no change\n\n${summary || "All findings were pushed back / declined / deferred."}`;
     default:
@@ -323,6 +326,7 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
     createIssueComment: github.createIssueComment,
     fetchPullHeadRef: github.fetchPullHeadRef,
     gitDataApi: github.gitDataApi,
+    fetchUserPermission: github.fetchUserPermission,
   };
   // First provider: local (a plain request/response). chatgpt/grok ride the bridge's
   // awaiting_chat lifecycle and are wired separately.
@@ -354,36 +358,49 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
   return { gh, requestFix, validate: builtinValidate, fixReportsActivity: settings.fixAgent.provider === "local" && streaming };
 }
 
+type PrRef = { owner: string; repo: string; pr: number };
+
+/** The PR's current loop session from durable GitHub history (fresh read). */
+function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullHead, botLogin: string): Promise<LoopSession> {
+  return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head });
+}
+
 /**
  * One post-review loop step. Fire-and-forget from harbor; never throws (a loop failure must
  * never un-post the review). Returns a structured result for logs/tests.
+ *
+ * The loop is PR state, not job state: any posted review on a PR whose durable session is
+ * ACTIVE (review-loop-session.ts) is a loop round — the explicit start, the driver's
+ * continuation, a push-triggered continuation, or a plain re-review requested mid-session.
  */
 export async function runPostReviewLoop(
   token: string,
   job: Job,
   sample: SamplePr | undefined,
   settings: BotSettings,
-  allJobs: readonly Job[],
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
 ): Promise<LoopStepResult> {
-  // Silent gates: the default off-path (no user asked for a loop here, or nothing to do). A
-  // zero-finding loop review is CONVERGED — its clean review (total=0) is the terminal signal.
+  // Silent gates: the default off-path (no fix agent) or nothing to do. A zero-finding review
+  // is CONVERGED — its clean review (total=0) is the terminal signal and ends the session.
   if (!loopEnabled(settings, env)) return { ran: false, reason: "disabled" };
-  if (job.thread?.loop?.kind !== "start") return { ran: false, reason: "not a /review-loop review" };
   if (job.origin !== "github") return { ran: false, reason: "not a github job" };
   const findings = job.findings ?? [];
+  if (findings.length === 0) return { ran: false, reason: "no findings (converged)" };
 
   const { owner, repo, pr, headSha } = job;
+  const ref: PrRef = { owner, repo, pr };
   const botLogin = ashlarBotLogin(env);
   const cap = roundCap(env);
   let d: LoopRuntimeDeps | undefined = deps;
   let rounds: RoundSummary[] = [];
   let diffLines: number | undefined;
-  // Past the gates the user asked for a loop: every stop that is not a supersession is ONE
-  // fixed ESCALATE (reason code + deterministic detail), never free text. `head` is the commit
-  // the handoff is about: the reviewed head — or, once this round pushed, the NEW head.
-  let sinceIso: string | undefined;
+  let requested = false; // true once the durable session says a loop is active
+  let sinceIso: string | undefined; // the session anchor (scopes rounds + handoff idempotency)
+  // Past the session gate the user asked for a loop: every stop that is not a supersession /
+  // operator stop is ONE fixed ESCALATE (reason code + deterministic detail), never free text.
+  // `head` is the commit the handoff is about: the reviewed head — or, once this round pushed,
+  // the NEW head.
   const escalate = async (reason: EscalateReason, detail: string, head: string = headSha): Promise<LoopStepResult> => {
     if (!d) return { ran: false, reason: `ESCALATE ${reason} not posted (no GitHub client): ${detail}` };
     const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, sinceIso });
@@ -407,34 +424,22 @@ export async function runPostReviewLoop(
   try {
     d = deps ?? (await productionDeps(settings));
     const gh = d.gh;
-    sinceIso = loopSinceIso(job, allJobs, botLogin);
-    trace(job.id, "step", { pr, head: headSha.slice(0, 7), findings: findings.length });
     const head = await gh.fetchPullHeadRef(token, owner, repo, pr);
-    // The reviewed head is STALE (a push landed after the review started): neither a clean
-    // verdict nor a fix applies to the live head. Request the live head's review so the loop
-    // goes on there — a stale review never ends or stalls the loop. Also the fork-push guard: a
-    // commit parented on a stale SHA would fast-forward over a contributor's backward force-push.
-    if (head.sha !== headSha) {
-      trace(job.id, "superseded", { live: head.sha.slice(0, 7) });
-      if (FULL_SHA_RE.test(head.sha)) {
-        const hist = await reconstructRounds(gh, token, owner, repo, pr, { botLogin, sinceIso }).catch(() => [] as RoundSummary[]);
-        const mode = effectiveFixMode(job, settings);
-        await gh
-          .createIssueComment(token, { owner, repo, pr, body: continueComment({ mode, round: Math.min(hist.length + 1, MAX_CONTINUE_ROUND), pr, head: head.sha }) })
-          .catch(() => {});
-      }
-      return { ran: false, reason: SUPERSEDED };
-    }
-    // CONVERGED on the LIVE head: its clean review (total=0) is the terminal signal.
-    if (findings.length === 0) {
-      trace(job.id, "converged");
-      return { ran: false, reason: "no findings (converged)" };
-    }
+    // A newer commit superseded this round (a push, or another round's fix): that head's own
+    // review drives the loop from here. Also the fork-push guard: a commit parented on a stale
+    // SHA would fast-forward over a contributor's backward force-push.
+    if (head.sha !== headSha) return { ran: false, reason: SUPERSEDED };
+    const session = await sessionOf(gh, token, ref, head, botLogin);
+    if (!session.active) return { ran: false, reason: NO_SESSION };
+    requested = true;
+    sinceIso = session.startIso;
+    trace(job.id, "step", { pr, head: headSha.slice(0, 7), findings: findings.length });
     diffLines = diffLinesOf(head);
     if (!sample) return await escalate("loop-error", "no head-pinned snapshot for this review");
 
-    // 1) Stuck or budget spent? The history must SHOW this review as the latest round: the
-    //    budget is only enforceable from an attributable history (one re-read for a lagging API).
+    // 1) Stuck or budget spent? Rounds are counted from the durable session anchor, so a
+    //    re-issued start never resets the budget. The history must SHOW this review as the
+    //    latest round (one re-read for a lagging API).
     const escOpts = {
       owner,
       repo,
@@ -444,7 +449,7 @@ export async function runPostReviewLoop(
       diffLines,
       botLogin,
       requireCurrentRound: true,
-      sinceIso,
+      sinceIso: session.startIso,
     };
     let esc = await maybeEscalate(gh, token, escOpts);
     if (esc.error === CURRENT_ROUND_MISSING) {
@@ -459,17 +464,31 @@ export async function runPostReviewLoop(
     if (esc.error) return await escalate("loop-error", `could not verify the loop history: ${esc.error}`);
 
     // 2) One fix round on the head-pinned snapshot.
-    const mode = effectiveFixMode(job, settings);
-    // Apply writes the head branch through THIS repository's API: only a POSITIVELY verified
-    // same-repository head may be written (a fork, or unknown provenance such as a deleted head
-    // repository, is refused — never coerced into "safe").
-    if (mode === "apply" && head.sameRepo !== true) {
-      return await escalate(
-        "loop-error",
-        head.fork
-          ? "apply on a fork PR: the installation token cannot push to a fork (use suggest mode)"
-          : "apply needs a verified same-repository head; the PR's head repository is unknown or different (use suggest mode)",
-      );
+    const mode = effectiveLoopMode(session.mode, settings);
+    if (mode === "apply") {
+      // Apply writes the head branch through THIS repository's API: only a POSITIVELY verified
+      // same-repository head may be written (a fork, or unknown provenance such as a deleted head
+      // repository, is refused — never coerced into "safe").
+      if (head.sameRepo !== true) {
+        return await escalate(
+          "loop-error",
+          head.fork
+            ? "apply on a fork PR: the installation token cannot push to a fork (use suggest mode)"
+            : "apply needs a verified same-repository head; the PR's head repository is unknown or different (use suggest mode)",
+        );
+      }
+      // Design §2: the loop WRITES code, so apply requires the session's starter (the latest
+      // human start) to hold write access. Fail closed on a lookup failure.
+      const starter = session.starter ?? "";
+      let permission: string;
+      try {
+        permission = await gh.fetchUserPermission(token, owner, repo, starter);
+      } catch (e) {
+        return await escalate("loop-error", `could not verify write permission for ${starter || "(unknown)"}: ${(e as Error)?.message ?? String(e)}`);
+      }
+      if (!WRITE_PERMISSIONS.has(permission)) {
+        return await escalate("loop-error", `apply requires write access; ${starter || "(unknown)"} has '${permission}' (re-run in suggest mode or by a maintainer)`);
+      }
     }
     // Editable set = the PR's CHANGED files only. sample.files also carries policy/reference
     // context fetched for the review; those stay read-only and never enter allowedPaths.
@@ -481,17 +500,22 @@ export async function runPostReviewLoop(
       files,
       reviewer: settings.fixAgent.provider ?? undefined,
     });
+    // Fresh reads (never cached): the world may move while the (slow) fix request runs.
     const superseded = async (): Promise<boolean> => (await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha;
-    // Re-verify the live head immediately before the commit path (the fix request can be slow).
+    const stopped = async (): Promise<boolean> => !(await sessionOf(gh, token, ref, head, botLogin)).active;
+    // Re-verify the live head AND the session immediately before the commit path.
     const validate: FixValidate = async (candidate) => {
       const v = await d!.validate(candidate);
       if (!v.ok) return v;
-      return (await superseded()) ? { ok: false, error: "head moved during fix" } : { ok: true };
+      if (await superseded()) return { ok: false, error: "head moved during fix" };
+      if (await stopped()) return { ok: false, error: "loop stopped during fix" };
+      return { ok: true };
     };
     const maxAttempts = fixAttempts(env);
     const deps2 = d;
-    // The provider call runs under the watcher: the deadline excludes queue time, a queued (or
-    // just-started) request whose head moved is cancelled instead of generated in full.
+    // The provider call runs under the watcher: the deadline excludes queue time, and a queued (or
+    // just-started) request whose head moved or whose session ended is cancelled instead of
+    // generated in full.
     const requestFix: RequestFix = (p) =>
       watchFixRequest((prompt, ctl) => deps2.requestFix(prompt, ctl), p, {
         generationMs: deps2.fixTimeoutMs ?? fixTimeoutMs(env),
@@ -500,7 +524,7 @@ export async function runPostReviewLoop(
         checkEveryMs: deps2.fixWatch?.checkEveryMs ?? FIX_RELEVANCE_CHECK_MS,
         tickMs: deps2.fixWatch?.tickMs ?? FIX_WATCH_TICK_MS,
         reportsActivity: deps2.fixReportsActivity ?? false,
-        stillWanted: async () => ((await superseded()) ? "the PR head moved" : null),
+        stillWanted: async () => ((await superseded()) ? "the PR head moved" : (await stopped()) ? "loop stopped" : null),
       });
     // Progress signal: the fix can wait long in a busy provider queue — a driver must be able to
     // tell "in progress" from "dead". Best effort: it never blocks or fails the round.
@@ -526,16 +550,20 @@ export async function runPostReviewLoop(
       trace(job.id, "fix-result", { attempt: attempts, outcome: res.outcome, ms: Date.now() - t0, error: res.error });
       if (!RETRYABLE.has(res.outcome) || attempts >= maxAttempts) break;
       if (await superseded()) return { ran: false, reason: SUPERSEDED };
+      if (await stopped()) return { ran: false, reason: STOPPED_QUIET };
       prompt = `${basePrompt}\n\n${retryFeedback(res)}`;
     }
 
     // 3) POST-COMMIT PHASE — the branch already moved, so from here every handoff names the NEW
     //    head. Order: the continuation (the control signal) FIRST, then the report, whose last
-    //    line states what actually happened; a failure to continue is a loop-error handoff.
+    //    line states what actually happened; a failure to continue is a loop-error handoff. An
+    //    operator stop that landed meanwhile means no continuation at all.
     const afterCommit = async (done: FixRoundResult, tries: number): Promise<LoopStepResult> => {
       const newHead = done.commitSha && FULL_SHA_RE.test(done.commitSha) ? done.commitSha : undefined;
       let status: ContinuationStatus;
-      if (!newHead) {
+      if (await stopped()) {
+        status = { ok: false, stopped: true };
+      } else if (!newHead) {
         status = { ok: false, error: "the commit sha was not returned" };
       } else {
         try {
@@ -550,18 +578,19 @@ export async function runPostReviewLoop(
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status) }).catch(() => {
         /* the report is informational; the continuation / handoff carries the signal */
       });
-      if (status.ok) {
-        trace(job.id, "continued", { commit: newHead?.slice(0, 7), round: rounds.length + 1 });
-        return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead, continued: true, attempts: tries };
+      if (status.ok) trace(job.id, "continued", { commit: newHead?.slice(0, 7), round: rounds.length + 1 });
+      if (status.ok || "stopped" in status) {
+        return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead ?? done.commitSha, continued: status.ok, attempts: tries };
       }
       const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
       return await escalate("loop-error", `the fix was committed but the next review could not be requested: ${status.error}`, live);
     };
 
     if (res.outcome === "applied") return await afterCommit(res, attempts);
-    // Nothing was pushed: a moved head makes ANY result moot — a suggestion for a stale head
-    // included — so the newer head's review drives the loop (quiet).
+    // Nothing was pushed: a moved head (superseded) or an operator stop makes ANY result moot —
+    // a suggestion for a stale head included — so nothing is posted.
     if (await superseded()) return { ran: false, reason: SUPERSEDED };
+    if (await stopped()) return { ran: false, reason: STOPPED_QUIET };
     if (res.outcome === "suggested") {
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts) });
       return { ran: true, step: "fix", outcome: res.outcome, continued: false, attempts };
@@ -572,10 +601,82 @@ export async function runPostReviewLoop(
       return await escalate("fix-declined", `no-change: ${res.summary ?? "every finding was pushed back / declined / deferred"}`);
     }
     return await escalate("fix-failed", `${res.outcome} after ${attempts} attempt(s): ${res.error ?? "no error detail"}`);
-
   } catch (e) {
-    return await escalate("loop-error", `loop step failed: ${(e as Error)?.message ?? String(e)}`);
+    const reason = `loop step failed: ${(e as Error)?.message ?? String(e)}`;
+    // Hand off only when a loop was requested; before the session is known a failure is a
+    // server-side error (no PR noise on a PR that never asked for a loop).
+    return requested ? await escalate("loop-error", reason) : { ran: false, reason };
   } finally {
     inFlightSteps.delete(stepKey);
+  }
+}
+
+/**
+ * A push to a PR whose loop session is ACTIVE continues the loop: the driver posts the fixed
+ * continuation marker so the next review runs on the pushed head (design §5 — the loop runs
+ * until CONVERGED / ESCALATE / STOPPED, not one round per command). The App's own push is
+ * skipped: its fix round posts the continuation itself. Never throws.
+ */
+export async function continueLoopOnPush(
+  token: string,
+  push: { owner: string; repo: string; pr: number; headSha: string; actor: string },
+  settings: BotSettings,
+  deps?: LoopRuntimeDeps,
+  env: NodeJS.ProcessEnv | undefined = envOf(),
+): Promise<{ posted: boolean; reason: string }> {
+  try {
+    if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
+    const botLogin = ashlarBotLogin(env);
+    if (isSelfLogin(push.actor, botLogin)) return { posted: false, reason: OWN_PUSH };
+    const d = deps ?? (await productionDeps(settings));
+    const head = await d.gh.fetchPullHeadRef(token, push.owner, push.repo, push.pr);
+    // A later push will continue with its own head; never request a review of a stale one.
+    if (head.sha !== push.headSha) return { posted: false, reason: SUPERSEDED };
+    const session = await sessionOf(d.gh, token, push, head, botLogin);
+    if (!session.active) return { posted: false, reason: NO_SESSION };
+    const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso });
+    const body = continueComment({ mode: session.mode ?? "suggest", round: rounds.length + 1, pr: push.pr, head: push.headSha });
+    await d.gh.createIssueComment(token, { owner: push.owner, repo: push.repo, pr: push.pr, body });
+    return { posted: true, reason: "continued" };
+  } catch (e) {
+    return { posted: false, reason: `continue on push failed: ${(e as Error)?.message ?? String(e)}` };
+  }
+}
+
+// In-process serialization so concurrent stop deliveries for one PR post STOPPED at most once
+// (the durable ack — the STOPPED marker — makes later deliveries no-ops).
+const inFlightStop = new Set<string>();
+
+/**
+ * A human stop directive ends the active session (the session fold already treats it as
+ * terminal); this posts the fixed STOPPED acknowledgement once. `stopAt` injects the stop from
+ * the webhook itself, so a list API that has not caught up yet still sees it. Never throws.
+ */
+export async function stopLoop(
+  token: string,
+  stop: { owner: string; repo: string; pr: number; actor: string; stopAt?: string },
+  settings: BotSettings,
+  deps?: LoopRuntimeDeps,
+  env: NodeJS.ProcessEnv | undefined = envOf(),
+): Promise<{ posted: boolean; reason: string }> {
+  const key = `${stop.owner}/${stop.repo}#${stop.pr}`;
+  if (inFlightStop.has(key)) return { posted: false, reason: "stop already in flight" };
+  inFlightStop.add(key);
+  try {
+    if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
+    const botLogin = ashlarBotLogin(env);
+    if (isSelfLogin(stop.actor, botLogin)) return { posted: false, reason: "bot-authored stop ignored" };
+    const d = deps ?? (await productionDeps(settings));
+    const head = await d.gh.fetchPullHeadRef(token, stop.owner, stop.repo, stop.pr);
+    const extra = stop.stopAt ? [{ at: stop.stopAt, kind: "stop" as const, actor: stop.actor }] : [];
+    const session = await readLoopSession(d.gh, token, stop.owner, stop.repo, stop.pr, { botLogin, pr: head, extra });
+    // Only a stop that actually ended an active session, and is not yet acknowledged.
+    if (session.active || session.endedBy !== "stop") return { posted: false, reason: NO_SESSION };
+    await d.gh.createIssueComment(token, { owner: stop.owner, repo: stop.repo, pr: stop.pr, body: stoppedComment() });
+    return { posted: true, reason: "stopped" };
+  } catch (e) {
+    return { posted: false, reason: `stop failed: ${(e as Error)?.message ?? String(e)}` };
+  } finally {
+    inFlightStop.delete(key);
   }
 }

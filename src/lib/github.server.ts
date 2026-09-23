@@ -658,6 +658,57 @@ export async function createPullReview(
   throw new Error("GitHub Reviews API failed");
 }
 
+export async function listPullReviews(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+): Promise<Array<{ userLogin: string; body: string; commitId: string; submittedAt: string }>> {
+  const out = await gh<Array<{ user?: { login?: string }; body?: string | null; commit_id?: string | null; submitted_at?: string | null }>>(
+    token,
+    `/repos/${owner}/${repo}/pulls/${pr}/reviews?per_page=100`,
+  );
+  if (!out.ok) return [];
+  return (out.data ?? []).map((r) => ({
+    userLogin: String(r.user?.login ?? ""),
+    body: String(r.body ?? ""),
+    commitId: String(r.commit_id ?? ""),
+    submittedAt: String(r.submitted_at ?? ""),
+  }));
+}
+
+export async function listReviewComments(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+): Promise<Array<{ userLogin: string; path: string; commitId: string }>> {
+  const out = await gh<Array<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null }>>(
+    token,
+    `/repos/${owner}/${repo}/pulls/${pr}/comments?per_page=100`,
+  );
+  if (!out.ok) return [];
+  return (out.data ?? []).map((c) => ({
+    userLogin: String(c.user?.login ?? ""),
+    path: String(c.path ?? ""),
+    commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
+  }));
+}
+
+export async function listIssueComments(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+): Promise<Array<{ userLogin: string; body: string }>> {
+  const out = await gh<Array<{ user?: { login?: string }; body?: string | null }>>(
+    token,
+    `/repos/${owner}/${repo}/issues/${pr}/comments?per_page=100`,
+  );
+  if (!out.ok) return [];
+  return (out.data ?? []).map((c) => ({ userLogin: String(c.user?.login ?? ""), body: String(c.body ?? "") }));
+}
+
 export async function createIssueComment(
   token: string,
   opts: { owner: string; repo: string; pr: number; body: string },

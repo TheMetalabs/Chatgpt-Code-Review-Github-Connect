@@ -3,10 +3,16 @@ import { dirname, join } from "node:path";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server.ts";
 import {
   DEFAULT_SETTINGS,
+  FIX_AGENT_PROVIDERS,
+  FIX_DELIVERIES,
+  FIX_MODES,
   LOCAL_REVIEW_MODES,
   normalizeReviewOrder,
   providersFromSettings,
   type BotSettings,
+  type FixAgentProvider,
+  type FixDelivery,
+  type FixMode,
   type LocalReviewMode,
   type ReviewProvider,
   type Severity,
@@ -145,6 +151,16 @@ function severity(v: unknown, fallback: Severity): Severity {
   return v === "P0" || v === "P1" || v === "P2" ? v : fallback;
 }
 
+function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
+  const d = DEFAULT_SETTINGS.fixAgent;
+  const p = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const provider = FIX_AGENT_PROVIDERS.includes(p.provider as FixAgentProvider) ? (p.provider as FixAgentProvider) : d.provider;
+  const delivery = FIX_DELIVERIES.includes(p.delivery as FixDelivery) ? (p.delivery as FixDelivery) : d.delivery;
+  const mode = FIX_MODES.includes(p.mode as FixMode) ? (p.mode as FixMode) : d.mode;
+  const parallelPrs = Math.max(1, Math.min(20, Math.floor(num(p.parallelPrs, d.parallelPrs))));
+  return { provider, delivery, mode, parallelPrs };
+}
+
 export function sanitizeBotSettings(raw: unknown): BotSettings {
   const p = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const mention = Array.isArray(p.mention)
@@ -166,6 +182,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     reviewChatgpt: bool(p.reviewChatgpt, DEFAULT_SETTINGS.reviewChatgpt),
     reviewGrok: bool(p.reviewGrok, DEFAULT_SETTINGS.reviewGrok),
     reviewLocal: bool(p.reviewLocal, DEFAULT_SETTINGS.reviewLocal),
+    fixAgent: normalizeFixAgent(p.fixAgent),
     localJsonRepairEnabled: bool(p.localJsonRepairEnabled, DEFAULT_SETTINGS.localJsonRepairEnabled),
     localLlmBaseUrl: str(p.localLlmBaseUrl, DEFAULT_SETTINGS.localLlmBaseUrl).trim(),
     localLlmApiKey: str(p.localLlmApiKey, DEFAULT_SETTINGS.localLlmApiKey),

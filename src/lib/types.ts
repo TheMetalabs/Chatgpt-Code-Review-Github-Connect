@@ -228,6 +228,8 @@ export interface BotSettings {
   reviewChatgpt: boolean;
   reviewGrok: boolean;
   reviewLocal: boolean;
+  /** Review-loop fix agent (design §6b) — configurable from the start; execution is phase 3. */
+  fixAgent: FixAgentSettings;
   /** Formatting-only recovery; independent of Local reviewer participation. */
   localJsonRepairEnabled: boolean;
   chatgptReasoning: ChatgptReasoning;
@@ -280,6 +282,26 @@ export interface SamplePr {
   referenceFiles?: SnapshotFile[];
 }
 
+export type FixAgentProvider = "chatgpt" | "grok" | "local" | "coding-agent";
+export type FixDelivery = "script-apply" | "chat-push" | "coding-agent";
+export type FixMode = "suggest" | "apply";
+export const FIX_AGENT_PROVIDERS: readonly FixAgentProvider[] = ["chatgpt", "grok", "local", "coding-agent"];
+export const FIX_DELIVERIES: readonly FixDelivery[] = ["script-apply", "chat-push", "coding-agent"];
+export const FIX_MODES: readonly FixMode[] = ["suggest", "apply"];
+
+/** Review-loop fix agent (design §6b), configurable from the start. Execution is phase 3;
+ * the config exists now so operators can pin who fixes and how before it ships. */
+export interface FixAgentSettings {
+  /** null = the review-loop does NOT auto-fix (safe default). */
+  provider: FixAgentProvider | null;
+  /** How the fix reaches the PR (§6 A/B/C). */
+  delivery: FixDelivery;
+  /** suggest = proposal / draft commit (human 1-click); apply = auto-commit + push (high-risk). */
+  mode: FixMode;
+  /** Max distinct PRs fixed concurrently — shares the reviewer bridge capacity. */
+  parallelPrs: number;
+}
+
 export const DEFAULT_SETTINGS: BotSettings = {
   username: "ashlar-bot",
   mention: ["@ashlar-bot", "/review"],
@@ -295,6 +317,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   reviewChatgpt: true,
   reviewGrok: true,
   reviewLocal: false,
+  fixAgent: { provider: null, delivery: "script-apply", mode: "suggest", parallelPrs: 3 },
   localJsonRepairEnabled: true,
   chatgptReasoning: "pro",
   grokReasoning: "heavy",

@@ -1,0 +1,103 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { maybeEscalate, reconstructRounds, type ReviewLoopGithub } from "./review-loop-engine.server.ts";
+
+const BOT = "ashlar-bot-review-loop[bot]";
+
+function findingsBody(total: number): string {
+  return `### Ashlar Review\nReviewed commit\n<!-- ashlar-findings total=${total} inline=${total} body=0 p0=0 p1=${total} p2=0 -->`;
+}
+
+/** Build a fake GitHub client from per-head round specs. */
+function fakeGh(
+  rounds: Array<{ head: string; findings: number; files: string[]; at: string }>,
+  issueComments: Array<{ userLogin: string; body: string }> = [],
+): { gh: ReviewLoopGithub; posted: string[] } {
+  const posted: string[] = [];
+  const gh: ReviewLoopGithub = {
+    async listPullReviews() {
+      // two reviews per head (explicit + synchronize) to prove dedup-by-head
+      return rounds.flatMap((r) => [
+        { userLogin: BOT, body: findingsBody(r.findings), commitId: r.head + "0000000", submittedAt: r.at },
+        { userLogin: BOT, body: findingsBody(r.findings), commitId: r.head + "0000000", submittedAt: r.at + "1" },
+      ]);
+    },
+    async listReviewComments() {
+      return rounds.flatMap((r) =>
+        r.files.map((f) => ({ userLogin: BOT, path: f, commitId: r.head + "0000000" })),
+      );
+    },
+    async listIssueComments() {
+      return issueComments;
+    },
+    async createIssueComment(_t, opts) {
+      posted.push(opts.body);
+      return { id: posted.length };
+    },
+  };
+  return { gh, posted };
+}
+
+describe("reconstructRounds", () => {
+  it("collapses multiple reviews on the same head into one round, ordered by time", async () => {
+    const { gh } = fakeGh([
+      { head: "aaaaaaa", findings: 6, files: ["x.ts"], at: "2026-01-01T00:00:00Z" },
+      { head: "bbbbbbb", findings: 3, files: ["y.ts"], at: "2026-01-01T01:00:00Z" },
+    ]);
+    const rounds = await reconstructRounds(gh, "t", "o", "r", 1);
+    assert.equal(rounds.length, 2);
+    assert.deepEqual(rounds.map((r) => [r.index, r.findings, r.head]), [
+      [1, 6, "aaaaaaa"],
+      [2, 3, "bbbbbbb"],
+    ]);
+    assert.deepEqual(rounds[0].files, ["x.ts"]);
+  });
+});
+
+describe("maybeEscalate", () => {
+  const files = ["src/lib/review-loop.ts"];
+  const pr68 = [6, 4, 3, 4, 3, 3].map((n, i) => ({
+    head: `h${i}`.padEnd(7, "0"),
+    findings: n,
+    files,
+    at: `2026-01-0${i + 1}T00:00:00Z`,
+  }));
+
+  it("emits a fixed ESCALATE handoff on a stuck (whack-a-mole) loop", async () => {
+    const { gh, posted } = fakeGh(pr68);
+    const res = await maybeEscalate(gh, "t", { owner: "o", repo: "r", pr: 68, head: "h5000000", roundCap: 8 });
+    assert.equal(res.escalated, true);
+    assert.equal(res.reason, "whack-a-mole");
+    assert.equal(posted.length, 1);
+    assert.ok(posted[0].includes("<!-- ashlar-loop-escalate reason=whack-a-mole"));
+    assert.ok(posted[0].includes("Ashlar review-loop halted"));
+  });
+
+  it("does not escalate a converged or still-progressing loop", async () => {
+    const conv = fakeGh([
+      { head: "aaaaaaa", findings: 3, files, at: "2026-01-01T00:00:00Z" },
+      { head: "bbbbbbb", findings: 0, files: [], at: "2026-01-02T00:00:00Z" },
+    ]);
+    const r1 = await maybeEscalate(conv.gh, "t", { owner: "o", repo: "r", pr: 1, head: "bbbbbbb", roundCap: 8 });
+    assert.equal(r1.escalated, false);
+    assert.equal(conv.posted.length, 0);
+
+    const prog = fakeGh([
+      { head: "aaaaaaa", findings: 5, files: ["a.ts"], at: "2026-01-01T00:00:00Z" },
+      { head: "bbbbbbb", findings: 3, files: ["b.ts"], at: "2026-01-02T00:00:00Z" },
+      { head: "ccccccc", findings: 1, files: ["c.ts"], at: "2026-01-03T00:00:00Z" },
+    ]);
+    const r2 = await maybeEscalate(prog.gh, "t", { owner: "o", repo: "r", pr: 2, head: "ccccccc", roundCap: 8 });
+    assert.equal(r2.escalated, false);
+    assert.equal(prog.posted.length, 0);
+  });
+
+  it("is idempotent: does not re-emit when an escalate for this head already exists", async () => {
+    const existing = [{ userLogin: BOT, body: "<!-- ashlar-loop-escalate reason=whack-a-mole round=6 pr=68 head=h500000 -->" }];
+    const { gh, posted } = fakeGh(pr68, existing);
+    const res = await maybeEscalate(gh, "t", { owner: "o", repo: "r", pr: 68, head: "h500000", roundCap: 8 });
+    assert.equal(res.escalated, false);
+    assert.equal(res.reason, "whack-a-mole"); // still classified, just not re-posted
+    assert.equal(posted.length, 0);
+  });
+});

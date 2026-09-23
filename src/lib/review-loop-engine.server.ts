@@ -1,0 +1,162 @@
+/**
+ * Review-loop ESCALATE engine (design §8), in ashlar so it reuses the single-source
+ * escalate composer (review-loop.ts §3) — no cross-repo drift. Reconstructs a PR's
+ * per-round finding trend from ashlar's own reviews, classifies why the loop is stuck,
+ * and emits the FIXED handoff. The external driver (grokbot cc_digest) only DETECTS it.
+ *
+ * Dependency-injected GitHub access (ReviewLoopGithub) so it unit-tests with fakes and
+ * never forces the harbor test fixture to stub new methods.
+ */
+import {
+  classifyStuck,
+  escalateFromRounds,
+  parseEscalateMarker,
+  type EscalateReason,
+  type RoundSummary,
+} from "./review-loop.ts";
+
+export interface ReviewLoopGithub {
+  listPullReviews(
+    token: string,
+    owner: string,
+    repo: string,
+    pr: number,
+  ): Promise<Array<{ userLogin: string; body: string; commitId: string; submittedAt: string }>>;
+  listReviewComments(
+    token: string,
+    owner: string,
+    repo: string,
+    pr: number,
+  ): Promise<Array<{ userLogin: string; path: string; commitId: string }>>;
+  listIssueComments(
+    token: string,
+    owner: string,
+    repo: string,
+    pr: number,
+  ): Promise<Array<{ userLogin: string; body: string }>>;
+  createIssueComment(
+    token: string,
+    opts: { owner: string; repo: string; pr: number; body: string },
+  ): Promise<{ id?: number }>;
+}
+
+// The real github.server binding lives at the harbor call site (harbor already imports
+// github.server); keeping this module DI-only lets it unit-test without the server graph.
+
+const FINDINGS_RE = /<!--\s*ashlar-findings\s+(.+?)\s*-->/;
+
+function isAshlar(login: string): boolean {
+  return login.toLowerCase().includes("ashlar");
+}
+
+function short(sha: string): string {
+  return (sha || "").slice(0, 7);
+}
+
+function parseFindingsTotal(body: string): number | null {
+  const m = FINDINGS_RE.exec(body || "");
+  if (!m) return null;
+  for (const pair of m[1].split(/\s+/)) {
+    if (pair.startsWith("total=")) {
+      const n = Number(pair.slice("total=".length));
+      return Number.isNaN(n) ? null : n;
+    }
+  }
+  return null;
+}
+
+/**
+ * One ROUND = one reviewed head. Multiple ashlar reviews on the same head (an explicit
+ * request plus a push-triggered synchronize review) collapse into one round so re-reviews
+ * of the same commit do not inflate the count; the latest review for a head wins its
+ * finding total, files are the union of that head's inline comments.
+ */
+export async function reconstructRounds(
+  gh: ReviewLoopGithub,
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+): Promise<RoundSummary[]> {
+  const [reviews, comments] = await Promise.all([
+    gh.listPullReviews(token, owner, repo, pr),
+    gh.listReviewComments(token, owner, repo, pr),
+  ]);
+
+  const filesByHead = new Map<string, Set<string>>();
+  for (const c of comments) {
+    if (!isAshlar(c.userLogin) || !c.commitId || !c.path) continue;
+    const head = short(c.commitId);
+    (filesByHead.get(head) ?? filesByHead.set(head, new Set()).get(head)!).add(c.path);
+  }
+
+  const byHead = new Map<string, number>();
+  const order: string[] = [];
+  const ashlarReviews = reviews
+    .filter((r) => isAshlar(r.userLogin))
+    .sort((a, b) => (a.submittedAt || "").localeCompare(b.submittedAt || ""));
+  for (const rv of ashlarReviews) {
+    const total = parseFindingsTotal(rv.body);
+    if (total === null) continue; // ops / non-summary review row
+    const head = short(rv.commitId);
+    if (!byHead.has(head)) order.push(head);
+    byHead.set(head, total);
+  }
+
+  return order.map((head, i) => ({
+    index: i + 1,
+    findings: byHead.get(head) ?? 0,
+    files: [...(filesByHead.get(head) ?? [])],
+    head,
+  }));
+}
+
+/** True if a bot-authored escalate handoff for this head already exists (idempotency). */
+async function alreadyEscalated(
+  gh: ReviewLoopGithub,
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  head: string,
+): Promise<boolean> {
+  const issues = await gh.listIssueComments(token, owner, repo, pr);
+  for (const c of issues) {
+    const parsed = parseEscalateMarker(c.body, { authoredByBot: isAshlar(c.userLogin) });
+    if (parsed && short(parsed.head) === short(head)) return true;
+  }
+  return false;
+}
+
+export interface EscalateResult {
+  escalated: boolean;
+  reason?: EscalateReason;
+  rounds: RoundSummary[];
+}
+
+/**
+ * Reconstruct the loop, classify, and — if stuck and not already escalated on this head —
+ * emit the fixed ESCALATE handoff. Safe to call after every loop review: a non-stuck loop
+ * (converged or still making progress) returns without posting.
+ */
+export async function maybeEscalate(
+  gh: ReviewLoopGithub,
+  token: string,
+  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number },
+): Promise<EscalateResult> {
+  const rounds = await reconstructRounds(gh, token, opts.owner, opts.repo, opts.pr);
+  const reason = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
+  if (!reason) return { escalated: false, rounds };
+  if (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head)) {
+    return { escalated: false, reason, rounds }; // one handoff per head
+  }
+  const body = escalateFromRounds(reason, rounds, {
+    pr: opts.pr,
+    head: short(opts.head),
+    repo: `${opts.owner}/${opts.repo}`,
+    roundCap: opts.roundCap,
+    diffLines: opts.diffLines,
+  });
+  await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
+  return { escalated: true, reason, rounds };
+}

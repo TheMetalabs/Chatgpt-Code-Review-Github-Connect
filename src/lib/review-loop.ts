@@ -294,3 +294,76 @@ export function sameDirective(a: ReviewLoopDirective | null, b: ReviewLoopDirect
   if (a.kind === "start" && b.kind === "start") return a.mode === b.mode;
   return true;
 }
+
+// ── Stuck classification (§8) — pure; drives the ESCALATE emission in-repo ────
+// WHY here: reuses escalateComment above so the fixed literals + directives have ONE
+// source (design §3 no-drift). ashlar reconstructs rounds from the API and emits; the
+// external driver only DETECTS the marker. See review-loop-engine.server.ts.
+
+export interface RoundSummary {
+  index: number; // 1-based round number
+  findings: number; // total findings that round
+  files: string[]; // files flagged that round
+  head: string; // reviewed commit (short sha)
+}
+
+const DIFF_TOO_LARGE_LINES = 5000;
+const WHACK_WINDOW = 3; // inspect the last N rounds for a recurring file
+const WHACK_MIN_REPEAT = 2; // a file flagged in >= this many of the window => whack-a-mole
+
+/**
+ * Classify why a loop is stuck, or null when it is converged / still making progress.
+ * Precedence: diff-too-large (structural) > whack-a-mole (recurring file) > oscillation
+ * (counts not trending down) > round-cap. The semantic reasons (guard-accretion,
+ * wrong-scope, re-flag-deferred) need diff/semantic context the trend can't supply and
+ * are left to the human.
+ */
+export function classifyStuck(
+  rounds: RoundSummary[],
+  opts: { roundCap: number; diffLines?: number },
+): EscalateReason | null {
+  if (rounds.length === 0) return null;
+  if (rounds[rounds.length - 1].findings === 0) return null; // converged (CONVERGED, not stuck)
+  if (opts.diffLines !== undefined && opts.diffLines > DIFF_TOO_LARGE_LINES) return "diff-too-large";
+
+  const window = rounds.slice(-WHACK_WINDOW);
+  if (window.length >= 2) {
+    const counts = new Map<string, number>();
+    for (const r of window) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
+    for (const v of counts.values()) if (v >= WHACK_MIN_REPEAT) return "whack-a-mole";
+  }
+
+  if (rounds.length >= 3) {
+    const w = rounds.slice(-3);
+    if (w[2].findings >= w[0].findings && w.every((r) => r.findings > 0)) return "oscillation";
+  }
+
+  if (rounds.length >= opts.roundCap) return "round-cap";
+  return null;
+}
+
+export function repeatedRoundFiles(rounds: RoundSummary[], window = WHACK_WINDOW): string[] {
+  const counts = new Map<string, number>();
+  for (const r of rounds.slice(-window)) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
+  return [...counts.entries()].filter(([, v]) => v >= WHACK_MIN_REPEAT).map(([f]) => f).sort();
+}
+
+/** Compose the ESCALATE handoff from a stuck loop's reconstructed round history (reuses
+ * escalateComment — the single source of the fixed literals + directives). */
+export function escalateFromRounds(
+  reason: EscalateReason,
+  rounds: RoundSummary[],
+  ctx: { pr: number; head: string; repo: string; roundCap: number; diffLines?: number },
+): string {
+  return escalateComment({
+    reason,
+    round: rounds.length ? rounds[rounds.length - 1].index : 0,
+    roundCap: ctx.roundCap,
+    pr: ctx.pr,
+    head: ctx.head,
+    repo: ctx.repo,
+    findingTrend: rounds.map((r) => r.findings),
+    repeatedFiles: repeatedRoundFiles(rounds),
+    diffLines: ctx.diffLines,
+  });
+}

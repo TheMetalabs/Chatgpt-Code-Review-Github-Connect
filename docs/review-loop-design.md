@@ -35,7 +35,8 @@
 - **권한:** 루프는 코드를 write하므로 **호출자(mention 작성자)의 write 권한을 확인**. 없으면 거절.
 - **기본 `suggest` 모드:** 수정안을 PR suggestion/초안 커밋으로 올려 사람이 1클릭 적용. auto-commit은 `apply`
   옵션에만. (근거: #66 오탐 2건·회귀 위험.)
-- **동시성 1/PR:** deliveryId 디둡 확장으로 "루프 1개/PR". 재진입·중복 트리거 차단.
+- **동시성:** 한 PR 내부는 deliveryId 디둡으로 "루프 1개/PR"(재진입·중복 차단). 서로 다른 PR은 **병렬**(§6 병렬성).
+- **fix 에이전트는 설정으로 지정**(§6b): 어느 provider가 어떤 방식으로 수정할지. 기본은 미설정(수정 안 함).
 
 ## 3. ⛔ 종료 신호는 고정·명시 리터럴 — 절대 LLM이 짓지 않는다 (핵심)
 
@@ -80,10 +81,27 @@
 
 불변식: `@ashlar review` 는 0-UNADDRESSED 일 때만 / 라운드당 in-flight 1개 / push 1개 / DIRTY SHA에 요청 금지.
 
-## 6. Fix 에이전트 프롬프트 레시피 (루프를 실제로 수렴시키는 엔진)
+## 6. Fix 에이전트 (루프를 실제로 수렴시키는 엔진)
 
-fix 주체는 **레포 write 권한이 있는 코딩 에이전트**(Codex/Claude류) — 채팅 리뷰어(ChatGPT/Grok)는 커밋 불가.
-프롬프트에 반드시:
+fix 주체는 **설정 가능**하다(§6b). 채팅 리뷰어(ChatGPT/Grok)도 **GitHub 플러그인/커넥터를 설치하면 탭에서 직접
+커밋·push 가능**하다(초기 전제 "채팅은 커밋 불가"는 틀렸다). 따라서 fix 전달(push) 메커니즘은 3가지:
+
+| 메커니즘 | 방식 | 장단점 |
+|---|---|---|
+| **A. 스크립트-apply (기본·권장)** | 채팅/로컬 응답을 **full-file 스키마**로 받아 코드가 파일을 덮어쓰고 git/gh로 push | LLM-free·결정적·**토큰↓·속도↑**. `diff` 금지(적용 취약). 큰 파일은 C로 폴백 |
+| **B. 채팅탭 push (플러그인)** | GitHub 커넥터 붙은 채팅탭이 스스로 커밋·push | 탭 자율. **fix-트리거 프롬프트가 필요**하고, 결과가 비결정적이라 검증 게이트 필수 |
+| **C. 코딩 에이전트** | 레포-write 코딩 에이전트(Codex/Claude류)가 도구로 수정 | 대형/구조적 수정에 강함. 토큰↑·느림 |
+
+**신뢰성(판단):** A의 **추출·적용·push는 결정적·LLM-free로 신뢰 가능**하나(파싱은 기존 `extract-chat-json`+
+`json-repair` 재사용, full-file은 적용 실패 0), **"항상 문제없이"는 불가** — 스키마는 *기계적 충실도*만 보장하고
+*수정의 옳음*은 보장 못 한다. 그래서 **항상**: full-file 표현형 + 적용 후 결정적 체크(파싱·예상경로·truncation·
+라인수 assert) + **§7 2단계 CI/테스트 게이트**(진짜 안전망) + 실패 시 폴백(다른 provider→C→ESCALATE).
+
+**병렬성(필수):** 리뷰가 PR별 병렬로 도는 것처럼 **fix도 서로 다른 PR을 병렬로** 처리해야 한다. 채팅탭 방식(B)은
+**PR별 fix 탭을 병렬로** 연다(리뷰어 탭과 동일한 bridge capacity 관리). **한 PR 내부는 동시성 1**(1커밋/라운드,
+루프 1개/PR — 워킹트리 경합 방지). 스크립트-apply(A)는 PR별 워크트리로 병렬.
+
+프롬프트에 반드시(어느 메커니즘이든):
 
 1. **내용 기준 4분류(태그 무시):** Fix / Push-back(증거로 반박) / Decline(근거+추적) / Defer(이슈#+코드마커).
    → 오탐을 못 반박하고 다 고치면 가짜 지적 만족시키려 진짜 버그를 심는다.
@@ -95,6 +113,26 @@ fix 주체는 **레포 write 권한이 있는 코딩 에이전트**(Codex/Claude
 4. **모든 bound/clamp에 "무엇을 제한하나 + 조건이 안 터지면 뭐가 되나" 기록.** 스코프 착오 방지.
 5. **Defer/Decline은 load-bearing**(이슈# 인용 + 코드 마커). 맨입은 ≥7회 재지적됨.
 6. **TDD**(실패 테스트 먼저), **커밋 1개/라운드**, **in-thread SHA 답글**.
+
+## 6b. Fix 에이전트 설정 (설계 초기부터 설정 가능)
+
+리뷰어 설정(`reviewChatgpt`/`reviewGrok`/`reviewLocal`)과 대칭으로, **fix 에이전트를 설정으로 고른다.** 초기부터
+스캐폴드하여 phase 3에서 동작만 붙인다.
+
+```
+fixAgent: {
+  provider: "chatgpt" | "grok" | "local" | "coding-agent",  // 누가 수정하나
+  delivery: "script-apply" | "chat-push" | "coding-agent",  // 어떻게 push 하나 (§6 A/B/C)
+  mode: "suggest" | "apply",          // suggest=제안/초안(사람 1클릭), apply=자동 push
+  parallelPrs: number,                // 서로 다른 PR 동시 fix 상한 (리뷰 capacity와 공유)
+}
+```
+
+- **기본값(안전 우선):** `provider` 없음(루프 미설정 시 fix 안 함) · `delivery: "script-apply"` ·
+  `mode: "suggest"` · `parallelPrs`는 bridge capacity 내. → 명시적으로 켜야 자동 수정이 돈다.
+- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인). `local`은
+  `script-apply`(grokbot `qwen_openai_edit.py` 재사용). `coding-agent`는 `coding-agent`.
+- **권한:** 어떤 provider든 push하려면 §2의 write-권한 게이트를 통과해야 한다. `apply` 모드는 명시적으로만.
 
 ## 7. 2단계 검증 (비용 최적화 — 정본 스킬의 핵심 추가)
 

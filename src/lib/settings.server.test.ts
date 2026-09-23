@@ -91,6 +91,24 @@ describe("sanitizeBotSettings", () => {
     assert.equal(merged.reviewGrok, false);
     assert.equal(merged.reviewChatgpt, true);
   });
+
+  it("defaults the fix agent to disabled (no auto-fix) with safe delivery/mode", () => {
+    const s = sanitizeBotSettings({});
+    assert.equal(s.fixAgent.provider, null);
+    assert.equal(s.fixAgent.delivery, "script-apply");
+    assert.equal(s.fixAgent.mode, "suggest");
+    assert.ok(s.fixAgent.parallelPrs >= 1);
+  });
+
+  it("normalizes fix agent config and rejects unknown values", () => {
+    const ok = sanitizeBotSettings({ fixAgent: { provider: "local", delivery: "chat-push", mode: "apply", parallelPrs: 5 } });
+    assert.deepEqual(ok.fixAgent, { provider: "local", delivery: "chat-push", mode: "apply", parallelPrs: 5 });
+    const bad = sanitizeBotSettings({ fixAgent: { provider: "bogus", delivery: "diff", mode: "yolo", parallelPrs: 999 } });
+    assert.equal(bad.fixAgent.provider, null); // unknown provider -> default (disabled)
+    assert.equal(bad.fixAgent.delivery, "script-apply");
+    assert.equal(bad.fixAgent.mode, "suggest");
+    assert.equal(bad.fixAgent.parallelPrs, 20); // clamped
+  });
 });
 
 describe("prompt budgets", () => {

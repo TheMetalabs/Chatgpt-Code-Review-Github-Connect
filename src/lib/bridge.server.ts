@@ -13,6 +13,7 @@ import { llmWorkAllowed } from "./ops-comment";
 import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
+import { createFixRegistry, fixChatMaxPromptChars, fixChatTimeoutMs, isFixItemId, type FixOffer, type FixRequest } from "./bridge-fix.server";
 
 type BridgeMeta = {
   token: string;
@@ -68,6 +69,8 @@ export type BridgePublic = Omit<BridgeStatus, "token"> & {
   workerStatus?: WorkerStatus;
   workerStatusFresh: boolean;
   localJsonRepairEnabled: boolean;
+  /** Live review-loop fix items (queued + claimed); never counted in pendingJobs. */
+  pendingFixes: number;
 };
 
 export function getBridgeStatus(): BridgeStatus {
@@ -87,6 +90,7 @@ export function getBridgePublic(): BridgePublic {
     workerStatusFresh: workerStatusIsFresh(meta.workerStatus, Date.now(), BRIDGE_CONNECTED_MS),
     repairProtocol: 1, captureProtocol: 1, recoveryProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
     pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && pendingChatProviders(job).length > 0).length,
+    pendingFixes: fixLiveCount(),
   };
 }
 
@@ -138,6 +142,82 @@ function submissionInFlightForClient(jobs: readonly Job[], clientId: string): bo
   );
 }
 
+// ── Review-loop fix items (bridge-fix.server.ts) ─────────────────────────────
+// A fix is NOT a harbor Job. Every per-id handler below branches on the `fix-` prefix FIRST, so a
+// fix never meets the review lifecycle, review-JSON validation, capture or repair.
+let fixRegistry: ReturnType<typeof createFixRegistry> | undefined;
+function fixes() {
+  return (fixRegistry ||= createFixRegistry({
+    now: () => Date.now(),
+    newId: () => randomBytes(18).toString("base64url"),
+    parallelLimit: () => getHarbor().settings.fixAgent?.parallelPrs ?? 1,
+    reasoning: () => ({chatgpt: getHarbor().settings.chatgptReasoning, grok: getHarbor().settings.grokReasoning}),
+    timeoutMs: () => fixChatTimeoutMs(process.env),
+    maxPromptChars: () => fixChatMaxPromptChars(process.env),
+    claimMs: BRIDGE_CLAIM_MS,
+    submitWindowMs: SUBMIT_WINDOW_MS,
+    // unref: a pending fix deadline must never keep the server (or a test runner) alive.
+    setTimer: (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
+    clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+  }));
+}
+function fixLiveCount() {
+  const {queued, claimed} = fixes().counts();
+  return queued + claimed;
+}
+
+/** Review-loop fix transport for chatgpt/grok: queue the prompt for a Chrome chat tab and resolve
+ * with the model's answer TEXT (rejects on failure / deadline / supersede — see bridge-fix.server.ts). */
+export function requestBridgeFix(request: FixRequest): Promise<string> {
+  return fixes().request(request);
+}
+
+export function isBridgeFixId(jobId: unknown): boolean {
+  return isFixItemId(jobId);
+}
+
+/** A fix answer is plain text for the runtime's deterministic parser: resolved as-is (the page's
+ * full text), never review-validated, salvaged or archived as a review. */
+export function completeBridgeFix(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string) {
+  const leg = legs?.[0];
+  const out = fixes().complete(jobId, leg?.provider, leg ? leg.originalText || leg.raw : raw, leaseId);
+  if (out.ok) {
+    meta.lastJobId = jobId;
+    meta.lastError = undefined;
+  }
+  return out;
+}
+
+/** Fix progress is diagnostics only (a timeout names the last stage); it never enters review history. */
+function recordFixProgress(jobId: string, leaseId: string | undefined, reports: unknown): boolean {
+  const provider = fixes().providerOf(jobId);
+  if (!provider || !reports || typeof reports !== "object" || Array.isArray(reports)) return false;
+  const report = (reports as Record<string, unknown>)[provider];
+  const events = report && typeof report === "object" ? sanitizeProgressEvents((report as {events?: unknown}).events) : [];
+  const latest = events.reduce<(typeof events)[number] | undefined>((last, event) => (!last || event.at >= last.at ? event : last), undefined);
+  return fixes().progress(jobId, leaseId, latest?.stage);
+}
+
+/** The oldest queued fix unless the review candidate is older. Neither kind starves: live fixes
+ * are bounded by fixAgent.parallelPrs and their deadline; a review waits for at most the fixes
+ * requested before it. A review without a known age keeps today's precedence. */
+function takeFix(clientId: string, excludeJobIds: readonly string[], review: ReturnType<typeof nextBridgeJob>): FixOffer | null {
+  // nextBridgeJob is null while a review submission is in flight; a fix must wait for it too.
+  if (submissionInFlightForClient(getHarbor().jobs, clientId)) return null;
+  const next = fixes().peek(excludeJobIds);
+  if (!next) return null;
+  if (review) {
+    const reviewAt = getHarbor().jobs.find(j => j.id === review.jobId)?.createdAt;
+    if (typeof reviewAt !== "number" || next.createdAt > reviewAt) return null;
+  }
+  const offer = fixes().take(next.id, clientId);
+  if (offer) {
+    meta.lastJobId = offer.jobId;
+    meta.lastError = undefined;
+  }
+  return offer;
+}
+
 function pendingChatProviders(job: Job): ReviewProvider[] {
   const providers = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length
     ? job.reviewProviders : providersFromSettings(getHarbor().settings);
@@ -148,6 +228,7 @@ function pendingChatProviders(job: Job): ReviewProvider[] {
 }
 
 export function bridgeJobState(jobId: string) {
+  if (isFixItemId(jobId)) return fixes().state(jobId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
   return {active: job?.status === "awaiting_chat", status: job?.status ?? "missing"};
 }
@@ -192,9 +273,18 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
   return null;
 }
 
-export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): ReturnType<typeof nextBridgeJob> {
+export type BridgeOffer = NonNullable<ReturnType<typeof nextBridgeJob>> | FixOffer;
+
+/** `fixes` is the worker's fixProtocol:1 opt-in: a worker that cannot harvest a plain-text fix
+ * answer (it would wait for review JSON forever) is never offered a fix item. */
+export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = [], options: {fixes?: boolean} = {}): BridgeOffer | null {
   meta.lastTakeAt = Date.now();
+  // A fix tab pastes its prompt in the foreground exactly like a review tab: one submission per
+  // Chrome profile across BOTH kinds (see SUBMIT_WINDOW_MS).
+  if (fixes().submitting(clientId)) return null;
   const job = nextBridgeJob(clientId, excludeJobIds);
+  const fix = options.fixes ? takeFix(clientId, excludeJobIds, job) : null;
+  if (fix) return fix;
   if (!job) return null;
   const claim = claimBridgeJob(job.jobId, clientId);
   if (!claim.ok) return null;
@@ -236,6 +326,7 @@ export function recoverBridgeJob(clientId: string, values: unknown) {
 }
 
 export function promptForJob(jobId: string): {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>} | null {
+  if (isFixItemId(jobId)) return fixes().prompt(jobId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) return null;
   const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok;
@@ -258,6 +349,7 @@ export function recordBridgeObservation(jobId: string, leaseId: string | undefin
 }
 
 export function recordBridgeProgress(jobId: string, leaseId: string | undefined, reports: unknown): boolean {
+  if (isFixItemId(jobId)) return recordFixProgress(jobId, leaseId, reports);
   const job=getHarbor().jobs.find(j=>j.id===jobId);
   if(!job || !ownsLease(job,leaseId) || !reports || typeof reports!=="object" || Array.isArray(reports))return false;
   // Validate all run identities before recording either provider (no partial batch).
@@ -289,6 +381,12 @@ export function refreshBridgeClaim(
   errors?: Partial<Record<ReviewProvider, ProviderError>>,
   leaseId?: string,
 ): boolean {
+  if (isFixItemId(jobId)) {
+    // Provider errors on a fix are terminal only via the explicit failure action.
+    const accepted = fixes().refresh(jobId, leaseId, generating);
+    if (accepted) meta.lastJobId = jobId;
+    return accepted;
+  }
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return false;
   patchHarborJob(jobId, current => {
@@ -314,6 +412,14 @@ export function refreshBridgeClaim(
 }
 
 export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId: string} | {ok: false; error: string} {
+  if (isFixItemId(jobId)) {
+    const out = fixes().claim(jobId, clientId);
+    if (out.ok) {
+      meta.lastJobId = jobId;
+      meta.lastError = undefined;
+    }
+    return out;
+  }
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job) || !(job.chatPrompt || job.chatPromptByProvider)) {
     return {ok: false, error: "job is not waiting for chat"};
@@ -339,6 +445,10 @@ export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId
 }
 
 export function releaseBridgeJob(jobId: string, leaseId?: string) {
+  if (isFixItemId(jobId)) {
+    fixes().release(jobId, leaseId);
+    return;
+  }
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return;
   patchHarborJob(jobId, current => ({
@@ -350,6 +460,7 @@ export function releaseBridgeJob(jobId: string, leaseId?: string) {
 /** Explicit terminal outcome; transient disconnection is reported by ping instead. */
 export function failBridgeProvider(jobId: string, provider: ReviewProvider, error: string, leaseId?: string): boolean {
   if (!isChatProvider(provider)) return false;
+  if (isFixItemId(jobId)) return fixes().fail(jobId, provider, error, leaseId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat") return true;
   if (!llmWorkAllowed(job) || !ownsLease(job, leaseId)) return false;

@@ -1,0 +1,331 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
+  createFixRegistry,
+  DEFAULT_FIX_MAX_PROMPT_CHARS,
+  DEFAULT_FIX_TIMEOUT_MS,
+  FIX_TERMINAL_RETAIN_MS,
+  fixChatMaxPromptChars,
+  fixChatTimeoutMs,
+  isFixItemId,
+  type FixRegistryDeps,
+  type FixRequest,
+} from "./bridge-fix.server.ts";
+
+const CLAIM_MS = 20 * 60_000;
+const SUBMIT_MS = 3 * 60_000;
+const REQ: FixRequest = { owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: "FIX PROMPT with file contents" };
+
+type FakeTimer = { fn: () => void; ms: number; cleared: boolean };
+
+/** Registry over a fake clock and fake timers: nothing here waits in real time. */
+function harness(over: Partial<FixRegistryDeps> = {}) {
+  let now = 1_700_000_000_000;
+  let seq = 0;
+  let limit = 3;
+  const timers: FakeTimer[] = [];
+  const reg = createFixRegistry({
+    now: () => now,
+    newId: () => `id${++seq}`,
+    parallelLimit: () => limit,
+    reasoning: () => ({ chatgpt: "pro", grok: "heavy" }),
+    timeoutMs: () => DEFAULT_FIX_TIMEOUT_MS,
+    maxPromptChars: () => DEFAULT_FIX_MAX_PROMPT_CHARS,
+    claimMs: CLAIM_MS,
+    submitWindowMs: SUBMIT_MS,
+    setTimer: (fn, ms) => {
+      const timer = { fn, ms, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (timer) => {
+      (timer as FakeTimer).cleared = true;
+    },
+    ...over,
+  });
+  return {
+    reg,
+    timers,
+    advance: (ms: number) => {
+      now += ms;
+    },
+    setLimit: (n: number) => {
+      limit = n;
+    },
+  };
+}
+
+/** Queue a request and take it for a Chrome profile: [promise, offer]. */
+function queueAndTake(h: ReturnType<typeof harness>, req: Partial<FixRequest> = {}, clientId = "chrome-1") {
+  const promise = h.reg.request({ ...REQ, ...req });
+  const next = h.reg.peek();
+  assert.ok(next, "the new request is offered");
+  const offer = h.reg.take(next.id, clientId);
+  assert.ok(offer, "the queued request can be taken");
+  return { promise, offer };
+}
+
+describe("bridge fix registry: lifecycle", () => {
+  it("enqueue → offered by take → claim → complete resolves with the answer text", async () => {
+    const h = harness();
+    const promise = h.reg.request(REQ);
+    const next = h.reg.peek();
+    assert.ok(next && isFixItemId(next.id));
+    assert.deepEqual(h.reg.state(next.id), { active: true, status: "awaiting_chat" });
+    const offer = h.reg.take(next.id, "chrome-1");
+    assert.deepEqual(offer, {
+      kind: "fix",
+      jobId: next.id,
+      provider: "chatgpt",
+      providers: ["chatgpt"],
+      resumeProviders: [],
+      leaseId: offer?.leaseId,
+      prompt: REQ.prompt,
+      reasoning: { chatgpt: "pro", grok: "heavy" },
+      title: "fix o/r#7",
+      owner: "o",
+      repo: "r",
+      pr: 7,
+    });
+    const answer = 'Here you go.\n{"summary":"s","files":[]}';
+    assert.deepEqual(h.reg.complete(next.id, "chatgpt", answer, offer!.leaseId), { ok: true });
+    assert.equal(await promise, answer);
+    assert.deepEqual(h.reg.state(next.id), { active: false, status: "posted" });
+    // Settlement drops the prompt (file contents) and disarms the deadline.
+    assert.equal(h.reg.snapshot(next.id)?.prompt, "");
+    assert.equal(h.reg.prompt(next.id), null);
+    assert.equal(h.timers[0].cleared, true);
+    assert.equal(h.reg.peek(), undefined);
+  });
+
+  it("an explicit failure rejects with the provider's reason (idempotent on replay)", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    assert.equal(h.reg.fail(offer.jobId, "chatgpt", "quota:\n usage limit — waiting for reset", offer.leaseId), true);
+    await assert.rejects(promise, /chatgpt fix request failed: quota: usage limit — waiting for reset/);
+    assert.deepEqual(h.reg.state(offer.jobId), { active: false, status: "dlq" });
+    assert.equal(h.reg.fail(offer.jobId, "chatgpt", "again", offer.leaseId), true);
+    assert.equal(h.reg.complete(offer.jobId, "chatgpt", "late", offer.leaseId).ok, false);
+  });
+
+  it("release requeues the item for any profile and voids the old lease", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    assert.equal(h.reg.release(offer.jobId, "not-the-lease"), false);
+    assert.equal(h.reg.release(offer.jobId, offer.leaseId), true);
+    assert.deepEqual(h.reg.state(offer.jobId), { active: true, status: "awaiting_chat" });
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "stale", offer.leaseId), {
+      ok: false,
+      code: "lease_conflict",
+      error: "fix item is not claimed by this worker",
+    });
+    assert.equal(h.reg.peek()?.id, offer.jobId);
+    const again = h.reg.take(offer.jobId, "chrome-2");
+    assert.ok(again && again.leaseId !== offer.leaseId);
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", again.leaseId), { ok: true });
+    assert.equal(await promise, "answer");
+  });
+
+  it("a done item acknowledges a lost-ACK replay only for its own lease", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    assert.equal(h.reg.complete(offer.jobId, "chatgpt", "answer", offer.leaseId).ok, true);
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", offer.leaseId), { ok: true });
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", "other-lease"), {
+      ok: false,
+      code: "lease_conflict",
+      error: "fix item already completed",
+    });
+    assert.equal(await promise, "answer");
+  });
+
+  it("complete rejects a provider mismatch and an empty answer without settling", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    assert.equal(h.reg.complete(offer.jobId, "grok", "answer", offer.leaseId).ok, false);
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "  \n ", offer.leaseId), { ok: false, code: "invalid", error: "empty fix answer" });
+    assert.deepEqual(h.reg.state(offer.jobId), { active: true, status: "awaiting_chat" });
+    assert.equal(h.reg.complete(offer.jobId, undefined, "answer", offer.leaseId).ok, true);
+    assert.equal(await promise, "answer");
+  });
+});
+
+describe("bridge fix registry: deadline and supersession", () => {
+  it("the deadline rejects 'timeout', reports cancelled and stops offering the item", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    assert.equal(h.timers[0].ms, DEFAULT_FIX_TIMEOUT_MS);
+    assert.equal(h.reg.progress(offer.jobId, offer.leaseId, "generating"), true);
+    h.timers[0].fn();
+    await assert.rejects(promise, /o\/r#7 timed out after 30 min \(last stage: generating\)/);
+    assert.deepEqual(h.reg.state(offer.jobId), { active: false, status: "cancelled" });
+    assert.equal(h.reg.peek(), undefined);
+    assert.equal(h.reg.prompt(offer.jobId), null);
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "late answer", offer.leaseId), {
+      ok: false,
+      code: "lease_conflict",
+      error: "fix item was cancelled (timeout)",
+    });
+  });
+
+  it("a late timer is backed by a lazy deadline check; a never-claimed item says so", async () => {
+    const h = harness();
+    const promise = h.reg.request(REQ);
+    const id = h.reg.peek()!.id;
+    h.advance(DEFAULT_FIX_TIMEOUT_MS);
+    assert.deepEqual(h.reg.state(id), { active: false, status: "cancelled" });
+    await assert.rejects(promise, /never picked up by the Chrome bridge/);
+  });
+
+  it("a per-request deadline is clamped like the env value", async () => {
+    const h = harness();
+    const promise = h.reg.request({ ...REQ, timeoutMs: 5 });
+    assert.equal(h.timers[0].ms, 60_000);
+    h.timers[0].fn();
+    await assert.rejects(promise, /timed out after 1 min/);
+  });
+
+  it("a second request for the same PR supersedes the first (which rejects 'superseded')", async () => {
+    const h = harness();
+    const first = queueAndTake(h);
+    const other = h.reg.request({ ...REQ, pr: 8, prompt: "another PR" });
+    const second = h.reg.request({ ...REQ, owner: "O", repo: "R", prompt: "newer prompt" });
+    await assert.rejects(first.promise, /fix request for o\/r#7 superseded by a newer request for the same PR/);
+    assert.deepEqual(h.reg.state(first.offer.jobId), { active: false, status: "cancelled" });
+    assert.equal(h.timers[0].cleared, true);
+    // The newer item is the one offered; another PR's item is untouched.
+    const offered = [h.reg.peek()!.id];
+    h.reg.take(offered[0], "chrome-1");
+    offered.push(h.reg.peek()!.id);
+    assert.deepEqual(
+      offered.map((id) => h.reg.snapshot(id)?.pr),
+      [8, 7],
+    );
+    assert.equal(h.reg.snapshot(offered[1])?.prompt, "newer prompt");
+    void other.catch(() => {});
+    void second.catch(() => {});
+  });
+});
+
+describe("bridge fix registry: parallelPrs and ownership", () => {
+  it("at most parallelPrs items are claimed at once; the rest wait queued", async () => {
+    const h = harness();
+    h.setLimit(1);
+    const a = queueAndTake(h, { pr: 1 });
+    const b = h.reg.request({ ...REQ, pr: 2 });
+    assert.equal(h.reg.peek(), undefined, "the cap holds B queued");
+    assert.deepEqual(h.reg.counts(), { queued: 1, claimed: 1 });
+    h.setLimit(2); // only to learn B's id
+    const bNext = h.reg.peek();
+    assert.ok(bNext);
+    h.setLimit(1);
+    // A direct claim cannot bypass the cap either.
+    assert.deepEqual(h.reg.claim(bNext.id, "chrome-1"), { ok: false, error: "fix parallel limit reached (fixAgent.parallelPrs)" });
+    assert.equal(h.reg.complete(a.offer.jobId, "chatgpt", "A done", a.offer.leaseId).ok, true);
+    assert.equal(await a.promise, "A done");
+    assert.equal(h.reg.peek()?.id, bNext.id, "a finished claim frees the slot");
+    void b.catch(() => {});
+  });
+
+  it("only the claiming profile may re-claim; a stale lease is renewed, the old one voided", () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    assert.deepEqual(h.reg.claim(offer.jobId, "chrome-2"), { ok: false, error: "fix generation belongs to another Chrome profile" });
+    assert.deepEqual(h.reg.claim(offer.jobId, "chrome-1"), { ok: true, leaseId: offer.leaseId });
+    h.advance(CLAIM_MS + 1);
+    const renewed = h.reg.claim(offer.jobId, "chrome-1");
+    assert.ok(renewed.ok && renewed.leaseId !== offer.leaseId);
+    assert.equal(h.reg.refresh(offer.jobId, offer.leaseId, { chatgpt: true }), false);
+    assert.equal(h.reg.refresh(offer.jobId, renewed.ok ? renewed.leaseId : "", { chatgpt: true }), true);
+    assert.equal(h.reg.fail(offer.jobId, "chatgpt", "x", offer.leaseId), false);
+    void promise.catch(() => {});
+  });
+
+  it("the submission window holds the profile until generation starts or the window passes", () => {
+    const h = harness();
+    const a = queueAndTake(h, { pr: 1 });
+    assert.equal(h.reg.submitting("chrome-1"), true);
+    assert.equal(h.reg.submitting("chrome-2"), false);
+    assert.equal(h.reg.submitting(""), false);
+    h.reg.refresh(a.offer.jobId, a.offer.leaseId, { grok: true });
+    assert.equal(h.reg.submitting("chrome-1"), true, "another provider's flag says nothing about this item");
+    h.reg.refresh(a.offer.jobId, a.offer.leaseId, { chatgpt: true });
+    assert.equal(h.reg.submitting("chrome-1"), false);
+    const b = queueAndTake(h, { pr: 2 });
+    assert.equal(h.reg.submitting("chrome-1"), true);
+    h.advance(SUBMIT_MS);
+    assert.equal(h.reg.submitting("chrome-1"), false, "a stuck submission stops blocking after the window");
+    void a.promise.catch(() => {});
+    void b.promise.catch(() => {});
+  });
+
+  it("an unknown fix id reports cancelled and every late call is safe", () => {
+    const h = harness();
+    assert.deepEqual(h.reg.state("fix-unknown"), { active: false, status: "cancelled" });
+    assert.deepEqual(h.reg.complete("fix-unknown", "chatgpt", "answer", "lease"), {
+      ok: false,
+      code: "lease_conflict",
+      error: "fix item is unknown or expired",
+    });
+    assert.equal(h.reg.fail("fix-unknown", "chatgpt", "x", "lease"), true);
+    assert.equal(h.reg.prompt("fix-unknown"), null);
+    assert.equal(h.reg.claim("fix-unknown", "chrome-1").ok, false);
+    assert.equal(h.reg.refresh("fix-unknown", "lease"), false);
+    assert.equal(h.reg.release("fix-unknown", "lease"), false);
+  });
+
+  it("settled items are forgotten after the retention window", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    h.reg.complete(offer.jobId, "chatgpt", "answer", offer.leaseId);
+    await promise;
+    assert.deepEqual(h.reg.state(offer.jobId), { active: false, status: "posted" });
+    h.advance(FIX_TERMINAL_RETAIN_MS + 1);
+    assert.deepEqual(h.reg.state(offer.jobId), { active: false, status: "cancelled" });
+    assert.equal(h.reg.snapshot(offer.jobId), undefined);
+  });
+});
+
+describe("bridge fix registry: request validation", () => {
+  it("an oversized prompt fails fast with the limit, never queues and never echoes the prompt", async () => {
+    const h = harness({ maxPromptChars: () => 20_000 });
+    const prompt = `SECRET-FILE-CONTENT ${"x".repeat(20_000)}`;
+    await assert.rejects(h.reg.request({ ...REQ, prompt }), (error: Error) => {
+      assert.match(error.message, new RegExp(`fix prompt is ${prompt.length} chars`));
+      assert.match(error.message, /at most 20000 \(ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS\)/);
+      assert.doesNotMatch(error.message, /SECRET-FILE-CONTENT/);
+      return true;
+    });
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0 });
+    assert.equal(h.timers.length, 0);
+  });
+
+  it("a non-bridge provider, a missing PR or an empty prompt is rejected up front", async () => {
+    const h = harness();
+    await assert.rejects(h.reg.request({ ...REQ, provider: "local" as never }), /not a Chrome bridge provider/);
+    await assert.rejects(h.reg.request({ ...REQ, pr: 0 }), /needs owner, repo and a PR number/);
+    await assert.rejects(h.reg.request({ ...REQ, repo: "" }), /needs owner, repo and a PR number/);
+    await assert.rejects(h.reg.request({ ...REQ, prompt: "  " }), /empty fix prompt/);
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0 });
+  });
+
+  it("env overrides are clamped to sane bounds", () => {
+    assert.equal(fixChatTimeoutMs({}), 30 * 60_000);
+    assert.equal(fixChatTimeoutMs(undefined), 30 * 60_000);
+    assert.equal(fixChatTimeoutMs({ ASHLAR_FIX_CHAT_TIMEOUT_MS: "120000" }), 120_000);
+    assert.equal(fixChatTimeoutMs({ ASHLAR_FIX_CHAT_TIMEOUT_MS: "1000" }), 60_000);
+    assert.equal(fixChatTimeoutMs({ ASHLAR_FIX_CHAT_TIMEOUT_MS: "99999999999" }), 6 * 60 * 60_000);
+    assert.equal(fixChatTimeoutMs({ ASHLAR_FIX_CHAT_TIMEOUT_MS: "soon" }), 30 * 60_000);
+    assert.equal(fixChatMaxPromptChars({}), 100_000);
+    assert.equal(fixChatMaxPromptChars({ ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS: "250000" }), 250_000);
+    assert.equal(fixChatMaxPromptChars({ ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS: "5" }), 10_000);
+    assert.equal(fixChatMaxPromptChars({ ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS: "9e9" }), 1_000_000);
+  });
+
+  it("fix ids are recognized by their prefix only", () => {
+    assert.equal(isFixItemId("fix-abc"), true);
+    assert.equal(isFixItemId("fix-"), false);
+    assert.equal(isFixItemId("job-abc"), false);
+    assert.equal(isFixItemId(42), false);
+  });
+});

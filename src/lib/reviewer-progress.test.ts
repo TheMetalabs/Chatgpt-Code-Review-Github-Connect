@@ -119,9 +119,11 @@ describe("buildReviewerLanes", () => {
     assert.equal(lane?.detail, "calling local LLM");
   });
 
-  it("a queued local leg whose server is alive is reported as queued, not stalled, however old its progress", () => {
-    // Regression: a concurrency-1 server serves other jobs first. An hour in the queue with fresh
-    // keepalives is normal and must not read as "no recent progress" (nor be aborted).
+  it("an accepted local leg whose server is alive but has produced no token reads as waiting, not stalled", () => {
+    // Regression: a leg that has been accepted (fresh keepalives) but has emitted no output token yet
+    // is "waiting", however old its last real progress — it must not read as "no recent progress" (nor
+    // be aborted). We do not claim a model-side queue position: one stream cannot tell "queued behind
+    // others" from "prefilling", and asserting a queue is exactly the misleading label being removed.
     const now = 10_000_000;
     const lanes = buildReviewerLanes(
       job({
@@ -134,9 +136,9 @@ describe("buildReviewerLanes", () => {
     );
     const lane = lanes.find((l) => l.provider === "local");
     assert.equal(lane?.state, "generating");
-    assert.equal(lane?.detail, "queued at local LLM · server alive, no output yet");
+    assert.equal(lane?.detail, "local LLM accepted · no output yet");
     assert.equal(localLegNote({ runId: "local:j1", stage: "local_queued", observedAt: now - 3_600_000, keepaliveAt: now - 2_000, receivedAt: now }, now, 300_000),
-      "local reviewer: queued at the local LLM (server alive, no output yet — a concurrency-1 server serves earlier jobs first)");
+      "local reviewer: request accepted, no output token yet (server alive; cancel manually if stalled)");
   });
 
   it("a queued local leg with no sign of life past the stale window reads as no response from the server", () => {

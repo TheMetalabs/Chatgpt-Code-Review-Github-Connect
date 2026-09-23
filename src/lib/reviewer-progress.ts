@@ -61,17 +61,18 @@ function claimed(job: Pick<Job, "bridgeClaimedAt">, now: number): boolean {
  * discriminant both the lane detail and the ops note map from, so the two strings can never drift:
  *  - `generating`   — output is flowing (fresh)
  *  - `stale`        — was generating, but no token for staleMs
- *  - `queued`       — accepted, waiting behind other jobs (server alive, no output yet — normal on a
- *                     concurrency-1 server); keepaliveAt is fresh
- *  - `no-response`  — queued/accepted but no sign of life for staleMs (server may be wedged)
+ *  - `waiting`      — accepted, no output token yet (server alive, keepaliveAt fresh). We only know
+ *                     "this request's own stream has produced nothing yet"; we do NOT claim a model-side
+ *                     queue position, since one stream cannot tell "queued behind others" from "prefilling".
+ *  - `no-response`  — accepted but no sign of life for staleMs (server may be wedged)
  * Only BINARY freshness (fresh vs stale) is derived, never the live elapsed age: these feed the
  * ops-comment change key, and a continuously changing value would rewrite the GitHub comment each tick. */
-export type LocalLegView = "generating" | "stale" | "queued" | "no-response";
+export type LocalLegView = "generating" | "stale" | "waiting" | "no-response";
 
 export function localLegView(progress: ProviderProgress | undefined, now: number, staleMs: number): LocalLegView {
   if (progress?.stage === "local_queued") {
     const aliveAt = progress.keepaliveAt ?? progress.observedAt;
-    return now - aliveAt > staleMs ? "no-response" : "queued";
+    return now - aliveAt > staleMs ? "no-response" : "waiting";
   }
   const observedAt = progress?.observedAt;
   return observedAt !== undefined && now - observedAt > staleMs ? "stale" : "generating";
@@ -80,7 +81,7 @@ export function localLegView(progress: ProviderProgress | undefined, now: number
 const LOCAL_LEG_DETAIL: Record<LocalLegView, string> = {
   generating: "calling local LLM",
   stale: "calling local LLM · no recent progress",
-  queued: "queued at local LLM · server alive, no output yet",
+  waiting: "local LLM accepted · no output yet",
   "no-response": "waiting for local LLM · no response from server",
 };
 
@@ -88,7 +89,7 @@ const LOCAL_LEG_DETAIL: Record<LocalLegView, string> = {
 const LOCAL_LEG_NOTE: Record<LocalLegView, string | null> = {
   generating: null,
   stale: "local reviewer: no recent progress (still waiting; cancel manually if stalled)",
-  queued: "local reviewer: queued at the local LLM (server alive, no output yet — a concurrency-1 server serves earlier jobs first)",
+  waiting: "local reviewer: request accepted, no output token yet (server alive; cancel manually if stalled)",
   "no-response": "local reviewer: no response from the local LLM server (still waiting; cancel manually if stalled)",
 };
 

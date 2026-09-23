@@ -52,6 +52,7 @@ stages and step recording are unchanged.
 | `src/lib/reviewer-progress.ts` | **only** the local provider's in-flight lane (heartbeat freshness); chat/Grok branches stay frozen |
 | `src/lib/reviewer-progress.test.ts` | local-lane rendering tests (chat-lane cases are the frozen-behavior guard) |
 | `src/lib/local-leg-activity.ts` (+ test) | **new** — local-leg liveness tracker + `ASHLAR_LOCAL_REVIEW_DEADLINE_MS` |
+| `src/lib/local-status.server.ts` (+ test) | **new** — polls the model server's `/api/status`; skips a local leg the server has no record of (0 active AND 0 queued) so a lost request never hangs the peers' post (`ASHLAR_LOCAL_IDLE_SKIP`) |
 | `src/lib/review-progress.ts` | **only** the `local_queued` / `local_generating` labels and the optional `keepaliveAt` field |
 | `src/lib/review-history.server.ts` | **only** the `local.accepted` / `local.generating` server-step names |
 | `src/lib/settings.server.ts` | **only** local-LLM settings (`localLlm*`, `reviewLocal`) |

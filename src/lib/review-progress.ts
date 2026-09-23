@@ -39,7 +39,7 @@ export const PROGRESS_LABELS = {
     context_changed: "Conversation changed · collect only the bound review; preserve tab",
     quota: "Provider reported a usage limit",
     error: "Provider or submission reported an explicit error",
-    local_queued: "Local LLM request sent · waiting in the model queue (server alive, no output yet)",
+    local_queued: "Local LLM request accepted · no output token yet (server alive)",
     local_generating: "Local LLM generating output",
 } as const;
 export type ProgressStage = keyof typeof PROGRESS_LABELS;

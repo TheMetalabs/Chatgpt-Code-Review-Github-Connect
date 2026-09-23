@@ -37,6 +37,11 @@ const ALLOW = new Set([
   // and step recording are untouched.
   "src/lib/local-leg-activity.ts",
   "src/lib/local-leg-activity.test.ts",
+  // Local-only lost-request gate: polls the model server's own /api/status and skips a local leg the
+  // server has no record of (0 active AND 0 queued), so a lost request never hangs the peers' post.
+  // Reads /api/status with the local key only; touches no chat/bridge/merge path.
+  "src/lib/local-status.server.ts",
+  "src/lib/local-status.server.test.ts",
   "src/lib/review-progress.ts",
   "src/lib/review-history.server.ts",
   ".env.example",

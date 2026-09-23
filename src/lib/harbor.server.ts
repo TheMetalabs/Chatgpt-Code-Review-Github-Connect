@@ -19,6 +19,7 @@ import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./ch
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
+import { fetchLocalServerLoad, localIdleSkipEnabled, LOCAL_IDLE_POLL_MS, LOCAL_IDLE_GRACE_MS, LOCAL_IDLE_CONFIRMATIONS } from "./local-status.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
@@ -754,6 +755,38 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       deadlineMs,
     )
     : undefined;
+  // 3. Lost-request watchdog: the abort the liveness timer CANNOT provide. A request that never landed
+  //    (a racing/transport error swallowed it) still gets keepalives on its socket, so the leg would sit
+  //    in "waiting" forever with no deadline — and a finished peer reviewer would never post. Poll the
+  //    server's own /api/status: only when it reports NO work at all (0 active AND 0 queued) is the leg
+  //    provably lost (unambiguous under concurrency — there are no slots to be behind). Skip it then, so
+  //    the peers' result posts. Never fires once output has flowed (the request clearly landed), never on
+  //    an unreachable/garbled status (that leaves the liveness/ceiling aborts in charge).
+  let idleTimer: ReturnType<typeof setInterval> | undefined;
+  if (localIdleSkipEnabled()) {
+    const base = state.settings.localLlmBaseUrl.trim();
+    const key = state.settings.localLlmApiKey.trim() || "local";
+    const startedAt = Date.now();
+    let idleHits = 0;
+    let probing = false;
+    idleTimer = setInterval(() => {
+      if (probing) return;
+      const leg = localActivity.get(jobId);
+      if (!leg || leg.everGenerated) { idleHits = 0; return; } // tokens flowed → it landed; stop skipping
+      if (Date.now() - startedAt < LOCAL_IDLE_GRACE_MS) return; // let the request register first
+      probing = true;
+      void fetchLocalServerLoad(base, key, localControllers.get(jobId)?.signal)
+        .then((load) => {
+          if (!load) { idleHits = 0; return; } // cannot confirm → never skip on this path
+          idleHits = load.activeRequests === 0 && load.waitingRequests === 0 ? idleHits + 1 : 0;
+          if (idleHits >= LOCAL_IDLE_CONFIRMATIONS) {
+            localControllers.get(jobId)?.abort(new Error("model server reports no active or queued work; request treated as lost (racing/transport error)"));
+          }
+        })
+        .catch(() => { idleHits = 0; })
+        .finally(() => { probing = false; });
+    }, LOCAL_IDLE_POLL_MS);
+  }
   try {
     const local = await generateLocalLeg(jobId, prompt);
     try {
@@ -784,6 +817,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     }));
   } finally {
     if (deadline) clearTimeout(deadline);
+    if (idleTimer) clearInterval(idleTimer);
     localLiveness.get(jobId)?.clear();
     localLiveness.delete(jobId);
     localInFlight.delete(jobId);

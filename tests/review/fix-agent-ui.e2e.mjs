@@ -214,3 +214,78 @@ test('Settings UI: a stored 90000 ms deadline (1.5 min) does not block an unrela
   await input.fill(String(rules.toForm('minutes',def)));
  }
 });
+
+// The rendered screen accepts exactly what the production route accepts, field by field: a sample
+// the page posts must be a 200 from the real route + validator, and a sample the page refuses (the
+// input's own constraints or the page's check) must be a 400 there.
+test('Settings UI: for every editable field the page accepts exactly the values the server accepts',async t=>{
+ const rules=await import('../../src/lib/settings-rules.ts');
+ const {settingsHarness}=await import('./settings-harness.mjs');
+ const context=await browser.newContext();t.after(()=>context.close());
+ const posts=[];let savedFix;
+ await context.route('https://fix-agent.fixture/**',async route=>{
+  const url=new URL(route.request().url());
+  if(url.pathname==='/')return route.fulfill({contentType:'text/html; charset=utf-8',body:`<div id="root"></div><script>window.savedFix=${JSON.stringify(savedFix)||'undefined'};</script><script>${bundle.replace(/<\/script/gi,'<\\/script')}</script>`});
+  if(url.pathname==='/api/harbor'&&route.request().method()==='POST'){
+   const body=route.request().postDataJSON();posts.push(body);savedFix=body.fixAgent;
+   return route.fulfill({contentType:'application/json',body:JSON.stringify({ok:true,settings:{fixAgent:body.fixAgent}})});
+  }
+  return route.fulfill({contentType:'application/json',body:'{"ok":true}'});
+ });
+ const page=await context.newPage();page.on('pageerror',error=>console.error('Fix agent UI fixture page error:',error.message));
+ await page.goto('https://fix-agent.fixture/');
+ const section=page.getByRole('region',{name:'Fix agent / review loop'});
+ await section.waitFor();
+ const save=page.getByRole('button',{name:'Save settings',exact:true});
+ const bar=save.locator('xpath=..');
+ const server=async fields=>{const {action:_a,...rest}=fields;return (await settingsHarness().post(rest)).status;};
+ // What the page does with one typed value: refused by the input, refused by the page, or posted.
+ async function pageSave(input,typed){
+  await input.fill(typed);
+  if(!(await input.evaluate(i=>i.validity.valid)))return {accepted:false};
+  if(await save.isDisabled())return {accepted:true,body:null};
+  const n=posts.length;
+  await save.click();
+  await bar.locator('span.text-ok, span.text-danger').first().waitFor();
+  return posts.length>n?{accepted:true,body:posts.at(-1)}:{accepted:false};
+ }
+ const num=typed=>typed.trim()===''?null:Number(typed); // an emptied number input sends nothing numeric
+ const rows=[];
+ const inline=rules.formAttrs(rules.SETTINGS_INT_FIELDS.maxInlineComments);
+ rows.push({label:'max_inline_comments',input:page.getByLabel('max_inline_comments'),attrs:inline,
+  typed:['0','20','7','21','-1','1.5',''],fields:typed=>({maxInlineComments:num(typed)})});
+ for(const f of rules.FIX_KNOB_FIELDS){
+  const attrs=rules.formAttrs(rules.fixKnobDomain(f.key));
+  const {min,max}=FIX_AGENT_KNOBS[f.key];
+  const typed=f.unit==='minutes'
+   ?[String(min/60_000),String(max/60_000),'1.5',String(rules.toForm('minutes',min+1)),String((min-1)/60_000),String(max/60_000+1),String(min/60_000+0.00001),'']
+   :[String(min),String(max),String(min+1),String(min-1),String(max+1),String(min+0.5),''];
+  rows.push({label:f.label,input:section.getByLabel(f.label),attrs,typed,
+   fields:t=>({fixAgent:{[f.key]:num(t)===null?null:rules.fromForm(attrs.unit,num(t))}})});
+ }
+ rows.push({label:'bot.username',input:page.getByLabel('bot.username'),typed:['ashlar-2','   ','','x'],fields:t=>({username:t})});
+ rows.push({label:'mentions',input:page.getByLabel('mentions'),typed:['@a, /b',' , ','','@solo'],
+  fields:t=>({mention:t.split(',').map(s=>s.trim()).filter(Boolean)})});
+ const mismatches=[];
+ for(const row of rows){
+  if(row.attrs){
+   assert.deepEqual(await row.input.evaluate(i=>[i.min,i.max,i.step]),[String(row.attrs.min),String(row.attrs.max),String(row.attrs.step)],`${row.label}: input domain from settings-rules`);
+  }
+  for(const typed of row.typed){
+   const ui=await pageSave(row.input,typed);
+   const status=ui.body?await server(ui.body):await server(row.fields(typed));
+   if(ui.accepted!==(status===200))mismatches.push(`${row.label}=${JSON.stringify(typed)}: page ${ui.accepted?'accepts':'refuses'}, server ${status}`);
+   // A posted value is the typed value (after the unit conversion), never a silent coercion.
+   if(ui.body){
+    const want=row.fields(typed);
+    const got=want.fixAgent?{fixAgent:Object.fromEntries(Object.keys(want.fixAgent).map(k=>[k,ui.body.fixAgent[k]]))}:Object.fromEntries(Object.keys(want).map(k=>[k,ui.body[k]]));
+    if(JSON.stringify(got)!==JSON.stringify(want))mismatches.push(`${row.label}=${JSON.stringify(typed)}: page posted ${JSON.stringify(got)}, typed ${JSON.stringify(want)}`);
+   }
+  }
+  // Leave the field valid for the next row.
+  await row.input.fill(row.typed[0]);
+ }
+ assert.deepEqual(mismatches,[]);
+ assert.ok(posts.length>0);
+ assert.equal(posts.at(-1).fixAgent.enabled,false,'the loop stays OFF (default) throughout');
+});

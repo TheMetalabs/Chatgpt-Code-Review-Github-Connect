@@ -32,3 +32,12 @@ export function settingsHarness(initial = {}) {
   const get = async () => (await (await Route.server.handlers.GET()).json()).settings;
   return {state, saves, post, get};
 }
+
+/** The browser's constraint validation for <input type=number min max step> (HTML: step base = min). */
+export function nativeValid(attrs, formValue) {
+  if (!Number.isFinite(formValue)) return true; // an empty input has no range/step error; the page's check rejects NaN
+  if (formValue < attrs.min || formValue > attrs.max) return false;
+  if (attrs.step === 'any') return true;
+  const steps = (formValue - attrs.min) / attrs.step;
+  return Math.abs(steps - Math.round(steps)) < 1e-9;
+}

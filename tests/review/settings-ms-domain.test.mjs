@@ -8,18 +8,9 @@ import assert from 'node:assert/strict';
 import * as rules from '../../src/lib/settings-rules.ts';
 import {overlayEnv, sanitizeBotSettings} from '../../src/lib/settings.server.ts';
 import {DEFAULT_SETTINGS, FIX_AGENT_KNOBS} from '../../src/lib/types.ts';
-import {settingsHarness} from './settings-harness.mjs';
+import {nativeValid, settingsHarness} from './settings-harness.mjs';
 
 const MS_KNOBS = ['timeoutMs', 'queueMaxMs', 'chatTimeoutMs'];
-
-/** The browser's constraint validation for <input type=number min max step> (HTML: step base = min). */
-export function nativeValid(attrs, formValue) {
-  if (!Number.isFinite(formValue)) return true; // an empty input has no range/step error; the page's check rejects NaN
-  if (formValue < attrs.min || formValue > attrs.max) return false;
-  if (attrs.step === 'any') return true;
-  const steps = (formValue - attrs.min) / attrs.step;
-  return Math.abs(steps - Math.round(steps)) < 1e-9;
-}
 
 /** What the Settings screen accepts for one fix-agent knob, given the value the operator typed. */
 function uiAccepts(key, formValue) {

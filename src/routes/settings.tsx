@@ -15,6 +15,7 @@ import {
 } from "@/lib/types";
 import {
   FIX_KNOB_FIELDS,
+  SETTINGS_INT_FIELDS,
   WIRED_FIX_DELIVERIES,
   WIRED_FIX_PROVIDERS,
   fixAgentProblem,
@@ -75,6 +76,9 @@ const FIX_PROVIDER_LABEL: Record<FixAgentProvider, string> = {
   "coding-agent": "coding-agent (not wired)",
 };
 
+
+/** The max_inline_comments input, derived from its shared domain (settings-rules). */
+const MAX_INLINE_ATTRS = formAttrs(SETTINGS_INT_FIELDS.maxInlineComments);
 
 /** A numeric draft value as an input value: an emptied input (NaN) stays empty, not "NaN". */
 function formValue(v: number): number | "" {
@@ -172,12 +176,9 @@ export function Settings() {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-    if (!mention.length) {
-      setNotice("mentions cannot be empty");
-      return;
-    }
-    // The server's own rules (settings-rules): what the page accepts, the server accepts.
-    const problem = settingsProblem(draft);
+    // The server's own rules (settings-rules), run on the document this save sends (the parsed
+    // mentions and the effective order included): what the page accepts, the server accepts.
+    const problem = settingsProblem({ ...draft, mention, reviewOrder: order });
     if (problem) {
       setNotice(problem);
       return;
@@ -391,10 +392,11 @@ export function Settings() {
           <Field label="max_inline_comments">
             <input
               type="number"
-              min={0}
-              max={20}
-              value={draft.maxInlineComments}
-              onChange={(e) => patch({ maxInlineComments: Number(e.target.value) })}
+              min={MAX_INLINE_ATTRS.min}
+              max={MAX_INLINE_ATTRS.max}
+              step={MAX_INLINE_ATTRS.step}
+              value={formValue(draft.maxInlineComments)}
+              onChange={(e) => patch({ maxInlineComments: fromForm(MAX_INLINE_ATTRS.unit, e.target.valueAsNumber) })}
               className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
             />
           </Field>

@@ -388,6 +388,29 @@ describe("schemaMergeProviderGates", () => {
   });
 });
 
+describe("merged finding ids are unique (they key the loop's thread replies)", () => {
+  it("two providers' own live-0 findings on different lines keep distinct ids", () => {
+    const gate = (f: typeof FINDING_412) => ({
+      ok: true as const,
+      findings: [{ ...f, id: "live-0" }],
+      mergeRecommendation: "REQUEST_CHANGES" as const,
+      highestRisk: f.title,
+      investigatedSafe: [],
+      assumptions: [],
+      dropped: [],
+    });
+    const merged = schemaMergeProviderGates(
+      [
+        { provider: "local", gate: gate(FINDING_412) },
+        { provider: "chatgpt", gate: gate({ ...FINDING_421, file: "src/auth/session.ts" }) },
+      ],
+      DEFAULT_SETTINGS,
+    );
+    assert.equal(merged.findings.length, 2);
+    assert.deepEqual(merged.findings.map((f) => f.id), ["live-0", "live-0~2"]);
+  });
+});
+
 describe("consensusFromGates", () => {
   it("keeps a finding both reviewers reported", () => {
     const shared = { ...FINDING_412, id: "a" };

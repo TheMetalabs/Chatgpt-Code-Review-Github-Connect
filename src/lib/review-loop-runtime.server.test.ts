@@ -1333,6 +1333,34 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     assert.ok(!body.includes("\n"), "flattened to one line");
   });
 
+  it("two findings sharing an id: neither thread gets the other's reply, neither passes the published filter", async () => {
+    const clash = [finding("src/a.ts", "A"), { ...finding("src/b.ts", "B"), line: 40 }]; // both "f1"
+    const posted = {
+      githubId: 555,
+      comments: [
+        { findingId: "f1", file: "src/a.ts", body: "BODY-A" },
+        { findingId: "f1", file: "src/b.ts", body: "BODY-B" },
+      ],
+      published: ["f1"],
+    };
+    const roots = [
+      { id: 101, path: "src/a.ts", body: "BODY-A" },
+      { id: 102, path: "src/b.ts", body: "BODY-B" },
+    ];
+    const f = fakeDeps({ start: "apply", rounds: [2], threads: roots });
+    const r = await runPostReviewLoop("t", job({ findings: clash }), sample, settings("apply"), f.deps, ENV_ON, posted);
+    assert.deepEqual(r, { ran: false, reason: "no findings (converged)" }, "an ambiguous id never reaches the fix agent");
+    assert.equal(f.replies.length, 0);
+    // No published list (an older poster): both reach the agent, but neither thread is guessed
+    const g = fakeDeps({ start: "apply", rounds: [2], threads: roots });
+    const { published: _omit, ...unfiltered } = posted;
+    const r2 = await runPostReviewLoop("t", job({ findings: clash }), sample, settings("apply"), g.deps, ENV_ON, unfiltered);
+    assert.ok(r2.ran && r2.step === "fix" && r2.outcome === "applied", JSON.stringify(r2));
+    assert.equal(g.replies.length, 0);
+    const report = g.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+    assert.match(report, /Thread replies: 0 posted, 2 failed\./);
+  });
+
   it("the fix acts only on PUBLISHED findings (policy-withheld ones never reach the agent)", async () => {
     const f = fakeDeps({ start: "apply", rounds: [2], threads });
     await runWith(f, "apply", { ...postedReview, published: ["f2"] });

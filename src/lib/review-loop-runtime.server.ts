@@ -302,6 +302,11 @@ export function threadReplyBody(d: FixDisposition | undefined, round: number, co
   return `${verb} by the Ashlar fix agent${d.action === "fixed" ? where : ""} (round ${round})${note ? `: ${note}` : "."}`;
 }
 
+function duplicateIds(ids: readonly string[]): Set<string> {
+  const seen = new Set<string>();
+  return new Set(ids.filter((id) => seen.has(id) || !seen.add(id)));
+}
+
 /** Map each posted finding to its live thread root: exact (path, body) match against the review's
  * actual comments (GitHub may drop comments it cannot anchor — those get no reply). */
 function mapFindingThreads(
@@ -310,7 +315,9 @@ function mapFindingThreads(
 ): Map<string, number> {
   const used = new Set<number>();
   const out = new Map<string, number>();
+  const ambiguous = duplicateIds(posted.map((c) => c.findingId));
   for (const c of posted) {
+    if (ambiguous.has(c.findingId)) continue; // which thread is whose is unknowable: no reply
     const root = roots.find((r) => !used.has(r.id) && r.path === c.file && r.body === c.body);
     if (!root) continue;
     used.add(root.id);
@@ -599,8 +606,10 @@ export async function runPostReviewLoop(
   if (job.origin !== "github") return { ran: false, reason: "not a github job" };
   // Fix exactly what was PUBLISHED: findings the precision policy withheld were never shown to
   // a human, and "fixing" them would chase possible false positives in unreviewable commits.
+  // An id shared by two findings cannot say which one was published: neither is (fail closed).
   const published = posted?.published ? new Set(posted.published) : undefined;
-  const findings = (job.findings ?? []).filter((f) => !published || published.has(f.id));
+  const ambiguous = duplicateIds((job.findings ?? []).map((f) => f.id));
+  const findings = (job.findings ?? []).filter((f) => !published || (published.has(f.id) && !ambiguous.has(f.id)));
   if (findings.length === 0) return { ran: false, reason: "no findings (converged)" };
 
   const { owner, repo, pr, headSha } = job;
@@ -825,6 +834,8 @@ export async function runPostReviewLoop(
         tally.failed = posted.comments.length;
         return tally;
       }
+      const unroutable = duplicateIds(posted.comments.map((c) => c.findingId)); // mapFindingThreads skipped them
+      tally.failed = posted.comments.filter((c) => unroutable.has(c.findingId)).length;
       const byId = new Map((dispositions ?? []).map((x) => [x.finding, x]));
       for (const [i, f] of findings.entries()) {
         const threadId = threads.get(f.id);

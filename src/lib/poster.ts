@@ -424,6 +424,18 @@ export function applyFpStep(
   return { agreed, disputed, dropped };
 }
 
+/** Finding ids key the loop's thread replies and published filter; a multi-provider merge keeps
+ * each provider's own `live-<i>` ids, so a later duplicate gets a suffix (the first keeps its id). */
+function withUniqueIds(findings: Finding[]): Finding[] {
+  const seen = new Set<string>();
+  return findings.map((f) => {
+    let id = f.id;
+    for (let n = 2; seen.has(id); n++) id = `${f.id}~${n}`;
+    seen.add(id);
+    return id === f.id ? f : { ...f, id };
+  });
+}
+
 export function finalizeFp(
   pending: {
     agreed: Finding[];
@@ -434,7 +446,7 @@ export function finalizeFp(
   },
   settings: BotSettings,
 ): LiveGateResult {
-  const kept = [...pending.agreed, ...pending.disputed.map((d) => d.finding)];
+  const kept = withUniqueIds([...pending.agreed, ...pending.disputed.map((d) => d.finding)]);
   const ranked = [...kept].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
   return {
     ok: true,

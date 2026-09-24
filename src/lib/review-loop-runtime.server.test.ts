@@ -1583,7 +1583,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
   });
 });
 
-describe("ambiguous control writes: a separate no-expiry ledger, never read as posted", () => {
+describe("ambiguous control writes: journaled with no expiry, never read as posted", () => {
   const unknownErr = () => Object.assign(new Error("GitHub issue comment 502: Bad Gateway"), { name: "GithubWriteError", status: 502, outcome: "unknown" });
   /** Every POST whose body matches `hit` fails with an UNKNOWN outcome and creates no row (the list stays stale). */
   const unknownFor = (f: ReturnType<typeof fakeDeps>, hit: (body: string) => boolean) => {
@@ -1607,10 +1607,10 @@ describe("ambiguous control writes: a separate no-expiry ledger, never read as p
     assert.equal(first.unresolved, true, "harbor logs it");
     const again = await stopLoop("t", stopReq, settings(), f.deps, ENV_ON);
     assert.equal(again.posted, false);
-    assert.notEqual(again.reason, "stop already recorded", "a ledger-only hit is not a recorded stop");
+    assert.notEqual(again.reason, "stop already recorded", "a write that may not have landed is not a recorded stop");
     assert.match(again.reason, /outcome unknown.*honored in this process until recorded/);
     assert.equal(attempts(), 1, "one POST only");
-    // the pending stop is still honored: a later session read is ended, no fix runs
+    // the stop is still honored (write-ahead): a later session read is ended, no fix runs
     assert.deepEqual(await run(f, "apply"), { ran: false, reason: "no active loop session" });
     assert.equal(f.prompts.length, 0);
     assert.equal(f.committed, false);

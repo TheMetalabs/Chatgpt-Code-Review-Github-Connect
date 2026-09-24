@@ -527,7 +527,7 @@ describe("round-5: exact session scoping and read-after-write lag", () => {
   });
 });
 
-describe("round-6: both handoff paths share the just-posted cache", () => {
+describe("round-6: both handoff paths share the control-write journal", () => {
   it("maybeEscalate never double-posts a stuck handoff while the list still omits the first", async () => {
     const H = "c".repeat(40);
     const posted: string[] = [];
@@ -633,7 +633,7 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     // a later caller for the same head + session (a redelivery, the push path) while the list still lags
     const again = await now(f, 15);
     assert.equal(again.escalated, false);
-    assert.equal(f.attempts(), 1, "the ambiguity ledger stops the re-entry too");
+    assert.equal(f.attempts(), 1, "the journal stops the re-entry too");
     assert.equal(f.stored.length, 1);
   });
 
@@ -664,7 +664,7 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     assert.equal(f.attempts(), 1);
   });
 
-  it("the ambiguity ledger never evicts an unresolved entry: 600 later unknown writes cannot re-enable a POST", async () => {
+  it("the journal never evicts an unresolved entry: 600 later unknown writes cannot re-enable a POST", async () => {
     const f = flaky(["unknown"], false, true); // every POST outcome unknown, every list scan stale
     const first = await now(f, 1000);
     assert.equal(first.escalated, false);

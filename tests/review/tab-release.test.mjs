@@ -8,7 +8,7 @@ import {join} from 'node:path';
 import {webcrypto} from 'node:crypto';
 import {root, source} from './load-source.mjs';
 import {PROGRESS_LABELS, sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
-import {background, storage, raw} from './helpers.mjs';
+import {background, storage, raw, until} from './helpers.mjs';
 
 /** The string-literal stages a progress call can record: literals of workerStep / recordReviewStep /
  * step arguments, including both arms of a conditional, but not the arguments of a nested call
@@ -157,6 +157,38 @@ for (const kind of ['review', 'fix']) {
     const history = uploaded(b);
     for (const stage of ['page:context_changed', 'worker:preserve_user_turn', 'worker:tab_preserved']) assert.ok(history.includes(stage), `${stage} in ${history}`);
     assert.ok(history.indexOf('worker:preserve_user_turn') < history.indexOf('worker:tab_preserved'), 'the cause precedes the preserve');
+  });
+}
+// A page that accepts a release message but never runs its handler (a frozen tab, a hung page): the
+// reply is bounded (pageReplyDeadline, replaced here by one that expires at once), so the cleanup
+// lane is never held and the bounded ownership wait applies.
+const TEMP = 'https://chatgpt.com/?temporary-chat=true';
+const expiresAtOnce = () => ({promise: new Promise((_resolve, reject) => setImmediate(() => reject(new Error('the page did not answer in time')))), cancel() {}});
+for (const kind of ['review', 'fix']) {
+  for (const [mode, state, status] of [['secured', secured(kind), 'awaiting_chat'], ['cancelled', {}, 'cancelled']]) {
+    test(`${kind}: a ${mode} leg whose page never answers the release message is preserved after the wait, never held`, async () => {
+      const b = worker(leg(kind, {...state, conversation: TEMP, pageUrl: TEMP}), {status, tab: {id: 10, url: TEMP, status: 'complete'}});
+      b.chrome.tabs.sendMessage = (id, msg) => { b.messages.push({id, ...msg}); }; // accepted, never answered
+      b.context.pageReplyDeadline = expiresAtOnce;
+      let settled = false;
+      const ticked = b.tick().then(() => { settled = true; });
+      assert.ok(await until(() => settled), 'the tick settles: an unanswered page does not hold the cleanup lane');
+      await ticked;
+      assert.ok(b.messages.some(m => m.type === (mode === 'secured' ? 'ashlar-can-close' : 'ashlar-fix-cancel')), 'the page was asked');
+      assert.equal(b.pending()?.states.chatgpt.cleanupWaitReason, 'page_unreachable', 'the blocker says why');
+      b.later();await b.tick();
+      assert.equal(b.pending(), undefined, 'retired after the wait');assert.deepEqual(b.closedTabs, [], 'never closed unproven');
+      assert.ok(uploaded(b).includes('worker:preserve_unreachable') && uploaded(b).includes('worker:tab_preserved'), `${uploaded(b)}`);
+    });
+  }
+  test(`${kind}: a frozen tab is never messaged; its blocker says so and it is preserved after the wait`, async () => {
+    const b = worker(leg(kind, {...secured(kind), conversation: TEMP}), {tab: {id: 10, url: TEMP, status: 'complete', frozen: true}, handler: () => owned});
+    await b.tick();
+    assert.equal(b.pending()?.states.chatgpt.cleanupWaitReason, 'tab_frozen');
+    assert.deepEqual(b.messages.filter(m => m.type !== 'ashlar-tab-status'), [], 'a frozen page is not asked');
+    b.later();await b.tick();
+    assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, []);
+    assert.ok(uploaded(b).includes('worker:preserve_unreachable'));
   });
 }
 test('worker status lists the recently retired legs (closed and preserved) with metadata only', async () => {

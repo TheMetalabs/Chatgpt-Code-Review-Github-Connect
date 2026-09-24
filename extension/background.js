@@ -296,6 +296,26 @@ async function sendToTab(tabId, msg, files) {
   }
 }
 
+/** How long a release message (can-close, cancel, preserve) or an ownership probe may go
+ * unanswered: a page that accepted it but never runs its handler (a frozen tab, a hung page) then
+ * counts as unreachable, instead of holding its single-flight cleanup lane (and the bounded
+ * ownership wait that only starts after a reply) forever. */
+const PAGE_REPLY_MS = 15_000;
+
+/** One reply deadline (a function so tests can replace the timer; cancelled once the reply came). */
+function pageReplyDeadline(ms = PAGE_REPLY_MS) {
+  let timer;
+  const promise = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the page did not answer in time")), ms); });
+  return {promise, cancel: () => clearTimeout(timer)};
+}
+
+/** sendToTab for the tab-release path and ownership probes, bounded by pageReplyDeadline. */
+async function askPage(tabId, msg, files) {
+  const deadline = pageReplyDeadline();
+  try { return await Promise.race([sendToTab(tabId, msg, files), deadline.promise]); }
+  finally { deadline.cancel(); }
+}
+
 async function quotaMap() {
   const s = await chrome.storage.local.get(["quota"]);
   return s.quota && typeof s.quota === "object" ? s.quota : {};
@@ -450,9 +470,10 @@ function allowedTab(tab, provider) {
 async function findOriginalTab(job, provider) {
   const urls = provider === "grok" ? ["https://grok.com/*"] : ["https://chatgpt.com/*", "https://chat.openai.com/*"];
   for (const tab of await chrome.tabs.query({url: urls})) {
-    if (!allowedTab(tab, provider)) continue;
+    // A frozen tab runs no handler until the user brings it back: it cannot answer now.
+    if (!allowedTab(tab, provider) || tab.frozen === true) continue;
     try {
-      const result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
+      const result = await askPage(tab.id, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
       if (matchesJob(result, job, provider)) return tab;
     } catch { /* A messaging outage is not evidence of completion. */ }
   }
@@ -513,7 +534,7 @@ async function completePreservedRelease(tab, provider, status) {
   const record=(await chrome.storage.session.get([key]))[key];
   if(!record)return;
   if(status.released===true){await chrome.storage.session.remove([key]);return;}
-  const ack=await sendToTab(tab.id,{type:"ashlar-fix-cancel",jobId:status.jobId,provider,runId:status.runId,kind:"fix",preserve:true},contentFiles(provider)).catch(()=>null);
+  const ack=await askPage(tab.id,{type:"ashlar-fix-cancel",jobId:status.jobId,provider,runId:status.runId,kind:"fix",preserve:true},contentFiles(provider)).catch(()=>null);
   if(ack?.ok===true && ack.jobId===status.jobId && ack.runId===status.runId && ack.provider===provider) {
     const known=tabOwners.get(tab.id);
     if(known?.jobId===status.jobId && known.runId===status.runId)tabOwners.set(tab.id,{...known,released:true});
@@ -784,7 +805,7 @@ function cleanupWaiting(job, provider, reason) {
  * retained binding is never counted as an orphan against tab capacity. Then the job retires. */
 async function preserveFixTab(job, provider, jobs, reason, tab, cause) {
   const state = job.states[provider];
-  if (tab) await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider)).catch(() => {});
+  if (tab) await askPage(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider)).catch(() => {});
   await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: state.tabId}});
   return finishTabCleanup(job, provider, jobs, reason, cause);
 }
@@ -845,6 +866,12 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     cleanupWaiting(job, provider, tab.discarded || tab.status === "unloaded" ? "tab_discarded" : "tab_loading");
     return waitOrPreserveFixTab(job, provider, jobs, "the tab never finished loading; tab preserved", undefined, "unreachable");
   }
+  if (tab.frozen === true) {
+    // A frozen tab (Chrome's energy saver) runs no handler until the user brings it back: a message
+    // would only wait. It keeps its page (a draft included), so it is never reloaded to ask either.
+    cleanupWaiting(job, provider, "tab_frozen");
+    return waitOrPreserveFixTab(job, provider, jobs, "the tab was frozen and could not answer; tab preserved", undefined, "unreachable");
+  }
   // A tab opened for a run that was never sent is unbound by design: the page then answers for an
   // unbound tab (Ashlar's only while it holds no turn and no draft), and only in the tab this browser
   // session created for the leg. Without that record the stored id may name the user's own tab: it
@@ -859,8 +886,9 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   const message = {...tabMessage(job, provider, cancelled ? "ashlar-fix-cancel" : "ashlar-can-close"),
     allocationUrl: providerUrl(provider), ...(undispatched ? {undispatched: true} : {})};
   let result;
-  try { result = await sendToTab(tab.id, message, contentFiles(provider)); } catch {
-    // No receiver and reinjection failed: ownership is unknown and the page cannot be messaged.
+  try { result = await askPage(tab.id, message, contentFiles(provider)); } catch {
+    // No receiver and reinjection failed, or no answer in time (askPage): ownership is unknown and
+    // the page cannot be messaged.
     cleanupWaiting(job, provider, "page_unreachable");
     return waitOrPreserveFixTab(job, provider, jobs, "the tab could not be reached; tab preserved", undefined, "unreachable");
   }

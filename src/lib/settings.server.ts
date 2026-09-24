@@ -20,7 +20,7 @@ import {
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
-import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, type SettingsIntField } from "./settings-rules.ts";
+import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixLoopRunnable, fixPairCompatible, settingsProblem, type SettingsIntField } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
 
 function envStr(key: string): string | undefined {
@@ -194,8 +194,6 @@ function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
   let provider = FIX_AGENT_PROVIDERS.includes(p.provider as FixAgentProvider) ? (p.provider as FixAgentProvider) : d.provider;
   let delivery = FIX_DELIVERIES.includes(p.delivery as FixDelivery) ? (p.delivery as FixDelivery) : d.delivery;
   const mode = FIX_MODES.includes(p.mode as FixMode) ? (p.mode as FixMode) : d.mode;
-  // Only a literal true enables the loop ("true", 1, … stay off): the switch fails closed.
-  const enabled = p.enabled === true;
   // Load-time normalization of a stored document (a save is VALIDATED first — settings-rules —
   // and never reaches here with an incompatible pair): an incompatible pair (design §6b matrix)
   // has no execution path, so it disables the fix agent (provider=null), failing closed.
@@ -203,6 +201,12 @@ function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
     provider = null;
     delivery = d.delivery;
   }
+  // Only a literal true enables the loop ("true", 1, … stay off), and only for a configuration the
+  // runtime can execute (fixLoopRunnable — the rule a save enforces): a stored or hand-edited
+  // enabled=true on a non-wired pair (a pre-#77 chat-push save, no provider) loads OFF, which is
+  // what the runtime already did, so the loaded document is one a save accepts and an unrelated
+  // save is never rejected for a switch the operator did not touch.
+  const enabled = p.enabled === true && fixLoopRunnable({ provider, delivery });
   const knobs = Object.fromEntries(
     (Object.keys(FIX_AGENT_KNOBS) as FixAgentKnob[]).map((key) => [key, fixKnob({ [key]: num(p[key], FIX_AGENT_KNOBS[key].def) }, key)]),
   ) as Record<FixAgentKnob, number>;

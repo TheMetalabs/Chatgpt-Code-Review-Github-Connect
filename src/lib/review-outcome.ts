@@ -66,10 +66,17 @@ export function postedOutcome(job: OutcomeJob, findings: number): PostedOutcome 
  * only the chat reviewers whose structured result was clean (a skipped one found nothing by absence). */
 export function outcomeNote(
   outcome: ReviewOutcome,
-  input: { chat: readonly ReviewProvider[]; verifying: boolean; findings: number; localError?: string },
+  input: { chat: readonly ReviewProvider[]; verifying: boolean; findings: number; localError?: string; localVerified?: boolean },
 ): string {
   const chat = input.chat.join(" + ") || "chat";
   if (outcome === "verified-clean") return `${chat} found nothing; local verification agreed.`;
+  // A skipped chat peer makes the round incomplete whatever local did, so the note is what tells an
+  // agreeing verification from a failed one.
+  if (outcome === "incomplete" && input.verifying) {
+    return input.localVerified
+      ? `${chat} found nothing; local verification agreed.`
+      : `${chat} found nothing; local verification did not complete (${input.localError || "unavailable"}).`;
+  }
   if (outcome === "findings" && input.verifying) return `${chat} found nothing; local verification found ${input.findings}.`;
   if (outcome === "unverified-clean") {
     return `${chat} found nothing; local verification did not complete (${input.localError || "unavailable"}), so this is ${chat}'s unverified clean result.`;

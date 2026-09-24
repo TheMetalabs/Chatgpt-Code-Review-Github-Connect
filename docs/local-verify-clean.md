@@ -25,7 +25,7 @@ race.
 | `findings` | any structured finding | summary mark | `total=N inline=… body=… p0 p1 p2` | no |
 | `raw` | a salvaged (unparseable) reply, not a verifier's | summary mark | `total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` | no |
 | `raw-unverified` | verification round, local's reply could not be used as a review (below) | summary mark + note | raw marker + ` unverified=1` | no |
-| `incomplete` | 0 findings, no raw, a reviewer was skipped | summary mark | none | no |
+| `incomplete` | 0 findings, no raw, a reviewer was skipped | summary mark (+ note in a verification round: agreed / did not complete) | none | no |
 | `clean` | not a verifier, 0 findings, nothing skipped | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `verified-clean` | verification round, local returned a structured clean result | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `unverified-clean` | verification round, local failed / timed out / offline | `Chat found no major issues, but local verification did not complete …` | `total=0 … unverified=1` | no |

@@ -162,8 +162,12 @@ describe("outcomeNote", () => {
   it("N6 credits only the chat reviewers pinned as clean (a skipped grok found nothing by absence)", () => {
     assert.equal(outcomeNote("verified-clean", { chat: ["chatgpt"], verifying: true, findings: 0 }).startsWith("chatgpt found nothing"), true);
   });
-  it("N7 clean, raw and incomplete carry no note", () => {
+  it("N7 clean, raw and incomplete carry no note outside a verification round", () => {
     for (const kind of ["clean", "raw", "incomplete"] as const) assert.equal(outcomeNote(kind, { chat, verifying: false, findings: 0 }), "", kind);
+  });
+  it("N8 incomplete in a verification round still says whether local verified", () => {
+    assert.equal(outcomeNote("incomplete", { chat, verifying: true, findings: 0, localVerified: true }), "chatgpt found nothing; local verification agreed.");
+    assert.equal(outcomeNote("incomplete", { chat, verifying: true, findings: 0, localVerified: false, localError: "HTTP 500" }), "chatgpt found nothing; local verification did not complete (HTTP 500).");
   });
 });
 

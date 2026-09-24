@@ -171,3 +171,40 @@ test('verify-clean outcome: the note credits only the chat reviewer whose struct
   assert.match(app.reviews[0].body,/\nchatgpt found nothing; local verification agreed\.\n/);
   assert.doesNotMatch(app.reviews[0].body,/grok found nothing/);
 });
+
+// chat clean with a skipped chat peer (grok quota) × local: the round is incomplete whatever local
+// did, so the note alone tells an agreeing verification from a failed one; raw evidence still wins.
+const SKIPPED_PEER={
+  clean:{marker:undefined,raw:[],note:/\nchatgpt found nothing; local verification agreed\.\n/},
+  error:{marker:undefined,raw:[],note:/\nchatgpt found nothing; local verification did not complete \(/},
+  unparseable:{marker:MRU,raw:['LOCAL-RAW'],note:RAW_NOTE},
+};
+for(const [local,e] of Object.entries(SKIPPED_PEER)){
+  test(`verify-clean outcome: chat clean + grok skipped × local ${local}`,async t=>{
+    const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
+    app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+    const out=await app.mention(`matrix-skipped-peer-${local}`);
+    const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+    await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+    app.bridge.bridgeHeartbeat();
+    const take=app.bridge.takeNextBridgeJob('matrix-client');
+    assert.equal(take?.jobId,out.jobId,'the bridge claims the job');
+    assert.equal(app.bridge.failBridgeProvider(out.jobId,'grok','quota: usage limit reached',take.leaseId),true);
+    assert.equal((await app.bridge.completeBridgeJob(out.jobId,cleanJson,[{provider:'chatgpt',raw:cleanJson}],take.leaseId)).ok,true);
+    let answered=0;
+    await eventually(()=>{
+      while(answered<app.localResponses.length){LOCAL[local].answer(app.localResponses[answered],answered);answered++;}
+      return app.reviews.length===1;
+    },'the review was not posted');
+    const body=app.reviews[0].body;
+    assert.ok(job().localVerifyStartedAt,'a verification round ran');
+    assert.equal(body.split('\n')[0],SUMMARY);
+    assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],e.marker,'trailing marker');
+    assert.equal(converged(body),false,'never CONVERGED with a reviewer skipped');
+    assert.match(body,/- Skipped grok/);
+    assert.match(body,e.note,'the verification note');
+    for(const mark of ['LOCAL-RAW'])assert.equal(body.includes(mark),e.raw.includes(mark),`${mark} kept iff expected`);
+    const note=body.match(e.note)[0].trim();
+    await eventually(()=>(app.ops.at(-1)??'').includes(note),'the ops comment does not carry the same note');
+  });
+}

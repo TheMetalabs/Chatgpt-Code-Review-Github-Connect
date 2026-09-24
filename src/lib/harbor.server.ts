@@ -1109,7 +1109,7 @@ export async function submitHarborChat(
     (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
     invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
     (byProvider.get("local")?.rawReview ? "not review JSON" : undefined);
-  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, localError });
+  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, localError, localVerified });
   transitionJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,

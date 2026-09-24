@@ -921,17 +921,22 @@ export async function runPostReviewLoop(
         const c = await ensureContinuation(gh, token, ref, { head: newHead, mode, sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, round: rounds.length + 1, sleep });
         status = c.posted || c.exists ? { ok: true } : { ok: false, error: c.error ?? "the continuation was not posted" };
       }
+      // The fixed signal (continuation above, or this handoff) goes out BEFORE the informational
+      // replies and report: those are up to maxInlineComments slow calls that must never delay
+      // the signal, or lose it to a crash midway.
+      let handoff: LoopStepResult | undefined;
+      if (!status.ok && !("ended" in status)) {
+        const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
+        handoff = await escalate("loop-error", `the fix was committed but the next review could not be requested: ${status.error}`, live);
+      }
       // The commit landed: every posted finding thread gets its disposition (addressed).
       const replies = await replyToThreads(done.dispositions, newHead ?? done.commitSha);
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status, replies) }).catch(() => {
         /* the report is informational; the continuation / handoff carries the signal */
       });
+      if (handoff) return handoff;
       if (status.ok) trace(job.id, "continued", { commit: newHead?.slice(0, 7), round: rounds.length + 1 });
-      if (status.ok || "ended" in status) {
-        return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead ?? done.commitSha, continued: status.ok, attempts: tries };
-      }
-      const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
-      return await escalate("loop-error", `the fix was committed but the next review could not be requested: ${status.error}`, live);
+      return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead ?? done.commitSha, continued: status.ok, attempts: tries };
     };
 
     if (res.outcome === "applied") return await afterCommit(res, attempts);
@@ -944,11 +949,15 @@ export async function runPostReviewLoop(
       return { ran: true, step: "fix", outcome: res.outcome, continued: false, attempts };
     }
     if (res.outcome === "no-change") {
-      // Each thread gets the agent's push-back / decline / defer; the full rationale stays
-      // visible (sanitized) in the report; the handoff carries the fixed signal.
+      // The handoff (the fixed signal) first; then each thread gets the agent's push-back /
+      // decline / defer and the report keeps the full rationale (sanitized) — informational, so a
+      // failed report never turns into a second handoff.
+      const handoff = await escalate("fix-declined", `no-change: ${sanitizeModelText(res.summary ?? "every finding was pushed back / declined / deferred", { oneLine: true, max: 500 })}`);
       const replies = await replyToThreads(res.dispositions);
-      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts, undefined, replies) });
-      return await escalate("fix-declined", `no-change: ${sanitizeModelText(res.summary ?? "every finding was pushed back / declined / deferred", { oneLine: true, max: 500 })}`);
+      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts, undefined, replies) }).catch(() => {
+        /* informational; the handoff carries the signal */
+      });
+      return handoff;
     }
     return await escalate("fix-failed", `${res.outcome} after ${attempts} attempt(s): ${sanitizeModelText(res.error ?? "no error detail", { oneLine: true, max: 500 })}`);
   } catch (e) {

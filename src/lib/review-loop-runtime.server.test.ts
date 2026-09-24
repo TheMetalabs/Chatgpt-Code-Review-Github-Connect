@@ -119,6 +119,7 @@ function fakeDeps(
     sameRepo?: boolean; // head-repository provenance (default: verified same repo unless a fork)
     threads?: Array<{ id: number; path: string; body: string }>; // the posted review's thread roots
     replyFails?: boolean;
+    listThreadsFails?: boolean; // listReviewThreadRoots throws (a failed page)
   } = {},
 ) {
   const posted: string[] = [];
@@ -184,6 +185,7 @@ function fakeDeps(
         };
       },
       async listReviewThreadRoots() {
+        if (opts.listThreadsFails) throw new Error("review comments page 2 failed (502)");
         return opts.threads ?? [];
       },
       async replyToReviewComment(_t, _o, _r, _pr, id, body) {
@@ -1314,6 +1316,44 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     // posted[0] is the continuation (the control signal comes first); the report follows
     const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
     assert.match(report, /Thread replies: 0 posted, 2 failed\./);
+  });
+
+  it("an unreadable thread list never fails the round: every reply is counted as failed", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [2], threads, listThreadsFails: true });
+    const r = await runWith(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.continued === true);
+    assert.equal(f.replies.length, 0);
+    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+    assert.match(report, /Thread replies: 0 posted, 2 failed\./);
+  });
+
+  it("the fixed signal goes out before the informational replies (no-change → handoff first)", async () => {
+    const f = fakeDeps({
+      start: "apply",
+      rounds: [2],
+      threads,
+      reply: withDispositions("[]", '[{"finding":"F1","action":"pushback","note":"n"}]'),
+    });
+    const handoffsAtReply: number[] = [];
+    const reply = f.deps.gh.replyToReviewComment;
+    f.deps.gh.replyToReviewComment = async (...a: Parameters<typeof reply>) => {
+      handoffsAtReply.push(escalations(f.posted).length);
+      return reply(...a);
+    };
+    const r = await runWith(f, "apply");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-declined");
+    assert.deepEqual(handoffsAtReply, [1, 1]);
+    // committed, but the next review cannot be requested → the loop-error handoff first, too
+    const g = fakeDeps({ start: "apply", rounds: [2], threads, failContinuation: true });
+    const seen: number[] = [];
+    const reply2 = g.deps.gh.replyToReviewComment;
+    g.deps.gh.replyToReviewComment = async (...a: Parameters<typeof reply2>) => {
+      seen.push(escalations(g.posted).length);
+      return reply2(...a);
+    };
+    const r2 = await runWith(g, "apply");
+    assert.ok(r2.ran && r2.step === "escalated" && r2.reason === "loop-error", JSON.stringify(r2));
+    assert.deepEqual(seen, [1, 1]);
   });
 
   it("model notes are sanitized: markers neutralized, @-mentions defanged, one line", async () => {

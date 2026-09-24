@@ -269,6 +269,65 @@ async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',basel
  return page;
 }
 
+// ── Page conformance: the SAME page scenario for a review run and a fix run (the P rows of the
+// review/fix conformance table; W rows: kind-conformance.test.mjs, S rows:
+// bridge-lease-conformance.test.mjs). A shared cell asserts one outcome for both kinds; an intended
+// difference asserts each kind's documented outcome.
+const KIND_ANSWER='{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["fixture checked"],"summary":"s","files":[]}';
+async function kindPage(t,kind,{done=true,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'},extra=''}={}){
+ const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
+ await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here.</p><pre><code>${KIND_ANSWER}</code></pre></div></div>${done?toolbar:''}</section></main>${done?'':stop}${extra}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
+ await page.evaluate(journal=>{
+  const saved=new Map([['ashlar:job','job-A'],['ashlar:run','run-A'],...(journal?[['ashlar:submission:job-A:run-A',JSON.stringify(journal)]]:[])]);
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+ },journal);
+ for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId:'job-A',runId:'run-A',provider:'chatgpt',...(kind==='fix'?{kind}:{}),...extra});
+ await send('ashlar-run',{resume:true,prompt:'fix prompt'});
+ return {page,send,harvest:()=>send('ashlar-harvest')};
+}
+for(const kind of ['review','fix']){
+ test(`real DOM conformance (${kind}): the bound answer is harvested after completion and its tab may close`,async t=>{
+  const {page,harvest,send}=await kindPage(t,kind);
+  await page.clock.runFor(3200);
+  const out=await harvest();
+  assert.equal(out.ok,true,JSON.stringify(out));
+  assert.equal(JSON.parse(out.raw).summary,'s','the fenced answer (review: its JSON; fix: its code)');
+  assert.equal((await send('ashlar-can-close')).canClose,true);
+  // P6: a draft the user typed afterwards hands the tab back to the user, for both kinds
+  await page.locator('#prompt-textarea').evaluate(el=>{el.textContent='my own question';});
+  const draft=await send('ashlar-can-close');
+  assert.equal(draft.canClose,false);assert.equal(draft.reason,'repurposed');
+  assert.equal((await page.evaluate(()=>new Promise(resolve=>receiver({type:'ashlar-tab-status'},null,resolve)))).released,true,'the repurposed tab frees its managed slot');
+ });
+ test(`real DOM conformance (${kind}): a visible quota banner before any answer ends the run as quota`,async t=>{
+  const {page,harvest}=await kindPage(t,kind,{done:false,extra:'<div role="alert">usage limit reached</div>'});
+  await page.clock.runFor(3200);
+  assert.equal((await harvest()).code,'quota');
+ });
+ test(`real DOM conformance (${kind}): a follow-up turn repurposes the tab; nothing is harvested from it`,async t=>{
+  const {page,harvest}=await kindPage(t,kind,{done:false});
+  await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);});
+  await page.clock.runFor(3200);
+  assert.equal((await harvest()).code,'busy','no answer from a repurposed conversation');
+  assert.equal(await page.evaluate(()=>__ashlarRunnerState.tabRepurposed),true);
+ });
+ test(`real DOM conformance (${kind}): harvest acceptance of an unbound page and of an edited sent turn`,async t=>{
+  // P3: no sent journal. A review keeps its legacy unbound observation; a fix reads nothing.
+  const unbound=await kindPage(t,kind,{journal:null});
+  await unbound.page.clock.runFor(3200);
+  assert.equal((await unbound.harvest()).ok===true,kind==='review',`${kind}: unbound harvest`);
+  // P5: the user edited the sent turn around Ashlar's prompt. Containment still binds it; a review
+  // tolerates the edit (intended, see the table), a fix needs the exact prompt and never harvests.
+  const edited=await kindPage(t,kind,{done:false});
+  await edited.page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='my note: fix prompt';});
+  await edited.page.evaluate(toolbar=>{document.querySelector('[data-testid="stop-button"]').remove();document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('beforeend',toolbar);},toolbar);
+  await edited.page.clock.runFor(3200);
+  assert.equal((await edited.harvest()).ok===true,kind==='review',`${kind}: edited-turn harvest`);
+ });
+}
+
 test('real DOM: a fix is harvested only from the response bound to its own sent prompt',async t=>{
  const code='{"summary":"unrelated","files":[{"path":"a.ts","content":"x"}]}';
  const unrelated=`<p>Earlier answer.</p><pre><code>${code}</code></pre>`;

@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
-import {content, background, storage, flush} from './helpers.mjs';
+import {content, background, storage, flush, until} from './helpers.mjs';
 
 const PARTS = ['I guarded the null path.', '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'];
 // A fix is read from the answer's fenced code only (literal text; see assistantCodeBlocks).
@@ -175,11 +175,11 @@ test('worker: fix items skip observation/capture/repair lanes; the same page sta
   const observation = {state: 'response_completed_json_invalid', text: 'not review json', totalChars: 15, truncated: false};
   const handler = () => ({ok: false, code: 'busy', retry: true, observation});
   const fix = worker([fixJob()], {api: active, handler});
-  await fix.tick();for (let i = 0; i < 20; i++) await flush();
-  assert.equal(fix.calls.some(c => REVIEW_LANES.includes(c.action)), false);
   const review = worker([fixJob({jobId: 'job-A', kind: undefined})], {api: active, handler});
-  await review.tick();for (let i = 0; i < 20; i++) await flush();
-  assert.ok(review.calls.some(c => c.action === 'observe'), 'sanity: this state does archive for a review');
+  await Promise.all([fix.tick(), review.tick()]);
+  // The review's archive follows a SHA-256 digest (threadpool): once it landed, the fix's would have.
+  assert.ok(await until(() => review.calls.some(c => c.action === 'observe')), 'sanity: this state does archive for a review');
+  assert.equal(fix.calls.some(c => REVIEW_LANES.includes(c.action)), false);
   assert.ok(review.messages.some(m => m.jobId) && review.messages.every(m => !('kind' in m)), 'review tab messages are unchanged (no kind field)');
 });
 
@@ -226,6 +226,14 @@ test('worker: a cancelled fix whose run was never sent closes its blank tab and 
   const moved = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/c/other'), url: 'https://chatgpt.com/c/other'});
   await moved.tick();
   assert.equal(moved.closedTabs.length, 0);assert.deepEqual(moved.local.state.pendingReviewJobs, {});
+  // blank on the same path but out of temporary-chat mode: a different page (the user's), preserved
+  const plain = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/'});
+  await plain.tick();
+  assert.equal(plain.closedTabs.length, 0);assert.deepEqual(plain.local.state.pendingReviewJobs, {});
+  // the fragment is not part of the page identity
+  const hashed = worker(unsent(), {api: cancelled, handler: blank(`${OPENED}#x`), url: `${OPENED}#x`});
+  await hashed.tick();
+  assert.deepEqual(hashed.closedTabs, [10]);
   const handler = blank(OPENED);
   // a started run never takes the undispatched path
   const started = worker([fixJob()], {api: cancelled, handler});

@@ -195,7 +195,8 @@ function recordFixProgress(jobId: string, leaseId: string | undefined, reports: 
   const report = (reports as Record<string, unknown>)[provider];
   const events = report && typeof report === "object" ? sanitizeProgressEvents((report as {events?: unknown}).events) : [];
   const latest = events.reduce<(typeof events)[number] | undefined>((last, event) => (!last || event.at >= last.at ? event : last), undefined);
-  return fixes().progress(jobId, leaseId, latest?.stage);
+  const runId = (report as {runId?: unknown} | undefined)?.runId;
+  return fixes().progress(jobId, leaseId, latest?.stage, typeof runId === "string" && runId.length <= 128 ? runId : undefined);
 }
 
 /** The oldest queued fix unless an eligible review is older. Neither kind starves: live fixes
@@ -314,8 +315,15 @@ export function recoverBridgeJob(clientId: string, values: unknown) {
   const bindings = values.filter((item): item is {jobId:string;provider:"chatgpt"|"grok";runId:string} =>
     Boolean(item && typeof item === "object" && typeof item.jobId === "string" && item.jobId.length <= 160 &&
       isChatProvider(item.provider) && typeof item.runId === "string" && item.runId.length > 0 && item.runId.length <= 128));
+  // A fix item's run is resumed the same way: same profile, provider and pinned run.
+  for (const binding of bindings) {
+    if (!isFixItemId(binding.jobId)) continue;
+    const offer = fixes().recover(binding.jobId, clientId, binding.provider, binding.runId);
+    if (offer) return offer;
+  }
   const harbor=getHarbor();
   for (const id of new Set(bindings.map(item=>item.jobId))) {
+    if (isFixItemId(id)) continue;
     const job=harbor.jobs.find(row=>row.id===id);
     if (!job || job.status!=="awaiting_chat" || !llmWorkAllowed(job) || job.bridgeClientId!==clientId ||
         job.chatFpRound || job.fpProviders?.length) continue;

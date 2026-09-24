@@ -703,11 +703,14 @@ async function cleanupProviderBody(job, provider, jobs) {
  * close without an acknowledged answer. It still requires the page's positive binding, and a tab
  * the user took over (follow-up, unsent draft, other conversation) is preserved.
  */
-/** Whether `url` is still the page a fix tab was opened on (providerUrl: the provider's new chat). */
+/** Whether `url` is still exactly the page a fix tab was opened on (providerUrl: the provider's
+ * new chat). The query is part of that identity (ChatGPT's `temporary-chat=true` is a different
+ * mode from its plain new chat); only the fragment is ignored. Anything else is preserved. */
 function onAllocationPage(url, provider) {
   try {
     const now = new URL(url), opened = new URL(providerUrl(provider));
-    return now.origin === opened.origin && now.pathname === opened.pathname;
+    const query = u => [...u.searchParams].map(([k, v]) => `${k}=${v}`).sort().join("&");
+    return now.origin === opened.origin && now.pathname === opened.pathname && query(now) === query(opened);
   } catch { return false; }
 }
 

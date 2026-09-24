@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
-import {background,storage,flush,raw} from './helpers.mjs';
+import {background,storage,until,raw} from './helpers.mjs';
 test('a stalled diagnostic upload never occupies the response collection lane',async t=>{
  let release;const pending=new Promise(r=>release=r);t.after(()=>release({ok:true}));let final=false;
  const task={jobId:'A',origin:'http://bridge',leaseId:'lease-A',prompt:'fixture',providers:['chatgpt'],states:{chatgpt:{tabId:10,started:true,runId:'run-A'}}};
@@ -10,7 +10,9 @@ test('a stalled diagnostic upload never occupies the response collection lane',a
   api:(_path,body)=>body.action==='observe'?pending:Promise.resolve({ok:true,active:true,accepted:true})});
  b.context.crypto=webcrypto;b.context.TextEncoder=TextEncoder;
  const jobs=await b.context.workerJobs('http://bridge');
- let returned=false;b.context.progressJob(jobs.A,jobs).then(()=>returned=true);for(let i=0;i<8;i++)await flush();
+ let returned=false;b.context.progressJob(jobs.A,jobs).then(()=>returned=true);
+ // The observe upload follows a SHA-256 digest (threadpool): wait for it, bounded, not a flush count.
+ await until(()=>returned && b.calls.some(c=>c.action==='observe'));
  assert.equal(b.calls.filter(c=>c.action==='observe').length,1);
  assert.equal(returned,true,'diagnostic RPC blocked the next content/complete poll');
  final=true;await b.context.progressJob(jobs.A,jobs);

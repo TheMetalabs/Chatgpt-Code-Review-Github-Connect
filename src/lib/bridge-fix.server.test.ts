@@ -302,6 +302,46 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     assert.equal(await promise, "ANSWER");
   });
 
+  it("every take is a fresh submission: a stale replay re-opens the profile's submission window", async () => {
+    const h = harness();
+    h.setLimit(1);
+    const promise = h.reg.request({ ...REQ, pr: 1 });
+    const first = h.reg.peek([], "chrome-1");
+    assert.ok(first && h.reg.take(first.id, "chrome-1")); // the take response is lost
+    h.advance(CLAIM_MS + 1); // the profile is away past claimMs (the window has long passed)
+    assert.equal(h.reg.submitting("chrome-1", [first.id]), false);
+    const replay = h.reg.take(first.id, "chrome-1");
+    assert.ok(replay, "its own profile gets it again");
+    assert.equal(h.reg.submitting("chrome-1", [first.id]), true, "the replayed prompt holds the foreground like a new one");
+    h.reg.refresh(first.id, replay.leaseId, { chatgpt: true });
+    assert.equal(h.reg.submitting("chrome-1", [first.id]), false);
+    void promise.catch(() => {});
+  });
+
+  it("a claim with a started run is resumed only through its tab binding, never re-submitted", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h, { pr: 1 }, "chrome-1");
+    // no run reported yet: recovery has nothing to prove
+    assert.equal(h.reg.recover(offer.jobId, "chrome-1", "chatgpt", "run-A"), null);
+    assert.equal(h.reg.progress(offer.jobId, offer.leaseId, "prompt_prepared", "run-A"), true);
+    assert.equal(h.reg.progress(offer.jobId, offer.leaseId, "x", "run-B"), false, "one run per claim");
+    // the worker lost its local job: take never offers the running fix again (no second tab/prompt)
+    assert.equal(h.reg.peek([], "chrome-1"), undefined);
+    assert.equal(h.reg.take(offer.jobId, "chrome-1"), null);
+    // wrong profile, provider or run: nothing
+    assert.equal(h.reg.recover(offer.jobId, "chrome-2", "chatgpt", "run-A"), null);
+    assert.equal(h.reg.recover(offer.jobId, "chrome-1", "grok", "run-A"), null);
+    assert.equal(h.reg.recover(offer.jobId, "chrome-1", "chatgpt", "run-B"), null);
+    h.advance(SUBMIT_MS + 1);
+    const resumed = h.reg.recover(offer.jobId, "chrome-1", "chatgpt", "run-A");
+    assert.ok(resumed);
+    assert.deepEqual(resumed.resumeProviders, ["chatgpt"]);
+    assert.deepEqual(resumed.bindings, [{ jobId: offer.jobId, provider: "chatgpt", runId: "run-A" }]);
+    assert.equal(h.reg.submitting("chrome-1", [offer.jobId]), false, "a resume sends nothing: no submission window");
+    assert.equal(h.reg.complete(offer.jobId, "chatgpt", "ANSWER", resumed.leaseId).ok, true);
+    assert.equal(await promise, "ANSWER");
+  });
+
   it("a stale claim cannot come back above parallelPrs once its slot was reassigned", async () => {
     const h = harness();
     h.setLimit(1);

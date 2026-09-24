@@ -79,6 +79,8 @@ export interface FixOffer {
   providers: FixChatProvider[];
   resumeProviders: FixChatProvider[];
   leaseId: string;
+  /** Recovery only: the tab binding (the run already in that tab) being resumed. */
+  bindings?: { jobId: string; provider: FixChatProvider; runId: string }[];
   prompt: string;
   reasoning: { chatgpt: string; grok: string };
   title: string;
@@ -105,6 +107,10 @@ export interface FixItem {
   claimedAt?: number;
   submitAt?: number;
   generating?: boolean;
+  /** The run the lease holder started for this claim, pinned by its first progress report. A
+   * claim with a run lives in a tab: it is resumed through that binding (recover), never offered
+   * again as a fresh submission. */
+  runId?: string;
   /** Latest reported progress stage (diagnostics for the timeout message). */
   stage?: string;
   endedAt?: number;
@@ -268,14 +274,15 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return answer;
   }
 
-  /** The next item `clientId` may take: first a fix it claimed but does not know (its take
-   * response was lost; the worker lists every job it knows in `exclude`), offered again under its
-   * lease, then the oldest queued item (none while parallelLimit() are claimed). */
+  /** The next item `clientId` may take: first a fix it claimed but does not know and never started
+   * a run for (its take response was lost; the worker lists every job it knows in `exclude`),
+   * offered again under its lease, then the oldest queued item (none while parallelLimit() are
+   * claimed). A claim with a run is in a tab: only recover() resumes it. */
   function peek(exclude: readonly string[] = [], clientId = ""): { id: string; createdAt: number } | undefined {
     prune();
     if (clientId) {
       for (const item of items.values()) {
-        if (item.state === "claimed" && item.clientId === clientId && !exclude.includes(item.id)) return { id: item.id, createdAt: item.createdAt };
+        if (item.state === "claimed" && item.clientId === clientId && !item.runId && !exclude.includes(item.id)) return { id: item.id, createdAt: item.createdAt };
       }
     }
     if (claimedCount() >= limit()) return undefined;
@@ -311,14 +318,16 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return { ok: true, leaseId };
   }
 
-  function offer(item: FixItem, leaseId: string): FixOffer {
+  function offer(item: FixItem, leaseId: string, resume?: string): FixOffer {
     return {
       kind: "fix",
       jobId: item.id,
       provider: item.provider,
       providers: [item.provider],
-      // Never a resume of a claimed tab: an offer is queued, or a replay no tab ever received.
-      resumeProviders: [],
+      // A take is a fresh submission (queued, or a replay no tab ever received); only recover()
+      // resumes the run a tab already holds.
+      resumeProviders: resume ? [item.provider] : [],
+      ...(resume ? { bindings: [{ jobId: item.id, provider: item.provider, runId: resume }] } : {}),
       leaseId,
       prompt: item.prompt,
       reasoning: deps.reasoning(),
@@ -333,9 +342,23 @@ export function createFixRegistry(deps: FixRegistryDeps) {
    * build its take payload (null when not claimable). */
   function take(id: string, clientId = ""): FixOffer | null {
     const item = items.get(id);
-    if (!item || !(item.state === "queued" || (item.state === "claimed" && Boolean(clientId) && item.clientId === clientId))) return null;
+    if (!item || !(item.state === "queued" || (item.state === "claimed" && Boolean(clientId) && item.clientId === clientId && !item.runId))) return null;
     const out = claim(id, clientId);
-    return out.ok ? offer(item, out.leaseId) : null;
+    if (!out.ok) return null;
+    // Every take hands out a fresh submission (a replay included): its foreground window starts now.
+    item.submitAt = deps.now();
+    item.generating = false;
+    return offer(item, out.leaseId);
+  }
+
+  /** Resume a live claim this profile already runs in a tab: same profile, provider and the run
+   * pinned by its progress. Renews the lease under the claim rules (a stale claim needs a free
+   * slot); nothing is re-sent, so the submission window is untouched. */
+  function recover(id: string, clientId: string, provider: string, runId: string): FixOffer | null {
+    const item = items.get(id);
+    if (!item || item.state !== "claimed" || !clientId || item.clientId !== clientId || item.provider !== provider || !item.runId || item.runId !== runId) return null;
+    const out = claim(id, clientId);
+    return out.ok ? offer(item, out.leaseId, runId) : null;
   }
 
   /** Heartbeat: renews the lease (not a deadline extension) and records generation start. */
@@ -369,7 +392,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     const item = items.get(id);
     if (!item || !holds(item, leaseId)) return false;
     item.state = "queued";
-    item.leaseId = item.clientId = undefined;
+    item.leaseId = item.clientId = item.runId = undefined;
     item.claimedAt = item.submitAt = undefined;
     item.generating = false;
     return true;
@@ -401,9 +424,12 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return { ok: true };
   }
 
-  function progress(id: string, leaseId: string | undefined, stage?: string): boolean {
+  function progress(id: string, leaseId: string | undefined, stage?: string, runId?: string): boolean {
     const item = items.get(id);
     if (!item || !holds(item, leaseId)) return false;
+    // One run per claim (as review legs): a report from another run is rejected.
+    if (runId && item.runId && item.runId !== runId) return false;
+    if (runId && !item.runId) item.runId = runId.slice(0, 128);
     if (stage) item.stage = stage.slice(0, 80);
     return true;
   }
@@ -446,5 +472,5 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return item && { ...item };
   };
 
-  return { request, peek, claim, take, refresh, state, prompt, release, fail, complete, progress, submitting, counts, providerOf, snapshot };
+  return { request, peek, claim, take, recover, refresh, state, prompt, release, fail, complete, progress, submitting, counts, providerOf, snapshot };
 }

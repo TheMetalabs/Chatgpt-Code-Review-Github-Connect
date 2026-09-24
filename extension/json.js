@@ -438,12 +438,14 @@ function fixTabOwnership(state) {
   const draft = typeof composer === "function" && globalThis.document ? composer() : null;
   const draftText = (draft && (draft.value || draft.innerText || draft.textContent || "") || "").trim();
   if (submission?.phase !== "sent") {
-    // Before the send is confirmed the composer may still hold Ashlar's own prompt; anything
-    // else in it is the user's.
-    if (draftText && !(submission?.expected && normalizePrompt(draftText).includes(submission.expected))) return "takenOver";
+    // Before the send is confirmed the composer may still hold Ashlar's own prompt, and the
+    // just-clicked turn is Ashlar's prompt. Ownership needs the EXACT prompt (the same test
+    // clickSend applies before sending): any text beyond it — a prefix, a suffix, an edit — is
+    // the user's, and the tab is preserved.
+    const ashlars = text => Boolean(submission?.expected) && normalizePrompt(text) === submission.expected;
+    if (draftText && !ashlars(draftText)) return "takenOver";
     if (!users.length) return "owned";
-    return Boolean(submission?.expected) && submission.baseline === 0 && users.length === 1 &&
-      normalizePrompt(messagePromptText(users[0])).includes(submission.expected) ? "owned" : "takenOver";
+    return submission?.baseline === 0 && users.length === 1 && ashlars(messagePromptText(users[0])) ? "owned" : "takenOver";
   }
   const bound = boundReviewResponse(submission);
   if (bound.followup) return "takenOver";

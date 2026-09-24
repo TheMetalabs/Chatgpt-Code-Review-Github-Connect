@@ -226,12 +226,18 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  const draft=text=>page.locator('#prompt-textarea').evaluate((el,t)=>{el.textContent=t;},text);
  await draft('my own question');
  assert.equal((await cancel()).owned,false,'no turn yet, but the composer holds the user\'s own text');
+ await draft('fix prompt\nmy own private suffix');
+ assert.equal((await cancel()).owned,false,'Ashlar\'s prompt plus user text is the user\'s: only the exact prompt is owned');
+ await draft('my note: fix prompt');
+ assert.equal((await cancel()).owned,false,'a user prefix is the user\'s too');
  await draft('fix prompt');
  await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='fix prompt';document.querySelector('main').append(u);});
  assert.equal((await cancel()).owned,true,'the just-clicked, not yet confirmed turn is Ashlar\'s');
  await draft('my own question');
  assert.equal((await cancel()).owned,false,'Ashlar\'s turn, but a user draft in the composer');
  await draft('');
+ await page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').textContent='fix prompt and my own words';});
+ assert.equal((await cancel()).owned,false,'a just-clicked turn with more than Ashlar\'s prompt preserves the tab');
  await page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').textContent='someone else asked this';});
  assert.equal((await cancel()).owned,false,'a turn that is not Ashlar\'s prompt preserves the tab');
 });

@@ -22,8 +22,8 @@
  *   - STOPPED: the operator's stop (acknowledged once by stopLoop; in-flight steps go quiet).
  * The fix-round budget (ASHLAR_LOOP_ROUND_CAP, default 5) is enforced at the next review: review
  * round N+1 verifies the N-th fix (clean → CONVERGED, else round-cap). The ONLY quiet exits are
- * supersession (a newer head drives the loop — its review is requested once, idempotently), an
- * operator stop, a newer loop request (a new session, or apply downgraded to suggest), and an
+ * supersession (a newer head drives the loop — its review is requested once, idempotently; a
+ * request that did not settle is logged, not quiet), an operator stop, a newer loop request (a new session, or apply downgraded to suggest), and an
  * existing handoff on this head. One relevance check guards every checkpoint of a round, and a
  * round that went moot is never retried. Apply also requires the session starter's write
  * permission (design §2).
@@ -162,6 +162,12 @@ const NEWER_REQUEST = "superseded by a newer loop request (a new session, anothe
 const HANDOFF_IN_FLIGHT = "a handoff for this head is still being posted by another loop step; this step did not run";
 /** NOT silent (logged): this session's handoff may have landed (unknown outcome, not listed yet). */
 const HANDED_OFF_UNKNOWN = "handed off (outcome unknown): the handoff may have landed and is not re-sent; no further fix runs";
+/** NOT silent (logged): a superseded step could not settle the live head's review request — the
+ * request may or may not exist, was refused, or the session / live head could not be read. The
+ * live head then has no review coming, so the step says so instead of exiting quietly. */
+const SUPERSEDED_UNKNOWN = "superseded (head moved); the live head's continuation outcome is unknown (not re-sent; not yet visible)";
+const SUPERSEDED_REFUSED = "superseded (head moved); the live head's review could not be requested";
+const SUPERSEDED_UNREADABLE = "superseded (head moved); the loop session or live head could not be read to continue on it";
 /** NOT silent (logged): the start record's POST outcome is unknown and no list shows it yet. */
 export const START_UNRESOLVED = "start unresolved: the start record's outcome is unknown (not re-sent; not yet visible)";
 /** A control write whose outcome is unknown and that no list shows yet (ambiguity ledger hit). */
@@ -625,6 +631,28 @@ function ensureContinuation(
   return emitControl(ctl, { key: { kind: "continue", ref, head: c.head, sessionIso: c.sinceIso }, body, since });
 }
 
+/** What a superseded step's request for the live head's review came to: skipped when none was
+ * needed (the head did not move, or the session is over), unreadable when it could not be decided. */
+type ContinueOnResult = EmitOutcome | { status: "skipped" } | { status: "unreadable"; error: string };
+
+/** A superseded step is quiet only when the live head's review is requested or not needed. */
+function supersededResult(r: ContinueOnResult): LoopStepResult {
+  switch (r.status) {
+    case "posted":
+    case "exists":
+    case "skipped":
+      return { ran: false, reason: SUPERSEDED };
+    case "unknown":
+      return { ran: false, reason: `${SUPERSEDED_UNKNOWN}: ${r.error}` };
+    case "rejected":
+      return { ran: false, reason: `${SUPERSEDED_REFUSED}: ${r.error}` };
+    case "unreadable":
+      return { ran: false, reason: `${SUPERSEDED_UNREADABLE}: ${r.error}` };
+    default:
+      return assertNever(r);
+  }
+}
+
 /** How an applied round's report ends, from its continuation's outcome. */
 function continuationStatus(c: EmitOutcome): ContinuationStatus {
   switch (c.status) {
@@ -723,21 +751,25 @@ export async function runPostReviewLoop(
     const ctl = controlCtx(d, token, botLogin);
     // A moved head supersedes this review: the LIVE head's review drives the loop. The push handler
     // (or the round that pushed) normally requested it already; asking again is idempotent, so a
-    // missed push event can never stall an active loop.
-    const continueOn = async (live: PullHead): Promise<void> => {
-      if (live.sha === headSha) return;
-      const now = await sessionOf(gh, token, ref, live, botLogin).catch(() => null);
-      if (!now?.active) return;
+    // missed push event can never stall an active loop — and a request that did not settle (an
+    // unreadable session, a refused or unknown POST) is reported, never dropped.
+    const continueOn = async (live: PullHead): Promise<ContinueOnResult> => {
+      if (live.sha === headSha) return { status: "skipped" };
+      let now: LoopSession;
+      try {
+        now = await sessionOf(gh, token, ref, live, botLogin);
+      } catch (e) {
+        return { status: "unreadable", error: (e as Error)?.message ?? String(e) };
+      }
+      if (!now.active) return { status: "skipped" };
       const r = await ensureContinuation(ctl, gh, ref, { head: live.sha, mode: now.mode ?? "suggest", sinceIso: now.startIso, sinceSeq: now.startSeq });
       trace(job.id, "superseded", { live: live.sha.slice(0, 7), continuation: r.status });
+      return r;
     };
     const head = await gh.fetchPullHeadRef(token, owner, repo, pr);
     // Also the fork-push guard: a commit parented on a stale SHA would fast-forward over a
     // contributor's backward force-push.
-    if (head.sha !== headSha) {
-      await continueOn(head);
-      return { ran: false, reason: SUPERSEDED };
-    }
+    if (head.sha !== headSha) return supersededResult(await continueOn(head));
     let session = await sessionOf(gh, token, ref, head, botLogin);
     // This review was requested by a fresh human start whose record harbor could not post at
     // admission: record it now (idempotent — an existing record, e.g. one a later stop ended,
@@ -889,9 +921,13 @@ export async function runPostReviewLoop(
       if (why === "handoff") return { ran: false, reason: ENDED_BY_HANDOFF };
       if (why === "converged") return { ran: false, reason: ENDED_CONVERGED };
       if (why === "newer") return { ran: false, reason: NEWER_REQUEST };
-      const live = await gh.fetchPullHeadRef(token, owner, repo, pr).catch(() => null);
-      if (live) await continueOn(live);
-      return { ran: false, reason: SUPERSEDED };
+      let live: PullHead;
+      try {
+        live = await gh.fetchPullHeadRef(token, owner, repo, pr);
+      } catch (e) {
+        return { ran: false, reason: `${SUPERSEDED_UNREADABLE}: ${(e as Error)?.message ?? String(e)}` };
+      }
+      return supersededResult(await continueOn(live));
     };
     const before = await checkpoint();
     if (before) return await quietExit(before);

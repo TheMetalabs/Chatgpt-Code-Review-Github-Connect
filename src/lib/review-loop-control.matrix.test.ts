@@ -499,15 +499,6 @@ async function assertNewerSessionLives(w: World): Promise<void> {
  * failed. Each fix deletes its group; the last one deletes gap(). A pattern is
  * `via | write | list | later`, each part `*` or a comma list. */
 const OPEN: ReadonlyArray<readonly [string, string]> = [
-  ["continueOn", "continue:applied | success,rejected | failing | redelivery,25h"],
-  ["continueOn", "continue:applied | unknown-landed | lagging,failing | redelivery,25h"],
-  ["continueOn", "continue:applied | unknown-lost | * | redelivery,25h,row-appears"],
-  ["continueOn", "continue:superseded | success | failing | redelivery,25h"],
-  ["continueOn", "continue:superseded | rejected,unknown-lost | * | *"],
-  ["continueOn", "continue:superseded | unknown-landed | lagging,failing | *"],
-  ["continueOn", "continue:moved-mid-round | success | failing | redelivery,25h"],
-  ["continueOn", "continue:moved-mid-round | rejected,unknown-lost | * | *"],
-  ["continueOn", "continue:moved-mid-round | unknown-landed | lagging,failing | *"],
   ["stop", "stop:webhook | success | normal,failing | row-appears"],
   ["stop", "stop:webhook | success | lagging | *"],
   ["stop", "stop:webhook | rejected | * | newer-start,row-appears"],

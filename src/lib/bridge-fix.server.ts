@@ -12,9 +12,55 @@
  * harbor/GitHub graph. bridge.server.ts owns the single production registry and routes every
  * per-id bridge handler here for `fix-` ids.
  *
- * STATES: queued → claimed → done (resolve) | failed (reject); claimed → queued (explicit
- * release); queued | claimed → cancelled (deadline "timeout" | newer request "superseded" |
- * the caller's abort "aborted" — the loop no longer wants the fix).
+ * LIFECYCLE (the one table every operation below implements; tested row by row in
+ * bridge-fix.server.test.ts "lifecycle table"). An item's state is (state, owner, run):
+ *
+ *   Q0  queued, no owner                 (requested, never leased)
+ *   QU  queued, owner, no run            (released before any run was reported)
+ *   QP  queued, owner, run pinned        (released after its run was pinned)
+ *   CU  claimed, lease, no run           (a fresh submission handed out; run not reported yet)
+ *   CP  claimed, lease, run pinned       (the run lives in the owner's tab)
+ *   DONE | FAILED | CANCELLED            (terminal; settled exactly once, see settle())
+ *   "stale" (no heartbeat for claimMs) is a property of CU/CP: it holds no parallelPrs slot.
+ *
+ * Every lease hand-out is CLASSIFIED once, before the lease moves (offerKindOf), by the run alone:
+ *   fresh  = no run and not handed out yet (Q0, QU): the worker must type the prompt into a NEW tab;
+ *   replay = CU re-offered to its own profile, which does not list it (the take response was
+ *            lost): the SAME delivery again, never a second one;
+ *   resume = a run is pinned (QP, CP, or recover proving the page's binding): nothing is re-sent,
+ *            the offer names the binding.
+ * Lease bookkeeping (lease(): state, clientId, leaseId, claimedAt) is separate from submission
+ * bookkeeping (beginSubmission(): submitAt, generating), which only a fresh or replay offer writes.
+ *
+ *   #    from     operation (who)                    to     offer   bookkeeping set
+ *   T1   -        request                            Q0     -       createdAt, deadlineAt, timer;
+ *                                                                    older live item of the PR → CANCELLED "superseded"
+ *   T2   Q0       take / claim (any profile, slot)   CU     fresh   lease + clientId; submitAt=now, generating=false
+ *   T3   CU       take (owner, not in exclude)       CU     replay  same lease (renewed only if stale); submitAt=now
+ *                                                                    (re-armed for the same delivery)
+ *   T4   CU       progress(runId) (holder)           CP     -       runId pinned, stage
+ *   T5   CU       recover(runId) (owner)             CP     resume  lease; runId pinned; submitAt/generating untouched
+ *   T6   CP       recover(same run) (owner)          CP     resume  lease; submitAt/generating untouched
+ *   T7   CU|CP    refresh (holder)                   same   -       claimedAt; generating=true when flagged
+ *   T8   CU|CP    claim (owner: lease renewal)       same   -       same lease, or a new one if stale; nothing else
+ *   T9   CU       release (holder)                   QU     -       lease, claimedAt, submitAt cleared; owner kept
+ *   T10  CP       release (holder)                   QP     -       lease, claimedAt, submitAt cleared; owner, run kept
+ *   T11  QU       take / claim (owner, slot)         CU     fresh   lease; submitAt=now, generating=false
+ *   T12  QP       take / claim (owner, slot)         CP     resume  lease only: submitAt stays unset, generating as it was
+ *   T13  QU|QP    recover(runId) (owner, slot)       CP     resume  lease; runId pinned (QU) / matched (QP)
+ *   T14  CU|CP    complete (holder)                  DONE   -       answerDigest; prompt dropped
+ *   T15  CU|CP    fail (holder)                      FAILED -       reason; prompt dropped
+ *   T16  live     deadline | newer request | abort   CANCELLED -    "timeout" | "superseded" | "aborted"
+ *   refused: another profile (any owned state), no free slot (T2/T11-T13, a stale T3/T8), a
+ *   different run (T5/T6/T13), a take of CP (only recover resumes a run), anything past deadlineAt.
+ *
+ * TERMINAL verdicts: the server's DONE / FAILED / CANCELLED, and on the page every PERMANENT
+ * ownership verdict (extension/json.js: "takenOver" — follow-up, edited turn, draft, replaced
+ * response — and a changed or unusable pinned conversation). A permanent verdict ends the run at
+ * once: the page frees its managed slot and reports `taken_over`, and the worker delivers it as a
+ * failure (T15), so the runtime retries or escalates now instead of at the deadline. Only a
+ * transient "unknown" (journal unreadable, turn not rendered yet, still generating) keeps the run
+ * polling, and the deadline (T16) bounds that.
  * INVARIANTS:
  *   - ONE live (queued | claimed) item per PR: a newer request for the same PR cancels the older
  *     one (its promise rejects "superseded"; the extension force-closes that tab);
@@ -50,6 +96,10 @@ import { createdBefore, nextCreationSeq } from "./creation-seq.ts";
 
 export type FixChatProvider = "chatgpt" | "grok";
 export type FixItemState = "queued" | "claimed" | "done" | "failed" | "cancelled";
+/** How a lease hand-out relates to the prompt (LIFECYCLE above): fresh = submit it in a new tab;
+ * replay = the same fresh delivery again (its take response was lost); resume = the run already
+ * in a tab (nothing is re-sent). */
+export type FixOfferKind = "fresh" | "replay" | "resume";
 
 export const FIX_ID_PREFIX = "fix-";
 export const DEFAULT_FIX_TIMEOUT_MS = 30 * 60_000;
@@ -81,6 +131,8 @@ export interface FixRequest {
 export interface FixOffer {
   kind: "fix";
   jobId: string;
+  /** The offer's classification (offerKindOf): the worker submits the prompt only for fresh/replay. */
+  offerKind: FixOfferKind;
   provider: FixChatProvider;
   providers: FixChatProvider[];
   resumeProviders: FixChatProvider[];
@@ -306,10 +358,18 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return oldest && { id: oldest.id, createdAt: oldest.createdAt, createdSeq: oldest.createdSeq };
   }
 
-  function claim(id: string, clientId = ""): { ok: true; leaseId: string } | { ok: false; error: string } {
-    const item = current(id);
-    if (!item || !live(item)) return { ok: false, error: "fix item is not waiting for chat" };
-    const now = deps.now();
+  /** THE classification of a lease hand-out on `item` (LIFECYCLE), read before the lease moves:
+   * a pinned run is always a resume; a claim without one was already handed out (replay); anything
+   * else has never reached a tab (fresh). */
+  function offerKindOf(item: FixItem): FixOfferKind {
+    if (item.runId) return "resume";
+    return item.state === "claimed" ? "replay" : "fresh";
+  }
+
+  /** Lease claim / renewal ONLY (state, owner, leaseId, claimedAt) under the ownership and
+   * parallelPrs rules. Never touches submission bookkeeping (submitAt, generating): that follows
+   * the offer's classification (beginSubmission). */
+  function lease(item: FixItem, clientId: string): { ok: true; leaseId: string } | { ok: false; error: string } {
     if (item.state === "claimed") {
       // Only the claiming profile holds the tab that owns this generation (mirrors review items).
       if (item.clientId !== clientId) return { ok: false, error: "fix generation belongs to another Chrome profile" };
@@ -325,21 +385,42 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     } else {
       item.state = "claimed";
       item.clientId = clientId;
-      item.submitAt = now;
-      item.generating = false;
     }
     const leaseId = deps.newId();
     item.leaseId = leaseId;
-    item.claimedAt = now;
+    item.claimedAt = deps.now();
     return { ok: true, leaseId };
   }
 
-  /** `resume`: the run a tab already holds. Resume semantics exist only with it: a resume offer
-   * always names its binding, and an offer without a run is a fresh submission. */
-  function offer(item: FixItem, leaseId: string, resume?: string): FixOffer {
+  /** Submission bookkeeping, by classification: a fresh offer starts the profile's foreground
+   * submission window (its generation has not started); a replay hands the SAME delivery out
+   * again, so its window restarts with it; a resume sends nothing and changes nothing. */
+  function beginSubmission(item: FixItem, kind: FixOfferKind) {
+    if (kind === "resume") return;
+    item.submitAt = deps.now();
+    if (kind === "fresh") item.generating = false;
+  }
+
+  /** The claim action: a lease for a live item. On a queued item it is that item's hand-out
+   * (fresh without a run: T2/T11; resume with one: T12); on a claimed item it is a renewal (T8),
+   * which is never a submission. */
+  function claim(id: string, clientId = ""): { ok: true; leaseId: string } | { ok: false; error: string } {
+    const item = current(id);
+    if (!item || !live(item)) return { ok: false, error: "fix item is not waiting for chat" };
+    const kind = item.state === "queued" ? offerKindOf(item) : undefined;
+    const out = lease(item, clientId);
+    if (out.ok && kind) beginSubmission(item, kind);
+    return out;
+  }
+
+  /** The take/recover payload. A resume offer always names its binding (the pinned run); fresh
+   * and replay offers carry none. */
+  function offer(item: FixItem, leaseId: string, kind: FixOfferKind): FixOffer {
+    const resume = kind === "resume" ? item.runId : undefined;
     return {
       kind: "fix",
       jobId: item.id,
+      offerKind: kind,
       provider: item.provider,
       providers: [item.provider],
       resumeProviders: resume ? [item.provider] : [],
@@ -354,27 +435,22 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     };
   }
 
-  /** Claim a queued item for `clientId` — or replay this client's own unacknowledged claim — and
-   * build its take payload (null when not claimable). */
+  /** Hand out a queued item (fresh T2/T11, or the owner's resume of a pinned run T12) — or replay
+   * this client's own unacknowledged claim (T3) — and build its take payload (null when not
+   * claimable). A claim with a run is in a tab: only recover() resumes it. */
   function take(id: string, clientId = ""): FixOffer | null {
     const item = current(id);
     if (!item || !(item.state === "queued" || (item.state === "claimed" && Boolean(clientId) && item.clientId === clientId && !item.runId))) return null;
-    const resume = item.state === "queued" && item.runId ? item.runId : undefined;
-    const out = claim(id, clientId);
+    const kind = offerKindOf(item);
+    const out = lease(item, clientId);
     if (!out.ok) return null;
-    // A released claim whose run was pinned is in that profile's tab: it is resumed through that
-    // binding (never re-sent).
-    if (resume) return offer(item, out.leaseId, resume);
-    // Every other take hands out a fresh submission (a replay, or a claim released before any run
-    // was established, included): its window starts now.
-    item.submitAt = deps.now();
-    item.generating = false;
-    return offer(item, out.leaseId);
+    beginSubmission(item, kind);
+    return offer(item, out.leaseId, kind);
   }
 
-  /** Resume a live claim this profile already runs in a tab: same profile, provider and the run
-   * pinned by its progress. Renews the lease under the claim rules (a stale claim needs a free
-   * slot); nothing is re-sent, so the submission window is untouched. */
+  /** Resume a live claim this profile already runs in a tab (T5/T6/T13): same profile, provider
+   * and the run pinned by its progress. Renews the lease under the claim rules (a stale claim needs
+   * a free slot); always a resume: nothing is re-sent, so no submission bookkeeping changes. */
   function recover(id: string, clientId: string, provider: string, runId: string): FixOffer | null {
     prune();
     const item = current(id);
@@ -383,13 +459,13 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     const live = item && (item.state === "claimed" || (item.state === "queued" && Boolean(item.clientId)));
     if (!item || !live || !clientId || item.clientId !== clientId || item.provider !== provider) return null;
     if (typeof runId !== "string" || !runId || runId.length > 128 || (item.runId && item.runId !== runId)) return null;
-    const out = claim(id, clientId);
+    const out = lease(item, clientId);
     if (!out.ok) return null;
     // The page's binding proves a run reached a tab of this profile even when its first progress
     // report was lost: pin that run now (atomically with the renewed lease), so the claim never
     // re-enters the lost-take replay (peek) as a fresh submission in a second tab.
     item.runId ??= runId;
-    return offer(item, out.leaseId, item.runId);
+    return offer(item, out.leaseId, "resume");
   }
 
   /** Heartbeat: renews the lease (not a deadline extension) and records generation start. */
@@ -426,10 +502,11 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   function release(id: string, leaseId?: string): boolean {
     const item = current(id);
     if (!item || !holds(item, leaseId)) return false;
+    // Lease bookkeeping only (T9/T10): `generating` describes the run in the tab, not the lease; a
+    // later resume keeps it as it was (a fresh hand-out resets it, beginSubmission).
     item.state = "queued";
     item.leaseId = undefined;
     item.claimedAt = item.submitAt = undefined;
-    item.generating = false;
     return true;
   }
 

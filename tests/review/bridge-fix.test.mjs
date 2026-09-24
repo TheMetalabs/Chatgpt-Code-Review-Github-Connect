@@ -105,6 +105,30 @@ test('recover resumes a running fix through its tab binding; take never re-submi
   assert.equal(h.snapshots.length, 0, 'no harbor job was patched');
 });
 
+// Review round 11 (4096523028): a resume (take of a released pinned run, or recover of a released
+// claim) re-leases a run that already lives in a tab. It is not a foreground submission: the
+// profile's next eligible job is handed out at once.
+for (const via of ['take', 'recover']) {
+  test(`a resumed fix (${via}) holds no submission window: the profile's next job is taken immediately`, async () => {
+    const h = bridgeHarness([makeJob({id: 'A', pr: 1, createdAt: Date.now() + 60_000})]);
+    const pending = quiet(h.bridge.requestBridgeFix(FIX));
+    const offer = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true});
+    assert.equal(offer.kind, 'fix');
+    const binding = {jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'};
+    if (via === 'take') {
+      const progress = {chatgpt: {runId: 'run-A', events: [{source: 'page', sequence: 1, stage: 'generating', at: Date.now()}]}};
+      assert.equal(h.bridge.recordBridgeProgress(offer.jobId, offer.leaseId, progress), true);
+    }
+    h.bridge.releaseBridgeJob(offer.jobId, offer.leaseId);
+    const resumed = via === 'take' ? h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true}) : h.bridge.recoverBridgeJob('chrome-1', [binding], {fixes: true});
+    assert.equal(resumed?.jobId, offer.jobId);
+    assert.deepEqual(resumed.resumeProviders, ['chatgpt']);assert.deepEqual(resumed.bindings, [binding]);
+    const next = h.bridge.takeNextBridgeJob('chrome-1', [offer.jobId], {fixes: true});
+    assert.equal(next?.jobId, 'A', 'the resumed fix does not hold the foreground');
+    void pending;
+  });
+}
+
 test('a review of unknown age keeps its precedence over a queued fix', async () => {
   const review = makeJob({id: 'R', pr: 4});delete review.createdAt;
   const h = bridgeHarness([review]);

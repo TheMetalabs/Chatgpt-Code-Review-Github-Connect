@@ -251,13 +251,19 @@ async function ghHttps(
   timeoutMs = 20_000,
 ): Promise<GhRes> {
   const p = path.startsWith("/") ? path : `/${path}`;
-  const resolved = await resolveGithubHost();
+  // A resolution failure happens before any request exists: nothing reached GitHub.
+  const resolved = await resolveGithubHost().catch((e: unknown) => {
+    throw new GithubTransportError(formatGithubError(e), false);
+  });
   try {
     return await ghCall(resolved, method, p, headers, body, timeoutMs);
   } catch (e) {
     clearResolvedCache();
     if (!mayResendOnOtherHost(method, e)) throw e;
-    const retry = await resolveGithubHost(true);
+    // The first attempt was a read or was never sent; a failed re-resolution reports that attempt.
+    const retry = await resolveGithubHost(true).catch(() => {
+      throw e;
+    });
     if (retry.hostname === resolved.hostname) throw e;
     return ghCall(retry, method, p, headers, body, timeoutMs);
   }

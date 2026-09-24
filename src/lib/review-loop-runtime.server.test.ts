@@ -99,6 +99,7 @@ const recorded = (mode: "suggest" | "apply", by: string, at: string): IssueRow =
 function fakeDeps(
   opts: {
     failContinuation?: boolean; // the continuation comment POST fails
+    failHandoff?: boolean; // every ESCALATE handoff POST fails
     requestDelayMs?: number; // the fix request takes this long (concurrency tests)
     start?: "suggest" | "apply" | null; // the human start directive (null → no session)
     rounds?: number[];
@@ -171,6 +172,7 @@ function fakeDeps(
       },
       async createIssueComment(_t, o) {
         if (opts.failContinuation && o.body.includes("ashlar-loop-continue")) throw new Error("comment POST 502");
+        if (opts.failHandoff && o.body.includes("ashlar-loop-escalate")) throw new Error("comment POST 502");
         posted.push(o.body);
         clock += 1;
         issues.push({ userLogin: BOT, body: o.body, createdAt: `2026-02-01T00:00:${String(clock).padStart(2, "0")}Z` });
@@ -1374,6 +1376,21 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     const r2 = await runWith(g, "apply");
     assert.ok(r2.ran && r2.step === "escalated" && r2.reason === "loop-error", JSON.stringify(r2));
     assert.deepEqual(seen, [1, 1]);
+  });
+
+  it("a handoff that did not land marks no thread addressed: no replies, no report", async () => {
+    const noChange = fakeDeps({ start: "apply", rounds: [2], threads, failHandoff: true, reply: withDispositions("[]", '[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"decline","note":"m"}]') });
+    const r = await runWith(noChange, "apply");
+    assert.equal(r.ran, false);assert.match(r.ran ? "" : r.reason, /ESCALATE fix-declined failed to post/);
+    assert.equal(noChange.replies.length, 0);
+    assert.equal(noChange.posted.some((b) => b.startsWith("### Ashlar fix agent")), false, "no report either");
+    // committed, the continuation failed, and so did the loop-error handoff
+    const committed = fakeDeps({ start: "apply", rounds: [2], threads, failContinuation: true, failHandoff: true });
+    const r2 = await runWith(committed, "apply");
+    assert.equal(r2.ran, false);assert.match(r2.ran ? "" : r2.reason, /ESCALATE loop-error failed to post/);
+    assert.equal(committed.committed, true);
+    assert.equal(committed.replies.length, 0);
+    assert.equal(committed.posted.some((b) => b.startsWith("### Ashlar fix agent")), false);
   });
 
   it("model notes are sanitized: markers neutralized, @-mentions defanged, one line", async () => {

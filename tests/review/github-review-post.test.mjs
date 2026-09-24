@@ -84,11 +84,11 @@ test('listReviewThreadRoots keys each root by the line it was posted on (origina
 });
 
 // A reply POST is retryable only when GitHub cannot have created it.
-function replyApi(transport) {
+function replyApi(transport, dns = { dnsLookup: async () => ({ address: '127.0.0.1', family: 4 }) }) {
   return loadTs('src/lib/github.server.ts', {
     ...loadTs('src/lib/github-transport.ts', { TLSSocket }),
     ...loadTs('src/lib/review-diff.ts'),
-    dnsLookup: async () => ({ address: '127.0.0.1', family: 4 }),
+    ...dns,
     https: { request(_options, callback) {
       const request = new EventEmitter();
       request.setTimeout = () => request;
@@ -111,4 +111,10 @@ test('replyToReviewComment: a request that never left is retryable; a 5xx or a l
   assert.deepEqual(await replied(replyApi(status(502))), { retryable: false });
   assert.deepEqual(await replied(replyApi(status(429))), { retryable: true });
   assert.equal(await replied(replyApi(status(201))), 'ok');
+  // every resolver fails before a request exists: nothing reached GitHub
+  const noDns = {
+    dnsLookup: async () => { throw new Error('getaddrinfo EAI_AGAIN'); },
+    Resolver: class { setServers() {} resolve4() { return Promise.reject(new Error('public DNS down')); } },
+  };
+  assert.deepEqual(await replied(replyApi((req) => req.emit('error', new Error('DoH unreachable')), noDns)), { retryable: true });
 });

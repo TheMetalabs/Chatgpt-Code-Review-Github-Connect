@@ -323,6 +323,9 @@ export function threadReplyBody(d: FixDisposition | undefined, round: number, co
   return `${verb} by the Ashlar fix agent${d.action === "fixed" ? where : ""} (round ${round})${note ? `: ${note}` : "."}`;
 }
 
+/** Whether THIS step posted its terminal handoff (the replies and report follow only then). */
+const handedOff = (r: LoopStepResult): boolean => r.ran && r.step === "escalated";
+
 function duplicateIds(ids: readonly string[]): Set<string> {
   const seen = new Set<string>();
   return new Set(ids.filter((id) => seen.has(id) || !seen.add(id)));
@@ -998,6 +1001,8 @@ export async function runPostReviewLoop(
       if (!status.ok && !("ended" in status)) {
         const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
         handoff = await escalate("loop-error", `the fix was committed but the next review could not be requested: ${status.error}`, live);
+        // No signal landed: mark no thread addressed (a later step or a human picks the session up).
+        if (!handedOff(handoff)) return handoff;
       }
       // The commit landed: every posted finding thread gets its disposition (addressed).
       const replies = await replyToThreads(done.dispositions, newHead ?? done.commitSha);
@@ -1023,6 +1028,7 @@ export async function runPostReviewLoop(
       // decline / defer and the report keeps the full rationale (sanitized) — informational, so a
       // failed report never turns into a second handoff.
       const handoff = await escalate("fix-declined", `no-change: ${sanitizeModelText(res.summary ?? "every finding was pushed back / declined / deferred", { oneLine: true, max: 500 })}`);
+      if (!handedOff(handoff)) return handoff; // no signal landed: mark no thread addressed
       const replies = await replyToThreads(res.dispositions);
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts, undefined, replies) }).catch(() => {
         /* informational; the handoff carries the signal */

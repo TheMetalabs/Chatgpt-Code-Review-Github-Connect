@@ -268,9 +268,16 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return answer;
   }
 
-  /** The oldest queued item a client may take now (none while parallelLimit() are claimed). */
-  function peek(exclude: readonly string[] = []): { id: string; createdAt: number } | undefined {
+  /** The next item `clientId` may take: first a fix it claimed but does not know (its take
+   * response was lost; the worker lists every job it knows in `exclude`), offered again under its
+   * lease, then the oldest queued item (none while parallelLimit() are claimed). */
+  function peek(exclude: readonly string[] = [], clientId = ""): { id: string; createdAt: number } | undefined {
     prune();
+    if (clientId) {
+      for (const item of items.values()) {
+        if (item.state === "claimed" && item.clientId === clientId && !exclude.includes(item.id)) return { id: item.id, createdAt: item.createdAt };
+      }
+    }
     if (claimedCount() >= limit()) return undefined;
     let oldest: FixItem | undefined;
     for (const item of items.values()) {
@@ -288,6 +295,8 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       // Only the claiming profile holds the tab that owns this generation (mirrors review items).
       if (item.clientId !== clientId) return { ok: false, error: "fix generation belongs to another Chrome profile" };
       if (!stale(item) && item.leaseId) return { ok: true, leaseId: item.leaseId };
+      // A stale claim gave up its slot; it may resume only while one is free again.
+      if (claimedCount() >= limit()) return { ok: false, error: "fix parallel limit reached (fixAgent.parallelPrs)" };
     } else if (claimedCount() >= limit()) {
       return { ok: false, error: "fix parallel limit reached (fixAgent.parallelPrs)" };
     } else {
@@ -308,7 +317,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       jobId: item.id,
       provider: item.provider,
       providers: [item.provider],
-      // A fix is only ever offered while queued (never re-offered as a resume of a claimed tab).
+      // Never a resume of a claimed tab: an offer is queued, or a replay no tab ever received.
       resumeProviders: [],
       leaseId,
       prompt: item.prompt,
@@ -320,10 +329,11 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     };
   }
 
-  /** Claim a queued item for `clientId` and build its take payload (null when not claimable). */
+  /** Claim a queued item for `clientId` — or replay this client's own unacknowledged claim — and
+   * build its take payload (null when not claimable). */
   function take(id: string, clientId = ""): FixOffer | null {
     const item = items.get(id);
-    if (!item || item.state !== "queued") return null;
+    if (!item || !(item.state === "queued" || (item.state === "claimed" && Boolean(clientId) && item.clientId === clientId))) return null;
     const out = claim(id, clientId);
     return out.ok ? offer(item, out.leaseId) : null;
   }
@@ -332,6 +342,8 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   function refresh(id: string, leaseId: string | undefined, generating?: Partial<Record<string, boolean>>): boolean {
     const item = items.get(id);
     if (!item || !holds(item, leaseId)) return false;
+    // A stale claim gave up its slot: its heartbeat may not revive it past parallelLimit().
+    if (stale(item) && claimedCount() >= limit()) return false;
     item.claimedAt = deps.now();
     if (generating?.[item.provider] === true) item.generating = true;
     return true;
@@ -396,14 +408,17 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return true;
   }
 
-  /** A claimed, not-yet-generating item of this profile inside the submission window. */
-  function submitting(clientId: string): boolean {
+  /** A claimed, not-yet-generating item of this profile inside the submission window. With
+   * `known` (the jobs the worker lists), an item it does not know is not being submitted: its
+   * take response was lost, and peek offers it again. */
+  function submitting(clientId: string, known?: readonly string[]): boolean {
     if (!clientId) return false;
     const now = deps.now();
     return [...items.values()].some(
       (item) =>
         item.state === "claimed" &&
         item.clientId === clientId &&
+        (!known || known.includes(item.id)) &&
         !item.generating &&
         !stale(item) &&
         item.submitAt !== undefined &&

@@ -279,6 +279,43 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     void b.catch(() => {});
   });
 
+  it("a claim whose take response was lost is offered again to its own profile only, under the same lease", async () => {
+    const h = harness();
+    h.setLimit(1);
+    const promise = h.reg.request({ ...REQ, pr: 1 });
+    const first = h.reg.peek([], "chrome-1");
+    assert.ok(first);
+    const lost = h.reg.take(first.id, "chrome-1"); // claimed; the response never reaches the worker
+    assert.ok(lost);
+    // the worker still does not list it: replayed (not a second claim), the same lease
+    assert.equal(h.reg.peek([], "chrome-1")?.id, first.id);
+    const replay = h.reg.take(first.id, "chrome-1");
+    assert.equal(replay?.leaseId, lost.leaseId);
+    assert.equal(replay?.prompt, REQ.prompt);
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 1 });
+    // another profile never gets it, and a worker that lists it is not offered it again
+    assert.equal(h.reg.peek([], "chrome-2"), undefined);
+    assert.equal(h.reg.take(first.id, "chrome-2"), null);
+    assert.equal(h.reg.peek([first.id], "chrome-1"), undefined);
+    assert.equal(h.reg.complete(first.id, "chatgpt", "ANSWER", lost.leaseId).ok, true);
+    assert.equal(await promise, "ANSWER");
+  });
+
+  it("a stale claim cannot come back above parallelPrs once its slot was reassigned", async () => {
+    const h = harness();
+    h.setLimit(1);
+    const a = queueAndTake(h, { pr: 1 }, "chrome-1");
+    const b = h.reg.request({ ...REQ, pr: 2 });
+    h.advance(CLAIM_MS + 1);
+    const bNext = h.reg.peek([], "chrome-2");
+    assert.ok(bNext && h.reg.take(bNext.id, "chrome-2"), "B takes the freed slot");
+    assert.equal(h.reg.refresh(a.offer.jobId, a.offer.leaseId, { chatgpt: true }), false, "A's heartbeat cannot revive it");
+    assert.deepEqual(h.reg.claim(a.offer.jobId, "chrome-1"), { ok: false, error: "fix parallel limit reached (fixAgent.parallelPrs)" });
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 1 });
+    void a.promise.catch(() => {});
+    void b.catch(() => {});
+  });
+
   it("only the claiming profile may re-claim; a stale lease is renewed, the old one voided", () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h);

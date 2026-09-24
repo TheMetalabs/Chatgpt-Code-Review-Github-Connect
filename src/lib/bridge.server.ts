@@ -204,7 +204,7 @@ function recordFixProgress(jobId: string, leaseId: string | undefined, reports: 
 function takeFix(clientId: string, excludeJobIds: readonly string[], review: ReturnType<typeof nextBridgeJob>): FixOffer | null {
   // nextBridgeJob is null while a review submission is in flight; a fix must wait for it too.
   if (submissionInFlightForClient(getHarbor().jobs, clientId)) return null;
-  const next = fixes().peek(excludeJobIds);
+  const next = fixes().peek(excludeJobIds, clientId);
   if (!next) return null;
   if (review) {
     // The OLDEST review this profile could take, not the candidate (harbor lists jobs newest
@@ -290,7 +290,7 @@ export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[
   meta.lastTakeAt = Date.now();
   // A fix tab pastes its prompt in the foreground exactly like a review tab: one submission per
   // Chrome profile across BOTH kinds (see SUBMIT_WINDOW_MS).
-  if (fixes().submitting(clientId)) return null;
+  if (fixes().submitting(clientId, excludeJobIds)) return null;
   const job = nextBridgeJob(clientId, excludeJobIds);
   const fix = options.fixes ? takeFix(clientId, excludeJobIds, job) : null;
   if (fix) return fix;

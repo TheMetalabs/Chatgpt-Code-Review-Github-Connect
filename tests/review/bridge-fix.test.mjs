@@ -55,6 +55,18 @@ test('a fix never jumps ahead of an older review, even when a newer review is th
   void pending;
 });
 
+test('a fix whose take response was lost is replayed to the same profile, not held behind its submit window', async () => {
+  const h = bridgeHarness([]);
+  const pending = quiet(h.bridge.requestBridgeFix(FIX));
+  const lost = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true});
+  assert.equal(lost.kind, 'fix');
+  const replay = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true}); // the worker never stored it
+  assert.equal(replay.jobId, lost.jobId);assert.equal(replay.leaseId, lost.leaseId);
+  assert.equal(h.bridge.takeNextBridgeJob('chrome-2', [], {fixes: true}), null, 'another profile never gets it');
+  assert.equal(h.bridge.takeNextBridgeJob('chrome-1', [lost.jobId], {fixes: true}), null, 'a known fix is being submitted: held');
+  void pending;
+});
+
 test('a fix requested before the next review is served first', async () => {
   const h = bridgeHarness([makeJob({id: 'A', pr: 1, createdAt: Date.now() + 60_000})]);
   const pending = quiet(h.bridge.requestBridgeFix(FIX));

@@ -57,10 +57,12 @@ export interface ReviewLoopGithub {
     repo: string,
     pr: number,
   ): Promise<Array<{ id?: number; userLogin: string; body: string; createdAt?: string; updatedAt?: string }>>;
+  // The created row as GitHub reported it (fakes may return only `id`); a failure throws
+  // github-transport's GithubWriteError (`status`, `outcome`).
   createIssueComment(
     token: string,
     opts: { owner: string; repo: string; pr: number; body: string },
-  ): Promise<{ id?: number }>;
+  ): Promise<{ id?: number; userLogin?: string; createdAt?: string }>;
 }
 
 // The real github.server binding lives at the harbor call site (harbor already imports

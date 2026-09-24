@@ -38,3 +38,27 @@ export function mayResendOnOtherHost(method: string, err: unknown): boolean {
   if (IDEMPOTENT.has(method.toUpperCase())) return true;
   return err instanceof GithubTransportError && !err.requestSent;
 }
+
+/** Whether a failed GitHub write created nothing ("rejected") or may have been applied ("unknown").
+ * GitHub answered 1xx/3xx/4xx → rejected (a redirect is never followed, a 4xx is a refusal). A 5xx
+ * is unknown: GitHub may have created the row before failing (a 502 after a comment landed is
+ * routine). No response → rejected only when the request never left; otherwise unknown. */
+export type GithubWriteOutcome = "rejected" | "unknown";
+
+export function githubWriteOutcome(status: number, notSent?: boolean): GithubWriteOutcome {
+  if (status === 0) return notSent === true ? "rejected" : "unknown";
+  return status < 500 ? "rejected" : "unknown";
+}
+
+/** A failed GitHub write: `status` is the HTTP status (0 when there was no response, or a 2xx
+ * without the created row's id — outcome unknown). */
+export class GithubWriteError extends Error {
+  readonly status: number;
+  readonly outcome: GithubWriteOutcome;
+  constructor(message: string, status: number, outcome: GithubWriteOutcome, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "GithubWriteError";
+    this.status = status;
+    this.outcome = outcome;
+  }
+}

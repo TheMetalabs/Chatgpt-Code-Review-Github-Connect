@@ -6,7 +6,7 @@ import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } 
 import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
-import { GithubTransportError, mayResendOnOtherHost, trackRequestSent } from "./github-transport";
+import { GithubTransportError, GithubWriteError, githubWriteOutcome, mayResendOnOtherHost, trackRequestSent } from "./github-transport";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
@@ -340,11 +340,21 @@ export async function probeGithub(installationId?: number): Promise<{
   }
 }
 
+/** The row GitHub created for a write, as GitHub reported it (a later read-your-writes key). */
+type GithubRow = { id?: number; user?: { login?: string } };
+export type PostedIssueComment = { id: number; userLogin: string; createdAt: string; body?: string };
+export type PostedReview = { id: number; inlineDropped: boolean; userLogin: string; submittedAt: string; commitId: string };
+
+/** A write's failure, classified by `githubWriteOutcome` (the message prefix is unchanged). */
+function writeError(message: string, out: { status: number; notSent?: boolean; cause?: unknown }): GithubWriteError {
+  return new GithubWriteError(message, out.status, githubWriteOutcome(out.status, out.notSent), out.cause);
+}
+
 async function gh<T>(
   token: string,
   path: string,
   init?: { method?: string; body?: string; headers?: Record<string, string> },
-): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string; notSent?: boolean }> {
+): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string; notSent?: boolean; cause?: unknown }> {
   let out: GhRes;
   try {
     out = await ghHttps(
@@ -358,7 +368,13 @@ async function gh<T>(
     );
   } catch (e) {
     // notSent: the connection never came up, so the request cannot have reached GitHub
-    return { ok: false, status: 0, text: formatGithubError(e), notSent: e instanceof GithubTransportError && !e.requestSent };
+    return {
+      ok: false,
+      status: 0,
+      text: formatGithubError(e),
+      notSent: e instanceof GithubTransportError && !e.requestSent,
+      cause: e,
+    };
   }
   if (out.status < 200 || out.status >= 300) return { ok: false, status: out.status, text: out.text.slice(0, 400) };
   return { ok: true, data: (out.text ? JSON.parse(out.text) : {}) as T };
@@ -639,10 +655,10 @@ export async function createPullReview(
     body: string;
     comments: PostedComment[];
   },
-): Promise<{ id: number; inlineDropped: boolean }> {
+): Promise<PostedReview> {
   let comments = opts.comments;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
+    const out = await gh<GithubRow & { submitted_at?: string; commit_id?: string }>(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -658,15 +674,21 @@ export async function createPullReview(
       }),
     });
     if (out.ok) {
-      if (!out.data.id) throw new Error("review missing id");
-      // true when GitHub refused an inline anchor and the review went out without ANY inline comment
-      return { id: out.data.id, inlineDropped: comments.length < opts.comments.length };
+      if (!out.data.id) throw new GithubWriteError("review missing id", 0, "unknown");
+      return {
+        id: out.data.id,
+        // true when GitHub refused an inline anchor and the review went out without ANY inline comment
+        inlineDropped: comments.length < opts.comments.length,
+        userLogin: String(out.data.user?.login ?? ""),
+        submittedAt: String(out.data.submitted_at ?? ""),
+        commitId: String(out.data.commit_id ?? ""),
+      };
     }
     if (comments.length && isReviewLineError(out.text)) {
       comments = [];
       continue;
     }
-    throw new Error(`GitHub Reviews API ${out.status}: ${out.text}`);
+    throw writeError(`GitHub Reviews API ${out.status}: ${out.text}`, out);
   }
   throw new Error("GitHub Reviews API failed");
 }
@@ -947,15 +969,20 @@ export async function fetchUserPermission(token: string, owner: string, repo: st
 export async function createIssueComment(
   token: string,
   opts: { owner: string; repo: string; pr: number; body: string },
-): Promise<{ id: number }> {
-  const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/issues/${opts.pr}/comments`, {
+): Promise<PostedIssueComment> {
+  const out = await gh<GithubRow & { created_at?: string; body?: string }>(token, `/repos/${opts.owner}/${opts.repo}/issues/${opts.pr}/comments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ body: opts.body }),
   });
-  if (!out.ok) throw new Error(`GitHub issue comment ${out.status}: ${out.text}`);
-  if (!out.data.id) throw new Error("comment missing id");
-  return { id: out.data.id };
+  if (!out.ok) throw writeError(`GitHub issue comment ${out.status}: ${out.text}`, out);
+  if (!out.data.id) throw new GithubWriteError("comment missing id", 0, "unknown");
+  return {
+    id: out.data.id,
+    userLogin: String(out.data.user?.login ?? ""),
+    createdAt: String(out.data.created_at ?? ""),
+    ...(typeof out.data.body === "string" ? { body: out.data.body } : {}),
+  };
 }
 
 export async function updateIssueComment(

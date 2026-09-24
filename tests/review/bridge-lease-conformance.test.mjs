@@ -102,6 +102,26 @@ for (const [kind, make] of Object.entries(KINDS)) {
     assert.equal(JSON.stringify(again.resumeProviders), '["chatgpt"]', 'resumed, never a fresh submission');
   });
 
+  test(`lease contract (${kind}): a tab binding whose run was never reported is resumed, never re-submitted`, () => {
+    const {h, take} = make();
+    const offer = take('chrome-1');
+    const binding = {jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}; // the progress report was lost
+    // Shared outcome: the owner gets the item back only as a RESUME of that tab. How differs by
+    // kind (intended): a fix pins the page's run on recovery at once; a review job refuses an
+    // unpinned recovery and is resumed by its own take once the claim goes stale.
+    let resumed = h.bridge.recoverBridgeJob('chrome-1', [binding]);
+    if (kind === 'review') {
+      assert.equal(resumed, null);
+      assert.equal(take('chrome-1'), null, 'a live claim is not handed out again');
+      h.advance(CLAIM_MS + 1);
+      resumed = take('chrome-1');
+    }
+    assert.equal(resumed?.jobId, offer.jobId);
+    assert.equal(JSON.stringify(resumed.resumeProviders), '["chatgpt"]', 'resumed, never a fresh submission');
+    assert.notEqual(take('chrome-1')?.jobId, offer.jobId, 'and never offered as a fresh submission afterwards');
+    assert.equal(h.bridge.recoverBridgeJob('chrome-2', [binding]), null, 'never another profile');
+  });
+
   test(`lease contract (${kind}): a stale claim stays with its profile`, () => {
     const {h, take} = make();
     const offer = take('chrome-1');

@@ -328,11 +328,29 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     void promise.catch(() => {});
   });
 
+  it("a surviving tab binding whose first progress report was lost pins its run and resumes", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h, { pr: 1 }, "chrome-1");
+    // run-A reached a tab, but no progress report ever pinned it; the worker then lost its job
+    assert.equal(h.reg.recover(offer.jobId, "chrome-2", "chatgpt", "run-A"), null, "not another profile");
+    assert.equal(h.reg.recover(offer.jobId, "chrome-1", "grok", "run-A"), null, "not another provider");
+    const resumed = h.reg.recover(offer.jobId, "chrome-1", "chatgpt", "run-A");
+    assert.ok(resumed);
+    assert.deepEqual(resumed.resumeProviders, ["chatgpt"]);
+    assert.deepEqual(resumed.bindings, [{ jobId: offer.jobId, provider: "chatgpt", runId: "run-A" }]);
+    assert.equal(h.reg.snapshot(offer.jobId)?.runId, "run-A", "the run is pinned");
+    // a later take (the worker lists nothing) never offers it as a fresh submission
+    assert.equal(h.reg.peek([], "chrome-1"), undefined);
+    assert.equal(h.reg.take(offer.jobId, "chrome-1"), null);
+    assert.equal(h.reg.recover(offer.jobId, "chrome-1", "chatgpt", "run-B"), null, "one run per claim");
+    assert.equal(h.reg.progress(offer.jobId, resumed.leaseId, "x", "run-B"), false);
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", resumed.leaseId), { ok: true });
+    assert.equal(await promise, "answer");
+  });
+
   it("a claim with a started run is resumed only through its tab binding, never re-submitted", async () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h, { pr: 1 }, "chrome-1");
-    // no run reported yet: recovery has nothing to prove
-    assert.equal(h.reg.recover(offer.jobId, "chrome-1", "chatgpt", "run-A"), null);
     assert.equal(h.reg.progress(offer.jobId, offer.leaseId, "prompt_prepared", "run-A"), true);
     assert.equal(h.reg.progress(offer.jobId, offer.leaseId, "x", "run-B"), false, "one run per claim");
     // the worker lost its local job: take never offers the running fix again (no second tab/prompt)

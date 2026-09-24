@@ -374,9 +374,15 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   function recover(id: string, clientId: string, provider: string, runId: string): FixOffer | null {
     const item = items.get(id);
     const live = item && (item.state === "claimed" || (item.state === "queued" && item.attempted === true));
-    if (!item || !live || !clientId || item.clientId !== clientId || item.provider !== provider || !item.runId || item.runId !== runId) return null;
+    if (!item || !live || !clientId || item.clientId !== clientId || item.provider !== provider) return null;
+    if (typeof runId !== "string" || !runId || runId.length > 128 || (item.runId && item.runId !== runId)) return null;
     const out = claim(id, clientId);
-    return out.ok ? offer(item, out.leaseId, runId) : null;
+    if (!out.ok) return null;
+    // The page's binding proves a run reached a tab of this profile even when its first progress
+    // report was lost: pin that run now (atomically with the renewed lease), so the claim never
+    // re-enters the lost-take replay (peek) as a fresh submission in a second tab.
+    item.runId ??= runId;
+    return offer(item, out.leaseId, item.runId);
   }
 
   /** Heartbeat: renews the lease (not a deadline extension) and records generation start. */

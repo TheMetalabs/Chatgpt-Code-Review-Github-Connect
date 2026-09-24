@@ -123,6 +123,7 @@ test('replyToReviewComment: a request that never left is retryable; a 5xx or a l
 // The write contract (#79 step 1): a created row comes back as GitHub reported it; a failure throws
 // GithubWriteError with the HTTP status (0 = no response) and whether GitHub may have applied it.
 const respond = (code, body) => (_req, callback) => { const res = new EventEmitter(); res.statusCode = code; callback(res); res.emit('data', Buffer.from(JSON.stringify(body))); res.emit('end'); };
+const truncated = (code) => (_req, callback) => { const res = new EventEmitter(); res.statusCode = code; callback(res); res.emit('data', Buffer.from('{"id":4')); res.emit('end'); };
 const refused = (req) => req.emit('error', new Error('connect ECONNREFUSED'));
 const lostAfterSend = (req) => { const socket = new EventEmitter(); socket.connecting = false; req.emit('socket', socket); req.emit('error', new Error('GitHub API timeout')); };
 const writes = {
@@ -155,5 +156,7 @@ for (const [name, write] of Object.entries(writes)) {
     assert.deepEqual(await failure(write, respond(502, { message: 'Bad Gateway' })), e(502, 'unknown'));
     assert.deepEqual(await failure(write, refused), e(0, 'rejected'));
     assert.deepEqual(await failure(write, lostAfterSend), e(0, 'unknown'));
+    // accepted, but the body is cut or not JSON: no usable response, and it may have landed
+    assert.deepEqual(await failure(write, truncated(201)), e(0, 'unknown'));
   });
 }

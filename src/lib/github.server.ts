@@ -377,7 +377,13 @@ async function gh<T>(
     };
   }
   if (out.status < 200 || out.status >= 300) return { ok: false, status: out.status, text: out.text.slice(0, 400) };
-  return { ok: true, data: (out.text ? JSON.parse(out.text) : {}) as T };
+  try {
+    return { ok: true, data: (out.text ? JSON.parse(out.text) : {}) as T };
+  } catch (e) {
+    // GitHub accepted the request but the body is truncated or not JSON (an intermediary, a cut
+    // connection): no usable response. For a write the outcome is unknown, never a retryable miss.
+    return { ok: false, status: 0, text: `malformed ${out.status} response: ${out.text.slice(0, 200)}`, notSent: false, cause: e };
+  }
 }
 
 export async function fetchPullHead(

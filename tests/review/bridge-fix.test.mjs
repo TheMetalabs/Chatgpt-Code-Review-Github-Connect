@@ -86,6 +86,20 @@ test('a fix whose take response was lost is replayed to the same profile, not he
   void pending;
 });
 
+// Review round 11 (4096523047): two overlapping takes of one profile with the same exclude list
+// both reach the claimed, run-less fix. They get ONE delivery (the replay repeats it: same
+// deliveryId and lease), which the worker opens at most one tab for (fix-extension.test.mjs).
+test('two overlapping takes, same client and exclude list: one fresh delivery, the other replays it', async () => {
+  const h = bridgeHarness([]);
+  const pending = quiet(h.bridge.requestBridgeFix(FIX));
+  const first = h.bridge.takeNextBridgeJob('chrome-1', ['job-known'], {fixes: true});
+  const second = h.bridge.takeNextBridgeJob('chrome-1', ['job-known'], {fixes: true});
+  assert.equal(second.jobId, first.jobId);
+  assert.deepEqual([first.offerKind, second.offerKind], ['fresh', 'replay'], 'at most one fresh submission path');
+  assert.ok(first.deliveryId);assert.equal(second.deliveryId, first.deliveryId);assert.equal(second.leaseId, first.leaseId);
+  void pending;
+});
+
 test('recover resumes a running fix through its tab binding; take never re-submits it', async () => {
   const h = bridgeHarness([]);
   const pending = quiet(h.bridge.requestBridgeFix(FIX));

@@ -30,14 +30,19 @@
  *   resume = a run is pinned (QP, CP, or recover proving the page's binding): nothing is re-sent,
  *            the offer names the binding.
  * Lease bookkeeping (lease(): state, clientId, leaseId, claimedAt) is separate from submission
- * bookkeeping (beginSubmission(): submitAt, generating), which only a fresh or replay offer writes.
+ * bookkeeping (beginSubmission(): submitAt, generating, deliveryId), which only a fresh or replay
+ * offer writes. Every offer carries the item's `deliveryId`, minted by a fresh hand-out only: a
+ * replay is the SAME delivery (same deliveryId), so two overlapping takes of one profile get one
+ * delivery twice, never two, and the worker opens at most one tab per jobId+deliveryId
+ * (extension/background.js admitJob + rememberFixDelivery).
  *
  *   #    from     operation (who)                    to     offer   bookkeeping set
  *   T1   -        request                            Q0     -       createdAt, deadlineAt, timer;
  *                                                                    older live item of the PR → CANCELLED "superseded"
- *   T2   Q0       take / claim (any profile, slot)   CU     fresh   lease + clientId; submitAt=now, generating=false
- *   T3   CU       take (owner, not in exclude)       CU     replay  same lease (renewed only if stale); submitAt=now
- *                                                                    (re-armed for the same delivery)
+ *   T2   Q0       take / claim (any profile, slot)   CU     fresh   lease + clientId; submitAt=now, generating=false,
+ *                                                                    deliveryId=new
+ *   T3   CU       take (owner, not in exclude)       CU     replay  same lease (renewed only if stale), SAME deliveryId;
+ *                                                                    submitAt=now (re-armed for that one delivery)
  *   T4   CU       progress(runId) (holder)           CP     -       runId pinned, stage
  *   T5   CU       recover(runId) (owner)             CP     resume  lease; runId pinned; submitAt/generating untouched
  *   T6   CP       recover(same run) (owner)          CP     resume  lease; submitAt/generating untouched
@@ -45,7 +50,7 @@
  *   T8   CU|CP    claim (owner: lease renewal)       same   -       same lease, or a new one if stale; nothing else
  *   T9   CU       release (holder)                   QU     -       lease, claimedAt, submitAt cleared; owner kept
  *   T10  CP       release (holder)                   QP     -       lease, claimedAt, submitAt cleared; owner, run kept
- *   T11  QU       take / claim (owner, slot)         CU     fresh   lease; submitAt=now, generating=false
+ *   T11  QU       take / claim (owner, slot)         CU     fresh   lease; submitAt=now, generating=false, deliveryId=new
  *   T12  QP       take / claim (owner, slot)         CP     resume  lease only: submitAt stays unset, generating as it was
  *   T13  QU|QP    recover(runId) (owner, slot)       CP     resume  lease; runId pinned (QU) / matched (QP)
  *   T14  CU|CP    complete (holder)                  DONE   -       answerDigest; prompt dropped
@@ -133,6 +138,9 @@ export interface FixOffer {
   jobId: string;
   /** The offer's classification (offerKindOf): the worker submits the prompt only for fresh/replay. */
   offerKind: FixOfferKind;
+  /** The fresh hand-out this offer delivers (minted by fresh only; a replay repeats it): the worker
+   * opens at most one tab per jobId + deliveryId. */
+  deliveryId: string;
   provider: FixChatProvider;
   providers: FixChatProvider[];
   resumeProviders: FixChatProvider[];
@@ -167,6 +175,8 @@ export interface FixItem {
   claimedAt?: number;
   submitAt?: number;
   generating?: boolean;
+  /** The current fresh hand-out's nonce (beginSubmission): a replay re-delivers the same one. */
+  deliveryId?: string;
   /** The run the lease holder started for this claim, pinned by its first progress report (or by a
    * recovery that proves the page's binding). It is the ONLY source of resume semantics: an item
    * with a run lives in a tab and is resumed through that binding (recover, or the owner's take
@@ -398,7 +408,9 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   function beginSubmission(item: FixItem, kind: FixOfferKind) {
     if (kind === "resume") return;
     item.submitAt = deps.now();
-    if (kind === "fresh") item.generating = false;
+    if (kind !== "fresh") return;
+    item.generating = false;
+    item.deliveryId = deps.newId();
   }
 
   /** The claim action: a lease for a live item. On a queued item it is that item's hand-out
@@ -421,6 +433,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       kind: "fix",
       jobId: item.id,
       offerKind: kind,
+      deliveryId: item.deliveryId ?? "",
       provider: item.provider,
       providers: [item.provider],
       resumeProviders: resume ? [item.provider] : [],

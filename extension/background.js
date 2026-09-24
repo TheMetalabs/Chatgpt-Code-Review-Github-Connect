@@ -9,6 +9,14 @@ const OWNED_PREFIX = "ashlar:tab:";
 // and completes the release handshake as soon as the page can answer (see completePreservedRelease).
 const PRESERVED_PREFIX = "ashlar:preserved:";
 const preservedKey = (jobId, provider, runId) => `${PRESERVED_PREFIX}${jobId}:${provider}:${runId || "legacy"}`;
+// Fix deliveries this profile opened a tab for: {jobId: {deliveryId, at}}. The server's offer names
+// its delivery (a fresh hand-out mints it; a lost-take replay repeats it, bridge-fix.server.ts), and
+// the worker opens at most ONE tab per jobId + deliveryId: the record is written before the tab is
+// created and outlives the job registry (a hard reset or a lost registry), so a replayed delivery
+// whose tab may already hold the run is never submitted a second time (recovery resumes that tab).
+// Kept longer than the longest fix deadline (6 h), dropped when the job retires.
+const FIX_DELIVERIES_KEY = "ashlar:fixDeliveries";
+const FIX_DELIVERY_RETAIN_MS = 7 * 60 * 60 * 1000;
 const DEFAULT_MAX_REVIEW_TABS = 4;
 const HEARTBEAT_MS = 10_000;
 const HEALTH_KEY = "bridgeHealth";
@@ -564,6 +572,34 @@ async function maintenanceState() {
 }
 async function maintenanceHeld() { return Boolean(await maintenanceState()); }
 
+/** The fix deliveries this profile opened a tab for (see FIX_DELIVERIES_KEY), expired ones dropped. */
+async function fixDeliveries() {
+  const stored = (await chrome.storage.local.get([FIX_DELIVERIES_KEY]))[FIX_DELIVERIES_KEY];
+  const now = Date.now();
+  return Object.fromEntries(Object.entries(stored && typeof stored === "object" ? stored : {})
+    .filter(([, value]) => typeof value?.deliveryId === "string" && Number.isFinite(value.at) && now - value.at < FIX_DELIVERY_RETAIN_MS));
+}
+
+function updateFixDeliveries(change) {
+  return writeInOrder(async () => {
+    const all = await fixDeliveries();
+    change(all);
+    await chrome.storage.local.set({[FIX_DELIVERIES_KEY]: all});
+  });
+}
+
+/** Durably record a fix delivery BEFORE its tab is created (a worker that stops in between only
+ * skips a replay of it; it never opens a second tab). */
+function rememberFixDelivery(job) {
+  if (job.kind !== "fix" || typeof job.deliveryId !== "string" || !job.deliveryId) return Promise.resolve();
+  return updateFixDeliveries(all => { all[job.jobId] = {deliveryId: job.deliveryId, at: Date.now()}; });
+}
+
+function forgetFixDelivery(job) {
+  if (job.kind !== "fix") return Promise.resolve();
+  return updateFixDeliveries(all => { delete all[job.jobId]; });
+}
+
 async function allocateProviderTab(job, provider, jobs) {
   // Serialize only the short capacity/create boundary, never model or bridge RPCs.
   const operation = allocationTail.then(async () => {
@@ -572,6 +608,8 @@ async function allocateProviderTab(job, provider, jobs) {
     state.allocating = true;
     try { await saveJobs(jobs); }
     catch (error) { delete state.allocating; throw error; } // No create was attempted.
+    try { await rememberFixDelivery(job); }
+    catch (error) { delete state.allocating; await saveJobs(jobs).catch(() => {}); throw error; } // No create was attempted.
     try {
       const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
       state.tabId = created.id;
@@ -894,6 +932,8 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
   if (signal?.aborted) return false;
   delete jobs[job.jobId];
   await saveJobs(jobs);
+  // Its item is settled on the server: no replay of its delivery can come any more.
+  await forgetFixDelivery(job).catch(() => {});
   return true;
 }
 
@@ -1718,14 +1758,28 @@ function admitJob(cfg, jobs) {
       await recordWorkerStatus(jobs, cfg.origin, "provider_quota"); return null;
     }
     await recordWorkerStatus(jobs, cfg.origin, "polling");
+    // One take in flight per origin: this lane (singleFlight on admissionLanes, and tickBody never
+    // queues a second waiter) serializes every admission trigger of this worker (alarm, interval,
+    // poll-now). A fix delivery this profile already opened a tab for is listed too, so the server
+    // never replays it here even when the job registry lost it (hard reset).
+    const delivered = await fixDeliveries();
     // fixProtocol:1 opts this worker into review-loop fix items (an older worker is never offered one).
     const payload = await api("/api/bridge", {
-      action: "take", attachmentProtocol: 2, fixProtocol: 1, clientId: await clientId(), excludeJobIds: Object.keys(jobs),
+      action: "take", attachmentProtocol: 2, fixProtocol: 1, clientId: await clientId(),
+      excludeJobIds: [...new Set([...Object.keys(jobs), ...Object.keys(delivered)])],
     }, cfg.origin).catch(async error => {
       await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;
     });
     if (!payload.job || jobs[payload.job.jobId]) {
       await recordWorkerStatus(jobs, cfg.origin, payload.job ? "duplicate_job" : "idle");
+      return null;
+    }
+    // At most one tab per fix jobId + deliveryId: a delivery (fresh, or its replay) whose tab this
+    // profile already opened is never submitted again. A resume opens no tab.
+    const offered = payload.job;
+    if (offered.kind === "fix" && !offered.resumeProviders?.length && offered.deliveryId &&
+        delivered[offered.jobId]?.deliveryId === offered.deliveryId) {
+      await recordWorkerStatus(jobs, cfg.origin, "duplicate_job");
       return null;
     }
     const job = {...payload.job, origin: cfg.origin, states: {}};

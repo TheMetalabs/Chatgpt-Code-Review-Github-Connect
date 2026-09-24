@@ -346,6 +346,44 @@ test('worker: take opts into fix items, and a kind:fix payload runs with its kin
   assert.equal(b.local.state.pendingReviewJobs['fix-A'].kind, 'fix');
 });
 
+// Review round 11 (4096523047): the server hands a claimed, run-less fix to its own profile again
+// whenever the worker does not list it (lost take response) — the SAME delivery (deliveryId). The
+// worker opens at most one tab per jobId + deliveryId, whatever triggers admission.
+test('worker: overlapping admission triggers never create two tabs for one fix jobId (one tab per delivery)', async () => {
+  const offer = {kind: 'fix', jobId: 'fix-A', offerKind: 'fresh', deliveryId: 'delivery-1', provider: 'chatgpt', providers: ['chatgpt'], resumeProviders: [],
+    leaseId: 'L', prompt: 'FIX PROMPT', reasoning: {chatgpt: 'pro', grok: 'heavy'}, title: 'fix o/r#1', owner: 'o', repo: 'r', pr: 1};
+  const takes = [];
+  // The server's replay rule (bridge-fix.server.ts T3): offered to this profile while it does not list it.
+  const api = async (path, body) => {
+    if (body?.action !== 'take') return active(path, body);
+    takes.push(body.excludeJobIds);
+    return body.excludeJobIds.includes('fix-A') ? {ok: true, job: null} : {ok: true, job: {...offer, offerKind: takes.length > 1 ? 'replay' : 'fresh'}};
+  };
+  const handler = () => ({ok: false, code: 'busy', retry: true});
+  const b = background({api, handler});
+  const runs = worker => worker.messages.filter(m => m.type === 'ashlar-run' && m.jobId === 'fix-A');
+  // Overlapping triggers of one worker (alarm, interval, poll-now): one take in flight, one tab.
+  await Promise.all([b.tick(), b.tick(), b.tick()]);
+  await b.tick();
+  assert.equal(b.tabs.size, 1, 'one tab');
+  assert.equal(new Set(runs(b).map(m => m.id)).size, 1, 'the prompt went to one tab');
+  // The job registry is lost while that tab keeps the run (hard reset: an empty registry and a
+  // reloaded worker over the same storage and tabs). Admission races the tab inventory, so the take
+  // can come before recovery sees the tab: the server would replay the same delivery.
+  await b.local.set({pendingReviewJobs: {}});
+  const reloaded = background({local: b.local, session: b.session, tabs: b.tabs, api, handler});
+  await Promise.all([reloaded.tick(), reloaded.tick()]);
+  await reloaded.tick();
+  assert.equal(b.tabs.size, 1, 'no second tab for the same delivery');
+  assert.equal(runs(reloaded).length, 0, 'the prompt is never submitted again');
+  assert.ok(takes.at(-1).includes('fix-A'), 'the delivered fix is listed, so the server never replays it here');
+  // Even a replay that reaches the worker (a server that ignores the list) opens nothing.
+  const deaf = background({local: b.local, session: b.session, tabs: b.tabs, api: async (path, body) => (body?.action === 'take' ? {ok: true, job: {...offer, offerKind: 'replay'}} : active(path, body)), handler});
+  await deaf.tick();
+  assert.equal(b.tabs.size, 1);assert.equal(runs(deaf).length, 0);
+  assert.equal(deaf.local.state.pendingReviewJobs['fix-A'], undefined, 'the duplicate delivery is not admitted');
+});
+
 test('worker: a cancelled fix tab that now carries another binding retires after the wait, leaving that binding untouched', async () => {
   const other = {ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B', provider: 'chatgpt'};
   const handler = (_id, m) => (m.type === 'ashlar-tab-status'

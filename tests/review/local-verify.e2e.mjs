@@ -53,3 +53,19 @@ test('race (default): local still starts with the chat leg',async t=>{
   assert.equal(job().localReviewRole,'race');
   await eventually(()=>app.localRequests.length===1,'race mode did not start local at snapshot');
 });
+
+test('race (default): a posted job does not keep the local leg\'s unused unparsed reply',async t=>{
+  const {app,jobId,job}=await setup(t,'race',{localJsonRepairEnabled:false});
+  await eventually(()=>app.localRequests.length===1,'race mode did not start local at snapshot');
+  const prose='P1 a.ts:1 a duplicate request writes twice. '+'x'.repeat(50_000);
+  app.localResponses[0].end(reply(prose));
+  await eventually(()=>app.localRequests.length===2,'local did not ask for its one JSON correction');
+  app.localResponses[1].end(reply(clean));
+  await eventually(()=>job().storedLegs?.some(l=>l.provider==='local'),'the local leg was not collected');
+  await app.harbor.submitHarborChat(jobId,clean);
+  await eventually(()=>job().status==='posted','the race review was not posted');
+  const local=job().storedLegs.find(l=>l.provider==='local');
+  assert.equal(local.originalText,clean,'the correction reply is the leg');
+  // race never reads it (only a released held leg is gated as evidence); history archived its copy
+  assert.equal(local.unparsedText?.length,undefined,'the unused first reply is not retained on the job');
+});

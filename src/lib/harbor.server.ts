@@ -877,7 +877,9 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
         };
       });
     } else {
-      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, local.unparsedText)));
+      // Only a released held leg's gate reads unparsedText (as evidence); on race nothing does, and the
+      // history already archived it, so the job does not keep an unbounded copy after it ends.
+      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, heldLocalReleased(j) ? local.unparsedText : undefined)));
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

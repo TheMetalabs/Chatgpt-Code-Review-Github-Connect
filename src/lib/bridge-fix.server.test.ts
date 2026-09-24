@@ -326,6 +326,26 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     assert.equal(h.reg.release("fix-unknown", "lease"), false);
   });
 
+  it("a burst of settled items is bounded (oldest forgotten first); a live item is never evicted", async () => {
+    const h = harness();
+    h.setLimit(1000);
+    const live = queueAndTake(h, { pr: 100_000 }); // claimed before the burst, stays live
+    const liveId = live.offer.jobId;
+    const ids: string[] = [];
+    for (let pr = 1; pr <= 205; pr++) {
+      const { promise, offer } = queueAndTake(h, { pr });
+      assert.equal(h.reg.complete(offer.jobId, "chatgpt", `answer ${pr}`, offer.leaseId).ok, true);
+      assert.equal(await promise, `answer ${pr}`);
+      ids.push(offer.jobId);
+    }
+    h.reg.counts(); // prune
+    const status = ids.map((id) => h.reg.state(id).status);
+    assert.deepEqual(status.slice(0, 5), Array(5).fill("cancelled"), "the 5 oldest settled snapshots are forgotten");
+    assert.deepEqual(status.slice(5), Array(200).fill("posted"), "the newest 200 are kept");
+    assert.deepEqual(h.reg.state(liveId), { active: true, status: "awaiting_chat" });
+    void live.promise.catch(() => {});
+  });
+
   it("settled items are forgotten after the retention window", async () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h);

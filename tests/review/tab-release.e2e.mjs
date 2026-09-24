@@ -190,10 +190,10 @@ test('an unbound page never answers for a job: can-close and a cancel without th
 // in tab 10, whose URL follows the page (an in-page pushState is a tab URL update in Chrome) when
 // `tick` syncs it. `server.value` is the job status the bridge reports; `onComplete` runs before
 // the bridge ACKs a delivered result.
-function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true}={}){
- const job={jobId:tab.job,...(kind==='fix'?{kind:'fix'}:{}),origin:'http://bridge',leaseId:'lease-A',prompt:PROMPT,providers:['chatgpt'],
-  reasoning:{chatgpt:'pro',grok:'heavy'},states:{chatgpt:{tabId:10,started,runId:tab.run}}};
- const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{[job.jobId]:job}}),
+function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true,jobId=tab.job,runId=tab.run,state={},job:extra={},session}={}){
+ const job={jobId,...(kind==='fix'?{kind:'fix'}:{}),origin:'http://bridge',leaseId:'lease-A',prompt:PROMPT,providers:['chatgpt'],
+  reasoning:{chatgpt:'pro',grok:'heavy'},states:{chatgpt:{tabId:10,started,runId,...state}},...extra};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{[job.jobId]:job}}),session,
   tabs:new Map([[10,{id:10,url:tab.page.url(),status:'complete'}]]),
   api:async(_path,body)=>{
    if(body?.action==='ping')return {ok:true,active:server.value==='awaiting_chat',accepted:server.value==='awaiting_chat',status:server.value,bridge:{captureProtocol:1,localJsonRepairEnabled:false}};
@@ -210,7 +210,9 @@ function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true}=
  };
  const sync=()=>{const known=b.tabs.get(10);if(known)known.url=tab.page.url();};
  return {b,job,sync,server,state:()=>b.local.state.pendingReviewJobs[job.jobId]?.states.chatgpt,
-  tick:async({syncUrl=true}={})=>{if(syncUrl)sync();await b.tick();}};
+  tick:async({syncUrl=true}={})=>{if(syncUrl)sync();await b.tick();},
+  // Past the bounded ownership wait (the worker reads Date.now; nothing waits on a timer).
+  later:()=>{const RealDate=b.context.Date||Date;const at=RealDate.now()+3*60_000;b.context.Date=class extends RealDate{static now(){return at;}};}};
 }
 /** A leg whose page collected its answer (tail frozen in), before the worker harvests and delivers it. */
 async function collectedLeg(t,{kind,tail='',onComplete,...rest}={}){
@@ -268,4 +270,108 @@ for(const syncUrl of [true,false])test(`worker: an ACKed tab moved in-page to an
  assert.deepEqual(w.b.closedTabs,[]);assert.equal(w.state(),undefined);
  assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
  assert.equal(w.b.messages.some(m=>m.type==='ashlar-can-close'),!syncUrl,syncUrl?'the worker saw the move itself: the page is not asked':'the page reports the move');
+});
+
+// ── Legs nobody wants any more (cancelled, superseded, forgotten): the tab has no use either. The
+// cancel exit stops the page (no send, no collect) and closes the tab unless the user took it over.
+const generatingTab=(t,extra={})=>chatTab(t,{thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal(),...extra});
+for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while its answer is still generating is closed at once, and its page stops`,async t=>{
+ const tab=await generatingTab(t,{kind});
+ const w=wire(tab,{kind});
+ await w.tick();await tab.page.clock.runFor(1600);
+ assert.equal((await tab.runner()).running,true,'generating');
+ w.server.value='cancelled';
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[10],'closed in the same tick, without waiting for the answer');
+ assert.equal(w.state(),undefined,'the job retired');
+ const cancel=w.b.messages.find(m=>m.type==='ashlar-fix-cancel');
+ assert.ok(cancel&&cancel.allocationUrl===TEMP_URL&&!cancel.undispatched,'the cancel exit, naming the allocation page');
+ await tab.page.clock.runFor(1000);
+ assert.deepEqual(await tab.runner(),{running:false,code:'cancelled'},'the page collector stopped');
+ assert.equal(await tab.clicks(),0);
+});
+for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled after dispatch but before its prompt was sent is closed, and never sends it`,async t=>{
+ const tab=await chatTab(t,{kind,composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
+ const w=wire(tab,{kind});
+ await w.tick();await tab.page.clock.runFor(1000);
+ assert.equal((await tab.runner()).running,true,'waiting for its attachment upload');
+ w.server.value='cancelled';
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
+ await tab.enableSend();await tab.page.clock.runFor(2000);
+ assert.equal(await tab.clicks(),0,'the cancelled prompt is never submitted');
+});
+for(const [name,view,expected] of [
+ ['a blank temporary chat is closed',{},{closed:[10]}],
+ ['a draft the user typed there is preserved',{composer:'my own question'},{closed:[]}],
+ ['a tab the user moved to another conversation is preserved',{url:OTHER_URL},{closed:[]}],
+])test(`worker, review: cancelled before its run was dispatched: ${name}, and the job retires`,async t=>{
+ const tab=await chatTab(t,{bound:false,...view});
+ const w=wire(tab,{started:false,server:{value:'cancelled'}});
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,expected.closed);assert.equal(w.state(),undefined,'retired, capacity released');
+ assert.ok(w.b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.undispatched===true),'the unbound page answers only the undispatched claim');
+ assert.equal(w.b.messages.some(m=>m.type==='ashlar-run'),false,'a cancelled run is never dispatched');
+});
+test('worker: a cancelled leg whose page could not be reached before the server forgot the job ("missing") still closes',async t=>{
+ const tab=await generatingTab(t);
+ const w=wire(tab);
+ await w.tick();await tab.page.clock.runFor(1600);
+ const send=w.b.chrome.tabs.sendMessage;let blocked=true;
+ w.b.chrome.tabs.sendMessage=(id,msg,callback)=>{
+  if(blocked&&msg.type!=='ashlar-tab-status'){w.b.messages.push({id,...msg});w.b.chrome.runtime.lastError={message:'Could not establish connection. Receiving end does not exist.'};callback();w.b.chrome.runtime.lastError=null;return;}
+  send(id,msg,callback);
+ };
+ w.server.value='cancelled';
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[],'the page could not be reached this tick');
+ assert.equal(w.state().abandoned,true,'the abandonment is durable');
+ blocked=false;w.server.value='missing';
+ await w.b.context.heartbeatTick();
+ assert.equal(w.b.local.state.pendingReviewJobs[w.job.jobId].serverStatus,'missing');
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
+});
+test('worker: job-muf51f0g-1942\'s stored leg (cancelled, then forgotten; wedged page) closes on the next tick',async t=>{
+ // The 1.1.22 record as stored: delivered with no outcome, closeRequested, the stale blocker; no
+ // abandoned flag. Its page: a temporary chat, a sent journal without a pinned conversation, the
+ // page journal ending in waiting_for_response, an error bubble with Retry, no Stop, no actions.
+ const tab=await chatTab(t,{thread:userTurn()+'<div role="alert">Something went wrong. <button>Retry</button></div>',journal:sentJournal()});
+ await tab.page.evaluate(key=>sessionStorage.setItem(key,JSON.stringify({sequence:4,events:['prompt_prepared','send_attempted','prompt_submitted','waiting_for_response']
+  .map((stage,i)=>({source:'page',sequence:i+1,stage,at:1_700_000_000_000+i}))})),'ashlar:steps:job-A:run-A');
+ await tab.reload(); // scripts freshly injected (an extension update), nothing running in the page
+ const events=['tab_created','run_dispatched','cleanup_pending'].map((stage,i)=>({source:'worker',sequence:i+1,stage,at:1_700_000_000_000+i}));
+ const w=wire(tab,{server:{value:'missing'},job:{serverStatus:'missing'},state:{delivered:true,cleanupPending:true,closeRequested:true,
+  cleanupWaitReason:'page_completion_or_journal_pending',workerEvents:events,workerSequence:3}});
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined,'the job retired');
+ assert.ok(w.b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.allocationUrl===TEMP_URL),'the cancel exit, not can-close');
+ const progress=w.b.calls.filter(c=>c.action==='progress').at(-1)?.progress?.chatgpt?.events||[];
+ assert.ok(progress.some(e=>e.source==='worker'&&e.stage==='tab_closed'),'the close reaches review history');
+});
+for(const mode of ['secured','cancelled'])test(`worker: a ${mode} leg whose tab now belongs to another job is never closed, and that job's page is untouched`,async t=>{
+ const tab=await generatingTab(t,{job:'job-B',run:'run-B'});
+ await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(1600);
+ const other={jobId:'job-B',provider:'chatgpt',runId:'run-B',closedKey:'ashlar:closed:job-B:chatgpt:run-B',closing:false};
+ const w=wire(tab,{jobId:'job-A',runId:'run-A',session:storage({'ashlar:tab:10':other}),
+  ...(mode==='secured'?{state:{delivered:true,cleanupPending:true,outcome:{ok:true,raw:ANSWER,originalText:ANSWER}}}:{server:{value:'cancelled'}})});
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[]);assert.ok(w.state(),'asked again first');
+ w.later();await w.tick();
+ assert.deepEqual(w.b.closedTabs,[],'never closed');assert.equal(w.state(),undefined,'leg A retired after the ownership wait');
+ assert.deepEqual(w.b.session.state['ashlar:tab:10'],other,'job B\'s tab record is intact');
+ assert.equal(w.b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.preserve===true),false,'job B\'s page is never told to release');
+ assert.equal(await tab.released(),null);
+ assert.deepEqual(await tab.page.evaluate(()=>({running:__ashlarRunnerState.running,stopped:__ashlarRunnerState.runStopped===true})),{running:true,stopped:false},'job B keeps running');
+});
+for(const [name,takeover,closed] of [['no user activity',null,[10]],['a follow-up turn',TAKEOVERS[0][2],[]]])test(`sweep: a freshly re-probed "missing" job with a live tab and ${name} is released and cleared`,async t=>{
+ const tab=await generatingTab(t);
+ const w=wire(tab);
+ await w.tick();await tab.page.clock.runFor(1600);
+ if(takeover)await takeover(tab.page);
+ w.server.value='missing';
+ await w.b.context.heartbeatTick();
+ const res=await w.b.context.clearStuckJobs();
+ assert.deepEqual({ok:res.ok,cleared:res.cleared},{ok:true,cleared:1});
+ assert.deepEqual(w.b.closedTabs,closed);
 });

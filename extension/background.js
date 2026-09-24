@@ -653,6 +653,8 @@ async function cleanupProviderBody(job, provider, jobs) {
         if (sourceArchiveDurable(state)) return finishTabCleanup(job, provider, jobs, "archived source durable; original tab absent");
         // A previous remove may have succeeded just before the worker stopped.
         if (state.closeRequested) return finishTabCleanup(job, provider, jobs, "close confirmed by absence");
+        // Nobody wants this leg's result: there is nothing left to wait for.
+        if (abandonedLeg(job, state)) return finishTabCleanup(job, provider, jobs, "no result wanted; tab absent");
         state.cleanupError = "original tab unavailable; cleanup waits for reconnection";
         cleanupWaiting(job, provider, "tab_unavailable");
         await saveJobs(jobs);
@@ -752,6 +754,26 @@ async function waitOrPreserveFixTab(job, provider, jobs, reason, tab, cause) {
   return preserveFixTab(job, provider, jobs, reason, tab, cause);
 }
 
+/** A leg whose result nobody wants any more: the server cancelled (or superseded) its job, or
+ * forgot it. Durable: `abandoned` survives a later "missing" once a restarted harbor forgot the
+ * cancelled job. A leg delivered with no outcome and no durable archive was only ever settled that
+ * way (the shape 1.1.22 stored before this flag existed). */
+function abandonedLeg(job, state) {
+  return state.abandoned === true || job.serverStatus === "cancelled" ||
+    (state.delivered === true && !state.outcome && !sourceArchiveDurable(state));
+}
+
+/** Settle every leg of a job the server cancelled or forgot (`status`): nothing is delivered for it
+ * any more, and its tab is released by the same verdict as a secured one (forceCloseFixTab). */
+function abandonLegs(job, providers, status) {
+  for (const provider of providers) {
+    const state = job.states[provider];
+    if (!state.delivered) { state.abandoned = true; state.abandonedAs = status; }
+    state.delivered = true;
+    state.cleanupPending = true;
+  }
+}
+
 /** The ownership verdict in a page reply: a verdict reply (ownership) as is; a fix reply of an
  * earlier page by its `owned`; an older page's can-close by canClose / reason. */
 function tabVerdict(result) {
@@ -762,14 +784,15 @@ function tabVerdict(result) {
 }
 
 /** The one release exit for a settled leg's tab (#82): a leg whose result is secured asks
- * "ashlar-can-close"; a cancelled fix asks "ashlar-fix-cancel", which also stops its run. Both get
+ * "ashlar-can-close"; an abandoned leg (abandonedLeg: cancelled or forgotten, either kind) asks
+ * "ashlar-fix-cancel", which also stops its run, even while it is still generating. Both get
  * the page's ownership verdict (json.js fixTabOwnership): the tab is closed unless the user
  * positively took it over (then preserved and released), and preserved after FIX_OWNERSHIP_WAIT_MS
  * when ownership cannot be proven: never held forever, never closed on a guess. A tab that carries
  * another binding is never closed nor told to release. */
 async function forceCloseFixTab(job, provider, jobs, tab) {
   const state = job.states[provider];
-  const cancelled = job.kind === "fix" && job.serverStatus === "cancelled";
+  const cancelled = abandonedLeg(job, state);
   if (tab.status && tab.status !== "complete") {
     // A loading or discarded tab cannot answer for itself (and is not woken up to do so).
     cleanupWaiting(job, provider, tab.discarded || tab.status === "unloaded" ? "tab_discarded" : "tab_loading");
@@ -1309,7 +1332,7 @@ async function repairProvider(job, provider, jobs) {
   }
 }
 
-/** A server-forgotten job must not wait forever for a tab that is already gone.
+/** A stalled leg is settled only once its tab is gone (a live tab may still answer).
  * True only when neither the recorded tab nor any owned provider tab is still live. */
 async function providerTabGone(job, provider) {
   const state = job.states[provider];
@@ -1326,29 +1349,17 @@ async function providerTabGone(job, provider) {
 /** The bridge job registry is in-memory only, so a job the server used to own that now
  * reports missing/unknown (typically after a restart) is gone for good — its legs can
  * never be delivered again and must be retired, or they pile up in recovery/cleanup and
- * starve admission. Explicit cancellation force-closes every leg; a forgotten job only
- * abandons legs whose tab is truly gone, so an open tab still holding an unharvested
- * answer is preserved. Returns true when the whole job was retired. */
+ * starve admission. Every leg of a cancelled or forgotten job is abandoned: its tab has no
+ * further use and is released by the page's verdict (closed unless the user took it over,
+ * preserved when that cannot be proven in time). Returns true when the whole job was retired. */
 async function abandonForgottenJob(job, jobs, status, signal) {
-  // status is the FRESH probe verdict from the clear sweep. Cancellation force-closes every leg (the
-  // operator meant to stop it); a missing/unknown job only abandons legs whose tab is truly gone.
-  const explicit = status === "cancelled";
-  const abandon = [];
-  for (const provider of job.providers) {
-    if (explicit || await providerTabGone(job, provider)) abandon.push(provider);
-  }
-  if (!abandon.length) return false;
-  // Generation fence: providerTabGone above may have outlived the sweep's watchdog. Bail before mutating
-  // so an abandoned sweep never marks legs delivered under a newer sweep's ownership.
+  // status is the FRESH probe verdict from the clear sweep.
   if (signal?.aborted) return false;
-  for (const provider of abandon) {
-    const state = job.states[provider];
-    state.delivered = true;      // terminal: the server can never accept this leg again
-    state.cleanupPending = true;
-    state.closeRequested = true; // a confirmed-absent tab finishes cleanup instead of waiting for a reconnection that never comes
-  }
+  abandonLegs(job, job.providers, status);
+  // A confirmed-absent tab finishes cleanup instead of waiting for a reconnection that never comes.
+  for (const provider of job.providers) job.states[provider].closeRequested = true;
   await saveJobs(jobs);
-  await joinLanes(abandon.map(provider => cleanupProvider(job, provider, jobs)));
+  await joinLanes(job.providers.map(provider => cleanupProvider(job, provider, jobs)));
   // Detach the final trace only for a freshly-confirmed missing/unknown job (server evicted it → upload
   // rejected and the fetch may hang); a cancelled job keeps its lease, so its trace is awaited.
   return retireCleanJob(job, jobs, ["missing", "unknown"].includes(status), signal);
@@ -1382,10 +1393,11 @@ function jobStale(job, staleMs, now = Date.now()) {
   return latest > 0 && now - latest > staleMs;
 }
 
-/** Sweep for jobs whose tabs are gone: those the server has forgotten (missing/unknown) or cancelled,
- * and — when includeStalled — those that progressed then went quiet past staleMs (a wedged
- * generating/repair leg that can never finish). Runs both from the popup button and the periodic alarm.
- * Never touches a job with a live tab (a harvestable answer) or one the server still owns/tracks. The
+/** Sweep for jobs the server has forgotten (missing/unknown) or cancelled — their tabs are released by
+ * the page's verdict (closed unless the user took them over) — and, when includeStalled, tab-gone jobs
+ * that progressed then went quiet past staleMs (a wedged generating/repair leg that can never finish).
+ * Runs both from the popup button and the periodic alarm. Never touches a job the server still
+ * owns/tracks, nor a stalled job whose tab is still live (a harvestable answer). The
  * ENTIRE operation — storage init, the concurrent re-probe, and the abandon sweep — is raced against one
  * deadline, so a stalled chrome.storage.get, bridge ping, or tab probe can never strand the popup's
  * runtime message. Returns how many were cleared. */
@@ -1413,9 +1425,9 @@ async function clearStuckJobs(opts = {}) {
   return { ok: true, cleared: counter.cleared, kept, timedOut: false };
 }
 
-/** The actual sweep (NO response deadline). Retires jobs whose tabs are gone: those the server has
- * forgotten (missing/unknown) or cancelled, and — when includeStalled — those that progressed then went
- * quiet past staleMs. Never touches a job with a live tab (a harvestable answer). `counter` is mutated
+/** The actual sweep (NO response deadline). Retires jobs the server has forgotten (missing/unknown) or
+ * cancelled, and — when includeStalled — tab-gone jobs that progressed then went quiet past staleMs
+ * (a stalled job with a live tab may still answer and is kept). `counter` is mutated
  * live so the deadline wrapper can report partial progress on timeout. Resolves only when the work truly
  * ends, so the auto-sweep can hold its lock until then. */
 async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signal } = {}, counter = { cleared: 0, total: 0 }) {
@@ -1567,19 +1579,18 @@ async function advanceJob(job, jobs) {
   if (await retireCleanJob(job, jobs)) return;
   const active = await heartbeat(job, jobs);
   if (!active && job.serverStatus === "cancelled") {
-    for (const p of job.providers) {
-      job.states[p].delivered = true; // Explicit cancellation, never elapsed time or 404.
-      job.states[p].cleanupPending = true;
-    }
+    // Explicit cancellation, never elapsed time or 404. Persisted before cleanup: a later
+    // "missing" (the harbor forgot the cancelled job) still takes the cancel exit.
+    abandonLegs(job, job.providers, "cancelled");
     await saveJobs(jobs);
     await joinLanes(job.providers.map(p => cleanupProvider(job, p, jobs)));
     await retireCleanJob(job, jobs); // default (await): cancelled keeps its lease, so its trace still uploads
     return;
   }
-  // A "missing"/"unknown" status is deliberately NOT auto-retired: after a worker restart the
-  // tab can re-bind, so such work must not be discarded (and it is already kept out of the
-  // capacity count). An operator clears provably-dead forgotten jobs on demand via the popup
-  // ("Clear stuck jobs" → clearStuckJobs), which only abandons legs whose tab is truly gone.
+  // A "missing"/"unknown" status is deliberately NOT auto-retired here: after a worker restart the
+  // tab can re-bind, so such work must not be discarded on one stale reply. The sweep
+  // (clearStuckJobs, also run by the periodic alarm) re-probes it and, still forgotten, abandons
+  // every leg and releases its tab by the page's verdict.
   const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
   // Missing is not ACK: observe and preserve the original response without redelivery.
   if (active && !job.prompt && job.providers.some(p=>!job.states[p].delivered && !sourceArchiveDurable(job.states[p]))) {

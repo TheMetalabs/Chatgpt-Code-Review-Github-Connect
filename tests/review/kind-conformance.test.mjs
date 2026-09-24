@@ -12,6 +12,8 @@ const URL_TAB = 'https://chatgpt.com/c/managed';
 const OTHER_TAB = 'https://chatgpt.com/c/users-own'; // a conversation the user moved the tab to
 const ANSWER = {review: raw, fix: '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'};
 const LATER_MS = 3 * 60_000; // past the fix ownership wait
+// A delivered (secured) leg carries its outcome; delivered with none is an abandoned leg (#82).
+const secured = kind => ({delivered: true, cleanupPending: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}});
 
 function item(kind, patch = {}, state = {}) {
   return {jobId: kind === 'fix' ? 'fix-A' : 'job-A', ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A',
@@ -71,21 +73,21 @@ const ROWS = [
   {id: 'W5', name: 'after delivery, a tab the user continued (follow-up/draft) is preserved and the job retires', same: true,
     expect: {closed: 0, retired: true, asked: true},
     async run(kind) {
-      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true}), handler: () => ({ok: true, canClose: false, reason: 'repurposed', url: URL_TAB})});
+      const b = worker(kind, {api: active, job: item(kind, {}, secured(kind)), handler: () => ({ok: true, canClose: false, reason: 'repurposed', url: URL_TAB})});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending(), asked: b.messages.some(m => m.type === 'ashlar-can-close')};
     }},
   {id: 'W6', name: 'after delivery, a tab navigated off the provider is preserved and the job retires', same: true,
     expect: {closed: 0, retired: true},
     async run(kind) {
-      const b = worker(kind, {api: active, url: 'https://example.com/', job: item(kind, {}, {delivered: true, cleanupPending: true})});
+      const b = worker(kind, {api: active, url: 'https://example.com/', job: item(kind, {}, secured(kind))});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
-  {id: 'W7', name: 'server cancelled while the answer is still pending',
-    // Intended: a review has no deadline and waits for its answer; a cancelled fix can never be
-    // delivered, so its positively owned tab is force-closed and the job retires.
-    expect: {review: {closed: 0, retired: false}, fix: {closed: 1, retired: true}},
+  {id: 'W7', name: 'server cancelled while the answer is still pending', same: true,
+    // A cancelled run can never be delivered (#82): its positively owned tab is closed (the cancel
+    // exit also stops its page) and the job retires, whatever kind it is.
+    expect: {closed: 1, retired: true},
     async run(kind) {
       const b = worker(kind, {api: cancelled, handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
       await b.tick();
@@ -122,11 +124,9 @@ const ROWS = [
       await b.tick();b.later();await b.tick();
       return {afterWait: Boolean(b.pending()), closed: b.closedTabs.length, otherRecord: b.session.state['ashlar:tab:10']?.jobId === 'job-B'};
     }},
-  {id: 'W15', name: 'server cancelled after the tab was opened but before the run was dispatched',
-    // Intended for the fix (its undispatched blank tab is closed while it holds nothing of the
-    // user's). The review cell (FLAG R1): an unbound page answers can-close with job_mismatch, so a
-    // cancelled review whose run never started is preserved after the ownership wait (never held).
-    expect: {review: {retired: true, closed: 0}, fix: {retired: true, closed: 1}},
+  {id: 'W15', name: 'server cancelled after the tab was opened but before the run was dispatched', same: true,
+    // The undispatched blank tab is closed while it holds nothing of the user's (either kind).
+    expect: {retired: true, closed: 1},
     async run(kind) {
       const OPENED = 'https://chatgpt.com/?temporary-chat=true';
       const b = worker(kind, {api: cancelled, url: OPENED, job: item(kind, {}, {started: false}),
@@ -165,8 +165,8 @@ const ROWS = [
       b.later();await b.tick();
       return {firstTick, afterWait: Boolean(b.pending()), closed: b.closedTabs.length};
     }},
-  {id: 'W26', name: 'server cancelled; the just-clicked (unsent) prompt proves content, but the tab left its allocation page',
-    expect: {review: {closed: 0, retired: false}, fix: {closed: 0, retired: true}},
+  {id: 'W26', name: 'server cancelled; the just-clicked (unsent) prompt proves content, but the tab left its allocation page', same: true,
+    expect: {closed: 0, retired: true},
     async run(kind) {
       const b = worker(kind, {api: cancelled, url: OTHER_TAB,
         handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', unsent: true, url: OTHER_TAB} : {ok: true, canClose: false, reason: 'pending', url: OTHER_TAB}});
@@ -177,7 +177,7 @@ const ROWS = [
     // The final check is the stored identity (origin + path), for both kinds: the user's conversation.
     expect: {closed: 0, retired: true},
     async run(kind) {
-      const b = worker(kind, {api: active, url: OTHER_TAB, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB}),
+      const b = worker(kind, {api: active, url: OTHER_TAB, job: item(kind, {}, {...secured(kind), conversation: URL_TAB}),
         handler: () => ({ok: true, canClose: true, url: OTHER_TAB, conversation: URL_TAB})});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};

@@ -204,7 +204,7 @@ test('parallel: restored provider tab with changed numeric ID still reserves cap
 });
 
 test('parallel: one failed cleanup never releases the job lock while its sibling is running',async()=>{
-  const a=pending('A',10,['chatgpt','grok']);for(const s of Object.values(a.states))s.delivered=true;
+  const a=pending('A',10,['chatgpt','grok']);for(const s of Object.values(a.states)){s.delivered=true;s.outcome={ok:true,raw:response('A')};}
   const b=fixture([a]);b.done.add('A');const set=b.local.set;let fail=true;
   b.local.set=async values=>{if(fail&&values.pendingReviewJobs?.A?.states.chatgpt.cleanupPending){fail=false;throw Error('write failed');}return set(values);};
   const remove=b.chrome.tabs.remove,hold=gate();let removing=false;

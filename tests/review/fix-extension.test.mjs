@@ -1,6 +1,6 @@
 // Extension handling of review-loop FIX items: the page runner harvests plain text (no review
 // JSON), the worker delivers it via complete, skips every review-JSON lane, and force-closes a
-// cancelled fix tab only with positive page ownership. Review behavior is asserted unchanged.
+// cancelled fix tab only with positive page ownership (a cancelled review takes the same exit, #82).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
@@ -193,11 +193,11 @@ test('worker: a cancelled fix is force-closed via ashlar-fix-cancel even while i
   assert.deepEqual(b.closedTabs, [10]);assert.deepEqual(b.local.state.pendingReviewJobs, {});
   assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.jobId === 'fix-A' && m.runId === 'run-A'));
   assert.equal(b.calls.some(c => c.action === 'complete' || c.action === 'failure'), false);
-  // A cancelled REVIEW with the same pending page keeps its tab (no deadline, no forced close).
+  // A cancelled REVIEW has no use for its tab either (#82): the same cancel exit closes it.
   const review = worker([fixJob({jobId: 'job-A', kind: undefined})], {api: cancelled, handler});
   await review.tick();
-  assert.equal(review.closedTabs.length, 0);assert.ok(review.local.state.pendingReviewJobs['job-A']);
-  assert.equal(review.messages.some(m => m.type === 'ashlar-fix-cancel'), false);
+  assert.deepEqual(review.closedTabs, [10]);assert.deepEqual(review.local.state.pendingReviewJobs, {});
+  assert.ok(review.messages.some(m => m.type === 'ashlar-fix-cancel' && m.jobId === 'job-A'));
 });
 
 test('worker: an unknown ownership is asked again, then the tab is preserved (slot freed) after the wait', async () => {

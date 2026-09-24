@@ -53,13 +53,15 @@ test('clearStuckJobs retires forgotten jobs whose tabs are gone (concurrently; a
   assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
 });
 
-test('clearStuckJobs KEEPS a forgotten job whose tab is still open', async () => {
+test('clearStuckJobs KEEPS a forgotten job whose open tab has not proven its ownership yet', async () => {
+  // Every leg of a forgotten job is abandoned and its tab released by the page's verdict (#82). This
+  // page answers job_mismatch: never closed on a guess, asked again until the bounded ownership wait.
   const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing' })], new Map([[10, { id: 10, url: 'https://chatgpt.com/c/A', status: 'complete' }]]));
   const res = await b.context.clearStuckJobs();
   assert.equal(res.ok, true);
   assert.equal(res.cleared, 0);
   assert.equal(res.kept, 1);
-  assert.ok(b.tabs.has(10), 'an open tab (possible unharvested answer) is preserved');
+  assert.ok(b.tabs.has(10), 'an open tab whose ownership is unproven is never closed');
 });
 
 test('clearStuckJobs never touches a job the server still owns', async () => {

@@ -67,11 +67,15 @@ test('active=false in validator is not permission to close an unacknowledged gen
   const b=scenario([work()],{api:async()=>({ok:true,active:false,status:'validator',accepted:false}),handler:()=>({ok:false,code:'busy',jobId:'A',provider:'chatgpt',runId:'A-chatgpt'})});
   await b.tick();assert.ok(b.local.state.pendingReviewJobs.A);assert.equal(b.closedTabs.length,0);assert.equal(b.messages.some(m=>m.type==='ashlar-run'),false);
 });
-test('explicit cancellation retires only owned terminal tabs, never an unfinished answer',async()=>{
-  const b=scenario([work()],{api:async()=>({ok:true,active:false,status:'cancelled',accepted:false})});
+test('explicit cancellation closes a tab its page proves Ashlar\'s, even unfinished; an unproven page is asked again, never closed on a guess',async()=>{
+  const cancelled=async()=>({ok:true,active:false,status:'cancelled',accepted:false});
+  const url='https://chatgpt.com/c/A',page={jobId:'A',runId:'A-chatgpt',provider:'chatgpt'};
+  const b=scenario([work()],{api:cancelled,handler:(_id,msg)=>msg.type==='ashlar-fix-cancel'
+    ?{...page,ok:true,ownership:'owned',conversation:url,running:true,url}:{...page,ok:false,code:'busy'}});
   await b.tick();assert.deepEqual(b.closedTabs,[10]);assert.equal(b.calls.some(c=>c.action==='complete'),false);
-  const r=scenario([work()],{api:async()=>({ok:true,active:false,status:'cancelled',accepted:false}),handler:()=>({ok:true,jobId:'A',runId:'A-chatgpt',provider:'chatgpt',canClose:false,reason:'pending'})});
-  await r.tick();assert.equal(r.closedTabs.length,0);assert.ok(r.local.state.pendingReviewJobs.A);
+  assert.deepEqual(b.local.state.pendingReviewJobs,{});
+  const r=scenario([work()],{api:cancelled,handler:()=>({...page,ok:true,ownership:'unknown',running:true,url})});
+  await r.tick();assert.equal(r.closedTabs.length,0);assert.ok(r.local.state.pendingReviewJobs.A,'asked again next tick');
 });
 test('navigate-away and reused numeric tab IDs are never auto-closed',async()=>{
   for(const mode of ['url','identity','repurposed']){

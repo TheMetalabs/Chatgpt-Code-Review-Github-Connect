@@ -5,7 +5,8 @@ const CLIENT_KEY = "ashlar:client";
 const CLOSED_PREFIX = "ashlar:closed:";
 const OWNED_PREFIX = "ashlar:tab:";
 // A fix run whose tab the worker preserved without the page's own release (it never answered):
-// the inventory treats that page's binding as released, so it is never an orphan holding capacity.
+// the inventory treats that page's binding as released, so it is never an orphan holding capacity,
+// and completes the release handshake as soon as the page can answer (see completePreservedRelease).
 const PRESERVED_PREFIX = "ashlar:preserved:";
 const preservedKey = (jobId, provider, runId) => `${PRESERVED_PREFIX}${jobId}:${provider}:${runId || "legacy"}`;
 const DEFAULT_MAX_REVIEW_TABS = 4;
@@ -464,7 +465,30 @@ async function refreshTabInventory() {
           current.url!==tab.url || result?.url!==tab.url || result?.ownershipProtocol!==1 || result.provider!==provider ||
           typeof result.jobId!=="string" || typeof result.runId!=="string")return;
       tabOwners.set(tab.id,{url:tab.url,jobId:result.jobId,provider,runId:result.runId,released:result.released === true});
+      await completePreservedRelease(tab,provider,result);
     }).catch(()=>{tabOwners.delete(tab.id);});
+  }
+  // A preserved record whose tab is gone has nothing left to release.
+  const session=await chrome.storage.session.get(null);
+  const stale=Object.entries(session).filter(([key,value])=>key.startsWith(PRESERVED_PREFIX) && Number.isInteger(value?.tabId) && !live.has(value.tabId)).map(([key])=>key);
+  if(stale.length)await chrome.storage.session.remove(stale);
+}
+
+/** The preserve handshake a review tab always completes before its job retires (the page frees
+ * its own managed slot: can-close "repurposed", capture/result "changed"). A fix tab preserved while
+ * it could not answer (still loading, unreachable, or its reply was lost) retired on the worker's
+ * backstop record instead; once the inventory reaches that page and it still reports the binding
+ * unreleased, the page is asked to release it (and to stop collecting). The record is dropped
+ * only when the page itself reports the binding released. */
+async function completePreservedRelease(tab, provider, status) {
+  const key=preservedKey(status.jobId,provider,status.runId);
+  const record=(await chrome.storage.session.get([key]))[key];
+  if(!record)return;
+  if(status.released===true){await chrome.storage.session.remove([key]);return;}
+  const ack=await sendToTab(tab.id,{type:"ashlar-fix-cancel",jobId:status.jobId,provider,runId:status.runId,kind:"fix",preserve:true},contentFiles(provider)).catch(()=>null);
+  if(ack?.ok===true && ack.jobId===status.jobId && ack.runId===status.runId && ack.provider===provider) {
+    const known=tabOwners.get(tab.id);
+    if(known?.jobId===status.jobId && known.runId===status.runId)tabOwners.set(tab.id,{...known,released:true});
   }
 }
 function sourceArchiveDurable(state) {
@@ -738,7 +762,7 @@ const FIX_OWNERSHIP_WAIT_MS = 2 * 60_000;
 async function preserveFixTab(job, provider, jobs, reason, tab) {
   const state = job.states[provider];
   if (tab) await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider)).catch(() => {});
-  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: true});
+  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: state.tabId}});
   return finishTabCleanup(job, provider, jobs, reason);
 }
 

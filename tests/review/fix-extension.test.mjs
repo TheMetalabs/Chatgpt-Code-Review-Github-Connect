@@ -374,3 +374,36 @@ test('worker: a cancelled fix tab that now carries another binding retires after
   await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
   assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 1, 'the other binding still counts against capacity');
 });
+
+test('worker: a fix tab preserved while it could not answer completes the release handshake once it can', async () => {
+  let status = null; // what the page reports to the inventory probe once it answers
+  const b = worker([fixJob()], {api: cancelled, status: 'loading', handler: (_id, m) => {
+    if (m.type === 'ashlar-tab-status' && status) return status;
+    if (m.type === 'ashlar-fix-cancel' && m.preserve === true) { status = {...status, released: true}; return {ok: true, owned: false, ownership: 'owned', url: URL_FIX}; }
+    return {ok: true, owned: true, url: URL_FIX};
+  }});
+  const RealDate = b.context.Date || Date;
+  const later = RealDate.now() + 3 * 60_000;
+  await b.tick();
+  b.context.Date = class extends RealDate { static now() { return later; } };
+  await b.tick();
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'retired on the backstop');
+  const key = 'ashlar:preserved:fix-A:chatgpt:run-A';
+  assert.ok(b.session.state[key], 'the backstop record holds until the page releases');
+  // the page finishes loading, still bound and unreleased
+  b.tabs.get(10).status = 'complete';
+  status = {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: URL_FIX};
+  await b.context.refreshTabInventory();await until(() => b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true));
+  const release = b.messages.find(m => m.type === 'ashlar-fix-cancel' && m.preserve === true);
+  assert.ok(release, 'the page is asked to release its slot (and stop collecting)');
+  assert.equal(release.jobId, 'fix-A');assert.equal(release.runId, 'run-A');assert.equal(release.kind, 'fix');
+  assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 0);
+  // the page now reports itself released: the backstop record is dropped
+  await b.context.refreshTabInventory();await until(() => !b.session.state[key]);
+  assert.equal(b.session.state[key], undefined, 'the handshake completed');
+  assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 0);
+  // a preserved record whose tab is gone is dropped too
+  await b.session.set({'ashlar:preserved:fix-Z:chatgpt:run-Z': {tabId: 999}});
+  await b.context.refreshTabInventory();await until(() => !b.session.state['ashlar:preserved:fix-Z:chatgpt:run-Z']);
+  assert.equal(b.session.state['ashlar:preserved:fix-Z:chatgpt:run-Z'], undefined);
+});

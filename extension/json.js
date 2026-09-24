@@ -393,6 +393,24 @@ async function waitUntilReviewOrQuota(name) {
   }
 }
 
+/** Does the journaled sent turn hold EXACTLY Ashlar's prompt? boundReviewResponse identifies the
+ * turn by containment, so a turn the user edited (a prefix or suffix around the prompt) still
+ * binds. "exact": the turn (by its journaled message ID when exactly one matches, else by its
+ * recorded position) is the prompt; "edited": it holds more or other text, so it is the user's;
+ * "unknown": the turn is not rendered/resolvable. Independent of the composer draft. */
+function journaledTurnIntegrity(submission, users) {
+  if (!submission?.expected) return "unknown";
+  let turn;
+  if (submission.messageId) {
+    const matches = users.filter(node => node.getAttribute("data-message-id") === submission.messageId);
+    if (matches.length === 1) turn = matches[0];
+  } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
+    turn = users[submission.submittedUsers - 1];
+  }
+  if (!turn) return "unknown";
+  return normalizePrompt(messagePromptText(turn)) === submission.expected ? "exact" : "edited";
+}
+
 /** A review-loop FIX answer is plain text for the server's deterministic fix parser: harvest
  * the bound response's fenced code blocks (literal text, see assistantCodeBlocks) — or, when it
  * has none, a fixed no-JSON line — after the same positive completion controls and two identical stable
@@ -402,6 +420,7 @@ async function waitUntilReviewOrQuota(name) {
  */
 async function waitUntilFixOrQuota(name) {
   const stability = {stable: "", hits: 0};
+  let edited = false;
   for (;;) {
     if (globalThis.__ashlarRunnerState?.fixCancelled) {
       const error = new Error("fix request cancelled by the server"); error.code = "cancelled"; throw error;
@@ -412,7 +431,20 @@ async function waitUntilFixOrQuota(name) {
     // Only the response identified as the answer to THIS run's sent prompt is a fix answer. With no
     // sent journal or no identified response, the page-global fallbacks would read whatever chat
     // is on screen: that is never an answer (a review keeps its legacy unbound observation).
-    const own = bound?.identified && bound.root ? bound.root : null;
+    // The bound match only proves the sent turn CONTAINS the prompt: a fix answer also needs the
+    // journaled turn to be EXACTLY Ashlar's prompt. A turn the user edited is theirs: the tab is
+    // repurposed and its response is never a fix answer, even if the edit is later undone. An
+    // unresolvable turn is not harvested yet.
+    let integrity = "unknown";
+    if (bound?.identified && bound.root && !edited) {
+      const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
+      integrity = journaledTurnIntegrity(submission, globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : []);
+      if (integrity === "edited") {
+        edited = true;
+        if (runner && !runner.tabRepurposed) { runner.tabRepurposed = true; recordReviewStep("context_changed"); }
+      }
+    }
+    const own = integrity === "exact" ? bound.root : null;
     const text = done && own ? boundAnswerText("fix", own) : "";
     const answered = done && Boolean(text.trim());
     // Local diagnostics only: the answer text is never copied into an observation.
@@ -464,15 +496,9 @@ function fixTabOwnership(state) {
   // The bound match only proves the sent turn CONTAINS Ashlar's prompt; an edited turn (a prefix
   // or suffix the user added) is the user's. Ownership needs the journaled turn (its message ID,
   // pinned by the bound match, else its recorded position) to hold EXACTLY the prompt.
-  let turn;
-  if (submission.messageId) {
-    const matches = users.filter(node => node.getAttribute("data-message-id") === submission.messageId);
-    if (matches.length === 1) turn = matches[0];
-  } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
-    turn = users[submission.submittedUsers - 1];
-  }
-  if (!turn) return {ownership: "unknown"};
-  if (normalizePrompt(messagePromptText(turn)) !== submission.expected) return {ownership: "takenOver"};
+  const integrity = journaledTurnIntegrity(submission, users);
+  if (integrity === "unknown") return {ownership: "unknown"};
+  if (integrity === "edited") return {ownership: "takenOver"};
   return {ownership: draftText ? "takenOver" : "owned"};
 }
 

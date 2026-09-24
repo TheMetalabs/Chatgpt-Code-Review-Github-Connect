@@ -21,6 +21,8 @@ function page({parts = PARTS, blocks = [PARTS[1]], limit = 50, bound = true} = {
   Object.assign(c.context, {
     readSubmissionJournal: async () => (bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A'} : null),
     boundReviewResponse: () => ({identified: true, followup: false, root: {}, responseId: 'response-A'}),
+    // No DOM here: the journaled sent turn holds exactly the prompt (edits are covered in browser.e2e).
+    journaledTurnIntegrity: () => 'exact',
     stopButtonVisible: () => false, replyDoneVisible: () => true, assistantCorpus: () => parts, assistantCodeBlocks: () => blocks,
     sleep: async () => { if (++polls > limit) throw new Error('test-only polling guard'); await new Promise(resolve => setImmediate(resolve)); },
   });

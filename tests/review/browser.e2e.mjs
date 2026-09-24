@@ -285,6 +285,25 @@ test('real DOM: a fix is harvested only from the response bound to its own sent 
  assert.equal((await page.evaluate(()=>window.fixOut)).raw,code);
 });
 
+test('real DOM: a fix is never harvested from a sent turn the user edited around the prompt',async t=>{
+ const code='{"summary":"guard","files":[{"path":"a.ts","content":"x"}]}';
+ const inner=`<p>Here.</p><pre><code>${code}</code></pre>`;
+ for(const edit of ['fix prompt and my own words','my note: fix prompt']){
+  const page=await fixPage(t,inner);
+  await page.evaluate(t=>{document.querySelector('[data-message-id="user-A"]').textContent=t;},edit);
+  await page.clock.runFor(6400);
+  assert.deepEqual(await page.evaluate(()=>window.fixOut),{pending:true},`an edited sent turn (${edit}) never yields a fix answer`);
+  assert.equal(await page.evaluate(()=>__ashlarRunnerState.tabRepurposed),true,'the edited tab is repurposed');
+  await page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='fix prompt';});
+  await page.clock.runFor(6400);
+  assert.deepEqual(await page.evaluate(()=>window.fixOut),{pending:true},'undoing the edit does not revive the harvest');
+ }
+ const control=await fixPage(t,inner);
+ await control.clock.runFor(3200);
+ assert.equal((await control.evaluate(()=>window.fixOut)).raw,code,'the exact sent prompt still harvests');
+ assert.notEqual(await control.evaluate(()=>__ashlarRunnerState.tabRepurposed),true);
+});
+
 test('real DOM: a fix is read from its fenced code block literally, never from rendered prose',async t=>{
  // What ChatGPT renders for the same JSON: unfenced it is markdown (the escaped \\n loses a
  // backslash, *x* becomes emphasis, __init__ bold) yet still parses; fenced it is literal code.

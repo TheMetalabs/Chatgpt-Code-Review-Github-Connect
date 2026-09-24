@@ -884,14 +884,22 @@ export async function listReviewThreadRoots(
   repo: string,
   pr: number,
   reviewId: number,
-): Promise<Array<{ id: number; path: string; body: string }>> {
-  const rows = await ghListAll<{ id?: number; path?: string | null; body?: string | null; in_reply_to_id?: number | null }>(
-    token,
-    `/repos/${owner}/${repo}/pulls/${pr}/reviews/${reviewId}/comments`,
-  );
+): Promise<Array<{ id: number; path: string; line?: number; body: string }>> {
+  const rows = await ghListAll<{
+    id?: number;
+    path?: string | null;
+    line?: number | null;
+    original_line?: number | null;
+    body?: string | null;
+    in_reply_to_id?: number | null;
+  }>(token, `/repos/${owner}/${repo}/pulls/${pr}/reviews/${reviewId}/comments`);
   return rows
     .filter((c) => Number.isFinite(c.id) && !c.in_reply_to_id)
-    .map((c) => ({ id: Number(c.id), path: String(c.path ?? ""), body: String(c.body ?? "") }));
+    .map((c) => {
+      // `line` goes null once the comment is outdated; the line it was posted on stays in original_line
+      const line = c.line ?? c.original_line;
+      return { id: Number(c.id), path: String(c.path ?? ""), ...(Number.isFinite(line) ? { line: Number(line) } : {}), body: String(c.body ?? "") };
+    });
 }
 
 /** Reply inside an inline review thread (the per-finding disposition, design §5 step 6). */

@@ -92,7 +92,7 @@ export interface LoopRuntimeGithub extends ReviewLoopGithub {
   /** Repository permission of a user (admin | write | read | none). Throws on lookup failure. */
   fetchUserPermission(token: string, owner: string, repo: string, login: string): Promise<string>;
   /** Top-level inline comments (finding threads) of one posted review. Throws on failure. */
-  listReviewThreadRoots(token: string, owner: string, repo: string, pr: number, reviewId: number): Promise<Array<{ id: number; path: string; body: string }>>;
+  listReviewThreadRoots(token: string, owner: string, repo: string, pr: number, reviewId: number): Promise<ThreadRoot[]>;
   /** Reply inside an inline review thread. Throws on failure. */
   replyToReviewComment(token: string, owner: string, repo: string, pr: number, commentId: number, body: string): Promise<void>;
 }
@@ -102,8 +102,11 @@ export interface LoopRuntimeGithub extends ReviewLoopGithub {
  * exactly what the humans were shown, and each posted finding thread gets its disposition. */
 export interface PostedLoopReview {
   githubId?: number;
-  comments: Array<{ findingId: string; file: string; body: string }>;
+  /** Each inline comment's thread key: (file, line, body). */
+  comments: Array<{ findingId: string; file: string; line?: number; body: string }>;
   published?: string[];
+  /** GitHub refused an inline anchor, so the review went out with none of its inline comments. */
+  inlineDropped?: boolean;
 }
 
 /** What the loop may act on once the review is posted. When GitHub refused an inline anchor the
@@ -111,15 +114,16 @@ export interface PostedLoopReview {
  * nowhere on the PR, so they are neither published (never fixed) nor threaded (no reply). */
 export function loopPostedReview(o: {
   githubId?: number;
-  comments: ReadonlyArray<{ findingId: string; file: string; body: string }>;
+  comments: ReadonlyArray<{ findingId: string; file: string; line?: number; body: string }>;
   inline: ReadonlyArray<Pick<Finding, "id">>;
   unanchored: ReadonlyArray<Pick<Finding, "id">>;
   inlineDropped: boolean;
 }): PostedLoopReview {
   return {
     githubId: o.githubId,
-    comments: o.inlineDropped ? [] : o.comments.map((c) => ({ findingId: c.findingId, file: c.file, body: c.body })),
+    comments: o.inlineDropped ? [] : o.comments.map((c) => ({ findingId: c.findingId, file: c.file, line: c.line, body: c.body })),
     published: [...(o.inlineDropped ? [] : o.inline), ...o.unanchored].map((f) => f.id),
+    ...(o.inlineDropped ? { inlineDropped: true } : {}),
   };
 }
 
@@ -324,23 +328,36 @@ function duplicateIds(ids: readonly string[]): Set<string> {
   return new Set(ids.filter((id) => seen.has(id) || !seen.add(id)));
 }
 
-/** Map each posted finding to its live thread root: exact (path, body) match against the review's
- * actual comments (GitHub may drop comments it cannot anchor — those get no reply). */
+/** A review thread's root comment: its file, line and body key the finding it was posted for. */
+export type ThreadRoot = { id: number; path: string; line?: number; body: string };
+
+const threadKey = (path: string, line: number | undefined, body: string) => JSON.stringify([path, line ?? null, body]);
+
+/** Map each posted finding to its live thread root by (file, line, body): two findings on
+ * different lines can render the same body. GitHub may drop comments it cannot anchor — those get
+ * no reply. A finding id or thread key two posted comments share cannot say which thread is whose:
+ * those get no reply either and count as unroutable (failed). */
 function mapFindingThreads(
   posted: PostedLoopReview["comments"],
-  roots: ReadonlyArray<{ id: number; path: string; body: string }>,
-): Map<string, number> {
+  roots: readonly ThreadRoot[],
+): { threads: Map<string, number>; unroutable: number } {
+  const keyOf = (c: PostedLoopReview["comments"][number]) => threadKey(c.file, c.line, c.body);
+  const sharedIds = duplicateIds(posted.map((c) => c.findingId));
+  const sharedKeys = duplicateIds(posted.map(keyOf));
   const used = new Set<number>();
-  const out = new Map<string, number>();
-  const ambiguous = duplicateIds(posted.map((c) => c.findingId));
+  const threads = new Map<string, number>();
+  let unroutable = 0;
   for (const c of posted) {
-    if (ambiguous.has(c.findingId)) continue; // which thread is whose is unknowable: no reply
-    const root = roots.find((r) => !used.has(r.id) && r.path === c.file && r.body === c.body);
+    if (sharedIds.has(c.findingId) || sharedKeys.has(keyOf(c))) {
+      unroutable += 1;
+      continue;
+    }
+    const root = roots.find((r) => !used.has(r.id) && threadKey(r.path, r.line, r.body) === keyOf(c));
     if (!root) continue;
     used.add(root.id);
-    out.set(c.findingId, root.id);
+    threads.set(c.findingId, root.id);
   }
-  return out;
+  return { threads, unroutable };
 }
 
 const SYNTAX_EXTS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -627,7 +644,10 @@ export async function runPostReviewLoop(
   const published = posted?.published ? new Set(posted.published) : undefined;
   const ambiguous = duplicateIds((job.findings ?? []).map((f) => f.id));
   const findings = (job.findings ?? []).filter((f) => !published || (published.has(f.id) && !ambiguous.has(f.id)));
-  if (findings.length === 0) return { ran: false, reason: "no findings (converged)" };
+  // GitHub refused the inline anchors and the review shows none of its findings: NOT convergence
+  // (the review still requests changes), so an active session gets a fixed handoff below.
+  const unshown = findings.length === 0 && posted?.inlineDropped === true && (job.findings?.length ?? 0) > 0;
+  if (findings.length === 0 && !unshown) return { ran: false, reason: "no findings (converged)" };
 
   const { owner, repo, pr, headSha } = job;
   const ref: PrRef = { owner, repo, pr };
@@ -712,6 +732,9 @@ export async function runPostReviewLoop(
     sinceSeq = session.startSeq;
     trace(job.id, "step", { pr, head: headSha.slice(0, 7), findings: findings.length });
     diffLines = diffLinesOf(head);
+    if (unshown) {
+      return await escalate("loop-error", "GitHub refused this review's inline comments, so none of its findings are shown on the PR; the loop does not fix what the PR does not show");
+    }
     if (!sample) return await escalate("loop-error", "no head-pinned snapshot for this review");
 
     // 1) Stuck or budget spent? Rounds are counted from the durable session anchor, so a
@@ -846,13 +869,13 @@ export async function runPostReviewLoop(
       if (!posted?.githubId || posted.comments.length === 0) return tally;
       let threads: Map<string, number>;
       try {
-        threads = mapFindingThreads(posted.comments, await gh.listReviewThreadRoots(token, owner, repo, pr, posted.githubId));
+        const mapped = mapFindingThreads(posted.comments, await gh.listReviewThreadRoots(token, owner, repo, pr, posted.githubId));
+        threads = mapped.threads;
+        tally.failed = mapped.unroutable;
       } catch {
         tally.failed = posted.comments.length;
         return tally;
       }
-      const unroutable = duplicateIds(posted.comments.map((c) => c.findingId)); // mapFindingThreads skipped them
-      tally.failed = posted.comments.filter((c) => unroutable.has(c.findingId)).length;
       const byId = new Map((dispositions ?? []).map((x) => [x.finding, x]));
       for (const [i, f] of findings.entries()) {
         const threadId = threads.get(f.id);

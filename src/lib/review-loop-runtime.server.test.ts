@@ -19,6 +19,7 @@ import {
   startLoop,
   stopLoop,
   type LoopRuntimeDeps,
+  type PostedLoopReview,
 } from "./review-loop-runtime.server.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
@@ -1270,7 +1271,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
   ];
   const withDispositions = (files: string, dispositions: string) =>
     `{"summary":"s","files":${files},"dispositions":${dispositions}}`;
-  const runWith = (f: ReturnType<typeof fakeDeps>, mode: "suggest" | "apply", posted = postedReview) =>
+  const runWith = (f: ReturnType<typeof fakeDeps>, mode: "suggest" | "apply", posted: PostedLoopReview = postedReview) =>
     runPostReviewLoop("t", job({ findings: two }), sample, settings(mode), f.deps, ENV_ON, posted);
 
   it("an applied round replies in every posted thread: the disposition, or a fixed 'processed' line", async () => {
@@ -1407,10 +1408,52 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     const base = { githubId: 5, comments, inline: [{ id: "f1" }], unanchored: [{ id: "f2" }] };
     assert.deepEqual(loopPostedReview({ ...base, inlineDropped: false }), {
       githubId: 5,
-      comments: [{ findingId: "f1", file: "src/a.ts", body: "BODY-A" }],
+      comments: [{ findingId: "f1", file: "src/a.ts", line: 3, body: "BODY-A" }],
       published: ["f1", "f2"],
     });
-    assert.deepEqual(loopPostedReview({ ...base, inlineDropped: true }), { githubId: 5, comments: [], published: ["f2"] });
+    assert.deepEqual(loopPostedReview({ ...base, inlineDropped: true }), { githubId: 5, comments: [], published: ["f2"], inlineDropped: true });
+  });
+
+  it("a review whose inline comments were ALL refused is not convergence: an active session hands off", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [2], threads });
+    const dropped = loopPostedReview({ githubId: 555, comments: postedReview.comments, inline: two, unanchored: [], inlineDropped: true });
+    const r = await runWith(f, "apply", dropped);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    assert.match(escalations(f.posted)[0], /GitHub refused this review's inline comments/);
+    assert.equal(f.prompts.length, 0, "never fixed what the PR does not show");
+    // without an active session it stays silent (no PR noise)
+    const none = fakeDeps({ start: null, rounds: [2], threads });
+    assert.deepEqual(await runWith(none, "apply", dropped), { ran: false, reason: "no active loop session" });
+  });
+
+  it("threads are keyed by (file, line, body): the same body on two lines, roots listed in reverse", async () => {
+    const same = [{ ...finding("src/a.ts", "A"), line: 3 }, { ...finding("src/a.ts", "B"), id: "f2", line: 9 }];
+    const posted = {
+      githubId: 555,
+      comments: [
+        { findingId: "f1", file: "src/a.ts", line: 3, body: "SAME" },
+        { findingId: "f2", file: "src/a.ts", line: 9, body: "SAME" },
+      ],
+      published: ["f1", "f2"],
+    };
+    const roots = [
+      { id: 102, path: "src/a.ts", line: 9, body: "SAME" },
+      { id: 101, path: "src/a.ts", line: 3, body: "SAME" },
+    ];
+    const f = fakeDeps({
+      start: "apply",
+      rounds: [2],
+      threads: roots,
+      reply: withDispositions('[{"path":"src/a.ts","content":"export const a = 9;\\n"}]', '[{"finding":"F1","action":"fixed","note":"fixed A"},{"finding":"F2","action":"defer","note":"later B"}]'),
+    });
+    await runPostReviewLoop("t", job({ findings: same }), sample, settings("apply"), f.deps, ENV_ON, posted);
+    assert.deepEqual(f.replies.map((x) => [x.id, x.body.split(": ")[1]]), [[101, "fixed A"], [102, "later B"]]);
+    // an identical (file, line, body) key cannot say which thread is whose: no reply, counted failed
+    const g = fakeDeps({ start: "apply", rounds: [2], threads: roots });
+    const clash = { ...posted, comments: posted.comments.map((c) => ({ ...c, line: 3 })) };
+    await runPostReviewLoop("t", job({ findings: same }), sample, settings("apply"), g.deps, ENV_ON, clash);
+    assert.equal(g.replies.length, 0);
+    assert.match(g.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "", /Thread replies: 0 posted, 2 failed\./);
   });
 
   it("the fix acts only on PUBLISHED findings (policy-withheld ones never reach the agent)", async () => {

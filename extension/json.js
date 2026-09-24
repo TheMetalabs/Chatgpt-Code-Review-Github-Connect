@@ -47,22 +47,32 @@ function extractChatJson(text) {
   return lastReviewJson(s);
 }
 
-/** Read all rendered blocks from the current assistant message. A detached clone's
- * textContent includes hidden duplicate text and the first markdown may be prose.
- */
-function cleanTurnText(el) {
-  if (!el) return "";
+/** Whether `node` itself is hidden from the reader: the ONE visibility rule every harvest shares
+ * (review corpus, fix code blocks): hidden, aria-hidden, template, display:none,
+ * visibility:hidden, opacity 0. */
+function hiddenNode(node) {
+  if (node.matches?.("[hidden], [aria-hidden='true'], template")) return true;
+  const style = globalThis.window?.getComputedStyle ? window.getComputedStyle(node) : null;
+  return Boolean(style && (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0));
+}
+
+/** The text a reader sees in `el`: every hidden descendant, control and reference marker is
+ * dropped (a detached clone's textContent includes hidden duplicate text). */
+function visibleText(el) {
   const walk = node => {
     if (node.nodeType === 3) return node.nodeValue || "";
     if (node.nodeType !== 1) return "";
-    if (node.matches("button, [role='button'], svg, script, style, template, [hidden], [aria-hidden='true'], [data-content-reference-start]")) return "";
-    const style = window.getComputedStyle(node);
-    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return "";
+    if (node.matches("button, [role='button'], svg, script, style, [data-content-reference-start]") || hiddenNode(node)) return "";
     if (node.tagName === "BR") return "\n";
     const text = [...node.childNodes].map(walk).join("");
     return /^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE|TR)$/.test(node.tagName) ? `\n${text}\n` : text;
   };
-  return walk(el).trim();
+  return el ? walk(el).trim() : "";
+}
+
+/** Read all rendered blocks from the current assistant message; the first markdown may be prose. */
+function cleanTurnText(el) {
+  return visibleText(el);
 }
 
 function assistantCorpus(root = currentAssistantRoot()) {
@@ -90,20 +100,24 @@ function assistantCodeBlocks(root = currentAssistantRoot()) {
   for (const turn of turns) {
     for (const pre of turn.querySelectorAll("pre")) {
       if (!renderedIn(pre, turn)) continue; // a hidden/stale block the renderer kept is not the answer
-      const text = (pre.querySelector("code") || pre).textContent || "";
-      if (text.trim()) blocks.push(text);
+      // Only a code element that is itself visible is the answer (a renderer can keep a stale,
+      // hidden <code> beside the live one); a block whose code is all hidden yields nothing. Its
+      // text is read with the same visibility rule as a review's corpus (visibleText).
+      const codes = [...pre.querySelectorAll("code")];
+      const visible = codes.length ? codes.filter(code => renderedIn(code, turn) && !codes.some(outer => outer !== code && outer.contains(code))) : [pre];
+      for (const source of visible) {
+        const text = visibleText(source);
+        if (text) blocks.push(text);
+      }
     }
   }
   return blocks;
 }
 
-/** Whether `el` is visible up to `root` (cleanTurnText's exclusions: hidden, aria-hidden,
- * template, display:none, visibility:hidden, opacity 0). */
+/** Whether `el` and every ancestor up to `root` is visible (hiddenNode). */
 function renderedIn(el, root) {
   for (let node = el; node && node !== root.parentElement; node = node.parentElement) {
-    if (node.matches?.("[hidden], [aria-hidden='true'], template")) return false;
-    const style = globalThis.window?.getComputedStyle ? window.getComputedStyle(node) : null;
-    if (style && (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0)) return false;
+    if (hiddenNode(node)) return false;
   }
   return true;
 }

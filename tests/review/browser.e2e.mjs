@@ -325,6 +325,18 @@ test('real DOM: a hidden or stale code block the renderer kept is never part of 
  assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),[visible]);
 });
 
+test('real DOM: a stale hidden <code> inside a visible block is never read; the visible one is, with review visibility rules',async t=>{
+ const visible='{"summary":"new","files":[]}';
+ const page=await fixture(t,user+answer(`<pre><div>json<button>Copy code</button></div><code hidden>{"summary":"stale-hidden"}</code><code aria-hidden="true">{"summary":"stale-aria"}</code><code style="display:none">{"summary":"stale-none"}</code><code>${visible}<span aria-hidden="true">{"stale":"inner"}</span></code></pre>`+
+  `<pre><code hidden>{"summary":"all-hidden"}</code></pre><pre>plain pre</pre><pre>  </pre>`,true));
+ assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),[visible,'plain pre'],'only visible code (and a bare pre); a block whose code is all hidden yields nothing');
+ assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks(null)),[]);
+ // the review corpus applies the same visibility rule to the same turn
+ const corpus=await page.evaluate(()=>assistantCorpus().join('\n'));
+ for(const stale of ['stale-hidden','stale-aria','stale-none','"stale":"inner"','all-hidden','Copy code'])assert.ok(!corpus.includes(stale),stale);
+ assert.ok(corpus.includes(visible));
+});
+
 test('real DOM: a completed fix with prose around its fence still proves its own tab (can close)',async t=>{
  const code='{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();

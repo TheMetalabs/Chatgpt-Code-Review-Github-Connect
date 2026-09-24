@@ -71,16 +71,6 @@ test('page: an answer with no fenced block harvests a fixed no-JSON line (the se
   assert.ok(!out.includes('{'), 'no JSON object for the fix parser to read');
 });
 
-test('page: assistantCodeBlocks reads the literal code text, not the rendered block chrome', () => {
-  const c = content('chatgpt'); // the real helper, not page()'s stub
-  const code = {textContent: '{"files":[{"path":"a.ts","content":"a\\\\nb *x* __init__"}]}'};
-  const pre = {querySelector: sel => (sel === 'code' ? code : null), textContent: `jsonCopy code${code.textContent}`};
-  const bare = {querySelector: () => null, textContent: 'plain pre'};
-  const turn = {matches: () => true, querySelectorAll: sel => (sel === 'pre' ? [pre, bare, {querySelector: () => null, textContent: '  '}] : [])};
-  assert.deepEqual([...c.context.assistantCodeBlocks(turn)], [code.textContent, 'plain pre']);
-  assert.deepEqual([...c.context.assistantCodeBlocks(null)], []);
-});
-
 test('page: a visible quota notice ends a fix only before an answer is visible', async () => {
   const p = page();
   Object.assign(p.c.context, {quotaHit: () => true, stopButtonVisible: () => true, replyDoneVisible: () => false});

@@ -371,9 +371,13 @@ async function waitUntilReviewOrQuota(name) {
     }
     const poll = await pollBoundResponse();
     const {runner, bound, stop, streaming, done, submission} = poll;
-    // Like a fix run, a review binds to the conversation its exact sent turn is first shown in
-    // (pinFixConversation): a later page in another conversation is the user's (tab release).
-    if (bound?.identified && !runner?.tabRepurposed && !submission.conversation &&
+    // Like a fix run, a review binds to the conversation its exact sent turn is shown in
+    // (pinFixConversation): a later page in another conversation is the user's (tab release). A new
+    // chat that names no conversation yet (namesNoConversation: ChatGPT's "/", Grok's home) is not
+    // one: the provider moves that URL to the conversation it assigns after the send, which is not
+    // the user's doing. There the review pins only once its answer is complete (the page it was
+    // collected on); until then its release verdict is unpinned and the worker follows its page.
+    if (bound?.identified && !runner?.tabRepurposed && !submission.conversation && ((done && bound.root) || !namesNoConversation(globalThis.location?.href)) &&
         journaledTurnIntegrity(submission, globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : []) === "exact") {
       pinFixConversation(submission);
     }
@@ -420,8 +424,9 @@ function conversationIdentity(href) {
 }
 
 /** Pin a run's (review or fix) conversation identity in its submission journal once its sent turn
- * is first proven to be exactly Ashlar's prompt (only a collector pins: the review loop, and the fix
- * loop's fixOwnershipProof phase "collect"). Pinned ONCE and never replaced: a later URL is compared
+ * is proven to be exactly Ashlar's prompt (only a collector pins: the review loop when the answer is
+ * complete, the fix loop's fixOwnershipProof phase "collect" at its first exact observation, which
+ * its answer then requires). Pinned ONCE and never replaced: a later URL is compared
  * with it (samePage), so a conversation the user moved to in this tab is never taken for the run's.
  * There is no location-based upgrade: a URL change carries no evidence of whose conversation the new
  * page is (the user can navigate before the provider assigns one), and neither provider's DOM ties a
@@ -452,6 +457,12 @@ function samePage(a, b) {
     const path = url => url.pathname.replace(/\/+$/, "");
     return x.origin === y.origin && path(x) === path(y);
   } catch { return false; }
+}
+
+/** Whether `href` is a provider's new-chat page, which names no conversation (its path is the site
+ * root: ChatGPT's "/" with or without `?temporary-chat=true`, Grok's home). */
+function namesNoConversation(href) {
+  try { return new URL(href).pathname.replace(/\/+$/, "") === ""; } catch { return false; }
 }
 
 /** Whether the page still shows the conversation its run was bound in (samePage). Not established = false. */

@@ -42,10 +42,10 @@ const fileChip=name=>`<div role="group" aria-label="${name}" style="width:120px;
 const composerHtml=({composer='',sendDisabled=false,uploading=false,chips=[]})=>`<form data-type="unified-composer">${chips.map(fileChip).join('')}<div contenteditable="true" id="prompt-textarea" style="width:300px;min-height:40px">${composer}</div>${uploading?'<div role="progressbar" style="width:60px;height:20px">uploading</div>':''}<button id="composer-submit-button" aria-label="Send prompt" style="width:32px;height:32px"${sendDisabled?' disabled':''}>send</button></form>`;
 const sentJournal=(extra={})=>({phase:'sent',expected:PROMPT,baseline:0,submittedUsers:1,messageId:'user-A',...extra});
 
-async function chatTab(t,{url=TEMP_URL,kind,job=kind==='fix'?'fix-A':'job-A',run='run-A',bound=true,journal,...view}={}){
+async function chatTab(t,{provider='chatgpt',url=provider==='grok'?'https://grok.com/':TEMP_URL,kind,job=kind==='fix'?'fix-A':'job-A',run='run-A',bound=true,journal,...view}={}){
  const page=await browser.newPage();t.after(()=>page.close());
  const served={thread:'',composer:'',sendDisabled:false,uploading:false,chips:[],after:'',...view};
- await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',
+ await page.route(provider==='grok'?'https://grok.com/**':'https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',
   body:`<html><body><main id="thread">${served.thread}</main>${served.after}${composerHtml(served)}</body></html>`}));
  await page.clock.install();
  await page.goto(url);
@@ -59,11 +59,11 @@ async function chatTab(t,{url=TEMP_URL,kind,job=kind==='fix'?'fix-A':'job-A',run
    window.sendClicks=0;document.querySelector('form').addEventListener('submit',e=>e.preventDefault());
    document.getElementById('composer-submit-button').addEventListener('click',()=>window.sendClicks++);
   });
-  for(const file of MANIFEST)await page.addScriptTag({content:source('extension/'+file)});
+  for(const file of MANIFEST)await page.addScriptTag({content:source('extension/'+(provider==='grok'&&file==='content-chatgpt.js'?'content-grok.js':file))});
  };
  await inject();
- const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId:job,runId:run,provider:'chatgpt',...(kind==='fix'?{kind}:{}),...extra});
- return {page,served,send,inject,job,run,
+ const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId:job,runId:run,provider,...(kind==='fix'?{kind}:{}),...extra});
+ return {page,served,send,inject,job,run,provider,
   reload:async()=>{await page.reload();await inject();},
   steps:()=>page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)||'{"events":[]}').events.map(e=>e.stage),`ashlar:steps:${job}:${run}`),
   released:()=>page.evaluate(key=>sessionStorage.getItem(key),`ashlar:released:${job}:${run}`),
@@ -177,19 +177,27 @@ for(const kind of ['review','fix'])test(`${kind}: a secured temporary chat reloa
  assert.deepEqual(verdict(await canClose(conv.tab)),{canClose:false,reason:'pending',cause:'not_rendered'},'nothing rendered on a conversation page proves nothing: asked again');
 });
 
-test('review: a run pins its conversation on its exact sent turn, once: a later location never replaces it',async t=>{
+/** The generating answer completes: Stop goes, the response actions render. */
+const finish=page=>page.evaluate(actions=>{document.querySelector('[data-testid="stop-button"]').remove();document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('beforeend',actions);},actions);
+const pinnedIn=tab=>tab.page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)).conversation,`ashlar:submission:${tab.job}:${tab.run}`);
+test('review: on a new chat that names no conversation yet, a run pins its conversation once the provider assigns one or its answer completes; never replaced',async t=>{
+ // A temporary chat keeps its URL: pinned there when the answer completes (not while generating).
  const temp=await chatTab(t,{thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
  await temp.send('ashlar-run',{resume:true});await temp.page.clock.runFor(1600);
- const journal=tab=>tab.page.evaluate(()=>JSON.parse(sessionStorage.getItem('ashlar:submission:job-A:run-A')).conversation);
- assert.equal(await journal(temp),TEMP_URL);
+ assert.equal(await pinnedIn(temp),undefined,'not pinned on the new-chat page while generating');
+ await finish(temp.page);await temp.page.clock.runFor(1600);
+ assert.equal(await pinnedIn(temp),TEMP_URL,'pinned where its answer completed');
  assert.equal((await temp.send('ashlar-harvest')).conversation,TEMP_URL,'every reply reports the pinned conversation');
+ // The provider assigns the conversation URL after the send (no user action): pinned there.
  const fresh=await chatTab(t,{url:'https://chatgpt.com/',thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
  await fresh.send('ashlar-run',{resume:true});await fresh.page.clock.runFor(1600);
- assert.equal(await journal(fresh),'https://chatgpt.com/');
- // A URL change is no evidence of whose conversation the page shows (the user can move first):
- // no location-based upgrade, for reviews as for fixes.
- await fresh.page.evaluate(url=>history.pushState({},'',url),CONV_URL);await fresh.page.clock.runFor(1600);
- assert.equal(await journal(fresh),'https://chatgpt.com/','never re-pinned by a later location');
+ await fresh.page.evaluate(url=>history.replaceState(history.state,'',url),CONV_URL);await fresh.page.clock.runFor(1600);
+ assert.equal(await pinnedIn(fresh),CONV_URL,'pinned in the conversation the provider assigned');
+ // Once pinned, a later location never replaces it.
+ await fresh.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);await fresh.page.clock.runFor(1600);
+ await finish(fresh.page);await fresh.page.clock.runFor(1600);
+ assert.equal(await pinnedIn(fresh),CONV_URL,'never re-pinned by a later location');
+ assert.equal((await fresh.send('ashlar-can-close',{allocationUrl:TEMP_URL})).identity,'changed');
 });
 test('an unbound page never answers for a job: can-close and a cancel without the undispatched claim get job_mismatch',async t=>{
  const tab=await chatTab(t,{bound:false});
@@ -207,8 +215,9 @@ test('an unbound page never answers for a job: can-close and a cancel without th
 // `tick` syncs it. `server.value` is the job status the bridge reports; `onComplete` runs before
 // the bridge ACKs a delivered result.
 function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true,jobId=tab.job,runId=tab.run,state={},job:extra={},session}={}){
- const job={jobId,...(kind==='fix'?{kind:'fix'}:{}),origin:'http://bridge',leaseId:'lease-A',prompt:PROMPT,providers:['chatgpt'],
-  reasoning:{chatgpt:'pro',grok:'heavy'},states:{chatgpt:{tabId:10,started,runId,...state}},...extra};
+ const provider=tab.provider||'chatgpt';
+ const job={jobId,...(kind==='fix'?{kind:'fix'}:{}),origin:'http://bridge',leaseId:'lease-A',prompt:PROMPT,providers:[provider],
+  reasoning:{chatgpt:'pro',grok:'heavy'},states:{[provider]:{tabId:10,started,runId,...state}},...extra};
  const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{[job.jobId]:job}}),session,
   tabs:new Map([[10,{id:10,url:tab.page.url(),status:'complete'}]]),
   api:async(_path,body)=>{
@@ -225,13 +234,13 @@ function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true,j
   });
  };
  const sync=()=>{const known=b.tabs.get(10);if(known)known.url=tab.page.url();};
- return {b,job,sync,server,state:()=>b.local.state.pendingReviewJobs[job.jobId]?.states.chatgpt,
+ return {b,job,sync,server,provider,state:()=>b.local.state.pendingReviewJobs[job.jobId]?.states[provider],
   tick:async({syncUrl=true}={})=>{if(syncUrl)sync();await b.tick();},
   // Past the bounded ownership wait (the worker reads Date.now; nothing waits on a timer).
   later:()=>{const RealDate=b.context.Date||Date;const at=RealDate.now()+3*60_000;b.context.Date=class extends RealDate{static now(){return at;}};}};
 }
 /** What review history receives: the last progress upload, through the server's own sanitizer. */
-const uploadedSteps=w=>sanitizeProgressEvents(w.b.calls.filter(c=>c.action==='progress').at(-1)?.progress?.chatgpt?.events).map(e=>`${e.source}:${e.stage}`);
+const uploadedSteps=w=>sanitizeProgressEvents(w.b.calls.filter(c=>c.action==='progress').at(-1)?.progress?.[w.provider||'chatgpt']?.events).map(e=>`${e.source}:${e.stage}`);
 /** A leg whose page collected its answer (tail frozen in), before the worker harvests and delivers it. */
 async function collectedLeg(t,{kind,tail='',onComplete,...rest}={}){
  const tab=await chatTab(t,{kind,thread:userTurn()+answerTurn({code:ANSWER+tail}),journal:sentJournal(),...rest});
@@ -292,6 +301,42 @@ for(const syncUrl of [true,false])test(`worker: an ACKed tab moved in-page to an
  assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
  assert.equal(w.b.messages.some(m=>m.type==='ashlar-can-close'),!syncUrl,syncUrl?'the worker saw the move itself: the page is not asked':'the page reports the move');
 });
+
+// ── A provider assigns the conversation's URL after the send (ChatGPT's bare new chat, or a
+// temporary chat it does not honour: "/" becomes "/c/<id>"; Grok's home likewise). That is the job's
+// own conversation, not a user's move: the secured or unwanted tab still closes.
+const PROVIDER_MOVES=[
+ ['ChatGPT, replaceState','chatgpt','https://chatgpt.com/','https://chatgpt.com/c/provider-assigned','replace'],
+ ['ChatGPT temporary chat not honoured, pushState','chatgpt',TEMP_URL,'https://chatgpt.com/c/provider-assigned','push'],
+ ['Grok','grok','https://grok.com/','https://grok.com/c/provider-assigned','replace'],
+];
+const assign=(page,url,how)=>page.evaluate(([url,how])=>{if(how==='push')history.pushState({},'',url);else history.replaceState(history.state,'',url);},[url,how]);
+for(const [name,provider,from,to,how] of PROVIDER_MOVES){
+ test(`worker, review (${name}): the provider assigns the conversation URL while generating; the ACKed tab closes`,async t=>{
+  const tab=await chatTab(t,{provider,url:from,thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+  const w=wire(tab);
+  await w.tick();await tab.page.clock.runFor(1600);
+  await assign(tab.page,to,how);await tab.page.clock.runFor(800);
+  await finish(tab.page);await tab.page.clock.runFor(2400);
+  assert.equal(await tab.page.evaluate(()=>__ashlarRunnerState.result?.ok),true,'collected');
+  await w.tick();
+  assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
+  assert.deepEqual(w.b.closedTabs,[10],`the secured tab is closed: ${uploadedSteps(w)}`);
+  assert.equal(w.state(),undefined,'the job retired');
+  assert.equal(await pinnedIn(tab),to,'pinned in the conversation the provider assigned');
+ });
+ for(const polled of [true,false])test(`worker, review (${name}): cancelled while generating after the provider assigned the conversation URL (${polled?'polled there':'not polled since'}); the tab closes`,async t=>{
+  const tab=await chatTab(t,{provider,url:from,thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+  const w=wire(tab);
+  await w.tick();await tab.page.clock.runFor(1600);
+  await assign(tab.page,to,how);await tab.page.clock.runFor(800);
+  if(polled)await w.tick();
+  w.server.value='cancelled';
+  await w.tick();
+  assert.deepEqual(w.b.closedTabs,[10],`the unwanted tab is closed: ${uploadedSteps(w)}`);
+  assert.equal(w.state(),undefined,'the job retired');
+ });
+}
 
 // ── Legs nobody wants any more (cancelled, superseded, forgotten): the tab has no use either. The
 // cancel exit stops the page (no send, no collect) and closes the tab unless the user took it over.

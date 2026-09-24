@@ -743,6 +743,14 @@ function onAllocationPage(url, provider) {
   return samePage(url, providerUrl(provider));
 }
 
+/** The page a run last answered on (state.pageUrl), when it can serve as the run's identity: not
+ * while it is still the page the tab was opened on, which names no conversation yet. A provider
+ * moves that URL to the conversation it assigns after the send (ChatGPT's bare new chat, Grok's
+ * home), and a move the worker has not polled since is not the user's: the page decides then. */
+function answeredPage(state, provider) {
+  return state.pageUrl && !onAllocationPage(state.pageUrl, provider) ? state.pageUrl : "";
+}
+
 /** Keep the conversation a run (review or fix) was bound in, as its page pinned it in the
  * submission journal when the sent turn was first proven exact: stored ONCE and never replaced (no
  * location-based upgrade: a later URL is no evidence of whose conversation it is), so a later reply
@@ -844,8 +852,8 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   const undispatched = cancelled && !state.started && await tabCreatedForLeg(job, provider, tab.id);
   if (!undispatched) {
     // The tab's own URL first: the conversation the run was bound in, else the page where this run
-    // last answered.
-    const known = state.conversation || state.pageUrl;
+    // last answered (answeredPage).
+    const known = state.conversation || answeredPage(state, provider);
     if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
   }
   const message = {...tabMessage(job, provider, cancelled ? "ashlar-fix-cancel" : "ashlar-can-close"),
@@ -893,10 +901,13 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     await closeProvenTab(job, provider, jobs, tab.id, url => onAllocationPage(url, provider), closed);
     return;
   }
-  // A run with no pinned conversation (a legacy journal, an older page): the identity the worker
-  // observed itself, the page where the run last answered, else (older pages) the URL that answered.
+  // A run with no pinned conversation (still generating, a legacy journal, an older page): the
+  // identity the worker observed itself, the page where the run last answered, else (older pages)
+  // the URL that answered. An unpinned run known only on the page the tab was opened on is where
+  // its page just proved its sent turn is still the last one: the conversation the provider
+  // assigned since (a review pins only when its answer is complete).
   if (verdict.unpinned === true || verdict.legacy === true || verdict.legacyReply === true) {
-    const identity = state.conversation || state.pageUrl;
+    const identity = state.conversation || answeredPage(state, provider) || (verdict.unpinned === true ? result.url : state.pageUrl);
     const holds = identity ? url => samePage(url, identity) : verdict.legacyReply ? url => url === result.url : url => onAllocationPage(url, provider);
     if (!holds(result.url)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
     await closeProvenTab(job, provider, jobs, tab.id, holds, closed);

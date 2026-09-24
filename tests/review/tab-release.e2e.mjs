@@ -37,12 +37,14 @@ const stopButton='<button data-testid="stop-button" aria-label="Stop generating"
 const userTurn=(id='user-A',text=PROMPT)=>`<section data-testid="conversation-turn-${id}"><div data-message-author-role="user" data-message-id="${id}"><div class="whitespace-pre-wrap">${text}</div></div></section>`;
 /** The assistant turn as ChatGPT renders a fenced JSON answer (`code`: the code block's text). */
 const answerTurn=({code=ANSWER,done=true,id='answer-A'}={})=>`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="${id}"><div class="markdown"><p>Review below.</p><pre><div><div id="lang">JSON</div><div><button>Copy</button></div></div><div><code id="code">${code.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</code></div></pre></div></div>${done?actions:''}</section>`;
-const composerHtml=({composer='',sendDisabled=false,uploading=false})=>`<form data-type="unified-composer"><div contenteditable="true" id="prompt-textarea" style="width:300px;min-height:40px">${composer}</div>${uploading?'<div role="progressbar" style="width:60px;height:20px">uploading</div>':''}<button id="composer-submit-button" aria-label="Send prompt" style="width:32px;height:32px"${sendDisabled?' disabled':''}>send</button></form>`;
+/** A file chip as the composer shows a staged attachment (the named shape attachmentsReady reads). */
+const fileChip=name=>`<div role="group" aria-label="${name}" style="width:120px;height:40px">${name}<button aria-label="Remove file">x</button></div>`;
+const composerHtml=({composer='',sendDisabled=false,uploading=false,chips=[]})=>`<form data-type="unified-composer">${chips.map(fileChip).join('')}<div contenteditable="true" id="prompt-textarea" style="width:300px;min-height:40px">${composer}</div>${uploading?'<div role="progressbar" style="width:60px;height:20px">uploading</div>':''}<button id="composer-submit-button" aria-label="Send prompt" style="width:32px;height:32px"${sendDisabled?' disabled':''}>send</button></form>`;
 const sentJournal=(extra={})=>({phase:'sent',expected:PROMPT,baseline:0,submittedUsers:1,messageId:'user-A',...extra});
 
 async function chatTab(t,{url=TEMP_URL,kind,job=kind==='fix'?'fix-A':'job-A',run='run-A',bound=true,journal,...view}={}){
  const page=await browser.newPage();t.after(()=>page.close());
- const served={thread:'',composer:'',sendDisabled:false,uploading:false,after:'',...view};
+ const served={thread:'',composer:'',sendDisabled:false,uploading:false,chips:[],after:'',...view};
  await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',
   body:`<html><body><main id="thread">${served.thread}</main>${served.after}${composerHtml(served)}</body></html>`}));
  await page.clock.install();
@@ -141,10 +143,12 @@ for(const kind of ['review','fix'])for(const [name,tail,redraw] of REDRAWS)test(
 });
 
 // Positive evidence the user took the tab over: preserved (slot freed), with the cause.
+const stageFile=p=>p.evaluate(html=>document.querySelector('form').insertAdjacentHTML('afterbegin',html),fileChip('my-notes.pdf'));
 const TAKEOVERS=[
  ['a follow-up turn','user_turn',p=>p.evaluate(html=>document.getElementById('thread').insertAdjacentHTML('beforeend',html),userTurn('user-B','my own question'))],
  ['a draft in the composer','draft',p=>p.evaluate(()=>{document.getElementById('prompt-textarea').textContent='my unsent question';})],
  ['an edit of Ashlar\'s prompt (the turn is replaced)','edited',p=>p.evaluate(html=>{document.querySelector('[data-testid="conversation-turn-user-A"]').outerHTML=html;},userTurn('user-A2','my edited question'))],
+ ['a file the user staged in the composer (no text yet)','draft',p=>stageFile(p)],
 ];
 for(const kind of ['review','fix'])for(const [name,cause,takeover] of TAKEOVERS)test(`${kind}: a secured tab with ${name} is preserved and released`,async t=>{
  const {tab}=await collected(t,{kind});
@@ -309,6 +313,25 @@ for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while 
  const steps=uploadedSteps(w);
  assert.ok(steps.includes('page:cancelled')&&steps.includes('worker:tab_closed'),`the stop and the close reach history: ${steps}`);
 });
+for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while generating is preserved when the user staged a file in its composer`,async t=>{
+ const tab=await generatingTab(t,{kind});
+ const w=wire(tab,{kind});
+ await w.tick();await tab.page.clock.runFor(1600);
+ await stageFile(tab.page);
+ w.server.value='cancelled';
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[],'the staged file is the user\'s draft');assert.equal(w.state(),undefined,'the job retired');
+ assert.ok(uploadedSteps(w).includes('worker:preserve_draft'));
+});
+for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while its own attachment is still uploading is closed (its own file is not a draft)`,async t=>{
+ const tab=await chatTab(t,{kind,composer:PROMPT,sendDisabled:true,uploading:true,chips:['diff.patch'],journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:['diff.patch']}});
+ const w=wire(tab,{kind});
+ await w.tick();await tab.page.clock.runFor(1000);
+ assert.equal((await tab.runner()).running,true,'waiting for its attachment upload');
+ w.server.value='cancelled';
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
+});
 for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled after dispatch but before its prompt was sent is closed, and never sends it`,async t=>{
  const tab=await chatTab(t,{kind,composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
  const w=wire(tab,{kind});
@@ -325,6 +348,7 @@ const createdHere=(job='job-A',run='run-A')=>storage({'ashlar:tab:10':{jobId:job
 for(const [name,view,expected] of [
  ['a blank temporary chat is closed',{},{closed:[10]}],
  ['a draft the user typed there is preserved',{composer:'my own question'},{closed:[]}],
+ ['a file the user staged there is preserved',{chips:['my-notes.pdf']},{closed:[]}],
  ['a tab the user moved to another conversation is preserved',{url:OTHER_URL},{closed:[]}],
 ])test(`worker, review: cancelled before its run was dispatched: ${name}, and the job retires`,async t=>{
  const tab=await chatTab(t,{bound:false,...view});

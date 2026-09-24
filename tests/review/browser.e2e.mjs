@@ -422,6 +422,8 @@ const PROOF_VIOLATIONS={
  editedPrefix:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='my note: fix prompt';}),
  followup:({page})=>page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);}),
  draft:({page})=>page.locator('#prompt-textarea').evaluate(el=>{el.textContent='my own question';}),
+ // a file the user staged in the composer before typing anything is a draft too
+ stagedFile:({page})=>page.evaluate(()=>document.querySelector('form').insertAdjacentHTML('afterbegin','<div role="group" aria-label="my-notes.pdf" style="width:120px;height:40px">my-notes.pdf</div>')),
  moved:({move})=>move(OTHER_URL),
  responseChanged:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="response-A"] code').textContent='{"summary":"regenerated","files":[]}';}),
 };

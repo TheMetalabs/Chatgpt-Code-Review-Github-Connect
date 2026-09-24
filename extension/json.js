@@ -289,6 +289,23 @@ function composerDraftText() {
   return (draft && (draft.value || draft.innerText || draft.textContent || "") || "").trim();
 }
 
+/** Files staged in the chat composer that are not this run's own attachments (its journal's or the
+ * ones fillComposer is uploading, by name): a file the user added before typing is a draft too. The
+ * chips are the named shapes the send barrier recognises (attachmentsReady), in the composer's own
+ * form; a group that wraps the editor or the send control is the composer, not a file. */
+function composerStagedFiles(state, submission) {
+  const editor = typeof composer === "function" && globalThis.document ? composer() : null;
+  const form = editor?.closest?.("form");
+  if (!form) return [];
+  const own = new Set([...(Array.isArray(submission?.attachments) ? submission.attachments : []),
+    ...(Array.isArray(state?.pendingAttachments) ? state.pendingAttachments : [])]);
+  const shown = chip => (typeof renderedControl === "function" ? renderedControl(chip) : !hiddenNode(chip));
+  return [...form.querySelectorAll('[data-file-name], [role="group"][aria-label]')]
+    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button') && shown(chip))
+    .map(chip => chip.getAttribute("data-file-name") || chip.getAttribute("aria-label") || "")
+    .filter(name => name.trim() && !own.has(name));
+}
+
 /** One poll of the response bound to this run's sent prompt: the completion evidence both
  * collectors (review JSON, fix code) decide on. A follow-up turn marks the tab repurposed. A
  * later request's global Stop cannot end or block this older response: completion needs the
@@ -500,7 +517,7 @@ function fixOwnershipProof(state, {phase, journal} = {}) {
   if (integrity === "edited") return takeOver("edited", "edited");
   // The first exact observation binds the fix to the conversation it is shown in (immutable).
   if (phase === "collect") pinFixConversation(submission);
-  if (composerDraftText()) return verdict("takenOver", "draft");
+  if (composerDraftText() || composerStagedFiles(state, submission).length) return verdict("takenOver", "draft");
   // The rendered turn proves its content only. An in-page (SPA) move to another conversation can
   // leave this DOM on screen under the new URL: the proof holds only in the pinned conversation.
   if (!submission.conversation) return verdict("unknown", "unpinned", {identity: "unestablished"});
@@ -588,6 +605,7 @@ function tabOwnership(state, allocationUrl) {
   // else there is the user's, including Ashlar's prompt with text added around it.
   const draft = composerDraftText();
   if (draft && norm(draft) !== norm(submission?.expected || state.pendingPrompt || "")) return {ownership: "takenOver", cause: "draft"};
+  if (composerStagedFiles(state, submission).length) return {ownership: "takenOver", cause: "draft"};
   if (submission?.phase !== "sent") {
     if (!submission && typeof state.finishedContext === "string") {
       // A run observed without a journal (a legacy page): compare with what it recorded when it finished.
@@ -797,7 +815,7 @@ function installReviewRunner(name, run) {
         // the tab the worker opened for a run it never sent (undispatched): Ashlar's only while it
         // holds nothing of the user's (no turn, no draft). A late run message for it stays stopped.
         const turns = globalThis.document ? document.querySelectorAll('[data-message-author-role="user"]').length : 0;
-        const draft = Boolean(composerDraftText());
+        const draft = Boolean(composerDraftText()) || composerStagedFiles(null, null).length > 0;
         const blank = !turns && !draft;
         if (msg.runId) { try { sessionStorage.setItem(`ashlar:stopped:${msg.jobId}:${msg.runId}`, "true"); } catch { /* nothing runs here yet */ } }
         reply({ok:true,releaseProtocol:1,owned:blank,canClose:blank,ownership:blank ? "owned" : "takenOver",

@@ -483,33 +483,22 @@ async function assertNewerSessionLives(w: World): Promise<void> {
     assert.ok(!s.active && s.endedBy === "escalate", `I6: ${JSON.stringify(s)}`);
     return;
   }
-  assert.ok(s.active, `I6: the newer session was ended: ${JSON.stringify(s)}`);
-  const ended = kindOf(via) === "stop" || (kindOf(via) === "handoff" && write !== "rejected");
-  if (ended) assert.equal(isoMs(s.startIso), isoMs(w.carolAt), `I6: the session is not carol's: ${JSON.stringify(s)}`);
-  else assert.equal(s.starter, "carol", `I6: carol's start is not the latest: ${JSON.stringify(s)}`);
+  // the step first (the runtime's own session read), then the durable session it saw
   w.clock += 1_000;
   w.reviews.push({ head: w.live(), total: 3, at: iso(w.clock) });
   w.phase = "follow";
   const r = await w.plainStep(w.live(), "follow");
   assert.equal(r.ran, true, `I6: the newer session's step did not run: ${JSON.stringify(r)}`);
+  assert.ok(s.active, `I6: the newer session was ended: ${JSON.stringify(s)}`);
+  const ended = kindOf(via) === "stop" || (kindOf(via) === "handoff" && write !== "rejected");
+  if (ended) assert.equal(isoMs(s.startIso), isoMs(w.carolAt), `I6: the session is not carol's: ${JSON.stringify(s)}`);
+  else assert.equal(s.starter, "carol", `I6: carol's start is not the latest: ${JSON.stringify(s)}`);
 }
 
 /** Cells that fail on this tree, by the fix that closes them: node:test reports them as todo, not
  * failed. Each fix deletes its group; the last one deletes gap(). A pattern is
  * `via | write | list | later`, each part `*` or a comma list. */
 const OPEN: ReadonlyArray<readonly [string, string]> = [
-  ["handoff", "continue:push | rejected | lagging | redelivery,newer-start,25h"],
-  ["handoff", "continue:applied | rejected | lagging | newer-start"],
-  ["handoff", "handoff:stuck | success | normal,failing | row-appears"],
-  ["handoff", "handoff:stuck | success | lagging | newer-start,25h,row-appears"],
-  ["handoff", "handoff:stuck | unknown-landed | normal | row-appears"],
-  ["handoff", "handoff:stuck | unknown-landed | lagging,failing | newer-start,row-appears"],
-  ["handoff", "handoff:stuck | unknown-lost | * | newer-start,row-appears"],
-  ["handoff", "handoff:terminal | success | normal,failing | row-appears"],
-  ["handoff", "handoff:terminal | success | lagging | *"],
-  ["handoff", "handoff:terminal | unknown-landed | normal | row-appears"],
-  ["handoff", "handoff:terminal | unknown-landed | lagging,failing | newer-start,row-appears"],
-  ["handoff", "handoff:terminal | unknown-lost | * | newer-start,row-appears"],
   ["continuation", "continue:push | success | normal,failing | row-appears"],
   ["continuation", "continue:push | success | lagging | redelivery,25h,row-appears"],
   ["continuation", "continue:push | unknown-landed | normal | row-appears"],

@@ -43,16 +43,14 @@ import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { retryWrite, type WriteRetryResult } from "./write-retry.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
-import { assertNever, emitControl, type EmitContext, type EmitOutcome } from "./review-loop-control.ts";
+import { assertNever, emitControl, ownWrites, type EmitContext, type EmitOutcome } from "./review-loop-control.ts";
 import {
   CURRENT_ROUND_MISSING,
   ESCALATE_IN_FLIGHT,
   escalateNow,
   controlInSession,
   maybeEscalate,
-  ambiguousEvents,
   dedupProbe,
-  handoffPrefix,
   readLoopSession,
   reconstructRounds,
   rememberAmbiguous,
@@ -594,12 +592,11 @@ function setPendingStop(gh: object, ref: PrRef, event: LoopEvent, pending: boole
   else byPr.delete(prKey(ref));
 }
 
-/** The PR's current loop session from durable GitHub history (fresh read), plus this process's
- * not-yet-durable stops, its ambiguous (maybe-landed, not yet listed) handoffs and any
- * caller-known events. */
+/** The PR's current loop session from durable GitHub history (fresh read; it folds this
+ * process's own control writes the list does not show yet), plus this process's not-yet-durable
+ * stops and any caller-known events. */
 function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullHead, botLogin: string, extra: LoopEvent[] = []): Promise<LoopSession> {
-  const handoffs = ambiguousEvents(gh, handoffPrefix(ref)); // ambiguous handoffs: terminal here
-  return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head, extra: [...pendingStops(gh, ref), ...handoffs, ...extra] });
+  return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head, extra: [...pendingStops(gh, ref), ...extra] });
 }
 
 /** `ambiguous`: the POST's outcome is unknown (it may have landed) and it is not visible yet. It is
@@ -714,7 +711,7 @@ export async function runPostReviewLoop(
   // the NEW head.
   const escalate = async (reason: EscalateReason, detail: string, head: string = headSha): Promise<LoopStepResult> => {
     if (!d) return { ran: false, reason: `ESCALATE ${reason} not posted (no GitHub client): ${detail}` };
-    const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, sinceIso, sinceSeq, sleep });
+    const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, sinceIso, sinceSeq, sleep, now: d!.now });
     try {
       let r = await post();
       if (r.error === ESCALATE_IN_FLIGHT) {
@@ -781,9 +778,11 @@ export async function runPostReviewLoop(
       }
     }
     if (!session.active) {
-      // This session's handoff may have landed (ambiguous, not listed yet): it ended the session.
-      const handedOff = session.endedBy === "escalate" && ambiguousEvents(gh, handoffPrefix(ref)).length > 0;
-      return { ran: false, reason: handedOff ? HANDED_OFF_UNKNOWN : NO_SESSION };
+      // The handoff that ended the session is this process's own and its outcome is still unknown
+      // (the read above just reconciled the journal against the list): logged, not silent.
+      const unknownHandoff =
+        session.endedBy === "escalate" && ownWrites(gh).unresolved(ref, "handoff").some((e) => isoMs(e.attemptAt) === isoMs(session.endedAt));
+      return { ran: false, reason: unknownHandoff ? HANDED_OFF_UNKNOWN : NO_SESSION };
     }
     requested = true;
     sinceIso = session.startIso;
@@ -813,6 +812,7 @@ export async function runPostReviewLoop(
       sinceIso: session.startIso,
       sinceSeq: session.startSeq,
       sleep,
+      now: d.now,
     };
     let esc = await maybeEscalate(gh, token, escOpts);
     for (const wait of HISTORY_RETRY_DELAYS_MS) {
@@ -1151,6 +1151,7 @@ export async function continueLoopOnPush(
       sinceIso: session.startIso,
       sinceSeq: session.startSeq,
       sleep: d.sleep,
+      now: d.now,
     });
     const tail = handoff.escalated ? "; handoff posted" : handoff.error ? `; handoff failed: ${handoff.error}` : "";
     return { posted: false, reason: `continue on push failed: ${c.error}${tail}` };

@@ -33,8 +33,15 @@ import {
   type RoundSummary,
 } from "./review-loop.ts";
 import { deriveLoopSession, type LoopEvent, type LoopSession } from "./review-loop-session.ts";
-import { retryWrite } from "./write-retry.ts";
-import { controlInSession, inSession, ownWrites } from "./review-loop-control.ts";
+import {
+  assertNever,
+  controlInSession,
+  emitControl,
+  inSession,
+  ownWrites,
+  type ControlWrite,
+  type EmitOutcome,
+} from "./review-loop-control.ts";
 
 // Single source of the App identity lives in review-loop.ts (shared with the webhook parser's
 // self-trigger guard); re-exported here for existing engine callers.
@@ -132,27 +139,25 @@ export async function reconstructRounds(
   }));
 }
 
-/** True if a bot-authored escalate handoff for this head already exists IN THIS SESSION
- * (idempotency). A handoff from an earlier, finished session must not silence a new one: a
- * human who re-runs the loop on the same head after an ESCALATE gets a fresh handoff. */
-async function alreadyEscalated(
-  gh: ReviewLoopGithub,
-  token: string,
-  owner: string,
-  repo: string,
-  pr: number,
-  head: string,
-  botLogin: string,
-  sinceIso?: string,
-  sinceSeq?: number,
-): Promise<boolean> {
-  const issues = await gh.listIssueComments(token, owner, repo, pr);
-  for (const c of issues) {
-    if (!controlInSession(c, { iso: sinceIso, seq: sinceSeq })) continue;
-    const parsed = parseEscalateMarker(c.body, { authoredByBot: isBot(c.userLogin, botLogin) });
-    if (parsed && parsed.head === head) return true; // full-SHA equality
-  }
-  return false;
+type HandoffTarget = { owner: string; repo: string; pr: number; head: string; sinceIso?: string; sinceSeq?: number };
+
+/** THE handoff of a head in a session: one, whichever path (stuck classification or a terminal
+ * failure) posts it. */
+function handoffWrite(o: HandoffTarget, body: string): ControlWrite {
+  return {
+    key: { kind: "handoff", ref: { owner: o.owner, repo: o.repo, pr: o.pr }, head: o.head, sessionIso: o.sinceIso },
+    body,
+    since: { iso: o.sinceIso, seq: o.sinceSeq },
+  };
+}
+
+/** True if a bot-authored escalate handoff for this head is LISTED in this session (idempotency;
+ * the listed row also confirms this process's own write). A handoff from an earlier, finished
+ * session must not silence a new one: a human who re-runs the loop on the same head after an
+ * ESCALATE gets a fresh handoff. Throws on a failed read. */
+async function alreadyEscalated(gh: ReviewLoopGithub, token: string, o: HandoffTarget, botLogin: string): Promise<boolean> {
+  const rows = await gh.listIssueComments(token, o.owner, o.repo, o.pr);
+  return ownWrites(gh).seen(handoffWrite(o, ""), rows, botLogin);
 }
 
 // Control comments THIS process posted (handoffs, continuations, start / stop records), kept per
@@ -230,25 +235,14 @@ export function dedupProbe(client: object, key: string, scan: () => Promise<bool
   };
 }
 
-/** Prefix of every handoff key of one PR (see handoffKey). */
-export function handoffPrefix(o: { owner: string; repo: string; pr: number }): string {
-  return `handoff:${o.owner}/${o.repo}#${o.pr}@`;
-}
-
-/** ONE handoff per head per session — the key both handoff paths (stuck classification and
- * terminal failures) record and consult. */
-function handoffKey(o: { owner: string; repo: string; pr: number; head: string; sinceIso?: string; sinceSeq?: number }): string {
-  return `handoff:${o.owner}/${o.repo}#${o.pr}@${o.head}#${o.sinceSeq ?? o.sinceIso ?? ""}`;
-}
-
 export function postedRecently(client: object, key: string, now: number = Date.now()): boolean {
   const at = postedByClient.get(client)?.get(key);
   return at !== undefined && now - at <= POSTED_TTL_MS;
 }
 
-/** A handoff POST whose outcome is unknown (it may have landed) and that the scans have not seen
- * yet. It is recorded in the ambiguity ledger (never re-sent, never followed by another handoff
- * for the head) with a synthetic handoff event that ends the session in this process. */
+/** A handoff POST whose outcome is unknown (it may have landed) and that no list shows yet. It is
+ * never re-sent nor followed by another handoff for the head, and its journal entry ends the
+ * session in this process (placed at the POST attempt). */
 export const HANDOFF_OUTCOME_UNKNOWN = "the handoff's outcome is unknown (it may have landed; not re-sent)";
 
 export interface EscalateResult {
@@ -300,6 +294,8 @@ export async function maybeEscalate(
     requireCurrentRound?: boolean;
     /** Waits between handoff POST retries (injectable for tests). */
     sleep?: (ms: number) => Promise<void>;
+    /** The clock a handoff attempt is stamped with (injectable for tests). */
+    now?: () => number;
   },
 ): Promise<EscalateResult> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
@@ -316,26 +312,19 @@ export async function maybeEscalate(
 async function maybeEscalateInner(
   gh: ReviewLoopGithub,
   token: string,
-  opts: {
-    owner: string;
-    repo: string;
-    pr: number;
-    head: string;
+  opts: HandoffTarget & {
     roundCap: number;
     diffLines?: number;
-    sinceIso?: string;
-    sinceSeq?: number;
     requireCurrentRound?: boolean;
     sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
   },
   botLogin: string,
 ): Promise<EscalateResult> {
   // Fail closed on an incomplete/failed history read: never classify or (dup-)post from
   // partial data — the list helpers throw rather than return a truncated list.
   let rounds: RoundSummary[];
-  let escalatedBefore: boolean;
-  let ambiguousBefore = false;
-  const hk = handoffKey(opts);
+  let reason: EscalateReason | null;
   try {
     rounds = await reconstructRounds(gh, token, opts.owner, opts.repo, opts.pr, { botLogin, sinceIso: opts.sinceIso });
     // Only classify when the most recent reconstructed round IS the current head. Otherwise the
@@ -345,22 +334,12 @@ async function maybeEscalateInner(
       if (opts.requireCurrentRound) return { escalated: false, rounds, error: CURRENT_ROUND_MISSING };
       if (rounds.length > 0) return { escalated: false, rounds };
     }
-    const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
-    if (!reasonPeek) return { escalated: false, rounds };
-    const listed = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq);
-    if (listed) clearAmbiguous(gh, hk);
-    escalatedBefore = listed || postedRecently(gh, hk);
-    ambiguousBefore = !escalatedBefore && ambiguousWrite(gh, hk);
+    reason = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
+    if (!reason) return { escalated: false, rounds };
+    if (await alreadyEscalated(gh, token, opts, botLogin)) return { escalated: false, reason, rounds }; // one handoff per head
   } catch (e) {
     return { escalated: false, rounds: [], error: (e as Error)?.message ?? String(e) };
   }
-  const reason = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
-  if (!reason) return { escalated: false, rounds };
-  if (escalatedBefore) {
-    return { escalated: false, reason, rounds }; // one handoff per head
-  }
-  // An earlier handoff for this head may have landed: never a second one, and never "exists".
-  if (ambiguousBefore) return { escalated: false, ambiguous: true, reason, rounds };
   // The budget is authoritative (round-cap), but the trend pattern still guides the human.
   const pattern = reason === "round-cap" ? stuckPattern(rounds) : null;
   const body = escalateFromRounds(reason, rounds, {
@@ -371,55 +350,38 @@ async function maybeEscalateInner(
     diffLines: opts.diffLines,
     detail: pattern ? `fix-round budget spent; the finding trend also shows ${pattern}` : undefined,
   });
-  const probe = dedupProbe(gh, hk, () => alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq));
-  const out = await postHandoff(gh, token, opts, body, probe.seen);
-  if (out === "exists" && !probe.ledgerOnly()) return { escalated: false, reason, rounds };
-  if (out !== "posted") {
-    rememberAmbiguous(gh, hk, handoffEvent());
-    return { escalated: false, ambiguous: true, reason, rounds };
+  const out = await emitHandoff(gh, token, opts, body, botLogin);
+  switch (out.status) {
+    case "posted":
+      return { escalated: true, reason, rounds };
+    case "exists": // this process's own, or listed meanwhile
+      return { escalated: false, reason, rounds };
+    case "unknown": // it may have landed: never a second one, and never "exists"
+      return { escalated: false, ambiguous: true, reason, rounds };
+    case "rejected": // nothing landed: the loop step hands off loop-error for this head instead
+      throw new Error(out.error);
+    default:
+      return assertNever(out);
   }
-  rememberPosted(gh, hk);
-  return { escalated: true, reason, rounds };
 }
-
-/** The synthetic handoff an ambiguous one stands for in this process: it ends the session (a
- * redelivered review of the head never runs another fix) until the real marker is listed. */
-function handoffEvent(): LoopEvent {
-  return { at: new Date().toISOString(), kind: "escalate" };
-}
-
-/** Delays before each terminal-handoff POST attempt. A handoff has no other poster, so one
- * transient failure must not leave the session active with no signal (a silent stall). */
-export const HANDOFF_RETRY_DELAYS_MS = [0, 2_000, 5_000];
 
 const defaultSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 
 /**
- * POST a terminal handoff, retrying transient failures. Before every retry the handoff scan runs
- * again, so a POST that GitHub accepted but whose response was lost is not posted twice once it
- * is visible (the transport never re-sends a write itself). An unreadable scan still posts: a
- * duplicate handoff is harmless next to a loop that stops silently. Throws the last error.
+ * POST a terminal handoff through the control gate: a refused POST is retried with backoff (a
+ * handoff has no other poster, so one transient failure must not leave the session active with no
+ * signal), and one whose outcome is unknown is never sent again — its attempt time stands in for
+ * it in every session read until the row is listed. The caller has just scanned the history.
  */
-async function postHandoff(
+function emitHandoff(
   gh: ReviewLoopGithub,
   token: string,
-  o: { owner: string; repo: string; pr: number; sleep?: (ms: number) => Promise<void> },
+  o: HandoffTarget & { sleep?: (ms: number) => Promise<void>; now?: () => number },
   body: string,
-  seen: () => Promise<boolean>,
-): Promise<"posted" | "exists" | "ambiguous"> {
-  // retryWrite: a POST whose outcome is unknown (it may have landed) is never sent again; the
-  // remaining schedule only re-checks the scan.
-  const r = await retryWrite({
-    delays: HANDOFF_RETRY_DELAYS_MS,
-    sleep: o.sleep ?? defaultSleep,
-    seen,
-    scanFirst: false,
-    post: () => gh.createIssueComment(token, { owner: o.owner, repo: o.repo, pr: o.pr, body }),
-  });
-  if ("posted" in r) return "posted";
-  if ("exists" in r) return "exists";
-  if (r.ambiguous) return "ambiguous"; // may have landed: the caller records it, never re-posts
-  throw r.error;
+  botLogin: string,
+): Promise<EmitOutcome> {
+  const ctx = { gh, token, botLogin, sleep: o.sleep ?? defaultSleep, now: o.now ?? (() => Date.now()), scanFirst: false };
+  return emitControl(ctx, handoffWrite(o, body));
 }
 
 /**
@@ -449,28 +411,18 @@ export async function escalateNow(
     sinceSeq?: number;
     /** Waits between handoff POST retries (injectable for tests). */
     sleep?: (ms: number) => Promise<void>;
+    /** The clock a handoff attempt is stamped with (injectable for tests). */
+    now?: () => number;
   },
 ): Promise<{ escalated: boolean; ambiguous?: boolean; error?: string }> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
-  const sessionKey = handoffKey(opts);
   if (inFlightEscalate.has(key)) return { escalated: false, error: ESCALATE_IN_FLIGHT };
   inFlightEscalate.add(key);
   try {
-    let before = false;
-    try {
-      const listed = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq);
-      if (listed) clearAmbiguous(gh, sessionKey);
-      before = listed || postedRecently(gh, sessionKey);
-    } catch {
-      // Unreadable history: fall back to what THIS process posted for this head + session (a
-      // sequential redelivery is then a no-op); otherwise post rather than end the loop without
-      // its signal.
-      before = postedRecently(gh, sessionKey);
-    }
-    if (before) return { escalated: false };
-    // An earlier handoff for this head may have landed: never a second one, and never "exists".
-    if (ambiguousWrite(gh, sessionKey)) return { escalated: false, ambiguous: true, error: HANDOFF_OUTCOME_UNKNOWN };
+    // An unreadable history does not suppress the post (the failure is the signal); the journal
+    // still knows this process's own handoff for the head and session.
+    if (await alreadyEscalated(gh, token, opts, botLogin).catch(() => false)) return { escalated: false };
     const body = escalateFromRounds(opts.reason, opts.rounds, {
       pr: opts.pr,
       head: opts.head,
@@ -479,17 +431,19 @@ export async function escalateNow(
       diffLines: opts.diffLines,
       detail: opts.detail,
     });
-    const probe = dedupProbe(gh, sessionKey, () =>
-      alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq),
-    );
-    const out = await postHandoff(gh, token, opts, body, probe.seen);
-    if (out === "exists" && !probe.ledgerOnly()) return { escalated: false };
-    if (out !== "posted") {
-      rememberAmbiguous(gh, sessionKey, handoffEvent());
-      return { escalated: false, ambiguous: true, error: HANDOFF_OUTCOME_UNKNOWN };
+    const out = await emitHandoff(gh, token, opts, body, botLogin);
+    switch (out.status) {
+      case "posted":
+        return { escalated: true };
+      case "exists":
+        return { escalated: false };
+      case "unknown": // it may have landed: never a second one, and never "exists"
+        return { escalated: false, ambiguous: true, error: HANDOFF_OUTCOME_UNKNOWN };
+      case "rejected":
+        return { escalated: false, error: out.error };
+      default:
+        return assertNever(out);
     }
-    rememberPosted(gh, sessionKey);
-    return { escalated: true };
   } catch (e) {
     return { escalated: false, error: (e as Error)?.message ?? String(e) };
   } finally {

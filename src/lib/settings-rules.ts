@@ -14,6 +14,9 @@
  * - SETTINGS_FIELD_RULES has one rule per writable BotSettings field (the type forces a new field
  *   to get one). The Settings API route passes every supplied field RAW to validatedSettingsPatch:
  *   an unknown / read-only field or an invalid value is a 400; the route prefilters nothing.
+ * - The schema is strict at EVERY nesting level: NESTED_SETTINGS_RULES has one key rule per nested
+ *   object (the type forces a new nested field to get one); a nested key outside it is a 400
+ *   before anything is merged or validated.
  * - enabled=true requires a WIRED provider AND a WIRED delivery the provider supports
  *   (fixLoopRunnable). loopEnabled in the runtime uses the same predicate, so a hand-edited or
  *   env-seeded non-wired pair also stays OFF at run time (fails closed).
@@ -35,7 +38,6 @@ import {
   type FixAgentProvider,
   type FixAgentSettings,
   type FixDelivery,
-  type FixMode,
 } from "./types.ts";
 import { CHATGPT_REASONING, GROK_REASONING } from "./reasoning.ts";
 
@@ -197,22 +199,35 @@ export function fromFormUnit(key: FixAgentKnob, v: number): number {
 
 const isObject = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === "object" && !Array.isArray(v);
 
-/** Why this fixAgent block cannot be saved (null = valid). */
+type Rule = (v: unknown) => string | null;
+
+const bool = (label: string): Rule => (v) => (typeof v === "boolean" ? null : `${label} must be true or false`);
+const text = (label: string): Rule => (v) => (typeof v === "string" ? null : `${label} must be a string`);
+const nonBlank = (label: string): Rule => (v) => (typeof v === "string" && v.trim() ? null : `${label} must be a non-empty string`);
+const oneOf = (label: string, values: readonly unknown[]): Rule => (v) => (values.includes(v) ? null : `${label} must be one of: ${values.join(", ")}`);
+
+/** One value rule per fixAgent field — the block's writable key set. `Record<keyof
+ * FixAgentSettings, Rule>` makes a new fixAgent field a type error until it has a rule; the knobs'
+ * rules come from FIX_KNOB_FIELDS (the Settings screen's own field table). */
+export const FIX_AGENT_FIELD_RULES: Readonly<Record<keyof FixAgentSettings, Rule>> = {
+  enabled: bool("fix_agent.enabled"),
+  provider: (v) =>
+    v === null || FIX_AGENT_PROVIDERS.includes(v as FixAgentProvider) ? null : `fix_agent.provider must be one of: none, ${FIX_AGENT_PROVIDERS.join(", ")}`,
+  delivery: oneOf("fix_agent.delivery", FIX_DELIVERIES),
+  mode: oneOf("fix_agent.mode", FIX_MODES),
+  ...(Object.fromEntries(FIX_KNOB_FIELDS.map((f) => [f.key, (v: unknown) => intProblem(f.label, fixKnobDomain(f.key), v)])) as Record<FixAgentKnob, Rule>),
+};
+
+/** Why this fixAgent block cannot be saved (null = valid). A key outside FIX_AGENT_FIELD_RULES is
+ * rejected before any value is looked at. */
 export function fixAgentProblem(raw: unknown): string | null {
   if (raw === undefined) return null;
   if (!isObject(raw)) return "fix_agent must be an object";
-  if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") return "fix_agent.enabled must be true or false";
-  if (raw.provider !== undefined && raw.provider !== null && !FIX_AGENT_PROVIDERS.includes(raw.provider as FixAgentProvider)) {
-    return `fix_agent.provider must be one of: none, ${FIX_AGENT_PROVIDERS.join(", ")}`;
-  }
-  if (raw.delivery !== undefined && !FIX_DELIVERIES.includes(raw.delivery as FixDelivery)) {
-    return `fix_agent.delivery must be one of: ${FIX_DELIVERIES.join(", ")}`;
-  }
-  if (raw.mode !== undefined && !FIX_MODES.includes(raw.mode as FixMode)) return `fix_agent.mode must be one of: ${FIX_MODES.join(", ")}`;
-  for (const f of FIX_KNOB_FIELDS) {
-    const v = raw[f.key];
-    if (v === undefined) continue;
-    const problem = intProblem(f.label, fixKnobDomain(f.key), v);
+  const unknownKey = nestedKeysProblem("fixAgent", raw);
+  if (unknownKey) return unknownKey;
+  for (const [key, rule] of Object.entries(FIX_AGENT_FIELD_RULES)) {
+    if (raw[key] === undefined) continue;
+    const problem = rule(raw[key]);
     if (problem) return problem;
   }
   const provider = (raw.provider ?? null) as FixAgentProvider | null;
@@ -237,7 +252,47 @@ export const NO_REVIEWER_PROBLEM = "enable ChatGPT, Grok, or a local URL+model";
 /** Every BotSettings field a save may write (the derived *Set flags are read-only). */
 export type SettingsField = Exclude<keyof BotSettings, "localLlmApiKeySet" | "webhookSecretSet">;
 
-type Rule = (v: unknown) => string | null;
+/** The object shape nested in a settings value: the value itself when it is an object, the element
+ * type of an array of objects; never for a primitive or an array of primitives. */
+type NestedShape<T> = T extends readonly (infer E)[] ? (E extends object ? E : never) : T extends object ? T : never;
+
+/** Every writable BotSettings field whose value is (or holds) a nested object — derived from the
+ * type, so a new nested field joins this set by itself. */
+export type NestedSettingsField = {
+  [K in SettingsField]-?: [NestedShape<NonNullable<BotSettings[K]>>] extends [never] ? never : K;
+}[SettingsField];
+
+/** A nested object's writable key set: one value rule per key (its keys ARE the set). */
+export interface NestedRule<T> {
+  label: string;
+  fields: Readonly<Record<keyof T, Rule>>;
+}
+
+/** One key rule per nested object. The mapped type makes a new nested BotSettings field a type
+ * error here until it has a rule, and each rule's `fields` must name exactly the nested type's
+ * keys, so no nested object can accept a key it does not store. */
+export const NESTED_SETTINGS_RULES: { readonly [K in NestedSettingsField]: NestedRule<NestedShape<NonNullable<BotSettings[K]>>> } = {
+  fixAgent: { label: "fix_agent", fields: FIX_AGENT_FIELD_RULES },
+};
+
+const NESTED_FIELDS = Object.keys(NESTED_SETTINGS_RULES) as NestedSettingsField[];
+
+function isNestedField(key: string): key is NestedSettingsField {
+  return Object.hasOwn(NESTED_SETTINGS_RULES, key);
+}
+
+/** Why a supplied nested value carries an own key outside its writable set (null = none): every
+ * object in it (the value itself, or each element of an array) is checked. A non-object value is
+ * left to the field's own rule. Runs BEFORE any merge or value rule, so an unknown key (a typo such
+ * as fix_agent.paralellPrs) is a 400 — never merged, ignored, dropped by sanitize and answered 200. */
+export function nestedKeysProblem(field: NestedSettingsField, value: unknown): string | null {
+  const { label, fields } = NESTED_SETTINGS_RULES[field];
+  for (const item of Array.isArray(value) ? value : [value]) {
+    if (!isObject(item)) continue;
+    for (const key of Object.keys(item)) if (!Object.hasOwn(fields, key)) return `${label}.${key} is not a writable settings field`;
+  }
+  return null;
+}
 
 const MAX_INT = Number.MAX_SAFE_INTEGER;
 
@@ -263,10 +318,6 @@ export function clampInt(d: IntDomain, v: unknown, def: number): number {
   return Math.min(d.max, Math.max(d.min, Math.floor(v)));
 }
 
-const bool = (label: string): Rule => (v) => (typeof v === "boolean" ? null : `${label} must be true or false`);
-const text = (label: string): Rule => (v) => (typeof v === "string" ? null : `${label} must be a string`);
-const nonBlank = (label: string): Rule => (v) => (typeof v === "string" && v.trim() ? null : `${label} must be a non-empty string`);
-const oneOf = (label: string, values: readonly unknown[]): Rule => (v) => (values.includes(v) ? null : `${label} must be one of: ${values.join(", ")}`);
 const int = (key: SettingsIntField): Rule => (v) => intProblem(SETTINGS_INT_FIELDS[key].label, SETTINGS_INT_FIELDS[key], v);
 const SEVERITIES = ["P0", "P1", "P2"] as const;
 
@@ -319,14 +370,15 @@ export const SECRET_FIELDS: readonly SettingsField[] = ["webhookSecret", "localL
 
 /** Why these settings cannot be saved (null = valid). `raw` is the full document about to be
  * saved (the live settings with the operator's patch merged over them), before normalization.
- * Every present field is checked by its rule; unknown keys (e.g. the read-only *Set flags the
+ * Every present field is checked by its rule (a nested object's unknown keys first —
+ * nestedKeysProblem); unknown top-level keys (e.g. the read-only *Set flags the
  * screen's draft carries) are not part of a document's validity — a PATCH with one is rejected by
  * validatedSettingsPatch. */
 export function settingsProblem(raw: Partial<BotSettings> | Record<string, unknown>): string | null {
   const r = raw as Record<string, unknown>;
   for (const key of SETTINGS_FIELDS) {
     if (r[key] === undefined) continue;
-    const problem = SETTINGS_FIELD_RULES[key](r[key]);
+    const problem = (isNestedField(key) && nestedKeysProblem(key, r[key])) || SETTINGS_FIELD_RULES[key](r[key]);
     if (problem) return problem;
   }
   if (!providersFromSettings(r as unknown as BotSettings).length) return NO_REVIEWER_PROBLEM;
@@ -347,14 +399,21 @@ export class SettingsError extends Error {
 /** The document a Settings patch would save: the patch merged over the live settings, checked by
  * settingsProblem BEFORE any normalization (a rejected value is never clamped into a valid one).
  * `patch` is taken RAW (the Settings API passes the request's fields untouched): an unknown or
- * read-only field is rejected, a secret follows SECRET_FIELDS, a fixAgent object is a partial
- * merged over the live one, and anything else — a non-object fixAgent included — is validated as
+ * read-only field is rejected, a nested object with a key outside its writable set
+ * (NESTED_SETTINGS_RULES) is rejected before any merge, a secret follows SECRET_FIELDS, a nested
+ * object (fixAgent) is a partial merged over the live one, and anything else — a non-object fixAgent included — is validated as
  * supplied. Throws SettingsError 400; the caller normalizes, persists, then swaps its live settings. */
 export function validatedSettingsPatch<T extends object>(current: T, patch: Partial<T> | Record<string, unknown>): T {
   const next: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(patch)) {
     if (!(SETTINGS_FIELDS as readonly string[]).includes(key)) throw new SettingsError(`${key} is not a writable settings field`, 400);
     if (value === undefined) continue; // absent: a programmatic partial patch
+    if (isNestedField(key)) {
+      // Strict at every level: a nested key outside the field's writable set is rejected here,
+      // before the value is merged over the live one or validated.
+      const unknownKey = nestedKeysProblem(key, value);
+      if (unknownKey) throw new SettingsError(unknownKey, 400);
+    }
     if (SECRET_FIELDS.includes(key as SettingsField)) {
       const problem = SETTINGS_FIELD_RULES[key as SettingsField](value);
       if (problem) throw new SettingsError(problem, 400);
@@ -364,9 +423,11 @@ export function validatedSettingsPatch<T extends object>(current: T, patch: Part
     }
     next[key] = value;
   }
-  if (isObject(next.fixAgent)) {
-    const live = (current as { fixAgent?: unknown }).fixAgent;
-    next.fixAgent = { ...(isObject(live) ? live : {}), ...next.fixAgent };
+  for (const field of NESTED_FIELDS) {
+    const supplied = next[field];
+    if (!isObject(supplied)) continue;
+    const live = (current as Record<string, unknown>)[field];
+    next[field] = { ...(isObject(live) ? live : {}), ...supplied };
   }
   const merged = { ...current, ...next };
   const problem = settingsProblem(merged as Record<string, unknown>);

@@ -83,11 +83,17 @@ function samples(key) {
   if (typeof DEFAULT_SETTINGS[key] === 'boolean') return B;
   return junk;
 }
+// Unknown nested keys: a typo alone, next to a valid key, and on a full valid block.
+function unknownNestedSamples() {
+  const base = {...DEFAULT_SETTINGS.fixAgent};
+  return [{paralellPrs: 9}, {parallelPrs: 4, paralellPrs: 9}, {enabled: false, bogus: true}, {...base, extra: 1},
+    {...base, provider: 'grok', enabled: true, Enabled: true}];
+}
 function fixAgentSamples() {
   const base = {...DEFAULT_SETTINGS.fixAgent};
   const out = [null, false, 'off', [], 1, {...base, enabled: true, provider: 'grok'}, {...base, enabled: true}, {...base, enabled: 'true'},
     {...base, provider: 'coding-agent', delivery: 'coding-agent'}, {...base, provider: 'coding-agent', delivery: 'coding-agent', enabled: true},
-    {...base, provider: 'local', delivery: 'chat-push'}, {...base, mode: 'yolo'}, {...base, provider: 'skynet'}];
+    {...base, provider: 'local', delivery: 'chat-push'}, {...base, mode: 'yolo'}, {...base, provider: 'skynet'}, ...unknownNestedSamples()];
   for (const [key, k] of Object.entries(FIX_AGENT_KNOBS)) {
     for (const v of [k.min, k.max, k.min + 1, k.max - 1, k.min - 1, k.max + 1, k.min + 0.5, 90_000, NaN, String(k.min), null]) out.push({...base, [key]: v});
   }
@@ -110,6 +116,14 @@ test('every settings field: the UI accepts exactly the values the server accepts
   }
   assert.deepEqual(mismatches, [], `${mismatches.length} of ${checked} samples disagree`);
   assert.ok(checked > 250, `sampled ${checked} values`);
+});
+
+test('an unknown nested key: the UI and the server BOTH reject it (agreeing is not enough)', async () => {
+  const draft = settingsHarness(STORED).state.settings;
+  for (const value of unknownNestedSamples()) {
+    assert.equal(uiAccepts(draft, 'fixAgent', value), false, `UI rejects fixAgent=${JSON.stringify(value)}`);
+    assert.equal(await serverAccepts('fixAgent', value), false, `server rejects fixAgent=${JSON.stringify(value)}`);
+  }
 });
 
 test('the numeric inputs the screen renders take their domain from settings-rules', () => {

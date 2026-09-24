@@ -663,8 +663,8 @@ function installReviewRunner(name, run) {
       const source = currentRepairSource();
       if (!source) {
         // A fresh/reloaded page can need another identical observation before
-        // source stability is established. Distinguish that from a genuinely
-        // repurposed or regenerated response so cleanup can safely preserve it.
+        // source stability is established. A changed page answers "changed"; neither
+        // answer decides who holds the tab (the release verdict does).
         let submission, bound, currentText = "";
         try {
           submission = state.confirmedSubmission?.record || savedSubmission();

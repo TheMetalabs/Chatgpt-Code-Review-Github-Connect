@@ -213,6 +213,20 @@ describe("heldLocalUnusable / heldLocalEvidence: a released held local reply is 
     assert.equal(heldLocalUnusable(ok, { unparsedText: "  " }), undefined);
   });
 
+  it("a clean gate whose reply also carried text outside the accepted JSON is not", () => {
+    assert.equal(heldLocalUnusable(ok, { residualReplies: "P1 a.ts:1 PROSE\n{}" }), "a completed reply carried text outside its review JSON");
+    assert.equal(heldLocalUnusable(ok, { residualReplies: " " }), undefined);
+  });
+
+  it("evidence keeps a reply that carried text outside its JSON, once when it is also the original", () => {
+    const reply = 'P1 a.ts:1 PROSE-FINDING\n{"findings":[]}';
+    const single = heldLocalEvidence({ findings: [] }, { raw: '{"findings":[]}', originalText: reply, residualReplies: reply });
+    assert.equal(String(single.raw_review).split("PROSE-FINDING").length - 1, 1);
+    // the multi-turn loop has no original text: its group replies are the evidence
+    const loop = heldLocalEvidence({ findings: [] }, { raw: '{"findings":[]}', residualReplies: `Review group (a.ts):\n${reply}` });
+    assert.match(String(loop.raw_review), /Review group \(a\.ts\):\nP1 a\.ts:1 PROSE-FINDING[\s\S]*\n---\n\n\{"findings":\[\]\}$/);
+  });
+
   it("evidence keeps what parsed and attaches every completed reply verbatim", () => {
     const parsed = { findings: [{ title: "partial" }], merge_recommendation: "REQUEST_CHANGES" };
     const out = heldLocalEvidence(parsed, { raw: "{}", originalText: "P1 a.ts:1 FULL-REPLY", unparsedText: "P1 FIRST-REPLY" });

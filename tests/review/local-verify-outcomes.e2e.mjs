@@ -46,6 +46,9 @@ const LOCAL={
   // the finding in prose, then the one JSON correction (which never sees the first reply) parses
   proseThenClean:{answer:answer(LOCAL_RAW,cleanJson)},
   proseThenMinimal:{answer:answer(LOCAL_RAW,minimalJson)},
+  // one completed reply: the finding in prose, then a clean review JSON object the parser accepts
+  proseAndClean:{answer:answer(`${LOCAL_RAW}\n${cleanJson}`)},
+  multiturnProseAndClean:{answer:answer(`${LOCAL_RAW}\n${cleanJson}`),settings:{localReviewMode:'multiturn'}},
   error:{answer:answer(fail500)},
   offline:{offline:true},
   notRun:{settings:{reviewLocal:false}},
@@ -62,6 +65,7 @@ const skipped=requests=>({status:'skipped',requests});
 const chatFindings=posted(SUMMARY,MF,0,{stamp:'none'});
 const chatRaw=posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'none'});
 const RAW_NOTE=/local verification's reply could not be used as a review/;
+const RESIDUAL_NOTE=/could not be used as a review \(a completed reply carried text outside its review JSON\)/;
 
 // [chat, local] → expected. stamp: which release the held local leg got (verify round / fallback / none).
 const CELLS={
@@ -74,6 +78,8 @@ const CELLS={
   'clean x proseThenClean':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:/could not be used as a review \(a completed reply was not review JSON\)/,stamp:'verify'}),
   'clean x proseThenMinimal':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:/could not be used as a review \(empty findings without investigated_safe/,stamp:'verify'}),
   'clean x malformed':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:/could not be used as a review \(1 finding\(s\) missing required fields\)/,stamp:'verify'}),
+  'clean x proseAndClean':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:RESIDUAL_NOTE,stamp:'verify'}),
+  'clean x multiturnProseAndClean':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:RESIDUAL_NOTE,stamp:'verify'}),
   'clean x error':posted(UNVERIFIED,M0U,1,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x offline':posted(UNVERIFIED,M0U,0,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x notRun':posted(CLEAN,M0,0),
@@ -89,6 +95,8 @@ const CELLS={
   'none x malformed':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseThenClean':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseThenMinimal':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x proseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x multiturnProseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x error':skipped(1),
   'none x offline':skipped(0),
   'none x notRun':skipped(0),
@@ -133,6 +141,8 @@ function assertPosted(name,e,{app,job},body){
   if(e.note)assert.match(body,e.note,`${name}: note`);
   else assert.doesNotMatch(body,/local verification/,`${name}: no verification note`);
   if(e.stamp==='verify')assert.ok(job.localVerifyStartedAt&&!job.localFallbackAt,`${name}: verification round stamp`);
+  // local verified only when its reply was a structured verdict: never with raw evidence or no reply
+  if(e.stamp==='verify')assert.equal(job.localVerified,e.marker!==MRU&&e.marker!==M0U,`${name}: localVerified`);
   if(e.stamp==='fallback')assert.ok(job.localFallbackAt&&!job.localVerifyStartedAt,`${name}: fallback stamp`);
   if(e.stamp==='none')assert.ok(!job.localFallbackAt&&!job.localVerifyStartedAt,`${name}: local stayed held`);
   assert.equal(app.reviews.length,1,`${name}: exactly one review`);

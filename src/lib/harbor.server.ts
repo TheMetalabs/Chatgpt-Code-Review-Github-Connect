@@ -356,7 +356,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
   await finishJob(jobId, sample);
 }
 
-export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; repair?: RepairReceipt };
+export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string; repair?: RepairReceipt };
 
 async function reactQuiet(token: string, job: Job, content: GithubReaction) {
   try {
@@ -822,8 +822,8 @@ async function generateLocalLeg(
 }
 
 /** Store the local leg's payload on the job (replacing any earlier one) and mark it collected. */
-function collectLocalLeg(j: Job, raw: string, originalText?: string, unparsedText?: string): Job {
-  const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw, originalText, unparsedText }];
+function collectLocalLeg(j: Job, raw: string, originalText?: string, evidence?: { unparsedText?: string; residualReplies?: string }): Job {
+  const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw, originalText, ...evidence }];
   return { ...j, storedLegs: next, generating: {...j.generating, local: false}, providerProgress: {...j.providerProgress, local: {runId: `local:${j.id}`, stage: "response_collected", observedAt: Date.now(), receivedAt: Date.now()}}, updatedAt: Date.now() };
 }
 
@@ -876,9 +876,10 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
         };
       });
     } else {
-      // Only a released held leg's gate reads unparsedText (as evidence); on race nothing does, and the
-      // history already archived it, so the job does not keep an unbounded copy after it ends.
-      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, heldLocalReleased(j) ? local.unparsedText : undefined)));
+      // Only a released held leg's gate reads unparsedText / residualReplies (as evidence); on race
+      // nothing does, so the job does not keep an unbounded copy after it ends.
+      const evidence = { unparsedText: local.unparsedText, residualReplies: local.residualReplies };
+      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, heldLocalReleased(j) ? evidence : undefined)));
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

@@ -47,7 +47,11 @@ Rules the table encodes:
 - A released held local leg's reply counts as a verdict only when it passes the gate on its own with
   every finding it reported intact (`LiveGateResult.malformed` is 0), and no completed reply was set
   aside to get it: the one JSON correction never sees the first reply, so a clean correction says
-  nothing about the finding that first reply may carry (`unparsedText`). A reply the gate rejects (for
+  nothing about the finding that first reply may carry (`unparsedText`). Nor may any text of the reply
+  itself be set aside: when canonicalizing a completed reply to its review JSON discards substantive
+  text around the object (`extractChatJsonParts`; code-fence markers and whitespace do not count), the
+  reply is kept verbatim (`residualReplies`, one-shot and multi-turn alike) and the object is not a
+  verdict — prose before a clean object can be the finding. A reply the gate rejects (for
   example a `findings` that is not a list, or an empty result without `investigated_safe`) or one
   that lost a finding for its shape is gated as evidence instead (`heldLocalEvidence` in
   `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block. So a

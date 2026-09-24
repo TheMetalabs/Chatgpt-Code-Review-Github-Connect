@@ -1,6 +1,6 @@
 import { bridgePromptText } from "./chat-prompt.ts";
 import type { BotSettings } from "./types.ts";
-import { extractChatJson } from "./extract-chat-json.ts";
+import { extractChatJsonParts } from "./extract-chat-json.ts";
 import { requestLocalJson, requestLocalChat, type LocalChatMessage, type LocalRequestOptions } from "./local-chat-request.server.ts";
 
 function localConfig(settings: BotSettings) {
@@ -77,10 +77,20 @@ export async function pingLocalLlm(
 
 /** One local leg's result. `unparsedText` holds every completed model reply that was not review JSON
  * and is not `originalText` (for example the first reply before the one JSON correction): it may carry
- * the real finding, so a held leg's caller keeps it as evidence (heldLocalSalvage), never drops it. */
+ * the real finding, so a held leg's caller keeps it as evidence (heldLocalSalvage), never drops it.
+ * `residualReplies` holds, verbatim, every completed reply whose review JSON was accepted although
+ * the model also wrote text outside that object (extractChatJsonParts): the accepted JSON does not
+ * carry that text, so a held leg does not count the JSON as a verdict (heldLocalUnusable). */
 export type LocalLegResult =
-  | { ok: true; raw: string; originalText?: string; unparsedText?: string }
+  | { ok: true; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string }
   | { ok: false; error: string; originalText?: string; unparsedText?: string };
+
+/** A completed reply canonicalized to its review JSON, keeping the reply when that discarded text. */
+function acceptedReply(reply: string): { raw: string; residualReplies?: string } | null {
+  const parts = extractChatJsonParts(reply);
+  if (!parts) return null;
+  return parts.residual ? { raw: parts.json, residualReplies: reply } : { raw: parts.json };
+}
 
 export async function runLocalLlm(
   prompt: string,
@@ -107,8 +117,8 @@ export async function runLocalLlm(
       { role: "user", content: prompt },
     ]);
     if (!raw.trim()) return { ok: false, error: "local LLM returned empty" };
-    const firstJson = extractChatJson(raw);
-    if (firstJson) return { ok: true, raw: firstJson, originalText: raw };
+    const firstJson = acceptedReply(raw);
+    if (firstJson) return { ok: true, ...firstJson, originalText: raw };
     first = raw;
 
     // Exactly one semantic retry, and only after an actual completed non-JSON reply. Do NOT echo the
@@ -126,10 +136,10 @@ export async function runLocalLlm(
         content: "Your previous reply was not extractable review JSON. Reply again with ONLY the JSON object (findings/merge_recommendation/keep). No markdown.",
       },
     ]);
-    const corrected = extractChatJson(raw2);
+    const corrected = acceptedReply(raw2);
     // The first reply is kept on both paths: it may carry the real finding the correction (which does
     // not see it) lost, so a held leg posts it as evidence and never counts the correction as a verdict.
-    return corrected ? {ok: true, raw: corrected, originalText: raw2, unparsedText: raw}
+    return corrected ? {ok: true, ...corrected, originalText: raw2, unparsedText: raw}
       : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, unparsedText: raw};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

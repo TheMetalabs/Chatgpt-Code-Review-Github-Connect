@@ -22,6 +22,12 @@ function parseReviewSlice(slice: string): string | null {
  */
 export function lastJsonObject(text: string, accept: (value: unknown) => boolean): string | null {
   const s = String(text || "");
+  const span = lastJsonObjectSpan(s, accept);
+  return span ? s.slice(span.start, span.end) : null;
+}
+
+/** Where lastJsonObject's slice sits in `s`: [start, end). */
+function lastJsonObjectSpan(s: string, accept: (value: unknown) => boolean): { start: number; end: number } | null {
   for (let end = s.lastIndexOf("}"); end >= 0; end = s.lastIndexOf("}", end - 1)) {
     let depth = 0;
     let inStr = false;
@@ -40,7 +46,7 @@ export function lastJsonObject(text: string, accept: (value: unknown) => boolean
         if (depth === 0) {
           const slice = s.slice(i, end + 1);
           try {
-            if (accept(JSON.parse(slice))) return slice;
+            if (accept(JSON.parse(slice))) return { start: i, end: end + 1 };
           } catch {
             /* not valid JSON at this slice; keep walking */
           }
@@ -58,10 +64,20 @@ export function lastReviewJson(text: string): string | null {
 }
 
 export function extractChatJson(text: string): string | null {
+  return extractChatJsonParts(text)?.json ?? null;
+}
+
+/** extractChatJson plus what canonicalizing the reply to that object discards: the text the model
+ * wrote around it, without markdown code-fence markers or surrounding whitespace. Empty when the
+ * reply was only the object (fenced or not); anything else is text the accepted JSON does not carry. */
+export function extractChatJsonParts(text: string): { json: string; residual: string } | null {
   const s = String(text || "");
   if (!s.trim()) return null;
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
-  return lastReviewJson(s);
+  const span = lastJsonObjectSpan(s, isReviewObject);
+  if (!span) return null;
+  const residual = `${s.slice(0, span.start)}\n${s.slice(span.end)}`.replace(/```[\w-]*/g, "").trim();
+  return { json: s.slice(span.start, span.end), residual };
 }
 
 /**

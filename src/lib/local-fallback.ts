@@ -125,14 +125,17 @@ export function heldLocalReleased(
  * undefined when it is one. It must pass the gate on its own with every finding it reported intact:
  * a verifier whose finding the gate dropped for its shape did not agree with a clean chat result. And
  * no completed reply may have been set aside to get it: the JSON correction does not see the first
- * reply, so a clean correction says nothing about the finding that reply may carry. */
+ * reply, so a clean correction says nothing about the finding that reply may carry. Nor may any text
+ * of the reply itself be set aside: prose the model wrote outside the accepted JSON object
+ * (`residualReplies`) can be a finding that object does not carry. */
 export function heldLocalUnusable(
   gate: { ok: true; malformed?: number; rawReview?: string } | { ok: false; reason: string },
-  leg: { unparsedText?: string },
+  leg: { unparsedText?: string; residualReplies?: string },
 ): string | undefined {
   if (!gate.ok) return gate.reason;
   if (gate.rawReview) return undefined; // already salvaged verbatim
   if (leg.unparsedText?.trim()) return "a completed reply was not review JSON";
+  if (leg.residualReplies?.trim()) return "a completed reply carried text outside its review JSON";
   if (gate.malformed) return `${gate.malformed} finding(s) missing required fields`;
   return undefined;
 }
@@ -141,15 +144,16 @@ export function heldLocalUnusable(
  * attached verbatim as raw_review, so it posts as evidence and never counts as a verdict. */
 export function heldLocalEvidence(
   parsed: Record<string, unknown> | null,
-  leg: { raw: string; originalText?: string; unparsedText?: string },
+  leg: { raw: string; originalText?: string; unparsedText?: string; residualReplies?: string },
 ): Record<string, unknown> {
-  const salvaged = JSON.parse(salvageReviewJson(localReplies({ unparsedText: leg.unparsedText, originalText: leg.originalText || leg.raw })));
+  const replies = localReplies({ unparsedText: leg.unparsedText, residualReplies: leg.residualReplies, originalText: leg.originalText || leg.raw });
+  const salvaged = JSON.parse(salvageReviewJson(replies));
   return { ...salvaged, ...(parsed ?? {}), raw_review: salvaged.raw_review };
 }
 
 /** Every completed reply of a local leg, each once, in the order the model wrote them. */
-export function localReplies(leg: { unparsedText?: string; originalText?: string }): string {
-  return [...new Set([leg.unparsedText, leg.originalText].map((t) => t?.trim() ?? "").filter(Boolean))].join("\n\n---\n\n");
+export function localReplies(leg: { unparsedText?: string; residualReplies?: string; originalText?: string }): string {
+  return [...new Set([leg.unparsedText, leg.residualReplies, leg.originalText].map((t) => t?.trim() ?? "").filter(Boolean))].join("\n\n---\n\n");
 }
 
 /** A RELEASED held local leg (verification round or chat-down fallback) that failed after the model

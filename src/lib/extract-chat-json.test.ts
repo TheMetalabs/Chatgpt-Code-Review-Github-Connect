@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractChatJson, htmlChatToText, salvageReviewJson } from "./extract-chat-json.ts";
+import { extractChatJson, extractChatJsonParts, htmlChatToText, salvageReviewJson } from "./extract-chat-json.ts";
 
 const PAYLOAD = `{
 "merge_recommendation": "APPROVE",
@@ -67,6 +67,30 @@ describe("extractChatJson", () => {
     const parsed = JSON.parse(hit);
     assert.equal(parsed.merge_recommendation, "REQUEST_CHANGES");
     assert.ok(Array.isArray(parsed.findings) && parsed.findings.length >= 1);
+  });
+});
+
+describe("extractChatJsonParts: what canonicalizing a reply to its review JSON discards", () => {
+  it("nothing when the reply is only the object, bare or fenced", () => {
+    assert.deepEqual(extractChatJsonParts(PAYLOAD), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(extractChatJsonParts(`  \n\`\`\`json\n${PAYLOAD}\n\`\`\`\n`), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(extractChatJsonParts(`\`\`\`${PAYLOAD}\`\`\``), { json: PAYLOAD, residual: "" });
+  });
+
+  it("the prose around the accepted object, before or after it", () => {
+    const before = extractChatJsonParts(`P1 a.ts:1 PROSE-FINDING: a duplicate request writes twice\n\`\`\`json\n${PAYLOAD}\n\`\`\``);
+    assert.equal(before?.json, PAYLOAD);
+    assert.equal(before?.residual, "P1 a.ts:1 PROSE-FINDING: a duplicate request writes twice");
+    assert.equal(extractChatJsonParts(`${PAYLOAD}\nAlso P1 b.ts:2 AFTER`)?.residual, "Also P1 b.ts:2 AFTER");
+    // an earlier object the extractor did not take is residual text too
+    assert.match(extractChatJsonParts(`{"findings":[{"title":"EARLIER"}]}\n${PAYLOAD}`)?.residual ?? "", /EARLIER/);
+  });
+
+  it("the JSON is exactly what extractChatJson returns; no review object is null", () => {
+    const text = `Thinking { "scratch": true }\n${PAYLOAD}\nDone.`;
+    assert.equal(extractChatJsonParts(text)?.json, extractChatJson(text));
+    assert.equal(extractChatJsonParts('{"foo":1}'), null);
+    assert.equal(extractChatJsonParts("  "), null);
   });
 });
 

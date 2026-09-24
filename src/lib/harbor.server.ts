@@ -31,7 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { stillRacing, shouldStartLocalRace } from "./local-fallback";
+import { localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verifyCleanNote, verifyCleanStep } from "./local-fallback";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
@@ -352,6 +352,7 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   const body = buildOpsComment({
     phase,
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
+    role: job.localReviewRole,
     notes: [`Job: ${job.id}`, ...notes],
   });
   try {
@@ -394,7 +395,21 @@ function localStaleNoteMs(): number {
   return Number.isFinite(n) ? n : 300_000;
 }
 
+// One watcher per job. submitHarborChat restarts it when a verify-clean job returns to awaiting_chat
+// for its local verification round (the watcher may have exited during the brief validator phase).
+const watching = new Set<string>();
+
 async function watchReviewers(jobId: string, token: string) {
+  if (watching.has(jobId)) return;
+  watching.add(jobId);
+  try {
+    await watchReviewersLoop(jobId, token);
+  } finally {
+    watching.delete(jobId);
+  }
+}
+
+async function watchReviewersLoop(jobId: string, token: string) {
   let lastNotes = "";
   let localStarted = false;
   for (;;) {
@@ -409,9 +424,13 @@ async function watchReviewers(jobId: string, token: string) {
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
     const localSkip = (job.assumptions ?? []).find((a) => a.startsWith("Skipped local"));
     const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "";
+    const role = job.localReviewRole;
+    const localReleased = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
     if (
-      shouldStartLocalRace({
+      shouldStartLocalLeg({
+        role,
         providers: job.reviewProviders ?? [],
+        localReleased,
         status: job.status,
         localDone: Boolean(localLeg?.raw.trim() || localSkip),
         localStarted: localStarted || localInFlight.has(jobId),
@@ -422,7 +441,7 @@ async function watchReviewers(jobId: string, token: string) {
     }
     const stored = job.storedLegs ?? [];
     const racing = stillRacing({
-      providers: job.reviewProviders ?? [],
+      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased }),
       payloads: stored.filter((l) => l.raw.trim()).map((l) => l.provider),
       assumptions: job.assumptions,
       localInFlight: localInFlight.has(jobId),
@@ -431,6 +450,21 @@ async function watchReviewers(jobId: string, token: string) {
       claimed,
       connected: bridge.connected,
     });
+    if (
+      job.status === "awaiting_chat" &&
+      releaseLocalAsFallback({
+        role,
+        providers: job.reviewProviders ?? [],
+        localReleased,
+        chatRacing: racing,
+        usableChat: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()),
+      })
+    ) {
+      // Chat is down (quota / disconnected / nothing returned): never lose the review — local runs
+      // as today's fallback, not as a verifier. The next tick starts it (shouldStartLocalLeg).
+      patchJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : { ...j, localFallbackAt: Date.now(), plan: "Chat reviewers returned nothing usable; local runs as the fallback.", updatedAt: Date.now() }));
+      continue;
+    }
     if (job.status === "awaiting_chat" && !racing) {
       const legs = stored.filter((l) => l.raw.trim());
       if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
@@ -462,6 +496,7 @@ async function watchReviewers(jobId: string, token: string) {
       const note = localLegNote(job.providerProgress?.local, Date.now(), localStaleNoteMs());
       if (note) notes.push(note);
     }
+    if (job.localVerifyStartedAt) notes.push("Chat review found nothing; the local LLM is verifying before the review posts.");
     for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);
 
     const phase: OpsPhase = racing ? (chat.length && !bridge.connected && !claimed ? "blocked" : "running") : "running";
@@ -598,18 +633,27 @@ async function playGithub(jobId: string, untrustedBody: string) {
   recordReviewCoverage(jobId, prompt, sample);
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
+  // Pinned once here like reviewProviders: a later settings change never alters a review in flight.
+  const localReviewRole = state.settings.localReviewRole ?? "race";
+  const verifier = localVerifies({ role: localReviewRole, providers });
 
 
   patchJob(jobId, (j) => ({
     ...j,
     status: "awaiting_chat",
-    plan: providers.includes("local")
+    plan: verifier
+      ? `Snapshot loaded. ${chatProviders.join(" + ")} review first; local verifies a clean result.`
+      : providers.includes("local")
       ? `Snapshot loaded. ${[...chatProviders, "local"].join(" + ")} race in parallel. Schema-merge when each finishes.`
       : chatProviders.length > 1
         ? `Snapshot loaded. ${chatProviders.join(" + ")} race in parallel. Schema-merge when each finishes.`
         : `Snapshot loaded. The Chrome bridge will send this to ${chatProviders[0] ?? "chat"} on this machine.`,
     chatPrompt: prompt,
     reviewProviders: providers,
+    localReviewRole,
+    localVerifyStartedAt: undefined,
+    localFallbackAt: undefined,
+    localVerifyNote: undefined,
     reviewOrder: order,
     storedLegs: [],
     updatedAt: Date.now(),
@@ -625,7 +669,8 @@ async function playGithub(jobId: string, untrustedBody: string) {
   if (providers.includes("local")) {
     // The loop reads files from this snapshot; harmless for single-turn mode (unused there).
     localSamples.set(jobId, sample);
-    void kickLocalRace(jobId, prompt);
+    // verify-clean: no local generation now; submitHarborChat starts it only after a clean chat result.
+    if (!verifier) void kickLocalRace(jobId, prompt);
   }
 }
 
@@ -835,6 +880,9 @@ export async function submitHarborChat(
     return { ok: false, error: "not a GitHub job" };
   }
   const providers = job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings);
+  // The role pinned at snapshot (never live settings); an FP round always merges as today.
+  const role = job.chatFpRound ? "race" : job.localReviewRole;
+  const localReleased = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
   const incoming: ChatLeg[] =
     legs && legs.length
       ? legs.filter((l) => providers.includes(l.provider) && l.raw.trim())
@@ -859,7 +907,7 @@ export async function submitHarborChat(
     const haveChat = payloads.some((l) => isChatProvider(l.provider));
     if (
       stillRacing({
-        providers,
+        providers: racingProviders({ role, providers, localReleased }),
         payloads: payloads.map((l) => l.provider),
         assumptions: job.assumptions,
         localInFlight: localInFlight.has(jobId),
@@ -885,7 +933,12 @@ export async function submitHarborChat(
       return { ok: true };
     }
   }
-  const skipped = providers.filter((p) => !payloads.some((l) => l.provider === p) && !(job.chatFpRound && p === "local"));
+  // A verifier local leg that was held back (chat had findings) or whose verification did not
+  // complete is not a "skipped reviewer": the latter is reported by the verify note instead.
+  const verifierLocal = localVerifies({ role, providers }) && !job.localFallbackAt;
+  const skipped = providers.filter(
+    (p) => !payloads.some((l) => l.provider === p) && !(job.chatFpRound && p === "local") && !(verifierLocal && p === "local"),
+  );
 
   let locked = false;
   patchJob(jobId, (j) => {
@@ -943,6 +996,11 @@ export async function submitHarborChat(
     byProvider.set(leg.provider, gate);
   }
 
+  if (!gates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
+    // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
+    releaseHeldLocalLeg(jobId, token, incoming, { localFallbackAt: Date.now(), plan: "Chat reviewers returned no valid JSON; local runs as the fallback." });
+    return { ok: true };
+  }
   if (!gates.length) {
     patchJob(jobId, (j) => ({
       ...j,
@@ -982,6 +1040,27 @@ export async function submitHarborChat(
     : combinedRaw.length > MAX_RAW_REVIEW_BODY
       ? `${combinedRaw.slice(0, MAX_RAW_REVIEW_BODY)}\n\n…(truncated to fit GitHub's review body limit; full original responses retained in review history)`
       : combinedRaw;
+  const step = verifyCleanStep({
+    role,
+    providers,
+    verifyStarted: Boolean(job.localVerifyStartedAt),
+    fallback: Boolean(job.localFallbackAt),
+    findings: merged.findings.length,
+    salvagedRaw: Boolean(rawReview),
+    localPayload: byProvider.has("local"),
+  });
+  if (step === "start-verify") {
+    // Chat parsed clean: hold the post and run local on the same prompt as the verification round.
+    releaseHeldLocalLeg(jobId, token, incoming, {
+      localVerifyStartedAt: Date.now(),
+      plan: `${providers.filter(isChatProvider).join(" + ")} found nothing; local verification round running.`,
+    });
+    return { ok: true };
+  }
+  const localError =
+    (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
+    invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim();
+  const localVerifyNote = verifyCleanNote({ chat: providers.filter(isChatProvider), step, localFindings: merged.findings.length, localError });
   patchJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,
@@ -998,10 +1077,32 @@ export async function submitHarborChat(
     coverage: [...coverageByFile.values()],
     droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
     plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
+    localVerifyNote: localVerifyNote || undefined,
     updatedAt: Date.now(),
   }));
   await finishJob(jobId, sample, token);
   return finishResult(jobId);
+}
+
+/** verify-clean: return a job from validator to awaiting_chat with its chat legs kept, and start its
+ * held-back local leg (verification round or chat-down fallback). The watcher then waits for local. */
+function releaseHeldLocalLeg(jobId: string, token: string, legs: ChatLeg[], release: Pick<Job, "plan"> & Partial<Job>) {
+  let released = false;
+  patchJob(jobId, (j) => {
+    if (j.status !== "validator") return j;
+    released = true;
+    const next = [...(j.storedLegs ?? [])];
+    for (const leg of legs) {
+      const i = next.findIndex((l) => l.provider === leg.provider);
+      if (i >= 0) next[i] = leg;
+      else next.push(leg);
+    }
+    return { ...j, ...release, status: "awaiting_chat", storedLegs: next, updatedAt: Date.now() };
+  });
+  const job = state.jobs.find((j) => j.id === jobId);
+  if (!released || !job) return;
+  void kickLocalRace(jobId, job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "");
+  void watchReviewers(jobId, token);
 }
 
 function finishResult(jobId: string): { ok: true } | { ok: false; error: string } {
@@ -1033,7 +1134,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       updatedAt: Date.now(),
     }));
     if (token) void reactQuiet(token, after, "+1");
-    if (token) void upsertOpsComment(token, jobId, "skipped", ["No findings passed the precision policy. No review posted."]);
+    if (token) void upsertOpsComment(token, jobId, "skipped", [after.localVerifyNote ?? "", "No findings passed the precision policy. No review posted."].filter(Boolean));
     return;
   }
 
@@ -1119,6 +1220,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   }
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
+  if (postedJob.localVerifyNote) notes.unshift(postedJob.localVerifyNote);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
   // Review-loop step (design §5 4–8): gated OFF by default (ASHLAR_FIX_AGENT + fixAgent.provider,
   // and only for /review-loop-triggered reviews). Best-effort — never un-posts the review.

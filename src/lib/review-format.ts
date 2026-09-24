@@ -71,13 +71,20 @@ function neutralizeMarkers(s: string): string {
   return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
 }
 
-export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage" | "rawReview">, findings: Finding[], username: string, unanchored: Finding[] = []): string {
+export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage" | "rawReview"> & Partial<Pick<Job, "localReviewRole" | "localVerifyNote">>, findings: Finding[], username: string, unanchored: Finding[] = []): string {
   const sha = job.headSha.slice(0, 7);
   const n = countBySeverity(findings);
   const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4).map(neutralizeMarkers);
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = providers.includes("local");
+  // verify-clean: say which reviewer produced this result (chat found nothing / local found N).
+  const verifyLine = job.localVerifyNote ? `\n${neutralizeMarkers(job.localVerifyNote)}\n` : "";
+  const localRoleNote = !local
+    ? ""
+    : job.localReviewRole === "verify-clean" && chat.length
+      ? " Local LLM verifies a clean chat result."
+      : " Local LLM is fallback if Chrome does not return.";
   // Neutralize the loop poller's clean-pass sentinel (matching the SAME separator set it accepts,
   // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
   // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
@@ -112,7 +119,7 @@ Not a clean pass — remaining reviewers did not run.`;
     const cov = job.coverage ?? [];
     const clearedCount = cov.filter((c) => c.status === "cleared").length;
     const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
-    return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->`;
+    return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n${verifyLine}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->`;
   }
   const unanchoredBlock = unanchored.length
     ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored
@@ -139,8 +146,8 @@ Here are some automated review suggestions for this pull request.
 | P1 | ${n.P1} |
 | P2 | ${n.P2} |
 
-${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local ? " Local LLM is fallback if Chrome does not return." : ""}
-${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
+${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${localRoleNote}
+${verifyLine}${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
 ${unanchoredBlock}${rawBlock}
 <details>
 <summary>ℹ️ About Ashlar</summary>

@@ -1,4 +1,4 @@
-import type { Job, ReviewProvider, ProviderError } from "./types.ts";
+import type { Job, LocalReviewRole, ReviewProvider, ProviderError } from "./types.ts";
 import { isChatProvider } from "./types.ts";
 
 export function shouldStartLocalRace(input: {
@@ -42,3 +42,93 @@ export function stillRacing(input: {
   }
   return false;
 }
+
+// settings.localReviewRole = "verify-clean" (pinned on the job at snapshot as Job.localReviewRole):
+// the chat reviewers run first, local is held back and is "released" either as a verification round
+// (merged chat result parsed clean) or as today's fallback (chat produced no usable result).
+
+/** Local is a verifier only when the job's role says so AND both a chat reviewer and local are enabled. */
+export function localVerifies(input: { role?: LocalReviewRole; providers: readonly ReviewProvider[] }): boolean {
+  return input.role === "verify-clean" && input.providers.includes("local") && input.providers.some(isChatProvider);
+}
+
+/** The providers the job waits on right now: a held-back local leg counts only once it is released. */
+export function racingProviders(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  localReleased: boolean;
+}): ReviewProvider[] {
+  if (!localVerifies(input) || input.localReleased) return [...input.providers];
+  return input.providers.filter((p) => p !== "local");
+}
+
+/** Race: start local alongside chat (as today). Verify-clean: start it only once it is released. */
+export function shouldStartLocalLeg(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  localReleased: boolean;
+  status: Job["status"];
+  localDone: boolean;
+  localStarted: boolean;
+}): boolean {
+  if (localVerifies(input) && !input.localReleased) return false;
+  return shouldStartLocalRace(input);
+}
+
+/** Chat finished without a usable result (quota / disconnected / no JSON): release local as the fallback. */
+export function releaseLocalAsFallback(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  localReleased: boolean;
+  chatRacing: boolean;
+  usableChat: boolean;
+}): boolean {
+  return localVerifies(input) && !input.localReleased && !input.chatRacing && !input.usableChat;
+}
+
+export type VerifyCleanStep =
+  /** Not a verifier job (race, local-only, chat-only) or local ran as the chat fallback: post as today. */
+  | "post"
+  /** Chat had findings (or a salvaged unparseable reply, which is not clean): post the chat result now. */
+  | "post-chat"
+  /** Chat parsed clean: hold the post and start the local verification round on the same prompt. */
+  | "start-verify"
+  /** Verification returned: post the merged result (local's findings, or the clean review). */
+  | "post-verified"
+  /** Verification failed / was skipped / aborted: post chat's clean result with a visible note. */
+  | "post-chat-unverified";
+
+/** What to do with a merged, gated result. Pure: callers pass the job's pinned role, never live settings. */
+export function verifyCleanStep(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  verifyStarted: boolean;
+  fallback: boolean;
+  findings: number;
+  salvagedRaw: boolean;
+  localPayload: boolean;
+}): VerifyCleanStep {
+  if (!localVerifies(input) || input.fallback) return "post";
+  if (!input.verifyStarted) return input.findings > 0 || input.salvagedRaw ? "post-chat" : "start-verify";
+  return input.localPayload ? "post-verified" : "post-chat-unverified";
+}
+
+/** Review/ops line saying which reviewer produced a verification round's result. */
+export function verifyCleanNote(input: {
+  chat: readonly ReviewProvider[];
+  step: VerifyCleanStep;
+  localFindings: number;
+  localError?: string;
+}): string {
+  const chat = input.chat.join(" + ") || "chat";
+  if (input.step === "post-verified") {
+    return input.localFindings > 0
+      ? `${chat} found nothing; local verification found ${input.localFindings}.`
+      : `${chat} found nothing; local verification agreed.`;
+  }
+  if (input.step === "post-chat-unverified") {
+    return `${chat} found nothing; local verification did not complete (${input.localError || "unavailable"}), so this is ${chat}'s unverified clean result.`;
+  }
+  return "";
+}
+

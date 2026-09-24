@@ -130,6 +130,14 @@ export interface Job {
   providerProgress?: Partial<Record<ReviewProvider, ProviderProgress>>;
   providerErrors?: Partial<Record<ReviewProvider, ProviderError>>;
   reviewProviders?: ReviewProvider[];
+  /** settings.localReviewRole pinned at snapshot; a later settings/env change never alters this job. */
+  localReviewRole?: LocalReviewRole;
+  /** verify-clean: set when the merged chat result was clean and the local verification round began. */
+  localVerifyStartedAt?: number;
+  /** verify-clean: set when the chat reviewers produced no usable result, so local ran as the fallback. */
+  localFallbackAt?: number;
+  /** verify-clean: summary line naming which reviewer produced the posted result (verifyCleanNote). */
+  localVerifyNote?: string;
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
   fpPending?: {
@@ -243,6 +251,8 @@ export interface BotSettings {
   localReviewMaxTokens: number;
   /** "single" = one-shot prompt; "multiturn" = SDK tool loop; "auto" = pick by PR size. */
   localReviewMode: LocalReviewMode;
+  /** "race" = local runs alongside chat; "verify-clean" = local verifies a clean chat result. */
+  localReviewRole: LocalReviewRole;
   /** auto-mode cutoff: a single-turn prompt estimated at or below this many tokens stays single-turn. */
   localReviewSingleTurnMaxTokens: number;
   reviewOrder: ReviewProvider[];
@@ -328,6 +338,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localLlmModel: "",
   localReviewMaxTokens: 32_768,
   localReviewMode: "auto",
+  localReviewRole: "race",
   localReviewSingleTurnMaxTokens: 30_000,
   reviewOrder: ["local", "chatgpt", "grok"],
   promptDiffMaxChars: 300_000,
@@ -388,7 +399,15 @@ export function chatProvidersOf(providers: readonly ReviewProvider[]): Array<"ch
   return providers.filter(isChatProvider);
 }
 
-export function describeEnabledReviewers(providers: readonly ReviewProvider[]): string {
+/**
+ * `race` (default): local runs in parallel with the chat reviewers. `verify-clean`: local runs only
+ * after the merged chat result is clean, as a verification round (settings.localReviewRole, env ASHLAR_LOCAL_REVIEW_ROLE).
+ */
+export type LocalReviewRole = "race" | "verify-clean";
+
+export const LOCAL_REVIEW_ROLES: LocalReviewRole[] = ["race", "verify-clean"];
+
+export function describeEnabledReviewers(providers: readonly ReviewProvider[], role?: LocalReviewRole): string {
   const chat = chatProvidersOf(providers as ReviewProvider[]);
   const local = providers.includes("local");
   const chatBit = !chat.length
@@ -396,7 +415,7 @@ export function describeEnabledReviewers(providers: readonly ReviewProvider[]): 
     : chat.length === 1
       ? `${chat[0]} (Chrome)`
       : `${chat.join(" + ")} in parallel (Chrome)`;
-  const localBit = !local ? "" : chat.length ? "local racing" : "local only";
+  const localBit = !local ? "" : !chat.length ? "local only" : role === "verify-clean" ? "local verifies a clean result" : "local racing";
   return [chatBit, localBit].filter(Boolean).join("; ") || "none configured";
 }
 

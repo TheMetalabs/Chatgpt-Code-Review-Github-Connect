@@ -76,6 +76,7 @@ export const Route = createFileRoute("/api/harbor")({
           reviewGrok?: boolean;
           reviewLocal?: boolean;
           localJsonRepairEnabled?: boolean;
+          localReviewRole?: string;
           localLlmBaseUrl?: string;
           localLlmApiKey?: string;
           localLlmModel?: string;
@@ -134,6 +135,7 @@ export const Route = createFileRoute("/api/harbor")({
           if (typeof body.reviewGrok === "boolean") patch.reviewGrok = body.reviewGrok;
           if (typeof body.reviewLocal === "boolean") patch.reviewLocal = body.reviewLocal;
           if (typeof body.localJsonRepairEnabled === "boolean") patch.localJsonRepairEnabled = body.localJsonRepairEnabled;
+          if (body.localReviewRole === "race" || body.localReviewRole === "verify-clean") patch.localReviewRole = body.localReviewRole;
           if (typeof body.localLlmBaseUrl === "string") patch.localLlmBaseUrl = body.localLlmBaseUrl.trim();
           if (typeof body.localLlmModel === "string") patch.localLlmModel = body.localLlmModel.trim();
           const localKey = keepSecret(body.localLlmApiKey);

@@ -71,6 +71,7 @@ export function Settings() {
     saved.reviewChatgpt,
     saved.reviewGrok,
     saved.reviewLocal,
+    saved.localReviewRole,
     saved.localJsonRepairEnabled,
     saved.localLlmBaseUrl,
     saved.localLlmModel,
@@ -185,6 +186,17 @@ export function Settings() {
           <Toggle label="review_grok" checked={draft.reviewGrok} onChange={(v) => toggle("reviewGrok", v)} />
           <Toggle label="review_local" checked={draft.reviewLocal} onChange={(v) => toggle("reviewLocal", v)} />
         </div>
+        <Field label="local_review_role">
+          <Toggle
+            label="local verifies a clean chat result"
+            checked={draft.localReviewRole === "verify-clean"}
+            onChange={(v) => patch({ localReviewRole: v ? "verify-clean" : "race" })}
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            Run chat reviewers first; when they find nothing, the local LLM runs a final verification round.
+            Off (default): local races the chat reviewers. If chat fails, local still runs as the fallback.
+          </p>
+        </Field>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="chatgpt_reasoning">
             <select
@@ -387,6 +399,7 @@ review:
   chatgpt: ${draft.reviewChatgpt}
   grok: ${draft.reviewGrok}
   local: ${draft.reviewLocal}
+  local_role: ${draft.localReviewRole}
   chatgpt_reasoning: ${draft.chatgptReasoning}
   grok_reasoning: ${draft.grokReasoning}
   order: [${order.join(", ")}]

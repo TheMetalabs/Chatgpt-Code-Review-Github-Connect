@@ -43,12 +43,17 @@ export interface LoopEvent {
   actor?: string; // start / stop author
   /** converged: the reviewed commit; continue / push: the head the loop moved to. */
   head?: string;
+  /** The issue comment's id (monotonic): a start record's id identifies its session exactly. */
+  seq?: number;
 }
 
 export interface LoopSession {
   active: boolean;
   /** Anchor: the first start after the last terminal event (the round window starts here). */
   startIso?: string;
+  /** The anchor start record's comment id: the session's own control comments come after it
+   * (id > startSeq) — exact where a second-resolution timestamp ties with the last session. */
+  startSeq?: number;
   /** The latest start's mode within the active session. */
   mode?: ReviewLoopMode;
   /** The latest start's author — the subject of the apply write-permission gate. */
@@ -81,7 +86,7 @@ export function deriveLoopSession(events: readonly LoopEvent[], opts: { liveHead
       if (!s.active) awaited = undefined;
       s = s.active
         ? { ...s, mode: e.mode ?? s.mode, starter: e.actor ?? s.starter }
-        : { active: true, startIso: e.at, mode: e.mode ?? "suggest", starter: e.actor };
+        : { active: true, startIso: e.at, ...(e.seq !== undefined ? { startSeq: e.seq } : {}), mode: e.mode ?? "suggest", starter: e.actor };
       resumable = undefined;
     } else if (e.kind === "continue" || e.kind === "push") {
       if (s.active) awaited = e.head ?? awaited;

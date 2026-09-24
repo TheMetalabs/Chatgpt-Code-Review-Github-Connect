@@ -1329,7 +1329,9 @@ export function fireHarbor(opts: HarborFireOpts): HarborFireResult {
  * posted once. Fire-and-forget; a redelivered webhook never repeats the side effect.
  */
 function recordLoopStart(token: string, job: Job): void {
-  if (job.thread?.loop?.kind !== "start") return;
+  // Same gate as applyLoopControl: with the fix agent off, a start is never recorded (a record
+  // written now would become a live session anchor once the agent is enabled).
+  if (!loopEnabled(state.settings) || job.thread?.loop?.kind !== "start") return;
   const start = { owner: job.owner, repo: job.repo, pr: job.pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) };
   void startLoop(token, start, state.settings).then(
     (r) => {

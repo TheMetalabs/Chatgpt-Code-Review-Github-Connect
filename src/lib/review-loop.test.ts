@@ -12,6 +12,7 @@ import {
   isoMs,
   isZeroFindings,
   parseFindingsTotal,
+  parseStopRecord,
   ESCALATE_DIRECTIVE,
   REVIEW_LOOP_ESCALATE_HUMAN,
   REVIEW_LOOP_STOPPED_HUMAN,
@@ -512,5 +513,37 @@ describe("sanitizeUntrusted: every untrusted field in a bot comment", () => {
     assert.ok(!body.includes("@org/team") || body.includes("@\u200borg/team"), "team mention defanged");
     assert.ok(!/Detail:[^\n]*<!--/.test(body), "marker in the detail neutralized");
     assert.equal(parseEscalateMarker(body, BOT)?.reason, "fix-declined");
+  });
+});
+
+describe("stop record (STOPPED acknowledgement that records the stop)", () => {
+  it("keeps the fixed STOPPED literal first and records who stopped the loop and when", () => {
+    const body = stoppedComment({ by: "bob", at: "2026-01-02T00:00:00Z" });
+    assert.ok(body.startsWith(STOPPED_MARKER));
+    assert.equal(isStoppedComment(body, BOT), true);
+    assert.deepEqual(parseStopRecord(body, BOT), { at: "2026-01-02T00:00:00Z", by: "bob" });
+    assert.equal(parseStopRecord(body, USER), null, "a human copy is not a record");
+    assert.equal(parseStopRecord(stoppedComment(), BOT), null, "a bare acknowledgement records nothing");
+    assert.equal(parseStopRecord(`quoted ${body}`, BOT), null, "anchored");
+    assert.throws(() => stoppedComment({ by: "not a login", at: "2026-01-02T00:00:00Z" }));
+  });
+});
+
+describe("classifyStuck: the fix-round budget is a hard N+1 bound for every trend", () => {
+  const R2 = (index: number, findings: number, f: string[] = []): RoundSummary => ({ index, findings, files: f, head: `h${index}` });
+  const trends: Record<string, number[]> = {
+    decreasing: [9, 7, 5, 3, 2, 1],
+    plateau: [4, 4, 4, 4, 4, 4],
+    rebound: [5, 2, 6, 3, 7, 4],
+  };
+  for (const [name, counts] of Object.entries(trends)) {
+    it(`${name}: exactly roundCap reviews is never round-cap; roundCap+1 with findings always is`, () => {
+      const rounds = counts.map((n, i) => R2(i + 1, n));
+      assert.notEqual(classifyStuck(rounds.slice(0, 5), { roundCap: 5 }), "round-cap");
+      assert.equal(classifyStuck(rounds, { roundCap: 5 }), "round-cap");
+    });
+  }
+  it("a clean verification review is never round-cap (CONVERGED)", () => {
+    assert.equal(classifyStuck([9, 7, 5, 3, 2, 0].map((n, i) => R2(i + 1, n)), { roundCap: 5 }), null);
   });
 });

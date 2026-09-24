@@ -723,13 +723,15 @@ export async function listIssueComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; body: string; createdAt: string; updatedAt: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; body?: string | null; created_at?: string; updated_at?: string }>(
+): Promise<Array<{ id: number; userLogin: string; body: string; createdAt: string; updatedAt: string }>> {
+  const rows = await ghListAll<{ id?: number; user?: { login?: string }; body?: string | null; created_at?: string; updated_at?: string }>(
     token,
     `/repos/${owner}/${repo}/issues/${pr}/comments`,
   );
   // updatedAt tells an edited comment apart: its current text cannot be placed at its creation.
+  // id orders comments exactly (monotonic), where second-resolution timestamps tie.
   return rows.map((c) => ({
+    id: Number(c.id ?? 0),
     userLogin: String(c.user?.login ?? ""),
     body: String(c.body ?? ""),
     createdAt: String(c.created_at ?? ""),

@@ -28,6 +28,7 @@ import {
   parseFindingsTotal,
   parseReviewLoopDirective,
   parseStartMarker,
+  parseStopRecord,
   type EscalateReason,
   type RoundSummary,
 } from "./review-loop.ts";
@@ -55,7 +56,7 @@ export interface ReviewLoopGithub {
     owner: string,
     repo: string,
     pr: number,
-  ): Promise<Array<{ userLogin: string; body: string; createdAt?: string; updatedAt?: string }>>;
+  ): Promise<Array<{ id?: number; userLogin: string; body: string; createdAt?: string; updatedAt?: string }>>;
   createIssueComment(
     token: string,
     opts: { owner: string; repo: string; pr: number; body: string },
@@ -69,12 +70,22 @@ function isBot(login: string, botLogin: string): boolean {
   return isSelfLogin(login, botLogin);
 }
 
-/** In-session test for a history row: compared as instants (isoMs). With a session anchor, a row
- * whose timestamp is missing or unparseable cannot be proven in-session and is excluded. */
+/** In-session test for a REVIEW row (a round): strictly after the anchor, compared as instants.
+ * The anchor is the start directive's time and a review it requested lands minutes later; a
+ * review in the anchor's own second belongs to what came before. A row whose timestamp is missing
+ * or unparseable cannot be proven in-session and is excluded. */
 function inSession(at: string | null | undefined, sinceMs: number): boolean {
   if (Number.isNaN(sinceMs)) return true; // no anchor: the whole history
   const t = isoMs(at);
-  return !Number.isNaN(t) && t >= sinceMs;
+  return !Number.isNaN(t) && t > sinceMs;
+}
+
+/** In-session test for one of the session's own CONTROL comments (handoff, continuation): posted
+ * after the session's start record — by comment id when known (exact; timestamps tie within a
+ * second, e.g. the last session's handoff and this session's start), else strictly by time. */
+export function controlInSession(c: { id?: number; createdAt?: string }, since: { iso?: string; seq?: number }): boolean {
+  if (since.seq !== undefined && c.id) return c.id > since.seq;
+  return inSession(c.createdAt, isoMs(since.iso));
 }
 
 /**
@@ -144,31 +155,40 @@ async function alreadyEscalated(
   head: string,
   botLogin: string,
   sinceIso?: string,
+  sinceSeq?: number,
 ): Promise<boolean> {
   const issues = await gh.listIssueComments(token, owner, repo, pr);
-  const sinceMs = isoMs(sinceIso);
   for (const c of issues) {
-    if (!inSession(c.createdAt, sinceMs)) continue;
+    if (!controlInSession(c, { iso: sinceIso, seq: sinceSeq })) continue;
     const parsed = parseEscalateMarker(c.body, { authoredByBot: isBot(c.userLogin, botLogin) });
     if (parsed && parsed.head === head) return true; // full-SHA equality
   }
   return false;
 }
 
-// Handoffs THIS process posted (key includes the session anchor), consulted ONLY when the GitHub
-// history cannot be read: a sequential redelivery for the same head and session is then a no-op.
-// Bounded and pruned by age. Cross-process dedup stays a documented NON-GOAL (single instance).
-const postedHandoffs = new Map<string, number>();
-const POSTED_HANDOFF_TTL_MS = 24 * 60 * 60_000;
-const POSTED_HANDOFF_MAX = 500;
+// Control comments THIS process posted (handoffs, continuations, start / stop records), kept per
+// GitHub client — production memoizes one client; each test's fake is its own — and consulted
+// TOGETHER with the listed history: a just-posted comment may not be listed yet (read-after-write
+// lag), and an unreadable history must not duplicate one either. Bounded and pruned by age.
+// Cross-process dedup stays a documented NON-GOAL (single harbor instance).
+const postedByClient = new WeakMap<object, Map<string, number>>();
+const POSTED_TTL_MS = 24 * 60 * 60_000;
+const POSTED_MAX = 500;
 
-function rememberHandoff(key: string, now: number): void {
-  postedHandoffs.set(key, now);
-  if (postedHandoffs.size <= POSTED_HANDOFF_MAX) return;
-  for (const [k, at] of postedHandoffs) {
-    if (now - at > POSTED_HANDOFF_TTL_MS || postedHandoffs.size > POSTED_HANDOFF_MAX) postedHandoffs.delete(k);
-    else break;
+export function rememberPosted(client: object, key: string, now: number = Date.now()): void {
+  const posted = postedByClient.get(client) ?? new Map<string, number>();
+  postedByClient.set(client, posted);
+  posted.delete(key); // re-insert: keeps the map in age order for pruning
+  posted.set(key, now);
+  for (const [k, at] of posted) {
+    if (posted.size <= POSTED_MAX && now - at <= POSTED_TTL_MS) break;
+    posted.delete(k);
   }
+}
+
+export function postedRecently(client: object, key: string, now: number = Date.now()): boolean {
+  const at = postedByClient.get(client)?.get(key);
+  return at !== undefined && now - at <= POSTED_TTL_MS;
 }
 
 export interface EscalateResult {
@@ -209,6 +229,8 @@ export async function maybeEscalate(
     diffLines?: number;
     botLogin?: string;
     sinceIso?: string;
+    /** The session's start-record comment id (exact handoff scoping; see controlInSession). */
+    sinceSeq?: number;
     /** Fail closed (error CURRENT_ROUND_MISSING) unless the reviewed head IS the latest round —
      * including a history with ZERO attributable rounds, which then can never "pass" the budget.
      * The loop runtime always sets it; a lenient caller only classifies a history it can see and
@@ -230,7 +252,7 @@ export async function maybeEscalate(
 async function maybeEscalateInner(
   gh: ReviewLoopGithub,
   token: string,
-  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number; sinceIso?: string; requireCurrentRound?: boolean },
+  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number; sinceIso?: string; sinceSeq?: number; requireCurrentRound?: boolean },
   botLogin: string,
 ): Promise<EscalateResult> {
   // Fail closed on an incomplete/failed history read: never classify or (dup-)post from
@@ -248,7 +270,7 @@ async function maybeEscalateInner(
     }
     const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
     if (!reasonPeek) return { escalated: false, rounds };
-    escalatedBefore = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso);
+    escalatedBefore = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq);
   } catch (e) {
     return { escalated: false, rounds: [], error: (e as Error)?.message ?? String(e) };
   }
@@ -294,22 +316,24 @@ export async function escalateNow(
     botLogin?: string;
     /** Session anchor: only handoffs posted in this session count for idempotency. */
     sinceIso?: string;
+    /** The session's start-record comment id (exact handoff scoping; see controlInSession). */
+    sinceSeq?: number;
   },
 ): Promise<{ escalated: boolean; error?: string }> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
-  const sessionKey = `${key}#${opts.sinceIso ?? ""}`;
+  const sessionKey = `handoff:${key}#${opts.sinceSeq ?? opts.sinceIso ?? ""}`;
   if (inFlightEscalate.has(key)) return { escalated: false, error: ESCALATE_IN_FLIGHT };
   inFlightEscalate.add(key);
   try {
     let before = false;
     try {
-      before = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso);
+      before = (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) || postedRecently(gh, sessionKey);
     } catch {
       // Unreadable history: fall back to what THIS process posted for this head + session (a
       // sequential redelivery is then a no-op); otherwise post rather than end the loop without
-      // its signal. The GitHub marker scan stays the source of truth whenever it is readable.
-      before = postedHandoffs.has(sessionKey);
+      // its signal.
+      before = postedRecently(gh, sessionKey);
     }
     if (before) return { escalated: false };
     const body = escalateFromRounds(opts.reason, opts.rounds, {
@@ -321,7 +345,7 @@ export async function escalateNow(
       detail: opts.detail,
     });
     await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
-    rememberHandoff(sessionKey, Date.now());
+    rememberPosted(gh, sessionKey);
     return { escalated: true };
   } catch (e) {
     return { escalated: false, error: (e as Error)?.message ?? String(e) };
@@ -357,7 +381,8 @@ function pushStop(events: LoopEvent[], c: { body?: string; createdAt?: string; u
  *   comment body, the PR body — is never replayed as a start: an edit cannot plant a backdated one.
  * - A human contributes STOP directives from UNEDITED issue and inline comments (at creation).
  *   An edited stop, and a stop added to the PR body, reach the loop through the webhook at their
- *   edit time; the App's STOPPED marker then makes them durable.
+ *   edit time; the App's STOPPED acknowledgement RECORDS them (review-loop.ts stoppedComment),
+ *   placed at the stop's own time — never at the acknowledgement's.
  * - ONLY the App contributes escalate / stopped markers, its canonical continuation for THIS PR
  *   (the head the loop moved to), and converged (total=0) reviews with their commit.
  * Reads fail closed: a list error throws (the caller must not act on a partial history).
@@ -382,9 +407,13 @@ export async function readLoopEvents(
     if (isSelfLogin(c.userLogin, botLogin)) {
       const bot = { authoredByBot: true };
       const start = parseStartMarker(c.body, bot);
+      const stopRecord = parseStopRecord(c.body, bot);
       const cont = canonicalContinuation(c.body, bot);
-      if (start) events.push({ at: start.at, kind: "start", mode: start.mode, actor: start.by });
+      if (start) events.push({ at: start.at, kind: "start", mode: start.mode, actor: start.by, ...(c.id ? { seq: c.id } : {}) });
       else if (parseEscalateMarker(c.body, bot)) events.push({ at: c.createdAt, kind: "escalate" });
+      // A recorded stop is placed at the stop's own time (an edit or a PR-body stop the fold
+      // cannot replay); a bare legacy acknowledgement is an event at its own creation.
+      else if (stopRecord) events.push({ at: stopRecord.at, kind: "stop", actor: stopRecord.by });
       else if (isStoppedComment(c.body, bot)) events.push({ at: c.createdAt, kind: "stopped" });
       else if (cont && cont.pr === pr) events.push({ at: c.createdAt, kind: "continue", head: cont.head });
     } else {

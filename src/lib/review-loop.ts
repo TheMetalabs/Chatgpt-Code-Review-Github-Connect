@@ -217,8 +217,34 @@ export function escalateComment(s: EscalateState): string {
 }
 
 /** STOPPED handoff — operator-requested stop. Fixed marker + immutable sentence. */
-export function stoppedComment(): string {
-  return `${STOPPED_MARKER}\n\n${REVIEW_LOOP_STOPPED_HUMAN}`;
+/** The STOPPED acknowledgement. It keeps the fixed STOPPED marker as its FIRST line (external
+ * detectors match that literal) and, on a second line, records the stop itself — who stopped the
+ * loop and WHEN (the stop's own event time, not this comment's) — so the stop is durable and
+ * placed correctly even when it arrived as an edit that the session fold cannot replay. */
+export function stoppedComment(stop?: LoopStop): string {
+  if (!stop) return `${STOPPED_MARKER}\n\n${REVIEW_LOOP_STOPPED_HUMAN}`;
+  if (!LOGIN_RE.test(stop.by) || !ISO_UTC_RE.test(stop.at) || Number.isNaN(Date.parse(stop.at))) {
+    throw new Error(`invalid loop stop (by=${stop.by} at=${stop.at})`);
+  }
+  return `${STOPPED_MARKER}\n<!-- ashlar-loop-stop at=${stop.at} by=${stop.by} -->\n\n${REVIEW_LOOP_STOPPED_HUMAN} (stop by ${stop.by}).`;
+}
+
+export interface LoopStop {
+  by: string; // the human who stopped the loop
+  at: string; // the stop's own event time (ISO-8601 UTC)
+}
+
+const STOP_RECORD_RE =
+  /^\s*<!--\s*ashlar-loop-stopped\s*-->[ \t]*\r?\n[ \t]*<!--\s*ashlar-loop-stop\s+at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)\s+by=([A-Za-z0-9-]{1,39})\s*-->/;
+
+/** The stop recorded in a STOPPED acknowledgement the caller has proven the App authored (anchored:
+ * the STOPPED marker opens the comment, the record is the very next line). Null otherwise —
+ * including a bare legacy acknowledgement without a record. */
+export function parseStopRecord(body: string | null | undefined, source: CommentSource): LoopStop | null {
+  if (!source.authoredByBot) return null;
+  const m = STOP_RECORD_RE.exec(body || "");
+  if (!m || !LOGIN_RE.test(m[2]) || Number.isNaN(Date.parse(m[1]))) return null;
+  return { at: m[1], by: m[2] };
 }
 
 // ── Self identity + loop continuation (§2 invariant: the bot never commands itself) ──

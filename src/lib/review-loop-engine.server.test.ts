@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  controlInSession,
   CURRENT_ROUND_MISSING,
   escalateNow,
   maybeEscalate,
@@ -9,7 +10,7 @@ import {
   reconstructRounds,
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
-import { continueComment, startComment } from "./review-loop.ts";
+import { continueComment, startComment, stoppedComment } from "./review-loop.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 
@@ -463,5 +464,65 @@ describe("round-3: instants, not strings; the trailing findings marker only", ()
     const events = await readLoopEvents(gh, "t", "o", "r", 1);
     assert.equal(events.some((e) => e.kind === "converged"), false);
     assert.equal((await readLoopSession(gh, "t", "o", "r", 1)).active, true);
+  });
+});
+
+describe("round-5: exact session scoping and read-after-write lag", () => {
+  const H = "a".repeat(40);
+  const T = "2026-01-01T12:00:00Z";
+  const escalateMarker = `<!-- ashlar-loop-escalate reason=fix-failed round=1 pr=1 head=${H} -->`;
+  const client = (issues: Array<{ id: number; userLogin: string; body: string; createdAt: string }>) => {
+    const posted: string[] = [];
+    const gh = {
+      async listIssueComments() { return issues; },
+      async listReviewComments() { return []; },
+      async listPullReviews() { return []; },
+      async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 999 }; },
+    };
+    return { gh, posted };
+  };
+
+  it("an old handoff in the SAME second as a new session's start never silences the new session", async () => {
+    const { gh, posted } = client([
+      { id: 10, userLogin: BOT, body: escalateMarker, createdAt: T }, // session A's handoff
+      { id: 11, userLogin: BOT, body: startComment({ mode: "apply", by: "alice", at: T }), createdAt: T }, // session B's start record
+    ]);
+    const session = await readLoopSession(gh as never, "t", "o", "r", 1);
+    assert.equal(session.active, true);
+    assert.equal(session.startSeq, 11);
+    const r = await escalateNow(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed", rounds: [], roundCap: 5, sinceIso: session.startIso, sinceSeq: session.startSeq });
+    assert.equal(r.escalated, true, "B gets its own handoff");
+    assert.equal(posted.length, 1);
+  });
+
+  it("a review in the start's own second belongs to what came before (rounds are strictly later)", async () => {
+    const { gh } = fakeGh([{ head: H, findings: 3, files: ["x.ts"], at: T }]);
+    assert.equal((await reconstructRounds(gh, "t", "o", "r", 1, { sinceIso: T })).length, 0);
+    assert.equal((await reconstructRounds(gh, "t", "o", "r", 1, { sinceIso: "2026-01-01T11:59:59Z" })).length, 1);
+  });
+
+  it("controlInSession uses comment ids when both are known, else strictly later time", () => {
+    assert.equal(controlInSession({ id: 12, createdAt: T }, { iso: T, seq: 11 }), true);
+    assert.equal(controlInSession({ id: 10, createdAt: T }, { iso: T, seq: 11 }), false);
+    assert.equal(controlInSession({ createdAt: "2026-01-01T12:00:01Z" }, { iso: T }), true);
+    assert.equal(controlInSession({ createdAt: T }, { iso: T }), false);
+  });
+
+  it("a just-posted handoff counts while a readable list still omits it (no duplicate)", async () => {
+    const { gh, posted } = client([]); // the list never shows what was posted
+    const opts = { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed" as const, rounds: [], roundCap: 5, sinceIso: T, sinceSeq: 11 };
+    assert.equal((await escalateNow(gh as never, "t", opts)).escalated, true);
+    assert.equal((await escalateNow(gh as never, "t", opts)).escalated, false);
+    assert.equal(posted.length, 1);
+  });
+
+  it("a recorded stop ends the session at the STOP's time, not at its acknowledgement's", async () => {
+    const { gh } = client([
+      { id: 1, userLogin: BOT, body: startComment({ mode: "apply", by: "alice", at: "2026-01-01T00:00:00Z" }), createdAt: "2026-01-01T00:00:00Z" },
+      { id: 2, userLogin: BOT, body: startComment({ mode: "apply", by: "carol", at: "2026-01-03T00:00:00Z" }), createdAt: "2026-01-03T00:00:00Z" },
+      { id: 3, userLogin: BOT, body: stoppedComment({ by: "bob", at: "2026-01-02T00:00:00Z" }), createdAt: "2026-01-04T00:00:00Z" }, // late ack
+    ]);
+    const s1 = await readLoopSession(gh as never, "t", "o", "r", 1);
+    assert.deepEqual({ active: s1.active, startIso: s1.startIso, starter: s1.starter, startSeq: s1.startSeq }, { active: true, startIso: "2026-01-03T00:00:00Z", starter: "carol", startSeq: 2 });
   });
 });

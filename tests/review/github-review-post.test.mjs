@@ -170,3 +170,42 @@ for (const [name, write] of Object.entries(writes)) {
     await assert.rejects(write(replyApi(truncated(201))), (err) => err.cause?.name === 'SyntaxError', 'the parse error is kept as the cause');
   });
 }
+
+// job.githubError is formatGithubError(err): a transport failure's text is already in the message,
+// so the kept cause must not repeat it (the loop-OFF posting path shows this on /jobs and the dlq).
+// One Error realm for both modules, as in production, so formatGithubError walks the cause chain.
+function oneRealmApi(transport) {
+  return loadTs('src/lib/github.server.ts', {
+    Error,
+    ...loadTs('src/lib/github-transport.ts', { TLSSocket, Error }),
+    ...loadTs('src/lib/review-diff.ts'),
+    dnsLookup: async () => ({ address: '127.0.0.1', family: 4 }),
+    https: { request(_options, callback) {
+      const request = new EventEmitter();
+      request.setTimeout = () => request;
+      request.write = () => {};
+      request.destroy = (e) => request.emit('error', e);
+      request.end = () => queueMicrotask(() => transport(request, callback));
+      return request;
+    } },
+  });
+}
+const refusedWithCode = (req) => req.emit('error', Object.assign(new Error('connect ECONNREFUSED 140.82.112.6:443'), { code: 'ECONNREFUSED' }));
+
+for (const [name, write] of Object.entries(writes)) {
+  test(`${name}: a transport failure's text appears once in formatGithubError`, async () => {
+    for (const [transport, text] of [[refusedWithCode, 'connect ECONNREFUSED 140.82.112.6:443 · ECONNREFUSED'], [lostAfterSend, 'GitHub API timeout']]) {
+      const api = oneRealmApi(transport);
+      const err = await write(api).then(() => assert.fail('the write must fail'), (e) => e);
+      assert.equal(err.cause?.name, 'GithubTransportError', 'the transport error stays the cause');
+      const shown = api.formatGithubError(err);
+      assert.equal(shown.split(text).length - 1, 1, `the transport failure is reported once: ${shown}`);
+      assert.equal(shown, err.message);
+    }
+    // a cause the message does not quote (the malformed body's parse error) is still shown
+    const api = oneRealmApi(truncated(201));
+    const err = await write(api).then(() => assert.fail('the write must fail'), (e) => e);
+    const shown = api.formatGithubError(err);
+    assert.ok(shown.startsWith(`${err.message} · `) && shown.includes(err.cause.message), shown);
+  });
+}

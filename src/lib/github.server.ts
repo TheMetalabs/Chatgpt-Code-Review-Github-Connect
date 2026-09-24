@@ -79,8 +79,9 @@ export function formatGithubError(e: unknown): string {
   if (!(e instanceof Error)) return String(e).slice(0, 240);
   const parts = [e.message];
   const cause = (e as Error & { cause?: unknown }).cause;
+  // a wrapper that already quotes its cause (a write's transport failure) must not show it twice
   if (cause instanceof Error) {
-    parts.push(cause.message);
+    if (!e.message.includes(cause.message)) parts.push(cause.message);
     const code = (cause as NodeJS.ErrnoException).code;
     if (code) parts.push(String(code));
   } else if (cause) {

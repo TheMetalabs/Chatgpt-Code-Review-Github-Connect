@@ -106,6 +106,23 @@ export interface PostedLoopReview {
   published?: string[];
 }
 
+/** What the loop may act on once the review is posted. When GitHub refused an inline anchor the
+ * review went out with NO inline comment (createPullReview's fallback): those findings appear
+ * nowhere on the PR, so they are neither published (never fixed) nor threaded (no reply). */
+export function loopPostedReview(o: {
+  githubId?: number;
+  comments: ReadonlyArray<{ findingId: string; file: string; body: string }>;
+  inline: ReadonlyArray<Pick<Finding, "id">>;
+  unanchored: ReadonlyArray<Pick<Finding, "id">>;
+  inlineDropped: boolean;
+}): PostedLoopReview {
+  return {
+    githubId: o.githubId,
+    comments: o.inlineDropped ? [] : o.comments.map((c) => ({ findingId: c.findingId, file: c.file, body: c.body })),
+    published: [...(o.inlineDropped ? [] : o.inline), ...o.unanchored].map((f) => f.id),
+  };
+}
+
 export interface LoopRuntimeDeps {
   gh: LoopRuntimeGithub;
   requestFix: RequestFix;

@@ -12,6 +12,7 @@ import {
   continueLoopOnPush,
   effectiveLoopMode,
   loopEnabled,
+  loopPostedReview,
   renderFindings,
   runPostReviewLoop,
   SILENT_REASONS,
@@ -1399,6 +1400,17 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     assert.equal(g.replies.length, 0);
     const report = g.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
     assert.match(report, /Thread replies: 0 posted, 2 failed\./);
+  });
+
+  it("inline findings GitHub refused to anchor are neither published nor threaded", () => {
+    const comments = [{ findingId: "f1", file: "src/a.ts", body: "BODY-A", line: 3 }];
+    const base = { githubId: 5, comments, inline: [{ id: "f1" }], unanchored: [{ id: "f2" }] };
+    assert.deepEqual(loopPostedReview({ ...base, inlineDropped: false }), {
+      githubId: 5,
+      comments: [{ findingId: "f1", file: "src/a.ts", body: "BODY-A" }],
+      published: ["f1", "f2"],
+    });
+    assert.deepEqual(loopPostedReview({ ...base, inlineDropped: true }), { githubId: 5, comments: [], published: ["f2"] });
   });
 
   it("the fix acts only on PUBLISHED findings (policy-withheld ones never reach the agent)", async () => {

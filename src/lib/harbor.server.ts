@@ -38,6 +38,7 @@ import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger,
 import {
   ashlarBotLogin,
   continueLoopOnPush,
+  loopPostedReview,
   loopStartAt,
   startLoop,
   loopEnabled,
@@ -1041,6 +1042,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   let githubId: number | undefined;
   let githubError: string | undefined;
   let postedToGithub = false;
+  let inlineDropped = false;
   if (token && after.origin === "github") {
     const still = state.jobs.find((j) => j.id === jobId);
     if (!still || still.status === "cancelled" || still.status === "posted") return;
@@ -1055,6 +1057,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
         comments: review.comments,
       });
       githubId = posted.id;
+      inlineDropped = posted.inlineDropped;
       postedToGithub = true;
     } catch (e) {
       githubError = formatGithubError(e);
@@ -1122,11 +1125,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   // fast-forward over (and undo) a contributor's backward force-push. The runtime re-checks
   // the live head right before committing as well.
   if (token && postedToGithub && !headMovedTo) {
-    const posted = {
-      githubId,
-      comments: review.comments.map((c) => ({ findingId: c.findingId, file: c.file, body: c.body })),
-      published: [...inline, ...unanchored].map((f) => f.id),
-    };
+    const posted = loopPostedReview({ githubId, comments: review.comments, inline, unanchored, inlineDropped });
     void runPostReviewLoop(token, postedJob, sample, state.settings, undefined, undefined, posted).then((r) => {
       // The runtime reports halts in-thread; also leave a server-side trace so nothing is lost.
       if (!r.ran && !SILENT_REASONS.includes(r.reason)) {

@@ -632,7 +632,7 @@ export async function createPullReview(
     body: string;
     comments: PostedComment[];
   },
-): Promise<{ id: number }> {
+): Promise<{ id: number; inlineDropped: boolean }> {
   let comments = opts.comments;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
@@ -652,7 +652,8 @@ export async function createPullReview(
     });
     if (out.ok) {
       if (!out.data.id) throw new Error("review missing id");
-      return { id: out.data.id };
+      // true when GitHub refused an inline anchor and the review went out without ANY inline comment
+      return { id: out.data.id, inlineDropped: comments.length < opts.comments.length };
     }
     if (comments.length && isReviewLineError(out.text)) {
       comments = [];

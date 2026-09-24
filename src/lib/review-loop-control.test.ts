@@ -4,6 +4,7 @@ import {
   assertNever,
   controlKey,
   emitControl,
+  LANDED_KEPT,
   ownWrites,
   type ControlKind,
   type ControlRow,
@@ -11,9 +12,11 @@ import {
   type EmitContext,
   type EmitOutcome,
 } from "./review-loop-control.ts";
-import { continueComment, escalateMarker, startComment, stoppedComment } from "./review-loop.ts";
-import { readLoopEvents } from "./review-loop-engine.server.ts";
+import { continueComment, escalateMarker, isoMs, startComment, stoppedComment } from "./review-loop.ts";
+import { escalateNow, readLoopEvents } from "./review-loop-engine.server.ts";
+import { stopLoop, type LoopRuntimeDeps } from "./review-loop-runtime.server.ts";
 import { deriveLoopSession, type LoopEvent } from "./review-loop-session.ts";
+import { DEFAULT_SETTINGS, type BotSettings } from "./types.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 const HEAD = "a".repeat(40);
@@ -28,6 +31,25 @@ const handoff = (pr = 1): ControlWrite => ({
   body: `${escalateMarker({ reason: "fix-failed", round: 1, pr, head: HEAD })}\n\nhandoff`,
   since: { iso: SESSION },
 });
+
+/** One write of each kind on PR 1, after the session anchor (ANCHOR). */
+function writeOfEachKind(): Record<ControlKind, ControlWrite> {
+  const LATER = "2026-02-25T00:00:00Z";
+  // The session's start record precedes every row a world stores (id 0): a continuation or
+  // handoff row is matched by its id, as in production once the start is listed.
+  const since = { iso: SESSION, seq: 0 };
+  return {
+    start: { key: { kind: "start", ref: ref(), by: "bob", at: LATER, mode: "apply" }, body: startComment({ mode: "apply", by: "bob", at: LATER }) },
+    stop: { key: { kind: "stop", ref: ref(), by: "bob", at: LATER }, body: stoppedComment({ by: "bob", at: LATER }) },
+    continue: {
+      key: { kind: "continue", ref: ref(), head: HEAD, sessionIso: SESSION },
+      body: continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD }),
+      since,
+    },
+    handoff: { ...handoff(), since },
+  };
+}
+const ANCHOR: LoopEvent = { at: SESSION, kind: "start", actor: "alice", mode: "suggest", seq: 0 };
 
 /** A GitHub fake: `plan` scripts each POST ("ok", "rejected", "landed" = stored then unknown, "lost"
  * = unknown, nothing stored); `hidden` keeps stored rows out of the list until it is cleared. */
@@ -149,8 +171,8 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(ownWrites(f.gh).state(controlKey(handoff(1).key)), "unknown");
   });
 
-  it("eviction by state: thousands of reconciled posted writes and refused writes are pruned; what may have landed, or is still owed, is kept", async () => {
-    const N = 2_000;
+  it("retention by state: a refused write is dropped at once; a landed one, listed or not, is kept until LANDED_KEPT later landings retire it; what may have landed, or is still owed, never is", async () => {
+    const N = LANDED_KEPT + 500;
     let posts = 0;
     let lose = true; // the first POST's outcome is unknown and nothing is stored
     const refused = new Set<number>(); // PRs whose POSTs GitHub refuses
@@ -177,44 +199,42 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     const reconcile = async (pr: number) => journal.standIns(ref(pr), await gh.listIssueComments("t", "o", "r", pr), BOT);
 
     assert.equal((await emitControl(ctx, handoff(1))).status, "unknown");
-    const posted = Array.from({ length: N }, (_, i) => handoff(2 + i));
-    for (const w of posted) {
+    // A refused write-ahead stop: honored until recorded.
+    const stop: ControlWrite = { key: { kind: "stop", ref: ref(2), by: "bob", at: "2026-03-01T00:00:00Z" }, body: stoppedComment({ by: "bob", at: "2026-03-01T00:00:00Z" }) };
+    journal.intend(stop);
+    refused.add(2);
+    assert.equal((await emitControl(ctx, stop)).status, "rejected");
+    const posted = Array.from({ length: N }, (_, i) => handoff(3 + i));
+    for (const [i, w] of posted.entries()) {
       assert.equal((await emitControl(ctx, w)).status, "posted");
-      assert.equal(stateOf(w), "posted", "kept until the list shows it (it stands in meanwhile)");
-      assert.deepEqual(await reconcile(w.key.ref.pr), [], "a session read reconciles it");
-      assert.equal(stateOf(w), undefined, "a reconciled write is evicted");
+      // half are reconciled by a session read, half are never read again (a terminal write)
+      if (i % 2 === 0) assert.deepEqual(await reconcile(w.key.ref.pr), [], "a session read reconciles it");
+      assert.equal(stateOf(w), "posted", "kept: it answers a later emit, and stands in when a read omits its row");
     }
-    const rejected = Array.from({ length: N }, (_, i) => handoff(2 + N + i));
+    const rejected = Array.from({ length: N }, (_, i) => handoff(3 + N + i));
     for (const w of rejected) {
       refused.add(w.key.ref.pr);
       assert.equal((await emitControl(ctx, w)).status, "rejected");
-      assert.equal(stateOf(w), undefined, "a refused write is evicted once no emit is in flight");
+      assert.equal(stateOf(w), undefined, "a refused write is dropped once no emit is in flight");
     }
-    // Kept: a posted write no session read has reconciled yet, and a refused write-ahead stop (both fold).
-    const unlisted = handoff(2 + 2 * N);
-    assert.equal((await emitControl(ctx, unlisted)).status, "posted");
-    const stopPr = 3 + 2 * N;
-    const stop: ControlWrite = { key: { kind: "stop", ref: ref(stopPr), by: "bob", at: "2026-03-01T00:00:00Z" }, body: stoppedComment({ by: "bob", at: "2026-03-01T00:00:00Z" }) };
-    journal.intend(stop);
-    refused.add(stopPr);
-    assert.equal((await emitControl(ctx, stop)).status, "rejected");
-    assert.equal(journal.seen(handoff(4 + 2 * N), [], BOT), false);
-    assert.deepEqual(journal.stats(), { prs: 3, entries: 3 }, "only unresolved entries remain, and no empty per-PR map");
+    assert.equal(journal.seen(handoff(3 + 2 * N), [], BOT), false);
+    assert.deepEqual(journal.stats(), { prs: LANDED_KEPT + 2, entries: LANDED_KEPT + 2 }, "the last LANDED_KEPT landings and the two unresolved entries; no empty per-PR map");
+    assert.equal(stateOf(posted[N - LANDED_KEPT - 1]), undefined, "the oldest landings are retired");
+    assert.equal(stateOf(posted[N - LANDED_KEPT]), "posted");
+    assert.equal(journal.standIns(posted[N - 1].key.ref, [], BOT).length, 1, "a kept landing stands in for a read that omits its row");
     assert.equal(stateOf(stop), "rejected");
-    assert.equal((await reconcile(stopPr)).length, 1, "the refused stop is still honored");
-    assert.equal((await reconcile(unlisted.key.ref.pr)).length, 0, "listed now: reconciled and evicted");
+    assert.equal((await reconcile(2)).length, 1, "the refused stop is still honored");
 
-    // An evicted write is still never sent twice: the listed row answers the emit's scan.
+    // A retired write is still never sent twice: the listed row answers the emit's scan.
     const sent = posts;
     assert.deepEqual(await emitControl(ctx, posted[0]), { status: "exists" });
     // The write that may have landed still blocks a second POST.
     assert.equal((await emitControl(ctx, handoff(1))).status, "unknown");
     assert.equal(posts, sent, "no POST");
     assert.equal(stateOf(handoff(1)), "unknown");
-    assert.deepEqual(journal.stats(), { prs: 2, entries: 2 });
   });
 
-  it("a listed row confirms an unknown entry: no stand-in beside it, the entry is evicted, and a later emit is 'exists'", async () => {
+  it("a listed row confirms an unknown entry: no stand-in beside it, and a later emit is 'exists'", async () => {
     const f = world(["landed"]);
     f.w.hidden = true; // the row landed but the list lags through the whole schedule
     assert.equal((await emitControl(f.ctx, handoff())).status, "unknown");
@@ -222,11 +242,116 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(ownWrites(f.gh).standIns(ref(), [], BOT).length, 1, "folded while unlisted");
     assert.deepEqual(ownWrites(f.gh).unresolved(ref(), "handoff").map((u) => u.key), [key]);
     assert.deepEqual(ownWrites(f.gh).standIns(ref(), f.rows, BOT), [], "the real row replaces the stand-in");
-    assert.equal(ownWrites(f.gh).state(key), undefined, "reconciled, then evicted: the listed row answers for it");
+    assert.equal(ownWrites(f.gh).state(key), "posted");
     assert.deepEqual(ownWrites(f.gh).unresolved(ref(), "handoff"), []);
-    f.w.hidden = false; // the list that reconciled it: its scan finds the row
     assert.deepEqual(await emitControl(f.ctx, handoff()), { status: "exists" });
     assert.equal(f.posts(), 1);
+  });
+
+  it("a read behind a row an earlier read listed (a lagging replica) still shows the write, and nothing POSTs it again", async () => {
+    const writes = writeOfEachKind();
+    const at = (es: LoopEvent[]) => es.map((e) => ({ ...e, at: new Date(isoMs(e.at)).toISOString() })); // a record's marker time may be spelled otherwise
+    for (const kind of Object.keys(writes) as ControlKind[]) {
+      for (const plan of ["ok", "landed"] as const) {
+        const label = `${kind} | ${plan}`;
+        const f = world([plan]);
+        f.w.hidden = true;
+        const read = () => readLoopEvents(f.gh, "t", "o", "r", 1, { botLogin: BOT });
+        assert.equal((await emitControl(f.ctx, writes[kind])).status, plan === "ok" ? "posted" : "unknown", label);
+        f.w.hidden = false;
+        const listed = await read(); // reconciles: the row is the write's event now
+        assert.equal(listed.length, 1, `${label}: the listed row`);
+        assert.equal(ownWrites(f.gh).state(controlKey(writes[kind].key)), "posted", `${label}: confirmed`);
+        f.w.hidden = true; // the next read comes from a replica behind the one that listed it
+        const behind = await read();
+        assert.deepEqual(at(behind), at(listed), `${label}: the same event`);
+        assert.deepEqual(deriveLoopSession([ANCHOR, ...behind]), deriveLoopSession([ANCHOR, ...listed]), `${label}: the session changed`);
+        assert.deepEqual(await emitControl(f.ctx, writes[kind]), { status: "exists" }, `${label}: a later emit`);
+        assert.equal(f.posts(), 1, `${label}: one POST`);
+      }
+    }
+  });
+
+  it("escalateNow after its handoff was listed once: a lagging or failed idempotency read posts no second handoff", async () => {
+    for (const plan of ["ok", "landed"] as const) {
+      for (const read of ["lagging", "failed"] as const) {
+        const label = `${plan} | ${read}`;
+        const f = world([plan]);
+        const opts = { owner: "o", repo: "r", pr: 1, head: HEAD, reason: "fix-failed" as const, rounds: [], roundCap: 3, botLogin: BOT, sinceIso: SESSION, sleep: f.ctx.sleep, now: f.ctx.now };
+        const first = await escalateNow(f.gh, "t", opts);
+        assert.equal(first.escalated || first.ambiguous, true, label);
+        const session = async () => deriveLoopSession([ANCHOR, ...(await readLoopEvents(f.gh, "t", "o", "r", 1, { botLogin: BOT }))]);
+        const ended = await session(); // lists the handoff: reconciled
+        assert.equal(ended.active, false, label);
+        if (read === "lagging") f.w.hidden = true;
+        const list = f.gh.listIssueComments;
+        if (read === "failed") f.gh.listIssueComments = async () => Promise.reject(new Error("GitHub 502 on list"));
+        assert.deepEqual(await escalateNow(f.gh, "t", opts), { escalated: false }, `${label}: the journal answers`);
+        f.gh.listIssueComments = list;
+        if (read === "lagging") assert.deepEqual(await session(), ended, `${label}: the handoff still ends the session`);
+        assert.equal(f.posts(), 1, `${label}: one handoff POST`);
+      }
+    }
+  });
+
+  it("a landed terminal write whose PR is never read again (a handoff, a stop) is retired after LANDED_KEPT later landings; an unknown one never is", async () => {
+    const START_AT = "2026-02-20T00:00:00Z";
+    const byPr = new Map<number, ControlRow[]>();
+    let id = 0;
+    let posts = 0;
+    let listFails = false;
+    const rowsOf = (pr: number) => byPr.get(pr) ?? [];
+    const gh = {
+      async listIssueComments(_t: string, _o: string, _r: string, pr: number) {
+        if (listFails) throw new Error("GitHub 502 on list");
+        return [...rowsOf(pr)];
+      },
+      async listReviewComments() {
+        return [];
+      },
+      async listPullReviews() {
+        return [];
+      },
+      async fetchPullHeadRef() {
+        return { ref: "feature", sha: HEAD, fork: false, sameRepo: true };
+      },
+      async createIssueComment(_t: string, o: { pr: number; body: string }) {
+        posts++;
+        if (o.pr === 1) throw unknownErr(); // lost: nothing stored
+        const row = { id: ++id, userLogin: BOT, body: o.body, createdAt: new Date(T0 + id * 1_000).toISOString() };
+        byPr.set(o.pr, [...rowsOf(o.pr), row]);
+        return { ...row };
+      },
+    };
+    const clock = { sleep: async () => {}, now: () => T0 };
+    const handoffOn = (pr: number) =>
+      escalateNow(gh as never, "t", { owner: "o", repo: "r", pr, head: HEAD, reason: "fix-failed", rounds: [], roundCap: 3, botLogin: BOT, sinceIso: START_AT, ...clock });
+    const journal = ownWrites(gh);
+    const handoffKey = (pr: number) => controlKey({ kind: "handoff", ref: ref(pr), head: HEAD, sessionIso: START_AT });
+
+    assert.equal((await handoffOn(1)).ambiguous, true, "PR 1: the handoff's outcome is unknown");
+    // PR 2: a stop that ends an active session (its record is the session's last control write)
+    byPr.set(2, [{ id: ++id, userLogin: BOT, body: startComment({ mode: "suggest", by: "alice", at: START_AT }), createdAt: START_AT }]);
+    const settings: BotSettings = { ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode: "suggest", parallelPrs: 3 } };
+    const deps = { gh, requestFix: async () => "", validate: async () => ({ ok: true }), ...clock } as unknown as LoopRuntimeDeps;
+    const STOP_AT = "2026-02-21T00:00:00Z";
+    const env = { ASHLAR_FIX_AGENT: "1" } as NodeJS.ProcessEnv;
+    assert.deepEqual(await stopLoop("t", { owner: "o", repo: "r", pr: 2, actor: "bob", stopAt: STOP_AT }, settings, deps, env), { posted: true, reason: "stopped" });
+    const stopKey = controlKey({ kind: "stop", ref: ref(2), by: "bob", at: STOP_AT });
+    assert.equal(journal.state(stopKey), "posted");
+    // PRs 3.. each get one handoff, and no session read follows any of them
+    const last = 3 + LANDED_KEPT;
+    for (let pr = 3; pr <= last; pr++) assert.equal((await handoffOn(pr)).escalated, true, `PR ${pr}`);
+    assert.deepEqual(journal.stats(), { prs: LANDED_KEPT + 1, entries: LANDED_KEPT + 1 }, "the last LANDED_KEPT landings and the unknown handoff");
+    assert.equal(journal.state(stopKey), undefined, "the stop record was the oldest landing: retired");
+    assert.equal(journal.state(handoffKey(3)), undefined, "retired");
+    assert.equal(journal.state(handoffKey(4)), "posted");
+    assert.equal(journal.state(handoffKey(1)), "unknown", "an unknown write is never retired");
+    const sent = posts;
+    listFails = true; // the idempotency read fails: the journal still answers for what it kept
+    assert.equal((await handoffOn(1)).ambiguous, true);
+    assert.deepEqual(await handoffOn(last), { escalated: false });
+    assert.equal(posts, sent, "no second POST");
   });
 
   it("a posted write whose 2xx row has createdAt '' (production's shape for a missing created_at) stands in at its attempt", async () => {
@@ -266,21 +391,8 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
   });
 
   it("a listed row the collector cannot place (createdAt '' or malformed) does not retire the stand-in: one event, the session unchanged", async () => {
-    const LATER = "2026-02-25T00:00:00Z";
-    // The session's start record precedes every row this world stores (id 0): a continuation or
-    // handoff row is matched by its id, as in production once the start is listed.
-    const since = { iso: SESSION, seq: 0 };
-    const writes: Record<ControlKind, ControlWrite> = {
-      start: { key: { kind: "start", ref: ref(), by: "bob", at: LATER, mode: "apply" }, body: startComment({ mode: "apply", by: "bob", at: LATER }) },
-      stop: { key: { kind: "stop", ref: ref(), by: "bob", at: LATER }, body: stoppedComment({ by: "bob", at: LATER }) },
-      continue: {
-        key: { kind: "continue", ref: ref(), head: HEAD, sessionIso: SESSION },
-        body: continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD }),
-        since,
-      },
-      handoff: { ...handoff(), since },
-    };
-    const anchor: LoopEvent = { at: SESSION, kind: "start", actor: "alice", mode: "suggest", seq: 0 };
+    const writes = writeOfEachKind();
+    const anchor = ANCHOR;
     const bare = (es: LoopEvent[]) => es.map(({ seq: _seq, ...e }) => e); // a listed start adds its id
     for (const kind of Object.keys(writes) as ControlKind[]) {
       for (const plan of ["ok", "landed"] as const) {

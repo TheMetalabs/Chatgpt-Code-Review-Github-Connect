@@ -11,10 +11,13 @@
  * - emitControl POSTs a write at most once while its outcome may have landed, joins concurrent
  *   emits of the same key, and returns a CLOSED outcome (posted | exists | unknown | rejected) that
  *   every caller handles in an exhaustive switch.
- * - OwnWrites journals every write until its row is listed (retention is by state, never by age or
- *   size). Every session read reconciles it against the listed history (a listed row the event
- *   collector reads confirms, then evicts, its entry) and folds the other entries as stand-in
- *   events: the loop reads its own writes.
+ * - OwnWrites journals every write. Every session read reconciles it against the listed history (a
+ *   listed row the event collector reads confirms its entry) and folds the entries the list does
+ *   not show as stand-in events: the loop reads its own writes — also when a later read lags behind
+ *   a row an earlier one listed. Retention follows the state: an unresolved write (it may have
+ *   landed and no list shows it, or a write-ahead stop not yet recorded) is kept for the life of
+ *   the process, never by age or size; a landed one (its row created or listed) is kept until
+ *   LANDED_KEPT later landings retire it; a refused or unsent one is dropped.
  *
  * DI-only (no transport import): it is reached only through the gated loop engine and runtime.
  * NON-GOALS: dedup across processes or restarts (the journal is in-process; single harbor instance).
@@ -190,21 +193,19 @@ interface OwnWrite {
   row?: CreatedRow;
   error?: string;
   inflight?: Promise<EmitOutcome>;
-  /** A collectable listed row confirmed it: from then on that row is its event, and a later emit's
-   * scan finds it. */
-  listed?: boolean;
 }
 
 const message = (e: unknown): string => (e as Error)?.message ?? String(e);
 
-/** Folded while not listed: a write-ahead intent, a posted write, or one that may have landed. Not
- * while its POST is in flight (no phantom), and not a refused write — a refused start stays
+/** Folded when a read does not list it: a write-ahead intent, a landed write (also one an earlier
+ * read listed: a later read may come from a replica behind that one), or one that may have landed.
+ * Not while its POST is in flight (no phantom), and not a refused write — a refused start stays
  * repairable by the loop step, a refused handoff leaves the session active. */
 function folds(e: OwnWrite): boolean {
   return e.writeAhead || e.state === "posted" || e.state === "unknown";
 }
 
-/** The event an own write that is not listed yet stands for. A continuation or handoff is placed
+/** The event an own write that a read does not list stands for. A continuation or handoff is placed
  * at the server's time, or at its POST attempt when the outcome is unknown — never at "now": a
  * newer start between the two must not be ended by an old session's handoff. A 2xx row with no
  * created_at reaches here as "" (github.server's shape), and the fold drops an undatable event:
@@ -226,23 +227,35 @@ function standInEvent(e: OwnWrite): LoopEvent {
 }
 
 /**
- * Done with, so evicted: a write whose row was listed and reconciled (the list carries its event
- * from then on, and every emit path — or its caller — scans before it POSTs), or one that neither
- * landed nor folds (refused or unsent, not write-ahead). Never while an emit is in flight. An
- * unknown write, and a write-ahead one whose row is not listed, are never done with.
+ * How many LANDED writes (the row was created — a 2xx — or listed) the journal keeps, across all
+ * PRs. A landed entry still answers a later emit of its key ("exists": no POST) and still stands in
+ * for its row when a read omits it: a read served by a replica behind the one that listed the row,
+ * or a failed idempotency read that does not suppress a handoff. Such lag lasts seconds, and GitHub
+ * throttles the App's content creation (on the order of 80 comments a minute per token), so the
+ * last 1,000 landings span far longer. The oldest landing is retired first, with no later read of
+ * its PR needed (a terminal handoff or stop gets none). Unresolved entries are never counted here.
+ */
+export const LANDED_KEPT = 1_000;
+
+/**
+ * Done with, so dropped at once: a write that neither landed nor folds (refused or unsent, not
+ * write-ahead). Never while an emit is in flight. A landed write is retired by landing order
+ * (LANDED_KEPT); an unknown write, and a write-ahead one whose record is not posted, never are.
  */
 function settled(e: OwnWrite): boolean {
   if (e.inflight) return false;
-  if (e.listed) return true;
   return !e.writeAhead && (e.state === "rejected" || e.state === "intent");
 }
 
-/** The control writes one GitHub client made in this process. Retention is by STATE, never by age
- * or size (no TTL, no cap): an entry that may have landed, or a write-ahead one whose row is not
- * listed, keeps blocking a second POST and folding for as long as the process lives; a settled
- * entry is evicted, and so is a PR's map once it is empty. */
+/** The control writes one GitHub client made in this process, retained by STATE: an entry that may
+ * have landed, or a write-ahead one whose record is not posted, keeps blocking a second POST and
+ * folding for as long as the process lives (no TTL, no cap); a landed entry is kept until
+ * LANDED_KEPT later landings retire it — not when a read first lists its row; a settled entry is
+ * dropped, and so is a PR's map once it is empty. */
 export class OwnWrites {
   private readonly byPr = new Map<string, Map<string, OwnWrite>>();
+  /** The landed entries, oldest landing first (a Set keeps insertion order). */
+  private readonly landed = new Set<OwnWrite>();
 
   private entries(ref: PrRef): Map<string, OwnWrite> {
     const pr = prKey(ref);
@@ -267,7 +280,7 @@ export class OwnWrites {
     return e;
   }
 
-  /** undefined: never journaled, or evicted. */
+  /** undefined: never journaled, dropped, or retired. */
   state(key: string): WriteState | undefined {
     for (const all of this.byPr.values()) {
       const e = all.get(key);
@@ -299,8 +312,9 @@ export class OwnWrites {
   }
 
   /** RECONCILE, then FOLD: every entry of the PR that a collectable listed row matches is confirmed
-   * (that row is its event now); every other entry that folds becomes a stand-in event. Called on
-   * every session read. */
+   * (that row is its event in this read); every other entry that folds becomes a stand-in event —
+   * a landed one too, when this read omits a row an earlier read listed. Called on every session
+   * read. */
   standIns(ref: PrRef, listed: readonly ControlRow[], botLogin: string): LoopEvent[] {
     const out: LoopEvent[] = [];
     for (const e of this.byPr.get(prKey(ref))?.values() ?? []) {
@@ -312,13 +326,32 @@ export class OwnWrites {
     return out;
   }
 
-  /** Evict the PR's settled entries, and its map once it is empty. */
+  /** Drop the PR's settled entries (and its map once it is empty), record its new landings, and
+   * retire the oldest landings past LANDED_KEPT. */
   prune(ref: PrRef): void {
     const pr = prKey(ref);
     const all = this.byPr.get(pr);
-    if (!all) return;
-    for (const [key, e] of all) if (settled(e)) all.delete(key);
-    if (all.size === 0) this.byPr.delete(pr);
+    if (all) {
+      for (const [key, e] of all) {
+        if (settled(e)) all.delete(key);
+        else if (e.state === "posted") this.landed.add(e); // already there: keeps its first place
+      }
+      if (all.size === 0) this.byPr.delete(pr);
+    }
+    this.retire();
+  }
+
+  /** Retire the oldest landed entries past LANDED_KEPT (their rows exist; see LANDED_KEPT). */
+  private retire(): void {
+    for (const e of this.landed) {
+      if (this.landed.size <= LANDED_KEPT) return;
+      this.landed.delete(e);
+      const pr = prKey(e.write.key.ref);
+      const all = this.byPr.get(pr);
+      const key = controlKey(e.write.key);
+      if (all?.get(key) === e) all.delete(key);
+      if (all?.size === 0) this.byPr.delete(pr);
+    }
   }
 
   /** What the journal holds (retention is observable: tests pin what is kept and what is not). */
@@ -363,7 +396,6 @@ function confirm(e: OwnWrite, row: ControlRow): void {
   if (!collectable(e.write, row)) return;
   e.state = "posted";
   e.row = { id: row.id, userLogin: row.userLogin, createdAt: row.createdAt };
-  e.listed = true;
 }
 
 const journals = new WeakMap<object, OwnWrites>();
@@ -392,8 +424,12 @@ export interface EmitContext {
 }
 
 /**
- * Emit one control write: at most one POST that may have landed, ever, per key in this process.
- * Synchronous up to the join, so a concurrent emit of the same key shares this one's outcome.
+ * Emit one control write: at most one POST that may have landed per key in this process. The
+ * journal answers for a write whose outcome is unknown for the life of the process, and for a
+ * landed one until LANDED_KEPT later landings retire it; after that its row answers the scan made
+ * before a POST (by the emit, or by its caller) — only a scan that fails or lags that far behind
+ * could let a second one through. Synchronous up to the join, so a concurrent emit of the same key
+ * shares this one's outcome.
  */
 export function emitControl(ctx: EmitContext, w: ControlWrite): Promise<EmitOutcome> {
   const journal = ownWrites(ctx.gh);
@@ -401,7 +437,7 @@ export function emitControl(ctx: EmitContext, w: ControlWrite): Promise<EmitOutc
   if (e.inflight) return e.inflight;
   const run = emitOnce(ctx, e).finally(() => {
     e.inflight = undefined;
-    journal.prune(w.key.ref); // a refused write, or one a re-check listed, is settled now
+    journal.prune(w.key.ref); // a refused write is settled now; a landed one is recorded
   });
   e.inflight = run;
   return run;

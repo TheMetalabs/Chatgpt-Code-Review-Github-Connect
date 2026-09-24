@@ -6,6 +6,8 @@
  *   I2 never silent — an unresolved result is always logged (never a SILENT_REASONS exit);
  *   I3 closed outcome — each entry point reports the outcome the cell implies;
  *   I4 reconcile — a row that shows up later confirms the write: one event, no leftover stand-in;
+ *      and a later read that lags behind that row again still shows the write once, and the same
+ *      session (a replica behind the one that listed it);
  *   I5 read-your-writes — the loop acts on its own write before the list shows it;
  *   I6 a newer session is never ended by an older record — also one started in the same second
  *      as the older write's POST (GitHub orders events at one-second resolution);
@@ -75,7 +77,16 @@ type Via =
   | "handoff:post-commit";
 type Write = "success" | "rejected" | "unknown-landed" | "unknown-lost";
 type List = "normal" | "lagging" | "failing";
-type Later = "redelivery" | "newer-start" | "same-second-start" | "25h" | "row-appears" | "push" | "moved" | "stop-restart";
+type Later =
+  | "redelivery"
+  | "newer-start"
+  | "same-second-start"
+  | "25h"
+  | "row-appears"
+  | "row-relapses"
+  | "push"
+  | "moved"
+  | "stop-restart";
 type Phase = "call" | "view" | "again" | "follow";
 type Cell = { via: Via; write: Write; list: List; later: Later };
 type Result = ControlResult | LoopStepResult;
@@ -98,7 +109,7 @@ const VIAS: Via[] = [
 ];
 const WRITES: Write[] = ["success", "rejected", "unknown-landed", "unknown-lost"];
 const LISTS: List[] = ["normal", "lagging", "failing"];
-const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears", "push", "moved", "stop-restart"];
+const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears", "row-relapses", "push", "moved", "stop-restart"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
@@ -199,6 +210,8 @@ class World {
   pushedHead?: string;
   /** When the write under test first left (its attempt instant). */
   firstAttemptMs?: number;
+  /** The first comment id at or after the write under test's first POST. */
+  private writeFrom?: number;
   committed = false;
   private nextId = 1;
   private lagFrom = Infinity;
@@ -332,6 +345,7 @@ class World {
     if (!this.underTestPost(body)) return this.store(BOT, body, at);
     if (this.underTest.length === 0) {
       this.firstAttemptMs = sentAt;
+      this.writeFrom = this.nextId;
       this.outage();
     }
     this.underTest.push(this.phase);
@@ -362,6 +376,12 @@ class World {
   catchUp(): void {
     this.lagFrom = Infinity;
     this.failing = false;
+  }
+
+  /** A read served by a replica behind the write under test again, after one listed its row. */
+  relapse(): void {
+    this.failing = false;
+    this.lagFrom = this.writeFrom ?? this.nextId;
   }
 
   async injectCarol(): Promise<void> {
@@ -535,16 +555,22 @@ async function assertReadsOwnWrite(w: World): Promise<void> {
   }
 }
 
-/** I4: once the row is listed, one session read confirms the entry (then evicts it: the listed row
- * answers for it) and no stand-in is left. */
-async function assertReconciled(w: World): Promise<void> {
+/** I4: once the row is listed, one session read confirms the entry and no stand-in is left; the
+ * entry is kept, so a later read that lags behind the row again (`relapse`) still shows the write
+ * once, and the same session. */
+async function assertReconciled(w: World, relapse: boolean): Promise<void> {
   const { write } = w.cell;
   w.catchUp();
-  await w.session();
-  if (write === "success" || write === "unknown-landed") assert.equal(ownWrites(w.deps.gh).state(w.key()), undefined, "I4: the listed row reconciles and evicts the journal entry");
+  const listed = await w.session();
+  if (write === "success" || write === "unknown-landed") assert.equal(ownWrites(w.deps.gh).state(w.key()), "posted", "I4: the listed row confirms the journal entry");
   const n = (await w.eventsOfWrite()).length;
   const expected = write !== "rejected" || kindOf(w.cell.via) === "stop" ? 1 : 0; // a refused stop still stands (write-ahead)
   assert.equal(n, expected, `I4: ${n} events for the write`);
+  if (!relapse) return;
+  w.relapse();
+  const behind = (await w.eventsOfWrite()).length;
+  assert.equal(behind, expected, `I4: ${behind} events for the write in a read behind its listed row`);
+  assert.deepEqual(await w.session(), listed, "I4: a read behind the listed row changed the session");
 }
 
 /** I2 across kinds: the session a handoff ended is read by the next head's handlers too. */
@@ -625,11 +651,13 @@ async function runCell(c: Cell, pr: number): Promise<void> {
         await assertReadsOwnWrite(w);
       }
       if (c.later === "25h") w.clock += 25 * 60 * 60_000;
-      if (c.later === "row-appears") await assertReconciled(w);
+      const listed = c.later === "row-appears" || c.later === "row-relapses";
+      if (listed) await assertReconciled(w, c.later === "row-relapses");
       w.phase = "again";
+      // after a relapse the list lags again, but the journal already holds what the listed row told it
       const again = await w.enter();
       const againCls = classify(w, again);
-      assert.equal(againCls, expectAgain(c, c.later === "row-appears"), `I3 again: ${JSON.stringify(again)}`);
+      assert.equal(againCls, expectAgain(c, listed), `I3 again: ${JSON.stringify(again)}`);
       assertLogged(w, again, againCls, "again");
     }
     assertExactlyOnce(w);

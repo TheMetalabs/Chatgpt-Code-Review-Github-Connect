@@ -95,9 +95,9 @@ test('recover resumes a running fix through its tab binding; take never re-submi
   const binding = {jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'};
   // the worker lost its local job while the tab (fix-A/run-A) survives
   assert.equal(h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true}), null, 'no second tab or prompt for a running fix');
-  assert.equal(h.bridge.recoverBridgeJob('chrome-2', [binding]), null, 'another profile cannot resume it');
-  assert.equal(h.bridge.recoverBridgeJob('chrome-1', [{...binding, runId: 'run-B'}]), null, 'only the run the server saw');
-  const resumed = h.bridge.recoverBridgeJob('chrome-1', [binding]);
+  assert.equal(h.bridge.recoverBridgeJob('chrome-2', [binding], {fixes: true}), null, 'another profile cannot resume it');
+  assert.equal(h.bridge.recoverBridgeJob('chrome-1', [{...binding, runId: 'run-B'}], {fixes: true}), null, 'only the run the server saw');
+  const resumed = h.bridge.recoverBridgeJob('chrome-1', [binding], {fixes: true});
   assert.equal(resumed.kind, 'fix');assert.equal(resumed.jobId, offer.jobId);
   assert.deepEqual(resumed.resumeProviders, ['chatgpt']);assert.deepEqual(resumed.bindings, [binding]);
   assert.equal(h.bridge.completeBridgeFix(offer.jobId, 'ANSWER', undefined, resumed.leaseId).ok, true);

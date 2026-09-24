@@ -142,10 +142,12 @@ async function api(path, body, expectedOrigin, signal) {
     // Browser/network failures retain the outbox; separate per-job/heartbeat lanes
     // keep unrelated work moving. Server ACK is independent of publication below.
     // A caller MAY pass a signal to cancel (e.g. the periodic sweep's watchdog); normal callers omit it.
-    res = await fetch(`${origin}${path}`, {
+    // fixProtocol:1 on EVERY bridge request: this worker handles review-loop fix items, and the
+    // server refuses every fix operation (and skips fix recovery) without it. Review requests ignore it.
+    res = await fetch(body ? `${origin}${path}` : `${origin}${path}${path.includes("?") ? "&" : "?"}fixProtocol=1`, {
       method: body ? "POST" : "GET",
       headers: {"content-type": "application/json", "x-ashlar-bridge-token": token},
-      body: body ? JSON.stringify({...body, token}) : undefined,
+      body: body ? JSON.stringify({...body, fixProtocol: 1, token}) : undefined,
       signal,
     });
   } catch (cause) {

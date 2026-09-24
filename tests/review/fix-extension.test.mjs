@@ -401,3 +401,16 @@ test('worker: a fix tab preserved while it could not answer completes the releas
   await b.context.refreshTabInventory();await until(() => !b.session.state['ashlar:preserved:fix-Z:chatgpt:run-Z']);
   assert.equal(b.session.state['ashlar:preserved:fix-Z:chatgpt:run-Z'], undefined);
 });
+
+test('worker: every bridge request carries the fixProtocol:1 opt-in (the server gates every fix operation on it)', async () => {
+  const b = worker([], {api: active});
+  const seen = [];
+  b.context.fetch = async (url, init) => { seen.push({url, body: init.body ? JSON.parse(init.body) : undefined}); return {ok: true, status: 200, json: async () => ({ok: true})}; };
+  for (const body of [{action: 'recover', clientId: 'c', bindings: []}, {action: 'ping', jobId: 'fix-A', leaseId: 'L'}, {action: 'claim', jobId: 'fix-A'},
+    {action: 'progress', jobId: 'fix-A'}, {action: 'release', jobId: 'fix-A'}, {action: 'failure', jobId: 'fix-A'}, {action: 'complete', jobId: 'fix-A'}, {action: 'ping'}]) await b.rpc('/api/bridge', body);
+  await b.rpc('/api/bridge?jobId=fix-A&attachmentProtocol=2');
+  await b.rpc('/api/bridge');
+  assert.equal(seen.length, 10);
+  assert.ok(seen.filter(s => s.body).every(s => s.body.fixProtocol === 1), JSON.stringify(seen));
+  assert.deepEqual(seen.filter(s => !s.body).map(s => new URL(s.url).searchParams.get('fixProtocol')), ['1', '1']);
+});

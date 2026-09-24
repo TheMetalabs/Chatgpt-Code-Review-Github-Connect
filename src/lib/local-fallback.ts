@@ -151,12 +151,21 @@ export function heldLocalUnusable(
   if (leg.unparsedText?.trim()) return "a completed reply was not review JSON";
   if (leg.residualReplies?.trim()) return "a completed reply carried text outside its review JSON";
   if (gate.malformed) return `${gate.malformed} finding(s) missing required fields`;
-  if (gate.overflow) return `${gate.overflow} finding(s) past the gate's row cap were not inspected`;
-  return undefined;
+  return gateUnreadRows(gate);
 }
 
-/** What to gate in place of an unusable held local reply: whatever parsed, with every completed reply
- * attached verbatim as raw_review, so it posts as evidence and never counts as a verdict. */
+/** Why ANY leg's gated result (chat or local, race or verify-clean) is not its reviewer's full verdict
+ * because the gate set rows past its cap (`overflow`) aside unread, or undefined. Such a leg is gated
+ * as evidence (heldLocalEvidence): an unread row may be the finding, so a result that skipped one can
+ * never read as clean, start or support a verification round, or converge. */
+export function gateUnreadRows(gate: { ok: true; overflow?: number; rawReview?: string } | { ok: false; reason: string }): string | undefined {
+  if (!gate.ok || gate.rawReview || !gate.overflow) return undefined;
+  return `${gate.overflow} finding(s) past the gate's row cap were not inspected`;
+}
+
+/** What to gate in place of an unusable reply (a released held local leg's, or any leg's with unread
+ * rows): whatever parsed, with every completed reply attached verbatim as raw_review, so it posts as
+ * evidence and never counts as a verdict. */
 export function heldLocalEvidence(
   parsed: Record<string, unknown> | null,
   leg: { raw: string; originalText?: string; unparsedText?: string; residualReplies?: string },

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, fallbackWaivesChat, heldLocalEvidence, heldLocalSalvage, heldLocalUnusable, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import { chatStalled, fallbackWaivesChat, gateUnreadRows, heldLocalEvidence, heldLocalSalvage, heldLocalUnusable, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
 import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
@@ -231,6 +231,11 @@ describe("heldLocalUnusable / heldLocalEvidence: a released held local reply is 
   it("a gate that never inspected every reported finding (rows past its cap) is not", () => {
     assert.equal(heldLocalUnusable({ ...ok, overflow: 1 }, {}), "1 finding(s) past the gate's row cap were not inspected");
     assert.equal(heldLocalUnusable({ ...ok, overflow: 0 }, {}), undefined);
+    // Unread rows disqualify every leg, not only the held local one (chat, race).
+    assert.equal(gateUnreadRows({ ...ok, overflow: 1 }), "1 finding(s) past the gate's row cap were not inspected");
+    assert.equal(gateUnreadRows({ ...ok, overflow: 0 }), undefined);
+    assert.equal(gateUnreadRows({ ...ok, overflow: 1, rawReview: "x" }), undefined, "already salvaged verbatim");
+    assert.equal(gateUnreadRows({ ok: false, reason: "r" }), undefined);
   });
 
   it("a clean gate whose reply also carried text outside the accepted JSON is not", () => {

@@ -25,10 +25,11 @@ const {recommended_test:_test,...partial}=finding;
 const malformedJson=JSON.stringify({findings:[{...partial,title:'LOCAL-RAW duplicate write'}],merge_recommendation:'REQUEST_CHANGES'});
 // nine well-formed findings: the gate inspects eight, all on a file this PR does not change (policy
 // drops), and never reaches the ninth, a valid P1 on the changed file
-const overflowJson=JSON.stringify({merge_recommendation:'REQUEST_CHANGES',findings:[
+const overflowOf=mark=>JSON.stringify({merge_recommendation:'REQUEST_CHANGES',findings:[
   ...Array.from({length:8},(_,i)=>({...finding,file:'unchanged.ts',title:`Unchanged file ${i+1}`})),
-  {...finding,title:'LOCAL-RAW ninth finding: duplicate write'},
+  {...finding,title:`${mark} ninth finding: duplicate write`},
 ]});
+const overflowJson=overflowOf('LOCAL-RAW');
 
 const CHAT={
   clean:cleanJson,
@@ -36,6 +37,8 @@ const CHAT={
   // exactly what the bridge stores for an unparseable reply with JSON repair off
   unparseable:salvageReviewJson('P1 a.ts:1 CHAT-RAW duplicate write'),
   none:'{"findings":"not a list"}',
+  // the same nine rows from chat: its unread ninth P1 makes it evidence, never a clean result
+  overflow:overflowOf('CHAT-RAW'),
 };
 const fail500=res=>{res.writeHead(500,{'content-type':'application/json'});res.end('{"error":"model crashed"}');};
 // Local request #i gets replies[i] (the last one repeats); a function reply answers the request itself.
@@ -97,6 +100,8 @@ const CELLS={
   'clean x notRun':posted(CLEAN,M0,0),
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`findings x ${local}`,local==='notRun'?posted(SUMMARY,MF,0):chatFindings])),
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`unparseable x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW']}):chatRaw])),
+  // chat's unread rows are evidence: never verify / verified-clean / clean, local stays held
+  ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`overflow x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW']}):chatRaw])),
   // local as the chat-down fallback is an ordinary reviewer: race parity, no verification note
   'none x clean':posted(CLEAN,M0,1,{stamp:'fallback'}),
   'none x assumesSkipped':posted(CLEAN,M0,1,{stamp:'fallback'}),
@@ -180,6 +185,26 @@ for(const [name,e] of Object.entries(CELLS)){
     assertPosted(name,e,run,app.reviews[0].body);
   });
 }
+
+// Race is where the unread-row case posted clean and CONVERGED before: chat's ninth row was never read.
+test('race outcome: chat overflow × local clean is evidence, never clean or CONVERGED',async t=>{
+  const app=await appFixture({localReviewRole:'race',localJsonRepairEnabled:false});t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const out=await app.mention('race-chat-overflow');
+  const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+  await app.harbor.submitHarborChat(out.jobId,CHAT.overflow);
+  await eventually(()=>app.localRequests.length===1,'race did not start local');
+  app.localResponses[0].end(envelope(cleanJson));
+  await eventually(()=>app.reviews.length===1,'the review was not posted');
+  const body=app.reviews[0].body;
+  assert.equal(body.split('\n')[0],SUMMARY,'not the clean first line');
+  assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MR,'raw marker');
+  assert.equal(converged(body),false,'never CONVERGED');
+  const start=body.indexOf(REVIEW_RAW_START);
+  assert.ok(start>=0&&body.indexOf('CHAT-RAW ninth finding')>start,'the unread ninth row is posted in the raw block');
+  assert.ok(job().assumptions.includes("chatgpt: 1 finding(s) past the gate's row cap were not inspected (reply posted verbatim)"),'the job records why');
+});
 
 test('verify-clean outcome: the note credits only the chat reviewer whose structured result was clean',async t=>{
   const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());

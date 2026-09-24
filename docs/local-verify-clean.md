@@ -58,6 +58,15 @@ Rules the table encodes:
   `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block. So a
   verifier whose P1 the gate dropped never reads as "local verification agreed", and the note names
   why the reply could not be used.
+- Unread rows disqualify **every** leg, not only a held local one: a chat or local leg, on race or
+  verify-clean, whose reply has findings past the gate's `GATED_FINDINGS_CAP` rows (`overflow`, never
+  inspected) is gated as evidence the same way (`gateUnreadRows` in `gateLeg`): what the gate read,
+  plus the full reply verbatim as the raw block, with `<provider>: N finding(s) past the gate's row
+  cap were not inspected (reply posted verbatim)` among the assumptions. It is never a clean
+  structured result, so it never starts or supports a verification round and never posts `clean` or
+  `verified-clean`: the unread row may be the finding (cells `overflow × *`, and the race test). This
+  is a gate rule, so it is the one place this document changes a race job: before it, race posted
+  such a reply clean and CONVERGED.
 - "A reviewer was skipped" is structured provider state: `submitHarborChat` stamps
   `Job.skippedProviders` (the enabled reviewers with no payload) with the merge, and the body lists it
   as one system line. It is never inferred from assumptions, which also carry the reviewers' own

@@ -31,7 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, fallbackWaivesChat, heldLocalEvidence, heldLocalReleased, heldLocalSalvage, heldLocalUnusable, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
+import { chatStalled, fallbackWaivesChat, gateUnreadRows, heldLocalEvidence, heldLocalReleased, heldLocalSalvage, heldLocalUnusable, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -1033,9 +1033,11 @@ export async function submitHarborChat(
   const invalid: string[] = [];
   const heldLocal = !job.chatFpRound && heldLocalReleased(job);
   let localUnusable: string | undefined;
+  const unusableNotes: string[] = [];
   for (const leg of payloads) {
     const { gate, unusable } = gateLeg(leg, sample, heldLocal);
-    if (unusable) localUnusable = unusable;
+    if (unusable) unusableNotes.push(`${leg.provider}: ${unusable} (reply posted verbatim)`);
+    if (unusable && leg.provider === "local") localUnusable = unusable;
     if (!gate.ok) {
       invalid.push(`${leg.provider}: ${gate.reason}`);
       continue;
@@ -1086,7 +1088,7 @@ export async function submitHarborChat(
   const nextAssumptions = [
     skipped.length ? skippedNote(skipped) : "",
     ...invalid,
-    localUnusable ? `local: ${localUnusable} (reply posted verbatim)` : "",
+    ...unusableNotes,
     ...merged.assumptions,
   ].filter(Boolean);
   // merged.findings is already publish-gated (gateLiveSubmission applies the poster's partition with
@@ -1133,11 +1135,12 @@ export async function submitHarborChat(
 /** Gate one reviewer leg. A released held local leg whose reply is not a verdict (docs §1: it failed
  * the gate, the gate dropped a finding it reported, or it took a reply that was not review JSON to
  * get there) is gated as evidence instead: its complete text posts verbatim, so it never counts as
- * verification and nothing it reported is lost. */
+ * verification and nothing it reported is lost. So is any leg, chat included and on any role, whose
+ * rows past the gate's cap went unread (gateUnreadRows): it is never a clean structured result. */
 function gateLeg(leg: ChatLeg, sample: SamplePr, heldLocal: boolean): { gate: ReturnType<typeof gateLiveSubmission>; unusable?: string } {
   const parsed = parseChatSubmission(leg.raw);
   const gate = gateLiveSubmission(parsed, sample, state.settings);
-  const unusable = heldLocal && leg.provider === "local" ? heldLocalUnusable(gate, leg) : undefined;
+  const unusable = heldLocal && leg.provider === "local" ? heldLocalUnusable(gate, leg) : gateUnreadRows(gate);
   return unusable ? { gate: gateLiveSubmission(heldLocalEvidence(parsed, leg), sample, state.settings), unusable } : { gate };
 }
 

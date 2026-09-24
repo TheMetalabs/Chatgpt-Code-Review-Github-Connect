@@ -37,6 +37,13 @@ describe("parseFixResponse", () => {
     assert.match(err('{"files":[]}'), /no rationale/);
   });
 
+  it("rejects a no-change round that marks a finding fixed (nothing changed, so nothing was fixed)", () => {
+    const fixedNoFiles = '{"summary":"done","files":[],"dispositions":[{"finding":"F1","action":"fixed","note":"done"},{"finding":"F2","action":"pushback","note":"n"}]}';
+    assert.match(err(fixedNoFiles), /no files changed, yet F1 marked fixed/);
+    const declined = ok('{"summary":"false positive","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"n"}]}');
+    assert.deepEqual(declined.files, []);
+  });
+
   it("rejects a sensitive repo-control path at the parser boundary (J6)", () => {
     assert.match(err('{"files":[{"path":".github/workflows/ci.yml","content":"x"}]}'), /sensitive/);
     assert.match(err('{"files":[{"path":".github/actions/x/action.yml","content":"x"}]}'), /sensitive/);

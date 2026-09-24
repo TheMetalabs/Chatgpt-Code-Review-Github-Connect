@@ -137,8 +137,11 @@ export function parseFixResponse(raw: string): FixParse {
   const dispositions = parseDispositions((parsed as { dispositions?: unknown }).dispositions);
   if (filesRaw.length === 0) {
     // A no-change round is valid ONLY when the agent gave a rationale (push-back/decline/defer of
-    // every finding); a bare empty response with no summary is malformed → fail closed.
+    // every finding); a bare empty response with no summary is malformed → fail closed. Nothing
+    // changed, so no finding can be "fixed": a response that says so contradicts itself (retry).
     if (summaryRaw.trim().length === 0) return { ok: false, error: "empty response (no files, no rationale)" };
+    const claimed = dispositions.filter((d) => d.action === "fixed").map((d) => d.finding);
+    if (claimed.length) return { ok: false, error: `no files changed, yet ${claimed.join(", ")} marked fixed` };
     return { ok: true, fix: { summary: summaryRaw, files: [], dispositions } };
   }
   const seen = new Set<string>();

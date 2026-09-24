@@ -286,3 +286,99 @@ test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a 
  await eventually(async()=>{await worker.evaluate(()=>tick());pageB=chatPages()[0];return pageB&&pageB.evaluate(()=>window.sends===1).catch(()=>false);},'the newer fix did not start');
  assert.match(await userText(pageB),/FIX PROMPT B for fixture#2/);
 });
+
+// ── Tab release (#82) with the real unpacked extension. The worker's own scheduling (its 2.5 s
+// interval, alarm and poll-now all call the global `tick`) is gated so the test decides when the
+// real tick body runs; nothing else about the worker, the content scripts or the bridge is replaced.
+const releaseHtml=`<!doctype html><html><body>
+ <main id="turns"></main><form data-type="unified-composer" onsubmit="return false">
+ <textarea id="prompt-textarea" style="width:500px;height:100px"></textarea>
+ <button id="send" data-testid="send-button" aria-label="Send prompt" type="button">Send</button></form>
+ <script>
+ window.sends=0;
+ document.querySelector('#send').onclick=()=>{window.sends++;const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';
+  const user=document.createElement('div');user.dataset.messageAuthorRole='user';user.dataset.messageId='user-1';user.textContent=document.querySelector('textarea').value;
+  turn.append(user);document.querySelector('#turns').append(turn);document.querySelector('textarea').value='';};
+ window.ensureAnswer=()=>{let turn=document.querySelector('#answer');if(turn)return turn;
+  turn=document.createElement('section');turn.id='answer';turn.dataset.testid='conversation-turn-2';
+  turn.innerHTML='<div data-message-author-role="assistant" data-message-id="asst-1"><div class="markdown"><p>Review below.</p><pre><div>JSON</div><div><code id="code"></code></div></pre></div></div>';
+  document.querySelector('#turns').append(turn);return turn;};
+ // Generating: Stop visible, no response actions.
+ window.stream=text=>{window.ensureAnswer();document.querySelector('#code').textContent=text;
+  if(!document.querySelector('#stop')){const s=document.createElement('button');s.id='stop';s.type='button';s.dataset.testid='stop-button';s.ariaLabel='Stop streaming';s.textContent='stop';s.style.cssText='width:32px;height:32px';document.querySelector('form').append(s);}};
+ // As ChatGPT ends a stream: Stop goes and the action bar mounts while the code block still ends in a
+ // partial closing fence, and a few no-text commits follow; reveal() then draws the rest of the fence.
+ window.finish=(raw,tail)=>{window.ensureAnswer();document.querySelector('#code').textContent=raw+tail;
+  document.querySelector('#stop')?.remove();
+  const bar=document.createElement('div');bar.setAttribute('aria-label','Response actions');bar.setAttribute('role','group');
+  bar.innerHTML='<button data-testid="copy-turn-action-button" aria-label="Copy response" style="width:32px;height:32px">c</button>';
+  document.querySelector('#answer').append(bar);
+  let n=0;const id=setInterval(()=>{bar.classList.toggle('commit-'+(n%2));if(++n>=4)clearInterval(id);},15);};
+ window.reveal=raw=>{document.querySelector('#code').textContent=raw;};
+ </script></body></html>`;
+async function gatedExtension(t,app,html) {
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-release-e2e-'));
+ const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
+ const extension=join(root,'extension');
+ const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,
+   channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',certificatePin(proxy),`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ t.after(async()=>{await context.close();await rm(profile,{recursive:true,force:true});});
+ const manager=await context.newPage();await manager.goto('chrome://extensions');
+ const developerMode=manager.locator('#devMode');await developerMode.waitFor({state:'visible'});
+ assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
+ if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ const worker=await extensionWorker(context,manager);
+ await manager.close();
+ await worker.evaluate(()=>{globalThis.__realTick=tick;tick=async()=>{};});
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,maxReviewTabs:4}),app.origin);
+ const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
+ return {context,worker,chatPages,tick:()=>worker.evaluate(()=>__realTick())};
+}
+let mentions=0;
+const request=(app,pr)=>{const id=++mentions;return app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:`release-${pr}-${id}`,event:'issue_comment',payload:{action:'created',installation:{id:1},
+ repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:pr,pull_request:{},title:'release '+pr},comment:{id:9000+id,body:'@ashlar-bot review'}}});};
+const historyStages=(app,jobId)=>(app.history.getJob(jobId,true)?.steps||[]).filter(s=>s.provider==='chatgpt').map(s=>`${s.source}:${s.stage}`);
+
+test('MV3 tab release: ChatGPT finishing the code fence after collection no longer keeps the posted review\'s tab open',async t=>{
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
+ const {chatPages,tick}=await gatedExtension(t,app,releaseHtml);
+ const req=request(app,501);assert.equal(req.queued,true);
+ let page;
+ await eventually(async()=>{await tick();page=chatPages()[0];return page&&page.evaluate(()=>window.sends===1).catch(()=>false);},'prompt was not submitted',15000);
+ const raw=JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['fixture checked']},null,2);
+ await page.evaluate(()=>window.stream('{\n  "findings": ['));
+ await tick();
+ await page.evaluate(raw=>window.finish(raw,'\n`'),raw);
+ // The page collects (its step journal is shared session storage) before the fence finishes; the
+ // worker asks only after that, as in the field (collection -> can-close 0.5-3.7 s).
+ await eventually(()=>page.evaluate(()=>Object.keys(sessionStorage).filter(k=>k.startsWith('ashlar:steps:'))
+  .some(k=>JSON.parse(sessionStorage.getItem(k)).events.some(e=>e.stage==='response_collected'))),'the page did not collect its answer',5000);
+ await page.evaluate(raw=>window.reveal(raw),raw);
+ await eventually(async()=>{await tick();return app.reviews.length===1&&page.isClosed();},'the posted review\'s tab was not closed',15000);
+ const original=app.history.getJob(req.jobId,true)?.responses?.chatgpt?.original||'';
+ assert.ok(original.endsWith('}\n`'),`the race happened: the collected original still ends in the partial fence (${JSON.stringify(original.slice(-4))})`);
+ const stages=historyStages(app,req.jobId);
+ assert.ok(stages.includes('worker:tab_closed'),`closed in history: ${stages}`);
+ assert.equal(stages.includes('worker:tab_preserved'),false);
+});
+
+test('MV3 tab release: a still-generating review superseded by a new mention closes its tab at once; the new review starts',async t=>{
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
+ const {worker,chatPages,tick}=await gatedExtension(t,app,releaseHtml);
+ const first=request(app,601);assert.equal(first.queued,true);
+ let old;
+ await eventually(async()=>{await tick();old=chatPages()[0];return old&&old.evaluate(()=>window.sends===1).catch(()=>false);},'first prompt was not submitted',15000);
+ await old.evaluate(()=>window.stream('{\n  "findings": ['));
+ await tick();
+ const second=request(app,601);assert.equal(second.queued,true);
+ assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===first.jobId)?.status,'cancelled','the new mention superseded the generating review');
+ await eventually(async()=>{await tick();return old.isClosed();},'the superseded review\'s tab was not closed',15000);
+ const jobs=await worker.evaluate(()=>chrome.storage.local.get('pendingReviewJobs').then(s=>Object.keys(s.pendingReviewJobs||{})));
+ assert.equal(jobs.includes(first.jobId),false,'the superseded job retired');
+ let next;
+ await eventually(async()=>{await tick();next=chatPages().find(p=>p!==old);return next&&next.evaluate(()=>window.sends===1).catch(()=>false);},'the new review did not start',15000);
+ assert.equal(chatPages().length,1,'only the new review\'s tab is open');
+ const stages=historyStages(app,first.jobId);
+ assert.ok(stages.includes('page:cancelled')&&stages.includes('worker:tab_closed'),`the stop and the close reach history: ${stages}`);
+});

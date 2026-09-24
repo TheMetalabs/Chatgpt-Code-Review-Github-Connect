@@ -699,14 +699,21 @@ async function cleanupProviderBody(job, provider, jobs) {
       await saveJobs(jobs);
     }
     if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
-    // A fix with no answer to show for it (the server cancelled it, or its run failed: quota, an
-    // error) closes only on the page's cancel-phase ownership proof; a delivered answer closes only on
-    // its complete-phase proof (can-close below). Either way the page re-establishes the full proof.
-    if (job.kind === "fix" && (job.serverStatus === "cancelled" || state.outcome?.ok !== true)) {
+    // The proof phase of a fix close is chosen by LOCAL proof only, never by server status: a leg
+    // that collected an answer (state.outcome.ok) closes only on its complete-phase proof (can-close
+    // below: the bound response ID and answer text still equal the stored completion), whatever the
+    // server reports (cancelled: settled, superseded, or forgotten by a restart or prune). Only a
+    // leg with no collected answer (cancelled before one, or its run failed: quota, an error) closes
+    // on the page's cancel-phase proof. Either way the page re-establishes the full proof. (An answer
+    // the server rejected (400, deliverOutcome) was collected too: its outcome became a failure, but
+    // `rejectedRaw` keeps the proof that the tab shows a collected answer.)
+    if (job.kind === "fix") {
+      const collected = state.outcome?.ok === true || typeof state.rejectedRaw === "string";
       // A tab that never finishes loading cannot answer for itself: past the ownership wait it is
       // preserved (never closed unproven) so the job retires and its capacity is released.
-      if (tab.status && tab.status !== "complete") return waitOrPreserveFixTab(job, provider, jobs, "the cancelled fix tab never finished loading; tab preserved");
-      return forceCloseFixTab(job, provider, jobs, tab);
+      if (tab.status && tab.status !== "complete") return waitOrPreserveFixTab(job, provider, jobs,
+        collected ? "the delivered fix tab never finished loading; tab preserved" : "the cancelled fix tab never finished loading; tab preserved");
+      if (!collected) return forceCloseFixTab(job, provider, jobs, tab);
     }
     if (tab.status && tab.status !== "complete") return;
     if (sourceArchiveDurable(state) && !sourceCleanupProofConfirmed(state)) {

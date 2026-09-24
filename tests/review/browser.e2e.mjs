@@ -430,6 +430,38 @@ test(`real DOM: a fix delivered, then its sent turn edited to "${edit}": can-clo
 });
 }
 
+// Round 12 (Ashlar 4097631101): the server reports the fix cancelled or unknown (a registry restart
+// or a terminal-retention prune forgets it) AFTER its answer was collected and delivered. The close
+// proof follows the local proof (an answer was collected), never the server status: an answer the
+// user regenerated or replaced (no follow-up turn, no draft) is preserved and its slot released,
+// never closed on the weaker cancel-phase proof. Control: the unchanged completion still closes.
+const ANSWER_CHANGES={
+ unchanged:null,
+ regenerated:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="response-A"] code').textContent='{"summary":"regenerated","files":[]}';}),
+ replaced:({page})=>page.evaluate(()=>{const r=document.querySelector('[data-message-id="response-A"]');r.dataset.messageId='response-B';r.querySelector('code').textContent='{"summary":"another answer","files":[]}';}),
+};
+for(const status of ['cancelled','unknown'])for(const [change,apply] of Object.entries(ANSWER_CHANGES)){
+test(`real DOM: a delivered fix whose server then reports ${status}, answer ${change}: ${apply?'preserved and released, never closed':'closed on the complete-phase proof (control)'}`,async t=>{
+ const ctx=await conversationPage(t,'fix');
+ const server={value:'awaiting_chat'};
+ const {b,state}=wiredWorker(ctx.page,server);
+ await b.tick();
+ // the worker takes and delivers the answer; its cleanup is held until the server forgot the item
+ const cleanup=b.context.cleanupProvider;b.context.cleanupProvider=async()=>{};
+ await ctx.complete();await ctx.page.clock.runFor(3200);await b.tick();
+ assert.equal(b.calls.some(c=>c.action==='complete'),true,'delivered while the proof held');
+ assert.equal(state().outcome?.ok,true,'the local outcome is kept');
+ server.value=status;await b.tick();
+ assert.equal(b.local.state.pendingReviewJobs['fix-A'].serverStatus,status);
+ await apply?.(ctx);
+ b.context.cleanupProvider=cleanup;
+ await b.tick();
+ const got={closed:b.closedTabs.length,retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released,
+  askedCancel:b.messages.some(m=>m.type==='ashlar-fix-cancel' && !m.preserve)};
+ assert.deepEqual(got,apply?{closed:0,retired:true,released:true,askedCancel:false}:{closed:1,retired:true,released:false,askedCancel:false});
+});
+}
+
 // ── The fix ownership proof at EVERY page decision point (conformance rows P19-P23): the same
 // violations of the full proof (fixOwnershipProof) against each decision, with a control. A cell
 // is `true` when the decision acts for Ashlar (collects, hands out, closes, restores, force-closes).
@@ -458,6 +490,9 @@ const PROOF_DECISIONS={
  },
  // P23 force-close on cancel (ashlar-fix-cancel)
  cancel:async ctx=>{await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-fix-cancel')).owned===true;},
+ // P26 cancel after the answer was collected (round 12): the page derives the checks from its local
+ // state, so with a stored completion the cancel proof also requires that exact answer
+ cancelCollected:async ctx=>{await ctx.complete();await ctx.page.clock.runFor(3200);await ctx.harvest();await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-fix-cancel')).owned===true;},
 };
 // A changed response is a violation only once a completion is stored; the collector and the
 // cancel proof have none to compare with.

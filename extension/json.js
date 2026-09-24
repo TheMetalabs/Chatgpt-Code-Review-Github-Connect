@@ -485,8 +485,10 @@ function storedFixCompletion(state) {
  *
  * owned = the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact"), no
  * follow-up turn, no user draft, the page still shows the conversation the run was pinned in and
- * ("complete") the currently bound response is done and still the stored completion (response ID
- * and answer text; `completion` overrides the stored one, for a restore). "cancel" before the send
+ * ("complete", and "cancel" whenever this run holds a stored completion: the checks follow the local
+ * state, never the caller's reason for asking) the currently bound response is done and still the
+ * stored completion (response ID and answer text; `completion` overrides the stored one, for a
+ * restore). "cancel" before the send
  * is confirmed: a blank page or just Ashlar's own prompt (`blank` / `unsent`: the worker also
  * requires the allocation page). takenOver = the user's (follow-up, edited turn, draft, another
  * response); unknown = not provable now (journal unreadable, turn not rendered, identity not
@@ -522,10 +524,16 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
     return takeOver("turn_not_ashlars");
   }
   const bound = boundReviewResponse(submission);
+  // The checks are derived from LOCAL state, not from the caller's phase alone: once this run holds
+  // a collected answer (a stored completion), every decision that can close the tab ("complete",
+  // and "cancel": the server settled or forgot the item) also requires that exact answer, so a
+  // regenerated or replaced response is never closed on the weaker cancel proof.
+  const stored = phase === "complete" || phase === "cancel" ? (completion || storedFixCompletion(state)) : null;
+  const answered = phase === "complete" || Boolean(stored);
   if (bound.followup) return takeOver("followup");
   if (!bound.identified) {
     // A collected answer whose turn is gone was replaced (edited, regenerated or deleted).
-    if (phase === "complete") return takeOver("response_changed");
+    if (answered) return takeOver("response_changed");
     return users.length && phase === "cancel" ? takeOver("turn_not_ashlars") : verdict("unknown", "turn_unrendered");
   }
   // The bound match only proves the sent turn CONTAINS Ashlar's prompt; an edited turn (a prefix
@@ -545,8 +553,7 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   // leave this DOM on screen under the new URL: the proof holds only in the pinned conversation.
   if (!submission.conversation) return verdict("unknown", "unpinned", {identity: "unestablished"});
   if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
-  if (phase === "complete") {
-    const stored = completion || storedFixCompletion(state);
+  if (answered) {
     if (!stored) return verdict("unknown", "no_completion", {conversation: submission.conversation});
     if (!bound.root || (bound.responseId || "") !== (stored.responseId || "")) return takeOver("response_changed");
     const busy = (typeof stopButtonVisible === "function" && stopButtonVisible()) ||

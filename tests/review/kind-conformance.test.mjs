@@ -241,6 +241,53 @@ const ROWS = [
       await b.tick();
       return {closed: b.closedTabs.length, askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel')};
     }},
+  // W33/W34 (round 12, Ashlar 4097631101): the proof a close rests on is chosen by LOCAL proof (an
+  // answer was collected: state.outcome.ok), never by server status. The server settling or
+  // forgetting the item (a restart or a terminal-retention prune reports an unknown fix id as
+  // cancelled) cannot downgrade a collected answer to the weaker cancel-phase proof, which never
+  // compares the response with the stored completion. (`serverStatus`: what an earlier heartbeat
+  // stored; cleanup runs before the tick's own heartbeat.)
+  {id: 'W33', name: 'an answer was collected, then the server reports cancelled / unknown and the page says the answer was replaced', same: true,
+    expect: {cancelled: {askedCancel: false, closed: 0, retired: true}, unknown: {askedCancel: false, closed: 0, retired: true}},
+    async run(kind) {
+      const got = {};
+      for (const status of ['cancelled', 'unknown']) {
+        const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
+          outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
+        // the cancel-phase proof would say owned (it never checks the answer); the complete-phase
+        // proof sees the regenerated/replaced response and hands the tab back
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
+          : {ok: true, canClose: false, reason: 'repurposed', ownership: 'takenOver', proof: 'response_changed', url: URL_TAB}});
+        await b.tick();await b.tick();
+        got[status] = {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs.length, retired: !b.pending()};
+      }
+      return got;
+    }},
+  {id: 'W34', name: 'an answer was collected, then the server reports cancelled / unknown and the completion is unchanged (control)', same: true,
+    expect: {cancelled: {askedCancel: false, closed: [10], retired: true}, unknown: {askedCancel: false, closed: [10], retired: true}},
+    async run(kind) {
+      const got = {};
+      for (const status of ['cancelled', 'unknown']) {
+        const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
+          outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
+          : {ok: true, canClose: true, reason: 'complete', ownership: 'owned', url: URL_TAB, conversation: URL_TAB}});
+        await b.tick();await b.tick();
+        got[status] = {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs, retired: !b.pending()};
+      }
+      return got;
+    }},
+  {id: 'W35', name: 'a collected answer the server rejected (400: its outcome became a failure), then the page says the answer was replaced', same: true,
+    // The collected answer is proven locally by rejectedRaw: the close still needs the complete-phase proof.
+    expect: {askedCancel: false, closed: 0, retired: true},
+    async run(kind) {
+      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, rejectedRaw: ANSWER[kind],
+        outcome: {ok: false, code: 'error', error: 'completed review was rejected: HTTP 400'}}),
+      handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
+        : {ok: true, canClose: false, reason: 'repurposed', ownership: 'takenOver', proof: 'response_changed', url: URL_TAB}});
+      await b.tick();
+      return {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs.length, retired: !b.pending()};
+    }},
   {id: 'W11', name: 'a lease conflict (409) on complete drops the lease; the outcome is kept for redelivery', same: true,
     expect: {lease: undefined, kept: true},
     async run(kind) {

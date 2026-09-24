@@ -283,15 +283,16 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  *  - "reload": the turn is already rendered and the journal is only `attempted`: the click belonged
  *    to an earlier page, so this page sees the send confirmed only after a reload.
  * `gated`: the runner waits after the send is confirmed until `openCollect()`, so a test can act
- * between the send proof and the collector's first poll. */
+ * between the send proof and the collector's first poll. `userId`: the sent turn's message ID when it
+ * renders (null: the renderer has assigned none yet). */
 // CONV_URL: a conversation URL; TEMP_URL: the page a fix tab opens on (ChatGPT's temporary chat keeps
 // this URL for its whole life, so it is the conversation's identity); NEW_URL: a bare new-chat page
 // that names no conversation until the provider assigns one.
 const CONV_URL='https://chatgpt.com/c/fix-conv',OTHER_URL='https://chatgpt.com/c/users-own-conv';
 const TEMP_URL='https://chatgpt.com/?temporary-chat=true',NEW_URL='https://chatgpt.com/';
-async function conversationPage(t,kind,{url=CONV_URL,jobId=kind==='fix'?'fix-A':'job-A',sent='click',gated=false,body=`<p>Here.</p><pre><code>${'{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["x"],"summary":"s","files":[]}'}</code></pre>`}={}){
+async function conversationPage(t,kind,{url=CONV_URL,jobId=kind==='fix'?'fix-A':'job-A',sent='click',gated=false,userId='user-A',body=`<p>Here.</p><pre><code>${'{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["x"],"summary":"s","files":[]}'}</code></pre>`}={}){
  const page=await browser.newPage();t.after(()=>page.close());
- const turns=`<section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${body}</div></div></section>`;
+ const turns=`<section data-testid="conversation-turn-1"><div data-message-author-role="user"${userId?` data-message-id="${userId}"`:''}>fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${body}</div></div></section>`;
  const html=sent==='click'
   ?`<html><body><main></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px">fix prompt</div><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form></body></html>`
   :`<html><body><main>${turns}</main>${stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form></body></html>`;
@@ -466,6 +467,22 @@ for(const row of SEND_IDENTITY_ROWS){
   assert.deepEqual(got,row.owned
    ?{harvested:true,canClose:true,delivered:true,takenOver:false,closed:1,retired:true,released:false,atSend:row.recorded,recorded:row.recorded}
    :{harvested:false,canClose:false,delivered:false,takenOver:true,closed:0,retired:true,released:true,atSend:row.recorded,recorded:row.recorded});
+ });
+}
+
+// Round 13 sweep: a message ID the renderer assigns to the sent turn after mounting is recorded in a
+// fix journal only while the page still shows the conversation its send was proven in; after an
+// in-page move, the turn at the recorded position proves nothing about the send. (A review journal
+// carries no conversation and keeps its late-ID upgrade unchanged.)
+for(const moved of [false,true]){
+ test(`real DOM: a late message ID on a fix's sent turn is ${moved?'never recorded after an in-page move':'recorded in its send-time conversation (control)'}`,async t=>{
+  const ctx=await conversationPage(t,'fix',{url:TEMP_URL,userId:null,gated:true});
+  assert.equal((await ctx.journal()).messageId,'','the turn had no ID when the send was proven');
+  if(moved)await ctx.move(OTHER_URL);
+  await ctx.page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').dataset.messageId='late-id';});
+  await ctx.openCollect();await ctx.page.clock.runFor(1600);
+  assert.equal((await ctx.journal()).messageId,moved?'':'late-id');
+  assert.equal((await ctx.journal()).conversation,TEMP_URL);
  });
 }
 

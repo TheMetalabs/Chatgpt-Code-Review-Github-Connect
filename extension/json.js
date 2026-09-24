@@ -184,8 +184,12 @@ function boundReviewResponse(submission) {
     return {root: null, followup: false, identified: false};
   }
   // Some renderers assign message IDs after mounting the text. Pin that identity
-  // when it appears rather than staying on the weaker positional fallback.
-  if (!submission.messageId && user.getAttribute("data-message-id")) {
+  // when it appears rather than staying on the weaker positional fallback. A fix
+  // journal (it carries the conversation its send was proven in) records it only
+  // while the page still shows that conversation: after an in-page move the turn at
+  // the recorded position proves nothing about the send. Review journals: unchanged.
+  if (!submission.messageId && user.getAttribute("data-message-id") &&
+      (!submission.conversation || submission.conversation === conversationIdentity(globalThis.location?.href))) {
     submission.messageId = user.getAttribute("data-message-id");
     const state = globalThis.__ashlarRunnerState;
     if (state?.confirmedSubmission?.record === submission) {

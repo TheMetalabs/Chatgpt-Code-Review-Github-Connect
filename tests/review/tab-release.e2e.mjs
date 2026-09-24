@@ -89,6 +89,17 @@ for(const kind of ['review','fix'])test(`${kind}: a cancelled run whose prompt i
  assert.equal(await tab.clicks(),0,'the stop marker survives the reload');
  assert.equal((await tab.runner()).code,'cancelled');
 });
+test('a stop that could not be persisted still holds when a late run message reaches the re-bound page',async t=>{
+ // After a reload the page is bound from sessionStorage but runs nothing yet; the cancel arrives
+ // while marker writes fail, then a late "ashlar-run" resumes the run: it must stay stopped.
+ const tab=await chatTab(t,{composer:PROMPT,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
+ await tab.page.evaluate(()=>{const set=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){
+  if(key.startsWith('ashlar:stopped:'))throw new DOMException('fixture quota exceeded','QuotaExceededError');return set.call(this,key,value);};});
+ assert.equal((await tab.send('ashlar-fix-cancel')).ok,true);
+ await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(2000);
+ assert.equal(await tab.clicks(),0,'the prompt is never submitted');
+ assert.deepEqual(await tab.runner(),{running:false,code:'cancelled'});
+});
 for(const kind of ['review','fix'])test(`${kind}: a cancelled run's collector ends as "cancelled" while its answer is still generating`,async t=>{
  const tab=await chatTab(t,{kind,thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
  await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(1600);

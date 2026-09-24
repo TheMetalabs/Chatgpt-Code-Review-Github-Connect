@@ -781,7 +781,9 @@ function installReviewRunner(name, run) {
     state.running = true;
     // Only a fix item's run message carries its kind; review runs keep kind undefined.
     state.kind = msg.kind === "fix" ? "fix" : undefined;
-    state.runStopped = runStoppedFor(state.jobId, state.runId);
+    // A page is bound to one (job, run) for life: a stop already taken (even one whose marker could
+    // not be written) holds, and a reload re-reads the marker.
+    state.runStopped ||= runStoppedFor(state.jobId, state.runId);
     state.nativeCompletion = undefined;
     state.sourceTrackingOwner = undefined;
     state.repairProbeTracker = undefined;

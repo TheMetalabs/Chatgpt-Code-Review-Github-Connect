@@ -4,7 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
-import {content, background, storage, flush, until} from './helpers.mjs';
+import vm from 'node:vm';
+import {content, background, storage, flush, until, source} from './helpers.mjs';
 
 const PARTS = ['I guarded the null path.', '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'];
 // A fix is read from the answer's fenced code only (literal text; see assistantCodeBlocks).
@@ -17,9 +18,10 @@ const msg = (type, extra = {}) => ({type, jobId: 'fix-A', runId: 'run-A', provid
  * `bound`: the run's prompt is sent and its response identified (a fix reads nothing else). */
 function page({parts = PARTS, blocks = [PARTS[1]], limit = 50, bound = true} = {}) {
   const c = content('chatgpt');
-  c.context.location = {href: URL_FIX}; // the conversation the fix is bound in (pinned on its first exact observation)
+  c.context.location = {href: URL_FIX}; // the page still shows the conversation the fix was sent in
   let polls = 0;
-  const journal = bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A'} : null;
+  // conversation: recorded by composer.js submissionConfirmed when the send was proven
+  const journal = bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX} : null;
   Object.assign(c.context, {
     readSubmissionJournal: async () => journal,
     // every later fix decision re-reads the same journal (fixOwnershipProof)
@@ -91,7 +93,10 @@ const COLLECT_VERDICTS = {
   edited: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; }},
   draft: {permanent: true, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'my own question'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
   moved: {permanent: true, journal: {conversation: 'https://chatgpt.com/c/users-own'}},
-  unusable: {permanent: true, set: c => { c.location = {href: ''}; }}, // no conversation identity can be pinned
+  // round 13: a sent journal with no send-time identity (legacy, or confirmed only after a reload)
+  // never gains one: the collector never records it from the current location
+  unestablished: {permanent: true, journal: {conversation: undefined}},
+  unreadableLocation: {permanent: true, set: c => { c.location = {href: ''}; }},
   turnUnrendered: {permanent: false, set: c => { c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
   composerEcho: {permanent: false, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
 };
@@ -99,7 +104,7 @@ for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
   test(`page: collect verdict "${name}" ${verdict.permanent ? 'ends the fix run at once (taken_over), slot freed' : 'is transient: the collector keeps polling'}`, async () => {
     const p = page({limit: 12});
     if (verdict.journal) {
-      const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', ...verdict.journal};
+      const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX, ...verdict.journal};
       Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
     }
     verdict.set?.(p.c.context);
@@ -611,4 +616,73 @@ test('worker: every bridge request carries the fixProtocol:1 opt-in (the server 
   assert.equal(seen.length, 10);
   assert.ok(seen.filter(s => s.body).every(s => s.body.fixProtocol === 1), JSON.stringify(seen));
   assert.deepEqual(seen.filter(s => !s.body).map(s => new URL(s.url).searchParams.get('fixProtocol')), ['1', '1']);
+});
+
+// ── Round 13 (Ashlar 4099207116): composer.js submissionConfirmed records the conversation the
+// send was made in at the moment the send is proven, exactly once. Only a send this page instance
+// clicked (the in-memory `sendAttempt`) confirmed while the page still shows the conversation it
+// was clicked in establishes it; nothing records it later.
+function composerPage(href) {
+  const saved = new Map();
+  const context = vm.createContext({console, location: {href},
+    sessionStorage: {getItem: k => saved.get(k) ?? null, setItem: (k, v) => { if (context.failWrites) throw new Error('quota'); saved.set(k, v); }}});
+  vm.runInContext(source('extension/composer.js'), context, {filename: 'composer.js'});
+  const turn = text => ({textContent: text, querySelector: () => null, getAttribute: n => (n === 'data-message-id' ? 'user-A' : null)});
+  context.turns = [];
+  context.userTurns = () => context.turns;
+  context.__ashlarRunnerState = {jobId: 'fix-A', runId: 'run-A', kind: 'fix'};
+  const key = 'ashlar:submission:fix-A:run-A';
+  return {context, turn, stored: () => JSON.parse(saved.get(key) || 'null'),
+    // what clickSend records in memory just before it clicks Send
+    click: (runId = 'run-A') => { context.__ashlarRunnerState.sendAttempt = {key: `ashlar:submission:fix-A:${runId}`, conversation: context.location.href.split('#')[0]}; },
+    record: () => ({phase: 'attempted', expected: 'fix prompt', baseline: 0, attachments: []})};
+}
+test('page: submissionConfirmed records the send-time conversation exactly once, and only for a send this page clicked where it still is', () => {
+  const p = composerPage('https://chatgpt.com/?temporary-chat=true#frag');
+  const record = p.record();
+  p.click();
+  assert.equal(p.context.submissionConfirmed(record), false, 'no turn yet: nothing is proven, nothing recorded');
+  assert.equal(record.conversation, undefined);
+  p.context.turns.push(p.turn('fix prompt'));
+  assert.equal(p.context.submissionConfirmed(record), true);
+  assert.equal(record.conversation, 'https://chatgpt.com/?temporary-chat=true', 'the location at the moment the send is proven (fragment dropped)');
+  assert.equal(p.stored().phase, 'sent');
+  assert.equal(p.stored().conversation, 'https://chatgpt.com/?temporary-chat=true', 'persisted with the sent journal');
+  // never replaced: a later confirmation (another location, another attempt) keeps the first identity
+  p.context.location.href = 'https://chatgpt.com/c/users-own';p.click();
+  p.context.submissionConfirmed(record);
+  assert.equal(record.conversation, 'https://chatgpt.com/?temporary-chat=true');
+  assert.equal(p.stored().conversation, 'https://chatgpt.com/?temporary-chat=true');
+  assert.equal(p.context.__ashlarRunnerState.confirmedSubmission.record.conversation, 'https://chatgpt.com/?temporary-chat=true');
+});
+const UNESTABLISHED = {
+  reload: () => {}, // the click belonged to an earlier page instance: no in-memory attempt here
+  otherRun: p => p.click('run-B'),
+  movedBeforeConfirm: p => { p.click();p.context.location.href = 'https://chatgpt.com/c/users-own'; }, // the old DOM renders the turn under the user's URL
+  noLocation: p => { p.click();p.context.location = undefined; },
+  reviewRun: p => { p.context.__ashlarRunnerState.kind = undefined;p.click(); }, // a review journal stays exactly as before
+};
+for (const [name, setup] of Object.entries(UNESTABLISHED)) {
+  test(`page: submissionConfirmed proves the send but records no conversation (${name})`, () => {
+    const p = composerPage('https://chatgpt.com/?temporary-chat=true');
+    const record = p.record();
+    setup(p);
+    p.context.turns.push(p.turn('fix prompt'));
+    assert.equal(p.context.submissionConfirmed(record), true, 'the send itself is proven');
+    assert.equal(record.phase, 'sent');
+    assert.equal(record.conversation, undefined, 'no send-time identity (json.js: identity "unestablished")');
+    assert.equal('conversation' in p.stored(), false);
+  });
+}
+test('page: a sent journal whose write failed keeps the send-time conversation for the retry, whatever the location later is', () => {
+  const p = composerPage('https://chatgpt.com/?temporary-chat=true');
+  const record = p.record();
+  p.click();p.context.turns.push(p.turn('fix prompt'));
+  p.context.failWrites = true;
+  assert.equal(p.context.submissionConfirmed(record), true);
+  assert.equal(p.stored(), null, 'the write failed');
+  assert.equal(p.context.__ashlarRunnerState.submissionPersistencePending, true);
+  p.context.location.href = 'https://chatgpt.com/c/users-own';p.context.failWrites = false;
+  assert.equal(p.context.retrySubmissionPersistence(), true);
+  assert.equal(p.stored().conversation, 'https://chatgpt.com/?temporary-chat=true', 'the retry writes what was proven at send, not the current URL');
 });

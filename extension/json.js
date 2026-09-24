@@ -431,37 +431,26 @@ function conversationIdentity(href) {
   return typeof href === "string" ? href.split("#")[0] : "";
 }
 
-/** Pin a fix's conversation identity in its submission journal once its sent turn is first proven
- * to be exactly Ashlar's prompt (only the collector pins: fixOwnershipProof phase "collect"). Pinned
- * ONCE and never replaced: a later URL is compared with it, so a conversation the user moved to in
- * this tab is never taken for the fix's. There is no location-based upgrade: a URL change carries
- * no evidence of whose conversation the new page is (the user can navigate before the provider
- * assigns one), and neither provider's DOM ties a conversation id to the sent turn or its response
- * (both expose only per-message ids). A fix pinned on a page that later moves is therefore
- * "unknown" there: never harvested, never closed. Fix tabs open on a page whose identity never
- * changes (ChatGPT: `/?temporary-chat=true`). Persisted with the journal (sessionStorage), so it
- * survives a reload of the tab. */
-function pinFixConversation(submission) {
-  if (!submission || submission.phase !== "sent" || submission.conversation) return;
-  const identity = conversationIdentity(globalThis.location?.href);
-  if (!identity) return;
-  submission.conversation = identity;
-  const state = globalThis.__ashlarRunnerState;
-  if (state?.confirmedSubmission?.record === submission) {
-    state.submissionPersistencePending = true;
-    if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();
-  } else {
-    try { sessionStorage.setItem(submissionKey(), JSON.stringify(submission)); } catch { /* re-pinned from memory next poll */ }
-  }
-}
+/* A fix's conversation identity is recorded ONCE, when its send is proven: composer.js
+ * submissionConfirmed writes `conversation` into the submission journal from the location at that
+ * instant (only for a send this page instance clicked, still shown where it was clicked). Every fix
+ * decision below only COMPARES the current location with it; none records one. There is no
+ * location-based pin or upgrade after the send: a later URL is no evidence of whose conversation it
+ * is (the user can move in-page while the old DOM is still rendered), and neither provider's DOM
+ * ties a conversation id to the sent turn or its response (both expose only per-message ids). A
+ * journal without it (legacy, recorded before this rule, or a confirmation seen only after a
+ * reload) is `identity:"unestablished"` for good: never harvested, never closed. A fix whose page
+ * changes URL after the send (a bare new-chat root the provider later names /c/<id>) is
+ * `identity:"changed"`. Fix tabs open on a page whose identity never changes (ChatGPT:
+ * `/?temporary-chat=true`). Persisted with the journal (sessionStorage), so it survives a reload. */
 
 /** Whether the page still shows the conversation its fix was bound in. Not established = false. */
 function fixConversationHolds(submission) {
   return Boolean(submission?.conversation) && submission.conversation === conversationIdentity(globalThis.location?.href);
 }
 
-/** The pinned conversation of this page's fix run ("" when none is established or readable). */
-function pinnedFixConversation(state) {
+/** The send-time conversation of this page's fix run ("" when none is established or readable). */
+function sentFixConversation(state) {
   try {
     const submission = state.confirmedSubmission?.record || savedSubmission();
     return typeof submission?.conversation === "string" ? submission.conversation : "";
@@ -484,7 +473,7 @@ function storedFixCompletion(state) {
  * submission journal the caller just read (default: the confirmed or saved one).
  *
  * owned = the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact"), no
- * follow-up turn, no user draft, the page still shows the conversation the run was pinned in and
+ * follow-up turn, no user draft, the page still shows the conversation its send was made in and
  * ("complete", and "cancel" whenever this run holds a stored completion: the checks follow the local
  * state, never the caller's reason for asking) the currently bound response is done and still the
  * stored completion (response ID and answer text; `completion` overrides the stored one, for a
@@ -492,7 +481,7 @@ function storedFixCompletion(state) {
  * is confirmed: a blank page or just Ashlar's own prompt (`blank` / `unsent`: the worker also
  * requires the allocation page). takenOver = the user's (follow-up, edited turn, draft, another
  * response); unknown = not provable now (journal unreadable, turn not rendered, identity not
- * pinned or moved: `identity` "unestablished" | "changed", still generating). Every takenOver
+ * recorded at send or moved: `identity` "unestablished" | "changed", still generating). Every takenOver
  * verdict is PERMANENT: it marks the tab repurposed for good (a draft the user later clears, or an
  * edit the user undoes, does not hand the tab back); see fixVerdictPermanent for what ends a run. */
 function fixOwnershipProof(state, {phase, completion, journal} = {}) {
@@ -541,8 +530,6 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   const integrity = journaledTurnIntegrity(submission, users);
   if (integrity === "unknown") return verdict("unknown", "turn_unresolved");
   if (integrity === "edited") return takeOver("edited");
-  // The first exact observation binds the fix to the conversation it is shown in (immutable).
-  if (phase === "collect") pinFixConversation(submission);
   if (draftText) {
     // The just-sent prompt can linger in the composer a moment after the send is confirmed: that
     // text is Ashlar's own, not evidence of a user (transient). Any other draft is the user's.
@@ -550,8 +537,9 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
     return takeOver("draft");
   }
   // The rendered turn proves its content only. An in-page (SPA) move to another conversation can
-  // leave this DOM on screen under the new URL: the proof holds only in the pinned conversation.
-  if (!submission.conversation) return verdict("unknown", "unpinned", {identity: "unestablished"});
+  // leave this DOM on screen under the new URL: the proof holds only in the conversation recorded
+  // when the send was proven (composer.js submissionConfirmed); a journal without one never gains it.
+  if (!submission.conversation) return verdict("unknown", "unestablished", {identity: "unestablished"});
   if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
   if (answered) {
     if (!stored) return verdict("unknown", "no_completion", {conversation: submission.conversation});
@@ -566,13 +554,13 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
 
 /** Whether a fix ownership verdict can never turn back into "owned" (bridge-fix.server.ts
  * LIFECYCLE, terminal verdicts): the user's (takenOver: follow-up, edited turn, draft, replaced
- * response), the page moved off the conversation its run was pinned in (a pinned identity never
- * comes back by waiting), or — while collecting, where the pin is made — no conversation identity
- * can be pinned at all. Everything else "unknown" is transient (journal unreadable, turn not
- * rendered yet, still generating, the sent prompt still echoed in the composer). */
-function fixVerdictPermanent(proof, phase) {
-  return proof.ownership === "takenOver" || proof.identity === "changed" ||
-    (phase === "collect" && proof.identity === "unestablished");
+ * response), the page moved off the conversation its send was made in (a recorded identity never
+ * comes back by waiting), or its sent journal carries no send-time identity (recorded only when the
+ * send is proven, so it can never be established later). The same in every phase. Everything else
+ * "unknown" is transient (journal unreadable, turn not rendered yet, still generating, the sent
+ * prompt still echoed in the composer). */
+function fixVerdictPermanent(proof) {
+  return proof.ownership === "takenOver" || proof.identity === "changed" || proof.identity === "unestablished";
 }
 
 /** End a fix run on a permanent verdict, at once: the tab is the user's for good (every later proof
@@ -594,7 +582,7 @@ function endFixRun(state, proof) {
 function fixAnswerReply(state, msg, value, busy) {
   if (value?.ok !== true || !(msg.kind === "fix" || state.kind === "fix")) return value;
   const proof = fixOwnershipProof(state, {phase: "complete"});
-  if (fixVerdictPermanent(proof, "complete")) {
+  if (fixVerdictPermanent(proof)) {
     state.result = endFixRun(state, proof);
     state.nativeCompletion = undefined;
     state.restoredCompletion = false;
@@ -605,7 +593,7 @@ function fixAnswerReply(state, msg, value, busy) {
 }
 
 /** can-close for a fix run: its answer is in hand and the full proof holds right now. A tab the
- * user took over (or one moved off its pinned conversation) is released and preserved. */
+ * user took over (or one moved off, or never given, its send-time conversation) is released and preserved. */
 function fixCanClose(state) {
   const url = globalThis.location?.href || "";
   // A run that ended on a permanent verdict (endFixRun) left a tab that is the user's for good.
@@ -617,7 +605,7 @@ function fixCanClose(state) {
     return {ok: true, canClose: false, reason: "pending", ownership: "unknown", url};
   }
   const proof = fixOwnershipProof(state, {phase: "complete"});
-  if (proof.ownership === "takenOver" || proof.identity === "changed") {
+  if (fixVerdictPermanent(proof)) {
     releaseManagedSlot(state);
     return {ok: true, canClose: false, reason: "repurposed", ownership: proof.ownership, proof: proof.reason, url};
   }
@@ -644,14 +632,14 @@ async function waitUntilFixOrQuota(name) {
     const {runner, bound, stop, streaming, done} = poll;
     // Only the response identified as the answer to THIS run's sent prompt, in a tab the full
     // ownership proof holds for right now, is a fix answer (fixOwnershipProof "collect": exact
-    // journaled turn, pinned conversation still shown, no follow-up, no draft). With no sent journal
+    // journaled turn, send-time conversation still shown, no follow-up, no draft). With no sent journal
     // or no identified response the page-global fallbacks would read whatever chat is on screen:
     // never an answer (a review keeps its legacy unbound observation). An edited turn repurposes
     // the tab for good; after an in-page move the lingering DOM is not harvested there.
     const proof = runner ? fixOwnershipProof(runner, {phase: "collect", journal: poll.submission}) : {ownership: "unknown"};
     // A permanent verdict ends the run NOW (endFixRun: slot freed, `taken_over`); only a transient
     // "unknown" keeps polling, bounded by the server's fix deadline.
-    if (runner && fixVerdictPermanent(proof, "collect")) {
+    if (runner && fixVerdictPermanent(proof)) {
       const ended = endFixRun(runner, proof);
       const error = new Error(ended.error); error.code = ended.code; throw error;
     }
@@ -713,10 +701,10 @@ function installReviewRunner(name, run) {
       "ashlar-capture-accepted", "ashlar-result-saved", "ashlar-fix-cancel"].includes(msg?.type)) return;
     const respond = reply;
     reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId, progress: reviewProgress(),
-      // A fix run reports the conversation it was bound in (once pinned) so the worker keeps it;
+      // A fix run reports the conversation its send was made in (recorded at send) so the worker keeps it;
       // review replies stay exactly as before.
-      ...(msg.kind === "fix" && !value?.conversation && state.jobId && msg.jobId === state.jobId && state.runId && msg.runId === state.runId && pinnedFixConversation(state)
-        ? {conversation: pinnedFixConversation(state)} : {})});
+      ...(msg.kind === "fix" && !value?.conversation && state.jobId && msg.jobId === state.jobId && state.runId && msg.runId === state.runId && sentFixConversation(state)
+        ? {conversation: sentFixConversation(state)} : {})});
     if (!msg.jobId) {
       reply({ ok: false, code: "job_mismatch", error: "jobId is required" });
       return;
@@ -740,11 +728,13 @@ function installReviewRunner(name, run) {
         reply({ok:false,code:"job_mismatch"});return;
       }
       state.fixCancelled = true; // The server settled this fix; stop collecting an answer for it.
-      const {ownership, reason, blank = false, unsent = false, identity, conversation} = fixOwnershipProof(state, {phase: "cancel"});
-      // A tab the user took over (or one the worker gives up identifying: preserve) stays open but
-      // is no longer Ashlar's: free its managed slot, or it counts against tab capacity (untracked
-      // binding) until the user closes it by hand.
-      if (ownership === "takenOver" || msg.preserve === true) releaseManagedSlot(state);
+      const proof = fixOwnershipProof(state, {phase: "cancel"});
+      const {ownership, reason, blank = false, unsent = false, identity, conversation} = proof;
+      // A tab on a permanent verdict (taken over, moved off its send-time conversation, or never
+      // given one) or one the worker gives up identifying (preserve) stays open but is no longer
+      // Ashlar's: free its managed slot, or it counts against tab capacity (untracked binding)
+      // until the user closes it by hand.
+      if (fixVerdictPermanent(proof) || msg.preserve === true) releaseManagedSlot(state);
       reply({ok:true,owned:ownership === "owned",ownership,proof:reason,blank,unsent,...(identity ? {identity} : {}),
         ...(conversation ? {conversation} : {}),url:globalThis.location?.href || ""});return;
     }
@@ -812,7 +802,7 @@ function installReviewRunner(name, run) {
         }
         state.kind = "fix"; // later proofs compare this run's fenced answer
         const verdict = fixOwnershipProof(state, {phase: "complete", completion: {responseId: proof.responseId, text: msg.text}});
-        if (verdict.ownership === "takenOver" || verdict.identity === "changed") {
+        if (fixVerdictPermanent(verdict)) {
           releaseManagedSlot(state);
           reply({ok:false,code:"completion_changed",proof:verdict.reason});return;
         }

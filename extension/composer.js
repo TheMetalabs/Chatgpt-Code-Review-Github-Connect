@@ -270,6 +270,13 @@ function findEligibleSendButton(selectors) {
   return null;
 }
 
+/** The identity of the conversation this page shows: its URL without the fragment (the same rule
+ * as json.js conversationIdentity, which compares against what is recorded here). */
+function shownConversation() {
+  const href = globalThis.location?.href;
+  return typeof href === "string" ? href.split("#")[0] : "";
+}
+
 function submissionConfirmed(record) {
   const turns = userTurns();
   // Composer clearing and Stop alone are not proof that THIS request was accepted.
@@ -279,6 +286,18 @@ function submissionConfirmed(record) {
   record.submittedUsers = turns.indexOf(match) + 1;
   record.messageId = match.getAttribute("data-message-id") || "";
   const state = globalThis.__ashlarRunnerState;
+  // A FIX run's conversation is a fact of THIS moment: recorded once, here, and never later (every
+  // later fix decision compares the location with it). Only a send this page instance clicked,
+  // confirmed while the page still shows the conversation it was clicked in, establishes it. A
+  // confirmation seen only after a reload (the click belonged to an earlier page) or under another
+  // location (an in-page move can leave the old DOM rendering the sent turn) proves the send, not
+  // which conversation holds it: no identity is recorded (json.js then reports
+  // `identity:"unestablished"`: never harvested, never closed). A review journal is unchanged.
+  const attempt = state?.sendAttempt;
+  if (state?.kind === "fix" && !record.conversation && attempt?.key === submissionKey() && attempt.conversation &&
+      attempt.conversation === shownConversation()) {
+    record.conversation = attempt.conversation;
+  }
   state.confirmedSubmission = {key: submissionKey(), record};
   state.submissionPersistencePending = true;
   step("prompt_submitted");
@@ -313,6 +332,10 @@ async function clickSend(findSend, findComposer, expectedText) {
           !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
         record.phase = "attempted";
         saveSubmission(record); // durable intent BEFORE invoking the site's handler
+        // In memory only: the conversation this page instance clicked in (submissionConfirmed
+        // records it once the send is proven, and only if the page still shows it then).
+        const runner = globalThis.__ashlarRunnerState;
+        if (runner) runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()};
         step("send_attempted");
         try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
       }

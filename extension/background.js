@@ -762,22 +762,7 @@ async function cleanupProviderBody(job, provider, jobs) {
       await saveJobs(jobs);
     }
     if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
-    // The proof phase of a fix close is chosen by LOCAL proof only, never by server status: a leg
-    // that collected an answer (state.outcome.ok) closes only on its complete-phase proof (can-close
-    // below: the bound response ID and answer text still equal the stored completion), whatever the
-    // server reports (cancelled: settled, superseded, or forgotten by a restart or prune). Only a
-    // leg with no collected answer (cancelled before one, or its run failed: quota, an error) closes
-    // on the page's cancel-phase proof. Either way the page re-establishes the full proof. (An answer
-    // the server rejected (400, deliverOutcome) was collected too: its outcome became a failure, but
-    // `rejectedRaw` keeps the proof that the tab shows a collected answer.)
-    if (job.kind === "fix") {
-      const collected = state.outcome?.ok === true || typeof state.rejectedRaw === "string";
-      // A tab that never finishes loading cannot answer for itself: past the ownership wait it is
-      // preserved (never closed unproven) so the job retires and its capacity is released.
-      if (tab.status && tab.status !== "complete") return waitOrPreserveFixTab(job, provider, jobs,
-        collected ? "the delivered fix tab never finished loading; tab preserved" : "the cancelled fix tab never finished loading; tab preserved");
-      if (!collected) return forceCloseFixTab(job, provider, jobs, tab);
-    }
+    if (job.kind === "fix") return cleanupFixTab(job, provider, jobs, tab);
     if (tab.status && tab.status !== "complete") return;
     if (sourceArchiveDurable(state) && !sourceCleanupProofConfirmed(state)) {
       const saved=state.sourceCapture;
@@ -821,26 +806,11 @@ async function cleanupProviderBody(job, provider, jobs) {
       return;
     }
     if (result.reason === "repurposed") return finishTabCleanup(job, provider, jobs, "user continued the conversation; tab preserved");
-    if (!result.canClose || (job.kind === "fix" && result.ownership !== "owned")) {
+    if (!result.canClose) {
       state.cleanupWaitReason="page_completion_or_journal_pending";
-      // A delivered fix's item is already settled (DONE): its leg must end too. A page that cannot
-      // prove ownership now is asked again, and past FIX_OWNERSHIP_WAIT_MS its tab is preserved
-      // (never closed unproven) so the leg retires and its capacity is freed. A review has no
-      // deadline: it waits (no forced eviction).
-      if (job.kind === "fix") return waitOrPreserveFixTab(job, provider, jobs, "the delivered fix tab never proved ownership; tab preserved", tab);
-      await saveJobs(jobs);return;
+      await saveJobs(jobs);return; // No deadline or forced eviction.
     }
     delete state.cleanupWaitReason;
-    if (job.kind === "fix") {
-      // The page re-established the full ownership proof for the delivered answer (fixOwnershipProof
-      // "complete"); the worker acts only on that verdict, and the final check compares the tab with
-      // the conversation identity it stored (never a URL echoed by the same reply).
-      if (adoptFixConversation(state, result)) await saveJobs(jobs);
-      const bound = state.conversation;
-      if (!bound || conversationIdentity(result.url) !== bound) return preserveFixTab(job, provider, jobs, "the fix tab is not in its bound conversation; tab preserved", tab);
-      await closeProvenTab(job, provider, jobs, tab.id, url => url === result.url && conversationIdentity(url) === bound);
-      return;
-    }
     await closeProvenTab(job, provider, jobs, tab.id, result.url);
   } catch (e) {
     state.cleanupError = String(e.message || e).slice(0, 240);
@@ -848,12 +818,11 @@ async function cleanupProviderBody(job, provider, jobs) {
   }
 }
 
-/** The one managed close, for a tab whose page just proved it may close (review: can-close;
- * fix: ownership on cancel): the tab must still be on the proven page (`proven`: the exact URL
- * that answered, or a predicate over the tab's URL that checks the identity the worker stored:
- * a fix's bound conversation or its allocation page), with no pending navigation and not loading,
- * and the close is recorded durably before the remove so a worker that stops in between retires
- * it by absence. */
+/** The one managed close, for a tab whose page just proved it may close (can-close): the tab must
+ * still be on the proven page (`proven`: the exact URL that answered, or a predicate over the tab's
+ * URL that checks the identity the worker stored: a fix's send-time conversation), with no pending
+ * navigation and not loading, and the close is recorded durably before the remove so a worker that
+ * stops in between retires it by absence. */
 async function closeProvenTab(job, provider, jobs, tabId, proven, reason) {
   const current = await chrome.tabs.get(tabId);
   const holds = typeof proven === "function" ? proven : url => url === proven;
@@ -864,23 +833,6 @@ async function closeProvenTab(job, provider, jobs, tabId, proven, reason) {
   await chrome.tabs.remove(tabId);
   await finishTabCleanup(job, provider, jobs, reason);
   return true;
-}
-
-/** The server cancelled a review-loop FIX item (its deadline passed, a newer request for the PR
- * superseded it, or a restart forgot it): no answer can be delivered, so waiting for completion
- * (as a review does, with no deadline) would hold the tab slot forever. This is the one managed
- * close without an acknowledged answer. It still requires the page's positive binding, and a tab
- * the user took over (follow-up, unsent draft, other conversation) is preserved.
- */
-/** Whether `url` is still exactly the page a fix tab was opened on (providerUrl: the provider's
- * new chat). The query is part of that identity (ChatGPT's `temporary-chat=true` is a different
- * mode from its plain new chat); only the fragment is ignored. Anything else is preserved. */
-function onAllocationPage(url, provider) {
-  try {
-    const now = new URL(url), opened = new URL(providerUrl(provider));
-    const query = u => [...u.searchParams].map(([k, v]) => `${k}=${v}`).sort().join("&");
-    return now.origin === opened.origin && now.pathname === opened.pathname && query(now) === query(opened);
-  } catch { return false; }
 }
 
 /** A conversation's identity: its URL without the fragment (as the page records it at send, composer.js). */
@@ -899,13 +851,66 @@ function adoptFixConversation(state, result) {
   return true;
 }
 
-/** How long a cancelled fix tab whose ownership is "unknown" is re-asked before it is preserved. */
+/** How long a DELIVERED fix whose tab cannot prove the close yet (still loading, unreachable, the
+ * page's proof pending) is re-asked before the tab is preserved. */
 const FIX_OWNERSHIP_WAIT_MS = 2 * 60_000;
 
-/** The one exit for a fix tab Ashlar keeps open (taken over, moved, unidentifiable, stuck
- * loading): the page is asked to free its managed slot when it can be messaged (`tab`), and the
- * worker records the preserved run as a backstop (the page may never answer), so the retained
- * binding is never counted as an orphan against tab capacity. Then the job retires. */
+/** Whether this fix leg ended on the proven-success path: its answer was collected
+ * (state.outcome.ok) and the server acknowledged the delivery (state.answerDelivered, written by
+ * deliverOutcome on the complete ACK only). A cancel, a supersede, a deadline, a failure (quota,
+ * error, taken_over, a rejected answer) or an outcome whose delivery record is lost never is. */
+function fixAnswerDelivered(state) {
+  return state.answerDelivered === true && state.outcome?.ok === true;
+}
+
+/** Cleanup of a fix leg. A fix tab lives in the user's logged-in chat profile, and Ashlar closes it
+ * ONLY on the proven-success path: the answer was delivered AND the page's complete-phase proof
+ * passes right now (can-close: the send-time conversation, the exact sent turn, the stored
+ * completion unchanged, no draft or follow-up), with the tab still in the conversation the worker
+ * stored. Every other end (cancelled, superseded, deadline, failure, taken over, unknown ownership,
+ * another binding, unreachable, still loading, a lost delivery record) preserves the tab: the page
+ * is asked to release its managed slot and stop its run, the worker records the preserved run
+ * (capacity backstop) and the job retires. Nothing here ever closes a tab on a cancel. */
+async function cleanupFixTab(job, provider, jobs, tab) {
+  const state = job.states[provider];
+  const loaded = !tab.status || tab.status === "complete";
+  if (!fixAnswerDelivered(state)) {
+    const why = state.outcome?.ok === false ? state.outcome.code || "failure" : state.outcome?.ok ? "answer delivery unconfirmed" : job.serverStatus || "no answer";
+    return preserveFixTab(job, provider, jobs, `fix ended without a delivered answer (${why}); tab preserved`, loaded ? tab : undefined);
+  }
+  if (!loaded) return waitOrPreserveFixTab(job, provider, jobs, "the delivered fix tab never finished loading; tab preserved");
+  let result;
+  try { result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider)); }
+  catch { return waitOrPreserveFixTab(job, provider, jobs, "the delivered fix tab could not be reached; tab preserved"); }
+  if (matchesJob(result, job, provider) && !result.canClose && result.reason === "pending" && state.outcome.completion) {
+    // A reload lost the page's in-memory completion: restore it from the worker's copy (the page
+    // re-proves it against the rendered response), then ask again.
+    const restored = await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-result-saved"), committed: true,
+      raw: state.outcome.raw, text: state.outcome.originalText, completion: state.outcome.completion}, contentFiles(provider)).catch(() => null);
+    if (matchesJob(restored, job, provider) && restored.code === "completion_changed")
+      return preserveFixTab(job, provider, jobs, "acknowledged response changed; tab preserved", tab);
+    if (matchesJob(restored, job, provider) && restored.accepted)
+      result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider)).catch(() => null);
+  }
+  if (!matchesJob(result, job, provider)) return preserveFixTab(job, provider, jobs, "the fix tab carries another binding; tab preserved");
+  if (result.reason === "repurposed") return preserveFixTab(job, provider, jobs, "user continued the conversation; tab preserved", tab);
+  if (!result.canClose || result.ownership !== "owned") {
+    state.cleanupWaitReason = "page_completion_or_journal_pending";
+    return waitOrPreserveFixTab(job, provider, jobs, "the delivered fix tab never proved ownership; tab preserved", tab);
+  }
+  delete state.cleanupWaitReason;
+  // The final check compares the tab with the conversation identity the worker stored (never a URL
+  // echoed by the same reply).
+  if (adoptFixConversation(state, result)) await saveJobs(jobs);
+  const bound = state.conversation;
+  if (!bound || conversationIdentity(result.url) !== bound) return preserveFixTab(job, provider, jobs, "the fix tab is not in its bound conversation; tab preserved", tab);
+  await closeProvenTab(job, provider, jobs, tab.id, url => url === result.url && conversationIdentity(url) === bound);
+}
+
+/** The one exit for a fix tab Ashlar keeps open: the page is asked to release its managed slot and
+ * stop its run when it can be messaged (`tab`), and the worker records the preserved run as a
+ * backstop (the page may never answer), so the retained binding is never counted as an orphan
+ * against tab capacity. Then the job retires. */
 async function preserveFixTab(job, provider, jobs, reason, tab) {
   const state = job.states[provider];
   if (tab) await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider)).catch(() => {});
@@ -913,69 +918,13 @@ async function preserveFixTab(job, provider, jobs, reason, tab) {
   return finishTabCleanup(job, provider, jobs, reason);
 }
 
-/** Ask again next tick until FIX_OWNERSHIP_WAIT_MS has passed, then preserve the tab so the job
- * retires (`tab` omitted: the page cannot be messaged, e.g. still loading). */
+/** The success path only: ask again next tick until FIX_OWNERSHIP_WAIT_MS has passed, then preserve
+ * the tab so the job retires (`tab` omitted: the page cannot be messaged, e.g. still loading). */
 async function waitOrPreserveFixTab(job, provider, jobs, reason, tab) {
   const state = job.states[provider];
   state.ownershipUnknownAt ??= Date.now();
   if (Date.now() - state.ownershipUnknownAt < FIX_OWNERSHIP_WAIT_MS) return saveJobs(jobs);
   return preserveFixTab(job, provider, jobs, reason, tab);
-}
-
-async function forceCloseFixTab(job, provider, jobs, tab) {
-  const state = job.states[provider];
-  // A tab opened for this fix whose run was never sent is unbound by design: the page then
-  // answers for an unbound tab (Ashlar's only while it holds no turn and no draft).
-  const undispatched = !state.started;
-  const message = {...tabMessage(job, provider, "ashlar-fix-cancel"), ...(undispatched ? {undispatched: true} : {})};
-  let result;
-  try { result = await sendToTab(tab.id, message, contentFiles(provider)); } catch {
-    // No receiver and reinjection failed: ownership is unknown and the page cannot be messaged.
-    // Ask again next tick; past the wait, preserve it (never close) so the job still retires.
-    return waitOrPreserveFixTab(job, provider, jobs, "fix tab could not be reached; tab preserved");
-  }
-  const unbound = undispatched && result?.ok === true && !result.jobId && !result.runId && result.provider === provider;
-  if (!(matchesJob(result, job, provider) || unbound) || result.ok !== true) {
-    // The tab now carries another binding (or none it can prove): never closed. A cancelled fix
-    // has no answer left to wait for, so past the ownership wait its leg retires and the tab is
-    // left to whoever holds it (never messaged, its binding and records untouched).
-    state.cleanupError = "tab ownership does not match; no tab was closed";
-    return waitOrPreserveFixTab(job, provider, jobs, "the fix tab carries another binding; tab preserved");
-  }
-  if (result.ownership === "unknown") {
-    // The page shows another conversation than the one the fix was sent in (an in-page move can
-    // leave the old DOM on screen): it is the user's now, and waiting cannot change a recorded identity.
-    if (result.identity === "changed") return preserveFixTab(job, provider, jobs, "the fix tab moved to another conversation; tab preserved", tab);
-    // The page never recorded the conversation its send was made in (a journal from before that
-    // rule, or a send confirmed only after a reload): it is recorded only when the send is proven,
-    // so waiting cannot establish it. Never closed; preserved now.
-    if (result.identity === "unestablished") return preserveFixTab(job, provider, jobs, "the fix conversation was never identified at send; tab preserved", tab);
-    // Not identifiable yet (a reload still rendering the sent turn): ask again next tick. Past the
-    // wait, preserve it (never close what might be the user's) and have the page free its slot.
-    return waitOrPreserveFixTab(job, provider, jobs, "fix tab ownership could not be established; tab preserved", tab);
-  }
-  if (result.owned !== true) return preserveFixTab(job, provider, jobs, "user took over the fix tab; tab preserved", tab);
-  // A verdict resting on a page with no bound turn (blank, or the just-clicked prompt before the
-  // send was confirmed) proves content, not which page this is: it is Ashlar's only while the tab
-  // is still on the page this fix opened; one navigated to another conversation (even an empty one)
-  // is the user's. (A fresh blank chat in the same tab holds nothing of the user's.)
-  if (unbound || result.blank === true || result.unsent === true) {
-    if (!onAllocationPage(result.url, provider)) return preserveFixTab(job, provider, jobs, "the unsent fix tab moved to another page; tab preserved", tab);
-    await closeProvenTab(job, provider, jobs, tab.id, url => onAllocationPage(url, provider), "fix cancelled; tab closed");
-    return;
-  }
-  // A verdict resting on the bound turn holds only in the conversation that turn was bound in: the
-  // identity the worker stored (adopted once from the page's journal), never the URL echoed here.
-  if (adoptFixConversation(state, result)) await saveJobs(jobs);
-  const bound = state.conversation;
-  if (!bound || !result.conversation) {
-    state.cleanupError = "the fix conversation identity is not established; no tab was closed";
-    return waitOrPreserveFixTab(job, provider, jobs, "the fix conversation identity was never established; tab preserved", tab);
-  }
-  if (result.conversation !== bound || conversationIdentity(result.url) !== bound) {
-    return preserveFixTab(job, provider, jobs, "the fix tab moved to another conversation; tab preserved", tab);
-  }
-  await closeProvenTab(job, provider, jobs, tab.id, url => conversationIdentity(url) === bound, "fix cancelled; tab closed");
 }
 
 async function retireCleanJob(job, jobs, forgotten = false, signal) {
@@ -1218,6 +1167,9 @@ async function deliverOutcome(job, provider, jobs, signal) {
     throw e;
   }
   state.delivered = true;
+  // A fix tab may close only after its answer was acknowledged (cleanupFixTab): this local record,
+  // never server status, is that proof.
+  if (job.kind === "fix" && out.ok) state.answerDelivered = true;
   delete state.formatError;
   workerStep(job,provider,"result_saved");
   const previousError = (await chrome.storage.local.get(["lastError"])).lastError;

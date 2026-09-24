@@ -66,14 +66,21 @@
  * failure (T15), so the runtime retries or escalates now instead of at the deadline. Only a
  * transient "unknown" (journal unreadable, turn not rendered yet, still generating) keeps the run
  * polling, and the deadline (T16) bounds that.
+ * TAB ENDS (extension/background.js cleanupFixTab): a fix tab is closed ONLY on the proven-success
+ * path — DONE (T14) acknowledged to the worker AND the page's complete-phase proof passing at close
+ * time (send-time conversation, exact sent turn, stored completion unchanged, no draft or
+ * follow-up). Every other end of the item (FAILED, CANCELLED for timeout / superseded / aborted,
+ * an unknown id) and every unproven tab (taken over, another binding, unreachable, still loading,
+ * a lost delivery record) is PRESERVED: the page frees its managed slot and stops its run, and the
+ * worker retires the job. Nothing on this server authorises a close.
  * INVARIANTS:
  *   - ONE live (queued | claimed) item per PR: a newer request for the same PR cancels the older
- *     one (its promise rejects "superseded"; the extension force-closes that tab);
+ *     one (its promise rejects "superseded"; the extension preserves that tab and frees its slot);
  *   - at most parallelLimit() (fixAgent.parallelPrs) items are claimed at once; the rest wait
  *     queued (the cap is enforced at claim, so neither take nor a direct claim can exceed it);
  *   - every request settles exactly once: resolve on complete, reject on failure / timeout /
  *     supersede / abort (an aborted item is cancelled like a superseded one, so the extension
- *     force-closes its tab instead of generating an answer nobody reads). The deadline (default 30 min, Settings fix_agent.chat_timeout_minutes) spans queue AND
+ *     stops its run and preserves its tab instead of generating an answer nobody reads). The deadline (default 30 min, Settings fix_agent.chat_timeout_minutes) spans queue AND
  *     generation, so a fix is never awaited forever (fail closed → the runtime ESCALATEs);
  *   - leases mirror review items: only the lease holder refreshes / completes / fails; only the
  *     claiming Chrome profile may re-claim (its tab owns the generation); release frees the

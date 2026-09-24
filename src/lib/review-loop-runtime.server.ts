@@ -48,7 +48,8 @@
  *     inline-prompt ceiling (fixAgent.chatMaxPromptChars, default 100k chars) turn a stuck
  *     tab or an oversized PR into a rejected request → retry, then ESCALATE fix-failed (never a
  *     hang). The watcher's abort (head moved, loop stopped, its deadline) cancels the item, so
- *     the extension closes the tab instead of generating an answer nobody reads. Only delivery
+ *     the extension stops the run and preserves the tab (a fix tab is closed only after a
+ *     delivered, re-proven answer) instead of generating an answer nobody reads. Only delivery
  *     "script-apply" is wired; "chat-push" fails closed.
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
@@ -544,7 +545,8 @@ export async function requestChatFix(
 /** Production provider routing (productionDeps' requestFix). local is a plain request/response;
  * chatgpt/grok go through the Chrome bridge's fix registry (NOT the review awaiting_chat
  * lifecycle) and come back as the same kind of answer text. The watcher's abort signal reaches
- * both, so an abandoned fix cancels its bridge item and the extension closes its tab. */
+ * both, so an abandoned fix cancels its bridge item and the extension stops its run (the tab is
+ * preserved, never closed on a cancel). */
 export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { loadBridge?: BridgeFixLoader } = {}): RequestFix {
   return async (prompt, ctl) => {
     const provider = settings.fixAgent.provider;

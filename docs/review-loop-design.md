@@ -261,10 +261,15 @@ fixAgent: {
 **채팅 fix 전송(구현, `bridge-fix.server.ts`):** `chatgpt`/`grok` + `script-apply`는 harbor Job이 아니라 bridge의
 **fix 항목**으로 간다(harbor Job은 PR별 supersede·리뷰 JSON 검증을 하므로 fix 답변을 거부/재작성한다). 확장이
 채팅 탭에 프롬프트를 붙여 넣고 **답변 전문(텍스트)**을 돌려주면, 파싱은 서버가 결정적으로 한다(`fix-apply`).
-- **PR당 live 항목 1개:** 같은 PR의 새 요청이 이전 항목을 취소(`superseded`)하고, 확장은 그 탭을 강제로 닫는다.
-- **데드라인:** 대기+생성 합산 기본 30분(설정 `fixAgent.chatTimeoutMs`, 1분~6시간). 만료 → 취소 → 탭 강제 종료 →
-  런타임 재시도 후 `fix-failed` ESCALATE. 리뷰와 달리 fix 탭만 "답변 없이" 닫히며, 사용자가 탭을 넘겨받았으면
-  (후속 턴·미전송 초안·다른 대화) 보존한다. 런타임 watcher는 chat fix를 이 데드라인과
+- **fix 탭은 증명된 성공 경로에서만 닫는다:** 답변이 전달(서버 ACK)되었고, 닫는 시점에 페이지의 complete 단계
+  증명(전송 시점 대화, 정확한 전송 턴, 저장된 완료 응답 그대로, 초안·후속 턴 없음)이 통과할 때만. 그 밖의 모든
+  종료(취소·supersede·데드라인·실패·taken_over·소유 불명·다른 바인딩·응답 없음·로딩 중·전달 기록 없음)는 탭을
+  **보존**하고 관리 슬롯만 해제한 뒤 작업을 끝낸다. 사용자의 로그인된 채팅 프로필에서 DOM 추론으로 탭을 강제로
+  닫지 않는다.
+- **PR당 live 항목 1개:** 같은 PR의 새 요청이 이전 항목을 취소(`superseded`)하고, 확장은 그 탭의 실행을 멈추고
+  슬롯을 해제한다(탭은 보존).
+- **데드라인:** 대기+생성 합산 기본 30분(설정 `fixAgent.chatTimeoutMs`, 1분~6시간). 만료 → 취소 → 탭 보존·슬롯
+  해제 → 런타임 재시도 후 `fix-failed` ESCALATE. 런타임 watcher는 chat fix를 이 데드라인과
   `fixAgent.timeoutMs` 중 긴 쪽 + 1분까지 기다린다 — 로컬 LLM용 생성 데드라인이 chat fix를 먼저 끊지 않는다.
 - **동시성:** `parallelPrs`개까지만 claim, 나머지는 대기. 리뷰와는 요청 시각이 빠른 쪽이 먼저(서로 굶기지 않음).
 - **호환:** `take`에 `fixProtocol:1`을 보내는 확장(1.1.23+)에만 fix 항목을 준다 — 확장 재로드 필요.

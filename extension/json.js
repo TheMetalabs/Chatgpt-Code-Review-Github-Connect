@@ -472,22 +472,21 @@ function storedFixCompletion(state) {
 
 /** THE ownership proof of a fix tab. Every fix decision calls it at the moment it acts and acts
  * only on its verdict: collecting an answer (phase "collect"), replying with a collected answer,
- * restoring a completion proof and closing after completion ("complete"), the forced close on
- * cancel ("cancel"); a non-owned verdict is also what releases the managed slot. `journal`: the
- * submission journal the caller just read (default: the confirmed or saved one).
+ * restoring a completion proof and closing after a delivered answer ("complete"); a permanent
+ * non-owned verdict is also what releases the managed slot. There is no cancel-phase proof: a fix
+ * tab is closed only on the proven-success path (background.js cleanupFixTab), and a cancelled fix
+ * is always preserved. `journal`: the submission journal the caller just read (default: the
+ * confirmed or saved one).
  *
  * owned = the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact"), no
  * follow-up turn, no user draft, the page still shows the conversation its send was made in and
- * ("complete", and "cancel" whenever this run holds a stored completion: the checks follow the local
- * state, never the caller's reason for asking) the currently bound response is done and still the
- * stored completion (response ID and answer text; `completion` overrides the stored one, for a
- * restore). "cancel" before the send
- * is confirmed: a blank page or just Ashlar's own prompt (`blank` / `unsent`: the worker also
- * requires the allocation page). takenOver = the user's (follow-up, edited turn, draft, another
- * response); unknown = not provable now (journal unreadable, turn not rendered, identity not
- * recorded at send or moved: `identity` "unestablished" | "changed", still generating). Every takenOver
- * verdict is PERMANENT: it marks the tab repurposed for good (a draft the user later clears, or an
- * edit the user undoes, does not hand the tab back); see fixVerdictPermanent for what ends a run. */
+ * ("complete") the currently bound response is done and still the stored completion (response ID
+ * and answer text; `completion` overrides the stored one, for a restore). takenOver = the user's
+ * (follow-up, edited turn, draft, another response); unknown = not provable now (journal
+ * unreadable, not sent, turn not rendered, identity not recorded at send or moved: `identity`
+ * "unestablished" | "changed", still generating). Every takenOver verdict is PERMANENT: it marks the
+ * tab repurposed for good (a draft the user later clears, or an edit the user undoes, does not hand
+ * the tab back); see fixVerdictPermanent for what ends a run. */
 function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   const verdict = (ownership, reason, extra = {}) => ({ownership, reason, ...extra});
   const takeOver = reason => {
@@ -499,35 +498,16 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   if (!submission) {
     try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return verdict("unknown", "journal_unreadable"); }
   }
+  // Nothing was sent: there is no answer to collect or to close after.
+  if (submission?.phase !== "sent") return verdict("unknown", "not_sent");
   const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
   const draftText = composerDraftText();
-  if (submission?.phase !== "sent") {
-    // Nothing was sent: there is no answer to collect or to close after.
-    if (phase !== "cancel") return verdict("unknown", "not_sent");
-    // Before the send is confirmed the composer may still hold Ashlar's own prompt, and the
-    // just-clicked turn is Ashlar's prompt. Ownership needs the EXACT prompt (the same test
-    // clickSend applies before sending): any text beyond it is the user's.
-    const ashlars = text => Boolean(submission?.expected) && normalizePrompt(text) === submission.expected;
-    if (draftText && !ashlars(draftText)) return takeOver("draft");
-    // No turn: the content proves nothing about WHICH page this is (an empty conversation the
-    // user moved to looks the same): `blank`, the worker also requires the allocation page.
-    if (!users.length) return verdict("owned", "blank", {blank: true});
-    // The just-clicked turn proves its content, not which page shows it: `unsent`, likewise.
-    if (submission?.baseline === 0 && users.length === 1 && ashlars(messagePromptText(users[0]))) return verdict("owned", "unsent", {unsent: true});
-    return takeOver("turn_not_ashlars");
-  }
   const bound = boundReviewResponse(submission);
-  // The checks are derived from LOCAL state, not from the caller's phase alone: once this run holds
-  // a collected answer (a stored completion), every decision that can close the tab ("complete",
-  // and "cancel": the server settled or forgot the item) also requires that exact answer, so a
-  // regenerated or replaced response is never closed on the weaker cancel proof.
-  const stored = phase === "complete" || phase === "cancel" ? (completion || storedFixCompletion(state)) : null;
-  const answered = phase === "complete" || Boolean(stored);
+  const answered = phase === "complete";
   if (bound.followup) return takeOver("followup");
   if (!bound.identified) {
     // A collected answer whose turn is gone was replaced (edited, regenerated or deleted).
-    if (answered) return takeOver("response_changed");
-    return users.length && phase === "cancel" ? takeOver("turn_not_ashlars") : verdict("unknown", "turn_unrendered");
+    return answered ? takeOver("response_changed") : verdict("unknown", "turn_unrendered");
   }
   // The bound match only proves the sent turn CONTAINS Ashlar's prompt; an edited turn (a prefix
   // or suffix the user added) is the user's, even if the edit is later undone.
@@ -546,6 +526,7 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   if (!submission.conversation) return verdict("unknown", "unestablished", {identity: "unestablished"});
   if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
   if (answered) {
+    const stored = completion || storedFixCompletion(state);
     if (!stored) return verdict("unknown", "no_completion", {conversation: submission.conversation});
     if (!bound.root || (bound.responseId || "") !== (stored.responseId || "")) return takeOver("response_changed");
     const busy = (typeof stopButtonVisible === "function" && stopButtonVisible()) ||
@@ -720,27 +701,16 @@ function installReviewRunner(name, run) {
       return;
     }
     if (msg.type === "ashlar-fix-cancel") {
-      // Positive binding only: an unbound page is never evidence that this tab is Ashlar's —
-      // except the tab the worker opened for this fix and never sent its run (undispatched):
-      // that one is Ashlar's only while it holds nothing of the user's (no turn, no draft).
-      if (msg.undispatched === true && !state.jobId && !state.runId) {
-        const turns = globalThis.document ? document.querySelectorAll('[data-message-author-role="user"]').length : 0;
-        const blank = !turns && !composerDraftText();
-        reply({ok:true,owned:blank,ownership:blank ? "owned" : "takenOver",blank,url:globalThis.location?.href || ""});return;
-      }
+      // The worker preserves this fix tab (every end but the proven-success close): stop the run
+      // and free the managed slot, or the tab counts against capacity (untracked binding) until the
+      // user closes it by hand. It authorises nothing else (never a close), so it carries no
+      // ownership verdict. Positive binding only: another page's run is never touched.
       if (!state.jobId || msg.jobId !== state.jobId || !state.runId || msg.runId !== state.runId) {
         reply({ok:false,code:"job_mismatch"});return;
       }
-      state.fixCancelled = true; // The server settled this fix; stop collecting an answer for it.
-      const proof = fixOwnershipProof(state, {phase: "cancel"});
-      const {ownership, reason, blank = false, unsent = false, identity, conversation} = proof;
-      // A tab on a permanent verdict (taken over, moved off its send-time conversation, or never
-      // given one) or one the worker gives up identifying (preserve) stays open but is no longer
-      // Ashlar's: free its managed slot, or it counts against tab capacity (untracked binding)
-      // until the user closes it by hand.
-      if (fixVerdictPermanent(proof) || msg.preserve === true) releaseManagedSlot(state);
-      reply({ok:true,owned:ownership === "owned",ownership,proof:reason,blank,unsent,...(identity ? {identity} : {}),
-        ...(conversation ? {conversation} : {}),url:globalThis.location?.href || ""});return;
+      state.fixCancelled = true;
+      releaseManagedSlot(state);
+      reply({ok:true,released:true,url:globalThis.location?.href || ""});return;
     }
     // Capture and JSON repair are review-JSON machinery: a fix run never takes part in them.
     if (["ashlar-capture-accepted", "ashlar-repair-source", "ashlar-repair-accepted"].includes(msg.type) && (msg.kind === "fix" || state.kind === "fix")) {

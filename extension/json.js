@@ -305,13 +305,63 @@ function repairedCollectionResult(state) {
     ? receipt.result : null;
 }
 
+/** Unsent text in the chat composer ("" when none): a user draft is the user's, never Ashlar's. */
+function composerDraftText() {
+  const draft = typeof composer === "function" && globalThis.document ? composer() : null;
+  return (draft && (draft.value || draft.innerText || draft.textContent || "") || "").trim();
+}
+
+/** One poll of the response bound to this run's sent prompt: the completion evidence both
+ * collectors (review JSON, fix code) decide on. A follow-up turn marks the tab repurposed. A
+ * later request's global Stop cannot end or block this older response: completion needs the
+ * positive controls on the original response itself. */
+async function pollBoundResponse() {
+  const runner = globalThis.__ashlarRunnerState;
+  const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
+  const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : undefined;
+  if (bound?.followup && runner && !runner.tabRepurposed) {
+    runner.tabRepurposed = true;
+    recordReviewStep("context_changed");
+  }
+  const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
+  const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
+  const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
+  return {runner, bound, stop, streaming, done};
+}
+
+/** A quota banner ends the run only while no answer is in hand and the banner can belong to it
+ * (no bound response yet, or the identified response with no follow-up). */
+function throwIfQuota(name, bound, answered) {
+  if ((!bound || (bound.identified && !bound.followup)) && quotaHit() && !answered) {
+    const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
+  }
+}
+
+/** Collection needs two identical stable observations (`key`). On the second one the runner
+ * records the answer and, for an identified response, its native completion proof. */
+function settleStableAnswer(stability, key, poll, {text, raw}) {
+  stability.hits = stability.stable === key ? stability.hits + 1 : 1;
+  stability.stable = key;
+  if (stability.hits < 2) return false;
+  const {runner, bound} = poll;
+  if (runner) {
+    runner.responseText = text;
+    if (bound?.identified && bound.responseId) runner.nativeCompletion = Object.freeze({
+      jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
+      responseId:bound.responseId,context:reviewPageContext(),text,raw,
+    });
+  }
+  recordReviewStep("response_collected");
+  return true;
+}
+
 async function waitUntilReviewOrQuota(name) {
   // A review-loop fix item is harvested as plain text; everything below is review-only.
   if (globalThis.__ashlarRunnerState?.kind === "fix") return waitUntilFixOrQuota(name);
   const owner = globalThis.__ashlarRunnerState;
   // Stamp the executing loop, never installReviewRunner's listener replacement.
   if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
-  let stable = "", hits = 0;
+  const stability = {stable: "", hits: 0};
   // No poll-count/elapsed-time failure. Controls can appear before response text is
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
@@ -323,18 +373,8 @@ async function waitUntilReviewOrQuota(name) {
       recordReviewStep("repair_accepted");
       return globalThis.__ashlarRunnerState.repairedResult;
     }
-    const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
-    const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : undefined;
-    const runner = globalThis.__ashlarRunnerState;
-    if (bound?.followup && runner && !runner.tabRepurposed) {
-      runner.tabRepurposed = true;
-      recordReviewStep("context_changed");
-    }
-    // A later request's global Stop/quota cannot end or block this older response.
-    // Require positive completion controls on the original response itself.
-    const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
-    const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
-    const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
+    const poll = await pollBoundResponse();
+    const {runner, bound, stop, streaming, done} = poll;
     const text = assistantCorpus(bound?.root).join("\n\n");
     const json = done ? harvestJson({allowThin: true, root: bound?.root}) : null;
     if (runner) trackCompletedSource(runner, bound, done, text);
@@ -345,24 +385,10 @@ async function waitUntilReviewOrQuota(name) {
     };
     recordReviewStep(!done ? (stop || streaming ? "generating" : "waiting_for_response") :
       json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response");
-    if ((!bound || (bound.identified && !bound.followup)) && quotaHit() && !json) {
-      const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
-    }
+    throwIfQuota(name, bound, Boolean(json));
     if (done && json) {
-      const current = JSON.stringify([json, text]);
-      hits = stable === current ? hits + 1 : 1; stable = current;
-      if (hits >= 2) {
-        if (runner) {
-          runner.responseText = text;
-          if (bound?.identified && bound.responseId) runner.nativeCompletion = Object.freeze({
-            jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
-            responseId:bound.responseId,context:reviewPageContext(),text,raw:json,
-          });
-        }
-        recordReviewStep("response_collected");
-        return json;
-      }
-    } else { hits = 0; stable = ""; }
+      if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) return json;
+    } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
   }
 }
@@ -375,23 +401,19 @@ async function waitUntilReviewOrQuota(name) {
  * and the worker's ashlar-fix-cancel stops this collector.
  */
 async function waitUntilFixOrQuota(name) {
-  let stable = "", hits = 0;
+  const stability = {stable: "", hits: 0};
   for (;;) {
-    const runner = globalThis.__ashlarRunnerState;
-    if (runner?.fixCancelled) {
+    if (globalThis.__ashlarRunnerState?.fixCancelled) {
       const error = new Error("fix request cancelled by the server"); error.code = "cancelled"; throw error;
     }
-    const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
-    const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : undefined;
-    if (bound?.followup && runner && !runner.tabRepurposed) {
-      runner.tabRepurposed = true;
-      recordReviewStep("context_changed");
-    }
-    // Same completion evidence as a review: a later request's Stop/quota never ends this answer.
-    const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
-    const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
-    const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
-    const text = done ? boundAnswerText("fix", bound?.root) : "";
+    // Same completion evidence, quota rule and stability as a review (shared helpers above).
+    const poll = await pollBoundResponse();
+    const {runner, bound, stop, streaming, done} = poll;
+    // Only the response identified as the answer to THIS run's sent prompt is a fix answer. With no
+    // sent journal or no identified response, the page-global fallbacks would read whatever chat
+    // is on screen: that is never an answer (a review keeps its legacy unbound observation).
+    const own = bound?.identified && bound.root ? bound.root : null;
+    const text = done && own ? boundAnswerText("fix", own) : "";
     const answered = done && Boolean(text.trim());
     // Local diagnostics only: the answer text is never copied into an observation.
     if (runner?.running) runner.observation = {
@@ -399,23 +421,10 @@ async function waitUntilFixOrQuota(name) {
       text: "", totalChars: text.length, truncated: false,
     };
     if (!answered) recordReviewStep(!done && (stop || streaming) ? "generating" : "waiting_for_response");
-    if ((!bound || (bound.identified && !bound.followup)) && quotaHit() && !answered) {
-      const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
-    }
+    throwIfQuota(name, bound, answered);
     if (answered) {
-      hits = stable === text ? hits + 1 : 1; stable = text;
-      if (hits >= 2) {
-        if (runner) {
-          runner.responseText = text;
-          if (bound?.identified && bound.responseId) runner.nativeCompletion = Object.freeze({
-            jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
-            responseId:bound.responseId,context:reviewPageContext(),text,raw:text,
-          });
-        }
-        recordReviewStep("response_collected");
-        return text;
-      }
-    } else { hits = 0; stable = ""; }
+      if (settleStableAnswer(stability, text, poll, {text, raw: text})) return text;
+    } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
   }
 }
@@ -431,26 +440,28 @@ async function waitUntilFixOrQuota(name) {
  * follow-up, typed a draft or opened another conversation) or "unknown" (the journal is
  * unreadable, or the sent turn is not rendered yet after a reload): the worker asks again. */
 function fixTabOwnership(state) {
-  if (state.tabRepurposed) return "takenOver";
+  if (state.tabRepurposed) return {ownership: "takenOver"};
   let submission;
-  try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return "unknown"; }
+  try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return {ownership: "unknown"}; }
   const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
-  const draft = typeof composer === "function" && globalThis.document ? composer() : null;
-  const draftText = (draft && (draft.value || draft.innerText || draft.textContent || "") || "").trim();
+  const draftText = composerDraftText();
   if (submission?.phase !== "sent") {
     // Before the send is confirmed the composer may still hold Ashlar's own prompt, and the
     // just-clicked turn is Ashlar's prompt. Ownership needs the EXACT prompt (the same test
     // clickSend applies before sending): any text beyond it — a prefix, a suffix, an edit — is
     // the user's, and the tab is preserved.
     const ashlars = text => Boolean(submission?.expected) && normalizePrompt(text) === submission.expected;
-    if (draftText && !ashlars(draftText)) return "takenOver";
-    if (!users.length) return "owned";
-    return submission?.baseline === 0 && users.length === 1 && ashlars(messagePromptText(users[0])) ? "owned" : "takenOver";
+    if (draftText && !ashlars(draftText)) return {ownership: "takenOver"};
+    // No turn and at most Ashlar's own draft: the content proves nothing about WHICH page this is
+    // (an empty conversation the user moved to looks the same), so the verdict is `blank` and the
+    // worker also requires the page the fix tab was opened on.
+    if (!users.length) return {ownership: "owned", blank: true};
+    return {ownership: submission?.baseline === 0 && users.length === 1 && ashlars(messagePromptText(users[0])) ? "owned" : "takenOver"};
   }
   const bound = boundReviewResponse(submission);
-  if (bound.followup) return "takenOver";
-  if (!bound.identified) return users.length ? "takenOver" : "unknown";
-  return draftText ? "takenOver" : "owned";
+  if (bound.followup) return {ownership: "takenOver"};
+  if (!bound.identified) return {ownership: users.length ? "takenOver" : "unknown"};
+  return {ownership: draftText ? "takenOver" : "owned"};
 }
 
 /** Short message replies keep MV3 workers recoverable; the page owns the long model call.
@@ -510,20 +521,19 @@ function installReviewRunner(name, run) {
       // that one is Ashlar's only while it holds nothing of the user's (no turn, no draft).
       if (msg.undispatched === true && !state.jobId && !state.runId) {
         const turns = globalThis.document ? document.querySelectorAll('[data-message-author-role="user"]').length : 0;
-        const draft = typeof composer === "function" && globalThis.document ? composer() : null;
-        const blank = !turns && !(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
-        reply({ok:true,owned:blank,ownership:blank ? "owned" : "takenOver",url:globalThis.location?.href || ""});return;
+        const blank = !turns && !composerDraftText();
+        reply({ok:true,owned:blank,ownership:blank ? "owned" : "takenOver",blank,url:globalThis.location?.href || ""});return;
       }
       if (!state.jobId || msg.jobId !== state.jobId || !state.runId || msg.runId !== state.runId) {
         reply({ok:false,code:"job_mismatch"});return;
       }
       state.fixCancelled = true; // The server settled this fix; stop collecting an answer for it.
-      const ownership = fixTabOwnership(state);
+      const {ownership, blank = false} = fixTabOwnership(state);
       // A tab the user took over (or one the worker gives up identifying: preserve) stays open but
       // is no longer Ashlar's: free its managed slot, or it counts against tab capacity (untracked
       // binding) until the user closes it by hand.
       if (ownership === "takenOver" || msg.preserve === true) releaseManagedSlot(state);
-      reply({ok:true,owned:ownership === "owned",ownership,url:globalThis.location?.href || ""});return;
+      reply({ok:true,owned:ownership === "owned",ownership,blank,url:globalThis.location?.href || ""});return;
     }
     if (["ashlar-capture-accepted", "ashlar-result-saved"].includes(msg.type)) {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider || msg.committed !== true) {
@@ -650,8 +660,7 @@ function installReviewRunner(name, run) {
         Boolean(bound?.root && typeof responseStreaming === "function" && responseStreaming(bound.root)) ||
         Boolean((captured || native) && bound?.root && !replyDoneVisible(bound.root));
       // User follow-ups/navigation transfer the tab back to the user. Do not close it.
-      const draft = typeof composer === "function" && globalThis.document ? composer() : null;
-      const hasDraft = Boolean(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
+      const hasDraft = Boolean(composerDraftText());
       if (!pending && (!unchanged || hasDraft)) releaseManagedSlot(state);
       reply({ok: true, canClose: !pending && unchanged && !busyNow && !hasDraft,
         reason: pending ? "pending" : !unchanged || hasDraft ? "repurposed" : busyNow ? "pending" : "complete",

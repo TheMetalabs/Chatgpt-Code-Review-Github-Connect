@@ -684,17 +684,26 @@ async function cleanupProviderBody(job, provider, jobs) {
       await saveJobs(jobs);return; // No deadline or forced eviction.
     }
     delete state.cleanupWaitReason;
-    const current = await chrome.tabs.get(tab.id);
-    if (current.pendingUrl || current.url !== result.url || current.status === "loading") return;
-    state.closeRequested = true;
-    await saveJobs(jobs);
-    await rememberOwnedTab(job, provider, true);
-    await chrome.tabs.remove(tab.id);
-    await finishTabCleanup(job, provider, jobs);
+    await closeProvenTab(job, provider, jobs, tab.id, result.url);
   } catch (e) {
     state.cleanupError = String(e.message || e).slice(0, 240);
     await saveJobs(jobs);
   }
+}
+
+/** The one managed close, for a tab whose page just proved it may close (review: can-close;
+ * fix: ownership on cancel): the tab must still be exactly on the page that answered (no pending
+ * navigation, not loading), and the close is recorded durably before the remove so a worker that
+ * stops in between retires it by absence. */
+async function closeProvenTab(job, provider, jobs, tabId, provenUrl, reason) {
+  const current = await chrome.tabs.get(tabId);
+  if (current.pendingUrl || current.url !== provenUrl || current.status === "loading") return false;
+  job.states[provider].closeRequested = true;
+  await saveJobs(jobs);
+  await rememberOwnedTab(job, provider, true);
+  await chrome.tabs.remove(tabId);
+  await finishTabCleanup(job, provider, jobs, reason);
+  return true;
 }
 
 /** The server cancelled a review-loop FIX item (its deadline passed, a newer request for the PR
@@ -749,17 +758,11 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     });
   }
   if (result.owned !== true) return finishTabCleanup(job, provider, jobs, "user took over the fix tab; tab preserved");
-  // A blank page is Ashlar's only while it is still the page this fix opened: one navigated to
-  // another conversation (even an empty one) is the user's. (A fresh blank chat in the same tab
-  // holds nothing of the user's.)
-  if (unbound && !onAllocationPage(result.url, provider)) return finishTabCleanup(job, provider, jobs, "the unsent fix tab moved to another page; tab preserved");
-  const current = await chrome.tabs.get(tab.id);
-  if (current.pendingUrl || current.url !== result.url || current.status === "loading") return;
-  state.closeRequested = true;
-  await saveJobs(jobs);
-  await rememberOwnedTab(job, provider, true);
-  await chrome.tabs.remove(tab.id);
-  await finishTabCleanup(job, provider, jobs, "fix cancelled; tab closed");
+  // A verdict resting on a blank page (unsent, or started but not confirmed sent) is Ashlar's only
+  // while it is still the page this fix opened: one navigated to another conversation (even an
+  // empty one) is the user's. (A fresh blank chat in the same tab holds nothing of the user's.)
+  if ((unbound || result.blank === true) && !onAllocationPage(result.url, provider)) return finishTabCleanup(job, provider, jobs, "the unsent fix tab moved to another page; tab preserved");
+  await closeProvenTab(job, provider, jobs, tab.id, result.url, "fix cancelled; tab closed");
 }
 
 async function retireCleanJob(job, jobs, forgotten = false, signal) {

@@ -13,11 +13,14 @@ const URL_FIX = 'https://chatgpt.com/c/fix';
 const run = (extra = {}) => ({type: 'ashlar-run', jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', kind: 'fix', prompt: 'FIX PROMPT', ...extra});
 const msg = (type, extra = {}) => ({type, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', kind: 'fix', ...extra});
 
-/** Page runner over a completed answer; a polling guard turns "pending forever" into an error. */
-function page({parts = PARTS, blocks = [PARTS[1]], limit = 50} = {}) {
+/** Page runner over a completed answer; a polling guard turns "pending forever" into an error.
+ * `bound`: the run's prompt is sent and its response identified (a fix reads nothing else). */
+function page({parts = PARTS, blocks = [PARTS[1]], limit = 50, bound = true} = {}) {
   const c = content('chatgpt');
   let polls = 0;
   Object.assign(c.context, {
+    readSubmissionJournal: async () => (bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A'} : null),
+    boundReviewResponse: () => ({identified: true, followup: false, root: {}, responseId: 'response-A'}),
     stopButtonVisible: () => false, replyDoneVisible: () => true, assistantCorpus: () => parts, assistantCodeBlocks: () => blocks,
     sleep: async () => { if (++polls > limit) throw new Error('test-only polling guard'); await new Promise(resolve => setImmediate(resolve)); },
   });
@@ -34,6 +37,13 @@ test('page: a fix collector returns the fenced code after two stable completed o
   assert.equal(p.polls(), 1, 'second identical observation completes it');
   assert.equal(p.state().responseText, ANSWER);
   assert.equal(p.state().observation.text, '', 'the answer text is never copied into an observation');
+});
+
+test('page: with no sent, identified submission a fix collector reads nothing on the page', async () => {
+  const p = page({bound: false, limit: 12});
+  Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+  await assert.rejects(p.c.context.waitUntilFixOrQuota('ChatGPT'), /test-only polling guard/);
+  assert.equal(p.state().nativeCompletion, undefined);
 });
 
 test('page: the same non-review answer keeps a REVIEW collector waiting (the fix path is kind-gated)', async () => {
@@ -239,6 +249,22 @@ test('worker: a cancelled fix whose run was never sent closes its blank tab and 
   const started = worker([fixJob()], {api: cancelled, handler});
   await started.tick();
   assert.equal(started.messages.some(m => m.undispatched), false);assert.equal(started.closedTabs.length, 0);
+});
+
+test('worker: a started fix whose page is owned only by being blank must still be on its allocation page', async () => {
+  const OPENED = 'https://chatgpt.com/?temporary-chat=true';
+  // the run was dispatched (started) but its send is not confirmed: the page answers owned+blank
+  const blank = (url) => (_id, m) => (m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', blank: true, url} : {ok: true, canClose: false, reason: 'pending'});
+  const moved = worker([fixJob()], {api: cancelled, handler: blank('https://chatgpt.com/c/other'), url: 'https://chatgpt.com/c/other'});
+  await moved.tick();
+  assert.equal(moved.closedTabs.length, 0, 'an empty conversation the user moved to is preserved');
+  assert.deepEqual(moved.local.state.pendingReviewJobs, {}, 'the job still retires');
+  const plain = worker([fixJob()], {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/'});
+  await plain.tick();
+  assert.equal(plain.closedTabs.length, 0);
+  const home = worker([fixJob()], {api: cancelled, handler: blank(OPENED), url: OPENED});
+  await home.tick();
+  assert.deepEqual(home.closedTabs, [10], 'still the page the fix opened: closed');
 });
 
 test('worker: a cancelled fix tab stuck loading is preserved after the wait (never closed unproven)', async () => {

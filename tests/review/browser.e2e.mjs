@@ -185,13 +185,12 @@ test('real DOM recovery: missing job resumes its bound observer without a new pr
 // fix tab must give before the worker may force-close it.
 test('real DOM: a fix item harvests its fenced JSON (no review JSON) only after completion',async t=>{
  const fixAnswer='{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
- const page=await fixture(t,user+answer(`<p>I guarded the null path.</p><pre><code>${fixAnswer}</code></pre>`)+stop);
- await page.evaluate(()=>{window.__ashlarRunnerState={kind:'fix'};});
- await startWait(page);await page.clock.runFor(3200);
- assert.equal((await page.evaluate(()=>waitResult)).pending,true,'Stop is visible: still generating');
+ const page=await fixPage(t,`<p>I guarded the null path.</p><pre><code>${fixAnswer}</code></pre>`,undefined,{done:false});
+ await page.clock.runFor(3200);
+ assert.equal((await page.evaluate(()=>window.fixOut)).pending,true,'Stop is visible: still generating');
  await page.evaluate(toolbar=>{document.querySelector('[data-testid="stop-button"]').remove();document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('beforeend',toolbar);},toolbar);
  await page.clock.runFor(3200);
- assert.equal((await page.evaluate(()=>waitResult)).raw,fixAnswer);
+ assert.equal((await page.evaluate(()=>window.fixOut)).raw,fixAnswer);
 });
 test('real DOM: a cancelled fix tab is Ashlar-owned only until the user takes it over',async t=>{
  const page=await browser.newPage();t.after(()=>page.close());
@@ -222,7 +221,9 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  });
  for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  const cancel=()=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type:'ashlar-fix-cancel',jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix'});
- assert.equal((await cancel()).owned,true,'only Ashlar\'s own half-sent prompt is in the tab');
+ const presend=await cancel();
+ assert.equal(presend.owned,true,'only Ashlar\'s own half-sent prompt is in the tab');
+ assert.equal(presend.blank,true,'owned only because nothing is on the page: the worker also checks the page');
  const draft=text=>page.locator('#prompt-textarea').evaluate((el,t)=>{el.textContent=t;},text);
  await draft('my own question');
  assert.equal((await cancel()).owned,false,'no turn yet, but the composer holds the user\'s own text');
@@ -232,7 +233,9 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  assert.equal((await cancel()).owned,false,'a user prefix is the user\'s too');
  await draft('fix prompt');
  await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='fix prompt';document.querySelector('main').append(u);});
- assert.equal((await cancel()).owned,true,'the just-clicked, not yet confirmed turn is Ashlar\'s');
+ const clicked=await cancel();
+ assert.equal(clicked.owned,true,'the just-clicked, not yet confirmed turn is Ashlar\'s');
+ assert.equal(clicked.blank,false,'Ashlar\'s exact prompt on the page proves ownership by content');
  await draft('my own question');
  assert.equal((await cancel()).owned,false,'Ashlar\'s turn, but a user draft in the composer');
  await draft('');
@@ -240,6 +243,39 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  assert.equal((await cancel()).owned,false,'a just-clicked turn with more than Ashlar\'s prompt preserves the tab');
  await page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').textContent='someone else asked this';});
  assert.equal((await cancel()).owned,false,'a turn that is not Ashlar\'s prompt preserves the tab');
+});
+
+/** A fix run's page: this run's user turn (user-A) and an assistant response (response-A) with
+ * `inner`, plus its submission journal (`journal` null = none yet). */
+async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'},{done=true}={}){
+ const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
+ await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${inner}</div></div>${done?'<button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button>':''}</section></main>${done?'':stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
+ await page.evaluate(journal=>{
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],...(journal?[['ashlar:submission:fix-A:run-A',JSON.stringify(journal)]]:[])]);
+  window.__saved=saved;
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+ },journal);
+ for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ await page.evaluate(()=>{const s=__ashlarRunnerState;s.kind='fix';s.running=true;window.fixOut={pending:true};
+  waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={error:e.message};});});
+ return page;
+}
+
+test('real DOM: a fix is harvested only from the response bound to its own sent prompt',async t=>{
+ const code='{"summary":"unrelated","files":[{"path":"a.ts","content":"x"}]}';
+ const unrelated=`<p>Earlier answer.</p><pre><code>${code}</code></pre>`;
+ for(const journal of [null,{phase:'attempted',expected:'fix prompt',baseline:0}]){
+  const page=await fixPage(t,unrelated,journal);
+  await page.clock.runFor(6400);
+  assert.deepEqual(await page.evaluate(()=>window.fixOut),{pending:true},`no answer without a sent, identified submission (${journal?journal.phase:'no journal'})`);
+ }
+ // the same page once the journal binds this run's turn: its response is the answer
+ const page=await fixPage(t,unrelated,{phase:'attempted',expected:'fix prompt',baseline:0});
+ await page.clock.runFor(3200);
+ await page.evaluate(()=>window.__saved.set('ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'})));
+ await page.clock.runFor(3200);
+ assert.equal((await page.evaluate(()=>window.fixOut)).raw,code);
 });
 
 test('real DOM: a fix is read from its fenced code block literally, never from rendered prose',async t=>{
@@ -250,11 +286,10 @@ test('real DOM: a fix is read from its fenced code block literally, never from r
  const code=`<pre><div>json</div><button>Copy code</button><div><code class="language-json">${literal.replace(/</g,'&lt;')}</code></div></pre>`;
  const page=await fixture(t,user+answer(`<p>Here is the fix.</p>${code}`,true));
  assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),[literal]);
- const unfenced=await fixture(t,user+answer(`<p>${prose}</p>`,true));
+ const unfenced=await fixPage(t,`<p>${prose}</p>`);
  assert.deepEqual(await unfenced.evaluate(()=>assistantCodeBlocks()),[],'rendered prose is never read as a fix');
- await unfenced.evaluate(()=>{window.__ashlarRunnerState={kind:'fix',running:true,jobId:'fix-A',runId:'run-A'};window.fixResult={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>window.fixResult={raw},e=>window.fixResult={error:e.message});});
  await unfenced.clock.runFor(3200);
- const out=await unfenced.evaluate(()=>window.fixResult);
+ const out=await unfenced.evaluate(()=>window.fixOut);
  assert.match(out.raw,/no fenced code block/);assert.ok(!out.raw.includes('{'),'no JSON reaches the fix parser');
 });
 

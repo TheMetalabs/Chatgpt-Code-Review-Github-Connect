@@ -200,8 +200,15 @@ export function postedRecently(client: object, key: string, now: number = Date.n
   return at !== undefined && now - at <= POSTED_TTL_MS;
 }
 
+/** A handoff POST whose outcome is unknown (it may have landed) and that the scans have not seen
+ * yet. It is recorded as posted in this process (a tombstone, so no re-entry sends it again) and
+ * never followed by another handoff for the head. */
+export const HANDOFF_OUTCOME_UNKNOWN = "the handoff's outcome is unknown (it may have landed; not re-sent)";
+
 export interface EscalateResult {
   escalated: boolean;
+  /** The handoff may have landed (unknown write outcome): treat the head as handed off. */
+  ambiguous?: boolean;
   reason?: EscalateReason;
   rounds: RoundSummary[];
   /** Set when history was incomplete/failed and escalation was skipped fail-closed. */
@@ -316,8 +323,10 @@ async function maybeEscalateInner(
   const seen = async () =>
     (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
     postedRecently(gh, handoffKey(opts));
-  if ((await postHandoff(gh, token, opts, body, seen)) === "exists") return { escalated: false, reason, rounds };
-  rememberPosted(gh, handoffKey(opts));
+  const out = await postHandoff(gh, token, opts, body, seen);
+  if (out === "exists") return { escalated: false, reason, rounds };
+  rememberPosted(gh, handoffKey(opts)); // posted, or a tombstone for one that may have landed
+  if (out === "ambiguous") return { escalated: false, ambiguous: true, reason, rounds };
   return { escalated: true, reason, rounds };
 }
 
@@ -339,7 +348,7 @@ async function postHandoff(
   o: { owner: string; repo: string; pr: number; sleep?: (ms: number) => Promise<void> },
   body: string,
   seen: () => Promise<boolean>,
-): Promise<"posted" | "exists"> {
+): Promise<"posted" | "exists" | "ambiguous"> {
   // retryWrite: a POST whose outcome is unknown (it may have landed) is never sent again; the
   // remaining schedule only re-checks the scan.
   const r = await retryWrite({
@@ -351,6 +360,7 @@ async function postHandoff(
   });
   if ("posted" in r) return "posted";
   if ("exists" in r) return "exists";
+  if (r.ambiguous) return "ambiguous"; // may have landed: the caller records it, never re-posts
   throw r.error;
 }
 
@@ -382,7 +392,7 @@ export async function escalateNow(
     /** Waits between handoff POST retries (injectable for tests). */
     sleep?: (ms: number) => Promise<void>;
   },
-): Promise<{ escalated: boolean; error?: string }> {
+): Promise<{ escalated: boolean; ambiguous?: boolean; error?: string }> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
   const sessionKey = handoffKey(opts);
@@ -410,8 +420,10 @@ export async function escalateNow(
     const seen = async () =>
       (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
       postedRecently(gh, sessionKey);
-    if ((await postHandoff(gh, token, opts, body, seen)) === "exists") return { escalated: false };
-    rememberPosted(gh, sessionKey);
+    const out = await postHandoff(gh, token, opts, body, seen);
+    if (out === "exists") return { escalated: false };
+    rememberPosted(gh, sessionKey); // posted, or a tombstone for one that may have landed
+    if (out === "ambiguous") return { escalated: false, ambiguous: true, error: HANDOFF_OUTCOME_UNKNOWN };
     return { escalated: true };
   } catch (e) {
     return { escalated: false, error: (e as Error)?.message ?? String(e) };

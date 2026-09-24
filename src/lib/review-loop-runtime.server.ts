@@ -53,6 +53,7 @@ import {
   readLoopSession,
   reconstructRounds,
   rememberPosted,
+  HANDOFF_OUTCOME_UNKNOWN,
   type LoopPrInfo,
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
@@ -576,7 +577,10 @@ function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullH
   return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head, extra: [...pendingStops(gh, ref), ...extra] });
 }
 
-type ContinueOutcome = { posted: boolean; exists?: boolean; error?: string };
+/** `ambiguous`: the POST's outcome is unknown (it may have landed) and it is not visible yet. It is
+ * recorded as posted in this process (no re-entry sends it again), and callers treat it as a
+ * continuation that may exist: never a loop-error handoff that would contradict it. */
+type ContinueOutcome = { posted: boolean; exists?: boolean; ambiguous?: boolean; error?: string };
 
 // ONE continuation per (PR, head, session). The push handler, a step whose head moved and an
 // applied round can each ask for the live head's review: concurrent callers share one post
@@ -625,7 +629,8 @@ function ensureContinuation(
     });
     if ("posted" in r) return { posted: true };
     if ("exists" in r) return { posted: false, exists: true };
-    return { posted: false, error: writeFailure(r) };
+    if (r.ambiguous) rememberPosted(gh, key); // tombstone: a later caller sees it as posted
+    return { posted: false, ambiguous: r.ambiguous, error: writeFailure(r) };
   })().finally(() => continuing.delete(key));
   continuing.set(key, run);
   return run;
@@ -788,6 +793,8 @@ export async function runPostReviewLoop(
     }
     rounds = esc.rounds;
     if (esc.escalated) return { ran: true, step: "escalated", reason: esc.reason ?? "stuck" };
+    // The handoff may have landed: never fix past it, never post a second one. Logged, not silent.
+    if (esc.ambiguous) return { ran: false, reason: `ESCALATE ${esc.reason ?? "stuck"}: ${HANDOFF_OUTCOME_UNKNOWN}` };
     // Stuck, but a handoff for this head already exists: never fix past an ESCALATE.
     if (esc.reason) return { ran: false, reason: ALREADY_ESCALATED };
     if (esc.error) return await escalate("loop-error", `could not verify the loop history: ${esc.error}`);
@@ -999,7 +1006,9 @@ export async function runPostReviewLoop(
         // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
         // budget — the round-cap handoff.
         const c = await ensureContinuation(gh, token, ref, { head: newHead, mode, sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, round: rounds.length + 1, sleep });
-        status = c.posted || c.exists ? { ok: true } : { ok: false, error: c.error ?? "the continuation was not posted" };
+        // An unknown outcome may have requested the review: never contradict it with a handoff.
+        if (c.ambiguous) trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
+        status = c.posted || c.exists || c.ambiguous ? { ok: true } : { ok: false, error: c.error ?? "the continuation was not posted" };
       }
       // The fixed signal (continuation above, or this handoff) goes out BEFORE the informational
       // replies and report: those are up to maxInlineComments slow calls that must never delay
@@ -1085,6 +1094,8 @@ export async function continueLoopOnPush(
     if (!session.active) return { posted: false, reason: NO_SESSION };
     const c = await ensureContinuation(d.gh, token, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, sleep: d.sleep });
     if (!c.error) return { posted: c.posted, reason: c.posted ? "continued" : "already continued" };
+    // It may have landed: no loop-error handoff that would end the session it continues.
+    if (c.ambiguous) return { posted: false, reason: `continuation outcome unknown (${c.error}); not re-sent, no handoff` };
     // The next review cannot be requested: end the loop with the fixed handoff instead of stalling.
     const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso }).catch(() => []);
     const handoff = await escalateNow(d.gh, token, {
@@ -1150,6 +1161,7 @@ export async function startLoop(
     });
     if ("posted" in r) return { posted: true, reason: "started" };
     if ("exists" in r) return { posted: false, reason: "start already recorded" };
+    if (r.ambiguous) rememberPosted(d.gh, key); // tombstone: never re-posted by a redelivery
     return { posted: false, reason: `start failed: ${writeFailure(r)}` };
   } catch (e) {
     return { posted: false, reason: `start failed: ${(e as Error)?.message ?? String(e)}` };
@@ -1199,6 +1211,9 @@ async function ensureStopRecord(
   });
   if ("posted" in r) return { posted: true };
   if ("exists" in r) return { posted: false, exists: true };
+  // May have landed: a tombstone stops a redelivered stop from posting it again. The stop stays
+  // pending in this process until the record is seen.
+  if (r.ambiguous) rememberPosted(gh, key);
   return { posted: false, error: writeFailure(r) };
 }
 

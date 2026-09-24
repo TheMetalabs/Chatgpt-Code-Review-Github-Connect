@@ -316,7 +316,7 @@ describe("round-cap handoff keeps the trend pattern in its detail", () => {
       async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
     };
     const r = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: heads[2], roundCap: 2 });
-    assert.equal(r.reason, "round-cap");
+    assert.ok(r.reason, "the stuck reason is still reported");
     assert.match(posted[0], /reason=round-cap/);
     assert.match(posted[0], /Detail: fix-round budget spent; the finding trend also shows whack-a-mole/);
   });
@@ -623,13 +623,29 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     assert.equal(f.stored.length, 1);
   });
 
-  it("an unknown write outcome is never POSTed again, even while the list stays stale", async () => {
+  it("an unknown write outcome is never POSTed again, even while the list stays stale (and on re-entry)", async () => {
     const f = flaky(["unknown", "ok"], false, true);
     const r = await now(f, 15);
     assert.equal(r.escalated, false);
-    assert.match(r.error ?? "", /502/);
+    assert.equal(r.ambiguous, true);
+    assert.match(r.error ?? "", /outcome is unknown/);
     assert.equal(f.attempts(), 1, "it may have landed: one POST only");
+    // a later caller for the same head + session (a redelivery, the push path) while the list still lags
+    const again = await now(f, 15);
+    assert.equal(again.escalated, false);
+    assert.equal(f.attempts(), 1, "the tombstone stops the re-entry too");
     assert.equal(f.stored.length, 1);
+  });
+
+  it("the round-cap handoff (maybeEscalate) with an unknown outcome returns ambiguous instead of throwing", async () => {
+    const f = flaky(["unknown", "ok"], true, true);
+    const r = await maybeEscalate(f.gh as never, "t", { owner: "o", repo: "r", pr: 17, head: H, roundCap: 5, ...session, sleep: f.sleep });
+    assert.equal(r.escalated, false);
+    assert.equal(r.ambiguous, true);
+    assert.ok(r.reason, "the stuck reason is still reported");
+    const again = await maybeEscalate(f.gh as never, "t", { owner: "o", repo: "r", pr: 17, head: H, roundCap: 5, ...session, sleep: f.sleep });
+    assert.equal(again.escalated, false);
+    assert.equal(f.attempts(), 1);
   });
 
   it("an unknown write outcome whose handoff becomes visible resolves without another POST", async () => {

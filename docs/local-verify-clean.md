@@ -92,11 +92,19 @@ bridge seen before, when `connected` flipped (`lastSeen + BRIDGE_CONNECTED_MS`);
 with the current token, process start or the last token rotation. A rotation therefore restarts the
 grace, and no older observation dates a newer disconnect. Row L13 pins it.
 
-A fallback release is permanent. From then on the job waits only on local (`racingProviders` with
-`localFallback`, read by both the watcher and `submitHarborChat`): chat is never required again,
-even when the bridge reconnects and a chat leg reads as pending. A chat payload that still lands
-before local posts is merged; it is never waited for. A take (`nextBridgeJob`) offers such a job no
-fresh chat generation — only a run that already started may resume. Row L14 pins it.
+A fallback release is permanent (it never re-releases), and it waives chat for as long as that local
+leg can still deliver the review (`fallbackWaivesChat`: running, or finished with a payload). Meanwhile
+the job waits only on local (`racingProviders` with `localFallback`, read by both the watcher and
+`submitHarborChat`): chat is not required, even when the bridge reconnects and a chat leg reads as
+pending. A chat payload that still lands before local posts is merged; it is never waited for. A take
+(`nextBridgeJob`) offers such a job no fresh chat generation — only a run that already started may
+resume. Row L14 pins it.
+
+Once the fallback ends with no payload (HTTP 500, transport error, offline: "Skipped local"), chat is
+the only reviewer left, so the waiver ends: the job waits on the pending chat reviewers again, exactly
+as before the release, and a take offers them as fresh work. A reconnected bridge (row L16) or a chat
+run that still holds its claim (row L17) therefore delivers the review instead of the job ending
+skipped under it. A chat leg that already ended with nothing (L9) leaves nothing to wait on: skipped.
 
 What never releases it:
 

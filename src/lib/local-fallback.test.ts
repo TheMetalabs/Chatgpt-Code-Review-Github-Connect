@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, heldLocalEvidence, heldLocalSalvage, heldLocalUnusable, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import { chatStalled, fallbackWaivesChat, heldLocalEvidence, heldLocalSalvage, heldLocalUnusable, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
 import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
@@ -128,6 +128,21 @@ describe("verify-clean local role", () => {
     // A verification round is not a fallback: chat already answered and stays part of the merge.
     assert.deepEqual(racingProviders({ ...fallback, localFallback: false }), ["chatgpt", "grok", "local"]);
     assert.deepEqual(racingProviders({ ...fallback, role: "race" }), ["chatgpt", "grok", "local"], "race is unchanged");
+  });
+
+  it("a fallback release waives chat only while local can still deliver; once local ends with nothing, chat is awaited again", () => {
+    const at = { localFallbackAt: 1, assumptions: [] as string[] };
+    assert.equal(fallbackWaivesChat({ ...at }), true, "local running");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: "{}" }] }), true, "local delivered");
+    assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Skipped local (HTTP 500)"] }), false, "local failed");
+    assert.equal(fallbackWaivesChat({ ...at, providerErrors: { local: { code: "error", message: "HTTP 500" } } }), false, "local errored");
+    assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Generated fixtures were skipped"] }), true, "reviewer text is not a skipped local");
+    assert.equal(fallbackWaivesChat({ assumptions: [] }), false, "no fallback release");
+    // A spent fallback makes the chat reviewers required again.
+    const fallback = { role: "verify-clean" as const, providers: ["chatgpt", "local"] as ReviewProvider[], localReleased: true };
+    const spent = { ...at, assumptions: ["Skipped local (HTTP 500)"] };
+    assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spent) }), payloads: [], assumptions: spent.assumptions, localInFlight: false }), true, "waits on chat");
+    assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spent) }), payloads: ["chatgpt"], assumptions: spent.assumptions, localInFlight: false }), false, "chat delivered: posts");
   });
 
   it("releases local as today's fallback only when chat finished without a usable result", () => {

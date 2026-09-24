@@ -10,6 +10,7 @@ import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./har
 import type { Job, ReviewProvider, ProviderError } from "./types";
 import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
+import { fallbackWaivesChat } from "./local-fallback";
 import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
@@ -160,12 +161,13 @@ function pendingChatProviders(job: Job): ReviewProvider[] {
   );
 }
 
-/** The chat providers a take may hand the extension. A job released as the chat-down fallback no
- * longer waits on chat (racingProviders), so it starts no fresh chat generation: only a run that
- * already started may resume, and its result is merged only if it lands before local posts. */
+/** The chat providers a take may hand the extension. While a fallback release waives chat
+ * (fallbackWaivesChat) the job does not wait on it, so it starts no fresh chat generation: only a run
+ * that already started may resume, and its result is merged only if it lands before local posts.
+ * Once that fallback ends with no payload, chat is awaited again and offered as fresh work. */
 function offerableChatProviders(job: Job): ReviewProvider[] {
   const pending = pendingChatProviders(job);
-  return job.localFallbackAt ? pending.filter(provider => job.attemptedProviders?.includes(provider)) : pending;
+  return fallbackWaivesChat(job) ? pending.filter(provider => job.attemptedProviders?.includes(provider)) : pending;
 }
 
 export function bridgeJobState(jobId: string) {

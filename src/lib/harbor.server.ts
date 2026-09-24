@@ -31,7 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, heldLocalEvidence, heldLocalReleased, heldLocalSalvage, heldLocalUnusable, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
+import { chatStalled, fallbackWaivesChat, heldLocalEvidence, heldLocalReleased, heldLocalSalvage, heldLocalUnusable, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -470,10 +470,11 @@ async function watchReviewersLoop(jobId: string, token: string) {
       now: Date.now(),
       graceMs: BRIDGE_CONNECTED_MS,
     });
-    // Once local runs as the fallback the job never waits on chat again, even if the bridge reconnects
-    // (chat is reported as skipped); a chat result that still arrives first is merged as usual.
+    // While local runs as the fallback the job does not wait on chat, even if the bridge reconnects
+    // (chat is reported as skipped); a chat result that still arrives first is merged as usual. Once
+    // that fallback ends with no payload, chat is awaited again (fallbackWaivesChat).
     const racing = stillRacing({
-      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased, localFallback: Boolean(job.localFallbackAt) }),
+      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased, localFallback: fallbackWaivesChat(job) }),
       payloads: stored.filter((l) => l.raw.trim()).map((l) => l.provider),
       assumptions: job.assumptions,
       localInFlight: localInFlight.has(jobId),
@@ -955,7 +956,7 @@ export async function submitHarborChat(
     const haveChat = payloads.some((l) => isChatProvider(l.provider));
     if (
       stillRacing({
-        providers: racingProviders({ role, providers, localReleased, localFallback: Boolean(job.localFallbackAt) }),
+        providers: racingProviders({ role, providers, localReleased, localFallback: fallbackWaivesChat(job) }),
         payloads: payloads.map((l) => l.provider),
         assumptions: job.assumptions,
         localInFlight: localInFlight.has(jobId),

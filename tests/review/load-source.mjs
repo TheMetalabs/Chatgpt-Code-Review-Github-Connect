@@ -36,6 +36,7 @@ export function bridgeHarness(jobs, extra = {}) {
   const bridge=loadTs('src/lib/bridge.server.ts', {
     ...crypto,...types,...parser, sanitizeWorkerStatus, JsonRepairService, localJsonRepairAvailable, cancelLocalJsonRepairs, inspectReviewFormat, sanitizeProgressEvents, reviewHistory:()=>history,
     loadDotenvFile(){},writeEnvPatch(){},resolveBridgeToken:()=>({token:'fixture',persist:false}),BRIDGE_TOKEN_ENV:'FIXTURE',
+    fallbackWaivesChat:fallback.fallbackWaivesChat,
     llmWorkAllowed:j=>['issue_comment.mention','pull_request_review_comment.followup'].includes(j.trigger),
     getHarbor:()=>state,
     patchHarborJob(id, fn){state.jobs=state.jobs.map(j=>j.id===id?fn(j):j);snapshots.push(structuredClone(state.jobs.find(j=>j.id===id)));},

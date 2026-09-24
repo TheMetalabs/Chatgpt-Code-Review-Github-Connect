@@ -20,6 +20,7 @@ const cleanAssumesSkipped=JSON.stringify({findings:[],merge_recommendation:'COMM
 const reply=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 const fail500=res=>{res.writeHead(500,{'content-type':'application/json'});res.end('{"error":"model crashed"}');};
 const settle=()=>new Promise(resolve=>setTimeout(resolve,150));
+const skippedLocal=job=>(job.assumptions??[]).some(a=>/^Skipped local/.test(a));
 const TERMINAL=['posted','skipped','dlq','cancelled'];
 
 async function start(t,{role='verify-clean',settings={},githubOptions={},delivery='lifecycle'}={}){
@@ -172,6 +173,46 @@ const ROWS=[
       assert.equal(s.app.bridge.getBridgePublic().pendingJobs,0,'nothing is offered to the reconnected bridge');
       await settle(); // several watcher ticks with the bridge connected
       await answerLocal(s.app,0,res=>res.end(reply(clean)));
+      return s;
+    }},
+  // The waiver lasts only while the fallback can still deliver: once local ends with no payload, chat
+  // is the only reviewer left and is awaited again (fresh work included), never a skip.
+  {name:'L16 the fallback fails after the bridge reconnects: chat is awaited and offered again, and its review posts once',expect:{status:'posted',requests:1,reviews:1,body:/- Skipped local[\s\S]*ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 /},
+    async run(t){
+      const s=await start(t);
+      await settle();
+      s.app.clock.now+=120_001; // offline past the grace: released as the fallback
+      await eventually(()=>s.app.localRequests.length===1,'the fallback did not start');
+      assert.ok(s.job().localFallbackAt,'released as the fallback');
+      s.app.bridge.bridgeHeartbeat();
+      assert.equal(s.app.bridge.takeNextBridgeJob('lifecycle-client'),null,'no fresh chat work while the fallback can still deliver');
+      fail500(s.app.localResponses[0]);
+      await eventually(()=>skippedLocal(s.job()),'the fallback never failed');
+      await settle(); // several watcher ticks: the job keeps waiting on chat instead of skipping
+      assert.equal(s.job().status,'awaiting_chat','chat is awaited again');
+      assert.equal(s.app.bridge.getBridgePublic().pendingJobs,1,'the job is offered to the reconnected bridge');
+      const take=s.app.bridge.takeNextBridgeJob('lifecycle-client');
+      assert.equal(take?.jobId,s.jobId,'fresh chat work for the job');
+      assert.deepEqual([...take.providers],['chatgpt']);
+      assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
+      return s;
+    }},
+  {name:'L17 the fallback fails while a chat run still holds its claim: that run is awaited and its review posts once',expect:{status:'posted',requests:1,reviews:1,body:/- Skipped local[\s\S]*ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 /},
+    async run(t){
+      const s=await start(t);
+      s.app.bridge.bridgeHeartbeat();
+      const take=s.app.bridge.takeNextBridgeJob('lifecycle-client');
+      assert.equal(take?.jobId,s.jobId,'the bridge claims the job');
+      await settle();
+      s.app.clock.now+=250_000; // the bridge goes silent past the grace; the 20 min claim lease still holds
+      await eventually(()=>s.app.localRequests.length===1,'the fallback did not start');
+      assert.ok(s.job().localFallbackAt,'released as the fallback');
+      s.app.bridge.bridgeHeartbeat(); // the bridge is back and its run resumes under the same lease
+      fail500(s.app.localResponses[0]);
+      await eventually(()=>skippedLocal(s.job()),'the fallback never failed');
+      await settle();
+      assert.equal(s.job().status,'awaiting_chat','the claimed chat run is awaited');
+      assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
       return s;
     }},
   {name:'R1 race: chat and local both find the issue',expect:{status:'posted',requests:1,reviews:1},

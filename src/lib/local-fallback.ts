@@ -53,10 +53,23 @@ export function localVerifies(input: { role?: LocalReviewRole; providers: readon
   return input.role === "verify-clean" && input.providers.includes("local") && input.providers.some(isChatProvider);
 }
 
+/** Whether a job released as the chat-down fallback (Job.localFallbackAt) waives chat: true while
+ * that local leg can still produce a payload (running, or finished with one). The release itself is
+ * permanent, whatever the bridge does later (a reconnect included), but the waiver lasts only as long
+ * as local can still deliver the review: once local ends with no payload (a failure, "Skipped local"),
+ * chat is the only reviewer left, so it is awaited and offered to the bridge again. */
+export function fallbackWaivesChat(
+  job: Pick<Job, "localFallbackAt" | "storedLegs" | "assumptions" | "providerErrors">,
+): boolean {
+  if (!job.localFallbackAt) return false;
+  if ((job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim())) return true;
+  const error = job.providerErrors?.local;
+  return !skippedProvider(job.assumptions, "local") && !(error && error.code !== "disconnected");
+}
+
 /** The providers the job waits on right now: a held-back local leg counts only once it is released.
- * Releasing local as the chat-down fallback (`localFallback`, Job.localFallbackAt) is permanent: the
- * job never requires a chat reviewer again, whatever the bridge does later (a reconnect included). A
- * chat payload that still lands before local posts is merged; it is never waited for. */
+ * While a fallback release waives chat (`localFallback` = fallbackWaivesChat), the job waits only on
+ * local: a chat payload that still lands before local posts is merged; it is never waited for. */
 export function racingProviders(input: {
   role?: LocalReviewRole;
   providers: readonly ReviewProvider[];

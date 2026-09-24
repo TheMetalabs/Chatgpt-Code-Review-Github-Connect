@@ -23,10 +23,10 @@
  * The fix-round budget (ASHLAR_LOOP_ROUND_CAP, default 5) is enforced at the next review: review
  * round N+1 verifies the N-th fix (clean → CONVERGED, else round-cap). The ONLY quiet exits are
  * supersession (a newer head drives the loop — its review is requested once, idempotently; a
- * request that did not settle is logged, not quiet), an operator stop, a newer loop request (a new session, or apply downgraded to suggest), and an
- * existing handoff on this head. One relevance check guards every checkpoint of a round, and a
- * round that went moot is never retried. Apply also requires the session starter's write
- * permission (design §2).
+ * request that did not settle is logged, not quiet), an operator stop, a newer loop request (a
+ * new session, or apply downgraded to suggest), and an existing handoff on this head. One
+ * relevance check guards every checkpoint of a round, and a round that went moot is never
+ * retried. Apply also requires the session starter's write permission (design §2).
  * Everything is gated OFF by default:
  *   - env ASHLAR_FIX_AGENT=1 AND settings.fixAgent.provider != null (design §6b), AND
  *   - the PR has an ACTIVE loop session (durable: a recorded start after the last terminal), AND

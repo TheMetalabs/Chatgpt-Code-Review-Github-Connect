@@ -11,9 +11,9 @@
  * the current loop session (sinceIso) and the current head; history reads fail closed (throw →
  * maybeEscalate aborts, never dup-posts); an in-process per-head guard serializes concurrent calls.
  * NON-GOALS (owned by the orchestrator): durable cross-PROCESS escalation dedup (needs a shared
- * store — here it is the in-process control-write journal + the marker scan); full commit-ancestry verification across a
- * force-push (here it is a proportionate latest-head-must-match-requested-head guard, not a
- * compare-API ancestry walk).
+ * store — here it is the in-process control-write journal + the marker scan); full
+ * commit-ancestry verification across a force-push (here it is a proportionate
+ * latest-head-must-match-requested-head guard, not a compare-API ancestry walk).
  */
 import {
   canonicalContinuation,

@@ -519,10 +519,13 @@ async function watchReviewersLoop(jobId: string, token: string) {
     if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;
     const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId), staleMs: localStaleNoteMs() });
     const notes: string[] = [];
-    if (chat.length && !bridge.connected && !claimed) {
-      notes.push(
-        `Chrome bridge is not connected. ${chat.map((p) => (p === "grok" ? "Grok" : "ChatGPT")).join(" / ")} start when the extension reconnects.`,
-      );
+    const chatNames = chat.map((p) => (p === "grok" ? "Grok" : "ChatGPT")).join(" / ");
+    // While a fallback release waives chat, a reconnect gets no fresh chat work and the job does not
+    // wait on chat, so the note must not promise that chat starts when the extension reconnects.
+    if (chat.length && fallbackWaivesChat(job)) {
+      notes.push(`Chat was unavailable, so local runs as the fallback. ${chatNames} is not awaited, even if the extension reconnects.`);
+    } else if (chat.length && !bridge.connected && !claimed) {
+      notes.push(`Chrome bridge is not connected. ${chatNames} start when the extension reconnects.`);
     }
     // Local leg visibility (never auto-abort): queued at the server vs generating vs no sign of
     // life. Stable state text only — a live age would rewrite the GitHub ops comment every tick.

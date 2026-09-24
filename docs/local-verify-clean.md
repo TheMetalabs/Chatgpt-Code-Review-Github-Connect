@@ -98,7 +98,9 @@ the job waits only on local (`racingProviders` with `localFallback`, read by bot
 `submitHarborChat`): chat is not required, even when the bridge reconnects and a chat leg reads as
 pending. A chat payload that still lands before local posts is merged; it is never waited for. A take
 (`nextBridgeJob`) offers such a job no fresh chat generation — only a run that already started may
-resume. Row L14 pins it.
+resume. The ops comment says so too: while the waiver holds it states that chat is not awaited, even
+if the extension reconnects, and the chat lane reads "not awaited · local runs as the fallback" — never
+that chat starts when the extension reconnects or waits for the Chrome bridge. Row L14 pins it.
 
 Once the fallback ends with no payload (HTTP 500, transport error, offline: "Skipped local"), chat is
 the only reviewer left, so the waiver ends: the job waits on the pending chat reviewers again, exactly

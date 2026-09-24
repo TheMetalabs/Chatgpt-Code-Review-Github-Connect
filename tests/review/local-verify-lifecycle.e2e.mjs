@@ -21,6 +21,13 @@ const reply=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{con
 const fail500=res=>{res.writeHead(500,{'content-type':'application/json'});res.end('{"error":"model crashed"}');};
 const settle=()=>new Promise(resolve=>setTimeout(resolve,150));
 const skippedLocal=job=>(job.assumptions??[]).some(a=>/^Skipped local/.test(a));
+/** The ops comment of a job whose fallback release waives chat: it says chat is not awaited and never
+ * that chat starts on reconnect or waits for the bridge. */
+function assertWaivedOps(body=''){
+  assert.match(body,/ChatGPT is not awaited, even if the extension reconnects/,'ops: chat is not awaited');
+  assert.match(body,/- ChatGPT: not awaited · local runs as the fallback/,'ops: the chat lane');
+  assert.doesNotMatch(body,/start when the extension reconnects|waiting for Chrome bridge/,'ops: no promise that chat starts');
+}
 const TERMINAL=['posted','skipped','dlq','cancelled'];
 
 async function start(t,{role='verify-clean',settings={},githubOptions={},delivery='lifecycle'}={}){
@@ -167,11 +174,15 @@ const ROWS=[
       s.app.clock.now+=120_001; // offline past the grace: released as the fallback
       await eventually(()=>s.app.localRequests.length===1,'the fallback did not start');
       assert.ok(s.job().localFallbackAt,'released as the fallback');
+      // The ops comment never promises chat on reconnect: the job does not wait on it.
+      await eventually(()=>/ChatGPT is not awaited, even if the extension reconnects/.test(s.app.ops.at(-1)??''),'the ops comment does not say chat is not awaited');
+      assertWaivedOps(s.app.ops.at(-1));
       s.app.bridge.bridgeHeartbeat(); // the bridge is back before local answers, and chat never returns
       assert.equal(s.app.bridge.getBridgePublic().connected,true);
       assert.equal(s.app.bridge.takeNextBridgeJob('lifecycle-client'),null,'no fresh chat generation for a fallback-released job');
       assert.equal(s.app.bridge.getBridgePublic().pendingJobs,0,'nothing is offered to the reconnected bridge');
       await settle(); // several watcher ticks with the bridge connected
+      assertWaivedOps(s.app.ops.at(-1));
       await answerLocal(s.app,0,res=>res.end(reply(clean)));
       return s;
     }},
@@ -190,6 +201,8 @@ const ROWS=[
       await eventually(()=>skippedLocal(s.job()),'the fallback never failed');
       await settle(); // several watcher ticks: the job keeps waiting on chat instead of skipping
       assert.equal(s.job().status,'awaiting_chat','chat is awaited again');
+      await eventually(()=>/- ChatGPT: waiting for Chrome bridge/.test(s.app.ops.at(-1)??''),'the ops comment does not show chat awaited again');
+      assert.doesNotMatch(s.app.ops.at(-1),/not awaited/,'ops: the waiver ended');
       assert.equal(s.app.bridge.getBridgePublic().pendingJobs,1,'the job is offered to the reconnected bridge');
       const take=s.app.bridge.takeNextBridgeJob('lifecycle-client');
       assert.equal(take?.jobId,s.jobId,'fresh chat work for the job');

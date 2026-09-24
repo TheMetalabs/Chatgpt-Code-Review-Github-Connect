@@ -262,7 +262,13 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
             assert.deepEqual(bare(after), bare(before), `${label} (${pass}): exactly one equivalent event`);
             assert.deepEqual(deriveLoopSession([anchor, ...after]), deriveLoopSession([anchor, ...before]), `${label} (${pass}): the session changed`);
           }
+          // The other paths that meet the listed row — the handoff idempotency read (seen) and a
+          // re-emit's scan or re-check — prove the write exists and leave its stand-in as it was.
+          assert.equal(ownWrites(f.gh).seen(writes[kind], f.rows, BOT), true, `${label}: seen`);
           assert.equal((await emitControl(f.ctx, writes[kind])).status, "exists", `${label}: the listed row still proves the write`);
+          const later = await read();
+          assert.deepEqual(bare(later), bare(before), `${label} (seen, re-emit): exactly one equivalent event`);
+          assert.deepEqual(deriveLoopSession([anchor, ...later]), deriveLoopSession([anchor, ...before]), `${label} (seen, re-emit): the session changed`);
           assert.equal(f.posts(), 1, `${label}: one POST`);
         }
       }

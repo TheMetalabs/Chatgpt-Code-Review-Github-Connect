@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
 import { continueComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
+import { watchFixRequest } from "./fix-request-watch.ts";
 import { botSettingsToEnv, sanitizeBotSettings } from "./settings.server.ts";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -16,6 +17,7 @@ import {
   renderFindings,
   CHAT_FIX_FENCE_RULE,
   fixGenerationMs,
+  productionRequestFix,
   requestChatFix,
   runPostReviewLoop,
   SILENT_REASONS,
@@ -1265,6 +1267,29 @@ describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per 
     const ac = new AbortController();
     await requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", "p", { loadBridge: loader, signal: ac.signal });
     assert.equal(seen[0], ac.signal);
+  });
+
+  it("production routing + the real watcher: an abandoned chat fix aborts its bridge item", async () => {
+    let signal: AbortSignal | undefined;
+    const loader = async () => ({
+      requestBridgeFix: (request: { signal?: AbortSignal }) => {
+        signal = request.signal;
+        return new Promise<string>((_resolve, reject) => request.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+      },
+    });
+    const requestFix = productionRequestFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, { loadBridge: loader });
+    const out = watchFixRequest(requestFix, "p", {
+      generationMs: 60 * 60_000,
+      queueMaxMs: 60 * 60_000,
+      livenessMs: 0,
+      checkEveryMs: 1,
+      tickMs: 5,
+      reportsActivity: false,
+      stillWanted: async () => "head moved",
+    });
+    await assert.rejects(out, /head moved/);
+    assert.ok(signal, "the chat transport received the watcher's signal");
+    assert.equal(signal.aborted, true, "the bridge item is cancelled, so the extension closes its tab");
   });
 
   it("delivery chat-push fails closed instead of silently becoming a server-side apply", async () => {

@@ -544,30 +544,14 @@ export async function requestChatFix(
   return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt: fenced, ...(opts.signal ? { signal: opts.signal } : {}) });
 }
 
-/** Production dependencies, loaded lazily so the static graph stays pure. `ref` is the PR a
- * chat fix item is keyed by (one live item per PR). */
-async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRuntimeDeps> {
-  // The GitHub client is the loop's only channel: if it cannot load, nothing can be posted (the
-  // ONE unobservable failure — logged server-side by harbor). Provider transports load LAZILY
-  // inside requestFix, so their failure is an ordinary request-failed → retry → fix-failed.
-  const github = await import("./github.server.ts");
-  productionGh ??= {
-    listPullReviews: github.listPullReviews,
-    listReviewComments: github.listReviewComments,
-    listIssueComments: github.listIssueComments,
-    createIssueComment: github.createIssueComment,
-    fetchPullHeadRef: github.fetchPullHeadRef,
-    gitDataApi: github.gitDataApi,
-    fetchUserPermission: github.fetchUserPermission,
-    listReviewThreadRoots: github.listReviewThreadRoots,
-    replyToReviewComment: github.replyToReviewComment,
-  };
-  const gh = productionGh;
-  // local is a plain request/response; chatgpt/grok go through the Chrome bridge's fix registry
-  // (NOT the review awaiting_chat lifecycle) and come back as the same kind of answer text.
-  const requestFix: RequestFix = async (prompt, ctl) => {
+/** Production provider routing (productionDeps' requestFix). local is a plain request/response;
+ * chatgpt/grok go through the Chrome bridge's fix registry (NOT the review awaiting_chat
+ * lifecycle) and come back as the same kind of answer text. The watcher's abort signal reaches
+ * both, so an abandoned fix cancels its bridge item and the extension closes its tab. */
+export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { loadBridge?: BridgeFixLoader } = {}): RequestFix {
+  return async (prompt, ctl) => {
     const provider = settings.fixAgent.provider;
-    if (provider === "chatgpt" || provider === "grok") return requestChatFix(settings, ref, provider, prompt, { signal: ctl?.signal });
+    if (provider === "chatgpt" || provider === "grok") return requestChatFix(settings, ref, provider, prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge });
     if (provider !== "local") {
       throw new Error(`fix provider ${provider} not wired yet (local, chatgpt, grok)`);
     }
@@ -590,6 +574,28 @@ async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRu
       { onActivity: (a) => ctl?.onActivity?.(a.kind === "output" ? "generating" : "queued") },
     );
   };
+}
+
+/** Production dependencies, loaded lazily so the static graph stays pure. `ref` is the PR a
+ * chat fix item is keyed by (one live item per PR). */
+async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRuntimeDeps> {
+  // The GitHub client is the loop's only channel: if it cannot load, nothing can be posted (the
+  // ONE unobservable failure — logged server-side by harbor). Provider transports load LAZILY
+  // inside requestFix, so their failure is an ordinary request-failed → retry → fix-failed.
+  const github = await import("./github.server.ts");
+  productionGh ??= {
+    listPullReviews: github.listPullReviews,
+    listReviewComments: github.listReviewComments,
+    listIssueComments: github.listIssueComments,
+    createIssueComment: github.createIssueComment,
+    fetchPullHeadRef: github.fetchPullHeadRef,
+    gitDataApi: github.gitDataApi,
+    fetchUserPermission: github.fetchUserPermission,
+    listReviewThreadRoots: github.listReviewThreadRoots,
+    replyToReviewComment: github.replyToReviewComment,
+  };
+  const gh = productionGh;
+  const requestFix = productionRequestFix(settings, ref);
   // Streaming (the default) reports queued vs generating, so the fix deadline can exclude queue time.
   // The transport's own streaming default (what requestLocalChat will actually do): a streamed
   // reply reports queued vs generating; a buffered one reports "generating" from its headers.

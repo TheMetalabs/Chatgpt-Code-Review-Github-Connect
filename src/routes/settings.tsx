@@ -2,8 +2,30 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { useAshlar } from "@/lib/store";
-import { DEFAULT_SETTINGS, PROVIDER_LABEL, SECRET_MASK, SECRET_MASK_PEM, isMaskedSecret, normalizeReviewOrder, providersFromSettings } from "@/lib/types";
-import type { BotSettings, GithubReady, ReviewProvider, Severity } from "@/lib/types";
+import {
+  DEFAULT_SETTINGS,
+  FIX_AGENT_KNOBS,
+  FIX_MODES,
+  PROVIDER_LABEL,
+  SECRET_MASK,
+  SECRET_MASK_PEM,
+  WIRED_FIX_DELIVERIES,
+  WIRED_FIX_PROVIDERS,
+  isMaskedSecret,
+  normalizeReviewOrder,
+  providersFromSettings,
+} from "@/lib/types";
+import type {
+  BotSettings,
+  FixAgentKnob,
+  FixAgentProvider,
+  FixAgentSettings,
+  FixDelivery,
+  FixMode,
+  GithubReady,
+  ReviewProvider,
+  Severity,
+} from "@/lib/types";
 import {
   CHATGPT_REASONING,
   CHATGPT_REASONING_LABEL,
@@ -18,10 +40,48 @@ export const Route = createFileRoute("/settings")({ component: Settings });
 function hydrateDraft(saved: BotSettings): BotSettings {
   return {
     ...saved,
+    fixAgent: { ...DEFAULT_SETTINGS.fixAgent, ...saved.fixAgent },
     localJsonRepairEnabled: saved.localJsonRepairEnabled ?? true,
     localLlmApiKey: saved.localLlmApiKeySet ? SECRET_MASK : "",
     webhookSecret: saved.webhookSecretSet ? SECRET_MASK : saved.webhookSecret,
   };
+}
+
+/** Numeric fix-agent fields on the form: ms values are edited in minutes. */
+const FIX_NUMBER_FIELDS: { key: FixAgentKnob; label: string; unit: "count" | "minutes" | "chars"; hint: string }[] = [
+  { key: "parallelPrs", label: "fix_agent.parallel_prs", unit: "count", hint: "PRs fixed at once (shares the chat bridge with reviews)" },
+  { key: "roundCap", label: "fix_agent.round_cap", unit: "count", hint: "review→fix rounds before a human decides" },
+  { key: "attempts", label: "fix_agent.attempts", unit: "count", hint: "tries per round for an unusable reply" },
+  { key: "timeoutMs", label: "fix_agent.timeout_minutes", unit: "minutes", hint: "Local LLM generation deadline, from first output" },
+  { key: "queueMaxMs", label: "fix_agent.queue_max_minutes", unit: "minutes", hint: "give up on a fix still queued this long" },
+  { key: "chatTimeoutMs", label: "fix_agent.chat_timeout_minutes", unit: "minutes", hint: "ChatGPT/Grok fix deadline, queue + generation" },
+  { key: "chatMaxPromptChars", label: "fix_agent.chat_max_prompt_chars", unit: "chars", hint: "bigger ChatGPT/Grok fix prompts fail at once (use Local)" },
+];
+
+const FIX_PROVIDER_LABEL: Record<FixAgentProvider, string> = {
+  chatgpt: "ChatGPT (Chrome bridge)",
+  grok: "Grok (Chrome bridge)",
+  local: "Local LLM",
+  "coding-agent": "coding-agent (not wired)",
+};
+
+const toFormUnit = (key: FixAgentKnob, v: number) =>
+  FIX_NUMBER_FIELDS.find((f) => f.key === key)?.unit === "minutes" ? v / 60_000 : v;
+const fromFormUnit = (key: FixAgentKnob, v: number) =>
+  FIX_NUMBER_FIELDS.find((f) => f.key === key)?.unit === "minutes" ? v * 60_000 : v;
+
+/** Why the fix-agent block cannot be saved as typed (null = valid). The server clamps as well;
+ * this tells the operator instead of silently changing what they typed. */
+function fixAgentProblem(fix: FixAgentSettings): string | null {
+  if (fix.enabled && fix.provider == null) return "choose a fix provider to enable the review loop";
+  for (const f of FIX_NUMBER_FIELDS) {
+    const k = FIX_AGENT_KNOBS[f.key];
+    const v = fix[f.key];
+    if (typeof v !== "number" || !Number.isInteger(v) || v < k.min || v > k.max) {
+      return `${f.label} must be a whole number from ${toFormUnit(f.key, k.min)} to ${toFormUnit(f.key, k.max)}`;
+    }
+  }
+  return null;
 }
 
 function replaceMasked(current: string, next: string): string {
@@ -42,6 +102,7 @@ export function Settings() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const order = normalizeReviewOrder(draft.reviewOrder);
+  const savedFixKey = JSON.stringify(saved.fixAgent);
 
   const secretDirty =
     (!isMaskedSecret(draft.localLlmApiKey) && Boolean(draft.localLlmApiKey.trim())) ||
@@ -79,12 +140,19 @@ export function Settings() {
     saved.reviewOrder.join(","),
     saved.chatgptReasoning,
     saved.grokReasoning,
+    savedFixKey,
   ]);
 
   function patch(p: Partial<typeof draft>) {
     setNotice(null);
     setTouched(true);
     setDraft((d) => ({ ...d, ...p }));
+  }
+
+  function patchFix(p: Partial<FixAgentSettings>) {
+    setNotice(null);
+    setTouched(true);
+    setDraft((d) => ({ ...d, fixAgent: { ...d.fixAgent, ...p } }));
   }
 
   function toggle(key: "reviewChatgpt" | "reviewGrok" | "reviewLocal", on: boolean) {
@@ -113,6 +181,11 @@ export function Settings() {
     }
     if (!providersFromSettings(draft).length) {
       setNotice("enable ChatGPT, Grok, or a local URL+model");
+      return;
+    }
+    const fixProblem = fixAgentProblem(draft.fixAgent);
+    if (fixProblem) {
+      setNotice(fixProblem);
       return;
     }
     setBusy(true);
@@ -348,6 +421,7 @@ export function Settings() {
             Signs Inbox ping only. Live GitHub HMAC uses the GitHub App webhook secret below. Masked if already saved.
           </p>
         </Field>
+        <FixAgentSection fix={draft.fixAgent} onChange={patchFix} />
         <div className="sticky bottom-4 z-10 flex flex-wrap items-center gap-2 rounded-xl border border-line bg-bg/95 p-3 backdrop-blur">
           <Button type="submit" disabled={busy || !dirty}>
             {busy ? "Saving…" : "Save settings"}
@@ -393,7 +467,14 @@ review:
 local_llm:
   base_url: ${draft.localLlmBaseUrl || "—"}
   model: ${draft.localLlmModel || "—"}
-  json_repair_enabled: ${draft.localJsonRepairEnabled}`}</pre>
+  json_repair_enabled: ${draft.localJsonRepairEnabled}
+fix_agent:  # review loop (experimental)
+  enabled: ${draft.fixAgent.enabled}
+  provider: ${draft.fixAgent.provider ?? "—"}
+  mode: ${draft.fixAgent.mode}
+  delivery: ${draft.fixAgent.delivery}
+  parallel_prs: ${draft.fixAgent.parallelPrs}
+  round_cap: ${draft.fixAgent.roundCap}`}</pre>
 
       <Button
         variant="secondary"
@@ -748,6 +829,99 @@ function GitHubApp({ github }: { github: GithubReady }) {
       {saved ? <p className="mt-3 text-[12px] text-ok">Saved. Secrets stay masked on this page.</p> : null}
       {probe ? <p className={`mt-3 text-[12px] ${error ? "text-danger" : "text-ok"}`}>{probe}</p> : null}
       {error ? <p className="mt-3 text-[12px] text-danger">{error}</p> : null}
+    </section>
+  );
+}
+
+function FixAgentSection({ fix, onChange }: { fix: FixAgentSettings; onChange: (p: Partial<FixAgentSettings>) => void }) {
+  // Offer what the loop can execute; a stored value outside that set stays visible (not silently
+  // rewritten) so the operator sees it and can pick a wired one.
+  const providers = WIRED_FIX_PROVIDERS.includes(fix.provider as FixAgentProvider) || fix.provider == null
+    ? WIRED_FIX_PROVIDERS
+    : [...WIRED_FIX_PROVIDERS, fix.provider];
+  const deliveries = WIRED_FIX_DELIVERIES.includes(fix.delivery) ? WIRED_FIX_DELIVERIES : [...WIRED_FIX_DELIVERIES, fix.delivery];
+  const active = fix.enabled && fix.provider != null;
+  return (
+    <section aria-label="Fix agent / review loop" className="space-y-4 rounded-xl border border-line bg-bg-elevated p-4">
+      <div>
+        <h2 className="text-sm font-medium">Fix agent / review loop</h2>
+        <p role="note" className="mt-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-relaxed text-fg-muted">
+          Experimental. When ON, a <code>/review-loop</code> request makes Ashlar fix its own findings and re-review, up to
+          the round budget. <code>apply</code> commits and pushes to the PR branch (the starter needs write access);
+          <code> suggest</code> only posts the proposed change. Saved changes apply to the next loop step — no restart.
+        </p>
+      </div>
+      <Toggle label="fix_agent.enabled" checked={fix.enabled} onChange={(v) => onChange({ enabled: v })} />
+      <p className="-mt-2 text-[12px] text-fg-subtle">
+        {active
+          ? `Loop ON: ${FIX_PROVIDER_LABEL[fix.provider as FixAgentProvider]} fixes, mode ${fix.mode}.`
+          : fix.enabled
+            ? "Loop stays OFF until a provider is chosen."
+            : "Loop OFF (default): no loop step and no fix request, ever."}
+      </p>
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Field label="fix_agent.provider">
+          <select
+            value={fix.provider ?? ""}
+            onChange={(e) => onChange({ provider: (e.target.value || null) as FixAgentProvider | null })}
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+          >
+            <option value="">none</option>
+            {providers.map((p) => (
+              <option key={p} value={p} disabled={!WIRED_FIX_PROVIDERS.includes(p)}>
+                {FIX_PROVIDER_LABEL[p]}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="fix_agent.mode">
+          <select
+            value={fix.mode}
+            onChange={(e) => onChange({ mode: e.target.value as FixMode })}
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+          >
+            {FIX_MODES.map((m) => (
+              <option key={m} value={m}>
+                {m === "apply" ? "apply (auto-push)" : "suggest (no push)"}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="fix_agent.delivery">
+          <select
+            value={fix.delivery}
+            onChange={(e) => onChange({ delivery: e.target.value as FixDelivery })}
+            className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+          >
+            {deliveries.map((d) => (
+              <option key={d} value={d} disabled={!WIRED_FIX_DELIVERIES.includes(d)}>
+                {d}
+              </option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      <div className="grid gap-4 sm:grid-cols-2">
+        {FIX_NUMBER_FIELDS.map((f) => {
+          const k = FIX_AGENT_KNOBS[f.key];
+          return (
+            <Field key={f.key} label={f.label}>
+              <input
+                type="number"
+                min={toFormUnit(f.key, k.min)}
+                max={toFormUnit(f.key, k.max)}
+                step={1}
+                value={toFormUnit(f.key, fix[f.key])}
+                onChange={(e) => onChange({ [f.key]: fromFormUnit(f.key, e.target.valueAsNumber) })}
+                className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
+              />
+              <span className="mt-1 block text-[11px] text-fg-subtle">
+                {f.hint} ({toFormUnit(f.key, k.min)}–{toFormUnit(f.key, k.max)}, default {toFormUnit(f.key, k.def)})
+              </span>
+            </Field>
+          );
+        })}
+      </div>
     </section>
   );
 }

@@ -20,7 +20,7 @@ import { SAMPLE_PRS } from "@/lib/samples";
 import { probeGithub } from "@/lib/github.server";
 import { clearGithubSecrets, patchGithubSecrets } from "@/lib/secrets.server";
 import { isMaskedSecret, normalizeReviewOrder } from "@/lib/types";
-import type { ReviewProvider } from "@/lib/types";
+import type { FixAgentSettings, ReviewProvider } from "@/lib/types";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "@/lib/reasoning";
 
 function sameOrigin(request: Request) {
@@ -82,6 +82,7 @@ export const Route = createFileRoute("/api/harbor")({
           reviewOrder?: ReviewProvider[];
           chatgptReasoning?: string;
           grokReasoning?: string;
+          fixAgent?: unknown;
           githubAppId?: string;
           githubClientId?: string;
           githubWebhookSecret?: string;
@@ -141,6 +142,12 @@ export const Route = createFileRoute("/api/harbor")({
           if (Array.isArray(body.reviewOrder)) patch.reviewOrder = normalizeReviewOrder(body.reviewOrder);
           if (typeof body.chatgptReasoning === "string") patch.chatgptReasoning = normalizeChatgptReasoning(body.chatgptReasoning);
           if (typeof body.grokReasoning === "string") patch.grokReasoning = normalizeGrokReasoning(body.grokReasoning);
+          // Fix agent / review loop: a partial object merged over the live one; patchHarborSettings
+          // normalizes it (sanitizeBotSettings: unknown values → defaults, numbers clamped, only a
+          // literal true enables). Applied in memory at once — the next loop step reads it.
+          if (body.fixAgent && typeof body.fixAgent === "object" && !Array.isArray(body.fixAgent)) {
+            patch.fixAgent = { ...getHarbor().settings.fixAgent, ...(body.fixAgent as Partial<FixAgentSettings>) };
+          }
           if (Object.keys(patch).length) {
             try {
               patchHarborSettings(patch);
@@ -149,7 +156,7 @@ export const Route = createFileRoute("/api/harbor")({
               return Response.json({ ok: false, error: msg }, { status: msg.includes("reviewer") ? 400 : 500 });
             }
           }
-          return Response.json({ ok: true, github: githubStatus(), bridge: getBridgePublic() });
+          return Response.json({ ok: true, settings: publicSettings(getHarbor().settings), github: githubStatus(), bridge: getBridgePublic() });
         }
         if (body.action === "github" || body.action === "github-clear") {
           if (!sameOrigin(request)) {

@@ -261,6 +261,7 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       reviewOrder: next.reviewOrder,
       chatgptReasoning: next.chatgptReasoning,
       grokReasoning: next.grokReasoning,
+      fixAgent: next.fixAgent,
     };
     if (next.localLlmApiKey.trim() && !isMaskedSecret(next.localLlmApiKey) && patch.localLlmApiKey && !isMaskedSecret(patch.localLlmApiKey)) {
       body.localLlmApiKey = next.localLlmApiKey;
@@ -274,7 +275,11 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error("could not save settings");
-    set({ settings: next });
+    // The server normalizes (e.g. clamps fix-agent numbers): show what it actually saved.
+    const saved = (await Promise.resolve()
+      .then(() => res.json())
+      .catch(() => null)) as { settings?: Partial<BotSettings> } | null;
+    set({ settings: saved?.settings?.fixAgent ? { ...next, fixAgent: saved.settings.fixAgent } : next });
   },
   resetDemo: () => {
     // This control is local-only. It must never cancel production jobs on the server.

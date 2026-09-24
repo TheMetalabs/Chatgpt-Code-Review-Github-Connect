@@ -410,20 +410,24 @@ async function waitUntilFixOrQuota(name) {
  * exists and the composer holds no user draft. Anything unknown preserves the tab — a user's
  * conversation is never closed.
  */
-function fixTabOwned(state) {
-  if (state.tabRepurposed) return false;
+/** Who holds a cancelled fix tab: "owned" (only Ashlar's work in it), "takenOver" (the user sent a
+ * follow-up, typed a draft or opened another conversation) or "unknown" (the journal is
+ * unreadable, or the sent turn is not rendered yet after a reload): the worker asks again. */
+function fixTabOwnership(state) {
+  if (state.tabRepurposed) return "takenOver";
   let submission;
-  try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return false; }
+  try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return "unknown"; }
   const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
   if (submission?.phase !== "sent") {
-    if (!users.length) return true;
+    if (!users.length) return "owned";
     return Boolean(submission?.expected) && submission.baseline === 0 && users.length === 1 &&
-      normalizePrompt(messagePromptText(users[0])).includes(submission.expected);
+      normalizePrompt(messagePromptText(users[0])).includes(submission.expected) ? "owned" : "takenOver";
   }
   const bound = boundReviewResponse(submission);
-  if (!bound.identified || bound.followup) return false;
+  if (bound.followup) return "takenOver";
+  if (!bound.identified) return users.length ? "takenOver" : "unknown";
   const draft = typeof composer === "function" && globalThis.document ? composer() : null;
-  return !(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
+  return draft && (draft.value || draft.innerText || draft.textContent || "").trim() ? "takenOver" : "owned";
 }
 
 /** Short message replies keep MV3 workers recoverable; the page owns the long model call.
@@ -483,11 +487,12 @@ function installReviewRunner(name, run) {
         reply({ok:false,code:"job_mismatch"});return;
       }
       state.fixCancelled = true; // The server settled this fix; stop collecting an answer for it.
-      const owned = fixTabOwned(state);
-      // A tab the user took over stays open but is no longer Ashlar's: free its managed slot, or
-      // it counts against tab capacity (untracked binding) until the user closes it by hand.
-      if (!owned) releaseManagedSlot(state);
-      reply({ok:true,owned,url:globalThis.location?.href || ""});return;
+      const ownership = fixTabOwnership(state);
+      // A tab the user took over (or one the worker gives up identifying: preserve) stays open but
+      // is no longer Ashlar's: free its managed slot, or it counts against tab capacity (untracked
+      // binding) until the user closes it by hand.
+      if (ownership === "takenOver" || msg.preserve === true) releaseManagedSlot(state);
+      reply({ok:true,owned:ownership === "owned",ownership,url:globalThis.location?.href || ""});return;
     }
     if (["ashlar-capture-accepted", "ashlar-result-saved"].includes(msg.type)) {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider || msg.committed !== true) {

@@ -694,6 +694,9 @@ async function cleanupProviderBody(job, provider, jobs) {
  * close without an acknowledged answer. It still requires the page's positive binding, and a tab
  * the user took over (follow-up, unsent draft, other conversation) is preserved.
  */
+/** How long a cancelled fix tab whose ownership is "unknown" is re-asked before it is preserved. */
+const FIX_OWNERSHIP_WAIT_MS = 2 * 60_000;
+
 async function forceCloseFixTab(job, provider, jobs, tab) {
   const state = job.states[provider];
   const result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-fix-cancel"), contentFiles(provider));
@@ -701,6 +704,14 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     state.cleanupError = "tab ownership does not match; no tab was closed";
     await saveJobs(jobs);
     return;
+  }
+  if (result.ownership === "unknown") {
+    // Not identifiable yet (a reload still rendering the sent turn): ask again next tick. Past the
+    // wait, preserve it (never close what might be the user's) and have the page free its slot.
+    state.ownershipUnknownAt ??= Date.now();
+    if (Date.now() - state.ownershipUnknownAt < FIX_OWNERSHIP_WAIT_MS) return saveJobs(jobs);
+    await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider));
+    return finishTabCleanup(job, provider, jobs, "fix tab ownership could not be established; tab preserved");
   }
   if (result.owned !== true) return finishTabCleanup(job, provider, jobs, "user took over the fix tab; tab preserved");
   const current = await chrome.tabs.get(tab.id);

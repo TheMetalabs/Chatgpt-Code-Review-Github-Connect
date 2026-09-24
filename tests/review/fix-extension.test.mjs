@@ -113,6 +113,27 @@ test('page: ashlar-fix-cancel needs a positive binding, reports ownership and st
   assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, 'the preserved tab frees its slot (not counted against capacity)');
 });
 
+test('page: fix-cancel ownership is "unknown" when it cannot be established yet; only takeover or preserve frees the slot', async () => {
+  const p = page({limit: 500});
+  Object.assign(p.c.context, {stopButtonVisible: () => true, replyDoneVisible: () => false, savedSubmission: () => null});
+  p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');
+  p.c.message(run());
+  await flush();
+  const status = () => p.c.message({type: 'ashlar-tab-status'}).released;
+  // the journal is unreadable
+  p.c.context.savedSubmission = () => { throw new Error('storage unavailable'); };
+  let out = p.c.message(msg('ashlar-fix-cancel'));
+  assert.equal(out.ownership, 'unknown');assert.equal(out.owned, false);assert.equal(status(), false, 'unknown never frees the slot');
+  // sent, but the bound turn is not rendered yet (reload / hydration)
+  Object.assign(p.c.context, {savedSubmission: () => ({phase: 'sent', expected: 'FIX PROMPT'}), boundReviewResponse: () => ({identified: false, followup: false})});
+  out = p.c.message(msg('ashlar-fix-cancel'));
+  assert.equal(out.ownership, 'unknown');assert.equal(status(), false);
+  // the worker gives up identifying it: preserve frees the slot
+  out = p.c.message(msg('ashlar-fix-cancel', {preserve: true}));
+  assert.equal(out.owned, false);assert.equal(status(), true);
+  await settled(p.c);
+});
+
 // ── worker ──────────────────────────────────────────────────────────────────
 function fixJob(patch = {}) {
   return {jobId: 'fix-A', kind: 'fix', origin: 'http://bridge', leaseId: 'lease-A', prompt: 'FIX PROMPT', providers: ['chatgpt'],
@@ -166,6 +187,23 @@ test('worker: a cancelled fix is force-closed via ashlar-fix-cancel even while i
   await review.tick();
   assert.equal(review.closedTabs.length, 0);assert.ok(review.local.state.pendingReviewJobs['job-A']);
   assert.equal(review.messages.some(m => m.type === 'ashlar-fix-cancel'), false);
+});
+
+test('worker: an unknown ownership is asked again, then the tab is preserved (slot freed) after the wait', async () => {
+  const b = worker([fixJob()], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', url: URL_FIX} : {ok: true})});
+  await b.tick();
+  assert.equal(b.closedTabs.length, 0);
+  const pending = b.local.state.pendingReviewJobs['fix-A'];
+  assert.ok(pending, 'not retired while ownership is unknown');
+  assert.equal(typeof pending.states.chatgpt.ownershipUnknownAt, 'number');
+  assert.equal(b.messages.some(m => m.preserve), false);
+  const RealDate = b.context.Date || Date;
+  const later = RealDate.now() + 3 * 60_000; // the wait has passed
+  b.context.Date = class extends RealDate { static now() { return later; } };
+  await b.tick();
+  assert.equal(b.closedTabs.length, 0, 'never closed on a guess');assert.ok(b.tabs.has(10));
+  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
+  assert.deepEqual(b.local.state.pendingReviewJobs, {});
 });
 
 test('worker: a cancelled fix tab the user took over is preserved, never closed', async () => {

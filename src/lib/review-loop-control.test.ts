@@ -95,6 +95,43 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(controlKey({ ...k, sessionIso: "2026-02-20T00:00:00Z" }), controlKey({ ...k, sessionIso: "2026-02-20T00:00:00.000Z" }));
   });
 
+  it("a session read while an emit is in flight (refused and backing off, or rendering its body) keeps its entry: a concurrent emit joins it", async () => {
+    const until = async (done: () => boolean) => {
+      for (let i = 0; i < 100 && !done(); i++) await new Promise((r) => setImmediate(r));
+      assert.ok(done(), "the first emit reached its pause");
+    };
+    const continuation = (body: ControlWrite["body"]): ControlWrite => ({
+      key: { kind: "continue", ref: ref(), head: HEAD, sessionIso: SESSION },
+      body,
+      since: { iso: SESSION },
+    });
+    const text = continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD });
+    for (const pause of ["backoff", "body"] as const) {
+      const f = world(pause === "backoff" ? ["rejected", "ok"] : ["ok"]);
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let paused = false;
+      const hold = async () => {
+        paused = true;
+        await gate;
+      };
+      // backoff: the first POST is refused and the retry waits (state "rejected"); body: the lazy
+      // body is still being computed (state "intent")
+      const ctx: EmitContext = { ...f.ctx, sleep: pause === "backoff" ? hold : f.ctx.sleep };
+      const w = continuation(pause === "body" ? async () => (await hold(), text) : text);
+      const first = emitControl(ctx, w);
+      await until(() => paused);
+      assert.deepEqual(ownWrites(f.gh).standIns(ref(), f.rows, BOT), [], `${pause}: a session read meanwhile`);
+      const second = emitControl(ctx, w);
+      release();
+      const [a, b] = await Promise.all([first, second]);
+      assert.deepEqual(a, { status: "posted" }, pause);
+      assert.deepEqual(b, a, `${pause}: the concurrent emit shares the first one's outcome`);
+      assert.equal(f.posts(), pause === "backoff" ? 2 : 1, `${pause}: one successful POST`);
+      assert.equal(f.rows.length, 1, `${pause}: one row`);
+    }
+  });
+
   it("no eviction: 10k other writes and 25 h later, a write that may have landed is still unknown and never re-sent", async () => {
     const f = world(["lost", "ok"]);
     f.w.hidden = true;

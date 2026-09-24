@@ -4,6 +4,7 @@ import { DEFAULT_SETTINGS, type BotSettings, type FixAgentSettings, type Finding
 import { continueComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
+import { FIX_PROVIDER_CAPS, fixDeadline } from "./settings-rules.ts";
 import { botSettingsToEnv, overlayEnv, sanitizeBotSettings } from "./settings.server.ts";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -17,6 +18,8 @@ import {
   renderFindings,
   CHAT_FIX_FENCE_RULE,
   fixGenerationMs,
+  fixWatchLimits,
+  providerFixDeps,
   productionRequestFix,
   requestChatFix,
   runPostReviewLoop,
@@ -1662,10 +1665,105 @@ describe("fixGenerationMs: the bridge deadline governs a chat fix, never the loc
     assert.equal(fixGenerationMs(fix({ provider: "local", timeoutMs: 1 })), MIN);
   });
 
-  it("a chat fix waits a margin past the longer deadline", () => {
+  it("a chat fix waits a margin past the bridge's own deadline; the local-LLM knob takes no part", () => {
     for (const provider of ["chatgpt", "grok"] as const) {
       assert.equal(fixGenerationMs(fix({ provider, chatTimeoutMs: 120 * MIN })), 121 * MIN, provider);
       assert.equal(fixGenerationMs(fix({ provider, timeoutMs: 15 * MIN })), 31 * MIN, "a low local deadline never undercuts the bridge's (default 30 min)");
+      assert.equal(fixGenerationMs(fix({ provider, timeoutMs: 6 * 60 * MIN, chatTimeoutMs: 10 * MIN })), 11 * MIN, "a high local deadline never outlasts the bridge's");
     }
+  });
+});
+
+describe("provider capabilities: activity and the governing deadline come from the provider's own row", () => {
+  const MIN = 60_000;
+  const ref = { owner: "o", repo: "r", pr: 7 };
+  const withFix = (over: Partial<FixAgentSettings>): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { ...DEFAULT_SETTINGS.fixAgent, enabled: true, ...over } });
+  const TABLE = [
+    { provider: "local", streaming: true, reportsActivity: true, governs: "timeoutMs", generationMs: 60 * MIN },
+    { provider: "local", streaming: false, reportsActivity: false, governs: "timeoutMs", generationMs: 60 * MIN },
+    { provider: "chatgpt", streaming: true, reportsActivity: false, governs: "chatTimeoutMs", generationMs: 31 * MIN },
+    { provider: "chatgpt", streaming: false, reportsActivity: false, governs: "chatTimeoutMs", generationMs: 31 * MIN },
+    { provider: "grok", streaming: true, reportsActivity: false, governs: "chatTimeoutMs", generationMs: 31 * MIN },
+    { provider: "grok", streaming: false, reportsActivity: false, governs: "chatTimeoutMs", generationMs: 31 * MIN },
+  ] as const;
+  for (const row of TABLE) {
+    it(`${row.provider}, local streaming ${row.streaming ? "on" : "off"} → reportsActivity=${row.reportsActivity}, ${row.governs} governs`, async () => {
+      const s = withFix({ provider: row.provider });
+      let consulted = 0;
+      const deps = await providerFixDeps(s, ref, { localStreaming: async () => (consulted++, row.streaming) });
+      assert.equal(deps.fixReportsActivity, row.reportsActivity);
+      assert.equal(consulted, row.provider === "local" ? 1 : 0, "the local streaming flag is read only for the local provider");
+      assert.deepEqual(fixDeadline(s.fixAgent), { governs: row.governs, generationMs: row.generationMs });
+      assert.equal(fixWatchLimits(s, deps, {}).reportsActivity, row.reportsActivity);
+      assert.equal(fixWatchLimits(s, deps, {}).generationMs, row.generationMs);
+      assert.equal(FIX_PROVIDER_CAPS[row.provider].transport, row.provider === "local" ? "local-llm" : "chrome-bridge");
+    });
+  }
+
+  it("production routing: a chatgpt fix pending on the bridge past queueMaxMs (local streaming on) is NOT aborted; the bridge deadline is terminal", async () => {
+    const s = withFix({ provider: "chatgpt", queueMaxMs: 10 * MIN, chatTimeoutMs: 120 * MIN });
+    const clock = { now: 0 };
+    let aborted = false;
+    // The bridge item: pending (no activity — a chat tab reports none) until its own deadline.
+    const bridgeRejects: Array<(e: Error) => void> = [];
+    const loadBridge = async () => ({
+      requestBridgeFix: (request: { signal?: AbortSignal }) =>
+        new Promise<string>((_resolve, reject) => {
+          bridgeRejects.push(reject);
+          request.signal?.addEventListener("abort", () => {
+            aborted = true;
+            reject(new Error("aborted"));
+          });
+        }),
+    });
+    const deps = await providerFixDeps(s, ref, { loadBridge, localStreaming: async () => true });
+    const limits = fixWatchLimits(s, { ...deps, fixWatch: { tickMs: 1, checkEveryMs: 24 * 60 * MIN } }, { ASHLAR_LOCAL_LLM_STREAM: "true" });
+    const out: { settled?: { ok: boolean; error?: unknown } } = {};
+    watchFixRequest(deps.requestFix, "p", { ...limits, now: () => clock.now, stillWanted: async () => null }).then(
+      () => (out.settled = { ok: true }),
+      (error) => (out.settled = { ok: false, error }),
+    );
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+    await tick();
+    assert.equal(bridgeRejects.length, 1, "the fix went to the Chrome bridge");
+    clock.now = 10 * MIN + 1;
+    await tick();
+    clock.now = 60 * MIN;
+    await tick();
+    assert.equal(out.settled === undefined, true, "not aborted by the 10 min queue ceiling (nor the 60 min local deadline)");
+    assert.equal(aborted, false);
+    // The bridge item's own deadline (chatTimeoutMs, 120 min) ends it: its error is the outcome.
+    clock.now = 120 * MIN;
+    bridgeRejects[0](new Error("fix request for o/r#7 timed out after 120 min"));
+    await tick();
+    assert.equal(out.settled?.ok, false);
+    assert.match(String((out.settled?.error as Error).message), /timed out after 120 min/);
+    assert.equal(aborted, false, "the watcher never cut it short");
+  });
+
+  it("production routing: a chatgpt fix the bridge never answers is ended by the watcher only a margin past chatTimeoutMs", async () => {
+    const s = withFix({ provider: "chatgpt", queueMaxMs: 10 * MIN, chatTimeoutMs: 120 * MIN });
+    const clock = { now: 0 };
+    const loadBridge = async () => ({
+      requestBridgeFix: (request: { signal?: AbortSignal }) => new Promise<string>((_r, reject) => request.signal?.addEventListener("abort", () => reject(new Error("aborted")))),
+    });
+    const deps = await providerFixDeps(s, ref, { loadBridge, localStreaming: async () => true });
+    const limits = fixWatchLimits(s, { ...deps, fixWatch: { tickMs: 1, checkEveryMs: 24 * 60 * MIN } }, {});
+    const out: { settled?: Error } = {};
+    watchFixRequest(deps.requestFix, "p", { ...limits, now: () => clock.now, stillWanted: async () => null }).catch((e) => (out.settled = e));
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+    clock.now = 120 * MIN;
+    await tick();
+    assert.equal(out.settled === undefined, true, "still the bridge's to end at 120 min");
+    clock.now = 121 * MIN + 1;
+    await tick();
+    assert.match(String(out.settled?.message), /generation exceeded its 121 min deadline/);
+  });
+
+  it("a local fix with streaming on still gets the queue ceiling and its own deadline", async () => {
+    const s = withFix({ provider: "local", queueMaxMs: 10 * MIN, timeoutMs: 30 * MIN });
+    const deps = await providerFixDeps(s, ref, { localStreaming: async () => true });
+    const limits = fixWatchLimits(s, deps, {});
+    assert.deepEqual([limits.reportsActivity, limits.queueMaxMs, limits.generationMs], [true, 10 * MIN, 30 * MIN]);
   });
 });

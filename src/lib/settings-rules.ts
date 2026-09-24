@@ -22,6 +22,7 @@ import {
   FIX_AGENT_PROVIDERS,
   FIX_DELIVERIES,
   FIX_MODES,
+  fixKnob,
   providersFromSettings,
   type BotSettings,
   type FixAgentKnob,
@@ -31,20 +32,56 @@ import {
   type FixMode,
 } from "./types.ts";
 
-/** Per-provider facts every fix-agent decision reads (design §6b). */
+/** Per-provider facts every fix-agent decision reads (design §6b): the Settings rules, the loop
+ * runtime's transport routing (productionRequestFix), and the fix watcher's deadlines
+ * (providerFixDeps / fixGenerationMs). One row per provider, so no provider's behaviour can leak
+ * into another's (e.g. the local LLM streaming flag or its deadline governing a chat fix). */
 export interface FixProviderCaps {
   /** The loop can execute this provider today. */
   wired: boolean;
   /** Deliveries the provider supports at all; a stored pair outside this list is incompatible. */
   deliveries: readonly FixDelivery[];
+  /** How a fix request reaches the provider. */
+  transport: "local-llm" | "chrome-bridge" | "none";
+  /** Whether a request reports queued / generating activity to the watcher. "local-streaming":
+   * only while the local transport streams (ASHLAR_LOCAL_LLM_STREAM); "never": the watcher times
+   * the request from send and its queue ceiling (fixAgent.queueMaxMs) does not apply. */
+  activity: "local-streaming" | "never";
+  /** The Settings deadline that ends a fix request. "timeoutMs": the watcher's generation
+   * deadline, from the first output. "chatTimeoutMs": the bridge item's own deadline, from send
+   * (queue + generation); the watcher waits FIX_DEADLINE_MARGIN_MS past it, so the bridge governs. */
+  deadline: "timeoutMs" | "chatTimeoutMs";
 }
 
 export const FIX_PROVIDER_CAPS: Readonly<Record<FixAgentProvider, FixProviderCaps>> = {
-  chatgpt: { wired: true, deliveries: ["script-apply", "chat-push"] },
-  grok: { wired: true, deliveries: ["script-apply", "chat-push"] },
-  local: { wired: true, deliveries: ["script-apply"] },
-  "coding-agent": { wired: false, deliveries: ["coding-agent"] },
+  chatgpt: { wired: true, deliveries: ["script-apply", "chat-push"], transport: "chrome-bridge", activity: "never", deadline: "chatTimeoutMs" },
+  grok: { wired: true, deliveries: ["script-apply", "chat-push"], transport: "chrome-bridge", activity: "never", deadline: "chatTimeoutMs" },
+  local: { wired: true, deliveries: ["script-apply"], transport: "local-llm", activity: "local-streaming", deadline: "timeoutMs" },
+  "coding-agent": { wired: false, deliveries: ["coding-agent"], transport: "none", activity: "never", deadline: "timeoutMs" },
 };
+
+/** The provider's row; an unknown / missing provider gets no transport and no activity. */
+export function fixProviderCaps(provider: FixAgentProvider | null | undefined): FixProviderCaps {
+  return (provider != null && FIX_PROVIDER_CAPS[provider]) || FIX_PROVIDER_CAPS["coding-agent"];
+}
+
+/** Whether a fix request to this provider reports activity. `localStreaming` is the local
+ * transport's streaming flag — consulted ONLY for a provider whose row says so. */
+export function fixReportsActivity(provider: FixAgentProvider | null | undefined, localStreaming: boolean): boolean {
+  return fixProviderCaps(provider).activity === "local-streaming" && localStreaming;
+}
+
+/** Past a chat fix item's own deadline, the watcher waits this long before giving up on it. */
+export const FIX_DEADLINE_MARGIN_MS = 60_000;
+
+/** The Settings knob whose deadline governs a fix request, and the watcher's generation deadline
+ * for it: the local timeoutMs itself, or a margin past the bridge's chatTimeoutMs (so the bridge
+ * item's own deadline is the terminal one and the local-LLM knob never touches a chat fix). */
+export function fixDeadline(fixAgent: Partial<FixAgentSettings> | undefined): { governs: "timeoutMs" | "chatTimeoutMs"; generationMs: number } {
+  const governs = fixProviderCaps(fixAgent?.provider).deadline;
+  const knob = fixKnob(fixAgent, governs);
+  return { governs, generationMs: governs === "chatTimeoutMs" ? knob + FIX_DEADLINE_MARGIN_MS : knob };
+}
 
 /** Providers the loop can execute today (the Settings screen offers exactly these). */
 export const WIRED_FIX_PROVIDERS: readonly FixAgentProvider[] = FIX_AGENT_PROVIDERS.filter((p) => FIX_PROVIDER_CAPS[p].wired);

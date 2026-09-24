@@ -89,7 +89,7 @@ import {
 } from "./review-loop.ts";
 import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
 import { fixKnob, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
-import { fixLoopOn } from "./settings-rules.ts";
+import { WIRED_FIX_DELIVERIES, fixDeadline, fixLoopOn, fixProviderCaps, fixReportsActivity } from "./settings-rules.ts";
 
 export interface PullHead extends LoopPrInfo {
   ref: string;
@@ -240,21 +240,34 @@ function roundCap(settings: BotSettings): number {
   return Math.min(fixKnob(settings.fixAgent, "roundCap"), MAX_CONTINUE_ROUND - 1);
 }
 
-/** Margin past a chat fix item's own deadline before the watcher gives up on it. */
-const CHAT_DEADLINE_MARGIN_MS = 60_000;
-
-/** The watcher's generation deadline for the configured fix provider. The local-LLM deadline
- * (fixAgent.timeoutMs, default 60 min, clamped to [1 min, 6 h]) counts from the provider's FIRST
- * output (queue time excluded — the local LLM serializes reviews and fixes); past it the call is
- * aborted: request-failed → retry → a fixed fix-failed handoff, never a silent wait. A chat fix
- * (chatgpt/grok) reports no activity, so the watcher times it from send, queue time included; its
- * bridge item carries its own deadline (fixAgent.chatTimeoutMs, from request). The watcher waits
- * a margin past the longer of the two, so the bridge's deadline governs and the local-LLM
- * deadline never cuts a chat fix short. */
+/** The watcher's generation deadline for the configured fix provider — from the provider
+ * capability table (settings-rules FIX_PROVIDER_CAPS), never from another provider's knob. Local:
+ * fixAgent.timeoutMs (default 60 min, clamped to [1 min, 6 h]), counted from the FIRST output
+ * (queue time excluded — the local LLM serializes reviews and fixes); past it the call is aborted:
+ * request-failed → retry → a fixed fix-failed handoff, never a silent wait. chatgpt/grok report no
+ * activity, so the watcher times them from send; the bridge item carries its own deadline
+ * (fixAgent.chatTimeoutMs) and the watcher waits a margin past it, so the bridge's deadline is the
+ * terminal one and neither the local-LLM deadline nor its queue ceiling touches a chat fix. */
 export function fixGenerationMs(fixAgent: Partial<BotSettings["fixAgent"]> | undefined): number {
-  const local = fixKnob(fixAgent, "timeoutMs");
-  if (fixAgent?.provider !== "chatgpt" && fixAgent?.provider !== "grok") return local;
-  return Math.max(local, fixKnob(fixAgent, "chatTimeoutMs")) + CHAT_DEADLINE_MARGIN_MS;
+  return fixDeadline(fixAgent).generationMs;
+}
+
+/** The watcher limits for one fix request: the provider's governing deadline, the queue ceiling
+ * (applies only to a provider that reports activity), liveness and cadence. Test overrides in
+ * `deps` win. */
+export function fixWatchLimits(
+  settings: BotSettings,
+  deps: Pick<LoopRuntimeDeps, "fixTimeoutMs" | "fixReportsActivity" | "fixWatch">,
+  env: NodeJS.ProcessEnv | undefined,
+): { generationMs: number; queueMaxMs: number; livenessMs: number; checkEveryMs: number; tickMs: number; reportsActivity: boolean } {
+  return {
+    generationMs: deps.fixTimeoutMs ?? fixGenerationMs(settings.fixAgent),
+    queueMaxMs: deps.fixWatch?.queueMaxMs ?? fixKnob(settings.fixAgent, "queueMaxMs"),
+    livenessMs: deps.fixWatch?.livenessMs ?? localLivenessMs(env),
+    checkEveryMs: deps.fixWatch?.checkEveryMs ?? FIX_RELEVANCE_CHECK_MS,
+    tickMs: deps.fixWatch?.tickMs ?? FIX_WATCH_TICK_MS,
+    reportsActivity: deps.fixReportsActivity ?? false,
+  };
 }
 
 /** How often a queued fix request re-checks that it is still wanted (head / session). */
@@ -520,8 +533,8 @@ export async function requestChatFix(
   prompt: string,
   opts: { signal?: AbortSignal; loadBridge?: BridgeFixLoader } = {},
 ): Promise<string> {
-  if (settings.fixAgent.delivery !== "script-apply") {
-    throw new Error(`fix delivery ${settings.fixAgent.delivery} is not wired for ${provider} (script-apply only)`);
+  if (!WIRED_FIX_DELIVERIES.includes(settings.fixAgent.delivery)) {
+    throw new Error(`fix delivery ${settings.fixAgent.delivery} is not wired for ${provider} (${WIRED_FIX_DELIVERIES.join(", ")} only)`);
   }
   const bridge = await (opts.loadBridge ?? (() => import("./bridge.server.ts")))();
   const fenced = `${prompt}\n\n${CHAT_FIX_FENCE_RULE}`;
@@ -535,8 +548,11 @@ export async function requestChatFix(
 export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { loadBridge?: BridgeFixLoader } = {}): RequestFix {
   return async (prompt, ctl) => {
     const provider = settings.fixAgent.provider;
-    if (provider === "chatgpt" || provider === "grok") return requestChatFix(settings, ref, provider, prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge });
-    if (provider !== "local") {
+    const transport = fixProviderCaps(provider).transport;
+    if (transport === "chrome-bridge") {
+      return requestChatFix(settings, ref, provider as "chatgpt" | "grok", prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge });
+    }
+    if (transport !== "local-llm") {
       throw new Error(`fix provider ${provider} not wired yet (local, chatgpt, grok)`);
     }
     const local = await import("./local-chat-request.server.ts");
@@ -579,15 +595,29 @@ async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRu
     replyToReviewComment: github.replyToReviewComment,
   };
   const gh = productionGh;
-  const requestFix = productionRequestFix(settings, ref);
-  // Streaming (the default) reports queued vs generating, so the fix deadline can exclude queue time.
-  // The transport's own streaming default (what requestLocalChat will actually do): a streamed
-  // reply reports queued vs generating; a buffered one reports "generating" from its headers.
-  // Transport unloadable → no activity (timed from send); requestFix then fails on its own import.
-  const streaming =
-    settings.fixAgent.provider === "local" &&
-    (await import("./local-chat-request.server.ts").then((m) => m.localStreamingDefault(), () => false));
-  return { gh, requestFix, validate: builtinValidate, fixReportsActivity: streaming };
+  return { gh, validate: builtinValidate, ...(await providerFixDeps(settings, ref)) };
+}
+
+/** The provider-dependent half of the production deps: the transport and whether it reports
+ * activity, both from the provider's row in the capability table (settings-rules). The local
+ * LLM's streaming flag is consulted ONLY for a provider whose row says its activity comes from
+ * it (local): a chat fix never reports activity, so the watcher times it from send and the
+ * local queue ceiling (queueMaxMs) cannot abort it — the bridge's chatTimeoutMs governs. */
+export async function providerFixDeps(
+  settings: BotSettings,
+  ref: PrRef,
+  opts: { loadBridge?: BridgeFixLoader; localStreaming?: () => Promise<boolean> } = {},
+): Promise<Pick<LoopRuntimeDeps, "requestFix" | "fixReportsActivity">> {
+  const requestFix = productionRequestFix(settings, ref, { loadBridge: opts.loadBridge });
+  const caps = fixProviderCaps(settings.fixAgent.provider);
+  // The local transport's own streaming default (what requestLocalChat will actually do): a
+  // streamed reply reports queued vs generating. Transport unloadable → no activity (timed from
+  // send); requestFix then fails on its own import.
+  const localStreaming =
+    caps.activity === "local-streaming"
+      ? await (opts.localStreaming ?? (() => import("./local-chat-request.server.ts").then((m) => m.localStreamingDefault())))().catch(() => false)
+      : false;
+  return { requestFix, fixReportsActivity: fixReportsActivity(settings.fixAgent.provider, localStreaming) };
 }
 
 const prKey = (ref: PrRef) => `${ref.owner}/${ref.repo}#${ref.pr}`.toLowerCase();
@@ -976,12 +1006,7 @@ export async function runPostReviewLoop(
     // generated in full.
     const requestFix: RequestFix = (p) =>
       watchFixRequest((prompt, ctl) => deps2.requestFix(prompt, ctl), p, {
-        generationMs: deps2.fixTimeoutMs ?? fixGenerationMs(settings.fixAgent),
-        queueMaxMs: deps2.fixWatch?.queueMaxMs ?? fixKnob(settings.fixAgent, "queueMaxMs"),
-        livenessMs: deps2.fixWatch?.livenessMs ?? localLivenessMs(env),
-        checkEveryMs: deps2.fixWatch?.checkEveryMs ?? FIX_RELEVANCE_CHECK_MS,
-        tickMs: deps2.fixWatch?.tickMs ?? FIX_WATCH_TICK_MS,
-        reportsActivity: deps2.fixReportsActivity ?? false,
+        ...fixWatchLimits(settings, deps2, env),
         stillWanted: async () => {
           const why = await checkpoint();
           return why ? MOOT_TEXT[why] : null;

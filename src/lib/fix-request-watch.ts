@@ -150,7 +150,9 @@ export function watchFixRequest(request: WatchedRequest, prompt: string, cfg: Fi
         void check();
       }
     }, cfg.tickMs);
-    (handle.timer as { unref?: () => void }).unref?.();
+    // Deliberately NOT unref'd: an in-flight request is real work, and the interval is cleared on
+    // every settle. Unref'd, a process whose only pending work is this watcher (Node 22's test
+    // runner) drains its event loop and abandons the request mid-flight.
     let pending: Promise<string>;
     try {
       pending = request(prompt, { signal: ac.signal, onActivity });

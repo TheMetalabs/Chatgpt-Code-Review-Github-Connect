@@ -328,6 +328,38 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     void promise.catch(() => {});
   });
 
+  it("a completion after the deadline loses even when the deadline timer has not fired yet", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h, { pr: 1 }, "chrome-1");
+    h.advance(DEFAULT_FIX_TIMEOUT_MS); // the timer is late: nothing fired it
+    assert.equal(h.timers[0].cleared, false);
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "late answer", offer.leaseId), {
+      ok: false,
+      code: "lease_conflict",
+      error: "fix item was cancelled (timeout)",
+    });
+    await assert.rejects(promise, /timed out after 30 min/);
+    assert.deepEqual(h.reg.state(offer.jobId), { active: false, status: "cancelled" });
+    // every other lease operation sees the same expiry
+    assert.equal(h.reg.refresh(offer.jobId, offer.leaseId, { chatgpt: true }), false);
+    assert.equal(h.reg.progress(offer.jobId, offer.leaseId, "generating", "run-A"), false);
+    assert.equal(h.reg.claim(offer.jobId, "chrome-1").ok, false);
+    assert.equal(h.reg.prompt(offer.jobId), null);
+  });
+
+  it("each lease operation enforces the deadline itself (fail, refresh, recover)", async () => {
+    for (const op of ["fail", "refresh", "recover"] as const) {
+      const h = harness();
+      const { promise, offer } = queueAndTake(h, { pr: 1 }, "chrome-1");
+      h.reg.progress(offer.jobId, offer.leaseId, "generating", "run-A");
+      h.advance(DEFAULT_FIX_TIMEOUT_MS + 1);
+      if (op === "fail") assert.equal(h.reg.fail(offer.jobId, "chatgpt", "error", offer.leaseId), true, "nothing left to fail");
+      if (op === "refresh") assert.equal(h.reg.refresh(offer.jobId, offer.leaseId), false);
+      if (op === "recover") assert.equal(h.reg.recover(offer.jobId, "chrome-1", "chatgpt", "run-A"), null);
+      await assert.rejects(promise, /timed out/, `${op}: the request settles as a timeout, not a failure`);
+    }
+  });
+
   it("a surviving tab binding whose first progress report was lost pins its run and resumes", async () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h, { pr: 1 }, "chrome-1");

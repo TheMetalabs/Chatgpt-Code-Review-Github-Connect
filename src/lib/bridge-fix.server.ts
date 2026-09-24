@@ -236,6 +236,15 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     settle(item, "cancelled", "aborted", { error: new Error(`fix request for ${labelOf(item)} was cancelled by the review loop`) });
   }
 
+  /** One item, with its deadline enforced first: a live item past deadlineAt is expired right here,
+   * synchronously, so a late or delayed timer never lets a completion, failure or lease mutation
+   * act on work that has already timed out. Every per-id lease operation reads through this. */
+  function current(id: string): FixItem | undefined {
+    const item = items.get(id);
+    if (item && live(item) && deps.now() >= item.deadlineAt) expire(id);
+    return item;
+  }
+
   /** Lazy deadline backstop (a late timer) + forgetting settled items. Never drops a live item. */
   function prune() {
     const now = deps.now();
@@ -304,7 +313,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   }
 
   function claim(id: string, clientId = ""): { ok: true; leaseId: string } | { ok: false; error: string } {
-    const item = items.get(id);
+    const item = current(id);
     if (!item || !live(item)) return { ok: false, error: "fix item is not waiting for chat" };
     const now = deps.now();
     if (item.state === "claimed") {
@@ -354,7 +363,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   /** Claim a queued item for `clientId` — or replay this client's own unacknowledged claim — and
    * build its take payload (null when not claimable). */
   function take(id: string, clientId = ""): FixOffer | null {
-    const item = items.get(id);
+    const item = current(id);
     if (!item || !(item.state === "queued" || (item.state === "claimed" && Boolean(clientId) && item.clientId === clientId && !item.runId))) return null;
     const attempted = item.state === "queued" && item.attempted === true;
     const out = claim(id, clientId);
@@ -372,7 +381,8 @@ export function createFixRegistry(deps: FixRegistryDeps) {
    * pinned by its progress. Renews the lease under the claim rules (a stale claim needs a free
    * slot); nothing is re-sent, so the submission window is untouched. */
   function recover(id: string, clientId: string, provider: string, runId: string): FixOffer | null {
-    const item = items.get(id);
+    prune();
+    const item = current(id);
     const live = item && (item.state === "claimed" || (item.state === "queued" && item.attempted === true));
     if (!item || !live || !clientId || item.clientId !== clientId || item.provider !== provider) return null;
     if (typeof runId !== "string" || !runId || runId.length > 128 || (item.runId && item.runId !== runId)) return null;
@@ -387,7 +397,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
 
   /** Heartbeat: renews the lease (not a deadline extension) and records generation start. */
   function refresh(id: string, leaseId: string | undefined, generating?: Partial<Record<string, boolean>>): boolean {
-    const item = items.get(id);
+    const item = current(id);
     if (!item || !holds(item, leaseId)) return false;
     // A stale claim gave up its slot: its heartbeat may not revive it past parallelLimit().
     if (stale(item) && claimedCount() >= limit()) return false;
@@ -407,7 +417,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   }
 
   function prompt(id: string): { prompt: string } | null {
-    const item = items.get(id);
+    const item = current(id);
     return item && live(item) && item.prompt ? { prompt: item.prompt } : null;
   }
 
@@ -416,7 +426,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
    * attemptedProviders — release is NOT authorization for a new generation: the item stays with
    * its profile and pinned run, and the next take by that profile resumes it. */
   function release(id: string, leaseId?: string): boolean {
-    const item = items.get(id);
+    const item = current(id);
     if (!item || !holds(item, leaseId)) return false;
     item.state = "queued";
     item.attempted = true;
@@ -428,7 +438,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
 
   /** Explicit terminal failure from the lease holder. A settled/unknown item has nothing left to fail. */
   function fail(id: string, provider: string, error: string, leaseId?: string): boolean {
-    const item = items.get(id);
+    const item = current(id);
     if (!item || !live(item)) return true;
     if (!holds(item, leaseId) || item.provider !== provider) return false;
     settle(item, "failed", "failure", { error: new Error(`${provider} fix request failed: ${oneLine(error) || "no detail"}`) });
@@ -436,7 +446,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   }
 
   function complete(id: string, provider: string | undefined, text: string, leaseId?: string): FixCompleteResult {
-    const item = items.get(id);
+    const item = current(id);
     if (!item) return { ok: false, code: "lease_conflict", error: "fix item is unknown or expired" };
     if (item.state === "done") {
       // A lost-ACK replay is identified by its payload, as a review's is (completeBridgeJob acks an
@@ -456,7 +466,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   }
 
   function progress(id: string, leaseId: string | undefined, stage?: string, runId?: string): boolean {
-    const item = items.get(id);
+    const item = current(id);
     if (!item || !holds(item, leaseId)) return false;
     // One run per claim (as review legs): a report from another run is rejected.
     if (runId && item.runId && item.runId !== runId) return false;
@@ -470,6 +480,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
    * take response was lost, and peek offers it again. */
   function submitting(clientId: string, known?: readonly string[]): boolean {
     if (!clientId) return false;
+    prune(); // an item past its deadline holds no submission window
     const now = deps.now();
     return [...items.values()].some(
       (item) =>

@@ -11,7 +11,7 @@
 import { buildChatParts, parseChatSubmission, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
-import { localGenerationParams, samplingRequestFields } from "./local-llm.server.ts";
+import { localGenerationParams, samplingRequestFields, type LocalLegResult } from "./local-llm.server.ts";
 import { gateLiveSubmission } from "./poster.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
 import type { BotSettings, LocalReviewMode, ReviewProvider, SamplePr } from "./types.ts";
@@ -212,7 +212,7 @@ async function reviewGroup(
   deps: Required<Pick<LocalReviewDeps, "request">> & LocalReviewDeps,
   t: LoopTuning,
   groupMeta: { group: number; groups: number },
-): Promise<string | null> {
+): Promise<GroupReview> {
   const groupSet = new Set(groupPaths);
   const sub = subsetSample(sample, groupSet);
   const built = buildChatParts({
@@ -305,6 +305,8 @@ async function reviewGroup(
   const messages: Msg[] = [{ role: "system", content: SYSTEM }, { role: "user", content: userParts.join("\n\n") }];
   const injectedPeers = new Set<string>();
   let finalRaw: string | null = null;
+  // The last completed terminal reply, verbatim: when it is not a usable review it is still evidence.
+  let reply: string | undefined;
   let lastPromptTokens = 0;
   // Measure the cap from the ACTUAL current messages (after peer injection and every prior tool
   // output). Count tool-call arguments too (they are not in `content`), and floor the estimate at the
@@ -348,6 +350,7 @@ async function reviewGroup(
     const partialFinish = choice?.finish_reason === "length" || choice?.finish_reason === "content_filter";
     const json = calls.length === 0 && !partialFinish ? extractChatJson(msg.content || "") : null;
     if (json) finalRaw = json;
+    if (calls.length === 0 && !partialFinish && msg.content?.trim()) reply = msg.content.trim();
     messages.push({ role: "assistant", content: msg.content ?? "", ...(calls.length ? { tool_calls: calls } : {}) });
     if (partialFinish) break;
     if (!calls.length) break;
@@ -381,12 +384,15 @@ async function reviewGroup(
     deps.onProgress?.({ ...groupMeta, iter, stage: "tool" });
     // The model explicitly could not finish this group — fail it (→ not_cleared) rather than
     // accepting whatever JSON is around as a completed review.
-    if (taskFailed) return null;
+    if (taskFailed) return { raw: null };
     if (done && finalRaw) break;
     if (done && !finalRaw) messages.push({ role: "user", content: "Now return the final review JSON object only." });
   }
-  return finalRaw;
+  return { raw: finalRaw, reply };
 }
+
+/** One group's review JSON (null when none completed) and its last completed terminal reply. */
+type GroupReview = { raw: string | null; reply?: string };
 
 function injectNewPeers(messages: Msg[], deps: LocalReviewDeps, injected: Set<string>): void {
   const peers = deps.peerReported?.() ?? [];
@@ -552,7 +558,7 @@ export async function runLocalReviewLoop(
   sample: SamplePr,
   settings: BotSettings,
   deps: LocalReviewDeps,
-): Promise<{ ok: true; raw: string } | { ok: false; error: string }> {
+): Promise<LocalLegResult> {
   const request = deps.request ?? requestLocalJson;
   const t = tuning();
   try {
@@ -560,6 +566,9 @@ export async function runLocalReviewLoop(
     deps.log?.(`local review loop: ${groups.length} group(s) over ${sample.changedPaths.length} changed file(s)`);
     const raws: string[] = [];
     const failedGroups: string[][] = [];
+    // A failed group's completed reply may still name a real finding (prose, or JSON the gate cannot
+    // use): returned as unparsedText so a held leg posts it verbatim instead of dropping it.
+    const unparsed: string[] = [];
     let aborted = false;
     for (let i = 0; i < groups.length; i += 1) {
       if (deps.signal?.aborted) {
@@ -577,14 +586,17 @@ export async function runLocalReviewLoop(
       // a transient request/tool failure late in a long multi-group run must not discard the groups
       // already reviewed. Keep their findings and move on; track failed groups for coverage reporting.
       try {
-        const raw = await reviewGroup(sample, group, settings, { ...deps, request }, t, { group: i + 1, groups: groups.length });
+        const { raw, reply } = await reviewGroup(sample, group, settings, { ...deps, request }, t, { group: i + 1, groups: groups.length });
         // A group counts as reviewed only if its result is a valid review — it must actually say
         // something (findings, or investigated_safe for its files), the same rule the downstream gate
         // applies. A null return (prose/truncated) or an empty `{"findings":[]}` with no
         // investigated_safe is a failure (→ not_cleared), so a sibling group's empty-but-safe result
         // can never make the leg look like a clean full pass. One authoritative check, not per-shape.
         if (raw && groupReviewValid(raw, group, sample, settings)) raws.push(raw);
-        else failedGroups.push(group);
+        else {
+          failedGroups.push(group);
+          if (reply) unparsed.push(`Review group (${group.join(", ")}):\n${reply}`);
+        }
       } catch (e) {
         deps.log?.(`group ${group[0]} failed: ${e instanceof Error ? e.message : String(e)}`);
         failedGroups.push(group);
@@ -597,12 +609,13 @@ export async function runLocalReviewLoop(
     // gate forces investigated_safe to [] when findings are empty), never as a false clean pass.
     // Only when NOTHING was produced at all is the leg skipped — distinguishing an abort-before-any-
     // -result from a genuine no-JSON run for the operator.
+    const evidence = unparsed.length ? { unparsedText: unparsed.join("\n\n---\n\n") } : {};
     if (!raws.length) {
       return { ok: false, error: aborted || deps.signal?.aborted
         ? "local review aborted before any group completed (deadline or cancellation)"
-        : "local loop produced no review JSON" };
+        : "local loop produced no review JSON", ...evidence };
     }
-    return { ok: true, raw: mergeGroupResults(raws, failedGroups, unreviewablePaths(sample)) };
+    return { ok: true, raw: mergeGroupResults(raws, failedGroups, unreviewablePaths(sample)), ...evidence };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

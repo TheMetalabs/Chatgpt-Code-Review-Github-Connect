@@ -38,8 +38,9 @@ Rules the table encodes:
   instead of "Skipped local", so in the verification round it posts as `raw-unverified` with its own
   header and a real finding in it reaches the fixing agent. Every completed reply counts: when the
   one JSON correction itself fails (HTTP 500, transport error, liveness or deadline abort), the first
-  reply is still salvaged. A failure with no completed reply (HTTP 500, transport error, offline)
-  stays a failure: `unverified-clean`.
+  reply is still salvaged, and the multi-turn tool loop (`localReviewMode=multiturn`, or `auto` on a
+  large PR) returns each failed group's completed reply the same way. A failure with no completed
+  reply (HTTP 500, transport error, offline) stays a failure: `unverified-clean`.
 - `unverified=1` is never CONVERGED, and only `clean` / `verified-clean` print the clean sentinel.
   `postedOutcome` renders a `verify` that somehow reaches the poster as `unverified-clean`.
 - Local as the chat-down fallback is an ordinary reviewer: chat unusable + local clean posts

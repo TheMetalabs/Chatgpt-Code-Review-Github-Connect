@@ -33,6 +33,8 @@ const LOCAL={
   unparseable:{answer:answer(LOCAL_RAW)},
   // the first reply completes with the finding in prose, then the one JSON correction fails
   proseThen500:{answer:answer(LOCAL_RAW,fail500)},
+  // the multi-turn tool loop (what auto mode picks for a large PR) replying with the finding in prose
+  multiturnProse:{answer:answer(LOCAL_RAW),settings:{localReviewMode:'multiturn'}},
   error:{answer:answer(fail500)},
   offline:{offline:true},
   notRun:{settings:{reviewLocal:false}},
@@ -56,6 +58,7 @@ const CELLS={
   'clean x findings':posted(SUMMARY,MF,1,{note:/chatgpt found nothing; local verification found 1\./,stamp:'verify'}),
   'clean x unparseable':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
   'clean x proseThen500':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
+  'clean x multiturnProse':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
   'clean x error':posted(UNVERIFIED,M0U,1,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x offline':posted(UNVERIFIED,M0U,0,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x notRun':posted(CLEAN,M0,0),
@@ -66,6 +69,7 @@ const CELLS={
   'none x findings':posted(SUMMARY,MF,1,{stamp:'fallback'}),
   'none x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseThen500':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x multiturnProse':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x error':skipped(1),
   'none x offline':skipped(0),
   'none x notRun':skipped(0),

@@ -1,0 +1,15 @@
+diff --git a/tests/review/app-fixture.mjs b/tests/review/app-fixture.mjs
+index b75fd6e..fbaf42f 100644
+--- a/tests/review/app-fixture.mjs
++++ b/tests/review/app-fixture.mjs
+@@ -41,7 +41,9 @@ export async function appFixture(options={}, githubOptions={}) {
+   [resolve(root,'src/lib/settings.server.ts'),{loadBotSettings:()=>settings,saveBotSettings:s=>s,sanitizeBotSettings:s=>s}],
+   [resolve(root,'src/lib/utils.ts'),{sleep:()=>new Promise(resolve=>setTimeout(resolve,25))}],
+   [resolve(root,'src/lib/github.server.ts'),{
+-    githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=> 'fixture-not-a-real-token',
++    githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async(...a)=>{githubCalls.tokens=(githubCalls.tokens??0)+1;if(githubOptions.installationToken)return githubOptions.installationToken(...a);return 'fixture-not-a-real-token';},
++    fetchPullHeadRef:async()=>{githubCalls.headRef=(githubCalls.headRef??0)+1;throw new Error('fixture: no loop GitHub');},
++    listIssueComments:async()=>{githubCalls.listIssue=(githubCalls.listIssue??0)+1;return [];},
+     githubWebhookSecret:()=> 'fixture-webhook-secret',
+     fetchPullHead:async()=>{githubCalls.head++;githubCalls.timeline.push('head');await githubOptions.beforeHead?.();if(githubOptions.headError)throw githubOptions.headError;return {...sample,draft:false,fork:false,...githubOptions.pull};},
+     fetchPullSnapshot:async(_token,target)=>{githubCalls.snapshot++;githubCalls.timeline.push('snapshot');if(githubOptions.snapshotError)throw githubOptions.snapshotError;return {...sample,...target};},

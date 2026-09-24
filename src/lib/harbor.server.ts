@@ -356,7 +356,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
   await finishJob(jobId, sample);
 }
 
-export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt };
+export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; repair?: RepairReceipt };
 
 async function reactQuiet(token: string, job: Job, content: GithubReaction) {
   try {
@@ -833,8 +833,8 @@ async function generateLocalLeg(
 }
 
 /** Store the local leg's payload on the job (replacing any earlier one) and mark it collected. */
-function collectLocalLeg(j: Job, raw: string, originalText?: string): Job {
-  const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw, originalText }];
+function collectLocalLeg(j: Job, raw: string, originalText?: string, unparsedText?: string): Job {
+  const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw, originalText, unparsedText }];
   return { ...j, storedLegs: next, generating: {...j.generating, local: false}, providerProgress: {...j.providerProgress, local: {runId: `local:${j.id}`, stage: "response_collected", observedAt: Date.now(), receivedAt: Date.now()}}, updatedAt: Date.now() };
 }
 
@@ -887,7 +887,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
         };
       });
     } else {
-      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText)));
+      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, local.unparsedText)));
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -1131,12 +1131,13 @@ export async function submitHarborChat(
 }
 
 /** Gate one reviewer leg. A released held local leg whose reply is not a verdict (docs §1: it failed
- * the gate, or the gate dropped a finding it reported) is gated as evidence instead: its complete text
+ * the gate, the gate dropped a finding it reported, or it took a reply that was not review JSON to
+ * get there) is gated as evidence instead: its complete text
  * posts verbatim, so it never counts as verification and nothing it reported is lost. */
 function gateLeg(leg: ChatLeg, sample: SamplePr, heldLocal: boolean): { gate: ReturnType<typeof gateLiveSubmission>; unusable?: string } {
   const parsed = parseChatSubmission(leg.raw);
   const gate = gateLiveSubmission(parsed, sample, state.settings);
-  const unusable = heldLocal && leg.provider === "local" ? heldLocalUnusable(gate) : undefined;
+  const unusable = heldLocal && leg.provider === "local" ? heldLocalUnusable(gate, leg) : undefined;
   return unusable ? { gate: gateLiveSubmission(heldLocalEvidence(parsed, leg), sample, state.settings), unusable } : { gate };
 }
 

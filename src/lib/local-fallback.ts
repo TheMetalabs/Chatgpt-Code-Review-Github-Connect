@@ -117,12 +117,16 @@ export function heldLocalReleased(
 
 /** Why a released held local leg's parsed reply is not a verdict (docs/local-verify-clean.md §1), or
  * undefined when it is one. It must pass the gate on its own with every finding it reported intact:
- * a verifier whose finding the gate dropped for its shape did not agree with a clean chat result. */
+ * a verifier whose finding the gate dropped for its shape did not agree with a clean chat result. And
+ * no completed reply may have been set aside to get it: the JSON correction does not see the first
+ * reply, so a clean correction says nothing about the finding that reply may carry. */
 export function heldLocalUnusable(
   gate: { ok: true; malformed?: number; rawReview?: string } | { ok: false; reason: string },
+  leg: { unparsedText?: string },
 ): string | undefined {
   if (!gate.ok) return gate.reason;
   if (gate.rawReview) return undefined; // already salvaged verbatim
+  if (leg.unparsedText?.trim()) return "a completed reply was not review JSON";
   if (gate.malformed) return `${gate.malformed} finding(s) missing required fields`;
   return undefined;
 }

@@ -155,7 +155,8 @@ export interface Job {
     skipped: string[];
     dropped: string[];
   };
-  storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt }[];
+  /** unparsedText: a local leg's completed replies that were not review JSON (local-llm LocalLegResult). */
+  storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; repair?: RepairReceipt }[];
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;
   attemptedProviders?: ReviewProvider[];

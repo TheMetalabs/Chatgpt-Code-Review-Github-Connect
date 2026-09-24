@@ -186,13 +186,18 @@ describe("heldLocalSalvage", () => {
 describe("heldLocalUnusable / heldLocalEvidence: a released held local reply is a verdict only when the gate used all of it", () => {
   const ok = { ok: true as const, malformed: 0 };
   it("a clean gate is a verdict; an already salvaged reply is left as it is", () => {
-    assert.equal(heldLocalUnusable(ok), undefined);
-    assert.equal(heldLocalUnusable({ ...ok, malformed: 1, rawReview: "x" }), undefined);
+    assert.equal(heldLocalUnusable(ok, {}), undefined);
+    assert.equal(heldLocalUnusable({ ...ok, malformed: 1, rawReview: "x" }, { unparsedText: "P1 x" }), undefined);
   });
 
   it("a rejected gate or a finding dropped for its shape is not", () => {
-    assert.equal(heldLocalUnusable({ ok: false, reason: "empty findings without investigated_safe" }), "empty findings without investigated_safe");
-    assert.equal(heldLocalUnusable({ ...ok, malformed: 2 }), "2 finding(s) missing required fields");
+    assert.equal(heldLocalUnusable({ ok: false, reason: "empty findings without investigated_safe" }, {}), "empty findings without investigated_safe");
+    assert.equal(heldLocalUnusable({ ...ok, malformed: 2 }, {}), "2 finding(s) missing required fields");
+  });
+
+  it("a clean gate reached only after a reply that was not review JSON is not", () => {
+    assert.equal(heldLocalUnusable(ok, { unparsedText: "P1 a.ts:1 FIRST-REPLY" }), "a completed reply was not review JSON");
+    assert.equal(heldLocalUnusable(ok, { unparsedText: "  " }), undefined);
   });
 
   it("evidence keeps what parsed and attaches every completed reply verbatim", () => {

@@ -31,6 +31,7 @@ test('local correction retry occurs once only after a completed invalid reply',a
  let requests=0;
  const settings=await endpoint(t,(_req,res)=>{requests++;res.end(envelope(requests===1?'prose':json));});
  const out=await loadLocal().runLocalLlm('review',settings);assert.equal(out.raw,json);assert.equal(requests,2);
+ assert.equal(out.unparsedText,'prose','the first reply the correction replaced is kept');
 });
 test('two completed invalid replies are a parse error, never answered raw',async t=>{
  let requests=0;

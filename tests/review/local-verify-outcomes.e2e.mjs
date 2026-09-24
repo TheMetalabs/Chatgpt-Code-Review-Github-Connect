@@ -14,6 +14,8 @@ const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Missing chec
   root_cause:'No guard',evidence:'a.ts:1: no guard',recommended_fix:'Check the key',recommended_test:'Assert one write'};
 const cleanJson=JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['a.ts: constant change only']});
 const dirtyJson=JSON.stringify({findings:[finding],merge_recommendation:'REQUEST_CHANGES'});
+// exactly the shape the correction prompt asks for (no investigated_safe)
+const minimalJson=JSON.stringify({findings:[],merge_recommendation:'COMMENT',keep:[]});
 const envelope=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 const LOCAL_RAW='P1 a.ts:1 LOCAL-RAW: a duplicate request writes twice';
 // valid JSON whose only finding lacks recommended_test: the gate drops it for its shape
@@ -41,6 +43,9 @@ const LOCAL={
   // the finding in prose, then a JSON object the parser accepts but the gate rejects
   schemaInvalid:{answer:answer(`${LOCAL_RAW}\n{"findings":"see above","merge_recommendation":"REQUEST_CHANGES"}`)},
   malformed:{answer:answer(malformedJson)},
+  // the finding in prose, then the one JSON correction (which never sees the first reply) parses
+  proseThenClean:{answer:answer(LOCAL_RAW,cleanJson)},
+  proseThenMinimal:{answer:answer(LOCAL_RAW,minimalJson)},
   error:{answer:answer(fail500)},
   offline:{offline:true},
   notRun:{settings:{reviewLocal:false}},
@@ -66,6 +71,8 @@ const CELLS={
   'clean x proseThen500':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
   'clean x multiturnProse':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
   'clean x schemaInvalid':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:/could not be used as a review \(empty findings without investigated_safe/,stamp:'verify'}),
+  'clean x proseThenClean':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:/could not be used as a review \(a completed reply was not review JSON\)/,stamp:'verify'}),
+  'clean x proseThenMinimal':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:/could not be used as a review \(empty findings without investigated_safe/,stamp:'verify'}),
   'clean x malformed':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:/could not be used as a review \(1 finding\(s\) missing required fields\)/,stamp:'verify'}),
   'clean x error':posted(UNVERIFIED,M0U,1,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x offline':posted(UNVERIFIED,M0U,0,{note:/local verification did not complete \(/,stamp:'verify'}),
@@ -80,6 +87,8 @@ const CELLS={
   'none x multiturnProse':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x schemaInvalid':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x malformed':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x proseThenClean':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x proseThenMinimal':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x error':skipped(1),
   'none x offline':skipped(0),
   'none x notRun':skipped(0),

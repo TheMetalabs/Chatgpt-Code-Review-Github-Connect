@@ -127,9 +127,9 @@ export async function runLocalLlm(
       },
     ]);
     const corrected = extractChatJson(raw2);
-    // Both completed replies are kept: the first one may carry the real finding the correction lost,
-    // and a caller that salvages a failed leg (heldLocalSalvage) posts them as evidence.
-    return corrected ? {ok: true, raw: corrected, originalText: raw2}
+    // The first reply is kept on both paths: it may carry the real finding the correction (which does
+    // not see it) lost, so a held leg posts it as evidence and never counts the correction as a verdict.
+    return corrected ? {ok: true, raw: corrected, originalText: raw2, unparsedText: raw}
       : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, unparsedText: raw};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

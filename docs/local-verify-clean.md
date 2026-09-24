@@ -42,7 +42,9 @@ Rules the table encodes:
   large PR) returns each failed group's completed reply the same way. A failure with no completed
   reply (HTTP 500, transport error, offline) stays a failure: `unverified-clean`.
 - A released held local leg's reply counts as a verdict only when it passes the gate on its own with
-  every finding it reported intact (`LiveGateResult.malformed` is 0). A reply the gate rejects (for
+  every finding it reported intact (`LiveGateResult.malformed` is 0), and no completed reply was set
+  aside to get it: the one JSON correction never sees the first reply, so a clean correction says
+  nothing about the finding that first reply may carry (`unparsedText`). A reply the gate rejects (for
   example a `findings` that is not a list, or an empty result without `investigated_safe`) or one
   that lost a finding for its shape is gated as evidence instead (`heldLocalEvidence` in
   `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block. So a

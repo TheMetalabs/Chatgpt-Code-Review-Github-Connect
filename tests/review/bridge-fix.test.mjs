@@ -141,8 +141,10 @@ test('every per-id handler routes a fix id to the fix item (state, prompt, ping,
   assert.equal(h.bridge.claimBridgeJob(id, 'chrome-2').ok, false);
   h.bridge.releaseBridgeJob(id, offer.leaseId);
   assert.equal(h.bridge.completeBridgeFix(id, 'late', undefined, offer.leaseId).code, 'lease_conflict');
-  const again = h.bridge.takeNextBridgeJob('chrome-2', [], {fixes: true});
-  assert.equal(again.jobId, id, 'release requeued the item for any profile');
+  assert.equal(h.bridge.takeNextBridgeJob('chrome-2', [], {fixes: true}), null, 'a released item stays with its profile');
+  const again = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true});
+  assert.equal(again.jobId, id, 'release requeued the item for its own profile');
+  assert.deepEqual([...again.resumeProviders], ['chatgpt'], 'as a resume');
   assert.equal(h.bridge.failBridgeProvider(id, 'chatgpt', 'quota: usage limit', offer.leaseId), false, 'a stale lease cannot fail it');
   assert.equal(h.bridge.failBridgeProvider(id, 'chatgpt', 'quota: usage limit', again.leaseId), true);
   await assert.rejects(pending, /chatgpt fix request failed: quota: usage limit/);

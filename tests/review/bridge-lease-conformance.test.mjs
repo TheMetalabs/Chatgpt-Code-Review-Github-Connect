@@ -24,12 +24,14 @@ const progress = runId => ({chatgpt: {runId, events: [{source: 'page', sequence:
 const KINDS = {
   review: () => {
     const h = harness([makeJob({id: 'job-A', createdAt: 1}), makeJob({id: 'job-B', pr: 2, createdAt: 2})]);
-    return {h, take: (client, known = []) => h.bridge.takeNextBridgeJob(client, known, {fixes: false})};
+    return {h, take: (client, known = []) => h.bridge.takeNextBridgeJob(client, known, {fixes: false}),
+      complete: async (id, text, leaseId) => h.bridge.completeBridgeJob(id, text, [{provider: 'chatgpt', raw: text}], leaseId), unknown: 'job-unknown'};
   },
   fix: () => {
     const h = harness([]);
     for (const pr of [1, 2]) h.bridge.requestBridgeFix({owner: 'fixture', repo: 'fixture', pr, provider: 'chatgpt', prompt: `FIX ${pr}`}).catch(() => {});
-    return {h, take: (client, known = []) => h.bridge.takeNextBridgeJob(client, known, {fixes: true})};
+    return {h, take: (client, known = []) => h.bridge.takeNextBridgeJob(client, known, {fixes: true}),
+      complete: async (id, text, leaseId) => h.bridge.completeBridgeFix(id, text, [{provider: 'chatgpt', raw: text}], leaseId), unknown: 'fix-unknown'};
   },
 };
 
@@ -70,5 +72,54 @@ for (const [kind, make] of Object.entries(KINDS)) {
     assert.equal(resumed?.jobId, offer.jobId);
     assert.equal(JSON.stringify(resumed.resumeProviders), '["chatgpt"]', 'a resume, never a fresh submission');
     assert.equal(JSON.stringify(resumed.bindings), JSON.stringify([binding]));
+  });
+
+  test(`lease contract (${kind}): release frees the lease, never the profile; the owner's next take resumes`, () => {
+    const {h, take} = make();
+    const offer = take('chrome-1');
+    assert.equal(h.bridge.recordBridgeProgress(offer.jobId, offer.leaseId, progress('run-A')), true);
+    assert.ok(h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: true}, undefined, offer.leaseId));
+    h.bridge.releaseBridgeJob(offer.jobId, 'not-the-lease');
+    assert.equal(h.bridge.claimBridgeJob(offer.jobId, 'chrome-1').leaseId, offer.leaseId, 'a release without the lease is ignored');
+    h.bridge.releaseBridgeJob(offer.jobId, offer.leaseId);
+    assert.equal(h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: true}, undefined, offer.leaseId), false, 'the released lease is void');
+    const others = take('chrome-2', []);
+    assert.ok(!others || others.jobId !== offer.jobId, 'another profile never starts a replacement generation');
+    assert.equal(h.bridge.claimBridgeJob(offer.jobId, 'chrome-2').ok, false);
+    const again = take('chrome-1', [others?.jobId].filter(Boolean));
+    assert.equal(again?.jobId, offer.jobId);
+    assert.notEqual(again.leaseId, offer.leaseId);
+    assert.equal(JSON.stringify(again.resumeProviders), '["chatgpt"]', 'resumed, never a fresh submission');
+  });
+
+  test(`lease contract (${kind}): a stale claim stays with its profile`, () => {
+    const {h, take} = make();
+    const offer = take('chrome-1');
+    assert.equal(h.bridge.recordBridgeProgress(offer.jobId, offer.leaseId, progress('run-A')), true);
+    h.advance(CLAIM_MS + 1);
+    assert.equal(h.bridge.claimBridgeJob(offer.jobId, 'chrome-2').ok, false, 'no heartbeat is not a transfer of ownership');
+    const others = take('chrome-2');
+    assert.ok(!others || others.jobId !== offer.jobId);
+    assert.equal(h.bridge.recoverBridgeJob('chrome-1', [{jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}])?.jobId, offer.jobId);
+  });
+
+  test(`lease contract (${kind}): failure needs the lease; nothing left to fail is acknowledged`, () => {
+    const {h, take, unknown} = make();
+    const offer = take('chrome-1');
+    assert.equal(h.bridge.failBridgeProvider(offer.jobId, 'chatgpt', 'quota: usage limit', 'not-the-lease'), false);
+    assert.equal(h.bridge.failBridgeProvider(offer.jobId, 'local', 'error', offer.leaseId), false, 'only a chat provider');
+    assert.equal(h.bridge.failBridgeProvider(offer.jobId, 'chatgpt', 'quota: usage limit', offer.leaseId), true);
+    assert.equal(h.bridge.failBridgeProvider(unknown, 'chatgpt', 'error', 'lease'), true, 'an unknown item has nothing left to fail');
+  });
+
+  test(`lease contract (${kind}): prompt and progress answer only for live work under its lease`, () => {
+    const {h, take, unknown} = make();
+    const offer = take('chrome-1');
+    assert.ok(h.bridge.promptForJob(offer.jobId)?.prompt, 'the waiting item hands out its prompt');
+    assert.equal(h.bridge.promptForJob(unknown), null);
+    assert.equal(h.bridge.recordBridgeProgress(offer.jobId, 'not-the-lease', progress('run-A')), false);
+    assert.equal(h.bridge.recordBridgeProgress(unknown, offer.leaseId, progress('run-A')), false);
+    assert.equal(h.bridge.claimBridgeJob(unknown, 'chrome-1').ok, false);
+    assert.equal(h.bridge.bridgeJobState(offer.jobId).active, true);
   });
 }

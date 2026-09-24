@@ -108,20 +108,28 @@ describe("bridge fix registry: lifecycle", () => {
     assert.equal(h.reg.complete(offer.jobId, "chatgpt", "late", offer.leaseId).ok, false);
   });
 
-  it("release requeues the item for any profile and voids the old lease", async () => {
+  it("release voids the lease and frees the slot, but the item stays with its profile and resumes", async () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h);
+    assert.equal(h.reg.progress(offer.jobId, offer.leaseId, "generating", "run-A"), true);
     assert.equal(h.reg.release(offer.jobId, "not-the-lease"), false);
     assert.equal(h.reg.release(offer.jobId, offer.leaseId), true);
     assert.deepEqual(h.reg.state(offer.jobId), { active: true, status: "awaiting_chat" });
+    assert.equal(h.reg.counts().active, 0, "the parallelPrs slot is free");
     assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "stale", offer.leaseId), {
       ok: false,
       code: "lease_conflict",
       error: "fix item is not claimed by this worker",
     });
-    assert.equal(h.reg.peek()?.id, offer.jobId);
-    const again = h.reg.take(offer.jobId, "chrome-2");
+    // Like a review job (bridgeClientId + attemptedProviders): never a replacement generation
+    // from another profile.
+    assert.equal(h.reg.peek([], "chrome-2"), undefined);
+    assert.equal(h.reg.take(offer.jobId, "chrome-2"), null);
+    assert.equal(h.reg.claim(offer.jobId, "chrome-2").ok, false);
+    const again = h.reg.take(offer.jobId, "chrome-1");
     assert.ok(again && again.leaseId !== offer.leaseId);
+    assert.deepEqual(again.resumeProviders, ["chatgpt"], "a resume, never a fresh submission");
+    assert.deepEqual(again.bindings, [{ jobId: offer.jobId, provider: "chatgpt", runId: "run-A" }]);
     assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", again.leaseId), { ok: true });
     assert.equal(await promise, "answer");
   });

@@ -342,7 +342,8 @@ export async function escalateNow(
   inFlightEscalate.add(key);
   try {
     // An unreadable history does not suppress the post (the failure is the signal); the journal
-    // still knows this process's own handoff for the head and session.
+    // still knows this process's own handoff for the head and session until a session read
+    // reconciles its listed row — which then ends the session every caller gates on.
     if (await alreadyEscalated(gh, token, opts, botLogin).catch(() => false)) return { escalated: false };
     const body = escalateFromRounds(opts.reason, opts.rounds, {
       pr: opts.pr,

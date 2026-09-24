@@ -112,7 +112,72 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(ownWrites(f.gh).state(controlKey(handoff(1).key)), "unknown");
   });
 
-  it("a listed row confirms an unknown entry: no stand-in beside it, and a later emit is 'exists'", async () => {
+  it("eviction by state: thousands of reconciled posted writes and refused writes are pruned; what may have landed, or is still owed, is kept", async () => {
+    const N = 2_000;
+    let posts = 0;
+    let lose = true; // the first POST's outcome is unknown and nothing is stored
+    const refused = new Set<number>(); // PRs whose POSTs GitHub refuses
+    const byPr = new Map<number, ControlRow[]>();
+    const gh = {
+      async listIssueComments(_t: string, _o: string, _r: string, pr: number) {
+        return [...(byPr.get(pr) ?? [])];
+      },
+      async createIssueComment(_t: string, o: { pr: number; body: string }) {
+        posts++;
+        if (lose) {
+          lose = false;
+          throw unknownErr();
+        }
+        if (refused.has(o.pr)) throw rejectedErr();
+        const row = { id: posts, userLogin: BOT, body: o.body, createdAt: new Date(T0 + posts * 1_000).toISOString() };
+        byPr.set(o.pr, [...(byPr.get(o.pr) ?? []), row]);
+        return { ...row };
+      },
+    };
+    const ctx: EmitContext = { gh, token: "t", botLogin: BOT, sleep: async () => {}, now: () => T0 };
+    const journal = ownWrites(gh);
+    const stateOf = (w: ControlWrite) => journal.state(controlKey(w.key));
+    const reconcile = async (pr: number) => journal.standIns(ref(pr), await gh.listIssueComments("t", "o", "r", pr), BOT);
+
+    assert.equal((await emitControl(ctx, handoff(1))).status, "unknown");
+    const posted = Array.from({ length: N }, (_, i) => handoff(2 + i));
+    for (const w of posted) {
+      assert.equal((await emitControl(ctx, w)).status, "posted");
+      assert.equal(stateOf(w), "posted", "kept until the list shows it (it stands in meanwhile)");
+      assert.deepEqual(await reconcile(w.key.ref.pr), [], "a session read reconciles it");
+      assert.equal(stateOf(w), undefined, "a reconciled write is evicted");
+    }
+    const rejected = Array.from({ length: N }, (_, i) => handoff(2 + N + i));
+    for (const w of rejected) {
+      refused.add(w.key.ref.pr);
+      assert.equal((await emitControl(ctx, w)).status, "rejected");
+      assert.equal(stateOf(w), undefined, "a refused write is evicted once no emit is in flight");
+    }
+    // Kept: a posted write no session read has reconciled yet, and a refused write-ahead stop (both fold).
+    const unlisted = handoff(2 + 2 * N);
+    assert.equal((await emitControl(ctx, unlisted)).status, "posted");
+    const stopPr = 3 + 2 * N;
+    const stop: ControlWrite = { key: { kind: "stop", ref: ref(stopPr), by: "bob", at: "2026-03-01T00:00:00Z" }, body: stoppedComment({ by: "bob", at: "2026-03-01T00:00:00Z" }) };
+    journal.intend(stop);
+    refused.add(stopPr);
+    assert.equal((await emitControl(ctx, stop)).status, "rejected");
+    assert.equal(journal.seen(handoff(4 + 2 * N), [], BOT), false);
+    assert.deepEqual(journal.stats(), { prs: 3, entries: 3 }, "only unresolved entries remain, and no empty per-PR map");
+    assert.equal(stateOf(stop), "rejected");
+    assert.equal((await reconcile(stopPr)).length, 1, "the refused stop is still honored");
+    assert.equal((await reconcile(unlisted.key.ref.pr)).length, 0, "listed now: reconciled and evicted");
+
+    // An evicted write is still never sent twice: the listed row answers the emit's scan.
+    const sent = posts;
+    assert.deepEqual(await emitControl(ctx, posted[0]), { status: "exists" });
+    // The write that may have landed still blocks a second POST.
+    assert.equal((await emitControl(ctx, handoff(1))).status, "unknown");
+    assert.equal(posts, sent, "no POST");
+    assert.equal(stateOf(handoff(1)), "unknown");
+    assert.deepEqual(journal.stats(), { prs: 2, entries: 2 });
+  });
+
+  it("a listed row confirms an unknown entry: no stand-in beside it, the entry is evicted, and a later emit is 'exists'", async () => {
     const f = world(["landed"]);
     f.w.hidden = true; // the row landed but the list lags through the whole schedule
     assert.equal((await emitControl(f.ctx, handoff())).status, "unknown");
@@ -120,8 +185,9 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(ownWrites(f.gh).standIns(ref(), [], BOT).length, 1, "folded while unlisted");
     assert.deepEqual(ownWrites(f.gh).unresolved(ref(), "handoff").map((u) => u.key), [key]);
     assert.deepEqual(ownWrites(f.gh).standIns(ref(), f.rows, BOT), [], "the real row replaces the stand-in");
-    assert.equal(ownWrites(f.gh).state(key), "posted");
+    assert.equal(ownWrites(f.gh).state(key), undefined, "reconciled, then evicted: the listed row answers for it");
     assert.deepEqual(ownWrites(f.gh).unresolved(ref(), "handoff"), []);
+    f.w.hidden = false; // the list that reconciled it: its scan finds the row
     assert.deepEqual(await emitControl(f.ctx, handoff()), { status: "exists" });
     assert.equal(f.posts(), 1);
   });

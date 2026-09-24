@@ -11,9 +11,10 @@
  * - emitControl POSTs a write at most once while its outcome may have landed, joins concurrent
  *   emits of the same key, and returns a CLOSED outcome (posted | exists | unknown | rejected) that
  *   every caller handles in an exhaustive switch.
- * - OwnWrites journals every write, never evicted by age or size. Every session read reconciles it
- *   against the listed history (a listed row the event collector reads confirms its entry) and
- *   folds the other entries as stand-in events: the loop reads its own writes.
+ * - OwnWrites journals every write until its row is listed (retention is by state, never by age or
+ *   size). Every session read reconciles it against the listed history (a listed row the event
+ *   collector reads confirms, then evicts, its entry) and folds the other entries as stand-in
+ *   events: the loop reads its own writes.
  *
  * DI-only (no transport import): it is reached only through the gated loop engine and runtime.
  * NON-GOALS: dedup across processes or restarts (the journal is in-process; single harbor instance).
@@ -189,6 +190,9 @@ interface OwnWrite {
   row?: CreatedRow;
   error?: string;
   inflight?: Promise<EmitOutcome>;
+  /** A collectable listed row confirmed it: from then on that row is its event, and a later emit's
+   * scan finds it. */
+  listed?: boolean;
 }
 
 const message = (e: unknown): string => (e as Error)?.message ?? String(e);
@@ -221,8 +225,22 @@ function standInEvent(e: OwnWrite): LoopEvent {
   }
 }
 
-/** The control writes one GitHub client made in this process. No TTL and no size cap: an entry that
- * may have landed must keep blocking a second POST for as long as the process lives. */
+/**
+ * Done with, so evicted: a write whose row was listed and reconciled (the list carries its event
+ * from then on, and every emit path — or its caller — scans before it POSTs), or one that neither
+ * landed nor folds (refused or unsent, not write-ahead). Never while an emit is in flight. An
+ * unknown write, and a write-ahead one whose row is not listed, are never done with.
+ */
+function settled(e: OwnWrite): boolean {
+  if (e.inflight) return false;
+  if (e.listed) return true;
+  return !e.writeAhead && (e.state === "rejected" || e.state === "intent");
+}
+
+/** The control writes one GitHub client made in this process. Retention is by STATE, never by age
+ * or size (no TTL, no cap): an entry that may have landed, or a write-ahead one whose row is not
+ * listed, keeps blocking a second POST and folding for as long as the process lives; a settled
+ * entry is evicted, and so is a PR's map once it is empty. */
 export class OwnWrites {
   private readonly byPr = new Map<string, Map<string, OwnWrite>>();
 
@@ -249,6 +267,7 @@ export class OwnWrites {
     return e;
   }
 
+  /** undefined: never journaled, or evicted. */
   state(key: string): WriteState | undefined {
     for (const all of this.byPr.values()) {
       const e = all.get(key);
@@ -264,16 +283,18 @@ export class OwnWrites {
 
   /** Forget an intent that was never sent (a stop that stopped nothing). */
   abandon(w: ControlWrite): void {
-    const all = this.entries(w.key.ref);
+    const all = this.byPr.get(prKey(w.key.ref));
     const key = controlKey(w.key);
-    if (all.get(key)?.state === "intent" && !all.get(key)?.inflight) all.delete(key);
+    if (all?.get(key)?.state === "intent" && !all.get(key)?.inflight) all.delete(key);
+    this.prune(w.key.ref);
   }
 
   /** A listed row that is `w`: confirms the entry (it is no longer unknown). */
   seen(w: ControlWrite, rows: readonly ControlRow[], botLogin: string): boolean {
     const hit = listedMatch(rows, w, botLogin);
-    const e = this.entries(w.key.ref).get(controlKey(w.key));
+    const e = this.byPr.get(prKey(w.key.ref))?.get(controlKey(w.key));
     if (hit && e) confirm(e, hit);
+    this.prune(w.key.ref);
     return !!hit;
   }
 
@@ -287,7 +308,24 @@ export class OwnWrites {
       if (hit && collectable(e.write, hit)) confirm(e, hit);
       else if (folds(e)) out.push(standInEvent(e));
     }
+    this.prune(ref);
     return out;
+  }
+
+  /** Evict the PR's settled entries, and its map once it is empty. */
+  prune(ref: PrRef): void {
+    const pr = prKey(ref);
+    const all = this.byPr.get(pr);
+    if (!all) return;
+    for (const [key, e] of all) if (settled(e)) all.delete(key);
+    if (all.size === 0) this.byPr.delete(pr);
+  }
+
+  /** What the journal holds (retention is observable: tests pin what is kept and what is not). */
+  stats(): { prs: number; entries: number } {
+    let entries = 0;
+    for (const all of this.byPr.values()) entries += all.size;
+    return { prs: this.byPr.size, entries };
   }
 
   /**
@@ -325,6 +363,7 @@ function confirm(e: OwnWrite, row: ControlRow): void {
   if (!collectable(e.write, row)) return;
   e.state = "posted";
   e.row = { id: row.id, userLogin: row.userLogin, createdAt: row.createdAt };
+  e.listed = true;
 }
 
 const journals = new WeakMap<object, OwnWrites>();
@@ -357,10 +396,12 @@ export interface EmitContext {
  * Synchronous up to the join, so a concurrent emit of the same key shares this one's outcome.
  */
 export function emitControl(ctx: EmitContext, w: ControlWrite): Promise<EmitOutcome> {
-  const e = ownWrites(ctx.gh).upsert(w);
+  const journal = ownWrites(ctx.gh);
+  const e = journal.upsert(w);
   if (e.inflight) return e.inflight;
   const run = emitOnce(ctx, e).finally(() => {
     e.inflight = undefined;
+    journal.prune(w.key.ref); // a refused write, or one a re-check listed, is settled now
   });
   e.inflight = run;
   return run;

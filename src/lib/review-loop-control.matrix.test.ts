@@ -535,12 +535,13 @@ async function assertReadsOwnWrite(w: World): Promise<void> {
   }
 }
 
-/** I4: once the row is listed, one session read confirms the entry and no stand-in is left. */
+/** I4: once the row is listed, one session read confirms the entry (then evicts it: the listed row
+ * answers for it) and no stand-in is left. */
 async function assertReconciled(w: World): Promise<void> {
   const { write } = w.cell;
   w.catchUp();
   await w.session();
-  if (write === "success" || write === "unknown-landed") assert.equal(ownWrites(w.deps.gh).state(w.key()), "posted", "I4: the listed row confirms the journal entry");
+  if (write === "success" || write === "unknown-landed") assert.equal(ownWrites(w.deps.gh).state(w.key()), undefined, "I4: the listed row reconciles and evicts the journal entry");
   const n = (await w.eventsOfWrite()).length;
   const expected = write !== "rejected" || kindOf(w.cell.via) === "stop" ? 1 : 0; // a refused stop still stands (write-ahead)
   assert.equal(n, expected, `I4: ${n} events for the write`);

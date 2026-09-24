@@ -48,7 +48,6 @@ import {
   CURRENT_ROUND_MISSING,
   ESCALATE_IN_FLIGHT,
   escalateNow,
-  controlInSession,
   maybeEscalate,
   dedupProbe,
   readLoopSession,
@@ -60,7 +59,6 @@ import {
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
 import {
-  canonicalContinuation,
   continueComment,
   fixingComment,
   isoMs,
@@ -599,64 +597,47 @@ function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullH
   return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head, extra: [...pendingStops(gh, ref), ...extra] });
 }
 
-/** `ambiguous`: the POST's outcome is unknown (it may have landed) and it is not visible yet. It is
- * recorded in the ambiguity ledger (no re-entry sends it again; a later caller gets `ambiguous`,
- * never `exists`), and callers treat it as a write that may exist: never a loop-error handoff
- * that would contradict it. */
+/** A control write's outcome in the stop record's terms (the stop still keeps its own loop). */
 type ContinueOutcome = { posted: boolean; exists?: boolean; ambiguous?: boolean; error?: string };
 
-// ONE continuation per (PR, head, session). The push handler, a step whose head moved and an
-// applied round can each ask for the live head's review: concurrent callers share one post
-// (single flight), and a later caller finds the durable one and posts nothing.
-const continuing = new Map<string, Promise<ContinueOutcome>>();
-
-/** Request the next review of `head` with the fixed continuation marker — once per session. An
- * unreadable history fails toward posting: a duplicate request is only superseded by harbor,
- * while a missing one would stall the loop. Never throws. */
+/**
+ * Request the next review of `head` with the fixed continuation marker — ONE per (PR, head,
+ * session): the push handler, a step whose head moved and an applied round can each ask, and the
+ * gate joins concurrent callers and finds a later caller this process's own or the listed one. An
+ * unreadable history fails toward posting (a duplicate request is only superseded by harbor, a
+ * missing one would stall the loop); a POST that may have landed is never sent again. The body is
+ * lazy — the round is computed only for a real POST — so the gate is reached with no await (the
+ * single-flight join point). Never throws.
+ */
 function ensureContinuation(
-  gh: LoopRuntimeGithub,
-  token: string,
+  ctl: EmitContext,
+  gh: ReviewLoopGithub,
   ref: PrRef,
-  c: { head: string; mode: ReviewLoopMode; sinceIso?: string; sinceSeq?: number; botLogin: string; round?: number; sleep?: (ms: number) => Promise<void> },
-): Promise<ContinueOutcome> {
-  if (!FULL_SHA_RE.test(c.head)) return Promise.resolve({ posted: false, error: "the head is not a full commit SHA" });
-  const key = `continue:${prKey(ref)}@${c.head}#${c.sinceSeq ?? c.sinceIso ?? ""}`;
-  const running = continuing.get(key);
-  if (running) return running;
-  const run = (async (): Promise<ContinueOutcome> => {
-    const since = { iso: c.sinceIso, seq: c.sinceSeq };
-    // What this process just posted counts even before the list API shows it.
-    const probe = dedupProbe(gh, key, () =>
-      gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).then(
-        (rows) =>
-          rows.some((r) => {
-            if (!isSelfLogin(r.userLogin, c.botLogin)) return false;
-            const k = canonicalContinuation(r.body, { authoredByBot: true });
-            return k?.pr === ref.pr && k.head === c.head && (since.iso === undefined || controlInSession(r, since));
-          }),
-        () => false,
-      ),
-    );
-    const r = await retryWrite({
-      delays: POST_RETRY_DELAYS_MS,
-      sleep: c.sleep ?? realSleep,
-      seen: probe.seen,
-      post: async () => {
-        const round =
-          c.round ??
-          (await reconstructRounds(gh, token, ref.owner, ref.repo, ref.pr, { botLogin: c.botLogin, sinceIso: c.sinceIso }).catch(() => [])).length + 1;
-        const body = continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head });
-        await gh.createIssueComment(token, { owner: ref.owner, repo: ref.repo, pr: ref.pr, body });
-        rememberPosted(gh, key);
-      },
-    });
-    if ("posted" in r) return { posted: true };
-    if ("exists" in r) return probe.ledgerOnly() ? { posted: false, ambiguous: true, error: OUTCOME_UNKNOWN } : { posted: false, exists: true };
-    if (r.ambiguous) rememberAmbiguous(gh, key); // never re-sent; not "posted" either
-    return { posted: false, ambiguous: r.ambiguous, error: writeFailure(r) };
-  })().finally(() => continuing.delete(key));
-  continuing.set(key, run);
-  return run;
+  c: { head: string; mode: ReviewLoopMode; sinceIso?: string; sinceSeq?: number; round?: number },
+): Promise<EmitOutcome> {
+  if (!FULL_SHA_RE.test(c.head)) return Promise.resolve({ status: "rejected", error: "the head is not a full commit SHA" });
+  const body = async () => {
+    const round =
+      c.round ?? (await reconstructRounds(gh, ctl.token, ref.owner, ref.repo, ref.pr, { botLogin: ctl.botLogin, sinceIso: c.sinceIso }).catch(() => [])).length + 1;
+    return continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head });
+  };
+  const since = { iso: c.sinceIso, seq: c.sinceSeq };
+  return emitControl(ctl, { key: { kind: "continue", ref, head: c.head, sessionIso: c.sinceIso }, body, since });
+}
+
+/** How an applied round's report ends, from its continuation's outcome. */
+function continuationStatus(c: EmitOutcome): ContinuationStatus {
+  switch (c.status) {
+    case "posted":
+    case "exists":
+      return { ok: true };
+    case "unknown": // it may have requested the review: never contradicted by a handoff
+      return { ok: false, unknown: true, error: c.error };
+    case "rejected":
+      return { ok: false, error: c.error };
+    default:
+      return assertNever(c);
+  }
 }
 
 /**
@@ -739,6 +720,7 @@ export async function runPostReviewLoop(
   try {
     d = deps ?? (await productionDeps(settings));
     const gh = d.gh;
+    const ctl = controlCtx(d, token, botLogin);
     // A moved head supersedes this review: the LIVE head's review drives the loop. The push handler
     // (or the round that pushed) normally requested it already; asking again is idempotent, so a
     // missed push event can never stall an active loop.
@@ -746,8 +728,8 @@ export async function runPostReviewLoop(
       if (live.sha === headSha) return;
       const now = await sessionOf(gh, token, ref, live, botLogin).catch(() => null);
       if (!now?.active) return;
-      const r = await ensureContinuation(gh, token, ref, { head: live.sha, mode: now.mode ?? "suggest", sinceIso: now.startIso, sinceSeq: now.startSeq, botLogin, sleep });
-      trace(job.id, "superseded", { live: live.sha.slice(0, 7), continuation: r.posted ? "posted" : r.exists ? "exists" : `failed: ${r.error}` });
+      const r = await ensureContinuation(ctl, gh, ref, { head: live.sha, mode: now.mode ?? "suggest", sinceIso: now.startIso, sinceSeq: now.startSeq });
+      trace(job.id, "superseded", { live: live.sha.slice(0, 7), continuation: r.status });
     };
     const head = await gh.fetchPullHeadRef(token, owner, repo, pr);
     // Also the fork-push guard: a commit parented on a stale SHA would fast-forward over a
@@ -1041,14 +1023,9 @@ export async function runPostReviewLoop(
       } else {
         // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
         // budget — the round-cap handoff.
-        const c = await ensureContinuation(gh, token, ref, { head: newHead, mode, sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, round: rounds.length + 1, sleep });
-        // An unknown outcome may have requested the review: never contradict it with a handoff.
-        if (c.ambiguous) trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
-        status = c.ambiguous
-          ? { ok: false, unknown: true, error: c.error ?? OUTCOME_UNKNOWN }
-          : c.posted || c.exists
-            ? { ok: true }
-            : { ok: false, error: c.error ?? "the continuation was not posted" };
+        const c = await ensureContinuation(ctl, gh, ref, { head: newHead, mode, sinceIso: session.startIso, sinceSeq: session.startSeq, round: rounds.length + 1 });
+        if (c.status === "unknown") trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
+        status = continuationStatus(c);
       }
       // The fixed signal (continuation above, or this handoff) goes out BEFORE the informational
       // replies and report: those are up to maxInlineComments slow calls that must never delay
@@ -1132,29 +1109,40 @@ export async function continueLoopOnPush(
     const moved = push.pushedAt ? [{ at: push.pushedAt, kind: "push" as const, head: push.headSha }] : [];
     const session = await sessionOf(d.gh, token, push, head, botLogin, moved);
     if (!session.active) return { posted: false, reason: NO_SESSION };
-    const c = await ensureContinuation(d.gh, token, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, sleep: d.sleep });
-    if (!c.error) return { posted: c.posted, reason: c.posted ? "continued" : "already continued" };
-    // It may have landed: no loop-error handoff that would end the session it continues.
-    if (c.ambiguous) return { posted: false, reason: `continuation outcome unknown (${c.error}); not re-sent, no handoff` };
+    const c = await ensureContinuation(controlCtx(d, token, botLogin), d.gh, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, sinceSeq: session.startSeq });
     // The next review cannot be requested: end the loop with the fixed handoff instead of stalling.
-    const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso }).catch(() => []);
-    const handoff = await escalateNow(d.gh, token, {
-      owner: push.owner,
-      repo: push.repo,
-      pr: push.pr,
-      head: push.headSha,
-      reason: "loop-error",
-      detail: `the pushed head's review could not be requested: ${c.error}`,
-      rounds,
-      roundCap: roundCap(env),
-      botLogin,
-      sinceIso: session.startIso,
-      sinceSeq: session.startSeq,
-      sleep: d.sleep,
-      now: d.now,
-    });
-    const tail = handoff.escalated ? "; handoff posted" : handoff.error ? `; handoff failed: ${handoff.error}` : "";
-    return { posted: false, reason: `continue on push failed: ${c.error}${tail}` };
+    const handOff = async (error: string) => {
+      const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso }).catch(() => []);
+      const handoff = await escalateNow(d.gh, token, {
+        owner: push.owner,
+        repo: push.repo,
+        pr: push.pr,
+        head: push.headSha,
+        reason: "loop-error",
+        detail: `the pushed head's review could not be requested: ${error}`,
+        rounds,
+        roundCap: roundCap(env),
+        botLogin,
+        sinceIso: session.startIso,
+        sinceSeq: session.startSeq,
+        sleep: d.sleep,
+        now: d.now,
+      });
+      const tail = handoff.escalated ? "; handoff posted" : handoff.error ? `; handoff failed: ${handoff.error}` : "";
+      return { posted: false, reason: `continue on push failed: ${error}${tail}` };
+    };
+    switch (c.status) {
+      case "posted":
+        return { posted: true, reason: "continued" };
+      case "exists":
+        return { posted: false, reason: "already continued" };
+      case "unknown": // it may have landed: no loop-error handoff that would end the session it continues
+        return { posted: false, reason: `continuation outcome unknown (${c.error}); not re-sent, no handoff` };
+      case "rejected":
+        return await handOff(c.error);
+      default:
+        return assertNever(c);
+    }
   } catch (e) {
     return { posted: false, reason: `continue on push failed: ${(e as Error)?.message ?? String(e)}` };
   }

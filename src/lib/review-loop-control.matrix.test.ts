@@ -499,20 +499,9 @@ async function assertNewerSessionLives(w: World): Promise<void> {
  * failed. Each fix deletes its group; the last one deletes gap(). A pattern is
  * `via | write | list | later`, each part `*` or a comma list. */
 const OPEN: ReadonlyArray<readonly [string, string]> = [
-  ["continuation", "continue:push | success | normal,failing | row-appears"],
-  ["continuation", "continue:push | success | lagging | redelivery,25h,row-appears"],
-  ["continuation", "continue:push | unknown-landed | normal | row-appears"],
-  ["continuation", "continue:applied | success,unknown-landed | normal,failing | row-appears"],
-  ["continuation", "continue:applied | success,unknown-landed | lagging | redelivery,25h,row-appears"],
-  ["continuation", "continue:applied | unknown-lost | normal,lagging | redelivery,25h,row-appears"],
-  ["continuation", "continue:applied | unknown-lost | failing | row-appears"],
-  ["continuation", "continue:superseded | success | normal,failing | row-appears"],
-  ["continuation", "continue:superseded | success | lagging | redelivery,25h,row-appears"],
-  ["continuation", "continue:superseded | unknown-landed | normal | row-appears"],
-  ["continuation", "continue:moved-mid-round | success | normal,failing | row-appears"],
-  ["continuation", "continue:moved-mid-round | success | lagging | redelivery,25h,row-appears"],
-  ["continuation", "continue:moved-mid-round | unknown-landed | normal | row-appears"],
-  ["continueOn", "continue:applied | * | failing | redelivery,25h"],
+  ["continueOn", "continue:applied | success,rejected | failing | redelivery,25h"],
+  ["continueOn", "continue:applied | unknown-landed | lagging,failing | redelivery,25h"],
+  ["continueOn", "continue:applied | unknown-lost | * | redelivery,25h,row-appears"],
   ["continueOn", "continue:superseded | success | failing | redelivery,25h"],
   ["continueOn", "continue:superseded | rejected,unknown-lost | * | *"],
   ["continueOn", "continue:superseded | unknown-landed | lagging,failing | *"],

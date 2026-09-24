@@ -185,7 +185,7 @@ export function ashlarBotLogin(env: NodeJS.ProcessEnv | undefined = envOf()): st
  * requested after the N-th fix, so the largest requested round is cap + 1 ≤ MAX_CONTINUE_ROUND. */
 function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   const n = Number(env?.ASHLAR_LOOP_ROUND_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), MAX_CONTINUE_ROUND - 1) : DEFAULT_ROUND_CAP;
+  return Math.min(Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ROUND_CAP, MAX_CONTINUE_ROUND - 1);
 }
 
 /** Generation deadline per fix request, counted from the provider's FIRST output (queue time

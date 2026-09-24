@@ -153,9 +153,9 @@ function fixJob(patch = {}) {
   return {jobId: 'fix-A', kind: 'fix', origin: 'http://bridge', leaseId: 'lease-A', prompt: 'FIX PROMPT', providers: ['chatgpt'],
     reasoning: {chatgpt: 'pro', grok: 'heavy'}, states: {chatgpt: {tabId: 10, started: true, runId: 'run-A'}}, ...patch};
 }
-function worker(jobs, {api, handler, url = URL_FIX, status = 'complete'}) {
+function worker(jobs, {api, handler, url = URL_FIX, status = 'complete', session}) {
   const tabs = new Map([[10, {id: 10, url, status}]]);
-  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: Object.fromEntries(jobs.map(j => [j.jobId, j]))}), tabs, api, handler});
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: Object.fromEntries(jobs.map(j => [j.jobId, j]))}), session, tabs, api, handler});
   b.context.crypto = webcrypto;b.context.TextEncoder = TextEncoder;
   return b;
 }
@@ -224,21 +224,23 @@ test('worker: a cancelled fix whose run was never sent closes its blank tab and 
   const OPENED = 'https://chatgpt.com/?temporary-chat=true'; // providerUrl: the page a fix tab opens on
   const blank = (url) => (_id, m) => (m.type === 'ashlar-fix-cancel' && m.undispatched ? {ok: true, owned: true, ownership: 'owned', url, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'});
   const unsent = () => [fixJob({states: {chatgpt: {tabId: 10, started: false, runId: 'run-A'}}})];
-  const b = worker(unsent(), {api: cancelled, handler: blank(OPENED), url: OPENED});
+  // this browser session created tab 10 for the leg (allocateProviderTab's record)
+  const session = () => storage({'ashlar:tab:10': {jobId: 'fix-A', provider: 'chatgpt', runId: 'run-A', closedKey: 'ashlar:closed:fix-A:chatgpt:run-A', closing: false}});
+  const b = worker(unsent(), {api: cancelled, handler: blank(OPENED), url: OPENED, session: session()});
   await b.tick();
   assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.undispatched === true));
   assert.deepEqual(b.closedTabs, [10]);assert.deepEqual(b.local.state.pendingReviewJobs, {});
   // blank, but moved to another conversation: the user's, preserved (the job still retires)
-  const moved = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/c/other'), url: 'https://chatgpt.com/c/other'});
+  const moved = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/c/other'), url: 'https://chatgpt.com/c/other', session: session()});
   await moved.tick();
   assert.equal(moved.closedTabs.length, 0);assert.deepEqual(moved.local.state.pendingReviewJobs, {});
   // blank on the same path out of temporary-chat mode: the query is not the page (origin + path,
   // #82), so it is still the page the tab was opened on and holds nothing of the user's: closed
-  const plain = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/'});
+  const plain = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/', session: session()});
   await plain.tick();
   assert.deepEqual(plain.closedTabs, [10]);assert.deepEqual(plain.local.state.pendingReviewJobs, {});
   // the fragment is not part of the page identity
-  const hashed = worker(unsent(), {api: cancelled, handler: blank(`${OPENED}#x`), url: `${OPENED}#x`});
+  const hashed = worker(unsent(), {api: cancelled, handler: blank(`${OPENED}#x`), url: `${OPENED}#x`, session: session()});
   await hashed.tick();
   assert.deepEqual(hashed.closedTabs, [10]);
   const handler = blank(OPENED);

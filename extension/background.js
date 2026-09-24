@@ -110,6 +110,17 @@ async function rememberOwnedTab(job, provider, closing = false) {
   }});
 }
 
+/** Whether this browser session recorded `tabId` as this leg's tab (allocateProviderTab writes the
+ * record right after it creates the tab). Chrome tab ids are unique only within one browser session
+ * and the job registry outlives it (storage.local), while this record does not (storage.session is
+ * cleared by a browser restart or an extension reload): a leg's stored tab id without it can name a
+ * tab the user opened since. An unbound page is Ashlar's only in the tab this proves. */
+async function tabCreatedForLeg(job, provider, tabId) {
+  const key = OWNED_PREFIX + tabId;
+  const owned = Number.isInteger(tabId) ? (await chrome.storage.session.get([key]))[key] : undefined;
+  return owned?.jobId === job.jobId && owned.provider === provider && owned.runId === job.states[provider].runId;
+}
+
 function formatRetry(until) {
   if (!until) return "later";
   const d = new Date(until);
@@ -827,8 +838,10 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     return waitOrPreserveFixTab(job, provider, jobs, "the tab never finished loading; tab preserved", undefined, "unreachable");
   }
   // A tab opened for a run that was never sent is unbound by design: the page then answers for an
-  // unbound tab (Ashlar's only while it holds no turn and no draft).
-  const undispatched = cancelled && !state.started;
+  // unbound tab (Ashlar's only while it holds no turn and no draft), and only in the tab this browser
+  // session created for the leg. Without that record the stored id may name the user's own tab: it
+  // is asked like any tab (only a page bound to this run can answer), never claimed as Ashlar's.
+  const undispatched = cancelled && !state.started && await tabCreatedForLeg(job, provider, tab.id);
   if (!undispatched) {
     // The tab's own URL first: the conversation the run was bound in, else the page where this run
     // last answered.
@@ -872,6 +885,11 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   // still on the page it was opened on (an empty conversation the user moved to is the user's).
   if (unbound || verdict.blank === true || verdict.unsent === true) {
     if (!onAllocationPage(result.url, provider)) return preserveFixTab(job, provider, jobs, "the unsent tab moved to another page; tab preserved", tab, "navigated");
+    // An unbound page's answer proves nothing about the tab: the record is checked again at the close.
+    if (unbound && !await tabCreatedForLeg(job, provider, tab.id)) {
+      cleanupWaiting(job, provider, "ownership_mismatch");
+      return waitOrPreserveFixTab(job, provider, jobs, "the tab carries another binding; tab preserved", undefined, "other_binding");
+    }
     await closeProvenTab(job, provider, jobs, tab.id, url => onAllocationPage(url, provider), closed);
     return;
   }

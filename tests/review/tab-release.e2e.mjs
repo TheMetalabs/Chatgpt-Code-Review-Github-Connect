@@ -320,17 +320,43 @@ for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled after 
  await tab.enableSend();await tab.page.clock.runFor(2000);
  assert.equal(await tab.clicks(),0,'the cancelled prompt is never submitted');
 });
+/** The record allocateProviderTab writes when it creates tab 10 for this leg (this browser session). */
+const createdHere=(job='job-A',run='run-A')=>storage({'ashlar:tab:10':{jobId:job,provider:'chatgpt',runId:run,closedKey:`ashlar:closed:${job}:chatgpt:${run}`,closing:false}});
 for(const [name,view,expected] of [
  ['a blank temporary chat is closed',{},{closed:[10]}],
  ['a draft the user typed there is preserved',{composer:'my own question'},{closed:[]}],
  ['a tab the user moved to another conversation is preserved',{url:OTHER_URL},{closed:[]}],
 ])test(`worker, review: cancelled before its run was dispatched: ${name}, and the job retires`,async t=>{
  const tab=await chatTab(t,{bound:false,...view});
- const w=wire(tab,{started:false,server:{value:'cancelled'}});
+ const w=wire(tab,{started:false,server:{value:'cancelled'},session:createdHere()});
  await w.tick();
  assert.deepEqual(w.b.closedTabs,expected.closed);assert.equal(w.state(),undefined,'retired, capacity released');
  assert.ok(w.b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.undispatched===true),'the unbound page answers only the undispatched claim');
  assert.equal(w.b.messages.some(m=>m.type==='ashlar-run'),false,'a cancelled run is never dispatched');
+});
+// Chrome tab ids are unique only within one browser session; the job registry survives a restart
+// (storage.local), the record of the tabs this session created does not (storage.session). A leg
+// allocated but never dispatched before a restart can therefore name the user's own tab.
+for(const kind of ['review','fix'])for(const url of ['https://chatgpt.com/',TEMP_URL,'https://chatgpt.com/?model=gpt-5'])test(`worker, ${kind}: a cancelled undispatched leg never claims or closes the user's blank tab that reuses its tab id (${url})`,async t=>{
+ const tab=await chatTab(t,{bound:false,url,kind});
+ const w=wire(tab,{kind,started:false,server:{value:'cancelled'}});
+ await w.tick();
+ assert.equal(w.b.session.state['ashlar:tab:10'],undefined,'fixture: this browser session never created tab 10');
+ assert.deepEqual(w.b.closedTabs,[]);
+ assert.equal(w.b.messages.some(m=>m.undispatched===true),false,'the unbound page is never claimed as Ashlar\'s');
+ w.later();await w.tick();
+ assert.deepEqual(w.b.closedTabs,[],'never closed');assert.equal(w.state(),undefined,'the leg retires after the ownership wait');
+ assert.equal(w.b.messages.some(m=>m.preserve===true),false,'the user\'s page is never told to release a binding');
+ assert.equal(w.b.messages.some(m=>m.type==='ashlar-run'),false);
+});
+test('sweep: a forgotten ("missing") undispatched leg never closes the user\'s blank tab that reuses its tab id',async t=>{
+ const tab=await chatTab(t,{bound:false,url:'https://chatgpt.com/'});
+ const w=wire(tab,{started:false,server:{value:'missing'}});
+ await w.b.context.heartbeatTick();
+ const res=await w.b.context.clearStuckJobs();
+ assert.equal(res.ok,true);
+ assert.deepEqual(w.b.closedTabs,[]);
+ assert.equal(w.b.messages.some(m=>m.undispatched===true),false);
 });
 test('worker: a cancelled leg whose page could not be reached before the server forgot the job ("missing") still closes',async t=>{
  const tab=await generatingTab(t);

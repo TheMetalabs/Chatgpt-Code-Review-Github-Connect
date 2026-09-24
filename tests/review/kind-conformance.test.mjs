@@ -130,7 +130,10 @@ const ROWS = [
     expect: {retired: true, closed: 1},
     async run(kind) {
       const OPENED = 'https://chatgpt.com/?temporary-chat=true';
-      const b = worker(kind, {api: cancelled, url: OPENED, job: item(kind, {}, {started: false}),
+      const job = item(kind, {}, {started: false});
+      // allocateProviderTab's record: this browser session created tab 10 for the leg
+      const session = storage({'ashlar:tab:10': {jobId: job.jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${job.jobId}:chatgpt:run-A`, closing: false}});
+      const b = worker(kind, {api: cancelled, url: OPENED, job, session,
         handler: (_id, m) => (m.type === 'ashlar-fix-cancel' && m.undispatched ? {ok: true, owned: true, ownership: 'owned', url: OPENED, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'})});
       await b.tick();b.later();await b.tick();
       return {retired: !b.pending(), closed: b.closedTabs.length};

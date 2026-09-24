@@ -1,23 +1,28 @@
 // Settings API (/api/harbor action=settings) for the fix agent / review loop: the route forwards
-// the whole fixAgent block, the production sanitizer normalizes it, and the response and the next
-// GET carry what was actually saved — the Settings screen is the loop's only switch.
+// the whole fixAgent block, the production rules (settings-rules — the same ones the Settings
+// screen runs) validate it, and the response and the next GET carry what was actually saved — the
+// Settings screen is the loop's only switch. A rejected value is a 400 and a failed persist a 500;
+// neither changes the live settings.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {loadTs, types} from './load-source.mjs';
 import {sanitizeBotSettings} from '../../src/lib/settings.server.ts';
+import {SettingsError, validatedSettingsPatch} from '../../src/lib/settings-rules.ts';
 import {normalizeChatgptReasoning, normalizeGrokReasoning} from '../../src/lib/reasoning.ts';
 
 function harness() {
-  const state = {settings: sanitizeBotSettings({})};
+  const state = {settings: sanitizeBotSettings({}), persistFails: false};
   const saves = [];
   const publicSettings = s => ({...s, webhookSecret: '', localLlmApiKey: ''});
   const {Route} = loadTs('src/routes/api/harbor.ts', {
     ...types,
     createFileRoute: () => config => config,
     getHarbor: () => ({...state, jobs: [], events: [], reviews: []}),
-    // patchHarborSettings' contract: sanitize the merged settings, persist, swap the live state.
+    // patchHarborSettings' contract: validate the merged document (the production rules), sanitize,
+    // persist (the JSON store must be written, else SettingsError 500), THEN swap the live state.
     patchHarborSettings: patch => {
-      const next = sanitizeBotSettings({...state.settings, ...patch});
+      const next = sanitizeBotSettings(validatedSettingsPatch(state.settings, patch));
+      if (state.persistFails) throw new SettingsError('could not save settings: .data/ashlar-settings.json is not writable (ENOTDIR); nothing was changed', 500);
       saves.push(next);
       state.settings = next;
       return next;
@@ -48,22 +53,64 @@ test('fixAgent round-trips through the Settings API and is live at once', async 
   assert.deepEqual(h.state.settings.fixAgent, {...wanted, enabled: false});
 });
 
-test('invalid fixAgent values are normalized, never stored as typed', async () => {
+const K = types.FIX_AGENT_KNOBS;
+// Every fixAgent field: a value the Settings screen rejects is rejected by the API too (400, no
+// save, live settings unchanged) — never clamped or rewritten into something the operator did not type.
+const INVALID = [
+  ['enabled', 'true'], ['enabled', 1], ['provider', 'skynet'], ['delivery', 'teleport'], ['mode', 'yolo'],
+  ...Object.keys(K).flatMap(key => [[key, K[key].max + 1], [key, K[key].min - 1], [key, 'x'], [key, null], [key, K[key].min + 0.5]]),
+];
+
+test('every invalid fixAgent value is rejected (400) and nothing is saved', async () => {
   const h = harness();
-  const res = await h.post({fixAgent: {enabled: 'true', provider: 'skynet', delivery: 'teleport', mode: 'yolo',
-    parallelPrs: 999, roundCap: -1, attempts: 'x', timeoutMs: 1, queueMaxMs: 1e15, chatTimeoutMs: null, chatMaxPromptChars: 5}});
-  assert.equal(res.status, 200);
-  const fix = h.state.settings.fixAgent;
-  const K = types.FIX_AGENT_KNOBS;
-  assert.deepEqual(fix, {enabled: false, provider: null, delivery: 'script-apply', mode: 'suggest', parallelPrs: K.parallelPrs.max,
-    roundCap: K.roundCap.min, attempts: K.attempts.def, timeoutMs: K.timeoutMs.min, queueMaxMs: K.queueMaxMs.max,
-    chatTimeoutMs: K.chatTimeoutMs.def, chatMaxPromptChars: K.chatMaxPromptChars.min});
-  // An incompatible provider→delivery pair disables the provider instead of saving a dead config.
-  await h.post({fixAgent: {enabled: true, provider: 'local', delivery: 'chat-push'}});
-  assert.equal(h.state.settings.fixAgent.provider, null);
+  const live = structuredClone(h.state.settings.fixAgent);
+  for (const [key, value] of INVALID) {
+    const res = await h.post({fixAgent: {[key]: value}});
+    assert.equal(res.status, 400, `${key}=${JSON.stringify(value)}`);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, key === 'enabled' || key === 'provider' || key === 'delivery' || key === 'mode' ? new RegExp(`fix_agent\\.${key}`) : /must be a whole number/);
+  }
+  assert.equal(h.saves.length, 0);
+  assert.deepEqual(h.state.settings.fixAgent, live);
   // A non-object fixAgent is ignored (no save at all).
-  const before = h.saves.length;
   await h.post({fixAgent: 'on'});
   await h.post({fixAgent: [true]});
-  assert.equal(h.saves.length, before);
+  assert.equal(h.saves.length, 0);
+});
+
+test('enabling a legacy delivery is rejected (400): the API refuses what the runtime could not run', async () => {
+  const h = harness();
+  for (const pair of [{provider: 'chatgpt', delivery: 'chat-push'}, {provider: 'grok', delivery: 'chat-push'}, {provider: 'coding-agent', delivery: 'coding-agent'}]) {
+    const res = await h.post({fixAgent: {...pair, enabled: true}});
+    assert.equal(res.status, 400, JSON.stringify(pair));
+    assert.match((await res.json()).error, /not wired yet/);
+  }
+  // An incompatible pair is rejected even while OFF (it has no execution path at all).
+  assert.equal((await h.post({fixAgent: {provider: 'local', delivery: 'chat-push'}})).status, 400);
+  assert.equal(h.saves.length, 0);
+  // The legacy pair can be kept while OFF; switching on works once the delivery is script-apply.
+  assert.equal((await h.post({fixAgent: {provider: 'chatgpt', delivery: 'chat-push', enabled: false}})).status, 200);
+  assert.equal((await h.post({fixAgent: {enabled: true}})).status, 400);
+  assert.equal(h.state.settings.fixAgent.enabled, false);
+  assert.equal((await h.post({fixAgent: {enabled: true, delivery: 'script-apply'}})).status, 200);
+  assert.equal(h.state.settings.fixAgent.enabled, true);
+});
+
+test('a save whose JSON store cannot be written fails (500), both for enable and disable, and the live settings stay', async () => {
+  const h = harness();
+  assert.equal((await h.post({fixAgent: {provider: 'grok'}})).status, 200);
+  for (const enabled of [true, false]) {
+    if (h.state.settings.fixAgent.enabled === enabled) {
+      h.state.persistFails = false;
+      assert.equal((await h.post({fixAgent: {enabled: !enabled}})).status, 200);
+    }
+    h.state.persistFails = true;
+    const before = structuredClone(h.state.settings);
+    const res = await h.post({fixAgent: {enabled}});
+    assert.equal(res.status, 500, `enabled=${enabled}`);
+    assert.match((await res.json()).error, /could not save settings/);
+    assert.deepEqual(h.state.settings, before, 'the live settings did not change');
+    assert.deepEqual((await h.get()).fixAgent, before.fixAgent, 'the next GET reads the last successful save');
+  }
 });

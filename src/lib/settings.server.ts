@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server.ts";
 import {
@@ -20,6 +20,7 @@ import {
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
+import { SettingsError, fixPairCompatible, settingsProblem } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
 
 function envStr(key: string): string | undefined {
@@ -158,13 +159,9 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_PROMPT_CONTEXT_MAX_CHARS: String(s.promptContextMaxChars),
     ASHLAR_PROMPT_POLICY_MAX_CHARS: String(s.promptPolicyMaxChars),
     ASHLAR_CONTEXT_PAD_LINES: String(s.contextPadLines),
-    ASHLAR_FIX_PROVIDER: s.fixAgent.provider ?? "",
-    ASHLAR_FIX_DELIVERY: s.fixAgent.delivery,
-    ASHLAR_FIX_MODE: s.fixAgent.mode,
-    // fixAgent.enabled is deliberately NOT mirrored: no env var can switch the loop on.
-    ...Object.fromEntries(
-      (Object.keys(FIX_AGENT_KNOBS) as FixAgentKnob[]).map((key) => [FIX_AGENT_KNOBS[key].env, String(fixKnob(s.fixAgent, key))]),
-    ),
+    // fixAgent is deliberately NOT mirrored (no field of it): the settings JSON is its only
+    // durable store, and a saved fixAgent wins over env at load (diskFixAgentWins). An env
+    // ASHLAR_FIX_* var only seeds a field that was never saved; no env var can switch the loop on.
   };
 }
 
@@ -184,16 +181,6 @@ function severity(v: unknown, fallback: Severity): Severity {
   return v === "P0" || v === "P1" || v === "P2" ? v : fallback;
 }
 
-// design §6b: which delivery each provider supports. An incompatible pair has no valid
-// execution path, so we DISABLE the fix agent (provider=null) rather than persist a config
-// that would silently never run — a visible, safe rejection of operator misconfiguration.
-const FIX_DELIVERY_BY_PROVIDER: Record<FixAgentProvider, readonly FixDelivery[]> = {
-  chatgpt: ["script-apply", "chat-push"],
-  grok: ["script-apply", "chat-push"],
-  local: ["script-apply"],
-  "coding-agent": ["coding-agent"],
-};
-
 function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
   const d = DEFAULT_SETTINGS.fixAgent;
   const p = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
@@ -202,8 +189,10 @@ function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
   const mode = FIX_MODES.includes(p.mode as FixMode) ? (p.mode as FixMode) : d.mode;
   // Only a literal true enables the loop ("true", 1, … stay off): the switch fails closed.
   const enabled = p.enabled === true;
-  // Enforce the provider→delivery matrix: an incompatible pair disables the fix agent.
-  if (provider !== null && !FIX_DELIVERY_BY_PROVIDER[provider].includes(delivery)) {
+  // Load-time normalization of a stored document (a save is VALIDATED first — settings-rules —
+  // and never reaches here with an incompatible pair): an incompatible pair (design §6b matrix)
+  // has no execution path, so it disables the fix agent (provider=null), failing closed.
+  if (provider !== null && !fixPairCompatible(provider, delivery)) {
     provider = null;
     delivery = d.delivery;
   }
@@ -274,10 +263,22 @@ function readJsonObject(path: string): Record<string, unknown> {
   }
 }
 
+/** Atomic: a crash or a full disk mid-write leaves the previous file intact, never a torn one. */
 function writeJson(path: string, value: BotSettings) {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (e) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* the tmp file may not exist */
+    }
+    throw e;
+  }
 }
 
 function readDiskSettings(): Record<string, unknown> {
@@ -321,16 +322,30 @@ export function loadBotSettings(): BotSettings {
   return sanitizeBotSettings(diskFixAgentWins(disk, diskReviewerFlagsWin(disk, overlayEnv(disk))));
 }
 
+/**
+ * Validate and persist a Settings save. The settings JSON (.data/ashlar-settings.json) is the ONE
+ * durable store: it must be written for the save to count. If it cannot be written the save FAILS
+ * (SettingsError 500) and nothing else is touched — no .env patch — so the caller keeps its live
+ * settings and the operator sees the error; after a restart load returns the last successful save.
+ * The legacy JSON copy and the .env mirror are supplemental (best effort): load reads the primary
+ * JSON over both (readDiskSettings, diskFixAgentWins). A document the rules reject (settings-rules)
+ * throws SettingsError 400 before anything is written.
+ */
 export function saveBotSettings(settings: BotSettings) {
+  const problem = settingsProblem(settings);
+  if (problem) throw new SettingsError(problem, 400);
   const runtime = sanitizeBotSettings(settings);
   const disk = persistableSettings(runtime);
-  let persisted = false;
   try {
     writeJson(settingsPath(), disk);
+  } catch (e) {
+    const why = e instanceof Error && "code" in e ? ` (${String((e as NodeJS.ErrnoException).code)})` : "";
+    throw new SettingsError(`could not save settings: ${settingsPath()} is not writable${why}; nothing was changed`, 500);
+  }
+  try {
     writeJson(legacySettingsPath(), disk);
-    persisted = true;
   } catch {
-    /* env file may still succeed */
+    /* supplemental: the primary JSON is read over the legacy copy */
   }
   try {
     const envPatch: Record<string, string | undefined> = botSettingsToEnv(disk);
@@ -341,12 +356,8 @@ export function saveBotSettings(settings: BotSettings) {
       envPatch.ASHLAR_WEBHOOK_SECRET = undefined;
     }
     writeEnvPatch(envPatch);
-    persisted = true;
   } catch {
-    /* json may still have been written */
+    /* supplemental: the JSON is the durable store */
   }
-  if (!persisted) throw new Error("settings persist failed");
   return runtime;
 }
-
-

@@ -274,7 +274,13 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error("could not save settings");
+    if (!res.ok) {
+      // The server's reason (a rejected value, or the settings file not writable) is the message.
+      const failed = (await Promise.resolve()
+        .then(() => res.json())
+        .catch(() => null)) as { error?: unknown } | null;
+      throw new Error(typeof failed?.error === "string" && failed.error ? failed.error : "could not save settings");
+    }
     // The server normalizes (e.g. clamps fix-agent numbers): show what it actually saved.
     const saved = (await Promise.resolve()
       .then(() => res.json())

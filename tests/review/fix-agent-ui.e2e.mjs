@@ -89,3 +89,52 @@ test('Settings UI: the review loop is OFF by default, validated, and saved from 
  assert.equal(posts.at(-1).fixAgent.enabled,false);
  assert.equal(posts.at(-1).fixAgent.provider,'grok','turning the loop off keeps the chosen provider');
 });
+
+test('Settings UI: a legacy delivery cannot be switched on, and a server-side save failure is shown, not reported as saved',async t=>{
+ const context=await browser.newContext();t.after(()=>context.close());
+ // Hydrated from a pre-#77 save: chat-push is a stored value the runtime refuses.
+ let savedFix={enabled:false,provider:'chatgpt',delivery:'chat-push',mode:'suggest',parallelPrs:3,roundCap:5,attempts:2,
+  timeoutMs:60*60_000,queueMaxMs:6*60*60_000,chatTimeoutMs:30*60_000,chatMaxPromptChars:100_000};
+ const posts=[];let failPersist=false;
+ await context.route('https://fix-agent.fixture/**',async route=>{
+  const url=new URL(route.request().url());
+  if(url.pathname==='/')return route.fulfill({contentType:'text/html; charset=utf-8',body:`<div id="root"></div><script>window.savedFix=${JSON.stringify(savedFix)};</script><script>${bundle.replace(/<\/script/gi,'<\\/script')}</script>`});
+  if(url.pathname==='/api/harbor'&&route.request().method()==='POST'){
+   const body=route.request().postDataJSON();posts.push(body);
+   if(failPersist)return route.fulfill({status:500,contentType:'application/json',body:JSON.stringify({ok:false,error:'could not save settings: .data/ashlar-settings.json is not writable (ENOTDIR); nothing was changed'})});
+   savedFix=body.fixAgent;
+   return route.fulfill({contentType:'application/json',body:JSON.stringify({ok:true,settings:{fixAgent:savedFix}})});
+  }
+  return route.fulfill({contentType:'application/json',body:'{"ok":true}'});
+ });
+ const page=await context.newPage();page.on('pageerror',error=>console.error('Fix agent UI fixture page error:',error.message));
+ await page.goto('https://fix-agent.fixture/');
+ const section=page.getByRole('region',{name:'Fix agent / review loop'});
+ await section.waitFor();
+ const delivery=section.getByLabel('fix_agent.delivery');
+ assert.equal(await delivery.inputValue(),'chat-push','the stored legacy value stays visible');
+ assert.deepEqual(await delivery.locator('option').evaluateAll(os=>os.map(o=>[o.value,o.disabled])),[['script-apply',false],['chat-push',true]]);
+ const enabled=section.getByRole('button',{name:'fix_agent.enabled'});
+ const save=page.getByRole('button',{name:'Save settings',exact:true});
+ await enabled.click();
+ await section.getByText(/Loop stays OFF: fix_agent\.delivery chat-push is not wired yet/).waitFor();
+ await save.click();
+ await page.getByText(/^fix_agent\.delivery chat-push is not wired yet: choose script-apply to enable the review loop$/).waitFor();
+ assert.equal(posts.length,0,'rejected on the page: nothing posted');
+ await delivery.selectOption('script-apply');
+ await save.click();
+ await page.getByText('Saved',{exact:true}).waitFor();
+ assert.equal(posts.length,1);
+ assert.deepEqual([posts[0].fixAgent.enabled,posts[0].fixAgent.provider,posts[0].fixAgent.delivery],[true,'chatgpt','script-apply']);
+ await section.getByText('Loop ON: ChatGPT (Chrome bridge) fixes, mode suggest.',{exact:true}).waitFor();
+ // The server cannot persist: its error is shown, the page does not claim "Saved", and a reload
+ // reads the last successful save (still ON).
+ failPersist=true;
+ await enabled.click();
+ await save.click();
+ await page.getByText(/could not save settings: .*not writable/).waitFor();
+ assert.equal(await page.getByText('Saved',{exact:true}).count(),0);
+ assert.equal(posts.at(-1).fixAgent.enabled,false);
+ await page.reload();
+ assert.equal(await section.getByRole('button',{name:'fix_agent.enabled'}).getAttribute('aria-pressed'),'true');
+});

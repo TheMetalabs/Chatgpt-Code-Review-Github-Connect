@@ -300,6 +300,21 @@ describe("the loop is OFF unless Settings enable it (no other path turns it on)"
     assert.equal(loopEnabled(off()), false);
   });
 
+  it("enabled on a pair the runtime cannot execute (hand-edited / env-seeded legacy delivery) → off, and no loop step runs", async () => {
+    for (const pair of [
+      { provider: "chatgpt", delivery: "chat-push" },
+      { provider: "grok", delivery: "chat-push" },
+      { provider: "coding-agent", delivery: "coding-agent" },
+    ] as const) {
+      const s = settings("apply", pair);
+      assert.equal(s.fixAgent.enabled, true);
+      assert.equal(loopEnabled(s), false, JSON.stringify(pair));
+      const f = fakeDeps({ start: "apply", rounds: [3] });
+      assert.deepEqual(await runPostReviewLoop("t", job(), sample, s, f.deps, ENV), { ran: false, reason: "disabled" });
+      assert.equal(f.prompts.length, 0, "no fix request");
+    }
+  });
+
   it("only a literal true switches it on (the switch fails closed)", () => {
     for (const v of ["true", "1", 1, "on", "yes", null, {}]) {
       assert.equal(loopEnabled(withProvider({ enabled: v })), false, JSON.stringify(v));

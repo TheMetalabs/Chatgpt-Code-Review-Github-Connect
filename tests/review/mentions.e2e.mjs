@@ -306,6 +306,23 @@ test('the loop is OFF unless Settings enable it; saving the toggle applies to th
   await settle();assert.equal(reads,1,'switched off: no further loop control');
 });
 
+test('Settings saves run the production rules: a legacy delivery cannot be enabled, and a failed persist changes nothing live',async t=>{
+  let persistFails=false;
+  const app=await appFixture({reviewLocal:false,fixAgent:{...FIX_ON,provider:'chatgpt',delivery:'chat-push',enabled:false}},
+    {saveBotSettings:s=>{if(persistFails)throw Object.assign(new Error('could not save settings: fixture store is not writable'),{status:500});return s;}});
+  t.after(()=>app.close());
+  const live=()=>app.harbor.getHarbor().settings.fixAgent;
+  // The runtime refuses chat-push, so the save does too — the switch stays off.
+  assert.throws(()=>app.harbor.patchHarborSettings({fixAgent:{...live(),enabled:true}}),e=>e.status===400&&/not wired yet/.test(e.message));
+  assert.equal(live().enabled,false);
+  app.harbor.patchHarborSettings({fixAgent:{...live(),enabled:true,delivery:'script-apply'}});
+  assert.equal(live().enabled,true);
+  // The JSON store cannot be written: the disable fails and the live switch stays as last saved.
+  persistFails=true;
+  assert.throws(()=>app.harbor.patchHarborSettings({fixAgent:{...live(),enabled:false}}),e=>e.status===500);
+  assert.equal(live().enabled,true,'a failed persist leaves the live settings unchanged');
+});
+
 test('a loop stop whose first attempt failed is retried when GitHub redelivers it (the claim is the only guard)',async t=>{
   let reads=0;
   const app=await appFixture({reviewLocal:false,fixAgent:{...FIX_ON}},

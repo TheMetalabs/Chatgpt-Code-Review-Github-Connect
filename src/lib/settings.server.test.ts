@@ -1,11 +1,22 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { botSettingsToEnv, diskFixAgentWins, diskReviewerFlagsWin, overlayEnv, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
-import { DEFAULT_SETTINGS, FIX_AGENT_KNOBS, providersFromSettings } from "./types.ts";
+import { resetDotenvLoadedForTests } from "./dotenv-file.server.ts";
+import {
+  botSettingsToEnv,
+  diskFixAgentWins,
+  diskReviewerFlagsWin,
+  loadBotSettings,
+  overlayEnv,
+  persistableSettings,
+  sanitizeBotSettings,
+  saveBotSettings,
+} from "./settings.server.ts";
+import { SettingsError, fixAgentProblem, fixLoopOn, settingsProblem } from "./settings-rules.ts";
+import { DEFAULT_SETTINGS, FIX_AGENT_KNOBS, providersFromSettings, type BotSettings, type FixAgentKnob, type FixAgentSettings } from "./types.ts";
 
 describe("sanitizeBotSettings", () => {
   it("keeps local LLM fields from a saved document", () => {
@@ -115,25 +126,16 @@ describe("sanitizeBotSettings", () => {
     assert.equal(bad.fixAgent.parallelPrs, 20); // clamped
   });
 
-  it("serializes fixAgent to env keys so it survives the env-only persistence fallback (H6)", () => {
-    const s = sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push", mode: "apply", parallelPrs: 4 } });
+  it("never mirrors fixAgent into env: the settings JSON is its only durable store", () => {
+    const s = sanitizeBotSettings({ fixAgent: { enabled: true, provider: "chatgpt", delivery: "chat-push", mode: "apply", parallelPrs: 4 } });
     const env = botSettingsToEnv(s);
-    assert.equal(env.ASHLAR_FIX_PROVIDER, "chatgpt");
-    assert.equal(env.ASHLAR_FIX_DELIVERY, "chat-push");
-    assert.equal(env.ASHLAR_FIX_MODE, "apply");
-    assert.equal(env.ASHLAR_FIX_PARALLEL_PRS, "4");
-    assert.equal(env.ASHLAR_LOOP_ROUND_CAP, String(DEFAULT_SETTINGS.fixAgent.roundCap));
-    assert.equal(env.ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS, String(DEFAULT_SETTINGS.fixAgent.chatMaxPromptChars));
-    // a disabled fix agent serializes provider as "" AND round-trips to null through the env
-    // overlay (an explicit empty ASHLAR_FIX_PROVIDER seeds "no provider") (J2/J8). At load a
-    // SAVED fixAgent still wins over this seed (diskFixAgentWins).
-    assert.equal(botSettingsToEnv(sanitizeBotSettings({})).ASHLAR_FIX_PROVIDER, "");
+    assert.deepEqual(Object.keys(env).filter((k) => /^ASHLAR_(FIX|LOOP)_/.test(k)), []);
+    // An explicit empty ASHLAR_FIX_PROVIDER still SEEDS "no provider" (J2/J8) for a never-saved field.
     const prev = process.env.ASHLAR_FIX_PROVIDER;
     try {
       process.env.ASHLAR_FIX_PROVIDER = "";
       const base = sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push", mode: "suggest", parallelPrs: 3 } }) as unknown as Record<string, unknown>;
-      const disabled = sanitizeBotSettings(overlayEnv(base));
-      assert.equal(disabled.fixAgent.provider, null, "empty env provider disables the persisted one");
+      assert.equal(sanitizeBotSettings(overlayEnv(base)).fixAgent.provider, null, "empty env provider seeds no provider");
     } finally {
       if (prev === undefined) delete process.env.ASHLAR_FIX_PROVIDER; else process.env.ASHLAR_FIX_PROVIDER = prev;
     }
@@ -236,4 +238,174 @@ describe("prompt budgets", () => {
     assert.equal(env.ASHLAR_PROMPT_DIFF_MAX_CHARS, "300000");
     assert.equal(env.ASHLAR_CONTEXT_PAD_LINES, "20");
   });
+});
+
+// ── Every fixAgent field: validated by the ONE rule set (settings-rules, the same function the
+// Settings screen calls), durable ONLY through the settings JSON. Scenarios per field: UI
+// validation, save path, env seed only, restart/load, and a save while the JSON store is unusable
+// (.data broken, .env writable) — that save must FAIL and a restart must load the last good save.
+type FixRow = { key: keyof FixAgentSettings; base?: Partial<FixAgentSettings>; good: unknown; next: unknown; bad: unknown; label: RegExp; env?: { name: string; raw: string; seeded: unknown } };
+const K = FIX_AGENT_KNOBS;
+const FIX_ROWS: FixRow[] = [
+  { key: "enabled", base: { provider: "grok" }, good: true, next: false, bad: "true", label: /fix_agent\.enabled/ },
+  { key: "provider", good: "local", next: "grok", bad: "skynet", label: /fix_agent\.provider/, env: { name: "ASHLAR_FIX_PROVIDER", raw: "grok", seeded: "grok" } },
+  { key: "delivery", base: { provider: "chatgpt" }, good: "chat-push", next: "script-apply", bad: "teleport", label: /fix_agent\.delivery/, env: { name: "ASHLAR_FIX_DELIVERY", raw: "chat-push", seeded: "chat-push" } },
+  { key: "mode", good: "apply", next: "suggest", bad: "yolo", label: /fix_agent\.mode/, env: { name: "ASHLAR_FIX_MODE", raw: "apply", seeded: "apply" } },
+  ...(Object.keys(K) as FixAgentKnob[]).map((key): FixRow => ({
+    key,
+    good: K[key].min,
+    next: K[key].max,
+    bad: K[key].max + 1,
+    label: /must be a whole number/,
+    env: { name: K[key].env, raw: String(K[key].max), seeded: K[key].max },
+  })),
+];
+
+function sandbox(t: { after: (fn: () => void) => void }) {
+  const cwd = mkdtempSync(join(tmpdir(), "fix-agent-json-"));
+  const prevCwd = process.cwd();
+  const prevEnv = { ...process.env };
+  const clean = () => {
+    for (const k of Object.keys(process.env)) if (k.startsWith("ASHLAR_")) delete process.env[k];
+    resetDotenvLoadedForTests();
+  };
+  process.chdir(cwd);
+  clean();
+  t.after(() => {
+    process.chdir(prevCwd);
+    for (const k of Object.keys(process.env)) if (!(k in prevEnv)) delete process.env[k];
+    Object.assign(process.env, prevEnv);
+    resetDotenvLoadedForTests();
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const doc = (fix: Partial<FixAgentSettings>): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { ...DEFAULT_SETTINGS.fixAgent, ...fix } });
+  return {
+    cwd,
+    doc,
+    /** A new process: the startup env (no ASHLAR_* in it), .env re-read on load. */
+    restart: () => {
+      clean();
+      return loadBotSettings();
+    },
+    /** .data unusable (a plain file where the directory should be), .env still writable. */
+    breakJson: () => {
+      renameSync(join(cwd, ".data"), join(cwd, ".data.bak"));
+      writeFileSync(join(cwd, ".data"), "not a directory");
+    },
+    repairJson: () => {
+      rmSync(join(cwd, ".data"), { force: true });
+      renameSync(join(cwd, ".data.bak"), join(cwd, ".data"));
+    },
+    envText: () => (existsSync(join(cwd, ".env")) ? readFileSync(join(cwd, ".env"), "utf8") : ""),
+  };
+}
+
+const saveError = (fn: () => unknown): SettingsError => {
+  try {
+    fn();
+  } catch (e) {
+    assert.ok(e instanceof SettingsError, `SettingsError, got ${String(e)}`);
+    return e;
+  }
+  assert.fail("the save did not fail");
+};
+
+describe("fixAgent: one validator, durable only via the settings JSON (every field)", () => {
+  for (const row of FIX_ROWS) {
+    const fix = (v: unknown) => ({ ...(row.base ?? {}), [row.key]: v }) as Partial<FixAgentSettings>;
+
+    it(`${row.key}: UI validation — the screen's rule (settings-rules) accepts the good value, rejects the bad one`, () => {
+      assert.equal(fixAgentProblem({ ...DEFAULT_SETTINGS.fixAgent, ...fix(row.good) }), null);
+      assert.equal(settingsProblem({ ...DEFAULT_SETTINGS, fixAgent: { ...DEFAULT_SETTINGS.fixAgent, ...fix(row.good) } }), null);
+      assert.match(fixAgentProblem({ ...DEFAULT_SETTINGS.fixAgent, ...fix(row.bad) }) ?? "", row.label);
+    });
+
+    it(`${row.key}: save — the bad value is rejected (400) and nothing is written; the good one is saved as typed`, (t) => {
+      const box = sandbox(t);
+      const err = saveError(() => saveBotSettings(box.doc(fix(row.bad))));
+      assert.equal(err.status, 400);
+      assert.match(err.message, row.label);
+      assert.equal(existsSync(join(box.cwd, ".data")), false, "no JSON written");
+      assert.equal(box.envText(), "", "no .env written");
+      assert.deepEqual(saveBotSettings(box.doc(fix(row.good))).fixAgent[row.key], row.good);
+    });
+
+    it(`${row.key}: env only seeds a never-saved field; a saved value wins`, (t) => {
+      const box = sandbox(t);
+      if (!row.env) {
+        // The switch has no env var at all.
+        Object.assign(process.env, { ASHLAR_FIX_AGENT: "1", ASHLAR_FIX_ENABLED: "true", ASHLAR_FIX_PROVIDER: "grok" });
+        assert.equal(loadBotSettings().fixAgent.enabled, false);
+        return;
+      }
+      process.env[row.env.name] = row.env.raw;
+      assert.deepEqual(loadBotSettings().fixAgent[row.key], row.env.seeded, "seeded");
+      saveBotSettings(box.doc(fix(row.good)));
+      box.restart();
+      process.env[row.env.name] = row.env.raw;
+      resetDotenvLoadedForTests();
+      assert.deepEqual(loadBotSettings().fixAgent[row.key], row.good, "the saved value wins over the env seed");
+    });
+
+    it(`${row.key}: restart — load returns the saved value`, (t) => {
+      const box = sandbox(t);
+      saveBotSettings(box.doc(fix(row.good)));
+      assert.deepEqual(box.restart().fixAgent[row.key], row.good);
+    });
+
+    it(`${row.key}: JSON store unusable (.env writable) — the save fails, .env untouched, restart loads the last good save`, (t) => {
+      const box = sandbox(t);
+      saveBotSettings(box.doc(fix(row.good)));
+      const envBefore = box.envText();
+      box.breakJson();
+      const err = saveError(() => saveBotSettings(box.doc(fix(row.next))));
+      assert.equal(err.status, 500);
+      assert.match(err.message, /could not save settings/);
+      assert.equal(box.envText(), envBefore, "the supplemental .env patch is not written when the JSON is not");
+      box.repairJson();
+      assert.deepEqual(box.restart().fixAgent[row.key], row.good, "the last successful save");
+    });
+  }
+
+  it("enabled on a legacy delivery (chat-push, coding-agent) is rejected by the screen rule and the save; the runtime stays off", (t) => {
+    const box = sandbox(t);
+    const legacy: Partial<FixAgentSettings>[] = [
+      { provider: "chatgpt", delivery: "chat-push" },
+      { provider: "grok", delivery: "chat-push" },
+      { provider: "coding-agent", delivery: "coding-agent" },
+    ];
+    for (const pair of legacy) {
+      const enabled = { ...DEFAULT_SETTINGS.fixAgent, ...pair, enabled: true };
+      assert.match(fixAgentProblem(enabled) ?? "", /not wired yet/, JSON.stringify(pair));
+      assert.equal(saveError(() => saveBotSettings(box.doc(enabled))).status, 400);
+      assert.equal(fixLoopOn(enabled), false, "the runtime rule fails closed on the same pair");
+      // Stored while OFF is fine (the screen keeps showing it); switching it on is not.
+      assert.equal(fixAgentProblem({ ...enabled, enabled: false }), null);
+    }
+    assert.equal(existsSync(join(box.cwd, ".data", "ashlar-settings.json")), false);
+  });
+
+  // A real process restart, both directions: before the fix, a failed JSON write with a working
+  // .env counted as saved, and the restart restored the stale switch from the JSON.
+  for (const [from, to] of [[false, true], [true, false]] as const) {
+    it(`real restart: ${from ? "disable" : "enable"} while the JSON store is unusable fails, and the restart keeps enabled=${from}`, (t) => {
+      const cwd = mkdtempSync(join(tmpdir(), "fix-agent-restart-"));
+      t.after(() => rmSync(cwd, { recursive: true, force: true }));
+      const module = new URL("./settings.server.ts", import.meta.url).href;
+      const env = { PATH: process.env.PATH, HOME: cwd };
+      const run = (code: string) =>
+        spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `import * as settings from ${JSON.stringify(module)};${code}`], { cwd, env, encoding: "utf8" });
+      const save = (enabled: boolean) =>
+        run(`try{settings.saveBotSettings(settings.sanitizeBotSettings({fixAgent:{enabled:${enabled},provider:"grok"}}));console.log("saved")}catch(e){console.log("failed",e.status)}`);
+      assert.equal(save(from).stdout.trim(), "saved");
+      renameSync(join(cwd, ".data"), join(cwd, ".data.bak"));
+      writeFileSync(join(cwd, ".data"), "not a directory");
+      assert.equal(save(to).stdout.trim(), "failed 500", "the save reports failure");
+      rmSync(join(cwd, ".data"));
+      renameSync(join(cwd, ".data.bak"), join(cwd, ".data"));
+      const loaded = run("console.log(JSON.stringify(settings.loadBotSettings().fixAgent))");
+      assert.equal(loaded.status, 0, loaded.stderr);
+      assert.equal(JSON.parse(loaded.stdout).enabled, from, "load after restart = the last successful save");
+    });
+  }
 });

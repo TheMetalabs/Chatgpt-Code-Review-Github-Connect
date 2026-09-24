@@ -28,7 +28,8 @@
  * round that went moot is never retried. Apply also requires the session starter's write
  * permission (design §2).
  * Everything is gated OFF by default:
- *   - Settings fixAgent.enabled AND fixAgent.provider != null (design §6b) — the Settings screen
+ *   - Settings fixAgent.enabled AND a runnable provider + delivery (settings-rules fixLoopOn,
+ *     the same rule every Settings save is validated with; design §6b) — the Settings screen
  *     is the ONLY switch (no env var); every entry point re-reads the live settings per call, so
  *     a saved toggle applies to the next step without a restart, AND
  *   - the PR has an ACTIVE loop session (durable: a recorded start after the last terminal), AND
@@ -88,6 +89,7 @@ import {
 } from "./review-loop.ts";
 import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
 import { fixKnob, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
+import { fixLoopOn } from "./settings-rules.ts";
 
 export interface PullHead extends LoopPrInfo {
   ref: string;
@@ -216,12 +218,13 @@ function envOf(): NodeJS.ProcessEnv | undefined {
   return typeof process !== "undefined" ? process.env : undefined;
 }
 
-/** Off unless the operator switched the fix agent on in Settings AND chose a provider. The
- * settings are the live ones (harbor passes its current state per call), so toggling in Settings
- * applies to the next loop step with no restart. No env var takes part. */
+/** Off unless the operator switched the fix agent on in Settings AND the provider + delivery are
+ * ones this runtime executes (settings-rules fixLoopOn — the rule every save is validated with,
+ * so a hand-edited or env-seeded non-wired pair fails closed here too). The settings are the live
+ * ones (harbor passes its current state per call), so toggling in Settings applies to the next
+ * loop step with no restart. No env var takes part. */
 export function loopEnabled(settings: BotSettings): boolean {
-  const fix = settings.fixAgent;
-  return fix?.enabled === true && fix.provider != null;
+  return fixLoopOn(settings.fixAgent);
 }
 
 /** The App's own login (for self-recognition): ASHLAR_BOT_LOGIN when it has the "<slug>[bot]"

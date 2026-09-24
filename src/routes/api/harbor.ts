@@ -142,9 +142,10 @@ export const Route = createFileRoute("/api/harbor")({
           if (Array.isArray(body.reviewOrder)) patch.reviewOrder = normalizeReviewOrder(body.reviewOrder);
           if (typeof body.chatgptReasoning === "string") patch.chatgptReasoning = normalizeChatgptReasoning(body.chatgptReasoning);
           if (typeof body.grokReasoning === "string") patch.grokReasoning = normalizeGrokReasoning(body.grokReasoning);
-          // Fix agent / review loop: a partial object merged over the live one; patchHarborSettings
-          // normalizes it (sanitizeBotSettings: unknown values → defaults, numbers clamped, only a
-          // literal true enables). Applied in memory at once — the next loop step reads it.
+          // Fix agent / review loop: a partial object merged over the live one. patchHarborSettings
+          // VALIDATES it with the same rules the Settings screen runs (settings-rules): an invalid
+          // value or an enabled configuration the runtime cannot execute is rejected (400), never
+          // clamped. A valid save applies in memory at once — the next loop step reads it.
           if (body.fixAgent && typeof body.fixAgent === "object" && !Array.isArray(body.fixAgent)) {
             patch.fixAgent = { ...getHarbor().settings.fixAgent, ...(body.fixAgent as Partial<FixAgentSettings>) };
           }
@@ -152,8 +153,11 @@ export const Route = createFileRoute("/api/harbor")({
             try {
               patchHarborSettings(patch);
             } catch (e) {
-              const msg = e instanceof Error ? e.message : "could not persist settings";
-              return Response.json({ ok: false, error: msg }, { status: msg.includes("reviewer") ? 400 : 500 });
+              // SettingsError: 400 = rejected input, 500 = not persisted (nothing changed either way).
+              const err = e as { message?: unknown; status?: unknown } | null;
+              const msg = typeof err?.message === "string" && err.message ? err.message : "could not persist settings";
+              const status = err?.status === 400 ? 400 : 500;
+              return Response.json({ ok: false, error: msg }, { status });
             }
           }
           return Response.json({ ok: true, settings: publicSettings(getHarbor().settings), github: githubStatus(), bridge: getBridgePublic() });

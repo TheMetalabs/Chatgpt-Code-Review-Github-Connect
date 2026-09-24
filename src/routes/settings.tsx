@@ -9,12 +9,20 @@ import {
   PROVIDER_LABEL,
   SECRET_MASK,
   SECRET_MASK_PEM,
-  WIRED_FIX_DELIVERIES,
-  WIRED_FIX_PROVIDERS,
   isMaskedSecret,
   normalizeReviewOrder,
   providersFromSettings,
 } from "@/lib/types";
+import {
+  FIX_KNOB_FIELDS,
+  WIRED_FIX_DELIVERIES,
+  WIRED_FIX_PROVIDERS,
+  fixAgentProblem,
+  fixLoopOn,
+  fromFormUnit,
+  settingsProblem,
+  toFormUnit,
+} from "@/lib/settings-rules";
 import type {
   BotSettings,
   FixAgentKnob,
@@ -47,16 +55,16 @@ function hydrateDraft(saved: BotSettings): BotSettings {
   };
 }
 
-/** Numeric fix-agent fields on the form: ms values are edited in minutes. */
-const FIX_NUMBER_FIELDS: { key: FixAgentKnob; label: string; unit: "count" | "minutes" | "chars"; hint: string }[] = [
-  { key: "parallelPrs", label: "fix_agent.parallel_prs", unit: "count", hint: "PRs fixed at once (shares the chat bridge with reviews)" },
-  { key: "roundCap", label: "fix_agent.round_cap", unit: "count", hint: "review→fix rounds before a human decides" },
-  { key: "attempts", label: "fix_agent.attempts", unit: "count", hint: "tries per round for an unusable reply" },
-  { key: "timeoutMs", label: "fix_agent.timeout_minutes", unit: "minutes", hint: "Local LLM generation deadline, from first output" },
-  { key: "queueMaxMs", label: "fix_agent.queue_max_minutes", unit: "minutes", hint: "give up on a fix still queued this long" },
-  { key: "chatTimeoutMs", label: "fix_agent.chat_timeout_minutes", unit: "minutes", hint: "ChatGPT/Grok fix deadline, queue + generation" },
-  { key: "chatMaxPromptChars", label: "fix_agent.chat_max_prompt_chars", unit: "chars", hint: "bigger ChatGPT/Grok fix prompts fail at once (use Local)" },
-];
+/** Hints for the numeric fix-agent fields; labels, units and bounds come from settings-rules. */
+const FIX_KNOB_HINT: Record<FixAgentKnob, string> = {
+  parallelPrs: "PRs fixed at once (shares the chat bridge with reviews)",
+  roundCap: "review→fix rounds before a human decides",
+  attempts: "tries per round for an unusable reply",
+  timeoutMs: "Local LLM generation deadline, from first output",
+  queueMaxMs: "Local LLM: give up on a fix still queued this long",
+  chatTimeoutMs: "ChatGPT/Grok fix deadline, queue + generation",
+  chatMaxPromptChars: "bigger ChatGPT/Grok fix prompts fail at once (use Local)",
+};
 
 const FIX_PROVIDER_LABEL: Record<FixAgentProvider, string> = {
   chatgpt: "ChatGPT (Chrome bridge)",
@@ -65,24 +73,6 @@ const FIX_PROVIDER_LABEL: Record<FixAgentProvider, string> = {
   "coding-agent": "coding-agent (not wired)",
 };
 
-const toFormUnit = (key: FixAgentKnob, v: number) =>
-  FIX_NUMBER_FIELDS.find((f) => f.key === key)?.unit === "minutes" ? v / 60_000 : v;
-const fromFormUnit = (key: FixAgentKnob, v: number) =>
-  FIX_NUMBER_FIELDS.find((f) => f.key === key)?.unit === "minutes" ? v * 60_000 : v;
-
-/** Why the fix-agent block cannot be saved as typed (null = valid). The server clamps as well;
- * this tells the operator instead of silently changing what they typed. */
-function fixAgentProblem(fix: FixAgentSettings): string | null {
-  if (fix.enabled && fix.provider == null) return "choose a fix provider to enable the review loop";
-  for (const f of FIX_NUMBER_FIELDS) {
-    const k = FIX_AGENT_KNOBS[f.key];
-    const v = fix[f.key];
-    if (typeof v !== "number" || !Number.isInteger(v) || v < k.min || v > k.max) {
-      return `${f.label} must be a whole number from ${toFormUnit(f.key, k.min)} to ${toFormUnit(f.key, k.max)}`;
-    }
-  }
-  return null;
-}
 
 function replaceMasked(current: string, next: string): string {
   if (!isMaskedSecret(current)) return next;
@@ -179,13 +169,10 @@ export function Settings() {
       setNotice("mentions cannot be empty");
       return;
     }
-    if (!providersFromSettings(draft).length) {
-      setNotice("enable ChatGPT, Grok, or a local URL+model");
-      return;
-    }
-    const fixProblem = fixAgentProblem(draft.fixAgent);
-    if (fixProblem) {
-      setNotice(fixProblem);
+    // The server's own rules (settings-rules): what the page accepts, the server accepts.
+    const problem = settingsProblem(draft);
+    if (problem) {
+      setNotice(problem);
       return;
     }
     setBusy(true);
@@ -201,8 +188,8 @@ export function Settings() {
       setTouched(false);
       setMentionText(mention.join(", "));
       setNotice("Saved");
-    } catch {
-      setNotice("could not save");
+    } catch (e) {
+      setNotice(e instanceof Error && e.message ? e.message : "could not save");
     } finally {
       setBusy(false);
     }
@@ -840,7 +827,8 @@ function FixAgentSection({ fix, onChange }: { fix: FixAgentSettings; onChange: (
     ? WIRED_FIX_PROVIDERS
     : [...WIRED_FIX_PROVIDERS, fix.provider];
   const deliveries = WIRED_FIX_DELIVERIES.includes(fix.delivery) ? WIRED_FIX_DELIVERIES : [...WIRED_FIX_DELIVERIES, fix.delivery];
-  const active = fix.enabled && fix.provider != null;
+  const active = fixLoopOn(fix);
+  const blocked = fix.enabled && !active ? fixAgentProblem(fix) : null;
   return (
     <section aria-label="Fix agent / review loop" className="space-y-4 rounded-xl border border-line bg-bg-elevated p-4">
       <div>
@@ -856,7 +844,7 @@ function FixAgentSection({ fix, onChange }: { fix: FixAgentSettings; onChange: (
         {active
           ? `Loop ON: ${FIX_PROVIDER_LABEL[fix.provider as FixAgentProvider]} fixes, mode ${fix.mode}.`
           : fix.enabled
-            ? "Loop stays OFF until a provider is chosen."
+            ? `Loop stays OFF: ${blocked ?? "choose a wired provider and delivery"}.`
             : "Loop OFF (default): no loop step and no fix request, ever."}
       </p>
       <div className="grid gap-4 sm:grid-cols-3">
@@ -902,7 +890,7 @@ function FixAgentSection({ fix, onChange }: { fix: FixAgentSettings; onChange: (
         </Field>
       </div>
       <div className="grid gap-4 sm:grid-cols-2">
-        {FIX_NUMBER_FIELDS.map((f) => {
+        {FIX_KNOB_FIELDS.map((f) => {
           const k = FIX_AGENT_KNOBS[f.key];
           return (
             <Field key={f.key} label={f.label}>
@@ -916,7 +904,7 @@ function FixAgentSection({ fix, onChange }: { fix: FixAgentSettings; onChange: (
                 className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
               />
               <span className="mt-1 block text-[11px] text-fg-subtle">
-                {f.hint} ({toFormUnit(f.key, k.min)}–{toFormUnit(f.key, k.max)}, default {toFormUnit(f.key, k.def)})
+                {FIX_KNOB_HINT[f.key]} ({toFormUnit(f.key, k.min)}–{toFormUnit(f.key, k.max)}, default {toFormUnit(f.key, k.def)})
               </span>
             </Field>
           );

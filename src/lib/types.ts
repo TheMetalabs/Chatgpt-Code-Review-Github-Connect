@@ -346,9 +346,8 @@ export function fixKnob(fixAgent: Partial<FixAgentSettings> | undefined, key: Fi
   return Math.min(k.max, Math.max(k.min, Math.floor(v)));
 }
 
-/** Providers / deliveries the loop can actually execute today (the Settings screen offers these). */
-export const WIRED_FIX_PROVIDERS: readonly FixAgentProvider[] = ["chatgpt", "grok", "local"];
-export const WIRED_FIX_DELIVERIES: readonly FixDelivery[] = ["script-apply"];
+// Which providers / deliveries the loop can execute (WIRED_FIX_*), and the validator every save
+// runs, live in settings-rules.ts — shared by the Settings screen, the save path and the runtime.
 
 export const DEFAULT_SETTINGS: BotSettings = {
   username: "ashlar-bot",

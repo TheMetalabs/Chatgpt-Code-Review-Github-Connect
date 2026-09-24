@@ -76,9 +76,9 @@ for (const [kind, make] of Object.entries(KINDS)) {
     assert.equal(h.bridge.recordBridgeProgress(offer.jobId, offer.leaseId, progress('run-A')), true);
     assert.equal(h.bridge.recordBridgeProgress(offer.jobId, offer.leaseId, progress('run-B')), false, 'another run is rejected');
     const binding = {jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'};
-    assert.equal(h.bridge.recoverBridgeJob('chrome-2', [binding]), null, 'not another profile');
-    assert.equal(h.bridge.recoverBridgeJob('chrome-1', [{...binding, runId: 'run-B'}]), null, 'not another run');
-    const resumed = h.bridge.recoverBridgeJob('chrome-1', [binding]);
+    assert.equal(h.bridge.recoverBridgeJob('chrome-2', [binding], {fixes: true}), null, 'not another profile');
+    assert.equal(h.bridge.recoverBridgeJob('chrome-1', [{...binding, runId: 'run-B'}], {fixes: true}), null, 'not another run');
+    const resumed = h.bridge.recoverBridgeJob('chrome-1', [binding], {fixes: true});
     assert.equal(resumed?.jobId, offer.jobId);
     assert.equal(JSON.stringify(resumed.resumeProviders), '["chatgpt"]', 'a resume, never a fresh submission');
     assert.equal(JSON.stringify(resumed.bindings), JSON.stringify([binding]));
@@ -109,7 +109,7 @@ for (const [kind, make] of Object.entries(KINDS)) {
     // Shared outcome: the owner gets the item back only as a RESUME of that tab. How differs by
     // kind (intended): a fix pins the page's run on recovery at once; a review job refuses an
     // unpinned recovery and is resumed by its own take once the claim goes stale.
-    let resumed = h.bridge.recoverBridgeJob('chrome-1', [binding]);
+    let resumed = h.bridge.recoverBridgeJob('chrome-1', [binding], {fixes: true});
     if (kind === 'review') {
       assert.equal(resumed, null);
       assert.equal(take('chrome-1'), null, 'a live claim is not handed out again');
@@ -119,7 +119,34 @@ for (const [kind, make] of Object.entries(KINDS)) {
     assert.equal(resumed?.jobId, offer.jobId);
     assert.equal(JSON.stringify(resumed.resumeProviders), '["chatgpt"]', 'resumed, never a fresh submission');
     assert.notEqual(take('chrome-1')?.jobId, offer.jobId, 'and never offered as a fresh submission afterwards');
-    assert.equal(h.bridge.recoverBridgeJob('chrome-2', [binding]), null, 'never another profile');
+    assert.equal(h.bridge.recoverBridgeJob('chrome-2', [binding], {fixes: true}), null, 'never another profile');
+  });
+
+  // Ashlar 4096068024: resume semantics exist only once a run is established. Released before any
+  // run: a fix is a fresh submission again (resumeProviders empty). FLAG R5 (review, asserted as
+  // today, not changed here): take already marked the provider attempted, so the owner's next take
+  // is a resume that names no binding (the worker then waits for an original tab that never existed).
+  test(`lease contract (${kind}): released before any run, the owner's next take`, () => {
+    const {h, take} = make();
+    const offer = take('chrome-1');
+    h.bridge.releaseBridgeJob(offer.jobId, offer.leaseId);
+    const again = take('chrome-1');
+    assert.equal(again?.jobId, offer.jobId);
+    assert.deepEqual({resume: JSON.stringify(again.resumeProviders), bindings: JSON.stringify(again.bindings)},
+      kind === 'fix' ? {resume: '[]', bindings: undefined} : {resume: '["chatgpt"]', bindings: undefined});
+    assert.equal(take('chrome-2', [again.jobId])?.jobId === offer.jobId, false, 'still never another profile');
+  });
+
+  test(`lease contract (${kind}): released after its run was established, the owner's next take resumes that run`, () => {
+    const {h, take} = make();
+    const offer = take('chrome-1');
+    assert.equal(h.bridge.recordBridgeProgress(offer.jobId, offer.leaseId, progress('run-A')), true);
+    h.bridge.releaseBridgeJob(offer.jobId, offer.leaseId);
+    const again = take('chrome-1');
+    assert.equal(again?.jobId, offer.jobId);
+    assert.equal(JSON.stringify(again.resumeProviders), '["chatgpt"]');
+    // a fix names the run it resumes; a review's take never carries bindings (its recover does)
+    assert.equal(JSON.stringify(again.bindings), kind === 'fix' ? JSON.stringify([{jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}]) : undefined);
   });
 
   test(`lease contract (${kind}): a stale claim stays with its profile`, () => {
@@ -130,7 +157,7 @@ for (const [kind, make] of Object.entries(KINDS)) {
     assert.equal(h.bridge.claimBridgeJob(offer.jobId, 'chrome-2').ok, false, 'no heartbeat is not a transfer of ownership');
     const others = take('chrome-2');
     assert.ok(!others || others.jobId !== offer.jobId);
-    assert.equal(h.bridge.recoverBridgeJob('chrome-1', [{jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}])?.jobId, offer.jobId);
+    assert.equal(h.bridge.recoverBridgeJob('chrome-1', [{jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}], {fixes: true})?.jobId, offer.jobId);
   });
 
   test(`lease contract (${kind}): complete needs the lease; a lost-ACK replay is identified by its payload`, async () => {

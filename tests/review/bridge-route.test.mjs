@@ -8,6 +8,7 @@ function route() {
   const c = vm.createContext({ Response, URL,
     createFileRoute: () => config => config,
     bridgeTokenOk: token => token === 'valid-token', bridgeHeartbeat() {},
+    fixOperationRefused: () => false,
     failBridgeProvider: (...args) => { failures.push(args); return true; },
   });
   const s = source('src/routes/api/bridge.ts').replace(/^import[\s\S]*?;\n/gm, '').replace('export const Route', 'globalThis.Route');
@@ -33,6 +34,8 @@ function routeWith(mocks) {
     createFileRoute: () => config => config,
     bridgeTokenOk: token => token === 'valid-token', bridgeHeartbeat() {}, getBridgePublic: () => ({}), bridgePromptText: text => text,
     isBridgeFixId: id => typeof id === 'string' && id.startsWith('fix-'),
+    // the production gate's rule (bridge.server.ts fixOperationRefused; bridge-fix-protocol.test.mjs runs the real one)
+    fixOperationRefused: (id, protocol) => typeof id === 'string' && id.startsWith('fix-') && protocol !== 1,
     completeBridgeFix: spy('completeBridgeFix', mocks.completeBridgeFix ?? { ok: true }),
     bridgeFormatErrors: spy('bridgeFormatErrors', mocks.bridgeFormatErrors ?? []),
     completeBridgeJob: spy('completeBridgeJob', mocks.completeBridgeJob ?? { ok: true }),
@@ -45,7 +48,7 @@ function routeWith(mocks) {
   }) });
   return { calls, post, names: () => calls.map(call => call[0]) };
 }
-const completeBody = (jobId, text) => ({ action: 'complete', repairProtocol: 1, captureProtocol: 1, jobId, leaseId: 'L', raw: text,
+const completeBody = (jobId, text) => ({ action: 'complete', repairProtocol: 1, captureProtocol: 1, fixProtocol: 1, jobId, leaseId: 'L', raw: text,
   results: [{ provider: 'chatgpt', raw: text, originalText: text }] });
 
 test('complete: a fix answer bypasses review validation and resolves as plain text', async () => {

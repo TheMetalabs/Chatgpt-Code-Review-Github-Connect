@@ -178,6 +178,20 @@ export function isBridgeFixId(jobId: unknown): boolean {
   return isFixItemId(jobId);
 }
 
+/** THE fix-protocol gate: every operation on a review-loop fix item needs the worker's
+ * fixProtocol:1 opt-in (a worker without it cannot harvest a plain-text fix answer and would wait
+ * for review JSON forever). The route applies it once, before dispatching any action:
+ * - per-id operations on a `fix-` id (claim, ping, prompt, progress, release, failure, complete and
+ *   the review-only observe/capture/repair lanes) are refused (409 fix_protocol_required) and
+ *   never touch the item;
+ * - take offers a fix item only to an opted-in worker (takeNextBridgeJob `fixes`);
+ * - recover skips fix bindings for a worker that has not opted in (recoverBridgeJob `fixes`);
+ *   its review bindings are recovered as before.
+ * Review operations are unchanged. True when the operation must be refused. */
+export function fixOperationRefused(jobId: unknown, fixProtocol: unknown): boolean {
+  return isFixItemId(jobId) && fixProtocol !== 1;
+}
+
 /** A fix answer is plain text for the runtime's deterministic parser: resolved as-is (the page's
  * full text), never review-validated, salvaged or archived as a review. */
 export function completeBridgeFix(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string) {
@@ -323,14 +337,15 @@ export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[
 /** Recover only the original profile's already-attempted, positively bound run.
  * This is NOT a capacity bypass for take/new generation and never widens providers.
  */
-export function recoverBridgeJob(clientId: string, values: unknown) {
+export function recoverBridgeJob(clientId: string, values: unknown, options: {fixes?: boolean} = {}) {
   if (!clientId || !Array.isArray(values) || values.length > 16) return null;
   const bindings = values.filter((item): item is {jobId:string;provider:"chatgpt"|"grok";runId:string} =>
     Boolean(item && typeof item === "object" && typeof item.jobId === "string" && item.jobId.length <= 160 &&
       isChatProvider(item.provider) && typeof item.runId === "string" && item.runId.length > 0 && item.runId.length <= 128));
-  // A fix item's run is resumed the same way: same profile, provider and pinned run.
+  // A fix item's run is resumed the same way: same profile, provider and pinned run - and only for a
+  // worker that opted into fix items (fixOperationRefused); an older worker's fix bindings are skipped.
   for (const binding of bindings) {
-    if (!isFixItemId(binding.jobId)) continue;
+    if (!isFixItemId(binding.jobId) || options.fixes !== true) continue;
     const offer = fixes().recover(binding.jobId, clientId, binding.provider, binding.runId);
     if (offer) return offer;
   }

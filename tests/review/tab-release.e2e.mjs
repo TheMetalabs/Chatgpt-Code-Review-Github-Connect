@@ -173,7 +173,7 @@ for(const kind of ['review','fix'])test(`${kind}: a secured temporary chat reloa
  assert.deepEqual(verdict(await canClose(conv.tab)),{canClose:false,reason:'pending',cause:'not_rendered'},'nothing rendered on a conversation page proves nothing: asked again');
 });
 
-test('review: a run pins its conversation on its exact sent turn, and follows a bare new-chat page to the assigned conversation once',async t=>{
+test('review: a run pins its conversation on its exact sent turn, once: a later location never replaces it',async t=>{
  const temp=await chatTab(t,{thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
  await temp.send('ashlar-run',{resume:true});await temp.page.clock.runFor(1600);
  const journal=tab=>tab.page.evaluate(()=>JSON.parse(sessionStorage.getItem('ashlar:submission:job-A:run-A')).conversation);
@@ -182,10 +182,10 @@ test('review: a run pins its conversation on its exact sent turn, and follows a 
  const fresh=await chatTab(t,{url:'https://chatgpt.com/',thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
  await fresh.send('ashlar-run',{resume:true});await fresh.page.clock.runFor(1600);
  assert.equal(await journal(fresh),'https://chatgpt.com/');
+ // A URL change is no evidence of whose conversation the page shows (the user can move first):
+ // no location-based upgrade, for reviews as for fixes.
  await fresh.page.evaluate(url=>history.pushState({},'',url),CONV_URL);await fresh.page.clock.runFor(1600);
- assert.equal(await journal(fresh),CONV_URL,'upgraded once to the conversation the provider assigned');
- await fresh.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);await fresh.page.clock.runFor(1600);
- assert.equal(await journal(fresh),CONV_URL,'never re-pinned after that');
+ assert.equal(await journal(fresh),'https://chatgpt.com/','never re-pinned by a later location');
 });
 test('an unbound page never answers for a job: can-close and a cancel without the undispatched claim get job_mismatch',async t=>{
  const tab=await chatTab(t,{bound:false});

@@ -5,38 +5,8 @@
 // neither changes the live settings.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {loadTs, types} from './load-source.mjs';
-import {sanitizeBotSettings} from '../../src/lib/settings.server.ts';
-import {SettingsError, validatedSettingsPatch} from '../../src/lib/settings-rules.ts';
-import {normalizeChatgptReasoning, normalizeGrokReasoning} from '../../src/lib/reasoning.ts';
-
-function harness() {
-  const state = {settings: sanitizeBotSettings({}), persistFails: false};
-  const saves = [];
-  const publicSettings = s => ({...s, webhookSecret: '', localLlmApiKey: ''});
-  const {Route} = loadTs('src/routes/api/harbor.ts', {
-    ...types,
-    createFileRoute: () => config => config,
-    getHarbor: () => ({...state, jobs: [], events: [], reviews: []}),
-    // patchHarborSettings' contract: validate the merged document (the production rules), sanitize,
-    // persist (the JSON store must be written, else SettingsError 500), THEN swap the live state.
-    patchHarborSettings: patch => {
-      const next = sanitizeBotSettings(validatedSettingsPatch(state.settings, patch));
-      if (state.persistFails) throw new SettingsError('could not save settings: .data/ashlar-settings.json is not writable (ENOTDIR); nothing was changed', 500);
-      saves.push(next);
-      state.settings = next;
-      return next;
-    },
-    publicSettings, publicJobs: j => j, publicReviews: r => r,
-    githubStatus: () => ({}), getBridgePublic: () => ({}), reviewHistory: () => ({health: () => ({ok: true})}),
-    normalizeChatgptReasoning, normalizeGrokReasoning,
-  });
-  const post = body => Route.server.handlers.POST({request: new Request('http://ashlar.test/api/harbor', {
-    method: 'POST', headers: {origin: 'http://ashlar.test', 'content-type': 'application/json'}, body: JSON.stringify({action: 'settings', ...body}),
-  })});
-  const get = async () => (await (await Route.server.handlers.GET()).json()).settings;
-  return {state, saves, post, get};
-}
+import {types} from './load-source.mjs';
+import {settingsHarness as harness} from './settings-harness.mjs';
 
 test('fixAgent round-trips through the Settings API and is live at once', async () => {
   const h = harness();
@@ -73,10 +43,114 @@ test('every invalid fixAgent value is rejected (400) and nothing is saved', asyn
   }
   assert.equal(h.saves.length, 0);
   assert.deepEqual(h.state.settings.fixAgent, live);
-  // A non-object fixAgent is ignored (no save at all).
-  await h.post({fixAgent: 'on'});
-  await h.post({fixAgent: [true]});
+  // A non-object fixAgent is rejected too (never silently ignored with a 200).
+  assert.equal((await h.post({fixAgent: 'on'})).status, 400);
+  assert.equal((await h.post({fixAgent: [true]})).status, 400);
   assert.equal(h.saves.length, 0);
+});
+
+// The route passes every supplied field RAW to the shared validator. Before, a non-object fixAgent
+// was dropped by the route and the request answered 200 with nothing changed.
+test('a supplied non-object fixAgent (null / false / "off" / [] …) is a 400; the enabled loop stays as stored, live and persisted', async () => {
+  const h = harness({fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply'}});
+  assert.equal(h.state.settings.fixAgent.enabled, true, 'fixture: the loop is ON and stored');
+  const live = structuredClone(h.state.settings);
+  for (const value of [null, false, 'off', [], 0, '', true, 'on', [{enabled: false}]]) {
+    const res = await h.post({fixAgent: value});
+    assert.equal(res.status, 400, `fixAgent=${JSON.stringify(value)}`);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /fix_agent must be an object/);
+    assert.deepEqual(h.state.settings, live, 'live settings unchanged');
+    assert.equal(h.saves.length, 0, 'nothing persisted');
+    assert.deepEqual((await h.get()).fixAgent, live.fixAgent);
+  }
+});
+
+const D = types.DEFAULT_SETTINGS;
+// Every top-level settings key: a supplied wrong-typed / out-of-domain value is a 400 and changes
+// nothing (no prefilter drops it, no coercion rewrites it); a valid value is saved as typed.
+const TOP_LEVEL = {
+  username: {bad: [42, null, '', '   ', ['bot'], true], good: 'ashlar-2'},
+  mention: {bad: ['@bot', [], [''], ['  '], [42], ['@a', null], null, {}], good: ['@ashlar-2', '/fix']},
+  skipForks: {bad: ['true', 1, null, 'false'], good: false},
+  skipDrafts: {bad: ['true', 0, null], good: false},
+  maxInlineComments: {bad: ['5', null, 1.5, -1, 21, 25, true], good: 20},
+  maxTurns: {bad: ['5', null, 2.5, -1, 1001, false], good: 7},
+  exploreTurns: {bad: ['5', null, 0.5, -1, 1001], good: 3},
+  publishMinSeverity: {bad: ['P3', 'p1', 1, null], good: 'P0'},
+  requestChangesMin: {bad: ['P9', 2, null], good: 'P2'},
+  precisionOverRecall: {bad: ['yes', 1, null], good: false},
+  webhookSecret: {bad: [42, null, {}, ['s'], true], good: 'new-secret'},
+  reviewChatgpt: {bad: ['true', 1, null], good: false},
+  reviewGrok: {bad: ['false', 0, null], good: false},
+  reviewLocal: {bad: ['true', 1, null], good: false},
+  fixAgent: {bad: [null, false, 'off', [], 1], good: {mode: 'apply'}},
+  localJsonRepairEnabled: {bad: ['false', 0, null], good: false},
+  chatgptReasoning: {bad: ['bogus', '', 3, null], good: 'high'},
+  grokReasoning: {bad: ['bogus', '', 3, null], good: 'fast'},
+  localLlmBaseUrl: {bad: [42, null, {}], good: 'http://127.0.0.1:1234/v1'},
+  localLlmApiKey: {bad: [42, null, {}], good: 'sk-new'},
+  localLlmModel: {bad: [42, null, []], good: 'qwen'},
+  localReviewMaxTokens: {bad: ['100', null, 0, 1.5, -5], good: 4096},
+  localReviewMode: {bad: ['turbo', 1, null], good: 'multiturn'},
+  localReviewSingleTurnMaxTokens: {bad: ['100', null, 0, 2.5], good: 8000},
+  reviewOrder: {bad: ['local', ['grok'], ['local', 'local', 'grok'], ['local', 'chatgpt', 'bing'], [], null, ['local', 'chatgpt', 'grok', 'grok']], good: ['grok', 'chatgpt', 'local']},
+  promptDiffMaxChars: {bad: ['10', null, -1, 0.5], good: 12345},
+  promptContextMaxChars: {bad: ['10', null, -1, 0.5], good: 0},
+  promptPolicyMaxChars: {bad: ['10', null, -1, 0.5], good: 999},
+  contextPadLines: {bad: ['10', null, -1, 0.5], good: 12},
+};
+
+test('every top-level settings key: a wrong-typed value is a 400 and nothing changes; a valid one is saved as typed', async () => {
+  assert.deepEqual(Object.keys(TOP_LEVEL).sort(), Object.keys(D).sort(), 'the table covers every settings key');
+  for (const [key, {bad, good}] of Object.entries(TOP_LEVEL)) {
+    const h = harness({reviewLocal: true, localLlmBaseUrl: 'http://127.0.0.1:1/v1', localLlmModel: 'm'});
+    const live = structuredClone(h.state.settings);
+    for (const value of bad) {
+      const res = await h.post({[key]: value});
+      assert.equal(res.status, 400, `${key}=${JSON.stringify(value)} must be rejected`);
+      assert.equal((await res.json()).ok, false);
+      assert.deepEqual(h.state.settings, live, `${key}=${JSON.stringify(value)}: live settings unchanged`);
+    }
+    assert.equal(h.saves.length, 0, `${key}: nothing persisted`);
+    const res = await h.post({[key]: good});
+    assert.equal(res.status, 200, `${key}=${JSON.stringify(good)} is valid`);
+    const want = key === 'fixAgent' ? {...live.fixAgent, ...good} : good;
+    assert.deepEqual(h.state.settings[key], want, `${key}: saved as typed`);
+  }
+});
+
+test('an unknown or read-only field is a 400 (never silently dropped)', async () => {
+  const h = harness();
+  const live = structuredClone(h.state.settings);
+  for (const body of [{maxInlinecomments: 3}, {localLlmApiKeySet: true}, {webhookSecretSet: false}, {fixAgentEnabled: true}, {username: 'ok', bogus: 1}]) {
+    const res = await h.post(body);
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.match((await res.json()).error, /is not a writable settings field/);
+  }
+  assert.deepEqual(h.state.settings, live);
+  assert.equal(h.saves.length, 0);
+});
+
+test('secrets: a non-string is a 400; blank, whitespace-only or masked keeps the stored secret; a new string replaces it', async () => {
+  const h = harness({webhookSecret: 'stored-hook', localLlmApiKey: 'sk-stored'});
+  for (const value of [null, 0, false, ['sk'], {}]) {
+    for (const key of ['webhookSecret', 'localLlmApiKey']) {
+      const res = await h.post({[key]: value});
+      assert.equal(res.status, 400, `${key}=${JSON.stringify(value)}`);
+      assert.match((await res.json()).error, /must be a string/);
+    }
+  }
+  assert.equal(h.saves.length, 0);
+  for (const value of ['', '   ', types.SECRET_MASK]) {
+    assert.equal((await h.post({webhookSecret: value, localLlmApiKey: value})).status, 200, JSON.stringify(value));
+    assert.equal(h.state.settings.webhookSecret, 'stored-hook', `webhookSecret=${JSON.stringify(value)} keeps the stored one`);
+    assert.equal(h.state.settings.localLlmApiKey, 'sk-stored');
+  }
+  assert.equal((await h.post({webhookSecret: ' fresh ', localLlmApiKey: 'sk-fresh'})).status, 200);
+  assert.equal(h.state.settings.webhookSecret, 'fresh');
+  assert.equal(h.state.settings.localLlmApiKey, 'sk-fresh');
 });
 
 test('enabling a legacy delivery is rejected (400): the API refuses what the runtime could not run', async () => {
@@ -113,4 +187,48 @@ test('a save whose JSON store cannot be written fails (500), both for enable and
     assert.deepEqual(h.state.settings, before, 'the live settings did not change');
     assert.deepEqual((await h.get()).fixAgent, before.fixAgent, 'the next GET reads the last successful save');
   }
+});
+
+// Load (a stored document or an env seed) normalizes INTO the save domain: whatever it yields, a
+// save accepts, so an unrelated save never fails on a stored value the operator did not touch.
+const STORED = [
+  {fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'chat-push'}}, // a pre-#77 save
+  {fixAgent: {enabled: true, provider: 'coding-agent', delivery: 'coding-agent'}},
+  {fixAgent: {enabled: true, provider: null}},
+  {fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply', timeoutMs: 90_000.7, chatTimeoutMs: 1, roundCap: 1e9}},
+  {maxTurns: 2.5, exploreTurns: -3, maxInlineComments: 99.9, localReviewMaxTokens: 0, contextPadLines: 1e300, promptDiffMaxChars: -1},
+  {username: '  ', mention: ['', 42, ' @x '], reviewOrder: ['grok', 'bogus'], chatgptReasoning: 'turbo', localReviewMode: 'x', publishMinSeverity: 'P7'},
+  {reviewChatgpt: false, reviewGrok: false, reviewLocal: false},
+  'not an object', null, [],
+];
+
+test('what load yields (disk or env seed), a save accepts: an unrelated save succeeds and keeps it', async () => {
+  const rules = await import('../../src/lib/settings-rules.ts');
+  for (const stored of STORED) {
+    const h = harness(stored);
+    assert.equal(rules.settingsProblem(h.state.settings), null, `loaded ${JSON.stringify(stored)} is save-valid`);
+    const before = structuredClone(h.state.settings);
+    const res = await h.post({skipDrafts: !before.skipDrafts});
+    assert.equal(res.status, 200, `unrelated save over ${JSON.stringify(stored)}: ${JSON.stringify(await res.clone().json())}`);
+    assert.deepEqual(h.state.settings, {...before, skipDrafts: !before.skipDrafts}, 'only the touched field changed');
+  }
+  // The loop stays OFF by default and for every non-runnable stored switch.
+  assert.equal(harness().state.settings.fixAgent.enabled, false);
+  for (const stored of STORED.slice(0, 3)) assert.equal(harness(stored).state.settings.fixAgent.enabled, false, JSON.stringify(stored));
+  assert.equal(harness(STORED[3]).state.settings.fixAgent.enabled, true, 'a runnable stored switch stays ON');
+});
+
+test('env seed: every whole-number env knob loads into the save domain', async (t) => {
+  const {overlayEnv, sanitizeBotSettings} = await import('../../src/lib/settings.server.ts');
+  const rules = await import('../../src/lib/settings-rules.ts');
+  const env = {ASHLAR_MAX_TURNS: '2.5', ASHLAR_EXPLORE_TURNS: '-1', ASHLAR_MAX_INLINE_COMMENTS: '50', ASHLAR_LOCAL_REVIEW_MAX_TOKENS: '0',
+    ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS: '0.5', ASHLAR_PROMPT_DIFF_MAX_CHARS: '-5', ASHLAR_CONTEXT_PAD_LINES: '1e400',
+    ASHLAR_FIX_TIMEOUT_MS: '90000.5', ASHLAR_FIX_PARALLEL_PRS: '0'};
+  const prev = Object.fromEntries(Object.keys(env).map(k => [k, process.env[k]]));
+  t.after(() => { for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  Object.assign(process.env, env);
+  const seeded = sanitizeBotSettings(overlayEnv({}));
+  assert.equal(rules.settingsProblem(seeded), null, JSON.stringify(seeded));
+  assert.equal(seeded.maxTurns, 2);
+  assert.equal(seeded.fixAgent.timeoutMs, 90_000);
 });

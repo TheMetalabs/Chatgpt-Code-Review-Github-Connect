@@ -16,6 +16,7 @@ import {
   completeBridgeFix,
   completeBridgeJob,
   failBridgeProvider,
+  fixOperationRefused,
   getBridgePublic,
   getBridgeStatus,
   isBridgeFixId,
@@ -69,6 +70,10 @@ export const Route = createFileRoute("/api/bridge")({
         }
         bridgeHeartbeat();
         const jobId = new URL(request.url).searchParams.get("jobId");
+        // A fix item's prompt is served only to a worker that opted into fix items.
+        if (fixOperationRefused(jobId, new URL(request.url).searchParams.get("fixProtocol") === "1" ? 1 : undefined)) {
+          return Response.json({ ok: false, code: "fix_protocol_required", error: "fix items need fixProtocol:1" }, { status: 409, headers });
+        }
         if (jobId) {
           const prompt = promptsForClient(promptForJob(jobId), new URL(request.url).searchParams.get("attachmentProtocol") === "2" ? 2 : 1);
           if (!prompt) return Response.json({ ok: false, error: "no prompt" }, { status: 404, headers });
@@ -113,6 +118,11 @@ export const Route = createFileRoute("/api/bridge")({
           return Response.json({ ok: false, error: "bad token" }, { status: 401, headers });
         }
         bridgeHeartbeat(body.workerStatus, body.extensionVersion);
+        // One gate for every operation on a fix item (see fixOperationRefused): an un-opted worker
+        // never claims, pings, reads, reports on, releases, fails or completes one.
+        if (fixOperationRefused(body.jobId, body.fixProtocol)) {
+          return Response.json({ ok: false, code: "fix_protocol_required", error: "fix items need fixProtocol:1" }, { status: 409, headers });
+        }
         if (body.action === "rotate") {
           return Response.json({ ok: true, token: rotateBridgeToken().token, bridge: getBridgePublic() }, { headers });
         }
@@ -170,7 +180,7 @@ export const Route = createFileRoute("/api/bridge")({
         }
         if (body.action === "recover") {
           return Response.json({ok:true,bridge:getBridgePublic(),job:promptsForClient(
-            recoverBridgeJob(String(body.clientId || ""),body.bindings),body.attachmentProtocol)}, {headers});
+            recoverBridgeJob(String(body.clientId || ""),body.bindings,{ fixes: body.fixProtocol === 1 }),body.attachmentProtocol)}, {headers});
         }
         if (body.action === "take") {
           return Response.json({ ok: true, bridge: getBridgePublic(), job: promptsForClient(takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : [], { fixes: body.fixProtocol === 1 }), body.attachmentProtocol) }, { headers });

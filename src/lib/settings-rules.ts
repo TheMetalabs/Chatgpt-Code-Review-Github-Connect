@@ -11,6 +11,9 @@
  * - settingsProblem(raw) / fixAgentProblem(raw) return null when a save is valid, else the message
  *   the operator sees. A field that is ABSENT keeps its default (programmatic partial patches); a
  *   field that is PRESENT must be valid — nothing is silently clamped or rewritten on save.
+ * - SETTINGS_FIELD_RULES has one rule per writable BotSettings field (the type forces a new field
+ *   to get one). The Settings API route passes every supplied field RAW to validatedSettingsPatch:
+ *   an unknown / read-only field or an invalid value is a 400; the route prefilters nothing.
  * - enabled=true requires a WIRED provider AND a WIRED delivery the provider supports
  *   (fixLoopRunnable). loopEnabled in the runtime uses the same predicate, so a hand-edited or
  *   env-seeded non-wired pair also stays OFF at run time (fails closed).
@@ -18,11 +21,14 @@
  * fail-closed); I/O; per-request provider behaviour beyond the capability table below.
  */
 import {
+  DEFAULT_REVIEW_ORDER,
   FIX_AGENT_KNOBS,
   FIX_AGENT_PROVIDERS,
   FIX_DELIVERIES,
   FIX_MODES,
+  LOCAL_REVIEW_MODES,
   fixKnob,
+  isMaskedSecret,
   providersFromSettings,
   type BotSettings,
   type FixAgentKnob,
@@ -31,6 +37,7 @@ import {
   type FixDelivery,
   type FixMode,
 } from "./types.ts";
+import { CHATGPT_REASONING, GROK_REASONING } from "./reasoning.ts";
 
 /** Per-provider facts every fix-agent decision reads (design §6b): the Settings rules, the loop
  * runtime's transport routing (productionRequestFix), and the fix watcher's deadlines
@@ -107,8 +114,64 @@ export function fixLoopOn(fix: Partial<FixAgentSettings> | undefined): boolean {
   return fix?.enabled === true && fixLoopRunnable(fix as FixAgentSettings);
 }
 
+/** How a whole-number setting is edited on the Settings screen. "minutes": stored in ms, edited
+ * in minutes. */
+export type FormUnit = "count" | "minutes" | "chars";
+
+export const MS_PER_MINUTE = 60_000;
+
+/** A whole-number setting's ONE validity domain: an integer in [min, max] (ms for a "minutes"
+ * field). The same domain holds at every boundary: the env seed and load normalize into it
+ * (fixKnob / sanitizeBotSettings), and an API save and a UI save are validated against it (this
+ * module), so a value one layer stores is a value every other layer accepts. */
+export interface IntDomain {
+  min: number;
+  max: number;
+  unit: FormUnit;
+}
+
+/** The input a Settings field renders, derived from its domain (never written by hand in the
+ * page): min / max in form units, and the step. A "minutes" input takes ANY number of minutes
+ * (step "any") because a server-valid value need not be a whole minute (90000 ms = 1.5 min); the
+ * page's own check (the shared rules below) then requires the ms value to be whole. Every other
+ * field steps by 1 (whole numbers only, the same as the server). */
+export interface FormInputAttrs {
+  min: number;
+  max: number;
+  step: number | "any";
+  unit: FormUnit;
+}
+
+export function formAttrs(d: IntDomain): FormInputAttrs {
+  return { min: toForm(d.unit, d.min), max: toForm(d.unit, d.max), step: d.unit === "minutes" ? "any" : 1, unit: d.unit };
+}
+
+/** Stored value -> the value the input shows. */
+export function toForm(unit: FormUnit, v: number): number {
+  return unit === "minutes" ? v / MS_PER_MINUTE : v;
+}
+
+/** The input's value -> the stored value. Minutes -> ms is EXACT for every whole-ms value: the
+ * float noise of the conversion (1.0000166666666666 min x 60000) is rounded away, but a value
+ * that is not a whole number of ms (1.00001 min) stays fractional, so the shared rule rejects it
+ * exactly as the server would. NaN (an empty input) stays NaN (rejected). */
+export function fromForm(unit: FormUnit, v: number): number {
+  if (unit !== "minutes") return v;
+  const ms = v * MS_PER_MINUTE;
+  const whole = Math.round(ms);
+  return Math.abs(ms - whole) < 1e-6 ? whole : ms;
+}
+
+/** Why `v` is outside the domain (null = valid). */
+export function intProblem(label: string, d: IntDomain, v: unknown): string | null {
+  if (typeof v === "number" && Number.isInteger(v) && v >= d.min && v <= d.max) return null;
+  return d.unit === "minutes"
+    ? `${label} must be a whole number of milliseconds, from ${toForm(d.unit, d.min)} to ${toForm(d.unit, d.max)} minutes`
+    : `${label} must be a whole number from ${d.min} to ${d.max}`;
+}
+
 /** Numeric fix-agent fields as the Settings screen shows them (ms values are edited in minutes). */
-export const FIX_KNOB_FIELDS: readonly { key: FixAgentKnob; label: string; unit: "count" | "minutes" | "chars" }[] = [
+export const FIX_KNOB_FIELDS: readonly { key: FixAgentKnob; label: string; unit: FormUnit }[] = [
   { key: "parallelPrs", label: "fix_agent.parallel_prs", unit: "count" },
   { key: "roundCap", label: "fix_agent.round_cap", unit: "count" },
   { key: "attempts", label: "fix_agent.attempts", unit: "count" },
@@ -118,12 +181,18 @@ export const FIX_KNOB_FIELDS: readonly { key: FixAgentKnob; label: string; unit:
   { key: "chatMaxPromptChars", label: "fix_agent.chat_max_prompt_chars", unit: "chars" },
 ];
 
+/** A fix-agent knob's domain (bounds from FIX_AGENT_KNOBS, the runtime's own clamp). */
+export function fixKnobDomain(key: FixAgentKnob): IntDomain {
+  const k = FIX_AGENT_KNOBS[key];
+  return { min: k.min, max: k.max, unit: FIX_KNOB_FIELDS.find((f) => f.key === key)?.unit ?? "count" };
+}
+
 export function toFormUnit(key: FixAgentKnob, v: number): number {
-  return FIX_KNOB_FIELDS.find((f) => f.key === key)?.unit === "minutes" ? v / 60_000 : v;
+  return toForm(fixKnobDomain(key).unit, v);
 }
 
 export function fromFormUnit(key: FixAgentKnob, v: number): number {
-  return FIX_KNOB_FIELDS.find((f) => f.key === key)?.unit === "minutes" ? v * 60_000 : v;
+  return fromForm(fixKnobDomain(key).unit, v);
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === "object" && !Array.isArray(v);
@@ -143,10 +212,8 @@ export function fixAgentProblem(raw: unknown): string | null {
   for (const f of FIX_KNOB_FIELDS) {
     const v = raw[f.key];
     if (v === undefined) continue;
-    const k = FIX_AGENT_KNOBS[f.key];
-    if (typeof v !== "number" || !Number.isInteger(v) || v < k.min || v > k.max) {
-      return `${f.label} must be a whole number from ${toFormUnit(f.key, k.min)} to ${toFormUnit(f.key, k.max)}`;
-    }
+    const problem = intProblem(f.label, fixKnobDomain(f.key), v);
+    if (problem) return problem;
   }
   const provider = (raw.provider ?? null) as FixAgentProvider | null;
   const delivery = (raw.delivery ?? "script-apply") as FixDelivery;
@@ -167,12 +234,101 @@ export function fixAgentProblem(raw: unknown): string | null {
 
 export const NO_REVIEWER_PROBLEM = "enable ChatGPT, Grok, or a local URL+model";
 
+/** Every BotSettings field a save may write (the derived *Set flags are read-only). */
+export type SettingsField = Exclude<keyof BotSettings, "localLlmApiKeySet" | "webhookSecretSet">;
+
+type Rule = (v: unknown) => string | null;
+
+const MAX_INT = Number.MAX_SAFE_INTEGER;
+
+/** Whole-number top-level settings: their ONE domain (load clamps into it, saves validate it). */
+export const SETTINGS_INT_FIELDS = {
+  maxInlineComments: { label: "max_inline_comments", min: 0, max: 20, unit: "count" },
+  maxTurns: { label: "max_turns", min: 0, max: 1000, unit: "count" },
+  exploreTurns: { label: "explore_turns", min: 0, max: 1000, unit: "count" },
+  localReviewMaxTokens: { label: "local_review.max_tokens", min: 1, max: MAX_INT, unit: "count" },
+  localReviewSingleTurnMaxTokens: { label: "local_review.single_turn_max_tokens", min: 1, max: MAX_INT, unit: "count" },
+  promptDiffMaxChars: { label: "prompt.diff_max_chars", min: 0, max: MAX_INT, unit: "chars" },
+  promptContextMaxChars: { label: "prompt.context_max_chars", min: 0, max: MAX_INT, unit: "chars" },
+  promptPolicyMaxChars: { label: "prompt.policy_max_chars", min: 0, max: MAX_INT, unit: "chars" },
+  contextPadLines: { label: "prompt.context_pad_lines", min: 0, max: MAX_INT, unit: "count" },
+} as const satisfies Partial<Record<SettingsField, IntDomain & { label: string }>>;
+
+export type SettingsIntField = keyof typeof SETTINGS_INT_FIELDS;
+
+/** Load-time normalization INTO the domain (a stored / env-seeded value; never used on a save):
+ * non-numeric -> `def`, else floored and clamped. */
+export function clampInt(d: IntDomain, v: unknown, def: number): number {
+  if (typeof v !== "number" || !Number.isFinite(v)) return def;
+  return Math.min(d.max, Math.max(d.min, Math.floor(v)));
+}
+
+const bool = (label: string): Rule => (v) => (typeof v === "boolean" ? null : `${label} must be true or false`);
+const text = (label: string): Rule => (v) => (typeof v === "string" ? null : `${label} must be a string`);
+const nonBlank = (label: string): Rule => (v) => (typeof v === "string" && v.trim() ? null : `${label} must be a non-empty string`);
+const oneOf = (label: string, values: readonly unknown[]): Rule => (v) => (values.includes(v) ? null : `${label} must be one of: ${values.join(", ")}`);
+const int = (key: SettingsIntField): Rule => (v) => intProblem(SETTINGS_INT_FIELDS[key].label, SETTINGS_INT_FIELDS[key], v);
+const SEVERITIES = ["P0", "P1", "P2"] as const;
+
+/** One rule per writable field. `Record<SettingsField, Rule>` makes a new BotSettings field a type
+ * error here until it has a rule, so no field can reach the store unvalidated. */
+export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
+  username: nonBlank("bot.username"),
+  mention: (v) =>
+    Array.isArray(v) && v.length > 0 && v.every((m) => typeof m === "string" && m.trim())
+      ? null
+      : "mentions must be a non-empty list of non-blank strings",
+  skipForks: bool("skip_forks"),
+  skipDrafts: bool("skip_drafts"),
+  maxInlineComments: int("maxInlineComments"),
+  maxTurns: int("maxTurns"),
+  exploreTurns: int("exploreTurns"),
+  publishMinSeverity: oneOf("publish_min_severity", SEVERITIES),
+  requestChangesMin: oneOf("request_changes_min", SEVERITIES),
+  precisionOverRecall: bool("precision_over_recall"),
+  webhookSecret: text("github.webhook_secret"),
+  reviewChatgpt: bool("review_chatgpt"),
+  reviewGrok: bool("review_grok"),
+  reviewLocal: bool("review_local"),
+  fixAgent: fixAgentProblem,
+  localJsonRepairEnabled: bool("local_json_repair_enabled"),
+  chatgptReasoning: oneOf("chatgpt_reasoning", CHATGPT_REASONING),
+  grokReasoning: oneOf("grok_reasoning", GROK_REASONING),
+  localLlmBaseUrl: text("local_llm.base_url"),
+  localLlmApiKey: text("local_llm.api_key"),
+  localLlmModel: text("local_llm.model"),
+  localReviewMaxTokens: int("localReviewMaxTokens"),
+  localReviewMode: oneOf("local_review.mode", LOCAL_REVIEW_MODES),
+  localReviewSingleTurnMaxTokens: int("localReviewSingleTurnMaxTokens"),
+  reviewOrder: (v) =>
+    Array.isArray(v) && v.length === DEFAULT_REVIEW_ORDER.length && DEFAULT_REVIEW_ORDER.every((p) => v.includes(p))
+      ? null
+      : `false_positive_check_order must list each of ${DEFAULT_REVIEW_ORDER.join(", ")} exactly once`,
+  promptDiffMaxChars: int("promptDiffMaxChars"),
+  promptContextMaxChars: int("promptContextMaxChars"),
+  promptPolicyMaxChars: int("promptPolicyMaxChars"),
+  contextPadLines: int("contextPadLines"),
+};
+
+export const SETTINGS_FIELDS = Object.keys(SETTINGS_FIELD_RULES) as SettingsField[];
+
+/** Secret fields: a blank or masked value in a patch means "keep the stored secret" (the screen
+ * shows a mask and "Blank keeps the stored key"); any other string replaces it (trimmed). A
+ * non-string is invalid like any other field. */
+export const SECRET_FIELDS: readonly SettingsField[] = ["webhookSecret", "localLlmApiKey"];
+
 /** Why these settings cannot be saved (null = valid). `raw` is the full document about to be
- * saved (the live settings with the operator's patch merged over them), before normalization. */
+ * saved (the live settings with the operator's patch merged over them), before normalization.
+ * Every present field is checked by its rule; unknown keys (e.g. the read-only *Set flags the
+ * screen's draft carries) are not part of a document's validity — a PATCH with one is rejected by
+ * validatedSettingsPatch. */
 export function settingsProblem(raw: Partial<BotSettings> | Record<string, unknown>): string | null {
   const r = raw as Record<string, unknown>;
-  const fix = fixAgentProblem(r.fixAgent);
-  if (fix) return fix;
+  for (const key of SETTINGS_FIELDS) {
+    if (r[key] === undefined) continue;
+    const problem = SETTINGS_FIELD_RULES[key](r[key]);
+    if (problem) return problem;
+  }
   if (!providersFromSettings(r as unknown as BotSettings).length) return NO_REVIEWER_PROBLEM;
   return null;
 }
@@ -190,9 +346,29 @@ export class SettingsError extends Error {
 
 /** The document a Settings patch would save: the patch merged over the live settings, checked by
  * settingsProblem BEFORE any normalization (a rejected value is never clamped into a valid one).
- * Throws SettingsError 400; the caller normalizes, persists, then swaps its live settings. */
-export function validatedSettingsPatch<T extends object>(current: T, patch: Partial<T>): T {
-  const merged = { ...current, ...patch };
+ * `patch` is taken RAW (the Settings API passes the request's fields untouched): an unknown or
+ * read-only field is rejected, a secret follows SECRET_FIELDS, a fixAgent object is a partial
+ * merged over the live one, and anything else — a non-object fixAgent included — is validated as
+ * supplied. Throws SettingsError 400; the caller normalizes, persists, then swaps its live settings. */
+export function validatedSettingsPatch<T extends object>(current: T, patch: Partial<T> | Record<string, unknown>): T {
+  const next: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (!(SETTINGS_FIELDS as readonly string[]).includes(key)) throw new SettingsError(`${key} is not a writable settings field`, 400);
+    if (value === undefined) continue; // absent: a programmatic partial patch
+    if (SECRET_FIELDS.includes(key as SettingsField)) {
+      const problem = SETTINGS_FIELD_RULES[key as SettingsField](value);
+      if (problem) throw new SettingsError(problem, 400);
+      const secret = (value as string).trim();
+      if (secret && !isMaskedSecret(secret)) next[key] = secret;
+      continue;
+    }
+    next[key] = value;
+  }
+  if (isObject(next.fixAgent)) {
+    const live = (current as { fixAgent?: unknown }).fixAgent;
+    next.fixAgent = { ...(isObject(live) ? live : {}), ...next.fixAgent };
+  }
+  const merged = { ...current, ...next };
   const problem = settingsProblem(merged as Record<string, unknown>);
   if (problem) throw new SettingsError(problem, 400);
   return merged;

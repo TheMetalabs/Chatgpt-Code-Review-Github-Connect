@@ -145,10 +145,12 @@ async function api(path, body, expectedOrigin, signal) {
     // Browser/network failures retain the outbox; separate per-job/heartbeat lanes
     // keep unrelated work moving. Server ACK is independent of publication below.
     // A caller MAY pass a signal to cancel (e.g. the periodic sweep's watchdog); normal callers omit it.
-    res = await fetch(`${origin}${path}`, {
+    // fixProtocol:1 on EVERY bridge request: this worker handles review-loop fix items, and the
+    // server refuses every fix operation (and skips fix recovery) without it. Review requests ignore it.
+    res = await fetch(body ? `${origin}${path}` : `${origin}${path}${path.includes("?") ? "&" : "?"}fixProtocol=1`, {
       method: body ? "POST" : "GET",
       headers: {"content-type": "application/json", "x-ashlar-bridge-token": token},
-      body: body ? JSON.stringify({...body, token}) : undefined,
+      body: body ? JSON.stringify({...body, fixProtocol: 1, token}) : undefined,
       signal,
     });
   } catch (cause) {
@@ -730,20 +732,14 @@ function onAllocationPage(url, provider) {
   return samePage(url, providerUrl(provider));
 }
 
-/** A bare provider new-chat page (root path, no query) names no conversation yet (json.js). */
-function provisionalConversation(identity) {
-  return /^https?:\/\/[^/?#]+\/?$/.test(identity);
-}
-
-/** Keep the conversation a run (review or fix) was bound in, as its page pinned it in the submission journal
- * when the sent turn was first proven exact: stored once and never replaced (except the page's one
- * upgrade from a bare new-chat page to the conversation URL the provider assigned), so a later
- * reply (or the tab's URL) is compared with it, never with a URL echoed by the same reply. True if
- * the stored identity changed. */
+/** Keep the conversation a run (review or fix) was bound in, as its page pinned it in the
+ * submission journal when the sent turn was first proven exact: stored ONCE and never replaced (no
+ * location-based upgrade: a later URL is no evidence of whose conversation it is), so a later reply
+ * (or the tab's URL) is compared with it, never with a URL echoed by the same reply. True if it was
+ * stored now. */
 function adoptFixConversation(state, result) {
   const seen = typeof result?.conversation === "string" && result.conversation.length <= 4096 ? result.conversation : "";
-  if (!seen || seen === state.conversation) return false;
-  if (state.conversation && !(provisionalConversation(state.conversation) && !provisionalConversation(seen))) return false;
+  if (!seen || state.conversation) return false;
   state.conversation = seen;
   return true;
 }
@@ -803,12 +799,13 @@ function abandonLegs(job, providers, status) {
   }
 }
 
-/** The ownership verdict in a page reply: a verdict reply (ownership) as is; a fix reply of an
- * earlier page by its `owned`; an older page's can-close by canClose / reason. */
-function tabVerdict(result) {
+/** The ownership verdict in a page reply: a verdict reply (ownership) as is; a cancel reply of an
+ * earlier page by its `owned`; an older page's review can-close by canClose / reason. A fix page
+ * always states its verdict: a fix can-close without one is not permission to close. */
+function tabVerdict(result, kind) {
   if (typeof result?.ownership === "string") return result;
   if (typeof result?.owned === "boolean") return {...result, ownership: result.owned ? "owned" : "takenOver"};
-  if (result?.canClose === true) return {...result, ownership: "owned", legacyReply: true};
+  if (result?.canClose === true && kind !== "fix") return {...result, ownership: "owned", legacyReply: true};
   return {...result, ownership: result?.reason === "repurposed" ? "takenOver" : "unknown"};
 }
 
@@ -821,7 +818,9 @@ function tabVerdict(result) {
  * another binding is never closed nor told to release. */
 async function forceCloseFixTab(job, provider, jobs, tab) {
   const state = job.states[provider];
-  const cancelled = abandonedLeg(job, state);
+  // A fix whose run failed (quota, an error) has no answer to show for it either: its page is asked
+  // with the cancel exit too (it also stops whatever that run still does).
+  const cancelled = abandonedLeg(job, state) || (job.kind === "fix" && state.outcome?.ok !== true);
   if (tab.status && tab.status !== "complete") {
     // A loading or discarded tab cannot answer for itself (and is not woken up to do so).
     cleanupWaiting(job, provider, tab.discarded || tab.status === "unloaded" ? "tab_discarded" : "tab_loading");
@@ -831,9 +830,9 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   // unbound tab (Ashlar's only while it holds no turn and no draft).
   const undispatched = cancelled && !state.started;
   if (!undispatched) {
-    // The tab's own URL first: the conversation the run was bound in (a bare new-chat page names
-    // none yet), else the page where this run last answered.
-    const known = (state.conversation && !provisionalConversation(state.conversation) ? state.conversation : "") || state.pageUrl;
+    // The tab's own URL first: the conversation the run was bound in, else the page where this run
+    // last answered.
+    const known = state.conversation || state.pageUrl;
     if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
   }
   const message = {...tabMessage(job, provider, cancelled ? "ashlar-fix-cancel" : "ashlar-can-close"),
@@ -855,7 +854,7 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   }
   // The page's own steps (context_changed, cancelled, ...) reach history from cleanup replies too.
   ingestPageProgress(state, result);
-  const verdict = tabVerdict(result);
+  const verdict = tabVerdict(result, job.kind);
   if (verdict.ownership === "unknown") {
     // Another conversation than the one the run was bound in (an in-page move can leave the old DOM
     // on screen): the user's, and waiting cannot change a pinned identity.
@@ -1085,6 +1084,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   await rememberOwnedTab(job, provider);
   delete state.connectionError;
   if (isBusyResult(result)) return;
+  // A fix answer is taken only with the page's positive ownership verdict for it (json.js
+  // fixAnswerReply: the full proof, re-established when the answer is handed out).
+  if (job.kind === "fix" && result?.ok && result.ownership !== "owned") return;
   if (result?.ok && typeof result.raw === "string" && result.raw.trim()) {
     state.outcome = { ok: true, raw: result.raw, originalText:typeof result.responseText==="string"?result.responseText:undefined,
       completion:typeof result.completion?.responseId === "string" && typeof result.completion?.context === "string"

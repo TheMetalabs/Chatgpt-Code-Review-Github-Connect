@@ -7,7 +7,8 @@
  *   I3 closed outcome — each entry point reports the outcome the cell implies;
  *   I4 reconcile — a row that shows up later confirms the write: one event, no leftover stand-in;
  *   I5 read-your-writes — the loop acts on its own write before the list shows it;
- *   I6 a newer session is never ended by an older record.
+ *   I6 a newer session is never ended by an older record — also one started in the same second
+ *      as the older write's POST (GitHub orders events at one-second resolution).
  * One table instead of one test per bug: each review round found another cell of this space.
  */
 import { describe, it } from "node:test";
@@ -48,6 +49,8 @@ const ALICE_AT = "2026-02-20T00:00:00Z"; // alice's start directive; review roun
 const ENV = { ASHLAR_FIX_AGENT: "1", ASHLAR_LOOP_ROUND_CAP: "5" } as NodeJS.ProcessEnv;
 const EDIT = '{"summary":"guard removed","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}';
 const iso = (ms: number) => new Date(ms).toISOString();
+/** GitHub's one-second resolution (rows and webhook event times). */
+const second = (ms: number) => iso(Math.floor(ms / 1000) * 1000);
 const reviewDay = (i: number) => iso(Date.parse("2026-02-21T00:00:00Z") + i * 86_400_000);
 
 // Reason strings the classifier keys on (the runtime keeps them private).
@@ -67,7 +70,7 @@ type Via =
   | "handoff:terminal";
 type Write = "success" | "rejected" | "unknown-landed" | "unknown-lost";
 type List = "normal" | "lagging" | "failing";
-type Later = "redelivery" | "newer-start" | "25h" | "row-appears";
+type Later = "redelivery" | "newer-start" | "same-second-start" | "25h" | "row-appears";
 type Phase = "call" | "view" | "again" | "follow";
 type Cell = { via: Via; write: Write; list: List; later: Later };
 type Result = ControlResult | LoopStepResult;
@@ -88,9 +91,15 @@ const VIAS: Via[] = [
 ];
 const WRITES: Write[] = ["success", "rejected", "unknown-landed", "unknown-lost"];
 const LISTS: List[] = ["normal", "lagging", "failing"];
-const LATERS: Later[] = ["redelivery", "newer-start", "25h", "row-appears"];
+const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
+/** A later event that means nothing for a path is not a cell: a newer start in the same second as
+ * the POST matters only where the write is stamped at its attempt (a continuation or handoff). */
+function applies(via: Via, later: Later): boolean {
+  if (later === "same-second-start") return kindOf(via) === "continue" || kindOf(via) === "handoff";
+  return true;
+}
 /** The head a continuation under test is for. */
 const CONTINUE_HEAD: Partial<Record<Via, string>> = {
   "continue:push": PUSHED,
@@ -164,6 +173,8 @@ class World {
   readonly underTest: Phase[] = [];
   rowsForWrite = 0;
   carolAt?: string;
+  /** When the write under test first left (its attempt instant). */
+  firstAttemptMs?: number;
   committed = false;
   private nextId = 1;
   private lagFrom = Infinity;
@@ -179,6 +190,7 @@ class World {
     this.pr = pr;
     this.ref = { owner: "o", repo: "r", pr };
     const { via } = cell;
+    if (this.sameSecond()) this.clock = T0 + 250; // a sub-second clock: attempts are not on a second boundary
     if (kindOf(via) !== "start") this.store(BOT, startComment({ mode: this.mode(), by: "alice", at: ALICE_AT }), ALICE_AT);
     const rounds = via === "handoff:stuck" ? [5, 4, 3, 2, 2, 2] : [3];
     rounds.forEach((total, i) => this.reviews.push({ head: i === rounds.length - 1 ? HEAD : String(i).repeat(40), total, at: reviewDay(i) }));
@@ -219,6 +231,12 @@ class World {
     // The control-write clock (a non-literal object, so this compiles before the field exists).
     const clock = { now: () => this.clock };
     this.deps = Object.assign(base, clock);
+  }
+
+  /** GitHub stamps a row in the second its request left (not a second later), and carol's newer
+   * start is in that same second: only GitHub's 1 s resolution orders the two. */
+  sameSecond(): boolean {
+    return this.cell.later === "same-second-start";
   }
 
   mode(): "suggest" | "apply" {
@@ -279,10 +297,14 @@ class World {
   }
 
   private async create(body: string) {
+    const sentAt = this.clock;
     this.clock += 1_000; // GitHub stamps the row after the request left
-    const at = iso(this.clock);
+    const at = this.sameSecond() ? second(sentAt) : iso(this.clock);
     if (!this.underTestPost(body)) return this.store(BOT, body, at);
-    if (this.underTest.length === 0) this.outage();
+    if (this.underTest.length === 0) {
+      this.firstAttemptMs = sentAt;
+      this.outage();
+    }
     this.underTest.push(this.phase);
     const { write } = this.cell;
     if (write === "rejected") throw writeError("rejected", 422);
@@ -297,7 +319,11 @@ class World {
   private outage(): void {
     if (this.cell.list === "lagging") this.lagFrom = this.nextId;
     if (this.cell.list === "failing") this.failing = true;
-    if (this.cell.later === "newer-start" && this.cell.write !== "success") this.hook = () => this.injectCarol();
+    if (this.newerStart() && this.cell.write !== "success") this.hook = () => this.injectCarol();
+  }
+
+  newerStart(): boolean {
+    return this.cell.later === "newer-start" || this.sameSecond();
   }
 
   disarm(): void {
@@ -311,7 +337,9 @@ class World {
 
   async injectCarol(): Promise<void> {
     if (this.carolAt) return;
-    this.carolAt = iso(this.clock);
+    // carol's directive time: now, or — same-second — the second the write under test left in
+    // (her webhook is handled later, during the write's backoff or after the call)
+    this.carolAt = this.sameSecond() && this.firstAttemptMs !== undefined ? second(this.firstAttemptMs) : iso(this.clock);
     await startLoop("t", { ...this.ref, actor: "carol", mode: "suggest", at: this.carolAt }, settings("suggest"), this.deps, ENV);
   }
 
@@ -505,7 +533,7 @@ async function runCell(c: Cell, pr: number): Promise<void> {
     assert.equal(cls, expectFirst(c), `I3 first: ${JSON.stringify(first)}`);
     assertLogged(w, first, cls, "first");
     w.disarm();
-    if (c.later === "newer-start") {
+    if (w.newerStart()) {
       await w.injectCarol(); // a success had no backoff to inject it in
       await assertNewerSessionLives(w);
     } else {
@@ -535,6 +563,7 @@ describe("control writes: kind × write result × list read × later event (#79 
     for (const write of WRITES)
       for (const list of LISTS)
         for (const later of LATERS) {
+          if (!applies(via, later)) continue;
           const cell = { via, write, list, later };
           const pr = 1000 + row++;
           it(`${via} | ${write} | ${list} | ${later}`, () => runCell(cell, pr));

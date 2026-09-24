@@ -155,7 +155,8 @@ interface OwnWrite {
   /** Honored by the session fold before (and whatever) its POST: a stop from the first moment. */
   writeAhead: boolean;
   state: WriteState;
-  /** Taken immediately BEFORE each POST; frozen at the attempt whose outcome is unknown. */
+  /** Taken immediately BEFORE each POST (at GitHub's one-second resolution); frozen at the attempt
+   * whose outcome is unknown. */
   attemptAt?: string;
   /** The server's row (posted) or the listed one (confirmed). */
   row?: CreatedRow;
@@ -331,6 +332,14 @@ async function emitOnce(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
   }
 }
 
+/** An attempt instant at GitHub's one-second resolution. GitHub stamps rows and webhook event times
+ * in whole seconds, so a stand-in must tie with a same-second start exactly as its row would (the
+ * fold's tie-break then opens the newer session); a millisecond stamp would order it AFTER that
+ * start and end the newer session with an older session's handoff. */
+function attemptSecond(ms: number): string {
+  return new Date(Math.floor(ms / 1000) * 1000).toISOString();
+}
+
 function unknownOutcome(e: OwnWrite): EmitOutcome {
   return { status: "unknown", attemptAt: e.attemptAt ?? "", error: e.error ?? "the write's outcome is unknown" };
 }
@@ -362,7 +371,7 @@ async function send(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
     post: async () => {
       const w = e.write.body;
       body ??= typeof w === "string" ? w : await w();
-      e.attemptAt = new Date(ctx.now()).toISOString();
+      e.attemptAt = attemptSecond(ctx.now());
       e.state = "sending";
       try {
         e.row = await ctx.gh.createIssueComment(ctx.token, { ...where, body });

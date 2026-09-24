@@ -161,7 +161,12 @@ ashlar 자신의 파서는 마커가 **코멘트 맨 앞**에 있을 때만 신�
 3. **백그라운드 폴러로 대기**(기존 `poll-ashlar-convergence.py` 재사용). 재요청 스팸 금지.
 4. **fix 에이전트에 넘겨 수정**(프롬프트는 §6). 라운드 = **커밋 1개**.
 5. **라운드 검증**(§7 CI Quick / touched-file). push **1회**.
-6. **지적마다 in-thread에 수정 SHA 답글**(요약 코멘트는 미처리로 읽힘).
+6. **지적마다 in-thread에 수정 SHA 답글**(요약 코멘트는 미처리로 읽힘). 구현: fix 응답의 `dispositions`
+   (`F<n>`별 fixed/pushback/decline/defer + 한 문장)로, 게시된 인라인 지적 스레드마다 고정 형식 답글을 단다 —
+   applied면 `Fixed … in <sha7> (round k): <note>` 또는 `Processed … (no per-finding note)`, no-change면
+   pushback/decline/defer 사유. suggest는 답글 없음(아무것도 반영되지 않았으므로). 노트는 모델 텍스트라 마커
+   무력화·@멘션 무력화·한 줄화한다. 수정 대상은 **게시된(published) 지적만** — 정밀도 정책이 거른 지적은 사람이
+   본 적이 없으니 수정하지 않는다.
 7. **0-UNADDRESSED 게이트** 후 다음 라운드. 반복.
 8. **정지 조건 감지 시 §8 ESCALATE.**
 

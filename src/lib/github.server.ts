@@ -251,13 +251,19 @@ async function ghHttps(
   timeoutMs = 20_000,
 ): Promise<GhRes> {
   const p = path.startsWith("/") ? path : `/${path}`;
-  const resolved = await resolveGithubHost();
+  // A resolution failure happens before any request exists: nothing reached GitHub.
+  const resolved = await resolveGithubHost().catch((e: unknown) => {
+    throw new GithubTransportError(formatGithubError(e), false);
+  });
   try {
     return await ghCall(resolved, method, p, headers, body, timeoutMs);
   } catch (e) {
     clearResolvedCache();
     if (!mayResendOnOtherHost(method, e)) throw e;
-    const retry = await resolveGithubHost(true);
+    // The first attempt was a read or was never sent; a failed re-resolution reports that attempt.
+    const retry = await resolveGithubHost(true).catch(() => {
+      throw e;
+    });
     if (retry.hostname === resolved.hostname) throw e;
     return ghCall(retry, method, p, headers, body, timeoutMs);
   }
@@ -338,7 +344,7 @@ async function gh<T>(
   token: string,
   path: string,
   init?: { method?: string; body?: string; headers?: Record<string, string> },
-): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string }> {
+): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string; notSent?: boolean }> {
   let out: GhRes;
   try {
     out = await ghHttps(
@@ -351,7 +357,8 @@ async function gh<T>(
       init?.body,
     );
   } catch (e) {
-    return { ok: false, status: 0, text: formatGithubError(e) };
+    // notSent: the connection never came up, so the request cannot have reached GitHub
+    return { ok: false, status: 0, text: formatGithubError(e), notSent: e instanceof GithubTransportError && !e.requestSent };
   }
   if (out.status < 200 || out.status >= 300) return { ok: false, status: out.status, text: out.text.slice(0, 400) };
   return { ok: true, data: (out.text ? JSON.parse(out.text) : {}) as T };
@@ -632,7 +639,7 @@ export async function createPullReview(
     body: string;
     comments: PostedComment[];
   },
-): Promise<{ id: number }> {
+): Promise<{ id: number; inlineDropped: boolean }> {
   let comments = opts.comments;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
@@ -652,7 +659,8 @@ export async function createPullReview(
     });
     if (out.ok) {
       if (!out.data.id) throw new Error("review missing id");
-      return { id: out.data.id };
+      // true when GitHub refused an inline anchor and the review went out without ANY inline comment
+      return { id: out.data.id, inlineDropped: comments.length < opts.comments.length };
     }
     if (comments.length && isReviewLineError(out.text)) {
       comments = [];
@@ -873,6 +881,55 @@ export async function fetchPullHeadRef(
     additions: n(out.data.additions),
     deletions: n(out.data.deletions),
   };
+}
+
+/** The top-level inline comments of ONE posted review — the finding threads the loop replies to.
+ * Paginated; throws on a page error (a partial list would silently skip replies). */
+export async function listReviewThreadRoots(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  reviewId: number,
+): Promise<Array<{ id: number; path: string; line?: number; body: string }>> {
+  const rows = await ghListAll<{
+    id?: number;
+    path?: string | null;
+    line?: number | null;
+    original_line?: number | null;
+    body?: string | null;
+    in_reply_to_id?: number | null;
+  }>(token, `/repos/${owner}/${repo}/pulls/${pr}/reviews/${reviewId}/comments`);
+  return rows
+    .filter((c) => Number.isFinite(c.id) && !c.in_reply_to_id)
+    .map((c) => {
+      // The thread key is the line the comment was POSTED on (original_line): `line` follows later
+      // commits (a fix inserting a line above moves it) and goes null once outdated.
+      const line = c.original_line ?? c.line;
+      return { id: Number(c.id), path: String(c.path ?? ""), ...(Number.isFinite(line) ? { line: Number(line) } : {}), body: String(c.body ?? "") };
+    });
+}
+
+/** Reply inside an inline review thread (the per-finding disposition, design §5 step 6). */
+export async function replyToReviewComment(
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  commentId: number,
+  body: string,
+): Promise<void> {
+  const out = await gh(token, `/repos/${owner}/${repo}/pulls/${pr}/comments/${commentId}/replies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+  if (!out.ok) {
+    // retryable only when GitHub cannot have created the reply: the request never left (or a rate
+    // limit refused it). A 5xx or a lost response may have created it — a retry would duplicate it.
+    const retryable = (out.status === 0 && out.notSent === true) || out.status === 429;
+    throw Object.assign(new Error(`thread reply ${out.status}: ${out.text.slice(0, 160)}`), { retryable });
+  }
 }
 
 /** A user's repository permission (legacy `permission` field: admin | write | read | none —

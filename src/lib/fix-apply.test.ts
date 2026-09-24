@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isSafeFixPath, parseFixResponse } from "./fix-apply.ts";
+import { isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
 
 const ok = (raw: string) => {
   const r = parseFixResponse(raw);
@@ -35,6 +35,29 @@ describe("parseFixResponse", () => {
     assert.deepEqual(fix.files, []);
     assert.match(err('{"summary":"","files":[]}'), /no rationale/);
     assert.match(err('{"files":[]}'), /no rationale/);
+  });
+
+  it("a no-change round must classify EVERY listed finding (missing or malformed entries are retried)", () => {
+    const parse = (dispositions: string) => parseFixResponse(`{"summary":"nothing to change","files":[],"dispositions":${dispositions}}`, { findingCount: 2 });
+    const errOf = (r: ReturnType<typeof parse>) => (r.ok ? "" : r.error);
+    assert.match(errOf(parse("[]")), /no valid disposition with a note for F1, F2/);
+    assert.match(errOf(parse('[{"finding":"F1","action":"pushback","note":"n"}]')), /no valid disposition with a note for F2$/);
+    assert.match(errOf(parse('[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"bogus"}]')), /no valid disposition with a note for F2$/);
+    for (const note of ['', '"note":"",', '"note":"   ",']) {
+      const noReason = `[{"finding":"F1","action":"pushback","note":"n"},{${note}"finding":"F2","action":"decline"}]`;
+      assert.match(errOf(parse(noReason)), /with a note for F2$/, `F2 without a reason (${note || "no note"})`);
+    }
+    const full = parse('[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"defer","note":"#88"}]');
+    assert.ok(full.ok && full.fix.dispositions.length === 2);
+    // without a count (a caller that lists no findings) only the summary + no-"fixed" rules apply
+    assert.equal(parseFixResponse('{"summary":"s","files":[]}').ok, true);
+  });
+
+  it("rejects a no-change round that marks a finding fixed (nothing changed, so nothing was fixed)", () => {
+    const fixedNoFiles = '{"summary":"done","files":[],"dispositions":[{"finding":"F1","action":"fixed","note":"done"},{"finding":"F2","action":"pushback","note":"n"}]}';
+    assert.match(err(fixedNoFiles), /no files changed, yet F1 marked fixed/);
+    const declined = ok('{"summary":"false positive","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"n"}]}');
+    assert.deepEqual(declined.files, []);
   });
 
   it("rejects a sensitive repo-control path at the parser boundary (J6)", () => {
@@ -90,5 +113,45 @@ describe("isSafeFixPath", () => {
     for (const p of bad) assert.equal(isSafeFixPath(p), false, JSON.stringify(p));
     assert.equal(isSafeFixPath(undefined), false);
     assert.equal(isSafeFixPath("x".repeat(401)), false);
+  });
+});
+
+describe("dispositions (advisory per-finding verdicts for the thread replies)", () => {
+  it("are parsed alongside files and on a no-change round", () => {
+    const withFiles = parseFixResponse(
+      '{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":[{"finding":"F1","action":"fixed","note":"  guarded  "}]}',
+    );
+    assert.ok(withFiles.ok);
+    if (withFiles.ok) assert.deepEqual(withFiles.fix.dispositions, [{ finding: "F1", action: "fixed", note: "guarded" }]);
+    const none = parseFixResponse('{"summary":"all false positives","files":[],"dispositions":[{"finding":"F2","action":"pushback","note":"n"}]}');
+    assert.ok(none.ok);
+    if (none.ok) assert.equal(none.fix.dispositions[0].action, "pushback");
+  });
+
+  it("malformed entries are DROPPED, never a parse failure (they cannot gate a push)", () => {
+    assert.deepEqual(parseDispositions("nope"), []);
+    assert.deepEqual(
+      parseDispositions([
+        { finding: "F1", action: "fixed", note: "ok" },
+        { finding: "F1", action: "decline", note: "dup (first wins)" },
+        { finding: "f2", action: "fixed" }, // bad id
+        { finding: "F0", action: "fixed" }, // bad id
+        { finding: "F3", action: "rewrite" }, // unknown action
+        { finding: "F4", action: "defer" }, // note missing → ""
+        null,
+      ]),
+      [
+        { finding: "F1", action: "fixed", note: "ok" },
+        { finding: "F4", action: "defer", note: "" },
+      ],
+    );
+    const r = parseFixResponse('{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":"garbage"}');
+    assert.ok(r.ok, "a garbage dispositions field does not fail the parse");
+    if (r.ok) assert.deepEqual(r.fix.dispositions, []);
+  });
+
+  it("notes are capped", () => {
+    const [d] = parseDispositions([{ finding: "F1", action: "fixed", note: "x".repeat(5000) }]);
+    assert.equal(d.note.length, 1000);
   });
 });

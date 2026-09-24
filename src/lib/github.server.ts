@@ -896,8 +896,9 @@ export async function listReviewThreadRoots(
   return rows
     .filter((c) => Number.isFinite(c.id) && !c.in_reply_to_id)
     .map((c) => {
-      // `line` goes null once the comment is outdated; the line it was posted on stays in original_line
-      const line = c.line ?? c.original_line;
+      // The thread key is the line the comment was POSTED on (original_line): `line` follows later
+      // commits (a fix inserting a line above moves it) and goes null once outdated.
+      const line = c.original_line ?? c.line;
       return { id: Number(c.id), path: String(c.path ?? ""), ...(Number.isFinite(line) ? { line: Number(line) } : {}), body: String(c.body ?? "") };
     });
 }

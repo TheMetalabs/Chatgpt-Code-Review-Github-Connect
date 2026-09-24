@@ -243,3 +243,17 @@ test('mixed receipt: turning format fallback OFF does not weaken an already comm
  assert.equal((await f.complete([{provider:f.provider,raw},f.peer])).ok,true);f.assertPreserved();
  assert.equal((await f.complete([{provider:f.provider,raw:raw.replace('COMMENT','APPROVE')}])).http,409);f.assertPreserved();
 });
+
+test('HTTP: a review whose inline anchors GitHub refused is recorded without the comments it never created',async t=>{
+ const app=await appFixture({reviewLocal:false},{inlineDropped:true});t.after(()=>app.close());const mention=app.mention();
+ await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===mention.jobId)?.status==='awaiting_chat','job not ready');
+ const {job}=await post(app,{action:'take',clientId:'fixture'});
+ const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Missing check',failure_scenario:'A duplicate request writes twice',root_cause:'No guard',evidence:'a.ts:1: no guard',recommended_fix:'Check the key',recommended_test:'Assert one write'};
+ const findingRaw=JSON.stringify({findings:[finding],merge_recommendation:'REQUEST_CHANGES'});
+ await post(app,{action:'complete',jobId:job.jobId,leaseId:job.leaseId,results:[{provider:'chatgpt',raw:findingRaw}]});
+ await eventually(()=>app.reviews.length===1,'review not posted');
+ assert.equal(app.reviews[0].comments.length,1,'sanity: the inline comment was submitted');
+ await eventually(()=>app.harbor.getHarbor().reviews.length===1,'review not recorded');
+ const stored=app.harbor.getHarbor().reviews[0];
+ assert.equal(stored.githubId,2);assert.equal(stored.comments.length,0,'GitHub created no inline comment');assert.ok(stored.body);
+});

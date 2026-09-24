@@ -867,13 +867,28 @@ export async function runPostReviewLoop(
       }
       return { ok: true };
     };
-    // Per-finding thread replies: best effort (a failed reply never fails the round), counted.
+    // Per-finding thread replies: a transient failure is retried (the list and each reply, same
+    // backoff as the continuation); what still fails never fails the round and is counted in the
+    // report. (A durable "0 unaddressed" gate across rounds is the K1 control-plane work, #79.)
+    const withRetry = async <T>(call: () => Promise<T>): Promise<T> => {
+      let last: unknown;
+      for (const wait of POST_RETRY_DELAYS_MS) {
+        if (wait) await sleep(wait);
+        try {
+          return await call();
+        } catch (e) {
+          last = e;
+        }
+      }
+      throw last;
+    };
     const replyToThreads = async (dispositions: FixDisposition[] | undefined, commitSha?: string): Promise<{ ok: number; failed: number }> => {
       const tally = { ok: 0, failed: 0 };
       if (!posted?.githubId || posted.comments.length === 0) return tally;
+      const reviewId = posted.githubId;
       let threads: Map<string, number>;
       try {
-        const mapped = mapFindingThreads(posted.comments, await gh.listReviewThreadRoots(token, owner, repo, pr, posted.githubId));
+        const mapped = mapFindingThreads(posted.comments, await withRetry(() => gh.listReviewThreadRoots(token, owner, repo, pr, reviewId)));
         threads = mapped.threads;
         tally.failed = mapped.unroutable;
       } catch {
@@ -884,8 +899,9 @@ export async function runPostReviewLoop(
       for (const [i, f] of findings.entries()) {
         const threadId = threads.get(f.id);
         if (threadId === undefined) continue;
+        const body = threadReplyBody(byId.get(`F${i + 1}`), rounds.length, commitSha);
         try {
-          await gh.replyToReviewComment(token, owner, repo, pr, threadId, threadReplyBody(byId.get(`F${i + 1}`), rounds.length, commitSha));
+          await withRetry(() => gh.replyToReviewComment(token, owner, repo, pr, threadId, body));
           tally.ok += 1;
         } catch {
           tally.failed += 1;

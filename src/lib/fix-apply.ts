@@ -146,9 +146,10 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
     if (claimed.length) return { ok: false, error: `no files changed, yet ${claimed.join(", ")} marked fixed` };
     // Every finding must be classified (a dropped malformed entry counts as missing): an incomplete
     // no-change response is malformed and retried, never a terminal fix-declined handoff.
-    const given = new Set(dispositions.map((d) => d.finding));
+    // Each classification must carry its reason: it is the thread reply a human reads.
+    const given = new Set(dispositions.filter((d) => d.note.trim().length > 0).map((d) => d.finding));
     const missing = Array.from({ length: opts.findingCount ?? 0 }, (_, i) => `F${i + 1}`).filter((id) => !given.has(id));
-    if (missing.length) return { ok: false, error: `no-change response has no valid disposition for ${missing.join(", ")}` };
+    if (missing.length) return { ok: false, error: `no-change response has no valid disposition with a note for ${missing.join(", ")}` };
     return { ok: true, fix: { summary: summaryRaw, files: [], dispositions } };
   }
   const seen = new Set<string>();

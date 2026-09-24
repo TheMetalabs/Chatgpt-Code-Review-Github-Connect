@@ -40,9 +40,13 @@ describe("parseFixResponse", () => {
   it("a no-change round must classify EVERY listed finding (missing or malformed entries are retried)", () => {
     const parse = (dispositions: string) => parseFixResponse(`{"summary":"nothing to change","files":[],"dispositions":${dispositions}}`, { findingCount: 2 });
     const errOf = (r: ReturnType<typeof parse>) => (r.ok ? "" : r.error);
-    assert.match(errOf(parse("[]")), /no valid disposition for F1, F2/);
-    assert.match(errOf(parse('[{"finding":"F1","action":"pushback","note":"n"}]')), /no valid disposition for F2$/);
-    assert.match(errOf(parse('[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"bogus"}]')), /no valid disposition for F2$/);
+    assert.match(errOf(parse("[]")), /no valid disposition with a note for F1, F2/);
+    assert.match(errOf(parse('[{"finding":"F1","action":"pushback","note":"n"}]')), /no valid disposition with a note for F2$/);
+    assert.match(errOf(parse('[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"bogus"}]')), /no valid disposition with a note for F2$/);
+    for (const note of ['', '"note":"",', '"note":"   ",']) {
+      const noReason = `[{"finding":"F1","action":"pushback","note":"n"},{${note}"finding":"F2","action":"decline"}]`;
+      assert.match(errOf(parse(noReason)), /with a note for F2$/, `F2 without a reason (${note || "no note"})`);
+    }
     const full = parse('[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"defer","note":"#88"}]');
     assert.ok(full.ok && full.fix.dispositions.length === 2);
     // without a count (a caller that lists no findings) only the summary + no-"fixed" rules apply

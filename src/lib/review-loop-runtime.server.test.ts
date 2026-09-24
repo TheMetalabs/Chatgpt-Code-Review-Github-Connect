@@ -121,6 +121,7 @@ function fakeDeps(
     sameRepo?: boolean; // head-repository provenance (default: verified same repo unless a fork)
     threads?: Array<{ id: number; path: string; body: string }>; // the posted review's thread roots
     replyFails?: boolean;
+    replyFailures?: number; // the first N thread-reply POSTs fail (transient)
     listThreadsFails?: boolean; // listReviewThreadRoots throws (a failed page)
   } = {},
 ) {
@@ -130,6 +131,7 @@ function fakeDeps(
   const permissionChecks: string[] = [];
   let committed = false;
   let moved = false;
+  let replyAttempts = 0;
   let sleeps = 0;
   let clock = 0;
   const start = opts.start === undefined ? "suggest" : opts.start;
@@ -191,7 +193,7 @@ function fakeDeps(
         return opts.threads ?? [];
       },
       async replyToReviewComment(_t, _o, _r, _pr, id, body) {
-        if (opts.replyFails) throw new Error("thread reply 502");
+        if (opts.replyFails || (opts.replyFailures ?? 0) > replyAttempts++) throw new Error("thread reply 502");
         threadReplies.push({ id, body });
       },
       async fetchUserPermission(_t, _o, _r, login) {
@@ -1320,6 +1322,14 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     // posted[0] is the continuation (the control signal comes first); the report follows
     const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
     assert.match(report, /Thread replies: 0 posted, 2 failed\./);
+  });
+
+  it("a transient reply failure is retried: every thread still gets its reply", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [2], threads, replyFailures: 1 });
+    const r = await runWith(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.continued === true);
+    assert.deepEqual(f.replies.map((x) => x.id), [101, 102]);
+    assert.ok(!/Thread replies:/.test(f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? ""), "no failure left to report");
   });
 
   it("an unreadable thread list never fails the round: every reply is counted as failed", async () => {

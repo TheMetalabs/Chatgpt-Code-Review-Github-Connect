@@ -1075,7 +1075,8 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
     }
   }
 
-  const stored: PostedReview = { ...review, githubId };
+  // Record what GitHub accepted: after a refused inline anchor the review went out with none.
+  const stored: PostedReview = { ...review, githubId, ...(inlineDropped ? { comments: [] } : {}) };
   state = {
     ...state,
     reviews: trim([

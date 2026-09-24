@@ -83,6 +83,81 @@ test('page: a visible quota notice ends a fix only before an answer is visible',
   assert.equal(await done.c.context.waitUntilFixOrQuota('ChatGPT'), ANSWER);
 });
 
+// Round 11 lifecycle (review 5307890587, P1): a PERMANENT ownership verdict ends the collector on
+// the observation that sees it (no further poll), with the distinct terminal code `taken_over`, the
+// tab marked the user's for good and its managed slot freed. A transient "unknown" keeps polling.
+const COLLECT_VERDICTS = {
+  followup: {permanent: true, set: c => { c.boundReviewResponse = () => ({identified: true, followup: true, root: {}, responseId: 'response-A'}); }},
+  edited: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; }},
+  draft: {permanent: true, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'my own question'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
+  moved: {permanent: true, journal: {conversation: 'https://chatgpt.com/c/users-own'}},
+  unusable: {permanent: true, set: c => { c.location = {href: ''}; }}, // no conversation identity can be pinned
+  turnUnrendered: {permanent: false, set: c => { c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  composerEcho: {permanent: false, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
+};
+for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
+  test(`page: collect verdict "${name}" ${verdict.permanent ? 'ends the fix run at once (taken_over), slot freed' : 'is transient: the collector keeps polling'}`, async () => {
+    const p = page({limit: 12});
+    if (verdict.journal) {
+      const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', ...verdict.journal};
+      Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
+    }
+    verdict.set?.(p.c.context);
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    const out = await p.c.context.waitUntilFixOrQuota('ChatGPT').then(raw => ({raw}), error => ({code: error.code, message: error.message}));
+    if (verdict.permanent) {
+      assert.equal(out.code, 'taken_over', JSON.stringify(out));
+      assert.equal(p.polls(), 0, 'ended on the observation that saw it, never polled until the deadline');
+      assert.equal(p.state().slotReleased, true, 'the managed slot is freed');
+      assert.equal(p.state().tabRepurposed, true, 'every later proof says the tab is the user\'s');
+    } else {
+      assert.match(out.message, /test-only polling guard/, 'still polling');
+      assert.notEqual(p.state().slotReleased, true);
+    }
+  });
+}
+
+test('page: a collected fix answer whose tab is then taken over ends the run (taken_over) instead of answering busy', async () => {
+  const p = page();
+  p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');
+  p.c.message(run());
+  await settled(p.c);
+  assert.equal(p.state().result?.ok, true, 'collected');
+  p.c.context.journaledTurnIntegrity = () => 'edited'; // the user edits the sent turn afterwards
+  const out = p.c.message(msg('ashlar-harvest'));
+  assert.equal(out.ok, false);assert.equal(out.code, 'taken_over');assert.equal(out.raw, undefined, 'the answer is never handed out');
+  assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true);
+  assert.equal(p.c.message(msg('ashlar-harvest')).code, 'taken_over', 'terminal: every later ask gets the same outcome');
+  assert.equal(p.c.message(msg('ashlar-can-close')).reason, 'repurposed');
+});
+
+test('worker: a taken_over page outcome is delivered as a failure at once; the tab is preserved and the leg retires', async () => {
+  const b = worker([fixJob()], {api: active, handler: (_id, m) => m.type === 'ashlar-fix-cancel'
+    ? {ok: true, owned: false, ownership: 'takenOver', proof: 'repurposed', url: URL_FIX}
+    : {ok: false, code: 'taken_over', error: 'fix run ended: the user took over the fix tab (followup); tab preserved'}});
+  await b.tick();
+  const failure = b.calls.find(c => c.action === 'failure');
+  assert.match(failure?.error || '', /^taken_over: fix run ended/);assert.equal(failure.leaseId, 'lease-A');
+  assert.deepEqual(b.closedTabs, [], 'never closed');
+  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the leg retired');
+});
+
+test('worker: a delivered fix whose page never proves ownership is preserved after the wait, so its leg ends too', async () => {
+  // The item is DONE on the server; only the leg (and its tab slot) could linger forever.
+  const b = worker([fixJob({states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', delivered: true, cleanupPending: true, conversation: URL_FIX, outcome: {ok: true, raw: ANSWER}}}})],
+    {api: active, handler: (_id, m) => (m.type === 'ashlar-can-close' ? {ok: true, canClose: false, reason: 'pending', ownership: 'unknown', url: URL_FIX} : {ok: true})});
+  await b.tick();
+  assert.ok(b.local.state.pendingReviewJobs['fix-A'], 'asked again first');
+  const RealDate = b.context.Date || Date;
+  const later = RealDate.now() + 3 * 60_000;
+  b.context.Date = class extends RealDate { static now() { return later; } };
+  await b.tick();
+  assert.deepEqual(b.closedTabs, [], 'never closed unproven');
+  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the leg retired');
+});
+
 test('page: a kind:fix run is routed to the fix collector and harvested as its plain text', async () => {
   const p = page();
   p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');

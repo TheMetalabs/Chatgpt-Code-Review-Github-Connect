@@ -751,19 +751,20 @@ async function cleanupProviderBody(job, provider, jobs) {
       return;
     }
     if (result.reason === "repurposed") return finishTabCleanup(job, provider, jobs, "user continued the conversation; tab preserved");
-    if (!result.canClose) {
+    if (!result.canClose || (job.kind === "fix" && result.ownership !== "owned")) {
       state.cleanupWaitReason="page_completion_or_journal_pending";
-      await saveJobs(jobs);return; // No deadline or forced eviction.
+      // A delivered fix's item is already settled (DONE): its leg must end too. A page that cannot
+      // prove ownership now is asked again, and past FIX_OWNERSHIP_WAIT_MS its tab is preserved
+      // (never closed unproven) so the leg retires and its capacity is freed. A review has no
+      // deadline: it waits (no forced eviction).
+      if (job.kind === "fix") return waitOrPreserveFixTab(job, provider, jobs, "the delivered fix tab never proved ownership; tab preserved", tab);
+      await saveJobs(jobs);return;
     }
     delete state.cleanupWaitReason;
     if (job.kind === "fix") {
       // The page re-established the full ownership proof for the delivered answer (fixOwnershipProof
       // "complete"); the worker acts only on that verdict, and the final check compares the tab with
       // the conversation identity it stored (never a URL echoed by the same reply).
-      if (result.ownership !== "owned") {
-        state.cleanupWaitReason = "page_completion_or_journal_pending";
-        await saveJobs(jobs);return;
-      }
       if (adoptFixConversation(state, result)) await saveJobs(jobs);
       const bound = state.conversation;
       if (!bound || conversationIdentity(result.url) !== bound) return preserveFixTab(job, provider, jobs, "the fix tab is not in its bound conversation; tab preserved", tab);

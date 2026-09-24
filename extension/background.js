@@ -592,7 +592,12 @@ async function finishTabCleanup(job, provider, jobs, reason) {
     }
     await saveJobs(jobs);
   }
-  await chrome.storage.session.remove([OWNED_PREFIX + state.tabId, closedKey(job, provider)]);
+  // The tab record is this leg's only while it still names this leg: a tab that now carries another
+  // binding keeps that binding's record (its explicit-close tracking), whichever kind retires here.
+  const ownedKey = OWNED_PREFIX + state.tabId;
+  const owned = state.tabId ? (await chrome.storage.session.get([ownedKey]))[ownedKey] : undefined;
+  const mine = owned && owned.jobId === job.jobId && owned.provider === provider;
+  await chrome.storage.session.remove(mine ? [ownedKey, closedKey(job, provider)] : [closedKey(job, provider)]);
 }
 
 /** Retryable journal: delivered -> cleanupPending -> closed -> cleanupDone.
@@ -760,9 +765,11 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   }
   const unbound = undispatched && result?.ok === true && !result.jobId && !result.runId && result.provider === provider;
   if (!(matchesJob(result, job, provider) || unbound) || result.ok !== true) {
+    // The tab now carries another binding (or none it can prove): never closed. A cancelled fix
+    // has no answer left to wait for, so past the ownership wait its leg retires and the tab is
+    // left to whoever holds it (never messaged, its binding and records untouched).
     state.cleanupError = "tab ownership does not match; no tab was closed";
-    await saveJobs(jobs);
-    return;
+    return waitOrPreserveFixTab(job, provider, jobs, "the fix tab carries another binding; tab preserved");
   }
   if (result.ownership === "unknown") {
     // Not identifiable yet (a reload still rendering the sent turn): ask again next tick. Past the

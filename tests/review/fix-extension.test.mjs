@@ -351,3 +351,26 @@ test('worker: take opts into fix items, and a kind:fix payload runs with its kin
   assert.equal(started.kind, 'fix');assert.equal(started.jobId, 'fix-A');assert.equal(started.prompt, 'FIX PROMPT');
   assert.equal(b.local.state.pendingReviewJobs['fix-A'].kind, 'fix');
 });
+
+test('worker: a cancelled fix tab that now carries another binding retires after the wait, leaving that binding untouched', async () => {
+  const other = {ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B', provider: 'chatgpt'};
+  const handler = (_id, m) => (m.type === 'ashlar-tab-status'
+    ? {ok: true, ownershipProtocol: 1, jobId: 'job-B', runId: 'run-B', provider: 'chatgpt', released: false, url: URL_FIX}
+    : other);
+  const b = worker([fixJob()], {api: cancelled, handler});
+  const otherRecord = {jobId: 'job-B', provider: 'chatgpt', runId: 'run-B', closedKey: 'ashlar:closed:job-B:chatgpt:run-B', closing: false};
+  await b.session.set({'ashlar:tab:10': otherRecord});
+  await b.tick();
+  assert.equal(b.closedTabs.length, 0);
+  assert.match(b.local.state.pendingReviewJobs['fix-A'].states.chatgpt.cleanupError, /ownership does not match/, 'waits first');
+  const RealDate = b.context.Date || Date;
+  const later = RealDate.now() + 3 * 60_000;
+  b.context.Date = class extends RealDate { static now() { return later; } };
+  await b.tick();
+  assert.equal(b.closedTabs.length, 0, 'never closed');assert.ok(b.tabs.has(10));
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the old fix leg retired: its prompt is gone and its slot released');
+  assert.deepEqual(b.session.state['ashlar:tab:10'], otherRecord, "the other binding's tab record is intact");
+  assert.equal(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), false, "another binding's page is never told to release");
+  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 1, 'the other binding still counts against capacity');
+});

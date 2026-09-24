@@ -34,7 +34,7 @@ import {
 } from "./review-loop.ts";
 import { deriveLoopSession, type LoopEvent, type LoopSession } from "./review-loop-session.ts";
 import { retryWrite } from "./write-retry.ts";
-import { controlInSession, inSession } from "./review-loop-control.ts";
+import { controlInSession, inSession, ownWrites } from "./review-loop-control.ts";
 
 // Single source of the App identity lives in review-loop.ts (shared with the webhook parser's
 // self-trigger guard); re-exported here for existing engine callers.
@@ -528,6 +528,8 @@ function pushStop(events: LoopEvent[], c: { body?: string; createdAt?: string; u
  *   placed at the stop's own time — never at the acknowledgement's.
  * - ONLY the App contributes escalate / stopped markers, its canonical continuation for THIS PR
  *   (the head the loop moved to), and converged (total=0) reviews with their commit.
+ * - The App's own control writes that the list does not show yet come from its journal
+ *   (review-loop-control.ts OwnWrites): a lagging list never hides what this process wrote.
  * Reads fail closed: a list error throws (the caller must not act on a partial history).
  */
 export async function readLoopEvents(
@@ -571,6 +573,9 @@ export async function readLoopEvents(
       events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
     }
   }
+  // Read-your-writes: this process's control writes the list does not show yet stand in for their
+  // rows (and a listed row confirms its write) — on every session read, before any gate acts.
+  events.push(...ownWrites(gh).standIns({ owner, repo, pr }, issues, botLogin));
   return events;
 }
 

@@ -1599,7 +1599,7 @@ describe("ambiguous control writes: a separate no-expiry ledger, never read as p
     assert.equal(attempts(), 1, "still one POST");
   });
 
-  it("a start record with an unknown outcome is an explicit unresolved start, never 'start already recorded' or a silent no-session", async () => {
+  it("a start record with an unknown outcome is never re-sent or reported recorded, and is folded as the human's start", async () => {
     const f = fakeDeps({ start: null, rounds: [3] });
     const attempts = unknownFor(f, (b) => b.includes("ashlar-loop-start"));
     const req = { owner: "o", repo: "r", pr: 7, actor: "alice", mode: "suggest" as const, at: "2025-12-31T00:00:00Z" };
@@ -1607,14 +1607,14 @@ describe("ambiguous control writes: a separate no-expiry ledger, never read as p
     assert.equal(first.posted, false);
     assert.ok(first.reason.startsWith(START_UNRESOLVED), first.reason);
     const again = await startLoop("t", req, settings(), f.deps, ENV_ON);
-    assert.deepEqual(again, { posted: false, reason: START_UNRESOLVED });
-    // the loop step for the review that start requested surfaces it as a LOGGED reason
+    assert.equal(again.posted, false);
+    assert.ok(again.reason.startsWith(START_UNRESOLVED), `never "start already recorded": ${again.reason}`);
+    assert.ok(!SILENT_REASONS.includes(START_UNRESOLVED), "logged, not silent");
+    // the loop step for the review that start requested runs on the folded start: no re-POST
     const j = job({ thread: { kind: "mention", commentId: 5, userText: "/review-loop", loop: { kind: "start", mode: "suggest" }, eventAt: req.at } });
     const r = await run(f, "suggest", ENV_ON, j);
-    assert.deepEqual(r, { ran: false, reason: START_UNRESOLVED });
-    assert.ok(!SILENT_REASONS.includes(START_UNRESOLVED), "logged, not silent");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested", JSON.stringify(r));
     assert.equal(attempts(), 1, "one POST only");
-    assert.equal(f.prompts.length, 0);
   });
 
   for (const [name, opts] of [

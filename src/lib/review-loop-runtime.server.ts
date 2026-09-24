@@ -43,7 +43,7 @@ import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { retryWrite, type WriteRetryResult } from "./write-retry.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
-import { sameStart } from "./review-loop-control.ts";
+import { assertNever, emitControl, type EmitContext, type EmitOutcome } from "./review-loop-control.ts";
 import {
   CURRENT_ROUND_MISSING,
   ESCALATE_IN_FLIGHT,
@@ -68,7 +68,6 @@ import {
   isoMs,
   isSelfLogin,
   MAX_CONTINUE_ROUND,
-  parseStartMarker,
   parseStopRecord,
   resolveBotLogin,
   sanitizeUntrusted,
@@ -146,6 +145,8 @@ export interface LoopRuntimeDeps {
   fixWatch?: { queueMaxMs?: number; livenessMs?: number; checkEveryMs?: number; tickMs?: number };
   /** Delay before the single loop-history re-read (injected so tests do not wait). */
   sleep?: (ms: number) => Promise<void>;
+  /** The clock a control write's attempt is stamped with (injected by tests). */
+  now?: () => number;
 }
 
 export type LoopStepResult =
@@ -209,6 +210,11 @@ function writeFailure(r: Extract<WriteRetryResult, { error: unknown }>): string 
   return r.ambiguous ? `${detail} (outcome unknown: not re-sent; not yet visible)` : detail;
 }
 const realSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+
+/** How this runtime's control writes reach GitHub (review-loop-control.ts emitControl). */
+function controlCtx(d: LoopRuntimeDeps, token: string, botLogin: string): EmitContext {
+  return { gh: d.gh, token, botLogin, sleep: d.sleep ?? realSleep, now: d.now ?? (() => Date.now()) };
+}
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
 // One loop step per PR head at a time (in-process): a second posted review of the same head
@@ -756,22 +762,23 @@ export async function runPostReviewLoop(
     let session = await sessionOf(gh, token, ref, head, botLogin);
     // This review was requested by a fresh human start whose record harbor could not post at
     // admission: record it now (idempotent — an existing record, e.g. one a later stop ended,
-    // is never re-posted) and re-read.
-    if (!session.active && job.thread?.loop?.kind === "start") {
-      const started = await startLoop(token, { owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }, settings, d, env);
-      // The record exists now (posted, or one the first read missed): re-read, backing off while a
-      // lagging list still hides it — never a silent no-session for a started loop.
-      const unresolved = started.reason.startsWith(START_UNRESOLVED);
-      if (started.posted || started.reason === "start already recorded" || unresolved) {
-        session = await sessionOf(gh, token, ref, head, botLogin);
-        for (const wait of HISTORY_RETRY_DELAYS_MS) {
-          if (session.active || session.endedBy) break; // visible now (or genuinely ended since)
-          await sleep(wait);
+    // is never re-posted) and re-read once: the journal makes the record visible at once.
+    if (!session.active && job.thread?.loop?.kind === "start" && !isSelfLogin(job.sender, botLogin)) {
+      const out = await recordStart(token, { owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }, d, botLogin);
+      switch (out.status) {
+        case "unknown": // it may have landed: never re-sent, and folded as the human's start
+          trace(job.id, "start-unresolved", { error: out.error });
           session = await sessionOf(gh, token, ref, head, botLogin);
-        }
+          break;
+        case "posted":
+        case "exists":
+          session = await sessionOf(gh, token, ref, head, botLogin);
+          break;
+        case "rejected": // a LOGGED reason, never a silent no-session for a started loop
+          return { ran: false, reason: `start failed: ${out.error}` };
+        default:
+          return assertNever(out);
       }
-      // A start whose record may never have landed: a LOGGED reason, never a silent no-session.
-      if (!session.active && unresolved) return { ran: false, reason: started.reason };
     }
     if (!session.active) {
       // This session's handoff may have landed (ambiguous, not listed yet): it ended the session.
@@ -1152,16 +1159,31 @@ export async function continueLoopOnPush(
   }
 }
 
+type StartRequest = { owner: string; repo: string; pr: number; actor: string; mode: ReviewLoopMode; at: string };
+
+/** POST the start record through the control gate. A malformed field posts nothing (a record the
+ * parser would reject must never be posted). */
+async function recordStart(token: string, start: StartRequest, d: LoopRuntimeDeps, botLogin: string): Promise<EmitOutcome> {
+  let body: string;
+  try {
+    body = startComment({ mode: start.mode, by: start.actor, at: start.at });
+  } catch (e) {
+    return { status: "rejected", error: (e as Error)?.message ?? String(e) };
+  }
+  const ref = { owner: start.owner, repo: start.repo, pr: start.pr };
+  return emitControl(controlCtx(d, token, botLogin), { key: { kind: "start", ref, by: start.actor, at: start.at, mode: start.mode }, body });
+}
+
 /**
  * Record a loop START (the durable start event, review-loop.ts startComment): harbor calls this
  * when it ADMITS a review for a fresh human start directive, and a loop step for that review
  * repairs a record that could not be posted then. The record carries the requester and the
- * directive's own event time, is posted at most once per (requester, time, mode) — every retry
- * re-scans first — and retries with backoff. Never throws.
+ * directive's own event time, is posted at most once per (requester, time, mode) — never again
+ * once a POST may have landed — and retries a refused POST with backoff. Never throws.
  */
 export async function startLoop(
   token: string,
-  start: { owner: string; repo: string; pr: number; actor: string; mode: ReviewLoopMode; at: string },
+  start: StartRequest,
   settings: BotSettings,
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
@@ -1170,31 +1192,20 @@ export async function startLoop(
     if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
     const botLogin = ashlarBotLogin(env);
     if (isSelfLogin(start.actor, botLogin)) return { posted: false, reason: "bot-authored start ignored" };
-    const record = { mode: start.mode, by: start.actor, at: start.at };
-    const body = startComment(record); // throws on a malformed field → "start failed"
     const d = deps ?? (await productionDeps(settings));
-    const key = `start:${prKey(start)}:${record.by.toLowerCase()}:${isoMs(record.at)}:${record.mode}`;
-    const probe = dedupProbe(d.gh, key, async () => {
-      const rows = await d.gh.listIssueComments(token, start.owner, start.repo, start.pr).catch(() => null);
-      return !!rows?.some((row) => isSelfLogin(row.userLogin, botLogin) && sameStart(parseStartMarker(row.body, { authoredByBot: true }), record));
-    });
-    const r = await retryWrite({
-      delays: POST_RETRY_DELAYS_MS,
-      sleep: d.sleep ?? realSleep,
-      seen: probe.seen,
-      post: async () => {
-        await d.gh.createIssueComment(token, { owner: start.owner, repo: start.repo, pr: start.pr, body });
-        rememberPosted(d.gh, key);
-      },
-    });
-    if ("posted" in r) return { posted: true, reason: "started" };
-    // A ledger-only hit is NOT a recorded start: it may never have landed.
-    if ("exists" in r) return { posted: false, reason: probe.ledgerOnly() ? START_UNRESOLVED : "start already recorded" };
-    if (r.ambiguous) {
-      rememberAmbiguous(d.gh, key); // never re-posted by a redelivery
-      return { posted: false, reason: `${START_UNRESOLVED}: ${writeFailure(r)}` };
+    const out = await recordStart(token, start, d, botLogin);
+    switch (out.status) {
+      case "posted":
+        return { posted: true, reason: "started" };
+      case "exists":
+        return { posted: false, reason: "start already recorded" };
+      case "unknown": // never "recorded": it may not have landed
+        return { posted: false, reason: `${START_UNRESOLVED}: ${out.error}` };
+      case "rejected":
+        return { posted: false, reason: `start failed: ${out.error}` };
+      default:
+        return assertNever(out);
     }
-    return { posted: false, reason: `start failed: ${writeFailure(r)}` };
   } catch (e) {
     return { posted: false, reason: `start failed: ${(e as Error)?.message ?? String(e)}` };
   }

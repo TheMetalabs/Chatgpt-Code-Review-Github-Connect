@@ -633,8 +633,24 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     // a later caller for the same head + session (a redelivery, the push path) while the list still lags
     const again = await now(f, 15);
     assert.equal(again.escalated, false);
-    assert.equal(f.attempts(), 1, "the tombstone stops the re-entry too");
+    assert.equal(f.attempts(), 1, "the ambiguity ledger stops the re-entry too");
     assert.equal(f.stored.length, 1);
+  });
+
+  it("an unknown handoff outcome never expires: more than 24 h later, the list still stale, no second POST", async () => {
+    const f = flaky(["unknown", "ok"], false, true);
+    assert.equal((await now(f, 18)).ambiguous, true);
+    const realNow = Date.now;
+    const later = realNow() + 25 * 60 * 60_000;
+    Date.now = () => later;
+    try {
+      const again = await now(f, 18);
+      assert.equal(again.escalated, false);
+      assert.equal(again.ambiguous, true, "still unknown, never reported as an existing handoff");
+    } finally {
+      Date.now = realNow;
+    }
+    assert.equal(f.attempts(), 1, "one POST only");
   });
 
   it("the round-cap handoff (maybeEscalate) with an unknown outcome returns ambiguous instead of throwing", async () => {

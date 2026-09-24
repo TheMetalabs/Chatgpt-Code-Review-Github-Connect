@@ -189,6 +189,71 @@ export function rememberPosted(client: object, key: string, now: number = Date.n
   }
 }
 
+// Control writes whose outcome is UNKNOWN (they may have landed) and that no list has shown yet —
+// a ledger SEPARATE from the confirmed-posted cache above, so "maybe posted" is never read as
+// "posted". No time-based expiry (a stale list after a day must still not trigger a second POST):
+// bounded by count, oldest evicted, and an entry is cleared once the matching row is actually seen
+// in a list scan. An entry may carry a synthetic LoopEvent the session fold must honor meanwhile
+// (an ambiguous handoff ends the session in this process).
+const maybePostedByClient = new WeakMap<object, Map<string, { event?: LoopEvent }>>();
+const MAYBE_POSTED_MAX = 500;
+
+export function rememberAmbiguous(client: object, key: string, event?: LoopEvent): void {
+  const ledger = maybePostedByClient.get(client) ?? new Map<string, { event?: LoopEvent }>();
+  maybePostedByClient.set(client, ledger);
+  const prev = ledger.get(key);
+  ledger.delete(key);
+  ledger.set(key, { event: event ?? prev?.event });
+  for (const k of ledger.keys()) {
+    if (ledger.size <= MAYBE_POSTED_MAX) break;
+    ledger.delete(k);
+  }
+}
+
+export function ambiguousWrite(client: object, key: string): boolean {
+  return maybePostedByClient.get(client)?.has(key) ?? false;
+}
+
+export function clearAmbiguous(client: object, key: string): void {
+  maybePostedByClient.get(client)?.delete(key);
+}
+
+/** The synthetic events of this client's unresolved ambiguous writes whose key starts with `prefix`. */
+export function ambiguousEvents(client: object, prefix: string): LoopEvent[] {
+  const out: LoopEvent[] = [];
+  for (const [k, v] of maybePostedByClient.get(client) ?? []) if (v.event && k.startsWith(prefix)) out.push(v.event);
+  return out;
+}
+
+/**
+ * The `seen` probe of an idempotent control write: confirmed-posted cache, then the list `scan`
+ * (a hit clears the ambiguity ledger), then the ledger. It is true for posted OR ambiguous — so a
+ * write that may have landed is never POSTed again — while `ledgerOnly()` tells the caller the hit
+ * came from the ledger alone, to report "outcome unknown" instead of "exists". A failed scan counts
+ * as "not seen".
+ */
+export function dedupProbe(client: object, key: string, scan: () => Promise<boolean>): { seen: () => Promise<boolean>; ledgerOnly: () => boolean } {
+  let viaLedger = false;
+  return {
+    seen: async () => {
+      viaLedger = false;
+      if (postedRecently(client, key)) return true;
+      if (await scan().catch(() => false)) {
+        clearAmbiguous(client, key);
+        return true;
+      }
+      viaLedger = ambiguousWrite(client, key);
+      return viaLedger;
+    },
+    ledgerOnly: () => viaLedger,
+  };
+}
+
+/** Prefix of every handoff key of one PR (see handoffKey). */
+export function handoffPrefix(o: { owner: string; repo: string; pr: number }): string {
+  return `handoff:${o.owner}/${o.repo}#${o.pr}@`;
+}
+
 /** ONE handoff per head per session — the key both handoff paths (stuck classification and
  * terminal failures) record and consult. */
 function handoffKey(o: { owner: string; repo: string; pr: number; head: string; sinceIso?: string; sinceSeq?: number }): string {
@@ -201,8 +266,8 @@ export function postedRecently(client: object, key: string, now: number = Date.n
 }
 
 /** A handoff POST whose outcome is unknown (it may have landed) and that the scans have not seen
- * yet. It is recorded as posted in this process (a tombstone, so no re-entry sends it again) and
- * never followed by another handoff for the head. */
+ * yet. It is recorded in the ambiguity ledger (never re-sent, never followed by another handoff
+ * for the head) with a synthetic handoff event that ends the session in this process. */
 export const HANDOFF_OUTCOME_UNKNOWN = "the handoff's outcome is unknown (it may have landed; not re-sent)";
 
 export interface EscalateResult {
@@ -288,6 +353,8 @@ async function maybeEscalateInner(
   // partial data — the list helpers throw rather than return a truncated list.
   let rounds: RoundSummary[];
   let escalatedBefore: boolean;
+  let ambiguousBefore = false;
+  const hk = handoffKey(opts);
   try {
     rounds = await reconstructRounds(gh, token, opts.owner, opts.repo, opts.pr, { botLogin, sinceIso: opts.sinceIso });
     // Only classify when the most recent reconstructed round IS the current head. Otherwise the
@@ -299,9 +366,10 @@ async function maybeEscalateInner(
     }
     const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
     if (!reasonPeek) return { escalated: false, rounds };
-    escalatedBefore =
-      (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
-      postedRecently(gh, handoffKey(opts));
+    const listed = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq);
+    if (listed) clearAmbiguous(gh, hk);
+    escalatedBefore = listed || postedRecently(gh, hk);
+    ambiguousBefore = !escalatedBefore && ambiguousWrite(gh, hk);
   } catch (e) {
     return { escalated: false, rounds: [], error: (e as Error)?.message ?? String(e) };
   }
@@ -310,6 +378,8 @@ async function maybeEscalateInner(
   if (escalatedBefore) {
     return { escalated: false, reason, rounds }; // one handoff per head
   }
+  // An earlier handoff for this head may have landed: never a second one, and never "exists".
+  if (ambiguousBefore) return { escalated: false, ambiguous: true, reason, rounds };
   // The budget is authoritative (round-cap), but the trend pattern still guides the human.
   const pattern = reason === "round-cap" ? stuckPattern(rounds) : null;
   const body = escalateFromRounds(reason, rounds, {
@@ -320,14 +390,21 @@ async function maybeEscalateInner(
     diffLines: opts.diffLines,
     detail: pattern ? `fix-round budget spent; the finding trend also shows ${pattern}` : undefined,
   });
-  const seen = async () =>
-    (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
-    postedRecently(gh, handoffKey(opts));
-  const out = await postHandoff(gh, token, opts, body, seen);
-  if (out === "exists") return { escalated: false, reason, rounds };
-  rememberPosted(gh, handoffKey(opts)); // posted, or a tombstone for one that may have landed
-  if (out === "ambiguous") return { escalated: false, ambiguous: true, reason, rounds };
+  const probe = dedupProbe(gh, hk, () => alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq));
+  const out = await postHandoff(gh, token, opts, body, probe.seen);
+  if (out === "exists" && !probe.ledgerOnly()) return { escalated: false, reason, rounds };
+  if (out !== "posted") {
+    rememberAmbiguous(gh, hk, handoffEvent());
+    return { escalated: false, ambiguous: true, reason, rounds };
+  }
+  rememberPosted(gh, hk);
   return { escalated: true, reason, rounds };
+}
+
+/** The synthetic handoff an ambiguous one stands for in this process: it ends the session (a
+ * redelivered review of the head never runs another fix) until the real marker is listed. */
+function handoffEvent(): LoopEvent {
+  return { at: new Date().toISOString(), kind: "escalate" };
 }
 
 /** Delays before each terminal-handoff POST attempt. A handoff has no other poster, so one
@@ -401,7 +478,9 @@ export async function escalateNow(
   try {
     let before = false;
     try {
-      before = (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) || postedRecently(gh, sessionKey);
+      const listed = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq);
+      if (listed) clearAmbiguous(gh, sessionKey);
+      before = listed || postedRecently(gh, sessionKey);
     } catch {
       // Unreadable history: fall back to what THIS process posted for this head + session (a
       // sequential redelivery is then a no-op); otherwise post rather than end the loop without
@@ -409,6 +488,8 @@ export async function escalateNow(
       before = postedRecently(gh, sessionKey);
     }
     if (before) return { escalated: false };
+    // An earlier handoff for this head may have landed: never a second one, and never "exists".
+    if (ambiguousWrite(gh, sessionKey)) return { escalated: false, ambiguous: true, error: HANDOFF_OUTCOME_UNKNOWN };
     const body = escalateFromRounds(opts.reason, opts.rounds, {
       pr: opts.pr,
       head: opts.head,
@@ -417,13 +498,16 @@ export async function escalateNow(
       diffLines: opts.diffLines,
       detail: opts.detail,
     });
-    const seen = async () =>
-      (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
-      postedRecently(gh, sessionKey);
-    const out = await postHandoff(gh, token, opts, body, seen);
-    if (out === "exists") return { escalated: false };
-    rememberPosted(gh, sessionKey); // posted, or a tombstone for one that may have landed
-    if (out === "ambiguous") return { escalated: false, ambiguous: true, error: HANDOFF_OUTCOME_UNKNOWN };
+    const probe = dedupProbe(gh, sessionKey, () =>
+      alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq),
+    );
+    const out = await postHandoff(gh, token, opts, body, probe.seen);
+    if (out === "exists" && !probe.ledgerOnly()) return { escalated: false };
+    if (out !== "posted") {
+      rememberAmbiguous(gh, sessionKey, handoffEvent());
+      return { escalated: false, ambiguous: true, error: HANDOFF_OUTCOME_UNKNOWN };
+    }
+    rememberPosted(gh, sessionKey);
     return { escalated: true };
   } catch (e) {
     return { escalated: false, error: (e as Error)?.message ?? String(e) };

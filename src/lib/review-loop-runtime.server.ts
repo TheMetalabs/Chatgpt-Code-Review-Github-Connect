@@ -49,9 +49,12 @@ import {
   escalateNow,
   controlInSession,
   maybeEscalate,
-  postedRecently,
+  ambiguousEvents,
+  dedupProbe,
+  handoffPrefix,
   readLoopSession,
   reconstructRounds,
+  rememberAmbiguous,
   rememberPosted,
   HANDOFF_OUTCOME_UNKNOWN,
   type LoopPrInfo,
@@ -159,6 +162,12 @@ const ENDED_CONVERGED = "the loop session converged";
 const NEWER_REQUEST = "superseded by a newer loop request (a new session, another starter, or apply downgraded to suggest)";
 /** NOT silent (logged): a concurrent handoff for this head outlived one backoff. */
 const HANDOFF_IN_FLIGHT = "a handoff for this head is still being posted by another loop step; this step did not run";
+/** NOT silent (logged): this session's handoff may have landed (unknown outcome, not listed yet). */
+const HANDED_OFF_UNKNOWN = "handed off (outcome unknown): the handoff may have landed and is not re-sent; no further fix runs";
+/** NOT silent (logged): the start record's POST outcome is unknown and no list shows it yet. */
+export const START_UNRESOLVED = "start unresolved: the start record's outcome is unknown (not re-sent; not yet visible)";
+/** A control write whose outcome is unknown and that no list shows yet (ambiguity ledger hit). */
+const OUTCOME_UNKNOWN = "outcome unknown: not re-sent; not yet visible";
 
 /** Benign non-run reasons: the default off-path and the designed quiet exits (a newer head
  * drives the loop / a handoff or the operator already ended it). Anything else is logged. */
@@ -572,14 +581,17 @@ function setPendingStop(gh: object, ref: PrRef, event: LoopEvent, pending: boole
 }
 
 /** The PR's current loop session from durable GitHub history (fresh read), plus this process's
- * not-yet-durable stops and any caller-known events. */
+ * not-yet-durable stops, its ambiguous (maybe-landed, not yet listed) handoffs and any
+ * caller-known events. */
 function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullHead, botLogin: string, extra: LoopEvent[] = []): Promise<LoopSession> {
-  return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head, extra: [...pendingStops(gh, ref), ...extra] });
+  const handoffs = ambiguousEvents(gh, handoffPrefix(ref)); // ambiguous handoffs: terminal here
+  return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head, extra: [...pendingStops(gh, ref), ...handoffs, ...extra] });
 }
 
 /** `ambiguous`: the POST's outcome is unknown (it may have landed) and it is not visible yet. It is
- * recorded as posted in this process (no re-entry sends it again), and callers treat it as a
- * continuation that may exist: never a loop-error handoff that would contradict it. */
+ * recorded in the ambiguity ledger (no re-entry sends it again; a later caller gets `ambiguous`,
+ * never `exists`), and callers treat it as a write that may exist: never a loop-error handoff
+ * that would contradict it. */
 type ContinueOutcome = { posted: boolean; exists?: boolean; ambiguous?: boolean; error?: string };
 
 // ONE continuation per (PR, head, session). The push handler, a step whose head moved and an
@@ -603,8 +615,7 @@ function ensureContinuation(
   const run = (async (): Promise<ContinueOutcome> => {
     const since = { iso: c.sinceIso, seq: c.sinceSeq };
     // What this process just posted counts even before the list API shows it.
-    const exists = async () =>
-      postedRecently(gh, key) ||
+    const probe = dedupProbe(gh, key, () =>
       gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).then(
         (rows) =>
           rows.some((r) => {
@@ -613,11 +624,12 @@ function ensureContinuation(
             return k?.pr === ref.pr && k.head === c.head && (since.iso === undefined || controlInSession(r, since));
           }),
         () => false,
-      );
+      ),
+    );
     const r = await retryWrite({
       delays: POST_RETRY_DELAYS_MS,
       sleep: c.sleep ?? realSleep,
-      seen: exists,
+      seen: probe.seen,
       post: async () => {
         const round =
           c.round ??
@@ -628,8 +640,8 @@ function ensureContinuation(
       },
     });
     if ("posted" in r) return { posted: true };
-    if ("exists" in r) return { posted: false, exists: true };
-    if (r.ambiguous) rememberPosted(gh, key); // tombstone: a later caller sees it as posted
+    if ("exists" in r) return probe.ledgerOnly() ? { posted: false, ambiguous: true, error: OUTCOME_UNKNOWN } : { posted: false, exists: true };
+    if (r.ambiguous) rememberAmbiguous(gh, key); // never re-sent; not "posted" either
     return { posted: false, ambiguous: r.ambiguous, error: writeFailure(r) };
   })().finally(() => continuing.delete(key));
   continuing.set(key, run);
@@ -698,6 +710,8 @@ export async function runPostReviewLoop(
         r = await post();
         if (r.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: `ESCALATE ${reason} not posted: another handoff for this head is in flight (detail: ${detail})` };
       }
+      // Before the generic error branch: a handoff that may have landed is terminal here, logged.
+      if (r.ambiguous) return { ran: false, reason: `ESCALATE ${reason}: ${HANDED_OFF_UNKNOWN} (detail: ${detail})` };
       if (r.error) return { ran: false, reason: `ESCALATE ${reason} failed to post: ${r.error} (detail: ${detail})` };
       if (!r.escalated) return { ran: false, reason: ALREADY_ESCALATED };
       trace(job.id, "handoff", { reason, head: head.slice(0, 7) });
@@ -739,7 +753,8 @@ export async function runPostReviewLoop(
       const started = await startLoop(token, { owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }, settings, d, env);
       // The record exists now (posted, or one the first read missed): re-read, backing off while a
       // lagging list still hides it — never a silent no-session for a started loop.
-      if (started.posted || started.reason === "start already recorded") {
+      const unresolved = started.reason.startsWith(START_UNRESOLVED);
+      if (started.posted || started.reason === "start already recorded" || unresolved) {
         session = await sessionOf(gh, token, ref, head, botLogin);
         for (const wait of HISTORY_RETRY_DELAYS_MS) {
           if (session.active || session.endedBy) break; // visible now (or genuinely ended since)
@@ -747,8 +762,14 @@ export async function runPostReviewLoop(
           session = await sessionOf(gh, token, ref, head, botLogin);
         }
       }
+      // A start whose record may never have landed: a LOGGED reason, never a silent no-session.
+      if (!session.active && unresolved) return { ran: false, reason: started.reason };
     }
-    if (!session.active) return { ran: false, reason: NO_SESSION };
+    if (!session.active) {
+      // This session's handoff may have landed (ambiguous, not listed yet): it ended the session.
+      const handedOff = session.endedBy === "escalate" && ambiguousEvents(gh, handoffPrefix(ref)).length > 0;
+      return { ran: false, reason: handedOff ? HANDED_OFF_UNKNOWN : NO_SESSION };
+    }
     requested = true;
     sinceIso = session.startIso;
     sinceSeq = session.startSeq;
@@ -1146,22 +1167,26 @@ export async function startLoop(
     const body = startComment(record); // throws on a malformed field → "start failed"
     const d = deps ?? (await productionDeps(settings));
     const key = `start:${prKey(start)}:${record.by.toLowerCase()}:${isoMs(record.at)}:${record.mode}`;
+    const probe = dedupProbe(d.gh, key, async () => {
+      const rows = await d.gh.listIssueComments(token, start.owner, start.repo, start.pr).catch(() => null);
+      return !!rows?.some((row) => isSelfLogin(row.userLogin, botLogin) && sameStart(parseStartMarker(row.body, { authoredByBot: true }), record));
+    });
     const r = await retryWrite({
       delays: POST_RETRY_DELAYS_MS,
       sleep: d.sleep ?? realSleep,
-      seen: async () => {
-        if (postedRecently(d.gh, key)) return true;
-        const rows = await d.gh.listIssueComments(token, start.owner, start.repo, start.pr).catch(() => null);
-        return !!rows?.some((row) => isSelfLogin(row.userLogin, botLogin) && sameStart(parseStartMarker(row.body, { authoredByBot: true }), record));
-      },
+      seen: probe.seen,
       post: async () => {
         await d.gh.createIssueComment(token, { owner: start.owner, repo: start.repo, pr: start.pr, body });
         rememberPosted(d.gh, key);
       },
     });
     if ("posted" in r) return { posted: true, reason: "started" };
-    if ("exists" in r) return { posted: false, reason: "start already recorded" };
-    if (r.ambiguous) rememberPosted(d.gh, key); // tombstone: never re-posted by a redelivery
+    // A ledger-only hit is NOT a recorded start: it may never have landed.
+    if ("exists" in r) return { posted: false, reason: probe.ledgerOnly() ? START_UNRESOLVED : "start already recorded" };
+    if (r.ambiguous) {
+      rememberAmbiguous(d.gh, key); // never re-posted by a redelivery
+      return { posted: false, reason: `${START_UNRESOLVED}: ${writeFailure(r)}` };
+    }
     return { posted: false, reason: `start failed: ${writeFailure(r)}` };
   } catch (e) {
     return { posted: false, reason: `start failed: ${(e as Error)?.message ?? String(e)}` };
@@ -1196,25 +1221,26 @@ async function ensureStopRecord(
     const rec = isSelfLogin(r.userLogin, botLogin) ? parseStopRecord(r.body, { authoredByBot: true }) : null;
     return !!rec && rec.by.toLowerCase() === stop.by.toLowerCase() && isoMs(rec.at) === isoMs(stop.at);
   };
+  const probe = dedupProbe(gh, key, async () => {
+    const rows = await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).catch(() => null);
+    return !!rows?.some(same);
+  });
   const r = await retryWrite({
     delays: POST_RETRY_DELAYS_MS,
     sleep: sleep ?? realSleep,
-    seen: async () => {
-      if (postedRecently(gh, key)) return true;
-      const rows = await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).catch(() => null);
-      return !!rows?.some(same);
-    },
+    seen: probe.seen,
     post: async () => {
       await gh.createIssueComment(token, { owner: ref.owner, repo: ref.repo, pr: ref.pr, body });
       rememberPosted(gh, key);
     },
   });
   if ("posted" in r) return { posted: true };
-  if ("exists" in r) return { posted: false, exists: true };
-  // May have landed: a tombstone stops a redelivered stop from posting it again. The stop stays
-  // pending in this process until the record is seen.
-  if (r.ambiguous) rememberPosted(gh, key);
-  return { posted: false, error: writeFailure(r) };
+  // A ledger-only hit may never have landed: not "exists" (the stop stays pending).
+  if ("exists" in r) return probe.ledgerOnly() ? { posted: false, ambiguous: true, error: OUTCOME_UNKNOWN } : { posted: false, exists: true };
+  // May have landed: the ledger stops a redelivered stop from posting it again. The stop stays
+  // pending in this process until the record is seen in a list.
+  if (r.ambiguous) rememberAmbiguous(gh, key);
+  return { posted: false, ambiguous: r.ambiguous, error: writeFailure(r) };
 }
 
 // In-process serialization so concurrent stop deliveries for one PR post the record at most once
@@ -1264,6 +1290,7 @@ export async function stopLoop(
     }
     const r = await ensureStopRecord(d.gh, token, stop, { by: stop.actor, at }, botLogin, d.sleep);
     if (r.posted || r.exists) setPendingStop(d.gh, stop, event, false);
+    if (r.ambiguous) return { posted: false, reason: `stop record ${r.error ?? OUTCOME_UNKNOWN} (honored in this process until recorded)` };
     if (r.error) return { posted: false, reason: `stop failed: ${r.error} (honored in this process until recorded)` };
     return r.posted ? { posted: true, reason: "stopped" } : { posted: false, reason: "stop already recorded" };
   } catch (e) {

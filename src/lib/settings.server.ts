@@ -20,7 +20,7 @@ import {
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
-import { SettingsError, fixPairCompatible, settingsProblem } from "./settings-rules.ts";
+import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, type SettingsIntField } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
 
 function envStr(key: string): string | undefined {
@@ -177,6 +177,13 @@ function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
+/** A whole-number field, normalized INTO its save domain (settings-rules SETTINGS_INT_FIELDS): a
+ * stored or env-seeded value outside it is clamped here, so the loaded document is one a save
+ * accepts (an unrelated save never fails on a value the operator did not touch). */
+function intField(p: Record<string, unknown>, key: SettingsIntField): number {
+  return clampInt(SETTINGS_INT_FIELDS[key], p[key], DEFAULT_SETTINGS[key]);
+}
+
 function severity(v: unknown, fallback: Severity): Severity {
   return v === "P0" || v === "P1" || v === "P2" ? v : fallback;
 }
@@ -213,9 +220,9 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     mention: mention.length ? mention : [...DEFAULT_SETTINGS.mention],
     skipForks: bool(p.skipForks, DEFAULT_SETTINGS.skipForks),
     skipDrafts: bool(p.skipDrafts, DEFAULT_SETTINGS.skipDrafts),
-    maxInlineComments: Math.max(0, Math.min(20, Math.floor(num(p.maxInlineComments, DEFAULT_SETTINGS.maxInlineComments)))),
-    maxTurns: num(p.maxTurns, DEFAULT_SETTINGS.maxTurns),
-    exploreTurns: num(p.exploreTurns, DEFAULT_SETTINGS.exploreTurns),
+    maxInlineComments: intField(p, "maxInlineComments"),
+    maxTurns: intField(p, "maxTurns"),
+    exploreTurns: intField(p, "exploreTurns"),
     publishMinSeverity: severity(p.publishMinSeverity, DEFAULT_SETTINGS.publishMinSeverity),
     requestChangesMin: severity(p.requestChangesMin, DEFAULT_SETTINGS.requestChangesMin),
     precisionOverRecall: bool(p.precisionOverRecall, DEFAULT_SETTINGS.precisionOverRecall),
@@ -228,18 +235,18 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localLlmBaseUrl: str(p.localLlmBaseUrl, DEFAULT_SETTINGS.localLlmBaseUrl).trim(),
     localLlmApiKey: str(p.localLlmApiKey, DEFAULT_SETTINGS.localLlmApiKey),
     localLlmModel: str(p.localLlmModel, DEFAULT_SETTINGS.localLlmModel).trim(),
-    localReviewMaxTokens: Math.max(1, Math.floor(num(p.localReviewMaxTokens, DEFAULT_SETTINGS.localReviewMaxTokens))),
+    localReviewMaxTokens: intField(p, "localReviewMaxTokens"),
     localReviewMode: LOCAL_REVIEW_MODES.includes(p.localReviewMode as LocalReviewMode)
       ? (p.localReviewMode as LocalReviewMode)
       : DEFAULT_SETTINGS.localReviewMode,
-    localReviewSingleTurnMaxTokens: Math.max(1, Math.floor(num(p.localReviewSingleTurnMaxTokens, DEFAULT_SETTINGS.localReviewSingleTurnMaxTokens))),
+    localReviewSingleTurnMaxTokens: intField(p, "localReviewSingleTurnMaxTokens"),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),
     grokReasoning: normalizeGrokReasoning(p.grokReasoning),
-    promptDiffMaxChars: Math.max(0, Math.floor(num(p.promptDiffMaxChars, DEFAULT_SETTINGS.promptDiffMaxChars))),
-    promptContextMaxChars: Math.max(0, Math.floor(num(p.promptContextMaxChars, DEFAULT_SETTINGS.promptContextMaxChars))),
-    promptPolicyMaxChars: Math.max(0, Math.floor(num(p.promptPolicyMaxChars, DEFAULT_SETTINGS.promptPolicyMaxChars))),
-    contextPadLines: Math.max(0, Math.floor(num(p.contextPadLines, DEFAULT_SETTINGS.contextPadLines))),
+    promptDiffMaxChars: intField(p, "promptDiffMaxChars"),
+    promptContextMaxChars: intField(p, "promptContextMaxChars"),
+    promptPolicyMaxChars: intField(p, "promptPolicyMaxChars"),
+    contextPadLines: intField(p, "contextPadLines"),
   };
   if (!providersFromSettings(next).length) next.reviewChatgpt = true;
   return next;

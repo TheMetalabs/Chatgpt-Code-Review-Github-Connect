@@ -264,6 +264,21 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     void b.catch(() => {});
   });
 
+  it("a stale claim (dead profile) frees its parallelPrs slot for another PR's fix", async () => {
+    const h = harness();
+    h.setLimit(1);
+    const a = queueAndTake(h, { pr: 1 }, "chrome-1"); // chrome-1 then dies: no heartbeat
+    const b = h.reg.request({ ...REQ, pr: 2 });
+    assert.equal(h.reg.peek(), undefined, "a live claim holds the only slot");
+    h.advance(CLAIM_MS + 1);
+    const next = h.reg.peek();
+    assert.ok(next, "the stale claim no longer counts against the cap");
+    assert.ok(h.reg.take(next.id, "chrome-2"), "another profile takes PR 2's fix");
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 1 });
+    void a.promise.catch(() => {});
+    void b.catch(() => {});
+  });
+
   it("only the claiming profile may re-claim; a stale lease is renewed, the old one voided", () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h);

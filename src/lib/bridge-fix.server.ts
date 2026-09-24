@@ -180,7 +180,10 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   const live = (item: FixItem) => item.state === "queued" || item.state === "claimed";
   const limit = () => Math.max(1, Math.floor(Number(deps.parallelLimit()) || 1));
   const stale = (item: FixItem) => item.claimedAt !== undefined && deps.now() - item.claimedAt > deps.claimMs;
-  const claimedCount = () => [...items.values()].filter((item) => item.state === "claimed").length;
+  // A stale claim (no heartbeat for claimMs: Chrome crashed, or the take response was lost) no
+  // longer holds a parallelPrs slot: nothing else would free it before its deadline, so every
+  // other PR's fix would stall behind a dead profile. Its own profile may still resume it.
+  const claimedCount = () => [...items.values()].filter((item) => item.state === "claimed" && !stale(item)).length;
   const holds = (item: FixItem, leaseId: string | undefined) => item.state === "claimed" && Boolean(item.leaseId) && item.leaseId === leaseId;
 
   /** The only transition out of queued/claimed: settles the waiter exactly once. */

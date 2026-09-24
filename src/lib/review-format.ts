@@ -133,7 +133,7 @@ export function findingsMarker(outcome: PostedOutcome, findings: Finding[], unan
 function rawBlock(outcome: PostedOutcome, raw: string): string {
   if (!raw) return "";
   const header = outcome === "raw-unverified"
-    ? "**⚠️ Local verification reply posted verbatim — it was not parseable review JSON.**"
+    ? "**⚠️ Local verification reply posted verbatim — it could not be used as a review.**"
     : "**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.**";
   return `\n${header} Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${REVIEW_RAW_START}\n${raw}\n${REVIEW_RAW_END}\n`;
 }

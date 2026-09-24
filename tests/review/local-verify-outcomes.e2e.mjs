@@ -16,6 +16,9 @@ const cleanJson=JSON.stringify({findings:[],merge_recommendation:'COMMENT',inves
 const dirtyJson=JSON.stringify({findings:[finding],merge_recommendation:'REQUEST_CHANGES'});
 const envelope=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 const LOCAL_RAW='P1 a.ts:1 LOCAL-RAW: a duplicate request writes twice';
+// valid JSON whose only finding lacks recommended_test: the gate drops it for its shape
+const {recommended_test:_test,...partial}=finding;
+const malformedJson=JSON.stringify({findings:[{...partial,title:'LOCAL-RAW duplicate write'}],merge_recommendation:'REQUEST_CHANGES'});
 
 const CHAT={
   clean:cleanJson,
@@ -35,6 +38,9 @@ const LOCAL={
   proseThen500:{answer:answer(LOCAL_RAW,fail500)},
   // the multi-turn tool loop (what auto mode picks for a large PR) replying with the finding in prose
   multiturnProse:{answer:answer(LOCAL_RAW),settings:{localReviewMode:'multiturn'}},
+  // the finding in prose, then a JSON object the parser accepts but the gate rejects
+  schemaInvalid:{answer:answer(`${LOCAL_RAW}\n{"findings":"see above","merge_recommendation":"REQUEST_CHANGES"}`)},
+  malformed:{answer:answer(malformedJson)},
   error:{answer:answer(fail500)},
   offline:{offline:true},
   notRun:{settings:{reviewLocal:false}},
@@ -50,7 +56,7 @@ const posted=(first,marker,requests,extra={})=>({status:'posted',first,marker,re
 const skipped=requests=>({status:'skipped',requests});
 const chatFindings=posted(SUMMARY,MF,0,{stamp:'none'});
 const chatRaw=posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'none'});
-const RAW_NOTE=/local verification's reply was not parseable review JSON/;
+const RAW_NOTE=/local verification's reply could not be used as a review/;
 
 // [chat, local] → expected. stamp: which release the held local leg got (verify round / fallback / none).
 const CELLS={
@@ -59,6 +65,8 @@ const CELLS={
   'clean x unparseable':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
   'clean x proseThen500':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
   'clean x multiturnProse':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
+  'clean x schemaInvalid':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:/could not be used as a review \(empty findings without investigated_safe/,stamp:'verify'}),
+  'clean x malformed':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:/could not be used as a review \(1 finding\(s\) missing required fields\)/,stamp:'verify'}),
   'clean x error':posted(UNVERIFIED,M0U,1,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x offline':posted(UNVERIFIED,M0U,0,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x notRun':posted(CLEAN,M0,0),
@@ -70,6 +78,8 @@ const CELLS={
   'none x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseThen500':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x multiturnProse':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x schemaInvalid':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x malformed':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x error':skipped(1),
   'none x offline':skipped(0),
   'none x notRun':skipped(0),

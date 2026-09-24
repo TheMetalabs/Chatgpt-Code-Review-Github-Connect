@@ -317,6 +317,27 @@ describe("gateLiveSubmission", () => {
     }
   });
 
+  it("counts the findings it dropped for their shape apart from policy drops", () => {
+    const gate = gateLiveSubmission(
+      {
+        merge_recommendation: "REQUEST_CHANGES",
+        findings: [
+          { severity: "P1", file: FINDING_412.file, line: FINDING_412.line, title: "no recommended_test", failure_scenario: "x", root_cause: "y", evidence: "z", recommended_fix: "w" },
+          { severity: "P1", file: FINDING_412.file, line: 0, title: "no valid line", failure_scenario: "x", root_cause: "y", evidence: "z", recommended_fix: "w", recommended_test: "t" },
+          { severity: "P0", file: "does/not/exist.ts", line: 1, title: "consider renaming this, it might be wrong", failure_scenario: "could be bad", root_cause: "style", evidence: "none", recommended_fix: "maybe refactor", recommended_test: "none" },
+        ],
+      },
+      SAMPLE_PRS["pay-412"],
+      DEFAULT_SETTINGS,
+    );
+    assert.equal(gate.ok, true);
+    if (gate.ok) {
+      assert.equal(gate.findings.length, 0);
+      assert.equal(gate.malformed, 2, "the phantom-file drop is policy, not shape");
+      assert.equal(gate.dropped.length, 3);
+    }
+  });
+
   it("rejects empty findings that never inspected the snapshot", () => {
     const gate = gateLiveSubmission(
       { merge_recommendation: "COMMENT", findings: [] },

@@ -63,7 +63,7 @@ const RAW = "P1 a.ts:1 LOCAL-RAW duplicate request writes twice";
 const RENDER: Record<PostedOutcome, { job: RowJob; findings: Finding[] }> = {
   findings: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw" }), findings: [finding] },
   raw: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw" }), findings: [] },
-  "raw-unverified": { job: verifying({ localVerified: false, rawReview: RAW, localVerifyNote: "chatgpt found nothing; local verification's reply was not parseable review JSON; it is posted verbatim below. Not a clean pass." }), findings: [] },
+  "raw-unverified": { job: verifying({ localVerified: false, rawReview: RAW, localVerifyNote: "chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); it is posted verbatim below. Not a clean pass." }), findings: [] },
   clean: { job: job({ localReviewRole: "race" }), findings: [] },
   "verified-clean": { job: verifying({ localVerified: true, localVerifyNote: "chatgpt found nothing; local verification agreed." }), findings: [] },
   "unverified-clean": { job: verifying({ localVerified: false, localVerifyNote: "chatgpt found nothing; local verification did not complete (x), so this is chatgpt's unverified clean result." }), findings: [] },
@@ -91,8 +91,8 @@ describe("reviewSummaryBody: every part of the body comes from the outcome", () 
     const body = render("raw-unverified");
     assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
     assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 unverified=1");
-    assert.match(body, /local verification's reply was not parseable review JSON/);
-    assert.match(body, /Local verification reply posted verbatim — it was not parseable review JSON\./);
+    assert.match(body, /local verification's reply could not be used as a review/);
+    assert.match(body, /Local verification reply posted verbatim — it could not be used as a review\./);
     const block = body.slice(body.indexOf(REVIEW_RAW_START), body.indexOf(REVIEW_RAW_END));
     assert.ok(block.includes(RAW), "the verifier's finding text is inside the raw block");
   });
@@ -154,9 +154,10 @@ describe("outcomeNote", () => {
   it("N2 local findings in the verification round", () => assert.equal(outcomeNote("findings", { chat, verifying: true, findings: 2 }), "chatgpt found nothing; local verification found 2."));
   it("N3 chat findings (no verification round)", () => assert.equal(outcomeNote("findings", { chat, verifying: false, findings: 2 }), ""));
   it("N4 unverified-clean names the failure", () => assert.match(outcomeNote("unverified-clean", { chat, verifying: true, findings: 0, localError: "x" }), /did not complete \(x\)/));
-  it("N5 raw-unverified says the reply is posted verbatim and is not clean", () => {
+  it("N5 raw-unverified names why the reply was unusable, says it is posted verbatim and is not clean", () => {
     const note = outcomeNote("raw-unverified", { chat, verifying: true, findings: 0 });
-    assert.match(note, /not parseable review JSON; it is posted verbatim below\. Not a clean pass\./);
+    assert.match(note, /could not be used as a review \(not review JSON\); it is posted verbatim below\. Not a clean pass\./);
+    assert.match(outcomeNote("raw-unverified", { chat, verifying: true, findings: 0, localError: "1 finding(s) missing required fields" }), /\(1 finding\(s\) missing required fields\)/);
   });
   it("N6 credits only the chat reviewers pinned as clean (a skipped grok found nothing by absence)", () => {
     assert.equal(outcomeNote("verified-clean", { chat: ["chatgpt"], verifying: true, findings: 0 }).startsWith("chatgpt found nothing"), true);

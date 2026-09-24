@@ -75,7 +75,7 @@ export function outcomeNote(
     return `${chat} found nothing; local verification did not complete (${input.localError || "unavailable"}), so this is ${chat}'s unverified clean result.`;
   }
   if (outcome === "raw-unverified") {
-    return `${chat} found nothing; local verification's reply was not parseable review JSON; it is posted verbatim below. Not a clean pass.`;
+    return `${chat} found nothing; local verification's reply could not be used as a review (${input.localError || "not review JSON"}); it is posted verbatim below. Not a clean pass.`;
   }
   return "";
 }

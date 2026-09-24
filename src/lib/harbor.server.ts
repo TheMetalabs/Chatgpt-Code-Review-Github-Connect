@@ -31,7 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, heldLocalSalvage, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
+import { chatStalled, heldLocalEvidence, heldLocalReleased, heldLocalSalvage, heldLocalUnusable, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -1034,9 +1034,11 @@ export async function submitHarborChat(
   const gates: LiveGateResult[] = [];
   const byProvider = new Map<ReviewProvider, LiveGateResult>();
   const invalid: string[] = [];
+  const heldLocal = !job.chatFpRound && heldLocalReleased(job);
+  let localUnusable: string | undefined;
   for (const leg of payloads) {
-    const parsed = parseChatSubmission(leg.raw);
-    const gate = gateLiveSubmission(parsed, sample, state.settings);
+    const { gate, unusable } = gateLeg(leg, sample, heldLocal);
+    if (unusable) localUnusable = unusable;
     if (!gate.ok) {
       invalid.push(`${leg.provider}: ${gate.reason}`);
       continue;
@@ -1087,6 +1089,7 @@ export async function submitHarborChat(
   const nextAssumptions = [
     skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
     ...invalid,
+    localUnusable ? `local: ${localUnusable} (reply posted verbatim)` : "",
     ...merged.assumptions,
   ].filter(Boolean);
   // merged.findings is already publish-gated (gateLiveSubmission applies the poster's partition with
@@ -1102,9 +1105,10 @@ export async function submitHarborChat(
     return { ok: true };
   }
   const localError =
+    localUnusable ||
     (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
     invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
-    (byProvider.get("local")?.rawReview ? "its reply could not be parsed" : undefined);
+    (byProvider.get("local")?.rawReview ? "not review JSON" : undefined);
   const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, localError });
   transitionJob(jobId, (j) => ({
     ...j,
@@ -1124,6 +1128,16 @@ export async function submitHarborChat(
   }));
   await finishJob(jobId, sample, token);
   return finishResult(jobId);
+}
+
+/** Gate one reviewer leg. A released held local leg whose reply is not a verdict (docs §1: it failed
+ * the gate, or the gate dropped a finding it reported) is gated as evidence instead: its complete text
+ * posts verbatim, so it never counts as verification and nothing it reported is lost. */
+function gateLeg(leg: ChatLeg, sample: SamplePr, heldLocal: boolean): { gate: ReturnType<typeof gateLiveSubmission>; unusable?: string } {
+  const parsed = parseChatSubmission(leg.raw);
+  const gate = gateLiveSubmission(parsed, sample, state.settings);
+  const unusable = heldLocal && leg.provider === "local" ? heldLocalUnusable(gate) : undefined;
+  return unusable ? { gate: gateLiveSubmission(heldLocalEvidence(parsed, leg), sample, state.settings), unusable } : { gate };
 }
 
 type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kind: "fallback" };

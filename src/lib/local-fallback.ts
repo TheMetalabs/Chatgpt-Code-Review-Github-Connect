@@ -107,6 +107,36 @@ export function chatStalled(input: {
   return input.now - input.disconnectedAt >= input.graceMs;
 }
 
+/** A verify-clean job's held local leg that has been released (verification round or fallback). */
+export function heldLocalReleased(
+  job: Pick<Job, "localReviewRole" | "reviewProviders" | "localVerifyStartedAt" | "localFallbackAt">,
+): boolean {
+  const released = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
+  return released && localVerifies({ role: job.localReviewRole, providers: job.reviewProviders ?? [] });
+}
+
+/** Why a released held local leg's parsed reply is not a verdict (docs/local-verify-clean.md §1), or
+ * undefined when it is one. It must pass the gate on its own with every finding it reported intact:
+ * a verifier whose finding the gate dropped for its shape did not agree with a clean chat result. */
+export function heldLocalUnusable(
+  gate: { ok: true; malformed?: number; rawReview?: string } | { ok: false; reason: string },
+): string | undefined {
+  if (!gate.ok) return gate.reason;
+  if (gate.rawReview) return undefined; // already salvaged verbatim
+  if (gate.malformed) return `${gate.malformed} finding(s) missing required fields`;
+  return undefined;
+}
+
+/** What to gate in place of an unusable held local reply: whatever parsed, with every completed reply
+ * attached verbatim as raw_review, so it posts as evidence and never counts as a verdict. */
+export function heldLocalEvidence(
+  parsed: Record<string, unknown> | null,
+  leg: { raw: string; originalText?: string; unparsedText?: string },
+): Record<string, unknown> {
+  const salvaged = JSON.parse(salvageReviewJson(localReplies({ unparsedText: leg.unparsedText, originalText: leg.originalText || leg.raw })));
+  return { ...salvaged, ...(parsed ?? {}), raw_review: salvaged.raw_review };
+}
+
 /** Every completed reply of a local leg, each once, in the order the model wrote them. */
 export function localReplies(leg: { unparsedText?: string; originalText?: string }): string {
   return [...new Set([leg.unparsedText, leg.originalText].map((t) => t?.trim() ?? "").filter(Boolean))].join("\n\n---\n\n");
@@ -122,8 +152,7 @@ export function heldLocalSalvage(
   job: Pick<Job, "localReviewRole" | "reviewProviders" | "localVerifyStartedAt" | "localFallbackAt">,
   failure: { originalText?: string; unparsedText?: string },
 ): string | undefined {
-  const released = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
-  if (!released || !localVerifies({ role: job.localReviewRole, providers: job.reviewProviders ?? [] })) return undefined;
+  if (!heldLocalReleased(job)) return undefined;
   const replies = localReplies(failure);
   return replies ? salvageReviewJson(replies) : undefined;
 }

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, heldLocalSalvage, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import { chatStalled, heldLocalEvidence, heldLocalSalvage, heldLocalUnusable, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
 
 describe("shouldStartLocalRace", () => {
   it("starts local immediately when the setting is on", () => {
@@ -180,5 +180,31 @@ describe("heldLocalSalvage", () => {
   it("a failure with no completed reply (HTTP 500, transport error) stays a failure", () => {
     assert.equal(heldLocalSalvage({ ...held, localVerifyStartedAt: 1 }, {}), undefined);
     assert.equal(heldLocalSalvage({ ...held, localVerifyStartedAt: 1 }, { originalText: "  " }), undefined);
+  });
+});
+
+describe("heldLocalUnusable / heldLocalEvidence: a released held local reply is a verdict only when the gate used all of it", () => {
+  const ok = { ok: true as const, malformed: 0 };
+  it("a clean gate is a verdict; an already salvaged reply is left as it is", () => {
+    assert.equal(heldLocalUnusable(ok), undefined);
+    assert.equal(heldLocalUnusable({ ...ok, malformed: 1, rawReview: "x" }), undefined);
+  });
+
+  it("a rejected gate or a finding dropped for its shape is not", () => {
+    assert.equal(heldLocalUnusable({ ok: false, reason: "empty findings without investigated_safe" }), "empty findings without investigated_safe");
+    assert.equal(heldLocalUnusable({ ...ok, malformed: 2 }), "2 finding(s) missing required fields");
+  });
+
+  it("evidence keeps what parsed and attaches every completed reply verbatim", () => {
+    const parsed = { findings: [{ title: "partial" }], merge_recommendation: "REQUEST_CHANGES" };
+    const out = heldLocalEvidence(parsed, { raw: "{}", originalText: "P1 a.ts:1 FULL-REPLY", unparsedText: "P1 FIRST-REPLY" });
+    assert.deepEqual(out.findings, parsed.findings);
+    assert.match(String(out.raw_review), /Detected severity markers: P1\.[\s\S]*FIRST-REPLY[\s\S]*\n---\n[\s\S]*FULL-REPLY/);
+  });
+
+  it("with no parsed object or original text the leg's JSON itself is the evidence", () => {
+    const out = heldLocalEvidence(null, { raw: '{"findings":"P1 a.ts:1 IN-JSON"}' });
+    assert.deepEqual(out.findings, []);
+    assert.match(String(out.raw_review), /IN-JSON/);
   });
 });

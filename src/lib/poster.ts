@@ -242,6 +242,9 @@ export type LiveGateResult = {
   assumptions: string[];
   coverage?: ModelCoverage[];
   dropped: string[];
+  /** How many findings were dropped for their shape (a required field missing, no valid line):
+   * the reviewer reported them, so a result that lost one is not the reviewer's full verdict. */
+  malformed?: number;
   // Verbatim reply preserved when it was not parseable review JSON and local repair was off.
   // Surfaced in the review body so the fixing agent can interpret it (never dropped).
   rawReview?: string;
@@ -270,10 +273,12 @@ export function gateLiveSubmission(
   const raw = Array.isArray(submitted.findings) ? submitted.findings : [];
   const parsed: Finding[] = [];
   const dropped: string[] = [];
+  let malformed = 0;
   raw.slice(0, 8).forEach((row, i) => {
     const f = asFinding(row, i);
     if (!f) {
       dropped.push(`finding ${i}: missing required fields`);
+      malformed += 1;
       return;
     }
     parsed.push(f);
@@ -313,6 +318,7 @@ export function gateLiveSubmission(
       : [],
     coverage: parseCoverage(submitted.coverage),
     dropped,
+    malformed,
     rawReview: rawReview || undefined,
   };
 }

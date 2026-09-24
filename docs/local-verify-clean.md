@@ -24,7 +24,7 @@ race.
 | `verify` | verifier, round not started, 0 findings, no raw | (not posted: local verification round starts) | — | — |
 | `findings` | any structured finding | summary mark | `total=N inline=… body=… p0 p1 p2` | no |
 | `raw` | a salvaged (unparseable) reply, not a verifier's | summary mark | `total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` | no |
-| `raw-unverified` | verification round, local's reply unparseable | summary mark + note | raw marker + ` unverified=1` | no |
+| `raw-unverified` | verification round, local's reply could not be used as a review (below) | summary mark + note | raw marker + ` unverified=1` | no |
 | `incomplete` | 0 findings, no raw, a reviewer was skipped | summary mark | none | no |
 | `clean` | not a verifier, 0 findings, nothing skipped | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `verified-clean` | verification round, local returned a structured clean result | `Didn't find any major issues.` | `total=0 …` | **yes** |
@@ -41,6 +41,13 @@ Rules the table encodes:
   reply is still salvaged, and the multi-turn tool loop (`localReviewMode=multiturn`, or `auto` on a
   large PR) returns each failed group's completed reply the same way. A failure with no completed
   reply (HTTP 500, transport error, offline) stays a failure: `unverified-clean`.
+- A released held local leg's reply counts as a verdict only when it passes the gate on its own with
+  every finding it reported intact (`LiveGateResult.malformed` is 0). A reply the gate rejects (for
+  example a `findings` that is not a list, or an empty result without `investigated_safe`) or one
+  that lost a finding for its shape is gated as evidence instead (`heldLocalEvidence` in
+  `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block. So a
+  verifier whose P1 the gate dropped never reads as "local verification agreed", and the note names
+  why the reply could not be used.
 - `unverified=1` is never CONVERGED, and only `clean` / `verified-clean` print the clean sentinel.
   `postedOutcome` renders a `verify` that somehow reaches the poster as `unverified-clean`.
 - Local as the chat-down fallback is an ordinary reviewer: chat unusable + local clean posts

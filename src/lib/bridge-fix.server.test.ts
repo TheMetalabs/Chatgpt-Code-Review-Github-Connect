@@ -251,7 +251,7 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     const a = queueAndTake(h, { pr: 1 });
     const b = h.reg.request({ ...REQ, pr: 2 });
     assert.equal(h.reg.peek(), undefined, "the cap holds B queued");
-    assert.deepEqual(h.reg.counts(), { queued: 1, claimed: 1 });
+    assert.deepEqual(h.reg.counts(), { queued: 1, claimed: 1, active: 1 });
     h.setLimit(2); // only to learn B's id
     const bNext = h.reg.peek();
     assert.ok(bNext);
@@ -274,7 +274,8 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     const next = h.reg.peek();
     assert.ok(next, "the stale claim no longer counts against the cap");
     assert.ok(h.reg.take(next.id, "chrome-2"), "another profile takes PR 2's fix");
-    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 1 });
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 2, active: 1 }, "A's request is still pending (live), but holds no slot");
+    assert.deepEqual(h.reg.state(a.offer.jobId), { active: true, status: "awaiting_chat" });
     void a.promise.catch(() => {});
     void b.catch(() => {});
   });
@@ -292,7 +293,7 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     const replay = h.reg.take(first.id, "chrome-1");
     assert.equal(replay?.leaseId, lost.leaseId);
     assert.equal(replay?.prompt, REQ.prompt);
-    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 1 });
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 1, active: 1 });
     // another profile never gets it, and a worker that lists it is not offered it again
     assert.equal(h.reg.peek([], "chrome-2"), undefined);
     assert.equal(h.reg.take(first.id, "chrome-2"), null);
@@ -311,7 +312,7 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     assert.ok(bNext && h.reg.take(bNext.id, "chrome-2"), "B takes the freed slot");
     assert.equal(h.reg.refresh(a.offer.jobId, a.offer.leaseId, { chatgpt: true }), false, "A's heartbeat cannot revive it");
     assert.deepEqual(h.reg.claim(a.offer.jobId, "chrome-1"), { ok: false, error: "fix parallel limit reached (fixAgent.parallelPrs)" });
-    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 1 });
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 2, active: 1 });
     void a.promise.catch(() => {});
     void b.catch(() => {});
   });
@@ -405,7 +406,7 @@ describe("bridge fix registry: request validation", () => {
       assert.doesNotMatch(error.message, /SECRET-FILE-CONTENT/);
       return true;
     });
-    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0 });
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0, active: 0 });
     assert.equal(h.timers.length, 0);
   });
 
@@ -415,7 +416,7 @@ describe("bridge fix registry: request validation", () => {
     await assert.rejects(h.reg.request({ ...REQ, pr: 0 }), /needs owner, repo and a PR number/);
     await assert.rejects(h.reg.request({ ...REQ, repo: "" }), /needs owner, repo and a PR number/);
     await assert.rejects(h.reg.request({ ...REQ, prompt: "  " }), /empty fix prompt/);
-    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0 });
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0, active: 0 });
   });
 
   it("env overrides are clamped to sane bounds", () => {

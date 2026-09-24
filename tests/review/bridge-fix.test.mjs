@@ -67,6 +67,15 @@ test('a fix whose take response was lost is replayed to the same profile, not he
   void pending;
 });
 
+test('a review of unknown age keeps its precedence over a queued fix', async () => {
+  const review = makeJob({id: 'R', pr: 4});delete review.createdAt;
+  const h = bridgeHarness([review]);
+  const pending = quiet(h.bridge.requestBridgeFix(FIX));
+  assert.equal(h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true}).jobId, 'R');
+  assert.equal(h.bridge.takeNextBridgeJob('chrome-2', ['R'], {fixes: true}).kind, 'fix', 'then the fix');
+  void pending;
+});
+
 test('a fix requested before the next review is served first', async () => {
   const h = bridgeHarness([makeJob({id: 'A', pr: 1, createdAt: Date.now() + 60_000})]);
   const pending = quiet(h.bridge.requestBridgeFix(FIX));

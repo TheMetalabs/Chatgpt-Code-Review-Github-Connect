@@ -426,11 +426,17 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     );
   }
 
-  function counts(): { queued: number; claimed: number } {
+  /** Live items: queued, claimed (every live claim, stale ones included: their requests are still
+   * pending), and active — the claims holding a parallelPrs slot (stale ones do not). */
+  function counts(): { queued: number; claimed: number; active: number } {
     prune();
     let queued = 0;
-    for (const item of items.values()) if (item.state === "queued") queued += 1;
-    return { queued, claimed: claimedCount() };
+    let claimed = 0;
+    for (const item of items.values()) {
+      if (item.state === "queued") queued += 1;
+      else if (item.state === "claimed") claimed += 1;
+    }
+    return { queued, claimed, active: claimedCount() };
   }
 
   const providerOf = (id: string): FixChatProvider | undefined => items.get(id)?.provider;

@@ -210,7 +210,8 @@ function takeFix(clientId: string, excludeJobIds: readonly string[], review: Ret
     // The OLDEST review this profile could take, not the candidate (harbor lists jobs newest
     // first): a fix never jumps ahead of a review requested before it.
     const waiting = getHarbor().jobs.filter(j => reviewEligible(j, clientId, excludeJobIds)).map(j => j.createdAt);
-    if (!waiting.length || next.createdAt > Math.min(...waiting)) return null;
+    // A review of unknown age keeps today's precedence (Math.min over a missing value is NaN).
+    if (!waiting.length || !waiting.every(Number.isFinite) || next.createdAt > Math.min(...waiting)) return null;
   }
   const offer = fixes().take(next.id, clientId);
   if (offer) {

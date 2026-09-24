@@ -12,8 +12,8 @@
  *   emits of the same key, and returns a CLOSED outcome (posted | exists | unknown | rejected) that
  *   every caller handles in an exhaustive switch.
  * - OwnWrites journals every write, never evicted by age or size. Every session read reconciles it
- *   against the listed history (a listed row confirms its entry) and folds the entries the list does
- *   not show yet as stand-in events: the loop reads its own writes.
+ *   against the listed history (a listed row the event collector reads confirms its entry) and
+ *   folds the other entries as stand-in events: the loop reads its own writes.
  *
  * DI-only (no transport import): it is reached only through the gated loop engine and runtime.
  * NON-GOALS: dedup across processes or restarts (the journal is in-process; single harbor instance).
@@ -136,6 +136,32 @@ export function listedMatch(rows: readonly ControlRow[], w: ControlWrite, botLog
   return rows.find((r) => isSelfLogin(r.userLogin, botLogin) && rowMatches(w, r));
 }
 
+/** A real instant (GitHub reports a missing created_at as ""; a malformed one parses to NaN). */
+export function datable(iso: string | null | undefined): boolean {
+  return !Number.isNaN(isoMs(iso));
+}
+
+/**
+ * Does the event collector (review-loop-engine readLoopEvents) turn this listed row of `w` into
+ * `w`'s event? A start or stop RECORD carries its own time in its marker; a continuation or handoff
+ * is placed at the row's createdAt, which must be a real instant. Only such a row retires the
+ * write's stand-in: a row the collector skips would otherwise make the event vanish exactly when
+ * the list catches up (it still proves the write exists — no second POST).
+ */
+export function collectable(w: ControlWrite, row: ControlRow): boolean {
+  const k = w.key;
+  switch (k.kind) {
+    case "start":
+    case "stop":
+      return true;
+    case "continue":
+    case "handoff":
+      return datable(row.createdAt);
+    default:
+      return assertNever(k);
+  }
+}
+
 /**
  * posted   — THIS emit created the row: its POST returned it, or answered "unknown" and a re-check
  *            then listed it (the gate is exclusive per key, so that row is this emit's);
@@ -251,13 +277,14 @@ export class OwnWrites {
     return !!hit;
   }
 
-  /** RECONCILE, then FOLD: every entry of the PR that a listed row matches is confirmed; every
-   * other entry that folds becomes a stand-in event. Called on every session read. */
+  /** RECONCILE, then FOLD: every entry of the PR that a collectable listed row matches is confirmed
+   * (that row is its event now); every other entry that folds becomes a stand-in event. Called on
+   * every session read. */
   standIns(ref: PrRef, listed: readonly ControlRow[], botLogin: string): LoopEvent[] {
     const out: LoopEvent[] = [];
     for (const e of this.byPr.get(prKey(ref))?.values() ?? []) {
       const hit = listedMatch(listed, e.write, botLogin);
-      if (hit) confirm(e, hit);
+      if (hit && collectable(e.write, hit)) confirm(e, hit);
       else if (folds(e)) out.push(standInEvent(e));
     }
     return out;
@@ -291,8 +318,11 @@ export class OwnWrites {
   }
 }
 
+/** A listed row that is `e`'s write confirms it — only a row the collector turns into its event:
+ * an uncollectable one leaves the entry (and its stand-in) as it was. */
 function confirm(e: OwnWrite, row: ControlRow): void {
   if (e.state === "sending") return; // its POST answers for it
+  if (!collectable(e.write, row)) return;
   e.state = "posted";
   e.row = { id: row.id, userLogin: row.userLogin, createdAt: row.createdAt };
 }

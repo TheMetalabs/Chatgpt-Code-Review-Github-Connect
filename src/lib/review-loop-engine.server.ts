@@ -36,6 +36,7 @@ import { deriveLoopSession, type LoopEvent, type LoopSession } from "./review-lo
 import {
   assertNever,
   controlInSession,
+  datable,
   emitControl,
   inSession,
   ownWrites,
@@ -392,6 +393,27 @@ function pushStop(events: LoopEvent[], c: { body?: string; createdAt?: string; u
 }
 
 /**
+ * The loop event of one of the App's own issue comments. Start and stop RECORDS carry their own
+ * time in the marker, so a row without a usable createdAt still holds them; every other App event
+ * is placed at the row's createdAt and needs a real instant. The journal retires a stand-in only
+ * for a row this collects (review-loop-control collectable): keep the two in step.
+ */
+function appEvent(c: { id?: number; body: string; createdAt?: string }, pr: number): LoopEvent | undefined {
+  const bot = { authoredByBot: true };
+  const at = datable(c.createdAt) ? c.createdAt : undefined;
+  const start = parseStartMarker(c.body, bot);
+  if (start) return { at: start.at, kind: "start", mode: start.mode, actor: start.by, ...(c.id ? { seq: c.id } : {}) };
+  if (parseEscalateMarker(c.body, bot)) return at ? { at, kind: "escalate" } : undefined;
+  // A recorded stop is placed at the stop's own time (an edit or a PR-body stop the fold cannot
+  // replay); a bare legacy acknowledgement is an event at its own creation.
+  const stopRecord = parseStopRecord(c.body, bot);
+  if (stopRecord) return { at: stopRecord.at, kind: "stop", actor: stopRecord.by };
+  if (isStoppedComment(c.body, bot)) return at ? { at, kind: "stopped" } : undefined;
+  const cont = canonicalContinuation(c.body, bot);
+  return cont && cont.pr === pr && at ? { at, kind: "continue", head: cont.head } : undefined;
+}
+
+/**
  * Collect the PR's loop events from durable history. Authorship is enforced HERE:
  * - STARTS come only from the App's start record (review-loop.ts startComment), posted when harbor
  *   accepts a fresh start directive, at the directive's own event time. Mutable human text — a
@@ -422,21 +444,10 @@ export async function readLoopEvents(
   ]);
   const events: LoopEvent[] = [];
   for (const c of issues) {
-    if (!c.createdAt) continue;
-    if (isSelfLogin(c.userLogin, botLogin)) {
-      const bot = { authoredByBot: true };
-      const start = parseStartMarker(c.body, bot);
-      const stopRecord = parseStopRecord(c.body, bot);
-      const cont = canonicalContinuation(c.body, bot);
-      if (start) events.push({ at: start.at, kind: "start", mode: start.mode, actor: start.by, ...(c.id ? { seq: c.id } : {}) });
-      else if (parseEscalateMarker(c.body, bot)) events.push({ at: c.createdAt, kind: "escalate" });
-      // A recorded stop is placed at the stop's own time (an edit or a PR-body stop the fold
-      // cannot replay); a bare legacy acknowledgement is an event at its own creation.
-      else if (stopRecord) events.push({ at: stopRecord.at, kind: "stop", actor: stopRecord.by });
-      else if (isStoppedComment(c.body, bot)) events.push({ at: c.createdAt, kind: "stopped" });
-      else if (cont && cont.pr === pr) events.push({ at: c.createdAt, kind: "continue", head: cont.head });
-    } else {
-      pushStop(events, c);
+    if (!isSelfLogin(c.userLogin, botLogin)) pushStop(events, c);
+    else {
+      const e = appEvent(c, pr);
+      if (e) events.push(e);
     }
   }
   for (const c of inline) {

@@ -5,13 +5,15 @@ import {
   controlKey,
   emitControl,
   ownWrites,
+  type ControlKind,
   type ControlRow,
   type ControlWrite,
   type EmitContext,
   type EmitOutcome,
 } from "./review-loop-control.ts";
-import { escalateMarker, stoppedComment } from "./review-loop.ts";
-import { deriveLoopSession } from "./review-loop-session.ts";
+import { continueComment, escalateMarker, startComment, stoppedComment } from "./review-loop.ts";
+import { readLoopEvents } from "./review-loop-engine.server.ts";
+import { deriveLoopSession, type LoopEvent } from "./review-loop-session.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 const HEAD = "a".repeat(40);
@@ -38,6 +40,12 @@ function world(plan: Array<"ok" | "rejected" | "landed" | "lost"> = ["ok"]) {
     async listIssueComments() {
       return w.hidden ? [] : [...rows];
     },
+    async listReviewComments() {
+      return [];
+    },
+    async listPullReviews() {
+      return [];
+    },
     async createIssueComment(_t: string, o: { body: string }) {
       const step = plan[Math.min(posts++, plan.length - 1)];
       clock += 1_000; // the server stamps the row after the request left
@@ -46,7 +54,7 @@ function world(plan: Array<"ok" | "rejected" | "landed" | "lost"> = ["ok"]) {
       if (step === "lost") throw unknownErr();
       rows.push(row);
       if (step === "landed") throw unknownErr();
-      return row;
+      return { ...row }; // GitHub's response, not the stored row
     },
   };
   const ctx: EmitContext = {
@@ -152,5 +160,46 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
       }
     };
     assert.throws(() => label({ status: "unknown", attemptAt: "", error: "e" }), /unhandled case/);
+  });
+
+  it("a listed row the collector cannot place (createdAt '' or malformed) does not retire the stand-in: one event, the session unchanged", async () => {
+    const LATER = "2026-02-25T00:00:00Z";
+    // The session's start record precedes every row this world stores (id 0): a continuation or
+    // handoff row is matched by its id, as in production once the start is listed.
+    const since = { iso: SESSION, seq: 0 };
+    const writes: Record<ControlKind, ControlWrite> = {
+      start: { key: { kind: "start", ref: ref(), by: "bob", at: LATER, mode: "apply" }, body: startComment({ mode: "apply", by: "bob", at: LATER }) },
+      stop: { key: { kind: "stop", ref: ref(), by: "bob", at: LATER }, body: stoppedComment({ by: "bob", at: LATER }) },
+      continue: {
+        key: { kind: "continue", ref: ref(), head: HEAD, sessionIso: SESSION },
+        body: continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD }),
+        since,
+      },
+      handoff: { ...handoff(), since },
+    };
+    const anchor: LoopEvent = { at: SESSION, kind: "start", actor: "alice", mode: "suggest", seq: 0 };
+    const bare = (es: LoopEvent[]) => es.map(({ seq: _seq, ...e }) => e); // a listed start adds its id
+    for (const kind of Object.keys(writes) as ControlKind[]) {
+      for (const plan of ["ok", "landed"] as const) {
+        for (const createdAt of ["", "yesterday"]) {
+          const label = `${kind} | ${plan} | createdAt=${JSON.stringify(createdAt)}`;
+          const f = world([plan]);
+          f.w.hidden = true; // the first session read finds only the journal
+          const read = () => readLoopEvents(f.gh, "t", "o", "r", 1, { botLogin: BOT });
+          assert.equal((await emitControl(f.ctx, writes[kind])).status, plan === "ok" ? "posted" : "unknown", label);
+          const before = await read();
+          assert.equal(before.length, 1, `${label}: the stand-in`);
+          for (const r of f.rows) r.createdAt = createdAt;
+          f.w.hidden = false; // the list catches up with a row it cannot date
+          for (const pass of ["reconciles", "after"]) {
+            const after = await read();
+            assert.deepEqual(bare(after), bare(before), `${label} (${pass}): exactly one equivalent event`);
+            assert.deepEqual(deriveLoopSession([anchor, ...after]), deriveLoopSession([anchor, ...before]), `${label} (${pass}): the session changed`);
+          }
+          assert.equal((await emitControl(f.ctx, writes[kind])).status, "exists", `${label}: the listed row still proves the write`);
+          assert.equal(f.posts(), 1, `${label}: one POST`);
+        }
+      }
+    }
   });
 });

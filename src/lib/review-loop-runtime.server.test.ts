@@ -314,6 +314,26 @@ describe("the loop is OFF unless the operator sets ASHLAR_FIX_AGENT=1 (no other 
     assert.deepEqual(importers, ["lib/review-loop-runtime.server.ts"]);
   });
 
+  it("the control-write gate is reached only through the gated engine and runtime", () => {
+    const importers = sources(SRC)
+      .filter((file) => /from\s+["'][^"']*review-loop-control(\.ts)?["']/.test(readFileSync(file, "utf8")))
+      .map((file) => relative(SRC, file))
+      .sort();
+    assert.deepEqual(importers, ["lib/review-loop-engine.server.ts", "lib/review-loop-runtime.server.ts"]);
+  });
+
+  it("control markers reach GitHub only through emitControl (one POST site); the runtime posts only progress and reports", () => {
+    const posts = (file: string) =>
+      readFileSync(join(SRC, file), "utf8")
+        .split("\n")
+        .filter((l) => !isComment(l) && /\.createIssueComment\(/.test(l));
+    assert.deepEqual(posts("lib/review-loop-engine.server.ts"), [], "the engine never POSTs a comment itself");
+    assert.equal(posts("lib/review-loop-control.ts").length, 1, "emitControl's one POST");
+    const runtime = posts("lib/review-loop-runtime.server.ts");
+    assert.ok(runtime.length > 0);
+    for (const l of runtime) assert.match(l, /body: (fixingComment|renderFixReport)\(/, `a control marker posted around the gate: ${l.trim()}`);
+  });
+
   it("every loop entry point is inert without the flag or without a provider: no GitHub or provider call", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3] });
     let calls = 0;

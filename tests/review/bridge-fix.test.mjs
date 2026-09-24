@@ -45,6 +45,16 @@ test('the next review goes first only if it predates the fix; one submission per
   assert.equal(await pending, 'ANSWER');
 });
 
+test('a fix never jumps ahead of an older review, even when a newer review is the candidate', async () => {
+  // harbor lists jobs newest first: R_new is the review candidate, R_old the oldest waiting review
+  const h = bridgeHarness([makeJob({id: 'R_new', pr: 3, createdAt: Date.now() + 60_000}), makeJob({id: 'R_old', pr: 1, createdAt: Date.now() - 60_000})]);
+  const pending = quiet(h.bridge.requestBridgeFix(FIX));
+  assert.equal(h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true}).jobId, 'R_new', 'an older review is waiting: no fix yet');
+  const fix = h.bridge.takeNextBridgeJob('chrome-2', ['R_new', 'R_old'], {fixes: true});
+  assert.equal(fix.kind, 'fix', 'with every older review taken, the fix goes before newer ones');
+  void pending;
+});
+
 test('a fix requested before the next review is served first', async () => {
   const h = bridgeHarness([makeJob({id: 'A', pr: 1, createdAt: Date.now() + 60_000})]);
   const pending = quiet(h.bridge.requestBridgeFix(FIX));

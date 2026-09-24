@@ -198,7 +198,7 @@ function recordFixProgress(jobId: string, leaseId: string | undefined, reports: 
   return fixes().progress(jobId, leaseId, latest?.stage);
 }
 
-/** The oldest queued fix unless the review candidate is older. Neither kind starves: live fixes
+/** The oldest queued fix unless an eligible review is older. Neither kind starves: live fixes
  * are bounded by fixAgent.parallelPrs and their deadline; a review waits for at most the fixes
  * requested before it. A review without a known age keeps today's precedence. */
 function takeFix(clientId: string, excludeJobIds: readonly string[], review: ReturnType<typeof nextBridgeJob>): FixOffer | null {
@@ -207,8 +207,10 @@ function takeFix(clientId: string, excludeJobIds: readonly string[], review: Ret
   const next = fixes().peek(excludeJobIds);
   if (!next) return null;
   if (review) {
-    const reviewAt = getHarbor().jobs.find(j => j.id === review.jobId)?.createdAt;
-    if (typeof reviewAt !== "number" || next.createdAt > reviewAt) return null;
+    // The OLDEST review this profile could take, not the candidate (harbor lists jobs newest
+    // first): a fix never jumps ahead of a review requested before it.
+    const waiting = getHarbor().jobs.filter(j => reviewEligible(j, clientId, excludeJobIds)).map(j => j.createdAt);
+    if (!waiting.length || next.createdAt > Math.min(...waiting)) return null;
   }
   const offer = fixes().take(next.id, clientId);
   if (offer) {
@@ -233,6 +235,19 @@ export function bridgeJobState(jobId: string) {
   return {active: job?.status === "awaiting_chat", status: job?.status ?? "missing"};
 }
 
+/** A review job this Chrome profile may take now (nextBridgeJob's filter; takeFix orders by it). */
+function reviewEligible(job: Job, clientId: string, excludeJobIds: readonly string[]): boolean {
+  if (excludeJobIds.includes(job.id) || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) return false;
+  if (job.bridgeClaimedAt && !STALE_CLAIM(job)) return false;
+  if (!pendingChatProviders(job).length) return false;
+  // Only the owning Chrome profile has the original tab. Never start a replacement
+  // generation from another profile merely because the heartbeat expired.
+  const attempted = job.attemptedProviders ?? [];
+  if (attempted.length && job.bridgeClientId && job.bridgeClientId !== clientId) return false;
+  const prompts = job.chatPromptByProvider;
+  return Boolean(job.chatPrompt || prompts?.chatgpt || prompts?.grok);
+}
+
 export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): {
   jobId: string;
   provider: ReviewProvider;
@@ -251,17 +266,11 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
   // Only one foreground submission at a time per Chrome profile (see SUBMIT_WINDOW_MS).
   if (submissionInFlightForClient(harbor.jobs, clientId)) return null;
   for (const job of harbor.jobs) {
-    if (excludeJobIds.includes(job.id) || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) continue;
-    if (job.bridgeClaimedAt && !STALE_CLAIM(job)) continue;
+    if (!reviewEligible(job, clientId, excludeJobIds)) continue;
     const providers = pendingChatProviders(job);
-    if (!providers.length) continue;
     const attempted = job.attemptedProviders ?? [];
-    // Only the owning Chrome profile has the original tab. Never start a replacement
-    // generation from another profile merely because the heartbeat expired.
-    if (attempted.length && job.bridgeClientId && job.bridgeClientId !== clientId) continue;
     const prompts = job.chatPromptByProvider;
     const prompt = job.chatPrompt || prompts?.chatgpt || prompts?.grok || "";
-    if (!prompt) continue;
     return {
       jobId: job.id, provider: providers[0], providers,
       resumeProviders: providers.filter(p => attempted.includes(p)),

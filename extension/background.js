@@ -713,6 +713,15 @@ async function cleanupProviderBody(job, provider, jobs) {
       await saveJobs(jobs);return; // No deadline or forced eviction.
     }
     delete state.cleanupWaitReason;
+    if (job.kind === "fix") {
+      // The page proved the tab unchanged since collection; a fix tab is also Ashlar's only in the
+      // conversation its run was bound in, and the final check compares against that identity.
+      if (adoptFixConversation(state, result)) await saveJobs(jobs);
+      const bound = state.conversation;
+      if (!bound || conversationIdentity(result.url) !== bound) return preserveFixTab(job, provider, jobs, "the fix tab is not in its bound conversation; tab preserved", tab);
+      await closeProvenTab(job, provider, jobs, tab.id, url => url === result.url && conversationIdentity(url) === bound);
+      return;
+    }
     await closeProvenTab(job, provider, jobs, tab.id, result.url);
   } catch (e) {
     state.cleanupError = String(e.message || e).slice(0, 240);
@@ -721,12 +730,15 @@ async function cleanupProviderBody(job, provider, jobs) {
 }
 
 /** The one managed close, for a tab whose page just proved it may close (review: can-close;
- * fix: ownership on cancel): the tab must still be exactly on the page that answered (no pending
- * navigation, not loading), and the close is recorded durably before the remove so a worker that
- * stops in between retires it by absence. */
-async function closeProvenTab(job, provider, jobs, tabId, provenUrl, reason) {
+ * fix: ownership on cancel): the tab must still be on the proven page (`proven`: the exact URL
+ * that answered, or a predicate over the tab's URL that checks the identity the worker stored:
+ * a fix's bound conversation or its allocation page), with no pending navigation and not loading,
+ * and the close is recorded durably before the remove so a worker that stops in between retires
+ * it by absence. */
+async function closeProvenTab(job, provider, jobs, tabId, proven, reason) {
   const current = await chrome.tabs.get(tabId);
-  if (current.pendingUrl || current.url !== provenUrl || current.status === "loading") return false;
+  const holds = typeof proven === "function" ? proven : url => url === proven;
+  if (current.pendingUrl || !holds(current.url) || current.status === "loading") return false;
   job.states[provider].closeRequested = true;
   await saveJobs(jobs);
   await rememberOwnedTab(job, provider, true);
@@ -750,6 +762,29 @@ function onAllocationPage(url, provider) {
     const query = u => [...u.searchParams].map(([k, v]) => `${k}=${v}`).sort().join("&");
     return now.origin === opened.origin && now.pathname === opened.pathname && query(now) === query(opened);
   } catch { return false; }
+}
+
+/** A conversation's identity: its URL without the fragment (as the page pins it, json.js). */
+function conversationIdentity(url) {
+  return typeof url === "string" ? url.split("#")[0] : "";
+}
+
+/** A bare provider new-chat page (root path, no query) names no conversation yet (json.js). */
+function provisionalConversation(identity) {
+  return /^https?:\/\/[^/?#]+\/?$/.test(identity);
+}
+
+/** Keep the conversation a fix run was bound in, as its page pinned it in the submission journal
+ * when the sent turn was first proven exact: stored once and never replaced (except the page's one
+ * upgrade from a bare new-chat page to the conversation URL the provider assigned), so a later
+ * reply (or the tab's URL) is compared with it, never with a URL echoed by the same reply. True if
+ * the stored identity changed. */
+function adoptFixConversation(state, result) {
+  const seen = typeof result?.conversation === "string" && result.conversation.length <= 4096 ? result.conversation : "";
+  if (!seen || seen === state.conversation) return false;
+  if (state.conversation && !(provisionalConversation(state.conversation) && !provisionalConversation(seen))) return false;
+  state.conversation = seen;
+  return true;
 }
 
 /** How long a cancelled fix tab whose ownership is "unknown" is re-asked before it is preserved. */
@@ -796,16 +831,35 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     return waitOrPreserveFixTab(job, provider, jobs, "the fix tab carries another binding; tab preserved");
   }
   if (result.ownership === "unknown") {
+    // The page shows another conversation than the one the fix was bound in (an in-page move can
+    // leave the old DOM on screen): it is the user's now, and waiting cannot change a pinned identity.
+    if (result.identity === "changed") return preserveFixTab(job, provider, jobs, "the fix tab moved to another conversation; tab preserved", tab);
     // Not identifiable yet (a reload still rendering the sent turn): ask again next tick. Past the
     // wait, preserve it (never close what might be the user's) and have the page free its slot.
     return waitOrPreserveFixTab(job, provider, jobs, "fix tab ownership could not be established; tab preserved", tab);
   }
   if (result.owned !== true) return preserveFixTab(job, provider, jobs, "user took over the fix tab; tab preserved", tab);
-  // A verdict resting on a blank page (unsent, or started but not confirmed sent) is Ashlar's only
-  // while it is still the page this fix opened: one navigated to another conversation (even an
-  // empty one) is the user's. (A fresh blank chat in the same tab holds nothing of the user's.)
-  if ((unbound || result.blank === true) && !onAllocationPage(result.url, provider)) return preserveFixTab(job, provider, jobs, "the unsent fix tab moved to another page; tab preserved", tab);
-  await closeProvenTab(job, provider, jobs, tab.id, result.url, "fix cancelled; tab closed");
+  // A verdict resting on a page with no bound turn (blank, or the just-clicked prompt before the
+  // send was confirmed) proves content, not which page this is: it is Ashlar's only while the tab
+  // is still on the page this fix opened; one navigated to another conversation (even an empty one)
+  // is the user's. (A fresh blank chat in the same tab holds nothing of the user's.)
+  if (unbound || result.blank === true || result.unsent === true) {
+    if (!onAllocationPage(result.url, provider)) return preserveFixTab(job, provider, jobs, "the unsent fix tab moved to another page; tab preserved", tab);
+    await closeProvenTab(job, provider, jobs, tab.id, url => onAllocationPage(url, provider), "fix cancelled; tab closed");
+    return;
+  }
+  // A verdict resting on the bound turn holds only in the conversation that turn was bound in: the
+  // identity the worker stored (adopted once from the page's journal), never the URL echoed here.
+  if (adoptFixConversation(state, result)) await saveJobs(jobs);
+  const bound = state.conversation;
+  if (!bound || !result.conversation) {
+    state.cleanupError = "the fix conversation identity is not established; no tab was closed";
+    return waitOrPreserveFixTab(job, provider, jobs, "the fix conversation identity was never established; tab preserved", tab);
+  }
+  if (result.conversation !== bound || conversationIdentity(result.url) !== bound) {
+    return preserveFixTab(job, provider, jobs, "the fix tab moved to another conversation; tab preserved", tab);
+  }
+  await closeProvenTab(job, provider, jobs, tab.id, url => conversationIdentity(url) === bound, "fix cancelled; tab closed");
 }
 
 async function retireCleanJob(job, jobs, forgotten = false, signal) {
@@ -983,6 +1037,8 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       truncated: Boolean(item.truncated)};
     await saveJobs(jobs);
   }
+  // A fix page reports the conversation its run was bound in: kept once, never replaced.
+  if (job.kind === "fix" && adoptFixConversation(state, result)) await saveJobs(jobs);
   await rememberOwnedTab(job, provider);
   delete state.connectionError;
   if (isBusyResult(result)) return;

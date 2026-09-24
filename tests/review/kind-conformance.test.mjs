@@ -9,6 +9,7 @@ import {webcrypto} from 'node:crypto';
 import {background, storage, raw, flush, until} from './helpers.mjs';
 
 const URL_TAB = 'https://chatgpt.com/c/managed';
+const OTHER_TAB = 'https://chatgpt.com/c/users-own'; // a conversation the user moved the tab to
 const ANSWER = {review: raw, fix: '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'};
 const LATER_MS = 3 * 60_000; // past the fix ownership wait
 
@@ -39,7 +40,8 @@ const ROWS = [
   {id: 'W1', name: 'a collected answer is delivered by complete, then its proven tab closes and the job retires', same: true,
     expect: {completed: true, closed: [10], retired: true},
     async run(kind) {
-      const b = worker(kind, {api: active, handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: true, url: URL_TAB} : {ok: true, raw: ANSWER[kind], responseText: ANSWER[kind]}});
+      // (a fix page also reports the conversation its run was bound in; a review worker ignores it)
+      const b = worker(kind, {api: active, handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: true, url: URL_TAB, conversation: URL_TAB} : {ok: true, raw: ANSWER[kind], responseText: ANSWER[kind], conversation: URL_TAB}});
       await b.tick();
       return {completed: b.calls.some(c => c.action === 'complete' && c.raw === ANSWER[kind]), closed: b.closedTabs, retired: !b.pending()};
     }},
@@ -85,7 +87,7 @@ const ROWS = [
     // delivered, so its positively owned tab is force-closed and the job retires.
     expect: {review: {closed: 0, retired: false}, fix: {closed: 1, retired: true}},
     async run(kind) {
-      const b = worker(kind, {api: cancelled, handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
+      const b = worker(kind, {api: cancelled, handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
@@ -132,6 +134,77 @@ const ROWS = [
         handler: (_id, m) => (m.type === 'ashlar-fix-cancel' && m.undispatched ? {ok: true, owned: true, ownership: 'owned', url: OPENED, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'})});
       await b.tick();b.later();await b.tick();
       return {retired: !b.pending(), closed: b.closedTabs.length};
+    }},
+  // W23-W27: the conversation identity cell. A fix's bound turn pins the conversation it is shown
+  // in (the page's journal; the worker keeps it once). Page content alone never proves WHICH
+  // conversation a tab shows: after an in-page move the old DOM can stay rendered under the user's
+  // conversation URL, and the cancel reply then echoes that URL. A review has no forced close.
+  {id: 'W23', name: 'server cancelled after an in-page move: the content still proves the fix, the URL is another conversation',
+    expect: {review: {closed: 0, retired: false}, fix: {closed: 0, retired: true}},
+    async run(kind) {
+      const b = worker(kind, {api: cancelled, url: OTHER_TAB, job: item(kind, {}, {conversation: URL_TAB}),
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: OTHER_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: OTHER_TAB}});
+      await b.tick();
+      return {closed: b.closedTabs.length, retired: !b.pending()};
+    }},
+  {id: 'W24', name: 'server cancelled; the page reports its bound conversation changed',
+    // Waiting cannot change a pinned identity: the fix tab is preserved at once (slot freed).
+    expect: {review: {closed: 0, retired: false, released: false}, fix: {closed: 0, retired: true, released: true}},
+    async run(kind) {
+      const b = worker(kind, {api: cancelled, url: OTHER_TAB, job: item(kind, {}, {conversation: URL_TAB}),
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', identity: 'changed', url: OTHER_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: OTHER_TAB}});
+      await b.tick();
+      return {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true)};
+    }},
+  {id: 'W25', name: 'server cancelled; the bound conversation identity was never established',
+    // Not established = unknown ownership: asked again, then preserved (never closed).
+    expect: {review: {firstTick: true, afterWait: true, closed: 0}, fix: {firstTick: true, afterWait: false, closed: 0}},
+    async run(kind) {
+      const b = worker(kind, {api: cancelled, handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
+      await b.tick();
+      const firstTick = Boolean(b.pending());
+      b.later();await b.tick();
+      return {firstTick, afterWait: Boolean(b.pending()), closed: b.closedTabs.length};
+    }},
+  {id: 'W26', name: 'server cancelled; the just-clicked (unsent) prompt proves content, but the tab left its allocation page',
+    expect: {review: {closed: 0, retired: false}, fix: {closed: 0, retired: true}},
+    async run(kind) {
+      const b = worker(kind, {api: cancelled, url: OTHER_TAB,
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', unsent: true, url: OTHER_TAB} : {ok: true, canClose: false, reason: 'pending', url: OTHER_TAB}});
+      await b.tick();
+      return {closed: b.closedTabs.length, retired: !b.pending()};
+    }},
+  {id: 'W27', name: 'after delivery, can-close passes on a tab that is not in the stored bound conversation',
+    // Intended for the fix (the final check is the stored identity). The review cell keeps its
+    // page-context proof (FLAG R4: a review that collected the lingering DOM after an in-page move
+    // records its context under the new URL, so this close passes there). Asserted as today.
+    expect: {review: {closed: 1, retired: true}, fix: {closed: 0, retired: true}},
+    async run(kind) {
+      const b = worker(kind, {api: active, url: OTHER_TAB, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB}),
+        handler: () => ({ok: true, canClose: true, url: OTHER_TAB, conversation: URL_TAB})});
+      await b.tick();
+      return {closed: b.closedTabs.length, retired: !b.pending()};
+    }},
+  {id: 'W28', name: 'the worker keeps the bound conversation the page reports once, and never replaces it',
+    // Intended: only a fix run is bound to a conversation identity; review replies carry none.
+    expect: {review: {first: undefined, kept: undefined}, fix: {first: URL_TAB, kept: URL_TAB}},
+    async run(kind) {
+      let reported = URL_TAB;
+      const b = worker(kind, {api: active, handler: () => ({ok: false, code: 'busy', retry: true, ...(kind === 'fix' ? {conversation: reported} : {})})});
+      await b.tick();
+      const first = b.pending().states.chatgpt.conversation;
+      reported = OTHER_TAB;
+      await b.tick();
+      return {first, kept: b.pending().states.chatgpt.conversation};
+    }},
+  {id: 'W29', name: 'a bound identity on a bare new-chat page follows the provider-assigned conversation once, then never again',
+    expect: {review: {kept: [undefined, undefined, undefined]}, fix: {kept: ['https://chatgpt.com/', URL_TAB, URL_TAB]}},
+    async run(kind) {
+      const reports = ['https://chatgpt.com/', URL_TAB, OTHER_TAB], kept = [];
+      let reported;
+      const b = worker(kind, {api: active, handler: () => ({ok: false, code: 'busy', retry: true, ...(kind === 'fix' ? {conversation: reported} : {})})});
+      for (const next of reports) { reported = next;await b.tick();kept.push(b.pending().states.chatgpt.conversation); }
+      return {kept};
     }},
   {id: 'W11', name: 'a lease conflict (409) on complete drops the lease; the outcome is kept for redelivery', same: true,
     expect: {lease: undefined, kept: true},

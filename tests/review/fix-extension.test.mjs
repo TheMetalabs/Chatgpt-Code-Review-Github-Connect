@@ -17,6 +17,7 @@ const msg = (type, extra = {}) => ({type, jobId: 'fix-A', runId: 'run-A', provid
  * `bound`: the run's prompt is sent and its response identified (a fix reads nothing else). */
 function page({parts = PARTS, blocks = [PARTS[1]], limit = 50, bound = true} = {}) {
   const c = content('chatgpt');
+  c.context.location = {href: URL_FIX}; // the conversation the fix is bound in (pinned on its first exact observation)
   let polls = 0;
   Object.assign(c.context, {
     readSubmissionJournal: async () => (bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A'} : null),
@@ -162,7 +163,7 @@ const REVIEW_LANES = ['observe', 'capture', 'capture-read', 'repair', 'repair-st
 
 test('worker: a completed fix answer is delivered as plain text by complete, then its tab closes', async () => {
   const b = worker([fixJob()], {api: active,
-    handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: true, url: URL_FIX} : {ok: true, raw: ANSWER, responseText: ANSWER}});
+    handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: true, url: URL_FIX, conversation: URL_FIX} : {ok: true, raw: ANSWER, responseText: ANSWER, conversation: URL_FIX}});
   await b.tick();
   const complete = b.calls.find(c => c.action === 'complete');
   assert.equal(complete.jobId, 'fix-A');assert.equal(complete.leaseId, 'lease-A');
@@ -186,7 +187,7 @@ test('worker: fix items skip observation/capture/repair lanes; the same page sta
 });
 
 test('worker: a cancelled fix is force-closed via ashlar-fix-cancel even while its answer is pending', async () => {
-  const handler = (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, url: URL_FIX} : {ok: true, canClose: false, reason: 'pending'};
+  const handler = (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, url: URL_FIX, conversation: URL_FIX} : {ok: true, canClose: false, reason: 'pending'};
   const b = worker([fixJob()], {api: cancelled, handler});
   await b.tick();
   assert.deepEqual(b.closedTabs, [10]);assert.deepEqual(b.local.state.pendingReviewJobs, {});

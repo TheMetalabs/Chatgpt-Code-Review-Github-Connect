@@ -183,7 +183,7 @@ export function cancelHarborJob(jobId: string) {
   const job=state.jobs.find(j=>j.id===jobId);if(job)recordJobHistory(job);
 }
 
-function patchJob(jobId: string, fn: (j: Job) => Job) {
+function transitionJob(jobId: string, fn: (j: Job) => Job) {
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? fn(j) : j)) };
   const job = state.jobs.find(j => j.id === jobId);
   if (job) recordJobHistory(job);
@@ -203,7 +203,7 @@ export function hasLocalSample(jobId: string): boolean {
 }
 
 export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
-  patchJob(jobId, fn);
+  transitionJob(jobId, fn);
 }
 
 export function publicJobs(jobs: Job[]) {
@@ -260,7 +260,7 @@ function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
     diffFilesFull: sample.changedPaths.length - (sample.diffDroppedPaths?.length ?? 0),
     diffFilesTotal: sample.changedPaths.length,
   };
-  patchJob(jobId, (j) => ({ ...j, promptStats, coverageDeterministic, updatedAt: Date.now() }));
+  transitionJob(jobId, (j) => ({ ...j, promptStats, coverageDeterministic, updatedAt: Date.now() }));
 }
 
 async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
@@ -273,12 +273,12 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
     await sleep(st === "snapshot" ? 280 : st === "explorer" ? 520 : st === "reviewer" ? 640 : 420);
     const live = current();
     if (!live || live.status === "cancelled") return;
-    patchJob(jobId, (j) => ({ ...j, status: st, updatedAt: Date.now() }));
+    transitionJob(jobId, (j) => ({ ...j, status: st, updatedAt: Date.now() }));
   }
   const live = current();
   if (!live || live.status === "cancelled") return;
   if (opts.forceDlq) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "dlq",
       skipReason: "validator timeout — job moved to DLQ",
@@ -294,7 +294,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
   const now = Date.now();
 
   if (mention && live.sampleKey === "pay-412") {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       traces: tracesForMention(now - 200),
       plan: "Prior findings + user line only. Do not reload the full thread.",
@@ -308,7 +308,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
     const naming = settings.precisionOverRecall
       ? CANDIDATE_412_DROPPED
       : { ...CANDIDATE_412_DROPPED, status: "accepted" as const, dropReason: undefined };
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       traces: tracesFor412(now - 1100),
       plan: "Investigate capture + fulfill replay against payment invariants.",
@@ -324,7 +324,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
       assumptions: ["Stripe at-least-once delivery"],
     }));
   } else if (live.sampleKey === "pay-418") {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       traces: tracesFor418(now - 420),
       plan: "New invoices route. Confirm auth guard. Findings forbidden until concrete failure.",
@@ -334,7 +334,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
       assumptions: [],
     }));
   } else if (live.sampleKey === "pay-421") {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       traces: tracesFor421(now - 300),
       plan: "Untrusted PR body quoted, not loaded. Investigate missing auth guard.",
@@ -385,7 +385,7 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
       pr: job.pr,
       body,
     });
-    patchJob(jobId, (j) => ({ ...j, opsCommentId: created.id, updatedAt: Date.now() }));
+    transitionJob(jobId, (j) => ({ ...j, opsCommentId: created.id, updatedAt: Date.now() }));
   } catch {
     /* same as reactions: never fail the review if the status comment cannot post */
   }
@@ -499,7 +499,7 @@ async function watchReviewersLoop(jobId: string, token: string) {
     ) {
       // Chat is down (quota / disconnected / nothing returned): never lose the review — local runs
       // as today's fallback, not as a verifier. The next tick starts it (shouldStartLocalLeg).
-      patchJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : { ...j, localFallbackAt: Date.now(), plan: "Chat reviewers returned nothing usable; local runs as the fallback.", updatedAt: Date.now() }));
+      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : { ...j, localFallbackAt: Date.now(), plan: "Chat reviewers returned nothing usable; local runs as the fallback.", updatedAt: Date.now() }));
       continue;
     }
     if (job.status === "awaiting_chat" && !racing) {
@@ -509,7 +509,7 @@ async function watchReviewersLoop(jobId: string, token: string) {
         // Report the real per-reviewer reason (usage limit / connection / genuinely empty) rather
         // than a blanket "finished without JSON" that hid infra causes like a quota block.
         const skip = emptyReviewSkip(buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) }));
-        patchJob(jobId, (j) => ({
+        transitionJob(jobId, (j) => ({
           ...j,
           status: "skipped",
           skipReason: skip.skipReason,
@@ -552,10 +552,10 @@ async function playGithub(jobId: string, untrustedBody: string) {
   const live0 = current();
   if (!live0 || live0.status === "cancelled") return;
 
-  patchJob(jobId, (j) => ({ ...j, status: "snapshot", updatedAt: Date.now() }));
+  transitionJob(jobId, (j) => ({ ...j, status: "snapshot", updatedAt: Date.now() }));
   const ready = githubReady();
   if ((!ready.appId && !ready.clientId) || !ready.privateKey || !live0.installationId) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "GitHub App credentials missing — cannot snapshot head SHA",
@@ -570,7 +570,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     token = await installationToken(live0.installationId);
   } catch (e) {
     const msg = formatGithubError(e);
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "GitHub snapshot failed",
@@ -604,7 +604,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
         isDraft: pull.draft,
         isFork: pull.fork,
       };
-      patchJob(jobId, (j) => ({
+      transitionJob(jobId, (j) => ({
         ...j,
         headSha: target.headSha,
         baseSha: target.baseSha,
@@ -619,14 +619,14 @@ async function playGithub(jobId: string, untrustedBody: string) {
     if (!resolved || resolved.status === "cancelled") return;
     const skip = reviewSkipReason({ sample: target, trigger: resolved.trigger, thread: resolved.thread, settings: state.settings });
     if (skip) {
-      patchJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
+      transitionJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
       await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
       return;
     }
     sample = await fetchPullSnapshot(token, target, { diffMaxChars: state.settings.promptDiffMaxChars });
   } catch (e) {
     const msg = formatGithubError(e);
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "GitHub snapshot failed",
@@ -643,14 +643,14 @@ async function playGithub(jobId: string, untrustedBody: string) {
   // Settings may have changed while snapshot I/O was in flight.
   const skip = reviewSkipReason({ sample: gated, trigger: gated.trigger, thread: gated.thread, settings: state.settings });
   if (skip) {
-    patchJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
+    transitionJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
     await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
     return;
   }
 
   const providers = providersFromSettings(state.settings);
   if (!providers.length) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "no review chat enabled",
@@ -675,7 +675,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
   const verifier = localVerifies({ role: localReviewRole, providers });
 
 
-  patchJob(jobId, (j) => ({
+  transitionJob(jobId, (j) => ({
     ...j,
     status: "awaiting_chat",
     plan: verifier
@@ -730,7 +730,7 @@ async function kickLocalRace(jobId: string, prompt: string) {
   const startedAt = Date.now();
   const leg = startLocalLeg(startedAt);
   localActivity.set(jobId, leg);
-  patchJob(jobId, j => ({...j, generating: {...j.generating, local: true},
+  transitionJob(jobId, j => ({...j, generating: {...j.generating, local: true},
     providerProgress: {...j.providerProgress, local: localLegProgress(leg, `local:${jobId}`, startedAt)},
     updatedAt: startedAt}));
   try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
@@ -750,7 +750,7 @@ function noteLocalActivity(jobId: string, kind: LocalLegActivityKind) {
   if (next.accepted) { try { reviewHistory().recordServerStep(jobId, "local.accepted"); } catch { /* visible history health */ } }
   if (next.generated) { try { reviewHistory().recordServerStep(jobId, "local.generating"); } catch { /* visible history health */ } }
   if (!next.flush) return;
-  patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+  transitionJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
     ...j,
     providerProgress: { ...j.providerProgress, local: localLegProgress(next.state, `local:${jobId}`, now) },
   }));
@@ -865,7 +865,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       if(!local.ok && local.originalText)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,local.originalText,local.originalText.length,local.originalText.length>128_000);
     } catch { /* metadata storage failure is visible without starting another model */ }
     if (!local.ok) {
-      patchJob(jobId, (j) => {
+      transitionJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
         // A released held leg's completed non-JSON reply is evidence: kept as a salvaged leg.
         const salvage = heldLocalSalvage(j, local);
@@ -878,11 +878,11 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
         };
       });
     } else {
-      patchJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText)));
+      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText)));
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+    transitionJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
       ...j, generating: {...j.generating, local: false},
       providerErrors: {...j.providerErrors, local: {code: "error", message: msg.slice(0, 160)}},
       providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now()}},
@@ -945,7 +945,7 @@ export async function submitHarborChat(
     for (const leg of incoming) reviewHistory().recordResponse(jobId,leg.provider,leg.raw,leg.originalText || "");
   } catch {
     // Stored Local legs remain available to the watcher; never repeat generation.
-    patchJob(jobId,j=>({...j,githubError:"Response history storage unavailable; result retained for retry"}));
+    transitionJob(jobId,j=>({...j,githubError:"Response history storage unavailable; result retained for retry"}));
     return {ok:false,error:"Response history storage unavailable; result retained for retry"};
   }
   if (!opts?.force && !job.chatFpRound) {
@@ -961,7 +961,7 @@ export async function submitHarborChat(
         providerErrors: job.providerErrors,
       })
     ) {
-      patchJob(jobId, (j) => {
+      transitionJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
         const next = [...(j.storedLegs ?? [])];
         for (const leg of incoming) {
@@ -987,7 +987,7 @@ export async function submitHarborChat(
   );
 
   let locked = false;
-  patchJob(jobId, (j) => {
+  transitionJob(jobId, (j) => {
     if (j.status !== "awaiting_chat") return j;
     locked = true;
     return { ...j, status: "validator", updatedAt: Date.now() };
@@ -995,7 +995,7 @@ export async function submitHarborChat(
   if (!locked) return { ok: false, error: "job is not waiting for a chat review" };
 
   const revert = (error: string) => {
-    patchJob(jobId, (j) =>
+    transitionJob(jobId, (j) =>
       j.status === "validator"
         ? { ...j, status: "awaiting_chat", githubError: error, updatedAt: Date.now() }
         : j,
@@ -1048,7 +1048,7 @@ export async function submitHarborChat(
     return { ok: true };
   }
   if (!gates.length) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: invalid.join("; ") || "no valid review JSON",
@@ -1106,7 +1106,7 @@ export async function submitHarborChat(
     invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
     (byProvider.get("local")?.rawReview ? "its reply could not be parsed" : undefined);
   const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, localError });
-  patchJob(jobId, (j) => ({
+  transitionJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,
     candidates: merged.findings,
@@ -1130,7 +1130,7 @@ export async function submitHarborChat(
  * held-back local leg (verification round or chat-down fallback). The watcher then waits for local. */
 function releaseHeldLocalLeg(jobId: string, token: string, legs: ChatLeg[], release: Pick<Job, "plan"> & Partial<Job>) {
   let released = false;
-  patchJob(jobId, (j) => {
+  transitionJob(jobId, (j) => {
     if (j.status !== "validator") return j;
     released = true;
     const next = [...(j.storedLegs ?? [])];
@@ -1167,7 +1167,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const review = buildReview(after, inline, unanchored, policy);
 
   if (!review) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "poster: zero findings (precision policy)",
@@ -1180,7 +1180,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
     return;
   }
 
-  patchJob(jobId, (j) => ({ ...j, status: "posting", updatedAt: Date.now() }));
+  transitionJob(jobId, (j) => ({ ...j, status: "posting", updatedAt: Date.now() }));
 
   let githubId: number | undefined;
   let githubError: string | undefined;
@@ -1204,7 +1204,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       postedToGithub = true;
     } catch (e) {
       githubError = formatGithubError(e);
-      patchJob(jobId, (j) => ({
+      transitionJob(jobId, (j) => ({
         ...j,
         status: "dlq",
         skipReason: "GitHub Reviews API failed — not marked posted",
@@ -1255,7 +1255,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       const head = await fetchPullHead(token, after.owner, after.repo, after.pr);
       if (head.headSha.slice(0, 7) !== after.headSha.slice(0, 7)) {
         headMovedTo = head.headSha;
-        patchJob(jobId, (j) => ({ ...j, headMovedTo: head.headSha, updatedAt: Date.now() }));
+        transitionJob(jobId, (j) => ({ ...j, headMovedTo: head.headSha, updatedAt: Date.now() }));
       }
     } catch {
       /* ops note is best-effort — never fail the posted review over a HEAD check */
@@ -1416,7 +1416,7 @@ function enqueueFromDecision(
   for (const item of state.jobs) if (item.id === job.id || item.skipReason === `superseded by ${job.id}`) recordJobHistory(item);
   // Supersession is an explicit cancellation, not a timer.
   for (const previous of state.jobs) if (previous.status === "cancelled") localControllers.get(previous.id)?.abort();
-  // Supersession bypasses patchJob: run the same terminal cleanup so a held job's snapshot is freed.
+  // Supersession bypasses transitionJob: run the same terminal cleanup so a held job's snapshot is freed.
   for (const previous of state.jobs) if (previous.skipReason === `superseded by ${job.id}`) releaseLocalSampleIfTerminal(previous);
   // A superseded job's ops comment keeps its last "running" state and looks stuck
   // forever. Mark those comments terminal so a re-trigger doesn't leave a phantom

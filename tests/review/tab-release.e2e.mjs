@@ -5,7 +5,9 @@
 // of the answer (a finishing code fence, labels, re-keyed ids, streaming flags) are not user activity.
 import {test,before,after} from 'node:test';
 import assert from 'node:assert/strict';
+import {webcrypto} from 'node:crypto';
 import {source} from './load-source.mjs';
+import {background,storage} from './helpers.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;
 before(async()=>{browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});});
@@ -58,7 +60,7 @@ async function chatTab(t,{url=TEMP_URL,kind,job=kind==='fix'?'fix-A':'job-A',run
  };
  await inject();
  const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId:job,runId:run,provider:'chatgpt',...(kind==='fix'?{kind}:{}),...extra});
- return {page,served,send,inject,
+ return {page,served,send,inject,job,run,
   reload:async()=>{await page.reload();await inject();},
   steps:()=>page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)||'{"events":[]}').events.map(e=>e.stage),`ashlar:steps:${job}:${run}`),
   released:()=>page.evaluate(key=>sessionStorage.getItem(key),`ashlar:released:${job}:${run}`),
@@ -182,4 +184,88 @@ test('an unbound page never answers for a job: can-close and a cancel without th
  await tab.page.evaluate(()=>{document.getElementById('prompt-textarea').textContent='my own question';});
  const draft=await tab.send('ashlar-fix-cancel',{allocationUrl:TEMP_URL,undispatched:true});
  assert.deepEqual({owned:draft.owned,cause:draft.cause},{owned:false,cause:'draft'});
+});
+
+// ── The real worker (vm harness) wired to that page over the message protocol: the job is started
+// in tab 10, whose URL follows the page (an in-page pushState is a tab URL update in Chrome) when
+// `tick` syncs it. `server.value` is the job status the bridge reports; `onComplete` runs before
+// the bridge ACKs a delivered result.
+function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true}={}){
+ const job={jobId:tab.job,...(kind==='fix'?{kind:'fix'}:{}),origin:'http://bridge',leaseId:'lease-A',prompt:PROMPT,providers:['chatgpt'],
+  reasoning:{chatgpt:'pro',grok:'heavy'},states:{chatgpt:{tabId:10,started,runId:tab.run}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{[job.jobId]:job}}),
+  tabs:new Map([[10,{id:10,url:tab.page.url(),status:'complete'}]]),
+  api:async(_path,body)=>{
+   if(body?.action==='ping')return {ok:true,active:server.value==='awaiting_chat',accepted:server.value==='awaiting_chat',status:server.value,bridge:{captureProtocol:1,localJsonRepairEnabled:false}};
+   if(body?.action==='complete'&&onComplete)await onComplete(body);
+   return {ok:true,job:null};
+  }});
+ b.context.crypto=webcrypto;b.context.TextEncoder=TextEncoder;
+ b.chrome.tabs.sendMessage=(id,msg,callback)=>{
+  b.messages.push({id,...msg});
+  if(!b.tabs.has(id)){b.chrome.runtime.lastError={message:`No tab with id: ${id}.`};callback();b.chrome.runtime.lastError=null;return;}
+  tab.page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),msg).then(callback,error=>{
+   b.chrome.runtime.lastError={message:error.message};callback();b.chrome.runtime.lastError=null;
+  });
+ };
+ const sync=()=>{const known=b.tabs.get(10);if(known)known.url=tab.page.url();};
+ return {b,job,sync,server,state:()=>b.local.state.pendingReviewJobs[job.jobId]?.states.chatgpt,
+  tick:async({syncUrl=true}={})=>{if(syncUrl)sync();await b.tick();}};
+}
+/** A leg whose page collected its answer (tail frozen in), before the worker harvests and delivers it. */
+async function collectedLeg(t,{kind,tail='',onComplete,...rest}={}){
+ const tab=await chatTab(t,{kind,thread:userTurn()+answerTurn({code:ANSWER+tail}),journal:sentJournal(),...rest});
+ const w=wire(tab,{kind,onComplete});
+ await w.tick(); // the page has no collector yet: the worker resumes observation (never re-sends)
+ await tab.page.clock.runFor(2400);
+ assert.equal(await tab.page.evaluate(()=>__ashlarRunnerState.result?.ok),true,'the page collected its answer');
+ return {tab,w};
+}
+
+// Secured legs: once the bridge ACKed the result, the tab closes whatever ChatGPT redraws.
+for(const kind of ['review','fix'])for(const [name,tail,redraw] of REDRAWS)test(`worker, ${kind}: the ACKed tab closes after ${name}`,async t=>{
+ const {tab,w}=await collectedLeg(t,{kind,tail});
+ await redraw(tab.page);
+ await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
+ assert.deepEqual(w.b.closedTabs,[10],'the secured tab is closed');
+ assert.equal(w.state(),undefined,'the job retired');
+ assert.equal((await tab.steps()).includes('context_changed'),false);
+ assert.equal(await tab.released(),null);
+ assert.ok(w.b.messages.some(m=>m.type==='ashlar-can-close'&&m.allocationUrl===TEMP_URL),'the worker names the page the tab was opened on');
+});
+for(const kind of ['review','fix'])test(`worker, ${kind}: an ACKed temporary chat reloaded blank before cleanup still closes`,async t=>{
+ let tab;
+ const reloadBlank=async()=>{tab.served.thread='';await tab.reload();};
+ const leg=await collectedLeg(t,{kind,onComplete:()=>reloadBlank()});
+ tab=leg.tab;
+ await leg.w.tick();
+ assert.deepEqual(leg.w.b.closedTabs,[10]);assert.equal(leg.w.state(),undefined);
+});
+test('worker: a secured tab closes even while its sent-journal write keeps failing',async t=>{
+ const tab=await chatTab(t,{thread:userTurn()+answerTurn(),journal:sentJournal({messageId:''})});
+ await tab.page.evaluate(()=>{const set=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){
+  if(key.startsWith('ashlar:submission:')&&JSON.parse(value).phase==='sent')throw new DOMException('fixture quota exceeded','QuotaExceededError');
+  return set.call(this,key,value);};});
+ const w=wire(tab);
+ await w.tick();await tab.page.clock.runFor(2400);
+ assert.equal(await tab.page.evaluate(()=>__ashlarRunnerState.submissionPersistencePending),true,'the journal write is still failing');
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
+});
+// Secured legs the user took over: preserved (never closed), released, and the job retires.
+for(const [name,cause,takeover] of TAKEOVERS)test(`worker: an ACKed tab with ${name} is preserved and released`,async t=>{
+ const {tab,w}=await collectedLeg(t,{});
+ await takeover(tab.page);
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[]);assert.equal(w.state(),undefined,'the job retired');
+ assert.equal(await tab.released(),'true');
+});
+for(const syncUrl of [true,false])test(`worker: an ACKed tab moved in-page to another conversation is preserved (${syncUrl?'the tab URL already moved':'only the page knows'})`,async t=>{
+ const {tab,w}=await collectedLeg(t,{});
+ await tab.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);
+ await w.tick({syncUrl});
+ assert.deepEqual(w.b.closedTabs,[]);assert.equal(w.state(),undefined);
+ assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
+ assert.equal(w.b.messages.some(m=>m.type==='ashlar-can-close'),!syncUrl,syncUrl?'the worker saw the move itself: the page is not asked':'the page reports the move');
 });

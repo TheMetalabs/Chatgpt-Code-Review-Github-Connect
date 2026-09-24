@@ -32,7 +32,7 @@ async function fixture(t,{fallback=true,text=invalid}={}){
  worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
   worker.messages.push({id,...msg});
   if(id!==10){cb({ok:false,code:'busy',jobId:msg.jobId,runId:msg.runId,provider:msg.provider});return;}
-  page.evaluate(msg=>new Promise(resolve=>{const async=receiver(msg,null,resolve);if(async!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});
+  page.evaluate(msg=>new Promise(resolve=>{const async=receiver(msg,null,resolve);if(async!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/A'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});
  };
  const cycle=async()=>{await worker.tick();await flush();await page.clock.runFor(1000);};
  return {app,job,page,worker,cycle,api};
@@ -127,7 +127,9 @@ for(const change of ['followup','draft'])test(`source receipt releases managed o
 
 
 
-test('source change after durable archive preserves the receipt, releases capacity, and salvages the archived original',async t=>{
+// The original is durably archived (secured): the provider changing its answer afterwards is not the
+// user's activity, so the tab closes (#82) while the archived original, not the page, is salvaged.
+test('source change after durable archive keeps the archived original, closes the secured tab, and salvages that original',async t=>{
  const f=await fixture(t,{fallback:false});let changed=false;const send=f.worker.chrome.tabs.sendMessage;
  f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
   if(msg.type==='ashlar-capture-accepted' && !changed) {
@@ -139,8 +141,7 @@ test('source change after durable archive preserves the receipt, releases capaci
  const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
  assert.equal(state.sourceCapture?.archiveDurable,true);assert.notEqual(state.sourceCapture?.cleanupProofConfirmed,true);assert.ok(state.sourceCapture?.id);
  assert.equal(state.sourceCapture.text,invalid,'unresolved repair must retain the exact local archived-source fallback');
- assert.equal(f.worker.closedTabs.length,0,'repurposed page must be preserved');
- assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true);
+ assert.deepEqual(f.worker.closedTabs,[10],'a changed answer is not a user takeover: the secured tab closes');
  await f.cycle();assert.equal(f.worker.local.state.bridgeWorkerStatus.capacity.used,0);
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1,'replacement DOM must not be archived as the original run');
  await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'archived original was not salvaged into a review with repair off');

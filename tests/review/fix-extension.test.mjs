@@ -229,10 +229,11 @@ test('worker: a cancelled fix whose run was never sent closes its blank tab and 
   const moved = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/c/other'), url: 'https://chatgpt.com/c/other'});
   await moved.tick();
   assert.equal(moved.closedTabs.length, 0);assert.deepEqual(moved.local.state.pendingReviewJobs, {});
-  // blank on the same path but out of temporary-chat mode: a different page (the user's), preserved
+  // blank on the same path out of temporary-chat mode: the query is not the page (origin + path,
+  // #82), so it is still the page the tab was opened on and holds nothing of the user's: closed
   const plain = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/'});
   await plain.tick();
-  assert.equal(plain.closedTabs.length, 0);assert.deepEqual(plain.local.state.pendingReviewJobs, {});
+  assert.deepEqual(plain.closedTabs, [10]);assert.deepEqual(plain.local.state.pendingReviewJobs, {});
   // the fragment is not part of the page identity
   const hashed = worker(unsent(), {api: cancelled, handler: blank(`${OPENED}#x`), url: `${OPENED}#x`});
   await hashed.tick();
@@ -259,9 +260,10 @@ test('worker: a started fix whose page is owned only by being blank must still b
   inventory = {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: 'https://chatgpt.com/c/other'};
   await moved.context.refreshTabInventory();await until(() => false, 200);
   assert.equal((await moved.context.tabCapacityReport({})).orphanTabs, 0, 'the preserved run is released worker-side');
+  // the query is not the page (origin + path, #82): a plain "/" is the temporary chat's page too
   const plain = worker([fixJob()], {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/'});
   await plain.tick();
-  assert.equal(plain.closedTabs.length, 0);
+  assert.deepEqual(plain.closedTabs, [10]);
   const home = worker([fixJob()], {api: cancelled, handler: blank(OPENED), url: OPENED});
   await home.tick();
   assert.deepEqual(home.closedTabs, [10], 'still the page the fix opened: closed');

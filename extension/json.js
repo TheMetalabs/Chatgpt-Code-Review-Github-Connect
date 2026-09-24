@@ -635,7 +635,7 @@ function installReviewRunner(name, run) {
         released:Boolean(state.slotReleased),url:globalThis.location?.href || ""});return;
     }
     if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close", "ashlar-repair-source", "ashlar-repair-accepted",
-      "ashlar-capture-accepted", "ashlar-result-saved", "ashlar-fix-cancel"].includes(msg?.type)) return;
+      "ashlar-capture-accepted", "ashlar-fix-cancel"].includes(msg?.type)) return;
     const respond = reply;
     reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId, progress: reviewProgress(),
       // A run (review or fix) reports the conversation it was bound in (once pinned) so the worker keeps it.
@@ -651,69 +651,42 @@ function installReviewRunner(name, run) {
       reply({ ok: false, code: "job_mismatch", error: "tab belongs to another job" });
       return;
     }
-    if (["ashlar-capture-accepted", "ashlar-result-saved"].includes(msg.type)) {
+    if (msg.type === "ashlar-capture-accepted") {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider || msg.committed !== true) {
         reply({ok:false,code:"job_mismatch"});return;
       }
-      if (msg.type === "ashlar-capture-accepted") {
-        const receipt = sourceReceiptFor(state);
-        if (receipt) {
-          reply(receipt.id === msg.captureId && receipt.responseId === msg.responseId && receipt.text === msg.text && receipt.context === msg.context
-            ? {ok:true,accepted:true} : {ok:false,code:"capture_source_changed"});return;
-        }
-        const source = currentRepairSource();
-        if (!source) {
-          // A fresh/reloaded page can need another identical observation before
-          // source stability is established. Distinguish that from a genuinely
-          // repurposed or regenerated response so cleanup can safely preserve it.
-          let submission, bound, currentText = "";
-          try {
-            submission = state.confirmedSubmission?.record || savedSubmission();
-            if (submission?.phase === "sent") bound = boundReviewResponse(submission);
-            if (bound?.root && !bound.followup && replyDoneVisible(bound.root) && !stopButtonVisible() && !responseStreaming(bound.root))
-              currentText = assistantCorpus(bound.root).join("\n\n");
-          } catch { /* unavailable remains retryable */ }
-          if (typeof msg.context === "string" && (msg.context !== reviewPageContext() || bound?.followup ||
-              (currentText && currentText !== msg.text))) {
-            releaseManagedSlot(state);
-            reply({ok:false,code:"capture_source_changed"});return;
-          }
-          reply({ok:false,code:"capture_source_unavailable"});return;
-        }
-        if (!msg.captureId || typeof msg.context !== "string") {reply({ok:false,code:"capture_source_changed"});return;}
-        if (source.responseId !== msg.responseId || source.text !== msg.text) {
-          // The worker secured its original elsewhere. The replacement is user-owned.
-          releaseManagedSlot(state);
+      const receipt = sourceReceiptFor(state);
+      if (receipt) {
+        reply(receipt.id === msg.captureId && receipt.responseId === msg.responseId && receipt.text === msg.text && receipt.context === msg.context
+          ? {ok:true,accepted:true} : {ok:false,code:"capture_source_changed"});return;
+      }
+      const source = currentRepairSource();
+      if (!source) {
+        // A fresh/reloaded page can need another identical observation before
+        // source stability is established. Distinguish that from a genuinely
+        // repurposed or regenerated response so cleanup can safely preserve it.
+        let submission, bound, currentText = "";
+        try {
+          submission = state.confirmedSubmission?.record || savedSubmission();
+          if (submission?.phase === "sent") bound = boundReviewResponse(submission);
+          if (bound?.root && !bound.followup && replyDoneVisible(bound.root) && !stopButtonVisible() && !responseStreaming(bound.root))
+            currentText = assistantCorpus(bound.root).join("\n\n");
+        } catch { /* unavailable remains retryable */ }
+        if (typeof msg.context === "string" && (msg.context !== reviewPageContext() || bound?.followup ||
+            (currentText && currentText !== msg.text))) {
           reply({ok:false,code:"capture_source_changed"});return;
         }
-        state.captureReceipt = Object.freeze({id:msg.captureId,jobId:state.jobId,runId:state.runId,provider:state.provider,
-          responseId:source.responseId,text:source.text,context:msg.context});
-        recordReviewStep("source_archived");
-        reply({ok:true,accepted:true});return;
+        reply({ok:false,code:"capture_source_unavailable"});return;
       }
-      // Restore only a previously collected+ACKed exact response, not another run
-      // or a new DOM result selected just because it happens to be the newest.
-      let submission;
-      try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { /* preserved */ }
-      const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : null;
-      if (!bound?.identified || !bound.root || !replyDoneVisible(bound.root) || stopButtonVisible() || responseStreaming(bound.root)) {
-        reply({ok:false,code:"completion_unavailable"});return;
+      if (!msg.captureId || typeof msg.context !== "string") {reply({ok:false,code:"capture_source_changed"});return;}
+      if (source.responseId !== msg.responseId || source.text !== msg.text) {
+        // The worker secured its original elsewhere; who holds the tab is the release verdict's call.
+        reply({ok:false,code:"capture_source_changed"});return;
       }
-      const proof=msg.completion;
-      // A fix answer is its own plain text; a review result must be the JSON of that text.
-      if (!proof?.responseId || typeof proof.context !== "string" || typeof msg.text !== "string" || typeof msg.raw !== "string" ||
-          !(msg.kind === "fix" ? msg.raw === msg.text : extractChatJson(msg.raw) && extractChatJson(msg.raw) === extractChatJson(msg.text)) || bound.followup ||
-          bound.responseId !== proof.responseId || proof.context !== reviewPageContext() || boundAnswerText(msg.kind, bound.root) !== msg.text) {
-        releaseManagedSlot(state);
-        reply({ok:false,code:"completion_changed"});return;
-      }
-      state.nativeCompletion = Object.freeze({jobId:state.jobId,provider:state.provider,runId:state.runId,
-        responseId:proof.responseId,context:proof.context,text:msg.text,raw:msg.raw});
-      if (msg.kind === "fix") state.kind = "fix"; // later proofs compare this run's fenced answer
-      state.restoredCompletion = true;
-      state.finishedContext = proof.context;
-      state.result = {ok:true,raw:msg.raw,responseText:msg.text,completion:nativeCleanupProof(state)};
-      recordReviewStep("cleanup_restored");reply({ok:true,accepted:true});return;
+      state.captureReceipt = Object.freeze({id:msg.captureId,jobId:state.jobId,runId:state.runId,provider:state.provider,
+        responseId:source.responseId,text:source.text,context:msg.context});
+      recordReviewStep("source_archived");
+      reply({ok:true,accepted:true});return;
     }
     if (["ashlar-repair-source", "ashlar-repair-accepted"].includes(msg.type)) {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider) {
@@ -790,9 +763,6 @@ function installReviewRunner(name, run) {
     const repaired = repairedCollectionResult(state);
     if (repaired) { reply(repaired); return; }
     if (sourceReceiptFor(state)) {reply({ok:false,code:"captured",observation:{state:"source_archived"}});return;}
-    if (state.restoredCompletion && state.nativeCompletion) {
-      reply({ok:true,raw:state.nativeCompletion.raw,responseText:state.nativeCompletion.text,completion:nativeCleanupProof(state)});return;
-    }
     if (state.result) { reply(state.result); return; }
     if (state.running) { reply(busy()); return; }
     if (msg.type === "ashlar-harvest") {
@@ -813,7 +783,6 @@ function installReviewRunner(name, run) {
     state.kind = msg.kind === "fix" ? "fix" : undefined;
     state.runStopped = runStoppedFor(state.jobId, state.runId);
     state.nativeCompletion = undefined;
-    state.restoredCompletion = false;
     state.sourceTrackingOwner = undefined;
     state.repairProbeTracker = undefined;
     state.repairReceipt = undefined;

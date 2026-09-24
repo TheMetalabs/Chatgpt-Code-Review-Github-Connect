@@ -242,7 +242,7 @@ function connectWorker(page) {
  worker.chrome.tabs.sendMessage=(id,msg,callback)=>{
   worker.messages.push({id,...msg});
   page.evaluate(msg=>new Promise(resolve=>runnerMessage(msg,null,resolve)),msg)
-   .then(result=>callback({...result,...(result.url!==undefined?{url:'https://chatgpt.com/c/fixture-A'}:{})}),error=>{
+   .then(result=>callback({...result,...(result.url!==undefined?{url:'https://chatgpt.com/c/fixture-A'}:{}),...(result.conversation!==undefined?{conversation:'https://chatgpt.com/c/fixture-A'}:{})}),error=>{
     worker.chrome.runtime.lastError={message:error.message};callback();worker.chrome.runtime.lastError=null;
    });
  };

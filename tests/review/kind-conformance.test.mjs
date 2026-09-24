@@ -91,10 +91,10 @@ const ROWS = [
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
-  {id: 'W8', name: 'server cancelled while the tab never finishes loading',
-    // Intended: a review waits (no deadline); a fix is preserved after the ownership wait, and the
-    // page completes the release handshake once it can answer (never counted as an orphan).
-    expect: {review: {firstTick: true, afterWait: true, closed: 0}, fix: {firstTick: true, afterWait: false, closed: 0}},
+  {id: 'W8', name: 'server cancelled while the tab never finishes loading', same: true,
+    // A tab that cannot answer is never held forever (#82): preserved after the ownership wait, and
+    // the page completes the release handshake once it can answer (never counted as an orphan).
+    expect: {firstTick: true, afterWait: false, closed: 0},
     async run(kind) {
       const b = worker(kind, {api: cancelled, status: 'loading', handler: () => ({ok: true, canClose: true, owned: true, url: URL_TAB})});
       await b.tick();
@@ -102,8 +102,8 @@ const ROWS = [
       b.later();await b.tick();
       return {firstTick, afterWait: Boolean(b.pending()), closed: b.closedTabs.length};
     }},
-  {id: 'W9', name: 'server cancelled while the loaded tab cannot be messaged',
-    expect: {review: {afterWait: true, closed: 0}, fix: {afterWait: false, closed: 0}},
+  {id: 'W9', name: 'server cancelled while the loaded tab cannot be messaged', same: true,
+    expect: {afterWait: false, closed: 0},
     async run(kind) {
       const b = worker(kind, {api: cancelled});
       const chrome = b.context.chrome;
@@ -112,10 +112,10 @@ const ROWS = [
       await b.tick();b.later();await b.tick();
       return {afterWait: Boolean(b.pending()), closed: b.closedTabs.length};
     }},
-  {id: 'W10', name: 'server cancelled while the tab now carries another binding',
-    // Intended: a review waits for positive ownership; a fix retires after the ownership wait
-    // (never closing the tab, never touching the other binding's record).
-    expect: {review: {afterWait: true, closed: 0, otherRecord: true}, fix: {afterWait: false, closed: 0, otherRecord: true}},
+  {id: 'W10', name: 'server cancelled while the tab now carries another binding', same: true,
+    // The leg retires after the ownership wait, never closing the tab and never touching the other
+    // binding's record.
+    expect: {afterWait: false, closed: 0, otherRecord: true},
     async run(kind) {
       const other = {jobId: 'job-B', provider: 'chatgpt', runId: 'run-B', closedKey: 'ashlar:closed:job-B:chatgpt:run-B', closing: false};
       const b = worker(kind, {api: cancelled, session: storage({'ashlar:tab:10': other}), handler: () => ({ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B'})});
@@ -124,10 +124,9 @@ const ROWS = [
     }},
   {id: 'W15', name: 'server cancelled after the tab was opened but before the run was dispatched',
     // Intended for the fix (its undispatched blank tab is closed while it holds nothing of the
-    // user's). The review cell is FLAGGED, not changed here: an unbound page answers can-close with
-    // job_mismatch, so a cancelled review whose run never started waits (and holds its slot) until
-    // an operator clears it (table row W15, review flag R1).
-    expect: {review: {retired: false, closed: 0}, fix: {retired: true, closed: 1}},
+    // user's). The review cell (FLAG R1): an unbound page answers can-close with job_mismatch, so a
+    // cancelled review whose run never started is preserved after the ownership wait (never held).
+    expect: {review: {retired: true, closed: 0}, fix: {retired: true, closed: 1}},
     async run(kind) {
       const OPENED = 'https://chatgpt.com/?temporary-chat=true';
       const b = worker(kind, {api: cancelled, url: OPENED, job: item(kind, {}, {started: false}),
@@ -135,30 +134,30 @@ const ROWS = [
       await b.tick();b.later();await b.tick();
       return {retired: !b.pending(), closed: b.closedTabs.length};
     }},
-  // W23-W27: the conversation identity cell. A fix's bound turn pins the conversation it is shown
+  // W23-W27: the conversation identity cell. A run's bound turn pins the conversation it is shown
   // in (the page's journal; the worker keeps it once). Page content alone never proves WHICH
   // conversation a tab shows: after an in-page move the old DOM can stay rendered under the user's
-  // conversation URL, and the cancel reply then echoes that URL. A review has no forced close.
-  {id: 'W23', name: 'server cancelled after an in-page move: the content still proves the fix, the URL is another conversation',
-    expect: {review: {closed: 0, retired: false}, fix: {closed: 0, retired: true}},
+  // conversation URL, and the reply then echoes that URL. The worker checks the tab's URL first.
+  {id: 'W23', name: 'server cancelled after an in-page move: the content still proves the run, the URL is another conversation', same: true,
+    expect: {closed: 0, retired: true},
     async run(kind) {
       const b = worker(kind, {api: cancelled, url: OTHER_TAB, job: item(kind, {}, {conversation: URL_TAB}),
         handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: OTHER_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: OTHER_TAB}});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
-  {id: 'W24', name: 'server cancelled; the page reports its bound conversation changed',
-    // Waiting cannot change a pinned identity: the fix tab is preserved at once (slot freed).
-    expect: {review: {closed: 0, retired: false, released: false}, fix: {closed: 0, retired: true, released: true}},
+  {id: 'W24', name: 'server cancelled; the page reports its bound conversation changed', same: true,
+    // Waiting cannot change a pinned identity: the tab is preserved at once (slot freed).
+    expect: {closed: 0, retired: true, released: true},
     async run(kind) {
       const b = worker(kind, {api: cancelled, url: OTHER_TAB, job: item(kind, {}, {conversation: URL_TAB}),
         handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', identity: 'changed', url: OTHER_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: OTHER_TAB}});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true)};
     }},
-  {id: 'W25', name: 'server cancelled; the bound conversation identity was never established',
+  {id: 'W25', name: 'server cancelled; the bound conversation identity was never established', same: true,
     // Not established = unknown ownership: asked again, then preserved (never closed).
-    expect: {review: {firstTick: true, afterWait: true, closed: 0}, fix: {firstTick: true, afterWait: false, closed: 0}},
+    expect: {firstTick: true, afterWait: false, closed: 0},
     async run(kind) {
       const b = worker(kind, {api: cancelled, handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
       await b.tick();
@@ -174,35 +173,33 @@ const ROWS = [
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
-  {id: 'W27', name: 'after delivery, can-close passes on a tab that is not in the stored bound conversation',
-    // Intended for the fix (the final check is the stored identity). The review cell keeps its
-    // page-context proof (FLAG R4: a review that collected the lingering DOM after an in-page move
-    // records its context under the new URL, so this close passes there). Asserted as today.
-    expect: {review: {closed: 1, retired: true}, fix: {closed: 0, retired: true}},
+  {id: 'W27', name: 'after delivery, can-close passes on a tab that is not in the stored bound conversation', same: true,
+    // The final check is the stored identity (origin + path), for both kinds: the user's conversation.
+    expect: {closed: 0, retired: true},
     async run(kind) {
       const b = worker(kind, {api: active, url: OTHER_TAB, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB}),
         handler: () => ({ok: true, canClose: true, url: OTHER_TAB, conversation: URL_TAB})});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
-  {id: 'W28', name: 'the worker keeps the bound conversation the page reports once, and never replaces it',
-    // Intended: only a fix run is bound to a conversation identity; review replies carry none.
-    expect: {review: {first: undefined, kept: undefined}, fix: {first: URL_TAB, kept: URL_TAB}},
+  {id: 'W28', name: 'the worker keeps the bound conversation the page reports once, and never replaces it', same: true,
+    // Both kinds pin their conversation (review replies report it too).
+    expect: {first: URL_TAB, kept: URL_TAB},
     async run(kind) {
       let reported = URL_TAB;
-      const b = worker(kind, {api: active, handler: () => ({ok: false, code: 'busy', retry: true, ...(kind === 'fix' ? {conversation: reported} : {})})});
+      const b = worker(kind, {api: active, handler: () => ({ok: false, code: 'busy', retry: true, conversation: reported})});
       await b.tick();
       const first = b.pending().states.chatgpt.conversation;
       reported = OTHER_TAB;
       await b.tick();
       return {first, kept: b.pending().states.chatgpt.conversation};
     }},
-  {id: 'W29', name: 'a bound identity on a bare new-chat page follows the provider-assigned conversation once, then never again',
-    expect: {review: {kept: [undefined, undefined, undefined]}, fix: {kept: ['https://chatgpt.com/', URL_TAB, URL_TAB]}},
+  {id: 'W29', name: 'a bound identity on a bare new-chat page follows the provider-assigned conversation once, then never again', same: true,
+    expect: {kept: ['https://chatgpt.com/', URL_TAB, URL_TAB]},
     async run(kind) {
       const reports = ['https://chatgpt.com/', URL_TAB, OTHER_TAB], kept = [];
       let reported;
-      const b = worker(kind, {api: active, handler: () => ({ok: false, code: 'busy', retry: true, ...(kind === 'fix' ? {conversation: reported} : {})})});
+      const b = worker(kind, {api: active, handler: () => ({ok: false, code: 'busy', retry: true, conversation: reported})});
       for (const next of reports) { reported = next;await b.tick();kept.push(b.pending().states.chatgpt.conversation); }
       return {kept};
     }},

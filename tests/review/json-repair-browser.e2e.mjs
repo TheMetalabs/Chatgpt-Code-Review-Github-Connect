@@ -71,7 +71,9 @@ async function workerFixture(t,{enabled=true,text=original,pageOptions={}}={}) {
  const page=await pageFixture(t,{jobId:job.jobId,text,...pageOptions});
  const worker=background({local:storage({origin:app.origin,token:'fixture-token',pendingReviewJobs:{[job.jobId]:job}}),tabs:new Map([[10,{id:10,url:'https://chatgpt.com/c/fixture',status:'complete'}]]),api:send});
  worker.context.crypto=webcrypto;worker.context.TextEncoder=TextEncoder;
- worker.chrome.tabs.sendMessage=(id,msg,cb)=>{worker.messages.push({id,...msg});page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/fixture'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});};
+ // The offline page is about:blank: present its logical provider URL for both the page URL and the
+ // conversation the run pinned there.
+ worker.chrome.tabs.sendMessage=(id,msg,cb)=>{worker.messages.push({id,...msg});page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/fixture'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/fixture'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});};
  async function cycle(){await worker.tick();await flush();await page.clock.runFor(1000);}
  return {app,job,page,worker,cycle};
 }

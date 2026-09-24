@@ -45,3 +45,26 @@ Rules the table encodes:
 - `OUTCOME_SHAPE` is a `Record` over the enum: adding a kind without deciding whether it converges
   fails the typecheck, and `review-outcome.test.ts` iterates `REVIEW_OUTCOMES` so it fails without
   a render row.
+
+## §3 Terminal cleanup — one writer, one edge
+
+`transitionJob(id, next)` in `harbor.server.ts` is the only writer of an existing job record. Every
+path that ends a job goes through it: the watcher and merge paths, the posted write in `finishJob`,
+operator cancel (`cancelHarborJob`) and supersession by a newer request for the same PR. The only
+other job-array writes are `resetHarbor` (drops every job) and inserting a new job (`trimJobs`);
+`tests/review/job-writer.test.mjs` pins that.
+
+On the live → terminal edge it calls `releaseTerminalJob` once. A terminal status is an explicit
+terminal signal:
+
+- The local snapshot is freed, unless a local leg is in flight (that leg holds its own reference and
+  frees the entry in its `finally`). A verify-clean job whose local leg never ran would otherwise keep
+  it forever.
+- Only `cancelled` (operator or supersession) aborts the in-flight local request and clears its
+  activity and liveness state. `posted`, `skipped` and `dlq` never abort local generation, so race
+  behavior is unchanged.
+- The reviewer watcher is not stopped here: it exits on its next tick that sees a terminal status.
+
+`tests/review/local-verify-lifecycle.e2e.mjs` has one row per terminal path (posted, cancelled while
+held or while local runs, superseded while held or while local runs, dlq, skipped fallback, race)
+asserting status, local requests, snapshot release, reviews, watcher exit and abort.

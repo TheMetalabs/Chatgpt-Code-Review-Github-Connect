@@ -167,39 +167,46 @@ export function resetHarbor() {
 
 export function cancelHarborJob(jobId: string) {
   cancelLocalJsonRepairs("superseded", jobId);
-  localControllers.get(jobId)?.abort();
-  localSamples.delete(jobId);
-  localActivity.delete(jobId);
-  localLiveness.get(jobId)?.clear();
-  localLiveness.delete(jobId);
-  state = {
-    ...state,
-    jobs: state.jobs.map((j) =>
-      j.id === jobId && isLive(j.status)
-        ? { ...j, status: "cancelled" as const, skipReason: "cancelled by operator", updatedAt: Date.now() }
-        : j,
-    ),
-  };
-  const job=state.jobs.find(j=>j.id===jobId);if(job)recordJobHistory(job);
+  transitionJob(jobId, (j) =>
+    isLive(j.status) ? { ...j, status: "cancelled", skipReason: "cancelled by operator", updatedAt: Date.now() } : j,
+  );
 }
 
-function transitionJob(jobId: string, fn: (j: Job) => Job) {
-  state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? fn(j) : j)) };
-  const job = state.jobs.find(j => j.id === jobId);
-  if (job) recordJobHistory(job);
-  releaseLocalSampleIfTerminal(job);
+/** The only writer of an existing job record (resetHarbor drops every job wholesale; a new job is
+ * inserted with trimJobs). Every path that ends a job goes through here, so terminal cleanup runs in
+ * exactly one place: on the live → terminal edge. Returns the written job. */
+function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
+  const before = state.jobs.find((j) => j.id === jobId);
+  if (!before) return undefined;
+  const after = next(before);
+  state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? after : j)) };
+  recordJobHistory(after);
+  if (isLive(before.status) && !isLive(after.status)) releaseTerminalJob(after);
+  return after;
 }
 
-/** A terminal job never needs its local snapshot again. verify-clean jobs whose local leg never
- * ran (chat had findings) would otherwise keep their SamplePr in this module map forever; an
- * in-flight local leg already holds its own reference and deletes the entry when it finishes. */
-function releaseLocalSampleIfTerminal(job: Job | undefined) {
-  if (job && !isLive(job.status) && !localInFlight.has(job.id)) localSamples.delete(job.id);
+/** A terminal status is an explicit terminal signal (docs/local-verify-clean.md §3): the job never
+ * needs its local snapshot again (a verify-clean job whose local leg never ran would otherwise keep
+ * it forever). An in-flight local leg holds its own reference and frees the entry in its finally.
+ * Only a cancellation (operator or supersession) stops that leg; a posted or skipped job never
+ * aborts local generation. */
+function releaseTerminalJob(job: Job) {
+  if (!localInFlight.has(job.id)) localSamples.delete(job.id);
+  if (job.status !== "cancelled") return;
+  localControllers.get(job.id)?.abort();
+  localActivity.delete(job.id);
+  localLiveness.get(job.id)?.clear();
+  localLiveness.delete(job.id);
 }
 
 /** Test seam: whether a job still retains its local snapshot. */
 export function hasLocalSample(jobId: string): boolean {
   return localSamples.has(jobId);
+}
+
+/** Test seam: whether a reviewer watcher is still running for a job. */
+export function isWatchingJob(jobId: string): boolean {
+  return watching.has(jobId);
 }
 
 export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
@@ -1230,23 +1237,16 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
           : r,
       ),
     ]),
-    jobs: state.jobs.map((j) =>
-      j.id === jobId
-        ? {
-            ...j,
-            status: "posted" as const,
-            postedReviewId: review.id,
-            postedToGithub,
-            githubError,
-            updatedAt: Date.now(),
-            mergeRecommendation: review.event,
-            findings: j.findings,
-          }
-        : j,
-    ),
   };
-  const finished=state.jobs.find(j=>j.id===jobId);if(finished)recordJobHistory(finished);
-  releaseLocalSampleIfTerminal(finished);
+  transitionJob(jobId, (j) => ({
+    ...j,
+    status: "posted",
+    postedReviewId: review.id,
+    postedToGithub,
+    githubError,
+    updatedAt: Date.now(),
+    mergeRecommendation: review.event,
+  }));
   try {reviewHistory().recordReview(stored);} catch { /* storage health remains visible */ }
   if (token) void reactQuiet(token, after, "+1");
   let headMovedTo: string | undefined;
@@ -1399,25 +1399,18 @@ function enqueueFromDecision(
     summary: `${job.owner}/${job.repo}#${job.pr} ${opts.trigger}`,
     jobId: job.id,
   };
-  state = {
-    ...state,
-    jobs: trimJobs([
-      job,
-      ...state.jobs.map((j) =>
-        j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status)
-          ? { ...j, status: "cancelled" as const, skipReason: `superseded by ${job.id}`, updatedAt: Date.now() }
-          : j,
-      ),
-    ]),
-    events: trim([ev, ...state.events]),
-  };
+  // Supersession is an explicit cancellation, not a timer: each live job for the same PR ends through
+  // transitionJob, which aborts its local leg and frees its snapshot.
+  const superseded = state.jobs
+    .filter((j) => j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status))
+    .map((j) => j.id);
+  for (const id of superseded) {
+    transitionJob(id, (j) => ({ ...j, status: "cancelled", skipReason: `superseded by ${job.id}`, updatedAt: Date.now() }));
+  }
+  state = { ...state, jobs: trimJobs([job, ...state.jobs]), events: trim([ev, ...state.events]) };
 
   recordDeliveryHistory(ev,{owner:job.owner,repo:job.repo,pr:job.pr,commentId:job.thread?.commentId});
-  for (const item of state.jobs) if (item.id === job.id || item.skipReason === `superseded by ${job.id}`) recordJobHistory(item);
-  // Supersession is an explicit cancellation, not a timer.
-  for (const previous of state.jobs) if (previous.status === "cancelled") localControllers.get(previous.id)?.abort();
-  // Supersession bypasses transitionJob: run the same terminal cleanup so a held job's snapshot is freed.
-  for (const previous of state.jobs) if (previous.skipReason === `superseded by ${job.id}`) releaseLocalSampleIfTerminal(previous);
+  recordJobHistory(job);
   // A superseded job's ops comment keeps its last "running" state and looks stuck
   // forever. Mark those comments terminal so a re-trigger doesn't leave a phantom
   // in-flight review. Best-effort — never blocks or fails the newly enqueued job.

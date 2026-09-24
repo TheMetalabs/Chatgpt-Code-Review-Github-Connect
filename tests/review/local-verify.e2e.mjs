@@ -68,18 +68,3 @@ test('verify-clean: a Chrome bridge that stays offline releases local as the fal
   assert.doesNotMatch(app.reviews[0].body,/local verification/);
   assert.equal(app.harbor.hasLocalSample(jobId),false);
 });
-
-test('verify-clean: supersession frees a held job\'s local snapshot (terminal cleanup runs for every cancelled job)',async t=>{
-  const {app,jobId,job}=await setup(t);
-  let prev=jobId,prevJob=job;
-  for(let i=0;i<3;i++){
-    assert.equal(prevJob().status,'awaiting_chat');
-    assert.equal(app.harbor.hasLocalSample(prev),true,'held verify-clean job keeps its snapshot');
-    const out=await app.mention('verify-supersede-'+i);
-    await eventually(()=>prevJob().status==='cancelled','previous job was not superseded');
-    assert.match(prevJob().skipReason,/superseded by/);
-    assert.equal(app.harbor.hasLocalSample(prev),false,'superseded job leaked its local snapshot');
-    await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId)?.status==='awaiting_chat','new snapshot not ready');
-    const id=out.jobId;prev=id;prevJob=()=>app.harbor.getHarbor().jobs.find(j=>j.id===id);
-  }
-});

@@ -193,7 +193,9 @@ function fakeDeps(
         return opts.threads ?? [];
       },
       async replyToReviewComment(_t, _o, _r, _pr, id, body) {
-        if (opts.replyFails || (opts.replyFailures ?? 0) > replyAttempts++) throw new Error("thread reply 502");
+        replyAttempts += 1;
+        if (opts.replyFails) throw new Error("thread reply 502"); // uncertain: GitHub may have created it
+        if ((opts.replyFailures ?? 0) >= replyAttempts) throw Object.assign(new Error("thread reply 0: connect ECONNREFUSED"), { retryable: true });
         threadReplies.push({ id, body });
       },
       async fetchUserPermission(_t, _o, _r, login) {
@@ -247,6 +249,9 @@ function fakeDeps(
     permissionChecks,
     get committed() {
       return committed;
+    },
+    get replyAttempts() {
+      return replyAttempts;
     },
     get sleeps() {
       return sleeps;
@@ -1322,6 +1327,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     // posted[0] is the continuation (the control signal comes first); the report follows
     const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
     assert.match(report, /Thread replies: 0 posted, 2 failed\./);
+    assert.equal(f.replyAttempts, 2, "an uncertain reply failure is never retried (it may already exist)");
   });
 
   it("a transient reply failure is retried: every thread still gets its reply", async () => {
@@ -1387,7 +1393,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     assert.ok(!body.includes("\n"), "flattened to one line");
   });
 
-  it("two findings sharing an id: neither thread gets the other's reply, neither passes the published filter", async () => {
+  it("findings that all share an id are not convergence: an active session hands off, nothing is fixed or replied", async () => {
     const clash = [finding("src/a.ts", "A"), { ...finding("src/b.ts", "B"), line: 40 }]; // both "f1"
     const posted = {
       githubId: 555,
@@ -1401,18 +1407,16 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
       { id: 101, path: "src/a.ts", body: "BODY-A" },
       { id: 102, path: "src/b.ts", body: "BODY-B" },
     ];
-    const f = fakeDeps({ start: "apply", rounds: [2], threads: roots });
-    const r = await runPostReviewLoop("t", job({ findings: clash }), sample, settings("apply"), f.deps, ENV_ON, posted);
-    assert.deepEqual(r, { ran: false, reason: "no findings (converged)" }, "an ambiguous id never reaches the fix agent");
-    assert.equal(f.replies.length, 0);
-    // No published list (an older poster): both reach the agent, but neither thread is guessed
-    const g = fakeDeps({ start: "apply", rounds: [2], threads: roots });
     const { published: _omit, ...unfiltered } = posted;
-    const r2 = await runPostReviewLoop("t", job({ findings: clash }), sample, settings("apply"), g.deps, ENV_ON, unfiltered);
-    assert.ok(r2.ran && r2.step === "fix" && r2.outcome === "applied", JSON.stringify(r2));
-    assert.equal(g.replies.length, 0);
-    const report = g.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
-    assert.match(report, /Thread replies: 0 posted, 2 failed\./);
+    // with the published list, and without one (an older poster): the same fixed handoff
+    for (const p of [posted, unfiltered]) {
+      const f = fakeDeps({ start: "apply", rounds: [2], threads: roots });
+      const r = await runPostReviewLoop("t", job({ findings: clash }), sample, settings("apply"), f.deps, ENV_ON, p);
+      assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+      assert.match(escalations(f.posted)[0], /shares its id with another/);
+      assert.equal(f.prompts.length, 0, "an ambiguous id never reaches the fix agent");
+      assert.equal(f.replies.length, 0);
+    }
   });
 
   it("inline findings GitHub refused to anchor are neither published nor threaded", () => {

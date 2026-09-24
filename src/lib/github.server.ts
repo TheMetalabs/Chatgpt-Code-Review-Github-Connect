@@ -338,7 +338,7 @@ async function gh<T>(
   token: string,
   path: string,
   init?: { method?: string; body?: string; headers?: Record<string, string> },
-): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string }> {
+): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string; notSent?: boolean }> {
   let out: GhRes;
   try {
     out = await ghHttps(
@@ -351,7 +351,8 @@ async function gh<T>(
       init?.body,
     );
   } catch (e) {
-    return { ok: false, status: 0, text: formatGithubError(e) };
+    // notSent: the connection never came up, so the request cannot have reached GitHub
+    return { ok: false, status: 0, text: formatGithubError(e), notSent: e instanceof GithubTransportError && !e.requestSent };
   }
   if (out.status < 200 || out.status >= 300) return { ok: false, status: out.status, text: out.text.slice(0, 400) };
   return { ok: true, data: (out.text ? JSON.parse(out.text) : {}) as T };
@@ -917,7 +918,12 @@ export async function replyToReviewComment(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ body }),
   });
-  if (!out.ok) throw new Error(`thread reply ${out.status}: ${out.text.slice(0, 160)}`);
+  if (!out.ok) {
+    // retryable only when GitHub cannot have created the reply: the request never left (or a rate
+    // limit refused it). A 5xx or a lost response may have created it — a retry would duplicate it.
+    const retryable = (out.status === 0 && out.notSent === true) || out.status === 429;
+    throw Object.assign(new Error(`thread reply ${out.status}: ${out.text.slice(0, 160)}`), { retryable });
+  }
 }
 
 /** A user's repository permission (legacy `permission` field: admin | write | read | none —

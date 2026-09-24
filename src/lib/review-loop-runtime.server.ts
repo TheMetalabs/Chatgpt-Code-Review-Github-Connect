@@ -647,11 +647,14 @@ export async function runPostReviewLoop(
   // An id shared by two findings cannot say which one was published: neither is (fail closed).
   const published = posted?.published ? new Set(posted.published) : undefined;
   const ambiguous = duplicateIds((job.findings ?? []).map((f) => f.id));
-  const findings = (job.findings ?? []).filter((f) => !published || (published.has(f.id) && !ambiguous.has(f.id)));
-  // GitHub refused the inline anchors and the review shows none of its findings: NOT convergence
-  // (the review still requests changes), so an active session gets a fixed handoff below.
+  const shown = (job.findings ?? []).filter((f) => !published || published.has(f.id));
+  const findings = shown.filter((f) => !ambiguous.has(f.id));
+  // Two cases are NOT convergence (the review still requests changes), so an active session gets a
+  // fixed handoff below: GitHub refused the inline anchors and the review shows none of its
+  // findings, or it shows findings that all share ids and cannot be attributed.
   const unshown = findings.length === 0 && posted?.inlineDropped === true && (job.findings?.length ?? 0) > 0;
-  if (findings.length === 0 && !unshown) return { ran: false, reason: "no findings (converged)" };
+  const unattributable = findings.length === 0 && shown.length > 0;
+  if (findings.length === 0 && !unshown && !unattributable) return { ran: false, reason: "no findings (converged)" };
 
   const { owner, repo, pr, headSha } = job;
   const ref: PrRef = { owner, repo, pr };
@@ -738,6 +741,9 @@ export async function runPostReviewLoop(
     diffLines = diffLinesOf(head);
     if (unshown) {
       return await escalate("loop-error", "GitHub refused this review's inline comments, so none of its findings are shown on the PR; the loop does not fix what the PR does not show");
+    }
+    if (unattributable) {
+      return await escalate("loop-error", "every finding of this review shares its id with another, so none can be attributed to its thread; the loop does not fix what it cannot attribute");
     }
     if (!sample) return await escalate("loop-error", "no head-pinned snapshot for this review");
 
@@ -867,10 +873,11 @@ export async function runPostReviewLoop(
       }
       return { ok: true };
     };
-    // Per-finding thread replies: a transient failure is retried (the list and each reply, same
-    // backoff as the continuation); what still fails never fails the round and is counted in the
-    // report. (A durable "0 unaddressed" gate across rounds is the K1 control-plane work, #79.)
-    const withRetry = async <T>(call: () => Promise<T>): Promise<T> => {
+    // Per-finding thread replies: a transient failure is retried with the continuation's backoff —
+    // the thread list (a read) always, a reply only when GitHub cannot have created it (its error
+    // says retryable), so a retry never duplicates one. What still fails never fails the round and
+    // is counted in the report. (A durable "0 unaddressed" gate across rounds is K1 work, #79.)
+    const withRetry = async <T>(call: () => Promise<T>, retryable: (e: unknown) => boolean = () => true): Promise<T> => {
       let last: unknown;
       for (const wait of POST_RETRY_DELAYS_MS) {
         if (wait) await sleep(wait);
@@ -878,10 +885,12 @@ export async function runPostReviewLoop(
           return await call();
         } catch (e) {
           last = e;
+          if (!retryable(e)) break;
         }
       }
       throw last;
     };
+    const replyRetryable = (e: unknown) => (e as { retryable?: unknown } | null)?.retryable === true;
     const replyToThreads = async (dispositions: FixDisposition[] | undefined, commitSha?: string): Promise<{ ok: number; failed: number }> => {
       const tally = { ok: 0, failed: 0 };
       if (!posted?.githubId || posted.comments.length === 0) return tally;
@@ -901,7 +910,7 @@ export async function runPostReviewLoop(
         if (threadId === undefined) continue;
         const body = threadReplyBody(byId.get(`F${i + 1}`), rounds.length, commitSha);
         try {
-          await withRetry(() => gh.replyToReviewComment(token, owner, repo, pr, threadId, body));
+          await withRetry(() => gh.replyToReviewComment(token, owner, repo, pr, threadId, body), replyRetryable);
           tally.ok += 1;
         } catch {
           tally.failed += 1;

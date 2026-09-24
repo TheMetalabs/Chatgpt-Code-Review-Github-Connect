@@ -82,3 +82,33 @@ test('listReviewThreadRoots keys each root by the line it was posted on (origina
     { id: 4, path: 'a.ts', body: 'no line' },
   ]);
 });
+
+// A reply POST is retryable only when GitHub cannot have created it.
+function replyApi(transport) {
+  return loadTs('src/lib/github.server.ts', {
+    ...loadTs('src/lib/github-transport.ts', { TLSSocket }),
+    ...loadTs('src/lib/review-diff.ts'),
+    dnsLookup: async () => ({ address: '127.0.0.1', family: 4 }),
+    https: { request(_options, callback) {
+      const request = new EventEmitter();
+      request.setTimeout = () => request;
+      request.write = () => {};
+      request.destroy = (e) => request.emit('error', e);
+      request.end = () => queueMicrotask(() => transport(request, callback));
+      return request;
+    } },
+  });
+}
+const replied = async (api) => api.replyToReviewComment('t', 'o', 'r', 1, 7, 'Fixed').then(() => 'ok', (e) => ({ retryable: e.retryable }));
+
+test('replyToReviewComment: a request that never left is retryable; a 5xx or a lost response is not', async () => {
+  // connect refused before any socket: nothing reached GitHub
+  assert.deepEqual(await replied(replyApi((req) => req.emit('error', new Error('connect ECONNREFUSED')))), { retryable: true });
+  // connected, then the response was lost: GitHub may have created the reply
+  const lost = (req) => { const socket = new EventEmitter(); socket.connecting = false; req.emit('socket', socket); req.emit('error', new Error('GitHub API timeout')); };
+  assert.deepEqual(await replied(replyApi(lost)), { retryable: false });
+  const status = (code) => (_req, callback) => { const res = new EventEmitter(); res.statusCode = code; callback(res); res.emit('data', Buffer.from('{}')); res.emit('end'); };
+  assert.deepEqual(await replied(replyApi(status(502))), { retryable: false });
+  assert.deepEqual(await replied(replyApi(status(429))), { retryable: true });
+  assert.equal(await replied(replyApi(status(201))), 'ok');
+});

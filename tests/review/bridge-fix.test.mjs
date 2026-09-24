@@ -198,3 +198,17 @@ test('a newer request for the PR supersedes the older one; its id then reports c
   assert.equal(h.bridge.completeBridgeFix(offer.jobId, 'late', undefined, offer.leaseId).code, 'lease_conflict');
   void newer;
 });
+
+test('the chat fix prompt ceiling is Settings fixAgent.chatMaxPromptChars, read live per request (no restart)', async () => {
+  const h = bridgeHarness([]);
+  const setFix = patch => { h.state.settings = {...h.state.settings, fixAgent: {...h.state.settings.fixAgent, ...patch}}; };
+  const big = {...FIX, prompt: 'x'.repeat(20_000)};
+  setFix({chatMaxPromptChars: 10_000});
+  await assert.rejects(h.bridge.requestBridgeFix(big), /accepts at most 10000/);
+  setFix({chatMaxPromptChars: 50_000}); // the operator saves a larger ceiling
+  const pending = quiet(h.bridge.requestBridgeFix({...big, pr: 10}));
+  const offer = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true});
+  assert.equal(offer.kind, 'fix');assert.equal(offer.prompt.length, 20_000);
+  h.bridge.completeBridgeFix(offer.jobId, 'OK', undefined, offer.leaseId);
+  assert.equal(await pending, 'OK');
+});

@@ -271,14 +271,37 @@ test('self-trigger guard is wired end-to-end with the configured App login (ASHL
   assert.equal(other.queued,true,'not self under the configured identity');
 });
 
-test('a loop stop whose first attempt failed is retried when GitHub redelivers it (the claim is the only guard)',async t=>{
+// The review loop's only switch is Settings (fixAgent.enabled + a provider), read live by harbor.
+const FIX_ON={enabled:true,provider:'local',delivery:'script-apply',mode:'suggest',parallelPrs:3};
+const loopStop=(id,at)=>({...comment(),sender:{login:'alice'},comment:{id,body:'/review-loop stop',created_at:at,updated_at:at,user:{login:'alice'}}});
+
+test('the loop is OFF unless Settings enable it; saving the toggle applies to the next delivery with no restart',async t=>{
   let reads=0;
-  const app=await appFixture({reviewLocal:false,fixAgent:{provider:'local',delivery:'script-apply',mode:'suggest',parallelPrs:3}},
+  const app=await appFixture({reviewLocal:false,fixAgent:{...FIX_ON,enabled:false}},
     {api:{fetchPullHeadRef:async()=>{reads++;throw new Error('GitHub API timeout');}}});
   t.after(()=>app.close());
+  const settle=()=>new Promise(resolve=>setTimeout(resolve,150));
+  // The old env flag alone does nothing: the saved switch is off.
   app.env.ASHLAR_FIX_AGENT='1';
+  assert.equal((await deliver(app,'issue_comment',loopStop(80,'2026-01-20T00:00:00Z'),'off-1')).status,202);
+  await settle();assert.equal(reads,0,'switch off: no loop control ran');
+  // Switched on in Settings (same process, no restart): the next delivery runs loop control.
+  app.harbor.patchHarborSettings({fixAgent:{...FIX_ON}});
+  await deliver(app,'issue_comment',loopStop(81,'2026-01-20T00:01:00Z'),'on-1');
+  await eventually(()=>reads===1,'the enabled switch did not reach loop control');
+  // Switched off again: the next delivery is inert again.
+  app.harbor.patchHarborSettings({fixAgent:{...FIX_ON,enabled:false}});
+  await deliver(app,'issue_comment',loopStop(82,'2026-01-20T00:02:00Z'),'off-2');
+  await settle();assert.equal(reads,1,'switched off: no further loop control');
+});
+
+test('a loop stop whose first attempt failed is retried when GitHub redelivers it (the claim is the only guard)',async t=>{
+  let reads=0;
+  const app=await appFixture({reviewLocal:false,fixAgent:{...FIX_ON}},
+    {api:{fetchPullHeadRef:async()=>{reads++;throw new Error('GitHub API timeout');}}});
+  t.after(()=>app.close());
   const at='2026-01-20T00:00:00Z';
-  const stop={...comment(),sender:{login:'alice'},comment:{id:77,body:'/review-loop stop',created_at:at,updated_at:at,user:{login:'alice'}}};
+  const stop=loopStop(77,at);
   const first=await deliver(app,'issue_comment',stop,'stop-1');
   assert.equal(first.status,202);
   await eventually(()=>reads===1,'the stop never ran');

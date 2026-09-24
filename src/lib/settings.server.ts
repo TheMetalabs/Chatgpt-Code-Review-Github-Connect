@@ -3,13 +3,16 @@ import { dirname, join } from "node:path";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server.ts";
 import {
   DEFAULT_SETTINGS,
+  FIX_AGENT_KNOBS,
   FIX_AGENT_PROVIDERS,
   FIX_DELIVERIES,
   FIX_MODES,
   LOCAL_REVIEW_MODES,
+  fixKnob,
   normalizeReviewOrder,
   providersFromSettings,
   type BotSettings,
+  type FixAgentKnob,
   type FixAgentProvider,
   type FixDelivery,
   type FixMode,
@@ -97,13 +100,19 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (promptContextMax !== undefined) o.promptContextMaxChars = promptContextMax;
   const promptPolicyMax = envNum("ASHLAR_PROMPT_POLICY_MAX_CHARS");
   if (promptPolicyMax !== undefined) o.promptPolicyMaxChars = promptPolicyMax;
-  // Read the provider EMPTY-PRESERVING (not via envStr, which collapses "" -> undefined): an
-  // explicit ASHLAR_FIX_PROVIDER="" is the disable sentinel and must override a persisted provider.
+  // Fix agent: env SEEDS these fields only until the operator saves Settings — a saved fixAgent
+  // wins at load (diskFixAgentWins). `enabled` has NO env var: the Settings screen is the only
+  // switch for the review loop. The provider is read EMPTY-PRESERVING (not via envStr, which
+  // collapses "" -> undefined): an explicit ASHLAR_FIX_PROVIDER="" seeds "no provider".
   const fixProviderRaw = process.env.ASHLAR_FIX_PROVIDER;
   const fixDelivery = envStr("ASHLAR_FIX_DELIVERY");
   const fixMode = envStr("ASHLAR_FIX_MODE");
-  const fixParallel = envNum("ASHLAR_FIX_PARALLEL_PRS");
-  if (fixProviderRaw !== undefined || fixDelivery || fixMode || fixParallel !== undefined) {
+  const fixKnobs: Record<string, number> = {};
+  for (const [key, knob] of Object.entries(FIX_AGENT_KNOBS)) {
+    const n = envNum(knob.env);
+    if (n !== undefined) fixKnobs[key] = n;
+  }
+  if (fixProviderRaw !== undefined || fixDelivery || fixMode || Object.keys(fixKnobs).length) {
     const baseFix = (o.fixAgent as Record<string, unknown> | undefined) ?? {};
     o.fixAgent = {
       ...baseFix,
@@ -111,7 +120,7 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
         fixProviderRaw !== undefined ? (fixProviderRaw.trim() === "" ? null : fixProviderRaw.trim()) : baseFix.provider,
       ...(fixDelivery ? { delivery: fixDelivery } : {}),
       ...(fixMode ? { mode: fixMode } : {}),
-      ...(fixParallel !== undefined ? { parallelPrs: fixParallel } : {}),
+      ...fixKnobs,
     };
   }
   const contextPad = envNum("ASHLAR_CONTEXT_PAD_LINES");
@@ -152,7 +161,10 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_FIX_PROVIDER: s.fixAgent.provider ?? "",
     ASHLAR_FIX_DELIVERY: s.fixAgent.delivery,
     ASHLAR_FIX_MODE: s.fixAgent.mode,
-    ASHLAR_FIX_PARALLEL_PRS: String(s.fixAgent.parallelPrs),
+    // fixAgent.enabled is deliberately NOT mirrored: no env var can switch the loop on.
+    ...Object.fromEntries(
+      (Object.keys(FIX_AGENT_KNOBS) as FixAgentKnob[]).map((key) => [FIX_AGENT_KNOBS[key].env, String(fixKnob(s.fixAgent, key))]),
+    ),
   };
 }
 
@@ -188,13 +200,17 @@ function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
   let provider = FIX_AGENT_PROVIDERS.includes(p.provider as FixAgentProvider) ? (p.provider as FixAgentProvider) : d.provider;
   let delivery = FIX_DELIVERIES.includes(p.delivery as FixDelivery) ? (p.delivery as FixDelivery) : d.delivery;
   const mode = FIX_MODES.includes(p.mode as FixMode) ? (p.mode as FixMode) : d.mode;
-  const parallelPrs = Math.max(1, Math.min(20, Math.floor(num(p.parallelPrs, d.parallelPrs))));
+  // Only a literal true enables the loop ("true", 1, … stay off): the switch fails closed.
+  const enabled = p.enabled === true;
   // Enforce the provider→delivery matrix: an incompatible pair disables the fix agent.
   if (provider !== null && !FIX_DELIVERY_BY_PROVIDER[provider].includes(delivery)) {
     provider = null;
     delivery = d.delivery;
   }
-  return { provider, delivery, mode, parallelPrs };
+  const knobs = Object.fromEntries(
+    (Object.keys(FIX_AGENT_KNOBS) as FixAgentKnob[]).map((key) => [key, fixKnob({ [key]: num(p[key], FIX_AGENT_KNOBS[key].def) }, key)]),
+  ) as Record<FixAgentKnob, number>;
+  return { enabled, provider, delivery, mode, ...knobs };
 }
 
 export function sanitizeBotSettings(raw: unknown): BotSettings {
@@ -290,10 +306,19 @@ export function diskReviewerFlagsWin(disk: Record<string, unknown>, merged: Reco
   return out;
 }
 
+/** A saved fixAgent wins over the env seed field by field: the Settings screen, not a process
+ * env var, operates the review loop (env only fills what was never saved). */
+export function diskFixAgentWins(disk: Record<string, unknown>, merged: Record<string, unknown>): Record<string, unknown> {
+  const saved = disk.fixAgent;
+  if (!saved || typeof saved !== "object" || Array.isArray(saved)) return merged;
+  const seeded = merged.fixAgent && typeof merged.fixAgent === "object" ? (merged.fixAgent as Record<string, unknown>) : {};
+  return { ...merged, fixAgent: { ...seeded, ...(saved as Record<string, unknown>) } };
+}
+
 export function loadBotSettings(): BotSettings {
   loadDotenvFile();
   const disk = readDiskSettings();
-  return sanitizeBotSettings(diskReviewerFlagsWin(disk, overlayEnv(disk)));
+  return sanitizeBotSettings(diskFixAgentWins(disk, diskReviewerFlagsWin(disk, overlayEnv(disk))));
 }
 
 export function saveBotSettings(settings: BotSettings) {

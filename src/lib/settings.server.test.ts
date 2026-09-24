@@ -1,7 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { botSettingsToEnv, diskReviewerFlagsWin, overlayEnv, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
-import { DEFAULT_SETTINGS, providersFromSettings } from "./types.ts";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { botSettingsToEnv, diskFixAgentWins, diskReviewerFlagsWin, overlayEnv, persistableSettings, sanitizeBotSettings } from "./settings.server.ts";
+import { DEFAULT_SETTINGS, FIX_AGENT_KNOBS, providersFromSettings } from "./types.ts";
 
 describe("sanitizeBotSettings", () => {
   it("keeps local LLM fields from a saved document", () => {
@@ -94,6 +98,7 @@ describe("sanitizeBotSettings", () => {
 
   it("defaults the fix agent to disabled (no auto-fix) with safe delivery/mode", () => {
     const s = sanitizeBotSettings({});
+    assert.equal(s.fixAgent.enabled, false);
     assert.equal(s.fixAgent.provider, null);
     assert.equal(s.fixAgent.delivery, "script-apply");
     assert.equal(s.fixAgent.mode, "suggest");
@@ -102,7 +107,7 @@ describe("sanitizeBotSettings", () => {
 
   it("normalizes fix agent config and rejects unknown values", () => {
     const ok = sanitizeBotSettings({ fixAgent: { provider: "local", delivery: "script-apply", mode: "apply", parallelPrs: 5 } });
-    assert.deepEqual(ok.fixAgent, { provider: "local", delivery: "script-apply", mode: "apply", parallelPrs: 5 });
+    assert.deepEqual(ok.fixAgent, { ...DEFAULT_SETTINGS.fixAgent, provider: "local", delivery: "script-apply", mode: "apply", parallelPrs: 5 });
     const bad = sanitizeBotSettings({ fixAgent: { provider: "bogus", delivery: "diff", mode: "yolo", parallelPrs: 999 } });
     assert.equal(bad.fixAgent.provider, null); // unknown provider -> default (disabled)
     assert.equal(bad.fixAgent.delivery, "script-apply");
@@ -117,8 +122,11 @@ describe("sanitizeBotSettings", () => {
     assert.equal(env.ASHLAR_FIX_DELIVERY, "chat-push");
     assert.equal(env.ASHLAR_FIX_MODE, "apply");
     assert.equal(env.ASHLAR_FIX_PARALLEL_PRS, "4");
-    // a disabled fix agent serializes provider as "" AND round-trips to null through the read
-    // path (an explicit empty ASHLAR_FIX_PROVIDER disables a persisted provider) (J2/J8)
+    assert.equal(env.ASHLAR_LOOP_ROUND_CAP, String(DEFAULT_SETTINGS.fixAgent.roundCap));
+    assert.equal(env.ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS, String(DEFAULT_SETTINGS.fixAgent.chatMaxPromptChars));
+    // a disabled fix agent serializes provider as "" AND round-trips to null through the env
+    // overlay (an explicit empty ASHLAR_FIX_PROVIDER seeds "no provider") (J2/J8). At load a
+    // SAVED fixAgent still wins over this seed (diskFixAgentWins).
     assert.equal(botSettingsToEnv(sanitizeBotSettings({})).ASHLAR_FIX_PROVIDER, "");
     const prev = process.env.ASHLAR_FIX_PROVIDER;
     try {
@@ -129,6 +137,77 @@ describe("sanitizeBotSettings", () => {
     } finally {
       if (prev === undefined) delete process.env.ASHLAR_FIX_PROVIDER; else process.env.ASHLAR_FIX_PROVIDER = prev;
     }
+  });
+
+  it("fixAgent round-trips every Settings field unchanged", () => {
+    const full = {
+      enabled: true,
+      provider: "grok",
+      delivery: "script-apply",
+      mode: "apply",
+      parallelPrs: 4,
+      roundCap: 7,
+      attempts: 3,
+      timeoutMs: 45 * 60_000,
+      queueMaxMs: 2 * 60 * 60_000,
+      chatTimeoutMs: 20 * 60_000,
+      chatMaxPromptChars: 250_000,
+    };
+    const once = sanitizeBotSettings({ fixAgent: full });
+    assert.deepEqual(once.fixAgent, full);
+    assert.deepEqual(sanitizeBotSettings(JSON.parse(JSON.stringify(once))).fixAgent, full, "saved JSON → load is lossless");
+  });
+
+  it("rejects or normalizes invalid fixAgent values (switch fails closed, numbers clamped)", () => {
+    for (const v of ["true", 1, "on", null, undefined, {}]) {
+      assert.equal(sanitizeBotSettings({ fixAgent: { enabled: v, provider: "local" } }).fixAgent.enabled, false, JSON.stringify(v));
+    }
+    const low = sanitizeBotSettings({ fixAgent: { parallelPrs: 0, roundCap: -3, attempts: 0, timeoutMs: 5, queueMaxMs: 1, chatTimeoutMs: 1, chatMaxPromptChars: 10 } }).fixAgent;
+    const high = sanitizeBotSettings({ fixAgent: { parallelPrs: 1e9, roundCap: 1e9, attempts: 99, timeoutMs: 1e12, queueMaxMs: 1e12, chatTimeoutMs: 1e12, chatMaxPromptChars: 1e12 } }).fixAgent;
+    const junk = sanitizeBotSettings({ fixAgent: { parallelPrs: "7", roundCap: NaN, attempts: "x", timeoutMs: null, queueMaxMs: Infinity, chatTimeoutMs: [], chatMaxPromptChars: {} } }).fixAgent;
+    for (const [key, knob] of Object.entries(FIX_AGENT_KNOBS)) {
+      assert.equal((low as unknown as Record<string, number>)[key], knob.min, `${key} low`);
+      assert.equal((high as unknown as Record<string, number>)[key], knob.max, `${key} high`);
+      assert.equal((junk as unknown as Record<string, number>)[key], knob.def, `${key} junk`);
+    }
+    assert.equal(sanitizeBotSettings({ fixAgent: { roundCap: 2.9 } }).fixAgent.roundCap, 2, "whole rounds");
+  });
+
+  it("env seeds the fix agent only until Settings saved it; the switch has no env var", () => {
+    const keys = ["ASHLAR_FIX_PROVIDER", "ASHLAR_LOOP_ROUND_CAP", "ASHLAR_FIX_CHAT_TIMEOUT_MS", "ASHLAR_FIX_AGENT"];
+    const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    try {
+      Object.assign(process.env, { ASHLAR_FIX_PROVIDER: "grok", ASHLAR_LOOP_ROUND_CAP: "7", ASHLAR_FIX_CHAT_TIMEOUT_MS: "120000", ASHLAR_FIX_AGENT: "1" });
+      const seeded = sanitizeBotSettings(overlayEnv({})).fixAgent;
+      assert.deepEqual([seeded.enabled, seeded.provider, seeded.roundCap, seeded.chatTimeoutMs], [false, "grok", 7, 120_000]);
+      const disk = { fixAgent: sanitizeBotSettings({ fixAgent: { enabled: true, provider: "local", roundCap: 3 } }).fixAgent };
+      const loaded = sanitizeBotSettings(diskFixAgentWins(disk, overlayEnv(disk))).fixAgent;
+      assert.deepEqual([loaded.enabled, loaded.provider, loaded.roundCap, loaded.chatTimeoutMs], [true, "local", 3, DEFAULT_SETTINGS.fixAgent.chatTimeoutMs]);
+      assert.equal("ASHLAR_FIX_ENABLED" in botSettingsToEnv(sanitizeBotSettings(disk)), false);
+    } finally {
+      for (const k of keys) {
+        if (prev[k] === undefined) delete process.env[k];
+        else process.env[k] = prev[k];
+      }
+    }
+  });
+
+  it("a saved fix agent survives a process restart even when the startup env says otherwise", (t) => {
+    const cwd = mkdtempSync(join(tmpdir(), "fix-agent-settings-"));
+    t.after(() => rmSync(cwd, { recursive: true, force: true }));
+    const module = new URL("./settings.server.ts", import.meta.url).href;
+    const env = { PATH: process.env.PATH, HOME: cwd, ASHLAR_FIX_PROVIDER: "", ASHLAR_LOOP_ROUND_CAP: "9", ASHLAR_FIX_AGENT: "0" };
+    const run = (code: string) =>
+      spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `import * as settings from ${JSON.stringify(module)};${code}`], { cwd, env, encoding: "utf8" });
+    const fresh = run("console.log(JSON.stringify(settings.loadBotSettings().fixAgent))");
+    assert.equal(fresh.status, 0, fresh.stderr);
+    assert.deepEqual(JSON.parse(fresh.stdout).enabled, false);
+    const saved = run('settings.saveBotSettings(settings.sanitizeBotSettings({fixAgent:{enabled:true,provider:"chatgpt",roundCap:2}}));');
+    assert.equal(saved.status, 0, saved.stderr);
+    const restored = run("console.log(JSON.stringify(settings.loadBotSettings().fixAgent))");
+    assert.equal(restored.status, 0, restored.stderr);
+    const fix = JSON.parse(restored.stdout);
+    assert.deepEqual([fix.enabled, fix.provider, fix.roundCap], [true, "chatgpt", 2]);
   });
 
   it("enforces the provider→delivery matrix, disabling incompatible pairs (F7)", () => {

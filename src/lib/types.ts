@@ -230,7 +230,7 @@ export interface BotSettings {
   reviewChatgpt: boolean;
   reviewGrok: boolean;
   reviewLocal: boolean;
-  /** Review-loop fix agent (design §6b) — configurable from the start; execution is phase 3. */
+  /** Review-loop fix agent (design §6b) — the Settings screen is its only switch. */
   fixAgent: FixAgentSettings;
   /** Formatting-only recovery; independent of Local reviewer participation. */
   localJsonRepairEnabled: boolean;
@@ -291,18 +291,61 @@ export const FIX_AGENT_PROVIDERS: readonly FixAgentProvider[] = ["chatgpt", "gro
 export const FIX_DELIVERIES: readonly FixDelivery[] = ["script-apply", "chat-push", "coding-agent"];
 export const FIX_MODES: readonly FixMode[] = ["suggest", "apply"];
 
-/** Review-loop fix agent (design §6b), configurable from the start. Execution is phase 3;
- * the config exists now so operators can pin who fixes and how before it ships. */
+/** Review-loop fix agent (design §6b). EVERY field is operated from the Settings screen and read
+ * per loop step from the live settings (no restart). The loop runs only when `enabled` is true AND
+ * a provider is chosen (review-loop-runtime loopEnabled) — nothing else (no env var) turns it on. */
 export interface FixAgentSettings {
-  /** null = the review-loop does NOT auto-fix (safe default). */
+  /** The ONE switch for the review loop / fix agent. Default false: no loop, no fix item. */
+  enabled: boolean;
+  /** Who fixes. null = no provider chosen: the loop stays off even when `enabled`. */
   provider: FixAgentProvider | null;
-  /** How the fix reaches the PR (§6 A/B/C). */
+  /** How the fix reaches the PR (§6 A/B/C). Only "script-apply" is wired. */
   delivery: FixDelivery;
   /** suggest = proposal / draft commit (human 1-click); apply = auto-commit + push (high-risk). */
   mode: FixMode;
   /** Max distinct PRs fixed concurrently — shares the reviewer bridge capacity. */
   parallelPrs: number;
+  /** Fix-round budget: at most this many review→fix rounds, then a human decides. */
+  roundCap: number;
+  /** Attempts per fix round for a retryable outcome (unusable reply). */
+  attempts: number;
+  /** Generation deadline per fix request (ms, from the provider's first output). */
+  timeoutMs: number;
+  /** Backstop for a fix request still queued at the provider (ms). */
+  queueMaxMs: number;
+  /** chatgpt / grok: a chat fix item's deadline, queue + generation (ms). */
+  chatTimeoutMs: number;
+  /** chatgpt / grok: the largest inline fix prompt (chars); bigger is rejected up front. */
+  chatMaxPromptChars: number;
 }
+
+export type FixAgentKnob = "parallelPrs" | "roundCap" | "attempts" | "timeoutMs" | "queueMaxMs" | "chatTimeoutMs" | "chatMaxPromptChars";
+
+/** Numeric fix-agent knobs: default, bounds, and the env var that seeds it before the first save
+ * (settings.server overlayEnv). The saved Settings value always wins over the env default. */
+export const FIX_AGENT_KNOBS: Record<FixAgentKnob, { def: number; min: number; max: number; env: string }> = {
+  parallelPrs: { def: 3, min: 1, max: 20, env: "ASHLAR_FIX_PARALLEL_PRS" },
+  // max = MAX_CONTINUE_ROUND - 1 (review-loop.ts): review cap+1 must stay a valid continuation round.
+  roundCap: { def: 5, min: 1, max: 9998, env: "ASHLAR_LOOP_ROUND_CAP" },
+  attempts: { def: 2, min: 1, max: 5, env: "ASHLAR_FIX_ATTEMPTS" },
+  timeoutMs: { def: 60 * 60_000, min: 60_000, max: 6 * 60 * 60_000, env: "ASHLAR_FIX_TIMEOUT_MS" },
+  queueMaxMs: { def: 6 * 60 * 60_000, min: 10 * 60_000, max: 24 * 60 * 60_000, env: "ASHLAR_FIX_QUEUE_MAX_MS" },
+  chatTimeoutMs: { def: 30 * 60_000, min: 60_000, max: 6 * 60 * 60_000, env: "ASHLAR_FIX_CHAT_TIMEOUT_MS" },
+  chatMaxPromptChars: { def: 100_000, min: 10_000, max: 1_000_000, env: "ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS" },
+};
+
+/** A numeric fix-agent knob, clamped to its bounds; missing / non-numeric → its default. Readers
+ * call this per use with the live settings, so a saved change applies on the next call. */
+export function fixKnob(fixAgent: Partial<FixAgentSettings> | undefined, key: FixAgentKnob): number {
+  const k = FIX_AGENT_KNOBS[key];
+  const v = fixAgent?.[key];
+  if (typeof v !== "number" || !Number.isFinite(v)) return k.def;
+  return Math.min(k.max, Math.max(k.min, Math.floor(v)));
+}
+
+/** Providers / deliveries the loop can actually execute today (the Settings screen offers these). */
+export const WIRED_FIX_PROVIDERS: readonly FixAgentProvider[] = ["chatgpt", "grok", "local"];
+export const WIRED_FIX_DELIVERIES: readonly FixDelivery[] = ["script-apply"];
 
 export const DEFAULT_SETTINGS: BotSettings = {
   username: "ashlar-bot",
@@ -319,7 +362,19 @@ export const DEFAULT_SETTINGS: BotSettings = {
   reviewChatgpt: true,
   reviewGrok: true,
   reviewLocal: false,
-  fixAgent: { provider: null, delivery: "script-apply", mode: "suggest", parallelPrs: 3 },
+  fixAgent: {
+    enabled: false,
+    provider: null,
+    delivery: "script-apply",
+    mode: "suggest",
+    parallelPrs: FIX_AGENT_KNOBS.parallelPrs.def,
+    roundCap: FIX_AGENT_KNOBS.roundCap.def,
+    attempts: FIX_AGENT_KNOBS.attempts.def,
+    timeoutMs: FIX_AGENT_KNOBS.timeoutMs.def,
+    queueMaxMs: FIX_AGENT_KNOBS.queueMaxMs.def,
+    chatTimeoutMs: FIX_AGENT_KNOBS.chatTimeoutMs.def,
+    chatMaxPromptChars: FIX_AGENT_KNOBS.chatMaxPromptChars.def,
+  },
   localJsonRepairEnabled: true,
   chatgptReasoning: "pro",
   grokReasoning: "heavy",

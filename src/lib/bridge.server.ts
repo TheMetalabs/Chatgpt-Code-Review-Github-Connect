@@ -8,12 +8,12 @@ import {sanitizeProgressEvents} from "./review-progress";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider, ProviderError } from "./types";
-import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, isChatProvider, providersFromSettings } from "./types";
+import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, fixKnob, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
 import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
-import { createFixRegistry, fixChatMaxPromptChars, fixChatTimeoutMs, isFixItemId, type FixOffer, type FixRequest } from "./bridge-fix.server";
+import { createFixRegistry, isFixItemId, type FixOffer, type FixRequest } from "./bridge-fix.server";
 
 type BridgeMeta = {
   token: string;
@@ -152,8 +152,9 @@ function fixes() {
     newId: () => randomBytes(18).toString("base64url"),
     parallelLimit: () => getHarbor().settings.fixAgent?.parallelPrs ?? 1,
     reasoning: () => ({chatgpt: getHarbor().settings.chatgptReasoning, grok: getHarbor().settings.grokReasoning}),
-    timeoutMs: () => fixChatTimeoutMs(process.env),
-    maxPromptChars: () => fixChatMaxPromptChars(process.env),
+    // Settings (fixAgent.chatTimeoutMs / chatMaxPromptChars), read per request: no restart.
+    timeoutMs: () => fixKnob(getHarbor().settings.fixAgent, "chatTimeoutMs"),
+    maxPromptChars: () => fixKnob(getHarbor().settings.fixAgent, "chatMaxPromptChars"),
     claimMs: BRIDGE_CLAIM_MS,
     submitWindowMs: SUBMIT_WINDOW_MS,
     // unref: a pending fix deadline must never keep the server (or a test runner) alive.

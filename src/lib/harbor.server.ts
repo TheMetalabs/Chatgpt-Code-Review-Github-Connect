@@ -1120,8 +1120,9 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
-  // Review-loop step (design §5 4–8): gated OFF by default (ASHLAR_FIX_AGENT + fixAgent.provider,
-  // and only for /review-loop-triggered reviews). Best-effort — never un-posts the review.
+  // Review-loop step (design §5 4–8): gated OFF by default (Settings fixAgent.enabled +
+  // fixAgent.provider, read from the live state.settings, so a saved toggle applies here with no
+  // restart). Best-effort — never un-posts the review.
   // Never start a fix round on a stale head: a commit parented on the reviewed SHA would
   // fast-forward over (and undo) a contributor's backward force-push. The runtime re-checks
   // the live head right before committing as well.

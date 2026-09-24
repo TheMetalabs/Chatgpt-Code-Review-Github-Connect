@@ -59,9 +59,12 @@ Archived sources awaiting processing: ${work.sourceCaptured || 0}.` : "\nCapacit
   const blockers = (capacity?.blockers || []).map(item=>`${item.jobId} / ${item.provider}: ${item.reason}`).join("\n");
   const stages=(work.stages||[]).map(s=>`${s.jobId} / ${s.provider}: ${s.stage}`).join("\n");
   const recovery = (work.recovery || []).map(j => `${j.jobId}: ${j.status}`).join("\n");
+  // Why a recently finished leg's tab was closed or kept (the job itself is gone).
+  const retired = (work.retired || []).slice(-4).map(r => `${r.jobId} / ${r.provider}: ${r.stage}${r.cause ? ` (${r.cause})` : ""}`).join("\n");
   workerEl.textContent = `${phases[work.phase] || work.phase}${admission}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}; JSON pending: ${work.waitingForJson || 0}` +
     slots + (blockers ? `\nSlot reasons:\n${blockers}` : "") +
-    (stages ? `\n${stages}` : "") + (recovery ? `\n${recovery}` : "") + (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
+    (stages ? `\n${stages}` : "") + (recovery ? `\n${recovery}` : "") + (retired ? `\nRecently retired:\n${retired}` : "") +
+    (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
 }
 
 (async () => {

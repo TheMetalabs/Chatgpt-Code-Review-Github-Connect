@@ -13,6 +13,9 @@ const DEFAULT_MAX_REVIEW_TABS = 4;
 const HEARTBEAT_MS = 10_000;
 const HEALTH_KEY = "bridgeHealth";
 const WORKER_STATUS_KEY = "bridgeWorkerStatus";
+// The last legs this worker retired (metadata only: ids, stage, preserve cause, fixed cleanup note),
+// shown in the popup so a kept or closed tab can be explained after its job is gone. Never uploaded.
+const RECENT_RETIRED_KEY = "bridgeRecentRetired";
 const MAINTENANCE_KEY = "extensionMaintenance";
 
 // Locks are ephemeral; identities, replies and allocation intent remain in storage.
@@ -225,6 +228,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
     const relevant = Object.values(jobs).filter(job => job.origin === origin);
     const phase = relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
     const admission = admissionReports.get(origin);
+    const retired = (await chrome.storage.local.get([RECENT_RETIRED_KEY]))[RECENT_RETIRED_KEY];
     await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
       origin, checkedAt: Date.now(), phase, capacity,
       admissionPhase: admission?.phase || "not_checked",
@@ -241,6 +245,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
         jobId: job.jobId, status: job.serverStatus || (job.recoveryError ? "connection_error" : "reconnecting_or_cleanup"),
       })),
+      retired: Array.isArray(retired) ? retired : [],
     }});
   });
 }
@@ -357,6 +362,16 @@ function workerStep(job, provider, stage) {
   if(!state.runId || state.workerEvents?.at(-1)?.stage===stage)return;
   state.workerSequence=(state.workerSequence||0)+1;
   state.workerEvents=[...(state.workerEvents||[]),{source:"worker",sequence:state.workerSequence,stage,at:Date.now()}].slice(-128);
+}
+
+/** Copy the page's step journal from a matching reply (poll or cleanup): untrusted input, so only
+ * primitive metadata is kept (the server sanitizes it again). True when it was taken. */
+function ingestPageProgress(state, result) {
+  if (result?.progress?.runId !== state.runId || !Array.isArray(result.progress.events)) return false;
+  state.pageEvents = result.progress.events.slice(-128).filter(e => e && e.source === "page" &&
+    Number.isSafeInteger(e.sequence) && typeof e.stage === "string" && e.stage.length < 80 && Number.isFinite(e.at))
+    .map(e => ({source: "page", sequence: e.sequence, stage: e.stage, at: e.at}));
+  return true;
 }
 
 function progressFor(job) {
@@ -595,11 +610,21 @@ function compactFinalCapturedSource(state) {
   return true;
 }
 
-/** `_cause` (a preserved tab only): why the tab was kept. */
-async function finishTabCleanup(job, provider, jobs, reason, _cause) {
+/** Why a tab is kept open (the preserve_<cause> history stage; a function so tests can read it). */
+function preserveCauses() {
+  return ["navigated", "user_turn", "edited", "draft", "ownership_unknown", "unreachable", "other_binding", "unknown"];
+}
+
+/** `cause` (a preserved tab only): why the tab was kept, recorded as preserve_<cause> just before
+ * tab_preserved so review history says why (the cleanup note is dropped with the retired job). */
+async function finishTabCleanup(job, provider, jobs, reason, cause) {
   const state = job.states[provider];
   state.cleanupDone = true;
   state.cleanupPending = false;
+  if (reason?.includes("preserved")) {
+    state.preserveCause = preserveCauses().includes(cause) ? cause : "unknown";
+    workerStep(job, provider, `preserve_${state.preserveCause}`);
+  }
   workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : "tab_closed");
   if (reason) state.cleanupNote = reason;
   delete state.cleanupError;
@@ -727,11 +752,15 @@ function adoptFixConversation(state, result) {
  * another binding, not rendered) is re-asked before it is preserved. */
 const FIX_OWNERSHIP_WAIT_MS = 2 * 60_000;
 
-/** Why a settled leg's cleanup is waiting on its page (the capacity blocker shows it). */
+/** Why a settled leg's cleanup is waiting on its page (the capacity blocker shows it). A new reason
+ * is also a history step, uploaded at once (best effort, not awaited): a cleanup that never finishes
+ * never reaches the final flush at retirement. */
 function cleanupWaiting(job, provider, reason) {
   const state = job.states[provider];
   if (state.cleanupWaitReason === reason) return;
   state.cleanupWaitReason = reason;
+  workerStep(job, provider, "cleanup_waiting_page");
+  void flushProgress(job).catch(() => {});
 }
 
 /** The one exit for a tab Ashlar keeps open (taken over, moved, unidentifiable, stuck loading):
@@ -824,6 +853,8 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     cleanupWaiting(job, provider, "ownership_mismatch");
     return waitOrPreserveFixTab(job, provider, jobs, "the tab carries another binding; tab preserved", undefined, "other_binding");
   }
+  // The page's own steps (context_changed, cancelled, ...) reach history from cleanup replies too.
+  ingestPageProgress(state, result);
   const verdict = tabVerdict(result);
   if (verdict.ownership === "unknown") {
     // Another conversation than the one the run was bound in (an in-page move can leave the old DOM
@@ -890,6 +921,13 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
     for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
     await chrome.storage.session.set({tabs});
     await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
+    const ring = (await chrome.storage.local.get([RECENT_RETIRED_KEY]))[RECENT_RETIRED_KEY];
+    const retired = job.providers.map(provider => {
+      const state = job.states[provider];
+      return {jobId: job.jobId, kind: job.kind === "fix" ? "fix" : "review", provider, tabId: state.tabId,
+        stage: state.workerEvents?.at(-1)?.stage || "", cause: state.preserveCause, note: state.cleanupNote, at: Date.now()};
+    });
+    await chrome.storage.local.set({[RECENT_RETIRED_KEY]: [...(Array.isArray(ring) ? ring : []), ...retired].slice(-16)});
   });
   // writeInOrder above is itself an unabortable storage sequence that can outlive the sweep watchdog.
   // Recheck before the registry delete/persist so an abandoned sweep can't delete jobs[jobId] and rewrite
@@ -1029,13 +1067,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await saveJobs(jobs);
     return;
   }
-  if(result.progress?.runId===state.runId && Array.isArray(result.progress.events)) {
-    // Treat this as untrusted input again at the server; only primitive metadata is sent.
-    state.pageEvents=result.progress.events.slice(-128).filter(e=>e && e.source==="page" &&
-      Number.isSafeInteger(e.sequence) && typeof e.stage==="string" && e.stage.length<80 && Number.isFinite(e.at))
-      .map(e=>({source:"page",sequence:e.sequence,stage:e.stage,at:e.at}));
-    await saveJobs(jobs);
-  }
+  if (ingestPageProgress(state, result)) await saveJobs(jobs);
   if (result.observation && typeof result.observation === "object") {
     const item = result.observation;
     const text = typeof item.text === "string" ? item.text.slice(0, 128_000) : "";
@@ -1209,6 +1241,7 @@ async function captureProvider(job, provider, jobs) {
     return; // Repair can proceed from archive; cleanup retries independently.
   }
   if(!matchesJob(result,job,provider))return;
+  ingestPageProgress(state,result);
   if(result.code==="capture_source_changed") {
     // The original is durably archived (secured); a changed page is not the user's by itself.
     state.cleanupPending=true;
@@ -1233,6 +1266,7 @@ async function notifyRepairReceipt(job, provider, jobs) {
   const result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-repair-accepted"),
     committed:true,repairId:attempt.id,responseId:attempt.responseId,text:attempt.text,raw:attempt.raw},contentFiles(provider));
   if(!matchesJob(result,job,provider))return;
+  ingestPageProgress(state,result);
   if(!result.accepted) {
     if(["repair_source_changed","repair_source_unavailable"].includes(result.code)) {
       // The server already secured this original; the page no longer attesting to it is not the

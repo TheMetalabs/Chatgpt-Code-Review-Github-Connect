@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
 import {source} from './load-source.mjs';
 import {background,storage} from './helpers.mjs';
+import {sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;
 before(async()=>{browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});});
@@ -214,6 +215,8 @@ function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true,j
   // Past the bounded ownership wait (the worker reads Date.now; nothing waits on a timer).
   later:()=>{const RealDate=b.context.Date||Date;const at=RealDate.now()+3*60_000;b.context.Date=class extends RealDate{static now(){return at;}};}};
 }
+/** What review history receives: the last progress upload, through the server's own sanitizer. */
+const uploadedSteps=w=>sanitizeProgressEvents(w.b.calls.filter(c=>c.action==='progress').at(-1)?.progress?.chatgpt?.events).map(e=>`${e.source}:${e.stage}`);
 /** A leg whose page collected its answer (tail frozen in), before the worker harvests and delivers it. */
 async function collectedLeg(t,{kind,tail='',onComplete,...rest}={}){
  const tab=await chatTab(t,{kind,thread:userTurn()+answerTurn({code:ANSWER+tail}),journal:sentJournal(),...rest});
@@ -256,18 +259,21 @@ test('worker: a secured tab closes even while its sent-journal write keeps faili
  assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
 });
 // Secured legs the user took over: preserved (never closed), released, and the job retires.
-for(const [name,cause,takeover] of TAKEOVERS)test(`worker: an ACKed tab with ${name} is preserved and released`,async t=>{
+for(const [name,cause,takeover] of TAKEOVERS)test(`worker: an ACKed tab with ${name} is preserved and released, and history says why`,async t=>{
  const {tab,w}=await collectedLeg(t,{});
  await takeover(tab.page);
  await w.tick();
  assert.deepEqual(w.b.closedTabs,[]);assert.equal(w.state(),undefined,'the job retired');
  assert.equal(await tab.released(),'true');
+ const steps=uploadedSteps(w);
+ for(const stage of ['page:context_changed',`worker:preserve_${cause}`,'worker:tab_preserved'])assert.ok(steps.includes(stage),`${stage} in ${steps}`);
 });
 for(const syncUrl of [true,false])test(`worker: an ACKed tab moved in-page to another conversation is preserved (${syncUrl?'the tab URL already moved':'only the page knows'})`,async t=>{
  const {tab,w}=await collectedLeg(t,{});
  await tab.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);
  await w.tick({syncUrl});
  assert.deepEqual(w.b.closedTabs,[]);assert.equal(w.state(),undefined);
+ assert.ok(uploadedSteps(w).includes('worker:preserve_navigated'),'the preserve cause reaches history');
  assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
  assert.equal(w.b.messages.some(m=>m.type==='ashlar-can-close'),!syncUrl,syncUrl?'the worker saw the move itself: the page is not asked':'the page reports the move');
 });
@@ -289,6 +295,8 @@ for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while 
  await tab.page.clock.runFor(1000);
  assert.deepEqual(await tab.runner(),{running:false,code:'cancelled'},'the page collector stopped');
  assert.equal(await tab.clicks(),0);
+ const steps=uploadedSteps(w);
+ assert.ok(steps.includes('page:cancelled')&&steps.includes('worker:tab_closed'),`the stop and the close reach history: ${steps}`);
 });
 for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled after dispatch but before its prompt was sent is closed, and never sends it`,async t=>{
  const tab=await chatTab(t,{kind,composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
@@ -346,8 +354,8 @@ test('worker: job-muf51f0g-1942\'s stored leg (cancelled, then forgotten; wedged
  await w.tick();
  assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined,'the job retired');
  assert.ok(w.b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.allocationUrl===TEMP_URL),'the cancel exit, not can-close');
- const progress=w.b.calls.filter(c=>c.action==='progress').at(-1)?.progress?.chatgpt?.events||[];
- assert.ok(progress.some(e=>e.source==='worker'&&e.stage==='tab_closed'),'the close reaches review history');
+ const steps=uploadedSteps(w);
+ assert.ok(steps.includes('page:cancelled')&&steps.includes('worker:tab_closed'),`the page's stop and the close reach review history: ${steps}`);
 });
 for(const mode of ['secured','cancelled'])test(`worker: a ${mode} leg whose tab now belongs to another job is never closed, and that job's page is untouched`,async t=>{
  const tab=await generatingTab(t,{job:'job-B',run:'run-B'});

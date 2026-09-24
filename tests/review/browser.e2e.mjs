@@ -215,7 +215,9 @@ test('real DOM: a cancelled fix tab is Ashlar-owned only until the user takes it
  await sentTurn('my note: fix prompt');
  assert.equal((await cancel()).owned,false,'a sent turn the user edited to prefix + prompt is the user\'s');
  await sentTurn('fix prompt');
- assert.equal((await cancel()).owned,true,'the exact sent prompt is Ashlar\'s again');
+ // One proof for every fix decision (fixOwnershipProof): an edited sent turn is the user's for good,
+ // even when the edit is undone (the collector has always treated it so; cancel now agrees).
+ assert.equal((await cancel()).owned,false,'an edited turn stays the user\'s after the edit is undone');
  await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);});
  assert.equal((await cancel()).owned,false,'a follow-up turn preserves the tab');
 });
@@ -342,26 +344,115 @@ test('real DOM: a fix whose tab moved away and back to its bound conversation is
  assert.equal((await journal()).conversation,CONV_URL,'pinned once, never replaced');
 });
 
-test('real DOM: a fix bound on a bare new-chat page follows the conversation URL the provider assigns once, then never again',async t=>{
+// Ashlar 4096068011: a fix pinned on a bare new-chat page is never re-pinned by a location. The user
+// can open another existing conversation before the provider assigns one (the old DOM stays on
+// screen), and nothing in either provider's DOM ties a conversation id to the sent turn or its
+// response, so a later URL is unknown: never harvested, never closed, preserved on cancel.
+test('real DOM: a fix pinned on a bare new-chat page that moves to another conversation is never re-pinned, harvested or closed',async t=>{
  const {page,send,journal,move,complete,harvest}=await conversationPage(t,'fix',{url:NEW_URL});
  assert.equal((await journal()).conversation,NEW_URL,'bound on a page that names no conversation yet');
  const server={value:'awaiting_chat'};
  const {b,sync,state}=wiredWorker(page,server);
  await b.tick();
  assert.equal(state().conversation,NEW_URL);
- await move(CONV_URL);sync();await page.clock.runFor(1600); // the provider assigns the conversation its URL
- assert.equal((await journal()).conversation,CONV_URL,'upgraded once to the assigned conversation');
- await b.tick();
- assert.equal(state().conversation,CONV_URL,'the worker follows that one upgrade');
- await complete();await page.clock.runFor(3200);
- assert.equal((await harvest()).ok,true,'the answer is collected in its conversation');
+ // the user opens one of their own conversations before any provider-assigned URL was observed
  await move(OTHER_URL);sync();await page.clock.runFor(1600);
- assert.equal((await journal()).conversation,CONV_URL,'never re-pinned after that');
- await b.tick(); // delivered; can-close in another conversation: preserved
- assert.deepEqual(b.closedTabs,[]);
- assert.equal(state(),undefined,'the delivered fix retired with its tab preserved');
- assert.equal((await send('ashlar-fix-cancel')).owned,false);
+ assert.equal((await journal()).conversation,NEW_URL,'never pinned to the conversation the user moved to');
+ await complete();await page.clock.runFor(3200); // the lingering DOM completes there
+ assert.notEqual((await harvest()).ok,true,'not harvested outside its pinned conversation');
+ const closing=await send('ashlar-can-close');
+ assert.equal(closing.canClose,false);
+ await b.tick();
+ assert.equal(state().conversation,NEW_URL,'the worker never follows a location either');
+ assert.equal(b.calls.some(c=>c.action==='complete'),false,'no answer is delivered');
+ assert.deepEqual(b.closedTabs,[],'the tab stays open');
+ server.value='cancelled';await b.tick();
+ assert.deepEqual(b.closedTabs,[],'cancelled: preserved, never closed');
+ assert.equal(state(),undefined,'the cancelled fix retired');
+ assert.equal((await send('ashlar-tab-status')).released,true,'the preserved tab frees its managed slot');
 });
+
+// Ashlar 4096068000: a completed fix whose sent turn the user edits after collection is never
+// handed out or closed; its tab is released and preserved (fixOwnershipProof "complete").
+for(const edit of ['fix prompt and my own words','my note: fix prompt']){
+test(`real DOM: a fix collected, then its sent turn edited to "${edit}": never delivered or closed, slot released, tab preserved`,async t=>{
+ const {page,send,complete}=await conversationPage(t,'fix');
+ const server={value:'awaiting_chat'};
+ const {b,state}=wiredWorker(page,server);
+ await b.tick();
+ await complete();await page.clock.runFor(3200); // the page collected the answer (generation done)
+ assert.equal(await page.evaluate(()=>__ashlarRunnerState.result?.ok),true,'collected by the page');
+ await page.evaluate(t=>{document.querySelector('[data-message-id="user-A"]').textContent=t;},edit);
+ await b.tick();
+ assert.equal(b.calls.some(c=>c.action==='complete'),false,'the answer is not handed out from the edited tab');
+ const closing=await send('ashlar-can-close');
+ assert.equal(closing.canClose,false);assert.equal(closing.reason,'repurposed');
+ assert.equal((await send('ashlar-tab-status')).released,true,'the slot is released');
+ server.value='cancelled';await b.tick();
+ assert.deepEqual(b.closedTabs,[],'the worker never removes the tab');
+ assert.equal(state(),undefined,'the fix retired with its tab preserved');
+});
+test(`real DOM: a fix delivered, then its sent turn edited to "${edit}": can-close refuses, the worker preserves the tab`,async t=>{
+ const {page,send,complete}=await conversationPage(t,'fix');
+ const server={value:'awaiting_chat'};
+ const {b,state}=wiredWorker(page,server);
+ // the worker takes the answer and delivers it, but its cleanup is held until after the edit
+ const cleanup=b.context.cleanupProvider;b.context.cleanupProvider=async()=>{};
+ await complete();await page.clock.runFor(3200);await b.tick();
+ assert.equal(b.calls.some(c=>c.action==='complete'),true,'delivered while the proof held');
+ await page.evaluate(t=>{document.querySelector('[data-message-id="user-A"]').textContent=t;},edit);
+ b.context.cleanupProvider=cleanup;
+ await b.tick();
+ assert.deepEqual(b.closedTabs,[],'never closed');
+ assert.equal(state(),undefined,'the delivered fix retired with its tab preserved');
+ assert.equal((await send('ashlar-tab-status')).released,true);
+});
+}
+
+// ── The fix ownership proof at EVERY page decision point (conformance rows P19-P23): the same
+// violations of the full proof (fixOwnershipProof) against each decision, with a control. A cell
+// is `true` when the decision acts for Ashlar (collects, hands out, closes, restores, force-closes).
+const PROOF_VIOLATIONS={
+ none:null,
+ editedSuffix:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='fix prompt and my own words';}),
+ editedPrefix:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='my note: fix prompt';}),
+ followup:({page})=>page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);}),
+ draft:({page})=>page.locator('#prompt-textarea').evaluate(el=>{el.textContent='my own question';}),
+ moved:({move})=>move(OTHER_URL),
+ responseChanged:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="response-A"] code').textContent='{"summary":"regenerated","files":[]}';}),
+};
+const PROOF_DECISIONS={
+ // P19 collect: the violation is present when the answer completes
+ collect:async ctx=>{await PROOF_VIOLATIONS[ctx.violation]?.(ctx);await ctx.complete();await ctx.page.clock.runFor(3200);return (await ctx.harvest()).ok===true;},
+ // P20 hand out a collected answer (ashlar-harvest / ashlar-run reply)
+ handOut:async ctx=>{await ctx.complete();await ctx.page.clock.runFor(3200);await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.harvest()).ok===true;},
+ // P21 close after completion (can-close)
+ canClose:async ctx=>{await ctx.complete();await ctx.page.clock.runFor(3200);await ctx.harvest();await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-can-close')).canClose===true;},
+ // P22 restore a completion proof after a reload (ashlar-result-saved)
+ restore:async ctx=>{
+  await ctx.complete();await ctx.page.clock.runFor(3200);const out=await ctx.harvest();
+  await ctx.page.evaluate(()=>{const s=__ashlarRunnerState;s.result=null;s.nativeCompletion=undefined;s.restoredCompletion=false;});
+  await PROOF_VIOLATIONS[ctx.violation]?.(ctx);
+  return (await ctx.send('ashlar-result-saved',{committed:true,raw:out.raw,text:out.responseText,completion:out.completion})).accepted===true;
+ },
+ // P23 force-close on cancel (ashlar-fix-cancel)
+ cancel:async ctx=>{await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-fix-cancel')).owned===true;},
+};
+// A changed response is a violation only once a completion is stored; the collector and the
+// cancel proof have none to compare with.
+const PROOF_NA={collect:['responseChanged'],cancel:['responseChanged']};
+for(const [decision,act] of Object.entries(PROOF_DECISIONS)){
+ test(`real DOM fix ownership proof at ${decision}: only the full proof acts, every violation is refused`,async t=>{
+  const got={},want={};
+  for(const violation of Object.keys(PROOF_VIOLATIONS)){
+   if(PROOF_NA[decision]?.includes(violation))continue;
+   const ctx=await conversationPage(t,'fix');
+   got[violation]=await act({...ctx,violation});
+   want[violation]=violation==='none';
+  }
+  assert.deepEqual(got,want);
+ });
+}
 
 /** A fix run's page: this run's user turn (user-A) and an assistant response (response-A) with
  * `inner`, plus its submission journal (`journal` null = none yet). */

@@ -19,8 +19,11 @@ function page({parts = PARTS, blocks = [PARTS[1]], limit = 50, bound = true} = {
   const c = content('chatgpt');
   c.context.location = {href: URL_FIX}; // the conversation the fix is bound in (pinned on its first exact observation)
   let polls = 0;
+  const journal = bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A'} : null;
   Object.assign(c.context, {
-    readSubmissionJournal: async () => (bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A'} : null),
+    readSubmissionJournal: async () => journal,
+    // every later fix decision re-reads the same journal (fixOwnershipProof)
+    savedSubmission: () => journal,
     boundReviewResponse: () => ({identified: true, followup: false, root: {}, responseId: 'response-A'}),
     // No DOM here: the journaled sent turn holds exactly the prompt (edits are covered in browser.e2e).
     journaledTurnIntegrity: () => 'exact',
@@ -163,7 +166,7 @@ const REVIEW_LANES = ['observe', 'capture', 'capture-read', 'repair', 'repair-st
 
 test('worker: a completed fix answer is delivered as plain text by complete, then its tab closes', async () => {
   const b = worker([fixJob()], {api: active,
-    handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: true, url: URL_FIX, conversation: URL_FIX} : {ok: true, raw: ANSWER, responseText: ANSWER, conversation: URL_FIX}});
+    handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: true, ownership: 'owned', url: URL_FIX, conversation: URL_FIX} : {ok: true, raw: ANSWER, responseText: ANSWER, ownership: 'owned', conversation: URL_FIX}});
   await b.tick();
   const complete = b.calls.find(c => c.action === 'complete');
   assert.equal(complete.jobId, 'fix-A');assert.equal(complete.leaseId, 'lease-A');

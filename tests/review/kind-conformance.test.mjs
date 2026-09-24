@@ -40,8 +40,9 @@ const ROWS = [
   {id: 'W1', name: 'a collected answer is delivered by complete, then its proven tab closes and the job retires', same: true,
     expect: {completed: true, closed: [10], retired: true},
     async run(kind) {
-      // (a fix page also reports the conversation its run was bound in; a review worker ignores it)
-      const b = worker(kind, {api: active, handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: true, url: URL_TAB, conversation: URL_TAB} : {ok: true, raw: ANSWER[kind], responseText: ANSWER[kind], conversation: URL_TAB}});
+      // (a fix page also reports the conversation its run was bound in and its ownership verdict,
+      // json.js fixOwnershipProof; a review worker ignores both)
+      const b = worker(kind, {api: active, handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB} : {ok: true, raw: ANSWER[kind], responseText: ANSWER[kind], ownership: 'owned', conversation: URL_TAB}});
       await b.tick();
       return {completed: b.calls.some(c => c.action === 'complete' && c.raw === ANSWER[kind]), closed: b.closedTabs, retired: !b.pending()};
     }},
@@ -71,7 +72,7 @@ const ROWS = [
   {id: 'W5', name: 'after delivery, a tab the user continued (follow-up/draft) is preserved and the job retires', same: true,
     expect: {closed: 0, retired: true, asked: true},
     async run(kind) {
-      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true}), handler: () => ({ok: true, canClose: false, reason: 'repurposed', url: URL_TAB})});
+      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, outcome: {ok: true, raw: ANSWER[kind]}}), handler: () => ({ok: true, canClose: false, reason: 'repurposed', ownership: 'takenOver', url: URL_TAB})});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending(), asked: b.messages.some(m => m.type === 'ashlar-can-close')};
     }},
@@ -180,8 +181,8 @@ const ROWS = [
     // records its context under the new URL, so this close passes there). Asserted as today.
     expect: {review: {closed: 1, retired: true}, fix: {closed: 0, retired: true}},
     async run(kind) {
-      const b = worker(kind, {api: active, url: OTHER_TAB, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB}),
-        handler: () => ({ok: true, canClose: true, url: OTHER_TAB, conversation: URL_TAB})});
+      const b = worker(kind, {api: active, url: OTHER_TAB, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, outcome: {ok: true, raw: ANSWER[kind]}}),
+        handler: () => ({ok: true, canClose: true, ownership: 'owned', url: OTHER_TAB, conversation: URL_TAB})});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
@@ -197,14 +198,48 @@ const ROWS = [
       await b.tick();
       return {first, kept: b.pending().states.chatgpt.conversation};
     }},
-  {id: 'W29', name: 'a bound identity on a bare new-chat page follows the provider-assigned conversation once, then never again',
-    expect: {review: {kept: [undefined, undefined, undefined]}, fix: {kept: ['https://chatgpt.com/', URL_TAB, URL_TAB]}},
+  {id: 'W29', name: 'a bound identity on a bare new-chat page is never replaced by a later location (no location-based upgrade)',
+    // Ashlar 4096068011: a URL the tab moves to is no evidence of whose conversation it is (the user
+    // can navigate before the provider assigns one), so the first pinned identity is kept.
+    expect: {review: {kept: [undefined, undefined, undefined]}, fix: {kept: ['https://chatgpt.com/', 'https://chatgpt.com/', 'https://chatgpt.com/']}},
     async run(kind) {
       const reports = ['https://chatgpt.com/', URL_TAB, OTHER_TAB], kept = [];
       let reported;
       const b = worker(kind, {api: active, handler: () => ({ok: false, code: 'busy', retry: true, ...(kind === 'fix' ? {conversation: reported} : {})})});
       for (const next of reports) { reported = next;await b.tick();kept.push(b.pending().states.chatgpt.conversation); }
       return {kept};
+    }},
+  // W30-W32: the fix worker acts only on the page's full ownership verdict (json.js
+  // fixOwnershipProof), re-established at the moment of each decision.
+  {id: 'W30', name: 'a collected answer the page hands out without a positive ownership verdict',
+    // Intended: a fix answer is taken only with ownership "owned" (the page re-proves the tab when
+    // it hands the answer out); a review result carries no verdict and is taken as today.
+    expect: {review: {completed: true}, fix: {completed: false}},
+    async run(kind) {
+      const b = worker(kind, {api: active, handler: (_id, m) => m.type === 'ashlar-can-close' ? {ok: true, canClose: false, reason: 'pending', url: URL_TAB} : {ok: true, raw: ANSWER[kind], responseText: ANSWER[kind], conversation: URL_TAB}});
+      await b.tick();
+      return {completed: b.calls.some(c => c.action === 'complete')};
+    }},
+  {id: 'W31', name: 'after delivery, can-close says canClose without a positive ownership verdict',
+    // Intended: the fix worker closes only on ownership "owned" (it waits otherwise, the tab kept);
+    // a review closes on canClose as today.
+    expect: {review: {closed: 1}, fix: {closed: 0}},
+    async run(kind) {
+      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, outcome: {ok: true, raw: ANSWER[kind]}}),
+        handler: () => ({ok: true, canClose: true, url: URL_TAB, conversation: URL_TAB})});
+      await b.tick();
+      return {closed: b.closedTabs.length};
+    }},
+  {id: 'W32', name: 'after a delivered FAILURE (no answer), the tab close decision',
+    // Intended: a fix with no answer has no completion to prove, so its tab closes only on the
+    // cancel-phase ownership proof (ashlar-fix-cancel, stored conversation), never on can-close;
+    // a review closes on can-close as today.
+    expect: {review: {closed: 1, askedCancel: false}, fix: {closed: 1, askedCancel: true}},
+    async run(kind) {
+      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, outcome: {ok: false, code: 'quota', error: 'limit'}}),
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB} : {ok: true, canClose: kind === 'review', reason: 'complete', url: URL_TAB}});
+      await b.tick();
+      return {closed: b.closedTabs.length, askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel')};
     }},
   {id: 'W11', name: 'a lease conflict (409) on complete drops the lease; the outcome is kept for redelivery', same: true,
     expect: {lease: undefined, kept: true},

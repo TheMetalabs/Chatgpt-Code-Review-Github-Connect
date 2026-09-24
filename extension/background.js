@@ -659,7 +659,10 @@ async function cleanupProviderBody(job, provider, jobs) {
       await saveJobs(jobs);
     }
     if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
-    if (job.kind === "fix" && job.serverStatus === "cancelled") {
+    // A fix with no answer to show for it (the server cancelled it, or its run failed: quota, an
+    // error) closes only on the page's cancel-phase ownership proof; a delivered answer closes only on
+    // its complete-phase proof (can-close below). Either way the page re-establishes the full proof.
+    if (job.kind === "fix" && (job.serverStatus === "cancelled" || state.outcome?.ok !== true)) {
       // A tab that never finishes loading cannot answer for itself: past the ownership wait it is
       // preserved (never closed unproven) so the job retires and its capacity is released.
       if (tab.status && tab.status !== "complete") return waitOrPreserveFixTab(job, provider, jobs, "the cancelled fix tab never finished loading; tab preserved");
@@ -714,8 +717,13 @@ async function cleanupProviderBody(job, provider, jobs) {
     }
     delete state.cleanupWaitReason;
     if (job.kind === "fix") {
-      // The page proved the tab unchanged since collection; a fix tab is also Ashlar's only in the
-      // conversation its run was bound in, and the final check compares against that identity.
+      // The page re-established the full ownership proof for the delivered answer (fixOwnershipProof
+      // "complete"); the worker acts only on that verdict, and the final check compares the tab with
+      // the conversation identity it stored (never a URL echoed by the same reply).
+      if (result.ownership !== "owned") {
+        state.cleanupWaitReason = "page_completion_or_journal_pending";
+        await saveJobs(jobs);return;
+      }
       if (adoptFixConversation(state, result)) await saveJobs(jobs);
       const bound = state.conversation;
       if (!bound || conversationIdentity(result.url) !== bound) return preserveFixTab(job, provider, jobs, "the fix tab is not in its bound conversation; tab preserved", tab);
@@ -769,20 +777,13 @@ function conversationIdentity(url) {
   return typeof url === "string" ? url.split("#")[0] : "";
 }
 
-/** A bare provider new-chat page (root path, no query) names no conversation yet (json.js). */
-function provisionalConversation(identity) {
-  return /^https?:\/\/[^/?#]+\/?$/.test(identity);
-}
-
 /** Keep the conversation a fix run was bound in, as its page pinned it in the submission journal
- * when the sent turn was first proven exact: stored once and never replaced (except the page's one
- * upgrade from a bare new-chat page to the conversation URL the provider assigned), so a later
- * reply (or the tab's URL) is compared with it, never with a URL echoed by the same reply. True if
- * the stored identity changed. */
+ * when the sent turn was first proven exact: stored ONCE and never replaced (no location-based
+ * upgrade: a later URL is no evidence of whose conversation it is), so a later reply (or the tab's
+ * URL) is compared with it, never with a URL echoed by the same reply. True if it was stored now. */
 function adoptFixConversation(state, result) {
   const seen = typeof result?.conversation === "string" && result.conversation.length <= 4096 ? result.conversation : "";
-  if (!seen || seen === state.conversation) return false;
-  if (state.conversation && !(provisionalConversation(state.conversation) && !provisionalConversation(seen))) return false;
+  if (!seen || state.conversation) return false;
   state.conversation = seen;
   return true;
 }
@@ -1042,6 +1043,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   await rememberOwnedTab(job, provider);
   delete state.connectionError;
   if (isBusyResult(result)) return;
+  // A fix answer is taken only with the page's positive ownership verdict for it (json.js
+  // fixAnswerReply: the full proof, re-established when the answer is handed out).
+  if (job.kind === "fix" && result?.ok && result.ownership !== "owned") return;
   if (result?.ok && typeof result.raw === "string" && result.raw.trim()) {
     state.outcome = { ok: true, raw: result.raw, originalText:typeof result.responseText==="string"?result.responseText:undefined,
       completion:typeof result.completion?.responseId === "string" && typeof result.completion?.context === "string"

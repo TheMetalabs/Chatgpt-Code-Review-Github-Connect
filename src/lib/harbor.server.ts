@@ -1122,8 +1122,8 @@ export async function submitHarborChat(
 
 /** Gate one reviewer leg. A released held local leg whose reply is not a verdict (docs §1: it failed
  * the gate, the gate dropped a finding it reported, or it took a reply that was not review JSON to
- * get there) is gated as evidence instead: its complete text
- * posts verbatim, so it never counts as verification and nothing it reported is lost. */
+ * get there) is gated as evidence instead: its complete text posts verbatim, so it never counts as
+ * verification and nothing it reported is lost. */
 function gateLeg(leg: ChatLeg, sample: SamplePr, heldLocal: boolean): { gate: ReturnType<typeof gateLiveSubmission>; unusable?: string } {
   const parsed = parseChatSubmission(leg.raw);
   const gate = gateLiveSubmission(parsed, sample, state.settings);

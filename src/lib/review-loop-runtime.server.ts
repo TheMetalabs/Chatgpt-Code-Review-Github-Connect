@@ -512,8 +512,8 @@ function renderFixReport(
   }
 }
 
-// ONE production GitHub client: the per-client caches (recently posted control comments, pending
-// stops) must span loop steps, webhook handlers and harbor calls.
+// ONE production GitHub client: the per-client control-write journal (review-loop-control.ts)
+// must span loop steps, webhook handlers and harbor calls.
 let productionGh: LoopRuntimeGithub | undefined;
 
 /** Production dependencies, loaded lazily so the static graph stays pure. */

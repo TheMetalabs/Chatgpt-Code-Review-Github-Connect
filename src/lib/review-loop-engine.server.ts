@@ -11,7 +11,7 @@
  * the current loop session (sinceIso) and the current head; history reads fail closed (throw →
  * maybeEscalate aborts, never dup-posts); an in-process per-head guard serializes concurrent calls.
  * NON-GOALS (owned by the orchestrator): durable cross-PROCESS escalation dedup (needs a shared
- * store — here it is in-process + the marker scan); full commit-ancestry verification across a
+ * store — here it is the in-process control-write journal + the marker scan); full commit-ancestry verification across a
  * force-push (here it is a proportionate latest-head-must-match-requested-head guard, not a
  * compare-API ancestry walk).
  */
@@ -158,86 +158,6 @@ function handoffWrite(o: HandoffTarget, body: string): ControlWrite {
 async function alreadyEscalated(gh: ReviewLoopGithub, token: string, o: HandoffTarget, botLogin: string): Promise<boolean> {
   const rows = await gh.listIssueComments(token, o.owner, o.repo, o.pr);
   return ownWrites(gh).seen(handoffWrite(o, ""), rows, botLogin);
-}
-
-// Control comments THIS process posted (handoffs, continuations, start / stop records), kept per
-// GitHub client — production memoizes one client; each test's fake is its own — and consulted
-// TOGETHER with the listed history: a just-posted comment may not be listed yet (read-after-write
-// lag), and an unreadable history must not duplicate one either. Bounded and pruned by age.
-// Cross-process dedup stays a documented NON-GOAL (single harbor instance).
-const postedByClient = new WeakMap<object, Map<string, number>>();
-const POSTED_TTL_MS = 24 * 60 * 60_000;
-const POSTED_MAX = 500;
-
-export function rememberPosted(client: object, key: string, now: number = Date.now()): void {
-  const posted = postedByClient.get(client) ?? new Map<string, number>();
-  postedByClient.set(client, posted);
-  posted.delete(key); // re-insert: keeps the map in age order for pruning
-  posted.set(key, now);
-  for (const [k, at] of posted) {
-    if (posted.size <= POSTED_MAX && now - at <= POSTED_TTL_MS) break;
-    posted.delete(k);
-  }
-}
-
-// Control writes whose outcome is UNKNOWN (they may have landed) and that no list has shown yet —
-// a ledger SEPARATE from the confirmed-posted cache above, so "maybe posted" is never read as
-// "posted". No expiry and no size-based eviction (a stale list after a day, or after many other
-// ambiguous writes, must still not trigger a second POST): an entry leaves only when the matching
-// row is actually seen in a list scan. The ledger is therefore bounded by the number of unresolved
-// unknown-outcome control writes, each a small string key — rare in practice. An entry may carry a synthetic LoopEvent the session fold must honor meanwhile
-// (an ambiguous handoff ends the session in this process).
-const maybePostedByClient = new WeakMap<object, Map<string, { event?: LoopEvent }>>();
-
-export function rememberAmbiguous(client: object, key: string, event?: LoopEvent): void {
-  const ledger = maybePostedByClient.get(client) ?? new Map<string, { event?: LoopEvent }>();
-  maybePostedByClient.set(client, ledger);
-  const prev = ledger.get(key);
-  ledger.set(key, { event: event ?? prev?.event });
-}
-
-export function ambiguousWrite(client: object, key: string): boolean {
-  return maybePostedByClient.get(client)?.has(key) ?? false;
-}
-
-export function clearAmbiguous(client: object, key: string): void {
-  maybePostedByClient.get(client)?.delete(key);
-}
-
-/** The synthetic events of this client's unresolved ambiguous writes whose key starts with `prefix`. */
-export function ambiguousEvents(client: object, prefix: string): LoopEvent[] {
-  const out: LoopEvent[] = [];
-  for (const [k, v] of maybePostedByClient.get(client) ?? []) if (v.event && k.startsWith(prefix)) out.push(v.event);
-  return out;
-}
-
-/**
- * The `seen` probe of an idempotent control write: confirmed-posted cache, then the list `scan`
- * (a hit clears the ambiguity ledger), then the ledger. It is true for posted OR ambiguous — so a
- * write that may have landed is never POSTed again — while `ledgerOnly()` tells the caller the hit
- * came from the ledger alone, to report "outcome unknown" instead of "exists". A failed scan counts
- * as "not seen".
- */
-export function dedupProbe(client: object, key: string, scan: () => Promise<boolean>): { seen: () => Promise<boolean>; ledgerOnly: () => boolean } {
-  let viaLedger = false;
-  return {
-    seen: async () => {
-      viaLedger = false;
-      if (postedRecently(client, key)) return true;
-      if (await scan().catch(() => false)) {
-        clearAmbiguous(client, key);
-        return true;
-      }
-      viaLedger = ambiguousWrite(client, key);
-      return viaLedger;
-    },
-    ledgerOnly: () => viaLedger,
-  };
-}
-
-export function postedRecently(client: object, key: string, now: number = Date.now()): boolean {
-  const at = postedByClient.get(client)?.get(key);
-  return at !== undefined && now - at <= POSTED_TTL_MS;
 }
 
 /** A handoff POST whose outcome is unknown (it may have landed) and that no list shows yet. It is

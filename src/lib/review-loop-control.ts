@@ -33,7 +33,8 @@ import { retryWrite, writeOutcomeUnknown } from "./write-retry.ts";
 export type ControlKind = "start" | "stop" | "continue" | "handoff";
 export type PrRef = { owner: string; repo: string; pr: number };
 export type ControlRow = { id?: number; userLogin: string; body: string; createdAt?: string; updatedAt?: string };
-/** The created row as GitHub reported it (fakes may return only `id`). */
+/** The created row as GitHub reported it (fakes may return only `id`; production reports a missing
+ * created_at as ""). */
 export type CreatedRow = { id?: number; userLogin?: string; createdAt?: string };
 
 /** The GitHub calls a control write needs (structurally a subset of the engine's client). */
@@ -173,7 +174,9 @@ function folds(e: OwnWrite): boolean {
 
 /** The event an own write that is not listed yet stands for. A continuation or handoff is placed
  * at the server's time, or at its POST attempt when the outcome is unknown — never at "now": a
- * newer start between the two must not be ended by an old session's handoff. */
+ * newer start between the two must not be ended by an old session's handoff. A 2xx row with no
+ * created_at reaches here as "" (github.server's shape), and the fold drops an undatable event:
+ * that is a missing time too, so it falls back to the attempt. */
 function standInEvent(e: OwnWrite): LoopEvent {
   const k = e.write.key;
   switch (k.kind) {
@@ -182,9 +185,9 @@ function standInEvent(e: OwnWrite): LoopEvent {
     case "stop":
       return { at: k.at, kind: "stop", actor: k.by };
     case "continue":
-      return { at: e.row?.createdAt ?? e.attemptAt ?? "", kind: "continue", head: k.head };
+      return { at: e.row?.createdAt || e.attemptAt || "", kind: "continue", head: k.head };
     case "handoff":
-      return { at: e.row?.createdAt ?? e.attemptAt ?? "", kind: "escalate" };
+      return { at: e.row?.createdAt || e.attemptAt || "", kind: "escalate" };
     default:
       return assertNever(k);
   }

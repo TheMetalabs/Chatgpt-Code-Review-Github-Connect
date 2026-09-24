@@ -11,6 +11,7 @@ import {
   type EmitOutcome,
 } from "./review-loop-control.ts";
 import { escalateMarker, stoppedComment } from "./review-loop.ts";
+import { deriveLoopSession } from "./review-loop-session.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 const HEAD = "a".repeat(40);
@@ -115,6 +116,17 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.deepEqual(ownWrites(f.gh).unresolved(ref(), "handoff"), []);
     assert.deepEqual(await emitControl(f.ctx, handoff()), { status: "exists" });
     assert.equal(f.posts(), 1);
+  });
+
+  it("a posted write whose 2xx row has createdAt '' (production's shape for a missing created_at) stands in at its attempt", async () => {
+    const f = world(["ok"]);
+    const gh = { ...f.gh, createIssueComment: async () => ({ id: 7, userLogin: BOT, createdAt: "" }) };
+    f.w.hidden = true; // the list lags: only the journal knows the row
+    assert.deepEqual(await emitControl({ ...f.ctx, gh, scanFirst: false }, handoff()), { status: "posted" });
+    const events = ownWrites(gh).standIns(ref(), [], BOT);
+    assert.deepEqual(events, [{ at: new Date(T0).toISOString(), kind: "escalate" }], "an undatable stand-in would be dropped by the fold");
+    const session = deriveLoopSession([{ at: SESSION, kind: "start", actor: "alice", mode: "suggest" }, ...events]);
+    assert.equal(session.active, false, "the posted handoff ends the session in this process");
   });
 
   it("a write-ahead intent folds at once; abandon drops only an unsent entry; the outcome switch is exhaustive", async () => {

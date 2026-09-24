@@ -141,6 +141,8 @@ export interface Job {
   localFallbackAt?: number;
   /** verify-clean: summary line naming which reviewer produced the posted result (verifyCleanNote). */
   localVerifyNote?: string;
+  /** verify-clean: the local verification round did not complete; the clean marker carries `unverified=1` (never CONVERGED). */
+  localUnverified?: boolean;
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
   fpPending?: {

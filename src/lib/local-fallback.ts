@@ -75,15 +75,35 @@ export function shouldStartLocalLeg(input: {
   return shouldStartLocalRace(input);
 }
 
-/** Chat finished without a usable result (quota / disconnected / no JSON): release local as the fallback. */
+/** Chat finished without a usable result (quota / disconnected / no JSON), or it is stalled with no
+ * progress because the Chrome bridge is offline / never claimed the job: release local as the fallback. */
 export function releaseLocalAsFallback(input: {
   role?: LocalReviewRole;
   providers: readonly ReviewProvider[];
   localReleased: boolean;
   chatRacing: boolean;
   usableChat: boolean;
+  /** chatStalled(): chat is nominally racing but cannot progress (bridge offline / job unclaimed). */
+  chatStalled?: boolean;
 }): boolean {
-  return localVerifies(input) && !input.localReleased && !input.chatRacing && !input.usableChat;
+  return localVerifies(input) && !input.localReleased && !input.usableChat && (!input.chatRacing || Boolean(input.chatStalled));
+}
+
+/** A held verify-clean chat leg that has made no progress (no payload, not generating) while the
+ * bridge is disconnected past BRIDGE_CONNECTED_MS, or the job stayed unclaimed past BRIDGE_CLAIM_MS.
+ * stillRacing treats `disconnected` as non-terminal, so without this the held local leg would never
+ * be released and the review would never complete. */
+export function chatStalled(input: {
+  chatProgress: boolean;
+  connected: boolean;
+  claimed: boolean;
+  waitedMs: number;
+  connectedGraceMs: number;
+  claimGraceMs: number;
+}): boolean {
+  if (input.chatProgress) return false;
+  if (!input.connected) return input.waitedMs >= input.connectedGraceMs;
+  return !input.claimed && input.waitedMs >= input.claimGraceMs;
 }
 
 export type VerifyCleanStep =

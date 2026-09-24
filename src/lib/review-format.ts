@@ -71,7 +71,7 @@ function neutralizeMarkers(s: string): string {
   return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
 }
 
-export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage" | "rawReview"> & Partial<Pick<Job, "localReviewRole" | "localVerifyNote">>, findings: Finding[], username: string, unanchored: Finding[] = []): string {
+export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage" | "rawReview"> & Partial<Pick<Job, "localReviewRole" | "localVerifyNote" | "localUnverified">>, findings: Finding[], username: string, unanchored: Finding[] = []): string {
   const sha = job.headSha.slice(0, 7);
   const n = countBySeverity(findings);
   const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4).map(neutralizeMarkers);
@@ -119,7 +119,7 @@ Not a clean pass — remaining reviewers did not run.`;
     const cov = job.coverage ?? [];
     const clearedCount = cov.filter((c) => c.status === "cleared").length;
     const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
-    return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n${verifyLine}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->`;
+    return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n${verifyLine}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0${job.localUnverified ? " unverified=1" : ""} -->`;
   }
   const unanchoredBlock = unanchored.length
     ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored

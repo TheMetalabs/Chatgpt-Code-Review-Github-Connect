@@ -3,6 +3,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {appFixture,eventually} from './app-fixture.mjs';
+import {isZeroFindings,parseFindingsTotal} from '../../src/lib/review-loop.ts';
+// The review loop's real CONVERGED detector, reading a bot-authored review.
+const converged=body=>isZeroFindings(body,{authoredByBot:true});
 
 const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Missing check',failure_scenario:'A duplicate request writes twice',
   root_cause:'No guard',evidence:'a.ts:1: no guard',recommended_fix:'Check the key',recommended_test:'Assert one write'};
@@ -35,6 +38,7 @@ test('verify-clean: chat findings post now without any local generation',async t
   assert.equal(job().status,'posted');assert.equal(app.reviews[0].comments.length,1);
   assert.doesNotMatch(app.reviews[0].body,/Skipped local/);
   await settle();assert.equal(app.localRequests.length,0);
+  assert.equal(app.harbor.hasLocalSample(jobId),false,'the never-used local snapshot is released at the terminal status');
 });
 
 test('verify-clean: clean chat starts the local round; local findings are what gets posted',async t=>{
@@ -60,6 +64,7 @@ test('verify-clean: chat clean + local clean posts the clean (CONVERGED) review'
   assert.match(app.reviews[0].body,/^Didn't find any major issues\./);
   assert.match(app.reviews[0].body,/local verification agreed/);
   assert.match(app.reviews[0].body,/ashlar-findings total=0 /);
+  assert.equal(converged(app.reviews[0].body),true,'a verified clean review IS the converged signal');
 });
 
 test('verify-clean: chat clean + local failure posts chat\'s clean result with the note',async t=>{
@@ -71,7 +76,9 @@ test('verify-clean: chat clean + local failure posts chat\'s clean result with t
   assert.equal(job().status,'posted');
   assert.match(app.reviews[0].body,/^Didn't find any major issues\./);
   assert.match(app.reviews[0].body,/local verification did not complete \(/);
-  assert.match(app.reviews[0].body,/ashlar-findings total=0 /);
+  assert.match(app.reviews[0].body,/ashlar-findings total=0 .*unverified=1 -->$/);
+  assert.equal(parseFindingsTotal(app.reviews[0].body),0);
+  assert.equal(converged(app.reviews[0].body),false,'an unverified clean result must never end the loop as converged');
 });
 
 test('verify-clean: an unparseable local reply is no verification: chat\'s clean result posts with the note',async t=>{
@@ -84,7 +91,8 @@ test('verify-clean: an unparseable local reply is no verification: chat\'s clean
   assert.equal(job().status,'posted');
   assert.match(app.reviews[0].body,/^Didn't find any major issues\./,'the clean sentinel, not the raw-reply wrapper');
   assert.match(app.reviews[0].body,/local verification did not complete \(/);
-  assert.match(app.reviews[0].body,/ashlar-findings total=0 /);
+  assert.match(app.reviews[0].body,/ashlar-findings total=0 .*unverified=1 -->$/);
+  assert.equal(converged(app.reviews[0].body),false,'an unparseable verifier is no verification: never converged');
   assert.doesNotMatch(app.reviews[0].body,/nothing structured here/,'the verifier\'s raw text stays out of the review');
   assert.equal(app.reviews[0].comments.length,0);
 });
@@ -104,4 +112,19 @@ test('verify-clean: chat with no usable result releases local as today\'s fallba
   await eventually(()=>app.reviews.length===1,'local fallback review was not posted');
   assert.equal(app.reviews[0].comments.length,1);
   assert.doesNotMatch(app.reviews[0].body,/local verification/);
+});
+
+test('verify-clean: a Chrome bridge that stays offline releases local as the fallback (the review still completes)',async t=>{
+  const {app,jobId,job}=await setup(t);
+  await settle();assert.equal(app.localRequests.length,0,'held while within the bridge grace period');
+  assert.equal(app.bridge.getBridgePublic().connected,false);
+  app.clock.now+=120_001; // past BRIDGE_CONNECTED_MS with no chat progress
+  await eventually(()=>app.localRequests.length===1,'offline bridge never released the held local leg');
+  assert.ok(job().localFallbackAt);assert.equal(job().localVerifyStartedAt,undefined);
+  app.localResponses[0].end(reply(dirty));
+  await eventually(()=>app.reviews.length===1,'local fallback review was not posted');
+  assert.equal(job().status,'posted');assert.equal(app.reviews[0].comments.length,1);
+  assert.match(app.reviews[0].body,/Skipped chatgpt/,'the offline chat reviewer stays visible');
+  assert.doesNotMatch(app.reviews[0].body,/local verification/);
+  assert.equal(app.harbor.hasLocalSample(jobId),false);
 });

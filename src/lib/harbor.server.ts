@@ -31,7 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verifyCleanNote, verifyCleanStep } from "./local-fallback";
+import { chatStalled, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verifyCleanNote, verifyCleanStep } from "./local-fallback";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
@@ -50,6 +50,7 @@ import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./setting
 import { redactSalvagedReviewBody } from "./review-format";
 import {
   BRIDGE_CLAIM_MS,
+  BRIDGE_CONNECTED_MS,
   LIVE_INFLIGHT_STATUSES,
   PROVIDER_LABEL,
   isChatProvider,
@@ -186,6 +187,19 @@ function patchJob(jobId: string, fn: (j: Job) => Job) {
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? fn(j) : j)) };
   const job = state.jobs.find(j => j.id === jobId);
   if (job) recordJobHistory(job);
+  releaseLocalSampleIfTerminal(job);
+}
+
+/** A terminal job never needs its local snapshot again. verify-clean jobs whose local leg never
+ * ran (chat had findings) would otherwise keep their SamplePr in this module map forever; an
+ * in-flight local leg already holds its own reference and deletes the entry when it finishes. */
+function releaseLocalSampleIfTerminal(job: Job | undefined) {
+  if (job && !isLive(job.status) && !localInFlight.has(job.id)) localSamples.delete(job.id);
+}
+
+/** Test seam: whether a job still retains its local snapshot. */
+export function hasLocalSample(jobId: string): boolean {
+  return localSamples.has(jobId);
 }
 
 export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
@@ -440,8 +454,21 @@ async function watchReviewersLoop(jobId: string, token: string) {
       void kickLocalRace(jobId, prompt);
     }
     const stored = job.storedLegs ?? [];
+    // verify-clean: a chat leg with no progress while the bridge is offline / never claims the job
+    // (a stale `generating` flag from before the bridge went away is not progress).
+    const stalled = localVerifies({ role, providers: job.reviewProviders ?? [] }) && chatStalled({
+      chatProgress: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()) || (Boolean(bridge.connected) && chat.some((p) => job.generating?.[p])),
+      connected: Boolean(bridge.connected),
+      claimed,
+      waitedMs: Date.now() - job.createdAt,
+      connectedGraceMs: BRIDGE_CONNECTED_MS,
+      claimGraceMs: BRIDGE_CLAIM_MS,
+    });
+    // Once local runs as that stalled chat's fallback, the job no longer waits on the offline chat leg
+    // (it is reported as skipped); a chat result that still arrives first is merged as usual.
+    const waitOn = racingProviders({ role, providers: job.reviewProviders ?? [], localReleased });
     const racing = stillRacing({
-      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased }),
+      providers: stalled && job.localFallbackAt ? waitOn.filter((p) => !isChatProvider(p)) : waitOn,
       payloads: stored.filter((l) => l.raw.trim()).map((l) => l.provider),
       assumptions: job.assumptions,
       localInFlight: localInFlight.has(jobId),
@@ -458,6 +485,7 @@ async function watchReviewersLoop(jobId: string, token: string) {
         localReleased,
         chatRacing: racing,
         usableChat: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()),
+        chatStalled: stalled,
       })
     ) {
       // Chat is down (quota / disconnected / nothing returned): never lose the review — local runs
@@ -654,6 +682,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     localVerifyStartedAt: undefined,
     localFallbackAt: undefined,
     localVerifyNote: undefined,
+    localUnverified: undefined,
     reviewOrder: order,
     storedLegs: [],
     updatedAt: Date.now(),
@@ -1090,6 +1119,7 @@ export async function submitHarborChat(
     droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
     plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
     localVerifyNote: localVerifyNote || undefined,
+    localUnverified: step === "post-chat-unverified" || undefined,
     updatedAt: Date.now(),
   }));
   await finishJob(jobId, sample, token);
@@ -1216,6 +1246,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
     ),
   };
   const finished=state.jobs.find(j=>j.id===jobId);if(finished)recordJobHistory(finished);
+  releaseLocalSampleIfTerminal(finished);
   try {reviewHistory().recordReview(stored);} catch { /* storage health remains visible */ }
   if (token) void reactQuiet(token, after, "+1");
   let headMovedTo: string | undefined;

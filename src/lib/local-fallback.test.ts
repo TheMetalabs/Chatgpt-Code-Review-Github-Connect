@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, verifyCleanNote, verifyCleanStep } from "./local-fallback.ts";
+import { chatStalled, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, verifyCleanNote, verifyCleanStep } from "./local-fallback.ts";
 
 describe("shouldStartLocalRace", () => {
   it("starts local immediately when the setting is on", () => {
@@ -124,6 +124,18 @@ describe("verify-clean local role", () => {
     assert.equal(releaseLocalAsFallback({ ...v, chatRacing: false, usableChat: true }), false, "chat has a result to judge");
     assert.equal(releaseLocalAsFallback({ ...v, localReleased: true, chatRacing: false, usableChat: false }), false);
     assert.equal(releaseLocalAsFallback({ ...v, role: "race", chatRacing: false, usableChat: false }), false);
+    assert.equal(releaseLocalAsFallback({ ...v, chatRacing: true, usableChat: false, chatStalled: true }), true, "stalled chat (bridge offline) releases local");
+    assert.equal(releaseLocalAsFallback({ ...v, chatRacing: true, usableChat: true, chatStalled: true }), false, "a usable chat result is judged, not replaced");
+  });
+
+  it("treats chat as stalled only with no progress past the bridge grace periods", () => {
+    const s = { chatProgress: false, connected: false, claimed: false, waitedMs: 0, connectedGraceMs: 120_000, claimGraceMs: 1_200_000 };
+    assert.equal(chatStalled(s), false, "within the disconnected grace");
+    assert.equal(chatStalled({ ...s, waitedMs: 120_000 }), true, "bridge offline past BRIDGE_CONNECTED_MS");
+    assert.equal(chatStalled({ ...s, waitedMs: 120_000, chatProgress: true }), false, "progress is never stalled");
+    assert.equal(chatStalled({ ...s, connected: true, waitedMs: 120_000 }), false, "connected: waits for the claim grace");
+    assert.equal(chatStalled({ ...s, connected: true, waitedMs: 1_200_000 }), true, "connected but never claimed");
+    assert.equal(chatStalled({ ...s, connected: true, claimed: true, waitedMs: 9_999_999 }), false, "claimed chat is still working");
   });
 
   it("decides what to post in each case", () => {

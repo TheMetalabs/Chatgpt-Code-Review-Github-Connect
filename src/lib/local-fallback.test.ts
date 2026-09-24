@@ -166,10 +166,15 @@ describe("heldLocalSalvage", () => {
 
   it("keeps the first reply as well when the JSON correction replied differently; identical replies once", () => {
     const v = { ...held, localVerifyStartedAt: 1 };
-    const raw = rawOf(heldLocalSalvage(v, { priorText: "P1 a.ts:1 FIRST-REPLY-MARK", originalText: "still prose" })) ?? "";
+    const raw = rawOf(heldLocalSalvage(v, { unparsedText: "P1 a.ts:1 FIRST-REPLY-MARK", originalText: "still prose" })) ?? "";
     assert.match(raw, /FIRST-REPLY-MARK[\s\S]*\n---\n[\s\S]*still prose/);
-    const same = rawOf(heldLocalSalvage(v, { priorText: text, originalText: text })) ?? "";
+    const same = rawOf(heldLocalSalvage(v, { unparsedText: text, originalText: text })) ?? "";
     assert.equal(same.split(text).length - 1, 1);
+  });
+
+  it("keeps the first reply when the JSON correction itself failed (no completed correction)", () => {
+    const raw = rawOf(heldLocalSalvage({ ...held, localVerifyStartedAt: 1 }, { unparsedText: "P1 a.ts:1 FIRST-REPLY-MARK" })) ?? "";
+    assert.match(raw, /FIRST-REPLY-MARK/);
   });
 
   it("a failure with no completed reply (HTTP 500, transport error) stays a failure", () => {

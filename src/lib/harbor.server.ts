@@ -17,7 +17,7 @@ import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { rankChangedFile } from "./review-budget";
-import { runLocalLlm } from "./local-llm.server";
+import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
@@ -31,7 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, heldLocalSalvage, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
+import { chatStalled, heldLocalSalvage, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -799,7 +799,7 @@ function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string
 async function generateLocalLeg(
   jobId: string,
   prompt: string,
-): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string; priorText?: string }> {
+): Promise<LocalLegResult> {
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
   const job = state.jobs.find((j) => j.id === jobId);
@@ -869,14 +869,16 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     const local = await generateLocalLeg(jobId, prompt);
     try {
       reviewHistory().recordServerStep(jobId,local.ok?"local.response_received":"local.failed");
-      if(!local.ok && local.originalText)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,local.originalText,local.originalText.length,local.originalText.length>128_000);
+      // Every completed reply that was not review JSON is archived, including one a later reply replaced.
+      const unparsed = local.ok ? local.unparsedText?.trim() : localReplies(local);
+      if(unparsed)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,unparsed,unparsed.length,unparsed.length>128_000);
     } catch { /* metadata storage failure is visible without starting another model */ }
     if (!local.ok) {
       transitionJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
         // A released held leg's completed non-JSON reply is evidence: kept as a salvaged leg.
         const salvage = heldLocalSalvage(j, local);
-        if (salvage) return collectLocalLeg(j, salvage, local.originalText);
+        if (salvage) return collectLocalLeg(j, salvage, localReplies(local));
         return {
           ...j, generating: {...j.generating, local: false},
           providerErrors: {...j.providerErrors, local: {code: "error", message: local.error}},

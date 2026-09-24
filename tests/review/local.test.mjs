@@ -40,6 +40,13 @@ test('two completed invalid replies are a parse error, never answered raw',async
 test('real transport failure is not silently retried as another generation',async t=>{
  let requests=0;const settings=await endpoint(t,(req)=>{requests++;req.socket.destroy();});
  const out=await loadLocal().runLocalLlm('review',settings);assert.equal(out.ok,false);assert.equal(requests,1);
+ assert.equal(out.unparsedText,undefined,'no completed reply, nothing to keep');
+});
+test('a JSON correction that fails keeps the completed first reply as evidence',async t=>{
+ let requests=0;
+ const settings=await endpoint(t,(req,res)=>{requests++;if(requests===1)res.end(envelope('P1 a.ts:1 FIRST-REPLY'));else req.socket.destroy();});
+ const out=await loadLocal().runLocalLlm('review',settings);
+ assert.equal(out.ok,false);assert.equal(requests,2);assert.equal(out.unparsedText,'P1 a.ts:1 FIRST-REPLY');
 });
 test('explicit cancellation aborts a pending local call',async t=>{
  let received;const ready=new Promise(r=>received=r);

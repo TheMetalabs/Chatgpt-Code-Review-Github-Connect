@@ -75,12 +75,19 @@ export async function pingLocalLlm(
   }
 }
 
+/** One local leg's result. `unparsedText` holds every completed model reply that was not review JSON
+ * and is not `originalText` (for example the first reply before the one JSON correction): it may carry
+ * the real finding, so a held leg's caller keeps it as evidence (heldLocalSalvage), never drops it. */
+export type LocalLegResult =
+  | { ok: true; raw: string; originalText?: string; unparsedText?: string }
+  | { ok: false; error: string; originalText?: string; unparsedText?: string };
+
 export async function runLocalLlm(
   prompt: string,
   settings: BotSettings,
   signal?: AbortSignal,
   opts?: LocalRequestOptions,
-): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string; priorText?: string }> {
+): Promise<LocalLegResult> {
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
   prompt = bridgePromptText(prompt); // Native API input remains readable source text, not escaped transport JSON.
@@ -91,6 +98,9 @@ export async function runLocalLlm(
     signal,
     opts,
   );
+  // The first completed reply, kept outside the try: a correction that then fails (HTTP 500,
+  // transport error, liveness or deadline abort) must not lose it.
+  let first: string | undefined;
   try {
     const raw = await call([
       { role: "system", content: "You are Ashlar. Return ONLY a JSON object. No markdown fences." },
@@ -99,6 +109,7 @@ export async function runLocalLlm(
     if (!raw.trim()) return { ok: false, error: "local LLM returned empty" };
     const firstJson = extractChatJson(raw);
     if (firstJson) return { ok: true, raw: firstJson, originalText: raw };
+    first = raw;
 
     // Exactly one semantic retry, and only after an actual completed non-JSON reply. Do NOT echo the
     // prior reply back: adding it on top of the full prompt and the same max_tokens budget could
@@ -119,9 +130,9 @@ export async function runLocalLlm(
     // Both completed replies are kept: the first one may carry the real finding the correction lost,
     // and a caller that salvages a failed leg (heldLocalSalvage) posts them as evidence.
     return corrected ? {ok: true, raw: corrected, originalText: raw2}
-      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, priorText: raw};
+      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, unparsedText: raw};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, error: msg.slice(0, 240) };
+    return { ok: false, error: msg.slice(0, 240), ...(first ? { unparsedText: first } : {}) };
   }
 }

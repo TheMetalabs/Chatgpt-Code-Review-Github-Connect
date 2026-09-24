@@ -24,12 +24,16 @@ const CHAT={
   unparseable:salvageReviewJson('P1 a.ts:1 CHAT-RAW duplicate write'),
   none:'{"findings":"not a list"}',
 };
-const answer=body=>res=>res.end(envelope(body));
+const fail500=res=>{res.writeHead(500,{'content-type':'application/json'});res.end('{"error":"model crashed"}');};
+// Local request #i gets replies[i] (the last one repeats); a function reply answers the request itself.
+const answer=(...replies)=>(res,i)=>{const r=replies[Math.min(i,replies.length-1)];typeof r==='function'?r(res):res.end(envelope(r));};
 const LOCAL={
   clean:{answer:answer(cleanJson)},
   findings:{answer:answer(dirtyJson)},
   unparseable:{answer:answer(LOCAL_RAW)},
-  error:{answer:res=>{res.writeHead(500,{'content-type':'application/json'});res.end('{"error":"model crashed"}');}},
+  // the first reply completes with the finding in prose, then the one JSON correction fails
+  proseThen500:{answer:answer(LOCAL_RAW,fail500)},
+  error:{answer:answer(fail500)},
   offline:{offline:true},
   notRun:{settings:{reviewLocal:false}},
 };
@@ -44,12 +48,14 @@ const posted=(first,marker,requests,extra={})=>({status:'posted',first,marker,re
 const skipped=requests=>({status:'skipped',requests});
 const chatFindings=posted(SUMMARY,MF,0,{stamp:'none'});
 const chatRaw=posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'none'});
+const RAW_NOTE=/local verification's reply was not parseable review JSON/;
 
 // [chat, local] → expected. stamp: which release the held local leg got (verify round / fallback / none).
 const CELLS={
   'clean x clean':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
   'clean x findings':posted(SUMMARY,MF,1,{note:/chatgpt found nothing; local verification found 1\./,stamp:'verify'}),
-  'clean x unparseable':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:/local verification's reply was not parseable review JSON/,stamp:'verify'}),
+  'clean x unparseable':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
+  'clean x proseThen500':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
   'clean x error':posted(UNVERIFIED,M0U,1,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x offline':posted(UNVERIFIED,M0U,0,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x notRun':posted(CLEAN,M0,0),
@@ -59,6 +65,7 @@ const CELLS={
   'none x clean':posted(CLEAN,M0,1,{stamp:'fallback'}),
   'none x findings':posted(SUMMARY,MF,1,{stamp:'fallback'}),
   'none x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x proseThen500':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x error':skipped(1),
   'none x offline':skipped(0),
   'none x notRun':skipped(0),
@@ -82,7 +89,7 @@ async function runCell(t,chat,local){
   // Answer every local request as it arrives, noting whether a review had already posted then.
   let answered=0,postedBeforeLocal=false;
   await eventually(()=>{
-    while(answered<app.localResponses.length){postedBeforeLocal||=app.reviews.length>0;stim.answer(app.localResponses[answered++]);}
+    while(answered<app.localResponses.length){postedBeforeLocal||=app.reviews.length>0;stim.answer(app.localResponses[answered],answered);answered++;}
     return ['posted','skipped','dlq','cancelled'].includes(job().status);
   },`${chat} x ${local}: the job never finished`);
   await new Promise(resolve=>setTimeout(resolve,150));
@@ -107,6 +114,11 @@ function assertPosted(name,e,{app,job},body){
   if(e.stamp==='none')assert.ok(!job.localFallbackAt&&!job.localVerifyStartedAt,`${name}: local stayed held`);
   assert.equal(app.reviews.length,1,`${name}: exactly one review`);
 }
+
+test('verify-clean outcome: every chat × local stimulus has a decided cell',()=>{
+  const missing=Object.keys(CHAT).flatMap(chat=>Object.keys(LOCAL).map(local=>`${chat} x ${local}`)).filter(name=>!CELLS[name]);
+  assert.deepEqual(missing,[]);
+});
 
 for(const [name,e] of Object.entries(CELLS)){
   test(`verify-clean outcome: chat ${name.replace(' x ',' × local ')}`,async t=>{

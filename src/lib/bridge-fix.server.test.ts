@@ -6,6 +6,9 @@ import {
   DEFAULT_FIX_TIMEOUT_MS,
   FIX_TERMINAL_RETAIN_MS,
   isFixItemId,
+  type FixItem,
+  type FixOffer,
+  type FixOfferKind,
   type FixRegistryDeps,
   type FixRequest,
 } from "./bridge-fix.server.ts";
@@ -44,6 +47,7 @@ function harness(over: Partial<FixRegistryDeps> = {}) {
   return {
     reg,
     timers,
+    now: () => now,
     advance: (ms: number) => {
       now += ms;
     },
@@ -74,6 +78,8 @@ describe("bridge fix registry: lifecycle", () => {
     assert.deepEqual(offer, {
       kind: "fix",
       jobId: next.id,
+      offerKind: "fresh",
+      deliveryId: offer?.deliveryId,
       provider: "chatgpt",
       providers: ["chatgpt"],
       resumeProviders: [],
@@ -572,5 +578,213 @@ describe("bridge fix registry: request validation", () => {
     assert.equal(isFixItemId("fix-"), false);
     assert.equal(isFixItemId("job-abc"), false);
     assert.equal(isFixItemId(42), false);
+  });
+});
+
+// ── The LIFECYCLE table (bridge-fix.server.ts header): one row per transition T1-T16 plus a row
+// per review finding (F-*). Each row starts from a named state, applies one operation and checks
+// the resulting state, the offer's classification and every piece of bookkeeping that transition
+// may (or must not) write. `kept` = unchanged from the starting state.
+type From = "Q0" | "QU" | "QP" | "CU" | "CP";
+type Named = From | "DONE" | "FAILED" | "CANCELLED";
+interface Ctx {
+  h: ReturnType<typeof harness>;
+  id: string;
+  leaseId?: string;
+  promise: Promise<string>;
+  before: FixItem;
+}
+interface Want {
+  to: Named;
+  offer?: FixOfferKind | null; // null = the operation hands out nothing
+  lease?: "same" | "new" | "none";
+  submitAt?: "now" | "unset" | "kept";
+  generating?: boolean | "kept";
+  submitting?: boolean; // submitting("chrome-1", [id]) right after the operation
+  /** Another eligible item of the same profile is taken at once (nothing holds the foreground). */
+  nextTakeable?: boolean;
+  reason?: string;
+  /** The delivery nonce: minted (new), repeated (same) or none yet. */
+  delivery?: "new" | "same" | "none";
+}
+interface Row {
+  t: string;
+  from: From;
+  generating?: boolean; // the run reported generation before the starting state was reached
+  op: (c: Ctx) => unknown;
+  want: Want;
+}
+
+function named(item: FixItem | undefined): Named | undefined {
+  if (!item) return undefined;
+  if (item.state === "done") return "DONE";
+  if (item.state === "failed") return "FAILED";
+  if (item.state === "cancelled") return "CANCELLED";
+  if (item.state === "claimed") return item.runId ? "CP" : "CU";
+  return !item.clientId ? "Q0" : item.runId ? "QP" : "QU";
+}
+
+/** Reach `from` for profile chrome-1 (runs are "run-A"), then move the clock on so a transition's
+ * "now" differs from every timestamp written while getting there. */
+function reach(from: From, generating = false): Ctx {
+  const h = harness();
+  const promise = h.reg.request(REQ);
+  promise.catch(() => {});
+  const id = h.reg.peek()!.id;
+  let leaseId: string | undefined;
+  if (from !== "Q0") {
+    leaseId = h.reg.take(id, "chrome-1")!.leaseId;
+    if (from === "CP" || from === "QP") assert.equal(h.reg.progress(id, leaseId, "generating", "run-A"), true);
+    if (generating) assert.equal(h.reg.refresh(id, leaseId, { chatgpt: true }), true);
+    if (from === "QU" || from === "QP") {
+      assert.equal(h.reg.release(id, leaseId), true);
+      leaseId = undefined;
+    }
+  }
+  h.advance(1_000);
+  assert.equal(named(h.reg.snapshot(id)), from, "setup reached the starting state");
+  return { h, id, leaseId, promise, before: h.reg.snapshot(id)! };
+}
+
+const LIFECYCLE: Row[] = [
+  { t: "T1 request queues an unowned item", from: "Q0", op: () => undefined, want: { delivery: "none", to: "Q0", lease: "none", submitAt: "unset" } },
+  { t: "T1 a newer request for the PR supersedes the live item", from: "CU", op: (c) => void c.h.reg.request(REQ).catch(() => {}), want: { to: "CANCELLED", reason: "superseded" } },
+  { t: "T2 take of Q0 is a fresh submission", from: "Q0", op: (c) => c.h.reg.take(c.id, "chrome-1"), want: { delivery: "new", to: "CU", offer: "fresh", lease: "new", submitAt: "now", generating: false, submitting: true, nextTakeable: false } },
+  { t: "T2 claim of Q0 is a fresh submission", from: "Q0", op: (c) => c.h.reg.claim(c.id, "chrome-1"), want: { delivery: "new", to: "CU", lease: "new", submitAt: "now", generating: false, submitting: true } },
+  { t: "T3 take of CU by its profile (lost take response) is a replay under the same lease", from: "CU", op: (c) => c.h.reg.take(c.id, "chrome-1"), want: { delivery: "same", to: "CU", offer: "replay", lease: "same", submitAt: "now", generating: "kept", submitting: true } },
+  {
+    t: "T3 a stale replay renews the lease",
+    from: "CU",
+    op: (c) => {
+      c.h.advance(CLAIM_MS + 1);
+      return c.h.reg.take(c.id, "chrome-1");
+    },
+    want: { delivery: "same", to: "CU", offer: "replay", lease: "new", submitAt: "now", submitting: true },
+  },
+  { t: "T4 progress pins the run", from: "CU", op: (c) => c.h.reg.progress(c.id, c.leaseId, "generating", "run-A"), want: { to: "CP", lease: "same", submitAt: "kept", generating: "kept" } },
+  { t: "T5 recover of CU pins the page's run and resumes", from: "CU", op: (c) => c.h.reg.recover(c.id, "chrome-1", "chatgpt", "run-A"), want: { delivery: "same", to: "CP", offer: "resume", lease: "same", submitAt: "kept", generating: "kept" } },
+  { t: "T6 recover of CP resumes (generating)", from: "CP", generating: true, op: (c) => c.h.reg.recover(c.id, "chrome-1", "chatgpt", "run-A"), want: { delivery: "same", to: "CP", offer: "resume", lease: "same", submitAt: "kept", generating: true, submitting: false } },
+  {
+    t: "T6 recover of a stale CP renews the lease only",
+    from: "CP",
+    op: (c) => {
+      c.h.advance(CLAIM_MS + 1);
+      return c.h.reg.recover(c.id, "chrome-1", "chatgpt", "run-A");
+    },
+    want: { delivery: "same", to: "CP", offer: "resume", lease: "new", submitAt: "kept", generating: "kept" },
+  },
+  { t: "T7 refresh records generation", from: "CU", op: (c) => c.h.reg.refresh(c.id, c.leaseId, { chatgpt: true }), want: { to: "CU", lease: "same", submitAt: "kept", generating: true, submitting: false } },
+  { t: "T8 claim of a live CU is a renewal (same lease), not a submission", from: "CU", op: (c) => c.h.reg.claim(c.id, "chrome-1"), want: { delivery: "same", to: "CU", lease: "same", submitAt: "kept", generating: "kept" } },
+  {
+    t: "T8 claim of a stale CP renews the lease only",
+    from: "CP",
+    generating: true,
+    op: (c) => {
+      c.h.advance(CLAIM_MS + 1);
+      return c.h.reg.claim(c.id, "chrome-1");
+    },
+    want: { delivery: "same", to: "CP", lease: "new", submitAt: "kept", generating: true },
+  },
+  { t: "T9 release of CU keeps the owner", from: "CU", op: (c) => c.h.reg.release(c.id, c.leaseId), want: { to: "QU", lease: "none", submitAt: "unset", submitting: false } },
+  { t: "T10 release of CP keeps owner, run and generation", from: "CP", generating: true, op: (c) => c.h.reg.release(c.id, c.leaseId), want: { to: "QP", lease: "none", submitAt: "unset", generating: true, submitting: false } },
+  { t: "T11 take of QU is a fresh submission again", from: "QU", op: (c) => c.h.reg.take(c.id, "chrome-1"), want: { delivery: "new", to: "CU", offer: "fresh", lease: "new", submitAt: "now", generating: false, submitting: true } },
+  { t: "T11 claim of QU is a fresh submission again", from: "QU", op: (c) => c.h.reg.claim(c.id, "chrome-1"), want: { delivery: "new", to: "CU", lease: "new", submitAt: "now", generating: false, submitting: true } },
+  { t: "T12 take of QP resumes: lease only", from: "QP", generating: true, op: (c) => c.h.reg.take(c.id, "chrome-1"), want: { delivery: "same", to: "CP", offer: "resume", lease: "new", submitAt: "unset", generating: true, submitting: false } },
+  { t: "T12 claim of QP resumes: lease only", from: "QP", generating: true, op: (c) => c.h.reg.claim(c.id, "chrome-1"), want: { delivery: "same", to: "CP", lease: "new", submitAt: "unset", generating: true, submitting: false } },
+  { t: "T13 recover of QU pins the page's run and resumes", from: "QU", op: (c) => c.h.reg.recover(c.id, "chrome-1", "chatgpt", "run-A"), want: { delivery: "same", to: "CP", offer: "resume", lease: "new", submitAt: "unset", submitting: false } },
+  { t: "T13 recover of QP resumes", from: "QP", generating: true, op: (c) => c.h.reg.recover(c.id, "chrome-1", "chatgpt", "run-A"), want: { delivery: "same", to: "CP", offer: "resume", lease: "new", submitAt: "unset", generating: true, submitting: false } },
+  { t: "T14 complete settles done", from: "CP", op: (c) => c.h.reg.complete(c.id, "chatgpt", "ANSWER", c.leaseId), want: { to: "DONE", reason: "completed", generating: false } },
+  { t: "T15 fail settles failed (the worker's terminal page verdicts arrive here)", from: "CU", op: (c) => c.h.reg.fail(c.id, "chatgpt", "taken_over: the user took over the fix tab", c.leaseId), want: { to: "FAILED", reason: "failure" } },
+  {
+    t: "T16 the deadline cancels a live item",
+    from: "QP",
+    op: (c) => {
+      c.h.advance(DEFAULT_FIX_TIMEOUT_MS);
+      return c.h.reg.state(c.id);
+    },
+    want: { to: "CANCELLED", reason: "timeout" },
+  },
+  // refusals: nothing moves
+  { t: "refused: another profile cannot take QU", from: "QU", op: (c) => c.h.reg.take(c.id, "chrome-2"), want: { to: "QU", offer: null, lease: "none", submitAt: "unset" } },
+  { t: "refused: another profile cannot recover CP", from: "CP", op: (c) => c.h.reg.recover(c.id, "chrome-2", "chatgpt", "run-A"), want: { to: "CP", offer: null, lease: "same", submitAt: "kept" } },
+  { t: "refused: take never re-offers CP (only recover resumes a run)", from: "CP", op: (c) => c.h.reg.take(c.id, "chrome-1"), want: { to: "CP", offer: null, lease: "same", submitAt: "kept" } },
+  { t: "refused: recover of another run", from: "QP", op: (c) => c.h.reg.recover(c.id, "chrome-1", "chatgpt", "run-B"), want: { to: "QP", offer: null, lease: "none", submitAt: "unset" } },
+  // Findings (review round 11). F-P2 (4096523028): a resume is never a foreground submission, through
+  // take AND recover: submitAt stays unset, the profile is not submitting, its next job is takeable.
+  { t: "F-P2 take: a resumed pinned run holds no submission window", from: "QP", op: (c) => c.h.reg.take(c.id, "chrome-1"), want: { delivery: "same", to: "CP", offer: "resume", submitAt: "unset", generating: "kept", submitting: false, nextTakeable: true } },
+  { t: "F-P2 recover: a resumed released run holds no submission window", from: "QU", op: (c) => c.h.reg.recover(c.id, "chrome-1", "chatgpt", "run-A"), want: { delivery: "same", to: "CP", offer: "resume", submitAt: "unset", generating: "kept", submitting: false, nextTakeable: true } },
+  { t: "F-P2 claim: a lease renewal of a released run is not a submission", from: "QP", op: (c) => c.h.reg.claim(c.id, "chrome-1"), want: { delivery: "same", to: "CP", submitAt: "unset", generating: "kept", submitting: false, nextTakeable: true } },
+];
+
+describe("bridge fix registry: lifecycle table", () => {
+  for (const row of LIFECYCLE) {
+    it(`${row.t} (${row.from} → ${row.want.to})`, async () => {
+      const c = reach(row.from, row.generating);
+      const out = row.op(c) as FixOffer | null | undefined;
+      const now = c.h.now();
+      const after = c.h.reg.snapshot(c.id)!;
+      const w = row.want;
+      assert.equal(named(after), w.to, "resulting state");
+      if (w.reason) assert.equal(after.reason, w.reason);
+      if (w.delivery === "none") assert.equal(after.deliveryId, undefined);
+      if (w.delivery === "same") assert.ok(after.deliveryId && after.deliveryId === c.before.deliveryId, "the same delivery");
+      if (w.delivery === "new") assert.ok(after.deliveryId && after.deliveryId !== c.before.deliveryId, "a new delivery");
+      if (w.offer !== undefined) {
+        if (w.offer === null) assert.equal(out, null, "nothing is handed out");
+        else {
+          assert.equal(out?.offerKind, w.offer, "the offer's classification");
+          assert.equal(out.leaseId, after.leaseId, "the offer carries the item's lease");
+          assert.equal(out.deliveryId, after.deliveryId, "the offer carries the item's delivery");
+          if (w.offer === "resume") assert.deepEqual(out.bindings, [{ jobId: c.id, provider: "chatgpt", runId: "run-A" }], "a resume names its binding");
+          else assert.equal("bindings" in out, false, "fresh and replay offers name no binding");
+          assert.equal(out.prompt, REQ.prompt);
+        }
+      }
+      if (w.lease === "none") assert.equal(after.leaseId, undefined);
+      if (w.lease === "same") assert.equal(after.leaseId, c.before.leaseId ?? c.leaseId);
+      if (w.lease === "new") assert.ok(after.leaseId && after.leaseId !== c.before.leaseId, "a new lease");
+      if (w.submitAt === "now") assert.equal(after.submitAt, now, "submitAt starts now");
+      if (w.submitAt === "unset") assert.equal(after.submitAt, undefined, "submitAt is not set");
+      if (w.submitAt === "kept") assert.equal(after.submitAt, c.before.submitAt, "submitAt is untouched");
+      if (w.generating === "kept") assert.equal(after.generating, c.before.generating, "generating is untouched");
+      else if (w.generating !== undefined) assert.equal(after.generating, w.generating);
+      if (w.submitting !== undefined) assert.equal(c.h.reg.submitting("chrome-1", [c.id]), w.submitting, "submitting(chrome-1, [id])");
+      if (w.nextTakeable !== undefined) {
+        assert.equal(c.h.reg.submitting("chrome-1"), !w.nextTakeable, "the profile's foreground is free");
+      }
+      if (w.nextTakeable) {
+        const other = c.h.reg.request({ ...REQ, pr: 8 });
+        other.catch(() => {});
+        const next = c.h.reg.peek([c.id], "chrome-1");
+        assert.ok(next && c.h.reg.take(next.id, "chrome-1")?.offerKind === "fresh", "another eligible job is taken");
+      }
+      void c.promise;
+    });
+  }
+
+  // F-P2b (4096523047): two overlapping takes from one profile with the same exclude list (the
+  // worker stored neither answer yet) both reach the claimed, run-less item. They get ONE delivery:
+  // the first is fresh, the second replays it (same deliveryId and lease); nothing mints a second.
+  it("F-P2b two overlapping takes, same client, same exclude list: one fresh delivery, replayed", () => {
+    const h = harness();
+    h.reg.request(REQ).catch(() => {});
+    const exclude = ["job-known"];
+    const a = h.reg.peek(exclude, "chrome-1");
+    const b = h.reg.peek(exclude, "chrome-1");
+    assert.ok(a && b && a.id === b.id);
+    const first = h.reg.take(a.id, "chrome-1");
+    const second = h.reg.take(b.id, "chrome-1");
+    assert.ok(first && second);
+    assert.deepEqual(
+      [first.offerKind, second.offerKind],
+      ["fresh", "replay"],
+      "at most one fresh submission path",
+    );
+    assert.ok(first.deliveryId, "a fresh offer names its delivery");
+    assert.equal(second.deliveryId, first.deliveryId, "the replay is the same delivery");
+    assert.equal(second.leaseId, first.leaseId);
+    assert.equal(h.reg.snapshot(a.id)?.deliveryId, first.deliveryId, "no second delivery was minted");
+    // once the worker lists it, nothing is handed out again
+    assert.equal(h.reg.peek([...exclude, a.id], "chrome-1"), undefined);
   });
 });

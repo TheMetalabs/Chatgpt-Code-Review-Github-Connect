@@ -208,16 +208,23 @@ test('real DOM: a cancelled fix tab is Ashlar-owned only until the user takes it
  await page.locator('#prompt-textarea').evaluate(el=>{el.textContent='my own question';});
  assert.equal((await cancel()).owned,false,'an unsent user draft preserves the tab');
  await page.locator('#prompt-textarea').evaluate(el=>{el.textContent='';});
+ // Every takenOver verdict is permanent (round 11 lifecycle): clearing the draft does not hand the
+ // tab back. Each case below starts again from a tab Ashlar still owns.
+ assert.equal((await cancel()).owned,false,'a draft the user cleared again keeps the tab the user\'s');
+ const reset=()=>page.evaluate(()=>{__ashlarRunnerState.tabRepurposed=false;});
+ await reset();
  assert.equal((await cancel()).owned,true);
  const sentTurn=text=>page.evaluate(t=>{document.querySelector('[data-message-id="user-A"]').textContent=t;},text);
  await sentTurn('fix prompt and my own words');
  assert.equal((await cancel()).owned,false,'a sent turn the user edited to prompt + suffix is the user\'s');
+ await reset();
  await sentTurn('my note: fix prompt');
  assert.equal((await cancel()).owned,false,'a sent turn the user edited to prefix + prompt is the user\'s');
  await sentTurn('fix prompt');
  // One proof for every fix decision (fixOwnershipProof): an edited sent turn is the user's for good,
  // even when the edit is undone (the collector has always treated it so; cancel now agrees).
  assert.equal((await cancel()).owned,false,'an edited turn stays the user\'s after the edit is undone');
+ await reset();assert.equal((await cancel()).owned,true);
  await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);});
  assert.equal((await cancel()).owned,false,'a follow-up turn preserves the tab');
 });
@@ -235,12 +242,20 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  assert.equal(presend.owned,true,'only Ashlar\'s own half-sent prompt is in the tab');
  assert.equal(presend.blank,true,'owned only because nothing is on the page: the worker also checks the page');
  const draft=text=>page.locator('#prompt-textarea').evaluate((el,t)=>{el.textContent=t;},text);
+ // Every takenOver verdict is permanent (round 11 lifecycle); each case starts again from a tab
+ // Ashlar still owns.
+ const reset=()=>page.evaluate(()=>{__ashlarRunnerState.tabRepurposed=false;});
  await draft('my own question');
  assert.equal((await cancel()).owned,false,'no turn yet, but the composer holds the user\'s own text');
+ await draft('fix prompt');
+ assert.equal((await cancel()).owned,false,'the user\'s draft keeps the tab the user\'s even once it is gone');
+ await reset();
  await draft('fix prompt\nmy own private suffix');
  assert.equal((await cancel()).owned,false,'Ashlar\'s prompt plus user text is the user\'s: only the exact prompt is owned');
+ await reset();
  await draft('my note: fix prompt');
  assert.equal((await cancel()).owned,false,'a user prefix is the user\'s too');
+ await reset();
  await draft('fix prompt');
  await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='fix prompt';document.querySelector('main').append(u);});
  const clicked=await cancel();
@@ -249,9 +264,10 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  assert.equal(clicked.unsent,true,'but not which page shows it (no bound conversation yet): the worker also checks the page');
  await draft('my own question');
  assert.equal((await cancel()).owned,false,'Ashlar\'s turn, but a user draft in the composer');
- await draft('');
+ await draft('');await reset();
  await page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').textContent='fix prompt and my own words';});
  assert.equal((await cancel()).owned,false,'a just-clicked turn with more than Ashlar\'s prompt preserves the tab');
+ await reset();
  await page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').textContent='someone else asked this';});
  assert.equal((await cancel()).owned,false,'a turn that is not Ashlar\'s prompt preserves the tab');
 });
@@ -333,14 +349,18 @@ test(`real DOM: a cancelled fix still in its bound conversation ${url} is closed
  assert.equal(state(),undefined);
 });
 }
-test('real DOM: a fix whose tab moved away and back to its bound conversation is Ashlar\'s again; the pin is never replaced',async t=>{
+// Round 11 lifecycle: moving off the pinned conversation is a PERMANENT verdict (a pinned identity
+// never comes back by waiting): the run ends at once and moving back does not revive it.
+test('real DOM: a fix whose tab moved away from its bound conversation ends at once, stays ended after moving back; the pin is never replaced',async t=>{
  const {page,send,journal,move}=await conversationPage(t,'fix');
- await move(OTHER_URL);await page.clock.runFor(1600); // the collector keeps seeing the exact turn there
+ await move(OTHER_URL);await page.clock.runFor(1600); // the collector sees the exact turn under another URL
  assert.equal((await journal()).conversation,CONV_URL,'a conversation URL is never re-pinned');
- assert.equal((await send('ashlar-fix-cancel')).identity,'changed');
+ const ended=await send('ashlar-harvest');
+ assert.equal(ended.code,'taken_over','the run ended now, not at the fix deadline');
+ assert.equal((await send('ashlar-tab-status')).released,true,'its managed slot is freed');
  await move(CONV_URL);
- const back=await send('ashlar-fix-cancel');
- assert.equal(back.owned,true);assert.equal(back.conversation,CONV_URL);
+ assert.equal((await send('ashlar-fix-cancel')).owned,false,'moving back does not hand the tab to the ended run');
+ assert.equal((await send('ashlar-harvest')).code,'taken_over');
  assert.equal((await journal()).conversation,CONV_URL,'pinned once, never replaced');
 });
 
@@ -363,12 +383,13 @@ test('real DOM: a fix pinned on a bare new-chat page that moves to another conve
  const closing=await send('ashlar-can-close');
  assert.equal(closing.canClose,false);
  await b.tick();
- assert.equal(state().conversation,NEW_URL,'the worker never follows a location either');
+ // Round 11: the move is a permanent verdict, so the run ended at once (taken_over) and the worker
+ // delivered it as a failure right away instead of waiting for the fix deadline.
+ assert.match(b.calls.find(c=>c.action==='failure')?.error||'',/^taken_over: /);
  assert.equal(b.calls.some(c=>c.action==='complete'),false,'no answer is delivered');
- assert.deepEqual(b.closedTabs,[],'the tab stays open');
- server.value='cancelled';await b.tick();
- assert.deepEqual(b.closedTabs,[],'cancelled: preserved, never closed');
- assert.equal(state(),undefined,'the cancelled fix retired');
+ assert.deepEqual(b.closedTabs,[],'preserved, never closed');
+ assert.equal(state(),undefined,'the ended fix leg retired');
+ assert.equal((await journal()).conversation,NEW_URL,'still never re-pinned');
  assert.equal((await send('ashlar-tab-status')).released,true,'the preserved tab frees its managed slot');
 });
 
@@ -454,6 +475,52 @@ for(const [decision,act] of Object.entries(PROOF_DECISIONS)){
  });
 }
 
+// ── Round 11 lifecycle (review 5307890587, P1): a PERMANENT ownership verdict ends the fix at once.
+// The real page and the real worker over the message protocol: the violation appears while the
+// answer is generating (the collector) or after it was collected (the hand-out). A permanent
+// verdict must reach the server as a `taken_over` failure on the worker's next tick (the runtime
+// retries or escalates now), with the tab preserved and its managed slot freed. Only a transient
+// verdict keeps the run alive (it would end at the fix deadline).
+const TERMINAL_VIOLATIONS={
+ followup:PROOF_VIOLATIONS.followup,editedSuffix:PROOF_VIOLATIONS.editedSuffix,editedPrefix:PROOF_VIOLATIONS.editedPrefix,
+ draft:PROOF_VIOLATIONS.draft,stagedFile:PROOF_VIOLATIONS.stagedFile,moved:PROOF_VIOLATIONS.moved,
+};
+const TRANSIENT_VIOLATIONS={
+ none:null,
+ // the just-sent prompt still echoed in the composer is Ashlar's own text, not a user draft
+ composerEcho:({page})=>page.locator('#prompt-textarea').evaluate(el=>{el.textContent='fix prompt';}),
+ // #82: the provider redrawing a collected answer is not the user's activity (PROOF_ACTS): the
+ // collected answer is still handed out and its tab closes
+ responseChanged:PROOF_VIOLATIONS.responseChanged,
+};
+for(const when of ['generating','collected']){
+ for(const [violation,apply] of Object.entries({...TERMINAL_VIOLATIONS,...TRANSIENT_VIOLATIONS})){
+  // a replaced response is a change only against a collected answer
+  if(when==='generating' && violation==='responseChanged')continue;
+  const terminal=violation in TERMINAL_VIOLATIONS;
+  test(`real DOM lifecycle: ${violation} while ${when} ${terminal?'ends the fix at once (taken_over), tab preserved':violation==='responseChanged'?'still delivers the collected answer and closes its tab':'keeps the run alive'}`,async t=>{
+   const ctx=await conversationPage(t,'fix');
+   const server={value:'awaiting_chat'};
+   const {b,sync,state}=wiredWorker(ctx.page,server);
+   await b.tick();
+   if(when==='collected'){await ctx.complete();await ctx.page.clock.runFor(3200);}
+   await apply?.(ctx);sync();
+   await ctx.page.clock.runFor(1600);
+   await b.tick();
+   const failure=b.calls.find(c=>c.action==='failure');
+   const got={failed:Boolean(failure),takenOver:/^taken_over: /.test(failure?.error||''),delivered:b.calls.some(c=>c.action==='complete'),
+    closed:b.closedTabs.length,retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released};
+   // control (none): generating waits, a collected answer is delivered and its tab closed; the
+   // composer echo waits (unknown, never handed out) without ending the run
+   const delivered=when==='collected' && ['none','responseChanged'].includes(violation);
+   const want=terminal
+    ?{failed:true,takenOver:true,delivered:false,closed:0,retired:true,released:true}
+    :{failed:false,takenOver:false,delivered,closed:delivered?1:0,retired:delivered,released:false};
+   assert.deepEqual(got,want);
+  });
+ }
+}
+
 /** A fix run's page: this run's user turn (user-A) and an assistant response (response-A) with
  * `inner`, plus its submission journal (`journal` null = none yet). */
 async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'},{done=true}={}){
@@ -512,7 +579,9 @@ for(const kind of ['review','fix']){
   const {page,harvest}=await kindPage(t,kind,{done:false});
   await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);});
   await page.clock.runFor(3200);
-  assert.equal((await harvest()).code,'busy','no answer from a repurposed conversation');
+  // Round 11 lifecycle: for a fix a follow-up is a permanent verdict that ends the run at once
+  // (taken_over); a review has no ownership proof or deadline and keeps waiting (busy).
+  assert.equal((await harvest()).code,kind==='fix'?'taken_over':'busy','no answer from a repurposed conversation');
   assert.equal(await page.evaluate(()=>__ashlarRunnerState.tabRepurposed),true);
  });
  test(`real DOM conformance (${kind}): harvest acceptance of an unbound page and of an edited sent turn`,async t=>{
@@ -575,11 +644,14 @@ test('real DOM: a fix is never harvested from a sent turn the user edited around
   const page=await fixPage(t,inner);
   await page.evaluate(t=>{document.querySelector('[data-message-id="user-A"]').textContent=t;},edit);
   await page.clock.runFor(6400);
-  assert.deepEqual(await page.evaluate(()=>window.fixOut),{pending:true},`an edited sent turn (${edit}) never yields a fix answer`);
+  // Round 11: an edited turn is a permanent verdict: the collector ends at once (taken_over).
+  const out=await page.evaluate(()=>window.fixOut);
+  assert.equal(out.raw,undefined,`an edited sent turn (${edit}) never yields a fix answer`);
+  assert.match(out.error||'',/^fix run ended: the user took over the fix tab \(edited\)/);
   assert.equal(await page.evaluate(()=>__ashlarRunnerState.tabRepurposed),true,'the edited tab is repurposed');
   await page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='fix prompt';});
   await page.clock.runFor(6400);
-  assert.deepEqual(await page.evaluate(()=>window.fixOut),{pending:true},'undoing the edit does not revive the harvest');
+  assert.equal((await page.evaluate(()=>window.fixOut)).raw,undefined,'undoing the edit does not revive the harvest');
  }
  const control=await fixPage(t,inner);
  await control.clock.runFor(3200);

@@ -497,10 +497,12 @@ function storedFixCompletion(state) {
  * ("complete") an answer was collected. Nothing about the answer itself is compared: ChatGPT keeps
  * redrawing a finished answer (the closing code fence after the action bar, labels, re-keyed ids,
  * streaming flags), and requiring the collected text again would keep the answer, and then the tab,
- * forever (#82). takenOver = the user's (follow-up, edited turn, draft); unknown = not provable now
- * (journal unreadable, turn not rendered, identity not pinned or moved: `identity` "unestablished" |
- * "changed"). Evidence that cannot be undone (follow-up, edited turn) marks the tab repurposed for
- * good. */
+ * forever (#82). takenOver = the user's (follow-up, edited turn, draft: typed text or a staged file);
+ * unknown = not provable now (journal unreadable, turn not rendered, the just-sent prompt still
+ * echoed in the composer, identity not pinned or moved: `identity` "unestablished" | "changed").
+ * Every takenOver verdict is PERMANENT: it marks the tab repurposed for good (a draft the user later
+ * clears, or an edit the user undoes, does not hand the tab back); see fixVerdictPermanent for what
+ * ends a run. */
 function fixOwnershipProof(state, {phase, journal} = {}) {
   const verdict = (ownership, reason, extra = {}) => ({ownership, reason, ...extra});
   const takeOver = (reason, cause) => {
@@ -528,7 +530,14 @@ function fixOwnershipProof(state, {phase, journal} = {}) {
   if (integrity === "edited") return takeOver("edited", "edited");
   // The first exact observation binds the fix to the conversation it is shown in (immutable).
   if (phase === "collect") pinFixConversation(submission);
-  if (composerDraftText() || composerStagedFiles(state, submission).length) return verdict("takenOver", "draft");
+  const draftText = composerDraftText();
+  const staged = composerStagedFiles(state, submission);
+  if (draftText || staged.length) {
+    // The just-sent prompt can linger in the composer a moment after the send is confirmed: that
+    // text is Ashlar's own, not evidence of a user (transient). Any other draft is the user's.
+    if (!staged.length && normalizePrompt(draftText) === submission.expected) return verdict("unknown", "composer_echo");
+    return takeOver("draft", "draft");
+  }
   // The rendered turn proves its content only. An in-page (SPA) move to another conversation can
   // leave this DOM on screen under the new URL: the proof holds only in the pinned conversation.
   if (!submission.conversation) return verdict("unknown", "unpinned", {identity: "unestablished"});
@@ -537,12 +546,46 @@ function fixOwnershipProof(state, {phase, journal} = {}) {
   return verdict("owned", "exact", {conversation: submission.conversation});
 }
 
+/** Whether a fix ownership verdict can never turn back into "owned" (bridge-fix.server.ts
+ * LIFECYCLE, terminal verdicts): the user's (takenOver: follow-up, edited turn, draft, replaced
+ * response), the page moved off the conversation its run was pinned in (a pinned identity never
+ * comes back by waiting), or — while collecting, where the pin is made — no conversation identity
+ * can be pinned at all. Everything else "unknown" is transient (journal unreadable, turn not
+ * rendered yet, still generating, the sent prompt still echoed in the composer). */
+function fixVerdictPermanent(proof, phase) {
+  return proof.ownership === "takenOver" || proof.identity === "changed" ||
+    (phase === "collect" && proof.identity === "unestablished");
+}
+
+/** End a fix run on a permanent verdict, at once: the tab is the user's for good (every later proof
+ * says so), its managed slot is freed, and the run's outcome is a distinct terminal `taken_over`
+ * failure the worker delivers right away (the server fails the item and the runtime retries or
+ * escalates now, not at the fix deadline). Returns that outcome. */
+function endFixRun(state, proof) {
+  if (!state.tabRepurposed) {
+    state.tabRepurposed = true;
+    // Why the tab is kept (the release verdict's cause; takeOver already named a takenOver one).
+    state.takeoverCause ||= proof.identity === "changed" ? "navigated" : proof.identity === "unestablished" ? "ownership_unknown" : "user_turn";
+    recordReviewStep("context_changed");
+  }
+  releaseManagedSlot(state);
+  const detail = proof.identity === "changed" ? "the tab moved to another conversation" :
+    proof.identity === "unestablished" ? "the fix conversation cannot be identified" : `the user took over the fix tab (${proof.reason})`;
+  return {ok: false, code: "taken_over", error: `fix run ended: ${detail}; tab preserved`, proof: proof.reason};
+}
+
 /** A collected fix answer is handed to the worker only while the tab still proves it
- * (fixOwnershipProof "complete"); otherwise the worker is told to wait, so an answer is never
- * delivered from a tab the user took over. Review results pass through unchanged. */
+ * (fixOwnershipProof "complete"); a transient verdict tells the worker to wait, a permanent one
+ * ends the run (taken_over), so an answer is never delivered from a tab the user took over and the
+ * run never waits for its deadline instead. Review results pass through unchanged. */
 function fixAnswerReply(state, msg, value, busy) {
   if (value?.ok !== true || !(msg.kind === "fix" || state.kind === "fix")) return value;
   const proof = fixOwnershipProof(state, {phase: "complete"});
+  if (fixVerdictPermanent(proof, "complete")) {
+    state.result = endFixRun(state, proof);
+    state.nativeCompletion = undefined;
+    return {...state.result, ownership: proof.ownership};
+  }
   if (proof.ownership !== "owned") return {...busy(), ownership: proof.ownership, proof: proof.reason};
   return {...value, ownership: "owned"};
 }
@@ -551,8 +594,10 @@ function fixAnswerReply(state, msg, value, busy) {
  * the bound response's fenced code blocks (literal text, see assistantCodeBlocks) — or, when it
  * has none, a fixed no-JSON line — after the same positive completion controls and two identical stable
  * observations as a review, with no review-JSON requirement and no capture/repair evidence (a
- * fix item has neither lane). No page timer ends it: the server's fix deadline cancels the item
- * and the worker's ashlar-fix-cancel stops this collector (throwIfStopped).
+ * fix item has neither lane). It ends on the answer, on quota, on a PERMANENT ownership verdict
+ * (fixVerdictPermanent: `taken_over` at once, never at the deadline) or when the server settles the
+ * item (the worker's ashlar-fix-cancel stops it: throwIfStopped); no page timer ends a transient
+ * wait: the fix deadline bounds it.
  */
 async function waitUntilFixOrQuota(name) {
   const stability = {stable: "", hits: 0};
@@ -568,6 +613,12 @@ async function waitUntilFixOrQuota(name) {
     // never an answer (a review keeps its legacy unbound observation). An edited turn repurposes
     // the tab for good; after an in-page move the lingering DOM is not harvested there.
     const proof = runner ? fixOwnershipProof(runner, {phase: "collect", journal: poll.submission}) : {ownership: "unknown"};
+    // A permanent verdict ends the run NOW (endFixRun: slot freed, `taken_over`); only a transient
+    // "unknown" keeps polling, bounded by the server's fix deadline.
+    if (runner && fixVerdictPermanent(proof, "collect")) {
+      const ended = endFixRun(runner, proof);
+      const error = new Error(ended.error); error.code = ended.code; throw error;
+    }
     const own = proof.ownership === "owned" && bound?.identified ? bound.root : null;
     const text = done && own ? boundAnswerText("fix", own) : "";
     const answered = done && Boolean(text.trim());
@@ -600,7 +651,8 @@ async function waitUntilFixOrQuota(name) {
  * after a reload) or `identity: "changed"`; the worker asks again or preserves the tab. */
 function tabOwnership(state, allocationUrl) {
   if (state.tabRepurposed) return {ownership: "takenOver", cause: state.takeoverCause || "user_turn"};
-  // A follow-up or an edit of Ashlar's sent turn cannot be undone: the tab is the user's for good.
+  // Every takeover is permanent (as for a fix run's answer, fixOwnershipProof): a draft the user
+  // clears again or an edit the user undoes does not hand the tab back.
   const takeOver = cause => {
     if (!state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = cause; recordReviewStep("context_changed"); }
     return {ownership: "takenOver", cause};
@@ -615,16 +667,16 @@ function tabOwnership(state, allocationUrl) {
   // Ashlar's own prompt in the composer (before or after the send) is not a user draft; anything
   // else there is the user's, including Ashlar's prompt with text added around it.
   const draft = composerDraftText();
-  if (draft && norm(draft) !== norm(submission?.expected || state.pendingPrompt || "")) return {ownership: "takenOver", cause: "draft"};
-  if (composerStagedFiles(state, submission).length) return {ownership: "takenOver", cause: "draft"};
+  if (draft && norm(draft) !== norm(submission?.expected || state.pendingPrompt || "")) return takeOver("draft");
+  if (composerStagedFiles(state, submission).length) return takeOver("draft");
   if (submission?.phase !== "sent") {
     if (!submission && typeof state.finishedContext === "string") {
       // A run observed without a journal (a legacy page): compare with what it recorded when it finished.
       let recorded;
       try { recorded = JSON.parse(state.finishedContext); } catch { recorded = null; }
       if (Array.isArray(recorded)) {
-        if (users.length > recorded[1]) return {ownership: "takenOver", cause: "user_turn"};
-        if (!samePage(href, recorded[0])) return {ownership: "takenOver", cause: "navigated"};
+        if (users.length > recorded[1]) return takeOver("user_turn");
+        if (!samePage(href, recorded[0])) return takeOver("navigated");
         return {ownership: "owned", legacy: true};
       }
     }
@@ -633,7 +685,7 @@ function tabOwnership(state, allocationUrl) {
     // `unsent`. The worker also requires the page the tab was opened on for both.
     if (!users.length) return {ownership: "owned", blank: true};
     if (submission?.baseline === 0 && users.length === 1 && promptOf(users[0]) === submission.expected) return {ownership: "owned", unsent: true};
-    return {ownership: "takenOver", cause: "user_turn"};
+    return takeOver("user_turn");
   }
   // An in-page (SPA) move can leave this DOM on screen under another conversation's URL: once the
   // run pinned its conversation (pinFixConversation), the page must still show it.
@@ -841,7 +893,6 @@ function installReviewRunner(name, run) {
       // A tab the user took over (or one the worker gives up identifying: preserve) stays open but
       // is no longer Ashlar's: free its managed slot, or it counts against tab capacity (untracked
       // binding) until the user closes it by hand.
-      if (verdict.ownership === "takenOver" && !state.tabRepurposed) recordReviewStep("context_changed");
       if (verdict.ownership === "takenOver" || msg.preserve === true) releaseManagedSlot(state);
       reply({ok:true,releaseProtocol:1,blank:false,unsent:false,...verdict,owned,canClose:owned,
         reason:owned ? "complete" : verdict.ownership === "takenOver" || verdict.identity === "changed" ? "repurposed" : "pending",

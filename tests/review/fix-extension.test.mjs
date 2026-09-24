@@ -83,6 +83,81 @@ test('page: a visible quota notice ends a fix only before an answer is visible',
   assert.equal(await done.c.context.waitUntilFixOrQuota('ChatGPT'), ANSWER);
 });
 
+// Round 11 lifecycle (review 5307890587, P1): a PERMANENT ownership verdict ends the collector on
+// the observation that sees it (no further poll), with the distinct terminal code `taken_over`, the
+// tab marked the user's for good and its managed slot freed. A transient "unknown" keeps polling.
+const COLLECT_VERDICTS = {
+  followup: {permanent: true, set: c => { c.boundReviewResponse = () => ({identified: true, followup: true, root: {}, responseId: 'response-A'}); }},
+  edited: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; }},
+  draft: {permanent: true, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'my own question'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
+  moved: {permanent: true, journal: {conversation: 'https://chatgpt.com/c/users-own'}},
+  unusable: {permanent: true, set: c => { c.location = {href: ''}; }}, // no conversation identity can be pinned
+  turnUnrendered: {permanent: false, set: c => { c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  composerEcho: {permanent: false, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
+};
+for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
+  test(`page: collect verdict "${name}" ${verdict.permanent ? 'ends the fix run at once (taken_over), slot freed' : 'is transient: the collector keeps polling'}`, async () => {
+    const p = page({limit: 12});
+    if (verdict.journal) {
+      const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', ...verdict.journal};
+      Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
+    }
+    verdict.set?.(p.c.context);
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    const out = await p.c.context.waitUntilFixOrQuota('ChatGPT').then(raw => ({raw}), error => ({code: error.code, message: error.message}));
+    if (verdict.permanent) {
+      assert.equal(out.code, 'taken_over', JSON.stringify(out));
+      assert.equal(p.polls(), 0, 'ended on the observation that saw it, never polled until the deadline');
+      assert.equal(p.state().slotReleased, true, 'the managed slot is freed');
+      assert.equal(p.state().tabRepurposed, true, 'every later proof says the tab is the user\'s');
+    } else {
+      assert.match(out.message, /test-only polling guard/, 'still polling');
+      assert.notEqual(p.state().slotReleased, true);
+    }
+  });
+}
+
+test('page: a collected fix answer whose tab is then taken over ends the run (taken_over) instead of answering busy', async () => {
+  const p = page();
+  p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');
+  p.c.message(run());
+  await settled(p.c);
+  assert.equal(p.state().result?.ok, true, 'collected');
+  p.c.context.journaledTurnIntegrity = () => 'edited'; // the user edits the sent turn afterwards
+  const out = p.c.message(msg('ashlar-harvest'));
+  assert.equal(out.ok, false);assert.equal(out.code, 'taken_over');assert.equal(out.raw, undefined, 'the answer is never handed out');
+  assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true);
+  assert.equal(p.c.message(msg('ashlar-harvest')).code, 'taken_over', 'terminal: every later ask gets the same outcome');
+  assert.equal(p.c.message(msg('ashlar-can-close')).reason, 'repurposed');
+});
+
+test('worker: a taken_over page outcome is delivered as a failure at once; the tab is preserved and the leg retires', async () => {
+  const b = worker([fixJob()], {api: active, handler: (_id, m) => m.type === 'ashlar-fix-cancel'
+    ? {ok: true, owned: false, ownership: 'takenOver', proof: 'repurposed', url: URL_FIX}
+    : {ok: false, code: 'taken_over', error: 'fix run ended: the user took over the fix tab (followup); tab preserved'}});
+  await b.tick();
+  const failure = b.calls.find(c => c.action === 'failure');
+  assert.match(failure?.error || '', /^taken_over: fix run ended/);assert.equal(failure.leaseId, 'lease-A');
+  assert.deepEqual(b.closedTabs, [], 'never closed');
+  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the leg retired');
+});
+
+test('worker: a delivered fix whose page never proves ownership is preserved after the wait, so its leg ends too', async () => {
+  // The item is DONE on the server; only the leg (and its tab slot) could linger forever.
+  const b = worker([fixJob({states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', delivered: true, cleanupPending: true, conversation: URL_FIX, outcome: {ok: true, raw: ANSWER}}}})],
+    {api: active, handler: (_id, m) => (m.type === 'ashlar-can-close' ? {ok: true, canClose: false, reason: 'pending', ownership: 'unknown', url: URL_FIX} : {ok: true})});
+  await b.tick();
+  assert.ok(b.local.state.pendingReviewJobs['fix-A'], 'asked again first');
+  const RealDate = b.context.Date || Date;
+  const later = RealDate.now() + 3 * 60_000;
+  b.context.Date = class extends RealDate { static now() { return later; } };
+  await b.tick();
+  assert.deepEqual(b.closedTabs, [], 'never closed unproven');
+  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the leg retired');
+});
+
 test('page: a kind:fix run is routed to the fix collector and harvested as its plain text', async () => {
   const p = page();
   p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');
@@ -348,6 +423,44 @@ test('worker: take opts into fix items, and a kind:fix payload runs with its kin
   const started = b.messages.find(m => m.type === 'ashlar-run');
   assert.equal(started.kind, 'fix');assert.equal(started.jobId, 'fix-A');assert.equal(started.prompt, 'FIX PROMPT');
   assert.equal(b.local.state.pendingReviewJobs['fix-A'].kind, 'fix');
+});
+
+// Review round 11 (4096523047): the server hands a claimed, run-less fix to its own profile again
+// whenever the worker does not list it (lost take response) — the SAME delivery (deliveryId). The
+// worker opens at most one tab per jobId + deliveryId, whatever triggers admission.
+test('worker: overlapping admission triggers never create two tabs for one fix jobId (one tab per delivery)', async () => {
+  const offer = {kind: 'fix', jobId: 'fix-A', offerKind: 'fresh', deliveryId: 'delivery-1', provider: 'chatgpt', providers: ['chatgpt'], resumeProviders: [],
+    leaseId: 'L', prompt: 'FIX PROMPT', reasoning: {chatgpt: 'pro', grok: 'heavy'}, title: 'fix o/r#1', owner: 'o', repo: 'r', pr: 1};
+  const takes = [];
+  // The server's replay rule (bridge-fix.server.ts T3): offered to this profile while it does not list it.
+  const api = async (path, body) => {
+    if (body?.action !== 'take') return active(path, body);
+    takes.push(body.excludeJobIds);
+    return body.excludeJobIds.includes('fix-A') ? {ok: true, job: null} : {ok: true, job: {...offer, offerKind: takes.length > 1 ? 'replay' : 'fresh'}};
+  };
+  const handler = () => ({ok: false, code: 'busy', retry: true});
+  const b = background({api, handler});
+  const runs = worker => worker.messages.filter(m => m.type === 'ashlar-run' && m.jobId === 'fix-A');
+  // Overlapping triggers of one worker (alarm, interval, poll-now): one take in flight, one tab.
+  await Promise.all([b.tick(), b.tick(), b.tick()]);
+  await b.tick();
+  assert.equal(b.tabs.size, 1, 'one tab');
+  assert.equal(new Set(runs(b).map(m => m.id)).size, 1, 'the prompt went to one tab');
+  // The job registry is lost while that tab keeps the run (hard reset: an empty registry and a
+  // reloaded worker over the same storage and tabs). Admission races the tab inventory, so the take
+  // can come before recovery sees the tab: the server would replay the same delivery.
+  await b.local.set({pendingReviewJobs: {}});
+  const reloaded = background({local: b.local, session: b.session, tabs: b.tabs, api, handler});
+  await Promise.all([reloaded.tick(), reloaded.tick()]);
+  await reloaded.tick();
+  assert.equal(b.tabs.size, 1, 'no second tab for the same delivery');
+  assert.equal(runs(reloaded).length, 0, 'the prompt is never submitted again');
+  assert.ok(takes.at(-1).includes('fix-A'), 'the delivered fix is listed, so the server never replays it here');
+  // Even a replay that reaches the worker (a server that ignores the list) opens nothing.
+  const deaf = background({local: b.local, session: b.session, tabs: b.tabs, api: async (path, body) => (body?.action === 'take' ? {ok: true, job: {...offer, offerKind: 'replay'}} : active(path, body)), handler});
+  await deaf.tick();
+  assert.equal(b.tabs.size, 1);assert.equal(runs(deaf).length, 0);
+  assert.equal(deaf.local.state.pendingReviewJobs['fix-A'], undefined, 'the duplicate delivery is not admitted');
 });
 
 test('worker: a cancelled fix tab that now carries another binding retires after the wait, leaving that binding untouched', async () => {

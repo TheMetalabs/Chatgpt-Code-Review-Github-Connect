@@ -232,3 +232,65 @@ test('env seed: every whole-number env knob loads into the save domain', async (
   assert.equal(seeded.maxTurns, 2);
   assert.equal(seeded.fixAgent.timeoutMs, 90_000);
 });
+
+// The schema is strict at EVERY nesting level: an unknown key inside a nested object (a typo such
+// as fixAgent.paralellPrs) is a 400 before anything is merged or validated — never merged, ignored
+// by the value rules, dropped by sanitize and answered 200 with nothing applied.
+test('fixAgent: {paralellPrs: 9} (a typo) is a 400; nothing persisted, live settings unchanged', async () => {
+  const h = harness({fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply', parallelPrs: 2}});
+  const live = structuredClone(h.state.settings);
+  const res = await h.post({fixAgent: {paralellPrs: 9}});
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.equal(body.ok, false);
+  assert.match(body.error, /fix_agent\.paralellPrs is not a writable settings field/);
+  assert.equal(h.saves.length, 0, 'no persistence call');
+  assert.deepEqual(h.state.settings, live, 'live settings unchanged');
+  assert.deepEqual((await h.get()).fixAgent, live.fixAgent, 'the next GET reads the stored block');
+});
+
+test('an unknown fixAgent key next to a valid one is a 400; the valid one is not applied either', async () => {
+  const h = harness();
+  const live = structuredClone(h.state.settings);
+  for (const patch of [{parallelPrs: 4, paralellPrs: 9}, {enabled: false, bogus: true}, {mode: 'apply', provider: 'grok', enabled_: true},
+    {...live.fixAgent, extra: 1}, {parallelPrs: 4, constructor: 1}]) {
+    const res = await h.post({fixAgent: patch});
+    assert.equal(res.status, 400, JSON.stringify(patch));
+    assert.match((await res.json()).error, /^fix_agent\.\S+ is not a writable settings field$/);
+    assert.deepEqual(h.state.settings, live, `${JSON.stringify(patch)}: live settings unchanged`);
+  }
+  assert.equal(h.saves.length, 0, 'no persistence call');
+});
+
+// Every nested object in BotSettings (a plain object, or an array of objects — found from the
+// defaults, so a future nested block is covered without editing this table) rejects an unknown key.
+function nestedFields() {
+  const isPlain = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+  return Object.entries(D).filter(([, v]) => isPlain(v) || (Array.isArray(v) && v.some(isPlain))).map(([k]) => k);
+}
+
+test('every nested settings object has a key rule, and an unknown key in any of them is a 400', async () => {
+  const rules = await import('../../src/lib/settings-rules.ts');
+  const nested = nestedFields();
+  assert.ok(nested.includes('fixAgent'), 'fixAgent is a nested object');
+  assert.ok(rules.NESTED_SETTINGS_RULES, 'settings-rules owns one key-rule table for every nested object');
+  assert.deepEqual(Object.keys(rules.NESTED_SETTINGS_RULES).sort(), nested.sort(), 'one rule per nested object, none missing');
+  for (const field of nested) {
+    const def = D[field];
+    const writable = Object.keys(rules.NESTED_SETTINGS_RULES[field].fields).sort();
+    const shape = Array.isArray(def) ? def.find(v => v && typeof v === 'object') : def;
+    assert.deepEqual(writable, Object.keys(shape).sort(), `${field}: the writable key set is exactly the stored shape`);
+    const h = harness();
+    const live = structuredClone(h.state.settings);
+    const withUnknown = Array.isArray(def) ? def.map(v => ({...v, notAKey: 1})) : {...def, notAKey: 1};
+    for (const value of [withUnknown, Array.isArray(def) ? [{notAKey: 1}] : {notAKey: 1}]) {
+      const res = await h.post({[field]: value});
+      assert.equal(res.status, 400, `${field}=${JSON.stringify(value)}`);
+      assert.match((await res.json()).error, /notAKey is not a writable settings field/);
+      assert.deepEqual(h.state.settings, live, `${field}: live settings unchanged`);
+    }
+    assert.equal(h.saves.length, 0, `${field}: nothing persisted`);
+    // The screen's own check (settingsProblem on the draft it sends) refuses the same document.
+    assert.match(rules.settingsProblem({...live, [field]: withUnknown}) ?? '', /notAKey is not a writable settings field/, `${field}: UI rejects it too`);
+  }
+});

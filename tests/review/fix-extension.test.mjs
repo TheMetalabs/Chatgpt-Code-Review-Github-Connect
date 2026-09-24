@@ -293,6 +293,35 @@ test('worker: a cancelled fix tab stuck loading is preserved after the wait (nev
   assert.equal(report.orphanTabs, 0, 'the preserved run is released worker-side');
 });
 
+test('worker: a loaded cancelled fix tab that cannot be messaged is preserved after the wait, and the job retires', async () => {
+  let status = null; // what the page reports to the inventory probe once it answers
+  const b = worker([fixJob()], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-tab-status' && status ? status : {ok: true, owned: true, url: URL_FIX})});
+  const chrome = b.context.chrome;
+  const send = chrome.tabs.sendMessage;
+  // No receiver for the cancel, and reinjection fails too.
+  chrome.tabs.sendMessage = (id, msg, cb) => {
+    if (msg.type !== 'ashlar-fix-cancel') return send(id, msg, cb);
+    b.messages.push({id, ...msg});
+    chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'};cb();chrome.runtime.lastError = null;
+  };
+  chrome.scripting.executeScript = async () => { throw new Error('Cannot access contents of the page'); };
+  await b.tick();
+  assert.equal(b.closedTabs.length, 0);
+  const pending = b.local.state.pendingReviewJobs['fix-A'];
+  assert.ok(pending, 'waits while the page cannot answer');
+  assert.equal(typeof pending.states.chatgpt.ownershipUnknownAt, 'number');
+  const RealDate = b.context.Date || Date;
+  const later = RealDate.now() + 3 * 60_000;
+  b.context.Date = class extends RealDate { static now() { return later; } };
+  await b.tick();
+  assert.equal(b.closedTabs.length, 0, 'never closed unproven');assert.ok(b.tabs.has(10));
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'retired, capacity released');
+  assert.equal(b.messages.some(m => m.preserve === true), false, 'an unreachable page is not messaged to preserve');
+  status = {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: URL_FIX};
+  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 0, 'the preserved run is released worker-side');
+});
+
 test('worker: a cancelled fix tab the user took over is preserved, never closed', async () => {
   const b = worker([fixJob()], {api: cancelled, handler: () => ({ok: true, owned: false, url: URL_FIX})});
   await b.tick();

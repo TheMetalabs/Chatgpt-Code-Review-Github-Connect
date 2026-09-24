@@ -49,9 +49,28 @@ test('a fix never jumps ahead of an older review, even when a newer review is th
   // harbor lists jobs newest first: R_new is the review candidate, R_old the oldest waiting review
   const h = bridgeHarness([makeJob({id: 'R_new', pr: 3, createdAt: Date.now() + 60_000}), makeJob({id: 'R_old', pr: 1, createdAt: Date.now() - 60_000})]);
   const pending = quiet(h.bridge.requestBridgeFix(FIX));
-  assert.equal(h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true}).jobId, 'R_new', 'an older review is waiting: no fix yet');
-  const fix = h.bridge.takeNextBridgeJob('chrome-2', ['R_new', 'R_old'], {fixes: true});
+  assert.equal(h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true}).jobId, 'R_old', 'the older review blocking the fix is dispatched, not the newer candidate');
+  const fix = h.bridge.takeNextBridgeJob('chrome-2', ['R_old'], {fixes: true});
   assert.equal(fix.kind, 'fix', 'with every older review taken, the fix goes before newer ones');
+  void pending;
+});
+
+test('a stream of newer reviews cannot starve a fix blocked by an older review', async () => {
+  // R_old, then the fix, then R_new; newer reviews keep arriving at the front of harbor.jobs.
+  const t = Date.now();
+  const h = bridgeHarness([makeJob({id: 'R_new', pr: 3, createdAt: t + 60_000}), makeJob({id: 'R_old', pr: 1, createdAt: t - 60_000})]);
+  const pending = quiet(h.bridge.requestBridgeFix(FIX));
+  const taken = [];
+  for (let i = 0; i < 3; i++) {
+    h.state.jobs = [makeJob({id: `R_post${i}`, pr: 10 + i, createdAt: t + 120_000 + i}), ...h.state.jobs];
+    const offer = h.bridge.takeNextBridgeJob('chrome-1', taken, {fixes: true});
+    assert.ok(offer, `take ${i} offers work`);
+    taken.push(offer.jobId);
+    h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: true}, undefined, offer.leaseId);
+  }
+  assert.equal(taken[0], 'R_old', 'the oldest review is taken first, not the newest candidate');
+  assert.match(taken[1], /^fix-/, 'then the fix, before any review requested after it');
+  assert.equal(taken[2], 'R_post2', 'post-fix reviews follow (newest first)');
   void pending;
 });
 

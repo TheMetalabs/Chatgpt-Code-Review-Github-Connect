@@ -201,25 +201,30 @@ function recordFixProgress(jobId: string, leaseId: string | undefined, reports: 
 
 /** The oldest queued fix unless an eligible review is older. Neither kind starves: live fixes
  * are bounded by fixAgent.parallelPrs and their deadline; a review waits for at most the fixes
- * requested before it. A review without a known age keeps today's precedence. */
-function takeFix(clientId: string, excludeJobIds: readonly string[], review: ReturnType<typeof nextBridgeJob>): FixOffer | null {
+ * requested before it. A review without a known age keeps today's precedence. A fix blocked by an
+ * older review names that OLDEST review (`reviewFirst`) so the caller dispatches it rather than
+ * nextBridgeJob's newest-first candidate: otherwise a stream of newer reviews would starve the
+ * fix while the old review never ran. */
+function takeFix(clientId: string, excludeJobIds: readonly string[], review: ReturnType<typeof nextBridgeJob>): {fix?: FixOffer; reviewFirst?: string} {
   // nextBridgeJob is null while a review submission is in flight; a fix must wait for it too.
-  if (submissionInFlightForClient(getHarbor().jobs, clientId)) return null;
+  if (submissionInFlightForClient(getHarbor().jobs, clientId)) return {};
   const next = fixes().peek(excludeJobIds, clientId);
-  if (!next) return null;
+  if (!next) return {};
   if (review) {
     // The OLDEST review this profile could take, not the candidate (harbor lists jobs newest
     // first): a fix never jumps ahead of a review requested before it.
-    const waiting = getHarbor().jobs.filter(j => reviewEligible(j, clientId, excludeJobIds)).map(j => j.createdAt);
-    // A review of unknown age keeps today's precedence (Math.min over a missing value is NaN).
-    if (!waiting.length || !waiting.every(Number.isFinite) || next.createdAt > Math.min(...waiting)) return null;
+    const waiting = getHarbor().jobs.filter(j => reviewEligible(j, clientId, excludeJobIds));
+    // A review of unknown age keeps today's precedence (the candidate goes first).
+    if (!waiting.length || !waiting.every(j => Number.isFinite(j.createdAt))) return {};
+    const oldest = waiting.reduce((a, b) => (b.createdAt < a.createdAt ? b : a));
+    if (next.createdAt > oldest.createdAt) return {reviewFirst: oldest.id};
   }
   const offer = fixes().take(next.id, clientId);
   if (offer) {
     meta.lastJobId = offer.jobId;
     meta.lastError = undefined;
   }
-  return offer;
+  return offer ? {fix: offer} : {};
 }
 
 function pendingChatProviders(job: Job): ReviewProvider[] {
@@ -250,7 +255,7 @@ function reviewEligible(job: Job, clientId: string, excludeJobIds: readonly stri
   return Boolean(job.chatPrompt || prompts?.chatgpt || prompts?.grok);
 }
 
-export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): {
+export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = [], onlyJobId?: string): {
   jobId: string;
   provider: ReviewProvider;
   providers: ReviewProvider[];
@@ -268,7 +273,7 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
   // Only one foreground submission at a time per Chrome profile (see SUBMIT_WINDOW_MS).
   if (submissionInFlightForClient(harbor.jobs, clientId)) return null;
   for (const job of harbor.jobs) {
-    if (!reviewEligible(job, clientId, excludeJobIds)) continue;
+    if ((onlyJobId !== undefined && job.id !== onlyJobId) || !reviewEligible(job, clientId, excludeJobIds)) continue;
     const providers = pendingChatProviders(job);
     const attempted = job.attemptedProviders ?? [];
     const prompts = job.chatPromptByProvider;
@@ -293,9 +298,12 @@ export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[
   // A fix tab pastes its prompt in the foreground exactly like a review tab: one submission per
   // Chrome profile across BOTH kinds (see SUBMIT_WINDOW_MS).
   if (fixes().submitting(clientId, excludeJobIds)) return null;
-  const job = nextBridgeJob(clientId, excludeJobIds);
-  const fix = options.fixes ? takeFix(clientId, excludeJobIds, job) : null;
+  let job = nextBridgeJob(clientId, excludeJobIds);
+  const {fix, reviewFirst} = options.fixes ? takeFix(clientId, excludeJobIds, job) : {};
   if (fix) return fix;
+  // A fix waits for the reviews requested before it: dispatch the oldest of those, not the
+  // newest-first candidate, so newer reviews cannot starve the fix.
+  if (reviewFirst && reviewFirst !== job?.jobId) job = nextBridgeJob(clientId, excludeJobIds, reviewFirst);
   if (!job) return null;
   const claim = claimBridgeJob(job.jobId, clientId);
   if (!claim.ok) return null;

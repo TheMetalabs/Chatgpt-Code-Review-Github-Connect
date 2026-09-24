@@ -461,6 +461,18 @@ function fixTabOwnership(state) {
   const bound = boundReviewResponse(submission);
   if (bound.followup) return {ownership: "takenOver"};
   if (!bound.identified) return {ownership: users.length ? "takenOver" : "unknown"};
+  // The bound match only proves the sent turn CONTAINS Ashlar's prompt; an edited turn (a prefix
+  // or suffix the user added) is the user's. Ownership needs the journaled turn (its message ID,
+  // pinned by the bound match, else its recorded position) to hold EXACTLY the prompt.
+  let turn;
+  if (submission.messageId) {
+    const matches = users.filter(node => node.getAttribute("data-message-id") === submission.messageId);
+    if (matches.length === 1) turn = matches[0];
+  } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
+    turn = users[submission.submittedUsers - 1];
+  }
+  if (!turn) return {ownership: "unknown"};
+  if (normalizePrompt(messagePromptText(turn)) !== submission.expected) return {ownership: "takenOver"};
   return {ownership: draftText ? "takenOver" : "owned"};
 }
 

@@ -208,6 +208,13 @@ test('real DOM: a cancelled fix tab is Ashlar-owned only until the user takes it
  assert.equal((await cancel()).owned,false,'an unsent user draft preserves the tab');
  await page.locator('#prompt-textarea').evaluate(el=>{el.textContent='';});
  assert.equal((await cancel()).owned,true);
+ const sentTurn=text=>page.evaluate(t=>{document.querySelector('[data-message-id="user-A"]').textContent=t;},text);
+ await sentTurn('fix prompt and my own words');
+ assert.equal((await cancel()).owned,false,'a sent turn the user edited to prompt + suffix is the user\'s');
+ await sentTurn('my note: fix prompt');
+ assert.equal((await cancel()).owned,false,'a sent turn the user edited to prefix + prompt is the user\'s');
+ await sentTurn('fix prompt');
+ assert.equal((await cancel()).owned,true,'the exact sent prompt is Ashlar\'s again');
  await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);});
  assert.equal((await cancel()).owned,false,'a follow-up turn preserves the tab');
 });

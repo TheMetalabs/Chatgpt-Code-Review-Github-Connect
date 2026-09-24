@@ -22,7 +22,7 @@
  *     queued (the cap is enforced at claim, so neither take nor a direct claim can exceed it);
  *   - every request settles exactly once: resolve on complete, reject on failure / timeout /
  *     supersede / abort (an aborted item is cancelled like a superseded one, so the extension
- *     force-closes its tab instead of generating an answer nobody reads). The deadline (default 30 min, ASHLAR_FIX_CHAT_TIMEOUT_MS) spans queue AND
+ *     force-closes its tab instead of generating an answer nobody reads). The deadline (default 30 min, Settings fix_agent.chat_timeout_minutes) spans queue AND
  *     generation, so a fix is never awaited forever (fail closed → the runtime ESCALATEs);
  *   - leases mirror review items: only the lease holder refreshes / completes / fails; only the
  *     claiming Chrome profile may re-claim (its tab owns the generation); release frees the
@@ -35,7 +35,7 @@
  *     error, a status or a log line;
  *   - the extension types the WHOLE prompt into the chat composer and confirms the send by finding
  *     that text in the rendered user message. A prompt over maxPromptChars() (default 100k chars,
- *     ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS) is rejected up front instead of risking a submission that
+ *     Settings fix_agent.chat_max_prompt_chars) is rejected up front instead of risking a submission that
  *     can never be confirmed (it would only end at the deadline). The file contents are NOT moved
  *     into the <<<ASHLAR_ATTACHMENTS_V2>>> upload envelope: a full-file rewrite needs the model to
  *     see every byte of the current file, and a chat may read attachments through retrieval — a
@@ -134,9 +134,9 @@ export interface FixRegistryDeps {
   /** fixAgent.parallelPrs: the most fix items claimed at once. */
   parallelLimit(): number;
   reasoning(): { chatgpt: string; grok: string };
-  /** Default deadline in ms (already clamped, see fixChatTimeoutMs). */
+  /** Default deadline in ms (Settings fixAgent.chatTimeoutMs, clamped by settings normalization). */
   timeoutMs(): number;
-  /** Largest inline prompt in chars (already clamped, see fixChatMaxPromptChars). */
+  /** Largest inline prompt in chars (Settings fixAgent.chatMaxPromptChars, clamped by settings normalization). */
   maxPromptChars(): number;
   /** Lease staleness (BRIDGE_CLAIM_MS): an ownership lease, never a generation deadline. */
   claimMs: number;
@@ -153,16 +153,6 @@ function clampInt(raw: unknown, fallback: number, min: number, max: number): num
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.floor(n)));
-}
-
-/** ASHLAR_FIX_CHAT_TIMEOUT_MS, clamped to [1 min, 6 h]; default 30 min. */
-export function fixChatTimeoutMs(env: Record<string, string | undefined> | undefined): number {
-  return clampInt(env?.ASHLAR_FIX_CHAT_TIMEOUT_MS, DEFAULT_FIX_TIMEOUT_MS, MIN_FIX_TIMEOUT_MS, MAX_FIX_TIMEOUT_MS);
-}
-
-/** ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS, clamped to [10k, 1M]; default 100k. */
-export function fixChatMaxPromptChars(env: Record<string, string | undefined> | undefined): number {
-  return clampInt(env?.ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS, DEFAULT_FIX_MAX_PROMPT_CHARS, MIN_FIX_MAX_PROMPT_CHARS, MAX_FIX_MAX_PROMPT_CHARS);
 }
 
 export function isFixItemId(id: unknown): id is string {
@@ -184,7 +174,7 @@ function requestProblem(req: FixRequest, maxChars: number): string | undefined {
   }
   if (typeof req.prompt !== "string" || !req.prompt.trim()) return "empty fix prompt";
   if (req.prompt.length > maxChars) {
-    return `fix prompt is ${req.prompt.length} chars; the Chrome bridge types the whole prompt into the chat composer and accepts at most ${maxChars} (ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS) — use the local fix provider or split the PR`;
+    return `fix prompt is ${req.prompt.length} chars; the Chrome bridge types the whole prompt into the chat composer and accepts at most ${maxChars} (Settings → Fix agent / review loop → fix_agent.chat_max_prompt_chars) — raise that limit, use the local fix provider or split the PR`;
   }
   return undefined;
 }

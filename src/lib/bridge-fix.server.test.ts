@@ -5,8 +5,6 @@ import {
   DEFAULT_FIX_MAX_PROMPT_CHARS,
   DEFAULT_FIX_TIMEOUT_MS,
   FIX_TERMINAL_RETAIN_MS,
-  fixChatMaxPromptChars,
-  fixChatTimeoutMs,
   isFixItemId,
   type FixRegistryDeps,
   type FixRequest,
@@ -524,7 +522,7 @@ describe("bridge fix registry: request validation", () => {
     const prompt = `SECRET-FILE-CONTENT ${"x".repeat(20_000)}`;
     await assert.rejects(h.reg.request({ ...REQ, prompt }), (error: Error) => {
       assert.match(error.message, new RegExp(`fix prompt is ${prompt.length} chars`));
-      assert.match(error.message, /at most 20000 \(ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS\)/);
+      assert.match(error.message, /at most 20000 \(Settings → Fix agent \/ review loop → fix_agent\.chat_max_prompt_chars\)/);
       assert.doesNotMatch(error.message, /SECRET-FILE-CONTENT/);
       return true;
     });
@@ -539,19 +537,6 @@ describe("bridge fix registry: request validation", () => {
     await assert.rejects(h.reg.request({ ...REQ, repo: "" }), /needs owner, repo and a PR number/);
     await assert.rejects(h.reg.request({ ...REQ, prompt: "  " }), /empty fix prompt/);
     assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0, active: 0 });
-  });
-
-  it("env overrides are clamped to sane bounds", () => {
-    assert.equal(fixChatTimeoutMs({}), 30 * 60_000);
-    assert.equal(fixChatTimeoutMs(undefined), 30 * 60_000);
-    assert.equal(fixChatTimeoutMs({ ASHLAR_FIX_CHAT_TIMEOUT_MS: "120000" }), 120_000);
-    assert.equal(fixChatTimeoutMs({ ASHLAR_FIX_CHAT_TIMEOUT_MS: "1000" }), 60_000);
-    assert.equal(fixChatTimeoutMs({ ASHLAR_FIX_CHAT_TIMEOUT_MS: "99999999999" }), 6 * 60 * 60_000);
-    assert.equal(fixChatTimeoutMs({ ASHLAR_FIX_CHAT_TIMEOUT_MS: "soon" }), 30 * 60_000);
-    assert.equal(fixChatMaxPromptChars({}), 100_000);
-    assert.equal(fixChatMaxPromptChars({ ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS: "250000" }), 250_000);
-    assert.equal(fixChatMaxPromptChars({ ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS: "5" }), 10_000);
-    assert.equal(fixChatMaxPromptChars({ ASHLAR_FIX_CHAT_MAX_PROMPT_CHARS: "9e9" }), 1_000_000);
   });
 
   it("fix ids are recognized by their prefix only", () => {

@@ -242,6 +242,8 @@ export async function maybeEscalate(
      * The loop runtime always sets it; a lenient caller only classifies a history it can see and
      * gets no budget guarantee for an unattributable one (classifyStuck([]) is null). */
     requireCurrentRound?: boolean;
+    /** Waits between handoff POST retries (injectable for tests). */
+    sleep?: (ms: number) => Promise<void>;
   },
 ): Promise<EscalateResult> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
@@ -258,7 +260,18 @@ export async function maybeEscalate(
 async function maybeEscalateInner(
   gh: ReviewLoopGithub,
   token: string,
-  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number; sinceIso?: string; sinceSeq?: number; requireCurrentRound?: boolean },
+  opts: {
+    owner: string;
+    repo: string;
+    pr: number;
+    head: string;
+    roundCap: number;
+    diffLines?: number;
+    sinceIso?: string;
+    sinceSeq?: number;
+    requireCurrentRound?: boolean;
+    sleep?: (ms: number) => Promise<void>;
+  },
   botLogin: string,
 ): Promise<EscalateResult> {
   // Fail closed on an incomplete/failed history read: never classify or (dup-)post from
@@ -297,9 +310,45 @@ async function maybeEscalateInner(
     diffLines: opts.diffLines,
     detail: pattern ? `fix-round budget spent; the finding trend also shows ${pattern}` : undefined,
   });
-  await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
+  const seen = async () =>
+    (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
+    postedRecently(gh, handoffKey(opts));
+  if ((await postHandoff(gh, token, opts, body, seen)) === "exists") return { escalated: false, reason, rounds };
   rememberPosted(gh, handoffKey(opts));
   return { escalated: true, reason, rounds };
+}
+
+/** Delays before each terminal-handoff POST attempt. A handoff has no other poster, so one
+ * transient failure must not leave the session active with no signal (a silent stall). */
+export const HANDOFF_RETRY_DELAYS_MS = [0, 2_000, 5_000];
+
+const defaultSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+
+/**
+ * POST a terminal handoff, retrying transient failures. Before every retry the handoff scan runs
+ * again, so a POST that GitHub accepted but whose response was lost is not posted twice once it
+ * is visible (the transport never re-sends a write itself). An unreadable scan still posts: a
+ * duplicate handoff is harmless next to a loop that stops silently. Throws the last error.
+ */
+async function postHandoff(
+  gh: ReviewLoopGithub,
+  token: string,
+  o: { owner: string; repo: string; pr: number; sleep?: (ms: number) => Promise<void> },
+  body: string,
+  seen: () => Promise<boolean>,
+): Promise<"posted" | "exists"> {
+  let last: unknown;
+  for (const [i, wait] of HANDOFF_RETRY_DELAYS_MS.entries()) {
+    if (wait) await (o.sleep ?? defaultSleep)(wait);
+    if (i > 0 && (await seen().catch(() => false))) return "exists";
+    try {
+      await gh.createIssueComment(token, { owner: o.owner, repo: o.repo, pr: o.pr, body });
+      return "posted";
+    } catch (e) {
+      last = e;
+    }
+  }
+  throw last;
 }
 
 /**
@@ -327,6 +376,8 @@ export async function escalateNow(
     sinceIso?: string;
     /** The session's start-record comment id (exact handoff scoping; see controlInSession). */
     sinceSeq?: number;
+    /** Waits between handoff POST retries (injectable for tests). */
+    sleep?: (ms: number) => Promise<void>;
   },
 ): Promise<{ escalated: boolean; error?: string }> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
@@ -353,7 +404,10 @@ export async function escalateNow(
       diffLines: opts.diffLines,
       detail: opts.detail,
     });
-    await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
+    const seen = async () =>
+      (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
+      postedRecently(gh, sessionKey);
+    if ((await postHandoff(gh, token, opts, body, seen)) === "exists") return { escalated: false };
     rememberPosted(gh, sessionKey);
     return { escalated: true };
   } catch (e) {

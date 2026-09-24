@@ -576,3 +576,64 @@ describe("round-6: the two handoff paths see each other's just-posted handoff", 
     assert.equal(posted.length, 1);
   });
 });
+
+describe("terminal handoffs retry a transient POST failure (a handoff has no other poster)", () => {
+  const H = "e".repeat(40);
+  const session = { sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
+  /** `plan[i]`: attempt i "ok", "fail" (GitHub rejected it), or "lost" (accepted, response lost). */
+  const flaky = (plan: Array<"ok" | "fail" | "lost">, stuck = false) => {
+    const stored: Array<{ id: number; userLogin: string; body: string; createdAt: string; updatedAt: string }> = [];
+    const sleeps: number[] = [];
+    let attempts = 0;
+    const reviews = stuck
+      ? [5, 4, 4].map((n, i) => ({ userLogin: BOT, body: findingsBody(n), commitId: i === 2 ? H : `m${i}`.padEnd(40, "0"), submittedAt: `2026-01-0${i + 2}T00:00:00Z` }))
+      : [];
+    const gh = {
+      async listPullReviews() { return reviews; },
+      async listReviewComments() { return reviews.map((r) => ({ userLogin: BOT, path: "a.ts", commitId: r.commitId, createdAt: r.submittedAt })); },
+      async listIssueComments() { return [...stored]; },
+      async createIssueComment(_t: string, o: { body: string }) {
+        const outcome = plan[Math.min(attempts++, plan.length - 1)];
+        if (outcome === "fail") throw new Error("comment POST 502");
+        const at = `2026-02-01T00:00:0${stored.length + 1}Z`;
+        stored.push({ id: stored.length + 10, userLogin: BOT, body: o.body, createdAt: at, updatedAt: at });
+        if (outcome === "lost") throw new Error("GitHub API timeout");
+        return { id: stored.length + 9 };
+      },
+    };
+    const sleep = async (ms: number) => void sleeps.push(ms);
+    return { gh, stored, sleeps, attempts: () => attempts, sleep };
+  };
+  const now = (f: ReturnType<typeof flaky>, pr: number) =>
+    escalateNow(f.gh as never, "t", { owner: "o", repo: "r", pr, head: H, reason: "fix-failed", rounds: [], roundCap: 5, ...session, sleep: f.sleep });
+
+  it("escalateNow posts on the retry after one failed POST", async () => {
+    const f = flaky(["fail", "ok"]);
+    assert.deepEqual(await now(f, 11), { escalated: true });
+    assert.equal(f.stored.length, 1);
+    assert.deepEqual(f.sleeps, [2_000]);
+  });
+
+  it("escalateNow never re-posts a handoff GitHub accepted whose response was lost", async () => {
+    const f = flaky(["lost", "ok"]);
+    assert.deepEqual(await now(f, 12), { escalated: false });
+    assert.equal(f.attempts(), 1, "the retry's scan saw the accepted handoff");
+    assert.equal(f.stored.length, 1);
+  });
+
+  it("escalateNow reports the failure after the last attempt", async () => {
+    const f = flaky(["fail"]);
+    const r = await now(f, 13);
+    assert.equal(r.escalated, false);
+    assert.match(r.error ?? "", /502/);
+    assert.equal(f.attempts(), 3);
+    assert.deepEqual(f.sleeps, [2_000, 5_000]);
+  });
+
+  it("the round-cap handoff (maybeEscalate) retries too", async () => {
+    const f = flaky(["fail", "ok"], true);
+    const r = await maybeEscalate(f.gh as never, "t", { owner: "o", repo: "r", pr: 14, head: H, roundCap: 5, ...session, sleep: f.sleep });
+    assert.equal(r.escalated, true);
+    assert.equal(f.stored.length, 1);
+  });
+});

@@ -548,7 +548,7 @@ export async function runPostReviewLoop(
   // the NEW head.
   const escalate = async (reason: EscalateReason, detail: string, head: string = headSha): Promise<LoopStepResult> => {
     if (!d) return { ran: false, reason: `ESCALATE ${reason} not posted (no GitHub client): ${detail}` };
-    const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, sinceIso, sinceSeq });
+    const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, sinceIso, sinceSeq, sleep });
     try {
       let r = await post();
       if (r.error === ESCALATE_IN_FLIGHT) {
@@ -630,6 +630,7 @@ export async function runPostReviewLoop(
       requireCurrentRound: true,
       sinceIso: session.startIso,
       sinceSeq: session.startSeq,
+      sleep,
     };
     let esc = await maybeEscalate(gh, token, escOpts);
     for (const wait of HISTORY_RETRY_DELAYS_MS) {
@@ -895,6 +896,7 @@ export async function continueLoopOnPush(
       botLogin,
       sinceIso: session.startIso,
       sinceSeq: session.startSeq,
+      sleep: d.sleep,
     });
     const tail = handoff.escalated ? "; handoff posted" : handoff.error ? `; handoff failed: ${handoff.error}` : "";
     return { posted: false, reason: `continue on push failed: ${c.error}${tail}` };

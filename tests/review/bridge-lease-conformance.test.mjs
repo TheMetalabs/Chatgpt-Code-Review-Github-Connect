@@ -3,7 +3,7 @@
 // the fix registry re-implements differently fails here, not in a later review round.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {bridgeHarness, job as makeJob, types} from './load-source.mjs';
+import {bridgeHarness, job as makeJob, types, json} from './load-source.mjs';
 
 const CLAIM_MS = types.BRIDGE_CLAIM_MS;
 
@@ -14,9 +14,19 @@ function harness(jobs) {
     constructor(...args) { super(...(args.length ? args : [clock.now])); }
     static now() { return clock.now; }
   }
-  const h = bridgeHarness(jobs, {Date: FixtureDate});
+  // As in production, a stored review result leaves awaiting_chat (validator) once harbor takes it.
+  let state;
+  const submitHarborChat = async id => { state.jobs = state.jobs.map(j => (j.id === id ? {...j, status: 'validator'} : j)); return {ok: true}; };
+  const h = bridgeHarness(jobs, {Date: FixtureDate, submitHarborChat});
+  state = h.state;
   return {...h, advance: ms => { clock.now += ms; }};
 }
+const settleMicrotasks = () => new Promise(resolve => setImmediate(resolve));
+// Two different valid answers of each kind.
+const ANSWERS = {
+  review: [json, JSON.stringify({findings: [], merge_recommendation: 'APPROVE', investigated_safe: ['other answer']})],
+  fix: ['{"summary":"a","files":[]}', '{"summary":"b","files":[]}'],
+};
 
 const progress = runId => ({chatgpt: {runId, events: [{source: 'page', sequence: 1, stage: 'prompt_prepared', at: 1}]}});
 
@@ -101,6 +111,21 @@ for (const [kind, make] of Object.entries(KINDS)) {
     const others = take('chrome-2');
     assert.ok(!others || others.jobId !== offer.jobId);
     assert.equal(h.bridge.recoverBridgeJob('chrome-1', [{jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}])?.jobId, offer.jobId);
+  });
+
+  test(`lease contract (${kind}): complete needs the lease; a lost-ACK replay is identified by its payload`, async () => {
+    const {h, take, complete, unknown} = make();
+    const [answer, other] = ANSWERS[kind];
+    const offer = take('chrome-1');
+    assert.equal((await complete(offer.jobId, answer, 'not-the-lease')).code, 'lease_conflict');
+    assert.equal((await complete(offer.jobId, answer, offer.leaseId)).ok, true);
+    await settleMicrotasks();
+    assert.equal((await complete(offer.jobId, answer, offer.leaseId)).ok, true, 'the same answer again: acknowledged');
+    assert.equal((await complete(offer.jobId, answer, 'another-lease')).ok, true, 'the payload, not the lease, identifies a replay');
+    const conflict = await complete(offer.jobId, other, offer.leaseId);
+    assert.equal(conflict.ok, false, 'a different answer after completion is never accepted');
+    assert.equal(h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: true}, undefined, offer.leaseId), false, 'a settled item keeps no lease');
+    assert.equal((await complete(unknown, answer, offer.leaseId)).ok, false, 'an unknown item never completes');
   });
 
   test(`lease contract (${kind}): failure needs the lease; nothing left to fail is acknowledged`, () => {

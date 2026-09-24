@@ -44,6 +44,8 @@
  * repair; persistence across restarts; tab management (the extension, driven by these states).
  */
 
+import { createHash } from "node:crypto";
+
 export type FixChatProvider = "chatgpt" | "grok";
 export type FixItemState = "queued" | "claimed" | "done" | "failed" | "cancelled";
 
@@ -116,6 +118,9 @@ export interface FixItem {
   /** A claim was handed out and later released: like a review's attemptedProviders, the item
    * stays with its profile (`clientId`) and a later take RESUMES it, never re-sends the prompt. */
   attempted?: boolean;
+  /** Digest of the delivered answer: a lost-ACK replay is acknowledged only for this exact text
+   * (a review acknowledges only an identical stored leg). */
+  answerDigest?: string;
   /** Latest reported progress stage (diagnostics for the timeout message). */
   stage?: string;
   endedAt?: number;
@@ -164,6 +169,7 @@ export function isFixItemId(id: unknown): id is string {
   return typeof id === "string" && id.length > FIX_ID_PREFIX.length && id.startsWith(FIX_ID_PREFIX);
 }
 
+const digest = (text: string) => createHash("sha256").update(text).digest("base64url");
 const labelOf = (item: Pick<FixItem, "owner" | "repo" | "pr">) => `${item.owner}/${item.repo}#${item.pr}`;
 const oneLine = (text: string) => String(text ?? "").replace(/\s+/g, " ").trim().slice(0, ERROR_MAX);
 const minutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
@@ -427,8 +433,10 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     const item = items.get(id);
     if (!item) return { ok: false, code: "lease_conflict", error: "fix item is unknown or expired" };
     if (item.state === "done") {
-      // Lost-ACK replay by the same lease holder: acknowledge, never deliver twice.
-      return item.leaseId === leaseId ? { ok: true } : { ok: false, code: "lease_conflict", error: "fix item already completed" };
+      // A lost-ACK replay is identified by its payload, as a review's is (completeBridgeJob acks an
+      // identical stored leg): the SAME answer is acknowledged, never delivered twice; any other
+      // text is a conflict.
+      return typeof text === "string" && item.answerDigest === digest(text) ? { ok: true } : { ok: false, code: "lease_conflict", error: "fix item already completed" };
     }
     if (!holds(item, leaseId)) {
       const why = item.state === "cancelled" ? `fix item was cancelled (${item.reason})` : item.state === "failed" ? "fix item already failed" : "fix item is not claimed by this worker";
@@ -436,6 +444,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     }
     if (provider !== undefined && provider !== item.provider) return { ok: false, code: "invalid", error: "provider does not match the fix item" };
     if (typeof text !== "string" || !text.trim()) return { ok: false, code: "invalid", error: "empty fix answer" };
+    item.answerDigest = digest(text);
     settle(item, "done", "completed", { text });
     return { ok: true };
   }

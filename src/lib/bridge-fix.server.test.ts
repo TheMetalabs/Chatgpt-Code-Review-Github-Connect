@@ -134,12 +134,14 @@ describe("bridge fix registry: lifecycle", () => {
     assert.equal(await promise, "answer");
   });
 
-  it("a done item acknowledges a lost-ACK replay only for its own lease", async () => {
+  it("a done item acknowledges a lost-ACK replay only of the same answer (as a review's identical leg)", async () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h);
     assert.equal(h.reg.complete(offer.jobId, "chatgpt", "answer", offer.leaseId).ok, true);
     assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", offer.leaseId), { ok: true });
-    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", "other-lease"), {
+    assert.equal(h.reg.complete(offer.jobId, "chatgpt", "another answer", offer.leaseId).ok, false, "a different text is not a replay");
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", "other-lease"), { ok: true }, "the payload identifies a replay");
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "other", "other-lease"), {
       ok: false,
       code: "lease_conflict",
       error: "fix item already completed",

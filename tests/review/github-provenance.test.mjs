@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { TLSSocket } from 'node:tls';
 import { parseGitHubPayload } from '../../src/lib/github-payload.ts';
 import { decideIngress, reviewSkipReason } from '../../src/lib/ingress.ts';
 import { DEFAULT_SETTINGS } from '../../src/lib/types.ts';
@@ -56,6 +57,7 @@ for (const fork of [true, false]) {
 // only DNS and the network stream. No GitHub credentials or live API calls.
 function githubWithResponse(body) {
   return loadTs('src/lib/github.server.ts', {
+    ...loadTs('src/lib/github-transport.ts', { TLSSocket }),
     dnsLookup: async () => ({ address: '127.0.0.1', family: 4 }),
     https: { request(options, callback) {
       assert.equal(options.path, '/repos/fixture/fixture/pulls/34');

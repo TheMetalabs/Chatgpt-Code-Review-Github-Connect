@@ -6,6 +6,7 @@ import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } 
 import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
+import { GithubTransportError, mayResendOnOtherHost, trackRequestSent } from "./github-transport";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
@@ -145,10 +146,11 @@ function httpsRaw(opts: {
         );
       },
     );
+    const requestSent = trackRequestSent(req);
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error("GitHub API timeout"));
     });
-    req.on("error", (err) => reject(new Error(formatGithubError(err))));
+    req.on("error", (err) => reject(new GithubTransportError(formatGithubError(err), requestSent())));
     if (opts.body) req.write(opts.body);
     req.end();
   });
@@ -254,6 +256,7 @@ async function ghHttps(
     return await ghCall(resolved, method, p, headers, body, timeoutMs);
   } catch (e) {
     clearResolvedCache();
+    if (!mayResendOnOtherHost(method, e)) throw e;
     const retry = await resolveGithubHost(true);
     if (retry.hostname === resolved.hostname) throw e;
     return ghCall(retry, method, p, headers, body, timeoutMs);

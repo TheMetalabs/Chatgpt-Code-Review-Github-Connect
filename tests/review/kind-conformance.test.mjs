@@ -136,8 +136,8 @@ const ROWS = [
       await b.tick();b.later();await b.tick();
       return {retired: !b.pending(), closed: b.closedTabs.length};
     }},
-  // W23-W27: the conversation identity cell. A fix's bound turn pins the conversation it is shown
-  // in (the page's journal; the worker keeps it once). Page content alone never proves WHICH
+  // W23-W27, W40: the conversation identity cell. A fix's page records the conversation its send
+  // was proven in (the page's journal, at send; the worker keeps it once). Page content alone never proves WHICH
   // conversation a tab shows: after an in-page move the old DOM can stay rendered under the user's
   // conversation URL, and the cancel reply then echoes that URL. A review has no forced close.
   {id: 'W23', name: 'server cancelled after an in-page move: the content still proves the fix, the URL is another conversation',
@@ -149,11 +149,21 @@ const ROWS = [
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
   {id: 'W24', name: 'server cancelled; the page reports its bound conversation changed',
-    // Waiting cannot change a pinned identity: the fix tab is preserved at once (slot freed).
+    // Waiting cannot change a recorded identity: the fix tab is preserved at once (slot freed).
     expect: {review: {closed: 0, retired: false, released: false}, fix: {closed: 0, retired: true, released: true}},
     async run(kind) {
       const b = worker(kind, {api: cancelled, url: OTHER_TAB, job: item(kind, {}, {conversation: URL_TAB}),
         handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', identity: 'changed', url: OTHER_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: OTHER_TAB}});
+      await b.tick();
+      return {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true)};
+    }},
+  {id: 'W40', name: 'server cancelled; the page reports its sent journal carries no send-time conversation (identity "unestablished")',
+    // Round 13: the identity is recorded only when the send is proven, so waiting cannot establish
+    // it: the fix tab is preserved at once (slot freed), never closed. A review has no forced close.
+    expect: {review: {closed: 0, retired: false, released: false}, fix: {closed: 0, retired: true, released: true}},
+    async run(kind) {
+      const b = worker(kind, {api: cancelled,
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', identity: 'unestablished', url: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true)};
     }},
@@ -200,7 +210,7 @@ const ROWS = [
     }},
   {id: 'W29', name: 'a bound identity on a bare new-chat page is never replaced by a later location (no location-based upgrade)',
     // Ashlar 4096068011: a URL the tab moves to is no evidence of whose conversation it is (the user
-    // can navigate before the provider assigns one), so the first pinned identity is kept.
+    // can navigate before the provider assigns one), so the first identity reported (recorded at send) is kept.
     expect: {review: {kept: [undefined, undefined, undefined]}, fix: {kept: ['https://chatgpt.com/', 'https://chatgpt.com/', 'https://chatgpt.com/']}},
     async run(kind) {
       const reports = ['https://chatgpt.com/', URL_TAB, OTHER_TAB], kept = [];

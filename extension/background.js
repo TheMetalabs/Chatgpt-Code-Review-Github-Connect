@@ -883,13 +883,13 @@ function onAllocationPage(url, provider) {
   } catch { return false; }
 }
 
-/** A conversation's identity: its URL without the fragment (as the page pins it, json.js). */
+/** A conversation's identity: its URL without the fragment (as the page records it at send, composer.js). */
 function conversationIdentity(url) {
   return typeof url === "string" ? url.split("#")[0] : "";
 }
 
-/** Keep the conversation a fix run was bound in, as its page pinned it in the submission journal
- * when the sent turn was first proven exact: stored ONCE and never replaced (no location-based
+/** Keep the conversation a fix run was sent in, as its page recorded it in the submission journal
+ * when the send was proven (composer.js submissionConfirmed): stored ONCE and never replaced (no location-based
  * upgrade: a later URL is no evidence of whose conversation it is), so a later reply (or the tab's
  * URL) is compared with it, never with a URL echoed by the same reply. True if it was stored now. */
 function adoptFixConversation(state, result) {
@@ -943,9 +943,13 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     return waitOrPreserveFixTab(job, provider, jobs, "the fix tab carries another binding; tab preserved");
   }
   if (result.ownership === "unknown") {
-    // The page shows another conversation than the one the fix was bound in (an in-page move can
-    // leave the old DOM on screen): it is the user's now, and waiting cannot change a pinned identity.
+    // The page shows another conversation than the one the fix was sent in (an in-page move can
+    // leave the old DOM on screen): it is the user's now, and waiting cannot change a recorded identity.
     if (result.identity === "changed") return preserveFixTab(job, provider, jobs, "the fix tab moved to another conversation; tab preserved", tab);
+    // The page never recorded the conversation its send was made in (a journal from before that
+    // rule, or a send confirmed only after a reload): it is recorded only when the send is proven,
+    // so waiting cannot establish it. Never closed; preserved now.
+    if (result.identity === "unestablished") return preserveFixTab(job, provider, jobs, "the fix conversation was never identified at send; tab preserved", tab);
     // Not identifiable yet (a reload still rendering the sent turn): ask again next tick. Past the
     // wait, preserve it (never close what might be the user's) and have the page free its slot.
     return waitOrPreserveFixTab(job, provider, jobs, "fix tab ownership could not be established; tab preserved", tab);

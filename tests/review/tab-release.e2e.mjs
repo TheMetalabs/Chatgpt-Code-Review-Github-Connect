@@ -165,6 +165,29 @@ for(const kind of ['review','fix'])test(`${kind}: a secured tab moved in-page to
  assert.deepEqual({...verdict(out),identity:out.identity,conversation:out.conversation},{canClose:false,reason:'repurposed',cause:'navigated',identity:'changed',conversation:TEMP_URL});
 });
 
+// The query is not the page (#82: origin + path): ChatGPT's `?temporary-chat=true` names a mode, not
+// another conversation, so a run bound on one form of the new-chat URL is still in its conversation
+// on the other (json.js samePage).
+const QUERY_FORMS=[[TEMP_URL,'https://chatgpt.com/'],['https://chatgpt.com/',TEMP_URL]];
+for(const kind of ['review','fix'])for(const [from,to] of QUERY_FORMS){
+ test(`${kind}: a secured tab bound on ${from} may still close once its URL reads ${to}`,async t=>{
+  const {tab}=await collected(t,{kind,url:from});
+  assert.equal(await pinnedIn(tab),from);
+  await tab.page.evaluate(url=>history.replaceState(history.state,'',url),to);
+  const out=await canClose(tab);
+  assert.deepEqual({...verdict(out),conversation:out.conversation},{canClose:true,reason:'complete',conversation:from});
+ });
+ test(`${kind}: a run bound on ${from} still collects its answer once its URL reads ${to}`,async t=>{
+  const tab=await chatTab(t,{kind,url:from,thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+  await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(1600);
+  if(kind==='fix')assert.equal(await pinnedIn(tab),from,'a fix pins its conversation at its first exact observation');
+  await tab.page.evaluate(url=>history.replaceState(history.state,'',url),to);
+  await finish(tab.page);await tab.page.clock.runFor(2400);
+  const out=await tab.send('ashlar-harvest');
+  assert.equal(out.ok,true,`collected: ${JSON.stringify({code:out.code,proof:out.proof})}`);
+ });
+}
+
 // A reloaded ACKed temporary chat renders nothing: blank on the page it was opened on, so it closes.
 for(const kind of ['review','fix'])test(`${kind}: a secured temporary chat reloaded blank still closes; a conversation page not rendered yet waits`,async t=>{
  const {tab}=await collected(t,{kind});
@@ -291,6 +314,14 @@ for(const [name,cause,takeover] of TAKEOVERS)test(`worker: an ACKed tab with ${n
  assert.equal(await tab.released(),'true');
  const steps=uploadedSteps(w);
  for(const stage of ['page:context_changed',`worker:preserve_${cause}`,'worker:tab_preserved'])assert.ok(steps.includes(stage),`${stage} in ${steps}`);
+});
+test('worker: an ACKed tab whose URL differs from its bound conversation only in the query closes',async t=>{
+ const {tab,w}=await collectedLeg(t,{});
+ assert.equal(await pinnedIn(tab),TEMP_URL);
+ await tab.page.evaluate(url=>history.replaceState(history.state,'',url),'https://chatgpt.com/');
+ await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
+ assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
 });
 for(const syncUrl of [true,false])test(`worker: an ACKed tab moved in-page to another conversation is preserved (${syncUrl?'the tab URL already moved':'only the page knows'})`,async t=>{
  const {tab,w}=await collectedLeg(t,{});

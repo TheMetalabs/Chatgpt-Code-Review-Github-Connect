@@ -1258,8 +1258,9 @@ const inFlightStop = new Set<string>();
  * or the PR body's update time) — so a stop that arrived as an edit, which the session fold
  * cannot replay, still ends the session at the right moment after a restart. Until the record is
  * durable (the post is retrying, or failed) this process honors the stop in every session read,
- * so no fix round commits past it. A stop is recorded when it ENDED the session, or when it races
- * a start still in flight (the caller saw a live loop-start review for the PR) — a stop that
+ * so no fix round commits past it. A stop is recorded when it ENDED the session, when it races a
+ * start still in flight (the caller saw a live loop-start review for the PR), or when the session
+ * it finds ended only in this process (an own write that may not be durable) — a stop that
  * stopped nothing posts nothing. A repeated stop finds its record and posts nothing. Never throws.
  */
 export async function stopLoop(
@@ -1295,10 +1296,13 @@ export async function stopLoop(
     const head = await d.gh.fetchPullHeadRef(token, stop.owner, stop.repo, stop.pr);
     const session = await sessionOf(d.gh, token, stop, head, botLogin);
     const endedIt = !session.active && session.endedBy === "stop" && isoMs(session.endedAt) === isoMs(at);
-    // Record (the STOPPED acknowledgement) only a stop that ended a session — or one that races a
-    // start whose record may still land later with an earlier time (a live loop-start review for
-    // this PR at stop time). A stop that stopped nothing posts nothing and is forgotten.
-    if (!endedIt && !(stop.startInFlight ?? false)) {
+    // Record (the STOPPED acknowledgement) a stop that ended a session; one that races a start
+    // whose record may still land later with an earlier time (a live loop-start review for this PR
+    // at stop time); and one that finds the session ended only in this process — by its own handoff
+    // of unknown outcome or a stop whose record is not posted — which a restart forgets, while after
+    // a durable end the record is a no-op in the fold. A stop that stopped nothing posts nothing.
+    const endedHereOnly = ownWrites(d.gh).unconfirmedEnd(ref, session) !== undefined;
+    if (!endedIt && !endedHereOnly && !(stop.startInFlight ?? false)) {
       ownWrites(d.gh).abandon(write);
       return { posted: false, reason: NO_SESSION };
     }

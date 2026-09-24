@@ -265,14 +265,20 @@ export class OwnWrites {
 
   /**
    * The kind of THIS process's own write that ended session `s` when that write may not be
-   * durable: a handoff whose outcome is unknown. Only this process sees that end — a restart
-   * forgets it and the durable history may still show the session active — so a gate must never
-   * treat it as a settled end. Call it with a session read that just reconciled the journal.
+   * durable: a handoff whose outcome is unknown, or a stop whose record is not posted (unsent,
+   * refused or unknown). Only this process sees that end — a restart forgets it and the durable
+   * history may still show the session active — so a gate must never treat it as a settled end.
+   * Call it with a session read that just reconciled the journal.
    */
-  unconfirmedEnd(ref: PrRef, s: Pick<LoopSession, "active" | "endedBy" | "endedAt">): "handoff" | undefined {
-    if (s.active || s.endedBy !== "escalate") return undefined;
+  unconfirmedEnd(ref: PrRef, s: Pick<LoopSession, "active" | "endedBy" | "endedAt">): "handoff" | "stop" | undefined {
+    if (s.active) return undefined;
     const at = isoMs(s.endedAt);
-    return this.unresolved(ref, "handoff").some((u) => isoMs(u.attemptAt) === at) ? "handoff" : undefined;
+    for (const e of this.byPr.get(prKey(ref))?.values() ?? []) {
+      const k = e.write.key;
+      if (s.endedBy === "escalate" && k.kind === "handoff" && e.state === "unknown" && isoMs(e.attemptAt) === at) return "handoff";
+      if (s.endedBy === "stop" && k.kind === "stop" && e.writeAhead && e.state !== "posted" && isoMs(k.at) === at) return "stop";
+    }
+    return undefined;
   }
 
   /** The writes of `kind` on this PR whose outcome is still unknown. */

@@ -8,7 +8,9 @@
  *   I4 reconcile — a row that shows up later confirms the write: one event, no leftover stand-in;
  *   I5 read-your-writes — the loop acts on its own write before the list shows it;
  *   I6 a newer session is never ended by an older record — also one started in the same second
- *      as the older write's POST (GitHub orders events at one-second resolution).
+ *      as the older write's POST (GitHub orders events at one-second resolution);
+ *   I7 a human stop survives a restart — even one that found the session ended only by this
+ *      process's own write that may not be durable.
  * One table instead of one test per bug: each review round found another cell of this space.
  */
 import { describe, it } from "node:test";
@@ -73,7 +75,7 @@ type Via =
   | "handoff:post-commit";
 type Write = "success" | "rejected" | "unknown-landed" | "unknown-lost";
 type List = "normal" | "lagging" | "failing";
-type Later = "redelivery" | "newer-start" | "same-second-start" | "25h" | "row-appears" | "push" | "moved";
+type Later = "redelivery" | "newer-start" | "same-second-start" | "25h" | "row-appears" | "push" | "moved" | "stop-restart";
 type Phase = "call" | "view" | "again" | "follow";
 type Cell = { via: Via; write: Write; list: List; later: Later };
 type Result = ControlResult | LoopStepResult;
@@ -96,7 +98,7 @@ const VIAS: Via[] = [
 ];
 const WRITES: Write[] = ["success", "rejected", "unknown-landed", "unknown-lost"];
 const LISTS: List[] = ["normal", "lagging", "failing"];
-const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears", "push", "moved"];
+const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears", "push", "moved", "stop-restart"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
@@ -500,7 +502,8 @@ function expectAgain(c: Cell, caughtUp: boolean): Cls {
 function assertLogged(w: World, r: Result, cls: string, label: string): void {
   const unresolved = cls === "unknown" || cls === "rejected" || cls === "unreadable" || ownWrites(w.deps.gh).state(w.key()) === "unknown";
   if (!unresolved) return;
-  const logged = isControl(r) ? controlResultLogged(r) : !(r.ran === false && SILENT_REASONS.includes(r.reason));
+  // a control result that posted its record acted on the PR: that is not a silent exit
+  const logged = isControl(r) ? r.posted || controlResultLogged(r) : !(r.ran === false && SILENT_REASONS.includes(r.reason));
   assert.ok(logged, `I2 ${label}: an unresolved result is silent: ${JSON.stringify(r)}`);
 }
 
@@ -557,6 +560,21 @@ async function assertNextHeadHeard(w: World): Promise<void> {
   assertLogged(w, r, cls, later);
 }
 
+/** I7: dave stops the loop after the write — by an edited comment or the PR body, which only the
+ * App's record keeps. After a restart (a fresh journal: durable history only, the list caught up)
+ * the session is over, whatever the write did. */
+async function assertStopSurvivesRestart(w: World): Promise<void> {
+  if (w.cell.list === "failing") w.catchUp(); // an unreadable session fails the stop: harbor redelivers it
+  w.phase = "view";
+  w.clock += 60_000;
+  const r = await stopLoop("t", { ...w.ref, actor: "dave", stopAt: iso(w.clock) }, settings(w.mode()), w.deps, ENV);
+  assertLogged(w, r, classify(w, r), "stop");
+  w.catchUp();
+  const restarted = { ...w.deps.gh }; // another client object: an empty journal
+  const s = await readLoopSession(restarted, "t", "o", "r", w.pr, { botLogin: BOT, pr: { sha: w.live() } });
+  assert.equal(s.active, false, `I7: the stop is lost after a restart: ${JSON.stringify(r)} → ${JSON.stringify(s)}`);
+}
+
 /** I6: carol's newer start is never ended by an older record; a step in her session runs. */
 async function assertNewerSessionLives(w: World): Promise<void> {
   const { via, write } = w.cell;
@@ -597,6 +615,8 @@ async function runCell(c: Cell, pr: number): Promise<void> {
       await assertNewerSessionLives(w);
     } else if (c.later === "push" || c.later === "moved") {
       await assertNextHeadHeard(w);
+    } else if (c.later === "stop-restart") {
+      await assertStopSurvivesRestart(w);
     } else {
       // I5 on a readable list (not beside carol's start, which would answer for the write)
       if (c.list !== "failing") {

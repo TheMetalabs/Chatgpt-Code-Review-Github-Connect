@@ -31,6 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
+import { nextCreationSeq } from "./creation-seq";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -1235,6 +1236,7 @@ function enqueueFromDecision(
     id: nid("job"),
     status: "queued",
     createdAt: Date.now(),
+    createdSeq: nextCreationSeq(),
     updatedAt: Date.now(),
     ingressMs: opts.ingressMs,
     traces: [],

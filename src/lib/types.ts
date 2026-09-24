@@ -100,6 +100,9 @@ export interface Job {
   status: JobStatus;
   skipReason?: string;
   createdAt: number;
+  /** Process-wide creation order shared with review-loop fix items (creation-seq.ts); breaks a
+   * createdAt tie in the bridge's cross-kind take order. Absent on jobs created before it existed. */
+  createdSeq?: number;
   updatedAt: number;
   ingressMs: number;
   traces: ToolTrace[];

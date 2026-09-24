@@ -53,6 +53,17 @@ test('new body mention edit queues once; retained mention and a redelivery never
   assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===first.jobId).status,'awaiting_chat');
   assert.equal(app.githubCalls.snapshot,1);
 });
+test('a webhook review and a fix created in the same ms are taken in creation order (one sequence for both kinds)',async t=>{
+  const app=await fixture(t);
+  const out=await deliver(app,'issue_comment',comment());const job=await settled(app,out.jobId);
+  assert.ok(Number.isSafeInteger(job.createdSeq),'harbor stamps the shared creation sequence');
+  // The fixture clock is frozen: the fix is created in the review's millisecond.
+  app.bridge.requestBridgeFix({owner:'fixture',repo:'fixture',pr:2,provider:'chatgpt',prompt:'FIX'}).catch(()=>{});
+  const first=app.bridge.takeNextBridgeJob('fixture-client',[],{fixes:true});
+  assert.equal(first.jobId,job.id,'the review requested first is taken first');
+  app.bridge.refreshBridgeClaim(first.jobId,{chatgpt:true},undefined,first.leaseId);
+  assert.match(app.bridge.takeNextBridgeJob('fixture-client',[job.id],{fixes:true}).jobId,/^fix-/);
+});
 test('fork policy discovered from a comment is checked before snapshot or eyes and explains the skip',async t=>{
   const app=await fixture(t,{pull:{draft:true,fork:true}});
   const out=await deliver(app,'issue_comment',comment());const job=await settled(app,out.jobId);

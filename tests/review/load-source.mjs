@@ -2,6 +2,8 @@ import {sanitizeWorkerStatus} from "../../src/lib/bridge-worker-status.ts";
 import {JsonRepairService, localJsonRepairAvailable, cancelLocalJsonRepairs} from "../../src/lib/json-repair.server.ts";
 import {inspectReviewFormat} from "../../src/lib/review-json-repair.ts";
 import * as bridgeFix from "../../src/lib/bridge-fix.server.ts";
+import * as creationSeq from "../../src/lib/creation-seq.ts";
+export {creationSeq};
 // Execute production source in a fresh realm, replacing only external I/O imports.
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
@@ -35,7 +37,7 @@ export function bridgeHarness(jobs, extra = {}) {
   const snapshots=[];
   const history=new ReviewHistoryStore(null);
   const bridge=loadTs('src/lib/bridge.server.ts', {
-    ...crypto,...types,...parser,...bridgeFix, sanitizeWorkerStatus, JsonRepairService, localJsonRepairAvailable, cancelLocalJsonRepairs, inspectReviewFormat, sanitizeProgressEvents, reviewHistory:()=>history,
+    ...crypto,...types,...parser,...bridgeFix,...creationSeq, sanitizeWorkerStatus, JsonRepairService, localJsonRepairAvailable, cancelLocalJsonRepairs, inspectReviewFormat, sanitizeProgressEvents, reviewHistory:()=>history,
     loadDotenvFile(){},writeEnvPatch(){},resolveBridgeToken:()=>({token:'fixture',persist:false}),BRIDGE_TOKEN_ENV:'FIXTURE',
     llmWorkAllowed:j=>['issue_comment.mention','pull_request_review_comment.followup'].includes(j.trigger),
     getHarbor:()=>state,

@@ -14,6 +14,7 @@ import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 import { createFixRegistry, isFixItemId, type FixOffer, type FixRequest } from "./bridge-fix.server";
+import { createdBefore } from "./creation-seq";
 
 type BridgeMeta = {
   token: string;
@@ -217,8 +218,11 @@ function takeFix(clientId: string, excludeJobIds: readonly string[], review: Ret
     const waiting = getHarbor().jobs.filter(j => reviewEligible(j, clientId, excludeJobIds));
     // A review of unknown age keeps today's precedence (the candidate goes first).
     if (!waiting.length || !waiting.every(j => Number.isFinite(j.createdAt))) return {};
-    const oldest = waiting.reduce((a, b) => (b.createdAt < a.createdAt ? b : a));
-    if (next.createdAt > oldest.createdAt) return {reviewFirst: oldest.id};
+    // Creation order is (createdAt, createdSeq): one sequence spans both kinds, so a fix created
+    // in the same millisecond as an earlier review still waits for it. A review without a
+    // sequence (created before it existed) ties as today: the fix goes first.
+    const oldest = waiting.reduce((a, b) => (createdBefore(b, a) ? b : a));
+    if (createdBefore(oldest, next)) return {reviewFirst: oldest.id};
   }
   const offer = fixes().take(next.id, clientId);
   if (offer) {

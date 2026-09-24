@@ -45,6 +45,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { createdBefore, nextCreationSeq } from "./creation-seq.ts";
 
 export type FixChatProvider = "chatgpt" | "grok";
 export type FixItemState = "queued" | "claimed" | "done" | "failed" | "cancelled";
@@ -104,6 +105,8 @@ export interface FixItem {
   /** Emptied at settlement (it inlines file contents). */
   prompt: string;
   createdAt: number;
+  /** Process-wide creation order shared with review jobs (creation-seq.ts): breaks a createdAt tie. */
+  createdSeq: number;
   deadlineAt: number;
   state: FixItemState;
   leaseId?: string;
@@ -269,6 +272,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       provider: req.provider,
       prompt: req.prompt,
       createdAt: now,
+      createdSeq: nextCreationSeq(),
       deadlineAt: now + timeoutMs,
       state: "queued",
     };
@@ -284,11 +288,11 @@ export function createFixRegistry(deps: FixRegistryDeps) {
    * a run for (its take response was lost; the worker lists every job it knows in `exclude`),
    * offered again under its lease, then the oldest queued item (none while parallelLimit() are
    * claimed). A claim with a run is in a tab: only recover() resumes it. */
-  function peek(exclude: readonly string[] = [], clientId = ""): { id: string; createdAt: number } | undefined {
+  function peek(exclude: readonly string[] = [], clientId = ""): { id: string; createdAt: number; createdSeq: number } | undefined {
     prune();
     if (clientId) {
       for (const item of items.values()) {
-        if (item.state === "claimed" && item.clientId === clientId && !item.runId && !exclude.includes(item.id)) return { id: item.id, createdAt: item.createdAt };
+        if (item.state === "claimed" && item.clientId === clientId && !item.runId && !exclude.includes(item.id)) return { id: item.id, createdAt: item.createdAt, createdSeq: item.createdSeq };
       }
     }
     if (claimedCount() >= limit()) return undefined;
@@ -297,9 +301,9 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       if (item.state !== "queued" || exclude.includes(item.id)) continue;
       // A released claim stays with its profile (review: bridgeClientId + attemptedProviders).
       if (item.clientId && item.clientId !== clientId) continue;
-      if (!oldest || item.createdAt < oldest.createdAt) oldest = item;
+      if (!oldest || createdBefore(item, oldest)) oldest = item;
     }
-    return oldest && { id: oldest.id, createdAt: oldest.createdAt };
+    return oldest && { id: oldest.id, createdAt: oldest.createdAt, createdSeq: oldest.createdSeq };
   }
 
   function claim(id: string, clientId = ""): { ok: true; leaseId: string } | { ok: false; error: string } {

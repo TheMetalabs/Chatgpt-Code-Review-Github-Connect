@@ -3,7 +3,7 @@
 // the fix registry re-implements differently fails here, not in a later review round.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {bridgeHarness, job as makeJob, types, json} from './load-source.mjs';
+import {bridgeHarness, job as makeJob, types, json, creationSeq} from './load-source.mjs';
 
 const CLAIM_MS = types.BRIDGE_CLAIM_MS;
 
@@ -168,3 +168,56 @@ for (const [kind, make] of Object.entries(KINDS)) {
     assert.equal(h.bridge.bridgeJobState(offer.jobId).active, true);
   });
 }
+
+// S19a: cross-kind take order is creation order, and a millisecond tie is not an order. Review
+// jobs and fix items draw from one process-wide creation sequence (creation-seq.ts); createdAt
+// stays the display timestamp. Every row runs on the frozen fixture clock: all items share one ms.
+const T0 = Date.UTC(2026, 8, 24, 12);
+const requestFix = h => h.bridge.requestBridgeFix({owner: 'fixture', repo: 'fixture', pr: 9, provider: 'chatgpt', prompt: 'FIX'}).catch(() => {});
+const takeOrder = (h, n) => {
+  const taken = [];
+  for (let i = 0; i < n; i++) {
+    const offer = h.bridge.takeNextBridgeJob('chrome-1', taken, {fixes: true});
+    assert.ok(offer, `take ${i} offers work`);
+    taken.push(offer.jobId);
+    h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: true}, undefined, offer.leaseId); // generation started
+  }
+  return taken.map(id => (id.startsWith('fix-') ? 'fix' : id));
+};
+
+test('take order (cross-kind): a review created in the same ms before a fix is taken first', () => {
+  const h = harness([]);
+  h.state.jobs = [makeJob({id: 'R', createdAt: T0, createdSeq: creationSeq.nextCreationSeq()})];
+  requestFix(h);
+  assert.deepEqual(takeOrder(h, 2), ['R', 'fix'], 'equal createdAt: the earlier-created review first');
+});
+
+test('take order (cross-kind): a fix created in the same ms before a review is taken first', () => {
+  const h = harness([]);
+  requestFix(h);
+  h.state.jobs = [makeJob({id: 'R', createdAt: T0, createdSeq: creationSeq.nextCreationSeq()})];
+  assert.deepEqual(takeOrder(h, 2), ['fix', 'R'], 'equal createdAt: the earlier-created fix first');
+});
+
+test('take order (cross-kind): a legacy review without a sequence keeps today\'s tie precedence', () => {
+  const h = harness([makeJob({id: 'R', createdAt: T0})]);
+  requestFix(h);
+  assert.deepEqual(takeOrder(h, 2), ['fix', 'R'], 'an unordered tie never holds the fix');
+});
+
+test('take order (cross-kind): among equal-ms reviews the lowest sequence is the one that blocks the fix', () => {
+  const h = harness([]);
+  const first = creationSeq.nextCreationSeq();
+  const second = creationSeq.nextCreationSeq();
+  // harbor lists newest first: R2 is the candidate, R1 the older review the fix waits for
+  h.state.jobs = [makeJob({id: 'R2', pr: 2, createdAt: T0, createdSeq: second}), makeJob({id: 'R1', pr: 1, createdAt: T0, createdSeq: first})];
+  requestFix(h);
+  assert.deepEqual(takeOrder(h, 3), ['R1', 'R2', 'fix']);
+});
+
+test('take order (fix kind): equal-ms fixes are taken in creation order', () => {
+  const h = harness([]);
+  for (const pr of [7, 3]) h.bridge.requestBridgeFix({owner: 'fixture', repo: 'fixture', pr, provider: 'chatgpt', prompt: `FIX ${pr}`}).catch(() => {});
+  const first = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true});
+  assert.equal(first.title, 'fix fixture/fixture#7');
+});

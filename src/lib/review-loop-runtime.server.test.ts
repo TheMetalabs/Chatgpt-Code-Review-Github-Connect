@@ -1596,7 +1596,42 @@ describe("ambiguous control writes: journaled with no expiry, never read as post
     };
     return () => attempts;
   };
+  /** Every POST whose body matches `hit` CREATES its row, then fails with an UNKNOWN outcome (a 502
+   * after creation): the retry schedule's re-check lists it. */
+  const landedFor = (f: ReturnType<typeof fakeDeps>, hit: (body: string) => boolean) => {
+    const orig = f.deps.gh.createIssueComment;
+    let attempts = 0;
+    f.deps.gh.createIssueComment = async (t, o) => {
+      if (!hit(o.body)) return orig(t, o);
+      attempts += 1;
+      await orig(t, o);
+      throw unknownErr();
+    };
+    return () => attempts;
+  };
   const stopReq = { owner: "o", repo: "r", pr: 7, actor: "bob", stopAt: "2026-01-20T00:00:00Z" };
+
+  it("an applied round whose loop-error handoff answered 502 but landed handed off: its report and replies follow", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], failContinuation: true, threads: [{ id: 50, path: "src/a.ts", body: "finding" }] });
+    const attempts = landedFor(f, (b) => b.includes("ashlar-loop-escalate"));
+    const posted: PostedLoopReview = { githubId: 9, comments: [{ findingId: "f1", file: "src/a.ts", body: "finding" }], published: ["f1"] };
+    const r = await runPostReviewLoop("t", job(), sample, settings("apply"), f.deps, ENV_ON, posted);
+    assert.equal(f.committed, true);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    assert.equal(attempts(), 1, "one handoff POST");
+    assert.equal(escalations(f.posted).length, 1);
+    assert.ok(f.posted.some((b) => b.startsWith("### Ashlar fix agent — applied")), "the pushed commit is reported");
+    assert.equal(f.replies.length, 1, "the finding thread gets its disposition");
+  });
+
+  it("a no-change round whose fix-declined handoff answered 502 but landed handed off: its report follows, not a silent 'already escalated'", async () => {
+    const f = fakeDeps({ start: "suggest", rounds: [3], reply: '{"summary":"false positive","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"n"}]}' });
+    const attempts = landedFor(f, (b) => b.includes("ashlar-loop-escalate"));
+    const r = await run(f, "suggest");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-declined", JSON.stringify(r));
+    assert.equal(attempts(), 1, "one handoff POST");
+    assert.ok(f.posted.some((b) => b.startsWith("### Ashlar fix agent — no change")), "the rationale is reported");
+  });
 
   it("a stop whose record has an unknown outcome: one POST, a redelivery is not 'recorded', the stop stays honored", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3] });

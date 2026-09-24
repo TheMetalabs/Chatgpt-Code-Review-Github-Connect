@@ -677,9 +677,9 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     assert.equal(f.attempts(), 601, "the first key's POST count stays one");
   });
 
-  it("an unknown write outcome whose handoff becomes visible resolves without another POST", async () => {
+  it("an unknown write outcome whose handoff becomes visible is this call's handoff: escalated, without another POST", async () => {
     const f = flaky(["unknown", "ok"]);
-    assert.deepEqual(await now(f, 16), { escalated: false });
+    assert.deepEqual(await now(f, 16), { escalated: true }, "never 'already escalated': the caller's report and replies follow");
     assert.equal(f.attempts(), 1);
     assert.equal(f.stored.length, 1);
   });

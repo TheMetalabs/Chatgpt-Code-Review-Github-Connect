@@ -274,7 +274,7 @@ async function maybeEscalateInner(
   switch (out.status) {
     case "posted":
       return { escalated: true, reason, rounds };
-    case "exists": // this process's own, or listed meanwhile
+    case "exists": // an earlier emit's, or listed before this one sent anything
       return { escalated: false, reason, rounds };
     case "unknown": // it may have landed: never a second one, and never "exists"
       return { escalated: false, ambiguous: true, reason, rounds };

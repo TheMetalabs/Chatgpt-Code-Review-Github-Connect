@@ -137,8 +137,9 @@ export function listedMatch(rows: readonly ControlRow[], w: ControlWrite, botLog
 }
 
 /**
- * posted   — THIS emit's POST returned the created row;
- * exists   — a matching row is listed, or this process already posted it;
+ * posted   — THIS emit created the row: its POST returned it, or answered "unknown" and a re-check
+ *            then listed it (the gate is exclusive per key, so that row is this emit's);
+ * exists   — a matching row was listed before this emit sent anything, or an earlier emit wrote it;
  * unknown  — a POST may have landed and no list shows it: it is never sent again;
  * rejected — nothing was created (every attempt refused, or never sent).
  */
@@ -358,6 +359,7 @@ async function send(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
   const { ref } = e.write.key;
   const where = { owner: ref.owner, repo: ref.repo, pr: ref.pr };
   let body: string | undefined;
+  let mayHaveLanded = false; // one of THIS emit's POSTs answered "unknown"
   const r = await retryWrite({
     delays: CONTROL_RETRY_DELAYS_MS,
     sleep: ctx.sleep,
@@ -378,13 +380,16 @@ async function send(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
         e.state = "posted";
       } catch (err) {
         e.state = writeOutcomeUnknown(err) ? "unknown" : "rejected";
+        mayHaveLanded ||= e.state === "unknown";
         e.error = message(err);
         throw err;
       }
     },
   });
   if ("posted" in r) return { status: "posted" };
-  if ("exists" in r) return { status: "exists" };
+  // Listed after this emit's own unknown POST: that row is the POST's. Callers read "exists" as
+  // someone else's write (a handoff caller then skips its report and replies silently).
+  if ("exists" in r) return { status: mayHaveLanded ? "posted" : "exists" };
   if (e.state === "unknown") return unknownOutcome(e);
   e.state = "rejected"; // also a body that could not be rendered: nothing was sent
   return { status: "rejected", error: message(r.error) };

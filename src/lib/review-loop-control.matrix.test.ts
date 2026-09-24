@@ -437,7 +437,8 @@ function norm(via: Via, e: Cls, when: "first" | "again"): Cls {
 
 function expectFirst(c: Cell): Cls {
   if (c.via === "start:self-heal" && c.list === "failing" && c.write !== "rejected") return "unreadable"; // re-reads after the emit
-  const e: Cls = c.write === "success" ? "posted" : c.write === "rejected" ? "rejected" : c.write === "unknown-landed" && c.list === "normal" ? "exists" : "unknown";
+  // a POST that answered "unknown" and whose row the re-check lists was posted by this call
+  const e: Cls = c.write === "success" || (c.write === "unknown-landed" && c.list === "normal") ? "posted" : c.write === "rejected" ? "rejected" : "unknown";
   return norm(c.via, e, "first");
 }
 

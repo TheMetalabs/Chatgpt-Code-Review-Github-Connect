@@ -97,13 +97,13 @@ describe("review-format", () => {
 
   it("surfaces skipped-provider warnings in a raw-only salvaged review", () => {
     const body = reviewSummaryBody(
-      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], assumptions: ["Skipped grok: quota or unavailable"], coverage: [], rawReview: "P1 salvaged chatgpt reply" },
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], assumptions: [], skippedProviders: ["grok"], coverage: [], rawReview: "P1 salvaged chatgpt reply" },
       [],
       "ashlar-bot",
       [],
     );
     assert.match(body, /salvaged chatgpt reply/);
-    assert.match(body, /Skipped grok: quota/); // partial-coverage warning not swallowed by the raw-only path
+    assert.match(body, /- Skipped grok \(quota or unavailable\)/); // partial-coverage warning not swallowed by the raw-only path
     assert.match(body, /raw=1/);
   });
 
@@ -143,7 +143,8 @@ describe("review-format", () => {
       {
         headSha: "bd663b721d",
         reviewProviders: ["chatgpt", "grok", "local"],
-        assumptions: ["Skipped grok, local (quota or unavailable)"],
+        assumptions: [],
+        skippedProviders: ["grok", "local"],
       },
       [],
       "ashlar-bot",

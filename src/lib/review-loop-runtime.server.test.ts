@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
+import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type ReviewProvider, type SamplePr } from "./types.ts";
 import { continueComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
 import { botSettingsToEnv, sanitizeBotSettings } from "./settings.server.ts";
@@ -377,7 +377,7 @@ describe("CONVERGED is the posted outcome, not \"no findings\" (docs/local-verif
     ["raw (a chat reply posted verbatim)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW" }, /not parseable review JSON/],
     ["raw-unverified", { ...VC, localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW" }, /local verification's reply could not be used/],
     ["unverified-clean", { ...VC, localVerified: false }, /local verification did not complete/],
-    ["incomplete", { reviewProviders: ["chatgpt", "grok"], assumptions: ["Skipped grok (quota or unavailable)"] }, /a reviewer did not run/],
+    ["incomplete", { reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: ["Skipped grok (quota or unavailable)"] }, /a reviewer did not run/],
   ];
   for (const [name, patch, detail] of notClean) {
     it(`${name}: an active session gets one fixed handoff, never a silent stop`, async () => {
@@ -392,7 +392,14 @@ describe("CONVERGED is the posted outcome, not \"no findings\" (docs/local-verif
     });
   }
 
-  for (const [name, patch] of [["clean", {}], ["verified-clean", { ...VC, localVerified: true }]] as const) {
+  // A reviewer's own assumption that says "skipped" is not a reviewer that did not run.
+  const ASSUMES_SKIPPED = { assumptions: ["Generated fixtures were skipped because they are irrelevant."], skippedProviders: [] as ReviewProvider[] };
+  for (const [name, patch] of [
+    ["clean", {}],
+    ["verified-clean", { ...VC, localVerified: true }],
+    ["clean, a reviewer assumption says skipped", ASSUMES_SKIPPED],
+    ["verified-clean, a reviewer assumption says skipped", { ...VC, localVerified: true, ...ASSUMES_SKIPPED }],
+  ] as const) {
     it(`${name}: silent convergence`, async () => {
       const f = fakeDeps({ rounds: [0] });
       assert.deepEqual(await run(f, "suggest", ENV_ON, job({ findings: [], ...patch })), { ran: false, reason: "no findings (converged)" });

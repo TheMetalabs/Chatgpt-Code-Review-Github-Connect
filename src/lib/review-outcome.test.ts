@@ -21,12 +21,13 @@ type RowJob = OutcomeJob & { localVerifyNote?: string };
 const job = (patch: Partial<RowJob> = {}): RowJob => ({ reviewProviders: CL, assumptions: [], ...patch });
 const held = (patch: Partial<RowJob> = {}) => job({ localReviewRole: VC, ...patch });
 const verifying = (patch: Partial<RowJob> = {}) => held({ localVerifyStartedAt: 1, ...patch });
+const ASSUMES_SKIPPED = "Generated fixtures were skipped because they are irrelevant.";
 
 describe("reviewOutcome: the one decision point", () => {
   const rows: Array<[string, OutcomeJob, number, ReviewOutcome]> = [
     ["D1 race findings", job({ localReviewRole: "race" }), 1, "findings"],
     ["D2 race raw", job({ localReviewRole: "race", rawReview: "P1 x" }), 0, "raw"],
-    ["D3 race skipped local", job({ localReviewRole: "race", assumptions: ["Skipped local (x)"] }), 0, "incomplete"],
+    ["D3 race skipped local", job({ localReviewRole: "race", skippedProviders: ["local"] }), 0, "incomplete"],
     ["D4 race clean", job({ localReviewRole: "race" }), 0, "clean"],
     ["D5 legacy/tape job without a role", job({ reviewProviders: ["chatgpt"] }), 0, "clean"],
     ["D6 FP round merges as race", held({ chatFpRound: true }), 0, "clean"],
@@ -35,15 +36,21 @@ describe("reviewOutcome: the one decision point", () => {
     ["D9 held, chat findings post now", held(), 1, "findings"],
     ["D10 held, chat raw is not clean", held({ rawReview: "P1 x" }), 0, "raw"],
     ["D11 held, chat clean starts verification", held(), 0, "verify"],
-    ["D12 held, a skipped chat reviewer still verifies", held({ reviewProviders: CGL, assumptions: ["Skipped grok (quota)"] }), 0, "verify"],
+    ["D12 held, a skipped chat reviewer still verifies", held({ reviewProviders: CGL, skippedProviders: ["grok"] }), 0, "verify"],
     ["D13 local verified clean", verifying({ localVerified: true }), 0, "verified-clean"],
     ["D14 local verified with findings", verifying({ localVerified: true }), 1, "findings"],
     ["D15 local reply unparseable", verifying({ localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW" }), 0, "raw-unverified"],
     ["D16 local failed", verifying({ localVerified: false }), 0, "unverified-clean"],
     ["D17 local never stamped", verifying(), 0, "unverified-clean"],
-    ["D18 verified but a chat reviewer skipped", verifying({ reviewProviders: CGL, localVerified: true, assumptions: ["Skipped grok (quota or unavailable)"] }), 0, "incomplete"],
+    ["D18 verified but a chat reviewer skipped", verifying({ reviewProviders: CGL, localVerified: true, skippedProviders: ["grok"] }), 0, "incomplete"],
     ["D19 local as the chat-down fallback, clean", held({ localFallbackAt: 1 }), 0, "clean"],
     ["D20 local as the chat-down fallback, raw", held({ localFallbackAt: 1, rawReview: "P1 x" }), 0, "raw"],
+    // A skipped reviewer is structured provider state; a reviewer's own assumption that says
+    // "skipped" is free text and never makes a complete review incomplete (race or verify-clean).
+    ["D21 race clean, a reviewer assumption says skipped", job({ localReviewRole: "race", assumptions: [ASSUMES_SKIPPED] }), 0, "clean"],
+    ["D22 verified clean, a reviewer assumption says skipped", verifying({ localVerified: true, assumptions: [ASSUMES_SKIPPED] }), 0, "verified-clean"],
+    ["D23 held clean, a reviewer assumption says skipped, still verifies", held({ assumptions: [ASSUMES_SKIPPED] }), 0, "verify"],
+    ["D24 an empty skipped list is nothing skipped", job({ localReviewRole: "race", skippedProviders: [] }), 0, "clean"],
   ];
   for (const [name, j, findings, expected] of rows) {
     it(name, () => assert.equal(reviewOutcome(j, findings), expected));
@@ -67,7 +74,7 @@ const RENDER: Record<PostedOutcome, { job: RowJob; findings: Finding[] }> = {
   clean: { job: job({ localReviewRole: "race" }), findings: [] },
   "verified-clean": { job: verifying({ localVerified: true, localVerifyNote: "chatgpt found nothing; local verification agreed." }), findings: [] },
   "unverified-clean": { job: verifying({ localVerified: false, localVerifyNote: "chatgpt found nothing; local verification did not complete (x), so this is chatgpt's unverified clean result." }), findings: [] },
-  incomplete: { job: job({ localReviewRole: "race", assumptions: ["Skipped local (x)"] }), findings: [] },
+  incomplete: { job: job({ localReviewRole: "race", skippedProviders: ["local"] }), findings: [] },
 };
 const render = (kind: PostedOutcome) => reviewSummaryBody({ ...RENDER[kind].job, headSha: "abc1234ffff", coverage: [] }, RENDER[kind].findings, "ashlar-bot");
 const trailer = (body: string) => /<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1] ?? null;

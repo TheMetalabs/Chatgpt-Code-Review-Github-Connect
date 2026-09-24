@@ -6,12 +6,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {appFixture,eventually} from './app-fixture.mjs';
+import {isZeroFindings} from '../../src/lib/review-loop.ts';
+import {CLEAN_REVIEW_BODY} from '../../src/lib/review-format.ts';
 
 const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Missing check',failure_scenario:'A duplicate request writes twice',
   root_cause:'No guard',evidence:'a.ts:1: no guard',recommended_fix:'Check the key',recommended_test:'Assert one write'};
 const clean=JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['a.ts: constant change only']});
 const dirty=JSON.stringify({findings:[finding],merge_recommendation:'REQUEST_CHANGES'});
 const none='{"findings":"not a list"}';
+// a complete clean review whose own free-form assumption says "skipped": no reviewer was skipped
+const cleanAssumesSkipped=JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['a.ts: constant change only'],
+  assumptions:['Generated fixtures were skipped because they are irrelevant.']});
 const reply=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 const fail500=res=>{res.writeHead(500,{'content-type':'application/json'});res.end('{"error":"model crashed"}');};
 const settle=()=>new Promise(resolve=>setTimeout(resolve,150));
@@ -43,7 +48,8 @@ async function newJobAfter(app,id,delivery){
   return out.jobId;
 }
 
-// expect: status, skip (regex or undefined), requests (total local requests), reviews, aborted.
+// expect: status, skip (regex or undefined), requests (total local requests), reviews, aborted, and
+// optionally body (regex) and clean (the review is a clean pass: the clean first line and CONVERGED).
 const ROWS=[
   {name:'L1 chat findings: local stays held and never runs',expect:{status:'posted',requests:0,reviews:1},
     async run(t){const s=await start(t);await s.app.harbor.submitHarborChat(s.jobId,dirty);return s;}},
@@ -174,6 +180,17 @@ const ROWS=[
       await s.app.harbor.submitHarborChat(s.jobId,dirty);
       await answerLocal(s.app,0,res=>res.end(reply(dirty)));return s;
     }},
+  {name:'L15 chat and local clean, each assuming something was "skipped": verified-clean and CONVERGED',expect:{status:'posted',requests:1,reviews:1,clean:true,body:/local verification agreed/},
+    async run(t){
+      const s=await start(t);await s.app.harbor.submitHarborChat(s.jobId,cleanAssumesSkipped);
+      await answerLocal(s.app,0,res=>res.end(reply(cleanAssumesSkipped)));return s;
+    }},
+  {name:'R3 race: chat and local clean, each assuming something was "skipped": clean and CONVERGED',expect:{status:'posted',requests:1,reviews:1,clean:true},
+    async run(t){
+      const s=await start(t,{role:'race'});
+      await s.app.harbor.submitHarborChat(s.jobId,cleanAssumesSkipped);
+      await answerLocal(s.app,0,res=>res.end(reply(cleanAssumesSkipped)));return s;
+    }},
   {name:'R2 race: superseded while local runs: aborted',expect:{status:'cancelled',skip:/superseded by/,requests:2,reviews:0,aborted:true},
     async run(t){
       const s=await start(t,{role:'race'});
@@ -198,6 +215,13 @@ for(const row of ROWS){
     assert.equal(app.localRequests.length,e.requests,'local requests');
     assert.equal(app.reviews.length,e.reviews,'reviews posted');
     if(e.body)assert.match(app.reviews[0].body,e.body,'review body');
+    if(e.clean){
+      const body=app.reviews[0].body;
+      assert.equal(body.split('\n')[0],CLEAN_REVIEW_BODY,'a clean pass');
+      assert.equal(isZeroFindings(body,{authoredByBot:true}),true,'CONVERGED');
+      assert.equal(JSON.stringify(job().skippedProviders),'[]','no reviewer was skipped');
+      assert.doesNotMatch(body,/skipped/i,'a reviewer assumption is not listed as a skipped reviewer');
+    }
     await eventually(()=>!app.harbor.hasLocalSample(jobId),`${row.name}: the local snapshot was never released`);
     await eventually(()=>!app.harbor.isWatchingJob(jobId),`${row.name}: the reviewer watcher never stopped`);
     assert.equal(Boolean(s.abort?.aborted),Boolean(e.aborted),'in-flight local request aborted');

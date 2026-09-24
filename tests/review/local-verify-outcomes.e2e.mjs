@@ -13,6 +13,8 @@ const converged=body=>isZeroFindings(body,{authoredByBot:true});
 const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Missing check',failure_scenario:'A duplicate request writes twice',
   root_cause:'No guard',evidence:'a.ts:1: no guard',recommended_fix:'Check the key',recommended_test:'Assert one write'};
 const cleanJson=JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['a.ts: constant change only']});
+// clean, with a free-form reviewer assumption that says "skipped" (no reviewer was skipped)
+const assumesSkippedJson=JSON.stringify({...JSON.parse(cleanJson),assumptions:['Generated fixtures were skipped because they are irrelevant.']});
 const dirtyJson=JSON.stringify({findings:[finding],merge_recommendation:'REQUEST_CHANGES'});
 // exactly the shape the correction prompt asks for (no investigated_safe)
 const minimalJson=JSON.stringify({findings:[],merge_recommendation:'COMMENT',keep:[]});
@@ -40,6 +42,7 @@ const fail500=res=>{res.writeHead(500,{'content-type':'application/json'});res.e
 const answer=(...replies)=>(res,i)=>{const r=replies[Math.min(i,replies.length-1)];typeof r==='function'?r(res):res.end(envelope(r));};
 const LOCAL={
   clean:{answer:answer(cleanJson)},
+  assumesSkipped:{answer:answer(assumesSkippedJson)},
   findings:{answer:answer(dirtyJson)},
   unparseable:{answer:answer(LOCAL_RAW)},
   // the first reply completes with the finding in prose, then the one JSON correction fails
@@ -77,6 +80,7 @@ const RESIDUAL_NOTE=/could not be used as a review \(a completed reply carried t
 // [chat, local] → expected. stamp: which release the held local leg got (verify round / fallback / none).
 const CELLS={
   'clean x clean':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
+  'clean x assumesSkipped':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
   'clean x findings':posted(SUMMARY,MF,1,{note:/chatgpt found nothing; local verification found 1\./,stamp:'verify'}),
   'clean x unparseable':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
   'clean x proseThen500':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
@@ -95,6 +99,7 @@ const CELLS={
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`unparseable x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW']}):chatRaw])),
   // local as the chat-down fallback is an ordinary reviewer: race parity, no verification note
   'none x clean':posted(CLEAN,M0,1,{stamp:'fallback'}),
+  'none x assumesSkipped':posted(CLEAN,M0,1,{stamp:'fallback'}),
   'none x findings':posted(SUMMARY,MF,1,{stamp:'fallback'}),
   'none x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseThen500':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),

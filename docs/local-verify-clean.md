@@ -15,7 +15,7 @@ alone: the body's first line, the raw block header, the trailing `ashlar-finding
 the loop's CONVERGED signal. The loop runtime (`runPostReviewLoop`) asks `postedOutcome` the same
 question instead of counting findings: a zero-finding review whose kind is not CONVERGED (`raw`,
 `raw-unverified`, `unverified-clean`, `incomplete`) gets one fixed ESCALATE `loop-error` in an active
-session, never a silent stop. No other code reads `localVerified`, `rawReview` or the skipped notes
+session, never a silent stop. No other code reads `localVerified`, `rawReview` or `skippedProviders`
 to decide any of these.
 
 `findings` is the publish-gated count. A job is a *verifier* when its role is `verify-clean`, both a
@@ -28,7 +28,7 @@ race.
 | `findings` | any structured finding | summary mark | `total=N inline=… body=… p0 p1 p2` | no |
 | `raw` | a salvaged (unparseable) reply, not a verifier's | summary mark | `total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` | no |
 | `raw-unverified` | verification round, local's reply could not be used as a review (below) | summary mark + note | raw marker + ` unverified=1` | no |
-| `incomplete` | 0 findings, no raw, a reviewer was skipped | summary mark (+ note in a verification round: agreed / did not complete) | none | no |
+| `incomplete` | 0 findings, no raw, a reviewer was skipped (`skippedProviders`) | summary mark (+ note in a verification round: agreed / did not complete) | none | no |
 | `clean` | not a verifier, 0 findings, nothing skipped | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `verified-clean` | verification round, local returned a structured clean result | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `unverified-clean` | verification round, local failed / timed out / offline | `Chat found no major issues, but local verification did not complete …` | `total=0 … unverified=1` | no |
@@ -58,6 +58,11 @@ Rules the table encodes:
   `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block. So a
   verifier whose P1 the gate dropped never reads as "local verification agreed", and the note names
   why the reply could not be used.
+- "A reviewer was skipped" is structured provider state: `submitHarborChat` stamps
+  `Job.skippedProviders` (the enabled reviewers with no payload) with the merge, and the body lists it
+  as one system line. It is never inferred from assumptions, which also carry the reviewers' own
+  free text: a clean review assuming "generated fixtures were skipped" stays `clean` /
+  `verified-clean` and CONVERGED, on race and verify-clean alike (rows R3, L15).
 - `unverified=1` is never CONVERGED, and only `clean` / `verified-clean` print the clean sentinel.
   `postedOutcome` renders a `verify` that somehow reaches the poster as `unverified-clean`.
 - Local as the chat-down fallback is an ordinary reviewer: chat unusable + local clean posts

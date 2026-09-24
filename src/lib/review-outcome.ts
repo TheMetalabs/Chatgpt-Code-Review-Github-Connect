@@ -22,7 +22,7 @@ export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 export type PostedOutcome = Exclude<ReviewOutcome, "verify">;
 
 export type OutcomeJob = Pick<Job, "reviewProviders" | "assumptions" | "rawReview"> &
-  Partial<Pick<Job, "localReviewRole" | "chatFpRound" | "localVerifyStartedAt" | "localFallbackAt" | "localVerified">>;
+  Partial<Pick<Job, "localReviewRole" | "chatFpRound" | "localVerifyStartedAt" | "localFallbackAt" | "localVerified" | "skippedProviders">>;
 
 /** A Record keyed by the closed enum: adding a kind without deciding its shape fails the typecheck. */
 export const OUTCOME_SHAPE: Record<PostedOutcome, { converged: boolean; unverified: boolean }> = {
@@ -35,10 +35,16 @@ export const OUTCOME_SHAPE: Record<PostedOutcome, { converged: boolean; unverifi
   incomplete: { converged: false, unverified: false },
 };
 
-/** Assumption lines that report a reviewer that did not run (the body lists them; any makes a
- * zero-finding result incomplete rather than clean). */
-export function skippedNotes(job: Pick<Job, "assumptions">): string[] {
-  return (job.assumptions ?? []).filter((a) => /skipped/i.test(a));
+/** The system line naming the reviewers that did not run (harbor records it with the merge). */
+export function skippedNote(providers: readonly ReviewProvider[]): string {
+  return `Skipped ${providers.join(", ")} (quota or unavailable)`;
+}
+
+/** The lines the body lists for reviewers that did not run. Read from the structured
+ * `skippedProviders` the merge stamped, never from assumptions: those also carry reviewer-written
+ * text, and a reviewer noting it "skipped" generated fixtures is not a reviewer that did not run. */
+export function skippedNotes(job: Pick<Job, "skippedProviders">): string[] {
+  return job.skippedProviders?.length ? [skippedNote(job.skippedProviders)] : [];
 }
 
 /** `findings` is the gated (publishable) count. An FP round always merges as race, and local run
@@ -50,7 +56,7 @@ export function reviewOutcome(job: OutcomeJob, findings: number): ReviewOutcome 
   if (verifier && !job.localVerifyStartedAt) return findings > 0 ? "findings" : raw ? "raw" : "verify";
   if (findings > 0) return "findings";
   if (raw) return verifier && !job.localVerified ? "raw-unverified" : "raw";
-  if (skippedNotes(job).length) return "incomplete";
+  if (job.skippedProviders?.length) return "incomplete";
   if (!verifier) return "clean";
   return job.localVerified ? "verified-clean" : "unverified-clean";
 }

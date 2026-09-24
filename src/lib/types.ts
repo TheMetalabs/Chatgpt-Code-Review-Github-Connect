@@ -144,6 +144,10 @@ export interface Job {
   /** verify-clean: local returned a STRUCTURED result in its verification round. Stamped at that
    * merge only; read by reviewOutcome (review-outcome.ts) and interpreted nowhere else. */
   localVerified?: boolean;
+  /** The enabled reviewers that produced no payload for the merged result (quota, unavailable,
+   * failed), stamped by that merge from provider state. The only input to "a reviewer did not run"
+   * (review-outcome.ts): a reviewer's own assumption that mentions skipping something never counts. */
+  skippedProviders?: ReviewProvider[];
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
   fpPending?: {

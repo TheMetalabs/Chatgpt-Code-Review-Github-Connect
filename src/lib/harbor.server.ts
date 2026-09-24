@@ -32,7 +32,7 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import { chatStalled, heldLocalEvidence, heldLocalReleased, heldLocalSalvage, heldLocalUnusable, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
-import { outcomeNote, reviewOutcome, salvagedReview } from "./review-outcome";
+import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
@@ -688,6 +688,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     localFallbackAt: undefined,
     localVerifyNote: undefined,
     localVerified: undefined,
+    skippedProviders: undefined,
     reviewOrder: order,
     storedLegs: [],
     updatedAt: Date.now(),
@@ -1079,14 +1080,16 @@ export async function submitHarborChat(
   const verifying = Boolean(job.localVerifyStartedAt) && !job.localFallbackAt;
   const localVerified = verifying ? structured.includes("local") : undefined;
   const nextAssumptions = [
-    skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
+    skipped.length ? skippedNote(skipped) : "",
     ...invalid,
     localUnusable ? `local: ${localUnusable} (reply posted verbatim)` : "",
     ...merged.assumptions,
   ].filter(Boolean);
   // merged.findings is already publish-gated (gateLiveSubmission applies the poster's partition with
   // the same settings), so this count is the one the posted body renders.
-  const outcome = reviewOutcome({ ...job, rawReview, localVerified, assumptions: nextAssumptions }, merged.findings.length);
+  // Skipped reviewers come from provider state (`skipped`), never from the merged assumptions, which
+  // also carry the reviewers' own free-form text.
+  const outcome = reviewOutcome({ ...job, rawReview, localVerified, assumptions: nextAssumptions, skippedProviders: skipped }, merged.findings.length);
   // Credit only the chat reviewers that produced the clean structured result (pinned when the
   // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
   const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
@@ -1111,6 +1114,7 @@ export async function submitHarborChat(
     rawReview,
     investigatedSafe: merged.investigatedSafe,
     assumptions: nextAssumptions,
+    skippedProviders: skipped,
     coverage: [...coverageByFile.values()],
     droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
     plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,

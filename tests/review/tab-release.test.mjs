@@ -61,12 +61,12 @@ function leg(kind, state = {}, patch = {}) {
     prompt: 'PROMPT', providers: ['chatgpt'], reasoning: {chatgpt: 'pro', grok: 'heavy'},
     states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', ...state}}, ...patch};
 }
-function worker(job, {handler, status = 'awaiting_chat', tab = {id: 10, url: URL_TAB, status: 'complete'}} = {}) {
+function worker(job, {handler, status = 'awaiting_chat', tab = {id: 10, url: URL_TAB, status: 'complete'}, session} = {}) {
   const tabs = new Map(tab ? [[10, tab]] : []);
   const api = async (_path, body) => (body?.action === 'ping'
     ? {ok: true, active: status === 'awaiting_chat', accepted: status === 'awaiting_chat', status, bridge: {captureProtocol: 1, localJsonRepairEnabled: false}}
     : {ok: true, job: null});
-  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[job.jobId]: job}}), tabs, api, handler});
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[job.jobId]: job}}), session, tabs, api, handler});
   b.context.crypto = webcrypto;b.context.TextEncoder = TextEncoder;
   b.pending = () => b.local.state.pendingReviewJobs[job.jobId];
   b.later = () => { const RealDate = b.context.Date || Date; const at = RealDate.now() + 3 * 60_000; b.context.Date = class extends RealDate { static now() { return at; } }; };
@@ -188,6 +188,51 @@ for (const kind of ['review', 'fix']) {
     assert.deepEqual(b.messages.filter(m => m.type !== 'ashlar-tab-status'), [], 'a frozen page is not asked');
     b.later();await b.tick();
     assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, []);
+    assert.ok(uploaded(b).includes('worker:preserve_unreachable'));
+  });
+}
+// A tab Chrome discarded (Memory Saver: job 649's tab sat in the background for 10+ minutes) holds no
+// page, so no takeover can be read in it. On its own page, in the tab this browser session created
+// for the leg, it is woken once and released by its page's verdict; on another page it is the user's.
+const createdHere = kind => storage({'ashlar:tab:10': {jobId: leg(kind).jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${leg(kind).jobId}:chatgpt:run-A`, closing: false}});
+const discardedTab = url => ({id: 10, url, status: 'unloaded', discarded: true});
+const blankVerdict = (_id, m) => (m.type === 'ashlar-tab-status' ? {ok: true} : {ok: true, releaseProtocol: 1, ownership: 'owned', blank: true, url: TEMP});
+function reloadSpy(b) {
+  const reloads = [];
+  // the woken tab loads (status "loading") until the test says it finished (loaded)
+  b.chrome.tabs.reload = async id => { reloads.push(id); Object.assign(b.tabs.get(id), {discarded: false, status: 'loading'}); };
+  return {reloads, loaded: () => { b.tabs.get(10).status = 'complete'; }};
+}
+for (const kind of ['review', 'fix']) {
+  for (const [mode, state, status] of [['secured', {...secured(kind), conversation: TEMP, pageUrl: TEMP}, 'awaiting_chat'], ['cancelled (still waiting to send)', {pageUrl: TEMP}, 'cancelled']]) {
+    test(`${kind}: a ${mode} leg whose temporary chat Chrome discarded is woken once, then closed on its page's verdict`, async () => {
+      const b = worker(leg(kind, state), {status, session: createdHere(kind), tab: discardedTab(TEMP), handler: blankVerdict});
+      const {reloads, loaded} = reloadSpy(b);
+      await b.tick();
+      assert.deepEqual(reloads, [10], 'woken (reloaded) once');
+      assert.deepEqual(b.closedTabs, []);
+      assert.ok(['tab_discarded', 'tab_loading'].includes(b.pending()?.states.chatgpt.cleanupWaitReason), 'waiting for the woken page');
+      assert.deepEqual(b.messages.filter(m => m.type !== 'ashlar-tab-status'), [], 'a discarded page is not asked');
+      await b.tick();
+      assert.deepEqual(b.closedTabs, [], 'still loading');
+      loaded();await b.tick();
+      assert.deepEqual(b.closedTabs, [10], 'its page answered (a reloaded temporary chat is blank): closed');
+      assert.equal(b.pending(), undefined, 'retired, capacity released');
+      assert.deepEqual(reloads, [10], 'never reloaded again');
+    });
+  }
+  test(`${kind}: a discarded tab on another page than its run's is the user's: preserved at once, never woken`, async () => {
+    const b = worker(leg(kind, {...secured(kind), conversation: TEMP}), {session: createdHere(kind), tab: discardedTab('https://chatgpt.com/c/users-own'), handler: blankVerdict});
+    const {reloads} = reloadSpy(b);
+    await b.tick();
+    assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, []);assert.deepEqual(reloads, []);
+    assert.ok(uploaded(b).includes('worker:preserve_navigated'), `${uploaded(b)}`);
+  });
+  test(`${kind}: a discarded tab this browser session did not create for the leg is never woken; preserved after the wait`, async () => {
+    const b = worker(leg(kind, {...secured(kind), conversation: TEMP}), {tab: discardedTab(TEMP), handler: blankVerdict});
+    const {reloads} = reloadSpy(b);
+    await b.tick();b.later();await b.tick();
+    assert.deepEqual(reloads, []);assert.deepEqual(b.closedTabs, []);assert.equal(b.pending(), undefined);
     assert.ok(uploaded(b).includes('worker:preserve_unreachable'));
   });
 }

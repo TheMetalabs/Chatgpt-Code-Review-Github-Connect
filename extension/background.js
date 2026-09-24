@@ -839,6 +839,26 @@ function abandonLegs(job, providers, status) {
   }
 }
 
+/** A tab Chrome discarded to save memory (or has not loaded since) holds no page: nothing in it can
+ * answer, and no follow-up, draft or edit is readable in it until it loads again (then its page
+ * renders what the provider kept, and gives the verdict). Its URL is still readable: on another
+ * page than the run's own it is the user's, preserved at once. Otherwise, in the tab this browser
+ * session created for the leg, it is woken once (reloaded in the background, as activating it would)
+ * so its page answers on a later tick within the same ownership wait; a tab that cannot be woken is
+ * preserved after the wait. A frozen tab is not this (it keeps its page): see forceCloseFixTab. */
+async function releaseDiscardedTab(job, provider, jobs, tab) {
+  const state = job.states[provider];
+  const known = state.conversation || answeredPage(state, provider);
+  if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", undefined, "navigated");
+  cleanupWaiting(job, provider, "tab_discarded");
+  if (!state.wokeDiscardedTab && await tabCreatedForLeg(job, provider, tab.id)) {
+    state.wokeDiscardedTab = true;
+    await saveJobs(jobs);
+    try { await chrome.tabs.reload(tab.id); } catch { /* still discarded: preserved after the wait */ }
+  }
+  return waitOrPreserveFixTab(job, provider, jobs, "the discarded tab could not answer; tab preserved", undefined, "unreachable");
+}
+
 /** The ownership verdict in a page reply: a verdict reply (ownership) as is; a cancel reply of an
  * earlier page by its `owned`; an older page's review can-close by canClose / reason. A fix page
  * always states its verdict: a fix can-close without one is not permission to close. */
@@ -861,9 +881,10 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   // A fix whose run failed (quota, an error) has no answer to show for it either: its page is asked
   // with the cancel exit too (it also stops whatever that run still does).
   const cancelled = abandonedLeg(job, state) || (job.kind === "fix" && state.outcome?.ok !== true);
+  if (tab.discarded === true || tab.status === "unloaded") return releaseDiscardedTab(job, provider, jobs, tab);
   if (tab.status && tab.status !== "complete") {
-    // A loading or discarded tab cannot answer for itself (and is not woken up to do so).
-    cleanupWaiting(job, provider, tab.discarded || tab.status === "unloaded" ? "tab_discarded" : "tab_loading");
+    // A loading tab cannot answer for itself yet: asked again next tick.
+    cleanupWaiting(job, provider, "tab_loading");
     return waitOrPreserveFixTab(job, provider, jobs, "the tab never finished loading; tab preserved", undefined, "unreachable");
   }
   if (tab.frozen === true) {

@@ -458,6 +458,28 @@ test('sweep: a forgotten ("missing") undispatched leg never closes the user\'s b
  assert.deepEqual(w.b.closedTabs,[]);
  assert.equal(w.b.messages.some(m=>m.undispatched===true),false);
 });
+// A background tab Chrome discarded while it waited (job 649: attachments_waiting for 10+ minutes)
+// holds no page. It is woken once (the tab this browser session created, still on its page) and its
+// reloaded page gives the verdict: what the provider keeps across a reload is still respected.
+for(const kind of ['review','fix'])for(const [name,restored,closed] of [['the reloaded temporary chat is blank: closed','',[10]],['the provider restores a draft on reload: preserved','my restored question',[]]])test(`worker, ${kind}: a cancelled leg's discarded tab is woken once: ${name}`,async t=>{
+ const tab=await chatTab(t,{kind,composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
+ const w=wire(tab,{kind});
+ await w.tick();await tab.page.clock.runFor(1000);
+ assert.equal((await tab.runner()).running,true,'waiting for its attachment upload');
+ // Chrome discards the tab: the worker sees only its URL and status until it is loaded again.
+ Object.assign(w.b.tabs.get(10),{status:'unloaded',discarded:true});
+ Object.assign(tab.served,{composer:restored,uploading:false,sendDisabled:false});
+ const reloads=[];
+ w.b.chrome.tabs.reload=async id=>{reloads.push(id);Object.assign(w.b.tabs.get(id),{discarded:false,status:'loading'});await tab.reload();};
+ w.server.value='cancelled';
+ await w.tick({syncUrl:false});
+ assert.deepEqual(reloads,[10],'woken once');assert.deepEqual(w.b.closedTabs,[]);
+ w.b.tabs.get(10).status='complete';
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,closed);assert.equal(w.state(),undefined,'the job retired');
+ assert.deepEqual(reloads,[10]);
+ assert.equal(await tab.clicks(),0,'the cancelled prompt is never sent from the woken page');
+});
 test('worker: a cancelled leg whose page could not be reached before the server forgot the job ("missing") still closes',async t=>{
  const tab=await generatingTab(t);
  const w=wire(tab);

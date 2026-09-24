@@ -254,11 +254,15 @@ fixAgent: {
 
 - **기본값(안전 우선):** `enabled: false` · `provider` 없음(루프·fix 항목 없음) · `delivery: "script-apply"` ·
   `mode: "suggest"` · `parallelPrs`는 bridge capacity 내. → 명시적으로 켜야 자동 수정이 돈다.
-- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인). `local`은
+- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인; grok은 fix 미연결). `local`은
   `script-apply`(grokbot `qwen_openai_edit.py` 재사용). `coding-agent`는 `coding-agent`.
 - **권한:** 어떤 provider든 push하려면 §2의 write-권한 게이트를 통과해야 한다. `apply` 모드는 명시적으로만.
+- **채팅 fix provider는 ChatGPT(임시 채팅)뿐:** fix 탭은 항상 `https://chatgpt.com/?temporary-chat=true`에서 열리고,
+  이 URL은 전송 후에도 바뀌지 않으므로 전송 시점 대화를 이후 모든 결정에서 비교할 수 있다. `grok`은 fix provider로
+  연결돼 있지 않다(전송 후 URL이 바뀔 수 있음): 설정 검증·Settings 화면·런타임 모두 "grok is not supported as a fix
+  provider yet"로 거부하고, 저장된 `{provider:"grok", enabled:true}`는 OFF로 로드된다. Grok **리뷰**는 그대로다.
 
-**채팅 fix 전송(구현, `bridge-fix.server.ts`):** `chatgpt`/`grok` + `script-apply`는 harbor Job이 아니라 bridge의
+**채팅 fix 전송(구현, `bridge-fix.server.ts`):** `chatgpt` + `script-apply`는 harbor Job이 아니라 bridge의
 **fix 항목**으로 간다(harbor Job은 PR별 supersede·리뷰 JSON 검증을 하므로 fix 답변을 거부/재작성한다). 확장이
 채팅 탭에 프롬프트를 붙여 넣고 **답변 전문(텍스트)**을 돌려주면, 파싱은 서버가 결정적으로 한다(`fix-apply`).
 - **fix 탭은 증명된 성공 경로에서만 닫는다:** 답변이 전달(서버 ACK)되었고, 닫는 시점에 페이지의 complete 단계

@@ -1,6 +1,7 @@
 /**
  * Chrome-bridge FIX work items — the chat transport of the review-loop fix agent for the
- * chatgpt / grok providers (design §6 mechanism A, script-apply).
+ * chatgpt provider (design §6 mechanism A, script-apply). ChatGPT only: a fix tab opens on its
+ * temporary chat, whose URL never changes; grok is not a fix provider (settings-rules FIX_PROVIDER_CAPS).
  *
  * WHY not a harbor Job: harbor jobs carry the REVIEW lifecycle (awaiting_chat → validator →
  * posting), supersede per PR (a fix would cancel the review that asked for it) and every bridge
@@ -106,7 +107,7 @@
 import { createHash } from "node:crypto";
 import { createdBefore, nextCreationSeq } from "./creation-seq.ts";
 
-export type FixChatProvider = "chatgpt" | "grok";
+export type FixChatProvider = "chatgpt";
 export type FixItemState = "queued" | "claimed" | "done" | "failed" | "cancelled";
 /** How a lease hand-out relates to the prompt (LIFECYCLE above): fresh = submit it in a new tab;
  * replay = the same fresh delivery again (its take response was lost); resume = the run already
@@ -238,8 +239,8 @@ const minutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 
 /** Why a request cannot be queued at all (undefined = acceptable). Never echoes the prompt. */
 function requestProblem(req: FixRequest, maxChars: number): string | undefined {
-  if (req?.provider !== "chatgpt" && req?.provider !== "grok") {
-    return `fix provider ${String(req?.provider)} is not a Chrome bridge provider (chatgpt | grok)`;
+  if (req?.provider !== "chatgpt") {
+    return `fix provider ${String(req?.provider)} is not a Chrome bridge fix provider (chatgpt only)`;
   }
   if (typeof req.owner !== "string" || !req.owner || typeof req.repo !== "string" || !req.repo || !Number.isSafeInteger(req.pr) || req.pr < 1) {
     return "fix request needs owner, repo and a PR number";

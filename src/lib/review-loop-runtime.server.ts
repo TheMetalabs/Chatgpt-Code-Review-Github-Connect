@@ -42,7 +42,8 @@
  *
  * FIX TRANSPORT (requestFix → the answer TEXT; this module parses it via runFixRound):
  *   - local: one OpenAI-compatible chat request;
- *   - chatgpt / grok: one Chrome-bridge fix item per PR (bridge-fix.server.ts) — the extension
+ *   - chatgpt: one Chrome-bridge fix item per PR (bridge-fix.server.ts; grok is not a fix
+ *     provider, settings-rules FIX_PROVIDER_CAPS) — the extension
  *     types the prompt into a chat tab and hands back the full answer. A newer request for the
  *     PR supersedes the older; a deadline (fixAgent.chatTimeoutMs, default 30 min) and an
  *     inline-prompt ceiling (fixAgent.chatMaxPromptChars, default 100k chars) turn a stuck
@@ -90,7 +91,7 @@ import {
 } from "./review-loop.ts";
 import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
 import { fixKnob, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
-import { WIRED_FIX_DELIVERIES, fixDeadline, fixLoopOn, fixProviderCaps, fixReportsActivity } from "./settings-rules.ts";
+import { WIRED_FIX_DELIVERIES, fixDeadline, fixLoopOn, fixProviderCaps, fixProviderUnsupported, fixReportsActivity } from "./settings-rules.ts";
 
 export interface PullHead extends LoopPrInfo {
   ref: string;
@@ -245,7 +246,7 @@ function roundCap(settings: BotSettings): number {
  * capability table (settings-rules FIX_PROVIDER_CAPS), never from another provider's knob. Local:
  * fixAgent.timeoutMs (default 60 min, clamped to [1 min, 6 h]), counted from the FIRST output
  * (queue time excluded — the local LLM serializes reviews and fixes); past it the call is aborted:
- * request-failed → retry → a fixed fix-failed handoff, never a silent wait. chatgpt/grok report no
+ * request-failed → retry → a fixed fix-failed handoff, never a silent wait. chatgpt reports no
  * activity, so the watcher times them from send; the bridge item carries its own deadline
  * (fixAgent.chatTimeoutMs) and the watcher waits a margin past it, so the bridge's deadline is the
  * terminal one and neither the local-LLM deadline nor its queue ceiling touches a chat fix. */
@@ -517,7 +518,7 @@ let productionGh: LoopRuntimeGithub | undefined;
 export type BridgeFixLoader = () => Promise<{ requestBridgeFix(request: FixRequest): Promise<string> }>;
 
 /**
- * chatgpt / grok fix transport: one Chrome-bridge fix item for this PR. Resolves with the chat's
+ * chatgpt fix transport: one Chrome-bridge fix item for this PR. Resolves with the chat's
  * full answer text; rejects (→ request-failed → retry → ESCALATE) on failure, deadline,
  * supersession or an oversized prompt. Only script-apply is wired: a "chat-push" configuration
  * (the tab commits by itself) must not silently become a server-side apply.
@@ -530,7 +531,7 @@ export const CHAT_FIX_FENCE_RULE =
 export async function requestChatFix(
   settings: BotSettings,
   ref: PrRef,
-  provider: "chatgpt" | "grok",
+  provider: "chatgpt",
   prompt: string,
   opts: { signal?: AbortSignal; loadBridge?: BridgeFixLoader } = {},
 ): Promise<string> {
@@ -543,7 +544,7 @@ export async function requestChatFix(
 }
 
 /** Production provider routing (productionDeps' requestFix). local is a plain request/response;
- * chatgpt/grok go through the Chrome bridge's fix registry (NOT the review awaiting_chat
+ * chatgpt goes through the Chrome bridge's fix registry (NOT the review awaiting_chat
  * lifecycle) and come back as the same kind of answer text. The watcher's abort signal reaches
  * both, so an abandoned fix cancels its bridge item and the extension stops its run (the tab is
  * preserved, never closed on a cancel). */
@@ -552,11 +553,9 @@ export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { 
     const provider = settings.fixAgent.provider;
     const transport = fixProviderCaps(provider).transport;
     if (transport === "chrome-bridge") {
-      return requestChatFix(settings, ref, provider as "chatgpt" | "grok", prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge });
+      return requestChatFix(settings, ref, "chatgpt", prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge });
     }
-    if (transport !== "local-llm") {
-      throw new Error(`fix provider ${provider} not wired yet (local, chatgpt, grok)`);
-    }
+    if (transport !== "local-llm") throw new Error(fixProviderUnsupported(provider));
     const local = await import("./local-chat-request.server.ts");
     const llm = await import("./local-llm.server.ts");
     return local.requestLocalChat(

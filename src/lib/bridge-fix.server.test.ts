@@ -566,7 +566,9 @@ describe("bridge fix registry: request validation", () => {
 
   it("a non-bridge provider, a missing PR or an empty prompt is rejected up front", async () => {
     const h = harness();
-    await assert.rejects(h.reg.request({ ...REQ, provider: "local" as never }), /not a Chrome bridge provider/);
+    await assert.rejects(h.reg.request({ ...REQ, provider: "local" as never }), /not a Chrome bridge fix provider/);
+    // grok is not a fix provider (settings-rules FIX_PROVIDER_CAPS): the registry never queues one
+    await assert.rejects(h.reg.request({ ...REQ, provider: "grok" as never }), /fix provider grok is not a Chrome bridge fix provider \(chatgpt only\)/);
     await assert.rejects(h.reg.request({ ...REQ, pr: 0 }), /needs owner, repo and a PR number/);
     await assert.rejects(h.reg.request({ ...REQ, repo: "" }), /needs owner, repo and a PR number/);
     await assert.rejects(h.reg.request({ ...REQ, prompt: "  " }), /empty fix prompt/);

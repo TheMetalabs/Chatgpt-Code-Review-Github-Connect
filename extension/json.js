@@ -443,14 +443,18 @@ function conversationIdentity(href) {
  * is (the user can move in-page while the old DOM is still rendered), and neither provider's DOM
  * ties a conversation id to the sent turn or its response (both expose only per-message ids). A
  * journal without it (legacy, recorded before this rule, or a confirmation seen only after a
- * reload) is `identity:"unestablished"` for good: never harvested, never closed. A fix whose page
- * changes URL after the send (a bare new-chat root the provider later names /c/<id>) is
- * `identity:"changed"`. Fix tabs open on a page whose identity never changes (ChatGPT:
- * `/?temporary-chat=true`). Persisted with the journal (sessionStorage), so it survives a reload. */
+ * reload) is `identity:"unestablished"` for good: never harvested, never closed. The fix provider
+ * is ChatGPT only, and a fix tab always opens on its temporary chat (fixChatPage), whose URL never
+ * changes: a send-time identity that is not that page (a fix sent anywhere else) is
+ * `unestablished` too. Persisted with the journal (sessionStorage), so it survives a reload. */
 
-/** Whether the page still shows the conversation its fix was bound in. Not established = false. */
+/** The only conversation a fix run can be proven in: ChatGPT's temporary chat, the page every fix
+ * tab is opened on (background.js providerUrl). Its URL never changes after the send. */
+function fixChatPage() { return "https://chatgpt.com/?temporary-chat=true"; }
+
+/** Whether the page still shows the conversation its fix was bound in. */
 function fixConversationHolds(submission) {
-  return Boolean(submission?.conversation) && submission.conversation === conversationIdentity(globalThis.location?.href);
+  return submission?.conversation === fixChatPage() && conversationIdentity(globalThis.location?.href) === fixChatPage();
 }
 
 /** The send-time conversation of this page's fix run ("" when none is established or readable). */
@@ -523,7 +527,7 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   // The rendered turn proves its content only. An in-page (SPA) move to another conversation can
   // leave this DOM on screen under the new URL: the proof holds only in the conversation recorded
   // when the send was proven (composer.js submissionConfirmed); a journal without one never gains it.
-  if (!submission.conversation) return verdict("unknown", "unestablished", {identity: "unestablished"});
+  if (submission.conversation !== fixChatPage()) return verdict("unknown", "unestablished", {identity: "unestablished"});
   if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
   if (answered) {
     const stored = completion || storedFixCompletion(state);

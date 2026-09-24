@@ -10,7 +10,9 @@ import {content, background, storage, flush, until, source} from './helpers.mjs'
 const PARTS = ['I guarded the null path.', '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'];
 // A fix is read from the answer's fenced code only (literal text; see assistantCodeBlocks).
 const ANSWER = PARTS[1];
-const URL_FIX = 'https://chatgpt.com/c/fix';
+// ChatGPT's temporary chat: the page every fix tab opens on (background.js providerUrl), whose URL
+// never changes; a fix is proven only there (json.js fixChatPage).
+const URL_FIX = 'https://chatgpt.com/?temporary-chat=true';
 const run = (extra = {}) => ({type: 'ashlar-run', jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', kind: 'fix', prompt: 'FIX PROMPT', ...extra});
 const msg = (type, extra = {}) => ({type, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', kind: 'fix', ...extra});
 
@@ -247,7 +249,7 @@ test('worker: fix items skip observation/capture/repair lanes; the same page sta
 // whose page proves the close (control). Every other cell: the tab is never removed, its managed
 // slot is released (the page is told when it can be messaged, and the worker's preserved-run record
 // keeps the binding out of the capacity count either way) and the job retires.
-const TEMP = 'https://chatgpt.com/?temporary-chat=true'; // providerUrl: the page every fix tab opens on
+const TEMP = URL_FIX;
 const ANSWER_OUTCOME = {ok: true, raw: ANSWER, originalText: ANSWER, completion: {responseId: 'response-A', context: TEMP}};
 const cancelledPing = status => async (_path, body) => body?.action === 'ping'
   ? {ok: true, active: false, accepted: false, status, bridge: {captureProtocol: 1, localJsonRepairEnabled: false}} : {ok: true, job: null};
@@ -356,6 +358,22 @@ test('worker: take opts into fix items, and a kind:fix payload runs with its kin
   const started = b.messages.find(m => m.type === 'ashlar-run');
   assert.equal(started.kind, 'fix');assert.equal(started.jobId, 'fix-A');assert.equal(started.prompt, 'FIX PROMPT');
   assert.equal(b.local.state.pendingReviewJobs['fix-A'].kind, 'fix');
+  // the fix tab opens on ChatGPT's temporary chat, the only page a fix can be proven in
+  assert.deepEqual([...b.tabs.values()].map(tab => tab.url), [URL_FIX]);
+});
+
+test('page: a fix whose send-time conversation is not the temporary chat is never collected: its run ends (taken_over)', async () => {
+  for (const where of ['https://chatgpt.com/c/fix', 'https://chatgpt.com/', 'https://chatgpt.com/?temporary-chat=false']) {
+    const p = page();
+    // the page shows exactly the conversation the send was proven in, but it is not the temporary chat
+    p.c.context.location = {href: where};
+    const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: where};
+    Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    await assert.rejects(p.c.context.waitUntilFixOrQuota('ChatGPT'), error => error.code === 'taken_over' && /cannot be identified/.test(error.message), where);
+    assert.equal(p.state().nativeCompletion, undefined, `${where}: nothing collected`);
+    assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, `${where}: the slot is freed`);
+  }
 });
 
 // Review round 11 (4096523047): the server hands a claimed, run-less fix to its own profile again

@@ -243,7 +243,7 @@ test(`real DOM: ashlar-fix-cancel on a ${name} fix page releases the slot and st
 // that names no conversation until the provider assigns one.
 const CONV_URL='https://chatgpt.com/c/fix-conv',OTHER_URL='https://chatgpt.com/c/users-own-conv';
 const TEMP_URL='https://chatgpt.com/?temporary-chat=true',NEW_URL='https://chatgpt.com/';
-async function conversationPage(t,kind,{url=CONV_URL,jobId=kind==='fix'?'fix-A':'job-A',sent='click',gated=false,userId='user-A',body=`<p>Here.</p><pre><code>${'{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["x"],"summary":"s","files":[]}'}</code></pre>`}={}){
+async function conversationPage(t,kind,{url=kind==='fix'?TEMP_URL:CONV_URL,jobId=kind==='fix'?'fix-A':'job-A',sent='click',gated=false,userId='user-A',body=`<p>Here.</p><pre><code>${'{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["x"],"summary":"s","files":[]}'}</code></pre>`}={}){
  const page=await browser.newPage();t.after(()=>page.close());
  const turns=`<section data-testid="conversation-turn-1"><div data-message-author-role="user"${userId?` data-message-id="${userId}"`:''}>fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${body}</div></div></section>`;
  const html=sent==='click'
@@ -296,7 +296,8 @@ function wiredWorker(page,serverStatus){
  const sync=()=>{b.tabs.get(10).url=page.url();};
  return {b,sync,state:()=>b.local.state.pendingReviewJobs['fix-A']?.states.chatgpt};
 }
-for(const url of [CONV_URL,TEMP_URL])for(const moved of [true,false]){
+for(const moved of [true,false]){
+const url=TEMP_URL; // a fix tab always opens on the temporary chat
 test(`real DOM: a cancelled fix ${moved?'whose tab moved in-page from '+url+' to another conversation (old DOM still rendered)':'still in its bound conversation '+url} is preserved, never closed`,async t=>{
  const {page,send,journal,move}=await conversationPage(t,'fix',{url});
  const server={value:'awaiting_chat'};
@@ -320,43 +321,14 @@ test(`real DOM: a cancelled fix ${moved?'whose tab moved in-page from '+url+' to
 test('real DOM: a fix whose tab moved away from its bound conversation ends at once, stays ended after moving back; the recorded identity is never replaced',async t=>{
  const {page,send,journal,move}=await conversationPage(t,'fix');
  await move(OTHER_URL);await page.clock.runFor(1600); // the collector sees the exact turn under another URL
- assert.equal((await journal()).conversation,CONV_URL,'the send-time identity is never re-recorded');
+ assert.equal((await journal()).conversation,TEMP_URL,'the send-time identity is never re-recorded');
  const ended=await send('ashlar-harvest');
  assert.equal(ended.code,'taken_over','the run ended now, not at the fix deadline');
  assert.equal((await send('ashlar-tab-status')).released,true,'its managed slot is freed');
- await move(CONV_URL);
+ await move(TEMP_URL);
  assert.equal((await send('ashlar-can-close')).reason,'repurposed','moving back does not hand the tab to the ended run');
  assert.equal((await send('ashlar-harvest')).code,'taken_over');
- assert.equal((await journal()).conversation,CONV_URL,'recorded once, never replaced');
-});
-
-// Ashlar 4096068011: a fix sent from a bare new-chat page is never re-identified by a location. The user
-// can open another existing conversation before the provider assigns one (the old DOM stays on
-// screen), and nothing in either provider's DOM ties a conversation id to the sent turn or its
-// response, so a later URL is unknown: never harvested, never closed, preserved on cancel.
-test('real DOM: a fix sent from a bare new-chat page that moves to another conversation is never re-identified, harvested or closed',async t=>{
- const {page,send,journal,move,complete,harvest}=await conversationPage(t,'fix',{url:NEW_URL});
- assert.equal((await journal()).conversation,NEW_URL,'bound on a page that names no conversation yet');
- const server={value:'awaiting_chat'};
- const {b,sync,state}=wiredWorker(page,server);
- await b.tick();
- assert.equal(state().conversation,NEW_URL);
- // the user opens one of their own conversations before any provider-assigned URL was observed
- await move(OTHER_URL);sync();await page.clock.runFor(1600);
- assert.equal((await journal()).conversation,NEW_URL,'never re-identified as the conversation the user moved to');
- await complete();await page.clock.runFor(3200); // the lingering DOM completes there
- assert.notEqual((await harvest()).ok,true,'not harvested outside its send-time conversation');
- const closing=await send('ashlar-can-close');
- assert.equal(closing.canClose,false);
- await b.tick();
- // Round 11: the move is a permanent verdict, so the run ended at once (taken_over) and the worker
- // delivered it as a failure right away instead of waiting for the fix deadline.
- assert.match(b.calls.find(c=>c.action==='failure')?.error||'',/^taken_over: /);
- assert.equal(b.calls.some(c=>c.action==='complete'),false,'no answer is delivered');
- assert.deepEqual(b.closedTabs,[],'preserved, never closed');
- assert.equal(state(),undefined,'the ended fix leg retired');
- assert.equal((await journal()).conversation,NEW_URL,'still never re-identified');
- assert.equal((await send('ashlar-tab-status')).released,true,'the preserved tab frees its managed slot');
+ assert.equal((await journal()).conversation,TEMP_URL,'recorded once, never replaced');
 });
 
 // Round 13 (Ashlar 4099207116): a fix's conversation identity is a fact of the moment its send is
@@ -368,17 +340,19 @@ test('real DOM: a fix sent from a bare new-chat page that moves to another conve
 //  - click: the send is confirmed on this page, which records its conversation (control when unmoved);
 //  - legacy: a sent journal with no conversation (recorded before this rule);
 //  - reload: the click belonged to an earlier page; this page confirms the send only after a reload;
-//  - root: sent from a bare new-chat root, which the provider later names /c/<id> (a change: the
-//    identity recorded at send is the root; ChatGPT fix tabs open on the temporary chat instead,
-//    whose URL never changes).
+//  - root / conversation: sent anywhere but the temporary chat (a bare new-chat root, an existing
+//    conversation): a fix tab always opens on the temporary chat, whose URL never changes, so a
+//    send-time identity that is not that page is unknown for good, even where the page never moved.
 const SEND_IDENTITY_ROWS=[
  {sent:'click',url:TEMP_URL,moveTo:null,recorded:TEMP_URL,owned:true},
  {sent:'click',url:TEMP_URL,moveTo:OTHER_URL,recorded:TEMP_URL,owned:false},
  {sent:'click',url:CONV_URL,moveTo:OTHER_URL,recorded:CONV_URL,owned:false},
+ {sent:'click',url:CONV_URL,moveTo:null,recorded:CONV_URL,owned:false,name:'conversation'},
  {sent:'legacy',url:TEMP_URL,moveTo:null,recorded:undefined,owned:false},
  {sent:'legacy',url:TEMP_URL,moveTo:OTHER_URL,recorded:undefined,owned:false},
  {sent:'reload',url:TEMP_URL,moveTo:null,recorded:undefined,owned:false},
  {sent:'reload',url:TEMP_URL,moveTo:OTHER_URL,recorded:undefined,owned:false},
+ {sent:'click',url:NEW_URL,moveTo:null,recorded:NEW_URL,owned:false,name:'root'},
  {sent:'click',url:NEW_URL,moveTo:CONV_URL,recorded:NEW_URL,owned:false,name:'root'},
 ];
 for(const row of SEND_IDENTITY_ROWS){
@@ -586,14 +560,19 @@ for(const when of ['generating','collected']){
  }
 }
 
-/** The conversation a send confirmed on a setContent page records (composer.js submissionConfirmed):
- * such a page is about:blank for its whole life. */
-const SENT_HERE='about:blank';
+/** The conversation a fix's send records (composer.js submissionConfirmed): a fix page is served at
+ * ChatGPT's temporary chat, the only page a fix can be proven in (json.js fixChatPage). */
+const SENT_HERE=TEMP_URL;
+/** Put `html` on the page at the temporary-chat URL (a fix page; setContent would be about:blank). */
+async function setFixContent(page,html){
+ await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',body:`<html><body>${html}</body></html>`}));
+ await page.goto(TEMP_URL);
+}
 /** A fix run's page: this run's user turn (user-A) and an assistant response (response-A) with
  * `inner`, plus its submission journal (`journal` null = none yet). */
 async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:SENT_HERE},{done=true}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
- await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${inner}</div></div>${done?'<button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button>':''}</section></main>${done?'':stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
+ await setFixContent(page,`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${inner}</div></div>${done?'<button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button>':''}</section></main>${done?'':stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
  await page.evaluate(journal=>{
   const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],...(journal?[['ashlar:submission:fix-A:run-A',JSON.stringify(journal)]]:[])]);
   window.__saved=saved;
@@ -611,9 +590,11 @@ async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',basel
 // bridge-lease-conformance.test.mjs). A shared cell asserts one outcome for both kinds; an intended
 // difference asserts each kind's documented outcome.
 const KIND_ANSWER='{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["fixture checked"],"summary":"s","files":[]}';
-async function kindPage(t,kind,{done=true,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:SENT_HERE},extra=''}={}){
+async function kindPage(t,kind,{done=true,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:kind==='fix'?SENT_HERE:'about:blank'},extra=''}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
- await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here.</p><pre><code>${KIND_ANSWER}</code></pre></div></div>${done?toolbar:''}</section></main>${done?'':stop}${extra}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
+ const html=`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here.</p><pre><code>${KIND_ANSWER}</code></pre></div></div>${done?toolbar:''}</section></main>${done?'':stop}${extra}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`;
+ // a fix page is served at the temporary chat (the only page a fix is proven in); a review page is unchanged
+ await (kind==='fix'?setFixContent(page,html):page.setContent(html));
  await page.evaluate(journal=>{
   const saved=new Map([['ashlar:job','job-A'],['ashlar:run','run-A'],...(journal?[['ashlar:submission:job-A:run-A',JSON.stringify(journal)]]:[])]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
@@ -700,7 +681,7 @@ test('real DOM: a fix is harvested only from the response bound to its own sent 
  // the same page once the journal binds this run's turn: its response is the answer
  const page=await fixPage(t,unrelated,{phase:'attempted',expected:'fix prompt',baseline:0});
  await page.clock.runFor(3200);
- await page.evaluate(()=>window.__saved.set('ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:'about:blank'})));
+ await page.evaluate(()=>window.__saved.set('ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})));
  await page.clock.runFor(3200);
  assert.equal((await page.evaluate(()=>window.fixOut)).raw,code);
 });
@@ -763,7 +744,7 @@ test('real DOM: a stale hidden <code> inside a visible block is never read; the 
 test('real DOM: a completed fix with prose around its fence still proves its own tab (can close)',async t=>{
  const code='{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
- await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here is the fix.</p><pre><code>${code}</code></pre></div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
+ await setFixContent(page,`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here is the fix.</p><pre><code>${code}</code></pre></div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
  await page.evaluate(()=>{
   const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})]]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});

@@ -664,6 +664,19 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     assert.equal(f.attempts(), 1);
   });
 
+  it("the ambiguity ledger never evicts an unresolved entry: 600 later unknown writes cannot re-enable a POST", async () => {
+    const f = flaky(["unknown"], false, true); // every POST outcome unknown, every list scan stale
+    const first = await now(f, 1000);
+    assert.equal(first.escalated, false);
+    assert.equal(first.ambiguous, true);
+    for (let pr = 1001; pr <= 1600; pr++) await now(f, pr); // 600 more distinct ambiguous keys
+    assert.equal(f.attempts(), 601);
+    const again = await now(f, 1000); // redelivery of the first one
+    assert.equal(again.escalated, false);
+    assert.equal(again.ambiguous, true, "still reported ambiguous");
+    assert.equal(f.attempts(), 601, "the first key's POST count stays one");
+  });
+
   it("an unknown write outcome whose handoff becomes visible resolves without another POST", async () => {
     const f = flaky(["unknown", "ok"]);
     assert.deepEqual(await now(f, 16), { escalated: false });

@@ -191,23 +191,18 @@ export function rememberPosted(client: object, key: string, now: number = Date.n
 
 // Control writes whose outcome is UNKNOWN (they may have landed) and that no list has shown yet —
 // a ledger SEPARATE from the confirmed-posted cache above, so "maybe posted" is never read as
-// "posted". No time-based expiry (a stale list after a day must still not trigger a second POST):
-// bounded by count, oldest evicted, and an entry is cleared once the matching row is actually seen
-// in a list scan. An entry may carry a synthetic LoopEvent the session fold must honor meanwhile
+// "posted". No expiry and no size-based eviction (a stale list after a day, or after many other
+// ambiguous writes, must still not trigger a second POST): an entry leaves only when the matching
+// row is actually seen in a list scan. The ledger is therefore bounded by the number of unresolved
+// unknown-outcome control writes, each a small string key — rare in practice. An entry may carry a synthetic LoopEvent the session fold must honor meanwhile
 // (an ambiguous handoff ends the session in this process).
 const maybePostedByClient = new WeakMap<object, Map<string, { event?: LoopEvent }>>();
-const MAYBE_POSTED_MAX = 500;
 
 export function rememberAmbiguous(client: object, key: string, event?: LoopEvent): void {
   const ledger = maybePostedByClient.get(client) ?? new Map<string, { event?: LoopEvent }>();
   maybePostedByClient.set(client, ledger);
   const prev = ledger.get(key);
-  ledger.delete(key);
   ledger.set(key, { event: event ?? prev?.event });
-  for (const k of ledger.keys()) {
-    if (ledger.size <= MAYBE_POSTED_MAX) break;
-    ledger.delete(k);
-  }
 }
 
 export function ambiguousWrite(client: object, key: string): boolean {

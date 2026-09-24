@@ -466,9 +466,14 @@ function endedWhy(s: LoopSession): Exclude<Moot, "head" | "newer"> {
   return s.endedBy === "escalate" ? "handoff" : s.endedBy === "converged" ? "converged" : "stopped";
 }
 
-/** How an applied round's report ends: continued, the session ended meanwhile (why), or why the
- * next review could not be requested. */
-type ContinuationStatus = { ok: true } | { ok: false; ended: Exclude<Moot, "head"> } | { ok: false; error: string };
+/** How an applied round's report ends: continued, the session ended meanwhile (why), the
+ * continuation's outcome is UNKNOWN (it may have landed: not confirmed, not re-sent, no handoff),
+ * or why the next review could not be requested. */
+type ContinuationStatus =
+  | { ok: true }
+  | { ok: false; ended: Exclude<Moot, "head"> }
+  | { ok: false; unknown: true; error: string }
+  | { ok: false; error: string };
 
 function renderFixReport(
   res: FixRoundResult,
@@ -485,7 +490,9 @@ function renderFixReport(
     case "applied": {
       const tail = !continuation || continuation.ok
         ? "Loop continues: the next review is requested on the new head."
-        : "ended" in continuation
+        : "unknown" in continuation
+          ? `Continuation outcome unknown (${sanitizeModelText(continuation.error, { oneLine: true, max: 300 })}): the next review may or may not have been requested; it is not re-sent.`
+          : "ended" in continuation
           ? continuation.ended === "stopped"
             ? "Loop stopped by the operator: no further review is requested."
             : `The loop ended meanwhile (${MOOT_TEXT[continuation.ended]}): no further review is requested.`
@@ -1029,13 +1036,17 @@ export async function runPostReviewLoop(
         const c = await ensureContinuation(gh, token, ref, { head: newHead, mode, sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, round: rounds.length + 1, sleep });
         // An unknown outcome may have requested the review: never contradict it with a handoff.
         if (c.ambiguous) trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
-        status = c.posted || c.exists || c.ambiguous ? { ok: true } : { ok: false, error: c.error ?? "the continuation was not posted" };
+        status = c.ambiguous
+          ? { ok: false, unknown: true, error: c.error ?? OUTCOME_UNKNOWN }
+          : c.posted || c.exists
+            ? { ok: true }
+            : { ok: false, error: c.error ?? "the continuation was not posted" };
       }
       // The fixed signal (continuation above, or this handoff) goes out BEFORE the informational
       // replies and report: those are up to maxInlineComments slow calls that must never delay
       // the signal, or lose it to a crash midway.
       let handoff: LoopStepResult | undefined;
-      if (!status.ok && !("ended" in status)) {
+      if (!status.ok && !("ended" in status) && !("unknown" in status)) {
         const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
         handoff = await escalate("loop-error", `the fix was committed but the next review could not be requested: ${status.error}`, live);
         // No signal landed: mark no thread addressed (a later step or a human picks the session up).

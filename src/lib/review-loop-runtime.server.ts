@@ -1157,8 +1157,7 @@ export async function continueLoopOnPush(
         sleep: d.sleep,
         now: d.now,
       });
-      const tail = handoff.escalated ? "; handoff posted" : handoff.error ? `; handoff failed: ${handoff.error}` : "";
-      return { posted: false, reason: `continue on push failed: ${error}${tail}` };
+      return { posted: false, reason: `continue on push failed: ${error}${handoffTail(handoff)}`, ...(handoff.ambiguous ? { unresolved: true as const } : {}) };
     };
     switch (c.status) {
       case "posted":
@@ -1175,6 +1174,15 @@ export async function continueLoopOnPush(
   } catch (e) {
     return { posted: false, reason: `continue on push failed: ${(e as Error)?.message ?? String(e)}` };
   }
+}
+
+/** How the push handler's loop-error handoff ended, for its result. One that may have landed is
+ * UNKNOWN (the result is unresolved: logged), never "failed" — it is not re-sent, and it ends the
+ * session in this process. */
+function handoffTail(h: { escalated: boolean; ambiguous?: boolean; error?: string }): string {
+  if (h.escalated) return "; handoff posted";
+  if (h.ambiguous) return "; handoff outcome unknown (it may have landed; not re-sent)";
+  return h.error ? `; handoff failed: ${h.error}` : "";
 }
 
 type StartRequest = { owner: string; repo: string; pr: number; actor: string; mode: ReviewLoopMode; at: string };

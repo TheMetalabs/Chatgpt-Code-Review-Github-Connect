@@ -1,5 +1,5 @@
 /**
- * The control-write MATRIX (#79 K1): every way a control comment is written (9 entry paths over
+ * The control-write MATRIX (#79 K1): every way a control comment is written (11 entry paths over
  * the 4 control kinds) × what its POST did × what the list shows × what happens next, checked
  * against what the loop owes a human:
  *   I1 exactly once — a write that may have landed is never POSTed again (≤ 1 row);
@@ -68,7 +68,9 @@ type Via =
   | "continue:superseded"
   | "continue:moved-mid-round"
   | "handoff:stuck"
-  | "handoff:terminal";
+  | "handoff:terminal"
+  | "handoff:push-loop-error"
+  | "handoff:post-commit";
 type Write = "success" | "rejected" | "unknown-landed" | "unknown-lost";
 type List = "normal" | "lagging" | "failing";
 type Later = "redelivery" | "newer-start" | "same-second-start" | "25h" | "row-appears" | "push" | "moved";
@@ -89,6 +91,8 @@ const VIAS: Via[] = [
   "continue:moved-mid-round",
   "handoff:stuck",
   "handoff:terminal",
+  "handoff:push-loop-error",
+  "handoff:post-commit",
 ];
 const WRITES: Write[] = ["success", "rejected", "unknown-landed", "unknown-lost"];
 const LISTS: List[] = ["normal", "lagging", "failing"];
@@ -109,6 +113,19 @@ const CONTINUE_HEAD: Partial<Record<Via, string>> = {
   "continue:applied": NEW_SHA,
   "continue:superseded": LIVE,
   "continue:moved-mid-round": MOVED,
+};
+/** The head a handoff under test is for: the reviewed head, or — the loop-error handoff after a
+ * refused continuation — the pushed head (push handler) or the round's commit (post-commit). */
+const HANDOFF_HEAD: Partial<Record<Via, string>> = {
+  "handoff:stuck": HEAD,
+  "handoff:terminal": HEAD,
+  "handoff:push-loop-error": PUSHED,
+  "handoff:post-commit": NEW_SHA,
+};
+/** The continuation GitHub always refuses in a path whose write under test is the handoff after it. */
+const REFUSED_CONTINUATION: Partial<Record<Via, string>> = {
+  "handoff:push-loop-error": PUSHED,
+  "handoff:post-commit": NEW_SHA,
 };
 
 const finding: Finding = {
@@ -245,17 +262,19 @@ class World {
   }
 
   mode(): "suggest" | "apply" {
-    return this.cell.via === "continue:applied" ? "apply" : "suggest";
+    return this.cell.via === "continue:applied" || this.cell.via === "handoff:post-commit" ? "apply" : "suggest";
   }
 
   live(): string {
     if (this.pushedHead) return this.pushedHead;
     switch (this.cell.via) {
       case "continue:push":
+      case "handoff:push-loop-error":
         return PUSHED;
       case "continue:superseded":
         return LIVE;
       case "continue:applied":
+      case "handoff:post-commit":
         return this.committed ? NEW_SHA : HEAD;
       case "continue:moved-mid-round":
         return this.prompts.length > 0 ? MOVED : HEAD;
@@ -275,7 +294,7 @@ class World {
       case "continue":
         return controlKey({ kind: "continue", ref, head: CONTINUE_HEAD[this.cell.via]!, sessionIso: ALICE_AT });
       case "handoff":
-        return controlKey({ kind: "handoff", ref, head: HEAD, sessionIso: ALICE_AT });
+        return controlKey({ kind: "handoff", ref, head: HANDOFF_HEAD[this.cell.via]!, sessionIso: ALICE_AT });
     }
   }
 
@@ -291,7 +310,7 @@ class World {
       case "continue":
         return canonicalContinuation(body, bot)?.head === CONTINUE_HEAD[this.cell.via];
       case "handoff":
-        return parseEscalateMarker(body, bot)?.head === HEAD;
+        return parseEscalateMarker(body, bot)?.head === HANDOFF_HEAD[this.cell.via];
     }
   }
 
@@ -306,6 +325,8 @@ class World {
     const sentAt = this.clock;
     this.clock += 1_000; // GitHub stamps the row after the request left
     const at = this.sameSecond() ? second(sentAt) : iso(this.clock);
+    const refused = REFUSED_CONTINUATION[this.cell.via];
+    if (refused && canonicalContinuation(body, { authoredByBot: true })?.head === refused) throw writeError("rejected", 422);
     if (!this.underTestPost(body)) return this.store(BOT, body, at);
     if (this.underTest.length === 0) {
       this.firstAttemptMs = sentAt;
@@ -362,6 +383,7 @@ class World {
       case "stop:webhook":
         return stopLoop("t", { ...this.ref, actor: "bob", stopAt: iso(T0) }, s, this.deps, ENV);
       case "continue:push":
+      case "handoff:push-loop-error":
         return continueLoopOnPush("t", { ...this.ref, headSha: PUSHED, actor: "alice" }, s, this.deps, ENV);
       default:
         return runPostReviewLoop("t", job(this.pr), sample, s, this.deps, ENV);
@@ -407,9 +429,12 @@ function expectNextHead(c: Cell): Cls {
 
 // ── classification ──────────────────────────────────────────────────────────────
 
-function controlClass(r: ControlResult): string {
+function controlClass(w: World, r: ControlResult): string {
   const why = r.reason;
   if (/list 502/.test(why)) return "unreadable";
+  // the push handler's refused continuation: its result's tail is the loop-error handoff under test
+  const tail = /^continue on push failed: .*; handoff (posted|failed|outcome unknown)/.exec(why)?.[1];
+  if (w.cell.via === "handoff:push-loop-error" && tail) return tail === "posted" ? "posted" : tail === "failed" ? "rejected" : "unknown";
   if (why === "started" || why === "stopped" || why === "continued") return r.posted ? "posted" : `other: ${why}`;
   if (/already (recorded|continued)$/.test(why)) return "exists";
   if (why.startsWith(START_UNRESOLVED) || /outcome unknown/.test(why)) return "unknown";
@@ -434,14 +459,15 @@ function stepClass(w: World, r: LoopStepResult): string {
   if (r.ran) return `other: ${JSON.stringify(r)}`;
   const why = r.reason;
   if (/^loop step failed|could not be read/.test(why)) return "unreadable";
-  if (/^start failed|could not be requested|failed to post/.test(why)) return "rejected";
+  // before "rejected": a post-commit handoff's detail quotes the refused continuation
   if (why.startsWith(START_UNRESOLVED) || /outcome is unknown|handed off \(outcome unknown\)/.test(why)) return "unknown";
+  if (/^start failed|could not be requested|failed to post/.test(why)) return "rejected";
   if (why === SUPERSEDED || why === ALREADY_ESCALATED || why === NO_SESSION) return "resolved";
   return `other: ${why}`;
 }
 
 const isControl = (r: Result): r is ControlResult => "posted" in r;
-const classify = (w: World, r: Result): string => (isControl(r) ? controlClass(r) : stepClass(w, r));
+const classify = (w: World, r: Result): string => (isControl(r) ? controlClass(w, r) : stepClass(w, r));
 
 /** A step path's result collapses outcomes the cell distinguishes. */
 function norm(via: Via, e: Cls, when: "first" | "again"): Cls {
@@ -496,8 +522,10 @@ async function assertReadsOwnWrite(w: World): Promise<void> {
     assert.equal(r.ran, false, `I5: a step ran past the stop: ${JSON.stringify(r)}`);
     assert.equal(w.prompts.length, before, "I5: a fix was requested past the stop");
   } else if (via.startsWith("handoff:")) {
-    await w.enter(); // the same review again
+    await w.enter(); // the same review (or push) again
     if (write !== "rejected") assert.equal(w.prompts.length, before, "I5: a fix ran past the handoff");
+    const s = await w.session();
+    assert.equal(s.active, write === "rejected", `I5: the session read does not show this process's own handoff: ${JSON.stringify(s)}`);
   } else if (via.startsWith("continue:")) {
     const n = (await w.eventsOfWrite()).length;
     assert.equal(n, write === "rejected" ? 0 : 1, `I5: ${n} continue events for the head`);

@@ -10,6 +10,9 @@ export const REVIEW_SUMMARY_MARK = "<!-- ashlar-review-summary -->";
 
 /** Clean-pass review body. Loop scripts match this string. */
 export const CLEAN_REVIEW_BODY = "Didn't find any major issues.";
+/** First line of a verify-clean result whose local verification did not complete. Must never contain
+ * the CLEAN_REVIEW_BODY sentinel (case-insensitively): it is not a clean pass. */
+export const UNVERIFIED_CLEAN_REVIEW_BODY = "Chat found no major issues, but local verification did not complete — this is not a clean pass.";
 
 // Delimiters bracketing the verbatim salvaged reply inside a review body, so the public snapshot can
 // strip it (it may echo private PR source) while the full body still posts to the auth-gated PR.
@@ -116,10 +119,12 @@ Not a clean pass — remaining reviewers did not run.`;
     }
     // First line stays exactly CLEAN_REVIEW_BODY so the loop poller's partial match
     // still detects a clean pass; the appended sha lets it catch stale-clean reviews.
+    // An unverified clean result must NOT carry the sentinel: substring-based consumers would
+    // treat it as converged.
     const cov = job.coverage ?? [];
     const clearedCount = cov.filter((c) => c.status === "cleared").length;
     const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
-    return `${CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n${verifyLine}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0${job.localUnverified ? " unverified=1" : ""} -->`;
+    return `${job.localUnverified ? UNVERIFIED_CLEAN_REVIEW_BODY : CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n${verifyLine}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0${job.localUnverified ? " unverified=1" : ""} -->`;
   }
   const unanchoredBlock = unanchored.length
     ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored

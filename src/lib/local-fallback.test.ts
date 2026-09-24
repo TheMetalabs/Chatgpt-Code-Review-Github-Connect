@@ -128,14 +128,20 @@ describe("verify-clean local role", () => {
     assert.equal(releaseLocalAsFallback({ ...v, chatRacing: true, usableChat: true, chatStalled: true }), false, "a usable chat result is judged, not replaced");
   });
 
-  it("treats chat as stalled only with no progress past the bridge grace periods", () => {
-    const s = { chatProgress: false, connected: false, claimed: false, waitedMs: 0, connectedGraceMs: 120_000, claimGraceMs: 1_200_000 };
-    assert.equal(chatStalled(s), false, "within the disconnected grace");
-    assert.equal(chatStalled({ ...s, waitedMs: 120_000 }), true, "bridge offline past BRIDGE_CONNECTED_MS");
-    assert.equal(chatStalled({ ...s, waitedMs: 120_000, chatProgress: true }), false, "progress is never stalled");
-    assert.equal(chatStalled({ ...s, connected: true, waitedMs: 120_000 }), false, "connected: waits for the claim grace");
-    assert.equal(chatStalled({ ...s, connected: true, waitedMs: 1_200_000 }), true, "connected but never claimed");
-    assert.equal(chatStalled({ ...s, connected: true, claimed: true, waitedMs: 9_999_999 }), false, "claimed chat is still working");
+  it("treats chat as stalled only after the bridge has been disconnected past the grace (never by job age or claim lease)", () => {
+    const G = 120_000;
+    const s = { chatProgress: false, connected: false, disconnectedAt: 1_000_000, now: 1_000_000, graceMs: G };
+    assert.equal(chatStalled(s), false, "just disconnected: within the grace");
+    assert.equal(chatStalled({ ...s, now: 1_000_000 + G }), true, "disconnected past BRIDGE_CONNECTED_MS");
+    assert.equal(chatStalled({ ...s, now: 1_000_000 + G, chatProgress: true }), false, "progress is never stalled");
+    assert.equal(chatStalled({ ...s, disconnectedAt: undefined, now: 9_999_999_999 }), false, "unknown disconnect time never stalls");
+    // A connected bridge never releases local by time: past BRIDGE_CLAIM_MS, stale lease, or old job.
+    assert.equal(chatStalled({ ...s, connected: true, disconnectedAt: undefined, now: 1_000_000 + 20 * 60_000 + 1 }), false, "connected, no payload, past BRIDGE_CLAIM_MS");
+    assert.equal(chatStalled({ ...s, connected: true, disconnectedAt: 0, now: 9_999_999_999 }), false, "connected with a stale claim lease");
+    // Job older than the grace, but the bridge only just disconnected: waits for the disconnect itself.
+    const now = 5_000_000;
+    assert.equal(chatStalled({ ...s, disconnectedAt: now - 1, now }), false, "job age is not the basis");
+    assert.equal(chatStalled({ ...s, disconnectedAt: now - 1, now: now - 1 + G }), true);
   });
 
   it("decides what to post in each case", () => {

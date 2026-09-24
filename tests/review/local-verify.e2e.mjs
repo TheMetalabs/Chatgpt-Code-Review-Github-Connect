@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {appFixture,eventually} from './app-fixture.mjs';
 import {isZeroFindings,parseFindingsTotal} from '../../src/lib/review-loop.ts';
+import {CLEAN_REVIEW_BODY} from '../../src/lib/review-format.ts';
 // The review loop's real CONVERGED detector, reading a bot-authored review.
 const converged=body=>isZeroFindings(body,{authoredByBot:true});
 
@@ -20,6 +21,14 @@ async function setup(t,role='verify-clean',extra={}) {
   await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId)?.status==='awaiting_chat','snapshot not ready');
   const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
   return {app,jobId:out.jobId,job};
+}
+// An unverified clean result must not carry the clean sentinel: every substring-based clean detector
+// (review-loop.ts documents `"didn't find any major issues"` substring matching) must stay not-converged.
+function assertUnverifiedNotClean(body){
+  assert.match(body,/^Chat found no major issues, but local verification did not complete — this is not a clean pass\./);
+  assert.equal(body.toLowerCase().includes("didn't find any major issues"),false,'no clean sentinel (case-insensitive)');
+  assert.equal(body.toLowerCase().includes(CLEAN_REVIEW_BODY.toLowerCase()),false);
+  assert.equal(converged(body),false);
 }
 const settle=()=>new Promise(resolve=>setTimeout(resolve,150));
 
@@ -74,7 +83,7 @@ test('verify-clean: chat clean + local failure posts chat\'s clean result with t
   app.localResponses[0].writeHead(500,{'content-type':'application/json'});app.localResponses[0].end('{"error":"model crashed"}');
   await eventually(()=>app.reviews.length===1,'chat clean result was not posted after local failed');
   assert.equal(job().status,'posted');
-  assert.match(app.reviews[0].body,/^Didn't find any major issues\./);
+  assertUnverifiedNotClean(app.reviews[0].body);
   assert.match(app.reviews[0].body,/local verification did not complete \(/);
   assert.match(app.reviews[0].body,/ashlar-findings total=0 .*unverified=1 -->$/);
   assert.equal(parseFindingsTotal(app.reviews[0].body),0);
@@ -89,7 +98,7 @@ test('verify-clean: an unparseable local reply is no verification: chat\'s clean
   let answered=0;
   await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(reply('Looks fine to me, nothing structured here.'));return app.reviews.length===1;},'chat clean result was not posted after local replied unparseable');
   assert.equal(job().status,'posted');
-  assert.match(app.reviews[0].body,/^Didn't find any major issues\./,'the clean sentinel, not the raw-reply wrapper');
+  assertUnverifiedNotClean(app.reviews[0].body);
   assert.match(app.reviews[0].body,/local verification did not complete \(/);
   assert.match(app.reviews[0].body,/ashlar-findings total=0 .*unverified=1 -->$/);
   assert.equal(converged(app.reviews[0].body),false,'an unparseable verifier is no verification: never converged');
@@ -127,4 +136,19 @@ test('verify-clean: a Chrome bridge that stays offline releases local as the fal
   assert.match(app.reviews[0].body,/Skipped chatgpt/,'the offline chat reviewer stays visible');
   assert.doesNotMatch(app.reviews[0].body,/local verification/);
   assert.equal(app.harbor.hasLocalSample(jobId),false);
+});
+
+test('verify-clean: supersession frees a held job\'s local snapshot (terminal cleanup runs for every cancelled job)',async t=>{
+  const {app,jobId,job}=await setup(t);
+  let prev=jobId,prevJob=job;
+  for(let i=0;i<3;i++){
+    assert.equal(prevJob().status,'awaiting_chat');
+    assert.equal(app.harbor.hasLocalSample(prev),true,'held verify-clean job keeps its snapshot');
+    const out=await app.mention('verify-supersede-'+i);
+    await eventually(()=>prevJob().status==='cancelled','previous job was not superseded');
+    assert.match(prevJob().skipReason,/superseded by/);
+    assert.equal(app.harbor.hasLocalSample(prev),false,'superseded job leaked its local snapshot');
+    await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId)?.status==='awaiting_chat','new snapshot not ready');
+    const id=out.jobId;prev=id;prevJob=()=>app.harbor.getHarbor().jobs.find(j=>j.id===id);
+  }
 });

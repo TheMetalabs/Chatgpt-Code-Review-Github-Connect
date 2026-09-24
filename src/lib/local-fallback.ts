@@ -90,20 +90,20 @@ export function releaseLocalAsFallback(input: {
 }
 
 /** A held verify-clean chat leg that has made no progress (no payload, not generating) while the
- * bridge is disconnected past BRIDGE_CONNECTED_MS, or the job stayed unclaimed past BRIDGE_CLAIM_MS.
- * stillRacing treats `disconnected` as non-terminal, so without this the held local leg would never
- * be released and the review would never complete. */
+ * bridge has been disconnected for at least `graceMs`, measured from the moment it disconnected
+ * (never from job age). A connected bridge never releases local by time: BRIDGE_CLAIM_MS is an
+ * ownership lease, not a reviewer deadline. stillRacing treats `disconnected` as non-terminal, so
+ * without this the held local leg would never be released while the bridge is offline. */
 export function chatStalled(input: {
   chatProgress: boolean;
   connected: boolean;
-  claimed: boolean;
-  waitedMs: number;
-  connectedGraceMs: number;
-  claimGraceMs: number;
+  /** When the bridge disconnected (epoch ms); undefined when unknown. */
+  disconnectedAt?: number;
+  now: number;
+  graceMs: number;
 }): boolean {
-  if (input.chatProgress) return false;
-  if (!input.connected) return input.waitedMs >= input.connectedGraceMs;
-  return !input.claimed && input.waitedMs >= input.claimGraceMs;
+  if (input.chatProgress || input.connected || input.disconnectedAt === undefined) return false;
+  return input.now - input.disconnectedAt >= input.graceMs;
 }
 
 export type VerifyCleanStep =

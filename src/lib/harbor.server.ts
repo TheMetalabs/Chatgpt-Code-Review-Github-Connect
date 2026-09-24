@@ -396,6 +396,16 @@ async function bridgeSnapshot() {
   return getBridgePublic();
 }
 
+// First time this process observed a bridge that has never been seen (lastSeen 0) as disconnected.
+let bridgeNeverSeenSince: number | undefined;
+/** When the bridge went offline: lastSeen + BRIDGE_CONNECTED_MS (when `connected` flipped false), or,
+ * for a bridge never seen by this server, when that was first observed. Undefined while connected. */
+function bridgeDisconnectedAt(bridge: { connected: boolean; lastSeen: number }): number | undefined {
+  if (bridge.connected) return undefined;
+  if (bridge.lastSeen > 0) return bridge.lastSeen + BRIDGE_CONNECTED_MS;
+  return (bridgeNeverSeenSince ??= Date.now());
+}
+
 const WATCH_TICK_MS = 5_000;
 // Ceiling for the salvaged verbatim review posted in the body, under GitHub's 65,535-char review
 // limit with room for the summary scaffolding. Full originals are retained in review history.
@@ -459,10 +469,9 @@ async function watchReviewersLoop(jobId: string, token: string) {
     const stalled = localVerifies({ role, providers: job.reviewProviders ?? [] }) && chatStalled({
       chatProgress: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()) || (Boolean(bridge.connected) && chat.some((p) => job.generating?.[p])),
       connected: Boolean(bridge.connected),
-      claimed,
-      waitedMs: Date.now() - job.createdAt,
-      connectedGraceMs: BRIDGE_CONNECTED_MS,
-      claimGraceMs: BRIDGE_CLAIM_MS,
+      disconnectedAt: bridgeDisconnectedAt(bridge),
+      now: Date.now(),
+      graceMs: BRIDGE_CONNECTED_MS,
     });
     // Once local runs as that stalled chat's fallback, the job no longer waits on the offline chat leg
     // (it is reported as skipped); a chat result that still arrives first is merged as usual.
@@ -1416,6 +1425,8 @@ function enqueueFromDecision(
   for (const item of state.jobs) if (item.id === job.id || item.skipReason === `superseded by ${job.id}`) recordJobHistory(item);
   // Supersession is an explicit cancellation, not a timer.
   for (const previous of state.jobs) if (previous.status === "cancelled") localControllers.get(previous.id)?.abort();
+  // Supersession bypasses patchJob: run the same terminal cleanup so a held job's snapshot is freed.
+  for (const previous of state.jobs) if (previous.skipReason === `superseded by ${job.id}`) releaseLocalSampleIfTerminal(previous);
   // A superseded job's ops comment keeps its last "running" state and looks stuck
   // forever. Mark those comments terminal so a re-trigger doesn't leave a phantom
   // in-flight review. Best-effort — never blocks or fails the newly enqueued job.

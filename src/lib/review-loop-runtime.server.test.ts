@@ -14,6 +14,7 @@ import {
   loopEnabled,
   loopPostedReview,
   renderFindings,
+  fixGenerationMs,
   requestChatFix,
   runPostReviewLoop,
   SILENT_REASONS,
@@ -1552,5 +1553,20 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     const none = fakeDeps({ start: "apply", rounds: [2], threads });
     const r = await runWith(none, "apply", { ...postedReview, published: [] });
     assert.deepEqual(r, { ran: false, reason: "no findings (converged)" });
+  });
+});
+
+describe("fixGenerationMs: the bridge deadline governs a chat fix, never the local-LLM one", () => {
+  const MIN = 60_000;
+  it("local keeps ASHLAR_FIX_TIMEOUT_MS", () => {
+    assert.equal(fixGenerationMs("local", {} as NodeJS.ProcessEnv), 60 * MIN);
+    assert.equal(fixGenerationMs("local", { ASHLAR_FIX_TIMEOUT_MS: String(15 * MIN) } as NodeJS.ProcessEnv), 15 * MIN);
+  });
+
+  it("a chat fix waits a margin past the longer deadline", () => {
+    for (const provider of ["chatgpt", "grok"]) {
+      assert.equal(fixGenerationMs(provider, { ASHLAR_FIX_CHAT_TIMEOUT_MS: String(120 * MIN) } as NodeJS.ProcessEnv), 121 * MIN, provider);
+      assert.equal(fixGenerationMs(provider, { ASHLAR_FIX_TIMEOUT_MS: String(15 * MIN) } as NodeJS.ProcessEnv), 31 * MIN, "a low local deadline never undercuts the bridge's (default 30 min)");
+    }
   });
 });

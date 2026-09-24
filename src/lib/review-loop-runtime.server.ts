@@ -50,7 +50,7 @@
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import type { GitDataApi } from "./fix-commit.ts";
-import type { FixRequest } from "./bridge-fix.server.ts";
+import { fixChatTimeoutMs, type FixRequest } from "./bridge-fix.server.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
@@ -244,6 +244,20 @@ const DEFAULT_FIX_TIMEOUT_MS = 60 * 60_000;
 function fixTimeoutMs(env: NodeJS.ProcessEnv | undefined = envOf()): number {
   const n = Number(env?.ASHLAR_FIX_TIMEOUT_MS);
   return Number.isFinite(n) && n > 0 ? Math.min(6 * 60 * 60_000, Math.max(60_000, Math.floor(n))) : DEFAULT_FIX_TIMEOUT_MS;
+}
+
+/** Margin past a chat fix item's own deadline before the watcher gives up on it. */
+const CHAT_DEADLINE_MARGIN_MS = 60_000;
+
+/** The watcher's generation deadline for a fix provider. A chat fix (chatgpt/grok) reports no
+ * activity, so the watcher times it from send, queue time included; its bridge item carries its
+ * own deadline (ASHLAR_FIX_CHAT_TIMEOUT_MS, from request). The watcher waits a margin past the
+ * longer of the two, so the bridge's deadline governs and ASHLAR_FIX_TIMEOUT_MS (the local-LLM
+ * generation deadline) never cuts a chat fix short. */
+export function fixGenerationMs(provider: string | null | undefined, env: NodeJS.ProcessEnv | undefined = envOf()): number {
+  const local = fixTimeoutMs(env);
+  if (provider !== "chatgpt" && provider !== "grok") return local;
+  return Math.max(local, fixChatTimeoutMs(env)) + CHAT_DEADLINE_MARGIN_MS;
 }
 
 /** Backstop for the provider QUEUE (a request still queued past it is abandoned):
@@ -966,7 +980,7 @@ export async function runPostReviewLoop(
     // generated in full.
     const requestFix: RequestFix = (p) =>
       watchFixRequest((prompt, ctl) => deps2.requestFix(prompt, ctl), p, {
-        generationMs: deps2.fixTimeoutMs ?? fixTimeoutMs(env),
+        generationMs: deps2.fixTimeoutMs ?? fixGenerationMs(settings.fixAgent.provider, env),
         queueMaxMs: deps2.fixWatch?.queueMaxMs ?? fixQueueMaxMs(env),
         livenessMs: deps2.fixWatch?.livenessMs ?? localLivenessMs(env),
         checkEveryMs: deps2.fixWatch?.checkEveryMs ?? FIX_RELEVANCE_CHECK_MS,

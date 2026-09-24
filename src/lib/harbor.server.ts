@@ -1342,15 +1342,15 @@ function recordLoopStart(token: string, job: Job): void {
   );
 }
 
-// Loop control claims each delivery before its side effect (loop-control-claims.ts): a
-// control-only delivery leaves no job or accepted event behind to recognize a redelivery by.
+// Loop control claims each delivery before its side effect (loop-control-claims.ts). The claim is
+// the ONLY redelivery guard: the same delivery may also leave a job or a 202 "ignored" event, and
+// checking those would shadow a claim released after a failed attempt, so the retry GitHub
+// redelivers would never run. A redelivery after a restart (empty claims) re-runs an idempotent step.
 const loopControlClaims = createDeliveryClaims();
 
 function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>, { kind: "review" }>, deliveryId: string) {
   if (!loopEnabled(state.settings) || parsed.installationId === undefined) return;
-  const redelivery =
-    acceptedDeliveryIds(state.events).includes(deliveryId) || state.jobs.some((j) => j.deliveryId === deliveryId);
-  if (redelivery || !loopControlClaims.claim(deliveryId)) return;
+  if (!loopControlClaims.claim(deliveryId)) return;
   const installationId = parsed.installationId;
   const { owner, repo, pr, headSha } = parsed.target;
   const run = (label: string, step: (token: string) => Promise<{ posted: boolean; reason: string }>) => {

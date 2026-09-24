@@ -55,6 +55,8 @@ export async function appFixture(options={}, githubOptions={}) {
     // 'getFile'"), every appFixture test throws, and the leaked Chromium handle hangs the process to
     // the CI 10-min timeout. Fixtures are snapshot-only, so head reads return null.
     getFile:async()=>githubOptions.getFile?githubOptions.getFile():null,
+    // Loop-runtime GitHub calls a test opts into (the runtime loads github.server lazily).
+    ...(githubOptions.api||{}),
   }],
   ['@tanstack/react-router',{createFileRoute:()=>config=>config}],
  ]);

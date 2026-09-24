@@ -10,6 +10,7 @@ import {
   ashlarBotLogin,
   builtinValidate,
   continueLoopOnPush,
+  controlResultLogged,
   effectiveLoopMode,
   loopEnabled,
   loopPostedReview,
@@ -850,6 +851,7 @@ describe("round-5: durable stop records, exact session scoping, prompt boundary,
     const first = await continueLoopOnPush("t", push, settings("apply"), f.deps, ENV_ON);
     assert.equal(first.posted, false);
     assert.match(first.reason, /continuation outcome unknown.*no handoff/);
+    assert.equal(first.unresolved, true, "harbor logs it");
     // a redelivered push while the list still lags: still unknown — never reported as "already continued"
     const again = await continueLoopOnPush("t", push, settings("apply"), f.deps, ENV_ON);
     assert.equal(again.posted, false);
@@ -1273,6 +1275,17 @@ describe("stopLoop (the fixed STOPPED acknowledgement)", () => {
 });
 
 describe("helpers", () => {
+  it("harbor logs every failed or unresolved control result through one predicate", () => {
+    assert.equal(controlResultLogged({ posted: false, reason: `${START_UNRESOLVED}: GitHub issue comment 502`, unresolved: true }), true);
+    assert.equal(controlResultLogged({ posted: false, reason: "stop failed: GitHub issue comment 422 (honored in this process until recorded)" }), true);
+    for (const reason of ["started", "start already recorded", "stopped", "stop already recorded", "continued", "already continued", "no active loop session", "disabled"]) {
+      assert.equal(controlResultLogged({ posted: reason === "started" || reason === "stopped" || reason === "continued", reason }), false, reason);
+    }
+    const harbor = readFileSync(join(new URL(".", import.meta.url).pathname, "harbor.server.ts"), "utf8");
+    assert.equal(harbor.match(/if \(controlResultLogged\(r\)\) console\.warn/g)?.length, 2, "the start record and every webhook control step log through it");
+    assert.ok(!/\/failed\/\.test\(r\.reason\)\)\s*console\.warn/.test(harbor), "no second logging rule");
+  });
+
   it("ashlarBotLogin: ASHLAR_BOT_LOGIN only in the App-reserved <slug>[bot] shape", () => {
     assert.equal(ashlarBotLogin({} as NodeJS.ProcessEnv), BOT);
     assert.equal(ashlarBotLogin({ ASHLAR_BOT_LOGIN: "other-app[bot]" } as NodeJS.ProcessEnv), "other-app[bot]");
@@ -1571,6 +1584,7 @@ describe("ambiguous control writes: a separate no-expiry ledger, never read as p
     const first = await stopLoop("t", stopReq, settings(), f.deps, ENV_ON);
     assert.equal(first.posted, false);
     assert.match(first.reason, /outcome unknown.*honored in this process until recorded/);
+    assert.equal(first.unresolved, true, "harbor logs it");
     const again = await stopLoop("t", stopReq, settings(), f.deps, ENV_ON);
     assert.equal(again.posted, false);
     assert.notEqual(again.reason, "stop already recorded", "a ledger-only hit is not a recorded stop");
@@ -1606,9 +1620,11 @@ describe("ambiguous control writes: a separate no-expiry ledger, never read as p
     const first = await startLoop("t", req, settings(), f.deps, ENV_ON);
     assert.equal(first.posted, false);
     assert.ok(first.reason.startsWith(START_UNRESOLVED), first.reason);
+    assert.equal(first.unresolved, true, "harbor logs it");
     const again = await startLoop("t", req, settings(), f.deps, ENV_ON);
     assert.equal(again.posted, false);
     assert.ok(again.reason.startsWith(START_UNRESOLVED), `never "start already recorded": ${again.reason}`);
+    assert.equal(again.unresolved, true);
     assert.ok(!SILENT_REASONS.includes(START_UNRESOLVED), "logged, not silent");
     // the loop step for the review that start requested runs on the folded start: no re-POST
     const j = job({ thread: { kind: "mention", commentId: 5, userText: "/review-loop", loop: { kind: "start", mode: "suggest" }, eventAt: req.at } });

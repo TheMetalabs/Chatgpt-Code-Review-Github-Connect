@@ -25,11 +25,13 @@ import { readLoopEvents, readLoopSession } from "./review-loop-engine.server.ts"
 import { controlKey, ownWrites, type ControlKey } from "./review-loop-control.ts";
 import {
   continueLoopOnPush,
+  controlResultLogged,
   runPostReviewLoop,
   SILENT_REASONS,
   START_UNRESOLVED,
   startLoop,
   stopLoop,
+  type ControlResult,
   type LoopRuntimeDeps,
   type LoopStepResult,
 } from "./review-loop-runtime.server.ts";
@@ -53,9 +55,6 @@ const SUPERSEDED = "superseded (head moved)";
 const ALREADY_ESCALATED = "already escalated on this head";
 const NO_SESSION = "no active loop session";
 
-/** harbor's logging rule for a control entry point's result. */
-const controlResultLogged = (r: { reason: string; unresolved?: true }) => r.unresolved === true || /failed/.test(r.reason);
-
 type Via =
   | "start:admission"
   | "start:self-heal"
@@ -71,7 +70,6 @@ type List = "normal" | "lagging" | "failing";
 type Later = "redelivery" | "newer-start" | "25h" | "row-appears";
 type Phase = "call" | "view" | "again" | "follow";
 type Cell = { via: Via; write: Write; list: List; later: Later };
-type ControlResult = { posted: boolean; reason: string; unresolved?: true };
 type Result = ControlResult | LoopStepResult;
 /** posted / exists / unknown / rejected as the entry point reports it; `ran` a step that ran
  * (the self-heal); `resolved` a step result that needs nothing more (posted and exists collapse). */
@@ -495,24 +493,6 @@ async function assertNewerSessionLives(w: World): Promise<void> {
   else assert.equal(s.starter, "carol", `I6: carol's start is not the latest: ${JSON.stringify(s)}`);
 }
 
-/** Cells that fail on this tree, by the fix that closes them: node:test reports them as todo, not
- * failed. Each fix deletes its group; the last one deletes gap(). A pattern is
- * `via | write | list | later`, each part `*` or a comma list. */
-const OPEN: ReadonlyArray<readonly [string, string]> = [
-  ["harbor", "start:admission | unknown-landed | lagging,failing | *"],
-  ["harbor", "start:admission | unknown-lost | * | *"],
-  ["harbor", "stop:webhook | unknown-landed | lagging,failing | *"],
-  ["harbor", "stop:webhook | unknown-lost | * | *"],
-  ["harbor", "continue:push | unknown-landed | lagging,failing | *"],
-  ["harbor", "continue:push | unknown-lost | * | *"],
-];
-
-function gap(c: Cell): string | undefined {
-  const parts = [c.via, c.write, c.list, c.later];
-  const hit = OPEN.find(([, p]) => p.split(" | ").every((alt, i) => alt === "*" || alt.split(",").includes(parts[i])));
-  return hit && `open until the ${hit[0]} fix (#79 K1)`;
-}
-
 async function runCell(c: Cell, pr: number): Promise<void> {
   const w = new World(c, pr);
   const realNow = Date.now;
@@ -557,6 +537,6 @@ describe("control writes: kind × write result × list read × later event (#79 
         for (const later of LATERS) {
           const cell = { via, write, list, later };
           const pr = 1000 + row++;
-          it(`${via} | ${write} | ${list} | ${later}`, { todo: gap(cell) }, () => runCell(cell, pr));
+          it(`${via} | ${write} | ${list} | ${later}`, () => runCell(cell, pr));
         }
 });

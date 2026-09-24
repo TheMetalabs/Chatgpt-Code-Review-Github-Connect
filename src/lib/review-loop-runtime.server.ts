@@ -175,6 +175,16 @@ const SUPERSEDED_UNREADABLE = "superseded (head moved); the loop session or live
 /** NOT silent (logged): the start record's POST outcome is unknown and no list shows it yet. */
 export const START_UNRESOLVED = "start unresolved: the start record's outcome is unknown (not re-sent; not yet visible)";
 
+/** What a control entry point (startLoop / stopLoop / continueLoopOnPush) reports. `unresolved`:
+ * its write's outcome is unknown — it may have landed, is never re-sent, and is not recorded yet. */
+export type ControlResult = { posted: boolean; reason: string; unresolved?: true };
+
+/** The ONE rule by which harbor logs a control result: a failure, or a write whose outcome is
+ * still unknown (never a silent "not posted"). */
+export function controlResultLogged(r: ControlResult): boolean {
+  return r.unresolved === true || /failed/.test(r.reason);
+}
+
 /** Benign non-run reasons: the default off-path and the designed quiet exits (a newer head
  * drives the loop / a handoff or the operator already ended it). Anything else is logged. */
 export const SILENT_REASONS: readonly string[] = [
@@ -1102,7 +1112,7 @@ export async function continueLoopOnPush(
   settings: BotSettings,
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
-): Promise<{ posted: boolean; reason: string }> {
+): Promise<ControlResult> {
   try {
     if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
     const botLogin = ashlarBotLogin(env);
@@ -1143,7 +1153,7 @@ export async function continueLoopOnPush(
       case "exists":
         return { posted: false, reason: "already continued" };
       case "unknown": // it may have landed: no loop-error handoff that would end the session it continues
-        return { posted: false, reason: `continuation outcome unknown (${c.error}); not re-sent, no handoff` };
+        return { posted: false, reason: `continuation outcome unknown (${c.error}); not re-sent, no handoff`, unresolved: true };
       case "rejected":
         return await handOff(c.error);
       default:
@@ -1182,7 +1192,7 @@ export async function startLoop(
   settings: BotSettings,
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
-): Promise<{ posted: boolean; reason: string }> {
+): Promise<ControlResult> {
   try {
     if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
     const botLogin = ashlarBotLogin(env);
@@ -1195,7 +1205,7 @@ export async function startLoop(
       case "exists":
         return { posted: false, reason: "start already recorded" };
       case "unknown": // never "recorded": it may not have landed
-        return { posted: false, reason: `${START_UNRESOLVED}: ${out.error}` };
+        return { posted: false, reason: `${START_UNRESOLVED}: ${out.error}`, unresolved: true };
       case "rejected":
         return { posted: false, reason: `start failed: ${out.error}` };
       default:
@@ -1237,7 +1247,7 @@ export async function stopLoop(
   settings: BotSettings,
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
-): Promise<{ posted: boolean; reason: string }> {
+): Promise<ControlResult> {
   if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
   const botLogin = ashlarBotLogin(env);
   if (isSelfLogin(stop.actor, botLogin)) return { posted: false, reason: "bot-authored stop ignored" };
@@ -1279,7 +1289,7 @@ export async function stopLoop(
       case "exists":
         return { posted: false, reason: "stop already recorded" };
       case "unknown": // never "recorded": it may not have landed
-        return { posted: false, reason: `stop record outcome unknown (${out.error}; not re-sent; honored in this process until recorded)` };
+        return { posted: false, reason: `stop record outcome unknown (${out.error}; not re-sent; honored in this process until recorded)`, unresolved: true };
       case "rejected":
         return { posted: false, reason: `stop failed: ${out.error} (honored in this process until recorded)` };
       default:

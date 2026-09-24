@@ -90,6 +90,21 @@ for (const kind of ['review', 'fix']) {
     assert.ok(b.session.state['ashlar:preserved:' + leg(kind).jobId + ':chatgpt:run-A'], 'the preserved backstop is recorded');
   });
 }
+// Chrome tab ids are unique only within one browser session, and the registry outlives it: an
+// undispatched leg's stored id (no session record of its creation) can name the user's own tab.
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: an undispatched leg never sends its prompt into a tab id this browser session did not create for it; it opens its own tab`, async () => {
+    const b = worker(leg(kind, {started: false}), {tab: {id: 10, url: 'https://chatgpt.com/', status: 'complete'}, handler: () => ({ok: false, code: 'busy', retry: true})});
+    await b.tick();
+    assert.equal(b.messages.some(m => m.id === 10 && m.type === 'ashlar-run'), false, 'no prompt is sent into the reused id');
+    assert.equal(b.pending().states.chatgpt.tabId, undefined, 'the stale id is dropped');
+    await b.tick();
+    const run = b.messages.find(m => m.type === 'ashlar-run');
+    assert.ok(run && run.id !== 10 && run.prompt === 'PROMPT', 'the leg dispatched into the tab it created');
+    assert.equal(b.pending().states.chatgpt.tabId, run.id);
+    assert.ok(b.tabs.has(10), 'the user\'s tab is untouched');
+  });
+}
 test('review: a page that answers "capture_source_changed" after a durable archive gets the release verdict (closed when Ashlar\'s)', async () => {
   const capture = {id: 'capture-A', archiveDurable: true, responseId: 'response-A', text: 'not json', context: '[]', sourceHash: 'h', totalChars: 8};
   const b = worker(leg('review', {sourceCapture: capture}, {captureProtocol: 1}), {handler: (_id, m) => (m.type === 'ashlar-capture-accepted' ? {ok: false, code: 'capture_source_changed'} : m.type === 'ashlar-can-close' ? owned : {ok: false, code: 'busy'})});

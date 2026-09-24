@@ -1035,6 +1035,14 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await saveJobs(jobs);
     return;
   }
+  if (!state.started && !observeOnly && !await tabCreatedForLeg(job, provider, state.tabId)) {
+    // The prompt goes only into the tab this browser session created for the leg: a stored id from
+    // before a browser restart (or an extension reload) can name the user's own tab. The leg opens
+    // its own tab instead; the old id is never messaged.
+    delete state.tabId;
+    await saveJobs(jobs);
+    return;
+  }
   let tab;
   try { tab = await chrome.tabs.get(state.tabId); }
   catch {

@@ -340,11 +340,13 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   }
 }
 
-// Backstop, not a generation timeout: guards a page that never renders a composer (e.g. a stale
-// model URL or a logged-out landing) so the runner fails cleanly and releases the lane instead of
-// waiting forever. Generation itself stays unbounded elsewhere.
-const COMPOSER_DEADLINE_MS = 3 * 60 * 60 * 1000; // 3h
 async function waitUntilComposer() {
+  // Backstop, not a generation timeout: guards a page that never renders a composer (e.g. a stale
+  // model URL or a logged-out landing) so the runner fails cleanly and releases the lane instead of
+  // waiting forever. Generation itself stays unbounded elsewhere. Local, not a top-level const: the
+  // worker re-injects this file into a page that already ran it, and a redeclared global lexical
+  // binding aborts the whole script (leaving every older definition in place).
+  const COMPOSER_DEADLINE_MS = 3 * 60 * 60 * 1000; // 3h
   const deadline = Date.now() + COMPOSER_DEADLINE_MS;
   for (;;) {
     if (typeof quotaHit === "function" && quotaHit()) {

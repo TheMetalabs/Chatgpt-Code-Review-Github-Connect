@@ -46,6 +46,33 @@ Rules the table encodes:
   fails the typecheck, and `review-outcome.test.ts` iterates `REVIEW_OUTCOMES` so it fails without
   a render row.
 
+## §2 Releasing the held local leg — only on an explicit terminal signal
+
+`releaseHeldLocal(jobId, token, release, plan, legs)` in `harbor.server.ts` is the single release
+point. It releases once (it sets `localVerifyStartedAt` or `localFallbackAt`, and does nothing when
+either is already set), returns the job to `awaiting_chat` with the chat legs kept, starts the
+local leg and makes sure a reviewer watcher waits for it.
+
+It is called only on an **explicit terminal signal** of the chat round:
+
+| Signal | Release | Caller |
+| --- | --- | --- |
+| The merged chat result is `verify` (§1: structured, 0 findings, no raw) | verification round (`localVerifyChat` = the chat reviewers whose structured result was clean) | `submitHarborChat` |
+| Every chat leg finished without a usable payload (no valid JSON) | fallback | `submitHarborChat` |
+| Every chat leg reached an explicit terminal outcome (quota, empty, tab closed, error) with no payload | fallback | watcher |
+| The Chrome bridge reports disconnected for at least `BRIDGE_CONNECTED_MS`, measured from the disconnect, with no chat progress | fallback | watcher (`chatStalled`) |
+
+What never releases it:
+
+- job age or any timer on the job;
+- `BRIDGE_CLAIM_MS` lease expiry — it is an ownership lease, not a reviewer deadline, and a bridge
+  that stays connected keeps local held however long chat takes;
+- a stale `generating` flag, or a `disconnected` provider error while the bridge is still connected.
+
+Chat findings (or a chat raw reply) never release local at all: the chat result posts and the job's
+terminal cleanup (§3) frees the snapshot. `tests/review/local-verify-lifecycle.e2e.mjs` rows L10–L12
+pin the watcher signals, including a claim lease expiring under a connected bridge.
+
 ## §3 Terminal cleanup — one writer, one edge
 
 `transitionJob(id, next)` in `harbor.server.ts` is the only writer of an existing job record. Every

@@ -91,6 +91,46 @@ const ROWS=[
     }},
   {name:'L9 chat unusable, local fallback HTTP 500: skipped',expect:{status:'skipped',requests:1,reviews:0},
     async run(t){const s=await start(t);await s.app.harbor.submitHarborChat(s.jobId,none);await answerLocal(s.app,0,fail500);return s;}},
+  // Release of the held local leg happens only on an explicit terminal signal (docs §2).
+  {name:'L10 bridge never connects: released as the fallback once disconnected past the grace',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/},
+    async run(t){
+      const s=await start(t);
+      await settle();assert.equal(s.app.localRequests.length,0,'held within the bridge grace period');
+      assert.equal(s.app.bridge.getBridgePublic().connected,false);
+      s.app.clock.now+=120_001; // past BRIDGE_CONNECTED_MS, measured from the disconnect, with no chat progress
+      await answerLocal(s.app,0,res=>res.end(reply(dirty)));
+      assert.ok(s.job().localFallbackAt&&!s.job().localVerifyStartedAt,'released as the fallback, not a verification');
+      return s;
+    }},
+  {name:'L11 chat reports an explicit quota failure: released as the fallback',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/},
+    async run(t){
+      const s=await start(t);
+      s.app.bridge.bridgeHeartbeat();
+      const take=s.app.bridge.takeNextBridgeJob('lifecycle-client');
+      assert.equal(take?.jobId,s.jobId,'the bridge claims the job');
+      await settle();assert.equal(s.app.localRequests.length,0,'a claimed chat leg keeps local held');
+      assert.equal(s.app.bridge.failBridgeProvider(s.jobId,'chatgpt','quota: usage limit reached',take.leaseId),true);
+      await answerLocal(s.app,0,res=>res.end(reply(dirty)));
+      assert.ok(s.job().localFallbackAt,'released as the fallback');
+      return s;
+    }},
+  {name:'L12 claim lease expiry while the bridge stays connected never releases local; only cancel ends it',expect:{status:'cancelled',skip:/cancelled by operator/,requests:0,reviews:0},
+    async run(t){
+      const s=await start(t);
+      s.app.bridge.bridgeHeartbeat();
+      assert.ok(s.app.bridge.takeNextBridgeJob('lifecycle-client'),'the bridge claims the job');
+      // 12 × 110s = 22 min > BRIDGE_CLAIM_MS (20 min): a heartbeat every 110s keeps the bridge connected
+      for(let i=0;i<12;i++){
+        s.app.clock.now+=110_000;s.app.bridge.bridgeHeartbeat();
+        await new Promise(resolve=>setTimeout(resolve,60)); // a few watcher ticks at each step
+      }
+      assert.equal(s.app.bridge.getBridgePublic().connected,true);
+      assert.equal(s.job().status,'awaiting_chat','the job still waits for chat');
+      assert.equal(s.app.localRequests.length,0,'an expired lease is not a reviewer deadline');
+      assert.equal(s.app.harbor.hasLocalSample(s.jobId),true,'the held job keeps its snapshot');
+      s.app.harbor.cancelHarborJob(s.jobId);
+      return s;
+    }},
   {name:'R1 race: chat and local both find the issue',expect:{status:'posted',requests:1,reviews:1},
     async run(t){
       const s=await start(t,{role:'race'});
@@ -120,6 +160,7 @@ for(const row of ROWS){
     if(e.skip)assert.match(job().skipReason??'',e.skip,'skipReason');
     assert.equal(app.localRequests.length,e.requests,'local requests');
     assert.equal(app.reviews.length,e.reviews,'reviews posted');
+    if(e.body)assert.match(app.reviews[0].body,e.body,'review body');
     await eventually(()=>!app.harbor.hasLocalSample(jobId),`${row.name}: the local snapshot was never released`);
     await eventually(()=>!app.harbor.isWatchingJob(jobId),`${row.name}: the reviewer watcher never stopped`);
     assert.equal(Boolean(s.abort?.aborted),Boolean(e.aborted),'in-flight local request aborted');

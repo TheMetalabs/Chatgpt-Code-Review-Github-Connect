@@ -53,18 +53,3 @@ test('race (default): local still starts with the chat leg',async t=>{
   assert.equal(job().localReviewRole,'race');
   await eventually(()=>app.localRequests.length===1,'race mode did not start local at snapshot');
 });
-
-test('verify-clean: a Chrome bridge that stays offline releases local as the fallback (the review still completes)',async t=>{
-  const {app,jobId,job}=await setup(t);
-  await settle();assert.equal(app.localRequests.length,0,'held while within the bridge grace period');
-  assert.equal(app.bridge.getBridgePublic().connected,false);
-  app.clock.now+=120_001; // past BRIDGE_CONNECTED_MS with no chat progress
-  await eventually(()=>app.localRequests.length===1,'offline bridge never released the held local leg');
-  assert.ok(job().localFallbackAt);assert.equal(job().localVerifyStartedAt,undefined);
-  app.localResponses[0].end(reply(dirty));
-  await eventually(()=>app.reviews.length===1,'local fallback review was not posted');
-  assert.equal(job().status,'posted');assert.equal(app.reviews[0].comments.length,1);
-  assert.match(app.reviews[0].body,/Skipped chatgpt/,'the offline chat reviewer stays visible');
-  assert.doesNotMatch(app.reviews[0].body,/local verification/);
-  assert.equal(app.harbor.hasLocalSample(jobId),false);
-});

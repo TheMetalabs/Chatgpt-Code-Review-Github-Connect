@@ -505,9 +505,9 @@ async function watchReviewersLoop(jobId: string, token: string) {
       })
     ) {
       // Chat is down (quota / disconnected / nothing returned): never lose the review — local runs
-      // as today's fallback, not as a verifier. The next tick starts it (shouldStartLocalLeg).
-      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : { ...j, localFallbackAt: Date.now(), plan: "Chat reviewers returned nothing usable; local runs as the fallback.", updatedAt: Date.now() }));
-      continue;
+      // as today's fallback, not as a verifier. Re-check at once only after a real release, so a
+      // release that did not apply can never spin this loop without its tick.
+      if (releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned nothing usable; local runs as the fallback.")) continue;
     }
     if (job.status === "awaiting_chat" && !racing) {
       const legs = stored.filter((l) => l.raw.trim());
@@ -970,15 +970,9 @@ export async function submitHarborChat(
     ) {
       transitionJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
-        const next = [...(j.storedLegs ?? [])];
-        for (const leg of incoming) {
-          const i = next.findIndex((l) => l.provider === leg.provider);
-          if (i >= 0) next[i] = leg;
-          else next.push(leg);
-        }
         return {
           ...j,
-          storedLegs: next,
+          storedLegs: upsertLegs(j.storedLegs, incoming),
           plan: haveChat && !haveLocal ? "Waiting for remaining racers before schema-merge." : "Waiting for remaining racers before schema-merge.",
           updatedAt: Date.now(),
         };
@@ -1051,7 +1045,7 @@ export async function submitHarborChat(
 
   if (!gates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
     // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
-    releaseHeldLocalLeg(jobId, token, incoming, { localFallbackAt: Date.now(), plan: "Chat reviewers returned no valid JSON; local runs as the fallback." });
+    releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned no valid JSON; local runs as the fallback.", incoming);
     return { ok: true };
   }
   if (!gates.length) {
@@ -1101,11 +1095,8 @@ export async function submitHarborChat(
   const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
   if (outcome === "verify") {
     // Chat parsed clean: hold the post and run local on the same prompt as the verification round.
-    releaseHeldLocalLeg(jobId, token, incoming, {
-      localVerifyStartedAt: Date.now(),
-      localVerifyChat: cleanChat,
-      plan: `${cleanChat.join(" + ") || "chat"} found nothing; local verification round running.`,
-    });
+    const plan = `${cleanChat.join(" + ") || "chat"} found nothing; local verification round running.`;
+    releaseHeldLocal(jobId, token, { kind: "verify", verifyChat: cleanChat }, plan, incoming);
     return { ok: true };
   }
   const localError =
@@ -1133,25 +1124,38 @@ export async function submitHarborChat(
   return finishResult(jobId);
 }
 
-/** verify-clean: return a job from validator to awaiting_chat with its chat legs kept, and start its
- * held-back local leg (verification round or chat-down fallback). The watcher then waits for local. */
-function releaseHeldLocalLeg(jobId: string, token: string, legs: ChatLeg[], release: Pick<Job, "plan"> & Partial<Job>) {
+type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kind: "fallback" };
+
+/** verify-clean: the single release point of a held local leg, called only on an explicit terminal
+ * signal of the chat round (docs/local-verify-clean.md §2): a clean structured chat result starts
+ * the verification round; chat finishing with nothing usable, or a bridge disconnected past its
+ * grace, starts the fallback. It releases once (a stamp is set), returns the job to awaiting_chat
+ * with the chat legs kept, starts local and makes sure a watcher waits for it. */
+function releaseHeldLocal(jobId: string, token: string, release: HeldLocalRelease, plan: string, legs: ChatLeg[] = []): boolean {
   let released = false;
-  transitionJob(jobId, (j) => {
-    if (j.status !== "validator") return j;
+  const job = transitionJob(jobId, (j) => {
+    if ((j.status !== "validator" && j.status !== "awaiting_chat") || j.localVerifyStartedAt || j.localFallbackAt) return j;
     released = true;
-    const next = [...(j.storedLegs ?? [])];
-    for (const leg of legs) {
-      const i = next.findIndex((l) => l.provider === leg.provider);
-      if (i >= 0) next[i] = leg;
-      else next.push(leg);
-    }
-    return { ...j, ...release, status: "awaiting_chat", storedLegs: next, updatedAt: Date.now() };
+    const stamp = release.kind === "verify"
+      ? { localVerifyStartedAt: Date.now(), localVerifyChat: release.verifyChat }
+      : { localFallbackAt: Date.now() };
+    return { ...j, ...stamp, status: "awaiting_chat", storedLegs: upsertLegs(j.storedLegs, legs), plan, updatedAt: Date.now() };
   });
-  const job = state.jobs.find((j) => j.id === jobId);
-  if (!released || !job) return;
+  if (!released || !job) return false;
   void kickLocalRace(jobId, job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "");
   void watchReviewers(jobId, token);
+  return true;
+}
+
+/** Store incoming legs over the stored ones, one per provider (a newer leg replaces an older one). */
+function upsertLegs(stored: Job["storedLegs"], incoming: ChatLeg[]): NonNullable<Job["storedLegs"]> {
+  const next = [...(stored ?? [])];
+  for (const leg of incoming) {
+    const i = next.findIndex((l) => l.provider === leg.provider);
+    if (i >= 0) next[i] = leg;
+    else next.push(leg);
+  }
+  return next;
 }
 
 function finishResult(jobId: string): { ok: true } | { ok: false; error: string } {

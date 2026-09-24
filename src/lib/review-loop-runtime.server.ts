@@ -41,19 +41,24 @@ import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, typ
 import type { GitDataApi } from "./fix-commit.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
-import { retryWrite, type WriteRetryResult } from "./write-retry.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
-import { assertNever, emitControl, ownWrites, type EmitContext, type EmitOutcome } from "./review-loop-control.ts";
+import {
+  assertNever,
+  emitControl,
+  ownWrites,
+  prKey,
+  type ControlWrite,
+  type EmitContext,
+  type EmitOutcome,
+  type PrRef,
+} from "./review-loop-control.ts";
 import {
   CURRENT_ROUND_MISSING,
   ESCALATE_IN_FLIGHT,
   escalateNow,
   maybeEscalate,
-  dedupProbe,
   readLoopSession,
   reconstructRounds,
-  rememberAmbiguous,
-  rememberPosted,
   HANDOFF_OUTCOME_UNKNOWN,
   type LoopPrInfo,
   type ReviewLoopGithub,
@@ -64,7 +69,6 @@ import {
   isoMs,
   isSelfLogin,
   MAX_CONTINUE_ROUND,
-  parseStopRecord,
   resolveBotLogin,
   sanitizeUntrusted,
   startComment,
@@ -170,8 +174,6 @@ const SUPERSEDED_REFUSED = "superseded (head moved); the live head's review coul
 const SUPERSEDED_UNREADABLE = "superseded (head moved); the loop session or live head could not be read to continue on it";
 /** NOT silent (logged): the start record's POST outcome is unknown and no list shows it yet. */
 export const START_UNRESOLVED = "start unresolved: the start record's outcome is unknown (not re-sent; not yet visible)";
-/** A control write whose outcome is unknown and that no list shows yet (ambiguity ledger hit). */
-const OUTCOME_UNKNOWN = "outcome unknown: not re-sent; not yet visible";
 
 /** Benign non-run reasons: the default off-path and the designed quiet exits (a newer head
  * drives the loop / a handoff or the operator already ended it). Anything else is logged. */
@@ -201,16 +203,9 @@ const RETRYABLE = new Set<FixRoundResult["outcome"]>(["request-failed", "parse-f
  * before the history counts as unverifiable (a loop-error handoff). */
 const HISTORY_RETRY_DELAYS_MS = [3_000, 6_000, 12_000];
 const ESCALATE_BACKOFF_MS = 1500;
-/** Attempts for a control post (the continuation, the start record): a transient failure must
- * not stall the loop. Each retry first re-scans, so a lost response never duplicates the post. */
+/** Attempts for a per-finding thread reply (a read always, a reply only when GitHub cannot have
+ * created it): a transient failure must not cost a thread its disposition. */
 const POST_RETRY_DELAYS_MS = [0, 2_000, 5_000];
-
-/** A control write that did not land (as far as we know): its error, and whether it may have landed
- * after all (outcome unknown: never re-sent, the row just never became visible). */
-function writeFailure(r: Extract<WriteRetryResult, { error: unknown }>): string {
-  const detail = (r.error as Error)?.message ?? String(r.error);
-  return r.ambiguous ? `${detail} (outcome unknown: not re-sent; not yet visible)` : detail;
-}
 const realSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 
 /** How this runtime's control writes reach GitHub (review-loop-control.ts emitControl). */
@@ -574,37 +569,12 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
   return { gh, requestFix, validate: builtinValidate, fixReportsActivity: streaming };
 }
 
-type PrRef = { owner: string; repo: string; pr: number };
-
-const prKey = (ref: PrRef) => `${ref.owner}/${ref.repo}#${ref.pr}`.toLowerCase();
-
-// Stops the webhook reported whose STOPPED record is not durable yet (its post is retrying, or
-// failed): every session read in THIS process honors them, so no round commits past a stop.
-// Per GitHub client, like the posted-comment cache.
-const pendingStopsByClient = new WeakMap<object, Map<string, LoopEvent[]>>();
-
-function pendingStops(gh: object, ref: PrRef): LoopEvent[] {
-  return pendingStopsByClient.get(gh)?.get(prKey(ref)) ?? [];
-}
-
-function setPendingStop(gh: object, ref: PrRef, event: LoopEvent, pending: boolean): void {
-  const byPr = pendingStopsByClient.get(gh) ?? new Map<string, LoopEvent[]>();
-  pendingStopsByClient.set(gh, byPr);
-  const rest = (byPr.get(prKey(ref)) ?? []).filter((e) => !(e.at === event.at && e.actor === event.actor));
-  const next = pending ? [...rest, event] : rest;
-  if (next.length) byPr.set(prKey(ref), next);
-  else byPr.delete(prKey(ref));
-}
-
-/** The PR's current loop session from durable GitHub history (fresh read; it folds this
- * process's own control writes the list does not show yet), plus this process's not-yet-durable
- * stops and any caller-known events. */
+/** The PR's current loop session from durable GitHub history (fresh read). It folds this
+ * process's own control writes the list does not show yet — a stop from the moment it arrived —
+ * plus any caller-known events. */
 function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullHead, botLogin: string, extra: LoopEvent[] = []): Promise<LoopSession> {
-  return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head, extra: [...pendingStops(gh, ref), ...extra] });
+  return readLoopSession(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, pr: head, extra });
 }
-
-/** A control write's outcome in the stop record's terms (the stop still keeps its own loop). */
-type ContinueOutcome = { posted: boolean; exists?: boolean; ambiguous?: boolean; error?: string };
 
 /**
  * Request the next review of `head` with the fixed continuation marker — ONE per (PR, head,
@@ -1242,48 +1212,9 @@ export function loopStartAt(job: Pick<Job, "thread" | "createdAt">): string {
   return job.thread?.eventAt ?? new Date(job.createdAt).toISOString();
 }
 
-/** Post the STOPPED acknowledgement that RECORDS a stop (who, and the stop's own time) — once:
- * this process's recent post or a listed record for the same stop makes it a no-op, and each retry
- * re-scans first. Never throws. */
-async function ensureStopRecord(
-  gh: LoopRuntimeGithub,
-  token: string,
-  ref: PrRef,
-  stop: { by: string; at: string },
-  botLogin: string,
-  sleep?: (ms: number) => Promise<void>,
-): Promise<ContinueOutcome> {
-  const key = `stop:${prKey(ref)}:${stop.by.toLowerCase()}:${isoMs(stop.at)}`;
-  let body: string;
-  try {
-    body = stoppedComment(stop);
-  } catch (e) {
-    return { posted: false, error: (e as Error)?.message ?? String(e) };
-  }
-  const same = (r: { userLogin: string; body: string }) => {
-    const rec = isSelfLogin(r.userLogin, botLogin) ? parseStopRecord(r.body, { authoredByBot: true }) : null;
-    return !!rec && rec.by.toLowerCase() === stop.by.toLowerCase() && isoMs(rec.at) === isoMs(stop.at);
-  };
-  const probe = dedupProbe(gh, key, async () => {
-    const rows = await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).catch(() => null);
-    return !!rows?.some(same);
-  });
-  const r = await retryWrite({
-    delays: POST_RETRY_DELAYS_MS,
-    sleep: sleep ?? realSleep,
-    seen: probe.seen,
-    post: async () => {
-      await gh.createIssueComment(token, { owner: ref.owner, repo: ref.repo, pr: ref.pr, body });
-      rememberPosted(gh, key);
-    },
-  });
-  if ("posted" in r) return { posted: true };
-  // A ledger-only hit may never have landed: not "exists" (the stop stays pending).
-  if ("exists" in r) return probe.ledgerOnly() ? { posted: false, ambiguous: true, error: OUTCOME_UNKNOWN } : { posted: false, exists: true };
-  // May have landed: the ledger stops a redelivered stop from posting it again. The stop stays
-  // pending in this process until the record is seen in a list.
-  if (r.ambiguous) rememberAmbiguous(gh, key);
-  return { posted: false, ambiguous: r.ambiguous, error: writeFailure(r) };
+/** The STOPPED acknowledgement that RECORDS a stop (who, and the stop's own time). */
+function stopWrite(ref: PrRef, stop: { by: string; at: string }, body: string): ControlWrite {
+  return { key: { kind: "stop", ref, by: stop.by, at: stop.at }, body };
 }
 
 // In-process serialization so concurrent stop deliveries for one PR post the record at most once
@@ -1315,12 +1246,21 @@ export async function stopLoop(
   const key = `${prKey(stop)}:${stop.actor.toLowerCase()}:${isoMs(at)}`;
   if (inFlightStop.has(key)) return { posted: false, reason: "stop already in flight" };
   inFlightStop.add(key);
-  const event: LoopEvent = { at, kind: "stop", actor: stop.actor };
+  const ref = { owner: stop.owner, repo: stop.repo, pr: stop.pr };
   let d: LoopRuntimeDeps | undefined;
   try {
     d = deps ?? (await productionDeps(settings));
-    // Honored in this process from the first moment, before any read that could fail.
-    setPendingStop(d.gh, stop, event, true);
+    let body = "";
+    let malformed: string | undefined; // a record the parser would reject is never posted
+    try {
+      body = stoppedComment({ by: stop.actor, at });
+    } catch (e) {
+      malformed = (e as Error)?.message ?? String(e);
+    }
+    const write = stopWrite(ref, { by: stop.actor, at }, body);
+    // Write-ahead: honored in this process from the first moment, before any read that could
+    // fail, and until its record is listed — whatever its POST does.
+    ownWrites(d.gh).intend(write);
     const head = await d.gh.fetchPullHeadRef(token, stop.owner, stop.repo, stop.pr);
     const session = await sessionOf(d.gh, token, stop, head, botLogin);
     const endedIt = !session.active && session.endedBy === "stop" && isoMs(session.endedAt) === isoMs(at);
@@ -1328,16 +1268,25 @@ export async function stopLoop(
     // start whose record may still land later with an earlier time (a live loop-start review for
     // this PR at stop time). A stop that stopped nothing posts nothing and is forgotten.
     if (!endedIt && !(stop.startInFlight ?? false)) {
-      setPendingStop(d.gh, stop, event, false);
+      ownWrites(d.gh).abandon(write);
       return { posted: false, reason: NO_SESSION };
     }
-    const r = await ensureStopRecord(d.gh, token, stop, { by: stop.actor, at }, botLogin, d.sleep);
-    if (r.posted || r.exists) setPendingStop(d.gh, stop, event, false);
-    if (r.ambiguous) return { posted: false, reason: `stop record ${r.error ?? OUTCOME_UNKNOWN} (honored in this process until recorded)` };
-    if (r.error) return { posted: false, reason: `stop failed: ${r.error} (honored in this process until recorded)` };
-    return r.posted ? { posted: true, reason: "stopped" } : { posted: false, reason: "stop already recorded" };
+    if (malformed) return { posted: false, reason: `stop failed: ${malformed} (honored in this process until recorded)` };
+    const out = await emitControl(controlCtx(d, token, botLogin), write);
+    switch (out.status) {
+      case "posted":
+        return { posted: true, reason: "stopped" };
+      case "exists":
+        return { posted: false, reason: "stop already recorded" };
+      case "unknown": // never "recorded": it may not have landed
+        return { posted: false, reason: `stop record outcome unknown (${out.error}; not re-sent; honored in this process until recorded)` };
+      case "rejected":
+        return { posted: false, reason: `stop failed: ${out.error} (honored in this process until recorded)` };
+      default:
+        return assertNever(out);
+    }
   } catch (e) {
-    // The pending stop stays: this process keeps honoring it (a redelivery may record it later).
+    // The intent stays: this process keeps honoring the stop (a redelivery may record it later).
     return { posted: false, reason: `stop failed: ${(e as Error)?.message ?? String(e)}${d ? " (honored in this process)" : ""}` };
   } finally {
     inFlightStop.delete(key);

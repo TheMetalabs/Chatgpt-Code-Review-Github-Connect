@@ -82,6 +82,12 @@ bridge seen before, when `connected` flipped (`lastSeen + BRIDGE_CONNECTED_MS`);
 with the current token, process start or the last token rotation. A rotation therefore restarts the
 grace, and no older observation dates a newer disconnect. Row L13 pins it.
 
+A fallback release is permanent. From then on the job waits only on local (`racingProviders` with
+`localFallback`, read by both the watcher and `submitHarborChat`): chat is never required again,
+even when the bridge reconnects and a chat leg reads as pending. A chat payload that still lands
+before local posts is merged; it is never waited for. A take (`nextBridgeJob`) offers such a job no
+fresh chat generation — only a run that already started may resume. Row L14 pins it.
+
 What never releases it:
 
 - job age or any timer on the job;

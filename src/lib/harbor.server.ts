@@ -1029,7 +1029,14 @@ export async function submitHarborChat(
   // Verbatim reply(ies) from any leg whose JSON could not be parsed (local repair off) — surfaced in
   // the review body so the fixing agent can act instead of the job pending forever. Combine every
   // provider's salvaged reply (labeled when more than one) so no review is silently discarded.
-  const salvaged = [...byProvider.entries()].filter(([, g]) => g.rawReview);
+  // Only a STRUCTURED result counts: a leg salvaged as raw text (unparseable, repair off) produced
+  // no verdict. That decides both whether local verified and which chat reviewers were clean.
+  const structured = [...byProvider.entries()].filter(([, g]) => !g.rawReview).map(([p]) => p);
+  const verifyingDone = Boolean(job.localVerifyStartedAt) && !job.localFallbackAt;
+  const localStructured = structured.includes("local");
+  // A verifier whose reply could not be parsed never verified: its raw text is kept out of the
+  // posted body (it stays in review history), so the chat's clean result posts as such.
+  const salvaged = [...byProvider.entries()].filter(([p, g]) => g.rawReview && !(verifyingDone && p === "local" && !localStructured));
   const combinedRaw = salvaged
     .map(([provider, g]) => (salvaged.length > 1 ? `**${PROVIDER_LABEL[provider]}:**\n\n${g.rawReview}` : g.rawReview))
     .join("\n\n---\n\n");
@@ -1047,20 +1054,25 @@ export async function submitHarborChat(
     fallback: Boolean(job.localFallbackAt),
     findings: merged.findings.length,
     salvagedRaw: Boolean(rawReview),
-    localPayload: byProvider.has("local"),
+    localStructured,
   });
+  // Credit only the chat reviewers that produced the clean structured result (pinned when the
+  // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
+  const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
   if (step === "start-verify") {
     // Chat parsed clean: hold the post and run local on the same prompt as the verification round.
     releaseHeldLocalLeg(jobId, token, incoming, {
       localVerifyStartedAt: Date.now(),
-      plan: `${providers.filter(isChatProvider).join(" + ")} found nothing; local verification round running.`,
+      localVerifyChat: cleanChat,
+      plan: `${cleanChat.join(" + ") || "chat"} found nothing; local verification round running.`,
     });
     return { ok: true };
   }
   const localError =
     (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
-    invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim();
-  const localVerifyNote = verifyCleanNote({ chat: providers.filter(isChatProvider), step, localFindings: merged.findings.length, localError });
+    invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
+    (byProvider.get("local")?.rawReview ? "its reply could not be parsed" : undefined);
+  const localVerifyNote = verifyCleanNote({ chat: cleanChat, step, localFindings: merged.findings.length, localError });
   patchJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,

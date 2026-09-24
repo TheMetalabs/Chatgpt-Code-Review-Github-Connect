@@ -134,6 +134,9 @@ export interface Job {
   localReviewRole?: LocalReviewRole;
   /** verify-clean: set when the merged chat result was clean and the local verification round began. */
   localVerifyStartedAt?: number;
+  /** The chat reviewers whose STRUCTURED result was clean when verification started (the only
+   * ones a verification note may credit). */
+  localVerifyChat?: ReviewProvider[];
   /** verify-clean: set when the chat reviewers produced no usable result, so local ran as the fallback. */
   localFallbackAt?: number;
   /** verify-clean: summary line naming which reviewer produced the posted result (verifyCleanNote). */

@@ -10,8 +10,8 @@ const clean=JSON.stringify({findings:[],merge_recommendation:'COMMENT',investiga
 const dirty=JSON.stringify({findings:[finding],merge_recommendation:'REQUEST_CHANGES'});
 const reply=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 
-async function setup(t,role='verify-clean') {
-  const app=await appFixture({localReviewRole:role});t.after(()=>app.close());
+async function setup(t,role='verify-clean',extra={}) {
+  const app=await appFixture({localReviewRole:role,...extra});t.after(()=>app.close());
   app.env.ASHLAR_LOCAL_LLM_STREAM='false';
   const out=await app.mention('verify-'+role);
   await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId)?.status==='awaiting_chat','snapshot not ready');
@@ -72,6 +72,21 @@ test('verify-clean: chat clean + local failure posts chat\'s clean result with t
   assert.match(app.reviews[0].body,/^Didn't find any major issues\./);
   assert.match(app.reviews[0].body,/local verification did not complete \(/);
   assert.match(app.reviews[0].body,/ashlar-findings total=0 /);
+});
+
+test('verify-clean: an unparseable local reply is no verification: chat\'s clean result posts with the note',async t=>{
+  const {app,jobId,job}=await setup(t,'verify-clean',{localJsonRepairEnabled:false});
+  await app.harbor.submitHarborChat(jobId,clean);
+  await eventually(()=>app.localRequests.length===1,'clean chat did not start local verification');
+  // the local leg may ask again (multi-turn): every reply stays unparseable
+  let answered=0;
+  await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(reply('Looks fine to me, nothing structured here.'));return app.reviews.length===1;},'chat clean result was not posted after local replied unparseable');
+  assert.equal(job().status,'posted');
+  assert.match(app.reviews[0].body,/^Didn't find any major issues\./,'the clean sentinel, not the raw-reply wrapper');
+  assert.match(app.reviews[0].body,/local verification did not complete \(/);
+  assert.match(app.reviews[0].body,/ashlar-findings total=0 /);
+  assert.doesNotMatch(app.reviews[0].body,/nothing structured here/,'the verifier\'s raw text stays out of the review');
+  assert.equal(app.reviews[0].comments.length,0);
 });
 
 test('race (default): local still starts with the chat leg',async t=>{

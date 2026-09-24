@@ -106,11 +106,12 @@ export function verifyCleanStep(input: {
   fallback: boolean;
   findings: number;
   salvagedRaw: boolean;
-  localPayload: boolean;
+  /** Local returned a STRUCTURED result. A salvaged, unparseable local reply is not a verification. */
+  localStructured: boolean;
 }): VerifyCleanStep {
   if (!localVerifies(input) || input.fallback) return "post";
   if (!input.verifyStarted) return input.findings > 0 || input.salvagedRaw ? "post-chat" : "start-verify";
-  return input.localPayload ? "post-verified" : "post-chat-unverified";
+  return input.localStructured ? "post-verified" : "post-chat-unverified";
 }
 
 /** Review/ops line saying which reviewer produced a verification round's result. */

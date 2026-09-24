@@ -89,11 +89,23 @@ function assistantCodeBlocks(root = currentAssistantRoot()) {
   const blocks = [];
   for (const turn of turns) {
     for (const pre of turn.querySelectorAll("pre")) {
+      if (!renderedIn(pre, turn)) continue; // a hidden/stale block the renderer kept is not the answer
       const text = (pre.querySelector("code") || pre).textContent || "";
       if (text.trim()) blocks.push(text);
     }
   }
   return blocks;
+}
+
+/** Whether `el` is visible up to `root` (cleanTurnText's exclusions: hidden, aria-hidden,
+ * template, display:none, visibility:hidden, opacity 0). */
+function renderedIn(el, root) {
+  for (let node = el; node && node !== root.parentElement; node = node.parentElement) {
+    if (node.matches?.("[hidden], [aria-hidden='true'], template")) return false;
+    const style = globalThis.window?.getComputedStyle ? window.getComputedStyle(node) : null;
+    if (style && (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0)) return false;
+  }
+  return true;
 }
 
 /** A bound response's canonical answer text, what its collector harvested and what every later
@@ -423,7 +435,12 @@ function fixTabOwnership(state) {
   let submission;
   try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return "unknown"; }
   const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  const draft = typeof composer === "function" && globalThis.document ? composer() : null;
+  const draftText = (draft && (draft.value || draft.innerText || draft.textContent || "") || "").trim();
   if (submission?.phase !== "sent") {
+    // Before the send is confirmed the composer may still hold Ashlar's own prompt; anything
+    // else in it is the user's.
+    if (draftText && !(submission?.expected && normalizePrompt(draftText).includes(submission.expected))) return "takenOver";
     if (!users.length) return "owned";
     return Boolean(submission?.expected) && submission.baseline === 0 && users.length === 1 &&
       normalizePrompt(messagePromptText(users[0])).includes(submission.expected) ? "owned" : "takenOver";
@@ -431,8 +448,7 @@ function fixTabOwnership(state) {
   const bound = boundReviewResponse(submission);
   if (bound.followup) return "takenOver";
   if (!bound.identified) return users.length ? "takenOver" : "unknown";
-  const draft = typeof composer === "function" && globalThis.document ? composer() : null;
-  return draft && (draft.value || draft.innerText || draft.textContent || "").trim() ? "takenOver" : "owned";
+  return draftText ? "takenOver" : "owned";
 }
 
 /** Short message replies keep MV3 workers recoverable; the page owns the long model call.

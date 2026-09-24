@@ -223,8 +223,15 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  const cancel=()=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type:'ashlar-fix-cancel',jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix'});
  assert.equal((await cancel()).owned,true,'only Ashlar\'s own half-sent prompt is in the tab');
+ const draft=text=>page.locator('#prompt-textarea').evaluate((el,t)=>{el.textContent=t;},text);
+ await draft('my own question');
+ assert.equal((await cancel()).owned,false,'no turn yet, but the composer holds the user\'s own text');
+ await draft('fix prompt');
  await page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='fix prompt';document.querySelector('main').append(u);});
  assert.equal((await cancel()).owned,true,'the just-clicked, not yet confirmed turn is Ashlar\'s');
+ await draft('my own question');
+ assert.equal((await cancel()).owned,false,'Ashlar\'s turn, but a user draft in the composer');
+ await draft('');
  await page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').textContent='someone else asked this';});
  assert.equal((await cancel()).owned,false,'a turn that is not Ashlar\'s prompt preserves the tab');
 });
@@ -243,6 +250,12 @@ test('real DOM: a fix is read from its fenced code block literally, never from r
  await unfenced.clock.runFor(3200);
  const out=await unfenced.evaluate(()=>window.fixResult);
  assert.match(out.raw,/no fenced code block/);assert.ok(!out.raw.includes('{'),'no JSON reaches the fix parser');
+});
+
+test('real DOM: a hidden or stale code block the renderer kept is never part of a fix answer',async t=>{
+ const visible='{"summary":"new","files":[]}';
+ const page=await fixture(t,user+answer(`<pre hidden><code>{"summary":"stale-hidden"}</code></pre><div style="display:none"><pre><code>{"summary":"stale-none"}</code></pre></div><pre style="opacity:0"><code>{"summary":"stale-transparent"}</code></pre><pre><code>${visible}</code></pre>`,true));
+ assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),[visible]);
 });
 
 test('real DOM: a completed fix with prose around its fence still proves its own tab (can close)',async t=>{

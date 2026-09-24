@@ -4,6 +4,10 @@ const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
 const CLOSED_PREFIX = "ashlar:closed:";
 const OWNED_PREFIX = "ashlar:tab:";
+// A fix run whose tab the worker preserved without the page's own release (it never answered):
+// the inventory treats that page's binding as released, so it is never an orphan holding capacity.
+const PRESERVED_PREFIX = "ashlar:preserved:";
+const preservedKey = (jobId, provider, runId) => `${PRESERVED_PREFIX}${jobId}:${provider}:${runId || "legacy"}`;
 const DEFAULT_MAX_REVIEW_TABS = 4;
 const HEARTBEAT_MS = 10_000;
 const HEALTH_KEY = "bridgeHealth";
@@ -503,7 +507,7 @@ async function tabCapacityReport(jobs, reservePending = false) {
   // it until its matching job is recovered or a secured cleanup releases it.
   const orphanTabs = tabs.filter(tab=>{
     const owner=knownTabOwner(tab);
-    if(!owner?.jobId || owner.released || ids.has(tab.id))return false;
+    if(!owner?.jobId || owner.released || ids.has(tab.id) || session[preservedKey(owner.jobId,owner.provider,owner.runId)])return false;
     const registered=jobs[owner.jobId]?.states?.[owner.provider];
     return !registered?.cleanupDone;
   });
@@ -716,7 +720,8 @@ async function waitOrPreserveFixTab(job, provider, jobs, reason, beforePreserve)
   const state = job.states[provider];
   state.ownershipUnknownAt ??= Date.now();
   if (Date.now() - state.ownershipUnknownAt < FIX_OWNERSHIP_WAIT_MS) return saveJobs(jobs);
-  await beforePreserve?.();
+  await beforePreserve?.().catch(() => {}); // the page may never answer: the marker below still holds
+  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: true});
   return finishTabCleanup(job, provider, jobs, reason);
 }
 

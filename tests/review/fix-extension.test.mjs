@@ -234,7 +234,8 @@ test('worker: a cancelled fix whose run was never sent closes its blank tab and 
 });
 
 test('worker: a cancelled fix tab stuck loading is preserved after the wait (never closed unproven)', async () => {
-  const b = worker([fixJob()], {api: cancelled, handler: () => ({ok: true, owned: true, url: URL_FIX}), status: 'loading'});
+  let status = null; // what the page reports to the inventory probe once it answers
+  const b = worker([fixJob()], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-tab-status' && status ? status : {ok: true, owned: true, url: URL_FIX}), status: 'loading'});
   await b.tick();
   assert.equal(b.closedTabs.length, 0);assert.ok(b.local.state.pendingReviewJobs['fix-A'], 'waits while loading');
   assert.equal(b.messages.some(m => m.type === 'ashlar-fix-cancel'), false, 'a loading page is not asked');
@@ -243,6 +244,12 @@ test('worker: a cancelled fix tab stuck loading is preserved after the wait (nev
   b.context.Date = class extends RealDate { static now() { return later; } };
   await b.tick();
   assert.equal(b.closedTabs.length, 0);assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'retired, capacity released');
+  // the page finishes loading later and still reports its unreleased binding: not an orphan
+  b.tabs.get(10).status = 'complete';
+  status = {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: URL_FIX};
+  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  const report = await b.context.tabCapacityReport({});
+  assert.equal(report.orphanTabs, 0, 'the preserved run is released worker-side');
 });
 
 test('worker: a cancelled fix tab the user took over is preserved, never closed', async () => {

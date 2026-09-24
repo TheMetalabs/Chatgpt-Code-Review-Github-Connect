@@ -699,8 +699,13 @@ const FIX_OWNERSHIP_WAIT_MS = 2 * 60_000;
 
 async function forceCloseFixTab(job, provider, jobs, tab) {
   const state = job.states[provider];
-  const result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-fix-cancel"), contentFiles(provider));
-  if (!matchesJob(result, job, provider) || result.ok !== true) {
+  // A tab opened for this fix whose run was never sent is unbound by design: the page then
+  // answers for an unbound tab (Ashlar's only while it holds no turn and no draft).
+  const undispatched = !state.started;
+  const message = {...tabMessage(job, provider, "ashlar-fix-cancel"), ...(undispatched ? {undispatched: true} : {})};
+  const result = await sendToTab(tab.id, message, contentFiles(provider));
+  const unbound = undispatched && result?.ok === true && !result.jobId && !result.runId && result.provider === provider;
+  if (!(matchesJob(result, job, provider) || unbound) || result.ok !== true) {
     state.cleanupError = "tab ownership does not match; no tab was closed";
     await saveJobs(jobs);
     return;

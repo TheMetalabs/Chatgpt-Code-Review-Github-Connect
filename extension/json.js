@@ -482,7 +482,15 @@ function installReviewRunner(name, run) {
       return;
     }
     if (msg.type === "ashlar-fix-cancel") {
-      // Positive binding only: an unbound page is never evidence that this tab is Ashlar's.
+      // Positive binding only: an unbound page is never evidence that this tab is Ashlar's —
+      // except the tab the worker opened for this fix and never sent its run (undispatched):
+      // that one is Ashlar's only while it holds nothing of the user's (no turn, no draft).
+      if (msg.undispatched === true && !state.jobId && !state.runId) {
+        const turns = globalThis.document ? document.querySelectorAll('[data-message-author-role="user"]').length : 0;
+        const draft = typeof composer === "function" && globalThis.document ? composer() : null;
+        const blank = !turns && !(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
+        reply({ok:true,owned:blank,ownership:blank ? "owned" : "takenOver",url:globalThis.location?.href || ""});return;
+      }
       if (!state.jobId || msg.jobId !== state.jobId || !state.runId || msg.runId !== state.runId) {
         reply({ok:false,code:"job_mismatch"});return;
       }

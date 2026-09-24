@@ -113,6 +113,14 @@ test('page: ashlar-fix-cancel needs a positive binding, reports ownership and st
   assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, 'the preserved tab frees its slot (not counted against capacity)');
 });
 
+test('page: an undispatched fix tab (never bound) answers for itself only when the worker says so', async () => {
+  const p = page();
+  assert.equal(p.c.message(msg('ashlar-fix-cancel')).code, 'job_mismatch', 'unbound, no claim: never Ashlar-owned');
+  const out = p.c.message(msg('ashlar-fix-cancel', {undispatched: true}));
+  assert.equal(out.ok, true);assert.equal(out.owned, true, 'a blank chat page with no turn or draft');
+  assert.ok(!out.jobId && !out.runId, 'the reply carries no binding');
+});
+
 test('page: fix-cancel ownership is "unknown" when it cannot be established yet; only takeover or preserve frees the slot', async () => {
   const p = page({limit: 500});
   Object.assign(p.c.context, {stopButtonVisible: () => true, replyDoneVisible: () => false, savedSubmission: () => null});
@@ -204,6 +212,18 @@ test('worker: an unknown ownership is asked again, then the tab is preserved (sl
   assert.equal(b.closedTabs.length, 0, 'never closed on a guess');assert.ok(b.tabs.has(10));
   assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
   assert.deepEqual(b.local.state.pendingReviewJobs, {});
+});
+
+test('worker: a cancelled fix whose run was never sent closes its blank tab and retires', async () => {
+  const handler = (_id, m) => (m.type === 'ashlar-fix-cancel' && m.undispatched ? {ok: true, owned: true, ownership: 'owned', url: URL_FIX, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'});
+  const b = worker([fixJob({states: {chatgpt: {tabId: 10, started: false, runId: 'run-A'}}})], {api: cancelled, handler});
+  await b.tick();
+  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.undispatched === true));
+  assert.deepEqual(b.closedTabs, [10]);assert.deepEqual(b.local.state.pendingReviewJobs, {});
+  // a started run never takes the undispatched path
+  const started = worker([fixJob()], {api: cancelled, handler});
+  await started.tick();
+  assert.equal(started.messages.some(m => m.undispatched), false);assert.equal(started.closedTabs.length, 0);
 });
 
 test('worker: a cancelled fix tab the user took over is preserved, never closed', async () => {

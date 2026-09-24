@@ -17,6 +17,9 @@ import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
 type BridgeMeta = {
   token: string;
   lastSeen: number;
+  /** When this token's bridge became unreachable without ever being seen: process start, or the
+   * last rotation (a rotation disconnects the extension until it gets the new token). */
+  unseenSince: number;
   lastJobId?: string;
   lastError?: string;
   lastTakeAt?: number;
@@ -45,7 +48,7 @@ function loadToken(): string {
   return resolved.token;
 }
 
-let meta: BridgeMeta = { token: loadToken(), lastSeen: 0 };
+let meta: BridgeMeta = { token: loadToken(), lastSeen: 0, unseenSince: Date.now() };
 // Diagnostic only, never used as authorization or to cancel a generation.
 const serverInstanceId = randomBytes(12).toString("base64url");
 
@@ -53,6 +56,8 @@ export type BridgeStatus = {
   token: string;
   connected: boolean;
   lastSeen: number;
+  /** When the bridge went offline (epoch ms); undefined while connected. */
+  disconnectedAt?: number;
   lastJobId?: string;
   lastError?: string;
 };
@@ -71,13 +76,21 @@ export type BridgePublic = Omit<BridgeStatus, "token"> & {
 };
 
 export function getBridgeStatus(): BridgeStatus {
+  const connected = meta.lastSeen > 0 && Date.now() - meta.lastSeen < BRIDGE_CONNECTED_MS;
   return {
     token: meta.token,
-    connected: meta.lastSeen > 0 && Date.now() - meta.lastSeen < BRIDGE_CONNECTED_MS,
+    connected,
     lastSeen: meta.lastSeen,
+    disconnectedAt: connected ? undefined : bridgeDisconnectedAt(),
     lastJobId: meta.lastJobId,
     lastError: meta.lastError,
   };
+}
+
+/** A seen bridge went offline when `connected` flipped (lastSeen + BRIDGE_CONNECTED_MS); an unseen
+ * one when this token started (process start or rotation), never at an older observation. */
+function bridgeDisconnectedAt(): number {
+  return meta.lastSeen > 0 ? meta.lastSeen + BRIDGE_CONNECTED_MS : meta.unseenSince;
 }
 
 export function getBridgePublic(): BridgePublic {
@@ -93,7 +106,7 @@ export function getBridgePublic(): BridgePublic {
 export function rotateBridgeToken() {
   const token = newToken();
   persistToken(token);
-  meta = { token, lastSeen: 0 };
+  meta = { token, lastSeen: 0, unseenSince: Date.now() };
   return getBridgeStatus();
 }
 

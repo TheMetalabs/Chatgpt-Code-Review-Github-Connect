@@ -131,6 +131,28 @@ const ROWS=[
       s.app.harbor.cancelHarborJob(s.jobId);
       return s;
     }},
+  {name:'L13 a bridge token rotation waits the grace from the rotation, not from an older unseen bridge',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/},
+    async run(t){
+      // Job A is admitted while the bridge has never been seen, then the bridge connects and stays
+      // healthy for hours: that old unseen spell must not date a later disconnect.
+      const a=await start(t,{delivery:'lifecycle-rotation-a'});
+      await settle();
+      a.app.bridge.bridgeHeartbeat();await settle();
+      a.app.harbor.cancelHarborJob(a.jobId);
+      for(let i=0;i<30;i++){a.app.clock.now+=100_000;a.app.bridge.bridgeHeartbeat();}
+      const out=await a.app.mention('lifecycle-rotation-b');
+      const job=()=>a.app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+      await eventually(()=>job()?.status==='awaiting_chat','job B not ready');
+      a.app.bridge.rotateBridgeToken(); // the extension is disconnected until it gets the new token
+      assert.equal(a.app.bridge.getBridgePublic().connected,false);
+      assert.equal(a.app.bridge.getBridgePublic().disconnectedAt,a.app.clock.now,'disconnected at the rotation');
+      await settle();
+      assert.equal(a.app.localRequests.length,0,'held: the bridge disconnected just now');
+      a.app.clock.now+=120_001;
+      await answerLocal(a.app,0,res=>res.end(reply(dirty)));
+      assert.ok(job().localFallbackAt,'released as the fallback once past the grace');
+      return {app:a.app,jobId:out.jobId,job};
+    }},
   {name:'R1 race: chat and local both find the issue',expect:{status:'posted',requests:1,reviews:1},
     async run(t){
       const s=await start(t,{role:'race'});

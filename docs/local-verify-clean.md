@@ -74,6 +74,11 @@ It is called only on an **explicit terminal signal** of the chat round:
 | Every chat leg reached an explicit terminal outcome (quota, empty, tab closed, error) with no payload | fallback | watcher |
 | The Chrome bridge reports disconnected for at least `BRIDGE_CONNECTED_MS`, measured from the disconnect, with no chat progress | fallback | watcher (`chatStalled`) |
 
+The disconnect time is the bridge's own (`BridgeStatus.disconnectedAt` in `bridge.server.ts`): for a
+bridge seen before, when `connected` flipped (`lastSeen + BRIDGE_CONNECTED_MS`); for one not seen
+with the current token, process start or the last token rotation. A rotation therefore restarts the
+grace, and no older observation dates a newer disconnect. Row L13 pins it.
+
 What never releases it:
 
 - job age or any timer on the job;

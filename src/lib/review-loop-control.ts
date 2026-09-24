@@ -27,7 +27,7 @@ import {
   parseStopRecord,
   type ReviewLoopMode,
 } from "./review-loop.ts";
-import type { LoopEvent } from "./review-loop-session.ts";
+import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
 import { retryWrite, writeOutcomeUnknown } from "./write-retry.ts";
 
 export type ControlKind = "start" | "stop" | "continue" | "handoff";
@@ -261,6 +261,18 @@ export class OwnWrites {
       else if (folds(e)) out.push(standInEvent(e));
     }
     return out;
+  }
+
+  /**
+   * The kind of THIS process's own write that ended session `s` when that write may not be
+   * durable: a handoff whose outcome is unknown. Only this process sees that end — a restart
+   * forgets it and the durable history may still show the session active — so a gate must never
+   * treat it as a settled end. Call it with a session read that just reconciled the journal.
+   */
+  unconfirmedEnd(ref: PrRef, s: Pick<LoopSession, "active" | "endedBy" | "endedAt">): "handoff" | undefined {
+    if (s.active || s.endedBy !== "escalate") return undefined;
+    const at = isoMs(s.endedAt);
+    return this.unresolved(ref, "handoff").some((u) => isoMs(u.attemptAt) === at) ? "handoff" : undefined;
   }
 
   /** The writes of `kind` on this PR whose outcome is still unknown. */

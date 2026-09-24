@@ -44,6 +44,7 @@ const PUSHED = "b".repeat(40); // a human push (continue:push)
 const LIVE = "c".repeat(40); // the live head a superseded step finds
 const MOVED = "d".repeat(40); // a push that lands while the fix request runs
 const NEW_SHA = "e".repeat(40); // the applied round's commit
+const FRESH = "f".repeat(40); // a human push after the write (later: push / moved)
 const T0 = Date.parse("2026-03-01T00:00:00Z"); // the world clock starts here
 const ALICE_AT = "2026-02-20T00:00:00Z"; // alice's start directive; review rounds follow it
 const ENV = { ASHLAR_FIX_AGENT: "1", ASHLAR_LOOP_ROUND_CAP: "5" } as NodeJS.ProcessEnv;
@@ -70,7 +71,7 @@ type Via =
   | "handoff:terminal";
 type Write = "success" | "rejected" | "unknown-landed" | "unknown-lost";
 type List = "normal" | "lagging" | "failing";
-type Later = "redelivery" | "newer-start" | "same-second-start" | "25h" | "row-appears";
+type Later = "redelivery" | "newer-start" | "same-second-start" | "25h" | "row-appears" | "push" | "moved";
 type Phase = "call" | "view" | "again" | "follow";
 type Cell = { via: Via; write: Write; list: List; later: Later };
 type Result = ControlResult | LoopStepResult;
@@ -91,13 +92,15 @@ const VIAS: Via[] = [
 ];
 const WRITES: Write[] = ["success", "rejected", "unknown-landed", "unknown-lost"];
 const LISTS: List[] = ["normal", "lagging", "failing"];
-const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears"];
+const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears", "push", "moved"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
- * the POST matters only where the write is stamped at its attempt (a continuation or handoff). */
+ * the POST matters only where the write is stamped at its attempt (a continuation or handoff); a
+ * human push, or a step whose head moved, reads a session a handoff may have ended. */
 function applies(via: Via, later: Later): boolean {
   if (later === "same-second-start") return kindOf(via) === "continue" || kindOf(via) === "handoff";
+  if (later === "push" || later === "moved") return kindOf(via) === "handoff";
   return true;
 }
 /** The head a continuation under test is for. */
@@ -173,6 +176,8 @@ class World {
   readonly underTest: Phase[] = [];
   rowsForWrite = 0;
   carolAt?: string;
+  /** The PR's head after a human push (later: push / moved). */
+  pushedHead?: string;
   /** When the write under test first left (its attempt instant). */
   firstAttemptMs?: number;
   committed = false;
@@ -244,6 +249,7 @@ class World {
   }
 
   live(): string {
+    if (this.pushedHead) return this.pushedHead;
     switch (this.cell.via) {
       case "continue:push":
         return PUSHED;
@@ -389,6 +395,16 @@ class World {
   }
 }
 
+/** What a human push (continueLoopOnPush) or a step whose head moved (a superseded step asks for
+ * the live head's review) reports after the write: nothing to continue once a handoff is durable,
+ * a request for the new head while the session is active — and, while the handoff that ended the
+ * session exists only in this process (its outcome unknown), a logged "unknown", never a quiet exit. */
+function expectNextHead(c: Cell): Cls {
+  if (c.list === "failing") return "unreadable";
+  if (c.write === "rejected") return c.later === "push" ? "posted" : "resolved";
+  return c.write === "success" || (c.write === "unknown-landed" && c.list === "normal") ? "resolved" : "unknown";
+}
+
 // ── classification ──────────────────────────────────────────────────────────────
 
 function controlClass(r: ControlResult): string {
@@ -499,6 +515,20 @@ async function assertReconciled(w: World): Promise<void> {
   assert.equal(n, expected, `I4: ${n} events for the write`);
 }
 
+/** I2 across kinds: the session a handoff ended is read by the next head's handlers too. */
+async function assertNextHeadHeard(w: World): Promise<void> {
+  const { later } = w.cell;
+  w.phase = "view";
+  w.pushedHead = FRESH;
+  const r =
+    later === "push"
+      ? await continueLoopOnPush("t", { ...w.ref, headSha: FRESH, actor: "alice" }, settings(w.mode()), w.deps, ENV)
+      : await w.plainStep(HEAD, "moved"); // the review of the old head: superseded by FRESH
+  const cls = classify(w, r);
+  assert.equal(cls, expectNextHead(w.cell), `I3 ${later}: ${JSON.stringify(r)}`);
+  assertLogged(w, r, cls, later);
+}
+
 /** I6: carol's newer start is never ended by an older record; a step in her session runs. */
 async function assertNewerSessionLives(w: World): Promise<void> {
   const { via, write } = w.cell;
@@ -537,6 +567,8 @@ async function runCell(c: Cell, pr: number): Promise<void> {
     if (w.newerStart()) {
       await w.injectCarol(); // a success had no backoff to inject it in
       await assertNewerSessionLives(w);
+    } else if (c.later === "push" || c.later === "moved") {
+      await assertNextHeadHeard(w);
     } else {
       // I5 on a readable list (not beside carol's start, which would answer for the write)
       if (c.list !== "failing") {

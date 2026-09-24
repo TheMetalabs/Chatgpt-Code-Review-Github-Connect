@@ -1633,6 +1633,22 @@ describe("ambiguous control writes: journaled with no expiry, never read as post
     assert.ok(f.posted.some((b) => b.startsWith("### Ashlar fix agent — no change")), "the rationale is reported");
   });
 
+  it("a round whose session this process's own unknown handoff ended mid-fix exits logged, not as a quiet 'ended by a handoff'", async () => {
+    const f = fakeDeps({ start: "suggest", rounds: [3], failContinuation: true });
+    const attempts = unknownFor(f, (b) => b.includes("ashlar-loop-escalate"));
+    const fix = f.deps.requestFix;
+    f.deps.requestFix = async (p, ctl) => {
+      // a late push event for this very head: its continuation is refused, its loop-error handoff's outcome is unknown
+      await continueLoopOnPush("t", { owner: "o", repo: "r", pr: 7, headSha: HEAD, actor: "alice" }, settings(), f.deps, ENV_ON);
+      return fix(p, ctl);
+    };
+    const r = await run(f, "suggest");
+    assert.equal(attempts(), 1, "one handoff POST");
+    assert.ok(!r.ran && r.reason.startsWith("handed off (outcome unknown)"), JSON.stringify(r));
+    assert.ok(!SILENT_REASONS.includes(r.reason), "logged");
+    assert.ok(!f.posted.some((b) => b.includes("Ashlar fix agent — suggestion")), "the moot suggestion is not posted");
+  });
+
   it("a stop whose record has an unknown outcome: one POST, a redelivery is not 'recorded', the stop stays honored", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3] });
     const attempts = unknownFor(f, (b) => b.startsWith(STOPPED_MARKER));

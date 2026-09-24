@@ -53,13 +53,19 @@ export function localVerifies(input: { role?: LocalReviewRole; providers: readon
   return input.role === "verify-clean" && input.providers.includes("local") && input.providers.some(isChatProvider);
 }
 
-/** The providers the job waits on right now: a held-back local leg counts only once it is released. */
+/** The providers the job waits on right now: a held-back local leg counts only once it is released.
+ * Releasing local as the chat-down fallback (`localFallback`, Job.localFallbackAt) is permanent: the
+ * job never requires a chat reviewer again, whatever the bridge does later (a reconnect included). A
+ * chat payload that still lands before local posts is merged; it is never waited for. */
 export function racingProviders(input: {
   role?: LocalReviewRole;
   providers: readonly ReviewProvider[];
   localReleased: boolean;
+  localFallback?: boolean;
 }): ReviewProvider[] {
-  if (!localVerifies(input) || input.localReleased) return [...input.providers];
+  if (!localVerifies(input)) return [...input.providers];
+  if (input.localFallback) return input.providers.filter((p) => !isChatProvider(p));
+  if (input.localReleased) return [...input.providers];
   return input.providers.filter((p) => p !== "local");
 }
 

@@ -99,7 +99,7 @@ export function getBridgePublic(): BridgePublic {
     workerStatus: meta.workerStatus,
     workerStatusFresh: workerStatusIsFresh(meta.workerStatus, Date.now(), BRIDGE_CONNECTED_MS),
     repairProtocol: 1, captureProtocol: 1, recoveryProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
-    pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && pendingChatProviders(job).length > 0).length,
+    pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && offerableChatProviders(job).length > 0).length,
   };
 }
 
@@ -160,6 +160,14 @@ function pendingChatProviders(job: Job): ReviewProvider[] {
   );
 }
 
+/** The chat providers a take may hand the extension. A job released as the chat-down fallback no
+ * longer waits on chat (racingProviders), so it starts no fresh chat generation: only a run that
+ * already started may resume, and its result is merged only if it lands before local posts. */
+function offerableChatProviders(job: Job): ReviewProvider[] {
+  const pending = pendingChatProviders(job);
+  return job.localFallbackAt ? pending.filter(provider => job.attemptedProviders?.includes(provider)) : pending;
+}
+
 export function bridgeJobState(jobId: string) {
   const job = getHarbor().jobs.find(j => j.id === jobId);
   return {active: job?.status === "awaiting_chat", status: job?.status ?? "missing"};
@@ -185,7 +193,7 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
   for (const job of harbor.jobs) {
     if (excludeJobIds.includes(job.id) || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) continue;
     if (job.bridgeClaimedAt && !STALE_CLAIM(job)) continue;
-    const providers = pendingChatProviders(job);
+    const providers = offerableChatProviders(job);
     if (!providers.length) continue;
     const attempted = job.attemptedProviders ?? [];
     // Only the owning Chrome profile has the original tab. Never start a replacement

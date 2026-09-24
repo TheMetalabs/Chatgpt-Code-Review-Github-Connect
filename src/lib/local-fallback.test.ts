@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { chatStalled, heldLocalEvidence, heldLocalSalvage, heldLocalUnusable, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
   it("starts local immediately when the setting is on", () => {
@@ -115,6 +116,18 @@ describe("verify-clean local role", () => {
     assert.equal(stillRacing({ providers: racingProviders({ role: "verify-clean", providers: [...both], localReleased: false }), payloads: ["chatgpt"], localInFlight: false }), false);
     // ...but not while the released verification leg is still running.
     assert.equal(stillRacing({ providers: racingProviders({ role: "verify-clean", providers: [...both], localReleased: true }), payloads: ["chatgpt"], localInFlight: true }), true);
+  });
+
+  it("a fallback release never requires chat again, whatever the chat leg's state (a reconnect included)", () => {
+    const fallback = { role: "verify-clean" as const, providers: ["chatgpt", "grok", "local"] as ReviewProvider[], localReleased: true, localFallback: true };
+    assert.deepEqual(racingProviders(fallback), ["local"]);
+    // A reconnected bridge: chat is pending again (no payload, no terminal error, generating).
+    const reconnected = { generating: { chatgpt: true, grok: true }, providerErrors: {} };
+    assert.equal(stillRacing({ providers: racingProviders(fallback), ...reconnected, payloads: ["local"], localInFlight: false }), false, "local done: the job posts");
+    assert.equal(stillRacing({ providers: racingProviders(fallback), ...reconnected, payloads: [], localInFlight: true }), true, "still waits on local itself");
+    // A verification round is not a fallback: chat already answered and stays part of the merge.
+    assert.deepEqual(racingProviders({ ...fallback, localFallback: false }), ["chatgpt", "grok", "local"]);
+    assert.deepEqual(racingProviders({ ...fallback, role: "race" }), ["chatgpt", "grok", "local"], "race is unchanged");
   });
 
   it("releases local as today's fallback only when chat finished without a usable result", () => {

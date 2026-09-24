@@ -153,6 +153,21 @@ const ROWS=[
       assert.ok(job().localFallbackAt,'released as the fallback once past the grace');
       return {app:a.app,jobId:out.jobId,job};
     }},
+  {name:'L14 the bridge reconnects after the fallback release: chat is never required again and gets no fresh work',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/},
+    async run(t){
+      const s=await start(t);
+      await settle();assert.equal(s.app.localRequests.length,0,'held within the bridge grace period');
+      s.app.clock.now+=120_001; // offline past the grace: released as the fallback
+      await eventually(()=>s.app.localRequests.length===1,'the fallback did not start');
+      assert.ok(s.job().localFallbackAt,'released as the fallback');
+      s.app.bridge.bridgeHeartbeat(); // the bridge is back before local answers, and chat never returns
+      assert.equal(s.app.bridge.getBridgePublic().connected,true);
+      assert.equal(s.app.bridge.takeNextBridgeJob('lifecycle-client'),null,'no fresh chat generation for a fallback-released job');
+      assert.equal(s.app.bridge.getBridgePublic().pendingJobs,0,'nothing is offered to the reconnected bridge');
+      await settle(); // several watcher ticks with the bridge connected
+      await answerLocal(s.app,0,res=>res.end(reply(clean)));
+      return s;
+    }},
   {name:'R1 race: chat and local both find the issue',expect:{status:'posted',requests:1,reviews:1},
     async run(t){
       const s=await start(t,{role:'race'});

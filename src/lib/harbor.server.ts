@@ -470,11 +470,10 @@ async function watchReviewersLoop(jobId: string, token: string) {
       now: Date.now(),
       graceMs: BRIDGE_CONNECTED_MS,
     });
-    // Once local runs as that stalled chat's fallback, the job no longer waits on the offline chat leg
-    // (it is reported as skipped); a chat result that still arrives first is merged as usual.
-    const waitOn = racingProviders({ role, providers: job.reviewProviders ?? [], localReleased });
+    // Once local runs as the fallback the job never waits on chat again, even if the bridge reconnects
+    // (chat is reported as skipped); a chat result that still arrives first is merged as usual.
     const racing = stillRacing({
-      providers: stalled && job.localFallbackAt ? waitOn.filter((p) => !isChatProvider(p)) : waitOn,
+      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased, localFallback: Boolean(job.localFallbackAt) }),
       payloads: stored.filter((l) => l.raw.trim()).map((l) => l.provider),
       assumptions: job.assumptions,
       localInFlight: localInFlight.has(jobId),
@@ -954,7 +953,7 @@ export async function submitHarborChat(
     const haveChat = payloads.some((l) => isChatProvider(l.provider));
     if (
       stillRacing({
-        providers: racingProviders({ role, providers, localReleased }),
+        providers: racingProviders({ role, providers, localReleased, localFallback: Boolean(job.localFallbackAt) }),
         payloads: payloads.map((l) => l.provider),
         assumptions: job.assumptions,
         localInFlight: localInFlight.has(jobId),

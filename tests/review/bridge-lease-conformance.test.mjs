@@ -122,6 +122,33 @@ for (const [kind, make] of Object.entries(KINDS)) {
     assert.equal(h.bridge.recoverBridgeJob('chrome-2', [binding], {fixes: true}), null, 'never another profile');
   });
 
+  // Ashlar 4096068024: resume semantics exist only once a run is established. Released before any
+  // run: a fix is a fresh submission again (resumeProviders empty). FLAG R5 (review, asserted as
+  // today, not changed here): take already marked the provider attempted, so the owner's next take
+  // is a resume that names no binding (the worker then waits for an original tab that never existed).
+  test(`lease contract (${kind}): released before any run, the owner's next take`, () => {
+    const {h, take} = make();
+    const offer = take('chrome-1');
+    h.bridge.releaseBridgeJob(offer.jobId, offer.leaseId);
+    const again = take('chrome-1');
+    assert.equal(again?.jobId, offer.jobId);
+    assert.deepEqual({resume: JSON.stringify(again.resumeProviders), bindings: JSON.stringify(again.bindings)},
+      kind === 'fix' ? {resume: '[]', bindings: undefined} : {resume: '["chatgpt"]', bindings: undefined});
+    assert.equal(take('chrome-2', [again.jobId])?.jobId === offer.jobId, false, 'still never another profile');
+  });
+
+  test(`lease contract (${kind}): released after its run was established, the owner's next take resumes that run`, () => {
+    const {h, take} = make();
+    const offer = take('chrome-1');
+    assert.equal(h.bridge.recordBridgeProgress(offer.jobId, offer.leaseId, progress('run-A')), true);
+    h.bridge.releaseBridgeJob(offer.jobId, offer.leaseId);
+    const again = take('chrome-1');
+    assert.equal(again?.jobId, offer.jobId);
+    assert.equal(JSON.stringify(again.resumeProviders), '["chatgpt"]');
+    // a fix names the run it resumes; a review's take never carries bindings (its recover does)
+    assert.equal(JSON.stringify(again.bindings), kind === 'fix' ? JSON.stringify([{jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}]) : undefined);
+  });
+
   test(`lease contract (${kind}): a stale claim stays with its profile`, () => {
     const {h, take} = make();
     const offer = take('chrome-1');

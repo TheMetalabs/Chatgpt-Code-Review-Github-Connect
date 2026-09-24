@@ -132,6 +132,34 @@ describe("bridge fix registry: lifecycle", () => {
     assert.equal(await promise, "answer");
   });
 
+  // Ashlar 4096068024: resume semantics exist only once a run is established.
+  it("release before any run: the owner's next take is a fresh submission (no resume, no bindings); another profile still cannot take it", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    assert.equal(h.reg.release(offer.jobId, offer.leaseId), true);
+    assert.equal(h.reg.take(offer.jobId, "chrome-2"), null, "the item stays with its profile");
+    const again = h.reg.take(offer.jobId, "chrome-1");
+    assert.ok(again && again.leaseId !== offer.leaseId);
+    assert.deepEqual(again.resumeProviders, [], "a fresh submission");
+    assert.equal("bindings" in again, false);
+    assert.equal(again.prompt, REQ.prompt);
+    assert.equal(h.reg.submitting("chrome-1"), true, "its submission window starts at this take");
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", again.leaseId), { ok: true });
+    assert.equal(await promise, "answer");
+  });
+
+  it("release after a run was established: the owner's next take resumes that run through its binding", async () => {
+    const h = harness();
+    const { promise, offer } = queueAndTake(h);
+    assert.equal(h.reg.progress(offer.jobId, offer.leaseId, "generating", "run-A"), true);
+    assert.equal(h.reg.release(offer.jobId, offer.leaseId), true);
+    const again = h.reg.take(offer.jobId, "chrome-1");
+    assert.deepEqual(again?.resumeProviders, ["chatgpt"]);
+    assert.deepEqual(again?.bindings, [{ jobId: offer.jobId, provider: "chatgpt", runId: "run-A" }]);
+    assert.deepEqual(h.reg.complete(offer.jobId, "chatgpt", "answer", again!.leaseId), { ok: true });
+    assert.equal(await promise, "answer");
+  });
+
   it("a done item acknowledges a lost-ACK replay only of the same answer (as a review's identical leg)", async () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h);

@@ -26,7 +26,8 @@
  *     generation, so a fix is never awaited forever (fail closed → the runtime ESCALATEs);
  *   - leases mirror review items: only the lease holder refreshes / completes / fails; only the
  *     claiming Chrome profile may re-claim (its tab owns the generation); release frees the
- *     lease and the parallelPrs slot but keeps the profile and run (a later take resumes it);
+ *     lease and the parallelPrs slot but keeps the profile and run (a later take resumes a pinned
+ *     run; released before any run it is a fresh submission: resume only with a runId);
  *     tests/review/bridge-lease-conformance.test.mjs runs every rule against both kinds;
  *   - settled items answer late bridge calls consistently (a lost-ACK replay is idempotent) and
  *     are then forgotten. An UNKNOWN `fix-` id reports cancelled: the registry is in-memory, so
@@ -114,13 +115,12 @@ export interface FixItem {
   claimedAt?: number;
   submitAt?: number;
   generating?: boolean;
-  /** The run the lease holder started for this claim, pinned by its first progress report. A
-   * claim with a run lives in a tab: it is resumed through that binding (recover), never offered
-   * again as a fresh submission. */
+  /** The run the lease holder started for this claim, pinned by its first progress report (or by a
+   * recovery that proves the page's binding). It is the ONLY source of resume semantics: an item
+   * with a run lives in a tab and is resumed through that binding (recover, or the owner's take
+   * after a release), never offered again as a fresh submission; an item without one is always a
+   * fresh submission (there is no binding a resume could observe). */
   runId?: string;
-  /** A claim was handed out and later released: like a review's attemptedProviders, the item
-   * stays with its profile (`clientId`) and a later take RESUMES it, never re-sends the prompt. */
-  attempted?: boolean;
   /** Digest of the delivered answer: a lost-ACK replay is acknowledged only for this exact text
    * (a review acknowledges only an identical stored leg). */
   answerDigest?: string;
@@ -317,8 +317,8 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       // A stale claim gave up its slot; it may resume only while one is free again.
       if (claimedCount() >= limit()) return { ok: false, error: "fix parallel limit reached (fixAgent.parallelPrs)" };
     } else if (item.clientId && item.clientId !== clientId) {
-      // Released, but its generation may live in that profile's tab: never start a replacement
-      // generation from another profile (the review rule for an attempted provider).
+      // Released: it stays with its profile (a run may live in that profile's tab, or its first
+      // progress report was lost): never a replacement generation from another profile.
       return { ok: false, error: "fix generation belongs to another Chrome profile" };
     } else if (claimedCount() >= limit()) {
       return { ok: false, error: "fix parallel limit reached (fixAgent.parallelPrs)" };
@@ -334,15 +334,15 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return { ok: true, leaseId };
   }
 
-  function offer(item: FixItem, leaseId: string, resume?: string, attempted = false): FixOffer {
+  /** `resume`: the run a tab already holds. Resume semantics exist only with it: a resume offer
+   * always names its binding, and an offer without a run is a fresh submission. */
+  function offer(item: FixItem, leaseId: string, resume?: string): FixOffer {
     return {
       kind: "fix",
       jobId: item.id,
       provider: item.provider,
       providers: [item.provider],
-      // A take is a fresh submission (queued, or a replay no tab ever received); only recover()
-      // resumes the run a tab already holds.
-      resumeProviders: resume || attempted ? [item.provider] : [],
+      resumeProviders: resume ? [item.provider] : [],
       ...(resume ? { bindings: [{ jobId: item.id, provider: item.provider, runId: resume }] } : {}),
       leaseId,
       prompt: item.prompt,
@@ -359,13 +359,14 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   function take(id: string, clientId = ""): FixOffer | null {
     const item = current(id);
     if (!item || !(item.state === "queued" || (item.state === "claimed" && Boolean(clientId) && item.clientId === clientId && !item.runId))) return null;
-    const attempted = item.state === "queued" && item.attempted === true;
+    const resume = item.state === "queued" && item.runId ? item.runId : undefined;
     const out = claim(id, clientId);
     if (!out.ok) return null;
-    // A released claim was already handed to this profile: it is resumed (its run, if one was
-    // pinned, is in a tab), exactly like a review job whose providers were attempted.
-    if (attempted) return offer(item, out.leaseId, item.runId, true);
-    // Every other take hands out a fresh submission (a replay included): its window starts now.
+    // A released claim whose run was pinned is in that profile's tab: it is resumed through that
+    // binding (never re-sent).
+    if (resume) return offer(item, out.leaseId, resume);
+    // Every other take hands out a fresh submission (a replay, or a claim released before any run
+    // was established, included): its window starts now.
     item.submitAt = deps.now();
     item.generating = false;
     return offer(item, out.leaseId);
@@ -377,7 +378,9 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   function recover(id: string, clientId: string, provider: string, runId: string): FixOffer | null {
     prune();
     const item = current(id);
-    const live = item && (item.state === "claimed" || (item.state === "queued" && item.attempted === true));
+    // A released claim stays with its profile: the page's binding proves its run (pinned below,
+    // as for a claim whose first progress report was lost), so it is resumable too.
+    const live = item && (item.state === "claimed" || (item.state === "queued" && Boolean(item.clientId)));
     if (!item || !live || !clientId || item.clientId !== clientId || item.provider !== provider) return null;
     if (typeof runId !== "string" || !runId || runId.length > 128 || (item.runId && item.runId !== runId)) return null;
     const out = claim(id, clientId);
@@ -416,14 +419,14 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   }
 
   /** The lease holder hands the lease back (review: releaseBridgeJob). It frees the parallelPrs
-   * slot and voids the lease, but — like a review job, which keeps bridgeClientId and its
-   * attemptedProviders — release is NOT authorization for a new generation: the item stays with
-   * its profile and pinned run, and the next take by that profile resumes it. */
+   * slot and voids the lease; the item stays with its profile. Resume semantics follow the run
+   * alone: with a pinned run the owner's next take resumes it through that binding (never re-sent);
+   * released before any run was established, the item is a fresh submission again (no binding a
+   * resume could observe; resumeProviders empty). */
   function release(id: string, leaseId?: string): boolean {
     const item = current(id);
     if (!item || !holds(item, leaseId)) return false;
     item.state = "queued";
-    item.attempted = true;
     item.leaseId = undefined;
     item.claimedAt = item.submitAt = undefined;
     item.generating = false;

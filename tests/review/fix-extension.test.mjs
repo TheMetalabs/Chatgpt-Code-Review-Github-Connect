@@ -86,10 +86,12 @@ test('page: ashlar-fix-cancel needs a positive binding, reports ownership and st
   assert.equal(p.c.message(msg('ashlar-fix-cancel', {runId: 'run-B'})).code, 'job_mismatch');
   const out = p.c.message(msg('ashlar-fix-cancel'));
   assert.equal(out.ok, true);assert.equal(out.owned, true, 'nothing sent yet and no user turn: only Ashlar work in the tab');
+  assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, false, 'an owned tab keeps its managed slot until closed');
   await settled(p.c);
   assert.equal(p.c.message(msg('ashlar-harvest')).code, 'cancelled');
   p.state().tabRepurposed = true;
   assert.equal(p.c.message(msg('ashlar-fix-cancel')).owned, false, 'a tab the user took over is never owned');
+  assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, 'the preserved tab frees its slot (not counted against capacity)');
 });
 
 // ── worker ──────────────────────────────────────────────────────────────────

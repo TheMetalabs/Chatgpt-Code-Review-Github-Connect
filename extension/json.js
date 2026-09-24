@@ -459,7 +459,11 @@ function installReviewRunner(name, run) {
         reply({ok:false,code:"job_mismatch"});return;
       }
       state.fixCancelled = true; // The server settled this fix; stop collecting an answer for it.
-      reply({ok:true,owned:fixTabOwned(state),url:globalThis.location?.href || ""});return;
+      const owned = fixTabOwned(state);
+      // A tab the user took over stays open but is no longer Ashlar's: free its managed slot, or
+      // it counts against tab capacity (untracked binding) until the user closes it by hand.
+      if (!owned) releaseManagedSlot(state);
+      reply({ok:true,owned,url:globalThis.location?.href || ""});return;
     }
     if (["ashlar-capture-accepted", "ashlar-result-saved"].includes(msg.type)) {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider || msg.committed !== true) {

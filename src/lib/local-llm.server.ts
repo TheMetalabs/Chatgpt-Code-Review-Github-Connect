@@ -80,7 +80,7 @@ export async function runLocalLlm(
   settings: BotSettings,
   signal?: AbortSignal,
   opts?: LocalRequestOptions,
-): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
+): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string; priorText?: string }> {
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
   prompt = bridgePromptText(prompt); // Native API input remains readable source text, not escaped transport JSON.
@@ -116,8 +116,10 @@ export async function runLocalLlm(
       },
     ]);
     const corrected = extractChatJson(raw2);
+    // Both completed replies are kept: the first one may carry the real finding the correction lost,
+    // and a caller that salvages a failed leg (heldLocalSalvage) posts them as evidence.
     return corrected ? {ok: true, raw: corrected, originalText: raw2}
-      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2};
+      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, priorText: raw};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

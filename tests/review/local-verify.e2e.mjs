@@ -110,6 +110,21 @@ test('verify-clean: an unparseable local verifier reply is posted verbatim as un
   assert.equal(app.reviews[0].comments.length,0);
 });
 
+test('verify-clean: the first unparseable reply is kept as evidence even when the JSON correction replies differently',async t=>{
+  const {app,jobId}=await setup(t,'verify-clean',{localJsonRepairEnabled:false});
+  await app.harbor.submitHarborChat(jobId,clean);
+  await eventually(()=>app.localRequests.length===1,'clean chat did not start local verification');
+  app.localResponses[0].end(reply('P1 a.ts:1 FIRST-REPLY-MARK: a duplicate request writes twice'));
+  await eventually(()=>app.localRequests.length===2,'local did not ask for its one JSON correction');
+  app.localResponses[1].end(reply('still prose, sorry'));
+  await eventually(()=>app.reviews.length===1,'the review was not posted');
+  const body=app.reviews[0].body;
+  const block=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
+  assert.ok(block.includes('FIRST-REPLY-MARK'),'the first reply (the one with the finding) is posted');
+  assert.ok(block.includes('still prose, sorry'),'and the correction reply');
+  assert.equal(converged(body),false);
+});
+
 test('race (default): local still starts with the chat leg',async t=>{
   const {app,job}=await setup(t,'race');
   assert.equal(job().localReviewRole,'race');

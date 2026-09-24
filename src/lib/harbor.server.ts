@@ -792,7 +792,7 @@ function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string
 async function generateLocalLeg(
   jobId: string,
   prompt: string,
-): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
+): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string; priorText?: string }> {
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
   const job = state.jobs.find((j) => j.id === jobId);

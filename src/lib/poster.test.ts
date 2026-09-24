@@ -9,6 +9,7 @@ import {
   filterPublishable,
   findingsAgree,
   gateLiveSubmission,
+  GATED_FINDINGS_CAP,
   isBotMention,
   mergeEvent,
   partitionConsensus,
@@ -335,6 +336,18 @@ describe("gateLiveSubmission", () => {
       assert.equal(gate.findings.length, 0);
       assert.equal(gate.malformed, 2, "the phantom-file drop is policy, not shape");
       assert.equal(gate.dropped.length, 3);
+    }
+  });
+
+  it("counts the reported findings past its row cap, which it never inspects", () => {
+    const row = (i: number) => ({ severity: "P1", file: FINDING_412.file, line: FINDING_412.line, title: `row ${i}`, failure_scenario: "x", root_cause: "y", evidence: "z", recommended_fix: "w", recommended_test: "t" });
+    const gate = (n: number) => gateLiveSubmission({ merge_recommendation: "REQUEST_CHANGES", findings: Array.from({ length: n }, (_, i) => row(i + 1)) }, SAMPLE_PRS["pay-412"], { ...DEFAULT_SETTINGS, precisionOverRecall: false });
+    const at = gate(GATED_FINDINGS_CAP), past = gate(GATED_FINDINGS_CAP + 2);
+    assert.ok(at.ok && past.ok);
+    if (at.ok && past.ok) {
+      assert.equal(at.overflow, 0);
+      assert.equal(past.overflow, 2);
+      assert.equal(past.findings.some((f) => f.title === `row ${GATED_FINDINGS_CAP + 1}`), false, "the overflow rows are not gated");
     }
   });
 

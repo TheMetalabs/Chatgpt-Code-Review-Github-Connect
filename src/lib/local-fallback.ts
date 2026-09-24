@@ -127,9 +127,10 @@ export function heldLocalReleased(
  * no completed reply may have been set aside to get it: the JSON correction does not see the first
  * reply, so a clean correction says nothing about the finding that reply may carry. Nor may any text
  * of the reply itself be set aside: prose the model wrote outside the accepted JSON object
- * (`residualReplies`) can be a finding that object does not carry. */
+ * (`residualReplies`) can be a finding that object does not carry. Every row it reported must have
+ * been inspected, too: a finding past the gate's row cap (`overflow`) was set aside unread. */
 export function heldLocalUnusable(
-  gate: { ok: true; malformed?: number; rawReview?: string } | { ok: false; reason: string },
+  gate: { ok: true; malformed?: number; overflow?: number; rawReview?: string } | { ok: false; reason: string },
   leg: { unparsedText?: string; residualReplies?: string },
 ): string | undefined {
   if (!gate.ok) return gate.reason;
@@ -137,6 +138,7 @@ export function heldLocalUnusable(
   if (leg.unparsedText?.trim()) return "a completed reply was not review JSON";
   if (leg.residualReplies?.trim()) return "a completed reply carried text outside its review JSON";
   if (gate.malformed) return `${gate.malformed} finding(s) missing required fields`;
+  if (gate.overflow) return `${gate.overflow} finding(s) past the gate's row cap were not inspected`;
   return undefined;
 }
 

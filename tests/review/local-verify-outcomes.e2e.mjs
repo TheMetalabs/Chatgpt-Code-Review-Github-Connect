@@ -21,6 +21,12 @@ const LOCAL_RAW='P1 a.ts:1 LOCAL-RAW: a duplicate request writes twice';
 // valid JSON whose only finding lacks recommended_test: the gate drops it for its shape
 const {recommended_test:_test,...partial}=finding;
 const malformedJson=JSON.stringify({findings:[{...partial,title:'LOCAL-RAW duplicate write'}],merge_recommendation:'REQUEST_CHANGES'});
+// nine well-formed findings: the gate inspects eight, all on a file this PR does not change (policy
+// drops), and never reaches the ninth, a valid P1 on the changed file
+const overflowJson=JSON.stringify({merge_recommendation:'REQUEST_CHANGES',findings:[
+  ...Array.from({length:8},(_,i)=>({...finding,file:'unchanged.ts',title:`Unchanged file ${i+1}`})),
+  {...finding,title:'LOCAL-RAW ninth finding: duplicate write'},
+]});
 
 const CHAT={
   clean:cleanJson,
@@ -43,6 +49,7 @@ const LOCAL={
   // the finding in prose, then a JSON object the parser accepts but the gate rejects
   schemaInvalid:{answer:answer(`${LOCAL_RAW}\n{"findings":"see above","merge_recommendation":"REQUEST_CHANGES"}`)},
   malformed:{answer:answer(malformedJson)},
+  overflow:{answer:answer(overflowJson)},
   // the finding in prose, then the one JSON correction (which never sees the first reply) parses
   proseThenClean:{answer:answer(LOCAL_RAW,cleanJson)},
   proseThenMinimal:{answer:answer(LOCAL_RAW,minimalJson)},
@@ -78,6 +85,7 @@ const CELLS={
   'clean x proseThenClean':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:/could not be used as a review \(a completed reply was not review JSON\)/,stamp:'verify'}),
   'clean x proseThenMinimal':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:/could not be used as a review \(empty findings without investigated_safe/,stamp:'verify'}),
   'clean x malformed':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:/could not be used as a review \(1 finding\(s\) missing required fields\)/,stamp:'verify'}),
+  'clean x overflow':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:/could not be used as a review \(1 finding\(s\) past the gate's row cap were not inspected\)/,stamp:'verify'}),
   'clean x proseAndClean':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:RESIDUAL_NOTE,stamp:'verify'}),
   'clean x multiturnProseAndClean':posted(SUMMARY,MRU,1,{raw:['LOCAL-RAW'],note:RESIDUAL_NOTE,stamp:'verify'}),
   'clean x error':posted(UNVERIFIED,M0U,1,{note:/local verification did not complete \(/,stamp:'verify'}),
@@ -95,6 +103,7 @@ const CELLS={
   'none x malformed':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseThenClean':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseThenMinimal':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x overflow':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x multiturnProseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x error':skipped(1),

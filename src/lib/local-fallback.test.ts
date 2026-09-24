@@ -213,6 +213,11 @@ describe("heldLocalUnusable / heldLocalEvidence: a released held local reply is 
     assert.equal(heldLocalUnusable(ok, { unparsedText: "  " }), undefined);
   });
 
+  it("a gate that never inspected every reported finding (rows past its cap) is not", () => {
+    assert.equal(heldLocalUnusable({ ...ok, overflow: 1 }, {}), "1 finding(s) past the gate's row cap were not inspected");
+    assert.equal(heldLocalUnusable({ ...ok, overflow: 0 }, {}), undefined);
+  });
+
   it("a clean gate whose reply also carried text outside the accepted JSON is not", () => {
     assert.equal(heldLocalUnusable(ok, { residualReplies: "P1 a.ts:1 PROSE\n{}" }), "a completed reply carried text outside its review JSON");
     assert.equal(heldLocalUnusable(ok, { residualReplies: " " }), undefined);

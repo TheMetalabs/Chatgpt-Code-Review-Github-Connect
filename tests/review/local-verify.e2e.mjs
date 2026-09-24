@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {appFixture,eventually} from './app-fixture.mjs';
 import {isZeroFindings,parseFindingsTotal} from '../../src/lib/review-loop.ts';
-import {CLEAN_REVIEW_BODY} from '../../src/lib/review-format.ts';
+import {CLEAN_REVIEW_BODY,REVIEW_RAW_END,REVIEW_RAW_START,REVIEW_SUMMARY_MARK} from '../../src/lib/review-format.ts';
 // The review loop's real CONVERGED detector, reading a bot-authored review.
 const converged=body=>isZeroFindings(body,{authoredByBot:true});
 
@@ -90,19 +90,23 @@ test('verify-clean: chat clean + local failure posts chat\'s clean result with t
   assert.equal(converged(app.reviews[0].body),false,'an unverified clean result must never end the loop as converged');
 });
 
-test('verify-clean: an unparseable local reply is no verification: chat\'s clean result posts with the note',async t=>{
+test('verify-clean: an unparseable local verifier reply is posted verbatim as unverified evidence, never filtered out',async t=>{
   const {app,jobId,job}=await setup(t,'verify-clean',{localJsonRepairEnabled:false});
   await app.harbor.submitHarborChat(jobId,clean);
   await eventually(()=>app.localRequests.length===1,'clean chat did not start local verification');
-  // the local leg may ask again (multi-turn): every reply stays unparseable
+  // every reply (the first and the one correction) is prose carrying a real finding
+  const prose='P1 a.ts:1 LOCAL-RAW: a duplicate request writes twice (nothing structured here)';
   let answered=0;
-  await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(reply('Looks fine to me, nothing structured here.'));return app.reviews.length===1;},'chat clean result was not posted after local replied unparseable');
+  await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(reply(prose));return app.reviews.length===1;},'the review was not posted after local replied unparseable');
+  const body=app.reviews[0].body;
   assert.equal(job().status,'posted');
-  assertUnverifiedNotClean(app.reviews[0].body);
-  assert.match(app.reviews[0].body,/local verification did not complete \(/);
-  assert.match(app.reviews[0].body,/ashlar-findings total=0 .*unverified=1 -->$/);
-  assert.equal(converged(app.reviews[0].body),false,'an unparseable verifier is no verification: never converged');
-  assert.doesNotMatch(app.reviews[0].body,/nothing structured here/,'the verifier\'s raw text stays out of the review');
+  assert.equal(body.split('\n')[0],REVIEW_SUMMARY_MARK);
+  const block=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
+  assert.ok(block.includes(prose),'the verifier\'s finding text is posted inside the raw block');
+  assert.match(body,/local verification's reply was not parseable review JSON/);
+  assert.match(body,/<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 unverified=1 -->$/);
+  assert.equal(body.toLowerCase().includes("didn't find any major issues"),false,'no clean sentinel');
+  assert.equal(converged(body),false,'an unparseable verifier is no verification: never converged');
   assert.equal(app.reviews[0].comments.length,0);
 });
 

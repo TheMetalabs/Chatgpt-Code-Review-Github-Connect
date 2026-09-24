@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import { chatStalled, heldLocalSalvage, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
 
 describe("shouldStartLocalRace", () => {
   it("starts local immediately when the setting is on", () => {
@@ -142,5 +142,30 @@ describe("verify-clean local role", () => {
     const now = 5_000_000;
     assert.equal(chatStalled({ ...s, disconnectedAt: now - 1, now }), false, "job age is not the basis");
     assert.equal(chatStalled({ ...s, disconnectedAt: now - 1, now: now - 1 + G }), true);
+  });
+});
+
+describe("heldLocalSalvage", () => {
+  const CL = ["chatgpt", "local"] as const;
+  const held = { localReviewRole: "verify-clean" as const, reviewProviders: [...CL] };
+  const text = "P1 a.ts:1 LOCAL-RAW: a duplicate request writes twice";
+  const rawOf = (s: string | undefined) => (s ? (JSON.parse(s) as { raw_review: string }).raw_review : undefined);
+
+  it("never salvages a race leg or a held leg that was not released", () => {
+    assert.equal(heldLocalSalvage({ ...held, localReviewRole: "race", localVerifyStartedAt: 1 }, { originalText: text }), undefined);
+    assert.equal(heldLocalSalvage(held, { originalText: text }), undefined);
+  });
+
+  it("keeps a released leg's completed non-JSON reply verbatim (verification round and fallback)", () => {
+    for (const stamp of [{ localVerifyStartedAt: 1 }, { localFallbackAt: 1 }]) {
+      const raw = rawOf(heldLocalSalvage({ ...held, ...stamp }, { originalText: text }));
+      assert.ok(raw?.includes(text), JSON.stringify(stamp));
+      assert.match(raw ?? "", /Detected severity markers: P1\./);
+    }
+  });
+
+  it("a failure with no completed reply (HTTP 500, transport error) stays a failure", () => {
+    assert.equal(heldLocalSalvage({ ...held, localVerifyStartedAt: 1 }, {}), undefined);
+    assert.equal(heldLocalSalvage({ ...held, localVerifyStartedAt: 1 }, { originalText: "  " }), undefined);
   });
 });

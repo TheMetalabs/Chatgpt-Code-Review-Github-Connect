@@ -1,4 +1,5 @@
 import type { Job, ReviewProvider } from "./types.ts";
+import { PROVIDER_LABEL } from "./types.ts";
 import { localVerifies } from "./local-fallback.ts";
 
 // The one place a merged, gated review result is classified. Harbor uses it to decide between
@@ -77,4 +78,19 @@ export function outcomeNote(
     return `${chat} found nothing; local verification's reply was not parseable review JSON; it is posted verbatim below. Not a clean pass.`;
   }
   return "";
+}
+
+/** The verbatim block posted for every leg whose reply could not be parsed, labeled when more than
+ * one. It combines EVERY salvaged leg on purpose: which reviewer wrote it (including a verifier)
+ * decides only the outcome kind, never whether the evidence is posted. Truncated under GitHub's
+ * review body limit; the full originals stay in review history. */
+export function salvagedReview(legs: ReadonlyArray<{ provider: ReviewProvider; rawReview?: string }>, max: number): string | undefined {
+  const salvaged = legs.filter((l) => l.rawReview);
+  const combined = salvaged
+    .map((l) => (salvaged.length > 1 ? `**${PROVIDER_LABEL[l.provider]}:**\n\n${l.rawReview}` : l.rawReview))
+    .join("\n\n---\n\n");
+  if (!combined) return undefined;
+  return combined.length > max
+    ? `${combined.slice(0, max)}\n\n…(truncated to fit GitHub's review body limit; full original responses retained in review history)`
+    : combined;
 }

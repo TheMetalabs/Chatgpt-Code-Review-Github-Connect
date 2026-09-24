@@ -1,5 +1,6 @@
 import type { Job, LocalReviewRole, ReviewProvider, ProviderError } from "./types.ts";
 import { isChatProvider } from "./types.ts";
+import { salvageReviewJson } from "./extract-chat-json.ts";
 
 export function shouldStartLocalRace(input: {
   providers: readonly ReviewProvider[];
@@ -104,4 +105,19 @@ export function chatStalled(input: {
 }): boolean {
   if (input.chatProgress || input.connected || input.disconnectedAt === undefined) return false;
   return input.now - input.disconnectedAt >= input.graceMs;
+}
+
+/** A RELEASED held local leg (verification round or chat-down fallback) that completed with a reply
+ * that is not review JSON: that reply is the only evidence it produced, possibly a real finding, so
+ * it becomes a salvaged leg (posted verbatim) instead of a "Skipped local". `originalText` exists
+ * only when the model completed a reply, so a transport error or HTTP 500 stays a failure. Race is
+ * unchanged: its local leg is not held. */
+export function heldLocalSalvage(
+  job: Pick<Job, "localReviewRole" | "reviewProviders" | "localVerifyStartedAt" | "localFallbackAt">,
+  failure: { originalText?: string },
+): string | undefined {
+  const released = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
+  if (!released || !localVerifies({ role: job.localReviewRole, providers: job.reviewProviders ?? [] })) return undefined;
+  const text = failure.originalText?.trim();
+  return text ? salvageReviewJson(text) : undefined;
 }

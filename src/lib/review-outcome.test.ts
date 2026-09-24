@@ -10,7 +10,7 @@ import {
   redactSalvagedReviewBody,
   reviewSummaryBody,
 } from "./review-format.ts";
-import { OUTCOME_SHAPE, REVIEW_OUTCOMES, outcomeNote, postedOutcome, reviewOutcome, type OutcomeJob, type PostedOutcome, type ReviewOutcome } from "./review-outcome.ts";
+import { OUTCOME_SHAPE, REVIEW_OUTCOMES, outcomeNote, postedOutcome, reviewOutcome, salvagedReview, type OutcomeJob, type PostedOutcome, type ReviewOutcome } from "./review-outcome.ts";
 import { isConvergedFindings, parseFindingsTotal } from "./review-loop.ts";
 import type { Finding, ReviewProvider } from "./types.ts";
 
@@ -163,5 +163,18 @@ describe("outcomeNote", () => {
   });
   it("N7 clean, raw and incomplete carry no note", () => {
     for (const kind of ["clean", "raw", "incomplete"] as const) assert.equal(outcomeNote(kind, { chat, verifying: false, findings: 0 }), "", kind);
+  });
+});
+
+describe("salvagedReview", () => {
+  it("keeps every salvaged leg, the verifier's included, labeled when more than one", () => {
+    assert.equal(salvagedReview([{ provider: "chatgpt" }, { provider: "local", rawReview: "LOCAL-RAW" }], 100), "LOCAL-RAW");
+    const both = salvagedReview([{ provider: "chatgpt", rawReview: "CHAT-RAW" }, { provider: "local", rawReview: "LOCAL-RAW" }], 1000) ?? "";
+    assert.match(both, /\*\*ChatGPT:\*\*\n\nCHAT-RAW\n\n---\n\n\*\*Local LLM:\*\*\n\nLOCAL-RAW/);
+  });
+
+  it("is undefined with nothing salvaged, and truncates past the limit", () => {
+    assert.equal(salvagedReview([{ provider: "chatgpt" }], 100), undefined);
+    assert.match(salvagedReview([{ provider: "local", rawReview: "x".repeat(50) }], 10) ?? "", /^x{10}\n\n…\(truncated/);
   });
 });

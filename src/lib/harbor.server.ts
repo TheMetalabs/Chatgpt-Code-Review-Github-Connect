@@ -31,8 +31,8 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
-import { outcomeNote, reviewOutcome } from "./review-outcome";
+import { chatStalled, heldLocalSalvage, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
+import { outcomeNote, reviewOutcome, salvagedReview } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
@@ -53,7 +53,6 @@ import {
   BRIDGE_CLAIM_MS,
   BRIDGE_CONNECTED_MS,
   LIVE_INFLIGHT_STATUSES,
-  PROVIDER_LABEL,
   isChatProvider,
   normalizeReviewOrder,
   providersFromSettings,
@@ -826,6 +825,12 @@ async function generateLocalLeg(
   return runLocalLlm(prompt, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
 }
 
+/** Store the local leg's payload on the job (replacing any earlier one) and mark it collected. */
+function collectLocalLeg(j: Job, raw: string, originalText?: string): Job {
+  const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw, originalText }];
+  return { ...j, storedLegs: next, generating: {...j.generating, local: false}, providerProgress: {...j.providerProgress, local: {runId: `local:${j.id}`, stage: "response_collected", observedAt: Date.now(), receivedAt: Date.now()}}, updatedAt: Date.now() };
+}
+
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
   // Two independent, both-optional aborts; neither fires for a healthy long review. Both honour the
   // signal, so the leg falls into the catch below and fails cleanly. Cleared in finally on settle.
@@ -860,18 +865,20 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       if(!local.ok && local.originalText)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,local.originalText,local.originalText.length,local.originalText.length>128_000);
     } catch { /* metadata storage failure is visible without starting another model */ }
     if (!local.ok) {
-      patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
-        ...j, generating: {...j.generating, local: false},
-        providerErrors: {...j.providerErrors, local: {code: "error", message: local.error}},
-        providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now()}},
-        assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12), updatedAt: Date.now(),
-      }));
-    } else {
       patchJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
-        const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw, originalText: local.originalText }];
-        return { ...j, storedLegs: next, generating: {...j.generating, local: false}, providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "response_collected", observedAt: Date.now(), receivedAt: Date.now()}}, updatedAt: Date.now() };
+        // A released held leg's completed non-JSON reply is evidence: kept as a salvaged leg.
+        const salvage = heldLocalSalvage(j, local);
+        if (salvage) return collectLocalLeg(j, salvage, local.originalText);
+        return {
+          ...j, generating: {...j.generating, local: false},
+          providerErrors: {...j.providerErrors, local: {code: "error", message: local.error}},
+          providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now()}},
+          assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12), updatedAt: Date.now(),
+        };
       });
+    } else {
+      patchJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText)));
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -1065,27 +1072,15 @@ export async function submitHarborChat(
       if (!prev || (prev.status === "cleared" && c.status === "not_cleared")) coverageByFile.set(c.file, c);
     }
   }
-  // Verbatim reply(ies) from any leg whose JSON could not be parsed (local repair off) — surfaced in
-  // the review body so the fixing agent can act instead of the job pending forever. Combine every
-  // provider's salvaged reply (labeled when more than one) so no review is silently discarded.
-  // Only a STRUCTURED result counts: a leg salvaged as raw text (unparseable, repair off) produced
-  // no verdict. That decides both whether local verified and which chat reviewers were clean.
+  // Verbatim reply(ies) from any leg whose JSON could not be parsed — surfaced in the review body so
+  // the fixing agent can act instead of the job pending forever. Every leg's salvaged reply is
+  // combined, a verifier's included: no review is silently discarded.
+  const rawReview = salvagedReview([...byProvider].map(([provider, g]) => ({ provider, rawReview: g.rawReview })), MAX_RAW_REVIEW_BODY);
+  // Only a STRUCTURED result counts: a leg salvaged as raw text (unparseable) produced no verdict.
+  // That decides both whether local verified and which chat reviewers were clean.
   const structured = [...byProvider.entries()].filter(([, g]) => !g.rawReview).map(([p]) => p);
   const verifying = Boolean(job.localVerifyStartedAt) && !job.localFallbackAt;
   const localVerified = verifying ? structured.includes("local") : undefined;
-  // A verifier whose reply could not be parsed never verified: its raw text is kept out of the
-  // posted body (it stays in review history), so the chat's clean result posts as such.
-  const salvaged = [...byProvider.entries()].filter(([p, g]) => g.rawReview && !(verifying && p === "local" && !localVerified));
-  const combinedRaw = salvaged
-    .map(([provider, g]) => (salvaged.length > 1 ? `**${PROVIDER_LABEL[provider]}:**\n\n${g.rawReview}` : g.rawReview))
-    .join("\n\n---\n\n");
-  // Keep the posted review body under GitHub's 65,535-char limit (each leg alone can be ~60 KB, so a
-  // multi-provider concatenation can overflow and DLQ the job); the full originals stay in history.
-  const rawReview = !combinedRaw
-    ? undefined
-    : combinedRaw.length > MAX_RAW_REVIEW_BODY
-      ? `${combinedRaw.slice(0, MAX_RAW_REVIEW_BODY)}\n\n…(truncated to fit GitHub's review body limit; full original responses retained in review history)`
-      : combinedRaw;
   const nextAssumptions = [
     skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
     ...invalid,

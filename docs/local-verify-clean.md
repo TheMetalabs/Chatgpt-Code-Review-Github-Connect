@@ -32,6 +32,12 @@ race.
 
 Rules the table encodes:
 
+- A reply that could not be parsed is **evidence, never discarded**. Every leg's salvaged text is
+  combined into the raw block (`salvagedReview`, which has no role or provider filter). A released
+  held local leg that completes with a non-JSON reply becomes a salvaged leg (`heldLocalSalvage`)
+  instead of "Skipped local", so in the verification round it posts as `raw-unverified` with its own
+  header and a real finding in it reaches the fixing agent. A failure with no completed reply
+  (HTTP 500, transport error, offline) stays a failure: `unverified-clean`.
 - `unverified=1` is never CONVERGED, and only `clean` / `verified-clean` print the clean sentinel.
   `postedOutcome` renders a `verify` that somehow reaches the poster as `unverified-clean`.
 - Local as the chat-down fallback is an ordinary reviewer: chat unusable + local clean posts

@@ -23,7 +23,7 @@ export function loadTs(path, imports = {}) {
 }
 export const types = loadTs('src/lib/types.ts');
 export const parser = loadTs('src/lib/extract-chat-json.ts');
-export const fallback = loadTs('src/lib/local-fallback.ts', types);
+export const fallback = loadTs('src/lib/local-fallback.ts', {...types, ...parser});
 export const json = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['fixture checked']});
 export function job(patch={}) {
   return {id:'job1',status:'awaiting_chat',trigger:'issue_comment.mention',chatPrompt:'Review fixture',reviewProviders:['chatgpt'],

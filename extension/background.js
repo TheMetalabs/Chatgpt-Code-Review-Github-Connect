@@ -626,8 +626,13 @@ async function cleanupProviderBody(job, provider, jobs) {
       await saveJobs(jobs);
     }
     if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
+    if (job.kind === "fix" && job.serverStatus === "cancelled") {
+      // A tab that never finishes loading cannot answer for itself: past the ownership wait it is
+      // preserved (never closed unproven) so the job retires and its capacity is released.
+      if (tab.status && tab.status !== "complete") return waitOrPreserveFixTab(job, provider, jobs, "the cancelled fix tab never finished loading; tab preserved");
+      return forceCloseFixTab(job, provider, jobs, tab);
+    }
     if (tab.status && tab.status !== "complete") return;
-    if (job.kind === "fix" && job.serverStatus === "cancelled") return forceCloseFixTab(job, provider, jobs, tab);
     if (sourceArchiveDurable(state) && !sourceCleanupProofConfirmed(state)) {
       const saved=state.sourceCapture;
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
@@ -694,8 +699,26 @@ async function cleanupProviderBody(job, provider, jobs) {
  * close without an acknowledged answer. It still requires the page's positive binding, and a tab
  * the user took over (follow-up, unsent draft, other conversation) is preserved.
  */
+/** Whether `url` is still the page a fix tab was opened on (providerUrl: the provider's new chat). */
+function onAllocationPage(url, provider) {
+  try {
+    const now = new URL(url), opened = new URL(providerUrl(provider));
+    return now.origin === opened.origin && now.pathname === opened.pathname;
+  } catch { return false; }
+}
+
 /** How long a cancelled fix tab whose ownership is "unknown" is re-asked before it is preserved. */
 const FIX_OWNERSHIP_WAIT_MS = 2 * 60_000;
+
+/** Ask again next tick until FIX_OWNERSHIP_WAIT_MS has passed, then preserve the tab (after
+ * `beforePreserve`) so the job retires. */
+async function waitOrPreserveFixTab(job, provider, jobs, reason, beforePreserve) {
+  const state = job.states[provider];
+  state.ownershipUnknownAt ??= Date.now();
+  if (Date.now() - state.ownershipUnknownAt < FIX_OWNERSHIP_WAIT_MS) return saveJobs(jobs);
+  await beforePreserve?.();
+  return finishTabCleanup(job, provider, jobs, reason);
+}
 
 async function forceCloseFixTab(job, provider, jobs, tab) {
   const state = job.states[provider];
@@ -713,12 +736,15 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   if (result.ownership === "unknown") {
     // Not identifiable yet (a reload still rendering the sent turn): ask again next tick. Past the
     // wait, preserve it (never close what might be the user's) and have the page free its slot.
-    state.ownershipUnknownAt ??= Date.now();
-    if (Date.now() - state.ownershipUnknownAt < FIX_OWNERSHIP_WAIT_MS) return saveJobs(jobs);
-    await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider));
-    return finishTabCleanup(job, provider, jobs, "fix tab ownership could not be established; tab preserved");
+    return waitOrPreserveFixTab(job, provider, jobs, "fix tab ownership could not be established; tab preserved", async () => {
+      await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider));
+    });
   }
   if (result.owned !== true) return finishTabCleanup(job, provider, jobs, "user took over the fix tab; tab preserved");
+  // A blank page is Ashlar's only while it is still the page this fix opened: one navigated to
+  // another conversation (even an empty one) is the user's. (A fresh blank chat in the same tab
+  // holds nothing of the user's.)
+  if (unbound && !onAllocationPage(result.url, provider)) return finishTabCleanup(job, provider, jobs, "the unsent fix tab moved to another page; tab preserved");
   const current = await chrome.tabs.get(tab.id);
   if (current.pendingUrl || current.url !== result.url || current.status === "loading") return;
   state.closeRequested = true;

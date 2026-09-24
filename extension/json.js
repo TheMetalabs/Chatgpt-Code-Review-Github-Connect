@@ -96,6 +96,16 @@ function assistantCodeBlocks(root = currentAssistantRoot()) {
   return blocks;
 }
 
+/** A bound response's canonical answer text, what its collector harvested and what every later
+ * completion proof must match: a review's full rendered corpus, a fix's fenced code only (or a
+ * fixed no-JSON line when it has none, so the server's fix parser fails closed). */
+function boundAnswerText(kind, root) {
+  const prose = assistantCorpus(root).join("\n\n");
+  if (kind !== "fix" || !prose.trim()) return prose;
+  const blocks = assistantCodeBlocks(root);
+  return blocks.length ? blocks.join("\n\n") : "(no fenced code block in the answer; the fix JSON must be inside a ```json fence)";
+}
+
 function harvestJson(opts) {
   const allowThin = Boolean(opts && opts.allowThin);
   const chunks = assistantCorpus(opts?.root);
@@ -261,7 +271,7 @@ function preserveSourceContext(state, receipt) {
   } catch { /* Unknown ownership never authorizes closure. */ }
   if (!state.tabRepurposed && (!bound?.identified || !bound.root || bound.followup ||
       bound.responseId !== receipt.responseId || receipt.context !== reviewPageContext() ||
-      assistantCorpus(bound.root).join("\n\n") !== receipt.text)) {
+      boundAnswerText(state.kind, bound.root) !== receipt.text)) {
     state.tabRepurposed = true;
     recordReviewStep("context_changed");
   }
@@ -369,12 +379,7 @@ async function waitUntilFixOrQuota(name) {
     const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
     const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
     const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
-    const prose = done ? assistantCorpus(bound?.root).join("\n\n") : "";
-    const blocks = prose.trim() ? assistantCodeBlocks(bound?.root) : [];
-    // No fenced block: a fixed line with no JSON, so the server's fix parser fails closed (a retry)
-    // instead of reading file content from rendered prose.
-    const text = !prose.trim() ? "" : blocks.length ? blocks.join("\n\n")
-      : "(no fenced code block in the answer; the fix JSON must be inside a ```json fence)";
+    const text = done ? boundAnswerText("fix", bound?.root) : "";
     const answered = done && Boolean(text.trim());
     // Local diagnostics only: the answer text is never copied into an observation.
     if (runner?.running) runner.observation = {
@@ -556,12 +561,13 @@ function installReviewRunner(name, run) {
       // A fix answer is its own plain text; a review result must be the JSON of that text.
       if (!proof?.responseId || typeof proof.context !== "string" || typeof msg.text !== "string" || typeof msg.raw !== "string" ||
           !(msg.kind === "fix" ? msg.raw === msg.text : extractChatJson(msg.raw) && extractChatJson(msg.raw) === extractChatJson(msg.text)) || bound.followup ||
-          bound.responseId !== proof.responseId || proof.context !== reviewPageContext() || assistantCorpus(bound.root).join("\n\n") !== msg.text) {
+          bound.responseId !== proof.responseId || proof.context !== reviewPageContext() || boundAnswerText(msg.kind, bound.root) !== msg.text) {
         releaseManagedSlot(state);
         reply({ok:false,code:"completion_changed"});return;
       }
       state.nativeCompletion = Object.freeze({jobId:state.jobId,provider:state.provider,runId:state.runId,
         responseId:proof.responseId,context:proof.context,text:msg.text,raw:msg.raw});
+      if (msg.kind === "fix") state.kind = "fix"; // later proofs compare this run's fenced answer
       state.restoredCompletion = true;
       state.finishedContext = proof.context;
       state.result = {ok:true,raw:msg.raw,responseText:msg.text,completion:nativeCleanupProof(state)};

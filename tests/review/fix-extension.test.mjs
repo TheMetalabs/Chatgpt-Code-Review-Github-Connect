@@ -147,8 +147,8 @@ function fixJob(patch = {}) {
   return {jobId: 'fix-A', kind: 'fix', origin: 'http://bridge', leaseId: 'lease-A', prompt: 'FIX PROMPT', providers: ['chatgpt'],
     reasoning: {chatgpt: 'pro', grok: 'heavy'}, states: {chatgpt: {tabId: 10, started: true, runId: 'run-A'}}, ...patch};
 }
-function worker(jobs, {api, handler}) {
-  const tabs = new Map([[10, {id: 10, url: URL_FIX, status: 'complete'}]]);
+function worker(jobs, {api, handler, url = URL_FIX, status = 'complete'}) {
+  const tabs = new Map([[10, {id: 10, url, status}]]);
   const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: Object.fromEntries(jobs.map(j => [j.jobId, j]))}), tabs, api, handler});
   b.context.crypto = webcrypto;b.context.TextEncoder = TextEncoder;
   return b;
@@ -215,15 +215,34 @@ test('worker: an unknown ownership is asked again, then the tab is preserved (sl
 });
 
 test('worker: a cancelled fix whose run was never sent closes its blank tab and retires', async () => {
-  const handler = (_id, m) => (m.type === 'ashlar-fix-cancel' && m.undispatched ? {ok: true, owned: true, ownership: 'owned', url: URL_FIX, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'});
-  const b = worker([fixJob({states: {chatgpt: {tabId: 10, started: false, runId: 'run-A'}}})], {api: cancelled, handler});
+  const OPENED = 'https://chatgpt.com/?temporary-chat=true'; // providerUrl: the page a fix tab opens on
+  const blank = (url) => (_id, m) => (m.type === 'ashlar-fix-cancel' && m.undispatched ? {ok: true, owned: true, ownership: 'owned', url, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'});
+  const unsent = () => [fixJob({states: {chatgpt: {tabId: 10, started: false, runId: 'run-A'}}})];
+  const b = worker(unsent(), {api: cancelled, handler: blank(OPENED), url: OPENED});
   await b.tick();
   assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.undispatched === true));
   assert.deepEqual(b.closedTabs, [10]);assert.deepEqual(b.local.state.pendingReviewJobs, {});
+  // blank, but moved to another conversation: the user's, preserved (the job still retires)
+  const moved = worker(unsent(), {api: cancelled, handler: blank('https://chatgpt.com/c/other'), url: 'https://chatgpt.com/c/other'});
+  await moved.tick();
+  assert.equal(moved.closedTabs.length, 0);assert.deepEqual(moved.local.state.pendingReviewJobs, {});
+  const handler = blank(OPENED);
   // a started run never takes the undispatched path
   const started = worker([fixJob()], {api: cancelled, handler});
   await started.tick();
   assert.equal(started.messages.some(m => m.undispatched), false);assert.equal(started.closedTabs.length, 0);
+});
+
+test('worker: a cancelled fix tab stuck loading is preserved after the wait (never closed unproven)', async () => {
+  const b = worker([fixJob()], {api: cancelled, handler: () => ({ok: true, owned: true, url: URL_FIX}), status: 'loading'});
+  await b.tick();
+  assert.equal(b.closedTabs.length, 0);assert.ok(b.local.state.pendingReviewJobs['fix-A'], 'waits while loading');
+  assert.equal(b.messages.some(m => m.type === 'ashlar-fix-cancel'), false, 'a loading page is not asked');
+  const RealDate = b.context.Date || Date;
+  const later = RealDate.now() + 3 * 60_000;
+  b.context.Date = class extends RealDate { static now() { return later; } };
+  await b.tick();
+  assert.equal(b.closedTabs.length, 0);assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'retired, capacity released');
 });
 
 test('worker: a cancelled fix tab the user took over is preserved, never closed', async () => {

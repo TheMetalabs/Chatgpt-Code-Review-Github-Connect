@@ -245,6 +245,25 @@ test('real DOM: a fix is read from its fenced code block literally, never from r
  assert.match(out.raw,/no fenced code block/);assert.ok(!out.raw.includes('{'),'no JSON reaches the fix parser');
 });
 
+test('real DOM: a completed fix with prose around its fence still proves its own tab (can close)',async t=>{
+ const code='{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
+ const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
+ await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here is the fix.</p><pre><code>${code}</code></pre></div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
+ await page.evaluate(()=>{
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'})]]);
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+ });
+ for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ await page.evaluate(()=>{const s=__ashlarRunnerState;s.kind='fix';s.running=true;window.fixOut={pending:true};
+  waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};s.running=false;s.result={ok:true,raw,responseText:raw};},e=>{window.fixOut={error:e.message};});});
+ await page.clock.runFor(3200);
+ assert.equal((await page.evaluate(()=>window.fixOut)).raw,code,'the fenced JSON only');
+ assert.ok(await page.evaluate(()=>__ashlarRunnerState.nativeCompletion?.responseId==='response-A'),'the bound response proves the answer');
+ const out=await page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type:'ashlar-can-close',jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix'});
+ assert.equal(out.canClose,true,out.reason);
+});
+
 test('real popup: a running review and tab-capacity blocker are shown together',async t=>{
  const page=await browser.newPage();t.after(()=>page.close());
  await page.setContent(source('extension/popup.html').replace('<script src="popup.js"></script>',''));

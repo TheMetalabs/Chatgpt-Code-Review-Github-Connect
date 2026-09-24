@@ -379,6 +379,7 @@ async function waitUntilReviewOrQuota(name) {
   // No poll-count/elapsed-time failure. Controls can appear before response text is
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
+    throwIfStopped();
     // The full original was secured, not accepted as a review. The worker owns
     // further formatting; no page loop or new model request is needed.
     if (sourceReceiptFor(globalThis.__ashlarRunnerState)) return null;
@@ -477,15 +478,13 @@ function pinnedFixConversation(state) {
  * has none, a fixed no-JSON line — after the same positive completion controls and two identical stable
  * observations as a review, with no review-JSON requirement and no capture/repair evidence (a
  * fix item has neither lane). No page timer ends it: the server's fix deadline cancels the item
- * and the worker's ashlar-fix-cancel stops this collector.
+ * and the worker's ashlar-fix-cancel stops this collector (throwIfStopped).
  */
 async function waitUntilFixOrQuota(name) {
   const stability = {stable: "", hits: 0};
   let edited = false;
   for (;;) {
-    if (globalThis.__ashlarRunnerState?.fixCancelled) {
-      const error = new Error("fix request cancelled by the server"); error.code = "cancelled"; throw error;
-    }
+    throwIfStopped();
     // Same completion evidence, quota rule and stability as a review (shared helpers above).
     const poll = await pollBoundResponse();
     const {runner, bound, stop, streaming, done} = poll;
@@ -586,6 +585,27 @@ function reviewPageContext() {
     last?.getAttribute("data-message-id") || "", last?.textContent || ""]);
 }
 
+/** The server no longer wants this run (cancelled, superseded, forgotten): nothing is sent or
+ * collected for it again. The marker is per (job, run) in sessionStorage, so a reload that
+ * re-binds the page (and a late "ashlar-run" for the same run) stays stopped. */
+function stopRun(state) {
+  if (!state.runStopped) recordReviewStep("cancelled");
+  state.runStopped = true;
+  try { sessionStorage.setItem(`ashlar:stopped:${state.jobId}:${state.runId}`, "true"); } catch { /* in-memory stop remains */ }
+}
+
+function runStoppedFor(jobId, runId) {
+  try { return Boolean(jobId && runId) && sessionStorage.getItem(`ashlar:stopped:${jobId}:${runId}`) === "true"; }
+  catch { return false; }
+}
+
+/** The one stop fence: every send and collect loop (composer.js and both collectors) calls it
+ * before acting, so a stopped run ends as "cancelled" instead of clicking Send or harvesting. */
+function throwIfStopped() {
+  if (!globalThis.__ashlarRunnerState?.runStopped) return;
+  const error = new Error("the run was stopped: its job was cancelled or forgotten"); error.code = "cancelled"; throw error;
+}
+
 function releaseManagedSlot(state) {
   state.slotReleased = true;
   try { sessionStorage.setItem(`ashlar:released:${state.jobId}:${state.runId}`, "true"); } catch { /* Only causes conservative recount on reload. */ }
@@ -603,6 +623,7 @@ function installReviewRunner(name, run) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
   try { state.slotReleased ||= sessionStorage.getItem(`ashlar:released:${state.jobId}:${state.runId}`) === "true"; } catch { /* Unknown remains managed. */ }
+  state.runStopped ||= runStoppedFor(state.jobId, state.runId);
   if (state.listener && state.protocol === "observed-submission-v6") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
   state.protocol = "observed-submission-v6";
@@ -643,7 +664,7 @@ function installReviewRunner(name, run) {
       if (!state.jobId || msg.jobId !== state.jobId || !state.runId || msg.runId !== state.runId) {
         reply({ok:false,code:"job_mismatch"});return;
       }
-      state.fixCancelled = true; // The server settled this fix; stop collecting an answer for it.
+      stopRun(state); // The server settled this run: stop sending and collecting for it (either kind).
       const {ownership, blank = false, unsent = false, identity, conversation} = fixTabOwnership(state);
       // A tab the user took over (or one the worker gives up identifying: preserve) stays open but
       // is no longer Ashlar's: free its managed slot, or it counts against tab capacity (untracked
@@ -812,7 +833,7 @@ function installReviewRunner(name, run) {
     state.running = true;
     // Only a fix item's run message carries its kind; review runs keep kind undefined.
     state.kind = msg.kind === "fix" ? "fix" : undefined;
-    state.fixCancelled = false;
+    state.runStopped = runStoppedFor(state.jobId, state.runId);
     state.nativeCompletion = undefined;
     state.restoredCompletion = false;
     state.sourceTrackingOwner = undefined;
@@ -832,7 +853,7 @@ function installReviewRunner(name, run) {
         state.result = { ok: true, raw, responseText: state.responseText, completion:nativeCleanupProof(state) };
       })
       .catch(e => {
-        recordReviewStep(e?.code === "quota" ? "quota" : "error");
+        recordReviewStep(e?.code === "quota" ? "quota" : e?.code === "cancelled" ? "cancelled" : "error");
         state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })

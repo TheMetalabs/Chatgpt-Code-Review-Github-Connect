@@ -116,6 +116,8 @@ async function fillComposer(el, text) {
     }
   }
   for (;;) {
+    // The stop fence lives with the runner state in json.js (absent: nothing can stop the run).
+    globalThis.throwIfStopped?.();
     // Uploading can replace the editor. Never type into a cached detached node.
     el = typeof composer === "function" ? composer() : el;
     if (!el?.isConnected) { await waitForPageChange(250); continue; }
@@ -297,6 +299,9 @@ async function clickSend(findSend, findComposer, expectedText) {
   }
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
+    // After the confirmation check, so an accepted send is still journaled as sent; before any
+    // click, so a stopped run never submits its prompt.
+    globalThis.throwIfStopped?.();
     if (typeof quotaHit === "function" && quotaHit()) {
       const error = new Error("provider usage limit before submission"); error.code = "quota"; throw error;
     }
@@ -328,6 +333,7 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   // Legacy pages have no durable send journal. Observe, but never guess and re-send.
   const expected = normalizePrompt(splitAttachments(prompt).prompt);
   for (;;) {
+    globalThis.throwIfStopped?.();
     const turns = userTurns();
     if (turns.length && (!expected || normalizePrompt(messagePromptText(turns.at(-1))).includes(expected))) {
       step("legacy_observation"); return;
@@ -349,6 +355,7 @@ async function waitUntilComposer() {
   const COMPOSER_DEADLINE_MS = 3 * 60 * 60 * 1000; // 3h
   const deadline = Date.now() + COMPOSER_DEADLINE_MS;
   for (;;) {
+    globalThis.throwIfStopped?.();
     if (typeof quotaHit === "function" && quotaHit()) {
       const e = new Error("usage limit");
       e.code = "quota";

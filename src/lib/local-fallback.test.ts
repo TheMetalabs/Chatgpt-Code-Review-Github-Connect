@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, verifyCleanNote, verifyCleanStep } from "./local-fallback.ts";
+import { chatStalled, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
 
 describe("shouldStartLocalRace", () => {
   it("starts local immediately when the setting is on", () => {
@@ -142,26 +142,5 @@ describe("verify-clean local role", () => {
     const now = 5_000_000;
     assert.equal(chatStalled({ ...s, disconnectedAt: now - 1, now }), false, "job age is not the basis");
     assert.equal(chatStalled({ ...s, disconnectedAt: now - 1, now: now - 1 + G }), true);
-  });
-
-  it("decides what to post in each case", () => {
-    const v = { role: "verify-clean" as const, providers: [...both], verifyStarted: false, fallback: false, salvagedRaw: false, localStructured: false };
-    assert.equal(verifyCleanStep({ ...v, findings: 2 }), "post-chat", "chat findings post now");
-    assert.equal(verifyCleanStep({ ...v, findings: 0, salvagedRaw: true }), "post-chat", "a salvaged reply is not clean");
-    assert.equal(verifyCleanStep({ ...v, findings: 0 }), "start-verify", "clean chat starts the verification round");
-    assert.equal(verifyCleanStep({ ...v, verifyStarted: true, findings: 3, localStructured: true }), "post-verified", "local findings post");
-    assert.equal(verifyCleanStep({ ...v, verifyStarted: true, findings: 0, localStructured: true }), "post-verified", "both clean: clean review");
-    assert.equal(verifyCleanStep({ ...v, verifyStarted: true, findings: 0, localStructured: false }), "post-chat-unverified", "local failed");
-    // a salvaged (unparseable) local reply is a payload but no verdict: verification did not complete
-    assert.equal(verifyCleanStep({ ...v, verifyStarted: true, findings: 0, salvagedRaw: true, localStructured: false }), "post-chat-unverified", "unparseable local reply");
-    assert.equal(verifyCleanStep({ ...v, fallback: true, findings: 0 }), "post", "local as chat-down fallback posts as today");
-    assert.equal(verifyCleanStep({ ...v, role: "race", findings: 0 }), "post");
-  });
-
-  it("names which reviewer produced the result", () => {
-    assert.equal(verifyCleanNote({ chat: ["chatgpt"], step: "post-verified", localFindings: 2 }), "chatgpt found nothing; local verification found 2.");
-    assert.equal(verifyCleanNote({ chat: ["chatgpt"], step: "post-verified", localFindings: 0 }), "chatgpt found nothing; local verification agreed.");
-    assert.match(verifyCleanNote({ chat: ["chatgpt"], step: "post-chat-unverified", localFindings: 0, localError: "timeout" }), /did not complete \(timeout\)/);
-    assert.equal(verifyCleanNote({ chat: ["chatgpt"], step: "post-chat", localFindings: 0 }), "");
   });
 });

@@ -1,4 +1,5 @@
 import type { Finding, Job, ReviewProvider, Severity } from "./types.ts";
+import { OUTCOME_SHAPE, postedOutcome, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
 
 const BADGE: Record<Severity, string> = {
   P0: "https://img.shields.io/badge/P0-red?style=flat",
@@ -74,76 +75,132 @@ function neutralizeMarkers(s: string): string {
   return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
 }
 
-export function reviewSummaryBody(job: Pick<Job, "headSha" | "reviewProviders" | "assumptions" | "coverage" | "rawReview"> & Partial<Pick<Job, "localReviewRole" | "localVerifyNote" | "localUnverified">>, findings: Finding[], username: string, unanchored: Finding[] = []): string {
-  const sha = job.headSha.slice(0, 7);
+type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote">>;
+
+/** Everything a body helper reads, computed once so every kind renders the same fields the same way. */
+type SummaryParts = {
+  outcome: PostedOutcome;
+  sha: string;
+  /** The verification note line (empty outside a verify-clean round), marker-neutralized. */
+  noteLine: string;
+  skipped: string[];
+  raw: string;
+};
+
+export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username: string, unanchored: Finding[] = []): string {
+  const outcome = postedOutcome(job, findings.length);
+  const parts: SummaryParts = {
+    outcome,
+    sha: job.headSha.slice(0, 7),
+    noteLine: job.localVerifyNote ? `\n${neutralizeMarkers(job.localVerifyNote)}\n` : "",
+    skipped: skippedNotes(job).slice(0, 4).map(neutralizeMarkers),
+    // Neutralize the loop poller's clean-pass sentinel (matching the SAME separator set it accepts,
+    // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
+    // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
+    raw: neutralizeMarkers((job.rawReview ?? "").trim().replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)")),
+  };
+  switch (outcome) {
+    case "findings":
+      return findingsBody(job, parts, findings, username, unanchored);
+    case "raw":
+    case "raw-unverified":
+      return rawOnlyBody(parts);
+    case "clean":
+    case "verified-clean":
+    case "unverified-clean":
+      return cleanBody(job, parts);
+    case "incomplete":
+      return incompleteBody(parts);
+    default: {
+      const unhandled: never = outcome;
+      return unhandled;
+    }
+  }
+}
+
+/** The trailing machine marker (the loop's CONVERGED side); an incomplete review carries none. */
+export function findingsMarker(outcome: PostedOutcome, findings: Finding[], unanchored: Finding[]): string {
+  const flag = OUTCOME_SHAPE[outcome].unverified ? " unverified=1" : "";
+  if (outcome === "incomplete") return "";
+  if (outcome === "raw" || outcome === "raw-unverified") return `<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0${flag} -->`;
+  if (outcome !== "findings") return `<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0${flag} -->`;
   const n = countBySeverity(findings);
-  const skipped = (job.assumptions ?? []).filter((a) => /skipped/i.test(a)).slice(0, 4).map(neutralizeMarkers);
+  return `<!-- ashlar-findings total=${findings.length} inline=${findings.length - unanchored.length} body=${unanchored.length} p0=${n.P0} p1=${n.P1} p2=${n.P2}${flag} -->`;
+}
+
+/** The verbatim salvaged block. Its header says whose reply it is: an unverified local
+ * verification reply is never presented as an ordinary (chat) salvage. */
+function rawBlock(outcome: PostedOutcome, raw: string): string {
+  if (!raw) return "";
+  const header = outcome === "raw-unverified"
+    ? "**⚠️ Local verification reply posted verbatim — it was not parseable review JSON.**"
+    : "**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.**";
+  return `\n${header} Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${REVIEW_RAW_START}\n${raw}\n${REVIEW_RAW_END}\n`;
+}
+
+/** A salvaged verbatim review is NOT a clean pass: the clean marker/string stays out so the loop
+ * poller does not converge, and the raw text is surfaced for the agent. Skipped-provider warnings
+ * are listed too, so a raw-only body is not mistaken for complete multi-provider coverage. */
+function rawOnlyBody(p: SummaryParts): string {
+  const skipNote = p.skipped.length ? `\n${p.skipped.map((s) => `- ${s}`).join("\n")}\n` : "";
+  return capReviewBody(`${REVIEW_SUMMARY_MARK}
+${p.noteLine}${rawBlock(p.outcome, p.raw)}${skipNote}
+**Reviewed commit:** \`${p.sha}\`
+${findingsMarker(p.outcome, [], [])}`);
+}
+
+function incompleteBody(p: SummaryParts): string {
+  return `${REVIEW_SUMMARY_MARK}
+ChatGPT/Grok did not finish a full review.
+${p.noteLine}
+${p.skipped.map((s) => `- ${s}`).join("\n")}
+
+Not a clean pass — remaining reviewers did not run.`;
+}
+
+/** First line stays exactly CLEAN_REVIEW_BODY so the loop poller's partial match still detects a
+ * clean pass; the appended sha lets it catch stale-clean reviews. An unverified clean result must
+ * NOT carry the sentinel: substring-based consumers would treat it as converged. */
+function cleanBody(job: SummaryJob, p: SummaryParts): string {
+  const first = OUTCOME_SHAPE[p.outcome].converged ? CLEAN_REVIEW_BODY : UNVERIFIED_CLEAN_REVIEW_BODY;
+  const cov = job.coverage ?? [];
+  const clearedCount = cov.filter((c) => c.status === "cleared").length;
+  const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
+  return `${first}\n\nReviewed commit: \`${p.sha}\`\n${p.noteLine}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n${findingsMarker(p.outcome, [], [])}`;
+}
+
+function unanchoredBlock(unanchored: Finding[]): string {
+  if (!unanchored.length) return "";
+  const rows = unanchored.map((f) => {
+    const detail = neutralizeMarkers([f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .join(" — "));
+    return `- ${severityBadgeMarkdown(f.severity)} \`${neutralizeMarkers(f.file)}:${f.line}\` — **${neutralizeMarkers(f.title)}**${detail ? `\n  ${detail}` : ""}`;
+  });
+  return `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${rows.join("\n")}\n`;
+}
+
+function reviewersLine(job: SummaryJob): string {
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
-  const local = providers.includes("local");
-  // verify-clean: say which reviewer produced this result (chat found nothing / local found N).
-  const verifyLine = job.localVerifyNote ? `\n${neutralizeMarkers(job.localVerifyNote)}\n` : "";
-  const localRoleNote = !local
+  const local = !providers.includes("local")
     ? ""
     : job.localReviewRole === "verify-clean" && chat.length
       ? " Local LLM verifies a clean chat result."
       : " Local LLM is fallback if Chrome does not return.";
-  // Neutralize the loop poller's clean-pass sentinel (matching the SAME separator set it accepts,
-  // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
-  // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
-  const rawReview = neutralizeMarkers(
-    (job.rawReview ?? "").trim().replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)"),
-  );
-  const rawBlock = rawReview
-    ? `\n**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.** Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${REVIEW_RAW_START}\n${rawReview}\n${REVIEW_RAW_END}\n`
-    : "";
-  // A salvaged verbatim review is NOT a clean pass: keep the clean marker/string out so the loop
-  // poller does not converge, and surface the raw text for the agent.
-  if (rawReview && !findings.length) {
-    // Surface skipped-provider warnings here too, so a raw-only body is not mistaken for complete
-    // multi-provider coverage when another enabled reviewer failed or hit quota.
-    const skipNote = skipped.length ? `\n${skipped.map((s) => `- ${s}`).join("\n")}\n` : "";
-    return capReviewBody(`${REVIEW_SUMMARY_MARK}
-${rawBlock}${skipNote}
-**Reviewed commit:** \`${sha}\`
-<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->`);
-  }
-  if (!findings.length) {
-    if (skipped.length) {
-      return `${REVIEW_SUMMARY_MARK}
-ChatGPT/Grok did not finish a full review.
+  return `${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local}`;
+}
 
-${skipped.map((s) => `- ${s}`).join("\n")}
-
-Not a clean pass — remaining reviewers did not run.`;
-    }
-    // First line stays exactly CLEAN_REVIEW_BODY so the loop poller's partial match
-    // still detects a clean pass; the appended sha lets it catch stale-clean reviews.
-    // An unverified clean result must NOT carry the sentinel: substring-based consumers would
-    // treat it as converged.
-    const cov = job.coverage ?? [];
-    const clearedCount = cov.filter((c) => c.status === "cleared").length;
-    const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
-    return `${job.localUnverified ? UNVERIFIED_CLEAN_REVIEW_BODY : CLEAN_REVIEW_BODY}\n\nReviewed commit: \`${sha}\`\n${verifyLine}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0${job.localUnverified ? " unverified=1" : ""} -->`;
-  }
-  const unanchoredBlock = unanchored.length
-    ? `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${unanchored
-        .map((f) => {
-          const detail = neutralizeMarkers([f.failureScenario, f.rootCause, f.evidence ? `Evidence: ${f.evidence}` : "", f.recommendedFix ? `Fix: ${f.recommendedFix}` : ""]
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .join(" — "));
-          return `- ${severityBadgeMarkdown(f.severity)} \`${neutralizeMarkers(f.file)}:${f.line}\` — **${neutralizeMarkers(f.title)}**${detail ? `\n  ${detail}` : ""}`;
-        })
-        .join("\n")}\n`
-    : "";
+function findingsBody(job: SummaryJob, p: SummaryParts, findings: Finding[], username: string, unanchored: Finding[]): string {
+  const n = countBySeverity(findings);
   return capReviewBody(`${REVIEW_SUMMARY_MARK}
 
 ### 💡 Ashlar Review
 
 Here are some automated review suggestions for this pull request.
 
-**Reviewed commit:** \`${sha}\`
+**Reviewed commit:** \`${p.sha}\`
 
 | Severity | Count |
 | --- | --- |
@@ -151,9 +208,9 @@ Here are some automated review suggestions for this pull request.
 | P1 | ${n.P1} |
 | P2 | ${n.P2} |
 
-${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${localRoleNote}
-${verifyLine}${skipped.length ? skipped.map((s) => `- ${s}`).join("\n") : ""}
-${unanchoredBlock}${rawBlock}
+${reviewersLine(job)}
+${p.noteLine}${p.skipped.length ? p.skipped.map((s) => `- ${s}`).join("\n") : ""}
+${unanchoredBlock(unanchored)}${rawBlock(p.outcome, p.raw)}
 <details>
 <summary>ℹ️ About Ashlar</summary>
 
@@ -162,6 +219,6 @@ Inline comments use P0 / P1 / P2 badges. Failures in one reviewer are skipped; r
 </details>
 
 — ${neutralizeMarkers(username)}
-<!-- ashlar-findings total=${findings.length} inline=${findings.length - unanchored.length} body=${unanchored.length} p0=${n.P0} p1=${n.P1} p2=${n.P2} -->
+${findingsMarker(p.outcome, findings, unanchored)}
 `);
 }

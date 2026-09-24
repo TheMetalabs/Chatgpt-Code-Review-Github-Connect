@@ -31,7 +31,8 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verifyCleanNote, verifyCleanStep } from "./local-fallback";
+import { chatStalled, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
+import { outcomeNote, reviewOutcome } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
@@ -691,7 +692,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     localVerifyStartedAt: undefined,
     localFallbackAt: undefined,
     localVerifyNote: undefined,
-    localUnverified: undefined,
+    localVerified: undefined,
     reviewOrder: order,
     storedLegs: [],
     updatedAt: Date.now(),
@@ -1070,11 +1071,11 @@ export async function submitHarborChat(
   // Only a STRUCTURED result counts: a leg salvaged as raw text (unparseable, repair off) produced
   // no verdict. That decides both whether local verified and which chat reviewers were clean.
   const structured = [...byProvider.entries()].filter(([, g]) => !g.rawReview).map(([p]) => p);
-  const verifyingDone = Boolean(job.localVerifyStartedAt) && !job.localFallbackAt;
-  const localStructured = structured.includes("local");
+  const verifying = Boolean(job.localVerifyStartedAt) && !job.localFallbackAt;
+  const localVerified = verifying ? structured.includes("local") : undefined;
   // A verifier whose reply could not be parsed never verified: its raw text is kept out of the
   // posted body (it stays in review history), so the chat's clean result posts as such.
-  const salvaged = [...byProvider.entries()].filter(([p, g]) => g.rawReview && !(verifyingDone && p === "local" && !localStructured));
+  const salvaged = [...byProvider.entries()].filter(([p, g]) => g.rawReview && !(verifying && p === "local" && !localVerified));
   const combinedRaw = salvaged
     .map(([provider, g]) => (salvaged.length > 1 ? `**${PROVIDER_LABEL[provider]}:**\n\n${g.rawReview}` : g.rawReview))
     .join("\n\n---\n\n");
@@ -1085,19 +1086,18 @@ export async function submitHarborChat(
     : combinedRaw.length > MAX_RAW_REVIEW_BODY
       ? `${combinedRaw.slice(0, MAX_RAW_REVIEW_BODY)}\n\n…(truncated to fit GitHub's review body limit; full original responses retained in review history)`
       : combinedRaw;
-  const step = verifyCleanStep({
-    role,
-    providers,
-    verifyStarted: Boolean(job.localVerifyStartedAt),
-    fallback: Boolean(job.localFallbackAt),
-    findings: merged.findings.length,
-    salvagedRaw: Boolean(rawReview),
-    localStructured,
-  });
+  const nextAssumptions = [
+    skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
+    ...invalid,
+    ...merged.assumptions,
+  ].filter(Boolean);
+  // merged.findings is already publish-gated (gateLiveSubmission applies the poster's partition with
+  // the same settings), so this count is the one the posted body renders.
+  const outcome = reviewOutcome({ ...job, rawReview, localVerified, assumptions: nextAssumptions }, merged.findings.length);
   // Credit only the chat reviewers that produced the clean structured result (pinned when the
   // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
   const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
-  if (step === "start-verify") {
+  if (outcome === "verify") {
     // Chat parsed clean: hold the post and run local on the same prompt as the verification round.
     releaseHeldLocalLeg(jobId, token, incoming, {
       localVerifyStartedAt: Date.now(),
@@ -1110,7 +1110,7 @@ export async function submitHarborChat(
     (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
     invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
     (byProvider.get("local")?.rawReview ? "its reply could not be parsed" : undefined);
-  const localVerifyNote = verifyCleanNote({ chat: cleanChat, step, localFindings: merged.findings.length, localError });
+  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, localError });
   patchJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,
@@ -1119,16 +1119,12 @@ export async function submitHarborChat(
     highestRisk: merged.highestRisk,
     rawReview,
     investigatedSafe: merged.investigatedSafe,
-    assumptions: [
-      skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
-      ...invalid,
-      ...merged.assumptions,
-    ].filter(Boolean),
+    assumptions: nextAssumptions,
     coverage: [...coverageByFile.values()],
     droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
     plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
     localVerifyNote: localVerifyNote || undefined,
-    localUnverified: step === "post-chat-unverified" || undefined,
+    localVerified,
     updatedAt: Date.now(),
   }));
   await finishJob(jobId, sample, token);

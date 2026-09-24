@@ -139,10 +139,11 @@ export interface Job {
   localVerifyChat?: ReviewProvider[];
   /** verify-clean: set when the chat reviewers produced no usable result, so local ran as the fallback. */
   localFallbackAt?: number;
-  /** verify-clean: summary line naming which reviewer produced the posted result (verifyCleanNote). */
+  /** verify-clean: summary line naming which reviewer produced the posted result (outcomeNote). */
   localVerifyNote?: string;
-  /** verify-clean: the local verification round did not complete; the clean marker carries `unverified=1` (never CONVERGED). */
-  localUnverified?: boolean;
+  /** verify-clean: local returned a STRUCTURED result in its verification round. Stamped at that
+   * merge only; read by reviewOutcome (review-outcome.ts) and interpreted nowhere else. */
+  localVerified?: boolean;
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
   fpPending?: {

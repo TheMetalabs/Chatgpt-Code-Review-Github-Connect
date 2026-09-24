@@ -78,6 +78,24 @@ function assistantCorpus(root = currentAssistantRoot()) {
   return chunks;
 }
 
+/** The fenced code blocks of the assistant turn(s) as LITERAL text. A fix answer carries file
+ * content, and rendered markdown rewrites it (backslash escapes, emphasis, links) while it still
+ * parses as JSON, so a fix is read from code blocks only. */
+function assistantCodeBlocks(root = currentAssistantRoot()) {
+  if (!root) return [];
+  const turns = root.matches('[data-message-author-role="assistant"]')
+    ? [root]
+    : [...root.querySelectorAll('[data-message-author-role="assistant"]')];
+  const blocks = [];
+  for (const turn of turns) {
+    for (const pre of turn.querySelectorAll("pre")) {
+      const text = (pre.querySelector("code") || pre).textContent || "";
+      if (text.trim()) blocks.push(text);
+    }
+  }
+  return blocks;
+}
+
 function harvestJson(opts) {
   const allowThin = Boolean(opts && opts.allowThin);
   const chunks = assistantCorpus(opts?.root);
@@ -328,7 +346,8 @@ async function waitUntilReviewOrQuota(name) {
 }
 
 /** A review-loop FIX answer is plain text for the server's deterministic fix parser: harvest
- * the FULL bound response after the same positive completion controls and two identical stable
+ * the bound response's fenced code blocks (literal text, see assistantCodeBlocks) — or, when it
+ * has none, a fixed no-JSON line — after the same positive completion controls and two identical stable
  * observations as a review, with no review-JSON requirement and no capture/repair evidence (a
  * fix item has neither lane). No page timer ends it: the server's fix deadline cancels the item
  * and the worker's ashlar-fix-cancel stops this collector.
@@ -350,7 +369,12 @@ async function waitUntilFixOrQuota(name) {
     const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
     const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
     const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
-    const text = done ? assistantCorpus(bound?.root).join("\n\n") : "";
+    const prose = done ? assistantCorpus(bound?.root).join("\n\n") : "";
+    const blocks = prose.trim() ? assistantCodeBlocks(bound?.root) : [];
+    // No fenced block: a fixed line with no JSON, so the server's fix parser fails closed (a retry)
+    // instead of reading file content from rendered prose.
+    const text = !prose.trim() ? "" : blocks.length ? blocks.join("\n\n")
+      : "(no fenced code block in the answer; the fix JSON must be inside a ```json fence)";
     const answered = done && Boolean(text.trim());
     // Local diagnostics only: the answer text is never copied into an observation.
     if (runner?.running) runner.observation = {

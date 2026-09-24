@@ -14,6 +14,7 @@ import {
   loopEnabled,
   loopPostedReview,
   renderFindings,
+  CHAT_FIX_FENCE_RULE,
   fixGenerationMs,
   requestChatFix,
   runPostReviewLoop,
@@ -1240,9 +1241,11 @@ describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per 
     for (const provider of ["chatgpt", "grok"] as const) {
       assert.equal(await requestChatFix(chat(provider), { owner: "o", repo: "r", pr: 7 }, provider, "FIX PROMPT", { loadBridge: loader }), "ANSWER TEXT");
     }
+    // the page reads fenced code only, so the chat prompt asks for exactly one ```json fence
+    const fenced = `FIX PROMPT\n\n${CHAT_FIX_FENCE_RULE}`;
     assert.deepEqual(calls, [
-      { owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: "FIX PROMPT" },
-      { owner: "o", repo: "r", pr: 7, provider: "grok", prompt: "FIX PROMPT" },
+      { owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: fenced },
+      { owner: "o", repo: "r", pr: 7, provider: "grok", prompt: fenced },
     ]);
   });
 

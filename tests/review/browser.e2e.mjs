@@ -183,9 +183,9 @@ test('real DOM recovery: missing job resumes its bound observer without a new pr
 
 // Review-loop FIX items: plain-text answers (no review JSON), and the ownership proof a cancelled
 // fix tab must give before the worker may force-close it.
-test('real DOM: a fix item harvests its full plain-text answer (no review JSON) only after completion',async t=>{
- const fixAnswer='I guarded the null path.\n{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
- const page=await fixture(t,user+answer(`<p>${fixAnswer.replace(/\n/g,'<br>')}</p>`)+stop);
+test('real DOM: a fix item harvests its fenced JSON (no review JSON) only after completion',async t=>{
+ const fixAnswer='{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
+ const page=await fixture(t,user+answer(`<p>I guarded the null path.</p><pre><code>${fixAnswer}</code></pre>`)+stop);
  await page.evaluate(()=>{window.__ashlarRunnerState={kind:'fix'};});
  await startWait(page);await page.clock.runFor(3200);
  assert.equal((await page.evaluate(()=>waitResult)).pending,true,'Stop is visible: still generating');
@@ -227,6 +227,22 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
  assert.equal((await cancel()).owned,true,'the just-clicked, not yet confirmed turn is Ashlar\'s');
  await page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').textContent='someone else asked this';});
  assert.equal((await cancel()).owned,false,'a turn that is not Ashlar\'s prompt preserves the tab');
+});
+
+test('real DOM: a fix is read from its fenced code block literally, never from rendered prose',async t=>{
+ // What ChatGPT renders for the same JSON: unfenced it is markdown (the escaped \\n loses a
+ // backslash, *x* becomes emphasis, __init__ bold) yet still parses; fenced it is literal code.
+ const literal='{"summary":"s","files":[{"path":"a.py","content":"print(\\"a\\\\nb\\") # *x* __init__"}]}';
+ const prose='{"summary":"s","files":[{"path":"a.py","content":"print(\\"a\\nb\\") # <em>x</em> <strong>init</strong>"}]}';
+ const code=`<pre><div>json</div><button>Copy code</button><div><code class="language-json">${literal.replace(/</g,'&lt;')}</code></div></pre>`;
+ const page=await fixture(t,user+answer(`<p>Here is the fix.</p>${code}`,true));
+ assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),[literal]);
+ const unfenced=await fixture(t,user+answer(`<p>${prose}</p>`,true));
+ assert.deepEqual(await unfenced.evaluate(()=>assistantCodeBlocks()),[],'rendered prose is never read as a fix');
+ await unfenced.evaluate(()=>{window.__ashlarRunnerState={kind:'fix',running:true,jobId:'fix-A',runId:'run-A'};window.fixResult={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>window.fixResult={raw},e=>window.fixResult={error:e.message});});
+ await unfenced.clock.runFor(3200);
+ const out=await unfenced.evaluate(()=>window.fixResult);
+ assert.match(out.raw,/no fenced code block/);assert.ok(!out.raw.includes('{'),'no JSON reaches the fix parser');
 });
 
 test('real popup: a running review and tab-capacity blocker are shown together',async t=>{

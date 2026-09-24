@@ -42,7 +42,7 @@ const html=`<!doctype html><html><body>
  <script>
  window.sends=0;
  document.querySelector('button').onclick=()=>{window.sends++;const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';const user=document.createElement('div');user.dataset.messageAuthorRole='user';user.textContent=document.querySelector('textarea').value;turn.append(user);document.querySelector('#turns').append(turn);document.querySelector('textarea').value='';};
- window.reply=(raw,done)=>{document.querySelector('#answer')?.remove();const turn=document.createElement('section');turn.id='answer';turn.dataset.testid='conversation-turn-2';const message=document.createElement('div');message.dataset.messageAuthorRole='assistant';const md=document.createElement('div');md.className='markdown';md.textContent=raw;message.append(md);turn.append(message);if(done){const button=document.createElement('button');button.dataset.testid='copy-turn-action-button';button.ariaLabel='Copy response';button.textContent='copy';turn.append(button);}document.querySelector('#turns').append(turn);};
+ window.reply=(raw,done,code)=>{document.querySelector('#answer')?.remove();const turn=document.createElement('section');turn.id='answer';turn.dataset.testid='conversation-turn-2';const message=document.createElement('div');message.dataset.messageAuthorRole='assistant';const md=document.createElement('div');md.className='markdown';md.textContent=raw;if(code!==undefined){const pre=document.createElement('pre');const c=document.createElement('code');c.textContent=code;pre.append(c);md.append(pre);}message.append(md);turn.append(message);if(done){const button=document.createElement('button');button.dataset.testid='copy-turn-action-button';button.ariaLabel='Copy response';button.textContent='copy';turn.append(button);}document.querySelector('#turns').append(turn);};
  </script></body></html>`;
 
 test('MV3 E2E: long queue → restart → final JSON ACK → close chat tab → one review',async t=>{
@@ -206,7 +206,7 @@ test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/
  assert.equal(await pageA.evaluate(()=>window.sends),1);assert.equal(app.reviews.length,1);
 });
 
-test('MV3 fix E2E: a fix prompt is answered as plain text in a chat tab; a superseded fix tab is force-closed',async t=>{
+test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a superseded fix tab is force-closed',async t=>{
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
  const profile=await mkdtemp(join(tmpdir(),'ashlar-fix-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
@@ -225,15 +225,15 @@ test('MV3 fix E2E: a fix prompt is answered as plain text in a chat tab; a super
  const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
  const userText=p=>p.evaluate(()=>document.querySelector('[data-message-author-role="user"]')?.textContent||'');
  const request=(pr,prompt)=>app.bridge.requestBridgeFix({owner:'fixture',repo:'fixture',pr,provider:'chatgpt',prompt});
- // 1) The fix prompt reaches a chat tab; the answer is plain text, not review JSON.
- const answer='Guarded the null path.\n{"summary":"guard","files":[{"path":"a.ts","content":"export const answer = 43;\\n"}],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
+ // 1) The fix prompt reaches a chat tab; the answer's fenced JSON (literal code) is delivered, not review JSON.
+ const answer='{"summary":"guard","files":[{"path":"a.ts","content":"export const answer = 43;\\n"}],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
  let result;
  request(1,'FIX PROMPT for fixture#1: return the JSON object').then(value=>{result={value};},error=>{result={error};});
  assert.equal(app.bridge.getBridgePublic().pendingFixes,1);
  let page;
  await eventually(async()=>{await worker.evaluate(()=>tick());page=chatPages()[0];return page&&page.evaluate(()=>window.sends===1).catch(()=>false);},'fix prompt was not submitted');
  assert.match(await userText(page),/FIX PROMPT for fixture#1/);
- await page.evaluate(raw=>window.reply(raw,true),answer);
+ await page.evaluate(code=>window.reply('Guarded the null path.',true,code),answer);
  await eventually(async()=>{await worker.evaluate(()=>tick());return result!==undefined;},'fix answer was not delivered');
  assert.equal(result.error,undefined);assert.equal(result.value,answer);
  await eventually(async()=>{await worker.evaluate(()=>tick());return page.isClosed();},'answered fix tab was not closed');

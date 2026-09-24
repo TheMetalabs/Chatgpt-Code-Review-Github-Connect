@@ -7,17 +7,18 @@ import {webcrypto} from 'node:crypto';
 import {content, background, storage, flush} from './helpers.mjs';
 
 const PARTS = ['I guarded the null path.', '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'];
-const ANSWER = PARTS.join('\n\n');
+// A fix is read from the answer's fenced code only (literal text; see assistantCodeBlocks).
+const ANSWER = PARTS[1];
 const URL_FIX = 'https://chatgpt.com/c/fix';
 const run = (extra = {}) => ({type: 'ashlar-run', jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', kind: 'fix', prompt: 'FIX PROMPT', ...extra});
 const msg = (type, extra = {}) => ({type, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', kind: 'fix', ...extra});
 
 /** Page runner over a completed answer; a polling guard turns "pending forever" into an error. */
-function page({parts = PARTS, limit = 50} = {}) {
+function page({parts = PARTS, blocks = [PARTS[1]], limit = 50} = {}) {
   const c = content('chatgpt');
   let polls = 0;
   Object.assign(c.context, {
-    stopButtonVisible: () => false, replyDoneVisible: () => true, assistantCorpus: () => parts,
+    stopButtonVisible: () => false, replyDoneVisible: () => true, assistantCorpus: () => parts, assistantCodeBlocks: () => blocks,
     sleep: async () => { if (++polls > limit) throw new Error('test-only polling guard'); await new Promise(resolve => setImmediate(resolve)); },
   });
   return {c, polls: () => polls, state: () => c.context.__ashlarRunnerState};
@@ -26,7 +27,7 @@ async function settled(c) {
   for (let i = 0; i < 200 && c.context.__ashlarRunnerState.running; i++) await flush();
 }
 
-test('page: a fix collector returns the FULL plain text after two stable completed observations', async () => {
+test('page: a fix collector returns the fenced code after two stable completed observations', async () => {
   const p = page();
   Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
   assert.equal(await p.c.context.waitUntilReviewOrQuota('ChatGPT'), ANSWER);
@@ -45,9 +46,27 @@ test('page: a fix collector waits through generation and empty completed turns, 
   Object.assign(p.c.context, {
     stopButtonVisible: () => p.polls() < 5, replyDoneVisible: () => p.polls() >= 5,
     assistantCorpus: () => (p.polls() < 10 ? [] : ['final fix answer']),
+    assistantCodeBlocks: () => (p.polls() < 10 ? [] : ['final fix answer']),
   });
   assert.equal(await p.c.context.waitUntilFixOrQuota('ChatGPT'), 'final fix answer');
   assert.equal(p.polls(), 11);
+});
+
+test('page: an answer with no fenced block harvests a fixed no-JSON line (the server fails closed)', async () => {
+  const p = page({blocks: []}); // the JSON is only in rendered prose, where markdown may have rewritten it
+  const out = await p.c.context.waitUntilFixOrQuota('ChatGPT');
+  assert.match(out, /no fenced code block/);
+  assert.ok(!out.includes('{'), 'no JSON object for the fix parser to read');
+});
+
+test('page: assistantCodeBlocks reads the literal code text, not the rendered block chrome', () => {
+  const c = content('chatgpt'); // the real helper, not page()'s stub
+  const code = {textContent: '{"files":[{"path":"a.ts","content":"a\\\\nb *x* __init__"}]}'};
+  const pre = {querySelector: sel => (sel === 'code' ? code : null), textContent: `jsonCopy code${code.textContent}`};
+  const bare = {querySelector: () => null, textContent: 'plain pre'};
+  const turn = {matches: () => true, querySelectorAll: sel => (sel === 'pre' ? [pre, bare, {querySelector: () => null, textContent: '  '}] : [])};
+  assert.deepEqual([...c.context.assistantCodeBlocks(turn)], [code.textContent, 'plain pre']);
+  assert.deepEqual([...c.context.assistantCodeBlocks(null)], []);
 });
 
 test('page: a visible quota notice ends a fix only before an answer is visible', async () => {

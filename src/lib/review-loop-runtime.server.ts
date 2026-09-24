@@ -524,6 +524,11 @@ export type BridgeFixLoader = () => Promise<{ requestBridgeFix(request: FixReque
  * supersession or an oversized prompt. Only script-apply is wired: a "chat-push" configuration
  * (the tab commits by itself) must not silently become a server-side apply.
  */
+/** The chat page reads a fix answer from fenced code blocks only (rendered markdown would rewrite
+ * file content), so a chat fix must fence its JSON. */
+export const CHAT_FIX_FENCE_RULE =
+  "Chat delivery: put that JSON object inside exactly one ```json fenced code block. Only fenced code is read; text outside it is ignored.";
+
 export async function requestChatFix(
   settings: BotSettings,
   ref: PrRef,
@@ -535,7 +540,8 @@ export async function requestChatFix(
     throw new Error(`fix delivery ${settings.fixAgent.delivery} is not wired for ${provider} (script-apply only)`);
   }
   const bridge = await (opts.loadBridge ?? (() => import("./bridge.server.ts")))();
-  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt, ...(opts.signal ? { signal: opts.signal } : {}) });
+  const fenced = `${prompt}\n\n${CHAT_FIX_FENCE_RULE}`;
+  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt: fenced, ...(opts.signal ? { signal: opts.signal } : {}) });
 }
 
 /** Production dependencies, loaded lazily so the static graph stays pure. `ref` is the PR a

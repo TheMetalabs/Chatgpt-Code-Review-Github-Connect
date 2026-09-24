@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {createHash,X509Certificate} from 'node:crypto';
 import {root,json} from './load-source.mjs';
 import {appFixture,eventually} from './app-fixture.mjs';
 import {chatFixtureProxy} from './browser-proxy.mjs';
@@ -34,6 +35,33 @@ async function evaluateTarget(cdp,url,expression) {
  }
 }
 
+// The fixture proxy's throwaway chatgpt.com certificate is trusted by an SPKI pin at launch.
+// Playwright's ignoreHTTPSErrors is sent to each page only after Playwright attaches to it, so a
+// tab the extension creates can complete its TLS handshake first and land on the certificate
+// interstitial (chrome-error://chromewebdata/), leaving its run undispatched. The pin applies
+// browser-wide from startup and trusts exactly this fixture key.
+const certificatePin=proxy=>`--ignore-certificate-errors-spki-list=${createHash('sha256').update(new X509Certificate(proxy.certificate).publicKey.export({type:'spki',format:'der'})).digest('base64')}`;
+
+// The extension's service worker as a Playwright Worker. `manager` is chrome://extensions with
+// developer mode on. Chromium can start the MV3 worker before Playwright's browser-level
+// auto-attach and then never attach it: Target.getTargets lists it with attached:false and no
+// 'serviceworker' event ever fires, so a plain waitForEvent times out. Reloading the unpacked
+// extension in this fresh test profile (before any test state exists) starts a new worker target,
+// which is auto-attached.
+async function extensionWorker(context,manager) {
+ const seen=context.waitForEvent('serviceworker').catch(error=>error);
+ const attached=context.serviceWorkers()[0];
+ if(attached)return attached;
+ const cdp=await context.newCDPSession(manager);
+ let targetInfos;
+ try {({targetInfos}=await cdp.send('Target.getTargets'));} finally {await cdp.detach().catch(()=>{});}
+ const orphan=targetInfos.find(target=>target.type==='service_worker'&&target.url.startsWith('chrome-extension://')&&!target.attached);
+ if(!orphan){const worker=await seen;if(worker instanceof Error)throw worker;return worker;}
+ const restarted=context.waitForEvent('serviceworker');
+ await manager.evaluate(id=>new Promise(resolve=>chrome.developerPrivate.reload(id,{failQuietly:true},()=>resolve())),new URL(orphan.url).host);
+ return restarted;
+}
+
 const envelope=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 const html=`<!doctype html><html><body>
  <div id="turns"></div><form data-type="unified-composer" onsubmit="return false">
@@ -47,14 +75,16 @@ const html=`<!doctype html><html><body>
 
 test('MV3 E2E: long queue → restart → final JSON ACK → close chat tab → one review',async t=>{
  const app=await appFixture();t.after(()=>app.close());
- const profile=await mkdtemp(join(tmpdir(),'ashlar-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-e2e-'));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
  const extension=join(root,'extension');
  const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
    // The disposable, local-fixture-only browser must allow its unpacked extension to reload.
    // This is a test launch setting; no installed browser profile or managed policy is changed.
-   args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
- t.after(()=>context.close());
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',certificatePin(proxy),`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ // node:test runs after-hooks in registration order: the profile is removed only once the browser
+ // that writes to it has exited (removing it first races Chrome's writes: ENOTEMPTY).
+ t.after(async()=>{await context.close();await rm(profile,{recursive:true,force:true});});
  // Set developer mode through Chrome's own UI in this newly created test profile.
  // Never alter managed policy or an existing user's browser preferences.
  const manager=await context.newPage();
@@ -64,13 +94,13 @@ test('MV3 E2E: long queue → restart → final JSON ACK → close chat tab → 
  assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
  if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
  assert.equal(await developerMode.evaluate(el=>Boolean(el.checked)),true);
+ let worker=await extensionWorker(context,manager);
  await manager.close();
  const diagnostics=[];
  context.on('page',page=>{page.on('pageerror',error=>diagnostics.push(['pageerror',error.message]));page.on('console',msg=>{if(msg.type()==='error')diagnostics.push(['console',msg.text()]);});});
  context.on('requestfailed',request=>diagnostics.push(['requestfailed',request.url(),request.failure()?.errorText]));
  // The launch-level local proxy also intercepts the first extension-created tab request.
  // Explicit loopback bypass keeps bridge RPCs out of the external-destination proxy.
- let worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
  await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
  const delivered=app.mention();assert.equal(delivered.queued,true);
  await eventually(()=>app.localRequests.length===1,'local generation not started');
@@ -160,19 +190,21 @@ test('local-only E2E: pending until response ends, then a single final review',a
 
 test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/closes → C admitted',async t=>{
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
- const profile=await mkdtemp(join(tmpdir(),'ashlar-parallel-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-parallel-e2e-'));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
  const extension=join(root,'extension');
  const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,
    channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
-   args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
- t.after(()=>context.close());
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',certificatePin(proxy),`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ // node:test runs after-hooks in registration order: the profile is removed only once the browser
+ // that writes to it has exited (removing it first races Chrome's writes: ENOTEMPTY).
+ t.after(async()=>{await context.close();await rm(profile,{recursive:true,force:true});});
  const manager=await context.newPage();await manager.goto('chrome://extensions');
  const developerMode=manager.locator('#devMode');await developerMode.waitFor({state:'visible'});
  assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
  if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ let worker=await extensionWorker(context,manager);
  await manager.close();
- let worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
  await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,maxReviewTabs:2}),app.origin);
  const request=pr=>app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'mv3-parallel-'+pr,event:'issue_comment',payload:{
    action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},
@@ -208,19 +240,21 @@ test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/
 
 test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a superseded fix tab is force-closed',async t=>{
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
- const profile=await mkdtemp(join(tmpdir(),'ashlar-fix-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-fix-e2e-'));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
  const extension=join(root,'extension');
  const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,
    channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
-   args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
- t.after(()=>context.close());
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',certificatePin(proxy),`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ // node:test runs after-hooks in registration order: the profile is removed only once the browser
+ // that writes to it has exited (removing it first races Chrome's writes: ENOTEMPTY).
+ t.after(async()=>{await context.close();await rm(profile,{recursive:true,force:true});});
  const manager=await context.newPage();await manager.goto('chrome://extensions');
  const developerMode=manager.locator('#devMode');await developerMode.waitFor({state:'visible'});
  assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
  if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ const worker=await extensionWorker(context,manager);
  await manager.close();
- const worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
  await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
  const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
  const userText=p=>p.evaluate(()=>document.querySelector('[data-message-author-role="user"]')?.textContent||'');

@@ -28,7 +28,7 @@ export async function until(check, ms = 5000) {
 }
 export function content(provider = 'chatgpt', persisted = new Map()) {
   const listeners = [];
-  const context = vm.createContext({ console, sessionStorage: { getItem: key => persisted.get(key), setItem: (key, value) => persisted.set(key, value) }, chrome: { runtime: { onMessage: { addListener: fn => listeners.push(fn), removeListener: fn => { const i=listeners.indexOf(fn);if(i>=0)listeners.splice(i,1); } } } } });
+  const context = vm.createContext({ console, URL, sessionStorage: { getItem: key => persisted.get(key), setItem: (key, value) => persisted.set(key, value) }, chrome: { runtime: { onMessage: { addListener: fn => listeners.push(fn), removeListener: fn => { const i=listeners.indexOf(fn);if(i>=0)listeners.splice(i,1); } } } } });
   for (const file of ['quota.js', 'model.js', 'json.js', `content-${provider}.js`]) {
     vm.runInContext(source(`extension/${file}`), context, { filename: file });
   }

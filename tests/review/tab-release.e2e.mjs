@@ -96,3 +96,90 @@ for(const kind of ['review','fix'])test(`${kind}: a cancelled run's collector en
  assert.equal(steps.at(-1),'cancelled','recorded as cancelled, not as a provider error');
  assert.equal(steps.includes('error'),false);
 });
+
+// ── The close verdict (page side). A review or fix run collects its answer, then the page changes.
+async function collected(t,{kind,tail='',url=TEMP_URL,...rest}={}){
+ const tab=await chatTab(t,{kind,url,thread:userTurn()+answerTurn({code:ANSWER+tail}),journal:sentJournal(),...rest});
+ await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(2400);
+ const out=await tab.send('ashlar-harvest');
+ assert.equal(out.ok,true,`collected: ${JSON.stringify(out)}`);
+ return {tab,out};
+}
+const canClose=tab=>tab.send('ashlar-can-close',{allocationUrl:TEMP_URL});
+const verdict=out=>({canClose:out.canClose,reason:out.reason,...(out.cause?{cause:out.cause}:{})});
+
+// ChatGPT keeps redrawing a finished answer. None of this is the user's activity.
+const REDRAWS=[
+ ['the closing code fence finishes drawing after collection ("}\\n`")','\n`',p=>p.locator('#code').evaluate(el=>{el.textContent=el.textContent.replace(/\n`+$/,'');})],
+ ['the closing code fence finishes drawing after collection ("}\\n``")','\n``',p=>p.locator('#code').evaluate(el=>{el.textContent=el.textContent.replace(/\n`+$/,'');})],
+ ['a late code-block label and an Edit affordance render','',p=>p.locator('#lang').evaluate(el=>{el.textContent='json';el.insertAdjacentHTML('afterend','<span>Edit</span>');})],
+ ['the provider re-keys its assistant message id','',p=>p.evaluate(()=>{document.querySelector('[data-message-author-role="assistant"]').dataset.messageId='answer-B';})],
+ ['the provider replaces the answer text (no new user turn)','',p=>p.locator('#code').evaluate(el=>{el.textContent='{"findings":[],"merge_recommendation":"REQUEST_CHANGES"}';})],
+ ['a streaming indicator and Stop reappear','',p=>p.evaluate(stop=>{document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('afterbegin','<div data-streaming-response-status="streaming" style="width:60px;height:20px">…</div>');document.body.insertAdjacentHTML('beforeend',stop);},stopButton)],
+];
+for(const kind of ['review','fix'])for(const [name,tail,redraw] of REDRAWS)test(`${kind}: a secured tab may close after ${name}`,async t=>{
+ const {tab,out}=await collected(t,{kind,tail});
+ if(tail)assert.ok(out.responseText.endsWith(tail),'the fixture reproduces the partial fence frozen at collection');
+ await redraw(tab.page);
+ assert.deepEqual(verdict(await canClose(tab)),{canClose:true,reason:'complete'});
+ assert.equal((await tab.steps()).includes('context_changed'),false,'no takeover recorded');
+ assert.equal(await tab.released(),null,'the managed slot is kept until the tab closes');
+});
+
+// Positive evidence the user took the tab over: preserved (slot freed), with the cause.
+const TAKEOVERS=[
+ ['a follow-up turn','user_turn',p=>p.evaluate(html=>document.getElementById('thread').insertAdjacentHTML('beforeend',html),userTurn('user-B','my own question'))],
+ ['a draft in the composer','draft',p=>p.evaluate(()=>{document.getElementById('prompt-textarea').textContent='my unsent question';})],
+ ['an edit of Ashlar\'s prompt (the turn is replaced)','edited',p=>p.evaluate(html=>{document.querySelector('[data-testid="conversation-turn-user-A"]').outerHTML=html;},userTurn('user-A2','my edited question'))],
+];
+for(const kind of ['review','fix'])for(const [name,cause,takeover] of TAKEOVERS)test(`${kind}: a secured tab with ${name} is preserved and released`,async t=>{
+ const {tab}=await collected(t,{kind});
+ await takeover(tab.page);
+ assert.deepEqual(verdict(await canClose(tab)),{canClose:false,reason:'repurposed',cause});
+ assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
+ assert.ok((await tab.steps()).includes('context_changed'));
+});
+for(const kind of ['review','fix'])test(`${kind}: a secured tab moved in-page to another conversation (old DOM still rendered) is the user's`,async t=>{
+ const {tab}=await collected(t,{kind});
+ assert.equal((await canClose(tab)).canClose,true,'control: still in its own conversation');
+ await tab.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);
+ const out=await canClose(tab);
+ assert.deepEqual({...verdict(out),identity:out.identity,conversation:out.conversation},{canClose:false,reason:'repurposed',cause:'navigated',identity:'changed',conversation:TEMP_URL});
+});
+
+// A reloaded ACKed temporary chat renders nothing: blank on the page it was opened on, so it closes.
+for(const kind of ['review','fix'])test(`${kind}: a secured temporary chat reloaded blank still closes; a conversation page not rendered yet waits`,async t=>{
+ const {tab}=await collected(t,{kind});
+ tab.served.thread='';
+ await tab.reload();
+ const out=await canClose(tab);
+ assert.deepEqual({...verdict(out),blank:out.blank},{canClose:true,reason:'complete',blank:true});
+ const conv=await collected(t,{kind,url:CONV_URL});
+ conv.tab.served.thread='';await conv.tab.reload();
+ assert.deepEqual(verdict(await canClose(conv.tab)),{canClose:false,reason:'pending',cause:'not_rendered'},'nothing rendered on a conversation page proves nothing: asked again');
+});
+
+test('review: a run pins its conversation on its exact sent turn, and follows a bare new-chat page to the assigned conversation once',async t=>{
+ const temp=await chatTab(t,{thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+ await temp.send('ashlar-run',{resume:true});await temp.page.clock.runFor(1600);
+ const journal=tab=>tab.page.evaluate(()=>JSON.parse(sessionStorage.getItem('ashlar:submission:job-A:run-A')).conversation);
+ assert.equal(await journal(temp),TEMP_URL);
+ assert.equal((await temp.send('ashlar-harvest')).conversation,TEMP_URL,'every reply reports the pinned conversation');
+ const fresh=await chatTab(t,{url:'https://chatgpt.com/',thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+ await fresh.send('ashlar-run',{resume:true});await fresh.page.clock.runFor(1600);
+ assert.equal(await journal(fresh),'https://chatgpt.com/');
+ await fresh.page.evaluate(url=>history.pushState({},'',url),CONV_URL);await fresh.page.clock.runFor(1600);
+ assert.equal(await journal(fresh),CONV_URL,'upgraded once to the conversation the provider assigned');
+ await fresh.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);await fresh.page.clock.runFor(1600);
+ assert.equal(await journal(fresh),CONV_URL,'never re-pinned after that');
+});
+test('an unbound page never answers for a job: can-close and a cancel without the undispatched claim get job_mismatch',async t=>{
+ const tab=await chatTab(t,{bound:false});
+ assert.equal((await tab.send('ashlar-can-close',{allocationUrl:TEMP_URL})).code,'job_mismatch');
+ assert.equal((await tab.send('ashlar-fix-cancel',{allocationUrl:TEMP_URL})).code,'job_mismatch');
+ const claimed=await tab.send('ashlar-fix-cancel',{allocationUrl:TEMP_URL,undispatched:true});
+ assert.deepEqual({owned:claimed.owned,blank:claimed.blank,releaseProtocol:claimed.releaseProtocol},{owned:true,blank:true,releaseProtocol:1});
+ await tab.page.evaluate(()=>{document.getElementById('prompt-textarea').textContent='my own question';});
+ const draft=await tab.send('ashlar-fix-cancel',{allocationUrl:TEMP_URL,undispatched:true});
+ assert.deepEqual({owned:draft.owned,cause:draft.cause},{owned:false,cause:'draft'});
+});

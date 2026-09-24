@@ -184,7 +184,9 @@ test('worker/HTTP: late assistant ID after schema-invalid collection starts exac
  assert.equal(f.app.localRequests.length,1);assert.equal(f.app.reviews.length,1);
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'&&!m.resume),false);
 });
-for(const change of ['original_user_removed','response_id_changed'])test(`accepted repair does not close changed context: ${change}`,async t=>{
+// After a repair is accepted (the result is secured): a vanished Ashlar turn proves nothing (never
+// closed on a guess), while a provider re-keying its own answer is not the user's activity.
+for(const change of ['original_user_removed','response_id_changed'])test(`accepted repair: the close verdict after the page changed (${change})`,async t=>{
  const page=await pageFixture(t,{manual:true});await observeAgain(page);
  const receipt={committed:true,repairId:'repair-A',responseId:'response-A',text:original,raw};
  assert.equal((await page.evaluate(receipt=>message('ashlar-repair-accepted',receipt),receipt)).accepted,true);
@@ -194,12 +196,15 @@ for(const change of ['original_user_removed','response_id_changed'])test(`accept
  },change);
  await observeAgain(page);
  assert.equal((await page.evaluate(()=>message('ashlar-harvest'))).raw,raw);
- const out=await page.evaluate(()=>message('ashlar-can-close'));assert.equal(out.canClose,false);assert.equal(out.reason,'repurposed');
+ const out=await page.evaluate(()=>message('ashlar-can-close'));
+ assert.deepEqual({canClose:out.canClose,reason:out.reason},change==='original_user_removed'?{canClose:false,reason:'pending'}:{canClose:true,reason:'complete'});
 });
 
 
-// Second review: the close authorization itself and a genuinely executing old loop.
-for(const change of ['unchanged','replaced_response','missing_response','changed_text'])test(`P1: final close guard checks acknowledged assistant after native collection (${change})`,async t=>{
+// Second review: the close authorization itself and a genuinely executing old loop. Once the
+// result is secured, the provider replacing, removing or redrawing its answer is not the user's
+// activity: the verdict closes (the acknowledged result stays the harvested one).
+for(const change of ['unchanged','replaced_response','missing_response','changed_text'])test(`P1: after the result is secured, the close verdict ignores the provider's redraws of the answer (${change})`,async t=>{
  const invalid=JSON.stringify({findings:[],investigated_safe:'checked'});
  const page=await pageFixture(t,{text:invalid});
  assert.equal(await page.evaluate(()=>__ashlarRunnerState.running),false);
@@ -214,7 +219,7 @@ for(const change of ['unchanged','replaced_response','missing_response','changed
  },change);
  assert.equal(await page.evaluate(()=>reviewPageContext()),context,'test must preserve all user-context fields');
  const out=await page.evaluate(()=>message('ashlar-can-close'));
- assert.equal(out.canClose,change==='unchanged');assert.equal(out.reason,change==='unchanged'?'complete':'repurposed');
+ assert.equal(out.canClose,true);assert.equal(out.reason,'complete');
  assert.equal((await page.evaluate(()=>message('ashlar-harvest'))).raw,raw);
 });
 async function upgradeLegacy(page) {
@@ -242,7 +247,8 @@ test('P2: preserved active v2 collector hands off committed repair without waiti
  await observeAgain(page);await observeAgain(page);
  assert.equal(await page.evaluate(()=>legacyState.running),false,'legacy invocation must actually have settled in this regression');
  const final=await page.evaluate(()=>message('ashlar-harvest'));assert.equal(final.raw,raw);assert.equal(final.responseText,original);
- const close=await page.evaluate(()=>message('ashlar-can-close'));assert.equal(close.canClose,false);assert.equal(close.reason,'repurposed');
+ // The provider replaced its own answer after the receipt: not the user's activity, the tab may close.
+ const close=await page.evaluate(()=>message('ashlar-can-close'));assert.equal(close.canClose,true);assert.equal(close.reason,'complete');
 });
 test('P2: current tracking collector probes cannot manufacture the second observation',async t=>{
  const page=await pageFixture(t,{manual:true});
@@ -296,7 +302,7 @@ test('P2: legacy probe evidence resets on Stop and is not mixed with older colle
  assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,false);
  assert.equal((await page.evaluate(()=>message('ashlar-repair-source'))).ok,true);
 });
-test('P1 worker/HTTP: response replacement after server receipt preserves the tab and acknowledged review',async t=>{
+test('P1 worker/HTTP: a response the provider replaced after the server receipt still closes the tab; the acknowledged review stands',async t=>{
  const f=await workerFixture(t);await f.cycle();await eventually(()=>f.app.localRequests.length===1,'repair not started');
  let replacement;const send=f.worker.chrome.tabs.sendMessage;
  f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
@@ -306,15 +312,15 @@ test('P1 worker/HTTP: response replacement after server receipt preserves the ta
   void replacement.then(()=>send(id,msg,cb));
  };
  f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:raw}}]}));
- await eventually(async()=>{await f.cycle();return !f.worker.local.state.pendingReviewJobs[f.job.jobId];},'acknowledged changed tab did not retire safely');
- assert.ok(replacement);assert.equal(f.worker.closedTabs.length,0);assert.equal(f.app.localRequests.length,1);assert.equal(f.app.reviews.length,1);
+ await eventually(async()=>{await f.cycle();return !f.worker.local.state.pendingReviewJobs[f.job.jobId];},'acknowledged changed tab did not retire');
+ assert.ok(replacement);assert.deepEqual(f.worker.closedTabs,[10]);assert.equal(f.app.localRequests.length,1);assert.equal(f.app.reviews.length,1);
  assert.equal((await f.page.evaluate(()=>message('ashlar-harvest'))).raw,raw);
 });
-test('P1: an unchanged repaired response still streaming cannot authorize cleanup',async t=>{
+test('P1: a streaming flag on a repaired (secured) response does not hold its tab',async t=>{
  const invalid=JSON.stringify({findings:[],investigated_safe:'checked'});const page=await pageFixture(t,{text:invalid});
  const receipt={committed:true,repairId:'streaming-repair',responseId:'response-A',text:invalid,raw};
  assert.equal((await page.evaluate(r=>message('ashlar-repair-accepted',r),receipt)).accepted,true);
  await page.evaluate(()=>{const status=document.createElement('div');status.dataset.streamingResponseStatus='';status.textContent='Generating';document.querySelector('#answer').prepend(status);});
- const out=await page.evaluate(()=>message('ashlar-can-close'));assert.equal(out.canClose,false);assert.equal(out.reason,'pending');
+ const out=await page.evaluate(()=>message('ashlar-can-close'));assert.equal(out.canClose,true);assert.equal(out.reason,'complete');
  await page.locator('[data-streaming-response-status]').evaluate(n=>n.remove());assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true);
 });

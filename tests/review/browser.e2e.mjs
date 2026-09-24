@@ -455,9 +455,9 @@ for(const kind of ['review','fix']){
   const out=await harvest();
   const canClose=(await send('ashlar-can-close')).canClose;
   // Intended difference (W/P table row P16): a fix answer is read only in the conversation its run
-  // was bound in. FLAG R4 (review, unchanged here): a review still harvests the lingering DOM and
-  // records its completion context under the new URL, so its can-close then passes there.
-  assert.deepEqual({ok:out.ok===true,canClose},kind==='fix'?{ok:false,canClose:false}:{ok:true,canClose:true});
+  // was bound in; a review still harvests the lingering DOM (FLAG R4, out of scope). Both runs pinned
+  // their conversation while generating, so neither tab may close in the user's conversation.
+  assert.deepEqual({ok:out.ok===true,canClose},kind==='fix'?{ok:false,canClose:false}:{ok:true,canClose:false});
  });
 }
 

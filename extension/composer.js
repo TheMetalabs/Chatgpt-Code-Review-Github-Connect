@@ -115,6 +115,9 @@ async function fillComposer(el, text) {
       body = [parts.prompt, ...parts.files.map(file => `--- ${file.name}\n${file.body}`)].filter(Boolean).join("\n\n");
     }
   }
+  // Before any text is typed: the ownership verdict must recognise Ashlar's own prompt in the
+  // composer even before clickSend journals it.
+  if (state) state.pendingPrompt = normalizePrompt(body);
   for (;;) {
     // The stop fence lives with the runner state in json.js (absent: nothing can stop the run).
     globalThis.throwIfStopped?.();

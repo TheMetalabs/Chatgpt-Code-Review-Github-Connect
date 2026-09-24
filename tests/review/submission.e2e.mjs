@@ -127,11 +127,13 @@ for(const provider of ['ChatGPT','Grok']) {
  });
 }
 
-test('a collected result stays available but cannot close its tab while the confirmed journal is unsaved',async t=>{
+test('a collected result stays available and may close its tab even while the confirmed journal write keeps failing',async t=>{
+ // The confirmed identity is held in memory; a pending local write is not the user's activity and
+ // must not hold a secured tab (it could hold it forever).
  const page=await fixture(t);await rejectSentWrites(page);await installCollector(page);await confirmWithId(page);
  await appendAnswer(page,originalJson);await page.clock.runFor(2400);
  assert.equal((await page.evaluate(()=>message())).raw,originalJson);
- assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,false);
+ assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true);
  await page.evaluate(()=>window.rejectSent=false);
  assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true);
  assert.equal(await page.evaluate(()=>clicks),1);
@@ -255,11 +257,11 @@ test('worker delivers the bound result once and preserves the follow-up tab afte
  assert.equal(worker.closedTabs.length,0);assert.equal(page.isClosed(),false);assert.equal(await page.evaluate(()=>clicks),1);
 });
 
-test('worker ACK cannot remove a tab with an unsaved sent journal; persistence retry does not redeliver',async t=>{
+test('worker ACK closes the secured tab even while its sent-journal write keeps failing; nothing is redelivered or re-sent',async t=>{
  const page=await fixture(t);await rejectSentWrites(page);await installCollector(page);await confirmWithId(page);await appendAnswer(page,originalJson);await page.clock.runFor(2400);
  const {worker,received}=connectWorker(page);await worker.tick();
- assert.equal(received.length,1);assert.equal(worker.closedTabs.length,0);
- assert.equal(worker.local.state.pendingReviewJobs.A.states.chatgpt.cleanupPending,true);
- await page.evaluate(()=>window.rejectSent=false);await worker.tick();await worker.tick();
- assert.equal(received.length,1);assert.deepEqual(worker.closedTabs,[10]);assert.equal(await page.evaluate(()=>clicks),1);
+ assert.equal(received.length,1);assert.deepEqual(worker.closedTabs,[10]);
+ assert.equal(worker.local.state.pendingReviewJobs.A,undefined,'the delivered leg retired');
+ await worker.tick();
+ assert.equal(received.length,1);assert.equal(await page.evaluate(()=>clicks),1);
 });

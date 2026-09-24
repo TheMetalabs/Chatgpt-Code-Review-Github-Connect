@@ -108,16 +108,20 @@ test('automatic output extraction never reads a shared system clipboard',async()
   c.context.sleep=async()=>{if(++polls===20)throw stop;};
   await assert.rejects(c.context.waitUntilReviewOrQuota('ChatGPT'),e=>e===stop);assert.equal(reads,0);
 });
-test('runner close permission rejects a fresh user turn, busy generation, and wrong run',async()=>{
-  const c=content();let text='review A';
+test('runner close permission rejects a fresh user turn and a wrong run; a busy page is not user activity',async()=>{
+  const c=content();const users=[{textContent:'review A',getAttribute:()=>null}];
   c.context.location={href:'https://chatgpt.com/c/A'};
   c.context.composer=()=>null;
-  c.context.document={querySelectorAll:()=>[{textContent:text,getAttribute:()=>null}]};
+  c.context.document={querySelectorAll:()=>users};
   c.context.runPrompt=async()=>raw;c.context.stopButtonVisible=()=>false;
   c.message({type:'ashlar-run',jobId:'A',runId:'run-A',provider:'chatgpt',prompt:'review'});await flush();
   const msg={type:'ashlar-can-close',jobId:'A',runId:'run-A',provider:'chatgpt'};
   assert.equal(c.message(msg)?.canClose,true);
-  text='personal follow-up';assert.equal(c.message(msg)?.canClose,false);
+  // The provider redrawing its own answer (or a Stop control) after the result is secured does not keep the tab.
+  c.context.stopButtonVisible=()=>true;assert.equal(c.message(msg)?.canClose,true);
+  users.push({textContent:'personal follow-up',getAttribute:()=>null});
+  const followup=c.message(msg);
+  assert.equal(followup?.canClose,false);assert.equal(followup?.reason,'repurposed');assert.equal(followup?.cause,'user_turn');
   assert.equal(c.message({...msg,runId:'run-B'})?.code,'job_mismatch');
 });
 

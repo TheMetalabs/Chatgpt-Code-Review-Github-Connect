@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
 import { continueComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
+import { botSettingsToEnv, sanitizeBotSettings } from "./settings.server.ts";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import {
   ashlarBotLogin,
   builtinValidate,
@@ -246,6 +249,68 @@ describe("loopEnabled", () => {
     assert.equal(loopEnabled(settings(), ENV_OFF), false);
     assert.equal(loopEnabled({ ...DEFAULT_SETTINGS }, ENV_ON), false); // provider null
     assert.equal(loopEnabled(settings(), ENV_ON), true);
+  });
+});
+
+describe("the loop is OFF unless the operator sets ASHLAR_FIX_AGENT=1 (no other path turns it on)", () => {
+  const SRC = join(new URL(".", import.meta.url).pathname, "..");
+  const isComment = (l: string) => /^\s*(\*|\/\/|\/\*)/.test(l);
+  const sources = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory() ? sources(join(dir, e.name)) : /\.tsx?$/.test(e.name) && !/\.test\.tsx?$/.test(e.name) ? [join(dir, e.name)] : [],
+    );
+
+  it("only the exact value \"1\" enables it, and neither the defaults nor a fresh settings file configure a provider", () => {
+    for (const v of ["", "0", "true", "yes", "on", " 1", "1 ", "01"]) {
+      assert.equal(loopEnabled(settings(), { ASHLAR_FIX_AGENT: v } as NodeJS.ProcessEnv), false, JSON.stringify(v));
+    }
+    assert.equal(DEFAULT_SETTINGS.fixAgent.provider, null);
+    assert.equal(loopEnabled(sanitizeBotSettings({}), ENV_ON), false);
+  });
+
+  it("the flag is read in exactly one place and never written by settings or any other module", () => {
+    const withProvider = sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "script-apply", mode: "apply" } });
+    assert.equal(withProvider.fixAgent.provider, "chatgpt");
+    assert.equal("ASHLAR_FIX_AGENT" in botSettingsToEnv(withProvider), false, "saving settings never sets the flag");
+    const uses = sources(SRC).flatMap((file) =>
+      readFileSync(file, "utf8")
+        .split("\n")
+        .filter((l) => !isComment(l) && /\.ASHLAR_FIX_AGENT\b|\[["'`]ASHLAR_FIX_AGENT["'`]\]|\bASHLAR_FIX_AGENT\s*[:=]/.test(l))
+        .map((l) => `${relative(SRC, file)}: ${l.trim()}`),
+    );
+    assert.deepEqual(uses, ['lib/review-loop-runtime.server.ts: if (env?.ASHLAR_FIX_AGENT !== "1") return false;']);
+  });
+
+  it("only the gated runtime reaches the loop engine (whose posts are not gated themselves)", () => {
+    const importers = sources(SRC)
+      .filter((file) => /from\s+["'][^"']*review-loop-engine\.server/.test(readFileSync(file, "utf8")))
+      .map((file) => relative(SRC, file));
+    assert.deepEqual(importers, ["lib/review-loop-runtime.server.ts"]);
+  });
+
+  it("every loop entry point is inert without the flag or without a provider: no GitHub or provider call", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    let calls = 0;
+    const gh = f.deps.gh as unknown as Record<string, unknown>;
+    for (const [k, fn] of Object.entries(gh)) {
+      if (typeof fn === "function") gh[k] = (...a: unknown[]) => (calls++, (fn as (...x: unknown[]) => unknown)(...a));
+    }
+    const requestFix = f.deps.requestFix;
+    f.deps.requestFix = (...a: Parameters<typeof requestFix>) => (calls++, requestFix(...a));
+    const pr = { owner: "o", repo: "r", pr: 7 };
+    for (const [env, s] of [
+      [ENV_OFF, settings("apply")],
+      [ENV_ON, { ...DEFAULT_SETTINGS }],
+    ] as const) {
+      assert.deepEqual(await runPostReviewLoop("t", job(), sample, s, f.deps, env), { ran: false, reason: "disabled" });
+      const start = { ...pr, actor: "alice", mode: "apply" as const, at: "2026-01-01T00:00:00Z" };
+      assert.deepEqual(await startLoop("t", start, s, f.deps, env), { posted: false, reason: "disabled" });
+      assert.deepEqual(await continueLoopOnPush("t", { ...pr, headSha: HEAD, actor: "alice" }, s, f.deps, env), { posted: false, reason: "disabled" });
+      const stop = { ...pr, actor: "bob", stopAt: "2026-01-20T00:00:00Z", startInFlight: true };
+      assert.deepEqual(await stopLoop("t", stop, s, f.deps, env), { posted: false, reason: "disabled" });
+    }
+    assert.equal(calls, 0);
+    assert.equal(f.posted.length, 0);
   });
 });
 

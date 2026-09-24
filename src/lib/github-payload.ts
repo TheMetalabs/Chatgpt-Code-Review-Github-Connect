@@ -21,6 +21,14 @@ export type ParsedDelivery =
       thread?: JobThread;
       installationId?: number;
       untrustedBody: string;
+      /** The webhook ACTOR (sender.login) — for synchronize, the pusher (target.sender is the PR
+       * author on lifecycle events). The loop engine keys "own push" / stop authorship on it. */
+      actor: string;
+      /** When the directive / push happened, so the loop engine can place it in the session even
+       * before the list API has caught up: a comment's created_at (or updated_at when a fresh
+       * directive arrived by EDIT); for a PR-body directive or a push (synchronize), the PR's
+       * updated_at. Recorded starts carry it (review-loop.ts startComment). */
+      eventAt?: string;
     }
   | { ok: false; reason: string };
 
@@ -38,9 +46,10 @@ type Gh = {
     head?: { sha?: string; repo?: { fork?: boolean } | null };
     base?: { sha?: string };
     user?: { login?: string };
+    updated_at?: string;
   };
   issue?: { number?: number; pull_request?: unknown; title?: string };
-  comment?: { id?: number; body?: string };
+  comment?: { id?: number; body?: string; created_at?: string; updated_at?: string };
 };
 
 function splitRepo(full: string | undefined): { owner: string; repo: string } | null {
@@ -48,6 +57,15 @@ function splitRepo(full: string | undefined): { owner: string; repo: string } | 
   const [owner, repo] = full.split("/");
   if (!owner || !repo) return null;
   return { owner, repo };
+}
+
+/** A comment directive's event time: its creation, or — for a fresh directive that arrived by
+ * EDIT — the edit. Never the (earlier) creation for an edit: without updated_at the time is
+ * unknown (undefined → the receiver's own clock, which is never earlier than the edit). */
+function commentEventAt(body: Gh): string | undefined {
+  const c = body.comment;
+  const at = body.action === "edited" ? c?.updated_at : c?.created_at;
+  return typeof at === "string" ? at : undefined;
 }
 
 export function parseGitHubPayload(
@@ -82,15 +100,15 @@ export function parseGitHubPayload(
     const newlyMentioned = body.action === "edited" && (typeof previous === "string" || previous === null) &&
       !isBotMention(strippedPrev, settings) && isBotMention(strippedText, settings);
     const bodyMention = (body.action === "opened" && isBotMention(strippedText, settings)) || newlyMentioned;
-    // Only a START directive (suggest/apply) is a review request on PR lifecycle events; a
-    // stop is a no-op here (avoids a spurious skipped job on PR open/edit). freshLoopDirective
-    // also drops a directive left unchanged during an unrelated body edit.
+    // A START directive (suggest/apply) is a review request on PR lifecycle events; a fresh STOP
+    // is a control event (ingress skips it as control-only; the loop engine stops the session at
+    // this edit's time). freshLoopDirective drops a directive left unchanged during an unrelated
+    // body edit, so a retained stop never re-fires.
     const freshLoop = freshLoopDirective(body.action, text, previous);
-    const bodyLoopStart = freshLoop?.kind === "start" ? freshLoop : undefined;
     // The App never authors PR bodies; should a self-authored body edit ever carry a mention or
     // directive it is not a command either (same invariant as comments). Its pushes
     // (synchronize) still parse as lifecycle events below.
-    const bodyRequest = !selfAuthored && (bodyMention || bodyLoopStart != null);
+    const bodyRequest = !selfAuthored && (bodyMention || freshLoop != null);
     const trigger: Trigger | undefined = bodyRequest ? "pull_request.body_mention" : PR_ACTIONS[body.action ?? ""];
     if (!trigger) return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"}; no new body mention)` };
     if (!repo || !pr?.number || !pr.head?.sha) return { ok: false, reason: "pull_request missing repo or head" };
@@ -111,11 +129,14 @@ export function parseGitHubPayload(
       trigger,
       target,
       installationId,
-      // A PR-body request has no comment ID: reactions belong on the PR itself.
-      // Preserve the full directive (incl. a coexisting stop) as metadata when a review is
-      // requested, matching the issue_comment path; bodyLoopStart only gates promotion above.
-      thread: bodyRequest ? { kind: "pr_body", commentId: 0, userText: text, loop: freshLoop } : undefined,
+      // A PR-body request has no comment ID: reactions belong on the PR itself. The fresh
+      // directive (start or stop) travels as metadata, matching the issue_comment path.
+      thread: bodyRequest
+        ? { kind: "pr_body", commentId: 0, userText: text, loop: freshLoop, eventAt: typeof pr.updated_at === "string" ? pr.updated_at : undefined }
+        : undefined,
       untrustedBody: text.slice(0, 4000),
+      actor: sender,
+      eventAt: (bodyRequest || trigger === "pull_request.synchronize") && typeof pr.updated_at === "string" ? pr.updated_at : undefined,
     };
   }
 
@@ -159,8 +180,11 @@ export function parseGitHubPayload(
         loop: continuation
           ? { kind: "start", mode: continuation.mode }
           : freshLoopDirective(body.action, body.comment?.body, body.changes?.body?.from),
+        eventAt: commentEventAt(body),
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
+      actor: sender,
+      eventAt: commentEventAt(body),
     };
   }
 
@@ -192,8 +216,11 @@ export function parseGitHubPayload(
         commentId: Number(body.comment?.id ?? 0),
         userText: String(body.comment?.body ?? ""),
         loop: freshLoopDirective(body.action, body.comment?.body, body.changes?.body?.from),
+        eventAt: commentEventAt(body),
       },
       untrustedBody: String(body.comment?.body ?? "").slice(0, 4000),
+      actor: sender,
+      eventAt: commentEventAt(body),
     };
   }
 

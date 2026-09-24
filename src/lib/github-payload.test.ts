@@ -160,13 +160,13 @@ describe("parseGitHubPayload", () => {
     if (d.ok) assert.equal(d.kind, "ignore");
   });
 
-  it("delivers a changed PR-body START directive on edit; a stop is a no-op on PR lifecycle", () => {
+  it("delivers a changed PR-body START directive on edit; a fresh STOP is a control event at the edit time", () => {
     const mk = (from: string, to: string) => parseGitHubPayload("pull_request", {
       action: "edited",
       repository: { full_name: "acme/pay", fork: false },
       sender: { login: "alice" },
       changes: { body: { from } },
-      pull_request: { number: 500, title: "t", body: to, draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
+      pull_request: { number: 500, title: "t", body: to, draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" }, updated_at: "2026-02-02T02:02:02Z" },
     });
     // suggest -> apply and stop -> start are fresh START requests: delivered
     for (const [from, to] of [["/review-loop", "/review-loop apply"], ["/review-loop stop", "/review-loop"]]) {
@@ -174,30 +174,81 @@ describe("parseGitHubPayload", () => {
       assert.equal(d.ok, true, `${from} -> ${to}`);
       if (d.ok) assert.equal(d.kind, "review", `${from} -> ${to} should be delivered`);
     }
-    // a change to stop is control-only on PR lifecycle -> not a review request
+    // a change to stop is a CONTROL event at the edit time (the loop engine stops the session);
+    // ingress admits no review for it
     const toStop = mk("/review-loop", "/review-loop stop");
-    assert.equal(toStop.ok, true);
-    if (toStop.ok) assert.equal(toStop.kind, "ignore");
+    assert.ok(toStop.ok && toStop.kind === "review");
+    if (toStop.ok && toStop.kind === "review") {
+      assert.equal(toStop.thread?.loop?.kind, "stop");
+      assert.equal(toStop.eventAt, "2026-02-02T02:02:02Z", "placed at the edit, not at the PR's creation");
+      const decision = decideIngress({ hmacOk: true, settings: DEFAULT_SETTINGS, sample: toStop.target, trigger: toStop.trigger, deliveryId: "d-stop", existing: [], thread: toStop.thread });
+      assert.ok(decision.ok && decision.skip && !decision.job, "control-only: no review job");
+    }
     // an unchanged retained directive is an unrelated edit
     const same = mk("/review-loop\n\nold", "/review-loop\n\nnew");
     assert.equal(same.ok, true);
     if (same.ok) assert.equal(same.kind, "ignore");
   });
 
-  it("does not promote a PR opened with only /review-loop stop into an explicit body request", () => {
-    // A stop is control-only on PR lifecycle: the open is a plain lifecycle delivery
-    // (pull_request.opened, gated by ingress) with NO loop directive attached — not a
-    // body_mention request, so no spurious stop-reason job is created.
+  it("a fresh directive that arrives by EDIT is placed at the edit time, never at the comment's creation", () => {
+    const edit = parseGitHubPayload("issue_comment", {
+      action: "edited",
+      repository: { full_name: "acme/pay" },
+      sender: { login: "bob" },
+      changes: { body: { from: "looks good" } },
+      issue: { number: 500, pull_request: {}, title: "t" },
+      comment: { id: 9, body: "/review-loop apply", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-05T00:00:00Z" },
+    });
+    assert.ok(edit.ok && edit.kind === "review");
+    if (edit.ok && edit.kind === "review") {
+      assert.equal(edit.thread?.loop?.kind, "start");
+      assert.equal(edit.eventAt, "2026-01-05T00:00:00Z");
+      assert.equal(edit.thread?.eventAt, "2026-01-05T00:00:00Z", "a recorded start carries the edit time");
+    }
+    const created = parseGitHubPayload("issue_comment", {
+      action: "created",
+      repository: { full_name: "acme/pay" },
+      sender: { login: "bob" },
+      issue: { number: 500, pull_request: {}, title: "t" },
+      comment: { id: 10, body: "/review-loop apply", created_at: "2026-01-06T00:00:00Z", updated_at: "2026-01-06T00:00:00Z" },
+    });
+    assert.ok(created.ok && created.kind === "review" && created.thread?.eventAt === "2026-01-06T00:00:00Z");
+  });
+
+  it("an edited directive without updated_at is never backdated to its creation", () => {
+    const d = parseGitHubPayload("issue_comment", {
+      action: "edited",
+      repository: { full_name: "acme/pay" },
+      sender: { login: "bob" },
+      changes: { body: { from: "fine" } },
+      issue: { number: 500, pull_request: {}, title: "t" },
+      comment: { id: 9, body: "/review-loop stop", created_at: "2026-01-01T00:00:00Z" },
+    });
+    assert.ok(d.ok && d.kind === "review");
+    if (d.ok && d.kind === "review") {
+      assert.equal(d.eventAt, undefined);
+    }
+    const created = parseGitHubPayload("issue_comment", {
+      action: "created", repository: { full_name: "acme/pay" }, sender: { login: "bob" },
+      issue: { number: 500, pull_request: {}, title: "t" }, comment: { id: 10, body: "/review-loop stop", created_at: "2026-01-02T00:00:00Z" },
+    });
+    assert.ok(created.ok && created.kind === "review" && created.eventAt === "2026-01-02T00:00:00Z");
+  });
+
+  it("a PR opened with only a stop directive is a control event, never a review request", () => {
+    // The stop travels as control metadata (the loop engine handles it); ingress skips it as
+    // control-only, so no review job — and no spurious stop-reason job — is created.
     const d = parseGitHubPayload("pull_request", {
       action: "opened",
       repository: { full_name: "acme/pay", fork: false },
       sender: { login: "alice" },
       pull_request: { number: 501, title: "t", body: "/review-loop stop", draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
     });
-    assert.equal(d.ok, true);
+    assert.ok(d.ok && d.kind === "review");
     if (d.ok && d.kind === "review") {
-      assert.equal(d.trigger, "pull_request.opened");
-      assert.equal(d.thread, undefined);
+      assert.equal(d.thread?.loop?.kind, "stop");
+      const decision = decideIngress({ hmacOk: true, settings: DEFAULT_SETTINGS, sample: d.target, trigger: d.trigger, deliveryId: "d-501", existing: [], thread: d.thread });
+      assert.ok(decision.ok && decision.skip && !decision.job, "control-only: no review job");
     }
   });
 
@@ -227,15 +278,19 @@ describe("parseGitHubPayload", () => {
     if (d.ok && d.kind === "review") { assert.equal(d.thread?.loop?.kind, "start"); assert.equal(d.thread?.loop?.mode, "apply"); }
   });
 
-  it("does not promote a PR body of only @ashlar-bot review-loop stop into a body request (F22)", () => {
+  it("a PR body of only @ashlar-bot review-loop stop is control-only: no review is admitted (F22)", () => {
     const d = parseGitHubPayload("pull_request", {
       action: "opened",
       repository: { full_name: "acme/pay", fork: false },
       sender: { login: "alice" },
       pull_request: { number: 502, title: "t", body: "@ashlar-bot review-loop stop", draft: false, head: { sha: "h1", repo: { fork: false } }, base: { sha: "b1" }, user: { login: "alice" } },
     });
-    assert.equal(d.ok, true);
-    if (d.ok && d.kind === "review") { assert.equal(d.trigger, "pull_request.opened"); assert.equal(d.thread, undefined); }
+    assert.ok(d.ok && d.kind === "review");
+    if (d.ok && d.kind === "review") {
+      assert.equal(d.thread?.loop?.kind, "stop");
+      const decision = decideIngress({ hmacOk: true, settings: DEFAULT_SETTINGS, sample: d.target, trigger: d.trigger, deliveryId: "d-502", existing: [], thread: d.thread });
+      assert.ok(decision.ok && decision.skip && !decision.job, "the mention is part of the directive: control-only");
+    }
   });
 
   it("still promotes a PR body with an independent mention plus a trailing stop (F22 control)", () => {
@@ -330,6 +385,19 @@ describe("parseGitHubPayload", () => {
         assert.ok(decision.ok && decision.skip, "skipped: LLM work only on an explicit request");
         assert.equal(decision.ok && decision.job, undefined, "no job → nothing is superseded");
       }
+    });
+
+    it("a push (synchronize) carries the PR's updated_at as its event time; other PR actions do not", () => {
+      const pr = (action: string) => ({
+        action,
+        repository: { full_name: "acme/pay" },
+        sender: { login: "alice" },
+        pull_request: { number: 412, title: "t", body: "", head: { sha: SHA40, repo: { fork: false } }, base: { sha: "b" }, user: { login: "alice" }, updated_at: "2026-01-02T03:04:05Z" },
+      });
+      const push = parseGitHubPayload("pull_request", pr("synchronize"));
+      assert.ok(push.ok && push.kind === "review" && push.eventAt === "2026-01-02T03:04:05Z");
+      const opened = parseGitHubPayload("pull_request", pr("opened"));
+      assert.ok(opened.ok && opened.kind === "review" && opened.eventAt === undefined);
     });
 
     it("a human comment carrying a continuation marker gets no loop start from the marker", () => {

@@ -16,14 +16,23 @@
  * compare-API ancestry walk).
  */
 import {
+  canonicalContinuation,
   classifyStuck,
   DEFAULT_ASHLAR_BOT_LOGIN,
   escalateFromRounds,
+  isoMs,
   isSelfLogin,
+  isStoppedComment,
+  stuckPattern,
   parseEscalateMarker,
+  parseFindingsTotal,
+  parseReviewLoopDirective,
+  parseStartMarker,
+  parseStopRecord,
   type EscalateReason,
   type RoundSummary,
 } from "./review-loop.ts";
+import { deriveLoopSession, type LoopEvent, type LoopSession } from "./review-loop-session.ts";
 
 // Single source of the App identity lives in review-loop.ts (shared with the webhook parser's
 // self-trigger guard); re-exported here for existing engine callers.
@@ -41,13 +50,13 @@ export interface ReviewLoopGithub {
     owner: string,
     repo: string,
     pr: number,
-  ): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string }>>;
+  ): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; body?: string; updatedAt?: string }>>;
   listIssueComments(
     token: string,
     owner: string,
     repo: string,
     pr: number,
-  ): Promise<Array<{ userLogin: string; body: string }>>;
+  ): Promise<Array<{ id?: number; userLogin: string; body: string; createdAt?: string; updatedAt?: string }>>;
   createIssueComment(
     token: string,
     opts: { owner: string; repo: string; pr: number; body: string },
@@ -57,23 +66,26 @@ export interface ReviewLoopGithub {
 // The real github.server binding lives at the harbor call site (harbor already imports
 // github.server); keeping this module DI-only lets it unit-test without the server graph.
 
-const FINDINGS_RE = /<!--\s*ashlar-findings\s+(.+?)\s*-->/;
-
 function isBot(login: string, botLogin: string): boolean {
   return isSelfLogin(login, botLogin);
 }
 
+/** In-session test for a REVIEW row (a round): strictly after the anchor, compared as instants.
+ * The anchor is the start directive's time and a review it requested lands minutes later; a
+ * review in the anchor's own second belongs to what came before. A row whose timestamp is missing
+ * or unparseable cannot be proven in-session and is excluded. */
+function inSession(at: string | null | undefined, sinceMs: number): boolean {
+  if (Number.isNaN(sinceMs)) return true; // no anchor: the whole history
+  const t = isoMs(at);
+  return !Number.isNaN(t) && t > sinceMs;
+}
 
-function parseFindingsTotal(body: string): number | null {
-  const m = FINDINGS_RE.exec(body || "");
-  if (!m) return null;
-  for (const pair of m[1].split(/\s+/)) {
-    if (pair.startsWith("total=")) {
-      const n = Number(pair.slice("total=".length));
-      return Number.isNaN(n) ? null : n;
-    }
-  }
-  return null;
+/** In-session test for one of the session's own CONTROL comments (handoff, continuation): posted
+ * after the session's start record — by comment id when known (exact; timestamps tie within a
+ * second, e.g. the last session's handoff and this session's start), else strictly by time. */
+export function controlInSession(c: { id?: number; createdAt?: string }, since: { iso?: string; seq?: number }): boolean {
+  if (since.seq !== undefined && c.id) return c.id > since.seq;
+  return inSession(c.createdAt, isoMs(since.iso));
 }
 
 /**
@@ -99,19 +111,21 @@ export async function reconstructRounds(
   // Full commit SHA is identity everywhere (a 7-char prefix can collide); short() is display-only.
   // G6: a comment counts only if it is in-session (created at/after sinceIso), so a pre-loop
   // comment on a head cannot leak into the current loop's file history.
+  const sinceMs = isoMs(opts.sinceIso);
   const filesByHead = new Map<string, Set<string>>();
   for (const c of comments) {
     if (!isBot(c.userLogin, botLogin) || !c.commitId || !c.path) continue;
-    if (opts.sinceIso && (c.createdAt || "") < opts.sinceIso) continue;
+    if (!inSession(c.createdAt, sinceMs)) continue;
     const head = c.commitId;
     (filesByHead.get(head) ?? filesByHead.set(head, new Set()).get(head)!).add(c.path);
   }
 
   const byHead = new Map<string, number>();
   const order: string[] = [];
+  const at = (iso: string | undefined) => isoMs(iso) || 0; // unparseable (no anchor only): oldest
   const ashlarReviews = reviews
-    .filter((r) => isBot(r.userLogin, botLogin) && (!opts.sinceIso || (r.submittedAt || "") >= opts.sinceIso))
-    .sort((a, b) => (a.submittedAt || "").localeCompare(b.submittedAt || ""));
+    .filter((r) => isBot(r.userLogin, botLogin) && inSession(r.submittedAt, sinceMs))
+    .sort((a, b) => at(a.submittedAt) - at(b.submittedAt));
   for (const rv of ashlarReviews) {
     const total = parseFindingsTotal(rv.body);
     if (total === null) continue; // ops / non-summary review row
@@ -129,7 +143,9 @@ export async function reconstructRounds(
   }));
 }
 
-/** True if a bot-authored escalate handoff for this head already exists (idempotency). */
+/** True if a bot-authored escalate handoff for this head already exists IN THIS SESSION
+ * (idempotency). A handoff from an earlier, finished session must not silence a new one: a
+ * human who re-runs the loop on the same head after an ESCALATE gets a fresh handoff. */
 async function alreadyEscalated(
   gh: ReviewLoopGithub,
   token: string,
@@ -138,13 +154,47 @@ async function alreadyEscalated(
   pr: number,
   head: string,
   botLogin: string,
+  sinceIso?: string,
+  sinceSeq?: number,
 ): Promise<boolean> {
   const issues = await gh.listIssueComments(token, owner, repo, pr);
   for (const c of issues) {
+    if (!controlInSession(c, { iso: sinceIso, seq: sinceSeq })) continue;
     const parsed = parseEscalateMarker(c.body, { authoredByBot: isBot(c.userLogin, botLogin) });
     if (parsed && parsed.head === head) return true; // full-SHA equality
   }
   return false;
+}
+
+// Control comments THIS process posted (handoffs, continuations, start / stop records), kept per
+// GitHub client — production memoizes one client; each test's fake is its own — and consulted
+// TOGETHER with the listed history: a just-posted comment may not be listed yet (read-after-write
+// lag), and an unreadable history must not duplicate one either. Bounded and pruned by age.
+// Cross-process dedup stays a documented NON-GOAL (single harbor instance).
+const postedByClient = new WeakMap<object, Map<string, number>>();
+const POSTED_TTL_MS = 24 * 60 * 60_000;
+const POSTED_MAX = 500;
+
+export function rememberPosted(client: object, key: string, now: number = Date.now()): void {
+  const posted = postedByClient.get(client) ?? new Map<string, number>();
+  postedByClient.set(client, posted);
+  posted.delete(key); // re-insert: keeps the map in age order for pruning
+  posted.set(key, now);
+  for (const [k, at] of posted) {
+    if (posted.size <= POSTED_MAX && now - at <= POSTED_TTL_MS) break;
+    posted.delete(k);
+  }
+}
+
+/** ONE handoff per head per session — the key both handoff paths (stuck classification and
+ * terminal failures) record and consult. */
+function handoffKey(o: { owner: string; repo: string; pr: number; head: string; sinceIso?: string; sinceSeq?: number }): string {
+  return `handoff:${o.owner}/${o.repo}#${o.pr}@${o.head}#${o.sinceSeq ?? o.sinceIso ?? ""}`;
+}
+
+export function postedRecently(client: object, key: string, now: number = Date.now()): boolean {
+  const at = postedByClient.get(client)?.get(key);
+  return at !== undefined && now - at <= POSTED_TTL_MS;
 }
 
 export interface EscalateResult {
@@ -155,6 +205,11 @@ export interface EscalateResult {
   error?: string;
 }
 
+/** The reviewed head is not the latest reconstructed round: the history does not (yet) show
+ * this review — a lagging read, or reviews not attributable to the bot login. The budget can
+ * only be enforced from an attributable history, so a strict caller must not fix blind. */
+export const CURRENT_ROUND_MISSING = "the current review is not the latest round in the loop history";
+
 /**
  * Reconstruct the loop, classify, and — if stuck and not already escalated on this head —
  * emit the fixed ESCALATE handoff. Safe to call after every loop review: a non-stuck loop
@@ -164,6 +219,9 @@ export interface EscalateResult {
 // both pass the check-then-post idempotency window and double-emit. (Cross-process dedup still
 // relies on the alreadyEscalated marker scan; note that in a multi-instance deploy.)
 const inFlightEscalate = new Set<string>();
+
+/** Another loop step for this PR/head holds the escalation guard; the caller backs off quietly. */
+export const ESCALATE_IN_FLIGHT = "escalate already in flight for this head";
 
 export async function maybeEscalate(
   gh: ReviewLoopGithub,
@@ -177,11 +235,20 @@ export async function maybeEscalate(
     diffLines?: number;
     botLogin?: string;
     sinceIso?: string;
+    /** The session's start-record comment id (exact handoff scoping; see controlInSession). */
+    sinceSeq?: number;
+    /** Fail closed (error CURRENT_ROUND_MISSING) unless the reviewed head IS the latest round —
+     * including a history with ZERO attributable rounds, which then can never "pass" the budget.
+     * The loop runtime always sets it; a lenient caller only classifies a history it can see and
+     * gets no budget guarantee for an unattributable one (classifyStuck([]) is null). */
+    requireCurrentRound?: boolean;
+    /** Waits between handoff POST retries (injectable for tests). */
+    sleep?: (ms: number) => Promise<void>;
   },
 ): Promise<EscalateResult> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
-  if (inFlightEscalate.has(key)) return { escalated: false, rounds: [], error: "escalate already in flight for this head" };
+  if (inFlightEscalate.has(key)) return { escalated: false, rounds: [], error: ESCALATE_IN_FLIGHT };
   inFlightEscalate.add(key);
   try {
     return await maybeEscalateInner(gh, token, opts, botLogin);
@@ -193,7 +260,18 @@ export async function maybeEscalate(
 async function maybeEscalateInner(
   gh: ReviewLoopGithub,
   token: string,
-  opts: { owner: string; repo: string; pr: number; head: string; roundCap: number; diffLines?: number; sinceIso?: string },
+  opts: {
+    owner: string;
+    repo: string;
+    pr: number;
+    head: string;
+    roundCap: number;
+    diffLines?: number;
+    sinceIso?: string;
+    sinceSeq?: number;
+    requireCurrentRound?: boolean;
+    sleep?: (ms: number) => Promise<void>;
+  },
   botLogin: string,
 ): Promise<EscalateResult> {
   // Fail closed on an incomplete/failed history read: never classify or (dup-)post from
@@ -205,12 +283,15 @@ async function maybeEscalateInner(
     // Only classify when the most recent reconstructed round IS the current head. Otherwise the
     // history is stale or the branch was force-pushed onto a divergent lineage, and those rounds
     // do not belong to this head — never attribute their trend to it.
-    if (rounds.length > 0 && rounds[rounds.length - 1].head !== opts.head) {
-      return { escalated: false, rounds };
+    if (rounds.length === 0 || rounds[rounds.length - 1].head !== opts.head) {
+      if (opts.requireCurrentRound) return { escalated: false, rounds, error: CURRENT_ROUND_MISSING };
+      if (rounds.length > 0) return { escalated: false, rounds };
     }
     const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
     if (!reasonPeek) return { escalated: false, rounds };
-    escalatedBefore = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin);
+    escalatedBefore =
+      (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
+      postedRecently(gh, handoffKey(opts));
   } catch (e) {
     return { escalated: false, rounds: [], error: (e as Error)?.message ?? String(e) };
   }
@@ -219,13 +300,209 @@ async function maybeEscalateInner(
   if (escalatedBefore) {
     return { escalated: false, reason, rounds }; // one handoff per head
   }
+  // The budget is authoritative (round-cap), but the trend pattern still guides the human.
+  const pattern = reason === "round-cap" ? stuckPattern(rounds) : null;
   const body = escalateFromRounds(reason, rounds, {
     pr: opts.pr,
     head: opts.head, // full SHA — the marker is the idempotency key
     repo: `${opts.owner}/${opts.repo}`,
     roundCap: opts.roundCap,
     diffLines: opts.diffLines,
+    detail: pattern ? `fix-round budget spent; the finding trend also shows ${pattern}` : undefined,
   });
-  await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
+  const seen = async () =>
+    (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
+    postedRecently(gh, handoffKey(opts));
+  if ((await postHandoff(gh, token, opts, body, seen)) === "exists") return { escalated: false, reason, rounds };
+  rememberPosted(gh, handoffKey(opts));
   return { escalated: true, reason, rounds };
+}
+
+/** Delays before each terminal-handoff POST attempt. A handoff has no other poster, so one
+ * transient failure must not leave the session active with no signal (a silent stall). */
+export const HANDOFF_RETRY_DELAYS_MS = [0, 2_000, 5_000];
+
+const defaultSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+
+/**
+ * POST a terminal handoff, retrying transient failures. Before every retry the handoff scan runs
+ * again, so a POST that GitHub accepted but whose response was lost is not posted twice once it
+ * is visible (the transport never re-sends a write itself). An unreadable scan still posts: a
+ * duplicate handoff is harmless next to a loop that stops silently. Throws the last error.
+ */
+async function postHandoff(
+  gh: ReviewLoopGithub,
+  token: string,
+  o: { owner: string; repo: string; pr: number; sleep?: (ms: number) => Promise<void> },
+  body: string,
+  seen: () => Promise<boolean>,
+): Promise<"posted" | "exists"> {
+  let last: unknown;
+  for (const [i, wait] of HANDOFF_RETRY_DELAYS_MS.entries()) {
+    if (wait) await (o.sleep ?? defaultSleep)(wait);
+    if (i > 0 && (await seen().catch(() => false))) return "exists";
+    try {
+      await gh.createIssueComment(token, { owner: o.owner, repo: o.repo, pr: o.pr, body });
+      return "posted";
+    } catch (e) {
+      last = e;
+    }
+  }
+  throw last;
+}
+
+/**
+ * Emit the fixed ESCALATE handoff for a NON-stuck terminal failure (fix-failed / fix-declined /
+ * loop-error) on this head. One handoff per head: shares the in-flight guard and the marker
+ * idempotency with maybeEscalate. Unlike classification, a failed idempotency READ does not
+ * suppress the post — the failure itself is the signal, and a duplicate handoff is harmless
+ * next to a loop that stops silently.
+ */
+export async function escalateNow(
+  gh: ReviewLoopGithub,
+  token: string,
+  opts: {
+    owner: string;
+    repo: string;
+    pr: number;
+    head: string;
+    reason: EscalateReason;
+    detail?: string;
+    rounds: RoundSummary[];
+    roundCap: number;
+    diffLines?: number;
+    botLogin?: string;
+    /** Session anchor: only handoffs posted in this session count for idempotency. */
+    sinceIso?: string;
+    /** The session's start-record comment id (exact handoff scoping; see controlInSession). */
+    sinceSeq?: number;
+    /** Waits between handoff POST retries (injectable for tests). */
+    sleep?: (ms: number) => Promise<void>;
+  },
+): Promise<{ escalated: boolean; error?: string }> {
+  const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
+  const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
+  const sessionKey = handoffKey(opts);
+  if (inFlightEscalate.has(key)) return { escalated: false, error: ESCALATE_IN_FLIGHT };
+  inFlightEscalate.add(key);
+  try {
+    let before = false;
+    try {
+      before = (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) || postedRecently(gh, sessionKey);
+    } catch {
+      // Unreadable history: fall back to what THIS process posted for this head + session (a
+      // sequential redelivery is then a no-op); otherwise post rather than end the loop without
+      // its signal.
+      before = postedRecently(gh, sessionKey);
+    }
+    if (before) return { escalated: false };
+    const body = escalateFromRounds(opts.reason, opts.rounds, {
+      pr: opts.pr,
+      head: opts.head,
+      repo: `${opts.owner}/${opts.repo}`,
+      roundCap: opts.roundCap,
+      diffLines: opts.diffLines,
+      detail: opts.detail,
+    });
+    const seen = async () =>
+      (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
+      postedRecently(gh, sessionKey);
+    if ((await postHandoff(gh, token, opts, body, seen)) === "exists") return { escalated: false };
+    rememberPosted(gh, sessionKey);
+    return { escalated: true };
+  } catch (e) {
+    return { escalated: false, error: (e as Error)?.message ?? String(e) };
+  } finally {
+    inFlightEscalate.delete(key);
+  }
+}
+
+// ── Durable loop session (review-loop-session.ts) ─────────────────────────────
+
+/** The PR fields the session needs (from GET /pulls/{pr}): the live head (a clean review of any
+ * other head cannot end the session unless the loop waits on it). */
+export interface LoopPrInfo {
+  sha?: string;
+}
+
+/** A comment edited after it was created: its CURRENT text says nothing about what it said at
+ * creation, so it cannot place a directive in time (the webhook handles edits as they happen). */
+function edited(c: { createdAt?: string; updatedAt?: string }): boolean {
+  return isoMs(c.updatedAt) > isoMs(c.createdAt);
+}
+
+/** A human STOP directive in an unedited comment (a start is never read from human text). */
+function pushStop(events: LoopEvent[], c: { body?: string; createdAt?: string; updatedAt?: string; userLogin: string }): void {
+  if (!c.createdAt || edited(c)) return;
+  if (parseReviewLoopDirective(c.body)?.kind === "stop") events.push({ at: c.createdAt, kind: "stop", actor: c.userLogin });
+}
+
+/**
+ * Collect the PR's loop events from durable history. Authorship is enforced HERE:
+ * - STARTS come only from the App's start record (review-loop.ts startComment), posted when harbor
+ *   accepts a fresh start directive, at the directive's own event time. Mutable human text — a
+ *   comment body, the PR body — is never replayed as a start: an edit cannot plant a backdated one.
+ * - A human contributes STOP directives from UNEDITED issue and inline comments (at creation).
+ *   An edited stop, and a stop added to the PR body, reach the loop through the webhook at their
+ *   edit time; the App's STOPPED acknowledgement RECORDS them (review-loop.ts stoppedComment),
+ *   placed at the stop's own time — never at the acknowledgement's.
+ * - ONLY the App contributes escalate / stopped markers, its canonical continuation for THIS PR
+ *   (the head the loop moved to), and converged (total=0) reviews with their commit.
+ * Reads fail closed: a list error throws (the caller must not act on a partial history).
+ */
+export async function readLoopEvents(
+  gh: ReviewLoopGithub,
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  opts: { botLogin?: string; pr?: LoopPrInfo } = {},
+): Promise<LoopEvent[]> {
+  const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
+  const [issues, inline, reviews] = await Promise.all([
+    gh.listIssueComments(token, owner, repo, pr),
+    gh.listReviewComments(token, owner, repo, pr),
+    gh.listPullReviews(token, owner, repo, pr),
+  ]);
+  const events: LoopEvent[] = [];
+  for (const c of issues) {
+    if (!c.createdAt) continue;
+    if (isSelfLogin(c.userLogin, botLogin)) {
+      const bot = { authoredByBot: true };
+      const start = parseStartMarker(c.body, bot);
+      const stopRecord = parseStopRecord(c.body, bot);
+      const cont = canonicalContinuation(c.body, bot);
+      if (start) events.push({ at: start.at, kind: "start", mode: start.mode, actor: start.by, ...(c.id ? { seq: c.id } : {}) });
+      else if (parseEscalateMarker(c.body, bot)) events.push({ at: c.createdAt, kind: "escalate" });
+      // A recorded stop is placed at the stop's own time (an edit or a PR-body stop the fold
+      // cannot replay); a bare legacy acknowledgement is an event at its own creation.
+      else if (stopRecord) events.push({ at: stopRecord.at, kind: "stop", actor: stopRecord.by });
+      else if (isStoppedComment(c.body, bot)) events.push({ at: c.createdAt, kind: "stopped" });
+      else if (cont && cont.pr === pr) events.push({ at: c.createdAt, kind: "continue", head: cont.head });
+    } else {
+      pushStop(events, c);
+    }
+  }
+  for (const c of inline) {
+    if (!isSelfLogin(c.userLogin, botLogin)) pushStop(events, c);
+  }
+  for (const r of reviews) {
+    if (isSelfLogin(r.userLogin, botLogin) && r.submittedAt && parseFindingsTotal(r.body) === 0) {
+      events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
+    }
+  }
+  return events;
+}
+
+/** The PR's current loop session (pure fold over readLoopEvents). */
+export async function readLoopSession(
+  gh: ReviewLoopGithub,
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  opts: { botLogin?: string; pr?: LoopPrInfo; extra?: LoopEvent[] } = {},
+): Promise<LoopSession> {
+  const events = await readLoopEvents(gh, token, owner, repo, pr, opts);
+  return deriveLoopSession([...events, ...(opts.extra ?? [])], { liveHead: opts.pr?.sha });
 }

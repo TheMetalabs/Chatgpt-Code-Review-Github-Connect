@@ -11,11 +11,26 @@
  * whole operation and the branch ref is NEVER moved — a partial failure leaves only orphan
  * blobs, which GitHub garbage-collects. The commit is atomic from the ref's point of view.
  * NON-GOALS: pushing to a fork's branch (the installation token can't); the caller gates forks.
+ * RETRY: a transient failure retries the whole blob→tree→commit→ref sequence once (blobs and
+ * trees are content-addressed; a second commit object is harmless until a ref points at it). A
+ * ref update whose response was LOST is recognized, not repeated: if the live ref already points
+ * at a commit this operation created, that is the success. A BranchMovedError (someone else moved
+ * the branch) is never retried over.
  * BOUNDARY: GitHub's REST ref update has no compare-and-swap. updateBranchRef narrows the window
  * to one API round-trip (read ref → compare → write); the residual race is documented, and the
  * next review re-verifies head lineage. A true CAS would need a different write path.
  */
 import type { FixFile } from "./fix-apply.ts";
+
+/** The branch no longer points at the expected base: someone else moved it. Never retried over. */
+export class BranchMovedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BranchMovedError";
+  }
+}
+
+const COMMIT_ATTEMPTS = 2;
 
 export interface GitDataApi {
   /** The tree sha of an existing commit (the base for the new tree). */
@@ -30,6 +45,9 @@ export interface GitDataApi {
    * base). Implementations must check-then-write as tightly as the backend allows and throw on
    * a mismatch, so a backward force-push is never fast-forwarded over. */
   updateBranchRef(branch: string, commitSha: string, expectedOldSha: string): Promise<void>;
+  /** The branch ref's current commit — lets a retry recognize a ref update that landed although its
+   * response was lost. Optional: without it a lost response is reported as a failure. */
+  readBranchRef?(branch: string): Promise<string>;
 }
 
 export type CommitResult = { ok: true; commitSha: string } | { ok: false; error: string };
@@ -39,17 +57,27 @@ export async function commitFiles(
   opts: { branch: string; baseCommitSha: string; message: string; files: FixFile[] },
 ): Promise<CommitResult> {
   if (opts.files.length === 0) return { ok: false, error: "no files to commit" };
-  try {
-    const baseTree = await api.baseTreeSha(opts.baseCommitSha);
-    const entries: Array<{ path: string; sha: string }> = [];
-    for (const f of opts.files) {
-      entries.push({ path: f.path, sha: await api.createBlob(f.content) });
+  const created: string[] = [];
+  let lastError = "commit failed";
+  for (let attempt = 1; attempt <= COMMIT_ATTEMPTS; attempt += 1) {
+    try {
+      const baseTree = await api.baseTreeSha(opts.baseCommitSha);
+      const entries: Array<{ path: string; sha: string }> = [];
+      for (const f of opts.files) {
+        entries.push({ path: f.path, sha: await api.createBlob(f.content) });
+      }
+      const tree = await api.createTree(baseTree, entries);
+      const commit = await api.createCommit(opts.message, tree, opts.baseCommitSha);
+      created.push(commit);
+      await api.updateBranchRef(opts.branch, commit, opts.baseCommitSha);
+      return { ok: true, commitSha: commit };
+    } catch (e) {
+      lastError = (e as Error)?.message ?? String(e);
+      // A lost response: the ref may already point at a commit THIS operation created.
+      const live = api.readBranchRef ? await api.readBranchRef(opts.branch).catch(() => undefined) : undefined;
+      if (live && created.includes(live)) return { ok: true, commitSha: live };
+      if (e instanceof BranchMovedError) break; // a real move by someone else — never retry over it
     }
-    const tree = await api.createTree(baseTree, entries);
-    const commit = await api.createCommit(opts.message, tree, opts.baseCommitSha);
-    await api.updateBranchRef(opts.branch, commit, opts.baseCommitSha);
-    return { ok: true, commitSha: commit };
-  } catch (e) {
-    return { ok: false, error: (e as Error)?.message ?? String(e) };
   }
+  return { ok: false, error: lastError };
 }

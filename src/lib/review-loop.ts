@@ -17,8 +17,27 @@ export const REVIEW_LOOP_STOPPED_HUMAN = "Ashlar review-loop stopped by operator
 
 export const STOPPED_MARKER = "<!-- ashlar-loop-stopped -->";
 
-/** total=0 on the findings marker is the machine side of CONVERGED (§3). */
-const ZERO_FINDINGS_RE = /<!--\s*ashlar-findings\s+total=0\b/;
+/** The findings marker is the TRAILING line of every ashlar review body (review-format.ts ends
+ * each body with it, and capReviewBody preserves it when truncating). Only a marker at the very
+ * end counts: one quoted earlier in a body — even one an emitter forgot to neutralize — is prose,
+ * never a count, exactly like the control markers that must OPEN their comment. */
+const FINDINGS_TRAILER_RE = /<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/;
+
+/** The review's finding total from its trailing marker; null when there is none (an ops or
+ * non-summary review) or it carries no total. total=0 is the machine side of CONVERGED (§3). */
+export function parseFindingsTotal(body: string | null | undefined): number | null {
+  const m = FINDINGS_TRAILER_RE.exec(body || "");
+  if (!m) return null;
+  const t = /(?:^|\s)total=(\d{1,6})(?=\s|$)/.exec(m[1]);
+  return t ? Number(t[1]) : null;
+}
+
+/** Epoch ms of an ISO-8601 timestamp; NaN when absent or unparseable. Session boundaries are
+ * compared as instants, never as strings: GitHub timestamps are second-precision ("…00Z") while
+ * Date#toISOString carries milliseconds ("…00.500Z"), and lexically "…00Z" sorts after "…00.500Z". */
+export function isoMs(iso: string | null | undefined): number {
+  return iso ? Date.parse(iso) : NaN;
+}
 
 /**
  * Terminal-signal detectors trust ONLY bot-authored comments. WHY: the markers are
@@ -39,7 +58,7 @@ export interface CommentSource {
 }
 
 export function isZeroFindings(body: string | null | undefined, source: CommentSource): boolean {
-  return source.authoredByBot && ZERO_FINDINGS_RE.test(body || "");
+  return source.authoredByBot && parseFindingsTotal(body) === 0;
 }
 
 // ── ESCALATE reason → directive (§8) ─────────────────────────────────────────
@@ -51,7 +70,12 @@ export type EscalateReason =
   | "wrong-scope"
   | "re-flag-deferred"
   | "diff-too-large"
-  | "round-cap";
+  | "round-cap"
+  // Fix-round terminal failures (the loop cannot progress without a human): every way a
+  // requested loop can stop maps to exactly one fixed reason — never to free text.
+  | "fix-failed"
+  | "fix-declined"
+  | "loop-error";
 
 const REASONS: readonly EscalateReason[] = [
   "whack-a-mole",
@@ -61,6 +85,9 @@ const REASONS: readonly EscalateReason[] = [
   "re-flag-deferred",
   "diff-too-large",
   "round-cap",
+  "fix-failed",
+  "fix-declined",
+  "loop-error",
 ];
 
 export function isEscalateReason(x: string): x is EscalateReason {
@@ -82,7 +109,13 @@ export const ESCALATE_DIRECTIVE: Record<EscalateReason, string> = {
   "diff-too-large":
     "Diff is too large / multi-domain to converge. Do not resume the loop — split into a dependency-ordered stack (design change).",
   "round-cap":
-    "Round cap reached without a clear signal. Classify by finding-count trend and repeated files, then decide direction.",
+    "Fix-round budget exhausted and the verification review still has findings. Classify by finding-count trend and repeated files, then decide direction.",
+  "fix-failed":
+    "The fix agent could not produce an applicable fix within its retries (see Detail). Fix these findings manually, or resolve the cause and re-run the loop.",
+  "fix-declined":
+    "The fix agent changed nothing: it pushed back on, declined or deferred every finding (see Detail). Adjudicate each one — accept the push-back and resolve the thread, or fix it manually.",
+  "loop-error":
+    "The loop could not run a fix round on this PR (see Detail), e.g. apply on a fork, no editable changed files, a missing snapshot or unreadable loop history. Resolve the cause, then re-run the loop.",
 };
 
 // ── ESCALATE payload composer (§8) ───────────────────────────────────────────
@@ -102,6 +135,15 @@ export interface EscalateState {
   ciState?: string;
   diffLines?: number;
   ledger?: { declines?: number; defers?: number; pushbacks?: number };
+  /** Deterministic failure detail (outcome + error). Untrusted (error text may quote model
+   * output): neutralized, flattened to one line and truncated before it is rendered. */
+  detail?: string;
+}
+
+const DETAIL_MAX = 500;
+
+function renderDetail(detail: string): string {
+  return sanitizeUntrusted(detail, { oneLine: true, max: DETAIL_MAX });
 }
 
 /** Escape HTML-comment delimiters so interpolated untrusted text (model output, file paths, CI
@@ -109,6 +151,19 @@ export interface EscalateState {
  * §3). Every emitter that embeds untrusted text in a bot comment must pass it through this. */
 export function neutralizeMarkers(s: string): string {
   return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
+}
+
+/**
+ * THE sanitizer for untrusted text inside ANY bot-authored comment (model output, file paths,
+ * error / CI text): control markers neutralized, @-mentions defanged (a bot comment must never
+ * ping a user or team from untrusted text), optionally flattened to one line and bounded. One
+ * function for every emitter, so no field can be sanitized "partially".
+ */
+export function sanitizeUntrusted(text: string | null | undefined, opts: { oneLine?: boolean; max?: number } = {}): string {
+  let t = neutralizeMarkers(String(text ?? "")).replace(/@(?=[A-Za-z0-9])/g, "@\u200b");
+  if (opts.oneLine) t = t.replace(/\s+/g, " ").trim();
+  const max = opts.max ?? 4000;
+  return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
 /** WHY a marker: structured fields live as attributes so detection never parses prose. */
@@ -140,20 +195,21 @@ export function escalateComment(s: EscalateState): string {
   const lines = [
     escalateMarker(s),
     "",
-    `${REVIEW_LOOP_ESCALATE_HUMAN} (round ${s.round}/${s.roundCap})`,
+    `${REVIEW_LOOP_ESCALATE_HUMAN} (review round ${s.round}; fix-round budget ${s.roundCap})`,
     "",
     "State (re-verify below — do not trust this narrative):",
     `- Finding trend: ${fmtTrend(s.findingTrend)}`,
-    `- Repeated flagged files: ${s.repeatedFiles && s.repeatedFiles.length ? neutralizeMarkers(s.repeatedFiles.join(", ")) : "(none)"}`,
-    `- ${fmtBool("Reviewed-commit ⊂ HEAD", s.reviewedCommitInHead)}; unaddressed=${s.unaddressed ?? "unknown"}; ${fmtBool("DIRTY", s.dirty)}; CI=${neutralizeMarkers(s.ciState ?? "unknown")}`,
+    `- Repeated flagged files: ${s.repeatedFiles && s.repeatedFiles.length ? sanitizeUntrusted(s.repeatedFiles.join(", "), { oneLine: true, max: 600 }) : "(none)"}`,
+    `- ${fmtBool("Reviewed-commit ⊂ HEAD", s.reviewedCommitInHead)}; unaddressed=${s.unaddressed ?? "unknown"}; ${fmtBool("DIRTY", s.dirty)}; CI=${sanitizeUntrusted(s.ciState ?? "unknown", { oneLine: true, max: 200 })}`,
     `- Diff size: ${s.diffLines ?? "unknown"} lines; decision ledger: ${ledger}`,
     "",
     `Stop reason: ${s.reason}`,
+    ...(s.detail ? [`Detail: ${renderDetail(s.detail)}`] : []),
     `Directive: ${ESCALATE_DIRECTIVE[s.reason]}`,
     "",
     "Re-derive from the API before acting (narrative may be stale after compaction):",
     "```",
-    `gh pr view ${s.pr} --repo ${neutralizeMarkers(s.repo)} --json reviews,comments,headRefOid,mergeable`,
+    `gh pr view ${s.pr} --repo ${sanitizeUntrusted(s.repo, { oneLine: true, max: 200 })} --json reviews,comments,headRefOid,mergeable`,
     `audit-unaddressed.py ${s.pr} --head ${s.head}`,
     "```",
   ];
@@ -161,8 +217,34 @@ export function escalateComment(s: EscalateState): string {
 }
 
 /** STOPPED handoff — operator-requested stop. Fixed marker + immutable sentence. */
-export function stoppedComment(): string {
-  return `${STOPPED_MARKER}\n\n${REVIEW_LOOP_STOPPED_HUMAN}`;
+/** The STOPPED acknowledgement. It keeps the fixed STOPPED marker as its FIRST line (external
+ * detectors match that literal) and, on a second line, records the stop itself — who stopped the
+ * loop and WHEN (the stop's own event time, not this comment's) — so the stop is durable and
+ * placed correctly even when it arrived as an edit that the session fold cannot replay. */
+export function stoppedComment(stop?: LoopStop): string {
+  if (!stop) return `${STOPPED_MARKER}\n\n${REVIEW_LOOP_STOPPED_HUMAN}`;
+  if (!LOGIN_RE.test(stop.by) || !ISO_UTC_RE.test(stop.at) || Number.isNaN(Date.parse(stop.at))) {
+    throw new Error(`invalid loop stop (by=${stop.by} at=${stop.at})`);
+  }
+  return `${STOPPED_MARKER}\n<!-- ashlar-loop-stop at=${stop.at} by=${stop.by} -->\n\n${REVIEW_LOOP_STOPPED_HUMAN} (stop by ${stop.by}).`;
+}
+
+export interface LoopStop {
+  by: string; // the human who stopped the loop
+  at: string; // the stop's own event time (ISO-8601 UTC)
+}
+
+const STOP_RECORD_RE =
+  /^\s*<!--\s*ashlar-loop-stopped\s*-->[ \t]*\r?\n[ \t]*<!--\s*ashlar-loop-stop\s+at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)\s+by=([A-Za-z0-9-]{1,39})\s*-->/;
+
+/** The stop recorded in a STOPPED acknowledgement the caller has proven the App authored (anchored:
+ * the STOPPED marker opens the comment, the record is the very next line). Null otherwise —
+ * including a bare legacy acknowledgement without a record. */
+export function parseStopRecord(body: string | null | undefined, source: CommentSource): LoopStop | null {
+  if (!source.authoredByBot) return null;
+  const m = STOP_RECORD_RE.exec(body || "");
+  if (!m || !LOGIN_RE.test(m[2]) || Number.isNaN(Date.parse(m[1]))) return null;
+  return { at: m[1], by: m[2] };
 }
 
 // ── Self identity + loop continuation (§2 invariant: the bot never commands itself) ──
@@ -191,6 +273,51 @@ export function isSelfLogin(login: string | null | undefined, botLogin: string =
 }
 
 export const REVIEW_LOOP_CONTINUE_HUMAN = "Ashlar review-loop continues — requesting the next review";
+export const REVIEW_LOOP_FIXING_HUMAN = "Ashlar review-loop — fix round in progress";
+export const REVIEW_LOOP_START_HUMAN = "Ashlar review-loop start recorded";
+
+// ── Recorded loop start (the durable start event) ───────────────────────────────
+// WHY: human comment bodies and the PR body are MUTABLE — rebuilding a session from their
+// current text at their creation time lets a later edit plant a backdated start. The start is
+// therefore recorded once, by the App, when harbor accepts a FRESH start directive for a review
+// it admits: the marker carries the requester and the directive's own event time (a comment's
+// creation or edit time, a PR body's update time), and only this record starts a session.
+
+export interface LoopStart {
+  mode: ReviewLoopMode;
+  by: string; // the human who issued the directive (the apply write-permission subject)
+  at: string; // the directive's event time (ISO-8601 UTC)
+}
+
+const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const START_MARKER_RE =
+  /^\s*<!--\s*ashlar-loop-start\s+mode=(apply|suggest)\s+by=([A-Za-z0-9-]{1,39})\s+at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)\s*-->/;
+
+/** The App's start record. Throws on a malformed field: a record the parser would reject must
+ * never be posted (the loop would silently not start). */
+export function startComment(s: LoopStart): string {
+  if ((s.mode !== "apply" && s.mode !== "suggest") || !LOGIN_RE.test(s.by) || !ISO_UTC_RE.test(s.at) || Number.isNaN(Date.parse(s.at))) {
+    throw new Error(`invalid loop start (mode=${s.mode} by=${s.by} at=${s.at})`);
+  }
+  return `<!-- ashlar-loop-start mode=${s.mode} by=${s.by} at=${s.at} -->\n\n${REVIEW_LOOP_START_HUMAN} — mode ${s.mode}, requested by ${s.by}.`;
+}
+
+/** Parse the start record from a comment the caller has proven the App authored (anchored: the
+ * record OPENS the comment). Null for any other author, or a missing / malformed record. */
+export function parseStartMarker(body: string | null | undefined, source: CommentSource): LoopStart | null {
+  if (!source.authoredByBot) return null;
+  const m = START_MARKER_RE.exec(body || "");
+  if (!m || !LOGIN_RE.test(m[2]) || Number.isNaN(Date.parse(m[3]))) return null;
+  return { mode: m[1] as ReviewLoopMode, by: m[2], at: m[3] };
+}
+
+/** Progress signal (informational, NEVER a trigger or a terminal event): posted right before the
+ * fix request so a driver can tell "the fix is queued/generating" from "the loop died" — the fix
+ * can wait long behind a busy provider. It ends in the fix report + continuation, or a handoff. */
+export function fixingComment(c: { round: number; pr: number; head: string }): string {
+  return `<!-- ashlar-loop-fixing round=${c.round} pr=${c.pr} head=${c.head} -->\n\n${REVIEW_LOOP_FIXING_HUMAN} (round ${c.round} on \`${c.head.slice(0, 7)}\`).`;
+}
 
 export interface LoopContinuation {
   mode: ReviewLoopMode;
@@ -256,16 +383,23 @@ export function canonicalContinuation(body: string | null | undefined, source: C
   return String(body ?? "").replace(/\s+$/, "") === canonical ? parsed : null;
 }
 
-// ── Substring detectors (the driver / poller mirror these) ───────────────────
+// ── Control-marker detectors ─────────────────────────────────────────────────
+// ashlar's own trust decisions (idempotency, the durable session, the continuation) accept a
+// control marker ONLY where the driver emits it: OPENING a dedicated control comment. A marker
+// that appears later in a bot comment is prose — e.g. model text quoted in a fix report — and is
+// never a signal, even if an emitter forgot to neutralize it (defense in depth; every emitter
+// also neutralizes untrusted text). External substring detectors stay compatible: the driver's
+// real markers are always at the start.
 
-const ESCALATE_MARKER_RE = /<!--\s*ashlar-loop-escalate\s+([^>]*?)-->/;
+const ESCALATE_MARKER_RE = /^\s*<!--\s*ashlar-loop-escalate\s+([^>]*?)-->/;
+const STOPPED_MARKER_RE = /^\s*<!--\s*ashlar-loop-stopped\s*-->/;
 
 export function isEscalateComment(body: string | null | undefined, source: CommentSource): boolean {
   return source.authoredByBot && ESCALATE_MARKER_RE.test(body || "");
 }
 
 export function isStoppedComment(body: string | null | undefined, source: CommentSource): boolean {
-  return source.authoredByBot && (body || "").includes(STOPPED_MARKER);
+  return source.authoredByBot && STOPPED_MARKER_RE.test(body || "");
 }
 
 export interface ParsedEscalate {
@@ -407,13 +541,16 @@ const WHACK_MIN_REPEAT = 2; // a file flagged in >= this many of the window => w
  * Classify why a loop is stuck, or null when it is converged / still making progress.
  *
  * CONTRACT (single source of the stuck-definition — do not patch case-by-case):
+ * - A ROUND is one reviewed head; review round k may be followed by fix round k.
+ * - `roundCap` is the FIX-ROUND BUDGET (design: at most N review→fix rounds, default 5). Review
+ *   round N+1 is the verification review of the N-th fix: clean → CONVERGED, else round-cap.
  * - Converged: last round has 0 findings → null.
- * - Still improving: the recent window is STRICTLY decreasing → null, even at the cap or with
- *   a recurring file (that is healthy progress, not stuck).
- * - Otherwise, in precedence order: diff-too-large (structural, never converges) >
- *   whack-a-mole (>=3 rounds, a file recurs in the window, trend not strictly improving) >
- *   oscillation (>=3 rounds, window not trending down, all non-zero) > round-cap (cap hit,
- *   trend not strictly improving).
+ * - diff-too-large (structural, never converges) first.
+ * - Budget: rounds > roundCap → round-cap, AUTHORITATIVE and REGARDLESS of trend (a hard bound —
+ *   the loop ends in one fixed terminal reason; the trend pattern goes into the detail).
+ * - Within the budget, patterns need >=3 rounds and a window that is NOT strictly decreasing (a
+ *   strictly decreasing window is healthy progress, even with a recurring file): whack-a-mole
+ *   (a file recurs in the window) > oscillation (all non-zero). See stuckPattern.
  * The semantic reasons (guard-accretion, wrong-scope, re-flag-deferred) need diff/semantic
  * context the finding trend cannot supply and are left to the human.
  */
@@ -425,29 +562,30 @@ export function classifyStuck(
   if (rounds[rounds.length - 1].findings === 0) return null; // converged (CONVERGED, not stuck)
   if (opts.diffLines !== undefined && opts.diffLines > DIFF_TOO_LARGE_LINES) return "diff-too-large";
 
+  // round-cap FIRST: the fix-round budget is a hard, authoritative bound — review N+1 with
+  // findings ends as round-cap whatever the trend, so a driver keys "budget spent" on ONE reason.
+  // (The trend pattern, if any, is still reported in the handoff's detail — stuckPattern.)
+  if (rounds.length > opts.roundCap) return "round-cap";
+  return stuckPattern(rounds);
+}
+
+/**
+ * The stuck PATTERN of a non-converged history, independent of the budget (null when still
+ * improving / too short). A loop whose recent findings are STRICTLY decreasing is still
+ * converging — a recurring file there is healthy progress, not stuck.
+ */
+export function stuckPattern(rounds: RoundSummary[]): "whack-a-mole" | "oscillation" | null {
+  if (rounds.length < 3) return null;
   const window = rounds.slice(-WHACK_WINDOW);
-  // A loop whose recent findings are STRICTLY decreasing is still converging — never escalate
-  // it (a recurring file or hitting the cap while improving is healthy progress, not stuck).
-  const strictlyImproving =
-    window.length >= 2 && window.every((r, i) => i === 0 || r.findings < window[i - 1].findings);
-
-  // whack-a-mole: enough history (>=3 rounds), a file recurs across the window, and the trend
-  // is NOT still improving (stalled or rebounding on the same file).
-  if (rounds.length >= 3 && !strictlyImproving) {
-    const counts = new Map<string, number>();
-    for (const r of window) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
-    for (const v of counts.values()) if (v >= WHACK_MIN_REPEAT) return "whack-a-mole";
-  }
-
-  // oscillation: >=3 rounds, the window is NOT strictly improving (plateau or rebound), all
-  // non-zero. Uses the same strict-improvement test as the guard above (not just endpoints), so
-  // [5,4,4] and [5,1,4] are caught, while [5,4,3] stays improving → null.
-  if (rounds.length >= 3 && !strictlyImproving && window.every((r) => r.findings > 0)) {
-    return "oscillation";
-  }
-
-  // round-cap: reached the cap AND not still improving (a converging loop keeps running).
-  if (rounds.length >= opts.roundCap && !strictlyImproving) return "round-cap";
+  const strictlyImproving = window.every((r, i) => i === 0 || r.findings < window[i - 1].findings);
+  if (strictlyImproving) return null;
+  // whack-a-mole: a file recurs across the window while the trend stalls or rebounds.
+  const counts = new Map<string, number>();
+  for (const r of window) for (const f of r.files) counts.set(f, (counts.get(f) ?? 0) + 1);
+  for (const v of counts.values()) if (v >= WHACK_MIN_REPEAT) return "whack-a-mole";
+  // oscillation: plateau or rebound with every round non-zero (same strict test, so [5,4,4] and
+  // [5,1,4] are caught while [5,4,3] stays improving).
+  if (window.every((r) => r.findings > 0)) return "oscillation";
   return null;
 }
 
@@ -462,9 +600,10 @@ export function repeatedRoundFiles(rounds: RoundSummary[], window = WHACK_WINDOW
 export function escalateFromRounds(
   reason: EscalateReason,
   rounds: RoundSummary[],
-  ctx: { pr: number; head: string; repo: string; roundCap: number; diffLines?: number },
+  ctx: { pr: number; head: string; repo: string; roundCap: number; diffLines?: number; detail?: string },
 ): string {
   return escalateComment({
+    detail: ctx.detail,
     reason,
     round: rounds.length ? rounds[rounds.length - 1].index : 0,
     roundCap: ctx.roundCap,

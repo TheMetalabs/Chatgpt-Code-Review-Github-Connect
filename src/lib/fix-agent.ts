@@ -20,8 +20,13 @@ import { commitFiles, type GitDataApi } from "./fix-commit.ts";
 
 export type FixMode = "suggest" | "apply";
 
-/** Provider transport: given the fix prompt, return the raw model reply. Injected. */
-export type RequestFix = (prompt: string) => Promise<string>;
+/** Provider transport: given the fix prompt, return the raw model reply. Injected. `ctl` lets the
+ * caller abort the call and observe the provider's phase (queued vs generating), so deadlines can
+ * exclude queue time and a stale request can be cancelled (fix-request-watch.ts). */
+export type RequestFix = (
+  prompt: string,
+  ctl?: { signal?: AbortSignal; onActivity?: (phase: "queued" | "generating") => void },
+) => Promise<string>;
 
 export interface FixRoundResult {
   ok: boolean;
@@ -69,7 +74,8 @@ export function buildFixPrompt(input: {
     "   reconstruct from memory. Only the paths shown below may be changed; any other path is",
     "   rejected. Unsafe/absolute/`..` paths are rejected.",
     "",
-    `Editable files in scope: ${paths.join(", ") || "(none)"}`,
+    // JSON array, never raw text: a repository-controlled path must stay data in this section.
+    `Editable files in scope (JSON): ${JSON.stringify(paths)}`,
     "",
     "Output schema (return exactly this shape, no prose outside the JSON):",
     '{ "summary": "<what you changed and why>", "files": [ { "path": "<one of the paths above>", "content": "<full new file>" } ] }',

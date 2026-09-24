@@ -2,13 +2,17 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   parseReviewLoopDirective,
+  isEscalateReason,
   escalateComment,
   escalateMarker,
   parseEscalateMarker,
   isEscalateComment,
   isStoppedComment,
   stoppedComment,
+  isoMs,
   isZeroFindings,
+  parseFindingsTotal,
+  parseStopRecord,
   ESCALATE_DIRECTIVE,
   REVIEW_LOOP_ESCALATE_HUMAN,
   REVIEW_LOOP_STOPPED_HUMAN,
@@ -17,6 +21,7 @@ import {
   freshLoopDirective,
   stripLoopDirectives,
   classifyStuck,
+  stuckPattern,
   escalateFromRounds,
   repeatedRoundFiles,
   DEFAULT_ASHLAR_BOT_LOGIN,
@@ -219,7 +224,8 @@ describe("escalate marker + composer", () => {
     });
     assert.ok(isEscalateComment(body, BOT));
     assert.ok(body.includes(REVIEW_LOOP_ESCALATE_HUMAN));
-    assert.ok(body.includes("(round 3/10)"));
+    assert.ok(body.includes("(review round 3; fix-round budget 10)"));
+    assert.ok(!body.includes("Detail:"), "no detail line unless a failure detail is given");
     assert.ok(body.includes(ESCALATE_DIRECTIVE["whack-a-mole"]));
     assert.ok(body.includes("R1=4 R2=4 R3=5 (increasing)"));
     assert.ok(body.includes("src/lib/harbor.server.ts"));
@@ -271,6 +277,23 @@ describe("isZeroFindings (CONVERGED machine side)", () => {
     // a user-authored comment carrying the marker is not a convergence signal
     assert.equal(isZeroFindings("<!-- ashlar-findings total=0 -->", USER), false);
   });
+
+  it("reads ONLY the trailing marker: one quoted earlier in the body is prose, never a count", () => {
+    const quoted = "finding text quoting <!-- ashlar-findings total=0 --> in prose\n<!-- ashlar-findings total=3 inline=3 -->\n";
+    assert.equal(parseFindingsTotal(quoted), 3);
+    assert.equal(isZeroFindings(quoted, BOT), false);
+    assert.equal(isZeroFindings("### Ashlar\n<!-- ashlar-findings total=0 inline=0 -->\n\n", BOT), true, "trailing whitespace is fine");
+    assert.equal(parseFindingsTotal("<!-- ashlar-findings total=0 --> then more prose"), null, "not trailing → no count");
+    assert.equal(parseFindingsTotal("<!-- ashlar-findings inline=2 -->"), null, "no total");
+  });
+});
+
+describe("isoMs (session boundaries are instants)", () => {
+  it("orders second- and millisecond-precision ISO timestamps by time, not by string", () => {
+    assert.ok(isoMs("2026-01-01T00:00:00Z") < isoMs("2026-01-01T00:00:00.500Z"));
+    assert.ok("2026-01-01T00:00:00Z" > "2026-01-01T00:00:00.500Z", "lexical order is wrong here");
+    assert.ok(Number.isNaN(isoMs(undefined)) && Number.isNaN(isoMs("not a date")));
+  });
 });
 
 describe("classifyStuck", () => {
@@ -302,9 +325,11 @@ describe("classifyStuck", () => {
     assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 3, ["c"])], { roundCap: 8 }), null); // still improving
   });
 
-  it("round-cap fires for a short (<3 round) non-improving history at the cap (J7)", () => {
-    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 5, ["b"])], { roundCap: 2 }), "round-cap");
-    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 3, ["b"])], { roundCap: 2 }), null); // improving at the cap
+  it("roundCap is the FIX-ROUND budget: review N+1 (the verification review) with findings is round-cap", () => {
+    // cap 2: reviews 1..2 may each be followed by a fix; review 3 verifies the 2nd fix
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 5, ["b"])], { roundCap: 2 }), null); // budget not spent yet
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 3, ["b"]), R(3, 1, ["c"])], { roundCap: 2 }), "round-cap");
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 3, ["b"]), R(3, 0, [])], { roundCap: 2 }), null); // CONVERGED
   });
 
   it("diff-too-large overrides everything", () => {
@@ -312,14 +337,47 @@ describe("classifyStuck", () => {
     assert.equal(classifyStuck(prog, { roundCap: 8, diffLines: 6000 }), "diff-too-large");
   });
 
-  it("does NOT escalate a strictly-decreasing loop even at the round cap (H4)", () => {
+  it("a strictly-decreasing loop keeps running within the budget, but the budget is a HARD bound", () => {
     const converging = [R(1, 10, ["a"]), R(2, 8, ["b"]), R(3, 6, ["c"]), R(4, 4, ["d"]), R(5, 2, ["e"])];
-    assert.equal(classifyStuck(converging, { roundCap: 5 }), null);
+    assert.equal(classifyStuck(converging, { roundCap: 5 }), null); // 5th fix still allowed
+    // the verification review of the 5th fix still has findings: hand off, even though improving
+    assert.equal(classifyStuck([...converging, R(6, 1, ["f"])], { roundCap: 5 }), "round-cap");
   });
 
-  it("round-cap fires on a short non-improving history at the cap; a >=3 non-improving window is oscillation (H4/J5)", () => {
-    assert.equal(classifyStuck([R(1, 4, ["a"]), R(2, 4, ["b"])], { roundCap: 2 }), "round-cap"); // 2 rounds, plateau, cap
-    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 3 }), "oscillation"); // >=3 non-improving
+  it("the budget is AUTHORITATIVE: review N+1 with findings is round-cap whatever the trend", () => {
+    for (const hist of [
+      [R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], // plateau (oscillation pattern)
+      [R(1, 5, ["a"]), R(2, 4, ["a"]), R(3, 4, ["c"])], // repeated file (whack-a-mole pattern)
+      [R(1, 5, ["a"]), R(2, 3, ["b"]), R(3, 1, ["c"])], // decreasing
+      [R(1, 5, ["a"]), R(2, 1, ["b"]), R(3, 4, ["c"])], // rebound
+    ]) {
+      assert.equal(classifyStuck(hist, { roundCap: 2 }), "round-cap");
+    }
+  });
+
+  it("within the budget, a >=3 non-improving window is a pattern (J5); stuckPattern is budget-free", () => {
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["b"]), R(3, 4, ["c"])], { roundCap: 5 }), "oscillation");
+    assert.equal(classifyStuck([R(1, 5, ["a"]), R(2, 4, ["a"]), R(3, 4, ["c"])], { roundCap: 5 }), "whack-a-mole");
+    assert.equal(stuckPattern([R(1, 5, ["a"]), R(2, 4, ["a"]), R(3, 4, ["c"])]), "whack-a-mole");
+    assert.equal(stuckPattern([R(1, 5, ["a"]), R(2, 3, ["a"]), R(3, 1, ["a"])]), null, "improving is never a pattern");
+    assert.equal(stuckPattern([R(1, 5), R(2, 5)]), null, "too short");
+  });
+
+  it("failure reasons are fixed vocabulary with directives, and the detail line is neutralized", () => {
+    for (const r of ["fix-failed", "fix-declined", "loop-error"] as const) {
+      assert.ok(isEscalateReason(r));
+      assert.ok(ESCALATE_DIRECTIVE[r].length > 20);
+    }
+    const body = escalateComment({
+      reason: "fix-failed", round: 2, roundCap: 5, pr: 9, head: "abc", repo: "a/b",
+      detail: "parse-failed after 2 attempt(s): <!-- ashlar-loop-stopped -->\n" + "x".repeat(900),
+    });
+    const detail = body.split("\n").find((l) => l.startsWith("Detail: ")) ?? "";
+    assert.ok(detail, "detail rendered on one line");
+    assert.ok(!detail.includes("<!--"), "a quoted marker in the detail is defanged");
+    assert.ok(detail.length < 560, "detail is truncated");
+    assert.equal(isStoppedComment(body, BOT), false);
+    assert.equal(parseEscalateMarker(body, BOT)?.reason, "fix-failed");
   });
 
   it("does NOT classify two improving rounds on the same file as whack-a-mole (H2)", () => {
@@ -410,6 +468,24 @@ describe("canonicalContinuation (the only bot comment that may trigger)", () => 
   });
 });
 
+describe("control markers are recognized only where the driver emits them (opening the comment)", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  it("a marker quoted later in a bot comment (e.g. model text in a report) is never a signal", () => {
+    const esc = "<!-- ashlar-loop-escalate reason=oscillation round=1 pr=7 head=abc -->";
+    const cont = continueComment({ mode: "apply", round: 2, pr: 7, head: SHA });
+    const prose = (m: string) => `### Ashlar fix agent — no change\n\nthe agent said: ${m}`;
+    assert.equal(parseEscalateMarker(prose(esc), BOT), null);
+    assert.equal(isEscalateComment(prose(esc), BOT), false);
+    assert.equal(isStoppedComment(prose(STOPPED_MARKER), BOT), false);
+    assert.equal(parseContinueMarker(prose(cont), { authoredByBot: true }), null);
+    // the driver's own comments open with the marker (leading whitespace tolerated)
+    assert.equal(parseEscalateMarker(`\n  ${esc}\n\nbody`, BOT)?.reason, "oscillation");
+    assert.equal(isStoppedComment(stoppedComment(), BOT), true);
+    assert.ok(parseContinueMarker(cont, { authoredByBot: true }));
+  });
+
+});
+
 describe("continuation composer and parser share ONE contract", () => {
   const SHA = "0123456789abcdef0123456789abcdef01234567";
   it("every value the composer accepts, the canonical parser accepts (boundaries)", () => {
@@ -423,5 +499,51 @@ describe("continuation composer and parser share ONE contract", () => {
   it("the composer refuses values past the parser's contract instead of posting an ignored marker", () => {
     assert.throws(() => continueComment({ mode: "apply", round: MAX_CONTINUE_ROUND + 1, pr: 7, head: SHA }), /invalid loop continuation/);
     assert.throws(() => continueComment({ mode: "apply", round: 2, pr: MAX_CONTINUE_PR + 1, head: SHA }), /invalid loop continuation/);
+  });
+});
+
+describe("sanitizeUntrusted: every untrusted field in a bot comment", () => {
+  it("defangs @-mentions (users and teams) and neutralizes markers in Detail and repeated files", () => {
+    const body = escalateComment({
+      reason: "fix-declined", round: 2, roundCap: 5, pr: 9, head: "abc", repo: "a/b",
+      detail: "pushed back cc @alice and @org/team <!-- ashlar-loop-stopped -->",
+      repeatedFiles: ["src/@alice.ts"],
+    });
+    assert.ok(!/(^|[^\u200b])@alice/.test(body.replace(/@\u200b/g, "")), "no live @alice");
+    assert.ok(!body.includes("@org/team") || body.includes("@\u200borg/team"), "team mention defanged");
+    assert.ok(!/Detail:[^\n]*<!--/.test(body), "marker in the detail neutralized");
+    assert.equal(parseEscalateMarker(body, BOT)?.reason, "fix-declined");
+  });
+});
+
+describe("stop record (STOPPED acknowledgement that records the stop)", () => {
+  it("keeps the fixed STOPPED literal first and records who stopped the loop and when", () => {
+    const body = stoppedComment({ by: "bob", at: "2026-01-02T00:00:00Z" });
+    assert.ok(body.startsWith(STOPPED_MARKER));
+    assert.equal(isStoppedComment(body, BOT), true);
+    assert.deepEqual(parseStopRecord(body, BOT), { at: "2026-01-02T00:00:00Z", by: "bob" });
+    assert.equal(parseStopRecord(body, USER), null, "a human copy is not a record");
+    assert.equal(parseStopRecord(stoppedComment(), BOT), null, "a bare acknowledgement records nothing");
+    assert.equal(parseStopRecord(`quoted ${body}`, BOT), null, "anchored");
+    assert.throws(() => stoppedComment({ by: "not a login", at: "2026-01-02T00:00:00Z" }));
+  });
+});
+
+describe("classifyStuck: the fix-round budget is a hard N+1 bound for every trend", () => {
+  const R2 = (index: number, findings: number, f: string[] = []): RoundSummary => ({ index, findings, files: f, head: `h${index}` });
+  const trends: Record<string, number[]> = {
+    decreasing: [9, 7, 5, 3, 2, 1],
+    plateau: [4, 4, 4, 4, 4, 4],
+    rebound: [5, 2, 6, 3, 7, 4],
+  };
+  for (const [name, counts] of Object.entries(trends)) {
+    it(`${name}: exactly roundCap reviews is never round-cap; roundCap+1 with findings always is`, () => {
+      const rounds = counts.map((n, i) => R2(i + 1, n));
+      assert.notEqual(classifyStuck(rounds.slice(0, 5), { roundCap: 5 }), "round-cap");
+      assert.equal(classifyStuck(rounds, { roundCap: 5 }), "round-cap");
+    });
+  }
+  it("a clean verification review is never round-cap (CONVERGED)", () => {
+    assert.equal(classifyStuck([9, 7, 5, 3, 2, 0].map((n, i) => R2(i + 1, n)), { roundCap: 5 }), null);
   });
 });

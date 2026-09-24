@@ -32,9 +32,19 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
+import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
-import { ashlarBotLogin, runPostReviewLoop, SILENT_REASONS } from "./review-loop-runtime.server.ts";
+import {
+  ashlarBotLogin,
+  continueLoopOnPush,
+  loopStartAt,
+  startLoop,
+  loopEnabled,
+  runPostReviewLoop,
+  SILENT_REASONS,
+  stopLoop,
+} from "./review-loop-runtime.server.ts";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { redactSalvagedReviewBody } from "./review-format";
 import {
@@ -607,6 +617,9 @@ async function playGithub(jobId: string, untrustedBody: string) {
   // available to reviewers, not merely that a webhook was received.
   const admitted = current();
   if (admitted) void reactQuiet(token, admitted, "eyes");
+  // A fresh human start directive whose review is ADMITTED is recorded as the loop start (the
+  // durable start event — review-loop.ts startComment), long before its review can finish.
+  if (admitted?.origin === "github" && admitted.thread?.loop?.kind === "start") recordLoopStart(token, admitted);
   void watchReviewers(jobId, token);
   if (providers.includes("local")) {
     // The loop reads files from this snapshot; harmless for single-turn mode (unused there).
@@ -1109,7 +1122,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   // fast-forward over (and undo) a contributor's backward force-push. The runtime re-checks
   // the live head right before committing as well.
   if (token && postedToGithub && !headMovedTo) {
-    void runPostReviewLoop(token, postedJob, sample, state.settings, state.jobs).then((r) => {
+    void runPostReviewLoop(token, postedJob, sample, state.settings).then((r) => {
       // The runtime reports halts in-thread; also leave a server-side trace so nothing is lost.
       if (!r.ran && !SILENT_REASONS.includes(r.reason)) {
         console.warn(`[review-loop] ${jobId}: ${r.reason}`);
@@ -1310,6 +1323,71 @@ export function fireHarbor(opts: HarborFireOpts): HarborFireResult {
   });
 }
 
+/**
+ * Review-loop PR state (design §5/§11), gated OFF unless the fix agent is enabled: a push to a
+ * PR with an ACTIVE loop session continues the loop (next review on the pushed head); a human
+ * stop directive ends it — live loop reviews are cancelled and the fixed STOPPED marker is
+ * posted once. Fire-and-forget; a redelivered webhook never repeats the side effect.
+ */
+function recordLoopStart(token: string, job: Job): void {
+  // Same gate as applyLoopControl: with the fix agent off, a start is never recorded (a record
+  // written now would become a live session anchor once the agent is enabled).
+  if (!loopEnabled(state.settings) || job.thread?.loop?.kind !== "start") return;
+  const start = { owner: job.owner, repo: job.repo, pr: job.pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) };
+  void startLoop(token, start, state.settings).then(
+    (r) => {
+      if (!r.posted && /failed/.test(r.reason)) console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${r.reason}`);
+    },
+    (e) => console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${formatGithubError(e)}`),
+  );
+}
+
+// Loop control claims each delivery before its side effect (loop-control-claims.ts). The claim is
+// the ONLY redelivery guard: the same delivery may also leave a job or a 202 "ignored" event, and
+// checking those would shadow a claim released after a failed attempt, so the retry GitHub
+// redelivers would never run. A redelivery after a restart (empty claims) re-runs an idempotent step.
+const loopControlClaims = createDeliveryClaims();
+
+function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>, { kind: "review" }>, deliveryId: string) {
+  if (!loopEnabled(state.settings) || parsed.installationId === undefined) return;
+  if (!loopControlClaims.claim(deliveryId)) return;
+  const installationId = parsed.installationId;
+  const { owner, repo, pr, headSha } = parsed.target;
+  const run = (label: string, step: (token: string) => Promise<{ posted: boolean; reason: string }>) => {
+    void (async () => {
+      try {
+        const r = await step(await installationToken(installationId));
+        if (!r.posted && /failed|in flight/.test(r.reason)) {
+          loopControlClaims.release(deliveryId); // a redelivery may retry what did not land
+          if (/failed/.test(r.reason)) console.warn(`[review-loop] ${label}: ${r.reason}`);
+        }
+      } catch (e) {
+        loopControlClaims.release(deliveryId);
+        console.warn(`[review-loop] ${label}: ${formatGithubError(e)}`);
+      }
+    })();
+  };
+  if (parsed.trigger === "pull_request.synchronize") {
+    run(`continue ${owner}/${repo}#${pr}`, (token) =>
+      continueLoopOnPush(token, { owner, repo, pr, headSha, actor: parsed.actor, pushedAt: parsed.eventAt }, state.settings));
+  } else if (parsed.thread?.loop?.kind === "stop") {
+    // Cancel the LOOP's own review work: jobs a loop directive or the driver's continuation
+    // requested. A plain review a human explicitly asked for still runs and posts — it cannot fix
+    // or continue anything, since its loop step finds the session ended by this stop. A live
+    // loop-start review means its start record may still land (with an earlier time): the stop is
+    // then recorded even if it ends nothing yet.
+    let startInFlight = false;
+    for (const j of state.jobs) {
+      if (j.owner === owner && j.repo === repo && j.pr === pr && isLive(j.status) && j.thread?.loop?.kind === "start") {
+        startInFlight = true;
+        cancelHarborJob(j.id);
+      }
+    }
+    run(`stop ${owner}/${repo}#${pr}`, (token) =>
+      stopLoop(token, { owner, repo, pr, actor: parsed.actor, stopAt: parsed.eventAt, startInFlight }, state.settings));
+  }
+}
+
 export function ingestGitHubWebhook(opts: {
   hmacOk: boolean;
   deliveryId: string;
@@ -1385,6 +1463,8 @@ export function ingestGitHubWebhook(opts: {
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false, ignored: parsed.reason };
   }
+
+  applyLoopControl(parsed, opts.deliveryId);
 
   const ingressMs = Math.max(8, performance.now() - t0);
   const decision = decideIngress({

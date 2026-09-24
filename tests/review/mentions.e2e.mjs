@@ -246,7 +246,7 @@ test('@ashlar-bot review-loop stop is control-only: recognized as a skip, no rev
   const out=await deliver(app,'issue_comment',raw);
   const job=app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
   assert.equal(job?.status,'skipped');
-  assert.equal(job?.skipReason,'review-loop stop (no active loop engine)');
+  assert.equal(job?.skipReason,'review-loop stop (control command — handled by the loop engine)');
   assert.equal(app.localRequests.length,0,'no reviewer leg runs for a stop');
 });
 
@@ -269,4 +269,20 @@ test('self-trigger guard is wired end-to-end with the configured App login (ASHL
   assert.equal(custom.queued,false);assert.match(String(custom.ignored||custom.skip),/bot-authored/);
   const other=await deliver(app,'issue_comment',from('ashlar-bot-review-loop[bot]'),'d-other-app');
   assert.equal(other.queued,true,'not self under the configured identity');
+});
+
+test('a loop stop whose first attempt failed is retried when GitHub redelivers it (the claim is the only guard)',async t=>{
+  let reads=0;
+  const app=await appFixture({reviewLocal:false,fixAgent:{provider:'local',delivery:'script-apply',mode:'suggest',parallelPrs:3}},
+    {api:{fetchPullHeadRef:async()=>{reads++;throw new Error('GitHub API timeout');}}});
+  t.after(()=>app.close());
+  app.env.ASHLAR_FIX_AGENT='1';
+  const at='2026-01-20T00:00:00Z';
+  const stop={...comment(),sender:{login:'alice'},comment:{id:77,body:'/review-loop stop',created_at:at,updated_at:at,user:{login:'alice'}}};
+  const first=await deliver(app,'issue_comment',stop,'stop-1');
+  assert.equal(first.status,202);
+  await eventually(()=>reads===1,'the stop never ran');
+  // The first attempt failed and released its claim; the same delivery id (GitHub's redelivery)
+  // must run the stop again, even though the first delivery left a 202 event behind.
+  await eventually(async()=>{await deliver(app,'issue_comment',stop,'stop-1');return reads>=2;},'the redelivered stop was not retried');
 });

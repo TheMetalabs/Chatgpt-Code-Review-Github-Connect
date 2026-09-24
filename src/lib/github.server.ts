@@ -6,12 +6,13 @@ import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } 
 import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
+import { GithubTransportError, mayResendOnOtherHost, trackRequestSent } from "./github-transport";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { applyBudget } from "./review-budget";
-import { commitFiles, type GitDataApi } from "./fix-commit.ts";
+import { BranchMovedError, commitFiles, type GitDataApi } from "./fix-commit.ts";
 import type { FixFile } from "./fix-apply.ts";
 
 const GH_HOST = "api.github.com";
@@ -145,10 +146,11 @@ function httpsRaw(opts: {
         );
       },
     );
+    const requestSent = trackRequestSent(req);
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error("GitHub API timeout"));
     });
-    req.on("error", (err) => reject(new Error(formatGithubError(err))));
+    req.on("error", (err) => reject(new GithubTransportError(formatGithubError(err), requestSent())));
     if (opts.body) req.write(opts.body);
     req.end();
   });
@@ -254,6 +256,7 @@ async function ghHttps(
     return await ghCall(resolved, method, p, headers, body, timeoutMs);
   } catch (e) {
     clearResolvedCache();
+    if (!mayResendOnOtherHost(method, e)) throw e;
     const retry = await resolveGithubHost(true);
     if (retry.hostname === resolved.hostname) throw e;
     return ghCall(retry, method, p, headers, body, timeoutMs);
@@ -703,8 +706,8 @@ export async function listReviewComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null }>(
+): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; updatedAt: string; body: string }>> {
+  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null; updated_at?: string | null; body?: string | null }>(
     token,
     `/repos/${owner}/${repo}/pulls/${pr}/comments`,
   );
@@ -713,6 +716,8 @@ export async function listReviewComments(
     path: String(c.path ?? ""),
     commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
     createdAt: String(c.created_at ?? ""),
+    updatedAt: String(c.updated_at ?? ""),
+    body: String(c.body ?? ""),
   }));
 }
 
@@ -721,12 +726,20 @@ export async function listIssueComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; body: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; body?: string | null }>(
+): Promise<Array<{ id: number; userLogin: string; body: string; createdAt: string; updatedAt: string }>> {
+  const rows = await ghListAll<{ id?: number; user?: { login?: string }; body?: string | null; created_at?: string; updated_at?: string }>(
     token,
     `/repos/${owner}/${repo}/issues/${pr}/comments`,
   );
-  return rows.map((c) => ({ userLogin: String(c.user?.login ?? ""), body: String(c.body ?? "") }));
+  // updatedAt tells an edited comment apart: its current text cannot be placed at its creation.
+  // id orders comments exactly (monotonic), where second-resolution timestamps tie.
+  return rows.map((c) => ({
+    id: Number(c.id ?? 0),
+    userLogin: String(c.user?.login ?? ""),
+    body: String(c.body ?? ""),
+    createdAt: String(c.created_at ?? ""),
+    updatedAt: String(c.updated_at ?? ""),
+  }));
 }
 
 export function gitDataApi(token: string, owner: string, repo: string): GitDataApi {
@@ -782,6 +795,11 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
       if (!out.ok || !out.data.sha) throw new Error(out.ok ? "commit has no sha" : `create commit failed (${out.status}): ${out.text}`);
       return out.data.sha;
     },
+    async readBranchRef(branch: string): Promise<string> {
+      const cur = await gh<{ object?: { sha?: string } }>(token, `${base}/ref/heads/${branch}`);
+      if (!cur.ok || !cur.data.object?.sha) throw new Error(`read ref failed (${cur.ok ? "no sha" : cur.status})`);
+      return cur.data.object.sha;
+    },
     async updateBranchRef(branch: string, commitSha: string, expectedOldSha: string): Promise<void> {
       // No ref CAS in the REST API: read the ref immediately before the write and refuse unless
       // it is exactly the reviewed base. force:false alone would still fast-forward over a
@@ -790,8 +808,10 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
       if (!cur.ok || !cur.data.object?.sha) {
         throw new Error(cur.ok ? "branch ref has no sha" : `read ref failed (${cur.status}): ${cur.text}`);
       }
+      // Already at the target: a previous attempt's write landed though its response was lost.
+      if (cur.data.object.sha === commitSha) return;
       if (cur.data.object.sha !== expectedOldSha) {
-        throw new Error(`branch moved (${expectedOldSha.slice(0, 7)} → ${cur.data.object.sha.slice(0, 7)}); refusing to update`);
+        throw new BranchMovedError(`branch moved (${expectedOldSha.slice(0, 7)} → ${cur.data.object.sha.slice(0, 7)}); refusing to update`);
       }
       const out = await gh(token, `${base}/refs/heads/${branch}`, {
         method: "PATCH",
@@ -823,12 +843,48 @@ export async function fetchPullHeadRef(
   owner: string,
   repo: string,
   pr: number,
-): Promise<{ ref: string; sha: string; fork: boolean }> {
-  const out = await gh<{ head?: { ref?: string; sha?: string; repo?: { fork?: boolean } | null } }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
+): Promise<{
+  ref: string;
+  sha: string;
+  fork: boolean;
+  sameRepo: boolean;
+  additions?: number;
+  deletions?: number;
+}> {
+  const out = await gh<{
+    head?: { ref?: string; sha?: string; repo?: { fork?: boolean; full_name?: string } | null };
+    additions?: number;
+    deletions?: number;
+  }>(token, `/repos/${owner}/${repo}/pulls/${pr}`);
   if (!out.ok || !out.data.head?.ref || !out.data.head.sha) {
     throw new Error(out.ok ? "pull request has no head ref/sha" : `could not load pull request (${out.status}): ${out.text}`);
   }
-  return { ref: out.data.head.ref, sha: out.data.head.sha, fork: Boolean(out.data.head.repo?.fork) };
+  // additions/deletions size the diff-too-large gate; absent/invalid → the gate is skipped.
+  const n = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined);
+  // POSITIVE provenance: the head is writable by this installation only when its repository IS
+  // the base repository. A null head repo (deleted fork) or a different full_name is not "same
+  // repo" — unknown provenance must never be coerced into "safe to push".
+  const headRepo = out.data.head.repo?.full_name;
+  return {
+    ref: out.data.head.ref,
+    sha: out.data.head.sha,
+    fork: Boolean(out.data.head.repo?.fork),
+    sameRepo: typeof headRepo === "string" && headRepo.toLowerCase() === `${owner}/${repo}`.toLowerCase(),
+    additions: n(out.data.additions),
+    deletions: n(out.data.deletions),
+  };
+}
+
+/** A user's repository permission (legacy `permission` field: admin | write | read | none —
+ * `maintain` reports as write). Throws on a lookup failure: the apply gate fails closed. */
+export async function fetchUserPermission(token: string, owner: string, repo: string, login: string): Promise<string> {
+  if (!login) throw new Error("no user to check");
+  const out = await gh<{ permission?: string }>(
+    token,
+    `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`,
+  );
+  if (!out.ok) throw new Error(`permission lookup for ${login} failed (${out.status})`);
+  return String(out.data.permission ?? "none");
 }
 
 export async function createIssueComment(

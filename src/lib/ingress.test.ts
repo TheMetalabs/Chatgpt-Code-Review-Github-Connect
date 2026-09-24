@@ -229,7 +229,7 @@ describe("decideIngress", () => {
       thread: { kind: "pr_body", commentId: 0, userText: "/review-loop stop", loop: { kind: "stop" } },
     });
     assert.equal(d.ok, true);
-    if (d.ok) assert.equal(d.skip, "review-loop stop (no active loop engine)");
+    if (d.ok) assert.equal(d.skip, "review-loop stop (control command — handled by the loop engine)");
   });
 
   it("a PR-body independent mention plus a trailing stop still queues the review", () => {
@@ -251,7 +251,7 @@ describe("decideIngress", () => {
       thread: { kind: "mention", commentId: 1, userText: "@ashlar-bot review-loop stop", loop: { kind: "stop" } },
     });
     assert.equal(d.ok, true);
-    if (d.ok) assert.equal(d.skip, "review-loop stop (no active loop engine)");
+    if (d.ok) assert.equal(d.skip, "review-loop stop (control command — handled by the loop engine)");
   });
 
   it("does not let a trailing /review-loop stop suppress an explicit mention in the same body", () => {
@@ -273,7 +273,7 @@ describe("decideIngress", () => {
       thread: { kind: "mention", commentId: 1, userText: "/review-loop stop", loop: { kind: "stop" } },
     });
     assert.equal(d.ok, true);
-    if (d.ok) assert.equal(d.skip, "review-loop stop (no active loop engine)");
+    if (d.ok) assert.equal(d.skip, "review-loop stop (control command — handled by the loop engine)");
   });
 
 });

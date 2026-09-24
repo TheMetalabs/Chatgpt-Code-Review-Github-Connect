@@ -42,6 +42,54 @@
 - **동시성:** 한 PR 내부는 deliveryId 디둡으로 "루프 1개/PR"(재진입·중복 차단). 서로 다른 PR은 **병렬**(§6 병렬성).
 - **fix 에이전트는 설정으로 지정**(§6b): 어느 provider가 어떤 방식으로 수정할지. 기본은 미설정(수정 안 함).
 
+### 2b. 루프 세션 — PR 상태, GitHub에서 도출 (구현: `review-loop-session.ts`)
+
+루프는 **잡 상태가 아니라 PR 상태**다. harbor 잡은 메모리에만 있어(재시작 시 소실) 세션 근거가 될 수 없다.
+GitHub가 영속하는 이벤트(App의 기록·마커, 사람의 stop 코멘트, 리뷰)를 접어서 세션을 도출한다 — 모든 프로세스·재시작이
+같은 답을 낸다.
+
+- **시작 = App의 start 기록:** harbor가 **새** start 지시어(이슈·인라인 코멘트의 작성/편집, PR 본문 open/편집)의 리뷰를
+  **승인(admit)** 할 때 App이 고정 기록 `<!-- ashlar-loop-start mode= by= at= -->` 를 한 번 남긴다(`at` = 지시어의 실제
+  시각: 코멘트 작성 시각, 편집으로 들어온 지시어는 편집 시각, PR 본문은 PR `updated_at`). 세션은 마지막 종료 이후
+  **첫 기록**에서 시작한다. 사람 코멘트·PR 본문의 **현재 텍스트는 start로 재생하지 않는다** — 편집으로 과거 시각의
+  start를 심을 수 없다. 기록 게시가 실패했으면 그 리뷰의 루프 단계가 같은 기록을 (멱등으로) 보충한다.
+  세션 안에서 start를 다시 걸어도 **앵커는 유지**되고 모드·시작자만 갱신된다 → 라운드 예산이 리셋되지 않는다.
+- **종료 이벤트:** 사람의 stop 지시어, 봇의 ESCALATE 마커, 봇의 STOPPED 마커, 봇의 clean 리뷰(`total=0`, CONVERGED).
+  같은 초의 동률은 head 이동 → 종료 → start 순(핸드오프와 같은 초의 start는 새 세션).
+- **stale clean 리뷰는 종료가 아니다:** clean 리뷰는 루프가 **기다리는 head** 에 대해서만 CONVERGED다. 루프가 봇의
+  연속 마커나 push(웹훅의 `updated_at`)로 이미 다른 head로 넘어간 뒤 도착한 옛 head의 clean 리뷰는, 그 head가 PR의
+  live head가 아니면 무시한다. clean 리뷰 **직후** 다른 head의 연속 마커가 달렸다면(드라이버가 그 리뷰 도착 전에
+  연속을 결정) 세션은 앵커·모드·시작자를 유지한 채 재개된다. live head의 clean 리뷰는 항상 종료이고, push는 끝난
+  세션을 재개하지 않는다(수렴 후의 사람 push는 새 루프를 열지 않는다).
+- **작성자 강제:** start 기록·마커·CONVERGED는 봇(App 로그인)만, 사람은 **편집되지 않은** 코멘트의 stop만(작성 시각).
+  편집된 코멘트의 stop과 PR 본문 stop은 웹훅이 **편집 시각**에 처리하고, STOPPED 확인 코멘트가 그 정지를 **기록**한다
+  (첫 줄은 고정 STOPPED 마커 그대로, 둘째 줄 `<!-- ashlar-loop-stop at= by= -->` — `at`은 정지 자체의 시각이지 확인
+  코멘트의 시각이 아님). 기록 게시는 재스캔 후 재시도하고, 기록이 영속화되기 전(재시도 중·실패)에는 이 프로세스의 모든
+  세션 조회가 그 정지를 반영한다 — 정지 뒤에 커밋되는 라운드는 없다. 같은 정지를 다시 받아도 기록은 한 번. 기록(= STOPPED 확인)은 그 정지가 세션을
+  **끝냈을 때**, 또는 그 PR의 loop-start 리뷰가 진행 중이라 start 기록이 나중에 더 이른 시각으로 도착할 수 있을 때만 —
+  아무것도 멈추지 않은 정지는 아무것도 게시하지 않는다. 같은 초의 사람 stop은 start 뒤로 정렬된다(정지가 이긴다).
+  봇 산문·사람이 쓴 마커는 무시.
+- **세션 범위 판정:** 세션 자신의 제어 코멘트(핸드오프·연속 마커)는 **start 기록의 코멘트 id 이후**인 것만 그 세션 것이다
+  (초 단위 시각은 이전 세션의 핸드오프와 같은 초에 겹칠 수 있다). 라운드(리뷰)는 start 시각보다 **엄격히 이후**인 것만.
+  방금 게시한 제어 코멘트(연속·핸드오프·start·stop 기록)는 목록 API에 아직 안 보여도 게시된 것으로 센다(프로세스 로컬 캐시,
+  GitHub 클라이언트별) — 읽기 지연으로 중복 트리거가 생기지 않는다.
+- **활성 세션의 모든 리뷰가 루프 라운드**다(명시 start, 연속 마커, push 연속, 세션 중 요청한 일반 리뷰).
+- **push = 다음 라운드:** 활성 세션에서 사람이 push하면 드라이버가 연속 마커를 달아 새 head를 리뷰한다(봇 자신의 push는
+  수정 라운드가 직접 연속 마커를 단다). 리뷰 중·수정 중 head가 움직이면 옛 라운드는 조용히 supersede되고, live head의
+  리뷰를 (다시) 요청한다 — 연속 마커는 **(PR, head, 세션)마다 하나**(동시 호출은 한 번의 게시를 공유, 이후 호출은 기존
+  마커를 찾아 게시하지 않음)라서 push 이벤트를 놓쳐도 루프가 멈추지 않고, 중복 트리거도 없다.
+- **정지:** 사람의 `/review-loop stop` 은 세션을 끝내고, 진행 중인 루프 리뷰(지시어·연속 마커가 요청한 것)를 취소하며
+  (사람이 따로 요청한 일반 리뷰는 게시되지만 세션이 끝났으므로 수정·연속은 없다), 고정 STOPPED 마커를 **한 번**
+  남긴다(웹훅의 작성 시각을 주입해 목록 API 지연과 무관). 수정 중이면 커밋 직전 재확인에서 멈추고, 커밋 후였다면
+  연속 요청을 하지 않는다.
+- **apply 권한:** 세션 시작자(마지막 start 기록의 요청자)의 저장소 권한이 write/admin이어야 apply한다 — 라운드 시작 때와
+  **커밋 직전에 다시** 확인한다. 조회 실패는 fail-closed(`loop-error`), 다른 사람이 수정 중에 start를 다시 걸면 그 라운드는
+  무의미해져 조용히 끝난다(새 요청이 이어받음). suggest는 쓰지 않으므로 권한 확인이 없다.
+- **연속 게시 실패:** 백오프 재시도 후에도 다음 리뷰를 요청하지 못하면 push된 head에 대한 `loop-error` 핸드오프로 끝난다
+  (조용한 정지 없음). App 자신의 push도 같은 경로를 타서, 커밋 직후 프로세스가 죽어 연속 마커가 없으면 보충한다.
+- **정지 사유 구분:** 세션이 끝나 라운드가 무의미해졌을 때의 조용한 사유는 끝난 방식(운영자 stop / 핸드오프 / 수렴)을
+  그대로 말한다 — 핸드오프를 "operator stop"으로 부르지 않는다.
+
 ## 3. ⛔ 종료 신호는 고정·명시 리터럴 — 절대 LLM이 짓지 않는다 (핵심)
 
 수렴 판정 `"didn't find any major issues"` 가 substring 매칭으로 안정적인 것처럼, **루프의 모든 종착 신호는
@@ -49,7 +97,7 @@
 
 | 종착 상태 | 고정 마커(머신) | 고정 문구(사람) | 감지 |
 |---|---|---|---|
-| **CONVERGED** | `<!-- ashlar-findings total=0 ... -->` | (지정 리뷰어의 clean verdict) | substring/마커 |
+| **CONVERGED** | `<!-- ashlar-findings total=0 ... -->` (리뷰 본문의 **마지막 줄**) | (지정 리뷰어의 clean verdict) | substring/마커 — ashlar 내부는 끝에 있는 마커만 센다 |
 | **ESCALATE** | `<!-- ashlar-loop-escalate reason=<code> round=<N> -->` | `Ashlar review-loop halted — human review required` | substring/마커 |
 | **STOPPED** | `<!-- ashlar-loop-stopped -->` | `Ashlar review-loop stopped by operator` | 마커 |
 
@@ -59,9 +107,33 @@
 |---|---|---|---|
 | **CONTINUE** | `<!-- ashlar-loop-continue mode=<apply\|suggest> round=<N> pr=<PR> head=<40hex> -->` | `Ashlar review-loop continues — requesting the next review` | 마커(봇 작성분만) |
 
+| **FIXING**(진행 신호) | `<!-- ashlar-loop-fixing round=<N> pr=<PR> head=<sha> -->` | `Ashlar review-loop — fix round in progress` | 마커(정보용 — 트리거·종료 아님) |
+
+FIXING은 수정 요청 직전에 단다(수정은 바쁜 provider 큐에서 오래 기다릴 수 있다 — 드라이버가 "진행 중"과
+"죽음"을 구분하게). 그 뒤에는 반드시 fix 리포트+연속 또는 핸드오프가 온다.
+
+**수정 요청 감시(`fix-request-watch.ts`):** 로컬 LLM은 리뷰와 수정을 한 줄로 처리하므로 수정 요청은 큐에서 오래
+기다릴 수 있다. 스트리밍 신호로 "대기(keepalive)"와 "생성(첫 출력)"을 구분해:
+- 생성 deadline(`ASHLAR_FIX_TIMEOUT_MS`, 기본 60분)은 **첫 출력부터** 센다 — 대기 시간 제외(부하 중 거짓
+  `fix-failed` 방지). 대기 상한은 별도(`ASHLAR_FIX_QUEUE_MAX_MS`, 기본 6시간), 신호 두절(liveness)도 중단.
+- **관련성 검사는 하나**(head 이동 · 세션 종료 · 새 세션 · apply→suggest 강등)이고, 라운드 시작 직전, 대기 중 2분마다,
+  생성 시작 순간, 재시도 전, 커밋 직전, 리포트 전에 같은 검사를 쓴다 — 해당하면 abort(대기열 자리 반환·생성 조기 차단)하고
+  조용히 끝난다(superseded / stopped / newer request). 이렇게 무의미해진 라운드는 **재시도하지 않는다.**
+- 수정 요청은 리뷰 경로와 같은 샘플링·예산(temperature 0.6 등)을 쓴다 — 없으면 추론 모델이 반복 루프로 상한까지
+  생성하다 `length`로 끝난다.
+- 서버 로그 `[review-loop] <job> step|fix-request|fix-result|continued|handoff` 로 활성 세션의 각 단계를
+  추적한다(세션 밖 PR의 리뷰는 로그를 남기지 않는다).
+- 커밋은 전송 수준에서 1회 재시도하고(모델 재요청 없음), 응답이 유실된 ref 갱신은 "이미 목표 커밋"으로 인식한다.
+- apply는 head 저장소가 **이 저장소임이 확인될 때만** 쓴다(fork·삭제된 head 저장소 등 출처 불명은 거절).
+
 CONTINUE 코멘트에는 멘션·지시어 산문이 없다. 봇이 작성한 이 마커만 다음 리뷰를 연다(head는 감사용이며, 리뷰는
 그 시점 PR 최신 head를 본다). 0건 라운드는 명시 요청과 같이 clean 리뷰(`ashlar-findings total=0`)를 올려
 CONVERGED를 남긴다(슬래시 형식·연속 마커도 동일).
+
+**신뢰 경계(구현):** 봇 코멘트는 루프 자신의 판단(멱등성·세션·연속 요청)에 쓰이므로, 봇 코멘트에 들어가는 모든
+비신뢰 텍스트(fix 에이전트 summary·경로·오류, 스레드 노트)는 마커 구분자를 무력화하고 @멘션을 무력화한다. 또한
+ashlar 자신의 파서는 마커가 **코멘트 맨 앞**에 있을 때만 신호로 인정한다(드라이버가 방출하는 위치) — 본문 중간에
+인용된 마커는 산문이다. 외부 substring 감지기는 그대로 호환된다(진짜 마커는 항상 맨 앞).
 
 원칙(스킬의 교훈):
 - **마커·문구는 드라이버가 방출**한다. reason/round 같은 구조 데이터는 **머신 마커의 속성**으로, 사람용 문구는
@@ -94,6 +166,28 @@ CONVERGED를 남긴다(슬래시 형식·연속 마커도 동일).
 8. **정지 조건 감지 시 §8 ESCALATE.**
 
 불변식: `@ashlar review` 는 0-UNADDRESSED 일 때만 / 라운드당 in-flight 1개 / push 1개 / DIRTY SHA에 요청 금지.
+
+**종료 계약(구현, `review-loop-runtime.server.ts`):** 루프 세션은 반드시 고정 신호 하나로 끝난다 —
+CONVERGED(clean 리뷰 `total=0`), ESCALATE(reason 코드), STOPPED(운영자 정지). 조용한 정지·자유 문장 종료는 없다.
+suggest 모드의 라운드는 고정 "suggestion" 리포트로 사람에게 넘기고, 사람이 적용·push하면 세션이 이어진다(§2b).
+
+- **수정 라운드 예산** `ASHLAR_LOOP_ROUND_CAP`(기본 **5**): 리뷰 라운드 k(≤5) 뒤에 수정 라운드 k. 리뷰 라운드
+  6은 5번째 수정의 **검증 리뷰** — clean이면 CONVERGED, 지적이 남으면 `round-cap` ESCALATE(추세와 무관한 하드 상한).
+- applied 라운드는 **항상** 다음 리뷰를 요청한다(연속 마커). 예산 판정은 다음 리뷰에서 한다.
+- 수정 라운드 실패는 라운드 안에서 재시도(`ASHLAR_FIX_ATTEMPTS`, 기본 2 — request/parse/scope/validation 실패) 후
+  `fix-failed`. 재시도 지시문은 **고정 문장**(거절 코드만 포함)이고, 거절 사유(모델 출력·저장소 경로를 인용할 수 있음)는
+  **JSON 인코딩된 비신뢰 데이터 필드**로만 되먹인다. 변경 없음은 `fix-declined`, 그 밖의 진행 불가는 `loop-error`.
+- 조용한 종료는 셋뿐: **supersede**(리뷰 후 head가 움직임 — 새 head의 리뷰가 루프를 이어받음; 제안(suggest)도
+  게시 전에 확인), **이 head에 이미 ESCALATE가 있음**(핸드오프를 넘어서 수정하지 않음), **같은 head의 다른 루프
+  단계가 진행 중**(프로세스 내 head별 가드 — 같은 head에 수정 라운드가 둘 돌지 않음).
+- **커밋 후 단계:** 브랜치가 이미 움직였으므로 이후 핸드오프는 **새 head**를 가리킨다. 연속 마커(제어 신호)를 먼저
+  달고, 그다음 리포트(마지막 줄이 실제 결과를 말함)를 단다. 연속 요청 실패는 새 head에 대한 `loop-error`.
+- 예산은 **권위적**이다: 검증 리뷰(N+1)에 지적이 남으면 추세 패턴과 무관하게 `round-cap`이고, 패턴(whack-a-mole·
+  oscillation)은 Detail에 남는다. 패턴 사유는 예산 안에서만 발동한다.
+- 라운드 이력은 봇 로그인으로 귀속 가능해야 한다: 현재 리뷰가 이력의 마지막 라운드로 보이지 않으면(API 지연 대비
+  3·6·12초 백오프 재조회 후) 수정하지 않고 `loop-error` — 예산을 우회하는 "맹목 수정"을 막는다. 같은 head의 다른
+  핸드오프가 게시 중이면 한 번 기다렸다가 다시 보고, 여전히 게시 중이면 **로그에 남는** 사유로 끝낸다(조용한 no-op 없음).
+- 세션 경계·이력 순서는 **시각(epoch ms)으로** 비교한다(문자열 비교 금지: `…00Z` 가 `…00.500Z` 보다 사전순으로 뒤).
 
 ## 6. Fix 에이전트 (루프를 실제로 수렴시키는 엔진)
 
@@ -186,7 +280,10 @@ Ashlar review-loop halted — human review required (round N/M)
 | `wrong-scope` | 맞는 수정·틀린 범위 반복 | 진짜 근본(예: O(N²) 실제 원인) 찾아 거기서 |
 | `re-flag-deferred` | 봇이 defer/pushback 재litigate | 오탐/설계 판단 — deferral load-bearing화 또는 방향 결정 |
 | `diff-too-large` | >5k/멀티도메인 | 수렴 불가 — 의존순서 스택 split, 루프 재개 금지 (**설계 변경**) |
-| `round-cap` | 상한 도달, 신호 불명확 | 추이·반복파일로 분류 후 방향 결정 |
+| `round-cap` | 수정 예산(기본 5) 소진 후 검증 리뷰에도 지적 | 추이·반복파일로 분류 후 방향 결정 |
+| `fix-failed` | fix 에이전트 응답이 재시도 후에도 적용 불가(요청·파싱·범위·검증·커밋 실패) | 수동 수정 또는 원인 해결 후 재실행 |
+| `fix-declined` | fix 에이전트가 모든 지적을 pushback/decline/defer(변경 없음) | 지적별 판정 — pushback 수용 시 스레드 resolve, 아니면 수동 수정 |
+| `loop-error` | 수정 라운드 자체를 못 돌림(fork에 apply, 편집 가능 파일 없음, 스냅샷·이력 불가 등) | 원인 해결 후 재실행 |
 
 **핵심 주의:** 상태값은 힌트일 뿐. 받는 에이전트는 컴팩션/세션교체로 요약이 stale일 수 있으니 **반드시 API에서
 round/findings/gates를 재도출**하고 착수. 그래서 재확인 명령을 페이로드에 박아둔다.

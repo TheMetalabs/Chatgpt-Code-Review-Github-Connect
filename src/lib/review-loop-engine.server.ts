@@ -33,6 +33,7 @@ import {
   type RoundSummary,
 } from "./review-loop.ts";
 import { deriveLoopSession, type LoopEvent, type LoopSession } from "./review-loop-session.ts";
+import { retryWrite } from "./write-retry.ts";
 
 // Single source of the App identity lives in review-loop.ts (shared with the webhook parser's
 // self-trigger guard); re-exported here for existing engine callers.
@@ -339,18 +340,18 @@ async function postHandoff(
   body: string,
   seen: () => Promise<boolean>,
 ): Promise<"posted" | "exists"> {
-  let last: unknown;
-  for (const [i, wait] of HANDOFF_RETRY_DELAYS_MS.entries()) {
-    if (wait) await (o.sleep ?? defaultSleep)(wait);
-    if (i > 0 && (await seen().catch(() => false))) return "exists";
-    try {
-      await gh.createIssueComment(token, { owner: o.owner, repo: o.repo, pr: o.pr, body });
-      return "posted";
-    } catch (e) {
-      last = e;
-    }
-  }
-  throw last;
+  // retryWrite: a POST whose outcome is unknown (it may have landed) is never sent again; the
+  // remaining schedule only re-checks the scan.
+  const r = await retryWrite({
+    delays: HANDOFF_RETRY_DELAYS_MS,
+    sleep: o.sleep ?? defaultSleep,
+    seen,
+    scanFirst: false,
+    post: () => gh.createIssueComment(token, { owner: o.owner, repo: o.repo, pr: o.pr, body }),
+  });
+  if ("posted" in r) return "posted";
+  if ("exists" in r) return "exists";
+  throw r.error;
 }
 
 /**

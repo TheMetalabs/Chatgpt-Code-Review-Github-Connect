@@ -41,6 +41,7 @@ import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, typ
 import type { GitDataApi } from "./fix-commit.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
+import { retryWrite, type WriteRetryResult } from "./write-retry.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
 import {
   CURRENT_ROUND_MISSING,
@@ -189,6 +190,13 @@ const ESCALATE_BACKOFF_MS = 1500;
 /** Attempts for a control post (the continuation, the start record): a transient failure must
  * not stall the loop. Each retry first re-scans, so a lost response never duplicates the post. */
 const POST_RETRY_DELAYS_MS = [0, 2_000, 5_000];
+
+/** A control write that did not land (as far as we know): its error, and whether it may have landed
+ * after all (outcome unknown: never re-sent, the row just never became visible). */
+function writeFailure(r: Extract<WriteRetryResult, { error: unknown }>): string {
+  const detail = (r.error as Error)?.message ?? String(r.error);
+  return r.ambiguous ? `${detail} (outcome unknown: not re-sent; not yet visible)` : detail;
+}
 const realSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -602,23 +610,22 @@ function ensureContinuation(
           }),
         () => false,
       );
-    let error = "the continuation was not posted";
-    for (const wait of POST_RETRY_DELAYS_MS) {
-      if (wait) await (c.sleep ?? realSleep)(wait);
-      if (await exists()) return { posted: false, exists: true };
-      try {
+    const r = await retryWrite({
+      delays: POST_RETRY_DELAYS_MS,
+      sleep: c.sleep ?? realSleep,
+      seen: exists,
+      post: async () => {
         const round =
           c.round ??
           (await reconstructRounds(gh, token, ref.owner, ref.repo, ref.pr, { botLogin: c.botLogin, sinceIso: c.sinceIso }).catch(() => [])).length + 1;
         const body = continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head });
         await gh.createIssueComment(token, { owner: ref.owner, repo: ref.repo, pr: ref.pr, body });
         rememberPosted(gh, key);
-        return { posted: true };
-      } catch (e) {
-        error = (e as Error)?.message ?? String(e);
-      }
-    }
-    return { posted: false, error };
+      },
+    });
+    if ("posted" in r) return { posted: true };
+    if ("exists" in r) return { posted: false, exists: true };
+    return { posted: false, error: writeFailure(r) };
   })().finally(() => continuing.delete(key));
   continuing.set(key, run);
   return run;
@@ -1128,23 +1135,22 @@ export async function startLoop(
     const body = startComment(record); // throws on a malformed field → "start failed"
     const d = deps ?? (await productionDeps(settings));
     const key = `start:${prKey(start)}:${record.by.toLowerCase()}:${isoMs(record.at)}:${record.mode}`;
-    let error = "the start record was not posted";
-    for (const wait of POST_RETRY_DELAYS_MS) {
-      if (wait) await (d.sleep ?? realSleep)(wait);
-      if (postedRecently(d.gh, key)) return { posted: false, reason: "start already recorded" };
-      const rows = await d.gh.listIssueComments(token, start.owner, start.repo, start.pr).catch(() => null);
-      if (rows?.some((r) => isSelfLogin(r.userLogin, botLogin) && sameStart(parseStartMarker(r.body, { authoredByBot: true }), record))) {
-        return { posted: false, reason: "start already recorded" };
-      }
-      try {
+    const r = await retryWrite({
+      delays: POST_RETRY_DELAYS_MS,
+      sleep: d.sleep ?? realSleep,
+      seen: async () => {
+        if (postedRecently(d.gh, key)) return true;
+        const rows = await d.gh.listIssueComments(token, start.owner, start.repo, start.pr).catch(() => null);
+        return !!rows?.some((row) => isSelfLogin(row.userLogin, botLogin) && sameStart(parseStartMarker(row.body, { authoredByBot: true }), record));
+      },
+      post: async () => {
         await d.gh.createIssueComment(token, { owner: start.owner, repo: start.repo, pr: start.pr, body });
         rememberPosted(d.gh, key);
-        return { posted: true, reason: "started" };
-      } catch (e) {
-        error = (e as Error)?.message ?? String(e);
-      }
-    }
-    return { posted: false, reason: `start failed: ${error}` };
+      },
+    });
+    if ("posted" in r) return { posted: true, reason: "started" };
+    if ("exists" in r) return { posted: false, reason: "start already recorded" };
+    return { posted: false, reason: `start failed: ${writeFailure(r)}` };
   } catch (e) {
     return { posted: false, reason: `start failed: ${(e as Error)?.message ?? String(e)}` };
   }
@@ -1178,21 +1184,22 @@ async function ensureStopRecord(
     const rec = isSelfLogin(r.userLogin, botLogin) ? parseStopRecord(r.body, { authoredByBot: true }) : null;
     return !!rec && rec.by.toLowerCase() === stop.by.toLowerCase() && isoMs(rec.at) === isoMs(stop.at);
   };
-  let error = "the stop record was not posted";
-  for (const wait of POST_RETRY_DELAYS_MS) {
-    if (wait) await (sleep ?? realSleep)(wait);
-    if (postedRecently(gh, key)) return { posted: false, exists: true };
-    const rows = await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).catch(() => null);
-    if (rows?.some(same)) return { posted: false, exists: true };
-    try {
+  const r = await retryWrite({
+    delays: POST_RETRY_DELAYS_MS,
+    sleep: sleep ?? realSleep,
+    seen: async () => {
+      if (postedRecently(gh, key)) return true;
+      const rows = await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr).catch(() => null);
+      return !!rows?.some(same);
+    },
+    post: async () => {
       await gh.createIssueComment(token, { owner: ref.owner, repo: ref.repo, pr: ref.pr, body });
       rememberPosted(gh, key);
-      return { posted: true };
-    } catch (e) {
-      error = (e as Error)?.message ?? String(e);
-    }
-  }
-  return { posted: false, error };
+    },
+  });
+  if ("posted" in r) return { posted: true };
+  if ("exists" in r) return { posted: false, exists: true };
+  return { posted: false, error: writeFailure(r) };
 }
 
 // In-process serialization so concurrent stop deliveries for one PR post the record at most once

@@ -580,8 +580,9 @@ describe("round-6: the two handoff paths see each other's just-posted handoff", 
 describe("terminal handoffs retry a transient POST failure (a handoff has no other poster)", () => {
   const H = "e".repeat(40);
   const session = { sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
-  /** `plan[i]`: attempt i "ok", "fail" (GitHub rejected it), or "lost" (accepted, response lost). */
-  const flaky = (plan: Array<"ok" | "fail" | "lost">, stuck = false) => {
+  /** `plan[i]`: attempt i "ok", "fail" (GitHub rejected it), "lost" (accepted, response lost), or
+   * "unknown" (accepted, then a GithubWriteError with outcome unknown — e.g. a 502 after creation). */
+  const flaky = (plan: Array<"ok" | "fail" | "lost" | "unknown">, stuck = false, stale = false) => {
     const stored: Array<{ id: number; userLogin: string; body: string; createdAt: string; updatedAt: string }> = [];
     const sleeps: number[] = [];
     let attempts = 0;
@@ -591,13 +592,14 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     const gh = {
       async listPullReviews() { return reviews; },
       async listReviewComments() { return reviews.map((r) => ({ userLogin: BOT, path: "a.ts", commitId: r.commitId, createdAt: r.submittedAt })); },
-      async listIssueComments() { return [...stored]; },
+      async listIssueComments() { return stale ? [] : [...stored]; },
       async createIssueComment(_t: string, o: { body: string }) {
         const outcome = plan[Math.min(attempts++, plan.length - 1)];
         if (outcome === "fail") throw new Error("comment POST 502");
         const at = `2026-02-01T00:00:0${stored.length + 1}Z`;
         stored.push({ id: stored.length + 10, userLogin: BOT, body: o.body, createdAt: at, updatedAt: at });
         if (outcome === "lost") throw new Error("GitHub API timeout");
+        if (outcome === "unknown") throw Object.assign(new Error("GitHub issue comment 502: Bad Gateway"), { name: "GithubWriteError", status: 502, outcome: "unknown" });
         return { id: stored.length + 9 };
       },
     };
@@ -618,6 +620,22 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     const f = flaky(["lost", "ok"]);
     assert.deepEqual(await now(f, 12), { escalated: false });
     assert.equal(f.attempts(), 1, "the retry's scan saw the accepted handoff");
+    assert.equal(f.stored.length, 1);
+  });
+
+  it("an unknown write outcome is never POSTed again, even while the list stays stale", async () => {
+    const f = flaky(["unknown", "ok"], false, true);
+    const r = await now(f, 15);
+    assert.equal(r.escalated, false);
+    assert.match(r.error ?? "", /502/);
+    assert.equal(f.attempts(), 1, "it may have landed: one POST only");
+    assert.equal(f.stored.length, 1);
+  });
+
+  it("an unknown write outcome whose handoff becomes visible resolves without another POST", async () => {
+    const f = flaky(["unknown", "ok"]);
+    assert.deepEqual(await now(f, 16), { escalated: false });
+    assert.equal(f.attempts(), 1);
     assert.equal(f.stored.length, 1);
   });
 

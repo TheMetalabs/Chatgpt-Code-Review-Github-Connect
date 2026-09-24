@@ -690,7 +690,9 @@ export async function createPullReview(
         commitId: String(out.data.commit_id ?? ""),
       };
     }
-    if (comments.length && isReviewLineError(out.text)) {
+    // Drop the inline comments and re-send only after GitHub definitely REFUSED the review for an
+    // anchor (422, nothing created). A 5xx or no response may have created it: never re-send.
+    if (comments.length && out.status === 422 && isReviewLineError(out.text)) {
       comments = [];
       continue;
     }

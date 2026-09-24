@@ -45,6 +45,15 @@ test('createPullReview reports inlineDropped when GitHub refused an inline ancho
   assert.equal(sent[1].comments.length, 0, 'the fallback posts no inline comment at all');
 });
 
+test('createPullReview never re-sends after a 5xx, even when its text reads like an anchor error', async () => {
+  const { api, sent } = githubWith([
+    [502, JSON.stringify({ message: 'Bad Gateway: could not comment' })],
+    [200, JSON.stringify({ id: 9 })],
+  ]);
+  await assert.rejects(api.createPullReview('t', review(inline)), (e) => e.name === 'GithubWriteError' && e.status === 502 && e.outcome === 'unknown');
+  assert.equal(sent.length, 1, 'the review may have been created: no second POST');
+});
+
 test('createPullReview: inlineDropped is false when every inline comment was accepted (or there were none)', async () => {
   const ok = githubWith([[200, JSON.stringify({ id: 7 })]]);
   assert.deepEqual(idAndDrop(await ok.api.createPullReview('t', review(inline))), { id: 7, inlineDropped: false });
@@ -158,5 +167,6 @@ for (const [name, write] of Object.entries(writes)) {
     assert.deepEqual(await failure(write, lostAfterSend), e(0, 'unknown'));
     // accepted, but the body is cut or not JSON: no usable response, and it may have landed
     assert.deepEqual(await failure(write, truncated(201)), e(0, 'unknown'));
+    await assert.rejects(write(replyApi(truncated(201))), (err) => err.cause?.name === 'SyntaxError', 'the parse error is kept as the cause');
   });
 }

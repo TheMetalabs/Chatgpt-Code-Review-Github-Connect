@@ -992,7 +992,8 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   // identity the worker observed itself, the page where the run last answered, else (older pages)
   // the URL that answered. An unpinned run known only on the page the tab was opened on is where
   // its page just proved its sent turn is still the last one: the conversation the provider
-  // assigned since (a review pins only when its answer is complete).
+  // assigned since (a review on a new-chat page pins only on the first conversation page it is
+  // shown on, or once its answer is complete: json.js waitUntilReviewOrQuota).
   if (verdict.unpinned === true || verdict.legacy === true || verdict.legacyReply === true) {
     const identity = state.conversation || answeredPage(state, provider) || (verdict.unpinned === true ? result.url : state.pageUrl);
     const holds = identity ? url => samePage(url, identity) : verdict.legacyReply ? url => url === result.url : url => onAllocationPage(url, provider);

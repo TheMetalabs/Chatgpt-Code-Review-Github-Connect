@@ -230,14 +230,10 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     const now = deps.now();
     for (const item of items.values()) if (live(item) && now >= item.deadlineAt) expire(item.id);
     for (const [id, item] of items) if (!live(item) && now - (item.endedAt ?? now) > FIX_TERMINAL_RETAIN_MS) items.delete(id);
-    let settled = [...items.values()].filter((item) => !live(item)).length;
-    for (const [id, item] of items) {
-      if (settled <= MAX_SETTLED_ITEMS) break;
-      if (!live(item)) {
-        items.delete(id);
-        settled -= 1;
-      }
-    }
+    // Over the cap, forget the items that SETTLED first (endedAt), not the ones created first: a
+    // long-running fix that just completed keeps its lost-ACK replay and its posted state.
+    const settled = [...items.values()].filter((item) => !live(item)).sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0));
+    for (const item of settled.slice(0, Math.max(0, settled.length - MAX_SETTLED_ITEMS))) items.delete(item.id);
   }
 
   function request(req: FixRequest): Promise<string> {

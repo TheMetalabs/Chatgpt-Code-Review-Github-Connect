@@ -255,10 +255,17 @@ test('worker: a started fix whose page is owned only by being blank must still b
   const OPENED = 'https://chatgpt.com/?temporary-chat=true';
   // the run was dispatched (started) but its send is not confirmed: the page answers owned+blank
   const blank = (url) => (_id, m) => (m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', blank: true, url} : {ok: true, canClose: false, reason: 'pending'});
-  const moved = worker([fixJob()], {api: cancelled, handler: blank('https://chatgpt.com/c/other'), url: 'https://chatgpt.com/c/other'});
+  let inventory = null; // what the page reports to the inventory probe
+  const movedHandler = (id, m) => (m.type === 'ashlar-tab-status' && inventory ? inventory : blank('https://chatgpt.com/c/other')(id, m));
+  const moved = worker([fixJob()], {api: cancelled, handler: movedHandler, url: 'https://chatgpt.com/c/other'});
   await moved.tick();
   assert.equal(moved.closedTabs.length, 0, 'an empty conversation the user moved to is preserved');
   assert.deepEqual(moved.local.state.pendingReviewJobs, {}, 'the job still retires');
+  assert.ok(moved.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
+  // the page still reports its binding unreleased (it never handled the preserve): not an orphan
+  inventory = {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: 'https://chatgpt.com/c/other'};
+  await moved.context.refreshTabInventory();await until(() => false, 200);
+  assert.equal((await moved.context.tabCapacityReport({})).orphanTabs, 0, 'the preserved run is released worker-side');
   const plain = worker([fixJob()], {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/'});
   await plain.tick();
   assert.equal(plain.closedTabs.length, 0);

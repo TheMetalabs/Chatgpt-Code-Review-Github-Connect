@@ -424,6 +424,28 @@ describe("bridge fix registry: parallelPrs and ownership", () => {
     void live.promise.catch(() => {});
   });
 
+  it("over the cap, the items that SETTLED first are forgotten, not the ones created first", async () => {
+    const h = harness();
+    h.setLimit(1000);
+    const first = queueAndTake(h, { pr: 100_000 }); // created first, stays live through the burst
+    const ids: string[] = [];
+    for (let pr = 1; pr <= 200; pr++) {
+      h.advance(1);
+      const { promise, offer } = queueAndTake(h, { pr });
+      assert.equal(h.reg.complete(offer.jobId, "chatgpt", `answer ${pr}`, offer.leaseId).ok, true);
+      await promise;
+      ids.push(offer.jobId);
+    }
+    h.advance(1);
+    assert.equal(h.reg.complete(first.offer.jobId, "chatgpt", "LATE", first.offer.leaseId).ok, true); // settles last
+    assert.equal(await first.promise, "LATE");
+    h.reg.counts(); // prune: 201 settled
+    assert.deepEqual(h.reg.state(first.offer.jobId), { active: false, status: "posted" }, "the newest settlement is kept");
+    assert.deepEqual(h.reg.complete(first.offer.jobId, "chatgpt", "LATE", first.offer.leaseId), { ok: true }, "its lost-ACK replay is acknowledged");
+    assert.equal(h.reg.state(ids[0]).status, "cancelled", "the earliest settled item is the one forgotten");
+    assert.equal(h.reg.state(ids[1]).status, "posted");
+  });
+
   it("settled items are forgotten after the retention window", async () => {
     const h = harness();
     const { promise, offer } = queueAndTake(h);

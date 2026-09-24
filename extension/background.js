@@ -726,15 +726,24 @@ function onAllocationPage(url, provider) {
 /** How long a cancelled fix tab whose ownership is "unknown" is re-asked before it is preserved. */
 const FIX_OWNERSHIP_WAIT_MS = 2 * 60_000;
 
-/** Ask again next tick until FIX_OWNERSHIP_WAIT_MS has passed, then preserve the tab (after
- * `beforePreserve`) so the job retires. */
-async function waitOrPreserveFixTab(job, provider, jobs, reason, beforePreserve) {
+/** The one exit for a fix tab Ashlar keeps open (taken over, moved, unidentifiable, stuck
+ * loading): the page is asked to free its managed slot when it can be messaged (`tab`), and the
+ * worker records the preserved run as a backstop (the page may never answer), so the retained
+ * binding is never counted as an orphan against tab capacity. Then the job retires. */
+async function preserveFixTab(job, provider, jobs, reason, tab) {
+  const state = job.states[provider];
+  if (tab) await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider)).catch(() => {});
+  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: true});
+  return finishTabCleanup(job, provider, jobs, reason);
+}
+
+/** Ask again next tick until FIX_OWNERSHIP_WAIT_MS has passed, then preserve the tab so the job
+ * retires (`tab` omitted: the page cannot be messaged, e.g. still loading). */
+async function waitOrPreserveFixTab(job, provider, jobs, reason, tab) {
   const state = job.states[provider];
   state.ownershipUnknownAt ??= Date.now();
   if (Date.now() - state.ownershipUnknownAt < FIX_OWNERSHIP_WAIT_MS) return saveJobs(jobs);
-  await beforePreserve?.().catch(() => {}); // the page may never answer: the marker below still holds
-  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: true});
-  return finishTabCleanup(job, provider, jobs, reason);
+  return preserveFixTab(job, provider, jobs, reason, tab);
 }
 
 async function forceCloseFixTab(job, provider, jobs, tab) {
@@ -753,15 +762,13 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   if (result.ownership === "unknown") {
     // Not identifiable yet (a reload still rendering the sent turn): ask again next tick. Past the
     // wait, preserve it (never close what might be the user's) and have the page free its slot.
-    return waitOrPreserveFixTab(job, provider, jobs, "fix tab ownership could not be established; tab preserved", async () => {
-      await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider));
-    });
+    return waitOrPreserveFixTab(job, provider, jobs, "fix tab ownership could not be established; tab preserved", tab);
   }
-  if (result.owned !== true) return finishTabCleanup(job, provider, jobs, "user took over the fix tab; tab preserved");
+  if (result.owned !== true) return preserveFixTab(job, provider, jobs, "user took over the fix tab; tab preserved", tab);
   // A verdict resting on a blank page (unsent, or started but not confirmed sent) is Ashlar's only
   // while it is still the page this fix opened: one navigated to another conversation (even an
   // empty one) is the user's. (A fresh blank chat in the same tab holds nothing of the user's.)
-  if ((unbound || result.blank === true) && !onAllocationPage(result.url, provider)) return finishTabCleanup(job, provider, jobs, "the unsent fix tab moved to another page; tab preserved");
+  if ((unbound || result.blank === true) && !onAllocationPage(result.url, provider)) return preserveFixTab(job, provider, jobs, "the unsent fix tab moved to another page; tab preserved", tab);
   await closeProvenTab(job, provider, jobs, tab.id, result.url, "fix cancelled; tab closed");
 }
 

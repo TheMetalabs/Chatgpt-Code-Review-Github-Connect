@@ -334,9 +334,10 @@ export type ThreadRoot = { id: number; path: string; line?: number; body: string
 const threadKey = (path: string, line: number | undefined, body: string) => JSON.stringify([path, line ?? null, body]);
 
 /** Map each posted finding to its live thread root by (file, line, body): two findings on
- * different lines can render the same body. GitHub may drop comments it cannot anchor — those get
- * no reply. A finding id or thread key two posted comments share cannot say which thread is whose:
- * those get no reply either and count as unroutable (failed). */
+ * different lines can render the same body. A comment with no matching root, or a finding id or
+ * thread key two posted comments share (which thread is whose is unknowable), gets no reply and
+ * counts as unroutable (failed). (A review whose inline comments GitHub refused posts none:
+ * posted.comments is then empty, see loopPostedReview.) */
 function mapFindingThreads(
   posted: PostedLoopReview["comments"],
   roots: readonly ThreadRoot[],
@@ -353,7 +354,10 @@ function mapFindingThreads(
       continue;
     }
     const root = roots.find((r) => !used.has(r.id) && threadKey(r.path, r.line, r.body) === keyOf(c));
-    if (!root) continue;
+    if (!root) {
+      unroutable += 1; // a posted inline finding with no live thread still owes a reply: failed
+      continue;
+    }
     used.add(root.id);
     threads.set(c.findingId, root.id);
   }
@@ -926,6 +930,7 @@ export async function runPostReviewLoop(
           baseCommitSha: headSha,
           message: `fix: apply ashlar review (PR #${pr}, ${headSha.slice(0, 7)})`,
           allowedPaths: files.map((f) => f.path),
+          findingCount: findings.length,
         },
       );
       trace(job.id, "fix-result", { attempt: attempts, outcome: res.outcome, ms: Date.now() - t0, error: res.error });

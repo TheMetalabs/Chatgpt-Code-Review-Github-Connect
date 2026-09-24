@@ -122,7 +122,9 @@ function looksTruncated(content: string): boolean {
  * { ok: false, error } on any anomaly (unparseable, no files, unsafe path, empty/truncated
  * content) so the caller can fall back rather than push a bad tree.
  */
-export function parseFixResponse(raw: string): FixParse {
+/** `findingCount`: the findings the prompt listed (F1..Fn). A no-change response must then give
+ * every one of them exactly one pushback / decline / defer disposition. */
+export function parseFixResponse(raw: string, opts: { findingCount?: number } = {}): FixParse {
   const json = lastJsonObject(String(raw ?? ""), isFixObject);
   if (!json) return { ok: false, error: "no fix JSON object found (deterministic path; caller may json-repair)" };
   const parsed: unknown = JSON.parse(json); // lastJsonObject only returns a slice that already parsed
@@ -142,6 +144,11 @@ export function parseFixResponse(raw: string): FixParse {
     if (summaryRaw.trim().length === 0) return { ok: false, error: "empty response (no files, no rationale)" };
     const claimed = dispositions.filter((d) => d.action === "fixed").map((d) => d.finding);
     if (claimed.length) return { ok: false, error: `no files changed, yet ${claimed.join(", ")} marked fixed` };
+    // Every finding must be classified (a dropped malformed entry counts as missing): an incomplete
+    // no-change response is malformed and retried, never a terminal fix-declined handoff.
+    const given = new Set(dispositions.map((d) => d.finding));
+    const missing = Array.from({ length: opts.findingCount ?? 0 }, (_, i) => `F${i + 1}`).filter((id) => !given.has(id));
+    if (missing.length) return { ok: false, error: `no-change response has no valid disposition for ${missing.join(", ")}` };
     return { ok: true, fix: { summary: summaryRaw, files: [], dispositions } };
   }
   const seen = new Set<string>();

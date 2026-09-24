@@ -113,6 +113,8 @@ export async function runFixRound(
     /** The ONLY paths the fix may touch (the in-scope files). Out-of-scope paths are rejected
      * before any blob is created — a fix must not edit e.g. .github/workflows/*. */
     allowedPaths: string[];
+    /** Findings the prompt listed (F1..Fn): a no-change answer must classify every one. */
+    findingCount?: number;
   },
 ): Promise<FixRoundResult> {
   // A provider transport failure returns a structured result so the orchestrator can fall
@@ -123,7 +125,7 @@ export async function runFixRound(
   } catch (e) {
     return { ok: false, outcome: "request-failed", error: (e as Error)?.message ?? String(e) };
   }
-  const parsed = parseFixResponse(raw);
+  const parsed = parseFixResponse(raw, { findingCount: opts.findingCount });
   if (!parsed.ok) return { ok: false, outcome: "parse-failed", error: parsed.error };
 
   // A valid no-change round (every finding pushed-back / declined / deferred): nothing to commit.

@@ -37,6 +37,18 @@ describe("parseFixResponse", () => {
     assert.match(err('{"files":[]}'), /no rationale/);
   });
 
+  it("a no-change round must classify EVERY listed finding (missing or malformed entries are retried)", () => {
+    const parse = (dispositions: string) => parseFixResponse(`{"summary":"nothing to change","files":[],"dispositions":${dispositions}}`, { findingCount: 2 });
+    const errOf = (r: ReturnType<typeof parse>) => (r.ok ? "" : r.error);
+    assert.match(errOf(parse("[]")), /no valid disposition for F1, F2/);
+    assert.match(errOf(parse('[{"finding":"F1","action":"pushback","note":"n"}]')), /no valid disposition for F2$/);
+    assert.match(errOf(parse('[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"bogus"}]')), /no valid disposition for F2$/);
+    const full = parse('[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"defer","note":"#88"}]');
+    assert.ok(full.ok && full.fix.dispositions.length === 2);
+    // without a count (a caller that lists no findings) only the summary + no-"fixed" rules apply
+    assert.equal(parseFixResponse('{"summary":"s","files":[]}').ok, true);
+  });
+
   it("rejects a no-change round that marks a finding fixed (nothing changed, so nothing was fixed)", () => {
     const fixedNoFiles = '{"summary":"done","files":[],"dispositions":[{"finding":"F1","action":"fixed","note":"done"},{"finding":"F2","action":"pushback","note":"n"}]}';
     assert.match(err(fixedNoFiles), /no files changed, yet F1 marked fixed/);

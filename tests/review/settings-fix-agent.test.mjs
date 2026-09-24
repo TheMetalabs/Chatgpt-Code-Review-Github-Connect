@@ -5,38 +5,8 @@
 // neither changes the live settings.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {loadTs, types} from './load-source.mjs';
-import {sanitizeBotSettings} from '../../src/lib/settings.server.ts';
-import {SettingsError, validatedSettingsPatch} from '../../src/lib/settings-rules.ts';
-import {normalizeChatgptReasoning, normalizeGrokReasoning} from '../../src/lib/reasoning.ts';
-
-function harness() {
-  const state = {settings: sanitizeBotSettings({}), persistFails: false};
-  const saves = [];
-  const publicSettings = s => ({...s, webhookSecret: '', localLlmApiKey: ''});
-  const {Route} = loadTs('src/routes/api/harbor.ts', {
-    ...types,
-    createFileRoute: () => config => config,
-    getHarbor: () => ({...state, jobs: [], events: [], reviews: []}),
-    // patchHarborSettings' contract: validate the merged document (the production rules), sanitize,
-    // persist (the JSON store must be written, else SettingsError 500), THEN swap the live state.
-    patchHarborSettings: patch => {
-      const next = sanitizeBotSettings(validatedSettingsPatch(state.settings, patch));
-      if (state.persistFails) throw new SettingsError('could not save settings: .data/ashlar-settings.json is not writable (ENOTDIR); nothing was changed', 500);
-      saves.push(next);
-      state.settings = next;
-      return next;
-    },
-    publicSettings, publicJobs: j => j, publicReviews: r => r,
-    githubStatus: () => ({}), getBridgePublic: () => ({}), reviewHistory: () => ({health: () => ({ok: true})}),
-    normalizeChatgptReasoning, normalizeGrokReasoning,
-  });
-  const post = body => Route.server.handlers.POST({request: new Request('http://ashlar.test/api/harbor', {
-    method: 'POST', headers: {origin: 'http://ashlar.test', 'content-type': 'application/json'}, body: JSON.stringify({action: 'settings', ...body}),
-  })});
-  const get = async () => (await (await Route.server.handlers.GET()).json()).settings;
-  return {state, saves, post, get};
-}
+import {types} from './load-source.mjs';
+import {settingsHarness as harness} from './settings-harness.mjs';
 
 test('fixAgent round-trips through the Settings API and is live at once', async () => {
   const h = harness();

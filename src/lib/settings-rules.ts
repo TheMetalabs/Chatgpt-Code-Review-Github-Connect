@@ -107,8 +107,64 @@ export function fixLoopOn(fix: Partial<FixAgentSettings> | undefined): boolean {
   return fix?.enabled === true && fixLoopRunnable(fix as FixAgentSettings);
 }
 
+/** How a whole-number setting is edited on the Settings screen. "minutes": stored in ms, edited
+ * in minutes. */
+export type FormUnit = "count" | "minutes" | "chars";
+
+export const MS_PER_MINUTE = 60_000;
+
+/** A whole-number setting's ONE validity domain: an integer in [min, max] (ms for a "minutes"
+ * field). The same domain holds at every boundary: the env seed and load normalize into it
+ * (fixKnob / sanitizeBotSettings), and an API save and a UI save are validated against it (this
+ * module), so a value one layer stores is a value every other layer accepts. */
+export interface IntDomain {
+  min: number;
+  max: number;
+  unit: FormUnit;
+}
+
+/** The input a Settings field renders, derived from its domain (never written by hand in the
+ * page): min / max in form units, and the step. A "minutes" input takes ANY number of minutes
+ * (step "any") because a server-valid value need not be a whole minute (90000 ms = 1.5 min); the
+ * page's own check (the shared rules below) then requires the ms value to be whole. Every other
+ * field steps by 1 (whole numbers only, the same as the server). */
+export interface FormInputAttrs {
+  min: number;
+  max: number;
+  step: number | "any";
+  unit: FormUnit;
+}
+
+export function formAttrs(d: IntDomain): FormInputAttrs {
+  return { min: toForm(d.unit, d.min), max: toForm(d.unit, d.max), step: d.unit === "minutes" ? "any" : 1, unit: d.unit };
+}
+
+/** Stored value -> the value the input shows. */
+export function toForm(unit: FormUnit, v: number): number {
+  return unit === "minutes" ? v / MS_PER_MINUTE : v;
+}
+
+/** The input's value -> the stored value. Minutes -> ms is EXACT for every whole-ms value: the
+ * float noise of the conversion (1.0000166666666666 min x 60000) is rounded away, but a value
+ * that is not a whole number of ms (1.00001 min) stays fractional, so the shared rule rejects it
+ * exactly as the server would. NaN (an empty input) stays NaN (rejected). */
+export function fromForm(unit: FormUnit, v: number): number {
+  if (unit !== "minutes") return v;
+  const ms = v * MS_PER_MINUTE;
+  const whole = Math.round(ms);
+  return Math.abs(ms - whole) < 1e-6 ? whole : ms;
+}
+
+/** Why `v` is outside the domain (null = valid). */
+export function intProblem(label: string, d: IntDomain, v: unknown): string | null {
+  if (typeof v === "number" && Number.isInteger(v) && v >= d.min && v <= d.max) return null;
+  return d.unit === "minutes"
+    ? `${label} must be a whole number of milliseconds, from ${toForm(d.unit, d.min)} to ${toForm(d.unit, d.max)} minutes`
+    : `${label} must be a whole number from ${d.min} to ${d.max}`;
+}
+
 /** Numeric fix-agent fields as the Settings screen shows them (ms values are edited in minutes). */
-export const FIX_KNOB_FIELDS: readonly { key: FixAgentKnob; label: string; unit: "count" | "minutes" | "chars" }[] = [
+export const FIX_KNOB_FIELDS: readonly { key: FixAgentKnob; label: string; unit: FormUnit }[] = [
   { key: "parallelPrs", label: "fix_agent.parallel_prs", unit: "count" },
   { key: "roundCap", label: "fix_agent.round_cap", unit: "count" },
   { key: "attempts", label: "fix_agent.attempts", unit: "count" },
@@ -118,12 +174,18 @@ export const FIX_KNOB_FIELDS: readonly { key: FixAgentKnob; label: string; unit:
   { key: "chatMaxPromptChars", label: "fix_agent.chat_max_prompt_chars", unit: "chars" },
 ];
 
+/** A fix-agent knob's domain (bounds from FIX_AGENT_KNOBS, the runtime's own clamp). */
+export function fixKnobDomain(key: FixAgentKnob): IntDomain {
+  const k = FIX_AGENT_KNOBS[key];
+  return { min: k.min, max: k.max, unit: FIX_KNOB_FIELDS.find((f) => f.key === key)?.unit ?? "count" };
+}
+
 export function toFormUnit(key: FixAgentKnob, v: number): number {
-  return FIX_KNOB_FIELDS.find((f) => f.key === key)?.unit === "minutes" ? v / 60_000 : v;
+  return toForm(fixKnobDomain(key).unit, v);
 }
 
 export function fromFormUnit(key: FixAgentKnob, v: number): number {
-  return FIX_KNOB_FIELDS.find((f) => f.key === key)?.unit === "minutes" ? v * 60_000 : v;
+  return fromForm(fixKnobDomain(key).unit, v);
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === "object" && !Array.isArray(v);
@@ -143,10 +205,8 @@ export function fixAgentProblem(raw: unknown): string | null {
   for (const f of FIX_KNOB_FIELDS) {
     const v = raw[f.key];
     if (v === undefined) continue;
-    const k = FIX_AGENT_KNOBS[f.key];
-    if (typeof v !== "number" || !Number.isInteger(v) || v < k.min || v > k.max) {
-      return `${f.label} must be a whole number from ${toFormUnit(f.key, k.min)} to ${toFormUnit(f.key, k.max)}`;
-    }
+    const problem = intProblem(f.label, fixKnobDomain(f.key), v);
+    if (problem) return problem;
   }
   const provider = (raw.provider ?? null) as FixAgentProvider | null;
   const delivery = (raw.delivery ?? "script-apply") as FixDelivery;

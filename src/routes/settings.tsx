@@ -18,10 +18,12 @@ import {
   WIRED_FIX_DELIVERIES,
   WIRED_FIX_PROVIDERS,
   fixAgentProblem,
+  fixKnobDomain,
   fixLoopOn,
-  fromFormUnit,
+  formAttrs,
+  fromForm,
   settingsProblem,
-  toFormUnit,
+  toForm,
 } from "@/lib/settings-rules";
 import type {
   BotSettings,
@@ -73,6 +75,11 @@ const FIX_PROVIDER_LABEL: Record<FixAgentProvider, string> = {
   "coding-agent": "coding-agent (not wired)",
 };
 
+
+/** A numeric draft value as an input value: an emptied input (NaN) stays empty, not "NaN". */
+function formValue(v: number): number | "" {
+  return Number.isFinite(v) ? v : "";
+}
 
 function replaceMasked(current: string, next: string): string {
   if (!isMaskedSecret(current)) return next;
@@ -891,20 +898,22 @@ function FixAgentSection({ fix, onChange }: { fix: FixAgentSettings; onChange: (
       </div>
       <div className="grid gap-4 sm:grid-cols-2">
         {FIX_KNOB_FIELDS.map((f) => {
-          const k = FIX_AGENT_KNOBS[f.key];
+          // min / max / step and the unit conversion come from the shared domain (settings-rules),
+          // so the input represents every value the server accepts (e.g. 90000 ms = 1.5 min).
+          const attrs = formAttrs(fixKnobDomain(f.key));
           return (
             <Field key={f.key} label={f.label}>
               <input
                 type="number"
-                min={toFormUnit(f.key, k.min)}
-                max={toFormUnit(f.key, k.max)}
-                step={1}
-                value={toFormUnit(f.key, fix[f.key])}
-                onChange={(e) => onChange({ [f.key]: fromFormUnit(f.key, e.target.valueAsNumber) })}
+                min={attrs.min}
+                max={attrs.max}
+                step={attrs.step}
+                value={formValue(toForm(attrs.unit, fix[f.key]))}
+                onChange={(e) => onChange({ [f.key]: fromForm(attrs.unit, e.target.valueAsNumber) })}
                 className="h-11 w-full rounded-md border border-line bg-bg px-3 text-sm outline-none"
               />
               <span className="mt-1 block text-[11px] text-fg-subtle">
-                {FIX_KNOB_HINT[f.key]} ({toFormUnit(f.key, k.min)}–{toFormUnit(f.key, k.max)}, default {toFormUnit(f.key, k.def)})
+                {FIX_KNOB_HINT[f.key]} ({attrs.min}–{attrs.max}, default {toForm(attrs.unit, FIX_AGENT_KNOBS[f.key].def)})
               </span>
             </Field>
           );

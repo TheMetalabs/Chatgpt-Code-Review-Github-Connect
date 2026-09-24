@@ -43,6 +43,7 @@ import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { retryWrite, type WriteRetryResult } from "./write-retry.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
+import { sameStart } from "./review-loop-control.ts";
 import {
   CURRENT_ROUND_MISSING,
   ESCALATE_IN_FLIGHT,
@@ -1149,11 +1150,6 @@ export async function continueLoopOnPush(
   } catch (e) {
     return { posted: false, reason: `continue on push failed: ${(e as Error)?.message ?? String(e)}` };
   }
-}
-
-/** Same recorded start: requester, directive time (as an instant) and mode. */
-function sameStart(a: { mode: string; by: string; at: string } | null, b: { mode: string; by: string; at: string }): boolean {
-  return !!a && a.mode === b.mode && a.by.toLowerCase() === b.by.toLowerCase() && isoMs(a.at) === isoMs(b.at);
 }
 
 /**

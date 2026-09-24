@@ -34,10 +34,14 @@ import {
 } from "./review-loop.ts";
 import { deriveLoopSession, type LoopEvent, type LoopSession } from "./review-loop-session.ts";
 import { retryWrite } from "./write-retry.ts";
+import { controlInSession, inSession } from "./review-loop-control.ts";
 
 // Single source of the App identity lives in review-loop.ts (shared with the webhook parser's
 // self-trigger guard); re-exported here for existing engine callers.
 export { DEFAULT_ASHLAR_BOT_LOGIN };
+// The session-scoping rule of a control comment lives with the control writes; re-exported for
+// existing engine callers.
+export { controlInSession };
 
 export interface ReviewLoopGithub {
   listPullReviews(
@@ -71,24 +75,6 @@ export interface ReviewLoopGithub {
 
 function isBot(login: string, botLogin: string): boolean {
   return isSelfLogin(login, botLogin);
-}
-
-/** In-session test for a REVIEW row (a round): strictly after the anchor, compared as instants.
- * The anchor is the start directive's time and a review it requested lands minutes later; a
- * review in the anchor's own second belongs to what came before. A row whose timestamp is missing
- * or unparseable cannot be proven in-session and is excluded. */
-function inSession(at: string | null | undefined, sinceMs: number): boolean {
-  if (Number.isNaN(sinceMs)) return true; // no anchor: the whole history
-  const t = isoMs(at);
-  return !Number.isNaN(t) && t > sinceMs;
-}
-
-/** In-session test for one of the session's own CONTROL comments (handoff, continuation): posted
- * after the session's start record — by comment id when known (exact; timestamps tie within a
- * second, e.g. the last session's handoff and this session's start), else strictly by time. */
-export function controlInSession(c: { id?: number; createdAt?: string }, since: { iso?: string; seq?: number }): boolean {
-  if (since.seq !== undefined && c.id) return c.id > since.seq;
-  return inSession(c.createdAt, isoMs(since.iso));
 }
 
 /**

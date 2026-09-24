@@ -9,12 +9,15 @@ const OWNED_PREFIX = "ashlar:tab:";
 // and completes the release handshake as soon as the page can answer (see completePreservedRelease).
 const PRESERVED_PREFIX = "ashlar:preserved:";
 const preservedKey = (jobId, provider, runId) => `${PRESERVED_PREFIX}${jobId}:${provider}:${runId || "legacy"}`;
-// Fix deliveries this profile opened a tab for: {jobId: {deliveryId, at}}. The server's offer names
-// its delivery (a fresh hand-out mints it; a lost-take replay repeats it, bridge-fix.server.ts), and
-// the worker opens at most ONE tab per jobId + deliveryId: the record is written before the tab is
-// created and outlives the job registry (a hard reset or a lost registry), so a replayed delivery
-// whose tab may already hold the run is never submitted a second time (recovery resumes that tab).
-// Kept longer than the longest fix deadline (6 h), dropped when the job retires.
+// Fix deliveries this profile opened a tab for: {jobId: {deliveryId, at, provider, phase, tabId}}.
+// The server's offer names its delivery (a fresh hand-out mints it; a lost-take replay repeats it,
+// bridge-fix.server.ts), and the worker opens at most ONE tab per jobId + deliveryId. Two phases: a
+// `creating` record (the intent) is written before chrome.tabs.create and promoted to `created`
+// with the tabId once the tab exists. The record outlives the job registry (a hard reset or a lost
+// registry): only a record a tab still proves (reconcileFixDeliveries) keeps a replayed delivery out,
+// so a delivery whose tab may already hold the run is never submitted a second time (recovery
+// resumes that tab), and an intent that never became a tab never strands it. Kept longer than the
+// longest fix deadline (6 h), dropped when the job retires.
 const FIX_DELIVERIES_KEY = "ashlar:fixDeliveries";
 const FIX_DELIVERY_RETAIN_MS = 7 * 60 * 60 * 1000;
 const DEFAULT_MAX_REVIEW_TABS = 4;
@@ -619,7 +622,8 @@ async function maintenanceState() {
 }
 async function maintenanceHeld() { return Boolean(await maintenanceState()); }
 
-/** The fix deliveries this profile opened a tab for (see FIX_DELIVERIES_KEY), expired ones dropped. */
+/** The fix deliveries this profile opened (or began opening) a tab for (see FIX_DELIVERIES_KEY),
+ * expired ones dropped. A record is {deliveryId, at, provider, phase: "creating" | "created", tabId}. */
 async function fixDeliveries() {
   const stored = (await chrome.storage.local.get([FIX_DELIVERIES_KEY]))[FIX_DELIVERIES_KEY];
   const now = Date.now();
@@ -635,16 +639,69 @@ function updateFixDeliveries(change) {
   });
 }
 
-/** Durably record a fix delivery BEFORE its tab is created (a worker that stops in between only
- * skips a replay of it; it never opens a second tab). */
-function rememberFixDelivery(job) {
+/** Phase 1 of a fix delivery record, written BEFORE its tab is created: `creating` is an intent,
+ * never proof that a tab exists (reconcileFixDeliveries clears it unless a tab or binding proves it). */
+function beginFixDelivery(job, provider) {
   if (job.kind !== "fix" || typeof job.deliveryId !== "string" || !job.deliveryId) return Promise.resolve();
-  return updateFixDeliveries(all => { all[job.jobId] = {deliveryId: job.deliveryId, at: Date.now()}; });
+  return updateFixDeliveries(all => { all[job.jobId] = {deliveryId: job.deliveryId, provider, phase: "creating", at: Date.now()}; });
+}
+
+/** Phase 2, written only after chrome.tabs.create returned the tab and its owned-tab record is
+ * stored: `created`, naming that tab. */
+function promoteFixDelivery(job, provider, tabId) {
+  if (job.kind !== "fix" || typeof job.deliveryId !== "string" || !job.deliveryId) return Promise.resolve();
+  return updateFixDeliveries(all => {
+    all[job.jobId] = {deliveryId: job.deliveryId, provider, phase: "created", tabId, at: all[job.jobId]?.at ?? Date.now()};
+  });
 }
 
 function forgetFixDelivery(job) {
   if (job.kind !== "fix") return Promise.resolve();
   return updateFixDeliveries(all => { delete all[job.jobId]; });
+}
+
+/** The fix deliveries that locally PROVE a tab: what admission lists in excludeJobIds and never
+ * opens again. A record of a job this worker still holds is its own allocation (the registry's
+ * allocation journal decides it; the job is excluded anyway). Any other record counts only while a
+ * tab proves it: its `created` tab is still live on the provider, or a tab still carries the job's
+ * binding (the session's owned-tab record, or the tab inventory); a `creating` record proven that way
+ * (the worker stopped after the create, before the promotion) is promoted. A record nothing proves
+ * (the worker stopped or was reset between the intent and chrome.tabs.create, or its tab is gone) is
+ * cleared, so the server replays that delivery and it is opened once, instead of an intent that
+ * never became a tab stranding the fix until its deadline. */
+async function reconcileFixDeliveries(jobs) {
+  const records = await fixDeliveries();
+  if (!Object.keys(records).length) return records;
+  const tabs = await chrome.tabs.query({}), live = new Map(tabs.map(tab => [tab.id, tab]));
+  const session = await chrome.storage.session.get(null);
+  const onProvider = (tab, provider) => Boolean(tab) && (!provider || allowedTab(tab, provider));
+  const boundTab = (jobId, provider) => {
+    for (const [key, value] of Object.entries(session)) {
+      const tab = key.startsWith(OWNED_PREFIX) && value?.jobId === jobId ? live.get(Number(key.slice(OWNED_PREFIX.length))) : undefined;
+      if (onProvider(tab, provider)) return tab.id;
+    }
+    return tabs.find(tab => knownTabOwner(tab)?.jobId === jobId && onProvider(tab, provider))?.id;
+  };
+  const proven = {}, rewrite = {};
+  for (const [jobId, record] of Object.entries(records)) {
+    if (jobs[jobId]) { proven[jobId] = record; continue; }
+    const createdTab = record.phase === "created" ? live.get(record.tabId) : undefined;
+    const tabId = onProvider(createdTab, record.provider) ? createdTab.id : boundTab(jobId, record.provider);
+    if (!tabId) { rewrite[jobId] = null; continue; }
+    proven[jobId] = {...record, phase: "created", tabId};
+    if (record.phase !== "created" || record.tabId !== tabId) rewrite[jobId] = proven[jobId];
+  }
+  if (Object.keys(rewrite).length) {
+    // Only a record still exactly as it was read is rewritten (a concurrent write wins).
+    const same = (a, b) => a?.deliveryId === b.deliveryId && a.at === b.at && a.phase === b.phase && a.tabId === b.tabId;
+    await updateFixDeliveries(all => {
+      for (const [jobId, next] of Object.entries(rewrite)) {
+        if (!same(all[jobId], records[jobId])) continue;
+        if (next) all[jobId] = next; else delete all[jobId];
+      }
+    });
+  }
+  return proven;
 }
 
 async function allocateProviderTab(job, provider, jobs) {
@@ -655,17 +712,23 @@ async function allocateProviderTab(job, provider, jobs) {
     state.allocating = true;
     try { await saveJobs(jobs); }
     catch (error) { delete state.allocating; throw error; } // No create was attempted.
-    try { await rememberFixDelivery(job); }
+    try { await beginFixDelivery(job, provider); }
     catch (error) { delete state.allocating; await saveJobs(jobs).catch(() => {}); throw error; } // No create was attempted.
     try {
       const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
       state.tabId = created.id;
       workerStep(job,provider,"tab_created");
       await rememberOwnedTab(job, provider);
+      // The delivery record says `created` only now that the tab exists and carries its owned record.
+      // A failed promotion is not fatal: that owned record proves the tab (reconcileFixDeliveries).
+      await promoteFixDelivery(job, provider, created.id).catch(() => {});
       delete state.allocating;
       await saveJobs(jobs); // Durable binding before any prompt dispatch.
     } catch (error) {
-      if (!state.tabId) { delete state.allocating; await saveJobs(jobs); }
+      if (!state.tabId) {
+        delete state.allocating; await saveJobs(jobs);
+        await forgetFixDelivery(job).catch(() => {}); // the create failed: no tab holds this delivery
+      }
       throw error;
     }
   });
@@ -810,11 +873,12 @@ function answeredPage(state, provider) {
   return state.pageUrl && !onAllocationPage(state.pageUrl, provider) ? state.pageUrl : "";
 }
 
-/** Keep the conversation a run (review or fix) was bound in, as its page pinned it in the
- * submission journal when the sent turn was first proven exact: stored ONCE and never replaced (no
- * location-based upgrade: a later URL is no evidence of whose conversation it is), so a later reply
- * (or the tab's URL) is compared with it, never with a URL echoed by the same reply. True if it was
- * stored now. */
+/** Keep the conversation a run (review or fix) was bound in, as its page recorded it in the
+ * submission journal: a fix (and a review sent on a conversation page) when its send was proven
+ * (composer.js submissionConfirmed), a review sent on a new chat where the provider put it (json.js
+ * pinNewChatReview). Stored ONCE and never replaced (no location-based upgrade: a later URL is no
+ * evidence of whose conversation it is), so a later reply (or the tab's URL) is compared with it,
+ * never with a URL echoed by the same reply. True if it was stored now. */
 function adoptFixConversation(state, result) {
   const seen = typeof result?.conversation === "string" && result.conversation.length <= 4096 ? result.conversation : "";
   if (!seen || state.conversation) return false;
@@ -907,18 +971,24 @@ function tabVerdict(result, kind) {
   return {...result, ownership: result?.reason === "repurposed" ? "takenOver" : "unknown"};
 }
 
-/** The one release exit for a settled leg's tab (#82): a leg whose result is secured asks
- * "ashlar-can-close"; an abandoned leg (abandonedLeg: cancelled or forgotten, either kind) asks
- * "ashlar-fix-cancel", which also stops its run, even while it is still generating. Both get
- * the page's ownership verdict (json.js fixTabOwnership): the tab is closed unless the user
- * positively took it over (then preserved and released), and preserved after FIX_OWNERSHIP_WAIT_MS
- * when ownership cannot be proven: never held forever, never closed on a guess. A tab that carries
- * another binding is never closed nor told to release. */
+/** The one release exit for a settled leg's tab (#82): a leg whose answer was collected asks
+ * "ashlar-can-close"; an abandoned leg with nothing collected (abandonedLeg: cancelled or
+ * forgotten, either kind) asks "ashlar-fix-cancel", which also stops its run, even while it is
+ * still generating. Both get the page's ownership verdict (json.js tabOwnership): the tab is closed
+ * unless the user positively took it over (then preserved and released), and preserved after
+ * FIX_OWNERSHIP_WAIT_MS when ownership cannot be proven: never held forever, never closed on a
+ * guess. A tab that carries another binding is never closed nor told to release. */
 async function forceCloseFixTab(job, provider, jobs, tab) {
   const state = job.states[provider];
-  // A fix whose run failed (quota, an error) has no answer to show for it either: its page is asked
-  // with the cancel exit too (it also stops whatever that run still does).
-  const cancelled = abandonedLeg(job, state) || (job.kind === "fix" && state.outcome?.ok !== true);
+  // The exit is chosen by LOCAL proof only, never by server status (#77, Ashlar 4097631101): a leg
+  // whose page handed over its answer (state.outcome.ok; `rejectedRaw` for one the server rejected
+  // with 400; a review's durably archived original) asks can-close whatever the server reports
+  // (cancelled: settled, superseded, or forgotten by a restart or a prune). Only a leg with nothing
+  // collected takes the cancel exit, which also stops whatever its run still does: an abandoned
+  // leg, or a fix whose run failed (quota, an error). Both exits get the same verdict, and it
+  // compares nothing about the answer (#82: ChatGPT keeps redrawing a finished one).
+  const collected = state.outcome?.ok === true || typeof state.rejectedRaw === "string" || sourceArchiveDurable(state);
+  const cancelled = !collected && (abandonedLeg(job, state) || (job.kind === "fix" && state.outcome?.ok !== true));
   if (tab.discarded === true || tab.status === "unloaded") return releaseDiscardedTab(job, provider, jobs, tab);
   if (tab.status && tab.status !== "complete") {
     // A loading tab cannot answer for itself yet: asked again next tick.
@@ -965,8 +1035,13 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   const verdict = tabVerdict(result, job.kind);
   if (verdict.ownership === "unknown") {
     // Another conversation than the one the run was bound in (an in-page move can leave the old DOM
-    // on screen): the user's, and waiting cannot change a pinned identity.
+    // on screen): the user's, and waiting cannot change a recorded identity.
     if (verdict.identity === "changed") return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
+    // The page never recorded the conversation its send was made in (a fix journal from before that
+    // rule, or a send confirmed only after a reload): it is recorded only when the send is proven,
+    // so waiting cannot establish it. Never closed; preserved now. (Only a fix page reports this: a
+    // review without a pinned conversation answers `unpinned`, see json.js tabOwnership.)
+    if (verdict.identity === "unestablished") return preserveFixTab(job, provider, jobs, "the conversation was never identified at send; tab preserved", tab, "ownership_unknown");
     // Not provable yet (a reload still rendering, an unreadable journal): ask again next tick; past
     // the wait, preserve it (never close what might be the user's) and have the page free its slot.
     cleanupWaiting(job, provider, "ownership_unknown");
@@ -1107,13 +1182,23 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       const original = await findOriginalTab(job, provider);
       if (original) { state.tabId = original.id; state.started = true; }
     }
-    if (!state.tabId) {
+    if (!state.tabId && job.kind === "fix" && (await fixDeliveries())[job.jobId]?.phase !== "created") {
+      // A fix allocation intent that never became a proven tab (no owned record, no bound page, and
+      // its delivery record never reached `created`: the worker stopped between the intent and
+      // chrome.tabs.create) is cleared, and the allocation below opens the tab once. Keeping the
+      // intent would strand the fix until its deadline. (A review keeps its intent, as before.)
+      delete state.allocating;
+      delete state.connectionError;
+      await saveJobs(jobs);
+      await forgetFixDelivery(job);
+    } else if (!state.tabId) {
       state.connectionError = "tab creation outcome unknown; original allocation preserved";
       await saveJobs(jobs);
       return;
+    } else {
+      delete state.allocating;
+      await saveJobs(jobs);
     }
-    delete state.allocating;
-    await saveJobs(jobs);
   }
   if (!state.tabId && (state.started || job.resumeProviders?.includes(provider))) {
     const original = await findOriginalTab(job, provider);
@@ -1878,9 +1963,10 @@ function admitJob(cfg, jobs) {
     await recordWorkerStatus(jobs, cfg.origin, "polling");
     // One take in flight per origin: this lane (singleFlight on admissionLanes, and tickBody never
     // queues a second waiter) serializes every admission trigger of this worker (alarm, interval,
-    // poll-now). A fix delivery this profile already opened a tab for is listed too, so the server
-    // never replays it here even when the job registry lost it (hard reset).
-    const delivered = await fixDeliveries();
+    // poll-now). A fix delivery this profile PROVABLY opened a tab for (reconcileFixDeliveries: a
+    // live created tab or a binding) is listed too, so the server never replays it here even when the
+    // job registry lost it (hard reset); an intent that never became a tab is cleared and replayed.
+    const delivered = await reconcileFixDeliveries(jobs);
     // fixProtocol:1 opts this worker into review-loop fix items (an older worker is never offered one).
     const payload = await api("/api/bridge", {
       action: "take", attachmentProtocol: 2, fixProtocol: 1, clientId: await clientId(),

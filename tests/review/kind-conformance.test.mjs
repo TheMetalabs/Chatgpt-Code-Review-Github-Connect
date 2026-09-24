@@ -138,8 +138,9 @@ const ROWS = [
       await b.tick();b.later();await b.tick();
       return {retired: !b.pending(), closed: b.closedTabs.length};
     }},
-  // W23-W27: the conversation identity cell. A run's bound turn pins the conversation it is shown
-  // in (the page's journal; the worker keeps it once). Page content alone never proves WHICH
+  // W23-W27, W40: the conversation identity cell. A run's page records the conversation it is bound
+  // in (a fix when its send is proven; a review then too on a conversation page, else where the
+  // provider put its new chat; the worker keeps it once). Page content alone never proves WHICH
   // conversation a tab shows: after an in-page move the old DOM can stay rendered under the user's
   // conversation URL, and the reply then echoes that URL. The worker checks the tab's URL first.
   {id: 'W23', name: 'server cancelled after an in-page move: the content still proves the run, the URL is another conversation', same: true,
@@ -151,11 +152,23 @@ const ROWS = [
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
   {id: 'W24', name: 'server cancelled; the page reports its bound conversation changed', same: true,
-    // Waiting cannot change a pinned identity: the tab is preserved at once (slot freed).
+    // Waiting cannot change a recorded identity: the tab is preserved at once (slot freed).
     expect: {closed: 0, retired: true, released: true},
     async run(kind) {
       const b = worker(kind, {api: cancelled, url: OTHER_TAB, job: item(kind, {}, {conversation: URL_TAB}),
         handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', identity: 'changed', url: OTHER_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: OTHER_TAB}});
+      await b.tick();
+      return {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true)};
+    }},
+  {id: 'W40', name: 'server cancelled; the page reports its sent journal carries no send-time conversation (identity "unestablished")', same: true,
+    // Round 13: the identity is recorded only when the send is proven, so waiting cannot establish
+    // it: the tab is preserved at once (slot freed), never closed. Only a fix page reports this (a
+    // review with no recorded conversation answers `unpinned`, json.js tabOwnership); since #82 a
+    // cancelled review takes the same cancel exit, so the worker treats the reply the same way.
+    expect: {closed: 0, retired: true, released: true},
+    async run(kind) {
+      const b = worker(kind, {api: cancelled,
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', identity: 'unestablished', url: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true)};
     }},
@@ -200,7 +213,8 @@ const ROWS = [
     }},
   {id: 'W29', name: 'a bound identity on a bare new-chat page is never replaced by a later location (no location-based upgrade)', same: true,
     // Ashlar 4096068011: a URL the tab moves to is no evidence of whose conversation it is (the user
-    // can navigate before the provider assigns one), so the first pinned identity is kept (both kinds pin).
+    // can navigate before the provider assigns one), so the first identity reported (recorded at
+    // send, or a new-chat review's pin) is kept (both kinds report one).
     expect: {kept: ['https://chatgpt.com/', 'https://chatgpt.com/', 'https://chatgpt.com/']},
     async run(kind) {
       const reports = ['https://chatgpt.com/', URL_TAB, OTHER_TAB], kept = [];
@@ -240,6 +254,69 @@ const ROWS = [
         handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB} : {ok: true, canClose: kind === 'review', reason: 'complete', url: URL_TAB}});
       await b.tick();
       return {closed: b.closedTabs.length, askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel')};
+    }},
+  // W33-W35 (round 12, Ashlar 4097631101): the release exit is chosen by LOCAL proof (an answer was
+  // collected: state.outcome.ok, or rejectedRaw), never by server status. The server settling or
+  // forgetting the item (a restart or a terminal-retention prune reports an unknown fix id as
+  // cancelled) never moves a collected leg to the cancel exit: it asks can-close and acts on that
+  // verdict, for both kinds. (`serverStatus`: what an earlier heartbeat stored; cleanup runs before
+  // the tick's own heartbeat.) The handlers below answer the two exits differently only to show
+  // which one the worker took: the page gives both the same verdict (json.js tabOwnership, #82),
+  // and that verdict compares nothing about the answer, so a regenerated or replaced answer with no
+  // user signal closes (browser.e2e "a delivered fix whose server then reports ...").
+  {id: 'W33', name: 'an answer was collected, then the server reports cancelled / unknown: can-close is asked, and its verdict (the user\'s) keeps the tab', same: true,
+    expect: {cancelled: {askedCancel: false, closed: 0, retired: true}, unknown: {askedCancel: false, closed: 0, retired: true}},
+    async run(kind) {
+      const got = {};
+      for (const status of ['cancelled', 'unknown']) {
+        const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
+          outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
+        // only a worker that took the cancel exit would see "owned" and close
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
+          : {ok: true, canClose: false, reason: 'repurposed', ownership: 'takenOver', proof: 'response_changed', url: URL_TAB}});
+        await b.tick();await b.tick();
+        got[status] = {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs.length, retired: !b.pending()};
+      }
+      return got;
+    }},
+  {id: 'W34', name: 'an answer was collected, then the server reports cancelled / unknown and can-close says owned (control)', same: true,
+    expect: {cancelled: {askedCancel: false, closed: [10], retired: true}, unknown: {askedCancel: false, closed: [10], retired: true}},
+    async run(kind) {
+      const got = {};
+      for (const status of ['cancelled', 'unknown']) {
+        const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
+          outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
+        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
+          : {ok: true, canClose: true, reason: 'complete', ownership: 'owned', url: URL_TAB, conversation: URL_TAB}});
+        await b.tick();await b.tick();
+        got[status] = {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs, retired: !b.pending()};
+      }
+      return got;
+    }},
+  {id: 'W35', name: 'a collected answer the server rejected (400: its outcome became a failure): can-close is asked, and its verdict (the user\'s) keeps the tab', same: true,
+    // The collected answer is proven locally by rejectedRaw: the leg asks can-close, never the cancel exit.
+    expect: {askedCancel: false, closed: 0, retired: true},
+    async run(kind) {
+      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, rejectedRaw: ANSWER[kind],
+        outcome: {ok: false, code: 'error', error: 'completed review was rejected: HTTP 400'}}),
+      handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
+        : {ok: true, canClose: false, reason: 'repurposed', ownership: 'takenOver', proof: 'response_changed', url: URL_TAB}});
+      await b.tick();
+      return {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs.length, retired: !b.pending()};
+    }},
+  // W36 (round 12, Ashlar 4097631112): an allocation intent is not a tab. Intended difference: a fix
+  // whose intent never became a proven tab (no owned record, no bound page, delivery record never
+  // `created`) allocates again, once; a review keeps its intent as before (FLAG R8: it waits forever).
+  {id: 'W36', name: 'the worker stopped between the allocation intent and chrome.tabs.create (registry intact, no tab)',
+    expect: {review: {tabs: 0, runs: 0, waiting: true}, fix: {tabs: 1, runs: 1, waiting: false}},
+    async run(kind) {
+      const job = item(kind, kind === 'fix' ? {deliveryId: 'delivery-1'} : {}, {tabId: undefined, started: undefined, allocating: true});
+      const b = worker(kind, {job, api: active, handler: () => ({ok: false, code: 'busy', retry: true})});
+      b.tabs.delete(10);
+      if (kind === 'fix') await b.local.set({'ashlar:fixDeliveries': {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', at: Date.now()}}});
+      await b.tick();await b.tick();
+      return {tabs: b.tabs.size, runs: b.messages.filter(m => m.type === 'ashlar-run' && !m.resume).length,
+        waiting: /tab creation outcome unknown/.test(b.pending().states.chatgpt.connectionError || '')};
     }},
   {id: 'W11', name: 'a lease conflict (409) on complete drops the lease; the outcome is kept for redelivery', same: true,
     expect: {lease: undefined, kept: true},

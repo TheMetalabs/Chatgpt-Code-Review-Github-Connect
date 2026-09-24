@@ -43,6 +43,10 @@ const composerHtml=({composer='',sendDisabled=false,uploading=false,chips=[]})=>
 const sentJournal=(extra={})=>({phase:'sent',expected:PROMPT,baseline:0,submittedUsers:1,messageId:'user-A',...extra});
 
 async function chatTab(t,{provider='chatgpt',url=provider==='grok'?'https://grok.com/':TEMP_URL,kind,job=kind==='fix'?'fix-A':'job-A',run='run-A',bound=true,journal,...view}={}){
+ // A sent FIX journal carries the conversation its send was proven in (#77: composer.js
+ // submissionConfirmed records it then, never later): the page the tab was sent on. A row that
+ // needs a journal without it names `conversation: undefined` itself.
+ if(kind==='fix'&&journal?.phase==='sent'&&!('conversation' in journal))journal={...journal,conversation:url};
  const page=await browser.newPage();t.after(()=>page.close());
  const served={thread:'',composer:'',sendDisabled:false,uploading:false,chips:[],after:'',...view};
  await page.route(provider==='grok'?'https://grok.com/**':'https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',
@@ -165,6 +169,21 @@ for(const kind of ['review','fix'])test(`${kind}: a secured tab moved in-page to
  assert.deepEqual({...verdict(out),identity:out.identity,conversation:out.conversation},{canClose:false,reason:'repurposed',cause:'navigated',identity:'changed',conversation:TEMP_URL});
 });
 
+// #77 (round 13) under the one release rule: a sent FIX journal that recorded no conversation (a
+// legacy journal, or a send confirmed only after a reload) can never establish it, so its tab is
+// never closed: "unestablished", slot freed (the worker preserves it at once). A REVIEW journal
+// without one is `unpinned` (#82: a review sent on a new chat pins later, and the worker checks the
+// page it observed), so the same page closes. Both exits answer the same verdict.
+for(const kind of ['review','fix'])test(`${kind}: a sent journal that recorded no conversation ${kind==='fix'?'is never closed ("unestablished", slot freed)':'is unpinned: the worker decides by the page it observed'}`,async t=>{
+ const tab=await chatTab(t,{kind,thread:userTurn()+answerTurn(),journal:sentJournal({conversation:undefined})});
+ for(const type of ['ashlar-can-close','ashlar-fix-cancel']){
+  const out=await tab.send(type,{allocationUrl:TEMP_URL});
+  assert.deepEqual({canClose:out.canClose,ownership:out.ownership,identity:out.identity,unpinned:out.unpinned},
+   kind==='fix'?{canClose:false,ownership:'unknown',identity:'unestablished',unpinned:undefined}:{canClose:true,ownership:'owned',identity:undefined,unpinned:true},type);
+ }
+ assert.equal(await tab.released(),kind==='fix'?'true':null);
+});
+
 // The query is not the page (#82: origin + path): ChatGPT's `?temporary-chat=true` names a mode, not
 // another conversation, so a run bound on one form of the new-chat URL is still in its conversation
 // on the other (json.js samePage).
@@ -180,7 +199,7 @@ for(const kind of ['review','fix'])for(const [from,to] of QUERY_FORMS){
  test(`${kind}: a run bound on ${from} still collects its answer once its URL reads ${to}`,async t=>{
   const tab=await chatTab(t,{kind,url:from,thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
   await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(1600);
-  if(kind==='fix')assert.equal(await pinnedIn(tab),from,'a fix pins its conversation at its first exact observation');
+  if(kind==='fix')assert.equal(await pinnedIn(tab),from,'a fix\'s conversation is the one its send recorded (never re-pinned at collect)');
   await tab.page.evaluate(url=>history.replaceState(history.state,'',url),to);
   await finish(tab.page);await tab.page.clock.runFor(2400);
   const out=await tab.send('ashlar-harvest');

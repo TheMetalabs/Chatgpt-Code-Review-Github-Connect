@@ -196,7 +196,7 @@ test('real DOM: a cancelled fix tab is Ashlar-owned only until the user takes it
  const page=await browser.newPage();t.after(()=>page.close());
  await page.setContent('<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">answer</div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div><button data-testid="send-button" aria-label="Send prompt">Send</button></form>');
  await page.evaluate(()=>{
-  // conversation: the identity pinned when the sent turn was first proven exact (this page)
+  // conversation: the identity recorded when the send was proven (this page)
   const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})]]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
@@ -273,31 +273,58 @@ test('real DOM: before its send is confirmed, a fix tab is owned only with no tu
 });
 
 /** A provider page served at a real chatgpt.com URL (so the SPA can move with history.pushState
- * while the old DOM stays rendered): this run's exact sent turn and a still-generating response,
- * its sent submission journal (no conversation pinned yet), and `kind`'s collector running. */
+ * while the old DOM stays rendered), with `kind`'s runner resumed on it. `sent` is how its send
+ * came about:
+ *  - "click" (default): the composer holds the prompt and the journal is only prepared; the runner's
+ *    clickSend clicks Send, the page renders this run's exact sent turn and a still-generating
+ *    response, and submissionConfirmed proves the send and records the conversation shown then;
+ *  - "legacy": the turn is already rendered and the journal is sent WITHOUT a conversation (a
+ *    journal recorded before the send-time identity existed);
+ *  - "reload": the turn is already rendered and the journal is only `attempted`: the click belonged
+ *    to an earlier page, so this page sees the send confirmed only after a reload.
+ * `gated`: the runner waits after the send is confirmed until `openCollect()`, so a test can act
+ * between the send proof and the collector's first poll. `userId`: the sent turn's message ID when it
+ * renders (null: the renderer has assigned none yet). */
 // CONV_URL: a conversation URL; TEMP_URL: the page a fix tab opens on (ChatGPT's temporary chat keeps
 // this URL for its whole life, so it is the conversation's identity); NEW_URL: a bare new-chat page
 // that names no conversation until the provider assigns one.
 const CONV_URL='https://chatgpt.com/c/fix-conv',OTHER_URL='https://chatgpt.com/c/users-own-conv';
 const TEMP_URL='https://chatgpt.com/?temporary-chat=true',NEW_URL='https://chatgpt.com/';
-async function conversationPage(t,kind,{url=CONV_URL,jobId=kind==='fix'?'fix-A':'job-A',body=`<p>Here.</p><pre><code>${'{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["x"],"summary":"s","files":[]}'}</code></pre>`}={}){
+async function conversationPage(t,kind,{url=CONV_URL,jobId=kind==='fix'?'fix-A':'job-A',sent='click',gated=false,userId='user-A',body=`<p>Here.</p><pre><code>${'{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["x"],"summary":"s","files":[]}'}</code></pre>`}={}){
  const page=await browser.newPage();t.after(()=>page.close());
- const html=`<html><body><main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${body}</div></div></section></main>${stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form></body></html>`;
+ const turns=`<section data-testid="conversation-turn-1"><div data-message-author-role="user"${userId?` data-message-id="${userId}"`:''}>fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${body}</div></div></section>`;
+ const html=sent==='click'
+  ?`<html><body><main></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px">fix prompt</div><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form></body></html>`
+  :`<html><body><main>${turns}</main>${stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form></body></html>`;
  await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',body:html}));
  await page.clock.install();await page.goto(url);
- await page.evaluate(({jobId})=>{
+ const journals={click:{phase:'prepared',expected:'fix prompt',baseline:0,attachments:[]},
+  legacy:{phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'},
+  reload:{phase:'attempted',expected:'fix prompt',baseline:0,attachments:[]}};
+ await page.evaluate(({jobId,journal,turns,stop})=>{
   sessionStorage.setItem('ashlar:job',jobId);sessionStorage.setItem('ashlar:run','run-A');
-  sessionStorage.setItem(`ashlar:submission:${jobId}:run-A`,JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'}));
+  sessionStorage.setItem(`ashlar:submission:${jobId}:run-A`,JSON.stringify(journal));
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
- },{jobId});
+  // The provider accepts the prompt: its turn and a still-generating response render, Stop replaces Send.
+  document.querySelector('[data-testid="send-button"]')?.addEventListener('click',event=>{
+   window.sendClicks=(window.sendClicks||0)+1;
+   document.querySelector('main').innerHTML=turns;document.querySelector('#prompt-textarea').textContent='';
+   event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
+  });
+ },{jobId,journal:journals[sent],turns,stop});
  for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ if(gated)await page.evaluate(()=>{
+  window.collectGate=new Promise(resolve=>{window.openCollect=resolve;});
+  // content-chatgpt.js's resume path (resumeSubmission, then the collector) with a pause between.
+  runPrompt=async prompt=>{await resumeSubmission(sendButton,composer,prompt);window.sendConfirmed=true;await window.collectGate;return waitUntilReviewOrQuota('ChatGPT');};
+ });
  const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId,runId:'run-A',provider:'chatgpt',...(kind==='fix'?{kind}:{}),...extra});
  await send('ashlar-run',{resume:true,prompt:'fix prompt'});
- await page.clock.runFor(1600); // generating: the collector observes its exact sent turn
+ await page.clock.runFor(1600); // the send is confirmed; ungated, the collector observes the generating response
  const journal=()=>page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)),`ashlar:submission:${jobId}:run-A`);
  const move=async url=>{await page.evaluate(url=>history.pushState({},'',url),url);};
  const complete=()=>page.evaluate(toolbar=>{document.querySelector('[data-testid="stop-button"]').remove();document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('beforeend',toolbar);},toolbar);
- return {page,send,journal,move,complete,harvest:()=>send('ashlar-harvest')};
+ return {page,send,journal,move,complete,harvest:()=>send('ashlar-harvest'),openCollect:()=>page.evaluate(()=>window.openCollect())};
 }
 /** The real worker wired to that page over the message protocol: the fix job is started in tab 10. */
 function wiredWorker(page,serverStatus){
@@ -335,7 +362,7 @@ test(`real DOM: a cancelled fix whose tab moved in-page from ${url} to another c
  assert.equal(state(),undefined,'the cancelled fix retired');
  assert.equal((await send('ashlar-tab-status')).released,true,'the preserved tab frees its managed slot');
  assert.ok(b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.preserve===true),'the page was told it is preserved');
- assert.deepEqual(pinned,{page:url,worker:url},'the exact sent turn pinned its conversation (page journal) and the worker kept it');
+ assert.deepEqual(pinned,{page:url,worker:url},'the send recorded its conversation (page journal) and the worker kept it');
 });
 test(`real DOM: a cancelled fix still in its bound conversation ${url} is closed (control)`,async t=>{
  const {page,journal}=await conversationPage(t,'fix',{url});
@@ -349,26 +376,26 @@ test(`real DOM: a cancelled fix still in its bound conversation ${url} is closed
  assert.equal(state(),undefined);
 });
 }
-// Round 11 lifecycle: moving off the pinned conversation is a PERMANENT verdict (a pinned identity
+// Round 11 lifecycle: moving off the send-time conversation is a PERMANENT verdict (a recorded identity
 // never comes back by waiting): the run ends at once and moving back does not revive it.
-test('real DOM: a fix whose tab moved away from its bound conversation ends at once, stays ended after moving back; the pin is never replaced',async t=>{
+test('real DOM: a fix whose tab moved away from its bound conversation ends at once, stays ended after moving back; the recorded identity is never replaced',async t=>{
  const {page,send,journal,move}=await conversationPage(t,'fix');
  await move(OTHER_URL);await page.clock.runFor(1600); // the collector sees the exact turn under another URL
- assert.equal((await journal()).conversation,CONV_URL,'a conversation URL is never re-pinned');
+ assert.equal((await journal()).conversation,CONV_URL,'the send-time identity is never re-recorded');
  const ended=await send('ashlar-harvest');
  assert.equal(ended.code,'taken_over','the run ended now, not at the fix deadline');
  assert.equal((await send('ashlar-tab-status')).released,true,'its managed slot is freed');
  await move(CONV_URL);
  assert.equal((await send('ashlar-fix-cancel')).owned,false,'moving back does not hand the tab to the ended run');
  assert.equal((await send('ashlar-harvest')).code,'taken_over');
- assert.equal((await journal()).conversation,CONV_URL,'pinned once, never replaced');
+ assert.equal((await journal()).conversation,CONV_URL,'recorded once, never replaced');
 });
 
-// Ashlar 4096068011: a fix pinned on a bare new-chat page is never re-pinned by a location. The user
+// Ashlar 4096068011: a fix sent from a bare new-chat page is never re-identified by a location. The user
 // can open another existing conversation before the provider assigns one (the old DOM stays on
 // screen), and nothing in either provider's DOM ties a conversation id to the sent turn or its
 // response, so a later URL is unknown: never harvested, never closed, preserved on cancel.
-test('real DOM: a fix pinned on a bare new-chat page that moves to another conversation is never re-pinned, harvested or closed',async t=>{
+test('real DOM: a fix sent from a bare new-chat page that moves to another conversation is never re-identified, harvested or closed',async t=>{
  const {page,send,journal,move,complete,harvest}=await conversationPage(t,'fix',{url:NEW_URL});
  assert.equal((await journal()).conversation,NEW_URL,'bound on a page that names no conversation yet');
  const server={value:'awaiting_chat'};
@@ -377,9 +404,9 @@ test('real DOM: a fix pinned on a bare new-chat page that moves to another conve
  assert.equal(state().conversation,NEW_URL);
  // the user opens one of their own conversations before any provider-assigned URL was observed
  await move(OTHER_URL);sync();await page.clock.runFor(1600);
- assert.equal((await journal()).conversation,NEW_URL,'never pinned to the conversation the user moved to');
+ assert.equal((await journal()).conversation,NEW_URL,'never re-identified as the conversation the user moved to');
  await complete();await page.clock.runFor(3200); // the lingering DOM completes there
- assert.notEqual((await harvest()).ok,true,'not harvested outside its pinned conversation');
+ assert.notEqual((await harvest()).ok,true,'not harvested outside its send-time conversation');
  const closing=await send('ashlar-can-close');
  assert.equal(closing.canClose,false);
  await b.tick();
@@ -389,8 +416,100 @@ test('real DOM: a fix pinned on a bare new-chat page that moves to another conve
  assert.equal(b.calls.some(c=>c.action==='complete'),false,'no answer is delivered');
  assert.deepEqual(b.closedTabs,[],'preserved, never closed');
  assert.equal(state(),undefined,'the ended fix leg retired');
- assert.equal((await journal()).conversation,NEW_URL,'still never re-pinned');
+ assert.equal((await journal()).conversation,NEW_URL,'still never re-identified');
  assert.equal((await send('ashlar-tab-status')).released,true,'the preserved tab frees its managed slot');
+});
+
+// Round 13 (Ashlar 4099207116): a fix's conversation identity is a fact of the moment its send is
+// proven. composer.js submissionConfirmed records it then (in the journal, once); the collector,
+// can-close, cancel and restore only compare with it. Each row: how the send came about, and whether
+// the user moved the tab in-page (history.pushState) after the send was proven and BEFORE the
+// collector's first poll, with the old DOM still rendered; then the old response finishes. The real
+// page and the real worker over the message protocol.
+//  - click: the send is confirmed on this page, which records its conversation (control when unmoved);
+//  - legacy: a sent journal with no conversation (recorded before this rule);
+//  - reload: the click belonged to an earlier page; this page confirms the send only after a reload;
+//  - root: sent from a bare new-chat root, which the provider later names /c/<id> (a change: the
+//    identity recorded at send is the root; ChatGPT fix tabs open on the temporary chat instead,
+//    whose URL never changes).
+const SEND_IDENTITY_ROWS=[
+ {sent:'click',url:TEMP_URL,moveTo:null,recorded:TEMP_URL,owned:true},
+ {sent:'click',url:TEMP_URL,moveTo:OTHER_URL,recorded:TEMP_URL,owned:false},
+ {sent:'click',url:CONV_URL,moveTo:OTHER_URL,recorded:CONV_URL,owned:false},
+ {sent:'legacy',url:TEMP_URL,moveTo:null,recorded:undefined,owned:false},
+ {sent:'legacy',url:TEMP_URL,moveTo:OTHER_URL,recorded:undefined,owned:false},
+ {sent:'reload',url:TEMP_URL,moveTo:null,recorded:undefined,owned:false},
+ {sent:'reload',url:TEMP_URL,moveTo:OTHER_URL,recorded:undefined,owned:false},
+ {sent:'click',url:NEW_URL,moveTo:CONV_URL,recorded:NEW_URL,owned:false,name:'root'},
+];
+for(const row of SEND_IDENTITY_ROWS){
+ const name=`${row.name||row.sent} on ${row.url}${row.moveTo?`, moved to ${row.moveTo} before the collector's first poll`:', never moved'}`;
+ test(`real DOM send-time identity (${name}): ${row.owned?'harvested and closed (control)':'never harvested, can-close refused, released, never removed'}`,async t=>{
+  const ctx=await conversationPage(t,'fix',{url:row.url,sent:row.sent,gated:true});
+  const server={value:'awaiting_chat'};
+  const {b,sync,state}=wiredWorker(ctx.page,server);
+  assert.equal(await ctx.page.evaluate(()=>window.sendConfirmed),true,'the send is proven before the collector starts');
+  assert.equal(await ctx.page.evaluate(()=>window.sendClicks||0),row.sent==='click'?1:0,'the prompt is clicked once, and only by the page that sends it');
+  const atSend=await ctx.journal();
+  assert.equal(atSend.phase,'sent');
+  if(row.moveTo){await ctx.move(row.moveTo);sync();}
+  await ctx.openCollect();await ctx.page.clock.runFor(1600); // the collector's first polls (old DOM still rendered)
+  await ctx.complete();await ctx.page.clock.runFor(3200);      // the old response finishes
+  const harvest=await ctx.harvest();
+  const closing=await ctx.send('ashlar-can-close');
+  await b.tick();await b.tick();
+  const failure=b.calls.find(c=>c.action==='failure');
+  const got={harvested:harvest.ok===true,canClose:closing.canClose===true,delivered:b.calls.some(c=>c.action==='complete'),
+   takenOver:/^taken_over: /.test(failure?.error||''),closed:b.closedTabs.length,retired:state()===undefined,
+   released:(await ctx.send('ashlar-tab-status')).released,
+   // the identity is recorded when the send is proven, and only then (never at the collector's poll)
+   atSend:atSend.conversation,recorded:(await ctx.journal()).conversation};
+  assert.deepEqual(got,row.owned
+   ?{harvested:true,canClose:true,delivered:true,takenOver:false,closed:1,retired:true,released:false,atSend:row.recorded,recorded:row.recorded}
+   :{harvested:false,canClose:false,delivered:false,takenOver:true,closed:0,retired:true,released:true,atSend:row.recorded,recorded:row.recorded});
+ });
+}
+
+// Round 13 sweep: a message ID the renderer assigns to the sent turn after mounting is recorded in a
+// fix journal only while the page still shows the conversation its send was proven in; after an
+// in-page move, the turn at the recorded position proves nothing about the send. (A review journal
+// carries no conversation and keeps its late-ID upgrade unchanged.)
+for(const moved of [false,true]){
+ test(`real DOM: a late message ID on a fix's sent turn is ${moved?'never recorded after an in-page move':'recorded in its send-time conversation (control)'}`,async t=>{
+  const ctx=await conversationPage(t,'fix',{url:TEMP_URL,userId:null,gated:true});
+  assert.equal((await ctx.journal()).messageId,'','the turn had no ID when the send was proven');
+  if(moved)await ctx.move(OTHER_URL);
+  await ctx.page.evaluate(()=>{document.querySelector('[data-message-author-role="user"]').dataset.messageId='late-id';});
+  await ctx.openCollect();await ctx.page.clock.runFor(1600);
+  assert.equal((await ctx.journal()).messageId,moved?'':'late-id');
+  assert.equal((await ctx.journal()).conversation,TEMP_URL);
+ });
+}
+
+// The send-time rule for a REVIEW, where it does not contradict #82: a review sent on a page that
+// names a conversation records it when its send is proven, so an in-page move before the
+// collector's first poll never pins the user's conversation there. A review sent on a new chat has
+// no conversation at its send: the provider assigns one afterwards, and the review pins where the
+// provider puts it (#82, json.js pinNewChatReview), not the new-chat page it was sent on.
+test('real DOM send-time identity (review on a conversation page, moved before the collector\'s first poll): recorded at send, never re-pinned, can-close refused',async t=>{
+ const ctx=await conversationPage(t,'review',{url:CONV_URL,gated:true});
+ assert.equal((await ctx.journal()).conversation,CONV_URL,'recorded when the send was proven');
+ await ctx.move(OTHER_URL);
+ await ctx.openCollect();await ctx.page.clock.runFor(1600);
+ await ctx.complete();await ctx.page.clock.runFor(3200);
+ assert.equal((await ctx.journal()).conversation,CONV_URL,'never re-pinned at collect');
+ const out=await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL});
+ assert.deepEqual({canClose:out.canClose,identity:out.identity,conversation:out.conversation},{canClose:false,identity:'changed',conversation:CONV_URL});
+});
+test('real DOM send-time identity (review on a new chat): nothing recorded at send; pinned where the provider puts it (#82)',async t=>{
+ const ctx=await conversationPage(t,'review',{url:NEW_URL,gated:true});
+ assert.equal((await ctx.journal()).conversation,undefined,'a new chat names no conversation when the send is proven');
+ await ctx.move(CONV_URL); // the provider assigns the conversation URL (no user action)
+ await ctx.openCollect();await ctx.page.clock.runFor(1600);
+ assert.equal((await ctx.journal()).conversation,CONV_URL,'pinned where the provider put it');
+ await ctx.complete();await ctx.page.clock.runFor(3200);
+ const out=await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL});
+ assert.deepEqual({canClose:out.canClose,conversation:out.conversation},{canClose:true,conversation:CONV_URL});
 });
 
 // Ashlar 4096068000: a completed fix whose sent turn the user edits after collection is never
@@ -430,13 +549,50 @@ test(`real DOM: a fix delivered, then its sent turn edited to "${edit}": can-clo
 });
 }
 
-// ── The fix ownership proof at EVERY page decision point (conformance rows P19-P21, P23): the same
-// violations of the full proof against each decision, with a control. A cell is `true` when the
+// Round 12 (Ashlar 4097631101), under #82's release rule: the server reports the fix cancelled or
+// unknown (a registry restart or a terminal-retention prune forgets it) AFTER its answer was
+// collected and delivered. The release follows the local proof (an answer was collected: it asks
+// can-close, never the cancel exit), never the server status, and acts on the one verdict. The
+// answer changing on the page (regenerated, replaced under a new message ID) is not the user's
+// activity (#82: ChatGPT keeps redrawing and re-keying a finished answer), so the tab still closes;
+// only a user signal (here a follow-up turn) keeps it, preserved and released.
+const ANSWER_CHANGES={
+ unchanged:null,
+ regenerated:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="response-A"] code').textContent='{"summary":"regenerated","files":[]}';}),
+ replaced:({page})=>page.evaluate(()=>{const r=document.querySelector('[data-message-id="response-A"]');r.dataset.messageId='response-B';r.querySelector('code').textContent='{"summary":"another answer","files":[]}';}),
+ followup:({page})=>page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);}),
+};
+for(const status of ['cancelled','unknown'])for(const [change,apply] of Object.entries(ANSWER_CHANGES)){
+const kept=change==='followup';
+test(`real DOM: a delivered fix whose server then reports ${status}, answer ${change}: asked can-close, ${kept?'preserved and released, never closed':'closed (no user signal)'}`,async t=>{
+ const ctx=await conversationPage(t,'fix');
+ const server={value:'awaiting_chat'};
+ const {b,state}=wiredWorker(ctx.page,server);
+ await b.tick();
+ // the worker takes and delivers the answer; its cleanup is held until the server forgot the item
+ const cleanup=b.context.cleanupProvider;b.context.cleanupProvider=async()=>{};
+ await ctx.complete();await ctx.page.clock.runFor(3200);await b.tick();
+ assert.equal(b.calls.some(c=>c.action==='complete'),true,'delivered while the proof held');
+ assert.equal(state().outcome?.ok,true,'the local outcome is kept');
+ server.value=status;await b.tick();
+ assert.equal(b.local.state.pendingReviewJobs['fix-A'].serverStatus,status);
+ await apply?.(ctx);
+ b.context.cleanupProvider=cleanup;
+ await b.tick();
+ const got={closed:b.closedTabs.length,retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released,
+  askedCancel:b.messages.some(m=>m.type==='ashlar-fix-cancel' && !m.preserve),askedCanClose:b.messages.some(m=>m.type==='ashlar-can-close')};
+ assert.deepEqual(got,kept?{closed:0,retired:true,released:true,askedCancel:false,askedCanClose:true}:{closed:1,retired:true,released:false,askedCancel:false,askedCanClose:true});
+});
+}
+
+// ── The fix ownership proof at EVERY page decision point (conformance rows P19-P21, P23, P26): the
+// same violations of the full proof against each decision, with a control. A cell is `true` when the
 // decision acts for Ashlar (collects, hands out, closes, force-closes). The answer collection
-// (fixOwnershipProof) and the tab release (tabOwnership) refuse every user signal; a response the
-// provider changed after collection is not one (#82: ChatGPT keeps redrawing a finished answer), so
-// a collected answer is still handed out and its tab still closes. (P22, restoring a completion
-// proof after a reload, is gone: a reloaded tab is released by the same verdict, no restore needed.)
+// (fixOwnershipProof) and the tab release (tabOwnership) refuse every user signal and a fix journal
+// with no send-time identity; a response the provider changed after collection is not one (#82:
+// ChatGPT keeps redrawing a finished answer), so a collected answer is still handed out and its tab
+// still closes. (P22, restoring a completion proof after a reload, is gone: a reloaded tab is
+// released by the same verdict, no restore needed.)
 const PROOF_VIOLATIONS={
  none:null,
  editedSuffix:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='fix prompt and my own words';}),
@@ -446,6 +602,12 @@ const PROOF_VIOLATIONS={
  // a file the user staged in the composer before typing anything is a draft too
  stagedFile:({page})=>page.evaluate(()=>document.querySelector('form').insertAdjacentHTML('afterbegin','<div role="group" aria-label="my-notes.pdf" style="width:120px;height:40px">my-notes.pdf</div>')),
  moved:({move})=>move(OTHER_URL),
+ // round 13: the journal carries no send-time identity (a legacy journal, or one confirmed only after
+ // a reload); nothing may record one later
+ noSendIdentity:({page})=>page.evaluate(()=>{
+  const key='ashlar:submission:fix-A:run-A',journal=JSON.parse(sessionStorage.getItem(key));delete journal.conversation;
+  sessionStorage.setItem(key,JSON.stringify(journal));delete __ashlarRunnerState.confirmedSubmission?.record.conversation;
+ }),
  responseChanged:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="response-A"] code').textContent='{"summary":"regenerated","files":[]}';}),
 };
 const PROOF_DECISIONS={
@@ -457,6 +619,9 @@ const PROOF_DECISIONS={
  canClose:async ctx=>{await ctx.complete();await ctx.page.clock.runFor(3200);await ctx.harvest();await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-can-close')).canClose===true;},
  // P23 force-close on cancel (ashlar-fix-cancel)
  cancel:async ctx=>{await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-fix-cancel')).owned===true;},
+ // P26 cancel after the answer was collected (round 12): the same verdict as can-close (tabOwnership,
+ // #82), so a provider-side change of the collected answer is not the user's there either
+ cancelCollected:async ctx=>{await ctx.complete();await ctx.page.clock.runFor(3200);await ctx.harvest();await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-fix-cancel')).owned===true;},
 };
 // The collector and the cancel verdict have no collected answer the provider could change.
 const PROOF_NA={collect:['responseChanged'],cancel:['responseChanged']};
@@ -483,7 +648,7 @@ for(const [decision,act] of Object.entries(PROOF_DECISIONS)){
 // verdict keeps the run alive (it would end at the fix deadline).
 const TERMINAL_VIOLATIONS={
  followup:PROOF_VIOLATIONS.followup,editedSuffix:PROOF_VIOLATIONS.editedSuffix,editedPrefix:PROOF_VIOLATIONS.editedPrefix,
- draft:PROOF_VIOLATIONS.draft,stagedFile:PROOF_VIOLATIONS.stagedFile,moved:PROOF_VIOLATIONS.moved,
+ draft:PROOF_VIOLATIONS.draft,stagedFile:PROOF_VIOLATIONS.stagedFile,moved:PROOF_VIOLATIONS.moved,noSendIdentity:PROOF_VIOLATIONS.noSendIdentity,
 };
 const TRANSIENT_VIOLATIONS={
  none:null,
@@ -521,9 +686,12 @@ for(const when of ['generating','collected']){
  }
 }
 
+/** The conversation a send confirmed on a setContent page records (composer.js submissionConfirmed):
+ * such a page is about:blank for its whole life. */
+const SENT_HERE='about:blank';
 /** A fix run's page: this run's user turn (user-A) and an assistant response (response-A) with
  * `inner`, plus its submission journal (`journal` null = none yet). */
-async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'},{done=true}={}){
+async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:SENT_HERE},{done=true}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${inner}</div></div>${done?'<button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button>':''}</section></main>${done?'':stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
  await page.evaluate(journal=>{
@@ -543,7 +711,7 @@ async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',basel
 // bridge-lease-conformance.test.mjs). A shared cell asserts one outcome for both kinds; an intended
 // difference asserts each kind's documented outcome.
 const KIND_ANSWER='{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["fixture checked"],"summary":"s","files":[]}';
-async function kindPage(t,kind,{done=true,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'},extra=''}={}){
+async function kindPage(t,kind,{done=true,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:SENT_HERE},extra=''}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here.</p><pre><code>${KIND_ANSWER}</code></pre></div></div>${done?toolbar:''}</section></main>${done?'':stop}${extra}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
  await page.evaluate(journal=>{
@@ -615,8 +783,9 @@ for(const kind of ['review','fix']){
   const out=await harvest();
   const canClose=(await send('ashlar-can-close')).canClose;
   // Intended difference (W/P table row P16): a fix answer is read only in the conversation its run
-  // was bound in; a review still harvests the lingering DOM (FLAG R4, out of scope). Both runs pinned
-  // their conversation while generating, so neither tab may close in the user's conversation.
+  // was bound in; a review still harvests the lingering DOM (FLAG R4, out of scope). Both runs
+  // recorded their conversation when the send was proven (a review sent on a conversation page does
+  // too), so neither tab may close in the user's conversation.
   assert.deepEqual({ok:out.ok===true,canClose},kind==='fix'?{ok:false,canClose:false}:{ok:true,canClose:false});
  });
 }
@@ -632,7 +801,7 @@ test('real DOM: a fix is harvested only from the response bound to its own sent 
  // the same page once the journal binds this run's turn: its response is the answer
  const page=await fixPage(t,unrelated,{phase:'attempted',expected:'fix prompt',baseline:0});
  await page.clock.runFor(3200);
- await page.evaluate(()=>window.__saved.set('ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'})));
+ await page.evaluate(()=>window.__saved.set('ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:'about:blank'})));
  await page.clock.runFor(3200);
  assert.equal((await page.evaluate(()=>window.fixOut)).raw,code);
 });
@@ -697,7 +866,7 @@ test('real DOM: a completed fix with prose around its fence still proves its own
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await page.setContent(`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here is the fix.</p><pre><code>${code}</code></pre></div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
  await page.evaluate(()=>{
-  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'})]]);
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})]]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
  });

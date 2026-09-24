@@ -12,7 +12,10 @@ back. It is released either as a **verification round** (the merged chat result 
 result is classified. Harbor calls it to decide between holding the post (`verify`) and posting.
 `reviewSummaryBody` calls it (through the `postedOutcome` render guard) and derives from the kind
 alone: the body's first line, the raw block header, the trailing `ashlar-findings` marker, and so
-the loop's CONVERGED signal. No other code reads `localVerified`, `rawReview` or the skipped notes
+the loop's CONVERGED signal. The loop runtime (`runPostReviewLoop`) asks `postedOutcome` the same
+question instead of counting findings: a zero-finding review whose kind is not CONVERGED (`raw`,
+`raw-unverified`, `unverified-clean`, `incomplete`) gets one fixed ESCALATE `loop-error` in an active
+session, never a silent stop. No other code reads `localVerified`, `rawReview` or the skipped notes
 to decide any of these.
 
 `findings` is the publish-gated count. A job is a *verifier* when its role is `verify-clean`, both a

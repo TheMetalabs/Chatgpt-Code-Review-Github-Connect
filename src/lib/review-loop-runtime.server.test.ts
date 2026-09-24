@@ -371,6 +371,36 @@ describe("runPostReviewLoop gates", () => {
   });
 });
 
+describe("CONVERGED is the posted outcome, not \"no findings\" (docs/local-verify-clean.md §1)", () => {
+  const VC = { reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", localVerifyStartedAt: 2, localVerifyChat: ["chatgpt"] } as Partial<Job>;
+  const notClean: Array<[string, Partial<Job>, RegExp]> = [
+    ["raw (a chat reply posted verbatim)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW" }, /not parseable review JSON/],
+    ["raw-unverified", { ...VC, localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW" }, /local verification's reply could not be used/],
+    ["unverified-clean", { ...VC, localVerified: false }, /local verification did not complete/],
+    ["incomplete", { reviewProviders: ["chatgpt", "grok"], assumptions: ["Skipped grok (quota or unavailable)"] }, /a reviewer did not run/],
+  ];
+  for (const [name, patch, detail] of notClean) {
+    it(`${name}: an active session gets one fixed handoff, never a silent stop`, async () => {
+      const f = fakeDeps({ rounds: [1] });
+      const r = await run(f, "suggest", ENV_ON, job({ findings: [], ...patch }));
+      assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+      assert.equal(escalations(f.posted).length, 1);
+      assert.match(escalations(f.posted)[0], detail);
+      assert.equal(f.prompts.length, 0, "nothing structured reaches the fix agent");
+      const none = fakeDeps({ start: null, rounds: [1] });
+      assert.deepEqual(await run(none, "suggest", ENV_ON, job({ findings: [], ...patch })), { ran: false, reason: "no active loop session" });
+    });
+  }
+
+  for (const [name, patch] of [["clean", {}], ["verified-clean", { ...VC, localVerified: true }]] as const) {
+    it(`${name}: silent convergence`, async () => {
+      const f = fakeDeps({ rounds: [0] });
+      assert.deepEqual(await run(f, "suggest", ENV_ON, job({ findings: [], ...patch })), { ran: false, reason: "no findings (converged)" });
+      assert.equal(f.posted.length, 0);
+    });
+  }
+});
+
 describe("session: durable, restart-proof, never reset by a re-issued start", () => {
   it("a re-issued start inside the session keeps the anchor: the budget spans the re-issue", async () => {
     const f = fakeDeps({

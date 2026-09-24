@@ -73,6 +73,7 @@ import {
   type RoundSummary,
 } from "./review-loop.ts";
 import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
+import { OUTCOME_SHAPE, postedOutcome, type PostedOutcome } from "./review-outcome.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface PullHead extends LoopPrInfo {
@@ -173,6 +174,20 @@ export const SILENT_REASONS: readonly string[] = [
   ENDED_CONVERGED,
   NEWER_REQUEST,
 ];
+
+/** The posted outcome of a zero-finding review when it is NOT a clean pass, else undefined. */
+function notCleanOutcome(job: Job): PostedOutcome | undefined {
+  const outcome = postedOutcome(job, 0);
+  return OUTCOME_SHAPE[outcome].converged ? undefined : outcome;
+}
+
+/** Fixed handoff detail per non-converged zero-finding outcome (never free text). */
+const NOT_CLEAN_DETAIL: Partial<Record<PostedOutcome, string>> = {
+  raw: "the reply was not parseable review JSON and is posted verbatim",
+  "raw-unverified": "local verification's reply could not be used as a review and is posted verbatim",
+  "unverified-clean": "chat found nothing, but local verification did not complete",
+  incomplete: "a reviewer did not run",
+};
 
 /** Write-capable repository permissions (legacy field; `maintain` reports as `write`). */
 const WRITE_PERMISSIONS = new Set(["admin", "write"]);
@@ -642,7 +657,8 @@ export async function runPostReviewLoop(
   posted?: PostedLoopReview,
 ): Promise<LoopStepResult> {
   // Silent gates: the default off-path (no fix agent) or nothing to do. A zero-finding review
-  // is CONVERGED — its clean review (total=0) is the terminal signal and ends the session.
+  // whose posted outcome is a clean pass is CONVERGED — its clean review (total=0) is the terminal
+  // signal and ends the session.
   if (!loopEnabled(settings, env)) return { ran: false, reason: "disabled" };
   if (job.origin !== "github") return { ran: false, reason: "not a github job" };
   // Fix exactly what was PUBLISHED: findings the precision policy withheld were never shown to
@@ -657,7 +673,11 @@ export async function runPostReviewLoop(
   // findings, or it shows findings that all share ids and cannot be attributed.
   const unshown = findings.length === 0 && posted?.inlineDropped === true && (job.findings?.length ?? 0) > 0;
   const unattributable = findings.length === 0 && shown.length > 0;
-  if (findings.length === 0 && !unshown && !unattributable) return { ran: false, reason: "no findings (converged)" };
+  // A third: the posted review is not a clean pass (raw, unverified, incomplete) although it has no
+  // structured finding. CONVERGED is decided by the posted outcome, the same one the body's marker
+  // carries, never by "no findings". Every review reaching this check posted zero findings.
+  const notClean = findings.length === 0 && !unshown && !unattributable ? notCleanOutcome(job) : undefined;
+  if (findings.length === 0 && !unshown && !unattributable && !notClean) return { ran: false, reason: "no findings (converged)" };
 
   const { owner, repo, pr, headSha } = job;
   const ref: PrRef = { owner, repo, pr };
@@ -747,6 +767,9 @@ export async function runPostReviewLoop(
     }
     if (unattributable) {
       return await escalate("loop-error", "every finding of this review shares its id with another, so none can be attributed to its thread; the loop does not fix what it cannot attribute");
+    }
+    if (notClean) {
+      return await escalate("loop-error", `this review is not a clean pass (${NOT_CLEAN_DETAIL[notClean] ?? notClean}) and carries no structured finding the fix agent can act on`);
     }
     if (!sample) return await escalate("loop-error", "no head-pinned snapshot for this review");
 

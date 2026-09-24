@@ -772,6 +772,48 @@ describe("round-5: durable stop records, exact session scoping, prompt boundary,
   });
 });
 
+describe("round-6: stops that exist only in a webhook, same-second order, lagged start records", () => {
+  it("a stop racing a start still in flight is recorded: the start record that lands later cannot outlive it", async () => {
+    const f = fakeDeps({ start: null, rounds: [3] }); // the start record is still in flight
+    const r = await stopLoop("t", { owner: "o", repo: "r", pr: 7, actor: "bob", stopAt: "2026-01-20T00:00:00Z", startInFlight: true }, settings(), f.deps, ENV_ON);
+    assert.deepEqual(r, { posted: true, reason: "stopped" });
+    f.issues.push(recorded("apply", "alice", "2026-01-19T00:00:00Z")); // the start record lands afterwards, placed earlier
+    const session = await readLoopSession(f.deps.gh, "t", "o", "r", 7, { botLogin: BOT, pr: { sha: HEAD } });
+    assert.equal(session.active, false, "the recorded stop ends it");
+    assert.deepEqual(await run(f, "apply"), { ran: false, reason: "no active loop session" });
+    assert.equal(f.prompts.length, 0);
+  });
+
+  it("a stop that stops nothing posts nothing — no session, or a stop older than the live session", async () => {
+    const idle = fakeDeps({ start: null, rounds: [3] });
+    assert.deepEqual(await stopLoop("t", { owner: "o", repo: "r", pr: 7, actor: "bob", stopAt: "2026-01-20T00:00:00Z" }, settings(), idle.deps, ENV_ON), { posted: false, reason: "no active loop session" });
+    const later = fakeDeps({ start: null, rounds: [3], issues: [recorded("apply", "carol", "2026-01-21T00:00:00Z")] });
+    assert.deepEqual(await stopLoop("t", { owner: "o", repo: "r", pr: 7, actor: "bob", stopAt: "2026-01-20T00:00:00Z" }, settings(), later.deps, ENV_ON), { posted: false, reason: "no active loop session" });
+    assert.equal(idle.posted.length + later.posted.length, 0, "no STOPPED marker for a stop that ended nothing");
+    const s2 = await readLoopSession(later.deps.gh, "t", "o", "r", 7, { botLogin: BOT, pr: { sha: HEAD } });
+    assert.equal(s2.active, true, "and the dropped stop is not honored against the newer session");
+  });
+
+  it("a stop in the same second as the start ends the session (the stop is causally later)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], issues: [{ userLogin: "bob", body: "/review-loop stop", createdAt: START_AT }] });
+    assert.deepEqual(await run(f, "apply"), { ran: false, reason: "no active loop session" });
+  });
+
+  it("a start record the first read missed (list lag) is re-read, not a silent no-session", async () => {
+    const f = fakeDeps({ start: null, rounds: [3], issues: [recorded("suggest", "alice", START_AT)] });
+    const listed = f.deps.gh.listIssueComments;
+    let calls = 0;
+    f.deps.gh.listIssueComments = async (...a) => {
+      const rows = await listed(...a);
+      return ++calls === 1 ? rows.filter((c) => !c.body.includes("ashlar-loop-start")) : rows; // first read lags
+    };
+    const j = job({ thread: { kind: "mention", commentId: 5, userText: "/review-loop", loop: { kind: "start", mode: "suggest" }, eventAt: START_AT } });
+    const r = await run(f, "suggest", ENV_ON, j);
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested", JSON.stringify(r));
+    assert.ok(!f.posted.some((b) => b.includes("ashlar-loop-start")), "the existing record is not posted again");
+  });
+});
+
 describe("apply write-permission gate (design §2)", () => {
   it("a starter without write access hands off (loop-error) and nothing is pushed", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3], permission: "read" });

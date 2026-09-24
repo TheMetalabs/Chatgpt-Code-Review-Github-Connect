@@ -119,3 +119,59 @@ describe("watchFixRequest (queue-aware deadlines, relevance)", () => {
     await assert.rejects(watchFixRequest(failing, "x", base), /ended with length/);
   });
 });
+
+describe("watchFixRequest: robustness (round 6)", () => {
+  it("a provider that throws synchronously is settled like a rejection: rejects, aborts, no timer left", async () => {
+    let signal: AbortSignal | undefined;
+    let checks = 0;
+    const request: WatchedRequest = (_p, ctl) => {
+      signal = ctl.signal;
+      throw new Error("pool closed");
+    };
+    await assert.rejects(watchFixRequest(request, "x", { ...base, checkEveryMs: 5, reportsActivity: false, stillWanted: async () => (checks++, null) }), /pool closed/);
+    assert.equal(signal?.aborted, true);
+    await wait(40);
+    assert.equal(checks, 0, "no tick ran after the throw");
+  });
+
+  it("a hung relevance check is abandoned for its tick: a later check still cancels", async () => {
+    let calls = 0;
+    const stillWanted = () => (++calls === 1 ? new Promise<string | null>(() => {}) : Promise.resolve("the PR head moved"));
+    const request: WatchedRequest = (_p, ctl) =>
+      new Promise((_resolve, reject) => ctl.signal.addEventListener("abort", () => reject(new Error("aborted"))));
+    const out = watchFixRequest(request, "x", { ...base, checkEveryMs: 10, reportsActivity: false, stillWanted });
+    await assert.rejects(out, (e: unknown) => e instanceof FixRequestStop && e.why === "cancelled");
+    assert.ok(calls >= 2, "the latch was released after the hung check");
+  });
+});
+
+describe("watchFixRequest: no lost checks (round 6, pre-review)", () => {
+  it("a late cancel from a probe abandoned by its bound still stops the request", async () => {
+    let release!: (why: string) => void;
+    const stillWanted = () => new Promise<string | null>((resolve) => (release = resolve));
+    const request: WatchedRequest = (_p, ctl) =>
+      new Promise((_resolve, reject) => ctl.signal.addEventListener("abort", () => reject(new Error("aborted"))));
+    const out = watchFixRequest(request, "x", { ...base, checkEveryMs: 10, reportsActivity: false, stillWanted });
+    await wait(40); // the first probe is abandoned by its bound
+    release("the loop was stopped");
+    await assert.rejects(out, (e: unknown) => e instanceof FixRequestStop && e.why === "cancelled");
+  });
+
+  it("the generation-start check is not dropped while a queued check is outstanding", async () => {
+    let calls = 0;
+    let first!: (v: null) => void;
+    const stillWanted = () => (++calls === 1 ? new Promise<string | null>((r) => (first = r)) : Promise.resolve("the PR head moved"));
+    let onActivity!: (p: FixPhase) => void;
+    const request: WatchedRequest = (_p, ctl) => {
+      onActivity = ctl.onActivity;
+      return new Promise((_resolve, reject) => ctl.signal.addEventListener("abort", () => reject(new Error("aborted"))));
+    };
+    const out = watchFixRequest(request, "x", { ...base, checkEveryMs: 20, reportsActivity: true, stillWanted });
+    onActivity("queued");
+    await wait(30); // a queued check is outstanding (hung)
+    onActivity("generating"); // generation-start check requested while the latch is held
+    first(null);
+    await assert.rejects(out, (e: unknown) => e instanceof FixRequestStop && e.why === "cancelled");
+    assert.ok(calls >= 2);
+  });
+});

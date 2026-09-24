@@ -141,3 +141,11 @@ describe("deriveLoopSession: events are ordered as instants", () => {
     assert.equal(deriveLoopSession([ev("yesterday", "start", { mode: "apply" })]).active, false);
   });
 });
+
+describe("deriveLoopSession: a human stop in a start's second", () => {
+  it("ends the session (stop sorts after start); an App handoff in a start's second still precedes it", () => {
+    const t = "2026-01-01T00:00:00Z";
+    assert.equal(deriveLoopSession([ev(t, "stop", { actor: "bob" }), ev(t, "start", { mode: "apply", actor: "alice" })]).active, false);
+    assert.equal(deriveLoopSession([ev(t, "escalate"), ev(t, "start", { mode: "apply", actor: "alice" })]).active, true);
+  });
+});

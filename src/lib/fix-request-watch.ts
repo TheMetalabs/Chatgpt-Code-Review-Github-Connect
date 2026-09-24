@@ -16,9 +16,13 @@
  * - Relevance: stillWanted() is consulted every checkEveryMs while queued (and throughout for a
  *   provider that reports no activity) and once when generation starts; a non-null reason aborts
  *   the request — the queue slot is released before, or the generation cut right after, it starts.
- *   A failing check never cancels (fail open: the commit path re-verifies the head anyway).
+ *   A failing check never cancels (fail open: the commit path re-verifies relevance anyway). A
+ *   check that does not answer within checkEveryMs releases the latch for the next tick (a hung
+ *   read never disables the checks that follow), yet its late answer still counts; a check asked
+ *   for while one is outstanding runs right after it instead of being dropped.
  * - A provider that reports no activity (reportsActivity:false) is timed as generating from send.
- * - Every expiry or cancel ABORTS the provider call (signal) and rejects with FixRequestStop.
+ * - Every expiry or cancel ABORTS the provider call (signal) and rejects with FixRequestStop; a
+ *   provider that throws synchronously is settled exactly like one that rejects.
  * NON-GOALS: parsing the answer, retries and handoffs (the runtime owns those).
  */
 
@@ -83,16 +87,41 @@ export function watchFixRequest(request: WatchedRequest, prompt: string, cfg: Fi
       reject(err);
       ac.abort();
     };
-    const check = async () => {
-      if (checking || done) return;
+    // A check that arrives while one is still outstanding is not dropped: it runs right after
+    // (the generation-start check in particular). A probe abandoned by its bound keeps its answer:
+    // a late "cancel" still stops the request.
+    let recheck = false;
+    const check = async (): Promise<void> => {
+      if (done) return;
+      if (checking) {
+        recheck = true;
+        return;
+      }
       checking = true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const probe = Promise.resolve().then(() => cfg.stillWanted());
+      probe.then(
+        (why) => {
+          if (why) stop(new FixRequestStop("cancelled", `fix request cancelled: ${why}`));
+        },
+        () => {
+          /* fail open — the commit path re-verifies relevance */
+        },
+      );
       try {
-        const why = await cfg.stillWanted();
-        if (why) stop(new FixRequestStop("cancelled", `fix request cancelled: ${why}`));
-      } catch {
-        /* fail open — the commit path re-verifies the head */
+        // Bounded: a hung read releases the latch for the next tick (fail open meanwhile).
+        const bound = new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(1, cfg.checkEveryMs));
+          (timer as { unref?: () => void }).unref?.();
+        });
+        await Promise.race([probe.then(() => undefined, () => undefined), bound]);
       } finally {
+        if (timer !== undefined) clearTimeout(timer);
         checking = false;
+        if (recheck && !done) {
+          recheck = false;
+          void check();
+        }
       }
     };
     const onActivity = (p: FixPhase) => {
@@ -122,7 +151,17 @@ export function watchFixRequest(request: WatchedRequest, prompt: string, cfg: Fi
       }
     }, cfg.tickMs);
     (handle.timer as { unref?: () => void }).unref?.();
-    request(prompt, { signal: ac.signal, onActivity }).then(
+    let pending: Promise<string>;
+    try {
+      pending = request(prompt, { signal: ac.signal, onActivity });
+    } catch (error) {
+      // A synchronous throw settles like a rejection: clear the timer, reject, abort.
+      settle();
+      reject(error);
+      ac.abort();
+      return;
+    }
+    pending.then(
       (value) => {
         if (done) return;
         settle();

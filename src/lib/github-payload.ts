@@ -60,10 +60,11 @@ function splitRepo(full: string | undefined): { owner: string; repo: string } | 
 }
 
 /** A comment directive's event time: its creation, or — for a fresh directive that arrived by
- * EDIT — the edit, never the (earlier) creation it would otherwise be backdated to. */
+ * EDIT — the edit. Never the (earlier) creation for an edit: without updated_at the time is
+ * unknown (undefined → the receiver's own clock, which is never earlier than the edit). */
 function commentEventAt(body: Gh): string | undefined {
   const c = body.comment;
-  const at = body.action === "edited" ? c?.updated_at ?? c?.created_at : c?.created_at;
+  const at = body.action === "edited" ? c?.updated_at : c?.created_at;
   return typeof at === "string" ? at : undefined;
 }
 

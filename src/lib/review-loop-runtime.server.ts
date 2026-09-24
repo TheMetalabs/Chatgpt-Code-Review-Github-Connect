@@ -597,7 +597,16 @@ export async function runPostReviewLoop(
     // is never re-posted) and re-read.
     if (!session.active && job.thread?.loop?.kind === "start") {
       const started = await startLoop(token, { owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }, settings, d, env);
-      if (started.posted) session = await sessionOf(gh, token, ref, head, botLogin);
+      // The record exists now (posted, or one the first read missed): re-read, backing off while a
+      // lagging list still hides it — never a silent no-session for a started loop.
+      if (started.posted || started.reason === "start already recorded") {
+        session = await sessionOf(gh, token, ref, head, botLogin);
+        for (const wait of HISTORY_RETRY_DELAYS_MS) {
+          if (session.active || session.endedBy) break; // visible now (or genuinely ended since)
+          await sleep(wait);
+          session = await sessionOf(gh, token, ref, head, botLogin);
+        }
+      }
     }
     if (!session.active) return { ran: false, reason: NO_SESSION };
     requested = true;
@@ -998,36 +1007,48 @@ const inFlightStop = new Set<string>();
  * or the PR body's update time) — so a stop that arrived as an edit, which the session fold
  * cannot replay, still ends the session at the right moment after a restart. Until the record is
  * durable (the post is retrying, or failed) this process honors the stop in every session read,
- * so no fix round commits past it. Only a stop that ENDED an active session is recorded; a
- * repeated stop finds its record and posts nothing. Never throws.
+ * so no fix round commits past it. A stop is recorded when it ENDED the session, or when it races
+ * a start still in flight (the caller saw a live loop-start review for the PR) — a stop that
+ * stopped nothing posts nothing. A repeated stop finds its record and posts nothing. Never throws.
  */
 export async function stopLoop(
   token: string,
-  stop: { owner: string; repo: string; pr: number; actor: string; stopAt?: string },
+  stop: { owner: string; repo: string; pr: number; actor: string; stopAt?: string; startInFlight?: boolean },
   settings: BotSettings,
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
 ): Promise<{ posted: boolean; reason: string }> {
-  const key = prKey(stop);
+  if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
+  const botLogin = ashlarBotLogin(env);
+  if (isSelfLogin(stop.actor, botLogin)) return { posted: false, reason: "bot-authored stop ignored" };
+  const at = stop.stopAt ?? new Date().toISOString();
+  // Single flight per STOP (PR, requester, time) — a distinct stop is never dropped behind another.
+  const key = `${prKey(stop)}:${stop.actor.toLowerCase()}:${isoMs(at)}`;
   if (inFlightStop.has(key)) return { posted: false, reason: "stop already in flight" };
   inFlightStop.add(key);
+  const event: LoopEvent = { at, kind: "stop", actor: stop.actor };
+  let d: LoopRuntimeDeps | undefined;
   try {
-    if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
-    const botLogin = ashlarBotLogin(env);
-    if (isSelfLogin(stop.actor, botLogin)) return { posted: false, reason: "bot-authored stop ignored" };
-    const d = deps ?? (await productionDeps(settings));
-    const head = await d.gh.fetchPullHeadRef(token, stop.owner, stop.repo, stop.pr);
-    const at = stop.stopAt ?? new Date().toISOString();
-    const event: LoopEvent = { at, kind: "stop", actor: stop.actor };
-    const session = await sessionOf(d.gh, token, stop, head, botLogin, [event]);
-    if (session.active || session.endedBy !== "stop" || isoMs(session.endedAt) !== isoMs(at)) return { posted: false, reason: NO_SESSION };
+    d = deps ?? (await productionDeps(settings));
+    // Honored in this process from the first moment, before any read that could fail.
     setPendingStop(d.gh, stop, event, true);
+    const head = await d.gh.fetchPullHeadRef(token, stop.owner, stop.repo, stop.pr);
+    const session = await sessionOf(d.gh, token, stop, head, botLogin);
+    const endedIt = !session.active && session.endedBy === "stop" && isoMs(session.endedAt) === isoMs(at);
+    // Record (the STOPPED acknowledgement) only a stop that ended a session — or one that races a
+    // start whose record may still land later with an earlier time (a live loop-start review for
+    // this PR at stop time). A stop that stopped nothing posts nothing and is forgotten.
+    if (!endedIt && !(stop.startInFlight ?? false)) {
+      setPendingStop(d.gh, stop, event, false);
+      return { posted: false, reason: NO_SESSION };
+    }
     const r = await ensureStopRecord(d.gh, token, stop, { by: stop.actor, at }, botLogin, d.sleep);
     if (r.posted || r.exists) setPendingStop(d.gh, stop, event, false);
     if (r.error) return { posted: false, reason: `stop failed: ${r.error} (honored in this process until recorded)` };
     return r.posted ? { posted: true, reason: "stopped" } : { posted: false, reason: "stop already recorded" };
   } catch (e) {
-    return { posted: false, reason: `stop failed: ${(e as Error)?.message ?? String(e)}` };
+    // The pending stop stays: this process keeps honoring it (a redelivery may record it later).
+    return { posted: false, reason: `stop failed: ${(e as Error)?.message ?? String(e)}${d ? " (honored in this process)" : ""}` };
   } finally {
     inFlightStop.delete(key);
   }

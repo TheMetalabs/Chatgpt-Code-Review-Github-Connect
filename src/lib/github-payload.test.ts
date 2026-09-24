@@ -215,6 +215,26 @@ describe("parseGitHubPayload", () => {
     assert.ok(created.ok && created.kind === "review" && created.thread?.eventAt === "2026-01-06T00:00:00Z");
   });
 
+  it("an edited directive without updated_at is never backdated to its creation", () => {
+    const d = parseGitHubPayload("issue_comment", {
+      action: "edited",
+      repository: { full_name: "acme/pay" },
+      sender: { login: "bob" },
+      changes: { body: { from: "fine" } },
+      issue: { number: 500, pull_request: {}, title: "t" },
+      comment: { id: 9, body: "/review-loop stop", created_at: "2026-01-01T00:00:00Z" },
+    });
+    assert.ok(d.ok && d.kind === "review");
+    if (d.ok && d.kind === "review") {
+      assert.equal(d.eventAt, undefined);
+    }
+    const created = parseGitHubPayload("issue_comment", {
+      action: "created", repository: { full_name: "acme/pay" }, sender: { login: "bob" },
+      issue: { number: 500, pull_request: {}, title: "t" }, comment: { id: 10, body: "/review-loop stop", created_at: "2026-01-02T00:00:00Z" },
+    });
+    assert.ok(created.ok && created.kind === "review" && created.eventAt === "2026-01-02T00:00:00Z");
+  });
+
   it("a PR opened with only a stop directive is a control event, never a review request", () => {
     // The stop travels as control metadata (the loop engine handles it); ingress skips it as
     // control-only, so no review job — and no spurious stop-reason job — is created.

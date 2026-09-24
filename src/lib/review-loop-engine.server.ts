@@ -186,6 +186,12 @@ export function rememberPosted(client: object, key: string, now: number = Date.n
   }
 }
 
+/** ONE handoff per head per session — the key both handoff paths (stuck classification and
+ * terminal failures) record and consult. */
+function handoffKey(o: { owner: string; repo: string; pr: number; head: string; sinceIso?: string; sinceSeq?: number }): string {
+  return `handoff:${o.owner}/${o.repo}#${o.pr}@${o.head}#${o.sinceSeq ?? o.sinceIso ?? ""}`;
+}
+
 export function postedRecently(client: object, key: string, now: number = Date.now()): boolean {
   const at = postedByClient.get(client)?.get(key);
   return at !== undefined && now - at <= POSTED_TTL_MS;
@@ -270,7 +276,9 @@ async function maybeEscalateInner(
     }
     const reasonPeek = classifyStuck(rounds, { roundCap: opts.roundCap, diffLines: opts.diffLines });
     if (!reasonPeek) return { escalated: false, rounds };
-    escalatedBefore = await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq);
+    escalatedBefore =
+      (await alreadyEscalated(gh, token, opts.owner, opts.repo, opts.pr, opts.head, botLogin, opts.sinceIso, opts.sinceSeq)) ||
+      postedRecently(gh, handoffKey(opts));
   } catch (e) {
     return { escalated: false, rounds: [], error: (e as Error)?.message ?? String(e) };
   }
@@ -290,6 +298,7 @@ async function maybeEscalateInner(
     detail: pattern ? `fix-round budget spent; the finding trend also shows ${pattern}` : undefined,
   });
   await gh.createIssueComment(token, { owner: opts.owner, repo: opts.repo, pr: opts.pr, body });
+  rememberPosted(gh, handoffKey(opts));
   return { escalated: true, reason, rounds };
 }
 
@@ -322,7 +331,7 @@ export async function escalateNow(
 ): Promise<{ escalated: boolean; error?: string }> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
-  const sessionKey = `handoff:${key}#${opts.sinceSeq ?? opts.sinceIso ?? ""}`;
+  const sessionKey = handoffKey(opts);
   if (inFlightEscalate.has(key)) return { escalated: false, error: ESCALATE_IN_FLIGHT };
   inFlightEscalate.add(key);
   try {

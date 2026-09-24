@@ -526,3 +526,53 @@ describe("round-5: exact session scoping and read-after-write lag", () => {
     assert.deepEqual({ active: s1.active, startIso: s1.startIso, starter: s1.starter, startSeq: s1.startSeq }, { active: true, startIso: "2026-01-03T00:00:00Z", starter: "carol", startSeq: 2 });
   });
 });
+
+describe("round-6: both handoff paths share the just-posted cache", () => {
+  it("maybeEscalate never double-posts a stuck handoff while the list still omits the first", async () => {
+    const H = "c".repeat(40);
+    const posted: string[] = [];
+    const reviews = [5, 4, 4].map((n, i) => ({ userLogin: BOT, body: findingsBody(n), commitId: i === 2 ? H : `h${i}`.padEnd(40, "0"), submittedAt: `2026-01-0${i + 2}T00:00:00Z` }));
+    const gh = {
+      async listPullReviews() { return reviews; },
+      async listReviewComments() { return reviews.map((r) => ({ userLogin: BOT, path: "a.ts", commitId: r.commitId, createdAt: r.submittedAt })); },
+      async listIssueComments() { return []; }, // never catches up
+      async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
+    };
+    const opts = { owner: "o", repo: "r", pr: 3, head: H, roundCap: 5, sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
+    assert.equal((await maybeEscalate(gh as never, "t", opts)).escalated, true);
+    const again = await maybeEscalate(gh as never, "t", opts);
+    assert.equal(again.escalated, false);
+    assert.equal(posted.length, 1);
+  });
+});
+
+describe("round-6: the two handoff paths see each other's just-posted handoff", () => {
+  const H = "d".repeat(40);
+  const stuck = () => {
+    const posted: string[] = [];
+    const reviews = [5, 4, 4].map((n, i) => ({ userLogin: BOT, body: findingsBody(n), commitId: i === 2 ? H : `k${i}`.padEnd(40, "0"), submittedAt: `2026-01-0${i + 2}T00:00:00Z` }));
+    const gh = {
+      async listPullReviews() { return reviews; },
+      async listReviewComments() { return reviews.map((r) => ({ userLogin: BOT, path: "a.ts", commitId: r.commitId, createdAt: r.submittedAt })); },
+      async listIssueComments() { return []; }, // never catches up
+      async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
+    };
+    return { gh, posted };
+  };
+  const session = { sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
+
+  it("escalateNow first, then maybeEscalate: one handoff", async () => {
+    const { gh, posted } = stuck();
+    assert.equal((await escalateNow(gh as never, "t", { owner: "o", repo: "r", pr: 4, head: H, reason: "fix-failed", rounds: [], roundCap: 5, ...session })).escalated, true);
+    const m = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 4, head: H, roundCap: 5, ...session });
+    assert.equal(m.escalated, false);
+    assert.equal(posted.length, 1);
+  });
+
+  it("maybeEscalate first, then escalateNow: one handoff", async () => {
+    const { gh, posted } = stuck();
+    assert.equal((await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 4, head: H, roundCap: 5, ...session })).escalated, true);
+    assert.equal((await escalateNow(gh as never, "t", { owner: "o", repo: "r", pr: 4, head: H, reason: "fix-failed", rounds: [], roundCap: 5, ...session })).escalated, false);
+    assert.equal(posted.length, 1);
+  });
+});

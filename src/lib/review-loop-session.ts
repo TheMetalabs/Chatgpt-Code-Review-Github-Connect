@@ -26,9 +26,10 @@
  *   anchor, mode and starter. A clean review of the live head always ends the session, and a
  *   push never resumes one (a human push after a real convergence starts nothing).
  * - Events are ordered as INSTANTS (isoMs), never as strings; an undatable event is ignored.
- * - Same-timestamp ties (GitHub timestamps are 1s resolution) order head moves first, then
- *   terminal events, then starts: a start posted in the same second as a handoff begins a new
- *   session, and a head move in a clean review's second marks it stale.
+ * - Same-timestamp ties (GitHub timestamps are 1s resolution) order head moves first, then the
+ *   App's terminal events, then starts, then human stops: a start posted in the same second as a
+ *   handoff begins a new session, a stop in a start's second ends it, and a head move in a clean
+ *   review's second marks it stale.
  * Authorship is the CALLER's job: only bot-authored markers/reviews may become escalate /
  * stopped / converged / continue events, and bot-authored comments never become start/stop events.
  */
@@ -62,7 +63,10 @@ export interface LoopSession {
   endedAt?: string;
 }
 
-const ORDER: Record<LoopEventKind, number> = { continue: -1, push: -1, stop: 0, escalate: 0, stopped: 0, converged: 0, start: 1 };
+// Same-second ties: head moves, then the App's terminal records (a new start in a handoff's
+// second opens a NEW session), then starts, then human stops — a stop in a start's second is
+// causally after it, and stopping is the safe reading.
+const ORDER: Record<LoopEventKind, number> = { continue: -1, push: -1, escalate: 0, stopped: 0, converged: 0, start: 1, stop: 2 };
 
 /** A clean review of `head` is stale when the loop already waits on another head and `head` is
  * not the live one. An unknown reviewed commit keeps the verdict (fail toward ending the loop). */

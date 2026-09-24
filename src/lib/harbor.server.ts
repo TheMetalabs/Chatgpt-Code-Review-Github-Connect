@@ -32,6 +32,7 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
+import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import {
@@ -1341,19 +1342,27 @@ function recordLoopStart(token: string, job: Job): void {
   );
 }
 
+// Loop control claims each delivery before its side effect (loop-control-claims.ts): a
+// control-only delivery leaves no job or accepted event behind to recognize a redelivery by.
+const loopControlClaims = createDeliveryClaims();
+
 function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>, { kind: "review" }>, deliveryId: string) {
   if (!loopEnabled(state.settings) || parsed.installationId === undefined) return;
   const redelivery =
     acceptedDeliveryIds(state.events).includes(deliveryId) || state.jobs.some((j) => j.deliveryId === deliveryId);
-  if (redelivery) return;
+  if (redelivery || !loopControlClaims.claim(deliveryId)) return;
   const installationId = parsed.installationId;
   const { owner, repo, pr, headSha } = parsed.target;
   const run = (label: string, step: (token: string) => Promise<{ posted: boolean; reason: string }>) => {
     void (async () => {
       try {
         const r = await step(await installationToken(installationId));
-        if (!r.posted && /failed/.test(r.reason)) console.warn(`[review-loop] ${label}: ${r.reason}`);
+        if (!r.posted && /failed|in flight/.test(r.reason)) {
+          loopControlClaims.release(deliveryId); // a redelivery may retry what did not land
+          if (/failed/.test(r.reason)) console.warn(`[review-loop] ${label}: ${r.reason}`);
+        }
       } catch (e) {
+        loopControlClaims.release(deliveryId);
         console.warn(`[review-loop] ${label}: ${formatGithubError(e)}`);
       }
     })();
@@ -1364,14 +1373,18 @@ function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>,
   } else if (parsed.thread?.loop?.kind === "stop") {
     // Cancel the LOOP's own review work: jobs a loop directive or the driver's continuation
     // requested. A plain review a human explicitly asked for still runs and posts — it cannot fix
-    // or continue anything, since its loop step finds the session ended by this stop.
+    // or continue anything, since its loop step finds the session ended by this stop. A live
+    // loop-start review means its start record may still land (with an earlier time): the stop is
+    // then recorded even if it ends nothing yet.
+    let startInFlight = false;
     for (const j of state.jobs) {
       if (j.owner === owner && j.repo === repo && j.pr === pr && isLive(j.status) && j.thread?.loop?.kind === "start") {
+        startInFlight = true;
         cancelHarborJob(j.id);
       }
     }
     run(`stop ${owner}/${repo}#${pr}`, (token) =>
-      stopLoop(token, { owner, repo, pr, actor: parsed.actor, stopAt: parsed.eventAt }, state.settings));
+      stopLoop(token, { owner, repo, pr, actor: parsed.actor, stopAt: parsed.eventAt, startInFlight }, state.settings));
   }
 }
 

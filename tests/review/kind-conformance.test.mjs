@@ -288,6 +288,20 @@ const ROWS = [
       await b.tick();
       return {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs.length, retired: !b.pending()};
     }},
+  // W36 (round 12, Ashlar 4097631112): an allocation intent is not a tab. Intended difference: a fix
+  // whose intent never became a proven tab (no owned record, no bound page, delivery record never
+  // `created`) allocates again, once; a review keeps its intent as before (FLAG R8: it waits forever).
+  {id: 'W36', name: 'the worker stopped between the allocation intent and chrome.tabs.create (registry intact, no tab)',
+    expect: {review: {tabs: 0, runs: 0, waiting: true}, fix: {tabs: 1, runs: 1, waiting: false}},
+    async run(kind) {
+      const job = item(kind, kind === 'fix' ? {deliveryId: 'delivery-1'} : {}, {tabId: undefined, started: undefined, allocating: true});
+      const b = worker(kind, {job, api: active, handler: () => ({ok: false, code: 'busy', retry: true})});
+      b.tabs.delete(10);
+      if (kind === 'fix') await b.local.set({'ashlar:fixDeliveries': {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', at: Date.now()}}});
+      await b.tick();await b.tick();
+      return {tabs: b.tabs.size, runs: b.messages.filter(m => m.type === 'ashlar-run' && !m.resume).length,
+        waiting: /tab creation outcome unknown/.test(b.pending().states.chatgpt.connectionError || '')};
+    }},
   {id: 'W11', name: 'a lease conflict (409) on complete drops the lease; the outcome is kept for redelivery', same: true,
     expect: {lease: undefined, kept: true},
     async run(kind) {

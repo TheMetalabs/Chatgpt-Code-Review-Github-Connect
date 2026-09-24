@@ -459,6 +459,91 @@ test('worker: overlapping admission triggers never create two tabs for one fix j
   assert.equal(deaf.local.state.pendingReviewJobs['fix-A'], undefined, 'the duplicate delivery is not admitted');
 });
 
+// Round 12 (Ashlar 4097631112): the delivery record is two-phase. `creating` (the intent) is written
+// before chrome.tabs.create and becomes `created` (with the tabId) only after the tab exists; only a
+// record a tab still proves keeps the delivery out of the server's replay. A worker that stops
+// between the intent and the create must not strand the fix until its deadline.
+const DELIVERIES = 'ashlar:fixDeliveries';
+const FRESH = {kind: 'fix', jobId: 'fix-A', offerKind: 'fresh', deliveryId: 'delivery-1', provider: 'chatgpt', providers: ['chatgpt'], resumeProviders: [],
+  leaseId: 'L', prompt: 'FIX PROMPT', reasoning: {chatgpt: 'pro', grok: 'heavy'}, title: 'fix o/r#1', owner: 'o', repo: 'r', pr: 1};
+/** The server's replay rule (bridge-fix.server.ts peek/T3): the claimed run-less item is offered to
+ * its profile again whenever the take does not list it; the replay is the SAME delivery. */
+function replayingServer() {
+  const takes = [];
+  const api = async (path, body) => {
+    if (body?.action !== 'take') return active(path, body);
+    takes.push(body.excludeJobIds);
+    return body.excludeJobIds.includes('fix-A') ? {ok: true, job: null} : {ok: true, job: {...FRESH, offerKind: takes.length > 1 ? 'replay' : 'fresh'}};
+  };
+  return {api, takes};
+}
+const runsOf = w => w.messages.filter(m => m.type === 'ashlar-run' && m.jobId === 'fix-A' && !m.resume);
+
+test('worker: a stop right after the delivery intent, before the tab exists: after a reset the delivery is replayed and opened once', async () => {
+  const {api, takes} = replayingServer();
+  const handler = () => ({ok: false, code: 'busy', retry: true});
+  const b = background({api, handler});
+  // The worker stops inside chrome.tabs.create: the intent is durable, no tab was ever created.
+  b.chrome.tabs.create = () => new Promise(() => {});
+  void b.tick();
+  assert.ok(await until(() => b.local.state[DELIVERIES]?.['fix-A']), 'the delivery intent was recorded');
+  assert.equal(b.tabs.size, 0);
+  // Restart with an empty job registry and the marker intact.
+  await b.local.set({pendingReviewJobs: {}});
+  const reloaded = background({local: b.local, session: b.session, tabs: b.tabs, api, handler});
+  await reloaded.tick();await reloaded.tick();await reloaded.tick();
+  assert.equal(takes.length >= 2 && takes[1].includes('fix-A'), false, 'an intent that never became a tab does not keep the delivery out');
+  assert.equal(b.tabs.size, 1, 'the delivery is opened, exactly once');
+  assert.equal(runsOf(reloaded).length, 1, 'the prompt is submitted once');
+  const record = b.local.state[DELIVERIES]['fix-A'];
+  assert.equal(record.phase, 'created');assert.equal(record.tabId, [...b.tabs.keys()][0]);assert.equal(record.deliveryId, 'delivery-1');
+  assert.ok(takes.at(-1).includes('fix-A'), 'now proven by its tab, it is listed');
+});
+
+test('worker: a stop right after the delivery intent with the job registry intact: the allocation runs again, one tab, one prompt', async () => {
+  // allocating is journaled, the delivery record is only `creating`, and no tab carries the binding.
+  const job = fixJob({deliveryId: 'delivery-1', states: {chatgpt: {runId: 'run-A', allocating: true}}});
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': job},
+    [DELIVERIES]: {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', at: Date.now()}}}),
+  api: active, handler: () => ({ok: false, code: 'busy', retry: true})});
+  await b.tick();await b.tick();
+  assert.equal(b.tabs.size, 1, 'one tab');
+  assert.equal(runsOf(b).length, 1, 'one prompt');
+  assert.equal(b.local.state[DELIVERIES]['fix-A'].phase, 'created');
+  assert.equal(b.local.state.pendingReviewJobs['fix-A'].states.chatgpt.allocating, undefined);
+});
+
+for (const registry of ['lost', 'intact']) {
+  test(`worker: a stop after chrome.tabs.create, before the promotion (registry ${registry}): the binding proves the tab, no second tab`, async () => {
+    const {api, takes} = replayingServer();
+    const handler = () => ({ok: false, code: 'busy', retry: true});
+    // The tab exists and carries its owned record; the delivery record is still `creating`.
+    const tabs = new Map([[101, {id: 101, url: 'https://chatgpt.com/?temporary-chat=true', status: 'complete'}]]);
+    const session = storage({'ashlar:tab:101': {jobId: 'fix-A', provider: 'chatgpt', runId: 'run-A', closedKey: 'ashlar:closed:fix-A:chatgpt:run-A', closing: false}});
+    const pending = registry === 'lost' ? {} : {'fix-A': fixJob({deliveryId: 'delivery-1', states: {chatgpt: {runId: 'run-A', allocating: true}}})};
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: pending,
+      [DELIVERIES]: {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', at: Date.now()}}}), session, tabs, api, handler});
+    await b.tick();await b.tick();
+    assert.equal(tabs.size, 1, 'no second tab');
+    assert.ok(takes.every(exclude => exclude.includes('fix-A')), 'the delivery stays out of the replay');
+    if (registry === 'lost') {
+      assert.equal(runsOf(b).length, 0, 'the prompt is never submitted again');
+      assert.deepEqual({phase: b.local.state[DELIVERIES]['fix-A'].phase, tabId: b.local.state[DELIVERIES]['fix-A'].tabId}, {phase: 'created', tabId: 101}, 'promoted by its binding');
+    } else {
+      assert.equal(b.local.state.pendingReviewJobs['fix-A'].states.chatgpt.tabId, 101, 'the allocation recovered its own tab');
+    }
+  });
+}
+
+test('worker: a created delivery whose tab is gone and that no tab binds no longer keeps the delivery out', async () => {
+  const {api, takes} = replayingServer();
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {},
+    [DELIVERIES]: {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'created', tabId: 77, at: Date.now()}}}), api, handler: () => ({ok: false, code: 'busy', retry: true})});
+  await b.tick();
+  assert.equal(takes[0].includes('fix-A'), false);
+  assert.equal(b.tabs.size, 1);assert.equal(runsOf(b).length, 1);
+});
+
 test('worker: a cancelled fix tab that now carries another binding retires after the wait, leaving that binding untouched', async () => {
   const other = {ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B', provider: 'chatgpt'};
   const handler = (_id, m) => (m.type === 'ashlar-tab-status'

@@ -732,6 +732,23 @@ async function startSendProbe(record) {
       } catch { /* diagnostics never affect the run */ }
     };
     for (const seconds of [1, 5, 15, 30, 60]) setTimeout(() => save(`${seconds}s`), Math.max(0, clickedAt + seconds * 1000 - Date.now()));
+    // HTML snapshot of the conversation area (the user asked for the live DOM, #93): fix runs only,
+    // which carry Ashlar's own prompt. Scripts, styles and SVG paths are dropped; capped; last 3 kept.
+    if (state?.kind === "fix" && (await local.get(["sendProbeHtmlOff"]))?.sendProbeHtmlOff !== true) {
+      for (const seconds of [5, 60]) setTimeout(() => {
+        try {
+          const area = document.querySelector("main") || document.body;
+          const clone = area.cloneNode(true);
+          for (const node of clone.querySelectorAll("script,style,noscript,svg path,img")) node.remove();
+          const html = clone.outerHTML.slice(0, 200_000);
+          globalThis.__ashlarSendProbeWrites = (globalThis.__ashlarSendProbeWrites || Promise.resolve()).then(async () => {
+            const stored = (await local.get(["sendProbeHtml"]))?.sendProbeHtml;
+            const list = Array.isArray(stored) ? stored : [];
+            await local.set({sendProbeHtml: [...list, {job, run, label: `${seconds}s`, at: Date.now(), url: location.href.split("?")[0], html}].slice(-3)});
+          }).catch(() => {});
+        } catch { /* diagnostics never affect the run */ }
+      }, Math.max(0, clickedAt + seconds * 1000 - Date.now()));
+    }
   } catch { /* diagnostics never affect the run */ }
 }
 

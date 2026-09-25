@@ -183,17 +183,15 @@ export function localReplies(leg: { unparsedText?: string; residualReplies?: str
   return [...new Set([leg.unparsedText, leg.residualReplies, leg.originalText].map((t) => t?.trim() ?? "").filter(Boolean))].join("\n\n---\n\n");
 }
 
-/** A RELEASED held local leg (verification round or chat-down fallback) that failed after the model
- * completed a reply that is not review JSON: that reply is the only evidence it produced, possibly a
- * real finding, so it becomes a salvaged leg (posted verbatim) instead of a "Skipped local". Both the
- * failed JSON correction (`originalText`) and the reply before it (`unparsedText`) count, so a
- * correction that itself fails (HTTP 500, transport error, abort) still keeps the first reply. A
- * failure with no completed reply stays a failure. Race is unchanged: its local leg is not held. */
-export function heldLocalSalvage(
-  job: Pick<Job, "localReviewRole" | "reviewProviders" | "localVerifyStartedAt" | "localFallbackAt">,
-  failure: { originalText?: string; unparsedText?: string },
-): string | undefined {
-  if (!heldLocalReleased(job)) return undefined;
+/** A local leg that failed after the model completed a reply that is not review JSON, on any role
+ * (race, or a released held leg: verification round or chat-down fallback): that reply is the only
+ * evidence it produced, possibly a real finding, so it becomes a salvaged leg (posted verbatim)
+ * instead of a "Skipped local". The same first reply is evidence when its JSON correction parses
+ * (incompleteVerdict), so a correction that fails cannot lose it. Both the failed JSON correction
+ * (`originalText`) and the reply before it (`unparsedText`) count, so a correction that itself fails
+ * (HTTP 500, transport error, abort) still keeps the first reply. A failure with no completed reply
+ * stays a failure. */
+export function failedLocalSalvage(failure: { originalText?: string; unparsedText?: string }): string | undefined {
   const replies = localReplies(failure);
   return replies ? salvageReviewJson(replies) : undefined;
 }

@@ -31,7 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, fallbackWaivesChat, gateUnreadRows, heldLocalReleased, heldLocalSalvage, incompleteVerdict, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
+import { chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -885,8 +885,8 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     if (!local.ok) {
       transitionJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
-        // A released held leg's completed non-JSON reply is evidence: kept as a salvaged leg.
-        const salvage = heldLocalSalvage(j, local);
+        // A completed non-JSON reply is evidence on any role: kept as a salvaged leg.
+        const salvage = failedLocalSalvage(local);
         if (salvage) return collectLocalLeg(j, salvage, localReplies(local));
         return {
           ...j, generating: {...j.generating, local: false},

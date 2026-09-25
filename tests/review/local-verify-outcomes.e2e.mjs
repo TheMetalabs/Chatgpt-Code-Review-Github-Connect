@@ -278,6 +278,11 @@ const RACE_CELLS={
   'clean x proseThenClean':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],why:WHY_NOT_VERDICT}),
   'clean x proseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_NOT_VERDICT}),
   'clean x multiturnProseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_NOT_VERDICT}),
+  // a leg that failed after completing a reply keeps that reply as evidence, never "Skipped local":
+  // the correction replied in prose too, or failed outright, or the multi-turn group did
+  'clean x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],why:WHY_UNPARSEABLE}),
+  'clean x proseThen500':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],why:WHY_UNPARSEABLE}),
+  'clean x multiturnProse':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_UNPARSEABLE}),
   // with no usable leg a rejected reply still skips (nothing posts, nothing claims clean)
   'none x error':skipped(1),
 };

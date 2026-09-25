@@ -1,7 +1,8 @@
 # Local verification of clean chat reviews (`localReviewRole=verify-clean`)
 
-Opt-in. The default role is `race` (local runs alongside the chat reviewers), and nothing here
-changes a race job. With `verify-clean` the chat reviewers run first and the local leg is held
+Opt-in. The default role is `race` (local runs alongside the chat reviewers), and apart from two
+evidence rules in §1 (a failed local leg's completed reply, and the complete-verdict rule) nothing
+here changes a race job. With `verify-clean` the chat reviewers run first and the local leg is held
 back. It is released either as a **verification round** (the merged chat result is clean) or as the
 **fallback** (chat produced nothing usable). The role is pinned on the job at snapshot
 (`Job.localReviewRole`), so a later settings change never alters a review in flight.
@@ -36,14 +37,18 @@ race.
 Rules the table encodes:
 
 - A reply that could not be parsed is **evidence, never discarded**. Every leg's salvaged text is
-  combined into the raw block (`salvagedReview`, which has no role or provider filter). A released
-  held local leg that completes with a non-JSON reply becomes a salvaged leg (`heldLocalSalvage`)
-  instead of "Skipped local", so in the verification round it posts as `raw-unverified` with its own
-  header and a real finding in it reaches the fixing agent. Every completed reply counts: when the
+  combined into the raw block (`salvagedReview`, which has no role or provider filter). A local leg
+  that fails after completing a non-JSON reply becomes a salvaged leg (`failedLocalSalvage`) instead
+  of "Skipped local", on any role: on race it posts as `raw` evidence (race cells `clean ×
+  unparseable`, `clean × proseThen500`, `clean × multiturnProse`), in the verification round as
+  `raw-unverified` with its own header, and as the fallback as `raw`, so a real finding in it reaches
+  the fixing agent. (The same first reply is evidence when its JSON correction parses, below, so the
+  correction failing must not drop it.) Every completed reply counts: when the
   one JSON correction itself fails (HTTP 500, transport error, liveness or deadline abort), the first
   reply is still salvaged, and the multi-turn tool loop (`localReviewMode=multiturn`, or `auto` on a
   large PR) returns each failed group's completed reply the same way. A failure with no completed
-  reply (HTTP 500, transport error, offline) stays a failure: `unverified-clean`.
+  reply (HTTP 500, transport error, offline) stays a failure: `unverified-clean` in a verification
+  round, "Skipped local" on race.
 - **Only a complete verdict earns clean credit**, for every leg — chat or local, race or
   verify-clean, held or not (`incompleteVerdict` in `gateLeg`, stamped per provider by the merge). A
   reply is its reviewer's verdict only when it passes the gate on its own with
@@ -77,8 +82,8 @@ Rules the table encodes:
   has findings past the gate's `GATED_FINDINGS_CAP` rows (`overflow`, never inspected) is gated as
   evidence (`gateUnreadRows`), with `<provider>: N finding(s) past the gate's row cap were not
   inspected (reply posted verbatim)` among the assumptions: the unread row may be the finding (cells
-  `overflow × *`, and the race test). The complete-verdict rule is a gate rule, so it is the one place
-  this document changes a race job: before it, race posted such replies clean and CONVERGED.
+  `overflow × *`, and the race test). The complete-verdict rule is a gate rule, so it changes a race
+  job too: before it, race posted such replies clean and CONVERGED.
 - "A reviewer was skipped" is structured provider state: `submitHarborChat` stamps
   `Job.skippedProviders` (the enabled reviewers with no payload) with the merge, and the body lists it
   as one system line. It is never inferred from assumptions, which also carry the reviewers' own

@@ -77,7 +77,7 @@ export async function pingLocalLlm(
 
 /** One local leg's result. `unparsedText` holds every completed model reply that was not review JSON
  * and is not `originalText` (for example the first reply before the one JSON correction): it may carry
- * the real finding, so the caller keeps it as evidence (heldLocalSalvage, incompleteVerdict), never
+ * the real finding, so the caller keeps it as evidence (failedLocalSalvage, incompleteVerdict), never
  * drops it.
  * `residualReplies` holds, verbatim, every completed reply whose review JSON was accepted although
  * the model also wrote text outside that object (extractChatJsonParts): the accepted JSON does not

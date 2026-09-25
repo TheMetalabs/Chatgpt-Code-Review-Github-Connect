@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, heldLocalSalvage, incompleteVerdict, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import { chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
 import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
@@ -173,41 +173,31 @@ describe("verify-clean local role", () => {
   });
 });
 
-describe("heldLocalSalvage", () => {
-  const CL = ["chatgpt", "local"] as const;
-  const held = { localReviewRole: "verify-clean" as const, reviewProviders: [...CL] };
+describe("failedLocalSalvage", () => {
   const text = "P1 a.ts:1 LOCAL-RAW: a duplicate request writes twice";
   const rawOf = (s: string | undefined) => (s ? (JSON.parse(s) as { raw_review: string }).raw_review : undefined);
 
-  it("never salvages a race leg or a held leg that was not released", () => {
-    assert.equal(heldLocalSalvage({ ...held, localReviewRole: "race", localVerifyStartedAt: 1 }, { originalText: text }), undefined);
-    assert.equal(heldLocalSalvage(held, { originalText: text }), undefined);
-  });
-
-  it("keeps a released leg's completed non-JSON reply verbatim (verification round and fallback)", () => {
-    for (const stamp of [{ localVerifyStartedAt: 1 }, { localFallbackAt: 1 }]) {
-      const raw = rawOf(heldLocalSalvage({ ...held, ...stamp }, { originalText: text }));
-      assert.ok(raw?.includes(text), JSON.stringify(stamp));
-      assert.match(raw ?? "", /Detected severity markers: P1\./);
-    }
+  it("keeps a failed leg's completed non-JSON reply verbatim", () => {
+    const raw = rawOf(failedLocalSalvage({ originalText: text }));
+    assert.ok(raw?.includes(text));
+    assert.match(raw ?? "", /Detected severity markers: P1\./);
   });
 
   it("keeps the first reply as well when the JSON correction replied differently; identical replies once", () => {
-    const v = { ...held, localVerifyStartedAt: 1 };
-    const raw = rawOf(heldLocalSalvage(v, { unparsedText: "P1 a.ts:1 FIRST-REPLY-MARK", originalText: "still prose" })) ?? "";
+    const raw = rawOf(failedLocalSalvage({ unparsedText: "P1 a.ts:1 FIRST-REPLY-MARK", originalText: "still prose" })) ?? "";
     assert.match(raw, /FIRST-REPLY-MARK[\s\S]*\n---\n[\s\S]*still prose/);
-    const same = rawOf(heldLocalSalvage(v, { unparsedText: text, originalText: text })) ?? "";
+    const same = rawOf(failedLocalSalvage({ unparsedText: text, originalText: text })) ?? "";
     assert.equal(same.split(text).length - 1, 1);
   });
 
   it("keeps the first reply when the JSON correction itself failed (no completed correction)", () => {
-    const raw = rawOf(heldLocalSalvage({ ...held, localVerifyStartedAt: 1 }, { unparsedText: "P1 a.ts:1 FIRST-REPLY-MARK" })) ?? "";
+    const raw = rawOf(failedLocalSalvage({ unparsedText: "P1 a.ts:1 FIRST-REPLY-MARK" })) ?? "";
     assert.match(raw, /FIRST-REPLY-MARK/);
   });
 
   it("a failure with no completed reply (HTTP 500, transport error) stays a failure", () => {
-    assert.equal(heldLocalSalvage({ ...held, localVerifyStartedAt: 1 }, {}), undefined);
-    assert.equal(heldLocalSalvage({ ...held, localVerifyStartedAt: 1 }, { originalText: "  " }), undefined);
+    assert.equal(failedLocalSalvage({}), undefined);
+    assert.equal(failedLocalSalvage({ originalText: "  " }), undefined);
   });
 });
 

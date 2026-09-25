@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import {readdirSync} from 'node:fs';
 import {join} from 'node:path';
 import {root, source} from './load-source.mjs';
+import {background, storage} from './helpers.mjs';
 import {PROGRESS_LABELS, sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
 
 /** The stages a progress call can record: string literals among the workerStep / recordReviewStep /
@@ -94,8 +95,32 @@ test('every stage the extension records has a history label (sanitizeProgressEve
   assert.deepEqual(kept(stages, 'page'), stages);
 });
 
-test('salvaged_no_repair (worker: raw reply delivered with Local JSON repair off) reaches history', () => {
+test('salvaged_no_repair (worker: invalid reply delivered as a raw review, no accepted repair) reaches history', () => {
   assert.deepEqual(kept(['salvaged_no_repair']), ['salvaged_no_repair']);
+});
+
+test('salvaged_no_repair is recorded with Local JSON repair on too, so its label does not claim repair was off', async () => {
+  // Two call sites record it: repairProvider with repair off (the reply goes out verbatim and the server
+  // salvages it), and the stall sweep after a repair that ended without being accepted (repair on; the
+  // worker sends salvageReviewEnvelope's canonical raw_review, not the reply). The label holds for both.
+  const job = {jobId: 'A', origin: 'http://bridge', leaseId: 'lease-A', prompt: 'review A', serverStatus: 'awaiting_chat',
+    localJsonRepairEnabled: true, providers: ['chatgpt'],
+    states: {chatgpt: {started: true, runId: 'run-A', tabId: 10,
+      workerEvents: [{source: 'worker', sequence: 1, stage: 'submitted', at: Date.now() - 24 * 3_600_000}],
+      sourceCapture: {archiveDurable: true, text: 'prose, not JSON', totalChars: 15, sourceHash: 'h', responseId: 'r', id: 'cap'},
+      repairAttempt: {id: 'ra', status: 'needs_attention', sourceHash: 'h', responseId: 'r'}}}};
+  const b = background({
+    local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {A: job}}),
+    tabs: new Map(), handler: () => ({ok: false, code: 'job_mismatch'}),
+  });
+  await b.context.clearStuckJobs({includeStalled: true});
+  const stages = b.calls.flatMap(call => call.progress?.chatgpt?.events?.map(event => event.stage) ?? []);
+  assert.ok(stages.includes('salvaged_no_repair'), 'the sweep records salvaged_no_repair for a repair-on leg');
+  const complete = b.calls.find(call => call.action === 'complete' && call.jobId === 'A');
+  assert.notEqual(complete.raw, 'prose, not JSON', 'the reply is not delivered verbatim here');
+  assert.equal(JSON.parse(complete.raw).raw_review, 'prose, not JSON', 'it is delivered as a raw review');
+  assert.doesNotMatch(PROGRESS_LABELS.salvaged_no_repair, /repair off|verbatim/i);
+  assert.match(PROGRESS_LABELS.salvaged_no_repair, /raw review/i);
 });
 
 test('a template stage without a declared expansion fails the guard instead of passing unchecked', () => {

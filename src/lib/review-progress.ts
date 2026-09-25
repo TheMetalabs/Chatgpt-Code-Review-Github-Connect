@@ -47,7 +47,7 @@ export const PROGRESS_LABELS = {
     disconnected: "Tab connection unknown · waiting for reconnection",
     context_changed: "Conversation changed · collect only the bound review; preserve tab",
     cancelled: "Run stopped · the job was cancelled or forgotten; nothing more is sent or collected",
-    salvaged_no_repair: "JSON invalid · original delivered verbatim (Local JSON repair off)",
+    salvaged_no_repair: "JSON invalid · original delivered as a raw review (no accepted repair)",
     quota: "Provider reported a usage limit",
     error: "Provider or submission reported an explicit error",
     local_queued: "Local LLM request sent · waiting in the model queue (server alive, no output yet)",

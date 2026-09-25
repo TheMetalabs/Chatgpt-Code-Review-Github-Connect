@@ -621,8 +621,9 @@ const STATEMENT_HEADS = new Set(['if', 'for', 'while', 'with', 'switch', 'catch'
 function functionAt(tokens, k) {
   const token = tokens[k];
   if (isPunct(token, '=>')) {
-    let to = k + 2;
-    if (tokens[k + 1]?.open !== '{') for (to = k + 1; to < tokens.length && !isPunct(tokens[to], ',') && !isPunct(tokens[to], ';'); to += 1);
+    if (tokens[k + 1]?.open === '{') return {from: k - 1, to: k + 2};
+    let to = k + 1;
+    while (to < tokens.length && !isPunct(tokens[to], ',') && !isPunct(tokens[to], ';')) to += 1;
     return {from: k - 1, to};
   }
   if (token.open !== '{') return null;

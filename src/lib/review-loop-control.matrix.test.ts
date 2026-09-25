@@ -15,7 +15,10 @@
  *   I6 a newer session is never ended by an older record — also one started in the same second
  *      as the older write's POST (GitHub orders events at one-second resolution);
  *   I7 a human stop survives a restart — even one that found the session ended only by this
- *      process's own write that may not be durable.
+ *      process's own write that may not be durable;
+ *   I8 a stop stays the boundary before a newer session — its record is owed while it is not
+ *      posted: a redelivery sends a refused one and only looks for an unknown one, and once it
+ *      landed a restart anchors the newer session at its own start.
  * One table instead of one test per bug: each review round found another cell of this space.
  */
 import { describe, it } from "node:test";
@@ -29,7 +32,7 @@ import {
   parseStopRecord,
   startComment,
 } from "./review-loop.ts";
-import { readLoopEvents, readLoopSession } from "./review-loop-engine.server.ts";
+import { readLoopEvents, readLoopSession, reconstructRounds } from "./review-loop-engine.server.ts";
 import { controlKey, ownWrites, type ControlKey } from "./review-loop-control.ts";
 import { postedIssueComment } from "./github-transport.ts";
 import {
@@ -88,9 +91,12 @@ type Shape = "none" | "row" | "row-without-id" | "null" | "primitive";
  * missing created_at, as production decodes it) or malformed — the listed row keeps its time. */
 type Stamp = "valid" | "empty" | "malformed";
 type List = "normal" | "lagging" | "failing";
+/** What happens after the call. newer-start-redelivery (a stop): carol starts a newer session,
+ * then the stop is redelivered — by then GitHub accepts a record it refused. */
 type Later =
   | "redelivery"
   | "newer-start"
+  | "newer-start-redelivery"
   | "same-second-start"
   | "25h"
   | "row-appears"
@@ -136,16 +142,18 @@ const SHAPES: Record<Write, Shape[]> = {
 };
 const STAMPS: Stamp[] = ["valid", "empty", "malformed"];
 const LISTS: List[] = ["normal", "lagging", "failing"];
-const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears", "row-relapses", "push", "moved", "stop-restart"];
+const LATERS: Later[] = ["redelivery", "newer-start", "newer-start-redelivery", "same-second-start", "25h", "row-appears", "row-relapses", "push", "moved", "stop-restart"];
 const ANCHORS: Anchor[] = ["listed", "lagging", "lost"];
 const PEERS: Peer[] = ["none", "before", "after"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
  * the POST matters only where the write is stamped at its attempt (a continuation or handoff); a
- * human push, or a step whose head moved, reads a session a handoff may have ended. */
+ * human push, or a step whose head moved, reads a session a handoff may have ended; a stop's
+ * redelivery after a newer start tests the boundary only a stop draws. */
 function applies(via: Via, later: Later): boolean {
   if (later === "same-second-start") return kindOf(via) === "continue" || kindOf(via) === "handoff";
+  if (later === "newer-start-redelivery") return kindOf(via) === "stop";
   if (later === "push" || later === "moved") return kindOf(via) === "handoff";
   return true;
 }
@@ -439,12 +447,17 @@ class World {
     }
     this.underTest.push(this.phase);
     const { write, shape, stamp } = this.cell;
-    if (write === "rejected") throw writeError("rejected", 422);
+    if (write === "rejected" && !this.refusalPassed()) throw writeError("rejected", 422);
     if (write === "unknown-lost") throw writeError("unknown", 502);
     const row = this.store(BOT, body, at);
     this.rowsForWrite += 1;
-    if (shape === "none") throw writeError("unknown", 502); // unknown-landed
-    return this.answer(row, shape, stamp);
+    if (write === "unknown-landed" && shape === "none") throw writeError("unknown", 502);
+    return this.answer(row, shape, stamp); // a shape with no usable row: unknown-landed too
+  }
+
+  /** A refused write is refused for good — except a stop redelivered after a newer start. */
+  private refusalPassed(): boolean {
+    return this.cell.later === "newer-start-redelivery" && this.phase === "again";
   }
 
   /** The list outage starts at the write's first POST; carol's newer start waits for its backoff. */
@@ -702,6 +715,40 @@ async function assertStopSurvivesRestart(w: World): Promise<void> {
   assert.equal(s.active, false, `I7: the stop is lost after a restart: ${JSON.stringify(r)} → ${JSON.stringify(s)}`);
 }
 
+/** What bob's stop, redelivered after carol's newer start, reports: its refused record is sent
+ * (GitHub accepts it now), a landed one is found, one whose outcome is unknown and that no read
+ * lists stays unknown — never re-sent, never "no active loop session". */
+function expectBoundary(c: Cell): Cls {
+  if (c.write === "rejected") return "posted";
+  return expectAgain(c, c.list === "failing");
+}
+
+/** I8: bob's stop ended alice's session and carol has started a newer one since. The stop's
+ * redelivery owes its record; in this process carol's session is her own, and — once the record
+ * landed — after a restart too (a fresh journal: durable history only), with no round from before
+ * the stop. A record whose outcome is unknown and that never landed is not re-sent: only this
+ * process keeps that boundary. */
+async function assertStopBoundaryOwed(w: World): Promise<void> {
+  await w.injectCarol();
+  if (w.cell.list === "failing") w.catchUp(); // an unreadable session fails the stop: harbor redelivers it
+  w.clock += 60_000;
+  w.phase = "again";
+  const r = await w.enter(); // bob's stop, redelivered
+  const cls = classify(w, r);
+  assert.equal(cls, expectBoundary(w.cell), `I3 boundary: ${JSON.stringify(r)}`);
+  assertLogged(w, r, cls, "boundary");
+  const own = (s: LoopSession) => s.active && isoMs(s.startIso) === isoMs(w.carolAt);
+  const here = await w.session();
+  assert.ok(own(here), `I8: carol's session is not her own in this process: ${JSON.stringify(here)}`);
+  if (w.rowsForWrite === 0) return;
+  w.catchUp();
+  const restarted = { ...w.deps.gh }; // another client object: an empty journal
+  const s = await readLoopSession(restarted, "t", "o", "r", w.pr, { botLogin: BOT, pr: { sha: w.live() } });
+  assert.ok(own(s), `I8: after a restart carol's start re-issues the stopped session: ${JSON.stringify(s)}`);
+  const rounds = await reconstructRounds(restarted, "t", "o", "r", w.pr, { botLogin: BOT, sinceIso: s.startIso });
+  assert.equal(rounds.length, 0, "I8: a round from before the stop counts in carol's session");
+}
+
 /** I6: carol's newer start is never ended by an older record; a step in her session runs. */
 async function assertNewerSessionLives(w: World): Promise<void> {
   const { via, write } = w.cell;
@@ -747,6 +794,8 @@ async function runCell(c: Cell, pr: number): Promise<void> {
       await assertNextHeadHeard(w);
     } else if (c.later === "stop-restart") {
       await assertStopSurvivesRestart(w);
+    } else if (c.later === "newer-start-redelivery") {
+      await assertStopBoundaryOwed(w);
     } else {
       // I5 on a readable list (not beside carol's start, which would answer for the write)
       if (c.list !== "failing") {

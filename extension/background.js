@@ -466,25 +466,52 @@ async function refreshTabInventory() {
     const provider=["chatgpt","grok"].find(p=>allowedTab(tab,p));
     if(!provider || tab.status === "loading" || tab.pendingUrl || inventoryLanes.has(tab.id))continue;
     const epoch=tabEpochs.get(tab.id) || 0;
-    void singleFlight(inventoryLanes,tab.id,async()=>{
-      let result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
-      if(result?.ownershipProtocol!==1 && inventoryUpgrades.get(tab.id)!==epoch) {
-        inventoryUpgrades.set(tab.id,epoch);
-        await chrome.scripting.executeScript({target:{tabId:tab.id},files:contentFiles(provider)});
-        result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
-      }
-      const current=await chrome.tabs.get(tab.id);
-      if((tabEpochs.get(tab.id) || 0)!==epoch || current.status==="loading" || current.pendingUrl ||
-          current.url!==tab.url || result?.url!==tab.url || result?.ownershipProtocol!==1 || result.provider!==provider ||
-          typeof result.jobId!=="string" || typeof result.runId!=="string")return;
-      tabOwners.set(tab.id,{url:tab.url,jobId:result.jobId,provider,runId:result.runId,released:result.released === true});
-      await completePreservedRelease(tab,provider,result);
-    }).catch(()=>{tabOwners.delete(tab.id);});
+    void singleFlight(inventoryLanes,tab.id,()=>probeTabOwner(tab,provider,epoch))
+      .catch(()=>{if((tabEpochs.get(tab.id) || 0)===epoch)tabOwners.delete(tab.id);});
   }
   // A preserved record whose tab is gone has nothing left to release.
   const session=await chrome.storage.session.get(null);
   const stale=Object.entries(session).filter(([key,value])=>key.startsWith(PRESERVED_PREFIX) && Number.isInteger(value?.tabId) && !live.has(value.tabId)).map(([key])=>key);
   if(stale.length)await chrome.storage.session.remove(stale);
+}
+
+/** One ownership probe of `tab`, recorded only while the tab's inventory epoch is still `epoch`: a
+ * probe that an invalidation overtook (tab removed, or its page answered a newer handshake) is dropped. */
+async function probeTabOwner(tab, provider, epoch) {
+  let result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
+  if(result?.ownershipProtocol!==1 && inventoryUpgrades.get(tab.id)!==epoch) {
+    inventoryUpgrades.set(tab.id,epoch);
+    await chrome.scripting.executeScript({target:{tabId:tab.id},files:contentFiles(provider)});
+    result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
+  }
+  const current=await chrome.tabs.get(tab.id);
+  if((tabEpochs.get(tab.id) || 0)!==epoch || current.status==="loading" || current.pendingUrl ||
+      current.url!==tab.url || result?.url!==tab.url || result?.ownershipProtocol!==1 || result.provider!==provider ||
+      typeof result.jobId!=="string" || typeof result.runId!=="string")return;
+  tabOwners.set(tab.id,{url:tab.url,jobId:result.jobId,provider,runId:result.runId,released:result.released === true});
+  await completePreservedRelease(tab,provider,result);
+}
+
+/** A page that just answered this worker's cleanup handshake by keeping its tab (the user took it
+ * over, or the archived response changed) may have released its managed slot in that same answer.
+ * Every earlier ownership snapshot of the tab predates that answer: an inventory probe that reached
+ * the page first still says "unreleased", and once the leg retires, that stale binding would count
+ * as an untracked orphan against tab capacity (blocking admission) until some later probe happens
+ * to land. So the prior snapshot and any probe still in flight are invalidated, and the page is asked
+ * again now, BEFORE the leg is marked cleaned up (retirement requires that). The page's own answer is
+ * the only evidence recorded; if it cannot answer, the tab stays uncertain (reserved), never free. */
+async function reprobePreservedTab(tabId, provider) {
+  if(!Number.isInteger(tabId))return;
+  invalidateTabInventory(tabId);
+  const epoch=tabEpochs.get(tabId);
+  try {
+    const tab=await chrome.tabs.get(tabId);
+    if(allowedTab(tab,provider) && tab.status!=="loading" && !tab.pendingUrl)await probeTabOwner(tab,provider,epoch);
+  } catch { if(tabEpochs.get(tabId)===epoch)tabOwners.delete(tabId); }
+}
+async function preserveAnsweredTab(job, provider, jobs, reason) {
+  await reprobePreservedTab(job.states[provider].tabId,provider);
+  return finishTabCleanup(job,provider,jobs,reason);
 }
 
 /** The preserve handshake a review tab always completes before its job retires (the page frees
@@ -769,7 +796,7 @@ async function cleanupProviderBody(job, provider, jobs) {
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
         captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
       if(matchesJob(restored,job,provider) && restored.code==="capture_source_changed")
-        return finishTabCleanup(job,provider,jobs,"archived response unavailable or changed; tab preserved");
+        return preserveAnsweredTab(job,provider,jobs,"archived response unavailable or changed; tab preserved");
       if(!matchesJob(restored,job,provider) || !restored.accepted) {
         state.cleanupError="archived source cleanup proof unavailable; tab preserved pending positive ownership";
         await saveJobs(jobs);return;
@@ -786,7 +813,7 @@ async function cleanupProviderBody(job, provider, jobs) {
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
         captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
       if(matchesJob(restored,job,provider) && restored.code==="capture_source_changed")
-        return finishTabCleanup(job,provider,jobs,"archived response unavailable or changed; tab preserved");
+        return preserveAnsweredTab(job,provider,jobs,"archived response unavailable or changed; tab preserved");
       if(matchesJob(restored,job,provider) && restored.accepted) {
         saved.cleanupProofConfirmed=true;saved.confirmed=true;await saveJobs(jobs);
         result=await sendToTab(tab.id,tabMessage(job,provider,"ashlar-can-close"),contentFiles(provider));
@@ -796,7 +823,7 @@ async function cleanupProviderBody(job, provider, jobs) {
       const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-result-saved"),committed:true,
         raw:state.outcome.raw,text:state.outcome.originalText,completion:state.outcome.completion},contentFiles(provider));
       if(matchesJob(restored,job,provider) && restored.code === "completion_changed")
-        return finishTabCleanup(job,provider,jobs,"acknowledged response changed; tab preserved");
+        return preserveAnsweredTab(job,provider,jobs,"acknowledged response changed; tab preserved");
       if(matchesJob(restored,job,provider) && restored.accepted)
         result=await sendToTab(tab.id,tabMessage(job,provider,"ashlar-can-close"),contentFiles(provider));
     }
@@ -805,7 +832,7 @@ async function cleanupProviderBody(job, provider, jobs) {
       await saveJobs(jobs);
       return;
     }
-    if (result.reason === "repurposed") return finishTabCleanup(job, provider, jobs, "user continued the conversation; tab preserved");
+    if (result.reason === "repurposed") return preserveAnsweredTab(job, provider, jobs, "user continued the conversation; tab preserved");
     if (!result.canClose) {
       state.cleanupWaitReason="page_completion_or_journal_pending";
       await saveJobs(jobs);return; // No deadline or forced eviction.
@@ -1285,7 +1312,7 @@ async function captureProvider(job, provider, jobs) {
     state.cleanupPending=true;
     delete state.captureError;
     await saveJobs(jobs);
-    return finishTabCleanup(job,provider,jobs,"archived response unavailable or changed; tab preserved");
+    return preserveAnsweredTab(job,provider,jobs,"archived response unavailable or changed; tab preserved");
   }
   if(!result.accepted)return;
   saved.cleanupProofConfirmed=true;
@@ -1309,7 +1336,7 @@ async function notifyRepairReceipt(job, provider, jobs) {
       // The server already secured this original, but the page can no longer
       // attest to it. Preserve the page rather than closing an ambiguous tab.
       state.repairReceiptPending=false;
-      await finishTabCleanup(job,provider,jobs,"repair source changed; tab preserved");
+      await preserveAnsweredTab(job,provider,jobs,"repair source changed; tab preserved");
     }
     return;
   }

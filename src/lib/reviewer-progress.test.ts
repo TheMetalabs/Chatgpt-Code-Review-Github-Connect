@@ -236,4 +236,21 @@ describe("buildReviewerLanes", () => {
     }
   });
 
+  it("a logged-out ChatGPT leg reads as a login problem in the lane and the ops headline (#455)", () => {
+    // Real producer path: the worker delivers "logged_out: <page message>" to failBridgeProvider,
+    // which records the skip note and the structured code.
+    const lanes = buildReviewerLanes(job({
+      reviewProviders: ["chatgpt"], generating: { chatgpt: false },
+      providerErrors: { chatgpt: { code: "logged_out", message: "logged_out: ChatGPT is logged out in this Chrome profile; log in and retry (nothing was typed or sent)" } },
+      assumptions: ["Skipped chatgpt: logged_out: ChatGPT is logged out in this Chrome profile; log in and retry (nothing was typed or sent)"],
+    }));
+    assert.equal(lanes[0].state, "skipped");
+    assert.match(lanes[0].detail, /^logged out in the worker's Chrome profile · log in there and retry/);
+    const skip = emptyReviewSkip(lanes);
+    assert.equal(skip.usageLimited, false);
+    assert.match(skip.skipReason, /ChatGPT logged out in Chrome/);
+    assert.match(skip.ops[0], /ChatGPT is logged out in the worker's Chrome profile; log in there and retry/);
+    assert.match(skip.ops[1], /^ChatGPT: logged out in the worker's Chrome profile/);
+  });
+
 });

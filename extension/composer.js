@@ -861,7 +861,7 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   }
 }
 
-async function waitUntilComposer(deadline = Date.now() + 3 * 60 * 1000) {
+async function waitUntilComposer(deadline = Date.now() + 3 * 60 * 1000, guard) {
   // Pre-send bound, not a generation timeout: a page that never renders a composer (a stale model
   // URL, a logged-out landing, a changed selector) fails the run as presend_stalled so the job retries
   // or settles (live 1.1.32: 10+ min in composer_waiting under the old 3 h backstop). Generation
@@ -873,6 +873,7 @@ async function waitUntilComposer(deadline = Date.now() + 3 * 60 * 1000) {
       e.code = "quota";
       throw e;
     }
+    guard?.(); // e.g. a logged-out landing: fail at once, not after the composer bound
     const el = composer();
     if (el) return el;
     if (Date.now() >= deadline) throw presendStalled("composer");
@@ -904,19 +905,25 @@ async function presendBound(stage, ms, work, onExpire) {
  * is bounded and records its own step, so a stall shows where it stopped. Locals, not top-level
  * consts: the worker re-injects this file into a page that already ran it, and a redeclared global
  * lexical binding aborts the whole script. */
-async function preparePresend(provider, reasoning, openComposer) {
+async function preparePresend(provider, reasoning, openComposer, guard) {
   const OVERLAYS_MS = 60 * 1000, COMPOSER_MS = 3 * 60 * 1000, REASONING_MS = 60 * 1000;
   const overlays = () => { step("overlays_dismissing"); return presendBound("overlays", OVERLAYS_MS, () => dismissOverlays()); };
   try {
+    // `guard` throws on a page no stage can fix (a logged-out landing): checked before the first
+    // overlay pass, by the composer wait on every look, and once more before anything is typed.
+    guard?.();
     await overlays();
+    guard?.();
     step("composer_waiting");
     let el = await presendBound("composer", COMPOSER_MS, deadline => openComposer(deadline));
+    guard?.();
     step("composer_ready");
     await overlays();
     step("reasoning_selecting");
     const picked = await presendBound("reasoning", REASONING_MS, deadline => selectReasoning(provider, reasoning, deadline), () => "skipped");
     if (picked === "skipped") step("reasoning_skipped");
     await overlays();
+    guard?.();
     el = composer() || el;
     return el;
   } catch (e) {

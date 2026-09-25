@@ -23,12 +23,27 @@ const stopButton='<button data-testid="stop-button" aria-label="Stop generating"
 const pill=menu=>menu==='none'?'':`<button class="__composer-pill" aria-haspopup="menu" style="width:90px;height:30px">Thinking</button>`;
 const composerForm=menu=>`<form data-type="unified-composer">${pill(menu)}<div contenteditable="true" id="prompt-textarea" style="width:300px;min-height:40px"></div><button id="composer-submit-button" aria-label="Send prompt" style="width:32px;height:32px">send</button></form>`;
 
-async function chatTab(t,{composer=true,menu='works',local:initial={}}={}){
+// The logged-out chatgpt.com landing of the #455 incident (live 1.1.33, ko locale), reduced to its
+// auth entry points: header Log in / Sign up, the sidebar login panel, the unauthenticated composer
+// form (a textarea the runner does not type into) and the cookie-preferences dialog.
+const btn=(attrs,label)=>`<button type="button" ${attrs} style="width:120px;height:36px">${label}</button>`;
+const loggedOutKo=`<main aria-label="ChatGPT" data-app-shell="">
+ <aside><section data-sidebar-login-panel=""><h2>내게 맞춘 응답을 받으세요</h2>${btn('command="show-modal" commandfor="mobile-auth-dialog" data-mobile-auth-entry-action="login" data-mobile-auth-entry-point="sidebar_bottom_unit"','로그인')}</section></aside>
+ <header><div data-header-auth-actions="">${btn('command="show-modal" commandfor="mobile-auth-dialog" data-login-button="" data-mobile-auth-entry-action="login"','로그인')}${btn('command="show-modal" commandfor="mobile-auth-dialog" data-mobile-auth-entry-action="signup"','무료로 회원가입')}</div></header>
+ <div id="thread"></div>
+ <form action="/unauth-mweb/conversation" data-logged-out="" data-mobile-composer="" method="post" style="width:600px;height:60px"><textarea aria-label="ChatGPT와 채팅" id="mobile-composer-prompt" name="prompt" placeholder="ChatGPT에게 물어보세요" style="width:500px;height:40px"></textarea></form>
+</main>
+<div role="dialog" aria-label="쿠키 기본 설정" style="width:400px;height:120px"><p>이 쿠키는 마케팅 캠페인의 효과를 측정하는 데 도움이 됩니다.</p>${btn('','모두 수락')}${btn('','필수 쿠키만')}</div>`;
+// The same landing in en with no auth attributes at all, and a composer that matches the runner's
+// selectors (the older logged-out UI): only the visible Log in / Sign up labels identify it.
+const loggedOutEn=`<main id="thread"></main><div>${btn('','Log in')}${btn('','Sign up for free')}</div>${composerForm('none')}`;
+
+async function chatTab(t,{composer=true,menu='works',local:initial={},landing}={}){
  const page=await browser.newPage();t.after(()=>page.close());
  // A page that never renders a composer: a landing that keeps loading (an image and a script are
  // there so the snapshot shows they are stripped).
- const body=composer?`<main id="thread"></main>${composerForm(menu)}`
-  :'<main id="thread"><div class="loading" style="width:200px;height:40px">Loading…<img src="x.png" alt=""><svg><path d="M0 0L9 9"></path></svg><script type="text/x-fixture">secret()</script></div></main>';
+ const body=landing??(composer?`<main id="thread"></main>${composerForm(menu)}`
+  :'<main id="thread"><div class="loading" style="width:200px;height:40px">Loading…<img src="x.png" alt=""><svg><path d="M0 0L9 9"></path></svg><script type="text/x-fixture">secret()</script></div></main>');
  await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',body:`<html><body>${body}</body></html>`}));
  await page.clock.install();
  await page.goto(URL_);
@@ -65,6 +80,7 @@ async function chatTab(t,{composer=true,menu='works',local:initial={}}={}){
   steps:()=>page.evaluate(()=>JSON.parse(sessionStorage.getItem('ashlar:steps:job-A:run-A')||'{"events":[]}').events.map(e=>e.stage)),
   runner:()=>page.evaluate(()=>({running:__ashlarRunnerState.running,code:__ashlarRunnerState.result?.code,error:__ashlarRunnerState.result?.error})),
   local:key=>page.evaluate(key=>window.__local.get(key),key),
+  typed:()=>page.evaluate(()=>[...document.querySelectorAll('textarea,[contenteditable="true"]')].map(el=>el.value??el.textContent).join('')),
   view:()=>page.evaluate(()=>({sendClicks:window.sendClicks,menuItemClicks:window.menuItemClicks,
    sent:document.querySelector('[data-message-author-role="user"]')?.textContent||'',pill:document.querySelector('.__composer-pill')?.textContent||''})),
  };
@@ -135,4 +151,22 @@ test('a normal page: the level is picked, the prompt typed and sent, with a step
  const view=await tab.view();
  assert.deepEqual(view,{sendClicks:1,menuItemClicks:['Extra high'],sent:PROMPT,pill:'Extra high'});
  assert.equal((await tab.runner()).running,true);
+});
+
+for(const [name,landing] of [['ko, auth attributes',loggedOutKo],['en, labels only, with a composer',loggedOutEn]])
+test(`a logged-out landing (${name}) fails as logged_out within seconds; nothing is typed or sent (#455)`,async t=>{
+ const tab=await chatTab(t,{landing});
+ assert.equal((await tab.start()).code,'busy');
+ await tab.page.clock.runFor(5000);
+ const out=await tab.runner();t.diagnostic(JSON.stringify(out));
+ assert.equal(out.running,false,`still waiting on a logged-out page: ${JSON.stringify(await tab.steps())}`);
+ assert.equal(out.code,'logged_out');
+ assert.match(out.error,/ChatGPT is logged out in this Chrome profile; log in and retry/);
+ const steps=await tab.steps();t.diagnostic(JSON.stringify(steps));
+ assert.equal(steps.at(-1),'logged_out');
+ for(const s of ['composer_ready','attachments_preparing','prompt_prepared','send_attempted'])assert.ok(!steps.includes(s),`${s} reached on a logged-out page`);
+ assert.equal(await tab.typed(),'','nothing typed');
+ assert.equal((await tab.view()).sendClicks,0);
+ assert.equal((await tab.send('ashlar-harvest')).code,'logged_out','the worker harvests the failure');
+ assert.equal(await tab.local('presendStallHtml'),undefined,'a logged-out page is not a stall');
 });

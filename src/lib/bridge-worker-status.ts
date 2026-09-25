@@ -1,5 +1,5 @@
 /** Bounded diagnostic metadata only. No field here authorizes cleanup or generation. */
-const ADMISSION_PHASES = ["not_checked", "polling", "admitted", "recovered", "idle", "tab_capacity", "provider_quota", "disconnected", "duplicate_job"] as const;
+const ADMISSION_PHASES = ["not_checked", "polling", "admitted", "recovered", "idle", "tab_capacity", "provider_quota", "logged_out", "disconnected", "duplicate_job"] as const;
 type AdmissionPhase = typeof ADMISSION_PHASES[number];
 export type WorkerStatus = {
   observedAt: number;
@@ -46,6 +46,7 @@ export function workerStatusLabel(status: WorkerStatus | undefined, fresh: boole
   const slots = `${status.capacity.used}/${status.capacity.limit}`;
   if (status.admissionPhase === "tab_capacity") return `${prefix}New jobs paused · managed capacity ${slots}`;
   if (status.admissionPhase === "provider_quota") return `${prefix}New jobs paused · provider quota`;
+  if (status.admissionPhase === "logged_out") return `${prefix}New jobs paused · ChatGPT logged out in Chrome; log in (re-checked every 10 min)`;
   if (status.admissionPhase === "disconnected") return `${prefix}Admission transport unavailable · originals preserved`;
   return `${prefix}Admission: ${status.admissionPhase} · managed capacity ${slots}`;
 }

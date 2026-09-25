@@ -564,8 +564,8 @@ export function failBridgeProvider(jobId: string, provider: ReviewProvider, erro
   const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? [];
   if (!enabled.includes(provider)) return false;
   const prefix = error.split(":", 1)[0];
-  const code: ProviderError["code"] = prefix === "quota" || prefix === "empty" || prefix === "tab_closed" || prefix === "cancelled"
-    ? prefix : "error";
+  const code: ProviderError["code"] = prefix === "quota" || prefix === "empty" || prefix === "tab_closed" || prefix === "cancelled" ||
+    prefix === "logged_out" ? prefix : "error";
   patchHarborJob(jobId, current => ({
     ...current,
     generating: {...current.generating, [provider]: false},

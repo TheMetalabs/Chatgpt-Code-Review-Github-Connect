@@ -37,12 +37,17 @@ function providerErrorNote(
   return rows.find(row => !/\b(chatgpt|grok|local)\b/i.test(row) && /bridge|disconnected/i.test(row))?.trim();
 }
 
+/** A leg the worker failed because the provider's Chrome session is logged out (#455). */
+const LOGGED_OUT_DETAIL = "logged out in the worker's Chrome profile · log in there and retry (nothing was sent)";
+const isLoggedOutNote = (note: string | undefined) => /\blogged_out\b/i.test(note ?? "");
+
 function emptyProviderDetail(
   job: Pick<Job, "assumptions" | "githubError" | "skipReason" | "bridgeClaimedAt" | "providerErrors">,
   provider: ReviewProvider,
   now: number,
 ): string {
   const note = providerErrorNote(job, provider) ?? "";
+  if (isLoggedOutNote(note)) return LOGGED_OUT_DETAIL;
   if (/quota|usage limit|한도/i.test(note)) return "usage limit";
   if (/disconnected|bridge|claim|not connected/i.test(note)) return "connection unknown · waiting for reconnection";
   if (/tab_closed/i.test(note)) return "review tab closed";
@@ -158,7 +163,7 @@ export function buildReviewerLanes(
         provider,
         state: "skipped" as const,
         label,
-        detail: skipNote ?? "skipped",
+        detail: isLoggedOutNote(skipNote) || job.providerErrors?.[provider]?.code === "logged_out" ? LOGGED_OUT_DETAIL : skipNote ?? "skipped",
         answered: false,
       };
     }
@@ -264,6 +269,7 @@ export function emptyReviewSkip(lanes: readonly ReviewerLane[]): {
   ops: string[];
 } {
   const usageLimited = lanes.some((lane) => /usage limit|quota|한도/i.test(lane.detail));
+  const loggedOut = lanes.filter((lane) => lane.detail === LOGGED_OUT_DETAIL).map((lane) => lane.label);
   // Reserve "finished without JSON" for a genuinely empty reply. Any lane whose detail is NOT that
   // explicit empty signal is some other terminal failure — a skip note in raw code form
   // (`tab_closed`, `cancelled`, `context_lost`, …) or a humanized detail — so bias toward "could not
@@ -273,11 +279,15 @@ export function emptyReviewSkip(lanes: readonly ReviewerLane[]): {
   const details = lanes.map((lane) => `${lane.label}: ${lane.detail}`);
   const skipReason = usageLimited
     ? "reviewers could not complete — usage limit reached"
+    : loggedOut.length
+      ? `reviewers could not complete — ${loggedOut.join(" / ")} logged out in Chrome`
     : infraFailed
       ? "reviewers could not complete — see per-reviewer details"
       : "every enabled reviewer finished with no JSON";
   const headline = usageLimited
     ? "No review posted — a reviewer hit its usage limit before returning JSON."
+    : loggedOut.length
+      ? `No review posted — ${loggedOut.join(" / ")} is logged out in the worker's Chrome profile; log in there and retry.`
     : infraFailed
       ? "No review posted — reviewers could not complete (see per-reviewer details)."
       : "Enabled reviewers finished without JSON. Nothing to post.";

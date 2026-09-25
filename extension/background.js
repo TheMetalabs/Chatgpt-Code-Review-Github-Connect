@@ -1,5 +1,9 @@
 const POLL_MS = 2500;
 const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
+// A page that reported its provider logged out (#455) pauses that provider's new legs this long,
+// then the next leg opens a tab and checks again.
+const LOGIN_PAUSE_MS = 10 * 60 * 1000;
+const LOGGED_OUT_ERROR = "ChatGPT is logged out in this Chrome profile; log in and retry (nothing was typed or sent)";
 const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
 const CLOSED_PREFIX = "ashlar:closed:";
@@ -580,6 +584,20 @@ async function markQuota(provider) {
   });
 }
 
+async function loginPauseMap() {
+  const s = await chrome.storage.local.get(["loginPause"]);
+  return s.loginPause && typeof s.loginPause === "object" ? s.loginPause : {};
+}
+
+async function markLoggedOut(provider) {
+  return writeInOrder(async () => {
+    const loginPause = await loginPauseMap();
+    loginPause[provider] = Date.now() + LOGIN_PAUSE_MS;
+    await chrome.storage.local.set({ loginPause });
+    return loginPause[provider];
+  });
+}
+
 function contentFiles(provider) {
   return provider === "grok"
     ? ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-grok.js"]
@@ -682,7 +700,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.33";
+const WORKER_BUILD = "1.1.34";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2003,6 +2021,12 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       await saveJobs(jobs);
       return;
     }
+    // Paused after a page reported this provider logged out: fail the leg at once, no tab.
+    if (!providerOpen(await loginPauseMap(), provider)) {
+      state.outcome = failure("logged_out", provider === "chatgpt" ? LOGGED_OUT_ERROR : `${provider} is logged out in this Chrome profile; log in and retry`);
+      await saveJobs(jobs);
+      return;
+    }
     await allocateProviderTab(job, provider, jobs);
     if (!state.tabId) return;
   }
@@ -2166,6 +2190,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   }
   await saveJobs(jobs);
   if (state.outcome.code === "quota") await markQuota(provider);
+  if (state.outcome.code === "logged_out") await markLoggedOut(provider);
 }
 
 async function deliverOutcome(job, provider, jobs, signal) {
@@ -2864,9 +2889,10 @@ function admitJob(cfg, jobs) {
     if (!await tabCapacityAvailable(jobs, true)) {
       await recordWorkerStatus(jobs, cfg.origin, "tab_capacity"); return null;
     }
-    const quota = await quotaMap();
-    if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) {
-      await recordWorkerStatus(jobs, cfg.origin, "provider_quota"); return null;
+    const quota = await quotaMap(), loginPause = await loginPauseMap();
+    if (!["chatgpt", "grok"].some(p => providerOpen(quota, p) && providerOpen(loginPause, p))) {
+      const loggedOut = ["chatgpt", "grok"].some(p => providerOpen(quota, p));
+      await recordWorkerStatus(jobs, cfg.origin, loggedOut ? "logged_out" : "provider_quota"); return null;
     }
     // A stale service worker (Chrome kept the previous build's script after the files on disk were
     // replaced; #93 validation) would drive pages that inject the NEW content scripts: its run

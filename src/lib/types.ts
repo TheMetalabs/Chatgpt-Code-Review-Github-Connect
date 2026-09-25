@@ -166,7 +166,7 @@ export interface Job {
 }
 
 export interface ProviderError {
-  code: "quota" | "empty" | "error" | "tab_closed" | "cancelled" | "disconnected";
+  code: "quota" | "empty" | "error" | "tab_closed" | "cancelled" | "disconnected" | "logged_out";
   message: string;
 }
 

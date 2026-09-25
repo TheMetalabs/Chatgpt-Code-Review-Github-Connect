@@ -559,6 +559,54 @@ test('worker: a created delivery whose tab is gone and that no tab binds no long
   assert.equal(b.tabs.size, 1);assert.equal(runsOf(b).length, 1);
 });
 
+// Round 15 (Ashlar 4100156779): the delivery record says `created` BEFORE state.tabId is durably
+// saved (allocateProviderTab promotes, then saves). A worker that stops in between leaves
+// `allocating` with no tabId and a `created` record. The record is validated, never trusted: its
+// tab still open in this browser session (or the page the inventory binds to this run) is restored
+// and the run continues in it; a recorded tab that is gone (and no owned record, no bound page) is
+// proven absent: the stale record is dropped and exactly one replacement is allocated, instead of
+// waiting on "tab creation outcome unknown" until the fix deadline.
+/** A page that has not been sent a run is bound to no job; once run, it is busy generating. */
+const UNBOUND_UNTIL_RUN = () => { const bound = new Set();
+  return (id, m) => { if (m.type === 'ashlar-run') bound.add(id);
+    return bound.has(id) ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle', jobId: '', runId: ''}; }; };
+const STOPPED = () => fixJob({deliveryId: 'delivery-1', states: {chatgpt: {runId: 'run-A', allocating: true}}});
+const CREATED = (tabId, session = 'boot-1') => ({deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'created', tabId, session, runId: 'run-A', at: Date.now()});
+for (const row of [
+  {name: 'its recorded tab is gone', tabs: [], record: CREATED(77), want: {tabs: 1, runs: 1, restored: false}},
+  {name: 'its recorded tab was recorded in an earlier browser session (the ID now names another tab)', tabs: [[77, {id: 77, url: URL_FIX, status: 'complete'}]],
+    record: CREATED(77, 'boot-0'), want: {tabs: 2, runs: 1, restored: false}},
+  {name: 'its recorded tab is still open (control)', tabs: [[77, {id: 77, url: URL_FIX, status: 'complete'}]], record: CREATED(77), want: {tabs: 1, runs: 1, restored: true}},
+]) {
+  test(`worker: a stop after the delivery was promoted, before its tabId was saved, and ${row.name}: ${row.want.restored ? 'resumed in that tab, no second tab' : 'exactly one replacement tab'}`, async () => {
+    const tabs = new Map(row.tabs);
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': STOPPED()}, [DELIVERIES]: {'fix-A': row.record}}),
+      // an undispatched tab's page carries no binding: it answers a harvest for no job
+      session: storage({'ashlar:browserSession': 'boot-1'}), tabs, api: active, handler: UNBOUND_UNTIL_RUN()});
+    b.context.crypto = webcrypto;
+    await b.tick();await b.tick();await b.tick();
+    const state = b.local.state.pendingReviewJobs['fix-A'].states.chatgpt;
+    const runs = runsOf(b);
+    assert.deepEqual({tabs: tabs.size, runs: runs.length, restored: runs[0]?.id === 77}, row.want);
+    assert.equal(state.connectionError, undefined, 'never "tab creation outcome unknown"');
+    assert.equal(state.allocating, undefined);
+    assert.equal(state.tabId, runs[0].id, 'the run continues in the tab it was dispatched to');
+    const record = b.local.state[DELIVERIES]['fix-A'];
+    assert.deepEqual({phase: record.phase, tabId: record.tabId, session: record.session}, {phase: 'created', tabId: state.tabId, session: 'boot-1'});
+    assert.ok(b.session.state[`ashlar:tab:${state.tabId}`]?.runId === 'run-A', 'the tab carries its owned record');
+  });
+}
+
+test('worker: a promoted fix delivery whose tab the user explicitly closed before its tabId was saved ends the run (tab_closed), no replacement', async () => {
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': STOPPED()}, [DELIVERIES]: {'fix-A': CREATED(77)}}),
+    session: storage({'ashlar:browserSession': 'boot-1', 'ashlar:closed:fix-A:chatgpt:run-A': true}), api: active, handler: () => ({ok: false, code: 'busy', retry: true})});
+  b.context.crypto = webcrypto;
+  await b.tick();
+  assert.equal(b.tabs.size, 0, 'no replacement for a tab the user closed');
+  assert.equal(runsOf(b).length, 0);
+  assert.ok(b.calls.some(c => c.action === 'failure' && /explicitly closed/.test(c.error)), 'the run ends now, not at the deadline');
+});
+
 test('worker: a cancelled fix tab that now carries another binding retires at once, leaving that binding untouched', async () => {
   const other = {ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B', provider: 'chatgpt'};
   const handler = (_id, m) => (m.type === 'ashlar-tab-status'

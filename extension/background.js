@@ -626,13 +626,61 @@ function beginFixDelivery(job, provider) {
   return updateFixDeliveries(all => { all[job.jobId] = {deliveryId: job.deliveryId, provider, phase: "creating", at: Date.now()}; });
 }
 
+/** This browser session's identity (chrome.storage.session survives a worker restart, never a
+ * browser restart). A tab ID means something only in the browser session that saw it: Chrome
+ * reuses IDs after a restart, so a recorded ID from another session may name an unrelated tab. */
+const BROWSER_SESSION_KEY = "ashlar:browserSession";
+let browserSessionPromise;
+function browserSessionId() {
+  browserSessionPromise ||= (async () => {
+    const stored = (await chrome.storage.session.get([BROWSER_SESSION_KEY]))[BROWSER_SESSION_KEY];
+    if (typeof stored === "string" && stored) return stored;
+    const id = crypto.randomUUID();
+    await chrome.storage.session.set({[BROWSER_SESSION_KEY]: id});
+    return id;
+  })().catch(error => { browserSessionPromise = undefined; throw error; });
+  return browserSessionPromise;
+}
+
 /** Phase 2, written only after chrome.tabs.create returned the tab and its owned-tab record is
- * stored: `created`, naming that tab. */
-function promoteFixDelivery(job, provider, tabId) {
-  if (job.kind !== "fix" || typeof job.deliveryId !== "string" || !job.deliveryId) return Promise.resolve();
+ * stored: `created`, naming that tab, the browser session its ID belongs to, and the run. */
+async function promoteFixDelivery(job, provider, tabId) {
+  if (job.kind !== "fix" || typeof job.deliveryId !== "string" || !job.deliveryId) return;
+  const session = await browserSessionId();
   return updateFixDeliveries(all => {
-    all[job.jobId] = {deliveryId: job.deliveryId, provider, phase: "created", tabId, at: all[job.jobId]?.at ?? Date.now()};
+    all[job.jobId] = {deliveryId: job.deliveryId, provider, phase: "created", tabId, session, runId: job.states[provider]?.runId,
+      at: all[job.jobId]?.at ?? Date.now()};
   });
+}
+
+/** The tab a `created` delivery record names, while that ID still means the same tab: recorded in
+ * THIS browser session and still open. A legacy record (no session) whose ID is open is `uncertain`. */
+async function recordedFixTab(record, live) {
+  if (record?.phase !== "created" || !Number.isInteger(record.tabId)) return {tab: undefined};
+  const tab = live.get(record.tabId);
+  if (!record.session) return {tab: undefined, uncertain: Boolean(tab)};
+  return {tab: record.session === await browserSessionId() ? tab : undefined};
+}
+
+/** A fix allocation journaled (`allocating`) with no durable tabId, and no owned record or bound
+ * page found for its run: the worker stopped between the intent and saving the tab. Decided from
+ * evidence, never by waiting:
+ * - "restore": a tab proves it: the page the tab inventory identifies as this run (`started`), or
+ *   the tab its delivery record names, still open in this browser session;
+ * - "absent": nothing can hold it (no record, an intent that never became a tab, or a recorded tab
+ *   that is gone): the caller clears the intent, and the allocation opens exactly one tab;
+ * - "uncertain": a legacy record whose ID is open but cannot be tied to this browser session. */
+async function fixAllocationEvidence(job, provider) {
+  const state = job.states[provider];
+  const tabs = await chrome.tabs.query({}), live = new Map(tabs.map(tab => [tab.id, tab]));
+  const bound = tabs.find(tab => { const owner = knownTabOwner(tab);
+    return allowedTab(tab, provider) && owner?.jobId === job.jobId && owner.provider === provider && owner.runId === state.runId && !owner.released; });
+  if (bound) return {verdict: "restore", tabId: bound.id, started: true};
+  const record = (await fixDeliveries())[job.jobId];
+  const mine = record?.deliveryId === job.deliveryId && record.provider === provider && (!record.runId || record.runId === state.runId);
+  const recorded = mine ? await recordedFixTab(record, live) : {tab: undefined};
+  if (recorded.tab) return {verdict: "restore", tabId: recorded.tab.id};
+  return {verdict: recorded.uncertain ? "uncertain" : "absent"};
 }
 
 function forgetFixDelivery(job) {
@@ -642,8 +690,9 @@ function forgetFixDelivery(job) {
 
 /** The fix deliveries that locally PROVE a tab: what admission lists in excludeJobIds and never
  * opens again. A record of a job this worker still holds is its own allocation (the registry's
- * allocation journal decides it; the job is excluded anyway). Any other record counts only while a
- * tab proves it: its `created` tab is still live on the provider, or a tab still carries the job's
+ * allocation journal decides it, pollProvider validating the record with fixAllocationEvidence; the
+ * job is excluded anyway). Any other record counts only while a tab proves it: its `created` tab
+ * is still live on the provider in the browser session that recorded it, or a tab still carries the job's
  * binding (the session's owned-tab record, or the tab inventory); a `creating` record proven that way
  * (the worker stopped after the create, before the promotion) is promoted. A record nothing proves
  * (the worker stopped or was reset between the intent and chrome.tabs.create, or its tab is gone) is
@@ -665,7 +714,10 @@ async function reconcileFixDeliveries(jobs) {
   const proven = {}, rewrite = {};
   for (const [jobId, record] of Object.entries(records)) {
     if (jobs[jobId]) { proven[jobId] = record; continue; }
-    const createdTab = record.phase === "created" ? live.get(record.tabId) : undefined;
+    // A recorded tab ID proves the tab only in the browser session that recorded it (a legacy
+    // record without one keeps its open-tab check).
+    const recorded = await recordedFixTab(record, live);
+    const createdTab = recorded.tab || (recorded.uncertain ? live.get(record.tabId) : undefined);
     const tabId = onProvider(createdTab, record.provider) ? createdTab.id : boundTab(jobId, record.provider);
     if (!tabId) { rewrite[jobId] = null; continue; }
     proven[jobId] = {...record, phase: "created", tabId};
@@ -1038,15 +1090,25 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       const original = await findOriginalTab(job, provider);
       if (original) { state.tabId = original.id; state.started = true; }
     }
-    if (!state.tabId && job.kind === "fix" && (await fixDeliveries())[job.jobId]?.phase !== "created") {
-      // A fix allocation intent that never became a proven tab (no owned record, no bound page, and
-      // its delivery record never reached `created`: the worker stopped between the intent and
-      // chrome.tabs.create) is cleared, and the allocation below opens the tab once. Keeping the
-      // intent would strand the fix until its deadline. (A review keeps its intent, as before.)
+    // A fix allocation is validated against its delivery record and the tab inventory (the record
+    // can say `created` before state.tabId was durably saved): see fixAllocationEvidence.
+    const evidence = !state.tabId && job.kind === "fix" ? await fixAllocationEvidence(job, provider) : undefined;
+    if (evidence?.verdict === "restore") {
+      state.tabId = evidence.tabId;
+      if (evidence.started) state.started = true;
+      await rememberOwnedTab(job, provider);
+    }
+    if (evidence?.verdict === "absent") {
+      // Nothing can hold this allocation: the intent is cleared, and the allocation below opens the
+      // tab once. Keeping it would strand the fix until its deadline. A tab the user explicitly
+      // closed ends the run instead, with no replacement. (A review keeps its intent, as before.)
       delete state.allocating;
       delete state.connectionError;
+      if ((await chrome.storage.session.get([closedKey(job, provider)]))[closedKey(job, provider)])
+        state.outcome = failure("tab_closed", "review tab was explicitly closed");
       await saveJobs(jobs);
       await forgetFixDelivery(job);
+      if (state.outcome) return;
     } else if (!state.tabId) {
       state.connectionError = "tab creation outcome unknown; original allocation preserved";
       await saveJobs(jobs);

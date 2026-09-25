@@ -2200,4 +2200,26 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.equal(f.posted.filter((body) => body.startsWith(STOPPED_MARKER)).length, 0, "no STOPPED after the restart was requested");
     assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "applied", JSON.stringify(rb));
   });
+
+  it("a step for a NEW head never waits behind the old head's running round: it runs its own round at once", async (t) => {
+    const f = fakeDeps({ rounds: [3] });
+    let pushed = false; // a contributor's push moved the head to MOVED, and its review is posted
+    const head = f.deps.gh.fetchPullHeadRef;
+    f.deps.gh.fetchPullHeadRef = async (...a) => ({ ...(await head(...a)), ...(pushed ? { sha: MOVED } : {}) });
+    const reviews = f.deps.gh.listPullReviews;
+    f.deps.gh.listPullReviews = async (...a) => [
+      ...(await reviews(...a)),
+      ...(pushed ? [{ userLogin: BOT, body: "<!-- ashlar-findings total=2 -->", commitId: MOVED, submittedAt: dayIso(5) }] : []),
+    ];
+    const hold = holdFirst(t, f);
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    pushed = true;
+    const rb = await soon(run(f, "suggest", ENV_ON, job({ id: "job-B", headSha: MOVED })));
+    hold.release();
+    const ra = await settles(a);
+    assert.ok(rb !== "still waiting" && rb.ran && rb.step === "fix" && rb.outcome === "suggested", `the new head's round ran while the old one was held: ${reasonOfStep(rb)}`);
+    assert.equal(f.prompts.length, 2, "one round per head");
+    assert.deepEqual(ra, { ran: false, reason: "superseded (head moved)" }, "the old head's round goes moot");
+  });
 });

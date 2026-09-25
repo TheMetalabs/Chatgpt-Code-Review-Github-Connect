@@ -2123,4 +2123,25 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.equal(f.prompts.length, 2, "the stopped round and the restarted one");
     assert.equal(escalations(f.posted).length, 0);
   });
+
+  it("a waiting restart whose start record harbor could not post, replaced by a plain review: the replacing step records it and runs the round", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(t, f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+    // the restart's review carries its start (the record failed at admission: the step self-heals it)
+    const restart = job({ id: "job-B", thread: { kind: "mention", commentId: 3, userText: "/review-loop apply", loop: { kind: "start", mode: "apply" }, eventAt: "2025-12-31T12:00:00Z" } });
+    const b = run(f, "apply", ENV_ON, restart);
+    const c = run(f, "apply", ENV_ON, job({ id: "job-C", sender: "bob", thread: { kind: "mention", commentId: 4, userText: "@ashlar-bot review" } }));
+    const rb = await soon(b);
+    hold.release();
+    const [ra, rc] = await settles(Promise.all([a, c]));
+    assert.equal(reasonOfStep(rb), STEP_REPLACED);
+    assert.deepEqual(ra, { ran: false, reason: "loop stopped by operator" });
+    const starts = f.posted.map((body) => parseStartMarker(body, { authoredByBot: true })).filter((s) => s !== null);
+    assert.deepEqual(starts, [{ mode: "apply", by: "alice", at: "2025-12-31T12:00:00Z" }], "the requested restart is recorded once");
+    assert.ok(rc.ran && rc.step === "fix" && rc.outcome === "applied", `the restarted round runs: ${JSON.stringify(rc)}`);
+    assert.equal(f.permissionChecks.at(-1), "alice", "on the restart's starter's authority");
+  });
 });

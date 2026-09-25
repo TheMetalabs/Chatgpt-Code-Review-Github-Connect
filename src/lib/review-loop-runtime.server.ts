@@ -255,13 +255,16 @@ const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 // it (latest wins), and the running step is never preempted. Different heads never wait on each
 // other — the older one is superseded at its head checks. Slots are per GitHub client (production
 // has one: harbor's calls). Cross-process coordination is a NON-GOAL (single harbor instance; see
-// the engine header).
-type StepTurn = { status: "run"; prior?: string } | { status: "replaced" } | { status: "expired" };
+// the engine header). Latest wins for the ROUND only: a fresh human start that a replaced waiter
+// carried (its record not posted yet) passes to the step that replaced it, which records it.
+type StepTurn = { status: "run"; prior?: string; starts: StartRequest[] } | { status: "replaced" } | { status: "expired" };
 type StepSlot = {
   /** The roundSignature of the last round that reached the provider while the slot was held,
    * handed to the next owner (a waiter) — never kept once the slot is free. */
   sig?: string;
   waiter?: (turn: StepTurn) => void;
+  /** The start requests the waiter carries: its own and those of every waiter it replaced. */
+  waiterStarts?: StartRequest[];
 };
 const productionStepSlots = new Map<string, StepSlot>();
 const stepSlotsByClient = new WeakMap<object, Map<string, StepSlot>>();
@@ -275,17 +278,22 @@ function stepSlots(deps: LoopRuntimeDeps | undefined): Map<string, StepSlot> {
 }
 
 /** Take a head's slot, synchronously (before any await): free → run now; held → wait for its
- * release, replacing a step that already waits, for at most `waitMaxMs`. */
-function claimStep(slots: Map<string, StepSlot>, key: string, waitMaxMs: number): StepTurn | Promise<StepTurn> {
+ * release, replacing a step that already waits (and taking over the start requests it carries),
+ * for at most `waitMaxMs`. */
+function claimStep(slots: Map<string, StepSlot>, key: string, waitMaxMs: number, own: StartRequest[]): StepTurn | Promise<StepTurn> {
   const slot = slots.get(key);
   if (!slot) {
     slots.set(key, {});
-    return { status: "run" };
+    return { status: "run", starts: own };
   }
+  const starts = [...(slot.waiter ? (slot.waiterStarts ?? []) : []), ...own];
   slot.waiter?.({ status: "replaced" });
   return new Promise<StepTurn>((resolve) => {
     const timer = setTimeout(() => {
-      if (slot.waiter === admit) slot.waiter = undefined;
+      if (slot.waiter === admit) {
+        slot.waiter = undefined;
+        slot.waiterStarts = undefined;
+      }
       resolve({ status: "expired" });
     }, waitMaxMs);
     (timer as { unref?: () => void }).unref?.();
@@ -294,6 +302,7 @@ function claimStep(slots: Map<string, StepSlot>, key: string, waitMaxMs: number)
       resolve(turn);
     };
     slot.waiter = admit;
+    slot.waiterStarts = starts;
   });
 }
 
@@ -305,8 +314,10 @@ function releaseStep(slots: Map<string, StepSlot>, key: string): void {
     slots.delete(key);
     return;
   }
+  const starts = slot.waiterStarts ?? [];
   slot.waiter = undefined;
-  next({ status: "run", prior: slot.sig });
+  slot.waiterStarts = undefined;
+  next({ status: "run", prior: slot.sig, starts });
 }
 
 /** Whose authority a round of `mode` acts on: apply writes on the starter's, so a start re-issued
@@ -925,15 +936,22 @@ export async function runPostReviewLoop(
   // This review was posted before its step was called: a session anchored at or after this instant
   // does not contain it.
   const calledAt = (deps?.now ?? Date.now)();
+  // The fresh human start this review was requested by (its record may not have been posted at
+  // admission): a waiter that a later step replaces hands it over.
+  const ownStart: StartRequest[] =
+    job.thread?.loop?.kind === "start" && !isSelfLogin(job.sender, botLogin)
+      ? [{ owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }]
+      : [];
   const stepKey = `${prKey(ref)}@${headSha}`;
   const slots = stepSlots(deps);
-  const claimed = claimStep(slots, stepKey, stepWaitMaxMs(deps, env));
+  const claimed = claimStep(slots, stepKey, stepWaitMaxMs(deps, env), ownStart);
   const waited = claimed instanceof Promise;
   if (waited) trace(job.id, "step-waits", { pr, head: headSha.slice(0, 7) });
   const turn = claimed instanceof Promise ? await claimed : claimed;
   if (turn.status === "replaced") return { ran: false, reason: STEP_REPLACED };
   if (turn.status === "expired") return { ran: false, reason: STEP_WAIT_EXPIRED };
   const prior = turn.prior; // the round the step this one waited behind ran, if any
+  const startRequests = turn.starts; // this review's start and those of the waiters it replaced
   try {
     if (waited) {
       // The wait can last hours: the operator's settings kill switch (fixAgent.mode = suggest, or
@@ -966,27 +984,29 @@ export async function runPostReviewLoop(
     // contributor's backward force-push.
     if (head.sha !== headSha) return supersededResult(await continueOn(head));
     let session = await sessionOf(gh, token, ref, head, botLogin);
-    // This review was requested by a fresh human start whose record harbor could not post at
-    // admission: record it now (idempotent — an existing record, e.g. one a later stop ended,
-    // is never re-posted) and re-read once: the journal makes the record visible at once.
-    if (!session.active && job.thread?.loop?.kind === "start" && !isSelfLogin(job.sender, botLogin)) {
-      const out = await recordStart(token, { owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }, d, botLogin);
-      switch (out.status) {
-        case "unknown": // it may have landed: never re-sent, and folded as the human's start
-          trace(job.id, "start-unresolved", { error: out.error });
-          session = await sessionOf(gh, token, ref, head, botLogin);
-          break;
-        case "posted":
-        case "exists":
-          session = await sessionOf(gh, token, ref, head, botLogin);
-          break;
-        case "rejected": // a LOGGED reason, never a silent no-session for a started loop
-          return { ran: false, reason: `start failed: ${out.error}` };
-        case "superseded": // unreachable: a start record is owed in every session (owedAs); never silent
-          return { ran: false, reason: `start failed: superseded (${MOOT_TEXT[out.why]})` };
-        default:
-          return assertNever(out);
+    // This review (or a waiting step it replaced) was requested by a fresh human start whose record
+    // harbor could not post at admission: record it now (idempotent — an existing record, e.g. one a
+    // later stop ended, is never re-posted) and re-read once: the journal makes the record visible
+    // at once.
+    if (!session.active && startRequests.length > 0) {
+      for (const start of startRequests) {
+        const out = await recordStart(token, start, d, botLogin);
+        switch (out.status) {
+          case "unknown": // it may have landed: never re-sent, and folded as the human's start
+            trace(job.id, "start-unresolved", { error: out.error });
+            break;
+          case "posted":
+          case "exists":
+            break;
+          case "rejected": // a LOGGED reason, never a silent no-session for a started loop
+            return { ran: false, reason: `start failed: ${out.error}` };
+          case "superseded": // unreachable: a start record is owed in every session (owedAs); never silent
+            return { ran: false, reason: `start failed: superseded (${MOOT_TEXT[out.why]})` };
+          default:
+            return assertNever(out);
+        }
       }
+      session = await sessionOf(gh, token, ref, head, botLogin);
     }
     if (!session.active) return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
     // A step that waited acts only for a session its review can belong to. One anchored after the

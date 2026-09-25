@@ -192,6 +192,45 @@ test('an inventory probe of a page that never answers ends, so the tab is probed
   await b.context.refreshTabInventory();
   assert.equal(b.messages.filter(m => m.type === 'ashlar-tab-status').length, 2, 'the unanswered probe released its lane');
 });
+test('an inventory probe re-sent after injecting the content scripts, and never answered, ends too', async () => {
+  const b = unanswered({});
+  // An older page answers without the ownership protocol; after the injection nothing answers.
+  b.chrome.tabs.sendMessage = (id, msg, cb) => { b.messages.push({id, ...msg}); if (b.messages.length === 1) cb({ok: true}); };
+  const injected = [];
+  b.chrome.scripting.executeScript = async ({target}) => { injected.push(target.tabId); };
+  const probes = () => b.messages.filter(m => m.type === 'ashlar-tab-status').length;
+  await b.context.refreshTabInventory();
+  assert.ok(await until(() => vm.runInContext('inventoryLanes.size', b.context) === 0, 2000), 'the unanswered probe after the injection ended');
+  assert.deepEqual([injected, probes()], [[10], 2], 'injected once, then probed again');
+  await b.context.refreshTabInventory();
+  assert.equal(probes(), 3, 'its lane is free for the next refresh');
+});
+// A reloaded page holds no collector (harvest answers idle), so the poll asks it to resume: that
+// message is bounded too, or a page that never answers it would hold the job's lane forever.
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a resume the page never answers settles the tick, and the next tick asks again`, async () => {
+    const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
+    const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
+      providers: ['chatgpt'], states: {chatgpt: {tabId: 10, started: true, runId: 'run-A'}}};
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[jobId]: job}}),
+      session: storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}}),
+      tabs: new Map([[10, {id: 10, url: URL_TAB, status: 'complete'}]]),
+      api: async (_path, body) => (body?.action === 'ping' ? {ok: true, active: true, accepted: true, status: 'awaiting_chat'} : {ok: true, job: null})});
+    b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+    b.context.pageReplyDeadline = expiresAtOnce;
+    b.chrome.tabs.sendMessage = (id, msg, cb) => {
+      b.messages.push({id, ...msg});
+      if (msg.type === 'ashlar-harvest') cb({ok: false, code: 'idle', jobId: msg.jobId, runId: msg.runId, provider: msg.provider});
+      // the resume (like every other message) is accepted and never answered
+    };
+    const resumes = () => b.messages.filter(m => m.id === 10 && m.type === 'ashlar-run' && m.resume === true).length;
+    const settles = async () => { let settled = false; b.tick().then(() => { settled = true; }, () => { settled = true; }); return until(() => settled, 2000); };
+    assert.ok(await settles(), 'the tick settles');
+    assert.equal(resumes(), 1, 'the page was asked to resume');
+    assert.ok(await settles(), 'the next tick settles');
+    assert.equal(resumes(), 2, 'and asks again');
+  });
+}
 // A frozen tab (energy saver, a collapsed tab group) is not probed by the inventory: a probe would
 // only time out, erasing the owner read there while it ran (the user's own frozen tabs then took
 // every review slot as unverified), and each refresh would queue another unanswered message.

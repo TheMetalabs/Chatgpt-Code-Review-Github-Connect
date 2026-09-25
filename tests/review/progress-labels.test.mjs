@@ -392,7 +392,7 @@ const TEMPLATE_STAGES = {
   // preserve_${state.preserveCause}. Every write of .preserveCause must store one of them (writeProblems).
   preserve_: {expressions: {'state.preserveCause': {values: files => returnedList(files, 'preserveCauses'),
     written: {property: 'preserveCause', list: 'preserveCauses'}}},
-    declared: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown',
+    declared: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'undelivered', 'unknown',
       // Tab Lease (Phase 1+): the takeover and restart causes of a preserved tab.
       'user_input', 'user_moved', 'browser_restart']},
   // Tab Lease (Phase 1+): a lease that runs out records lease_expired_<phase>. Nothing lists the phases in

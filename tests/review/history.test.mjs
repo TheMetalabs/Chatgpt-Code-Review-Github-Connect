@@ -63,6 +63,24 @@ test('history: a stored page or worker stage is read back only as a label key or
  assert.deepEqual(new Store(dir).getJob('A').steps.map(x=>x.stage),[...expected,'json_observed']);
  assert.equal(/secret|Prompt/i.test(readFileSync(path,'utf8')),false,'the rewrite leaves no name on disk');
 });
+test('history: a server step appended after a stored stage name rewrites the log with its sentinel',async t=>{
+ // append rewrites the whole log from the same read as recordProgress: a status change, a server step or
+ // an observation leaves no stored stage name on disk either.
+ const {h,Store,dir}=await store(t);h.recordJob(job('A'));
+ const {createHash}=await import('node:crypto');const path=join(dir,'jobs',createHash('sha256').update('A').digest('hex'),'steps.json');
+ const seed=()=>{const stored=JSON.parse(readFileSync(path,'utf8'));
+  stored.items.push({id:'w'+stored.items.length,source:'worker',stage:'secret_token_abc123',at:1,provider:'chatgpt',runId:'run-A'});
+  writeFileSync(path,JSON.stringify(stored));};
+ const writers={status:s=>s.recordJob(job('A','posting',200)),serverStep:s=>s.recordServerStep('A','local.requested'),
+  observation:s=>s.recordObservation('A','chatgpt','run-A','partial',7,false)};
+ for(const [name,write] of Object.entries(writers)){
+  seed();write(new Store(dir));
+  assert.equal(readFileSync(path,'utf8').includes('secret_token'),false,`${name}: the rewrite leaves no name on disk`);
+ }
+ const steps=new Store(dir).getJob('A').steps;
+ assert.deepEqual(steps.map(x=>x.stage),['job.awaiting_chat','unlabelled:9699b893','job.posting','unlabelled:9699b893','local.requested',
+  'unlabelled:9699b893','response.observed_unparsed']);
+});
 test('history: private responses are separate from lists/default detail and survive restart',async t=>{
  const {h,Store,dir}=await store(t);h.recordJob(job('A'));h.recordResponse('A','chatgpt','{"findings":[]}', 'PRIVATE ORIGINAL');
  assert.equal(JSON.stringify(h.listJobs({})).includes('PRIVATE'),false);assert.equal(JSON.stringify(h.getJob('A')).includes('PRIVATE'),false);

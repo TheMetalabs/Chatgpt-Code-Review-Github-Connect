@@ -162,6 +162,41 @@ test('page: a draft typed and cleared while the sent turn is unresolved keeps th
   assert.equal(p.state().slotReleased, true, 'the managed slot is freed');
 });
 
+// R17 (Ashlar 4101855318, P1): the collector pins the response of its first answered observation.
+// The user regenerates it before the second stable observation: boundReviewResponse now binds the
+// newest reply, which must end the run (taken_over, tab preserved), never become the fix answer. With
+// no response ID the rendered node is the pin; a re-render of the pinned ID, or the same node, is
+// still the same response (controls).
+const REGENERATED = '{"summary":"regenerated","files":[],"dispositions":[]}';
+const PIN_CASES = {
+  regenerated: {ids: ['response-A', 'response-B'], newNode: true, want: {code: 'taken_over'}},
+  regeneratedNoId: {ids: ['', ''], newNode: true, want: {code: 'taken_over'}},
+  rerenderedSameId: {ids: ['response-A', 'response-A'], newNode: true, same: true, want: {raw: ANSWER}},
+  sameNodeNoId: {ids: ['', ''], newNode: false, same: true, want: {raw: ANSWER}},
+};
+for (const [name, cell] of Object.entries(PIN_CASES)) {
+  test(`page: a fix response ${name} after its first answered observation ${cell.want.code ? 'ends the run (taken_over), never collected' : 'is still collected (control)'}`, async () => {
+    const p = page({limit: 12});
+    const first = {}, later = () => (cell.newNode ? {} : first);
+    Object.assign(p.c.context, {
+      boundReviewResponse: () => (p.polls() < 1
+        ? {identified: true, followup: false, root: first, responseId: cell.ids[0]}
+        : {identified: true, followup: false, root: later(), responseId: cell.ids[1]}),
+      assistantCodeBlocks: () => [p.polls() < 1 || cell.same ? ANSWER : REGENERATED],
+    });
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    const out = await p.c.context.waitUntilFixOrQuota('ChatGPT').then(raw => ({raw}), error => ({code: error.code}));
+    assert.deepEqual(out, cell.want);
+    assert.equal(p.polls(), 1, 'decided on the poll after the first answered observation');
+    if (cell.want.code) {
+      assert.equal(p.state().nativeCompletion, undefined, 'nothing collected');
+      assert.equal(p.state().responseText, undefined, 'the regenerated text is never the answer');
+      assert.equal(p.state().tabRepurposed, true, 'the tab is the user\'s for good');
+      assert.equal(p.state().slotReleased, true);
+    }
+  });
+}
+
 // Round 15 (Ashlar 4100156796) drift guard: the page proves a fix only in json.js fixChatPage();
 // the worker opens every fix tab at background.js providerUrl(provider, reasoning). Today providerUrl
 // ignores the reasoning (never a model slug in the URL), so both are the same page for every value;

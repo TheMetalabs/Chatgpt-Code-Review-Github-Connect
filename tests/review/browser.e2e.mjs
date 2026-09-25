@@ -582,6 +582,31 @@ test('real DOM lifecycle: the sent turn not rendered in the recorded conversatio
  assert.equal(await ctx.page.evaluate(()=>__ashlarRunnerState.running),true,'still collecting');
 });
 
+// R17 (Ashlar 4101855318, P1): the answer completes and the collector observes it once; before its
+// second stable observation the user regenerates it (a new response replaces response-A). The run
+// ends taken_over with the tab preserved: the regenerated response is never handed out, delivered or
+// closed on.
+test('real DOM lifecycle: a fix response regenerated before its second stable observation ends the fix (taken_over), never delivered',async t=>{
+ const ctx=await conversationPage(t,'fix');
+ const server={value:'awaiting_chat'};
+ const {b,state}=wiredWorker(ctx.page,server);
+ await b.tick();
+ await ctx.complete();
+ assert.equal(await ctx.page.evaluate(()=>__ashlarRunnerState.observation?.state),'answer_observed','the first answered observation');
+ const regenerated='{"summary":"regenerated","files":[],"dispositions":[]}';
+ await ctx.page.evaluate(regenerated=>{
+  document.querySelector('[data-message-id="response-A"]').outerHTML=`<div data-message-author-role="assistant" data-message-id="response-B"><div class="markdown"><pre><code>${regenerated}</code></pre></div></div>`;
+ },regenerated);
+ await ctx.page.clock.runFor(3200);
+ const out=await ctx.harvest();
+ await b.tick();
+ const failure=b.calls.find(c=>c.action==='failure');
+ assert.notEqual(out.raw,regenerated,'never handed out');
+ assert.deepEqual({code:out.code,takenOver:/^taken_over: /.test(failure?.error||''),delivered:b.calls.some(c=>c.action==='complete'),closed:b.closedTabs.length,
+  retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released,canClose:(await ctx.send('ashlar-can-close')).canClose},
+  {code:'taken_over',takenOver:true,delivered:false,closed:0,retired:true,released:true,canClose:false});
+});
+
 // R17 (Ashlar 4101855338): the same absent turn, while the user types a draft of their own and clears it
 // before the turn renders again. The draft was seen: the run ends taken_over on that poll, the tab is
 // preserved, and the restored turn with an empty composer never hands it back.

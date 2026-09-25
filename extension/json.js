@@ -480,18 +480,20 @@ function storedFixCompletion(state) {
  * non-owned verdict is also what releases the managed slot. There is no cancel-phase proof: a fix
  * tab is closed only on the proven-success path (background.js cleanupFixTab), and a cancelled fix
  * is always preserved. `journal`: the submission journal the caller just read (default: the
- * confirmed or saved one).
+ * confirmed or saved one). `pinned` ("collect"): the response the collector pinned at its first
+ * answered observation (waitUntilFixOrQuota).
  *
  * owned = the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact"), no
- * follow-up turn, no user draft, the page still shows the conversation its send was made in and
- * ("complete") the currently bound response is done and still the stored completion (response ID
+ * follow-up turn, no user draft, the page still shows the conversation its send was made in,
+ * ("collect") the bound response is still the pinned one, and ("complete") the currently bound
+ * response is done and still the stored completion (response ID
  * and answer text; `completion` overrides the stored one, for a restore). takenOver = the user's
  * (follow-up, edited turn, draft, another response); unknown = not provable now (journal
  * unreadable, not sent, turn not rendered, identity not recorded at send or moved: `identity`
  * "unestablished" | "changed", still generating). Every takenOver verdict is PERMANENT: it marks the
  * tab repurposed for good (a draft the user later clears, or an edit the user undoes, does not hand
  * the tab back); see fixVerdictPermanent for what ends a run. */
-function fixOwnershipProof(state, {phase, completion, journal} = {}) {
+function fixOwnershipProof(state, {phase, completion, journal, pinned} = {}) {
   const verdict = (ownership, reason, extra = {}) => ({ownership, reason, ...extra});
   const takeOver = reason => {
     if (!state.tabRepurposed) { state.tabRepurposed = true; recordReviewStep("context_changed"); }
@@ -529,6 +531,12 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   // below (turn not rendered or not resolvable yet): a draft typed and cleared while the turn is
   // briefly unresolved still latches the takeover.
   if (draftText && normalizePrompt(draftText) !== submission.expected) return takeOver("draft");
+  // 4. ("collect") The pinned response. boundReviewResponse always binds the LAST reply after the
+  // sent turn, so a response regenerated after the first answered observation would bind instead:
+  // any other response (another ID; with no ID, another rendered node) is the user's.
+  if (pinned && bound.root && ((bound.responseId || "") !== pinned.responseId || (!pinned.responseId && bound.root !== pinned.root))) {
+    return takeOver("response_changed");
+  }
   if (!bound.identified) {
     // A collected answer whose turn is gone was replaced (edited, regenerated or deleted). Still in
     // the recorded conversation with no addressable turn: not rendered yet (transient).
@@ -618,7 +626,9 @@ function fixCanClose(state) {
  * item (the worker's ashlar-fix-cancel); no page timer ends a transient wait: the fix deadline bounds it.
  */
 async function waitUntilFixOrQuota(name) {
-  const stability = {stable: "", hits: 0};
+  // `pinned`: the response this run collects, fixed at its first answered observation and never
+  // replaced (a regenerated response ends the run: fixOwnershipProof "collect").
+  const stability = {stable: "", hits: 0, pinned: undefined};
   for (;;) {
     if (globalThis.__ashlarRunnerState?.fixCancelled) {
       const error = new Error("fix request cancelled by the server"); error.code = "cancelled"; throw error;
@@ -632,7 +642,7 @@ async function waitUntilFixOrQuota(name) {
     // or no identified response the page-global fallbacks would read whatever chat is on screen:
     // never an answer (a review keeps its legacy unbound observation). An edited turn repurposes
     // the tab for good; after an in-page move the lingering DOM is not harvested there.
-    const proof = runner ? fixOwnershipProof(runner, {phase: "collect", journal: poll.submission}) : {ownership: "unknown"};
+    const proof = runner ? fixOwnershipProof(runner, {phase: "collect", journal: poll.submission, pinned: stability.pinned}) : {ownership: "unknown"};
     // A permanent verdict ends the run NOW (endFixRun: slot freed, `taken_over`); only a transient
     // "unknown" keeps polling, bounded by the server's fix deadline.
     if (runner && fixVerdictPermanent(proof)) {
@@ -650,6 +660,8 @@ async function waitUntilFixOrQuota(name) {
     if (!answered) recordReviewStep(!done && (stop || streaming) ? "generating" : "waiting_for_response");
     throwIfQuota(name, bound, answered);
     if (answered) {
+      // Its ID (the rendered node when it has none): the only response a later poll may collect.
+      stability.pinned ||= {responseId: bound.responseId || "", root: bound.root};
       if (settleStableAnswer(stability, text, poll, {text, raw: text})) return text;
     } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));

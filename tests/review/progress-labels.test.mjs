@@ -352,14 +352,22 @@ function calledAt(level, k, path) {
     (first < 0 ? level.length : first) === k + 1;
 }
 
+/** The equality operators: a string compared by one (`kind === "step"`) yields a boolean, not a key. */
+const EQUALITY = new Set(['===', '!==', '==', '!=']);
+
+/** Whether the string at `level[k]` is only compared: an operand of an equality or a `case` label. */
+const compared = (level, k) => isWord(level[k - 1], 'case') ||
+  [level[k - 1], level[k + 1]].some(token => token?.kind === 'punct' && EQUALITY.has(token.text));
+
 /** Why `level[k]` reaches a recorder by a name the tokens never spell as one, or null: a string whose
- * value is a recorder's name (`globalThis["workerStep"]`, `Reflect.get(self, "step")`), a call through a
+ * value is a recorder's name and that is not only compared (`globalThis["workerStep"]`,
+ * `Reflect.get(self, "step")`, an argument or a stored value that may reach such a lookup), a call through a
  * computed member whose name the guard cannot read, on any object (`e.currentTarget[name](...)`: the
  * global object can arrive as any value), or the global object read other than by a static member name
  * (`globalThis[name]`). */
 function reachedByName(level, k, container, path) {
   const token = level[k], value = literalValue(token);
-  if (value !== undefined && Object.hasOwn(RECORDERS, value)) {
+  if (value !== undefined && Object.hasOwn(RECORDERS, value) && !compared(level, k)) {
     return 'a string naming a recorder can reach it through a computed member or a lookup, so the stages it records there cannot be checked';
   }
   if (computedMember(level, k) && memberKey(token) === undefined && calledAt(level, k, path)) {
@@ -1117,6 +1125,9 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     ['const record = Reflect.get(api, "recordReviewStep");\nrecord("unlabelled_lookup");', named(1, '"recordReviewStep"')],
     ['const recorders = {"workerStep": note};', named(1, '"workerStep"')],
     ['log(`${"st\\u0065p"}`);', named(1, '"st\\u0065p"')],
+    // Passed or stored, a recorder's name may reach a lookup the guard cannot see.
+    ['note("step");', named(1, '"step"')],
+    ['const kinds = ["workerStep"];', named(1, '"workerStep"')],
     // A name the guard cannot read fails closed.
     ['globalThis[name]("unlabelled_computed");', global(1, 'globalThis'), called(1, '[name]')],
     ['\nglobalThis?.[name]?.(job, provider, "unlabelled_computed");', global(2, 'globalThis'), called(2, '[name]')],
@@ -1180,6 +1191,9 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     'try { run(); } catch (window) { note(window); }\nfor (const top of rows) note(top);\nfor (const [parent] of rows) { note(parent); }\n' +
     'class A { m(key) { return note(this[key]); } static n() { return this; } }\nconst o = {top() { return 1; }, parent(x) { return x; }};\n' +
     'const pick = function self(n) { return n ? self(n - 1) : note(self); };'), []);
+  // A recorder's name only compared is a boolean's operand, never a key.
+  assert.deepEqual(problems('if (kind === "step") go(); if ("workerStep" !== row.kind) skip(); ok = kind == `step`;\n' +
+    'switch (kind) { case "recordReviewStep": break; }'), []);
   // A computed member the guard can read, one that is not called, or an array literal calls no recorder
   // by a hidden name.
   assert.deepEqual(problems('handlers["open"](row); rows[0](); const state = job.states[provider]; job.states[provider].runId = id;\n' +

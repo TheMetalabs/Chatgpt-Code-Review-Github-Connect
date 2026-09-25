@@ -39,7 +39,8 @@ const userTurn=(id='user-A',text=PROMPT)=>`<section data-testid="conversation-tu
 const answerTurn=({code=ANSWER,done=true,id='answer-A'}={})=>`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="${id}"><div class="markdown"><p>Review below.</p><pre><div><div id="lang">JSON</div><div><button>Copy</button></div></div><div><code id="code">${code.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</code></div></pre></div></div>${done?actions:''}</section>`;
 /** A file chip as the composer shows a staged attachment (the named shape attachmentsReady reads). */
 const fileChip=name=>`<div role="group" aria-label="${name}" style="width:120px;height:40px">${name}<button aria-label="Remove file">x</button></div>`;
-const composerHtml=({composer='',sendDisabled=false,uploading=false,chips=[]})=>`<form data-type="unified-composer">${chips.map(fileChip).join('')}<div contenteditable="true" id="prompt-textarea" style="width:300px;min-height:40px">${composer}</div>${uploading?'<div role="progressbar" style="width:60px;height:20px">uploading</div>':''}<button id="composer-submit-button" aria-label="Send prompt" style="width:32px;height:32px"${sendDisabled?' disabled':''}>send</button></form>`;
+/** `controls`: more of the composer's own controls; `sendTitle`: a tooltip title on the send button. */
+const composerHtml=({composer='',sendDisabled=false,uploading=false,chips=[],controls='',sendTitle=''})=>`<form data-type="unified-composer">${chips.map(fileChip).join('')}${controls}<div contenteditable="true" id="prompt-textarea" style="width:300px;min-height:40px">${composer}</div>${uploading?'<div role="progressbar" style="width:60px;height:20px">uploading</div>':''}<button id="composer-submit-button" aria-label="Send prompt"${sendTitle?` title="${sendTitle}"`:''} style="width:32px;height:32px"${sendDisabled?' disabled':''}>send</button></form>`;
 const sentJournal=(extra={})=>({phase:'sent',expected:PROMPT,baseline:0,submittedUsers:1,messageId:'user-A',...extra});
 
 async function chatTab(t,{provider='chatgpt',url=provider==='grok'?'https://grok.com/':TEMP_URL,kind,job=kind==='fix'?'fix-A':'job-A',run='run-A',bound=true,journal,...view}={}){
@@ -237,10 +238,10 @@ for(const [shape,chip] of CHIP_SHAPES){
   const out=await tab.send('ashlar-fix-cancel',{allocationUrl:TEMP_URL,undispatched:true});
   assert.deepEqual({owned:out.owned,canClose:out.canClose,ownership:out.ownership,blank:out.blank,cause:out.cause},{owned:false,canClose:false,ownership:'takenOver',blank:false,cause:'draft'});
  });
- // A named element inside a chip (a remove control's title) is part of that chip, not another file:
- // before the send, the run's own chip is still its own.
- test(`worker, review: a leg cancelled while its own attachment (${shape}, its remove control titled) still uploads is closed: its own file is not a draft`,async t=>{
-  const own=name=>chip(name).replace('<button aria-label="Remove file">','<button title="Remove file" aria-label="Remove file">');
+ // A named element inside a chip (its icon's title, its remove control's title) is part of that
+ // chip, not another file: before the send, the run's own chip is still its own.
+ test(`worker, review: a leg cancelled while its own attachment (${shape}, its icon and remove control titled) still uploads is closed: its own file is not a draft`,async t=>{
+  const own=name=>chip(name).replace('<button aria-label="Remove file">','<span title="Patch file">p</span><button title="Remove file" aria-label="Remove file">');
   const tab=await chatTab(t,{composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:['diff.patch']}});
   await stageChip(tab.page,own,'diff.patch');
   const w=wire(tab);
@@ -276,6 +277,51 @@ for(const [wrapper,wrap] of UNNAMED_WRAPPERS){
   assert.deepEqual({owned:out.owned,canClose:out.canClose,ownership:out.ownership,blank:out.blank,cause:out.cause},{owned:false,canClose:false,ownership:'takenOver',blank:false,cause:'draft'});
  });
 }
+// Ashlar, review of 5af999fd: the composer's own titled controls are not title-only file chips. The
+// title on a control is its tooltip, so neither the send barrier nor the release verdict reads it as
+// a file (composer.js fileChips, one list for both): a secured review or fix tab closes, a fix run
+// delivers its answer instead of ending taken_over, and an undispatched blank page closes.
+const TITLED_CONTROLS=[
+ ['a titled send button',{sendTitle:'Send prompt'},'Send prompt'],
+ ['a titled voice button',{controls:'<button type="button" title="Start voice mode" aria-label="Start voice mode" style="width:32px;height:32px">v</button>'},'Start voice mode'],
+ ['a titled model menu',{controls:'<span aria-haspopup="menu" title="GPT-5 Thinking" style="display:inline-block;width:60px;height:20px">GPT-5</span>'},'GPT-5 Thinking'],
+ ['a titled tool pill (role=button)',{controls:'<div role="button" tabindex="0" title="Search the web" style="width:60px;height:20px">Search</div>'},'Search the web'],
+ ['a titled help link',{controls:'<a href="/help" title="Help and shortcuts" style="display:inline-block;width:20px;height:20px">?</a>'},'Help and shortcuts'],
+ ['a titled attach label',{controls:'<label title="Attach files" style="display:inline-block;width:20px;height:20px">+<input type="file" hidden></label>'},'Attach files'],
+];
+for(const [control,view,title] of TITLED_CONTROLS){
+ test(`the send barrier and the release verdict both read ${control} as the composer's, not a file`,async t=>{
+  const tab=await chatTab(t,{bound:false,...view});
+  assert.deepEqual(await tab.page.evaluate(title=>({ready:attachmentsReady(document.querySelector('form'),[title]),staged:composerStagedFiles(null,null)}),title),
+   {ready:false,staged:[]});
+ });
+ for(const kind of ['review','fix'])test(`${kind}: a secured tab whose composer has ${control} is Ashlar's and closes`,async t=>{
+  const {tab}=await collected(t,{kind,...view}); // a fix run's own collection delivers (never taken_over)
+  const out=await tab.send('ashlar-can-close',{allocationUrl:TEMP_URL,secured:true});
+  assert.deepEqual({...verdict(out),ownership:out.ownership},{canClose:true,reason:'complete',ownership:'owned'});
+ });
+ for(const kind of ['review','fix'])test(`worker, ${kind}: a leg whose composer has ${control} delivers its answer and its ACKed tab closes`,async t=>{
+  const {tab,w}=await collectedLeg(t,{kind,...view});
+  await w.tick();
+  assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
+  assert.equal(w.b.calls.some(c=>c.action==='failure'),false,'never ended as taken_over');
+  assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
+  assert.equal((await tab.steps()).includes('context_changed'),false);
+ });
+ test(`review: an undispatched page whose composer has ${control} is blank: the worker may close it`,async t=>{
+  const tab=await chatTab(t,{bound:false,...view});
+  const out=await tab.send('ashlar-fix-cancel',{allocationUrl:TEMP_URL,undispatched:true});
+  assert.deepEqual({owned:out.owned,canClose:out.canClose,ownership:out.ownership,blank:out.blank},{owned:true,canClose:true,ownership:'owned',blank:true});
+ });
+}
+// Control: next to those controls, the user's title-only chip is still the one staged file.
+for(const kind of ['review','fix'])test(`${kind}: the user's title-only chip next to the composer's titled controls is the only staged file: preserved as a draft`,async t=>{
+ const {tab}=await collected(t,{kind,sendTitle:'Send prompt',controls:TITLED_CONTROLS.map(([, view])=>view.controls||'').join('')});
+ await stageChip(tab.page,CHIP_SHAPES.find(([shape])=>shape==='a title-only chip')[1],'my-notes.pdf');
+ assert.deepEqual(await tab.page.evaluate(()=>composerStagedFiles(null,{phase:'sent'})),['my-notes.pdf']);
+ const out=await tab.send('ashlar-can-close',{allocationUrl:TEMP_URL,secured:true});
+ assert.deepEqual({...verdict(out),ownership:out.ownership},{canClose:false,reason:'repurposed',cause:'draft',ownership:'takenOver'});
+});
 for(const kind of ['review','fix'])test(`${kind}: a secured tab moved in-page to another conversation (old DOM still rendered) is the user's`,async t=>{
  const {tab}=await collected(t,{kind});
  assert.equal((await canClose(tab)).canClose,true,'control: still in its own conversation');

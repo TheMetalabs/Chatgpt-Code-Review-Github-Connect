@@ -182,13 +182,29 @@ function renderedControl(el) {
 }
 
 /** The file-chip shapes a composer renders for a staged attachment: a named group, a data-file-name
- * tile, or an element that names its file only in its title. ONE list for the send barrier
- * (attachmentsReady: the run's own files are there) and the release verdict (json.js
+ * tile, or an element that names its file only in its title. ONE list (fileChips) for the send
+ * barrier (attachmentsReady: the run's own files are there) and the release verdict (json.js
  * composerStagedFiles: a file there that is not the run's is the user's draft), so neither sees a
  * chip the other misses (Ashlar 4101623051). Functions, not top-level consts: composer.js is
  * re-injected into a page that already ran it. */
 function fileChipSelector() {
   return '[role="group"][aria-label], [data-file-name], [title]';
+}
+/** The composer's own controls (the send and stop buttons, a voice button, a model or tool menu, an
+ * attach label, a link). The title on one of them is its tooltip, never a file's name. */
+function composerControlSelector() {
+  const roles = ["button", "link", "menuitem", "menuitemcheckbox", "menuitemradio", "switch", "checkbox", "radio", "combobox",
+    "option", "tab", "textbox", "slider"].map(role => `[role="${role}"]`);
+  return ["button", "a[href]", "input", "select", "textarea", "label", "summary", "[aria-haspopup]", ...roles,
+    "#composer-submit-button", '[data-testid="send-button"]', '[data-testid="stop-button"]'].join(", ");
+}
+/** The file chips in a composer form: every element in a fileChipSelector shape, except a control
+ * that is a chip only by its title (its tooltip: "Send prompt", "Start voice mode"). A named group or
+ * a data-file-name tile is a chip whatever element renders it. The barrier and the verdict both read
+ * this list, so neither takes a control's tooltip for a file (Ashlar, review of 5af999fd). */
+function fileChips(form) {
+  return [...form.querySelectorAll(fileChipSelector())]
+    .filter(chip => chip.matches('[role="group"][aria-label], [data-file-name]') || !chip.matches(composerControlSelector()));
 }
 /** Every name a file chip gives its file, in its shapes' order (data-file-name, aria-label, title). */
 function fileChipNames(chip) {
@@ -199,7 +215,7 @@ function attachmentsReady(form, names = []) {
   if (!form) return names.length === 0;
   const progress = form.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="uploading"], [class*="animate-spin"]');
   if ([...progress].some(renderedControl)) return false;
-  const chips = [...form.querySelectorAll(fileChipSelector())].filter(renderedControl);
+  const chips = fileChips(form).filter(renderedControl);
   return names.every(name => chips.some(chip => fileChipNames(chip).includes(name)));
 }
 

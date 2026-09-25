@@ -914,6 +914,8 @@ async function cleanupProviderBody(job, provider, jobs) {
       return;
     }
     if (result.reason === "repurposed") return preserveAnsweredTab(job, provider, jobs, "user continued the conversation; tab preserved");
+    // The page freed its slot: the leg stalled (#87) under a Stop that never clears, so no close is ever proven.
+    if (result.reason === "stalled") return preserveAnsweredTab(job, provider, jobs, "review stalled under a stuck Stop; tab preserved");
     if (!result.canClose) {
       state.cleanupWaitReason="page_completion_or_journal_pending";
       await saveJobs(jobs);return; // No deadline or forced eviction.

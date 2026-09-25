@@ -67,4 +67,39 @@ describe("reviewPostedNotes", () => {
     assert.match(moved[0], /Reviewed abcdef0 \(HEAD moved to 9998887\)/);
     assert.deepEqual(reviewPostedNotes({ headSha: "abcdef012345" }, 0), ["Reviewed abcdef0"]);
   });
+
+  // #77 job 989: the merge gate (cc_merge.py COVERAGE_RE) saw ~7 of 42 not_cleared files and a cut
+  // last name («packag») because every note was cut to 200 chars.
+  it("keeps a 42-file not_cleared line whole and still caps every other note", () => {
+    const files = [
+      ...Array.from({ length: 41 }, (_, i) => `src/lib/review-loop/module-${String(i).padStart(2, "0")}.server.ts`),
+      "package.json",
+    ];
+    const notes = reviewPostedNotes(
+      {
+        headSha: "abcdef012345",
+        headMovedTo: "999888777666",
+        // WHY cast: numbers alone never reach 200 chars; this proves the cap still applies to other notes.
+        promptStats: { diffChars: "9".repeat(300) as unknown as number, contextChars: 2000, policyChars: 300, diffFilesFull: 3, diffFilesTotal: 4 },
+        coverageDeterministic: [{ path: "a.ts", inDiff: true, inContext: true }],
+        coverage: files.map((file) => ({ file, status: "not_cleared" as const, reason: "x" })),
+        droppedCount: 2,
+      },
+      1,
+    );
+    const line = `Coverage (model): not_cleared = ${files.join(", ")}`;
+    assert.ok(line.length > 200);
+    assert.ok(notes.includes(line), "the not_cleared note is emitted whole, byte for byte");
+    const others = notes.filter((n) => n !== line);
+    assert.ok(others.every((n) => n.length <= 200), "every other note stays at 200 chars or less");
+    assert.ok(others.some((n) => n.startsWith("Prompt: diff ") && n.length === 200));
+    assert.ok(notes.length <= 8);
+
+    // The gate parses the posted body, not the notes: the same regex must recover all 42 names.
+    const body = buildOpsComment({ phase: "posted", providers: ["chatgpt"], notes: ["Job: j1", ...notes] });
+    assert.ok(body.includes(`\n- ${line}\n`));
+    const m = /Coverage \(model\):\s*not_cleared\s*=\s*(.+)/.exec(body);
+    assert.ok(m);
+    assert.deepEqual(m[1].trim().split(",").map((p) => p.trim()).filter(Boolean), files);
+  });
 });

@@ -205,14 +205,18 @@ const literalValue = token => token?.kind === 'str' || (token?.kind === 'tpl' &&
 const GLOBAL_NAMES = new Set(['globalThis', 'self', 'window', 'frames', 'top', 'parent', 'this']);
 
 /** Whether the `[` group at `level[k]` is a computed member (`x[k]`, `f()[k]`, `x?.[k]`, `{a: f}[k]`) rather
- * than an array literal: it follows `?.` or the end of an operand. A `{...}` after an operator is an object
- * literal; one at the start of a statement or after `=>` is a block. */
+ * than an array literal: it follows `?.` or the end of an operand. A `{...}` after an operator or a keyword
+ * that starts an expression (`return {a: f}[k]`) is an object literal; one at the start of a statement,
+ * after `=>`, `do` or `else` is a block. */
 function computedMember(level, k) {
   const token = level[k], before = level[k - 1];
   if (token?.open !== '[' || !before) return false;
   if (before.kind === 'punct') return before.text === '?.';
   if (before.kind === 'word') return !REGEX_AFTER.has(before.text) && !['const', 'let', 'var'].includes(before.text);
-  if (before.open === '{') return level[k - 2]?.kind === 'punct' && !['=>', ';'].includes(level[k - 2].text);
+  if (before.open === '{') {
+    const lead = level[k - 2];
+    return lead?.kind === 'punct' ? !['=>', ';'].includes(lead.text) : lead?.kind === 'word' && REGEX_AFTER.has(lead.text) && !['do', 'else'].includes(lead.text);
+  }
   if (before.kind === 'group') return before.open === '[' || (before.open === '(' && !HEADED.has(level[k - 2]?.text));
   return true; // after a string, a template or a regex
 }
@@ -1320,6 +1324,10 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     ['new handlers[kind]("unlabelled_new");', called(1, '[kind]')],
     ['f()[i](job, provider, "unlabelled_result");', called(1, '[i]')],
     ['const f = {a: note}[kind](job, provider, "unlabelled_object");', called(1, '[kind]')],
+    // An object literal after a keyword that starts an expression is one too.
+    ['function f() { return {a: note}[kind]("unlabelled_object"); }', called(1, '[kind]')],
+    ['throw {a: note}[kind]("unlabelled_object");', called(1, '[kind]')],
+    ['async function f() { await {a: note}[kind]("unlabelled_object"); }', called(1, '[kind]')],
     // Through parentheses, whose value the member can be, and through new, which calls what it constructs.
     ['(e.view[name])("unlabelled_paren");', called(1, '[name]')],
     ['(0, e.view[name])("unlabelled_comma");', called(1, '[name]')],
@@ -1355,7 +1363,7 @@ test('a recorder is reached only by its name: a string naming one, a call throug
   assert.deepEqual(problems('handlers["open"](row); rows[0](); const state = job.states[provider]; job.states[provider].runId = id;\n' +
     'note(job.states[provider], rows[i]); if (ok) [a, b].forEach(note); Reflect.apply(note, null, [rows[i]]); return [a](b);\n' +
     'const state = (job.states[provider]); note((rows[i]).id, (0, rows[i])); f(a)(rows[i]); new Row(rows[i]); new f()[i];\n' +
-    'if (ok) {}\n[a, b].forEach(note);\nx = y => {};\n[a](b);\nfunction f() {}\n[kind](x);'), []);
+    'if (ok) {}\n[a, b].forEach(note);\nx = y => {};\n[a](b);\nfunction f() {}\n[kind](x);\nif (ok) {} else {}\n[kind](x);'), []);
 });
 
 test('a recorder forwards its stage parameter only when nothing in its body can change or shadow it', () => {

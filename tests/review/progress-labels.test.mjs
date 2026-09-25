@@ -1083,6 +1083,12 @@ test('repair_${status.status} takes the RepairStatus values only where status is
     [`${reply}(response.repair).status = "stalled";\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
     [reply.replace('\nconst status', '\nObject.assign(response.repair, patch);\nconst status') + `${record};`,
       'line 3 uses other than as a member read (response.repair holds what status aliases)'],
+    // A tag receives the object its function is read from; an earlier substitution of the read's own
+    // template runs first; a pattern around the read makes the member before it a target.
+    [`${reply}status.fmt\`x\`;\n${record};`, 'reads status, which line 4 uses other than as a member read'],
+    [`${reply}response.repair.fmt\`x\`;\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}log(\`\${Object.assign(response.repair, patch)} \${${record}}\`);`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}[status.status, row[${record}]] = ["stalled", 0];`, 'reads status, which line 4 uses'],
     // Code that runs between them without standing between them: a function anywhere in the block, called
     // at any time (declared after the read and hoisted, or before the declarations); a loop around the
     // read, whose next pass runs its whole statement first; and the rest of the block when the read is
@@ -1212,6 +1218,9 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     ['const record = Reflect.get(api, "recordReviewStep");\nrecord("unlabelled_lookup");', named(1, '"recordReviewStep"')],
     ['const recorders = {"workerStep": note};', named(1, '"workerStep"')],
     ['log(`${"st\\u0065p"}`);', named(1, '"st\\u0065p"')],
+    // A line continuation and a legacy octal escape spell a recorder's name too.
+    ['globalThis[\'workerStep\\\n\'](job, provider, "unlabelled_computed");', named(1, '\'workerStep\\\n\'')],
+    ['globalThis["workerSte\\160"](job, provider, "unlabelled_computed");', named(1, '"workerSte\\160"')],
     // Passed or stored, a recorder's name may reach a lookup the guard cannot see.
     ['note("step");', named(1, '"step"')],
     ['const kinds = ["workerStep"];', named(1, '"workerStep"')],
@@ -1268,7 +1277,8 @@ test('a recorder is reached only by its name: a string naming one, a call throug
   assert.deepEqual(problems('window.getComputedStyle(node); globalThis.__ashlarRunnerState = state; globalThis.window?.getComputedStyle(el);\n' +
     'const saved = globalThis["__ashlarRunnerState"]; if (typeof window === "undefined") note(self.location?.href);\n' +
     'const box = {top: rect.top, window: 1}; node.parent[key] = rect.top + 1; const view = document.defaultView.innerWidth;\n' +
-    'globalThis.recordReviewStep?.("optional_call"); const doc = "workerStep(job, provider, stage)"; note("steps", "Step");'), []);
+    'globalThis.recordReviewStep?.("optional_call"); const doc = "workerStep(job, provider, stage)"; note("steps", "Step");\n' +
+    'note(window.this);'), []);
   // A local of a global name is not the global object: a declaration (a pattern's too), a parameter (an
   // arrow's, a catch's, a function expression's own name), a for head's declaration, a method's name or
   // an object key; nor is `this` in a class body.

@@ -47,6 +47,12 @@ ${noteLines}
 `;
 }
 
+const NOTE_MAX_CHARS = 200;
+const MAX_NOTES = 8;
+// WHY: cc_merge.py COVERAGE_RE parses this line from the posted comment to gate merges; a cut
+// line hid files from the gate (#77 job 989: ~7 of 42). Keep the literal format byte-identical.
+const COVERAGE_MODEL_PREFIX = "Coverage (model): not_cleared = ";
+
 // WHY: make the "review posted" comment show what the reviewer actually saw —
 // reviewed sha (+ whether HEAD moved), prompt sizes, deterministic + model
 // coverage, and precision-dropped count. Pure/read-only; never affects the verdict.
@@ -72,10 +78,10 @@ export function reviewPostedNotes(
   const cov = job.coverage ?? [];
   if (cov.length) {
     const nc = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
-    notes.push(`Coverage (model): not_cleared = ${nc.join(", ") || "none"}`);
+    notes.push(`${COVERAGE_MODEL_PREFIX}${nc.join(", ") || "none"}`);
   }
   if (typeof job.droppedCount === "number") {
     notes.push(`Findings: ${returnedFindings} returned${unanchoredInBody ? ` (${unanchoredInBody} in body — no inline anchor)` : ""}, ${job.droppedCount} dropped by precision policy`);
   }
-  return notes.map((n) => n.slice(0, 200)).slice(0, 8);
+  return notes.map((n) => (n.startsWith(COVERAGE_MODEL_PREFIX) ? n : n.slice(0, NOTE_MAX_CHARS))).slice(0, MAX_NOTES);
 }

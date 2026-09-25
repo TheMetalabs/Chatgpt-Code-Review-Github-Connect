@@ -861,14 +861,11 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   }
 }
 
-async function waitUntilComposer() {
-  // Backstop, not a generation timeout: guards a page that never renders a composer (e.g. a stale
-  // model URL or a logged-out landing) so the runner fails cleanly and releases the lane instead of
-  // waiting forever. Generation itself stays unbounded elsewhere. Local, not a top-level const: the
-  // worker re-injects this file into a page that already ran it, and a redeclared global lexical
-  // binding aborts the whole script (leaving every older definition in place).
-  const COMPOSER_DEADLINE_MS = 3 * 60 * 60 * 1000; // 3h
-  const deadline = Date.now() + COMPOSER_DEADLINE_MS;
+async function waitUntilComposer(deadline = Date.now() + 3 * 60 * 1000) {
+  // Pre-send bound, not a generation timeout: a page that never renders a composer (a stale model
+  // URL, a logged-out landing, a changed selector) fails the run as presend_stalled so the job retries
+  // or settles (live 1.1.32: 10+ min in composer_waiting under the old 3 h backstop). Generation
+  // itself stays unbounded elsewhere.
   for (;;) {
     globalThis.throwIfStopped?.();
     if (typeof quotaHit === "function" && quotaHit()) {
@@ -878,13 +875,76 @@ async function waitUntilComposer() {
     }
     const el = composer();
     if (el) return el;
-    if (Date.now() >= deadline) {
-      const e = new Error("composer never rendered within deadline");
-      e.code = "composer_timeout";
-      throw e;
-    }
-    await sleep(250);
+    if (Date.now() >= deadline) throw presendStalled("composer");
+    await waitForPageChange(1000);
   }
+}
+
+function presendStalled(stage) {
+  const e = new Error(`presend_stalled: the pre-send stage "${stage}" did not finish in time; nothing was sent`);
+  e.code = "presend_stalled";
+  e.stage = stage;
+  return e;
+}
+
+/** `work(deadline)` bounded by `ms`: past it the run fails as presend_stalled(stage), or, with
+ * `onExpire`, resolves to its value. The work is also handed the deadline, so a late copy stops
+ * clicking on its own. Deadlines are wall clock: a throttled background tab only checks late. */
+async function presendBound(stage, ms, work, onExpire) {
+  const deadline = Date.now() + ms;
+  let timer;
+  const expired = new Promise((resolve, reject) => {
+    timer = setTimeout(() => (onExpire ? resolve(onExpire()) : reject(presendStalled(stage))), ms);
+  });
+  try { return await Promise.race([work(deadline), expired]); }
+  finally { clearTimeout(timer); }
+}
+
+/** Everything a new run does before typing: overlays, the composer, the reasoning level. Every stage
+ * is bounded and records its own step, so a stall shows where it stopped. Locals, not top-level
+ * consts: the worker re-injects this file into a page that already ran it, and a redeclared global
+ * lexical binding aborts the whole script. */
+async function preparePresend(provider, reasoning, openComposer) {
+  const OVERLAYS_MS = 60 * 1000, COMPOSER_MS = 3 * 60 * 1000, REASONING_MS = 60 * 1000;
+  const overlays = () => { step("overlays_dismissing"); return presendBound("overlays", OVERLAYS_MS, () => dismissOverlays()); };
+  try {
+    await overlays();
+    step("composer_waiting");
+    let el = await presendBound("composer", COMPOSER_MS, deadline => openComposer(deadline));
+    step("composer_ready");
+    await overlays();
+    step("reasoning_selecting");
+    const picked = await presendBound("reasoning", REASONING_MS, deadline => selectReasoning(provider, reasoning, deadline), () => "skipped");
+    if (picked === "skipped") step("reasoning_skipped");
+    await overlays();
+    el = composer() || el;
+    return el;
+  } catch (e) {
+    if (e?.code === "presend_stalled") savePresendStallHtml(e.stage);
+    throw e;
+  }
+}
+
+/** Diagnostic: the page as a pre-send stall left it, in chrome.storage.local "presendStallHtml" (last
+ * 3). The main area (or body) without scripts, styles, images and SVG paths, capped at 200 KB; the
+ * URL without its query. Off with {presendStallHtmlOff:true}. Never affects the run. */
+function savePresendStallHtml(stage) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    const state = globalThis.__ashlarRunnerState;
+    const area = document.querySelector("main") || document.body;
+    const clone = area.cloneNode(true);
+    for (const node of clone.querySelectorAll("script,style,noscript,img,svg path")) node.remove();
+    const record = {job: state?.jobId, run: state?.runId, stage, at: Date.now(),
+      url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: clone.outerHTML.slice(0, 200_000)};
+    globalThis.__ashlarPresendWrites = (globalThis.__ashlarPresendWrites || Promise.resolve()).then(async () => {
+      const flags = await local.get(["presendStallHtmlOff", "presendStallHtml"]);
+      if (flags?.presendStallHtmlOff === true) return;
+      const list = Array.isArray(flags?.presendStallHtml) ? flags.presendStallHtml : [];
+      await local.set({presendStallHtml: [...list, record].slice(-3)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
 }
 
 async function waitFor(fn, ms, label) {

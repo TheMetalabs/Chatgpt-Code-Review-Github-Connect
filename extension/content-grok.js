@@ -33,11 +33,11 @@ function clickLabel(re) {
   return false;
 }
 
-async function startFresh() {
+async function startFresh(deadline) {
   clickLabel(/temporary|private chat|incognito|ghost/i);
   await sleep(400);
   clickLabel(/new chat|new conversation/i);
-  return waitUntilComposer();
+  return waitUntilComposer(deadline);
 }
 
 async function runPrompt(prompt, reasoning, resume = false) {
@@ -46,12 +46,7 @@ async function runPrompt(prompt, reasoning, resume = false) {
     await resumeSubmission(sendButton, composer, prompt);
     return waitUntilReviewOrQuota("Grok");
   }
-  step("composer_waiting");
-  await dismissOverlays();
-  const el = await startFresh();
-  await dismissOverlays();
-  await selectReasoning("grok", reasoning || "heavy");
-  await dismissOverlays();
+  const el = await preparePresend("grok", reasoning || "heavy", deadline => startFresh(deadline));
   if (quotaHit()) throw quotaError();
   step("attachments_preparing");
   const submittedText = await fillComposer(el, prompt);

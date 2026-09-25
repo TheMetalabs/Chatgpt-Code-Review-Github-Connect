@@ -29,13 +29,8 @@ async function runPrompt(prompt, reasoning, resume = false) {
     await resumeSubmission(sendButton, composer, prompt);
     return waitUntilReviewOrQuota("ChatGPT");
   }
-  step("composer_waiting");
-  await dismissOverlays();
-  await waitUntilComposer();
-  await dismissOverlays();
-  await selectReasoning("chatgpt", reasoning || "extra_high");
-  await dismissOverlays();
-  const el = composer();
+  // Every pre-send stage is bounded (composer.js preparePresend): a stall fails as presend_stalled.
+  const el = await preparePresend("chatgpt", reasoning || "extra_high", deadline => waitUntilComposer(deadline));
   if (!el) throw new Error("ChatGPT composer not found");
   if (quotaHit()) throw quotaError();
   step("attachments_preparing");

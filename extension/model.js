@@ -32,7 +32,18 @@ function grokPill() {
   return document.querySelector("#model-select-trigger") || document.querySelector("button[aria-label='모델 선택']");
 }
 
-async function selectReasoning(provider, level) {
+function reasoningMenuItems() {
+  return [
+    ...document.querySelectorAll(
+      "[role='menuitem'], [role='option'], [role='menuitemradio'], [data-radix-collection-item], [cmdk-item]",
+    ),
+  ];
+}
+
+/** Picks the reasoning level on the model pill: "current" when it already shows it, "selected" once
+ * clicked, "skipped" when it cannot be picked by `deadline` (no pill, a menu that never opens, no
+ * matching item): the run then continues with the current model, never waits on the menu. */
+async function selectReasoning(provider, level, deadline = Date.now() + 60_000) {
   const want = String(level || (provider === "grok" ? "heavy" : "extra_high"));
   const hit = provider === "grok" ? grokLevelHit : chatgptLevelHit;
   const fallback =
@@ -44,28 +55,38 @@ async function selectReasoning(provider, level) {
         ? ["extra_high", "high", "medium"]
         : [want];
   const pill = provider === "grok" ? grokPill() : chatgptPill();
-  if (!pill) return;
-  if (hit(want, pillText(pill))) return;
+  if (!pill) return "skipped";
+  if (hit(want, pillText(pill))) return "current";
+  const escape = () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   // The stop fence (json.js), before each click: the model menu of a conversation the user opened in
   // the tab meanwhile is never touched.
   globalThis.throwIfStopped?.();
+  if (Date.now() >= deadline) return "skipped";
   pill.click();
-  await sleep(800);
+  // The menu renders after the click; wait for its items, but only up to the deadline.
+  let items = [];
+  for (;;) {
+    await (typeof waitForPageChange === "function" ? waitForPageChange(400) : sleep(400));
+    globalThis.throwIfStopped?.();
+    items = reasoningMenuItems();
+    if (items.length || Date.now() >= deadline) break;
+  }
+  if (Date.now() >= deadline && !items.length) { escape(); return "skipped"; }
+  // Items can still be mounting; one short settle before choosing.
+  await sleep(400);
   globalThis.throwIfStopped?.();
-  const items = [
-    ...document.querySelectorAll(
-      "[role='menuitem'], [role='option'], [role='menuitemradio'], [data-radix-collection-item], [cmdk-item]",
-    ),
-  ];
+  if (Date.now() >= deadline) { escape(); return "skipped"; }
+  items = reasoningMenuItems();
   for (const key of fallback) {
     const el = items.find((n) => hit(key, pillText(n)));
     if (el instanceof HTMLElement) {
       el.click();
       await sleep(400);
-      return;
+      return "selected";
     }
   }
-  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  escape();
+  return "skipped";
 }
 
 function findingsJsonTooThin(raw) {

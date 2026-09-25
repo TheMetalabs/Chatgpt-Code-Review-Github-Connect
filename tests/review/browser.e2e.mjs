@@ -551,8 +551,8 @@ test(`real DOM: a fix delivered, then its sent turn edited to "${edit}": can-clo
 
 // Round 12 (Ashlar 4097631101), under #82's release rule: the server reports the fix cancelled or
 // unknown (a registry restart or a terminal-retention prune forgets it) AFTER its answer was
-// collected and delivered. The release follows the local proof (an answer was collected: it asks
-// can-close, never the cancel exit), never the server status, and acts on the one verdict. The
+// collected and delivered. Whether the tab closes never follows the server status: the page answers
+// both exits with the one verdict, and a cancelled job's exit also stops the page's run (#82). The
 // answer changing on the page (regenerated, replaced under a new message ID) is not the user's
 // activity (#82: ChatGPT keeps redrawing and re-keying a finished answer), so the tab still closes;
 // only a user signal (here a follow-up turn) keeps it, preserved and released.
@@ -564,7 +564,7 @@ const ANSWER_CHANGES={
 };
 for(const status of ['cancelled','unknown'])for(const [change,apply] of Object.entries(ANSWER_CHANGES)){
 const kept=change==='followup';
-test(`real DOM: a delivered fix whose server then reports ${status}, answer ${change}: asked can-close, ${kept?'preserved and released, never closed':'closed (no user signal)'}`,async t=>{
+test(`real DOM: a delivered fix whose server then reports ${status}, answer ${change}: ${kept?'preserved and released, never closed':'closed (no user signal)'}${status==='cancelled'?', its run stopped':''}`,async t=>{
  const ctx=await conversationPage(t,'fix');
  const server={value:'awaiting_chat'};
  const {b,state}=wiredWorker(ctx.page,server);
@@ -580,8 +580,9 @@ test(`real DOM: a delivered fix whose server then reports ${status}, answer ${ch
  b.context.cleanupProvider=cleanup;
  await b.tick();
  const got={closed:b.closedTabs.length,retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released,
-  askedCancel:b.messages.some(m=>m.type==='ashlar-fix-cancel' && !m.preserve),askedCanClose:b.messages.some(m=>m.type==='ashlar-can-close')};
- assert.deepEqual(got,kept?{closed:0,retired:true,released:true,askedCancel:false,askedCanClose:true}:{closed:1,retired:true,released:false,askedCancel:false,askedCanClose:true});
+  stopped:await ctx.page.evaluate(()=>sessionStorage.getItem('ashlar:stopped:fix-A:run-A')==='true')};
+ // (a preserved tab's run is stopped too: the preserve message is the cancel exit, preserveFixTab)
+ assert.deepEqual(got,{closed:kept?0:1,retired:true,released:kept,stopped:status==='cancelled' || kept});
 });
 }
 

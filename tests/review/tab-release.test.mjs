@@ -105,6 +105,53 @@ for (const kind of ['review', 'fix']) {
     assert.ok(b.tabs.has(10), 'the user\'s tab is untouched');
   });
 }
+// A cancelled or forgotten leg is stopped whatever it collected (#82), and released by the same
+// verdict as a secured one: #77's rule that a close never follows the server status holds because
+// the page answers both exits with ONE verdict (json.js tabOwnership), modelled here; only the cancel
+// exit also stops the page's run (a review loop still polling after its original was archived).
+function pageExits(verdict) {
+  const page = {stopped: false};
+  page.handler = (_id, m) => {
+    if (m.type === 'ashlar-fix-cancel') page.stopped = true;
+    return m.type === 'ashlar-can-close' || m.type === 'ashlar-fix-cancel' ? {...verdict, stopped: page.stopped} : {ok: false, code: 'busy', retry: true};
+  };
+  return page;
+}
+const archived = {id: 'capture-A', archiveDurable: true, responseId: 'response-A', text: 'not json', context: '[]', sourceHash: 'h', totalChars: 8};
+const abandonedAs = {delivered: true, cleanupPending: true, abandoned: true, abandonedAs: 'cancelled', conversation: URL_TAB};
+const ABANDONED_AFTER_COLLECT = [
+  // the original is durably archived, but the page never recorded the capture receipt (it answered
+  // capture_source_changed or unavailable), so its review loop still polls
+  ['review', 'its original durably archived', {sourceCapture: archived, ...abandonedAs}, {captureProtocol: 1}],
+  // collected, then cancelled before the result was ACKed (abandonLegs): never secured
+  ['review', 'its answer collected, never ACKed', {outcome: {ok: true, raw, originalText: raw}, ...abandonedAs}],
+  ['fix', 'its answer collected, never ACKed', {outcome: {ok: true, raw: ANSWER.fix, originalText: ANSWER.fix}, ...abandonedAs}],
+];
+for (const [kind, what, state, patch = {}] of ABANDONED_AFTER_COLLECT) {
+  for (const verdict of ['owned', 'takenOver']) {
+    test(`${kind}: a cancelled leg with ${what} is stopped, and its tab ${verdict === 'owned' ? 'closed as nobody\'s result' : 'kept'} by the page's verdict`, async () => {
+      const page = pageExits(verdict === 'owned' ? owned : {ok: true, releaseProtocol: 1, ownership: 'takenOver', cause: 'user_turn', url: URL_TAB});
+      const job = leg(kind, state, {serverStatus: 'cancelled', ...patch});
+      const b = worker(job, {status: 'cancelled', handler: page.handler});
+      await b.tick();
+      assert.equal(page.stopped, true, 'the cancel exit stopped the page\'s run');
+      assert.equal(b.messages.some(m => m.type === 'ashlar-can-close'), false);
+      assert.equal(b.pending(), undefined, 'retired');
+      assert.deepEqual(b.closedTabs, verdict === 'owned' ? [10] : []);
+      const note = (b.local.state.bridgeRecentRetired || []).find(entry => entry.jobId === job.jobId)?.note;
+      assert.equal(note, verdict === 'owned' ? 'no result wanted; tab closed' : 'the user took over the tab; tab preserved', 'a result never secured is not reported as secured');
+    });
+  }
+}
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: control: a secured leg the server still wants asks can-close, is not stopped, and closes as a secured result`, async () => {
+    const page = pageExits(owned);
+    const b = worker(leg(kind, {...secured(kind), conversation: URL_TAB}), {handler: page.handler});
+    await b.tick();
+    assert.equal(page.stopped, false);assert.deepEqual(b.closedTabs, [10]);
+    assert.equal((b.local.state.bridgeRecentRetired || []).find(entry => entry.jobId === leg(kind).jobId)?.note, 'result secured; tab closed');
+  });
+}
 test('review: a page that answers "capture_source_changed" after a durable archive gets the release verdict (closed when Ashlar\'s)', async () => {
   const capture = {id: 'capture-A', archiveDurable: true, responseId: 'response-A', text: 'not json', context: '[]', sourceHash: 'h', totalChars: 8};
   const b = worker(leg('review', {sourceCapture: capture}, {captureProtocol: 1}), {handler: (_id, m) => (m.type === 'ashlar-capture-accepted' ? {ok: false, code: 'capture_source_changed'} : m.type === 'ashlar-can-close' ? owned : {ok: false, code: 'busy'})});

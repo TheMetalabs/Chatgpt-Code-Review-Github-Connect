@@ -971,24 +971,24 @@ function tabVerdict(result, kind) {
   return {...result, ownership: result?.reason === "repurposed" ? "takenOver" : "unknown"};
 }
 
-/** The one release exit for a settled leg's tab (#82): a leg whose answer was collected asks
- * "ashlar-can-close"; an abandoned leg with nothing collected (abandonedLeg: cancelled or
- * forgotten, either kind) asks "ashlar-fix-cancel", which also stops its run, even while it is
- * still generating. Both get the page's ownership verdict (json.js tabOwnership): the tab is closed
+/** The one release exit for a settled leg's tab (#82): a leg whose result is secured asks
+ * "ashlar-can-close"; an abandoned leg (abandonedLeg: cancelled or forgotten, either kind, whatever
+ * it collected) asks "ashlar-fix-cancel", which also stops its run, even while it is still
+ * generating. Both get the page's ownership verdict (json.js tabOwnership): the tab is closed
  * unless the user positively took it over (then preserved and released), and preserved after
  * FIX_OWNERSHIP_WAIT_MS when ownership cannot be proven: never held forever, never closed on a
  * guess. A tab that carries another binding is never closed nor told to release. */
 async function forceCloseFixTab(job, provider, jobs, tab) {
   const state = job.states[provider];
-  // The exit is chosen by LOCAL proof only, never by server status (#77, Ashlar 4097631101): a leg
-  // whose page handed over its answer (state.outcome.ok; `rejectedRaw` for one the server rejected
-  // with 400; a review's durably archived original) asks can-close whatever the server reports
-  // (cancelled: settled, superseded, or forgotten by a restart or a prune). Only a leg with nothing
-  // collected takes the cancel exit, which also stops whatever its run still does: an abandoned
-  // leg, or a fix whose run failed (quota, an error). Both exits get the same verdict, and it
-  // compares nothing about the answer (#82: ChatGPT keeps redrawing a finished one).
-  const collected = state.outcome?.ok === true || typeof state.rejectedRaw === "string" || sourceArchiveDurable(state);
-  const cancelled = !collected && (abandonedLeg(job, state) || (job.kind === "fix" && state.outcome?.ok !== true));
+  // Whether the tab may close never follows the server status (#77, Ashlar 4097631101): both exits
+  // get the same verdict, and it compares nothing about the answer (#82: ChatGPT keeps redrawing a
+  // finished one), so a collected answer the server then cancels or forgets is released exactly as
+  // a secured one. The exit decides only whether the page's run is stopped too, and the cleanup
+  // note. A fix that collected no answer (its run failed: quota, an error) is asked with the cancel
+  // exit too (it also stops whatever that run still does); one that did (state.outcome.ok, or
+  // `rejectedRaw` for an answer the server rejected with 400) is not, unless it was abandoned.
+  const collected = state.outcome?.ok === true || typeof state.rejectedRaw === "string";
+  const cancelled = abandonedLeg(job, state) || (job.kind === "fix" && !collected);
   if (tab.discarded === true || tab.status === "unloaded") return releaseDiscardedTab(job, provider, jobs, tab);
   if (tab.status && tab.status !== "complete") {
     // A loading tab cannot answer for itself yet: asked again next tick.

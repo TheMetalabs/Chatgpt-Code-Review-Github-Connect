@@ -34,6 +34,15 @@ const ping = (status, active) => async (_path, body) => (body?.action === 'ping'
 const active = ping('awaiting_chat', true);
 const cancelled = ping('cancelled', false);
 const httpError = (status, code) => Object.assign(new Error(`HTTP ${status}`), {status, code});
+/** A page that answers BOTH release exits (can-close and the cancel exit) with one verdict, as json.js
+ * does (tabOwnership); only the cancel exit stops its run. */
+const sameVerdict = verdict => {
+  let stopped = false;
+  return (_id, m) => {
+    if (m.type === 'ashlar-fix-cancel') stopped = true;
+    return m.type === 'ashlar-can-close' || m.type === 'ashlar-fix-cancel' ? {...verdict, stopped} : {ok: false, code: 'busy', retry: true};
+  };
+};
 
 /** One row per behaviour: `run(kind)` drives the scenario and returns the observable outcome;
  * `same: true` — both kinds must give the same outcome (and `expect` pins it); otherwise
@@ -255,54 +264,55 @@ const ROWS = [
       await b.tick();
       return {closed: b.closedTabs.length, askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel')};
     }},
-  // W33-W35 (round 12, Ashlar 4097631101): the release exit is chosen by LOCAL proof (an answer was
-  // collected: state.outcome.ok, or rejectedRaw), never by server status. The server settling or
-  // forgetting the item (a restart or a terminal-retention prune reports an unknown fix id as
-  // cancelled) never moves a collected leg to the cancel exit: it asks can-close and acts on that
-  // verdict, for both kinds. (`serverStatus`: what an earlier heartbeat stored; cleanup runs before
-  // the tick's own heartbeat.) The handlers below answer the two exits differently only to show
-  // which one the worker took: the page gives both the same verdict (json.js tabOwnership, #82),
-  // and that verdict compares nothing about the answer, so a regenerated or replaced answer with no
-  // user signal closes (browser.e2e "a delivered fix whose server then reports ...").
-  {id: 'W33', name: 'an answer was collected, then the server reports cancelled / unknown: can-close is asked, and its verdict (the user\'s) keeps the tab', same: true,
-    expect: {cancelled: {askedCancel: false, closed: 0, retired: true}, unknown: {askedCancel: false, closed: 0, retired: true}},
+  // W33-W35 (round 12, Ashlar 4097631101, under #82's release rule): whether a leg whose answer was
+  // collected closes never follows the server status. The server settling or forgetting the item (a
+  // restart or a terminal-retention prune reports an unknown fix id as cancelled) after the answer
+  // was collected releases the tab by the page's verdict alone, for both kinds: closed when Ashlar's,
+  // kept (and released) when the user's. The page mock answers BOTH exits with the same verdict, as
+  // json.js does (tabOwnership); only the cancel exit also stops the page's run (tab-release.test.mjs
+  // pins which legs are stopped). That verdict compares nothing about the answer, so a regenerated
+  // or replaced answer with no user signal closes (browser.e2e "a delivered fix whose server then
+  // reports ..."). (`serverStatus`: what an earlier heartbeat stored; cleanup runs before the tick's
+  // own heartbeat.)
+  {id: 'W33', name: 'an answer was collected, then the server reports cancelled / unknown, and the page\'s verdict is the user\'s: the tab is kept', same: true,
+    expect: {cancelled: {closed: 0, retired: true, released: true}, unknown: {closed: 0, retired: true, released: true}},
     async run(kind) {
       const got = {};
       for (const status of ['cancelled', 'unknown']) {
         const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
           outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
-        // only a worker that took the cancel exit would see "owned" and close
-        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
-          : {ok: true, canClose: false, reason: 'repurposed', ownership: 'takenOver', proof: 'response_changed', url: URL_TAB}});
+        handler: sameVerdict({ok: true, releaseProtocol: 1, ownership: 'takenOver', cause: 'user_turn', url: URL_TAB})});
         await b.tick();await b.tick();
-        got[status] = {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs.length, retired: !b.pending()};
+        got[status] = {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.preserve === true)};
       }
       return got;
     }},
-  {id: 'W34', name: 'an answer was collected, then the server reports cancelled / unknown and can-close says owned (control)', same: true,
-    expect: {cancelled: {askedCancel: false, closed: [10], retired: true}, unknown: {askedCancel: false, closed: [10], retired: true}},
+  {id: 'W34', name: 'an answer was collected, then the server reports cancelled / unknown, and the page\'s verdict is Ashlar\'s: the tab closes (control)', same: true,
+    expect: {cancelled: {closed: [10], retired: true}, unknown: {closed: [10], retired: true}},
     async run(kind) {
       const got = {};
       for (const status of ['cancelled', 'unknown']) {
         const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
           outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
-        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
-          : {ok: true, canClose: true, reason: 'complete', ownership: 'owned', url: URL_TAB, conversation: URL_TAB}});
+        handler: sameVerdict({ok: true, releaseProtocol: 1, ownership: 'owned', url: URL_TAB, conversation: URL_TAB})});
         await b.tick();await b.tick();
-        got[status] = {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs, retired: !b.pending()};
+        got[status] = {closed: b.closedTabs, retired: !b.pending()};
       }
       return got;
     }},
-  {id: 'W35', name: 'a collected answer the server rejected (400: its outcome became a failure): can-close is asked, and its verdict (the user\'s) keeps the tab', same: true,
-    // The collected answer is proven locally by rejectedRaw: the leg asks can-close, never the cancel exit.
-    expect: {askedCancel: false, closed: 0, retired: true},
+  {id: 'W35', name: 'a collected answer the server rejected (400: its outcome became a failure): the page\'s verdict decides, kept when the user\'s, closed when Ashlar\'s', same: true,
+    // The collected answer is proven locally by rejectedRaw: the leg is released like a secured one.
+    expect: {takenOver: {closed: 0, retired: true}, owned: {closed: 1, retired: true}},
     async run(kind) {
-      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, rejectedRaw: ANSWER[kind],
-        outcome: {ok: false, code: 'error', error: 'completed review was rejected: HTTP 400'}}),
-      handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB}
-        : {ok: true, canClose: false, reason: 'repurposed', ownership: 'takenOver', proof: 'response_changed', url: URL_TAB}});
-      await b.tick();
-      return {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs.length, retired: !b.pending()};
+      const got = {};
+      for (const ownership of ['takenOver', 'owned']) {
+        const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, rejectedRaw: ANSWER[kind],
+          outcome: {ok: false, code: 'error', error: 'completed review was rejected: HTTP 400'}}),
+        handler: sameVerdict({ok: true, releaseProtocol: 1, ownership, ...(ownership === 'owned' ? {conversation: URL_TAB} : {cause: 'user_turn'}), url: URL_TAB})});
+        await b.tick();
+        got[ownership] = {closed: b.closedTabs.length, retired: !b.pending()};
+      }
+      return got;
     }},
   // W36 (round 12, Ashlar 4097631112): an allocation intent is not a tab. Intended difference: a fix
   // whose intent never became a proven tab (no owned record, no bound page, delivery record never

@@ -1835,7 +1835,10 @@ const NOT_CUT = "untouched: the newest loop comment is not FIXING";
 async function handOffCutRound(d: BootSweepDeps, token: string, ref: PrRef, settings: BotSettings, botLogin: string): Promise<string> {
   const { gh } = d;
   const state = stepState(gh === productionGh ? undefined : d); // production steps run on productionStepState
-  if ([...state.slots.keys()].some((k) => k.startsWith(`${prKey(ref)}@`))) return "untouched: a loop step for it runs in this process";
+  // Re-checked at each handoff POST attempt: a step that claimed the PR's slot during the sweep's
+  // reads (a review job that survived the restart) owns the round, so the sweep never cuts it.
+  const stepRuns = () => [...state.slots.keys()].some((k) => k.startsWith(`${prKey(ref)}@`));
+  if (stepRuns()) return "untouched: a loop step for it runs in this process";
   if (newestLoopComment(await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr), botLogin)?.kind !== "fixing") return NOT_CUT;
   const head = await gh.fetchPullHeadRef(token, ref.owner, ref.repo, ref.pr);
   const session = await sessionOf(gh, token, ref, head, botLogin);
@@ -1852,7 +1855,11 @@ async function handOffCutRound(d: BootSweepDeps, token: string, ref: PrRef, sett
     diffLines: diffLinesOf(head),
     botLogin,
     session: current,
-    superseded: () => freshMoot(gh, token, ref, botLogin, { session: current }),
+    superseded: async () => {
+      if (stepRuns()) return "newer";
+      const moot = await freshMoot(gh, token, ref, botLogin, { session: current });
+      return moot ?? (stepRuns() ? "newer" : null);
+    },
     sleep: d.sleep ?? realSleep,
     now: d.now,
   });

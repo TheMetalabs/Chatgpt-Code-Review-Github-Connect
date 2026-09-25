@@ -1615,6 +1615,25 @@ describe("boot sweep: a fix round a restart cut (FIXING newest, nothing running)
     await settles(a);
   });
 
+  it("a step that starts while the sweep reads (a review that survived the restart) is never handed off by the sweep", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow()] });
+    const hold = holdFirst(t, f);
+    let a: Promise<unknown> | undefined;
+    const orig = f.deps.gh.fetchPullHeadRef;
+    f.deps.gh.fetchPullHeadRef = async (...args: Parameters<typeof orig>) => {
+      if (!a) {
+        a = run(f, "apply"); // claims the PR's slot, then holds at the provider
+        await settles(hold.generating);
+      }
+      return orig(...args);
+    };
+    const [r] = await sweepCutFixRounds(settings("apply"), sweepDeps(f), ENV);
+    assert.equal(r.outcome, `untouched: a newer loop request took over`, r.outcome);
+    assert.equal(escalations(f.posted).length, 0, "the sweep posted no handoff");
+    hold.release();
+    await settles(a!);
+  });
+
   it("a failing GitHub read never breaks boot: the census failing skips the sweep, a PR's failing read skips that PR", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow()] });
     const census = { ...sweepDeps(f), openPulls: () => Promise.reject(new Error("list installations 502")) };

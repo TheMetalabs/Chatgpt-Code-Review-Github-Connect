@@ -389,8 +389,9 @@ const TEMPLATE_STAGES = {
     bound: [{name: 'status', init: /^response\.repair$/, is: 'response.repair'},
       {name: 'response', init: /^await api\("\/api\/bridge",(\{\.\.\.)?repairBody\(/, is: 'the bridge\'s reply to a repairBody() request'}]}}},
   // Tab release (#82): finishTabCleanup sets state.preserveCause to one of preserveCauses(), then records
-  // preserve_${state.preserveCause}.
-  preserve_: {expressions: {'state.preserveCause': {values: files => returnedList(files, 'preserveCauses')}},
+  // preserve_${state.preserveCause}. Every write of .preserveCause must store one of them (writeProblems).
+  preserve_: {expressions: {'state.preserveCause': {values: files => returnedList(files, 'preserveCauses'),
+    written: {property: 'preserveCause', list: 'preserveCauses'}}},
     declared: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown',
       // Tab Lease (Phase 1+): the takeover and restart causes of a preserved tab.
       'user_input', 'user_moved', 'browser_restart']},
@@ -398,6 +399,66 @@ const TEMPLATE_STAGES = {
   // code yet: when the extension records this template, its expression goes here with a reader of its phases.
   lease_expired_: {expressions: {}, declared: ['creating', 'opening', 'sending', 'generating', 'answered', 'releasing']},
 };
+
+const isLiteral = token => token?.kind === 'str' || (token?.kind === 'tpl' && !token.substs.length);
+
+/** Why storing `init` (an initialiser's tokens) can put a value outside `values` into a property, or
+ * null: it must be a string `list()` lists, or clamp a variable into them exactly as
+ * `list().includes(x) ? x : "<listed>"` (x one name, read twice to the same value). */
+function unclamped(init, list, values) {
+  if (init.length === 1 && isLiteral(init[0])) return values.includes(init[0].value) ? null : `stores "${init[0].value}", which ${list}() does not list`;
+  const clamp = new RegExp(`^${list}\\(\\)\\.includes\\(([\\w$]+)\\)\\?\\1:"([^"\\\\]*)"$`).exec(render(init));
+  if (!clamp) return `stores \`${render(init)}\`, which is neither a string ${list}() lists nor \`${list}().includes(x) ? x : "<listed>"\``;
+  return values.includes(clamp[2]) ? null : `falls back to "${clamp[2]}", which ${list}() does not list`;
+}
+
+/** The tokens of `level` from `from` up to the first punct in `stops`. */
+function until(level, from, stops) {
+  let end = from;
+  while (end < level.length && !(level[end].kind === 'punct' && stops.includes(level[end].text))) end += 1;
+  return level.slice(from, end);
+}
+
+/** Why `level[k]` writes `property` with a value that may be outside `values`, or null. A member write
+ * (`x.property` or `x["property"]`) with =, ||=, ??= or &&= stores its right side; an object key
+ * `property: v` stores v; each must pass unclamped(). Any other write is a problem: another compound
+ * assignment, ++, --, delete, a shorthand `{property}`, or a method or accessor of that name. A
+ * destructuring pattern (`{...}` followed by `=`) reads the property instead. */
+function unlistedWrite(level, k, container, pattern, {property, list}, values) {
+  const token = level[k], before = level[k - 1], after = level[k + 1];
+  // An array literal ["p"] is never assigned, updated or deleted, so it passes the member checks below.
+  const computed = token.open === '[' && token.tokens[0]?.value === property;
+  if (computed || (token.kind === 'word' && token.text === property && (isPunct(before, '.') || isPunct(before, '?.')))) {
+    if (after?.kind === 'punct' && ['=', '||=', '??=', '&&='].includes(after.text)) return unclamped(until(level, k + 2, [';', ',']), list, values);
+    if (after?.kind === 'punct' && (ASSIGN.has(after.text) || after.text === '++' || after.text === '--')) return `is updated with ${after.text}`;
+    let j = k - 1; // back over the member chain it ends, to what is applied to it
+    for (; j >= 0 && (level[j].kind === 'word' || level[j].kind === 'group' || isPunct(level[j], '.') || isPunct(level[j], '?.')); j -= 1) {
+      if (level[j].kind === 'word' && level[j].text === 'delete') return 'is deleted';
+    }
+    return isPunct(level[j], '++') || isPunct(level[j], '--') ? `is updated with ${level[j].text}` : null;
+  }
+  if ((token.kind === 'word' ? token.text : token.value) !== property || container?.open !== '{' || pattern) return null;
+  if (after?.open === '(' && (k === 0 || isPunct(before, ',') || ['get', 'set', 'async'].includes(before?.text))) return 'is a method or accessor';
+  if (k > 0 && !isPunct(before, ',')) return null;
+  if (isPunct(after, ':')) return unclamped(until(level, k + 2, [',']), list, values);
+  return !after || isPunct(after, ',') ? 'is written from a variable of the same name' : null;
+}
+
+/** The writes of `written.property` in `files` that can store a value outside `values`, as problems of
+ * the recorded `template` that reads it. */
+function writeProblems(files, written, values, template) {
+  const problems = [];
+  for (const [file, text] of Object.entries(files)) {
+    let tokens;
+    try { ({tokens} = tokenize(text, 0)); } catch { continue; } // recordedStages reports the file
+    walkTokens(tokens, (token, level, k, container, path) => {
+      const holder = path.at(-1), pattern = holder && isPunct(holder.tokens[holder.index + 1], '=');
+      const why = unlistedWrite(level, k, container, pattern, written, values);
+      if (why) problems.push(`${file}:${lineOf(text, token)} .${written.property} ${why}, so \`${template}\` may record a stage without a label`);
+    });
+  }
+  return problems;
+}
 
 /** The declared prefix, labelled-ahead values and expression entry of a recorded template stage. */
 function templateSpec(template) {
@@ -427,6 +488,10 @@ function guardedStages(files) {
   const {literals, templates, sites, problems} = extensionStages(files);
   const stages = [...literals, ...[...templates].flatMap(template => expandTemplate(template, files))];
   for (const site of sites) problems.push(...boundProblems(site, templateSpec(site.template).spec.bound ?? []));
+  for (const template of templates) {
+    const {spec} = templateSpec(template);
+    if (spec.written) problems.push(...writeProblems(files, spec.written, spec.values(files), template));
+  }
   return {literals, templates, problems, stages};
 }
 
@@ -519,6 +584,68 @@ test('a preserve_ cause added only to preserveCauses() fails the guard: the expa
 /** background.js's repair reply: the bindings repair_${status.status} reads. */
 const REPAIR_REPLY = 'const response = await api("/api/bridge", repairBody(job, provider, "repair-status", attempt), job.origin);\n' +
   'const status = response.repair;\n';
+
+test('preserve_${state.preserveCause} records a listed cause only while every write of .preserveCause stores one', () => {
+  const causes = 'function preserveCauses() {\n  return ["navigated", "draft", "unknown"];\n}\n';
+  const record = 'workerStep(job, provider, `preserve_${state.preserveCause}`);';
+  const problems = code => guardedStages({'background.js': `${causes}function finish(job, provider, state, cause, row) {\n  ${code}\n  ${record}\n}\n`}).problems;
+  // #82's finishTabCleanup clamps the page's cause; a listed literal, a default of one and reads are fine.
+  for (const code of [
+    'state.preserveCause = preserveCauses().includes(cause) ? cause : "unknown";',
+    'state.preserveCause = "draft";',
+    'state.preserveCause = `draft`; row.list[0] = cause; row.list[""] = cause;',
+    'state.preserveCause ||= "unknown";',
+    'job.states[provider] = {...state, preserveCause: "draft", note: row.note};',
+    'if (state.preserveCause === "draft") note({cause: state.preserveCause});',
+    // A variable of that name is not the property.
+    'note([preserveCause, cause]); note({cause: preserveCause}); if (ok) { preserveCause = cause; log(row); preserveCause(row); }',
+    'job.states[provider] = {...state, "note": row.cause};',
+    'const {preserveCause = "unknown"} = row;',
+    // A destructuring pattern reads the property.
+    'const {preserveCause} = state; const {preserveCause: kept, note} = row; ({preserveCause: row.cause} = state);',
+  ]) assert.deepEqual(problems(code), [], code);
+  const neither = init => `stores \`${init}\`, which is neither a string preserveCauses() lists nor \`preserveCauses().includes(x) ? x : "<listed>"\``;
+  for (const [code, why] of [
+    // An unclamped value, from the page or anywhere else, or a literal the list does not hold.
+    ['state.preserveCause = cause || "unknown";', neither('cause||"unknown"')],
+    ['state.preserveCause = cause;', neither('cause')],
+    ['state.preserveCause = `${cause}`;', neither('`${cause}`')],
+    ['state.preserveCause ??= row.cause;', neither('row.cause')],
+    ['state["preserveCause"] = cause;', neither('cause')],
+    ['state.preserveCause = "staged";', 'stores "staged", which preserveCauses() does not list'],
+    ['job.states[provider] = {...state, preserveCause: cause};', neither('cause')],
+    ['job.states[provider] = {...state, "preserveCause": row.cause};', neither('row.cause')],
+    // A clamp is exactly preserveCauses().includes(x) ? x : "<listed>".
+    ['state.preserveCause = preserveCauses().includes(cause) ? cause : "staged";', 'falls back to "staged", which preserveCauses() does not list'],
+    ['state.preserveCause = otherCauses().includes(cause) ? cause : "unknown";', neither('otherCauses().includes(cause)?cause:"unknown"')],
+    ['state.preserveCause = preserveCauses().includes(cause) ? row.cause : "unknown";', neither('preserveCauses().includes(cause)?row.cause:"unknown"')],
+    ['state.preserveCause = preserveCauses().includes(next()) ? next() : "unknown";', neither('preserveCauses().includes(next())?next():"unknown"')],
+    ['state.preserveCause = preserveCauses().includes(cause) ? cause : "unknown" + late;', neither('preserveCauses().includes(cause)?cause:"unknown"+late')],
+    ['state.preserveCause = preserveCauses() + includes(cause) ? cause : "unknown";', neither('preserveCauses()+includes(cause)?cause:"unknown"')],
+    ['state.preserveCause = preserveCauses().includes(cause || row.cause) ? cause : "unknown";', neither('preserveCauses().includes(cause||row.cause)?cause:"unknown"')],
+    ['state.preserveCause = preserveCauses().includes((next())) ? (next()) : "unknown";', neither('preserveCauses().includes((next()))?(next()):"unknown"')],
+    ['state.preserveCause = preserveCauses(row).includes(cause) ? cause : "unknown";', neither('preserveCauses(row).includes(cause)?cause:"unknown"')],
+    // Any other write.
+    ['state.preserveCause += "_late";', 'is updated with +='],
+    ['state.preserveCause++;', 'is updated with ++'],
+    ['state.preserveCause--;', 'is updated with --'],
+    ['++job.states[provider].preserveCause;', 'is updated with ++'],
+    ['--state.preserveCause;', 'is updated with --'],
+    ['delete state.preserveCause;', 'is deleted'],
+    ['delete job.states[provider].preserveCause;', 'is deleted'],
+    ['delete state?.preserveCause;', 'is deleted'],
+    ['delete state?.["preserveCause"];', 'is deleted'],
+    ['job.states[provider] = {preserveCause, ...state};', 'is written from a variable of the same name'],
+    ['job.states[provider] = {...state, preserveCause};', 'is written from a variable of the same name'],
+    ['job.states[provider] = {preserveCause() { return cause; }};', 'is a method or accessor'],
+    ['job.states[provider] = {...state, preserveCause() { return cause; }};', 'is a method or accessor'],
+    ['job.states[provider] = {...state, get preserveCause() { return cause; }};', 'is a method or accessor'],
+    ['job.states[provider] = {...state, set preserveCause(value) {}};', 'is a method or accessor'],
+    ['job.states[provider] = {...state, async preserveCause() {}};', 'is a method or accessor'],
+  ]) {
+    assert.deepEqual(problems(code), [`background.js:5 .preserveCause ${why}, so \`preserve_\${state.preserveCause}\` may record a stage without a label`], code);
+  }
+});
 
 test('a template stage takes its declared list only through a declared expression, not through its prefix', () => {
   // preserveCauses() lists only labelled causes, so expanding by prefix would pass; row.cause is not drawn

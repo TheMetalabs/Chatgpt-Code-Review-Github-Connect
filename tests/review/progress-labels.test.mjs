@@ -59,6 +59,8 @@ function unionMembers(path, name) {
  * is not listed here fails the guard: declare its expansion so each value is checked for a label. */
 const TEMPLATE_STAGES = {
   repair_: unionMembers('src/lib/json-repair-types.ts', 'RepairStatus'),
+  // Tab release (#82): finishTabCleanup records preserve_<cause> just before tab_preserved.
+  preserve_: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown'],
 };
 
 function expandTemplate(template) {
@@ -93,8 +95,20 @@ test('salvaged_no_repair (worker: raw reply delivered with Local JSON repair off
 });
 
 test('a template stage without a declared expansion fails the guard instead of passing unchecked', () => {
-  assert.throws(() => expandTemplate('lease_expired_${phase}'), /no declared expansion/);
+  assert.throws(() => expandTemplate('undeclared_${phase}'), /no declared expansion/);
   assert.throws(() => expandTemplate('repair_${status.status}_late'), /exactly <prefix>/);
   const {templates} = recordedStages('workerStep(job, provider, `repair_${status.status}`);');
   assert.deepEqual([...templates], ['repair_${status.status}']);
+});
+
+test('the tab-release (#82) stages have history labels and survive sanitize', () => {
+  const stages = ['cancelled', 'cleanup_waiting_page', 'tab_preserved', 'tab_closed',
+    ...expandTemplate('preserve_${state.preserveCause}')];
+  assert.deepEqual(unlabelled(stages), []);
+  assert.deepEqual(kept(stages, 'worker'), stages);
+  assert.deepEqual(kept(['cancelled'], 'page'), ['cancelled'], '#82: the page records cancelled when its run is stopped');
+});
+
+test('tab_preserved names no cause of its own: the worker preserves for non-user reasons too, and preserve_<cause> carries why', () => {
+  assert.doesNotMatch(PROGRESS_LABELS.tab_preserved, /user|repurpos/i);
 });

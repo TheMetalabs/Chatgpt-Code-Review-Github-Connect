@@ -176,6 +176,11 @@ const PIN_CASES = {
   regeneratedNoId: {ids: ['', ''], newNode: true, want: {code: 'taken_over'}},
   rerenderedSameId: {ids: ['response-A', 'response-A'], newNode: true, same: true, want: {raw: ANSWER}},
   sameNodeNoId: {ids: ['', ''], newNode: false, same: true, want: {raw: ANSWER}},
+  // R18: the pinned node itself gains its response ID after it was first answered (a late ID): the
+  // same response, collected under that ID (control)
+  idAssignedLate: {ids: ['', 'response-A'], newNode: false, same: true, want: {raw: ANSWER}, completionId: 'response-A'},
+  // ... but an ID-less pin never adopts the ID of ANOTHER node
+  regeneratedWithId: {ids: ['', 'response-B'], newNode: true, want: {code: 'taken_over'}},
 };
 for (const [name, cell] of Object.entries(PIN_CASES)) {
   test(`page: a fix response ${name} after its first answered observation ${cell.want.code ? 'ends the run (taken_over), never collected' : 'is still collected (control)'}`, async () => {
@@ -192,12 +197,37 @@ for (const [name, cell] of Object.entries(PIN_CASES)) {
     const out = await p.c.context.waitUntilFixOrQuota('ChatGPT').then(raw => ({raw}), error => ({code: error.code}));
     assert.deepEqual(out, cell.want);
     assert.equal(p.polls(), 1, 'decided on the poll after the first answered observation');
+    if (cell.completionId) assert.equal(p.state().nativeCompletion?.responseId, cell.completionId);
     if (cell.want.code) {
       assert.equal(p.state().nativeCompletion, undefined, 'nothing collected');
       assert.equal(p.state().responseText, undefined, 'the regenerated text is never the answer');
       assert.equal(p.state().tabRepurposed, true, 'the tab is the user\'s for good');
       assert.equal(p.state().slotReleased, true);
     }
+  });
+}
+
+// R18: the ID appears only after the answer was collected with none. The hand-out and close proofs
+// (phase "complete") identify an ID-less completion by its text, as they always did: the late ID alone
+// does not make it another response (control); another text still does.
+for (const [name, cell] of Object.entries({sameText: {text: ANSWER, owned: true}, otherText: {text: REGENERATED, owned: false}})) {
+  test(`page: a fix collected with no response ID whose ID appears before hand-out, ${name}: ${cell.owned ? 'handed out and closable' : 'taken over, never closed'}`, async () => {
+    const p = page({limit: 12});
+    const root = {}, node = {};
+    let id = '', block = ANSWER;
+    Object.assign(p.c.context, {
+      boundReviewResponse: () => ({identified: true, followup: false, root, message: node, responseId: id}),
+      assistantCodeBlocks: () => [block],
+    });
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    const raw = await p.c.context.waitUntilFixOrQuota('ChatGPT');
+    assert.equal(p.state().nativeCompletion, undefined, 'collected with no response ID');
+    Object.assign(p.state(), {running: false, result: {ok: true, raw, responseText: raw}});
+    id = 'response-A'; block = cell.text;
+    const handOut = p.c.context.fixOwnershipProof(p.state(), {phase: 'complete'});
+    const close = p.c.context.fixCanClose(p.state());
+    assert.deepEqual({handOut: handOut.ownership, canClose: close.canClose},
+      cell.owned ? {handOut: 'owned', canClose: true} : {handOut: 'takenOver', canClose: false});
   });
 }
 

@@ -607,6 +607,25 @@ test('real DOM lifecycle: a fix response regenerated before its second stable ob
   {code:'taken_over',takenOver:true,delivered:false,closed:0,retired:true,released:true,canClose:false});
 });
 
+// R18 control: the answer completes before its response ID is assigned, and the ID then appears on
+// the same message node (a late ID). It is the same response: collected under that ID, delivered and
+// closed on the proven-success path, never ended as taken_over.
+test('real DOM lifecycle: a fix response whose ID is assigned after its first answered observation is delivered and closed (control)',async t=>{
+ const ctx=await conversationPage(t,'fix');
+ const server={value:'awaiting_chat'};
+ const {b,state}=wiredWorker(ctx.page,server);
+ await b.tick();
+ await ctx.page.evaluate(()=>document.querySelector('[data-message-id="response-A"]').removeAttribute('data-message-id'));
+ await ctx.complete();
+ assert.equal(await ctx.page.evaluate(()=>__ashlarRunnerState.observation?.state),'answer_observed','the first answered observation, with no response ID');
+ await ctx.page.evaluate(()=>document.querySelector('[data-message-author-role="assistant"]').setAttribute('data-message-id','response-A'));
+ await ctx.page.clock.runFor(3200);
+ await b.tick();
+ const failure=b.calls.find(c=>c.action==='failure');
+ assert.deepEqual({failure:failure?.error,delivered:b.calls.some(c=>c.action==='complete'),closed:b.closedTabs.length,retired:state()===undefined},
+  {failure:undefined,delivered:true,closed:1,retired:true});
+});
+
 // R17 (Ashlar 4101855338): the same absent turn, while the user types a draft of their own and clears it
 // before the turn renders again. The draft was seen: the run ends taken_over on that poll, the tab is
 // preserved, and the restored turn with an empty composer never hands it back.

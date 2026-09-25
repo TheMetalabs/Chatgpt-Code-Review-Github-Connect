@@ -540,8 +540,11 @@ function fixOwnershipProof(state, {phase, completion, journal, pinned} = {}) {
   // 4. ("collect") The pinned response. boundReviewResponse always binds the LAST reply after the
   // sent turn, so a response regenerated after the first answered observation would bind instead:
   // any other response (another ID; with no ID, another assistant message node) is the user's.
-  if (pinned && bound.root && ((bound.responseId || "") !== pinned.responseId || (!pinned.responseId && bound.message !== pinned.message))) {
-    return takeOver("response_changed");
+  // An ID-less pin adopts the ID its own node gains later (renderers can assign it after mounting
+  // the text): the same node is the same response, never another one.
+  if (pinned && bound.root) {
+    if (!pinned.responseId && bound.responseId && bound.message === pinned.message) pinned.responseId = bound.responseId;
+    if ((bound.responseId || "") !== pinned.responseId || (!pinned.responseId && bound.message !== pinned.message)) return takeOver("response_changed");
   }
   if (!bound.identified) {
     // A collected answer whose turn is gone was replaced (edited, regenerated or deleted). Still in
@@ -553,7 +556,9 @@ function fixOwnershipProof(state, {phase, completion, journal, pinned} = {}) {
   if (answered) {
     const stored = completion || storedFixCompletion(state);
     if (!stored) return verdict("unknown", "no_completion", {conversation: submission.conversation});
-    if (!bound.root || (bound.responseId || "") !== (stored.responseId || "")) return takeOver("response_changed");
+    // A completion collected with no response ID is identified by its text (checked below), so an ID
+    // the response gained after collection does not make it another one.
+    if (!bound.root || (stored.responseId && (bound.responseId || "") !== stored.responseId)) return takeOver("response_changed");
     const busy = (typeof stopButtonVisible === "function" && stopButtonVisible()) ||
       (typeof responseStreaming === "function" && globalThis.document && responseStreaming(bound.root)) || !replyDoneVisible(bound.root);
     if (busy) return verdict("unknown", "generating", {conversation: submission.conversation});
@@ -633,7 +638,8 @@ function fixCanClose(state) {
  */
 async function waitUntilFixOrQuota(name) {
   // `pinned`: the response this run collects, fixed at its first answered observation and never
-  // replaced (a regenerated response ends the run: fixOwnershipProof "collect").
+  // replaced (a regenerated response ends the run: fixOwnershipProof "collect"); an ID-less pin only
+  // gains the ID its own node is assigned later.
   const stability = {stable: "", hits: 0, pinned: undefined};
   for (;;) {
     if (globalThis.__ashlarRunnerState?.fixCancelled) {

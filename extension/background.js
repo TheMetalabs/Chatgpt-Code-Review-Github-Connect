@@ -217,11 +217,38 @@ async function rememberOwnedTab(job, provider, closing = false) {
  * record right after it creates the tab). Chrome tab ids are unique only within one browser session
  * and the job registry outlives it (storage.local), while this record does not (storage.session is
  * cleared by a browser restart or an extension reload): a leg's stored tab id without it can name a
- * tab the user opened since. An unbound page is Ashlar's only in the tab this proves. */
+ * tab the user opened since. An unbound page is Ashlar's only in the tab this proves. A record marked
+ * replacedBy is a tombstone (Ashlar 4101623043): it proves what the old id was, never that the old id
+ * is still the leg's tab. */
 async function tabCreatedForLeg(job, provider, tabId) {
+  const owned = await ownedTabRecord(tabId);
+  return ownedByLeg(job, provider, owned) && owned.replacedBy === undefined;
+}
+async function ownedTabRecord(tabId) {
   const key = OWNED_PREFIX + tabId;
-  const owned = Number.isInteger(tabId) ? (await chrome.storage.session.get([key]))[key] : undefined;
+  return Number.isInteger(tabId) ? (await chrome.storage.session.get([key]))[key] : undefined;
+}
+function ownedByLeg(job, provider, owned) {
   return owned?.jobId === job.jobId && owned.provider === provider && owned.runId === job.states[provider].runId;
+}
+
+/** Move the leg to the tab its stored id was replaced by, when the session records say so (Ashlar
+ * 4101623043). moveReplacedTab writes the added id's record, and marks the removed id's replacedBy,
+ * before it saves the leg's state.tabId: a worker that stops in between restarts with the leg naming
+ * the removed id (gone, and an undispatched page cannot be found by its binding) while the records
+ * name its live tab. The chain is followed from this leg's own record to the record that is not a
+ * tombstone, which must be this leg's too. True if the leg moved now (the caller saves it). */
+async function followDurableReplace(job, provider) {
+  const state = job.states[provider];
+  let id = state.tabId, owned = await ownedTabRecord(id);
+  for (let hops = 0; ownedByLeg(job, provider, owned) && Number.isInteger(owned.replacedBy) && hops < 64; hops++) {
+    id = owned.replacedBy;
+    owned = await ownedTabRecord(id);
+  }
+  if (id === state.tabId || !ownedByLeg(job, provider, owned) || owned.replacedBy !== undefined) return false;
+  state.tabId = id;
+  workerStep(job, provider, "tab_rekeyed");
+  return true;
 }
 
 function formatRetry(until) {
@@ -1018,6 +1045,7 @@ async function cleanupProviderBody(job, provider, jobs) {
   }
   try {
     let tab;
+    if (await followDurableReplace(job, provider)) await saveJobs(jobs);
     const lookedUp = state.tabId;
     try { tab = await chrome.tabs.get(lookedUp); }
     catch {
@@ -1623,6 +1651,8 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await saveJobs(jobs);
     return;
   }
+  // A replace the session recorded before the worker stopped names the leg's live tab (Ashlar 4101623043).
+  if (state.tabId && await followDurableReplace(job, provider)) await saveJobs(jobs);
   if (!state.started && !observeOnly && !await tabCreatedForLeg(job, provider, state.tabId)) {
     // The prompt goes only into the tab this browser session created for the leg: a stored id from
     // before a browser restart (or an extension reload) can name the user's own tab. The leg opens
@@ -2005,6 +2035,7 @@ async function repairProvider(job, provider, jobs) {
 async function providerTabGone(job, provider) {
   const state = job.states[provider];
   if (!state.tabId && !state.started) return true;
+  await followDurableReplace(job, provider); // (the sweep saves a move with the job)
   const lookedUp = state.tabId;
   if (lookedUp) {
     try {

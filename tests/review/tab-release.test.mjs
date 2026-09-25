@@ -960,3 +960,59 @@ for (const kind of ['review', 'fix']) {
     assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');
   });
 }
+// Ashlar 4101623043: moveReplacedTab writes the replacement's creation record, and marks the old id's
+// record replacedBy, before it saves the leg's new id. A worker that stops in between restarts with
+// the leg naming the dead id A while the session records name the live tab B. The leg follows that
+// durable chain (the poll, the cleanup and the sweep), and the old id's tombstone never proves that A
+// is still the leg's tab.
+const tombstoned = kind => {
+  const record = createdHere(kind).state['ashlar:tab:10'];
+  return storage({'ashlar:tab:10': {...record, replacedBy: 11}, 'ashlar:tab:11': record});
+};
+const unboundPage = kind => (_id, m) => {
+  if (m.type === 'ashlar-run') return {ok: false, code: 'busy', retry: true};
+  if (m.type === 'ashlar-fix-cancel' && m.undispatched === true) {
+    return kind === 'fix' ? {ok: false, code: 'job_mismatch', jobId: '', runId: ''}
+      : {ok: true, releaseProtocol: 1, owned: true, canClose: true, ownership: 'owned', blank: true, unsent: false, url: TEMP, jobId: '', runId: ''};
+  }
+  return {ok: false, code: 'idle', jobId: '', runId: '', provider: 'chatgpt'};
+};
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a replaced id's creation record is a tombstone: it never proves that the old id is the leg's tab`, async () => {
+    const b = worker(leg(kind, {started: false}), {session: tombstoned(kind), tab: null});
+    const job = leg(kind, {started: false});
+    assert.equal(await b.context.tabCreatedForLeg(job, 'chatgpt', 10), false, 'the removed id');
+    assert.equal(await b.context.tabCreatedForLeg(job, 'chatgpt', 11), true, 'the id its tab lives on');
+  });
+  test(`${kind}: a worker restarted between a replace and its registry write dispatches the undispatched leg into the live tab, once`, async () => {
+    const b = worker(leg(kind, {started: false}), {session: tombstoned(kind), tab: null, handler: unboundPage(kind)});
+    b.tabs.set(11, {id: 11, url: TEMP, status: 'complete'});
+    await b.tick();
+    const state = b.pending().states.chatgpt;
+    assert.equal(state.tabId, 11, 'the leg names the live tab (persisted)');
+    assert.ok(stagesOf(state.workerEvents).includes('worker:tab_rekeyed'), 'the move reaches history');
+    assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run').map(m => [m.id, m.prompt, m.resume === true]), [[11, 'PROMPT', false]], 'dispatched once, into B');
+    assert.equal(b.messages.some(m => m.id === 10), false, 'the dead id is never messaged');
+    assert.deepEqual([...b.tabs.keys()], [11], 'no second tab was opened for the leg');
+    assert.equal(state.connectionError, undefined, 'no connection-error recovery');
+  });
+  test(`${kind}: a cancelled undispatched leg whose replace the registry never recorded ${kind === 'fix' ? 'keeps the live tab (#77) and fences its run there' : 'closes the live tab'}, never leaking it as absent`, async () => {
+    const b = worker(leg(kind, {started: false}), {status: 'cancelled', session: tombstoned(kind), tab: null, handler: unboundPage(kind)});
+    b.tabs.set(11, {id: 11, url: TEMP, status: 'complete'});
+    await b.tick();
+    assert.ok(b.messages.some(m => m.id === 11 && m.type === 'ashlar-fix-cancel' && m.undispatched === true), 'its unbound page is told the run was never dispatched');
+    assert.deepEqual(b.closedTabs, kind === 'fix' ? [] : [11]);
+    assert.equal(b.pending(), undefined, 'retired');
+    assert.deepEqual(historyOf(b), [kind === 'fix' ? 'worker:tab_preserved' : 'worker:tab_closed'], 'not tab_lost');
+  });
+  test(`${kind}: the stalled-job sweep never takes a leg whose replace the registry never recorded for gone`, async () => {
+    const quiet = {started: false, workerSequence: 1, workerEvents: [{source: 'worker', sequence: 1, stage: 'tab_created', at: 1}]};
+    const b = worker(leg(kind, quiet), {session: tombstoned(kind), tab: null, handler: unboundPage(kind)});
+    b.tabs.set(11, {id: 11, url: TEMP, status: 'complete'});
+    assert.equal((await b.context.clearStuckJobs({includeStalled: true, staleMs: 1})).ok, true);
+    assert.equal(b.calls.some(c => c.action === 'failure'), false, 'no "tab closed" failure for a tab that lives on');
+    const state = b.pending().states.chatgpt;
+    assert.equal(state.outcome, undefined);
+    assert.equal(state.tabId, 11, 'the sweep saved the leg\'s live tab');
+  });
+}

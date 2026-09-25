@@ -765,7 +765,11 @@ function preserveCauses() {
 }
 
 /** `cause` (a preserved tab only): why the tab was kept, recorded as preserve_<cause> just before
- * tab_preserved so review history says why (the cleanup note is dropped with the retired job). */
+ * tab_preserved so review history says why (the cleanup note is dropped with the retired job).
+ * Any other end is tab_closed only when the worker itself closed the tab (closeProvenTab marks
+ * closeIssued before its remove, so a worker that stops right after it still says so); a tab that is
+ * gone otherwise (the user or the browser closed it, Chrome replaced it, it was never opened, or it
+ * is no longer found) is tab_lost. */
 async function finishTabCleanup(job, provider, jobs, reason, cause) {
   const state = job.states[provider];
   state.cleanupDone = true;
@@ -774,7 +778,7 @@ async function finishTabCleanup(job, provider, jobs, reason, cause) {
     state.preserveCause = preserveCauses().includes(cause) ? cause : "unknown";
     workerStep(job, provider, `preserve_${state.preserveCause}`);
   }
-  workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : "tab_closed");
+  workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : state.closeIssued === true ? "tab_closed" : "tab_lost");
   if (reason) state.cleanupNote = reason;
   delete state.cleanupError;
   delete state.cleanupWaitReason;
@@ -855,10 +859,20 @@ async function closeProvenTab(job, provider, jobs, tabId, proven, reason) {
   const current = await chrome.tabs.get(tabId);
   const holds = typeof proven === "function" ? proven : url => url === proven;
   if (current.pendingUrl || !holds(current.url) || current.status === "loading") return false;
-  job.states[provider].closeRequested = true;
+  const state = job.states[provider];
+  state.closeRequested = true;
+  // The worker's own close (a sweep also sets closeRequested, to accept an absence it confirmed).
+  state.closeIssued = true;
   await saveJobs(jobs);
   await rememberOwnedTab(job, provider, true);
-  await chrome.tabs.remove(tabId);
+  try { await chrome.tabs.remove(tabId); }
+  catch (error) {
+    // Not closed (the user is dragging the tab, or it is already gone): whoever ends it next, it is
+    // not the worker's close unless a later remove succeeds.
+    delete state.closeIssued;
+    await saveJobs(jobs).catch(() => {});
+    throw error;
+  }
   await finishTabCleanup(job, provider, jobs, reason);
   return true;
 }

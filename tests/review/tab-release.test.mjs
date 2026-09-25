@@ -300,3 +300,68 @@ test('worker status lists the recently retired legs (closed and preserved) with 
   assert.doesNotMatch(JSON.stringify(retired), /PROMPT|https?:/, 'no prompt or URL text');
   assert.deepEqual(b.closedTabs, [10]);
 });
+
+// ── tab_lost (#82 step 0): tab_closed in review history says the worker closed the tab. A tab that is
+// gone otherwise (the user or the browser closed it, it was never opened, or it can no longer be
+// found) ends as tab_lost: a leg whose tab Chrome replaced was recorded as closed while it leaked.
+// (spread: the stages come from the worker's realm)
+const historyOf = b => [...(b.pending() ? stagesOf(b.pending().states.chatgpt.workerEvents) : uploaded(b))].filter(stage => /^worker:tab_(closed|lost|preserved)$/.test(stage));
+const unableToEdit = () => { throw new Error('Tabs cannot be edited right now (user may be dragging a tab).'); };
+for (const kind of ['review', 'fix']) {
+  const ABSENT = [
+    ['an abandoned leg whose tab is gone', {delivered: true, cleanupPending: true, abandoned: true, abandonedAs: 'cancelled'}, 'cancelled'],
+    ['a leg whose tab a sweep confirmed absent (closeRequested, never closed by the worker)', {...secured(kind), closeRequested: true}, 'awaiting_chat'],
+    ['a leg that never opened a tab', {delivered: true, cleanupPending: true, started: false, tabId: undefined, outcome: {ok: false, code: 'quota', error: 'usage limit'}}, 'awaiting_chat'],
+  ];
+  for (const [what, state, status] of ABSENT) {
+    test(`${kind}: ${what} retires as tab_lost, not tab_closed`, async () => {
+      const b = worker(leg(kind, state, status === 'cancelled' ? {serverStatus: 'cancelled'} : {}), {status, tab: null});
+      await b.tick();
+      assert.equal(b.pending(), undefined, 'retired');
+      assert.deepEqual(historyOf(b), ['worker:tab_lost']);
+      assert.equal((b.local.state.bridgeRecentRetired || []).find(entry => entry.jobId === leg(kind).jobId)?.stage, 'tab_lost');
+    });
+  }
+  test(`${kind}: a tab the user closed retires as tab_lost`, async () => {
+    const b = worker(leg(kind, secured(kind)), {session: createdHere(kind), handler: () => owned});
+    await b.closeTab(10);
+    await b.tick();
+    assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, []);
+    assert.deepEqual(historyOf(b), ['worker:tab_lost']);
+  });
+  test(`${kind}: control: a close the worker issued before it stopped retires by absence as tab_closed`, async () => {
+    const b = worker(leg(kind, {...secured(kind), closeRequested: true, closeIssued: true}), {tab: null});
+    await b.tick();
+    assert.equal(b.pending(), undefined);
+    assert.deepEqual(historyOf(b), ['worker:tab_closed']);
+  });
+  test(`${kind}: a remove that failed is not the worker's close: the tab the user then closes is tab_lost`, async () => {
+    const b = worker(leg(kind, {...secured(kind), conversation: URL_TAB}), {session: createdHere(kind), handler: () => owned});
+    const remove = b.chrome.tabs.remove;
+    b.chrome.tabs.remove = unableToEdit;
+    await b.tick();
+    assert.ok(b.pending(), 'not closed yet');assert.equal(b.pending().states.chatgpt.closeIssued, undefined);
+    b.chrome.tabs.remove = remove;
+    await b.closeTab(10);
+    await b.tick();
+    assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, []);
+    assert.deepEqual(historyOf(b), ['worker:tab_lost']);
+  });
+  test(`${kind}: control: a remove that failed once and then succeeded is tab_closed`, async () => {
+    const b = worker(leg(kind, {...secured(kind), conversation: URL_TAB}), {session: createdHere(kind), handler: () => owned});
+    const remove = b.chrome.tabs.remove;
+    b.chrome.tabs.remove = unableToEdit;
+    await b.tick();
+    b.chrome.tabs.remove = remove;
+    await b.tick();
+    assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, [10]);
+    assert.deepEqual(historyOf(b), ['worker:tab_closed']);
+  });
+}
+test('review: a durably archived leg whose tab is gone releases it as tab_lost', async () => {
+  const b = worker(leg('review', {sourceCapture: archived}, {captureProtocol: 1}), {tab: null});
+  const jobs = await b.jobs();
+  await b.context.cleanupProvider(jobs['job-A'], 'chatgpt', jobs);
+  assert.equal(jobs['job-A'].states.chatgpt.cleanupDone, true, 'released: repair no longer needs the tab');
+  assert.deepEqual([...stagesOf(jobs['job-A'].states.chatgpt.workerEvents)].filter(stage => /^worker:tab_/.test(stage)), ['worker:tab_lost']);
+});

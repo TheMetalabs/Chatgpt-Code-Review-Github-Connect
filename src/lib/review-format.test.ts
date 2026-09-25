@@ -4,6 +4,21 @@ import { FINDING_412 } from "./samples.ts";
 import { CLEAN_REVIEW_BODY, REVIEW_RAW_END, REVIEW_RAW_START, inlineFindingComment, redactSalvagedReviewBody, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
 
 describe("review-format", () => {
+  it("a verify-clean job released as the fallback says local ran as the fallback, never that it verifies chat", () => {
+    const findingJob = (patch: Record<string, unknown>) =>
+      reviewSummaryBody(
+        { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", assumptions: [], coverage: [], ...patch },
+        [{ ...FINDING_412, id: "f1" }],
+        "ashlar-bot",
+      );
+    const fallback = findingJob({ localFallbackAt: 1, skippedProviders: ["chatgpt"] });
+    assert.match(fallback, /\nchatgpt ran in parallel\. Local LLM ran as the fallback\.\n/);
+    assert.doesNotMatch(fallback, /verifies a clean chat result/);
+    // only a job that was not released as the fallback is described by its verify-clean role
+    assert.match(findingJob({}), / Local LLM verifies a clean chat result\./);
+    assert.match(findingJob({ localVerifyStartedAt: 1 }), / Local LLM verifies a clean chat result\./);
+  });
+
   it("surfaces a salvaged raw review in the body and is not a clean pass", () => {
     const body = reviewSummaryBody(
       { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "P1 real bug in pay.ts when amount is 0", rawCauses: { chatgpt: "unparseable" } },

@@ -186,14 +186,19 @@ function unanchoredBlock(unanchored: Finding[]): string {
   return `\n**Findings without an inline anchor** — the reported line could not be matched to this PR's diff, so they are surfaced here instead of being dropped:\n\n${rows.join("\n")}\n`;
 }
 
+/** Which role local actually had in this job: a verify-clean job released as the chat-down fallback
+ * (localFallbackAt) ran local as an ordinary reviewer, never as a verifier of a clean chat result,
+ * so the release state wins over the configured role (as in reviewOutcome). */
 function reviewersLine(job: SummaryJob): string {
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
   const local = !providers.includes("local")
     ? ""
-    : job.localReviewRole === "verify-clean" && chat.length
-      ? " Local LLM verifies a clean chat result."
-      : " Local LLM is fallback if Chrome does not return.";
+    : job.localFallbackAt
+      ? " Local LLM ran as the fallback."
+      : job.localReviewRole === "verify-clean" && chat.length
+        ? " Local LLM verifies a clean chat result."
+        : " Local LLM is fallback if Chrome does not return.";
   return `${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local}`;
 }
 

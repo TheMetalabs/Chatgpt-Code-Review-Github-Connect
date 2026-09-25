@@ -8,7 +8,7 @@ import {join} from 'node:path';
 import {webcrypto} from 'node:crypto';
 import {root, source} from './load-source.mjs';
 import {PROGRESS_LABELS, sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
-import {background, storage, raw, until} from './helpers.mjs';
+import {background, content, storage, raw, flush, until} from './helpers.mjs';
 
 /** The string-literal stages a progress call can record: literals of workerStep / recordReviewStep /
  * step arguments, including both arms of a conditional, but not the arguments of a nested call
@@ -105,6 +105,32 @@ for (const kind of ['review', 'fix']) {
     assert.ok(run && run.id !== 10 && run.prompt === 'PROMPT', 'the leg dispatched into the tab it created');
     assert.equal(b.pending().states.chatgpt.tabId, run.id);
     assert.ok(b.tabs.has(10), 'the user\'s tab is untouched');
+  });
+}
+// A leg nobody wants any more never sends, for either kind (#82), not even for the run message the
+// worker gave up on (askPage bounds every page message) that reaches the page after the leg retired.
+// The release tells the unbound page in the tab created for the leg that the run was never
+// dispatched, and the page fences it (a review with its claim, a fix with a refusal that vouches for
+// nothing, #77). The real page script answers here (kind-conformance W15b pins the cancelled case).
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a forgotten ("missing") leg that was never dispatched fences its run in its unbound page: a late run message for it never sends`, async () => {
+    const opened = 'https://chatgpt.com/?temporary-chat=true';
+    const jobId = leg(kind).jobId;
+    const persisted = new Map();
+    const page = content('chatgpt', persisted);
+    page.context.location = {href: opened};
+    let sent = 0;
+    page.context.runPrompt = async () => { await flush(); page.context.throwIfStopped(); sent++; return ANSWER[kind]; };
+    const session = storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}});
+    const b = worker(leg(kind, {started: false}), {status: 'missing', session, tab: {id: 10, url: opened, status: 'complete'}, handler: (_id, m) => page.message(m)});
+    await b.context.heartbeatTick();
+    assert.deepEqual({ok: (await b.context.clearStuckJobs()).ok, retired: !b.pending()}, {ok: true, retired: true});
+    assert.deepEqual(b.closedTabs, kind === 'fix' ? [] : [10], kind === 'fix' ? 'a fix tab is kept (#77)' : 'the blank review tab is closed');
+    assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.undispatched === true), 'the release says the run was never dispatched');
+    assert.equal(persisted.get(`ashlar:stopped:${jobId}:run-A`), 'true', 'the page fenced the run');
+    page.message({type: 'ashlar-run', jobId, runId: 'run-A', provider: 'chatgpt', ...(kind === 'fix' ? {kind: 'fix'} : {}), prompt: 'PROMPT'});
+    assert.ok(await until(() => page.context.__ashlarRunnerState.result), 'the late run ended');
+    assert.deepEqual({sent, code: page.context.__ashlarRunnerState.result.code}, {sent: 0, code: 'cancelled'});
   });
 }
 // A cancelled or forgotten leg is stopped whatever it collected (#82), and released by the same

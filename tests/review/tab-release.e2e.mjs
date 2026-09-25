@@ -477,6 +477,25 @@ for(const [name,view,expected] of [
  assert.ok(w.b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.undispatched===true),'the unbound page answers only the undispatched claim');
  assert.equal(w.b.messages.some(m=>m.type==='ashlar-run'),false,'a cancelled run is never dispatched');
 });
+// A run message the worker gave up on (askPage bounds every page message) can still reach the page
+// after its leg retired. The release told the unbound page in the tab created for the leg that the
+// run was never dispatched, for either kind (a review's claim; a fix's refusal, which vouches for
+// nothing and keeps the tab, #77), so that run binds the page stopped: never sent (#82), even when
+// the stop marker cannot be written.
+for(const kind of ['review','fix'])for(const persisted of [true,false])test(`worker, ${kind}: cancelled before its run was dispatched, a late run message for it never sends (${persisted?'stop marker written':'stop marker write fails'})`,async t=>{
+ const tab=await chatTab(t,{kind,bound:false});
+ if(!persisted)await tab.page.evaluate(()=>{const set=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){
+  if(key.startsWith('ashlar:stopped:'))throw new DOMException('fixture quota exceeded','QuotaExceededError');return set.call(this,key,value);};});
+ const w=wire(tab,{kind,started:false,server:{value:'cancelled'},session:createdHere(tab.job)});
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,kind==='fix'?[]:[10]);assert.equal(w.state(),undefined,'the leg retired');
+ assert.ok(w.b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.undispatched===true&&(kind!=='fix'||m.preserve===true)),'the release says the run was never dispatched');
+ assert.equal(await tab.page.evaluate(key=>sessionStorage.getItem(key),`ashlar:stopped:${tab.job}:${tab.run}`),persisted?'true':null);
+ assert.equal(await tab.released(),null,'an unbound page has no binding to release');
+ await tab.send('ashlar-run',{prompt:PROMPT});await tab.page.clock.runFor(2000);
+ assert.equal(await tab.clicks(),0,'the late run never sends');
+ assert.deepEqual(await tab.runner(),{running:false,code:'cancelled'});
+});
 // Chrome tab ids are unique only within one browser session; the job registry survives a restart
 // (storage.local), the record of the tabs this session created does not (storage.session). A leg
 // allocated but never dispatched before a restart can therefore name the user's own tab.

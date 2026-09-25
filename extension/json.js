@@ -798,8 +798,19 @@ function stopRun(state) {
   try { sessionStorage.setItem(`ashlar:stopped:${state.jobId}:${state.runId}`, "true"); } catch { /* in-memory stop remains */ }
 }
 
+/** Stop a run this page is not bound to: the tab the worker opened for a run it never sent
+ * (undispatched), either kind. A late "ashlar-run" for it (a dispatch the worker gave up on) binds
+ * the page stopped (runStoppedFor), also when the marker cannot be written. */
+function fenceRun(state, jobId, runId) {
+  if (!jobId || !runId) return;
+  state.fencedRuns = [...(state.fencedRuns || []), JSON.stringify([jobId, runId])].slice(-16);
+  try { sessionStorage.setItem(`ashlar:stopped:${jobId}:${runId}`, "true"); } catch { /* the in-memory fence remains */ }
+}
+
 function runStoppedFor(jobId, runId) {
-  try { return Boolean(jobId && runId) && sessionStorage.getItem(`ashlar:stopped:${jobId}:${runId}`) === "true"; }
+  if (!jobId || !runId) return false;
+  if (globalThis.__ashlarRunnerState?.fencedRuns?.includes(JSON.stringify([jobId, runId]))) return true;
+  try { return sessionStorage.getItem(`ashlar:stopped:${jobId}:${runId}`) === "true"; }
   catch { return false; }
 }
 
@@ -944,14 +955,18 @@ function installReviewRunner(name, run) {
       // only when the worker keeps the tab, so that reply stops the run, frees the managed slot and
       // authorises nothing (no ownership verdict), and no fix page ever answers for an unbound tab.
       const fixRun = msg.kind === "fix" || state.kind === "fix";
-      if (msg.type === "ashlar-fix-cancel" && msg.undispatched === true && !fixRun && !state.jobId && !state.runId) {
+      if (msg.type === "ashlar-fix-cancel" && msg.undispatched === true && !state.jobId && !state.runId) {
+        // The tab the worker opened for a run it never sent (undispatched), either kind: a late run
+        // message for it stays stopped. A fix page stops there: the worker keeps an undispatched fix
+        // tab (#77), so the page refuses the release like any unbound page and vouches for nothing.
+        fenceRun(state, msg.jobId, msg.runId);
+        if (fixRun) { reply({ok:false,code:"job_mismatch"});return; }
         // Positive binding only: an unbound page is never evidence that this tab is Ashlar's, except
-        // the tab the worker opened for a run it never sent (undispatched): Ashlar's only while it
-        // holds nothing of the user's (no turn, no draft). A late run message for it stays stopped.
+        // the tab the worker opened for a review it never sent: Ashlar's only while it holds nothing
+        // of the user's (no turn, no draft).
         const turns = globalThis.document ? document.querySelectorAll('[data-message-author-role="user"]').length : 0;
         const draft = Boolean(composerDraftText()) || composerStagedFiles(null, null).length > 0;
         const blank = !turns && !draft;
-        if (msg.runId) { try { sessionStorage.setItem(`ashlar:stopped:${msg.jobId}:${msg.runId}`, "true"); } catch { /* nothing runs here yet */ } }
         reply({ok:true,releaseProtocol:1,owned:blank,canClose:blank,ownership:blank ? "owned" : "takenOver",
           ...(blank ? {} : {cause: draft ? "draft" : "user_turn"}),blank,unsent:false,url:globalThis.location?.href || ""});return;
       }

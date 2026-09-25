@@ -1106,11 +1106,12 @@ function cleanupWaiting(job, provider, reason) {
  * its run) when it can be messaged (`tab`), and the worker records the preserved run as a backstop
  * (the page may never answer), so the retained binding is never counted as an orphan against tab
  * capacity. A page that was asked is probed again before the leg retires (reprobePreservedTab, #77),
- * so retirement follows the page's own post-release status. Then the job retires. */
-async function preserveFixTab(job, provider, jobs, reason, tab, cause) {
+ * so retirement follows the page's own post-release status. Then the job retires. `extra`: fields
+ * added to the release message (an undispatched fix leg's `undispatched`, see forceCloseFixTab). */
+async function preserveFixTab(job, provider, jobs, reason, tab, cause, extra) {
   const state = job.states[provider];
   if (tab) {
-    const released = await askPage(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider)).catch(() => null);
+    const released = await askPage(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true, ...extra}, contentFiles(provider)).catch(() => null);
     // The page's own steps (cancelled, context_changed, ...) reach history from this reply too.
     if (matchesJob(released, job, provider)) ingestPageProgress(state, released);
   }
@@ -1204,9 +1205,14 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     // answer; the preserved-run record covers it until the inventory reaches it), and only a tab that
     // is the leg's: an undispatched leg's stored id names its tab only when this browser session
     // created it (#82, tabCreatedForLeg); otherwise it may be the user's tab, never messaged.
-    const reachable = (!tab.status || tab.status === "complete") && tab.discarded !== true && tab.frozen !== true &&
-      (state.started === true || await tabCreatedForLeg(job, provider, tab.id));
-    return preserveFixTab(job, provider, jobs, `fix ended without a delivered answer (${why}); tab preserved`, reachable ? tab : undefined, "undelivered");
+    const loaded = (!tab.status || tab.status === "complete") && tab.discarded !== true && tab.frozen !== true;
+    // That tab holds an unbound page, which refuses a release naming the run: `undispatched` has it
+    // fence the run instead, so a late run message for it (a dispatch askPage gave up on) stays
+    // stopped (#82). It states a fact about the run, never a claim on the tab: no fix page vouches
+    // for an unbound tab, and the tab is kept (#77).
+    const undispatched = loaded && state.started !== true && await tabCreatedForLeg(job, provider, tab.id);
+    return preserveFixTab(job, provider, jobs, `fix ended without a delivered answer (${why}); tab preserved`,
+      loaded && (state.started === true || undispatched) ? tab : undefined, "undelivered", undispatched ? {undispatched: true} : undefined);
   }
   // Whether the tab may close never follows the server status (#77, Ashlar 4097631101): both review
   // exits get the same verdict, and it compares nothing about the answer (#82: ChatGPT keeps

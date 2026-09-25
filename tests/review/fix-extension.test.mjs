@@ -226,13 +226,28 @@ test('page: ashlar-fix-cancel needs a positive binding; it stops the collector a
 
 test('page: an undispatched tab (never bound) answers the cancel exit for itself only for a REVIEW, and only when the worker says so; no fix page vouches for an unbound tab', async () => {
   const p = page();
+  const stopped = jobId => p.c.context.sessionStorage.getItem(`ashlar:stopped:${jobId}:run-A`);
   const review = (extra = {}) => msg('ashlar-fix-cancel', {jobId: 'job-A', kind: undefined, ...extra});
   assert.equal(p.c.message(review()).code, 'job_mismatch', 'unbound, no claim: never Ashlar-owned');
+  assert.equal(stopped('job-A'), undefined, 'no claim: nothing is fenced either');
   const out = p.c.message(review({undispatched: true}));
   assert.equal(out.ok, true);assert.equal(out.owned, true, 'a blank chat page with no turn or draft (#82: a cancelled review\'s own tab)');
   assert.ok(!out.jobId && !out.runId, 'the reply carries no binding');
-  // a fix: the worker preserves its undispatched tab and never asks (#77)
-  assert.equal(p.c.message(msg('ashlar-fix-cancel', {undispatched: true})).code, 'job_mismatch', 'a fix page never answers for an unbound tab');
+  assert.equal(stopped('job-A'), 'true', 'the never-dispatched review run is fenced');
+  // A fix: the worker keeps its undispatched tab (#77) and only tells the page, with the release, that
+  // the run was never dispatched. The page refuses it like any unbound page, vouching for nothing,
+  // and fences the run, so a late run message for it never sends (#82).
+  const fix = p.c.message(msg('ashlar-fix-cancel', {undispatched: true, preserve: true}));
+  assert.deepEqual({ok: fix.ok, code: fix.code}, {ok: false, code: 'job_mismatch'}, 'a fix page never answers for an unbound tab');
+  for (const key of ['owned', 'ownership', 'canClose', 'blank', 'unsent', 'released', 'stopped']) assert.equal(key in fix, false, `the refusal carries no ${key}`);
+  assert.ok(!p.state().jobId && !p.state().runId, 'the page stays unbound');
+  assert.equal(stopped('fix-A'), 'true', 'the never-dispatched fix run is fenced');
+  let sent = 0;
+  p.c.context.runPrompt = async () => { await flush(); p.c.context.throwIfStopped(); sent++; return ANSWER; };
+  p.c.message(run());
+  await settled(p.c);
+  assert.equal(sent, 0, 'the late run never sends');
+  assert.equal(p.state().result?.code, 'cancelled');
 });
 
 test('page: a fix page\'s release verdict (can-close) is "unknown" while it cannot be established and frees no slot; the cancel exit always frees it', async () => {

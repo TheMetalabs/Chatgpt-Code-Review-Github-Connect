@@ -6,7 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
-import {background, storage, raw, flush, until} from './helpers.mjs';
+import {background, content, storage, raw, flush, until} from './helpers.mjs';
 
 const URL_TAB = 'https://chatgpt.com/c/managed';
 const OTHER_TAB = 'https://chatgpt.com/c/users-own'; // a conversation the user moved the tab to
@@ -155,6 +155,27 @@ const ROWS = [
         handler: (_id, m) => (m.type === 'ashlar-fix-cancel' && m.undispatched ? {ok: true, owned: true, ownership: 'owned', url: OPENED, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'})});
       await b.tick();b.later();await b.tick();
       return {retired: !b.pending(), closed: b.closedTabs.length};
+    }},
+  {id: 'W15b', name: 'W15, then the run message the worker gave up on reaches the page after the leg retired', same: true,
+    // A cancelled leg never sends, for either kind (#82). The release names the run as never
+    // dispatched (`undispatched`), so the unbound page in the tab created for the leg fences it: a
+    // review page with its claim, a fix page with a refusal that vouches for nothing (#77). The late
+    // run binds the page stopped. The real page script answers here, not a stub.
+    expect: {retired: true, sent: 0, code: 'cancelled', marker: 'true'},
+    async run(kind) {
+      const OPENED = 'https://chatgpt.com/?temporary-chat=true';
+      const job = item(kind, {}, {started: false});
+      const persisted = new Map();
+      const page = content('chatgpt', persisted);
+      page.context.location = {href: OPENED};
+      let sent = 0;
+      page.context.runPrompt = async () => { await flush(); page.context.throwIfStopped(); sent++; return ANSWER[kind]; };
+      const session = storage({'ashlar:tab:10': {jobId: job.jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${job.jobId}:chatgpt:run-A`, closing: false}});
+      const b = worker(kind, {api: cancelled, url: OPENED, job, session, handler: (_id, m) => page.message(m)});
+      await b.tick();
+      page.message({type: 'ashlar-run', jobId: job.jobId, runId: 'run-A', provider: 'chatgpt', ...(kind === 'fix' ? {kind: 'fix'} : {}), prompt: 'PROMPT'});
+      await until(() => page.context.__ashlarRunnerState.result);
+      return {retired: !b.pending(), sent, code: page.context.__ashlarRunnerState.result?.code, marker: persisted.get(`ashlar:stopped:${job.jobId}:run-A`)};
     }},
   // W23-W27, W40: the conversation identity cell. A run's page records the conversation it is bound
   // in (a fix when its send is proven; a review then too on a conversation page, else where the

@@ -361,13 +361,18 @@ function throwIfQuota(name, bound, answered) {
  * reasoning run at ~29.5 min by mounting a turn that never gets completion controls (8/8 field
  * runs). Healthy runs: answer mount to completion took at most 154 s in 367 runs. Growth, not any
  * text change: a label re-rendered in place (a ticking timer) is not progress. No bound answer yet
- * (thinking), a follow-up or a completed turn clears the lease: none of them has a deadline. */
+ * (thinking), a follow-up or a completed turn clears the lease: none of them has a deadline.
+ * Only observed time counts: a poll gap over 3 min is a host sleep or a frozen tab, whose first
+ * poll on resume still sees the pre-pause answer, so the lease moves forward by that gap. Chrome
+ * wakes a hidden tab's timers about once a minute, so throttled polls still count. */
 function expireGeneratingLease(lease, name, {bound, stop, streaming, done}, text) {
   // Declared here, not at top level: content scripts are re-injected.
-  const GENERATING_LEASE_MS = 15 * 60_000;
+  const GENERATING_LEASE_MS = 15 * 60_000, POLLING_SUSPENDED_MS = 3 * 60_000;
+  const now = Date.now(), gap = lease.polled ? now - lease.polled : 0;
+  lease.polled = now;
+  if (gap > POLLING_SUSPENDED_MS) lease.at += gap;
   if (done || !bound?.root || bound.followup) { lease.state = ""; return; }
   const state = JSON.stringify([bound.responseId || "", Boolean(stop), Boolean(streaming)]);
-  const now = Date.now();
   if (state !== lease.state) Object.assign(lease, {state, chars: text.length, at: now});
   else if (text.length > lease.chars) Object.assign(lease, {chars: text.length, at: now});
   else if (now - lease.at >= GENERATING_LEASE_MS) {
@@ -401,7 +406,7 @@ async function waitUntilReviewOrQuota(name) {
   // Stamp the executing loop, never installReviewRunner's listener replacement.
   if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
   const stability = {stable: "", hits: 0};
-  const lease = {state: "", chars: 0, at: 0};
+  const lease = {state: "", chars: 0, at: 0, polled: 0};
   // No poll-count failure and no deadline before the answer mounts (expireGeneratingLease bounds
   // only a mounted answer that stops progressing). Controls can appear before response text is
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.

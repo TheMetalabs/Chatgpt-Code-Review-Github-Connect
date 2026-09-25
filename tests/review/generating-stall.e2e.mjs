@@ -150,6 +150,39 @@ test('guard: a slow answer that keeps growing for 60 min under Stop is not a sta
   await page.clock.runFor(2400);assert.equal((await snap(page)).received?.raw,raw);
 });
 
+// A host sleep or a frozen tab stops polling mid-answer. The first poll after resume still sees the
+// pre-pause answer, before ChatGPT reconnects: the pause is not the answer failing to progress.
+const sleepMidAnswer=async(t,raw)=>{
+  const page=await pageFor(t,user);await page.evaluate(stop(true));await collect(page);
+  await mount(page,codeBlock,{done:false});await setCode(page,raw.slice(0,raw.length>>1));await page.clock.runFor(2400);
+  assert.equal((await snap(page)).stages.at(-1),'generating');
+  await page.clock.fastForward(20*MIN);await page.clock.runFor(2400);
+  const resumed=await snap(page);t.diagnostic('first polls after a 20 min sleep: '+JSON.stringify(resumed));
+  assert.equal(resumed.received,null,`the sleep counted as no progress: ${JSON.stringify(resumed)}`);
+  return page;
+};
+test('guard: a 20 min host sleep mid-answer is not a stall; the resumed answer is collected',async t=>{
+  const raw=review77(),page=await sleepMidAnswer(t,raw);
+  await setCode(page,raw);await page.evaluate(stop(false));
+  await page.locator('section[data-turn="assistant"]').evaluate((el,html)=>el.insertAdjacentHTML('beforeend',html),actions);
+  await page.clock.runFor(2400);assert.equal((await snap(page)).received?.raw,raw);
+});
+test('guard: after a sleep, an answer that never progresses again still fails 15 min after resume',async t=>{
+  const page=await sleepMidAnswer(t,review77());
+  await page.clock.runFor(14*MIN);assert.equal((await snap(page)).received,null);
+  await page.clock.runFor(2*MIN);assert.equal((await snap(page)).received?.code,'stalled');
+});
+// Chrome wakes a hidden tab's timers about once a minute; a stalled turn does not mutate the DOM,
+// so its polls come that far apart. Those gaps are live observation, not a suspended host.
+test('guard: polls throttled to one per 2 min still count toward the lease',async t=>{
+  const page=await pageFor(t,user);await page.evaluate(stop(true));await collect(page);
+  await mount(page,'<p></p>',{done:false});await page.clock.runFor(2400);
+  for(let i=0;i<7;i+=1)await page.clock.fastForward(2*MIN);
+  assert.equal((await snap(page)).received,null);
+  for(let i=0;i<2;i+=1)await page.clock.fastForward(2*MIN);
+  const end=await snap(page);t.diagnostic(JSON.stringify(end));assert.equal(end.received?.code,'stalled');
+});
+
 // The runner's own outcome path (installReviewRunner's catch), not the collect() mirror above: the
 // worker harvests `stalled` as the leg's terminal result, and the journal ends with the lease step.
 async function runViaRunner(page,{kind}={}){await page.evaluate(kind=>{

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
+import {readFileSync} from 'node:fs';
 import {appFixture,eventually} from './app-fixture.mjs';
 const raw=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "condition"'],merge_recommendation:'COMMENT'});
 const original=raw.replace(/\\"/g,'"');
@@ -29,6 +30,25 @@ test('HTTP: completed unparseable reply -> one Local repair -> original provider
  await post(app,{action:'repair-commit',...binding,repairId:out.repair.id});assert.equal(app.reviews.length,1);
  const job=app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId);assert.deepEqual(Array.from(job.storedLegs,l=>l.provider),['chatgpt']);assert.equal(job.storedLegs[0].repair.normalizedBy,'local');
  assert.equal(app.history.getJob(binding.jobId,true).responses.chatgpt.original,original);
+});
+test('HTTP: a labelled stray-quote answer goes json_invalid -> capture -> repair -> posted with no Local call',async t=>{
+ // Job 1043 (#87), on the unchanged extension 1.1.22 protocol: complete is refused with 422, the
+ // source is captured, and repair runs from the capture.
+ const text=readFileSync(new URL('./fixtures/chatgpt-1043-labelled-stray-quote.txt',import.meta.url),'utf8');
+ const {app,binding:base}=await setup(t);const binding={...base,sourceHash:createHash('sha256').update(text).digest('hex')};
+ const refused=await post(app,{action:'complete',repairProtocol:1,captureProtocol:1,jobId:binding.jobId,leaseId:binding.leaseId,raw:text,results:[{provider:'chatgpt',raw:text,originalText:text}]});
+ assert.equal(refused.http,422);assert.equal(refused.code,'json_repair_required');
+ const source={text,totalChars:text.length,truncated:false,responseId:binding.responseId,completed:true,stable:true};
+ const captured=await post(app,{action:'capture',...binding,source});assert.equal(captured.http,200);
+ const started=await post(app,{action:'repair',...binding,source:{...source,captureId:captured.capture.id}});assert.equal(started.ok,true);
+ const repair=action=>post(app,{action,...binding,repairId:started.repair.id});
+ await eventually(async()=>(await repair('repair-status')).repair.status==='ready','deterministic repair not ready');
+ assert.equal((await repair('repair-commit')).repair.status,'accepted');
+ await eventually(()=>app.reviews.length===1,'review not posted');
+ await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId)?.status==='posted','job not posted');
+ assert.equal(app.localRequests.length,0,'the Local model was called');
+ const leg=app.harbor.getHarbor().jobs.find(j=>j.id===binding.jobId).storedLegs[0];
+ assert.deepEqual(JSON.parse(leg.raw).findings.map(finding=>finding.severity),['P1','P1','P2']);
 });
 test('HTTP: OFF/new settings inhibit Local without aborting or failing the original job',async t=>{
  const {app,binding,start}=await setup(t,{localJsonRepairEnabled:false});const out=await start();assert.equal(out.repair.status,'disabled');

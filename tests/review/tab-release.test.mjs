@@ -807,7 +807,21 @@ function noPageWhileDiscarded(b) {
   b.chrome.scripting.executeScript = async ({target}) => { if (b.tabs.get(target.tabId)?.discarded) throw new Error('Cannot access contents of the page'); };
 }
 test('the onReplaced listener is registered at the worker\'s top level (a replace never fires onRemoved)', () => {
-  assert.match(source('extension/background.js'), /^chrome\.tabs\.onReplaced\.addListener\(\(added, removed\) => void rekeyReplacedTab\(added, removed\)/m);
+  assert.match(source('extension/background.js'), /^chrome\.tabs\.onReplaced\.addListener\(\(added, removed\) => rekeyReplacedTab\(added, removed\)\);/m);
+  assert.match(source('extension/background.js'), /^chrome\.tabs\.onRemoved\.addListener\(\(id, info\) => rememberClosedTab\(id, info\)\);/m);
+});
+// The tab queue (#85): the listeners record the fact in memory and queue its operation. They return
+// nothing (Chrome never waits for a listener, and the worker's own close runs inside an operation
+// that must not wait for the one it queues).
+test('the replace and remove listeners return nothing: their operations are queued, never awaited', async () => {
+  const b = worker(leg('review'), {session: createdHere('review'), tab: {id: 10, url: URL_TAB, status: 'complete'}});
+  b.tabs.delete(10);b.tabs.set(11, {id: 11, url: URL_TAB, status: 'complete'});
+  assert.equal(b.context.rekeyReplacedTab(11, 10), undefined);
+  assert.equal(b.context.liveTabId(10), 11, 'the replace is known at once');
+  assert.equal(b.context.rememberClosedTab(11, {isWindowClosing: false}), undefined);
+  await b.queueIdle();
+  assert.deepEqual(b.effects.filter(e => e.kind !== undefined), [], 'no tab effect');
+  assert.equal(b.session.state['ashlar:closed:job-A:chatgpt:run-A'], true, 'the removal applied after the re-key');
 });
 for (const kind of ['review', 'fix']) {
   test(`${kind}: a secured leg whose tab Chrome replaced on discard follows it: woken under the new id, then closed`, async () => {
@@ -878,9 +892,9 @@ test('a leg whose tab the worker closed is not revived by a late replace naming 
   assert.equal(states.grok.tabId, 20);assert.equal(states.grok.workerEvents, undefined);
 });
 // Ashlar 4101062763: Chrome fires A -> B and then B -> C before the first re-key's storage round trips
-// finished. Re-keys run in one ordered lane, and each moves its records to the END of the chain known
-// when it runs, so nothing is left naming the dead intermediate id B; lanes that look B up meanwhile
-// are told the tab lives on (replacedSince).
+// finished. Re-keys run in the tab queue in the order Chrome reported them, and each moves its records
+// to the END of the chain known when it runs, so nothing is left naming the dead intermediate id B;
+// operations that look B up meanwhile are told the tab lives on (replacedSince).
 test('back-to-back replaces (A -> B -> C, the first still recording) end at C: the leg and its ownership, preserved and fix delivery records', async () => {
   const backstop = 'ashlar:preserved:fix-A:chatgpt:run-A';
   const session = createdHere('fix');session.state[backstop] = {tabId: 10};
@@ -891,13 +905,13 @@ test('back-to-back replaces (A -> B -> C, the first still recording) end at C: t
   const get = b.session.get;let release, first = true;const gate = new Promise(resolve => { release = resolve; });
   b.session.get = async keys => { if (keys == null && first) { first = false;await gate; } return get(keys); };
   b.tabs.delete(10);b.tabs.set(12, {id: 12, url: TEMP, status: 'complete'});
-  const ab = b.context.rekeyReplacedTab(11, 10);
-  const bc = b.context.rekeyReplacedTab(12, 11);
+  b.context.rekeyReplacedTab(11, 10);
+  b.context.rekeyReplacedTab(12, 11);
   for (let i = 0; i < 10; i++) await flush();
   assert.ok(b.context.replacedSince(state, 10) && b.context.replacedSince(state, 11), 'A and B are covered while the chain settles');
-  release();await ab;
+  release();
+  await b.queueIdle();
   assert.ok(b.context.replacedSince(state, 11), 'B is never taken for a tab that is gone');
-  await bc;
   assert.equal(state.tabId, 12, 'the leg names the live tab');
   assert.equal(b.pending().states.chatgpt.tabId, 12, 'persisted');
   assert.deepEqual({jobId: b.session.state['ashlar:tab:12']?.jobId, replacedBy: b.session.state['ashlar:tab:12']?.replacedBy}, {jobId: 'fix-A', replacedBy: undefined}, 'the ownership record names C');
@@ -929,13 +943,13 @@ for (const kind of ['review', 'fix']) {
 }
 /** Chrome already swapped tab 10's page into `tab`, but the onReplaced event reaches the worker only
  * while it searches for the leg's tab (findOriginalTab's query), after the old id's lookup failed.
- * Dispatched as the real listener does it: not awaited (`b.rekeyed` settles once it is recorded), so
- * the search can end before the re-key moved the leg. */
+ * Dispatched as the real listener does it: its re-key is queued behind the running operation
+ * (`b.rekeyed` settles once the queue ran it), so the search ends before the re-key moved the leg. */
 function replacedDuringLookup(b, tab) {
   b.tabs.delete(10);b.tabs.set(tab.id, tab);
   const query = b.chrome.tabs.query;let delivered = false;
   b.chrome.tabs.query = async filter => {
-    if (filter?.url && !delivered) { delivered = true;b.rekeyed = b.context.rekeyReplacedTab(tab.id, 10).catch(() => {}); }
+    if (filter?.url && !delivered) { delivered = true;b.context.rekeyReplacedTab(tab.id, 10);b.rekeyed = b.queueIdle(); }
     return query(filter);
   };
 }
@@ -996,18 +1010,31 @@ for (const kind of ['review', 'fix']) {
     assert.equal((await b.context.clearStuckJobs({includeStalled: true, staleMs: 1})).ok, true);
     assert.ok(b.calls.some(c => c.action === 'failure' && /^tab_closed: /.test(c.error)), 'the stalled leg is settled');
   });
-  test(`${kind}: a replace whose re-key failed holds a cancelled leg only while it is being recorded`, async () => {
+  // A re-key that failed (its storage round trips) is applied again by the leg's next operation
+  // (applyPendingReplace): the leg still follows its tab, never retired as lost while it lives on.
+  test(`${kind}: a replace whose re-key failed is applied by the leg's next operation; the leg follows its tab, never retired as lost`, async () => {
     const b = worker(leg(kind, {pageUrl: TEMP}), {status: 'cancelled', session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: blankVerdict});
     noPageWhileDiscarded(b);
-    let fail;const recording = new Promise((_resolve, reject) => { fail = reject; });
-    b.context.moveReplacedTab = () => recording; // the re-key's storage round trips, held and then failed
+    b.chrome.tabs.reload = async id => { Object.assign(b.tabs.get(id), {discarded: false, status: 'loading'}); };
+    const move = b.context.moveReplacedTab;let failures = 0;
+    b.context.moveReplacedTab = async (...args) => { if (!failures++) throw new Error('storage unavailable'); return move(...args); };
     replacedDuringLookup(b, {id: 11, url: TEMP, status: 'unloaded', discarded: true});
     await b.tick();
-    assert.ok(b.pending(), 'held while the replace is being recorded');
-    fail(new Error('storage unavailable'));await b.rekeyed;
+    assert.ok(b.pending(), 'not retired: the tab has a new id');
+    await b.rekeyed;
+    assert.equal(failures, 1, 'the queued re-key failed');
+    assert.equal(b.pending().states.chatgpt.tabId, 10, 'nothing moved the leg yet');
     await b.tick();
-    assert.equal(b.pending(), undefined, 'retired once nothing is moving it to another id');
-    assert.deepEqual(historyOf(b), ['worker:tab_lost']);
+    assert.equal(b.pending()?.states.chatgpt.tabId ?? 11, 11, 'the next operation moved it');
+    if (kind === 'fix') {
+      assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, [], 'kept (#77), not lost');
+      assert.deepEqual(historyOf(b), ['worker:tab_preserved']);
+      return;
+    }
+    b.tabs.get(11).status = 'complete';
+    await b.tick();
+    assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, [11], 'closed under its new id, not lost');
+    assert.deepEqual(historyOf(b), ['worker:tab_closed']);
   });
 }
 for (const kind of ['review', 'fix']) {
@@ -1037,10 +1064,13 @@ for (const kind of ['review', 'fix']) {
     const set = b.session.set;let release, held = false;const gate = new Promise(resolve => { release = resolve; });
     b.session.set = async values => { if ('ashlar:tab:11' in values) { held = true;await gate; } return set(values); };
     b.tabs.delete(10);b.tabs.set(11, {id: 11, url: TEMP, status: 'complete'});
-    const rekeyed = b.context.rekeyReplacedTab(11, 10);
+    b.context.rekeyReplacedTab(11, 10);
     assert.ok(await until(() => held), 'the re-key is writing its records');
-    await b.tick();
-    release();await rekeyed;
+    // The tick's poll waits in the tab queue behind the re-key.
+    const ticking = b.tick();
+    for (let i = 0; i < 20; i++) await flush();
+    assert.equal(b.messages.some(m => m.type === 'ashlar-run'), false, 'nothing is dispatched while the re-key runs');
+    release();await ticking;await b.queueIdle();
     await b.tick();
     assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' && !m.resume).map(m => m.id), [11], 'dispatched once, into the replaced tab');
     assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');

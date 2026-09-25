@@ -115,8 +115,11 @@ export function background({ local = storage({ origin: 'http://bridge', token: '
     /** Run `fn` as one operation in the tab queue (a direct call of an operation body). */
     op: (fn, kind = 'test') => context.tabOp(kind, fn),
     queueIdle: () => context.tabQueueIdle(),
-    closeTab: async id => { tabs.delete(id); for (const fn of removed) await fn(id, {isWindowClosing:false}); },
+    // (The listeners return nothing; their facts apply as queued operations, awaited here. A hook
+    // inside an operation fires the listener itself instead: awaiting the queue there would wait for
+    // the operation that waits for the hook.)
+    closeTab: async id => { tabs.delete(id); for (const fn of removed) fn(id, {isWindowClosing:false}); await context.tabQueueIdle?.(); },
     // Chrome swapped tab `removedId`'s page into `tab` (a new id): onReplaced(added, removed), no onRemoved.
-    replaceTab: async (removedId, tab) => { tabs.delete(removedId); tabs.set(tab.id, tab); for (const fn of replaced) await fn(tab.id, removedId); },
+    replaceTab: async (removedId, tab) => { tabs.delete(removedId); tabs.set(tab.id, tab); for (const fn of replaced) fn(tab.id, removedId); await context.tabQueueIdle?.(); },
     tick: () => context.tick() };
 }

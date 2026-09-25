@@ -169,9 +169,10 @@ test('durable archive repairs after original tab disappears before cleanup proof
   if(msg.type==='ashlar-capture-accepted') {
    if(!removed) {
     removed=true;
-    void f.worker.closeTab(id).then(()=>{
-      f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
-    });
+    // The user closes the tab while the receipt is in flight. Its removal is queued behind this
+    // operation (the tab queue, #85): the listener fires now, and the queue is not awaited here.
+    f.worker.tabs.delete(id);f.worker.context.rememberClosedTab(id,{isWindowClosing:false});
+    f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
     return;
    }
    f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
@@ -233,9 +234,10 @@ test('capture-read failure after tab loss falls back to the durable local source
   if(msg.type==='ashlar-capture-accepted') {
    if(!removed) {
     removed=true;
-    void f.worker.closeTab(id).then(()=>{
-      f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
-    });
+    // The user closes the tab while the receipt is in flight. Its removal is queued behind this
+    // operation (the tab queue, #85): the listener fires now, and the queue is not awaited here.
+    f.worker.tabs.delete(id);f.worker.context.rememberClosedTab(id,{isWindowClosing:false});
+    f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
     return;
    }
    f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;

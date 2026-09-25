@@ -44,16 +44,10 @@ const inventoryLanes = new Map();
 const tabOwners = new Map();
 const tabEpochs = new Map();
 const inventoryUpgrades = new Map();
-/** Replaces the worker is still recording (removed tab id -> added id): set as onReplaced is
- * dispatched, before rekeyReplacedTab's first await, and cleared once it settled (see replacedSince). */
-const replacingTabs = new Map();
-/** Every replace this worker saw (removed tab id -> added id), kept for its life: a chain A -> B -> C
- * resolves to C (liveTabId), also for a record written under A or B after its replace was handled.
- * Chrome never reuses a tab id within a browser session. */
+/** Every replace this worker saw (removed tab id -> added id), kept for its life and set as the
+ * listener runs: a chain A -> B -> C resolves to C (liveTabId), also for a record written under A or
+ * B after its replace was handled. Chrome never reuses a tab id within a browser session. */
 const replacedTabIds = new Map();
-/** The one ordered lane for re-keys (Ashlar 4101062763): each replace runs after the one dispatched
- * before it, so B -> C finds what A -> B wrote for B. */
-let replaceTail = Promise.resolve();
 const admissionLanes = new Map();
 const admissionReports = new Map();
 let registryPromise;
@@ -133,9 +127,15 @@ function closedKey(job, provider) {
   return `${CLOSED_PREFIX}${job.jobId}:${provider}:${job.states[provider].runId || "legacy"}`;
 }
 
-async function rememberClosedTab(tabId, info) {
+/** onRemoved: the fact is recorded in memory at once, and applied to the tab's records as the next
+ * operation in the tab queue (after the one running, which may be the worker's own close). The
+ * listener returns nothing: Chrome never waits for it, and neither may an operation that closes. */
+function rememberClosedTab(tabId, info) {
   invalidateTabInventory(tabId);
   pageBackoff.delete(tabId);
+  void tabOp("removed", () => recordClosedTab(tabId, info)).catch(() => {});
+}
+async function recordClosedTab(tabId, info) {
   const key = OWNED_PREFIX + tabId;
   const owned = (await chrome.storage.session.get([key]))[key];
   // Only managed tabs; session-scoped records cannot poison a reused ID after restart.
@@ -155,22 +155,21 @@ async function rememberClosedTab(tabId, info) {
  * it; Chrome never reuses a tab id), a preserved backstop and a fix delivery record name the new id
  * first, then the leg's state.tabId moves (recorded as a tab_rekeyed step): a lane that reads the new
  * id finds its records in place. A leg that already released its tab (cleanupDone: closed or
- * preserved) is left as it is: following the tab would not make it Ashlar's again. */
+ * preserved) is left as it is: following the tab would not make it Ashlar's again.
+ *
+ * The listener records the replace in memory at once (replacedTabIds, the inventory cache) and queues
+ * the re-key as a `rekey` operation in the tab queue: re-keys run in the order Chrome reported them
+ * (Ashlar 4101062763), each after the operation that was running, and read everything it wrote under
+ * the old id. A leg's operation that starts before it applies it first (applyPendingReplace). The
+ * listener returns nothing: Chrome never waits for it. */
 function rekeyReplacedTab(addedTabId, removedTabId) {
-  if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return Promise.resolve();
-  // Synchronously, in dispatch order, as the listener runs: the leg moves only after the storage round
-  // trips of every earlier replace and of this one (replacedSince covers the ids meanwhile).
+  if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return;
   replacedTabIds.set(removedTabId, addedTabId);
-  replacingTabs.set(removedTabId, addedTabId);
-  // To the chain's END when the lane gets to it: a later replace of the added id already dispatched
-  // (A -> B, then B -> C) moves A's records straight to C.
-  return inReplaceLane(() => moveReplacedTab(liveTabId(removedTabId), removedTabId))
-    .finally(() => { if (replacingTabs.get(removedTabId) === addedTabId) replacingTabs.delete(removedTabId); });
-}
-function inReplaceLane(operation) {
-  const pending = replaceTail.then(operation);
-  replaceTail = pending.catch(() => {}); // a failed re-key must not block the next one
-  return pending;
+  invalidateTabInventory(removedTabId);
+  invalidateTabInventory(addedTabId);
+  // To the chain's END when it runs: a later replace of the added id already reported (A -> B, then
+  // B -> C) moves A's records straight to C.
+  void tabOp("rekey", () => moveReplacedTab(liveTabId(removedTabId), removedTabId)).catch(() => {});
 }
 /** The id Chrome's replaces moved `tabId` to (itself when none did). */
 function liveTabId(tabId) {
@@ -178,11 +177,11 @@ function liveTabId(tabId) {
   for (let hops = 0; replacedTabIds.has(id) && hops < 64; hops++) id = replacedTabIds.get(id);
   return id;
 }
-/** A record naming `tabId` was just written, but Chrome already replaced that id (the replace was
- * handled before the write: the allocation's first records, a lane that still held the old id): the
- * record, and the leg if it still names that id, follow the chain in the replace lane. */
-async function followReplacedTab(tabId) {
-  if (Number.isInteger(tabId) && replacedTabIds.has(tabId)) await inReplaceLane(() => moveReplacedTab(liveTabId(tabId), tabId));
+/** A replace of the leg's tab that Chrome reported but whose re-key has not run yet (queued behind
+ * this operation, or it failed): applied now, inside the leg's operation, so it acts on the live id
+ * and never reads the old one as absent. (A re-key is idempotent: the queued one then finds it done.) */
+async function applyPendingReplace(state) {
+  if (Number.isInteger(state.tabId) && liveTabId(state.tabId) !== state.tabId) await moveReplacedTab(liveTabId(state.tabId), state.tabId);
 }
 async function moveReplacedTab(addedTabId, removedTabId) {
   invalidateTabInventory(removedTabId);
@@ -216,12 +215,12 @@ async function moveReplacedTab(addedTabId, removedTabId) {
   if (moved) await saveJobs(jobs);
 }
 
-/** Whether the leg's tab `lookedUp` (an id a lane just found gone) is gone only because Chrome
- * replaced it: the re-key already moved the leg to the new id, or is still recording the replace
- * (the listener does not await it, and a lane's lookup can end before it moved the leg). Either
- * way the tab lives on, and the next tick asks it under its new id. */
+/** Whether the leg's tab `lookedUp` (an id an operation just found gone) is gone only because Chrome
+ * replaced it: the re-key already moved the leg to the new id, or Chrome reported the replace while
+ * this operation ran (its re-key runs next). Either way the tab lives on, and the next tick asks it
+ * under its new id. */
 function replacedSince(state, lookedUp) {
-  return state.tabId !== lookedUp || replacingTabs.has(lookedUp);
+  return state.tabId !== lookedUp || liveTabId(lookedUp) !== lookedUp;
 }
 
 /** The session record that `tabId` (by default the leg's tab) is this leg's tab (tabCreatedForLeg). */
@@ -231,7 +230,6 @@ async function rememberOwnedTab(job, provider, closing = false, tabId = job.stat
   await chrome.storage.session.set({[OWNED_PREFIX + tabId]: {
     jobId: job.jobId, provider, runId: state.runId, closedKey: closedKey(job, provider), closing,
   }});
-  await followReplacedTab(tabId);
 }
 
 /** Whether this browser session recorded `tabId` as this leg's tab (allocateProviderTab writes the
@@ -1066,9 +1064,10 @@ async function allocateProviderTab(job, provider, jobs) {
     await rememberOwnedTab(job, provider, false, created.id);
     // The delivery record says `created` only now that the tab exists and carries its owned record.
     // A failed promotion is not fatal: that owned record proves the tab (reconcileFixDeliveries).
-    await promoteFixDelivery(job, provider, created.id).then(() => followReplacedTab(created.id)).catch(() => {});
-    // (Where a replace Chrome made meanwhile moved those records.)
-    state.tabId = liveTabId(created.id);
+    await promoteFixDelivery(job, provider, created.id).catch(() => {});
+    // A replace Chrome reported meanwhile is applied after this operation (its re-key), to these
+    // records and to the leg alike.
+    state.tabId = created.id;
     workerStep(job,provider,"tab_created");
     delete state.allocating;
     await saveJobs(jobs); // Durable binding before any prompt dispatch.
@@ -1159,6 +1158,7 @@ async function cleanupProviderBody(job, provider, jobs) {
   if (jobs[job.jobId] !== job) return;
   const state = job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`;
   if (capturePersistence.has(key) || (!state.delivered && !sourceArchiveDurable(state)) || state.cleanupDone || state.repairReceiptPending) return;
+  await applyPendingReplace(state);
   // No tab id and no run: nothing to look up or close (a leg that never had a tab ends with no tab
   // step at all, not even cleanup_pending: its last step stays what happened to its result).
   if (!state.tabId && !state.started) return finishTabCleanup(job, provider, jobs);
@@ -1312,7 +1312,6 @@ async function preserveFixTab(job, provider, jobs, reason, tab, cause, extra) {
   }
   const preservedTabId = state.tabId;
   await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: preservedTabId}});
-  await followReplacedTab(preservedTabId);
   if (tab) await reprobePreservedTab(tab.id, provider);
   return finishTabCleanup(job, provider, jobs, reason, cause);
 }
@@ -1782,6 +1781,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (jobs[job.jobId] !== job) return;
   const state = job.states[provider];
   if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
+  await applyPendingReplace(state);
   if (!state.runId) state.runId = crypto.randomUUID();
   // Memory is not a receipt: a previous write may have failed while leaving the
   // shared object mutated. Retry persistence before ANY tab can adopt this runId
@@ -2076,6 +2076,7 @@ async function readRepairSource(job, provider, full = true) {
 /** The page's completed source for the leg's run (read-only), one operation in the tab queue. */
 async function readPageSource(job, provider) {
   const state=job.states[provider];
+  await applyPendingReplace(state);
   if(!state.tabId)return null;
   const result=await askPage(state.tabId,tabMessage(job,provider,"ashlar-repair-source"),contentFiles(provider));
   const source=result?.source;
@@ -2117,6 +2118,7 @@ async function commitCapture(job, provider, jobs) {
   if(jobs[job.jobId]!==job)return false;
   const state=job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`, saved=state.sourceCapture;
   if(!saved?.id)return false;
+  await applyPendingReplace(state);
   // Server archive success and local receipt persistence are the durability
   // barrier for repair. Page revalidation is only cleanup authorization.
   if(!sourceArchiveDurable(state)) {
@@ -2174,6 +2176,7 @@ async function commitRepairReceipt(job, provider, jobs) {
   if(jobs[job.jobId]!==job)return false;
   const state=job.states[provider], attempt=state.repairAttempt;
   if(!state.repairReceiptPending || !attempt?.raw || !attempt.text)return false;
+  await applyPendingReplace(state);
   // A prior outbox write may have failed after mutating the shared registry.
   // Re-establish durability on EVERY receipt retry, before notifying the page.
   await saveJobs(jobs);
@@ -2858,9 +2861,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 });
 chrome.tabs.onUpdated?.addListener((id, change) => noteTabUpdated(id, change));
-chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
+chrome.tabs.onRemoved.addListener((id, info) => rememberClosedTab(id, info));
 // Top level like the others, so a replace (never followed by onRemoved) also wakes a stopped worker.
-chrome.tabs.onReplaced.addListener((added, removed) => void rekeyReplacedTab(added, removed).catch(() => {}));
+chrome.tabs.onReplaced.addListener((added, removed) => rekeyReplacedTab(added, removed));
 chrome.runtime.onInstalled.addListener(loop);
 chrome.runtime.onStartup.addListener(loop);
 void clearCommittedMaintenanceOnWorkerStart();

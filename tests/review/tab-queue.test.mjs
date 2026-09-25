@@ -308,3 +308,143 @@ test('a capture commit and the next tick\'s harvest of the same leg never interl
   assert.deepEqual(b.closedTabs, [10], 'closed once');
   assert.equal(b.session.state['ashlar:tab:10'], undefined, 'no owned record survives the closed tab');
 });
+
+// ── Chrome's events inside an operation (commit 6): a replace, a close, a navigation or a discard
+// reported while an operation runs is applied by its own operation after it (the re-key, the
+// removal), and the operation itself checks the synchronously kept facts (liveTabId) before it reads
+// an id as absent.
+
+// W7: the inventory read the tab list before a replace A -> B. Its re-key (which moves the preserved
+// record to B) runs after the inventory's own drops, so the record is never taken for a gone tab's.
+test('an inventory that read the tab list before a replace keeps the preserved record, under the new id', async () => {
+  const backstop = 'ashlar:preserved:job-A:chatgpt:run-A';
+  const b = worker(leg({tabId: 10, started: true, delivered: true, cleanupDone: true}), {session: storage({[backstop]: {tabId: 10}}),
+    tab: {id: 10, url: 'https://chatgpt.com/c/users-own', status: 'complete'},
+    handler: (_id, m) => (m.type === 'ashlar-tab-status' ? {ok: true, ownershipProtocol: 1, jobId: 'job-A', runId: 'run-A', provider: 'chatgpt', released: true, url: 'https://chatgpt.com/c/users-own'} : {ok: true})});
+  const query = b.chrome.tabs.query;
+  let fired = false;
+  b.chrome.tabs.query = async filter => {
+    const tabs = await query(filter);
+    if (!fired && !filter?.url) {
+      fired = true;
+      b.tabs.delete(10);b.tabs.set(11, {id: 11, url: 'https://chatgpt.com/c/users-own', status: 'complete'});
+      b.context.rekeyReplacedTab(11, 10);
+      // (Before the queue, the re-key ran beside the inventory and could finish before its drops.)
+      await until(() => b.session.state[backstop]?.tabId === 11, 200);
+    }
+    return tabs;
+  };
+  await b.context.refreshTabInventory();
+  await b.queueIdle();
+  assert.ok(fired);
+  assert.deepEqual(b.session.state[backstop], {tabId: 11}, 'the preserved record follows the tab, never dropped as stale');
+});
+
+// Q2: each operation shape, with a replace, a close, a navigation to the user's own conversation, or a
+// discard fired just before its k-th chrome call (tabs or session storage), for every k. After the
+// worker settles: the leg names the live id; a replaced tab is never read as absent; no owned record
+// is left for a closed tab; a tab whose page moved before the close's own re-check of its URL is never
+// removed (a move after that re-check is the O1 window of milliseconds); no fresh run starts in a tab
+// off its new chat (a run message that races a move is refused by the page, json.js, and never counts
+// as started).
+const CONV = 'https://chatgpt.com/c/managed', OWN = 'https://chatgpt.com/c/users-own';
+const Q2_SHAPES = {
+  'a dispatching poll': {kinds: ['poll'], state: {started: false}, url: TEMP},
+  'a harvesting poll': {kinds: ['poll'], state: {started: true, pageUrl: CONV}, url: CONV},
+  'a closing release': {kinds: ['release'], state: {started: true, delivered: true, cleanupPending: true, answerDelivered: true, outcome: {ok: true, raw: '{}'}, conversation: CONV, pageUrl: CONV}, url: CONV},
+  'a preserving release': {kinds: ['release'], state: {started: true, delivered: true, cleanupPending: true, answerDelivered: true, outcome: {ok: true, raw: '{}'}, conversation: CONV, pageUrl: CONV}, url: CONV, takenOver: true},
+  'the inventory': {kinds: ['inventory', 'probe'], state: {started: true, pageUrl: CONV}, url: CONV},
+  'a capture commit': {kinds: ['captureCommit'], state: {started: true, pageUrl: CONV, observation: {state: 'response_completed_json_invalid', text: TEXT}}, url: CONV, capture: true},
+};
+function q2World(shape, perturb) {
+  const b = worker({...leg({tabId: 10, runId: 'run-A', ...shape.state}), ...(shape.capture ? {captureProtocol: 1} : {})},
+    {session: createdHere(), tab: {id: 10, url: shape.url, status: 'complete'}});
+  const page = {bound: shape.state.started, navigated: false, live: 10};
+  const violations = [];
+  const answer = (id, m) => {
+    const tab = b.tabs.get(id);
+    const unbound = {jobId: '', runId: '', provider: 'chatgpt'};
+    if (page.navigated) {
+      return m.type === 'ashlar-tab-status' ? {ok: true, ownershipProtocol: 1, ...unbound, released: false, url: tab.url}
+        : m.type === 'ashlar-run' && !m.resume ? {ok: false, code: 'taken_over', cause: 'navigated', ...unbound} : {ok: false, code: 'job_mismatch', ...unbound};
+    }
+    if (m.type === 'ashlar-tab-status') return {ok: true, ownershipProtocol: 1, jobId: page.bound ? 'job-A' : '', runId: page.bound ? 'run-A' : '', provider: 'chatgpt', released: false, url: tab.url};
+    if (m.type === 'ashlar-run') { if (!page.bound && !m.resume) page.bound = true; return {ok: false, code: 'busy', retry: true}; }
+    if (m.type === 'ashlar-harvest') return page.bound ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle', ...unbound};
+    if (m.type === 'ashlar-repair-source') return {ok: true, source: pageSource};
+    if (m.type === 'ashlar-capture-accepted') return {ok: true, accepted: true};
+    if (m.type === 'ashlar-can-close' || m.type === 'ashlar-fix-cancel') {
+      return shape.takenOver ? {ok: true, releaseProtocol: 1, ownership: 'takenOver', cause: 'user_turn', url: tab.url, conversation: CONV}
+        : {ok: true, releaseProtocol: 1, ownership: 'owned', url: tab.url, conversation: CONV};
+    }
+    return {ok: true};
+  };
+  b.chrome.tabs.sendMessage = (id, msg, cb) => {
+    b.messages.push({id, ...msg});
+    const tab = b.tabs.get(id);
+    if (msg.type === 'ashlar-run' && !msg.resume && tab && !b.context.samePage(tab.url, TEMP)) page.runOffNewChat = true;
+    if (!tab || tab.discarded) { b.chrome.runtime.lastError = {message: tab ? 'Could not establish connection. Receiving end does not exist.' : `No tab with id: ${id}.`};cb();b.chrome.runtime.lastError = null;return; }
+    cb({jobId: msg.jobId, runId: msg.runId, provider: msg.provider, ...answer(id, msg)});
+  };
+  b.chrome.scripting.executeScript = async ({target}) => { if (!b.tabs.get(target.tabId) || b.tabs.get(target.tabId).discarded) throw new Error('Cannot access contents of the page'); };
+  b.chrome.tabs.reload = async id => { const tab = b.tabs.get(id); if (tab) Object.assign(tab, {discarded: false, status: 'complete'}); };
+  const remove = b.chrome.tabs.remove;
+  b.chrome.tabs.remove = async id => { if (page.navigated && page.navigatedAt <= page.lastGet) violations.push(`removed the user's tab ${id}`); return remove(id); };
+  b.context.api = (orig => async (path, body, ...rest) => { await orig(path, body, ...rest); return captureApi(path, body); })(b.context.api);
+  // The k-th chrome call inside an operation of the shape's kinds: the event fires just before it.
+  let calls = 0;
+  const counted = (target, name) => {
+    const real = target[name];
+    target[name] = (...args) => {
+      if (shape.kinds.includes(vm.runInContext('activeOp?.kind', b.context))) {
+        if (++calls === perturb?.k) { page.firedAt = calls; perturb.fire(b, page); }
+        if (target === b.chrome.tabs && name === 'get') page.lastGet = calls;
+      }
+      return real.apply(target, args);
+    };
+  };
+  for (const name of ['get', 'query', 'sendMessage', 'create', 'remove', 'reload']) counted(b.chrome.tabs, name);
+  for (const name of ['get', 'set', 'remove']) counted(b.session, name);
+  b.calls_ = () => calls;
+  b.violations = violations;
+  b.page = page;
+  return b;
+}
+const Q2_EVENTS = {
+  replace: (b, page) => { const tab = b.tabs.get(page.live); if (!tab) return; b.tabs.delete(tab.id);page.live = tab.id + 100;b.tabs.set(page.live, {...tab, id: page.live});page.replaced = tab.id;b.context.rekeyReplacedTab(page.live, tab.id); },
+  close: (b, page) => { if (!b.tabs.has(page.live)) return; b.tabs.delete(page.live);page.closed = page.live;b.context.rememberClosedTab(page.live, {isWindowClosing: false}); },
+  navigate: (b, page) => { const tab = b.tabs.get(page.live); if (!tab) return; tab.url = OWN;page.navigated = true;page.navigatedAt = page.firedAt ?? Infinity;page.boundBefore = page.bound;b.context.noteTabUpdated(tab.id, {url: OWN}); },
+  discard: (b, page) => { const tab = b.tabs.get(page.live); if (!tab) return; Object.assign(tab, {discarded: true, status: 'unloaded'}); },
+};
+async function settle(b) {
+  const RealDate = Date;let shift = 0;
+  b.context.Date = class extends RealDate { static now() { return RealDate.now() + shift; } };
+  for (let i = 0; i < 5; i++) { await b.tick();await b.queueIdle();shift += 3 * 60_000; }
+}
+for (const [what, shape] of Object.entries(Q2_SHAPES)) {
+  test(`Q2: ${what}, with a replace, a close, a navigation or a discard before any of its chrome calls, holds every invariant`, async () => {
+    const base = q2World(shape);
+    await base.tick();await base.queueIdle();
+    const total = base.calls_();
+    assert.ok(total > 0, `sanity: ${what} ran (${total} chrome calls)`);
+    const found = [];
+    for (const [event, fire] of Object.entries(Q2_EVENTS)) {
+      for (let k = 1; k <= total; k++) {
+        const b = q2World(shape, {k, fire});
+        await settle(b);
+        const page = b.page, state = b.pending()?.states.chatgpt;
+        const history = (state?.workerEvents || []).map(e => e.stage);
+        const bad = [...b.violations];
+        if (page.replaced !== undefined) {
+          if (state && !state.cleanupDone && state.tabId !== page.live) bad.push(`leg names ${state.tabId}, live ${page.live}`);
+          if (history.includes('tab_lost') || b.calls.some(c => c.action === 'failure' && /^tab_closed/.test(c.error || ''))) bad.push('replaced tab read as absent');
+        }
+        if (page.closed !== undefined && b.session.state[`ashlar:tab:${page.closed}`]) bad.push('owned record left for the closed tab');
+        if (page.navigated && !page.boundBefore && state?.started === true) bad.push('a run refused off its new chat counted as started');
+        if (page.navigated && !page.boundBefore && (b.closedTabs.length || page.bound)) bad.push('a fresh run started, or its tab closed, off its new chat');
+        if (bad.length) found.push(`${event}@${k}: ${[...new Set(bad)].join('; ')}`);
+      }
+    }
+    assert.deepEqual(found, []);
+  });
+}

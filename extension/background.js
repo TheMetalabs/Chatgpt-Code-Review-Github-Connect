@@ -827,12 +827,20 @@ function preserveCauses() {
   return ["navigated", "user_turn", "edited", "draft", "ownership_unknown", "unreachable", "other_binding", "unknown"];
 }
 
+/** Whether a leg ever had a tab, or may have one: an id it opened or adopted, a dispatched run, a
+ * tab_created step (the id may have been dropped since), or a create whose outcome is unknown
+ * (allocating). A leg with none of these (a usage limit before allocation, cancelled while it
+ * waited for capacity, a create that failed) never had a tab. */
+function legHadTab(state) {
+  return Boolean(state.tabId || state.started || state.allocating || state.workerEvents?.some(event => event.stage === "tab_created"));
+}
+
 /** `cause` (a preserved tab only): why the tab was kept, recorded as preserve_<cause> just before
  * tab_preserved so review history says why (the cleanup note is dropped with the retired job).
  * Any other end is tab_closed only when the worker itself closed the tab (closeProvenTab marks
  * closeIssued before its remove, so a worker that stops right after it still says so); a tab that is
- * gone otherwise (the user or the browser closed it, Chrome replaced it, it was never opened, or it
- * is no longer found) is tab_lost. */
+ * gone otherwise (the user or the browser closed it, Chrome replaced it, its creation is unknown, or
+ * it is no longer found) is tab_lost. A leg that never had a tab (legHadTab) records no tab step. */
 async function finishTabCleanup(job, provider, jobs, reason, cause) {
   const state = job.states[provider];
   state.cleanupDone = true;
@@ -841,7 +849,7 @@ async function finishTabCleanup(job, provider, jobs, reason, cause) {
     state.preserveCause = preserveCauses().includes(cause) ? cause : "unknown";
     workerStep(job, provider, `preserve_${state.preserveCause}`);
   }
-  workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : state.closeIssued === true ? "tab_closed" : "tab_lost");
+  if (legHadTab(state)) workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : state.closeIssued === true ? "tab_closed" : "tab_lost");
   if (reason) state.cleanupNote = reason;
   delete state.cleanupError;
   delete state.cleanupWaitReason;
@@ -876,10 +884,12 @@ function cleanupProvider(job, provider, jobs) {
 async function cleanupProviderBody(job, provider, jobs) {
   const state = job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`;
   if (capturePersistence.has(key) || (!state.delivered && !sourceArchiveDurable(state)) || state.cleanupDone || state.repairReceiptPending) return;
+  // No tab id and no run: nothing to look up or close (a leg that never had a tab ends with no tab
+  // step at all, not even cleanup_pending: its last step stays what happened to its result).
+  if (!state.tabId && !state.started) return finishTabCleanup(job, provider, jobs);
   state.cleanupPending = true;
   workerStep(job,provider,"cleanup_pending");
   await saveJobs(jobs);
-  if (!state.tabId && !state.started) return finishTabCleanup(job, provider, jobs);
   if ((await chrome.storage.session.get([closedKey(job, provider)]))[closedKey(job, provider)]) {
     return finishTabCleanup(job, provider, jobs, "already closed");
   }

@@ -302,16 +302,19 @@ test('worker status lists the recently retired legs (closed and preserved) with 
 });
 
 // ── tab_lost (#82 step 0): tab_closed in review history says the worker closed the tab. A tab that is
-// gone otherwise (the user or the browser closed it, it was never opened, or it can no longer be
+// gone otherwise (the user or the browser closed it, its creation is unknown, or it can no longer be
 // found) ends as tab_lost: a leg whose tab Chrome replaced was recorded as closed while it leaked.
+// A leg that never had a tab records no tab step at all (a tab that never existed was not lost).
 // (spread: the stages come from the worker's realm)
 const historyOf = b => [...(b.pending() ? stagesOf(b.pending().states.chatgpt.workerEvents) : uploaded(b))].filter(stage => /^worker:tab_(closed|lost|preserved)$/.test(stage));
 const unableToEdit = () => { throw new Error('Tabs cannot be edited right now (user may be dragging a tab).'); };
 for (const kind of ['review', 'fix']) {
+  const cancelledBeforeATab = {delivered: true, cleanupPending: true, abandoned: true, abandonedAs: 'cancelled', started: false, tabId: undefined};
   const ABSENT = [
     ['an abandoned leg whose tab is gone', {delivered: true, cleanupPending: true, abandoned: true, abandonedAs: 'cancelled'}, 'cancelled'],
     ['a leg whose tab a sweep confirmed absent (closeRequested, never closed by the worker)', {...secured(kind), closeRequested: true}, 'awaiting_chat'],
-    ['a leg that never opened a tab', {delivered: true, cleanupPending: true, started: false, tabId: undefined, outcome: {ok: false, code: 'quota', error: 'usage limit'}}, 'awaiting_chat'],
+    ['a leg cancelled while its tab creation outcome was unknown (allocating)', {...cancelledBeforeATab, allocating: true}, 'cancelled'],
+    ['a leg whose tab id was dropped after it opened a tab', {...cancelledBeforeATab, workerSequence: 1, workerEvents: [{source: 'worker', sequence: 1, stage: 'tab_created', at: 1}]}, 'cancelled'],
   ];
   for (const [what, state, status] of ABSENT) {
     test(`${kind}: ${what} retires as tab_lost, not tab_closed`, async () => {
@@ -322,6 +325,23 @@ for (const kind of ['review', 'fix']) {
       assert.equal((b.local.state.bridgeRecentRetired || []).find(entry => entry.jobId === leg(kind).jobId)?.stage, 'tab_lost');
     });
   }
+  test(`${kind}: a leg cancelled while it waited for capacity (it never had a tab) retires with no tab step`, async () => {
+    const b = worker(leg(kind, cancelledBeforeATab, {serverStatus: 'cancelled'}), {status: 'cancelled', tab: null});
+    await b.tick();
+    assert.equal(b.pending(), undefined, 'retired');
+    assert.deepEqual([...uploaded(b)].filter(stage => /^worker:(tab_|cleanup_)/.test(stage)), [], 'no tab_lost (nor cleanup_pending) for a tab that never existed');
+    assert.doesNotMatch((b.local.state.bridgeRecentRetired || []).find(entry => entry.jobId === leg(kind).jobId)?.stage ?? '-', /^(tab_|cleanup_)/);
+  });
+  test(`${kind}: a leg that hit a usage limit before it opened a tab retires with no tab step; its last step is its saved result`, async () => {
+    const b = worker(leg(kind, {started: false, tabId: undefined}), {tab: null});
+    b.local.state.quota = {chatgpt: Date.now() + 60 * 60_000};
+    for (let i = 0; i < 4 && b.pending(); i++) await b.tick();
+    assert.equal(b.pending(), undefined, 'retired');assert.equal(b.tabs.size, 0, 'no tab was opened');
+    assert.ok(b.calls.some(call => call.action === 'failure' && /^quota:/.test(call.error)), 'the usage limit reached the server');
+    assert.deepEqual([...uploaded(b)].filter(stage => /^worker:(tab_|cleanup_)/.test(stage)), [], 'no tab_lost (nor cleanup_pending) for a tab that never existed');
+    assert.equal(uploaded(b).at(-1), 'worker:result_saved');
+    assert.equal((b.local.state.bridgeRecentRetired || []).find(entry => entry.jobId === leg(kind).jobId)?.stage, 'result_saved');
+  });
   test(`${kind}: a tab the user closed retires as tab_lost`, async () => {
     const b = worker(leg(kind, secured(kind)), {session: createdHere(kind), handler: () => owned});
     await b.closeTab(10);

@@ -54,3 +54,19 @@ then be deleted, so they are handed over:
 - #77 adds no new lifecycle abstractions: no new modules, record types or cross-cutting helpers for
   tab identity, verdicts or journals.
 - A finding in a section 1 or section 3 class gets a reply pointing to this document.
+
+## 5. Practical scope (#77 and #85)
+
+This is the user's rule. #77 and #85 judge findings the same way.
+
+- **In scope.** Review findings are fixed until the loop works in real use: real users on the real
+  provider pages.
+- **Out of scope.** A finding is out of scope when it only happens in an unrealistic interleaving.
+  Examples:
+  - a user action timed to within a second of a poll or a send;
+  - several rare coincidences that must all happen at once.
+- **What an out-of-scope finding gets.**
+  - A thread reply that cites this section, not a code change.
+  - A Tab Lease trace in #82, so the lifecycle model covers the finding.
+- **Cheap, safe fixes are still taken**, even when the finding is out of scope. A cheap, safe fix is
+  small and local, and it comes with a regression test that fails without it (section 4).

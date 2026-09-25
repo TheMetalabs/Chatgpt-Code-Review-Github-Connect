@@ -339,6 +339,23 @@ test('an inventory that read the tab list before a replace keeps the preserved r
   assert.ok(fired);
   assert.deepEqual(b.session.state[backstop], {tabId: 11}, 'the preserved record follows the tab, never dropped as stale');
 });
+// I3: the inventory waited in the queue, Chrome reported a replace A -> B meanwhile, and its re-key
+// queued behind the inventory. The inventory's tab list shows B, not A: the record still under A
+// names a tab that lives on (liveTabId), never a gone one, so the re-key finds it and moves it.
+test('an inventory that runs before a queued re-key keeps the preserved record of the replaced tab, under the new id', async () => {
+  const backstop = 'ashlar:preserved:job-A:chatgpt:run-A';
+  const b = worker(leg({tabId: 10, started: true, delivered: true, cleanupDone: true}), {session: storage({[backstop]: {tabId: 10}}),
+    tab: {id: 10, url: 'https://chatgpt.com/c/users-own', status: 'complete'}, handler: () => ({ok: true})});
+  let release;
+  const held = b.op(() => new Promise(resolve => { release = resolve; }));
+  assert.ok(await until(() => release), 'the queue is held');
+  const inventory = b.context.refreshTabInventory();
+  b.tabs.delete(10);b.tabs.set(11, {id: 11, url: 'https://chatgpt.com/c/users-own', status: 'complete'});
+  b.context.rekeyReplacedTab(11, 10); // its re-key queues behind the inventory
+  release();
+  await held;await inventory;await b.queueIdle();
+  assert.deepEqual(b.session.state[backstop], {tabId: 11}, 'the preserved record follows the tab, never dropped as stale');
+});
 
 // Q2: each operation shape, with a replace, a close, a navigation to the user's own conversation, or a
 // discard fired just before its k-th chrome call (tabs or session storage), for every k. After the

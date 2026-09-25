@@ -741,9 +741,11 @@ async function refreshTabInventoryBody() {
   for(const id of tabOwners.keys())if(!live.has(id))invalidateTabInventory(id);
   // Removed IDs need no permanent tombstone once their single-flight probe ended.
   for(const id of tabEpochs.keys())if(!live.has(id) && !inventoryLanes.has(id)){tabEpochs.delete(id);inventoryUpgrades.delete(id);}
-  // A preserved record whose tab is gone has nothing left to release.
+  // A preserved record whose tab is gone has nothing left to release. An id Chrome reported replaced
+  // is never read as absent (I3): its re-key, which may still wait behind this operation, moves the
+  // record to the live id, and a later inventory judges that one.
   const session=await chrome.storage.session.get(null);
-  const stale=Object.entries(session).filter(([key,value])=>key.startsWith(PRESERVED_PREFIX) && Number.isInteger(value?.tabId) && !live.has(value.tabId)).map(([key])=>key);
+  const stale=Object.entries(session).filter(([key,value])=>key.startsWith(PRESERVED_PREFIX) && Number.isInteger(value?.tabId) && !live.has(value.tabId) && liveTabId(value.tabId)===value.tabId).map(([key])=>key);
   if(stale.length)await chrome.storage.session.remove(stale);
   return tabs.filter(probeable).map(tab=>tab.id);
 }

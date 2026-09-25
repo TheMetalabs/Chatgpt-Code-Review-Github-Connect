@@ -192,14 +192,21 @@ function unanchoredBlock(unanchored: Finding[]): string {
 function reviewersLine(job: SummaryJob): string {
   const providers = (job.reviewProviders ?? []) as ReviewProvider[];
   const chat = providers.filter((p) => p === "chatgpt" || p === "grok");
+  if (job.localFallbackAt) return fallbackReviewersLine(job, chat, providers.includes("local"));
   const local = !providers.includes("local")
     ? ""
-    : job.localFallbackAt
-      ? " Local LLM ran as the fallback."
-      : job.localReviewRole === "verify-clean" && chat.length
-        ? " Local LLM verifies a clean chat result."
-        : " Local LLM is fallback if Chrome does not return.";
+    : job.localReviewRole === "verify-clean" && chat.length
+      ? " Local LLM verifies a clean chat result."
+      : " Local LLM is fallback if Chrome does not return.";
   return `${chat.length ? `${chat.join(" + ")} ran in parallel.` : ""}${local}`;
+}
+
+/** A fallback release exists only because chat did not return, so the line names what actually ran:
+ * a chat reviewer listed as skipped did not run (its skipped note says so), and one that did (the
+ * fallback failed and chat was awaited again) is not claimed to have run in parallel with local. */
+function fallbackReviewersLine(job: SummaryJob, chat: ReviewProvider[], local: boolean): string {
+  const ran = chat.filter((p) => !(job.skippedProviders ?? []).includes(p));
+  return [ran.length ? `${ran.join(" + ")} ran.` : "", local ? "Local LLM ran as the fallback." : ""].filter(Boolean).join(" ");
 }
 
 function findingsBody(job: SummaryJob, p: SummaryParts, findings: Finding[], username: string, unanchored: Finding[]): string {

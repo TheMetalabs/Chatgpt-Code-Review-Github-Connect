@@ -12,11 +12,32 @@ describe("review-format", () => {
         "ashlar-bot",
       );
     const fallback = findingJob({ localFallbackAt: 1, skippedProviders: ["chatgpt"] });
-    assert.match(fallback, /\nchatgpt ran in parallel\. Local LLM ran as the fallback\.\n/);
+    assert.match(fallback, /\nLocal LLM ran as the fallback\.\n/);
     assert.doesNotMatch(fallback, /verifies a clean chat result/);
     // only a job that was not released as the fallback is described by its verify-clean role
-    assert.match(findingJob({}), / Local LLM verifies a clean chat result\./);
-    assert.match(findingJob({ localVerifyStartedAt: 1 }), / Local LLM verifies a clean chat result\./);
+    assert.match(findingJob({}), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat result\.\n/);
+    assert.match(findingJob({ localVerifyStartedAt: 1 }), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat result\.\n/);
+  });
+
+  it("a fallback release names only the chat reviewers that ran, never a skipped one as running in parallel", () => {
+    const line = (patch: Record<string, unknown>) =>
+      reviewSummaryBody(
+        { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok", "local"], localReviewRole: "verify-clean", localFallbackAt: 1, assumptions: [], coverage: [], ...patch },
+        [{ ...FINDING_412, id: "f1" }],
+        "ashlar-bot",
+      ).split("\n").find((l) => l.includes("Local LLM"));
+    // chat unavailable: the fallback is the only reviewer that ran; the skipped note names chat
+    assert.equal(line({ skippedProviders: ["chatgpt", "grok"] }), "Local LLM ran as the fallback.");
+    assert.equal(line({ skippedProviders: ["grok"] }), "chatgpt ran. Local LLM ran as the fallback.");
+    // the fallback failed and chat was awaited again: chat ran, but not in parallel with a verifier
+    assert.equal(line({ skippedProviders: ["local"] }), "chatgpt + grok ran. Local LLM ran as the fallback.");
+    // race keeps its wording, skipped chat included
+    const race = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local"], localReviewRole: "race", skippedProviders: ["chatgpt"], assumptions: [], coverage: [] },
+      [{ ...FINDING_412, id: "f1" }],
+      "ashlar-bot",
+    );
+    assert.match(race, /\nchatgpt ran in parallel\. Local LLM is fallback if Chrome does not return\.\n/);
   });
 
   it("surfaces a salvaged raw review in the body and is not a clean pass", () => {

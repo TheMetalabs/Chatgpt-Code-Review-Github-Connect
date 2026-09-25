@@ -58,9 +58,16 @@ async function newJobAfter(app,id,delivery){
 
 // expect: status, skip (regex or undefined), requests (total local requests), reviews, aborted, and
 // optionally body (regex), clean (the review is a clean pass: the clean first line and CONVERGED) and
-// local (the role the findings body's reviewers line gives local: its release, not the configured role).
+// reviewers (the findings body's exact reviewers line: local's release, not its configured role, and
+// only the chat reviewers that ran).
+// The findings body's reviewers line: held (verify-clean), released as the fallback while chat was
+// unavailable (chat never ran, so it is not named as running), and a failed fallback after which chat
+// was awaited again and ran.
+const VERIFIER='chatgpt ran in parallel. Local LLM verifies a clean chat result.';
+const FALLBACK_ONLY='Local LLM ran as the fallback.';
+const CHAT_AFTER_FALLBACK='chatgpt ran. Local LLM ran as the fallback.';
 const ROWS=[
-  {name:'L1 chat findings: local stays held and never runs',expect:{status:'posted',requests:0,reviews:1,local:'verifier'},
+  {name:'L1 chat findings: local stays held and never runs',expect:{status:'posted',requests:0,reviews:1,reviewers:VERIFIER},
     async run(t){const s=await start(t);await s.app.harbor.submitHarborChat(s.jobId,dirty);return s;}},
   {name:'L2 chat clean, local verifies clean',expect:{status:'posted',requests:1,reviews:1},
     async run(t){const s=await start(t);await s.app.harbor.submitHarborChat(s.jobId,clean);await answerLocal(s.app,0,res=>res.end(reply(clean)));return s;}},
@@ -107,7 +114,7 @@ const ROWS=[
   {name:'L9 chat unusable, local fallback HTTP 500: skipped',expect:{status:'skipped',requests:1,reviews:0},
     async run(t){const s=await start(t);await s.app.harbor.submitHarborChat(s.jobId,none);await answerLocal(s.app,0,fail500);return s;}},
   // Release of the held local leg happens only on an explicit terminal signal (docs §2).
-  {name:'L10 bridge never connects: released as the fallback once disconnected past the grace',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,local:'fallback'},
+  {name:'L10 bridge never connects: released as the fallback once disconnected past the grace',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,reviewers:FALLBACK_ONLY},
     async run(t){
       const s=await start(t);
       await settle();assert.equal(s.app.localRequests.length,0,'held within the bridge grace period');
@@ -117,7 +124,7 @@ const ROWS=[
       assert.ok(s.job().localFallbackAt&&!s.job().localVerifyStartedAt,'released as the fallback, not a verification');
       return s;
     }},
-  {name:'L11 chat reports an explicit quota failure: released as the fallback',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,local:'fallback'},
+  {name:'L11 chat reports an explicit quota failure: released as the fallback',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,reviewers:FALLBACK_ONLY},
     async run(t){
       const s=await start(t);
       s.app.bridge.bridgeHeartbeat();
@@ -146,7 +153,7 @@ const ROWS=[
       s.app.harbor.cancelHarborJob(s.jobId);
       return s;
     }},
-  {name:'L13 a bridge token rotation waits the grace from the rotation, not from an older unseen bridge',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,local:'fallback'},
+  {name:'L13 a bridge token rotation waits the grace from the rotation, not from an older unseen bridge',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,reviewers:FALLBACK_ONLY},
     async run(t){
       // Job A is admitted while the bridge has never been seen, then the bridge connects and stays
       // healthy for hours: that old unseen spell must not date a later disconnect.
@@ -189,7 +196,7 @@ const ROWS=[
     }},
   // The waiver lasts only while the fallback can still deliver: once local ends with no payload, chat
   // is the only reviewer left and is awaited again (fresh work included), never a skip.
-  {name:'L16 the fallback fails after the bridge reconnects: chat is awaited and offered again, and its review posts once',expect:{status:'posted',requests:1,reviews:1,body:/- Skipped local[\s\S]*ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 /,local:'fallback'},
+  {name:'L16 the fallback fails after the bridge reconnects: chat is awaited and offered again, and its review posts once',expect:{status:'posted',requests:1,reviews:1,body:/- Skipped local[\s\S]*ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 /,reviewers:CHAT_AFTER_FALLBACK},
     async run(t){
       const s=await start(t);
       await settle();
@@ -211,7 +218,7 @@ const ROWS=[
       assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
       return s;
     }},
-  {name:'L17 the fallback fails while a chat run still holds its claim: that run is awaited and its review posts once',expect:{status:'posted',requests:1,reviews:1,body:/- Skipped local[\s\S]*ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 /,local:'fallback'},
+  {name:'L17 the fallback fails while a chat run still holds its claim: that run is awaited and its review posts once',expect:{status:'posted',requests:1,reviews:1,body:/- Skipped local[\s\S]*ashlar-findings total=1 inline=1 body=0 p0=0 p1=1 /,reviewers:CHAT_AFTER_FALLBACK},
     async run(t){
       const s=await start(t);
       s.app.bridge.bridgeHeartbeat();
@@ -270,8 +277,7 @@ for(const row of ROWS){
     assert.equal(app.localRequests.length,e.requests,'local requests');
     assert.equal(app.reviews.length,e.reviews,'reviews posted');
     if(e.body)assert.match(app.reviews[0].body,e.body,'review body');
-    if(e.local)assert.match(app.reviews[0].body,e.local==='fallback'?/ Local LLM ran as the fallback\./:/ Local LLM verifies a clean chat result\./,'reviewers line: local\'s role');
-    if(e.local==='fallback')assert.doesNotMatch(app.reviews[0].body,/verifies a clean chat result/,'a fallback release is never described as verifying chat');
+    if(e.reviewers)assert.equal(app.reviews[0].body.split('\n').find(l=>l.includes('Local LLM')),e.reviewers,'reviewers line');
     if(e.clean){
       const body=app.reviews[0].body;
       assert.equal(body.split('\n')[0],CLEAN_REVIEW_BODY,'a clean pass');

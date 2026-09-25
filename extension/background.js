@@ -451,6 +451,11 @@ const PAGE_REPLY_MS = 15_000;
  * meanwhile fails at once, as the timeout would. Any reply ends it, and so does the tab finishing a
  * load (noteTabUpdated): a new page. */
 const PAGE_BACKOFF_MS = 30_000;
+
+/** A new run message carries `until`: a page that receives it later (a delivery askPage stopped
+ * waiting for) starts nothing (json.js: stale_run). It ends this long before the reply deadline, so
+ * a page that accepts it still answers while the worker waits. */
+const RUN_UNTIL_SLACK_MS = 5_000;
 const pageBackoff = new Map(); // tabId -> the time until which it is not messaged
 
 /** One reply deadline (a function so tests can replace the timer; cancelled once the reply came). */
@@ -1687,10 +1692,10 @@ async function unrecordedTabWait(job, provider, jobs) {
 }
 
 /** Why a page refused a new run message (json.js, before it binds anything): "taken_over" (its tab
- * is not the fresh page the run may start on); "" when it did not refuse. A refusal comes from an
- * unbound page, so it never names this run. */
+ * is not the fresh page the run may start on), "stale_run" (it arrived after its `until`); "" when
+ * it did not refuse. A refusal comes from an unbound page, so it never names this run. */
 function refusedRun(result, job, provider) {
-  return !matchesJob(result, job, provider) && result?.ok === false && result.code === "taken_over" ? result.code : "";
+  return !matchesJob(result, job, provider) && result?.ok === false && ["taken_over", "stale_run"].includes(result.code) ? result.code : "";
 }
 
 /** A new run whose tab stopped being the fresh page it was opened on before its prompt was sent (X2,
@@ -1837,8 +1842,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   try {
     if (!state.started && !observeOnly) {
       // The page runner deduplicates a retried start when its acknowledgement was lost (or late:
-      // askPage gives up on it, and the next tick asks again).
-      result = await askPage(state.tabId, run, contentFiles(provider));
+      // askPage gives up on it, and the next tick asks again). A copy that reaches an unbound page
+      // after `until` starts nothing there (X4, #85).
+      result = await askPage(state.tabId, {...run, until: Date.now() + PAGE_REPLY_MS - RUN_UNTIL_SLACK_MS}, contentFiles(provider));
       // A page that refused the new run bound nothing: the run was never started.
       if (!refusedRun(result, job, provider)) {
         dispatched = true;
@@ -1866,7 +1872,11 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await discardWaitOver(job, provider, jobs); // a woken page that never answers is bounded too
     return;
   }
-  if (!state.started && refusedRun(result, job, provider) === "taken_over") return takenBeforeSend(job, provider, jobs, result.cause);
+  const refused = state.started ? "" : refusedRun(result, job, provider);
+  if (refused === "taken_over") return takenBeforeSend(job, provider, jobs, result.cause);
+  // The page received the run after its deadline and started nothing: dispatched again next tick,
+  // into the same tab, with a new deadline.
+  if (refused === "stale_run") return;
   if (await discardWaitOver(job, provider, jobs, matchesJob(result, job, provider) && discardedRunProven(result, dispatched))) return;
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
     state.connectionError = "original job binding unavailable; waiting for reconnection";

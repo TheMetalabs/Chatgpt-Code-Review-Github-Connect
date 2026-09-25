@@ -124,3 +124,39 @@ test('control: a page already bound to the run is not asked again for its fresh 
   await flush();
   assert.equal(runs, 1);
 });
+
+// X4 (#85): a new run message carries `until`. An unbound page that receives it later (a delivery
+// the worker stopped waiting for) starts nothing: it binds, stores and fences nothing, so the
+// worker's next dispatch of the same run, on time, still starts it.
+for (const provider of ['chatgpt', 'grok']) {
+  for (const [what, until] of [['past its until', () => Date.now() - 1], ['without an until', () => undefined]]) {
+    test(`${provider}: an unbound page refuses a new run ${what} (stale_run): nothing is bound, stored or fenced`, async () => {
+      const persisted = new Map();
+      const c = content(provider, persisted);
+      let runs = 0;
+      c.context.runPrompt = async () => { runs++; return raw; };
+      const run = { type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider, prompt: 'review' };
+      const reply = c.message({ ...run, until: until() });
+      assert.deepEqual({ ok: reply?.ok, code: reply?.code, retry: reply?.retry, jobId: reply?.jobId }, { ok: false, code: 'stale_run', retry: true, jobId: '' });
+      await flush();
+      assert.equal(runs, 0, 'nothing started');
+      assert.deepEqual([...persisted.keys()].filter(key => /^ashlar:(job|run|stopped:)/.test(key)), [], 'nothing bound or fenced');
+      assert.equal(c.message(run)?.code, 'busy', 'the next dispatch, on time, starts the run');
+      await flush();
+      assert.equal(runs, 1);
+      assert.equal(c.context.__ashlarRunnerState.runStopped, false, 'not stopped');
+    });
+  }
+  test(`${provider}: control: a resume, and a copy for the run the page is already bound to, are not held to until`, async () => {
+    const persisted = new Map([['ashlar:job', 'A'], ['ashlar:run', 'run-A']]);
+    const c = content(provider, persisted);
+    let runs = 0;
+    c.context.runPrompt = () => { runs++; return new Promise(() => {}); };
+    const late = { type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider, prompt: 'review', until: Date.now() - 60_000 };
+    assert.equal(c.message({ ...late, resume: true })?.code, 'busy', 'a resume of the bound run observes it');
+    await flush();
+    assert.equal(c.message(late)?.code, 'busy', 'a late copy for the bound run is deduplicated, not refused');
+    await flush();
+    assert.equal(runs, 1);
+  });
+}

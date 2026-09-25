@@ -1125,6 +1125,13 @@ function installReviewRunner(name, run) {
       reply({ok: false, code: "disconnected", error: "original job binding is unavailable"});
       return;
     }
+    // A new run message that arrives after its `until` (a delivery the worker stopped waiting for:
+    // X4, #85) starts nothing: nothing is bound, stored or fenced, and the worker asks again. A
+    // resume, or a copy for the run this page is already bound to, is not a new run.
+    if (!msg.resume && !state.jobId && !(Number(msg.until) >= Date.now())) {
+      reply({ok: false, code: "stale_run", retry: true, error: "the run message arrived after the worker stopped waiting for it; nothing was started"});
+      return;
+    }
     // A new ChatGPT run starts only on the fresh page its tab was opened on (the worker's
     // allocationUrl), with no user turn (X2, #85): a tab the user moved to their own conversation, or
     // sent a message in, before Ashlar's prompt went out is theirs. Nothing is bound, typed or sent

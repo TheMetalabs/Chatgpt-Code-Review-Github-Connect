@@ -1180,3 +1180,64 @@ for (const [provider, url] of [['chatgpt', TEMP], ['chatgpt', 'https://chatgpt.c
     assert.equal(b.calls.some(c => c.action === 'failure'), false);
   });
 }
+
+// X4 (#85): a new run message carries `until`; a page that receives it later starts nothing.
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a run the page refused as stale is not started; the next poll dispatches it once more, into the same tab, with a new until`, async () => {
+    let refuse = true;
+    const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'},
+      handler: (_id, m) => (m.type !== 'ashlar-run' ? {ok: true}
+        : refuse ? {ok: false, code: 'stale_run', retry: true, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'busy', retry: true})});
+    await b.tick();
+    assert.equal(b.pending().states.chatgpt.started, false, 'never counted as dispatched');
+    assert.equal(uploaded(b).includes('worker:run_dispatched'), false);
+    refuse = false;
+    await b.tick();
+    const runs = b.messages.filter(m => m.type === 'ashlar-run');
+    assert.deepEqual(runs.map(m => m.id), [10, 10], 'dispatched again into the same tab, no second tab');
+    assert.ok(runs.every(m => Number.isFinite(m.until) && m.until > Date.now()), 'each carries a deadline ahead');
+    assert.ok(runs[1].until >= runs[0].until);
+    assert.equal(b.pending().states.chatgpt.started, true);
+    assert.deepEqual([...b.tabs.keys()], [10]);
+    assert.equal(b.calls.some(c => c.action === 'failure'), false);
+  });
+}
+// Ashlar 4101623037, both branches: a run message askPage gave up on reaches the page late; an
+// extension reload then clears the record of the tab this session created for the leg. Exactly one
+// prompt is sent across all tabs: the page that received it in time bound the run and is adopted
+// (cdc0cadd); a copy that arrives after its until (here: after the reloaded worker found the tab
+// unbound and opened its own) starts nothing.
+for (const kind of ['review', 'fix']) for (const branch of ['in time, before the reload', 'after its until, once the leg opened its own tab']) {
+  test(`${kind}: a run message delivered late (${branch}) never makes a second prompt`, async () => {
+    let prompts = 0;
+    const pages = new Map();
+    const pageOf = id => {
+      if (!pages.has(id)) { const c = content('chatgpt'); c.context.runPrompt = () => { prompts++; return new Promise(() => {}); }; pages.set(id, c); }
+      return pages.get(id);
+    };
+    const handler = (id, m) => { let reply; pageOf(id).listeners[0](m, {}, r => { reply = r; }); return reply; };
+    const b1 = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler});
+    b1.context.pageReplyDeadline = expiresAtOnce;
+    let late;
+    const send = b1.chrome.tabs.sendMessage;
+    b1.chrome.tabs.sendMessage = (id, msg, cb) => { if (id === 10 && msg.type === 'ashlar-run' && !late) { late = msg; return; } return send(id, msg, cb); };
+    await b1.tick();
+    assert.ok(late && b1.pending().states.chatgpt.started === false, 'the dispatch was given up on');
+    const deliver = () => { pageOf(10).listeners[0](late, {}, () => {}); return flush(); };
+    if (branch.startsWith('in time')) await deliver();
+    // The extension reloads: same registry and tabs, no record of the tab this session created.
+    const b2 = worker(JSON.parse(JSON.stringify(b1.pending())), {session: storage(), tab: b1.tabs.get(10), handler});
+    for (const [id, tab] of b1.tabs) b2.tabs.set(id, tab);
+    for (let i = 0; i < 3; i++) await b2.tick();
+    if (!branch.startsWith('in time')) {
+      const RealDate = Date;
+      pageOf(10).context.Date = class extends RealDate { static now() { return RealDate.now() + 60_000; } };
+      await deliver();
+      await b2.tick();
+    }
+    await flush();
+    assert.equal(prompts, 1, 'exactly one prompt across all tabs');
+    assert.equal(b2.pending().states.chatgpt.started, true);
+    assert.equal(b2.messages.filter(m => m.type === 'ashlar-run' && m.resume !== true).length, branch.startsWith('in time') ? 0 : 1);
+  });
+}

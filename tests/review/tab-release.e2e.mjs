@@ -67,7 +67,9 @@ async function chatTab(t,{provider='chatgpt',url=provider==='grok'?'https://grok
   for(const file of MANIFEST)await page.addScriptTag({content:source('extension/'+(provider==='grok'&&file==='content-chatgpt.js'?'content-grok.js':file))});
  };
  await inject();
- const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId:job,runId:run,provider,...(kind==='fix'?{kind}:{}),...extra});
+ // A run message carries its deadline (until, X4 #85) as the worker's does, on the page's clock.
+ const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>{if(msg.type==='ashlar-run'&&!('until' in msg))msg.until=Date.now()+10_000;receiver(msg,null,resolve);}),
+  {type,jobId:job,runId:run,provider,...(kind==='fix'?{kind}:{}),...extra});
  return {page,served,send,inject,job,run,provider,
   reload:async()=>{await page.reload();await inject();},
   steps:()=>page.evaluate(key=>JSON.parse(sessionStorage.getItem(key)||'{"events":[]}').events.map(e=>e.stage),`ashlar:steps:${job}:${run}`),

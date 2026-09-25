@@ -42,9 +42,11 @@ export function content(provider = 'chatgpt', persisted = new Map()) {
   context.replyDoneVisible = () => false;
   context.assistantCorpus = () => [raw];
   context.quotaHit = () => false;
-  // A run message carries the page it may start on, as the worker's does (a row that tests the
-  // fresh-page check names its own).
-  const stamp = msg => (msg?.type === 'ashlar-run' && !('allocationUrl' in msg) ? {...msg, allocationUrl: allocationUrl(provider)} : msg);
+  // A run message carries the page it may start on and its deadline, as the worker's does (a row
+  // that tests the fresh-page check or the deadline names its own).
+  const stamp = msg => (msg?.type === 'ashlar-run'
+    ? {...('allocationUrl' in msg ? {} : {allocationUrl: allocationUrl(provider)}), ...('until' in msg ? {} : {until: vm.runInContext('Date.now()', context) + 10_000}), ...msg}
+    : msg);
   return { context, listeners, message(msg) { let reply; listeners[0](stamp(msg), {}, r => { reply = r; }); return reply; } };
 }
 export function background({ local = storage({ origin: 'http://bridge', token: 'token' }), session = storage(), handler, tabs = new Map(), api } = {}) {

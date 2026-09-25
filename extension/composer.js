@@ -211,6 +211,7 @@ async function stageFixAttachment(file) {
   if (await sha256Hex(await staged.arrayBuffer()) !== file.sha256) throw fixAttachmentFailed("the staged bytes do not match their SHA-256");
   // The stop fence, in the same task as the upload.
   globalThis.throwIfStopped?.();
+  markUploadAlerts();
   const dt = new DataTransfer();
   dt.items.add(staged);
   input.files = dt.files;
@@ -219,15 +220,24 @@ async function stageFixAttachment(file) {
 }
 
 /** Wait until the composer shows the fix attachment's chip with no upload in progress
- * (attachmentsReady, the send barrier's own rule). A chip that never settles within the window is
- * an upload that failed: the run ends (attachment_failed) before any text is typed. */
+ * (attachmentsReady, the send barrier's own rule), held for SETTLE_MS: a chip can render a frame
+ * before its progress ring (the live 1.1.29 run typed and clicked Send 27 ms after the chip showed,
+ * mid-upload, and ChatGPT dropped the click). A chip or toast that reports the upload failed
+ * (uploadFailure), or a chip that never settles within the window, ends the run (attachment_failed)
+ * before any text is typed. */
 async function waitFixAttachmentStaged(name) {
-  const STAGE_MS = 3 * 60 * 1000;
+  const STAGE_MS = 3 * 60 * 1000, SETTLE_MS = 1000;
   const deadline = Date.now() + STAGE_MS;
+  let readySince = null;
   for (;;) {
     globalThis.throwIfStopped?.();
     const form = (typeof composer === "function" ? composer() : null)?.closest("form") || composerFileInput()?.closest("form");
-    if (form && attachmentsReady(form, [name])) return;
+    const failed = uploadFailure(form, [name]);
+    if (failed) throw fixAttachmentFailed(`the page reported the upload of ${name} failed (${failed})`);
+    if (form && attachmentsReady(form, [name])) {
+      readySince ??= Date.now();
+      if (Date.now() - readySince >= SETTLE_MS) return;
+    } else readySince = null;
     if (Date.now() >= deadline) throw fixAttachmentFailed(`${name} was not shown as uploaded within ${STAGE_MS / 60000} minutes`);
     step("attachments_waiting");
     await waitForPageChange(250);
@@ -238,6 +248,7 @@ async function attachFiles(files) {
   if (!files.length) return false;
   const input = composerFileInput();
   if (!input) return false;
+  markUploadAlerts();
   const dt = new DataTransfer();
   for (const f of files) {
     dt.items.add(new File([f.body], f.name, { type: "text/plain" }));
@@ -374,12 +385,65 @@ function fileChipNames(chip) {
   return ["data-file-name", "aria-label", "title"].map(name => chip.getAttribute(name)).filter(name => name !== null);
 }
 
+/** A staged file's chip is still uploading while it (or anything in it) shows progress: a spinner, a
+ * progress ring or bar, a busy or loading state, or an "uploading" label. Read inside the run's own
+ * chips only: the composer's own "Upload files" control is not an upload in progress. */
+function chipUploading(chip) {
+  const busy = '[aria-busy="true"], [role="progressbar"], progress, [aria-valuenow], ' +
+    '[data-state="uploading"], [data-state="loading"], [data-state="pending"], [data-status="uploading"], ' +
+    '[class*="animate-spin"], [class*="spinner" i], [class*="loading" i], [class*="progress" i], ' +
+    '[aria-label*="uploading" i], [aria-label*="loading" i], [aria-label*="업로드 중"], circle[stroke-dashoffset]';
+  if (chip.matches(busy) || [...chip.querySelectorAll(busy)].some(renderedControl)) return true;
+  return /uploading|업로드 중/i.test(chip.innerText ?? chip.textContent ?? "");
+}
+
 function attachmentsReady(form, names = []) {
   if (!form) return names.length === 0;
-  const progress = form.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="uploading"], [class*="animate-spin"]');
+  const progress = form.querySelectorAll('[aria-busy="true"], [role="progressbar"], progress, [data-state="uploading"], [class*="animate-spin"]');
   if ([...progress].some(renderedControl)) return false;
   const chips = fileChips(form).filter(renderedControl);
-  return names.every(name => chips.some(chip => fileChipNames(chip).includes(name)));
+  return names.every(name => {
+    const own = chips.filter(chip => fileChipNames(chip).includes(name));
+    return own.length > 0 && !own.some(chipUploading);
+  });
+}
+
+/** The alerts and toasts on the page that could report an upload's failure. */
+function uploadAlerts() {
+  return [...document.querySelectorAll('[role="alert"], [aria-live="assertive"], [data-testid*="toast" i], [class*="toast" i]')]
+    .filter(renderedControl);
+}
+
+/** Remembered right before a file is staged, so an alert already on the page is never read as that
+ * upload's failure. */
+function markUploadAlerts() {
+  const state = globalThis.__ashlarRunnerState;
+  if (state) state.uploadAlertBaseline = new Set(uploadAlerts());
+}
+
+/** Why the page says a staged upload failed, or null: one of the run's chips in an error state, or an
+ * alert or toast that appeared after the staging and reports an upload or file error (a temporary
+ * chat or a plan that refuses files says so this way). Never a guess from a missing chip: that is
+ * the window's job. */
+function uploadFailure(form, names = []) {
+  if (!names.length) return null;
+  const failedChip = '[data-state="error"], [data-state="failed"], [data-status="error"], [aria-invalid="true"], [role="alert"]';
+  for (const chip of form ? fileChips(form).filter(renderedControl) : []) {
+    if (!names.some(name => fileChipNames(chip).includes(name))) continue;
+    const error = [...chip.querySelectorAll(failedChip)].find(renderedControl) || (chip.matches(failedChip) ? chip : null);
+    const said = (error?.innerText ?? error?.textContent ?? "").replace(/\s+/g, " ").trim();
+    if (error) return `its chip shows an error${said ? `: ${said.slice(0, 160)}` : ""}`;
+  }
+  const baseline = globalThis.__ashlarRunnerState?.uploadAlertBaseline;
+  if (!baseline) return null;
+  const about = /upload|file|attach|업로드|파일|첨부/i;
+  const failed = /fail|unable|could ?n[o']t|can[' ]?no?t|not (?:supported|allowed|available)|error|rejected|실패|없습니다|불가|지원하지/i;
+  for (const alert of uploadAlerts()) {
+    if (baseline.has(alert)) continue;
+    const text = (alert.textContent || "").replace(/\s+/g, " ").trim();
+    if (about.test(text) && failed.test(text)) return text.slice(0, 200);
+  }
+  return null;
 }
 
 function normalizePrompt(text) {
@@ -463,15 +527,31 @@ function step(stage) {
 function actionableSend(button) {
   if (!(button instanceof HTMLElement) || !button.isConnected || button.hidden ||
       button.disabled || button.getAttribute("aria-disabled") === "true") return false;
-  if (!renderedControl(button)) return false;
-  const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("data-testid") || ""}`;
-  return !/stop|abort|중지|停止/i.test(label);
+  if (!renderedControl(button) || !enabledLooking(button)) return false;
+  return !stopLabelled(button);
 }
 
+function stopLabelled(button) {
+  const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("data-testid") || ""}`;
+  return /stop|abort|중지|停止/i.test(label);
+}
+
+/** A control a page disables by styling rather than by `disabled` (the live 1.1.29 Send took a click
+ * during the upload and dropped it): data-disabled, a disabled data-state, or no pointer events. */
+function enabledLooking(button) {
+  const flag = button.getAttribute("data-disabled");
+  if (flag !== null && flag !== "false") return false;
+  if (button.getAttribute("data-state") === "disabled") return false;
+  return getComputedStyle(button).pointerEvents !== "none";
+}
+
+/** The first actionable Send, by selector priority. A rendered Send that is disabled ends the search:
+ * a looser selector must not find some other button to click while the real Send says "not yet". */
 function findEligibleSendButton(selectors) {
   const root = typeof composer === "function" ? composer()?.closest("form") || document : document;
   for (const selector of selectors) for (const button of root.querySelectorAll(selector)) {
     if (actionableSend(button)) return button;
+    if (button instanceof HTMLElement && renderedControl(button) && !stopLabelled(button)) return null;
   }
   return null;
 }
@@ -553,6 +633,12 @@ async function clickSend(findSend, findComposer, expectedText) {
     } else {
       const editor = findComposer(), button = findSend();
       const form = editor?.closest("form");
+      const failed = uploadFailure(form, record.attachments || []);
+      if (failed) {
+        const error = new Error(`the page reported an attachment upload failed (${failed}); nothing was sent`);
+        error.code = "attachment_failed";
+        throw error;
+      }
       const uploadBusy = !attachmentsReady(form, record.attachments || []);
       step(uploadBusy ? "attachments_waiting" : "send_waiting");
       const otherTurn = userTurns().length !== record.baseline;

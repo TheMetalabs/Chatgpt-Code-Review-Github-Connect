@@ -39,6 +39,14 @@ test('submission: a cleared composer or a different user turn is not the owned r
  assert.equal((await page.evaluate(()=>result)).pending,true);assert.equal(await page.evaluate(()=>clicks),1);
 });
 
+test('submission: a rendered but disabled Send stops the search; a looser selector never finds another button',async t=>{
+ const page=await fixture(t,{disabled:true});
+ await page.evaluate(()=>{document.querySelector('form').insertAdjacentHTML('beforeend','<button type="submit" id="other" style="width:40px;height:20px">x</button>');window.composer=()=>document.querySelector('textarea');});
+ assert.equal(await page.evaluate(()=>findEligibleSendButton(['#composer-submit-button','button[type="submit"]'])?.id??null),null);
+ await page.evaluate(()=>{document.querySelector('#composer-submit-button').disabled=false;});
+ assert.equal(await page.evaluate(()=>findEligibleSendButton(['#composer-submit-button','button[type="submit"]']).id),'composer-submit-button');
+});
+
 test('submission: hidden matching controls are skipped in favor of the visible owned form button',async t=>{
  const page=await fixture(t,{hidden:true});
  await page.evaluate(()=>{window.composer=()=>document.querySelector('textarea');});

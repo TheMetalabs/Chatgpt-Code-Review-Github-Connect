@@ -12,8 +12,14 @@ particular button/upload state occurred on the operator's machine.
 The new flow is: persisted job/run identity → composer/attachments → persisted
 send intent → one eligible send click → a new matching user message → response
 observation → local outbox → private server archive → receipt → safe tab cleanup.
-Send selectors enumerate controls, ignore hidden/disabled/Stop buttons, and prefer
-the current composer's form. Upload/send availability has no duration deadline.
+Send selectors enumerate controls, ignore hidden/disabled/Stop buttons (including a
+Send disabled only by styling: `data-disabled`, `pointer-events: none`), prefer the
+current composer's form, and never fall through to a looser selector while the real
+Send is rendered but disabled. A staged file is ready only when its own chip shows no
+progress (spinner, ring, bar, busy/loading state, "uploading" label); a fix attachment
+must also hold that for 1 s, and a chip error or a new upload-error alert/toast ends
+the run as `attachment_failed` before anything is sent. Review upload/send availability
+has no duration deadline; a fix attachment has 3 minutes.
 A click, an empty composer, a Stop control or elapsed time cannot confirm receipt.
 
 Once a click might have reached the site, it is not automatically repeated. A

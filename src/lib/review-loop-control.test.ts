@@ -530,6 +530,22 @@ describe("session identity: one continuation and one handoff per head per SESSIO
     }
   });
 
+  it("a handoff read whose session has no id for its start record keeps the entry's id scope: an older session's row never confirms the unknown handoff", async () => {
+    const f = world(["lost"]);
+    const listed: SessionRef = { at: START, seq: 5 };
+    const key = controlKey(handoff(1, listed).key);
+    assert.equal((await escalateIn(f, listed)).ambiguous, true);
+    // the last session's handoff for the head: posted after alice's directive but before her start
+    // record (id 3 < 5), so it is in her session by time only
+    f.rows.push({ id: 3, userLogin: BOT, body: handoff(1, listed).body as string, createdAt: "2026-02-20T00:00:01Z" });
+    for (const session of [{ at: START }, listed]) {
+      const r = await escalateIn(f, session);
+      assert.deepEqual([r.escalated, r.ambiguous], [false, true], `${JSON.stringify(session)}: ${JSON.stringify(r)}`);
+      assert.equal(ownWrites(f.gh).state(key), "unknown", `${JSON.stringify(session)}: the older row never confirms this session's handoff`);
+    }
+    assert.equal(f.posts(), 1);
+  });
+
   const NEW_SHA = "e".repeat(40); // a fix round's commit
   const ROUND_AT = "2026-02-21T00:00:00Z"; // the review of HEAD, in the session
   /** One PR through the runtime (push handler, loop step): `script` decides each POST ("ok";

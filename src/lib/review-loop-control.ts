@@ -330,10 +330,12 @@ export class OwnWrites {
     this.prune(w.key.ref);
   }
 
-  /** A listed row that is `w`: confirms the entry (it is no longer unknown). */
+  /** A listed row that is `w`: confirms the entry (it is no longer unknown). Matched in the
+   * entry's scope too (keepScope): a read with no id for the session's start record never lets an
+   * older session's row confirm it. */
   seen(w: ControlWrite, rows: readonly ControlRow[], botLogin: string): boolean {
-    const hit = listedMatch(rows, w, botLogin);
     const e = this.find(w);
+    const hit = listedMatch(rows, e ? keepScope(w, e.write) : w, botLogin);
     if (hit && e) confirm(e, hit);
     this.prune(w.key.ref);
     return !!hit;

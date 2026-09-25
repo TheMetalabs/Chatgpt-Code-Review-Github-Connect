@@ -684,6 +684,24 @@ test('sweep: a forgotten ("missing") undispatched leg never closes the user\'s b
  assert.deepEqual(w.b.closedTabs,[]);
  assert.equal(w.b.messages.some(m=>m.undispatched===true),false);
 });
+// Ashlar 4101623037 on a real page: a run message the worker gave up on (askPage) still bound the page,
+// and its prompt was sent, but the leg never recorded started; then an extension reload cleared the
+// record of the tab this session created for it. The page answers for its binding (ashlar-tab-status):
+// the leg adopts it and observes it to the end. The prompt is never sent again, and no second tab opens.
+for(const kind of ['review','fix'])test(`worker, ${kind}: after an extension reload, an undispatched leg whose tab holds its sent run adopts it, never sends it again, and delivers its answer`,async t=>{
+ const tab=await generatingTab(t,{kind});
+ const w=wire(tab,{kind,started:false}); // no session: the reload cleared it
+ const created=[];const create=w.b.chrome.tabs.create;w.b.chrome.tabs.create=async options=>{created.push(options);return create(options);};
+ await w.tick();await tab.page.clock.runFor(1600);
+ assert.equal(w.state().started,true,'adopted');
+ assert.ok(w.b.messages.some(m=>m.type==='ashlar-tab-status'),'the page was asked for its binding');
+ await finish(tab.page);await tab.page.clock.runFor(2400);
+ await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'its answer is delivered');
+ assert.equal(await tab.clicks(),0,'the prompt is never sent again');
+ assert.deepEqual(w.b.messages.filter(m=>m.type==='ashlar-run'&&m.resume!==true),[],'never a fresh run');
+ assert.deepEqual(created,[],'no second tab');
+});
 // A background tab Chrome discarded while it waited (job 649: attachments_waiting for 10+ minutes)
 // holds no page. It is woken once (the tab this browser session created, still on its page) and its
 // reloaded page gives the verdict: what the provider keeps across a reload is still respected.

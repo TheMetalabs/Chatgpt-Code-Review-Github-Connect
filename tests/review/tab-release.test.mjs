@@ -94,12 +94,20 @@ for (const kind of ['review', 'fix']) {
   });
 }
 // Chrome tab ids are unique only within one browser session, and the registry outlives it: an
-// undispatched leg's stored id (no session record of its creation) can name the user's own tab.
-for (const kind of ['review', 'fix']) {
-  test(`${kind}: an undispatched leg never sends its prompt into a tab id this browser session did not create for it; it opens its own tab`, async () => {
-    const b = worker(leg(kind, {started: false}), {tab: {id: 10, url: 'https://chatgpt.com/', status: 'complete'}, handler: () => ({ok: false, code: 'busy', retry: true})});
+// undispatched leg's stored id (no session record of its creation) can name the user's own tab. Its
+// page is asked for its binding (read-only, Ashlar 4101623037) and the id is dropped only on proof.
+const statusOf = (jobId, runId) => ({ok: true, ownershipProtocol: 1, jobId, runId, provider: 'chatgpt', released: false, url: 'https://chatgpt.com/'});
+for (const kind of ['review', 'fix']) for (const [what, url, status] of [
+  ['the user\'s own tab (an unbound page)', 'https://chatgpt.com/', statusOf('', '')],
+  ['a tab bound to another job', 'https://chatgpt.com/c/other', statusOf('job-other', 'run-other')],
+  ['a tab bound to another run of this job', 'https://chatgpt.com/c/other', statusOf(leg(kind).jobId, 'run-old')],
+  ['a tab on another site', 'https://example.com/', undefined],
+]) {
+  test(`${kind}: an undispatched leg never sends its prompt into a tab id this browser session did not create for it (${what}); it opens its own tab`, async () => {
+    const b = worker(leg(kind, {started: false}), {tab: {id: 10, url, status: 'complete'},
+      handler: (_id, m) => (m.type === 'ashlar-tab-status' ? status : {ok: false, code: 'busy', retry: true})});
     await b.tick();
-    assert.equal(b.messages.some(m => m.id === 10 && m.type === 'ashlar-run'), false, 'no prompt is sent into the reused id');
+    assert.deepEqual([...new Set(b.messages.filter(m => m.id === 10).map(m => m.type))], status ? ['ashlar-tab-status'] : [], 'the reused id is only asked for its binding (read-only)');
     assert.equal(b.pending().states.chatgpt.tabId, undefined, 'the stale id is dropped');
     await b.tick();
     const run = b.messages.find(m => m.type === 'ashlar-run');
@@ -108,6 +116,70 @@ for (const kind of ['review', 'fix']) {
     assert.ok(b.tabs.has(10), 'the user\'s tab is untouched');
   });
 }
+// Ashlar 4101623037: a run message reached the page after askPage gave up on it, so the page bound
+// the run (and may have sent its prompt) while the leg never recorded started. An extension reload
+// then cleared storage.session: the leg's own tab has no creation record. Its page answers for its
+// binding: adopted and observed, never sent the prompt again, no second tab.
+for (const kind of ['review', 'fix']) for (const [what, harvest] of [
+  ['still generating', {ok: false, code: 'busy', retry: true}],
+  ['reloaded, its collector gone', {ok: false, code: 'idle'}],
+]) {
+  test(`${kind}: after an extension reload, an undispatched leg whose tab is bound to its run (${what}) adopts it and never sends the prompt again`, async () => {
+    const b = worker(leg(kind, {started: false}), {tab: {id: 10, url: TEMP, status: 'complete'},
+      handler: (_id, m) => (m.type === 'ashlar-tab-status' ? {...statusOf(leg(kind).jobId, 'run-A'), url: TEMP} : m.type === 'ashlar-harvest' ? harvest : {ok: false, code: 'busy', retry: true})});
+    await b.tick();await b.tick();
+    const state = b.pending().states.chatgpt;
+    assert.equal(state.tabId, 10, 'the tab is kept');assert.equal(state.started, true, 'adopted as started');
+    assert.ok(b.messages.some(m => m.id === 10 && m.type === 'ashlar-harvest'), 'observed');
+    assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' && m.resume !== true), [], 'never a fresh run: the page\'s journal resumes it');
+    assert.equal(b.messages.some(m => m.type === 'ashlar-run'), harvest.code === 'idle', 'a page with no collector is resumed, only then');
+    assert.deepEqual([...b.tabs.keys()], [10], 'no second tab');
+    assert.equal(b.session.state['ashlar:tab:10']?.runId, 'run-A', 'the adopted tab is recorded as the leg\'s again');
+  });
+}
+// A page that cannot say (it never answers, or the tab is discarded, loading or frozen: a tab that may
+// be the user's is never woken to ask) keeps the leg from opening a second tab. Past the bounded wait
+// the leg fails: the prompt is never sent again on a guess, and the tab is never closed unproven.
+const unreachable = b => { b.chrome.tabs.sendMessage = (id, msg) => { b.messages.push({id, ...msg}); }; b.context.pageReplyDeadline = expiresAtOnce; };
+for (const kind of ['review', 'fix']) for (const [what, tab, setup] of [
+  ['its page never answers', {status: 'complete'}, unreachable],
+  ['it is discarded', {status: 'unloaded', discarded: true}, () => {}],
+  ['it is still loading', {status: 'loading'}, () => {}],
+  ['it is frozen', {status: 'complete', frozen: true}, () => {}],
+]) {
+  test(`${kind}: after an extension reload, an undispatched leg whose stored tab cannot say whether it holds the run (${what}) opens no second tab, and fails after a bounded wait`, async () => {
+    const b = worker(leg(kind, {started: false}), {tab: {id: 10, url: TEMP, ...tab}, handler: () => ({ok: false, code: 'busy', retry: true})});
+    setup(b);
+    const reloads = [];b.chrome.tabs.reload = async id => { reloads.push(id); };
+    await b.tick();await b.tick();
+    let state = b.pending().states.chatgpt;
+    assert.equal(state.tabId, 10, 'the id is kept while the page cannot say');
+    assert.match(state.connectionError || '', /no second tab/);
+    assert.deepEqual([...b.tabs.keys()], [10], 'no second tab');
+    b.later();await b.tick();
+    assert.ok(b.calls.some(c => c.action === 'failure' && /^tab_unreachable: .*not sent again/.test(c.error)), 'the bounded failure is delivered');
+    b.later();await b.tick();await b.tick();
+    assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run'), [], 'the prompt is never sent');
+    assert.deepEqual([...b.tabs.keys()], [10], 'never a second tab');assert.deepEqual(b.closedTabs, [], 'never closed unproven');
+    assert.deepEqual(reloads, [], 'never woken');
+    state = b.pending()?.states.chatgpt;
+    assert.ok(!state || state.outcome?.code === 'tab_unreachable', 'failed, or retired');
+  });
+}
+test('review: a stored tab that could not answer at first and then proves it holds the run within the wait is adopted, never failed', async () => {
+  let reachable = false;
+  const b = worker(leg('review', {started: false}), {tab: {id: 10, url: TEMP, status: 'complete'},
+    handler: (_id, m) => { if (!reachable) throw new Error('Could not establish connection. Receiving end does not exist.');
+      return m.type === 'ashlar-tab-status' ? {...statusOf('job-A', 'run-A'), url: TEMP} : {ok: false, code: 'busy', retry: true}; }});
+  await b.tick();
+  assert.equal(b.pending().states.chatgpt.unrecordedTabSince > 0, true, 'waiting');
+  reachable = true;await b.tick();
+  const state = b.pending().states.chatgpt;
+  assert.equal(state.started, true);assert.equal(state.unrecordedTabSince, undefined, 'the wait ended');
+  b.later();await b.tick();
+  assert.equal(b.calls.some(c => c.action === 'failure'), false);
+  assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' && m.resume !== true), []);
+});
 // A leg nobody wants any more never sends, for either kind (#82), not even for the run message the
 // worker gave up on (askPage bounds every page message) that reaches the page after the leg retired.
 // The release tells the unbound page in the tab created for the leg that the run was never

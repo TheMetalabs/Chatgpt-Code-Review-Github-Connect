@@ -1582,6 +1582,45 @@ async function refreshJobHeartbeat(job, jobs, signal) {
   return true;
 }
 
+/** What the leg's stored tab holds when this browser session has no record of creating it
+ * (tabCreatedForLeg): "run" when its page is bound to this leg's run, "none" when the tab is gone or
+ * its page proves it is not (another page, another job or run, or no binding), "unknown" when it
+ * cannot say now (discarded, loading, frozen, unreachable, an older page). Only the read-only status
+ * message is sent: it never binds a page or starts a run, and a tab that may be the user's is never
+ * woken or reloaded to ask. */
+async function unrecordedTabHolds(job, provider, tabId) {
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); } catch { return "none"; }
+  if (!allowedTab(tab, provider)) return "none";
+  if (tab.discarded === true || tab.status === "unloaded" || (tab.status && tab.status !== "complete") || tab.frozen === true) return "unknown";
+  let page;
+  try { page = await askPage(tabId, {type: "ashlar-tab-status"}, contentFiles(provider)); } catch { return "unknown"; }
+  if (page?.ownershipProtocol !== 1 || typeof page.jobId !== "string" || typeof page.runId !== "string") return "unknown";
+  const runId = job.states[provider].runId;
+  return page.jobId === job.jobId && page.provider === provider && (page.runId === runId || !page.runId) ? "run" : "none";
+}
+
+/** How long a leg waits for its unrecorded stored tab to say whether it holds the leg's run. */
+const UNRECORDED_TAB_WAIT_MS = 2 * 60_000;
+
+/** The leg's unrecorded stored tab cannot say whether it holds the run (unrecordedTabHolds): no second
+ * tab is opened meanwhile, since the prompt may already be in that page. Past UNRECORDED_TAB_WAIT_MS
+ * the leg fails (`tab_unreachable`), never sending the prompt again: its failure is delivered and the
+ * cleanup rule releases the tab (never closed unproven), which frees the slot. */
+async function unrecordedTabWait(job, provider, jobs) {
+  const state = job.states[provider];
+  state.unrecordedTabSince ??= Date.now();
+  if (Date.now() - state.unrecordedTabSince < UNRECORDED_TAB_WAIT_MS) {
+    state.connectionError = "the stored chat tab cannot say yet whether it holds this run; no second tab is opened";
+    workerStep(job, provider, "disconnected");
+    await saveJobs(jobs);
+    return;
+  }
+  delete state.unrecordedTabSince;
+  state.outcome = failure("tab_unreachable", "the chat tab could not be asked whether it already holds this run; the prompt was not sent again");
+  await saveJobs(jobs);
+}
+
 async function pollProvider(job, provider, jobs, observeOnly = false) {
   const state = job.states[provider];
   if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
@@ -1655,11 +1694,26 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   if (state.tabId && await followDurableReplace(job, provider)) await saveJobs(jobs);
   if (!state.started && !observeOnly && !await tabCreatedForLeg(job, provider, state.tabId)) {
     // The prompt goes only into the tab this browser session created for the leg: a stored id from
-    // before a browser restart (or an extension reload) can name the user's own tab. The leg opens
-    // its own tab instead; the old id is never messaged.
-    delete state.tabId;
-    await saveJobs(jobs);
-    return;
+    // before a browser restart (or an extension reload) can name the user's own tab, never sent a run.
+    // But an extension reload also loses the record of the leg's own tab, whose page a run message
+    // askPage gave up on may have bound, and sent the prompt in, after all (Ashlar 4101623037): that
+    // page is asked for its binding first (read-only), and the id is dropped only on proof.
+    const holds = await unrecordedTabHolds(job, provider, state.tabId);
+    if (holds === "run") {
+      // This run's page: adopted and observed, never sent again (the page's journal resumes it).
+      state.started = true;
+      delete state.unrecordedTabSince;
+      await saveJobs(jobs);
+    } else if (holds === "unknown") {
+      return unrecordedTabWait(job, provider, jobs);
+    } else {
+      // Gone, or its page proves it holds no run of this leg: the leg opens its own tab.
+      delete state.tabId;
+      delete state.unrecordedTabSince;
+      delete state.connectionError;
+      await saveJobs(jobs);
+      return;
+    }
   }
   let tab;
   try { tab = await chrome.tabs.get(state.tabId); }

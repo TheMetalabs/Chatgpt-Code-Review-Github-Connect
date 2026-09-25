@@ -657,12 +657,11 @@ async function promoteFixDelivery(job, provider, tabId) {
 }
 
 /** The tab a `created` delivery record names, while that ID still means the same tab: recorded in
- * THIS browser session and still open. A legacy record (no session) whose ID is open is `uncertain`. */
+ * THIS browser session and still open. A record with no session proves nothing by its ID (Chrome
+ * reuses IDs): only a binding can prove it (reconcileFixDeliveries). */
 async function recordedFixTab(record, live) {
-  if (record?.phase !== "created" || !Number.isInteger(record.tabId)) return {tab: undefined};
-  const tab = live.get(record.tabId);
-  if (!record.session) return {tab: undefined, uncertain: Boolean(tab)};
-  return {tab: record.session === await browserSessionId() ? tab : undefined};
+  if (record?.phase !== "created" || !Number.isInteger(record.tabId) || !record.session) return {tab: undefined};
+  return {tab: record.session === await browserSessionId() ? live.get(record.tabId) : undefined};
 }
 
 /** A fix allocation journaled (`allocating`) with no durable tabId, and no owned record or bound
@@ -671,8 +670,8 @@ async function recordedFixTab(record, live) {
  * - "restore": a tab proves it: the page the tab inventory identifies as this run (`started`), or
  *   the tab its delivery record names, still open in this browser session;
  * - "absent": nothing can hold it (no record, an intent that never became a tab, or a recorded tab
- *   that is gone): the caller clears the intent, and the allocation opens exactly one tab;
- * - "uncertain": a legacy record whose ID is open but cannot be tied to this browser session. */
+ *   that is gone, or a record not tied to this browser session): the caller clears the intent, and
+ *   the allocation opens exactly one tab. */
 async function fixAllocationEvidence(job, provider) {
   const state = job.states[provider];
   const tabs = await chrome.tabs.query({}), live = new Map(tabs.map(tab => [tab.id, tab]));
@@ -683,7 +682,7 @@ async function fixAllocationEvidence(job, provider) {
   const mine = record?.deliveryId === job.deliveryId && record.provider === provider && (!record.runId || record.runId === state.runId);
   const recorded = mine ? await recordedFixTab(record, live) : {tab: undefined};
   if (recorded.tab) return {verdict: "restore", tabId: recorded.tab.id};
-  return {verdict: recorded.uncertain ? "uncertain" : "absent"};
+  return {verdict: "absent"};
 }
 
 function forgetFixDelivery(job) {
@@ -706,7 +705,7 @@ async function reconcileFixDeliveries(jobs) {
   const records = await fixDeliveries();
   if (!Object.keys(records).length) return records;
   const tabs = await chrome.tabs.query({}), live = new Map(tabs.map(tab => [tab.id, tab]));
-  const session = await chrome.storage.session.get(null);
+  const session = await chrome.storage.session.get(null), browserSession = await browserSessionId();
   const onProvider = (tab, provider) => Boolean(tab) && (!provider || allowedTab(tab, provider));
   // A binding proves a record only when it is the record's run (jobId + provider + runId; a legacy
   // record without a runId matches the job and provider).
@@ -722,18 +721,18 @@ async function reconcileFixDeliveries(jobs) {
   const proven = {}, rewrite = {};
   for (const [jobId, record] of Object.entries(records)) {
     if (jobs[jobId]) { proven[jobId] = record; continue; }
-    // A recorded tab ID proves the tab only in the browser session that recorded it (a legacy
-    // record without one keeps its open-tab check).
+    // A recorded tab ID proves the tab only in the browser session that recorded it; a binding (the
+    // session's owned record or the live inventory) proves it in THIS session. Either way the proven
+    // record names this session, so after a browser restart a reused ID never re-proves it.
     const recorded = await recordedFixTab(record, live);
-    const createdTab = recorded.tab || (recorded.uncertain ? live.get(record.tabId) : undefined);
-    const tabId = onProvider(createdTab, record.provider) ? createdTab.id : boundTab(jobId, record);
+    const tabId = onProvider(recorded.tab, record.provider) ? recorded.tab.id : boundTab(jobId, record);
     if (!tabId) { rewrite[jobId] = null; continue; }
-    proven[jobId] = {...record, phase: "created", tabId};
-    if (record.phase !== "created" || record.tabId !== tabId) rewrite[jobId] = proven[jobId];
+    proven[jobId] = {...record, phase: "created", tabId, session: browserSession};
+    if (record.phase !== "created" || record.tabId !== tabId || record.session !== browserSession) rewrite[jobId] = proven[jobId];
   }
   if (Object.keys(rewrite).length) {
     // Only a record still exactly as it was read is rewritten (a concurrent write wins).
-    const same = (a, b) => a?.deliveryId === b.deliveryId && a.at === b.at && a.phase === b.phase && a.tabId === b.tabId;
+    const same = (a, b) => a?.deliveryId === b.deliveryId && a.at === b.at && a.phase === b.phase && a.tabId === b.tabId && a.session === b.session;
     await updateFixDeliveries(all => {
       for (const [jobId, next] of Object.entries(rewrite)) {
         if (!same(all[jobId], records[jobId])) continue;

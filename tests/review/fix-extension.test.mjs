@@ -665,6 +665,27 @@ for (const bindingRun of ['run-0', 'run-A']) {
     assert.equal(report.orphanTabs, bindingRun === 'run-A' ? 0 : 1);
   });
 }
+// Round 16: a `creating` record that reconcile promotes because a binding proves its tab is stamped
+// with THIS browser session. A session-less record is never re-proven by whatever tab later has its
+// ID: Chrome reuses tab IDs after a browser restart, so an unrelated tab must not keep the delivery out.
+test('worker: a delivery promoted by its binding records its browser session; after a restart an unrelated tab with the reused ID proves nothing', async () => {
+  const tabs1 = new Map([[77, {id: 77, url: URL_FIX, status: 'complete'}]]);
+  const local = storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {},
+    [DELIVERIES]: {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', runId: 'run-A', at: Date.now()}}});
+  const boot1 = background({local, session: storage({'ashlar:browserSession': 'boot-1', 'ashlar:tab:77': ownedRecord('run-A')}), tabs: tabs1,
+    api: active, handler: () => ({ok: false, code: 'busy', retry: true})});
+  const proven1 = await boot1.context.reconcileFixDeliveries({});
+  assert.deepEqual({phase: proven1['fix-A']?.phase, tabId: proven1['fix-A']?.tabId, session: proven1['fix-A']?.session}, {phase: 'created', tabId: 77, session: 'boot-1'});
+  assert.equal(local.state[DELIVERIES]['fix-A'].session, 'boot-1', 'the promoted record names the session its tab ID belongs to');
+  // Browser restart: only local storage survives; tab 77 is now an unrelated, unbound ChatGPT tab.
+  const tabs2 = new Map([[77, {id: 77, url: 'https://chatgpt.com/c/other', status: 'complete'}]]);
+  const boot2 = background({local, session: storage({'ashlar:browserSession': 'boot-2'}), tabs: tabs2, api: active,
+    handler: () => ({ok: false, code: 'idle', jobId: '', runId: ''})});
+  await boot2.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  const proven2 = await boot2.context.reconcileFixDeliveries({});
+  assert.equal(proven2['fix-A'], undefined, 'a reused tab ID does not prove the delivery');
+  assert.equal(local.state[DELIVERIES]['fix-A'], undefined, 'the unproven record is cleared (replayed once)');
+});
 test('worker: retiring a fix job forgets only its own delivery record', async () => {
   const b = worker([], {api: active});
   await b.local.set({[DELIVERIES]: {'fix-A': {deliveryId: 'delivery-2', provider: 'chatgpt', phase: 'creating', at: Date.now()}}});

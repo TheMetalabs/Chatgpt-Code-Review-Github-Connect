@@ -27,12 +27,12 @@ before(async()=>{
  browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});
 });
 after(async()=>{await browser?.close();});
-const record={captures:[{id:'capture-fixture',provider:'chatgpt',runId:'run-A',responseId:'response-A',sourceHash:'fixture-hash',totalChars:40,at:2}],job:{id:'job-A',owner:'fixture',repo:'repo',pr:219,status:'posted',createdAt:1,deliveryId:'delivery-A',commentId:42,findingCount:0},inCurrentRuntime:false,droppedSteps:0,steps:[{id:'s',stage:'send_unconfirmed',source:'page',at:2,runId:'run-A'}],review:{githubId:55,event:'COMMENT',at:3,body:'Posted review body'}};
+const record={captures:[{id:'capture-fixture',provider:'chatgpt',runId:'run-A',responseId:'response-A',sourceHash:'fixture-hash',totalChars:40,at:2}],job:{id:'job-A',owner:'fixture',repo:'repo',pr:219,status:'posted',createdAt:1,deliveryId:'delivery-A',commentId:42,findingCount:0},inCurrentRuntime:false,droppedSteps:0,steps:[{id:'s',stage:'send_unconfirmed',source:'page',at:2,runId:'run-A'},{id:'u',stage:'tab_woken',source:'page',at:3,runId:'run-A',provider:'chatgpt'},{id:'c',stage:'constructor',source:'worker',at:4,runId:'run-A'},{id:'j',stage:'job.posted',source:'server',at:5}],review:{githubId:55,event:'COMMENT',at:3,body:'Posted review body'}};
 test('history UI: authenticated search, archived timeline and inert original text',async t=>{
  const context=await browser.newContext();t.after(()=>context.close());let requests=0;
  await context.route('https://history.fixture/**',async route=>{
   const request=route.request(),url=new URL(request.url());
-  if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:'<div id="root"></div><script>'+bundle.replace(/<\/script/gi,'<\\/script')+'</script>'});
+  if(url.pathname==='/')return route.fulfill({contentType:'text/html; charset=utf-8',body:'<div id="root"></div><script>'+bundle.replace(/<\/script/gi,'<\\/script')+'</script>'});
   if(url.pathname!=='/api/history')return route.fulfill({status:404,body:''});
   requests++;assert.equal(request.headers()['x-ashlar-history-token'],'fixture-token');assert.equal(url.searchParams.has('token'),false);
   const body=url.searchParams.has('jobId')?{ok:true,record:{...record,...(url.searchParams.has('responses')?{captures:[{...record.captures[0],text:'<script>window.captureExfiltrated=true</script>'}],responses:{chatgpt:{json:'{"findings":[]}',original:'<script>window.exfiltrated=true</script>',jsonChars:15,originalChars:40,truncated:false}}}:{})}}:
@@ -42,6 +42,15 @@ test('history UI: authenticated search, archived timeline and inert original tex
  const page=await context.newPage();await page.goto('https://history.fixture/');assert.equal(requests,0);
  await page.getByLabel('History access token').fill('fixture-token');await page.getByRole('button',{name:'Open private history'}).click();
  await page.getByRole('button',{name:'job-A',exact:true}).click();await page.getByText('Archived record;', {exact:false}).waitFor();
+ // Timeline labels: a labelled stage by its label; a page or worker stage without one under the fallback,
+ // flagged (an inherited Object property such as constructor is not a label); a server step by its name.
+ const flagged='The extension recorded this stage before it had a history label';
+ assert.deepEqual(await page.locator('ol > li > div:first-child').evaluateAll(nodes=>nodes.map(node=>({text:node.textContent,warn:node.classList.contains('text-warn'),title:node.getAttribute('title')}))),[
+  {text:'Submission unconfirmed · inspect original tab; no automatic resend',warn:false,title:null},
+  {text:'Unlabelled step · tab_woken',warn:true,title:flagged},
+  {text:'Unlabelled step · constructor',warn:true,title:flagged},
+  {text:'job.posted',warn:false,title:null},
+ ]);
  await page.getByText('full source secured',{exact:false}).waitFor({state:'attached'});
  assert.equal(await page.getByText('<script>window.captureExfiltrated=true</script>',{exact:true}).count(),0);
  await page.getByRole('button',{name:'Load original response / JSON'}).click();await page.getByText('Original rendered response',{exact:true}).waitFor({state:'attached'});

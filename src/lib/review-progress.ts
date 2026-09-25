@@ -34,8 +34,6 @@ export const PROGRESS_LABELS = {
     result_saved: "Server acknowledged response storage",
     cleanup_pending: "Response secured · tab cleanup pending",
     tab_closed: "Review tab closed",
-    tab_lost: "Tab gone · Ashlar did not close it (closed by the user or browser, or never opened)",
-    tab_rekeyed: "Chrome replaced the tab under a new tab id · the run follows it",
     tab_preserved: "Tab preserved · see the preserve cause",
     preserve_navigated: "Tab preserved · the user moved it to another conversation or site",
     preserve_user_turn: "Tab preserved · the user sent a follow-up turn",
@@ -54,6 +52,9 @@ export const PROGRESS_LABELS = {
     error: "Provider or submission reported an explicit error",
     local_queued: "Local LLM request sent · waiting in the model queue (server alive, no output yet)",
     local_generating: "Local LLM generating output",
+    // Tab Lease (Phase 1+). Labelled ahead of the extension: a stage without a label is dropped.
+    tab_lost: "Tab lost · it disappeared without Ashlar closing it (vanished, creation unknown or browser restart)",
+    tab_rekeyed: "Browser replaced the tab's ID · the lease follows the new ID",
 } as const;
 export type ProgressStage = keyof typeof PROGRESS_LABELS;
 export type ProgressEvent = {

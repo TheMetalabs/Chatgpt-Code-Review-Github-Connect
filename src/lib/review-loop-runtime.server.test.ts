@@ -2144,4 +2144,42 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.ok(rc.ran && rc.step === "fix" && rc.outcome === "applied", `the restarted round runs: ${JSON.stringify(rc)}`);
     assert.equal(f.permissionChecks.at(-1), "alice", "on the restart's starter's authority");
   });
+
+  it("K2-2: a stop by edit (no new comment row) while a restart's unrecorded start waits is recorded, and the restart never commits", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(t, f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+    // the restart's start record failed at admission; its review is posted (harbor sees no live start job) and waits
+    const restart = job({ id: "job-B", thread: { kind: "mention", commentId: 3, userText: "/review-loop apply", loop: { kind: "start", mode: "apply" }, eventAt: "2025-12-31T12:00:00Z" } });
+    const b = run(f, "apply", ENV_ON, restart);
+    // the operator changes their mind: a stop edited into an older comment (or the PR body) — the fold cannot replay it
+    const stop = await stopLoop("t", { owner: "o", repo: "r", pr: 7, actor: "alice", stopAt: "2025-12-31T18:00:00Z" }, settings("apply"), f.deps, ENV_ON);
+    hold.release();
+    const [ra, rb] = await settles(Promise.all([a, b]));
+    assert.equal(f.committed, false, "no App commit after the operator's stop");
+    assert.deepEqual(stop, { posted: true, reason: "stopped" }, "the stop is recorded: a waiting step still carries a start it may end");
+    assert.deepEqual(ra, { ran: false, reason: "loop stopped by operator" });
+    assert.ok(!rb.ran && SILENT_REASONS.includes(rb.reason), `the restart's step ends quietly: ${JSON.stringify(rb)}`);
+    assert.equal(f.prompts.length, 1, "only the stopped round's request");
+  });
+
+  it("a stop older than the waiting restart's start ends nothing and records nothing; the restart runs", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(t, f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+    f.issues.push({ userLogin: BOT, body: stoppedComment({ by: "alice", at: "2025-12-31T06:00:00Z" }), createdAt: "2025-12-31T06:00:01Z" });
+    const restart = job({ id: "job-B", thread: { kind: "mention", commentId: 3, userText: "/review-loop apply", loop: { kind: "start", mode: "apply" }, eventAt: "2025-12-31T12:00:00Z" } });
+    const b = run(f, "apply", ENV_ON, restart);
+    // an edited stop dated between the acknowledged stop and the restart: the restart comes after it
+    const stop = await stopLoop("t", { owner: "o", repo: "r", pr: 7, actor: "alice", stopAt: "2025-12-31T09:00:00Z" }, settings("apply"), f.deps, ENV_ON);
+    hold.release();
+    const [, rb] = await settles(Promise.all([a, b]));
+    assert.deepEqual(stop, { posted: false, reason: "no active loop session" });
+    assert.equal(f.posted.filter((body) => body.startsWith(STOPPED_MARKER)).length, 0, "no STOPPED after the restart was requested");
+    assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "applied", JSON.stringify(rb));
+  });
 });

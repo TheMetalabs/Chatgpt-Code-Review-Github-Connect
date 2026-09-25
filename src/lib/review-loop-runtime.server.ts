@@ -257,7 +257,7 @@ const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 // has one: harbor's calls). Cross-process coordination is a NON-GOAL (single harbor instance; see
 // the engine header). Latest wins for the ROUND only: a fresh human start that a replaced waiter
 // carried (its record not posted yet) passes to the step that replaced it, which records it.
-type StepTurn = { status: "run"; prior?: string; starts: StartRequest[] } | { status: "replaced" } | { status: "expired" };
+type StepTurn = { status: "run"; prior?: string; starts: StartRequest[] } | { status: "replaced" } | { status: "expired"; starts: StartRequest[] };
 type StepSlot = {
   /** The roundSignature of the last round that reached the provider while the slot was held,
    * handed to the next owner (a waiter) — never kept once the slot is free. */
@@ -266,15 +266,50 @@ type StepSlot = {
   /** The start requests the waiter carries: its own and those of every waiter it replaced. */
   waiterStarts?: StartRequest[];
 };
-const productionStepSlots = new Map<string, StepSlot>();
-const stepSlotsByClient = new WeakMap<object, Map<string, StepSlot>>();
+/** In-process loop-step state of one GitHub client. */
+type StepState = {
+  /** The per-head slots, by `${prKey}@${head}`. */
+  slots: Map<string, StepSlot>;
+  /** Fresh human starts that loop steps carry and have not recorded yet (a restart's review waiting
+   * behind a running round), by prKey: a stop meanwhile may end the session they will open, so
+   * stopLoop records it as it does for a start still in flight in harbor. */
+  pendingStarts: Map<string, Set<StartRequest>>;
+};
+const productionStepState: StepState = { slots: new Map(), pendingStarts: new Map() };
+const stepStateByClient = new WeakMap<object, StepState>();
 const MAX_TIMER_MS = 2_147_483_647;
 
+function stepState(deps: LoopRuntimeDeps | undefined): StepState {
+  if (!deps) return productionStepState;
+  let state = stepStateByClient.get(deps.gh);
+  if (!state) stepStateByClient.set(deps.gh, (state = { slots: new Map(), pendingStarts: new Map() }));
+  return state;
+}
+
 function stepSlots(deps: LoopRuntimeDeps | undefined): Map<string, StepSlot> {
-  if (!deps) return productionStepSlots;
-  let slots = stepSlotsByClient.get(deps.gh);
-  if (!slots) stepSlotsByClient.set(deps.gh, (slots = new Map()));
-  return slots;
+  return stepState(deps).slots;
+}
+
+function holdStarts(state: StepState, pr: string, starts: readonly StartRequest[]): void {
+  if (starts.length === 0) return;
+  let held = state.pendingStarts.get(pr);
+  if (!held) state.pendingStarts.set(pr, (held = new Set()));
+  for (const s of starts) held.add(s);
+}
+
+function dropStarts(state: StepState, pr: string, starts: readonly StartRequest[]): void {
+  const held = state.pendingStarts.get(pr);
+  if (!held) return;
+  for (const s of starts) held.delete(s);
+  if (held.size === 0) state.pendingStarts.delete(pr);
+}
+
+/** Does a loop step carry an unrecorded start that a stop at `at` would end (the start at or before
+ * the stop — in one second the stop is causally later)? */
+function startPendingBefore(state: StepState, pr: string, at: string): boolean {
+  const stopMs = isoMs(at);
+  for (const s of state.pendingStarts.get(pr) ?? []) if (Number.isNaN(stopMs) || isoMs(s.at) <= stopMs) return true;
+  return false;
 }
 
 /** Take a head's slot, synchronously (before any await): free → run now; held → wait for its
@@ -294,7 +329,7 @@ function claimStep(slots: Map<string, StepSlot>, key: string, waitMaxMs: number,
         slot.waiter = undefined;
         slot.waiterStarts = undefined;
       }
-      resolve({ status: "expired" });
+      resolve({ status: "expired", starts });
     }, waitMaxMs);
     (timer as { unref?: () => void }).unref?.();
     const admit = (turn: StepTurn) => {
@@ -943,13 +978,19 @@ export async function runPostReviewLoop(
       ? [{ owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }]
       : [];
   const stepKey = `${prKey(ref)}@${headSha}`;
-  const slots = stepSlots(deps);
+  const state = stepState(deps);
+  const slots = state.slots;
+  // Pending from now until it is recorded (or handed to the step that replaces this one).
+  holdStarts(state, prKey(ref), ownStart);
   const claimed = claimStep(slots, stepKey, stepWaitMaxMs(deps, env), ownStart);
   const waited = claimed instanceof Promise;
   if (waited) trace(job.id, "step-waits", { pr, head: headSha.slice(0, 7) });
   const turn = claimed instanceof Promise ? await claimed : claimed;
-  if (turn.status === "replaced") return { ran: false, reason: STEP_REPLACED };
-  if (turn.status === "expired") return { ran: false, reason: STEP_WAIT_EXPIRED };
+  if (turn.status === "replaced") return { ran: false, reason: STEP_REPLACED }; // its start is handed over
+  if (turn.status === "expired") {
+    dropStarts(state, prKey(ref), turn.starts);
+    return { ran: false, reason: STEP_WAIT_EXPIRED };
+  }
   const prior = turn.prior; // the round the step this one waited behind ran, if any
   const startRequests = turn.starts; // this review's start and those of the waiters it replaced
   try {
@@ -1008,6 +1049,7 @@ export async function runPostReviewLoop(
       }
       session = await sessionOf(gh, token, ref, head, botLogin);
     }
+    dropStarts(state, prKey(ref), startRequests); // recorded, or the session they would open runs
     if (!session.active) return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
     // A step that waited acts only for a session its review can belong to. One anchored after the
     // step was called (a stop → restart during the wait) started after this review was posted, so
@@ -1357,6 +1399,7 @@ export async function runPostReviewLoop(
     // server-side error (no PR noise on a PR that never asked for a loop).
     return requested ? await escalate("loop-error", reason) : { ran: false, reason };
   } finally {
+    dropStarts(state, prKey(ref), startRequests);
     releaseStep(slots, stepKey);
   }
 }
@@ -1560,9 +1603,11 @@ function stopDecides(events: readonly LoopEvent[], stop: { actor: string; at: st
  * decides which session runs (it is the boundary before a newer start, which without its record
  * re-issues the ended session with the rounds before the stop; or it keeps a session over that a
  * continuation after it would resume) — and when it races a start still in flight (the caller saw
- * a live loop-start review for the PR), or finds the session ended only in this process (an own
- * write that may not be durable). A stop that changes nothing posts nothing. A repeated stop finds
- * its record and posts nothing; one whose record's outcome is unknown is only looked for again.
+ * a live loop-start review for the PR, or a loop step carries an unrecorded start no later than
+ * the stop: a restart's review waiting behind a running round), or finds the session ended only in
+ * this process (an own write that may not be durable). A stop that changes nothing posts nothing.
+ * A repeated stop finds its record and posts nothing; one whose record's outcome is unknown is only
+ * looked for again.
  * The record is the STOPPED acknowledgement while no session runs; posted while a newer session is
  * active it is the bare record (stopRecordComment), never a terminal signal for that session — the
  * form is decided by a fresh read right before each POST attempt, so a retry after a newer start
@@ -1632,7 +1677,10 @@ export async function stopLoop(
     const decides =
       stopDecides(events, self, head.sha) || stopDecides([...durable, { at, kind: "stop", actor: stop.actor }], self, head.sha);
     const endedHereOnly = ownWrites(d.gh).unconfirmedEnd(ref, session) !== undefined;
-    if (!endedIt && !decides && !endedHereOnly && !(stop.startInFlight ?? false)) {
+    // A start not recorded yet may still land with an earlier time: harbor's live loop-start review,
+    // or a loop step that carries one (a restart's review waiting behind a running round).
+    const startInFlight = (stop.startInFlight ?? false) || startPendingBefore(stepState(deps), prKey(ref), at);
+    if (!endedIt && !decides && !endedHereOnly && !startInFlight) {
       ownWrites(d.gh).abandon(write);
       return { posted: false, reason: NO_SESSION };
     }

@@ -226,14 +226,99 @@ function propertyName(level, k, container) {
   return !keyed ? undefined : token.open === '[' ? memberKey(token) : literalValue(token);
 }
 
-/** Whether `level[k]` refers to the global object: one of GLOBAL_NAMES that is not a property name or an
- * object key, or a `defaultView` property (a document's window) however its name is spelled. */
-function globalReference(level, k, container) {
+/** The names a binding target binds: a name, or each name in a destructuring pattern or a parameter
+ * list (`a, {b, c: [d]}, e = 1, ...f`): an element up to its default value, the value after a key's `:`,
+ * a rest element. */
+function bindingNames(target) {
+  if (target?.kind === 'word') return [target.text];
+  if (!['{', '[', '('].includes(target?.open)) return [];
+  return argumentsOf(target.tokens).flatMap(element => {
+    let part = isPunct(element[0], '...') ? element.slice(1) : element;
+    const colon = part.findIndex(token => isPunct(token, ':')), eq = part.findIndex(token => isPunct(token, '='));
+    if (colon >= 0 && (eq < 0 || colon < eq)) part = part.slice(colon + 1);
+    return bindingNames(part[0]);
+  });
+}
+
+/** The names `tokens` declares at its own level: each const, let or var declarator's name or pattern,
+ * and a function or class declaration's name (an expression's name binds only inside it). */
+function declaredNames(tokens) {
+  return tokens.flatMap((token, k) => {
+    const before = tokens[k - 1];
+    if (token.kind !== 'word' || isPunct(before, '.') || isPunct(before, '?.')) return [];
+    if (['const', 'let', 'var'].includes(token.text)) return argumentsOf(until(tokens, k + 1, [';'])).flatMap(([target]) => bindingNames(target));
+    if (token.text !== 'function' && token.text !== 'class') return [];
+    const lead = isWord(before, 'async') ? tokens[k - 2] : before, name = tokens[k + (isPunct(tokens[k + 1], '*') ? 2 : 1)];
+    const declaration = !lead || isPunct(lead, ';') || lead.kind === 'group' || isWord(lead, 'export') || isWord(lead, 'default');
+    return declaration && name?.kind === 'word' && name.text !== 'extends' ? [name.text] : [];
+  });
+}
+
+/** Where the statement at `tokens[from]` ends: after its block when it is one, else after its `;` (an
+ * if's else arm included), else at the end of the level. */
+function statementEnd(tokens, from) {
+  if (tokens[from]?.open === '{') return from + 1;
+  for (let j = from; j < tokens.length; j += 1) if (isPunct(tokens[j], ';') && !isWord(tokens[j + 1], 'else')) return j + 1;
+  return tokens.length;
+}
+
+/** The names bound inside the group at `tokens[index]` by the head in front of it: a function's,
+ * method's or catch's parameters (and a function expression's own name) for its body, and for the
+ * parameter list itself. The head of an if, while, with, switch or for binds none there. */
+function headNames(tokens, index) {
+  const group = tokens[index];
+  const head = group.open === '{' && tokens[index - 1]?.open === '(' ? index - 1 : group.open === '(' && tokens[index + 1]?.open === '{' ? index : -1;
+  if (head < 0 || ['if', 'while', 'with', 'switch', 'for', 'await'].includes(tokens[head - 1]?.text)) return [];
+  return [...(isWord(tokens[head - 2], 'function') ? bindingNames(tokens[head - 1]) : []), ...bindingNames(tokens[head])];
+}
+
+/** The parameters of the arrows in `tokens` that `tokens[index]` is a parameter of or in the body of: an
+ * arrow before it whose body runs to it without a `,` or `;` between. */
+function arrowNames(tokens, index) {
+  const names = [];
+  for (let a = isPunct(tokens[index + 1], '=>') ? index + 1 : index - 1; a > 0 && !isPunct(tokens[a], ',') && !isPunct(tokens[a], ';'); a -= 1) {
+    if (isPunct(tokens[a], '=>')) names.push(...bindingNames(tokens[a - 1]));
+  }
+  return names;
+}
+
+/** The names the for heads in `tokens` declare for the loop statements that hold `tokens[index]`. */
+function forNames(tokens, index) {
+  return tokens.slice(0, index).flatMap((token, j) => {
+    const head = isWord(tokens[j + 1], 'await') ? j + 2 : j + 1;
+    return isWord(token, 'for') && tokens[head]?.open === '(' && index < statementEnd(tokens, head + 1) ? declaredNames(tokens[head].tokens) : [];
+  });
+}
+
+/** Whether the word `name` at `level[k]`, inside the levels `path`, is bound by the code rather than
+ * being the global object's: declared in a level that holds it, a parameter of a function, method, arrow
+ * or catch whose head or body holds it, or declared by a for head over it. A binding site binds itself. */
+function boundLocally(path, level, k, name) {
+  const frames = [...path, {tokens: level, index: k}];
+  return frames.some(({tokens, index}, f) => [...declaredNames(tokens), ...arrowNames(tokens, index), ...forNames(tokens, index),
+    ...(f < frames.length - 1 ? headNames(tokens, index) : [])].includes(name));
+}
+
+/** Whether the `{` group at `tokens[index]` is a class body: `class`, a name and an extends clause before it. */
+function classBody(tokens, index) {
+  let j = index - 1;
+  while (j >= 0 && !isWord(tokens[j], 'class') && (tokens[j].kind === 'word' || isPunct(tokens[j], '.') || tokens[j].open === '(' || tokens[j].open === '[')) j -= 1;
+  return tokens[index]?.open === '{' && isWord(tokens[j], 'class');
+}
+
+/** Whether `level[k]` (inside the levels `path`) refers to the global object: one of GLOBAL_NAMES that is
+ * not a property name, an object key or a method's name, nor bound by the code where it stands (a
+ * declaration, a parameter or a catch binding of that name makes it a local), with `this` anywhere but in
+ * a class body (strict code, whose `this` is never the global object); or a `defaultView` property (a
+ * document's window) however its name is spelled. */
+function globalReference(level, k, container, path) {
   const token = level[k], before = level[k - 1];
   if (propertyName(level, k, container) === 'defaultView') return true;
-  if (token.kind !== 'word' || isPunct(before, '.') || isPunct(before, '?.')) return false;
+  if (token.kind !== 'word' || !GLOBAL_NAMES.has(token.text) || isPunct(before, '.') || isPunct(before, '?.')) return false;
   const key = container?.open === '{' && (k === 0 || isPunct(before, ',')) && isPunct(level[k + 1], ':');
-  return GLOBAL_NAMES.has(token.text) && !key;
+  if (key || (level[k + 1]?.open === '(' && level[k + 2]?.open === '{')) return false;
+  if (token.text === 'this') return !path.some(({tokens, index}) => classBody(tokens, index));
+  return !boundLocally(path, level, k, token.text);
 }
 
 /** Whether the global object at `level[k]` is read only by a static member name (`globalThis.x`,
@@ -280,7 +365,7 @@ function reachedByName(level, k, container, path) {
   if (computedMember(level, k) && memberKey(token) === undefined && calledAt(level, k, path)) {
     return 'a call through a computed member whose name the guard cannot read can call a recorder on any object that holds one (the global object holds them all), so the stage it records cannot be checked';
   }
-  if (!globalReference(level, k, container) || staticGlobalRead(level, k)) return null;
+  if (staticGlobalRead(level, k) || !globalReference(level, k, container, path)) return null;
   return 'the global object, which holds every recorder declared at the top of a script, is read other than by a static member name, so a recorder reached there records stages that cannot be checked';
 }
 
@@ -1055,6 +1140,15 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     ['Object.values(window).forEach(record => record("unlabelled_each"));', global(1, 'window')],
     ['const {[name]: record} = globalThis;', global(1, 'globalThis')],
     ['const current = globalThis.window;', global(1, 'globalThis')],
+    // A global name is a local only where the code binds it: not past an arrow's body, outside a sibling
+    // block, a function's parameters or a function expression. A shorthand key reads the name too, and
+    // `this` outside a class body is the global object when its function is called plainly.
+    ['note({parent, id});', global(1, 'parent')],
+    ['rows.map(parent => 0), note(parent);', global(1, 'parent')],
+    ['if (ok) { const top = 1; }\nnote(top);', global(2, 'top')],
+    ['function f(top) {}\nnote(top);', global(2, 'top')],
+    ['const f = function top() {};\nnote(top);', global(2, 'top')],
+    ['function pick(key) {\n  return note(this);\n}', global(2, 'this')],
     // The global object arrives as other values too (a method that returns its receiver, an event's
     // target), so a call through a computed member the guard cannot read fails on any object.
     ['const name = ["worker", "Step"].join("");\nglobalThis.valueOf()[name](job, provider, "unlabelled_valueof");', called(2, '[name]')],
@@ -1077,6 +1171,15 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     'const saved = globalThis["__ashlarRunnerState"]; if (typeof window === "undefined") note(self.location?.href);\n' +
     'const box = {top: rect.top, window: 1}; node.parent[key] = rect.top + 1; const view = document.defaultView.innerWidth;\n' +
     'globalThis.recordReviewStep?.("optional_call"); const doc = "workerStep(job, provider, stage)"; note("steps", "Step");'), []);
+  // A local of a global name is not the global object: a declaration (a pattern's too), a parameter (an
+  // arrow's, a catch's, a function expression's own name), a for head's declaration, a method's name or
+  // an object key; nor is `this` in a class body.
+  assert.deepEqual(problems('const {top, left} = rect; const frames = []; note(frames, top, left);\n' +
+    'function f(parent) { return parent.id + note(parent); }\nfunction g(parent, id) { return {parent, id}; }\n' +
+    'rows.map(self => note(self)); rows.map((window, i) => note(window, i)); rows.map(({top}) => note(top));\n' +
+    'try { run(); } catch (window) { note(window); }\nfor (const top of rows) note(top);\nfor (const [parent] of rows) { note(parent); }\n' +
+    'class A { m(key) { return note(this[key]); } static n() { return this; } }\nconst o = {top() { return 1; }, parent(x) { return x; }};\n' +
+    'const pick = function self(n) { return n ? self(n - 1) : note(self); };'), []);
   // A computed member the guard can read, one that is not called, or an array literal calls no recorder
   // by a hidden name.
   assert.deepEqual(problems('handlers["open"](row); rows[0](); const state = job.states[provider]; job.states[provider].runId = id;\n' +

@@ -1975,9 +1975,10 @@ function admitJob(cfg, jobs) {
     await recordWorkerStatus(jobs, cfg.origin, "polling");
     // One take in flight per origin: this lane (singleFlight on admissionLanes, and tickBody never
     // queues a second waiter) serializes every admission trigger of this worker (alarm, interval,
-    // poll-now). A fix delivery this profile PROVABLY opened a tab for (reconcileFixDeliveries: a
-    // live created tab or a binding) is listed too, so the server never replays it here even when the
-    // job registry lost it (hard reset); an intent that never became a tab is cleared and replayed.
+    // poll-now). A fix delivery this profile PROVABLY opened a tab for (reconcileFixDeliveries: a tab
+    // that carries its binding, or its recorded tab while that page is still unread) is listed too, so
+    // the server never replays it here even when the job registry lost it (hard reset); an intent
+    // that never became a tab, or a record whose tab holds no binding of it, is cleared and replayed.
     const delivered = await reconcileFixDeliveries(jobs);
     // fixProtocol:1 opts this worker into review-loop fix items (an older worker is never offered one).
     const payload = await api("/api/bridge", {

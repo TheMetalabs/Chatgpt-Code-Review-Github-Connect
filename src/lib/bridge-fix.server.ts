@@ -142,6 +142,8 @@ export const MIN_FIX_MAX_PROMPT_CHARS = 10_000;
 export const MAX_FIX_MAX_PROMPT_CHARS = 1_000_000;
 /** A settled item keeps answering late bridge calls (lost-ACK replays) this long, then is forgotten. */
 export const FIX_TERMINAL_RETAIN_MS = 10 * 60_000;
+/** Characters of an item's opaque token shown in /api/harbor summaries (enough to tell items apart). */
+const SUMMARY_ID_CHARS = 6;
 /** Memory bound for settled items under a burst (the oldest are forgotten first). */
 const MAX_SETTLED_ITEMS = 200;
 const ERROR_MAX = 240;
@@ -180,6 +182,18 @@ export interface FixOffer {
   owner: string;
   repo: string;
   pr: number;
+}
+
+/** One registry item as /api/harbor shows it (FixRegistry.summaries): no prompt or secret. */
+export interface FixItemSummary {
+  /** `fix-` plus the first characters of the opaque token: never the addressable full id. */
+  id: string;
+  state: FixItemState;
+  hasClient: boolean;
+  hasRun: boolean;
+  ageSec: number;
+  /** Seconds until the deadline cancels a live item; null once settled. */
+  deadlineInSec: number | null;
 }
 
 export interface FixItem {
@@ -639,6 +653,22 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return { queued, claimed, active: claimedCount() };
   }
 
+  /** Read-only diagnostics for the unauthenticated /api/harbor: why a live item is not moving (never
+   * owned, owned without a run, near its deadline). Presence flags and timing only: no prompt, lease,
+   * client, run or full id (a full id addresses the per-id bridge operations). */
+  function summaries(): FixItemSummary[] {
+    prune();
+    const now = deps.now();
+    return [...items.values()].map((item) => ({
+      id: item.id.slice(0, FIX_ID_PREFIX.length + SUMMARY_ID_CHARS),
+      state: item.state,
+      hasClient: Boolean(item.clientId),
+      hasRun: Boolean(item.runId),
+      ageSec: Math.max(0, Math.floor((now - item.createdAt) / 1000)),
+      deadlineInSec: live(item) ? Math.max(0, Math.floor((item.deadlineAt - now) / 1000)) : null,
+    }));
+  }
+
   const providerOf = (id: string): FixChatProvider | undefined => items.get(id)?.provider;
   /** Test/diagnostic copy of one item. */
   const snapshot = (id: string): FixItem | undefined => {
@@ -646,5 +676,5 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return item && { ...item };
   };
 
-  return { request, peek, claim, take, recover, refresh, state, prompt, release, fail, complete, progress, submitting, counts, providerOf, snapshot };
+  return { request, peek, claim, take, recover, refresh, state, prompt, release, fail, complete, progress, submitting, counts, summaries, providerOf, snapshot };
 }

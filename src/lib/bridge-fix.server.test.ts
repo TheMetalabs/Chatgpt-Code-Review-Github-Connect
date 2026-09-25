@@ -819,3 +819,34 @@ describe("bridge fix registry: lifecycle table", () => {
     assert.equal(h.reg.snapshot(id)!.deliveryId, d2.deliveryId);
   });
 });
+
+describe("bridge fix registry: summaries (read-only /api/harbor observability)", () => {
+  it("lists every item's state, owner/run presence and timing, and never a prompt, lease, client or full id", () => {
+    let n = 0;
+    // production-length opaque ids (items and leases), so a short id is a strict prefix
+    const h = harness({ newId: () => `opaqueToken${++n}xxxxxxxxxxxxxx` });
+    h.reg.request({ ...REQ, pr: 1 }).catch(() => {});
+    const { offer } = queueAndTake(h, { pr: 2 });
+    h.reg.progress(offer.jobId, offer.leaseId, "run_dispatched", "run-secret");
+    h.advance(90_000);
+    const rows = h.reg.summaries();
+    assert.equal(rows.length, 2);
+    const byState = Object.fromEntries(rows.map((row) => [row.state, row]));
+    assert.deepEqual(
+      { ...byState.queued, id: undefined },
+      { id: undefined, state: "queued", hasClient: false, hasRun: false, ageSec: 90, deadlineInSec: DEFAULT_FIX_TIMEOUT_MS / 1000 - 90 },
+    );
+    assert.deepEqual({ ...byState.claimed, id: undefined }, { ...byState.queued, id: undefined, state: "claimed", hasClient: true, hasRun: true });
+    for (const row of rows) {
+      assert.deepEqual(Object.keys(row).sort(), ["ageSec", "deadlineInSec", "hasClient", "hasRun", "id", "state"]);
+      assert.match(row.id, /^fix-.{1,8}$/, "a short id only");
+    }
+    const text = JSON.stringify(rows);
+    for (const secret of [REQ.prompt, offer.leaseId, "chrome-1", "run-secret", offer.jobId]) assert.equal(text.includes(secret), false, secret);
+    // a settled item stays listed (terminal state, no deadline) until it is forgotten
+    h.reg.complete(offer.jobId, "chatgpt", "ANSWER", offer.leaseId);
+    const done = h.reg.summaries().find((row) => row.state === "done");
+    assert.ok(done);
+    assert.equal(done.deadlineInSec, null);
+  });
+});

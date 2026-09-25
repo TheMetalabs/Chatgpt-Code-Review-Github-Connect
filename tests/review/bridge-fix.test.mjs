@@ -272,3 +272,21 @@ test('a forgotten review the worker keeps delivering never holds back a queued f
   h.bridge.completeBridgeFix(offer.jobId, 'OK', undefined, offer.leaseId);
   assert.equal(await pending, 'OK');
 });
+
+test('/api/harbor bridge.fixItems lists each fix item without its prompt or secrets', async () => {
+  const h = bridgeHarness([], {workerStatusIsFresh: () => false});
+  const pending = quiet(h.bridge.requestBridgeFix(FIX));
+  let pub = h.bridge.getBridgePublic();
+  assert.equal(pub.pendingFixes, 1);
+  assert.equal(pub.fixItems.length, 1);
+  assert.deepEqual({...pub.fixItems[0], id: undefined, ageSec: undefined, deadlineInSec: undefined},
+    {id: undefined, state: 'queued', hasClient: false, hasRun: false, ageSec: undefined, deadlineInSec: undefined});
+  const offer = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true});
+  pub = h.bridge.getBridgePublic();
+  assert.deepEqual([pub.fixItems[0].state, pub.fixItems[0].hasClient], ['claimed', true]);
+  assert.ok(offer.jobId.startsWith(pub.fixItems[0].id) && offer.jobId !== pub.fixItems[0].id, 'a short id, never the full one');
+  const text = JSON.stringify(pub.fixItems);
+  for (const secret of [FIX.prompt, offer.leaseId, offer.jobId, 'chrome-1']) assert.equal(text.includes(secret), false, secret);
+  h.bridge.completeBridgeFix(offer.jobId, 'OK', undefined, offer.leaseId);
+  assert.equal(await pending, 'OK');
+});

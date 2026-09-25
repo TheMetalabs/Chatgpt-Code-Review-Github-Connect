@@ -58,10 +58,12 @@ Rules the table encodes:
   nothing about the finding that first reply may carry (`unparsedText`). Nor may any text of a local
   reply itself be set aside: when canonicalizing a completed reply to its review JSON discards substantive
   text around the object (`extractChatJsonParts`; whitespace and the one complete code fence wrapping the
-  object do not count — any run of three or more backticks or tildes, closed by a run of the same
+  object do not count — any run of three or more backticks or tildes, with any CommonMark info string
+  (`application/json`, `json title="…"`; a backtick run's may not hold a backtick), closed by a run of the same
   character at least as long, or left open with nothing after the object (CommonMark closes it at the
   end of the reply), and a bare fence line that is the only text after the object (an empty block) —
-  while any other fence marker is kept as text; cells `clean × fencedClean`, `clean × unclosedFence`), the
+  while any other fence marker is kept as text; cells `clean × fencedClean`, `clean × unclosedFence`,
+  `clean × mimeFencedClean`), the
   reply is kept verbatim (`residualReplies`, one-shot and multi-turn alike) and the object is not a
   verdict — prose before a clean object can be the finding. These two reply-text rules (`unparsedText`,
   `residualReplies`) are local-only, because only a local leg's reply is the model's own completion

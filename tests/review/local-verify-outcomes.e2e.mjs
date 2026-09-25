@@ -54,6 +54,8 @@ const LOCAL={
   fencedClean:{answer:answer('````json\n'+cleanJson+'\n````')},
   // the clean object alone in a fence the reply never closes: CommonMark closes it at the end
   unclosedFence:{answer:answer('```json\n'+cleanJson+'\n')},
+  // the clean object alone in a fence whose info string is a MIME type (any CommonMark info string)
+  mimeFencedClean:{answer:answer('```application/json\n'+cleanJson+'\n```')},
   assumesSkipped:{answer:answer(assumesSkippedJson)},
   findings:{answer:answer(dirtyJson)},
   unparseable:{answer:answer(LOCAL_RAW)},
@@ -101,6 +103,7 @@ const CELLS={
   'clean x clean':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
   'clean x fencedClean':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
   'clean x unclosedFence':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
+  'clean x mimeFencedClean':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
   'clean x assumesSkipped':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
   'clean x findings':posted(SUMMARY,MF,1,{note:/chatgpt found nothing; local verification found 1\./,stamp:'verify'}),
   'clean x unparseable':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
@@ -127,6 +130,7 @@ const CELLS={
   'none x clean':fallback(SUMMARY,MR,1,{why:WHY_NOT_VERDICT}),
   'none x fencedClean':fallback(SUMMARY,MR,1,{why:WHY_NOT_VERDICT}),
   'none x unclosedFence':fallback(SUMMARY,MR,1,{why:WHY_NOT_VERDICT}),
+  'none x mimeFencedClean':fallback(SUMMARY,MR,1,{why:WHY_NOT_VERDICT}),
   'none x assumesSkipped':fallback(SUMMARY,MR,1,{why:WHY_NOT_VERDICT}),
   'none x findings':fallback(SUMMARY,MF,1),
   'none x unparseable':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW'],why:WHY_CHAT_REJECTED+WHY_UNPARSEABLE}),
@@ -269,6 +273,7 @@ test('race outcome: a parseable chat reply the review schema rejects is posted v
 const RACE_CELLS={
   'clean x clean':posted(CLEAN,M0,1),
   'clean x unclosedFence':posted(CLEAN,M0,1),
+  'clean x mimeFencedClean':posted(CLEAN,M0,1),
   // a reply the gate rejects beside a usable one is evidence, never a clean total=0
   'none x clean':posted(SUMMARY,MR,1,{raw:['CHAT-RAW'],why:WHY_NOT_VERDICT}),
   'malformed x clean':posted(SUMMARY,MR,1,{raw:['CHAT-RAW'],why:WHY_NOT_VERDICT}),

@@ -84,6 +84,17 @@ describe("extractChatJsonParts: what canonicalizing a reply to its review JSON d
     assert.deepEqual(fence("~~~"), { json: PAYLOAD, residual: "" });
   });
 
+  it("nothing when the object's fence carries any CommonMark info string", () => {
+    for (const info of ["application/json", "json title=\"review.json\"", " json ", "{.json #review}", "c++", "json;charset=utf-8"]) {
+      assert.deepEqual(extractChatJsonParts(`\`\`\`${info}\n${PAYLOAD}\n\`\`\``), { json: PAYLOAD, residual: "" }, info);
+      assert.deepEqual(extractChatJsonParts(`~~~~${info}\n${PAYLOAD}\n~~~~`), { json: PAYLOAD, residual: "" }, `~ ${info}`);
+      assert.deepEqual(extractChatJsonParts(`\`\`\`${info}\n${PAYLOAD}\n`), { json: PAYLOAD, residual: "" }, `unclosed ${info}`);
+    }
+    // a tilde fence's info string may hold backticks; a backtick run followed by one is inline code, not a fence
+    assert.deepEqual(extractChatJsonParts(`~~~ json \`review\`\n${PAYLOAD}\n~~~`), { json: PAYLOAD, residual: "" });
+    assert.equal(extractChatJsonParts(`\`\`\` json \`review\`\n${PAYLOAD}\n\`\`\``)?.residual, "``` json `review`");
+  });
+
   it("nothing when the object's fence runs to the end of the reply (CommonMark closes it there)", () => {
     for (const open of ["```json", "````", "~~~"]) {
       for (const end of ["", "\n", "\r\n", "\n  \n"]) {

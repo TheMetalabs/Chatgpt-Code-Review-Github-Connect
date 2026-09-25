@@ -84,6 +84,9 @@ export function extractChatJsonParts(text: string): { json: string; residual: st
 /** Remove the complete code fence directly around the accepted object, and nothing else: an opening
  * run of three or more backticks (or tildes), at a line start, with an optional info string, right
  * before it, and a closing run of the same character at least as long (CommonMark) right after it.
+ * The info string is whatever CommonMark allows (`application/json`, `json title="review"`): any text
+ * after a tilde run, and any text without a backtick after a backtick run (a backtick there makes the
+ * line inline code, not a fence).
  * Any fence length counts, so a four-backtick fence is not left behind as residual text. An opening
  * fence with only whitespace after the object is complete too: CommonMark closes an unclosed fence at
  * the end of the document, so that block holds the object alone. A bare fence line (no info string)
@@ -93,8 +96,8 @@ export function extractChatJsonParts(text: string): { json: string; residual: st
 function unwrapFence(before: string, after: string): { before: string; after: string } {
   const head = before.trimEnd();
   const lineStart = head.lastIndexOf("\n") + 1;
-  const open = /^[ \t]*(`{3,}|~{3,})[ \t]*[\w-]*$/.exec(head.slice(lineStart));
-  if (!open) return { before, after: bareFenceOnly(after) ? "" : after };
+  const open = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(head.slice(lineStart));
+  if (!open || (open[1][0] === "`" && open[2].includes("`"))) return { before, after: bareFenceOnly(after) ? "" : after };
   const tail = after.trimStart();
   if (!tail) return { before: head.slice(0, lineStart), after: "" };
   const close = new RegExp(`^${open[1][0]}{${open[1].length},}[ \\t]*(?=\\r?\\n|$)`).exec(tail);

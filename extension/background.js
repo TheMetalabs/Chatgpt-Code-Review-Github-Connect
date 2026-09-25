@@ -47,6 +47,13 @@ const inventoryUpgrades = new Map();
 /** Replaces the worker is still recording (removed tab id -> added id): set as onReplaced is
  * dispatched, before rekeyReplacedTab's first await, and cleared once it settled (see replacedSince). */
 const replacingTabs = new Map();
+/** Every replace this worker saw (removed tab id -> added id), kept for its life: a chain A -> B -> C
+ * resolves to C (liveTabId), also for a record written under A or B after its replace was handled.
+ * Chrome never reuses a tab id within a browser session. */
+const replacedTabIds = new Map();
+/** The one ordered lane for re-keys (Ashlar 4101062763): each replace runs after the one dispatched
+ * before it, so B -> C finds what A -> B wrote for B. */
+let replaceTail = Promise.resolve();
 const admissionLanes = new Map();
 const admissionReports = new Map();
 let registryPromise;
@@ -128,12 +135,33 @@ async function rememberClosedTab(tabId, info) {
  * first, then the leg's state.tabId moves (recorded as a tab_rekeyed step): a lane that reads the new
  * id finds its records in place. A leg that already released its tab (cleanupDone: closed or
  * preserved) is left as it is: following the tab would not make it Ashlar's again. */
-async function rekeyReplacedTab(addedTabId, removedTabId) {
-  if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return;
-  // Synchronously, as the listener runs: the leg moves only after the storage round trips below.
+function rekeyReplacedTab(addedTabId, removedTabId) {
+  if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return Promise.resolve();
+  // Synchronously, in dispatch order, as the listener runs: the leg moves only after the storage round
+  // trips of every earlier replace and of this one (replacedSince covers the ids meanwhile).
+  replacedTabIds.set(removedTabId, addedTabId);
   replacingTabs.set(removedTabId, addedTabId);
-  try { await moveReplacedTab(addedTabId, removedTabId); }
-  finally { if (replacingTabs.get(removedTabId) === addedTabId) replacingTabs.delete(removedTabId); }
+  // To the chain's END when the lane gets to it: a later replace of the added id already dispatched
+  // (A -> B, then B -> C) moves A's records straight to C.
+  return inReplaceLane(() => moveReplacedTab(liveTabId(removedTabId), removedTabId))
+    .finally(() => { if (replacingTabs.get(removedTabId) === addedTabId) replacingTabs.delete(removedTabId); });
+}
+function inReplaceLane(operation) {
+  const pending = replaceTail.then(operation);
+  replaceTail = pending.catch(() => {}); // a failed re-key must not block the next one
+  return pending;
+}
+/** The id Chrome's replaces moved `tabId` to (itself when none did). */
+function liveTabId(tabId) {
+  let id = tabId;
+  for (let hops = 0; replacedTabIds.has(id) && hops < 64; hops++) id = replacedTabIds.get(id);
+  return id;
+}
+/** A record naming `tabId` was just written, but Chrome already replaced that id (the replace was
+ * handled before the write: the allocation's first records, a lane that still held the old id): the
+ * record, and the leg if it still names that id, follow the chain in the replace lane. */
+async function followReplacedTab(tabId) {
+  if (Number.isInteger(tabId) && replacedTabIds.has(tabId)) await inReplaceLane(() => moveReplacedTab(liveTabId(tabId), tabId));
 }
 async function moveReplacedTab(addedTabId, removedTabId) {
   invalidateTabInventory(removedTabId);
@@ -177,9 +205,12 @@ function replacedSince(state, lookedUp) {
 
 async function rememberOwnedTab(job, provider, closing = false) {
   const state = job.states[provider];
-  if (state.tabId) await chrome.storage.session.set({[OWNED_PREFIX + state.tabId]: {
+  const tabId = state.tabId;
+  if (!tabId) return;
+  await chrome.storage.session.set({[OWNED_PREFIX + tabId]: {
     jobId: job.jobId, provider, runId: state.runId, closedKey: closedKey(job, provider), closing,
   }});
+  await followReplacedTab(tabId);
 }
 
 /** Whether this browser session recorded `tabId` as this leg's tab (allocateProviderTab writes the
@@ -890,7 +921,7 @@ async function allocateProviderTab(job, provider, jobs) {
       await rememberOwnedTab(job, provider);
       // The delivery record says `created` only now that the tab exists and carries its owned record.
       // A failed promotion is not fatal: that owned record proves the tab (reconcileFixDeliveries).
-      await promoteFixDelivery(job, provider, created.id).catch(() => {});
+      await promoteFixDelivery(job, provider, created.id).then(() => followReplacedTab(created.id)).catch(() => {});
       delete state.allocating;
       await saveJobs(jobs); // Durable binding before any prompt dispatch.
     } catch (error) {
@@ -1126,7 +1157,9 @@ async function preserveFixTab(job, provider, jobs, reason, tab, cause, extra) {
     // keeps what the verdict reply and the poll already carried.
     if (abandonedLeg(job, state) && matchesJob(released, job, provider)) ingestPageProgress(state, released);
   }
-  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: state.tabId}});
+  const preservedTabId = state.tabId;
+  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: preservedTabId}});
+  await followReplacedTab(preservedTabId);
   if (tab) await reprobePreservedTab(tab.id, provider);
   return finishTabCleanup(job, provider, jobs, reason, cause);
 }

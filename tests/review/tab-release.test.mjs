@@ -707,6 +707,56 @@ test('a leg whose tab the worker closed is not revived by a late replace naming 
   assert.equal(states.chatgpt.tabId, 10);assert.deepEqual(states.chatgpt.workerEvents.map(e => e.stage), ['tab_closed']);
   assert.equal(states.grok.tabId, 20);assert.equal(states.grok.workerEvents, undefined);
 });
+// Ashlar 4101062763: Chrome fires A -> B and then B -> C before the first re-key's storage round trips
+// finished. Re-keys run in one ordered lane, and each moves its records to the END of the chain known
+// when it runs, so nothing is left naming the dead intermediate id B; lanes that look B up meanwhile
+// are told the tab lives on (replacedSince).
+test('back-to-back replaces (A -> B -> C, the first still recording) end at C: the leg and its ownership, preserved and fix delivery records', async () => {
+  const backstop = 'ashlar:preserved:fix-A:chatgpt:run-A';
+  const session = createdHere('fix');session.state[backstop] = {tabId: 10};
+  const b = worker(leg('fix', {}, {deliveryId: 'delivery-A'}), {session, tab: {id: 10, url: TEMP, status: 'complete'}});
+  b.local.state['ashlar:fixDeliveries'] = {'fix-A': {deliveryId: 'delivery-A', provider: 'chatgpt', phase: 'created', tabId: 10, at: Date.now()}};
+  const state = (await b.jobs())['fix-A'].states.chatgpt;
+  // The first re-key's first storage read is held until the second replace has been dispatched.
+  const get = b.session.get;let release, first = true;const gate = new Promise(resolve => { release = resolve; });
+  b.session.get = async keys => { if (keys == null && first) { first = false;await gate; } return get(keys); };
+  b.tabs.delete(10);b.tabs.set(12, {id: 12, url: TEMP, status: 'complete'});
+  const ab = b.context.rekeyReplacedTab(11, 10);
+  const bc = b.context.rekeyReplacedTab(12, 11);
+  for (let i = 0; i < 10; i++) await flush();
+  assert.ok(b.context.replacedSince(state, 10) && b.context.replacedSince(state, 11), 'A and B are covered while the chain settles');
+  release();await ab;
+  assert.ok(b.context.replacedSince(state, 11), 'B is never taken for a tab that is gone');
+  await bc;
+  assert.equal(state.tabId, 12, 'the leg names the live tab');
+  assert.equal(b.pending().states.chatgpt.tabId, 12, 'persisted');
+  assert.deepEqual({jobId: b.session.state['ashlar:tab:12']?.jobId, replacedBy: b.session.state['ashlar:tab:12']?.replacedBy}, {jobId: 'fix-A', replacedBy: undefined}, 'the ownership record names C');
+  assert.equal(b.session.state['ashlar:tab:10']?.replacedBy, 12, 'A\'s record says where its tab went');
+  assert.deepEqual(b.session.state[backstop], {tabId: 12}, 'the preserved record names C');
+  assert.equal(b.local.state['ashlar:fixDeliveries']['fix-A'].tabId, 12, 'the fix delivery record names C');
+  assert.equal(b.context.replacedSince(state, 12), false, 'settled');
+});
+// A record written under an id Chrome already replaced (here the allocation's first records: the
+// replace reached the worker before chrome.tabs.create's reply was handled) follows the chain too.
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: an allocation whose new tab Chrome replaced before its records were written dispatches into the live tab, never a second one`, async () => {
+    const unbound = (_id, m) => (m.type === 'ashlar-run' ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle', jobId: '', runId: '', provider: 'chatgpt'});
+    const b = worker(leg(kind, {started: false, tabId: undefined}), {tab: null, handler: unbound});
+    const create = b.chrome.tabs.create;
+    b.chrome.tabs.create = async options => {
+      const tab = await create(options);
+      b.tabs.delete(tab.id);b.tabs.set(tab.id + 1000, {...tab, id: tab.id + 1000});
+      await b.context.rekeyReplacedTab(tab.id + 1000, tab.id);
+      return tab;
+    };
+    await b.tick();await b.tick();
+    const live = [...b.tabs.keys()];
+    assert.equal(live.length, 1, 'no second tab was opened for the leg');
+    assert.equal(b.pending().states.chatgpt.tabId, live[0], 'the leg names the live tab');
+    assert.equal(b.session.state[`ashlar:tab:${live[0]}`]?.jobId, leg(kind).jobId, 'its creation record follows it');
+    assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' && !m.resume).map(m => m.id), [live[0]], 'dispatched once, into the live tab');
+  });
+}
 /** Chrome already swapped tab 10's page into `tab`, but the onReplaced event reaches the worker only
  * while it searches for the leg's tab (findOriginalTab's query), after the old id's lookup failed.
  * Dispatched as the real listener does it: not awaited (`b.rekeyed` settles once it is recorded), so

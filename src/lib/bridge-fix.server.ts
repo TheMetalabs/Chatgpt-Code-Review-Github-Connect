@@ -102,29 +102,28 @@
  *     after a restart nothing can ever be delivered and the extension must release that tab;
  *   - the prompt inlines file contents: it is dropped at settlement and never copied into an
  *     error, a status or a log line;
- *   - the prompt is delivered VERBATIM, byte-exact, from request() to the composer: the route never
- *     converts it to an attachment protocol (routes/api/bridge.ts promptsForClient) and the page
- *     never splits, uploads or trims it (extension/composer.js promptParts), so a file line that looks
- *     like an attachment envelope stays file content. The only intended change is the runtime's
- *     fence rule appended before request() (review-loop-runtime requestChatFix). The page verifies
- *     the prompt LOSSLESSLY (composer.js fixPromptForm: only CRLF->LF and the whitespace at the two
- *     ends of the whole prompt): the composer draft before Send (a draft whose whitespace the editor
- *     changed is never sent: `prompt_altered`) and the sent turn after it (json.js
- *     journaledTurnIntegrity against the journal's `exact` form). The whitespace-normalized
- *     comparison (normalizePrompt) only locates the sent turn;
- *   - the extension types the WHOLE prompt into the chat composer and confirms the send by finding
- *     that text in the rendered user message. A prompt over maxPromptChars() (default 100k chars,
- *     Settings fix_agent.chat_max_prompt_chars) is rejected up front instead of risking a submission that
- *     can never be confirmed (it would only end at the deadline). The file contents are NOT moved
- *     into the <<<ASHLAR_ATTACHMENTS_V2>>> upload envelope: a full-file rewrite needs the model to
- *     see every byte of the current file, and a chat may read attachments through retrieval — a
- *     partial view becomes a confidently wrong "complete" file.
+ *   - a chatgpt fix (review-loop-runtime requestChatFix) carries its full request as ONE file
+ *     attachment (fix-attachment.ts, #93: the composer does not keep typed whitespace). `prompt` is
+ *     then one whitespace-canonical line naming the file and its SHA-256, and the worker receives
+ *     both as the fix-only frame (fixDeliveryText); the route never converts it to the review
+ *     attachment protocol (routes/api/bridge.ts promptsForClient). The page recomputes the hash
+ *     over the bytes it stages, uploads the file and waits until it is staged, or fails the run
+ *     (`attachment_failed`); it never pastes the source into the typed prompt. The typed line is
+ *     still verified LOSSLESSLY (composer.js fixPromptForm): the draft before Send
+ *     (`prompt_altered`) and the sent turn after it (json.js journaledTurnIntegrity against the
+ *     journal's `exact` form); being canonical, a whitespace-collapsing composer keeps it exact;
+ *   - the typed prompt is at most maxPromptChars() (default 100k chars, Settings
+ *     fix_agent.chat_max_prompt_chars) and the attachment at most FIX_ATTACHMENT_MAX_BYTES; either
+ *     over its limit is rejected up front instead of risking a submission that can never be
+ *     confirmed (it would only end at the deadline). A prompt with no attachment (a direct
+ *     registry caller) is typed verbatim, as before.
  * NON-GOALS: parsing or validating the answer (fix-apply / the runtime); review JSON, capture or
  * repair; persistence across restarts; tab management (the extension, driven by these states).
  */
 
 import { createHash } from "node:crypto";
 import { createdBefore, nextCreationSeq } from "./creation-seq.ts";
+import { fixAttachmentProblem, fixDeliveryText, type FixAttachment } from "./fix-attachment.ts";
 
 export type FixChatProvider = "chatgpt";
 export type FixItemState = "queued" | "claimed" | "done" | "failed" | "cancelled";
@@ -154,6 +153,9 @@ export interface FixRequest {
   pr: number;
   provider: FixChatProvider;
   prompt: string;
+  /** The full fix request as a file (fix-attachment.ts): `prompt` is then the one typed line that
+   * names it and its SHA-256, and the worker receives both (fixDeliveryText). */
+  attachment?: FixAttachment;
   /** Deadline override (clamped like the env value); default deps.timeoutMs(). */
   timeoutMs?: number;
   /** The caller's cancellation (head moved, loop stopped, its own deadline): cancels the item.
@@ -206,6 +208,8 @@ export interface FixItem {
   provider: FixChatProvider;
   /** Emptied at settlement (it inlines file contents). */
   prompt: string;
+  /** The request's source file (FixRequest.attachment); dropped at settlement like the prompt. */
+  attachment?: FixAttachment;
   createdAt: number;
   /** Process-wide creation order shared with review jobs (creation-seq.ts): breaks a createdAt tie. */
   createdSeq: number;
@@ -277,6 +281,9 @@ const labelOf = (item: Pick<FixItem, "owner" | "repo" | "pr">) => `${item.owner}
 const oneLine = (text: string) => String(text ?? "").replace(/\s+/g, " ").trim().slice(0, ERROR_MAX);
 const minutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 
+/** What the worker receives for an item: its typed prompt, and its attachment's frame when it has one. */
+const delivered = (item: FixItem) => (item.attachment ? fixDeliveryText(item.prompt, item.attachment) : item.prompt);
+
 /** Why a request cannot be queued at all (undefined = acceptable). Never echoes the prompt. */
 function requestProblem(req: FixRequest, maxChars: number): string | undefined {
   if (req?.provider !== "chatgpt") {
@@ -286,6 +293,10 @@ function requestProblem(req: FixRequest, maxChars: number): string | undefined {
     return "fix request needs owner, repo and a PR number";
   }
   if (typeof req.prompt !== "string" || !req.prompt.trim()) return "empty fix prompt";
+  if (req.attachment !== undefined) {
+    const problem = fixAttachmentProblem(req.prompt, req.attachment);
+    if (problem) return problem;
+  }
   if (req.prompt.length > maxChars) {
     return `fix prompt is ${req.prompt.length} chars; the Chrome bridge types the whole prompt into the chat composer and accepts at most ${maxChars} (Settings → Fix agent / review loop → fix_agent.chat_max_prompt_chars) — raise that limit, use the local fix provider or split the PR`;
   }
@@ -312,6 +323,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     item.reason = reason;
     item.endedAt = deps.now();
     item.prompt = "";
+    item.attachment = undefined;
     item.generating = false;
     const waiter = waiters.get(item.id);
     waiters.delete(item.id);
@@ -381,6 +393,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       pr: req.pr,
       provider: req.provider,
       prompt: req.prompt,
+      ...(req.attachment ? { attachment: req.attachment } : {}),
       createdAt: now,
       createdSeq: nextCreationSeq(),
       deadlineAt: now + timeoutMs,
@@ -488,7 +501,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       resumeProviders: resume ? [item.provider] : [],
       ...(resume ? { bindings: [{ jobId: item.id, provider: item.provider, runId: resume }] } : {}),
       leaseId,
-      prompt: item.prompt,
+      prompt: delivered(item),
       reasoning: deps.reasoning(),
       title: `fix ${labelOf(item)}`,
       owner: item.owner,
@@ -563,7 +576,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
 
   function prompt(id: string): { prompt: string } | null {
     const item = current(id);
-    return item && live(item) && item.prompt ? { prompt: item.prompt } : null;
+    return item && live(item) && item.prompt ? { prompt: delivered(item) } : null;
   }
 
   /** The lease holder hands the lease back (review: releaseBridgeJob). It frees the parallelPrs

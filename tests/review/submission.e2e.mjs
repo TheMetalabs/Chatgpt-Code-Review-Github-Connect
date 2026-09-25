@@ -27,16 +27,33 @@ test('submission: disabled upload/send controls may wait for days without fallin
  await acknowledge(page);await page.clock.runFor(500);assert.equal((await page.evaluate(()=>result)).submitted,true);
 });
 
-test('submission: a no-op click is not confirmation, and delayed ACK never resends',async t=>{
+test('submission: a no-op click is not confirmation, and a delayed ACK within the window never resends',async t=>{
  const page=await fixture(t);await start(page);await page.clock.runFor(500);
  assert.equal((await page.evaluate(()=>result)).pending,true,'click is only an attempt, not provider receipt');
- await page.clock.fastForward(365*24*3600_000);assert.equal(await page.evaluate(()=>clicks),1);
+ await page.clock.runFor(45_000);assert.equal(await page.evaluate(()=>clicks),1);
  await acknowledge(page);await page.clock.runFor(500);assert.equal((await page.evaluate(()=>result)).submitted,true);assert.equal(await page.evaluate(()=>clicks),1);
+});
+
+// The live 1.1.29 run sat in send_unconfirmed for 10+ minutes after a click ChatGPT dropped.
+test('submission: a click whose turn never renders ends as send_unconfirmed after 60 s and is never resent',async t=>{
+ const page=await fixture(t);await start(page);await page.clock.runFor(59_000);
+ assert.equal((await page.evaluate(()=>result)).pending,true);
+ await page.clock.runFor(2_000);
+ assert.match((await page.evaluate(()=>result)).error||'',/no sent turn appeared within 60 seconds/);
+ assert.equal(await page.evaluate(()=>clicks),1);
 });
 
 test('submission: a cleared composer or a different user turn is not the owned request',async t=>{
  const page=await fixture(t);await start(page);await acknowledge(page,'personal message');await page.clock.runFor(1000);
  assert.equal((await page.evaluate(()=>result)).pending,true);assert.equal(await page.evaluate(()=>clicks),1);
+});
+
+test('submission: a rendered but disabled Send stops the search; a looser selector never finds another button',async t=>{
+ const page=await fixture(t,{disabled:true});
+ await page.evaluate(()=>{document.querySelector('form').insertAdjacentHTML('beforeend','<button type="submit" id="other" style="width:40px;height:20px">x</button>');window.composer=()=>document.querySelector('textarea');});
+ assert.equal(await page.evaluate(()=>findEligibleSendButton(['#composer-submit-button','button[type="submit"]'])?.id??null),null);
+ await page.evaluate(()=>{document.querySelector('#composer-submit-button').disabled=false;});
+ assert.equal(await page.evaluate(()=>findEligibleSendButton(['#composer-submit-button','button[type="submit"]']).id),'composer-submit-button');
 });
 
 test('submission: hidden matching controls are skipped in favor of the visible owned form button',async t=>{

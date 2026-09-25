@@ -1177,13 +1177,18 @@ test('real popup: a running review and tab-capacity blocker are shown together',
 // (upload='ok'), no chip (upload='none') or a chip whose upload never ends (upload='stuck'); the
 // composer may collapse typed whitespace like the real one (collapse).
 const FIX_SOURCE='Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\\treturn \\"a  b\\"\\n"\n\n\n    pass  # two  spaces\t\n';
-async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true}={}){
+// upload='slow': the chip renders after 2 s with a progress ring (no role, no animate-spin) and Send is
+// marked disabled the way a styled control is (data-disabled, pointer-events:none) until the upload ends
+// at 20 s; a Send click meanwhile is swallowed (the live 1.1.29 failure: send_attempted, no turn).
+// upload='error': the same ring, then at 3 s the chip turns to an error state and an error toast shows.
+// upload='rejected': no chip; an error toast at 1.5 s. swallow: every Send click is ignored.
+async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await setFixContent(page,`<main></main><form data-type="unified-composer">${fileInput?'<input type="file" multiple>':''}<div id="chips"></div><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>`);
- await page.evaluate(({stop,upload,collapse})=>{
+ await page.evaluate(({stop,upload,collapse,swallow})=>{
   const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A']]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
-  window.__saved=saved;window.sends=0;window.uploads=[];
+  window.__saved=saved;window.sends=0;window.clicks=0;window.uploads=[];window.uploading=false;
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
   const composer=document.querySelector('#prompt-textarea');
   // the real composer's whitespace handling: every whitespace run becomes one space
@@ -1192,6 +1197,23 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true}={}){
    for(const file of event.target.files){
     window.uploads.push({name:file.name,bytes:[...new Uint8Array(await file.arrayBuffer())]});
     if(upload==='none')continue;
+    const send=document.querySelector('[data-testid="send-button"]');
+    const toast=text=>document.body.insertAdjacentHTML('beforeend',`<div role="alert" style="width:240px;height:30px">${text}</div>`);
+    if(upload==='rejected'){setTimeout(()=>toast('Unable to upload '+file.name+': upload failed'),1500);continue;}
+    if(upload==='slow'||upload==='error'){
+     window.uploading=true;send.dataset.disabled='true';send.style.pointerEvents='none';
+     setTimeout(()=>{
+      const chip=document.createElement('div');chip.dataset.fileName=file.name;chip.style.cssText='width:120px;height:24px';chip.textContent=file.name;
+      chip.insertAdjacentHTML('beforeend','<svg class="ring" aria-label="Uploading" style="width:20px;height:20px"><circle cx="10" cy="10" r="8" stroke-dasharray="50" stroke-dashoffset="30"></circle></svg>');
+      document.querySelector('#chips').append(chip);
+      setTimeout(()=>{
+       chip.querySelector('svg').remove();
+       if(upload==='error'){chip.dataset.state='error';chip.insertAdjacentHTML('beforeend','<span role="alert" style="display:inline-block;width:60px;height:20px">Upload failed</span>');toast('Upload failed for '+file.name);return;}
+       window.uploading=false;delete send.dataset.disabled;send.style.pointerEvents='';
+      },upload==='error'?1000:18000);
+     },2000);
+     continue;
+    }
     const chip=document.createElement('div');chip.dataset.fileName=file.name;chip.style.cssText='width:80px;height:20px';chip.textContent=file.name;
     if(upload==='stuck'){const bar=document.createElement('div');bar.setAttribute('role','progressbar');bar.style.cssText='width:40px;height:4px';chip.append(bar);}
     document.querySelector('#chips').append(chip);
@@ -1199,6 +1221,7 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true}={}){
    event.target.value='';
   });
   document.querySelector('[data-testid="send-button"]').addEventListener('click',event=>{
+   event.preventDefault();window.clicks++;if(window.uploading||swallow)return;
    window.sends++;
    window.atClick={text:composer.value,chips:[...document.querySelectorAll('#chips [data-file-name]')].map(chip=>chip.dataset.fileName)};
    const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';
@@ -1208,7 +1231,7 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true}={}){
    turn.append(userTurn);document.querySelector('main').append(turn);
    composer.value='';document.querySelector('#chips').replaceChildren();event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
   });
- },{stop,upload,collapse});
+ },{stop,upload,collapse,swallow});
  for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(()=>{Object.assign(__ashlarRunnerState,{kind:'fix',jobId:'fix-A',runId:'run-A',running:true});});
  const fill=async(delivery,ms=1600)=>{
@@ -1270,6 +1293,48 @@ for(const [name,opts,ms,detail] of [
  });
 }
 
+// The live 1.1.29 failure (temporary chat): attachments_waiting resolved 27 ms before prompt_prepared,
+// Send was clicked while the upload was still running, and the run sat in send_unconfirmed for its
+// whole deadline. Ashlar waits for THIS file's chip with no upload in progress and an enabled Send.
+test('real DOM: a fix waits for its chip to finish uploading (progress ring, styled-disabled Send) and only then sends',async t=>{
+ const {attachment,typed,text}=await fixDelivery();
+ const {page,fill,journal}=await attachmentPage(t,{upload:'slow'});
+ const early=await fill(text,10_000);
+ assert.deepEqual([await page.evaluate(()=>window.clicks),early.sends,early.sent],[0,0,false],'no Send click while the upload runs: '+JSON.stringify(early));
+ await page.clock.runFor(15_000);
+ const out=await page.evaluate(()=>({clicks:window.clicks,sends:window.sends,sent:window.sent===true,atClick:window.atClick}));
+ assert.deepEqual(out,{clicks:1,sends:1,sent:true,atClick:{text:typed,chips:[attachment.name]}});
+ assert.equal((await journal()).phase,'sent');
+});
+
+for(const [name,upload,ms,detail] of [
+ ['an upload whose chip turns to an error',  'error',   8_000, /its chip shows an error: Upload failed/],
+ ['an upload the page refuses with an error toast','rejected',5_000, /Unable to upload ashlar-fix/],
+]){
+ test(`real DOM: ${name} ends the fix as attachment_failed at once, and nothing is sent`,async t=>{
+  const {text}=await fixDelivery();
+  const {page,fill,journal}=await attachmentPage(t,{upload});
+  const out=await fill(text,ms);
+  assert.equal(out.code,'attachment_failed',JSON.stringify(out));
+  assert.match(out.error,detail);assert.match(out.error,/nothing was sent$/);
+  assert.deepEqual([await page.evaluate(()=>window.clicks),out.sends,out.composer],[0,0,''],'no click, nothing typed');
+  assert.equal(await journal(),null,'nothing prepared');
+ });
+}
+
+test('real DOM: a Send click that produces no user turn ends as send_unconfirmed within a minute, with no second click',async t=>{
+ const {text}=await fixDelivery();
+ const {page,fill,journal}=await attachmentPage(t,{swallow:true});
+ const early=await fill(text,30_000);
+ assert.deepEqual([early.code,early.sent,await page.evaluate(()=>window.clicks)],[undefined,false,1],'clicked once, still waiting for the turn at 30 s');
+ await page.clock.runFor(35_000);
+ const out=await page.evaluate(()=>({...window.filled,clicks:window.clicks}));
+ assert.equal(out.code,'send_unconfirmed',JSON.stringify(out));
+ assert.match(out.error,/no sent turn appeared within 60 seconds/);
+ assert.equal(out.clicks,1,'never clicked again');
+ assert.equal((await journal()).phase,'attempted');
+});
+
 test('real DOM (#93): a fix attachment whose bytes do not match the hash, a typed line without the hash, or a broken frame is never staged or sent',async t=>{
  const {attachment,typed,text}=await fixDelivery();
  const {fixDeliveryText}=await attachmentLib();
@@ -1298,4 +1363,15 @@ test('real DOM (#93): a fix attachment over the 512 KiB cap is refused before an
  assert.equal(out.code,'attachment_too_large');
  assert.match(out.error,new RegExp(`is ${body.length} bytes; at most ${FIX_ATTACHMENT_MAX_BYTES} bytes`));
  assert.deepEqual([out.sends,out.composer,(await uploads()).length],[0,'',0]);
+});
+
+test('real DOM: a stray disabled Send earlier in DOM order does not hide the real enabled one (same selector)',async t=>{
+ const page=await fixture(t,'');
+ await page.evaluate(()=>{document.body.insertAdjacentHTML('beforeend','<form><div id="prompt-textarea" contenteditable="true"></div><button type="button" aria-label="Send prompt" id="stray" disabled>Send</button><button type="button" aria-label="Send prompt" id="real">Send</button></form>');});
+ await page.addScriptTag({content:source('extension/composer.js')});
+ const id=await page.evaluate(()=>findEligibleSendButton(['button[aria-label*="Send"]'])?.id||null);
+ assert.equal(id,'real');
+ // Only a disabled Send under the selector: no looser selector is tried.
+ await page.evaluate(()=>document.getElementById('real').setAttribute('disabled',''));
+ assert.equal(await page.evaluate(()=>findEligibleSendButton(['button[aria-label*="Send"]','button[type="button"]'])?.id||null),null);
 });

@@ -1126,7 +1126,7 @@ function compactFinalCapturedSource(state) {
 
 /** Why a tab is kept open (the preserve_<cause> history stage; a function so tests can read it). */
 function preserveCauses() {
-  return ["navigated", "user_turn", "edited", "draft", "regenerated", "ownership_unknown", "unreachable", "other_binding", "undelivered", "unknown"];
+  return ["navigated", "user_turn", "edited", "draft", "regenerated", "stalled", "ownership_unknown", "unreachable", "other_binding", "undelivered", "unknown"];
 }
 
 /** Whether a leg ever had a tab, or may have one: an id it opened or adopted, a dispatched run, a
@@ -1609,6 +1609,9 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   }
   // The page's own steps (context_changed, cancelled, ...) reach history from cleanup replies too.
   ingestPageProgress(state, result);
+  // The page freed its slot: the review leg stalled (#87) under a Stop that never clears, so no close
+  // is ever proven. Kept and retired at once, like a takeover.
+  if (result.reason === "stalled") return preserveFixTab(job, provider, jobs, "review stalled under a stuck Stop; tab preserved", tab, "stalled");
   const verdict = tabVerdict(result, job.kind);
   if (verdict.ownership === "unknown") {
     // Another conversation than the one the run was bound in (an in-page move can leave the old DOM

@@ -75,7 +75,7 @@ They are not a signed-in ChatGPT/Grok/production Local-model smoke test or a hea
 memory benchmark. The repository's existing legacy brand/PWA test failures remain
 unchanged and enabled.
 
-## Tab queue (#85, extension 1.1.23.2)
+## Tab queue (#85, extension 1.1.25)
 
 Every Chrome tab operation runs in one first-in-first-out queue (`tabOp` in
 `extension/background.js`): opening a tab, messaging its page, closing, reloading,

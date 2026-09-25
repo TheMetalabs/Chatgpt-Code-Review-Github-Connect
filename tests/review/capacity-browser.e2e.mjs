@@ -85,10 +85,19 @@ test('full source archive failure retains tab and blocks admission until recover
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'storage recovery did not release source');
 });
 
-test('a full pool of genuinely generating tabs stays pending without capture or forced eviction',async t=>{
+// #87: the generating lease bounds a mounted answer that stops progressing. Still pending at 14 min
+// (no capture, no forced eviction); at 16 min the leg fails as `stalled`, and its tab, whose Stop
+// never clears, is kept (never closed) while the leg retires and frees its slot.
+test('a full pool of genuinely generating tabs stays pending until the generating lease fails them as stalled',async t=>{
  const f=await fixture(t);await f.page.evaluate(()=>{const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Stop';document.querySelector('form').append(stop);});await f.page.clock.runFor(1000);
- await f.cycle();await f.page.clock.fastForward(365*24*3600_000);await f.cycle();
+ await f.cycle();await f.page.clock.runFor(14*60_000);await f.cycle();
  assert.equal(f.worker.closedTabs.length,0);assert.equal(f.worker.calls.some(c=>c.action==='capture'),false);assert.equal(f.app.localRequests.length,0);
+ assert.equal(f.worker.calls.some(c=>c.action==='failure'),false,'still pending at 14 min');
+ await f.page.clock.runFor(2*60_000);
+ await eventually(async()=>{await f.cycle();return f.worker.calls.some(c=>c.action==='failure'&&/^stalled:/.test(c.error));},'the lease never failed the stalled leg');
+ await eventually(async()=>{await f.cycle();return !f.worker.local.state.pendingReviewJobs[f.job.jobId];},'the stalled leg never retired');
+ assert.equal(f.worker.closedTabs.length,0,'kept under its Stop');assert.equal(f.worker.calls.some(c=>c.action==='capture'),false);assert.equal(f.app.localRequests.length,0);
+ assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true,'the kept tab holds no tab capacity');
 });
 
 test('native result cleanup can rehydrate an ACKed page without restarting its collector',async t=>{

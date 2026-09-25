@@ -87,6 +87,7 @@ const TOP_LEVEL = {
   reviewLocal: {bad: ['true', 1, null], good: false},
   fixAgent: {bad: [null, false, 'off', [], 1], good: {mode: 'apply'}},
   localJsonRepairEnabled: {bad: ['false', 0, null], good: false},
+  localRepairNoThinking: {bad: ['true', 1, null], good: true},
   chatgptReasoning: {bad: ['bogus', '', 3, null], good: 'high'},
   grokReasoning: {bad: ['bogus', '', 3, null], good: 'fast'},
   localLlmBaseUrl: {bad: [42, null, {}], good: 'http://127.0.0.1:1234/v1'},

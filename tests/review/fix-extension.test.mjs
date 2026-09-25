@@ -168,8 +168,8 @@ test('page: a draft typed and cleared while the sent turn is unresolved keeps th
 // R17 (Ashlar 4101855318, P1): the collector pins the response of its first answered observation.
 // The user regenerates it before the second stable observation: boundReviewResponse now binds the
 // newest reply, which must end the run (taken_over, tab preserved), never become the fix answer. With
-// no response ID the rendered node is the pin; a re-render of the pinned ID, or the same node, is
-// still the same response (controls).
+// no response ID the assistant message node is the pin; a re-render of the pinned ID, or the same
+// node, is still the same response (controls).
 const REGENERATED = '{"summary":"regenerated","files":[],"dispositions":[]}';
 const PIN_CASES = {
   regenerated: {ids: ['response-A', 'response-B'], newNode: true, want: {code: 'taken_over'}},
@@ -180,11 +180,12 @@ const PIN_CASES = {
 for (const [name, cell] of Object.entries(PIN_CASES)) {
   test(`page: a fix response ${name} after its first answered observation ${cell.want.code ? 'ends the run (taken_over), never collected' : 'is still collected (control)'}`, async () => {
     const p = page({limit: 12});
-    const first = {}, later = () => (cell.newNode ? {} : first);
+    // the turn container (root) stays; the assistant message node inside it is what regenerates
+    const root = {}, first = {}, later = () => (cell.newNode ? {} : first);
     Object.assign(p.c.context, {
       boundReviewResponse: () => (p.polls() < 1
-        ? {identified: true, followup: false, root: first, responseId: cell.ids[0]}
-        : {identified: true, followup: false, root: later(), responseId: cell.ids[1]}),
+        ? {identified: true, followup: false, root, message: first, responseId: cell.ids[0]}
+        : {identified: true, followup: false, root, message: later(), responseId: cell.ids[1]}),
       assistantCodeBlocks: () => [p.polls() < 1 || cell.same ? ANSWER : REGENERATED],
     });
     Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});

@@ -207,7 +207,7 @@ function boundReviewResponse(submission) {
   // is safe only when it contains no user or unrelated response messages.
   const root = container && [...container.querySelectorAll('[data-message-author-role]')].every(node => replies.includes(node))
     ? container : message;
-  return {root, followup: next >= 0, identified: true, responseId: message.getAttribute("data-message-id") || ""};
+  return {root, followup: next >= 0, identified: true, responseId: message.getAttribute("data-message-id") || "", message};
 }
 
 /** Each call is a fresh observation; the tracker also runs after native JSON
@@ -539,8 +539,8 @@ function fixOwnershipProof(state, {phase, completion, journal, pinned} = {}) {
   if (draftText && normalizePrompt(draftText) !== submission.expected) return takeOver("draft");
   // 4. ("collect") The pinned response. boundReviewResponse always binds the LAST reply after the
   // sent turn, so a response regenerated after the first answered observation would bind instead:
-  // any other response (another ID; with no ID, another rendered node) is the user's.
-  if (pinned && bound.root && ((bound.responseId || "") !== pinned.responseId || (!pinned.responseId && bound.root !== pinned.root))) {
+  // any other response (another ID; with no ID, another assistant message node) is the user's.
+  if (pinned && bound.root && ((bound.responseId || "") !== pinned.responseId || (!pinned.responseId && bound.message !== pinned.message))) {
     return takeOver("response_changed");
   }
   if (!bound.identified) {
@@ -666,8 +666,8 @@ async function waitUntilFixOrQuota(name) {
     if (!answered) recordReviewStep(!done && (stop || streaming) ? "generating" : "waiting_for_response");
     throwIfQuota(name, bound, answered);
     if (answered) {
-      // Its ID (the rendered node when it has none): the only response a later poll may collect.
-      stability.pinned ||= {responseId: bound.responseId || "", root: bound.root};
+      // Its ID (its message node when it has none): the only response a later poll may collect.
+      stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
       if (settleStableAnswer(stability, text, poll, {text, raw: text})) return text;
     } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));

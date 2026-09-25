@@ -197,11 +197,11 @@ test('real DOM: a fix item harvests its fenced JSON (no review JSON) only after 
 // and frees the managed slot, and its reply carries no ownership verdict for the worker to act on.
 const CANCEL_PAGES={
  bound:{html:'<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">answer</div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main>',
-  journal:{phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:'about:blank'}},
+  journal:{phase:'sent',expected:'fix prompt',exact:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:'about:blank'}},
  draft:{html:'<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section></main>',draft:'my own question',
-  journal:{phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:'about:blank'}},
+  journal:{phase:'sent',expected:'fix prompt',exact:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:'about:blank'}},
  edited:{html:'<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt and my own words</div></section></main>',
-  journal:{phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:'about:blank'}},
+  journal:{phase:'sent',expected:'fix prompt',exact:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:'about:blank'}},
  unsent:{html:'<main></main>',draft:'fix prompt',journal:{phase:'attempted',expected:'fix prompt',baseline:0}},
  blank:{html:'<main></main>',journal:null},
 };
@@ -251,7 +251,7 @@ async function conversationPage(t,kind,{url=kind==='fix'?TEMP_URL:CONV_URL,jobId
   :`<html><body><main>${turns}</main>${stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form></body></html>`;
  await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',body:html}));
  await page.clock.install();await page.goto(url);
- const journals={click:{phase:'prepared',expected:'fix prompt',baseline:0,attachments:[]},
+ const journals={click:{phase:'prepared',expected:'fix prompt',exact:'fix prompt',baseline:0,attachments:[]},
   legacy:{phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A'},
   reload:{phase:'attempted',expected:'fix prompt',baseline:0,attachments:[]}};
  await page.evaluate(({jobId,journal,turns,stop})=>{
@@ -658,7 +658,7 @@ async function setFixContent(page,html){
 }
 /** A fix run's page: this run's user turn (user-A) and an assistant response (response-A) with
  * `inner`, plus its submission journal (`journal` null = none yet). */
-async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:SENT_HERE},{done=true}={}){
+async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',exact:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:SENT_HERE},{done=true}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await setFixContent(page,`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown">${inner}</div></div>${done?'<button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button>':''}</section></main>${done?'':stop}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
  await page.evaluate(journal=>{
@@ -678,7 +678,7 @@ async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',basel
 // bridge-lease-conformance.test.mjs). A shared cell asserts one outcome for both kinds; an intended
 // difference asserts each kind's documented outcome.
 const KIND_ANSWER='{"findings":[],"merge_recommendation":"COMMENT","investigated_safe":["fixture checked"],"summary":"s","files":[]}';
-async function kindPage(t,kind,{done=true,journal={phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:kind==='fix'?SENT_HERE:'about:blank'},extra=''}={}){
+async function kindPage(t,kind,{done=true,journal={phase:'sent',expected:'fix prompt',...(kind==='fix'?{exact:'fix prompt'}:{}),baseline:0,submittedUsers:1,messageId:'user-A',conversation:kind==='fix'?SENT_HERE:'about:blank'},extra=''}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  const html=`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here.</p><pre><code>${KIND_ANSWER}</code></pre></div></div>${done?toolbar:''}</section></main>${done?'':stop}${extra}<form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`;
  // a fix page is served at the temporary chat (the only page a fix is proven in); a review page is unchanged
@@ -769,7 +769,7 @@ test('real DOM: a fix is harvested only from the response bound to its own sent 
  // the same page once the journal binds this run's turn: its response is the answer
  const page=await fixPage(t,unrelated,{phase:'attempted',expected:'fix prompt',baseline:0});
  await page.clock.runFor(3200);
- await page.evaluate(()=>window.__saved.set('ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})));
+ await page.evaluate(()=>window.__saved.set('ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',exact:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})));
  await page.clock.runFor(3200);
  assert.equal((await page.evaluate(()=>window.fixOut)).raw,code);
 });
@@ -886,12 +886,154 @@ test(`real DOM: a fix prompt whose inlined source holds ${name} reaches the comp
 });
 }
 
+// R17 (Ashlar 4101855330): a fix prompt inlines source whose whitespace is content, so it is verified
+// LOSSLESSLY (composer.js fixPromptForm: only CRLF->LF and the two ends of the whole prompt), never by
+// the whitespace-collapsing normalizePrompt a review prompt keeps. Each alteration changes ONE whitespace
+// sequence (every one is invisible to normalizePrompt).
+const WS_PROMPT='Fix F1. Current content of src/a.py:\n\ndef f(x):\n\tif x:\n\t\treturn "a  b\t c"\n\n\n    pass  # two  spaces\nReturn the JSON object.';
+const WS_ALTERATIONS={
+ tabToSpaces:text=>text.replace('\t\t','\t    '),
+ stringSpacesCollapsed:text=>text.replace('"a  b','"a b'),
+ blankLinesMerged:text=>text.replace('\n\n\n','\n\n'),
+ indentDropped:text=>text.replace('\n    pass','\n  pass'),
+ newlineToSpace:text=>text.replace(':\n\tif',': \tif'),
+};
+/** A temporary-chat fix page with a textarea composer. `editor(value)` is what the editor keeps of a
+ * typed value; `render(value)` is the text of the sent turn the provider renders from the composer. */
+async function whitespacePage(t,{kind='fix',editor=null,render=null}={}){
+ const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
+ await setFixContent(page,'<main></main><form data-type="unified-composer"><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>');
+ await page.evaluate(({stop,editor,render})=>{
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A']]);
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
+  window.__saved=saved;window.sends=0;
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+  const composer=document.querySelector('#prompt-textarea');
+  if(editor){const alter=new Function('return '+editor)();composer.addEventListener('input',()=>{composer.value=alter(composer.value);});}
+  document.querySelector('[data-testid="send-button"]').addEventListener('click',event=>{
+   window.sends++;
+   const shown=render?new Function('return '+render)()(composer.value):composer.value;
+   const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';
+   const userTurn=document.createElement('div');userTurn.dataset.messageAuthorRole='user';userTurn.dataset.messageId='user-A';userTurn.textContent=shown;
+   turn.append(userTurn);document.querySelector('main').append(turn);
+   composer.value='';event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
+  });
+ },{stop,editor:editor&&editor.toString(),render:render&&render.toString()});
+ for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ await page.evaluate(kind=>{Object.assign(__ashlarRunnerState,{kind:kind==='fix'?'fix':undefined,jobId:'fix-A',runId:'run-A',running:true});},kind);
+ const journal=()=>page.evaluate(()=>JSON.parse(window.__saved.get('ashlar:submission:fix-A:run-A')||'null'));
+ const fill=async(prompt=WS_PROMPT)=>{
+  await page.evaluate(prompt=>{window.filled={pending:true};
+   fillComposer(composer(),prompt).then(text=>{window.filled={text};return clickSend(sendButton,composer,text);})
+    .then(()=>{window.sent=true;},e=>{window.filled={error:e.message,code:e.code};});},prompt);
+  await page.clock.runFor(1600);
+  return page.evaluate(()=>({...window.filled,sends:window.sends,sent:window.sent===true}));
+ };
+ return {page,journal,fill};
+}
+for(const [name,alter] of Object.entries(WS_ALTERATIONS)){
+ test(`real DOM: a fix prompt whose editor changes one whitespace sequence (${name}) is never sent; a review prompt still is`,async t=>{
+  assert.notEqual(alter(WS_PROMPT),WS_PROMPT,'the fixture alters the prompt');
+  const fix=await whitespacePage(t,{editor:alter});
+  assert.deepEqual(await fix.fill(),{code:'prompt_altered',error:"the composer changed the fix prompt's whitespace; it was not sent",sends:0,sent:false});
+  assert.equal(await fix.journal(),null,'nothing was prepared, nothing sent');
+  // a review prompt keeps the whitespace-normalized comparison: the same editor is accepted
+  const review=await whitespacePage(t,{kind:'review',editor:alter});
+  const out=await review.fill();
+  assert.deepEqual([out.error,out.sends,out.sent],[undefined,1,true]);
+ });
+ test(`real DOM: a fix draft changed (${name}) after it was filled is caught before Send`,async t=>{
+  const {page,journal}=await whitespacePage(t);
+  await page.evaluate(({prompt,altered})=>{document.querySelector('#prompt-textarea').value=altered;window.out={pending:true};
+   clickSend(sendButton,composer,prompt).then(()=>{window.out={sent:true};},e=>{window.out={code:e.code};});},{prompt:WS_PROMPT,altered:alter(WS_PROMPT)});
+  await page.clock.runFor(1600);
+  assert.deepEqual({out:await page.evaluate(()=>window.out),sends:await page.evaluate(()=>window.sends),phase:(await journal()).phase},
+   {out:{code:'prompt_altered'},sends:0,phase:'prepared'});
+ });
+ test(`real DOM: a fix whose sent turn renders the prompt with one whitespace sequence changed (${name}) is never harvested`,async t=>{
+  const {page,fill,journal}=await whitespacePage(t,{render:alter});
+  assert.deepEqual(await fill(),{text:WS_PROMPT,sends:1,sent:true},'the composer held the prompt exactly; the send is confirmed');
+  assert.equal((await journal()).exact,WS_PROMPT,'the journal carries the lossless form');
+  const code='{"summary":"s","files":[],"dispositions":[]}';
+  await page.evaluate(({code,toolbar})=>{
+   document.querySelector('[data-testid="stop-button"]').remove();
+   document.querySelector('main').insertAdjacentHTML('beforeend',`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><pre><code>${code}</code></pre></div></div>${toolbar}</section>`);
+   window.fixOut={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={code:e.code};});
+  },{code,toolbar});
+  await page.clock.runFor(3200);
+  assert.deepEqual(await page.evaluate(()=>window.fixOut),{code:'taken_over'});
+  assert.equal(await page.evaluate(()=>__ashlarRunnerState.tabRepurposed),true,'the tab is preserved as the user\'s');
+ });
+}
+test('real DOM: a prepared fix journal with no lossless prompt form is never sent, even with the prompt held exactly',async t=>{
+ const {page}=await whitespacePage(t);
+ await page.evaluate(prompt=>{
+  window.__saved.set('ashlar:submission:fix-A:run-A',JSON.stringify({phase:'prepared',expected:normalizePrompt(prompt),baseline:0,attachments:[]}));
+  document.querySelector('#prompt-textarea').value=prompt;window.out={pending:true};
+  clickSend(sendButton,composer,prompt).then(()=>{window.out={sent:true};},e=>{window.out={code:e.code};});
+ },WS_PROMPT);
+ await page.clock.runFor(1600);
+ assert.deepEqual({out:await page.evaluate(()=>window.out),sends:await page.evaluate(()=>window.sends)},{out:{code:'prompt_altered'},sends:0});
+});
+test('real DOM: a fix prompt with tabs, runs of spaces and blank lines, sent through CRLF, round-trips and is harvested (control)',async t=>{
+ const {page,fill,journal}=await whitespacePage(t);
+ // the textarea stores CRLF as LF: a transport change the lossless form undoes
+ const crlf=WS_PROMPT.replace(/\n/g,'\r\n');
+ const out=await fill(crlf);
+ assert.deepEqual(out,{text:crlf,sends:1,sent:true});
+ assert.equal((await journal()).exact,WS_PROMPT);
+ const code='{"summary":"s","files":[],"dispositions":[]}';
+ await page.evaluate(({code,toolbar})=>{
+  // the provider stores line endings as LF and trims the message: the lossless form is unchanged
+  const turn=document.querySelector('[data-message-id="user-A"]');turn.textContent=`\n${turn.textContent.replace(/\n/g,'\r\n')}\n`;
+  document.querySelector('[data-testid="stop-button"]').remove();
+  document.querySelector('main').insertAdjacentHTML('beforeend',`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><pre><code>${code}</code></pre></div></div>${toolbar}</section>`);
+  window.fixOut={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={code:e.code};});
+ },{code,toolbar});
+ await page.clock.runFor(3200);
+ assert.deepEqual(await page.evaluate(()=>window.fixOut),{raw:code});
+});
+// ChatGPT's composer is a rich editor holding one <p> per line (an empty line: <p><br class=
+// "ProseMirror-trailingBreak"></p>). Its innerText separates the <p> blocks by a blank line, so the
+// lossless reading is structural (composer.js losslessText); a changed whitespace sequence still fails.
+test('real DOM: a rich-editor composer holding the fix prompt one <p> per line reads back exactly; one changed sequence does not',async t=>{
+ const page=await browser.newPage();t.after(()=>page.close());
+ await page.setContent('<form><div id="prompt-textarea" contenteditable="true" class="ProseMirror" style="white-space:pre-wrap;width:400px;min-height:60px"></div></form>');
+ await page.addScriptTag({content:source('extension/composer.js')});
+ const read=text=>page.evaluate(text=>{
+  const el=document.querySelector('#prompt-textarea');el.replaceChildren();
+  for(const line of text.split('\n')){const p=document.createElement('p');if(line)p.textContent=line;else{const br=document.createElement('br');br.className='ProseMirror-trailingBreak';p.append(br);}el.append(p);}
+  return {holds:composerHoldsFix(el,fixPromptForm(text===window.altered?window.original:text)),innerTextExact:fixPromptForm(el.innerText)===fixPromptForm(window.original)};
+ },text);
+ await page.evaluate(original=>{window.original=original;},WS_PROMPT);
+ assert.deepEqual(await read(WS_PROMPT),{holds:true,innerTextExact:false},'held exactly (innerText would not be)');
+ for(const [name,alter] of Object.entries(WS_ALTERATIONS)){
+  await page.evaluate(altered=>{window.altered=altered;},alter(WS_PROMPT));
+  assert.equal((await read(alter(WS_PROMPT))).holds,false,name);
+ }
+});
+
+// Control, through the browser's own editing path: a pre-wrap rich editor typed into with
+// execCommand insertText holds each line in a <div> (a blank one as <div><br></div>), whose innerText
+// adds blank lines; the lossless reading is the prompt exactly, so the fix is filled, never aborted.
+test('real DOM: a fix prompt typed into a pre-wrap rich editor is held exactly (control)',async t=>{
+ const page=await browser.newPage();t.after(()=>page.close());
+ await page.setContent('<form><div id="prompt-textarea" contenteditable="true" style="white-space:pre-wrap;width:400px;min-height:60px"></div></form>');
+ await page.addScriptTag({content:source('extension/composer.js')});
+ const out=await page.evaluate(async prompt=>{
+  window.__ashlarRunnerState={kind:'fix'};window.composer=()=>document.querySelector('#prompt-textarea');
+  const filled=await fillComposer(composer(),prompt).catch(e=>e.code);
+  return {filled:filled===prompt,holds:composerHoldsFix(composer(),fixPromptForm(prompt)),innerTextExact:fixPromptForm(composer().innerText)===fixPromptForm(prompt)};
+ },WS_PROMPT);
+ assert.deepEqual(out,{filled:true,holds:true,innerTextExact:false});
+});
+
 test('real DOM: a completed fix with prose around its fence still proves its own tab (can close)',async t=>{
  const code='{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await setFixContent(page,`<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">fix prompt</div></section><section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><p>Here is the fix.</p><pre><code>${code}</code></pre></div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div></form>`);
  await page.evaluate(()=>{
-  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})]]);
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A'],['ashlar:submission:fix-A:run-A',JSON.stringify({phase:'sent',expected:'fix prompt',exact:'fix prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})]]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
  });

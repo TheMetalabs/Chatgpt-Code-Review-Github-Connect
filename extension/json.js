@@ -415,7 +415,9 @@ async function waitUntilReviewOrQuota(name) {
  * turn by containment, so a turn the user edited (a prefix or suffix around the prompt) still
  * binds. "exact": the turn (by its journaled message ID when exactly one matches, else by its
  * recorded position) is the prompt; "edited": it holds more or other text, so it is the user's;
- * "unknown": the turn is not rendered/resolvable. Independent of the composer draft. */
+ * "unknown": the turn is not rendered/resolvable. Independent of the composer draft. A fix journal
+ * compares its prompt's lossless form (`exact`, composer.js fixPromptForm): a turn whose whitespace
+ * differs from the prompt in any other way is not it; a review journal compares normalized text. */
 function journaledTurnIntegrity(submission, users) {
   if (!submission?.expected) return "unknown";
   let turn;
@@ -426,6 +428,7 @@ function journaledTurnIntegrity(submission, users) {
     turn = users[submission.submittedUsers - 1];
   }
   if (!turn) return "unknown";
+  if (typeof submission.exact === "string") return fixPromptForm(messagePromptText(turn)) === submission.exact ? "exact" : "edited";
   return normalizePrompt(messagePromptText(turn)) === submission.expected ? "exact" : "edited";
 }
 
@@ -512,8 +515,11 @@ function fixOwnershipProof(state, {phase, completion, journal, pinned} = {}) {
   // 1. The conversation. The rendered turn proves its content only; an in-page (SPA) move to another
   // conversation can leave this DOM on screen under the new URL, or remove it: the proof holds only
   // in the conversation recorded when the send was proven (composer.js submissionConfirmed); a
-  // journal without one never gains it.
-  if (submission.conversation !== fixChatPage()) return verdict("unknown", "unestablished", {identity: "unestablished"});
+  // journal without one never gains it. Nor does one without its prompt's lossless form (`exact`,
+  // recorded by composer.js clickSend when the send is prepared): its turn can never be proven exact.
+  if (submission.conversation !== fixChatPage() || typeof submission.exact !== "string") {
+    return verdict("unknown", "unestablished", {identity: "unestablished"});
+  }
   if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
   // 2. The journal-addressable sent turn (its message ID, else its recorded position) holds EXACTLY
   // Ashlar's prompt. boundReviewResponse only proves the turn CONTAINS it, and finds no turn at all

@@ -23,7 +23,7 @@ function page({parts = PARTS, blocks = [PARTS[1]], limit = 50, bound = true} = {
   c.context.location = {href: URL_FIX}; // the page still shows the conversation the fix was sent in
   let polls = 0;
   // conversation: recorded by composer.js submissionConfirmed when the send was proven
-  const journal = bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX} : null;
+  const journal = bound ? {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX} : null;
   Object.assign(c.context, {
     readSubmissionJournal: async () => journal,
     // every later fix decision re-reads the same journal (fixOwnershipProof)
@@ -100,6 +100,9 @@ const COLLECT_VERDICTS = {
   // round 13: a sent journal with no send-time identity (legacy, or confirmed only after a reload)
   // never gains one: the collector never records it from the current location
   unestablished: {permanent: true, journal: {conversation: undefined}},
+  // R17 (Ashlar 4101855330): a fix journal without its prompt's lossless form (composer.js clickSend
+  // records `exact`) can never prove its sent turn exact
+  noLosslessForm: {permanent: true, journal: {exact: undefined}},
   unreadableLocation: {permanent: true, set: c => { c.location = {href: ''}; }},
   turnUnrendered: {permanent: false, set: c => { c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
   // round 15: a permanent verdict is decided BEFORE the response must be identified: moved away with
@@ -118,7 +121,7 @@ for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
   test(`page: collect verdict "${name}" ${verdict.permanent ? 'ends the fix run at once (taken_over), slot freed' : 'is transient: the collector keeps polling'}`, async () => {
     const p = page({limit: 12});
     if (verdict.journal) {
-      const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX, ...verdict.journal};
+      const journal = {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX, ...verdict.journal};
       Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
     }
     verdict.set?.(p.c.context);
@@ -207,7 +210,7 @@ for (const reasoning of [...CHATGPT_REASONING, undefined]) {
   test(`page: an untouched confirmed fix on the tab the worker opens for reasoning ${reasoning} is owned`, async () => {
     const opened = background().context.providerUrl('chatgpt', reasoning);
     const p = page();
-    const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: opened};
+    const journal = {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: opened};
     Object.assign(p.c.context, {location: {href: opened}, readSubmissionJournal: async () => journal, savedSubmission: () => journal});
     Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
     assert.equal(p.c.context.fixOwnershipProof(p.state(), {phase: 'collect', journal}).ownership, 'owned', opened);
@@ -457,7 +460,7 @@ test('page: a fix whose send-time conversation is not the temporary chat is neve
     const p = page();
     // the page shows exactly the conversation the send was proven in, but it is not the temporary chat
     p.c.context.location = {href: where};
-    const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: where};
+    const journal = {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: where};
     Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
     Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
     await assert.rejects(p.c.context.waitUntilFixOrQuota('ChatGPT'), error => error.code === 'taken_over' && /cannot be identified/.test(error.message), where);

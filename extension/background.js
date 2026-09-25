@@ -4,6 +4,12 @@ const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
 const CLOSED_PREFIX = "ashlar:closed:";
 const OWNED_PREFIX = "ashlar:tab:";
+// The tab a leg's run was dispatched into, written when the page accepted it ({jobId, provider,
+// runId, tabId, at}): chrome.storage.session survives a stopped or suspended worker (a tab id is
+// meaningful only within one browser session). It is the proof that lets the worker re-bind that
+// tab's page when the page lost its binding (rebindDispatchedPage), never any other tab.
+const DISPATCH_PREFIX = "ashlar:dispatched:";
+const dispatchKey = (jobId, provider) => `${DISPATCH_PREFIX}${jobId}:${provider}`;
 // A fix run whose tab the worker preserved without the page's own release (it never answered):
 // the inventory treats that page's binding as released, so it is never an orphan holding capacity,
 // and completes the release handshake as soon as the page can answer (see completePreservedRelease).
@@ -299,13 +305,25 @@ function bridgeTransportError(cause, body) {
   return error;
 }
 
+/** How long one bridge request may take (a function so tests can shorten it): a request the bridge
+ * never answers (a hung take, a stalled proxy) fails as a transport error instead of holding its
+ * lane (admission, a job's claim or observation, the heartbeat) forever; the caller retries on a
+ * later tick. A result upload (`complete`, `capture`) keeps no deadline: its outbox is kept until the
+ * server ACKs it, however slowly its body arrives (long-wait.test.mjs), and it holds only its job's
+ * lane. */
+function apiTimeoutMs() { return 30_000; }
+const UNBOUNDED_BRIDGE_ACTIONS = new Set(["complete", "capture"]);
+
 async function api(path, body, expectedOrigin, signal) {
   const { origin, token } = await settings();
   if (!origin || !token) throw new Error("set origin and token in the popup");
   if (expectedOrigin && expectedOrigin !== origin) throw new Error("bridge origin changed; original job preserved");
+  // The request (headers and body) is bounded by apiTimeoutMs (but a result upload), and by the caller's signal if any.
+  const timeout = UNBOUNDED_BRIDGE_ACTIONS.has(body?.action) ? undefined : AbortSignal.timeout(apiTimeoutMs());
+  const requestSignal = signal && timeout ? AbortSignal.any([signal, timeout]) : signal || timeout;
   let res;
   try {
-    // Model completion and saved-result delivery have NO application deadline.
+    // Model completion and saved-result delivery have NO application deadline (a request does).
     // Browser/network failures retain the outbox; separate per-job/heartbeat lanes
     // keep unrelated work moving. Server ACK is independent of publication below.
     // A caller MAY pass a signal to cancel (e.g. the periodic sweep's watchdog); normal callers omit it.
@@ -315,7 +333,7 @@ async function api(path, body, expectedOrigin, signal) {
       method: body ? "POST" : "GET",
       headers: {"content-type": "application/json", "x-ashlar-bridge-token": token},
       body: body ? JSON.stringify({...body, fixProtocol: 1, token}) : undefined,
-      signal,
+      signal: requestSignal,
     });
   } catch (cause) {
     throw bridgeTransportError(cause, body);
@@ -1720,6 +1738,7 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
       const tabs = {...old.tabs};
       for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
       await chrome.storage.session.set({tabs});
+      await chrome.storage.session.remove(job.providers.map(p => dispatchKey(job.jobId, p)));
       await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
       await rememberRetired(job);
     });
@@ -1805,6 +1824,45 @@ async function unrecordedTabWait(job, provider, jobs) {
   await saveJobs(jobs);
 }
 
+/** A page that answers unbound (no jobId: a new document that lost its session binding, e.g. after
+ * ChatGPT reloaded it or moved it to /c/<id>) in the tab this browser session dispatched the leg's
+ * run into (dispatchKey) is re-bound to that run: it is sent the run as a RESUME (adoptLegacy), so it
+ * observes the conversation and never types or sends the prompt again. Only that exact tab and run
+ * qualify; a page bound to anything else answers job_mismatch and is left alone. The page's reply,
+ * or null when the tab does not qualify or the page did not answer. */
+async function rebindDispatchedPage(job, provider, run, result) {
+  const state = job.states[provider];
+  if (!state.started || result?.jobId !== "" || !Number.isInteger(state.tabId)) return null;
+  const key = dispatchKey(job.jobId, provider);
+  const record = (await chrome.storage.session.get([key]))[key];
+  if (record?.runId !== state.runId || record.tabId !== state.tabId || record.provider !== provider) return null;
+  try {
+    const reply = await askPage(state.tabId, {...run, resume: true, adoptLegacy: true}, contentFiles(provider));
+    if (matchesJob(reply, job, provider)) workerStep(job, provider, "run_rebound");
+    return reply;
+  } catch { return null; }
+}
+
+/** How long a started leg may wait for its lost binding: the server's BINDING_LOST_MS (#95). */
+const BINDING_LOST_MS = 10 * 60_000;
+
+/** A started leg whose run no page answers for (`message`: why) waits for its binding to come back,
+ * but not forever: from the first such wait (bindingLostAt, cleared by a matching reply), after
+ * BINDING_LOST_MS the leg fails locally (`binding_lost`), and that failure is delivered and its tab
+ * released like any other, instead of heartbeating "disconnected" until someone clears it. */
+async function waitForBinding(job, provider, jobs, message) {
+  const state = job.states[provider];
+  state.connectionError = message;
+  state.bindingLostAt ??= Date.now();
+  if (Date.now() - state.bindingLostAt >= BINDING_LOST_MS) {
+    delete state.connectionError;
+    delete state.bindingLostAt;
+    state.outcome = failure("binding_lost", `the run's page binding stayed unavailable for ${BINDING_LOST_MS / 60_000} minutes (${message})`);
+    workerStep(job, provider, "binding_lost");
+  }
+  await saveJobs(jobs);
+}
+
 /** Why a page refused a new run message (json.js, before it binds anything): "taken_over" (its tab
  * is not the fresh page the run may start on), "stale_run" (it arrived after its `until`); "" when
  * it did not refuse. A refusal comes from an unbound page, so it never names this run. */
@@ -1883,7 +1941,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (!state.tabId && (state.started || job.resumeProviders?.includes(provider))) {
     const original = await findOriginalTab(job, provider);
     if (original) { state.tabId = original.id; state.started = true; await saveJobs(jobs); }
-    else { state.connectionError = "original review tab unavailable; waiting for reconnection"; await saveJobs(jobs); return; }
+    else return waitForBinding(job, provider, jobs, "original review tab unavailable; waiting for reconnection");
   }
   if (!state.tabId) {
     if (observeOnly) return;
@@ -1930,7 +1988,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   try { tab = await chrome.tabs.get(state.tabId); }
   catch {
     tab = await findOriginalTab(job, provider);
-    if (!tab) { state.connectionError = "tab connection unknown; waiting for reconnection"; await saveJobs(jobs); return; }
+    if (!tab) return waitForBinding(job, provider, jobs, "tab connection unknown; waiting for reconnection");
     state.tabId = tab.id; state.started = true; await saveJobs(jobs);
   }
   // A discarded tab holds no page (and a woken one that never finishes loading still holds none):
@@ -1981,6 +2039,8 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
         state.started = true;
         workerStep(job,provider,"run_dispatched");
         await saveJobs(jobs);
+        await chrome.storage.session.set({[dispatchKey(job.jobId, provider)]:
+          {jobId: job.jobId, provider, runId: state.runId, tabId: state.tabId, at: Date.now()}});
       }
     } else {
       result = await askPage(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
@@ -2008,12 +2068,14 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   // into the same tab, with a new deadline.
   if (refused === "stale_run") return;
   if (await discardWaitOver(job, provider, jobs, matchesJob(result, job, provider) && discardedRunProven(result, dispatched))) return;
+  if (!observeOnly && (result?.code === "disconnected" || !matchesJob(result, job, provider))) {
+    const rebound = await rebindDispatchedPage(job, provider, run, result);
+    if (rebound) result = rebound;
+  }
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
-    state.connectionError = "original job binding unavailable; waiting for reconnection";
     const original = await findOriginalTab(job, provider);
     if (original && original.id !== state.tabId) { state.tabId = original.id; state.started = true; }
-    await saveJobs(jobs);
-    return;
+    return waitForBinding(job, provider, jobs, "original job binding unavailable; waiting for reconnection");
   }
   if (ingestPageProgress(state, result)) await saveJobs(jobs);
   if (result.observation && typeof result.observation === "object") {
@@ -2032,6 +2094,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (adopted || answeredAt) await saveJobs(jobs);
   await rememberOwnedTab(job, provider);
   delete state.connectionError;
+  delete state.bindingLostAt;
   if (isBusyResult(result)) return;
   // A fix answer is taken only with the page's positive ownership verdict for it (json.js
   // fixAnswerReply: the full proof, re-established when the answer is handed out).

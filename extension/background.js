@@ -572,8 +572,9 @@ async function tabCapacityReport(jobs, reservePending = false) {
   const orphanTabs = tabs.filter(tab=>{
     const owner=knownTabOwner(tab);
     if(!owner?.jobId || owner.released || ids.has(tab.id) || session[preservedKey(owner.jobId,owner.provider,owner.runId)])return false;
+    // Only the SAME run's retired leg frees it: a binding of another run of that job still holds a tab.
     const registered=jobs[owner.jobId]?.states?.[owner.provider];
-    return !registered?.cleanupDone;
+    return !(registered?.cleanupDone && registered.runId===owner.runId);
   });
   for(const tab of orphanTabs)ids.add(tab.id);
   let restorationReserved=0;
@@ -623,7 +624,9 @@ function updateFixDeliveries(change) {
  * never proof that a tab exists (reconcileFixDeliveries clears it unless a tab or binding proves it). */
 function beginFixDelivery(job, provider) {
   if (job.kind !== "fix" || typeof job.deliveryId !== "string" || !job.deliveryId) return Promise.resolve();
-  return updateFixDeliveries(all => { all[job.jobId] = {deliveryId: job.deliveryId, provider, phase: "creating", at: Date.now()}; });
+  return updateFixDeliveries(all => {
+    all[job.jobId] = {deliveryId: job.deliveryId, provider, phase: "creating", runId: job.states[provider]?.runId, at: Date.now()};
+  });
 }
 
 /** This browser session's identity (chrome.storage.session survives a worker restart, never a
@@ -685,7 +688,8 @@ async function fixAllocationEvidence(job, provider) {
 
 function forgetFixDelivery(job) {
   if (job.kind !== "fix") return Promise.resolve();
-  return updateFixDeliveries(all => { delete all[job.jobId]; });
+  // Only this delivery's record: another delivery of the job keeps its own.
+  return updateFixDeliveries(all => { if (all[job.jobId]?.deliveryId === job.deliveryId) delete all[job.jobId]; });
 }
 
 /** The fix deliveries that locally PROVE a tab: what admission lists in excludeJobIds and never
@@ -704,12 +708,16 @@ async function reconcileFixDeliveries(jobs) {
   const tabs = await chrome.tabs.query({}), live = new Map(tabs.map(tab => [tab.id, tab]));
   const session = await chrome.storage.session.get(null);
   const onProvider = (tab, provider) => Boolean(tab) && (!provider || allowedTab(tab, provider));
-  const boundTab = (jobId, provider) => {
+  // A binding proves a record only when it is the record's run (jobId + provider + runId; a legacy
+  // record without a runId matches the job and provider).
+  const sameRun = (binding, jobId, record) => binding?.jobId === jobId && (!binding.provider || binding.provider === record.provider) &&
+    (!record.runId || binding.runId === record.runId);
+  const boundTab = (jobId, record) => {
     for (const [key, value] of Object.entries(session)) {
-      const tab = key.startsWith(OWNED_PREFIX) && value?.jobId === jobId ? live.get(Number(key.slice(OWNED_PREFIX.length))) : undefined;
-      if (onProvider(tab, provider)) return tab.id;
+      const tab = key.startsWith(OWNED_PREFIX) && sameRun(value, jobId, record) ? live.get(Number(key.slice(OWNED_PREFIX.length))) : undefined;
+      if (onProvider(tab, record.provider)) return tab.id;
     }
-    return tabs.find(tab => knownTabOwner(tab)?.jobId === jobId && onProvider(tab, provider))?.id;
+    return tabs.find(tab => sameRun(knownTabOwner(tab), jobId, record) && onProvider(tab, record.provider))?.id;
   };
   const proven = {}, rewrite = {};
   for (const [jobId, record] of Object.entries(records)) {
@@ -718,7 +726,7 @@ async function reconcileFixDeliveries(jobs) {
     // record without one keeps its open-tab check).
     const recorded = await recordedFixTab(record, live);
     const createdTab = recorded.tab || (recorded.uncertain ? live.get(record.tabId) : undefined);
-    const tabId = onProvider(createdTab, record.provider) ? createdTab.id : boundTab(jobId, record.provider);
+    const tabId = onProvider(createdTab, record.provider) ? createdTab.id : boundTab(jobId, record);
     if (!tabId) { rewrite[jobId] = null; continue; }
     proven[jobId] = {...record, phase: "created", tabId};
     if (record.phase !== "created" || record.tabId !== tabId) rewrite[jobId] = proven[jobId];
@@ -802,7 +810,7 @@ async function finishTabCleanup(job, provider, jobs, reason) {
   // binding keeps that binding's record (its explicit-close tracking), whichever kind retires here.
   const ownedKey = OWNED_PREFIX + state.tabId;
   const owned = state.tabId ? (await chrome.storage.session.get([ownedKey]))[ownedKey] : undefined;
-  const mine = owned && owned.jobId === job.jobId && owned.provider === provider;
+  const mine = owned && owned.jobId === job.jobId && owned.provider === provider && owned.runId === state.runId;
   await chrome.storage.session.remove(mine ? [ownedKey, closedKey(job, provider)] : [closedKey(job, provider)]);
 }
 

@@ -612,6 +612,51 @@ test('worker: a promoted fix delivery whose tab the user explicitly closed befor
   assert.ok(b.calls.some(c => c.action === 'failure' && /explicitly closed/.test(c.error)), 'the run ends now, not at the deadline');
 });
 
+// Round 15 (Ashlar 4100156790): runId is part of a binding's identity (matchesJob, preservedKey,
+// closedKey), so every ownership comparison of a binding includes it. An older run's leg never
+// removes, proves or frees what a newer run of the same job and provider holds. Shared review code:
+// asserted for both kinds. Control: the matching run.
+const ownedRecord = runId => ({jobId: 'fix-A', provider: 'chatgpt', runId, closedKey: `ashlar:closed:fix-A:chatgpt:${runId}`, closing: false});
+for (const kind of ['review', 'fix']) for (const tabRun of ['run-B', 'run-A']) {
+  test(`worker (${kind}): a retiring leg of run-A ${tabRun === 'run-A' ? 'removes its own tab record (control)' : "keeps the newer run-B's record of that tab"}`, async () => {
+    const job = fixJob(kind === 'fix' ? {} : {kind: undefined});
+    const b = worker([job], {api: active});
+    await b.session.set({'ashlar:tab:10': ownedRecord(tabRun)});
+    const jobs = b.local.state.pendingReviewJobs;
+    await b.context.finishTabCleanup(jobs['fix-A'], 'chatgpt', jobs, 'test');
+    assert.deepEqual(b.session.state['ashlar:tab:10'], tabRun === 'run-A' ? undefined : ownedRecord('run-B'));
+  });
+}
+for (const bindingRun of ['run-0', 'run-A']) {
+  test(`worker: a delivery record of run-A is ${bindingRun === 'run-A' ? 'proven by its own run\'s binding (control)' : 'not proven by an older run\'s binding of the job'}`, async () => {
+    const {api, takes} = replayingServer();
+    const tabs = new Map([[101, {id: 101, url: URL_FIX, status: 'complete'}]]);
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {},
+      [DELIVERIES]: {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', runId: 'run-A', at: Date.now()}}}),
+    session: storage({'ashlar:tab:101': ownedRecord(bindingRun)}), tabs, api, handler: () => ({ok: false, code: 'busy', retry: true})});
+    const proven = await b.context.reconcileFixDeliveries({});
+    assert.equal(Boolean(proven['fix-A']), bindingRun === 'run-A');
+    assert.equal(Boolean(b.local.state[DELIVERIES]['fix-A']), bindingRun === 'run-A', 'an unproven record is cleared (replayed once)');
+    assert.equal(takes.length, 0);
+  });
+  test(`worker: a tab bound to ${bindingRun} of a job whose run-A leg retired ${bindingRun === 'run-A' ? 'is free (control)' : 'still counts against capacity'}`, async () => {
+    const job = fixJob({states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', delivered: true, cleanupDone: true}}});
+    const b = worker([job], {api: active, handler: (_id, m) => m.type === 'ashlar-tab-status'
+      ? {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: bindingRun, provider: 'chatgpt', released: false, url: URL_FIX} : {ok: false, code: 'busy'}});
+    await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+    const report = await b.context.tabCapacityReport(b.local.state.pendingReviewJobs);
+    assert.equal(report.orphanTabs, bindingRun === 'run-A' ? 0 : 1);
+  });
+}
+test('worker: retiring a fix job forgets only its own delivery record', async () => {
+  const b = worker([], {api: active});
+  await b.local.set({[DELIVERIES]: {'fix-A': {deliveryId: 'delivery-2', provider: 'chatgpt', phase: 'creating', at: Date.now()}}});
+  await b.context.forgetFixDelivery(fixJob({deliveryId: 'delivery-1'}));
+  assert.equal(b.local.state[DELIVERIES]['fix-A']?.deliveryId, 'delivery-2', 'a newer delivery keeps its record');
+  await b.context.forgetFixDelivery(fixJob({deliveryId: 'delivery-2'}));
+  assert.equal(b.local.state[DELIVERIES]['fix-A'], undefined);
+});
+
 test('worker: a cancelled fix tab that now carries another binding retires at once, leaving that binding untouched', async () => {
   const other = {ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B', provider: 'chatgpt'};
   const handler = (_id, m) => (m.type === 'ashlar-tab-status'

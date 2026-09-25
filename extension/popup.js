@@ -46,6 +46,7 @@ async function refreshDiagnostics() {
     disconnected: "Server unavailable; preserving pending work",
     maintenance: "Extension update lock active; new review admission paused",
     duplicate_job: "Server repeated an existing job; original work preserved",
+    stale_worker: "Stale service worker: files on disk are newer; reload the extension",
   };
   const admission = work.admissionPhase
     ? `\nNew requests: ${admissionPhases[work.admissionPhase] || work.admissionPhase}` +

@@ -15,6 +15,17 @@ export function storage(initial = {}) {
   };
 }
 export const flush = () => new Promise(resolve => setImmediate(resolve));
+/** Flush until `check()` holds or `ms` of wall clock passed; returns whether it held. For steps
+ * that finish off the event loop (webcrypto digests run on the threadpool): a fixed flush count
+ * races them and fails under CPU load. Callers still assert the condition, with their message. */
+export async function until(check, ms = 5000) {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) return false;
+    await flush();
+  }
+  return true;
+}
 export function content(provider = 'chatgpt', persisted = new Map()) {
   const listeners = [];
   const context = vm.createContext({ console, sessionStorage: { getItem: key => persisted.get(key), setItem: (key, value) => persisted.set(key, value) }, chrome: { runtime: { onMessage: { addListener: fn => listeners.push(fn), removeListener: fn => { const i=listeners.indexOf(fn);if(i>=0)listeners.splice(i,1); } } } } });

@@ -31,6 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
+import { nextCreationSeq } from "./creation-seq";
 import { stillRacing, shouldStartLocalRace } from "./local-fallback";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -49,6 +50,7 @@ import {
   type ControlResult,
 } from "./review-loop-runtime.server.ts";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
+import { validatedSettingsPatch } from "./settings-rules";
 import { redactSalvagedReviewBody } from "./review-format";
 import {
   BRIDGE_CLAIM_MS,
@@ -137,12 +139,13 @@ export function githubStatus() {
   return githubReady();
 }
 
+/** Validate, persist, THEN swap the live settings. The rules (settings-rules settingsProblem)
+ * run on the document as the operator sent it, before any normalization, so an input the runtime
+ * would refuse (e.g. the loop enabled on a non-wired delivery) is rejected (SettingsError 400)
+ * instead of being clamped or rewritten. A failed persist (SettingsError 500) leaves the live
+ * settings unchanged: what runs is always what a restart would load. */
 export function patchHarborSettings(patch: Partial<BotSettings>) {
-  const next = sanitizeBotSettings({ ...state.settings, ...patch });
-  if (!providersFromSettings(next).length) {
-    throw new Error("at least one configured reviewer is required");
-  }
-  const saved = saveBotSettings(next);
+  const saved = saveBotSettings(sanitizeBotSettings(validatedSettingsPatch(state.settings, patch)));
   const previousSettings = state.settings;
   state = { ...state, settings: saved };
   if (!saved.localJsonRepairEnabled || previousSettings.localLlmBaseUrl !== saved.localLlmBaseUrl ||
@@ -1122,8 +1125,9 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
-  // Review-loop step (design §5 4–8): gated OFF by default (ASHLAR_FIX_AGENT + fixAgent.provider,
-  // and only for /review-loop-triggered reviews). Best-effort — never un-posts the review.
+  // Review-loop step (design §5 4–8): gated OFF by default (Settings fixAgent.enabled +
+  // fixAgent.provider, read from the live state.settings, so a saved toggle applies here with no
+  // restart). Best-effort — never un-posts the review.
   // Never start a fix round on a stale head: a commit parented on the reviewed SHA would
   // fast-forward over (and undo) a contributor's backward force-push. The runtime re-checks
   // the live head right before committing as well.
@@ -1236,6 +1240,7 @@ function enqueueFromDecision(
     id: nid("job"),
     status: "queued",
     createdAt: Date.now(),
+    createdSeq: nextCreationSeq(),
     updatedAt: Date.now(),
     ingressMs: opts.ingressMs,
     traces: [],

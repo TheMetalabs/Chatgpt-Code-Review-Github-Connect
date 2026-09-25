@@ -261,6 +261,7 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       reviewOrder: next.reviewOrder,
       chatgptReasoning: next.chatgptReasoning,
       grokReasoning: next.grokReasoning,
+      fixAgent: next.fixAgent,
     };
     if (next.localLlmApiKey.trim() && !isMaskedSecret(next.localLlmApiKey) && patch.localLlmApiKey && !isMaskedSecret(patch.localLlmApiKey)) {
       body.localLlmApiKey = next.localLlmApiKey;
@@ -273,8 +274,18 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error("could not save settings");
-    set({ settings: next });
+    if (!res.ok) {
+      // The server's reason (a rejected value, or the settings file not writable) is the message.
+      const failed = (await Promise.resolve()
+        .then(() => res.json())
+        .catch(() => null)) as { error?: unknown } | null;
+      throw new Error(typeof failed?.error === "string" && failed.error ? failed.error : "could not save settings");
+    }
+    // The server normalizes (e.g. clamps fix-agent numbers): show what it actually saved.
+    const saved = (await Promise.resolve()
+      .then(() => res.json())
+      .catch(() => null)) as { settings?: Partial<BotSettings> } | null;
+    set({ settings: saved?.settings?.fixAgent ? { ...next, fixAgent: saved.settings.fixAgent } : next });
   },
   resetDemo: () => {
     // This control is local-only. It must never cancel production jobs on the server.

@@ -19,7 +19,10 @@ export async function chatFixtureProxy(html) {
    // Handle errors at registration, not only after the host passes the allowlist.
    socket.on('error',()=>socket.destroy());
   };
-  const tls=createTlsServer({key:await readFile(key),cert:await readFile(cert)},(req,res)=>{
+  // The e2e pins this certificate browser-wide (--ignore-certificate-errors-spki-list), because
+  // Playwright's ignoreHTTPSErrors reaches a tab only after Playwright attaches to it.
+  const certificate=await readFile(cert);
+  const tls=createTlsServer({key:await readFile(key),cert:certificate},(req,res)=>{
    requests.push(req.url);
    res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store'});res.end(html);
   });
@@ -38,7 +41,7 @@ export async function chatFixtureProxy(html) {
    socket.on('close',()=>upstream.destroy());upstream.on('close',()=>socket.destroy());
   });
   await new Promise((resolve,reject)=>{proxy.once('error',reject);proxy.listen(0,'127.0.0.1',resolve);});
-  return {port:proxy.address().port,server:`http://127.0.0.1:${proxy.address().port}`,requests,async close(){
+  return {port:proxy.address().port,server:`http://127.0.0.1:${proxy.address().port}`,certificate,requests,async close(){
    for(const socket of sockets)socket.destroy();
    await Promise.all([new Promise(resolve=>proxy.close(resolve)),new Promise(resolve=>tls.close(resolve))]);
    await rm(dir,{recursive:true,force:true});

@@ -38,7 +38,9 @@ export async function appFixture(options={}, githubOptions={}) {
    process:{env:{NODE_TEST_CONTEXT:'review-fixture',ASHLAR_BRIDGE_TOKEN:'fixture-token',ASHLAR_HISTORY_TOKEN:'fixture-history-token-32-characters-long'}}});
  const mocks=new Map([
   [resolve(root,'src/lib/dotenv-file.server.ts'),{loadDotenvFile(){},writeEnvPatch(){}}],
-  [resolve(root,'src/lib/settings.server.ts'),{loadBotSettings:()=>settings,saveBotSettings:s=>s,sanitizeBotSettings:s=>s}],
+  // Persistence is an adapter; a test can make a save fail (githubOptions.saveBotSettings).
+  [resolve(root,'src/lib/settings.server.ts'),{loadBotSettings:()=>settings,
+  saveBotSettings:s=>githubOptions.saveBotSettings?githubOptions.saveBotSettings(s):s,sanitizeBotSettings:s=>s}],
   [resolve(root,'src/lib/utils.ts'),{sleep:()=>new Promise(resolve=>setTimeout(resolve,25))}],
   [resolve(root,'src/lib/github.server.ts'),{
     githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=> 'fixture-not-a-real-token',

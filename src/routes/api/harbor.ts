@@ -19,9 +19,8 @@ import { runLocalLlm } from "@/lib/local-llm.server";
 import { SAMPLE_PRS } from "@/lib/samples";
 import { probeGithub } from "@/lib/github.server";
 import { clearGithubSecrets, patchGithubSecrets } from "@/lib/secrets.server";
-import { isMaskedSecret, normalizeReviewOrder } from "@/lib/types";
+import { isMaskedSecret } from "@/lib/types";
 import type { ReviewProvider } from "@/lib/types";
-import { normalizeChatgptReasoning, normalizeGrokReasoning } from "@/lib/reasoning";
 
 function sameOrigin(request: Request) {
   const origin = request.headers.get("origin");
@@ -61,27 +60,6 @@ export const Route = createFileRoute("/api/harbor")({
           raw?: string;
           extra?: string;
           token?: string;
-          username?: string;
-          mention?: string[];
-          skipForks?: boolean;
-          skipDrafts?: boolean;
-          maxInlineComments?: number;
-          maxTurns?: number;
-          exploreTurns?: number;
-          publishMinSeverity?: "P0" | "P1" | "P2";
-          requestChangesMin?: "P0" | "P1" | "P2";
-          precisionOverRecall?: boolean;
-          webhookSecret?: string;
-          reviewChatgpt?: boolean;
-          reviewGrok?: boolean;
-          reviewLocal?: boolean;
-          localJsonRepairEnabled?: boolean;
-          localLlmBaseUrl?: string;
-          localLlmApiKey?: string;
-          localLlmModel?: string;
-          reviewOrder?: ReviewProvider[];
-          chatgptReasoning?: string;
-          grokReasoning?: string;
           githubAppId?: string;
           githubClientId?: string;
           githubWebhookSecret?: string;
@@ -107,49 +85,24 @@ export const Route = createFileRoute("/api/harbor")({
           if (!sameOrigin(request)) {
             return Response.json({ ok: false, error: "bad origin" }, { status: 401 });
           }
-          const patch: Parameters<typeof patchHarborSettings>[0] = {};
-          if (typeof body.username === "string" && body.username.trim()) patch.username = body.username.trim();
-          if (Array.isArray(body.mention)) {
-            patch.mention = body.mention.map((m) => String(m).trim()).filter(Boolean);
-          }
-          if (typeof body.skipForks === "boolean") patch.skipForks = body.skipForks;
-          if (typeof body.skipDrafts === "boolean") patch.skipDrafts = body.skipDrafts;
-          if (typeof body.precisionOverRecall === "boolean") patch.precisionOverRecall = body.precisionOverRecall;
-          if (typeof body.maxInlineComments === "number" && Number.isFinite(body.maxInlineComments)) {
-            patch.maxInlineComments = Math.max(0, Math.min(20, Math.floor(body.maxInlineComments)));
-          }
-          if (typeof body.maxTurns === "number" && Number.isFinite(body.maxTurns)) patch.maxTurns = body.maxTurns;
-          if (typeof body.exploreTurns === "number" && Number.isFinite(body.exploreTurns)) {
-            patch.exploreTurns = body.exploreTurns;
-          }
-          if (body.publishMinSeverity === "P0" || body.publishMinSeverity === "P1" || body.publishMinSeverity === "P2") {
-            patch.publishMinSeverity = body.publishMinSeverity;
-          }
-          if (body.requestChangesMin === "P0" || body.requestChangesMin === "P1" || body.requestChangesMin === "P2") {
-            patch.requestChangesMin = body.requestChangesMin;
-          }
-          const webhookSecret = keepSecret(body.webhookSecret);
-          if (webhookSecret) patch.webhookSecret = webhookSecret.trim();
-          if (typeof body.reviewChatgpt === "boolean") patch.reviewChatgpt = body.reviewChatgpt;
-          if (typeof body.reviewGrok === "boolean") patch.reviewGrok = body.reviewGrok;
-          if (typeof body.reviewLocal === "boolean") patch.reviewLocal = body.reviewLocal;
-          if (typeof body.localJsonRepairEnabled === "boolean") patch.localJsonRepairEnabled = body.localJsonRepairEnabled;
-          if (typeof body.localLlmBaseUrl === "string") patch.localLlmBaseUrl = body.localLlmBaseUrl.trim();
-          if (typeof body.localLlmModel === "string") patch.localLlmModel = body.localLlmModel.trim();
-          const localKey = keepSecret(body.localLlmApiKey);
-          if (localKey) patch.localLlmApiKey = localKey.trim();
-          if (Array.isArray(body.reviewOrder)) patch.reviewOrder = normalizeReviewOrder(body.reviewOrder);
-          if (typeof body.chatgptReasoning === "string") patch.chatgptReasoning = normalizeChatgptReasoning(body.chatgptReasoning);
-          if (typeof body.grokReasoning === "string") patch.grokReasoning = normalizeGrokReasoning(body.grokReasoning);
+          // Every supplied field goes RAW to the shared validator (settings-rules
+          // validatedSettingsPatch, via patchHarborSettings) — the same rules the Settings screen
+          // runs. Nothing is prefiltered, coerced, trimmed or dropped here: a supplied invalid value
+          // (a non-object fixAgent, a wrong-typed flag, an out-of-range number, an unknown field)
+          // is a 400 and changes nothing. A valid save applies in memory at once.
+          const { action: _action, ...patch } = body as Record<string, unknown>;
           if (Object.keys(patch).length) {
             try {
-              patchHarborSettings(patch);
+              patchHarborSettings(patch as Parameters<typeof patchHarborSettings>[0]);
             } catch (e) {
-              const msg = e instanceof Error ? e.message : "could not persist settings";
-              return Response.json({ ok: false, error: msg }, { status: msg.includes("reviewer") ? 400 : 500 });
+              // SettingsError: 400 = rejected input, 500 = not persisted (nothing changed either way).
+              const err = e as { message?: unknown; status?: unknown } | null;
+              const msg = typeof err?.message === "string" && err.message ? err.message : "could not persist settings";
+              const status = err?.status === 400 ? 400 : 500;
+              return Response.json({ ok: false, error: msg }, { status });
             }
           }
-          return Response.json({ ok: true, github: githubStatus(), bridge: getBridgePublic() });
+          return Response.json({ ok: true, settings: publicSettings(getHarbor().settings), github: githubStatus(), bridge: getBridgePublic() });
         }
         if (body.action === "github" || body.action === "github-clear") {
           if (!sameOrigin(request)) {

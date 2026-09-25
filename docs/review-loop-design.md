@@ -154,8 +154,8 @@ FIXING은 수정 요청 직전에 단다(수정은 바쁜 provider 큐에서 오
 
 **수정 요청 감시(`fix-request-watch.ts`):** 로컬 LLM은 리뷰와 수정을 한 줄로 처리하므로 수정 요청은 큐에서 오래
 기다릴 수 있다. 스트리밍 신호로 "대기(keepalive)"와 "생성(첫 출력)"을 구분해:
-- 생성 deadline(`ASHLAR_FIX_TIMEOUT_MS`, 기본 60분)은 **첫 출력부터** 센다 — 대기 시간 제외(부하 중 거짓
-  `fix-failed` 방지). 대기 상한은 별도(`ASHLAR_FIX_QUEUE_MAX_MS`, 기본 6시간), 신호 두절(liveness)도 중단.
+- 생성 deadline(설정 `fixAgent.timeoutMs`, 기본 60분)은 **첫 출력부터** 센다 — 대기 시간 제외(부하 중 거짓
+  `fix-failed` 방지). 대기 상한은 별도(설정 `fixAgent.queueMaxMs`, 기본 6시간), 신호 두절(liveness)도 중단.
 - **관련성 검사는 하나**(head 이동 · 세션 종료 · 새 세션 · apply→suggest 강등)이고, 라운드 시작 직전, 대기 중 2분마다,
   생성 시작 순간, 재시도 전, 커밋 직전, 리포트 전에 같은 검사를 쓴다 — 해당하면 abort(대기열 자리 반환·생성 조기 차단)하고
   조용히 끝난다(superseded / stopped / newer request). 이렇게 무의미해진 라운드는 **재시도하지 않는다.**
@@ -216,10 +216,10 @@ ashlar 자신의 파서는 마커가 **코멘트 맨 앞**에 있을 때만 신�
 CONVERGED(clean 리뷰 `total=0`), ESCALATE(reason 코드), STOPPED(운영자 정지). 조용한 정지·자유 문장 종료는 없다.
 suggest 모드의 라운드는 고정 "suggestion" 리포트로 사람에게 넘기고, 사람이 적용·push하면 세션이 이어진다(§2b).
 
-- **수정 라운드 예산** `ASHLAR_LOOP_ROUND_CAP`(기본 **5**): 리뷰 라운드 k(≤5) 뒤에 수정 라운드 k. 리뷰 라운드
+- **수정 라운드 예산** 설정 `fixAgent.roundCap`(기본 **5**): 리뷰 라운드 k(≤5) 뒤에 수정 라운드 k. 리뷰 라운드
   6은 5번째 수정의 **검증 리뷰** — clean이면 CONVERGED, 지적이 남으면 `round-cap` ESCALATE(추세와 무관한 하드 상한).
 - applied 라운드는 **항상** 다음 리뷰를 요청한다(연속 마커). 예산 판정은 다음 리뷰에서 한다.
-- 수정 라운드 실패는 라운드 안에서 재시도(`ASHLAR_FIX_ATTEMPTS`, 기본 2 — request/parse/scope/validation 실패) 후
+- 수정 라운드 실패는 라운드 안에서 재시도(설정 `fixAgent.attempts`, 기본 2 — request/parse/scope/validation 실패) 후
   `fix-failed`. 재시도 지시문은 **고정 문장**(거절 코드만 포함)이고, 거절 사유(모델 출력·저장소 경로를 인용할 수 있음)는
   **JSON 인코딩된 비신뢰 데이터 필드**로만 되먹인다. 변경 없음은 `fix-declined`, 그 밖의 진행 불가는 `loop-error`.
 - 조용한 종료는 셋뿐: **supersede**(리뷰 후 head가 움직임 — 새 head의 리뷰가 루프를 이어받음; 제안(suggest)도
@@ -274,18 +274,55 @@ fix 주체는 **설정 가능**하다(§6b). 채팅 리뷰어(ChatGPT/Grok)도 *
 
 ```
 fixAgent: {
+  enabled: boolean,                   // 루프의 유일한 스위치 (기본 false)
   provider: "chatgpt" | "grok" | "local" | "coding-agent",  // 누가 수정하나
   delivery: "script-apply" | "chat-push" | "coding-agent",  // 어떻게 push 하나 (§6 A/B/C)
   mode: "suggest" | "apply",          // suggest=제안/초안(사람 1클릭), apply=자동 push
   parallelPrs: number,                // 서로 다른 PR 동시 fix 상한 (리뷰 capacity와 공유)
+  roundCap, attempts, timeoutMs, queueMaxMs, chatTimeoutMs, chatMaxPromptChars,  // 루프 수치 (아래)
 }
 ```
 
-- **기본값(안전 우선):** `provider` 없음(루프 미설정 시 fix 안 함) · `delivery: "script-apply"` ·
+- **운영은 Settings 화면에서만(재시작 없음):** Settings의 "Fix agent / review loop" 섹션이 위 필드를 **전부**
+  다룬다. 루프는 `enabled === true` **그리고** `provider != null`일 때만 돈다(`loopEnabled`). 환경변수로 루프를 켜는
+  경로는 없다(예전 `ASHLAR_FIX_AGENT`는 제거됨 — 설정해도 무시). 저장하면 harbor의 메모리 설정이 즉시 바뀌고, 모든
+  진입점(리뷰 게시 후 단계·start·push 연속·stop)과 수치(라운드 예산·재시도·deadline·프롬프트 한도·parallelPrs)는
+  **호출마다** 현재 설정을 읽는다 — 다음 단계부터 적용. 이미 진행 중인 수정 라운드는 시작 시점의 설정으로 끝난다.
+- **env는 초기값만:** `ASHLAR_FIX_PROVIDER`/`_DELIVERY`/`_MODE`/`_PARALLEL_PRS`, `ASHLAR_LOOP_ROUND_CAP`,
+  `ASHLAR_FIX_ATTEMPTS`/`_TIMEOUT_MS`/`_QUEUE_MAX_MS`/`_CHAT_TIMEOUT_MS`/`_CHAT_MAX_PROMPT_CHARS`는 한 번도 저장하지
+  않은 필드의 **시드**일 뿐이다. 저장된 `fixAgent`가 있으면 재시작 시에도 저장값이 이긴다. `enabled`에는 env가 없다.
+
+- **기본값(안전 우선):** `enabled: false` · `provider` 없음(루프·fix 항목 없음) · `delivery: "script-apply"` ·
   `mode: "suggest"` · `parallelPrs`는 bridge capacity 내. → 명시적으로 켜야 자동 수정이 돈다.
-- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인). `local`은
+- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인; grok은 fix 미연결). `local`은
   `script-apply`(grokbot `qwen_openai_edit.py` 재사용). `coding-agent`는 `coding-agent`.
 - **권한:** 어떤 provider든 push하려면 §2의 write-권한 게이트를 통과해야 한다. `apply` 모드는 명시적으로만.
+- **채팅 fix provider는 ChatGPT(임시 채팅)뿐:** fix 탭은 항상 `https://chatgpt.com/?temporary-chat=true`에서 열리고,
+  이 URL은 전송 후에도 바뀌지 않으므로 전송 시점 대화를 이후 모든 결정에서 비교할 수 있다. `grok`은 fix provider로
+  연결돼 있지 않다(전송 후 URL이 바뀔 수 있음): 설정 검증·Settings 화면·런타임 모두 "grok is not supported as a fix
+  provider yet"로 거부하고, 저장된 `{provider:"grok", enabled:true}`는 OFF로 로드된다. Grok **리뷰**는 그대로다.
+
+**채팅 fix 전송(구현, `bridge-fix.server.ts`):** `chatgpt` + `script-apply`는 harbor Job이 아니라 bridge의
+**fix 항목**으로 간다(harbor Job은 PR별 supersede·리뷰 JSON 검증을 하므로 fix 답변을 거부/재작성한다). 확장이
+채팅 탭에 프롬프트를 붙여 넣고 **답변 전문(텍스트)**을 돌려주면, 파싱은 서버가 결정적으로 한다(`fix-apply`).
+- **fix 탭은 증명된 성공 경로에서만 닫는다:** 답변이 전달(서버 ACK)되었고, 닫는 시점에 페이지의 complete 단계
+  증명(전송 시점 대화, 정확한 전송 턴, 저장된 완료 응답 그대로, 초안·후속 턴 없음)이 통과할 때만. 그 밖의 모든
+  종료(취소·supersede·데드라인·실패·taken_over·소유 불명·다른 바인딩·응답 없음·로딩 중·전달 기록 없음)는 탭을
+  **보존**하고 관리 슬롯만 해제한 뒤 작업을 끝낸다. 사용자의 로그인된 채팅 프로필에서 DOM 추론으로 탭을 강제로
+  닫지 않는다. 영구 판정(전송 시점 대화에서 이동·미확정, 전송 턴의 편집·교체, 후속 턴, 초안)은 응답 식별 여부를
+  기다리지 않고 **일시적 판정보다 먼저** 내린다 — 이전 DOM이 사라졌거나 턴이 통째로 바뀌어도 데드라인이 아니라
+  즉시 `taken_over`로 끝난다.
+- **PR당 live 항목 1개:** 같은 PR의 새 요청이 이전 항목을 취소(`superseded`)하고, 확장은 그 탭의 실행을 멈추고
+  슬롯을 해제한다(탭은 보존).
+- **데드라인:** 대기+생성 합산 기본 30분(설정 `fixAgent.chatTimeoutMs`, 1분~6시간). 만료 → 취소 → 탭 보존·슬롯
+  해제 → 런타임 재시도 후 `fix-failed` ESCALATE. 런타임 watcher는 chat fix를 이 데드라인과
+  `fixAgent.timeoutMs` 중 긴 쪽 + 1분까지 기다린다 — 로컬 LLM용 생성 데드라인이 chat fix를 먼저 끊지 않는다.
+- **동시성:** `parallelPrs`개까지만 claim, 나머지는 대기. 리뷰와는 요청 시각이 빠른 쪽이 먼저(서로 굶기지 않음).
+- **호환:** `take`에 `fixProtocol:1`을 보내는 확장(1.1.23+)에만 fix 항목을 준다 — 확장 재로드 필요.
+- **프롬프트 한도:** 프롬프트 전체를 composer에 입력하고 전송 확인도 그 텍스트로 하므로, 파일 내용을 첨부
+  봉투(`<<<ASHLAR_ATTACHMENTS_V2>>>`)로 빼지 않는다(첨부는 부분 열람될 수 있어 full-file 재작성이 틀어진다).
+  대신 기본 10만 자(설정 `fixAgent.chatMaxPromptChars`, 1만~100만) 초과는 즉시 실패 → ESCALATE. 큰 PR은 `local`.
+- `chat-push`(탭 자율 push)는 미구현 — 설정돼 있으면 fail-closed로 ESCALATE.
 
 ## 7. 2단계 검증 (비용 최적화 — 정본 스킬의 핵심 추가)
 

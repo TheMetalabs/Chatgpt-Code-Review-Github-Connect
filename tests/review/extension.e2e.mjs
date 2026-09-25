@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {createHash,X509Certificate} from 'node:crypto';
 import {root,json} from './load-source.mjs';
 import {appFixture,eventually} from './app-fixture.mjs';
 import {chatFixtureProxy} from './browser-proxy.mjs';
@@ -34,6 +35,33 @@ async function evaluateTarget(cdp,url,expression) {
  }
 }
 
+// The fixture proxy's throwaway chatgpt.com certificate is trusted by an SPKI pin at launch.
+// Playwright's ignoreHTTPSErrors is sent to each page only after Playwright attaches to it, so a
+// tab the extension creates can complete its TLS handshake first and land on the certificate
+// interstitial (chrome-error://chromewebdata/), leaving its run undispatched. The pin applies
+// browser-wide from startup and trusts exactly this fixture key.
+const certificatePin=proxy=>`--ignore-certificate-errors-spki-list=${createHash('sha256').update(new X509Certificate(proxy.certificate).publicKey.export({type:'spki',format:'der'})).digest('base64')}`;
+
+// The extension's service worker as a Playwright Worker. `manager` is chrome://extensions with
+// developer mode on. Chromium can start the MV3 worker before Playwright's browser-level
+// auto-attach and then never attach it: Target.getTargets lists it with attached:false and no
+// 'serviceworker' event ever fires, so a plain waitForEvent times out. Reloading the unpacked
+// extension in this fresh test profile (before any test state exists) starts a new worker target,
+// which is auto-attached.
+async function extensionWorker(context,manager) {
+ const seen=context.waitForEvent('serviceworker').catch(error=>error);
+ const attached=context.serviceWorkers()[0];
+ if(attached)return attached;
+ const cdp=await context.newCDPSession(manager);
+ let targetInfos;
+ try {({targetInfos}=await cdp.send('Target.getTargets'));} finally {await cdp.detach().catch(()=>{});}
+ const orphan=targetInfos.find(target=>target.type==='service_worker'&&target.url.startsWith('chrome-extension://')&&!target.attached);
+ if(!orphan){const worker=await seen;if(worker instanceof Error)throw worker;return worker;}
+ const restarted=context.waitForEvent('serviceworker');
+ await manager.evaluate(id=>new Promise(resolve=>chrome.developerPrivate.reload(id,{failQuietly:true},()=>resolve())),new URL(orphan.url).host);
+ return restarted;
+}
+
 const envelope=content=>JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]});
 const html=`<!doctype html><html><body>
  <div id="turns"></div><form data-type="unified-composer" onsubmit="return false">
@@ -42,19 +70,21 @@ const html=`<!doctype html><html><body>
  <script>
  window.sends=0;
  document.querySelector('button').onclick=()=>{window.sends++;const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';const user=document.createElement('div');user.dataset.messageAuthorRole='user';user.textContent=document.querySelector('textarea').value;turn.append(user);document.querySelector('#turns').append(turn);document.querySelector('textarea').value='';};
- window.reply=(raw,done)=>{document.querySelector('#answer')?.remove();const turn=document.createElement('section');turn.id='answer';turn.dataset.testid='conversation-turn-2';const message=document.createElement('div');message.dataset.messageAuthorRole='assistant';const md=document.createElement('div');md.className='markdown';md.textContent=raw;message.append(md);turn.append(message);if(done){const button=document.createElement('button');button.dataset.testid='copy-turn-action-button';button.ariaLabel='Copy response';button.textContent='copy';turn.append(button);}document.querySelector('#turns').append(turn);};
+ window.reply=(raw,done,code)=>{document.querySelector('#answer')?.remove();const turn=document.createElement('section');turn.id='answer';turn.dataset.testid='conversation-turn-2';const message=document.createElement('div');message.dataset.messageAuthorRole='assistant';const md=document.createElement('div');md.className='markdown';md.textContent=raw;if(code!==undefined){const pre=document.createElement('pre');const c=document.createElement('code');c.textContent=code;pre.append(c);md.append(pre);}message.append(md);turn.append(message);if(done){const button=document.createElement('button');button.dataset.testid='copy-turn-action-button';button.ariaLabel='Copy response';button.textContent='copy';turn.append(button);}document.querySelector('#turns').append(turn);};
  </script></body></html>`;
 
 test('MV3 E2E: long queue → restart → final JSON ACK → close chat tab → one review',async t=>{
  const app=await appFixture();t.after(()=>app.close());
- const profile=await mkdtemp(join(tmpdir(),'ashlar-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-e2e-'));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
  const extension=join(root,'extension');
  const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
    // The disposable, local-fixture-only browser must allow its unpacked extension to reload.
    // This is a test launch setting; no installed browser profile or managed policy is changed.
-   args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
- t.after(()=>context.close());
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',certificatePin(proxy),`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ // node:test runs after-hooks in registration order: the profile is removed only once the browser
+ // that writes to it has exited (removing it first races Chrome's writes: ENOTEMPTY).
+ t.after(async()=>{await context.close();await rm(profile,{recursive:true,force:true});});
  // Set developer mode through Chrome's own UI in this newly created test profile.
  // Never alter managed policy or an existing user's browser preferences.
  const manager=await context.newPage();
@@ -64,13 +94,13 @@ test('MV3 E2E: long queue → restart → final JSON ACK → close chat tab → 
  assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
  if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
  assert.equal(await developerMode.evaluate(el=>Boolean(el.checked)),true);
+ let worker=await extensionWorker(context,manager);
  await manager.close();
  const diagnostics=[];
  context.on('page',page=>{page.on('pageerror',error=>diagnostics.push(['pageerror',error.message]));page.on('console',msg=>{if(msg.type()==='error')diagnostics.push(['console',msg.text()]);});});
  context.on('requestfailed',request=>diagnostics.push(['requestfailed',request.url(),request.failure()?.errorText]));
  // The launch-level local proxy also intercepts the first extension-created tab request.
  // Explicit loopback bypass keeps bridge RPCs out of the external-destination proxy.
- let worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
  await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
  const delivered=app.mention();assert.equal(delivered.queued,true);
  await eventually(()=>app.localRequests.length===1,'local generation not started');
@@ -160,19 +190,21 @@ test('local-only E2E: pending until response ends, then a single final review',a
 
 test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/closes → C admitted',async t=>{
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
- const profile=await mkdtemp(join(tmpdir(),'ashlar-parallel-e2e-'));t.after(()=>rm(profile,{recursive:true,force:true}));
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-parallel-e2e-'));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
  const extension=join(root,'extension');
  const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,
    channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
-   args:['--no-sandbox','--enable-unsafe-extension-debugging',`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
- t.after(()=>context.close());
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',certificatePin(proxy),`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ // node:test runs after-hooks in registration order: the profile is removed only once the browser
+ // that writes to it has exited (removing it first races Chrome's writes: ENOTEMPTY).
+ t.after(async()=>{await context.close();await rm(profile,{recursive:true,force:true});});
  const manager=await context.newPage();await manager.goto('chrome://extensions');
  const developerMode=manager.locator('#devMode');await developerMode.waitFor({state:'visible'});
  assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
  if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ let worker=await extensionWorker(context,manager);
  await manager.close();
- let worker=context.serviceWorkers()[0]||await context.waitForEvent('serviceworker');
  await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,maxReviewTabs:2}),app.origin);
  const request=pr=>app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'mv3-parallel-'+pr,event:'issue_comment',payload:{
    action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},
@@ -204,4 +236,64 @@ test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/
  await eventually(async()=>{await worker.evaluate(()=>tick());pageC=context.pages().find(p=>p!==pageA&&p.url().startsWith('https://chatgpt.com/'));return pageC&&pageC.evaluate(()=>window.sends===1).catch(()=>false);},'freed B slot did not admit C');
  assert.equal(pageA.isClosed(),false);assert.equal(context.pages().filter(p=>p.url().startsWith('https://chatgpt.com/')).length,2);
  assert.equal(await pageA.evaluate(()=>window.sends),1);assert.equal(app.reviews.length,1);
+});
+
+test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a superseded fix tab is preserved, never closed',async t=>{
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-fix-e2e-'));
+ const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
+ const extension=join(root,'extension');
+ const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,
+   channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',certificatePin(proxy),`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ // node:test runs after-hooks in registration order: the profile is removed only once the browser
+ // that writes to it has exited (removing it first races Chrome's writes: ENOTEMPTY).
+ t.after(async()=>{await context.close();await rm(profile,{recursive:true,force:true});});
+ const manager=await context.newPage();await manager.goto('chrome://extensions');
+ const developerMode=manager.locator('#devMode');await developerMode.waitFor({state:'visible'});
+ assert.equal(await developerMode.evaluate(el=>Boolean(el.disabled)),false,'test browser developer mode is policy-controlled');
+ if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ const worker=await extensionWorker(context,manager);
+ await manager.close();
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
+ const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
+ const userText=p=>p.evaluate(()=>document.querySelector('[data-message-author-role="user"]')?.textContent||'');
+ const request=(pr,prompt)=>app.bridge.requestBridgeFix({owner:'fixture',repo:'fixture',pr,provider:'chatgpt',prompt});
+ // 1) The fix prompt reaches a chat tab; the answer's fenced JSON (literal code) is delivered, not review JSON.
+ const answer='{"summary":"guard","files":[{"path":"a.ts","content":"export const answer = 43;\\n"}],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
+ let result;
+ request(1,'FIX PROMPT for fixture#1: return the JSON object').then(value=>{result={value};},error=>{result={error};});
+ assert.equal(app.bridge.getBridgePublic().pendingFixes,1);
+ let page;
+ await eventually(async()=>{await worker.evaluate(()=>tick());page=chatPages()[0];return page&&page.evaluate(()=>window.sends===1).catch(()=>false);},'fix prompt was not submitted');
+ assert.match(await userText(page),/FIX PROMPT for fixture#1/);
+ await page.evaluate(code=>window.reply('Guarded the null path.',true,code),answer);
+ await eventually(async()=>{await worker.evaluate(()=>tick());return result!==undefined;},'fix answer was not delivered');
+ assert.equal(result.error,undefined);assert.equal(result.value,answer);
+ await eventually(async()=>{await worker.evaluate(()=>tick());return page.isClosed();},'answered fix tab was not closed');
+ assert.equal(app.bridge.getBridgePublic().pendingFixes,0);
+ assert.equal(app.reviews.length,0);assert.equal(app.harbor.getHarbor().jobs.length,0,'a fix is never a harbor review job');
+ // 2) A newer request for the same PR supersedes a still-generating fix: that tab is PRESERVED (a
+ // fix tab is closed only on the proven-success path), its managed slot released, its leg retired.
+ let firstError;
+ request(2,'FIX PROMPT A for fixture#2').catch(error=>{firstError=error;});
+ let pageA;
+ await eventually(async()=>{await worker.evaluate(()=>tick());pageA=chatPages()[0];return pageA&&pageA.evaluate(()=>window.sends===1).catch(()=>false);},'first fix prompt was not submitted');
+ const pending=()=>worker.evaluate(async()=>(await chrome.storage.local.get('pendingReviewJobs')).pendingReviewJobs||{});
+ const jobA=Object.keys(await pending()).find(id=>id.startsWith('fix-'));
+ assert.ok(jobA,'the first fix is a worker job');
+ request(2,'FIX PROMPT B for fixture#2').catch(()=>{});
+ await eventually(()=>firstError!==undefined,'the older fix was not superseded');
+ assert.match(firstError.message,/superseded by a newer request for the same PR/);
+ await eventually(async()=>{await worker.evaluate(()=>tick());return !(jobA in await pending());},'the superseded fix leg did not retire');
+ assert.equal(pageA.isClosed(),false,'the superseded fix tab is preserved, never closed');
+ await eventually(()=>worker.evaluate(async id=>{
+  await refreshTabInventory();
+  const report=await tabCapacityReport((await chrome.storage.local.get('pendingReviewJobs')).pendingReviewJobs||{});
+  return report.orphanTabs===0 && !report.blockers.some(blocker=>blocker.jobId===id);
+ },jobA),'the preserved fix tab still holds a managed slot');
+ let pageB;
+ await eventually(async()=>{await worker.evaluate(()=>tick());pageB=chatPages().find(p=>p!==pageA);return pageB&&pageB.evaluate(()=>window.sends===1).catch(()=>false);},'the newer fix did not start');
+ assert.match(await userText(pageB),/FIX PROMPT B for fixture#2/);
+ assert.equal(await pageA.evaluate(()=>window.sends),1,'the preserved tab is never sent anything again');
 });

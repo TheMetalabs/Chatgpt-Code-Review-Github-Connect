@@ -20,7 +20,7 @@
  *   - suggest: the fixed "suggestion" report — the designed hand-off (a human applies it and
  *     pushes; the push continues the session).
  *   - STOPPED: the operator's stop (acknowledged once by stopLoop; in-flight steps go quiet).
- * The fix-round budget (ASHLAR_LOOP_ROUND_CAP, default 5) is enforced at the next review: review
+ * The fix-round budget (Settings fixAgent.roundCap, default 5) is enforced at the next review: review
  * round N+1 verifies the N-th fix (clean → CONVERGED, else round-cap). The ONLY quiet exits are
  * supersession (a newer head drives the loop — its review is requested once, idempotently; a
  * request that did not settle is logged, not quiet), an operator stop, a newer loop request (a
@@ -29,7 +29,10 @@
  * relevance check guards every checkpoint of a round, and a round that went moot is never
  * retried. Apply also requires the session starter's write permission (design §2).
  * Everything is gated OFF by default:
- *   - env ASHLAR_FIX_AGENT=1 AND settings.fixAgent.provider != null (design §6b), AND
+ *   - Settings fixAgent.enabled AND a runnable provider + delivery (settings-rules fixLoopOn,
+ *     the same rule every Settings save is validated with; design §6b) — the Settings screen
+ *     is the ONLY switch (no env var); every entry point re-reads the live settings per call, so
+ *     a saved toggle applies to the next step without a restart, AND
  *   - the PR has an ACTIVE loop session (durable: a recorded start after the last terminal), AND
  *   - github origin, same-repo (not a fork — the installation token cannot push to a fork),
  *     with findings on HEAD.
@@ -37,9 +40,23 @@
  * Static imports are pure/DI-only modules; the production GitHub + provider transport are
  * loaded by DYNAMIC import inside the gate, so the harbor test fixture (which links a strict
  * github.server stub) is untouched and the fix path never runs in tests unless injected.
+ *
+ * FIX TRANSPORT (requestFix → the answer TEXT; this module parses it via runFixRound):
+ *   - local: one OpenAI-compatible chat request;
+ *   - chatgpt: one Chrome-bridge fix item per PR (bridge-fix.server.ts; grok is not a fix
+ *     provider, settings-rules FIX_PROVIDER_CAPS) — the extension
+ *     types the prompt into a chat tab and hands back the full answer. A newer request for the
+ *     PR supersedes the older; a deadline (fixAgent.chatTimeoutMs, default 30 min) and an
+ *     inline-prompt ceiling (fixAgent.chatMaxPromptChars, default 100k chars) turn a stuck
+ *     tab or an oversized PR into a rejected request → retry, then ESCALATE fix-failed (never a
+ *     hang). The watcher's abort (head moved, loop stopped, its deadline) cancels the item, so
+ *     the extension stops the run and preserves the tab (a fix tab is closed only after a
+ *     delivered, re-proven answer) instead of generating an answer nobody reads. Only delivery
+ *     "script-apply" is wired; "chat-push" fails closed.
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import { BranchMovedError, type GitDataApi } from "./fix-commit.ts";
+import type { FixRequest } from "./bridge-fix.server.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
@@ -84,7 +101,8 @@ import {
   type RoundSummary,
 } from "./review-loop.ts";
 import { deriveLoopSession, sameSession, sessionRef, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
-import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
+import { fixKnob, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
+import { WIRED_FIX_DELIVERIES, fixDeadline, fixLoopOn, fixProviderCaps, fixProviderUnsupported, fixReportsActivity } from "./settings-rules.ts";
 
 export interface PullHead extends LoopPrInfo {
   ref: string;
@@ -142,7 +160,7 @@ export interface LoopRuntimeDeps {
   gh: LoopRuntimeGithub;
   requestFix: RequestFix;
   validate: FixValidate;
-  /** Generation-deadline override (tests); production reads ASHLAR_FIX_TIMEOUT_MS. */
+  /** Generation-deadline override (tests); production reads Settings fixAgent.timeoutMs. */
   fixTimeoutMs?: number;
   /** The provider reports queued/generating activity (streaming local LLM): the deadline then
    * excludes queue time. Absent/false → timed from send. */
@@ -226,10 +244,8 @@ export const SILENT_REASONS: readonly string[] = [
 /** Write-capable repository permissions (legacy field; `maintain` reports as `write`). */
 const WRITE_PERMISSIONS = new Set(["admin", "write"]);
 
-/** Fix-round budget (design: at most 5 review→fix rounds, then a human decides). */
-const DEFAULT_ROUND_CAP = 5;
-/** Attempts per fix round for retryable outcomes (the reply was unusable, not the finding). */
-const DEFAULT_FIX_ATTEMPTS = 2;
+/** Outcomes worth another attempt in the same round (the reply was unusable, not the finding);
+ * the attempt budget is Settings fixAgent.attempts. */
 const RETRYABLE = new Set<FixRoundResult["outcome"]>(["request-failed", "parse-failed", "scope-violation", "validation-failed"]);
 /** Re-reads for a history that does not show this review yet (a lagging list API), with backoff,
  * before the history counts as unverifiable (a loop-error handoff). */
@@ -365,12 +381,13 @@ function roundSignature(session: LoopSession, settings: BotSettings): string {
   return `${isoMs(session.startIso)}|${mode}|${roundActor(mode, session.starter)}`;
 }
 
-/** How long a second step waits for its head's running step: that step's own worst case (every
- * attempt queued to the ceiling, then generating twice its deadline). Every await in a step is
- * bounded (transport timeouts, the fix watcher's deadlines, fixed sleeps), so this fires only on a
- * bug. */
-function stepWaitMaxMs(deps: LoopRuntimeDeps | undefined, env: NodeJS.ProcessEnv | undefined): number {
-  const own = fixAttempts(env) * ((deps?.fixWatch?.queueMaxMs ?? fixQueueMaxMs(env)) + 2 * (deps?.fixTimeoutMs ?? fixTimeoutMs(env)));
+/** How long a second step waits for its head's running step: that step's own worst case under the
+ * settings of this call (every attempt queued to the ceiling, then generating twice the configured
+ * provider's deadline — fixGenerationMs, the watcher's own). Every await in a step is bounded
+ * (transport timeouts, the fix watcher's deadlines, fixed sleeps), so this fires only on a bug. */
+function stepWaitMaxMs(settings: BotSettings, deps: LoopRuntimeDeps | undefined): number {
+  const fix = settings.fixAgent;
+  const own = fixKnob(fix, "attempts") * ((deps?.fixWatch?.queueMaxMs ?? fixKnob(fix, "queueMaxMs")) + 2 * (deps?.fixTimeoutMs ?? fixGenerationMs(fix)));
   return Math.min(Math.max(0, deps?.stepWaitMaxMs ?? own), MAX_TIMER_MS);
 }
 
@@ -391,10 +408,13 @@ function envOf(): NodeJS.ProcessEnv | undefined {
   return typeof process !== "undefined" ? process.env : undefined;
 }
 
-/** Off unless the operator explicitly enabled the env flag AND configured a fix provider. */
-export function loopEnabled(settings: BotSettings, env: NodeJS.ProcessEnv | undefined = envOf()): boolean {
-  if (env?.ASHLAR_FIX_AGENT !== "1") return false;
-  return settings.fixAgent?.provider != null;
+/** Off unless the operator switched the fix agent on in Settings AND the provider + delivery are
+ * ones this runtime executes (settings-rules fixLoopOn — the rule every save is validated with,
+ * so a hand-edited or env-seeded non-wired pair fails closed here too). The settings are the live
+ * ones (harbor passes its current state per call), so toggling in Settings applies to the next
+ * loop step with no restart. No env var takes part. */
+export function loopEnabled(settings: BotSettings): boolean {
+  return fixLoopOn(settings.fixAgent);
 }
 
 /** The App's own login (for self-recognition): ASHLAR_BOT_LOGIN when it has the "<slug>[bot]"
@@ -404,29 +424,40 @@ export function ashlarBotLogin(env: NodeJS.ProcessEnv | undefined = envOf()): st
   return resolveBotLogin(env?.ASHLAR_BOT_LOGIN);
 }
 
-/** ASHLAR_LOOP_ROUND_CAP, bounded inside the continuation marker's contract: review N+1 is
+/** Settings fixAgent.roundCap, bounded inside the continuation marker's contract: review N+1 is
  * requested after the N-th fix, so the largest requested round is cap + 1 ≤ MAX_CONTINUE_ROUND. */
-function roundCap(env: NodeJS.ProcessEnv | undefined = envOf()): number {
-  const n = Number(env?.ASHLAR_LOOP_ROUND_CAP);
-  return Math.min(Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ROUND_CAP, MAX_CONTINUE_ROUND - 1);
+function roundCap(settings: BotSettings): number {
+  return Math.min(fixKnob(settings.fixAgent, "roundCap"), MAX_CONTINUE_ROUND - 1);
 }
 
-/** Generation deadline per fix request, counted from the provider's FIRST output (queue time
- * excluded — the local LLM serializes reviews and fixes): ASHLAR_FIX_TIMEOUT_MS, clamped to
- * [1 min, 6 h], default 60 min. Past it the provider call is aborted: request-failed → retry → a
- * fixed fix-failed handoff, never a silent wait. */
-const DEFAULT_FIX_TIMEOUT_MS = 60 * 60_000;
-function fixTimeoutMs(env: NodeJS.ProcessEnv | undefined = envOf()): number {
-  const n = Number(env?.ASHLAR_FIX_TIMEOUT_MS);
-  return Number.isFinite(n) && n > 0 ? Math.min(6 * 60 * 60_000, Math.max(60_000, Math.floor(n))) : DEFAULT_FIX_TIMEOUT_MS;
+/** The watcher's generation deadline for the configured fix provider — from the provider
+ * capability table (settings-rules FIX_PROVIDER_CAPS), never from another provider's knob. Local:
+ * fixAgent.timeoutMs (default 60 min, clamped to [1 min, 6 h]), counted from the FIRST output
+ * (queue time excluded — the local LLM serializes reviews and fixes); past it the call is aborted:
+ * request-failed → retry → a fixed fix-failed handoff, never a silent wait. chatgpt reports no
+ * activity, so the watcher times them from send; the bridge item carries its own deadline
+ * (fixAgent.chatTimeoutMs) and the watcher waits a margin past it, so the bridge's deadline is the
+ * terminal one and neither the local-LLM deadline nor its queue ceiling touches a chat fix. */
+export function fixGenerationMs(fixAgent: Partial<BotSettings["fixAgent"]> | undefined): number {
+  return fixDeadline(fixAgent).generationMs;
 }
 
-/** Backstop for the provider QUEUE (a request still queued past it is abandoned):
- * ASHLAR_FIX_QUEUE_MAX_MS, clamped to [10 min, 24 h], default 6 h. */
-const DEFAULT_FIX_QUEUE_MAX_MS = 6 * 60 * 60_000;
-function fixQueueMaxMs(env: NodeJS.ProcessEnv | undefined = envOf()): number {
-  const n = Number(env?.ASHLAR_FIX_QUEUE_MAX_MS);
-  return Number.isFinite(n) && n > 0 ? Math.min(24 * 60 * 60_000, Math.max(10 * 60_000, Math.floor(n))) : DEFAULT_FIX_QUEUE_MAX_MS;
+/** The watcher limits for one fix request: the provider's governing deadline, the queue ceiling
+ * (applies only to a provider that reports activity), liveness and cadence. Test overrides in
+ * `deps` win. */
+export function fixWatchLimits(
+  settings: BotSettings,
+  deps: Pick<LoopRuntimeDeps, "fixTimeoutMs" | "fixReportsActivity" | "fixWatch">,
+  env: NodeJS.ProcessEnv | undefined,
+): { generationMs: number; queueMaxMs: number; livenessMs: number; checkEveryMs: number; tickMs: number; reportsActivity: boolean } {
+  return {
+    generationMs: deps.fixTimeoutMs ?? fixGenerationMs(settings.fixAgent),
+    queueMaxMs: deps.fixWatch?.queueMaxMs ?? fixKnob(settings.fixAgent, "queueMaxMs"),
+    livenessMs: deps.fixWatch?.livenessMs ?? localLivenessMs(env),
+    checkEveryMs: deps.fixWatch?.checkEveryMs ?? FIX_RELEVANCE_CHECK_MS,
+    tickMs: deps.fixWatch?.tickMs ?? FIX_WATCH_TICK_MS,
+    reportsActivity: deps.fixReportsActivity ?? false,
+  };
 }
 
 /** How often a queued fix request re-checks that it is still wanted (head / session). */
@@ -440,11 +471,6 @@ function trace(jobId: string, event: string, fields: Record<string, string | num
     .map(([k, v]) => `${k}=${String(v).replace(/\s+/g, " ").slice(0, 200)}`)
     .join(" ");
   console.info(`[review-loop] ${jobId} ${event}${kv ? ` ${kv}` : ""}`);
-}
-
-function fixAttempts(env: NodeJS.ProcessEnv | undefined = envOf()): number {
-  const n = Number(env?.ASHLAR_FIX_ATTEMPTS);
-  return Number.isFinite(n) && n >= 1 ? Math.min(5, Math.floor(n)) : DEFAULT_FIX_ATTEMPTS;
 }
 
 /** Feedback appended to the prompt for a retry: the deterministic rejection, one line. */
@@ -754,30 +780,48 @@ function renderFixReport(
 // must span loop steps, webhook handlers and harbor calls.
 let productionGh: LoopRuntimeGithub | undefined;
 
-/** Production dependencies, loaded lazily so the static graph stays pure. */
-async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
-  // The GitHub client is the loop's only channel: if it cannot load, nothing can be posted (the
-  // ONE unobservable failure — logged server-side by harbor). Provider transports load LAZILY
-  // inside requestFix, so their failure is an ordinary request-failed → retry → fix-failed.
-  const github = await import("./github.server.ts");
-  productionGh ??= {
-    listPullReviews: github.listPullReviews,
-    listReviewComments: github.listReviewComments,
-    listIssueComments: github.listIssueComments,
-    createIssueComment: github.createIssueComment,
-    fetchPullHeadRef: github.fetchPullHeadRef,
-    gitDataApi: github.gitDataApi,
-    fetchUserPermission: github.fetchUserPermission,
-    listReviewThreadRoots: github.listReviewThreadRoots,
-    replyToReviewComment: github.replyToReviewComment,
-  };
-  const gh = productionGh;
-  // First provider: local (a plain request/response). chatgpt/grok ride the bridge's
-  // awaiting_chat lifecycle and are wired separately.
-  const requestFix: RequestFix = async (prompt, ctl) => {
-    if (settings.fixAgent.provider !== "local") {
-      throw new Error(`fix provider ${settings.fixAgent.provider} not wired yet (local only)`);
+/** The bridge transport surface requestChatFix needs (injected in tests). */
+export type BridgeFixLoader = () => Promise<{ requestBridgeFix(request: FixRequest): Promise<string> }>;
+
+/**
+ * chatgpt fix transport: one Chrome-bridge fix item for this PR. Resolves with the chat's
+ * full answer text; rejects (→ request-failed → retry → ESCALATE) on failure, deadline,
+ * supersession or an oversized prompt. Only script-apply is wired: a "chat-push" configuration
+ * (the tab commits by itself) must not silently become a server-side apply.
+ */
+/** The chat page reads a fix answer from fenced code blocks only (rendered markdown would rewrite
+ * file content), so a chat fix must fence its JSON. */
+export const CHAT_FIX_FENCE_RULE =
+  "Chat delivery: put that JSON object inside exactly one ```json fenced code block. Only fenced code is read; text outside it is ignored.";
+
+export async function requestChatFix(
+  settings: BotSettings,
+  ref: PrRef,
+  provider: "chatgpt",
+  prompt: string,
+  opts: { signal?: AbortSignal; loadBridge?: BridgeFixLoader } = {},
+): Promise<string> {
+  if (!WIRED_FIX_DELIVERIES.includes(settings.fixAgent.delivery)) {
+    throw new Error(`fix delivery ${settings.fixAgent.delivery} is not wired for ${provider} (${WIRED_FIX_DELIVERIES.join(", ")} only)`);
+  }
+  const bridge = await (opts.loadBridge ?? (() => import("./bridge.server.ts")))();
+  const fenced = `${prompt}\n\n${CHAT_FIX_FENCE_RULE}`;
+  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt: fenced, ...(opts.signal ? { signal: opts.signal } : {}) });
+}
+
+/** Production provider routing (productionDeps' requestFix). local is a plain request/response;
+ * chatgpt goes through the Chrome bridge's fix registry (NOT the review awaiting_chat
+ * lifecycle) and come back as the same kind of answer text. The watcher's abort signal reaches
+ * both, so an abandoned fix cancels its bridge item and the extension stops its run (the tab is
+ * preserved, never closed on a cancel). */
+export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { loadBridge?: BridgeFixLoader } = {}): RequestFix {
+  return async (prompt, ctl) => {
+    const provider = settings.fixAgent.provider;
+    const transport = fixProviderCaps(provider).transport;
+    if (transport === "chrome-bridge") {
+      return requestChatFix(settings, ref, "chatgpt", prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge });
     }
+    if (transport !== "local-llm") throw new Error(fixProviderUnsupported(provider));
     const local = await import("./local-chat-request.server.ts");
     const llm = await import("./local-llm.server.ts");
     return local.requestLocalChat(
@@ -797,14 +841,50 @@ async function productionDeps(settings: BotSettings): Promise<LoopRuntimeDeps> {
       { onActivity: (a) => ctl?.onActivity?.(a.kind === "output" ? "generating" : "queued") },
     );
   };
-  // Streaming (the default) reports queued vs generating, so the fix deadline can exclude queue time.
-  // The transport's own streaming default (what requestLocalChat will actually do): a streamed
-  // reply reports queued vs generating; a buffered one reports "generating" from its headers.
-  // Transport unloadable → no activity (timed from send); requestFix then fails on its own import.
-  const streaming =
-    settings.fixAgent.provider === "local" &&
-    (await import("./local-chat-request.server.ts").then((m) => m.localStreamingDefault(), () => false));
-  return { gh, requestFix, validate: builtinValidate, fixReportsActivity: streaming };
+}
+
+/** Production dependencies, loaded lazily so the static graph stays pure. `ref` is the PR a
+ * chat fix item is keyed by (one live item per PR). */
+async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRuntimeDeps> {
+  // The GitHub client is the loop's only channel: if it cannot load, nothing can be posted (the
+  // ONE unobservable failure — logged server-side by harbor). Provider transports load LAZILY
+  // inside requestFix, so their failure is an ordinary request-failed → retry → fix-failed.
+  const github = await import("./github.server.ts");
+  productionGh ??= {
+    listPullReviews: github.listPullReviews,
+    listReviewComments: github.listReviewComments,
+    listIssueComments: github.listIssueComments,
+    createIssueComment: github.createIssueComment,
+    fetchPullHeadRef: github.fetchPullHeadRef,
+    gitDataApi: github.gitDataApi,
+    fetchUserPermission: github.fetchUserPermission,
+    listReviewThreadRoots: github.listReviewThreadRoots,
+    replyToReviewComment: github.replyToReviewComment,
+  };
+  const gh = productionGh;
+  return { gh, validate: builtinValidate, ...(await providerFixDeps(settings, ref)) };
+}
+
+/** The provider-dependent half of the production deps: the transport and whether it reports
+ * activity, both from the provider's row in the capability table (settings-rules). The local
+ * LLM's streaming flag is consulted ONLY for a provider whose row says its activity comes from
+ * it (local): a chat fix never reports activity, so the watcher times it from send and the
+ * local queue ceiling (queueMaxMs) cannot abort it — the bridge's chatTimeoutMs governs. */
+export async function providerFixDeps(
+  settings: BotSettings,
+  ref: PrRef,
+  opts: { loadBridge?: BridgeFixLoader; localStreaming?: () => Promise<boolean> } = {},
+): Promise<Pick<LoopRuntimeDeps, "requestFix" | "fixReportsActivity">> {
+  const requestFix = productionRequestFix(settings, ref, { loadBridge: opts.loadBridge });
+  const caps = fixProviderCaps(settings.fixAgent.provider);
+  // The local transport's own streaming default (what requestLocalChat will actually do): a
+  // streamed reply reports queued vs generating. Transport unloadable → no activity (timed from
+  // send); requestFix then fails on its own import.
+  const localStreaming =
+    caps.activity === "local-streaming"
+      ? await (opts.localStreaming ?? (() => import("./local-chat-request.server.ts").then((m) => m.localStreamingDefault())))().catch(() => false)
+      : false;
+  return { requestFix, fixReportsActivity: fixReportsActivity(settings.fixAgent.provider, localStreaming) };
 }
 
 /** The PR's current loop session from durable GitHub history (fresh read). It folds this
@@ -906,7 +986,7 @@ export async function runPostReviewLoop(
 ): Promise<LoopStepResult> {
   // Silent gates: the default off-path (no fix agent) or nothing to do. A zero-finding review
   // is CONVERGED — its clean review (total=0) is the terminal signal and ends the session.
-  if (!loopEnabled(settings, env)) return { ran: false, reason: "disabled" };
+  if (!loopEnabled(settings)) return { ran: false, reason: "disabled" };
   if (job.origin !== "github") return { ran: false, reason: "not a github job" };
   // Fix exactly what was PUBLISHED: findings the precision policy withheld were never shown to
   // a human, and "fixing" them would chase possible false positives in unreviewable commits.
@@ -925,7 +1005,7 @@ export async function runPostReviewLoop(
   const { owner, repo, pr, headSha } = job;
   const ref: PrRef = { owner, repo, pr };
   const botLogin = ashlarBotLogin(env);
-  const cap = roundCap(env);
+  let cap = roundCap(settings); // re-read with the settings of a step admitted after a wait
   let d: LoopRuntimeDeps | undefined = deps;
   let rounds: RoundSummary[] = [];
   let diffLines: number | undefined;
@@ -980,7 +1060,7 @@ export async function runPostReviewLoop(
   const slots = state.slots;
   // Pending from now until it is recorded (or handed to the step that replaces this one).
   holdStarts(state, prKey(ref), ownStart);
-  const claimed = claimStep(slots, stepKey, stepWaitMaxMs(deps, env), ownStart);
+  const claimed = claimStep(slots, stepKey, stepWaitMaxMs(settings, deps), ownStart);
   const waited = claimed instanceof Promise;
   if (waited) trace(job.id, "step-waits", { pr, head: headSha.slice(0, 7) });
   const turn = claimed instanceof Promise ? await claimed : claimed;
@@ -993,12 +1073,15 @@ export async function runPostReviewLoop(
   const startRequests = turn.starts; // this review's start and those of the waiters it replaced
   try {
     if (waited) {
-      // The wait can last hours: the operator's settings kill switch (fixAgent.mode = suggest, or
-      // no provider) set meanwhile governs this step — every later read, check and round below.
+      // The wait can last hours: the operator's settings set meanwhile govern this step — every
+      // later read, check, budget and round below. The kill switch is the Settings gate itself
+      // (fixAgent.enabled off, or a provider + delivery this runtime cannot run: loopEnabled);
+      // fixAgent.mode = suggest downgrades the round.
       settings = await settingsNow(deps, settings);
-      if (!loopEnabled(settings, env)) return { ran: false, reason: "disabled" };
+      if (!loopEnabled(settings)) return { ran: false, reason: "disabled" };
+      cap = roundCap(settings);
     }
-    d = deps ?? (await productionDeps(settings));
+    d = deps ?? (await productionDeps(settings, ref));
     const gh = d.gh;
     const ctl = controlCtx(d, token, botLogin);
     // A moved head supersedes this review: the LIVE head's review drives the loop. The push handler
@@ -1273,19 +1356,14 @@ export async function runPostReviewLoop(
       }
       return tally;
     };
-    const maxAttempts = fixAttempts(env);
+    const maxAttempts = fixKnob(settings.fixAgent, "attempts");
     const deps2 = d;
     // The provider call runs under the watcher: the deadline excludes queue time, and a queued (or
     // just-started) request whose head moved or whose session ended is cancelled instead of
     // generated in full.
     const requestFix: RequestFix = (p) =>
       watchFixRequest((prompt, ctl) => deps2.requestFix(prompt, ctl), p, {
-        generationMs: deps2.fixTimeoutMs ?? fixTimeoutMs(env),
-        queueMaxMs: deps2.fixWatch?.queueMaxMs ?? fixQueueMaxMs(env),
-        livenessMs: deps2.fixWatch?.livenessMs ?? localLivenessMs(env),
-        checkEveryMs: deps2.fixWatch?.checkEveryMs ?? FIX_RELEVANCE_CHECK_MS,
-        tickMs: deps2.fixWatch?.tickMs ?? FIX_WATCH_TICK_MS,
-        reportsActivity: deps2.fixReportsActivity ?? false,
+        ...fixWatchLimits(settings, deps2, env),
         stillWanted: async () => {
           const why = await checkpoint();
           return why ? MOOT_TEXT[why] : null;
@@ -1424,9 +1502,9 @@ export async function continueLoopOnPush(
   env: NodeJS.ProcessEnv | undefined = envOf(),
 ): Promise<ControlResult> {
   try {
-    if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
+    if (!loopEnabled(settings)) return { posted: false, reason: "disabled" };
     const botLogin = ashlarBotLogin(env);
-    const d = deps ?? (await productionDeps(settings));
+    const d = deps ?? (await productionDeps(settings, { owner: push.owner, repo: push.repo, pr: push.pr }));
     const head = await d.gh.fetchPullHeadRef(token, push.owner, push.repo, push.pr);
     // A later push will continue with its own head; never request a review of a stale one.
     if (head.sha !== push.headSha) return { posted: false, reason: SUPERSEDED };
@@ -1450,7 +1528,7 @@ export async function continueLoopOnPush(
         reason: "loop-error",
         detail: `the pushed head's review could not be requested: ${error}`,
         rounds,
-        roundCap: roundCap(env),
+        roundCap: roundCap(settings),
         botLogin,
         session: since,
         superseded: () => freshMoot(d.gh, token, push, botLogin, { session: since, extra: moved }),
@@ -1539,10 +1617,10 @@ export async function startLoop(
   env: NodeJS.ProcessEnv | undefined = envOf(),
 ): Promise<ControlResult> {
   try {
-    if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
+    if (!loopEnabled(settings)) return { posted: false, reason: "disabled" };
     const botLogin = ashlarBotLogin(env);
     if (isSelfLogin(start.actor, botLogin)) return { posted: false, reason: "bot-authored start ignored" };
-    const d = deps ?? (await productionDeps(settings));
+    const d = deps ?? (await productionDeps(settings, { owner: start.owner, repo: start.repo, pr: start.pr }));
     const out = await recordStart(token, start, d, botLogin);
     switch (out.status) {
       case "posted":
@@ -1622,7 +1700,7 @@ export async function stopLoop(
   deps?: LoopRuntimeDeps,
   env: NodeJS.ProcessEnv | undefined = envOf(),
 ): Promise<ControlResult> {
-  if (!loopEnabled(settings, env)) return { posted: false, reason: "disabled" };
+  if (!loopEnabled(settings)) return { posted: false, reason: "disabled" };
   const botLogin = ashlarBotLogin(env);
   if (isSelfLogin(stop.actor, botLogin)) return { posted: false, reason: "bot-authored stop ignored" };
   const at = stop.stopAt ?? new Date().toISOString();
@@ -1633,7 +1711,7 @@ export async function stopLoop(
   const ref = { owner: stop.owner, repo: stop.repo, pr: stop.pr };
   let d: LoopRuntimeDeps | undefined;
   try {
-    d = deps ?? (await productionDeps(settings));
+    d = deps ?? (await productionDeps(settings, ref));
     let body = "";
     let recordOnly = "";
     let malformed: string | undefined; // a record the parser would reject is never posted

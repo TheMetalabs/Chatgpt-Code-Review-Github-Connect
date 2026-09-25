@@ -29,6 +29,55 @@ function readComposer(el) {
   return el.innerText || el.textContent || "";
 }
 
+/** An element's text for a LOSSLESS comparison (a fix prompt): a textarea's value; in a rich editor
+ * every text node verbatim, each block (P, DIV, PRE, LI, ...) one line and each <br> a line break,
+ * except the <br> that ends a block (the editor's placeholder that keeps an empty or newline-ended line
+ * visible). innerText is not lossless there: it separates <p> blocks by a blank line (ChatGPT's
+ * composer holds one <p> per line) and collapses spaces outside pre-wrap. */
+function losslessText(el) {
+  if (!el) return "";
+  if ((typeof HTMLTextAreaElement === "function" && el instanceof HTMLTextAreaElement) ||
+      (typeof HTMLInputElement === "function" && el instanceof HTMLInputElement)) return el.value || "";
+  const read = (node, block) => {
+    const parts = [];
+    for (const child of node.childNodes || []) {
+      if (child.nodeType === 3) parts.push({text: child.nodeValue || ""});
+      else if (child.nodeType !== 1 || child.matches('script, style, [hidden], [aria-hidden="true"]')) continue;
+      else if (child.tagName === "BR") parts.push({text: "\n", br: true});
+      else {
+        const inner = /^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE)$/.test(child.tagName);
+        parts.push({text: read(child, inner), block: inner});
+      }
+    }
+    if (block && parts.at(-1)?.br) parts.pop();
+    return parts.map((part, i) => (i && (part.block || parts[i - 1].block) ? "\n" : "") + part.text).join("");
+  };
+  return read(el, true);
+}
+
+/** The form a FIX prompt is verified in, before Send (the composer draft) and after it (the sent turn):
+ * its exact text, with only the provider's known transport changes undone. Line endings become LF (a
+ * textarea and the provider store CRLF as LF), and whitespace at the two ends of the whole prompt is
+ * dropped (the provider trims a sent message; a fix prompt starts and ends with Ashlar's instructions,
+ * never with source). Every other character, whitespace included, must match: a fix prompt inlines
+ * source whose spaces are content. A review prompt keeps normalizePrompt. */
+function fixPromptForm(text) {
+  return String(text ?? "").replace(/\r\n?/g, "\n").trim();
+}
+
+/** Whether the composer holds the fix prompt whose fixPromptForm is `exact`, read losslessly. */
+function composerHoldsFix(el, exact) {
+  return typeof exact === "string" && fixPromptForm(losslessText(el)) === exact;
+}
+
+/** A fix draft that matches its prompt only once whitespace is collapsed was changed by the editor:
+ * typing it again yields the same, and sending it would deliver other source. The run ends before Send. */
+function fixPromptAltered() {
+  const error = new Error("the composer changed the fix prompt's whitespace; it was not sent");
+  error.code = "prompt_altered";
+  return error;
+}
+
 function composerHas(el, text) {
   const got = readComposer(el).replace(/\s+/g, " ").trim();
   const want = String(text || "").replace(/\s+/g, " ").trim();
@@ -81,6 +130,15 @@ function splitAttachments(raw) {
   return {prompt, files};
 }
 
+/** The text to type and the files to upload for this run's prompt. A FIX run's prompt is delivered
+ * VERBATIM, byte-exact: it inlines whole source files, so a line that looks like an attachment
+ * envelope (a `<<<ASHLAR_ATTACHMENTS_V2>>>` sentinel, a legacy `<<<ATTACH:…>>>` block) is file
+ * content, never transport, and nothing is uploaded or trimmed. Only a review prompt carries
+ * attachments (splitAttachments). The run's kind is set by ashlar-run before the runner starts. */
+function promptParts(raw) {
+  return globalThis.__ashlarRunnerState?.kind === "fix" ? {prompt: String(raw ?? ""), files: []} : splitAttachments(raw);
+}
+
 async function attachFiles(files) {
   if (!files.length) return false;
   const input =
@@ -101,9 +159,14 @@ async function attachFiles(files) {
 }
 
 async function fillComposer(el, text) {
-  const parts = splitAttachments(text);
+  const parts = promptParts(text);
   let body = parts.prompt || (parts.files.length ? "" : text);
   const state = globalThis.__ashlarRunnerState;
+  // A fix prompt must be held exactly (fixPromptForm, read losslessly); a review prompt normalized.
+  const exact = state?.kind === "fix" ? fixPromptForm(body) : null;
+  const holds = editor => exact === null ? normalizePrompt(readComposer(editor)) === normalizePrompt(body) : composerHoldsFix(editor, exact);
+  // Held only once whitespace is collapsed: the editor changed the fix prompt (fixPromptAltered).
+  const altered = editor => exact !== null && normalizePrompt(readComposer(editor)) === normalizePrompt(body);
   if (state) state.pendingAttachments = [];
   if (parts.files.length) {
     const attached = await attachFiles(parts.files);
@@ -131,13 +194,15 @@ async function fillComposer(el, text) {
     if (!el.isConnected) continue;
     // The send barrier checks the complete text too; do not accept a truncated
     // draft here using the historical 85-percent heuristic.
-    if (normalizePrompt(readComposer(el)) === normalizePrompt(body)) return body;
+    if (holds(el)) return body;
+    if (altered(el)) throw fixPromptAltered();
     const dt = new DataTransfer(); dt.setData("text/plain", body);
     selectComposerContents(el);
     el.dispatchEvent(new ClipboardEvent("paste", {clipboardData: dt, bubbles: true, cancelable: true}));
     await Promise.resolve();
     if (!el.isConnected) continue;
-    if (normalizePrompt(readComposer(el)) === normalizePrompt(body)) return body;
+    if (holds(el)) return body;
+    if (altered(el)) throw fixPromptAltered();
     step("composer_waiting");
     await waitForPageChange(250);
   }
@@ -270,6 +335,13 @@ function findEligibleSendButton(selectors) {
   return null;
 }
 
+/** The identity of the conversation this page shows: its URL without the fragment (the same rule
+ * as json.js conversationIdentity, which compares against what is recorded here). */
+function shownConversation() {
+  const href = globalThis.location?.href;
+  return typeof href === "string" ? href.split("#")[0] : "";
+}
+
 function submissionConfirmed(record) {
   const turns = userTurns();
   // Composer clearing and Stop alone are not proof that THIS request was accepted.
@@ -279,6 +351,18 @@ function submissionConfirmed(record) {
   record.submittedUsers = turns.indexOf(match) + 1;
   record.messageId = match.getAttribute("data-message-id") || "";
   const state = globalThis.__ashlarRunnerState;
+  // A FIX run's conversation is a fact of THIS moment: recorded once, here, and never later (every
+  // later fix decision compares the location with it). Only a send this page instance clicked,
+  // confirmed while the page still shows the conversation it was clicked in, establishes it. A
+  // confirmation seen only after a reload (the click belonged to an earlier page) or under another
+  // location (an in-page move can leave the old DOM rendering the sent turn) proves the send, not
+  // which conversation holds it: no identity is recorded (json.js then reports
+  // `identity:"unestablished"`: never harvested, never closed). A review journal is unchanged.
+  const attempt = state?.sendAttempt;
+  if (state?.kind === "fix" && !record.conversation && attempt?.key === submissionKey() && attempt.conversation &&
+      attempt.conversation === shownConversation()) {
+    record.conversation = attempt.conversation;
+  }
   state.confirmedSubmission = {key: submissionKey(), record};
   state.submissionPersistencePending = true;
   step("prompt_submitted");
@@ -288,10 +372,15 @@ function submissionConfirmed(record) {
 
 async function clickSend(findSend, findComposer, expectedText) {
   let record = await readSubmissionJournal();
+  // A fix journal also carries its prompt's lossless form (`exact`, fixPromptForm): the draft is sent
+  // only while it holds exactly that, and the sent turn is later proven against it (json.js
+  // journaledTurnIntegrity). The whitespace-normalized `expected` only locates the sent turn.
+  const fix = globalThis.__ashlarRunnerState?.kind === "fix";
   if (!record) {
     const expected = normalizePrompt(expectedText || readComposer(findComposer()));
     if (!expected) throw new Error("cannot submit an empty review prompt");
-    record = {phase: "prepared", expected, baseline: userTurns().length, attachments: [...(globalThis.__ashlarRunnerState?.pendingAttachments || [])]};
+    record = {phase: "prepared", expected, ...(fix ? {exact: fixPromptForm(expectedText)} : {}),
+      baseline: userTurns().length, attachments: [...(globalThis.__ashlarRunnerState?.pendingAttachments || [])]};
     saveSubmission(record);
     step("prompt_prepared");
   }
@@ -309,10 +398,18 @@ async function clickSend(findSend, findComposer, expectedText) {
       const uploadBusy = !attachmentsReady(form, record.attachments || []);
       step(uploadBusy ? "attachments_waiting" : "send_waiting");
       const otherTurn = userTurns().length !== record.baseline;
-      if (!uploadBusy && !otherTurn && normalizePrompt(readComposer(editor)) === record.expected && actionableSend(button) &&
+      const drafted = normalizePrompt(readComposer(editor)) === record.expected;
+      // A fix draft that is the prompt only once whitespace is collapsed (or a fix journal with no
+      // lossless form to check it against) is never sent.
+      if (fix && drafted && !composerHoldsFix(editor, record.exact)) throw fixPromptAltered();
+      if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
           !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
         record.phase = "attempted";
         saveSubmission(record); // durable intent BEFORE invoking the site's handler
+        // In memory only: the conversation this page instance clicked in (submissionConfirmed
+        // records it once the send is proven, and only if the page still shows it then).
+        const runner = globalThis.__ashlarRunnerState;
+        if (runner) runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()};
         step("send_attempted");
         try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
       }
@@ -326,7 +423,7 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   const record = await readSubmissionJournal();
   if (record) return clickSend(findSend, findComposer, record.expected);
   // Legacy pages have no durable send journal. Observe, but never guess and re-send.
-  const expected = normalizePrompt(splitAttachments(prompt).prompt);
+  const expected = normalizePrompt(promptParts(prompt).prompt);
   for (;;) {
     const turns = userTurns();
     if (turns.length && (!expected || normalizePrompt(messagePromptText(turns.at(-1))).includes(expected))) {

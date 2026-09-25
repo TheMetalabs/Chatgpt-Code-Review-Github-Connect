@@ -8,11 +8,13 @@ import {sanitizeProgressEvents} from "./review-progress";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider, ProviderError } from "./types";
-import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, isChatProvider, providersFromSettings } from "./types";
+import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, fixKnob, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
 import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
+import { createFixRegistry, isFixItemId, type FixOffer, type FixRequest } from "./bridge-fix.server";
+import { createdBefore } from "./creation-seq";
 
 type BridgeMeta = {
   token: string;
@@ -68,6 +70,8 @@ export type BridgePublic = Omit<BridgeStatus, "token"> & {
   workerStatus?: WorkerStatus;
   workerStatusFresh: boolean;
   localJsonRepairEnabled: boolean;
+  /** Live review-loop fix items (queued + claimed); never counted in pendingJobs. */
+  pendingFixes: number;
 };
 
 export function getBridgeStatus(): BridgeStatus {
@@ -87,6 +91,7 @@ export function getBridgePublic(): BridgePublic {
     workerStatusFresh: workerStatusIsFresh(meta.workerStatus, Date.now(), BRIDGE_CONNECTED_MS),
     repairProtocol: 1, captureProtocol: 1, recoveryProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
     pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && pendingChatProviders(job).length > 0).length,
+    pendingFixes: fixLiveCount(),
   };
 }
 
@@ -138,6 +143,109 @@ function submissionInFlightForClient(jobs: readonly Job[], clientId: string): bo
   );
 }
 
+// ── Review-loop fix items (bridge-fix.server.ts) ─────────────────────────────
+// A fix is NOT a harbor Job. Every per-id handler below branches on the `fix-` prefix FIRST, so a
+// fix never meets the review lifecycle, review-JSON validation, capture or repair.
+let fixRegistry: ReturnType<typeof createFixRegistry> | undefined;
+function fixes() {
+  return (fixRegistry ||= createFixRegistry({
+    now: () => Date.now(),
+    newId: () => randomBytes(18).toString("base64url"),
+    parallelLimit: () => getHarbor().settings.fixAgent?.parallelPrs ?? 1,
+    reasoning: () => ({chatgpt: getHarbor().settings.chatgptReasoning, grok: getHarbor().settings.grokReasoning}),
+    // Settings (fixAgent.chatTimeoutMs / chatMaxPromptChars), read per request: no restart.
+    timeoutMs: () => fixKnob(getHarbor().settings.fixAgent, "chatTimeoutMs"),
+    maxPromptChars: () => fixKnob(getHarbor().settings.fixAgent, "chatMaxPromptChars"),
+    claimMs: BRIDGE_CLAIM_MS,
+    submitWindowMs: SUBMIT_WINDOW_MS,
+    // unref: a pending fix deadline must never keep the server (or a test runner) alive.
+    setTimer: (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
+    clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+  }));
+}
+function fixLiveCount() {
+  const {queued, claimed} = fixes().counts();
+  return queued + claimed;
+}
+
+/** Review-loop fix transport for chatgpt/grok: queue the prompt for a Chrome chat tab and resolve
+ * with the model's answer TEXT (rejects on failure / deadline / supersede — see bridge-fix.server.ts). */
+export function requestBridgeFix(request: FixRequest): Promise<string> {
+  return fixes().request(request);
+}
+
+export function isBridgeFixId(jobId: unknown): boolean {
+  return isFixItemId(jobId);
+}
+
+/** THE fix-protocol gate: every operation on a review-loop fix item needs the worker's
+ * fixProtocol:1 opt-in (a worker without it cannot harvest a plain-text fix answer and would wait
+ * for review JSON forever). The route applies it once, before dispatching any action:
+ * - per-id operations on a `fix-` id (claim, ping, prompt, progress, release, failure, complete and
+ *   the review-only observe/capture/repair lanes) are refused (409 fix_protocol_required) and
+ *   never touch the item;
+ * - take offers a fix item only to an opted-in worker (takeNextBridgeJob `fixes`);
+ * - recover skips fix bindings for a worker that has not opted in (recoverBridgeJob `fixes`);
+ *   its review bindings are recovered as before.
+ * Review operations are unchanged. True when the operation must be refused. */
+export function fixOperationRefused(jobId: unknown, fixProtocol: unknown): boolean {
+  return isFixItemId(jobId) && fixProtocol !== 1;
+}
+
+/** A fix answer is plain text for the runtime's deterministic parser: resolved as-is (the page's
+ * full text), never review-validated, salvaged or archived as a review. */
+export function completeBridgeFix(jobId: string, raw: string, legs: ChatLeg[] | undefined, leaseId?: string) {
+  const leg = legs?.[0];
+  const out = fixes().complete(jobId, leg?.provider, leg ? leg.originalText || leg.raw : raw, leaseId);
+  if (out.ok) {
+    meta.lastJobId = jobId;
+    meta.lastError = undefined;
+  }
+  return out;
+}
+
+/** Fix progress is diagnostics only (a timeout names the last stage); it never enters review history. */
+function recordFixProgress(jobId: string, leaseId: string | undefined, reports: unknown): boolean {
+  const provider = fixes().providerOf(jobId);
+  if (!provider || !reports || typeof reports !== "object" || Array.isArray(reports)) return false;
+  const report = (reports as Record<string, unknown>)[provider];
+  const events = report && typeof report === "object" ? sanitizeProgressEvents((report as {events?: unknown}).events) : [];
+  const latest = events.reduce<(typeof events)[number] | undefined>((last, event) => (!last || event.at >= last.at ? event : last), undefined);
+  const runId = (report as {runId?: unknown} | undefined)?.runId;
+  return fixes().progress(jobId, leaseId, latest?.stage, typeof runId === "string" && runId.length <= 128 ? runId : undefined);
+}
+
+/** The oldest queued fix unless an eligible review is older. Neither kind starves: live fixes
+ * are bounded by fixAgent.parallelPrs and their deadline; a review waits for at most the fixes
+ * requested before it. A review without a known age keeps today's precedence. A fix blocked by an
+ * older review names that OLDEST review (`reviewFirst`) so the caller dispatches it rather than
+ * nextBridgeJob's newest-first candidate: otherwise a stream of newer reviews would starve the
+ * fix while the old review never ran. */
+function takeFix(clientId: string, excludeJobIds: readonly string[], review: ReturnType<typeof nextBridgeJob>): {fix?: FixOffer; reviewFirst?: string} {
+  // nextBridgeJob is null while a review submission is in flight; a fix must wait for it too.
+  if (submissionInFlightForClient(getHarbor().jobs, clientId)) return {};
+  const next = fixes().peek(excludeJobIds, clientId);
+  if (!next) return {};
+  if (review) {
+    // The OLDEST review this profile could take, not the candidate (harbor lists jobs newest
+    // first): a fix never jumps ahead of a review requested before it.
+    const waiting = getHarbor().jobs.filter(j => reviewEligible(j, clientId, excludeJobIds));
+    // A review of unknown age keeps today's precedence (the candidate goes first).
+    if (!waiting.length || !waiting.every(j => Number.isFinite(j.createdAt))) return {};
+    // Creation order is (createdAt, createdSeq): one sequence spans both kinds, so a fix created
+    // in the same millisecond as an earlier review still waits for it. A review without a
+    // sequence (created before it existed) ties as today: the fix goes first.
+    const oldest = waiting.reduce((a, b) => (createdBefore(b, a) ? b : a));
+    if (createdBefore(oldest, next)) return {reviewFirst: oldest.id};
+  }
+  const offer = fixes().take(next.id, clientId);
+  if (offer) {
+    meta.lastJobId = offer.jobId;
+    meta.lastError = undefined;
+  }
+  return offer ? {fix: offer} : {};
+}
+
 function pendingChatProviders(job: Job): ReviewProvider[] {
   const providers = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length
     ? job.reviewProviders : providersFromSettings(getHarbor().settings);
@@ -148,11 +256,25 @@ function pendingChatProviders(job: Job): ReviewProvider[] {
 }
 
 export function bridgeJobState(jobId: string) {
+  if (isFixItemId(jobId)) return fixes().state(jobId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
   return {active: job?.status === "awaiting_chat", status: job?.status ?? "missing"};
 }
 
-export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): {
+/** A review job this Chrome profile may take now (nextBridgeJob's filter; takeFix orders by it). */
+function reviewEligible(job: Job, clientId: string, excludeJobIds: readonly string[]): boolean {
+  if (excludeJobIds.includes(job.id) || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) return false;
+  if (job.bridgeClaimedAt && !STALE_CLAIM(job)) return false;
+  if (!pendingChatProviders(job).length) return false;
+  // Only the owning Chrome profile has the original tab. Never start a replacement
+  // generation from another profile merely because the heartbeat expired.
+  const attempted = job.attemptedProviders ?? [];
+  if (attempted.length && job.bridgeClientId && job.bridgeClientId !== clientId) return false;
+  const prompts = job.chatPromptByProvider;
+  return Boolean(job.chatPrompt || prompts?.chatgpt || prompts?.grok);
+}
+
+export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = [], onlyJobId?: string): {
   jobId: string;
   provider: ReviewProvider;
   providers: ReviewProvider[];
@@ -170,17 +292,11 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
   // Only one foreground submission at a time per Chrome profile (see SUBMIT_WINDOW_MS).
   if (submissionInFlightForClient(harbor.jobs, clientId)) return null;
   for (const job of harbor.jobs) {
-    if (excludeJobIds.includes(job.id) || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) continue;
-    if (job.bridgeClaimedAt && !STALE_CLAIM(job)) continue;
+    if ((onlyJobId !== undefined && job.id !== onlyJobId) || !reviewEligible(job, clientId, excludeJobIds)) continue;
     const providers = pendingChatProviders(job);
-    if (!providers.length) continue;
     const attempted = job.attemptedProviders ?? [];
-    // Only the owning Chrome profile has the original tab. Never start a replacement
-    // generation from another profile merely because the heartbeat expired.
-    if (attempted.length && job.bridgeClientId && job.bridgeClientId !== clientId) continue;
     const prompts = job.chatPromptByProvider;
     const prompt = job.chatPrompt || prompts?.chatgpt || prompts?.grok || "";
-    if (!prompt) continue;
     return {
       jobId: job.id, provider: providers[0], providers,
       resumeProviders: providers.filter(p => attempted.includes(p)),
@@ -192,9 +308,21 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
   return null;
 }
 
-export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): ReturnType<typeof nextBridgeJob> {
+export type BridgeOffer = NonNullable<ReturnType<typeof nextBridgeJob>> | FixOffer;
+
+/** `fixes` is the worker's fixProtocol:1 opt-in: a worker that cannot harvest a plain-text fix
+ * answer (it would wait for review JSON forever) is never offered a fix item. */
+export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = [], options: {fixes?: boolean} = {}): BridgeOffer | null {
   meta.lastTakeAt = Date.now();
-  const job = nextBridgeJob(clientId, excludeJobIds);
+  // A fix tab pastes its prompt in the foreground exactly like a review tab: one submission per
+  // Chrome profile across BOTH kinds (see SUBMIT_WINDOW_MS).
+  if (fixes().submitting(clientId, excludeJobIds)) return null;
+  let job = nextBridgeJob(clientId, excludeJobIds);
+  const {fix, reviewFirst} = options.fixes ? takeFix(clientId, excludeJobIds, job) : {};
+  if (fix) return fix;
+  // A fix waits for the reviews requested before it: dispatch the oldest of those, not the
+  // newest-first candidate, so newer reviews cannot starve the fix.
+  if (reviewFirst && reviewFirst !== job?.jobId) job = nextBridgeJob(clientId, excludeJobIds, reviewFirst);
   if (!job) return null;
   const claim = claimBridgeJob(job.jobId, clientId);
   if (!claim.ok) return null;
@@ -209,13 +337,21 @@ export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[
 /** Recover only the original profile's already-attempted, positively bound run.
  * This is NOT a capacity bypass for take/new generation and never widens providers.
  */
-export function recoverBridgeJob(clientId: string, values: unknown) {
+export function recoverBridgeJob(clientId: string, values: unknown, options: {fixes?: boolean} = {}) {
   if (!clientId || !Array.isArray(values) || values.length > 16) return null;
   const bindings = values.filter((item): item is {jobId:string;provider:"chatgpt"|"grok";runId:string} =>
     Boolean(item && typeof item === "object" && typeof item.jobId === "string" && item.jobId.length <= 160 &&
       isChatProvider(item.provider) && typeof item.runId === "string" && item.runId.length > 0 && item.runId.length <= 128));
+  // A fix item's run is resumed the same way: same profile, provider and pinned run - and only for a
+  // worker that opted into fix items (fixOperationRefused); an older worker's fix bindings are skipped.
+  for (const binding of bindings) {
+    if (!isFixItemId(binding.jobId) || options.fixes !== true) continue;
+    const offer = fixes().recover(binding.jobId, clientId, binding.provider, binding.runId);
+    if (offer) return offer;
+  }
   const harbor=getHarbor();
   for (const id of new Set(bindings.map(item=>item.jobId))) {
+    if (isFixItemId(id)) continue;
     const job=harbor.jobs.find(row=>row.id===id);
     if (!job || job.status!=="awaiting_chat" || !llmWorkAllowed(job) || job.bridgeClientId!==clientId ||
         job.chatFpRound || job.fpProviders?.length) continue;
@@ -236,6 +372,7 @@ export function recoverBridgeJob(clientId: string, values: unknown) {
 }
 
 export function promptForJob(jobId: string): {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>} | null {
+  if (isFixItemId(jobId)) return fixes().prompt(jobId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job)) return null;
   const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok;
@@ -258,6 +395,7 @@ export function recordBridgeObservation(jobId: string, leaseId: string | undefin
 }
 
 export function recordBridgeProgress(jobId: string, leaseId: string | undefined, reports: unknown): boolean {
+  if (isFixItemId(jobId)) return recordFixProgress(jobId, leaseId, reports);
   const job=getHarbor().jobs.find(j=>j.id===jobId);
   if(!job || !ownsLease(job,leaseId) || !reports || typeof reports!=="object" || Array.isArray(reports))return false;
   // Validate all run identities before recording either provider (no partial batch).
@@ -289,6 +427,12 @@ export function refreshBridgeClaim(
   errors?: Partial<Record<ReviewProvider, ProviderError>>,
   leaseId?: string,
 ): boolean {
+  if (isFixItemId(jobId)) {
+    // Provider errors on a fix are terminal only via the explicit failure action.
+    const accepted = fixes().refresh(jobId, leaseId, generating);
+    if (accepted) meta.lastJobId = jobId;
+    return accepted;
+  }
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return false;
   patchHarborJob(jobId, current => {
@@ -313,7 +457,15 @@ export function refreshBridgeClaim(
   return true;
 }
 
-export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId: string} | {ok: false; error: string} {
+export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId: string} | {ok: false; error: string; code?: string} {
+  if (isFixItemId(jobId)) {
+    const out = fixes().claim(jobId, clientId);
+    if (out.ok) {
+      meta.lastJobId = jobId;
+      meta.lastError = undefined;
+    }
+    return out;
+  }
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job) || !(job.chatPrompt || job.chatPromptByProvider)) {
     return {ok: false, error: "job is not waiting for chat"};
@@ -339,6 +491,10 @@ export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId
 }
 
 export function releaseBridgeJob(jobId: string, leaseId?: string) {
+  if (isFixItemId(jobId)) {
+    fixes().release(jobId, leaseId);
+    return;
+  }
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return;
   patchHarborJob(jobId, current => ({
@@ -350,6 +506,7 @@ export function releaseBridgeJob(jobId: string, leaseId?: string) {
 /** Explicit terminal outcome; transient disconnection is reported by ping instead. */
 export function failBridgeProvider(jobId: string, provider: ReviewProvider, error: string, leaseId?: string): boolean {
   if (!isChatProvider(provider)) return false;
+  if (isFixItemId(jobId)) return fixes().fail(jobId, provider, error, leaseId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat") return true;
   if (!llmWorkAllowed(job) || !ownsLease(job, leaseId)) return false;

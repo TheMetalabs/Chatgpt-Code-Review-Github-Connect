@@ -1112,8 +1112,13 @@ async function preserveFixTab(job, provider, jobs, reason, tab, cause, extra) {
   const state = job.states[provider];
   if (tab) {
     const released = await askPage(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true, ...extra}, contentFiles(provider)).catch(() => null);
-    // The page's own steps (cancelled, context_changed, ...) reach history from this reply too.
-    if (matchesJob(released, job, provider)) ingestPageProgress(state, released);
+    // The release also stops the page's run, and the page records that as "cancelled" (the job was
+    // cancelled or forgotten). Its reply reaches history only for a leg that was (abandonedLeg, the
+    // same test that picks the review cancel exit): for a fix leg kept without a delivered answer it
+    // is the page's only report. A leg the user took over after its result was secured, or a fix
+    // whose run ended on its own (quota, an error, taken over), was never cancelled: its history
+    // keeps what the verdict reply and the poll already carried.
+    if (abandonedLeg(job, state) && matchesJob(released, job, provider)) ingestPageProgress(state, released);
   }
   await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: state.tabId}});
   if (tab) await reprobePreservedTab(tab.id, provider);

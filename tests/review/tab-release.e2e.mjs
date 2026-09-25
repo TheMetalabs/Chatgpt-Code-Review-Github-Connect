@@ -342,15 +342,22 @@ test('worker: a secured tab closes even while its sent-journal write keeps faili
  await w.tick();
  assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
 });
-// Secured legs the user took over: preserved (never closed), released, and the job retires.
-for(const [name,cause,takeover] of TAKEOVERS)test(`worker: an ACKed tab with ${name} is preserved and released, and history says why`,async t=>{
- const {tab,w}=await collectedLeg(t,{});
- await takeover(tab.page);
+// Secured legs the user took over: preserved (never closed), released, and the job retires. Nobody
+// cancelled them: the release also stops the page's run, but history never says it was cancelled.
+for(const kind of ['review','fix'])for(const [name,cause,takeover] of TAKEOVERS)test(`worker, ${kind}: an ACKed tab with ${name} is preserved and released, and history says why`,async t=>{
+ // (a fix answer is handed out only while its page proves the tab is Ashlar's, #77: the user takes
+ // the fix tab over after the answer was harvested, before the bridge ACKs it)
+ let page;
+ const {tab,w}=await collectedLeg(t,{kind,onComplete:kind==='fix'?()=>takeover(page):undefined});
+ page=tab.page;
+ if(kind!=='fix')await takeover(tab.page);
  await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
  assert.deepEqual(w.b.closedTabs,[]);assert.equal(w.state(),undefined,'the job retired');
  assert.equal(await tab.released(),'true');
  const steps=uploadedSteps(w);
  for(const stage of ['page:context_changed',`worker:preserve_${cause}`,'worker:tab_preserved'])assert.ok(steps.includes(stage),`${stage} in ${steps}`);
+ assert.equal(steps.includes('page:cancelled'),false,`a secured leg is never reported as cancelled: ${steps}`);
 });
 test('worker: an ACKed tab whose URL differs from its bound conversation only in the query closes',async t=>{
  const {tab,w}=await collectedLeg(t,{});

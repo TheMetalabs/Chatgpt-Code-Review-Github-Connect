@@ -251,6 +251,33 @@ for (const kind of ['review', 'fix']) {
     assert.ok(history.indexOf('worker:preserve_user_turn') < history.indexOf('worker:tab_preserved'), 'the cause precedes the preserve');
   });
 }
+// History says a run was cancelled only when its job was. The release that keeps a tab also stops the
+// page's run, which the page records as "cancelled" ("the job was cancelled or forgotten"): that
+// reply is uploaded only for an abandoned leg (for a fix kept without a delivered answer it is the
+// page's only report). The real page script answers here, bound to the leg's run.
+const PRESERVED_HISTORY = [
+  // [kind, what, the worker's leg, the page's run state, the server status, history says cancelled]
+  ['review', 'a secured review the user took over', secured('review'), {tabRepurposed: true, takeoverCause: 'user_turn'}, 'awaiting_chat', false],
+  ['fix', 'a delivered fix the user took over', {...secured('fix'), conversation: 'https://chatgpt.com/?temporary-chat=true'}, {kind: 'fix', tabRepurposed: true, takeoverCause: 'user_turn'}, 'awaiting_chat', false],
+  ['fix', 'a fix whose run ended on a usage limit', {delivered: true, cleanupPending: true, outcome: {ok: false, code: 'quota', error: 'limit'}}, {kind: 'fix', result: {ok: false, code: 'quota'}}, 'dlq', false],
+  ['fix', 'a fix the server cancelled while it was generating', {}, {kind: 'fix', running: true}, 'cancelled', true],
+];
+for (const [kind, what, state, pageState, status, cancelled] of PRESERVED_HISTORY) {
+  test(`${kind}: ${what} is preserved, and review history ${cancelled ? 'says its run was cancelled' : 'never says it was cancelled'}`, async () => {
+    const url = 'https://chatgpt.com/?temporary-chat=true';
+    const jobId = leg(kind).jobId;
+    const page = content('chatgpt', new Map([['ashlar:job', jobId], ['ashlar:run', 'run-A']]));
+    page.context.location = {href: url};
+    Object.assign(page.context.__ashlarRunnerState, pageState);
+    const b = worker(leg(kind, state), {status, tab: {id: 10, url, status: 'complete'}, handler: (_id, m) => page.message(m)});
+    await b.tick();
+    assert.equal(b.pending(), undefined, 'retired');assert.deepEqual(b.closedTabs, [], 'kept');
+    assert.equal(page.context.__ashlarRunnerState.runStopped, true, 'the release stopped the page\'s run either way');
+    const history = uploaded(b);
+    assert.ok(history.includes('worker:tab_preserved'), `preserved: ${history}`);
+    assert.equal(history.includes('page:cancelled'), cancelled, `page:cancelled in ${history}`);
+  });
+}
 // A page that accepts a release message but never runs its handler (a frozen tab, a hung page): the
 // reply is bounded (pageReplyDeadline, replaced here by one that expires at once), so the cleanup
 // lane is never held and the bounded ownership wait applies.

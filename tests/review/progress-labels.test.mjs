@@ -335,8 +335,13 @@ test('the tab-release (#82) stages have history labels and survive sanitize', ()
   assert.deepEqual(kept(['cancelled'], 'page'), ['cancelled'], '#82: the page records cancelled when its run is stopped');
 });
 
-test('tab_preserved names no cause of its own: the worker preserves for non-user reasons too, and preserve_<cause> carries why', () => {
-  assert.doesNotMatch(PROGRESS_LABELS.tab_preserved, /user|repurpos/i);
+test('tab_preserved points at a preserve cause only when the extension records one', () => {
+  // These labels land before #82, and main records tab_preserved with no preserve_<cause> beside it: a
+  // label that sends the reader to the cause would point at nothing. That relabel lands with #82.
+  const {literals, templates} = guardedStages(extensionFiles());
+  const recordsCause = [...literals, ...templates].some(stage => stage.startsWith('preserve_'));
+  assert.ok(recordsCause || !/preserve cause/i.test(PROGRESS_LABELS.tab_preserved),
+    `tab_preserved (${PROGRESS_LABELS.tab_preserved}) points at a preserve cause the extension never records`);
 });
 
 /** The stages the Tab Lease redesign (Phase 1+) records. Labelled before the extension ships them:

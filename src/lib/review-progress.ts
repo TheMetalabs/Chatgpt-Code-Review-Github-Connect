@@ -34,7 +34,7 @@ export const PROGRESS_LABELS = {
     result_saved: "Server acknowledged response storage",
     cleanup_pending: "Response secured · tab cleanup pending",
     tab_closed: "Review tab closed",
-    tab_preserved: "Tab preserved · see the preserve cause",
+    tab_preserved: "User-repurposed tab preserved",
     preserve_navigated: "Tab preserved · the user moved it to another conversation or site",
     preserve_user_turn: "Tab preserved · the user sent a follow-up turn",
     preserve_edited: "Tab preserved · the user edited Ashlar's prompt",

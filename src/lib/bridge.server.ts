@@ -4,7 +4,7 @@ import type {RepairInput} from "./json-repair.server";
 import {inspectReviewFormat} from "./review-json-repair";
 import type {RepairRecord} from "./json-repair-types";
 import {reviewHistory} from "./review-history.server";
-import {sanitizeProgressEvents} from "./review-progress";
+import {sanitizeProgressEvents} from "./review-progress.server";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider, ProviderError } from "./types";

@@ -18,19 +18,25 @@ test('observability: trace endpoint rejects a foreign lease and accepts bound su
  assert.ok(app.history.getJob(job.jobId).steps.some(e=>e.stage==='send_unconfirmed'));
  assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===job.jobId).status,'awaiting_chat');
 });
-test('observability: a well-formed stage without a label reaches the lane and history under the fallback; a malformed one is dropped',async t=>{
+test('observability: a well-formed stage without a label reaches the lane and history as a hash of its name; a malformed one is dropped',async t=>{
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());const job=await ready(app);
  const {buildReviewerLanes}=await import('../../src/lib/reviewer-progress.ts');const {stepLabel}=await import('../../src/lib/review-progress.ts');
  const at=Date.now();
  const progress={chatgpt:{runId:'run-A',events:[{source:'page',sequence:1,stage:'send_unconfirmed',at},
-   {source:'worker',sequence:1,stage:'tab_woken',at:at+1},{source:'worker',sequence:2,stage:'lifecycle_diverged:closed/preserved',at:at+2}]}};
+   {source:'worker',sequence:1,stage:'secret_token_abc123',at:at+1},{source:'worker',sequence:2,stage:'lifecycle_diverged:closed/preserved',at:at+2}]}};
  assert.equal((await post(app,{action:'progress',jobId:job.jobId,leaseId:job.leaseId,progress})).ok,true);
  const live=app.harbor.getHarbor().jobs.find(j=>j.id===job.jobId);
- assert.equal(live.providerProgress.chatgpt.stage,'tab_woken','the latest well-formed stage is the live one, labelled or not');
- assert.equal(buildReviewerLanes(live).find(l=>l.provider==='chatgpt').detail,'Unlabelled step · tab_woken');
+ assert.equal(live.providerProgress.chatgpt.stage,'unlabelled:9699b893','the latest well-formed stage is the live one, as its sentinel');
+ assert.equal(buildReviewerLanes(live).find(l=>l.provider==='chatgpt').detail,'Unlabelled step · #9699b893');
  const steps=Array.from(app.history.getJob(job.jobId).steps).filter(e=>e.runId==='run-A');
- assert.deepEqual(steps.map(e=>e.stage),['send_unconfirmed','tab_woken']);
- assert.equal(stepLabel(steps[1]),'Unlabelled step · tab_woken');
+ assert.deepEqual(steps.map(e=>e.stage),['send_unconfirmed','unlabelled:9699b893']);
+ assert.equal(stepLabel(steps[1]),'Unlabelled step · #9699b893');
+ // Neither the live job (the unauthenticated harbor snapshot and the ops comment read it) nor the
+ // history API keeps the name.
+ assert.equal(JSON.stringify(app.harbor.publicJobs(app.harbor.getHarbor().jobs)).includes('secret_token'),false);
+ const detail=await fetch(app.origin+'/api/history?jobId='+job.jobId+'&responses=1',{headers:{'x-ashlar-history-token':'fixture-history-token-32-characters-long'}}).then(r=>r.json());
+ assert.ok(detail.record.steps.some(e=>e.stage==='unlabelled:9699b893'));
+ assert.equal(JSON.stringify(detail).includes('secret_token'),false);
 });
 test('observability: history requires token and keeps response text out of default metadata',async t=>{
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());const job=await ready(app);

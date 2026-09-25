@@ -9,7 +9,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 import * as crypto from 'node:crypto';
 import {ReviewHistoryStore} from '../../src/lib/review-history.server.ts';
-import {sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
+import {sanitizeProgressEvents} from '../../src/lib/review-progress.server.ts';
 export const root = process.env.REVIEW_SOURCE_ROOT || resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const source = path => readFileSync(resolve(root, path), 'utf8');
 export function loadTs(path, imports = {}) {

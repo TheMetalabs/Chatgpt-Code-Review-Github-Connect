@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress.ts";
-import { sanitizeProgressEvents, stageIs, type ProviderProgress } from "./review-progress.ts";
+import { isUnlabelledStage, stageIs, type ProviderProgress } from "./review-progress.ts";
+import { sanitizeProgressEvents } from "./review-progress.server.ts";
 import type { Job } from "./types.ts";
 
 function job(partial: Partial<Job>): Job {
@@ -69,8 +70,10 @@ describe("buildReviewerLanes", () => {
     assert.equal(lanes.find((l) => l.provider === "grok")?.state, "waiting");
   });
 
-  it("shows a stage recorded ahead of its label under the unlabelled fallback", () => {
-    const [event] = sanitizeProgressEvents([{source: "page", sequence: 1, stage: "tab_woken", at: 1}]);
+  it("shows a stage recorded ahead of its label under the unlabelled fallback, by its hash only", () => {
+    // The detail reaches the GitHub ops comment and the unauthenticated harbor snapshot: a stage name
+    // passes a lexical check only, so the lane shows the sentinel's hash, never the name.
+    const [event] = sanitizeProgressEvents([{source: "page", sequence: 1, stage: "secret_token_abc123", at: 1}]);
     const lanes = buildReviewerLanes(
       job({
         reviewProviders: ["chatgpt"],
@@ -79,7 +82,23 @@ describe("buildReviewerLanes", () => {
       }),
     );
     assert.equal(lanes[0].state, "waiting");
-    assert.equal(lanes[0].detail, "Unlabelled step · tab_woken");
+    assert.equal(lanes[0].detail, "Unlabelled step · #9699b893");
+    assert.equal(JSON.stringify(lanes).includes("secret_token"), false);
+  });
+
+  it("shows a progress stage of any other shape as a bare unlabelled step, never by its value", () => {
+    // providerProgress is only written through sanitizeProgressEvents or by the server; a stage read back
+    // that is neither a label key nor exactly a sentinel is still not shown.
+    for (const stage of ["secret_token_abc123", "unlabelled:9699b893x", "unlabelled:9699B893", "unlabelled:secret"]) {
+      const lanes = buildReviewerLanes(
+        job({
+          reviewProviders: ["chatgpt"],
+          generating: { chatgpt: true },
+          providerProgress: {chatgpt: {runId: "run", stage: stage as ProviderProgress["stage"], observedAt: Date.now(), receivedAt: Date.now()}},
+        }),
+      );
+      assert.equal(lanes[0].detail, "Unlabelled step", stage);
+    }
   });
 
   it("shows local generating from inFlight, skipped from assumptions", () => {
@@ -250,9 +269,9 @@ describe("buildReviewerLanes", () => {
     }
   });
 
-  it("emptyReviewSkip does not read a usage limit into the name of a stage that has no label", () => {
-    // The extension's own stage name reaches the lane detail under the unlabelled fallback; a word in
-    // it ("quota") is not the provider reporting a usage limit.
+  it("emptyReviewSkip does not read a usage limit into a stage that has no label", () => {
+    // A stage without a label is not the provider reporting a usage limit, whatever its name says
+    // ("quota"); the lane shows only its hash.
     const [event] = sanitizeProgressEvents([{source: "page", sequence: 1, stage: "quota_banner_dismissed", at: 1}]);
     const lanes = buildReviewerLanes(job({
       reviewProviders: ["chatgpt"],
@@ -260,7 +279,7 @@ describe("buildReviewerLanes", () => {
       providerErrors: {chatgpt: {code: "error", message: "context_lost: the page lost the conversation"}},
       providerProgress: {chatgpt: {runId: "run", stage: event.stage, observedAt: 1, receivedAt: 1}},
     }));
-    assert.equal(lanes[0].detail, "Unlabelled step · quota_banner_dismissed");
+    assert.equal(lanes[0].detail, "Unlabelled step · #0cb42f85");
     const skip = emptyReviewSkip(lanes);
     assert.equal(skip.usageLimited, false);
     assert.equal(skip.skipReason, "reviewers could not complete — see per-reviewer details");
@@ -302,15 +321,21 @@ describe("buildReviewerLanes", () => {
 describe("ProgressStage", () => {
   // The @ts-expect-error lines are the pin: `npx tsc --noEmit` fails on an unused one, so widening the
   // type back to string (or letting stageIs take any string) turns the type-check red.
-  it("is closed for a stage the server writes or compares, and opened only by sanitizeProgressEvents", () => {
+  it("is closed for a stage the server writes or compares, and opened only by a sentinel's shape check", () => {
     // @ts-expect-error a mistyped stage the server writes is not a ProgressStage
     const typo: ProviderProgress = {runId: "local:j1", stage: "eror", observedAt: 1, receivedAt: 1};
     const fromBody: string = "tab_woken";
     // @ts-expect-error an unchecked string is not a ProgressStage until sanitizeProgressEvents passes it
     const unchecked: ProviderProgress = {runId: "run", stage: fromBody, observedAt: 1, receivedAt: 1};
+    // @ts-expect-error nor is a string of the sentinel's shape until isUnlabelledStage checks it
+    const spelled: ProviderProgress = {runId: "run", stage: "unlabelled:6fac6376", observedAt: 1, receivedAt: 1};
+    const sentinel: string = "unlabelled:6fac6376";
+    if (isUnlabelledStage(sentinel)) assert.equal(stageIs(sentinel, "generating"), false);
+    assert.equal(stageIs(spelled.stage, "generating"), false);
     // @ts-expect-error a comparison names a labelled stage, so a mistyped one fails too
     assert.equal(stageIs(typo.stage, "local_queud"), false);
     const [event] = sanitizeProgressEvents([{source: "page", sequence: 1, stage: fromBody, at: 1}]);
+    assert.equal(event.stage, "unlabelled:6fac6376", "kept as the sentinel: the first 8 hex digits of the name's SHA-256");
     const recorded: ProviderProgress = {runId: "run", stage: event.stage, observedAt: 1, receivedAt: 1};
     assert.equal(stageIs(recorded.stage, "generating"), false);
     assert.equal(stageIs(unchecked.stage, "generating"), false);

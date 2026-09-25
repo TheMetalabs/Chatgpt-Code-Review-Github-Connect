@@ -39,7 +39,7 @@ function providerErrorNote(
 
 /** A usage-limit cause in text the server wrote: a provider error note, a skip note, a job's skip reason.
  * Only a lane builder reads it, where it knows the text is one of those; emptyReviewSkip reads the lane's
- * flag, never its detail, because a detail can also carry an extension-recorded stage name. */
+ * flag, never its detail, because a detail can also carry an extension-recorded stage's label. */
 const USAGE_LIMIT_NOTE = /usage limit|quota|한도/i;
 
 function usageLimitNote(
@@ -223,8 +223,7 @@ export function buildReviewerLanes(
     }
     const progress=job.providerProgress?.[provider];
     if(progress) {
-      // The flag comes from the stage itself: an unlabelled stage's name reaches the detail as it was
-      // recorded, and a word in it is not the provider reporting a limit.
+      // The flag comes from the stage itself, never from the detail it is shown as.
       return {provider,state:stageIs(progress.stage,"generating")?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false,
         usageLimited:stageIs(progress.stage,"quota")};
     }

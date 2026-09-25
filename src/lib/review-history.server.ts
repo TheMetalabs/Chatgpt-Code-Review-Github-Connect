@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, rmSync, openSync, closeSync, fsyncSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type { Job, PostedReview, ReviewProvider, WebhookLog } from "./types.ts";
-import { sanitizeProgressEvents } from "./review-progress.ts";
+import { sanitizeProgressEvents } from "./review-progress.server.ts";
 type Summary = {
     id: string;
     owner: string;

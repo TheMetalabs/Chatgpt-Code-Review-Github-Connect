@@ -24,17 +24,22 @@ test('history: telemetry validates stage, bounds metadata and deduplicates by ru
  h.recordProgress('A','chatgpt','run-A',[e,{...e,stage:'secret prompt'}]);h.recordProgress('A','chatgpt','run-A',[e]);
  const r=h.getJob('A');assert.equal(r.steps.filter(x=>x.stage==='send_unconfirmed').length,1);assert.equal(JSON.stringify(r).includes('never-log'),false);assert.equal(JSON.stringify(r).includes('secret prompt'),false);
 });
-test('history: a well-formed stage without a label survives a restart under the fallback label; a malformed one never lands',async t=>{
+test('history: a well-formed stage without a label survives a restart as a hash of its name; a malformed one never lands',async t=>{
  // The extension can record a stage before the server labels it (a new stage, or a recorder call the label
- // guard cannot see). The step stays in history, shown and flagged as unlabelled rather than lost.
+ // guard cannot see). The step stays in history, shown and flagged as unlabelled rather than lost. A stage
+ // name passes a lexical check only, so it can spell a secret: history keeps a sentinel, never the name.
  const {h,Store,dir}=await store(t);h.recordJob(job('A'));
  const {stepLabel,unlabelledStep,PROGRESS_LABELS}=await import('../../src/lib/review-progress.ts');
  const e={source:'worker',stage:'tab_woken',sequence:1,at:123};
- h.recordProgress('A','chatgpt','run-A',[e,{...e,sequence:2,stage:'generating'},{...e,sequence:3,stage:'dom_drift:follow_up'},{...e,sequence:4,stage:'Tab_Woken'}]);
+ h.recordProgress('A','chatgpt','run-A',[e,{...e,sequence:2,stage:'generating'},{...e,sequence:3,stage:'dom_drift:follow_up'},{...e,sequence:4,stage:'Tab_Woken'},{...e,sequence:5,stage:'secret_token_abc123'}]);
  const steps=new Store(dir).getJob('A').steps.filter(x=>x.source==='worker');
- assert.deepEqual(steps.map(x=>x.stage),['tab_woken','generating']);
- assert.deepEqual(steps.map(stepLabel),['Unlabelled step · tab_woken',PROGRESS_LABELS.generating]);
- assert.deepEqual(steps.map(unlabelledStep),[true,false]);
+ assert.deepEqual(steps.map(x=>x.stage),['unlabelled:6fac6376','generating','unlabelled:9699b893']);
+ assert.deepEqual(steps.map(stepLabel),['Unlabelled step · #6fac6376',PROGRESS_LABELS.generating,'Unlabelled step · #9699b893']);
+ assert.deepEqual(steps.map(unlabelledStep),[true,false,true]);
+ assert.equal(JSON.stringify(new Store(dir).getJob('A',true)).includes('secret_token'),false,'nor in the private detail');
+ const files=readdirSync(dir,{recursive:true}).filter(path=>path.endsWith('.json'));
+ assert.ok(files.length);
+ assert.deepEqual(files.filter(path=>/secret_token|tab_woken/.test(readFileSync(join(dir,path),'utf8'))),[],'no stored file keeps the name');
  assert.equal(stepLabel({source:'server',stage:'job.awaiting_chat'}),'job.awaiting_chat','a server step is shown by its own name');
  assert.equal(unlabelledStep({source:'server',stage:'job.awaiting_chat'}),false);
 });

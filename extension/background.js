@@ -636,6 +636,50 @@ function isBusyResult(result) {
   return result.retry === true || /already running|busy/i.test(String(result.error || ""));
 }
 
+// Diagnostic build (1.1.27, #93 validation): why a dispatched run's page stops matching its job.
+// Stored locally only (chrome.storage.local "bindingProbes", last 40), read from the profile on
+// disk. No prompt, answer, title or full URL: host plus a path shape, and match flags. Off with
+// chrome.storage.local {bindingProbe:false}.
+const BINDING_PROBE_KEY = "bindingProbes";
+const BINDING_PROBE_EVERY_MS = 60_000;
+function urlShape(url) {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    const path = u.pathname === "/" ? "/" : u.pathname.startsWith("/c/") ? "/c/*" : `/${u.pathname.split("/")[1] || ""}/*`;
+    return `${u.host}${path}${u.searchParams.has("temporary-chat") ? "?temporary-chat" : ""}`;
+  } catch { return "unparsable"; }
+}
+function replyShape(result, job, state) {
+  if (!result || typeof result !== "object") return {type: typeof result};
+  return {ok: result.ok, code: typeof result.code === "string" ? result.code.slice(0, 40) : undefined,
+    hasJob: Boolean(result.jobId), jobMatch: result.jobId === job.jobId, runMatch: result.runId === state.runId,
+    observing: result.observing === true};
+}
+async function recordBindingProbe(job, provider, result) {
+  try {
+    const state = job.states[provider];
+    if (Date.now() - (state.probedAt || 0) < BINDING_PROBE_EVERY_MS) return;
+    const stored = await chrome.storage.local.get(["bindingProbe", BINDING_PROBE_KEY]);
+    if (stored.bindingProbe === false) return;
+    state.probedAt = Date.now();
+    let page, tab;
+    try {
+      const s = await askPage(state.tabId, {type: "ashlar-tab-status"}, contentFiles(provider));
+      page = {hasJob: Boolean(s?.jobId), jobMatch: s?.jobId === job.jobId, hasRun: Boolean(s?.runId),
+        runMatch: s?.runId === state.runId, released: Boolean(s?.released), protocol: s?.ownershipProtocol, url: urlShape(s?.url)};
+    } catch (e) { page = {error: String(e?.message || e).slice(0, 80)}; }
+    try {
+      const t = await chrome.tabs.get(state.tabId);
+      tab = {status: t.status, url: urlShape(t.url), pending: urlShape(t.pendingUrl), discarded: Boolean(t.discarded), active: Boolean(t.active)};
+    } catch (e) { tab = {error: String(e?.message || e).slice(0, 80)}; }
+    const record = {at: Date.now(), job: job.jobId, provider, kind: job.kind || "review", tabId: state.tabId,
+      started: Boolean(state.started), dispatch: state.dispatchReply, reply: replyShape(result, job, state), page, tab,
+      steps: (state.workerEvents || []).slice(-6).map(e => e.stage)};
+    await chrome.storage.local.set({[BINDING_PROBE_KEY]: [...(stored[BINDING_PROBE_KEY] || []), record].slice(-40)});
+  } catch { /* diagnostics never affect the run */ }
+}
+
 function workerStep(job, provider, stage) {
   const state=job.states[provider];
   if(!state.runId || state.workerEvents?.at(-1)?.stage===stage)return;
@@ -2038,6 +2082,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
         dispatched = true;
         state.started = true;
         workerStep(job,provider,"run_dispatched");
+        state.dispatchReply = replyShape(result, job, state);
         await saveJobs(jobs);
         await chrome.storage.session.set({[dispatchKey(job.jobId, provider)]:
           {jobId: job.jobId, provider, runId: state.runId, tabId: state.tabId, at: Date.now()}});
@@ -2073,6 +2118,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     if (rebound) result = rebound;
   }
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
+    await recordBindingProbe(job, provider, result);
     const original = await findOriginalTab(job, provider);
     if (original && original.id !== state.tabId) { state.tabId = original.id; state.started = true; }
     return waitForBinding(job, provider, jobs, "original job binding unavailable; waiting for reconnection");

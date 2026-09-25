@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildFixPrompt, runFixRound } from "./fix-agent.ts";
+import { MIN_FIX_MAX_PROMPT_CHARS } from "./bridge-fix.server.ts";
+import { FIX_ATTACHMENT_MAX_BYTES } from "./fix-attachment.ts";
 import type { GitDataApi } from "./fix-commit.ts";
 
 function fakeApi(): { api: GitDataApi; committed: boolean } {
@@ -188,5 +190,27 @@ describe("buildFixPrompt dispositions contract", () => {
     const p = buildFixPrompt({ findings: "[F1] [P1] a.ts:1 — x", files: [{ path: "a.ts", content: "x" }] });
     assert.match(p, /For EVERY finding ID below \(F1, F2, …\) add one "dispositions" entry/);
     assert.match(p, /"dispositions": \[ \{ "finding": "F1", "action": "fixed\|pushback\|decline\|defer"/);
+  });
+});
+
+describe("buildFixPrompt fix discipline", () => {
+  const p = buildFixPrompt({ findings: "[F1] [P1] a.ts:1 — x", files: [{ path: "a.ts", content: "x" }] });
+  const instructions = p.split("--- Current file contents")[0];
+
+  it("carries the scope, reuse, bounds, tests and evidence rules", () => {
+    assert.match(instructions, /6\. Scope: change only what the flagged defect classes need\. No renames, reformatting,\n\s+refactors or comment edits outside the fix/);
+    assert.match(instructions, /7\. Reuse first: prefer the existing proven helpers\/guards[\s\S]*ONE shared\n\s+helper \(in one in-scope file\) only when the same defect class appears in 2\+ places/);
+    assert.match(instructions, /8\. Bounds: for every guard or clamp you add, the note states what it bounds and what happens\n\s+when the condition never trips/);
+    assert.match(instructions, /9\. Tests: if the code's test file is in scope, add a regression test there; otherwise the\n\s+note says "test needed: <test file or location>"/);
+    assert.match(instructions, /10\. A decline or defer MUST cite evidence in its note: an issue number \(#123\), a file:line,\n\s+or a quoted code reference/);
+  });
+
+  it("keeps the output schema unchanged (no new JSON fields)", () => {
+    assert.ok(instructions.includes('{ "summary": "<what you changed and why>", "files": [ { "path": "<one of the paths above>", "content": "<full new file>" } ], "dispositions": [ { "finding": "F1", "action": "fixed|pushback|decline|defer", "note": "<one sentence>" } ] }'));
+  });
+
+  it("the fixed instructions stay far under the prompt-size floor and the attachment cap", () => {
+    assert.ok(instructions.length < MIN_FIX_MAX_PROMPT_CHARS / 2, `instructions are ${instructions.length} chars`);
+    assert.ok(Buffer.byteLength(instructions, "utf8") < FIX_ATTACHMENT_MAX_BYTES / 64);
   });
 });

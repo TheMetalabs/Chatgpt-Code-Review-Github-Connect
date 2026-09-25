@@ -60,6 +60,14 @@ export function parseDispositions(raw: unknown): FixDisposition[] {
   return out;
 }
 
+// Load-bearing evidence for a decline/defer (fix recipe 5): an issue number, a file:line, or a
+// quoted code reference (backticks or quotes, 3+ chars). A bare "later"/"out of scope" is not.
+const EVIDENCE_RE = /#\d+|[\w./-]+\.\w+:\d+|`[^`\n]{3,}`|"[^"\n]{3,}"|\u201c[^\u201d\n]{3,}\u201d/;
+
+export function citesEvidence(note: string): boolean {
+  return EVIDENCE_RE.test(note);
+}
+
 export type FixParse = { ok: true; fix: FixResponse } | { ok: false; error: string };
 
 function isFixObject(value: unknown): boolean {
@@ -150,6 +158,10 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
     const given = new Set(dispositions.filter((d) => d.note.trim().length > 0).map((d) => d.finding));
     const missing = Array.from({ length: opts.findingCount ?? 0 }, (_, i) => `F${i + 1}`).filter((id) => !given.has(id));
     if (missing.length) return { ok: false, error: `no-change response has no valid disposition with a note for ${missing.join(", ")}` };
+    // A decline/defer that cites nothing is re-flagged next round; on a no-change round it is the
+    // whole answer, so it is malformed (retried) rather than a terminal fix-declined handoff.
+    const bare = dispositions.filter((d) => (d.action === "decline" || d.action === "defer") && !citesEvidence(d.note)).map((d) => d.finding);
+    if (bare.length) return { ok: false, error: `decline/defer without evidence (issue #, file:line or quote) for ${bare.join(", ")}` };
     return { ok: true, fix: { summary: summaryRaw, files: [], dispositions } };
   }
   const seen = new Set<string>();

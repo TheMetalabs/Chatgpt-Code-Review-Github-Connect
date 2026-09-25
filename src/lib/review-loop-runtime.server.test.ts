@@ -1844,7 +1844,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
       start: "apply",
       rounds: [2],
       threads,
-      reply: withDispositions("[]", '[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"decline","note":"m"}]'),
+      reply: withDispositions("[]", '[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"decline","note":"m, see #88"}]'),
     });
     const handoffsAtReply: number[] = [];
     const reply = f.deps.gh.replyToReviewComment;
@@ -1869,7 +1869,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
   });
 
   it("a handoff that did not land marks no thread addressed: no replies, no report", async () => {
-    const noChange = fakeDeps({ start: "apply", rounds: [2], threads, failHandoff: true, reply: withDispositions("[]", '[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"decline","note":"m"}]') });
+    const noChange = fakeDeps({ start: "apply", rounds: [2], threads, failHandoff: true, reply: withDispositions("[]", '[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"decline","note":"m, see #88"}]') });
     const r = await runWith(noChange, "apply");
     assert.equal(r.ran, false);assert.match(r.ran ? "" : r.reason, /ESCALATE fix-declined failed to post/);
     assert.equal(noChange.replies.length, 0);

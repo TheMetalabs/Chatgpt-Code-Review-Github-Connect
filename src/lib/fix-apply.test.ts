@@ -53,6 +53,22 @@ describe("parseFixResponse", () => {
     assert.equal(parseFixResponse('{"summary":"s","files":[]}').ok, true);
   });
 
+  it("a no-change decline/defer must cite evidence: issue #, file:line or a quote (fix recipe 5)", () => {
+    const parse = (note: string, action = "decline") => parseFixResponse(`{"summary":"nothing to change","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"n"},{"finding":"F2","action":"${action}","note":${JSON.stringify(note)}}]}`, { findingCount: 2 });
+    for (const bare of ["out of scope", "will do later", "by design", "see ##", "``", "a.ts:"]) {
+      for (const action of ["decline", "defer"]) {
+        const r = parse(bare, action);
+        assert.ok(!r.ok && /decline\/defer without evidence .* for F2$/.test(r.error), `${action} ${JSON.stringify(bare)}`);
+      }
+    }
+    for (const cited of ["tracked in #88", "guard at src/a.ts:12", "contract mandates `FIXED_LITERAL`", 'spec says "fixed literal"', "per \u201cfixed literal\u201d"]) {
+      assert.equal(parse(cited, "defer").ok, true, cited);
+      assert.equal(parse(cited, "decline").ok, true, cited);
+    }
+    // pushback is rule 1's rebuttal, not a decline/defer: a plain reason still stands
+    assert.equal(parseFixResponse('{"summary":"s","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"false positive"}]}', { findingCount: 1 }).ok, true);
+  });
+
   it("rejects a no-change round that marks a finding fixed (nothing changed, so nothing was fixed)", () => {
     const fixedNoFiles = '{"summary":"done","files":[],"dispositions":[{"finding":"F1","action":"fixed","note":"done"},{"finding":"F2","action":"pushback","note":"n"}]}';
     assert.match(err(fixedNoFiles), /no files changed, yet F1 marked fixed/);

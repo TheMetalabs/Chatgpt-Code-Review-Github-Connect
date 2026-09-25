@@ -101,6 +101,9 @@ GitHub가 영속하는 이벤트(App의 기록·마커, 사람의 stop 코멘트
 | **ESCALATE** | `<!-- ashlar-loop-escalate reason=<code> round=<N> -->` | `Ashlar review-loop halted — human review required` | substring/마커 |
 | **STOPPED** | `<!-- ashlar-loop-stopped -->` | `Ashlar review-loop stopped by operator` | 마커 |
 
+`total=0` 이어도 `unverified=1` 이 붙은 마커는 CONVERGED가 아니다(verify-clean 로컬 검증 미완료) — [local-verify-clean.md §1](local-verify-clean.md).
+런타임도 지적 개수가 아니라 같은 게시 결과(`postedOutcome`)로 판정한다: 구조화 지적이 0건이어도 clean pass가 아닌 리뷰(raw / raw-unverified / unverified-clean / incomplete)는 활성 세션에서 고정 ESCALATE `loop-error` 하나로 넘기며, 조용히 멈추지 않는다.
+
 연속(비종착) 제어 신호 — 루프가 다음 라운드로 넘어갈 때 드라이버가 방출:
 
 | 신호 | 고정 마커(머신) | 고정 문구(사람) | 감지 |

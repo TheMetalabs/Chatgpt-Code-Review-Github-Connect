@@ -358,6 +358,33 @@ test("no reviewer JSON across groups is an explicit failure, not an empty pass",
   assert.match(out.error, /no review JSON/i);
 });
 
+test("a group's completed non-JSON reply is returned as evidence, never dropped", async () => {
+  const { request } = mock([assistant("P1 src/pay.ts:2 GROUP-PROSE: a duplicate request writes twice")]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, false);
+  assert.match(out.unparsedText ?? "", /^Review group \(src\/pay\.ts\):\nP1 src\/pay\.ts:2 GROUP-PROSE/);
+});
+
+test("a partial run returns the failed group's reply alongside the merged JSON", async () => {
+  process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP = "1";
+  try {
+    const { request } = mock([assistant("P1 src/a.ts:2 GROUP-PROSE"), assistant(REVIEW_JSON)]);
+    const out = await runLocalReviewLoop(sampleWith(["src/a.ts", "src/pay.ts"]), settings, { request });
+    assert.equal(out.ok, true);
+    assert.match(out.unparsedText ?? "", /GROUP-PROSE/);
+    assert.doesNotMatch(out.unparsedText ?? "", /"findings"/, "a reviewed group's JSON is not evidence");
+  } finally {
+    delete process.env.ASHLAR_LOCAL_REVIEW_MAX_FILES_PER_GROUP;
+  }
+});
+
+test("a tool-call turn's content is provisional: no evidence is kept from it", async () => {
+  const { request } = mock([assistant("thinking about src/pay.ts", [toolCall("task_done", { state: "FAILED" })])]);
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request });
+  assert.equal(out.ok, false);
+  assert.equal(out.unparsedText, undefined);
+});
+
 test("D1: findings are deduped and sorted by severity before the downstream 8-cap", async () => {
   // 8 P2 findings then 1 P1 — the P1 must be in the top 8 after dedup+sort. Each group reports only
   // its own files (group1=[a,b], group2=[c,d]) so both pass per-group gate validation.

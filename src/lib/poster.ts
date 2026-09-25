@@ -242,6 +242,12 @@ export type LiveGateResult = {
   assumptions: string[];
   coverage?: ModelCoverage[];
   dropped: string[];
+  /** How many findings were dropped for their shape (a required field missing, no valid line):
+   * the reviewer reported them, so a result that lost one is not the reviewer's full verdict. */
+  malformed?: number;
+  /** How many reported findings lie past the gate's row cap (GATED_FINDINGS_CAP) and were never
+   * inspected: a result that set one aside unread is not the reviewer's full verdict either. */
+  overflow?: number;
   // Verbatim reply preserved when it was not parseable review JSON and local repair was off.
   // Surfaced in the review body so the fixing agent can interpret it (never dropped).
   rawReview?: string;
@@ -261,6 +267,9 @@ function parseCoverage(raw: unknown): ModelCoverage[] {
   return out;
 }
 
+/** The most reported findings one reviewer leg's gate inspects; any past it are counted as overflow. */
+export const GATED_FINDINGS_CAP = 8;
+
 export function gateLiveSubmission(
   submitted: Record<string, unknown> | null,
   snapshot: SamplePr,
@@ -270,10 +279,13 @@ export function gateLiveSubmission(
   const raw = Array.isArray(submitted.findings) ? submitted.findings : [];
   const parsed: Finding[] = [];
   const dropped: string[] = [];
-  raw.slice(0, 8).forEach((row, i) => {
+  let malformed = 0;
+  const overflow = Math.max(0, raw.length - GATED_FINDINGS_CAP);
+  raw.slice(0, GATED_FINDINGS_CAP).forEach((row, i) => {
     const f = asFinding(row, i);
     if (!f) {
       dropped.push(`finding ${i}: missing required fields`);
+      malformed += 1;
       return;
     }
     parsed.push(f);
@@ -313,6 +325,8 @@ export function gateLiveSubmission(
       : [],
     coverage: parseCoverage(submitted.coverage),
     dropped,
+    malformed,
+    overflow,
     rawReview: rawReview || undefined,
   };
 }

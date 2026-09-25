@@ -3,12 +3,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { stripTypeScriptTypes } from 'node:module';
-import { extractChatJson } from '../../src/lib/extract-chat-json.ts';
+import { extractChatJsonParts } from '../../src/lib/extract-chat-json.ts';
 import { source, raw } from './helpers.mjs';
 const settings = { localLlmBaseUrl: 'http://local/v1/', localLlmApiKey: ' secret ', localLlmModel: ' model ' };
 function local(responses) {
   const calls = [], clients = [], probes = [];
-  const context = vm.createContext({ console, extractChatJson, bridgePromptText,
+  const context = vm.createContext({ console, extractChatJsonParts, bridgePromptText,
     AbortSignal: {timeout: ms => ({timeout: ms})},
     requestLocalJson: async (...args) => {probes.push(args);return {};},
     requestLocalChat: async (...args) => { calls.push(args); const next = responses.shift(); if (next instanceof Error) throw next; return next; },
@@ -43,6 +43,32 @@ test('only completed non-JSON content gets one semantic retry', async () => {
   const retryMsgs = c.calls[1][2].messages;
   assert.equal(retryMsgs.every((m) => m.content !== 'prose'), true, 'prior non-JSON reply is not echoed into the retry');
   assert.match(retryMsgs[retryMsgs.length - 1].content, /ONLY the JSON object/);
+});
+test('a completed reply with text around its JSON keeps that reply as residual evidence', async () => {
+  const prose = 'P1 a.ts:1 PROSE-FINDING: a duplicate request writes twice';
+  const mixed = `${prose}\n${raw}`;
+  const out = await local([mixed]).context.runLocalLlm('review', settings);
+  assert.equal(out.raw, raw);
+  assert.equal(out.residualReplies, mixed, 'the whole reply, verbatim');
+  assert.equal(out.unparsedText, undefined);
+  // only the object, fenced or not: nothing discarded
+  for (const only of [raw, '```json\n' + raw + '\n```', '````json\n' + raw + '\n````', '~~~\n' + raw + '\n~~~', '```json\n' + raw + '\n', raw + '\n```',
+    '```application/json\n' + raw + '\n```', '``` json title="review.json"\n' + raw + '\n```', '~~~ json `review`\n' + raw + '\n~~~']) {
+    const out = await local([only]).context.runLocalLlm('review', settings);
+    assert.equal(out.residualReplies, undefined, `nothing discarded from ${JSON.stringify(only.slice(0, 8))}`);
+    assert.equal(out.raw, raw);
+  }
+  // prose on the opener's own line is its info string, and a marker indented four spaces is a code
+  // line: neither is the object's fence, so the whole reply is kept
+  for (const reply of [`~~~ ${prose} ${raw}\n~~~`, `\`\`\`${prose} ${raw}\n\`\`\``, `~~~ ${prose} ${raw}`, `    ~~~ ${prose}\n${raw}\n~~~`]) {
+    const out = await local([reply]).context.runLocalLlm('review', settings);
+    assert.equal(out.residualReplies, reply, `kept: ${JSON.stringify(reply.slice(0, 12))}`);
+    assert.equal(out.raw, raw);
+  }
+  // the JSON correction's own reply is checked the same way
+  const corrected = await local(['prose', mixed]).context.runLocalLlm('review', settings);
+  assert.equal(corrected.residualReplies, mixed);
+  assert.equal(corrected.unparsedText, 'prose');
 });
 test('network errors do not replay model requests; health checks also have no automatic deadline', async () => {
   const c = local([new Error('connection closed')]);

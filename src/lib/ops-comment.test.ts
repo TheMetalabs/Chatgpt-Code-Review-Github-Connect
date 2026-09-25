@@ -16,6 +16,15 @@ describe("buildOpsComment", () => {
     assert.doesNotMatch(body, /127\.0\.0\.1|jwhy\.net|Qwen|sk-/);
   });
 
+  it("a verify-clean job released as the fallback reads local runs as the fallback, never that it verifies a clean result", () => {
+    const header = (localFallback?: boolean) =>
+      buildOpsComment({ phase: "posted", providers: ["chatgpt", "local"], role: "verify-clean", localFallback, notes: [] })
+        .split("\n").find((l) => l.startsWith("Reviewers:"));
+    assert.equal(header(true), "Reviewers: chatgpt (Chrome); local runs as the fallback.");
+    assert.equal(header(false), "Reviewers: chatgpt (Chrome); local verifies a clean result.");
+    assert.equal(header(), "Reviewers: chatgpt (Chrome); local verifies a clean result.");
+  });
+
   it("does not mention Grok when the setting is off", () => {
     const body = buildOpsComment({
       phase: "running",

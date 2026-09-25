@@ -26,6 +26,7 @@ import {
   stuckPattern,
   parseEscalateMarker,
   parseFindingsTotal,
+  isConvergedFindings,
   parseReviewLoopDirective,
   parseStartMarker,
   parseStopRecord,
@@ -487,7 +488,7 @@ export async function readLoopEvents(
     if (!isSelfLogin(c.userLogin, botLogin)) pushStop(events, c);
   }
   for (const r of reviews) {
-    if (isSelfLogin(r.userLogin, botLogin) && r.submittedAt && parseFindingsTotal(r.body) === 0) {
+    if (isSelfLogin(r.userLogin, botLogin) && r.submittedAt && isConvergedFindings(r.body)) {
       events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
     }
   }

@@ -1,6 +1,6 @@
 import { bridgePromptText } from "./chat-prompt.ts";
 import type { BotSettings } from "./types.ts";
-import { extractChatJson } from "./extract-chat-json.ts";
+import { extractChatJsonParts } from "./extract-chat-json.ts";
 import { requestLocalJson, requestLocalChat, type LocalChatMessage, type LocalRequestOptions } from "./local-chat-request.server.ts";
 
 function localConfig(settings: BotSettings) {
@@ -75,12 +75,30 @@ export async function pingLocalLlm(
   }
 }
 
+/** One local leg's result. `unparsedText` holds every completed model reply that was not review JSON
+ * and is not `originalText` (for example the first reply before the one JSON correction): it may carry
+ * the real finding, so the caller keeps it as evidence (failedLocalSalvage, incompleteVerdict), never
+ * drops it.
+ * `residualReplies` holds, verbatim, every completed reply whose review JSON was accepted although
+ * the model also wrote text outside that object (extractChatJsonParts): the accepted JSON does not
+ * carry that text, so the leg does not count the JSON as a verdict (incompleteVerdict). */
+export type LocalLegResult =
+  | { ok: true; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string }
+  | { ok: false; error: string; originalText?: string; unparsedText?: string };
+
+/** A completed reply canonicalized to its review JSON, keeping the reply when that discarded text. */
+function acceptedReply(reply: string): { raw: string; residualReplies?: string } | null {
+  const parts = extractChatJsonParts(reply);
+  if (!parts) return null;
+  return parts.residual ? { raw: parts.json, residualReplies: reply } : { raw: parts.json };
+}
+
 export async function runLocalLlm(
   prompt: string,
   settings: BotSettings,
   signal?: AbortSignal,
   opts?: LocalRequestOptions,
-): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
+): Promise<LocalLegResult> {
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
   prompt = bridgePromptText(prompt); // Native API input remains readable source text, not escaped transport JSON.
@@ -91,14 +109,18 @@ export async function runLocalLlm(
     signal,
     opts,
   );
+  // The first completed reply, kept outside the try: a correction that then fails (HTTP 500,
+  // transport error, liveness or deadline abort) must not lose it.
+  let first: string | undefined;
   try {
     const raw = await call([
       { role: "system", content: "You are Ashlar. Return ONLY a JSON object. No markdown fences." },
       { role: "user", content: prompt },
     ]);
     if (!raw.trim()) return { ok: false, error: "local LLM returned empty" };
-    const firstJson = extractChatJson(raw);
-    if (firstJson) return { ok: true, raw: firstJson, originalText: raw };
+    const firstJson = acceptedReply(raw);
+    if (firstJson) return { ok: true, ...firstJson, originalText: raw };
+    first = raw;
 
     // Exactly one semantic retry, and only after an actual completed non-JSON reply. Do NOT echo the
     // prior reply back: adding it on top of the full prompt and the same max_tokens budget could
@@ -115,11 +137,13 @@ export async function runLocalLlm(
         content: "Your previous reply was not extractable review JSON. Reply again with ONLY the JSON object (findings/merge_recommendation/keep). No markdown.",
       },
     ]);
-    const corrected = extractChatJson(raw2);
-    return corrected ? {ok: true, raw: corrected, originalText: raw2}
-      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2};
+    const corrected = acceptedReply(raw2);
+    // The first reply is kept on both paths: it may carry the real finding the correction (which does
+    // not see it) lost, so a held leg posts it as evidence and never counts the correction as a verdict.
+    return corrected ? {ok: true, ...corrected, originalText: raw2, unparsedText: raw}
+      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, unparsedText: raw};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, error: msg.slice(0, 240) };
+    return { ok: false, error: msg.slice(0, 240), ...(first ? { unparsedText: first } : {}) };
   }
 }

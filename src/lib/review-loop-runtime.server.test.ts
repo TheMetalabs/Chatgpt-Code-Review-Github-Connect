@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
+import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type ReviewProvider, type SamplePr } from "./types.ts";
 import { continueComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
 import { botSettingsToEnv, sanitizeBotSettings } from "./settings.server.ts";
@@ -369,6 +369,50 @@ describe("runPostReviewLoop gates", () => {
     const r = await run(f, "suggest", ENV_ON, job({ thread: { kind: "mention", commentId: 9, userText: "@ashlar-bot review" } }));
     assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested");
   });
+});
+
+describe("CONVERGED is the posted outcome, not \"no findings\" (docs/local-verify-clean.md §1)", () => {
+  const VC = { reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", localVerifyStartedAt: 2, localVerifyChat: ["chatgpt"] } as Partial<Job>;
+  const notClean: Array<[string, Partial<Job>, RegExp]> = [
+    ["raw (a chat reply posted verbatim)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW", rawCauses: { chatgpt: "unparseable" } }, /posted verbatim: the reply was not valid review JSON\)/],
+    ["raw (a parsed chat reply with rows past the gate's cap)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW", rawCauses: { chatgpt: "unread-rows" } }, /posted verbatim: the reply parsed, but its findings past the gate's row cap were not inspected\)/],
+    ["raw (no cause recorded)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW" }, /posted verbatim: a reply could not be used as structured review JSON\)/],
+    ["raw-unverified", { ...VC, localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW", rawCauses: { local: "unparseable" } }, /local verification's reply could not be used/],
+    // a chat reply that landed during a verification round that returned nothing: never local's reply
+    ["raw (a late chat reply in a failed verification round)", { ...VC, reviewProviders: ["chatgpt", "grok", "local"], localVerified: false, rawReview: "GROK-RAW", rawCauses: { grok: "not-a-verdict" } }, /posted verbatim: the reply could not be used as a complete structured review\)/],
+    ["unverified-clean", { ...VC, localVerified: false }, /local verification did not complete/],
+    ["incomplete", { reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: ["Skipped grok (quota or unavailable)"] }, /a reviewer did not run/],
+    ["incomplete (a reviewer returned no complete verdict)", { reviewProviders: ["chatgpt", "local"], localReviewRole: "race", incompleteProviders: ["chatgpt"] }, /a reviewer returned no complete review/],
+  ];
+  for (const [name, patch, detail] of notClean) {
+    it(`${name}: an active session gets one fixed handoff, never a silent stop`, async () => {
+      const f = fakeDeps({ rounds: [1] });
+      const r = await run(f, "suggest", ENV_ON, job({ findings: [], ...patch }));
+      assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+      assert.equal(escalations(f.posted).length, 1);
+      assert.match(escalations(f.posted)[0], detail);
+      // Only a recorded pre-gate salvage is handed off as one: never unread rows or an unknown cause.
+      if (patch.rawReview && patch.rawCauses?.chatgpt !== "unparseable") assert.doesNotMatch(escalations(f.posted)[0], /not parseable|not valid review JSON|local repair/i);
+      assert.equal(f.prompts.length, 0, "nothing structured reaches the fix agent");
+      const none = fakeDeps({ start: null, rounds: [1] });
+      assert.deepEqual(await run(none, "suggest", ENV_ON, job({ findings: [], ...patch })), { ran: false, reason: "no active loop session" });
+    });
+  }
+
+  // A reviewer's own assumption that says "skipped" is not a reviewer that did not run.
+  const ASSUMES_SKIPPED = { assumptions: ["Generated fixtures were skipped because they are irrelevant."], skippedProviders: [] as ReviewProvider[] };
+  for (const [name, patch] of [
+    ["clean", {}],
+    ["verified-clean", { ...VC, localVerified: true }],
+    ["clean, a reviewer assumption says skipped", ASSUMES_SKIPPED],
+    ["verified-clean, a reviewer assumption says skipped", { ...VC, localVerified: true, ...ASSUMES_SKIPPED }],
+  ] as const) {
+    it(`${name}: silent convergence`, async () => {
+      const f = fakeDeps({ rounds: [0] });
+      assert.deepEqual(await run(f, "suggest", ENV_ON, job({ findings: [], ...patch })), { ran: false, reason: "no findings (converged)" });
+      assert.equal(f.posted.length, 0);
+    });
+  }
 });
 
 describe("session: durable, restart-proof, never reset by a re-issued start", () => {

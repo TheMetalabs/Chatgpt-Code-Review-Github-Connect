@@ -1,6 +1,6 @@
 import {PROGRESS_LABELS, type ProviderProgress} from "./review-progress.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
-import { skippedProvider } from "./local-fallback.ts";
+import { fallbackWaivesChat, skippedProvider } from "./local-fallback.ts";
 import type { Job, JobStatus, ReviewerLane, ReviewerLaneState, ReviewProvider } from "./types.ts";
 import { BRIDGE_CLAIM_MS, PROVIDER_LABEL, isChatProvider } from "./types.ts";
 
@@ -116,6 +116,7 @@ export function buildReviewerLanes(
     | "githubError"
     | "providerErrors"
     | "providerProgress"
+    | "localFallbackAt"
   >,
   opts?: { localInFlight?: boolean; now?: number; enabled?: readonly ReviewProvider[]; staleMs?: number },
 ): ReviewerLane[] {
@@ -161,6 +162,12 @@ export function buildReviewerLanes(
         detail: skipNote ?? "skipped",
         answered: false,
       };
+    }
+
+    // A fallback release waives chat while local can still deliver: the job does not wait on this
+    // lane whatever the bridge does, so it must not read as waiting for the bridge.
+    if (isChatProvider(provider) && job.status === "awaiting_chat" && fallbackWaivesChat(job)) {
+      return { provider, state: "skipped" as const, label, detail: "not awaited · local runs as the fallback", answered: false };
     }
 
     if (job.status === "skipped" || job.status === "cancelled" || job.status === "dlq") {

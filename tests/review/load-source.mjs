@@ -23,7 +23,7 @@ export function loadTs(path, imports = {}) {
 }
 export const types = loadTs('src/lib/types.ts');
 export const parser = loadTs('src/lib/extract-chat-json.ts');
-export const fallback = loadTs('src/lib/local-fallback.ts', types);
+export const fallback = loadTs('src/lib/local-fallback.ts', {...types, ...parser});
 export const json = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['fixture checked']});
 export function job(patch={}) {
   return {id:'job1',status:'awaiting_chat',trigger:'issue_comment.mention',chatPrompt:'Review fixture',reviewProviders:['chatgpt'],
@@ -36,6 +36,7 @@ export function bridgeHarness(jobs, extra = {}) {
   const bridge=loadTs('src/lib/bridge.server.ts', {
     ...crypto,...types,...parser, sanitizeWorkerStatus, JsonRepairService, localJsonRepairAvailable, cancelLocalJsonRepairs, inspectReviewFormat, sanitizeProgressEvents, reviewHistory:()=>history,
     loadDotenvFile(){},writeEnvPatch(){},resolveBridgeToken:()=>({token:'fixture',persist:false}),BRIDGE_TOKEN_ENV:'FIXTURE',
+    fallbackWaivesChat:fallback.fallbackWaivesChat,
     llmWorkAllowed:j=>['issue_comment.mention','pull_request_review_comment.followup'].includes(j.trigger),
     getHarbor:()=>state,
     patchHarborJob(id, fn){state.jobs=state.jobs.map(j=>j.id===id?fn(j):j);snapshots.push(structuredClone(state.jobs.find(j=>j.id===id)));},

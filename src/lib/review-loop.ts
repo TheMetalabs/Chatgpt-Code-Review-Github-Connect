@@ -32,6 +32,15 @@ export function parseFindingsTotal(body: string | null | undefined): number | nu
   return t ? Number(t[1]) : null;
 }
 
+/** CONVERGED (machine side): the trailing marker says total=0 AND it is not flagged `unverified=1`.
+ * A verify-clean job whose local verification round did not complete posts chat's clean result
+ * with `unverified=1`: a transient local failure must never end the loop as converged. */
+export function isConvergedFindings(body: string | null | undefined): boolean {
+  if (parseFindingsTotal(body) !== 0) return false;
+  const m = FINDINGS_TRAILER_RE.exec(body || "");
+  return !(m && /(?:^|\s)unverified=1(?=\s|$)/.test(m[1]));
+}
+
 /** Epoch ms of an ISO-8601 timestamp; NaN when absent or unparseable. Session boundaries are
  * compared as instants, never as strings: GitHub timestamps are second-precision ("…00Z") while
  * Date#toISOString carries milliseconds ("…00.500Z"), and lexically "…00Z" sorts after "…00.500Z". */
@@ -58,7 +67,7 @@ export interface CommentSource {
 }
 
 export function isZeroFindings(body: string | null | undefined, source: CommentSource): boolean {
-  return source.authoredByBot && parseFindingsTotal(body) === 0;
+  return source.authoredByBot && isConvergedFindings(body);
 }
 
 // ── ESCALATE reason → directive (§8) ─────────────────────────────────────────

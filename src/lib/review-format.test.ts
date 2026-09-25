@@ -4,9 +4,45 @@ import { FINDING_412 } from "./samples.ts";
 import { CLEAN_REVIEW_BODY, REVIEW_RAW_END, REVIEW_RAW_START, inlineFindingComment, redactSalvagedReviewBody, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
 
 describe("review-format", () => {
+  it("a verify-clean job released as the fallback says local ran as the fallback, never that it verifies chat", () => {
+    const findingJob = (patch: Record<string, unknown>) =>
+      reviewSummaryBody(
+        { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", assumptions: [], coverage: [], ...patch },
+        [{ ...FINDING_412, id: "f1" }],
+        "ashlar-bot",
+      );
+    const fallback = findingJob({ localFallbackAt: 1, skippedProviders: ["chatgpt"] });
+    assert.match(fallback, /\nLocal LLM ran as the fallback\.\n/);
+    assert.doesNotMatch(fallback, /verifies a clean chat result/);
+    // only a job that was not released as the fallback is described by its verify-clean role
+    assert.match(findingJob({}), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat result\.\n/);
+    assert.match(findingJob({ localVerifyStartedAt: 1 }), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat result\.\n/);
+  });
+
+  it("a fallback release names only the chat reviewers that ran, never a skipped one as running in parallel", () => {
+    const line = (patch: Record<string, unknown>) =>
+      reviewSummaryBody(
+        { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok", "local"], localReviewRole: "verify-clean", localFallbackAt: 1, assumptions: [], coverage: [], ...patch },
+        [{ ...FINDING_412, id: "f1" }],
+        "ashlar-bot",
+      ).split("\n").find((l) => l.includes("Local LLM"));
+    // chat unavailable: the fallback is the only reviewer that ran; the skipped note names chat
+    assert.equal(line({ skippedProviders: ["chatgpt", "grok"] }), "Local LLM ran as the fallback.");
+    assert.equal(line({ skippedProviders: ["grok"] }), "chatgpt ran. Local LLM ran as the fallback.");
+    // the fallback failed and chat was awaited again: chat ran, but not in parallel with a verifier
+    assert.equal(line({ skippedProviders: ["local"] }), "chatgpt + grok ran. Local LLM ran as the fallback.");
+    // race keeps its wording, skipped chat included
+    const race = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local"], localReviewRole: "race", skippedProviders: ["chatgpt"], assumptions: [], coverage: [] },
+      [{ ...FINDING_412, id: "f1" }],
+      "ashlar-bot",
+    );
+    assert.match(race, /\nchatgpt ran in parallel\. Local LLM is fallback if Chrome does not return\.\n/);
+  });
+
   it("surfaces a salvaged raw review in the body and is not a clean pass", () => {
     const body = reviewSummaryBody(
-      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "P1 real bug in pay.ts when amount is 0" },
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "P1 real bug in pay.ts when amount is 0", rawCauses: { chatgpt: "unparseable" } },
       [],
       "ashlar-bot",
       [],
@@ -14,7 +50,7 @@ describe("review-format", () => {
     assert.doesNotMatch(body, new RegExp(CLEAN_REVIEW_BODY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(body, /P1 real bug in pay\.ts/);
     assert.match(body, /raw=1/);
-    assert.match(body, /not parseable JSON/i);
+    assert.match(body, /not valid review JSON/i);
   });
 
   it("delimits the salvaged block and redacts it from the public snapshot (keeps it in the posted body)", () => {
@@ -97,13 +133,13 @@ describe("review-format", () => {
 
   it("surfaces skipped-provider warnings in a raw-only salvaged review", () => {
     const body = reviewSummaryBody(
-      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], assumptions: ["Skipped grok: quota or unavailable"], coverage: [], rawReview: "P1 salvaged chatgpt reply" },
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], assumptions: [], skippedProviders: ["grok"], coverage: [], rawReview: "P1 salvaged chatgpt reply" },
       [],
       "ashlar-bot",
       [],
     );
     assert.match(body, /salvaged chatgpt reply/);
-    assert.match(body, /Skipped grok: quota/); // partial-coverage warning not swallowed by the raw-only path
+    assert.match(body, /- Skipped grok \(quota or unavailable\)/); // partial-coverage warning not swallowed by the raw-only path
     assert.match(body, /raw=1/);
   });
 
@@ -143,7 +179,8 @@ describe("review-format", () => {
       {
         headSha: "bd663b721d",
         reviewProviders: ["chatgpt", "grok", "local"],
-        assumptions: ["Skipped grok, local (quota or unavailable)"],
+        assumptions: [],
+        skippedProviders: ["grok", "local"],
       },
       [],
       "ashlar-bot",

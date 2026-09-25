@@ -56,6 +56,18 @@ describe("buildReviewerLanes", () => {
     assert.equal(JSON.stringify(lanes).includes("failure_scenario"), false);
   });
 
+  it("reports a chat lane a fallback release waives as not awaited, never as waiting for the bridge", () => {
+    const waived = buildReviewerLanes(job({ reviewProviders: ["chatgpt", "local"], localFallbackAt: 1 }), { localInFlight: true });
+    assert.equal(waived[0].detail, "not awaited · local runs as the fallback");
+    assert.equal(waived[0].state, "skipped");
+    // Once the fallback ends with nothing, chat is awaited again and its lane says so.
+    const spent = buildReviewerLanes(job({ reviewProviders: ["chatgpt", "local"], localFallbackAt: 1, assumptions: ["Skipped local (HTTP 500)"] }));
+    assert.equal(spent[0].detail, "waiting for Chrome bridge");
+    // A chat result that still landed is reported as answered.
+    const landed = buildReviewerLanes(job({ reviewProviders: ["chatgpt", "local"], localFallbackAt: 1, storedLegs: [{ provider: "chatgpt", raw: json }] }), { localInFlight: true });
+    assert.equal(landed[0].state, "answered");
+  });
+
   it("shows generating only after a page observation, not an undelivered flag", () => {
     const lanes = buildReviewerLanes(
       job({

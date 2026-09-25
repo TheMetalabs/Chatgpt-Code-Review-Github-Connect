@@ -110,6 +110,28 @@ describe("sanitizeBotSettings", () => {
     assert.equal(bad.fixAgent.parallelPrs, 20); // clamped
   });
 
+  it("defaults localReviewRole to race, rejects unknown values, and round-trips ASHLAR_LOCAL_REVIEW_ROLE", () => {
+    assert.equal(DEFAULT_SETTINGS.localReviewRole, "race");
+    assert.equal(sanitizeBotSettings({}).localReviewRole, "race");
+    assert.equal(sanitizeBotSettings({ localReviewRole: "bogus" }).localReviewRole, "race");
+    const verify = sanitizeBotSettings({ localReviewRole: "verify-clean" });
+    assert.equal(verify.localReviewRole, "verify-clean");
+    // Distinct from localReviewMode (single/multiturn/auto), which keeps its own env key.
+    assert.equal(verify.localReviewMode, DEFAULT_SETTINGS.localReviewMode);
+    const env = botSettingsToEnv(verify);
+    assert.equal(env.ASHLAR_LOCAL_REVIEW_ROLE, "verify-clean");
+    assert.equal(botSettingsToEnv(DEFAULT_SETTINGS).ASHLAR_LOCAL_REVIEW_ROLE, "race");
+    const prev = process.env.ASHLAR_LOCAL_REVIEW_ROLE;
+    try {
+      process.env.ASHLAR_LOCAL_REVIEW_ROLE = env.ASHLAR_LOCAL_REVIEW_ROLE;
+      assert.equal(sanitizeBotSettings(overlayEnv({})).localReviewRole, "verify-clean");
+      process.env.ASHLAR_LOCAL_REVIEW_ROLE = "nonsense";
+      assert.equal(sanitizeBotSettings(overlayEnv({ localReviewRole: "verify-clean" })).localReviewRole, "race");
+    } finally {
+      if (prev === undefined) delete process.env.ASHLAR_LOCAL_REVIEW_ROLE; else process.env.ASHLAR_LOCAL_REVIEW_ROLE = prev;
+    }
+  });
+
   it("serializes fixAgent to env keys so it survives the env-only persistence fallback (H6)", () => {
     const s = sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "chat-push", mode: "apply", parallelPrs: 4 } });
     const env = botSettingsToEnv(s);

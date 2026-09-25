@@ -108,9 +108,18 @@ export interface Job {
   findings: Finding[];
   mergeRecommendation?: MergeRec;
   highestRisk?: string;
-  // Verbatim model reply kept when it was not parseable review JSON and local repair was off;
+  // Verbatim model reply (every salvaged leg's) posted as evidence instead of structured findings;
   // surfaced in the review body for the fixing agent (see salvageReviewJson).
   rawReview?: string;
+  /** Why each salvaged leg in rawReview is posted verbatim, stamped by the merge that salvaged it.
+   * The body's raw header and the loop's handoff read the cause from here, never from the outcome. */
+  rawCauses?: Partial<Record<ReviewProvider, RawCause>>;
+  /** The salvaged legs whose reply rawReview holds only in part (cut to fit GitHub's review body
+   * limit). Outcome, header and note describe the block as posted, never the replies before the cut. */
+  rawTruncated?: ReviewProvider[];
+  /** Where each salvaged leg's piece ends in rawReview, in block order (salvagedReview). A body that
+   * has to cut the block further to fit GitHub's limit names exactly the replies its cut reaches. */
+  rawLegs?: RawLeg[];
   investigatedSafe: string[];
   assumptions: string[];
   postedReviewId?: string;
@@ -130,6 +139,29 @@ export interface Job {
   providerProgress?: Partial<Record<ReviewProvider, ProviderProgress>>;
   providerErrors?: Partial<Record<ReviewProvider, ProviderError>>;
   reviewProviders?: ReviewProvider[];
+  /** settings.localReviewRole pinned at snapshot; a later settings/env change never alters this job. */
+  localReviewRole?: LocalReviewRole;
+  /** verify-clean: set when the merged chat result was clean and the local verification round began. */
+  localVerifyStartedAt?: number;
+  /** The chat reviewers whose STRUCTURED result was clean when verification started (the only
+   * ones a verification note may credit). */
+  localVerifyChat?: ReviewProvider[];
+  /** verify-clean: set when the chat reviewers produced no usable result, so local ran as the fallback. */
+  localFallbackAt?: number;
+  /** verify-clean: summary line naming which reviewer produced the posted result (outcomeNote). */
+  localVerifyNote?: string;
+  /** verify-clean: local returned a STRUCTURED result in its verification round. Stamped at that
+   * merge only; read by reviewOutcome (review-outcome.ts) and interpreted nowhere else. */
+  localVerified?: boolean;
+  /** The enabled reviewers that produced no payload for the merged result (quota, unavailable,
+   * failed), stamped by that merge from provider state. The only input to "a reviewer did not run"
+   * (review-outcome.ts): a reviewer's own assumption that mentions skipping something never counts. */
+  skippedProviders?: ReviewProvider[];
+  /** The reviewers that produced a payload for the merged result that was not their complete verdict
+   * (incompleteVerdict: gate rejection, salvage, a dropped or unread finding, discarded text), stamped
+   * by that merge. Their replies post as evidence; none of them may leave the result clean
+   * (review-outcome.ts). */
+  incompleteProviders?: ReviewProvider[];
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
   fpPending?: {
@@ -141,7 +173,10 @@ export interface Job {
     skipped: string[];
     dropped: string[];
   };
-  storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt }[];
+  /** unparsedText: a local leg's completed replies that were not review JSON; residualReplies: its
+   * completed replies whose JSON was accepted but that also carried text outside it (local-llm
+   * LocalLegResult). Either one makes the leg evidence, never a verdict (incompleteVerdict). */
+  storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string; repair?: RepairReceipt }[];
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;
   attemptedProviders?: ReviewProvider[];
@@ -243,6 +278,8 @@ export interface BotSettings {
   localReviewMaxTokens: number;
   /** "single" = one-shot prompt; "multiturn" = SDK tool loop; "auto" = pick by PR size. */
   localReviewMode: LocalReviewMode;
+  /** "race" = local runs alongside chat; "verify-clean" = local verifies a clean chat result. */
+  localReviewRole: LocalReviewRole;
   /** auto-mode cutoff: a single-turn prompt estimated at or below this many tokens stays single-turn. */
   localReviewSingleTurnMaxTokens: number;
   reviewOrder: ReviewProvider[];
@@ -328,6 +365,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localLlmModel: "",
   localReviewMaxTokens: 32_768,
   localReviewMode: "auto",
+  localReviewRole: "race",
   localReviewSingleTurnMaxTokens: 30_000,
   reviewOrder: ["local", "chatgpt", "grok"],
   promptDiffMaxChars: 300_000,
@@ -388,7 +426,27 @@ export function chatProvidersOf(providers: readonly ReviewProvider[]): Array<"ch
   return providers.filter(isChatProvider);
 }
 
-export function describeEnabledReviewers(providers: readonly ReviewProvider[]): string {
+/**
+ * `race` (default): local runs in parallel with the chat reviewers. `verify-clean`: local runs only
+ * after the merged chat result is clean, as a verification round (settings.localReviewRole, env ASHLAR_LOCAL_REVIEW_ROLE).
+ */
+export type LocalReviewRole = "race" | "verify-clean";
+
+/** Why a leg's reply is posted verbatim instead of as structured findings: `unparseable` — it was
+ * not valid review JSON (salvaged before the gate: unparseable, or JSON the review schema rejects);
+ * `unread-rows` — it parsed, but the gate set
+ * findings past its row cap aside unread; `not-a-verdict` — a released held local reply the gate
+ * could not use in full (docs/local-verify-clean.md §1). */
+export type RawCause = "unparseable" | "unread-rows" | "not-a-verdict";
+
+/** One salvaged leg's place in Job.rawReview: its piece ends at `end` (exclusive). */
+export type RawLeg = { provider: ReviewProvider; end: number };
+
+export const LOCAL_REVIEW_ROLES: LocalReviewRole[] = ["race", "verify-clean"];
+
+/** `localFallback`: the job released local as the chat-down fallback (Job.localFallbackAt), so local
+ * runs as an ordinary reviewer whatever its configured role; that release wins over `role`. */
+export function describeEnabledReviewers(providers: readonly ReviewProvider[], role?: LocalReviewRole, localFallback = false): string {
   const chat = chatProvidersOf(providers as ReviewProvider[]);
   const local = providers.includes("local");
   const chatBit = !chat.length
@@ -396,7 +454,8 @@ export function describeEnabledReviewers(providers: readonly ReviewProvider[]): 
     : chat.length === 1
       ? `${chat[0]} (Chrome)`
       : `${chat.join(" + ")} in parallel (Chrome)`;
-  const localBit = !local ? "" : chat.length ? "local racing" : "local only";
+  const localBit = !local ? "" : !chat.length ? "local only" : localFallback ? "local runs as the fallback"
+    : role === "verify-clean" ? "local verifies a clean result" : "local racing";
   return [chatBit, localBit].filter(Boolean).join("; ") || "none configured";
 }
 

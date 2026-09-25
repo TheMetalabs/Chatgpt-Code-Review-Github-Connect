@@ -545,13 +545,19 @@ function enabledLooking(button) {
   return getComputedStyle(button).pointerEvents !== "none";
 }
 
-/** The first actionable Send, by selector priority. A rendered Send that is disabled ends the search:
- * a looser selector must not find some other button to click while the real Send says "not yet". */
+/** The first actionable Send, by selector priority. Every match of a selector is tried (a stray or
+ * leftover node may come first in DOM order). A selector that rendered a Send but no actionable one
+ * ends the search: a looser selector must not find some other button to click while the real Send
+ * says "not yet". */
 function findEligibleSendButton(selectors) {
   const root = typeof composer === "function" ? composer()?.closest("form") || document : document;
-  for (const selector of selectors) for (const button of root.querySelectorAll(selector)) {
-    if (actionableSend(button)) return button;
-    if (button instanceof HTMLElement && renderedControl(button) && !stopLabelled(button)) return null;
+  for (const selector of selectors) {
+    let renderedDisabled = false;
+    for (const button of root.querySelectorAll(selector)) {
+      if (actionableSend(button)) return button;
+      if (button instanceof HTMLElement && renderedControl(button) && !stopLabelled(button)) renderedDisabled = true;
+    }
+    if (renderedDisabled) return null;
   }
   return null;
 }

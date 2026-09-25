@@ -1364,3 +1364,14 @@ test('real DOM (#93): a fix attachment over the 512 KiB cap is refused before an
  assert.match(out.error,new RegExp(`is ${body.length} bytes; at most ${FIX_ATTACHMENT_MAX_BYTES} bytes`));
  assert.deepEqual([out.sends,out.composer,(await uploads()).length],[0,'',0]);
 });
+
+test('real DOM: a stray disabled Send earlier in DOM order does not hide the real enabled one (same selector)',async t=>{
+ const page=await fixture(t,'');
+ await page.evaluate(()=>{document.body.insertAdjacentHTML('beforeend','<form><div id="prompt-textarea" contenteditable="true"></div><button type="button" aria-label="Send prompt" id="stray" disabled>Send</button><button type="button" aria-label="Send prompt" id="real">Send</button></form>');});
+ await page.addScriptTag({content:source('extension/composer.js')});
+ const id=await page.evaluate(()=>findEligibleSendButton(['button[aria-label*="Send"]'])?.id||null);
+ assert.equal(id,'real');
+ // Only a disabled Send under the selector: no looser selector is tried.
+ await page.evaluate(()=>document.getElementById('real').setAttribute('disabled',''));
+ assert.equal(await page.evaluate(()=>findEligibleSendButton(['button[aria-label*="Send"]','button[type="button"]'])?.id||null),null);
+});

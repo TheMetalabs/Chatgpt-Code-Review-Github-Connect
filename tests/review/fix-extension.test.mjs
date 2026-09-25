@@ -1346,3 +1346,26 @@ test('page: a sent journal whose write failed keeps the send-time conversation f
   assert.equal(p.context.retrySubmissionPersistence(), true);
   assert.equal(p.stored().conversation, 'https://chatgpt.com/?temporary-chat=true', 'the retry writes what was proven at send, not the current URL');
 });
+
+// Incident 2026-09-25 (PR #93): a restarted server forgot job-lost while its answer was collected; the
+// worker keeps it (delivery answered "job not found", status "missing") and its tab. That undeliverable
+// result must not keep the worker from taking new work: the next take lists job-lost and the offered
+// fix opens its own tab.
+test('worker: a collected review the server forgot never blocks admission of a queued fix', async () => {
+  const lost = {jobId: 'job-lost', origin: 'http://bridge', leaseId: 'L0', prompt: 'REVIEW', providers: ['chatgpt'], captureProtocol: 1,
+    reasoning: {chatgpt: 'pro', grok: 'heavy'}, states: {chatgpt: {tabId: 10, started: true, runId: 'run-0', outcome: {ok: true, raw: '{"summary":"x"}'}}}};
+  const takes = [];
+  const api = async (_path, body) => {
+    if (body?.action === 'take') { takes.push(body); return {ok: true, job: body.excludeJobIds.includes('fix-A') ? null : FRESH}; }
+    if (body?.action === 'complete' && body.jobId === 'job-lost') throw Object.assign(new Error('job not found'), {status: 200});
+    if (body?.action === 'ping' && body.jobId === 'job-lost') return {ok: true, active: false, accepted: false, status: 'missing', bridge: {captureProtocol: 1}};
+    return active(_path, body);
+  };
+  const b = worker([lost], {api, url: 'https://chatgpt.com/c/lost', handler: () => ({ok: false, code: 'busy', retry: true})});
+  await b.tick();await b.tick();
+  assert.ok(takes.length, 'admission reaches take while the forgotten result is undeliverable');
+  assert.equal(takes[0].fixProtocol, 1);assert.ok(takes[0].excludeJobIds.includes('job-lost'));
+  assert.equal(b.local.state.pendingReviewJobs['fix-A']?.kind, 'fix', 'the fix is admitted');
+  assert.equal(runsOf(b).length, 1, 'its prompt goes to a new tab');
+  assert.ok(b.local.state.pendingReviewJobs['job-lost'], 'the forgotten review is kept, not dropped');
+});

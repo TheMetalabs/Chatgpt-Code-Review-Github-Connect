@@ -298,6 +298,26 @@ const settles = <T>(p: Promise<T>, ms = 10_000): Promise<T> => {
   const bound = new Promise<never>((_res, rej) => (timer = setTimeout(() => rej(new Error(`did not settle within ${ms} ms`)), ms)));
   return Promise.race([p, bound]).finally(() => clearTimeout(timer));
 };
+/** Holds the FIRST provider request (its round is mid-generation) until released. The hold is
+ * also released when the test ends, whatever it threw: the watcher's interval keeps the runner
+ * alive while a request is in flight, so a failing test would otherwise hang the file. */
+const holdFirst = (t: TestContext, f: ReturnType<typeof fakeDeps>) => {
+  let release!: () => void;
+  const held = new Promise<void>((res) => (release = res));
+  t.after(() => release());
+  let reached!: () => void;
+  const generating = new Promise<void>((res) => (reached = res));
+  const orig = f.deps.requestFix;
+  let calls = 0;
+  f.deps.requestFix = async (p, ctl) => {
+    if (++calls === 1) {
+      reached();
+      await held;
+    }
+    return orig(p, ctl);
+  };
+  return { generating, release };
+};
 
 describe("the loop is OFF unless Settings enable it (no other path turns it on)", () => {
   const SRC = join(new URL(".", import.meta.url).pathname, "..");
@@ -2176,26 +2196,6 @@ describe("the branch ref moves only while the round is still wanted (#79 K2-7 wr
 describe("a second step for the same head waits for the running one (#79 K2-8, K2-9 step half, R7 4092621920)", () => {
   const STEP_REPLACED = "replaced by a newer loop step for this head (the newer one runs)";
   const ROUND_ALREADY_RUN = "this head's fix round already ran for this session, mode and starter";
-  /** Holds the FIRST provider request (its round is mid-generation) until released. The hold is
-   * also released when the test ends, whatever it threw: the watcher's interval keeps the runner
-   * alive while a request is in flight, so a failing test would otherwise hang the file. */
-  const holdFirst = (t: TestContext, f: ReturnType<typeof fakeDeps>) => {
-    let release!: () => void;
-    const held = new Promise<void>((res) => (release = res));
-    t.after(() => release());
-    let reached!: () => void;
-    const generating = new Promise<void>((res) => (reached = res));
-    const orig = f.deps.requestFix;
-    let calls = 0;
-    f.deps.requestFix = async (p, ctl) => {
-      if (++calls === 1) {
-        reached();
-        await held;
-      }
-      return orig(p, ctl);
-    };
-    return { generating, release };
-  };
   /** Only for a step expected to return at once (replaced, or its wait expired): never awaited past a hold. */
   const soon = <T>(p: Promise<T>): Promise<T | "still waiting"> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2691,5 +2691,224 @@ describe("the production step gate (harbor passes no deps: its only path)", () =
     const f = fakeDeps();
     f.deps.stepWaitMaxMs = 1e12;
     assert.equal(stepWaitMaxMs(settings(), f.deps), MAX_TIMER_MS);
+  });
+});
+
+describe("kill switch: the Settings gate and an operator stop leave GitHub and the provider untouched (#79)", () => {
+  type Fake = ReturnType<typeof fakeDeps>;
+  type GitApi = ReturnType<LoopRuntimeDeps["gh"]["gitDataApi"]>;
+  /** Every GitHub write the loop can make: comments, thread replies, and a commit's Git Data objects and ref. */
+  const GH_WRITES = new Set(["createIssueComment", "replyToReviewComment", "createBlob", "createTree", "createCommit", "updateBranchRef"]);
+  /** The Git Data writes of a commit; updateBranchRef is the push (the branch moves). */
+  const GIT_WRITES = new Set(["createBlob", "createTree", "createCommit", "updateBranchRef"]);
+  const wrap = (name: string, fn: unknown, calls: string[]) => (...a: unknown[]) => (calls.push(name), (fn as (...x: unknown[]) => unknown)(...a));
+  /** Counts every call on the fake GitHub client (its Git Data API included) and on the provider. */
+  const spy = (f: Fake) => {
+    const calls: string[] = [];
+    const gh = f.deps.gh as unknown as Record<string, unknown>;
+    for (const [k, fn] of Object.entries(gh)) if (typeof fn === "function" && k !== "gitDataApi") gh[k] = wrap(k, fn, calls);
+    const git = f.deps.gh.gitDataApi;
+    f.deps.gh.gitDataApi = (...a) => {
+      const api = git(...a) as unknown as Record<string, unknown>;
+      return Object.fromEntries(Object.entries(api).map(([k, fn]) => [k, typeof fn === "function" ? wrap(k, fn, calls) : fn])) as unknown as GitApi;
+    };
+    let provider = 0;
+    const requestFix = f.deps.requestFix;
+    f.deps.requestFix = (...a) => (provider++, requestFix(...a));
+    return {
+      calls,
+      writes: () => calls.filter((c) => GH_WRITES.has(c)),
+      gitWrites: () => calls.filter((c) => GIT_WRITES.has(c)),
+      get provider() {
+        return provider;
+      },
+    };
+  };
+  const PR = { owner: "o", repo: "r", pr: 7 };
+  const PUSHED = "b".repeat(40);
+  const OFF: ReadonlyArray<[string, Partial<FixAgentSettings>]> = [
+    ["enabled=false", { enabled: false }],
+    ["enabled=true, provider=null", { enabled: true, provider: null }],
+  ];
+  const startReview = (mode: "suggest" | "apply") =>
+    job({ thread: { kind: "mention", commentId: 5, userText: mode === "apply" ? "/review-loop apply" : "/review-loop", loop: { kind: "start", mode }, eventAt: START_AT } });
+  const continuations = (posted: string[]) => posted.filter((b) => b.includes("ashlar-loop-continue"));
+
+  /** Fires one trigger on a fresh fake: once with the loop ON (the control — the trigger does act,
+   * so its zero below is the gate's), then once per OFF variant: no GitHub call at all, no write,
+   * no provider call. */
+  const inert = async (fake: () => Fake, fire: (f: Fake, s: BotSettings) => Promise<LoopStepResult | { posted: boolean; reason: string }>, onActs: (o: ReturnType<typeof spy>) => void) => {
+    const on = fake();
+    const onSpy = spy(on);
+    await fire(on, settings("apply"));
+    onActs(onSpy);
+    for (const [label, over] of OFF) {
+      const f = fake();
+      const o = spy(f);
+      const r = await fire(f, settings("apply", over));
+      assert.equal((r as { reason?: string }).reason, "disabled", `${label}: ${JSON.stringify(r)}`);
+      assert.deepEqual(o.writes(), [], `${label}: GitHub writes`);
+      assert.equal(o.provider, 0, `${label}: provider calls`);
+      assert.deepEqual(o.calls, [], `${label}: no GitHub call at all`);
+    }
+  };
+
+  it("(a) a posted review on an active apply session: 0 GitHub writes, 0 provider calls", async () => {
+    await inert(
+      () => fakeDeps({ start: "apply", rounds: [3] }),
+      (f, s) => runPostReviewLoop("t", job(), sample, s, f.deps, ENV),
+      (o) => {
+        assert.equal(o.provider, 1, "control: the ON loop calls the provider");
+        assert.ok(o.writes().includes("updateBranchRef"), `control: the ON loop pushes: ${o.writes().join(",")}`);
+      },
+    );
+  });
+
+  for (const mode of ["suggest", "apply"] as const) {
+    it(`(a) a /review-loop${mode === "apply" ? " apply" : ""} comment: its start record is never posted — 0 GitHub writes, 0 provider calls`, async () => {
+      await inert(
+        () => fakeDeps({ start: null, rounds: [3] }),
+        (f, s) => startLoop("t", { ...PR, actor: "alice", mode, at: "2026-01-02T00:00:00Z" }, s, f.deps, ENV),
+        (o) => assert.deepEqual(o.writes(), ["createIssueComment"], "control: the ON loop records the start"),
+      );
+    });
+
+    it(`(a) the review a /review-loop${mode === "apply" ? " apply" : ""} comment requested (start not recorded yet): 0 GitHub writes, 0 provider calls`, async () => {
+      await inert(
+        () => fakeDeps({ start: null, rounds: [3] }),
+        (f, s) => runPostReviewLoop("t", startReview(mode), sample, s, f.deps, ENV),
+        (o) => {
+          assert.equal(o.provider, 1, "control: the ON loop records the start and runs the round");
+          assert.ok(o.writes().length > 0);
+        },
+      );
+    });
+  }
+
+  it("(a) a human push on an active session: no continuation — 0 GitHub writes, 0 provider calls", async () => {
+    await inert(
+      () => fakeDeps({ start: "apply", rounds: [4, 3], liveSha: PUSHED }),
+      (f, s) => continueLoopOnPush("t", { ...PR, headSha: PUSHED, actor: "alice" }, s, f.deps, ENV),
+      (o) => assert.deepEqual(o.writes(), ["createIssueComment"], "control: the ON loop posts the continuation"),
+    );
+  });
+
+  /** An operator's stop comment: its row lands in the PR history and harbor forwards it to stopLoop. */
+  const stopComment = async (f: Fake, at: string) => {
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: at });
+    return stopLoop("t", { ...PR, actor: "alice", stopAt: at }, settings("apply"), f.deps, ENV);
+  };
+
+  it("(b) a stop comment while the apply round generates: 0 commits, 0 ref updates, no continuation", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(t, f);
+    const o = spy(f);
+    const a = run(f, "apply", {}, job({ id: "job-A" }));
+    await settles(hold.generating);
+    assert.deepEqual(await stopComment(f, "2026-01-02T00:00:00Z"), { posted: true, reason: "stopped" });
+    hold.release();
+    assert.deepEqual(await settles(a), { ran: false, reason: "loop stopped by operator" });
+    assert.deepEqual(o.gitWrites(), [], "no blob, tree, commit or ref write after the stop");
+    assert.equal(f.committed, false);
+    assert.deepEqual(continuations(f.posted), []);
+    assert.deepEqual(escalations(f.posted), []);
+  });
+
+  it("(b) a stop comment while the commit's objects are created: the ref never moves (no push), no continuation", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const o = spy(f);
+    let stop: Awaited<ReturnType<typeof stopLoop>> | undefined;
+    const git = f.deps.gh.gitDataApi;
+    f.deps.gh.gitDataApi = (...a) => {
+      const api = git(...a);
+      return { ...api, createBlob: async (c: string) => ((stop ??= await stopComment(f, "2026-01-02T00:00:00Z")), api.createBlob(c)) };
+    };
+    assert.deepEqual(await run(f, "apply"), { ran: false, reason: "loop stopped by operator" });
+    assert.deepEqual(stop, { posted: true, reason: "stopped" });
+    assert.equal(o.calls.filter((c) => c === "updateBranchRef").length, 0, "0 ref updates");
+    assert.equal(f.committed, false, "no commit reaches the branch");
+    assert.equal(f.prompts.length, 1, "a stopped round is not retried");
+    assert.deepEqual(continuations(f.posted), []);
+  });
+
+  it("(b) a stop comment while step B waits behind A: A stops, B is admitted to an ended session — 0 commits, 1 provider call", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(t, f);
+    const o = spy(f);
+    let admittedAt: number | undefined; // o.calls.length when B was admitted (a step that waited re-reads the settings)
+    f.deps.settingsNow = () => ((admittedAt = o.calls.length), settings("apply"));
+    const a = run(f, "apply", {}, job({ id: "job-A" }));
+    await settles(hold.generating);
+    const b = run(f, "apply", {}, job({ id: "job-B" })); // a re-review of the same head: waits behind A
+    assert.deepEqual(await stopComment(f, "2026-01-02T00:00:00Z"), { posted: true, reason: "stopped" });
+    hold.release();
+    const [ra, rb] = await settles(Promise.all([a, b]));
+    assert.deepEqual(ra, { ran: false, reason: "loop stopped by operator" });
+    assert.deepEqual(rb, { ran: false, reason: "no active loop session" }, "B's first read after admission finds the session ended: no round");
+    assert.notEqual(admittedAt, undefined, "B waited and was admitted");
+    assert.deepEqual(o.calls.slice(admittedAt).filter((c) => GH_WRITES.has(c)), [], "the admitted B writes nothing");
+    assert.deepEqual(o.gitWrites(), [], "no blob, tree, commit or ref write");
+    assert.equal(f.committed, false);
+    assert.equal(o.provider, 1, "only A's request; the admitted B calls no provider");
+    assert.deepEqual(continuations(f.posted), []);
+  });
+
+  it("(b) a stop by edit while a restart's review B (its start not recorded yet) waits behind A: still 0 commits", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(t, f);
+    const o = spy(f);
+    const a = run(f, "apply", {}, job({ id: "job-A" }));
+    await settles(hold.generating);
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+    const restart = job({ id: "job-B", thread: { kind: "mention", commentId: 3, userText: "/review-loop apply", loop: { kind: "start", mode: "apply" }, eventAt: "2025-12-31T12:00:00Z" } });
+    const b = run(f, "apply", {}, restart);
+    // no new comment row: the stop is edited into an older comment, so only stopLoop sees it
+    const stop = await stopLoop("t", { ...PR, actor: "alice", stopAt: "2025-12-31T18:00:00Z" }, settings("apply"), f.deps, ENV);
+    assert.deepEqual(stop, { posted: true, reason: "stopped" }, "recorded: B carries a start the stop ends");
+    hold.release();
+    const [, rb] = await settles(Promise.all([a, b]));
+    assert.deepEqual(rb, { ran: false, reason: "no active loop session" }, "B's start and the later stop fold to an ended session: no round");
+    assert.deepEqual(o.gitWrites(), [], "no blob, tree, commit or ref write");
+    assert.equal(f.committed, false);
+    assert.equal(o.provider, 1, "only A's request");
+  });
+
+  it("(c) Settings switched off while a step waits: the admitted step makes 0 provider calls and 0 GitHub calls", async (t) => {
+    const variants: ReadonlyArray<[string, Partial<FixAgentSettings> | undefined]> = [["control: still ON", undefined], ...OFF];
+    for (const [label, over] of variants) {
+      const f = fakeDeps({ start: "apply", rounds: [3] });
+      const hold = holdFirst(t, f);
+      const o = spy(f);
+      let current = settings("apply");
+      let admittedAt: number | undefined; // o.calls.length when the waiting step was admitted
+      let providerAt = 0;
+      f.deps.settingsNow = () => {
+        admittedAt = o.calls.length;
+        providerAt = o.provider;
+        return current;
+      };
+      const a = run(f, "apply", {}, job({ id: "job-A" }));
+      await settles(hold.generating);
+      // stop → restart: B's round is a new one, which the ON control runs
+      f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+      f.issues.push(recorded("apply", "alice", "2025-12-31T12:00:00Z"));
+      const b = runPostReviewLoop("t", job({ id: "job-B" }), sample, current, f.deps, ENV);
+      if (over) current = settings("apply", over); // the operator saves the switch off; B holds the old settings
+      hold.release();
+      const [ra, rb] = await settles(Promise.all([a, b]));
+      assert.deepEqual(ra, { ran: false, reason: NEWER }, `${label}: A's round went moot`);
+      assert.notEqual(admittedAt, undefined, `${label}: B waited and was admitted`);
+      const bCalls = o.calls.slice(admittedAt);
+      if (!over) {
+        assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "applied", `${label}: ${JSON.stringify(rb)}`);
+        assert.equal(o.provider - providerAt, 1, `${label}: B calls the provider`);
+        assert.ok(bCalls.includes("updateBranchRef"), `${label}: B pushes`);
+        continue;
+      }
+      assert.deepEqual(rb, { ran: false, reason: "disabled" }, label);
+      assert.equal(o.provider - providerAt, 0, `${label}: B's provider calls`);
+      assert.deepEqual(bCalls, [], `${label}: B's GitHub calls (reads and writes)`);
+      assert.equal(f.committed, false, label);
+    }
   });
 });

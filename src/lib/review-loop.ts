@@ -41,6 +41,21 @@ export function isConvergedFindings(body: string | null | undefined): boolean {
   return !(m && /(?:^|\s)unverified=1(?=\s|$)/.test(m[1]));
 }
 
+/** INCOMPLETE (machine side): the trailing line of an incomplete review (review-format.ts), a review
+ * that is neither a clean pass nor a finding count (a reviewer did not run, or returned no complete
+ * review). It is its own fixed marker and NEVER contains the `<!-- ashlar-findings` prefix: external
+ * pollers read that prefix anywhere in a body and take total=0 as converged. Loop reconstruction reads
+ * it as the end of the session, owing the fixed loop-error handoff (review-loop-session.ts owedHandoff)
+ * that the review's own loop step posts, or the next step on the PR when that one was lost (design §3). */
+export const INCOMPLETE_OUTCOME_MARKER = "<!-- ashlar-outcome incomplete -->";
+const INCOMPLETE_TRAILER_RE = /<!--\s*ashlar-outcome\s+incomplete\s*-->\s*$/;
+
+/** Whether a review body ends with the INCOMPLETE marker. Only a marker at the very end counts, as for
+ * the findings marker: one quoted earlier in a body is prose. */
+export function isIncompleteOutcome(body: string | null | undefined): boolean {
+  return INCOMPLETE_TRAILER_RE.test(body || "");
+}
+
 /** Epoch ms of an ISO-8601 timestamp; NaN when absent or unparseable. Session boundaries are
  * compared as instants, never as strings: GitHub timestamps are second-precision ("…00Z") while
  * Date#toISOString carries milliseconds ("…00.500Z"), and lexically "…00Z" sorts after "…00.500Z". */

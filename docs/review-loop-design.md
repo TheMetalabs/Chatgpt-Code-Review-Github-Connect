@@ -54,7 +54,8 @@ GitHub가 영속하는 이벤트(App의 기록·마커, 사람의 stop 코멘트
   **첫 기록**에서 시작한다. 사람 코멘트·PR 본문의 **현재 텍스트는 start로 재생하지 않는다** — 편집으로 과거 시각의
   start를 심을 수 없다. 기록 게시가 실패했으면 그 리뷰의 루프 단계가 같은 기록을 (멱등으로) 보충한다.
   세션 안에서 start를 다시 걸어도 **앵커는 유지**되고 모드·시작자만 갱신된다 → 라운드 예산이 리셋되지 않는다.
-- **종료 이벤트:** 사람의 stop 지시어, 봇의 ESCALATE 마커, 봇의 STOPPED 마커, 봇의 clean 리뷰(`total=0`, CONVERGED).
+- **종료 이벤트:** 사람의 stop 지시어, 봇의 ESCALATE 마커, 봇의 STOPPED 마커, 봇의 clean 리뷰(`total=0`, CONVERGED),
+  봇의 incomplete 리뷰(INCOMPLETE 마커 — 세션을 끝내고 `loop-error` 핸드오프를 **빚진다**, §3).
   같은 초의 동률은 head 이동 → 종료 → start 순(핸드오프와 같은 초의 start는 새 세션).
 - **stale clean 리뷰는 종료가 아니다:** clean 리뷰는 루프가 **기다리는 head** 에 대해서만 CONVERGED다. 루프가 봇의
   연속 마커나 push(웹훅의 `updated_at`)로 이미 다른 head로 넘어간 뒤 도착한 옛 head의 clean 리뷰는, 그 head가 PR의
@@ -100,8 +101,22 @@ GitHub가 영속하는 이벤트(App의 기록·마커, 사람의 stop 코멘트
 | **CONVERGED** | `<!-- ashlar-findings total=0 ... -->` (리뷰 본문의 **마지막 줄**) | (지정 리뷰어의 clean verdict) | substring/마커 — ashlar 내부는 끝에 있는 마커만 센다 |
 | **ESCALATE** | `<!-- ashlar-loop-escalate reason=<code> round=<N> -->` | `Ashlar review-loop halted — human review required` | substring/마커 |
 | **STOPPED** | `<!-- ashlar-loop-stopped -->` | `Ashlar review-loop stopped by operator` | 마커 |
+| **INCOMPLETE**(비수렴 — ESCALATE를 빚짐) | `<!-- ashlar-outcome incomplete -->` (리뷰 본문의 **마지막 줄**) | `Not a clean pass — …` | 끝에 있는 마커(봇 리뷰만) — `<!-- ashlar-findings` 접두사를 **절대** 포함하지 않는다 |
 
 `total=0` 이어도 `unverified=1` 이 붙은 마커는 CONVERGED가 아니다(verify-clean 로컬 검증 미완료) — [local-verify-clean.md §1](local-verify-clean.md).
+
+**INCOMPLETE 마커(구현: `review-loop.ts` `INCOMPLETE_OUTCOME_MARKER`):** incomplete 리뷰(리뷰어가 돌지 않았거나 완전한
+리뷰를 돌려주지 않음 — clean pass도 지적 개수도 아님)는 findings 마커 대신 고정 마커 `<!-- ashlar-outcome incomplete -->`
+를 본문 마지막 줄로 단다. 이 마커는 `<!-- ashlar-findings` 접두사를 **절대 포함하지 않는다** — 외부 폴러
+(`poll-ashlar-convergence.py` `parse_body_findings`)는 그 접두사를 본문 **어디서든** 읽고 `total=0`을 수렴으로 보기
+때문이다(리뷰어 텍스트는 마커 무력화되어 이 접두사를 만들 수 없다). 핸드오프는 리뷰 게시 **뒤의** best-effort 단계라서,
+게시와 핸드오프 사이에 프로세스가 죽거나 핸드오프 게시가 실패하면 신호가 사라질 수 있다. 그래서 루프 재구성
+(`readLoopEvents` → `deriveLoopSession`)은 활성 세션의 incomplete 리뷰를 **세션 종료 + `loop-error` 핸드오프 의무**
+(`owedHandoff`: 그 리뷰의 head, 끝난 세션의 앵커로 범위 지정)로 읽는다 — CONVERGED도, head를 기다리는 활성 세션도 아니다.
+그 리뷰 자신의 루프 단계가 핸드오프를 달고, 유실됐다면 PR의 **다음 루프 단계**(push, 다음 리뷰)가 영속 마커에서 복구해
+고정 detail로 **한 번** 단다(수정 라운드·연속 요청은 없다 — 루프는 거기서 끝났다). 의무는 그 head의 봇 핸드오프, 사람의
+stop, 그 head(또는 live head)의 이후 clean 리뷰로 해소되고, 새 start는 새 세션을 연다. 루프가 이미 다른 head로 넘어간 뒤
+도착한 옛 head의 incomplete 리뷰는 stale clean 리뷰와 똑같이 무시된다(§2b).
 런타임도 지적 개수가 아니라 같은 게시 결과(`postedOutcome`)로 판정한다: 구조화 지적이 0건이어도 clean pass가 아닌 리뷰(raw / raw-unverified / unverified-clean / incomplete)는 활성 세션에서 고정 ESCALATE `loop-error` 하나로 넘기며, 조용히 멈추지 않는다.
 
 연속(비종착) 제어 신호 — 루프가 다음 라운드로 넘어갈 때 드라이버가 방출:

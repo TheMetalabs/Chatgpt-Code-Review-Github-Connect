@@ -27,6 +27,7 @@ import {
   parseEscalateMarker,
   parseFindingsTotal,
   isConvergedFindings,
+  isIncompleteOutcome,
   parseReviewLoopDirective,
   parseStartMarker,
   parseStopRecord,
@@ -447,8 +448,9 @@ function pushStop(events: LoopEvent[], c: { body?: string; createdAt?: string; u
  *   An edited stop, and a stop added to the PR body, reach the loop through the webhook at their
  *   edit time; the App's STOPPED acknowledgement RECORDS them (review-loop.ts stoppedComment),
  *   placed at the stop's own time — never at the acknowledgement's.
- * - ONLY the App contributes escalate / stopped markers, its canonical continuation for THIS PR
- *   (the head the loop moved to), and converged (total=0) reviews with their commit.
+ * - ONLY the App contributes escalate / stopped markers (a handoff with its head), its canonical
+ *   continuation for THIS PR (the head the loop moved to), and converged (total=0) and incomplete
+ *   (the fixed INCOMPLETE marker) reviews with their commit.
  * Reads fail closed: a list error throws (the caller must not act on a partial history).
  */
 export async function readLoopEvents(
@@ -473,8 +475,9 @@ export async function readLoopEvents(
       const start = parseStartMarker(c.body, bot);
       const stopRecord = parseStopRecord(c.body, bot);
       const cont = canonicalContinuation(c.body, bot);
+      const handoff = parseEscalateMarker(c.body, bot);
       if (start) events.push({ at: start.at, kind: "start", mode: start.mode, actor: start.by, ...(c.id ? { seq: c.id } : {}) });
-      else if (parseEscalateMarker(c.body, bot)) events.push({ at: c.createdAt, kind: "escalate" });
+      else if (handoff) events.push({ at: c.createdAt, kind: "escalate", head: handoff.head });
       // A recorded stop is placed at the stop's own time (an edit or a PR-body stop the fold
       // cannot replay); a bare legacy acknowledgement is an event at its own creation.
       else if (stopRecord) events.push({ at: stopRecord.at, kind: "stop", actor: stopRecord.by });
@@ -488,9 +491,9 @@ export async function readLoopEvents(
     if (!isSelfLogin(c.userLogin, botLogin)) pushStop(events, c);
   }
   for (const r of reviews) {
-    if (isSelfLogin(r.userLogin, botLogin) && r.submittedAt && isConvergedFindings(r.body)) {
-      events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
-    }
+    if (!isSelfLogin(r.userLogin, botLogin) || !r.submittedAt) continue;
+    if (isConvergedFindings(r.body)) events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
+    else if (isIncompleteOutcome(r.body)) events.push({ at: r.submittedAt, kind: "incomplete", head: r.commitId || undefined });
   }
   return events;
 }

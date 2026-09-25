@@ -12,8 +12,8 @@ back. It is released either as a **verification round** (the merged chat result 
 `reviewOutcome(job, findings)` in `src/lib/review-outcome.ts` is the only place a merged, gated
 result is classified. Harbor calls it to decide between holding the post (`verify`) and posting.
 `reviewSummaryBody` calls it (through the `postedOutcome` render guard) and derives from the kind
-alone: the body's first line, the raw block header, the trailing `ashlar-findings` marker, and so
-the loop's CONVERGED signal. The loop runtime (`runPostReviewLoop`) asks `postedOutcome` the same
+alone: the body's first line, the raw block header, the trailing `ashlar-findings` marker (or, for
+`incomplete`, its own `<!-- ashlar-outcome incomplete -->` marker), and so the loop's CONVERGED signal. The loop runtime (`runPostReviewLoop`) asks `postedOutcome` the same
 question instead of counting findings: a zero-finding review whose kind is not CONVERGED (`raw`,
 `raw-unverified`, `unverified-clean`, `incomplete`) gets one fixed ESCALATE `loop-error` in an active
 session, never a silent stop. No other code reads `localVerified`, `rawReview` or `skippedProviders`
@@ -29,7 +29,7 @@ race.
 | `findings` | any structured finding | summary mark | `total=N inline=… body=… p0 p1 p2` | no |
 | `raw` | a reply posted verbatim as evidence, none of it local verification's own in full (in a verification round: + note) | summary mark | `total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` | no |
 | `raw-unverified` | verification round, local's own reply is in the raw block in full (`rawCauses.local`, not in `rawTruncated`): it could not be used as a review (below) | summary mark + note | raw marker + ` unverified=1` | no |
-| `incomplete` | 0 findings, no raw, a reviewer was skipped (`skippedProviders`) or returned no complete verdict (`incompleteProviders`) | summary mark (+ note in a verification round: agreed / did not complete) | none | no |
+| `incomplete` | 0 findings, no raw, a reviewer was skipped (`skippedProviders`) or returned no complete verdict (`incompleteProviders`) | summary mark (+ note in a verification round: agreed / did not complete) | `<!-- ashlar-outcome incomplete -->`, its own fixed marker: never an `ashlar-findings` one (an external poller reads that prefix anywhere as a count, total=0 as converged); loop reconstruction reads it as the end of the session owing a `loop-error` handoff ([review-loop-design.md §3](review-loop-design.md)) | no |
 | `clean` | not a verifier, 0 findings, nothing skipped, every reviewer's payload a complete verdict | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `verified-clean` | verification round, local returned a structured clean result | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `unverified-clean` | verification round, local failed / timed out / offline | `Chat found no major issues, but local verification did not complete …` | `total=0 … unverified=1` | no |

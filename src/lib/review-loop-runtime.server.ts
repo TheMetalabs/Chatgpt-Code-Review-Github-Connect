@@ -198,6 +198,16 @@ export function notCleanDetail(job: Partial<Pick<Job, "rawCauses" | "rawTruncate
   return NOT_CLEAN_DETAIL[outcome] ?? outcome;
 }
 
+/** The fixed handoff for a posted review that is not a clean pass and carries no structured finding. */
+function notCleanHandoff(job: Job, outcome: PostedOutcome): string {
+  return `this review is not a clean pass (${notCleanDetail(job, outcome)}) and carries no structured finding the fix agent can act on`;
+}
+
+/** The fixed handoff an incomplete review owes when a later loop step recovers it from the review's
+ * durable INCOMPLETE marker (review-loop-session.ts owedHandoff): that review's job state is gone. */
+export const INCOMPLETE_RECOVERED_DETAIL =
+  "an incomplete review of this head (not a clean pass: a reviewer did not run or returned no complete review) carries no structured finding the fix agent can act on, and its handoff was not recorded";
+
 /** Write-capable repository permissions (legacy field; `maintain` reports as `write`). */
 const WRITE_PERMISSIONS = new Set(["admin", "write"]);
 
@@ -765,7 +775,19 @@ export async function runPostReviewLoop(
         }
       }
     }
-    if (!session.active) return { ran: false, reason: NO_SESSION };
+    if (!session.active) {
+      const owed = session.owedHandoff;
+      if (!owed) return { ran: false, reason: NO_SESSION };
+      // The session ended at an incomplete review that owes its loop-error handoff: this review's own
+      // (the history already lists it), or an earlier one whose handoff a crash or a failed post lost.
+      // Settled once for that head, scoped to the session it ended; never a fix round past it.
+      requested = true;
+      sinceIso = owed.startIso;
+      sinceSeq = owed.startSeq;
+      const owedHead = owed.head ?? headSha;
+      const own = owedHead === headSha && notClean === "incomplete";
+      return await escalate("loop-error", own ? notCleanHandoff(job, notClean) : INCOMPLETE_RECOVERED_DETAIL, owedHead);
+    }
     requested = true;
     sinceIso = session.startIso;
     sinceSeq = session.startSeq;
@@ -777,9 +799,7 @@ export async function runPostReviewLoop(
     if (unattributable) {
       return await escalate("loop-error", "every finding of this review shares its id with another, so none can be attributed to its thread; the loop does not fix what it cannot attribute");
     }
-    if (notClean) {
-      return await escalate("loop-error", `this review is not a clean pass (${notCleanDetail(job, notClean)}) and carries no structured finding the fix agent can act on`);
-    }
+    if (notClean) return await escalate("loop-error", notCleanHandoff(job, notClean));
     if (!sample) return await escalate("loop-error", "no head-pinned snapshot for this review");
 
     // 1) Stuck or budget spent? Rounds are counted from the durable session anchor, so a
@@ -1107,7 +1127,30 @@ export async function continueLoopOnPush(
     // (before the continuation below exists) is stale and must not end the session.
     const moved = push.pushedAt ? [{ at: push.pushedAt, kind: "push" as const, head: push.headSha }] : [];
     const session = await sessionOf(d.gh, token, push, head, botLogin, moved);
-    if (!session.active) return { posted: false, reason: NO_SESSION };
+    if (!session.active) {
+      // A session that ended at an incomplete review whose handoff was lost is not continued by a
+      // push (the loop ended there): the push recovers the handoff it owes instead.
+      const owed = session.owedHandoff;
+      if (!owed) return { posted: false, reason: NO_SESSION };
+      const owedHead = owed.head ?? push.headSha;
+      const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: owed.startIso }).catch(() => []);
+      const handoff = await escalateNow(d.gh, token, {
+        owner: push.owner,
+        repo: push.repo,
+        pr: push.pr,
+        head: owedHead,
+        reason: "loop-error",
+        detail: INCOMPLETE_RECOVERED_DETAIL,
+        rounds,
+        roundCap: roundCap(env),
+        botLogin,
+        sinceIso: owed.startIso,
+        sinceSeq: owed.startSeq,
+        sleep: d.sleep,
+      });
+      const outcome = handoff.escalated ? "handoff posted" : handoff.error ? `handoff failed: ${handoff.error}` : "handoff already posted";
+      return { posted: false, reason: `the loop ended at an incomplete review; ${outcome}` };
+    }
     const c = await ensureContinuation(d.gh, token, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, sleep: d.sleep });
     if (!c.error) return { posted: c.posted, reason: c.posted ? "continued" : "already continued" };
     // The next review cannot be requested: end the loop with the fixed handoff instead of stalling.

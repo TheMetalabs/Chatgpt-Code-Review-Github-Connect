@@ -1,6 +1,7 @@
 import type { Finding, Job, RawLeg, ReviewProvider, Severity } from "./types.ts";
 import { OUTCOME_SHAPE, RAW_TRUNCATED_TEXT, postedOutcome, rawCauseText, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
 import { neutralizeMarkers, rawBodyText } from "./review-raw-text.ts";
+import { INCOMPLETE_OUTCOME_MARKER } from "./review-loop.ts";
 
 const BADGE: Record<Severity, string> = {
   P0: "https://img.shields.io/badge/P0-red?style=flat",
@@ -163,7 +164,8 @@ function renderedLegEnds(job: SummaryJob): RawLeg[] {
   return (Object.keys(job.rawCauses ?? {}) as ReviewProvider[]).map((provider) => ({ provider, end: Infinity }));
 }
 
-/** The trailing machine marker (the loop's CONVERGED side); an incomplete review carries none. */
+/** The trailing findings marker (the loop's CONVERGED side). An incomplete review carries none: it
+ * ends with its own INCOMPLETE_OUTCOME_MARKER instead (incompleteBody), never an ashlar-findings one. */
 export function findingsMarker(outcome: PostedOutcome, findings: Finding[], unanchored: Finding[]): string {
   const flag = OUTCOME_SHAPE[outcome].unverified ? " unverified=1" : "";
   if (outcome === "incomplete") return "";
@@ -204,7 +206,8 @@ ChatGPT/Grok did not finish a full review.
 ${p.noteLine}
 ${p.skipped.map((s) => `- ${s}`).join("\n")}
 
-Not a clean pass — ${p.incomplete ? "not every reviewer returned a complete review" : "remaining reviewers did not run"}.`;
+Not a clean pass — ${p.incomplete ? "not every reviewer returned a complete review" : "remaining reviewers did not run"}.
+${INCOMPLETE_OUTCOME_MARKER}`;
 }
 
 /** First line stays exactly CLEAN_REVIEW_BODY so the loop poller's partial match still detects a

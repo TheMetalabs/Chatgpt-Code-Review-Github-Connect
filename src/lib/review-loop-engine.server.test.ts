@@ -10,7 +10,7 @@ import {
   reconstructRounds,
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
-import { continueComment, startComment, stoppedComment } from "./review-loop.ts";
+import { continueComment, INCOMPLETE_OUTCOME_MARKER, startComment, stoppedComment } from "./review-loop.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 
@@ -422,6 +422,26 @@ describe("durable loop events: authorship is enforced when reading history", () 
     // the stale clean review (commit "c") does not end the session: the loop waits on the live head
     assert.equal((await readLoopSession(g as never, "t", "o", "r", 1, { pr: { sha: live } })).active, true);
     assert.equal((await readLoopSession(g as never, "t", "o", "r", 1, { pr: { sha: "c" } })).active, false, "clean on the live head");
+  });
+
+  it("an incomplete review is read from its fixed trailing marker, the App's own only: it ends the session owing a handoff for its head", async () => {
+    const body = `<!-- ashlar-review-summary -->\nChatGPT/Grok did not finish a full review.\n\nNot a clean pass — remaining reviewers did not run.\n${INCOMPLETE_OUTCOME_MARKER}`;
+    const g = gh(
+      [recorded("apply", "alice", "2026-01-01T00:00:00Z"), { userLogin: bot, body: "<!-- ashlar-loop-escalate reason=loop-error round=1 pr=1 head=h -->", createdAt: "2025-12-01T00:00:00Z" }],
+      [],
+      [
+        { userLogin: bot, body, submittedAt: "2026-01-02T00:00:00Z" },
+        { userLogin: "mallory", body, submittedAt: "2026-01-02T01:00:00Z" }, // human copy: NOT incomplete
+        { userLogin: bot, body: `${INCOMPLETE_OUTCOME_MARKER}\nquoted, not trailing`, submittedAt: "2026-01-02T02:00:00Z" }, // prose
+      ],
+    );
+    const events = await readLoopEvents(g as never, "t", "o", "r", 1);
+    assert.deepEqual(events.filter((e) => e.kind === "incomplete").map((e) => `${e.at}:${e.head}`), ["2026-01-02T00:00:00Z:c"]);
+    assert.deepEqual(events.filter((e) => e.kind === "escalate").map((e) => e.head), ["h"], "a handoff carries its head");
+    const session = await readLoopSession(g as never, "t", "o", "r", 1, { pr: { sha: "c" } });
+    assert.equal(session.active, false);
+    assert.equal(session.endedBy, "incomplete", "never converged");
+    assert.deepEqual(session.owedHandoff, { head: "c", startIso: "2026-01-01T00:00:00Z", startSeq: undefined });
   });
 
   it("readLoopSession folds history + injected events (a stop the list API has not caught up with)", async () => {

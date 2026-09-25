@@ -366,6 +366,8 @@ for(const [local,e] of Object.entries(SKIPPED_PEER)){
     assert.ok(job().localVerifyStartedAt,'a verification round ran');
     assert.equal(body.split('\n')[0],SUMMARY);
     assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],e.marker,'trailing marker');
+    // incomplete: its own fixed marker, and no ashlar-findings prefix an external poller could read as total=0
+    if(!e.marker){assert.equal(body.split('\n').at(-1),'<!-- ashlar-outcome incomplete -->','the INCOMPLETE marker');assert.equal(body.includes('<!-- ashlar-findings'),false);}
     assert.equal(converged(body),false,'never CONVERGED with a reviewer skipped');
     assert.match(body,/- Skipped grok/);
     assert.match(body,e.note,'the verification note');

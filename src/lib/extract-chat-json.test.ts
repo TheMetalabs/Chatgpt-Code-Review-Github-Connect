@@ -84,6 +84,28 @@ describe("extractChatJsonParts: what canonicalizing a reply to its review JSON d
     assert.deepEqual(fence("~~~"), { json: PAYLOAD, residual: "" });
   });
 
+  it("nothing when the object's fence runs to the end of the reply (CommonMark closes it there)", () => {
+    for (const open of ["```json", "````", "~~~"]) {
+      for (const end of ["", "\n", "\r\n", "\n  \n"]) {
+        assert.deepEqual(extractChatJsonParts(`${open}\n${PAYLOAD}${end}`), { json: PAYLOAD, residual: "" }, JSON.stringify(open + end));
+      }
+    }
+  });
+
+  it("nothing when a bare fence line is the only text after the object (it opens an empty block)", () => {
+    assert.deepEqual(extractChatJsonParts(`${PAYLOAD}\n\`\`\``), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(extractChatJsonParts(`${PAYLOAD}\n~~~~\n`), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(extractChatJsonParts(`\`\`\`json\n${PAYLOAD}\n\`\`\`\n\`\`\``), { json: PAYLOAD, residual: "" }, "after a complete pair");
+    // a marker with an info string names content, and prose beside a stray marker is still prose
+    assert.equal(extractChatJsonParts(`${PAYLOAD}\n\`\`\`json`)?.residual, "```json");
+    assert.match(extractChatJsonParts(`P1 a.ts:1 BEFORE\n${PAYLOAD}\n\`\`\``)?.residual ?? "", /^P1 a\.ts:1 BEFORE$/);
+  });
+
+  it("an unclosed fence with text after the object is not the object's block: that text is residual", () => {
+    assert.match(extractChatJsonParts(`\`\`\`json\n${PAYLOAD}\nP1 a.ts:1 AFTER`)?.residual ?? "", /P1 a\.ts:1 AFTER/);
+    assert.match(extractChatJsonParts(`\`\`\`json\n${PAYLOAD}\n~~~`)?.residual ?? "", /^```json\s+~~~$/);
+  });
+
   it("a fence that is not a matching pair around the object is kept, as is every fence in the prose", () => {
     // three backticks do not close a four-backtick fence (CommonMark), so neither run is a fence pair
     assert.match(extractChatJsonParts(`\`\`\`\`json\n${PAYLOAD}\n\`\`\``)?.residual ?? "", /^````json\s+```$/);

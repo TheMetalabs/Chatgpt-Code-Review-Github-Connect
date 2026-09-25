@@ -54,7 +54,9 @@ Rules the table encodes:
   itself be set aside: when canonicalizing a completed reply to its review JSON discards substantive
   text around the object (`extractChatJsonParts`; whitespace and the one complete code fence wrapping the
   object do not count — any run of three or more backticks or tildes, closed by a run of the same
-  character at least as long — while any other fence marker is kept as text; cell `clean × fencedClean`), the
+  character at least as long, or left open with nothing after the object (CommonMark closes it at the
+  end of the reply), and a bare fence line that is the only text after the object (an empty block) —
+  while any other fence marker is kept as text; cells `clean × fencedClean`, `clean × unclosedFence`), the
   reply is kept verbatim (`residualReplies`, one-shot and multi-turn alike) and the object is not a
   verdict — prose before a clean object can be the finding. A reply that lost a finding for its shape
   or left one unread, or had a reply or text set aside, is gated as evidence instead (`verdictEvidence`

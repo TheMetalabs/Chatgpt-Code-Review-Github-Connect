@@ -56,6 +56,8 @@ async function run(kind, start, events) {
   const realSend = b.chrome.tabs.sendMessage;
   b.chrome.tabs.sendMessage = (id, msg, cb) => {
     const t = b.tabs.get(id);
+    // A frozen page runs no handler: only the read-only inventory probe (bounded) may be sent to it.
+    if (t?.frozen && msg.type !== 'ashlar-tab-status') w.frozenMessaged = true;
     if (t && (w.mode === 'hang' || t.frozen)) { b.messages.push({id, ...msg}); return; } // accepted, never answered
     if (t && w.mode === 'noReceiver') { b.messages.push({id, ...msg}); b.chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'}; cb(); b.chrome.runtime.lastError = null; return; }
     return realSend(id, msg, cb);
@@ -67,6 +69,7 @@ async function run(kind, start, events) {
     const userBefore = w.user || w.reused;
     const closedBefore = b.closedTabs.length;
     if (!await settles(() => b.tick())) return 'tick_never_settles';
+    if (w.frozenMessaged) return 'messaged_frozen_tab';
     if (b.closedTabs.length > closedBefore && userBefore) return 'closed_user_tab';
     return '';
   };
@@ -121,7 +124,8 @@ async function shrink(kind, start, events, violation) {
 // The shrunk traces the walk found on #82 (fc3fae26): each held the job's lane forever.
 for (const kind of ['review', 'fix']) {
   for (const start of START) {
-    for (const trace of [['hang', 'tick'], ['hang', 'missing'], ['hang', 'cancel', 'tick'], ['hang', 'tick', 'pageOk', 'tick']]) {
+    for (const trace of [['hang', 'tick'], ['hang', 'missing'], ['hang', 'cancel', 'tick'], ['hang', 'tick', 'pageOk', 'tick'],
+      ['freeze', 'tick'], ['freeze', 'tick', 'thaw', 'tick'], ['freeze', 'missing']]) {
       test(`${kind} ${start}: [${trace.join(', ')}] settles every tick and ends the leg`, async () => {
         assert.equal(await run(kind, start, trace), '');
       });
@@ -181,3 +185,29 @@ test('an inventory probe of a page that never answers ends, so the tab is probed
   await b.context.refreshTabInventory();
   assert.equal(b.messages.filter(m => m.type === 'ashlar-tab-status').length, 2, 'the unanswered probe released its lane');
 });
+
+// The poll never asks a page that cannot run a handler: a frozen tab until it thaws, a discarded one
+// until it loads again (the tab's own state, read without messaging it).
+for (const kind of ['review', 'fix']) {
+  for (const [what, asleep, awake] of [['frozen', {frozen: true}, {frozen: false}], ['discarded', {discarded: true}, {discarded: false}]]) {
+    for (const started of [true, false]) {
+      test(`${kind}: the poll of ${started ? 'a generating' : 'an undispatched'} leg skips its ${what} tab, and asks it once it is back`, async () => {
+        const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
+        const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
+          providers: ['chatgpt'], states: {chatgpt: {tabId: 10, started, runId: 'run-A'}}};
+        const tab = {id: 10, url: URL_TAB, status: 'complete', ...asleep};
+        const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[jobId]: job}}),
+          session: storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}}),
+          tabs: new Map([[10, tab]]), api: async (_path, body) => (body?.action === 'ping' ? {ok: true, active: true, accepted: true, status: 'awaiting_chat'} : {ok: true, job: null})});
+        b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+        const asked = () => b.messages.filter(m => m.id === 10 && ['ashlar-run', 'ashlar-harvest'].includes(m.type)).length;
+        await b.tick();
+        assert.equal(asked(), 0, `a ${what} tab is not messaged`);
+        assert.equal(b.local.state.pendingReviewJobs[jobId].states.chatgpt.started, started, 'nothing was dispatched');
+        Object.assign(tab, awake);
+        await b.tick();
+        assert.equal(asked(), 1, 'asked once it is back');
+      });
+    }
+  }
+}

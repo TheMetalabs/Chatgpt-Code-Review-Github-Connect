@@ -1256,6 +1256,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await saveJobs(jobs);
     return;
   }
+  // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws, and a
+  // discarded one holds no page: a message would only wait out askPage. Polled again next tick.
+  if (tab.frozen === true || tab.discarded === true) return;
   const run = { ...tabMessage(job, provider, "ashlar-run"),
     prompt: job.prompts?.[provider] || job.prompt, reasoning: job.reasoning?.[provider], adoptLegacy: state.adoptLegacy };
   let result;

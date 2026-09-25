@@ -5,6 +5,9 @@ import {ReviewHistoryStore} from '../../src/lib/review-history.server.ts';
 import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
+import http from 'node:http';
+import {requestLocalChat} from '../../src/lib/local-chat-request.server.ts';
+import {overlayEnv, sanitizeBotSettings, botSettingsToEnv} from '../../src/lib/settings.server.ts';
 const value={findings:[],investigated_safe:['a.ts: checked "condition"']};
 const raw=JSON.stringify(value),original=raw.replace(/\\"/g,'"');
 const hash=text=>createHash('sha256').update(text).digest('hex');
@@ -111,4 +114,35 @@ test('a stray-quote slip is repaired without a Local call and its commit is acce
  assert.equal(f.service.status('A',started.id).status,'ready');assert.equal(f.calls.length,0,'the Local model was called');
  assert.equal((await f.service.commit('A',started.id)).status,'accepted');
  assert.deepEqual(JSON.parse(f.accepted[0].raw).findings.map(finding=>finding.severity),['P1','P1','P2']);
+});
+
+// #87 failure A2(i): with no max_tokens the server's 8192-token default (thinking included) ended
+// every repair before it could re-emit the original, and the record said only "failed".
+test('the Local request carries a token budget for re-emitting the original, and thinking stays on by default',async t=>{
+ const f=fixture(t);f.service.start(input);await flush();
+ assert.equal(f.calls[0][2].max_tokens,Math.ceil(original.length/2)+4096);
+ assert.equal('chat_template_kwargs' in f.calls[0][2],false);
+});
+test('ASHLAR_LOCAL_REPAIR_NO_THINKING turns thinking off for the Local repair request only when set',async t=>{
+ assert.equal(DEFAULT_SETTINGS.localRepairNoThinking,false);
+ const saved=process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;t.after(()=>{if(saved===undefined)delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;else process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING=saved;});
+ process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING='true';
+ const flagged=sanitizeBotSettings(overlayEnv({}));assert.equal(flagged.localRepairNoThinking,true);
+ assert.equal(botSettingsToEnv(flagged).ASHLAR_LOCAL_REPAIR_NO_THINKING,'true');
+ delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;assert.equal(sanitizeBotSettings(overlayEnv({})).localRepairNoThinking,false);
+ const f=fixture(t);f.settings.localRepairNoThinking=true;f.service.start(input);await flush();
+ assert.deepEqual(f.calls[0][2].chat_template_kwargs,{enable_thinking:false});
+ assert.equal(f.calls[0][2].max_tokens,Math.ceil(original.length/2)+4096);
+});
+test('a Local reply cut off at the token limit is recorded as finish_reason_length',async t=>{
+ const server=http.createServer((req,res)=>{req.resume();req.on('end',()=>{
+  res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'needs_attention');assert.deepEqual(done.errors,['finish_reason_length']);assert.equal(f.calls.length,1);
 });

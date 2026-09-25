@@ -15,7 +15,20 @@ type ChatRequest = {
   top_k?: number;
   presence_penalty?: number;
   max_tokens?: number;
+  /** Non-OpenAI extension (vLLM/omlx chat templates, e.g. {enable_thinking:false}); callers send it
+   * only when the operator opted in, since a strict server may reject it. */
+  chat_template_kwargs?: Record<string, unknown>;
 };
+
+/** The server finished the reply early; `finishReason` says why ("length": the token budget ran out). */
+export class LocalChatCutOff extends Error {
+  readonly finishReason: string;
+  constructor(finishReason: string) {
+    super(`local LLM response ended with ${finishReason}`);
+    this.name = "LocalChatCutOff";
+    this.finishReason = finishReason;
+  }
+}
 
 /** What the transport observed on an in-flight request.
  * `keepalive`: the server answered (response headers, or an empty heartbeat chunk) but has produced
@@ -242,7 +255,7 @@ export async function requestLocalChat(
     { choices?: { finish_reason?: string; message?: { content?: unknown } }[] };
   const choice = parsed?.choices?.[0];
   if (choice?.finish_reason === "length" || choice?.finish_reason === "content_filter") {
-    throw new Error(`local LLM response ended with ${choice.finish_reason}`);
+    throw new LocalChatCutOff(choice.finish_reason);
   }
   if (typeof choice?.message?.content !== "string") throw new Error("local LLM returned no completed message");
   return choice.message.content;

@@ -73,6 +73,8 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (local !== undefined) o.reviewLocal = local;
   const repair = envFlag("ASHLAR_LOCAL_JSON_REPAIR_ENABLED");
   if (repair !== undefined) o.localJsonRepairEnabled = repair;
+  const repairNoThinking = envFlag("ASHLAR_LOCAL_REPAIR_NO_THINKING");
+  if (repairNoThinking !== undefined) o.localRepairNoThinking = repairNoThinking;
   const baseUrl = envStr("ASHLAR_LOCAL_LLM_BASE_URL");
   if (baseUrl) o.localLlmBaseUrl = baseUrl;
   const model = envStr("ASHLAR_LOCAL_LLM_MODEL");
@@ -136,6 +138,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_REVIEW_GROK: String(s.reviewGrok),
     ASHLAR_REVIEW_LOCAL: String(s.reviewLocal),
     ASHLAR_LOCAL_JSON_REPAIR_ENABLED: String(s.localJsonRepairEnabled),
+    ASHLAR_LOCAL_REPAIR_NO_THINKING: String(s.localRepairNoThinking),
     ASHLAR_LOCAL_LLM_BASE_URL: s.localLlmBaseUrl,
     ASHLAR_LOCAL_LLM_MODEL: s.localLlmModel,
     ASHLAR_LOCAL_LLM_API_KEY: s.localLlmApiKey,
@@ -220,6 +223,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     reviewLocal: bool(p.reviewLocal, DEFAULT_SETTINGS.reviewLocal),
     fixAgent: normalizeFixAgent(p.fixAgent),
     localJsonRepairEnabled: bool(p.localJsonRepairEnabled, DEFAULT_SETTINGS.localJsonRepairEnabled),
+    localRepairNoThinking: bool(p.localRepairNoThinking, DEFAULT_SETTINGS.localRepairNoThinking),
     localLlmBaseUrl: str(p.localLlmBaseUrl, DEFAULT_SETTINGS.localLlmBaseUrl).trim(),
     localLlmApiKey: str(p.localLlmApiKey, DEFAULT_SETTINGS.localLlmApiKey),
     localLlmModel: str(p.localLlmModel, DEFAULT_SETTINGS.localLlmModel).trim(),

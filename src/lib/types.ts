@@ -234,6 +234,9 @@ export interface BotSettings {
   fixAgent: FixAgentSettings;
   /** Formatting-only recovery; independent of Local reviewer participation. */
   localJsonRepairEnabled: boolean;
+  /** Sends chat_template_kwargs {enable_thinking:false} with a repair request. Off by default:
+   * a server that strictly follows the OpenAI schema may reject the unknown field. */
+  localRepairNoThinking: boolean;
   chatgptReasoning: ChatgptReasoning;
   grokReasoning: GrokReasoning;
   localLlmBaseUrl: string;
@@ -321,6 +324,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   reviewLocal: false,
   fixAgent: { provider: null, delivery: "script-apply", mode: "suggest", parallelPrs: 3 },
   localJsonRepairEnabled: true,
+  localRepairNoThinking: false,
   chatgptReasoning: "pro",
   grokReasoning: "heavy",
   localLlmBaseUrl: "http://127.0.0.1:11434/v1",

@@ -1098,6 +1098,26 @@ test('fresh run: the user moving the tab between the fill and the click: Send is
  assert.equal(await tab.clicks(),0,'never clicked on the user\'s conversation');
  assert.deepEqual(await tab.runner(),{running:false,code:'taken_over'});
 });
+// Ashlar 4103758194 (the legacy branch): a run that ended taken_over before its Send wrote no
+// journal, so its release verdict fell to the journal-less branch, which recorded the user's own
+// turn (a temporary chat keeps its URL on a send) as the page's finished state and said owned.
+// The take-over is positive evidence and latches: the tab is kept, also once a draft is cleared.
+for(const [what,act,undo,cause] of [
+ ['sends their own message',p=>p.evaluate(html=>document.getElementById('thread').insertAdjacentHTML('beforeend',html),userTurn('user-X','my own question')),null,'user_turn'],
+ ['types a draft, then clears it',p=>p.evaluate(()=>{const el=document.getElementById('prompt-textarea');el.textContent='my unsent question';el.style.display='';}),p=>p.evaluate(()=>{document.getElementById('prompt-textarea').textContent='';}),'draft'],
+])test(`fresh run: the user ${what} in the new chat before Ashlar types: the release verdict keeps the tab (${cause})`,async t=>{
+ const tab=await chatTab(t,{bound:false});
+ await tab.page.evaluate(()=>{document.getElementById('prompt-textarea').style.display='none';});
+ assert.equal((await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL})).code,'busy');
+ await tab.page.clock.runFor(1000);
+ await act(tab.page);
+ await tab.page.clock.runFor(3000);
+ assert.deepEqual(await tab.runner(),{running:false,code:'taken_over'});
+ if(undo)await undo(tab.page);
+ const out=await tab.send('ashlar-can-close',{allocationUrl:TEMP_URL,secured:true});
+ assert.deepEqual({canClose:out.canClose,ownership:out.ownership,cause:out.cause},{canClose:false,ownership:'takenOver',cause});
+ assert.equal(await tab.clicks(),0);
+});
 // Ashlar 4103758186: a file the user stages while the accepted run waits for an enabled Send is
 // theirs: it stays staged, and Send is never clicked (it would go out with Ashlar's prompt).
 test('fresh run: the user staging a file between the fill and the click: Send is never clicked, the file stays',async t=>{

@@ -1017,7 +1017,7 @@ function throwIfStopped() {
   const left = state?.freshPage ? freshPageLeft(state.freshPage, state) : "";
   if (!left) return;
   const error = new Error(`${left === "user_turn" ? "a user message appeared in the tab" : left === "draft" ? "a user draft appeared in the tab" : "the tab left its new chat"} before the prompt was sent; nothing was sent`);
-  error.code = "taken_over"; throw error;
+  error.code = "taken_over"; error.takeoverCause = left; throw error;
 }
 
 function releaseManagedSlot(state) {
@@ -1265,6 +1265,10 @@ function installReviewRunner(name, run) {
       .catch(e => {
         // A new run whose tab stopped being its fresh page before the send (throwIfStopped).
         const takenOver = e?.code === "taken_over";
+        // Positive evidence, permanent (tabOwnership): a run that ended before its Send wrote no
+        // journal, so the release verdict must not re-derive ownership from this page's finished
+        // state, which already holds the user's turn or draft (Ashlar 4103758194).
+        if (takenOver && !state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = e.takeoverCause || "navigated"; }
         const leaseExpired = e?.code === "stalled"; // expireGeneratingLease (#87)
         recordReviewStep(e?.code === "quota" ? "quota" : e?.code === "cancelled" ? "cancelled" : takenOver ? "context_changed" :
           leaseExpired ? "lease_expired_generating" : "error");

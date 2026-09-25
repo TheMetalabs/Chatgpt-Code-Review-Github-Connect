@@ -284,10 +284,6 @@ function stepState(deps: LoopRuntimeDeps | undefined): StepState {
   return state;
 }
 
-function stepSlots(deps: LoopRuntimeDeps | undefined): Map<string, StepSlot> {
-  return stepState(deps).slots;
-}
-
 function holdStarts(state: StepState, pr: string, starts: readonly StartRequest[]): void {
   if (starts.length === 0) return;
   let held = state.pendingStarts.get(pr);

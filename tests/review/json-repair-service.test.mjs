@@ -119,9 +119,17 @@ test('a stray-quote slip is repaired without a Local call and its commit is acce
 // #87 failure A2(i): with no max_tokens the server's 8192-token default (thinking included) ended
 // every repair before it could re-emit the original, and the record said only "failed".
 test('the Local request carries a token budget for re-emitting the original, and thinking stays on by default',async t=>{
- const f=fixture(t);f.service.start(input);await flush();
- assert.equal(f.calls[0][2].max_tokens,Math.ceil(original.length/2)+4096);
+ const long=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "condition"','b.ts: '+'x'.repeat(20000)]}).replace(/\\"/g,'"');
+ const f=fixture(t);f.service.start({...input,original:long,sourceHash:hash(long)});await flush();
+ assert.equal(f.calls[0][2].max_tokens,Math.ceil(long.length/2)+4096);
  assert.equal('chat_template_kwargs' in f.calls[0][2],false);
+});
+// Before #87 no budget was sent and omlx used its 8192-token default; a short original (the common
+// zero-to-two-finding review) must never get less than that, since thinking shares the budget.
+test('a short original still gets at least the 8192 tokens the server default used to give it',async t=>{
+ assert.ok(Math.ceil(original.length/2)+4096<8192);
+ const f=fixture(t);f.service.start(input);await flush();
+ assert.equal(f.calls[0][2].max_tokens,8192);
 });
 test('ASHLAR_LOCAL_REPAIR_NO_THINKING turns thinking off for the Local repair request only when set',async t=>{
  assert.equal(DEFAULT_SETTINGS.localRepairNoThinking,false);
@@ -132,7 +140,7 @@ test('ASHLAR_LOCAL_REPAIR_NO_THINKING turns thinking off for the Local repair re
  delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;assert.equal(sanitizeBotSettings(overlayEnv({})).localRepairNoThinking,false);
  const f=fixture(t);f.settings.localRepairNoThinking=true;f.service.start(input);await flush();
  assert.deepEqual(f.calls[0][2].chat_template_kwargs,{enable_thinking:false});
- assert.equal(f.calls[0][2].max_tokens,Math.ceil(original.length/2)+4096);
+ assert.equal(f.calls[0][2].max_tokens,8192);
 });
 test('a Local reply cut off at the token limit is recorded as finish_reason_length',async t=>{
  const server=http.createServer((req,res)=>{req.resume();req.on('end',()=>{

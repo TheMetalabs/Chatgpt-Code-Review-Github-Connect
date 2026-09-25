@@ -18,6 +18,8 @@ type Dependencies = {
 export function localJsonRepairAvailable(settings: BotSettings): boolean {
   return settings.localJsonRepairEnabled !== false && Boolean(settings.localLlmBaseUrl.trim() && settings.localLlmModel.trim());
 }
+/** omlx's completion default, which every repair got before it sent a budget (#87). */
+const SERVER_DEFAULT_BUDGET=8192;
 export const repairSourceHash=(text:string)=>createHash("sha256").update(text).digest("hex");
 const services = new Set<JsonRepairService>();
 /** Explicit operator cancellation only; never called because of elapsed time. */
@@ -77,8 +79,8 @@ export class JsonRepairService {
       const candidate=escapeStrayQuotes(record.original) ?? await (this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
         model:record.model,temperature:0,
         // The candidate re-emits the whole original; without a budget omlx stops at its 8192-token
-        // default, which includes the model's thinking (#87).
-        max_tokens:Math.ceil(record.original.length/2)+4096,
+        // default, which includes the model's thinking (#87). A short original never gets less than it.
+        max_tokens:Math.max(SERVER_DEFAULT_BUDGET,Math.ceil(record.original.length/2)+4096),
         ...(settings.localRepairNoThinking ? {chat_template_kwargs:{enable_thinking:false}} : {}),
         messages:[{
           role:"system",content:[

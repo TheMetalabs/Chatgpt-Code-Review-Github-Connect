@@ -888,7 +888,7 @@ export async function runPostReviewLoop(
       if ((await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha) return "head";
       const now = await sessionOf(gh, token, ref, head, botLogin);
       if (!now.active) return endedWhy(gh, ref, now);
-      // another start — also one in the same second as this session's (only its record differs)
+      // a newer session (a start in this one's own second re-issues it: see SessionRef)
       if (!sameSession(sessionRef(now), since)) return "newer";
       // apply acts on the starter's authority: a re-issued start by someone else, or a downgrade
       // to suggest, takes the round over

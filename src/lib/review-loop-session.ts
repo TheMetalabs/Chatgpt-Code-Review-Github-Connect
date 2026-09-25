@@ -44,7 +44,8 @@ export interface LoopEvent {
   actor?: string; // start / stop author
   /** converged: the reviewed commit; continue / push: the head the loop moved to. */
   head?: string;
-  /** The issue comment's id (monotonic): a start record's id identifies its session exactly. */
+  /** The issue comment's id (monotonic): a start record's id scopes its session's own control
+   * rows exactly (it does not name the session: see SessionRef). */
   seq?: number;
 }
 
@@ -55,10 +56,6 @@ export interface LoopSession {
   /** The anchor start record's comment id: the session's own control comments come after it
    * (id > startSeq) — exact where a second-resolution timestamp ties with the last session. */
   startSeq?: number;
-  /** The anchor start's requester and mode: with startIso, its marker — what names the session
-   * while its record has no id yet (see SessionRef). A re-issued start never changes them. */
-  startBy?: string;
-  startMode?: ReviewLoopMode;
   /** The latest start's mode within the active session. */
   mode?: ReviewLoopMode;
   /** The latest start's author — the subject of the apply write-permission gate. */
@@ -94,15 +91,7 @@ export function deriveLoopSession(events: readonly LoopEvent[], opts: { liveHead
       if (!s.active) awaited = undefined;
       s = s.active
         ? { ...s, mode: e.mode ?? s.mode, starter: e.actor ?? s.starter }
-        : {
-            active: true,
-            startIso: e.at,
-            ...(e.seq !== undefined ? { startSeq: e.seq } : {}),
-            startBy: e.actor,
-            startMode: e.mode ?? "suggest",
-            mode: e.mode ?? "suggest",
-            starter: e.actor,
-          };
+        : { active: true, startIso: e.at, ...(e.seq !== undefined ? { startSeq: e.seq } : {}), mode: e.mode ?? "suggest", starter: e.actor };
       resumable = undefined;
     } else if (e.kind === "continue" || e.kind === "push") {
       if (s.active) awaited = e.head ?? awaited;
@@ -127,31 +116,25 @@ export function deriveLoopSession(events: readonly LoopEvent[], opts: { liveHead
 }
 
 /**
- * A session's IDENTITY: its anchor start. The start record's comment id names it exactly — two
- * starts in one second differ only there. A start whose record is not listed yet (its POST outcome
- * unknown) has no id; its marker — requester, directive instant, mode — names the same start from
- * the first moment, so learning the id later never makes it another session.
+ * A session as its own writes name it: the anchor INSTANT is its identity — at one instant ORDER
+ * places every start together (terminal records before, human stops after), so the first opens
+ * the session and every later start of that second re-issues it: no two sessions are ever anchored
+ * in one second. The anchor start RECORD is not: which of a second's starts anchors depends on
+ * what a read lists (the first listed record, else the first stand-in), so it changes as the list
+ * catches up or relapses. Its comment id (seq) only scopes the session's own control rows
+ * (review-loop-control controlInSession).
  */
 export interface SessionRef {
   at?: string;
   seq?: number;
-  by?: string;
-  mode?: ReviewLoopMode;
 }
 
-export function sessionRef(s: Pick<LoopSession, "startIso" | "startSeq" | "startBy" | "startMode">): SessionRef {
-  return { at: s.startIso, seq: s.startSeq, by: s.startBy, mode: s.startMode };
+export function sessionRef(s: Pick<LoopSession, "startIso" | "startSeq">): SessionRef {
+  return { at: s.startIso, seq: s.startSeq };
 }
 
-/** The anchor's marker as one comparable string (the instant, never its spelling). */
-export function startMarkerOf(r: SessionRef | undefined): string {
-  const t = isoMs(r?.at);
-  return `${r?.by?.toLowerCase() ?? ""}:${Number.isNaN(t) ? "" : t}:${r?.mode ?? ""}`;
-}
-
-/** THE session comparison: by start-record id when both sides know it, else by the anchor's
- * marker (a side whose record is not listed yet is the same session as the listed one). */
+/** THE session comparison: the same anchor instant (never its spelling, nor its start record). */
 export function sameSession(a: SessionRef | undefined, b: SessionRef | undefined): boolean {
-  if (a?.seq !== undefined && b?.seq !== undefined) return a.seq === b.seq;
-  return startMarkerOf(a) === startMarkerOf(b);
+  const [x, y] = [isoMs(a?.at), isoMs(b?.at)];
+  return x === y || (Number.isNaN(x) && Number.isNaN(y));
 }

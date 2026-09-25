@@ -494,7 +494,7 @@ describe("session identity: one continuation and one handoff per head per SESSIO
         const label = `${kind} | ${plan}`;
         const f = world([plan]);
         f.w.hidden = true; // the write's row is never listed here: only the journal answers
-        const idless: SessionRef = { at: START, by: "alice", mode: "suggest" };
+        const idless: SessionRef = { at: START };
         const listed: SessionRef = { ...idless, seq: recordStart(f, "alice", "suggest") };
         const expected = plan === "ok" ? "posted" : "unknown";
         const again = plan === "ok" ? "exists" : "unknown";
@@ -505,7 +505,7 @@ describe("session identity: one continuation and one handoff per head per SESSIO
         };
         assert.equal(await emit(idless), expected, `${label}: while the start has no id`);
         assert.equal(await emit(listed), again, `${label}: once the start is listed`);
-        assert.equal(await emit(idless), again, `${label}: named by its marker again`);
+        assert.equal(await emit(idless), again, `${label}: named without its id again`);
         assert.equal(f.posts(), 1, `${label}: one POST`);
         const key = controlKey(kind === "continue" ? continuation(listed).key : handoff(1, listed).key);
         assert.equal(key, controlKey(kind === "continue" ? continuation(idless).key : handoff(1, idless).key), `${label}: one key`);
@@ -617,6 +617,7 @@ describe("session identity: one continuation and one handoff per head per SESSIO
       push: () => continueLoopOnPush("t", { owner: "o", repo: "r", pr: 1, headSha: PUSHED, actor: "alice" }, settings, deps, env),
       session: () => readLoopSession(gh, "t", "o", "r", 1, { botLogin: BOT }),
       continuations: () => posts.filter((b) => canonicalContinuation(b, bot) !== null).length,
+      suggestions: () => posts.filter((b) => b.startsWith("### Ashlar fix agent — suggestion")).length,
     };
   }
 
@@ -686,7 +687,7 @@ describe("session identity: one continuation and one handoff per head per SESSIO
     }
   });
 
-  it("a fix round whose session is replaced by a start in the same second goes quiet: no report, and no continuation for the old session", async () => {
+  it("a start in the same second as a fix round's session re-issues it: a suggest round posts its suggestion, an applied round its continuation", async () => {
     for (const mode of ["suggest", "apply"] as const) {
       // alice's start record is lost (her session has no id); bob's start in the same second lands
       // while the round runs — its record now anchors the session (the fold lists it first)
@@ -697,13 +698,48 @@ describe("session identity: one continuation and one handoff per head per SESSIO
       if (mode === "suggest") f.view.onFix = bob;
       else f.view.onCommit = bob; // after the last checkpoint before the commit
       const r = await f.step(mode);
-      assert.equal(r.ran, mode === "apply", `${mode}: ${JSON.stringify(r)}`);
-      if (mode === "suggest") assert.match(r.ran ? "" : r.reason, /newer loop request/, mode);
-      else assert.equal(r.ran && r.step === "fix" && r.continued, false, `${mode}: ${JSON.stringify(r)}`);
       const s = await f.session();
-      assert.deepEqual([s.active, s.startBy], [true, "bob"], mode);
-      assert.equal(f.posts.filter((b) => b.startsWith("### Ashlar fix agent — suggestion")).length, 0, `${mode}: no suggestion for alice's session`);
-      assert.equal(f.continuations(), 0, `${mode}: no continuation keyed to alice's session`);
+      const bobSeq = f.rows.find((row) => parseStartMarker(row.body, bot)?.by === "bob")?.id;
+      assert.deepEqual([s.active, isoMs(s.startIso), s.startSeq], [true, isoMs(START), bobSeq], `${mode}: bob's record anchors the same session`);
+      if (mode === "suggest") {
+        assert.equal(r.ran, true, `${mode}: ${JSON.stringify(r)}`);
+        assert.equal(f.suggestions(), 1, `${mode}: the round's suggestion`);
+      } else {
+        assert.equal(r.ran && r.step === "fix" && r.continued, true, `${mode}: ${JSON.stringify(r)}`);
+        assert.equal(f.continuations(), 1, `${mode}: the round's continuation`);
+      }
+    }
+  });
+
+  it("a fix round whose anchor moves between two same-second starts recorded before it (the list catches up to one, or relapses behind it) is not taken over", async () => {
+    for (const mode of ["suggest", "apply"] as const) {
+      for (const list of ["catches-up", "relapses"] as const) {
+        const label = `${mode} | the list ${list}`;
+        // alice's start record is lost; bob's, in the same second, is stored before the round
+        const f = pushWorld((body) => (parseStartMarker(body, bot)?.by === "alice" ? "lost" : "ok"));
+        f.view.head = HEAD;
+        if (list === "catches-up") f.view.shown = () => false; // behind every row
+        await f.start("alice", mode);
+        await f.start("bob", mode);
+        const before = await f.session();
+        // nothing new is started: only what the list shows changes, while the fix request runs
+        // (suggest: the report checkpoint reads it) or once the commit is written (apply: the
+        // post-commit check reads it; the starter check before the commit is another matter)
+        const flip = async () => void (f.view.shown = list === "catches-up" ? () => true : () => false);
+        if (mode === "suggest") f.view.onFix = flip;
+        else f.view.onCommit = flip;
+        const r = await f.step(mode);
+        const after = await f.session();
+        assert.notEqual(after.startSeq, before.startSeq, `${label}: the anchor moved to the other start`);
+        assert.deepEqual([after.active, isoMs(after.startIso)], [true, isoMs(before.startIso)], `${label}: the same session`);
+        if (mode === "suggest") {
+          assert.equal(r.ran, true, `${label}: ${JSON.stringify(r)}`);
+          assert.equal(f.suggestions(), 1, `${label}: the round's suggestion`);
+        } else {
+          assert.equal(r.ran && r.step === "fix" && r.continued, true, `${label}: ${JSON.stringify(r)}`);
+          assert.equal(f.continuations(), 1, `${label}: the round's continuation`);
+        }
+      }
     }
   });
 });

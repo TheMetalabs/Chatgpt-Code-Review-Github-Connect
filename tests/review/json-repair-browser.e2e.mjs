@@ -13,7 +13,11 @@ async function pageFixture(t,{jobId='A',text=original,streaming=false,manual=fal
  const context=await browser.newContext();t.after(()=>context.close());await context.route('**/*',r=>r.abort());const page=await context.newPage();
  await page.setContent('<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">owned review prompt</div></section><section id="answer" data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"></div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div><button data-testid="send-button" aria-label="Send prompt" disabled>Send</button></form>');
  await page.clock.install();await page.evaluate(({jobId,text,streaming})=>{
-  const saved=new Map([['ashlar:job',jobId],['ashlar:run','run-A'],[`ashlar:submission:${jobId}:run-A`,JSON.stringify({phase:'sent',expected:'owned review prompt',baseline:0,submittedUsers:1,messageId:'user-A'})]]);
+  // The review was sent on the conversation page it shows (logically /c/fixture, see workerFixture), so
+  // its send recorded that conversation (composer.js submissionConfirmed). #85 r1 (Ashlar 4101062732): a
+  // collector pins a conversation only from a provider move it watched in flight, so the fixture
+  // records it at send instead of relying on a pin at collect.
+  const saved=new Map([['ashlar:job',jobId],['ashlar:run','run-A'],[`ashlar:submission:${jobId}:run-A`,JSON.stringify({phase:'sent',expected:'owned review prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})]]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   document.querySelector('.markdown').textContent=text;window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
   if(streaming){const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Stop generating';document.querySelector('form').append(stop);}
@@ -72,7 +76,7 @@ async function workerFixture(t,{enabled=true,text=original,pageOptions={}}={}) {
  const worker=background({local:storage({origin:app.origin,token:'fixture-token',pendingReviewJobs:{[job.jobId]:job}}),tabs:new Map([[10,{id:10,url:'https://chatgpt.com/c/fixture',status:'complete'}]]),api:send});
  worker.context.crypto=webcrypto;worker.context.TextEncoder=TextEncoder;
  // The offline page is about:blank: present its logical provider URL for both the page URL and the
- // conversation the run pinned there.
+ // conversation the run recorded there at send.
  worker.chrome.tabs.sendMessage=(id,msg,cb)=>{worker.messages.push({id,...msg});page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/fixture'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/fixture'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});};
  async function cycle(){await worker.tick();await flush();await page.clock.runFor(1000);}
  return {app,job,page,worker,cycle};

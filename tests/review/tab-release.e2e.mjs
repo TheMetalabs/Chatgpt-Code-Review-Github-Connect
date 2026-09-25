@@ -250,7 +250,8 @@ for(const kind of ['review','fix'])test(`${kind}: a secured temporary chat reloa
  assert.deepEqual({...verdict(out),blank:out.blank},{canClose:true,reason:'complete',blank:true});
  // (a fix is never secured on a conversation page: it is proven only in the temporary chat, #77)
  if(kind==='fix')return;
- const conv=await collected(t,{kind,url:CONV_URL});
+ // (a review sent on a conversation page records it at send: composer.js submissionConfirmed)
+ const conv=await collected(t,{kind,url:CONV_URL,journal:sentJournal({conversation:CONV_URL})});
  conv.tab.served.thread='';await conv.tab.reload();
  assert.deepEqual(verdict(await canClose(conv.tab)),{canClose:false,reason:'pending',cause:'not_rendered'},'nothing rendered on a conversation page proves nothing: asked again');
 });
@@ -276,6 +277,38 @@ test('review: on a new chat that names no conversation yet, a run pins its conve
  await finish(fresh.page);await fresh.page.clock.runFor(1600);
  assert.equal(await pinnedIn(fresh),CONV_URL,'never re-pinned by a later location');
  assert.equal((await fresh.send('ashlar-can-close',{allocationUrl:TEMP_URL})).identity,'changed');
+});
+// Ashlar 4101062732: a review sent on a new chat pins only a provider move its page watched happen
+// while the run was in flight (json.js newChatPin). A collector that first sees the run on another
+// conversation page (the user moved in-page before its first poll, the old DOM still rendered; a
+// resumed or reloaded page) never pins that URL, and an unpinned review is Ashlar's only on its new
+// chat: both exits refuse it and the worker keeps the tab. An unpinned sent turn must be EXACTLY the
+// prompt: the prompt plus the user's own text is an edit.
+for(const generating of [true,false])test(`review: a new-chat review moved in-page to another conversation before its collector's first poll (${generating?'still generating':'answer complete'}, old DOM rendered) never pins it; neither exit returns owned`,async t=>{
+ const tab=await chatTab(t,{thread:userTurn()+answerTurn({done:!generating}),...(generating?{after:stopButton}:{}),journal:sentJournal()});
+ await tab.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);
+ await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(1600);
+ if(generating){await finish(tab.page);await tab.page.clock.runFor(1600);}
+ await tab.page.clock.runFor(2400);
+ assert.equal(await tab.page.evaluate(()=>__ashlarRunnerState.result?.ok),true,'its answer is collected (the harvest is not the release)');
+ assert.equal(await pinnedIn(tab),undefined,'the user\'s conversation is never pinned');
+ for(const type of ['ashlar-can-close','ashlar-fix-cancel']){
+  const out=await tab.send(type,{allocationUrl:TEMP_URL});
+  assert.deepEqual({owned:out.owned,canClose:out.canClose,ownership:out.ownership,identity:out.identity,cause:out.cause},
+   {owned:false,canClose:false,ownership:'unknown',identity:'changed',cause:'navigated'},type);
+ }
+ assert.equal(await tab.released(),'true','the kept tab frees its managed slot');
+});
+test('review: a new-chat review whose sent turn the user edited to the prompt plus their own text before it pinned: never pinned, and neither exit returns owned',async t=>{
+ const tab=await chatTab(t,{thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+ await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(1600);
+ await tab.page.evaluate(text=>{document.querySelector('[data-message-id="user-A"] .whitespace-pre-wrap').textContent=text;},PROMPT+' Also check my own branch.');
+ await finish(tab.page);await tab.page.clock.runFor(2400);
+ assert.equal(await pinnedIn(tab),undefined,'not pinned: the turn is not exactly the prompt');
+ for(const type of ['ashlar-can-close','ashlar-fix-cancel']){
+  const out=await tab.send(type,{allocationUrl:TEMP_URL});
+  assert.deepEqual({owned:out.owned,canClose:out.canClose,ownership:out.ownership,cause:out.cause},{owned:false,canClose:false,ownership:'takenOver',cause:'edited'},type);
+ }
 });
 test('an unbound page never answers for a job: can-close and a cancel without the undispatched claim get job_mismatch',async t=>{
  const tab=await chatTab(t,{bound:false});
@@ -461,6 +494,50 @@ for(const [name,provider,from,to,how] of PROVIDER_MOVES){
   assert.equal(w.state(),undefined,'the job retired');
  });
 }
+
+// Ashlar 4101062732, the worker side: the page's collector never saw the new chat after the send, so
+// the conversation page it answered on is no identity (it may be the user's): the ACKed tab is kept.
+// So is one whose unpinned turn the user edited. Control: a review this page itself sent on the new
+// chat, which the provider moved before the collector's first poll while it was still generating,
+// pins where the provider put it and closes.
+test('worker, review: a new-chat review whose tab moved to another conversation before its collector saw the new chat is preserved, never closed',async t=>{
+ const tab=await chatTab(t,{thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+ await tab.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);
+ const w=wire(tab);
+ await w.tick();await tab.page.clock.runFor(1600);
+ await finish(tab.page);await tab.page.clock.runFor(2400);
+ await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
+ assert.deepEqual(w.b.closedTabs,[],'never closed');assert.equal(w.state(),undefined,'the job retired');
+ assert.ok(uploadedSteps(w).includes('worker:preserve_navigated'),`${uploadedSteps(w)}`);
+ assert.equal(await pinnedIn(tab),undefined);
+});
+test('worker, review: a new-chat review whose unpinned sent turn the user edited (prompt plus their text) is preserved, never closed',async t=>{
+ const tab=await chatTab(t,{thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+ const w=wire(tab);
+ await w.tick();await tab.page.clock.runFor(1600);
+ await tab.page.evaluate(text=>{document.querySelector('[data-message-id="user-A"] .whitespace-pre-wrap').textContent=text;},PROMPT+' Also check my own branch.');
+ await finish(tab.page);await tab.page.clock.runFor(2400);
+ await w.tick();
+ assert.deepEqual(w.b.closedTabs,[]);assert.equal(w.state(),undefined);
+ assert.ok(uploadedSteps(w).includes('worker:preserve_edited'),`${uploadedSteps(w)}`);
+});
+test('worker, review (control): a review this page sent on the new chat, moved by the provider before its collector\'s first poll while generating, pins there and closes',async t=>{
+ const tab=await chatTab(t,{composer:PROMPT,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
+ const w=wire(tab);
+ await w.tick();await tab.page.clock.runFor(600);
+ assert.equal(await tab.clicks(),1,'this page clicked Send on the new chat');
+ // The provider accepts the prompt: it assigns the conversation URL and renders the sent turn with a
+ // generating answer before the collector's first poll.
+ await tab.page.evaluate(([url,html,stop])=>{history.replaceState(history.state,'',url);document.getElementById('thread').innerHTML=html;
+  document.getElementById('prompt-textarea').textContent='';document.body.insertAdjacentHTML('beforeend',stop);},[CONV_URL,userTurn()+answerTurn({done:false}),stopButton]);
+ await tab.page.clock.runFor(1600);
+ assert.equal(await pinnedIn(tab),CONV_URL,'pinned where the provider moved it while this page watched the run');
+ await finish(tab.page);await tab.page.clock.runFor(2400);
+ await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
+ assert.deepEqual(w.b.closedTabs,[10],`closed: ${uploadedSteps(w)}`);assert.equal(w.state(),undefined);
+});
 
 // ── Legs nobody wants any more (cancelled, superseded, forgotten): the tab has no use either. The
 // cancel exit stops the page (no send, no collect) and closes a REVIEW tab unless the user took it

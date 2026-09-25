@@ -11,7 +11,10 @@ async function makePage(t,jobId,{text=invalid,runId='run-A',start=true}={}){
  const context=await browser.newContext();t.after(()=>context.close());await context.route('**/*',route=>route.abort());const page=await context.newPage();
  await page.setContent('<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">owned prompt</div></section><section id="answer" data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"></div></div><button aria-label="Copy response" data-testid="copy-turn-action-button">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div><button data-testid="send-button" aria-label="Send prompt" disabled>Send</button></form>');
  await page.clock.install();await page.evaluate(({jobId,runId,text})=>{
-  const values=new Map([['ashlar:job',jobId],['ashlar:run',runId],[`ashlar:submission:${jobId}:${runId}`,JSON.stringify({phase:'sent',expected:'owned prompt',baseline:0,submittedUsers:1,messageId:'user-A'})]]);
+  // Sent on the conversation page it shows (logically /c/A, see fixture): the send recorded it
+  // (composer.js submissionConfirmed). #85 r1 (Ashlar 4101062732): a collector pins a conversation only
+  // from a provider move it watched in flight, so the fixture records it at send.
+  const values=new Map([['ashlar:job',jobId],['ashlar:run',runId],[`ashlar:submission:${jobId}:${runId}`,JSON.stringify({phase:'sent',expected:'owned prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})]]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:key=>values.get(key)||null,setItem:(key,value)=>values.set(key,value),removeItem:key=>values.delete(key)}});
   window.chrome={runtime:{onMessage:{addListener:fn=>window.receiver=fn,removeListener(){}}}};document.querySelector('.markdown').textContent=text;
   window.clicks=0;document.querySelector('form').onsubmit=ev=>{ev.preventDefault();window.clicks++;};
@@ -107,7 +110,7 @@ test('captured-source cleanup restores a freshly reloaded page from the saved re
   }
   if(!reloaded)return send(id,msg,cb);
   void reloaded.then(page=>page.evaluate(msg=>new Promise(resolve=>{const pending=receiver(msg,null,resolve);if(pending!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg))
-   .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{})}));
+   .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/A'}:{})}));
  };
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1 && f.app.reviews.length>0;},'capture ACK lost its cleanup state across page reload');
  assert.ok(reloaded);assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,1,'salvage posts the captured original after the reload-restored cleanup');
@@ -310,7 +313,7 @@ test('native saved response recovers cleanup in a different document using only 
   if(msg.type==='ashlar-can-close' && !replacement)replacement=makePage(t,f.job.jobId,{text:valid,start:false});
   if(!replacement)return send(id,msg,cb);
   void replacement.then(page=>page.evaluate(msg=>new Promise(resolve=>{const pending=receiver(msg,null,resolve);if(pending!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg))
-   .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{})}));
+   .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/A'}:{})}));
  };
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'new document could not restore native cleanup proof');
  assert.ok(replacement);assert.equal(f.app.reviews.length,1);assert.equal(f.worker.calls.filter(c=>c.action==='complete').length,1);

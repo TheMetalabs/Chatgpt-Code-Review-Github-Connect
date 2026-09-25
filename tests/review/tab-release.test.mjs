@@ -375,6 +375,18 @@ for (const kind of ['review', 'fix']) {
     assert.ok(uploaded(b).includes('worker:preserve_unreachable'));
   });
 }
+// Ashlar 4101062732: an unpinned review verdict holds only on the new chat the tab was opened on. The
+// page the run last answered on (state.pageUrl) is no identity: it can be the user's own conversation.
+for (const [where, url, closed] of [['a page that left its new chat', 'https://chatgpt.com/c/users-own', false], ['its new chat (control)', TEMP, true]]) {
+  test(`review: an unpinned "owned" verdict from ${where} is ${closed ? 'closed' : 'preserved, never closed'}`, async () => {
+    const b = worker(leg('review', {...secured('review'), pageUrl: url}), {tab: {id: 10, url, status: 'complete'},
+      handler: (_id, m) => (m.type === 'ashlar-can-close' ? {ok: true, releaseProtocol: 1, ownership: 'owned', unpinned: true, url} : {ok: true})});
+    await b.tick();
+    assert.equal(b.pending(), undefined, 'retired');
+    assert.deepEqual(b.closedTabs, closed ? [10] : []);
+    if (!closed) assert.ok(uploaded(b).includes('worker:preserve_navigated'), `${uploaded(b)}`);
+  });
+}
 test('worker status lists the recently retired legs (closed and preserved) with metadata only', async () => {
   const closedJob = leg('review', secured('review'));
   const keptJob = {...leg('fix', secured('fix')), states: {chatgpt: {...leg('fix', secured('fix')).states.chatgpt, tabId: 11}}};

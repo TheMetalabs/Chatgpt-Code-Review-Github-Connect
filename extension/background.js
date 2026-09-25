@@ -1307,14 +1307,20 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     await closeProvenTab(job, provider, jobs, tab.id, url => onAllocationPage(url, provider), closed);
     return;
   }
-  // A run with no pinned conversation (still generating, a legacy journal, an older page): the
-  // identity the worker observed itself, the page where the run last answered, else (older pages)
-  // the URL that answered. An unpinned run known only on the page the tab was opened on is where
-  // its page just proved its sent turn is still the last one: the conversation the provider
-  // assigned since (a review on a new-chat page pins only on the first conversation page it is
-  // shown on, or once its answer is complete: json.js waitUntilReviewOrQuota).
-  if (verdict.unpinned === true || verdict.legacy === true || verdict.legacyReply === true) {
-    const identity = state.conversation || answeredPage(state, provider) || (verdict.unpinned === true ? result.url : state.pageUrl);
+  // A review with no pinned conversation (json.js newChatPin pins only a provider move its page saw
+  // happen in flight): Ashlar's only while its tab is still on the new chat it was opened on. A page
+  // it left has no trustworthy identity, whoever moved it (the page the run last answered on can be
+  // the user's own conversation, Ashlar 4101062732): kept, never closed.
+  if (verdict.unpinned === true) {
+    const holds = url => onAllocationPage(url, provider) && (!state.conversation || samePage(url, state.conversation));
+    if (!holds(result.url)) return preserveFixTab(job, provider, jobs, "the unpinned tab left its new chat; tab preserved", tab, "navigated");
+    await closeProvenTab(job, provider, jobs, tab.id, holds, closed);
+    return;
+  }
+  // A run observed without a journal (a legacy page, or an older page's can-close): the identity the
+  // worker observed itself, the page where the run last answered, else the URL it last saw.
+  if (verdict.legacy === true || verdict.legacyReply === true) {
+    const identity = state.conversation || answeredPage(state, provider) || state.pageUrl;
     const holds = identity ? url => samePage(url, identity) : verdict.legacyReply ? url => url === result.url : url => onAllocationPage(url, provider);
     if (!holds(result.url)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
     await closeProvenTab(job, provider, jobs, tab.id, holds, closed);

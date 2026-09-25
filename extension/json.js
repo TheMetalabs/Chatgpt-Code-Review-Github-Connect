@@ -419,12 +419,17 @@ async function waitUntilReviewOrQuota(name) {
     // the user's (tab release). A review sent on a conversation page recorded it at its send
     // (composer.js submissionConfirmed). A review sent on a new chat (namesNoConversation: ChatGPT's
     // "/", Grok's home) had none to record: the provider moves that URL to the conversation it
-    // assigns after the send, which is not the user's doing (#82). It pins on the first
-    // conversation page its exact sent turn is shown on, or once its answer is complete (the page it
-    // was collected on); until then its release verdict is unpinned and the worker follows its page.
-    if (bound?.identified && !runner?.tabRepurposed && !submission.conversation && ((done && bound.root) || !namesNoConversation(globalThis.location?.href)) &&
+    // assigns while it answers, which is not the user's doing (#82). Only a move this page saw
+    // happen while the run was in flight is pinned (newChatPin): its exact sent turn shown on the
+    // new chat after the send (or its Send clicked there), then on a conversation page before the
+    // answer completed. A conversation URL first seen with the answer complete, or by a collector
+    // that never saw the new chat after the send (a resumed or reloaded page), is not a URL the
+    // send produced (the user may have moved in-page while the old DOM was still rendered, Ashlar
+    // 4101062732): no pin, and the release verdict keeps the tab. On the new chat itself it pins
+    // once its answer is complete (the page it was collected on).
+    if (bound?.identified && !runner?.tabRepurposed && !submission.conversation &&
         journaledTurnIntegrity(submission, globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : []) === "exact") {
-      pinNewChatReview(submission);
+      if (newChatPin(runner, done, Boolean(bound.root))) pinNewChatReview(submission);
     }
     const text = assistantCorpus(bound?.root).join("\n\n");
     const json = done ? harvestJson({allowThin: true, root: bound?.root}) : null;
@@ -499,16 +504,41 @@ function conversationIdentity(href) {
  * The one exception (#82) is a REVIEW whose journal has no send-time conversation: a review sent on
  * a new chat (namesNoConversation: ChatGPT's "/" or a temporary chat it does not honour, Grok's home,
  * the page every Ashlar tab opens on) has no conversation yet when its send is proven; the provider
- * assigns one afterwards, which is not the user's doing. It pins where the provider put it
- * (pinNewChatReview). The collector cannot tell that journal from a review journal written before
- * this rule or confirmed only after a reload, so those pin the same way (as before #77's rule). A
- * review without a pinned conversation is released as `unpinned` (the worker checks the page it
- * observed), never as "unestablished". */
+ * assigns one while it answers, which is not the user's doing. It pins where the provider put it
+ * (pinNewChatReview), but only when this page saw that move happen while the run was in flight
+ * (newChatPin); a URL it did not see the send produce is never pinned. A review without a pinned
+ * conversation is released as `unpinned` only on the new chat its tab was opened on; on any other
+ * page it has left it with no trustworthy identity and is kept (`identity: "changed"`), never
+ * "unestablished". */
+
+/** Whether a review collector poll may pin its new-chat run's conversation here (the journaled turn
+ * is shown, EXACTLY Ashlar's prompt): on the new chat once the answer is complete; on a conversation
+ * page only while the answer is still in flight, and only when this page instance saw the run on the
+ * new chat after its send (sawNewChatAfterSend): the provider's move, observed as it happened. A
+ * poll on the new chat while generating records that sighting. */
+function newChatPin(runner, done, answered) {
+  if (namesNoConversation(globalThis.location?.href)) {
+    if (!done && runner) { try { runner.newChatSeen = submissionKey(); } catch { /* unbound: no sighting */ } }
+    return done && answered;
+  }
+  return !done && sawNewChatAfterSend(runner);
+}
+
+/** Whether this page instance saw its run on a new-chat page after the send: it clicked Send there
+ * (composer.js sendAttempt), or a collector poll found the exact sent turn there while generating.
+ * In memory only: a reloaded page has not seen it (its later URL is no evidence of the move). */
+function sawNewChatAfterSend(runner) {
+  let key;
+  try { key = submissionKey(); } catch { return false; }
+  return runner?.newChatSeen === key ||
+    (runner?.sendAttempt?.key === key && namesNoConversation(runner.sendAttempt.conversation));
+}
 
 /** Pin a review's conversation identity that its send did not record (see above): only the review
- * collector calls it, once its exact sent turn is shown on the first conversation page the provider
- * moves it to, or once its answer is complete. Pinned ONCE and never replaced: a later URL is
- * compared with it (samePage). A fix never pins here: its identity is the send-time one. */
+ * collector calls it (newChatPin): on the conversation page the provider moved the run to while this
+ * page watched it answer, or on the new chat once its answer is complete. Pinned ONCE and never
+ * replaced: a later URL is compared with it (samePage). A fix never pins here: its identity is the
+ * send-time one. */
 function pinNewChatReview(submission) {
   if (!submission || submission.phase !== "sent" || submission.conversation) return;
   const identity = conversationIdentity(globalThis.location?.href);
@@ -787,6 +817,13 @@ function tabOwnership(state, allocationUrl, fix = false) {
   // run's conversation is recorded (at send, or a new-chat review's pin), the page must still show it.
   const pinned = typeof submission.conversation === "string" ? submission.conversation : "";
   if (pinned && !samePage(pinned, href)) return {ownership: "unknown", identity: "changed", cause: "navigated", conversation: pinned};
+  // A review with no pin has no trustworthy conversation: it is Ashlar's only on the new chat its tab
+  // was opened on. Any other page is one its send was not seen to produce (a move the collector did
+  // not watch happen in flight, or the user's own conversation with the old DOM still on screen,
+  // Ashlar 4101062732): kept, never closed on the page's word. (A fix without one: unestablished.)
+  if (!pinned && !fix && !(namesNoConversation(href) && (!allocationUrl || samePage(href, allocationUrl)))) {
+    return {ownership: "unknown", identity: "changed", cause: "navigated"};
+  }
   // A FIX records its conversation only when its send is proven (composer.js submissionConfirmed),
   // and only the temporary chat proves it (#77, fixSentInTemporaryChat): a sent fix journal without
   // one (a legacy journal, a send confirmed only after a reload) or with another page can never
@@ -809,11 +846,11 @@ function tabOwnership(state, allocationUrl, fix = false) {
     if (unestablished) return unestablished;
     return !users.length && samePage(href, allocationUrl) ? {ownership: "owned", blank: true} : {ownership: "unknown", cause: "not_rendered"};
   }
-  // Runs with a recorded conversation were seen with EXACTLY the prompt once (a review's send-time
-  // record and its pin need an exact turn; a fix's collector ends on any other), so any other text
-  // is an edit; an unpinned run (legacy journal, or a renderer that never matched exactly) must
-  // still contain it.
-  if (pinned ? sent !== submission.expected : !sent.includes(submission.expected)) return takeOver("edited");
+  // The journaled turn must hold EXACTLY Ashlar's prompt (normalized), pinned or not: a review's
+  // send-time record and its pin need an exact turn, a fix's collector ends on any other, and an
+  // unpinned turn that merely contains the prompt may be the user's edit around it (Ashlar
+  // 4101062732). Any other text is an edit.
+  if (sent !== submission.expected) return takeOver("edited");
   if (users.indexOf(turn) < users.length - 1) return takeOver("user_turn");
   if (regeneratedAfterCompletion(state, submission)) return takeOver("regenerated");
   if (unestablished) return unestablished;

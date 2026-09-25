@@ -355,6 +355,32 @@ function throwIfQuota(name, bound, answered) {
   }
 }
 
+/** Generating lease (#82 section 4.5, #87), review runs only. Once the bound answer is mounted and
+ * not yet complete, its response ID or Stop/streaming state must change, or its text grow past its
+ * longest length so far, within 15 min; otherwise the run fails as `stalled`. ChatGPT ends a
+ * reasoning run at ~29.5 min by mounting a turn that never gets completion controls (8/8 field
+ * runs). Healthy runs: answer mount to completion took at most 154 s in 367 runs. Growth, not any
+ * text change: a label re-rendered in place (a ticking timer) is not progress. No bound answer yet
+ * (thinking), a follow-up or a completed turn clears the lease: none of them has a deadline.
+ * Only observed time counts: a poll gap over 3 min is a host sleep or a frozen tab, whose first
+ * poll on resume still sees the pre-pause answer, so the lease moves forward by that gap. Chrome
+ * wakes a hidden tab's timers about once a minute, so throttled polls still count. */
+function expireGeneratingLease(lease, name, {bound, stop, streaming, done}, text) {
+  // Declared here, not at top level: content scripts are re-injected.
+  const GENERATING_LEASE_MS = 15 * 60_000, POLLING_SUSPENDED_MS = 3 * 60_000;
+  const now = Date.now(), gap = lease.polled ? now - lease.polled : 0;
+  lease.polled = now;
+  if (gap > POLLING_SUSPENDED_MS) lease.at += gap;
+  if (done || !bound?.root || bound.followup) { lease.state = ""; return; }
+  const state = JSON.stringify([bound.responseId || "", Boolean(stop), Boolean(streaming)]);
+  if (state !== lease.state) Object.assign(lease, {state, chars: text.length, at: now});
+  else if (text.length > lease.chars) Object.assign(lease, {chars: text.length, at: now});
+  else if (now - lease.at >= GENERATING_LEASE_MS) {
+    const error = new Error(`${name} answer unchanged for ${GENERATING_LEASE_MS / 60_000} min without completion controls`);
+    error.code = "stalled"; throw error;
+  }
+}
+
 /** Collection needs two identical stable observations (`key`). On the second one the runner
  * records the answer and, for an identified response, its native completion proof. */
 function settleStableAnswer(stability, key, poll, {text, raw}) {
@@ -380,7 +406,9 @@ async function waitUntilReviewOrQuota(name) {
   // Stamp the executing loop, never installReviewRunner's listener replacement.
   if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
   const stability = {stable: "", hits: 0};
-  // No poll-count/elapsed-time failure. Controls can appear before response text is
+  const lease = {state: "", chars: 0, at: 0, polled: 0};
+  // No poll-count failure and no deadline before the answer mounts (expireGeneratingLease bounds
+  // only a mounted answer that stops progressing). Controls can appear before response text is
   // observable. A missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
     // The full original was secured, not accepted as a review. The worker owns
@@ -404,6 +432,7 @@ async function waitUntilReviewOrQuota(name) {
     recordReviewStep(!done ? (stop || streaming ? "generating" : "waiting_for_response") :
       json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response");
     throwIfQuota(name, bound, Boolean(json));
+    expireGeneratingLease(lease, name, poll, text);
     if (done && json) {
       if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) return json;
     } else { stability.hits = 0; stability.stable = ""; }
@@ -915,9 +944,12 @@ function installReviewRunner(name, run) {
         Boolean((captured || native) && bound?.root && !replyDoneVisible(bound.root));
       // User follow-ups/navigation transfer the tab back to the user. Do not close it.
       const hasDraft = Boolean(composerDraftText());
-      if (!pending && (!unchanged || hasDraft)) releaseManagedSlot(state);
+      // A leg the generating lease failed (#87) under a Stop that never clears can never prove a
+      // close: the tab is kept, and its managed slot freed so it stops holding tab capacity.
+      const stalledBusy = !pending && unchanged && !hasDraft && busyNow && state.result?.code === "stalled";
+      if (!pending && (!unchanged || hasDraft || stalledBusy)) releaseManagedSlot(state);
       reply({ok: true, canClose: !pending && unchanged && !busyNow && !hasDraft,
-        reason: pending ? "pending" : !unchanged || hasDraft ? "repurposed" : busyNow ? "pending" : "complete",
+        reason: pending ? "pending" : !unchanged || hasDraft ? "repurposed" : stalledBusy ? "stalled" : busyNow ? "pending" : "complete",
         url: globalThis.location?.href || ""});
       return;
     }
@@ -965,7 +997,8 @@ function installReviewRunner(name, run) {
         state.result = { ok: true, raw, responseText: state.responseText, completion:nativeCleanupProof(state) };
       })
       .catch(e => {
-        recordReviewStep(e?.code === "quota" ? "quota" : "error");
+        const leaseExpired = e?.code === "stalled"; // expireGeneratingLease (#87)
+        recordReviewStep(e?.code === "quota" ? "quota" : leaseExpired ? "lease_expired_generating" : "error");
         state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })

@@ -1,4 +1,4 @@
-import {progressLabel, type ProviderProgress} from "./review-progress.ts";
+import {progressLabel, stageIs, type ProviderProgress} from "./review-progress.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { skippedProvider } from "./local-fallback.ts";
 import type { Job, JobStatus, ReviewerLane, ReviewerLaneState, ReviewProvider } from "./types.ts";
@@ -81,7 +81,7 @@ function claimed(job: Pick<Job, "bridgeClaimedAt">, now: number): boolean {
 export type LocalLegView = "generating" | "stale" | "queued" | "no-response";
 
 export function localLegView(progress: ProviderProgress | undefined, now: number, staleMs: number): LocalLegView {
-  if (progress?.stage === "local_queued") {
+  if (progress && stageIs(progress.stage, "local_queued")) {
     const aliveAt = progress.keepaliveAt ?? progress.observedAt;
     return now - aliveAt > staleMs ? "no-response" : "queued";
   }
@@ -225,8 +225,8 @@ export function buildReviewerLanes(
     if(progress) {
       // The flag comes from the stage itself: an unlabelled stage's name reaches the detail as it was
       // recorded, and a word in it is not the provider reporting a limit.
-      return {provider,state:progress.stage==="generating"?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false,
-        usageLimited:progress.stage==="quota"};
+      return {provider,state:stageIs(progress.stage,"generating")?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false,
+        usageLimited:stageIs(progress.stage,"quota")};
     }
     if (g === true) {
       return { provider, state: "waiting", label, detail: "Chrome task pending · submission not confirmed", answered: false };

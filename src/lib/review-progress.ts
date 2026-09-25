@@ -74,9 +74,15 @@ export const PROGRESS_LABELS = {
 } as const;
 /** A stage with a history label. */
 export type LabelledStage = keyof typeof PROGRESS_LABELS;
+declare const unlabelledStage: unique symbol;
+/** A well-formed stage the extension recorded ahead of its label. Only sanitizeProgressEvents makes one,
+ * after the stage-name check, so it stands for extension input that passed that check. */
+export type UnlabelledStage = string & {readonly [unlabelledStage]: true};
 /** A recorded stage: a labelled one, or a well-formed one recorded ahead of its label. Look its label up
- * with progressLabel, never PROGRESS_LABELS directly, so an unlabelled stage shows its fallback. */
-export type ProgressStage = string;
+ * with progressLabel, never PROGRESS_LABELS directly, so an unlabelled stage shows its fallback. The type
+ * stays closed for server code: a stage the server writes must be a LabelledStage, so a mistyped one fails
+ * to compile rather than showing up as an unlabelled step. */
+export type ProgressStage = LabelledStage | UnlabelledStage;
 /** The shape of a stage name the server keeps: snake_case from a letter, shorter than the bound the worker
  * puts on a page-reported stage (background.js, e.stage.length < 80). No space, capital or punctuation
  * matches, so a stage cannot carry free text (a prompt, a detail suffix) into history. */
@@ -84,6 +90,9 @@ const STAGE_NAME = /^[a-z][a-z0-9_]{0,78}$/;
 /** What an unlabelled stage is shown as, ahead of its own name. */
 export const UNLABELLED_STAGE = "Unlabelled step";
 export const isLabelledStage = (stage: string): stage is LabelledStage => Object.hasOwn(PROGRESS_LABELS, stage);
+/** Whether a recorded stage is the named labelled stage. Compare through this rather than ===: a string
+ * literal still compiles against the unlabelled half of ProgressStage, a mistyped name here does not. */
+export const stageIs = (stage: ProgressStage | undefined, want: LabelledStage): boolean => stage === want;
 /** The history and lane label of a stage: its PROGRESS_LABELS entry, or the unlabelled fallback. The
  * check is derived, not stored: once a label lands, earlier history rows of that stage show it too. */
 export const progressLabel = (stage: string): string => isLabelledStage(stage) ? PROGRESS_LABELS[stage] : `${UNLABELLED_STAGE} · ${stage}`;
@@ -125,6 +134,7 @@ export function sanitizeProgressEvents(value: unknown): ProgressEvent[] {
             typeof row.stage !== "string" || !STAGE_NAME.test(row.stage) ||
             typeof row.at !== "number" || !Number.isFinite(row.at) || row.at < 0)
             return [];
-        return [{ source: row.source, sequence: Number(row.sequence), stage: row.stage, at: row.at }];
+        // The only place an UnlabelledStage is made: row.stage passed the stage-name check above.
+        return [{ source: row.source, sequence: Number(row.sequence), stage: row.stage as ProgressStage, at: row.at }];
     });
 }

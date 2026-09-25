@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress.ts";
-import { sanitizeProgressEvents } from "./review-progress.ts";
+import { sanitizeProgressEvents, stageIs, type ProviderProgress } from "./review-progress.ts";
 import type { Job } from "./types.ts";
 
 function job(partial: Partial<Job>): Job {
@@ -70,11 +70,12 @@ describe("buildReviewerLanes", () => {
   });
 
   it("shows a stage recorded ahead of its label under the unlabelled fallback", () => {
+    const [event] = sanitizeProgressEvents([{source: "page", sequence: 1, stage: "tab_woken", at: 1}]);
     const lanes = buildReviewerLanes(
       job({
         reviewProviders: ["chatgpt"],
         generating: { chatgpt: true },
-        providerProgress: {chatgpt: {runId: "run", stage: "tab_woken", observedAt: Date.now(), receivedAt: Date.now()}},
+        providerProgress: {chatgpt: {runId: "run", stage: event.stage, observedAt: Date.now(), receivedAt: Date.now()}},
       }),
     );
     assert.equal(lanes[0].state, "waiting");
@@ -296,4 +297,25 @@ describe("buildReviewerLanes", () => {
     assert.equal(emptyReviewSkip([{provider: "chatgpt", label: "ChatGPT", state: "empty", detail: "usage limit", answered: false}]).usageLimited, false);
   });
 
+});
+
+describe("ProgressStage", () => {
+  // The @ts-expect-error lines are the pin: `npx tsc --noEmit` fails on an unused one, so widening the
+  // type back to string (or letting stageIs take any string) turns the type-check red.
+  it("is closed for a stage the server writes or compares, and opened only by sanitizeProgressEvents", () => {
+    // @ts-expect-error a mistyped stage the server writes is not a ProgressStage
+    const typo: ProviderProgress = {runId: "local:j1", stage: "eror", observedAt: 1, receivedAt: 1};
+    const fromBody: string = "tab_woken";
+    // @ts-expect-error an unchecked string is not a ProgressStage until sanitizeProgressEvents passes it
+    const unchecked: ProviderProgress = {runId: "run", stage: fromBody, observedAt: 1, receivedAt: 1};
+    // @ts-expect-error a comparison names a labelled stage, so a mistyped one fails too
+    assert.equal(stageIs(typo.stage, "local_queud"), false);
+    const [event] = sanitizeProgressEvents([{source: "page", sequence: 1, stage: fromBody, at: 1}]);
+    const recorded: ProviderProgress = {runId: "run", stage: event.stage, observedAt: 1, receivedAt: 1};
+    assert.equal(stageIs(recorded.stage, "generating"), false);
+    assert.equal(stageIs(unchecked.stage, "generating"), false);
+    const written: ProviderProgress = {runId: "local:j1", stage: "local_queued", observedAt: 1, receivedAt: 1};
+    assert.equal(stageIs(written.stage, "local_queued"), true);
+    assert.equal(stageIs(undefined, "local_queued"), false);
+  });
 });

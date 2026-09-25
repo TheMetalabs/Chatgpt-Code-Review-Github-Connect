@@ -1199,15 +1199,19 @@ function abandonLegs(job, providers, status) {
  * renders what the provider kept, and gives the verdict). Its URL is still readable: on another
  * page than the run's known one it is the user's, preserved at once. A tab not on its run's page
  * (onRunPage: with no identity yet, the new chat it was opened on) is never reloaded. Otherwise, in the tab this browser
- * session created for the leg, it is woken once (reloaded in the background, as activating it would)
- * so its page answers on a later tick within the same ownership wait; a tab that cannot be woken is
- * preserved after the wait. A frozen tab is not this (it keeps its page): see forceCloseFixTab. */
+ * session created for the leg, it is woken once (reloaded in the background, as activating it would;
+ * within the leg's DISCARD_WAKES_MAX, and never for a leg that failed as tab_discarded) so its page
+ * answers on a later tick within the same ownership wait; a tab that cannot be woken is preserved
+ * after the wait. A frozen tab is not this (it keeps its page): see forceCloseFixTab. */
 async function releaseDiscardedTab(job, provider, jobs, tab) {
   const state = job.states[provider];
   const known = state.conversation || answeredPage(state, provider);
   if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", undefined, "navigated");
   cleanupWaiting(job, provider, "tab_discarded");
-  if (onRunPage(state, provider, tab.url)) await wakeTabOnce(job, provider, jobs, tab, "wokeDiscardedTab");
+  // A leg that failed because its discarded tab could not resume its run (tab_discarded) is not
+  // reloaded by its own cleanup: a reload now could show an answer the provider finished meanwhile,
+  // and closing it would throw that answer away after its failure was delivered. Kept (unreachable).
+  if (onRunPage(state, provider, tab.url) && state.outcome?.code !== "tab_discarded") await wakeTabOnce(job, provider, jobs, tab, "wokeDiscardedTab");
   return waitOrPreserveFixTab(job, provider, jobs, "the discarded tab could not answer; tab preserved", undefined, "unreachable");
 }
 
@@ -1219,14 +1223,21 @@ function onRunPage(state, provider, url) {
   return known ? samePage(url, known) : onAllocationPage(url, provider);
 }
 
-/** Reload `tab` once per leg and phase (`marker`, durable), only when this browser session created
- * it for the leg (tabCreatedForLeg: a stored id without that record may name the user's tab, which is
- * never reloaded). The reload wakes a discarded page in the background, as activating it would. True
- * if it was reloaded now. */
+/** How many times one leg's tab may be woken in all (DISCARD_WAKES_MAX): an active leg's wake is once
+ * per discard (a page that proved its run went on earns the next one, discardWaitOver), capped so a
+ * tab Chrome keeps discarding is never reloaded in a loop. */
+const DISCARD_WAKES_MAX = 3;
+
+/** Reload `tab` once per `marker` (durable: the active leg's clears it once its woken page resumed
+ * the run; the cleanup's is once per leg) and at most DISCARD_WAKES_MAX times per leg, only when this
+ * browser session created it for the leg (tabCreatedForLeg: a stored id without that record may name
+ * the user's tab, which is never reloaded). The reload wakes a discarded page in the background, as
+ * activating it would. True if it was reloaded now. */
 async function wakeTabOnce(job, provider, jobs, tab, marker) {
   const state = job.states[provider];
-  if (state[marker] || !await tabCreatedForLeg(job, provider, tab.id)) return false;
+  if (state[marker] || (state.wakes || 0) >= DISCARD_WAKES_MAX || !await tabCreatedForLeg(job, provider, tab.id)) return false;
   state[marker] = true;
+  state.wakes = (state.wakes || 0) + 1;
   workerStep(job, provider, "tab_woken");
   await saveJobs(jobs);
   try { await chrome.tabs.reload(tab.id); } catch { /* still discarded: the caller's bounded wait applies */ }
@@ -1240,11 +1251,12 @@ const DISCARDED_WAKE_WAIT_MS = 2 * 60_000;
 /** A tab Chrome discarded (or never loaded) while its leg is still active holds no page: no run can be
  * dispatched into it and nothing can be harvested from it (Ashlar 4101062759: every poll returned
  * there, and the leg held its capacity slot until something outside reloaded the tab). The tab this
- * browser session created for the leg, on its run's own page, is woken once (wakeTabOnce): once it
- * has loaded, the poll dispatches the run into it or, for a sent run, resumes observing it (the page's
- * journal never sends a prompt twice). A FIX whose run was dispatched is never woken: its temporary
- * chat is not restored by a reload (json.js: it renders nothing), so nothing there could resume. Any
- * other one (not provably the leg's, on another page, or already woken and still not loaded) is never
+ * browser session created for the leg, on its run's own page, is woken once per discard (wakeTabOnce,
+ * at most DISCARD_WAKES_MAX times per leg): once it has loaded, the poll dispatches the run into it
+ * or, for a sent run, resumes observing it (the page's journal never sends a prompt twice). A FIX
+ * whose run was dispatched is never woken: its temporary chat is not restored by a reload (json.js:
+ * it renders nothing), so nothing there could resume. Any other one (not provably the leg's, on
+ * another page, already woken for this discard and still not loaded, or past the cap) is never
  * reloaded. The discard's time limit (DISCARDED_WAKE_WAIT_MS, from the first poll that found it)
  * holds until the loaded page proves its run goes on (discardedRunProven): past it the leg fails with
  * `tab_discarded`, its failure is delivered and its tab is released by the cleanup rule, which frees
@@ -1279,12 +1291,20 @@ function discardedRunProven(result, dispatched) {
 async function discardWaitOver(job, provider, jobs, proven = false) {
   const state = job.states[provider];
   if (!state.discardedAt) return false;
-  if (proven) { delete state.discardedAt; await saveJobs(jobs); return false; }
+  if (proven) {
+    // Its woken page resumed the run: a later discard is a new one, woken again (within the cap).
+    delete state.discardedAt;
+    delete state.wokeActiveTab;
+    await saveJobs(jobs);
+    return false;
+  }
   if (Date.now() - state.discardedAt < DISCARDED_WAKE_WAIT_MS) return false;
   delete state.discardedAt;
   state.outcome = failure("tab_discarded", state.wokeActiveTab
     ? "the chat tab was discarded; Ashlar woke it, but its reloaded page could not resume the run; no answer was collected"
-    : "the chat tab was discarded and could not be woken; no answer was collected");
+    : (state.wakes || 0) >= DISCARD_WAKES_MAX
+      ? `the chat tab was discarded again and was not woken (Ashlar already woke it ${state.wakes} times); no answer was collected`
+      : "the chat tab was discarded and could not be woken; no answer was collected");
   await saveJobs(jobs);
   return true;
 }
@@ -1615,7 +1635,8 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     state.tabId = tab.id; state.started = true; await saveJobs(jobs);
   }
   // A discarded tab holds no page (and a woken one that never finishes loading still holds none):
-  // woken once or, past a bounded wait, the leg fails (wakeOrFailDiscardedTab), never polled forever.
+  // woken once per discard or, past a bounded wait, the leg fails (wakeOrFailDiscardedTab), never
+  // polled forever.
   if (tab.discarded === true || tab.status === "unloaded" || (state.discardedAt && tab.status && tab.status !== "complete")) {
     return wakeOrFailDiscardedTab(job, provider, jobs, tab);
   }

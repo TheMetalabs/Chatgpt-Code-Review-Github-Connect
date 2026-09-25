@@ -451,6 +451,46 @@ test('review: a woken page that never answers is bounded by the discard\'s time 
   assert.equal(b.pending()?.states.chatgpt.outcome?.code ?? 'retired', b.pending() ? 'tab_discarded' : 'retired');
   assert.ok(b.calls.some(c => c.action === 'failure' && /tab_discarded/.test(c.error)), 'the failure is delivered');
 });
+// Ashlar 4101062759 (R3): the wake was once per leg, so a tab Chrome discarded AGAIN after its woken
+// page resumed was never woken: the leg failed "could not be woken" although this discard was never
+// tried, and its cleanup's own wake then reloaded the tab and closed it with the finished answer.
+// Now a page that proved its run goes on earns the next wake (once per discard), capped per leg, and
+// a leg that failed as tab_discarded is never reloaded by its own cleanup (kept: recoverable).
+test('review: a tab Chrome discards again after each resume is woken once per discard, at most 3 times; then the leg fails, and its cleanup never reloads it', async () => {
+  const b = worker(leg('review', {started: true, pageUrl: TEMP}), {session: createdHere('review'), tab: discardedTab(TEMP), handler: freshPage({observing: true})});
+  const {reloads, loaded} = reloadSpy(b);
+  const advance = stepClock(b);
+  for (let i = 1; i <= 3; i++) {
+    await b.tick();
+    assert.equal(reloads.length, i, `discard ${i}: woken`);
+    loaded();await b.tick();await b.tick();
+    assert.equal(b.pending().states.chatgpt.discardedAt, undefined, `discard ${i}: its woken page resumed the run`);
+    assert.equal(b.pending().states.chatgpt.outcome, undefined);
+    Object.assign(b.tabs.get(10), {status: 'unloaded', discarded: true});
+  }
+  await b.tick();
+  assert.equal(reloads.length, 3, 'a fourth discard is not woken (the cap)');
+  advance(3 * 60_000);await b.tick();
+  assert.match(b.calls.find(c => c.action === 'failure')?.error || '', /^tab_discarded: .*discarded again and was not woken \(Ashlar already woke it 3 times\)/, 'the failure says why it was not woken');
+  for (let i = 0; i < 3 && b.pending(); i++) { advance(3 * 60_000);await b.tick(); }
+  assert.equal(b.pending(), undefined, 'retired: its capacity slot is released');
+  assert.equal(reloads.length, 3, 'its cleanup never reloads it either');
+  assert.deepEqual(b.closedTabs, [], 'kept');assert.ok(uploaded(b).includes('worker:preserve_unreachable'), `${uploaded(b)}`);
+});
+test('review: a leg that failed because its woken tab never finished loading is not reloaded by its own cleanup when Chrome discards it again; kept after the wait', async () => {
+  const b = worker(leg('review', {started: true, pageUrl: TEMP}), {session: createdHere('review'), tab: discardedTab(TEMP), handler: freshPage({observing: true})});
+  const {reloads} = reloadSpy(b);
+  const advance = stepClock(b);
+  await b.tick();
+  assert.deepEqual(reloads, [10], 'woken');
+  advance(3 * 60_000);await b.tick();
+  assert.match(b.calls.find(c => c.action === 'failure')?.error || '', /^tab_discarded: .*woke it/, 'the woken tab never loaded: the bounded failure is delivered');
+  Object.assign(b.tabs.get(10), {status: 'unloaded', discarded: true});
+  for (let i = 0; i < 3 && b.pending(); i++) { await b.tick();advance(3 * 60_000); }
+  assert.equal(b.pending(), undefined, 'retired: its capacity slot is released');
+  assert.deepEqual(reloads, [10], 'never reloaded by its cleanup');assert.deepEqual(b.closedTabs, [], 'kept (recoverable), never closed on a reload');
+  assert.ok(uploaded(b).includes('worker:preserve_unreachable'), `${uploaded(b)}`);
+});
 // A fix's temporary chat is not restored by a reload (json.js: a reloaded temporary chat renders
 // nothing), so a fix whose run was dispatched is never woken: it fails after the time limit, and its
 // tab is kept (a fix tab closes only on its proven-success path, #77).

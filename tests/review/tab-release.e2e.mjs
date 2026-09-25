@@ -717,6 +717,32 @@ test('worker, review: a generating leg whose tab Chrome discarded is woken once;
  assert.equal(w.b.tabs.size,0,'no second tab was opened');
  assert.ok(uploadedSteps(w).includes('worker:tab_woken'),`${uploadedSteps(w)}`);
 });
+// Ashlar 4101062759 (R3): Chrome discards the tab again after its woken page resumed the run (a
+// background tab reloaded in the background is a likely next candidate). That is a new discard: woken
+// again, and the answer the provider finished meanwhile is delivered, never failed and thrown away.
+test('worker, review: a generating leg whose tab Chrome discards again after its woken page resumed is woken again, and the answer is delivered',async t=>{
+ const tab=await generatingTab(t,{url:CONV_URL,journal:sentJournal({conversation:CONV_URL})});
+ const w=wire(tab,{session:createdHere()});
+ await w.tick();await tab.page.clock.runFor(1600);
+ const reloads=[];
+ w.b.chrome.tabs.reload=async id=>{reloads.push(id);Object.assign(w.b.tabs.get(id),{discarded:false,status:'loading'});await tab.reload();};
+ Object.assign(w.b.tabs.get(10),{status:'unloaded',discarded:true});
+ await w.tick({syncUrl:false});
+ w.b.tabs.get(10).status='complete';
+ await w.tick();await tab.page.clock.runFor(2400);await w.tick();
+ assert.equal((await tab.runner()).running,true,'the woken page resumed its run (still generating)');
+ assert.equal(w.state().discardedAt,undefined,'its page shows the run\'s response: this discard is over');
+ Object.assign(w.b.tabs.get(10),{status:'unloaded',discarded:true});
+ Object.assign(tab.served,{thread:userTurn()+answerTurn(),after:''}); // the provider finished meanwhile
+ await w.tick({syncUrl:false});
+ assert.deepEqual(reloads,[10,10],'a new discard: woken again');
+ w.b.tabs.get(10).status='complete';
+ for(let i=0;i<3&&w.state();i++){await w.tick();await tab.page.clock.runFor(2400);}
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'the answer is delivered');
+ assert.equal(w.b.calls.some(c=>c.action==='failure'),false,'never failed as tab_discarded');
+ assert.deepEqual(w.b.closedTabs,[10],`closed once the answer was secured: ${uploadedSteps(w)}`);assert.equal(w.state(),undefined);
+ assert.equal(await tab.clicks(),0,'the prompt is never sent again');
+});
 // Ashlar 4101062759, reopened: a page loaded again after a discard is not proof that the run goes on.
 // A reload keeps the submission journal but not the page: the prompt Ashlar entered but never sent
 // (its composer text and its file chip) is gone, so the resumed send waits for the chip forever and

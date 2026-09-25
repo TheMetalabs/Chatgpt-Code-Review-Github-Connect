@@ -502,6 +502,38 @@ for(const [name,local] of Object.entries(TRUNCATED_LOCAL)){
   });
 }
 
+// The block is sized as the body renders it: each `-->` is neutralized to `--&gt;` (+3). A 52,000-
+// character reply quoting a mermaid chart fit the 60,000 limit by its own length, so the merge called it
+// whole (raw-unverified) and GitHub's cap then cut its end under "Local verification reply posted
+// verbatim".
+test('verify-clean outcome: a local verification reply that the body lengthens is cut to fit, and the body, note and handoff say so',async t=>{
+  const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false});t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const out=await app.mention('matrix-neutralized-local');
+  const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+  await app.harbor.submitHarborChat(out.jobId,cleanJson);
+  const reply=`${LOCAL_RAW}\n${'A --> B\n'.repeat(6_500)}LOCAL-END`;
+  assert.ok(reply.length<60_000&&reply.length+3*6_500>60_000,'fits only by its own length');
+  let answered=0;
+  await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(envelope(reply));return app.reviews.length===1;},'the review was not posted');
+  const body=app.reviews[0].body;
+  assert.ok(body.length<=65_000,`under GitHub's limit: ${body.length}`);
+  assert.doesNotMatch(body,/review body truncated to fit GitHub's limit/,'GitHub\'s cap never cuts the body');
+  const raw=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
+  assert.ok(body.includes(REVIEW_RAW_END),'the block is whole');
+  assert.ok(raw.includes(LOCAL_RAW),'local\'s reply keeps its start');
+  assert.match(raw.slice(-200),/A --&gt; B\n(A[^\n]*)?\n\n…\(truncated to fit GitHub's review body limit; full original responses retained in review history\)\n$/,'and ends in its own marker');
+  assert.doesNotMatch(raw,/LOCAL-END/);
+  assert.deepEqual([...(job().rawTruncated??[])],['local']);
+  assert.doesNotMatch(body,/Local verification reply posted verbatim|posted verbatim below/,'a cut reply is never called verbatim');
+  assert.match(body,/\*\*⚠️ Review posted verbatim — the reply was not valid review JSON \(truncated below to fit GitHub's review body limit, full original in review history\)\.\*\*/);
+  assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MR,'plain raw, never raw-unverified');
+  assert.match(job().localVerifyNote,/^chatgpt found nothing; local verification's reply could not be used as a review \([^)]*\); posted below \(local verification truncated to fit GitHub's review body limit, full originals in review history\)\. Not a clean pass\.$/);
+  assert.ok(body.includes(`\n${job().localVerifyNote}\n`),'the body carries the note');
+  assert.match(notCleanDetail(job(),postedOutcome(job(),0)),/^posted verbatim: the reply was not valid review JSON \(truncated below/,'the loop handoff names the cut');
+});
+
 // Scope of the residual-text rule (docs §1): it is local-only. A chat leg's verdict is the review JSON
 // its client submits. The extension picks that object out of the page and sends the turn capture
 // beside it (originalText): rendered code-block labels, reasoning summaries and page text the server

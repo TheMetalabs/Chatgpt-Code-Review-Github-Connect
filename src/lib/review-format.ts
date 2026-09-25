@@ -1,5 +1,6 @@
 import type { Finding, Job, ReviewProvider, Severity } from "./types.ts";
 import { OUTCOME_SHAPE, postedOutcome, rawCauseText, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
+import { neutralizeMarkers, rawBodyText } from "./review-raw-text.ts";
 
 const BADGE: Record<Severity, string> = {
   P0: "https://img.shields.io/badge/P0-red?style=flat",
@@ -67,14 +68,6 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-/** Render model/operator-controlled text inert to the body's HTML-comment delimiters and markers so
- * it cannot forge or break the raw wrapper or the findings marker. Entities still display as `<!--` /
- * `-->` in the GitHub body. Applied to EVERY interpolated field (never to the literal wrapper the code
- * emits), so exactly one genuine raw pair exists and public redaction is unambiguous. */
-function neutralizeMarkers(s: string): string {
-  return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
-}
-
 type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses">>;
 
 /** Everything a body helper reads, computed once so every kind renders the same fields the same way. */
@@ -99,10 +92,9 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     noteLine: job.localVerifyNote ? `\n${neutralizeMarkers(job.localVerifyNote)}\n` : "",
     skipped: skippedNotes(job).slice(0, 4).map(neutralizeMarkers),
     incomplete: Boolean(job.incompleteProviders?.length),
-    // Neutralize the loop poller's clean-pass sentinel (matching the SAME separator set it accepts,
-    // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
-    // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
-    raw: neutralizeMarkers((job.rawReview ?? "").trim().replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)")),
+    // The clean-pass sentinel reworded and markers neutralized (rawBodyText): the length the merge
+    // sized the block by (salvagedReview).
+    raw: rawBodyText((job.rawReview ?? "").trim()),
     rawWhy: rawCauseText(job.rawCauses, job.rawTruncated),
   };
   switch (outcome) {

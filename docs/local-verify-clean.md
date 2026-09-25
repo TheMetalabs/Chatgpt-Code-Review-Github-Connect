@@ -119,7 +119,10 @@ Rules the table encodes:
   (…); grok's reply could not be used as a review and is posted verbatim below. Not a clean pass.`
   (the late-Grok raw tests).
 - The raw block is held under GitHub's body limit per reply (`salvagedReview`), never by cutting the
-  concatenation, so an earlier long reply cannot crowd a later one out. Each salvaged leg gets an
+  concatenation, so an earlier long reply cannot crowd a later one out. Each reply is measured as the
+  body renders it (`rawBodyText`: every `<!--` / `-->` neutralized, the clean sentinel reworded), never
+  by its own length, so a reply the body lengthens past its share is cut here and named, not cut by
+  GitHub's cap under a "verbatim" header (the neutralized-local test). Each salvaged leg gets an
   equal share (a shorter reply passes the rest on); a reply over its share keeps its start and ends
   in its own `…(<Reviewer> reply truncated …)` marker, and a reply the salvage itself cut at 60,000
   characters (`SALVAGE_TRUNCATED_MARK`) counts as cut too. Those legs are `Job.rawTruncated`, and

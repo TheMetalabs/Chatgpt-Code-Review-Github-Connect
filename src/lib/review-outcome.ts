@@ -2,6 +2,7 @@ import type { Job, RawCause, ReviewProvider } from "./types.ts";
 import { PROVIDER_LABEL } from "./types.ts";
 import { localVerifies } from "./local-fallback.ts";
 import { SALVAGE_TRUNCATED_MARK } from "./extract-chat-json.ts";
+import { rawBodyText } from "./review-raw-text.ts";
 
 // The one place a merged, gated review result is classified. Harbor uses it to decide between
 // holding the post for local verification and posting; review-format derives the body's first
@@ -200,7 +201,10 @@ function verificationFindingsNote(input: Parameters<typeof outcomeNote>[1]): str
  * equal share of the room, and a reply shorter than its share passes the rest to the others; a reply
  * over its share keeps its start and ends in its own truncation marker. `truncated` names those legs,
  * and a leg salvageReviewJson already cut (SALVAGE_TRUNCATED_MARK), so the outcome, header and note
- * describe the block as posted. The full originals stay in review history. */
+ * describe the block as posted. Lengths are the body's (rawBodyText), never the reply's own: the body
+ * neutralizes each `<!--` / `-->` and rewords the clean sentinel, so a reply that fits by its own
+ * length can still overflow the body and be cut there unannounced. The full originals stay in review
+ * history. */
 export function salvagedReview(
   legs: ReadonlyArray<{ provider: ReviewProvider; rawReview?: string }>,
   max: number,
@@ -211,20 +215,33 @@ export function salvagedReview(
   const SEPARATOR = "\n\n---\n\n";
   const heads = salvaged.map((l) => (labeled ? `**${PROVIDER_LABEL[l.provider]}:**\n\n` : ""));
   const frame = heads.reduce((n, h) => n + h.length, 0) + SEPARATOR.length * (salvaged.length - 1);
-  const shares = fairShares(salvaged.map((l) => l.rawReview.length), Math.max(0, max - frame));
+  const lengths = salvaged.map((l) => rawBodyText(l.rawReview).length);
+  const shares = fairShares(lengths, Math.max(0, max - frame));
   const truncated: ReviewProvider[] = [];
   const text = salvaged
     .map((l, i) => {
-      if (l.rawReview.length <= shares[i]) {
+      if (lengths[i] <= shares[i]) {
         if (l.rawReview.endsWith(SALVAGE_TRUNCATED_MARK.trim())) truncated.push(l.provider);
         return `${heads[i]}${l.rawReview}`;
       }
       truncated.push(l.provider);
       const whose = labeled ? `${PROVIDER_LABEL[l.provider]} reply truncated` : "truncated";
-      return `${heads[i]}${l.rawReview.slice(0, shares[i])}\n\n…(${whose} to fit GitHub's review body limit; full original responses retained in review history)`;
+      return `${heads[i]}${l.rawReview.slice(0, renderedPrefix(l.rawReview, shares[i]))}\n\n…(${whose} to fit GitHub's review body limit; full original responses retained in review history)`;
     })
     .join(SEPARATOR);
   return { text, truncated };
+}
+
+/** The longest prefix of `s` whose body rendering (rawBodyText) is at most `room` characters. */
+function renderedPrefix(s: string, room: number): number {
+  let lo = 0;
+  let hi = Math.min(s.length, room);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (rawBodyText(s.slice(0, mid)).length <= room) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 /** Split `room` among replies of these lengths: equal shares, a reply shorter than its share keeping

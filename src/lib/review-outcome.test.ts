@@ -13,6 +13,7 @@ import {
 import { OUTCOME_SHAPE, REVIEW_OUTCOMES, outcomeNote, postedOutcome, rawCauseText, reviewOutcome, salvagedReview, type OutcomeJob, type PostedOutcome, type ReviewOutcome } from "./review-outcome.ts";
 import { isConvergedFindings, parseFindingsTotal } from "./review-loop.ts";
 import { SALVAGE_TRUNCATED_MARK, salvageReviewJson } from "./extract-chat-json.ts";
+import { rawBodyText } from "./review-raw-text.ts";
 import type { Finding, Job, ReviewProvider } from "./types.ts";
 
 const CL: ReviewProvider[] = ["chatgpt", "local"];
@@ -347,5 +348,28 @@ describe("salvagedReview", () => {
     assert.deepEqual(salvagedReview([{ provider: "local", rawReview: cut }], 60_000), { text: cut, truncated: ["local"] });
     const whole = JSON.parse(salvageReviewJson("P1 LOCAL-RAW")).raw_review as string;
     assert.deepEqual(salvagedReview([{ provider: "local", rawReview: whole }], 60_000)?.truncated, []);
+  });
+
+  // The body neutralizes each `-->` (+3) and rewords the clean sentinel: a reply that fits by its own
+  // length used to overflow the body there, cut unannounced under a header that called it verbatim.
+  it("sizes each reply as the body renders it, never by its own length", () => {
+    const chart = `LOCAL-START ${"A --> B\n".repeat(100)}LOCAL-END`;
+    assert.ok(chart.length <= 1_000 && rawBodyText(chart).length > 1_000, "fits by its own length only");
+    const out = salvagedReview([{ provider: "local", rawReview: chart }], 1_000);
+    assert.deepEqual(out?.truncated, ["local"]);
+    assert.doesNotMatch(out?.text ?? "", /LOCAL-END/);
+    const kept = (out?.text ?? "").replace(/\n\n…\([^)]*\)$/, "");
+    assert.ok(rawBodyText(kept).length <= 1_000, `as posted: ${rawBodyText(kept).length}`);
+    assert.ok(rawBodyText(chart.slice(0, kept.length + 1)).length > 1_000, "the longest prefix that fits");
+    // shares are split by rendered length too: the neutralized reply is the longer one
+    // 1,900 of room after the labels and separator: grok's 900 fits its 950, and local is left 1,000,
+    // which holds its own 821 characters but not the 1,121 the body renders
+    const frame = "**Grok:**\n\n".length + "**Local LLM:**\n\n".length + "\n\n---\n\n".length;
+    const two = salvagedReview([{ provider: "grok", rawReview: "g".repeat(900) }, { provider: "local", rawReview: chart }], frame + 1_900);
+    assert.deepEqual(two?.truncated, ["local"]);
+    assert.ok(two?.text.includes("g".repeat(900)), "grok's reply is whole");
+    const sentinel = "Didn't find any major issues. ".repeat(40);
+    assert.deepEqual(salvagedReview([{ provider: "local", rawReview: sentinel }], sentinel.length)?.truncated, ["local"], "the reworded sentinel is longer");
+    assert.deepEqual(salvagedReview([{ provider: "local", rawReview: chart }], rawBodyText(chart).length)?.truncated, [], "exactly the rendered length fits");
   });
 });

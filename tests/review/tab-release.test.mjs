@@ -386,18 +386,19 @@ function stepClock(b) {
   b.context.Date = class extends RealDate { static now() { return now; } };
   return ms => { now += ms; };
 }
-/** A page that runs nothing until a run message starts (or resumes) its collector. */
-function freshPage() {
+/** A page that runs nothing until a run message starts (or resumes) its collector. `observing`: its
+ * collector identified the response bound to the run's sent turn (json.js busy().observing). */
+function freshPage({observing = false} = {}) {
   let running = false;
   return (_id, m) => {
     if (m.type === 'ashlar-run') { running = true; return {ok: false, code: 'busy', retry: true}; }
-    if (m.type === 'ashlar-harvest') return running ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle'};
+    if (m.type === 'ashlar-harvest') return running ? {ok: false, code: 'busy', retry: true, observing} : {ok: false, code: 'idle'};
     return {ok: true};
   };
 }
-for (const kind of ['review', 'fix']) for (const started of [false, true]) {
+for (const [kind, started] of [['review', false], ['review', true], ['fix', false]]) {
   test(`${kind}: an active leg (${started ? 'generating' : 'not dispatched yet'}) whose tab Chrome discarded is woken once, then ${started ? 'resumes observing its run' : 'dispatches its run'} there, exactly once`, async () => {
-    const b = worker(leg(kind, {started, pageUrl: TEMP}), {session: createdHere(kind), tab: discardedTab(TEMP), handler: freshPage()});
+    const b = worker(leg(kind, {started, pageUrl: TEMP}), {session: createdHere(kind), tab: discardedTab(TEMP), handler: freshPage({observing: true})});
     const {reloads, loaded} = reloadSpy(b);
     const runs = () => b.messages.filter(m => m.type === 'ashlar-run');
     await b.tick();
@@ -412,8 +413,61 @@ for (const kind of ['review', 'fix']) for (const started of [false, true]) {
     assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');assert.deepEqual(b.closedTabs, []);
     assert.equal(b.pending().states.chatgpt.outcome, undefined, 'the job goes on');
     assert.deepEqual(reloads, [10], 'woken only once');
+    b.later();await b.tick();
+    assert.equal(b.pending().states.chatgpt.outcome, undefined, `past the discard's time limit the run still goes on: ${started ? 'its page observes the response bound to its sent turn' : 'it was dispatched into the loaded page'}`);
   });
 }
+// Ashlar 4101062759, reopened: loading again is not proof that the run goes on. A reload keeps the
+// submission journal but not the page: a prompt entered but never sent (its composer text and file
+// chips are gone) waits there forever without clicking, a run dispatched before its journal was
+// written waits for a turn that never came, and a temporary chat renders nothing to observe. The
+// discard's time limit holds until the page identifies the response bound to the run's sent turn.
+test('review: a woken generating leg whose reloaded page never shows its run\'s sent turn fails after the discard\'s time limit (the failure says it was woken), and retires', async () => {
+  const b = worker(leg('review', {started: true, pageUrl: TEMP}), {session: createdHere('review'), tab: discardedTab(TEMP), handler: freshPage({observing: false})});
+  const {reloads, loaded} = reloadSpy(b);
+  const advance = stepClock(b);
+  await b.tick();loaded();await b.tick();await b.tick();
+  assert.deepEqual(reloads, [10], 'woken once');
+  assert.equal(b.messages.filter(m => m.type === 'ashlar-run' && m.resume === true).length, 1, 'observation resumed (never a new send)');
+  assert.equal(b.pending().states.chatgpt.outcome, undefined, 'within the time limit the page may still show it');
+  advance(3 * 60_000);await b.tick();
+  const failure = b.calls.find(c => c.action === 'failure');
+  assert.match(failure?.error || '', /^tab_discarded: .*woke it, but its reloaded page could not resume the run/, 'the failure is delivered and says a wake was tried');
+  for (let i = 0; i < 3 && b.pending(); i++) { advance(3 * 60_000);await b.tick(); }
+  assert.equal(b.pending(), undefined, 'retired: its capacity slot is released');
+  assert.deepEqual(reloads, [10], 'never reloaded again');
+  assert.equal(b.messages.filter(m => m.type === 'ashlar-run' && m.resume !== true).length, 0, 'never sent');
+});
+test('review: a woken page that never answers is bounded by the discard\'s time limit too', async () => {
+  const b = worker(leg('review', {started: true, pageUrl: TEMP}), {session: createdHere('review'), tab: discardedTab(TEMP), handler: freshPage()});
+  const {loaded} = reloadSpy(b);
+  const advance = stepClock(b);
+  await b.tick();loaded();
+  b.chrome.tabs.sendMessage = (id, msg, callback) => { b.messages.push({id, ...msg}); b.chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'}; callback(); b.chrome.runtime.lastError = null; };
+  b.chrome.scripting.executeScript = async () => { throw new Error('Cannot access contents of the page'); };
+  await b.tick();
+  assert.equal(b.pending().states.chatgpt.outcome, undefined);
+  advance(3 * 60_000);await b.tick();
+  assert.equal(b.pending()?.states.chatgpt.outcome?.code ?? 'retired', b.pending() ? 'tab_discarded' : 'retired');
+  assert.ok(b.calls.some(c => c.action === 'failure' && /tab_discarded/.test(c.error)), 'the failure is delivered');
+});
+// A fix's temporary chat is not restored by a reload (json.js: a reloaded temporary chat renders
+// nothing), so a fix whose run was dispatched is never woken: it fails after the time limit, and its
+// tab is kept (a fix tab closes only on its proven-success path, #77).
+test('fix: an active leg whose run was dispatched is never woken (its temporary chat is not restored); it fails after the time limit and its tab is kept', async () => {
+  const b = worker(leg('fix', {started: true, pageUrl: TEMP}), {session: createdHere('fix'), tab: discardedTab(TEMP), handler: freshPage({observing: true})});
+  const {reloads} = reloadSpy(b);
+  const advance = stepClock(b);
+  await b.tick();
+  assert.deepEqual(reloads, [], 'never woken');assert.equal(b.pending().states.chatgpt.outcome, undefined);
+  advance(3 * 60_000);await b.tick();
+  assert.ok(b.calls.some(c => c.action === 'failure' && /^tab_discarded: .*could not be woken/.test(c.error)), 'the bounded failure is delivered');
+  for (let i = 0; i < 3 && b.pending(); i++) { advance(3 * 60_000);await b.tick(); }
+  assert.equal(b.pending(), undefined, 'retired: its capacity slot is released');
+  assert.deepEqual(reloads, [], 'never reloaded');assert.deepEqual(b.closedTabs, [], 'never closed');
+  assert.ok(uploaded(b).includes('worker:preserve_undelivered'), `${uploaded(b)}`);
+  assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' || m.type === 'ashlar-harvest'), [], 'nothing was sent to the tab');
+});
 for (const kind of ['review', 'fix']) for (const [what, session, url] of [
   ['this browser session did not create', undefined, TEMP],
   ['is on another page than its run\'s', 'created', 'https://chatgpt.com/c/users-own'],

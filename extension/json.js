@@ -356,6 +356,9 @@ async function pollBoundResponse() {
   const runner = globalThis.__ashlarRunnerState;
   const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
   const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : undefined;
+  // The run's sent turn is on this page: its response can be observed here (the worker's proof that
+  // a page loaded again after a discard resumed the run, background.js discardedRunProven).
+  if (bound?.identified && runner) runner.boundObserved = true;
   if (bound?.followup && runner && !runner.tabRepurposed) {
     runner.tabRepurposed = true;
     runner.takeoverCause = "user_turn";
@@ -920,7 +923,8 @@ function installReviewRunner(name, run) {
   if (state.listener && state.protocol === "observed-submission-v7") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
   state.protocol = "observed-submission-v7";
-  const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation });
+  const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation,
+    observing: state.boundObserved === true });
   state.listener = (msg, _sender, reply) => {
     // Read-only inventory: never adopt a page, collect a prompt, or start a run.
     if (msg?.type === "ashlar-tab-status") {

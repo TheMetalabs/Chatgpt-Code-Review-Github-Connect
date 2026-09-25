@@ -1242,19 +1242,51 @@ const DISCARDED_WAKE_WAIT_MS = 2 * 60_000;
  * there, and the leg held its capacity slot until something outside reloaded the tab). The tab this
  * browser session created for the leg, on its run's own page, is woken once (wakeTabOnce): once it
  * has loaded, the poll dispatches the run into it or, for a sent run, resumes observing it (the page's
- * journal never sends a prompt twice). Any other one (not provably the leg's, on another page, or
- * already woken and still not loaded) is never reloaded: past DISCARDED_WAKE_WAIT_MS the leg fails
- * with `tab_discarded`, its failure is delivered and its tab is released by the cleanup rule, which
- * frees its slot. */
+ * journal never sends a prompt twice). A FIX whose run was dispatched is never woken: its temporary
+ * chat is not restored by a reload (json.js: it renders nothing), so nothing there could resume. Any
+ * other one (not provably the leg's, on another page, or already woken and still not loaded) is never
+ * reloaded. The discard's time limit (DISCARDED_WAKE_WAIT_MS, from the first poll that found it)
+ * holds until the loaded page proves its run goes on (discardedRunProven): past it the leg fails with
+ * `tab_discarded`, its failure is delivered and its tab is released by the cleanup rule, which frees
+ * its slot. */
 async function wakeOrFailDiscardedTab(job, provider, jobs, tab) {
   const state = job.states[provider];
   state.discardedAt ??= Date.now();
   const asleep = tab.discarded === true || tab.status === "unloaded";
-  if (asleep && onRunPage(state, provider, tab.url) && await wakeTabOnce(job, provider, jobs, tab, "wokeActiveTab")) return;
-  if (Date.now() - state.discardedAt < DISCARDED_WAKE_WAIT_MS) return saveJobs(jobs);
+  const restorable = !(job.kind === "fix" && state.started);
+  if (asleep && restorable && onRunPage(state, provider, tab.url) && await wakeTabOnce(job, provider, jobs, tab, "wokeActiveTab")) return;
+  if (!await discardWaitOver(job, provider, jobs)) await saveJobs(jobs);
+}
+
+/** Whether a page reply proves, after a discard, that the leg's run goes on in the page that loaded
+ * again: the run was dispatched into it now (a new run in a loaded page), the page settled a result
+ * (an answer, an archived source, a failure), or its collector identified the response bound to the
+ * run's sent turn there (`observing`). Loading is not that proof (Ashlar 4101062759, reopened): a
+ * reload keeps the submission journal but not the page, so a prompt that was entered but never sent
+ * (its composer text and file chips are gone) waits there forever without clicking, a run dispatched
+ * before its journal was written waits for a turn that never came, and a temporary chat renders
+ * nothing for a sent run's collector to observe. */
+function discardedRunProven(result, dispatched) {
+  if (dispatched || result?.observing === true) return true;
+  if (result?.ok === true) return true;
+  return typeof result?.code === "string" && !["busy", "idle", "disconnected", "job_mismatch"].includes(result.code);
+}
+
+/** The discard's time limit for an active leg whose tab was discarded (state.discardedAt): `proven`
+ * (discardedRunProven) ends it; past DISCARDED_WAKE_WAIT_MS without that proof the leg fails with
+ * `tab_discarded` (a prompt never clicked is never sent twice: the cleanup rule releases the tab and
+ * the slot). True if the leg failed now. */
+async function discardWaitOver(job, provider, jobs, proven = false) {
+  const state = job.states[provider];
+  if (!state.discardedAt) return false;
+  if (proven) { delete state.discardedAt; await saveJobs(jobs); return false; }
+  if (Date.now() - state.discardedAt < DISCARDED_WAKE_WAIT_MS) return false;
   delete state.discardedAt;
-  state.outcome = failure("tab_discarded", "the chat tab was discarded and could not be woken; no answer was collected");
+  state.outcome = failure("tab_discarded", state.wokeActiveTab
+    ? "the chat tab was discarded; Ashlar woke it, but its reloaded page could not resume the run; no answer was collected"
+    : "the chat tab was discarded and could not be woken; no answer was collected");
   await saveJobs(jobs);
+  return true;
 }
 
 /** The ownership verdict in a page reply: a verdict reply (ownership) as is; a cancel reply of an
@@ -1588,7 +1620,8 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     return wakeOrFailDiscardedTab(job, provider, jobs, tab);
   }
   if (tab.status && tab.status !== "complete") return;
-  if (state.discardedAt) { delete state.discardedAt; await saveJobs(jobs); } // it holds a page again
+  // A page loaded again after a discard is not yet proof that the run goes on: the time limit holds
+  // until a reply proves it (discardedRunProven, below).
   if (!allowedTab(tab, provider)) {
     state.outcome = failure("context_lost", "review tab navigated away");
     await saveJobs(jobs);
@@ -1599,12 +1632,13 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   if (tab.frozen === true) return;
   const run = { ...tabMessage(job, provider, "ashlar-run"),
     prompt: job.prompts?.[provider] || job.prompt, reasoning: job.reasoning?.[provider], adoptLegacy: state.adoptLegacy };
-  let result;
+  let result, dispatched = false;
   try {
     if (!state.started && !observeOnly) {
       // The page runner deduplicates a retried start when its acknowledgement was lost (or late:
       // askPage gives up on it, and the next tick asks again).
       result = await askPage(state.tabId, run, contentFiles(provider));
+      dispatched = true;
       state.started = true;
       workerStep(job,provider,"run_dispatched");
       await saveJobs(jobs);
@@ -1625,8 +1659,10 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     workerStep(job,provider,"disconnected");
     await saveJobs(jobs);
     await chrome.storage.local.set({ lastError: state.connectionError });
+    await discardWaitOver(job, provider, jobs); // a woken page that never answers is bounded too
     return;
   }
+  if (await discardWaitOver(job, provider, jobs, matchesJob(result, job, provider) && discardedRunProven(result, dispatched))) return;
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
     state.connectionError = "original job binding unavailable; waiting for reconnection";
     const original = await findOriginalTab(job, provider);

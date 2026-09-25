@@ -717,6 +717,61 @@ test('worker, review: a generating leg whose tab Chrome discarded is woken once;
  assert.equal(w.b.tabs.size,0,'no second tab was opened');
  assert.ok(uploadedSteps(w).includes('worker:tab_woken'),`${uploadedSteps(w)}`);
 });
+// Ashlar 4101062759, reopened: a page loaded again after a discard is not proof that the run goes on.
+// A reload keeps the submission journal but not the page: the prompt Ashlar entered but never sent
+// (its composer text and its file chip) is gone, so the resumed send waits for the chip forever and
+// never clicks (job 649's shape); a temporary chat renders nothing for a sent run's collector. The
+// discard's time limit holds until the page identifies the response bound to the run's sent turn:
+// the leg fails (tab_discarded), is delivered and retires, and the cleanup rule releases the tab.
+for(const [name,view,journal,reloaded] of [
+ ['its attachment was still uploading (the reload serves an empty composer, no chip)',{composer:PROMPT,chips:['diff.patch'],uploading:true,sendDisabled:true},{phase:'prepared',expected:PROMPT,baseline:0,attachments:['diff.patch']},{composer:'',chips:[],uploading:false,sendDisabled:false}],
+ ['its answer was generating in a temporary chat (the reload renders nothing)',{thread:userTurn()+answerTurn({done:false}),after:stopButton},sentJournal(),{thread:'',after:''}],
+])test(`worker, review: a leg whose tab Chrome discarded while ${name} is woken once, then fails within the discard's time limit, never sends, and its tab is released`,async t=>{
+ const tab=await chatTab(t,{...view,journal});
+ const w=wire(tab,{session:createdHere()});
+ await w.tick();await tab.page.clock.runFor(1600);
+ assert.equal((await tab.runner()).running,true,'the run is going on');
+ Object.assign(w.b.tabs.get(10),{status:'unloaded',discarded:true});
+ Object.assign(tab.served,reloaded);
+ const reloads=[];
+ w.b.chrome.tabs.reload=async id=>{reloads.push(id);Object.assign(w.b.tabs.get(id),{discarded:false,status:'loading'});await tab.reload();};
+ await w.tick({syncUrl:false});
+ assert.deepEqual(reloads,[10],'woken once');
+ w.b.tabs.get(10).status='complete';
+ await w.tick();await tab.page.clock.runFor(5000);await w.tick();
+ assert.equal((await tab.runner()).running,true,'the resumed run waits in the reloaded page');
+ assert.equal(w.state().outcome,undefined,'within the time limit the page may still resume');
+ w.later();await w.tick();await tab.page.clock.runFor(5000);
+ const failure=w.b.calls.find(c=>c.action==='failure');
+ assert.match(failure?.error||'',/^tab_discarded: .*woke it/,'the bounded failure is delivered');
+ assert.equal(w.state(),undefined,`retired, capacity released: ${uploadedSteps(w)}`);
+ assert.deepEqual(w.b.closedTabs,[10],'nothing of the user\'s in the reloaded page: the cleanup rule closes it');
+ assert.deepEqual(reloads,[10]);assert.equal(await tab.clicks(),0,'the prompt is never sent from the woken page');
+ assert.equal(w.b.messages.filter(m=>m.type==='ashlar-run'&&m.resume!==true).length,0,'never dispatched again');
+});
+// A fix's temporary chat is not restored by a reload, so a fix whose run was dispatched is never
+// woken; if the user brings the tab back (Chrome reloads it), its collector has nothing to observe.
+// Either way the leg ends in a bounded failure and the tab is kept (#77), its run stopped.
+for(const [name,userReloads] of [['Ashlar never wakes it',false],['the user brings it back (Chrome reloads it) and the temporary chat renders nothing',true]])test(`worker, fix: a generating leg whose temporary chat Chrome discarded (${name}) ends in a bounded failure and its tab is kept`,async t=>{
+ const tab=await generatingTab(t,{kind:'fix'});
+ const w=wire(tab,{kind:'fix',session:createdHere('fix-A')});
+ await w.tick();await tab.page.clock.runFor(1600);
+ assert.equal((await tab.runner()).running,true,'generating');
+ Object.assign(w.b.tabs.get(10),{status:'unloaded',discarded:true});
+ Object.assign(tab.served,{thread:'',after:''});
+ const reloads=[];
+ w.b.chrome.tabs.reload=async id=>{reloads.push(id);};
+ await w.tick({syncUrl:false});
+ assert.deepEqual(reloads,[],'never woken by Ashlar');
+ if(userReloads){await tab.reload();Object.assign(w.b.tabs.get(10),{discarded:false,status:'complete'});await w.tick();await tab.page.clock.runFor(2400);await w.tick();}
+ assert.equal(w.state().outcome,undefined,'within the time limit');
+ w.later();await w.tick({syncUrl:false});
+ assert.ok(w.b.calls.some(c=>c.action==='failure'&&/^tab_discarded/.test(c.error)),'the bounded failure is delivered');
+ assert.equal(w.state(),undefined,'retired, capacity released');
+ assert.deepEqual(w.b.closedTabs,[],'a fix tab without a delivered answer is kept (#77)');assert.deepEqual(reloads,[]);
+ assert.ok(uploadedSteps(w).includes('worker:preserve_undelivered'),`${uploadedSteps(w)}`);
+ if(userReloads){await tab.page.clock.runFor(1000);assert.deepEqual(await tab.runner(),{running:false,code:'cancelled'},'the kept tab\'s run is stopped');}
+});
 test('worker: a cancelled leg whose page could not be reached before the server forgot the job ("missing") still closes',async t=>{
  const tab=await generatingTab(t);
  const w=wire(tab);

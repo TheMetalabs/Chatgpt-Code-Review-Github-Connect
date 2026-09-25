@@ -14,6 +14,7 @@ import {
   effectiveLoopMode,
   loopEnabled,
   loopPostedReview,
+  loopStepGateForTests,
   renderFindings,
   runPostReviewLoop,
   SILENT_REASONS,
@@ -2332,5 +2333,46 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.deepEqual(rb, { ran: false, reason: ROUND_ALREADY_RUN });
     assert.equal(f.prompts.length, 1);
     assert.equal(suggestions(f.posted).length, 1);
+  });
+});
+
+describe("the production step gate (harbor passes no deps: its only path)", () => {
+  const { stepState, stepWaitMaxMs, MAX_TIMER_MS } = loopStepGateForTests;
+  const H = 60 * 60_000;
+
+  it("is ONE process-wide state across calls, shared by the steps and stopLoop", () => {
+    assert.equal(stepState(undefined), stepState(undefined));
+    assert.ok(stepState(undefined).slots instanceof Map && stepState(undefined).pendingStarts instanceof Map);
+  });
+
+  it("injected deps share the state of their GitHub client, whatever the deps object", () => {
+    const f = fakeDeps();
+    assert.equal(stepState({ ...f.deps }), stepState(f.deps), "another deps object, the same client");
+    assert.notEqual(stepState(fakeDeps().deps), stepState(f.deps), "another client");
+    assert.notEqual(stepState(f.deps), stepState(undefined));
+  });
+
+  it("the wait outlasts the running step's worst case: every attempt queued to its ceiling, then generating to its deadline", () => {
+    const worst = (attempts: number, queueMs: number, generationMs: number) => attempts * (queueMs + generationMs);
+    const cases: Array<[NodeJS.ProcessEnv, number]> = [
+      [{}, worst(2, 6 * H, 1 * H)], // the defaults
+      [{ ASHLAR_FIX_ATTEMPTS: "5", ASHLAR_FIX_QUEUE_MAX_MS: String(24 * H), ASHLAR_FIX_TIMEOUT_MS: String(6 * H) }, worst(5, 24 * H, 6 * H)], // the maxima
+      [{ ASHLAR_FIX_ATTEMPTS: "1", ASHLAR_FIX_QUEUE_MAX_MS: "1", ASHLAR_FIX_TIMEOUT_MS: "1" }, worst(1, 10 * 60_000, 60_000)], // clamped minima
+    ];
+    for (const [env, min] of cases) {
+      const bound = stepWaitMaxMs(undefined, env);
+      assert.ok(bound >= min, `${JSON.stringify(env)}: ${bound} < ${min}`);
+      assert.ok(bound <= MAX_TIMER_MS, `${JSON.stringify(env)}: a timer cannot hold ${bound} ms`);
+    }
+    const f = fakeDeps();
+    f.deps.fixWatch = { queueMaxMs: 1_000 };
+    f.deps.fixTimeoutMs = 500;
+    assert.ok(stepWaitMaxMs(f.deps, {}) >= worst(2, 1_000, 500), "injected deadlines count as the running step's own");
+  });
+
+  it("an override past a timer's range is clamped to it (an unclamped one fires at once and expires every waiter)", () => {
+    const f = fakeDeps();
+    f.deps.stepWaitMaxMs = 1e12;
+    assert.equal(stepWaitMaxMs(f.deps, {}), MAX_TIMER_MS);
   });
 });

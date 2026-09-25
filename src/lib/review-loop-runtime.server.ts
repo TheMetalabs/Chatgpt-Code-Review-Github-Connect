@@ -380,6 +380,10 @@ function stepWaitMaxMs(deps: LoopRuntimeDeps | undefined, env: NodeJS.ProcessEnv
   return Math.min(Math.max(0, deps?.stepWaitMaxMs ?? own), MAX_TIMER_MS);
 }
 
+/** Tests only: the step gate's production path (harbor passes no deps) is unreachable from a unit
+ * test, which always injects a client. */
+export const loopStepGateForTests = { stepState, stepWaitMaxMs, MAX_TIMER_MS } as const;
+
 /** The operator's current settings for a step admitted after a wait: harbor replaces its settings
  * object on every save, so the one a step was called with can be hours old. Production re-loads the
  * store that save writes (loaded lazily, as the other production modules are). */

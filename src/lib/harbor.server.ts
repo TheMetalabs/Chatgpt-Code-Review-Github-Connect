@@ -407,8 +407,8 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
 }
 
 async function bridgeSnapshot() {
-  const { getBridgePublic } = await import("./bridge.server");
-  return getBridgePublic();
+  const { getBridgePublic, chatBridgeLink } = await import("./bridge.server");
+  return { bridge: getBridgePublic(), chatBridgeLink };
 }
 
 const WATCH_TICK_MS = 5_000;
@@ -442,7 +442,7 @@ async function watchReviewersLoop(jobId: string, token: string) {
   let lastNotes = "";
   let localStarted = false;
   for (;;) {
-    const bridge = await bridgeSnapshot();
+    const { bridge, chatBridgeLink } = await bridgeSnapshot();
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
     if (job.status === "cancelled" || job.status === "posted" || job.status === "skipped" || job.status === "dlq") return;
@@ -470,11 +470,13 @@ async function watchReviewersLoop(jobId: string, token: string) {
     }
     const stored = job.storedLegs ?? [];
     // verify-clean: a chat leg with no progress while the bridge is offline / never claims the job
-    // (a stale `generating` flag from before the bridge went away is not progress).
+    // (a stale `generating` flag from before the bridge went away is not progress). A claimed job is
+    // judged by its owning profile's link: no other profile can resume its run.
+    const link = chatBridgeLink(job);
     const stalled = localVerifies({ role, providers: job.reviewProviders ?? [] }) && chatStalled({
-      chatProgress: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()) || (Boolean(bridge.connected) && chat.some((p) => job.generating?.[p])),
-      connected: Boolean(bridge.connected),
-      disconnectedAt: bridge.disconnectedAt,
+      chatProgress: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()) || (link.connected && chat.some((p) => job.generating?.[p])),
+      connected: link.connected,
+      disconnectedAt: link.disconnectedAt,
       now: Date.now(),
       graceMs: BRIDGE_CONNECTED_MS,
     });

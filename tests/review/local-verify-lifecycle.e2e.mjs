@@ -172,14 +172,16 @@ const ROWS=[
       assert.ok(s.job().localFallbackAt,'released as the fallback');
       return s;
     }},
-  {name:'L12 claim lease expiry while the bridge stays connected never releases local; only cancel ends it',expect:{status:'cancelled',skip:/cancelled by operator/,requests:0,reviews:0},
+  {name:'L12 claim lease expiry while the owning profile stays connected never releases local; only cancel ends it',expect:{status:'cancelled',skip:/cancelled by operator/,requests:0,reviews:0},
     async run(t){
       const s=await start(t);
       s.app.bridge.bridgeHeartbeat();
       assert.ok(s.app.bridge.takeNextBridgeJob('lifecycle-client'),'the bridge claims the job');
-      // 12 × 110s = 22 min > BRIDGE_CLAIM_MS (20 min): a heartbeat every 110s keeps the bridge connected
+      // 12 × 110s = 22 min > BRIDGE_CLAIM_MS (20 min): every 110s the owner heartbeats and polls for
+      // other work while it holds this job (excluded, so its lease is not renewed), staying connected
       for(let i=0;i<12;i++){
         s.app.clock.now+=110_000;s.app.bridge.bridgeHeartbeat();
+        assert.equal(s.app.bridge.takeNextBridgeJob('lifecycle-client',[s.jobId]),null,'no other work');
         await new Promise(resolve=>setTimeout(resolve,60)); // a few watcher ticks at each step
       }
       assert.equal(s.app.bridge.getBridgePublic().connected,true);
@@ -187,6 +189,45 @@ const ROWS=[
       assert.equal(s.app.localRequests.length,0,'an expired lease is not a reviewer deadline');
       assert.equal(s.app.harbor.hasLocalSample(s.jobId),true,'the held job keeps its snapshot');
       s.app.harbor.cancelHarborJob(s.jobId);
+      return s;
+    }},
+  // Chat ownership is per profile: only the owner can resume a claimed run (nextBridgeJob, claimBridgeJob),
+  // so the owner's silence stalls the job whatever another profile does.
+  {name:'L22 another profile keeps the bridge connected: the silent owner still stalls, local is released as the fallback, and the other profile never takes the owner\'s run',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,reviewers:FALLBACK_ONLY,ops:FALLBACK_OPS},
+    async run(t){
+      const s=await start(t);
+      s.app.bridge.bridgeHeartbeat();
+      const take=s.app.bridge.takeNextBridgeJob('client-a');
+      assert.equal(take?.jobId,s.jobId,'client A claims the job');
+      await settle();assert.equal(s.app.localRequests.length,0,'a claimed chat leg keeps local held');
+      // Client A goes silent. Client B heartbeats and polls for work every 60s, past A's grace.
+      for(let i=0;i<5;i++){
+        s.app.clock.now+=60_000;s.app.bridge.bridgeHeartbeat();
+        assert.equal(s.app.bridge.takeNextBridgeJob('client-b'),null,'client B never takes A\'s run');
+        await new Promise(resolve=>setTimeout(resolve,60)); // a few watcher ticks at each step
+      }
+      assert.equal(s.app.bridge.getBridgePublic().connected,true,'the bridge stays connected through client B');
+      await eventually(()=>s.app.localRequests.length===1,'the fallback did not start');
+      assert.ok(s.job().localFallbackAt&&!s.job().localVerifyStartedAt,'released as the fallback, not a verification');
+      assert.equal(s.app.bridge.takeNextBridgeJob('client-b'),null,'client B still cannot take A\'s run');
+      assert.match(String(s.app.bridge.claimBridgeJob(s.jobId,'client-b').error),/another Chrome profile/,'nor claim it');
+      await answerLocal(s.app,0,res=>res.end(reply(dirty)));
+      return s;
+    }},
+  {name:'L23 the owner\'s lease pings keep its long chat run alive while another profile heartbeats: local stays held',expect:{status:'posted',requests:0,reviews:1,reviewers:VERIFIER,ops:VERIFIER_OPS},
+    async run(t){
+      const s=await start(t);
+      s.app.bridge.bridgeHeartbeat();
+      const take=s.app.bridge.takeNextBridgeJob('client-a');
+      assert.equal(take?.jobId,s.jobId,'client A claims the job');
+      // A generates for 10 min, heard from only through its job's lease pings (as the extension does).
+      for(let i=0;i<10;i++){
+        s.app.clock.now+=60_000;s.app.bridge.bridgeHeartbeat();
+        assert.equal(s.app.bridge.refreshBridgeClaim(s.jobId,{chatgpt:true},{},take.leaseId),true,'A\'s lease ping is accepted');
+        await new Promise(resolve=>setTimeout(resolve,60)); // a few watcher ticks at each step
+      }
+      assert.equal(s.app.localRequests.length,0,'a live owner\'s generation is not a stall');
+      assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
       return s;
     }},
   {name:'L13 a bridge token rotation waits the grace from the rotation, not from an older unseen bridge',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,reviewers:FALLBACK_ONLY,ops:FALLBACK_OPS},
@@ -364,3 +405,25 @@ for(const row of ROWS){
     assert.equal(Boolean(s.abort?.aborted),Boolean(e.aborted),'in-flight local request aborted');
   });
 }
+
+test('chat bridge link: an owned job follows its owner, an unowned one the server-wide bridge, and a rotation disconnects every owner',async t=>{
+  const {app,jobId}=await start(t,{delivery:'lifecycle-bridge-link'});
+  const link=bridgeClientId=>({...app.bridge.chatBridgeLink({bridgeClientId})}); // copied into this realm for deepEqual
+  const serverWide=()=>{const {connected,disconnectedAt}=app.bridge.getBridgeStatus();return {connected,disconnectedAt};};
+  assert.deepEqual(link(undefined),serverWide(),'no owner: the server-wide status (offline)');
+  app.bridge.bridgeHeartbeat();
+  assert.deepEqual(link(undefined),serverWide(),'no owner: the server-wide status (online)');
+  assert.deepEqual(link(''),serverWide(),'a claim without a profile id has no owner');
+  assert.equal(link('client-a').connected,false,'a profile never heard from is offline, whoever else heartbeats');
+  assert.equal(app.bridge.claimBridgeJob(jobId,'client-a').ok,true);
+  const claimedAt=app.clock.now;
+  assert.deepEqual(link('client-a'),{connected:true,disconnectedAt:undefined},'a claim is heard from its profile');
+  app.clock.now+=120_001;app.bridge.bridgeHeartbeat();
+  assert.deepEqual(link('client-a'),{connected:false,disconnectedAt:claimedAt+120_000},'offline when its own window closed');
+  assert.equal(app.bridge.recoverBridgeJob('client-a',[]),null,'nothing to recover');
+  assert.equal(link('client-a').connected,true,'a recover request is heard from its profile');
+  app.clock.now+=10_000;
+  app.bridge.rotateBridgeToken();
+  assert.deepEqual(link('client-a'),{connected:false,disconnectedAt:app.clock.now},'offline at the rotation, as an unseen bridge is');
+  app.harbor.cancelHarborJob(jobId);
+});

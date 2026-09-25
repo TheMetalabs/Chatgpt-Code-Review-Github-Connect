@@ -134,12 +134,19 @@ It is called only on an **explicit terminal signal** of the chat round:
 | The merged chat result is `verify` (§1: 0 findings, no raw, every chat payload a complete verdict) | verification round (`localVerifyChat` = the chat reviewers whose complete verdict was clean) | `submitHarborChat` |
 | Every chat leg finished without a usable payload (no valid JSON) | fallback | `submitHarborChat` |
 | Every chat leg reached an explicit terminal outcome (quota, empty, tab closed, error) with no payload | fallback | watcher |
-| The Chrome bridge reports disconnected for at least `BRIDGE_CONNECTED_MS`, measured from the disconnect, with no chat progress | fallback | watcher (`chatStalled`) |
+| The job's Chrome bridge link reports disconnected for at least `BRIDGE_CONNECTED_MS`, measured from the disconnect, with no chat progress | fallback | watcher (`chatStalled`) |
 
-The disconnect time is the bridge's own (`BridgeStatus.disconnectedAt` in `bridge.server.ts`): for a
-bridge seen before, when `connected` flipped (`lastSeen + BRIDGE_CONNECTED_MS`); for one not seen
-with the current token, process start or the last token rotation. A rotation therefore restarts the
-grace, and no older observation dates a newer disconnect. Row L13 pins it.
+The link is `chatBridgeLink` in `bridge.server.ts`. A job no Chrome profile has claimed uses the
+server-wide bridge status (`BridgeStatus.disconnectedAt`): for a bridge seen before, when `connected`
+flipped (`lastSeen + BRIDGE_CONNECTED_MS`); for one not seen with the current token, process start or
+the last token rotation. A rotation therefore restarts the grace, and no older observation dates a
+newer disconnect. Row L13 pins it.
+
+A claimed job (`Job.bridgeClientId`) can be resumed only by the profile that owns it (`nextBridgeJob`,
+`claimBridgeJob`), so its link is that profile's own: when it was last heard from, by a request that
+names it (take, claim, recover) or by a ping under its lease for any job it owns, with the same
+window and the same rotation rule. Another profile's heartbeat keeps the server-wide bridge connected
+but never masks the owner's silence (row L22); the owner's lease pings keep a long run alive (L23).
 
 A fallback release is permanent (it never re-releases), and it waives chat for as long as that local
 leg can still deliver the review (`fallbackWaivesChat`: running, or finished with a payload). Meanwhile
@@ -160,13 +167,13 @@ skipped under it. A chat leg that already ended with nothing (L9) leaves nothing
 What never releases it:
 
 - job age or any timer on the job;
-- `BRIDGE_CLAIM_MS` lease expiry — it is an ownership lease, not a reviewer deadline, and a bridge
+- `BRIDGE_CLAIM_MS` lease expiry — it is an ownership lease, not a reviewer deadline, and a link
   that stays connected keeps local held however long chat takes;
-- a stale `generating` flag, or a `disconnected` provider error while the bridge is still connected.
+- a stale `generating` flag, or a `disconnected` provider error while the link is still connected.
 
 Chat findings (or a chat raw reply) never release local at all: the chat result posts and the job's
 terminal cleanup (§3) frees the snapshot. `tests/review/local-verify-lifecycle.e2e.mjs` rows L10–L12
-pin the watcher signals, including a claim lease expiring under a connected bridge.
+pin the watcher signals, including a claim lease expiring while its owner stays connected.
 
 ## §3 Terminal cleanup — one writer, one edge
 

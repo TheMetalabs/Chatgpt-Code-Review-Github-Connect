@@ -50,6 +50,11 @@ function loadToken(): string {
 }
 
 let meta: BridgeMeta = { token: loadToken(), lastSeen: 0, unseenSince: Date.now() };
+/** When each Chrome profile (clientId) was last heard from: a request naming it (take, claim,
+ * recover) or a lease ping for a job it owns. Kept apart from meta.lastSeen, which any profile
+ * refreshes, because a claimed job's chat run can be resumed only by its owner. */
+const clientSeen = new Map<string, number>();
+const MAX_TRACKED_CLIENTS = 256;
 // Diagnostic only, never used as authorization or to cancel a generation.
 const serverInstanceId = randomBytes(12).toString("base64url");
 
@@ -94,6 +99,28 @@ function bridgeDisconnectedAt(): number {
   return meta.lastSeen > 0 ? meta.lastSeen + BRIDGE_CONNECTED_MS : meta.unseenSince;
 }
 
+function noteClientSeen(clientId: string | undefined) {
+  if (!clientId) return;
+  clientSeen.delete(clientId);
+  clientSeen.set(clientId, Date.now());
+  if (clientSeen.size > MAX_TRACKED_CLIENTS) clientSeen.delete(clientSeen.keys().next().value!);
+}
+
+/** The bridge link a job's chat run depends on. A claimed job (bridgeClientId) can be resumed only by
+ * the profile that owns it (nextBridgeJob, claimBridgeJob), so it is that profile's own liveness:
+ * another profile's heartbeat never masks the owner's disconnect. A job no profile owns uses the
+ * server-wide status. An owner not heard from since this token started (process start or rotation)
+ * went offline then, as an unseen bridge does. */
+export function chatBridgeLink(job: Pick<Job, "bridgeClientId">): {connected: boolean; disconnectedAt?: number} {
+  if (!job.bridgeClientId) {
+    const {connected, disconnectedAt} = getBridgeStatus();
+    return {connected, disconnectedAt};
+  }
+  const seen = clientSeen.get(job.bridgeClientId) ?? 0;
+  const connected = seen > 0 && Date.now() - seen < BRIDGE_CONNECTED_MS;
+  return {connected, disconnectedAt: connected ? undefined : seen > 0 ? seen + BRIDGE_CONNECTED_MS : meta.unseenSince};
+}
+
 export function getBridgePublic(): BridgePublic {
   const { token: _t, ...rest } = getBridgeStatus();
   return {...rest, protocolVersion: 1, serverInstanceId, lastTakeAt: meta.lastTakeAt,
@@ -108,6 +135,7 @@ export function rotateBridgeToken() {
   const token = newToken();
   persistToken(token);
   meta = { token, lastSeen: 0, unseenSince: Date.now() };
+  clientSeen.clear(); // every profile is offline until it gets the new token
   return getBridgeStatus();
 }
 
@@ -217,6 +245,7 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
 
 export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = []): ReturnType<typeof nextBridgeJob> {
   meta.lastTakeAt = Date.now();
+  noteClientSeen(clientId);
   const job = nextBridgeJob(clientId, excludeJobIds);
   if (!job) return null;
   const claim = claimBridgeJob(job.jobId, clientId);
@@ -234,6 +263,7 @@ export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[
  */
 export function recoverBridgeJob(clientId: string, values: unknown) {
   if (!clientId || !Array.isArray(values) || values.length > 16) return null;
+  noteClientSeen(clientId);
   const bindings = values.filter((item): item is {jobId:string;provider:"chatgpt"|"grok";runId:string} =>
     Boolean(item && typeof item === "object" && typeof item.jobId === "string" && item.jobId.length <= 160 &&
       isChatProvider(item.provider) && typeof item.runId === "string" && item.runId.length > 0 && item.runId.length <= 128));
@@ -332,11 +362,14 @@ export function refreshBridgeClaim(
     }
     return {...current, bridgeClaimedAt: Date.now(), generating: nextGenerating, providerErrors: nextErrors, updatedAt: Date.now()};
   });
+  // Only a ping under the owner's own lease speaks for the owner.
+  if (job.bridgeLeaseId && job.bridgeLeaseId === leaseId) noteClientSeen(job.bridgeClientId);
   meta.lastJobId = jobId;
   return true;
 }
 
 export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId: string} | {ok: false; error: string} {
+  noteClientSeen(clientId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job) || !(job.chatPrompt || job.chatPromptByProvider)) {
     return {ok: false, error: "job is not waiting for chat"};

@@ -27,7 +27,7 @@ import {
   parseEscalateMarker,
   parseFindingsTotal,
   isConvergedFindings,
-  isIncompleteOutcome,
+  notCleanOutcomeOf,
   parseReviewLoopDirective,
   parseStartMarker,
   parseStopRecord,
@@ -449,8 +449,9 @@ function pushStop(events: LoopEvent[], c: { body?: string; createdAt?: string; u
  *   edit time; the App's STOPPED acknowledgement RECORDS them (review-loop.ts stoppedComment),
  *   placed at the stop's own time — never at the acknowledgement's.
  * - ONLY the App contributes escalate / stopped markers (a handoff with its head), its canonical
- *   continuation for THIS PR (the head the loop moved to), and converged (total=0) and incomplete
- *   (the fixed INCOMPLETE marker) reviews with their commit.
+ *   continuation for THIS PR (the head the loop moved to), and converged (total=0) and not-clean
+ *   (review-loop.ts notCleanOutcomeOf: incomplete, raw, raw-unverified, unverified-clean) reviews
+ *   with their commit.
  * Reads fail closed: a list error throws (the caller must not act on a partial history).
  */
 export async function readLoopEvents(
@@ -493,7 +494,10 @@ export async function readLoopEvents(
   for (const r of reviews) {
     if (!isSelfLogin(r.userLogin, botLogin) || !r.submittedAt) continue;
     if (isConvergedFindings(r.body)) events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
-    else if (isIncompleteOutcome(r.body)) events.push({ at: r.submittedAt, kind: "incomplete", head: r.commitId || undefined });
+    else {
+      const outcome = notCleanOutcomeOf(r.body);
+      if (outcome) events.push({ at: r.submittedAt, kind: "not-clean", outcome, head: r.commitId || undefined });
+    }
   }
   return events;
 }

@@ -14,15 +14,16 @@
  *   the starter (the apply-permission subject) — it never resets the round count.
  * - Terminal events END an active session: a human stop directive, the bot's ESCALATE marker,
  *   the bot's STOPPED marker, a bot review with `ashlar-findings total=0` (CONVERGED), or a bot
- *   review with the INCOMPLETE marker. An incomplete review is not a clean pass and carries no
- *   finding, so the session it ends OWES the fixed loop-error handoff (owedHandoff) until it is
- *   settled (settlesOwed: the bot's handoff for its head, a stop, or a later clean review): its own
- *   loop step posts it, and when a crash or a failed post lost it, the next loop step on the PR (a
+ *   review whose marker records a NOT CLEAN outcome (review-loop.ts notCleanOutcomeOf: incomplete,
+ *   raw, raw-unverified, unverified-clean). Such a review is not a clean pass and carries no
+ *   structured finding, so the session it ends OWES the fixed loop-error handoff (owedHandoff) until
+ *   it is settled (settlesOwed: the bot's handoff for its head, a stop, or a later clean review): its
+ *   own loop step posts it, and when a crash or a failed post lost it, the next loop step on the PR (a
  *   push, another review) recovers it from this durable marker. A new start opens a new session.
  * - A terminal event with no active session is a no-op, except that the bot's STOPPED marker
  *   acknowledges a preceding human stop (endedBy "stop" → "stopped"), which makes the STOPPED
  *   emission idempotent.
- * - A clean (or incomplete) review is CONVERGED (INCOMPLETE) only for the head the loop is waiting on. The loop moves to a
+ * - A clean (or not-clean) review ends the session only for the head the loop is waiting on. The loop moves to a
  *   new head through the driver's continuation (`continue`) or a push (`push`, injected by the
  *   push handler); a clean review of any OTHER head that is not the PR's live head is stale — it
  *   landed after the loop had moved on — and is ignored. A continuation posted AFTER a converged
@@ -38,20 +39,30 @@
  * Authorship is the CALLER's job: only bot-authored markers/reviews may become escalate /
  * stopped / converged / continue events, and bot-authored comments never become start/stop events.
  */
-import { isoMs, type ReviewLoopMode } from "./review-loop.ts";
+import { isoMs, type NotCleanOutcome, type ReviewLoopMode } from "./review-loop.ts";
 
-export type LoopEventKind = "start" | "stop" | "escalate" | "stopped" | "converged" | "incomplete" | "continue" | "push";
+export type LoopEventKind = "start" | "stop" | "escalate" | "stopped" | "converged" | "not-clean" | "continue" | "push";
 
 export interface LoopEvent {
   at: string; // ISO timestamp (created_at / submitted_at)
   kind: LoopEventKind;
   mode?: ReviewLoopMode; // start only
   actor?: string; // start / stop author
-  /** converged / incomplete: the reviewed commit; escalate: the handoff's head; continue / push: the
+  /** converged / not-clean: the reviewed commit; escalate: the handoff's head; continue / push: the
    * head the loop moved to. */
   head?: string;
+  /** not-clean only: the outcome its marker records. */
+  outcome?: NotCleanOutcome;
   /** The issue comment's id (monotonic): a start record's id identifies its session exactly. */
   seq?: number;
+}
+
+/** The loop-error handoff a session that ended at a not-clean review owes (LoopSession.owedHandoff). */
+export interface OwedHandoff {
+  head?: string;
+  outcome?: NotCleanOutcome;
+  startIso?: string;
+  startSeq?: number;
 }
 
 export interface LoopSession {
@@ -67,24 +78,25 @@ export interface LoopSession {
   starter?: string;
   endedBy?: Exclude<LoopEventKind, "start" | "continue" | "push">;
   endedAt?: string;
-  /** The session ended at an incomplete review (endedBy "incomplete") and no bot handoff for its head
-   * followed: the fixed loop-error handoff it owes, for that head, scoped to the session it ended. */
-  owedHandoff?: { head?: string; startIso?: string; startSeq?: number };
+  /** The session ended at a not-clean review (endedBy "not-clean") and no bot handoff for its head
+   * followed: the fixed loop-error handoff it owes, for that head and outcome, scoped to the session it
+   * ended. */
+  owedHandoff?: OwedHandoff;
 }
 
 // Same-second ties: head moves, then the App's terminal records (a new start in a handoff's
 // second opens a NEW session), then starts, then human stops — a stop in a start's second is
 // causally after it, and stopping is the safe reading.
-const ORDER: Record<LoopEventKind, number> = { continue: -1, push: -1, escalate: 0, stopped: 0, converged: 0, incomplete: 0, start: 1, stop: 2 };
+const ORDER: Record<LoopEventKind, number> = { continue: -1, push: -1, escalate: 0, stopped: 0, converged: 0, "not-clean": 0, start: 1, stop: 2 };
 
-/** A clean or incomplete review of `head` is stale when the loop already waits on another head and
+/** A clean or not-clean review of `head` is stale when the loop already waits on another head and
  * `head` is not the live one. An unknown reviewed commit keeps the verdict (fail toward ending the loop). */
 function staleVerdict(head: string | undefined, awaited: string | undefined, live: string | undefined): boolean {
   if (!head || head === live) return false;
   return awaited !== undefined && head !== awaited;
 }
 
-/** What settles the handoff an incomplete review owes, once its session ended: the bot's handoff for
+/** What settles the handoff a not-clean review owes, once its session ended: the bot's handoff for
  * its head, a human stop (the loop is stopped anyway), or a clean review of its head or of the live
  * head (the PR converged after all). Another review that is not clean leaves it owed: its own loop step
  * posts the handoff instead of a fix round. */
@@ -103,7 +115,7 @@ export function deriveLoopSession(events: readonly LoopEvent[], opts: { liveHead
     .map((x) => x.e);
   let s: LoopSession = { active: false };
   let awaited: string | undefined; // the head the active session waits on (latest continue / push)
-  // A converged or incomplete end that a later continuation may prove stale: the session it ended +
+  // A converged or not-clean end that a later continuation may prove stale: the session it ended +
   // its head (the driver decided to continue before that review landed).
   let resumable: { session: LoopSession; head: string } | undefined;
   for (const e of sorted) {
@@ -121,16 +133,16 @@ export function deriveLoopSession(events: readonly LoopEvent[], opts: { liveHead
         resumable = undefined;
       }
     } else if (s.active) {
-      const verdict = e.kind === "converged" || e.kind === "incomplete";
+      const verdict = e.kind === "converged" || e.kind === "not-clean";
       if (verdict && staleVerdict(e.head, awaited, opts.liveHead)) continue; // ignored
       resumable = verdict && e.head && e.head !== opts.liveHead ? { session: s, head: e.head } : undefined;
-      const owed = e.kind === "incomplete" ? { owedHandoff: { head: e.head, startIso: s.startIso, startSeq: s.startSeq } } : {};
+      const owed = e.kind === "not-clean" ? { owedHandoff: { head: e.head, outcome: e.outcome, startIso: s.startIso, startSeq: s.startSeq } } : {};
       s = { active: false, endedBy: e.kind, endedAt: e.at, ...owed };
       awaited = undefined;
     } else {
-      // After an end, a human stop, a handoff, or a clean or incomplete review of the LIVE head settles
+      // After an end, a human stop, a handoff, or a clean or not-clean review of the LIVE head settles
       // it (no later resume); a duplicate review of an older head does not.
-      if ((e.kind !== "converged" && e.kind !== "incomplete") || e.head === opts.liveHead) resumable = undefined;
+      if ((e.kind !== "converged" && e.kind !== "not-clean") || e.head === opts.liveHead) resumable = undefined;
       if (e.kind === "stopped" && s.endedBy === "stop") s = { ...s, endedBy: "stopped" };
       if (s.owedHandoff && settlesOwed(e, s.owedHandoff.head, opts.liveHead)) {
         const { owedHandoff: _settled, ...rest } = s;

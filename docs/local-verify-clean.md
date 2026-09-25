@@ -16,7 +16,10 @@ alone: the body's first line, the raw block header, the trailing `ashlar-finding
 `incomplete`, its own `<!-- ashlar-outcome incomplete -->` marker), and so the loop's CONVERGED signal. The loop runtime (`runPostReviewLoop`) asks `postedOutcome` the same
 question instead of counting findings: a zero-finding review whose kind is not CONVERGED (`raw`,
 `raw-unverified`, `unverified-clean`, `incomplete`) gets one fixed ESCALATE `loop-error` in an active
-session, never a silent stop. No other code reads `localVerified`, `rawReview` or `skippedProviders`
+session, never a silent stop. Each of those four is read back from its own trailing marker
+(`notCleanOutcomeOf` in `src/lib/review-loop.ts`) as the end of the loop session owing that handoff, so
+a handoff lost to a crash or a failed post is recovered by the next loop step
+([review-loop-design.md §3](review-loop-design.md)). No other code reads `localVerified`, `rawReview` or `skippedProviders`
 to decide any of these.
 
 `findings` is the publish-gated count. A job is a *verifier* when its role is `verify-clean`, both a

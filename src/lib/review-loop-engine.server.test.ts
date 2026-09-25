@@ -436,12 +436,36 @@ describe("durable loop events: authorship is enforced when reading history", () 
       ],
     );
     const events = await readLoopEvents(g as never, "t", "o", "r", 1);
-    assert.deepEqual(events.filter((e) => e.kind === "incomplete").map((e) => `${e.at}:${e.head}`), ["2026-01-02T00:00:00Z:c"]);
+    assert.deepEqual(events.filter((e) => e.kind === "not-clean").map((e) => `${e.at}:${e.outcome}:${e.head}`), ["2026-01-02T00:00:00Z:incomplete:c"]);
     assert.deepEqual(events.filter((e) => e.kind === "escalate").map((e) => e.head), ["h"], "a handoff carries its head");
     const session = await readLoopSession(g as never, "t", "o", "r", 1, { pr: { sha: "c" } });
     assert.equal(session.active, false);
-    assert.equal(session.endedBy, "incomplete", "never converged");
-    assert.deepEqual(session.owedHandoff, { head: "c", startIso: "2026-01-01T00:00:00Z", startSeq: undefined });
+    assert.equal(session.endedBy, "not-clean", "never converged");
+    assert.deepEqual(session.owedHandoff, { head: "c", outcome: "incomplete", startIso: "2026-01-01T00:00:00Z", startSeq: undefined });
+  });
+
+  it("raw, raw-unverified and unverified-clean reviews are read from their trailing findings marker as not clean, the App's own only", async () => {
+    const markers = {
+      raw: "<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->",
+      "raw-unverified": "<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 unverified=1 -->",
+      "unverified-clean": "<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1 -->",
+    };
+    for (const [outcome, marker] of Object.entries(markers)) {
+      const g = gh(
+        [recorded("apply", "alice", "2026-01-01T00:00:00Z")],
+        [],
+        [
+          { userLogin: bot, body: `<!-- ashlar-review-summary -->\nbody\n${marker}`, submittedAt: "2026-01-02T00:00:00Z" },
+          { userLogin: "mallory", body: marker, submittedAt: "2026-01-02T01:00:00Z" }, // human copy: NOT an event
+          { userLogin: bot, body: `${marker}\nquoted, not trailing`, submittedAt: "2026-01-02T02:00:00Z" }, // prose
+        ],
+      );
+      const events = await readLoopEvents(g as never, "t", "o", "r", 1);
+      assert.deepEqual(events.filter((e) => e.kind !== "start").map((e) => `${e.kind}:${e.outcome}:${e.at}`), [`not-clean:${outcome}:2026-01-02T00:00:00Z`], outcome);
+      const session = await readLoopSession(g as never, "t", "o", "r", 1, { pr: { sha: "c" } });
+      assert.equal(session.active, false, `${outcome}: never an active wait on the reviewed head`);
+      assert.deepEqual(session.owedHandoff, { head: "c", outcome, startIso: "2026-01-01T00:00:00Z", startSeq: undefined }, outcome);
+    }
   });
 
   it("readLoopSession folds history + injected events (a stop the list API has not caught up with)", async () => {

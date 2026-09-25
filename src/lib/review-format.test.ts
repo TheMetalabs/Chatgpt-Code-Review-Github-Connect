@@ -2,8 +2,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { FINDING_412 } from "./samples.ts";
 import { CLEAN_REVIEW_BODY, REVIEW_RAW_END, REVIEW_RAW_START, inlineFindingComment, redactSalvagedReviewBody, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
-import { INCOMPLETE_OUTCOME_MARKER, isConvergedFindings, isIncompleteOutcome, parseFindingsTotal } from "./review-loop.ts";
-import { postedOutcome, REVIEW_OUTCOMES } from "./review-outcome.ts";
+import { INCOMPLETE_OUTCOME_MARKER, isConvergedFindings, isIncompleteOutcome, notCleanOutcomeOf, parseFindingsTotal } from "./review-loop.ts";
+import { OUTCOME_SHAPE, postedOutcome, REVIEW_OUTCOMES, type PostedOutcome } from "./review-outcome.ts";
+import type { ReviewProvider } from "./types.ts";
 
 describe("review-format", () => {
   it("a verify-clean job released as the fallback says local ran as the fallback, never that it verifies chat", () => {
@@ -265,6 +266,44 @@ describe("review-format", () => {
       assert.equal(isIncompleteOutcome(`${INCOMPLETE_OUTCOME_MARKER}\nquoted, then more text`), false);
       assert.equal(isIncompleteOutcome(`text\n${INCOMPLETE_OUTCOME_MARKER}\n`), true);
       assert.equal(isIncompleteOutcome(undefined), false);
+    });
+  });
+
+  describe("every posted body tells the loop whether it is a not-clean outcome (the durable side of its handoff)", () => {
+    // A marker a raw reply quotes is prose (neutralized): only the body's own trailing marker counts.
+    const quoted = "<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1 raw=1 -->";
+    const base = { headSha: "abc1234ffff", assumptions: [], coverage: [] };
+    const verifying = { ...base, reviewProviders: ["chatgpt", "local"] as ReviewProvider[], localReviewRole: "verify-clean" as const, localVerifyStartedAt: 1 };
+    // Keyed by the closed enum: a new outcome cannot be added without deciding what the loop reads.
+    const jobs: Record<PostedOutcome, Parameters<typeof reviewSummaryBody>[0]> = {
+      findings: { ...base, reviewProviders: ["chatgpt"] },
+      raw: { ...base, reviewProviders: ["chatgpt"], rawReview: `P1 bug ${quoted}`, rawCauses: { chatgpt: "unparseable" } },
+      "raw-unverified": { ...verifying, localVerified: false, rawReview: `P1 bug ${quoted}`, rawCauses: { local: "unparseable" } },
+      clean: { ...base, reviewProviders: ["chatgpt"] },
+      "verified-clean": { ...verifying, localVerified: true },
+      "unverified-clean": { ...verifying, localVerified: false },
+      incomplete: { ...base, reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"] },
+    };
+    for (const [outcome, job] of Object.entries(jobs) as Array<[PostedOutcome, Parameters<typeof reviewSummaryBody>[0]]>) {
+      const expected = OUTCOME_SHAPE[outcome].converged || outcome === "findings" ? null : outcome;
+      it(`${outcome}: ${expected ? "read as not clean, with its outcome" : "never read as not clean"}`, () => {
+        const findings = outcome === "findings" ? [{ ...FINDING_412, id: "f1" }] : [];
+        assert.equal(postedOutcome(job, findings.length), outcome, "the fixture renders the outcome it names");
+        const body = reviewSummaryBody(job, findings, "ashlar-bot");
+        assert.equal(notCleanOutcomeOf(body), expected);
+        if (expected) assert.equal(isConvergedFindings(body), false, "never CONVERGED");
+      });
+    }
+
+    it("only the trailing marker counts, and a finding count or a clean pass is not a not-clean outcome", () => {
+      assert.equal(notCleanOutcomeOf(`${quoted}\nquoted, then more text`), null);
+      assert.equal(notCleanOutcomeOf(`text\n${quoted}\n`), "raw-unverified");
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->"), "raw");
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1 -->"), "unverified-clean");
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=2 inline=2 body=0 p0=0 p1=2 p2=0 -->"), null);
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->"), null);
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 unverified=10 -->"), null, "a flag is exactly =1");
+      assert.equal(notCleanOutcomeOf(undefined), null);
     });
   });
 });

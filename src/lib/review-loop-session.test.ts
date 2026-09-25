@@ -150,49 +150,49 @@ describe("deriveLoopSession: a human stop in a start's second", () => {
   });
 });
 
-describe("deriveLoopSession: an incomplete review ends the session and owes the loop-error handoff", () => {
+describe("deriveLoopSession: a not-clean review ends the session and owes the loop-error handoff", () => {
   const A = "a".repeat(40);
   const B = "b".repeat(40);
   const t = (i: number) => `2026-01-0${i}T00:00:00Z`;
   const start = ev(t(1), "start", { mode: "apply", actor: "alice", seq: 11 });
-  const OWED = { active: false, endedBy: "incomplete", endedAt: t(2), owedHandoff: { head: A, startIso: t(1), startSeq: 11 } };
+  const OWED = { active: false, endedBy: "not-clean", endedAt: t(2), owedHandoff: { head: A, outcome: "incomplete", startIso: t(1), startSeq: 11 } };
   const fold = (events: LoopEvent[], liveHead: string | undefined = A) => deriveLoopSession([start, ...events], { liveHead });
 
   it("never CONVERGED and never a silent wait: the session ends, owing the handoff for the reviewed head, scoped to it", () => {
-    assert.deepEqual(fold([ev(t(2), "incomplete", { head: A })]), OWED);
+    assert.deepEqual(fold([ev(t(2), "not-clean", { head: A, outcome: "incomplete" })]), OWED);
     // the head is live or the loop waits on it: the verdict stands
-    assert.deepEqual(fold([ev("2026-01-01T12:00:00Z", "continue", { head: A }), ev(t(2), "incomplete", { head: A })], B), OWED);
+    assert.deepEqual(fold([ev("2026-01-01T12:00:00Z", "continue", { head: A }), ev(t(2), "not-clean", { head: A, outcome: "incomplete" })], B), OWED);
   });
 
   it("the bot's handoff for that head settles it; one for another head does not", () => {
-    const settled = fold([ev(t(2), "incomplete", { head: A }), ev(t(3), "escalate", { head: A })]);
-    assert.deepEqual(settled, { active: false, endedBy: "incomplete", endedAt: t(2) });
-    assert.deepEqual(fold([ev(t(2), "incomplete", { head: A }), ev(t(3), "escalate", { head: B })]), OWED);
+    const settled = fold([ev(t(2), "not-clean", { head: A, outcome: "incomplete" }), ev(t(3), "escalate", { head: A })]);
+    assert.deepEqual(settled, { active: false, endedBy: "not-clean", endedAt: t(2) });
+    assert.deepEqual(fold([ev(t(2), "not-clean", { head: A, outcome: "incomplete" }), ev(t(3), "escalate", { head: B })]), OWED);
     // same second: the handoff (an issue comment) folds first and ends the session; nothing is owed
-    assert.equal(fold([ev(t(2), "escalate", { head: A }), ev(t(2), "incomplete", { head: A })]).owedHandoff, undefined);
+    assert.equal(fold([ev(t(2), "escalate", { head: A }), ev(t(2), "not-clean", { head: A, outcome: "incomplete" })]).owedHandoff, undefined);
   });
 
-  it("a stop, or a later clean review of its head or the live head, settles it; a push, another incomplete review or a stale clean review does not", () => {
-    const after = (e: LoopEvent, liveHead?: string) => fold([ev(t(2), "incomplete", { head: A }), e], liveHead).owedHandoff;
+  it("a stop, or a later clean review of its head or the live head, settles it; a push, another not-clean review or a stale clean review does not", () => {
+    const after = (e: LoopEvent, liveHead?: string) => fold([ev(t(2), "not-clean", { head: A, outcome: "incomplete" }), e], liveHead).owedHandoff;
     assert.equal(after(ev(t(3), "stop", { actor: "bob" })), undefined, "stop");
     assert.equal(after(ev(t(3), "stopped")), undefined, "stopped");
     assert.equal(after(ev(t(3), "converged", { head: A })), undefined, "clean review of its head");
     assert.equal(after(ev(t(3), "converged", { head: B }), B), undefined, "clean review of the live head");
     assert.deepEqual(after(ev(t(3), "push", { head: B }), B), OWED.owedHandoff, "a push does not continue a loop that ended");
-    assert.deepEqual(after(ev(t(3), "incomplete", { head: A })), OWED.owedHandoff, "another incomplete review");
+    assert.deepEqual(after(ev(t(3), "not-clean", { head: A, outcome: "incomplete" })), OWED.owedHandoff, "another not-clean review");
     assert.deepEqual(after(ev(t(3), "converged", { head: "c".repeat(40) }), B), OWED.owedHandoff, "a clean review of another, not live, head");
   });
 
   it("a new start opens a new session: the old session's handoff is no longer owed", () => {
-    const s = fold([ev(t(2), "incomplete", { head: A }), ev(t(3), "start", { mode: "suggest", actor: "c" })]);
+    const s = fold([ev(t(2), "not-clean", { head: A, outcome: "incomplete" }), ev(t(3), "start", { mode: "suggest", actor: "c" })]);
     assert.deepEqual(s, { active: true, startIso: t(3), mode: "suggest", starter: "c" });
   });
 
-  it("a stale incomplete review (the loop moved past its head, which is not live) is ignored, and a continuation after one proves it stale", () => {
+  it("a stale not-clean review (the loop moved past its head, which is not live) is ignored, and a continuation after one proves it stale", () => {
     const ACTIVE = { active: true, startIso: t(1), startSeq: 11, mode: "apply", starter: "alice" };
     for (const kind of ["continue", "push"] as const) {
-      assert.deepEqual(fold([ev(t(2), kind, { head: B }), ev(t(3), "incomplete", { head: A })], B), ACTIVE, kind);
+      assert.deepEqual(fold([ev(t(2), kind, { head: B }), ev(t(3), "not-clean", { head: A, outcome: "incomplete" })], B), ACTIVE, kind);
     }
-    assert.deepEqual(fold([ev(t(2), "incomplete", { head: A }), ev(t(3), "continue", { head: B })], B), ACTIVE, "resumed, nothing owed");
+    assert.deepEqual(fold([ev(t(2), "not-clean", { head: A, outcome: "incomplete" }), ev(t(3), "continue", { head: B })], B), ACTIVE, "resumed, nothing owed");
   });
 });

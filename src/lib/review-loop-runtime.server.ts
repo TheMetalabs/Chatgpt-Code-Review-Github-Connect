@@ -69,10 +69,11 @@ import {
   startComment,
   stoppedComment,
   type EscalateReason,
+  type NotCleanOutcome,
   type ReviewLoopMode,
   type RoundSummary,
 } from "./review-loop.ts";
-import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
+import type { LoopEvent, LoopSession, OwedHandoff } from "./review-loop-session.ts";
 import { OUTCOME_SHAPE, postedOutcome, rawCauseText, type PostedOutcome } from "./review-outcome.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
@@ -203,10 +204,26 @@ function notCleanHandoff(job: Job, outcome: PostedOutcome): string {
   return `this review is not a clean pass (${notCleanDetail(job, outcome)}) and carries no structured finding the fix agent can act on`;
 }
 
-/** The fixed handoff an incomplete review owes when a later loop step recovers it from the review's
- * durable INCOMPLETE marker (review-loop-session.ts owedHandoff): that review's job state is gone. */
-export const INCOMPLETE_RECOVERED_DETAIL =
-  "an incomplete review of this head (not a clean pass: a reviewer did not run or returned no complete review) carries no structured finding the fix agent can act on, and its handoff was not recorded";
+/** Why each not-clean outcome is not a clean pass, as far as its durable marker tells (a raw marker
+ * records no cause, so its text is cause-neutral, as rawCauseText's is without one). */
+const RECOVERED_WHY: Record<NotCleanOutcome, string> = {
+  incomplete: "a reviewer did not run or returned no complete review",
+  raw: `posted verbatim: ${rawCauseText(undefined)}`,
+  "raw-unverified": NOT_CLEAN_DETAIL["raw-unverified"]!,
+  "unverified-clean": NOT_CLEAN_DETAIL["unverified-clean"]!,
+};
+
+/** The fixed handoff a not-clean review owes when a later loop step recovers it from the review's
+ * durable marker (review-loop-session.ts owedHandoff): that review's job state is gone, so it names
+ * the outcome the marker records. */
+export function recoveredHandoffDetail(outcome: NotCleanOutcome | undefined): string {
+  const review = outcome ? `the ${outcome} review of this head (not a clean pass: ${RECOVERED_WHY[outcome]})` : "a review of this head that is not a clean pass";
+  return `${review} carries no structured finding the fix agent can act on, and its handoff was not recorded`;
+}
+export const INCOMPLETE_RECOVERED_DETAIL = recoveredHandoffDetail("incomplete");
+
+/** What a push reports when the session it finds ended at a not-clean review. */
+const endedNotClean = (owed: OwedHandoff) => `the loop ended at a review that is not a clean pass (${owed.outcome ?? "not clean"})`;
 
 /** Write-capable repository permissions (legacy field; `maintain` reports as `write`). */
 const WRITE_PERMISSIONS = new Set(["admin", "write"]);
@@ -735,6 +752,17 @@ export async function runPostReviewLoop(
     }
   };
 
+  // The loop-error handoff a session that ended at a not-clean review owes, settled once for that head
+  // and scoped to the session it ended; never a fix round past it. With this review's own detail when
+  // it is that review (its job is here), else the fixed detail recovered from the durable marker.
+  const settleOwed = async (owed: OwedHandoff): Promise<LoopStepResult> => {
+    sinceIso = owed.startIso;
+    sinceSeq = owed.startSeq;
+    const owedHead = owed.head ?? headSha;
+    const own = notClean !== undefined && owedHead === headSha && notClean === (owed.outcome ?? notClean);
+    return await escalate("loop-error", own ? notCleanHandoff(job, notClean) : recoveredHandoffDetail(owed.outcome), owedHead);
+  };
+
   const stepKey = `${owner}/${repo}#${pr}@${headSha}`;
   if (inFlightSteps.has(stepKey)) return { ran: false, reason: STEP_IN_FLIGHT };
   inFlightSteps.add(stepKey);
@@ -778,15 +806,10 @@ export async function runPostReviewLoop(
     if (!session.active) {
       const owed = session.owedHandoff;
       if (!owed) return { ran: false, reason: NO_SESSION };
-      // The session ended at an incomplete review that owes its loop-error handoff: this review's own
+      // The session ended at a not-clean review that owes its loop-error handoff: this review's own
       // (the history already lists it), or an earlier one whose handoff a crash or a failed post lost.
-      // Settled once for that head, scoped to the session it ended; never a fix round past it.
       requested = true;
-      sinceIso = owed.startIso;
-      sinceSeq = owed.startSeq;
-      const owedHead = owed.head ?? headSha;
-      const own = owedHead === headSha && notClean === "incomplete";
-      return await escalate("loop-error", own ? notCleanHandoff(job, notClean) : INCOMPLETE_RECOVERED_DETAIL, owedHead);
+      return await settleOwed(owed);
     }
     requested = true;
     sinceIso = session.startIso;
@@ -1128,8 +1151,8 @@ export async function continueLoopOnPush(
     const moved = push.pushedAt ? [{ at: push.pushedAt, kind: "push" as const, head: push.headSha }] : [];
     const session = await sessionOf(d.gh, token, push, head, botLogin, moved);
     if (!session.active) {
-      // A session that ended at an incomplete review whose handoff was lost is not continued by a
-      // push (the loop ended there): the push recovers the handoff it owes instead.
+      // A session that ended at a not-clean review whose handoff was lost is not continued by a push
+      // (the loop ended there): the push recovers the handoff it owes instead.
       const owed = session.owedHandoff;
       if (!owed) return { posted: false, reason: NO_SESSION };
       const owedHead = owed.head ?? push.headSha;
@@ -1140,7 +1163,7 @@ export async function continueLoopOnPush(
         pr: push.pr,
         head: owedHead,
         reason: "loop-error",
-        detail: INCOMPLETE_RECOVERED_DETAIL,
+        detail: recoveredHandoffDetail(owed.outcome),
         rounds,
         roundCap: roundCap(env),
         botLogin,
@@ -1149,7 +1172,7 @@ export async function continueLoopOnPush(
         sleep: d.sleep,
       });
       const outcome = handoff.escalated ? "handoff posted" : handoff.error ? `handoff failed: ${handoff.error}` : "handoff already posted";
-      return { posted: false, reason: `the loop ended at an incomplete review; ${outcome}` };
+      return { posted: false, reason: `${endedNotClean(owed)}; ${outcome}` };
     }
     const c = await ensureContinuation(d.gh, token, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, sinceSeq: session.startSeq, botLogin, sleep: d.sleep });
     if (!c.error) return { posted: c.posted, reason: c.posted ? "continued" : "already continued" };

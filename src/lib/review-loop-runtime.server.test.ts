@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type ReviewProvider, type SamplePr } from "./types.ts";
-import { continueComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
+import { continueComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment, type NotCleanOutcome } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
 import { botSettingsToEnv, sanitizeBotSettings } from "./settings.server.ts";
 import { reviewSummaryBody } from "./review-format.ts";
@@ -15,6 +15,7 @@ import {
   INCOMPLETE_RECOVERED_DETAIL,
   loopEnabled,
   loopPostedReview,
+  recoveredHandoffDetail,
   renderFindings,
   runPostReviewLoop,
   SILENT_REASONS,
@@ -449,14 +450,15 @@ describe("an incomplete review owes its loop-error handoff durably (the INCOMPLE
     // Recreated from durable GitHub events only: not CONVERGED, not an active session waiting on the head.
     const lost = await session(f, HEAD);
     assert.equal(lost.active, false);
-    assert.equal(lost.endedBy, "incomplete");
+    assert.equal(lost.endedBy, "not-clean");
     assert.equal(lost.owedHandoff?.head, HEAD, "the loop-error handoff is owed for the reviewed head");
+    assert.equal(lost.owedHandoff?.outcome, "incomplete");
     // Storage is back and a contributor pushes: the loop ended at the incomplete review, so the push
     // recovers its handoff (never a continuation of a loop that ended).
     opts.failHandoff = false;
     opts.liveSha = MOVED;
     const pushed = await continueLoopOnPush("t", pushTo(MOVED, "2026-01-11T00:00:00Z"), settings(), f.deps, ENV_ON);
-    assert.deepEqual(pushed, { posted: false, reason: "the loop ended at an incomplete review; handoff posted" });
+    assert.deepEqual(pushed, { posted: false, reason: "the loop ended at a review that is not a clean pass (incomplete); handoff posted" });
     const handoff = escalations(f.posted);
     assert.equal(handoff.length, 1);
     assert.equal(reasonOf(handoff[0]), "loop-error");
@@ -485,6 +487,49 @@ describe("an incomplete review owes its loop-error handoff durably (the INCOMPLE
     assert.deepEqual(await continueLoopOnPush("t", pushTo(MOVED, "2026-01-12T00:00:00Z"), settings(), f.deps, ENV_ON), { posted: false, reason: "no active loop session" });
     assert.equal(f.posted.length, 0);
   });
+
+  // The sibling outcomes that are not a clean pass: their findings marker is the durable record.
+  const verifying = { reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", localVerifyStartedAt: 1, localVerified: false } as Partial<Job>;
+  const SIBLINGS: Array<[NotCleanOutcome, Partial<Job>]> = [
+    ["raw", { findings: [], reviewProviders: ["chatgpt"], rawReview: "P1 the guard is missing", rawCauses: { chatgpt: "unparseable" }, assumptions: [] }],
+    ["raw-unverified", { ...verifying, findings: [], rawReview: "P1 the guard is missing", rawCauses: { local: "unparseable" }, assumptions: [] }],
+    ["unverified-clean", { ...verifying, findings: [], assumptions: [] }],
+  ];
+  for (const [outcome, over] of SIBLINGS) {
+    const siblingJob = () => job(over);
+    const siblingReview = () => ({ body: reviewSummaryBody(siblingJob(), [], BOT), commitId: HEAD, submittedAt: "2026-01-10T00:00:00Z" });
+
+    it(`${outcome}: a lost handoff leaves the session ended owing it, and the next push posts it once, naming the outcome, instead of continuing`, async () => {
+      const opts: Parameters<typeof fakeDeps>[0] = { reviews: [siblingReview()], failHandoff: true };
+      const f = fakeDeps(opts);
+      const r = await run(f, "suggest", ENV_ON, siblingJob());
+      assert.ok(!r.ran && /^ESCALATE loop-error failed to post/.test(r.reason), JSON.stringify(r));
+      const lost = await session(f, HEAD);
+      assert.equal(lost.active, false, "never an active session waiting on the reviewed head");
+      assert.equal(lost.owedHandoff?.head, HEAD);
+      assert.equal(lost.owedHandoff?.outcome, outcome);
+      opts.failHandoff = false;
+      opts.liveSha = MOVED;
+      const pushed = await continueLoopOnPush("t", pushTo(MOVED, "2026-01-11T00:00:00Z"), settings(), f.deps, ENV_ON);
+      assert.deepEqual(pushed, { posted: false, reason: `the loop ended at a review that is not a clean pass (${outcome}); handoff posted` });
+      const handoff = escalations(f.posted);
+      assert.equal(handoff.length, 1);
+      assert.equal(reasonOf(handoff[0]), "loop-error");
+      assert.ok(handoff[0].includes(`head=${HEAD}`), "for the reviewed head");
+      assert.ok(handoff[0].includes(recoveredHandoffDetail(outcome)), "with the fixed detail naming the outcome");
+      assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 0, "the ended loop is not continued");
+      assert.equal((await session(f, MOVED)).owedHandoff, undefined, "settled");
+    });
+
+    it(`${outcome}: the review's own step posts the handoff with its job's own detail when the history already lists it`, async () => {
+      const f = fakeDeps({ reviews: [siblingReview()] });
+      const r = await run(f, "suggest", ENV_ON, siblingJob());
+      assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+      assert.equal(escalations(f.posted).length, 1);
+      assert.match(escalations(f.posted)[0], /this review is not a clean pass \(/);
+      assert.equal((await session(f, HEAD)).owedHandoff, undefined, "settled by its handoff");
+    });
+  }
 
   it("a new start opens a new session: the old handoff is no longer owed and the loop runs", async () => {
     const round = { body: "<!-- ashlar-findings total=1 -->", commitId: HEAD, submittedAt: "2026-01-12T00:00:00Z" }; // this review, in the new session

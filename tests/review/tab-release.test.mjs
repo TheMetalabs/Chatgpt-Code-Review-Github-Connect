@@ -450,11 +450,16 @@ test('a leg whose tab the worker closed is not revived by a late replace naming 
   assert.equal(states.grok.tabId, 20);assert.equal(states.grok.workerEvents, undefined);
 });
 /** Chrome already swapped tab 10's page into `tab`, but the onReplaced event reaches the worker only
- * while it searches for the leg's tab (findOriginalTab's query), after the old id's lookup failed. */
+ * while it searches for the leg's tab (findOriginalTab's query), after the old id's lookup failed.
+ * Dispatched as the real listener does it: not awaited (`b.rekeyed` settles once it is recorded), so
+ * the search can end before the re-key moved the leg. */
 function replacedDuringLookup(b, tab) {
   b.tabs.delete(10);b.tabs.set(tab.id, tab);
   const query = b.chrome.tabs.query;let delivered = false;
-  b.chrome.tabs.query = async filter => { if (filter?.url && !delivered) { delivered = true;await b.context.rekeyReplacedTab(tab.id, 10); } return query(filter); };
+  b.chrome.tabs.query = async filter => {
+    if (filter?.url && !delivered) { delivered = true;b.rekeyed = b.context.rekeyReplacedTab(tab.id, 10).catch(() => {}); }
+    return query(filter);
+  };
 }
 for (const kind of ['review', 'fix']) {
   test(`${kind}: a cancelled leg whose tab Chrome replaced during its cleanup's lookup is not retired as lost; it closes the tab under its new id`, async () => {
@@ -464,8 +469,9 @@ for (const kind of ['review', 'fix']) {
     replacedDuringLookup(b, {id: 11, url: TEMP, status: 'unloaded', discarded: true});
     await b.tick();
     assert.ok(b.pending(), 'not retired: the tab is not absent, it has a new id');
-    assert.equal(b.pending().states.chatgpt.tabId, 11);
     assert.deepEqual(historyOf(b), [], 'no tab_lost');
+    await b.rekeyed;
+    assert.equal(b.pending().states.chatgpt.tabId, 11);
     await b.tick();
     b.tabs.get(11).status = 'complete';
     await b.tick();
@@ -478,7 +484,21 @@ for (const kind of ['review', 'fix']) {
     replacedDuringLookup(b, {id: 11, url: URL_TAB, status: 'unloaded', discarded: true});
     const jobs = await b.jobs();
     assert.equal(await b.context.providerTabGone(jobs[leg(kind).jobId], 'chatgpt'), false, 'the sweep keeps a leg whose tab lives on');
+    await b.rekeyed;
     assert.equal(jobs[leg(kind).jobId].states.chatgpt.tabId, 11);
+  });
+  test(`${kind}: a replace whose re-key failed holds a cancelled leg only while it is being recorded`, async () => {
+    const b = worker(leg(kind, {pageUrl: TEMP}), {status: 'cancelled', session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: blankVerdict});
+    noPageWhileDiscarded(b);
+    let fail;const recording = new Promise((_resolve, reject) => { fail = reject; });
+    b.context.moveReplacedTab = () => recording; // the re-key's storage round trips, held and then failed
+    replacedDuringLookup(b, {id: 11, url: TEMP, status: 'unloaded', discarded: true});
+    await b.tick();
+    assert.ok(b.pending(), 'held while the replace is being recorded');
+    fail(new Error('storage unavailable'));await b.rekeyed;
+    await b.tick();
+    assert.equal(b.pending(), undefined, 'retired once nothing is moving it to another id');
+    assert.deepEqual(historyOf(b), ['worker:tab_lost']);
   });
 }
 for (const kind of ['review', 'fix']) {

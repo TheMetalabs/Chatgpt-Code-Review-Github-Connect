@@ -43,6 +43,9 @@ const inventoryLanes = new Map();
 const tabOwners = new Map();
 const tabEpochs = new Map();
 const inventoryUpgrades = new Map();
+/** Replaces the worker is still recording (removed tab id -> added id): set as onReplaced is
+ * dispatched, before rekeyReplacedTab's first await, and cleared once it settled (see replacedSince). */
+const replacingTabs = new Map();
 const admissionLanes = new Map();
 const admissionReports = new Map();
 let registryPromise;
@@ -126,6 +129,12 @@ async function rememberClosedTab(tabId, info) {
  * preserved) is left as it is: following the tab would not make it Ashlar's again. */
 async function rekeyReplacedTab(addedTabId, removedTabId) {
   if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return;
+  // Synchronously, as the listener runs: the leg moves only after the storage round trips below.
+  replacingTabs.set(removedTabId, addedTabId);
+  try { await moveReplacedTab(addedTabId, removedTabId); }
+  finally { if (replacingTabs.get(removedTabId) === addedTabId) replacingTabs.delete(removedTabId); }
+}
+async function moveReplacedTab(addedTabId, removedTabId) {
   invalidateTabInventory(removedTabId);
   invalidateTabInventory(addedTabId);
   const session = await chrome.storage.session.get(null);
@@ -155,6 +164,14 @@ async function rekeyReplacedTab(addedTabId, removedTabId) {
     }
   }
   if (moved) await saveJobs(jobs);
+}
+
+/** Whether the leg's tab `lookedUp` (an id a lane just found gone) is gone only because Chrome
+ * replaced it: the re-key already moved the leg to the new id, or is still recording the replace
+ * (the listener does not await it, and a lane's lookup can end before it moved the leg). Either
+ * way the tab lives on, and the next tick asks it under its new id. */
+function replacedSince(state, lookedUp) {
+  return state.tabId !== lookedUp || replacingTabs.has(lookedUp);
 }
 
 async function rememberOwnedTab(job, provider, closing = false) {
@@ -873,9 +890,8 @@ async function cleanupProviderBody(job, provider, jobs) {
     catch {
       tab = await findOriginalTab(job, provider);
       if (!tab) {
-        // Chrome replaced the tab while it was looked up (rekeyReplacedTab moved the leg to the new
-        // id): it is not absent. The next tick asks it under its new id.
-        if (state.tabId !== lookedUp) return;
+        // Chrome replaced the tab while it was looked up: it is not absent.
+        if (replacedSince(state, lookedUp)) return;
         // Once the full source receipt is durably local+server stored, tab absence
         // cannot strand repair. It also cannot authorize closing a replacement.
         if (sourceArchiveDurable(state)) return finishTabCleanup(job, provider, jobs, "archived source durable; original tab absent");
@@ -1676,8 +1692,8 @@ async function providerTabGone(job, provider) {
     } catch { /* recorded tab is gone; fall through to a full owned-tab search */ }
   }
   const found = await findOriginalTab(job, provider);
-  // A tab Chrome replaced meanwhile (rekeyReplacedTab moved the leg to its new id) is not gone.
-  return !found && state.tabId === lookedUp;
+  // A tab Chrome replaced meanwhile is not gone.
+  return !found && !replacedSince(state, lookedUp);
 }
 
 /** The bridge job registry is in-memory only, so a job the server used to own that now

@@ -126,23 +126,30 @@ function stageValues(text, tokens, found, where) {
   found.problems.push(`${where}: stage \`${expression}\` is not a literal, so its value cannot be checked for a label`);
 }
 
-/** Calls `visit(token, level, k)` for every token of `level` and of the groups and template
- * substitutions inside it. */
-function walkTokens(level, visit) {
+/** Calls `visit(token, level, k, container)` for every token of `level` and of the groups and template
+ * substitutions inside it; `container` is the group or template holding `level` (none for the file). */
+function walkTokens(level, visit, container) {
   level.forEach((token, k) => {
-    visit(token, level, k);
-    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walkTokens(inner, visit);
+    visit(token, level, k, container);
+    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walkTokens(inner, visit, token);
   });
 }
 
 /** The argument group of the recorder call at `level[k]`, `name(...)` or `name?.(...)`, else null. The
- * name of a function declaration is not a call. */
+ * name of a function declaration is not a call, and neither is `name(...) {...}`: a method named after
+ * the recorder (or a call followed by a block), whose parentheses may bind the stage name. */
 function recorderCall(level, k) {
   const token = level[k], before = level[k - 1];
   if (token?.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text) || (before?.kind === 'word' && before.text === 'function')) return null;
-  const group = isPunct(level[k + 1], '?.') ? level[k + 2] : level[k + 1];
-  return group?.kind === 'group' && group.open === '(' ? group : null;
+  const at = isPunct(level[k + 1], '?.') ? k + 2 : k + 1, group = level[at];
+  return group?.kind === 'group' && group.open === '(' && level[at + 1]?.open !== '{' ? group : null;
 }
+
+/** Whether `level[k]` starts a statement: first in the file or a block, or after `;` or a bracketed run
+ * (an if head, a block, a call ended by a line break). A function there is a declaration; anywhere else
+ * it is an expression, which is called through whatever holds it rather than by its name. */
+const startsStatement = (level, k, container) => (!container || container.open === '{') &&
+  (k === 0 || isPunct(level[k - 1], ';') || level[k - 1].kind === 'group');
 
 /** Names that reach a binding without naming it: a sloppy-mode `arguments[i] = x` rebinds a parameter,
  * and eval and with can reassign or shadow one. */
@@ -170,19 +177,21 @@ function forwardsUnchanged(tokens, param) {
 
 /** The bodies of the recorders declared in a file's `tokens` (a declaration in a comment or a string is
  * none), each with the name of its stage parameter when the body passes it on unchanged, else null.
- * Forwarding that parameter to another recorder is safe: every call of the enclosing recorder is itself
- * checked. Its parameters must be plain names, the stage one once: a default value can reassign it, and
- * a repeated name binds the last one. */
+ * Forwarding that parameter to another recorder is safe: every use of the enclosing recorder's name is a
+ * checked call, and a declaration is reached only by its name (a function expression named after a
+ * recorder forwards nothing). Its parameters must be plain names, the stage one once: a default value
+ * can reassign it, and a repeated name binds the last one. */
 function recorderBodies(tokens) {
   const bodies = [];
-  walkTokens(tokens, (token, level, k) => {
+  walkTokens(tokens, (token, level, k, container) => {
     const [name, params, body] = level.slice(k + 1, k + 4);
     if (token.kind === 'word' && token.text === 'function' && name?.kind === 'word' && Object.hasOwn(RECORDERS, name.text) &&
         params?.kind === 'group' && params.open === '(' && body?.kind === 'group' && body.open === '{') {
       const names = argumentsOf(params.tokens).map(param => param.length === 1 && param[0].kind === 'word' ? param[0].text : null);
       const param = names[RECORDERS[name.text]];
       const plain = param && names.every(Boolean) && names.filter(other => other === param).length === 1;
-      bodies.push({param: plain && forwardsUnchanged(body.tokens, param) ? param : null, from: body.at, to: body.end});
+      const declared = startsStatement(level, k, container);
+      bodies.push({param: declared && plain && forwardsUnchanged(body.tokens, param) ? param : null, from: body.at, to: body.end});
     }
   });
   return bodies;
@@ -191,7 +200,9 @@ function recorderBodies(tokens) {
 /** Every stage a recorder call in `text` can record, by the position of its stage argument: the
  * literals, the template literals verbatim, and a problem for each stage argument the guard cannot read.
  * Calls are found in the tokens, so a comment or a string is never one, and one is never hidden by a
- * comment or a regex before it. A file the tokenizer cannot read is itself a problem. */
+ * comment or a regex before it. A file the tokenizer cannot read is itself a problem. So is any other
+ * use of a recorder's name than a call, its function declaration or `typeof name`: a recorder passed as
+ * a value, aliased, or called through .call or .apply records a stage no call here shows. */
 function recordedStages(text, file = 'source') {
   const found = {literals: new Set(), templates: new Set(), problems: []};
   let tokens;
@@ -201,13 +212,19 @@ function recordedStages(text, file = 'source') {
   }
   const bodies = recorderBodies(tokens);
   walkTokens(tokens, (token, level, k) => {
-    const group = recorderCall(level, k);
-    if (!group) return;
-    const where = `${file}:${text.slice(0, token.at).split('\n').length} ${token.text}()`;
+    if (token.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text)) return;
+    const group = recorderCall(level, k), before = level[k - 1];
+    const where = `${file}:${text.slice(0, token.at).split('\n').length} ${token.text}`;
+    if (!group) {
+      if (before?.kind === 'word' && (before.text === 'function' || before.text === 'typeof')) return;
+      return found.problems.push(level[k + 1]?.open === '('
+        ? `${where}(...) {...}: a method named after a recorder, or a call followed by a block, is not read as a call`
+        : `${where}: the recorder is used other than by a call, so the stages it records through that use cannot be checked`);
+    }
     const arg = argumentsOf(group.tokens)[RECORDERS[token.text]] ?? [];
     const forwarded = arg.length === 1 && arg[0].kind === 'word' &&
       bodies.some(body => body.from < token.at && token.at < body.to && body.param === arg[0].text);
-    if (!forwarded) stageValues(text, arg, found, where);
+    if (!forwarded) stageValues(text, arg, found, `${where}()`);
   });
   return found;
 }
@@ -443,6 +460,35 @@ test('a recorder call is found in the tokens: a // in a regex or a comment befor
   assert.deepEqual(read('globalThis.recordReviewStep?.("optional_call");'), {literals: ['optional_call'], problems: []}, 'name?.(...) is a call');
   assert.deepEqual(read('workerSt\\u0065p(job, provider, "escaped_name");'), {literals: ['escaped_name'], problems: []});
   assert.deepEqual(read('const doc = "workerStep(job, provider, stage)";'), {literals: [], problems: []}, 'a call in a string is none');
+});
+
+test('a recorder is reached only by its calls: a recorder used as a value, an alias or a method is a problem', () => {
+  const problems = text => recordedStages(text, 'fixture.js').problems;
+  const value = (line, name) => `fixture.js:${line} ${name}: the recorder is used other than by a call, so the stages it records through that use cannot be checked`;
+  for (const [text, line, name] of [
+    ['["unlabelled_cb"].forEach(step);', 1, 'step'],
+    ['setTimeout(step, 0, "unlabelled_timer");', 1, 'step'],
+    ['const record = workerStep;\nrecord(job, provider, "unlabelled_alias");', 1, 'workerStep'],
+    ['const {recordReviewStep: record} = globalThis;\nrecord("unlabelled_alias");', 1, 'recordReviewStep'],
+    ['workerStep.call(null, job, provider, "unlabelled_call");', 1, 'workerStep'],
+    ['\nworkerStep.apply(null, [job, provider, "unlabelled_apply"]);', 2, 'workerStep'],
+    ['globalThis.recordReviewStep = stage => post(stage);', 1, 'recordReviewStep'],
+  ]) assert.deepEqual(problems(text), [value(line, name)], text);
+  // A method named after a recorder: its parentheses bind `stage`, so step() no longer forwards, and
+  // passing the method on is a use as a value.
+  assert.deepEqual(problems('function step(stage) {\n  const o = {recordReviewStep(stage) { recordReviewStep(stage); }};\n  [row.stage].forEach(o.recordReviewStep);\n}\nstep("composer_waiting");'), [
+    'fixture.js:2 recordReviewStep(...) {...}: a method named after a recorder, or a call followed by a block, is not read as a call',
+    'fixture.js:2 recordReviewStep(): stage `stage` is not a literal, so its value cannot be checked for a label',
+    value(3, 'recordReviewStep'),
+  ]);
+  // A function expression named after a recorder is called through what holds it, never by that name.
+  for (const text of ['const record = function step(stage) {\n  recordReviewStep(stage);\n};\nrecord(computeStage());',
+    '(function step(stage) {\n  recordReviewStep(stage);\n})(computeStage());']) {
+    assert.deepEqual(problems(text), ['fixture.js:2 recordReviewStep(): stage `stage` is not a literal, so its value cannot be checked for a label'], text);
+  }
+  // typeof and the declaration's own name are not uses that record; a declaration starts a statement.
+  assert.deepEqual(problems('function step(stage) {\n  if (typeof recordReviewStep === "function") recordReviewStep(stage);\n}\nstep("composer_waiting");'), []);
+  assert.deepEqual(problems('const ready = true;\nfunction step(stage) {\n  recordReviewStep(stage);\n}\nstep("composer_waiting");'), []);
 });
 
 test('a recorder forwards its stage parameter only when nothing in its body can change or shadow it', () => {

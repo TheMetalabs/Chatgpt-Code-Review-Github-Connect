@@ -270,11 +270,28 @@ function declaredNames(tokens) {
   });
 }
 
-/** Where the statement at `tokens[from]` ends: after its block when it is one, else after its `;` (an
- * if's else arm included), else at the end of the level. */
+/** Where the statement at `tokens[from]` ends: after its block when it is one; after the statement an
+ * if, for, while or with head governs (an if's else arm included); after a do's while head, a try's or a
+ * switch's last block, or the statement a label names; else after its `;`, else at the end of the level. */
 function statementEnd(tokens, from) {
-  if (tokens[from]?.open === '{') return from + 1;
-  for (let j = from; j < tokens.length; j += 1) if (isPunct(tokens[j], ';') && !isWord(tokens[j + 1], 'else')) return j + 1;
+  const token = tokens[from], head = isWord(tokens[from + 1], 'await') ? from + 2 : from + 1;
+  if (token?.open === '{') return from + 1;
+  if (['if', 'for', 'while', 'with'].some(word => isWord(token, word)) && tokens[head]?.open === '(') {
+    const end = statementEnd(tokens, head + 1);
+    return isWord(token, 'if') && isWord(tokens[end], 'else') ? statementEnd(tokens, end + 1) : end;
+  }
+  if (isWord(token, 'do')) {
+    const end = statementEnd(tokens, from + 1);
+    return isWord(tokens[end], 'while') ? end + (isPunct(tokens[end + 2], ';') ? 3 : 2) : end;
+  }
+  if (isWord(token, 'try')) {
+    let end = from + 2;
+    if (isWord(tokens[end], 'catch')) end += tokens[end + 1]?.open === '(' ? 3 : 2;
+    return isWord(tokens[end], 'finally') ? end + 2 : end;
+  }
+  if (isWord(token, 'switch')) return from + 3;
+  if (token?.kind === 'word' && isPunct(tokens[from + 1], ':')) return statementEnd(tokens, from + 2);
+  for (let j = from; j < tokens.length; j += 1) if (isPunct(tokens[j], ';')) return j + 1;
   return tokens.length;
 }
 
@@ -1310,6 +1327,14 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     ['function pick(key) {\n  return note(this);\n}', global(2, 'this')],
     ['class B { top = 1; m() { return note(top); } }', global(1, 'top')],
     ['const o = {a: ok ? top : 0};', global(1, 'top')],
+    // A for head binds for its loop statement only, however that statement is built.
+    ['for (const top of rows) if (ok) {} note(top);', global(1, 'top')],
+    ['for (const top of rows) if (ok) {} else note(top); note(top);', global(1, 'top')],
+    ['for (const top of rows) while (ok) {} note(top);', global(1, 'top')],
+    ['for (const top of rows) do {} while (ok); note(top);', global(1, 'top')],
+    ['for (const top of rows) try {} catch {} finally {} note(top);', global(1, 'top')],
+    ['for (const top of rows) switch (top) {} note(top);', global(1, 'top')],
+    ['for (const top of rows) next: for (;;) {} note(top);', global(1, 'top')],
     // The global object arrives as other values too (a method that returns its receiver, an event's
     // target), so a call through a computed member the guard cannot read fails on any object.
     ['const name = ["worker", "Step"].join("");\nglobalThis.valueOf()[name](job, provider, "unlabelled_valueof");', called(2, '[name]')],
@@ -1352,6 +1377,7 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     'function f(parent) { return parent.id + note(parent); }\nfunction g(parent, id) { return {parent, id}; }\n' +
     'rows.map(self => note(self)); rows.map((window, i) => note(window, i)); rows.map(({top}) => note(top));\n' +
     'try { run(); } catch (window) { note(window); }\nfor (const top of rows) note(top);\nfor (const [parent] of rows) { note(parent); }\n' +
+    'for (const top of rows) if (ok) { note(top); } else if (top) note(top); else do note(top); while (ok);\n' +
     'class A { m(key) { return note(this[key]); } static n() { return this; } }\nconst o = {top() { return 1; }, parent(x) { return x; }};\n' +
     'const pick = function self(n) { return n ? self(n - 1) : note(self); };\n' +
     'top: for (const row of rows) { if (row) continue top; break top; }\nclass B { #top = 1; top = 2; static parent; frames; m() { return this.#top; } }'), []);

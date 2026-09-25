@@ -663,12 +663,18 @@ function forgetFixDelivery(job) {
 /** The fix deliveries that locally PROVE a tab: what admission lists in excludeJobIds and never
  * opens again. A record of a job this worker still holds is its own allocation (the registry's
  * allocation journal decides it; the job is excluded anyway). Any other record counts only while a
- * tab proves it: its `created` tab is still live on the provider, or a tab still carries the job's
- * binding (the session's owned-tab record, or the tab inventory); a `creating` record proven that way
- * (the worker stopped after the create, before the promotion) is promoted. A record nothing proves
- * (the worker stopped or was reset between the intent and chrome.tabs.create, or its tab is gone) is
- * cleared, so the server replays that delivery and it is opened once, instead of an intent that
- * never became a tab stranding the fix until its deadline. */
+ * tab proves it by its BINDING: a live tab on the provider that this browser session's owned-tab
+ * record or the tab inventory (the page's own binding) names the job for; a `creating` record proven
+ * that way (the worker stopped after the create, before the promotion) is promoted. A `created`
+ * record's tab id alone proves nothing: tab ids are unique only within one browser session, and the
+ * record outlives it (storage.local), so after a browser restart the id can name the user's own tab
+ * (as for tabCreatedForLeg, #82). While that tab's page has not been read yet (no session record for
+ * it, the inventory still probing it, or it cannot answer: discarded, loading) the record is kept as
+ * it is: after an extension reload the same id can still be the tab holding the run, and clearing
+ * it then would send the prompt a second time. A record nothing proves (the worker stopped or was
+ * reset between the intent and chrome.tabs.create, its tab is gone, or the page in it names no
+ * binding of this job) is cleared, so the server replays that delivery and it is opened once,
+ * instead of stranding the fix until its deadline. */
 async function reconcileFixDeliveries(jobs) {
   const records = await fixDeliveries();
   if (!Object.keys(records).length) return records;
@@ -686,8 +692,14 @@ async function reconcileFixDeliveries(jobs) {
   for (const [jobId, record] of Object.entries(records)) {
     if (jobs[jobId]) { proven[jobId] = record; continue; }
     const createdTab = record.phase === "created" ? live.get(record.tabId) : undefined;
-    const tabId = onProvider(createdTab, record.provider) ? createdTab.id : boundTab(jobId, record.provider);
-    if (!tabId) { rewrite[jobId] = null; continue; }
+    const tabId = boundTab(jobId, record.provider);
+    if (!tabId) {
+      // The recorded tab is still open on the provider, but nothing has read which binding its page
+      // holds yet: kept (still excluded) until the inventory reads it.
+      const unread = onProvider(createdTab, record.provider) && !session[OWNED_PREFIX + createdTab.id] && !knownTabOwner(createdTab);
+      if (unread) proven[jobId] = record; else rewrite[jobId] = null;
+      continue;
+    }
     proven[jobId] = {...record, phase: "created", tabId};
     if (record.phase !== "created" || record.tabId !== tabId) rewrite[jobId] = proven[jobId];
   }

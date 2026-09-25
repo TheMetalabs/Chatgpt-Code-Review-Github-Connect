@@ -570,6 +570,50 @@ test('worker: a created delivery whose tab is gone and that no tab binds no long
   assert.equal(b.tabs.size, 1);assert.equal(runsOf(b).length, 1);
 });
 
+// A `created` record names its tab by id, and Chrome tab ids are unique only within one browser
+// session while the record outlives it (#82's rule for stored tab ids, tabCreatedForLeg): the record
+// proves the delivery only through a binding (this session's owned-tab record, or the page's own
+// binding read by the tab inventory), never by the id alone.
+const USERS_TAB = 'https://chatgpt.com/c/users-own';
+const createdRecord = () => ({[DELIVERIES]: {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'created', tabId: 10, at: Date.now()}}});
+test('worker: after a browser restart a created record whose id now names the user\'s own tab is kept only until that page is read, then the delivery is opened once', async () => {
+  const {api, takes} = replayingServer();
+  let page = null; // the user's page cannot answer yet (still loading its content, frozen, discarded)
+  const handler = (id, m) => (m.type === 'ashlar-tab-status' && page ? page : {ok: false, code: 'busy', retry: true});
+  // registry lost, storage.session cleared by the restart, and the user's conversation tab got id 10
+  const tabs = new Map([[10, {id: 10, url: USERS_TAB, status: 'complete'}]]);
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {}, ...createdRecord()}), tabs, api, handler});
+  await b.tick();await b.tick();
+  assert.ok(takes.length && takes.every(exclude => exclude.includes('fix-A')), 'unread: the record still keeps the delivery out (it may be the tab holding the run)');
+  assert.equal(b.local.state[DELIVERIES]['fix-A']?.tabId, 10, 'kept as it was');
+  assert.equal(tabs.size, 1);
+  // the page answers: no binding (the user's own tab)
+  page = {ok: true, ownershipProtocol: 1, jobId: '', runId: '', provider: 'chatgpt', url: USERS_TAB};
+  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  await b.tick();await b.tick();
+  assert.equal(takes.at(-1).includes('fix-A'), true, 'listed again once proven by its new tab');
+  assert.ok(takes.some(exclude => !exclude.includes('fix-A')), 'the stale record stopped keeping the delivery out');
+  assert.equal(tabs.size, 2, 'the delivery is opened, exactly once');
+  const runs = runsOf(b);
+  assert.equal(runs.length, 1, 'the prompt is submitted once');assert.notEqual(runs[0].id, 10, 'into the tab the worker created');
+  assert.equal(b.messages.some(m => m.id === 10 && m.type !== 'ashlar-tab-status'), false, 'the user\'s tab only answered the status probe');
+  assert.ok(tabs.has(10), 'never closed');
+  assert.deepEqual({phase: b.local.state[DELIVERIES]['fix-A'].phase, tabId: b.local.state[DELIVERIES]['fix-A'].tabId}, {phase: 'created', tabId: runs[0].id});
+});
+test('worker: after an extension reload (session cleared, same tab ids) a created record whose tab\'s page is bound to the fix keeps the delivery out: no second tab, no second prompt', async () => {
+  const {api, takes} = replayingServer();
+  const RUN_URL = 'https://chatgpt.com/c/fix-conversation';
+  const handler = (_id, m) => (m.type === 'ashlar-tab-status' ? {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: RUN_URL} : {ok: false, code: 'busy', retry: true});
+  const tabs = new Map([[10, {id: 10, url: RUN_URL, status: 'complete'}]]);
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {}, ...createdRecord()}), tabs, api, handler});
+  await b.tick();
+  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  await b.tick();await b.tick();
+  assert.ok(takes.length && takes.every(exclude => exclude.includes('fix-A')), 'never replayed here');
+  assert.equal(tabs.size, 1, 'no second tab');assert.equal(runsOf(b).length, 0, 'the prompt is never submitted again');
+  assert.equal(b.local.state[DELIVERIES]['fix-A']?.tabId, 10);
+});
+
 test('worker: a cancelled fix tab that now carries another binding retires after the wait, leaving that binding untouched', async () => {
   const other = {ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B', provider: 'chatgpt'};
   const handler = (_id, m) => (m.type === 'ashlar-tab-status'

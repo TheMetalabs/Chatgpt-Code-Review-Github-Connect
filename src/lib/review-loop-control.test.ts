@@ -153,6 +153,43 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     }
   });
 
+  it("a joiner shares what the joined emit SENT; one that ended superseded sent nothing on its caller's read: the joiner's own decide() answers", async () => {
+    const text = continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD });
+    const key = { kind: "continue" as const, ref: ref(), head: HEAD, session: { at: SESSION } };
+    const owed = { status: "owed" as const, body: text };
+    // A's first POST is refused; B joins during A's backoff; A's retry gets `plan[1]` — or, where A
+    // ends superseded, A's own read decides so at that retry (B's read decides B's `joiner`).
+    const cases = [
+      { aEnds: "posted", plan: ["rejected", "ok"], joiner: owed, b: { status: "posted" }, bDecided: 0, posts: 2 },
+      { aEnds: "unknown", plan: ["rejected", "lost"], joiner: owed, b: "unknown", bDecided: 0, posts: 2 },
+      { aEnds: "rejected", plan: ["rejected"], joiner: owed, b: "rejected", bDecided: 0, posts: 3 },
+      { aEnds: "superseded", plan: ["rejected", "ok"], joiner: owed, b: { status: "posted" }, bDecided: 1, posts: 2 },
+      { aEnds: "superseded", plan: ["rejected", "ok"], joiner: { status: "superseded" as const, why: "newer" as const }, b: { status: "superseded", why: "newer" }, bDecided: 1, posts: 1 },
+    ] as const;
+    for (const c of cases) {
+      const label = `A ${c.aEnds}, B's own read ${c.joiner.status}`;
+      const f = world([...c.plan]);
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let paused = false;
+      const ctx: EmitContext = { ...f.ctx, sleep: async (ms) => ((paused = true), await gate, f.tick(ms)) };
+      let aDecided = 0;
+      const a = emitControl(ctx, { key, decide: async () => (++aDecided > 1 && c.aEnds === "superseded" ? { status: "superseded", why: "converged" } : owed) });
+      for (let i = 0; i < 100 && !paused; i++) await new Promise((r) => setImmediate(r));
+      assert.ok(paused, `${label}: A backs off after its refused POST`);
+      let bDecided = 0;
+      const b = emitControl(ctx, { key, decide: async () => (bDecided++, c.joiner) });
+      release();
+      const [ra, rb] = await Promise.all([a, b]);
+      if (c.aEnds === "superseded") assert.deepEqual(ra, { status: "superseded", why: "converged" }, `${label}: A`);
+      else assert.equal(ra.status, c.aEnds, `${label}: A`);
+      if (typeof c.b === "string") assert.deepEqual(rb, ra, `${label}: B shares A's outcome`);
+      else assert.deepEqual(rb, c.b, `${label}: B`);
+      assert.deepEqual([bDecided, f.posts()], [c.bDecided, c.posts], `${label}: B's decide() calls, POSTs`);
+      assert.ok(f.rows.length <= 1, `${label}: ${f.rows.length} rows`);
+    }
+  });
+
   it("no eviction: 10k other writes and 25 h later, a write that may have landed is still unknown and never re-sent", async () => {
     const f = world(["lost", "ok"]);
     f.w.hidden = true;

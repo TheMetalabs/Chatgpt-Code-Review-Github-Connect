@@ -10,7 +10,9 @@
  * not, a session that ended or stayed open on a guess. Here it is handled once:
  * - emitControl POSTs a write at most once while its outcome may have landed, joins concurrent
  *   emits of the same key, and returns a CLOSED outcome (posted | exists | unknown | rejected |
- *   superseded) that every caller handles in an exhaustive switch.
+ *   superseded) that every caller handles in an exhaustive switch. A joiner shares the outcome of
+ *   what was SENT; a joined emit that ended superseded sent nothing on its caller's read, so the
+ *   joiner then decides for itself (its own read — its own known events — may still owe it).
  * - Every POST attempt is DECIDED at that attempt: emitControl calls the write's decide() — the
  *   caller's fresh read of the session — right before each POST (the first one too: a caller's
  *   own read may predate another write's backoff), never on a decision taken before a wait. It
@@ -223,7 +225,8 @@ export function collectable(w: ControlWrite, row: ControlRow): boolean {
  * unknown    — a POST may have landed and no list shows it: it is never sent again;
  * rejected   — nothing was created (every attempt refused, or not sent: undecided or unrenderable);
  * superseded — an attempt's decide() found the write no longer owed (`why`): nothing was created
- *              (only refused attempts came before) and nothing stands in for it.
+ *              (only refused attempts came before) and nothing stands in for it. Always the
+ *              caller's OWN decide(): a joiner never inherits another caller's.
  */
 export type EmitOutcome =
   | { status: "posted" }
@@ -504,12 +507,15 @@ export interface EmitContext {
  * landed one until LANDED_KEPT later landings retire it; after that its row answers the scan made
  * before a POST (by the emit, or by its caller) — only a scan that fails or lags that far behind
  * could let a second one through. Synchronous up to the join, so a concurrent emit of the same key
- * shares this one's outcome.
+ * shares this one's outcome — except "superseded": that is the joined caller's decide() on ITS
+ * read (its inputs, e.g. a push only the joiner knows, or a replica that lags for it alone), and it
+ * sent nothing, so the joiner emits again and its own decide() answers (the settled entry was
+ * dropped: that emit starts fresh, or joins another joiner's).
  */
 export function emitControl(ctx: EmitContext, w: ControlWrite): Promise<EmitOutcome> {
   const journal = ownWrites(ctx.gh);
   const e = journal.upsert(w);
-  if (e.inflight) return e.inflight;
+  if (e.inflight) return e.inflight.then((out) => (out.status === "superseded" ? emitControl(ctx, w) : out));
   const run = emitOnce(ctx, e).finally(() => {
     e.inflight = undefined;
     journal.prune(w.key.ref); // a refused write is settled now; a landed one is recorded

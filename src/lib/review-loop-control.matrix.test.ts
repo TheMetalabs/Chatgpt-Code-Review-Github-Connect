@@ -35,6 +35,11 @@
  *      commit (GitHub syncs a PR's head after a ref update): synced, the first read still shows
  *      the parent, or no read of the call catches up. The commit's continuation is decided owed
  *      and POSTed, and the report never says the head moved (unless a human push really moved it).
+ *  I11 a joiner decides for itself — × who joins the step's in-flight continuation: nobody; the push
+ *      handler for its head (whose read knows its push); that handler, and then a stale clean review
+ *      that only a read knowing the push sees as stale. A joiner shares what the step's emit sent,
+ *      but never its supersession: whenever the joiner's own read owes the continuation it reports
+ *      what was sent (its own POST, if the step sent none), never a quiet superseded exit.
  * One table instead of one test per bug: each review round found another cell of this space.
  */
 import { describe, it } from "node:test";
@@ -66,7 +71,7 @@ import {
   type LoopRuntimeDeps,
   type LoopStepResult,
 } from "./review-loop-runtime.server.ts";
-import { sessionRef, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
+import { sameSession, sessionRef, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 const HEAD = "a".repeat(40); // the reviewed head
@@ -153,6 +158,14 @@ type BetweenAt = "retry" | "first";
  * asynchronously after a ref update (the sync that later sends `synchronize`), so a read right
  * after the commit may still show its parent — the first read only, or every read of the call. */
 type HeadRead = "synced" | "lags-one" | "lags-call";
+/** Who else asks for the step's continuation while it is in flight (I11): nobody; or the push
+ * handler for its head — the App's own `synchronize` for its commit (continue:applied), the human's
+ * push for a step whose head moved (continue:superseded) — whose read knows its push (pushedAt; and
+ * is never behind the head: GitHub sends the webhook after the sync). It reaches the gate while the
+ * step's first attempt is being decided, and joins it. push+stale-clean: then a clean review of the
+ * reviewed head lands — stale for a read that knows the push, the end of the session for the step's
+ * own read, which does not: the step's emit ends superseded while the joiner's read owes the write. */
+type Join = "none" | "push" | "push+stale-clean";
 type Phase = "call" | "view" | "again" | "follow";
 type Cell = {
   via: Via;
@@ -167,6 +180,7 @@ type Cell = {
   between: Between;
   betweenAt: BetweenAt;
   headRead: HeadRead;
+  join: Join;
 };
 type Result = ControlResult | LoopStepResult;
 /** posted / exists / unknown / rejected as the entry point reports it; `ran` a step that ran
@@ -202,6 +216,7 @@ const PEERS: Peer[] = ["none", "before", "after"];
 const PRIORS: Prior[] = ["none", "stale-resume"];
 const BETWEENS: Between[] = ["nothing", "stop+new-start", "new-start-only", "head-moved"];
 const HEAD_READS: HeadRead[] = ["synced", "lags-one", "lags-call"];
+const JOINS: Join[] = ["none", "push", "push+stale-clean"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
@@ -235,6 +250,16 @@ const commits = (via: Via) => via === "continue:applied" || via === "handoff:pos
  * answer: how GitHub's answer is decoded does not depend on what a head read shows. */
 const headReads = (via: Via, write: Write, shape: Shape, stamp: Stamp): readonly HeadRead[] =>
   commits(via) && shape === SHAPES[write][0] && stamp === "valid" ? HEAD_READS : ["synced"];
+/** Who joins the step's continuation (I11), on the paths whose step emits one, with the plain 2xx
+ * answer. Not a refused continuation, nor a retry the failing list leaves undecided (so refused):
+ * both callers then hand off, in the order the event loop picks — the handoff paths' own cells. The
+ * stale clean review supersedes the step's first attempt, so it has no event between attempts. */
+function joins(via: Via, write: Write, shape: Shape, stamp: Stamp, list: List, between: Between): readonly Join[] {
+  const stepContinues = via === "continue:applied" || via === "continue:superseded";
+  if (!stepContinues || write === "rejected" || shape !== SHAPES[write][0] || stamp !== "valid") return ["none"];
+  if (between === "nothing") return JOINS;
+  return list === "failing" ? ["none"] : ["none", "push"];
+}
 
 /** What the write's retry is, decided after the event between its attempts (I9): still owed (sent,
  * with the cell's write result), superseded (never sent again), or undecided (the session could not
@@ -363,6 +388,11 @@ class World {
   private inEvent = false;
   /** The POSTs of a continuation GitHub always refuses (REFUSED_CONTINUATION). */
   refusedContinuations = 0;
+  /** Every read so far, by the caller's token ("t" the step and the other events, "p" the joiner). */
+  private readonly readsBy = new Map<string, number>();
+  /** The push handler that joined the step's continuation (I11), and its push's time. */
+  joined?: Promise<ControlResult>;
+  pushedAt?: string;
   private hook?: () => Promise<void>;
   readonly deps: LoopRuntimeDeps;
   readonly ref: { owner: string; repo: string; pr: number };
@@ -383,15 +413,21 @@ class World {
       this.store(BOT, continueComment({ mode: this.mode(), round: 2, pr, head: HEAD }), iso(T0 + 30_000));
       this.clock = T0 + 60_000; // bob's stop (at T0) is handled after the continuation landed
     }
-    const read = () => {
+    const read = (token: string) => {
+      this.readsBy.set(token, (this.readsBy.get(token) ?? 0) + 1);
       if (this.failing) throw new Error("list 502");
     };
     const gh: LoopRuntimeDeps["gh"] = {
-      listIssueComments: async () => (read(), this.issues.filter((r) => r.id < this.visibleBefore()).map((r) => ({ ...r }))),
-      listPullReviews: async () => (read(), this.history().map((r) => ({ userLogin: BOT, body: `<!-- ashlar-findings total=${r.total} -->`, commitId: r.head, submittedAt: r.at }))),
-      listReviewComments: async () => (read(), this.history().map((r) => ({ userLogin: BOT, path: "src/a.ts", commitId: r.head, createdAt: r.at, body: "finding" }))),
+      listIssueComments: async (t) => (read(t), this.issues.filter((r) => r.id < this.visibleBefore()).map((r) => ({ ...r }))),
+      listPullReviews: async (t) => (read(t), this.history().map((r) => ({ userLogin: BOT, body: `<!-- ashlar-findings total=${r.total} -->`, commitId: r.head, submittedAt: r.at }))),
+      listReviewComments: async (t) => (read(t), this.history().map((r) => ({ userLogin: BOT, path: "src/a.ts", commitId: r.head, createdAt: r.at, body: "finding" }))),
       createIssueComment: async (_t, o) => this.create(o.body),
-      fetchPullHeadRef: async (token) => ({ ref: "feature", sha: this.headRead(token), fork: false, sameRepo: true }),
+      fetchPullHeadRef: async (token) => {
+        this.readsBy.set(token, (this.readsBy.get(token) ?? 0) + 1);
+        const sha = this.headRead(token);
+        if (this.joinsNow(token)) await this.joinPush(); // the step's first attempt is being decided
+        return { ref: "feature", sha, fork: false, sameRepo: true };
+      },
       fetchUserPermission: async () => "write",
       listReviewThreadRoots: async () => [],
       replyToReviewComment: async () => {},
@@ -508,6 +544,39 @@ class World {
       case "lags-call":
         return HEAD;
     }
+  }
+
+  /** Is this head read the step's, deciding its continuation's first attempt, with the joiner still
+   * to come (I11)? The step's emit is in flight and has sent nothing (its entry is an intent). */
+  private joinsNow(token: string): boolean {
+    if (this.cell.join === "none" || this.joined || token !== "t" || this.inEvent || this.phase !== "call") return false;
+    return ownWrites(this.deps.gh).state(this.key()) === "intent";
+  }
+
+  /** The push handler for the continuation's head runs up to the gate and joins the step's emit
+   * (its reads resolve at once; then it waits on the gate). push+stale-clean: then the clean
+   * review of the reviewed head lands. */
+  private async joinPush(): Promise<void> {
+    const headSha = CONTINUE_HEAD[this.cell.via]!;
+    const actor = this.cell.via === "continue:applied" ? BOT : "alice"; // the App's own push, or the human's
+    const pushedAt = second(this.clock);
+    this.pushedAt = pushedAt;
+    this.joined = continueLoopOnPush("p", { ...this.ref, headSha, actor, pushedAt }, settings(this.mode()), this.deps, ENV);
+    let seen = -1;
+    for (let quiet = 0, i = 0; quiet < 3 && i < 200; i++) {
+      await new Promise((r) => setImmediate(r));
+      const n = this.readsBy.get("p") ?? 0;
+      quiet = n === seen ? quiet + 1 : 0;
+      seen = n;
+    }
+    if (this.cell.join !== "push+stale-clean") return;
+    this.clock += 1_000;
+    this.reviews.push({ head: HEAD, total: 0, at: iso(this.clock) });
+  }
+
+  /** The joiner's push, as its own read folds it. */
+  pushEvent(): LoopEvent {
+    return { at: this.pushedAt ?? "", kind: "push", head: CONTINUE_HEAD[this.cell.via] };
   }
 
   /** The journal key of the write under test (in the session its call read). */
@@ -820,6 +889,24 @@ function expectFirstBetween(c: Cell): Cls {
   }
 }
 
+/** The step's first call where the push handler joined its continuation (I11): the stale clean
+ * review supersedes the step's own first attempt (its read ends the session converged) — an applied
+ * round's report says so, a superseded step exits quietly; otherwise the joiner changes nothing for
+ * the step. */
+function expectFirstJoined(c: Cell): Cls {
+  if (c.join === "push+stale-clean") return c.via === "continue:applied" ? "superseded" : "resolved";
+  return c.between === "nothing" ? expectFirst(c) : expectFirstBetween(c);
+}
+
+/** What the joiner reports (I11): where its own read supersedes the write too (a stop and a newer
+ * start, a moved head), that; otherwise the continuation is owed and it reports what was sent — the
+ * step's POST it shared, or (stale-clean: only the step's read superseded it) its own, with the
+ * cell's write result — as a push handler does. */
+function expectJoiner(c: Cell): Cls {
+  if (c.join === "push" && fateAtRetry(c) === "superseded") return "resolved";
+  return expectFirst({ ...c, via: "continue:push" });
+}
+
 function expectAgain(c: Cell, caughtUp: boolean): Cls {
   const list = caughtUp ? "normal" : c.list;
   if (list === "failing" && c.via !== "start:admission") return "unreadable"; // it reads the session before emitting
@@ -834,9 +921,11 @@ function expectAgain(c: Cell, caughtUp: boolean): Cls {
 
 // ── invariants ──────────────────────────────────────────────────────────────────
 
-/** I2: an unresolved outcome — or any result while the write's outcome is still unknown — is logged. */
-function assertLogged(w: World, r: Result, cls: string, label: string): void {
-  const unresolved = cls === "unknown" || cls === "rejected" || cls === "unreadable" || ownWrites(w.deps.gh).state(w.key()) === "unknown";
+/** I2: an unresolved outcome — or any result while the write's outcome is still unknown — is logged.
+ * `sender`: false for a caller that sent no attempt of the write: its own read superseded it before
+ * any (push+stale-clean: the step), and the joiner that sent it reports that write's outcome. */
+function assertLogged(w: World, r: Result, cls: string, label: string, sender = true): void {
+  const unresolved = cls === "unknown" || cls === "rejected" || cls === "unreadable" || (sender && ownWrites(w.deps.gh).state(w.key()) === "unknown");
   if (!unresolved) return;
   // a control result that posted its record acted on the PR: that is not a silent exit
   const logged = isControl(r) ? r.posted || controlResultLogged(r) : !(r.ran === false && SILENT_REASONS.includes(r.reason));
@@ -1042,6 +1131,24 @@ function assertOwnCommitNoMove(w: World): void {
   assert.ok(!/The PR head moved meanwhile/.test(report), `I10: the report says the head moved (head read ${headRead}): ${report}`);
 }
 
+/** I11: a joiner never inherits another caller's supersession. Whenever its own read owes the
+ * continuation — its session runs (with its push folded) and the head is still the continuation's —
+ * it reports what was sent, never a quiet superseded or no-session exit; and the continuation stands
+ * once in this process, and as its rows after a restart. */
+async function assertJoined(w: World, r: ControlResult): Promise<void> {
+  const cls = controlClass(w, r);
+  assert.equal(cls, expectJoiner(w.cell), `I3 joiner: ${JSON.stringify(r)}`);
+  assertLogged(w, r, cls, "joiner");
+  w.catchUp();
+  const own = await readLoopSession(w.deps.gh, "p", "o", "r", w.pr, { botLogin: BOT, pr: { sha: w.live() }, extra: [w.pushEvent()] });
+  const owes = w.live() === CONTINUE_HEAD[w.cell.via] && own.active && sameSession(sessionRef(own), w.callSession);
+  if (owes) assert.notEqual(cls, "resolved", `I11: the joiner's own read owes the continuation, yet it reports ${JSON.stringify(r)}`);
+  if (w.cell.between !== "nothing") return; // I9 checks the write (assertBetween)
+  assert.equal((await w.eventsOfWrite()).length, 1, "I11: the continuation does not stand once in this process");
+  const restarted = { ...w.deps.gh }; // another client object: an empty journal
+  assert.equal((await w.eventsOfWrite(restarted)).length, w.rowsForWrite, "I11: the continuation after a restart is not its rows");
+}
+
 async function runCell(c: Cell, pr: number): Promise<void> {
   const w = new World(c, pr);
   const realNow = Date.now;
@@ -1053,13 +1160,19 @@ async function runCell(c: Cell, pr: number): Promise<void> {
     if (sessionScoped(c.via)) w.callSession = sessionRef(await w.session());
     w.armFirstAttempt();
     const first = await w.enter();
+    const joiner = w.joined ? await w.joined : undefined; // the joiner's call ends with the step's
     const cls = classify(w, first);
-    assert.equal(cls, c.between === "nothing" ? expectFirst(c) : expectFirstBetween(c), `I3 first: ${JSON.stringify(first)}`);
-    assertLogged(w, first, cls, "first");
+    const expected = c.join !== "none" ? expectFirstJoined(c) : c.between === "nothing" ? expectFirst(c) : expectFirstBetween(c);
+    assert.equal(cls, expected, `I3 first: ${JSON.stringify(first)}`);
+    assertLogged(w, first, cls, "first", c.join !== "push+stale-clean");
+    assert.equal(joiner !== undefined, c.join !== "none", "I11: the push handler ran while the step's continuation was being decided");
     w.disarm();
     await w.afterCall();
+    if (joiner) await assertJoined(w, joiner);
     if (c.between !== "nothing") {
       await assertBetween(w);
+    } else if (joiner) {
+      // the joined continuation is checked (assertJoined)
     } else if (w.newerStart()) {
       await w.injectCarol(); // a success had no backoff to inject it in
       await assertNewerSessionLives(w);
@@ -1094,7 +1207,7 @@ async function runCell(c: Cell, pr: number): Promise<void> {
   }
 }
 
-describe("control writes: kind (× a stop's prior session) × write result (× 2xx body × created_at) × list read × later event, or what happens between the write's attempts (× anchor start × peer start × how the step's head reads follow its commit) (#79 K1)", () => {
+describe("control writes: kind (× a stop's prior session) × write result (× 2xx body × created_at) × list read × later event, or what happens between the write's attempts (× anchor start × peer start × how the step's head reads follow its commit × who joins the step's continuation) (#79 K1)", () => {
   let row = 0;
   for (const via of VIAS)
     for (const prior of kindOf(via) === "stop" ? PRIORS : (["none"] as const))
@@ -1104,20 +1217,22 @@ describe("control writes: kind (× a stop's prior session) × write result (× 2
             for (const list of LISTS)
               for (const between of betweens(via))
                 for (const betweenAt of betweenAts(via, between))
-                  for (const later of between === "nothing" ? LATERS : (["row-appears"] as const))
-                    for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
-                      for (const peer of sessionScoped(via) ? PEERS : (["none"] as const))
-                        for (const headRead of headReads(via, write, shape, stamp)) {
-                          if (!applies(via, later)) continue;
-                          const cell = { via, write, shape, stamp, list, later, anchor, peer, prior, between, betweenAt, headRead };
-                          const pr = 1000 + row++;
-                          const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
-                          const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
-                          const where = betweenAt === "retry" ? "between attempts" : "before the first attempt";
-                          const next = between === "nothing" ? later : `${where}: ${between}`;
-                          const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
-                          const before = prior === "none" ? "" : ` | prior ${prior}`;
-                          const commit = headRead === "synced" ? "" : ` | head read ${headRead}`;
-                          it(`${via} | ${write}${answer}${time} | ${list} | ${next}${session}${before}${commit}`, () => runCell(cell, pr));
-                        }
+                  for (const join of joins(via, write, shape, stamp, list, between))
+                    for (const later of between === "nothing" && join === "none" ? LATERS : (["row-appears"] as const))
+                      for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
+                        for (const peer of sessionScoped(via) ? PEERS : (["none"] as const))
+                          for (const headRead of headReads(via, write, shape, stamp)) {
+                            if (!applies(via, later)) continue;
+                            const cell = { via, write, shape, stamp, list, later, anchor, peer, prior, between, betweenAt, headRead, join };
+                            const pr = 1000 + row++;
+                            const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
+                            const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
+                            const where = betweenAt === "retry" ? "between attempts" : "before the first attempt";
+                            const next = between === "nothing" ? (join === "none" ? later : "joined") : `${where}: ${between}`;
+                            const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
+                            const before = prior === "none" ? "" : ` | prior ${prior}`;
+                            const commit = headRead === "synced" ? "" : ` | head read ${headRead}`;
+                            const joined = join === "none" ? "" : ` | joined by ${join}`;
+                            it(`${via} | ${write}${answer}${time} | ${list} | ${next}${session}${before}${commit}${joined}`, () => runCell(cell, pr));
+                          }
 });

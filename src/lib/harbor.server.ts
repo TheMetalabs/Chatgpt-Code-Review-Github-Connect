@@ -39,6 +39,7 @@ import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger,
 import {
   ashlarBotLogin,
   continueLoopOnPush,
+  controlResultLogged,
   loopPostedReview,
   loopStartAt,
   startLoop,
@@ -46,6 +47,7 @@ import {
   runPostReviewLoop,
   SILENT_REASONS,
   stopLoop,
+  type ControlResult,
 } from "./review-loop-runtime.server.ts";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { validatedSettingsPatch } from "./settings-rules";
@@ -1346,7 +1348,7 @@ function recordLoopStart(token: string, job: Job): void {
   const start = { owner: job.owner, repo: job.repo, pr: job.pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) };
   void startLoop(token, start, state.settings).then(
     (r) => {
-      if (!r.posted && /failed/.test(r.reason)) console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${r.reason}`);
+      if (controlResultLogged(r)) console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${r.reason}`);
     },
     (e) => console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${formatGithubError(e)}`),
   );
@@ -1363,14 +1365,12 @@ function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>,
   if (!loopControlClaims.claim(deliveryId)) return;
   const installationId = parsed.installationId;
   const { owner, repo, pr, headSha } = parsed.target;
-  const run = (label: string, step: (token: string) => Promise<{ posted: boolean; reason: string }>) => {
+  const run = (label: string, step: (token: string) => Promise<ControlResult>) => {
     void (async () => {
       try {
         const r = await step(await installationToken(installationId));
-        if (!r.posted && /failed|in flight/.test(r.reason)) {
-          loopControlClaims.release(deliveryId); // a redelivery may retry what did not land
-          if (/failed/.test(r.reason)) console.warn(`[review-loop] ${label}: ${r.reason}`);
-        }
+        if (!r.posted && /failed|in flight/.test(r.reason)) loopControlClaims.release(deliveryId); // a redelivery may retry what did not land
+        if (controlResultLogged(r)) console.warn(`[review-loop] ${label}: ${r.reason}`);
       } catch (e) {
         loopControlClaims.release(deliveryId);
         console.warn(`[review-loop] ${label}: ${formatGithubError(e)}`);

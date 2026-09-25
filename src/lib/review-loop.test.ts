@@ -9,6 +9,7 @@ import {
   isEscalateComment,
   isStoppedComment,
   stoppedComment,
+  stopRecordComment,
   isoMs,
   isZeroFindings,
   parseFindingsTotal,
@@ -526,6 +527,16 @@ describe("stop record (STOPPED acknowledgement that records the stop)", () => {
     assert.equal(parseStopRecord(stoppedComment(), BOT), null, "a bare acknowledgement records nothing");
     assert.equal(parseStopRecord(`quoted ${body}`, BOT), null, "anchored");
     assert.throws(() => stoppedComment({ by: "not a login", at: "2026-01-02T00:00:00Z" }));
+  });
+
+  it("the bare record (posted while a newer session runs) records the stop but is no STOPPED signal", () => {
+    const body = stopRecordComment({ by: "bob", at: "2026-01-02T00:00:00Z" });
+    assert.deepEqual(parseStopRecord(body, BOT), { at: "2026-01-02T00:00:00Z", by: "bob" });
+    assert.equal(isStoppedComment(body, BOT), false, "no terminal marker");
+    assert.ok(!body.includes("ashlar-loop-stopped") && !body.includes(REVIEW_LOOP_STOPPED_HUMAN), "nothing a STOPPED substring detector matches");
+    assert.equal(parseStopRecord(body, USER), null, "a human copy is not a record");
+    assert.equal(parseStopRecord(`quoted ${body}`, BOT), null, "anchored");
+    assert.throws(() => stopRecordComment({ by: "bob", at: "yesterday" }));
   });
 });
 

@@ -56,6 +56,8 @@
  *   T13  QU|QP    recover(runId) (owner, slot)       CP     resume  lease; runId pinned (QU) / matched (QP)
  *   T14  CU|CP    complete (holder)                  DONE   -       answerDigest; prompt dropped
  *   T15  CU|CP    fail (holder)                      FAILED -       reason; prompt dropped
+ *   T15b CU|CP    refresh `disconnected` past         FAILED -       reason "binding_lost" (bound from the first
+ *                 bindingLostMs, no run since (holder)                 binding-less heartbeat; a generating one resets it)
  *   T16  live     deadline | newer request | abort   CANCELLED -    "timeout" | "superseded" | "aborted"
  *   refused: a claim of a queued item (Q0, QU, QP: `take_required`; only take and recover hand out a
  *   delivery, and only their response carries the offer the worker journals), another profile (any
@@ -213,6 +215,8 @@ export interface FixItem {
   answerDigest?: string;
   /** Latest reported progress stage (diagnostics for the timeout message). */
   stage?: string;
+  /** First heartbeat of the current unbroken run of binding-less (`disconnected`) heartbeats. */
+  bindingLostAt?: number;
   endedAt?: number;
   reason?: string;
 }
@@ -232,6 +236,9 @@ export interface FixRegistryDeps {
   claimMs: number;
   /** Foreground-submission window shared with review tabs (SUBMIT_WINDOW_MS). */
   submitWindowMs: number;
+  /** BINDING_LOST_MS: a claim whose heartbeats report its binding unavailable this long, with no
+   * bound run since, fails (its heartbeats would otherwise hold the claim until the deadline). */
+  bindingLostMs?: number;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
 }
@@ -509,14 +516,24 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return offer(item, out.leaseId, "resume");
   }
 
-  /** Heartbeat: renews the lease (not a deadline extension) and records generation start. */
-  function refresh(id: string, leaseId: string | undefined, generating?: Partial<Record<string, boolean>>): boolean {
+  /** Heartbeat: renews the lease (not a deadline extension) and records generation start. A
+   * heartbeat reporting the binding unavailable (`disconnected`) starts the binding-lost bound; one
+   * reporting the run generating again clears it; past bindingLostMs the item fails. */
+  function refresh(id: string, leaseId: string | undefined, generating?: Partial<Record<string, boolean>>, errors?: Partial<Record<string, { code?: string }>>): boolean {
     const item = current(id);
     if (!item || !holds(item, leaseId)) return false;
     // A stale claim gave up its slot: its heartbeat may not revive it past parallelLimit().
     if (stale(item) && claimedCount() >= limit()) return false;
-    item.claimedAt = deps.now();
-    if (generating?.[item.provider] === true) item.generating = true;
+    const now = deps.now();
+    item.claimedAt = now;
+    const lost = errors?.[item.provider]?.code === "disconnected";
+    if (lost) item.bindingLostAt ??= now;
+    else if (generating?.[item.provider] === true) item.bindingLostAt = undefined;
+    if (generating?.[item.provider] === true && !lost) item.generating = true;
+    const bound = deps.bindingLostMs;
+    if (lost && bound !== undefined && now - item.bindingLostAt! >= bound) {
+      settle(item, "failed", "binding_lost", { error: new Error(`${item.provider} fix request failed: original job binding unavailable for ${minutes(bound)} min with no bound run reported`) });
+    }
     return true;
   }
 

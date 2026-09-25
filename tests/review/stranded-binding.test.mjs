@@ -88,3 +88,40 @@ test('a stranded review never holds a queued fix\'s precedence', () => {
   assert.equal(next?.kind, 'fix');
   assert.equal(row(h, 'R').providerErrors.chatgpt.code, 'error');
 });
+
+test('a fix leg whose original binding stays unavailable fails after BINDING_LOST_MS, freeing its slot', async () => {
+  // Validation on PR #93: the fix was taken, its worker lost the binding and kept heartbeating
+  // `disconnected`: the claim stayed fresh, pendingFixes 1, and the only parallelPrs slot held,
+  // until the fix deadline (30 min default).
+  const h = clocked([]);
+  const pending = quiet(h.bridge.requestBridgeFix({owner: 'fixture', repo: 'fixture', pr: 93, provider: 'chatgpt', prompt: 'FIX'}));
+  const offer = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true});
+  assert.equal(offer?.kind, 'fix');
+  const other = quiet(h.bridge.requestBridgeFix({owner: 'fixture', repo: 'fixture', pr: 94, provider: 'chatgpt', prompt: 'FIX 2'}));
+  for (let i = 0; i < 10; i++) {
+    assert.equal(h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: false}, LOST, offer.leaseId), true);
+    h.advance(MIN - 1);
+    assert.equal(h.bridge.bridgeJobState(offer.jobId).status, 'awaiting_chat', `minute ${i}: still a transient wait`);
+  }
+  h.advance(10);
+  h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: false}, LOST, offer.leaseId);
+  assert.equal(h.bridge.bridgeJobState(offer.jobId).status, 'dlq', 'past the bound the fix is a provider failure');
+  await assert.rejects(pending, /binding/);
+  const next = h.bridge.takeNextBridgeJob('chrome-1', [offer.jobId], {fixes: true});
+  assert.equal(next?.kind, 'fix', 'the freed slot serves the next fix');
+  void other;
+});
+
+test('a fix leg that reports its run again restarts the bound', () => {
+  const h = clocked([]);
+  quiet(h.bridge.requestBridgeFix({owner: 'fixture', repo: 'fixture', pr: 93, provider: 'chatgpt', prompt: 'FIX'}));
+  const offer = h.bridge.takeNextBridgeJob('chrome-1', [], {fixes: true});
+  h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: false}, LOST, offer.leaseId);
+  h.advance(9 * MIN);
+  h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: true}, undefined, offer.leaseId);
+  h.advance(MIN);
+  h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: false}, LOST, offer.leaseId);
+  h.advance(9 * MIN);
+  h.bridge.refreshBridgeClaim(offer.jobId, {chatgpt: false}, LOST, offer.leaseId);
+  assert.equal(h.bridge.bridgeJobState(offer.jobId).status, 'awaiting_chat');
+});

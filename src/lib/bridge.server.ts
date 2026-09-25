@@ -158,6 +158,7 @@ function fixes() {
     maxPromptChars: () => fixKnob(getHarbor().settings.fixAgent, "chatMaxPromptChars"),
     claimMs: BRIDGE_CLAIM_MS,
     submitWindowMs: SUBMIT_WINDOW_MS,
+    bindingLostMs: BINDING_LOST_MS,
     // unref: a pending fix deadline must never keep the server (or a test runner) alive.
     setTimer: (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
     clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -461,8 +462,9 @@ export function refreshBridgeClaim(
   leaseId?: string,
 ): boolean {
   if (isFixItemId(jobId)) {
-    // Provider errors on a fix are terminal only via the explicit failure action.
-    const accepted = fixes().refresh(jobId, leaseId, generating);
+    // Provider errors on a fix are terminal only via the explicit failure action, or once its
+    // binding has stayed unavailable past BINDING_LOST_MS (a heartbeat must not hold it forever).
+    const accepted = fixes().refresh(jobId, leaseId, generating, errors);
     if (accepted) meta.lastJobId = jobId;
     return accepted;
   }

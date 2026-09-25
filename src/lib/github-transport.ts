@@ -51,7 +51,7 @@ export function githubWriteOutcome(status: number, notSent?: boolean): GithubWri
 }
 
 /** A failed GitHub write: `status` is the HTTP status (0 when there was no response, or a 2xx
- * without the created row's id — outcome unknown). */
+ * without a usable created row — outcome unknown, see createdRow). */
 export class GithubWriteError extends Error {
   readonly status: number;
   readonly outcome: GithubWriteOutcome;
@@ -61,4 +61,60 @@ export class GithubWriteError extends Error {
     this.status = status;
     this.outcome = outcome;
   }
+}
+
+/** A created issue comment as GitHub answered it (a created_at GitHub did not report reads as ""). */
+export type PostedIssueComment = { id: number; userLogin: string; createdAt: string; body?: string };
+/** A created review as GitHub answered it (a field GitHub did not report reads as ""). */
+export type PostedReviewRow = { id: number; userLogin: string; submittedAt: string; commitId: string };
+
+type Row = { id: number; [field: string]: unknown };
+
+const isRow = (data: unknown): data is Row => {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return false;
+  const id = (data as { id?: unknown }).id;
+  return typeof id === "number" && Number.isSafeInteger(id) && id > 0;
+};
+
+const text = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/**
+ * The created row in a write's 2xx answer (`body`, as received): a JSON object carrying GitHub's
+ * id, a positive integer. Anything else — an empty body, JSON null, a primitive, an array, an
+ * object without a usable id — cannot be that row, yet GitHub accepted the request: the write may
+ * have landed. That is GithubWriteError outcome "unknown" (status 0: no usable response, as for a
+ * body that is not JSON) under the write's own message prefix — never a TypeError from reading the
+ * row, which a caller would take for a refusal and send the write again.
+ */
+export function createdRow(api: string, status: number, body: string): Row {
+  let data: unknown;
+  try {
+    data = JSON.parse(body);
+  } catch {
+    data = undefined;
+  }
+  if (isRow(data)) return data;
+  throw new GithubWriteError(`${api} 0: no created row in the ${status} response: ${body.slice(0, 200) || "(empty body)"}`, 0, "unknown");
+}
+
+/** The issue comment a 2xx POST created (see createdRow). */
+export function postedIssueComment(status: number, body: string): PostedIssueComment {
+  const row = createdRow("GitHub issue comment", status, body);
+  return {
+    id: row.id,
+    userLogin: text((row.user as { login?: unknown } | null | undefined)?.login),
+    createdAt: text(row.created_at),
+    ...(typeof row.body === "string" ? { body: row.body } : {}),
+  };
+}
+
+/** The review a 2xx POST created (see createdRow). */
+export function postedReviewRow(status: number, body: string): PostedReviewRow {
+  const row = createdRow("GitHub Reviews API", status, body);
+  return {
+    id: row.id,
+    userLogin: text((row.user as { login?: unknown } | null | undefined)?.login),
+    submittedAt: text(row.submitted_at),
+    commitId: text(row.commit_id),
+  };
 }

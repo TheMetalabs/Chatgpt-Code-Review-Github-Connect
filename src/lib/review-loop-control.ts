@@ -499,11 +499,14 @@ function unknownOutcome(e: OwnWrite): EmitOutcome {
   return { status: "unknown", attemptAt: e.attemptAt ?? "", error: e.error ?? "the write's outcome is unknown" };
 }
 
-/** A write that may have landed is only ever looked for again (a failed read finds nothing). */
+/** A write that may have landed is only ever looked for again. A failed read finds nothing — so
+ * does one whose answer is no list of rows (never a TypeError: the outcome stays closed). */
 async function recheck(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
   const { ref } = e.write.key;
-  const rows = await ctx.gh.listIssueComments(ctx.token, ref.owner, ref.repo, ref.pr).catch(() => null);
-  const hit = rows ? listedMatch(rows, e.write, ctx.botLogin) : undefined;
+  const hit = await ctx.gh
+    .listIssueComments(ctx.token, ref.owner, ref.repo, ref.pr)
+    .then((rows) => listedMatch(rows, e.write, ctx.botLogin))
+    .catch(() => undefined);
   if (!hit) return unknownOutcome(e);
   confirm(e, hit);
   return { status: "exists" };

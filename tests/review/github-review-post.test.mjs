@@ -209,3 +209,42 @@ for (const [name, write] of Object.entries(writes)) {
     assert.ok(shown.startsWith(`${err.message} · `) && shown.includes(err.cause.message), shown);
   });
 }
+
+// A 2xx whose body is no usable created row: GitHub accepted the write, so it may have landed — an
+// unknown outcome under the write's own message prefix, from one POST, and the text the loop-OFF
+// posting path shows as the job's githubError. Never a TypeError from reading the row: the control
+// gate reads a generic error as a refusal and POSTs the write again.
+const rawRespond = (code, text) => (_req, callback) => { const res = new EventEmitter(); res.statusCode = code; callback(res); res.emit('data', Buffer.from(text)); res.emit('end'); };
+const createdShapes = {
+  'row without an id': JSON.stringify({ user: { login: 'ashlar-bot[bot]' }, created_at: '2026-09-24T13:00:00Z', body: 'b' }),
+  'row whose id is not a number': JSON.stringify({ id: '41', user: { login: 'ashlar-bot[bot]' } }),
+  null: 'null',
+  'primitive (number)': '41',
+  'primitive (string)': '"created"',
+  array: JSON.stringify([{ id: 41 }]),
+  'empty body': '',
+};
+
+for (const [name, write] of Object.entries(writes)) {
+  test(`${name}: a 2xx body with no usable created row is an unknown outcome from one POST, never a TypeError`, async () => {
+    for (const [shape, text] of Object.entries(createdShapes)) {
+      let posts = 0;
+      const api = oneRealmApi((req, callback) => { posts += 1; rawRespond(201, text)(req, callback); });
+      const err = await write(api).then(() => assert.fail(`${shape}: the write must fail`), (e) => e);
+      assert.deepEqual({ name: err.name, status: err.status, outcome: err.outcome }, { name: 'GithubWriteError', status: 0, outcome: 'unknown' }, shape);
+      assert.match(err.message, /^GitHub (issue comment|Reviews API) 0: no created row in the 201 response: /, shape);
+      assert.ok(err.message.endsWith(text || '(empty body)'), `${shape}: the answer is quoted: ${err.message}`);
+      assert.equal(api.formatGithubError(err), err.message, `${shape}: the job's githubError is the write's own text`);
+      assert.equal(posts, 1, `${shape}: one POST`);
+    }
+  });
+}
+
+test('a list page that is not a JSON array fails the read: never "no rows"', async () => {
+  for (const text of ['null', '{}', '"rows"', '']) {
+    const api = oneRealmApi(rawRespond(200, text));
+    await assert.rejects(api.listIssueComments('t', 'o', 'r', 1), (e) => /^list \/repos\/o\/r\/issues\/1\/comments failed \(200\): not a list: /.test(e.message), JSON.stringify(text));
+  }
+  const page = oneRealmApi(rawRespond(200, JSON.stringify([{ id: 3, user: { login: 'bob' }, body: 'x', created_at: '2026-09-24T13:00:00Z' }])));
+  assert.deepEqual([...(await page.listIssueComments('t', 'o', 'r', 1))].map((r) => ({ ...r })), [{ id: 3, userLogin: 'bob', body: 'x', createdAt: '2026-09-24T13:00:00Z', updatedAt: '' }]);
+});

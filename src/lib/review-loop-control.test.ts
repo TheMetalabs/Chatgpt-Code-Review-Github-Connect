@@ -351,6 +351,18 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(posts, sent, "no second POST");
   });
 
+  it("a re-check whose list answers no list of rows finds nothing: the outcome stays unknown, never a rejected emit", async () => {
+    for (const answer of [{}, [null], "rows", 7]) {
+      const label = JSON.stringify(answer);
+      const f = world(["lost"]);
+      assert.equal((await emitControl(f.ctx, handoff())).status, "unknown", label);
+      f.gh.listIssueComments = async () => answer as unknown as ControlRow[];
+      const again = await emitControl(f.ctx, handoff()).catch((e: unknown) => ({ status: "threw", error: String(e) }));
+      assert.equal(again.status, "unknown", `${label}: ${JSON.stringify(again)}`);
+      assert.equal(f.posts(), 1, `${label}: never re-sent`);
+    }
+  });
+
   it("a posted write whose 2xx row has createdAt '' (production's shape for a missing created_at) stands in at its attempt", async () => {
     const f = world(["ok"]);
     const gh = { ...f.gh, createIssueComment: async () => ({ id: 7, userLogin: BOT, createdAt: "" }) };

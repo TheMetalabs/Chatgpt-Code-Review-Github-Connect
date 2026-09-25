@@ -6,7 +6,16 @@ import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } 
 import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
-import { GithubTransportError, GithubWriteError, githubWriteOutcome, mayResendOnOtherHost, trackRequestSent } from "./github-transport";
+import {
+  GithubTransportError,
+  GithubWriteError,
+  githubWriteOutcome,
+  mayResendOnOtherHost,
+  postedIssueComment,
+  postedReviewRow,
+  trackRequestSent,
+  type PostedIssueComment,
+} from "./github-transport";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
@@ -341,9 +350,6 @@ export async function probeGithub(installationId?: number): Promise<{
   }
 }
 
-/** The row GitHub created for a write, as GitHub reported it (a later read-your-writes key). */
-type GithubRow = { id?: number; user?: { login?: string } };
-export type PostedIssueComment = { id: number; userLogin: string; createdAt: string; body?: string };
 export type PostedReview = { id: number; inlineDropped: boolean; userLogin: string; submittedAt: string; commitId: string };
 
 /** A write's failure, classified by `githubWriteOutcome` (the message prefix is unchanged). */
@@ -355,7 +361,7 @@ async function gh<T>(
   token: string,
   path: string,
   init?: { method?: string; body?: string; headers?: Record<string, string> },
-): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string; notSent?: boolean; cause?: unknown }> {
+): Promise<{ ok: true; status: number; text: string; data: T } | { ok: false; status: number; text: string; notSent?: boolean; cause?: unknown }> {
   let out: GhRes;
   try {
     out = await ghHttps(
@@ -379,7 +385,7 @@ async function gh<T>(
   }
   if (out.status < 200 || out.status >= 300) return { ok: false, status: out.status, text: out.text.slice(0, 400) };
   try {
-    return { ok: true, data: (out.text ? JSON.parse(out.text) : {}) as T };
+    return { ok: true, status: out.status, text: out.text, data: (out.text ? JSON.parse(out.text) : {}) as T };
   } catch (e) {
     // GitHub accepted the request but the body is truncated or not JSON (an intermediary, a cut
     // connection): no usable response. For a write the outcome is unknown, never a retryable miss.
@@ -665,7 +671,7 @@ export async function createPullReview(
 ): Promise<PostedReview> {
   let comments = opts.comments;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const out = await gh<GithubRow & { submitted_at?: string; commit_id?: string }>(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
+    const out = await gh(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -681,14 +687,10 @@ export async function createPullReview(
       }),
     });
     if (out.ok) {
-      if (!out.data.id) throw new GithubWriteError("review missing id", 0, "unknown");
       return {
-        id: out.data.id,
+        ...postedReviewRow(out.status, out.text),
         // true when GitHub refused an inline anchor and the review went out without ANY inline comment
         inlineDropped: comments.length < opts.comments.length,
-        userLogin: String(out.data.user?.login ?? ""),
-        submittedAt: String(out.data.submitted_at ?? ""),
-        commitId: String(out.data.commit_id ?? ""),
       };
     }
     // Drop the inline comments and re-send only after GitHub definitely REFUSED the review for an
@@ -711,7 +713,9 @@ async function ghListAll<T>(token: string, pathBase: string): Promise<T[]> {
     const sep = pathBase.includes("?") ? "&" : "?";
     const out = await gh<T[]>(token, `${pathBase}${sep}per_page=100&page=${page}`);
     if (!out.ok) throw new Error(`list ${pathBase} failed (${out.status}): ${out.text}`);
-    const batch = out.data ?? [];
+    // a page that is not a JSON array (null, an object, an empty body) is no page: never "no rows"
+    if (!Array.isArray(out.data)) throw new Error(`list ${pathBase} failed (${out.status}): not a list: ${out.text.slice(0, 200) || "(empty body)"}`);
+    const batch = out.data;
     all.push(...batch);
     if (batch.length < 100) return all; // exhausted
     if (page === MAX_PAGES) {
@@ -979,19 +983,13 @@ export async function createIssueComment(
   token: string,
   opts: { owner: string; repo: string; pr: number; body: string },
 ): Promise<PostedIssueComment> {
-  const out = await gh<GithubRow & { created_at?: string; body?: string }>(token, `/repos/${opts.owner}/${opts.repo}/issues/${opts.pr}/comments`, {
+  const out = await gh(token, `/repos/${opts.owner}/${opts.repo}/issues/${opts.pr}/comments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ body: opts.body }),
   });
   if (!out.ok) throw writeError(`GitHub issue comment ${out.status}: ${out.text}`, out);
-  if (!out.data.id) throw new GithubWriteError("comment missing id", 0, "unknown");
-  return {
-    id: out.data.id,
-    userLogin: String(out.data.user?.login ?? ""),
-    createdAt: String(out.data.created_at ?? ""),
-    ...(typeof out.data.body === "string" ? { body: out.data.body } : {}),
-  };
+  return postedIssueComment(out.status, out.text);
 }
 
 export async function updateIssueComment(

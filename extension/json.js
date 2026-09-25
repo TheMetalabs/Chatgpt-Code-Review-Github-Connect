@@ -993,10 +993,15 @@ function runStoppedFor(jobId, runId) {
 
 /** Why this page is no longer the fresh page a new run may start on (X2, #85; `page`: the page its
  * tab was opened on, or the one the run was accepted on): "navigated" when it shows another page,
- * "user_turn" once it holds a user turn (a message the user sent there); "" while it still is. */
-function freshPageLeft(page) {
+ * "user_turn" once it holds a user turn (a message the user sent there), "draft" once its composer
+ * holds the user's unsent text or file (Ashlar 4103758186: never typed over, never sent along);
+ * "" while it still is. Ashlar's own attachments are not a draft, nor its own text once it started
+ * typing (composer.js fillComposer: composerTyping; clickSend sends only the exact prompt). */
+function freshPageLeft(page, state) {
   if (!samePage(globalThis.location?.href || "", page)) return "navigated";
-  return globalThis.document?.querySelector('[data-message-author-role="user"]') ? "user_turn" : "";
+  if (globalThis.document?.querySelector('[data-message-author-role="user"]')) return "user_turn";
+  if (composerStagedFiles(state, null).length) return "draft";
+  return !state?.composerTyping && composerDraftText() ? "draft" : "";
 }
 
 /** The one stop fence: every send and collect loop (composer.js and both collectors) calls it
@@ -1009,9 +1014,9 @@ function throwIfStopped() {
   if (state?.runStopped) {
     const error = new Error("the run was stopped: its job was cancelled or forgotten"); error.code = "cancelled"; throw error;
   }
-  const left = state?.freshPage ? freshPageLeft(state.freshPage) : "";
+  const left = state?.freshPage ? freshPageLeft(state.freshPage, state) : "";
   if (!left) return;
-  const error = new Error(`${left === "user_turn" ? "a user message appeared in the tab" : "the tab left its new chat"} before the prompt was sent; nothing was sent`);
+  const error = new Error(`${left === "user_turn" ? "a user message appeared in the tab" : left === "draft" ? "a user draft appeared in the tab" : "the tab left its new chat"} before the prompt was sent; nothing was sent`);
   error.code = "taken_over"; throw error;
 }
 
@@ -1221,7 +1226,7 @@ function installReviewRunner(name, run) {
     // starts a new chat itself.)
     let freshPage;
     if (!msg.resume && !state.jobId && state.provider === "chatgpt") {
-      const cause = freshPageLeft(msg.allocationUrl);
+      const cause = freshPageLeft(msg.allocationUrl, null);
       if (cause) {
         fenceRun(state, msg.jobId, msg.runId);
         reply({ok: false, code: "taken_over", cause, error: "the tab is no longer the new chat it was opened on; nothing was sent"});

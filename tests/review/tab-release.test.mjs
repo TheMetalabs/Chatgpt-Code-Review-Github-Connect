@@ -1187,12 +1187,12 @@ for (const kind of ['review', 'fix']) {
   // X2-g: the page refuses the new run (its own check: off the new chat, or a user turn there). It
   // bound nothing; the leg never counts as started, fails taken_over with the page's cause, and the
   // tab is kept without another message. A fix is kept as undelivered, never closed (#77).
-  for (const cause of ['navigated', 'user_turn']) {
+  for (const cause of ['navigated', 'user_turn', 'draft']) {
     test(`${kind}: a new run the page refuses (${cause}) is never started; the tab is kept and never messaged again`, async () => {
       const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: refusedRunVerdict(cause)});
       for (let i = 0; i < 3 && b.pending(); i++) await b.tick();
       assert.deepEqual(b.messages.filter(m => m.id === 10 && m.type !== 'ashlar-tab-status').map(m => m.type), ['ashlar-run'], 'one run message, nothing after the refusal');
-      assert.match(failureOf(b), cause === 'user_turn' ? /^taken_over: a user message appeared in the tab before the prompt was sent/ : /^taken_over: the tab left its new chat/);
+      assert.match(failureOf(b), cause === 'user_turn' ? /^taken_over: a user message appeared in the tab before the prompt was sent/ : cause === 'draft' ? /^taken_over: a user draft appeared in the tab before the prompt was sent/ : /^taken_over: the tab left its new chat/);
       assert.deepEqual(b.closedTabs, [], 'never closed');
       assert.equal(b.pending(), undefined, 'retired');
       assert.equal(uploaded(b).includes('worker:run_dispatched'), false, 'never recorded as dispatched');

@@ -97,6 +97,50 @@ test('chatgpt: a run accepted on its new chat ends taken_over once the tab moves
   await flush(); resume(); await flush();
   assert.equal(d.message({ type: 'ashlar-harvest', jobId: 'A', runId: 'run-A', provider: 'chatgpt' })?.raw, raw);
 });
+// Ashlar 4103758186: the fresh-page fence also covers the unsent composer. A draft or a staged
+// file the user left in the new chat before Ashlar types is theirs: a new run is refused there,
+// and an accepted run ends taken_over before any typing, upload or Send. Ashlar's own typed
+// prompt and its own attachments are not a draft.
+const withDraft = (c, {text = '', files = []} = {}) => {
+  c.context.composerDraftText = () => text;
+  c.context.composerStagedFiles = state => files.filter(name => !(state?.pendingAttachments || []).includes(name));
+};
+for (const [what, draft] of [['a typed draft', {text: 'my own question'}], ['a staged file', {files: ['mine.pdf']}]]) {
+  test(`chatgpt: a fresh page holding ${what} refuses a new run (draft): nothing is bound, typed or sent`, async () => {
+    const persisted = new Map();
+    const c = content('chatgpt', persisted);
+    let runs = 0;
+    c.context.runPrompt = async () => { runs++; return raw; };
+    withDraft(c, draft);
+    const reply = c.message({ type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider: 'chatgpt', prompt: 'review' });
+    assert.deepEqual({ ok: reply?.ok, code: reply?.code, cause: reply?.cause, jobId: reply?.jobId }, { ok: false, code: 'taken_over', cause: 'draft', jobId: '' });
+    await flush();
+    assert.equal(runs, 0);
+    assert.equal(persisted.get('ashlar:job'), undefined);
+    assert.equal(persisted.get('ashlar:stopped:A:run-A'), 'true');
+  });
+  test(`chatgpt: an accepted run ends taken_over when the user leaves ${what} before its Send`, async () => {
+    const c = content('chatgpt');
+    let resume;
+    c.context.runPrompt = async () => { await new Promise(r => { resume = r; }); c.context.throwIfStopped(); return raw; };
+    c.message({ type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider: 'chatgpt', prompt: 'review' });
+    await flush();
+    withDraft(c, draft);
+    resume(); await flush();
+    assert.equal(c.message({ type: 'ashlar-harvest', jobId: 'A', runId: 'run-A', provider: 'chatgpt' })?.code, 'taken_over');
+  });
+}
+test('control: Ashlar\'s own prompt being typed and its own staged attachment are not a draft', async () => {
+  const c = content('chatgpt');
+  let resume;
+  c.context.runPrompt = async () => { await new Promise(r => { resume = r; }); c.context.throwIfStopped(); return raw; };
+  c.message({ type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider: 'chatgpt', prompt: 'review' });
+  await flush();
+  Object.assign(c.context.__ashlarRunnerState, {composerTyping: true, pendingPrompt: 'review', pendingAttachments: ['diff.txt']});
+  withDraft(c, {text: 'revi', files: ['diff.txt']});
+  resume(); await flush();
+  assert.equal(c.message({ type: 'ashlar-harvest', jobId: 'A', runId: 'run-A', provider: 'chatgpt' })?.raw, raw);
+});
 for (const [what, provider, href, msg] of [
   ['a ChatGPT new chat without its query', 'chatgpt', 'https://chatgpt.com/', {}],
   ['a Grok page (its fresh-page check is deferred)', 'grok', 'https://grok.com/c/x', {}],

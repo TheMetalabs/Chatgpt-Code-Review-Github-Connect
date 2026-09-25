@@ -1536,7 +1536,7 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   // it). Kept at once, never messaged, and its slot released now. A fix keeps its #77 cause.
   if (state.started !== true && state.outcome?.code === "taken_over") {
     return preserveFixTab(job, provider, jobs, "the tab was taken over before the prompt was sent; tab preserved", undefined,
-      job.kind === "fix" ? "undelivered" : state.outcome.cause === "user_turn" ? "user_turn" : "navigated");
+      job.kind === "fix" ? "undelivered" : ["user_turn", "draft"].includes(state.outcome.cause) ? state.outcome.cause : "navigated");
   }
   if (job.kind === "fix" && !fixAnswerDelivered(state)) {
     const why = state.outcome?.ok === false ? state.outcome.code || "failure" : state.outcome?.ok ? "answer delivery unconfirmed"
@@ -1814,13 +1814,13 @@ function refusedRun(result, job, provider) {
 
 /** A new run whose tab stopped being the fresh page it was opened on before its prompt was sent (X2,
  * #85): the worker saw the tab off its new chat, or the page refused the run (`cause`: "navigated",
- * or "user_turn" for a user message there). Nothing was sent. The leg fails `taken_over`, and its
+ * "user_turn" for a user message there, or "draft" for the user's unsent text or file). Nothing was sent. The leg fails `taken_over`, and its
  * release keeps the tab without asking it (forceCloseFixTab). */
 async function takenBeforeSend(job, provider, jobs, cause) {
   const state = job.states[provider];
-  const turn = cause === "user_turn";
-  state.outcome = {...failure("taken_over", `${turn ? "a user message appeared in the tab" : "the tab left its new chat"} before the prompt was sent; nothing was sent`),
-    cause: turn ? "user_turn" : "navigated"};
+  const known = cause === "user_turn" || cause === "draft" ? cause : "navigated";
+  const what = {user_turn: "a user message appeared in the tab", draft: "a user draft appeared in the tab", navigated: "the tab left its new chat"}[known];
+  state.outcome = {...failure("taken_over", `${what} before the prompt was sent; nothing was sent`), cause: known};
   workerStep(job, provider, "taken_before_send");
   await saveJobs(jobs);
 }

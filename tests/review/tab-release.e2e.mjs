@@ -1065,13 +1065,14 @@ for(const [name,takeover,closed] of [['no user activity',null,[10]],['a follow-u
 // run), and a run it accepted ends before its Send once the user moves the tab to their own
 // conversation: nothing more is typed or clicked there.
 const composerText=tab=>tab.page.evaluate(()=>document.getElementById('prompt-textarea').textContent);
-for(const [what,view,cause] of [['on the user\'s conversation',{url:OTHER_URL},'navigated'],['holding a user turn',{thread:userTurn('user-X','my own question')},'user_turn']])
+for(const [what,view,cause] of [['on the user\'s conversation',{url:OTHER_URL},'navigated'],['holding a user turn',{thread:userTurn('user-X','my own question')},'user_turn'],
+ ['holding the user\'s unsent text (Ashlar 4103758186)',{composer:'my unsent question'},'draft'],['holding a file the user staged (Ashlar 4103758186)',{chips:['my-notes.pdf']},'draft']])
  test(`fresh run: a page ${what} refuses a new run; nothing is bound, typed or clicked, and the run is fenced`,async t=>{
   const tab=await chatTab(t,{bound:false,...view});
   const out=await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL});
   assert.deepEqual({ok:out.ok,code:out.code,cause:out.cause,jobId:out.jobId},{ok:false,code:'taken_over',cause,jobId:''});
   await tab.page.clock.runFor(2000);
-  assert.equal(await tab.clicks(),0);assert.equal(await composerText(tab),'','nothing typed');
+  assert.equal(await tab.clicks(),0);assert.equal(await composerText(tab),view.composer||'','nothing typed');
   assert.equal(await tab.page.evaluate(()=>sessionStorage.getItem('ashlar:job')),null,'nothing bound');
   assert.equal(await tab.page.evaluate(key=>sessionStorage.getItem(key),`ashlar:stopped:${tab.job}:${tab.run}`),'true','the run is fenced');
  });
@@ -1095,6 +1096,20 @@ test('fresh run: the user moving the tab between the fill and the click: Send is
  await tab.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);
  await tab.enableSend();await tab.page.clock.runFor(3000);
  assert.equal(await tab.clicks(),0,'never clicked on the user\'s conversation');
+ assert.deepEqual(await tab.runner(),{running:false,code:'taken_over'});
+});
+// Ashlar 4103758186: a file the user stages while the accepted run waits for an enabled Send is
+// theirs: it stays staged, and Send is never clicked (it would go out with Ashlar's prompt).
+test('fresh run: the user staging a file between the fill and the click: Send is never clicked, the file stays',async t=>{
+ const tab=await chatTab(t,{bound:false,sendDisabled:true});
+ assert.equal((await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL})).code,'busy');
+ await tab.page.clock.runFor(3000);
+ assert.ok((await composerText(tab)).includes('Review fixture PR #1'),'the prompt was typed');
+ assert.equal((await tab.runner()).running,true,'waiting for an enabled Send');
+ await stageFile(tab.page);
+ await tab.enableSend();await tab.page.clock.runFor(3000);
+ assert.equal(await tab.clicks(),0,'never clicked with the user\'s file staged');
+ assert.deepEqual(await tab.page.evaluate(()=>composerStagedFiles(null,null)),['my-notes.pdf'],'the file stays');
  assert.deepEqual(await tab.runner(),{running:false,code:'taken_over'});
 });
 // The steps before the typing act on the page too: the overlay dismissal, the model menu and the

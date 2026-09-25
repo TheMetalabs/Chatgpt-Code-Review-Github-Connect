@@ -187,6 +187,8 @@ async function fillComposer(el, text) {
   for (;;) {
     // The stop fence lives with the runner state in json.js (absent: nothing can stop the run).
     globalThis.throwIfStopped?.();
+    // From here the composer text is Ashlar's own (checked empty of the user's just above).
+    if (state) state.composerTyping = true;
     // Uploading can replace the editor. Never type into a cached detached node.
     el = typeof composer === "function" ? composer() : el;
     if (!el?.isConnected) { await waitForPageChange(250); continue; }

@@ -11,7 +11,47 @@ const findingKeys = [...findingStrings,"severity","line","side"];
 export function jsonBody(raw: string): string {
   const text = raw.trim();
   const fence = /^```(?:json)?\s*\n([\s\S]*)\n```$/i.exec(text);
-  return fence ? fence[1].trim() : text;
+  if (fence) return fence[1].trim();
+  // The browser capture is the rendered DOM: a ```json block renders its language label ("JSON")
+  // and header wrappers as a line of its own plus blank lines before the object. Only that bare
+  // label is dropped; any other text before the JSON stays and fails validation.
+  const label = /^json[ \t]*\n\s*(?=[{[])/i.exec(text);
+  return label ? text.slice(label[0].length) : text;
+}
+const MAX_STRAY_QUOTE_FIXES = 8;
+/** Index of the first quote that closes a string but is followed by something no JSON string can
+ * be followed by (anything except , } ] : or the end), or -1. A plain string scan: the wording and
+ * position in JSON.parse's error message belong to the engine and may change with a Node upgrade. */
+function prematureStringEnd(text: string): number {
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    if (!inString) { inString = text[i] === '"'; continue; }
+    if (text[i] === "\\") { i++; continue; }
+    if (text[i] !== '"') continue;
+    inString = false;
+    let next = i + 1;
+    while (next < text.length && /\s/.test(text[next])) next++;
+    if (next < text.length && !",}]:".includes(text[next])) return i;
+  }
+  return -1;
+}
+/** Deterministic, character-preserving repair for one observed model slip: inside a string the
+ * model writes an escaped backslash and forgets the quote's own escape (`\\"` for `\\\"`), which
+ * ends the string early. Only such a quote, preceded by an even run of two or more backslashes and
+ * followed by something that cannot follow a string, is escaped, at most 8 times; any other parse
+ * failure returns null. The caller still runs validateRepairCandidate on the result. */
+export function escapeStrayQuotes(raw: string): string | null {
+  let text = jsonBody(raw);
+  for (let fixes = 0; ; fixes++) {
+    try { JSON.parse(text); return fixes ? text : null; } catch { /* locate the slip below */ }
+    if (fixes >= MAX_STRAY_QUOTE_FIXES) return null;
+    const quote = prematureStringEnd(text);
+    if (quote < 0) return null;
+    let slashes = 0;
+    for (let i = quote - 1; i >= 0 && text[i] === "\\"; i--) slashes++;
+    if (slashes === 0 || slashes % 2 !== 0) return null;
+    text = `${text.slice(0, quote)}\\${text.slice(quote)}`;
+  }
 }
 export function repairSchemaDefinition(kind: RepairSchema) {
   const string = {type:"string",minLength:1};

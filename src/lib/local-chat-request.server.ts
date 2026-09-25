@@ -15,7 +15,30 @@ type ChatRequest = {
   top_k?: number;
   presence_penalty?: number;
   max_tokens?: number;
+  /** Non-OpenAI extension (vLLM/omlx chat templates, e.g. {enable_thinking:false}); callers send it
+   * only when the operator opted in, since a strict server may reject it. */
+  chat_template_kwargs?: Record<string, unknown>;
 };
+
+/** The server finished the reply early; `finishReason` says why ("length": the token budget ran out). */
+export class LocalChatCutOff extends Error {
+  readonly finishReason: string;
+  constructor(finishReason: string) {
+    super(`local LLM response ended with ${finishReason}`);
+    this.name = "LocalChatCutOff";
+    this.finishReason = finishReason;
+  }
+}
+
+/** The server refused the request with a non-2xx status before any reply existed. */
+export class LocalChatHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, body: string) {
+    super(`local LLM HTTP ${status}: ${body.slice(0, 160)}`);
+    this.name = "LocalChatHttpError";
+    this.status = status;
+  }
+}
 
 /** What the transport observed on an in-flight request.
  * `keepalive`: the server answered (response headers, or an empty heartbeat chunk) but has produced
@@ -217,7 +240,7 @@ export function requestLocalJson(
         }
         const text = Buffer.concat(chunks).toString("utf8");
         if (!ok) {
-          reject(new Error(`local LLM HTTP ${res.statusCode}: ${text.slice(0, 160)}`));
+          reject(new LocalChatHttpError(res.statusCode ?? 0, text));
           return;
         }
         try { resolve(JSON.parse(text)); }
@@ -242,7 +265,7 @@ export async function requestLocalChat(
     { choices?: { finish_reason?: string; message?: { content?: unknown } }[] };
   const choice = parsed?.choices?.[0];
   if (choice?.finish_reason === "length" || choice?.finish_reason === "content_filter") {
-    throw new Error(`local LLM response ended with ${choice.finish_reason}`);
+    throw new LocalChatCutOff(choice.finish_reason);
   }
   if (typeof choice?.message?.content !== "string") throw new Error("local LLM returned no completed message");
   return choice.message.content;

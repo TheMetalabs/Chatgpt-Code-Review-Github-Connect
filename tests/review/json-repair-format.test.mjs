@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {validateRepairCandidate, inspectReviewFormat, REPAIR_SCHEMA_VERSION} from '../../src/lib/review-json-repair.ts';
+import {readFileSync} from 'node:fs';
+import {escapeStrayQuotes, jsonBody, validateRepairCandidate, inspectReviewFormat, REPAIR_SCHEMA_VERSION} from '../../src/lib/review-json-repair.ts';
 import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 import {sanitizeBotSettings, botSettingsToEnv} from '../../src/lib/settings.server.ts';
 const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Preserve the transaction',failure_scenario:'The write commits twice.',root_cause:'The writer does not hold the lock.',evidence:'a.ts:1: if (state === "active") commit();',recommended_fix:'Keep the lock until commit.',recommended_test:'Run two concurrent writes.'};
@@ -88,4 +89,59 @@ test('malformed source cannot hide another finding inside a repaired string',()=
  const swallowed=source.slice(start,end);
  const candidate=JSON.stringify({findings:[{...first,recommended_test:swallowed}]});
  assert.equal(validateRepairCandidate(source,candidate,'review').ok,false,'another finding was absorbed as string content');
+});
+
+// Job 1043 (#87): ChatGPT's rendered code block is captured with its "JSON" language label and
+// blank header lines before the object. The original is the verbatim capture; the candidate is the
+// label-free body with the one stray quote escaped by hand.
+const labelledOriginal=readFileSync(new URL('./fixtures/chatgpt-1043-labelled-stray-quote.txt',import.meta.url),'utf8');
+const handFixed=labelledOriginal.slice(labelledOriginal.indexOf('{')).replace(String.raw`\\").trim();`,String.raw`\\\").trim();`);
+test('a correct repair of a labelled capture is accepted: the rendered JSON label is not content',()=>{
+ assert.match(labelledOriginal,/^JSON\n\n/);
+ const out=validateRepairCandidate(labelledOriginal,handFixed,'review');
+ assert.deepEqual(out.errors,undefined);assert.equal(out.ok,true);
+ assert.deepEqual(JSON.parse(out.raw).findings.map(f=>f.severity),['P1','P1','P2']);
+ assert.equal(validateRepairCandidate('JSON\n\n'+malformed,raw,'review').ok,true);
+ assert.equal(inspectReviewFormat('json\n\n\n'+raw,'review').ok,true);
+});
+test('only a bare label line before an object or array is stripped; prose around JSON is kept',()=>{
+ assert.equal(jsonBody('JSON\n\n\n{"findings":[]}'),'{"findings":[]}');
+ assert.equal(jsonBody('json\n[1]'),'[1]');
+ for(const text of ['Here is JSON\n{"findings":[]}','JSONish\n{"findings":[]}','JSON {"findings":[]}','JSON\nnote\n{"findings":[]}'])
+  assert.equal(jsonBody(text),text);
+ assert.equal(inspectReviewFormat('Here is JSON\n'+raw,'review').ok,false);
+ assert.equal(validateRepairCandidate('Here is JSON\n'+malformed,raw,'review').ok,false);
+});
+
+// #87 failure A1: to quote code that itself holds an escaped quote, the model writes `\\"` where
+// `\\\"` belongs, which ends the string early. This slip is repaired without the Local model.
+test('the stray-quote slip in a labelled capture is escaped, and the result is an accepted repair',()=>{
+ const fixed=escapeStrayQuotes(labelledOriginal);
+ assert.equal(fixed,handFixed);
+ assert.equal(validateRepairCandidate(labelledOriginal,fixed,'review').ok,true);
+ const slip='{"findings":[],"highest_risk":"r \\\\" x","assumptions":["y"]}';
+ assert.equal(JSON.parse(escapeStrayQuotes(slip)).highest_risk,'r \\" x');
+});
+test('only the stray-quote slip is escaped; every other parse failure is left to the Local model',()=>{
+ assert.equal(escapeStrayQuotes(raw),null,'JSON that already parses');
+ assert.equal(escapeStrayQuotes(labelledOriginal.replace(String.raw`\\").trim();`,String.raw`\\\").trim();`)),null,'already parses once the label is gone');
+ assert.equal(escapeStrayQuotes('{"findings":[],"highest_risk":"x" "assumptions":["y"]}'),null,'missing comma');
+ assert.equal(escapeStrayQuotes(labelledOriginal.slice(0,9000)),null,'truncated answer');
+ assert.equal(escapeStrayQuotes('{"findings":[],"highest_risk":"odd \\\\\\" then \\\\\\\\\\" x"'),null,'odd run is an escape, not a slip');
+ assert.equal(escapeStrayQuotes('{"findings":[],"highest_risk":"r \\\\" "assumptions":["y"]}'),null,'a quote that really ends its string');
+ assert.equal(escapeStrayQuotes('{"findings":[],"highest_risk":"a \\\\" \\\\"key\\\\": x","investigated_safe":[]}'),null,'a fix would turn text into a key');
+ assert.equal(escapeStrayQuotes('{"findings":[],"highest_risk":"a \\\\", b","assumptions":[]}'),null,'a quote followed by a comma may really end its string');
+});
+test('at most 8 stray quotes are escaped in one answer',()=>{
+ const answer=n=>`{"findings":[],"investigated_safe":[${Array.from({length:n},(_,i)=>`"s${i} \\\\" t"`).join(',')}]}`;
+ const eight=escapeStrayQuotes(answer(8));
+ assert.deepEqual(JSON.parse(eight).investigated_safe,Array.from({length:8},(_,i)=>`s${i} \\" t`));
+ assert.equal(validateRepairCandidate(answer(8),eight,'review').ok,true);
+ assert.equal(escapeStrayQuotes(answer(9)),null);
+});
+test('the stray-quote scan does not depend on the wording of JSON.parse errors',()=>{
+ // The position in V8's message is an engine detail; a Node upgrade must not silently disable the fix.
+ const parse=JSON.parse;
+ JSON.parse=function(...args){try{return parse.apply(this,args);}catch{throw new SyntaxError('Unexpected token');}};
+ try{assert.equal(escapeStrayQuotes(labelledOriginal),handFixed);}finally{JSON.parse=parse;}
 });

@@ -305,13 +305,25 @@ function bridgeTransportError(cause, body) {
   return error;
 }
 
+/** How long one bridge request may take (a function so tests can shorten it): a request the bridge
+ * never answers (a hung take, a stalled proxy) fails as a transport error instead of holding its
+ * lane (admission, a job's claim or observation, the heartbeat) forever; the caller retries on a
+ * later tick. A result upload (`complete`, `capture`) keeps no deadline: its outbox is kept until the
+ * server ACKs it, however slowly its body arrives (long-wait.test.mjs), and it holds only its job's
+ * lane. */
+function apiTimeoutMs() { return 30_000; }
+const UNBOUNDED_BRIDGE_ACTIONS = new Set(["complete", "capture"]);
+
 async function api(path, body, expectedOrigin, signal) {
   const { origin, token } = await settings();
   if (!origin || !token) throw new Error("set origin and token in the popup");
   if (expectedOrigin && expectedOrigin !== origin) throw new Error("bridge origin changed; original job preserved");
+  // The request (headers and body) is bounded by apiTimeoutMs (but a result upload), and by the caller's signal if any.
+  const timeout = UNBOUNDED_BRIDGE_ACTIONS.has(body?.action) ? undefined : AbortSignal.timeout(apiTimeoutMs());
+  const requestSignal = signal && timeout ? AbortSignal.any([signal, timeout]) : signal || timeout;
   let res;
   try {
-    // Model completion and saved-result delivery have NO application deadline.
+    // Model completion and saved-result delivery have NO application deadline (a request does).
     // Browser/network failures retain the outbox; separate per-job/heartbeat lanes
     // keep unrelated work moving. Server ACK is independent of publication below.
     // A caller MAY pass a signal to cancel (e.g. the periodic sweep's watchdog); normal callers omit it.
@@ -321,7 +333,7 @@ async function api(path, body, expectedOrigin, signal) {
       method: body ? "POST" : "GET",
       headers: {"content-type": "application/json", "x-ashlar-bridge-token": token},
       body: body ? JSON.stringify({...body, fixProtocol: 1, token}) : undefined,
-      signal,
+      signal: requestSignal,
     });
   } catch (cause) {
     throw bridgeTransportError(cause, body);

@@ -24,6 +24,20 @@ test('history: telemetry validates stage, bounds metadata and deduplicates by ru
  h.recordProgress('A','chatgpt','run-A',[e,{...e,stage:'secret prompt'}]);h.recordProgress('A','chatgpt','run-A',[e]);
  const r=h.getJob('A');assert.equal(r.steps.filter(x=>x.stage==='send_unconfirmed').length,1);assert.equal(JSON.stringify(r).includes('never-log'),false);assert.equal(JSON.stringify(r).includes('secret prompt'),false);
 });
+test('history: a well-formed stage without a label survives a restart under the fallback label; a malformed one never lands',async t=>{
+ // The extension can record a stage before the server labels it (a new stage, or a recorder call the label
+ // guard cannot see). The step stays in history, shown and flagged as unlabelled rather than lost.
+ const {h,Store,dir}=await store(t);h.recordJob(job('A'));
+ const {stepLabel,unlabelledStep,PROGRESS_LABELS}=await import('../../src/lib/review-progress.ts');
+ const e={source:'worker',stage:'tab_woken',sequence:1,at:123};
+ h.recordProgress('A','chatgpt','run-A',[e,{...e,sequence:2,stage:'generating'},{...e,sequence:3,stage:'dom_drift:follow_up'},{...e,sequence:4,stage:'Tab_Woken'}]);
+ const steps=new Store(dir).getJob('A').steps.filter(x=>x.source==='worker');
+ assert.deepEqual(steps.map(x=>x.stage),['tab_woken','generating']);
+ assert.deepEqual(steps.map(stepLabel),['Unlabelled step · tab_woken',PROGRESS_LABELS.generating]);
+ assert.deepEqual(steps.map(unlabelledStep),[true,false]);
+ assert.equal(stepLabel({source:'server',stage:'job.awaiting_chat'}),'job.awaiting_chat','a server step is shown by its own name');
+ assert.equal(unlabelledStep({source:'server',stage:'job.awaiting_chat'}),false);
+});
 test('history: private responses are separate from lists/default detail and survive restart',async t=>{
  const {h,Store,dir}=await store(t);h.recordJob(job('A'));h.recordResponse('A','chatgpt','{"findings":[]}', 'PRIVATE ORIGINAL');
  assert.equal(JSON.stringify(h.listJobs({})).includes('PRIVATE'),false);assert.equal(JSON.stringify(h.getJob('A')).includes('PRIVATE'),false);

@@ -1,4 +1,4 @@
-import {PROGRESS_LABELS, type ProviderProgress} from "./review-progress.ts";
+import {progressLabel, type ProviderProgress} from "./review-progress.ts";
 import { extractChatJson } from "./extract-chat-json.ts";
 import { skippedProvider } from "./local-fallback.ts";
 import type { Job, JobStatus, ReviewerLane, ReviewerLaneState, ReviewProvider } from "./types.ts";
@@ -207,8 +207,8 @@ export function buildReviewerLanes(
       return {provider, state: "waiting", label, detail: "connection unknown · waiting for reconnection", answered: false};
     }
     const progress=job.providerProgress?.[provider];
-    if(progress && Object.hasOwn(PROGRESS_LABELS,progress.stage)) {
-      return {provider,state:progress.stage==="generating"?"generating":"waiting",label,detail:PROGRESS_LABELS[progress.stage],answered:false};
+    if(progress) {
+      return {provider,state:progress.stage==="generating"?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false};
     }
     if (g === true) {
       return { provider, state: "waiting", label, detail: "Chrome task pending · submission not confirmed", answered: false };

@@ -68,6 +68,18 @@ describe("buildReviewerLanes", () => {
     assert.equal(lanes.find((l) => l.provider === "grok")?.state, "waiting");
   });
 
+  it("shows a stage recorded ahead of its label under the unlabelled fallback", () => {
+    const lanes = buildReviewerLanes(
+      job({
+        reviewProviders: ["chatgpt"],
+        generating: { chatgpt: true },
+        providerProgress: {chatgpt: {runId: "run", stage: "tab_woken", observedAt: Date.now(), receivedAt: Date.now()}},
+      }),
+    );
+    assert.equal(lanes[0].state, "waiting");
+    assert.equal(lanes[0].detail, "Unlabelled step · tab_woken");
+  });
+
   it("shows local generating from inFlight, skipped from assumptions", () => {
     const racing = buildReviewerLanes(job({ reviewProviders: ["chatgpt", "local"] }), { localInFlight: true });
     assert.equal(racing.find((l) => l.provider === "local")?.state, "generating");

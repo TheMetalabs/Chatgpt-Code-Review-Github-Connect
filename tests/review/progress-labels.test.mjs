@@ -1,6 +1,6 @@
-// sanitizeProgressEvents keeps only stages that are PROGRESS_LABELS keys, so a stage the extension
-// records without a label never reaches review history or the live reviewer status. These rows pin
-// that every stage the extension can record is labelled — including the ones built from a template.
+// sanitizeProgressEvents keeps a well-formed stage that has no PROGRESS_LABELS entry, but review history
+// and the live reviewer status can only show it as "Unlabelled step · <stage>". These rows pin that every
+// stage the extension can record is labelled — including the ones built from a template.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync} from 'node:fs';
@@ -8,7 +8,7 @@ import {tmpdir} from 'node:os';
 import {dirname, join, sep} from 'node:path';
 import {root, source} from './load-source.mjs';
 import {background, storage} from './helpers.mjs';
-import {PROGRESS_LABELS, sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
+import {PROGRESS_LABELS, progressLabel, sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
 
 /** The progress recorders and the position of their stage argument. */
 const RECORDERS = {workerStep: 2, recordReviewStep: 0, step: 0};
@@ -877,14 +877,14 @@ function kept(stages, sourceName = 'worker') {
   return sanitizeProgressEvents(events).map(event => event.stage);
 }
 
-test('every stage the extension records has a history label (sanitizeProgressEvents drops unlabelled ones)', () => {
+test('every stage the extension records has a history label (an unlabelled one shows only under the fallback)', () => {
   const {literals, templates, problems, stages} = guardedStages(extensionFiles());
   assert.deepEqual(problems, [], 'every stage argument is a literal the guard can check');
   assert.ok(literals.has('tab_closed') && literals.has('generating') && literals.has('prompt_submitted'),
     'sanity: the scan sees worker, page and composer stages');
   assert.equal(literals.has('preserved'), false, 'a nested call argument is not a stage');
   assert.ok(templates.has('repair_${status.status}'), 'sanity: the scan sees template stages');
-  assert.deepEqual(unlabelled(stages), [], 'recorded stages without a PROGRESS_LABELS entry never reach review history');
+  assert.deepEqual(unlabelled(stages), [], 'recorded stages without a PROGRESS_LABELS entry reach review history only as unlabelled steps');
   assert.deepEqual(kept(stages, 'worker'), stages);
   assert.deepEqual(kept(stages, 'page'), stages);
 });
@@ -947,7 +947,7 @@ test('a preserve_ cause added only to preserveCauses() fails the guard: the expa
   assert.deepEqual(unlabelled(guardedStages(files('"unknown"')).stages), []);
   assert.deepEqual(unlabelled(guardedStages(files('"staged"')).stages), ['preserve_staged'],
     'a cause the extension can record, labelled nowhere');
-  assert.deepEqual(kept(['preserve_staged']), [], 'its event would be dropped from history');
+  assert.deepEqual(kept(['preserve_staged']).map(progressLabel), ['Unlabelled step · preserve_staged'], 'history would show it only as an unlabelled step');
   assert.throws(() => guardedStages(files('...LEGACY')), /string literals only/);
   assert.throws(() => guardedStages({'background.js': recorder}), /not found in source/, 'no list, no expansion');
   assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `lease_expired_${phase}`);'}),
@@ -1023,7 +1023,7 @@ test('preserve_${state.preserveCause} records a listed cause only while every wr
 
 test('a template stage takes its declared list only through a declared expression, not through its prefix', () => {
   // preserveCauses() lists only labelled causes, so expanding by prefix would pass; row.cause is not drawn
-  // from it and can be preserve_staged, which sanitizeProgressEvents drops.
+  // from it and can be preserve_staged, which history shows only as an unlabelled step.
   const causes = 'function preserveCauses() {\n  return ["navigated", "draft", "unknown"];\n}\n';
   const recorded = expression => ({'background.js': `${causes}workerStep(job, provider, \`preserve_\${${expression}}\`);`});
   assert.deepEqual(unlabelled(guardedStages(recorded('state.preserveCause')).stages), []);
@@ -1442,8 +1442,8 @@ test('tab_preserved points at a preserve cause only when the extension records o
     `tab_preserved (${PROGRESS_LABELS.tab_preserved}) points at a preserve cause the extension never records`);
 });
 
-/** The stages the Tab Lease redesign (Phase 1+) records. Labelled before the extension ships them:
- * a stage recorded ahead of its label is dropped by sanitizeProgressEvents for good. */
+/** The stages the Tab Lease redesign (Phase 1+) records. Labelled before the extension ships them, so
+ * history never shows them under the unlabelled fallback. */
 const TAB_LEASE_STAGES = ['tab_lost', 'tab_rekeyed', 'user_touched', 'dom_drift', 'dom_evidence_without_touch',
   'lifecycle_diverged', 'group_expanded', 'preserve_user_input', 'preserve_user_moved', 'preserve_browser_restart',
   ...declaredStages('lease_expired_')];
@@ -1456,10 +1456,24 @@ test('the Tab Lease stages have history labels and survive sanitize from either 
   for (const stage of TAB_LEASE_STAGES) assert.ok(PROGRESS_LABELS[stage].trim(), `${stage} has a non-empty label`);
 });
 
-test('the stage allow-list stays closed: a detail suffix or an undeclared phase is still dropped', () => {
-  // The redesign doc writes dom_drift:<kind> and lifecycle_diverged:<ours>/<legacy>; only the bare
-  // stage is a label key, so the detail has to travel outside the stage name.
-  assert.deepEqual(kept(['dom_drift:follow_up', 'lifecycle_diverged:closed/preserved', 'lease_expired_unknown', 'preserve_']), []);
+test('a well-formed stage without a label is kept under the fallback label; a malformed stage is dropped', () => {
+  // The redesign doc writes dom_drift:<kind> and lifecycle_diverged:<ours>/<legacy>; a stage name is
+  // snake_case only, so the detail has to travel outside it. An undeclared phase or an empty cause is a
+  // well-formed name the extension may record ahead of its label: history keeps it and flags it.
+  assert.deepEqual(kept(['dom_drift:follow_up', 'lifecycle_diverged:closed/preserved', 'Tab_lost', 'tab lost', '_tab', '9tab', '', 'tab-lost']), []);
+  const early = ['lease_expired_unknown', 'preserve_', 'tab_woken'];
+  assert.deepEqual(kept(early), early);
+  assert.deepEqual(early.map(progressLabel), early.map(stage => `Unlabelled step · ${stage}`));
+  assert.equal(progressLabel('tab_closed'), PROGRESS_LABELS.tab_closed);
+  assert.deepEqual(kept(['constructor']).map(progressLabel), ['Unlabelled step · constructor'], 'an inherited Object property is not a label');
+});
+
+test('a well-formed page stage the worker forwards is never lost to the server\'s length bound', () => {
+  const bound = Number(source('extension/background.js').match(/\be\.stage\.length\s*<\s*(\d+)/)[1]);
+  const longest = 'a'.repeat(bound - 1);
+  assert.deepEqual(kept([longest], 'page'), [longest]);
+  assert.deepEqual(kept(['a'.repeat(bound)], 'page'), [], 'a stage the worker would not forward is not a stage name');
+  assert.deepEqual(Object.keys(PROGRESS_LABELS).filter(stage => !kept([stage]).length), [], 'every labelled stage is a well-formed stage name');
 });
 
 test('every labelled stage fits the bound the worker puts on page stage names', () => {

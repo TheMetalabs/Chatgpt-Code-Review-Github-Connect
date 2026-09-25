@@ -8,6 +8,8 @@ import {appFixture,eventually} from './app-fixture.mjs';
 import {isZeroFindings} from '../../src/lib/review-loop.ts';
 import {CLEAN_REVIEW_BODY,REVIEW_RAW_END,REVIEW_RAW_START,REVIEW_SUMMARY_MARK,UNVERIFIED_CLEAN_REVIEW_BODY} from '../../src/lib/review-format.ts';
 import {salvageReviewJson} from '../../src/lib/extract-chat-json.ts';
+import {postedOutcome} from '../../src/lib/review-outcome.ts';
+import {notCleanDetail} from '../../src/lib/review-loop-runtime.server.ts';
 
 const converged=body=>isZeroFindings(body,{authoredByBot:true});
 const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Missing check',failure_scenario:'A duplicate request writes twice',
@@ -76,7 +78,11 @@ const CLEAN=CLEAN_REVIEW_BODY,SUMMARY=REVIEW_SUMMARY_MARK,UNVERIFIED=UNVERIFIED_
 const posted=(first,marker,requests,extra={})=>({status:'posted',first,marker,requests,converged:marker===M0,raw:[],note:null,...extra});
 const skipped=requests=>({status:'skipped',requests});
 const chatFindings=posted(SUMMARY,MF,0,{stamp:'none'});
-const chatRaw=posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'none'});
+// why: the raw header's cause (Job.rawCauses), never inferred from the outcome
+const WHY_UNPARSEABLE='the reply was not parseable JSON.';
+const WHY_UNREAD="the reply parsed, but its findings past the gate's row cap were not inspected.";
+const WHY_NOT_VERDICT='the reply could not be used as a complete structured review.';
+const chatRaw=why=>posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'none',why});
 const RAW_NOTE=/local verification's reply could not be used as a review/;
 const RESIDUAL_NOTE=/could not be used as a review \(a completed reply carried text outside its review JSON\)/;
 
@@ -99,21 +105,21 @@ const CELLS={
   'clean x offline':posted(UNVERIFIED,M0U,0,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x notRun':posted(CLEAN,M0,0),
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`findings x ${local}`,local==='notRun'?posted(SUMMARY,MF,0):chatFindings])),
-  ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`unparseable x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW']}):chatRaw])),
+  ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`unparseable x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_UNPARSEABLE}):chatRaw(WHY_UNPARSEABLE)])),
   // chat's unread rows are evidence: never verify / verified-clean / clean, local stays held
-  ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`overflow x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW']}):chatRaw])),
+  ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`overflow x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_UNREAD}):chatRaw(WHY_UNREAD)])),
   // local as the chat-down fallback is an ordinary reviewer: race parity, no verification note
   'none x clean':posted(CLEAN,M0,1,{stamp:'fallback'}),
   'none x assumesSkipped':posted(CLEAN,M0,1,{stamp:'fallback'}),
   'none x findings':posted(SUMMARY,MF,1,{stamp:'fallback'}),
-  'none x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback',why:WHY_UNPARSEABLE}),
   'none x proseThen500':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x multiturnProse':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x schemaInvalid':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
-  'none x malformed':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x malformed':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback',why:WHY_NOT_VERDICT}),
   'none x proseThenClean':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x proseThenMinimal':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
-  'none x overflow':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  'none x overflow':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback',why:WHY_UNREAD}),
   'none x proseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x multiturnProseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
   'none x error':skipped(1),
@@ -157,6 +163,8 @@ function assertPosted(name,e,{app,job},body){
     assert.equal(body.includes(mark),e.raw.includes(mark),`${name}: ${mark} kept iff expected`);
     assert.equal(outside.includes(mark),false,`${name}: ${mark} only inside the raw block`);
   }
+  if(e.why)assert.equal(/\*\*⚠️ Review posted verbatim — ([^*]*)\*\*/.exec(body)?.[1],e.why,`${name}: why the raw block is posted`);
+  assert.doesNotMatch(body,/local repair/i,`${name}: local repair never causes an outcome`);
   if(e.note)assert.match(body,e.note,`${name}: note`);
   else assert.doesNotMatch(body,/local verification/,`${name}: no verification note`);
   if(e.stamp==='verify')assert.ok(job.localVerifyStartedAt&&!job.localFallbackAt,`${name}: verification round stamp`);
@@ -204,6 +212,13 @@ test('race outcome: chat overflow × local clean is evidence, never clean or CON
   const start=body.indexOf(REVIEW_RAW_START);
   assert.ok(start>=0&&body.indexOf('CHAT-RAW ninth finding')>start,'the unread ninth row is posted in the raw block');
   assert.ok(job().assumptions.includes("chatgpt: 1 finding(s) past the gate's row cap were not inspected (reply posted verbatim)"),'the job records why');
+  // The reply parsed: the body and the loop handoff name the unread rows, never a parse failure or local repair.
+  assert.deepEqual({...job().rawCauses},{chatgpt:'unread-rows'},'the merge stamps the structured cause');
+  assert.match(body,/Review posted verbatim — the reply parsed, but its findings past the gate's row cap were not inspected\./,'the body names the row cap');
+  assert.doesNotMatch(body,/not parseable|local repair/i,'the body never calls the parsed reply unparseable');
+  const handoff=notCleanDetail(job(),postedOutcome(job(),0));
+  assert.match(handoff,/row cap were not inspected/,'the loop handoff names the row cap');
+  assert.doesNotMatch(handoff,/not parseable|local repair/i,'the loop handoff never calls it a parse failure');
 });
 
 test('verify-clean outcome: the note credits only the chat reviewer whose structured result was clean',async t=>{

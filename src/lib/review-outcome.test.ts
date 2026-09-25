@@ -10,14 +10,14 @@ import {
   redactSalvagedReviewBody,
   reviewSummaryBody,
 } from "./review-format.ts";
-import { OUTCOME_SHAPE, REVIEW_OUTCOMES, outcomeNote, postedOutcome, reviewOutcome, salvagedReview, type OutcomeJob, type PostedOutcome, type ReviewOutcome } from "./review-outcome.ts";
+import { OUTCOME_SHAPE, REVIEW_OUTCOMES, outcomeNote, postedOutcome, rawCauseText, reviewOutcome, salvagedReview, type OutcomeJob, type PostedOutcome, type ReviewOutcome } from "./review-outcome.ts";
 import { isConvergedFindings, parseFindingsTotal } from "./review-loop.ts";
-import type { Finding, ReviewProvider } from "./types.ts";
+import type { Finding, Job, ReviewProvider } from "./types.ts";
 
 const CL: ReviewProvider[] = ["chatgpt", "local"];
 const CGL: ReviewProvider[] = ["chatgpt", "grok", "local"];
 const VC = "verify-clean" as const;
-type RowJob = OutcomeJob & { localVerifyNote?: string };
+type RowJob = OutcomeJob & Partial<Pick<Job, "localVerifyNote" | "rawCauses">>;
 const job = (patch: Partial<RowJob> = {}): RowJob => ({ reviewProviders: CL, assumptions: [], ...patch });
 const held = (patch: Partial<RowJob> = {}) => job({ localReviewRole: VC, ...patch });
 const verifying = (patch: Partial<RowJob> = {}) => held({ localVerifyStartedAt: 1, ...patch });
@@ -68,8 +68,8 @@ const finding: Finding = { ...FINDING_412, id: "f1" };
 const RAW = "P1 a.ts:1 LOCAL-RAW duplicate request writes twice";
 /** One job per posted kind, used by the render rows and by the invariants over the whole enum. */
 const RENDER: Record<PostedOutcome, { job: RowJob; findings: Finding[] }> = {
-  findings: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw" }), findings: [finding] },
-  raw: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw" }), findings: [] },
+  findings: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses: { chatgpt: "unparseable" } }), findings: [finding] },
+  raw: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses: { chatgpt: "unparseable" } }), findings: [] },
   "raw-unverified": { job: verifying({ localVerified: false, rawReview: RAW, localVerifyNote: "chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); it is posted verbatim below. Not a clean pass." }), findings: [] },
   clean: { job: job({ localReviewRole: "race" }), findings: [] },
   "verified-clean": { job: verifying({ localVerified: true, localVerifyNote: "chatgpt found nothing; local verification agreed." }), findings: [] },
@@ -124,6 +124,42 @@ describe("reviewSummaryBody: every part of the body comes from the outcome", () 
     assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
     assert.match(body, /did not finish a full review/);
     assert.equal(parseFindingsTotal(body), null);
+  });
+});
+
+describe("the raw header says why, from the cause the merge stamped (never from the outcome)", () => {
+  const rawBody = (rawCauses: Job["rawCauses"], findings: Finding[] = []) =>
+    reviewSummaryBody({ ...job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses }), headSha: "abc1234ffff", coverage: [] }, findings, "ashlar-bot");
+  const header = (body: string) => /\*\*⚠️ Review posted verbatim — ([^*]*)\*\*/.exec(body)?.[1];
+
+  it("a parse failure says the reply was not parseable, and nothing about local repair", () => {
+    assert.equal(header(rawBody({ chatgpt: "unparseable" })), "the reply was not parseable JSON.");
+  });
+
+  it("rows past the gate's cap: the reply parsed, its unread rows are why; never a parse failure or local repair", () => {
+    for (const body of [rawBody({ chatgpt: "unread-rows" }), rawBody({ chatgpt: "unread-rows" }, [finding])]) {
+      assert.equal(header(body), "the reply parsed, but its findings past the gate's row cap were not inspected.");
+      assert.doesNotMatch(body, /not parseable|local repair/i);
+    }
+  });
+
+  it("a released held local reply that is not a verdict says so", () => {
+    assert.equal(header(rawBody({ local: "not-a-verdict" })), "the reply could not be used as a complete structured review.");
+  });
+
+  it("no recorded cause is cause-neutral: it claims neither a parse failure nor unread rows", () => {
+    for (const causes of [undefined, {}, { chatgpt: "bogus" } as unknown as Job["rawCauses"], { toString: "unparseable" } as unknown as Job["rawCauses"]]) {
+      const body = rawBody(causes);
+      assert.equal(header(body), "a reply could not be used as structured review JSON.");
+      assert.doesNotMatch(body, /not parseable|local repair|row cap/i);
+    }
+  });
+
+  it("several salvaged legs: one labeled clause each, in merge order", () => {
+    assert.equal(
+      rawCauseText({ chatgpt: "unparseable", local: "unread-rows" }),
+      "ChatGPT: the reply was not parseable JSON; Local LLM: the reply parsed, but its findings past the gate's row cap were not inspected",
+    );
   });
 });
 

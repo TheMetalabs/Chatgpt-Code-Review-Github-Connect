@@ -1,5 +1,5 @@
 import type { Finding, Job, ReviewProvider, Severity } from "./types.ts";
-import { OUTCOME_SHAPE, postedOutcome, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
+import { OUTCOME_SHAPE, postedOutcome, rawCauseText, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
 
 const BADGE: Record<Severity, string> = {
   P0: "https://img.shields.io/badge/P0-red?style=flat",
@@ -75,7 +75,7 @@ function neutralizeMarkers(s: string): string {
   return String(s ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
 }
 
-type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote">>;
+type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses">>;
 
 /** Everything a body helper reads, computed once so every kind renders the same fields the same way. */
 type SummaryParts = {
@@ -85,6 +85,8 @@ type SummaryParts = {
   noteLine: string;
   skipped: string[];
   raw: string;
+  /** Why the raw block is posted (rawCauseText): fixed text from the merge's stamped causes. */
+  rawWhy: string;
 };
 
 export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username: string, unanchored: Finding[] = []): string {
@@ -98,6 +100,7 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
     // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
     raw: neutralizeMarkers((job.rawReview ?? "").trim().replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)")),
+    rawWhy: rawCauseText(job.rawCauses),
   };
   switch (outcome) {
     case "findings":
@@ -129,13 +132,15 @@ export function findingsMarker(outcome: PostedOutcome, findings: Finding[], unan
 }
 
 /** The verbatim salvaged block. Its header says whose reply it is: an unverified local
- * verification reply is never presented as an ordinary (chat) salvage. */
-function rawBlock(outcome: PostedOutcome, raw: string): string {
-  if (!raw) return "";
-  const header = outcome === "raw-unverified"
+ * verification reply is never presented as an ordinary (chat) salvage. Otherwise it says why, from
+ * the causes the merge stamped: a reply that parsed but had rows the gate did not read is not called
+ * unparseable. */
+function rawBlock(p: SummaryParts): string {
+  if (!p.raw) return "";
+  const header = p.outcome === "raw-unverified"
     ? "**⚠️ Local verification reply posted verbatim — it could not be used as a review.**"
-    : "**⚠️ Review posted verbatim — the reply was not parseable JSON and local repair is off.**";
-  return `\n${header} Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${REVIEW_RAW_START}\n${raw}\n${REVIEW_RAW_END}\n`;
+    : `**⚠️ Review posted verbatim — ${p.rawWhy}.**`;
+  return `\n${header} Structured findings/inline anchors are unavailable; the fixing agent should read the original review below and judge it:\n\n${REVIEW_RAW_START}\n${p.raw}\n${REVIEW_RAW_END}\n`;
 }
 
 /** A salvaged verbatim review is NOT a clean pass: the clean marker/string stays out so the loop
@@ -144,7 +149,7 @@ function rawBlock(outcome: PostedOutcome, raw: string): string {
 function rawOnlyBody(p: SummaryParts): string {
   const skipNote = p.skipped.length ? `\n${p.skipped.map((s) => `- ${s}`).join("\n")}\n` : "";
   return capReviewBody(`${REVIEW_SUMMARY_MARK}
-${p.noteLine}${rawBlock(p.outcome, p.raw)}${skipNote}
+${p.noteLine}${rawBlock(p)}${skipNote}
 **Reviewed commit:** \`${p.sha}\`
 ${findingsMarker(p.outcome, [], [])}`);
 }
@@ -210,7 +215,7 @@ Here are some automated review suggestions for this pull request.
 
 ${reviewersLine(job)}
 ${p.noteLine}${p.skipped.length ? p.skipped.map((s) => `- ${s}`).join("\n") : ""}
-${unanchoredBlock(unanchored)}${rawBlock(p.outcome, p.raw)}
+${unanchoredBlock(unanchored)}${rawBlock(p)}
 <details>
 <summary>ℹ️ About Ashlar</summary>
 

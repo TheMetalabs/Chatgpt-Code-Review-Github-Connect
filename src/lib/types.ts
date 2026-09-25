@@ -108,9 +108,12 @@ export interface Job {
   findings: Finding[];
   mergeRecommendation?: MergeRec;
   highestRisk?: string;
-  // Verbatim model reply kept when it was not parseable review JSON and local repair was off;
+  // Verbatim model reply (every salvaged leg's) posted as evidence instead of structured findings;
   // surfaced in the review body for the fixing agent (see salvageReviewJson).
   rawReview?: string;
+  /** Why each salvaged leg in rawReview is posted verbatim, stamped by the merge that salvaged it.
+   * The body's raw header and the loop's handoff read the cause from here, never from the outcome. */
+  rawCauses?: Partial<Record<ReviewProvider, RawCause>>;
   investigatedSafe: string[];
   assumptions: string[];
   postedReviewId?: string;
@@ -417,6 +420,12 @@ export function chatProvidersOf(providers: readonly ReviewProvider[]): Array<"ch
  * after the merged chat result is clean, as a verification round (settings.localReviewRole, env ASHLAR_LOCAL_REVIEW_ROLE).
  */
 export type LocalReviewRole = "race" | "verify-clean";
+
+/** Why a leg's reply is posted verbatim instead of as structured findings: `unparseable` — it was
+ * not parseable review JSON (salvaged before the gate); `unread-rows` — it parsed, but the gate set
+ * findings past its row cap aside unread; `not-a-verdict` — a released held local reply the gate
+ * could not use in full (docs/local-verify-clean.md §1). */
+export type RawCause = "unparseable" | "unread-rows" | "not-a-verdict";
 
 export const LOCAL_REVIEW_ROLES: LocalReviewRole[] = ["race", "verify-clean"];
 

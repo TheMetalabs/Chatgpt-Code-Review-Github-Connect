@@ -73,7 +73,7 @@ import {
   type RoundSummary,
 } from "./review-loop.ts";
 import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
-import { OUTCOME_SHAPE, postedOutcome, type PostedOutcome } from "./review-outcome.ts";
+import { OUTCOME_SHAPE, postedOutcome, rawCauseText, type PostedOutcome } from "./review-outcome.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface PullHead extends LoopPrInfo {
@@ -183,11 +183,18 @@ function notCleanOutcome(job: Job): PostedOutcome | undefined {
 
 /** Fixed handoff detail per non-converged zero-finding outcome (never free text). */
 const NOT_CLEAN_DETAIL: Partial<Record<PostedOutcome, string>> = {
-  raw: "the reply was not parseable review JSON and is posted verbatim",
   "raw-unverified": "local verification's reply could not be used as a review and is posted verbatim",
   "unverified-clean": "chat found nothing, but local verification did not complete",
   incomplete: "a reviewer did not run",
 };
+
+/** The handoff detail for a non-converged zero-finding outcome. A raw review says why it is posted
+ * verbatim from the causes its merge stamped (the same fixed text as the body's raw header), so a
+ * reply whose unread rows made it evidence is never handed off as a parse failure. */
+export function notCleanDetail(job: Pick<Job, "rawCauses">, outcome: PostedOutcome): string {
+  if (outcome === "raw") return `posted verbatim: ${rawCauseText(job.rawCauses)}`;
+  return NOT_CLEAN_DETAIL[outcome] ?? outcome;
+}
 
 /** Write-capable repository permissions (legacy field; `maintain` reports as `write`). */
 const WRITE_PERMISSIONS = new Set(["admin", "write"]);
@@ -769,7 +776,7 @@ export async function runPostReviewLoop(
       return await escalate("loop-error", "every finding of this review shares its id with another, so none can be attributed to its thread; the loop does not fix what it cannot attribute");
     }
     if (notClean) {
-      return await escalate("loop-error", `this review is not a clean pass (${NOT_CLEAN_DETAIL[notClean] ?? notClean}) and carries no structured finding the fix agent can act on`);
+      return await escalate("loop-error", `this review is not a clean pass (${notCleanDetail(job, notClean)}) and carries no structured finding the fix agent can act on`);
     }
     if (!sample) return await escalate("loop-error", "no head-pinned snapshot for this review");
 

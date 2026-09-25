@@ -35,7 +35,7 @@ import { chatStalled, fallbackWaivesChat, gateUnreadRows, heldLocalEvidence, hel
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
-import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import type { BotSettings, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import {
   ashlarBotLogin,
   continueLoopOnPush,
@@ -1039,8 +1039,10 @@ export async function submitHarborChat(
   const heldLocal = !job.chatFpRound && heldLocalReleased(job);
   let localUnusable: string | undefined;
   const unusableNotes: string[] = [];
+  // Why each salvaged leg is posted verbatim, kept for the body and the loop handoff (Job.rawCauses).
+  const rawCauses: Partial<Record<ReviewProvider, RawCause>> = {};
   for (const leg of payloads) {
-    const { gate, unusable } = gateLeg(leg, sample, heldLocal);
+    const { gate, unusable, cause } = gateLeg(leg, sample, heldLocal);
     if (unusable) unusableNotes.push(`${leg.provider}: ${unusable} (reply posted verbatim)`);
     if (unusable && leg.provider === "local") localUnusable = unusable;
     if (!gate.ok) {
@@ -1049,6 +1051,7 @@ export async function submitHarborChat(
     }
     gates.push(gate);
     byProvider.set(leg.provider, gate);
+    if (gate.rawReview && cause) rawCauses[leg.provider] = cause;
   }
 
   if (!gates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
@@ -1123,6 +1126,7 @@ export async function submitHarborChat(
     mergeRecommendation: merged.mergeRecommendation,
     highestRisk: merged.highestRisk,
     rawReview,
+    rawCauses: rawReview ? rawCauses : undefined,
     investigatedSafe: merged.investigatedSafe,
     assumptions: nextAssumptions,
     skippedProviders: skipped,
@@ -1141,12 +1145,23 @@ export async function submitHarborChat(
  * the gate, the gate dropped a finding it reported, or it took a reply that was not review JSON to
  * get there) is gated as evidence instead: its complete text posts verbatim, so it never counts as
  * verification and nothing it reported is lost. So is any leg, chat included and on any role, whose
- * rows past the gate's cap went unread (gateUnreadRows): it is never a clean structured result. */
-function gateLeg(leg: ChatLeg, sample: SamplePr, heldLocal: boolean): { gate: ReturnType<typeof gateLiveSubmission>; unusable?: string } {
+ * rows past the gate's cap went unread (gateUnreadRows): it is never a clean structured result.
+ * `cause` says why a leg posts verbatim: a reply salvaged before the gate (the bridge's, or a failed
+ * held local leg's) was not parseable review JSON; a converted one parsed, and is evidence for
+ * unread rows alone or for another reason it is not a verdict. */
+function gateLeg(
+  leg: ChatLeg,
+  sample: SamplePr,
+  heldLocal: boolean,
+): { gate: ReturnType<typeof gateLiveSubmission>; unusable?: string; cause?: RawCause } {
   const parsed = parseChatSubmission(leg.raw);
   const gate = gateLiveSubmission(parsed, sample, state.settings);
-  const unusable = heldLocal && leg.provider === "local" ? heldLocalUnusable(gate, leg) : gateUnreadRows(gate);
-  return unusable ? { gate: gateLiveSubmission(heldLocalEvidence(parsed, leg), sample, state.settings), unusable } : { gate };
+  if (gate.ok && gate.rawReview) return { gate, cause: "unparseable" };
+  const unread = gateUnreadRows(gate);
+  const unusable = heldLocal && leg.provider === "local" ? heldLocalUnusable(gate, leg) : unread;
+  if (!unusable) return { gate };
+  const cause: RawCause = unusable === unread ? "unread-rows" : "not-a-verdict";
+  return { gate: gateLiveSubmission(heldLocalEvidence(parsed, leg), sample, state.settings), unusable, cause };
 }
 
 type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kind: "fallback" };

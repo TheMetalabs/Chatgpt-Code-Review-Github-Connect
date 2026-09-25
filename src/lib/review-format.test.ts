@@ -6,7 +6,7 @@ import { CLEAN_REVIEW_BODY, REVIEW_RAW_END, REVIEW_RAW_START, inlineFindingComme
 describe("review-format", () => {
   it("surfaces a salvaged raw review in the body and is not a clean pass", () => {
     const body = reviewSummaryBody(
-      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "P1 real bug in pay.ts when amount is 0" },
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "P1 real bug in pay.ts when amount is 0", rawCauses: { chatgpt: "unparseable" } },
       [],
       "ashlar-bot",
       [],

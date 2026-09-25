@@ -1,4 +1,4 @@
-import type { Job, ReviewProvider } from "./types.ts";
+import type { Job, RawCause, ReviewProvider } from "./types.ts";
 import { PROVIDER_LABEL } from "./types.ts";
 import { localVerifies } from "./local-fallback.ts";
 
@@ -45,6 +45,27 @@ export function skippedNote(providers: readonly ReviewProvider[]): string {
  * text, and a reviewer noting it "skipped" generated fixtures is not a reviewer that did not run. */
 export function skippedNotes(job: Pick<Job, "skippedProviders">): string[] {
   return job.skippedProviders?.length ? [skippedNote(job.skippedProviders)] : [];
+}
+
+/** The fixed text for each raw cause: a Record over the closed type, so a new cause cannot render
+ * without deciding what it says. */
+const RAW_CAUSE_TEXT: Record<RawCause, string> = {
+  unparseable: "the reply was not parseable JSON",
+  "unread-rows": "the reply parsed, but its findings past the gate's row cap were not inspected",
+  "not-a-verdict": "the reply could not be used as a complete structured review",
+};
+
+/** Why a review's verbatim block is posted, from the causes its merge stamped (Job.rawCauses): one
+ * clause per salvaged leg, labeled with its reviewer when there is more than one. Fixed text only,
+ * never model output. Cause-neutral when no cause was recorded: the body and the loop handoff never
+ * claim a cause the merge did not report (a parse failure, say, for rows the gate did not read). */
+export function rawCauseText(causes: Job["rawCauses"]): string {
+  const rows = Object.entries(causes ?? {}).filter(
+    (row): row is [ReviewProvider, RawCause] => Object.hasOwn(PROVIDER_LABEL, row[0]) && Object.hasOwn(RAW_CAUSE_TEXT, String(row[1])),
+  );
+  if (!rows.length) return "a reply could not be used as structured review JSON";
+  if (rows.length === 1) return RAW_CAUSE_TEXT[rows[0][1]];
+  return rows.map(([provider, cause]) => `${PROVIDER_LABEL[provider]}: ${RAW_CAUSE_TEXT[cause]}`).join("; ");
 }
 
 /** `findings` is the gated (publishable) count. An FP round always merges as race, and local run

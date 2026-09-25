@@ -31,7 +31,7 @@ import {
   parseStopRecord,
   type ReviewLoopMode,
 } from "./review-loop.ts";
-import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
+import { sameSession, startMarkerOf, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
 import { retryWrite, writeOutcomeUnknown } from "./write-retry.ts";
 
 export type ControlKind = "start" | "stop" | "continue" | "handoff";
@@ -47,12 +47,13 @@ export interface ControlGithub {
   createIssueComment(token: string, o: { owner: string; repo: string; pr: number; body: string }): Promise<CreatedRow>;
 }
 
-/** What a control write IS, independent of its text: the identity every dedup check keys on. */
+/** What a control write IS, independent of its text: the identity every dedup check keys on. A
+ * continuation or handoff belongs to one session (its rows are matched only in it). */
 export type ControlKey =
   | { kind: "start"; ref: PrRef; by: string; at: string; mode: ReviewLoopMode }
   | { kind: "stop"; ref: PrRef; by: string; at: string }
-  | { kind: "continue"; ref: PrRef; head: string; sessionIso?: string }
-  | { kind: "handoff"; ref: PrRef; head: string; sessionIso?: string };
+  | { kind: "continue"; ref: PrRef; head: string; session?: SessionRef }
+  | { kind: "handoff"; ref: PrRef; head: string; session?: SessionRef };
 
 export function assertNever(x: never): never {
   throw new Error(`unhandled case: ${JSON.stringify(x)}`);
@@ -63,9 +64,10 @@ export function prKey(ref: PrRef): string {
 }
 
 /**
- * The key string of a write. A session is named by its anchor INSTANT, never by the start record's
- * comment id: a start whose POST outcome is unknown has no id until it is listed, and a key that
- * changed mid-session would let the same continuation or handoff be POSTed twice.
+ * The key string of a write. A session is named by its start record's comment id when known — two
+ * starts in one second share their instant — else by the start's marker (a start whose POST
+ * outcome is unknown has no id until it is listed). The journal aliases the two (OwnWrites.find):
+ * a session that learns its id never gets a second entry, so never a second POST.
  */
 export function controlKey(k: ControlKey): string {
   const pr = prKey(k.ref);
@@ -76,7 +78,7 @@ export function controlKey(k: ControlKey): string {
       return `stop:${pr}:${k.by.toLowerCase()}:${isoMs(k.at)}`;
     case "continue":
     case "handoff":
-      return `${k.kind}:${pr}@${k.head}#${k.sessionIso ? isoMs(k.sessionIso) : ""}`;
+      return `${k.kind}:${pr}@${k.head}#${k.session?.seq !== undefined ? `s${k.session.seq}` : `m${startMarkerOf(k.session)}`}`;
     default:
       return assertNever(k);
   }
@@ -87,8 +89,6 @@ export interface ControlWrite {
   /** Lazy so a continuation computes its round only when a POST is really sent — and so a caller
    * reaches emitControl with no await (the single-flight join point). */
   body: string | (() => Promise<string>);
-  /** The session a continuation or handoff belongs to (its rows are matched only in it). */
-  since?: { iso?: string; seq?: number };
 }
 
 /** In-session test for a REVIEW row (a round): strictly after the anchor, compared as instants.
@@ -114,6 +114,11 @@ export function sameStart(a: { mode: string; by: string; at: string } | null, b:
   return !!a && a.mode === b.mode && a.by.toLowerCase() === b.by.toLowerCase() && isoMs(a.at) === isoMs(b.at);
 }
 
+/** The scope of a session's own control rows: after its start record (see controlInSession). */
+function sessionScope(s: SessionRef | undefined): { iso?: string; seq?: number } {
+  return { iso: s?.at, seq: s?.seq };
+}
+
 /** The ONE definition of "this listed row is that write" (the caller has proven the App wrote it). */
 export function rowMatches(w: ControlWrite, row: ControlRow): boolean {
   const k = w.key;
@@ -127,10 +132,10 @@ export function rowMatches(w: ControlWrite, row: ControlRow): boolean {
     }
     case "continue": {
       const c = canonicalContinuation(row.body, bot);
-      return !!c && c.pr === k.ref.pr && c.head === k.head && controlInSession(row, w.since ?? {});
+      return !!c && c.pr === k.ref.pr && c.head === k.head && controlInSession(row, sessionScope(k.session));
     }
     case "handoff":
-      return parseEscalateMarker(row.body, bot)?.head === k.head && controlInSession(row, w.since ?? {}); // full-SHA equality
+      return parseEscalateMarker(row.body, bot)?.head === k.head && controlInSession(row, sessionScope(k.session)); // full-SHA equality
     default:
       return assertNever(k);
   }
@@ -182,6 +187,8 @@ export type EmitOutcome =
 type WriteState = "intent" | "sending" | "posted" | "unknown" | "rejected";
 
 interface OwnWrite {
+  /** Its journal key: controlKey of its write — the id-bearing one once its session knows its id. */
+  key: string;
   write: ControlWrite;
   /** Honored by the session fold before (and whatever) its POST: a stop from the first moment. */
   writeAhead: boolean;
@@ -266,17 +273,43 @@ export class OwnWrites {
     return fresh;
   }
 
-  /** The entry of `w` (created unsent), carrying the latest text and session scope of the write. */
-  upsert(w: ControlWrite): OwnWrite {
-    const all = this.entries(w.key.ref);
+  /**
+   * The entry of `w`: under its key, or — a continuation or handoff — the entry of the same kind,
+   * head and session (sameSession) under the other name of that session: its marker before the
+   * start record's id was known, or its id when `w` does not know it. An entry found by its marker
+   * moves to the id-bearing key: one entry per session, whichever name a caller has.
+   */
+  private find(w: ControlWrite): OwnWrite | undefined {
+    const all = this.byPr.get(prKey(w.key.ref));
     const key = controlKey(w.key);
-    const e = all.get(key);
+    const exact = all?.get(key);
+    if (exact || !all) return exact;
+    const k = w.key;
+    if (k.kind !== "continue" && k.kind !== "handoff") return undefined;
+    for (const e of all.values()) {
+      const o = e.write.key;
+      if (o.kind !== k.kind || o.head !== k.head || !sameSession(o.session, k.session)) continue;
+      if (k.session?.seq !== undefined && o.session?.seq === undefined) {
+        all.delete(e.key);
+        e.key = key;
+        all.set(key, e);
+      }
+      return e;
+    }
+    return undefined;
+  }
+
+  /** The entry of `w` (created unsent), carrying the latest text and session scope of the write —
+   * a caller that names the session only by its marker brings its text, never a looser scope. */
+  upsert(w: ControlWrite): OwnWrite {
+    const e = this.find(w);
     if (!e) {
-      const fresh: OwnWrite = { write: w, writeAhead: false, state: "intent" };
-      all.set(key, fresh);
+      const key = controlKey(w.key);
+      const fresh: OwnWrite = { key, write: w, writeAhead: false, state: "intent" };
+      this.entries(w.key.ref).set(key, fresh);
       return fresh;
     }
-    if (!e.inflight) e.write = w;
+    if (!e.inflight) e.write = controlKey(w.key) === e.key ? w : { ...w, key: e.write.key };
     return e;
   }
 
@@ -296,16 +329,15 @@ export class OwnWrites {
 
   /** Forget an intent that was never sent (a stop that stopped nothing). */
   abandon(w: ControlWrite): void {
-    const all = this.byPr.get(prKey(w.key.ref));
-    const key = controlKey(w.key);
-    if (all?.get(key)?.state === "intent" && !all.get(key)?.inflight) all.delete(key);
+    const e = this.find(w);
+    if (e?.state === "intent" && !e.inflight) this.byPr.get(prKey(w.key.ref))?.delete(e.key);
     this.prune(w.key.ref);
   }
 
   /** A listed row that is `w`: confirms the entry (it is no longer unknown). */
   seen(w: ControlWrite, rows: readonly ControlRow[], botLogin: string): boolean {
     const hit = listedMatch(rows, w, botLogin);
-    const e = this.byPr.get(prKey(w.key.ref))?.get(controlKey(w.key));
+    const e = this.find(w);
     if (hit && e) confirm(e, hit);
     this.prune(w.key.ref);
     return !!hit;
@@ -348,8 +380,7 @@ export class OwnWrites {
       this.landed.delete(e);
       const pr = prKey(e.write.key.ref);
       const all = this.byPr.get(pr);
-      const key = controlKey(e.write.key);
-      if (all?.get(key) === e) all.delete(key);
+      if (all?.get(e.key) === e) all.delete(e.key);
       if (all?.size === 0) this.byPr.delete(pr);
     }
   }

@@ -12,7 +12,7 @@ describe("deriveLoopSession (durable session fold)", () => {
 
   it("a start opens the session, anchored at the start; mode + starter come from it", () => {
     const s = deriveLoopSession([ev("2026-01-01T00:00:00Z", "start", { mode: "apply", actor: "alice" })]);
-    assert.deepEqual(s, { active: true, startIso: "2026-01-01T00:00:00Z", mode: "apply", starter: "alice" });
+    assert.deepEqual(s, { active: true, startIso: "2026-01-01T00:00:00Z", startBy: "alice", startMode: "apply", mode: "apply", starter: "alice" });
   });
 
   it("a re-issued start keeps the anchor and updates mode + starter (the budget never resets)", () => {
@@ -20,7 +20,8 @@ describe("deriveLoopSession (durable session fold)", () => {
       ev("2026-01-01T00:00:00Z", "start", { mode: "suggest", actor: "alice" }),
       ev("2026-01-03T00:00:00Z", "start", { mode: "apply", actor: "bob" }),
     ]);
-    assert.deepEqual(s, { active: true, startIso: "2026-01-01T00:00:00Z", mode: "apply", starter: "bob" });
+    // the anchor's own requester and mode stay: they name the session (SessionRef)
+    assert.deepEqual(s, { active: true, startIso: "2026-01-01T00:00:00Z", startBy: "alice", startMode: "suggest", mode: "apply", starter: "bob" });
   });
 
   it("every terminal kind ends the session; a later start opens a NEW session", () => {
@@ -32,7 +33,7 @@ describe("deriveLoopSession (durable session fold)", () => {
         ev("2026-01-02T00:00:00Z", kind),
         ev("2026-01-03T00:00:00Z", "start", { mode: "suggest", actor: "c" }),
       ]);
-      assert.deepEqual(again, { active: true, startIso: "2026-01-03T00:00:00Z", mode: "suggest", starter: "c" }, kind);
+      assert.deepEqual(again, { active: true, startIso: "2026-01-03T00:00:00Z", startBy: "c", startMode: "suggest", mode: "suggest", starter: "c" }, kind);
     }
   });
 
@@ -51,7 +52,7 @@ describe("deriveLoopSession (durable session fold)", () => {
       ev("2026-01-02T00:00:00Z", "start", { mode: "suggest", actor: "new" }),
       ev("2026-01-02T00:00:00Z", "escalate"),
     ]);
-    assert.deepEqual(s, { active: true, startIso: "2026-01-02T00:00:00Z", mode: "suggest", starter: "new" });
+    assert.deepEqual(s, { active: true, startIso: "2026-01-02T00:00:00Z", startBy: "new", startMode: "suggest", mode: "suggest", starter: "new" });
   });
 
   it("the STOPPED marker acknowledges a prior human stop (idempotent emission); terminals with no session are no-ops", () => {
@@ -75,7 +76,7 @@ describe("deriveLoopSession: a clean review ends the session only for the head t
   const B = "b".repeat(40);
   const t = (i: number) => `2026-01-0${i}T00:00:00Z`;
   const start = ev(t(1), "start", { mode: "apply", actor: "alice" });
-  const ACTIVE = { active: true, startIso: t(1), mode: "apply", starter: "alice" };
+  const ACTIVE = { active: true, startIso: t(1), startBy: "alice", startMode: "apply", mode: "apply", starter: "alice" };
 
   it("a clean review of a head the loop already moved past (continue / push) is stale and ignored", () => {
     for (const kind of ["continue", "push"] as const) {
@@ -134,7 +135,7 @@ describe("deriveLoopSession: events are ordered as instants", () => {
       ev("2026-01-01T00:00:00Z", "escalate"),
       ev("2026-01-01T00:00:00.500Z", "start", { mode: "apply", actor: "alice" }),
     ]);
-    assert.deepEqual(s, { active: true, startIso: "2026-01-01T00:00:00.500Z", mode: "apply", starter: "alice" });
+    assert.deepEqual(s, { active: true, startIso: "2026-01-01T00:00:00.500Z", startBy: "alice", startMode: "apply", mode: "apply", starter: "alice" });
   });
 
   it("an unparseable timestamp is ignored like a missing one", () => {

@@ -77,7 +77,7 @@ import {
   type ReviewLoopMode,
   type RoundSummary,
 } from "./review-loop.ts";
-import type { LoopEvent, LoopSession } from "./review-loop-session.ts";
+import { sessionRef, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface PullHead extends LoopPrInfo {
@@ -612,16 +612,15 @@ function ensureContinuation(
   ctl: EmitContext,
   gh: ReviewLoopGithub,
   ref: PrRef,
-  c: { head: string; mode: ReviewLoopMode; sinceIso?: string; sinceSeq?: number; round?: number },
+  c: { head: string; mode: ReviewLoopMode; session: SessionRef; round?: number },
 ): Promise<EmitOutcome> {
   if (!FULL_SHA_RE.test(c.head)) return Promise.resolve({ status: "rejected", error: "the head is not a full commit SHA" });
   const body = async () => {
     const round =
-      c.round ?? (await reconstructRounds(gh, ctl.token, ref.owner, ref.repo, ref.pr, { botLogin: ctl.botLogin, sinceIso: c.sinceIso }).catch(() => [])).length + 1;
+      c.round ?? (await reconstructRounds(gh, ctl.token, ref.owner, ref.repo, ref.pr, { botLogin: ctl.botLogin, sinceIso: c.session.at }).catch(() => [])).length + 1;
     return continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head });
   };
-  const since = { iso: c.sinceIso, seq: c.sinceSeq };
-  return emitControl(ctl, { key: { kind: "continue", ref, head: c.head, sessionIso: c.sinceIso }, body, since });
+  return emitControl(ctl, { key: { kind: "continue", ref, head: c.head, session: c.session }, body });
 }
 
 /** What a superseded step's request for the live head's review came to: skipped when none was
@@ -707,8 +706,7 @@ export async function runPostReviewLoop(
   let rounds: RoundSummary[] = [];
   let diffLines: number | undefined;
   let requested = false; // true once the durable session says a loop is active
-  let sinceIso: string | undefined; // the session anchor (scopes rounds + handoff idempotency)
-  let sinceSeq: number | undefined; // the anchor start record's comment id (exact control scoping)
+  let since: SessionRef | undefined; // the session (scopes rounds + handoff idempotency)
   const sleep = (ms: number) => (d?.sleep ?? realSleep)(ms);
   // Past the session gate the user asked for a loop: every stop that is not a supersession /
   // operator stop is ONE fixed ESCALATE (reason code + deterministic detail), never free text.
@@ -716,7 +714,7 @@ export async function runPostReviewLoop(
   // the NEW head.
   const escalate = async (reason: EscalateReason, detail: string, head: string = headSha): Promise<LoopStepResult> => {
     if (!d) return { ran: false, reason: `ESCALATE ${reason} not posted (no GitHub client): ${detail}` };
-    const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, sinceIso, sinceSeq, sleep, now: d!.now });
+    const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, session: since, sleep, now: d!.now });
     try {
       let r = await post();
       if (r.error === ESCALATE_IN_FLIGHT) {
@@ -758,7 +756,7 @@ export async function runPostReviewLoop(
         return { status: "unreadable", error: (e as Error)?.message ?? String(e) };
       }
       if (!now.active) return endedByUnresolvedHandoff(gh, ref, now) ? { status: "handed-off-unknown" } : { status: "skipped" };
-      const r = await ensureContinuation(ctl, gh, ref, { head: live.sha, mode: now.mode ?? "suggest", sinceIso: now.startIso, sinceSeq: now.startSeq });
+      const r = await ensureContinuation(ctl, gh, ref, { head: live.sha, mode: now.mode ?? "suggest", session: sessionRef(now) });
       trace(job.id, "superseded", { live: live.sha.slice(0, 7), continuation: r.status });
       return r;
     };
@@ -789,8 +787,7 @@ export async function runPostReviewLoop(
     }
     if (!session.active) return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
     requested = true;
-    sinceIso = session.startIso;
-    sinceSeq = session.startSeq;
+    since = sessionRef(session);
     trace(job.id, "step", { pr, head: headSha.slice(0, 7), findings: findings.length });
     diffLines = diffLinesOf(head);
     if (unshown) {
@@ -813,8 +810,7 @@ export async function runPostReviewLoop(
       diffLines,
       botLogin,
       requireCurrentRound: true,
-      sinceIso: session.startIso,
-      sinceSeq: session.startSeq,
+      session: since,
       sleep,
       now: d.now,
     };
@@ -1050,7 +1046,7 @@ export async function runPostReviewLoop(
       } else {
         // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
         // budget — the round-cap handoff.
-        const c = await ensureContinuation(ctl, gh, ref, { head: newHead, mode, sinceIso: session.startIso, sinceSeq: session.startSeq, round: rounds.length + 1 });
+        const c = await ensureContinuation(ctl, gh, ref, { head: newHead, mode, session: sessionRef(session), round: rounds.length + 1 });
         if (c.status === "unknown") trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
         status = continuationStatus(c);
       }
@@ -1138,7 +1134,8 @@ export async function continueLoopOnPush(
     if (!session.active) {
       return endedByUnresolvedHandoff(d.gh, push, session) ? { posted: false, reason: HANDED_OFF_UNKNOWN, unresolved: true } : { posted: false, reason: NO_SESSION };
     }
-    const c = await ensureContinuation(controlCtx(d, token, botLogin), d.gh, push, { head: push.headSha, mode: session.mode ?? "suggest", sinceIso: session.startIso, sinceSeq: session.startSeq });
+    const since = sessionRef(session);
+    const c = await ensureContinuation(controlCtx(d, token, botLogin), d.gh, push, { head: push.headSha, mode: session.mode ?? "suggest", session: since });
     // The next review cannot be requested: end the loop with the fixed handoff instead of stalling.
     const handOff = async (error: string) => {
       const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso }).catch(() => []);
@@ -1152,8 +1149,7 @@ export async function continueLoopOnPush(
         rounds,
         roundCap: roundCap(env),
         botLogin,
-        sinceIso: session.startIso,
-        sinceSeq: session.startSeq,
+        session: since,
         sleep: d.sleep,
         now: d.now,
       });

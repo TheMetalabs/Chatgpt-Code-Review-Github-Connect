@@ -32,7 +32,7 @@ import {
   type EscalateReason,
   type RoundSummary,
 } from "./review-loop.ts";
-import { deriveLoopSession, type LoopEvent, type LoopSession } from "./review-loop-session.ts";
+import { deriveLoopSession, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
 import {
   assertNever,
   controlInSession,
@@ -140,16 +140,14 @@ export async function reconstructRounds(
   }));
 }
 
-type HandoffTarget = { owner: string; repo: string; pr: number; head: string; sinceIso?: string; sinceSeq?: number };
+/** `session`: the loop session (its anchor start, see SessionRef) — it scopes the rounds, and the
+ * handoff is one per head in it. */
+type HandoffTarget = { owner: string; repo: string; pr: number; head: string; session?: SessionRef };
 
 /** THE handoff of a head in a session: one, whichever path (stuck classification or a terminal
  * failure) posts it. */
 function handoffWrite(o: HandoffTarget, body: string): ControlWrite {
-  return {
-    key: { kind: "handoff", ref: { owner: o.owner, repo: o.repo, pr: o.pr }, head: o.head, sessionIso: o.sinceIso },
-    body,
-    since: { iso: o.sinceIso, seq: o.sinceSeq },
-  };
+  return { key: { kind: "handoff", ref: { owner: o.owner, repo: o.repo, pr: o.pr }, head: o.head, session: o.session }, body };
 }
 
 /** True if a bot-authored escalate handoff for this head is LISTED in this session (idempotency;
@@ -205,9 +203,8 @@ export async function maybeEscalate(
     roundCap: number;
     diffLines?: number;
     botLogin?: string;
-    sinceIso?: string;
-    /** The session's start-record comment id (exact handoff scoping; see controlInSession). */
-    sinceSeq?: number;
+    /** The loop session: rounds after its anchor, one handoff per head in it (see SessionRef). */
+    session?: SessionRef;
     /** Fail closed (error CURRENT_ROUND_MISSING) unless the reviewed head IS the latest round —
      * including a history with ZERO attributable rounds, which then can never "pass" the budget.
      * The loop runtime always sets it; a lenient caller only classifies a history it can see and
@@ -247,7 +244,7 @@ async function maybeEscalateInner(
   let rounds: RoundSummary[];
   let reason: EscalateReason | null;
   try {
-    rounds = await reconstructRounds(gh, token, opts.owner, opts.repo, opts.pr, { botLogin, sinceIso: opts.sinceIso });
+    rounds = await reconstructRounds(gh, token, opts.owner, opts.repo, opts.pr, { botLogin, sinceIso: opts.session?.at });
     // Only classify when the most recent reconstructed round IS the current head. Otherwise the
     // history is stale or the branch was force-pushed onto a divergent lineage, and those rounds
     // do not belong to this head — never attribute their trend to it.
@@ -326,10 +323,8 @@ export async function escalateNow(
     roundCap: number;
     diffLines?: number;
     botLogin?: string;
-    /** Session anchor: only handoffs posted in this session count for idempotency. */
-    sinceIso?: string;
-    /** The session's start-record comment id (exact handoff scoping; see controlInSession). */
-    sinceSeq?: number;
+    /** The loop session: only handoffs posted in it count for idempotency (see SessionRef). */
+    session?: SessionRef;
     /** Waits between handoff POST retries (injectable for tests). */
     sleep?: (ms: number) => Promise<void>;
     /** The clock a handoff attempt is stamped with (injectable for tests). */

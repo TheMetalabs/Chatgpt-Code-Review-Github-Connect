@@ -12,10 +12,10 @@ import {
   type EmitContext,
   type EmitOutcome,
 } from "./review-loop-control.ts";
-import { continueComment, escalateMarker, isoMs, startComment, stoppedComment } from "./review-loop.ts";
-import { escalateNow, readLoopEvents } from "./review-loop-engine.server.ts";
-import { stopLoop, type LoopRuntimeDeps } from "./review-loop-runtime.server.ts";
-import { deriveLoopSession, type LoopEvent } from "./review-loop-session.ts";
+import { canonicalContinuation, continueComment, escalateMarker, isoMs, parseStartMarker, startComment, stoppedComment } from "./review-loop.ts";
+import { escalateNow, readLoopEvents, readLoopSession } from "./review-loop-engine.server.ts";
+import { continueLoopOnPush, startLoop, stopLoop, type LoopRuntimeDeps } from "./review-loop-runtime.server.ts";
+import { deriveLoopSession, type LoopEvent, type SessionRef } from "./review-loop-session.ts";
 import { DEFAULT_SETTINGS, type BotSettings } from "./types.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
@@ -26,10 +26,9 @@ const ref = (pr = 1) => ({ owner: "o", repo: "r", pr });
 const unknownErr = () => Object.assign(new Error("GitHub issue comment 502: Bad Gateway"), { outcome: "unknown", status: 502 });
 const rejectedErr = () => Object.assign(new Error("GitHub issue comment 422"), { outcome: "rejected", status: 422 });
 
-const handoff = (pr = 1): ControlWrite => ({
-  key: { kind: "handoff", ref: ref(pr), head: HEAD, sessionIso: SESSION },
+const handoff = (pr = 1, session: SessionRef = { at: SESSION }): ControlWrite => ({
+  key: { kind: "handoff", ref: ref(pr), head: HEAD, session },
   body: `${escalateMarker({ reason: "fix-failed", round: 1, pr, head: HEAD })}\n\nhandoff`,
-  since: { iso: SESSION },
 });
 
 /** One write of each kind on PR 1, after the session anchor (ANCHOR). */
@@ -37,16 +36,15 @@ function writeOfEachKind(): Record<ControlKind, ControlWrite> {
   const LATER = "2026-02-25T00:00:00Z";
   // The session's start record precedes every row a world stores (id 0): a continuation or
   // handoff row is matched by its id, as in production once the start is listed.
-  const since = { iso: SESSION, seq: 0 };
+  const session = { at: SESSION, seq: 0 };
   return {
     start: { key: { kind: "start", ref: ref(), by: "bob", at: LATER, mode: "apply" }, body: startComment({ mode: "apply", by: "bob", at: LATER }) },
     stop: { key: { kind: "stop", ref: ref(), by: "bob", at: LATER }, body: stoppedComment({ by: "bob", at: LATER }) },
     continue: {
-      key: { kind: "continue", ref: ref(), head: HEAD, sessionIso: SESSION },
+      key: { kind: "continue", ref: ref(), head: HEAD, session },
       body: continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD }),
-      since,
     },
-    handoff: { ...handoff(), since },
+    handoff: handoff(1, session),
   };
 }
 const ANCHOR: LoopEvent = { at: SESSION, kind: "start", actor: "alice", mode: "suggest", seq: 0 };
@@ -112,9 +110,9 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.deepEqual(b, a);
     assert.deepEqual(await emitControl(f.ctx, handoff()), { status: "exists" }, "a later emit finds this process's own write");
     assert.equal(f.posts(), 1);
-    // the session part of a key is the anchor instant (an id-less unknown start cannot change it)
+    // an id-less session is named by its start's marker: the instant, not its spelling
     const k = { kind: "continue" as const, ref: ref(), head: HEAD };
-    assert.equal(controlKey({ ...k, sessionIso: "2026-02-20T00:00:00Z" }), controlKey({ ...k, sessionIso: "2026-02-20T00:00:00.000Z" }));
+    assert.equal(controlKey({ ...k, session: { at: "2026-02-20T00:00:00Z" } }), controlKey({ ...k, session: { at: "2026-02-20T00:00:00.000Z" } }));
   });
 
   it("a session read while an emit is in flight (refused and backing off, or rendering its body) keeps its entry: a concurrent emit joins it", async () => {
@@ -123,9 +121,8 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
       assert.ok(done(), "the first emit reached its pause");
     };
     const continuation = (body: ControlWrite["body"]): ControlWrite => ({
-      key: { kind: "continue", ref: ref(), head: HEAD, sessionIso: SESSION },
+      key: { kind: "continue", ref: ref(), head: HEAD, session: { at: SESSION } },
       body,
-      since: { iso: SESSION },
     });
     const text = continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD });
     for (const pause of ["backoff", "body"] as const) {
@@ -277,7 +274,7 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
       for (const read of ["lagging", "failed"] as const) {
         const label = `${plan} | ${read}`;
         const f = world([plan]);
-        const opts = { owner: "o", repo: "r", pr: 1, head: HEAD, reason: "fix-failed" as const, rounds: [], roundCap: 3, botLogin: BOT, sinceIso: SESSION, sleep: f.ctx.sleep, now: f.ctx.now };
+        const opts = { owner: "o", repo: "r", pr: 1, head: HEAD, reason: "fix-failed" as const, rounds: [], roundCap: 3, botLogin: BOT, session: { at: SESSION }, sleep: f.ctx.sleep, now: f.ctx.now };
         const first = await escalateNow(f.gh, "t", opts);
         assert.equal(first.escalated || first.ambiguous, true, label);
         const session = async () => deriveLoopSession([ANCHOR, ...(await readLoopEvents(f.gh, "t", "o", "r", 1, { botLogin: BOT }))]);
@@ -325,9 +322,9 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     };
     const clock = { sleep: async () => {}, now: () => T0 };
     const handoffOn = (pr: number) =>
-      escalateNow(gh as never, "t", { owner: "o", repo: "r", pr, head: HEAD, reason: "fix-failed", rounds: [], roundCap: 3, botLogin: BOT, sinceIso: START_AT, ...clock });
+      escalateNow(gh as never, "t", { owner: "o", repo: "r", pr, head: HEAD, reason: "fix-failed", rounds: [], roundCap: 3, botLogin: BOT, session: { at: START_AT }, ...clock });
     const journal = ownWrites(gh);
-    const handoffKey = (pr: number) => controlKey({ kind: "handoff", ref: ref(pr), head: HEAD, sessionIso: START_AT });
+    const handoffKey = (pr: number) => controlKey({ kind: "handoff", ref: ref(pr), head: HEAD, session: { at: START_AT } });
 
     assert.equal((await handoffOn(1)).ambiguous, true, "PR 1: the handoff's outcome is unknown");
     // PR 2: a stop that ends an active session (its record is the session's last control write)
@@ -421,6 +418,174 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
           assert.equal(f.posts(), 1, `${label}: one POST`);
         }
       }
+    }
+  });
+});
+
+describe("session identity: one continuation and one handoff per head per SESSION — its start record's id, or its marker until the id is known (#79 K1)", () => {
+  const START = "2026-02-20T00:00:00Z"; // alice's and bob's start directives: the same second
+  const PUSHED = "b".repeat(40);
+  const bot = { authoredByBot: true };
+  const continuation = (session: SessionRef): ControlWrite => ({
+    key: { kind: "continue", ref: ref(), head: HEAD, session },
+    body: continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD }),
+  });
+  const escalateIn = (f: ReturnType<typeof world>, session: SessionRef) =>
+    escalateNow(f.gh, "t", { owner: "o", repo: "r", pr: 1, head: HEAD, reason: "fix-failed", rounds: [], roundCap: 3, botLogin: BOT, session, sleep: f.ctx.sleep, now: f.ctx.now });
+  /** A start record stored by the fake (ids grow with creation): its id names its session. */
+  const recordStart = (f: ReturnType<typeof world>, by: string, mode: "suggest" | "apply"): number => {
+    const row = { id: f.rows.length + 1, userLogin: BOT, body: startComment({ mode, by, at: START }), createdAt: START };
+    f.rows.push(row);
+    return row.id;
+  };
+
+  it("two starts in one second: session B's continuation and handoff each get their own single POST beside A's posted or unknown one", async () => {
+    for (const aStart of ["listed", "id-less"] as const) {
+      for (const prior of ["posted", "unknown"] as const) {
+        const label = `A ${aStart} | A's writes ${prior}`;
+        // A's continuation and handoff are the first two POSTs; every later one succeeds
+        const f = world(prior === "posted" ? ["ok"] : ["lost", "lost", "ok"]);
+        const aliceSeq = aStart === "listed" ? recordStart(f, "alice", "suggest") : undefined;
+        const A: SessionRef = { at: START, by: "alice", mode: "suggest", ...(aliceSeq !== undefined ? { seq: aliceSeq } : {}) };
+        assert.equal((await emitControl(f.ctx, continuation(A))).status, prior === "posted" ? "posted" : "unknown", label);
+        const aHandoff = await escalateIn(f, A);
+        assert.equal(prior === "posted" ? aHandoff.escalated : aHandoff.ambiguous, true, `${label}: ${JSON.stringify(aHandoff)}`);
+        assert.equal(f.posts(), 2, label);
+        // bob's start in the same second, recorded after A's writes: a new session, same instant
+        const B: SessionRef = { at: START, seq: recordStart(f, "bob", "apply"), by: "bob", mode: "apply" };
+        assert.deepEqual(await emitControl(f.ctx, continuation(B)), { status: "posted" }, `${label}: B's continuation`);
+        assert.deepEqual(await escalateIn(f, B), { escalated: true }, `${label}: B's handoff`);
+        assert.equal(f.posts(), 4, `${label}: one POST each for B`);
+        assert.deepEqual(await emitControl(f.ctx, continuation(B)), { status: "exists" }, `${label}: B's continuation again`);
+        assert.deepEqual(await escalateIn(f, B), { escalated: false }, `${label}: B's handoff again`);
+        // A's own entries still answer for A (a later row may confirm A's unknown one: its scope
+        // is "after A's start")
+        assert.notEqual((await emitControl(f.ctx, continuation(A))).status, "posted", `${label}: A's continuation again`);
+        assert.equal((await escalateIn(f, A)).escalated, false, `${label}: A's handoff again`);
+        assert.equal(f.posts(), 4, `${label}: no second POST for either session`);
+      }
+    }
+  });
+
+  it("a session that learns its start record's id between two emits keeps its one entry: no second POST", async () => {
+    for (const kind of ["continue", "handoff"] as const) {
+      for (const plan of ["ok", "landed", "lost"] as const) {
+        const label = `${kind} | ${plan}`;
+        const f = world([plan]);
+        f.w.hidden = true; // the write's row is never listed here: only the journal answers
+        const idless: SessionRef = { at: START, by: "alice", mode: "suggest" };
+        const listed: SessionRef = { ...idless, seq: recordStart(f, "alice", "suggest") };
+        const expected = plan === "ok" ? "posted" : "unknown";
+        const again = plan === "ok" ? "exists" : "unknown";
+        const emit = async (session: SessionRef): Promise<string> => {
+          if (kind === "continue") return (await emitControl(f.ctx, continuation(session))).status;
+          const r = await escalateIn(f, session);
+          return r.escalated ? "posted" : r.ambiguous ? "unknown" : r.error ? `error: ${r.error}` : "exists";
+        };
+        assert.equal(await emit(idless), expected, `${label}: while the start has no id`);
+        assert.equal(await emit(listed), again, `${label}: once the start is listed`);
+        assert.equal(await emit(idless), again, `${label}: named by its marker again`);
+        assert.equal(f.posts(), 1, `${label}: one POST`);
+        const key = controlKey(kind === "continue" ? continuation(listed).key : handoff(1, listed).key);
+        assert.equal(ownWrites(f.gh).state(key), plan === "ok" ? "posted" : "unknown", `${label}: the entry moved to the id-bearing key`);
+        assert.equal(ownWrites(f.gh).stats().entries, 1, `${label}: one entry`);
+      }
+    }
+  });
+
+  it("an emit that names the session only by its marker keeps the entry's id scope: an older session's row never answers for it", async () => {
+    const f = world(["lost"]);
+    const listed: SessionRef = { at: START, by: "alice", mode: "suggest", seq: 5 };
+    assert.equal((await emitControl(f.ctx, continuation(listed))).status, "unknown");
+    // the last session's continuation for the head: posted after alice's directive but before her
+    // start record (id 3 < 5), so it is in her session by time and not by id
+    f.rows.push({ id: 3, userLogin: BOT, body: continuation(listed).body as string, createdAt: "2026-02-20T00:00:01Z" });
+    const { seq: _seq, ...marker } = listed;
+    assert.equal((await emitControl(f.ctx, continuation(marker))).status, "unknown", "the older row never confirms this session's write");
+    assert.equal((await emitControl(f.ctx, continuation(listed))).status, "unknown");
+    assert.equal(f.posts(), 1);
+  });
+
+  /** One PR through the runtime's push handler: `script` decides each POST ("ok"; "landed" = stored,
+   * then unknown; "lost" = unknown, nothing stored); `view.shown` is what the list returns. */
+  function pushWorld(script: (body: string) => "ok" | "landed" | "lost") {
+    let clock = T0;
+    const rows: ControlRow[] = [];
+    const posts: string[] = [];
+    const view = { shown: (_id: number) => true };
+    const gh = {
+      async listIssueComments() {
+        return rows.filter((r) => view.shown(r.id ?? 0)).map((r) => ({ ...r }));
+      },
+      async listReviewComments() {
+        return [];
+      },
+      async listPullReviews() {
+        return [];
+      },
+      async fetchPullHeadRef() {
+        return { ref: "feature", sha: PUSHED, fork: false, sameRepo: true };
+      },
+      async createIssueComment(_t: string, o: { body: string }) {
+        posts.push(o.body);
+        clock += 1_000;
+        const step = script(o.body);
+        if (step === "lost") throw unknownErr();
+        const row = { id: rows.length + 1, userLogin: BOT, body: o.body, createdAt: new Date(clock).toISOString() };
+        rows.push(row);
+        if (step === "landed") throw unknownErr();
+        return { ...row };
+      },
+    };
+    const deps = { gh, requestFix: async () => "", validate: async () => ({ ok: true }), sleep: async (ms: number) => void (clock += ms), now: () => clock } as unknown as LoopRuntimeDeps;
+    const settings: BotSettings = { ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode: "suggest", parallelPrs: 3 } };
+    const env = { ASHLAR_FIX_AGENT: "1" } as NodeJS.ProcessEnv;
+    return {
+      gh,
+      rows,
+      view,
+      start: (actor: string, mode: "suggest" | "apply") => startLoop("t", { owner: "o", repo: "r", pr: 1, actor, mode, at: START }, settings, deps, env),
+      push: () => continueLoopOnPush("t", { owner: "o", repo: "r", pr: 1, headSha: PUSHED, actor: "alice" }, settings, deps, env),
+      session: () => readLoopSession(gh, "t", "o", "r", 1, { botLogin: BOT }),
+      continuations: () => posts.filter((b) => canonicalContinuation(b, bot)?.head === PUSHED).length,
+    };
+  }
+
+  it("push handler: a session whose start record is listed only after its continuation was sent requests that review once", async () => {
+    for (const cont of ["ok", "lost"] as const) {
+      // alice's start record lands but its response is lost, and the list lags behind it
+      const f = pushWorld((body) => (parseStartMarker(body, bot) ? "landed" : cont));
+      f.view.shown = () => false;
+      assert.equal((await f.start("alice", "suggest")).unresolved, true, cont);
+      assert.equal((await f.session()).startSeq, undefined, `${cont}: the session has no start id yet`);
+      const first = await f.push();
+      assert.equal(first.posted || first.unresolved, true, `${cont}: ${JSON.stringify(first)}`);
+      f.view.shown = (id) => id === 1; // the start record is listed; the continuation still lags
+      assert.equal((await f.session()).startSeq, 1, `${cont}: the session learned its start id`);
+      const again = await f.push();
+      assert.equal(again.reason.startsWith(cont === "ok" ? "already continued" : "continuation outcome unknown"), true, `${cont}: ${JSON.stringify(again)}`);
+      assert.equal(f.continuations(), 1, `${cont}: one continuation POST`);
+    }
+  });
+
+  it("push handler: a start in the same second as an id-less one opens a session that gets its own continuation, once", async () => {
+    for (const cont of ["ok", "lost"] as const) {
+      let continuations = 0;
+      // alice's start record is lost; her session's continuation `cont`; everything later lands
+      const f = pushWorld((body) => {
+        const start = parseStartMarker(body, bot);
+        if (start) return start.by === "alice" ? "lost" : "ok";
+        return continuations++ === 0 ? cont : "ok";
+      });
+      assert.equal((await f.start("alice", "suggest")).unresolved, true, cont);
+      const first = await f.push();
+      assert.equal(first.posted || first.unresolved, true, `${cont}: ${JSON.stringify(first)}`);
+      assert.deepEqual(await f.start("bob", "apply"), { posted: true, reason: "started" }, cont);
+      const s = await f.session();
+      assert.deepEqual([s.active, isoMs(s.startIso), s.startBy, s.startSeq], [true, isoMs(START), "bob", f.rows.length], `${cont}: bob's session, in the same second`);
+      assert.deepEqual(await f.push(), { posted: true, reason: "continued" }, `${cont}: bob's session requests its own review`);
+      assert.deepEqual(await f.push(), { posted: false, reason: "already continued" }, cont);
+      assert.equal(f.continuations(), 2, `${cont}: one continuation POST per session`);
     }
   });
 });

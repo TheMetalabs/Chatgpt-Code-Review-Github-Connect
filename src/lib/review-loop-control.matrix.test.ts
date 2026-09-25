@@ -298,18 +298,19 @@ class World {
     }
   }
 
-  /** The journal key of the write under test. */
+  /** The journal key of the write under test (alice's session: her start record is row 1). */
   key(): string {
     const ref = this.ref;
+    const session = { at: ALICE_AT, seq: 1, by: "alice", mode: this.mode() };
     switch (kindOf(this.cell.via)) {
       case "start":
         return controlKey({ kind: "start", ref, by: "alice", at: ALICE_AT, mode: "suggest" });
       case "stop":
         return controlKey({ kind: "stop", ref, by: "bob", at: iso(T0) });
       case "continue":
-        return controlKey({ kind: "continue", ref, head: CONTINUE_HEAD[this.cell.via]!, sessionIso: ALICE_AT });
+        return controlKey({ kind: "continue", ref, head: CONTINUE_HEAD[this.cell.via]!, session });
       case "handoff":
-        return controlKey({ kind: "handoff", ref, head: HANDOFF_HEAD[this.cell.via]!, sessionIso: ALICE_AT });
+        return controlKey({ kind: "handoff", ref, head: HANDOFF_HEAD[this.cell.via]!, session });
     }
   }
 

@@ -11,6 +11,7 @@ import {
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
 import { continueComment, startComment, stoppedComment } from "./review-loop.ts";
+import { sessionRef } from "./review-loop-session.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 
@@ -147,7 +148,7 @@ describe("maybeEscalate — provenance, session boundary, fail-closed (round-1 f
     };
     const all = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "new0000", roundCap: 8 });
     assert.equal(all.rounds.length, 2);
-    const scoped = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "new0000", roundCap: 8, sinceIso: "2026-05-01T00:00:00Z" });
+    const scoped = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "new0000", roundCap: 8, session: { at: "2026-05-01T00:00:00Z" } });
     assert.equal(scoped.rounds.length, 1, "only the in-session review counts");
   });
 
@@ -332,12 +333,12 @@ describe("escalateNow: one handoff per head per session, even when the history i
       async listIssueComments(): Promise<Array<{ userLogin: string; body: string }>> { throw new Error("502"); },
       async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
     };
-    const opts = { owner: "o", repo: "r", pr: 9, head: "e".repeat(40), reason: "fix-failed" as const, detail: "x", rounds: [], roundCap: 5, sinceIso: "2026-01-01T00:00:00Z" };
+    const opts = { owner: "o", repo: "r", pr: 9, head: "e".repeat(40), reason: "fix-failed" as const, detail: "x", rounds: [], roundCap: 5, session: { at: "2026-01-01T00:00:00Z" } };
     assert.equal((await escalateNow(gh as never, "t", opts)).escalated, true);
     assert.equal((await escalateNow(gh as never, "t", opts)).escalated, false);
     assert.equal(posted.length, 1);
     // a NEW session (a later anchor) on the same head may hand off again
-    assert.equal((await escalateNow(gh as never, "t", { ...opts, sinceIso: "2026-02-01T00:00:00Z" })).escalated, true);
+    assert.equal((await escalateNow(gh as never, "t", { ...opts, session: { at: "2026-02-01T00:00:00Z" } })).escalated, true);
     assert.equal(posted.length, 2);
     void bot;
   });
@@ -444,7 +445,7 @@ describe("round-3: instants, not strings; the trailing findings marker only", ()
     const marker = `<!-- ashlar-loop-escalate reason=fix-failed round=1 pr=1 head=${A} -->`;
     const { gh, posted } = fakeGh([], []);
     gh.listIssueComments = async () => [{ userLogin: BOT, body: marker, createdAt: "2026-01-01T00:00:00Z" }];
-    const r = await escalateNow(gh, "t", { owner: "o", repo: "r", pr: 1, head: A, reason: "fix-failed", rounds: [], roundCap: 5, sinceIso: "2026-01-01T00:00:00.500Z" });
+    const r = await escalateNow(gh, "t", { owner: "o", repo: "r", pr: 1, head: A, reason: "fix-failed", rounds: [], roundCap: 5, session: { at: "2026-01-01T00:00:00.500Z" } });
     assert.equal(r.escalated, true, "the pre-session handoff is out of scope");
     assert.equal(posted.length, 1);
   });
@@ -490,7 +491,7 @@ describe("round-5: exact session scoping and read-after-write lag", () => {
     const session = await readLoopSession(gh as never, "t", "o", "r", 1);
     assert.equal(session.active, true);
     assert.equal(session.startSeq, 11);
-    const r = await escalateNow(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed", rounds: [], roundCap: 5, sinceIso: session.startIso, sinceSeq: session.startSeq });
+    const r = await escalateNow(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed", rounds: [], roundCap: 5, session: sessionRef(session) });
     assert.equal(r.escalated, true, "B gets its own handoff");
     assert.equal(posted.length, 1);
   });
@@ -510,7 +511,7 @@ describe("round-5: exact session scoping and read-after-write lag", () => {
 
   it("a just-posted handoff counts while a readable list still omits it (no duplicate)", async () => {
     const { gh, posted } = client([]); // the list never shows what was posted
-    const opts = { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed" as const, rounds: [], roundCap: 5, sinceIso: T, sinceSeq: 11 };
+    const opts = { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed" as const, rounds: [], roundCap: 5, session: { at: T, seq: 11 } };
     assert.equal((await escalateNow(gh as never, "t", opts)).escalated, true);
     assert.equal((await escalateNow(gh as never, "t", opts)).escalated, false);
     assert.equal(posted.length, 1);
@@ -538,7 +539,7 @@ describe("round-6: both handoff paths share the control-write journal", () => {
       async listIssueComments() { return []; }, // never catches up
       async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
     };
-    const opts = { owner: "o", repo: "r", pr: 3, head: H, roundCap: 5, sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
+    const opts = { owner: "o", repo: "r", pr: 3, head: H, roundCap: 5, session: { at: "2026-01-01T00:00:00Z", seq: 1 } };
     assert.equal((await maybeEscalate(gh as never, "t", opts)).escalated, true);
     const again = await maybeEscalate(gh as never, "t", opts);
     assert.equal(again.escalated, false);
@@ -559,7 +560,7 @@ describe("round-6: the two handoff paths see each other's just-posted handoff", 
     };
     return { gh, posted };
   };
-  const session = { sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
+  const session = { session: { at: "2026-01-01T00:00:00Z", seq: 1 } };
 
   it("escalateNow first, then maybeEscalate: one handoff", async () => {
     const { gh, posted } = stuck();
@@ -579,7 +580,7 @@ describe("round-6: the two handoff paths see each other's just-posted handoff", 
 
 describe("terminal handoffs retry a transient POST failure (a handoff has no other poster)", () => {
   const H = "e".repeat(40);
-  const session = { sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
+  const session = { session: { at: "2026-01-01T00:00:00Z", seq: 1 } };
   /** `plan[i]`: attempt i "ok", "fail" (GitHub rejected it), "lost" (accepted, response lost), or
    * "unknown" (accepted, then a GithubWriteError with outcome unknown — e.g. a 502 after creation). */
   const flaky = (plan: Array<"ok" | "fail" | "lost" | "unknown">, stuck = false, stale = false) => {

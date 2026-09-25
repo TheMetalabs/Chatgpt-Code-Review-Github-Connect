@@ -556,7 +556,10 @@ async function refreshTabInventory() {
   for(const id of tabEpochs.keys())if(!live.has(id) && !inventoryLanes.has(id)){tabEpochs.delete(id);inventoryUpgrades.delete(id);}
   for(const tab of tabs) {
     const provider=["chatgpt","grok"].find(p=>allowedTab(tab,p));
-    if(!provider || tab.status === "loading" || tab.pendingUrl || inventoryLanes.has(tab.id))continue;
+    // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws: a probe
+    // would only time out (erasing the owner read there while it ran) and every refresh would queue
+    // another. Its page cannot change while it is frozen, so what was read there stands.
+    if(!provider || tab.status === "loading" || tab.pendingUrl || tab.frozen === true || inventoryLanes.has(tab.id))continue;
     const epoch=tabEpochs.get(tab.id) || 0;
     void singleFlight(inventoryLanes,tab.id,async()=>{
       let result=await askPage(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));

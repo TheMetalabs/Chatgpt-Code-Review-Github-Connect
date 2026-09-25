@@ -58,8 +58,8 @@ async function run(kind, start, events) {
   const realSend = b.chrome.tabs.sendMessage;
   b.chrome.tabs.sendMessage = (id, msg, cb) => {
     const t = b.tabs.get(id);
-    // A frozen page runs no handler: only the read-only inventory probe (bounded) may be sent to it.
-    if (t?.frozen && msg.type !== 'ashlar-tab-status') w.frozenMessaged = true;
+    // A frozen page runs no handler: nothing is sent to it (not even the read-only inventory probe).
+    if (t?.frozen) w.frozenMessaged = true;
     if (t && (w.mode === 'hang' || t.frozen)) { b.messages.push({id, ...msg}); return; } // accepted, never answered
     // a discarded tab holds no page: nothing answers and nothing can be injected
     if (t && (w.mode === 'noReceiver' || t.discarded)) { b.messages.push({id, ...msg}); b.chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'}; cb(); b.chrome.runtime.lastError = null; return; }
@@ -191,6 +191,43 @@ test('an inventory probe of a page that never answers ends, so the tab is probed
   assert.ok(await until(() => vm.runInContext('inventoryLanes.size', b.context) === 0), 'the unanswered probe ended');
   await b.context.refreshTabInventory();
   assert.equal(b.messages.filter(m => m.type === 'ashlar-tab-status').length, 2, 'the unanswered probe released its lane');
+});
+// A frozen tab (energy saver, a collapsed tab group) is not probed by the inventory: a probe would
+// only time out, erasing the owner read there while it ran (the user's own frozen tabs then took
+// every review slot as unverified), and each refresh would queue another unanswered message.
+function frozenUserTabs(ids) {
+  const tabs = new Map(ids.map(id => [id, {id, url: `https://chatgpt.com/c/users-own-${id}`, status: 'complete'}]));
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {}}), tabs});
+  b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+  b.chrome.tabs.sendMessage = (id, msg, cb) => {
+    b.messages.push({id, ...msg});
+    if (tabs.get(id)?.frozen) return; // accepted, never answered
+    cb({ok: true, ownershipProtocol: 1, jobId: '', runId: '', provider: 'chatgpt', released: false, url: tabs.get(id).url});
+  };
+  b.context.pageReplyDeadline = expiresAtOnce;
+  b.refresh = async () => { await b.context.refreshTabInventory(); return until(() => vm.runInContext('inventoryLanes.size', b.context) === 0); };
+  return b;
+}
+test('the user\'s own tabs read as unbound keep that reading while frozen: they take no review capacity', async () => {
+  const b = frozenUserTabs([50, 51, 52, 53]);
+  assert.ok(await b.refresh());
+  const before = await b.context.tabCapacityReport({});
+  assert.deepEqual([before.used, before.available], [0, 4], 'read as the user\'s own');
+  for (const tab of b.tabs.values()) tab.frozen = true;
+  for (let i = 0; i < 3; i++) assert.ok(await b.refresh());
+  const after = await b.context.tabCapacityReport({});
+  assert.deepEqual([after.used, after.unknownReserved, after.available], [0, 0, 4], 'frozen user tabs leave every slot available');
+});
+test('a frozen tab is not probed by the inventory, and is probed again once it thaws', async () => {
+  const b = frozenUserTabs([50]);
+  b.tabs.get(50).frozen = true;
+  const probes = () => b.messages.filter(m => m.id === 50 && m.type === 'ashlar-tab-status').length;
+  for (let i = 0; i < 10; i++) assert.ok(await b.refresh());
+  assert.equal(probes(), 0, 'no unanswered probe piles up on a frozen tab');
+  b.tabs.get(50).frozen = false;
+  assert.ok(await b.refresh());
+  assert.equal(probes(), 1, 'probed once it can answer');
+  assert.equal((await b.context.tabCapacityReport({})).available, 4);
 });
 
 // The poll never asks a page that cannot run a handler: a frozen tab until it thaws, a discarded one

@@ -337,6 +337,7 @@ test('the scan reads extension scripts below the top level, keyed by their path'
   write('runtime/lease.js', '\nworkerStep(job, provider, "lease_nested_unlabelled");');
   write('runtime/page/steps.mjs', 'recordReviewStep(pageStage);');
   write('runtime/notes.txt', 'workerStep(job, provider, "not_a_script");');
+  mkdirSync(join(dir, 'runtime/vendor.js'));
   const files = extensionFiles(dir);
   assert.deepEqual(Object.keys(files), ['background.js', 'runtime/lease.js', 'runtime/page/steps.mjs']);
   const {stages, problems} = guardedStages(files);
@@ -457,6 +458,8 @@ test('a recorder call is found in the tokens: a // in a regex or a comment befor
   assert.deepEqual(read('function probe(job, provider, url) { if (/^https:\\/\\/chatgpt\\.com\\//.test(url)) workerStep(job, provider, "after_regex"); }'),
     {literals: ['after_regex'], problems: []}, 'a // inside a regex literal is not a comment');
   assert.deepEqual(read('workerStep /* why */ (job, provider, "after_comment");'), {literals: ['after_comment'], problems: []});
+  assert.deepEqual(read('if (/[/]/.test(url)) workerStep(job, provider, "after_class");'), {literals: ['after_class'], problems: []},
+    'a / inside a regex character class does not end the regex');
   assert.deepEqual(read('globalThis.recordReviewStep?.("optional_call");'), {literals: ['optional_call'], problems: []}, 'name?.(...) is a call');
   assert.deepEqual(read('workerSt\\u0065p(job, provider, "escaped_name");'), {literals: ['escaped_name'], problems: []});
   assert.deepEqual(read('const doc = "workerStep(job, provider, stage)";'), {literals: [], problems: []}, 'a call in a string is none');
@@ -473,6 +476,7 @@ test('a recorder is reached only by its calls: a recorder used as a value, an al
     ['workerStep.call(null, job, provider, "unlabelled_call");', 1, 'workerStep'],
     ['\nworkerStep.apply(null, [job, provider, "unlabelled_apply"]);', 2, 'workerStep'],
     ['globalThis.recordReviewStep = stage => post(stage);', 1, 'recordReviewStep'],
+    ['function pick() {\n  return step;\n}', 2, 'step'],
   ]) assert.deepEqual(problems(text), [value(line, name)], text);
   // A method named after a recorder: its parentheses bind `stage`, so step() no longer forwards, and
   // passing the method on is a use as a value.
@@ -508,9 +512,12 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
     // `++` and `--` are one operator: the `/` after them divides, so it does not hide the assignment.
     forwarding('n = i++ / 2; stage = computeStage(); m = n / 2;\n  recordReviewStep(stage);'),
     forwarding('n = i-- / 2; stage = computeStage(); m = n / 2;\n  recordReviewStep(stage);'),
+    // After a call's parentheses (not an if, while, for or with head) a `/` divides too.
+    forwarding('n = f(a) / 2; stage = computeStage(); m = n / 2;\n  recordReviewStep(stage);'),
     // An escape in an identifier spells the same name.
     forwarding('st\\u0061ge = computeStage();\n  recordReviewStep(stage);'),
     forwarding('st\\u{61}ge = computeStage();\n  recordReviewStep(stage);'),
+    forwarding('\\u0073tage = computeStage();\n  recordReviewStep(stage);'),
     forwarding('var stage = row.stage;\n  recordReviewStep(stage);'),
     forwarding('log(`${stage = computeStage()}`);\n  recordReviewStep(stage);'),
     forwarding('arguments[0] = computeStage();\n  recordReviewStep(stage);'),
@@ -533,6 +540,10 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
     assert.equal(found.length, 1, `${text}\n: the forwarded stage is a problem, not a silent pass`);
     assert.match(found[0], /recordReviewStep\(\): stage `stage` is not a literal/);
   }
+  // Only a call inside the forwarder's body forwards its parameter: one before or after it is checked.
+  const outside = 'fixture.js:%s recordReviewStep(): stage `stage` is not a literal, so its value cannot be checked for a label';
+  assert.deepEqual(problems('function step(stage) {\n  recordReviewStep(stage);\n}\nrecordReviewStep(stage);'), [outside.replace('%s', 4)]);
+  assert.deepEqual(problems('recordReviewStep(stage);\nfunction step(stage) {\n  recordReviewStep(stage);\n}'), [outside.replace('%s', 1)]);
   // A forwarded stage is the whole stage argument: `stage = computeStage()` starts with the name and
   // reassigns it, so the call after it does not forward either.
   assert.deepEqual(problems(forwarding('recordReviewStep(stage = computeStage());\n  recordReviewStep(stage);')), [

@@ -111,6 +111,9 @@ function fakeDeps(
     liveSha?: string;
     movedDuringFix?: boolean;
     refMovedAtWrite?: boolean;
+    // the first N reads of the PR head after an applied round's commit still show its parent
+    // (GitHub syncs a PR's head.sha after a ref update); Infinity: no read of the call catches up
+    lagHeadReads?: number;
     commitSha?: string;
     lastHead?: string; // head of the latest reconstructed round (default: the reviewed HEAD)
     additions?: number;
@@ -137,6 +140,7 @@ function fakeDeps(
   let replyAttempts = 0;
   let sleeps = 0;
   let clock = 0;
+  let laggedHeadReads = 0;
   const start = opts.start === undefined ? "suggest" : opts.start;
   const issues: IssueRow[] = [
     ...(start ? [recorded(start, "alice", START_AT)] : []),
@@ -182,8 +186,10 @@ function fakeDeps(
       },
       async fetchPullHeadRef() {
         // movedDuringFix: the head moves once the fix request was sent (a push during the fix);
-        // an applied round's commit is the head from then on
-        const sha = committed ? (opts.commitSha ?? NEW_SHA) : moved || (opts.movedDuringFix && prompts.length > 0) ? MOVED : (opts.liveSha ?? HEAD);
+        // an applied round's commit is the head from then on — once a read has caught up with it
+        const lags = committed && laggedHeadReads < (opts.lagHeadReads ?? 0);
+        if (lags) laggedHeadReads += 1;
+        const sha = committed && !lags ? (opts.commitSha ?? NEW_SHA) : moved || (opts.movedDuringFix && prompts.length > 0) ? MOVED : (opts.liveSha ?? HEAD);
         return {
           ref: "feature",
           sha,
@@ -257,6 +263,9 @@ function fakeDeps(
     },
     get replyAttempts() {
       return replyAttempts;
+    },
+    get laggedHeadReads() {
+      return laggedHeadReads;
     },
     get sleeps() {
       return sleeps;
@@ -511,6 +520,23 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.ok(f.posted[2].includes(NEW_SHA));
     assert.match(f.posted[2], /Loop continues/);
     assert.ok(!f.posted.some((b) => /@ashlar/i.test(b)), "no bot @-mention posted");
+  });
+
+  it("the App's own commit is no moved head: a read of the PR head that still shows its parent (GitHub syncs it after the ref update) keeps the continuation owed", async () => {
+    // one lagging read (the continuation's own decision), or none that catches up in the call —
+    // a fake that never moves the head on the commit
+    for (const lagHeadReads of [1, Infinity]) {
+      const f = fakeDeps({ start: "apply", rounds: [3], lagHeadReads });
+      const r = await run(f, "apply");
+      assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.continued === true, `${lagHeadReads}: ${JSON.stringify(r)}`);
+      assert.ok(f.laggedHeadReads >= 1, `${lagHeadReads}: a read after the commit showed its parent`);
+      const continuations = f.posted.map((b) => parseContinueMarker(b, { authoredByBot: true })).filter((c) => c !== null);
+      assert.deepEqual(continuations, [{ mode: "apply", round: 2, pr: 7, head: NEW_SHA }], `${lagHeadReads}: the commit's review is requested once`);
+      const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+      assert.match(report, /Loop continues/, `${lagHeadReads}: the report`);
+      assert.ok(!/head moved/i.test(report), `${lagHeadReads}: the report says the head moved`);
+      assert.equal(escalations(f.posted).length, 0, `${lagHeadReads}: no handoff`);
+    }
   });
 
   it("a retryable failure is retried with the rejection fed back, then succeeds", async () => {

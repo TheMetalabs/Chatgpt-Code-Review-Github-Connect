@@ -512,15 +512,23 @@ function sessionMoot(gh: object, ref: PrRef, now: LoopSession, session: SessionR
  * this process's own writes, and `extra`: the caller's known events, e.g. a push). Moot when the
  * session no longer runs — or, given `head` (a continuation's), when the PR head moved off it: the
  * live head's own request drives the loop. A failed read throws (that attempt is not sent).
+ *
+ * `parent`: `head` is the App's OWN commit on that parent. GitHub updates a PR's head (the pull's
+ * head.sha) asynchronously after a ref update — the same background sync that later sends
+ * `synchronize` — so a read right after the commit can still show the parent. That read is no move
+ * (the commit is the head, not yet synced): the session decides, on the commit. Only a head that is
+ * neither supersedes the continuation. (A human force-push back to the parent is its own push: its
+ * handler requests that head's review, and harbor supersedes this commit's.)
  */
 async function freshMoot(
   gh: LoopRuntimeGithub,
   token: string,
   ref: PrRef,
   botLogin: string,
-  o: { session: SessionRef; head?: string; extra?: LoopEvent[] },
+  o: { session: SessionRef; head?: string; parent?: string; extra?: LoopEvent[] },
 ): Promise<Moot | null> {
-  const live = await gh.fetchPullHeadRef(token, ref.owner, ref.repo, ref.pr);
+  let live = await gh.fetchPullHeadRef(token, ref.owner, ref.repo, ref.pr);
+  if (o.head !== undefined && o.parent !== undefined && live.sha === o.parent) live = { ...live, sha: o.head };
   if (o.head !== undefined && live.sha !== o.head) return "head";
   return sessionMoot(gh, ref, await sessionOf(gh, token, ref, live, botLogin, o.extra), o.session);
 }
@@ -662,15 +670,16 @@ function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullH
  * unreadable ROUND history fails toward posting (a duplicate request is only superseded by harbor,
  * a missing one would stall the loop); a POST that may have landed is never sent again. Each POST
  * attempt is decided by a fresh read (freshMoot, `extra` included): superseded once the session no
- * longer runs or the PR head moved off `head`, and not sent when that read fails. The decision is
- * lazy — the round is computed only for a real POST — so the gate is reached with no await (the
- * single-flight join point). Never throws.
+ * longer runs or the PR head moved off `head` (for the App's own commit, `parent`: a read still
+ * showing its parent is no move), and not sent when that read fails. The decision is lazy — the
+ * round is computed only for a real POST — so the gate is reached with no await (the single-flight
+ * join point). Never throws.
  */
 function ensureContinuation(
   ctl: EmitContext,
   gh: LoopRuntimeGithub,
   ref: PrRef,
-  c: { head: string; mode: ReviewLoopMode; session: SessionRef; round?: number; extra?: LoopEvent[] },
+  c: { head: string; parent?: string; mode: ReviewLoopMode; session: SessionRef; round?: number; extra?: LoopEvent[] },
 ): Promise<EmitOutcome> {
   if (!FULL_SHA_RE.test(c.head)) return Promise.resolve({ status: "rejected", error: "the head is not a full commit SHA" });
   const decide = async (): Promise<Decision> => {
@@ -1107,7 +1116,8 @@ export async function runPostReviewLoop(
       const newHead = done.commitSha && FULL_SHA_RE.test(done.commitSha) ? done.commitSha : undefined;
       // Our own commit moved the head, so only the SESSION decides here (an unreadable one does
       // not end the round: the continuation's own decision reads it again, and sends nothing
-      // undecided).
+      // undecided) — also in that decision, whose head read may still show the commit's parent
+      // (GitHub syncs a PR's head after the ref update: `parent`, see freshMoot).
       const now = await sessionOf(gh, token, ref, newHead ? { ...head, sha: newHead } : head, botLogin).catch(() => null);
       const gone = now ? sessionMoot(gh, ref, now, current) : null;
       let status: ContinuationStatus;
@@ -1118,7 +1128,7 @@ export async function runPostReviewLoop(
       } else {
         // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
         // budget — the round-cap handoff.
-        const c = await ensureContinuation(ctl, gh, ref, { head: newHead, mode, session: current, round: rounds.length + 1 });
+        const c = await ensureContinuation(ctl, gh, ref, { head: newHead, parent: headSha, mode, session: current, round: rounds.length + 1 });
         if (c.status === "unknown") trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
         status = continuationStatus(c);
       }

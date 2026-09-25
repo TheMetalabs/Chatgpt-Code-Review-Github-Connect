@@ -31,6 +31,10 @@
  *      no event (an unknown retry's stand-in neither), no journal entry, and the newer session
  *      runs on; a stop's retry takes the record form its own read decides (I8); a retry that
  *      cannot read the session is not sent at all.
+ *  I10 the App's own commit is no moved head — × how the step's reads of the PR head follow its
+ *      commit (GitHub syncs a PR's head after a ref update): synced, the first read still shows
+ *      the parent, or no read of the call catches up. The commit's continuation is decided owed
+ *      and POSTed, and the report never says the head moved (unless a human push really moved it).
  * One table instead of one test per bug: each review round found another cell of this space.
  */
 import { describe, it } from "node:test";
@@ -145,8 +149,25 @@ type Between = "nothing" | "stop+new-start" | "new-start-only" | "head-moved";
  * read of the session is older than that wait); the write's result then applies from its first
  * POST. */
 type BetweenAt = "retry" | "first";
+/** How the step's reads of the PR head follow its own commit (I10): GitHub updates a pull's head
+ * asynchronously after a ref update (the sync that later sends `synchronize`), so a read right
+ * after the commit may still show its parent — the first read only, or every read of the call. */
+type HeadRead = "synced" | "lags-one" | "lags-call";
 type Phase = "call" | "view" | "again" | "follow";
-type Cell = { via: Via; write: Write; shape: Shape; stamp: Stamp; list: List; later: Later; anchor: Anchor; peer: Peer; prior: Prior; between: Between; betweenAt: BetweenAt };
+type Cell = {
+  via: Via;
+  write: Write;
+  shape: Shape;
+  stamp: Stamp;
+  list: List;
+  later: Later;
+  anchor: Anchor;
+  peer: Peer;
+  prior: Prior;
+  between: Between;
+  betweenAt: BetweenAt;
+  headRead: HeadRead;
+};
 type Result = ControlResult | LoopStepResult;
 /** posted / exists / unknown / rejected as the entry point reports it; `ran` a step that ran
  * (the self-heal); `resolved` a step result that needs nothing more (posted and exists collapse). */
@@ -180,6 +201,7 @@ const ANCHORS: Anchor[] = ["listed", "lagging", "lost"];
 const PEERS: Peer[] = ["none", "before", "after"];
 const PRIORS: Prior[] = ["none", "stale-resume"];
 const BETWEENS: Between[] = ["nothing", "stop+new-start", "new-start-only", "head-moved"];
+const HEAD_READS: HeadRead[] = ["synced", "lags-one", "lags-call"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
@@ -206,6 +228,13 @@ const betweens = (via: Via): readonly Between[] => (decidedByRead(via) ? BETWEEN
 /** Where an event can come for this path: before the first attempt only where the path waits before
  * it (the stuck step's history re-reads). */
 const betweenAts = (via: Via, between: Between): readonly BetweenAt[] => (between !== "nothing" && via === "handoff:stuck" ? ["retry", "first"] : ["retry"]);
+/** The paths whose step commits (an applied round): its continuation, or the loop-error handoff after
+ * that continuation is refused. */
+const commits = (via: Via) => via === "continue:applied" || via === "handoff:post-commit";
+/** How the step's head reads follow its commit (I10), on the paths that commit — with the plain 2xx
+ * answer: how GitHub's answer is decoded does not depend on what a head read shows. */
+const headReads = (via: Via, write: Write, shape: Shape, stamp: Stamp): readonly HeadRead[] =>
+  commits(via) && shape === SHAPES[write][0] && stamp === "valid" ? HEAD_READS : ["synced"];
 
 /** What the write's retry is, decided after the event between its attempts (I9): still owed (sent,
  * with the cell's write result), superseded (never sent again), or undecided (the session could not
@@ -328,6 +357,12 @@ class World {
   private failing = false;
   /** The step's review is not in the history yet (a lagging list): before the first attempt. */
   private reviewLags = false;
+  /** The step's reads of the PR head since its commit (I10). */
+  private headReadsAfterCommit = 0;
+  /** Another caller's event runs (a stop, a start, a human push): its reads are not the step's. */
+  private inEvent = false;
+  /** The POSTs of a continuation GitHub always refuses (REFUSED_CONTINUATION). */
+  refusedContinuations = 0;
   private hook?: () => Promise<void>;
   readonly deps: LoopRuntimeDeps;
   readonly ref: { owner: string; repo: string; pr: number };
@@ -356,7 +391,7 @@ class World {
       listPullReviews: async () => (read(), this.history().map((r) => ({ userLogin: BOT, body: `<!-- ashlar-findings total=${r.total} -->`, commitId: r.head, submittedAt: r.at }))),
       listReviewComments: async () => (read(), this.history().map((r) => ({ userLogin: BOT, path: "src/a.ts", commitId: r.head, createdAt: r.at, body: "finding" }))),
       createIssueComment: async (_t, o) => this.create(o.body),
-      fetchPullHeadRef: async () => ({ ref: "feature", sha: this.live(), fork: false, sameRepo: true }),
+      fetchPullHeadRef: async (token) => ({ ref: "feature", sha: this.headRead(token), fork: false, sameRepo: true }),
       fetchUserPermission: async () => "write",
       listReviewThreadRoots: async () => [],
       replyToReviewComment: async () => {},
@@ -460,6 +495,21 @@ class World {
     }
   }
 
+  /** The PR head a read shows: the live one — except that the step's reads in the call (token "t",
+   * not another caller's event) may still show its commit's parent (I10). */
+  private headRead(token: string): string {
+    const live = this.live();
+    if (token !== "t" || this.inEvent || this.phase !== "call" || !this.committed || live !== NEW_SHA) return live;
+    switch (this.cell.headRead) {
+      case "synced":
+        return live;
+      case "lags-one":
+        return this.headReadsAfterCommit++ === 0 ? HEAD : live;
+      case "lags-call":
+        return HEAD;
+    }
+  }
+
   /** The journal key of the write under test (in the session its call read). */
   key(): string {
     const ref = this.ref;
@@ -515,7 +565,10 @@ class World {
     this.clock += 1_000; // GitHub stamps the row after the request left
     const at = this.sameSecond() ? second(sentAt) : iso(this.clock);
     const refused = REFUSED_CONTINUATION[this.cell.via];
-    if (refused && canonicalContinuation(body, { authoredByBot: true })?.head === refused) throw writeError("rejected", 422);
+    if (refused && canonicalContinuation(body, { authoredByBot: true })?.head === refused) {
+      this.refusedContinuations += 1;
+      throw writeError("rejected", 422);
+    }
     const start = parseStartMarker(body, { authoredByBot: true });
     if (start && sessionScoped(this.cell.via) && isoMs(start.at) === isoMs(ALICE_AT)) {
       // the session's start records: alice's follows the cell's anchor, bob's lands
@@ -581,8 +634,23 @@ class World {
     this.startsHidden = this.cell.anchor !== "listed";
   }
 
+  /** Another caller's event (its reads are its own, never the step's). */
+  private async event(run: () => Promise<void>): Promise<void> {
+    const outer = this.inEvent;
+    this.inEvent = true;
+    try {
+      await run();
+    } finally {
+      this.inEvent = outer;
+    }
+  }
+
   /** The cell's event between the write's refused first POST and its retry (I9). */
-  private async betweenAttempts(): Promise<void> {
+  private betweenAttempts(): Promise<void> {
+    return this.event(() => this.between());
+  }
+
+  private async between(): Promise<void> {
     switch (this.cell.between) {
       case "nothing":
         return;
@@ -609,8 +677,9 @@ class World {
     if (this.carolAt) return;
     // carol's directive time: now, or — same-second — the second the write under test left in
     // (her webhook is handled later, during the write's backoff or after the call)
-    this.carolAt = this.sameSecond() && this.firstAttemptMs !== undefined ? second(this.firstAttemptMs) : iso(this.clock);
-    await startLoop("t", { ...this.ref, actor: "carol", mode: "suggest", at: this.carolAt }, settings("suggest"), this.deps, ENV);
+    const at = this.sameSecond() && this.firstAttemptMs !== undefined ? second(this.firstAttemptMs) : iso(this.clock);
+    this.carolAt = at;
+    await this.event(async () => void (await startLoop("t", { ...this.ref, actor: "carol", mode: "suggest", at }, settings("suggest"), this.deps, ENV)));
   }
 
   /** The entry call of the cell's path (also its redelivery). */
@@ -960,6 +1029,19 @@ async function assertBetween(w: World): Promise<void> {
   assert.equal(r.ran, true, `I9: a step in carol's newer session did not run: ${JSON.stringify(r)}`);
 }
 
+/** I10: the App's own commit is no moved head, whatever the step's reads of the PR head showed of it
+ * (still its parent, once or through the call): the commit's continuation was decided owed and
+ * POSTed in the call (the write under test, or the refused one before the handoff under test), and
+ * the report never says the head moved — unless a human push moved it (between: head-moved). */
+function assertOwnCommitNoMove(w: World): void {
+  const { via, headRead, between } = w.cell;
+  const posts = via === "continue:applied" ? w.underTest.filter((p) => p === "call").length : w.refusedContinuations;
+  assert.ok(posts >= 1, `I10: the commit's continuation was not POSTed in the call (head read ${headRead})`);
+  if (between === "head-moved") return;
+  const report = w.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+  assert.ok(!/The PR head moved meanwhile/.test(report), `I10: the report says the head moved (head read ${headRead}): ${report}`);
+}
+
 async function runCell(c: Cell, pr: number): Promise<void> {
   const w = new World(c, pr);
   const realNow = Date.now;
@@ -1005,13 +1087,14 @@ async function runCell(c: Cell, pr: number): Promise<void> {
     }
     assertExactlyOnce(w);
     if (kindOf(c.via) === "stop") assertStopRecordForms(w);
+    if (commits(c.via)) assertOwnCommitNoMove(w);
   } finally {
     Date.now = realNow;
     console.info = realInfo;
   }
 }
 
-describe("control writes: kind (× a stop's prior session) × write result (× 2xx body × created_at) × list read × later event, or what happens between the write's attempts (× anchor start × peer start) (#79 K1)", () => {
+describe("control writes: kind (× a stop's prior session) × write result (× 2xx body × created_at) × list read × later event, or what happens between the write's attempts (× anchor start × peer start × how the step's head reads follow its commit) (#79 K1)", () => {
   let row = 0;
   for (const via of VIAS)
     for (const prior of kindOf(via) === "stop" ? PRIORS : (["none"] as const))
@@ -1023,16 +1106,18 @@ describe("control writes: kind (× a stop's prior session) × write result (× 2
                 for (const betweenAt of betweenAts(via, between))
                   for (const later of between === "nothing" ? LATERS : (["row-appears"] as const))
                     for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
-                      for (const peer of sessionScoped(via) ? PEERS : (["none"] as const)) {
-                        if (!applies(via, later)) continue;
-                        const cell = { via, write, shape, stamp, list, later, anchor, peer, prior, between, betweenAt };
-                        const pr = 1000 + row++;
-                        const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
-                        const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
-                        const where = betweenAt === "retry" ? "between attempts" : "before the first attempt";
-                        const next = between === "nothing" ? later : `${where}: ${between}`;
-                        const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
-                        const before = prior === "none" ? "" : ` | prior ${prior}`;
-                        it(`${via} | ${write}${answer}${time} | ${list} | ${next}${session}${before}`, () => runCell(cell, pr));
-                      }
+                      for (const peer of sessionScoped(via) ? PEERS : (["none"] as const))
+                        for (const headRead of headReads(via, write, shape, stamp)) {
+                          if (!applies(via, later)) continue;
+                          const cell = { via, write, shape, stamp, list, later, anchor, peer, prior, between, betweenAt, headRead };
+                          const pr = 1000 + row++;
+                          const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
+                          const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
+                          const where = betweenAt === "retry" ? "between attempts" : "before the first attempt";
+                          const next = between === "nothing" ? later : `${where}: ${between}`;
+                          const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
+                          const before = prior === "none" ? "" : ` | prior ${prior}`;
+                          const commit = headRead === "synced" ? "" : ` | head read ${headRead}`;
+                          it(`${via} | ${write}${answer}${time} | ${list} | ${next}${session}${before}${commit}`, () => runCell(cell, pr));
+                        }
 });

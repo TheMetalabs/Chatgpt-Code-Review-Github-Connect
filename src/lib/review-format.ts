@@ -135,7 +135,9 @@ export function findingsMarker(outcome: PostedOutcome, findings: Finding[], unan
 }
 
 /** The verbatim salvaged block. Its header says whose reply it is: an unverified local
- * verification reply is never presented as an ordinary (chat) salvage. Otherwise it says why, from
+ * verification reply is never presented as an ordinary (chat) salvage, and `raw-unverified` needs
+ * local's own leg in the block (reviewOutcome), so another reviewer's reply is never presented as
+ * local verification's. Otherwise it says why, from
  * the causes the merge stamped: a reply that parsed but had rows the gate did not read is not called
  * unparseable. */
 function rawBlock(p: SummaryParts): string {

@@ -39,7 +39,7 @@ describe("reviewOutcome: the one decision point", () => {
     ["D12 held, a skipped chat reviewer still verifies", held({ reviewProviders: CGL, skippedProviders: ["grok"] }), 0, "verify"],
     ["D13 local verified clean", verifying({ localVerified: true }), 0, "verified-clean"],
     ["D14 local verified with findings", verifying({ localVerified: true }), 1, "findings"],
-    ["D15 local reply unparseable", verifying({ localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW" }), 0, "raw-unverified"],
+    ["D15 local reply unparseable", verifying({ localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW", rawCauses: { local: "unparseable" } }), 0, "raw-unverified"],
     ["D16 local failed", verifying({ localVerified: false }), 0, "unverified-clean"],
     ["D17 local never stamped", verifying(), 0, "unverified-clean"],
     ["D18 verified but a chat reviewer skipped", verifying({ reviewProviders: CGL, localVerified: true, skippedProviders: ["grok"] }), 0, "incomplete"],
@@ -60,6 +60,13 @@ describe("reviewOutcome: the one decision point", () => {
     ["D28 fallback clean beside chat with no complete verdict", held({ localFallbackAt: 1, incompleteProviders: ["chatgpt"] }), 0, "incomplete"],
     ["D29 its evidence posted: raw", job({ localReviewRole: "race", incompleteProviders: ["chatgpt"], rawReview: "P1 x" }), 0, "raw"],
     ["D30 an empty incomplete list is nothing incomplete", job({ localReviewRole: "race", incompleteProviders: [] }), 0, "clean"],
+    // raw-unverified says the raw block is local verification's own reply: it needs local's leg among
+    // the salvaged ones. A chat run that landed during the round with evidence of its own, while local
+    // returned nothing, is plain raw (its reply is never credited to local).
+    ["D31 local failed, a late chat reply is the only raw evidence", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "GROK-RAW", rawCauses: { grok: "not-a-verdict" }, incompleteProviders: ["grok"] }), 0, "raw"],
+    ["D32 local verified, a late chat reply is raw evidence", verifying({ reviewProviders: CGL, localVerified: true, rawReview: "GROK-RAW", rawCauses: { grok: "unparseable" }, incompleteProviders: ["grok"] }), 0, "raw"],
+    ["D33 local's reply and a late chat reply are both raw evidence", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "x", rawCauses: { grok: "unparseable", local: "not-a-verdict" } }), 0, "raw-unverified"],
+    ["D34 no salvaged leg recorded: never attributed to local", verifying({ localVerified: false, rawReview: "x" }), 0, "raw"],
   ];
   for (const [name, j, findings, expected] of rows) {
     it(name, () => assert.equal(reviewOutcome(j, findings), expected));
@@ -79,7 +86,7 @@ const RAW = "P1 a.ts:1 LOCAL-RAW duplicate request writes twice";
 const RENDER: Record<PostedOutcome, { job: RowJob; findings: Finding[] }> = {
   findings: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses: { chatgpt: "unparseable" } }), findings: [finding] },
   raw: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses: { chatgpt: "unparseable" } }), findings: [] },
-  "raw-unverified": { job: verifying({ localVerified: false, rawReview: RAW, localVerifyNote: "chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); it is posted verbatim below. Not a clean pass." }), findings: [] },
+  "raw-unverified": { job: verifying({ localVerified: false, rawReview: RAW, rawCauses: { local: "unparseable" }, localVerifyNote: "chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); it is posted verbatim below. Not a clean pass." }), findings: [] },
   clean: { job: job({ localReviewRole: "race" }), findings: [] },
   "verified-clean": { job: verifying({ localVerified: true, localVerifyNote: "chatgpt found nothing; local verification agreed." }), findings: [] },
   "unverified-clean": { job: verifying({ localVerified: false, localVerifyNote: "chatgpt found nothing; local verification did not complete (x), so this is chatgpt's unverified clean result." }), findings: [] },
@@ -245,6 +252,20 @@ describe("outcomeNote", () => {
   it("N11 with no reviewer to credit the wording is provider-neutral, never local's", () => {
     const note = outcomeNote("findings", { chat, verifying: true, findings: 1, localVerified: true, findingsBy: { chatgpt: 0, local: 0 } });
     assert.equal(note, "chatgpt found nothing; the review found 1.");
+  });
+  // A late chat reply is the raw block of a verification round: the note names whose reply it is and
+  // what local verification did, never that local's reply is posted.
+  it("N12 raw in a verification round credits the raw reply to its reviewer and states local's result", () => {
+    const late = { chat, verifying: true, findings: 0, findingsBy: {}, rawBy: ["grok"] as ReviewProvider[] };
+    assert.equal(
+      outcomeNote("raw", { ...late, localVerified: false, localError: "local LLM HTTP 500" }),
+      "chatgpt found nothing; local verification did not complete (local LLM HTTP 500); grok's reply could not be used as a review and is posted verbatim below. Not a clean pass.",
+    );
+    assert.equal(
+      outcomeNote("raw", { ...late, localVerified: true }),
+      "chatgpt found nothing; local verification found nothing; grok's reply could not be used as a review and is posted verbatim below. Not a clean pass.",
+    );
+    assert.doesNotMatch(outcomeNote("raw", { ...late, rawBy: [] }), /local verification's reply/);
   });
 });
 

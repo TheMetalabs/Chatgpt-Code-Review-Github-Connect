@@ -22,7 +22,7 @@ export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 export type PostedOutcome = Exclude<ReviewOutcome, "verify">;
 
 export type OutcomeJob = Pick<Job, "reviewProviders" | "assumptions" | "rawReview"> &
-  Partial<Pick<Job, "localReviewRole" | "chatFpRound" | "localVerifyStartedAt" | "localFallbackAt" | "localVerified" | "skippedProviders" | "incompleteProviders">>;
+  Partial<Pick<Job, "localReviewRole" | "chatFpRound" | "localVerifyStartedAt" | "localFallbackAt" | "localVerified" | "skippedProviders" | "incompleteProviders" | "rawCauses">>;
 
 /** A Record keyed by the closed enum: adding a kind without deciding its shape fails the typecheck. */
 export const OUTCOME_SHAPE: Record<PostedOutcome, { converged: boolean; unverified: boolean }> = {
@@ -78,7 +78,10 @@ export function rawCauseText(causes: Job["rawCauses"]): string {
  * as the chat-down fallback is an ordinary reviewer, so neither is a verifier. A reviewer whose payload
  * was not its complete verdict (`incompleteProviders`) never leaves the result clean or starts a
  * verification round, on any role: its reply posts as evidence (raw), and without that evidence the
- * result is still incomplete. */
+ * result is still incomplete. `raw-unverified` says the raw block holds local verification's own
+ * reply, so it needs local's leg among the salvaged ones (`rawCauses`): a chat run that started before
+ * the round can land during it with evidence of its own while local returns nothing, and that reply
+ * is posted as plain `raw`, never credited to local. */
 export function reviewOutcome(job: OutcomeJob, findings: number): ReviewOutcome {
   const role = job.chatFpRound ? "race" : job.localReviewRole;
   const verifier = localVerifies({ role, providers: job.reviewProviders ?? [] }) && !job.localFallbackAt;
@@ -86,7 +89,7 @@ export function reviewOutcome(job: OutcomeJob, findings: number): ReviewOutcome 
   const incomplete = Boolean(job.incompleteProviders?.length);
   if (verifier && !job.localVerifyStartedAt) return findings > 0 ? "findings" : raw ? "raw" : incomplete ? "incomplete" : "verify";
   if (findings > 0) return "findings";
-  if (raw) return verifier && !job.localVerified ? "raw-unverified" : "raw";
+  if (raw) return verifier && !job.localVerified && Object.hasOwn(job.rawCauses ?? {}, "local") ? "raw-unverified" : "raw";
   if (job.skippedProviders?.length || incomplete) return "incomplete";
   if (!verifier) return "clean";
   return job.localVerified ? "verified-clean" : "unverified-clean";
@@ -112,6 +115,8 @@ export function outcomeNote(
     findingsBy: Partial<Record<ReviewProvider, number>>;
     localError?: string;
     localVerified?: boolean;
+    /** The reviewers whose reply is in the raw block (the salvaged legs). */
+    rawBy?: readonly ReviewProvider[];
   },
 ): string {
   const chat = input.chat.join(" + ") || "chat";
@@ -130,7 +135,21 @@ export function outcomeNote(
   if (outcome === "raw-unverified") {
     return `${chat} found nothing; local verification's reply could not be used as a review (${input.localError || "not review JSON"}); it is posted verbatim below. Not a clean pass.`;
   }
+  if (outcome === "raw" && input.verifying) return verificationRawNote(input);
   return "";
+}
+
+/** A verification round whose raw block holds only another reviewer's reply (a chat run that landed
+ * during the round): the note says what local verification did and whose reply is posted, never that
+ * local's reply is. */
+function verificationRawNote(input: Parameters<typeof outcomeNote>[1]): string {
+  const chat = input.chat.join(" + ") || "chat";
+  const by = (input.rawBy ?? []).filter((p) => p !== "local");
+  const localPart = input.localVerified
+    ? "local verification found nothing"
+    : `local verification did not complete (${input.localError || "unavailable"})`;
+  const whose = by.length ? `${by.join(" + ")}'s reply` : "a reviewer's reply";
+  return `${chat} found nothing; ${localPart}; ${whose} could not be used as a review and is posted verbatim below. Not a clean pass.`;
 }
 
 /** A verification round's findings, each credited to the reviewer whose gated reply carried it: a

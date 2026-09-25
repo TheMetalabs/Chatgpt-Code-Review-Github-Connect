@@ -26,8 +26,8 @@ race.
 | --- | --- | --- | --- | --- |
 | `verify` | verifier, round not started, 0 findings, no raw | (not posted: local verification round starts) | — | — |
 | `findings` | any structured finding | summary mark | `total=N inline=… body=… p0 p1 p2` | no |
-| `raw` | a salvaged (unparseable) reply, not a verifier's | summary mark | `total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` | no |
-| `raw-unverified` | verification round, local's reply could not be used as a review (below) | summary mark + note | raw marker + ` unverified=1` | no |
+| `raw` | a reply posted verbatim as evidence, none of it local verification's own (in a verification round: + note) | summary mark | `total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` | no |
+| `raw-unverified` | verification round, local's own reply is in the raw block (`rawCauses.local`): it could not be used as a review (below) | summary mark + note | raw marker + ` unverified=1` | no |
 | `incomplete` | 0 findings, no raw, a reviewer was skipped (`skippedProviders`) or returned no complete verdict (`incompleteProviders`) | summary mark (+ note in a verification round: agreed / did not complete) | none | no |
 | `clean` | not a verifier, 0 findings, nothing skipped, every reviewer's payload a complete verdict | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `verified-clean` | verification round, local returned a structured clean result | `Didn't find any major issues.` | `total=0 …` | **yes** |
@@ -90,7 +90,12 @@ Rules the table encodes:
   reads e.g. `chatgpt found nothing; grok found 1; local verification found nothing.` — local is
   credited only with its own, a pinned clean chat reviewer is called clean only while it reports none,
   and with no reviewer to credit the wording is provider-neutral (`… the review found N.`). The late
-  Grok test pins it.
+  Grok test pins it. Raw evidence is credited the same way: `raw-unverified` (and its header "Local
+  verification reply posted verbatim") needs local's own leg in the raw block. When the block holds
+  only a late chat reply and local returned no verdict, the kind is `raw` with the cause-based header,
+  and the note gives both facts, e.g. `chatgpt found nothing; local verification did not complete
+  (…); grok's reply could not be used as a review and is posted verbatim below. Not a clean pass.`
+  (the late-Grok raw tests).
 - `unverified=1` is never CONVERGED, and only `clean` / `verified-clean` print the clean sentinel.
   `postedOutcome` renders a `verify` that somehow reaches the poster as `unverified-clean`.
 - Local as the chat-down fallback is an ordinary reviewer, the same as race: chat that returned no

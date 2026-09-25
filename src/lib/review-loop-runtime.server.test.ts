@@ -377,7 +377,9 @@ describe("CONVERGED is the posted outcome, not \"no findings\" (docs/local-verif
     ["raw (a chat reply posted verbatim)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW", rawCauses: { chatgpt: "unparseable" } }, /posted verbatim: the reply was not valid review JSON\)/],
     ["raw (a parsed chat reply with rows past the gate's cap)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW", rawCauses: { chatgpt: "unread-rows" } }, /posted verbatim: the reply parsed, but its findings past the gate's row cap were not inspected\)/],
     ["raw (no cause recorded)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW" }, /posted verbatim: a reply could not be used as structured review JSON\)/],
-    ["raw-unverified", { ...VC, localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW" }, /local verification's reply could not be used/],
+    ["raw-unverified", { ...VC, localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW", rawCauses: { local: "unparseable" } }, /local verification's reply could not be used/],
+    // a chat reply that landed during a verification round that returned nothing: never local's reply
+    ["raw (a late chat reply in a failed verification round)", { ...VC, reviewProviders: ["chatgpt", "grok", "local"], localVerified: false, rawReview: "GROK-RAW", rawCauses: { grok: "not-a-verdict" } }, /posted verbatim: the reply could not be used as a complete structured review\)/],
     ["unverified-clean", { ...VC, localVerified: false }, /local verification did not complete/],
     ["incomplete", { reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: ["Skipped grok (quota or unavailable)"] }, /a reviewer did not run/],
     ["incomplete (a reviewer returned no complete verdict)", { reviewProviders: ["chatgpt", "local"], localReviewRole: "race", incompleteProviders: ["chatgpt"] }, /a reviewer returned no complete review/],

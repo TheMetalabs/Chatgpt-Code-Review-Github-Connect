@@ -390,3 +390,48 @@ test('verify-clean outcome: a late chat finding during the verification round is
   assert.ok(body.includes(`\n${note}\n`),'the body carries the attributed note');
   await eventually(()=>(app.ops.at(-1)??'').includes(note),'the ops comment does not carry the same note');
 });
+
+// The same late Grok run, but its reply is not a verdict (the bridge salvages it, or the gate rejects
+// it beside clean ChatGPT) while local verification fails with no reply at all: the raw block holds
+// only Grok's reply, so it is plain raw evidence. The header, the note and the loop handoff never
+// credit that reply to local verification, and the note still says local did not complete.
+const LATE_GROK={
+  malformed:{reply:JSON.stringify({findings:[{...partial,title:'GROK-RAW duplicate write'}],merge_recommendation:'REQUEST_CHANGES'}),cause:'unparseable'},
+  rejected:{reply:'{"findings":"GROK-RAW not a list"}',cause:'unparseable'},
+  emptyWithoutSafe:{reply:'{"findings":[],"merge_recommendation":"APPROVE","highest_risk":"GROK-RAW instant"}',cause:'not-a-verdict'},
+};
+for(const [name,grok] of Object.entries(LATE_GROK)){
+  test(`verify-clean outcome: a late ${name} grok reply beside a failed verification is grok's raw evidence, never local's`,async t=>{
+    const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
+    app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+    const out=await app.mention(`matrix-late-grok-raw-${name}`);
+    const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+    await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+    app.bridge.bridgeHeartbeat();
+    const take=app.bridge.takeNextBridgeJob('matrix-client');
+    assert.equal(app.bridge.failBridgeProvider(out.jobId,'grok','quota: usage limit reached',take.leaseId),true);
+    assert.equal((await app.bridge.completeBridgeJob(out.jobId,cleanJson,[{provider:'chatgpt',raw:cleanJson}],take.leaseId)).ok,true);
+    await eventually(()=>app.localRequests.length===1,'clean chatgpt did not start the verification round');
+    assert.equal((await app.bridge.completeBridgeJob(out.jobId,grok.reply,[{provider:'grok',raw:grok.reply}],take.leaseId)).ok,true);
+    await eventually(()=>job().storedLegs.some(l=>l.provider==='grok'),'the late grok reply was not kept');
+    fail500(app.localResponses[0]);
+    await eventually(()=>app.reviews.length===1,'the review was not posted');
+    const body=app.reviews[0].body;
+    const raw=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
+    assert.ok(raw.includes('GROK-RAW'),'grok\'s reply is the raw block');
+    assert.doesNotMatch(raw,/LOCAL-RAW|model crashed/,'local wrote nothing into it');
+    assert.deepEqual({...job().rawCauses},{grok:grok.cause});
+    assert.equal(job().localVerified,false);
+    assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MR,'raw evidence, never CONVERGED');
+    assert.equal(converged(body),false);
+    assert.doesNotMatch(body,/Local verification reply posted verbatim/,'the header never calls grok\'s reply local verification\'s');
+    assert.match(body,/\*\*⚠️ Review posted verbatim — /);
+    const note=job().localVerifyNote;
+    assert.match(note,/^chatgpt found nothing; local verification did not complete \(local LLM HTTP 500[^)]*\); grok's reply could not be used as a review and is posted verbatim below\. Not a clean pass\.$/);
+    assert.doesNotMatch(note,/local verification's reply/);
+    assert.ok(body.includes(`\n${note}\n`),'the body carries the note');
+    const handoff=notCleanDetail(job(),postedOutcome(job(),0));
+    assert.doesNotMatch(handoff,/local verification's reply/,'nor does the loop handoff');
+    assert.match(handoff,/^posted verbatim: /);
+  });
+}

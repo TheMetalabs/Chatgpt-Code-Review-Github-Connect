@@ -1123,7 +1123,7 @@ export async function submitHarborChat(
   // the same settings), so this count is the one the posted body renders.
   // Skipped reviewers come from provider state (`skipped`), never from the merged assumptions, which
   // also carry the reviewers' own free-form text.
-  const outcome = reviewOutcome({ ...job, rawReview, localVerified, assumptions: nextAssumptions, skippedProviders: skipped, incompleteProviders }, merged.findings.length);
+  const outcome = reviewOutcome({ ...job, rawReview, rawCauses, localVerified, assumptions: nextAssumptions, skippedProviders: skipped, incompleteProviders }, merged.findings.length);
   // Credit only the chat reviewers that produced the clean structured result (pinned when the
   // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
   const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
@@ -1140,7 +1140,8 @@ export async function submitHarborChat(
     (byProvider.get("local")?.rawReview ? "not review JSON" : undefined);
   // Each merged reviewer's accepted finding count: the note credits findings to the leg that reported them.
   const findingsBy: Partial<Record<ReviewProvider, number>> = Object.fromEntries([...byProvider].map(([p, g]) => [p, g.findings.length]));
-  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified });
+  const rawBy = [...byProvider].filter(([, g]) => g.rawReview).map(([p]) => p);
+  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified, rawBy });
   transitionJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,

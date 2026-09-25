@@ -52,9 +52,9 @@ test('verify-clean multi-turn: residual text past the posted raw cap is archived
   const {app,jobId}=await setup(t,'verify-clean',{localJsonRepairEnabled:false,localReviewMode:'multiturn'});
   await app.harbor.submitHarborChat(jobId,clean);
   await eventually(()=>app.localRequests.length===1,'clean chat did not start local verification');
-  // one group's accepted reply: a clean review JSON object after >60,000 chars of prose whose finding
-  // marker sits past the posted raw_review cap
-  const prose='P1 a.ts:1 a duplicate request writes twice. '+'x'.repeat(70_000)+' RESIDUAL-TAIL-MARK: the second write';
+  // one group's accepted reply: a clean review JSON object after >128,000 chars of prose (past the
+  // posted raw_review cap AND the history observation cap) whose finding marker sits at its tail
+  const prose='P1 a.ts:1 a duplicate request writes twice. '+'x'.repeat(140_000)+' RESIDUAL-TAIL-MARK: the second write';
   app.localResponses[0].end(reply(`${prose}\n${clean}`));
   await eventually(()=>app.reviews.length===1,'the review was not posted');
   const body=app.reviews[0].body;
@@ -62,8 +62,23 @@ test('verify-clean multi-turn: residual text past the posted raw cap is archived
   assert.equal(body.includes('RESIDUAL-TAIL-MARK'),false,'the posted raw block is capped');
   assert.equal(converged(body),false);
   const archived=app.history.getJob(jobId,true);
-  const kept=[archived.observations?.local?.text,archived.responses?.local?.original].filter(Boolean).join('\n');
-  assert.ok(kept.includes('RESIDUAL-TAIL-MARK'),'review history keeps the uncapped residual reply');
+  const original=archived.responses?.local?.original??'';
+  assert.ok(original.includes('RESIDUAL-TAIL-MARK'),'review history keeps the whole residual reply as the leg\'s original');
+  assert.equal(archived.responses.local.truncated,false);
+});
+
+test('race (default) multi-turn: a parsed local leg\'s residual text is its archived original, never an unparsed observation',async t=>{
+  const {app,jobId,job}=await setup(t,'race',{localJsonRepairEnabled:false,localReviewMode:'multiturn'});
+  await eventually(()=>app.localRequests.length===1,'race mode did not start local at snapshot');
+  app.localResponses[0].end(reply(`RACE-RESIDUAL-MARK some thoughts first.\n${dirty}`));
+  await eventually(()=>(job().storedLegs??[]).some(l=>l.provider==='local'),'the local leg was not collected');
+  await app.harbor.submitHarborChat(jobId,clean);
+  await eventually(()=>app.reviews.length===1,'the review was not posted');
+  assert.match(app.reviews[0].body,/ashlar-findings total=1 inline=1 /,'the local leg parsed, merged and posted its finding');
+  const archived=app.history.getJob(jobId,true);
+  assert.equal(archived.observations?.local,undefined,'a parsed leg is not archived as observed-but-not-parsed');
+  assert.equal(archived.steps.some(s=>s.stage==='response.observed_unparsed'),false);
+  assert.ok((archived.responses?.local?.original??'').includes('RACE-RESIDUAL-MARK'),'its residual text is kept as its original reply');
 });
 
 test('race (default): local still starts with the chat leg',async t=>{

@@ -129,6 +129,23 @@ for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
   });
 }
 
+// Round 15 (Ashlar 4100156796) drift guard: the page proves a fix only in json.js fixChatPage();
+// the worker opens every fix tab at background.js providerUrl(provider, reasoning). Today providerUrl
+// ignores the reasoning (never a model slug in the URL), so both are the same page for every value;
+// this pins that, using the URL the worker actually opens, so a future per-reasoning URL cannot
+// silently turn every fix into taken_over.
+const CHATGPT_REASONING = JSON.parse(source('src/lib/reasoning.ts').match(/CHATGPT_REASONING = (\[[^\]]*\])/)[1]);
+for (const reasoning of [...CHATGPT_REASONING, undefined]) {
+  test(`page: an untouched confirmed fix on the tab the worker opens for reasoning ${reasoning} is owned`, async () => {
+    const opened = background().context.providerUrl('chatgpt', reasoning);
+    const p = page();
+    const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: opened};
+    Object.assign(p.c.context, {location: {href: opened}, readSubmissionJournal: async () => journal, savedSubmission: () => journal});
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    assert.equal(p.c.context.fixOwnershipProof(p.state(), {phase: 'collect', journal}).ownership, 'owned', opened);
+  });
+}
+
 test('page: a collected fix answer whose tab is then taken over ends the run (taken_over) instead of answering busy', async () => {
   const p = page();
   p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');

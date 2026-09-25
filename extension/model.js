@@ -46,8 +46,12 @@ async function selectReasoning(provider, level) {
   const pill = provider === "grok" ? grokPill() : chatgptPill();
   if (!pill) return;
   if (hit(want, pillText(pill))) return;
+  // The stop fence (json.js), before each click: the model menu of a conversation the user opened in
+  // the tab meanwhile is never touched.
+  globalThis.throwIfStopped?.();
   pill.click();
   await sleep(800);
+  globalThis.throwIfStopped?.();
   const items = [
     ...document.querySelectorAll(
       "[role='menuitem'], [role='option'], [role='menuitemradio'], [data-radix-collection-item], [cmdk-item]",

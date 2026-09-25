@@ -119,9 +119,11 @@ Two page checks cover what a lock cannot:
 - A new ChatGPT prompt is typed and sent only while its tab is still the new chat it was
   opened on, with no user turn there. The worker checks the tab's URL before the first
   dispatch (a page there already bound to the run, whose `started` the worker never
-  saved, is adopted and observed instead); the page checks again when it accepts the run (`allocationUrl`) and before
-  every composer step until the Send click (`throwIfStopped`). A refused run binds
-  nothing, is never counted as started, fails `taken_over`, and its tab is kept.
+  saved, is adopted and observed instead); the page checks again when it accepts the
+  run (`allocationUrl`) and before every composer step until the Send click
+  (`throwIfStopped`: each overlay dismissal, model menu click, file upload, typing pass
+  and the click). A refused run binds nothing, is never counted as started, fails
+  `taken_over`, and its tab is kept.
 - A run message carries a deadline (`until`, 5 s before the reply window this send
   has). An unbound page that receives it later starts nothing (`stale_run`), and the
   next poll dispatches again into the same tab. A poll with less than 8 s of budget

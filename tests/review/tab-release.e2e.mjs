@@ -1085,6 +1085,42 @@ test('fresh run: the user moving the tab between the fill and the click: Send is
  assert.equal(await tab.clicks(),0,'never clicked on the user\'s conversation');
  assert.deepEqual(await tab.runner(),{running:false,code:'taken_over'});
 });
+// The steps before the typing act on the page too: the overlay dismissal, the model menu and the
+// attachment upload. A move during any of them: nothing more is clicked there and no file is staged
+// in the user's composer (their next send would upload it).
+const MODEL_CONTROLS='<button type="button" class="__composer-pill" aria-haspopup="menu" style="width:80px;height:32px">Instant</button><input type="file" multiple>';
+const ATTACHED_PROMPT=`${PROMPT}\n<<<ASHLAR_ATTACHMENTS_V2>>>\n${JSON.stringify([{name:'diff.patch',body:'diff'}])}\n<<<END_ASHLAR_ATTACHMENTS_V2>>>`;
+const dialog=(id,label)=>`<div role="dialog" id="${id}" style="width:200px;height:100px"><button id="${id}-ok" style="width:60px;height:24px">${label}</button></div>`;
+for(const [when,at,before,view] of [
+ ['an overlay dismissal',100,['overlay'],{after:dialog('d1','OK')}],
+ ['the model menu\'s wait',200,['pill'],{}],
+ ['the wait after the model was picked',1000,['pill','model'],{}],
+])test(`fresh run: the user moving the tab during ${when}: nothing more is clicked there and no file is staged`,async t=>{
+ const tab=await chatTab(t,{bound:false,controls:MODEL_CONTROLS,...view});
+ await tab.page.evaluate(()=>{
+  window.pageClicks=[];
+  document.querySelector('.__composer-pill').addEventListener('click',()=>{
+   window.pageClicks.push('pill');
+   document.body.insertAdjacentHTML('beforeend','<div role="menu"><div role="menuitem" id="xh" style="width:100px;height:24px">Extra high</div></div>');
+   document.getElementById('xh').addEventListener('click',()=>window.pageClicks.push('model'));
+  });
+  // The first overlay's button opens another one (a second notice).
+  document.getElementById('d1-ok')?.addEventListener('click',()=>{
+   window.pageClicks.push('overlay');document.getElementById('d1').remove();
+   document.body.insertAdjacentHTML('beforeend','<div role="dialog" id="d2" style="width:200px;height:100px"><button id="d2-ok" style="width:60px;height:24px">Got it</button></div>');
+   document.getElementById('d2-ok').addEventListener('click',()=>{window.pageClicks.push('overlay-2');document.getElementById('d2').remove();});
+  });
+ });
+ assert.equal((await tab.send('ashlar-run',{prompt:ATTACHED_PROMPT,allocationUrl:TEMP_URL})).code,'busy','accepted on its new chat');
+ await tab.page.clock.runFor(at);
+ assert.deepEqual(await tab.page.evaluate(()=>window.pageClicks),before,'the steps so far ran on the new chat');
+ await tab.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);
+ await tab.page.clock.runFor(3000);
+ assert.deepEqual(await tab.page.evaluate(()=>window.pageClicks),before,'nothing more clicked on the user\'s conversation');
+ assert.equal(await tab.page.evaluate(()=>document.querySelector('input[type="file"]').files.length),0,'no file staged in the user\'s composer');
+ assert.equal(await composerText(tab),'','nothing typed');assert.equal(await tab.clicks(),0,'Send never clicked');
+ assert.deepEqual(await tab.runner(),{running:false,code:'taken_over'});
+});
 test('fresh run, control: a run left on its new chat types and clicks Send once',async t=>{
  const tab=await chatTab(t,{bound:false});
  assert.equal((await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL})).code,'busy');

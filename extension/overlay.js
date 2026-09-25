@@ -63,6 +63,8 @@ function clickOverlayButton(root, want) {
 async function dismissOverlays() {
   const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
+    // The stop fence (json.js): nothing is clicked once the run stopped or its tab left its new chat.
+    globalThis.throwIfStopped?.();
     const root = overlayRoot();
     if (!root) return;
     if (clickOverlayButton(root, "personal") || clickOverlayButton(root, "accept")) {

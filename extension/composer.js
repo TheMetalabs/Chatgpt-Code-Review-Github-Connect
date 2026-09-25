@@ -115,6 +115,9 @@ async function fillComposer(el, text) {
   const state = globalThis.__ashlarRunnerState;
   if (state) state.pendingAttachments = [];
   if (parts.files.length) {
+    // The stop fence, in the same task as the upload: no file is staged in a composer the user opened
+    // in the tab meanwhile (their next send would upload it).
+    globalThis.throwIfStopped?.();
     const attached = await attachFiles(parts.files);
     if (attached) {
       if (state) state.pendingAttachments = parts.files.map(file => file.name);

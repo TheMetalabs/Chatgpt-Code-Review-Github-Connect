@@ -126,6 +126,24 @@ function stageValues(text, tokens, found, where) {
   found.problems.push(`${where}: stage \`${expression}\` is not a literal, so its value cannot be checked for a label`);
 }
 
+/** Calls `visit(token, level, k)` for every token of `level` and of the groups and template
+ * substitutions inside it. */
+function walkTokens(level, visit) {
+  level.forEach((token, k) => {
+    visit(token, level, k);
+    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walkTokens(inner, visit);
+  });
+}
+
+/** The argument group of the recorder call at `level[k]`, `name(...)` or `name?.(...)`, else null. The
+ * name of a function declaration is not a call. */
+function recorderCall(level, k) {
+  const token = level[k], before = level[k - 1];
+  if (token?.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text) || (before?.kind === 'word' && before.text === 'function')) return null;
+  const group = isPunct(level[k + 1], '?.') ? level[k + 2] : level[k + 1];
+  return group?.kind === 'group' && group.open === '(' ? group : null;
+}
+
 /** Names that reach a binding without naming it: a sloppy-mode `arguments[i] = x` rebinds a parameter,
  * and eval and with can reassign or shadow one. */
 const INDIRECT = new Set(['arguments', 'eval', 'with']);
@@ -143,23 +161,21 @@ function forwardsUnchanged(tokens, param) {
     }
     if (token.kind === 'tpl') return token.substs.every(inner => forwardsUnchanged(inner, param));
     if (token.kind !== 'group') return true;
-    const call = token.open === '(' && prev?.kind === 'word' && Object.hasOwn(RECORDERS, prev.text) && tokens[k - 2]?.text !== 'function';
-    const [stage, ...rest] = call ? argumentsOf(token.tokens)[RECORDERS[prev.text]] ?? [] : [];
+    const caller = [k - 1, k - 2].find(j => recorderCall(tokens, j) === token);
+    const [stage, ...rest] = caller === undefined ? [] : argumentsOf(token.tokens)[RECORDERS[tokens[caller].text]] ?? [];
     const forwarded = !rest.length && stage?.kind === 'word' && stage.text === param ? stage : null;
     return forwardsUnchanged(token.tokens.filter(inner => inner !== forwarded), param);
   });
 }
 
-/** The bodies of the recorders declared in `text`, found by walking its tokens (a declaration in a
- * comment or a string is none), each with the name of its stage parameter when the body passes it on
- * unchanged, else null. Forwarding that parameter to another recorder is safe: every call of the
- * enclosing recorder is itself checked. Its parameters must be plain names, the stage one once: a
- * default value can reassign it, and a repeated name binds the last one. A file the tokenizer cannot
- * read throws: its recorders forward nothing, and the caller says why. */
-function recorderBodies(text) {
-  const {tokens} = tokenize(text, 0);
+/** The bodies of the recorders declared in a file's `tokens` (a declaration in a comment or a string is
+ * none), each with the name of its stage parameter when the body passes it on unchanged, else null.
+ * Forwarding that parameter to another recorder is safe: every call of the enclosing recorder is itself
+ * checked. Its parameters must be plain names, the stage one once: a default value can reassign it, and
+ * a repeated name binds the last one. */
+function recorderBodies(tokens) {
   const bodies = [];
-  const walk = level => level.forEach((token, k) => {
+  walkTokens(tokens, (token, level, k) => {
     const [name, params, body] = level.slice(k + 1, k + 4);
     if (token.kind === 'word' && token.text === 'function' && name?.kind === 'word' && Object.hasOwn(RECORDERS, name.text) &&
         params?.kind === 'group' && params.open === '(' && body?.kind === 'group' && body.open === '{') {
@@ -168,53 +184,31 @@ function recorderBodies(text) {
       const plain = param && names.every(Boolean) && names.filter(other => other === param).length === 1;
       bodies.push({param: plain && forwardsUnchanged(body.tokens, param) ? param : null, from: body.at, to: body.end});
     }
-    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walk(inner);
   });
-  walk(tokens);
   return bodies;
 }
 
-/** Whether a call sits in a comment, given the text before it on its line. */
-function commentedOut(before) {
-  if (/^\s*\*/.test(before)) return true; // a JSDoc continuation line
-  for (let i = 0; i < before.length; i += 1) {
-    const c = before[i];
-    if (c === '"' || c === "'" || c === '`') for (i += 1; i < before.length && before[i] !== c; i += before[i] === '\\' ? 2 : 1);
-    else if (before.startsWith('//', i)) return true;
-    else if (before.startsWith('/*', i)) {
-      if (!before.includes('*/', i + 2)) return true;
-      i = before.indexOf('*/', i + 2) + 1;
-    }
-  }
-  return false;
-}
-
 /** Every stage a recorder call in `text` can record, by the position of its stage argument: the
- * literals, the template literals verbatim, and a problem for each stage argument the guard cannot read. */
+ * literals, the template literals verbatim, and a problem for each stage argument the guard cannot read.
+ * Calls are found in the tokens, so a comment or a string is never one, and one is never hidden by a
+ * comment or a regex before it. A file the tokenizer cannot read is itself a problem. */
 function recordedStages(text, file = 'source') {
   const found = {literals: new Set(), templates: new Set(), problems: []};
-  let bodies = [];
-  try { bodies = recorderBodies(text); } catch (error) {
-    found.problems.push(`${file}: could not be tokenized (${error.message}), so its recorders forward nothing`);
+  let tokens;
+  try { ({tokens} = tokenize(text, 0)); } catch (error) {
+    found.problems.push(`${file}: could not be tokenized (${error.message}), so its recorder calls cannot be read`);
+    return found;
   }
-  for (const call of text.matchAll(/\b(workerStep|recordReviewStep|step)\s*\(/g)) {
-    const before = text.slice(text.lastIndexOf('\n', call.index) + 1, call.index);
-    if (commentedOut(before) || /\bfunction\s*$/.test(before)) continue; // a comment or the declaration
-    const where = `${file}:${text.slice(0, call.index).split('\n').length} ${call[1]}()`;
-    let tokens;
-    try {
-      const open = call.index + call[0].length - 1, inner = tokenize(text, open + 1, ')');
-      if (text[inner.end] !== ')') throw new Error('unclosed (');
-      tokens = inner.tokens;
-    } catch (error) {
-      found.problems.push(`${where}: arguments could not be read (${error.message})`);
-      continue;
-    }
-    const arg = argumentsOf(tokens)[RECORDERS[call[1]]] ?? [];
+  const bodies = recorderBodies(tokens);
+  walkTokens(tokens, (token, level, k) => {
+    const group = recorderCall(level, k);
+    if (!group) return;
+    const where = `${file}:${text.slice(0, token.at).split('\n').length} ${token.text}()`;
+    const arg = argumentsOf(group.tokens)[RECORDERS[token.text]] ?? [];
     const forwarded = arg.length === 1 && arg[0].kind === 'word' &&
-      bodies.some(body => body.from < call.index && call.index < body.to && body.param === arg[0].text);
+      bodies.some(body => body.from < token.at && token.at < body.to && body.param === arg[0].text);
     if (!forwarded) stageValues(text, arg, found, where);
-  }
+  });
   return found;
 }
 
@@ -429,7 +423,7 @@ test('the guard reads the stage argument by position: other arguments, a conditi
   assert.deepEqual(read('recordReviewStep(!done ? (stop || streaming ? "generating" : "waiting_for_response") : e?.code ?? "error");'),
     {literals: ['error', 'generating', 'waiting_for_response'], templates: [],
       problems: ['fixture.js:1 recordReviewStep(): stage `e?.code` is not a literal, so its value cannot be checked for a label']});
-  assert.deepEqual(read('recordReviewStep(/* why */ "cancelled" /* ) */); // step(nothing)\n/* step(nothing) */ step("tab_created");\n  * step(nothing)'),
+  assert.deepEqual(read('recordReviewStep(/* why */ "cancelled" /* ) */); // step(nothing)\n/* step(nothing) */ step("tab_created");\n/**\n  * step(nothing)\n  */'),
     {literals: ['cancelled', 'tab_created'], templates: [], problems: []});
   assert.deepEqual(read('const url = "http://x"; step(`${kind}`);').problems.length, 0, 'a // inside a string is not a comment');
   assert.deepEqual(read('const url = "http://x"; step(`${kind}`);').templates, ['${kind}']);
@@ -438,12 +432,26 @@ test('the guard reads the stage argument by position: other arguments, a conditi
     {literals: ['composer_waiting'], templates: [], problems: []});
 });
 
+test('a recorder call is found in the tokens: a // in a regex or a comment before its ( hides nothing', () => {
+  const read = text => {
+    const found = recordedStages(text, 'fixture.js');
+    return {literals: [...found.literals], problems: found.problems};
+  };
+  assert.deepEqual(read('function probe(job, provider, url) { if (/^https:\\/\\/chatgpt\\.com\\//.test(url)) workerStep(job, provider, "after_regex"); }'),
+    {literals: ['after_regex'], problems: []}, 'a // inside a regex literal is not a comment');
+  assert.deepEqual(read('workerStep /* why */ (job, provider, "after_comment");'), {literals: ['after_comment'], problems: []});
+  assert.deepEqual(read('globalThis.recordReviewStep?.("optional_call");'), {literals: ['optional_call'], problems: []}, 'name?.(...) is a call');
+  assert.deepEqual(read('workerSt\\u0065p(job, provider, "escaped_name");'), {literals: ['escaped_name'], problems: []});
+  assert.deepEqual(read('const doc = "workerStep(job, provider, stage)";'), {literals: [], problems: []}, 'a call in a string is none');
+});
+
 test('a recorder forwards its stage parameter only when nothing in its body can change or shadow it', () => {
   const problems = text => recordedStages(text, 'fixture.js').problems;
   const forwarding = body => `function step(stage) {\n  ${body}\n}\nstep("composer_waiting");`;
   // Still forwarding: the parameter reaches the recorder as is; x.stage and row?.stage are other names.
   for (const body of ['recordReviewStep(stage);', 'if (x.stage && row?.stage !== "a") recordReviewStep(stage);',
-    'setTimeout(() => recordReviewStep(stage), 0);', 'recordReviewStep(stage); recordReviewStep(stage);']) {
+    'setTimeout(() => recordReviewStep(stage), 0);', 'recordReviewStep(stage); recordReviewStep(stage);',
+    'globalThis.recordReviewStep?.(stage);']) {
     assert.deepEqual(problems(forwarding(body)), [], body);
   }
   for (const text of [
@@ -479,12 +487,11 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
   }
 });
 
-test('a file the tokenizer cannot read is a problem that names the file, not only a blame on its forwarder', () => {
+test('a file the tokenizer cannot read is a problem that names the file, not a blame on its forwarder', () => {
   // Valid JavaScript the tokenizer misreads: after a block's `}` it takes `/` for division, so the
   // regex's `)` closes nothing. The guard cannot read the file, and says so.
   const text = 'function step(stage) {\n  recordReviewStep(stage);\n}\nfunction probe(b) {}\n/\\)/.test(b);\nstep("composer_waiting");';
-  const {problems} = recordedStages(text, 'composer.js');
-  assert.ok(problems.includes('composer.js: could not be tokenized (unexpected )), so its recorders forward nothing'), problems.join('\n'));
+  assert.deepEqual(recordedStages(text, 'composer.js').problems, ['composer.js: could not be tokenized (unexpected )), so its recorder calls cannot be read']);
   // After the head of if, while, for or with, a `/` starts a regex: the file tokenizes and step() forwards.
   for (const head of ['if (a)', 'while (a)', 'for (;a;)', 'with (a)']) {
     const readable = `function step(stage) {\n  recordReviewStep(stage);\n}\nfunction probe(a, b) { ${head} /\\)/.test(b); }\nstep("composer_waiting");`;

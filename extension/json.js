@@ -1274,7 +1274,7 @@ function installReviewRunner(name, run) {
         if (takenOver && !state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = e.takeoverCause || "navigated"; }
         const leaseExpired = e?.code === "stalled"; // expireGeneratingLease (#87)
         recordReviewStep(e?.code === "quota" ? "quota" : e?.code === "cancelled" ? "cancelled" : takenOver ? "context_changed" :
-          leaseExpired ? "lease_expired_generating" : e?.code === "presend_stalled" ? "presend_stalled" : "error");
+          leaseExpired ? "lease_expired_generating" : e?.code === "presend_stalled" ? "presend_stalled" : e?.code === "logged_out" ? "logged_out" : "error");
         state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })

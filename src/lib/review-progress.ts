@@ -21,6 +21,7 @@ export const PROGRESS_LABELS = {
     reasoning_selecting: "Prompt not sent · selecting the reasoning level",
     reasoning_skipped: "Reasoning level could not be selected in time · continuing with the current model",
     presend_stalled: "A pre-send stage stalled past its bound · nothing was sent; run failed",
+    logged_out: "ChatGPT is logged out in this Chrome profile · nothing was sent; log in and retry",
     attachments_waiting: "Prompt entered · waiting for named attachments to finish uploading",
     response_completed_json_invalid: "Response completion controls observed · JSON invalid; inspect original (no automatic resend)",
     attachments_preparing: "Preparing prompt and attachments",

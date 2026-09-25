@@ -64,3 +64,32 @@ test('normalizing a result does not break duplicate-delivery acknowledgement',as
  state.jobs[0].status='posted';
  assert.equal((await bridge.completeBridgeJob('job1',wrapped,[{provider:'chatgpt',raw:wrapped}],'lease')).ok,true);
 });
+
+test('a logged-out ChatGPT page pauses new chatgpt legs ~10 min: the next leg fails fast with no tab, and with every provider paused nothing is taken (#455)',async()=>{
+ const offers=[{jobId:'A',provider:'chatgpt',providers:['chatgpt'],prompt:'p'},{jobId:'B',provider:'chatgpt',providers:['chatgpt'],prompt:'p'}];
+ const api=async(_p,body)=>body?.action==='take'?{ok:true,job:offers.shift()??null}:{ok:true,prompt:'p'};
+ const b=background({api,handler:(_id,msg)=>msg.type==='ashlar-run'?{ok:false,code:'busy'}:
+  {ok:false,code:'logged_out',error:'ChatGPT is logged out in this Chrome profile; log in and retry (nothing was typed or sent)'}});
+ for(let i=0;i<4 && !b.calls.some(c=>c.action==='failure'&&c.jobId==='A');i++){await b.tick();await flush();}
+ const failA=b.calls.find(c=>c.action==='failure'&&c.jobId==='A');
+ assert.ok(failA,'the logged_out outcome is delivered');
+ assert.match(failA.error,/^logged_out: ChatGPT is logged out in this Chrome profile; log in and retry/);
+ const until=b.local.state.loginPause?.chatgpt;
+ assert.ok(until>Date.now()+9*60_000 && until<=Date.now()+10*60_000,`chatgpt paused ~10 min: ${until}`);
+ const tabsBefore=b.effects.filter(e=>e.effect==='create').length;
+ for(let i=0;i<4 && !b.calls.some(c=>c.action==='failure'&&c.jobId==='B');i++){await b.tick();await flush();}
+ const failB=b.calls.find(c=>c.action==='failure'&&c.jobId==='B');
+ assert.ok(failB,'the next chatgpt leg fails at once while paused');
+ assert.match(failB.error,/^logged_out: /);
+ assert.equal(b.effects.filter(e=>e.effect==='create').length,tabsBefore,'no tab is opened for a paused provider');
+ // Grok also unavailable: admission takes nothing and says why.
+ await b.local.set({quota:{grok:Date.now()+60*60_000}});
+ const takes=b.calls.filter(c=>c.action==='take').length;
+ await b.tick();await flush();
+ assert.equal(b.calls.filter(c=>c.action==='take').length,takes,'no new job is taken while every provider is paused');
+ assert.equal(b.local.state.bridgeWorkerStatus.admissionPhase,'logged_out');
+ // Past the pause, admission re-checks.
+ await b.local.set({loginPause:{chatgpt:Date.now()-1}});
+ await b.tick();await flush();
+ assert.equal(b.calls.filter(c=>c.action==='take').length,takes+1,'admission resumes after the pause');
+});

@@ -43,6 +43,7 @@ async function refreshDiagnostics() {
     admitted: "New review assigned", recovered: "Original bound review recovered without a new tab", idle: "No new job assigned at the last poll",
     tab_capacity: "New tabs paused: review-tab capacity reached",
     provider_quota: "New work paused: provider quota",
+    logged_out: "New work paused: ChatGPT is logged out in this Chrome profile; log in (re-checked every 10 min)",
     disconnected: "Server unavailable; preserving pending work",
     maintenance: "Extension update lock active; new review admission paused",
     duplicate_job: "Server repeated an existing job; original work preserved",

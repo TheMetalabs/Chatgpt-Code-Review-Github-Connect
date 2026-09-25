@@ -576,9 +576,75 @@ function firstMisuse(tokens, from, to, name, aliases, ctx = {}) {
   return null;
 }
 
+/** Words whose parenthesised head is followed by a block that runs where it stands. */
+const STATEMENT_HEADS = new Set(['if', 'for', 'while', 'with', 'switch', 'catch', 'await']);
+
+/** The range of `tokens` that a function or class starting at `tokens[k]` spans, as {from, to}, or null:
+ * a `(...)` and the `{...}` after it (a function declaration or expression, or a method, but not an if,
+ * for, while, with, switch or catch), an arrow's parameters and body (an expression body runs to the
+ * next `,` or `;`), or a class body. Its code runs when it is called, not where it stands. */
+function functionAt(tokens, k) {
+  const token = tokens[k];
+  if (isPunct(token, '=>')) {
+    let to = k + 2;
+    if (tokens[k + 1]?.open !== '{') for (to = k + 1; to < tokens.length && !isPunct(tokens[to], ',') && !isPunct(tokens[to], ';'); to += 1);
+    return {from: k - 1, to};
+  }
+  if (token.open !== '{') return null;
+  if (tokens[k - 1]?.open === '(' && !STATEMENT_HEADS.has(tokens[k - 2]?.text)) return {from: k - 1, to: k + 1};
+  return classBody(tokens, k) ? {from: k, to: k + 1} : null;
+}
+
+/** The functions and classes anywhere in `level` (functionAt), as {tokens, from, to}. */
+function functionRanges(level) {
+  const ranges = [];
+  walkTokens(level, (token, tokens, k) => {
+    const range = functionAt(tokens, k);
+    if (range) ranges.push({tokens, ...range});
+  });
+  return ranges;
+}
+
+/** The loop at or after `tokens[start]` whose statement holds `tokens[index]`, as {from, to}, or null: a
+ * for, while or do loop with its head (a for's update runs between passes) and its body. */
+function loopAround(tokens, index, start) {
+  for (let j = start; j < index; j += 1) {
+    let to = -1;
+    if (isWord(tokens[j], 'do')) {
+      to = statementEnd(tokens, j + 1);
+      if (isWord(tokens[to], 'while')) to += 2;
+    } else if (isWord(tokens[j], 'for') || isWord(tokens[j], 'while')) {
+      const head = isWord(tokens[j + 1], 'await') ? j + 2 : j + 1;
+      if (tokens[head]?.open === '(') to = statementEnd(tokens, head + 1);
+    }
+    if (index < to) return {from: j, to};
+  }
+  return null;
+}
+
+/** The first misuse of `name` in code of the block that declares it (`decl`) that can run between the
+ * declaration and the read at the end of `path` without standing between them: a function anywhere in
+ * the block, called at any time (before the declaration or after the read as well); a loop in the block
+ * around the read, whose next pass runs its whole statement before the read again; and, when the read is
+ * itself in a function there, the rest of the block after the declaration. `contexts` is what surrounds
+ * each level of `path` (innerContext). */
+function runsLater(path, decl, name, aliases, contexts) {
+  const block = path[decl.frame].tokens;
+  let hit = null, deferred = false;
+  for (let frame = decl.frame; frame < path.length; frame += 1) {
+    const {tokens, index} = path[frame], loop = loopAround(tokens, index, frame === decl.frame ? decl.at + 1 : 0);
+    if (loop) hit ||= firstMisuse(tokens, loop.from, loop.to, name, aliases, contexts[frame]);
+    deferred ||= tokens.some((token, k) => { const range = functionAt(tokens, k); return Boolean(range) && range.from <= index && index < range.to; });
+  }
+  if (deferred) hit ||= firstMisuse(block, decl.at + 1, block.length, name, aliases, contexts[decl.frame]);
+  for (const range of functionRanges(block)) hit ||= firstMisuse(range.tokens, range.from, range.to, name, aliases);
+  return hit;
+}
+
 /** What could change or shadow `name` between its declaration `decl` and the read at the end of `path`:
  * the first misuse in the code between them (an earlier substitution of a template the read is in
- * included), or a function declaration of the name in a level the read sits in, hoisted over it. */
+ * included), or in code that runs between them from elsewhere (runsLater), or a function declaration of
+ * the name in a level the read sits in, hoisted over it. */
 function changedBetween(path, decl, name, aliases) {
   const contexts = [{}];
   for (let frame = 1; frame < path.length; frame += 1) {
@@ -594,7 +660,7 @@ function changedBetween(path, decl, name, aliases) {
     const hoisted = level.find((token, k) => token.kind === 'word' && token.text === name && level[k - 1]?.text === 'function');
     hit ||= firstMisuse(level, 0, path[frame].index, name, aliases, contexts[frame]) || (hoisted && {token: hoisted, why: MISUSE});
   }
-  return hit;
+  return hit || runsLater(path, decl, name, aliases, contexts);
 }
 
 /** What a `const` declared by `by` with initialiser `init` aliases: the object its leading member chain
@@ -947,6 +1013,10 @@ test('repair_${status.status} takes the RepairStatus values only where status is
   // Reading values below either name, a method of such a value, and writes elsewhere change neither.
   assert.deepEqual(problems(`${REPAIR_REPLY}note(response.repair.id, response?.repair?.runId, response.ok, status.status.trim(), [status.id], status.id in row);\n` +
     `attempt.status = response.repair.status; attempt.repair = {detail: status.status}; row.response.repair = null;\n${record};`), []);
+  // Code after the read runs after it unless a loop or a function brings it back: a write after the read,
+  // a loop after it, functions that only read either name and another block's own status change nothing.
+  assert.deepEqual(problems(`${REPAIR_REPLY}${record};\nstatus.status = "late";\nfor (const row of rows) response.repair.status = row;\n` +
+    'const peek = () => status.status;\nfunction later() { return response.repair.id; }\nif (ok) { const status = {}; status.status = "x"; }'), []);
   const reply = REPAIR_REPLY;
   for (const [body, problem] of [
     // Another binding named status, or none.
@@ -1013,6 +1083,23 @@ test('repair_${status.status} takes the RepairStatus values only where status is
     [`${reply}(response.repair).status = "stalled";\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
     [reply.replace('\nconst status', '\nObject.assign(response.repair, patch);\nconst status') + `${record};`,
       'line 3 uses other than as a member read (response.repair holds what status aliases)'],
+    // Code that runs between them without standing between them: a function anywhere in the block, called
+    // at any time (declared after the read and hoisted, or before the declarations); a loop around the
+    // read, whose next pass runs its whole statement first; and the rest of the block when the read is
+    // itself in a function.
+    [`${reply}mutate();\n${record};\nfunction mutate() { status.status = "stalled"; }`, 'reads status, which line 6 uses'],
+    [`${reply}mutate();\n${record};\nfunction mutate(late = status.status = "stalled") {}`, 'reads status, which line 6 uses'],
+    [`function mutate() { response.repair.status = "stalled"; }\n${reply}mutate();\n${record};`, 'reads response, which line 2 uses'],
+    [`const mutate = () => response.repair.status = "stalled";\n${reply}mutate();\n${record};`, 'reads response, which line 2 uses'],
+    [`const hooks = {reset() { response.repair = null; }};\n${reply}hooks.reset();\n${record};`, 'reads response, which line 2 uses'],
+    [`class Hooks { static reset() { status.status = "stalled"; } }\n${reply}Hooks.reset();\n${record};`, 'reads status, which line 2 uses'],
+    [`${reply}for (const row of rows) {\n  ${record};\n  response.repair.status = "stalled";\n}`, 'reads response, which line 6 uses'],
+    [`${reply}for (const row of rows) {\n  ${record};\n  status.status = row;\n}`, 'reads status, which line 6 uses'],
+    [`${reply}for (let i = 0; i < 2; status.status = "stalled", i += 1) ${record};`, 'reads status, which line 4 uses'],
+    [`${reply}while (next()) ${record}, status.status = "stalled";`, 'reads status, which line 4 uses'],
+    [`${reply}do {\n  if (ok) ${record};\n  response.repair = patch;\n} while (next());`, 'reads response, which line 6 uses'],
+    [`${reply}setTimeout(() => ${record});\nstatus.status = "stalled";`, 'reads status, which line 5 uses'],
+    [`${reply}const later = () => {\n  ${record};\n};\nresponse.repair = patch;\nlater();`, 'reads response, which line 7 uses'],
   ]) {
     const found = problems(body);
     assert.equal(found.length, 1, `${body}\n: ${found.join('\n')}`);

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {validateRepairCandidate, inspectReviewFormat, REPAIR_SCHEMA_VERSION} from '../../src/lib/review-json-repair.ts';
+import {readFileSync} from 'node:fs';
+import {jsonBody, validateRepairCandidate, inspectReviewFormat, REPAIR_SCHEMA_VERSION} from '../../src/lib/review-json-repair.ts';
 import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 import {sanitizeBotSettings, botSettingsToEnv} from '../../src/lib/settings.server.ts';
 const finding={severity:'P1',file:'a.ts',line:1,side:'RIGHT',title:'Preserve the transaction',failure_scenario:'The write commits twice.',root_cause:'The writer does not hold the lock.',evidence:'a.ts:1: if (state === "active") commit();',recommended_fix:'Keep the lock until commit.',recommended_test:'Run two concurrent writes.'};
@@ -88,4 +89,26 @@ test('malformed source cannot hide another finding inside a repaired string',()=
  const swallowed=source.slice(start,end);
  const candidate=JSON.stringify({findings:[{...first,recommended_test:swallowed}]});
  assert.equal(validateRepairCandidate(source,candidate,'review').ok,false,'another finding was absorbed as string content');
+});
+
+// Job 1043 (#87): ChatGPT's rendered code block is captured with its "JSON" language label and
+// blank header lines before the object. The original is the verbatim capture; the candidate is the
+// label-free body with the one stray quote escaped by hand.
+const labelledOriginal=readFileSync(new URL('./fixtures/chatgpt-1043-labelled-stray-quote.txt',import.meta.url),'utf8');
+const handFixed=labelledOriginal.slice(labelledOriginal.indexOf('{')).replace(String.raw`\\").trim();`,String.raw`\\\").trim();`);
+test('a correct repair of a labelled capture is accepted: the rendered JSON label is not content',()=>{
+ assert.match(labelledOriginal,/^JSON\n\n/);
+ const out=validateRepairCandidate(labelledOriginal,handFixed,'review');
+ assert.deepEqual(out.errors,undefined);assert.equal(out.ok,true);
+ assert.deepEqual(JSON.parse(out.raw).findings.map(f=>f.severity),['P1','P1','P2']);
+ assert.equal(validateRepairCandidate('JSON\n\n'+malformed,raw,'review').ok,true);
+ assert.equal(inspectReviewFormat('json\n\n\n'+raw,'review').ok,true);
+});
+test('only a bare label line before an object or array is stripped; prose around JSON is kept',()=>{
+ assert.equal(jsonBody('JSON\n\n\n{"findings":[]}'),'{"findings":[]}');
+ assert.equal(jsonBody('json\n[1]'),'[1]');
+ for(const text of ['Here is JSON\n{"findings":[]}','JSONish\n{"findings":[]}','JSON {"findings":[]}','JSON\nnote\n{"findings":[]}'])
+  assert.equal(jsonBody(text),text);
+ assert.equal(inspectReviewFormat('Here is JSON\n'+raw,'review').ok,false);
+ assert.equal(validateRepairCandidate('Here is JSON\n'+malformed,raw,'review').ok,false);
 });

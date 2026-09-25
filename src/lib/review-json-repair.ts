@@ -11,7 +11,12 @@ const findingKeys = [...findingStrings,"severity","line","side"];
 export function jsonBody(raw: string): string {
   const text = raw.trim();
   const fence = /^```(?:json)?\s*\n([\s\S]*)\n```$/i.exec(text);
-  return fence ? fence[1].trim() : text;
+  if (fence) return fence[1].trim();
+  // The browser capture is the rendered DOM: a ```json block renders its language label ("JSON")
+  // and header wrappers as a line of its own plus blank lines before the object. Only that bare
+  // label is dropped; any other text before the JSON stays and fails validation.
+  const label = /^json[ \t]*\n\s*(?=[{[])/i.exec(text);
+  return label ? text.slice(label[0].length) : text;
 }
 export function repairSchemaDefinition(kind: RepairSchema) {
   const string = {type:"string",minLength:1};

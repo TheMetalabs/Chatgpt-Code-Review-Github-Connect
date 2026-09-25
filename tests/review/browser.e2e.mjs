@@ -1182,10 +1182,15 @@ const FIX_SOURCE='Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\
 // at 20 s; a Send click meanwhile is swallowed (the live 1.1.29 failure: send_attempted, no turn).
 // upload='error': the same ring, then at 3 s the chip turns to an error state and an error toast shows.
 // upload='rejected': no chip; an error toast at 1.5 s. swallow: every Send click is ignored.
-async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false}={}){
+// render: how the sent user turn shows the file. 'tile': a data-file-name tile in the message node;
+// 'card'/'beside': ChatGPT's file card (the name and its type and size as plain text, no data
+// attributes) inside the message node, or beside it in the turn's section; 'none': no file shown.
+// The page stays on the temporary chat URL after the send (ChatGPT does not move it).
+const FILE_CARD=name=>`<div class="group relative inline-block text-sm"><div class="relative overflow-hidden rounded-2xl border"><div class="p-2 w-80"><div class="flex flex-row items-center gap-2"><div class="relative h-10 w-10 shrink-0"><svg viewBox="0 0 36 36" style="width:36px;height:36px"><rect width="36" height="36"></rect></svg></div><div class="overflow-hidden"><div class="truncate font-semibold">${name}</div><div class="truncate text-token-text-secondary">Document · 1.2 KB</div></div></div></div></div></div>`;
+async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false,render='tile'}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await setFixContent(page,`<main></main><form data-type="unified-composer">${fileInput?'<input type="file" multiple>':''}<div id="chips"></div><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>`);
- await page.evaluate(({stop,upload,collapse,swallow})=>{
+ await page.evaluate(({stop,upload,collapse,swallow,render,card})=>{
   const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A']]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.__saved=saved;window.sends=0;window.clicks=0;window.uploads=[];window.uploading=false;
@@ -1226,12 +1231,32 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swall
    window.atClick={text:composer.value,chips:[...document.querySelectorAll('#chips [data-file-name]')].map(chip=>chip.dataset.fileName)};
    const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';
    const userTurn=document.createElement('div');userTurn.dataset.messageAuthorRole='user';userTurn.dataset.messageId='user-A';
-   const tile=document.createElement('div');tile.dataset.fileName=window.atClick.chips[0]||'';tile.textContent=window.atClick.chips[0]||'';
-   const text=document.createElement('div');text.textContent=composer.value;userTurn.append(tile,text);
+   const name=window.atClick.chips[0]||'';
+   if(render==='tile'){
+    const tile=document.createElement('div');tile.dataset.fileName=name;tile.textContent=name;
+    const text=document.createElement('div');text.textContent=composer.value;userTurn.append(tile,text);
+   }else{
+    // 'card': the plain-text bubble (whitespace-pre-wrap) with the card above it in the message node;
+    // 'card-rich': the rich-text body with the card inside its collapsible content; 'beside'/'none':
+    // the rich-text body alone.
+    const column=document.createElement('div');column.className='flex w-full flex-col items-end gap-1';
+    if(render==='card'){
+     column.insertAdjacentHTML('beforeend',card.replace('__NAME__',name));
+     const bubble=document.createElement('div');bubble.className='user-message-bubble-color';
+     const plain=document.createElement('div');plain.className='whitespace-pre-wrap';plain.textContent=composer.value;bubble.append(plain);column.append(bubble);
+    }else{
+     const body=document.createElement('div');body.dataset.testid='collapsible-user-message-content';
+     if(render==='card-rich')body.insertAdjacentHTML('beforeend',card.replace('__NAME__',name));
+     const rich=document.createElement('div');rich.className='rich-text-user-turn markdown';const p=document.createElement('p');p.textContent=composer.value;rich.append(p);body.append(rich);
+     column.append(body);
+    }
+    userTurn.append(column);
+    if(render==='beside')turn.insertAdjacentHTML('beforeend',`<div class="flex justify-end">${card.replace('__NAME__',name)}</div>`);
+   }
    turn.append(userTurn);document.querySelector('main').append(turn);
    composer.value='';document.querySelector('#chips').replaceChildren();event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
   });
- },{stop,upload,collapse,swallow});
+ },{stop,upload,collapse,swallow,render,card:FILE_CARD('__NAME__')});
  for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(()=>{Object.assign(__ashlarRunnerState,{kind:'fix',jobId:'fix-A',runId:'run-A',running:true});});
  const fill=async(delivery,ms=1600)=>{
@@ -1275,6 +1300,40 @@ test('real DOM (#93): a composer that collapses typed whitespace still sends the
  },{code,toolbar});
  await page.clock.runFor(3200);
  assert.deepEqual(await page.evaluate(()=>window.fixOut),{raw:code},'the sent turn (file tile + typed line) proves the fix');
+});
+
+// The live 1.1.30 failure (a chatgpt fix in the temporary chat, its source attached as
+// ashlar-fix-request.txt): ChatGPT renders the sent turn with the file as a card holding the name and
+// its type and size as plain text, in or beside the message node, and the URL stays on the temporary
+// chat. The card is not the prompt: the turn is the fix's send when it grew the user turns, is exactly
+// the typed line with the card left out, and shows the file; its answer is then harvested. A turn
+// that shows the typed line but not the file is not the fix's send (send_unconfirmed, never re-sent).
+async function harvestAfterSend(page){
+ const code='{"summary":"s","files":[],"dispositions":[]}';
+ await page.evaluate(({code,toolbar})=>{
+  document.querySelector('[data-testid="stop-button"]').remove();
+  document.querySelector('main').insertAdjacentHTML('beforeend',`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><pre><code>${code}</code></pre></div></div>${toolbar}</section>`);
+  window.fixOut={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={code:e.code};});
+ },{code,toolbar});
+ await page.clock.runFor(3200);
+ return {out:await page.evaluate(()=>window.fixOut),code};
+}
+test('real DOM: a temporary-chat fix whose sent turn shows ChatGPT\'s file card (in or beside the message) is confirmed and harvested; one without the file is not its send',async t=>{
+ const {attachment,typed,text}=await fixDelivery();
+ const got={};
+ for(const render of ['card','card-rich','beside']){
+  const {page,fill,journal}=await attachmentPage(t,{render,collapse:true});
+  const sent=await fill(text);
+  const j=await journal();
+  const {out,code}=await harvestAfterSend(page);
+  got[render]={sent:[sent.sends,sent.sent,sent.code],url:await page.evaluate(()=>location.href),
+   journal:[j.phase,j.submittedUsers,j.exact===typed,j.attachments],answer:out.raw===code?'harvested':out};
+ }
+ const {page,fill,journal}=await attachmentPage(t,{render:'none',collapse:true});
+ const none=await fill(text,61_000);
+ got.none={sent:[none.sends,none.sent,none.code],clicks:await page.evaluate(()=>window.clicks),phase:(await journal()).phase};
+ const shown={sent:[1,true,undefined],url:TEMP_URL,journal:['sent',1,true,[attachment.name]],answer:'harvested'};
+ assert.deepEqual(got,{card:shown,'card-rich':shown,beside:shown,none:{sent:[1,false,'send_unconfirmed'],clicks:1,phase:'attempted'}});
 });
 
 for(const [name,opts,ms,detail] of [

@@ -1113,3 +1113,70 @@ for (const kind of ['review', 'fix']) {
     assert.equal(state.tabId, 11, 'the sweep saved the leg\'s live tab');
   });
 }
+
+// X2 (#85): a new ChatGPT prompt is typed and sent only on the new chat its tab was opened on. The
+// fresh tab is active, so the user can open one of their own conversations in it before the first
+// dispatch (or Chrome swaps a prerendered page of theirs in). Nothing is sent there: the leg fails
+// `taken_over`, the tab is kept (never closed, never messaged) and its slot is freed at once.
+const MOVED = 'https://chatgpt.com/c/users-own';
+const refusedRunVerdict = cause => (_id, m) => (m.type === 'ashlar-tab-status' ? {ok: true}
+  : m.type === 'ashlar-run' ? {ok: false, code: 'taken_over', cause, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'busy', retry: true});
+const failureOf = b => b.calls.find(c => c.action === 'failure')?.error || '';
+for (const kind of ['review', 'fix']) {
+  const kept = kind === 'fix' ? 'worker:preserve_undelivered' : 'worker:preserve_navigated';
+  test(`${kind}: a fresh tab the user moved to their own conversation before the dispatch gets no run message; it is kept and its slot freed`, async () => {
+    const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: MOVED, status: 'complete'}, handler: blankVerdict});
+    for (let i = 0; i < 3 && b.pending(); i++) await b.tick();
+    assert.deepEqual(b.messages.filter(m => m.id === 10 && m.type !== 'ashlar-tab-status').map(m => m.type), [], 'the tab is never messaged');
+    assert.match(failureOf(b), /^taken_over: the tab left its new chat before the prompt was sent; nothing was sent/);
+    assert.deepEqual(b.closedTabs, [], 'never closed');assert.ok(b.tabs.has(10));
+    assert.equal(b.pending(), undefined, 'retired: the slot is free');
+    assert.ok(uploaded(b).includes('worker:taken_before_send') && uploaded(b).includes(kept), `${uploaded(b)}`);
+    assert.equal((await b.context.tabCapacityReport({})).managedTabs, 0, 'the kept tab holds no review slot');
+  });
+  test(`${kind}: a fresh tab Chrome replaced with a page on the user's conversation (prerender) gets no run message; it is kept`, async () => {
+    const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: blankVerdict});
+    await b.replaceTab(10, {id: 11, url: MOVED, status: 'complete'});
+    for (let i = 0; i < 3 && b.pending(); i++) await b.tick();
+    assert.equal(b.messages.some(m => m.type === 'ashlar-run'), false, 'no run message to either id');
+    assert.match(failureOf(b), /^taken_over: /);
+    assert.deepEqual(b.closedTabs, []);assert.ok(b.tabs.has(11));
+    assert.equal(b.pending(), undefined);
+    assert.ok(uploaded(b).includes('worker:taken_before_send') && uploaded(b).includes(kept), `${uploaded(b)}`);
+  });
+  test(`${kind}: a fresh tab with a navigation pending gets no run message`, async () => {
+    const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, pendingUrl: MOVED, status: 'complete'}, handler: blankVerdict});
+    await b.tick();
+    assert.equal(b.messages.some(m => m.type === 'ashlar-run'), false);
+    assert.match(failureOf(b), /^taken_over: /);assert.deepEqual(b.closedTabs, []);
+  });
+  // X2-g: the page refuses the new run (its own check: off the new chat, or a user turn there). It
+  // bound nothing; the leg never counts as started, fails taken_over with the page's cause, and the
+  // tab is kept without another message. A fix is kept as undelivered, never closed (#77).
+  for (const cause of ['navigated', 'user_turn']) {
+    test(`${kind}: a new run the page refuses (${cause}) is never started; the tab is kept and never messaged again`, async () => {
+      const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: refusedRunVerdict(cause)});
+      for (let i = 0; i < 3 && b.pending(); i++) await b.tick();
+      assert.deepEqual(b.messages.filter(m => m.id === 10 && m.type !== 'ashlar-tab-status').map(m => m.type), ['ashlar-run'], 'one run message, nothing after the refusal');
+      assert.match(failureOf(b), cause === 'user_turn' ? /^taken_over: a user message appeared in the tab before the prompt was sent/ : /^taken_over: the tab left its new chat/);
+      assert.deepEqual(b.closedTabs, [], 'never closed');
+      assert.equal(b.pending(), undefined, 'retired');
+      assert.equal(uploaded(b).includes('worker:run_dispatched'), false, 'never recorded as dispatched');
+      assert.ok(uploaded(b).includes(kind === 'fix' ? 'worker:preserve_undelivered' : `worker:preserve_${cause}`), `${uploaded(b)}`);
+    });
+  }
+}
+// X2-c, controls: a fresh tab still on its new chat is dispatched (ChatGPT's temporary chat, with or
+// without its query), and so is Grok's home (Grok's fresh-page check is deferred, #82).
+for (const [provider, url] of [['chatgpt', TEMP], ['chatgpt', 'https://chatgpt.com/'], ['grok', 'https://grok.com/']]) {
+  test(`control: a fresh ${provider} tab on ${url} is dispatched once, with its allocation page`, async () => {
+    const job = {...leg('review', {started: false}), providers: [provider], states: {[provider]: {tabId: 10, started: false, runId: 'run-A'}}};
+    const session = storage({'ashlar:tab:10': {jobId: job.jobId, provider, runId: 'run-A', closedKey: `ashlar:closed:${job.jobId}:${provider}:run-A`, closing: false}});
+    const b = worker(job, {session, tab: {id: 10, url, status: 'complete'}});
+    await b.tick();
+    const runs = b.messages.filter(m => m.type === 'ashlar-run');
+    assert.deepEqual(runs.map(m => [m.id, m.allocationUrl]), [[10, provider === 'grok' ? 'https://grok.com/' : TEMP]]);
+    assert.equal(b.pending().states[provider].started, true);
+    assert.equal(b.calls.some(c => c.action === 'failure'), false);
+  });
+}

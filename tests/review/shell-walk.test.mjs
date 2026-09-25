@@ -408,7 +408,8 @@ for (const kind of ['review', 'fix']) {
         const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
         const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
           providers: ['chatgpt'], states: {chatgpt: {tabId: 10, started, runId: 'run-A'}}};
-        const tab = {id: 10, url: URL_TAB, status: 'complete', ...asleep};
+        // (An undispatched leg's tab still shows the new chat it was opened on: X2, #85.)
+        const tab = {id: 10, url: started ? URL_TAB : 'https://chatgpt.com/?temporary-chat=true', status: 'complete', ...asleep};
         const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[jobId]: job}}),
           session: storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}}),
           tabs: new Map([[10, tab]]), api: async (_path, body) => (body?.action === 'ping' ? {ok: true, active: true, accepted: true, status: 'awaiting_chat'} : {ok: true, job: null})});

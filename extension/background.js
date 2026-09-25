@@ -1423,6 +1423,13 @@ function tabVerdict(result, kind) {
  * retires. No page verdict can authorise that close, so nothing is waited for. */
 async function forceCloseFixTab(job, provider, jobs, tab) {
   const state = job.states[provider];
+  // A new run its tab stopped being fresh for before the send (takenBeforeSend): nothing was sent,
+  // and the page (the user's now) holds no binding of it (it fenced the run itself when it refused
+  // it). Kept at once, never messaged, and its slot released now. A fix keeps its #77 cause.
+  if (state.started !== true && state.outcome?.code === "taken_over") {
+    return preserveFixTab(job, provider, jobs, "the tab was taken over before the prompt was sent; tab preserved", undefined,
+      job.kind === "fix" ? "undelivered" : state.outcome.cause === "user_turn" ? "user_turn" : "navigated");
+  }
   if (job.kind === "fix" && !fixAnswerDelivered(state)) {
     const why = state.outcome?.ok === false ? state.outcome.code || "failure" : state.outcome?.ok ? "answer delivery unconfirmed"
       : state.abandonedAs || job.serverStatus || "no answer";
@@ -1679,6 +1686,26 @@ async function unrecordedTabWait(job, provider, jobs) {
   await saveJobs(jobs);
 }
 
+/** Why a page refused a new run message (json.js, before it binds anything): "taken_over" (its tab
+ * is not the fresh page the run may start on); "" when it did not refuse. A refusal comes from an
+ * unbound page, so it never names this run. */
+function refusedRun(result, job, provider) {
+  return !matchesJob(result, job, provider) && result?.ok === false && result.code === "taken_over" ? result.code : "";
+}
+
+/** A new run whose tab stopped being the fresh page it was opened on before its prompt was sent (X2,
+ * #85): the worker saw the tab off its new chat, or the page refused the run (`cause`: "navigated",
+ * or "user_turn" for a user message there). Nothing was sent. The leg fails `taken_over`, and its
+ * release keeps the tab without asking it (forceCloseFixTab). */
+async function takenBeforeSend(job, provider, jobs, cause) {
+  const state = job.states[provider];
+  const turn = cause === "user_turn";
+  state.outcome = {...failure("taken_over", `${turn ? "a user message appeared in the tab" : "the tab left its new chat"} before the prompt was sent; nothing was sent`),
+    cause: turn ? "user_turn" : "navigated"};
+  workerStep(job, provider, "taken_before_send");
+  await saveJobs(jobs);
+}
+
 async function pollProvider(job, provider, jobs, observeOnly = false) {
   const state = job.states[provider];
   if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
@@ -1797,7 +1824,14 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws: a message
   // would only wait out askPage. Polled again next tick.
   if (tab.frozen === true) return;
-  const run = { ...tabMessage(job, provider, "ashlar-run"),
+  // A new ChatGPT prompt goes only into the new chat its tab was opened on (X2, #85): the tab is
+  // active, so the user may have opened one of their own conversations in it before this dispatch.
+  // Nothing is sent there (the page checks again: json.js freshPageLeft).
+  if (!state.started && !observeOnly && provider === "chatgpt" && (tab.pendingUrl || !onAllocationPage(tab.url, provider))) {
+    return takenBeforeSend(job, provider, jobs, "navigated");
+  }
+  // `allocationUrl`: the page a new run may start on (json.js checks it before it binds).
+  const run = { ...tabMessage(job, provider, "ashlar-run"), allocationUrl: providerUrl(provider),
     prompt: job.prompts?.[provider] || job.prompt, reasoning: job.reasoning?.[provider], adoptLegacy: state.adoptLegacy };
   let result, dispatched = false;
   try {
@@ -1805,10 +1839,13 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       // The page runner deduplicates a retried start when its acknowledgement was lost (or late:
       // askPage gives up on it, and the next tick asks again).
       result = await askPage(state.tabId, run, contentFiles(provider));
-      dispatched = true;
-      state.started = true;
-      workerStep(job,provider,"run_dispatched");
-      await saveJobs(jobs);
+      // A page that refused the new run bound nothing: the run was never started.
+      if (!refusedRun(result, job, provider)) {
+        dispatched = true;
+        state.started = true;
+        workerStep(job,provider,"run_dispatched");
+        await saveJobs(jobs);
+      }
     } else {
       result = await askPage(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
       if (result?.code === "idle" && (!observeOnly || matchesJob(result, job, provider))) {
@@ -1829,6 +1866,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await discardWaitOver(job, provider, jobs); // a woken page that never answers is bounded too
     return;
   }
+  if (!state.started && refusedRun(result, job, provider) === "taken_over") return takenBeforeSend(job, provider, jobs, result.cause);
   if (await discardWaitOver(job, provider, jobs, matchesJob(result, job, provider) && discardedRunProven(result, dispatched))) return;
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
     state.connectionError = "original job binding unavailable; waiting for reconnection";

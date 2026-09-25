@@ -12,6 +12,7 @@ export const PROGRESS_LABELS = {
     repair_needs_attention: "Local JSON repair needs attention · inspect original and candidate",
     tab_created: "Review tab created",
     run_dispatched: "Page runner acknowledged · submission not yet confirmed",
+    taken_before_send: "Tab taken over before the prompt was sent (it left its new chat, or the user wrote there) · nothing was sent; tab kept",
     composer_waiting: "Prompt not sent · waiting for composer",
     attachments_waiting: "Prompt entered · waiting for named attachments to finish uploading",
     response_completed_json_invalid: "Response completion controls observed · JSON invalid; inspect original (no automatic resend)",

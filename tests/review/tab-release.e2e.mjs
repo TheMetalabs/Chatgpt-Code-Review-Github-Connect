@@ -768,7 +768,7 @@ for(const kind of ['review','fix'])for(const persisted of [true,false])test(`wor
  assert.ok(w.b.messages.some(m=>m.type==='ashlar-fix-cancel'&&m.undispatched===true&&(kind!=='fix'||m.preserve===true)),'the release says the run was never dispatched');
  assert.equal(await tab.page.evaluate(key=>sessionStorage.getItem(key),`ashlar:stopped:${tab.job}:${tab.run}`),persisted?'true':null);
  assert.equal(await tab.released(),null,'an unbound page has no binding to release');
- await tab.send('ashlar-run',{prompt:PROMPT});await tab.page.clock.runFor(2000);
+ await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL});await tab.page.clock.runFor(2000);
  assert.equal(await tab.clicks(),0,'the late run never sends');
  assert.deepEqual(await tab.runner(),{running:false,code:'cancelled'});
 });
@@ -1044,4 +1044,48 @@ for(const [name,takeover,closed] of [['no user activity',null,[10]],['a follow-u
  const res=await w.b.context.clearStuckJobs();
  assert.deepEqual({ok:res.ok,cleared:res.cleared},{ok:true,cleared:1});
  assert.deepEqual(w.b.closedTabs,closed);
+});
+
+// X2 (#85), real pages: a new ChatGPT run is typed and sent only on the new chat its tab was opened
+// on, with no user turn there. The page refuses a run elsewhere (binding nothing, and fencing that
+// run), and a run it accepted ends before its Send once the user moves the tab to their own
+// conversation: nothing more is typed or clicked there.
+const composerText=tab=>tab.page.evaluate(()=>document.getElementById('prompt-textarea').textContent);
+for(const [what,view,cause] of [['on the user\'s conversation',{url:OTHER_URL},'navigated'],['holding a user turn',{thread:userTurn('user-X','my own question')},'user_turn']])
+ test(`fresh run: a page ${what} refuses a new run; nothing is bound, typed or clicked, and the run is fenced`,async t=>{
+  const tab=await chatTab(t,{bound:false,...view});
+  const out=await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL});
+  assert.deepEqual({ok:out.ok,code:out.code,cause:out.cause,jobId:out.jobId},{ok:false,code:'taken_over',cause,jobId:''});
+  await tab.page.clock.runFor(2000);
+  assert.equal(await tab.clicks(),0);assert.equal(await composerText(tab),'','nothing typed');
+  assert.equal(await tab.page.evaluate(()=>sessionStorage.getItem('ashlar:job')),null,'nothing bound');
+  assert.equal(await tab.page.evaluate(key=>sessionStorage.getItem(key),`ashlar:stopped:${tab.job}:${tab.run}`),'true','the run is fenced');
+ });
+test('fresh run: the user moving the tab to their own conversation while the run waits for its composer: nothing is typed or clicked',async t=>{
+ const tab=await chatTab(t,{bound:false});
+ await tab.page.evaluate(()=>{document.getElementById('prompt-textarea').style.display='none';});
+ assert.equal((await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL})).code,'busy','accepted on its new chat');
+ await tab.page.clock.runFor(1000);
+ assert.equal((await tab.runner()).running,true,'waiting for the composer');
+ await tab.page.evaluate(url=>{history.pushState({},'',url);document.getElementById('prompt-textarea').style.display='';},OTHER_URL);
+ await tab.page.clock.runFor(3000);
+ assert.equal(await composerText(tab),'','nothing typed');assert.equal(await tab.clicks(),0,'nothing clicked');
+ assert.deepEqual(await tab.runner(),{running:false,code:'taken_over'});
+});
+test('fresh run: the user moving the tab between the fill and the click: Send is never clicked',async t=>{
+ const tab=await chatTab(t,{bound:false,sendDisabled:true});
+ assert.equal((await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL})).code,'busy');
+ await tab.page.clock.runFor(3000);
+ assert.ok((await composerText(tab)).includes('Review fixture PR #1'),'the prompt was typed');
+ assert.equal((await tab.runner()).running,true,'waiting for an enabled Send');
+ await tab.page.evaluate(url=>history.pushState({},'',url),OTHER_URL);
+ await tab.enableSend();await tab.page.clock.runFor(3000);
+ assert.equal(await tab.clicks(),0,'never clicked on the user\'s conversation');
+ assert.deepEqual(await tab.runner(),{running:false,code:'taken_over'});
+});
+test('fresh run, control: a run left on its new chat types and clicks Send once',async t=>{
+ const tab=await chatTab(t,{bound:false});
+ assert.equal((await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL})).code,'busy');
+ await tab.page.clock.runFor(3000);
+ assert.equal(await tab.clicks(),1);
 });

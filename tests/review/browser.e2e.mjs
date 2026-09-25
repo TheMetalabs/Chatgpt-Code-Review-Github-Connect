@@ -51,8 +51,10 @@ test('real DOM: markdown br and escaped source code are recovered from final res
  const page=await fixture(t,user+answer(`<p>${html}</p>`,true));await startWait(page);await page.clock.runFor(3200);
  assert.deepEqual(JSON.parse((await page.evaluate(()=>waitResult)).raw),JSON.parse(raw));
 });
+// The page already shows the sent turn: it is bound to the run (a new run is refused there, X2 #85).
+const boundTo=(page,jobId,runId='')=>page.evaluate(([jobId,runId])=>{window.__ashlarRunnerState={running:false,jobId,runId,result:null};},[jobId,runId]);
 test('real DOM: harvest does not expose provisional JSON while the runner is busy',async t=>{
- const page=await fixture(t,user+answer(json)+stop);await page.addScriptTag({content:source('extension/content-chatgpt.js')});
+ const page=await fixture(t,user+answer(json)+stop);await boundTo(page,'j');await page.addScriptTag({content:source('extension/content-chatgpt.js')});
  await page.evaluate(()=>{runPrompt=async()=>new Promise(()=>{});handler({type:'ashlar-run',jobId:'j',prompt:'p'},null,()=>{});});
  const result=await page.evaluate(()=>new Promise(resolve=>handler({type:'ashlar-harvest',jobId:'j'},null,resolve)));
  assert.equal(result.ok,false);assert.equal(result.code,'busy');
@@ -66,7 +68,7 @@ test('real DOM: even completed-looking prose is not converted to empty after a p
 
 test('real DOM: only a completed owned run without a new user draft may be closed',async t=>{
  const page=await fixture(t,user+answer(json,true)+'<textarea id="prompt-textarea"></textarea>');
- await page.addScriptTag({content:source('extension/content-chatgpt.js')});
+ await boundTo(page,'A','run-A');await page.addScriptTag({content:source('extension/content-chatgpt.js')});
  await page.evaluate(()=>{
    composer=()=>document.querySelector('textarea');
    runPrompt=async()=>'{"findings":[]}';

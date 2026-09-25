@@ -26,9 +26,12 @@ export async function until(check, ms = 5000) {
   }
   return true;
 }
+/** The page a provider tab is opened on (background.js providerUrl): where a new run may start. */
+export const allocationUrl = provider => (provider === 'grok' ? 'https://grok.com/' : 'https://chatgpt.com/?temporary-chat=true');
 export function content(provider = 'chatgpt', persisted = new Map()) {
   const listeners = [];
-  const context = vm.createContext({ console, URL, sessionStorage: { getItem: key => persisted.get(key), setItem: (key, value) => persisted.set(key, value) }, chrome: { runtime: { onMessage: { addListener: fn => listeners.push(fn), removeListener: fn => { const i=listeners.indexOf(fn);if(i>=0)listeners.splice(i,1); } } } } });
+  // The page shows the new chat its tab was opened on (a row that needs another page sets its own).
+  const context = vm.createContext({ console, URL, location: { href: allocationUrl(provider) }, sessionStorage: { getItem: key => persisted.get(key), setItem: (key, value) => persisted.set(key, value) }, chrome: { runtime: { onMessage: { addListener: fn => listeners.push(fn), removeListener: fn => { const i=listeners.indexOf(fn);if(i>=0)listeners.splice(i,1); } } } } });
   for (const file of ['quota.js', 'model.js', 'json.js', `content-${provider}.js`]) {
     vm.runInContext(source(`extension/${file}`), context, { filename: file });
   }
@@ -39,7 +42,10 @@ export function content(provider = 'chatgpt', persisted = new Map()) {
   context.replyDoneVisible = () => false;
   context.assistantCorpus = () => [raw];
   context.quotaHit = () => false;
-  return { context, listeners, message(msg) { let reply; listeners[0](msg, {}, r => { reply = r; }); return reply; } };
+  // A run message carries the page it may start on, as the worker's does (a row that tests the
+  // fresh-page check names its own).
+  const stamp = msg => (msg?.type === 'ashlar-run' && !('allocationUrl' in msg) ? {...msg, allocationUrl: allocationUrl(provider)} : msg);
+  return { context, listeners, message(msg) { let reply; listeners[0](stamp(msg), {}, r => { reply = r; }); return reply; } };
 }
 export function background({ local = storage({ origin: 'http://bridge', token: 'token' }), session = storage(), handler, tabs = new Map(), api } = {}) {
   const messages = [], calls = [], closedTabs = []; const removed = [], replaced = [];

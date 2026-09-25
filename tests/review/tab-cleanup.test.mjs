@@ -113,11 +113,12 @@ test('automatic output extraction never reads a shared system clipboard',async()
   await assert.rejects(c.context.waitUntilReviewOrQuota('ChatGPT'),e=>e===stop);assert.equal(reads,0);
 });
 test('runner close permission rejects a fresh user turn and a wrong run; a busy page is not user activity',async()=>{
-  const c=content();const users=[{textContent:'review A',getAttribute:()=>null}];
-  c.context.location={href:'https://chatgpt.com/c/A'};
+  // The run starts on the new chat its tab opened (X2, #85); its send moves the page to /c/A.
+  const c=content();const users=[];
   c.context.composer=()=>null;
-  c.context.document={querySelectorAll:()=>users};
-  c.context.runPrompt=async()=>raw;c.context.stopButtonVisible=()=>false;
+  c.context.document={querySelectorAll:()=>users,querySelector:()=>users[0]||null};
+  c.context.runPrompt=async()=>{users.push({textContent:'review A',getAttribute:()=>null});c.context.location={href:'https://chatgpt.com/c/A'};return raw;};
+  c.context.stopButtonVisible=()=>false;
   c.message({type:'ashlar-run',jobId:'A',runId:'run-A',provider:'chatgpt',prompt:'review'});await flush();
   const msg={type:'ashlar-can-close',jobId:'A',runId:'run-A',provider:'chatgpt'};
   assert.equal(c.message(msg)?.canClose,true);

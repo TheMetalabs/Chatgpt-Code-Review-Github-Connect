@@ -393,9 +393,10 @@ async function clickSend(findSend, findComposer, expectedText) {
         record.phase = "attempted";
         saveSubmission(record); // durable intent BEFORE invoking the site's handler
         // In memory only: the conversation this page instance clicked in (submissionConfirmed
-        // records it once the send is proven, and only if the page still shows it then).
+        // records it once the send is proven, and only if the page still shows it then). The
+        // fresh-page fence (json.js throwIfStopped) ends here: the provider moves the page after a send.
         const runner = globalThis.__ashlarRunnerState;
-        if (runner) runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()};
+        if (runner) { runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()}; runner.freshPage = undefined; }
         step("send_attempted");
         try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
       }

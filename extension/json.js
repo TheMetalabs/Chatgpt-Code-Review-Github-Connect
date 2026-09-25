@@ -914,11 +914,28 @@ function runStoppedFor(jobId, runId) {
   catch { return false; }
 }
 
+/** Why this page is no longer the fresh page a new run may start on (X2, #85; `page`: the page its
+ * tab was opened on, or the one the run was accepted on): "navigated" when it shows another page,
+ * "user_turn" once it holds a user turn (a message the user sent there); "" while it still is. */
+function freshPageLeft(page) {
+  if (!samePage(globalThis.location?.href || "", page)) return "navigated";
+  return globalThis.document?.querySelector('[data-message-author-role="user"]') ? "user_turn" : "";
+}
+
 /** The one stop fence: every send and collect loop (composer.js and both collectors) calls it
- * before acting, so a stopped run ends as "cancelled" instead of clicking Send or harvesting. */
+ * before acting, so a stopped run ends as "cancelled" instead of clicking Send or harvesting. A new
+ * run also ends ("taken_over") once its tab stops being the fresh page it was accepted on, until its
+ * Send is clicked (composer.js clickSend clears freshPage then): nothing more is typed or clicked in
+ * a conversation the user opened, or wrote in, meanwhile. */
 function throwIfStopped() {
-  if (!globalThis.__ashlarRunnerState?.runStopped) return;
-  const error = new Error("the run was stopped: its job was cancelled or forgotten"); error.code = "cancelled"; throw error;
+  const state = globalThis.__ashlarRunnerState;
+  if (state?.runStopped) {
+    const error = new Error("the run was stopped: its job was cancelled or forgotten"); error.code = "cancelled"; throw error;
+  }
+  const left = state?.freshPage ? freshPageLeft(state.freshPage) : "";
+  if (!left) return;
+  const error = new Error(`${left === "user_turn" ? "a user message appeared in the tab" : "the tab left its new chat"} before the prompt was sent; nothing was sent`);
+  error.code = "taken_over"; throw error;
 }
 
 function releaseManagedSlot(state) {
@@ -939,9 +956,9 @@ function installReviewRunner(name, run) {
   }
   try { state.slotReleased ||= sessionStorage.getItem(`ashlar:released:${state.jobId}:${state.runId}`) === "true"; } catch { /* Unknown remains managed. */ }
   state.runStopped ||= runStoppedFor(state.jobId, state.runId);
-  if (state.listener && state.protocol === "observed-submission-v7") return;
+  if (state.listener && state.protocol === "observed-submission-v8") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
-  state.protocol = "observed-submission-v7";
+  state.protocol = "observed-submission-v8";
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation,
     observing: state.boundObserved === true });
   state.listener = (msg, _sender, reply) => {
@@ -1108,7 +1125,23 @@ function installReviewRunner(name, run) {
       reply({ok: false, code: "disconnected", error: "original job binding is unavailable"});
       return;
     }
+    // A new ChatGPT run starts only on the fresh page its tab was opened on (the worker's
+    // allocationUrl), with no user turn (X2, #85): a tab the user moved to their own conversation, or
+    // sent a message in, before Ashlar's prompt went out is theirs. Nothing is bound, typed or sent
+    // there, and the run is fenced, so a later copy of this message binds stopped. (Grok's runner
+    // starts a new chat itself.)
+    let freshPage;
+    if (!msg.resume && !state.jobId && state.provider === "chatgpt") {
+      const cause = freshPageLeft(msg.allocationUrl);
+      if (cause) {
+        fenceRun(state, msg.jobId, msg.runId);
+        reply({ok: false, code: "taken_over", cause, error: "the tab is no longer the new chat it was opened on; nothing was sent"});
+        return;
+      }
+      freshPage = globalThis.location?.href || "";
+    }
     const resume = Boolean(msg.resume || state.jobId);
+    state.freshPage = freshPage;
     state.jobId = String(msg.jobId);
     state.runId = state.runId || String(msg.runId || "");
     try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
@@ -1136,7 +1169,9 @@ function installReviewRunner(name, run) {
         state.result = { ok: true, raw, responseText: state.responseText, completion:nativeCleanupProof(state) };
       })
       .catch(e => {
-        recordReviewStep(e?.code === "quota" ? "quota" : e?.code === "cancelled" ? "cancelled" : "error");
+        // A new run whose tab stopped being its fresh page before the send (throwIfStopped).
+        const takenOver = e?.code === "taken_over";
+        recordReviewStep(e?.code === "quota" ? "quota" : e?.code === "cancelled" ? "cancelled" : takenOver ? "context_changed" : "error");
         state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })

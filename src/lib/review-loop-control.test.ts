@@ -14,9 +14,9 @@ import {
 } from "./review-loop-control.ts";
 import { canonicalContinuation, continueComment, escalateMarker, isoMs, parseStartMarker, startComment, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopEvents, readLoopSession } from "./review-loop-engine.server.ts";
-import { continueLoopOnPush, startLoop, stopLoop, type LoopRuntimeDeps } from "./review-loop-runtime.server.ts";
+import { continueLoopOnPush, runPostReviewLoop, startLoop, stopLoop, type LoopRuntimeDeps } from "./review-loop-runtime.server.ts";
 import { deriveLoopSession, type LoopEvent, type SessionRef } from "./review-loop-session.ts";
-import { DEFAULT_SETTINGS, type BotSettings } from "./types.ts";
+import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 const HEAD = "a".repeat(40);
@@ -506,26 +506,48 @@ describe("session identity: one continuation and one handoff per head per SESSIO
     assert.equal(f.posts(), 1);
   });
 
-  /** One PR through the runtime's push handler: `script` decides each POST ("ok"; "landed" = stored,
-   * then unknown; "lost" = unknown, nothing stored); `view.shown` is what the list returns. */
+  const NEW_SHA = "e".repeat(40); // a fix round's commit
+  const ROUND_AT = "2026-02-21T00:00:00Z"; // the review of HEAD, in the session
+  /** One PR through the runtime (push handler, loop step): `script` decides each POST ("ok";
+   * "landed" = stored, then unknown; "lost" = unknown, nothing stored); `view.shown` is what the
+   * list returns; `view.onFix` / `view.onCommit` run while a fix round requests its fix / writes
+   * its commit. */
   function pushWorld(script: (body: string) => "ok" | "landed" | "lost") {
     let clock = T0;
     const rows: ControlRow[] = [];
     const posts: string[] = [];
-    const view = { shown: (_id: number) => true };
+    const view = { shown: (_id: number) => true, head: PUSHED, committed: false, onFix: async () => {}, onCommit: async () => {} };
+    const round = () => ({ userLogin: BOT, commitId: HEAD, path: "src/a.ts", body: "<!-- ashlar-findings total=2 -->", submittedAt: ROUND_AT, createdAt: ROUND_AT });
     const gh = {
       async listIssueComments() {
         return rows.filter((r) => view.shown(r.id ?? 0)).map((r) => ({ ...r }));
       },
       async listReviewComments() {
-        return [];
+        return [round()];
       },
       async listPullReviews() {
-        return [];
+        return [round()];
       },
       async fetchPullHeadRef() {
-        return { ref: "feature", sha: PUSHED, fork: false, sameRepo: true };
+        return { ref: "feature", sha: view.committed ? NEW_SHA : view.head, fork: false, sameRepo: true };
       },
+      async fetchUserPermission() {
+        return "write";
+      },
+      async listReviewThreadRoots() {
+        return [];
+      },
+      async replyToReviewComment() {},
+      gitDataApi: () => ({
+        baseTreeSha: async () => "tree",
+        createBlob: async () => "blob",
+        createTree: async () => "tree2",
+        createCommit: async () => NEW_SHA,
+        updateBranchRef: async () => {
+          view.committed = true;
+          await view.onCommit();
+        },
+      }),
       async createIssueComment(_t: string, o: { body: string }) {
         posts.push(o.body);
         clock += 1_000;
@@ -537,17 +559,40 @@ describe("session identity: one continuation and one handoff per head per SESSIO
         return { ...row };
       },
     };
-    const deps = { gh, requestFix: async () => "", validate: async () => ({ ok: true }), sleep: async (ms: number) => void (clock += ms), now: () => clock } as unknown as LoopRuntimeDeps;
-    const settings: BotSettings = { ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode: "suggest", parallelPrs: 3 } };
+    const requestFix = async () => {
+      await view.onFix();
+      return '{"summary":"guard added","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}';
+    };
+    const deps = { gh, requestFix, validate: async () => ({ ok: true }), sleep: async (ms: number) => void (clock += ms), now: () => clock } as unknown as LoopRuntimeDeps;
+    const settingsOf = (mode: "suggest" | "apply"): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } });
+    const settings = settingsOf("suggest");
     const env = { ASHLAR_FIX_AGENT: "1" } as NodeJS.ProcessEnv;
+    const finding: Finding = {
+      id: "f1",
+      status: "accepted",
+      severity: "P1",
+      file: "src/a.ts",
+      line: 3,
+      side: "RIGHT",
+      title: "null deref",
+      failureScenario: "x is undefined",
+      rootCause: "missing guard",
+      evidence: "line 3",
+      recommendedFix: "guard it",
+      recommendedTest: "add a test",
+    } as Finding;
+    const job = { owner: "o", repo: "r", pr: 1, headSha: HEAD, origin: "github", sender: "alice", id: "job", createdAt: T0, findings: [finding], thread: { kind: "mention", commentId: 1, userText: "review" } } as unknown as Job;
+    const sample = { changedPaths: ["src/a.ts"], files: [{ path: "src/a.ts", content: "export const a = 1;\n", language: "ts" }] } as unknown as SamplePr;
     return {
       gh,
       rows,
+      posts,
       view,
+      step: (mode: "suggest" | "apply") => runPostReviewLoop("t", job, sample, settingsOf(mode), deps, env),
       start: (actor: string, mode: "suggest" | "apply") => startLoop("t", { owner: "o", repo: "r", pr: 1, actor, mode, at: START }, settings, deps, env),
       push: () => continueLoopOnPush("t", { owner: "o", repo: "r", pr: 1, headSha: PUSHED, actor: "alice" }, settings, deps, env),
       session: () => readLoopSession(gh, "t", "o", "r", 1, { botLogin: BOT }),
-      continuations: () => posts.filter((b) => canonicalContinuation(b, bot)?.head === PUSHED).length,
+      continuations: () => posts.filter((b) => canonicalContinuation(b, bot) !== null).length,
     };
   }
 
@@ -586,6 +631,27 @@ describe("session identity: one continuation and one handoff per head per SESSIO
       assert.deepEqual(await f.push(), { posted: true, reason: "continued" }, `${cont}: bob's session requests its own review`);
       assert.deepEqual(await f.push(), { posted: false, reason: "already continued" }, cont);
       assert.equal(f.continuations(), 2, `${cont}: one continuation POST per session`);
+    }
+  });
+
+  it("a fix round whose session is replaced by a start in the same second goes quiet: no report, and no continuation for the old session", async () => {
+    for (const mode of ["suggest", "apply"] as const) {
+      // alice's start record is lost (her session has no id); bob's start in the same second lands
+      // while the round runs — its record now anchors the session (the fold lists it first)
+      const f = pushWorld((body) => (parseStartMarker(body, bot)?.by === "alice" ? "lost" : "ok"));
+      f.view.head = HEAD;
+      assert.equal((await f.start("alice", mode)).unresolved, true, mode);
+      const bob = () => f.start("bob", mode).then(() => {});
+      if (mode === "suggest") f.view.onFix = bob;
+      else f.view.onCommit = bob; // after the last checkpoint before the commit
+      const r = await f.step(mode);
+      assert.equal(r.ran, mode === "apply", `${mode}: ${JSON.stringify(r)}`);
+      if (mode === "suggest") assert.match(r.ran ? "" : r.reason, /newer loop request/, mode);
+      else assert.equal(r.ran && r.step === "fix" && r.continued, false, `${mode}: ${JSON.stringify(r)}`);
+      const s = await f.session();
+      assert.deepEqual([s.active, s.startBy], [true, "bob"], mode);
+      assert.equal(f.posts.filter((b) => b.startsWith("### Ashlar fix agent — suggestion")).length, 0, `${mode}: no suggestion for alice's session`);
+      assert.equal(f.continuations(), 0, `${mode}: no continuation keyed to alice's session`);
     }
   });
 });

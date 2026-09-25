@@ -77,7 +77,7 @@ import {
   type ReviewLoopMode,
   type RoundSummary,
 } from "./review-loop.ts";
-import { sessionRef, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
+import { sameSession, sessionRef, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
 import type { BotSettings, Finding, Job, SamplePr } from "./types.ts";
 
 export interface PullHead extends LoopPrInfo {
@@ -888,7 +888,8 @@ export async function runPostReviewLoop(
       if ((await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha) return "head";
       const now = await sessionOf(gh, token, ref, head, botLogin);
       if (!now.active) return endedWhy(gh, ref, now);
-      if (now.startIso !== session.startIso) return "newer";
+      // another start — also one in the same second as this session's (only its record differs)
+      if (!sameSession(sessionRef(now), since)) return "newer";
       // apply acts on the starter's authority: a re-issued start by someone else, or a downgrade
       // to suggest, takes the round over
       if (mode === "apply" && (effectiveLoopMode(now.mode, settings) !== "apply" || (now.starter ?? "") !== starter)) return "newer";
@@ -1039,7 +1040,7 @@ export async function runPostReviewLoop(
       let status: ContinuationStatus;
       if (now && !now.active) {
         status = { ok: false, ended: endedWhy(gh, ref, now) };
-      } else if (now && now.startIso !== session.startIso) {
+      } else if (now && !sameSession(sessionRef(now), since)) {
         status = { ok: false, ended: "newer" };
       } else if (!newHead) {
         status = { ok: false, error: "the commit sha was not returned" };

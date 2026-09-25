@@ -1,7 +1,7 @@
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS, type BotSettings, type FixAgentSettings, type Finding, type Job, type SamplePr } from "./types.ts";
-import { continueComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
+import { continueComment, fixingComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { FIX_PROVIDER_CAPS, fixDeadline } from "./settings-rules.ts";
@@ -29,6 +29,9 @@ import {
   START_UNRESOLVED,
   startLoop,
   stopLoop,
+  sweepCutFixRounds,
+  BOOT_SWEEP_MAX_PRS,
+  type BootSweepDeps,
   type LoopRuntimeDeps,
   type LoopStepResult,
   type PostedLoopReview,
@@ -1532,6 +1535,115 @@ describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; gro
   });
 });
 
+/** The FIXING marker a fix round posts right before its fix request (the row a restart leaves newest). */
+const fixingRow = (at = "2026-01-02T00:00:00Z"): IssueRow => ({ userLogin: BOT, body: fixingComment({ round: 1, pr: 7, head: HEAD }), createdAt: at });
+/** The boot sweep's deps over a fake: its GitHub client, and an open-PR census of `prs`. */
+const sweepDeps = (f: ReturnType<typeof fakeDeps>, prs: number[] = [7]): BootSweepDeps & { census: number } => {
+  const d = {
+    gh: f.deps.gh,
+    sleep: f.deps.sleep,
+    census: 0,
+    openPulls: async () => (d.census++, prs.map((pr) => ({ owner: "o", repo: "r", pr, token: "t" }))),
+  };
+  return d;
+};
+
+describe("boot sweep: a fix round a restart cut (FIXING newest, nothing running) is handed off once (#79)", () => {
+  const writes = (f: ReturnType<typeof fakeDeps>) => f.posted.length;
+
+  it("a session left at FIXING is handed off (loop-error) once; a second boot hands it off no more", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow()] });
+    assert.deepEqual(await sweepCutFixRounds(settings("apply"), sweepDeps(f), ENV), [{ pr: "o/r#7", outcome: "handed off (loop-error)" }]);
+    assert.equal(escalations(f.posted).length, 1);
+    assert.equal(reasonOf(escalations(f.posted)[0]), "loop-error");
+    assert.match(escalations(f.posted)[0], /Detail: the server restarted during a fix round/);
+    // A restart: a new process has a fresh client (an empty control journal) over the same PR history.
+    const reboot = { ...sweepDeps(f), gh: { ...f.deps.gh } };
+    const again = await sweepCutFixRounds(settings("apply"), reboot, ENV);
+    assert.deepEqual(again, [{ pr: "o/r#7", outcome: "untouched: the newest loop comment is not FIXING" }]);
+    assert.equal(escalations(f.posted).length, 1, "no second handoff");
+  });
+
+  it("a handoff whose response was lost is never re-sent by a later sweep in the process (the control journal)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow()] });
+    let posts = 0;
+    // The POST may have landed, and no list shows it yet (a lost response, a lagging list).
+    f.deps.gh.createIssueComment = async () => (posts++, Promise.reject(Object.assign(new Error("socket hang up"), { outcome: "unknown" })));
+    const [first] = await sweepCutFixRounds(settings("apply"), sweepDeps(f), ENV);
+    assert.match(first.outcome, /^handoff unconfirmed/, first.outcome);
+    const [second] = await sweepCutFixRounds(settings("apply"), sweepDeps(f), ENV);
+    assert.equal(second.outcome, "untouched: no active loop session", "the journal's stand-in ends the session");
+    assert.equal(posts, 1, "one POST in all");
+  });
+
+  it("a converged, stopped or waiting session is untouched: 0 writes", async (t) => {
+    const stop = { userLogin: "alice", body: "/review-loop stop", createdAt: "2026-01-03T00:00:00Z" };
+    const cases: Array<[string, ReturnType<typeof fakeDeps>]> = [
+      ["converged (a clean review of the live head)", fakeDeps({ start: "apply", rounds: [3, 0], issues: [fixingRow()] })],
+      ["stopped by a human stop (not acknowledged yet)", fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow(), stop] })],
+      ["stopped and acknowledged", fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow(), { userLogin: BOT, body: stoppedComment(), createdAt: "2026-01-03T00:00:00Z" }] })],
+      ["already handed off", fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow(), { userLogin: BOT, body: "<!-- ashlar-loop-escalate reason=fix-failed round=1 pr=7 head=" + HEAD + " -->", createdAt: "2026-01-03T00:00:00Z" }] })],
+      ["no session at all", fakeDeps({ start: null, rounds: [3], issues: [fixingRow()] })],
+    ];
+    for (const [label, f] of cases) {
+      const [r] = await sweepCutFixRounds(settings("apply"), sweepDeps(f), ENV);
+      assert.match(r.outcome, /^untouched/, `${label}: ${r.outcome}`);
+      assert.equal(writes(f), 0, label);
+    }
+    // Waiting: a real round ran to its end — a suggestion waits for the human's push, an applied
+    // round for the next review. Its FIXING is followed by the round's own report / continuation.
+    for (const mode of ["suggest", "apply"] as const) {
+      const f = fakeDeps({ start: mode, rounds: [3] });
+      const step = await run(f, mode);
+      assert.ok(step.ran && step.step === "fix", JSON.stringify(step));
+      assert.ok(f.posted.some((b) => b.includes("ashlar-loop-fixing")), "the round posted FIXING");
+      const before = writes(f);
+      const [r] = await sweepCutFixRounds(settings(mode), sweepDeps(f), ENV);
+      assert.equal(r.outcome, "untouched: the newest loop comment is not FIXING", `${mode}: ${r.outcome}`);
+      assert.equal(writes(f), before, `${mode}: no write`);
+    }
+    // A step for the PR still runs in this process (its FIXING is newest): it is left to it.
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(t, f);
+    const a = run(f, "apply");
+    await settles(hold.generating);
+    const before = writes(f);
+    const [r] = await sweepCutFixRounds(settings("apply"), sweepDeps(f), ENV);
+    assert.equal(r.outcome, "untouched: a loop step for it runs in this process");
+    assert.equal(writes(f), before);
+    hold.release();
+    await settles(a);
+  });
+
+  it("a failing GitHub read never breaks boot: the census failing skips the sweep, a PR's failing read skips that PR", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow()] });
+    const census = { ...sweepDeps(f), openPulls: () => Promise.reject(new Error("list installations 502")) };
+    assert.deepEqual(await sweepCutFixRounds(settings("apply"), census, ENV), []);
+    const list = f.deps.gh.listIssueComments;
+    f.deps.gh.listIssueComments = (t, o, r, pr) => (pr === 7 ? Promise.reject(new Error("list comments 502")) : list(t, o, r, pr));
+    const head = f.deps.gh.fetchPullHeadRef;
+    f.deps.gh.fetchPullHeadRef = (t, o, r, pr) => (pr === 8 ? Promise.reject(new Error("GET /pulls 502")) : head(t, o, r, pr));
+    const out = await sweepCutFixRounds(settings("apply"), sweepDeps(f, [7, 8, 9]), ENV);
+    assert.deepEqual(out.map((x) => x.outcome), [
+      "untouched: read failed (list comments 502)",
+      "untouched: read failed (GET /pulls 502)",
+      "handed off (loop-error)",
+    ]);
+    assert.equal(escalations(f.posted).length, 1, "the readable PR is still handed off");
+  });
+
+  it("is bounded: at most BOOT_SWEEP_MAX_PRS PRs are read, whatever the census returns", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    let reads = 0;
+    const list = f.deps.gh.listIssueComments;
+    f.deps.gh.listIssueComments = (...a) => (reads++, list(...a));
+    const d = sweepDeps(f, Array.from({ length: BOOT_SWEEP_MAX_PRS + 10 }, (_x, i) => i + 1));
+    assert.equal((await sweepCutFixRounds(settings("apply"), d, ENV)).length, BOOT_SWEEP_MAX_PRS);
+    assert.equal(reads, BOOT_SWEEP_MAX_PRS);
+    assert.equal(d.census, 1);
+  });
+});
+
 describe("helpers", () => {
   it("harbor logs every failed or unresolved control result through one predicate", () => {
     assert.equal(controlResultLogged({ posted: false, reason: `${START_UNRESOLVED}: GitHub issue comment 502`, unresolved: true }), true);
@@ -2791,6 +2903,22 @@ describe("kill switch: the Settings gate and an operator stop leave GitHub and t
       (f, s) => continueLoopOnPush("t", { ...PR, headSha: PUSHED, actor: "alice" }, s, f.deps, ENV),
       (o) => assert.deepEqual(o.writes(), ["createIssueComment"], "control: the ON loop posts the continuation"),
     );
+  });
+
+  it("(a) the boot sweep of cut fix rounds: 0 GitHub calls — not even the open-PR census", async () => {
+    for (const [label, over] of [["control: ON", undefined], ...OFF] as const) {
+      const f = fakeDeps({ start: "apply", rounds: [3], issues: [fixingRow()] });
+      const o = spy(f);
+      const d = sweepDeps(f);
+      const out = await sweepCutFixRounds(settings("apply", over ?? {}), d, ENV);
+      if (!over) {
+        assert.deepEqual(o.writes(), ["createIssueComment"], "control: the ON sweep hands the cut round off");
+        continue;
+      }
+      assert.deepEqual(out, [], label);
+      assert.equal(d.census, 0, `${label}: no census of installed repositories / open PRs`);
+      assert.deepEqual(o.calls, [], `${label}: no GitHub call at all`);
+    }
   });
 
   /** An operator's stop comment: its row lands in the PR history and harbor forwards it to stopLoop. */

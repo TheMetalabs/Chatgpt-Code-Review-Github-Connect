@@ -91,6 +91,7 @@ import {
   isoMs,
   isSelfLogin,
   MAX_CONTINUE_ROUND,
+  newestLoopComment,
   resolveBotLogin,
   sanitizeUntrusted,
   startComment,
@@ -293,7 +294,7 @@ const productionStepState: StepState = { slots: new Map(), pendingStarts: new Ma
 const stepStateByClient = new WeakMap<object, StepState>();
 const MAX_TIMER_MS = 2_147_483_647;
 
-function stepState(deps: LoopRuntimeDeps | undefined): StepState {
+function stepState(deps: Pick<LoopRuntimeDeps, "gh"> | undefined): StepState {
   if (!deps) return productionStepState;
   let state = stepStateByClient.get(deps.gh);
   if (!state) stepStateByClient.set(deps.gh, (state = { slots: new Map(), pendingStarts: new Map() }));
@@ -849,6 +850,10 @@ async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRu
   // The GitHub client is the loop's only channel: if it cannot load, nothing can be posted (the
   // ONE unobservable failure — logged server-side by harbor). Provider transports load LAZILY
   // inside requestFix, so their failure is an ordinary request-failed → retry → fix-failed.
+  return { gh: await productionGithub(), validate: builtinValidate, ...(await providerFixDeps(settings, ref)) };
+}
+
+async function productionGithub(): Promise<LoopRuntimeGithub> {
   const github = await import("./github.server.ts");
   productionGh ??= {
     listPullReviews: github.listPullReviews,
@@ -861,8 +866,7 @@ async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRu
     listReviewThreadRoots: github.listReviewThreadRoots,
     replyToReviewComment: github.replyToReviewComment,
   };
-  const gh = productionGh;
-  return { gh, validate: builtinValidate, ...(await providerFixDeps(settings, ref)) };
+  return productionGh;
 }
 
 /** The provider-dependent half of the production deps: the transport and whether it reports
@@ -1785,4 +1789,75 @@ export async function stopLoop(
   } finally {
     inFlightStop.delete(key);
   }
+}
+
+// ── Boot: a fix round a restart cut ─────────────────────────────────────────────
+// A deploy or restart during a round leaves the PR's newest loop comment at FIXING and its session
+// active with nothing running it — a silent stall. At boot this hands each such session off, once.
+
+/** The handoff detail of a fix round the server restart cut. */
+export const RESTART_CUT_DETAIL = "the server restarted during a fix round, so nothing is running it any more; re-issue /review-loop <mode> to resume";
+/** Bound on the open PRs one boot sweep reads. */
+export const BOOT_SWEEP_MAX_PRS = 20;
+
+export type BootSweepDeps = Pick<LoopRuntimeDeps, "gh" | "sleep" | "now"> & {
+  /** Open PRs of the installed repositories with their installation token — at most `max`. */
+  openPulls(max: number): Promise<Array<PrRef & { token: string }>>;
+};
+
+/**
+ * Hand off (loop-error) every active session whose newest loop comment is FIXING while no step for
+ * its PR is in flight in this process (at boot there never is). The handoff is the escalate path's:
+ * one per head and session, emitted through the control journal (a lost response is never re-sent)
+ * and decided by a fresh session read at each POST attempt. Loop OFF: no GitHub call. Bounded, and
+ * never throws (a failed read skips the PR, or the sweep); each outcome is logged.
+ */
+export async function sweepCutFixRounds(settings: BotSettings, deps?: BootSweepDeps, env: NodeJS.ProcessEnv | undefined = envOf()): Promise<Array<{ pr: string; outcome: string }>> {
+  if (!loopEnabled(settings)) return [];
+  const log = (line: string) => console.info(`[review-loop] boot sweep ${line}`);
+  const done: Array<{ pr: string; outcome: string }> = [];
+  try {
+    const d = deps ?? { gh: await productionGithub(), openPulls: (await import("./github.server.ts")).listInstalledOpenPulls };
+    const botLogin = ashlarBotLogin(env);
+    for (const { token, ...ref } of (await d.openPulls(BOOT_SWEEP_MAX_PRS)).slice(0, BOOT_SWEEP_MAX_PRS)) {
+      const outcome = await handOffCutRound(d, token, ref, settings, botLogin).catch((e) => `untouched: read failed (${(e as Error)?.message ?? String(e)})`);
+      if (outcome !== NOT_CUT) log(`${prKey(ref)}: ${outcome}`);
+      done.push({ pr: prKey(ref), outcome });
+    }
+  } catch (e) {
+    log(`skipped: ${(e as Error)?.message ?? String(e)}`);
+  }
+  return done;
+}
+
+const NOT_CUT = "untouched: the newest loop comment is not FIXING";
+
+async function handOffCutRound(d: BootSweepDeps, token: string, ref: PrRef, settings: BotSettings, botLogin: string): Promise<string> {
+  const { gh } = d;
+  const state = stepState(gh === productionGh ? undefined : d); // production steps run on productionStepState
+  if ([...state.slots.keys()].some((k) => k.startsWith(`${prKey(ref)}@`))) return "untouched: a loop step for it runs in this process";
+  if (newestLoopComment(await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr), botLogin)?.kind !== "fixing") return NOT_CUT;
+  const head = await gh.fetchPullHeadRef(token, ref.owner, ref.repo, ref.pr);
+  const session = await sessionOf(gh, token, ref, head, botLogin);
+  if (!session.active) return "untouched: no active loop session";
+  const current = sessionRef(session);
+  const rounds = await reconstructRounds(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, sinceIso: current.at }).catch(() => []);
+  const r = await escalateNow(gh, token, {
+    ...ref,
+    head: head.sha,
+    reason: "loop-error",
+    detail: RESTART_CUT_DETAIL,
+    rounds,
+    roundCap: roundCap(settings),
+    diffLines: diffLinesOf(head),
+    botLogin,
+    session: current,
+    superseded: () => freshMoot(gh, token, ref, botLogin, { session: current }),
+    sleep: d.sleep ?? realSleep,
+    now: d.now,
+  });
+  if (r.escalated) return "handed off (loop-error)";
+  if (r.superseded) return `untouched: ${MOOT_TEXT[r.superseded]}`;
+  if (r.ambiguous) return `handoff unconfirmed: ${r.error}`;
+  return r.error ? `handoff not posted: ${r.error}` : "untouched: already handed off on this head";
 }

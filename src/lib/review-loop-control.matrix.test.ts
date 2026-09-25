@@ -3,7 +3,9 @@
  * the 4 control kinds) × what its POST did (× the 2xx body it answered, decoded as production
  * decodes it, and the created row's server created_at) × what the list shows × what happens next — and, for a continuation or handoff, × how
  * its session's anchor start is known (listed, lagging, lost) × a peer start in the anchor's second
- * (none, before or after the write) — checked against what the loop owes a human:
+ * (none, before or after the write); for a stop, × what the session was before it (active, or ended
+ * by a stale clean review whose resuming continuation lands after the stop's own time) — checked
+ * against what the loop owes a human:
  *   I1 exactly once — a write that may have landed is never POSTed again (≤ 1 row);
  *   I2 never silent — an unresolved result is always logged (never a SILENT_REASONS exit);
  *   I3 closed outcome — each entry point reports the outcome the cell implies;
@@ -14,8 +16,8 @@
  *   I5 read-your-writes — the loop acts on its own write before the list shows it;
  *   I6 a newer session is never ended by an older record — also one started in the same second
  *      as the older write's POST (GitHub orders events at one-second resolution);
- *   I7 a human stop survives a restart — even one that found the session ended only by this
- *      process's own write that may not be durable;
+ *   I7 a human stop survives a restart — even one that found the session ended (or kept from
+ *      resuming) only by this process's own write that may not be durable;
  *   I8 a stop stays the boundary before a newer session — its record is owed while it is not
  *      posted: a redelivery sends a refused one and only looks for an unknown one, and once it
  *      landed a restart anchors the newer session at its own start; posted while that session
@@ -28,6 +30,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
 import {
   canonicalContinuation,
+  continueComment,
   isoMs,
   isStoppedComment,
   parseEscalateMarker,
@@ -60,6 +63,7 @@ const LIVE = "c".repeat(40); // the live head a superseded step finds
 const MOVED = "d".repeat(40); // a push that lands while the fix request runs
 const NEW_SHA = "e".repeat(40); // the applied round's commit
 const FRESH = "f".repeat(40); // a human push after the write (later: push / moved)
+const STALE = "9".repeat(40); // a head the loop had left, whose clean review lands late (prior: stale-resume)
 const T0 = Date.parse("2026-03-01T00:00:00Z"); // the world clock starts here
 const ALICE_AT = "2026-02-20T00:00:00Z"; // alice's start directive; review rounds follow it
 const ENV = { ASHLAR_FIX_AGENT: "1", ASHLAR_LOOP_ROUND_CAP: "5" } as NodeJS.ProcessEnv;
@@ -116,8 +120,13 @@ type Anchor = "listed" | "lagging" | "lost";
 /** bob's start in alice's second — a re-issue of her session, whose record a read may list first
  * and so anchor there — recorded before the write's call or after it. */
 type Peer = "none" | "before" | "after";
+/** What alice's session was before bob's stop (a stop cell): active, or — stale-resume — ended by a
+ * clean review of a head the loop had left (it landed after the driver moved on), with the
+ * driver's continuation for the live head, which resumes the session, landing after the stop's own
+ * time and before its webhook is handled: only the stop keeps the session over. */
+type Prior = "none" | "stale-resume";
 type Phase = "call" | "view" | "again" | "follow";
-type Cell = { via: Via; write: Write; shape: Shape; stamp: Stamp; list: List; later: Later; anchor: Anchor; peer: Peer };
+type Cell = { via: Via; write: Write; shape: Shape; stamp: Stamp; list: List; later: Later; anchor: Anchor; peer: Peer; prior: Prior };
 type Result = ControlResult | LoopStepResult;
 /** posted / exists / unknown / rejected as the entry point reports it; `ran` a step that ran
  * (the self-heal); `resolved` a step result that needs nothing more (posted and exists collapse). */
@@ -149,6 +158,7 @@ const LISTS: List[] = ["normal", "lagging", "failing"];
 const LATERS: Later[] = ["redelivery", "newer-start", "newer-start-redelivery", "same-second-start", "25h", "row-appears", "row-relapses", "push", "moved", "stop-restart"];
 const ANCHORS: Anchor[] = ["listed", "lagging", "lost"];
 const PEERS: Peer[] = ["none", "before", "after"];
+const PRIORS: Prior[] = ["none", "stale-resume"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
@@ -284,6 +294,11 @@ class World {
     if (kindOf(via) !== "start" && cell.anchor === "listed") this.store(BOT, startComment({ mode: this.mode(), by: "alice", at: ALICE_AT }), ALICE_AT);
     const rounds = via === "handoff:stuck" ? [5, 4, 3, 2, 2, 2] : [3];
     rounds.forEach((total, i) => this.reviews.push({ head: i === rounds.length - 1 ? HEAD : String(i).repeat(40), total, at: reviewDay(i) }));
+    if (cell.prior === "stale-resume") {
+      this.reviews.push({ head: STALE, total: 0, at: reviewDay(rounds.length) });
+      this.store(BOT, continueComment({ mode: this.mode(), round: 2, pr, head: HEAD }), iso(T0 + 30_000));
+      this.clock = T0 + 60_000; // bob's stop (at T0) is handled after the continuation landed
+    }
     const read = () => {
       if (this.failing) throw new Error("list 502");
     };
@@ -842,22 +857,24 @@ async function runCell(c: Cell, pr: number): Promise<void> {
   }
 }
 
-describe("control writes: kind × write result (× 2xx body × created_at) × list read × later event (× anchor start × peer start) (#79 K1)", () => {
+describe("control writes: kind (× a stop's prior session) × write result (× 2xx body × created_at) × list read × later event (× anchor start × peer start) (#79 K1)", () => {
   let row = 0;
   for (const via of VIAS)
-    for (const write of WRITES)
-      for (const shape of SHAPES[write])
-        for (const stamp of shape === "row" ? STAMPS : (["valid"] as const))
-          for (const list of LISTS)
-            for (const later of LATERS)
-              for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
-                for (const peer of sessionScoped(via) ? PEERS : (["none"] as const)) {
-                  if (!applies(via, later)) continue;
-                  const cell = { via, write, shape, stamp, list, later, anchor, peer };
-                  const pr = 1000 + row++;
-                  const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
-                  const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
-                  const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
-                  it(`${via} | ${write}${answer}${time} | ${list} | ${later}${session}`, () => runCell(cell, pr));
-                }
+    for (const prior of kindOf(via) === "stop" ? PRIORS : (["none"] as const))
+      for (const write of WRITES)
+        for (const shape of SHAPES[write])
+          for (const stamp of shape === "row" ? STAMPS : (["valid"] as const))
+            for (const list of LISTS)
+              for (const later of LATERS)
+                for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
+                  for (const peer of sessionScoped(via) ? PEERS : (["none"] as const)) {
+                    if (!applies(via, later)) continue;
+                    const cell = { via, write, shape, stamp, list, later, anchor, peer, prior };
+                    const pr = 1000 + row++;
+                    const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
+                    const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
+                    const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
+                    const before = prior === "none" ? "" : ` | prior ${prior}`;
+                    it(`${via} | ${write}${answer}${time} | ${list} | ${later}${session}${before}`, () => runCell(cell, pr));
+                  }
 });

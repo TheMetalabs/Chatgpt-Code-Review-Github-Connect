@@ -57,7 +57,7 @@ import {
   ESCALATE_IN_FLIGHT,
   escalateNow,
   maybeEscalate,
-  readLoopEvents,
+  readLoopHistory,
   readLoopSession,
   reconstructRounds,
   HANDOFF_OUTCOME_UNKNOWN,
@@ -1256,18 +1256,29 @@ function endedByStop(s: LoopSession, at: string): boolean {
   return !s.active && s.endedBy === "stop" && isoMs(s.endedAt) === isoMs(at);
 }
 
+/** Does folding one stop decide which session runs — whether one does, and which (its anchor)?
+ * `events` holds the stop (its stand-in, and any listed record or unedited comment of it); the
+ * fold without every event of it is the history had it never happened. */
+function stopDecides(events: readonly LoopEvent[], stop: { actor: string; at: string }, liveHead: string): boolean {
+  const mine = (e: LoopEvent) => e.kind === "stop" && isoMs(e.at) === isoMs(stop.at) && e.actor?.toLowerCase() === stop.actor.toLowerCase();
+  const withIt = deriveLoopSession(events, { liveHead });
+  const without = deriveLoopSession(events.filter((e) => !mine(e)), { liveHead });
+  return withIt.active !== without.active || (withIt.active && !sameSession(sessionRef(withIt), sessionRef(without)));
+}
+
 /**
  * A human stop directive ends the active session. The stop is RECORDED durably by the App's
  * STOPPED acknowledgement at the stop's own time (`stopAt`: the comment's creation or edit time,
  * or the PR body's update time) — so a stop that arrived as an edit, which the session fold
  * cannot replay, still ends the session at the right moment after a restart. Until the record is
  * durable (the post is retrying, or failed) this process honors the stop in every session read,
- * so no fix round commits past it. A stop is recorded when it ENDED the session — also when a
- * newer start has opened another since (the stop is the boundary before the active session: a
- * restart without its record folds that start into the ended session as a re-issue, with the
- * rounds before the stop) — when it races a start still in flight (the caller saw a live
- * loop-start review for the PR), or when the session it finds ended only in this process (an own
- * write that may not be durable). A stop that stopped nothing posts nothing. A repeated stop finds
+ * so no fix round commits past it. A stop is recorded whenever it changes the session fold — in
+ * what this process reads or in the durable history a restart reads: it ENDED the session, or it
+ * decides which session runs (it is the boundary before a newer start, which without its record
+ * re-issues the ended session with the rounds before the stop; or it keeps a session over that a
+ * continuation after it would resume) — and when it races a start still in flight (the caller saw
+ * a live loop-start review for the PR), or finds the session ended only in this process (an own
+ * write that may not be durable). A stop that changes nothing posts nothing. A repeated stop finds
  * its record and posts nothing; one whose record's outcome is unknown is only looked for again.
  * The record is the STOPPED acknowledgement while no session runs; posted while a newer session is
  * active it is the bare record (stopRecordComment), never a terminal signal for that session.
@@ -1306,21 +1317,25 @@ export async function stopLoop(
     // fail, and until its record is listed — whatever its POST does.
     ownWrites(d.gh).intend(write);
     const head = await d.gh.fetchPullHeadRef(token, stop.owner, stop.repo, stop.pr);
-    const events = await readLoopEvents(d.gh, token, stop.owner, stop.repo, stop.pr, { botLogin, pr: head });
+    const { events, durable } = await readLoopHistory(d.gh, token, stop.owner, stop.repo, stop.pr, { botLogin, pr: head });
     const session = deriveLoopSession(events, { liveHead: head.sha });
     const endedIt = endedByStop(session, at);
-    // Record (the STOPPED acknowledgement) a stop that ended a session; one that ended the session
-    // before the active one (the fold up to the stop's own instant ends there, and a later start —
-    // strictly later: a start in the stop's second precedes it — opened the active one); one that
-    // races a start whose record may still land later with an earlier time (a live loop-start
-    // review for this PR at stop time); and one that finds the session ended only in this process —
-    // by its own handoff of unknown outcome or a stop whose record is not posted — which a restart
-    // forgets, while after a durable end the record is a no-op in the fold. A stop that stopped
+    // The record is owed whenever the stop changes the fold — without it, a restart (or this
+    // process, once the intent is dropped) reads another session: the stop ENDED the session; or it
+    // decides which session runs — it ended the one before a newer start (without it that start
+    // re-issues the stopped session, with the rounds before the stop), or it keeps a session over
+    // that a later continuation would resume (a stale clean review ended it) — in what this process
+    // reads, or in what a restart reads: the durable history, where this process's own writes that
+    // may not have landed (another stop not yet recorded, a handoff of unknown outcome) are absent
+    // and may be all that kept the session over. Also owed when it races a start whose record may
+    // still land later with an earlier time (a live loop-start review for this PR at stop time), and
+    // when it finds the session ended only in this process (unconfirmedEnd). A stop that changes
     // nothing posts nothing. The gate re-sends a refused record and only looks for an unknown one.
-    const upToStop = deriveLoopSession(events.filter((e) => isoMs(e.at) <= isoMs(at)), { liveHead: head.sha });
-    const bounds = session.active && endedByStop(upToStop, at);
+    const self = { actor: stop.actor, at };
+    const decides =
+      stopDecides(events, self, head.sha) || stopDecides([...durable, { at, kind: "stop", actor: stop.actor }], self, head.sha);
     const endedHereOnly = ownWrites(d.gh).unconfirmedEnd(ref, session) !== undefined;
-    if (!endedIt && !bounds && !endedHereOnly && !(stop.startInFlight ?? false)) {
+    if (!endedIt && !decides && !endedHereOnly && !(stop.startInFlight ?? false)) {
       ownWrites(d.gh).abandon(write);
       return { posted: false, reason: NO_SESSION };
     }

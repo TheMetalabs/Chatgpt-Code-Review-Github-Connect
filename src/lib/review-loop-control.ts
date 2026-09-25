@@ -353,11 +353,18 @@ export class OwnWrites {
    * a landed one too, when this read omits a row an earlier read listed. Called on every session
    * read. */
   standIns(ref: PrRef, listed: readonly ControlRow[], botLogin: string): LoopEvent[] {
-    const out: LoopEvent[] = [];
+    return this.reconcile(ref, listed, botLogin).map((s) => s.event);
+  }
+
+  /** standIns, each marked `landed` when its write's row exists (created or listed) — false for a
+   * write that may exist only in this process (a write-ahead intent not posted, or one whose
+   * outcome is unknown): a restart, reading GitHub alone, does not see it. */
+  reconcile(ref: PrRef, listed: readonly ControlRow[], botLogin: string): Array<{ event: LoopEvent; landed: boolean }> {
+    const out: Array<{ event: LoopEvent; landed: boolean }> = [];
     for (const e of this.byPr.get(prKey(ref))?.values() ?? []) {
       const hit = listedMatch(listed, e.write, botLogin);
       if (hit && collectable(e.write, hit)) confirm(e, hit);
-      else if (folds(e)) out.push(standInEvent(e));
+      else if (folds(e)) out.push({ event: standInEvent(e), landed: e.state === "posted" });
     }
     this.prune(ref);
     return out;

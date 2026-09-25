@@ -433,6 +433,25 @@ export async function readLoopEvents(
   pr: number,
   opts: { botLogin?: string; pr?: LoopPrInfo } = {},
 ): Promise<LoopEvent[]> {
+  return (await readLoopHistory(gh, token, owner, repo, pr, opts)).events;
+}
+
+/** One read of the PR's loop events (readLoopEvents: `events`), and the part of them a restart
+ * would read — `durable`: the listed history and the stand-ins of this process's LANDED writes,
+ * without its writes that may exist only here (a stop not yet recorded, an outcome unknown). */
+export interface LoopHistory {
+  events: LoopEvent[];
+  durable: LoopEvent[];
+}
+
+export async function readLoopHistory(
+  gh: ReviewLoopGithub,
+  token: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  opts: { botLogin?: string; pr?: LoopPrInfo } = {},
+): Promise<LoopHistory> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const [issues, inline, reviews] = await Promise.all([
     gh.listIssueComments(token, owner, repo, pr),
@@ -457,8 +476,11 @@ export async function readLoopEvents(
   }
   // Read-your-writes: this process's control writes the list does not show yet stand in for their
   // rows (and a listed row confirms its write) — on every session read, before any gate acts.
-  events.push(...ownWrites(gh).standIns({ owner, repo, pr }, issues, botLogin));
-  return events;
+  const own = ownWrites(gh).reconcile({ owner, repo, pr }, issues, botLogin);
+  return {
+    events: [...events, ...own.map((s) => s.event)],
+    durable: [...events, ...own.filter((s) => s.landed).map((s) => s.event)],
+  };
 }
 
 /** The PR's current loop session (pure fold over readLoopEvents). */

@@ -1926,9 +1926,15 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (tab.frozen === true) return;
   // A new ChatGPT prompt goes only into the new chat its tab was opened on (X2, #85): the tab is
   // active, so the user may have opened one of their own conversations in it before this dispatch.
-  // Nothing is sent there (the page checks again: json.js freshPageLeft).
+  // Nothing is sent there (the page checks again: json.js freshPageLeft). Unless its page is already
+  // bound to this run: it accepted a run message whose `started` the worker never saved (it stopped
+  // right after the acknowledgement), and ChatGPT moved the chat to its conversation after the send.
+  // That run is adopted and observed, never failed as unsent nor sent again; only the read-only
+  // status message asks (unrecordedTabHolds).
   if (!state.started && !observeOnly && provider === "chatgpt" && (tab.pendingUrl || !onAllocationPage(tab.url, provider))) {
-    return takenBeforeSend(job, provider, jobs, "navigated");
+    if (tab.pendingUrl || await unrecordedTabHolds(job, provider, tab.id) !== "run") return takenBeforeSend(job, provider, jobs, "navigated");
+    state.started = true;
+    await saveJobs(jobs);
   }
   // `allocationUrl`: the page a new run may start on (json.js checks it before it binds).
   const run = { ...tabMessage(job, provider, "ashlar-run"), allocationUrl: providerUrl(provider),

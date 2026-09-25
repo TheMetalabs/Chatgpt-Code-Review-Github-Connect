@@ -1199,6 +1199,29 @@ for (const kind of ['review', 'fix']) {
       assert.ok(uploaded(b).includes(kind === 'fix' ? 'worker:preserve_undelivered' : `worker:preserve_${cause}`), `${uploaded(b)}`);
     });
   }
+  // The page accepted the run and sent it, but the worker never saved `started` (it stopped right
+  // after the acknowledgement), and ChatGPT has moved the chat to its conversation since. Before the
+  // leg fails as "nothing was sent", its page is asked (read-only): bound to this run, it is adopted
+  // as started and harvested, never sent the prompt again. A page bound to nothing still fails it.
+  for (const [boundTo, adopted] of [['the leg\'s run', true], ['nothing', false]]) {
+    test(`${kind}: a fresh tab now off its new chat whose page is bound to ${boundTo} is ${adopted ? 'adopted as started, never failed as unsent' : 'failed taken_over'}`, async () => {
+      const binding = adopted ? {jobId: leg(kind).jobId, runId: 'run-A'} : {jobId: '', runId: ''};
+      const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: MOVED, status: 'complete'},
+        handler: (_id, m) => (m.type === 'ashlar-tab-status' ? {ok: true, ownershipProtocol: 1, provider: 'chatgpt', released: false, url: MOVED, ...binding}
+          : m.type === 'ashlar-harvest' ? {ok: false, code: 'busy', retry: true, provider: 'chatgpt', ...binding} : blankVerdict(_id, m))});
+      await b.tick();
+      assert.equal(b.messages.some(m => m.type === 'ashlar-run'), false, 'the prompt is never sent (again)');
+      assert.deepEqual(b.closedTabs, [], 'never closed');
+      if (adopted) {
+        const state = b.pending().states.chatgpt;
+        assert.deepEqual({started: state.started, outcome: state.outcome}, {started: true, outcome: undefined}, 'adopted, not failed');
+        assert.ok(b.messages.some(m => m.id === 10 && m.type === 'ashlar-harvest'), 'its run is harvested');
+      } else {
+        for (let i = 0; i < 2 && b.pending(); i++) await b.tick();
+        assert.match(failureOf(b), /^taken_over: the tab left its new chat before the prompt was sent/);
+      }
+    });
+  }
 }
 // X2-c, controls: a fresh tab still on its new chat is dispatched (ChatGPT's temporary chat, with or
 // without its query), and so is Grok's home (Grok's fresh-page check is deferred, #82).

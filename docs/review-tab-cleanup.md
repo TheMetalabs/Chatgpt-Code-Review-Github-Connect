@@ -118,7 +118,8 @@ Two page checks cover what a lock cannot:
 
 - A new ChatGPT prompt is typed and sent only while its tab is still the new chat it was
   opened on, with no user turn there. The worker checks the tab's URL before the first
-  dispatch; the page checks again when it accepts the run (`allocationUrl`) and before
+  dispatch (a page there already bound to the run, whose `started` the worker never
+  saved, is adopted and observed instead); the page checks again when it accepts the run (`allocationUrl`) and before
   every composer step until the Send click (`throwIfStopped`). A refused run binds
   nothing, is never counted as started, fails `taken_over`, and its tab is kept.
 - A run message carries a deadline (`until`, 5 s before the reply window this send

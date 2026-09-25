@@ -305,11 +305,20 @@ function releaseStep(slots: Map<string, StepSlot>, key: string): void {
   next({ status: "run", prior: slot.sig });
 }
 
-/** A fix round's identity for a step that waited behind another: the session anchor, the effective
- * mode and the starter. A stop → restart (a new anchor), a mode change or another starter is a new
- * round; anything else is a re-trigger of the round that already ran. */
+/** Whose authority a round of `mode` acts on: apply writes on the starter's, so a start re-issued
+ * by someone else takes the round over; suggest acts for the session, whoever re-issued it. Logins
+ * compare as GitHub's do (case-insensitive). */
+function roundActor(mode: ReviewLoopMode, starter: string | undefined): string {
+  return mode === "apply" ? (starter ?? "").toLowerCase() : "";
+}
+
+/** A fix round's identity for a step that waited behind another — the terms the running round's
+ * relevance check compares, and no others: the session anchor, the effective mode and, for apply,
+ * the starter. A stop → restart (a new anchor), a mode change or another apply starter is a new
+ * round (the running one went moot); anything else is a re-trigger of the round that already ran. */
 function roundSignature(session: LoopSession, settings: BotSettings): string {
-  return `${isoMs(session.startIso)}|${effectiveLoopMode(session.mode, settings)}|${(session.starter ?? "").toLowerCase()}`;
+  const mode = effectiveLoopMode(session.mode, settings);
+  return `${isoMs(session.startIso)}|${mode}|${roundActor(mode, session.starter)}`;
 }
 
 /** How long a second step waits for its head's running step: that step's own worst case (every
@@ -1071,8 +1080,8 @@ export async function runPostReviewLoop(
       const gone = sessionMoot(gh, ref, now, current); // ended, or a newer session
       if (gone) return gone;
       // apply acts on the starter's authority: a re-issued start by someone else, or a downgrade
-      // to suggest, takes the round over
-      if (mode === "apply" && (effectiveLoopMode(now.mode, settings) !== "apply" || (now.starter ?? "") !== starter)) return "newer";
+      // to suggest, takes the round over (roundSignature compares the same terms)
+      if (mode === "apply" && (effectiveLoopMode(now.mode, settings) !== "apply" || roundActor("apply", now.starter) !== roundActor("apply", starter))) return "newer";
       return null;
     };
     let moot: Moot | undefined; // once a checkpoint finds the round moot it is never retried

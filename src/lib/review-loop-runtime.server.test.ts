@@ -2021,4 +2021,36 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", "the running step finishes its round");
     assert.equal(f.prompts.length, 1, "the expired step sent no prompt");
   });
+
+  it("suggest: another person re-issuing the same mode mid-round runs no second round — suggest acts for the session, not a starter", async (t) => {
+    const f = fakeDeps({ rounds: [3] }); // suggest, started by alice
+    const hold = holdFirst(t, f);
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    f.issues.push(recorded("suggest", "bob", "2026-01-30T00:00:00Z")); // same session: only the starter changes
+    const reissue = job({ id: "job-B", sender: "bob", thread: { kind: "mention", commentId: 2, userText: "/review-loop suggest", loop: { kind: "start", mode: "suggest" }, eventAt: "2026-01-30T00:00:00Z" } });
+    const b = run(f, "suggest", ENV_ON, reissue);
+    hold.release();
+    const [ra, rb] = await settles(Promise.all([a, b]));
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", "the running round posts its suggestion for the session");
+    assert.deepEqual(rb, { ran: false, reason: ROUND_ALREADY_RUN });
+    assert.equal(f.prompts.length, 1);
+    assert.equal(fixings(f.posted).length, 1);
+    assert.equal(suggestions(f.posted).length, 1);
+  });
+
+  it("apply: the starter re-issuing apply under another login case mid-round is the same starter — the round commits, nothing stalls", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] }); // started by alice
+    const hold = holdFirst(t, f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    f.issues.push(recorded("apply", "Alice", "2026-01-30T00:00:00Z")); // GitHub logins are case-insensitive
+    const b = run(f, "apply", ENV_ON, job({ id: "job-B", sender: "Alice" }));
+    hold.release();
+    const [ra, rb] = await settles(Promise.all([a, b]));
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "applied", `the round is still the starter's: ${JSON.stringify(ra)}`);
+    assert.equal(f.committed, true);
+    assert.deepEqual(rb, { ran: false, reason: "superseded (head moved)" }, "the waiter finds the head at the App's commit");
+    assert.equal(f.prompts.length, 1);
+  });
 });

@@ -1164,7 +1164,8 @@ function abandonLegs(job, providers, status) {
 /** A tab Chrome discarded to save memory (or has not loaded since) holds no page: nothing in it can
  * answer, and no follow-up, draft or edit is readable in it until it loads again (then its page
  * renders what the provider kept, and gives the verdict). Its URL is still readable: on another
- * page than the run's own it is the user's, preserved at once. Otherwise, in the tab this browser
+ * page than the run's known one it is the user's, preserved at once. A tab not on its run's page
+ * (onRunPage: with no identity yet, the new chat it was opened on) is never reloaded. Otherwise, in the tab this browser
  * session created for the leg, it is woken once (reloaded in the background, as activating it would)
  * so its page answers on a later tick within the same ownership wait; a tab that cannot be woken is
  * preserved after the wait. A frozen tab is not this (it keeps its page): see forceCloseFixTab. */
@@ -1173,12 +1174,54 @@ async function releaseDiscardedTab(job, provider, jobs, tab) {
   const known = state.conversation || answeredPage(state, provider);
   if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", undefined, "navigated");
   cleanupWaiting(job, provider, "tab_discarded");
-  if (!state.wokeDiscardedTab && await tabCreatedForLeg(job, provider, tab.id)) {
-    state.wokeDiscardedTab = true;
-    await saveJobs(jobs);
-    try { await chrome.tabs.reload(tab.id); } catch { /* still discarded: preserved after the wait */ }
-  }
+  if (onRunPage(state, provider, tab.url)) await wakeTabOnce(job, provider, jobs, tab, "wokeDiscardedTab");
   return waitOrPreserveFixTab(job, provider, jobs, "the discarded tab could not answer; tab preserved", undefined, "unreachable");
+}
+
+/** Whether `url` is the leg's run's own page: the conversation it was bound in, else the page it last
+ * answered on, else (no identity yet) the new chat its tab was opened on. A discarded tab anywhere
+ * else is not the run's any more, whoever moved it: never woken. */
+function onRunPage(state, provider, url) {
+  const known = state.conversation || answeredPage(state, provider);
+  return known ? samePage(url, known) : onAllocationPage(url, provider);
+}
+
+/** Reload `tab` once per leg and phase (`marker`, durable), only when this browser session created
+ * it for the leg (tabCreatedForLeg: a stored id without that record may name the user's tab, which is
+ * never reloaded). The reload wakes a discarded page in the background, as activating it would. True
+ * if it was reloaded now. */
+async function wakeTabOnce(job, provider, jobs, tab, marker) {
+  const state = job.states[provider];
+  if (state[marker] || !await tabCreatedForLeg(job, provider, tab.id)) return false;
+  state[marker] = true;
+  workerStep(job, provider, "tab_woken");
+  await saveJobs(jobs);
+  try { await chrome.tabs.reload(tab.id); } catch { /* still discarded: the caller's bounded wait applies */ }
+  return true;
+}
+
+/** How long an ACTIVE leg (not settled yet) waits for its discarded tab to hold a page again, from
+ * the first poll that found it discarded: the wake's reload, or the user bringing the tab back. */
+const DISCARDED_WAKE_WAIT_MS = 2 * 60_000;
+
+/** A tab Chrome discarded (or never loaded) while its leg is still active holds no page: no run can be
+ * dispatched into it and nothing can be harvested from it (Ashlar 4101062759: every poll returned
+ * there, and the leg held its capacity slot until something outside reloaded the tab). The tab this
+ * browser session created for the leg, on its run's own page, is woken once (wakeTabOnce): once it
+ * has loaded, the poll dispatches the run into it or, for a sent run, resumes observing it (the page's
+ * journal never sends a prompt twice). Any other one (not provably the leg's, on another page, or
+ * already woken and still not loaded) is never reloaded: past DISCARDED_WAKE_WAIT_MS the leg fails
+ * with `tab_discarded`, its failure is delivered and its tab is released by the cleanup rule, which
+ * frees its slot. */
+async function wakeOrFailDiscardedTab(job, provider, jobs, tab) {
+  const state = job.states[provider];
+  state.discardedAt ??= Date.now();
+  const asleep = tab.discarded === true || tab.status === "unloaded";
+  if (asleep && onRunPage(state, provider, tab.url) && await wakeTabOnce(job, provider, jobs, tab, "wokeActiveTab")) return;
+  if (Date.now() - state.discardedAt < DISCARDED_WAKE_WAIT_MS) return saveJobs(jobs);
+  delete state.discardedAt;
+  state.outcome = failure("tab_discarded", "the chat tab was discarded and could not be woken; no answer was collected");
+  await saveJobs(jobs);
 }
 
 /** The ownership verdict in a page reply: a verdict reply (ownership) as is; a cancel reply of an
@@ -1506,15 +1549,21 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     if (!tab) { state.connectionError = "tab connection unknown; waiting for reconnection"; await saveJobs(jobs); return; }
     state.tabId = tab.id; state.started = true; await saveJobs(jobs);
   }
+  // A discarded tab holds no page (and a woken one that never finishes loading still holds none):
+  // woken once or, past a bounded wait, the leg fails (wakeOrFailDiscardedTab), never polled forever.
+  if (tab.discarded === true || tab.status === "unloaded" || (state.discardedAt && tab.status && tab.status !== "complete")) {
+    return wakeOrFailDiscardedTab(job, provider, jobs, tab);
+  }
   if (tab.status && tab.status !== "complete") return;
+  if (state.discardedAt) { delete state.discardedAt; await saveJobs(jobs); } // it holds a page again
   if (!allowedTab(tab, provider)) {
     state.outcome = failure("context_lost", "review tab navigated away");
     await saveJobs(jobs);
     return;
   }
-  // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws, and a
-  // discarded one holds no page: a message would only wait out askPage. Polled again next tick.
-  if (tab.frozen === true || tab.discarded === true) return;
+  // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws: a message
+  // would only wait out askPage. Polled again next tick.
+  if (tab.frozen === true) return;
   const run = { ...tabMessage(job, provider, "ashlar-run"),
     prompt: job.prompts?.[provider] || job.prompt, reasoning: job.reasoning?.[provider], adoptLegacy: state.adoptLegacy };
   let result;

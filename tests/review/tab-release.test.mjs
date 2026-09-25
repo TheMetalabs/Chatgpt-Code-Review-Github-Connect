@@ -375,6 +375,64 @@ for (const kind of ['review', 'fix']) {
     assert.ok(uploaded(b).includes('worker:preserve_unreachable'));
   });
 }
+// Ashlar 4101062759: Chrome discards an ACTIVE leg's tab (before its run was dispatched, or while it
+// generates). The poll used to return there on every tick, so the leg waited for an outside reload
+// forever, holding its slot. The tab this browser session created for the leg, on its run's page, is
+// woken once and the run goes on in it (dispatched, or resumed: never sent twice, no second tab);
+// any other discarded tab is never reloaded, and the leg ends with a bounded failure.
+/** A clock the test moves (the worker reads Date.now; nothing waits on a timer). */
+function stepClock(b) {
+  const RealDate = b.context.Date || Date;let now = RealDate.now();
+  b.context.Date = class extends RealDate { static now() { return now; } };
+  return ms => { now += ms; };
+}
+/** A page that runs nothing until a run message starts (or resumes) its collector. */
+function freshPage() {
+  let running = false;
+  return (_id, m) => {
+    if (m.type === 'ashlar-run') { running = true; return {ok: false, code: 'busy', retry: true}; }
+    if (m.type === 'ashlar-harvest') return running ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle'};
+    return {ok: true};
+  };
+}
+for (const kind of ['review', 'fix']) for (const started of [false, true]) {
+  test(`${kind}: an active leg (${started ? 'generating' : 'not dispatched yet'}) whose tab Chrome discarded is woken once, then ${started ? 'resumes observing its run' : 'dispatches its run'} there, exactly once`, async () => {
+    const b = worker(leg(kind, {started, pageUrl: TEMP}), {session: createdHere(kind), tab: discardedTab(TEMP), handler: freshPage()});
+    const {reloads, loaded} = reloadSpy(b);
+    const runs = () => b.messages.filter(m => m.type === 'ashlar-run');
+    await b.tick();
+    assert.deepEqual(reloads, [10], 'woken once');
+    assert.deepEqual(runs(), [], 'nothing is sent to a page that is not there');
+    assert.ok(stagesOf(b.pending().states.chatgpt.workerEvents).includes('worker:tab_woken'), 'the wake reaches history');
+    await b.tick();
+    assert.deepEqual(reloads, [10], 'still loading: not reloaded again');assert.deepEqual(runs(), []);
+    loaded();await b.tick();await b.tick();
+    assert.deepEqual(runs().map(m => ({id: m.id, resume: m.resume === true})), [{id: 10, resume: started}], started ? 'observation resumed once (never a new send)' : 'dispatched once');
+    assert.equal(b.pending().states.chatgpt.started, true);
+    assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');assert.deepEqual(b.closedTabs, []);
+    assert.equal(b.pending().states.chatgpt.outcome, undefined, 'the job goes on');
+    assert.deepEqual(reloads, [10], 'woken only once');
+  });
+}
+for (const kind of ['review', 'fix']) for (const [what, session, url] of [
+  ['this browser session did not create', undefined, TEMP],
+  ['is on another page than its run\'s', 'created', 'https://chatgpt.com/c/users-own'],
+]) {
+  test(`${kind}: an active leg whose discarded tab ${what} is never reloaded; the leg fails after a bounded wait and retires`, async () => {
+    const b = worker(leg(kind, {started: true, pageUrl: TEMP}), {session: session ? createdHere(kind) : undefined, tab: discardedTab(url), handler: freshPage()});
+    const {reloads} = reloadSpy(b);
+    const advance = stepClock(b);
+    await b.tick();
+    assert.equal(b.pending().states.chatgpt.outcome, undefined, 'the user may still bring the tab back');
+    advance(3 * 60_000);await b.tick();
+    assert.equal(b.pending()?.states.chatgpt.outcome?.code ?? 'retired', b.pending() ? 'tab_discarded' : 'retired');
+    assert.ok(b.calls.some(c => c.action === 'failure' && /tab_discarded/.test(c.error)), 'the failure is delivered, not waited on forever');
+    for (let i = 0; i < 3 && b.pending(); i++) { advance(3 * 60_000);await b.tick(); }
+    assert.equal(b.pending(), undefined, 'retired: its capacity slot is released');
+    assert.deepEqual(reloads, [], 'never reloaded');assert.deepEqual(b.closedTabs, [], 'never closed');
+    assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' || m.type === 'ashlar-harvest'), [], 'nothing was sent to the tab');
+  });
+}
 // Ashlar 4101062732: an unpinned review verdict holds only on the new chat the tab was opened on. The
 // page the run last answered on (state.pageUrl) is no identity: it can be the user's own conversation.
 for (const [where, url, closed] of [['a page that left its new chat', 'https://chatgpt.com/c/users-own', false], ['its new chat (control)', TEMP, true]]) {

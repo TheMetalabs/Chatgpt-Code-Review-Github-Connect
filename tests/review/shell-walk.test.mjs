@@ -26,7 +26,9 @@ async function run(kind, start, events) {
   // secured: the answer acknowledged by the server (answerDelivered: the worker's record of the
   // complete ACK, which a fix needs to take its proven-success path, #77; a review ignores it)
   const state = start === 'secured' ? {delivered: true, cleanupPending: true, answerDelivered: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}, conversation: URL_TAB, pageUrl: URL_TAB}
-    : start === 'undispatched' ? {started: false} : {};
+    // generating: dispatched, and its poll recorded the page its run answered on (pageUrl, every
+    // successful reply records it): the conversation page the tab shows
+    : start === 'undispatched' ? {started: false} : {pageUrl: URL_TAB};
   const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
     providers: ['chatgpt'], reasoning: {chatgpt: 'pro'}, states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', ...state}}};
   const session = storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}});

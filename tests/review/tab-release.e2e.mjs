@@ -690,6 +690,33 @@ for(const kind of ['review'])for(const [name,restored,closed] of [['the reloaded
  assert.deepEqual(reloads,[10]);
  assert.equal(await tab.clicks(),0,'the cancelled prompt is never sent from the woken page');
 });
+// Ashlar 4101062759: Chrome discards an ACTIVE review's tab while its answer is generating. The poll
+// wakes the tab this browser session created once; the reloaded page resumes observing its sent run
+// from its journal (never sends again), and the leg goes on to deliver and close. No second tab.
+test('worker, review: a generating leg whose tab Chrome discarded is woken once; its reloaded page resumes the run (never sends again) and the answer is delivered',async t=>{
+ const tab=await generatingTab(t);
+ const w=wire(tab,{session:createdHere()});
+ await w.tick();await tab.page.clock.runFor(1600);
+ assert.equal((await tab.runner()).running,true,'generating');
+ // Chrome discards the tab; the provider finishes the answer meanwhile (the reload renders it).
+ Object.assign(w.b.tabs.get(10),{status:'unloaded',discarded:true});
+ Object.assign(tab.served,{thread:userTurn()+answerTurn(),after:''});
+ const reloads=[];
+ w.b.chrome.tabs.reload=async id=>{reloads.push(id);Object.assign(w.b.tabs.get(id),{discarded:false,status:'loading'});await tab.reload();};
+ const resumes=()=>w.b.messages.filter(m=>m.type==='ashlar-run'&&m.resume===true).length;
+ const before=resumes();
+ await w.tick({syncUrl:false});
+ assert.deepEqual(reloads,[10],'woken once');
+ w.b.tabs.get(10).status='complete';
+ await w.tick();await tab.page.clock.runFor(2400);
+ assert.equal(resumes()-before,1,'observation resumed once in the reloaded page');
+ await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
+ assert.deepEqual(w.b.closedTabs,[10],`closed: ${uploadedSteps(w)}`);assert.equal(w.state(),undefined,'the job retired');
+ assert.deepEqual(reloads,[10]);assert.equal(await tab.clicks(),0,'the prompt is never sent again');
+ assert.equal(w.b.tabs.size,0,'no second tab was opened');
+ assert.ok(uploadedSteps(w).includes('worker:tab_woken'),`${uploadedSteps(w)}`);
+});
 test('worker: a cancelled leg whose page could not be reached before the server forgot the job ("missing") still closes',async t=>{
  const tab=await generatingTab(t);
  const w=wire(tab);

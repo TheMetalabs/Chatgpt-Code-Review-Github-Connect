@@ -46,6 +46,7 @@ export const PROGRESS_LABELS = {
     preserve_undelivered: "Tab preserved · the fix ended without a delivered answer (a fix tab closes only after its answer is delivered)",
     preserve_unknown: "Tab preserved · cause not reported",
     cleanup_waiting_page: "Tab cleanup waiting on the page · loading, discarded, unreachable or ownership not yet proven",
+    tab_woken: "Discarded tab reloaded once by Ashlar · its page resumes the run (a sent prompt is never sent again)",
     disconnected: "Tab connection unknown · waiting for reconnection",
     context_changed: "Conversation changed · collect only the bound review; preserve tab",
     cancelled: "Run stopped · the job was cancelled or forgotten; nothing more is sent or collected",

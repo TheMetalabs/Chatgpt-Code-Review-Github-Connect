@@ -1377,7 +1377,9 @@ function stopDecides(events: readonly LoopEvent[], stop: { actor: string; at: st
  * write that may not be durable). A stop that changes nothing posts nothing. A repeated stop finds
  * its record and posts nothing; one whose record's outcome is unknown is only looked for again.
  * The record is the STOPPED acknowledgement while no session runs; posted while a newer session is
- * active it is the bare record (stopRecordComment), never a terminal signal for that session.
+ * active it is the bare record (stopRecordComment), never a terminal signal for that session — the
+ * form is decided by a fresh read right before each POST attempt, so a retry after a newer start
+ * arrived during its backoff sends the bare record.
  * Never throws.
  */
 export async function stopLoop(
@@ -1408,7 +1410,19 @@ export async function stopLoop(
     } catch (e) {
       malformed = (e as Error)?.message ?? String(e);
     }
-    const write = stopWrite(ref, { by: stop.actor, at }, owedAs(body));
+    // The record's form, decided right before each POST attempt by a fresh read (the stop itself
+    // folded, as the write-ahead intent below): the STOPPED acknowledgement — a terminal signal that
+    // watchers detect by its marker alone — only while no session runs; with a newer session active
+    // (the stop ended only one before it, or a start arrived while a refused POST backed off) the
+    // bare record, which the fold places the same way and no watcher reads as "the loop stopped".
+    // A stop's record is never superseded: once owed, it stays owed until it lands.
+    const gh = d.gh;
+    const decide = async (): Promise<Decision> => {
+      const live = await gh.fetchPullHeadRef(token, stop.owner, stop.repo, stop.pr);
+      const now = await sessionOf(gh, token, ref, live, botLogin);
+      return { status: "owed", body: now.active ? recordOnly : body };
+    };
+    const write = stopWrite(ref, { by: stop.actor, at }, decide);
     // Write-ahead: honored in this process from the first moment, before any read that could
     // fail, and until its record is listed — whatever its POST does.
     ownWrites(d.gh).intend(write);
@@ -1436,11 +1450,7 @@ export async function stopLoop(
       return { posted: false, reason: NO_SESSION };
     }
     if (malformed) return { posted: false, reason: `stop failed: ${malformed} (honored in this process until recorded)` };
-    // The record's form, chosen at this read: the STOPPED acknowledgement — a terminal signal that
-    // watchers detect by its marker alone — only while no session runs once the stop is folded;
-    // with a newer session active (the stop ended only one before it) the bare record, which the
-    // fold places the same way and no watcher reads as "the loop stopped".
-    const out = await emitControl(controlCtx(d, token, botLogin), session.active ? stopWrite(ref, { by: stop.actor, at }, owedAs(recordOnly)) : write);
+    const out = await emitControl(controlCtx(d, token, botLogin), write);
     switch (out.status) {
       case "posted":
         return { posted: true, reason: "stopped" };

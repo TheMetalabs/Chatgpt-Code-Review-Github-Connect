@@ -21,14 +21,16 @@
  *   I8 a stop stays the boundary before a newer session — its record is owed while it is not
  *      posted: a redelivery sends a refused one and only looks for an unknown one, and once it
  *      landed a restart anchors the newer session at its own start; posted while that session
- *      runs, the record is no terminal signal (no STOPPED marker, no STOPPED sentence), while a
- *      record posted with no session running is the STOPPED acknowledgement.
+ *      runs — a redelivery after it started, or a retry after it started during the backoff —
+ *      the record is no terminal signal (no STOPPED marker, no STOPPED sentence), while a record
+ *      posted with no session running is the STOPPED acknowledgement.
  *   I9 every POST attempt is decided against a fresh read — × what happens BETWEEN the write's
  *      first POST (refused) and its retry: nothing, a stop and a newer start, a start alone (it
  *      re-issues the running session), a push that moves the PR head. A continuation or handoff
  *      whose session is over, or a continuation whose head moved, is never sent again: no row,
  *      no event (an unknown retry's stand-in neither), no journal entry, and the newer session
- *      runs on; a retry that cannot read the session is not sent at all.
+ *      runs on; a stop's retry takes the record form its own read decides (I8); a retry that
+ *      cannot read the session is not sent at all.
  * One table instead of one test per bug: each review round found another cell of this space.
  */
 import { describe, it } from "node:test";
@@ -192,9 +194,9 @@ function applies(via: Via, later: Later): boolean {
 }
 /** Only a continuation or handoff names its session (its anchor start). */
 const sessionScoped = (via: Via) => kindOf(via) === "continue" || kindOf(via) === "handoff";
-/** Every POST attempt of a write of this kind is decided by a fresh read of the session (a start
- * record is owed in every session: nothing to read). */
-const decidedByRead = (via: Via) => sessionScoped(via);
+/** Every POST attempt of a write of this kind is decided by a fresh read of the session — for a
+ * stop, which form its record takes (a start record is owed in every session: nothing to read). */
+const decidedByRead = (via: Via) => sessionScoped(via) || kindOf(via) === "stop";
 /** A refused continuation of a push or an applied round is followed by the loop-error handoff for
  * its head, decided by a fresh read of the session like every control POST: sent only when the
  * list is readable — a list failing through the call decides (so sends) neither. */
@@ -305,6 +307,8 @@ class World {
   readonly underTest: Phase[] = [];
   /** The body of every POST of the write under test (in the order of underTest). */
   readonly underTestBodies: string[] = [];
+  /** Whether carol's newer session had started at each POST of the write under test. */
+  readonly underTestNewer: boolean[] = [];
   rowsForWrite = 0;
   carolAt?: string;
   /** The PR's head after a human push (later: push / moved). */
@@ -529,6 +533,7 @@ class World {
     }
     this.underTest.push(this.phase);
     this.underTestBodies.push(body);
+    this.underTestNewer.push(this.carolAt !== undefined);
     if (this.cell.between !== "nothing" && this.cell.betweenAt === "retry" && this.underTest.length === 1) {
       this.hook = () => this.betweenAttempts(); // during the backoff before the retry
       throw writeError("rejected", 422);
@@ -722,7 +727,7 @@ function expectFirst(c: Cell): Cls {
   if (c.via === "start:self-heal" && c.list === "failing" && c.write !== "rejected") return "unreadable"; // re-reads after the emit
   // a control entry point whose refused write cannot be decided again (nor its loop-error handoff)
   // reports the unreadable list; a step reports the handoff that failed to post
-  const entry = c.via === "continue:push" || c.via === "handoff:push-loop-error";
+  const entry = c.via === "continue:push" || c.via === "handoff:push-loop-error" || c.via === "stop:webhook";
   if (entry && decidedByRead(c.via) && c.write === "rejected" && c.list === "failing") return "unreadable";
   // a POST that answered "unknown" and whose row the re-check lists was posted by this call (a
   // list behind the session's start records is behind the write's row too)
@@ -886,14 +891,15 @@ async function assertStopBoundaryOwed(w: World): Promise<void> {
 
 /** I8 (the record's form): bob's record, whenever it is sent, records his stop; it is the STOPPED
  * acknowledgement — the terminal signal watchers detect by its marker — except when it is sent
- * while carol's newer session runs (the redelivery after her start): then it opens with the record
- * line alone and says nothing a STOPPED detector matches. */
+ * while carol's newer session runs (the redelivery after her start, or a retry after she started
+ * during its backoff): then it opens with the record line alone and says nothing a STOPPED
+ * detector matches. Carol's session starts after bob's stop in every stop cell. */
 function assertStopRecordForms(w: World): void {
   const bot = { authoredByBot: true };
   w.underTestBodies.forEach((body, i) => {
     const phase = w.underTest[i];
     assert.deepEqual(parseStopRecord(body, bot), { at: iso(T0), by: "bob" }, `I8: the ${phase} POST does not record bob's stop`);
-    const newerRuns = w.cell.later === "newer-start-redelivery" && phase === "again";
+    const newerRuns = w.underTestNewer[i];
     assert.equal(isStoppedComment(body, bot), !newerRuns, `I8: the ${phase} POST ${newerRuns ? "is a STOPPED signal while carol's session runs" : "is no STOPPED acknowledgement"}: ${body}`);
     if (newerRuns) assert.ok(!body.includes(REVIEW_LOOP_STOPPED_HUMAN) && !body.includes("ashlar-loop-stopped"), `I8: a STOPPED detector matches it: ${body}`);
   });
@@ -925,23 +931,26 @@ async function assertNewerSessionLives(w: World): Promise<void> {
 /** I9: the write's retry was decided after the event between its attempts. A write superseded or
  * undecided there is never POSTed again and leaves nothing: no row, no event (an unknown retry's
  * stand-in neither), no journal entry — in this process and after a restart; one still owed stands
- * as its write result says. carol's newer session (stop+new-start) runs on, anchored at her start,
+ * as its write result says. A stop is the exception it always was: its intent stands in until its
+ * record lands (write-ahead). carol's newer session (after a stop) runs on, anchored at her start,
  * and a step in it runs. */
 async function assertBetween(w: World): Promise<void> {
   const c = w.cell;
   const fate = fateAtRetry(c);
+  const writeAhead = kindOf(c.via) === "stop";
   if (fate !== "owed") {
     const refused = c.betweenAt === "retry" ? 1 : 0; // only a refused first POST came before
     assert.equal(w.underTest.length, refused, `I9: a write ${fate} at its retry was POSTed (${w.underTest.join(", ")})`);
-    assert.equal(ownWrites(w.deps.gh).state(w.key()), undefined, `I9: a write ${fate} at its retry left a journal entry`);
+    if (!writeAhead) assert.equal(ownWrites(w.deps.gh).state(w.key()), undefined, `I9: a write ${fate} at its retry left a journal entry`);
   }
   w.catchUp();
   const here = (await w.eventsOfWrite()).length;
-  assert.equal(here, fate === "owed" && c.write !== "rejected" ? 1 : 0, `I9: ${here} events of the write in this process`);
+  assert.equal(here, writeAhead || (fate === "owed" && c.write !== "rejected") ? 1 : 0, `I9: ${here} events of the write in this process`);
   const restarted = { ...w.deps.gh }; // another client object: an empty journal
   const durable = (await w.eventsOfWrite(restarted)).length;
   assert.equal(durable, w.rowsForWrite, `I9: ${durable} events of the write after a restart`);
-  if (c.between !== "stop+new-start") return;
+  // carol's start after a stop opens her own session (bob's stop, or dave's, is its boundary)
+  if (c.between !== "stop+new-start" && !(writeAhead && c.between === "new-start-only")) return;
   const s = await w.session();
   assert.ok(s.active && isoMs(s.startIso) === isoMs(w.carolAt), `I9: carol's newer session does not run as her own: ${JSON.stringify(s)}`);
   w.clock += 1_000;

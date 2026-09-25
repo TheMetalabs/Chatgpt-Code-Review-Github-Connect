@@ -1,4 +1,5 @@
 import {cancelLocalJsonRepairs} from "./json-repair.server";
+import { ignoredTarget } from "./webhook-target.ts";
 import type {RepairReceipt} from "./json-repair-types.ts";
 import {recordJobHistory, recordDeliveryHistory, reviewHistory} from "./review-history.server";
 import {
@@ -1467,7 +1468,9 @@ export function ingestGitHubWebhook(opts: {
       hmac: "ok",
       httpStatus: 202,
       at: Date.now(),
-      summary: `${opts.event} ignored`,
+      // The PR the ignored delivery is about (bot comments, reviews, pushes): lane tooling filters
+      // webhook-driven signals by repo#pr, and a bare "<event> ignored" could not be attributed.
+      summary: `${ignoredTarget(opts.payload)}${opts.event} ignored`,
       skipReason: parsed.reason,
     };
     recordDeliveryHistory(ev);
@@ -1510,3 +1513,4 @@ if (!(globalThis as Record<symbol, unknown>)[BOOT_SWEPT]) {
   (globalThis as Record<symbol, unknown>)[BOOT_SWEPT] = true;
   void sweepCutFixRounds(state.settings);
 }
+

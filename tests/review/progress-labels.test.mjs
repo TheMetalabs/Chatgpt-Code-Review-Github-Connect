@@ -135,12 +135,12 @@ function walkTokens(level, visit, container) {
   });
 }
 
-/** The argument group of the recorder call at `level[k]`, `name(...)` or `name?.(...)`, else null. The
- * name of a function declaration is not a call, and neither is `name(...) {...}`: a method named after
- * the recorder (or a call followed by a block), whose parentheses may bind the stage name. */
+/** The argument group of the recorder call at `level[k]`, `name(...)` or `name?.(...)`, else null.
+ * `name(...) {...}` is not a call: a function declaration's name, a method named after the recorder (or
+ * a call followed by a block), whose parentheses may bind the stage name. */
 function recorderCall(level, k) {
-  const token = level[k], before = level[k - 1];
-  if (token?.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text) || (before?.kind === 'word' && before.text === 'function')) return null;
+  const token = level[k];
+  if (token?.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text)) return null;
   const at = isPunct(level[k + 1], '?.') ? k + 2 : k + 1, group = level[at];
   return group?.kind === 'group' && group.open === '(' && level[at + 1]?.open !== '{' ? group : null;
 }
@@ -520,6 +520,8 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
     forwarding('rows.forEach(stage => recordReviewStep(stage));'),
     forwarding('function inner(stage) { recordReviewStep(stage); }\n  inner(computeStage());'),
     forwarding('try { run(); } catch (stage) { recordReviewStep(stage); }'),
+    // A nested declaration named after a recorder: its parameters are a binding, not a call's arguments.
+    forwarding('function recordReviewStep(stage) { workerStep(job, provider, stage); }\n  recordReviewStep(stage);'),
     // A default value can reassign the parameter before the body runs; a repeated name binds the last one.
     'function step(stage, late = stage += "_late") {\n  recordReviewStep(stage);\n}\nstep("composer_waiting");',
     'function step(stage, stage) {\n  recordReviewStep(stage);\n}\nstep("composer_waiting");',
@@ -531,6 +533,12 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
     assert.equal(found.length, 1, `${text}\n: the forwarded stage is a problem, not a silent pass`);
     assert.match(found[0], /recordReviewStep\(\): stage `stage` is not a literal/);
   }
+  // A forwarded stage is the whole stage argument: `stage = computeStage()` starts with the name and
+  // reassigns it, so the call after it does not forward either.
+  assert.deepEqual(problems(forwarding('recordReviewStep(stage = computeStage());\n  recordReviewStep(stage);')), [
+    'fixture.js:2 recordReviewStep(): stage `stage = computeStage()` is not a literal, so its value cannot be checked for a label',
+    'fixture.js:3 recordReviewStep(): stage `stage` is not a literal, so its value cannot be checked for a label',
+  ]);
 });
 
 test('a file the tokenizer cannot read is a problem that names the file, not a blame on its forwarder', () => {

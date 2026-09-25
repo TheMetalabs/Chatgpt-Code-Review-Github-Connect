@@ -24,7 +24,8 @@
  * round N+1 verifies the N-th fix (clean → CONVERGED, else round-cap). The ONLY quiet exits are
  * supersession (a newer head drives the loop — its review is requested once, idempotently; a
  * request that did not settle is logged, not quiet), an operator stop, a newer loop request (a
- * new session, or apply downgraded to suggest), and an existing handoff on this head. One
+ * new session, or apply downgraded to suggest), an existing handoff on this head, and a second
+ * step for this head that a newer one replaced or whose round the step it waited behind ran. One
  * relevance check guards every checkpoint of a round, and a round that went moot is never
  * retried. Apply also requires the session starter's write permission (design §2).
  * Everything is gated OFF by default:
@@ -54,7 +55,7 @@
  *     "script-apply" is wired; "chat-push" fails closed.
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
-import type { GitDataApi } from "./fix-commit.ts";
+import { BranchMovedError, type GitDataApi } from "./fix-commit.ts";
 import type { FixRequest } from "./bridge-fix.server.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
@@ -90,6 +91,7 @@ import {
   isoMs,
   isSelfLogin,
   MAX_CONTINUE_ROUND,
+  newestLoopComment,
   resolveBotLogin,
   sanitizeUntrusted,
   startComment,
@@ -170,6 +172,13 @@ export interface LoopRuntimeDeps {
   sleep?: (ms: number) => Promise<void>;
   /** The clock a control write's attempt is stamped with (injected by tests). */
   now?: () => number;
+  /** Bound on a second step's wait for the running step of its head (tests); production derives it
+   * from the fix request's own deadlines (stepWaitMaxMs). */
+  stepWaitMaxMs?: number;
+  /** The operator's settings as they are NOW (tests); production re-loads them from the settings
+   * store. Read by a step that waited for its head's running step, when it is admitted. Absent in a
+   * test → the settings of the call. */
+  settingsNow?: () => BotSettings | Promise<BotSettings>;
 }
 
 export type LoopStepResult =
@@ -179,7 +188,14 @@ export type LoopStepResult =
 
 const SUPERSEDED = "superseded (head moved)";
 const ALREADY_ESCALATED = "already escalated on this head";
-const STEP_IN_FLIGHT = "another loop step is in flight for this head";
+/** A later step for this head replaced this one while it waited: the newer one runs. */
+const STEP_REPLACED = "replaced by a newer loop step for this head (the newer one runs)";
+/** The step this one waited behind already ran this head's round for the same session, mode and
+ * starter (a re-trigger mid-round): that round's report or handoff is the result. */
+const ROUND_ALREADY_RUN = "this head's fix round already ran for this session, mode and starter";
+/** NOT silent (logged): the running step for this head outlived the wait bound — a bug, since every
+ * await in a step is bounded. This step did not run; the running one is never force-released. */
+const STEP_WAIT_EXPIRED = "another loop step for this head outlived the wait bound; this step did not run";
 const NO_SESSION = "no active loop session";
 const STOPPED_QUIET = "loop stopped by operator";
 const ENDED_BY_HANDOFF = "the loop session ended with a handoff";
@@ -217,7 +233,8 @@ export const SILENT_REASONS: readonly string[] = [
   "no findings (converged)",
   SUPERSEDED,
   ALREADY_ESCALATED,
-  STEP_IN_FLIGHT,
+  STEP_REPLACED,
+  ROUND_ALREADY_RUN,
   NO_SESSION,
   STOPPED_QUIET,
   ENDED_BY_HANDOFF,
@@ -247,10 +264,146 @@ function controlCtx(d: LoopRuntimeDeps, token: string, botLogin: string): EmitCo
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
 // One loop step per PR head at a time (in-process): a second posted review of the same head
-// (re-request, redelivery) must not run a parallel fix round. Different heads never block each
-// other — the older one is superseded at its head checks. Cross-process coordination is a
-// NON-GOAL (single harbor instance; see the engine header).
-const inFlightSteps = new Set<string>();
+// (re-request, redelivery, a restart after a stop, a mode change) never runs a parallel fix round.
+// It WAITS for the running step instead of being dropped — dropped, it left an active session with
+// nothing running once the running round went moot. At most one waiter: a later arrival replaces
+// it (latest wins), and the running step is never preempted. Different heads never wait on each
+// other — the older one is superseded at its head checks. Slots are per GitHub client (production
+// has one: harbor's calls). Cross-process coordination is a NON-GOAL (single harbor instance; see
+// the engine header). Latest wins for the ROUND only: a fresh human start that a replaced waiter
+// carried (its record not posted yet) passes to the step that replaced it, which records it.
+type StepTurn = { status: "run"; prior?: string; starts: StartRequest[] } | { status: "replaced" } | { status: "expired"; starts: StartRequest[] };
+type StepSlot = {
+  /** The roundSignature of the last round that reached the provider while the slot was held,
+   * handed to the next owner (a waiter) — never kept once the slot is free. */
+  sig?: string;
+  waiter?: (turn: StepTurn) => void;
+  /** The start requests the waiter carries: its own and those of every waiter it replaced. */
+  waiterStarts?: StartRequest[];
+};
+/** In-process loop-step state of one GitHub client. */
+type StepState = {
+  /** The per-head slots, by `${prKey}@${head}`. */
+  slots: Map<string, StepSlot>;
+  /** Fresh human starts that loop steps carry and have not recorded yet (a restart's review waiting
+   * behind a running round), by prKey: a stop meanwhile may end the session they will open, so
+   * stopLoop records it as it does for a start still in flight in harbor. */
+  pendingStarts: Map<string, Set<StartRequest>>;
+};
+const productionStepState: StepState = { slots: new Map(), pendingStarts: new Map() };
+const stepStateByClient = new WeakMap<object, StepState>();
+const MAX_TIMER_MS = 2_147_483_647;
+
+function stepState(deps: Pick<LoopRuntimeDeps, "gh"> | undefined): StepState {
+  if (!deps) return productionStepState;
+  let state = stepStateByClient.get(deps.gh);
+  if (!state) stepStateByClient.set(deps.gh, (state = { slots: new Map(), pendingStarts: new Map() }));
+  return state;
+}
+
+function holdStarts(state: StepState, pr: string, starts: readonly StartRequest[]): void {
+  if (starts.length === 0) return;
+  let held = state.pendingStarts.get(pr);
+  if (!held) state.pendingStarts.set(pr, (held = new Set()));
+  for (const s of starts) held.add(s);
+}
+
+function dropStarts(state: StepState, pr: string, starts: readonly StartRequest[]): void {
+  const held = state.pendingStarts.get(pr);
+  if (!held) return;
+  for (const s of starts) held.delete(s);
+  if (held.size === 0) state.pendingStarts.delete(pr);
+}
+
+/** Does a loop step carry an unrecorded start that a stop at `at` would end (the start at or before
+ * the stop — in one second the stop is causally later)? */
+function startPendingBefore(state: StepState, pr: string, at: string): boolean {
+  const stopMs = isoMs(at);
+  for (const s of state.pendingStarts.get(pr) ?? []) if (Number.isNaN(stopMs) || isoMs(s.at) <= stopMs) return true;
+  return false;
+}
+
+/** Take a head's slot, synchronously (before any await): free → run now; held → wait for its
+ * release, replacing a step that already waits (and taking over the start requests it carries),
+ * for at most `waitMaxMs`. */
+function claimStep(slots: Map<string, StepSlot>, key: string, waitMaxMs: number, own: StartRequest[]): StepTurn | Promise<StepTurn> {
+  const slot = slots.get(key);
+  if (!slot) {
+    slots.set(key, {});
+    return { status: "run", starts: own };
+  }
+  const starts = [...(slot.waiter ? (slot.waiterStarts ?? []) : []), ...own];
+  slot.waiter?.({ status: "replaced" });
+  return new Promise<StepTurn>((resolve) => {
+    const timer = setTimeout(() => {
+      if (slot.waiter === admit) {
+        slot.waiter = undefined;
+        slot.waiterStarts = undefined;
+      }
+      resolve({ status: "expired", starts });
+    }, waitMaxMs);
+    (timer as { unref?: () => void }).unref?.();
+    const admit = (turn: StepTurn) => {
+      clearTimeout(timer);
+      resolve(turn);
+    };
+    slot.waiter = admit;
+    slot.waiterStarts = starts;
+  });
+}
+
+/** Release a head's slot: the waiter, if any, becomes the owner and learns the last round run. */
+function releaseStep(slots: Map<string, StepSlot>, key: string): void {
+  const slot = slots.get(key);
+  const next = slot?.waiter;
+  if (!slot || !next) {
+    slots.delete(key);
+    return;
+  }
+  const starts = slot.waiterStarts ?? [];
+  slot.waiter = undefined;
+  slot.waiterStarts = undefined;
+  next({ status: "run", prior: slot.sig, starts });
+}
+
+/** Whose authority a round of `mode` acts on: apply writes on the starter's, so a start re-issued
+ * by someone else takes the round over; suggest acts for the session, whoever re-issued it. Logins
+ * compare as GitHub's do (case-insensitive). */
+function roundActor(mode: ReviewLoopMode, starter: string | undefined): string {
+  return mode === "apply" ? (starter ?? "").toLowerCase() : "";
+}
+
+/** A fix round's identity for a step that waited behind another — the terms the running round's
+ * relevance check compares, and no others: the session anchor, the effective mode and, for apply,
+ * the starter. A stop → restart (a new anchor), a mode change or another apply starter is a new
+ * round (the running one went moot); anything else is a re-trigger of the round that already ran. */
+function roundSignature(session: LoopSession, settings: BotSettings): string {
+  const mode = effectiveLoopMode(session.mode, settings);
+  return `${isoMs(session.startIso)}|${mode}|${roundActor(mode, session.starter)}`;
+}
+
+/** How long a second step waits for its head's running step: that step's own worst case under the
+ * settings of this call (every attempt queued to the ceiling, then generating twice the configured
+ * provider's deadline — fixGenerationMs, the watcher's own). Every await in a step is bounded
+ * (transport timeouts, the fix watcher's deadlines, fixed sleeps), so this fires only on a bug. */
+function stepWaitMaxMs(settings: BotSettings, deps: LoopRuntimeDeps | undefined): number {
+  const fix = settings.fixAgent;
+  const own = fixKnob(fix, "attempts") * ((deps?.fixWatch?.queueMaxMs ?? fixKnob(fix, "queueMaxMs")) + 2 * (deps?.fixTimeoutMs ?? fixGenerationMs(fix)));
+  return Math.min(Math.max(0, deps?.stepWaitMaxMs ?? own), MAX_TIMER_MS);
+}
+
+/** Tests only: the step gate's production path (harbor passes no deps) is unreachable from a unit
+ * test, which always injects a client. */
+export const loopStepGateForTests = { stepState, stepWaitMaxMs, MAX_TIMER_MS } as const;
+
+/** The operator's current settings for a step admitted after a wait: harbor replaces its settings
+ * object on every save, so the one a step was called with can be hours old. Production re-loads the
+ * store that save writes (loaded lazily, as the other production modules are). */
+async function settingsNow(deps: LoopRuntimeDeps | undefined, called: BotSettings): Promise<BotSettings> {
+  if (deps) return deps.settingsNow ? await deps.settingsNow() : called;
+  const { loadBotSettings } = await import("./settings.server.ts");
+  return loadBotSettings();
+}
 
 function envOf(): NodeJS.ProcessEnv | undefined {
   return typeof process !== "undefined" ? process.env : undefined;
@@ -697,6 +850,10 @@ async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRu
   // The GitHub client is the loop's only channel: if it cannot load, nothing can be posted (the
   // ONE unobservable failure — logged server-side by harbor). Provider transports load LAZILY
   // inside requestFix, so their failure is an ordinary request-failed → retry → fix-failed.
+  return { gh: await productionGithub(), validate: builtinValidate, ...(await providerFixDeps(settings, ref)) };
+}
+
+async function productionGithub(): Promise<LoopRuntimeGithub> {
   const github = await import("./github.server.ts");
   productionGh ??= {
     listPullReviews: github.listPullReviews,
@@ -709,8 +866,7 @@ async function productionDeps(settings: BotSettings, ref: PrRef): Promise<LoopRu
     listReviewThreadRoots: github.listReviewThreadRoots,
     replyToReviewComment: github.replyToReviewComment,
   };
-  const gh = productionGh;
-  return { gh, validate: builtinValidate, ...(await providerFixDeps(settings, ref)) };
+  return productionGh;
 }
 
 /** The provider-dependent half of the production deps: the transport and whether it reports
@@ -853,7 +1009,7 @@ export async function runPostReviewLoop(
   const { owner, repo, pr, headSha } = job;
   const ref: PrRef = { owner, repo, pr };
   const botLogin = ashlarBotLogin(env);
-  const cap = roundCap(settings);
+  let cap = roundCap(settings); // re-read with the settings of a step admitted after a wait
   let d: LoopRuntimeDeps | undefined = deps;
   let rounds: RoundSummary[] = [];
   let diffLines: number | undefined;
@@ -894,10 +1050,41 @@ export async function runPostReviewLoop(
     }
   };
 
-  const stepKey = `${owner}/${repo}#${pr}@${headSha}`;
-  if (inFlightSteps.has(stepKey)) return { ran: false, reason: STEP_IN_FLIGHT };
-  inFlightSteps.add(stepKey);
+  // This review was posted before its step was called: a session anchored at or after this instant
+  // does not contain it.
+  const calledAt = (deps?.now ?? Date.now)();
+  // The fresh human start this review was requested by (its record may not have been posted at
+  // admission): a waiter that a later step replaces hands it over.
+  const ownStart: StartRequest[] =
+    job.thread?.loop?.kind === "start" && !isSelfLogin(job.sender, botLogin)
+      ? [{ owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }]
+      : [];
+  const stepKey = `${prKey(ref)}@${headSha}`;
+  const state = stepState(deps);
+  const slots = state.slots;
+  // Pending from now until it is recorded (or handed to the step that replaces this one).
+  holdStarts(state, prKey(ref), ownStart);
+  const claimed = claimStep(slots, stepKey, stepWaitMaxMs(settings, deps), ownStart);
+  const waited = claimed instanceof Promise;
+  if (waited) trace(job.id, "step-waits", { pr, head: headSha.slice(0, 7) });
+  const turn = claimed instanceof Promise ? await claimed : claimed;
+  if (turn.status === "replaced") return { ran: false, reason: STEP_REPLACED }; // its start is handed over
+  if (turn.status === "expired") {
+    dropStarts(state, prKey(ref), turn.starts);
+    return { ran: false, reason: STEP_WAIT_EXPIRED };
+  }
+  const prior = turn.prior; // the round the step this one waited behind ran, if any
+  const startRequests = turn.starts; // this review's start and those of the waiters it replaced
   try {
+    if (waited) {
+      // The wait can last hours: the operator's settings set meanwhile govern this step — every
+      // later read, check, budget and round below. The kill switch is the Settings gate itself
+      // (fixAgent.enabled off, or a provider + delivery this runtime cannot run: loopEnabled);
+      // fixAgent.mode = suggest downgrades the round.
+      settings = await settingsNow(deps, settings);
+      if (!loopEnabled(settings)) return { ran: false, reason: "disabled" };
+      cap = roundCap(settings);
+    }
     d = deps ?? (await productionDeps(settings, ref));
     const gh = d.gh;
     const ctl = controlCtx(d, token, botLogin);
@@ -923,29 +1110,45 @@ export async function runPostReviewLoop(
     // contributor's backward force-push.
     if (head.sha !== headSha) return supersededResult(await continueOn(head));
     let session = await sessionOf(gh, token, ref, head, botLogin);
-    // This review was requested by a fresh human start whose record harbor could not post at
-    // admission: record it now (idempotent — an existing record, e.g. one a later stop ended,
-    // is never re-posted) and re-read once: the journal makes the record visible at once.
-    if (!session.active && job.thread?.loop?.kind === "start" && !isSelfLogin(job.sender, botLogin)) {
-      const out = await recordStart(token, { owner, repo, pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) }, d, botLogin);
-      switch (out.status) {
-        case "unknown": // it may have landed: never re-sent, and folded as the human's start
-          trace(job.id, "start-unresolved", { error: out.error });
-          session = await sessionOf(gh, token, ref, head, botLogin);
-          break;
-        case "posted":
-        case "exists":
-          session = await sessionOf(gh, token, ref, head, botLogin);
-          break;
-        case "rejected": // a LOGGED reason, never a silent no-session for a started loop
-          return { ran: false, reason: `start failed: ${out.error}` };
-        case "superseded": // unreachable: a start record is owed in every session (owedAs); never silent
-          return { ran: false, reason: `start failed: superseded (${MOOT_TEXT[out.why]})` };
-        default:
-          return assertNever(out);
+    // This review (or a waiting step it replaced) was requested by a fresh human start whose record
+    // harbor could not post at admission: record it now (idempotent — an existing record, e.g. one a
+    // later stop ended, is never re-posted) and re-read once: the journal makes the record visible
+    // at once.
+    if (!session.active && startRequests.length > 0) {
+      for (const start of startRequests) {
+        const out = await recordStart(token, start, d, botLogin);
+        switch (out.status) {
+          case "unknown": // it may have landed: never re-sent, and folded as the human's start
+            trace(job.id, "start-unresolved", { error: out.error });
+            break;
+          case "posted":
+          case "exists":
+            break;
+          case "rejected": // a LOGGED reason, never a silent no-session for a started loop
+            return { ran: false, reason: `start failed: ${out.error}` };
+          case "superseded": // unreachable: a start record is owed in every session (owedAs); never silent
+            return { ran: false, reason: `start failed: superseded (${MOOT_TEXT[out.why]})` };
+          default:
+            return assertNever(out);
+        }
       }
+      session = await sessionOf(gh, token, ref, head, botLogin);
     }
+    dropStarts(state, prKey(ref), startRequests); // recorded, or the session they would open runs
     if (!session.active) return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
+    // A step that waited acts only for a session its review can belong to. One anchored after the
+    // step was called (a stop → restart during the wait) started after this review was posted, so
+    // its rounds never include it: the history check below would hand the restarted session off
+    // (loop-error). The new session's own review drives it. A step that carries the start
+    // anchoring this session (or one after it) is that review, whatever this host's clock says.
+    const anchorMs = isoMs(session.startIso);
+    const carriesAnchor = startRequests.some((s) => isoMs(s.at) >= anchorMs);
+    if (waited && !carriesAnchor && calledAt <= anchorMs) return { ran: false, reason: NEWER_REQUEST };
+    // A step that waited behind a round of this very session, mode and starter (a re-trigger
+    // mid-round): that round's report or handoff is the result — no second FIXING, provider call
+    // or suggestion. A new session, mode or starter runs its own round on these fresh reads.
+    const sig = roundSignature(session, settings);
+    if (prior !== undefined && prior === sig) return { ran: false, reason: ROUND_ALREADY_RUN };
     requested = true;
     const current = sessionRef(session); // the step's session, as every later check compares it
     since = current;
@@ -1045,17 +1248,18 @@ export async function runPostReviewLoop(
       reviewer: settings.fixAgent.provider ?? undefined,
     });
     // ONE relevance predicate for every checkpoint of the round — before it starts, while queued,
-    // at generation start, before a retry, before the commit and before a report: the PR head,
-    // the session and (for apply) the session's mode must still be the ones this step started
-    // from. Fresh reads, never cached: the world moves while a slow fix request runs.
+    // at generation start, before a retry, before the commit, right before the branch ref moves
+    // and before a report: the PR head, the session and (for apply) the session's mode must still
+    // be the ones this step started from. Fresh reads, never cached: the world moves while a slow
+    // fix request runs.
     const relevance = async (): Promise<Moot | null> => {
       if ((await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha) return "head";
       const now = await sessionOf(gh, token, ref, head, botLogin);
       const gone = sessionMoot(gh, ref, now, current); // ended, or a newer session
       if (gone) return gone;
       // apply acts on the starter's authority: a re-issued start by someone else, or a downgrade
-      // to suggest, takes the round over
-      if (mode === "apply" && (effectiveLoopMode(now.mode, settings) !== "apply" || (now.starter ?? "") !== starter)) return "newer";
+      // to suggest, takes the round over (roundSignature compares the same terms)
+      if (mode === "apply" && (effectiveLoopMode(now.mode, settings) !== "apply" || roundActor("apply", now.starter) !== roundActor("apply", starter))) return "newer";
       return null;
     };
     let moot: Moot | undefined; // once a checkpoint finds the round moot it is never retried
@@ -1090,6 +1294,26 @@ export async function runPostReviewLoop(
         if (authFailure) return { ok: false, error: authFailure };
       }
       return { ok: true };
+    };
+    // The LAST check before the branch moves: blob, tree and commit creation take seconds for a
+    // multi-file fix, and a stop or a downgrade landing meanwhile must not move the ref. A moot
+    // round refuses the write (a BranchMovedError is never retried over; the round then exits
+    // quietly below). A failed read throws: no ref is written without a successful check. Residual
+    // (K5): a stop arriving inside updateBranchRef's own read→PATCH round trip (under a second).
+    const guardRef = (api: GitDataApi): GitDataApi => {
+      const readBranchRef = api.readBranchRef?.bind(api);
+      return {
+        baseTreeSha: (commitSha) => api.baseTreeSha(commitSha),
+        createBlob: (content) => api.createBlob(content),
+        createTree: (baseTreeSha, entries) => api.createTree(baseTreeSha, entries),
+        createCommit: (message, treeSha, parentSha) => api.createCommit(message, treeSha, parentSha),
+        updateBranchRef: async (branch, commitSha, expectedOldSha) => {
+          const why = await checkpoint();
+          if (why) throw new BranchMovedError(`${MOOT_TEXT[why]} before the branch ref update; not moved`);
+          return api.updateBranchRef(branch, commitSha, expectedOldSha);
+        },
+        ...(readBranchRef ? { readBranchRef } : {}),
+      };
     };
     // Per-finding thread replies: a transient failure is retried with the continuation's backoff —
     // the thread list (a read) always, a reply only when GitHub cannot have created it (its error
@@ -1149,6 +1373,10 @@ export async function runPostReviewLoop(
           return why ? MOOT_TEXT[why] : null;
         },
       });
+    // The round reaches the provider: a step waiting behind this one runs no second round for the
+    // same session, mode and starter.
+    const slot = slots.get(stepKey);
+    if (slot) slot.sig = sig;
     // Progress signal: the fix can wait long in a busy provider queue — a driver must be able to
     // tell "in progress" from "dead". Best effort: it never blocks or fails the round.
     await gh.createIssueComment(token, { owner, repo, pr, body: fixingComment({ round: rounds.length, pr, head: headSha }) }).catch(() => {});
@@ -1160,7 +1388,7 @@ export async function runPostReviewLoop(
       const t0 = Date.now();
       trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, provider: settings.fixAgent.provider ?? "none" });
       res = await runFixRound(
-        { requestFix, api: gh.gitDataApi(token, owner, repo), validate },
+        { requestFix, api: guardRef(gh.gitDataApi(token, owner, repo)), validate },
         {
           prompt,
           mode,
@@ -1254,7 +1482,8 @@ export async function runPostReviewLoop(
     // server-side error (no PR noise on a PR that never asked for a loop).
     return requested ? await escalate("loop-error", reason) : { ran: false, reason };
   } finally {
-    inFlightSteps.delete(stepKey);
+    dropStarts(state, prKey(ref), startRequests);
+    releaseStep(slots, stepKey);
   }
 }
 
@@ -1457,9 +1686,11 @@ function stopDecides(events: readonly LoopEvent[], stop: { actor: string; at: st
  * decides which session runs (it is the boundary before a newer start, which without its record
  * re-issues the ended session with the rounds before the stop; or it keeps a session over that a
  * continuation after it would resume) — and when it races a start still in flight (the caller saw
- * a live loop-start review for the PR), or finds the session ended only in this process (an own
- * write that may not be durable). A stop that changes nothing posts nothing. A repeated stop finds
- * its record and posts nothing; one whose record's outcome is unknown is only looked for again.
+ * a live loop-start review for the PR, or a loop step carries an unrecorded start no later than
+ * the stop: a restart's review waiting behind a running round), or finds the session ended only in
+ * this process (an own write that may not be durable). A stop that changes nothing posts nothing.
+ * A repeated stop finds its record and posts nothing; one whose record's outcome is unknown is only
+ * looked for again.
  * The record is the STOPPED acknowledgement while no session runs; posted while a newer session is
  * active it is the bare record (stopRecordComment), never a terminal signal for that session — the
  * form is decided by a fresh read right before each POST attempt, so a retry after a newer start
@@ -1529,7 +1760,10 @@ export async function stopLoop(
     const decides =
       stopDecides(events, self, head.sha) || stopDecides([...durable, { at, kind: "stop", actor: stop.actor }], self, head.sha);
     const endedHereOnly = ownWrites(d.gh).unconfirmedEnd(ref, session) !== undefined;
-    if (!endedIt && !decides && !endedHereOnly && !(stop.startInFlight ?? false)) {
+    // A start not recorded yet may still land with an earlier time: harbor's live loop-start review,
+    // or a loop step that carries one (a restart's review waiting behind a running round).
+    const startInFlight = (stop.startInFlight ?? false) || startPendingBefore(stepState(deps), prKey(ref), at);
+    if (!endedIt && !decides && !endedHereOnly && !startInFlight) {
       ownWrites(d.gh).abandon(write);
       return { posted: false, reason: NO_SESSION };
     }
@@ -1555,4 +1789,82 @@ export async function stopLoop(
   } finally {
     inFlightStop.delete(key);
   }
+}
+
+// ── Boot: a fix round a restart cut ─────────────────────────────────────────────
+// A deploy or restart during a round leaves the PR's newest loop comment at FIXING and its session
+// active with nothing running it — a silent stall. At boot this hands each such session off, once.
+
+/** The handoff detail of a fix round the server restart cut. */
+export const RESTART_CUT_DETAIL = "the server restarted during a fix round, so nothing is running it any more; re-issue /review-loop <mode> to resume";
+/** Bound on the open PRs one boot sweep reads. */
+export const BOOT_SWEEP_MAX_PRS = 20;
+
+export type BootSweepDeps = Pick<LoopRuntimeDeps, "gh" | "sleep" | "now"> & {
+  /** Open PRs of the installed repositories with their installation token — at most `max`. */
+  openPulls(max: number): Promise<Array<PrRef & { token: string }>>;
+};
+
+/**
+ * Hand off (loop-error) every active session whose newest loop comment is FIXING while no step for
+ * its PR is in flight in this process (at boot there never is). The handoff is the escalate path's:
+ * one per head and session, emitted through the control journal (a lost response is never re-sent)
+ * and decided by a fresh session read at each POST attempt. Loop OFF: no GitHub call. Bounded, and
+ * never throws (a failed read skips the PR, or the sweep); each outcome is logged.
+ */
+export async function sweepCutFixRounds(settings: BotSettings, deps?: BootSweepDeps, env: NodeJS.ProcessEnv | undefined = envOf()): Promise<Array<{ pr: string; outcome: string }>> {
+  if (!loopEnabled(settings)) return [];
+  const log = (line: string) => console.info(`[review-loop] boot sweep ${line}`);
+  const done: Array<{ pr: string; outcome: string }> = [];
+  try {
+    const d = deps ?? { gh: await productionGithub(), openPulls: (await import("./github.server.ts")).listInstalledOpenPulls };
+    const botLogin = ashlarBotLogin(env);
+    for (const { token, ...ref } of (await d.openPulls(BOOT_SWEEP_MAX_PRS)).slice(0, BOOT_SWEEP_MAX_PRS)) {
+      const outcome = await handOffCutRound(d, token, ref, settings, botLogin).catch((e) => `untouched: read failed (${(e as Error)?.message ?? String(e)})`);
+      if (outcome !== NOT_CUT) log(`${prKey(ref)}: ${outcome}`);
+      done.push({ pr: prKey(ref), outcome });
+    }
+  } catch (e) {
+    log(`skipped: ${(e as Error)?.message ?? String(e)}`);
+  }
+  return done;
+}
+
+const NOT_CUT = "untouched: the newest loop comment is not FIXING";
+
+async function handOffCutRound(d: BootSweepDeps, token: string, ref: PrRef, settings: BotSettings, botLogin: string): Promise<string> {
+  const { gh } = d;
+  const state = stepState(gh === productionGh ? undefined : d); // production steps run on productionStepState
+  // Re-checked at each handoff POST attempt: a step that claimed the PR's slot during the sweep's
+  // reads (a review job that survived the restart) owns the round, so the sweep never cuts it.
+  const stepRuns = () => [...state.slots.keys()].some((k) => k.startsWith(`${prKey(ref)}@`));
+  if (stepRuns()) return "untouched: a loop step for it runs in this process";
+  if (newestLoopComment(await gh.listIssueComments(token, ref.owner, ref.repo, ref.pr), botLogin)?.kind !== "fixing") return NOT_CUT;
+  const head = await gh.fetchPullHeadRef(token, ref.owner, ref.repo, ref.pr);
+  const session = await sessionOf(gh, token, ref, head, botLogin);
+  if (!session.active) return "untouched: no active loop session";
+  const current = sessionRef(session);
+  const rounds = await reconstructRounds(gh, token, ref.owner, ref.repo, ref.pr, { botLogin, sinceIso: current.at }).catch(() => []);
+  const r = await escalateNow(gh, token, {
+    ...ref,
+    head: head.sha,
+    reason: "loop-error",
+    detail: RESTART_CUT_DETAIL,
+    rounds,
+    roundCap: roundCap(settings),
+    diffLines: diffLinesOf(head),
+    botLogin,
+    session: current,
+    superseded: async () => {
+      if (stepRuns()) return "newer";
+      const moot = await freshMoot(gh, token, ref, botLogin, { session: current });
+      return moot ?? (stepRuns() ? "newer" : null);
+    },
+    sleep: d.sleep ?? realSleep,
+    now: d.now,
+  });
+  if (r.escalated) return "handed off (loop-error)";
+  if (r.superseded) return `untouched: ${MOOT_TEXT[r.superseded]}`;
+  if (r.ambiguous) return `handoff unconfirmed: ${r.error}`;
+  return r.error ? `handoff not posted: ${r.error}` : "untouched: already handed off on this head";
 }

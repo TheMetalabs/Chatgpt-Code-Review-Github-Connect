@@ -1831,6 +1831,26 @@ async function rebindDispatchedPage(job, provider, run, result) {
   } catch { return null; }
 }
 
+/** How long a started leg may wait for its lost binding: the server's BINDING_LOST_MS (#95). */
+const BINDING_LOST_MS = 10 * 60_000;
+
+/** A started leg whose run no page answers for (`message`: why) waits for its binding to come back,
+ * but not forever: from the first such wait (bindingLostAt, cleared by a matching reply), after
+ * BINDING_LOST_MS the leg fails locally (`binding_lost`), and that failure is delivered and its tab
+ * released like any other, instead of heartbeating "disconnected" until someone clears it. */
+async function waitForBinding(job, provider, jobs, message) {
+  const state = job.states[provider];
+  state.connectionError = message;
+  state.bindingLostAt ??= Date.now();
+  if (Date.now() - state.bindingLostAt >= BINDING_LOST_MS) {
+    delete state.connectionError;
+    delete state.bindingLostAt;
+    state.outcome = failure("binding_lost", `the run's page binding stayed unavailable for ${BINDING_LOST_MS / 60_000} minutes (${message})`);
+    workerStep(job, provider, "binding_lost");
+  }
+  await saveJobs(jobs);
+}
+
 /** Why a page refused a new run message (json.js, before it binds anything): "taken_over" (its tab
  * is not the fresh page the run may start on), "stale_run" (it arrived after its `until`); "" when
  * it did not refuse. A refusal comes from an unbound page, so it never names this run. */
@@ -1909,7 +1929,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (!state.tabId && (state.started || job.resumeProviders?.includes(provider))) {
     const original = await findOriginalTab(job, provider);
     if (original) { state.tabId = original.id; state.started = true; await saveJobs(jobs); }
-    else { state.connectionError = "original review tab unavailable; waiting for reconnection"; await saveJobs(jobs); return; }
+    else return waitForBinding(job, provider, jobs, "original review tab unavailable; waiting for reconnection");
   }
   if (!state.tabId) {
     if (observeOnly) return;
@@ -1956,7 +1976,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   try { tab = await chrome.tabs.get(state.tabId); }
   catch {
     tab = await findOriginalTab(job, provider);
-    if (!tab) { state.connectionError = "tab connection unknown; waiting for reconnection"; await saveJobs(jobs); return; }
+    if (!tab) return waitForBinding(job, provider, jobs, "tab connection unknown; waiting for reconnection");
     state.tabId = tab.id; state.started = true; await saveJobs(jobs);
   }
   // A discarded tab holds no page (and a woken one that never finishes loading still holds none):
@@ -2041,11 +2061,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     if (rebound) result = rebound;
   }
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
-    state.connectionError = "original job binding unavailable; waiting for reconnection";
     const original = await findOriginalTab(job, provider);
     if (original && original.id !== state.tabId) { state.tabId = original.id; state.started = true; }
-    await saveJobs(jobs);
-    return;
+    return waitForBinding(job, provider, jobs, "original job binding unavailable; waiting for reconnection");
   }
   if (ingestPageProgress(state, result)) await saveJobs(jobs);
   if (result.observation && typeof result.observation === "object") {
@@ -2064,6 +2082,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (adopted || answeredAt) await saveJobs(jobs);
   await rememberOwnedTab(job, provider);
   delete state.connectionError;
+  delete state.bindingLostAt;
   if (isBusyResult(result)) return;
   // A fix answer is taken only with the page's positive ownership verdict for it (json.js
   // fixAnswerReply: the full proof, re-established when the answer is handed out).

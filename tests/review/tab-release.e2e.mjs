@@ -1224,3 +1224,24 @@ test('worker, review: a restarted worker harvests a run whose new chat moved to 
  assert.equal(again.b.messages.some(m=>m.adoptLegacy===true),false,'a bound page needs no re-binding');
  assert.equal(await tab.clicks(),0);
 });
+// No record proves the tab after a browser restart (storage.session is gone), so the unbound page is
+// never re-bound: the leg waits for its binding, but only for BINDING_LOST_MS (the server's bound,
+// #95), then fails locally and its failure is delivered, instead of reporting "disconnected" forever.
+test('worker: a leg whose binding stays lost for 10 minutes fails binding_lost and is delivered',async t=>{
+ const tab=await chatTab(t,{bound:false});
+ const w=wire(tab,{started:false,session:createdHere(tab.job)});
+ await w.tick();await tab.page.clock.runFor(3000);
+ await tab.page.evaluate(()=>sessionStorage.clear());await tab.page.goto(CONV_URL);await tab.inject();
+ const again=wire(tab,{local:w.b.local});
+ await again.tick();
+ assert.match(again.state().connectionError||'',/original job binding unavailable/);
+ const RealDate=again.b.context.Date||Date;const at=RealDate.now()+9*60_000;
+ again.b.context.Date=class extends RealDate{static now(){return at;}};
+ await again.tick();
+ assert.equal(again.state().outcome,undefined,'still within the bound');
+ const late=at+2*60_000;again.b.context.Date=class extends RealDate{static now(){return late;}};
+ await again.tick();
+ const failed=again.b.calls.find(c=>c.action==='failure');
+ assert.ok(failed&&/^binding_lost:/.test(failed.error),`the leg fails binding_lost: ${JSON.stringify(again.state())}`);
+ assert.equal(await tab.clicks(),0,'nothing is sent again');
+});

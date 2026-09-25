@@ -13,6 +13,7 @@ export const PROGRESS_LABELS = {
     tab_created: "Review tab created",
     run_dispatched: "Page runner acknowledged · submission not yet confirmed",
     run_rebound: "Page lost its binding · re-bound in the dispatched tab to observe (never resent)",
+    binding_lost: "Page binding stayed unavailable for 10 minutes · leg failed; nothing was resent",
     taken_before_send: "Tab taken over before the prompt was sent (it left its new chat, or the user wrote there) · nothing was sent; tab kept",
     composer_waiting: "Prompt not sent · waiting for composer",
     attachments_waiting: "Prompt entered · waiting for named attachments to finish uploading",

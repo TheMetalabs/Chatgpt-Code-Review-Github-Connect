@@ -142,7 +142,8 @@ for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
 
 // R17 (Ashlar 4101855338): a draft seen on ONE poll while the sent turn was unresolved latches the
 // takeover for good. The user then clears it and the turn resolves again: every later decision
-// (collect, hand-out, can-close, restore after a reload) still says the tab is the user's.
+// (collect, hand-out, the release verdict) still says the tab is the user's. (#82 removed the
+// completion restore after a reload: a reloaded tab is released by the same verdict, tabOwnership.)
 test('page: a draft typed and cleared while the sent turn is unresolved keeps the tab taken over at every later decision', async () => {
   const p = page();
   const c = p.c.context;
@@ -155,14 +156,12 @@ test('page: a draft typed and cleared while the sent turn is unresolved keeps th
   draft = ''; integrity = 'exact';
   const later = {
     collect: c.fixOwnershipProof(p.state(), {phase: 'collect'}).ownership,
-    handOut: c.fixOwnershipProof(p.state(), {phase: 'complete', completion: {responseId: 'response-A', text: ANSWER}}).ownership,
+    handOut: c.fixOwnershipProof(p.state(), {phase: 'complete'}).ownership,
   };
   p.state().result = {ok: true, raw: ANSWER, responseText: ANSWER};
-  const close = c.fixCanClose(p.state());
-  p.state().result = null;
-  const restored = p.c.message(msg('ashlar-result-saved', {committed: true, raw: ANSWER, text: ANSWER, completion: {responseId: 'response-A', context: '[]'}}));
-  assert.deepEqual({...later, canClose: close.canClose, closeReason: close.reason, restore: restored.code},
-    {collect: 'takenOver', handOut: 'takenOver', canClose: false, closeReason: 'repurposed', restore: 'completion_changed'});
+  const close = p.c.message(msg('ashlar-can-close'));
+  assert.deepEqual({...later, canClose: close.canClose, closeReason: close.reason, cause: close.cause},
+    {collect: 'takenOver', handOut: 'takenOver', canClose: false, closeReason: 'repurposed', cause: 'draft'});
   assert.equal(p.state().slotReleased, true, 'the managed slot is freed');
 });
 
@@ -208,11 +207,13 @@ for (const [name, cell] of Object.entries(PIN_CASES)) {
   });
 }
 
-// R18: the ID appears only after the answer was collected with none. The hand-out and close proofs
-// (phase "complete") identify an ID-less completion by its text, as they always did: the late ID alone
-// does not make it another response (control); another text still does.
-for (const [name, cell] of Object.entries({sameText: {text: ANSWER, owned: true}, otherText: {text: REGENERATED, owned: false}})) {
-  test(`page: a fix collected with no response ID whose ID appears before hand-out, ${name}: ${cell.owned ? 'handed out and closable' : 'taken over, never closed'}`, async () => {
+// R18: the ID appears only after the answer was collected with none: the late ID alone does not make
+// it another response. Since #82 the hand-out proof (phase "complete") compares nothing about the
+// answer (ChatGPT keeps redrawing a finished one), so what is handed out is always the answer the
+// collector pinned and collected, never the text now on screen; whether the tab then closes is the
+// release verdict's (tabOwnership: a regeneration signal keeps it, browser.e2e).
+for (const [name, cell] of Object.entries({sameText: {text: ANSWER}, otherText: {text: REGENERATED}})) {
+  test(`page: a fix collected with no response ID whose ID appears before hand-out, ${name}: the collected answer is handed out`, async () => {
     const p = page({limit: 12});
     const root = {}, node = {};
     let id = '', block = ANSWER;
@@ -226,9 +227,8 @@ for (const [name, cell] of Object.entries({sameText: {text: ANSWER, owned: true}
     Object.assign(p.state(), {running: false, result: {ok: true, raw, responseText: raw}});
     id = 'response-A'; block = cell.text;
     const handOut = p.c.context.fixOwnershipProof(p.state(), {phase: 'complete'});
-    const close = p.c.context.fixCanClose(p.state());
-    assert.deepEqual({handOut: handOut.ownership, canClose: close.canClose},
-      cell.owned ? {handOut: 'owned', canClose: true} : {handOut: 'takenOver', canClose: false});
+    const out = p.c.message(msg('ashlar-harvest'));
+    assert.deepEqual({handOut: handOut.ownership, ok: out.ok, raw: out.raw}, {handOut: 'owned', ok: true, raw: ANSWER});
   });
 }
 
@@ -364,7 +364,7 @@ test('page: a fix page\'s release verdict (can-close) is "unknown" while it cann
   let out = p.c.message(msg('ashlar-can-close'));
   assert.equal(out.ownership, 'unknown');assert.equal(out.owned, false);assert.equal(status(), false, 'unknown never frees the slot');
   // sent (its conversation recorded at send), but the bound turn is not rendered yet (reload / hydration)
-  Object.assign(p.c.context, {savedSubmission: () => ({phase: 'sent', expected: 'FIX PROMPT', conversation: URL_FIX}), boundReviewResponse: () => ({identified: false, followup: false})});
+  Object.assign(p.c.context, {savedSubmission: () => ({phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', conversation: URL_FIX}), boundReviewResponse: () => ({identified: false, followup: false})});
   out = p.c.message(msg('ashlar-can-close'));
   assert.equal(out.ownership, 'unknown');assert.equal(out.identity, undefined);assert.equal(status(), false);
   // the worker keeps the tab (preserve): the cancel exit frees the slot and states no verdict
@@ -374,22 +374,28 @@ test('page: a fix page\'s release verdict (can-close) is "unknown" while it cann
   assert.equal(p.c.message(msg('ashlar-harvest')).code, 'cancelled', 'the collector stopped');
 });
 
-test('page: a fix page\'s release verdict on a sent journal with no send-time conversation is permanent: "unestablished", slot freed at once', async () => {
-  // Round 13 (#77): a fix records its conversation only when its send is proven, so a sent journal
-  // without one (legacy, or confirmed only after a reload) can never establish it: never owned,
-  // never closed (the worker preserves it at once), even before its turn renders. (Rendered rows:
-  // browser.e2e noSendIdentity at every decision point.)
-  const p = page({limit: 500});
-  Object.assign(p.c.context, {stopButtonVisible: () => true, replyDoneVisible: () => false, savedSubmission: () => null});
-  p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');
-  p.c.message(run());
-  await flush();
-  Object.assign(p.c.context, {savedSubmission: () => ({phase: 'sent', expected: 'FIX PROMPT'}), boundReviewResponse: () => ({identified: false, followup: false})});
-  const out = p.c.message(msg('ashlar-can-close'));
-  assert.deepEqual({ownership: out.ownership, identity: out.identity, owned: out.owned, canClose: out.canClose}, {ownership: 'unknown', identity: 'unestablished', owned: false, canClose: false});
-  assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, 'a permanent verdict frees the managed slot');
-  await settled(p.c);
-});
+// Round 13 (#77): a fix records its conversation only when its send is proven, so a sent journal
+// without one (legacy, or confirmed only after a reload) can never establish it: never owned, never
+// closed (the worker preserves it at once), even before its turn renders. R17 (#77): nor can one
+// without its prompt's lossless form (`exact`), whose turn can never be proven exact. (Rendered rows:
+// browser.e2e noSendIdentity at every decision point.)
+for (const [name, journal] of Object.entries({
+  'no send-time conversation': {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT'},
+  'no lossless prompt form': {phase: 'sent', expected: 'FIX PROMPT', conversation: URL_FIX},
+})) {
+  test(`page: a fix page's release verdict on a sent journal with ${name} is permanent: "unestablished", slot freed at once`, async () => {
+    const p = page({limit: 500});
+    Object.assign(p.c.context, {stopButtonVisible: () => true, replyDoneVisible: () => false, savedSubmission: () => null});
+    p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');
+    p.c.message(run());
+    await flush();
+    Object.assign(p.c.context, {savedSubmission: () => journal, boundReviewResponse: () => ({identified: false, followup: false})});
+    const out = p.c.message(msg('ashlar-can-close'));
+    assert.deepEqual({ownership: out.ownership, identity: out.identity, owned: out.owned, canClose: out.canClose}, {ownership: 'unknown', identity: 'unestablished', owned: false, canClose: false});
+    assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, 'a permanent verdict frees the managed slot');
+    await settled(p.c);
+  });
+}
 
 // ── worker ──────────────────────────────────────────────────────────────────
 function fixJob(patch = {}) {
@@ -1086,8 +1092,10 @@ test('worker: a delivery promoted by its binding records its browser session; af
   assert.equal(local.state[DELIVERIES]['fix-A'].session, 'boot-1', 'the promoted record names the session its tab ID belongs to');
   // Browser restart: only local storage survives; tab 77 is now an unrelated, unbound ChatGPT tab.
   const tabs2 = new Map([[77, {id: 77, url: 'https://chatgpt.com/c/other', status: 'complete'}]]);
+  // Its page answers the inventory with no binding (read: #85 keeps an unread recorded tab until then).
   const boot2 = background({local, session: storage({'ashlar:browserSession': 'boot-2'}), tabs: tabs2, api: active,
-    handler: () => ({ok: false, code: 'idle', jobId: '', runId: ''})});
+    handler: (_id, m) => (m.type === 'ashlar-tab-status'
+      ? {ok: true, ownershipProtocol: 1, jobId: '', runId: '', provider: 'chatgpt', url: 'https://chatgpt.com/c/other'} : {ok: false, code: 'idle'})});
   await boot2.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
   const proven2 = await boot2.context.reconcileFixDeliveries({});
   assert.equal(proven2['fix-A'], undefined, 'a reused tab ID does not prove the delivery');

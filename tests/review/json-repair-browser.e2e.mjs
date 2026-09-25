@@ -90,7 +90,7 @@ test('worker/HTTP: disabled fallback salvages the reply into a posted review, wi
  assert.equal(f.app.localRequests.length,0,'salvage must not call the repair formatter');
  assert.equal(f.worker.calls.some(x=>x.action==='repair'||x.action==='failure'),false,'salvage is a complete, never a repair or failure');
  assert.equal(f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId).status,'posted');
- assert.match(f.app.reviews[0].body,/not parseable JSON/i,'posted body carries the verbatim salvaged reply');
+ assert.match(f.app.reviews[0].body,/not valid review JSON/i,'posted body carries the verbatim salvaged reply');
 });
 test('worker/HTTP: current valid JSON wins over a pending repair without a duplicate post',async t=>{
  const f=await workerFixture(t);await f.cycle();await eventually(()=>f.app.localRequests.length===1,'repair not started');

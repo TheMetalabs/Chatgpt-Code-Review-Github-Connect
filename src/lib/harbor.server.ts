@@ -1148,7 +1148,7 @@ export async function submitHarborChat(
  * verification and nothing it reported is lost. So is any leg, chat included and on any role, whose
  * rows past the gate's cap went unread (gateUnreadRows): it is never a clean structured result.
  * `cause` says why a leg posts verbatim: a reply salvaged before the gate (the bridge's, or a failed
- * held local leg's) was not parseable review JSON; a converted one parsed, and is evidence for
+ * held local leg's) was not valid review JSON; a converted one parsed, and is evidence for
  * unread rows alone or for another reason it is not a verdict. */
 function gateLeg(
   leg: ChatLeg,

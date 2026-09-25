@@ -91,7 +91,7 @@ describe("reviewSummaryBody: every part of the body comes from the outcome", () 
     const body = render("raw");
     assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
     assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0");
-    assert.match(body, /Review posted verbatim — the reply was not parseable JSON/);
+    assert.match(body, /Review posted verbatim — the reply was not valid review JSON/);
   });
 
   it("raw-unverified: the verifier's reply is kept verbatim inside the raw block, flagged unverified", () => {
@@ -132,14 +132,16 @@ describe("the raw header says why, from the cause the merge stamped (never from 
     reviewSummaryBody({ ...job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses }), headSha: "abc1234ffff", coverage: [] }, findings, "ashlar-bot");
   const header = (body: string) => /\*\*⚠️ Review posted verbatim — ([^*]*)\*\*/.exec(body)?.[1];
 
-  it("a parse failure says the reply was not parseable, and nothing about local repair", () => {
-    assert.equal(header(rawBody({ chatgpt: "unparseable" })), "the reply was not parseable JSON.");
+  it("a salvage before the gate says the reply was not valid review JSON (it may have parsed and failed the schema), and nothing about local repair", () => {
+    const body = rawBody({ chatgpt: "unparseable" });
+    assert.equal(header(body), "the reply was not valid review JSON.");
+    assert.doesNotMatch(body, /not parseable|local repair/i);
   });
 
   it("rows past the gate's cap: the reply parsed, its unread rows are why; never a parse failure or local repair", () => {
     for (const body of [rawBody({ chatgpt: "unread-rows" }), rawBody({ chatgpt: "unread-rows" }, [finding])]) {
       assert.equal(header(body), "the reply parsed, but its findings past the gate's row cap were not inspected.");
-      assert.doesNotMatch(body, /not parseable|local repair/i);
+      assert.doesNotMatch(body, /not parseable|not valid review JSON|local repair/i);
     }
   });
 
@@ -151,14 +153,14 @@ describe("the raw header says why, from the cause the merge stamped (never from 
     for (const causes of [undefined, {}, { chatgpt: "bogus" } as unknown as Job["rawCauses"], { toString: "unparseable" } as unknown as Job["rawCauses"]]) {
       const body = rawBody(causes);
       assert.equal(header(body), "a reply could not be used as structured review JSON.");
-      assert.doesNotMatch(body, /not parseable|local repair|row cap/i);
+      assert.doesNotMatch(body, /not parseable|not valid review JSON|local repair|row cap/i);
     }
   });
 
   it("several salvaged legs: one labeled clause each, in merge order", () => {
     assert.equal(
       rawCauseText({ chatgpt: "unparseable", local: "unread-rows" }),
-      "ChatGPT: the reply was not parseable JSON; Local LLM: the reply parsed, but its findings past the gate's row cap were not inspected",
+      "ChatGPT: the reply was not valid review JSON; Local LLM: the reply parsed, but its findings past the gate's row cap were not inspected",
     );
   });
 });

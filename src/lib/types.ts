@@ -422,7 +422,8 @@ export function chatProvidersOf(providers: readonly ReviewProvider[]): Array<"ch
 export type LocalReviewRole = "race" | "verify-clean";
 
 /** Why a leg's reply is posted verbatim instead of as structured findings: `unparseable` — it was
- * not parseable review JSON (salvaged before the gate); `unread-rows` — it parsed, but the gate set
+ * not valid review JSON (salvaged before the gate: unparseable, or JSON the review schema rejects);
+ * `unread-rows` — it parsed, but the gate set
  * findings past its row cap aside unread; `not-a-verdict` — a released held local reply the gate
  * could not use in full (docs/local-verify-clean.md §1). */
 export type RawCause = "unparseable" | "unread-rows" | "not-a-verdict";

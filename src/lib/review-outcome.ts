@@ -48,9 +48,11 @@ export function skippedNotes(job: Pick<Job, "skippedProviders">): string[] {
 }
 
 /** The fixed text for each raw cause: a Record over the closed type, so a new cause cannot render
- * without deciding what it says. */
+ * without deciding what it says. `unparseable` covers every salvage before the gate, and the bridge
+ * (repair off) and a multi-turn group salvage a reply that parsed as JSON but failed the review
+ * schema too, so its text claims only what holds for both: the reply was not valid review JSON. */
 const RAW_CAUSE_TEXT: Record<RawCause, string> = {
-  unparseable: "the reply was not parseable JSON",
+  unparseable: "the reply was not valid review JSON",
   "unread-rows": "the reply parsed, but its findings past the gate's row cap were not inspected",
   "not-a-verdict": "the reply could not be used as a complete structured review",
 };

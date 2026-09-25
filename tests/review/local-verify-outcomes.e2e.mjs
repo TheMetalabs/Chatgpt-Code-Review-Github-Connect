@@ -79,7 +79,7 @@ const posted=(first,marker,requests,extra={})=>({status:'posted',first,marker,re
 const skipped=requests=>({status:'skipped',requests});
 const chatFindings=posted(SUMMARY,MF,0,{stamp:'none'});
 // why: the raw header's cause (Job.rawCauses), never inferred from the outcome
-const WHY_UNPARSEABLE='the reply was not parseable JSON.';
+const WHY_UNPARSEABLE='the reply was not valid review JSON.';
 const WHY_UNREAD="the reply parsed, but its findings past the gate's row cap were not inspected.";
 const WHY_NOT_VERDICT='the reply could not be used as a complete structured review.';
 const chatRaw=why=>posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'none',why});
@@ -215,10 +215,34 @@ test('race outcome: chat overflow × local clean is evidence, never clean or CON
   // The reply parsed: the body and the loop handoff name the unread rows, never a parse failure or local repair.
   assert.deepEqual({...job().rawCauses},{chatgpt:'unread-rows'},'the merge stamps the structured cause');
   assert.match(body,/Review posted verbatim — the reply parsed, but its findings past the gate's row cap were not inspected\./,'the body names the row cap');
-  assert.doesNotMatch(body,/not parseable|local repair/i,'the body never calls the parsed reply unparseable');
+  assert.doesNotMatch(body,/not parseable|not valid review JSON|local repair/i,'the body never calls the parsed reply unparseable');
   const handoff=notCleanDetail(job(),postedOutcome(job(),0));
   assert.match(handoff,/row cap were not inspected/,'the loop handoff names the row cap');
-  assert.doesNotMatch(handoff,/not parseable|local repair/i,'the loop handoff never calls it a parse failure');
+  assert.doesNotMatch(handoff,/not parseable|not valid review JSON|local repair/i,'the loop handoff never calls it a parse failure');
+});
+
+// The bridge (repair off) salvages a reply that parses as JSON but fails the review schema exactly as
+// it salvages prose, so the pre-gate cause's text must hold for both: never "not parseable".
+test('race outcome: a parseable chat reply the review schema rejects is posted verbatim as not valid review JSON, never as unparseable',async t=>{
+  const app=await appFixture({localReviewRole:'race',localJsonRepairEnabled:false,reviewLocal:false});t.after(()=>app.close());
+  const out=await app.mention('race-chat-schema-invalid');
+  const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+  app.bridge.bridgeHeartbeat();
+  const take=app.bridge.takeNextBridgeJob('schema-client');
+  assert.equal(take?.jobId,out.jobId,'the bridge claims the job');
+  // valid JSON; its one finding carries a key the review schema does not allow
+  const parseable=JSON.stringify({findings:[{...finding,title:'CHAT-RAW duplicate write',confidence:'high'}],merge_recommendation:'REQUEST_CHANGES'});
+  assert.equal((await app.bridge.completeBridgeJob(out.jobId,parseable,[{provider:'chatgpt',raw:parseable}],take.leaseId)).ok,true);
+  await eventually(()=>app.reviews.length===1,'the review was not posted');
+  const body=app.reviews[0].body;
+  assert.ok(body.indexOf('CHAT-RAW duplicate write')>body.indexOf(REVIEW_RAW_START),'the reply is posted in the raw block');
+  assert.deepEqual({...job().rawCauses},{chatgpt:'unparseable'},'a pre-gate salvage');
+  assert.match(body,/Review posted verbatim — the reply was not valid review JSON\./);
+  assert.doesNotMatch(body,/not parseable/i,'a reply that parsed as JSON is never called unparseable');
+  const handoff=notCleanDetail(job(),postedOutcome(job(),0));
+  assert.match(handoff,/posted verbatim: the reply was not valid review JSON/);
+  assert.doesNotMatch(handoff,/not parseable/i,'nor in the loop handoff');
 });
 
 test('verify-clean outcome: the note credits only the chat reviewer whose structured result was clean',async t=>{

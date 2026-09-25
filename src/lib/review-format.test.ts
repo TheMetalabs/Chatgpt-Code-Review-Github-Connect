@@ -29,7 +29,7 @@ describe("review-format", () => {
     assert.doesNotMatch(body, new RegExp(CLEAN_REVIEW_BODY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(body, /P1 real bug in pay\.ts/);
     assert.match(body, /raw=1/);
-    assert.match(body, /not parseable JSON/i);
+    assert.match(body, /not valid review JSON/i);
   });
 
   it("delimits the salvaged block and redacts it from the public snapshot (keeps it in the posted body)", () => {

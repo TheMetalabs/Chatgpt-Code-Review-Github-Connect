@@ -62,7 +62,7 @@ test('fallback OFF salvages the completed original into a posted review and rele
  assert.equal(f.app.localRequests.length,0,'salvage must not call the repair formatter');
  assert.ok(f.worker.closedTabs.includes(10),'completed tab must be released after salvage');
  assert.equal(f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId).status,'posted');
- assert.match(f.app.reviews[0].body,/not parseable JSON/i,'posted body carries the verbatim salvaged reply');
+ assert.match(f.app.reviews[0].body,/not valid review JSON/i,'posted body carries the verbatim salvaged reply');
  assert.equal(f.worker.tabs.size,0);assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
 });
 
@@ -145,7 +145,7 @@ test('source change after durable archive preserves the receipt, releases capaci
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1,'replacement DOM must not be archived as the original run');
  await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'archived original was not salvaged into a review with repair off');
  assert.equal(f.app.localRequests.length,0,'repair off: salvage must not call the formatter');
- assert.match(f.app.reviews[0].body,/not parseable JSON/i,'salvaged body carries the archived original, not the replacement DOM');
+ assert.match(f.app.reviews[0].body,/not valid review JSON/i,'salvaged body carries the archived original, not the replacement DOM');
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false,'source change must not trigger another model generation');
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1);
 });

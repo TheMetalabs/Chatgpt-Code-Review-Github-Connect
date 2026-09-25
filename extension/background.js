@@ -668,10 +668,10 @@ async function recordedFixTab(record, live) {
  * page found for its run: the worker stopped between the intent and saving the tab. Decided from
  * evidence, never by waiting:
  * - "restore": a tab proves it: the page the tab inventory identifies as this run (`started`), or
- *   the tab its delivery record names, still open in this browser session;
- * - "absent": nothing can hold it (no record, an intent that never became a tab, or a recorded tab
- *   that is gone, or a record not tied to this browser session): the caller clears the intent, and
- *   the allocation opens exactly one tab. */
+ *   the tab its delivery record names, still open in this browser session and bound to no other run;
+ * - "absent": nothing can hold it (no record, an intent that never became a tab, a recorded tab
+ *   that is gone or now bound to another run, or a record not tied to this browser session): the
+ *   caller clears the intent, and the allocation opens exactly one tab (the other run keeps its tab). */
 async function fixAllocationEvidence(job, provider) {
   const state = job.states[provider];
   const tabs = await chrome.tabs.query({}), live = new Map(tabs.map(tab => [tab.id, tab]));
@@ -681,7 +681,14 @@ async function fixAllocationEvidence(job, provider) {
   const record = (await fixDeliveries())[job.jobId];
   const mine = record?.deliveryId === job.deliveryId && record.provider === provider && (!record.runId || record.runId === state.runId);
   const recorded = mine ? await recordedFixTab(record, live) : {tab: undefined};
-  if (recorded.tab) return {verdict: "restore", tabId: recorded.tab.id};
+  // The recorded tab is this run's only while nothing names another binding for it: its page (the
+  // tab inventory) or this session's owned record naming another job, provider or run means it now
+  // belongs to that run, and it is left to it untouched.
+  const other = binding => Boolean(binding?.jobId) &&
+    (binding.jobId !== job.jobId || binding.provider !== provider || binding.runId !== state.runId);
+  if (recorded.tab && !other(knownTabOwner(recorded.tab)) &&
+      !other((await chrome.storage.session.get([OWNED_PREFIX + recorded.tab.id]))[OWNED_PREFIX + recorded.tab.id]))
+    return {verdict: "restore", tabId: recorded.tab.id};
   return {verdict: "absent"};
 }
 

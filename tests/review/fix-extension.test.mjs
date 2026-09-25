@@ -619,6 +619,35 @@ for (const row of [
   });
 }
 
+// Round 16: the recorded tab of run-A that now carries ANOTHER run's binding of the same job and
+// provider (its page binding in the inventory, or this session's owned record) is not run-A's: it is
+// never restored for run-A, and run-B's ownership of it is left untouched (no adoption, no close).
+for (const evidence of ['inventory', 'owned record', 'inventory and owned record']) {
+  test(`worker: a stop after the delivery was promoted, whose recorded tab now carries run-B's ${evidence}: not restored for run-A, run-B keeps it`, async () => {
+    const tabs = new Map([[77, {id: 77, url: URL_FIX, status: 'complete'}]]);
+    const inventory = evidence.includes('inventory'), owned = evidence.includes('owned');
+    const fresh = UNBOUND_UNTIL_RUN();
+    const handler = (id, m) => {
+      if (id !== 77) return fresh(id, m);
+      const binding = inventory ? {jobId: 'fix-A', runId: 'run-B', provider: 'chatgpt'} : {jobId: '', runId: ''};
+      return m.type === 'ashlar-tab-status' ? {ok: true, ownershipProtocol: 1, released: false, url: URL_FIX, provider: 'chatgpt', ...binding}
+        : {ok: false, code: inventory ? 'busy' : 'idle', retry: true, ...binding};
+    };
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': STOPPED()}, [DELIVERIES]: {'fix-A': CREATED(77)}}),
+      session: storage({'ashlar:browserSession': 'boot-1', ...(owned ? {'ashlar:tab:77': ownedRecord('run-B')} : {})}), tabs, api: active, handler});
+    b.context.crypto = webcrypto;
+    await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+    const verdict = await b.context.fixAllocationEvidence(b.local.state.pendingReviewJobs['fix-A'], 'chatgpt');
+    assert.notEqual(verdict.verdict, 'restore', 'another run\'s tab is not run-A\'s evidence');
+    await b.tick();await b.tick();await b.tick();
+    const state = b.local.state.pendingReviewJobs['fix-A'].states.chatgpt;
+    assert.notEqual(state.tabId, 77, 'run-A does not adopt run-B\'s tab');
+    assert.equal(runsOf(b).some(m => m.id === 77), false, 'no run-A prompt reaches run-B\'s tab');
+    assert.ok(tabs.has(77) && !b.closedTabs.includes(77), 'run-B\'s tab is never closed');
+    assert.deepEqual(b.session.state['ashlar:tab:77'], owned ? ownedRecord('run-B') : undefined, 'run-B\'s owned record is unchanged');
+  });
+}
+
 test('worker: a promoted fix delivery whose tab the user explicitly closed before its tabId was saved ends the run (tab_closed), no replacement', async () => {
   const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': STOPPED()}, [DELIVERIES]: {'fix-A': CREATED(77)}}),
     session: storage({'ashlar:browserSession': 'boot-1', 'ashlar:closed:fix-A:chatgpt:run-A': true}), api: active, handler: () => ({ok: false, code: 'busy', retry: true})});

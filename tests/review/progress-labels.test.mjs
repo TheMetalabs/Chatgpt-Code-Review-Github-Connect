@@ -15,6 +15,8 @@ const RECORDERS = {workerStep: 2, recordReviewStep: 0, step: 0};
 const STAGE_NAME = /^[a-z][a-z0-9_]*$/;
 const CLOSERS = {'(': ')', '[': ']', '{': '}'};
 const REGEX_AFTER = new Set(['return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'throw', 'instanceof', 'do', 'else', 'yield', 'await']);
+/** Statements whose parenthesised head is followed by a statement, which may start with a regex. */
+const HEADED = new Set(['if', 'while', 'for', 'with']);
 /** Punctuators read whole, longest first. An operator read in pieces changes what follows it: after
  * `i++` a `/` divides, while after `+` it starts a regex that would swallow the code up to the next `/`. */
 const PUNCTUATORS = ['??', '?.', '||', '++', '--'];
@@ -48,7 +50,7 @@ function tokenize(text, i, close) {
       }
       i = push('tpl', i, j + 1, {value: text.slice(i + 1, j), substs});
     } else if (c === '/' && (!prev || (prev.kind === 'punct' && prev.text !== '++' && prev.text !== '--') ||
-        (prev.kind === 'word' && REGEX_AFTER.has(prev.text)))) {
+        (prev.kind === 'word' && REGEX_AFTER.has(prev.text)) || (prev.open === '(' && HEADED.has(tokens.at(-2)?.text)))) {
       let j = i + 1, inClass = false;
       for (; j < text.length && (text[j] !== '/' || inClass); j += 1) {
         if (text[j] === '\\') j += 1;
@@ -466,6 +468,11 @@ test('a file the tokenizer cannot read is a problem that names the file, not onl
   const text = 'function step(stage) {\n  recordReviewStep(stage);\n}\nfunction probe(b) {}\n/\\)/.test(b);\nstep("composer_waiting");';
   const {problems} = recordedStages(text, 'composer.js');
   assert.ok(problems.includes('composer.js: could not be tokenized (unexpected )), so its recorders forward nothing'), problems.join('\n'));
+  // After the head of if, while, for or with, a `/` starts a regex: the file tokenizes and step() forwards.
+  for (const head of ['if (a)', 'while (a)', 'for (;a;)', 'with (a)']) {
+    const readable = `function step(stage) {\n  recordReviewStep(stage);\n}\nfunction probe(a, b) { ${head} /\\)/.test(b); }\nstep("composer_waiting");`;
+    assert.deepEqual(recordedStages(readable, 'composer.js').problems, [], head);
+  }
 });
 
 test('the tab-release (#82) stages have history labels and survive sanitize', () => {

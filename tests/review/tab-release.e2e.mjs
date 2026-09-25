@@ -48,6 +48,10 @@ async function chatTab(t,{provider='chatgpt',url=provider==='grok'?'https://grok
  // submissionConfirmed records it then, never later): the page the tab was sent on. A row that
  // needs a journal without it names `conversation: undefined` itself.
  if(kind==='fix'&&journal?.phase==='sent'&&!('conversation' in journal))journal={...journal,conversation:url};
+ // A FIX journal also carries its prompt's lossless form from the moment its send is prepared (#77
+ // R17: composer.js clickSend records `exact`, fixPromptForm; this single-line prompt is its own).
+ // A row that needs a journal without it names `exact: undefined` itself.
+ if(kind==='fix'&&journal&&!('exact' in journal))journal={...journal,exact:journal.expected};
  const page=await browser.newPage();t.after(()=>page.close());
  const served={thread:'',composer:'',sendDisabled:false,uploading:false,chips:[],after:'',...view};
  await page.route(provider==='grok'?'https://grok.com/**':'https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',
@@ -211,6 +215,14 @@ for(const kind of ['review','fix'])for(const [name,cause,takeover] of TAKEOVERS)
  assert.deepEqual(verdict(await canClose(tab)),{canClose:false,reason:'repurposed',cause});
  assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
  assert.ok((await tab.steps()).includes('context_changed'));
+});
+// #77 R17 at release: a fix's sent turn is held to its prompt's lossless form (json.js fixTurnExact),
+// so an edit that changes only whitespace (a fix prompt inlines source, whose spaces are content) is
+// the user's too. A review compares its normalized prompt: the same edit leaves its tab closable.
+for(const kind of ['review','fix'])test(`${kind}: a secured tab whose sent turn the user edited in whitespace only is ${kind==='fix'?'preserved as edited':'still closable (control)'}`,async t=>{
+ const {tab}=await collected(t,{kind});
+ await tab.page.evaluate(()=>{const body=document.querySelector('[data-message-id="user-A"] .whitespace-pre-wrap');body.textContent=body.textContent.replace(' at ','  at ');});
+ assert.deepEqual(verdict(await canClose(tab)),kind==='fix'?{canClose:false,reason:'repurposed',cause:'edited'}:{canClose:true,reason:'complete'});
 });
 // Ashlar 4101623051: every file-chip shape the send barrier accepts is a staged file for the release
 // verdict too (composer.js fileChipSelector: one list for attachmentsReady and composerStagedFiles), a

@@ -391,6 +391,23 @@ test('worker status lists the recently retired legs (closed and preserved) with 
   assert.doesNotMatch(JSON.stringify(retired), /PROMPT|https?:/, 'no prompt or URL text');
   assert.deepEqual(b.closedTabs, [10]);
 });
+// Ashlar 4101062777: the ring is shared by every bridge origin the worker has served, but the popup
+// shows the worker status of the configured origin only: each entry names its origin, and a status
+// lists that origin's entries alone.
+test('the recently retired legs in a worker status are those of its own origin', async () => {
+  const b = worker(leg('review', secured('review')), {handler: () => owned});
+  await b.tick();
+  assert.equal(b.pending(), undefined, 'job-A retired under http://bridge');
+  // The user points the extension at another bridge, where job-B then retires.
+  b.local.state.origin = 'http://other';
+  await b.context.rememberRetired({origin: 'http://other', jobId: 'job-B', providers: ['chatgpt'], states: {chatgpt: {tabId: 12, preserveCause: 'draft'}}});
+  const statusFor = async origin => { await b.context.recordWorkerStatus({}, origin); return b.local.state.bridgeWorkerStatus; };
+  const other = await statusFor('http://other');
+  assert.deepEqual({origin: other.origin, jobs: other.retired.map(r => r.jobId)}, {origin: 'http://other', jobs: ['job-B']}, 'B lists none of A\'s legs');
+  const bridge = await statusFor('http://bridge');
+  assert.deepEqual({origin: bridge.origin, jobs: bridge.retired.map(r => r.jobId)}, {origin: 'http://bridge', jobs: ['job-A']}, 'back on A: A\'s legs only');
+  assert.doesNotMatch(JSON.stringify(bridge.retired), /https?:/, 'the entries shown carry no URL (the status names its origin)');
+});
 // Ashlar 4101062772: the ring is diagnostics only; it is written inside the retirement's storage
 // sequence, so a failed ring write must not leave the cleaned job in the registry (retried as
 // recovery work, holding a capacity slot).

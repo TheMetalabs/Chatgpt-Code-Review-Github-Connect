@@ -24,8 +24,9 @@ const DEFAULT_MAX_REVIEW_TABS = 4;
 const HEARTBEAT_MS = 10_000;
 const HEALTH_KEY = "bridgeHealth";
 const WORKER_STATUS_KEY = "bridgeWorkerStatus";
-// The last legs this worker retired (metadata only: ids, stage, preserve cause, fixed cleanup note),
-// shown in the popup so a kept or closed tab can be explained after its job is gone. Never uploaded.
+// The last legs this worker retired (metadata only: the job's bridge origin, ids, stage, preserve
+// cause, fixed cleanup note), shown in the popup (for the configured origin only) so a kept or closed
+// tab can be explained after its job is gone. Never uploaded.
 const RECENT_RETIRED_KEY = "bridgeRecentRetired";
 const MAINTENANCE_KEY = "extensionMaintenance";
 
@@ -313,7 +314,11 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
     const phase = relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
     const admission = admissionReports.get(origin);
     // Diagnostics only: an unreadable ring shows no recent legs, it never fails the status write.
-    const retired = await chrome.storage.local.get([RECENT_RETIRED_KEY]).then(got => got[RECENT_RETIRED_KEY], () => []);
+    const ring = await chrome.storage.local.get([RECENT_RETIRED_KEY]).then(got => got[RECENT_RETIRED_KEY], () => []);
+    // The ring is shared by every origin the worker has served: only this origin's legs are its
+    // history (an entry without an origin predates the field and is shown under none). The status
+    // already names its origin, so the entries drop theirs.
+    const retired = (Array.isArray(ring) ? ring : []).filter(entry => entry?.origin === origin).map(({origin: _origin, ...entry}) => entry);
     await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
       origin, checkedAt: Date.now(), phase, capacity,
       admissionPhase: admission?.phase || "not_checked",
@@ -330,7 +335,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
         jobId: job.jobId, status: job.serverStatus || (job.recoveryError ? "connection_error" : "reconnecting_or_cleanup"),
       })),
-      retired: Array.isArray(retired) ? retired : [],
+      retired,
     }});
   });
 }
@@ -1338,7 +1343,7 @@ async function rememberRetired(job) {
     const ring = (await chrome.storage.local.get([RECENT_RETIRED_KEY]))[RECENT_RETIRED_KEY];
     const retired = job.providers.map(provider => {
       const state = job.states[provider];
-      return {jobId: job.jobId, kind: job.kind === "fix" ? "fix" : "review", provider, tabId: state.tabId,
+      return {origin: job.origin, jobId: job.jobId, kind: job.kind === "fix" ? "fix" : "review", provider, tabId: state.tabId,
         stage: state.workerEvents?.at(-1)?.stage || "", cause: state.preserveCause, note: state.cleanupNote, at: Date.now()};
     });
     await chrome.storage.local.set({[RECENT_RETIRED_KEY]: [...(Array.isArray(ring) ? ring : []), ...retired].slice(-16)});

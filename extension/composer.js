@@ -635,6 +635,24 @@ function stillShowsConversation(conversation) {
   return typeof samePage === "function" ? samePage(conversation, globalThis.location?.href) : conversation === shownConversation();
 }
 
+/** A prompt as ChatGPT's Markdown rendering shows it: fence and emphasis markers, heading and quote
+ * markers dropped, whitespace collapsed (#93: a round-2 review prompt with Markdown never matched
+ * its rendered turn, so the run ended send_unconfirmed although it was sent). */
+function renderedPlain(text) {
+  return normalizePrompt(String(text || "").replace(/```[\w+-]*/g, " ").replace(/[`*_~]/g, "").replace(/^\s*(?:#{1,6}|>)\s?/gm, "")).replace(/\s+/g, " ").trim();
+}
+
+/** Whether a rendered user turn holds a review prompt: the exact normalized text, or (Markdown having
+ * restyled it) its plain rendering, whole or, for long prompts, both 160-character ends. */
+function reviewTurnHolds(turnText, expected) {
+  if (!expected) return false;
+  if (normalizePrompt(turnText).includes(expected)) return true;
+  const shown = renderedPlain(turnText), want = renderedPlain(expected);
+  if (!want) return false;
+  if (shown.includes(want)) return true;
+  return want.length > 400 && shown.includes(want.slice(0, 160)) && shown.includes(want.slice(-160));
+}
+
 function submissionConfirmed(record) {
   const turns = userTurns();
   const state = globalThis.__ashlarRunnerState;
@@ -644,7 +662,7 @@ function submissionConfirmed(record) {
   // review turn, or a legacy fix journal with no lossless form (never proven exact: json.js
   // tabOwnership "unestablished"), contains its prompt.
   const match = turns.slice(record.baseline).find(turn => fix && typeof record.exact === "string" ? fixTurnSent(turn, record) :
-    normalizePrompt(messagePromptText(turn)).includes(record.expected));
+    reviewTurnHolds(messagePromptText(turn), record.expected));
   if (!record.expected || !match) return false;
   record.phase = "sent";
   record.submittedUsers = turns.indexOf(match) + 1;

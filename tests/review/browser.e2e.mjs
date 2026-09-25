@@ -1466,3 +1466,15 @@ test('real DOM: a stray disabled Send earlier in DOM order does not hide the rea
  await page.evaluate(()=>document.getElementById('real').setAttribute('disabled',''));
  assert.equal(await page.evaluate(()=>findEligibleSendButton(['button[aria-label*="Send"]','button[type="button"]'])?.id||null),null);
 });
+
+test('real DOM (#93): a review prompt that ChatGPT renders as Markdown still counts as its sent turn',async t=>{
+ const page=await fixture(t,'');
+ await page.addScriptTag({content:source('extension/composer.js')});
+ const out=await page.evaluate(()=>{
+  const prompt='Review this diff.\n\n```diff\n- const a = 1;\n+ const a = 2;\n```\n\n**Rules:** use `json` only.\n'+'context line '.repeat(60);
+  // What the rendered user turn reads as: fences, backticks and emphasis gone.
+  const shown='Review this diff.\n- const a = 1;\n+ const a = 2;\nRules: use json only.\n'+'context line '.repeat(60);
+  return {rendered:reviewTurnHolds(shown,normalizePrompt(prompt)),other:reviewTurnHolds('an unrelated message',normalizePrompt(prompt)),plain:reviewTurnHolds(prompt,normalizePrompt(prompt))};
+ });
+ assert.deepEqual(out,{rendered:true,other:false,plain:true});
+});

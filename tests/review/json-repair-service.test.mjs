@@ -154,3 +154,35 @@ test('a Local reply cut off at the token limit is recorded as finish_reason_leng
  const done=f.service.status('A',started.id);
  assert.equal(done.status,'needs_attention');assert.deepEqual(done.errors,['finish_reason_length']);assert.equal(f.calls.length,1);
 });
+
+// vLLM/SGLang answer HTTP 400 when prompt + max_tokens exceeds max_model_len, before generating
+// anything. Without a budget they fill whatever context is left, which is the request every repair
+// sent before #87; the budget must not turn a repair that used to run into a rejected one.
+async function contextServer(t,reject) {
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);const status=reject(body);
+  if(status){res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify({object:'error',type:'BadRequestError',code:status,
+   message:"This model's maximum context length is 32768 tokens. However, you requested 37000 tokens (12904 in the messages, 24096 in the completion)."}));return;}
+  res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:raw}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ return {bodies,done:f.service.status('A',started.id)};
+}
+test('a budget rejected against the context window is sent once more without max_tokens',async t=>{
+ const {bodies,done}=await contextServer(t,body=>'max_tokens' in body ? 400 : 0);
+ assert.equal(done.status,'ready');assert.equal(bodies.length,2);
+ assert.equal(bodies[0].max_tokens,8192);assert.equal('max_tokens' in bodies[1],false);
+ assert.deepEqual(bodies[1].messages,bodies[0].messages);
+});
+test('the unbudgeted request is sent at most once, and other failures are never resent',async t=>{
+ const rejected=await contextServer(t,()=>400);
+ assert.equal(rejected.bodies.length,2);assert.equal(rejected.done.status,'needs_attention');
+ assert.deepEqual(rejected.done.errors,['local_request_failed_or_incomplete_no_automatic_retry']);
+ const failed=await contextServer(t,()=>500);
+ assert.equal(failed.bodies.length,1);assert.deepEqual(failed.done.errors,['local_request_failed_or_incomplete_no_automatic_retry']);
+});

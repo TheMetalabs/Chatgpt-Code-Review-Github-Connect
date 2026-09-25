@@ -30,6 +30,16 @@ export class LocalChatCutOff extends Error {
   }
 }
 
+/** The server refused the request with a non-2xx status before any reply existed. */
+export class LocalChatHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, body: string) {
+    super(`local LLM HTTP ${status}: ${body.slice(0, 160)}`);
+    this.name = "LocalChatHttpError";
+    this.status = status;
+  }
+}
+
 /** What the transport observed on an in-flight request.
  * `keepalive`: the server answered (response headers, or an empty heartbeat chunk) but has produced
  * no output for THIS request yet — it is alive and the request is queued or still prefilling.
@@ -230,7 +240,7 @@ export function requestLocalJson(
         }
         const text = Buffer.concat(chunks).toString("utf8");
         if (!ok) {
-          reject(new Error(`local LLM HTTP ${res.statusCode}: ${text.slice(0, 160)}`));
+          reject(new LocalChatHttpError(res.statusCode ?? 0, text));
           return;
         }
         try { resolve(JSON.parse(text)); }

@@ -4,6 +4,7 @@ import {JsonRepairService} from '../../src/lib/json-repair.server.ts';
 import {ReviewHistoryStore} from '../../src/lib/review-history.server.ts';
 import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 import {createHash} from 'node:crypto';
+import {readFileSync} from 'node:fs';
 const value={findings:[],investigated_safe:['a.ts: checked "condition"']};
 const raw=JSON.stringify(value),original=raw.replace(/\\"/g,'"');
 const hash=text=>createHash('sha256').update(text).digest('hex');
@@ -102,4 +103,12 @@ test('a temporary result archive failure retries commit, never Local generation'
  const started=f.service.start(input);await flush();assert.equal(f.service.status('A',started.id).status,'ready');
  assert.equal((await f.service.commit('A',started.id)).status,'ready');assert.equal(f.calls.length,1);
  fail=false;assert.equal((await f.service.commit('A',started.id)).status,'accepted');assert.equal(f.calls.length,1);assert.equal(commits,2);
+});
+
+test('a stray-quote slip is repaired without a Local call and its commit is accepted',async t=>{
+ const text=readFileSync(new URL('./fixtures/chatgpt-1043-labelled-stray-quote.txt',import.meta.url),'utf8');
+ const f=fixture(t);const started=f.service.start({...input,original:text,sourceHash:hash(text)});await flush();
+ assert.equal(f.service.status('A',started.id).status,'ready');assert.equal(f.calls.length,0,'the Local model was called');
+ assert.equal((await f.service.commit('A',started.id)).status,'accepted');
+ assert.deepEqual(JSON.parse(f.accepted[0].raw).findings.map(finding=>finding.severity),['P1','P1','P2']);
 });

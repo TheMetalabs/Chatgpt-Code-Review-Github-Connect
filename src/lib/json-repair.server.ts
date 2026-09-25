@@ -1,6 +1,6 @@
 import {createHash} from "node:crypto";
 import {requestLocalChat} from "./local-chat-request.server.ts";
-import {MAX_REPAIR_CHARS, REPAIR_SCHEMA_VERSION, inspectReviewFormat, repairSchemaDefinition, validateRepairCandidate} from "./review-json-repair.ts";
+import {MAX_REPAIR_CHARS, REPAIR_SCHEMA_VERSION, escapeStrayQuotes, inspectReviewFormat, repairSchemaDefinition, validateRepairCandidate} from "./review-json-repair.ts";
 import type {RepairRecord, RepairStatus} from "./json-repair-types.ts";
 import type {BotSettings} from "./types.ts";
 import type {ReviewHistoryStore} from "./review-history.server.ts";
@@ -73,7 +73,8 @@ export class JsonRepairService {
     try {
       if(controller.signal.aborted || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))return;
       const settings=this.deps.settings();
-      const candidate=await (this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
+      // A known, deterministic slip needs no model; its result is validated below like any candidate.
+      const candidate=escapeStrayQuotes(record.original) ?? await (this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
         model:record.model,temperature:0,messages:[{
           role:"system",content:[
             "You are a formatting-only JSON repair tool, NOT a code reviewer.",

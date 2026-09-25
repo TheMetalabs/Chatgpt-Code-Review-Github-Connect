@@ -2222,4 +2222,32 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.equal(f.prompts.length, 2, "one round per head");
     assert.deepEqual(ra, { ran: false, reason: "superseded (head moved)" }, "the old head's round goes moot");
   });
+
+  it("a waiter behind a step that exited BEFORE the provider (session still active) runs its own round: the signature is recorded only at FIXING", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3], failHandoff: true });
+    let release!: () => void;
+    const held = new Promise<void>((res) => (release = res));
+    t.after(() => release());
+    let reached!: () => void;
+    const atPermission = new Promise<void>((res) => (reached = res));
+    const permission = f.deps.gh.fetchUserPermission;
+    let checks = 0;
+    f.deps.gh.fetchUserPermission = async (...a) => {
+      if (++checks === 1) {
+        reached();
+        await held;
+        throw new Error("permission lookup 502 (transient)");
+      }
+      return permission(...a);
+    };
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await settles(atPermission);
+    const b = run(f, "apply", ENV_ON, job({ id: "job-B" })); // the same session, mode and starter
+    release();
+    const [ra, rb] = await settles(Promise.all([a, b]));
+    assert.ok(!ra.ran && /^ESCALATE loop-error failed to post/.test(ra.reason), `A's handoff did not land: the session stays active: ${JSON.stringify(ra)}`);
+    assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "applied", `B runs the round A never reached: ${JSON.stringify(rb)}`);
+    assert.equal(f.prompts.length, 1);
+    assert.equal(f.committed, true);
+  });
 });

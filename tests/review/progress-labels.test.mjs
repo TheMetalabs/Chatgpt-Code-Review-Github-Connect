@@ -340,16 +340,42 @@ function staticGlobalRead(level, k) {
  * `Function.prototype.call.call(f, ...)`), and of the methods that call or bind the function they are on. */
 const APPLIERS = new Set(['apply', 'call', 'bind', 'construct']);
 
-/** Whether the value that ends at `level[k]` is called: `(...)`, `?.(...)` or a template after it, a
- * .call, .apply or .bind on it, or handed first to a call of an APPLIERS name. `path` holds `level`. */
+/** Whether `new` applies to the member chain that ends at `level[k]` (`new x.y[k]`, not `new f()[k]`). */
+function constructed(level, k) {
+  let j = k;
+  for (;;) {
+    if (computedMember(level, j)) j -= isPunct(level[j - 1], '?.') ? 2 : 1;
+    else if (level[j]?.kind === 'word' && (isPunct(level[j - 1], '.') || isPunct(level[j - 1], '?.'))) j -= 2;
+    else return isWord(level[j - 1], 'new');
+  }
+}
+
+/** Whether the `(` group at `tokens[i]` is a parenthesised expression, whose value is one of its operands:
+ * not a call's arguments, a function's or an arrow's parameters, or the head of a statement. */
+function parenthesised(tokens, i) {
+  const before = tokens[i - 1];
+  if (isPunct(tokens[i + 1], '=>')) return false;
+  if (!before || before.kind === 'punct') return true;
+  if (before.kind === 'word') return REGEX_AFTER.has(before.text);
+  return before.open === '{';
+}
+
+/** Whether the value that ends at `level[k]` is called: `(...)`, `?.(...)` or a template after it, `new`
+ * on its chain, a .call, .apply or .bind on it, or handed first to a call of an APPLIERS name; the same
+ * for a parenthesised expression it ends an operand of (`(x[k])()`, `(0, x[k])()`), whose value it can be.
+ * `path` holds `level`. */
 function calledAt(level, k, path) {
   const next = isPunct(level[k + 1], '?.') ? level[k + 2] : level[k + 1];
-  if (next?.open === '(' || level[k + 1]?.kind === 'tpl') return true;
+  if (next?.open === '(' || level[k + 1]?.kind === 'tpl' || constructed(level, k)) return true;
   if ((isPunct(level[k + 1], '.') || isPunct(level[k + 1], '?.')) && APPLIERS.has(level[k + 2]?.text)) return true;
-  const holder = path.at(-1), callee = holder?.tokens[holder.index - 1];
+  const holder = path.at(-1), group = holder?.tokens[holder.index], callee = holder?.tokens[holder.index - 1];
+  if (group?.open !== '(') return false;
+  if (parenthesised(holder.tokens, holder.index)) {
+    const ends = !level[k + 1] || (level[k + 1].kind === 'punct' && !isPunct(level[k + 1], '.') && !isPunct(level[k + 1], '?.'));
+    return ends && calledAt(holder.tokens, holder.index, path.slice(0, -1));
+  }
   const first = level.findIndex(token => isPunct(token, ','));
-  return holder?.tokens[holder.index].open === '(' && callee?.kind === 'word' && APPLIERS.has(callee.text) &&
-    (first < 0 ? level.length : first) === k + 1;
+  return callee?.kind === 'word' && APPLIERS.has(callee.text) && (first < 0 ? level.length : first) === k + 1;
 }
 
 /** The equality operators: a string compared by one (`kind === "step"`) yields a boolean, not a key. */
@@ -1269,6 +1295,13 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     ['handlers[kind]`unlabelled_tag`;', called(1, '[kind]')],
     ['new handlers[kind]("unlabelled_new");', called(1, '[kind]')],
     ['f()[i](job, provider, "unlabelled_result");', called(1, '[i]')],
+    // Through parentheses, whose value the member can be, and through new, which calls what it constructs.
+    ['(e.view[name])("unlabelled_paren");', called(1, '[name]')],
+    ['(0, e.view[name])("unlabelled_comma");', called(1, '[name]')],
+    ['(e.view[name] || note)("unlabelled_either");', called(1, '[name]')],
+    ['Reflect.apply((e.view[name]), null, ["unlabelled_reflect"]);', called(1, '[name]')],
+    ['new e.view[name];', called(1, '[name]')],
+    ['new (e.view?.[name]);', called(1, '[name]')],
   ]) assert.deepEqual(problems(text), expected, text);
   assert.deepEqual(problems('const {recordReviewStep: record} = globalThis;'), [
     'fixture.js:1 recordReviewStep: the recorder is used other than by a call, so the stages it records through that use cannot be checked',
@@ -1294,7 +1327,8 @@ test('a recorder is reached only by its name: a string naming one, a call throug
   // A computed member the guard can read, one that is not called, or an array literal calls no recorder
   // by a hidden name.
   assert.deepEqual(problems('handlers["open"](row); rows[0](); const state = job.states[provider]; job.states[provider].runId = id;\n' +
-    'note(job.states[provider], rows[i]); if (ok) [a, b].forEach(note); Reflect.apply(note, null, [rows[i]]); return [a](b);'), []);
+    'note(job.states[provider], rows[i]); if (ok) [a, b].forEach(note); Reflect.apply(note, null, [rows[i]]); return [a](b);\n' +
+    'const state = (job.states[provider]); note((rows[i]).id, (0, rows[i])); f(a)(rows[i]); new Row(rows[i]); new f()[i];'), []);
 });
 
 test('a recorder forwards its stage parameter only when nothing in its body can change or shadow it', () => {

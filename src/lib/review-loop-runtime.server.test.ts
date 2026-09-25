@@ -2165,6 +2165,24 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.equal(f.prompts.length, 1, "only the stopped round's request");
   });
 
+  it("K2-2: the start a replaced waiter handed over stays pending — a stop by edit during the new waiter's wait is recorded, nothing commits", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(t, f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+    const restart = job({ id: "job-B", thread: { kind: "mention", commentId: 3, userText: "/review-loop apply", loop: { kind: "start", mode: "apply" }, eventAt: "2025-12-31T12:00:00Z" } });
+    const b = run(f, "apply", ENV_ON, restart);
+    const c = run(f, "apply", ENV_ON, job({ id: "job-C", sender: "bob", thread: { kind: "mention", commentId: 4, userText: "@ashlar-bot review" } }));
+    assert.equal(reasonOfStep(await soon(b)), STEP_REPLACED);
+    const stop = await stopLoop("t", { owner: "o", repo: "r", pr: 7, actor: "alice", stopAt: "2025-12-31T18:00:00Z" }, settings("apply"), f.deps, ENV_ON);
+    hold.release();
+    const [, rc] = await settles(Promise.all([a, c]));
+    assert.equal(f.committed, false, "no App commit after the operator's stop");
+    assert.deepEqual(stop, { posted: true, reason: "stopped" });
+    assert.ok(!rc.ran && SILENT_REASONS.includes(rc.reason), `the replacing step ends quietly: ${JSON.stringify(rc)}`);
+  });
+
   it("a stop older than the waiting restart's start ends nothing and records nothing; the restart runs", async (t) => {
     const f = fakeDeps({ start: "apply", rounds: [3] });
     const hold = holdFirst(t, f);

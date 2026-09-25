@@ -83,7 +83,7 @@ export function controlKey(k: ControlKey): string {
       return `stop:${pr}:${k.by.toLowerCase()}:${isoMs(k.at)}`;
     case "continue":
     case "handoff":
-      return `${k.kind}:${pr}@${k.head}#${k.session?.at ? isoMs(k.session.at) : ""}`;
+      return `${k.kind}:${pr}@${k.head}#${datable(k.session?.at) ? isoMs(k.session?.at) : ""}`;
     default:
       return assertNever(k);
   }
@@ -229,11 +229,18 @@ function folds(e: OwnWrite): boolean {
   return e.writeAhead || e.state === "posted" || e.state === "unknown";
 }
 
-/** The event an own write that a read does not list stands for. A continuation or handoff is placed
- * at the server's time, or at its POST attempt when the outcome is unknown — never at "now": a
- * newer start between the two must not be ended by an old session's handoff. A 2xx row with no
- * created_at reaches here as "" (github.server's shape), and the fold drops an undatable event:
- * that is a missing time too, so it falls back to the attempt. */
+/** Where a continuation or handoff stand-in is placed: at the server's time when it is a real
+ * instant, else at its POST attempt — never at "now": a newer start between the two must not be
+ * ended by an old session's handoff. The fold drops an undatable event, so a 2xx row whose
+ * created_at is missing ("", github-transport's shape) or malformed is a missing time: it falls
+ * back to the attempt (a non-empty malformed time is no time either). */
+function standInAt(e: OwnWrite): string {
+  const server = e.row?.createdAt;
+  return server !== undefined && datable(server) ? server : (e.attemptAt ?? "");
+}
+
+/** The event an own write that a read does not list stands for (a continuation or handoff: at
+ * standInAt). */
 function standInEvent(e: OwnWrite): LoopEvent {
   const k = e.write.key;
   switch (k.kind) {
@@ -242,9 +249,9 @@ function standInEvent(e: OwnWrite): LoopEvent {
     case "stop":
       return { at: k.at, kind: "stop", actor: k.by };
     case "continue":
-      return { at: e.row?.createdAt || e.attemptAt || "", kind: "continue", head: k.head };
+      return { at: standInAt(e), kind: "continue", head: k.head };
     case "handoff":
-      return { at: e.row?.createdAt || e.attemptAt || "", kind: "escalate" };
+      return { at: standInAt(e), kind: "escalate" };
     default:
       return assertNever(k);
   }

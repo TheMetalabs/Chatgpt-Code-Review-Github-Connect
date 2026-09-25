@@ -363,15 +363,25 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     }
   });
 
-  it("a posted write whose 2xx row has createdAt '' (production's shape for a missing created_at) stands in at its attempt", async () => {
-    const f = world(["ok"]);
-    const gh = { ...f.gh, createIssueComment: async () => ({ id: 7, userLogin: BOT, createdAt: "" }) };
-    f.w.hidden = true; // the list lags: only the journal knows the row
-    assert.deepEqual(await emitControl({ ...f.ctx, gh, scanFirst: false }, handoff()), { status: "posted" });
-    const events = ownWrites(gh).standIns(ref(), [], BOT);
-    assert.deepEqual(events, [{ at: new Date(T0).toISOString(), kind: "escalate" }], "an undatable stand-in would be dropped by the fold");
-    const session = deriveLoopSession([{ at: SESSION, kind: "start", actor: "alice", mode: "suggest" }, ...events]);
-    assert.equal(session.active, false, "the posted handoff ends the session in this process");
+  it("a posted continuation or handoff whose 2xx row has no real created_at ('' — production's shape for a missing one — or malformed) stands in at its attempt", async () => {
+    const attempt = new Date(T0).toISOString();
+    for (const kind of ["continue", "handoff"] as const) {
+      for (const createdAt of ["", "yesterday"]) {
+        const label = `${kind} | createdAt=${JSON.stringify(createdAt)}`;
+        const f = world(["ok"]);
+        const gh = { ...f.gh, createIssueComment: async () => ({ id: 7, userLogin: BOT, createdAt }) };
+        f.w.hidden = true; // the list lags: only the journal knows the row
+        assert.deepEqual(await emitControl({ ...f.ctx, gh, scanFirst: false }, writeOfEachKind()[kind]), { status: "posted" }, label);
+        const events = ownWrites(gh).standIns(ref(), [], BOT);
+        const expected: LoopEvent = kind === "handoff" ? { at: attempt, kind: "escalate" } : { at: attempt, kind: "continue", head: HEAD };
+        assert.deepEqual(events, [expected], `${label}: an undatable stand-in would be dropped by the fold`);
+        const session = deriveLoopSession([ANCHOR, ...events]);
+        assert.equal(session.active, kind === "continue", `${label}: the posted handoff ends the session in this process`);
+      }
+    }
+    // a session anchor that is no real instant names no session, however it is spelled
+    const k = { kind: "handoff" as const, ref: ref(), head: HEAD };
+    assert.equal(controlKey({ ...k, session: { at: "yesterday" } }), controlKey({ ...k, session: {} }));
   });
 
   it("a write-ahead intent folds at once; abandon drops only an unsent entry; the outcome switch is exhaustive", async () => {

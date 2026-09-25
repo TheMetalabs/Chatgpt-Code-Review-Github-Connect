@@ -1,7 +1,7 @@
 /**
  * The control-write MATRIX (#79 K1): every way a control comment is written (11 entry paths over
  * the 4 control kinds) × what its POST did (× the 2xx body it answered, decoded as production
- * decodes it) × what the list shows × what happens next — and, for a continuation or handoff, × how
+ * decodes it, and the created row's server created_at) × what the list shows × what happens next — and, for a continuation or handoff, × how
  * its session's anchor start is known (listed, lagging, lost) × a peer start in the anchor's second
  * (none, before or after the write) — checked against what the loop owes a human:
  *   I1 exactly once — a write that may have landed is never POSTed again (≤ 1 row);
@@ -84,6 +84,9 @@ type Write = "success" | "rejected" | "unknown-landed" | "unknown-lost";
  * usable row — a row without an id, JSON null, a primitive — which leaves the row created and its
  * outcome unknown: an unknown-landed write, as a 502 ("none": no 2xx) is. */
 type Shape = "none" | "row" | "row-without-id" | "null" | "primitive";
+/** The created row's created_at in that answer (a success): the row's own time, "" (GitHub's
+ * missing created_at, as production decodes it) or malformed — the listed row keeps its time. */
+type Stamp = "valid" | "empty" | "malformed";
 type List = "normal" | "lagging" | "failing";
 type Later =
   | "redelivery"
@@ -104,7 +107,7 @@ type Anchor = "listed" | "lagging" | "lost";
  * and so anchor there — recorded before the write's call or after it. */
 type Peer = "none" | "before" | "after";
 type Phase = "call" | "view" | "again" | "follow";
-type Cell = { via: Via; write: Write; shape: Shape; list: List; later: Later; anchor: Anchor; peer: Peer };
+type Cell = { via: Via; write: Write; shape: Shape; stamp: Stamp; list: List; later: Later; anchor: Anchor; peer: Peer };
 type Result = ControlResult | LoopStepResult;
 /** posted / exists / unknown / rejected as the entry point reports it; `ran` a step that ran
  * (the self-heal); `resolved` a step result that needs nothing more (posted and exists collapse). */
@@ -131,6 +134,7 @@ const SHAPES: Record<Write, Shape[]> = {
   "unknown-landed": ["none", "row-without-id", "null", "primitive"],
   "unknown-lost": ["none"],
 };
+const STAMPS: Stamp[] = ["valid", "empty", "malformed"];
 const LISTS: List[] = ["normal", "lagging", "failing"];
 const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears", "row-relapses", "push", "moved", "stop-restart"];
 const ANCHORS: Anchor[] = ["listed", "lagging", "lost"];
@@ -402,9 +406,11 @@ class World {
   }
 
   /** GitHub's 2xx answer to the POST that created `row` — the row, or the cell's shape for the
-   * write under test — decoded as production decodes it (a shape with no usable row throws). */
-  private answer(row: IssueRow, shape: Shape = "row") {
-    const created = { id: row.id, user: { login: row.userLogin }, created_at: row.createdAt, body: row.body };
+   * write under test, with its stamp — decoded as production decodes it (a shape with no usable
+   * row throws). */
+  private answer(row: IssueRow, shape: Shape = "row", stamp: Stamp = "valid") {
+    const createdAt = stamp === "valid" ? row.createdAt : stamp === "empty" ? "" : "yesterday";
+    const created = { id: row.id, user: { login: row.userLogin }, created_at: createdAt, body: row.body };
     const { id: _id, ...withoutId } = created;
     const json = shape === "row-without-id" ? withoutId : shape === "null" ? null : shape === "primitive" ? "created" : created;
     return postedIssueComment(201, JSON.stringify(json));
@@ -432,13 +438,13 @@ class World {
       this.outage();
     }
     this.underTest.push(this.phase);
-    const { write, shape } = this.cell;
+    const { write, shape, stamp } = this.cell;
     if (write === "rejected") throw writeError("rejected", 422);
     if (write === "unknown-lost") throw writeError("unknown", 502);
     const row = this.store(BOT, body, at);
     this.rowsForWrite += 1;
     if (shape === "none") throw writeError("unknown", 502); // unknown-landed
-    return this.answer(row, shape);
+    return this.answer(row, shape, stamp);
   }
 
   /** The list outage starts at the write's first POST; carol's newer start waits for its backoff. */
@@ -507,10 +513,12 @@ class World {
     return readLoopSession(this.deps.gh, "t", "o", "r", this.pr, { botLogin: BOT, pr: { sha: this.live() } });
   }
 
-  /** The events that stand for the write under test. */
+  /** The events that stand for the write under test — only those the fold can place (it drops an
+   * event whose time is no real instant). */
   async eventsOfWrite(): Promise<LoopEvent[]> {
     const events = await readLoopEvents(this.deps.gh, "t", "o", "r", this.pr, { botLogin: BOT, pr: { sha: this.live() } });
     return events.filter((e) => {
+      if (Number.isNaN(isoMs(e.at))) return false;
       switch (kindOf(this.cell.via)) {
         case "start":
           return e.kind === "start" && e.actor?.toLowerCase() === "alice" && isoMs(e.at) === isoMs(ALICE_AT);
@@ -762,20 +770,22 @@ async function runCell(c: Cell, pr: number): Promise<void> {
   }
 }
 
-describe("control writes: kind × write result (× 2xx body) × list read × later event (× anchor start × peer start) (#79 K1)", () => {
+describe("control writes: kind × write result (× 2xx body × created_at) × list read × later event (× anchor start × peer start) (#79 K1)", () => {
   let row = 0;
   for (const via of VIAS)
     for (const write of WRITES)
       for (const shape of SHAPES[write])
-        for (const list of LISTS)
-          for (const later of LATERS)
-            for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
-              for (const peer of sessionScoped(via) ? PEERS : (["none"] as const)) {
-                if (!applies(via, later)) continue;
-                const cell = { via, write, shape, list, later, anchor, peer };
-                const pr = 1000 + row++;
-                const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
-                const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
-                it(`${via} | ${write}${answer} | ${list} | ${later}${session}`, () => runCell(cell, pr));
-              }
+        for (const stamp of shape === "row" ? STAMPS : (["valid"] as const))
+          for (const list of LISTS)
+            for (const later of LATERS)
+              for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
+                for (const peer of sessionScoped(via) ? PEERS : (["none"] as const)) {
+                  if (!applies(via, later)) continue;
+                  const cell = { via, write, shape, stamp, list, later, anchor, peer };
+                  const pr = 1000 + row++;
+                  const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
+                  const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
+                  const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
+                  it(`${via} | ${write}${answer}${time} | ${list} | ${later}${session}`, () => runCell(cell, pr));
+                }
 });

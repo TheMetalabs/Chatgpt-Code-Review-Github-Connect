@@ -189,7 +189,9 @@ async function runViaRunner(page,{kind}={}){await page.evaluate(kind=>{
   window.__ashlarRunnerState.running=false;
   window.chrome.runtime.onMessage={addListener:fn=>window.runnerMessage=fn,removeListener(){}};
   installReviewRunner('ChatGPT',async()=>{
-    saveSubmission({phase:'sent',expected:'Review fixture. Head: abc123 Only inspect changed files.',baseline:0,submittedUsers:1,messageId:'user-A'});
+    // Sent on the conversation page it shows: the send recorded it (composer.js submissionConfirmed).
+    // #85's release verdict (tabOwnership) keeps a review with no pinned conversation off its new chat.
+    saveSubmission({phase:'sent',expected:'Review fixture. Head: abc123 Only inspect changed files.',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href});
     return waitUntilReviewOrQuota('ChatGPT');
   });
   window.message=type=>new Promise(resolve=>runnerMessage({type,kind,jobId:'A',runId:'run-A',provider:'chatgpt',prompt:'x'},null,resolve));

@@ -24,6 +24,10 @@ const DEFAULT_MAX_REVIEW_TABS = 4;
 const HEARTBEAT_MS = 10_000;
 const HEALTH_KEY = "bridgeHealth";
 const WORKER_STATUS_KEY = "bridgeWorkerStatus";
+// The last legs this worker retired (metadata only: the job's bridge origin, ids, stage, preserve
+// cause, fixed cleanup note), shown in the popup (for the configured origin only) so a kept or closed
+// tab can be explained after its job is gone. Never uploaded.
+const RECENT_RETIRED_KEY = "bridgeRecentRetired";
 const MAINTENANCE_KEY = "extensionMaintenance";
 
 // Locks are ephemeral; identities, replies and allocation intent remain in storage.
@@ -40,13 +44,41 @@ const inventoryLanes = new Map();
 const tabOwners = new Map();
 const tabEpochs = new Map();
 const inventoryUpgrades = new Map();
+/** Every replace this worker saw (removed tab id -> added id), kept for its life and set as the
+ * listener runs: a chain A -> B -> C resolves to C (liveTabId), also for a record written under A or
+ * B after its replace was handled. Chrome never reuses a tab id within a browser session. */
+const replacedTabIds = new Map();
 const admissionLanes = new Map();
 const admissionReports = new Map();
 let registryPromise;
 let clientPromise;
 let storageTail = Promise.resolve();
-let allocationTail = Promise.resolve();
 let maintenanceTail = Promise.resolve();
+
+/** The tab queue (#85): every operation on a tab (a leg's poll, its release, the tab inventory and
+ * its probes) runs one at a time, first in first out, from its first read to its last write, so no
+ * other operation acts on a tab between what one read and what it does. Each await inside is
+ * bounded (a page message by its reply window: pageWindow; the whole operation by TAB_OP_BUDGET_MS),
+ * so nothing holds the queue, and it is never released while an operation still runs. Bridge calls
+ * never run inside an operation (their lanes stay outside), and an operation never awaits another
+ * one: it may schedule one (`void tabOp(...)`), which runs after it. */
+const TAB_OP_BUDGET_MS = 30_000;
+let tabTail = Promise.resolve();
+let activeOp = null; // {kind, deadline} of the running operation
+/** A hard reset ran (hardReset): no later operation runs and no registry write lands until the
+ * reload (lanes still holding the old registry can neither persist it again nor act on a tab). */
+let resetting = false;
+function tabOp(kind, body) {
+  const run = tabTail.then(async () => {
+    if (resetting) return undefined;
+    activeOp = {kind, deadline: Date.now() + TAB_OP_BUDGET_MS};
+    try { return await body(); } finally { activeOp = null; }
+  });
+  tabTail = run.catch(() => {}); // a failed operation must not block the next one
+  return run;
+}
+/** Resolves once every operation queued so far (and any they queued) has ended (tests). */
+async function tabQueueIdle() { for (let tail; tail !== tabTail;) { tail = tabTail; await tail; } }
 
 function singleFlight(lanes, key, operation) {
   if (lanes.has(key)) return lanes.get(key);
@@ -99,8 +131,15 @@ function closedKey(job, provider) {
   return `${CLOSED_PREFIX}${job.jobId}:${provider}:${job.states[provider].runId || "legacy"}`;
 }
 
-async function rememberClosedTab(tabId, info) {
+/** onRemoved: the fact is recorded in memory at once, and applied to the tab's records as the next
+ * operation in the tab queue (after the one running, which may be the worker's own close). The
+ * listener returns nothing: Chrome never waits for it, and neither may an operation that closes. */
+function rememberClosedTab(tabId, info) {
   invalidateTabInventory(tabId);
+  pageBackoff.delete(tabId);
+  void tabOp("removed", () => recordClosedTab(tabId, info)).catch(() => {});
+}
+async function recordClosedTab(tabId, info) {
   const key = OWNED_PREFIX + tabId;
   const owned = (await chrome.storage.session.get([key]))[key];
   // Only managed tabs; session-scoped records cannot poison a reused ID after restart.
@@ -111,11 +150,128 @@ async function rememberClosedTab(tabId, info) {
   await chrome.storage.session.remove([key]);
 }
 
-async function rememberOwnedTab(job, provider, closing = false) {
+/** Chrome can swap a tab's page into a new tab id (a discard while its WebContentsDiscard study is
+ * off, a prerender activation): onReplaced(added, removed) fires and onRemoved does not, so every
+ * record keyed by the old id names a tab that is gone while the leg's tab lives on under the new one.
+ * Its cleanup then took it for absent and never closed it, and an undispatched leg lost the record
+ * that lets it send into the tab it created. The leg follows its tab: the session ownership record
+ * (copied: the old id's record is kept, marked replacedBy, so a lane still checking the old id finds
+ * it; Chrome never reuses a tab id), a preserved backstop and a fix delivery record name the new id
+ * first, then the leg's state.tabId moves (recorded as a tab_rekeyed step): a lane that reads the new
+ * id finds its records in place. A leg that already released its tab (cleanupDone: closed or
+ * preserved) is left as it is: following the tab would not make it Ashlar's again.
+ *
+ * The listener records the replace in memory at once (replacedTabIds, the inventory cache) and queues
+ * the re-key as a `rekey` operation in the tab queue: re-keys run in the order Chrome reported them
+ * (Ashlar 4101062763), each after the operation that was running, and read everything it wrote under
+ * the old id. A leg's operation that starts before it applies it first (applyPendingReplace). The
+ * listener returns nothing: Chrome never waits for it. */
+function rekeyReplacedTab(addedTabId, removedTabId) {
+  if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return;
+  replacedTabIds.set(removedTabId, addedTabId);
+  invalidateTabInventory(removedTabId);
+  invalidateTabInventory(addedTabId);
+  // To the chain's END when it runs: a later replace of the added id already reported (A -> B, then
+  // B -> C) moves A's records straight to C.
+  void tabOp("rekey", () => moveReplacedTab(liveTabId(removedTabId), removedTabId)).catch(() => {});
+}
+/** The id Chrome's replaces moved `tabId` to (itself when none did). */
+function liveTabId(tabId) {
+  let id = tabId;
+  for (let hops = 0; replacedTabIds.has(id) && hops < 64; hops++) id = replacedTabIds.get(id);
+  return id;
+}
+/** A replace of the leg's tab that Chrome reported but whose re-key has not run yet (queued behind
+ * this operation, or it failed): applied now, inside the leg's operation, so it acts on the live id
+ * and never reads the old one as absent. (A re-key is idempotent: the queued one then finds it done.) */
+async function applyPendingReplace(state) {
+  if (Number.isInteger(state.tabId) && liveTabId(state.tabId) !== state.tabId) await moveReplacedTab(liveTabId(state.tabId), state.tabId);
+}
+async function moveReplacedTab(addedTabId, removedTabId) {
+  invalidateTabInventory(removedTabId);
+  invalidateTabInventory(addedTabId);
+  const session = await chrome.storage.session.get(null);
+  const owned = session[OWNED_PREFIX + removedTabId], records = {};
+  if (owned) {
+    const {replacedBy: _replaced, ...record} = owned;
+    records[OWNED_PREFIX + addedTabId] = record;
+    // Still proves what the old id was, but no longer names the leg's tab (allocation recovery).
+    records[OWNED_PREFIX + removedTabId] = {...record, replacedBy: addedTabId};
+  }
+  for (const [key, value] of Object.entries(session)) {
+    if (key.startsWith(PRESERVED_PREFIX) && value?.tabId === removedTabId) records[key] = {...value, tabId: addedTabId};
+  }
+  if (Object.keys(records).length) await chrome.storage.session.set(records);
+  if (Object.values(await fixDeliveries()).some(record => record.tabId === removedTabId)) {
+    await updateFixDeliveries(all => { for (const record of Object.values(all)) if (record.tabId === removedTabId) record.tabId = addedTabId; });
+  }
+  const jobs = await workerJobs((await settings()).origin);
+  let moved = false;
+  for (const job of Object.values(jobs)) {
+    for (const provider of job.providers || []) {
+      const state = job.states?.[provider];
+      if (state?.tabId !== removedTabId || state.cleanupDone) continue;
+      state.tabId = addedTabId;
+      workerStep(job, provider, "tab_rekeyed");
+      moved = true;
+    }
+  }
+  if (moved) await saveJobs(jobs);
+}
+
+/** Whether the leg's tab `lookedUp` (an id an operation just found gone) is gone only because Chrome
+ * replaced it: the re-key already moved the leg to the new id, or Chrome reported the replace while
+ * this operation ran (its re-key runs next). Either way the tab lives on, and the next tick asks it
+ * under its new id. */
+function replacedSince(state, lookedUp) {
+  return state.tabId !== lookedUp || liveTabId(lookedUp) !== lookedUp;
+}
+
+/** The session record that `tabId` (by default the leg's tab) is this leg's tab (tabCreatedForLeg). */
+async function rememberOwnedTab(job, provider, closing = false, tabId = job.states[provider].tabId) {
   const state = job.states[provider];
-  if (state.tabId) await chrome.storage.session.set({[OWNED_PREFIX + state.tabId]: {
+  if (!tabId) return;
+  await chrome.storage.session.set({[OWNED_PREFIX + tabId]: {
     jobId: job.jobId, provider, runId: state.runId, closedKey: closedKey(job, provider), closing,
   }});
+}
+
+/** Whether this browser session recorded `tabId` as this leg's tab (allocateProviderTab writes the
+ * record right after it creates the tab). Chrome tab ids are unique only within one browser session
+ * and the job registry outlives it (storage.local), while this record does not (storage.session is
+ * cleared by a browser restart or an extension reload): a leg's stored tab id without it can name a
+ * tab the user opened since. An unbound page is Ashlar's only in the tab this proves. A record marked
+ * replacedBy is a tombstone (Ashlar 4101623043): it proves what the old id was, never that the old id
+ * is still the leg's tab. */
+async function tabCreatedForLeg(job, provider, tabId) {
+  const owned = await ownedTabRecord(tabId);
+  return ownedByLeg(job, provider, owned) && owned.replacedBy === undefined;
+}
+async function ownedTabRecord(tabId) {
+  const key = OWNED_PREFIX + tabId;
+  return Number.isInteger(tabId) ? (await chrome.storage.session.get([key]))[key] : undefined;
+}
+function ownedByLeg(job, provider, owned) {
+  return owned?.jobId === job.jobId && owned.provider === provider && owned.runId === job.states[provider].runId;
+}
+
+/** Move the leg to the tab its stored id was replaced by, when the session records say so (Ashlar
+ * 4101623043). moveReplacedTab writes the added id's record, and marks the removed id's replacedBy,
+ * before it saves the leg's state.tabId: a worker that stops in between restarts with the leg naming
+ * the removed id (gone, and an undispatched page cannot be found by its binding) while the records
+ * name its live tab. The chain is followed from this leg's own record to the record that is not a
+ * tombstone, which must be this leg's too. True if the leg moved now (the caller saves it). */
+async function followDurableReplace(job, provider) {
+  const state = job.states[provider];
+  let id = state.tabId, owned = await ownedTabRecord(id);
+  for (let hops = 0; ownedByLeg(job, provider, owned) && Number.isInteger(owned.replacedBy) && hops < 64; hops++) {
+    id = owned.replacedBy;
+    owned = await ownedTabRecord(id);
+  }
+  if (id === state.tabId || !ownedByLeg(job, provider, owned) || owned.replacedBy !== undefined) return false;
+  state.tabId = id;
+  workerStep(job, provider, "tab_rekeyed");
+  return true;
 }
 
 function formatRetry(until) {
@@ -238,6 +394,12 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
     const relevant = Object.values(jobs).filter(job => job.origin === origin);
     const phase = relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
     const admission = admissionReports.get(origin);
+    // Diagnostics only: an unreadable ring shows no recent legs, it never fails the status write.
+    const ring = await chrome.storage.local.get([RECENT_RETIRED_KEY]).then(got => got[RECENT_RETIRED_KEY], () => []);
+    // The ring is shared by every origin the worker has served: only this origin's legs are its
+    // history (an entry without an origin predates the field and is shown under none). The status
+    // already names its origin, so the entries drop theirs.
+    const retired = (Array.isArray(ring) ? ring : []).filter(entry => entry?.origin === origin).map(({origin: _origin, ...entry}) => entry);
     await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
       origin, checkedAt: Date.now(), phase, capacity,
       admissionPhase: admission?.phase || "not_checked",
@@ -254,6 +416,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       recovery: relevant.filter(job => !activelyReviewing(job)).slice(0, 8).map(job => ({
         jobId: job.jobId, status: job.serverStatus || (job.recoveryError ? "connection_error" : "reconnecting_or_cleanup"),
       })),
+      retired,
     }});
   });
 }
@@ -271,7 +434,10 @@ function noReceiver(err) {
   return /receiving end does not exist|could not establish connection/i.test(m);
 }
 
-async function sendToTab(tabId, msg, files) {
+/** `live()`: whether the caller still waits for the reply (askPage). A first send that found no
+ * receiver is followed by a re-injection and a second send 400 ms later; neither happens once the
+ * caller gave up, so a message the worker stopped waiting for is never delivered afterwards. */
+async function sendToTab(tabId, msg, files, live = () => true) {
   const once = () =>
     new Promise((resolve, reject) => {
       // Content scripts acknowledge immediately. Do not turn a delayed browser
@@ -281,14 +447,100 @@ async function sendToTab(tabId, msg, files) {
         else resolve(res);
       });
     });
+  const late = () => new Error("the page did not answer in time; the message was not sent again");
   try {
     return await once();
   } catch (e) {
     if (!files?.length || !noReceiver(e)) throw e;
+    if (!live()) throw late();
     await chrome.scripting.executeScript({ target: { tabId }, files });
     await sleep(400);
+    if (!live()) throw late();
     return once();
   }
+}
+
+/** How long any worker-to-page message may go unanswered (every page handler replies at once, the
+ * long model call runs detached in the page): a page that accepted it but never runs its handler (a
+ * frozen tab, a hung page) then counts as unreachable (and is backed off: PAGE_BACKOFF_MS), instead
+ * of holding the tab queue (a job's poll, its cleanup and the bounded ownership wait that only
+ * starts after a reply, an inventory probe) and its lane (a capture or repair receipt) forever. */
+const PAGE_REPLY_MS = 15_000;
+
+/** How long a tab whose page did not answer in time (PAGE_REPLY_MS) is not messaged again, by any
+ * lane: a hung page would otherwise cost every lane that asks it (the leg's poll every tick, its
+ * release, the inventory probe, a lookup of the leg's tab) PAGE_REPLY_MS each time. A message to it
+ * meanwhile fails at once, as the timeout would. Any reply ends it, and so does the tab finishing a
+ * load (noteTabUpdated): a new page. */
+const PAGE_BACKOFF_MS = 30_000;
+
+/** A new run message carries `until`: a page that receives it later (a delivery askPage stopped
+ * waiting for) starts nothing (json.js: stale_run). It ends this long before the reply deadline, so
+ * a page that accepts it still answers while the worker waits. */
+const RUN_UNTIL_SLACK_MS = 5_000;
+/** A new run is not dispatched with less reply window than this left in its poll operation (its
+ * `until` would leave the page too little time): the next poll dispatches it. */
+const MIN_DISPATCH_WINDOW_MS = 8_000;
+const pageBackoff = new Map(); // tabId -> the time until which it is not messaged
+
+/** How long the page message sent now may wait for its reply: PAGE_REPLY_MS, capped by what is
+ * left of the running operation's budget (<= 0: spent, nothing is sent). */
+function pageWindow() {
+  return activeOp ? Math.min(PAGE_REPLY_MS, activeOp.deadline - Date.now()) : PAGE_REPLY_MS;
+}
+
+/** One reply deadline (a function so tests can replace the timer; cancelled once the reply came). */
+function pageReplyDeadline(ms = PAGE_REPLY_MS) {
+  let timer;
+  const promise = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the page did not answer in time")), ms); });
+  return {promise, cancel: () => clearTimeout(timer)};
+}
+
+/** An error meaning the page did not answer in time, now or within PAGE_BACKOFF_MS (`silent`): not
+ * evidence about what the tab holds (findOriginalTab: "unknown"). */
+function pageSilent(error) {
+  error.silent = true;
+  return error;
+}
+
+/** `start(live)` (a page message, or a script injection into the page) bounded by
+ * pageReplyDeadline over the reply window it has (pageWindow): the page that does not answer in
+ * time is backed off (PAGE_BACKOFF_MS), and one still backed off is not asked at all. `live()` is
+ * true until the deadline gave up. */
+async function withinPageReply(tabId, start) {
+  if ((pageBackoff.get(tabId) || 0) > Date.now()) throw pageSilent(new Error("the page did not answer in time recently; it is not asked again yet"));
+  pageBackoff.delete(tabId);
+  // The operation's budget is spent: the page is not asked now (not evidence about the tab either).
+  const replyWindow = pageWindow();
+  if (replyWindow <= 0) throw pageSilent(new Error("the tab operation's time budget is spent; the page was not asked"));
+  const deadline = pageReplyDeadline(replyWindow);
+  let phase = "waiting";
+  const expired = deadline.promise.then(undefined, error => {
+    if (phase === "waiting") { phase = "expired"; pageBackoff.set(tabId, Date.now() + PAGE_BACKOFF_MS); }
+    throw pageSilent(error);
+  });
+  try {
+    const value = await Promise.race([start(() => phase === "waiting"), expired]);
+    phase = "answered";
+    pageBackoff.delete(tabId);
+    return value;
+  } catch (error) {
+    if (phase === "waiting") phase = "failed";
+    throw error;
+  } finally { deadline.cancel(); }
+}
+
+/** sendToTab bounded by pageReplyDeadline: how the worker sends every page message. A reply that
+ * never came is a messaging outage (retried once the back-off ends), never a model failure. */
+async function askPage(tabId, msg, files) {
+  return withinPageReply(tabId, live => sendToTab(tabId, msg, files, live));
+}
+
+/** A tab's page changed: its inventory reading is stale, and a page that finished loading is a new
+ * page, asked again at once. */
+function noteTabUpdated(id, change) {
+  if (change.url || change.status) invalidateTabInventory(id);
+  if (change.status === "complete") pageBackoff.delete(id);
 }
 
 async function quotaMap() {
@@ -321,6 +573,7 @@ function contentFiles(provider) {
  * An unacknowledged outcome is replayed to the bridge, never to the model.
  */
 async function saveJobs(jobs) {
+  if (resetting) return; // the registry was reset: nothing from before it is written again
   // Snapshot now, write in invocation order. Later snapshots include other lanes'
   // mutations because they reference the same registry throughout this worker.
   const snapshot = JSON.parse(JSON.stringify(jobs));
@@ -370,6 +623,16 @@ function workerStep(job, provider, stage) {
   if(!state.runId || state.workerEvents?.at(-1)?.stage===stage)return;
   state.workerSequence=(state.workerSequence||0)+1;
   state.workerEvents=[...(state.workerEvents||[]),{source:"worker",sequence:state.workerSequence,stage,at:Date.now()}].slice(-128);
+}
+
+/** Copy the page's step journal from a matching reply (poll or cleanup): untrusted input, so only
+ * primitive metadata is kept (the server sanitizes it again). True when it was taken. */
+function ingestPageProgress(state, result) {
+  if (result?.progress?.runId !== state.runId || !Array.isArray(result.progress.events)) return false;
+  state.pageEvents = result.progress.events.slice(-128).filter(e => e && e.source === "page" &&
+    Number.isSafeInteger(e.sequence) && typeof e.stage === "string" && e.stage.length < 80 && Number.isFinite(e.at))
+    .map(e => ({source: "page", sequence: e.sequence, stage: e.stage, at: e.at}));
+  return true;
 }
 
 function progressFor(job) {
@@ -432,16 +695,24 @@ function allowedTab(tab, provider) {
   } catch { return false; }
 }
 
+/** The provider tab whose page is bound to this leg's run; null when none is; undefined ("unknown")
+ * when a page that did not answer in time (or is backed off, withinPageReply) may be it. Every caller
+ * but providerTabGone reads unknown as null: it keeps waiting. */
 async function findOriginalTab(job, provider) {
   const urls = provider === "grok" ? ["https://grok.com/*"] : ["https://chatgpt.com/*", "https://chat.openai.com/*"];
+  let unknown = false;
   for (const tab of await chrome.tabs.query({url: urls})) {
-    if (!allowedTab(tab, provider)) continue;
+    // A frozen tab runs no handler until the user brings it back: it cannot answer now.
+    if (!allowedTab(tab, provider) || tab.frozen === true) continue;
     try {
-      const result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
+      const result = await askPage(tab.id, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
       if (matchesJob(result, job, provider)) return tab;
-    } catch { /* A messaging outage is not evidence of completion. */ }
+    } catch (error) {
+      // A messaging outage is not evidence of completion, nor a silent page of absence.
+      if (error?.silent) unknown = true;
+    }
   }
-  return null;
+  return unknown ? undefined : null;
 }
 
 function invalidateTabInventory(tabId) {
@@ -456,33 +727,58 @@ function knownTabOwner(tab) {
 /** Ownership-only probes have independent lanes. An unresponsive tab remains
  * uncertain; it cannot hold the admission/cleanup scheduler or cause fan-out.
  */
+/** The tab inventory, one operation in the tab queue (the query, and the cache entries and preserved
+ * records of tabs that are gone: no re-key can run between the query and those drops), then one probe
+ * operation per provider tab whose page can answer (single-flight per tab), waited for so the caller
+ * reads what they found. */
 async function refreshTabInventory() {
+  const ids=await tabOp("inventory", refreshTabInventoryBody);
+  await Promise.allSettled(ids.map(id=>inventoryLanes.get(id) || singleFlight(inventoryLanes,id,()=>tabOp("probe",()=>probeTabNow(id)))));
+}
+async function refreshTabInventoryBody() {
   const tabs=await chrome.tabs.query({});
   const live=new Set(tabs.map(tab=>tab.id));
   for(const id of tabOwners.keys())if(!live.has(id))invalidateTabInventory(id);
   // Removed IDs need no permanent tombstone once their single-flight probe ended.
   for(const id of tabEpochs.keys())if(!live.has(id) && !inventoryLanes.has(id)){tabEpochs.delete(id);inventoryUpgrades.delete(id);}
-  for(const tab of tabs) {
-    const provider=["chatgpt","grok"].find(p=>allowedTab(tab,p));
-    if(!provider || tab.status === "loading" || tab.pendingUrl || inventoryLanes.has(tab.id))continue;
-    const epoch=tabEpochs.get(tab.id) || 0;
-    void singleFlight(inventoryLanes,tab.id,()=>probeTabOwner(tab,provider,epoch))
-      .catch(()=>{if((tabEpochs.get(tab.id) || 0)===epoch)tabOwners.delete(tab.id);});
-  }
-  // A preserved record whose tab is gone has nothing left to release.
+  // A preserved record whose tab is gone has nothing left to release. An id Chrome reported replaced
+  // is never read as absent (I3): its re-key, which may still wait behind this operation, moves the
+  // record to the live id, and a later inventory judges that one.
   const session=await chrome.storage.session.get(null);
-  const stale=Object.entries(session).filter(([key,value])=>key.startsWith(PRESERVED_PREFIX) && Number.isInteger(value?.tabId) && !live.has(value.tabId)).map(([key])=>key);
+  const stale=Object.entries(session).filter(([key,value])=>key.startsWith(PRESERVED_PREFIX) && Number.isInteger(value?.tabId) && !live.has(value.tabId) && liveTabId(value.tabId)===value.tabId).map(([key])=>key);
   if(stale.length)await chrome.storage.session.remove(stale);
+  return tabs.filter(probeable).map(tab=>tab.id);
+}
+
+/** The provider a tab's page can be probed for now (undefined: none). A frozen tab (energy saver, a
+ * collapsed tab group) runs no handler until it thaws: a probe would only time out (erasing the owner
+ * read there while it ran) and every refresh would queue another. Its page cannot change while it is
+ * frozen, so what was read there stands. */
+function probeable(tab) {
+  const provider=["chatgpt","grok"].find(p=>allowedTab(tab,p));
+  return provider && tab.status !== "loading" && !tab.pendingUrl && tab.frozen !== true ? provider : undefined;
+}
+/** A scheduled probe, as its operation starts: the tab and its epoch are read now, not when the
+ * inventory scheduled it (the tab may have changed or gone in between). */
+async function probeTabNow(tabId) {
+  const epoch=tabEpochs.get(tabId) || 0;
+  let tab;
+  try { tab=await chrome.tabs.get(tabId); } catch { return; }
+  const provider=probeable(tab);
+  if(!provider)return;
+  try { await probeTabOwner(tab,provider,epoch); }
+  catch { if((tabEpochs.get(tabId) || 0)===epoch)tabOwners.delete(tabId); }
 }
 
 /** One ownership probe of `tab`, recorded only while the tab's inventory epoch is still `epoch`: a
  * probe that an invalidation overtook (tab removed, or its page answered a newer handshake) is dropped. */
 async function probeTabOwner(tab, provider, epoch) {
-  let result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
+  let result=await askPage(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
   if(result?.ownershipProtocol!==1 && inventoryUpgrades.get(tab.id)!==epoch) {
     inventoryUpgrades.set(tab.id,epoch);
-    await chrome.scripting.executeScript({target:{tabId:tab.id},files:contentFiles(provider)});
-    result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
+    // A hung page never completes an injection either: bounded like a message.
+    await withinPageReply(tab.id,()=>chrome.scripting.executeScript({target:{tabId:tab.id},files:contentFiles(provider)}));
+    result=await askPage(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
   }
   const current=await chrome.tabs.get(tab.id);
   if((tabEpochs.get(tab.id) || 0)!==epoch || current.status==="loading" || current.pendingUrl ||
@@ -492,26 +788,25 @@ async function probeTabOwner(tab, provider, epoch) {
   await completePreservedRelease(tab,provider,result);
 }
 
-/** A page that just answered this worker's cleanup handshake by keeping its tab (the user took it
- * over, or the archived response changed) may have released its managed slot in that same answer.
- * Every earlier ownership snapshot of the tab predates that answer: an inventory probe that reached
- * the page first still says "unreleased", and once the leg retires, that stale binding would count
- * as an untracked orphan against tab capacity (blocking admission) until some later probe happens
- * to land. So the prior snapshot and any probe still in flight are invalidated, and the page is asked
- * again now, BEFORE the leg is marked cleaned up (retirement requires that). The page's own answer is
- * the only evidence recorded; if it cannot answer, the tab stays uncertain (reserved), never free. */
+/** A page that just answered this worker's release handshake by keeping its tab (preserveFixTab:
+ * the user took it over, ownership could not be proven, or a fix ended without a delivered answer)
+ * released its managed slot in that same answer. Every earlier ownership snapshot of the tab
+ * predates that answer: an inventory probe that reached the page first still says "unreleased", and
+ * once the leg retires, that stale binding would count as an untracked orphan against tab capacity
+ * (blocking admission) until some later probe happens to land. So the prior snapshot and any probe
+ * still in flight are invalidated, and the page is asked again now, BEFORE the leg is marked cleaned
+ * up (retirement requires that). The page's own answer is the only evidence recorded; if it cannot
+ * answer (bounded by askPage), the tab stays uncertain (reserved), never free. A frozen or discarded
+ * tab is not probed (it cannot answer; the preserved-run record covers it). */
 async function reprobePreservedTab(tabId, provider) {
   if(!Number.isInteger(tabId))return;
   invalidateTabInventory(tabId);
   const epoch=tabEpochs.get(tabId);
   try {
     const tab=await chrome.tabs.get(tabId);
-    if(allowedTab(tab,provider) && tab.status!=="loading" && !tab.pendingUrl)await probeTabOwner(tab,provider,epoch);
+    if(allowedTab(tab,provider) && tab.status!=="loading" && tab.status!=="unloaded" && !tab.pendingUrl && tab.frozen!==true && tab.discarded!==true)
+      await probeTabOwner(tab,provider,epoch);
   } catch { if(tabEpochs.get(tabId)===epoch)tabOwners.delete(tabId); }
-}
-async function preserveAnsweredTab(job, provider, jobs, reason) {
-  await reprobePreservedTab(job.states[provider].tabId,provider);
-  return finishTabCleanup(job,provider,jobs,reason);
 }
 
 /** The preserve handshake a review tab always completes before its job retires (the page frees
@@ -525,7 +820,7 @@ async function completePreservedRelease(tab, provider, status) {
   const record=(await chrome.storage.session.get([key]))[key];
   if(!record)return;
   if(status.released===true){await chrome.storage.session.remove([key]);return;}
-  const ack=await sendToTab(tab.id,{type:"ashlar-fix-cancel",jobId:status.jobId,provider,runId:status.runId,kind:"fix",preserve:true},contentFiles(provider)).catch(()=>null);
+  const ack=await askPage(tab.id,{type:"ashlar-fix-cancel",jobId:status.jobId,provider,runId:status.runId,kind:"fix",preserve:true},contentFiles(provider)).catch(()=>null);
   if(ack?.ok===true && ack.jobId===status.jobId && ack.runId===status.runId && ack.provider===provider) {
     const known=tabOwners.get(tab.id);
     if(known?.jobId===status.jobId && known.runId===status.runId)tabOwners.set(tab.id,{...known,released:true});
@@ -710,14 +1005,24 @@ function forgetFixDelivery(job) {
 /** The fix deliveries that locally PROVE a tab: what admission lists in excludeJobIds and never
  * opens again. A record of a job this worker still holds is its own allocation (the registry's
  * allocation journal decides it, pollProvider validating the record with fixAllocationEvidence; the
- * job is excluded anyway). Any other record counts only while a tab proves it: its `created` tab
- * is still live on the provider in the browser session that recorded it, or a tab still carries the job's
- * binding (the session's owned-tab record, or the tab inventory), and no other run claims that tab
- * (tabClaimedByOtherRun: such a tab is skipped, left untouched); a `creating` record proven that way
- * (the worker stopped after the create, before the promotion) is promoted. A record nothing proves
- * (the worker stopped or was reset between the intent and chrome.tabs.create, or its tab is gone) is
- * cleared, so the server replays that delivery and it is opened once, instead of an intent that
- * never became a tab stranding the fix until its deadline. */
+ * job is excluded anyway). Any other record counts only while a tab proves it: by its BINDING (a live
+ * tab on the provider that this browser session's owned-tab record or the tab inventory, the page's
+ * own binding, names the record's run for: jobId, provider and runId), or as the `created` tab the
+ * record names while that id still means the same tab (recorded in THIS browser session, #77:
+ * recordedFixTab), and either way only while no other run claims that tab (tabClaimedByOtherRun:
+ * such a tab is skipped, left untouched); a `creating` record proven that way (the worker stopped
+ * after the create, before the promotion) is promoted, and a proven record names THIS browser
+ * session, so after a browser restart a reused ID never re-proves it. A `created` record's tab id
+ * alone proves nothing: tab ids are unique only within one browser session, and the record outlives
+ * it (storage.local), so after a browser restart the id can name the user's own tab (as for
+ * tabCreatedForLeg, #82). While that tab's page has not been read yet (no session record for it, the
+ * inventory still probing it, or it cannot answer: discarded, loading) the record is kept as it is:
+ * after an extension reload the same id can still be the tab holding the run (and the browser
+ * session id, kept in storage.session, is new), and clearing it then would send the prompt a second
+ * time. A record nothing proves (the worker stopped or was reset between the intent and
+ * chrome.tabs.create, its tab is gone, or the page in it names no binding of this run) is cleared,
+ * so the server replays that delivery and it is opened once, instead of stranding the fix until its
+ * deadline. */
 async function reconcileFixDeliveries(jobs) {
   const records = await fixDeliveries();
   if (!Object.keys(records).length) return records;
@@ -743,12 +1048,16 @@ async function reconcileFixDeliveries(jobs) {
   const proven = {}, rewrite = {};
   for (const [jobId, record] of Object.entries(records)) {
     if (jobs[jobId]) { proven[jobId] = record; continue; }
-    // A recorded tab ID proves the tab only in the browser session that recorded it; a binding (the
-    // session's owned record or the live inventory) proves it in THIS session. Either way the proven
-    // record names this session, so after a browser restart a reused ID never re-proves it.
+    const createdTab = record.phase === "created" ? live.get(record.tabId) : undefined;
     const recorded = await recordedFixTab(record, live);
-    const tabId = await accept(recorded.tab, jobId, record) ? recorded.tab.id : await boundTab(jobId, record);
-    if (!tabId) { rewrite[jobId] = null; continue; }
+    const tabId = await boundTab(jobId, record) || (await accept(recorded.tab, jobId, record) ? recorded.tab.id : undefined);
+    if (!tabId) {
+      // The recorded tab is still open on the provider, but nothing has read which binding its page
+      // holds yet: kept (still excluded) until the inventory reads it.
+      const unread = onProvider(createdTab, record.provider) && !session[OWNED_PREFIX + createdTab.id] && !knownTabOwner(createdTab);
+      if (unread) proven[jobId] = record; else rewrite[jobId] = null;
+      continue;
+    }
     proven[jobId] = {...record, phase: "created", tabId, session: browserSession};
     if (record.phase !== "created" || record.tabId !== tabId || record.session !== browserSession) rewrite[jobId] = proven[jobId];
   }
@@ -765,36 +1074,45 @@ async function reconcileFixDeliveries(jobs) {
   return proven;
 }
 
+/** Open the leg's tab, inside its poll operation: the capacity check, the intent, the create and
+ * the records run with no other tab operation in between (the tab queue), so two allocations never
+ * both pass one capacity check. The tab's evidence is written before the leg names it (CE-2):
+ * saveJobs persists the shared registry whenever any lane saves, so a state.tabId set before its
+ * owned-tab record would be persisted without it, and after a worker stop that tab could not be
+ * proven the leg's (tabCreatedForLeg). */
 async function allocateProviderTab(job, provider, jobs) {
-  // Serialize only the short capacity/create boundary, never model or bridge RPCs.
-  const operation = allocationTail.then(async () => {
-    const state = job.states[provider];
-    if (state.tabId || state.allocating || await maintenanceHeld() || !await tabCapacityAvailable(jobs)) return;
-    state.allocating = true;
-    try { await saveJobs(jobs); }
-    catch (error) { delete state.allocating; throw error; } // No create was attempted.
-    try { await beginFixDelivery(job, provider); }
-    catch (error) { delete state.allocating; await saveJobs(jobs).catch(() => {}); throw error; } // No create was attempted.
-    try {
-      const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
+  const state = job.states[provider];
+  if (state.tabId || state.allocating || await maintenanceHeld() || !await tabCapacityAvailable(jobs)) return;
+  state.allocating = true;
+  try { await saveJobs(jobs); }
+  catch (error) { delete state.allocating; throw error; } // No create was attempted.
+  try { await beginFixDelivery(job, provider); }
+  catch (error) { delete state.allocating; await saveJobs(jobs).catch(() => {}); throw error; } // No create was attempted.
+  let created;
+  try {
+    created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
+    await rememberOwnedTab(job, provider, false, created.id);
+    // The delivery record says `created` only now that the tab exists and carries its owned record.
+    // A failed promotion is not fatal: that owned record proves the tab (reconcileFixDeliveries).
+    await promoteFixDelivery(job, provider, created.id).catch(() => {});
+    // A replace Chrome reported meanwhile is applied after this operation (its re-key), to these
+    // records and to the leg alike.
+    state.tabId = created.id;
+    workerStep(job,provider,"tab_created");
+    delete state.allocating;
+    await saveJobs(jobs); // Durable binding before any prompt dispatch.
+  } catch (error) {
+    if (!created) {
+      delete state.allocating; await saveJobs(jobs);
+      await forgetFixDelivery(job).catch(() => {}); // the create failed: no tab holds this delivery
+    } else if (!state.tabId) {
+      // The tab exists but a write after the create failed: the leg names it (in memory; the intent
+      // stays until a save lands), never opens another for this allocation.
       state.tabId = created.id;
       workerStep(job,provider,"tab_created");
-      await rememberOwnedTab(job, provider);
-      // The delivery record says `created` only now that the tab exists and carries its owned record.
-      // A failed promotion is not fatal: that owned record proves the tab (reconcileFixDeliveries).
-      await promoteFixDelivery(job, provider, created.id).catch(() => {});
-      delete state.allocating;
-      await saveJobs(jobs); // Durable binding before any prompt dispatch.
-    } catch (error) {
-      if (!state.tabId) {
-        delete state.allocating; await saveJobs(jobs);
-        await forgetFixDelivery(job).catch(() => {}); // the create failed: no tab holds this delivery
-      }
-      throw error;
     }
-  });
-  allocationTail = operation.catch(() => {});
-  return operation;
+    throw error;
+  }
 }
 
 function compactFinalCapturedSource(state) {
@@ -806,13 +1124,37 @@ function compactFinalCapturedSource(state) {
   return true;
 }
 
-async function finishTabCleanup(job, provider, jobs, reason) {
+/** Why a tab is kept open (the preserve_<cause> history stage; a function so tests can read it). */
+function preserveCauses() {
+  return ["navigated", "user_turn", "edited", "draft", "regenerated", "stalled", "ownership_unknown", "unreachable", "other_binding", "undelivered", "unknown"];
+}
+
+/** Whether a leg ever had a tab, or may have one: an id it opened or adopted, a dispatched run, a
+ * tab_created step (the id may have been dropped since), or a create whose outcome is unknown
+ * (allocating). A leg with none of these (a usage limit before allocation, cancelled while it
+ * waited for capacity, a create that failed) never had a tab. */
+function legHadTab(state) {
+  return Boolean(state.tabId || state.started || state.allocating || state.workerEvents?.some(event => event.stage === "tab_created"));
+}
+
+/** `cause` (a preserved tab only): why the tab was kept, recorded as preserve_<cause> just before
+ * tab_preserved so review history says why (the cleanup note is dropped with the retired job).
+ * Any other end is tab_closed only when the worker itself closed the tab (closeProvenTab marks
+ * closeIssued before its remove, so a worker that stops right after it still says so); a tab that is
+ * gone otherwise (the user or the browser closed it, Chrome replaced it, its creation is unknown, or
+ * it is no longer found) is tab_lost. A leg that never had a tab (legHadTab) records no tab step. */
+async function finishTabCleanup(job, provider, jobs, reason, cause) {
   const state = job.states[provider];
   state.cleanupDone = true;
   state.cleanupPending = false;
-  workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : "tab_closed");
+  if (reason?.includes("preserved")) {
+    state.preserveCause = preserveCauses().includes(cause) ? cause : "unknown";
+    workerStep(job, provider, `preserve_${state.preserveCause}`);
+  }
+  if (legHadTab(state)) workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : state.closeIssued === true ? "tab_closed" : "tab_lost");
   if (reason) state.cleanupNote = reason;
   delete state.cleanupError;
+  delete state.cleanupWaitReason;
   await saveJobs(jobs);
   if(sourceArchiveDurable(state)) {
     // Browser ownership can be released before JSON repair finishes, but the
@@ -839,121 +1181,115 @@ async function finishTabCleanup(job, provider, jobs, reason) {
  * Never delete the last ownership record before remove() has succeeded.
  */
 function cleanupProvider(job, provider, jobs) {
-  return singleFlight(cleanupLanes,`${job.origin}:${job.jobId}:${provider}`,()=>cleanupProviderBody(job,provider,jobs));
+  return singleFlight(cleanupLanes,`${job.origin}:${job.jobId}:${provider}`,()=>tabOp("release",()=>cleanupProviderBody(job,provider,jobs)));
 }
 async function cleanupProviderBody(job, provider, jobs) {
+  // Nothing for a job that retired (or was reset) while this operation waited in the queue.
+  if (jobs[job.jobId] !== job) return;
   const state = job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`;
   if (capturePersistence.has(key) || (!state.delivered && !sourceArchiveDurable(state)) || state.cleanupDone || state.repairReceiptPending) return;
+  await applyPendingReplace(state);
+  // No tab id and no run: nothing to look up or close (a leg that never had a tab ends with no tab
+  // step at all, not even cleanup_pending: its last step stays what happened to its result).
+  if (!state.tabId && !state.started) return finishTabCleanup(job, provider, jobs);
   state.cleanupPending = true;
   workerStep(job,provider,"cleanup_pending");
   await saveJobs(jobs);
-  if (!state.tabId && !state.started) return finishTabCleanup(job, provider, jobs);
   if ((await chrome.storage.session.get([closedKey(job, provider)]))[closedKey(job, provider)]) {
     return finishTabCleanup(job, provider, jobs, "already closed");
   }
   try {
     let tab;
-    try { tab = await chrome.tabs.get(state.tabId); }
+    if (await followDurableReplace(job, provider)) await saveJobs(jobs);
+    const lookedUp = state.tabId;
+    try { tab = await chrome.tabs.get(lookedUp); }
     catch {
       tab = await findOriginalTab(job, provider);
       if (!tab) {
+        // Chrome replaced the tab while it was looked up: it is not absent.
+        if (replacedSince(state, lookedUp)) return;
         // Once the full source receipt is durably local+server stored, tab absence
         // cannot strand repair. It also cannot authorize closing a replacement.
         if (sourceArchiveDurable(state)) return finishTabCleanup(job, provider, jobs, "archived source durable; original tab absent");
         // A previous remove may have succeeded just before the worker stopped.
         if (state.closeRequested) return finishTabCleanup(job, provider, jobs, "close confirmed by absence");
+        // Nobody wants this leg's result: there is nothing left to wait for.
+        if (abandonedLeg(job, state)) return finishTabCleanup(job, provider, jobs, "no result wanted; tab absent");
         state.cleanupError = "original tab unavailable; cleanup waits for reconnection";
+        cleanupWaiting(job, provider, "tab_unavailable");
         await saveJobs(jobs);
         return;
       }
       state.tabId = tab.id;
       await saveJobs(jobs);
     }
-    if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved");
-    if (job.kind === "fix") return cleanupFixTab(job, provider, jobs, tab);
-    if (tab.status && tab.status !== "complete") return;
-    if (sourceArchiveDurable(state) && !sourceCleanupProofConfirmed(state)) {
-      const saved=state.sourceCapture;
-      const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
-        captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
-      if(matchesJob(restored,job,provider) && restored.code==="capture_source_changed")
-        return preserveAnsweredTab(job,provider,jobs,"archived response unavailable or changed; tab preserved");
-      if(!matchesJob(restored,job,provider) || !restored.accepted) {
-        state.cleanupError="archived source cleanup proof unavailable; tab preserved pending positive ownership";
-        await saveJobs(jobs);return;
-      }
-      saved.cleanupProofConfirmed=true;
-      saved.confirmed=true;
-      await saveJobs(jobs);
-    }
-    let result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider));
-    if (matchesJob(result,job,provider) && !result.canClose && result.reason === "pending" && sourceArchiveDurable(state)) {
-      const saved=state.sourceCapture;
-      // A page reload can lose its in-memory source receipt after the ACK. The
-      // worker still holds the exact full source/context until cleanup completes.
-      const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
-        captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
-      if(matchesJob(restored,job,provider) && restored.code==="capture_source_changed")
-        return preserveAnsweredTab(job,provider,jobs,"archived response unavailable or changed; tab preserved");
-      if(matchesJob(restored,job,provider) && restored.accepted) {
-        saved.cleanupProofConfirmed=true;saved.confirmed=true;await saveJobs(jobs);
-        result=await sendToTab(tab.id,tabMessage(job,provider,"ashlar-can-close"),contentFiles(provider));
-      }
-    }
-    if (matchesJob(result,job,provider) && !result.canClose && result.reason === "pending" && state.delivered && state.outcome?.ok && state.outcome.completion) {
-      const restored=await sendToTab(tab.id,{...tabMessage(job,provider,"ashlar-result-saved"),committed:true,
-        raw:state.outcome.raw,text:state.outcome.originalText,completion:state.outcome.completion},contentFiles(provider));
-      if(matchesJob(restored,job,provider) && restored.code === "completion_changed")
-        return preserveAnsweredTab(job,provider,jobs,"acknowledged response changed; tab preserved");
-      if(matchesJob(restored,job,provider) && restored.accepted)
-        result=await sendToTab(tab.id,tabMessage(job,provider,"ashlar-can-close"),contentFiles(provider));
-    }
-    if (!matchesJob(result, job, provider)) {
-      state.cleanupError = "tab ownership does not match; no tab was closed";
-      await saveJobs(jobs);
-      return;
-    }
-    if (result.reason === "repurposed") return preserveAnsweredTab(job, provider, jobs, "user continued the conversation; tab preserved");
-    // The page freed its slot: the leg stalled (#87) under a Stop that never clears, so no close is ever proven.
-    if (result.reason === "stalled") return preserveAnsweredTab(job, provider, jobs, "review stalled under a stuck Stop; tab preserved");
-    if (!result.canClose) {
-      state.cleanupWaitReason="page_completion_or_journal_pending";
-      await saveJobs(jobs);return; // No deadline or forced eviction.
-    }
-    delete state.cleanupWaitReason;
-    await closeProvenTab(job, provider, jobs, tab.id, result.url);
+    if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved", "navigated");
+    return forceCloseFixTab(job, provider, jobs, tab);
   } catch (e) {
     state.cleanupError = String(e.message || e).slice(0, 240);
     await saveJobs(jobs);
   }
 }
 
-/** The one managed close, for a tab whose page just proved it may close (can-close): the tab must
- * still be on the proven page (`proven`: the exact URL that answered, or a predicate over the tab's
- * URL that checks the identity the worker stored: a fix's send-time conversation), with no pending
- * navigation and not loading, and the close is recorded durably before the remove so a worker that
- * stops in between retires it by absence. */
+/** The one managed close, for a tab whose page just proved it may close (forceCloseFixTab): the
+ * tab must still be on the proven page (`proven`: the exact URL that answered, or a predicate over
+ * the tab's URL that checks the identity the worker stored: the run's bound conversation, the page
+ * it last answered on, or its allocation page), with no pending navigation and not loading, and
+ * the close is recorded durably before the remove so a worker that stops in between retires it by
+ * absence. */
 async function closeProvenTab(job, provider, jobs, tabId, proven, reason) {
   const current = await chrome.tabs.get(tabId);
   const holds = typeof proven === "function" ? proven : url => url === proven;
   if (current.pendingUrl || !holds(current.url) || current.status === "loading") return false;
-  job.states[provider].closeRequested = true;
-  await saveJobs(jobs);
-  await rememberOwnedTab(job, provider, true);
-  await chrome.tabs.remove(tabId);
+  const state = job.states[provider];
+  state.closeRequested = true;
+  // The worker's own close (a sweep also sets closeRequested, to accept an absence it confirmed).
+  state.closeIssued = true;
+  try {
+    await saveJobs(jobs);
+    await rememberOwnedTab(job, provider, true);
+    await chrome.tabs.remove(tabId);
+  } catch (error) {
+    // Not closed (a write before the remove failed, the user is dragging the tab, or it is already
+    // gone): whoever ends it next, it is not the worker's close unless a later remove succeeds.
+    delete state.closeIssued;
+    await saveJobs(jobs).catch(() => {});
+    throw error;
+  }
   await finishTabCleanup(job, provider, jobs, reason);
   return true;
 }
 
-/** A conversation's identity: its URL without the fragment (as the page records it at send, composer.js). */
-function conversationIdentity(url) {
-  return typeof url === "string" ? url.split("#")[0] : "";
+/** Whether two URLs show the same page for tab ownership (json.js samePage): origin and path
+ * (trailing slashes ignored). The query and fragment are not the page: ChatGPT's
+ * `?temporary-chat=true` names a mode, not another conversation. */
+function samePage(a, b) {
+  try {
+    const x = new URL(a), y = new URL(b);
+    const path = url => url.pathname.replace(/\/+$/, "");
+    return x.origin === y.origin && path(x) === path(y);
+  } catch { return false; }
 }
 
-/** Keep the conversation a fix run was sent in, as its page recorded it in the submission journal
- * when the send was proven (composer.js submissionConfirmed): stored ONCE and never replaced (no location-based
- * upgrade: a later URL is no evidence of whose conversation it is), so a later reply (or the tab's
- * URL) is compared with it, never with a URL echoed by the same reply. True if it was stored now. */
+/** Whether `url` is still the page a tab was opened on (providerUrl: the provider's new chat). */
+function onAllocationPage(url, provider) {
+  return samePage(url, providerUrl(provider));
+}
+
+/** The page a run last answered on (state.pageUrl), when it can serve as the run's identity: not
+ * while it is still the page the tab was opened on, which names no conversation yet. A provider
+ * moves that URL to the conversation it assigns after the send (ChatGPT's bare new chat, Grok's
+ * home), and a move the worker has not polled since is not the user's: the page decides then. */
+function answeredPage(state, provider) {
+  return state.pageUrl && !onAllocationPage(state.pageUrl, provider) ? state.pageUrl : "";
+}
+
+/** Keep the conversation a run (review or fix) was bound in, as its page recorded it in the
+ * submission journal: a fix (and a review sent on a conversation page) when its send was proven
+ * (composer.js submissionConfirmed), a review sent on a new chat where the provider put it (json.js
+ * pinNewChatReview). Stored ONCE and never replaced (no location-based upgrade: a later URL is no
+ * evidence of whose conversation it is), so a later reply (or the tab's URL) is compared with it,
+ * never with a URL echoed by the same reply. True if it was stored now. */
 function adoptFixConversation(state, result) {
   const seen = typeof result?.conversation === "string" && result.conversation.length <= 4096 ? result.conversation : "";
   if (!seen || state.conversation) return false;
@@ -961,11 +1297,12 @@ function adoptFixConversation(state, result) {
   return true;
 }
 
-/** How long a DELIVERED fix whose tab cannot prove the close yet (still loading, unreachable, the
- * page's proof pending) is re-asked before the tab is preserved. */
+/** How long a settled leg's tab whose ownership cannot be proven (loading, discarded, unreachable,
+ * another binding, not rendered) is re-asked before it is preserved. A fix waits only on its
+ * proven-success path (a delivered answer): nothing else can close a fix tab, so nothing else waits. */
 const FIX_OWNERSHIP_WAIT_MS = 2 * 60_000;
 
-/** Whether this fix leg ended on the proven-success path: its answer was collected
+/** Whether this fix leg may take the proven-success path (#77): its answer was collected
  * (state.outcome.ok) and the server acknowledged the delivery (state.answerDelivered, written by
  * deliverOutcome on the complete ACK only). A cancel, a supersede, a deadline, a failure (quota,
  * error, taken_over, a rejected answer) or an outcome whose delivery record is lost never is. */
@@ -973,72 +1310,393 @@ function fixAnswerDelivered(state) {
   return state.answerDelivered === true && state.outcome?.ok === true;
 }
 
-/** Cleanup of a fix leg. A fix tab lives in the user's logged-in chat profile, and Ashlar closes it
- * ONLY on the proven-success path: the answer was delivered AND the page's complete-phase proof
- * passes right now (can-close: the send-time conversation, the exact sent turn, the stored
- * completion unchanged, no draft or follow-up), with the tab still in the conversation the worker
- * stored. Every other end (cancelled, superseded, deadline, failure, taken over, unknown ownership,
- * another binding, unreachable, still loading, a lost delivery record) preserves the tab: the page
- * is asked to release its managed slot and stop its run, the worker records the preserved run
- * (capacity backstop) and the job retires. Nothing here ever closes a tab on a cancel. */
-async function cleanupFixTab(job, provider, jobs, tab) {
+/** Why a settled leg's cleanup is waiting on its page (the capacity blocker shows it). A new reason
+ * is also a history step, uploaded at once (best effort, not awaited): a cleanup that never finishes
+ * never reaches the final flush at retirement. */
+function cleanupWaiting(job, provider, reason) {
   const state = job.states[provider];
-  const loaded = !tab.status || tab.status === "complete";
-  if (!fixAnswerDelivered(state)) {
-    const why = state.outcome?.ok === false ? state.outcome.code || "failure" : state.outcome?.ok ? "answer delivery unconfirmed" : job.serverStatus || "no answer";
-    return preserveFixTab(job, provider, jobs, `fix ended without a delivered answer (${why}); tab preserved`, loaded ? tab : undefined);
-  }
-  if (!loaded) return waitOrPreserveFixTab(job, provider, jobs, "the delivered fix tab never finished loading; tab preserved");
-  let result;
-  try { result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider)); }
-  catch { return waitOrPreserveFixTab(job, provider, jobs, "the delivered fix tab could not be reached; tab preserved"); }
-  if (matchesJob(result, job, provider) && !result.canClose && result.reason === "pending" && state.outcome.completion) {
-    // A reload lost the page's in-memory completion: restore it from the worker's copy (the page
-    // re-proves it against the rendered response), then ask again.
-    const restored = await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-result-saved"), committed: true,
-      raw: state.outcome.raw, text: state.outcome.originalText, completion: state.outcome.completion}, contentFiles(provider)).catch(() => null);
-    if (matchesJob(restored, job, provider) && restored.code === "completion_changed")
-      return preserveFixTab(job, provider, jobs, "acknowledged response changed; tab preserved", tab);
-    if (matchesJob(restored, job, provider) && restored.accepted)
-      result = await sendToTab(tab.id, tabMessage(job, provider, "ashlar-can-close"), contentFiles(provider)).catch(() => null);
-  }
-  if (!matchesJob(result, job, provider)) return preserveFixTab(job, provider, jobs, "the fix tab carries another binding; tab preserved");
-  if (result.reason === "repurposed") return preserveFixTab(job, provider, jobs, "user continued the conversation; tab preserved", tab);
-  if (!result.canClose || result.ownership !== "owned") {
-    state.cleanupWaitReason = "page_completion_or_journal_pending";
-    return waitOrPreserveFixTab(job, provider, jobs, "the delivered fix tab never proved ownership; tab preserved", tab);
-  }
-  delete state.cleanupWaitReason;
-  // The final check compares the tab with the conversation identity the worker stored (never a URL
-  // echoed by the same reply).
-  if (adoptFixConversation(state, result)) await saveJobs(jobs);
-  const bound = state.conversation;
-  if (!bound || conversationIdentity(result.url) !== bound) return preserveFixTab(job, provider, jobs, "the fix tab is not in its bound conversation; tab preserved", tab);
-  await closeProvenTab(job, provider, jobs, tab.id, url => url === result.url && conversationIdentity(url) === bound);
+  if (state.cleanupWaitReason === reason) return;
+  state.cleanupWaitReason = reason;
+  workerStep(job, provider, "cleanup_waiting_page");
+  void flushProgress(job).catch(() => {});
 }
 
-/** The one exit for a fix tab Ashlar keeps open: the page is asked to release its managed slot and
- * stop its run when it can be messaged (`tab`), and the worker records the preserved run as a
- * backstop (the page may never answer), so the retained binding is never counted as an orphan
- * against tab capacity. Then the job retires. */
-async function preserveFixTab(job, provider, jobs, reason, tab) {
+/** The one exit for a tab Ashlar keeps open (taken over, moved, unidentifiable, stuck loading, a
+ * fix that ended without a delivered answer): the page is asked to free its managed slot (and stop
+ * its run) when it can be messaged (`tab`), and the worker records the preserved run as a backstop
+ * (the page may never answer), so the retained binding is never counted as an orphan against tab
+ * capacity. A page that was asked is probed again before the leg retires (reprobePreservedTab, #77),
+ * so retirement follows the page's own post-release status. Then the job retires. `extra`: fields
+ * added to the release message (an undispatched fix leg's `undispatched`, see forceCloseFixTab). */
+async function preserveFixTab(job, provider, jobs, reason, tab, cause, extra) {
   const state = job.states[provider];
-  if (tab) await sendToTab(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true}, contentFiles(provider)).catch(() => {});
-  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: state.tabId}});
-  return finishTabCleanup(job, provider, jobs, reason);
+  if (tab) {
+    const released = await askPage(tab.id, {...tabMessage(job, provider, "ashlar-fix-cancel"), preserve: true, ...extra}, contentFiles(provider)).catch(() => null);
+    // The release also stops the page's run, and the page records that as "cancelled" (the job was
+    // cancelled or forgotten). Its reply reaches history only for a leg that was (abandonedLeg, the
+    // same test that picks the review cancel exit): for a fix leg kept without a delivered answer it
+    // is the page's only report. A leg the user took over after its result was secured, or a fix
+    // whose run ended on its own (quota, an error, taken over), was never cancelled: its history
+    // keeps what the verdict reply and the poll already carried.
+    if (abandonedLeg(job, state) && matchesJob(released, job, provider)) ingestPageProgress(state, released);
+  }
+  const preservedTabId = state.tabId;
+  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: preservedTabId}});
+  if (tab) await reprobePreservedTab(tab.id, provider);
+  return finishTabCleanup(job, provider, jobs, reason, cause);
 }
 
-/** The success path only: ask again next tick until FIX_OWNERSHIP_WAIT_MS has passed, then preserve
- * the tab so the job retires (`tab` omitted: the page cannot be messaged, e.g. still loading). */
-async function waitOrPreserveFixTab(job, provider, jobs, reason, tab) {
+/** Ask again next tick until FIX_OWNERSHIP_WAIT_MS has passed, then preserve the tab so the job
+ * retires (`tab` omitted: the page cannot be messaged, e.g. still loading). */
+async function waitOrPreserveFixTab(job, provider, jobs, reason, tab, cause) {
   const state = job.states[provider];
   state.ownershipUnknownAt ??= Date.now();
   if (Date.now() - state.ownershipUnknownAt < FIX_OWNERSHIP_WAIT_MS) return saveJobs(jobs);
-  return preserveFixTab(job, provider, jobs, reason, tab);
+  return preserveFixTab(job, provider, jobs, reason, tab, cause);
 }
 
+/** A leg whose result nobody wants any more: the server cancelled (or superseded) its job, or
+ * forgot it. Durable: `abandoned` survives a later "missing" once a restarted harbor forgot the
+ * cancelled job. A leg delivered with no outcome and no durable archive was only ever settled that
+ * way (the shape 1.1.22 stored before this flag existed). */
+function abandonedLeg(job, state) {
+  return state.abandoned === true || job.serverStatus === "cancelled" ||
+    (state.delivered === true && !state.outcome && !sourceArchiveDurable(state));
+}
+
+/** Settle every leg of a job the server cancelled or forgot (`status`): nothing is delivered for it
+ * any more, and its tab is released by the same verdict as a secured one (forceCloseFixTab; a fix
+ * leg without a delivered answer is preserved and released, never closed). */
+function abandonLegs(job, providers, status) {
+  for (const provider of providers) {
+    const state = job.states[provider];
+    if (!state.delivered) { state.abandoned = true; state.abandonedAs = status; }
+    state.delivered = true;
+    state.cleanupPending = true;
+  }
+}
+
+/** abandonLegs for every leg of `job` (and, for the sweep, `closeRequested`: it confirmed the job is
+ * gone), saved, as one `abandon` operation in the tab queue: after the leg's poll that may be between
+ * its run message and saving `started` (W1), so the release that follows sees what it dispatched. */
+function abandonJobLegs(job, jobs, status, closeRequested = false) {
+  return tabOp("abandon", async () => {
+    if (jobs[job.jobId] !== job) return;
+    abandonLegs(job, job.providers, status);
+    if (closeRequested) for (const provider of job.providers) job.states[provider].closeRequested = true;
+    await saveJobs(jobs);
+  });
+}
+
+/** A tab Chrome discarded to save memory (or has not loaded since) holds no page: nothing in it can
+ * answer, and no follow-up, draft or edit is readable in it until it loads again (then its page
+ * renders what the provider kept, and gives the verdict). Its URL is still readable: on another
+ * page than the run's known one it is the user's, preserved at once. A tab not on its run's page
+ * (onRunPage: with no identity yet, the new chat it was opened on) is never reloaded. Otherwise, in the tab this browser
+ * session created for the leg, it is woken once (reloaded in the background, as activating it would;
+ * within the leg's DISCARD_WAKES_MAX, and never for a leg that failed as tab_discarded) so its page
+ * answers on a later tick within the same ownership wait; a tab that cannot be woken is preserved
+ * after the wait. A frozen tab is not this (it keeps its page): see forceCloseFixTab. */
+async function releaseDiscardedTab(job, provider, jobs, tab) {
+  const state = job.states[provider];
+  const known = state.conversation || answeredPage(state, provider);
+  if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", undefined, "navigated");
+  cleanupWaiting(job, provider, "tab_discarded");
+  // A leg that failed because its discarded tab could not resume its run (tab_discarded) is not
+  // reloaded by its own cleanup: a reload now could show an answer the provider finished meanwhile,
+  // and closing it would throw that answer away after its failure was delivered. Kept (unreachable).
+  if (onRunPage(state, provider, tab.url) && state.outcome?.code !== "tab_discarded") await wakeTabOnce(job, provider, jobs, tab, "wokeDiscardedTab");
+  return waitOrPreserveFixTab(job, provider, jobs, "the discarded tab could not answer; tab preserved", undefined, "unreachable");
+}
+
+/** Whether `url` is the leg's run's own page: the conversation it was bound in, else the page it last
+ * answered on, else (no identity yet) the new chat its tab was opened on. A discarded tab anywhere
+ * else is not the run's any more, whoever moved it: never woken. */
+function onRunPage(state, provider, url) {
+  const known = state.conversation || answeredPage(state, provider);
+  return known ? samePage(url, known) : onAllocationPage(url, provider);
+}
+
+/** How many times one leg's tab may be woken in all (DISCARD_WAKES_MAX): an active leg's wake is once
+ * per discard (a page that proved its run went on earns the next one, discardWaitOver), capped so a
+ * tab Chrome keeps discarding is never reloaded in a loop. */
+const DISCARD_WAKES_MAX = 3;
+
+/** Reload `tab` once per `marker` (durable: the active leg's clears it once its woken page resumed
+ * the run; the cleanup's is once per leg) and at most DISCARD_WAKES_MAX times per leg, only when this
+ * browser session created it for the leg (tabCreatedForLeg: a stored id without that record may name
+ * the user's tab, which is never reloaded). The reload wakes a discarded page in the background, as
+ * activating it would. True if it was reloaded now. */
+async function wakeTabOnce(job, provider, jobs, tab, marker) {
+  const state = job.states[provider];
+  if (state[marker] || (state.wakes || 0) >= DISCARD_WAKES_MAX || !await tabCreatedForLeg(job, provider, tab.id)) return false;
+  state[marker] = true;
+  state.wakes = (state.wakes || 0) + 1;
+  workerStep(job, provider, "tab_woken");
+  await saveJobs(jobs);
+  try { await chrome.tabs.reload(tab.id); } catch { /* still discarded: the caller's bounded wait applies */ }
+  return true;
+}
+
+/** How long an ACTIVE leg (not settled yet) waits for its discarded tab to hold a page again, from
+ * the first poll that found it discarded: the wake's reload, or the user bringing the tab back. */
+const DISCARDED_WAKE_WAIT_MS = 2 * 60_000;
+
+/** A tab Chrome discarded (or never loaded) while its leg is still active holds no page: no run can be
+ * dispatched into it and nothing can be harvested from it (Ashlar 4101062759: every poll returned
+ * there, and the leg held its capacity slot until something outside reloaded the tab). The tab this
+ * browser session created for the leg, on its run's own page, is woken once per discard (wakeTabOnce,
+ * at most DISCARD_WAKES_MAX times per leg): once it has loaded, the poll dispatches the run into it
+ * or, for a sent run, resumes observing it (the page's journal never sends a prompt twice). A FIX
+ * whose run was dispatched is never woken: its temporary chat is not restored by a reload (json.js:
+ * it renders nothing), so nothing there could resume. Any other one (not provably the leg's, on
+ * another page, already woken for this discard and still not loaded, or past the cap) is never
+ * reloaded. The discard's time limit (DISCARDED_WAKE_WAIT_MS, from the first poll that found it)
+ * holds until the loaded page proves its run goes on (discardedRunProven): past it the leg fails with
+ * `tab_discarded`, its failure is delivered and its tab is released by the cleanup rule, which frees
+ * its slot. */
+async function wakeOrFailDiscardedTab(job, provider, jobs, tab) {
+  const state = job.states[provider];
+  state.discardedAt ??= Date.now();
+  const asleep = tab.discarded === true || tab.status === "unloaded";
+  const restorable = !(job.kind === "fix" && state.started);
+  if (asleep && restorable && onRunPage(state, provider, tab.url) && await wakeTabOnce(job, provider, jobs, tab, "wokeActiveTab")) return;
+  if (!await discardWaitOver(job, provider, jobs)) await saveJobs(jobs);
+}
+
+/** Whether a page reply proves, after a discard, that the leg's run goes on in the page that loaded
+ * again: the run was dispatched into it now (a new run in a loaded page), the page settled a result
+ * (an answer, an archived source, a failure), or its collector identified the response bound to the
+ * run's sent turn there (`observing`). Loading is not that proof (Ashlar 4101062759, reopened): a
+ * reload keeps the submission journal but not the page, so a prompt that was entered but never sent
+ * (its composer text and file chips are gone) waits there forever without clicking, a run dispatched
+ * before its journal was written waits for a turn that never came, and a temporary chat renders
+ * nothing for a sent run's collector to observe. */
+function discardedRunProven(result, dispatched) {
+  if (dispatched || result?.observing === true) return true;
+  if (result?.ok === true) return true;
+  return typeof result?.code === "string" && !["busy", "idle", "disconnected", "job_mismatch"].includes(result.code);
+}
+
+/** The discard's time limit for an active leg whose tab was discarded (state.discardedAt): `proven`
+ * (discardedRunProven) ends it; past DISCARDED_WAKE_WAIT_MS without that proof the leg fails with
+ * `tab_discarded` (a prompt never clicked is never sent twice: the cleanup rule releases the tab and
+ * the slot). True if the leg failed now. */
+async function discardWaitOver(job, provider, jobs, proven = false) {
+  const state = job.states[provider];
+  if (!state.discardedAt) return false;
+  if (proven) {
+    // Its woken page resumed the run: a later discard is a new one, woken again (within the cap).
+    delete state.discardedAt;
+    delete state.wokeActiveTab;
+    await saveJobs(jobs);
+    return false;
+  }
+  if (Date.now() - state.discardedAt < DISCARDED_WAKE_WAIT_MS) return false;
+  delete state.discardedAt;
+  state.outcome = failure("tab_discarded", state.wokeActiveTab
+    ? "the chat tab was discarded; Ashlar woke it, but its reloaded page could not resume the run; no answer was collected"
+    : (state.wakes || 0) >= DISCARD_WAKES_MAX
+      ? `the chat tab was discarded again and was not woken (Ashlar already woke it ${state.wakes} times); no answer was collected`
+      : "the chat tab was discarded and could not be woken; no answer was collected");
+  await saveJobs(jobs);
+  return true;
+}
+
+/** The ownership verdict in a page reply: a verdict reply (ownership) as is; a cancel reply of an
+ * earlier page by its `owned`; an older page's review can-close by canClose / reason. A fix page
+ * always states its verdict: a fix can-close without one is not permission to close. */
+function tabVerdict(result, kind) {
+  if (typeof result?.ownership === "string") return result;
+  if (typeof result?.owned === "boolean") return {...result, ownership: result.owned ? "owned" : "takenOver"};
+  if (result?.canClose === true && kind !== "fix") return {...result, ownership: "owned", legacyReply: true};
+  return {...result, ownership: result?.reason === "repurposed" ? "takenOver" : "unknown"};
+}
+
+/** The one release exit for a settled leg's tab (#82): a review leg whose result is secured asks
+ * "ashlar-can-close"; an abandoned review leg (abandonedLeg: cancelled or forgotten, whatever it
+ * collected) asks "ashlar-fix-cancel", which also stops its run, even while it is still generating.
+ * Both get the page's ownership verdict (json.js tabOwnership): the tab is closed unless the user
+ * positively took it over (then preserved and released), and preserved after FIX_OWNERSHIP_WAIT_MS
+ * when ownership cannot be proven: never held forever, never closed on a guess. A tab that carries
+ * another binding is never closed nor told to release.
+ *
+ * A FIX tab is closed ONLY on the proven-success path (#77): its answer was delivered (the worker
+ * recorded the server's complete ACK: fixAnswerDelivered, never server status) AND the same verdict
+ * (can-close) owns the tab in the conversation the worker stored. Every other end of a fix leg
+ * (cancelled, superseded, deadline, forgotten, failure, taken_over, a rejected answer, an answer
+ * whose delivery was never acknowledged, a run never dispatched) is preserved at once: the page is
+ * told to stop its run and release its managed slot (the message names this leg's run only, so a
+ * page bound to another refuses it), the preserved-run record keeps capacity right, and the job
+ * retires. No page verdict can authorise that close, so nothing is waited for. */
+async function forceCloseFixTab(job, provider, jobs, tab) {
+  const state = job.states[provider];
+  // A new run its tab stopped being fresh for before the send (takenBeforeSend): nothing was sent,
+  // and the page (the user's now) holds no binding of it (it fenced the run itself when it refused
+  // it). Kept at once, never messaged, and its slot released now. A fix keeps its #77 cause.
+  if (state.started !== true && state.outcome?.code === "taken_over") {
+    return preserveFixTab(job, provider, jobs, "the tab was taken over before the prompt was sent; tab preserved", undefined,
+      job.kind === "fix" ? "undelivered" : ["user_turn", "draft"].includes(state.outcome.cause) ? state.outcome.cause : "navigated");
+  }
+  if (job.kind === "fix" && !fixAnswerDelivered(state)) {
+    const why = state.outcome?.ok === false ? state.outcome.code || "failure" : state.outcome?.ok ? "answer delivery unconfirmed"
+      : state.abandonedAs || job.serverStatus || "no answer";
+    // Only a page that can run the handler now is told (a loading, discarded or frozen one cannot
+    // answer; the preserved-run record covers it until the inventory reaches it), and only a tab that
+    // is the leg's: an undispatched leg's stored id names its tab only when this browser session
+    // created it (#82, tabCreatedForLeg); otherwise it may be the user's tab, never messaged.
+    const loaded = (!tab.status || tab.status === "complete") && tab.discarded !== true && tab.frozen !== true;
+    // That tab holds an unbound page, which refuses a release naming the run: `undispatched` has it
+    // fence the run instead, so a late run message for it (a dispatch askPage gave up on) stays
+    // stopped (#82). It states a fact about the run, never a claim on the tab: no fix page vouches
+    // for an unbound tab, and the tab is kept (#77).
+    const undispatched = loaded && state.started !== true && await tabCreatedForLeg(job, provider, tab.id);
+    return preserveFixTab(job, provider, jobs, `fix ended without a delivered answer (${why}); tab preserved`,
+      loaded && (state.started === true || undispatched) ? tab : undefined, "undelivered", undispatched ? {undispatched: true} : undefined);
+  }
+  // Whether the tab may close never follows the server status (#77, Ashlar 4097631101): both review
+  // exits get the same verdict, and it compares nothing about the answer (#82: ChatGPT keeps
+  // redrawing a finished one), so a collected answer the server then cancels or forgets is released
+  // exactly as a secured one. The exit decides only whether the page's run is stopped too, and the
+  // cleanup note. A fix reaching this point had its answer delivered: it asks can-close even if the
+  // server settled or forgot the item since (its run already ended with the answer it collected,
+  // and a fix page's cancel reply carries no verdict).
+  const cancelled = job.kind !== "fix" && abandonedLeg(job, state);
+  if (tab.discarded === true || tab.status === "unloaded") return releaseDiscardedTab(job, provider, jobs, tab);
+  if (tab.status && tab.status !== "complete") {
+    // A loading tab cannot answer for itself yet: asked again next tick.
+    cleanupWaiting(job, provider, "tab_loading");
+    return waitOrPreserveFixTab(job, provider, jobs, "the tab never finished loading; tab preserved", undefined, "unreachable");
+  }
+  if (tab.frozen === true) {
+    // A frozen tab (Chrome's energy saver) runs no handler until the user brings it back: a message
+    // would only wait. It keeps its page (a draft included), so it is never reloaded to ask either.
+    cleanupWaiting(job, provider, "tab_frozen");
+    return waitOrPreserveFixTab(job, provider, jobs, "the tab was frozen and could not answer; tab preserved", undefined, "unreachable");
+  }
+  // A tab opened for a run that was never sent is unbound by design: the page then answers for an
+  // unbound tab (Ashlar's only while it holds no turn and no draft), and only in the tab this browser
+  // session created for the leg. Without that record the stored id may name the user's own tab: it
+  // is asked like any tab (only a page bound to this run can answer), never claimed as Ashlar's.
+  const undispatched = cancelled && !state.started && await tabCreatedForLeg(job, provider, tab.id);
+  if (!undispatched) {
+    // The tab's own URL first: the conversation the run was bound in, else the page where this run
+    // last answered (answeredPage).
+    const known = state.conversation || answeredPage(state, provider);
+    if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
+  }
+  // `secured`: this run's answer was completed and taken (collected, or its full source archived):
+  // a page that no longer remembers that (reloaded, for one by this cleanup's own wake, or re-injected
+  // after an update) still reads a generation on it as the user's (json.js regeneratedAfterCompletion).
+  const secured = state.outcome?.ok === true || sourceArchiveDurable(state);
+  const message = {...tabMessage(job, provider, cancelled ? "ashlar-fix-cancel" : "ashlar-can-close"),
+    allocationUrl: providerUrl(provider), ...(undispatched ? {undispatched: true} : {}), ...(secured ? {secured: true} : {})};
+  let result;
+  try { result = await askPage(tab.id, message, contentFiles(provider)); } catch {
+    // No receiver and reinjection failed, or no answer in time (askPage): ownership is unknown and
+    // the page cannot be messaged.
+    cleanupWaiting(job, provider, "page_unreachable");
+    return waitOrPreserveFixTab(job, provider, jobs, "the tab could not be reached; tab preserved", undefined, "unreachable");
+  }
+  const unbound = undispatched && result?.ok === true && !result.jobId && !result.runId && result.provider === provider;
+  if (!(matchesJob(result, job, provider) || unbound)) {
+    // The tab now carries another binding (or none it can prove): never closed. Past the ownership
+    // wait the leg retires and the tab is left to whoever holds it (never messaged, its binding and
+    // records untouched).
+    state.cleanupError = "tab ownership does not match; no tab was closed";
+    cleanupWaiting(job, provider, "ownership_mismatch");
+    return waitOrPreserveFixTab(job, provider, jobs, "the tab carries another binding; tab preserved", undefined, "other_binding");
+  }
+  // The page's own steps (context_changed, cancelled, ...) reach history from cleanup replies too.
+  ingestPageProgress(state, result);
+  // The page freed its slot: the review leg stalled (#87) under a Stop that never clears, so no close
+  // is ever proven. Kept and retired at once, like a takeover.
+  if (result.reason === "stalled") return preserveFixTab(job, provider, jobs, "review stalled under a stuck Stop; tab preserved", tab, "stalled");
+  const verdict = tabVerdict(result, job.kind);
+  if (verdict.ownership === "unknown") {
+    // Another conversation than the one the run was bound in (an in-page move can leave the old DOM
+    // on screen): the user's, and waiting cannot change a recorded identity.
+    if (verdict.identity === "changed") return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
+    // The page never recorded the conversation its send was made in (a fix journal from before that
+    // rule, or a send confirmed only after a reload): it is recorded only when the send is proven,
+    // so waiting cannot establish it. Never closed; preserved now. (Only a fix page reports this: a
+    // review without a pinned conversation answers `unpinned`, see json.js tabOwnership.)
+    if (verdict.identity === "unestablished") return preserveFixTab(job, provider, jobs, "the conversation was never identified at send; tab preserved", tab, "ownership_unknown");
+    // Not provable yet (a reload still rendering, an unreadable journal): ask again next tick; past
+    // the wait, preserve it (never close what might be the user's) and have the page free its slot.
+    cleanupWaiting(job, provider, "ownership_unknown");
+    return waitOrPreserveFixTab(job, provider, jobs, "tab ownership could not be established; tab preserved", tab, "ownership_unknown");
+  }
+  if (verdict.ownership !== "owned") return preserveFixTab(job, provider, jobs, "the user took over the tab; tab preserved", tab, verdict.cause);
+  delete state.cleanupWaitReason;
+  const closed = cancelled ? "no result wanted; tab closed" : "result secured; tab closed";
+  // A verdict resting on a page with no bound turn (blank, or the just-clicked prompt before the
+  // send was confirmed) proves content, not which page this is: Ashlar's only while the tab is
+  // still on the page it was opened on (an empty conversation the user moved to is the user's).
+  if (unbound || verdict.blank === true || verdict.unsent === true) {
+    if (!onAllocationPage(result.url, provider)) return preserveFixTab(job, provider, jobs, "the unsent tab moved to another page; tab preserved", tab, "navigated");
+    // An unbound page's answer proves nothing about the tab: the record is checked again at the close.
+    if (unbound && !await tabCreatedForLeg(job, provider, tab.id)) {
+      cleanupWaiting(job, provider, "ownership_mismatch");
+      return waitOrPreserveFixTab(job, provider, jobs, "the tab carries another binding; tab preserved", undefined, "other_binding");
+    }
+    await closeProvenTab(job, provider, jobs, tab.id, url => onAllocationPage(url, provider), closed);
+    return;
+  }
+  // A review with no pinned conversation (json.js newChatPin pins only a provider move its page saw
+  // happen in flight): Ashlar's only while its tab is still on the new chat it was opened on. A page
+  // it left has no trustworthy identity, whoever moved it (the page the run last answered on can be
+  // the user's own conversation, Ashlar 4101062732): kept, never closed.
+  if (verdict.unpinned === true) {
+    const holds = url => onAllocationPage(url, provider) && (!state.conversation || samePage(url, state.conversation));
+    if (!holds(result.url)) return preserveFixTab(job, provider, jobs, "the unpinned tab left its new chat; tab preserved", tab, "navigated");
+    await closeProvenTab(job, provider, jobs, tab.id, holds, closed);
+    return;
+  }
+  // A run observed without a journal (a legacy page, or an older page's can-close): the identity the
+  // worker observed itself, the page where the run last answered, else the URL it last saw.
+  if (verdict.legacy === true || verdict.legacyReply === true) {
+    const identity = state.conversation || answeredPage(state, provider) || state.pageUrl;
+    const holds = identity ? url => samePage(url, identity) : verdict.legacyReply ? url => url === result.url : url => onAllocationPage(url, provider);
+    if (!holds(result.url)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
+    await closeProvenTab(job, provider, jobs, tab.id, holds, closed);
+    return;
+  }
+  // A verdict resting on the bound turn holds only in the conversation that turn was bound in: the
+  // identity the worker stored (adopted once from the page's journal), never the URL echoed here.
+  if (adoptFixConversation(state, result)) await saveJobs(jobs);
+  const bound = state.conversation;
+  if (!bound || !result.conversation) {
+    state.cleanupError = "the conversation identity is not established; no tab was closed";
+    cleanupWaiting(job, provider, "conversation_unestablished");
+    return waitOrPreserveFixTab(job, provider, jobs, "the conversation identity was never established; tab preserved", tab, "ownership_unknown");
+  }
+  if (!samePage(result.conversation, bound) || !samePage(result.url, bound)) {
+    return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
+  }
+  await closeProvenTab(job, provider, jobs, tab.id, url => samePage(url, bound), closed);
+}
+
+/** Add the job's legs to the recent-retired ring (RECENT_RETIRED_KEY). Diagnostics only, so best
+ * effort: a failed read or write loses the entry, never the retirement it describes (the job is
+ * still deleted from the registry and its capacity released). */
+async function rememberRetired(job) {
+  try {
+    const ring = (await chrome.storage.local.get([RECENT_RETIRED_KEY]))[RECENT_RETIRED_KEY];
+    const retired = job.providers.map(provider => {
+      const state = job.states[provider];
+      return {origin: job.origin, jobId: job.jobId, kind: job.kind === "fix" ? "fix" : "review", provider, tabId: state.tabId,
+        stage: state.workerEvents?.at(-1)?.stage || "", cause: state.preserveCause, note: state.cleanupNote, at: Date.now()};
+    });
+    await chrome.storage.local.set({[RECENT_RETIRED_KEY]: [...(Array.isArray(ring) ? ring : []), ...retired].slice(-16)});
+  } catch { /* the diagnostic entry is lost; the retirement goes on */ }
+}
+
+function retirable(job) {
+  return job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone);
+}
 async function retireCleanJob(job, jobs, forgotten = false, signal) {
-  if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
+  if (!retirable(job)) return false;
   // Final trace uploading terminal events (result_saved, tab_closed) to review history. Detach it ONLY
   // for a job the caller FRESHLY confirmed the server has forgotten (missing/unknown): recordBridgeProgress
   // can't find the evicted job so the upload is rejected, and the bridge fetch is unbounded — awaiting it
@@ -1052,23 +1710,29 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
   // the session/local deletions below are NOT signal-abortable, so run them here and they would overlap
   // the next alarm's sweep. Recheck the signal and bail before deleting under a newer sweep's ownership.
   if (signal?.aborted) return false;
-  await writeInOrder(async () => {
-    const old = await chrome.storage.session.get(["tabs"]);
-    const tabs = {...old.tabs};
-    for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
-    await chrome.storage.session.set({tabs});
-    await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
+  // The retirement itself is one `retire` operation in the tab queue: after every operation of the
+  // job queued before it, and only while the job is still registered and retirable, so the job lane
+  // and the sweep never both retire it (W5).
+  return tabOp("retire", async () => {
+    if (jobs[job.jobId] !== job || !retirable(job)) return false;
+    await writeInOrder(async () => {
+      const old = await chrome.storage.session.get(["tabs"]);
+      const tabs = {...old.tabs};
+      for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
+      await chrome.storage.session.set({tabs});
+      await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
+      await rememberRetired(job);
+    });
+    // writeInOrder above is itself an unabortable storage sequence that can outlive the sweep watchdog.
+    // Recheck before the registry delete/persist. (delete + saveJobs is sync-then-await, so no abort
+    // can interleave between them once we pass this fence.)
+    if (signal?.aborted) return false;
+    delete jobs[job.jobId];
+    await saveJobs(jobs);
+    // Its item is settled on the server: no replay of its delivery can come any more.
+    await forgetFixDelivery(job).catch(() => {});
+    return true;
   });
-  // writeInOrder above is itself an unabortable storage sequence that can outlive the sweep watchdog.
-  // Recheck before the registry delete/persist so an abandoned sweep can't delete jobs[jobId] and rewrite
-  // pendingReviewJobs concurrently with the next alarm's sweep. (delete + saveJobs is sync-then-await, so
-  // no abort can interleave between them once we pass this fence.)
-  if (signal?.aborted) return false;
-  delete jobs[job.jobId];
-  await saveJobs(jobs);
-  // Its item is settled on the server: no replay of its delivery can come any more.
-  await forgetFixDelivery(job).catch(() => {});
-  return true;
 }
 
 function connectionErrors(job) {
@@ -1102,9 +1766,75 @@ async function refreshJobHeartbeat(job, jobs, signal) {
   return true;
 }
 
-async function pollProvider(job, provider, jobs, observeOnly = false) {
+/** What the leg's stored tab holds when this browser session has no record of creating it
+ * (tabCreatedForLeg): "run" when its page is bound to this leg's run, "none" when the tab is gone or
+ * its page proves it is not (another page, another job or run, or no binding), "unknown" when it
+ * cannot say now (discarded, loading, frozen, unreachable, an older page). Only the read-only status
+ * message is sent: it never binds a page or starts a run, and a tab that may be the user's is never
+ * woken or reloaded to ask. */
+async function unrecordedTabHolds(job, provider, tabId) {
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); } catch { return "none"; }
+  if (!allowedTab(tab, provider)) return "none";
+  if (tab.discarded === true || tab.status === "unloaded" || (tab.status && tab.status !== "complete") || tab.frozen === true) return "unknown";
+  let page;
+  try { page = await askPage(tabId, {type: "ashlar-tab-status"}, contentFiles(provider)); } catch { return "unknown"; }
+  if (page?.ownershipProtocol !== 1 || typeof page.jobId !== "string" || typeof page.runId !== "string") return "unknown";
+  const runId = job.states[provider].runId;
+  return page.jobId === job.jobId && page.provider === provider && (page.runId === runId || !page.runId) ? "run" : "none";
+}
+
+/** How long a leg waits for its unrecorded stored tab to say whether it holds the leg's run. */
+const UNRECORDED_TAB_WAIT_MS = 2 * 60_000;
+
+/** The leg's unrecorded stored tab cannot say whether it holds the run (unrecordedTabHolds): no second
+ * tab is opened meanwhile, since the prompt may already be in that page. Past UNRECORDED_TAB_WAIT_MS
+ * the leg fails (`tab_unreachable`), never sending the prompt again: its failure is delivered and the
+ * cleanup rule releases the tab (never closed unproven), which frees the slot. */
+async function unrecordedTabWait(job, provider, jobs) {
+  const state = job.states[provider];
+  state.unrecordedTabSince ??= Date.now();
+  if (Date.now() - state.unrecordedTabSince < UNRECORDED_TAB_WAIT_MS) {
+    state.connectionError = "the stored chat tab cannot say yet whether it holds this run; no second tab is opened";
+    workerStep(job, provider, "disconnected");
+    await saveJobs(jobs);
+    return;
+  }
+  delete state.unrecordedTabSince;
+  state.outcome = failure("tab_unreachable", "the chat tab could not be asked whether it already holds this run; the prompt was not sent again");
+  await saveJobs(jobs);
+}
+
+/** Why a page refused a new run message (json.js, before it binds anything): "taken_over" (its tab
+ * is not the fresh page the run may start on), "stale_run" (it arrived after its `until`); "" when
+ * it did not refuse. A refusal comes from an unbound page, so it never names this run. */
+function refusedRun(result, job, provider) {
+  return !matchesJob(result, job, provider) && result?.ok === false && ["taken_over", "stale_run"].includes(result.code) ? result.code : "";
+}
+
+/** A new run whose tab stopped being the fresh page it was opened on before its prompt was sent (X2,
+ * #85): the worker saw the tab off its new chat, or the page refused the run (`cause`: "navigated",
+ * "user_turn" for a user message there, or "draft" for the user's unsent text or file). Nothing was sent. The leg fails `taken_over`, and its
+ * release keeps the tab without asking it (forceCloseFixTab). */
+async function takenBeforeSend(job, provider, jobs, cause) {
+  const state = job.states[provider];
+  const known = cause === "user_turn" || cause === "draft" ? cause : "navigated";
+  const what = {user_turn: "a user message appeared in the tab", draft: "a user draft appeared in the tab", navigated: "the tab left its new chat"}[known];
+  state.outcome = {...failure("taken_over", `${what} before the prompt was sent; nothing was sent`), cause: known};
+  workerStep(job, provider, "taken_before_send");
+  await saveJobs(jobs);
+}
+
+/** A leg's poll, one operation in the tab queue (allocation, dispatch, harvest and their records). */
+function pollProvider(job, provider, jobs, observeOnly = false) {
+  return tabOp("poll", () => pollProviderBody(job, provider, jobs, observeOnly));
+}
+async function pollProviderBody(job, provider, jobs, observeOnly) {
+  // Nothing for a job that retired (or was reset) while this operation waited in the queue.
+  if (jobs[job.jobId] !== job) return;
   const state = job.states[provider];
   if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
+  await applyPendingReplace(state);
   if (!state.runId) state.runId = crypto.randomUUID();
   // Memory is not a receipt: a previous write may have failed while leaving the
   // shared object mutated. Retry persistence before ANY tab can adopt this runId
@@ -1114,8 +1844,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     // Creation may have succeeded before a worker restart. Recover a recorded owner;
     // if none can be established, keep the intent instead of opening another tab.
     const session = await chrome.storage.session.get(null);
+    // (A record Chrome replaced the tab of names the old id: its copy names the tab's current one.)
     const owner = Object.entries(session).find(([key, value]) => key.startsWith(OWNED_PREFIX) &&
-      value?.jobId === job.jobId && value.provider === provider && value.runId === state.runId);
+      value?.jobId === job.jobId && value.provider === provider && value.runId === state.runId && value.replacedBy === undefined);
     if (owner) state.tabId = Number(owner[0].slice(OWNED_PREFIX.length));
     else {
       const original = await findOriginalTab(job, provider);
@@ -1170,6 +1901,31 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await saveJobs(jobs);
     return;
   }
+  // A replace the session recorded before the worker stopped names the leg's live tab (Ashlar 4101623043).
+  if (state.tabId && await followDurableReplace(job, provider)) await saveJobs(jobs);
+  if (!state.started && !observeOnly && !await tabCreatedForLeg(job, provider, state.tabId)) {
+    // The prompt goes only into the tab this browser session created for the leg: a stored id from
+    // before a browser restart (or an extension reload) can name the user's own tab, never sent a run.
+    // But an extension reload also loses the record of the leg's own tab, whose page a run message
+    // askPage gave up on may have bound, and sent the prompt in, after all (Ashlar 4101623037): that
+    // page is asked for its binding first (read-only), and the id is dropped only on proof.
+    const holds = await unrecordedTabHolds(job, provider, state.tabId);
+    if (holds === "run") {
+      // This run's page: adopted and observed, never sent again (the page's journal resumes it).
+      state.started = true;
+      delete state.unrecordedTabSince;
+      await saveJobs(jobs);
+    } else if (holds === "unknown") {
+      return unrecordedTabWait(job, provider, jobs);
+    } else {
+      // Gone, or its page proves it holds no run of this leg: the leg opens its own tab.
+      delete state.tabId;
+      delete state.unrecordedTabSince;
+      delete state.connectionError;
+      await saveJobs(jobs);
+      return;
+    }
+  }
   let tab;
   try { tab = await chrome.tabs.get(state.tabId); }
   catch {
@@ -1177,31 +1933,64 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     if (!tab) { state.connectionError = "tab connection unknown; waiting for reconnection"; await saveJobs(jobs); return; }
     state.tabId = tab.id; state.started = true; await saveJobs(jobs);
   }
+  // A discarded tab holds no page (and a woken one that never finishes loading still holds none):
+  // woken once per discard or, past a bounded wait, the leg fails (wakeOrFailDiscardedTab), never
+  // polled forever.
+  if (tab.discarded === true || tab.status === "unloaded" || (state.discardedAt && tab.status && tab.status !== "complete")) {
+    return wakeOrFailDiscardedTab(job, provider, jobs, tab);
+  }
   if (tab.status && tab.status !== "complete") return;
+  // A page loaded again after a discard is not yet proof that the run goes on: the time limit holds
+  // until a reply proves it (discardedRunProven, below).
   if (!allowedTab(tab, provider)) {
     state.outcome = failure("context_lost", "review tab navigated away");
     await saveJobs(jobs);
     return;
   }
-  const run = { ...tabMessage(job, provider, "ashlar-run"),
+  // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws: a message
+  // would only wait out askPage. Polled again next tick.
+  if (tab.frozen === true) return;
+  // A new ChatGPT prompt goes only into the new chat its tab was opened on (X2, #85): the tab is
+  // active, so the user may have opened one of their own conversations in it before this dispatch.
+  // Nothing is sent there (the page checks again: json.js freshPageLeft). Unless its page is already
+  // bound to this run: it accepted a run message whose `started` the worker never saved (it stopped
+  // right after the acknowledgement), and ChatGPT moved the chat to its conversation after the send.
+  // That run is adopted and observed, never failed as unsent nor sent again; only the read-only
+  // status message asks (unrecordedTabHolds).
+  if (!state.started && !observeOnly && provider === "chatgpt" && (tab.pendingUrl || !onAllocationPage(tab.url, provider))) {
+    if (tab.pendingUrl || await unrecordedTabHolds(job, provider, tab.id) !== "run") return takenBeforeSend(job, provider, jobs, "navigated");
+    state.started = true;
+    await saveJobs(jobs);
+  }
+  // `allocationUrl`: the page a new run may start on (json.js checks it before it binds).
+  const run = { ...tabMessage(job, provider, "ashlar-run"), allocationUrl: providerUrl(provider),
     prompt: job.prompts?.[provider] || job.prompt, reasoning: job.reasoning?.[provider], adoptLegacy: state.adoptLegacy };
-  let result;
+  let result, dispatched = false;
   try {
     if (!state.started && !observeOnly) {
-      // The page runner deduplicates a retried start when its acknowledgement was lost.
-      result = await sendToTab(state.tabId, run, contentFiles(provider));
-      state.started = true;
-      workerStep(job,provider,"run_dispatched");
-      await saveJobs(jobs);
+      // The page runner deduplicates a retried start when its acknowledgement was lost (or late:
+      // askPage gives up on it, and the next tick asks again). A copy that reaches an unbound page
+      // after `until`, computed from the reply window this send has, starts nothing there (X4, #85):
+      // a page starts a run only while the worker that sent it still waits for the reply.
+      const replyWindow = pageWindow();
+      if (replyWindow < MIN_DISPATCH_WINDOW_MS) return;
+      result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS}, contentFiles(provider));
+      // A page that refused the new run bound nothing: the run was never started.
+      if (!refusedRun(result, job, provider)) {
+        dispatched = true;
+        state.started = true;
+        workerStep(job,provider,"run_dispatched");
+        await saveJobs(jobs);
+      }
     } else {
-      result = await sendToTab(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
+      result = await askPage(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
       if (result?.code === "idle" && (!observeOnly || matchesJob(result, job, provider))) {
         // A reloaded bound page has no in-memory collector. Missing server work
         // may resume observation, never adopt a page or submit another prompt.
         const resume = observeOnly
           ? { ...tabMessage(job, provider, "ashlar-run"), resume: true }
           : { ...run, resume: true };
-        result = await sendToTab(state.tabId, resume, contentFiles(provider));
+        result = await askPage(state.tabId, resume, contentFiles(provider));
       }
     }
   } catch (e) {
@@ -1210,8 +1999,15 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     workerStep(job,provider,"disconnected");
     await saveJobs(jobs);
     await chrome.storage.local.set({ lastError: state.connectionError });
+    await discardWaitOver(job, provider, jobs); // a woken page that never answers is bounded too
     return;
   }
+  const refused = state.started ? "" : refusedRun(result, job, provider);
+  if (refused === "taken_over") return takenBeforeSend(job, provider, jobs, result.cause);
+  // The page received the run after its deadline and started nothing: dispatched again next tick,
+  // into the same tab, with a new deadline.
+  if (refused === "stale_run") return;
+  if (await discardWaitOver(job, provider, jobs, matchesJob(result, job, provider) && discardedRunProven(result, dispatched))) return;
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
     state.connectionError = "original job binding unavailable; waiting for reconnection";
     const original = await findOriginalTab(job, provider);
@@ -1219,13 +2015,7 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     await saveJobs(jobs);
     return;
   }
-  if(result.progress?.runId===state.runId && Array.isArray(result.progress.events)) {
-    // Treat this as untrusted input again at the server; only primitive metadata is sent.
-    state.pageEvents=result.progress.events.slice(-128).filter(e=>e && e.source==="page" &&
-      Number.isSafeInteger(e.sequence) && typeof e.stage==="string" && e.stage.length<80 && Number.isFinite(e.at))
-      .map(e=>({source:"page",sequence:e.sequence,stage:e.stage,at:e.at}));
-    await saveJobs(jobs);
-  }
+  if (ingestPageProgress(state, result)) await saveJobs(jobs);
   if (result.observation && typeof result.observation === "object") {
     const item = result.observation;
     const text = typeof item.text === "string" ? item.text.slice(0, 128_000) : "";
@@ -1234,8 +2024,12 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
       truncated: Boolean(item.truncated)};
     await saveJobs(jobs);
   }
-  // A fix page reports the conversation its run was bound in: kept once, never replaced.
-  if (job.kind === "fix" && adoptFixConversation(state, result)) await saveJobs(jobs);
+  // The page reports the conversation its run was bound in: kept once, never replaced. The tab URL
+  // where this run's page last answered is the release identity of a run that never pinned one.
+  const adopted = adoptFixConversation(state, result);
+  const answeredAt = typeof tab.url === "string" && tab.url.length <= 4096 && tab.url !== state.pageUrl ? tab.url : "";
+  if (answeredAt) state.pageUrl = answeredAt;
+  if (adopted || answeredAt) await saveJobs(jobs);
   await rememberOwnedTab(job, provider);
   delete state.connectionError;
   if (isBusyResult(result)) return;
@@ -1287,7 +2081,7 @@ async function deliverOutcome(job, provider, jobs, signal) {
     throw e;
   }
   state.delivered = true;
-  // A fix tab may close only after its answer was acknowledged (cleanupFixTab): this local record,
+  // A fix tab may close only after its answer was acknowledged (forceCloseFixTab): this local record,
   // never server status, is that proof.
   if (job.kind === "fix" && out.ok) state.answerDelivered = true;
   delete state.formatError;
@@ -1304,6 +2098,12 @@ async function deliverOutcome(job, provider, jobs, signal) {
 function repairBody(job, provider, action, attempt) {
   return {action, jobId:job.jobId, leaseId:job.leaseId, provider, runId:job.states[provider].runId,
     repairId:attempt.id, responseId:attempt.responseId, sourceHash:attempt.sourceHash};
+}
+/** A durable capture as the local registry holds it (its text: the exact local copy, if kept). */
+function localArchivedSource(state) {
+  const saved=state.sourceCapture;
+  return {text:saved.text,totalChars:saved.totalChars,truncated:false,completed:true,stable:true,
+    responseId:saved.responseId,sourceHash:saved.sourceHash,captureId:saved.id,context:saved.context};
 }
 async function readRepairSource(job, provider, full = true) {
   const state=job.states[provider];
@@ -1333,11 +2133,16 @@ async function readRepairSource(job, provider, full = true) {
       }
       if(typeof text!=="string")return null;
     }
-    return {text,totalChars:saved.totalChars,truncated:false,completed:true,stable:true,
-      responseId:saved.responseId,sourceHash:saved.sourceHash,captureId:saved.id,context:saved.context};
+    return {...localArchivedSource(state),text};
   }
+  return tabOp("sourceRead",()=>readPageSource(job,provider));
+}
+/** The page's completed source for the leg's run (read-only), one operation in the tab queue. */
+async function readPageSource(job, provider) {
+  const state=job.states[provider];
+  await applyPendingReplace(state);
   if(!state.tabId)return null;
-  const result=await sendToTab(state.tabId,tabMessage(job,provider,"ashlar-repair-source"),contentFiles(provider));
+  const result=await askPage(state.tabId,tabMessage(job,provider,"ashlar-repair-source"),contentFiles(provider));
   const source=result?.source;
   if(!matchesJob(result,job,provider) || !result.ok || !source || typeof source.text!=="string" ||
      !source.text.trim() || source.text.length>500_000 || source.text.length!==source.totalChars ||
@@ -1351,10 +2156,9 @@ async function readRepairSource(job, provider, full = true) {
  * Capturing releases a browser resource; it never marks delivered or posts JSON.
  */
 async function captureProvider(job, provider, jobs) {
-  const state=job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`;
+  const state=job.states[provider];
   if(state.delivered || state.cleanupDone || sourceCleanupProofConfirmed(state) || job.captureProtocol!==1)return;
-  let saved=state.sourceCapture;
-  if(!saved?.id) {
+  if(!state.sourceCapture?.id) {
     if(!state.formatError && state.observation?.state!=="response_completed_json_invalid")return;
     const source=await readRepairSource(job,provider);
     if(!source || typeof source.context!=="string")return;
@@ -1365,10 +2169,20 @@ async function captureProvider(job, provider, jobs) {
     const receipt=response.capture;
     if(!receipt?.id || receipt.jobId!==job.jobId || receipt.provider!==provider || receipt.runId!==state.runId ||
         receipt.responseId!==source.responseId || receipt.sourceHash!==source.sourceHash || receipt.totalChars!==source.text.length)return;
-    saved={...source,...receipt,archiveDurable:false,cleanupProofConfirmed:false};
-    state.sourceCapture=saved;
+    state.sourceCapture={...source,...receipt,archiveDurable:false,cleanupProofConfirmed:false};
     workerStep(job,provider,"source_archive_saved");
   }
+  // The receipt's commit (its durable writes and the page's acknowledgement) is one operation in the
+  // tab queue; the release it enables runs after it.
+  if(await tabOp("captureCommit",()=>commitCapture(job,provider,jobs)))await cleanupProvider(job,provider,jobs);
+}
+/** Commit the capture receipt the bridge just returned (state.sourceCapture), inside the tab queue:
+ * persist it, mark it durable, and hand it to the page. True when the leg's tab may be released now. */
+async function commitCapture(job, provider, jobs) {
+  if(jobs[job.jobId]!==job)return false;
+  const state=job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`, saved=state.sourceCapture;
+  if(!saved?.id)return false;
+  await applyPendingReplace(state);
   // Server archive success and local receipt persistence are the durability
   // barrier for repair. Page revalidation is only cleanup authorization.
   if(!sourceArchiveDurable(state)) {
@@ -1391,52 +2205,63 @@ async function captureProvider(job, provider, jobs) {
   } else {
     await saveJobs(jobs);
   }
-  if(state.delivered || (state.outcome?.ok && !state.formatError) || state.cleanupDone)return;
-  if(!state.tabId) return finishTabCleanup(job,provider,jobs,"archived source durable; original tab absent");
+  if(state.delivered || (state.outcome?.ok && !state.formatError) || state.cleanupDone)return false;
+  if(!state.tabId) { await finishTabCleanup(job,provider,jobs,"archived source durable; original tab absent"); return false; }
   let result;
   try {
-    result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
+    result=await askPage(state.tabId,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
       captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
   } catch {
-    return; // Repair can proceed from archive; cleanup retries independently.
+    return false; // Repair can proceed from archive; cleanup retries independently.
   }
-  if(!matchesJob(result,job,provider))return;
+  if(!matchesJob(result,job,provider))return false;
+  ingestPageProgress(state,result);
   if(result.code==="capture_source_changed") {
+    // The original is durably archived (secured); a changed page is not the user's by itself.
     state.cleanupPending=true;
     delete state.captureError;
     await saveJobs(jobs);
-    return preserveAnsweredTab(job,provider,jobs,"archived response unavailable or changed; tab preserved");
+    return true;
   }
-  if(!result.accepted)return;
+  if(!result.accepted)return false;
   saved.cleanupProofConfirmed=true;
   saved.confirmed=true; // Backward-compatible alias for pre-split persisted states.
   state.cleanupPending=true;
   delete state.captureError;
   await saveJobs(jobs);
-  await cleanupProvider(job,provider,jobs);
+  return true;
 }
+/** Hand the accepted repair to the page (one operation in the tab queue), then release the tab. */
 async function notifyRepairReceipt(job, provider, jobs) {
+  if(await tabOp("repairReceipt",()=>commitRepairReceipt(job,provider,jobs)))await cleanupProvider(job,provider,jobs);
+}
+/** True when the leg's tab may be released now. */
+async function commitRepairReceipt(job, provider, jobs) {
+  if(jobs[job.jobId]!==job)return false;
   const state=job.states[provider], attempt=state.repairAttempt;
-  if(!state.repairReceiptPending || !attempt?.raw || !attempt.text)return;
+  if(!state.repairReceiptPending || !attempt?.raw || !attempt.text)return false;
+  await applyPendingReplace(state);
   // A prior outbox write may have failed after mutating the shared registry.
   // Re-establish durability on EVERY receipt retry, before notifying the page.
   await saveJobs(jobs);
-  const result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-repair-accepted"),
+  const result=await askPage(state.tabId,{...tabMessage(job,provider,"ashlar-repair-accepted"),
     committed:true,repairId:attempt.id,responseId:attempt.responseId,text:attempt.text,raw:attempt.raw},contentFiles(provider));
-  if(!matchesJob(result,job,provider))return;
+  if(!matchesJob(result,job,provider))return false;
+  ingestPageProgress(state,result);
   if(!result.accepted) {
     if(["repair_source_changed","repair_source_unavailable"].includes(result.code)) {
-      // The server already secured this original, but the page can no longer
-      // attest to it. Preserve the page rather than closing an ambiguous tab.
+      // The server already secured this original; the page no longer attesting to it is not the
+      // user's activity: the release verdict decides who holds the tab.
       state.repairReceiptPending=false;
-      await preserveAnsweredTab(job,provider,jobs,"repair source changed; tab preserved");
+      await saveJobs(jobs);
+      return true;
     }
-    return;
+    return false;
   }
   state.repairReceiptPending=false;
   workerStep(job,provider,"repair_accepted");
   await saveJobs(jobs);
-  await cleanupProvider(job,provider,jobs);
+  return true;
 }
 async function acceptRepairReceipt(job, provider, jobs, result) {
   const state=job.states[provider], attempt=state.repairAttempt;
@@ -1522,46 +2347,37 @@ async function repairProvider(job, provider, jobs) {
   }
 }
 
-/** A server-forgotten job must not wait forever for a tab that is already gone.
+/** A stalled leg is settled only once its tab is gone (a live tab may still answer).
  * True only when neither the recorded tab nor any owned provider tab is still live. */
 async function providerTabGone(job, provider) {
   const state = job.states[provider];
   if (!state.tabId && !state.started) return true;
-  if (state.tabId) {
+  await followDurableReplace(job, provider); // (the sweep saves a move with the job)
+  const lookedUp = state.tabId;
+  if (lookedUp) {
     try {
-      const tab = await chrome.tabs.get(state.tabId);
+      const tab = await chrome.tabs.get(lookedUp);
       if (allowedTab(tab, provider)) return false;
     } catch { /* recorded tab is gone; fall through to a full owned-tab search */ }
   }
-  return !(await findOriginalTab(job, provider));
+  const found = await findOriginalTab(job, provider);
+  // A tab Chrome replaced meanwhile is not gone, nor one whose page did not answer (unknown: it may
+  // hold the run).
+  return found === null && !replacedSince(state, lookedUp);
 }
 
 /** The bridge job registry is in-memory only, so a job the server used to own that now
  * reports missing/unknown (typically after a restart) is gone for good — its legs can
  * never be delivered again and must be retired, or they pile up in recovery/cleanup and
- * starve admission. Explicit cancellation force-closes every leg; a forgotten job only
- * abandons legs whose tab is truly gone, so an open tab still holding an unharvested
- * answer is preserved. Returns true when the whole job was retired. */
+ * starve admission. Every leg of a cancelled or forgotten job is abandoned: its tab has no
+ * further use and is released by the page's verdict (closed unless the user took it over,
+ * preserved when that cannot be proven in time). Returns true when the whole job was retired. */
 async function abandonForgottenJob(job, jobs, status, signal) {
-  // status is the FRESH probe verdict from the clear sweep. Cancellation force-closes every leg (the
-  // operator meant to stop it); a missing/unknown job only abandons legs whose tab is truly gone.
-  const explicit = status === "cancelled";
-  const abandon = [];
-  for (const provider of job.providers) {
-    if (explicit || await providerTabGone(job, provider)) abandon.push(provider);
-  }
-  if (!abandon.length) return false;
-  // Generation fence: providerTabGone above may have outlived the sweep's watchdog. Bail before mutating
-  // so an abandoned sweep never marks legs delivered under a newer sweep's ownership.
+  // status is the FRESH probe verdict from the clear sweep.
   if (signal?.aborted) return false;
-  for (const provider of abandon) {
-    const state = job.states[provider];
-    state.delivered = true;      // terminal: the server can never accept this leg again
-    state.cleanupPending = true;
-    state.closeRequested = true; // a confirmed-absent tab finishes cleanup instead of waiting for a reconnection that never comes
-  }
-  await saveJobs(jobs);
-  await joinLanes(abandon.map(provider => cleanupProvider(job, provider, jobs)));
+  // A confirmed-absent tab finishes cleanup instead of waiting for a reconnection that never comes.
+  await abandonJobLegs(job, jobs, status, true);
+  await joinLanes(job.providers.map(provider => cleanupProvider(job, provider, jobs)));
   // Detach the final trace only for a freshly-confirmed missing/unknown job (server evicted it → upload
   // rejected and the fetch may hang); a cancelled job keeps its lease, so its trace is awaited.
   return retireCleanJob(job, jobs, ["missing", "unknown"].includes(status), signal);
@@ -1595,10 +2411,75 @@ function jobStale(job, staleMs, now = Date.now()) {
   return latest > 0 && now - latest > staleMs;
 }
 
-/** Sweep for jobs whose tabs are gone: those the server has forgotten (missing/unknown) or cancelled,
- * and — when includeStalled — those that progressed then went quiet past staleMs (a wedged
- * generating/repair leg that can never finish). Runs both from the popup button and the periodic alarm.
- * Never touches a job with a live tab (a harvestable answer) or one the server still owns/tracks. The
+/** The stalled sweep's decisions for one job (runStuckSweep), inside a `stall` operation. True when
+ * they were saved (the caller then delivers, cleans up and retires). */
+async function settleStalledJob(job, jobs, signal) {
+  if (jobs[job.jobId] !== job || signal?.aborted) return false;
+  for (const provider of job.providers) {
+    const state = job.states[provider];
+    // Fully done — the server ACKed AND tab cleanup finished. Nothing to do.
+    if (state.delivered && state.cleanupDone) continue;
+    // A durably-archived source is owned by the repair pipeline ONLY while a repair is actively
+    // running or committable (prepared/running/ready): its tab was closed ON PURPOSE and repair may
+    // run arbitrarily long without events, so settling would cancel a live repair. But a repair in a
+    // terminal non-accepted state (needs_attention/interrupted/disabled/superseded), or a durable leg
+    // with no active repair, is dead — repairProvider won't retry or settle it, so the job would sit
+    // forever. Salvage the archived original instead (deliver it verbatim as raw_review, the same
+    // terminal path as repair-off); a fabricated tab_closed failure would be dropped by deliverOutcome's
+    // durable guard anyway.
+    if (sourceArchiveDurable(state)) {
+      // accepted is a resumable SUCCESS (the commit landed; acceptRepairReceipt records the receipt on
+      // the next tick even if the worker stopped before it did). Salvaging it would collide with the
+      // server's already-stored repaired leg (lease_conflict) and clear the lease. Exempt it too.
+      if (["prepared", "running", "ready", "accepted"].includes(state.repairAttempt?.status)) continue;
+      if (!state.outcome) {
+        const salvage = localArchivedSource(state); // local archived copy — no fetch, no page, no hang
+        if (salvage?.text) {
+          // Repair is enabled here (the leg had a repair attempt), so the server would re-demand
+          // repair on the raw text. Deliver the canonicalized raw_review envelope instead.
+          state.outcome = { ok: true, raw: salvageReviewEnvelope(salvage.text), originalText: salvage.text, salvaged: true };
+          delete state.formatError;
+          workerStep(job, provider, "salvaged_no_repair");
+        }
+      }
+      continue; // salvaged (delivered in the post-loop) or nothing local to salvage — never fabricate a failure
+    }
+    // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
+    // stalled one — providerTabGone reports it "gone", but touching it would misreport a reviewer that
+    // never ran. Only act on a leg that actually started or held a tab that is now gone. (Job-level
+    // staleness can trip on a different leg's old events, so the per-leg guard is essential.)
+    if (!state.started && !state.tabId) continue;
+    if (!(await providerTabGone(job, provider))) continue;
+    if (state.delivered) {
+      // Result already ACKed, but cleanup stalled: the tab closed before closeRequested was persisted,
+      // so cleanupProviderBody loops on "original tab unavailable" and retireCleanJob never releases
+      // the job — it keeps consuming tab capacity. Confirm tab absence so cleanup can finish; the
+      // outcome is already delivered, so leave it untouched (never re-report it as a failure).
+      state.closeRequested = true;
+    } else if (state.outcome && !state.formatError) {
+      // A NORMAL saved outcome (a valid response, or an explicit failure) is handled by the delivery
+      // flow — never fabricate a tab_closed over a valid saved review.
+      continue;
+    } else {
+      // No outcome, or a formatError outcome (server returned 422 json_repair_required) whose source
+      // never became durable and whose tab is now gone — it can NEVER be repaired or delivered
+      // (readRepairSource has no tab, delivery loops on 422), so a sole-provider job would sit
+      // awaiting_chat forever. Settle it with a terminal failure.
+      state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
+      delete state.formatError;
+      state.closeRequested = true;
+    }
+  }
+  if (signal?.aborted) return false; // a slow providerTabGone/storage read may have outlived the watchdog
+  await saveJobs(jobs);
+  return true;
+}
+
+/** Sweep for jobs the server has forgotten (missing/unknown) or cancelled — their tabs are released by
+ * the page's verdict (closed unless the user took them over) — and, when includeStalled, tab-gone jobs
+ * that progressed then went quiet past staleMs (a wedged generating/repair leg that can never finish).
+ * Runs both from the popup button and the periodic alarm. Never touches a job the server still
+ * owns/tracks, nor a stalled job whose tab is still live (a harvestable answer). The
  * ENTIRE operation — storage init, the concurrent re-probe, and the abandon sweep — is raced against one
  * deadline, so a stalled chrome.storage.get, bridge ping, or tab probe can never strand the popup's
  * runtime message. Returns how many were cleared. */
@@ -1608,16 +2489,14 @@ async function clearStuckJobs(opts = {}) {
   // shared with the still-running work so a timeout still reports partial progress. Never throws.
   const { deadlineMs = 15_000, includeStalled = false, staleMs = STALL_MS } = opts;
   const TIMED_OUT = Symbol("clear-timeout");
-  const controller = new AbortController();
   let timer;
-  const counter = { cleared: 0, total: 0 };
+  // One sweep at a time (W2): a sweep already running (the alarm's) is joined, never run beside.
+  const {work, counter, controller} = sweepOnce({includeStalled, staleMs});
   // On timeout, ABORT the work — don't just return. Otherwise the detached runStuckSweep keeps running
   // unfenced and the "click again" the popup suggests starts another sweep over the same registry, so
   // repeated attempts accumulate pending ops that later resume concurrently. Aborting fences it (its
   // fetches reject, its per-mutation signal checks bail), so a re-click never overlaps the timed-out sweep.
   const deadline = new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve(TIMED_OUT); }, deadlineMs); });
-  const work = runStuckSweep({ includeStalled, staleMs, signal: controller.signal }, counter)
-    .catch(error => ({ ok: false, error: String(error?.message || error || "clear failed") }));
   const result = await Promise.race([work, deadline]);
   clearTimeout(timer);
   const kept = Math.max(0, counter.total - counter.cleared);
@@ -1626,9 +2505,9 @@ async function clearStuckJobs(opts = {}) {
   return { ok: true, cleared: counter.cleared, kept, timedOut: false };
 }
 
-/** The actual sweep (NO response deadline). Retires jobs whose tabs are gone: those the server has
- * forgotten (missing/unknown) or cancelled, and — when includeStalled — those that progressed then went
- * quiet past staleMs. Never touches a job with a live tab (a harvestable answer). `counter` is mutated
+/** The actual sweep (NO response deadline). Retires jobs the server has forgotten (missing/unknown) or
+ * cancelled, and — when includeStalled — tab-gone jobs that progressed then went quiet past staleMs
+ * (a stalled job with a live tab may still answer and is kept). `counter` is mutated
  * live so the deadline wrapper can report partial progress on timeout. Resolves only when the work truly
  * ends, so the auto-sweep can hold its lock until then. */
 async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signal } = {}, counter = { cleared: 0, total: 0 }) {
@@ -1671,63 +2550,10 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
       // it re-sticks. REPORT a terminal failure instead (deliverOutcome sends action:"failure"), which
       // settles the server leg; the record is retired only once every leg is delivered (ACKed), and
       // retained if the server is unreachable. A live-tab provider is left alone (may still answer).
-      for (const provider of job.providers) {
-        const state = job.states[provider];
-        // Fully done — the server ACKed AND tab cleanup finished. Nothing to do.
-        if (state.delivered && state.cleanupDone) continue;
-        // A durably-archived source is owned by the repair pipeline ONLY while a repair is actively
-        // running or committable (prepared/running/ready): its tab was closed ON PURPOSE and repair may
-        // run arbitrarily long without events, so settling would cancel a live repair. But a repair in a
-        // terminal non-accepted state (needs_attention/interrupted/disabled/superseded), or a durable leg
-        // with no active repair, is dead — repairProvider won't retry or settle it, so the job would sit
-        // forever. Salvage the archived original instead (deliver it verbatim as raw_review, the same
-        // terminal path as repair-off); a fabricated tab_closed failure would be dropped by deliverOutcome's
-        // durable guard anyway.
-        if (sourceArchiveDurable(state)) {
-          // accepted is a resumable SUCCESS (the commit landed; acceptRepairReceipt records the receipt on
-          // the next tick even if the worker stopped before it did). Salvaging it would collide with the
-          // server's already-stored repaired leg (lease_conflict) and clear the lease. Exempt it too.
-          if (["prepared", "running", "ready", "accepted"].includes(state.repairAttempt?.status)) continue;
-          if (!state.outcome) {
-            const salvage = await readRepairSource(job, provider, false); // local archived copy — no fetch, no hang
-            if (salvage?.text) {
-              // Repair is enabled here (the leg had a repair attempt), so the server would re-demand
-              // repair on the raw text. Deliver the canonicalized raw_review envelope instead.
-              state.outcome = { ok: true, raw: salvageReviewEnvelope(salvage.text), originalText: salvage.text, salvaged: true };
-              delete state.formatError;
-              workerStep(job, provider, "salvaged_no_repair");
-            }
-          }
-          continue; // salvaged (delivered in the post-loop) or nothing local to salvage — never fabricate a failure
-        }
-        // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
-        // stalled one — providerTabGone reports it "gone", but touching it would misreport a reviewer that
-        // never ran. Only act on a leg that actually started or held a tab that is now gone. (Job-level
-        // staleness can trip on a different leg's old events, so the per-leg guard is essential.)
-        if (!state.started && !state.tabId) continue;
-        if (!(await providerTabGone(job, provider))) continue;
-        if (state.delivered) {
-          // Result already ACKed, but cleanup stalled: the tab closed before closeRequested was persisted,
-          // so cleanupProviderBody loops on "original tab unavailable" and retireCleanJob never releases
-          // the job — it keeps consuming tab capacity. Confirm tab absence so cleanup can finish; the
-          // outcome is already delivered, so leave it untouched (never re-report it as a failure).
-          state.closeRequested = true;
-        } else if (state.outcome && !state.formatError) {
-          // A NORMAL saved outcome (a valid response, or an explicit failure) is handled by the delivery
-          // flow — never fabricate a tab_closed over a valid saved review.
-          continue;
-        } else {
-          // No outcome, or a formatError outcome (server returned 422 json_repair_required) whose source
-          // never became durable and whose tab is now gone — it can NEVER be repaired or delivered
-          // (readRepairSource has no tab, delivery loops on 422), so a sole-provider job would sit
-          // awaiting_chat forever. Settle it with a terminal failure.
-          state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
-          delete state.formatError;
-          state.closeRequested = true;
-        }
-      }
-      if (signal?.aborted) return; // a slow providerTabGone/storage read may have outlived the watchdog
-      await saveJobs(jobs);
+      // The per-leg decisions (the salvage from the local archive, the tab lookup, the outcome and
+      // closeRequested writes) are one `stall` operation in the tab queue; delivery, cleanup and
+      // retirement follow outside it.
+      if (!await tabOp("stall", () => settleStalledJob(job, jobs, signal))) return;
       if (signal?.aborted) return;
       // Deliver a newly-stamped failure (deliverOutcome sends it + cleans up on ACK); for an
       // already-delivered leg whose closeRequested we just set, deliverOutcome early-returns, so finish its
@@ -1755,11 +2581,24 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
 // signal, so the sweep unwinds and settles — releasing the lock only once the cancellation lands (never
 // leaving it wedged for the worker's lifetime, and never overlapping the next run). No popup waits on it.
 const AUTO_SWEEP_WATCHDOG_MS = 45_000;
-let autoSweepInFlight = false;
+/** The one sweep in flight (the popup's Clear stuck and the alarm's share it, W2): {work, counter,
+ * controller}. It is released once its work ended, or once it was aborted (a watchdog or the popup's
+ * deadline): an aborted sweep only finishes the operation it is in, and enqueues nothing more. */
+let sweepFlight = null;
+function sweepOnce({includeStalled, staleMs = STALL_MS}) {
+  if (sweepFlight) return sweepFlight;
+  const controller = new AbortController(), counter = {cleared: 0, total: 0};
+  const flight = {controller, counter};
+  const release = () => { if (sweepFlight === flight) sweepFlight = null; };
+  controller.signal.addEventListener("abort", release, {once: true});
+  flight.work = runStuckSweep({includeStalled, staleMs, signal: controller.signal}, counter)
+    .catch(error => ({ ok: false, error: String(error?.message || error || "clear failed") }))
+    .finally(release);
+  sweepFlight = flight;
+  return flight;
+}
 async function autoSweepStuckJobs(watchdogMs = AUTO_SWEEP_WATCHDOG_MS) {
-  if (autoSweepInFlight) return;
-  autoSweepInFlight = true;
-  const controller = new AbortController();
+  const {work, controller} = sweepOnce({includeStalled: true});
   const watchdog = setTimeout(() => controller.abort(), watchdogMs);
   try {
     // Race the WHOLE sweep against the watchdog's abort so the lock always releases — even when the hang
@@ -1768,10 +2607,10 @@ async function autoSweepStuckJobs(watchdogMs = AUTO_SWEEP_WATCHDOG_MS) {
     // detached remainder can no longer mutate the registry: no overlap with the next sweep, no wedge for
     // the worker's lifetime.
     await Promise.race([
-      runStuckSweep({ includeStalled: true, signal: controller.signal }).catch(() => {}),
+      work,
       new Promise((resolve) => { controller.signal.addEventListener("abort", () => resolve(), { once: true }); }),
     ]);
-  } finally { clearTimeout(watchdog); autoSweepInFlight = false; }
+  } finally { clearTimeout(watchdog); }
 }
 
 async function advanceJob(job, jobs) {
@@ -1780,19 +2619,17 @@ async function advanceJob(job, jobs) {
   if (await retireCleanJob(job, jobs)) return;
   const active = await heartbeat(job, jobs);
   if (!active && job.serverStatus === "cancelled") {
-    for (const p of job.providers) {
-      job.states[p].delivered = true; // Explicit cancellation, never elapsed time or 404.
-      job.states[p].cleanupPending = true;
-    }
-    await saveJobs(jobs);
+    // Explicit cancellation, never elapsed time or 404. Persisted before cleanup: a later
+    // "missing" (the harbor forgot the cancelled job) still takes the cancel exit.
+    await abandonJobLegs(job, jobs, "cancelled");
     await joinLanes(job.providers.map(p => cleanupProvider(job, p, jobs)));
     await retireCleanJob(job, jobs); // default (await): cancelled keeps its lease, so its trace still uploads
     return;
   }
-  // A "missing"/"unknown" status is deliberately NOT auto-retired: after a worker restart the
-  // tab can re-bind, so such work must not be discarded (and it is already kept out of the
-  // capacity count). An operator clears provably-dead forgotten jobs on demand via the popup
-  // ("Clear stuck jobs" → clearStuckJobs), which only abandons legs whose tab is truly gone.
+  // A "missing"/"unknown" status is deliberately NOT auto-retired here: after a worker restart the
+  // tab can re-bind, so such work must not be discarded on one stale reply. The sweep
+  // (clearStuckJobs, also run by the periodic alarm) re-probes it and, still forgotten, abandons
+  // every leg and releases its tab by the page's verdict.
   const canDeliver = active || ["validator", "posting", "posted", "skipped", "dlq"].includes(job.serverStatus);
   // Missing is not ACK: observe and preserve the original response without redelivery.
   if (active && !job.prompt && job.providers.some(p=>!job.states[p].delivered && !sourceArchiveDurable(job.states[p]))) {
@@ -1917,9 +2754,10 @@ function admitJob(cfg, jobs) {
     await recordWorkerStatus(jobs, cfg.origin, "polling");
     // One take in flight per origin: this lane (singleFlight on admissionLanes, and tickBody never
     // queues a second waiter) serializes every admission trigger of this worker (alarm, interval,
-    // poll-now). A fix delivery this profile PROVABLY opened a tab for (reconcileFixDeliveries: a
-    // live created tab or a binding) is listed too, so the server never replays it here even when the
-    // job registry lost it (hard reset); an intent that never became a tab is cleared and replayed.
+    // poll-now). A fix delivery this profile PROVABLY opened a tab for (reconcileFixDeliveries: a tab
+    // that carries its binding, or its recorded tab while that page is still unread) is listed too, so
+    // the server never replays it here even when the job registry lost it (hard reset); an intent
+    // that never became a tab, or a record whose tab holds no binding of it, is cleared and replayed.
     const delivered = await reconcileFixDeliveries(jobs);
     // fixProtocol:1 opts this worker into review-loop fix items (an older worker is never offered one).
     const payload = await api("/api/bridge", {
@@ -1965,8 +2803,9 @@ async function tickBody() {
   const jobs = await workerJobs(cfg.origin);
   void refreshTabInventory().catch(()=>{});
   await recordWorkerStatus(jobs, cfg.origin);
-  // There is deliberately NO global work lock or "any active job" return. A later
-  // wakeup can advance B/admit C even while A's short transport attempt is pending.
+  // Bridge work has no global lock and no "any active job" return: a later wakeup can advance B or
+  // admit C while A's bridge call is pending. Tab work runs in the tab queue (tabOp), one operation
+  // at a time, each bounded.
   const work = Object.values(jobs).filter(job=>job.origin===cfg.origin).flatMap(job=>job.providers
     .filter(provider=>(job.states[provider].delivered || sourceArchiveDurable(job.states[provider])) && !job.states[provider].cleanupDone &&
       !cleanupLanes.has(`${job.origin}:${job.jobId}:${provider}`))
@@ -2001,10 +2840,13 @@ async function heartbeatTick() {
 async function maintenanceSnapshot(id) {
   const cfg=await settings();
   const jobs=cfg.origin ? await workerJobs(cfg.origin) : {};
-  await Promise.allSettled([...admissionLanes.values(), allocationTail]);
-  const current=await maintenanceState();
-  if(!current || current.id!==id)return {ok:false,error:"maintenance lock lost"};
-  const capacity=await tabCapacityReport(jobs,true);
+  await Promise.allSettled([...admissionLanes.values()]);
+  // Read in the tab queue, after every allocation queued before it (a leg's poll operation opens its tab).
+  const capacity=await tabOp("maintenance",async()=>{
+    const current=await maintenanceState();
+    return current?.id===id ? tabCapacityReport(jobs,true) : null;
+  });
+  if(!capacity)return {ok:false,error:"maintenance lock lost"};
   const pendingCleanup=Object.values(jobs).filter(job=>!cfg.origin || job.origin===cfg.origin)
     .reduce((n,job)=>n+job.providers.filter(p=>(job.states[p].delivered || sourceArchiveDurable(job.states[p])) && !job.states[p].cleanupDone).length,0);
   if(cfg.origin)await recordWorkerStatus(jobs,cfg.origin,"maintenance");
@@ -2051,6 +2893,19 @@ async function clearCommittedMaintenanceOnWorkerStart() {
   });
 }
 
+/** The popup's hard reset (see its message handler), as a `reset` operation in the tab queue: after
+ * the operation running now, it drops the cached registry and persists an empty one; from then on no
+ * operation runs and no registry write lands until the reload (W12: lanes still holding the old
+ * registry would persist it again, or act on a tab). */
+function hardReset() {
+  return tabOp("reset", async () => {
+    resetting = true;
+    registryPromise = Promise.resolve({});
+    await writeInOrder(() => chrome.storage.local.set({ [PENDING_JOBS]: {} }));
+    return { ok: true };
+  });
+}
+
 function loop() {
   chrome.alarms.create("ashlar-poll", { periodInMinutes: 1 });
   void heartbeatTick();
@@ -2078,17 +2933,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     // cached registry AND persist an empty one so any tick that races the reload writes {} rather than the
     // stale 30, then reload the extension so all in-flight lane closures holding the old jobs object are torn
     // down. Never throws: reload runs after the reply regardless.
-    (async () => {
-      try {
-        registryPromise = Promise.resolve({});
-        await writeInOrder(() => chrome.storage.local.set({ [PENDING_JOBS]: {} }));
-        sendResponse({ ok: true });
-      } catch (error) {
-        sendResponse({ ok: false, error: String(error?.message || error) });
-      } finally {
-        setTimeout(() => chrome.runtime.reload(), 150);
-      }
-    })();
+    hardReset().then(sendResponse, error => sendResponse({ ok: false, error: String(error?.message || error) }))
+      .finally(() => setTimeout(() => chrome.runtime.reload(), 150));
     return true;
   }
   if (message?.type === "ashlar-maintenance-acquire") {
@@ -2101,10 +2947,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     void commitMaintenanceReload(message.id).then(sendResponse,error=>sendResponse({ok:false,error:String(error?.message||error)})); return true;
   }
 });
-chrome.tabs.onUpdated?.addListener((id, change) => {
-  if(change.url || change.status)invalidateTabInventory(id);
-});
-chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
+chrome.tabs.onUpdated?.addListener((id, change) => noteTabUpdated(id, change));
+chrome.tabs.onRemoved.addListener((id, info) => rememberClosedTab(id, info));
+// Top level like the others, so a replace (never followed by onRemoved) also wakes a stopped worker.
+chrome.tabs.onReplaced.addListener((added, removed) => rekeyReplacedTab(added, removed));
 chrome.runtime.onInstalled.addListener(loop);
 chrome.runtime.onStartup.addListener(loop);
 void clearCommittedMaintenanceOnWorkerStart();

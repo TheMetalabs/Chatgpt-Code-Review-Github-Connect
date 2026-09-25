@@ -51,8 +51,10 @@ test('real DOM: markdown br and escaped source code are recovered from final res
  const page=await fixture(t,user+answer(`<p>${html}</p>`,true));await startWait(page);await page.clock.runFor(3200);
  assert.deepEqual(JSON.parse((await page.evaluate(()=>waitResult)).raw),JSON.parse(raw));
 });
+// The page already shows the sent turn: it is bound to the run (a new run is refused there, X2 #85).
+const boundTo=(page,jobId,runId='')=>page.evaluate(([jobId,runId])=>{window.__ashlarRunnerState={running:false,jobId,runId,result:null};},[jobId,runId]);
 test('real DOM: harvest does not expose provisional JSON while the runner is busy',async t=>{
- const page=await fixture(t,user+answer(json)+stop);await page.addScriptTag({content:source('extension/content-chatgpt.js')});
+ const page=await fixture(t,user+answer(json)+stop);await boundTo(page,'j');await page.addScriptTag({content:source('extension/content-chatgpt.js')});
  await page.evaluate(()=>{runPrompt=async()=>new Promise(()=>{});handler({type:'ashlar-run',jobId:'j',prompt:'p'},null,()=>{});});
  const result=await page.evaluate(()=>new Promise(resolve=>handler({type:'ashlar-harvest',jobId:'j'},null,resolve)));
  assert.equal(result.ok,false);assert.equal(result.code,'busy');
@@ -66,7 +68,7 @@ test('real DOM: even completed-looking prose is not converted to empty after a p
 
 test('real DOM: only a completed owned run without a new user draft may be closed',async t=>{
  const page=await fixture(t,user+answer(json,true)+'<textarea id="prompt-textarea"></textarea>');
- await page.addScriptTag({content:source('extension/content-chatgpt.js')});
+ await boundTo(page,'A','run-A');await page.addScriptTag({content:source('extension/content-chatgpt.js')});
  await page.evaluate(()=>{
    composer=()=>document.querySelector('textarea');
    runPrompt=async()=>'{"findings":[]}';
@@ -221,7 +223,9 @@ test(`real DOM: ashlar-fix-cancel on a ${name} fix page releases the slot and st
  assert.equal(out.ok,true);assert.equal(out.released,true);
  assert.deepEqual(['owned','ownership','blank','unsent','identity'].filter(key=>key in out),[],'no verdict a close could rest on');
  assert.equal((await send('ashlar-tab-status')).released,true,'the managed slot is freed');
- assert.equal(await page.evaluate(()=>__ashlarRunnerState.fixCancelled),true,'the collector stops');
+ // (#82's stop fence: the run is stopped for good, nothing is sent or collected for it again)
+ assert.equal(await page.evaluate(()=>__ashlarRunnerState.runStopped),true,'the collector stops');
+ assert.equal(await page.evaluate(()=>sessionStorage.getItem('ashlar:stopped:fix-A:run-A')),'true','the stop survives a reload');
 });
 }
 
@@ -399,6 +403,32 @@ for(const moved of [false,true]){
  });
 }
 
+// The send-time rule for a REVIEW, where it does not contradict #82: a review sent on a page that
+// names a conversation records it when its send is proven, so an in-page move before the
+// collector's first poll never pins the user's conversation there. A review sent on a new chat has
+// no conversation at its send: the provider assigns one afterwards, and the review pins where the
+// provider puts it (#82, json.js pinNewChatReview), not the new-chat page it was sent on.
+test('real DOM send-time identity (review on a conversation page, moved before the collector\'s first poll): recorded at send, never re-pinned, can-close refused',async t=>{
+ const ctx=await conversationPage(t,'review',{url:CONV_URL,gated:true});
+ assert.equal((await ctx.journal()).conversation,CONV_URL,'recorded when the send was proven');
+ await ctx.move(OTHER_URL);
+ await ctx.openCollect();await ctx.page.clock.runFor(1600);
+ await ctx.complete();await ctx.page.clock.runFor(3200);
+ assert.equal((await ctx.journal()).conversation,CONV_URL,'never re-pinned at collect');
+ const out=await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL});
+ assert.deepEqual({canClose:out.canClose,identity:out.identity,conversation:out.conversation},{canClose:false,identity:'changed',conversation:CONV_URL});
+});
+test('real DOM send-time identity (review on a new chat): nothing recorded at send; pinned where the provider puts it (#82)',async t=>{
+ const ctx=await conversationPage(t,'review',{url:NEW_URL,gated:true});
+ assert.equal((await ctx.journal()).conversation,undefined,'a new chat names no conversation when the send is proven');
+ await ctx.move(CONV_URL); // the provider assigns the conversation URL (no user action)
+ await ctx.openCollect();await ctx.page.clock.runFor(1600);
+ assert.equal((await ctx.journal()).conversation,CONV_URL,'pinned where the provider put it');
+ await ctx.complete();await ctx.page.clock.runFor(3200);
+ const out=await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL});
+ assert.deepEqual({canClose:out.canClose,conversation:out.conversation},{canClose:true,conversation:CONV_URL});
+});
+
 // Ashlar 4096068000: a completed fix whose sent turn the user edits after collection is never
 // handed out or closed; its tab is released and preserved (fixOwnershipProof "complete").
 for(const edit of ['fix prompt and my own words','my note: fix prompt']){
@@ -436,18 +466,24 @@ test(`real DOM: a fix delivered, then its sent turn edited to "${edit}": can-clo
 });
 }
 
-// Round 12 (Ashlar 4097631101): the server reports the fix cancelled or unknown (a registry restart
-// or a terminal-retention prune forgets it) AFTER its answer was collected and delivered. The close
-// proof follows the local proof (an answer was collected), never the server status: an answer the
-// user regenerated or replaced (no follow-up turn, no draft) is preserved and its slot released,
-// never closed on the weaker cancel-phase proof. Control: the unchanged completion still closes.
+// Round 12 (Ashlar 4097631101), under #82's release rule: the server reports the fix cancelled or
+// unknown (a registry restart or a terminal-retention prune forgets it) AFTER its answer was
+// collected and delivered. Whether the tab closes never follows the server status: the answer was
+// delivered (the worker recorded the complete ACK), so the fix takes its proven-success path and asks
+// can-close whatever the server says since (#77: its run already ended with that answer, and a fix
+// page's cancel reply carries no verdict). The answer changing on the page (regenerated, replaced
+// under a new message ID) is not the user's activity (#82: ChatGPT keeps redrawing and re-keying a
+// finished answer), so the tab still closes; only a user signal (here a follow-up turn) keeps it,
+// preserved and released (the preserve message also stops the page's run).
 const ANSWER_CHANGES={
  unchanged:null,
  regenerated:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="response-A"] code').textContent='{"summary":"regenerated","files":[]}';}),
  replaced:({page})=>page.evaluate(()=>{const r=document.querySelector('[data-message-id="response-A"]');r.dataset.messageId='response-B';r.querySelector('code').textContent='{"summary":"another answer","files":[]}';}),
+ followup:({page})=>page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);}),
 };
 for(const status of ['cancelled','unknown'])for(const [change,apply] of Object.entries(ANSWER_CHANGES)){
-test(`real DOM: a delivered fix whose server then reports ${status}, answer ${change}: ${apply?'preserved and released, never closed':'closed on the complete-phase proof (control)'}`,async t=>{
+const kept=change==='followup';
+test(`real DOM: a delivered fix whose server then reports ${status}, answer ${change}: ${kept?'preserved, released and stopped, never closed':'closed (no user signal)'}`,async t=>{
  const ctx=await conversationPage(t,'fix');
  const server={value:'awaiting_chat'};
  const {b,state}=wiredWorker(ctx.page,server);
@@ -463,20 +499,30 @@ test(`real DOM: a delivered fix whose server then reports ${status}, answer ${ch
  b.context.cleanupProvider=cleanup;
  await b.tick();
  const got={closed:b.closedTabs.length,retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released,
-  askedCancel:b.messages.some(m=>m.type==='ashlar-fix-cancel' && !m.preserve)};
- assert.deepEqual(got,apply?{closed:0,retired:true,released:true,askedCancel:false}:{closed:1,retired:true,released:false,askedCancel:false});
+  stopped:await ctx.page.evaluate(()=>sessionStorage.getItem('ashlar:stopped:fix-A:run-A')==='true')};
+ // (a preserved tab's run is stopped: the preserve message is the cancel exit, preserveFixTab)
+ assert.deepEqual(got,{closed:kept?0:1,retired:true,released:kept,stopped:kept});
 });
 }
 
-// ── The fix ownership proof at EVERY page decision point (conformance rows P19-P22): the same
-// violations of the full proof (fixOwnershipProof) against each decision, with a control. A cell
-// is `true` when the decision acts for Ashlar (collects, hands out, closes, restores).
+// ── The fix ownership proof at EVERY page decision point (conformance rows P19-P21, P23, P26): the
+// same violations of the full proof against each decision, with a control. A cell is `true` when the
+// decision acts for Ashlar (collects, hands out, closes). The answer collection (fixOwnershipProof)
+// and the tab release (tabOwnership) refuse every user signal and a fix journal with no send-time
+// identity; a response the provider changed after collection is not one (#82: ChatGPT keeps
+// redrawing a finished answer), so a collected answer is still handed out and its tab still closes.
+// The cancel exit (P23, P26) never acts for Ashlar on a fix page, whatever the page shows: a fix tab
+// is closed only on the proven-success path (#77), so its cancel reply stops the run, frees the slot
+// and carries no verdict. (P22, restoring a completion proof after a reload, is gone: a reloaded tab
+// is released by the same verdict, no restore needed.)
 const PROOF_VIOLATIONS={
  none:null,
  editedSuffix:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='fix prompt and my own words';}),
  editedPrefix:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='my note: fix prompt';}),
  followup:({page})=>page.evaluate(()=>{const u=document.createElement('div');u.dataset.messageAuthorRole='user';u.textContent='personal follow-up';document.querySelector('main').append(u);}),
  draft:({page})=>page.locator('#prompt-textarea').evaluate(el=>{el.textContent='my own question';}),
+ // a file the user staged in the composer before typing anything is a draft too
+ stagedFile:({page})=>page.evaluate(()=>document.querySelector('form').insertAdjacentHTML('afterbegin','<div role="group" aria-label="my-notes.pdf" style="width:120px;height:40px">my-notes.pdf</div>')),
  moved:({move})=>move(OTHER_URL),
  // round 13: the journal carries no send-time identity (a legacy journal, or one confirmed only after
  // a reload); nothing may record one later
@@ -499,18 +545,18 @@ const PROOF_DECISIONS={
  handOut:async ctx=>{await ctx.complete();await ctx.page.clock.runFor(3200);await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.harvest()).ok===true;},
  // P21 close after completion (can-close)
  canClose:async ctx=>{await ctx.complete();await ctx.page.clock.runFor(3200);await ctx.harvest();await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-can-close')).canClose===true;},
- // P22 restore a completion proof after a reload (ashlar-result-saved)
- restore:async ctx=>{
-  await ctx.complete();await ctx.page.clock.runFor(3200);const out=await ctx.harvest();
-  await ctx.page.evaluate(()=>{const s=__ashlarRunnerState;s.result=null;s.nativeCompletion=undefined;s.restoredCompletion=false;});
-  await PROOF_VIOLATIONS[ctx.violation]?.(ctx);
-  return (await ctx.send('ashlar-result-saved',{committed:true,raw:out.raw,text:out.responseText,completion:out.completion})).accepted===true;
- },
+ // P23 the cancel exit before an answer (ashlar-fix-cancel): never a verdict for a fix page
+ cancel:async ctx=>{await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-fix-cancel')).owned===true;},
+ // P26 the cancel exit after the answer was collected (round 12): never a verdict either
+ cancelCollected:async ctx=>{await ctx.complete();await ctx.page.clock.runFor(3200);await ctx.harvest();await PROOF_VIOLATIONS[ctx.violation]?.(ctx);return (await ctx.send('ashlar-fix-cancel')).owned===true;},
 };
-// A changed response is a violation only once a completion is stored; the collector has none to
-// compare with. (There is no cancel decision: a cancel never closes a fix tab.)
-// A move that removed the old DOM leaves no response to complete (the lifecycle rows cover it).
-const PROOF_NA={collect:['responseChanged','movedDomRemoved']};
+// The collector and the cancel exit before an answer have no collected answer the provider could
+// change; a move that removed the old DOM leaves no response to complete (the lifecycle rows cover it).
+const PROOF_NA={collect:['responseChanged','movedDomRemoved'],cancel:['responseChanged']};
+// Not the user's activity: the decision still acts for Ashlar.
+const PROOF_ACTS=['none','responseChanged'];
+// Decisions that never act for Ashlar on a fix page (#77: a cancel never closes a fix tab).
+const PROOF_NEVER=['cancel','cancelCollected'];
 for(const [decision,act] of Object.entries(PROOF_DECISIONS)){
  test(`real DOM fix ownership proof at ${decision}: only the full proof acts, every violation is refused`,async t=>{
   const got={},want={};
@@ -518,7 +564,7 @@ for(const [decision,act] of Object.entries(PROOF_DECISIONS)){
    if(PROOF_NA[decision]?.includes(violation))continue;
    const ctx=await conversationPage(t,'fix');
    got[violation]=await act({...ctx,violation});
-   want[violation]=violation==='none';
+   want[violation]=!PROOF_NEVER.includes(decision) && PROOF_ACTS.includes(violation);
   }
   assert.deepEqual(got,want);
  });
@@ -532,20 +578,23 @@ for(const [decision,act] of Object.entries(PROOF_DECISIONS)){
 // verdict keeps the run alive (it would end at the fix deadline).
 const TERMINAL_VIOLATIONS={
  followup:PROOF_VIOLATIONS.followup,editedSuffix:PROOF_VIOLATIONS.editedSuffix,editedPrefix:PROOF_VIOLATIONS.editedPrefix,
- draft:PROOF_VIOLATIONS.draft,moved:PROOF_VIOLATIONS.moved,noSendIdentity:PROOF_VIOLATIONS.noSendIdentity,responseChanged:PROOF_VIOLATIONS.responseChanged,
+ draft:PROOF_VIOLATIONS.draft,stagedFile:PROOF_VIOLATIONS.stagedFile,moved:PROOF_VIOLATIONS.moved,noSendIdentity:PROOF_VIOLATIONS.noSendIdentity,
  movedDomRemoved:PROOF_VIOLATIONS.movedDomRemoved,turnReplaced:PROOF_VIOLATIONS.turnReplaced,
 };
 const TRANSIENT_VIOLATIONS={
  none:null,
  // the just-sent prompt still echoed in the composer is Ashlar's own text, not a user draft
  composerEcho:({page})=>page.locator('#prompt-textarea').evaluate(el=>{el.textContent='fix prompt';}),
+ // #82: the provider redrawing a collected answer is not the user's activity (PROOF_ACTS): the
+ // collected answer is still handed out and its tab closes
+ responseChanged:PROOF_VIOLATIONS.responseChanged,
 };
 for(const when of ['generating','collected']){
  for(const [violation,apply] of Object.entries({...TERMINAL_VIOLATIONS,...TRANSIENT_VIOLATIONS})){
-  // a replaced response is a violation only against a stored completion
+  // a replaced response is a change only against a collected answer
   if(when==='generating' && violation==='responseChanged')continue;
   const terminal=violation in TERMINAL_VIOLATIONS;
-  test(`real DOM lifecycle: ${violation} while ${when} ${terminal?'ends the fix at once (taken_over), tab preserved':'keeps the run alive'}`,async t=>{
+  test(`real DOM lifecycle: ${violation} while ${when} ${terminal?'ends the fix at once (taken_over), tab preserved':violation==='responseChanged'?'still delivers the collected answer and closes its tab':'keeps the run alive'}`,async t=>{
    const ctx=await conversationPage(t,'fix');
    const server={value:'awaiting_chat'};
    const {b,sync,state}=wiredWorker(ctx.page,server);
@@ -559,7 +608,7 @@ for(const when of ['generating','collected']){
     closed:b.closedTabs.length,retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released};
    // control (none): generating waits, a collected answer is delivered and its tab closed; the
    // composer echo waits (unknown, never handed out) without ending the run
-   const delivered=when==='collected' && violation==='none';
+   const delivered=when==='collected' && ['none','responseChanged'].includes(violation);
    const want=terminal
     ?{failed:true,takenOver:true,delivered:false,closed:0,retired:true,released:true}
     :{failed:false,takenOver:false,delivered,closed:delivered?1:0,retired:delivered,released:false};
@@ -646,24 +695,26 @@ test('real DOM lifecycle: a draft typed and cleared while the sent turn is not r
   {takenOver:true,delivered:false,closed:0,retired:true,released:true,canClose:false});
 });
 
-// Round 15 class sibling (Ashlar 4100156785): restoring a completion after a reload
-// (ashlar-result-saved) decides the permanent verdicts before it asks whether the response is
-// available, so a tab the user took over answers `completion_changed` (the worker preserves it at
-// once) instead of the retryable `completion_unavailable`. Control: a response not rendered yet in
-// the recorded conversation stays retryable.
+// Round 15 class sibling (Ashlar 4100156785): after a reload lost the page's collected answer, the
+// tab's release decides the permanent verdicts before anything transient, so a tab the user took over
+// answers `repurposed` (slot freed: the worker preserves it at once) instead of the retryable
+// `pending`. #77 pinned this on the completion restore (ashlar-result-saved); #82 removed that restore
+// (a reloaded tab is released by the same verdict, json.js tabOwnership, with nothing to restore), so
+// the row asks that verdict. Control: a sent turn not rendered yet in the recorded conversation (asked
+// without the allocation page, where a blank temporary chat is Ashlar's) stays retryable.
 for(const [name,apply,want] of [
- ['movedDomRemoved',PROOF_VIOLATIONS.movedDomRemoved,{code:'completion_changed',released:true}],
- ['turnReplaced',PROOF_VIOLATIONS.turnReplaced,{code:'completion_changed',released:true}],
- ['notRenderedYet',({page})=>page.evaluate(()=>{document.querySelector('main').innerHTML='';}),{code:'completion_unavailable',released:false}],
+ ['movedDomRemoved',PROOF_VIOLATIONS.movedDomRemoved,{reason:'repurposed',released:true}],
+ ['turnReplaced',PROOF_VIOLATIONS.turnReplaced,{reason:'repurposed',released:true}],
+ ['notRenderedYet',({page})=>page.evaluate(()=>{document.querySelector('main').innerHTML='';}),{reason:'pending',released:false}],
 ]){
- test(`real DOM restore after a reload, ${name}: ${want.code}`,async t=>{
+ test(`real DOM release verdict after a reload, ${name}: ${want.reason}`,async t=>{
   const ctx=await conversationPage(t,'fix');
   await ctx.complete();await ctx.page.clock.runFor(3200);const out=await ctx.harvest();
   assert.equal(out.ok,true,'collected');
   await ctx.page.evaluate(()=>{const s=__ashlarRunnerState;s.result=null;s.nativeCompletion=undefined;s.restoredCompletion=false;s.running=false;});
   await apply(ctx);
-  const restored=await ctx.send('ashlar-result-saved',{committed:true,raw:out.raw,text:out.responseText,completion:out.completion});
-  assert.deepEqual({code:restored.code,released:(await ctx.send('ashlar-tab-status')).released},want);
+  const verdict=await ctx.send('ashlar-can-close');
+  assert.deepEqual({reason:verdict.reason,released:(await ctx.send('ashlar-tab-status')).released},want);
  });
 }
 
@@ -771,9 +822,10 @@ for(const kind of ['review','fix']){
   const out=await harvest();
   const canClose=(await send('ashlar-can-close')).canClose;
   // Intended difference (W/P table row P16): a fix answer is read only in the conversation its run
-  // was bound in. FLAG R4 (review, unchanged here): a review still harvests the lingering DOM and
-  // records its completion context under the new URL, so its can-close then passes there.
-  assert.deepEqual({ok:out.ok===true,canClose},kind==='fix'?{ok:false,canClose:false}:{ok:true,canClose:true});
+  // was bound in; a review still harvests the lingering DOM (FLAG R4, out of scope). Both runs
+  // recorded their conversation when the send was proven (a review sent on a conversation page does
+  // too), so neither tab may close in the user's conversation.
+  assert.deepEqual({ok:out.ok===true,canClose},kind==='fix'?{ok:false,canClose:false}:{ok:true,canClose:false});
  });
 }
 

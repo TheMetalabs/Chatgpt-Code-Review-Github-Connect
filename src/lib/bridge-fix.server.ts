@@ -72,10 +72,11 @@
  * response (the send-time conversation, the journaled sent turn's exact text) is decided BEFORE any
  * transient one, at every page decision (collect, hand-out, can-close, restore), so a transient wait
  * never hides it until the deadline.
- * TAB ENDS (extension/background.js cleanupFixTab): a fix tab is closed ONLY on the proven-success
- * path — DONE (T14) acknowledged to the worker AND the page's complete-phase proof passing at close
- * time (send-time conversation, exact sent turn, stored completion unchanged, no draft or
- * follow-up). Every other end of the item (FAILED, CANCELLED for timeout / superseded / aborted,
+ * TAB ENDS (extension/background.js forceCloseFixTab): a fix tab is closed ONLY on the proven-success
+ * path — DONE (T14) acknowledged to the worker AND the page's release verdict owning the tab at close
+ * time (json.js tabOwnership: the temporary chat the fix was sent in, the exact sent turn, no
+ * follow-up, no draft; ChatGPT's own redraws of the answer are not the user's, #82). Every other end
+ * of the item (FAILED, CANCELLED for timeout / superseded / aborted,
  * an unknown id) and every unproven tab (taken over, another binding, unreachable, still loading,
  * a lost delivery record) is PRESERVED: the page frees its managed slot and stops its run, and the
  * worker retires the job. Nothing on this server authorises a close.

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 export const root = fileURLToPath(new URL('../../', import.meta.url));
 export const source = name => fs.readFileSync(new URL(name, `file://${root}`), 'utf8');
@@ -26,9 +27,12 @@ export async function until(check, ms = 5000) {
   }
   return true;
 }
+/** The page a provider tab is opened on (background.js providerUrl): where a new run may start. */
+export const allocationUrl = provider => (provider === 'grok' ? 'https://grok.com/' : 'https://chatgpt.com/?temporary-chat=true');
 export function content(provider = 'chatgpt', persisted = new Map()) {
   const listeners = [];
-  const context = vm.createContext({ console, sessionStorage: { getItem: key => persisted.get(key), setItem: (key, value) => persisted.set(key, value) }, chrome: { runtime: { onMessage: { addListener: fn => listeners.push(fn), removeListener: fn => { const i=listeners.indexOf(fn);if(i>=0)listeners.splice(i,1); } } } } });
+  // The page shows the new chat its tab was opened on (a row that needs another page sets its own).
+  const context = vm.createContext({ console, URL, location: { href: allocationUrl(provider) }, sessionStorage: { getItem: key => persisted.get(key), setItem: (key, value) => persisted.set(key, value) }, chrome: { runtime: { onMessage: { addListener: fn => listeners.push(fn), removeListener: fn => { const i=listeners.indexOf(fn);if(i>=0)listeners.splice(i,1); } } } } });
   for (const file of ['quota.js', 'model.js', 'json.js', `content-${provider}.js`]) {
     vm.runInContext(source(`extension/${file}`), context, { filename: file });
   }
@@ -39,16 +43,22 @@ export function content(provider = 'chatgpt', persisted = new Map()) {
   context.replyDoneVisible = () => false;
   context.assistantCorpus = () => [raw];
   context.quotaHit = () => false;
-  return { context, listeners, message(msg) { let reply; listeners[0](msg, {}, r => { reply = r; }); return reply; } };
+  // A run message carries the page it may start on and its deadline, as the worker's does (a row
+  // that tests the fresh-page check or the deadline names its own).
+  const stamp = msg => (msg?.type === 'ashlar-run'
+    ? {...('allocationUrl' in msg ? {} : {allocationUrl: allocationUrl(provider)}), ...('until' in msg ? {} : {until: vm.runInContext('Date.now()', context) + 10_000}), ...msg}
+    : msg);
+  return { context, listeners, message(msg) { let reply; listeners[0](stamp(msg), {}, r => { reply = r; }); return reply; } };
 }
 export function background({ local = storage({ origin: 'http://bridge', token: 'token' }), session = storage(), handler, tabs = new Map(), api } = {}) {
-  const messages = [], calls = [], closedTabs = []; const removed = [];
+  const messages = [], calls = [], closedTabs = []; const removed = [], replaced = [];
   let nextTab = Math.max(100, ...tabs.keys());
   const chrome = {
     storage: { local, session }, runtime: { lastError: null },
     alarms: { create: async () => {}, clear: async () => {} },
     tabs: {
       onRemoved: { addListener: fn => removed.push(fn) },
+      onReplaced: { addListener: fn => replaced.push(fn) },
       remove: async id => { if (!tabs.has(id)) throw new Error(`No tab with id: ${id}.`); closedTabs.push(id); tabs.delete(id); for (const fn of removed) await fn(id, {isWindowClosing:false}); },
       query: async () => [...tabs.values()],
       get: async id => { if (!tabs.has(id)) throw new Error(`No tab with id: ${id}.`); return tabs.get(id); },
@@ -70,11 +80,46 @@ export function background({ local = storage({ origin: 'http://bridge', token: '
   const context = vm.createContext({ console, chrome, setInterval: () => 1, clearInterval() {}, setTimeout, clearTimeout, URL, AbortSignal, AbortController, crypto: {randomUUID: () => "fixture-client"} });
   const code = source('extension/background.js');
   vm.runInContext(code.slice(0, code.indexOf('\nchrome.alarms.onAlarm.addListener')), context, { filename: 'background.js' });
+  // The tab queue (#85): each tab effect is recorded with the kind of operation it ran in (undefined:
+  // none), and `queue.overlapped` says whether two operation bodies ever ran at once.
+  // `queue.bridgeInOp`: bridge calls made inside an operation (R2: none, but the detached progress flush).
+  const opContext = new AsyncLocalStorage(), effects = [], queue = {overlapped: false, running: 0, bridgeInOp: []};
+  const recorded = (target, name, effect) => {
+    let fn = target[name];
+    Object.defineProperty(target, name, {configurable: true, enumerable: true, set: value => { fn = value; },
+      get: () => { const current = fn; return current && ((...args) => {
+        effects.push({effect, kind: opContext.getStore()?.kind, ...(effect === 'message' ? {type: args[1]?.type} : {})});
+        return current(...args);
+      }); }});
+  };
+  for (const [name, effect] of [['sendMessage', 'message'], ['create', 'create'], ['remove', 'remove'], ['reload', 'reload']]) recorded(chrome.tabs, name, effect);
+  recorded(chrome.scripting, 'executeScript', 'inject');
+  if (context.tabOp) {
+    const tabOp = context.tabOp;
+    context.tabOp = (kind, body) => tabOp(kind, () => opContext.run({kind}, async () => {
+      if (++queue.running > 1) queue.overlapped = true;
+      try { return await body(); } finally { queue.running--; }
+    }));
+  }
   if (context.rememberClosedTab) chrome.tabs.onRemoved.addListener(context.rememberClosedTab);
+  if (context.rekeyReplacedTab) chrome.tabs.onReplaced.addListener(context.rekeyReplacedTab);
   context.waitTab = async () => {};
   let sleeps = 0;
   context.sleep = async () => { if (++sleeps > 8) throw new Error("test-only polling guard: tick did not return"); };
   const rpc = context.api;
-  context.api = async (path, body, origin, signal) => { calls.push({ path, ...body }); return api ? api(path, body, origin, signal) : { ok: true, job: null }; };
-  return { context, rpc, local, session, tabs, messages, calls, closedTabs, chrome, closeTab: async id => { tabs.delete(id); for (const fn of removed) await fn(id, {isWindowClosing:false}); }, tick: () => context.tick() };
+  context.api = async (path, body, origin, signal) => {
+    const kind = opContext.getStore()?.kind;
+    if (kind && body?.action !== 'progress') queue.bridgeInOp.push(`${body?.action || path}@${kind}`);
+    calls.push({ path, ...body }); return api ? api(path, body, origin, signal) : { ok: true, job: null }; };
+  return { context, rpc, local, session, tabs, messages, calls, closedTabs, chrome, effects, queue,
+    /** Run `fn` as one operation in the tab queue (a direct call of an operation body). */
+    op: (fn, kind = 'test') => context.tabOp(kind, fn),
+    queueIdle: () => context.tabQueueIdle(),
+    // (The listeners return nothing; their facts apply as queued operations, awaited here. A hook
+    // inside an operation fires the listener itself instead: awaiting the queue there would wait for
+    // the operation that waits for the hook.)
+    closeTab: async id => { tabs.delete(id); for (const fn of removed) fn(id, {isWindowClosing:false}); await context.tabQueueIdle?.(); },
+    // Chrome swapped tab `removedId`'s page into `tab` (a new id): onReplaced(added, removed), no onRemoved.
+    replaceTab: async (removedId, tab) => { tabs.delete(removedId); tabs.set(tab.id, tab); for (const fn of replaced) fn(tab.id, removedId); await context.tabQueueIdle?.(); },
+    tick: () => context.tick() };
 }

@@ -169,6 +169,9 @@ async function fillComposer(el, text) {
   const altered = editor => exact !== null && normalizePrompt(readComposer(editor)) === normalizePrompt(body);
   if (state) state.pendingAttachments = [];
   if (parts.files.length) {
+    // The stop fence, in the same task as the upload: no file is staged in a composer the user opened
+    // in the tab meanwhile (their next send would upload it).
+    globalThis.throwIfStopped?.();
     const attached = await attachFiles(parts.files);
     if (attached) {
       if (state) state.pendingAttachments = parts.files.map(file => file.name);
@@ -178,7 +181,14 @@ async function fillComposer(el, text) {
       body = [parts.prompt, ...parts.files.map(file => `--- ${file.name}\n${file.body}`)].filter(Boolean).join("\n\n");
     }
   }
+  // Before any text is typed: the ownership verdict must recognise Ashlar's own prompt in the
+  // composer even before clickSend journals it.
+  if (state) state.pendingPrompt = normalizePrompt(body);
   for (;;) {
+    // The stop fence lives with the runner state in json.js (absent: nothing can stop the run).
+    globalThis.throwIfStopped?.();
+    // From here the composer text is Ashlar's own (checked empty of the user's just above).
+    if (state) state.composerTyping = true;
     // Uploading can replace the editor. Never type into a cached detached node.
     el = typeof composer === "function" ? composer() : el;
     if (!el?.isConnected) { await waitForPageChange(250); continue; }
@@ -232,13 +242,42 @@ function renderedControl(el) {
   const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0;
 }
 
+/** The file-chip shapes a composer renders for a staged attachment: a named group, a data-file-name
+ * tile, or an element that names its file only in its title. ONE list (fileChips) for the send
+ * barrier (attachmentsReady: the run's own files are there) and the release verdict (json.js
+ * composerStagedFiles: a file there that is not the run's is the user's draft), so neither sees a
+ * chip the other misses (Ashlar 4101623051). Functions, not top-level consts: composer.js is
+ * re-injected into a page that already ran it. */
+function fileChipSelector() {
+  return '[role="group"][aria-label], [data-file-name], [title]';
+}
+/** The composer's own controls (the send and stop buttons, a voice button, a model or tool menu, an
+ * attach label, a link). The title on one of them is its tooltip, never a file's name. */
+function composerControlSelector() {
+  const roles = ["button", "link", "menuitem", "menuitemcheckbox", "menuitemradio", "switch", "checkbox", "radio", "combobox",
+    "option", "tab", "textbox", "slider"].map(role => `[role="${role}"]`);
+  return ["button", "a[href]", "input", "select", "textarea", "label", "summary", "[aria-haspopup]", ...roles,
+    "#composer-submit-button", '[data-testid="send-button"]', '[data-testid="stop-button"]'].join(", ");
+}
+/** The file chips in a composer form: every element in a fileChipSelector shape, except a control
+ * that is a chip only by its title (its tooltip: "Send prompt", "Start voice mode"). A named group or
+ * a data-file-name tile is a chip whatever element renders it. The barrier and the verdict both read
+ * this list, so neither takes a control's tooltip for a file (Ashlar, review of 5af999fd). */
+function fileChips(form) {
+  return [...form.querySelectorAll(fileChipSelector())]
+    .filter(chip => chip.matches('[role="group"][aria-label], [data-file-name]') || !chip.matches(composerControlSelector()));
+}
+/** Every name a file chip gives its file, in its shapes' order (data-file-name, aria-label, title). */
+function fileChipNames(chip) {
+  return ["data-file-name", "aria-label", "title"].map(name => chip.getAttribute(name)).filter(name => name !== null);
+}
+
 function attachmentsReady(form, names = []) {
   if (!form) return names.length === 0;
   const progress = form.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="uploading"], [class*="animate-spin"]');
   if ([...progress].some(renderedControl)) return false;
-  const chips = [...form.querySelectorAll('[role="group"][aria-label], [data-file-name], [title]')].filter(renderedControl);
-  return names.every(name => chips.some(chip =>
-    chip.getAttribute("data-file-name") === name || chip.getAttribute("aria-label") === name || chip.getAttribute("title") === name));
+  const chips = fileChips(form).filter(renderedControl);
+  return names.every(name => chips.some(chip => fileChipNames(chip).includes(name)));
 }
 
 function normalizePrompt(text) {
@@ -336,10 +375,18 @@ function findEligibleSendButton(selectors) {
 }
 
 /** The identity of the conversation this page shows: its URL without the fragment (the same rule
- * as json.js conversationIdentity, which compares against what is recorded here). */
+ * as json.js conversationIdentity). What is recorded from it is later compared with the location by
+ * samePage (origin and path: json.js fixConversationHolds, tabOwnership; stillShowsConversation
+ * below), never by exact equality. */
 function shownConversation() {
   const href = globalThis.location?.href;
   return typeof href === "string" ? href.split("#")[0] : "";
+}
+
+/** Whether the page still shows `conversation` (json.js samePage when loaded: origin and path, the
+ * query and fragment are not the page; else the exact identity). */
+function stillShowsConversation(conversation) {
+  return typeof samePage === "function" ? samePage(conversation, globalThis.location?.href) : conversation === shownConversation();
 }
 
 function submissionConfirmed(record) {
@@ -351,16 +398,22 @@ function submissionConfirmed(record) {
   record.submittedUsers = turns.indexOf(match) + 1;
   record.messageId = match.getAttribute("data-message-id") || "";
   const state = globalThis.__ashlarRunnerState;
-  // A FIX run's conversation is a fact of THIS moment: recorded once, here, and never later (every
-  // later fix decision compares the location with it). Only a send this page instance clicked,
+  // A run's conversation is a fact of THIS moment: recorded once, here, and never later (every
+  // later decision compares the location with it). Only a send this page instance clicked,
   // confirmed while the page still shows the conversation it was clicked in, establishes it. A
   // confirmation seen only after a reload (the click belonged to an earlier page) or under another
   // location (an in-page move can leave the old DOM rendering the sent turn) proves the send, not
-  // which conversation holds it: no identity is recorded (json.js then reports
-  // `identity:"unestablished"`: never harvested, never closed). A review journal is unchanged.
+  // which conversation holds it: no identity is recorded (a fix is then `identity:"unestablished"`
+  // in json.js: never harvested, never closed). A FIX always records it here. A REVIEW records it
+  // here only when it was sent on a page that names a conversation, with its exact prompt (the rule
+  // its release verdict holds a recorded conversation to): a review sent on a new chat has no
+  // conversation yet and pins where the provider puts it (json.js pinNewChatReview, #82).
   const attempt = state?.sendAttempt;
-  if (state?.kind === "fix" && !record.conversation && attempt?.key === submissionKey() && attempt.conversation &&
-      attempt.conversation === shownConversation()) {
+  const fix = state?.kind === "fix";
+  const reviewNamed = !fix && typeof namesNoConversation === "function" && Boolean(attempt?.conversation) &&
+    !namesNoConversation(attempt.conversation) && normalizePrompt(messagePromptText(match)) === record.expected;
+  if ((fix || reviewNamed) && !record.conversation && attempt?.key === submissionKey() && attempt.conversation &&
+      stillShowsConversation(attempt.conversation)) {
     record.conversation = attempt.conversation;
   }
   state.confirmedSubmission = {key: submissionKey(), record};
@@ -386,6 +439,9 @@ async function clickSend(findSend, findComposer, expectedText) {
   }
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
+    // After the confirmation check, so an accepted send is still journaled as sent; before any
+    // click, so a stopped run never submits its prompt.
+    globalThis.throwIfStopped?.();
     if (typeof quotaHit === "function" && quotaHit()) {
       const error = new Error("provider usage limit before submission"); error.code = "quota"; throw error;
     }
@@ -407,9 +463,10 @@ async function clickSend(findSend, findComposer, expectedText) {
         record.phase = "attempted";
         saveSubmission(record); // durable intent BEFORE invoking the site's handler
         // In memory only: the conversation this page instance clicked in (submissionConfirmed
-        // records it once the send is proven, and only if the page still shows it then).
+        // records it once the send is proven, and only if the page still shows it then). The
+        // fresh-page fence (json.js throwIfStopped) ends here: the provider moves the page after a send.
         const runner = globalThis.__ashlarRunnerState;
-        if (runner) runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()};
+        if (runner) { runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()}; runner.freshPage = undefined; }
         step("send_attempted");
         try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
       }
@@ -425,6 +482,7 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   // Legacy pages have no durable send journal. Observe, but never guess and re-send.
   const expected = normalizePrompt(promptParts(prompt).prompt);
   for (;;) {
+    globalThis.throwIfStopped?.();
     const turns = userTurns();
     if (turns.length && (!expected || normalizePrompt(messagePromptText(turns.at(-1))).includes(expected))) {
       step("legacy_observation"); return;
@@ -437,13 +495,16 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   }
 }
 
-// Backstop, not a generation timeout: guards a page that never renders a composer (e.g. a stale
-// model URL or a logged-out landing) so the runner fails cleanly and releases the lane instead of
-// waiting forever. Generation itself stays unbounded elsewhere.
-const COMPOSER_DEADLINE_MS = 3 * 60 * 60 * 1000; // 3h
 async function waitUntilComposer() {
+  // Backstop, not a generation timeout: guards a page that never renders a composer (e.g. a stale
+  // model URL or a logged-out landing) so the runner fails cleanly and releases the lane instead of
+  // waiting forever. Generation itself stays unbounded elsewhere. Local, not a top-level const: the
+  // worker re-injects this file into a page that already ran it, and a redeclared global lexical
+  // binding aborts the whole script (leaving every older definition in place).
+  const COMPOSER_DEADLINE_MS = 3 * 60 * 60 * 1000; // 3h
   const deadline = Date.now() + COMPOSER_DEADLINE_MS;
   for (;;) {
+    globalThis.throwIfStopped?.();
     if (typeof quotaHit === "function" && quotaHit()) {
       const e = new Error("usage limit");
       e.code = "quota";

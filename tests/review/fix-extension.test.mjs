@@ -715,6 +715,83 @@ test('worker: a delivery promoted by its binding records its browser session; af
   assert.equal(proven2['fix-A'], undefined, 'a reused tab ID does not prove the delivery');
   assert.equal(local.state[DELIVERIES]['fix-A'], undefined, 'the unproven record is cleared (replayed once)');
 });
+// Round 17: EVERY candidate a fix delivery/allocation accepts is vetoed when another run claims the
+// tab (tabClaimedByOtherRun: the tab inventory or this session's owned record naming another jobId,
+// provider or runId). A claimed candidate is skipped; the other run's tab and owned record are never
+// modified, and nothing is closed.
+/** A worker whose tab 77 (a live ChatGPT tab in browser session boot-1) has the page binding
+ * `inventory` (or none) and the owned record `owned` (or none). A harvest never identifies run-A,
+ * so direct recovery (findOriginalTab) cannot establish it. */
+async function claimedTab77({inventory, owned, pending = {}, record}) {
+  const tabs = new Map([[77, {id: 77, url: URL_FIX, status: 'complete'}]]);
+  const fresh = UNBOUND_UNTIL_RUN();
+  const binding = {jobId: '', runId: '', ...inventory};
+  const handler = (id, m) => id !== 77 ? fresh(id, m) : m.type === 'ashlar-tab-status'
+    ? {ok: true, ownershipProtocol: 1, released: false, url: URL_FIX, provider: 'chatgpt', ...binding}
+    : {ok: false, code: 'busy', retry: true, jobId: '', runId: ''};
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: pending, ...(record ? {[DELIVERIES]: {'fix-A': record}} : {})}),
+    session: storage({'ashlar:browserSession': 'boot-1', ...(owned ? {'ashlar:tab:77': owned} : {})}), tabs, api: active, handler});
+  b.context.crypto = webcrypto;
+  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  return b;
+}
+const RUN_A = {jobId: 'fix-A', provider: 'chatgpt', runId: 'run-A'};
+
+test('worker: an allocating fix run-A whose tab 77 the inventory binds to run-A but whose owned record names run-B: 77 is not restored, run-A never owns it', async () => {
+  const b = await claimedTab77({inventory: RUN_A, owned: ownedRecord('run-B'), pending: {'fix-A': STOPPED()}});
+  const verdict = await b.context.fixAllocationEvidence(b.local.state.pendingReviewJobs['fix-A'], 'chatgpt');
+  assert.notEqual(verdict.tabId, 77, 'a tab another run claims is not run-A\'s evidence');
+  assert.equal(verdict.verdict, 'absent');
+  await b.tick();await b.tick();await b.tick();
+  assert.notEqual(b.local.state.pendingReviewJobs['fix-A'].states.chatgpt.tabId, 77, 'run-A does not adopt run-B\'s tab');
+  assert.equal(runsOf(b).some(m => m.id === 77), false, 'no run-A prompt reaches run-B\'s tab');
+  assert.deepEqual(b.session.state['ashlar:tab:77'], ownedRecord('run-B'), 'run-A\'s ownership is never recorded on 77');
+  assert.ok(b.tabs.has(77) && !b.closedTabs.includes(77), 'run-B\'s tab is never closed');
+});
+
+for (const evidence of ['inventory', 'owned record', 'inventory and owned record']) {
+  test(`worker: a created delivery of run-A whose live recorded tab carries run-B's ${evidence} is not proven: removed, run-B's tab untouched`, async () => {
+    const b = await claimedTab77({inventory: evidence.includes('inventory') ? {...RUN_A, runId: 'run-B'} : undefined,
+      owned: evidence.includes('owned') ? ownedRecord('run-B') : undefined, record: CREATED(77)});
+    const proven = await b.context.reconcileFixDeliveries({});
+    assert.equal(proven['fix-A'], undefined, 'the delivery is not kept out of the replay');
+    assert.equal(b.local.state[DELIVERIES]['fix-A'], undefined, 'the unproven record is removed (replayed once)');
+    assert.deepEqual(b.session.state['ashlar:tab:77'], evidence.includes('owned') ? ownedRecord('run-B') : undefined, 'run-B\'s owned record is unchanged');
+    assert.ok(b.tabs.has(77) && !b.closedTabs.includes(77), 'nothing is closed');
+  });
+}
+
+// Every candidate path, fed each conflicting owner (another runId, jobId or provider in the inventory or
+// the owned record). A path added later without the veto fails here. Controls: the conflict-free binding.
+test('worker: every fix candidate path (inventory fast path, recorded tab, created fast path, boundTab) skips a tab another run claims', async () => {
+  const OTHERS = {
+    inventory: [{...RUN_A, runId: 'run-B'}, {...RUN_A, jobId: 'fix-B'}],
+    owned: [ownedRecord('run-B'), {...ownedRecord('run-A'), jobId: 'fix-B'}, {...ownedRecord('run-A'), provider: 'grok'}],
+  };
+  const creating = {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', runId: 'run-A', at: Date.now()};
+  const allocation = async b => (await b.context.fixAllocationEvidence(b.local.state.pendingReviewJobs['fix-A'], 'chatgpt')).tabId === 77;
+  const reconcile = async b => (await b.context.reconcileFixDeliveries({}))['fix-A']?.tabId === 77;
+  const PATHS = [
+    // the candidate comes from the named source; the conflict is fed through the other one (or either)
+    {name: 'allocation inventory fast path', check: allocation, pending: true, candidate: {inventory: RUN_A}, conflicts: ['owned']},
+    {name: 'allocation recorded tab', check: allocation, pending: true, record: CREATED(77), candidate: {}, conflicts: ['inventory', 'owned']},
+    {name: 'reconcile created fast path', check: reconcile, record: CREATED(77), candidate: {}, conflicts: ['inventory', 'owned']},
+    {name: 'reconcile boundTab (owned record)', check: reconcile, record: creating, candidate: {owned: ownedRecord('run-A')}, conflicts: ['inventory']},
+    {name: 'reconcile boundTab (inventory)', check: reconcile, record: creating, candidate: {inventory: RUN_A}, conflicts: ['owned']},
+  ];
+  const failures = [];
+  for (const path of PATHS) {
+    const setup = extra => claimedTab77({pending: path.pending ? {'fix-A': STOPPED()} : {}, record: path.record, ...path.candidate, ...extra});
+    if (!await path.check(await setup({}))) failures.push(`${path.name}: control not accepted`);
+    for (const source of path.conflicts) for (const other of OTHERS[source]) {
+      const b = await setup({[source]: other});
+      if (await path.check(b)) failures.push(`${path.name}: accepted a tab whose ${source} names ${JSON.stringify(other)}`);
+      if (source === 'owned') assert.deepEqual(b.session.state['ashlar:tab:77'], other, 'the other run\'s owned record is unchanged');
+      assert.ok(b.tabs.has(77) && !b.closedTabs.includes(77), 'nothing is closed');
+    }
+  }
+  assert.deepEqual(failures, []);
+});
 test('worker: retiring a fix job forgets only its own delivery record', async () => {
   const b = worker([], {api: active});
   await b.local.set({[DELIVERIES]: {'fix-A': {deliveryId: 'delivery-2', provider: 'chatgpt', phase: 'creating', at: Date.now()}}});

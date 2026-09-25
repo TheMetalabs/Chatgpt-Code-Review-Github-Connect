@@ -664,31 +664,40 @@ async function recordedFixTab(record, live) {
   return {tab: record.session === await browserSessionId() ? live.get(record.tabId) : undefined};
 }
 
+/** True when the tab is claimed by a run other than `run` ({jobId, provider, runId}): its page binding
+ * (the tab inventory) or this session's owned record (ashlar:tab:<id>) names another jobId, provider
+ * or runId (a run with no runId, a legacy record, is compared by job and provider only). Such a tab
+ * is never evidence for `run`: every fix delivery/allocation candidate is vetoed through this, and
+ * the other run's tab and owned record are left untouched. */
+async function tabClaimedByOtherRun(tab, {jobId, provider, runId}) {
+  const other = binding => Boolean(binding?.jobId) && (binding.jobId !== jobId ||
+    Boolean(binding.provider && provider && binding.provider !== provider) || Boolean(runId && binding.runId !== runId));
+  if (other(knownTabOwner(tab))) return true;
+  return other((await chrome.storage.session.get([OWNED_PREFIX + tab.id]))[OWNED_PREFIX + tab.id]);
+}
+
 /** A fix allocation journaled (`allocating`) with no durable tabId, and no owned record or bound
  * page found for its run: the worker stopped between the intent and saving the tab. Decided from
- * evidence, never by waiting:
+ * evidence, never by waiting. Every candidate tab is accepted only while no other run claims it
+ * (tabClaimedByOtherRun); a claimed candidate is skipped and the next evidence is examined:
  * - "restore": a tab proves it: the page the tab inventory identifies as this run (`started`), or
- *   the tab its delivery record names, still open in this browser session and bound to no other run;
+ *   the tab its delivery record names, still open in this browser session;
  * - "absent": nothing can hold it (no record, an intent that never became a tab, a recorded tab
- *   that is gone or now bound to another run, or a record not tied to this browser session): the
+ *   that is gone or claimed by another run, or a record not tied to this browser session): the
  *   caller clears the intent, and the allocation opens exactly one tab (the other run keeps its tab). */
 async function fixAllocationEvidence(job, provider) {
   const state = job.states[provider];
+  const run = {jobId: job.jobId, provider, runId: state.runId};
   const tabs = await chrome.tabs.query({}), live = new Map(tabs.map(tab => [tab.id, tab]));
-  const bound = tabs.find(tab => { const owner = knownTabOwner(tab);
-    return allowedTab(tab, provider) && owner?.jobId === job.jobId && owner.provider === provider && owner.runId === state.runId && !owner.released; });
-  if (bound) return {verdict: "restore", tabId: bound.id, started: true};
+  for (const tab of tabs) {
+    const owner = knownTabOwner(tab);
+    if (allowedTab(tab, provider) && owner?.jobId === job.jobId && owner.provider === provider && owner.runId === state.runId &&
+        !owner.released && !await tabClaimedByOtherRun(tab, run)) return {verdict: "restore", tabId: tab.id, started: true};
+  }
   const record = (await fixDeliveries())[job.jobId];
   const mine = record?.deliveryId === job.deliveryId && record.provider === provider && (!record.runId || record.runId === state.runId);
   const recorded = mine ? await recordedFixTab(record, live) : {tab: undefined};
-  // The recorded tab is this run's only while nothing names another binding for it: its page (the
-  // tab inventory) or this session's owned record naming another job, provider or run means it now
-  // belongs to that run, and it is left to it untouched.
-  const other = binding => Boolean(binding?.jobId) &&
-    (binding.jobId !== job.jobId || binding.provider !== provider || binding.runId !== state.runId);
-  if (recorded.tab && !other(knownTabOwner(recorded.tab)) &&
-      !other((await chrome.storage.session.get([OWNED_PREFIX + recorded.tab.id]))[OWNED_PREFIX + recorded.tab.id]))
-    return {verdict: "restore", tabId: recorded.tab.id};
+  if (recorded.tab && !await tabClaimedByOtherRun(recorded.tab, run)) return {verdict: "restore", tabId: recorded.tab.id};
   return {verdict: "absent"};
 }
 
@@ -703,7 +712,8 @@ function forgetFixDelivery(job) {
  * allocation journal decides it, pollProvider validating the record with fixAllocationEvidence; the
  * job is excluded anyway). Any other record counts only while a tab proves it: its `created` tab
  * is still live on the provider in the browser session that recorded it, or a tab still carries the job's
- * binding (the session's owned-tab record, or the tab inventory); a `creating` record proven that way
+ * binding (the session's owned-tab record, or the tab inventory), and no other run claims that tab
+ * (tabClaimedByOtherRun: such a tab is skipped, left untouched); a `creating` record proven that way
  * (the worker stopped after the create, before the promotion) is promoted. A record nothing proves
  * (the worker stopped or was reset between the intent and chrome.tabs.create, or its tab is gone) is
  * cleared, so the server replays that delivery and it is opened once, instead of an intent that
@@ -718,12 +728,17 @@ async function reconcileFixDeliveries(jobs) {
   // record without a runId matches the job and provider).
   const sameRun = (binding, jobId, record) => binding?.jobId === jobId && (!binding.provider || binding.provider === record.provider) &&
     (!record.runId || binding.runId === record.runId);
-  const boundTab = (jobId, record) => {
+  // Every candidate (the recorded tab, then each bound tab) proves the record only while no other run
+  // claims it (tabClaimedByOtherRun); a claimed candidate is skipped, never modified.
+  const accept = async (tab, jobId, record) => onProvider(tab, record.provider) &&
+    !await tabClaimedByOtherRun(tab, {jobId, provider: record.provider, runId: record.runId});
+  const boundTab = async (jobId, record) => {
     for (const [key, value] of Object.entries(session)) {
       const tab = key.startsWith(OWNED_PREFIX) && sameRun(value, jobId, record) ? live.get(Number(key.slice(OWNED_PREFIX.length))) : undefined;
-      if (onProvider(tab, record.provider)) return tab.id;
+      if (await accept(tab, jobId, record)) return tab.id;
     }
-    return tabs.find(tab => sameRun(knownTabOwner(tab), jobId, record) && onProvider(tab, record.provider))?.id;
+    for (const tab of tabs) if (sameRun(knownTabOwner(tab), jobId, record) && await accept(tab, jobId, record)) return tab.id;
+    return undefined;
   };
   const proven = {}, rewrite = {};
   for (const [jobId, record] of Object.entries(records)) {
@@ -732,7 +747,7 @@ async function reconcileFixDeliveries(jobs) {
     // session's owned record or the live inventory) proves it in THIS session. Either way the proven
     // record names this session, so after a browser restart a reused ID never re-proves it.
     const recorded = await recordedFixTab(record, live);
-    const tabId = onProvider(recorded.tab, record.provider) ? recorded.tab.id : boundTab(jobId, record);
+    const tabId = await accept(recorded.tab, jobId, record) ? recorded.tab.id : await boundTab(jobId, record);
     if (!tabId) { rewrite[jobId] = null; continue; }
     proven[jobId] = {...record, phase: "created", tabId, session: browserSession};
     if (record.phase !== "created" || record.tabId !== tabId || record.session !== browserSession) rewrite[jobId] = proven[jobId];

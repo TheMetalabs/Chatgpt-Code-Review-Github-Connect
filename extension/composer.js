@@ -181,13 +181,26 @@ function renderedControl(el) {
   const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0;
 }
 
+/** The file-chip shapes a composer renders for a staged attachment: a named group, a data-file-name
+ * tile, or an element that names its file only in its title. ONE list for the send barrier
+ * (attachmentsReady: the run's own files are there) and the release verdict (json.js
+ * composerStagedFiles: a file there that is not the run's is the user's draft), so neither sees a
+ * chip the other misses (Ashlar 4101623051). Functions, not top-level consts: composer.js is
+ * re-injected into a page that already ran it. */
+function fileChipSelector() {
+  return '[role="group"][aria-label], [data-file-name], [title]';
+}
+/** Every name a file chip gives its file, in its shapes' order (data-file-name, aria-label, title). */
+function fileChipNames(chip) {
+  return ["data-file-name", "aria-label", "title"].map(name => chip.getAttribute(name)).filter(name => name !== null);
+}
+
 function attachmentsReady(form, names = []) {
   if (!form) return names.length === 0;
   const progress = form.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-state="uploading"], [class*="animate-spin"]');
   if ([...progress].some(renderedControl)) return false;
-  const chips = [...form.querySelectorAll('[role="group"][aria-label], [data-file-name], [title]')].filter(renderedControl);
-  return names.every(name => chips.some(chip =>
-    chip.getAttribute("data-file-name") === name || chip.getAttribute("aria-label") === name || chip.getAttribute("title") === name));
+  const chips = [...form.querySelectorAll(fileChipSelector())].filter(renderedControl);
+  return names.every(name => chips.some(chip => fileChipNames(chip).includes(name)));
 }
 
 function normalizePrompt(text) {

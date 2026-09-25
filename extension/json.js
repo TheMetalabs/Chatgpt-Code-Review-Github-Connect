@@ -304,8 +304,11 @@ function composerDraftText() {
  * name: its journal's, or the ones fillComposer is uploading). A confirmed send took its attachments
  * out of the composer with the sent turn, so afterwards every chip there is the user's, whatever its
  * name: a file named like the run's old upload is the user's new one (Ashlar 4101062749). The chips
- * are the named shapes the send barrier recognises (attachmentsReady), in the composer's own form; a
- * group that wraps the editor or the send control is the composer, not a file. */
+ * are every shape the send barrier accepts (composer.js fileChipSelector, shared with
+ * attachmentsReady, title-only chips included: Ashlar 4101623051), in the composer's own form, and a
+ * chip is the run's own when any name it gives matches, as the barrier reads it. A group that wraps
+ * the editor or the send control is the composer, not a file, and a named element inside a chip (its
+ * remove control's title) is part of that chip, not another file. */
 function composerStagedFiles(state, submission) {
   const editor = typeof composer === "function" && globalThis.document ? composer() : null;
   const form = editor?.closest?.("form");
@@ -313,10 +316,12 @@ function composerStagedFiles(state, submission) {
   const own = new Set(submission?.phase === "sent" ? [] : [...(Array.isArray(submission?.attachments) ? submission.attachments : []),
     ...(Array.isArray(state?.pendingAttachments) ? state.pendingAttachments : [])]);
   const shown = chip => (typeof renderedControl === "function" ? renderedControl(chip) : !hiddenNode(chip));
-  return [...form.querySelectorAll('[data-file-name], [role="group"][aria-label]')]
-    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button') && shown(chip))
-    .map(chip => chip.getAttribute("data-file-name") || chip.getAttribute("aria-label") || "")
-    .filter(name => name.trim() && !own.has(name));
+  const chips = [...form.querySelectorAll(fileChipSelector())]
+    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button') && shown(chip));
+  return chips.filter(chip => !chips.some(outer => outer !== chip && outer.contains(chip)))
+    .map(chip => fileChipNames(chip).filter(name => name.trim()))
+    .filter(names => names.length && !names.some(name => own.has(name)))
+    .map(names => names[0]);
 }
 
 /** The response's variant pager: what the provider shows on an answer once it was regenerated (a

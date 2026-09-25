@@ -209,6 +209,48 @@ for(const kind of ['review','fix'])for(const [name,cause,takeover] of TAKEOVERS)
  assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
  assert.ok((await tab.steps()).includes('context_changed'));
 });
+// Ashlar 4101623051: every file-chip shape the send barrier accepts is a staged file for the release
+// verdict too (composer.js fileChipSelector: one list for attachmentsReady and composerStagedFiles), a
+// chip that names its file only in its title included.
+const CHIP_SHAPES=[
+ ['a named group',name=>`<div role="group" aria-label="${name}" style="width:120px;height:40px">${name}<button aria-label="Remove file">x</button></div>`],
+ ['a data-file-name tile',name=>`<div data-file-name="${name}" style="width:120px;height:40px">${name}<button aria-label="Remove file">x</button></div>`],
+ ['a title-only chip',name=>`<div title="${name}" style="width:120px;height:40px">${name}<button aria-label="Remove file">x</button></div>`],
+];
+const stageChip=(page,chip,name)=>page.evaluate(html=>document.querySelector('form').insertAdjacentHTML('afterbegin',html),chip(name));
+for(const [shape,chip] of CHIP_SHAPES){
+ test(`the send barrier and the release verdict read the same file chip (${shape})`,async t=>{
+  const tab=await chatTab(t,{bound:false});
+  await stageChip(tab.page,chip,'my-notes.pdf');
+  assert.deepEqual(await tab.page.evaluate(()=>({ready:attachmentsReady(document.querySelector('form'),['my-notes.pdf']),staged:composerStagedFiles(null,null)})),
+   {ready:true,staged:['my-notes.pdf']});
+ });
+ for(const kind of ['review','fix'])test(`${kind}: a secured tab where the user staged a file (${shape}) is preserved as a draft, never closed`,async t=>{
+  const {tab}=await collected(t,{kind});
+  await stageChip(tab.page,chip,'my-notes.pdf');
+  const out=await canClose(tab);
+  assert.deepEqual({...verdict(out),ownership:out.ownership},{canClose:false,reason:'repurposed',cause:'draft',ownership:'takenOver'});
+ });
+ test(`review: an undispatched page where the user staged a file (${shape}) is not blank: never claimed as Ashlar's`,async t=>{
+  const tab=await chatTab(t,{bound:false});
+  await stageChip(tab.page,chip,'my-notes.pdf');
+  const out=await tab.send('ashlar-fix-cancel',{allocationUrl:TEMP_URL,undispatched:true});
+  assert.deepEqual({owned:out.owned,canClose:out.canClose,ownership:out.ownership,blank:out.blank,cause:out.cause},{owned:false,canClose:false,ownership:'takenOver',blank:false,cause:'draft'});
+ });
+ // A named element inside a chip (a remove control's title) is part of that chip, not another file:
+ // before the send, the run's own chip is still its own.
+ test(`worker, review: a leg cancelled while its own attachment (${shape}, its remove control titled) still uploads is closed: its own file is not a draft`,async t=>{
+  const own=name=>chip(name).replace('<button aria-label="Remove file">','<button title="Remove file" aria-label="Remove file">');
+  const tab=await chatTab(t,{composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:['diff.patch']}});
+  await stageChip(tab.page,own,'diff.patch');
+  const w=wire(tab);
+  await w.tick();await tab.page.clock.runFor(1000);
+  assert.equal((await tab.runner()).running,true,'waiting for its attachment upload');
+  w.server.value='cancelled';
+  await w.tick();
+  assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
+ });
+}
 for(const kind of ['review','fix'])test(`${kind}: a secured tab moved in-page to another conversation (old DOM still rendered) is the user's`,async t=>{
  const {tab}=await collected(t,{kind});
  assert.equal((await canClose(tab)).canClose,true,'control: still in its own conversation');

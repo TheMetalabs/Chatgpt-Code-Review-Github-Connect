@@ -31,7 +31,7 @@ import {
   parseStopRecord,
   type ReviewLoopMode,
 } from "./review-loop.ts";
-import { sameSession, startMarkerOf, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
+import type { LoopEvent, LoopSession, SessionRef } from "./review-loop-session.ts";
 import { retryWrite, writeOutcomeUnknown } from "./write-retry.ts";
 
 export type ControlKind = "start" | "stop" | "continue" | "handoff";
@@ -64,10 +64,15 @@ export function prKey(ref: PrRef): string {
 }
 
 /**
- * The key string of a write. A session is named by its start record's comment id when known — two
- * starts in one second share their instant — else by the start's marker (a start whose POST
- * outcome is unknown has no id until it is listed). The journal aliases the two (OwnWrites.find):
- * a session that learns its id never gets a second entry, so never a second POST.
+ * The key string of a write. A continuation or handoff names its session by the anchor's INSTANT,
+ * which is the whole of a session's identity: at one instant the fold (review-loop-session ORDER)
+ * places the App's terminal records first, then every start, then human stops — so all starts in
+ * one second are consecutive, the first opens the session (or re-issues an active one) and every
+ * later one re-issues it. No two sessions are ever anchored in one second. Never by the anchor's
+ * start RECORD (its comment id, or its marker): which of a second's starts anchors depends on what
+ * a read lists (the first listed record, else the first stand-in), so that name changes with the
+ * list mid-session — and a key that changed would POST the same continuation or handoff twice.
+ * The record's id only scopes the write's rows (controlInSession, keepScope).
  */
 export function controlKey(k: ControlKey): string {
   const pr = prKey(k.ref);
@@ -78,7 +83,7 @@ export function controlKey(k: ControlKey): string {
       return `stop:${pr}:${k.by.toLowerCase()}:${isoMs(k.at)}`;
     case "continue":
     case "handoff":
-      return `${k.kind}:${pr}@${k.head}#${k.session?.seq !== undefined ? `s${k.session.seq}` : `m${startMarkerOf(k.session)}`}`;
+      return `${k.kind}:${pr}@${k.head}#${k.session?.at ? isoMs(k.session.at) : ""}`;
     default:
       return assertNever(k);
   }
@@ -117,6 +122,18 @@ export function sameStart(a: { mode: string; by: string; at: string } | null, b:
 /** The scope of a session's own control rows: after its start record (see controlInSession). */
 function sessionScope(s: SessionRef | undefined): { iso?: string; seq?: number } {
   return { iso: s?.at, seq: s?.seq };
+}
+
+/** `w`, scoped no looser than `prior` (the same write, as its journal entry holds it): a read that
+ * has no id for the session's start record — or an earlier one — never widens the rows that answer
+ * for the write (the tightest known id wins); `w` brings its text. */
+function keepScope(w: ControlWrite, prior: ControlWrite): ControlWrite {
+  const k = w.key;
+  const p = prior.key;
+  if ((k.kind !== "continue" && k.kind !== "handoff") || p.kind !== k.kind) return w;
+  const [a, b] = [k.session?.seq, p.session?.seq];
+  const seq = a === undefined ? b : b === undefined ? a : Math.max(a, b);
+  return seq === a ? w : { ...w, key: { ...k, session: { ...k.session, seq } } };
 }
 
 /** The ONE definition of "this listed row is that write" (the caller has proven the App wrote it). */
@@ -187,7 +204,7 @@ export type EmitOutcome =
 type WriteState = "intent" | "sending" | "posted" | "unknown" | "rejected";
 
 interface OwnWrite {
-  /** Its journal key: controlKey of its write — the id-bearing one once its session knows its id. */
+  /** Its journal key: controlKey of its write (never changes: see controlKey). */
   key: string;
   write: ControlWrite;
   /** Honored by the session fold before (and whatever) its POST: a stop from the first moment. */
@@ -273,34 +290,13 @@ export class OwnWrites {
     return fresh;
   }
 
-  /**
-   * The entry of `w`: under its key, or — a continuation or handoff — the entry of the same kind,
-   * head and session (sameSession) under the other name of that session: its marker before the
-   * start record's id was known, or its id when `w` does not know it. An entry found by its marker
-   * moves to the id-bearing key: one entry per session, whichever name a caller has.
-   */
+  /** The entry of `w`, if journaled. */
   private find(w: ControlWrite): OwnWrite | undefined {
-    const all = this.byPr.get(prKey(w.key.ref));
-    const key = controlKey(w.key);
-    const exact = all?.get(key);
-    if (exact || !all) return exact;
-    const k = w.key;
-    if (k.kind !== "continue" && k.kind !== "handoff") return undefined;
-    for (const e of all.values()) {
-      const o = e.write.key;
-      if (o.kind !== k.kind || o.head !== k.head || !sameSession(o.session, k.session)) continue;
-      if (k.session?.seq !== undefined && o.session?.seq === undefined) {
-        all.delete(e.key);
-        e.key = key;
-        all.set(key, e);
-      }
-      return e;
-    }
-    return undefined;
+    return this.byPr.get(prKey(w.key.ref))?.get(controlKey(w.key));
   }
 
-  /** The entry of `w` (created unsent), carrying the latest text and session scope of the write —
-   * a caller that names the session only by its marker brings its text, never a looser scope. */
+  /** The entry of `w` (created unsent), carrying the latest text of the write and never a looser
+   * session scope (keepScope). */
   upsert(w: ControlWrite): OwnWrite {
     const e = this.find(w);
     if (!e) {
@@ -309,7 +305,7 @@ export class OwnWrites {
       this.entries(w.key.ref).set(key, fresh);
       return fresh;
     }
-    if (!e.inflight) e.write = controlKey(w.key) === e.key ? w : { ...w, key: e.write.key };
+    if (!e.inflight) e.write = keepScope(w, e.write);
     return e;
   }
 

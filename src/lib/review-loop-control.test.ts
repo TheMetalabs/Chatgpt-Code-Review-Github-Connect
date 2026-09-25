@@ -110,7 +110,7 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.deepEqual(b, a);
     assert.deepEqual(await emitControl(f.ctx, handoff()), { status: "exists" }, "a later emit finds this process's own write");
     assert.equal(f.posts(), 1);
-    // an id-less session is named by its start's marker: the instant, not its spelling
+    // a session is named by its anchor instant, not its spelling
     const k = { kind: "continue" as const, ref: ref(), head: HEAD };
     assert.equal(controlKey({ ...k, session: { at: "2026-02-20T00:00:00Z" } }), controlKey({ ...k, session: { at: "2026-02-20T00:00:00.000Z" } }));
   });
@@ -422,7 +422,7 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
   });
 });
 
-describe("session identity: one continuation and one handoff per head per SESSION — its start record's id, or its marker until the id is known (#79 K1)", () => {
+describe("session identity: one continuation and one handoff per head per SESSION — named by its anchor instant; its start record's id only scopes the rows (#79 K1)", () => {
   const START = "2026-02-20T00:00:00Z"; // alice's and bob's start directives: the same second
   const PUSHED = "b".repeat(40);
   const bot = { authoredByBot: true };
@@ -432,37 +432,58 @@ describe("session identity: one continuation and one handoff per head per SESSIO
   });
   const escalateIn = (f: ReturnType<typeof world>, session: SessionRef) =>
     escalateNow(f.gh, "t", { owner: "o", repo: "r", pr: 1, head: HEAD, reason: "fix-failed", rounds: [], roundCap: 3, botLogin: BOT, session, sleep: f.ctx.sleep, now: f.ctx.now });
-  /** A start record stored by the fake (ids grow with creation): its id names its session. */
+  /** A start record stored by the fake (ids grow with creation). */
   const recordStart = (f: ReturnType<typeof world>, by: string, mode: "suggest" | "apply"): number => {
     const row = { id: f.rows.length + 1, userLogin: BOT, body: startComment({ mode, by, at: START }), createdAt: START };
     f.rows.push(row);
     return row.id;
   };
 
-  it("two starts in one second: session B's continuation and handoff each get their own single POST beside A's posted or unknown one", async () => {
+  it("the fold anchors at most one session in a second: whatever order a read lists a second's starts and terminal records in, the anchor instant is the same", () => {
+    // at one instant the fold orders the App's terminal records, then starts, then human stops:
+    // the second's starts are consecutive, so the first opens the session and the rest re-issue it
+    const second: LoopEvent[] = [
+      { at: START, kind: "start", actor: "alice", mode: "suggest", seq: 3 },
+      { at: START, kind: "start", actor: "bob", mode: "apply" },
+      { at: START, kind: "escalate" },
+      { at: START, kind: "start", actor: "carol", mode: "suggest", seq: 2 },
+    ];
+    const orders = (xs: LoopEvent[]): LoopEvent[][] => (xs.length <= 1 ? [xs] : xs.flatMap((x, i) => orders([...xs.slice(0, i), ...xs.slice(i + 1)]).map((o) => [x, ...o])));
+    for (const before of [[], [{ at: "2026-02-19T00:00:00Z", kind: "start", actor: "dave", mode: "suggest" }]] as LoopEvent[][]) {
+      for (const stop of [[], [{ at: START, kind: "stop", actor: "erin" }]] as LoopEvent[][]) {
+        const seen = new Set<string>();
+        for (const order of orders([...second, ...stop])) {
+          const s = deriveLoopSession([...before, ...order]);
+          seen.add(JSON.stringify([s.active, isoMs(s.startIso), s.endedBy, isoMs(s.endedAt)]));
+        }
+        assert.equal(seen.size, 1, `${before.length} earlier start(s), ${stop.length} stop(s): ${[...seen].join(" | ")}`);
+      }
+    }
+  });
+
+  it("two starts in one second are ONE session: the second start's continuation and handoff find the first's posted or unknown ones — no second POST", async () => {
     for (const aStart of ["listed", "id-less"] as const) {
       for (const prior of ["posted", "unknown"] as const) {
-        const label = `A ${aStart} | A's writes ${prior}`;
-        // A's continuation and handoff are the first two POSTs; every later one succeeds
+        const label = `alice's start ${aStart} | her session's writes ${prior}`;
+        // the continuation and handoff are the first two POSTs; every later one would succeed
         const f = world(prior === "posted" ? ["ok"] : ["lost", "lost", "ok"]);
         const aliceSeq = aStart === "listed" ? recordStart(f, "alice", "suggest") : undefined;
-        const A: SessionRef = { at: START, by: "alice", mode: "suggest", ...(aliceSeq !== undefined ? { seq: aliceSeq } : {}) };
+        const A: SessionRef = { at: START, ...(aliceSeq !== undefined ? { seq: aliceSeq } : {}) };
         assert.equal((await emitControl(f.ctx, continuation(A))).status, prior === "posted" ? "posted" : "unknown", label);
         const aHandoff = await escalateIn(f, A);
         assert.equal(prior === "posted" ? aHandoff.escalated : aHandoff.ambiguous, true, `${label}: ${JSON.stringify(aHandoff)}`);
         assert.equal(f.posts(), 2, label);
-        // bob's start in the same second, recorded after A's writes: a new session, same instant
-        const B: SessionRef = { at: START, seq: recordStart(f, "bob", "apply"), by: "bob", mode: "apply" };
-        assert.deepEqual(await emitControl(f.ctx, continuation(B)), { status: "posted" }, `${label}: B's continuation`);
-        assert.deepEqual(await escalateIn(f, B), { escalated: true }, `${label}: B's handoff`);
-        assert.equal(f.posts(), 4, `${label}: one POST each for B`);
-        assert.deepEqual(await emitControl(f.ctx, continuation(B)), { status: "exists" }, `${label}: B's continuation again`);
-        assert.deepEqual(await escalateIn(f, B), { escalated: false }, `${label}: B's handoff again`);
-        // A's own entries still answer for A (a later row may confirm A's unknown one: its scope
-        // is "after A's start")
-        assert.notEqual((await emitControl(f.ctx, continuation(A))).status, "posted", `${label}: A's continuation again`);
-        assert.equal((await escalateIn(f, A)).escalated, false, `${label}: A's handoff again`);
-        assert.equal(f.posts(), 4, `${label}: no second POST for either session`);
+        // bob's start in the same second, recorded after those writes: it re-issues the session —
+        // and a read that lists his record first (alice's id-less) anchors it there
+        const B: SessionRef = { at: START, seq: recordStart(f, "bob", "apply") };
+        for (const session of [B, A]) {
+          const again = await emitControl(f.ctx, continuation(session));
+          assert.equal(again.status, prior === "posted" ? "exists" : "unknown", `${label}: the continuation again (${JSON.stringify(session)})`);
+          const handoffAgain = await escalateIn(f, session);
+          assert.equal(handoffAgain.escalated, false, `${label}: the handoff again (${JSON.stringify(session)})`);
+          assert.equal(handoffAgain.ambiguous, prior === "unknown" ? true : undefined, `${label}: ${JSON.stringify(handoffAgain)}`);
+        }
+        assert.equal(f.posts(), 2, `${label}: no second POST`);
       }
     }
   });
@@ -487,23 +508,26 @@ describe("session identity: one continuation and one handoff per head per SESSIO
         assert.equal(await emit(idless), again, `${label}: named by its marker again`);
         assert.equal(f.posts(), 1, `${label}: one POST`);
         const key = controlKey(kind === "continue" ? continuation(listed).key : handoff(1, listed).key);
-        assert.equal(ownWrites(f.gh).state(key), plan === "ok" ? "posted" : "unknown", `${label}: the entry moved to the id-bearing key`);
+        assert.equal(key, controlKey(kind === "continue" ? continuation(idless).key : handoff(1, idless).key), `${label}: one key`);
+        assert.equal(ownWrites(f.gh).state(key), plan === "ok" ? "posted" : "unknown", label);
         assert.equal(ownWrites(f.gh).stats().entries, 1, `${label}: one entry`);
       }
     }
   });
 
-  it("an emit that names the session only by its marker keeps the entry's id scope: an older session's row never answers for it", async () => {
-    const f = world(["lost"]);
-    const listed: SessionRef = { at: START, by: "alice", mode: "suggest", seq: 5 };
-    assert.equal((await emitControl(f.ctx, continuation(listed))).status, "unknown");
-    // the last session's continuation for the head: posted after alice's directive but before her
-    // start record (id 3 < 5), so it is in her session by time and not by id
-    f.rows.push({ id: 3, userLogin: BOT, body: continuation(listed).body as string, createdAt: "2026-02-20T00:00:01Z" });
-    const { seq: _seq, ...marker } = listed;
-    assert.equal((await emitControl(f.ctx, continuation(marker))).status, "unknown", "the older row never confirms this session's write");
-    assert.equal((await emitControl(f.ctx, continuation(listed))).status, "unknown");
-    assert.equal(f.posts(), 1);
+  it("an emit whose read has no id for the session's start record, or an earlier one, keeps the entry's id scope: an older session's row never answers for it", async () => {
+    for (const caller of [{ at: START }, { at: START, seq: 3 }] as SessionRef[]) {
+      const label = JSON.stringify(caller);
+      const f = world(["lost"]);
+      const listed: SessionRef = { at: START, seq: 5 };
+      assert.equal((await emitControl(f.ctx, continuation(listed))).status, "unknown", label);
+      // the last session's continuation for the head: posted after alice's directive but before her
+      // start record (id 4 < 5), so it is in her session by time (and by the looser id) only
+      f.rows.push({ id: 4, userLogin: BOT, body: continuation(listed).body as string, createdAt: "2026-02-20T00:00:01Z" });
+      assert.equal((await emitControl(f.ctx, continuation(caller))).status, "unknown", `${label}: the older row never confirms this session's write`);
+      assert.equal((await emitControl(f.ctx, continuation(listed))).status, "unknown", label);
+      assert.equal(f.posts(), 1, label);
+    }
   });
 
   const NEW_SHA = "e".repeat(40); // a fix round's commit
@@ -613,7 +637,7 @@ describe("session identity: one continuation and one handoff per head per SESSIO
     }
   });
 
-  it("push handler: a start in the same second as an id-less one opens a session that gets its own continuation, once", async () => {
+  it("push handler: a start in the same second as an id-less one re-issues that session: its continuation is found, never POSTed again", async () => {
     for (const cont of ["ok", "lost"] as const) {
       let continuations = 0;
       // alice's start record is lost; her session's continuation `cont`; everything later lands
@@ -627,10 +651,38 @@ describe("session identity: one continuation and one handoff per head per SESSIO
       assert.equal(first.posted || first.unresolved, true, `${cont}: ${JSON.stringify(first)}`);
       assert.deepEqual(await f.start("bob", "apply"), { posted: true, reason: "started" }, cont);
       const s = await f.session();
-      assert.deepEqual([s.active, isoMs(s.startIso), s.startBy, s.startSeq], [true, isoMs(START), "bob", f.rows.length], `${cont}: bob's session, in the same second`);
-      assert.deepEqual(await f.push(), { posted: true, reason: "continued" }, `${cont}: bob's session requests its own review`);
-      assert.deepEqual(await f.push(), { posted: false, reason: "already continued" }, cont);
-      assert.equal(f.continuations(), 2, `${cont}: one continuation POST per session`);
+      // bob's listed record now anchors the session (listed before alice's stand-in): same second
+      assert.deepEqual([s.active, isoMs(s.startIso), s.startSeq], [true, isoMs(START), f.rows.length], `${cont}: ${JSON.stringify(s)}`);
+      const again = await f.push();
+      assert.equal(again.reason.startsWith(cont === "ok" ? "already continued" : "continuation outcome unknown"), true, `${cont}: ${JSON.stringify(again)}`);
+      assert.equal(f.continuations(), 1, `${cont}: one continuation POST`);
+    }
+  });
+
+  it("push handler: the list catching up to, or relapsing behind, a same-second start moves the session's anchor between its two starts — one continuation", async () => {
+    // alice's start record is lost (a stand-in with no id for the life of the process); bob's, in
+    // the same second, is stored (`bobStart`: its response too, or not). Which of the two anchors
+    // depends on what a read lists: bob's listed record first, else alice's stand-in.
+    for (const bobStart of ["ok", "landed"] as const) {
+      for (const list of ["catches-up", "relapses"] as const) {
+        const label = `bob's start ${bobStart} | the list ${list}`;
+        const f = pushWorld((body) => {
+          const start = parseStartMarker(body, bot);
+          return start?.by === "alice" ? "lost" : start ? bobStart : "ok";
+        });
+        if (list === "catches-up") f.view.shown = () => false; // behind every row
+        await f.start("alice", "suggest");
+        await f.start("bob", "suggest");
+        const before = await f.session();
+        assert.deepEqual(await f.push(), { posted: true, reason: "continued" }, label);
+        // bob's record (id 1) is listed, the continuation (id 2) not yet; or a replica behind both
+        f.view.shown = list === "catches-up" ? (id) => id <= 1 : () => false;
+        const after = await f.session();
+        assert.notEqual(after.startSeq, before.startSeq, `${label}: the anchor moved to the other start`);
+        assert.deepEqual([after.active, isoMs(after.startIso)], [true, isoMs(before.startIso)], `${label}: the same session`);
+        assert.deepEqual(await f.push(), { posted: false, reason: "already continued" }, label);
+        assert.equal(f.continuations(), 1, `${label}: one continuation POST`);
+      }
     }
   });
 

@@ -27,8 +27,12 @@ import {
   takeNextBridgeJob,
 } from "@/lib/bridge.server";
 
-function promptsForClient<T extends {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>}>(value: T | null, protocol: unknown): T | null {
+/** A review prompt in the worker's attachment protocol (bridgePromptText). A FIX prompt is
+ * delivered verbatim, byte-exact, whatever the protocol: it inlines whole source files, so an
+ * envelope-looking line in a file is content, never an attachment to convert or reject. */
+function promptsForClient<T extends {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>; kind?: string}>(value: T | null, protocol: unknown, fix = value?.kind === "fix"): T | null {
   if (!value) return null;
+  if (fix) return value;
   return {...value, prompt: bridgePromptText(value.prompt, protocol),
     ...(value.prompts ? {prompts: Object.fromEntries(Object.entries(value.prompts).map(([provider, text]) => [provider, bridgePromptText(text || "", protocol)]))} : {})};
 }
@@ -75,7 +79,7 @@ export const Route = createFileRoute("/api/bridge")({
           return Response.json({ ok: false, code: "fix_protocol_required", error: "fix items need fixProtocol:1" }, { status: 409, headers });
         }
         if (jobId) {
-          const prompt = promptsForClient(promptForJob(jobId), new URL(request.url).searchParams.get("attachmentProtocol") === "2" ? 2 : 1);
+          const prompt = promptsForClient(promptForJob(jobId), new URL(request.url).searchParams.get("attachmentProtocol") === "2" ? 2 : 1, isBridgeFixId(jobId));
           if (!prompt) return Response.json({ ok: false, error: "no prompt" }, { status: 404, headers });
           return Response.json({ ok: true, ...prompt }, { headers });
         }

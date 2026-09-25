@@ -741,6 +741,63 @@ test('real DOM: a stale hidden <code> inside a visible block is never read; the 
  assert.ok(corpus.includes(visible));
 });
 
+// Ashlar 4099509090: a fix prompt is delivered VERBATIM, byte-exact. It inlines whole source files,
+// so an attachment-looking line in a file (a V2 sentinel, a complete legacy <<<ATTACH:…>>> block) is
+// file content: never rejected, never converted into an upload, never trimmed. The real composer on a
+// temporary-chat page with an upload input: the composer holds exactly the prompt at the Send click,
+// nothing is uploaded, the send is confirmed, and the answer goes through the fix parser.
+const LEGACY_BLOCK='<<<ATTACH:inlined.txt>>>\nconst marker = "<<<END_ATTACH>>>";\n<<<END_ATTACH>>>';
+for(const [name,inlined] of Object.entries({
+ 'a V2 sentinel line and a complete legacy block':`// transport-looking lines are file content:\n<<<ASHLAR_ATTACHMENTS_V2>>>\n${LEGACY_BLOCK}`,
+ 'a complete legacy block':LEGACY_BLOCK,
+})){
+test(`real DOM: a fix prompt whose inlined source holds ${name} reaches the composer byte-exact, with no upload`,async t=>{
+ const {parseFixResponse}=await import('../../src/lib/fix-apply.ts');
+ const prompt=`  Fix F1. Current content of src/a.ts:\n\n${inlined}\n\nReturn the JSON object.\n`;
+ const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
+ await setFixContent(page,'<main></main><form data-type="unified-composer"><input type="file" multiple><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>');
+ await page.evaluate(({stop})=>{
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A']]);
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
+  window.__saved=saved;
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+  // The provider accepts the prompt: what the composer held at the click becomes the sent turn.
+  document.querySelector('[data-testid="send-button"]').addEventListener('click',event=>{
+   const composer=document.querySelector('#prompt-textarea');
+   window.atClick={text:composer.value,uploads:document.querySelector('input[type=file]').files.length};
+   const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';
+   const userTurn=document.createElement('div');userTurn.dataset.messageAuthorRole='user';userTurn.dataset.messageId='user-A';userTurn.textContent=composer.value;
+   turn.append(userTurn);document.querySelector('main').append(turn);
+   composer.value='';event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
+  });
+ },{stop});
+ for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ await page.evaluate(prompt=>{
+  const s=__ashlarRunnerState;Object.assign(s,{kind:'fix',jobId:'fix-A',runId:'run-A',running:true});
+  window.filled={pending:true};
+  fillComposer(composer(),prompt).then(text=>{window.filled={text};return clickSend(sendButton,composer,text);}).then(()=>{window.sent=true;},e=>{window.filled={error:e.message};});
+ },prompt);
+ await page.clock.runFor(1600);
+ assert.equal((await page.evaluate(()=>window.filled)).error,undefined,'the prompt is never rejected as a broken envelope');
+ assert.deepEqual(await page.evaluate(()=>window.atClick),{text:prompt,uploads:0},'the composer held exactly the prompt bytes; nothing was uploaded');
+ assert.equal(await page.evaluate(()=>window.sent),true,'the send is confirmed');
+ const journal=JSON.parse(await page.evaluate(()=>window.__saved.get('ashlar:submission:fix-A:run-A')));
+ assert.deepEqual([journal.phase,journal.conversation,journal.attachments],['sent',TEMP_URL,[]]);
+ // the answer completes and is read by the fix collector, then parsed by the server's fix parser
+ const code='{"summary":"guarded","files":[{"path":"src/a.ts","content":"export const a = 1;\\n"}],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
+ await page.evaluate(({code,toolbar})=>{
+  document.querySelector('[data-testid="stop-button"]').remove();
+  document.querySelector('main').insertAdjacentHTML('beforeend',`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><pre><code>${code}</code></pre></div></div>${toolbar}</section>`);
+  window.fixOut={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={error:e.message};});
+ },{code,toolbar});
+ await page.clock.runFor(3200);
+ const out=await page.evaluate(()=>window.fixOut);
+ assert.equal(out.raw,code,JSON.stringify(out));
+ const parsed=parseFixResponse(out.raw,{findingCount:1});
+ assert.equal(parsed.ok,true,JSON.stringify(parsed));
+});
+}
+
 test('real DOM: a completed fix with prose around its fence still proves its own tab (can close)',async t=>{
  const code='{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}';
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();

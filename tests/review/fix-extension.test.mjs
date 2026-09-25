@@ -100,6 +100,11 @@ const COLLECT_VERDICTS = {
   unestablished: {permanent: true, journal: {conversation: undefined}},
   unreadableLocation: {permanent: true, set: c => { c.location = {href: ''}; }},
   turnUnrendered: {permanent: false, set: c => { c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  // round 15: a permanent verdict is decided BEFORE the response must be identified: moved away with
+  // the old DOM gone, or the sent turn replaced (no response binds to it any more)
+  movedUnrendered: {permanent: true, set: c => { c.location = {href: 'https://chatgpt.com/c/users-own'}; c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  replacedUnrendered: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  movedComposerEcho: {permanent: true, set: c => { c.location = {href: 'https://chatgpt.com/c/users-own'}; c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
   composerEcho: {permanent: false, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
 };
 for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {

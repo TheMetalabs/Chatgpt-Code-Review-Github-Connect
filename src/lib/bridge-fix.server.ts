@@ -68,7 +68,10 @@
  * once: the page frees its managed slot and reports `taken_over`, and the worker delivers it as a
  * failure (T15), so the runtime retries or escalates now instead of at the deadline. Only a
  * transient "unknown" (journal unreadable, turn not rendered yet, still generating) keeps the run
- * polling, and the deadline (T16) bounds that.
+ * polling, and the deadline (T16) bounds that. Every permanent verdict that needs no identified
+ * response (the send-time conversation, the journaled sent turn's exact text) is decided BEFORE any
+ * transient one, at every page decision (collect, hand-out, can-close, restore), so a transient wait
+ * never hides it until the deadline.
  * TAB ENDS (extension/background.js cleanupFixTab): a fix tab is closed ONLY on the proven-success
  * path — DONE (T14) acknowledged to the worker AND the page's complete-phase proof passing at close
  * time (send-time conversation, exact sent turn, stored completion unchanged, no draft or

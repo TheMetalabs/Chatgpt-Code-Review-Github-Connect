@@ -485,6 +485,12 @@ const PROOF_VIOLATIONS={
   sessionStorage.setItem(key,JSON.stringify(journal));delete __ashlarRunnerState.confirmedSubmission?.record.conversation;
  }),
  responseChanged:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="response-A"] code').textContent='{"summary":"regenerated","files":[]}';}),
+ // round 15 (Ashlar 4100156785): permanent verdicts that leave NO identifiable response. The user
+ // navigates in-page to another conversation and the old DOM is removed (the new page renders
+ // nothing yet); or the sent turn's text is replaced with unrelated text (the turn no longer
+ // contains the prompt, so no response binds to it).
+ movedDomRemoved:({page,move})=>move(OTHER_URL).then(()=>page.evaluate(()=>{document.querySelector('main').innerHTML='';document.querySelector('[data-testid="stop-button"]')?.remove();})),
+ turnReplaced:({page})=>page.evaluate(()=>{document.querySelector('[data-message-id="user-A"]').textContent='an unrelated question of my own';}),
 };
 const PROOF_DECISIONS={
  // P19 collect: the violation is present when the answer completes
@@ -503,7 +509,8 @@ const PROOF_DECISIONS={
 };
 // A changed response is a violation only once a completion is stored; the collector has none to
 // compare with. (There is no cancel decision: a cancel never closes a fix tab.)
-const PROOF_NA={collect:['responseChanged']};
+// A move that removed the old DOM leaves no response to complete (the lifecycle rows cover it).
+const PROOF_NA={collect:['responseChanged','movedDomRemoved']};
 for(const [decision,act] of Object.entries(PROOF_DECISIONS)){
  test(`real DOM fix ownership proof at ${decision}: only the full proof acts, every violation is refused`,async t=>{
   const got={},want={};
@@ -526,6 +533,7 @@ for(const [decision,act] of Object.entries(PROOF_DECISIONS)){
 const TERMINAL_VIOLATIONS={
  followup:PROOF_VIOLATIONS.followup,editedSuffix:PROOF_VIOLATIONS.editedSuffix,editedPrefix:PROOF_VIOLATIONS.editedPrefix,
  draft:PROOF_VIOLATIONS.draft,moved:PROOF_VIOLATIONS.moved,noSendIdentity:PROOF_VIOLATIONS.noSendIdentity,responseChanged:PROOF_VIOLATIONS.responseChanged,
+ movedDomRemoved:PROOF_VIOLATIONS.movedDomRemoved,turnReplaced:PROOF_VIOLATIONS.turnReplaced,
 };
 const TRANSIENT_VIOLATIONS={
  none:null,
@@ -558,6 +566,41 @@ for(const when of ['generating','collected']){
    assert.deepEqual(got,want);
   });
  }
+}
+
+// Round 15 control: `turn_unrendered` is reserved for a turn genuinely not rendered while the page is
+// still in the recorded conversation: the run keeps waiting (never taken over by DOM absence alone).
+test('real DOM lifecycle: the sent turn not rendered in the recorded conversation while generating keeps the run alive',async t=>{
+ const ctx=await conversationPage(t,'fix');
+ const server={value:'awaiting_chat'};
+ const {b,state}=wiredWorker(ctx.page,server);
+ await b.tick();
+ await ctx.page.evaluate(()=>{document.querySelector('main').innerHTML='';});
+ await ctx.page.clock.runFor(1600);await b.tick();
+ assert.deepEqual({failed:b.calls.some(c=>c.action==='failure'),retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released},
+  {failed:false,retired:false,released:false});
+ assert.equal(await ctx.page.evaluate(()=>__ashlarRunnerState.running),true,'still collecting');
+});
+
+// Round 15 class sibling (Ashlar 4100156785): restoring a completion after a reload
+// (ashlar-result-saved) decides the permanent verdicts before it asks whether the response is
+// available, so a tab the user took over answers `completion_changed` (the worker preserves it at
+// once) instead of the retryable `completion_unavailable`. Control: a response not rendered yet in
+// the recorded conversation stays retryable.
+for(const [name,apply,want] of [
+ ['movedDomRemoved',PROOF_VIOLATIONS.movedDomRemoved,{code:'completion_changed',released:true}],
+ ['turnReplaced',PROOF_VIOLATIONS.turnReplaced,{code:'completion_changed',released:true}],
+ ['notRenderedYet',({page})=>page.evaluate(()=>{document.querySelector('main').innerHTML='';}),{code:'completion_unavailable',released:false}],
+]){
+ test(`real DOM restore after a reload, ${name}: ${want.code}`,async t=>{
+  const ctx=await conversationPage(t,'fix');
+  await ctx.complete();await ctx.page.clock.runFor(3200);const out=await ctx.harvest();
+  assert.equal(out.ok,true,'collected');
+  await ctx.page.evaluate(()=>{const s=__ashlarRunnerState;s.result=null;s.nativeCompletion=undefined;s.restoredCompletion=false;s.running=false;});
+  await apply(ctx);
+  const restored=await ctx.send('ashlar-result-saved',{committed:true,raw:out.raw,text:out.responseText,completion:out.completion});
+  assert.deepEqual({code:restored.code,released:(await ctx.send('ashlar-tab-status')).released},want);
+ });
 }
 
 /** The conversation a fix's send records (composer.js submissionConfirmed): a fix page is served at

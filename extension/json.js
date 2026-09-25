@@ -504,31 +504,37 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   }
   // Nothing was sent: there is no answer to collect or to close after.
   if (submission?.phase !== "sent") return verdict("unknown", "not_sent");
+  // PERMANENT verdicts first: none of them needs the response to be identified, so no transient
+  // wait (a turn not rendered or resolved yet, the prompt echoed in the composer) can hide one
+  // until the deadline.
+  // 1. The conversation. The rendered turn proves its content only; an in-page (SPA) move to another
+  // conversation can leave this DOM on screen under the new URL, or remove it: the proof holds only
+  // in the conversation recorded when the send was proven (composer.js submissionConfirmed); a
+  // journal without one never gains it.
+  if (submission.conversation !== fixChatPage()) return verdict("unknown", "unestablished", {identity: "unestablished"});
+  if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
+  // 2. The journal-addressable sent turn (its message ID, else its recorded position) holds EXACTLY
+  // Ashlar's prompt. boundReviewResponse only proves the turn CONTAINS it, and finds no turn at all
+  // once the user replaced its text: an edited or replaced turn is the user's, even if undone later.
   const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  const integrity = journaledTurnIntegrity(submission, users);
+  if (integrity === "edited") return takeOver("edited");
   const draftText = composerDraftText();
   const bound = boundReviewResponse(submission);
   const answered = phase === "complete";
   if (bound.followup) return takeOver("followup");
   if (!bound.identified) {
-    // A collected answer whose turn is gone was replaced (edited, regenerated or deleted).
+    // A collected answer whose turn is gone was replaced (edited, regenerated or deleted). Still in
+    // the recorded conversation with no addressable turn: not rendered yet (transient).
     return answered ? takeOver("response_changed") : verdict("unknown", "turn_unrendered");
   }
-  // The bound match only proves the sent turn CONTAINS Ashlar's prompt; an edited turn (a prefix
-  // or suffix the user added) is the user's, even if the edit is later undone.
-  const integrity = journaledTurnIntegrity(submission, users);
   if (integrity === "unknown") return verdict("unknown", "turn_unresolved");
-  if (integrity === "edited") return takeOver("edited");
   if (draftText) {
     // The just-sent prompt can linger in the composer a moment after the send is confirmed: that
     // text is Ashlar's own, not evidence of a user (transient). Any other draft is the user's.
     if (normalizePrompt(draftText) === submission.expected) return verdict("unknown", "composer_echo");
     return takeOver("draft");
   }
-  // The rendered turn proves its content only. An in-page (SPA) move to another conversation can
-  // leave this DOM on screen under the new URL: the proof holds only in the conversation recorded
-  // when the send was proven (composer.js submissionConfirmed); a journal without one never gains it.
-  if (submission.conversation !== fixChatPage()) return verdict("unknown", "unestablished", {identity: "unestablished"});
-  if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
   if (answered) {
     const stored = completion || storedFixCompletion(state);
     if (!stored) return verdict("unknown", "no_completion", {conversation: submission.conversation});
@@ -766,6 +772,16 @@ function installReviewRunner(name, run) {
       // or a new DOM result selected just because it happens to be the newest.
       let submission;
       try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { /* preserved */ }
+      if (msg.kind === "fix" || state.kind === "fix") {
+        // A permanent fix verdict (moved or unestablished conversation, an edited or replaced sent
+        // turn, a follow-up, a draft) needs no rendered response: it is decided BEFORE the response
+        // availability below, so a tab the user took over is never answered "unavailable" (retry).
+        const early = fixOwnershipProof(state, {phase: "collect", journal: submission});
+        if (fixVerdictPermanent(early)) {
+          releaseManagedSlot(state);
+          reply({ok:false,code:"completion_changed",proof:early.reason});return;
+        }
+      }
       const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : null;
       if (!bound?.identified || !bound.root || !replyDoneVisible(bound.root) || stopButtonVisible() || responseStreaming(bound.root)) {
         reply({ok:false,code:"completion_unavailable"});return;

@@ -89,6 +89,7 @@ function tokenize(text, i, close) {
 }
 
 const isPunct = (token, text) => token?.kind === 'punct' && token.text === text;
+const lineOf = (text, token) => text.slice(0, token.at).split('\n').length;
 /** The operators that assign to their left side. */
 const ASSIGN = new Set(['=', '+=', '-=', '*=', '/=', '%=', '**=', '<<=', '>>=', '>>>=', '&=', '|=', '^=', '&&=', '||=', '??=']);
 
@@ -103,8 +104,9 @@ function argumentsOf(tokens) {
  * through parentheses, both arms of a conditional (its test is not a stage) and each operand of || and
  * ??. Anything else (a variable, a call, a concatenation) is a problem: the guard cannot see its value.
  * So is an assignment: it binds looser than a conditional, so `x += late ? "a" : "b"` records x + "a". */
-function stageValues(text, tokens, found, where) {
-  if (tokens.length === 1 && tokens[0].kind === 'group' && tokens[0].open === '(') return stageValues(text, tokens[0].tokens, found, where);
+function stageValues(text, tokens, found, where, site) {
+  const values = part => stageValues(text, part, found, where, site);
+  if (tokens.length === 1 && tokens[0].kind === 'group' && tokens[0].open === '(') return values(tokens[0].tokens);
   const expression = tokens.length ? text.slice(tokens[0].at, tokens.at(-1).end) : '(missing)';
   if (tokens.some(token => token.kind === 'punct' && ASSIGN.has(token.text))) {
     return found.problems.push(`${where}: stage \`${expression}\` assigns, so what it records is the assigned value, which cannot be checked for a label`);
@@ -117,16 +119,19 @@ function stageValues(text, tokens, found, where) {
       else if (isPunct(tokens[k], ':')) nested ? nested -= 1 : colon = k;
     }
     if (colon < 0) return found.problems.push(`${where}: a conditional stage without its ':' arm`);
-    stageValues(text, tokens.slice(question + 1, colon), found, where);
-    return stageValues(text, tokens.slice(colon + 1), found, where);
+    values(tokens.slice(question + 1, colon));
+    return values(tokens.slice(colon + 1));
   }
   const or = tokens.findIndex(token => isPunct(token, '||') || isPunct(token, '??'));
   if (or >= 0) {
-    stageValues(text, tokens.slice(0, or), found, where);
-    return stageValues(text, tokens.slice(or + 1), found, where);
+    values(tokens.slice(0, or));
+    return values(tokens.slice(or + 1));
   }
   const [only] = tokens;
-  if (tokens.length === 1 && only.kind === 'tpl' && only.substs.length) return found.templates.add(only.value);
+  if (tokens.length === 1 && only.kind === 'tpl' && only.substs.length) {
+    found.templates.add(only.value);
+    return found.sites.push({...site, template: only.value, token: only});
+  }
   if (tokens.length === 1 && (only.kind === 'str' || only.kind === 'tpl')) {
     if (STAGE_NAME.test(only.value)) return found.literals.add(only.value);
     return found.problems.push(`${where}: ${only.text} is not a stage name (${STAGE_NAME})`);
@@ -134,13 +139,28 @@ function stageValues(text, tokens, found, where) {
   found.problems.push(`${where}: stage \`${expression}\` is not a literal, so its value cannot be checked for a label`);
 }
 
-/** Calls `visit(token, level, k, container)` for every token of `level` and of the groups and template
- * substitutions inside it; `container` is the group or template holding `level` (none for the file). */
-function walkTokens(level, visit, container) {
+/** Calls `visit(token, level, k, container, path)` for every token of `level` and of the groups and
+ * template substitutions inside it; `container` is the group or template holding `level` (none for the
+ * file) and `path` the enclosing levels, each as {tokens, index} of the token that holds the next one. */
+function walkTokens(level, visit, container, path = []) {
   level.forEach((token, k) => {
-    visit(token, level, k, container);
-    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walkTokens(inner, visit, token);
+    visit(token, level, k, container, path);
+    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) {
+      walkTokens(inner, visit, token, [...path, {tokens: level, index: k}]);
+    }
   });
+}
+
+/** The frames from `level` down to `target`, {tokens, index} per level, or null when it is not there. */
+function pathTo(level, target) {
+  for (const [index, token] of level.entries()) {
+    if (token === target) return [{tokens: level, index}];
+    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) {
+      const rest = pathTo(inner, target);
+      if (rest) return [{tokens: level, index}, ...rest];
+    }
+  }
+  return null;
 }
 
 /** The argument group of the recorder call at `level[k]`, `name(...)` or `name?.(...)`, else null.
@@ -212,17 +232,17 @@ function recorderBodies(tokens) {
  * use of a recorder's name than a call, its function declaration or `typeof name`: a recorder passed as
  * a value, aliased, or called through .call or .apply records a stage no call here shows. */
 function recordedStages(text, file = 'source') {
-  const found = {literals: new Set(), templates: new Set(), problems: []};
+  const found = {literals: new Set(), templates: new Set(), sites: [], problems: []};
   let tokens;
   try { ({tokens} = tokenize(text, 0)); } catch (error) {
     found.problems.push(`${file}: could not be tokenized (${error.message}), so its recorder calls cannot be read`);
     return found;
   }
   const bodies = recorderBodies(tokens);
-  walkTokens(tokens, (token, level, k) => {
+  walkTokens(tokens, (token, level, k, container, path) => {
     if (token.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text)) return;
     const group = recorderCall(level, k), before = level[k - 1];
-    const where = `${file}:${text.slice(0, token.at).split('\n').length} ${token.text}`;
+    const where = `${file}:${lineOf(text, token)} ${token.text}`;
     if (!group) {
       if (before?.kind === 'word' && (before.text === 'function' || before.text === 'typeof')) return;
       return found.problems.push(level[k + 1]?.open === '('
@@ -232,7 +252,7 @@ function recordedStages(text, file = 'source') {
     const arg = argumentsOf(group.tokens)[RECORDERS[token.text]] ?? [];
     const forwarded = arg.length === 1 && arg[0].kind === 'word' &&
       bodies.some(body => body.from < token.at && token.at < body.to && body.param === arg[0].text);
-    if (!forwarded) stageValues(text, arg, found, `${where}()`);
+    if (!forwarded) stageValues(text, arg, found, `${where}()`, {text, where: `${where}()`, path, level});
   });
   return found;
 }
@@ -245,14 +265,94 @@ function extensionFiles(dir = join(root, 'extension')) {
 }
 
 function extensionStages(files) {
-  const literals = new Set(), templates = new Set(), problems = [];
+  const literals = new Set(), templates = new Set(), sites = [], problems = [];
   for (const [name, text] of Object.entries(files)) {
     const found = recordedStages(text, name);
     found.literals.forEach(stage => literals.add(stage));
     found.templates.forEach(template => templates.add(template));
+    sites.push(...found.sites);
     problems.push(...found.problems);
   }
-  return {literals, templates, problems};
+  return {literals, templates, sites, problems};
+}
+
+/** Tokens as compact source: no comments or line breaks, a space only between two words. */
+const render = tokens => tokens.map((token, k) => (token.kind === 'word' && tokens[k - 1]?.kind === 'word' ? ' ' : '') +
+  (token.kind === 'group' ? `${token.open}${render(token.tokens)}${CLOSERS[token.open]}` : token.text)).join('');
+
+/** The `const name = ...` a read at the end of `path` sees: the nearest one before it in a level that
+ * encloses the read (a sibling block's declaration is out of scope), as {frame, at, init}, or null. The
+ * initialiser runs to the `;`: a second declarator or a missing `;` makes it another expression. */
+function constBefore(path, name) {
+  for (let frame = path.length - 1; frame >= 0; frame -= 1) {
+    const {tokens, index} = path[frame];
+    for (let at = index - 1; at > 0; at -= 1) {
+      if (tokens[at].kind !== 'word' || tokens[at].text !== name || tokens[at - 1].text !== 'const') continue;
+      let end = at + 2; // after the `=`; a declaration without one fails its initialiser
+      while (end < tokens.length && !isPunct(tokens[end], ';')) end += 1;
+      return {frame, at, init: tokens.slice(at + 2, end)};
+    }
+  }
+  return null;
+}
+
+/** Whether `tokens[k]` uses `name` other than as the object of a member read (`name.x` or `name?.x`,
+ * not assigned, updated or deleted): a rebinding, an assignment, an argument or an alias can change what
+ * `name.x` holds later. with, eval and arguments reach a binding without naming it. */
+function misuses(tokens, k, name) {
+  const token = tokens[k], before = tokens[k - 1], after = tokens[k + 3];
+  if (token.kind !== 'word' || isPunct(before, '.') || isPunct(before, '?.')) return false;
+  if (INDIRECT.has(token.text)) return true;
+  if (token.text !== name) return false;
+  const member = (isPunct(tokens[k + 1], '.') || isPunct(tokens[k + 1], '?.')) && tokens[k + 2]?.kind === 'word';
+  const written = after?.kind === 'punct' && (ASSIGN.has(after.text) || after.text === '++' || after.text === '--');
+  const prefixed = isPunct(before, '++') || isPunct(before, '--') || (before?.kind === 'word' && before.text === 'delete');
+  return !member || written || prefixed;
+}
+
+/** The first token of `tokens[from..to)`, groups and template substitutions included, that misuses `name`. */
+function firstMisuse(tokens, from, to, name) {
+  for (let k = from; k < to; k += 1) {
+    if (misuses(tokens, k, name)) return tokens[k];
+    for (const inner of tokens[k].kind === 'group' ? [tokens[k].tokens] : tokens[k].substs ?? []) {
+      const hit = firstMisuse(inner, 0, inner.length, name);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+/** What could change or shadow `name` between its declaration `decl` and the read at the end of `path`:
+ * the first misuse in the code between them (an earlier substitution of a template the read is in
+ * included), or a function declaration of the name in a level the read sits in, hoisted over it. */
+function changedBetween(path, decl, name) {
+  let hit = firstMisuse(path[decl.frame].tokens, decl.at + 1, path[decl.frame].index, name);
+  for (let frame = decl.frame + 1; frame < path.length; frame += 1) {
+    const holder = path[frame - 1].tokens[path[frame - 1].index], level = path[frame].tokens;
+    for (const prior of holder.kind === 'tpl' ? holder.substs.slice(0, holder.substs.indexOf(level)) : []) {
+      hit ||= firstMisuse(prior, 0, prior.length, name);
+    }
+    hit ||= firstMisuse(level, 0, path[frame].index, name) ||
+      level.find((token, k) => token.kind === 'word' && token.text === name && level[k - 1]?.text === 'function');
+  }
+  return hit;
+}
+
+/** The problem with a recorded template whose expression reads names bound as `bound` lists, if any.
+ * Each name must be the nearest enclosing `const` before the read (for a later name, before the previous
+ * name's declaration), initialised as listed, and neither changed nor shadowed up to the read. */
+function boundProblems(site, bound) {
+  const path = [...site.path, ...pathTo(site.level, site.token)];
+  let from = path;
+  for (const {name, init, is} of bound) {
+    const decl = constBefore(from, name), read = `${site.where}: \`${site.template}\` reads ${name}`;
+    if (!decl) return [`${read}, which no \`const ${name} = ...\` before it in an enclosing block declares, so its values are unknown`];
+    if (!init.test(render(decl.init))) return [`${read} = \`${render(decl.init)}\`, not ${is}, so its values are unknown`];
+    const changed = changedBetween(path, decl, name);
+    if (changed) return [`${read}, which line ${lineOf(site.text, changed)} uses other than as a member read, so it may not hold ${is} there`];
+    from = [...path.slice(0, decl.frame), {tokens: path[decl.frame].tokens, index: decl.at}];
+  }
+  return [];
 }
 
 /** The string members of a `export type Name = "a" | "b";` union, read from source. */
@@ -276,16 +376,21 @@ function returnedList(files, name) {
 /** The values of a template stage, keyed by its static prefix and then by the whole `${...}` expression
  * it substitutes. The prefix says nothing about the value: `preserve_${row.cause}` does not take
  * preserveCauses()'s values because it starts with preserve_. So each expression the extension records
- * is declared here with a reader of its value domain, the list the code draws that expression's value
- * from (null when it is not in source); `declared` holds values labelled ahead of the code. A recorded
- * template expands to both, so a value added only in the code still needs a label. A recorded template
- * whose prefix or expression is not declared here, or whose list is not found in source, fails the guard. */
+ * is declared here with `values`, a reader of its value domain: the list the code draws that expression's
+ * value from (null when it is not in source); `declared` holds values labelled ahead of the code. A
+ * recorded template expands to both, so a value added only in the code still needs a label. A recorded
+ * template whose prefix or expression is not declared here, or whose list is not found in source, fails
+ * the guard. An expression's text alone does not say where its value comes from, so `bound` lists the
+ * `const` declarations each recording of it must read (see boundProblems). */
 const TEMPLATE_STAGES = {
-  // background.js: `status` is the bridge's repair reply, whose status is a RepairStatus.
-  repair_: {declared: [], expressions: {'status.status': () => unionMembers('src/lib/json-repair-types.ts', 'RepairStatus')}},
+  // background.js: `status` is the repair record of the bridge's reply to a repair request, and its
+  // status is a RepairStatus.
+  repair_: {declared: [], expressions: {'status.status': {values: () => unionMembers('src/lib/json-repair-types.ts', 'RepairStatus'),
+    bound: [{name: 'status', init: /^response\.repair$/, is: 'response.repair'},
+      {name: 'response', init: /^await api\("\/api\/bridge",(\{\.\.\.)?repairBody\(/, is: 'the bridge\'s reply to a repairBody() request'}]}}},
   // Tab release (#82): finishTabCleanup sets state.preserveCause to one of preserveCauses(), then records
   // preserve_${state.preserveCause}.
-  preserve_: {expressions: {'state.preserveCause': files => returnedList(files, 'preserveCauses')},
+  preserve_: {expressions: {'state.preserveCause': {values: files => returnedList(files, 'preserveCauses')}},
     declared: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown',
       // Tab Lease (Phase 1+): the takeover and restart causes of a preserved tab.
       'user_input', 'user_moved', 'browser_restart']},
@@ -294,8 +399,8 @@ const TEMPLATE_STAGES = {
   lease_expired_: {expressions: {}, declared: ['creating', 'opening', 'sending', 'generating', 'answered', 'releasing']},
 };
 
-/** Every stage a recorded template can produce, given the extension's scripts. */
-function expandTemplate(template, files) {
+/** The declared prefix, labelled-ahead values and expression entry of a recorded template stage. */
+function templateSpec(template) {
   const prefix = template.slice(0, template.indexOf('${'));
   assert.ok(Object.hasOwn(TEMPLATE_STAGES, prefix), `template stage \`${template}\` has no declared expansion in TEMPLATE_STAGES`);
   assert.match(template, /^[a-z_]+\$\{[^}]+\}$/, `template stage \`${template}\` is exactly <prefix>\${value}`);
@@ -303,7 +408,13 @@ function expandTemplate(template, files) {
   const expression = template.slice(prefix.length + 2, -1).trim();
   assert.ok(Object.hasOwn(expressions, expression),
     `template stage \`${template}\`: \`${expression}\` is not a declared ${prefix} expression, so the values it can take are unknown`);
-  const values = expressions[expression](files);
+  return {prefix, declared, spec: expressions[expression]};
+}
+
+/** Every stage a recorded template can produce, given the extension's scripts. */
+function expandTemplate(template, files) {
+  const {prefix, declared, spec} = templateSpec(template);
+  const values = spec.values(files);
   assert.ok(values, `template stage \`${template}\` is recorded, but the list of its values was not found in source`);
   return [...new Set([...declared, ...values])].map(value => prefix + value);
 }
@@ -313,8 +424,10 @@ const declaredStages = prefix => TEMPLATE_STAGES[prefix].declared.map(value => p
 
 /** Every stage `files` can record, and the stage arguments the guard could not read. */
 function guardedStages(files) {
-  const {literals, templates, problems} = extensionStages(files);
-  return {literals, templates, problems, stages: [...literals, ...[...templates].flatMap(template => expandTemplate(template, files))]};
+  const {literals, templates, sites, problems} = extensionStages(files);
+  const stages = [...literals, ...[...templates].flatMap(template => expandTemplate(template, files))];
+  for (const site of sites) problems.push(...boundProblems(site, templateSpec(site.template).spec.bound ?? []));
+  return {literals, templates, problems, stages};
 }
 
 const unlabelled = stages => [...new Set(stages)].filter(stage => !Object.hasOwn(PROGRESS_LABELS, stage)).sort();
@@ -403,6 +516,10 @@ test('a preserve_ cause added only to preserveCauses() fails the guard: the expa
     'Tab Lease: recording lease_expired_<phase> needs its expression declared with a list of the phases in code');
 });
 
+/** background.js's repair reply: the bindings repair_${status.status} reads. */
+const REPAIR_REPLY = 'const response = await api("/api/bridge", repairBody(job, provider, "repair-status", attempt), job.origin);\n' +
+  'const status = response.repair;\n';
+
 test('a template stage takes its declared list only through a declared expression, not through its prefix', () => {
   // preserveCauses() lists only labelled causes, so expanding by prefix would pass; row.cause is not drawn
   // from it and can be preserve_staged, which sanitizeProgressEvents drops.
@@ -416,8 +533,60 @@ test('a template stage takes its declared list only through a declared expressio
   assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `repair_${response.status}`);'}),
     /`response.status` is not a declared repair_ expression/, 'the same for repair_: RepairStatus is the domain of status.status only');
   assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `repair_${status.state}`);'}), /not a declared repair_ expression/);
-  const {stages} = guardedStages({'background.js': 'workerStep(job, provider, `repair_${status.status}`);'});
+  const {stages, problems} = guardedStages({'background.js': `${REPAIR_REPLY}workerStep(job, provider, \`repair_\${status.status}\`);`});
+  assert.deepEqual(problems, []);
   assert.deepEqual(stages.sort(), unionMembers('src/lib/json-repair-types.ts', 'RepairStatus').map(value => `repair_${value}`).sort());
+});
+
+test('repair_${status.status} takes the RepairStatus values only where status is the bridge\'s repair reply', () => {
+  const record = 'workerStep(job, provider, `repair_${status.status}`)';
+  const problems = body => guardedStages({'background.js': `async function poll(job, provider, attempt) {\n${body}\n}`}).problems;
+  // background.js's two shapes: the reply read in the same block, and read in an if block below it.
+  assert.deepEqual(problems(`${REPAIR_REPLY}if (status?.id !== attempt.id) return;\nattempt.status = status.status;\n${record};`), []);
+  // Member reads, other names' properties and an unrelated function in the block are not changes.
+  assert.deepEqual(problems(`${REPAIR_REPLY}if (typeof status.id !== "string" || row?.status) return;\nif (ok) {\n  ${record};\n  function helper() {}\n}`), []);
+  assert.deepEqual(problems('const response = await api("/api/bridge", {...repairBody(job, provider, "repair", attempt), source}, job.origin);\n' +
+    `const status = response.repair;\nif (status?.id && status.runId === attempt.runId) {\n  attempt.id = status.id;\n  ${record};\n}`), []);
+  const reply = REPAIR_REPLY;
+  for (const [body, problem] of [
+    // Another binding named status, or none.
+    [`const status = {status: "stalled"};\n${record};`, 'reads status = `{status:"stalled"}`, not response.repair'],
+    [`${record};`, 'reads status, which no `const status = ...` before it in an enclosing block declares'],
+    [`${reply.replace('const status', 'let status')}${record};`, 'reads status, which no `const status = ...`'],
+    // The initialiser runs to its `;`: a second declarator, or none and a line break, is another expression.
+    [`${reply.replace('response.repair;', 'response.repair, late = true;')}${record};`, 'reads status = `response.repair,late=true`'],
+    [`${reply.replace('response.repair;', 'response.repair')}${record}`, 'reads status = `response.repair workerStep(job,provider,'],
+    [`${reply.replace('const status = response.repair;', '')}if (ok) { const status = response.repair; }\n${record};`, 'reads status, which no `const status = ...`'],
+    [`${reply}if (ok) {\n  const status = {status: "stalled"};\n  ${record};\n}`, 'reads status = `{status:"stalled"}`'],
+    // A response that is not the bridge's repair reply.
+    [`const response = {repair: {status: "stalled"}};\nconst status = response.repair;\n${record};`,
+      'reads response = `{repair:{status:"stalled"}}`, not the bridge\'s reply to a repairBody() request'],
+    [`const response = await api("/api/bridge", {action: "status"}, job.origin);\nconst status = response.repair;\n${record};`,
+      'reads response = `await api("/api/bridge",{action:"status"},job.origin)`, not the bridge\'s reply'],
+    // Between the declaration and the read: a write, an alias, a shadow or a hoisted function.
+    [`${reply}status.status = "stalled";\n${record};`, 'reads status, which line 4 uses other than as a member read'],
+    [`${reply}status.status += "_late";\n${record};`, 'line 4 uses'],
+    [`${reply}status.status++;\n${record};`, 'line 4 uses'],
+    [`${reply}++status.status;\n${record};`, 'line 4 uses'],
+    [`${reply}status.status--;\n${record};`, 'line 4 uses'],
+    [`${reply}--status.status;\n${record};`, 'line 4 uses'],
+    [`${reply}status?.(patch);\n${record};`, 'line 4 uses'],
+    [`${reply}delete status.status;\n${record};`, 'line 4 uses'],
+    [`${reply}normalize(status);\n${record};`, 'line 4 uses'],
+    [`${reply}const copy = status;\n${record};`, 'line 4 uses'],
+    [`${reply}status[key] = "stalled";\n${record};`, 'line 4 uses'],
+    [`${reply}tweak(response);\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}rows.forEach(status => ${record});`, 'line 4 uses'],
+    [`${reply}if (ok) {\n  ${record};\n  function status() {}\n}`, 'line 6 uses'],
+    [`${reply}with (row) ${record};`, 'line 4 uses'],
+    [`${reply}eval(patch);\n${record};`, 'line 4 uses'],
+    [`${reply}log(\`\${status.status = "stalled"} \${${record}}\`);`, 'line 4 uses'],
+  ]) {
+    const found = problems(body);
+    assert.equal(found.length, 1, `${body}\n: ${found.join('\n')}`);
+    assert.match(found[0], /^background\.js:\d+ workerStep\(\): `repair_\$\{status\.status\}` reads /, body);
+    assert.ok(found[0].includes(problem), `${body}\n: ${found[0]}`);
+  }
 });
 
 test('a stage argument the guard cannot read fails it instead of passing unchecked', () => {

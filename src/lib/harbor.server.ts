@@ -180,8 +180,10 @@ function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
   if (!before) return undefined;
   const after = next(before);
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? after : j)) };
-  recordJobHistory(after);
+  // Cleanup before the history write: the edge is crossed once, so a write that throws here must not
+  // strand the in-flight local request or the held snapshot (the store reports its own health).
   if (isLive(before.status) && !isLive(after.status)) releaseTerminalJob(after);
+  recordJobHistory(after);
   return after;
 }
 
@@ -202,6 +204,11 @@ function releaseTerminalJob(job: Job) {
 /** Test seam: whether a job still retains its local snapshot. */
 export function hasLocalSample(jobId: string): boolean {
   return localSamples.has(jobId);
+}
+
+/** Test seam: whether a job still has local-leg activity or liveness state (a cancellation clears it). */
+export function hasLocalLegState(jobId: string): boolean {
+  return localActivity.has(jobId) || localLiveness.has(jobId);
 }
 
 /** Test seam: whether a reviewer watcher is still running for a job. */

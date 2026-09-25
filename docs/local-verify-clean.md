@@ -138,8 +138,10 @@ operator cancel (`cancelHarborJob`) and supersession by a newer request for the 
 other job-array writes are `resetHarbor` (drops every job) and inserting a new job (`trimJobs`);
 `tests/review/job-writer.test.mjs` pins that.
 
-On the live → terminal edge it calls `releaseTerminalJob` once. A terminal status is an explicit
-terminal signal:
+On the live → terminal edge it calls `releaseTerminalJob` once, before the job's history write: the
+edge is crossed only once, so a history write that throws must not skip the cleanup (the store reports
+its own health; rows L18–L21 inject that failure on cancel and supersession, held and verifying). A
+terminal status is an explicit terminal signal:
 
 - The local snapshot is freed, unless a local leg is in flight (that leg holds its own reference and
   frees the entry in its `finally`). A verify-clean job whose local leg never ran would otherwise keep

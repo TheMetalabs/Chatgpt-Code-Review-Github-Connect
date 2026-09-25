@@ -61,6 +61,10 @@ export async function appFixture(options={}, githubOptions={}) {
   ['@tanstack/react-router',{createFileRoute:()=>config=>config}],
  ]);
  const cache=new Map();
+ // githubOptions.wrap: {'src/lib/x.ts': realExports => replacedExports} runs the real module and
+ // replaces only the exports a test injects a fault into (the rest stay the production functions).
+ const wraps=new Map(Object.entries(githubOptions.wrap||{}).map(([path,fn])=>[resolve(root,path),fn]));
+ const REAL='#real';
  function resolveModule(spec,parent){
    if(spec.startsWith('node:')||mocks.has(spec))return spec;
    let path=spec.startsWith('@/')?resolve(root,'src',spec.slice(2)):resolve(dirname(parent),spec);
@@ -69,9 +73,13 @@ export async function appFixture(options={}, githubOptions={}) {
  async function instantiate(id){
    if(cache.has(id))return cache.get(id);
    const promise=(async()=>{
-     const values=mocks.get(id)||(id.startsWith('node:')?await import(id):null);
+     let values=mocks.get(id)||(id.startsWith('node:')?await import(id):null);
+     if(!values&&wraps.has(id)){
+       const real=await instantiate(id+REAL);if(real.status==='unlinked')await real.link(linker);if(real.status==='linked')await real.evaluate();
+       values={...real.namespace,...wraps.get(id)(real.namespace)};
+     }
      if(values)return new vm.SyntheticModule(Object.keys(values),function(){for(const [key,value]of Object.entries(values))this.setExport(key,value);},{context,identifier:id});
-     return new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(id,'utf8')),{context,identifier:id,importModuleDynamically:async(spec,module)=>{
+     return new vm.SourceTextModule(stripTypeScriptTypes(readFileSync(id.endsWith(REAL)?id.slice(0,-REAL.length):id,'utf8')),{context,identifier:id,importModuleDynamically:async(spec,module)=>{
        const child=await instantiate(resolveModule(spec,module.identifier));if(child.status==='unlinked')await child.link(linker);if(child.status==='linked')await child.evaluate();return child;
      }});
    })();cache.set(id,promise);return promise;

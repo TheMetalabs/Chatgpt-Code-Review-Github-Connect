@@ -57,6 +57,39 @@ async function newJobAfter(app,id,delivery){
   return out.jobId;
 }
 
+/** A history store whose write of one job's cancelled record throws once (the fault the live → terminal
+ * edge must survive: the job is terminal, so no later transition would run its cleanup again). */
+function historyFault(){
+  const fault={jobId:undefined,thrown:0};
+  const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({recordJobHistory(job){
+    if(!fault.thrown&&job.id===fault.jobId&&job.status==='cancelled'){fault.thrown++;throw new Error('history store unavailable');}
+    return real.recordJobHistory(job);
+  }})}};
+  return {fault,githubOptions};
+}
+/** Start a verify-clean job whose cancelled-record history write will throw; `verifying` also starts
+ * the local verification round (streaming, so its liveness watchdog is armed). */
+async function startFaulted(t,{verifying,delivery}){
+  const {fault,githubOptions}=historyFault();
+  const s=await start(t,{githubOptions,delivery});
+  fault.jobId=s.jobId;s.fault=fault;
+  if(verifying){
+    s.app.env.ASHLAR_LOCAL_LLM_STREAM='true';
+    await s.app.harbor.submitHarborChat(s.jobId,clean);
+    await eventually(()=>s.app.localRequests.length===1,'verification round did not start');
+    assert.equal(s.app.harbor.hasLocalLegState(s.jobId),true,'the running leg has activity and liveness state');
+    s.abort=trackAbort(s.app.localResponses[0]);
+  }
+  return s;
+}
+/** The throwing write surfaced to the caller, and the edge's cleanup had already run by then. */
+function assertCleanedDespiteHistory(s,thrown){
+  assert.match(String(thrown?.message),/history store unavailable/,'the history failure reaches the caller');
+  assert.equal(s.fault.thrown,1,'the cancelled record write failed');
+  assert.equal(s.job().status,'cancelled','the job is terminal');
+  assert.equal(s.app.harbor.hasLocalLegState(s.jobId),false,'activity and liveness cleared on the edge');
+}
+
 // expect: status, skip (regex or undefined), requests (total local requests), reviews, aborted, and
 // optionally body (regex), clean (the review is a clean pass: the clean first line and CONVERGED) and
 // reviewers (the findings body's exact reviewers line: local's release, not its configured role, and
@@ -237,6 +270,40 @@ const ROWS=[
       await settle();
       assert.equal(s.job().status,'awaiting_chat','the claimed chat run is awaited');
       assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
+      return s;
+    }},
+  // Terminal cleanup runs on the live → terminal edge even when that edge's history write throws.
+  {name:'L18 operator cancel while local verifies, history write throws: still aborted and released',expect:{status:'cancelled',skip:/cancelled by operator/,requests:1,reviews:0,aborted:true},
+    async run(t){
+      const s=await startFaulted(t,{verifying:true,delivery:'lifecycle-history-cancel-verifying'});
+      let thrown;try{s.app.harbor.cancelHarborJob(s.jobId);}catch(e){thrown=e;}
+      assertCleanedDespiteHistory(s,thrown);
+      await eventually(()=>s.abort.aborted,'the in-flight local request was not aborted');
+      return s;
+    }},
+  {name:'L19 operator cancel while local is held, history write throws: the snapshot is still released',expect:{status:'cancelled',skip:/cancelled by operator/,requests:0,reviews:0},
+    async run(t){
+      const s=await startFaulted(t,{verifying:false,delivery:'lifecycle-history-cancel-held'});
+      assert.equal(s.app.harbor.hasLocalSample(s.jobId),true,'the held job keeps its snapshot');
+      let thrown;try{s.app.harbor.cancelHarborJob(s.jobId);}catch(e){thrown=e;}
+      assertCleanedDespiteHistory(s,thrown);
+      assert.equal(s.app.harbor.hasLocalSample(s.jobId),false,'released on the edge');
+      return s;
+    }},
+  {name:'L20 superseded while local verifies, history write throws: still aborted and released',expect:{status:'cancelled',skip:/superseded by/,requests:1,reviews:0,aborted:true},
+    async run(t){
+      const s=await startFaulted(t,{verifying:true,delivery:'lifecycle-history-supersede-verifying'});
+      let thrown;try{await s.app.mention('lifecycle-history-supersede-verifying-next');}catch(e){thrown=e;}
+      assertCleanedDespiteHistory(s,thrown);
+      await eventually(()=>s.abort.aborted,'the superseded job\'s local request was not aborted');
+      return s;
+    }},
+  {name:'L21 superseded while held, history write throws: the snapshot is still released',expect:{status:'cancelled',skip:/superseded by/,requests:0,reviews:0},
+    async run(t){
+      const s=await startFaulted(t,{verifying:false,delivery:'lifecycle-history-supersede-held'});
+      let thrown;try{await s.app.mention('lifecycle-history-supersede-held-next');}catch(e){thrown=e;}
+      assertCleanedDespiteHistory(s,thrown);
+      assert.equal(s.app.harbor.hasLocalSample(s.jobId),false,'released on the edge');
       return s;
     }},
   {name:'R1 race: chat and local both find the issue',expect:{status:'posted',requests:1,reviews:1},

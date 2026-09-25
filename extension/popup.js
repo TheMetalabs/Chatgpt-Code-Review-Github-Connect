@@ -232,7 +232,7 @@ async function requestClearStuck() {
   statusEl.textContent = res?.ok
     ? (res.timedOut
         ? `Cleared ${res.cleared} so far — the sweep timed out (bridge or a tab is slow). Click again to finish the rest.`
-        : `Cleared ${res.cleared} stuck/stalled job(s) (${res.kept} kept). Jobs with a live tab were left alone; long-stalled tab-gone legs (including server-owned ones) were reported failed.`)
+        : `Cleared ${res.cleared} stuck/stalled job(s) (${res.kept} kept). Cancelled or forgotten jobs were abandoned: a review tab still open was released by its page's check, closed unless you had used it (then kept), and a fix tab without a delivered answer was kept. A stalled job with an open tab was left alone; long-stalled tab-gone legs (including server-owned ones) were reported failed.`)
     : !res
       ? "No response from the worker after several tries — reload the extension from chrome://extensions, then retry."
       : `Could not clear stuck jobs: ${res.error || "no eligible jobs"}`;

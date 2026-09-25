@@ -2,6 +2,7 @@
 // chat tab is closed unless the user positively took it over. These rows pin the worker side (vm
 // harness) and the history diagnostics; the real-page scenarios are in tab-release.e2e.mjs.
 import test from 'node:test';
+import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import {readdirSync} from 'node:fs';
 import {join} from 'node:path';
@@ -407,6 +408,30 @@ test('the recently retired legs in a worker status are those of its own origin',
   const bridge = await statusFor('http://bridge');
   assert.deepEqual({origin: bridge.origin, jobs: bridge.retired.map(r => r.jobId)}, {origin: 'http://bridge', jobs: ['job-A']}, 'back on A: A\'s legs only');
   assert.doesNotMatch(JSON.stringify(bridge.retired), /https?:/, 'the entries shown carry no URL (the status names its origin)');
+});
+// Ashlar 4101062782: "Clear stuck jobs" abandons every leg of a cancelled or forgotten job, and a live
+// tab is released by its page's verdict (closed unless the user took it over). The popup's report
+// and its help text say so; they no longer claim that jobs with a live tab are left alone.
+test('the popup describes what Clear stuck did to a forgotten job\'s live tab', async () => {
+  const b = worker(leg('review', {}, {serverStatus: 'missing'}), {status: 'missing', handler: () => owned});
+  const elements = new Map();
+  const document = {getElementById(id) {
+    if (!elements.has(id)) elements.set(id, {textContent: '', value: '', addEventListener() {}});
+    return elements.get(id);
+  }};
+  const context = vm.createContext({document, console, setTimeout, chrome: {
+    storage: {local: storage({origin: 'http://bridge', enabled: true}), onChanged: {addListener() {}}},
+    runtime: {getManifest: () => ({version: 'test'}), sendMessage: async message => (message.type === 'ashlar-clear-stuck' ? b.context.clearStuckJobs({includeStalled: true}) : undefined)},
+  }});
+  vm.runInContext(source('extension/popup.js'), context);
+  await vm.runInContext('requestClearStuck()', context);
+  assert.deepEqual(b.closedTabs, [10], 'the forgotten job\'s live, untouched tab was closed');
+  assert.equal(b.pending(), undefined, 'and the job cleared');
+  const status = elements.get('status').textContent;
+  assert.match(status, /^Cleared 1 /);
+  assert.doesNotMatch(status, /live tab were left alone/, 'the report does not claim the live tab was left alone');
+  assert.match(status, /closed unless you had used it/);
+  assert.doesNotMatch(source('extension/popup.html'), /Never touches a job with a live tab/, 'nor does the button\'s help text');
 });
 // Ashlar 4101062772: the ring is diagnostics only; it is written inside the retirement's storage
 // sequence, so a failed ring write must not leave the cleaned job in the registry (retried as

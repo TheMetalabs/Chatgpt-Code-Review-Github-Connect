@@ -21,6 +21,15 @@ import { lastJsonObject } from "./extract-chat-json.ts";
 export interface FixFile {
   path: string;
   content: string; // the COMPLETE new file content (overwrite), never a diff
+  /** GitHub-source fixes only (fix-source-github.ts): the git blob SHA of the file the model read
+   * and edited. The server checks it against the head tree before any commit (stale read = reject). */
+  baseBlobSha?: string;
+}
+
+/** GitHub-source fixes only: the connector check the model echoes (the blob it read for the canary). */
+export interface FixCanary {
+  path: string;
+  blobSha: string;
 }
 
 export type DispositionAction = "fixed" | "pushback" | "decline" | "defer";
@@ -36,6 +45,24 @@ export interface FixResponse {
   summary: string;
   files: FixFile[];
   dispositions: FixDisposition[];
+  /** Present only when the reply carries a well-formed `canary` echo (GitHub-source fixes). */
+  canary?: FixCanary;
+}
+
+const BLOB_SHA_RE = /^[0-9a-f]{40}$/i;
+
+function canaryOf(raw: unknown): FixCanary | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const { path, blobSha } = raw as { path?: unknown; blobSha?: unknown };
+  if (typeof path !== "string" || typeof blobSha !== "string" || !BLOB_SHA_RE.test(blobSha)) return undefined;
+  return { path, blobSha: blobSha.toLowerCase() };
+}
+
+/** The canary echo of a reply's fix JSON object, read even when the rest of the object would not
+ * parse as a fix (a truncated file still proves the connector read the canary). */
+export function fixReplyCanary(raw: string): FixCanary | undefined {
+  const json = lastJsonObject(String(raw ?? ""), isFixObject);
+  return json ? canaryOf((JSON.parse(json) as { canary?: unknown }).canary) : undefined;
 }
 
 const DISPOSITION_ACTIONS: readonly DispositionAction[] = ["fixed", "pushback", "decline", "defer"];
@@ -145,6 +172,8 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
   }
   const summaryRaw = typeof (parsed as { summary?: unknown }).summary === "string" ? (parsed as { summary: string }).summary : "";
   const dispositions = parseDispositions((parsed as { dispositions?: unknown }).dispositions);
+  const canary = canaryOf((parsed as { canary?: unknown }).canary);
+  const extra = canary ? { canary } : {};
   if (filesRaw.length === 0) {
     // A no-change round is valid ONLY when the agent gave a rationale (push-back/decline/defer of
     // every finding); a bare empty response with no summary is malformed → fail closed. Nothing
@@ -162,7 +191,7 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
     // whole answer, so it is malformed (retried) rather than a terminal fix-declined handoff.
     const bare = dispositions.filter((d) => (d.action === "decline" || d.action === "defer") && !citesEvidence(d.note)).map((d) => d.finding);
     if (bare.length) return { ok: false, error: `decline/defer without evidence (issue #, file:line or quote) for ${bare.join(", ")}` };
-    return { ok: true, fix: { summary: summaryRaw, files: [], dispositions } };
+    return { ok: true, fix: { summary: summaryRaw, files: [], dispositions, ...extra } };
   }
   const seen = new Set<string>();
   const files: FixFile[] = [];
@@ -170,6 +199,7 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
     if (!entry || typeof entry !== "object") return { ok: false, error: "file entry is not an object" };
     const path = (entry as { path?: unknown }).path;
     const content = (entry as { content?: unknown }).content;
+    const baseBlobSha = (entry as { baseBlobSha?: unknown }).baseBlobSha;
     if (!isSafeFixPath(path)) return { ok: false, error: `unsafe or missing path: ${JSON.stringify(String(path).slice(0, 80))}` };
     if (isSensitivePath(path)) return { ok: false, error: `sensitive repo-control path: ${path}` };
     if (seen.has(path)) return { ok: false, error: `duplicate path: ${path}` };
@@ -182,12 +212,15 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
     if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
       return { ok: false, error: `content for ${path} exceeds ${MAX_FILE_BYTES} bytes` };
     }
+    if (baseBlobSha !== undefined && (typeof baseBlobSha !== "string" || !BLOB_SHA_RE.test(baseBlobSha))) {
+      return { ok: false, error: `baseBlobSha for ${path} is not a 40-hex git blob SHA` };
+    }
     seen.add(path);
-    files.push({ path, content });
+    files.push({ path, content, ...(typeof baseBlobSha === "string" ? { baseBlobSha: baseBlobSha.toLowerCase() } : {}) });
   }
   const totalBytes = files.reduce((n, f) => n + Buffer.byteLength(f.content, "utf8"), 0);
   if (totalBytes > MAX_TOTAL_BYTES) {
     return { ok: false, error: `change set exceeds ${MAX_TOTAL_BYTES} bytes total` };
   }
-  return { ok: true, fix: { summary: summaryRaw, files, dispositions } };
+  return { ok: true, fix: { summary: summaryRaw, files, dispositions, ...extra } };
 }

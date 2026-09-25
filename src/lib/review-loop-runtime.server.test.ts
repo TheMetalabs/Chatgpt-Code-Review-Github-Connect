@@ -679,6 +679,51 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.match(escalations(f.posted)[0], /Detail: request-failed after 2 attempt\(s\): local LLM timeout/);
   });
 
+  it("fixSource=github: connector_unavailable ends the round at once (fix-failed, never retried)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    f.deps.requestFix = async (p) => {
+      f.prompts.push(p);
+      throw new Error("connector_unavailable: the reply has no connector check (canary) echo");
+    };
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed");
+    assert.equal(f.prompts.length, 1, "no second attempt");
+    assert.match(escalations(f.posted)[0], /request-failed after 1 attempt\(s\): connector_unavailable/);
+    assert.equal(f.committed, false);
+  });
+
+  it("fixSource=github: every attempt carries the round's GitHub source (head, editable paths, head-tree blobs, retry note)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], reply: ["not json", '{"summary":"s","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}'] });
+    const api = f.deps.gh.gitDataApi;
+    const blobReads: Array<{ sha: string; paths: readonly string[] }> = [];
+    f.deps.gh.gitDataApi = (...a) => ({
+      ...api(...a),
+      async blobShas(sha: string, paths: readonly string[]) {
+        blobReads.push({ sha, paths });
+        return new Map([["src/a.ts", "1".repeat(40)]]);
+      },
+    });
+    const sources: Array<import("./fix-source-github.ts").GithubFixSource> = [];
+    const orig = f.deps.requestFix;
+    f.deps.requestFix = async (p, ctl) => {
+      if (ctl?.github) sources.push(ctl.github);
+      return orig(p, ctl);
+    };
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied");
+    assert.equal(sources.length, 2);
+    const [first, second] = sources;
+    assert.deepEqual([first.owner, first.repo, first.pr, first.headSha], ["o", "r", 7, HEAD]);
+    assert.deepEqual(first.paths, ["src/a.ts"], "only the changed files are editable (never the policy context)");
+    assert.match(first.findings, /\[F1\] \[P1\] src\/a\.ts:3/);
+    assert.equal(first.retryNote, undefined);
+    assert.match(second.retryNote ?? "", /PREVIOUS ATTEMPT REJECTED \(parse-failed\)/);
+    assert.equal(first.switched, second.switched, "the attachment switch is shared by the round's attempts");
+    assert.deepEqual([...(await first.headBlobs())], [["src/a.ts", "1".repeat(40)]]);
+    await second.headBlobs();
+    assert.deepEqual(blobReads, [{ sha: HEAD, paths: ["src/a.ts"] }], "the head tree is read once per round, at the reviewed head");
+  });
+
   it("apply with a failing validator never pushes and hands off (fix-failed)", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3], validateOk: false });
     const r = await run(f, "apply");

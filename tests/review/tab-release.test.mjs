@@ -967,6 +967,31 @@ for (const kind of ['review', 'fix']) {
     await b.rekeyed;
     assert.equal(jobs[leg(kind).jobId].states.chatgpt.tabId, 11);
   });
+  // CE-3: the lookup of a stalled leg's tab (findOriginalTab) skips a page that does not answer in
+  // time or is backed off. That page may hold the leg's run: "unknown", never "gone".
+  test(`${kind}: the stalled-job sweep keeps a leg whose run may be in a provider tab that did not answer`, async () => {
+    const quiet = {workerSequence: 1, workerEvents: [{source: 'worker', sequence: 1, stage: 'run_dispatched', at: 1}]};
+    const b = worker(leg(kind, quiet), {tab: null});
+    b.tabs.set(20, {id: 20, url: 'https://chatgpt.com/c/elsewhere', status: 'complete'}); // the leg's tab 10 is gone
+    // tab 20's page never answers
+    b.chrome.tabs.sendMessage = (id, msg) => { b.messages.push({id, ...msg}); };
+    b.context.pageReplyDeadline = expiresAtOnce;
+    assert.equal((await b.context.clearStuckJobs({includeStalled: true, staleMs: 1})).ok, true);
+    assert.ok(b.messages.some(m => m.id === 20 && m.type === 'ashlar-harvest'), 'the provider tab was asked');
+    assert.equal(b.calls.some(c => c.action === 'failure'), false, 'no "tab closed" failure while that tab may hold the run');
+    assert.equal(b.pending().states.chatgpt.outcome, undefined);
+    // Swept again within the page's back-off: still unknown, not gone.
+    assert.equal((await b.context.clearStuckJobs({includeStalled: true, staleMs: 1})).ok, true);
+    assert.equal(b.calls.some(c => c.action === 'failure'), false);
+    assert.equal(b.pending().states.chatgpt.outcome, undefined);
+  });
+  test(`${kind}: control: the stalled-job sweep settles a leg whose tab is gone when every provider page answers for another run`, async () => {
+    const quiet = {workerSequence: 1, workerEvents: [{source: 'worker', sequence: 1, stage: 'run_dispatched', at: 1}]};
+    const b = worker(leg(kind, quiet), {tab: null, handler: () => ({ok: false, code: 'job_mismatch', jobId: 'job-other', runId: 'run-other', provider: 'chatgpt'})});
+    b.tabs.set(20, {id: 20, url: 'https://chatgpt.com/c/elsewhere', status: 'complete'});
+    assert.equal((await b.context.clearStuckJobs({includeStalled: true, staleMs: 1})).ok, true);
+    assert.ok(b.calls.some(c => c.action === 'failure' && /^tab_closed: /.test(c.error)), 'the stalled leg is settled');
+  });
   test(`${kind}: a replace whose re-key failed holds a cancelled leg only while it is being recorded`, async () => {
     const b = worker(leg(kind, {pageUrl: TEMP}), {status: 'cancelled', session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: blankVerdict});
     noPageWhileDiscarded(b);

@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
 import vm from 'node:vm';
-import {background, storage, raw, until} from './helpers.mjs';
+import {background, storage, raw, until, flush} from './helpers.mjs';
 
 const URL_TAB = 'https://chatgpt.com/c/managed', OTHER = 'https://chatgpt.com/c/users-own';
 const ANSWER = {review: raw, fix: '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'};
@@ -195,14 +195,25 @@ for (const [what, type, states, send] of RECEIPTS) {
     assert.ok(b.messages.some(m => m.type === type), 'the page was asked');
   });
 }
-test('an inventory probe of a page that never answers ends, so the tab is probed again', async () => {
+/** The worker's clock moved on by `ms` (past a page back-off, PAGE_BACKOFF_MS). */
+function later(b, ms) {
+  const RealDate = Date, at = (b.context.Date || RealDate).now() + ms;
+  b.context.Date = class extends RealDate { static now() { return at; } };
+}
+const idle = b => until(() => vm.runInContext('inventoryLanes.size', b.context) === 0);
+test('an inventory probe of a page that never answers ends, and the tab is probed again once its back-off ended', async () => {
   const b = unanswered({});
+  const probes = () => b.messages.filter(m => m.type === 'ashlar-tab-status').length;
   await b.context.refreshTabInventory();
-  assert.ok(await until(() => b.messages.filter(m => m.type === 'ashlar-tab-status').length === 1), 'probed');
+  assert.ok(await until(() => probes() === 1), 'probed');
   // The probe's lane is single-flight per tab: a second probe is sent only once the first ended.
-  assert.ok(await until(() => vm.runInContext('inventoryLanes.size', b.context) === 0), 'the unanswered probe ended');
+  assert.ok(await idle(b), 'the unanswered probe ended');
   await b.context.refreshTabInventory();
-  assert.equal(b.messages.filter(m => m.type === 'ashlar-tab-status').length, 2, 'the unanswered probe released its lane');
+  assert.ok(await idle(b));
+  assert.equal(probes(), 1, 'a page that did not answer is not asked again while it is backed off');
+  later(b, 30_000);
+  await b.context.refreshTabInventory();
+  assert.equal(probes(), 2, 'the unanswered probe released its lane, and the back-off ended');
 });
 test('an inventory probe re-sent after injecting the content scripts, and never answered, ends too', async () => {
   const b = unanswered({});
@@ -215,12 +226,27 @@ test('an inventory probe re-sent after injecting the content scripts, and never 
   assert.ok(await until(() => vm.runInContext('inventoryLanes.size', b.context) === 0, 2000), 'the unanswered probe after the injection ended');
   assert.deepEqual([injected, probes()], [[10], 2], 'injected once, then probed again');
   await b.context.refreshTabInventory();
-  assert.equal(probes(), 3, 'its lane is free for the next refresh');
+  assert.ok(await idle(b));
+  assert.equal(probes(), 2, 'not asked again while it is backed off');
+  later(b, 30_000);
+  await b.context.refreshTabInventory();
+  assert.equal(probes(), 3, 'its lane is free for the next refresh once the back-off ended');
+});
+test('an inventory probe whose script injection the page never completes ends within the reply deadline', async () => {
+  const b = unanswered({});
+  // An older page answers without the ownership protocol; a hung page never runs the injection.
+  b.chrome.tabs.sendMessage = (id, msg, cb) => { b.messages.push({id, ...msg}); cb({ok: true}); };
+  b.chrome.scripting.executeScript = () => new Promise(() => {});
+  await b.context.refreshTabInventory();
+  assert.ok(await until(() => vm.runInContext('inventoryLanes.size', b.context) === 0, 2000), 'the probe ended');
+  await b.context.refreshTabInventory();
+  assert.ok(await idle(b));
+  assert.equal(b.messages.filter(m => m.type === 'ashlar-tab-status').length, 1, 'the page that did not run the injection is backed off');
 });
 // A reloaded page holds no collector (harvest answers idle), so the poll asks it to resume: that
 // message is bounded too, or a page that never answers it would hold the job's lane forever.
 for (const kind of ['review', 'fix']) {
-  test(`${kind}: a resume the page never answers settles the tick, and the next tick asks again`, async () => {
+  test(`${kind}: a resume the page never answers settles the tick, and a tick after the page's back-off asks again`, async () => {
     const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
     const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
       providers: ['chatgpt'], states: {chatgpt: {tabId: 10, started: true, runId: 'run-A'}}};
@@ -240,9 +266,101 @@ for (const kind of ['review', 'fix']) {
     assert.ok(await settles(), 'the tick settles');
     assert.equal(resumes(), 1, 'the page was asked to resume');
     assert.ok(await settles(), 'the next tick settles');
+    assert.equal(resumes(), 1, 'not asked again while the page is backed off');
+    later(b, 30_000);
+    assert.ok(await settles(), 'a tick after the back-off settles');
     assert.equal(resumes(), 2, 'and asks again');
   });
 }
+/** A leg on tab 10 (`states`), its page answering every message with `answer(msg)` (undefined: never
+ * answered), the tab recorded as created for the leg in this browser session. */
+function legOnTab(kind, states, answer, url = URL_TAB) {
+  const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
+  const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
+    providers: ['chatgpt'], states: {chatgpt: {tabId: 10, runId: 'run-A', ...states}}};
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[jobId]: job}}),
+    session: storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}}),
+    tabs: new Map([[10, {id: 10, url, status: 'complete'}]]),
+    api: async (_path, body) => (body?.action === 'ping' ? {ok: true, active: true, accepted: true, status: 'awaiting_chat'} : {ok: true, job: null})});
+  b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+  b.chrome.tabs.sendMessage = (id, msg, cb) => {
+    b.messages.push({id, ...msg});
+    const reply = answer(msg);
+    if (reply) cb({jobId: msg.jobId, runId: msg.runId, provider: msg.provider, ...reply});
+  };
+  b.pending = () => b.local.state.pendingReviewJobs[jobId];
+  return b;
+}
+// X4 (a late page message): after a first send that found no receiver, sendToTab injects the scripts
+// again and sends a second time. Once askPage gave up on the reply, neither happens: a page must never
+// receive a run the worker stopped waiting for (it would start it unseen, Ashlar 4101623037).
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a run message whose first send found no receiver is not sent again after its reply deadline`, async () => {
+    const delivered = [];
+    const b = legOnTab(kind, {started: false}, msg => (msg.type === 'ashlar-tab-status' ? {ok: true} : undefined), 'https://chatgpt.com/?temporary-chat=true');
+    const realSend = b.chrome.tabs.sendMessage;
+    let injected = 0;
+    b.chrome.tabs.sendMessage = (id, msg, cb) => {
+      if (msg.type !== 'ashlar-run') return realSend(id, msg, cb);
+      b.messages.push({id, ...msg});
+      if (!injected) { b.chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'}; cb(); b.chrome.runtime.lastError = null; return; }
+      delivered.push(msg); // the re-injected page received it (it would start the run)
+    };
+    let injection;
+    b.chrome.scripting.executeScript = () => new Promise(resolve => { injection = () => { injected++; resolve(); }; });
+    const deadlines = [];
+    b.context.pageReplyDeadline = () => { let reject; const promise = new Promise((_resolve, fail) => { reject = fail; }); deadlines.push(() => reject(new Error('the page did not answer in time'))); return {promise, cancel() {}}; };
+    const runs = () => b.messages.filter(m => m.type === 'ashlar-run').length;
+    let settled = false;
+    b.tick().then(() => { settled = true; }, () => { settled = true; });
+    assert.ok(await until(() => runs() === 1 && injection), 'the first send found no receiver; the scripts are being injected again');
+    for (const expire of deadlines) expire();
+    assert.ok(await until(() => settled), 'the tick ends once askPage gave up');
+    injection();
+    for (let i = 0; i < 5; i++) await flush();
+    assert.deepEqual([runs(), delivered.length], [1, 0], 'the run message is never sent after its deadline');
+    assert.equal(b.pending().states.chatgpt.started, false, 'nothing was dispatched');
+  });
+}
+// A tab whose page did not answer in time is backed off: no lane messages it for PAGE_BACKOFF_MS (a
+// hung page would otherwise cost every lane that asks it the full reply deadline, every tick). A
+// message to it meanwhile fails at once, as the timeout did; a lookup of the leg's tab reads it as
+// "unknown", never as absent.
+test('a tab that did not answer is messaged by no lane until its back-off ended, or its page loaded again', async () => {
+  const b = legOnTab('review', {started: true}, () => undefined);
+  b.context.pageReplyDeadline = expiresAtOnce;
+  const asked = () => b.messages.filter(m => m.id === 10).length;
+  await b.tick();
+  assert.ok(await until(() => b.messages.some(m => m.type === 'ashlar-harvest')), 'the poll asked the page');
+  assert.ok(await idle(b));
+  const before = asked();
+  await b.tick();
+  await b.context.refreshTabInventory();
+  assert.ok(await idle(b));
+  assert.equal(asked(), before, 'the next poll and the inventory do not message it');
+  assert.match(b.pending().states.chatgpt.connectionError, /not asked again yet/);
+  const jobs = await b.context.workerJobs('http://bridge');
+  assert.equal(await b.context.findOriginalTab(jobs['job-A'], 'chatgpt'), undefined, 'a lookup reads the silent page as unknown, not absent');
+  assert.equal(asked(), before, 'nor does a lookup of the leg\'s tab');
+  later(b, 30_000);
+  await b.tick();
+  assert.ok(b.messages.slice(before).some(m => m.id === 10 && m.type === 'ashlar-harvest'), 'asked again once the back-off ended');
+  // A page that loaded again is a new page: asked at once.
+  assert.ok(await idle(b));
+  const again = asked();
+  b.context.noteTabUpdated(10, {status: 'loading'});
+  await b.tick();
+  assert.equal(asked(), again, 'still backed off while it loads');
+  b.context.noteTabUpdated(10, {status: 'complete'});
+  await b.tick();
+  assert.ok(asked() > again, 'asked at once after the load');
+});
+test('control: a page that answers is never backed off', async () => {
+  const b = legOnTab('review', {started: true}, msg => (msg.type === 'ashlar-tab-status' ? {ok: true} : {ok: false, code: 'busy', retry: true}));
+  b.context.pageReplyDeadline = expiresAtOnce;
+  for (let i = 0; i < 3; i++) await b.tick();
+  assert.equal(b.messages.filter(m => m.type === 'ashlar-harvest').length, 3, 'asked every tick');
+});
 // A frozen tab (energy saver, a collapsed tab group) is not probed by the inventory: a probe would
 // only time out, erasing the owner read there while it ran (the user's own frozen tabs then took
 // every review slot as unverified), and each refresh would queue another unanswered message.

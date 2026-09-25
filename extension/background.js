@@ -115,6 +115,7 @@ function closedKey(job, provider) {
 
 async function rememberClosedTab(tabId, info) {
   invalidateTabInventory(tabId);
+  pageBackoff.delete(tabId);
   const key = OWNED_PREFIX + tabId;
   const owned = (await chrome.storage.session.get([key]))[key];
   // Only managed tabs; session-scoped records cannot poison a reused ID after restart.
@@ -411,7 +412,10 @@ function noReceiver(err) {
   return /receiving end does not exist|could not establish connection/i.test(m);
 }
 
-async function sendToTab(tabId, msg, files) {
+/** `live()`: whether the caller still waits for the reply (askPage). A first send that found no
+ * receiver is followed by a re-injection and a second send 400 ms later; neither happens once the
+ * caller gave up, so a message the worker stopped waiting for is never delivered afterwards. */
+async function sendToTab(tabId, msg, files, live = () => true) {
   const once = () =>
     new Promise((resolve, reject) => {
       // Content scripts acknowledge immediately. Do not turn a delayed browser
@@ -421,22 +425,33 @@ async function sendToTab(tabId, msg, files) {
         else resolve(res);
       });
     });
+  const late = () => new Error("the page did not answer in time; the message was not sent again");
   try {
     return await once();
   } catch (e) {
     if (!files?.length || !noReceiver(e)) throw e;
+    if (!live()) throw late();
     await chrome.scripting.executeScript({ target: { tabId }, files });
     await sleep(400);
+    if (!live()) throw late();
     return once();
   }
 }
 
 /** How long any worker-to-page message may go unanswered (every page handler replies at once, the
  * long model call runs detached in the page): a page that accepted it but never runs its handler (a
- * frozen tab, a hung page) then counts as unreachable for this tick, instead of holding its
- * single-flight lane (a job's poll, its cleanup and the bounded ownership wait that only starts
- * after a reply, a capture or repair receipt, an inventory probe) forever. */
+ * frozen tab, a hung page) then counts as unreachable (and is backed off: PAGE_BACKOFF_MS), instead
+ * of holding its single-flight lane (a job's poll, its cleanup and the bounded ownership wait that
+ * only starts after a reply, a capture or repair receipt, an inventory probe) forever. */
 const PAGE_REPLY_MS = 15_000;
+
+/** How long a tab whose page did not answer in time (PAGE_REPLY_MS) is not messaged again, by any
+ * lane: a hung page would otherwise cost every lane that asks it (the leg's poll every tick, its
+ * release, the inventory probe, a lookup of the leg's tab) PAGE_REPLY_MS each time. A message to it
+ * meanwhile fails at once, as the timeout would. Any reply ends it, and so does the tab finishing a
+ * load (noteTabUpdated): a new page. */
+const PAGE_BACKOFF_MS = 30_000;
+const pageBackoff = new Map(); // tabId -> the time until which it is not messaged
 
 /** One reply deadline (a function so tests can replace the timer; cancelled once the reply came). */
 function pageReplyDeadline(ms = PAGE_REPLY_MS) {
@@ -445,12 +460,47 @@ function pageReplyDeadline(ms = PAGE_REPLY_MS) {
   return {promise, cancel: () => clearTimeout(timer)};
 }
 
-/** sendToTab bounded by pageReplyDeadline: how the worker sends every page message. A reply that
- * never came is a messaging outage (retried next tick), never a model failure. */
-async function askPage(tabId, msg, files) {
+/** An error meaning the page did not answer in time, now or within PAGE_BACKOFF_MS (`silent`): not
+ * evidence about what the tab holds (findOriginalTab: "unknown"). */
+function pageSilent(error) {
+  error.silent = true;
+  return error;
+}
+
+/** `start(live)` (a page message, or a script injection into the page) bounded by
+ * pageReplyDeadline: the page that does not answer in time is backed off (PAGE_BACKOFF_MS), and one
+ * still backed off is not asked at all. `live()` is true until the deadline gave up. */
+async function withinPageReply(tabId, start) {
+  if ((pageBackoff.get(tabId) || 0) > Date.now()) throw pageSilent(new Error("the page did not answer in time recently; it is not asked again yet"));
+  pageBackoff.delete(tabId);
   const deadline = pageReplyDeadline();
-  try { return await Promise.race([sendToTab(tabId, msg, files), deadline.promise]); }
-  finally { deadline.cancel(); }
+  let phase = "waiting";
+  const expired = deadline.promise.then(undefined, error => {
+    if (phase === "waiting") { phase = "expired"; pageBackoff.set(tabId, Date.now() + PAGE_BACKOFF_MS); }
+    throw pageSilent(error);
+  });
+  try {
+    const value = await Promise.race([start(() => phase === "waiting"), expired]);
+    phase = "answered";
+    pageBackoff.delete(tabId);
+    return value;
+  } catch (error) {
+    if (phase === "waiting") phase = "failed";
+    throw error;
+  } finally { deadline.cancel(); }
+}
+
+/** sendToTab bounded by pageReplyDeadline: how the worker sends every page message. A reply that
+ * never came is a messaging outage (retried once the back-off ends), never a model failure. */
+async function askPage(tabId, msg, files) {
+  return withinPageReply(tabId, live => sendToTab(tabId, msg, files, live));
+}
+
+/** A tab's page changed: its inventory reading is stale, and a page that finished loading is a new
+ * page, asked again at once. */
+function noteTabUpdated(id, change) {
+  if (change.url || change.status) invalidateTabInventory(id);
+  if (change.status === "complete") pageBackoff.delete(id);
 }
 
 async function quotaMap() {
@@ -604,17 +654,24 @@ function allowedTab(tab, provider) {
   } catch { return false; }
 }
 
+/** The provider tab whose page is bound to this leg's run; null when none is; undefined ("unknown")
+ * when a page that did not answer in time (or is backed off, withinPageReply) may be it. Every caller
+ * but providerTabGone reads unknown as null: it keeps waiting. */
 async function findOriginalTab(job, provider) {
   const urls = provider === "grok" ? ["https://grok.com/*"] : ["https://chatgpt.com/*", "https://chat.openai.com/*"];
+  let unknown = false;
   for (const tab of await chrome.tabs.query({url: urls})) {
     // A frozen tab runs no handler until the user brings it back: it cannot answer now.
     if (!allowedTab(tab, provider) || tab.frozen === true) continue;
     try {
       const result = await askPage(tab.id, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
       if (matchesJob(result, job, provider)) return tab;
-    } catch { /* A messaging outage is not evidence of completion. */ }
+    } catch (error) {
+      // A messaging outage is not evidence of completion, nor a silent page of absence.
+      if (error?.silent) unknown = true;
+    }
   }
-  return null;
+  return unknown ? undefined : null;
 }
 
 function invalidateTabInventory(tabId) {
@@ -657,7 +714,8 @@ async function probeTabOwner(tab, provider, epoch) {
   let result=await askPage(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
   if(result?.ownershipProtocol!==1 && inventoryUpgrades.get(tab.id)!==epoch) {
     inventoryUpgrades.set(tab.id,epoch);
-    await chrome.scripting.executeScript({target:{tabId:tab.id},files:contentFiles(provider)});
+    // A hung page never completes an injection either: bounded like a message.
+    await withinPageReply(tab.id,()=>chrome.scripting.executeScript({target:{tabId:tab.id},files:contentFiles(provider)}));
     result=await askPage(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
   }
   const current=await chrome.tabs.get(tab.id);
@@ -2098,8 +2156,9 @@ async function providerTabGone(job, provider) {
     } catch { /* recorded tab is gone; fall through to a full owned-tab search */ }
   }
   const found = await findOriginalTab(job, provider);
-  // A tab Chrome replaced meanwhile is not gone.
-  return !found && !replacedSince(state, lookedUp);
+  // A tab Chrome replaced meanwhile is not gone, nor one whose page did not answer (unknown: it may
+  // hold the run).
+  return found === null && !replacedSince(state, lookedUp);
 }
 
 /** The bridge job registry is in-memory only, so a job the server used to own that now
@@ -2656,9 +2715,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     void commitMaintenanceReload(message.id).then(sendResponse,error=>sendResponse({ok:false,error:String(error?.message||error)})); return true;
   }
 });
-chrome.tabs.onUpdated?.addListener((id, change) => {
-  if(change.url || change.status)invalidateTabInventory(id);
-});
+chrome.tabs.onUpdated?.addListener((id, change) => noteTabUpdated(id, change));
 chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
 // Top level like the others, so a replace (never followed by onRemoved) also wakes a stopped worker.
 chrome.tabs.onReplaced.addListener((added, removed) => void rekeyReplacedTab(added, removed).catch(() => {}));

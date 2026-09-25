@@ -2093,4 +2093,34 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
       assert.equal(reads, 1);
     });
   });
+
+  it("a waiter whose review predates a stop → restart made during its wait stays quiet: the restart's own review drives the new session", async (t) => {
+    const f = fakeDeps({ rounds: [3] }); // S1: suggest by alice; this head's review at dayIso(0)
+    let clock = Date.parse("2026-01-01T00:00:05Z"); // the reviews of A and B were posted just before
+    f.deps.now = () => clock;
+    const RESTART_REVIEW = "2026-01-01T13:00:00Z";
+    let restartReviewed = false; // the restart's own review of this head, posted in S2
+    const reviews = f.deps.gh.listPullReviews;
+    f.deps.gh.listPullReviews = async (...a) => [
+      ...(await reviews(...a)),
+      ...(restartReviewed ? [{ userLogin: BOT, body: "<!-- ashlar-findings total=3 -->", commitId: HEAD, submittedAt: RESTART_REVIEW }] : []),
+    ];
+    const hold = holdFirst(t, f);
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    const b = run(f, "suggest", ENV_ON, job({ id: "job-B", thread: { kind: "mention", commentId: 9, userText: "@ashlar-bot review" } }));
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2026-01-01T06:00:00Z" });
+    f.issues.push(recorded("suggest", "alice", "2026-01-01T12:00:00Z")); // S2; its review is still generating
+    hold.release();
+    const [ra, rb] = await settles(Promise.all([a, b]));
+    assert.deepEqual(ra, { ran: false, reason: NEWER });
+    assert.equal(escalations(f.posted).length, 0, "the stale waiter hands off nothing: the restarted session stays active");
+    assert.deepEqual(rb, { ran: false, reason: NEWER });
+    restartReviewed = true;
+    clock = Date.parse(RESTART_REVIEW) + 1_000;
+    const rc = await settles(run(f, "suggest", ENV_ON, job({ id: "job-C" })));
+    assert.ok(rc.ran && rc.step === "fix" && rc.outcome === "suggested", `the restart's round runs: ${JSON.stringify(rc)}`);
+    assert.equal(f.prompts.length, 2, "the stopped round and the restarted one");
+    assert.equal(escalations(f.posted).length, 0);
+  });
 });

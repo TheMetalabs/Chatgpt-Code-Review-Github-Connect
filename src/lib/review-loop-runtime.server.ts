@@ -922,6 +922,9 @@ export async function runPostReviewLoop(
     }
   };
 
+  // This review was posted before its step was called: a session anchored at or after this instant
+  // does not contain it.
+  const calledAt = (deps?.now ?? Date.now)();
   const stepKey = `${prKey(ref)}@${headSha}`;
   const slots = stepSlots(deps);
   const claimed = claimStep(slots, stepKey, stepWaitMaxMs(deps, env));
@@ -986,6 +989,11 @@ export async function runPostReviewLoop(
       }
     }
     if (!session.active) return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
+    // A step that waited acts only for a session its review can belong to. One anchored after the
+    // step was called (a stop → restart during the wait) started after this review was posted, so
+    // its rounds never include it: the history check below would hand the restarted session off
+    // (loop-error). The new session's own review drives it.
+    if (waited && calledAt <= isoMs(session.startIso)) return { ran: false, reason: NEWER_REQUEST };
     // A step that waited behind a round of this very session, mode and starter (a re-trigger
     // mid-round): that round's report or handoff is the result — no second FIXING, provider call
     // or suggestion. A new session, mode or starter runs its own round on these fresh reads.

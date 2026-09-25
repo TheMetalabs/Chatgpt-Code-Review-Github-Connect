@@ -1,6 +1,6 @@
 import {cancelLocalJsonRepairs} from "./json-repair.server";
 import type {RepairReceipt} from "./json-repair-types.ts";
-import {recordJobHistory, recordDeliveryHistory, reviewHistory} from "./review-history.server";
+import {reviewHistory} from "./review-history.server";
 import {
   CANDIDATE_412_DROPPED,
   FINDING_412,
@@ -179,11 +179,11 @@ export function resetHarbor() {
 /** The last job or delivery history write that failed. Non-fatal: what it recorded was applied. */
 let historyFault: { id: string; at: number; error: string } | undefined;
 
-/** Every job and delivery history write in harbor goes through here. History records a transition,
- * it is never part of one: a write that throws is caught, logged and surfaced (historyHealth), so it
- * can never abort or half-apply the state change it records (a job patched but its lease ping, local
- * leg start or review start never reached). A later successful write clears the fault, as the store
- * clears its own. */
+/** Every job and delivery history write in harbor goes through here, straight to the store: this is
+ * the one boundary where a failed write stops. The store throws on a failed write (after recording
+ * its own health error); here it is caught, logged and surfaced (historyHealth) with the record it
+ * failed for. History records a transition, it is never part of one, so a failure never aborts the
+ * state change it records. A later successful write clears the fault, as the store clears its own. */
 function noteHistory(id: string, write: () => void) {
   try {
     write();
@@ -194,16 +194,17 @@ function noteHistory(id: string, write: () => void) {
     console.warn(`[harbor] history write failed for ${id} (the state change was applied): ${error}`);
   }
 }
-const noteJobHistory = (job: Job) => noteHistory(job.id, () => recordJobHistory(job));
-const noteDeliveryHistory = (ev: WebhookLog, target?: Parameters<typeof recordDeliveryHistory>[1]) =>
-  noteHistory(ev.id, () => recordDeliveryHistory(ev, target));
+const noteJobHistory = (job: Job) => noteHistory(job.id, () => reviewHistory().recordJob(job));
+const noteDeliveryHistory = (ev: WebhookLog, target?: Parameters<ReturnType<typeof reviewHistory>["recordDelivery"]>[1]) =>
+  noteHistory(ev.id, () => reviewHistory().recordDelivery(ev, target));
 
-/** History storage health for the dashboard: the store's own, plus a history write that failed
- * outside it (a non-fatal history error; the job state is current). */
+/** History storage health for the dashboard: the store's own, and the record whose write failed (a
+ * non-fatal history error; the job state is current). A failure the store's own health does not
+ * record (a throw outside its disk I/O) is surfaced as a failed write. */
 export function historyHealth() {
   const store = reviewHistory().health();
-  if (!historyFault || !store.ok) return store;
-  return { ...store, ok: false, error: "history_write_failed", failedId: historyFault.id, failedAt: historyFault.at };
+  if (!historyFault) return store;
+  return { ...store, ok: false, error: store.error ?? "history_write_failed", failedId: historyFault.id, failedAt: historyFault.at };
 }
 
 export function cancelHarborJob(jobId: string) {

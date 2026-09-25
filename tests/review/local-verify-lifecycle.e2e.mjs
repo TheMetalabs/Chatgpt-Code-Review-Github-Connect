@@ -57,22 +57,31 @@ async function newJobAfter(app,id,delivery){
   return out.jobId;
 }
 
-/** A history store whose write of one job's cancelled record throws once (the fault the live → terminal
- * edge must survive: the job is terminal, so no later transition would run its cleanup again). */
-function historyFault(){
-  const fault={jobId:undefined,thrown:0};
-  const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({recordJobHistory(job){
-    if(!fault.thrown&&job.id===fault.jobId&&job.status==='cancelled'){fault.thrown++;throw new Error('history store unavailable');}
-    return real.recordJobHistory(job);
-  }})}};
-  return {fault,githubOptions};
+/** Fails the app's history store's own record writes the way a full or unwritable disk does
+ * (review-history.server.ts write: the store records history_write_failed in its health, then throws),
+ * for the records `when(key, record)` selects while `fault.on`. The fault sits in the store, below every
+ * harbor call site, so harbor sees exactly what production does. */
+function failHistoryWrites(app,when){
+  const store=app.history,write=store.write,fault={on:true,thrown:0,keys:[]};
+  store.write=function(key,value){
+    if(fault.on&&when(key,value)){
+      fault.thrown++;fault.keys.push(key.split('/')[0]);
+      this.lastError='history_write_failed';throw new Error('history_write_failed');
+    }
+    return write.call(this,key,value);
+  };
+  return fault;
 }
-/** Start a verify-clean job whose cancelled-record history write will throw; `verifying` also starts
- * the local verification round (streaming, so its liveness watchdog is armed). */
+/** A job's record write: its meta record, carrying the job's id, status and skip reason. */
+const jobRecord=(key,value)=>key.startsWith('jobs/')&&key.endsWith('/meta.json');
+/** Start a verify-clean job whose cancelled-record history write will fail once (the fault the live →
+ * terminal edge must survive: the job is terminal, so no later transition would run its cleanup
+ * again); `verifying` also starts the local verification round (streaming, so its liveness watchdog is
+ * armed). */
 async function startFaulted(t,{verifying,delivery}){
-  const {fault,githubOptions}=historyFault();
-  const s=await start(t,{githubOptions,delivery});
-  fault.jobId=s.jobId;s.fault=fault;
+  const s=await start(t,{delivery});
+  const fault=failHistoryWrites(s.app,(key,record)=>!fault.thrown&&jobRecord(key)&&record.id===s.jobId&&record.status==='cancelled');
+  s.fault=fault;
   if(verifying){
     s.app.env.ASHLAR_LOCAL_LLM_STREAM='true';
     await s.app.harbor.submitHarborChat(s.jobId,clean);
@@ -102,7 +111,7 @@ function assertCleanedDespiteHistory(s,thrown,logged){
   assert.equal(s.fault.thrown,1,'the cancelled record write failed');
   assert.equal(s.job().status,'cancelled','the job is terminal');
   assert.equal(s.app.harbor.hasLocalLegState(s.jobId),false,'activity and liveness cleared on the edge');
-  assert.ok(logged.some(l=>l.includes(s.jobId)&&/history store unavailable/.test(l)),'the failure is logged');
+  assert.ok(logged.some(l=>l.includes(s.jobId)&&/history_write_failed/.test(l)),'the failure is logged');
 }
 
 // expect: status, skip (regex or undefined), requests (total local requests), reviews, aborted, and
@@ -245,21 +254,18 @@ const ROWS=[
       assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
       return s;
     }},
-  // A history write that fails is never a bridge disconnect: every ping is applied and speaks for its owner.
-  {name:'L24 history writes fail through a long claimed chat run: the owner\'s lease pings are applied, it stays connected, local stays held, and the run completes',expect:{status:'posted',requests:0,reviews:1,reviewers:VERIFIER,ops:VERIFIER_OPS},
+  // History storage that is down is never a bridge disconnect: every ping is applied and speaks for its
+  // owner. A ping changes no history record (the store skips a summary that only moved in time), so it
+  // never reaches a write that could fail: the edges that do write under a failing store are L18-L21 and
+  // the history tests below.
+  {name:'L24 history storage fails every write through a long claimed chat run: the owner\'s lease pings are applied, it stays connected, local stays held, and the run completes',expect:{status:'posted',requests:0,reviews:1,reviewers:VERIFIER,ops:VERIFIER_OPS},
     async run(t){
-      const fault={on:false,thrown:0};
-      const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({recordJobHistory(job){
-        if(fault.on){fault.thrown++;throw new Error('history store unavailable');}
-        return real.recordJobHistory(job);
-      }})}};
-      const s=await start(t,{githubOptions,delivery:'lifecycle-history-pings'});
+      const s=await start(t,{delivery:'lifecycle-history-pings'});
       s.app.bridge.bridgeHeartbeat();
       const take=s.app.bridge.takeNextBridgeJob('client-a');
       assert.equal(take?.jobId,s.jobId,'client A claims the job');
-      const logged=warnings(t);
-      fault.on=true;
-      // 5 min of pings, past BRIDGE_CONNECTED_MS (2 min), while every job history write fails
+      const fault=failHistoryWrites(s.app,()=>true);
+      // 5 min of pings, past BRIDGE_CONNECTED_MS (2 min), while every history write fails
       for(let i=0;i<5;i++){
         s.app.clock.now+=60_000;s.app.bridge.bridgeHeartbeat();
         assert.equal(s.app.bridge.refreshBridgeClaim(s.jobId,{chatgpt:true},{},take.leaseId),true,'A\'s lease ping is accepted');
@@ -267,9 +273,7 @@ const ROWS=[
         assert.equal(s.app.bridge.chatBridgeLink(s.job()).connected,true,'the owner stays connected');
         await new Promise(resolve=>setTimeout(resolve,60)); // a few watcher ticks at each step
       }
-      assert.ok(fault.thrown>=5,'every ping\'s history write failed');
-      assert.ok(logged.some(l=>/history write failed/.test(l)),'the failures are logged');
-      assertHistoryFault(s.app,s.jobId);
+      assert.equal(fault.thrown,0,'a lease ping writes no history record, so the failing store is never reached');
       assert.equal(s.app.localRequests.length,0,'no verify-clean fallback while the owner pings');
       fault.on=false; // history storage restored
       assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
@@ -519,32 +523,23 @@ test('chat bridge link: an owned job follows its owner, an unowned one the serve
 });
 
 test('history: a new job whose delivery and job history writes fail still starts its review, and the failure never reaches the webhook',async t=>{
-  const thrown=[];
-  const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({
-    recordJobHistory(job){if(job.status==='queued'){thrown.push('job');throw new Error('history store unavailable');}return real.recordJobHistory(job);},
-    recordDeliveryHistory(){thrown.push('delivery');throw new Error('history store unavailable');},
-  })}};
-  const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false},githubOptions);t.after(()=>app.close());
+  const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false});t.after(()=>app.close());
+  const fault=failHistoryWrites(app,(key,record)=>key.startsWith('deliveries/')||(jobRecord(key)&&record.status==='queued'));
   const logged=warnings(t);
   let out,error;try{out=app.mention('history-new-job');}catch(e){error=e;}
   assert.equal(error,undefined,'the webhook is accepted');
   assert.equal(out.queued,true);
-  assert.deepEqual(thrown,['delivery','job'],'both writes failed');
+  assert.deepEqual(fault.keys,['deliveries','jobs'],'both writes failed');
   assert.equal(logged.filter(l=>/history write failed/.test(l)).length,2,'each failure is logged');
   await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId)?.status==='awaiting_chat','the review never started');
   assert.equal(app.harbor.hasLocalSample(out.jobId),true,'the held verify-clean job has its snapshot');
 });
 
 test('history: an operator reset whose history write fails still drops every job and releases its local state',async t=>{
-  const fault={on:false,thrown:0};
-  const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({recordJobHistory(job){
-    if(fault.on&&job.skipReason==='operator reset'){fault.thrown++;throw new Error('history store unavailable');}
-    return real.recordJobHistory(job);
-  }})}};
-  const {app,jobId}=await start(t,{githubOptions,delivery:'history-reset'});
+  const {app,jobId}=await start(t,{delivery:'history-reset'});
   assert.equal(app.harbor.hasLocalSample(jobId),true,'the held job keeps its snapshot');
   const logged=warnings(t);
-  fault.on=true;
+  const fault=failHistoryWrites(app,(key,record)=>jobRecord(key)&&record.skipReason==='operator reset');
   let error;try{app.harbor.resetHarbor();}catch(e){error=e;}
   assert.equal(error,undefined,'the reset completes');
   assert.equal(fault.thrown,1,'the cancelled record write failed');

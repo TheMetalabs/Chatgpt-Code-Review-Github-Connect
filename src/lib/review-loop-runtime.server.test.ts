@@ -10,7 +10,7 @@ import { botSettingsToEnv, overlayEnv, sanitizeBotSettings } from "./settings.se
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { createHash } from "node:crypto";
-import { FIX_ATTACHMENT_MAX_BYTES, FIX_ATTACHMENT_NAME, fixAttachment, fixTypedPrompt } from "./fix-attachment.ts";
+import { FIX_ATTACHMENT_MAX_BYTES, FIX_ATTACHMENT_NAME, fixAttachment, fixTypedPrompt, plainMarkdownLine, rendersAsTyped } from "./fix-attachment.ts";
 import type { FixRequest } from "./bridge-fix.server.ts";
 import {
   ashlarBotLogin,
@@ -1482,7 +1482,12 @@ describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; gro
     assert.ok(req.prompt.includes(`SHA-256 ${req.attachment.sha256}`), "the typed prompt names the hash");
     assert.match(req.prompt, /authoritative/);
     assert.ok(!req.prompt.includes("def f(x)") && !req.prompt.includes("tabs  and"), "no source or finding in the typed body");
-    assert.ok(req.prompt.includes(CHAT_FIX_FENCE_RULE));
+    // Rendered as Markdown, "```json" lost its backticks live (#93): the typed line has none, and it
+    // renders as typed; the full rule stays in the attachment.
+    assert.ok(!/[`*]/.test(req.prompt), "no Markdown-active characters in the typed line");
+    assert.ok(rendersAsTyped(req.prompt));
+    assert.ok(req.prompt.includes(plainMarkdownLine(CHAT_FIX_FENCE_RULE)));
+    assert.ok(req.attachment.body.includes(CHAT_FIX_FENCE_RULE), "the attachment keeps the rule verbatim");
   });
 
   it("a fix request over the attachment cap fails fast with a clear reason, never reaching the bridge", async () => {

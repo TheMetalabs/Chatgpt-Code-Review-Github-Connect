@@ -52,7 +52,7 @@ test('every invalid fixAgent value is rejected (400) and nothing is saved', asyn
 // The route passes every supplied field RAW to the shared validator. Before, a non-object fixAgent
 // was dropped by the route and the request answered 200 with nothing changed.
 test('a supplied non-object fixAgent (null / false / "off" / [] …) is a 400; the enabled loop stays as stored, live and persisted', async () => {
-  const h = harness({fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply'}});
+  const h = harness({fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'suggest'}});
   assert.equal(h.state.settings.fixAgent.enabled, true, 'fixture: the loop is ON and stored');
   const live = structuredClone(h.state.settings);
   for (const value of [null, false, 'off', [], 0, '', true, 'on', [{enabled: false}]]) {
@@ -196,7 +196,7 @@ const STORED = [
   {fixAgent: {enabled: true, provider: 'coding-agent', delivery: 'coding-agent'}},
   {fixAgent: {enabled: true, provider: null}},
   {fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply', mode: 'apply'}}, // grok was a fix provider before
-  {fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', timeoutMs: 90_000.7, chatTimeoutMs: 1, roundCap: 1e9}},
+  {fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'suggest', timeoutMs: 90_000.7, chatTimeoutMs: 1, roundCap: 1e9}},
   {maxTurns: 2.5, exploreTurns: -3, maxInlineComments: 99.9, localReviewMaxTokens: 0, contextPadLines: 1e300, promptDiffMaxChars: -1},
   {username: '  ', mention: ['', 42, ' @x '], reviewOrder: ['grok', 'bogus'], chatgptReasoning: 'turbo', localReviewMode: 'x', publishMinSeverity: 'P7'},
   {reviewChatgpt: false, reviewGrok: false, reviewLocal: false},
@@ -255,7 +255,7 @@ test('env seed: every whole-number env knob loads into the save domain', async (
 // as fixAgent.paralellPrs) is a 400 before anything is merged or validated — never merged, ignored
 // by the value rules, dropped by sanitize and answered 200 with nothing applied.
 test('fixAgent: {paralellPrs: 9} (a typo) is a 400; nothing persisted, live settings unchanged', async () => {
-  const h = harness({fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', parallelPrs: 2}});
+  const h = harness({fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'suggest', parallelPrs: 2}});
   const live = structuredClone(h.state.settings);
   const res = await h.post({fixAgent: {paralellPrs: 9}});
   assert.equal(res.status, 400);

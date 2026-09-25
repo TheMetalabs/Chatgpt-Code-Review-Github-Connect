@@ -285,7 +285,7 @@ describe("the loop is OFF unless Settings enable it (no other path turns it on)"
     readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
       e.isDirectory() ? sources(join(dir, e.name)) : /\.tsx?$/.test(e.name) && !/\.test\.tsx?$/.test(e.name) ? [join(dir, e.name)] : [],
     );
-  const withProvider = (fix: Record<string, unknown>) => sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "script-apply", ...fix } });
+  const withProvider = (fix: Record<string, unknown>) => sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "script-apply", mode: "suggest", ...fix } });
 
   it("default settings → off: no switch, no provider", () => {
     assert.equal(DEFAULT_SETTINGS.fixAgent.enabled, false);
@@ -316,6 +316,18 @@ describe("the loop is OFF unless Settings enable it (no other path turns it on)"
       assert.deepEqual(await runPostReviewLoop("t", job(), sample, s, f.deps, ENV), { ran: false, reason: "disabled" });
       assert.equal(f.prompts.length, 0, "no fix request");
     }
+  });
+
+  it("a loaded document whose stored provider / delivery / mode was invalid never runs, even where load repaired the value (Ashlar 4099509084)", async () => {
+    const valid = { enabled: true, provider: "chatgpt", delivery: "script-apply", mode: "apply" };
+    for (const stored of [{ ...valid, provider: "skynet" }, { ...valid, delivery: "teleport" }, { ...valid, mode: "yolo" }, { ...valid, provider: "local", delivery: "chat-push" }]) {
+      const s = sanitizeBotSettings({ fixAgent: stored });
+      assert.equal(loopEnabled(s), false, JSON.stringify(stored));
+      const f = fakeDeps({ start: "apply", rounds: [3] });
+      assert.deepEqual(await runPostReviewLoop("t", job(), sample, s, f.deps, ENV), { ran: false, reason: "disabled" });
+      assert.equal(f.prompts.length, 0, "no fix request");
+    }
+    assert.equal(loopEnabled(sanitizeBotSettings({ fixAgent: valid })), true, "control: the valid stored configuration runs");
   });
 
   it("only a literal true switches it on (the switch fails closed)", () => {

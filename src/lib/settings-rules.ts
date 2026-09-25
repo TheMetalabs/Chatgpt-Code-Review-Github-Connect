@@ -38,6 +38,7 @@ import {
   type FixAgentProvider,
   type FixAgentSettings,
   type FixDelivery,
+  type FixMode,
 } from "./types.ts";
 import { CHATGPT_REASONING, GROK_REASONING } from "./reasoning.ts";
 
@@ -118,6 +119,19 @@ export function fixLoopRunnable(fix: Pick<FixAgentSettings, "provider" | "delive
   const delivery = fix?.delivery;
   if (delivery === undefined || !WIRED_FIX_DELIVERIES.includes(delivery)) return false;
   return WIRED_FIX_PROVIDERS.includes(provider) && fixPairCompatible(provider, delivery);
+}
+
+/** Whether a STORED fixAgent block (raw: as read from disk or an env seed, BEFORE any
+ * normalization) may load with the loop ON. Load normalization never makes an unsafe configuration
+ * runnable: the switch survives only as a literal true whose raw provider, delivery and mode are
+ * each valid as stored and together a wired, compatible pair (fixLoopRunnable). A value load would
+ * repair (an invalid delivery defaulted to script-apply, an invalid mode defaulted to suggest, an
+ * unknown provider) or a missing one turns the loop OFF; the rest may still be normalized. */
+export function storedFixLoopOn(raw: unknown): boolean {
+  if (!isObject(raw) || raw.enabled !== true) return false;
+  if (!FIX_MODES.includes(raw.mode as FixMode)) return false;
+  // fixLoopRunnable reads the raw provider and delivery: each must be a known value, and the pair wired.
+  return fixLoopRunnable({ provider: raw.provider as FixAgentProvider, delivery: raw.delivery as FixDelivery });
 }
 
 /** The loop is ON: the switch is a literal true AND the configuration is runnable. */

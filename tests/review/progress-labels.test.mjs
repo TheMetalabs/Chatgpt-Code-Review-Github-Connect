@@ -15,11 +15,14 @@ const RECORDERS = {workerStep: 2, recordReviewStep: 0, step: 0};
 const STAGE_NAME = /^[a-z][a-z0-9_]*$/;
 const CLOSERS = {'(': ')', '[': ']', '{': '}'};
 const REGEX_AFTER = new Set(['return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'throw', 'instanceof', 'do', 'else', 'yield', 'await']);
+/** Punctuators read whole, longest first. An operator read in pieces changes what follows it: after
+ * `i++` a `/` divides, while after `+` it starts a regex that would swallow the code up to the next `/`. */
+const PUNCTUATORS = ['??', '?.', '||', '++', '--'];
 
 /** One bracket level of JavaScript from `i` up to `close` (the end of `text` when there is none), as
- * tokens: str, tpl (`substs` holds the tokens of each ${}), regex, word, punct (`??`, `?.` and `||`
- * whole) and group (a bracketed run holding its own tokens). Comments and whitespace are dropped. A
- * closer that does not match throws. */
+ * tokens: str, tpl (`substs` holds the tokens of each ${}), regex, word, punct (PUNCTUATORS whole) and
+ * group (a bracketed run holding its own tokens). Comments and whitespace are dropped. A closer that does
+ * not match throws. */
 function tokenize(text, i, close) {
   const tokens = [];
   const push = (kind, from, to, extra = {}) => { tokens.push({kind, at: from, text: text.slice(from, to), ...extra}); return to; };
@@ -44,7 +47,8 @@ function tokenize(text, i, close) {
         } else j += 1;
       }
       i = push('tpl', i, j + 1, {value: text.slice(i + 1, j), substs});
-    } else if (c === '/' && (!prev || prev.kind === 'punct' || (prev.kind === 'word' && REGEX_AFTER.has(prev.text)))) {
+    } else if (c === '/' && (!prev || (prev.kind === 'punct' && prev.text !== '++' && prev.text !== '--') ||
+        (prev.kind === 'word' && REGEX_AFTER.has(prev.text)))) {
       let j = i + 1, inClass = false;
       for (; j < text.length && (text[j] !== '/' || inClass); j += 1) {
         if (text[j] === '\\') j += 1;
@@ -62,7 +66,7 @@ function tokenize(text, i, close) {
       let j = i;
       while (j < text.length && /[\w$]/.test(text[j])) j += 1;
       i = push('word', i, j);
-    } else i = push('punct', i, i + (['??', '?.', '||'].find(op => text.startsWith(op, i)) ?? c).length);
+    } else i = push('punct', i, i + (PUNCTUATORS.find(op => text.startsWith(op, i)) ?? c).length);
   }
   return {tokens, end: i};
 }
@@ -431,6 +435,9 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
     forwarding('stage ??= fallback;\n  recordReviewStep(stage);'),
     forwarding('if (late) stage += "_late";\n  recordReviewStep(stage);'),
     forwarding('[...stage] = parts;\n  recordReviewStep(stage);'),
+    // `++` and `--` are one operator: the `/` after them divides, so it does not hide the assignment.
+    forwarding('n = i++ / 2; stage = computeStage(); m = n / 2;\n  recordReviewStep(stage);'),
+    forwarding('n = i-- / 2; stage = computeStage(); m = n / 2;\n  recordReviewStep(stage);'),
     forwarding('var stage = row.stage;\n  recordReviewStep(stage);'),
     forwarding('log(`${stage = computeStage()}`);\n  recordReviewStep(stage);'),
     forwarding('arguments[0] = computeStage();\n  recordReviewStep(stage);'),

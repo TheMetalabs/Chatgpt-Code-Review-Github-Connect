@@ -307,10 +307,11 @@ async function sendToTab(tabId, msg, files) {
   }
 }
 
-/** How long a release message (can-close, cancel, preserve) or an ownership probe may go
- * unanswered: a page that accepted it but never runs its handler (a frozen tab, a hung page) then
- * counts as unreachable, instead of holding its single-flight cleanup lane (and the bounded
- * ownership wait that only starts after a reply) forever. */
+/** How long any worker-to-page message may go unanswered (every page handler replies at once, the
+ * long model call runs detached in the page): a page that accepted it but never runs its handler (a
+ * frozen tab, a hung page) then counts as unreachable for this tick, instead of holding its
+ * single-flight lane (a job's poll, its cleanup and the bounded ownership wait that only starts
+ * after a reply, a capture or repair receipt, an inventory probe) forever. */
 const PAGE_REPLY_MS = 15_000;
 
 /** One reply deadline (a function so tests can replace the timer; cancelled once the reply came). */
@@ -320,7 +321,8 @@ function pageReplyDeadline(ms = PAGE_REPLY_MS) {
   return {promise, cancel: () => clearTimeout(timer)};
 }
 
-/** sendToTab for the tab-release path and ownership probes, bounded by pageReplyDeadline. */
+/** sendToTab bounded by pageReplyDeadline: how the worker sends every page message. A reply that
+ * never came is a messaging outage (retried next tick), never a model failure. */
 async function askPage(tabId, msg, files) {
   const deadline = pageReplyDeadline();
   try { return await Promise.race([sendToTab(tabId, msg, files), deadline.promise]); }
@@ -514,11 +516,11 @@ async function refreshTabInventory() {
     if(!provider || tab.status === "loading" || tab.pendingUrl || inventoryLanes.has(tab.id))continue;
     const epoch=tabEpochs.get(tab.id) || 0;
     void singleFlight(inventoryLanes,tab.id,async()=>{
-      let result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
+      let result=await askPage(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
       if(result?.ownershipProtocol!==1 && inventoryUpgrades.get(tab.id)!==epoch) {
         inventoryUpgrades.set(tab.id,epoch);
         await chrome.scripting.executeScript({target:{tabId:tab.id},files:contentFiles(provider)});
-        result=await sendToTab(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
+        result=await askPage(tab.id,{type:"ashlar-tab-status"},contentFiles(provider));
       }
       const current=await chrome.tabs.get(tab.id);
       if((tabEpochs.get(tab.id) || 0)!==epoch || current.status==="loading" || current.pendingUrl ||
@@ -1259,20 +1261,21 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
   let result;
   try {
     if (!state.started && !observeOnly) {
-      // The page runner deduplicates a retried start when its acknowledgement was lost.
-      result = await sendToTab(state.tabId, run, contentFiles(provider));
+      // The page runner deduplicates a retried start when its acknowledgement was lost (or late:
+      // askPage gives up on it, and the next tick asks again).
+      result = await askPage(state.tabId, run, contentFiles(provider));
       state.started = true;
       workerStep(job,provider,"run_dispatched");
       await saveJobs(jobs);
     } else {
-      result = await sendToTab(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
+      result = await askPage(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
       if (result?.code === "idle" && (!observeOnly || matchesJob(result, job, provider))) {
         // A reloaded bound page has no in-memory collector. Missing server work
         // may resume observation, never adopt a page or submit another prompt.
         const resume = observeOnly
           ? { ...tabMessage(job, provider, "ashlar-run"), resume: true }
           : { ...run, resume: true };
-        result = await sendToTab(state.tabId, resume, contentFiles(provider));
+        result = await askPage(state.tabId, resume, contentFiles(provider));
       }
     }
   } catch (e) {
@@ -1403,7 +1406,7 @@ async function readRepairSource(job, provider, full = true) {
       responseId:saved.responseId,sourceHash:saved.sourceHash,captureId:saved.id,context:saved.context};
   }
   if(!state.tabId)return null;
-  const result=await sendToTab(state.tabId,tabMessage(job,provider,"ashlar-repair-source"),contentFiles(provider));
+  const result=await askPage(state.tabId,tabMessage(job,provider,"ashlar-repair-source"),contentFiles(provider));
   const source=result?.source;
   if(!matchesJob(result,job,provider) || !result.ok || !source || typeof source.text!=="string" ||
      !source.text.trim() || source.text.length>500_000 || source.text.length!==source.totalChars ||
@@ -1461,7 +1464,7 @@ async function captureProvider(job, provider, jobs) {
   if(!state.tabId) return finishTabCleanup(job,provider,jobs,"archived source durable; original tab absent");
   let result;
   try {
-    result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
+    result=await askPage(state.tabId,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
       captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
   } catch {
     return; // Repair can proceed from archive; cleanup retries independently.
@@ -1489,7 +1492,7 @@ async function notifyRepairReceipt(job, provider, jobs) {
   // A prior outbox write may have failed after mutating the shared registry.
   // Re-establish durability on EVERY receipt retry, before notifying the page.
   await saveJobs(jobs);
-  const result=await sendToTab(state.tabId,{...tabMessage(job,provider,"ashlar-repair-accepted"),
+  const result=await askPage(state.tabId,{...tabMessage(job,provider,"ashlar-repair-accepted"),
     committed:true,repairId:attempt.id,responseId:attempt.responseId,text:attempt.text,raw:attempt.raw},contentFiles(provider));
   if(!matchesJob(result,job,provider))return;
   ingestPageProgress(state,result);

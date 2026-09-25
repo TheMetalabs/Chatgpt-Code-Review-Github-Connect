@@ -680,6 +680,14 @@ async function recordBindingProbe(job, provider, result) {
   } catch { /* diagnostics never affect the run */ }
 }
 
+/** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
+ * mismatch means Chrome runs a cached older worker against newer files on disk. */
+const WORKER_BUILD = "1.1.28";
+function staleWorker() {
+  const onDisk = chrome.runtime.getManifest?.().version;
+  return Boolean(onDisk) && onDisk !== WORKER_BUILD;
+}
+
 function workerStep(job, provider, stage) {
   const state=job.states[provider];
   if(!state.runId || state.workerEvents?.at(-1)?.stage===stage)return;
@@ -2859,6 +2867,14 @@ function admitJob(cfg, jobs) {
     const quota = await quotaMap();
     if (!["chatgpt", "grok"].some(p => providerOpen(quota, p))) {
       await recordWorkerStatus(jobs, cfg.origin, "provider_quota"); return null;
+    }
+    // A stale service worker (Chrome kept the previous build's script after the files on disk were
+    // replaced; #93 validation) would drive pages that inject the NEW content scripts: its run
+    // messages lack what they require, and every run it starts loses its binding. It takes nothing.
+    if (staleWorker()) {
+      await recordWorkerStatus(jobs, cfg.origin, "stale_worker");
+      await chrome.storage.local.set({lastError: `stale service worker: running build ${WORKER_BUILD}, files on disk ${chrome.runtime.getManifest?.().version}; reload the extension`});
+      return null;
     }
     await recordWorkerStatus(jobs, cfg.origin, "polling");
     // One take in flight per origin: this lane (singleFlight on admissionLanes, and tickBody never

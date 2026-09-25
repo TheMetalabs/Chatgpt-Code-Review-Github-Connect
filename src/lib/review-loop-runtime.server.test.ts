@@ -2053,4 +2053,44 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.deepEqual(rb, { ran: false, reason: "superseded (head moved)" }, "the waiter finds the head at the App's commit");
     assert.equal(f.prompts.length, 1);
   });
+
+  describe("a step that waited acts on the operator's CURRENT settings, not those of its call (the settings kill switch)", () => {
+    /** A (apply) is held; the operator stops and restarts (apply), and the restart's review B waits
+     * with the settings of its call; then the operator changes the settings to `now`. */
+    const restartThenSettings = async (t: TestContext, now: BotSettings) => {
+      const f = fakeDeps({ start: "apply", rounds: [3] });
+      let current = settings("apply");
+      let reads = 0;
+      f.deps.settingsNow = () => (reads++, current);
+      const hold = holdFirst(t, f);
+      const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+      await settles(hold.generating);
+      f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+      f.issues.push(recorded("apply", "alice", "2025-12-31T12:00:00Z"));
+      const b = runPostReviewLoop("t", job({ id: "job-B" }), sample, current, f.deps, ENV_ON);
+      current = now; // harbor replaces its settings object on a save; B holds the old one
+      hold.release();
+      const [ra, rb] = await settles(Promise.all([a, b]));
+      assert.deepEqual(ra, { ran: false, reason: NEWER }, "the stopped round ends quietly");
+      return { f, rb, reads };
+    };
+
+    it("fixAgent.mode = suggest during the wait: the admitted step suggests and never commits", async (t) => {
+      const { f, rb, reads } = await restartThenSettings(t, settings("suggest"));
+      assert.equal(f.committed, false, "no App commit after the operator set suggest");
+      assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "suggested", JSON.stringify(rb));
+      assert.equal(suggestions(f.posted).length, 1);
+      assert.equal(reads, 1, "only the step that waited re-reads the settings");
+    });
+
+    it("fixAgent.provider = none during the wait: the admitted step is disabled — no read, no prompt, no post", async (t) => {
+      const off = { ...settings("apply"), fixAgent: { ...settings("apply").fixAgent, provider: null } };
+      const { f, rb, reads } = await restartThenSettings(t, off);
+      assert.equal(f.committed, false);
+      assert.deepEqual(rb, { ran: false, reason: "disabled" });
+      assert.equal(f.prompts.length, 1, "only the stopped round's request");
+      assert.equal(fixings(f.posted).length, 1, "only the stopped round's FIXING");
+      assert.equal(reads, 1);
+    });
+  });
 });

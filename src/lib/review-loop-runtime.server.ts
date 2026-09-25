@@ -156,6 +156,10 @@ export interface LoopRuntimeDeps {
   /** Bound on a second step's wait for the running step of its head (tests); production derives it
    * from the fix request's own deadlines (stepWaitMaxMs). */
   stepWaitMaxMs?: number;
+  /** The operator's settings as they are NOW (tests); production re-loads them from the settings
+   * store. Read by a step that waited for its head's running step, when it is admitted. Absent in a
+   * test → the settings of the call. */
+  settingsNow?: () => BotSettings | Promise<BotSettings>;
 }
 
 export type LoopStepResult =
@@ -328,6 +332,15 @@ function roundSignature(session: LoopSession, settings: BotSettings): string {
 function stepWaitMaxMs(deps: LoopRuntimeDeps | undefined, env: NodeJS.ProcessEnv | undefined): number {
   const own = fixAttempts(env) * ((deps?.fixWatch?.queueMaxMs ?? fixQueueMaxMs(env)) + 2 * (deps?.fixTimeoutMs ?? fixTimeoutMs(env)));
   return Math.min(Math.max(0, deps?.stepWaitMaxMs ?? own), MAX_TIMER_MS);
+}
+
+/** The operator's current settings for a step admitted after a wait: harbor replaces its settings
+ * object on every save, so the one a step was called with can be hours old. Production re-loads the
+ * store that save writes (loaded lazily, as the other production modules are). */
+async function settingsNow(deps: LoopRuntimeDeps | undefined, called: BotSettings): Promise<BotSettings> {
+  if (deps) return deps.settingsNow ? await deps.settingsNow() : called;
+  const { loadBotSettings } = await import("./settings.server.ts");
+  return loadBotSettings();
 }
 
 function envOf(): NodeJS.ProcessEnv | undefined {
@@ -912,12 +925,19 @@ export async function runPostReviewLoop(
   const stepKey = `${prKey(ref)}@${headSha}`;
   const slots = stepSlots(deps);
   const claimed = claimStep(slots, stepKey, stepWaitMaxMs(deps, env));
-  if (claimed instanceof Promise) trace(job.id, "step-waits", { pr, head: headSha.slice(0, 7) });
+  const waited = claimed instanceof Promise;
+  if (waited) trace(job.id, "step-waits", { pr, head: headSha.slice(0, 7) });
   const turn = claimed instanceof Promise ? await claimed : claimed;
   if (turn.status === "replaced") return { ran: false, reason: STEP_REPLACED };
   if (turn.status === "expired") return { ran: false, reason: STEP_WAIT_EXPIRED };
   const prior = turn.prior; // the round the step this one waited behind ran, if any
   try {
+    if (waited) {
+      // The wait can last hours: the operator's settings kill switch (fixAgent.mode = suggest, or
+      // no provider) set meanwhile governs this step — every later read, check and round below.
+      settings = await settingsNow(deps, settings);
+      if (!loopEnabled(settings, env)) return { ran: false, reason: "disabled" };
+    }
     d = deps ?? (await productionDeps(settings));
     const gh = d.gh;
     const ctl = controlCtx(d, token, botLogin);

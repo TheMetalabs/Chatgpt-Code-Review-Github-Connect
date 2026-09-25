@@ -84,6 +84,8 @@ type SummaryParts = {
   /** The verification note line (empty outside a verify-clean round), marker-neutralized. */
   noteLine: string;
   skipped: string[];
+  /** A reviewer returned a payload that was not its complete verdict (Job.incompleteProviders). */
+  incomplete: boolean;
   raw: string;
   /** Why the raw block is posted (rawCauseText): fixed text from the merge's stamped causes. */
   rawWhy: string;
@@ -96,6 +98,7 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     sha: job.headSha.slice(0, 7),
     noteLine: job.localVerifyNote ? `\n${neutralizeMarkers(job.localVerifyNote)}\n` : "",
     skipped: skippedNotes(job).slice(0, 4).map(neutralizeMarkers),
+    incomplete: Boolean(job.incompleteProviders?.length),
     // Neutralize the loop poller's clean-pass sentinel (matching the SAME separator set it accepts,
     // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
     // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
@@ -160,7 +163,7 @@ ChatGPT/Grok did not finish a full review.
 ${p.noteLine}
 ${p.skipped.map((s) => `- ${s}`).join("\n")}
 
-Not a clean pass — remaining reviewers did not run.`;
+Not a clean pass — ${p.incomplete ? "not every reviewer returned a complete review" : "remaining reviewers did not run"}.`;
 }
 
 /** First line stays exactly CLEAN_REVIEW_BODY so the loop poller's partial match still detects a

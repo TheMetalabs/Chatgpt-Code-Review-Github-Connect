@@ -87,10 +87,12 @@ test('race (default): local still starts with the chat leg',async t=>{
   await eventually(()=>app.localRequests.length===1,'race mode did not start local at snapshot');
 });
 
-test('race (default): a posted job does not keep the local leg\'s unused unparsed reply',async t=>{
+// The complete-verdict rule holds on race too (docs §1): the JSON correction never saw the first
+// reply, so a clean correction is not local's verdict and that first reply posts as evidence.
+test('race (default): a local first reply set aside for the JSON correction is posted as evidence, never clean',async t=>{
   const {app,jobId,job}=await setup(t,'race',{localJsonRepairEnabled:false});
   await eventually(()=>app.localRequests.length===1,'race mode did not start local at snapshot');
-  const prose='P1 a.ts:1 a duplicate request writes twice. '+'x'.repeat(50_000);
+  const prose='P1 a.ts:1 FIRST-REPLY a duplicate request writes twice. '+'x'.repeat(50_000);
   app.localResponses[0].end(reply(prose));
   await eventually(()=>app.localRequests.length===2,'local did not ask for its one JSON correction');
   app.localResponses[1].end(reply(clean));
@@ -99,6 +101,10 @@ test('race (default): a posted job does not keep the local leg\'s unused unparse
   await eventually(()=>job().status==='posted','the race review was not posted');
   const local=job().storedLegs.find(l=>l.provider==='local');
   assert.equal(local.originalText,clean,'the correction reply is the leg');
-  // race never reads it (only a released held leg is gated as evidence); history archived its copy
-  assert.equal(local.unparsedText?.length,undefined,'the unused first reply is not retained on the job');
+  assert.equal(local.unparsedText,prose,'the first reply is kept as the leg\'s evidence');
+  const body=app.reviews[0].body;
+  assert.equal(converged(body),false,'never CONVERGED');
+  assert.ok(body.indexOf('FIRST-REPLY')>body.indexOf(REVIEW_RAW_START)&&body.indexOf(REVIEW_RAW_START)>=0,'posted in the raw block');
+  assert.deepEqual([...job().incompleteProviders],['local']);
+  assert.deepEqual({...job().rawCauses},{local:'not-a-verdict'});
 });

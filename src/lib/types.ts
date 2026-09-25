@@ -151,6 +151,11 @@ export interface Job {
    * failed), stamped by that merge from provider state. The only input to "a reviewer did not run"
    * (review-outcome.ts): a reviewer's own assumption that mentions skipping something never counts. */
   skippedProviders?: ReviewProvider[];
+  /** The reviewers that produced a payload for the merged result that was not their complete verdict
+   * (incompleteVerdict: gate rejection, salvage, a dropped or unread finding, discarded text), stamped
+   * by that merge. Their replies post as evidence; none of them may leave the result clean
+   * (review-outcome.ts). */
+  incompleteProviders?: ReviewProvider[];
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
   fpPending?: {
@@ -164,7 +169,7 @@ export interface Job {
   };
   /** unparsedText: a local leg's completed replies that were not review JSON; residualReplies: its
    * completed replies whose JSON was accepted but that also carried text outside it (local-llm
-   * LocalLegResult). Both are kept only for a released held local leg. */
+   * LocalLegResult). Either one makes the leg evidence, never a verdict (incompleteVerdict). */
   storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string; repair?: RepairReceipt }[];
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;

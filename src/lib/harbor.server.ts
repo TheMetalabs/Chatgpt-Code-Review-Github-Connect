@@ -31,7 +31,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, fallbackWaivesChat, gateUnreadRows, heldLocalEvidence, heldLocalReleased, heldLocalSalvage, heldLocalUnusable, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing } from "./local-fallback";
+import { chatStalled, fallbackWaivesChat, gateUnreadRows, heldLocalReleased, heldLocalSalvage, incompleteVerdict, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -701,6 +701,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     localVerifyNote: undefined,
     localVerified: undefined,
     skippedProviders: undefined,
+    incompleteProviders: undefined,
     reviewOrder: order,
     storedLegs: [],
     updatedAt: Date.now(),
@@ -878,7 +879,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       // under the response cap where a single-turn reply's originalText is (the posted evidence is capped
       // lower, so this is where the rest of it lives). A multi-turn leg has no originalText, so its
       // residual group replies are that original; the submit's recordResponse (same JSON, no original)
-      // keeps it. Never an "unparsed" observation: on race the leg's JSON is merged and posted.
+      // keeps it. Never an "unparsed" observation: the reply parsed (its gate posts it as evidence).
       if(local.ok&&!local.originalText&&local.residualReplies?.trim())reviewHistory().recordResponse(jobId,"local",local.raw,local.residualReplies);
     } catch { /* metadata storage failure is visible without starting another model */ }
     if (!local.ok) {
@@ -895,10 +896,10 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
         };
       });
     } else {
-      // Only a released held leg's gate reads unparsedText / residualReplies (as evidence); on race
-      // nothing does, so the job does not keep an unbounded copy after it ends.
+      // Every leg's gate reads unparsedText / residualReplies (race or held alike): a reply set aside to
+      // reach the accepted JSON is evidence, so that JSON is never the leg's complete verdict.
       const evidence = { unparsedText: local.unparsedText, residualReplies: local.residualReplies };
-      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, heldLocalReleased(j) ? evidence : undefined)));
+      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, evidence)));
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -1050,8 +1051,15 @@ export async function submitHarborChat(
   const unusableNotes: string[] = [];
   // Why each salvaged leg is posted verbatim, kept for the body and the loop handoff (Job.rawCauses).
   const rawCauses: Partial<Record<ReviewProvider, RawCause>> = {};
-  for (const leg of payloads) {
-    const { gate, unusable, cause } = gateLeg(leg, sample, heldLocal);
+  // Each reviewer's complete-verdict state (gateLeg): only these earn clean credit.
+  const complete = new Set<ReviewProvider>();
+  // A released held local leg's rejected reply is always evidence (docs §1). Any other leg the gate
+  // rejected becomes evidence once another leg passed (the merge posts, so its reply is never dropped);
+  // when none did, it stays rejected, so chat with nothing usable still releases the fallback or skips.
+  const first = payloads.map((leg) => ({ leg, ...gateLeg(leg, sample, heldLocal && leg.provider === "local") }));
+  const posts = first.some((g) => g.gate.ok);
+  for (const g of first) {
+    const { leg, gate, verdict, unusable, cause } = !g.gate.ok && posts ? { leg: g.leg, ...gateLeg(g.leg, sample, true) } : g;
     if (unusable) unusableNotes.push(`${leg.provider}: ${unusable} (reply posted verbatim)`);
     if (unusable && leg.provider === "local") localUnusable = unusable;
     if (!gate.ok) {
@@ -1060,8 +1068,11 @@ export async function submitHarborChat(
     }
     gates.push(gate);
     byProvider.set(leg.provider, gate);
+    if (verdict) complete.add(leg.provider);
     if (gate.rawReview && cause) rawCauses[leg.provider] = cause;
   }
+  // Every reviewer that returned a payload but no complete verdict, a rejected one included.
+  const incompleteProviders = [...new Set(payloads.map((l) => l.provider))].filter((p) => !complete.has(p));
 
   if (!gates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
     // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
@@ -1097,9 +1108,9 @@ export async function submitHarborChat(
   // the fixing agent can act instead of the job pending forever. Every leg's salvaged reply is
   // combined, a verifier's included: no review is silently discarded.
   const rawReview = salvagedReview([...byProvider].map(([provider, g]) => ({ provider, rawReview: g.rawReview })), MAX_RAW_REVIEW_BODY);
-  // Only a STRUCTURED result counts: a leg salvaged as raw text (unparseable) produced no verdict.
-  // That decides both whether local verified and which chat reviewers were clean.
-  const structured = [...byProvider.entries()].filter(([, g]) => !g.rawReview).map(([p]) => p);
+  // Only a complete verdict counts (gateLeg), never payload presence or the absence of raw text:
+  // that decides both whether local verified and which chat reviewers were clean.
+  const structured = [...complete];
   const verifying = Boolean(job.localVerifyStartedAt) && !job.localFallbackAt;
   const localVerified = verifying ? structured.includes("local") : undefined;
   const nextAssumptions = [
@@ -1112,7 +1123,7 @@ export async function submitHarborChat(
   // the same settings), so this count is the one the posted body renders.
   // Skipped reviewers come from provider state (`skipped`), never from the merged assumptions, which
   // also carry the reviewers' own free-form text.
-  const outcome = reviewOutcome({ ...job, rawReview, localVerified, assumptions: nextAssumptions, skippedProviders: skipped }, merged.findings.length);
+  const outcome = reviewOutcome({ ...job, rawReview, localVerified, assumptions: nextAssumptions, skippedProviders: skipped, incompleteProviders }, merged.findings.length);
   // Credit only the chat reviewers that produced the clean structured result (pinned when the
   // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
   const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
@@ -1139,6 +1150,7 @@ export async function submitHarborChat(
     investigatedSafe: merged.investigatedSafe,
     assumptions: nextAssumptions,
     skippedProviders: skipped,
+    incompleteProviders,
     coverage: [...coverageByFile.values()],
     droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
     plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
@@ -1150,27 +1162,29 @@ export async function submitHarborChat(
   return finishResult(jobId);
 }
 
-/** Gate one reviewer leg. A released held local leg whose reply is not a verdict (docs §1: it failed
- * the gate, the gate dropped a finding it reported, or it took a reply that was not review JSON to
- * get there) is gated as evidence instead: its complete text posts verbatim, so it never counts as
- * verification and nothing it reported is lost. So is any leg, chat included and on any role, whose
- * rows past the gate's cap went unread (gateUnreadRows): it is never a clean structured result.
+/** Gate one reviewer leg and decide its complete-verdict state (docs/local-verify-clean.md §1). Every
+ * leg, chat or local, race or verify-clean: a reply is its reviewer's verdict only when it passed the
+ * gate with nothing set aside (incompleteVerdict: no finding dropped for its shape or left unread past
+ * the row cap, no completed reply or text around the accepted JSON discarded to get it) and was not
+ * salvaged verbatim. Any other reply is gated as evidence instead (verdictEvidence): what parsed, plus
+ * its complete text verbatim, so it posts and nothing it reported is lost. A reply the gate rejects
+ * outright becomes evidence only with `rejectedEvidence` (the caller decides: see submitHarborChat).
  * `cause` says why a leg posts verbatim: a reply salvaged before the gate (the bridge's, or a failed
- * held local leg's) was not valid review JSON; a converted one parsed, and is evidence for
- * unread rows alone or for another reason it is not a verdict. */
+ * held local leg's) was not valid review JSON; a converted one is evidence for unread rows alone or
+ * for another reason it is not a verdict. */
 function gateLeg(
   leg: ChatLeg,
   sample: SamplePr,
-  heldLocal: boolean,
-): { gate: ReturnType<typeof gateLiveSubmission>; unusable?: string; cause?: RawCause } {
+  rejectedEvidence: boolean,
+): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause } {
   const parsed = parseChatSubmission(leg.raw);
   const gate = gateLiveSubmission(parsed, sample, state.settings);
-  if (gate.ok && gate.rawReview) return { gate, cause: "unparseable" };
-  const unread = gateUnreadRows(gate);
-  const unusable = heldLocal && leg.provider === "local" ? heldLocalUnusable(gate, leg) : unread;
-  if (!unusable) return { gate };
-  const cause: RawCause = unusable === unread ? "unread-rows" : "not-a-verdict";
-  return { gate: gateLiveSubmission(heldLocalEvidence(parsed, leg), sample, state.settings), unusable, cause };
+  if (gate.ok && gate.rawReview) return { gate, verdict: false, cause: "unparseable" };
+  const unusable = incompleteVerdict(gate, leg);
+  if (!unusable) return { gate, verdict: gate.ok };
+  if (!gate.ok && !rejectedEvidence) return { gate, verdict: false };
+  const cause: RawCause = unusable === gateUnreadRows(gate) ? "unread-rows" : "not-a-verdict";
+  return { gate: gateLiveSubmission(verdictEvidence(parsed, leg), sample, state.settings), verdict: false, unusable, cause };
 }
 
 type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kind: "fallback" };

@@ -22,7 +22,7 @@ export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 export type PostedOutcome = Exclude<ReviewOutcome, "verify">;
 
 export type OutcomeJob = Pick<Job, "reviewProviders" | "assumptions" | "rawReview"> &
-  Partial<Pick<Job, "localReviewRole" | "chatFpRound" | "localVerifyStartedAt" | "localFallbackAt" | "localVerified" | "skippedProviders">>;
+  Partial<Pick<Job, "localReviewRole" | "chatFpRound" | "localVerifyStartedAt" | "localFallbackAt" | "localVerified" | "skippedProviders" | "incompleteProviders">>;
 
 /** A Record keyed by the closed enum: adding a kind without deciding its shape fails the typecheck. */
 export const OUTCOME_SHAPE: Record<PostedOutcome, { converged: boolean; unverified: boolean }> = {
@@ -40,11 +40,15 @@ export function skippedNote(providers: readonly ReviewProvider[]): string {
   return `Skipped ${providers.join(", ")} (quota or unavailable)`;
 }
 
-/** The lines the body lists for reviewers that did not run. Read from the structured
- * `skippedProviders` the merge stamped, never from assumptions: those also carry reviewer-written
- * text, and a reviewer noting it "skipped" generated fixtures is not a reviewer that did not run. */
-export function skippedNotes(job: Pick<Job, "skippedProviders">): string[] {
-  return job.skippedProviders?.length ? [skippedNote(job.skippedProviders)] : [];
+/** The lines the body lists for reviewers that did not run or returned no complete verdict. Read from
+ * the structured `skippedProviders` / `incompleteProviders` the merge stamped, never from assumptions:
+ * those also carry reviewer-written text, and a reviewer noting it "skipped" generated fixtures is not
+ * a reviewer that did not run. */
+export function skippedNotes(job: Pick<Job, "skippedProviders" | "incompleteProviders">): string[] {
+  return [
+    job.skippedProviders?.length ? skippedNote(job.skippedProviders) : "",
+    job.incompleteProviders?.length ? `No complete review from ${job.incompleteProviders.join(", ")} (reply posted as evidence)` : "",
+  ].filter(Boolean);
 }
 
 /** The fixed text for each raw cause: a Record over the closed type, so a new cause cannot render
@@ -71,15 +75,19 @@ export function rawCauseText(causes: Job["rawCauses"]): string {
 }
 
 /** `findings` is the gated (publishable) count. An FP round always merges as race, and local run
- * as the chat-down fallback is an ordinary reviewer, so neither is a verifier. */
+ * as the chat-down fallback is an ordinary reviewer, so neither is a verifier. A reviewer whose payload
+ * was not its complete verdict (`incompleteProviders`) never leaves the result clean or starts a
+ * verification round, on any role: its reply posts as evidence (raw), and without that evidence the
+ * result is still incomplete. */
 export function reviewOutcome(job: OutcomeJob, findings: number): ReviewOutcome {
   const role = job.chatFpRound ? "race" : job.localReviewRole;
   const verifier = localVerifies({ role, providers: job.reviewProviders ?? [] }) && !job.localFallbackAt;
   const raw = Boolean(job.rawReview?.trim());
-  if (verifier && !job.localVerifyStartedAt) return findings > 0 ? "findings" : raw ? "raw" : "verify";
+  const incomplete = Boolean(job.incompleteProviders?.length);
+  if (verifier && !job.localVerifyStartedAt) return findings > 0 ? "findings" : raw ? "raw" : incomplete ? "incomplete" : "verify";
   if (findings > 0) return "findings";
   if (raw) return verifier && !job.localVerified ? "raw-unverified" : "raw";
-  if (job.skippedProviders?.length) return "incomplete";
+  if (job.skippedProviders?.length || incomplete) return "incomplete";
   if (!verifier) return "clean";
   return job.localVerified ? "verified-clean" : "unverified-clean";
 }

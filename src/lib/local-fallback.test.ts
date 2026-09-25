@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, fallbackWaivesChat, gateUnreadRows, heldLocalEvidence, heldLocalSalvage, heldLocalUnusable, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import { chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, heldLocalSalvage, incompleteVerdict, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
 import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
@@ -211,26 +211,26 @@ describe("heldLocalSalvage", () => {
   });
 });
 
-describe("heldLocalUnusable / heldLocalEvidence: a released held local reply is a verdict only when the gate used all of it", () => {
+describe("incompleteVerdict / verdictEvidence: a reviewer reply is a complete verdict only when the gate used all of it", () => {
   const ok = { ok: true as const, malformed: 0 };
   it("a clean gate is a verdict; an already salvaged reply is left as it is", () => {
-    assert.equal(heldLocalUnusable(ok, {}), undefined);
-    assert.equal(heldLocalUnusable({ ...ok, malformed: 1, rawReview: "x" }, { unparsedText: "P1 x" }), undefined);
+    assert.equal(incompleteVerdict(ok, {}), undefined);
+    assert.equal(incompleteVerdict({ ...ok, malformed: 1, rawReview: "x" }, { unparsedText: "P1 x" }), undefined);
   });
 
   it("a rejected gate or a finding dropped for its shape is not", () => {
-    assert.equal(heldLocalUnusable({ ok: false, reason: "empty findings without investigated_safe" }, {}), "empty findings without investigated_safe");
-    assert.equal(heldLocalUnusable({ ...ok, malformed: 2 }, {}), "2 finding(s) missing required fields");
+    assert.equal(incompleteVerdict({ ok: false, reason: "empty findings without investigated_safe" }, {}), "empty findings without investigated_safe");
+    assert.equal(incompleteVerdict({ ...ok, malformed: 2 }, {}), "2 finding(s) missing required fields");
   });
 
   it("a clean gate reached only after a reply that was not review JSON is not", () => {
-    assert.equal(heldLocalUnusable(ok, { unparsedText: "P1 a.ts:1 FIRST-REPLY" }), "a completed reply was not review JSON");
-    assert.equal(heldLocalUnusable(ok, { unparsedText: "  " }), undefined);
+    assert.equal(incompleteVerdict(ok, { unparsedText: "P1 a.ts:1 FIRST-REPLY" }), "a completed reply was not review JSON");
+    assert.equal(incompleteVerdict(ok, { unparsedText: "  " }), undefined);
   });
 
   it("a gate that never inspected every reported finding (rows past its cap) is not", () => {
-    assert.equal(heldLocalUnusable({ ...ok, overflow: 1 }, {}), "1 finding(s) past the gate's row cap were not inspected");
-    assert.equal(heldLocalUnusable({ ...ok, overflow: 0 }, {}), undefined);
+    assert.equal(incompleteVerdict({ ...ok, overflow: 1 }, {}), "1 finding(s) past the gate's row cap were not inspected");
+    assert.equal(incompleteVerdict({ ...ok, overflow: 0 }, {}), undefined);
     // Unread rows disqualify every leg, not only the held local one (chat, race).
     assert.equal(gateUnreadRows({ ...ok, overflow: 1 }), "1 finding(s) past the gate's row cap were not inspected");
     assert.equal(gateUnreadRows({ ...ok, overflow: 0 }), undefined);
@@ -239,28 +239,28 @@ describe("heldLocalUnusable / heldLocalEvidence: a released held local reply is 
   });
 
   it("a clean gate whose reply also carried text outside the accepted JSON is not", () => {
-    assert.equal(heldLocalUnusable(ok, { residualReplies: "P1 a.ts:1 PROSE\n{}" }), "a completed reply carried text outside its review JSON");
-    assert.equal(heldLocalUnusable(ok, { residualReplies: " " }), undefined);
+    assert.equal(incompleteVerdict(ok, { residualReplies: "P1 a.ts:1 PROSE\n{}" }), "a completed reply carried text outside its review JSON");
+    assert.equal(incompleteVerdict(ok, { residualReplies: " " }), undefined);
   });
 
   it("evidence keeps a reply that carried text outside its JSON, once when it is also the original", () => {
     const reply = 'P1 a.ts:1 PROSE-FINDING\n{"findings":[]}';
-    const single = heldLocalEvidence({ findings: [] }, { raw: '{"findings":[]}', originalText: reply, residualReplies: reply });
+    const single = verdictEvidence({ findings: [] }, { raw: '{"findings":[]}', originalText: reply, residualReplies: reply });
     assert.equal(String(single.raw_review).split("PROSE-FINDING").length - 1, 1);
     // the multi-turn loop has no original text: its group replies are the evidence
-    const loop = heldLocalEvidence({ findings: [] }, { raw: '{"findings":[]}', residualReplies: `Review group (a.ts):\n${reply}` });
+    const loop = verdictEvidence({ findings: [] }, { raw: '{"findings":[]}', residualReplies: `Review group (a.ts):\n${reply}` });
     assert.match(String(loop.raw_review), /Review group \(a\.ts\):\nP1 a\.ts:1 PROSE-FINDING[\s\S]*\n---\n\n\{"findings":\[\]\}$/);
   });
 
   it("evidence keeps what parsed and attaches every completed reply verbatim", () => {
     const parsed = { findings: [{ title: "partial" }], merge_recommendation: "REQUEST_CHANGES" };
-    const out = heldLocalEvidence(parsed, { raw: "{}", originalText: "P1 a.ts:1 FULL-REPLY", unparsedText: "P1 FIRST-REPLY" });
+    const out = verdictEvidence(parsed, { raw: "{}", originalText: "P1 a.ts:1 FULL-REPLY", unparsedText: "P1 FIRST-REPLY" });
     assert.deepEqual(out.findings, parsed.findings);
     assert.match(String(out.raw_review), /Detected severity markers: P1\.[\s\S]*FIRST-REPLY[\s\S]*\n---\n[\s\S]*FULL-REPLY/);
   });
 
   it("with no parsed object or original text the leg's JSON itself is the evidence", () => {
-    const out = heldLocalEvidence(null, { raw: '{"findings":"P1 a.ts:1 IN-JSON"}' });
+    const out = verdictEvidence(null, { raw: '{"findings":"P1 a.ts:1 IN-JSON"}' });
     assert.deepEqual(out.findings, []);
     assert.match(String(out.raw_review), /IN-JSON/);
   });

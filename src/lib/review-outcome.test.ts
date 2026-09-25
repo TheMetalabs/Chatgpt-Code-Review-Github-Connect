@@ -51,6 +51,15 @@ describe("reviewOutcome: the one decision point", () => {
     ["D22 verified clean, a reviewer assumption says skipped", verifying({ localVerified: true, assumptions: [ASSUMES_SKIPPED] }), 0, "verified-clean"],
     ["D23 held clean, a reviewer assumption says skipped, still verifies", held({ assumptions: [ASSUMES_SKIPPED] }), 0, "verify"],
     ["D24 an empty skipped list is nothing skipped", job({ localReviewRole: "race", skippedProviders: [] }), 0, "clean"],
+    // A reviewer whose payload was not its complete verdict (Job.incompleteProviders) never leaves a
+    // result clean, starts or passes a verification round, on race or verify-clean. Its reply normally
+    // posts as evidence (raw); these rows pin the classification even without that evidence.
+    ["D25 race, a reviewer with no complete verdict", job({ localReviewRole: "race", incompleteProviders: ["chatgpt"] }), 0, "incomplete"],
+    ["D26 held, a chat reviewer with no complete verdict never starts verification", held({ reviewProviders: CGL, incompleteProviders: ["grok"] }), 0, "incomplete"],
+    ["D27 verified, but a chat reviewer returned no complete verdict", verifying({ reviewProviders: CGL, localVerified: true, incompleteProviders: ["grok"] }), 0, "incomplete"],
+    ["D28 fallback clean beside chat with no complete verdict", held({ localFallbackAt: 1, incompleteProviders: ["chatgpt"] }), 0, "incomplete"],
+    ["D29 its evidence posted: raw", job({ localReviewRole: "race", incompleteProviders: ["chatgpt"], rawReview: "P1 x" }), 0, "raw"],
+    ["D30 an empty incomplete list is nothing incomplete", job({ localReviewRole: "race", incompleteProviders: [] }), 0, "clean"],
   ];
   for (const [name, j, findings, expected] of rows) {
     it(name, () => assert.equal(reviewOutcome(j, findings), expected));
@@ -124,6 +133,15 @@ describe("reviewSummaryBody: every part of the body comes from the outcome", () 
     assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
     assert.match(body, /did not finish a full review/);
     assert.equal(parseFindingsTotal(body), null);
+  });
+
+  it("incomplete for a reviewer without a complete verdict: named from provider state, never the sentinel or a marker", () => {
+    const body = reviewSummaryBody({ ...job({ localReviewRole: "race", incompleteProviders: ["grok"] }), headSha: "abc1234ffff", coverage: [] }, [], "ashlar-bot");
+    assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
+    assert.match(body, /- No complete review from grok \(reply posted as evidence\)/);
+    assert.match(body, /not every reviewer returned a complete review/);
+    assert.equal(parseFindingsTotal(body), null);
+    assert.equal(isConvergedFindings(body), false);
   });
 });
 

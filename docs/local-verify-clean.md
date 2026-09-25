@@ -28,8 +28,8 @@ race.
 | `findings` | any structured finding | summary mark | `total=N inline=… body=… p0 p1 p2` | no |
 | `raw` | a salvaged (unparseable) reply, not a verifier's | summary mark | `total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` | no |
 | `raw-unverified` | verification round, local's reply could not be used as a review (below) | summary mark + note | raw marker + ` unverified=1` | no |
-| `incomplete` | 0 findings, no raw, a reviewer was skipped (`skippedProviders`) | summary mark (+ note in a verification round: agreed / did not complete) | none | no |
-| `clean` | not a verifier, 0 findings, nothing skipped | `Didn't find any major issues.` | `total=0 …` | **yes** |
+| `incomplete` | 0 findings, no raw, a reviewer was skipped (`skippedProviders`) or returned no complete verdict (`incompleteProviders`) | summary mark (+ note in a verification round: agreed / did not complete) | none | no |
+| `clean` | not a verifier, 0 findings, nothing skipped, every reviewer's payload a complete verdict | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `verified-clean` | verification round, local returned a structured clean result | `Didn't find any major issues.` | `total=0 …` | **yes** |
 | `unverified-clean` | verification round, local failed / timed out / offline | `Chat found no major issues, but local verification did not complete …` | `total=0 … unverified=1` | no |
 
@@ -44,7 +44,9 @@ Rules the table encodes:
   reply is still salvaged, and the multi-turn tool loop (`localReviewMode=multiturn`, or `auto` on a
   large PR) returns each failed group's completed reply the same way. A failure with no completed
   reply (HTTP 500, transport error, offline) stays a failure: `unverified-clean`.
-- A released held local leg's reply counts as a verdict only when it passes the gate on its own with
+- **Only a complete verdict earns clean credit**, for every leg — chat or local, race or
+  verify-clean, held or not (`incompleteVerdict` in `gateLeg`, stamped per provider by the merge). A
+  reply is its reviewer's verdict only when it passes the gate on its own with
   every finding it reported inspected and intact (`LiveGateResult.overflow` is 0: no row past the
   gate's `GATED_FINDINGS_CAP` rows went unread; `malformed` is 0), and no completed reply was set
   aside to get it: the one JSON correction never sees the first reply, so a clean correction says
@@ -54,21 +56,27 @@ Rules the table encodes:
   object do not count — any run of three or more backticks or tildes, closed by a run of the same
   character at least as long — while any other fence marker is kept as text; cell `clean × fencedClean`), the
   reply is kept verbatim (`residualReplies`, one-shot and multi-turn alike) and the object is not a
-  verdict — prose before a clean object can be the finding. A reply the gate rejects (for
-  example a `findings` that is not a list, or an empty result without `investigated_safe`) or one
-  that lost a finding for its shape or left one unread is gated as evidence instead (`heldLocalEvidence` in
-  `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block. So a
-  verifier whose P1 the gate dropped never reads as "local verification agreed", and the note names
-  why the reply could not be used.
-- Unread rows disqualify **every** leg, not only a held local one: a chat or local leg, on race or
-  verify-clean, whose reply has findings past the gate's `GATED_FINDINGS_CAP` rows (`overflow`, never
-  inspected) is gated as evidence the same way (`gateUnreadRows` in `gateLeg`): what the gate read,
-  plus the full reply verbatim as the raw block, with `<provider>: N finding(s) past the gate's row
-  cap were not inspected (reply posted verbatim)` among the assumptions. It is never a clean
-  structured result, so it never starts or supports a verification round and never posts `clean` or
-  `verified-clean`: the unread row may be the finding (cells `overflow × *`, and the race test). This
-  is a gate rule, so it is the one place this document changes a race job: before it, race posted
-  such a reply clean and CONVERGED.
+  verdict — prose before a clean object can be the finding. A reply that lost a finding for its shape
+  or left one unread, or had a reply or text set aside, is gated as evidence instead (`verdictEvidence`
+  in `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block, with
+  `<provider>: <why> (reply posted verbatim)` among the assumptions. A reply the gate rejects (for
+  example a `findings` that is not a list, or an empty result without `investigated_safe`) is
+  evidence the same way whenever the merge posts: always for a released held local leg, and for any
+  other leg once another leg passed the gate; when no leg passed, it stays rejected, so chat with
+  nothing usable still releases the fallback (verify-clean) or skips (race). So a verifier whose P1
+  the gate dropped never reads as "local verification agreed", and the note names why the reply could
+  not be used; a chat reviewer whose P1 the gate dropped, or whose reply it rejected beside a clean
+  peer, never starts a verification round (cells `malformed × *`, the rejected-Grok test); and on
+  race a clean chat result beside local evidence, or clean local beside chat evidence, never posts
+  clean or CONVERGED (the race cells). The merge stamps these reviewers as `Job.incompleteProviders`;
+  `reviewOutcome` never classifies a result with one as `clean`, `verify` or `verified-clean`, even
+  without its evidence (rows D25–D28), and the body names them.
+- Unread rows are one case of that rule: a chat or local leg, on race or verify-clean, whose reply
+  has findings past the gate's `GATED_FINDINGS_CAP` rows (`overflow`, never inspected) is gated as
+  evidence (`gateUnreadRows`), with `<provider>: N finding(s) past the gate's row cap were not
+  inspected (reply posted verbatim)` among the assumptions: the unread row may be the finding (cells
+  `overflow × *`, and the race test). The complete-verdict rule is a gate rule, so it is the one place
+  this document changes a race job: before it, race posted such replies clean and CONVERGED.
 - "A reviewer was skipped" is structured provider state: `submitHarborChat` stamps
   `Job.skippedProviders` (the enabled reviewers with no payload) with the merge, and the body lists it
   as one system line. It is never inferred from assumptions, which also carry the reviewers' own
@@ -76,8 +84,9 @@ Rules the table encodes:
   `verified-clean` and CONVERGED, on race and verify-clean alike (rows R3, L15).
 - `unverified=1` is never CONVERGED, and only `clean` / `verified-clean` print the clean sentinel.
   `postedOutcome` renders a `verify` that somehow reaches the poster as `unverified-clean`.
-- Local as the chat-down fallback is an ordinary reviewer: chat unusable + local clean posts
-  `clean`, the same as race.
+- Local as the chat-down fallback is an ordinary reviewer, the same as race: chat that returned no
+  payload + local clean posts `incomplete` (chat skipped), and a chat reply the gate rejected posts as
+  evidence beside local's result (cells `none × *`), never `clean`.
 - `OUTCOME_SHAPE` is a `Record` over the enum: adding a kind without deciding whether it converges
   fails the typecheck, and `review-outcome.test.ts` iterates `REVIEW_OUTCOMES` so it fails without
   a render row.

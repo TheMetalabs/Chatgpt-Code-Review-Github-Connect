@@ -380,6 +380,7 @@ describe("CONVERGED is the posted outcome, not \"no findings\" (docs/local-verif
     ["raw-unverified", { ...VC, localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW" }, /local verification's reply could not be used/],
     ["unverified-clean", { ...VC, localVerified: false }, /local verification did not complete/],
     ["incomplete", { reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: ["Skipped grok (quota or unavailable)"] }, /a reviewer did not run/],
+    ["incomplete (a reviewer returned no complete verdict)", { reviewProviders: ["chatgpt", "local"], localReviewRole: "race", incompleteProviders: ["chatgpt"] }, /a reviewer returned no complete review/],
   ];
   for (const [name, patch, detail] of notClean) {
     it(`${name}: an active session gets one fixed handoff, never a silent stop`, async () => {

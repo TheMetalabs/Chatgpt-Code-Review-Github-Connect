@@ -38,7 +38,10 @@ const CHAT={
   findings:dirtyJson,
   // exactly what the bridge stores for an unparseable reply with JSON repair off
   unparseable:salvageReviewJson('P1 a.ts:1 CHAT-RAW duplicate write'),
-  none:'{"findings":"not a list"}',
+  // the gate rejects it (findings is not a list); beside a usable leg it is posted as evidence
+  none:'{"findings":"CHAT-RAW not a list"}',
+  // valid JSON whose only P1 lacks recommended_test: the gate drops it for its shape, so it is no verdict
+  malformed:JSON.stringify({findings:[{...partial,title:'CHAT-RAW duplicate write'}],merge_recommendation:'REQUEST_CHANGES'}),
   // the same nine rows from chat: its unread ninth P1 makes it evidence, never a clean result
   overflow:overflowOf('CHAT-RAW'),
 };
@@ -85,6 +88,9 @@ const WHY_UNPARSEABLE='the reply was not valid review JSON.';
 const WHY_UNREAD="the reply parsed, but its findings past the gate's row cap were not inspected.";
 const WHY_NOT_VERDICT='the reply could not be used as a complete structured review.';
 const chatRaw=why=>posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'none',why});
+// local as the fallback beside chat's rejected reply: the merge posts, so that reply is evidence too
+const fallback=(first,marker,requests,extra={})=>posted(first,marker,requests,{stamp:'fallback',...extra,raw:['CHAT-RAW',...(extra.raw??[])]});
+const WHY_CHAT_REJECTED='ChatGPT: the reply could not be used as a complete structured review; Local LLM: ';
 const RAW_NOTE=/local verification's reply could not be used as a review/;
 const RESIDUAL_NOTE=/could not be used as a review \(a completed reply carried text outside its review JSON\)/;
 
@@ -111,21 +117,24 @@ const CELLS={
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`unparseable x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_UNPARSEABLE}):chatRaw(WHY_UNPARSEABLE)])),
   // chat's unread rows are evidence: never verify / verified-clean / clean, local stays held
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`overflow x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_UNREAD}):chatRaw(WHY_UNREAD)])),
-  // local as the chat-down fallback is an ordinary reviewer: race parity, no verification note
-  'none x clean':posted(CLEAN,M0,1,{stamp:'fallback'}),
-  'none x fencedClean':posted(CLEAN,M0,1,{stamp:'fallback'}),
-  'none x assumesSkipped':posted(CLEAN,M0,1,{stamp:'fallback'}),
-  'none x findings':posted(SUMMARY,MF,1,{stamp:'fallback'}),
-  'none x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback',why:WHY_UNPARSEABLE}),
-  'none x proseThen500':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
-  'none x multiturnProse':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
-  'none x schemaInvalid':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
-  'none x malformed':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback',why:WHY_NOT_VERDICT}),
-  'none x proseThenClean':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
-  'none x proseThenMinimal':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback'}),
-  'none x overflow':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback',why:WHY_UNREAD}),
-  'none x proseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
-  'none x multiturnProseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],stamp:'fallback'}),
+  // a P1 the gate dropped for its shape leaves chat without a complete verdict: evidence, local held
+  ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`malformed x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_NOT_VERDICT}):chatRaw(WHY_NOT_VERDICT)])),
+  // local as the chat-down fallback is an ordinary reviewer (race parity, no verification note), and
+  // chat's rejected reply is no verdict: it posts beside local's result as evidence, never clean
+  'none x clean':fallback(SUMMARY,MR,1,{why:WHY_NOT_VERDICT}),
+  'none x fencedClean':fallback(SUMMARY,MR,1,{why:WHY_NOT_VERDICT}),
+  'none x assumesSkipped':fallback(SUMMARY,MR,1,{why:WHY_NOT_VERDICT}),
+  'none x findings':fallback(SUMMARY,MF,1),
+  'none x unparseable':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW'],why:WHY_CHAT_REJECTED+WHY_UNPARSEABLE}),
+  'none x proseThen500':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW']}),
+  'none x multiturnProse':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
+  'none x schemaInvalid':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
+  'none x malformed':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_CHAT_REJECTED+WHY_NOT_VERDICT}),
+  'none x proseThenClean':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW']}),
+  'none x proseThenMinimal':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW']}),
+  'none x overflow':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_CHAT_REJECTED+WHY_UNREAD}),
+  'none x proseAndClean':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
+  'none x multiturnProseAndClean':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
   'none x error':skipped(1),
   'none x offline':skipped(0),
   'none x notRun':skipped(0),
@@ -137,9 +146,9 @@ async function closedPortUrl(){
   return `http://127.0.0.1:${port}/v1`;
 }
 
-async function runCell(t,chat,local){
+async function runCell(t,chat,local,role='verify-clean'){
   const stim=LOCAL[local];
-  const settings={localReviewRole:'verify-clean',localJsonRepairEnabled:false,...stim.settings,...(stim.offline?{localLlmBaseUrl:await closedPortUrl()}:{})};
+  const settings={localReviewRole:role,localJsonRepairEnabled:false,...stim.settings,...(stim.offline?{localLlmBaseUrl:await closedPortUrl()}:{})};
   const app=await appFixture(settings);t.after(()=>app.close());
   app.env.ASHLAR_LOCAL_LLM_STREAM='false';
   const out=await app.mention(`matrix-${chat}-${local}`);
@@ -169,6 +178,8 @@ function assertPosted(name,e,{app,job},body){
   }
   if(e.why)assert.equal(/\*\*⚠️ Review posted verbatim — ([^*]*)\*\*/.exec(body)?.[1],e.why,`${name}: why the raw block is posted`);
   assert.doesNotMatch(body,/local repair/i,`${name}: local repair never causes an outcome`);
+  // a body that is not clean never carries the converging total=0 marker (unverified=1 is not one)
+  if(!e.converged)assert.doesNotMatch(body,/ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->/,`${name}: no converging total=0 marker`);
   if(e.note)assert.match(body,e.note,`${name}: note`);
   else assert.doesNotMatch(body,/local verification/,`${name}: no verification note`);
   if(e.stamp==='verify')assert.ok(job.localVerifyStartedAt&&!job.localFallbackAt,`${name}: verification round stamp`);
@@ -249,19 +260,61 @@ test('race outcome: a parseable chat reply the review schema rejects is posted v
   assert.doesNotMatch(handoff,/not parseable/i,'nor in the loop handoff');
 });
 
-test('verify-clean outcome: the note credits only the chat reviewer whose structured result was clean',async t=>{
+// Race: the complete-verdict rule (docs §1) on the default role. Each chat × local pair posts through the
+// same path as the verify-clean matrix; only a leg that is its reviewer's complete verdict earns clean.
+const RACE_CELLS={
+  'clean x clean':posted(CLEAN,M0,1),
+  // a reply the gate rejects beside a usable one is evidence, never a clean total=0
+  'none x clean':posted(SUMMARY,MR,1,{raw:['CHAT-RAW'],why:WHY_NOT_VERDICT}),
+  'malformed x clean':posted(SUMMARY,MR,1,{raw:['CHAT-RAW'],why:WHY_NOT_VERDICT}),
+  'clean x malformed':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_NOT_VERDICT}),
+  'clean x schemaInvalid':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_NOT_VERDICT}),
+  // the first reply set aside for the JSON correction, or prose around the accepted object, is evidence
+  'clean x proseThenClean':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],why:WHY_NOT_VERDICT}),
+  'clean x proseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_NOT_VERDICT}),
+  'clean x multiturnProseAndClean':posted(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_NOT_VERDICT}),
+  // with no usable leg a rejected reply still skips (nothing posts, nothing claims clean)
+  'none x error':skipped(1),
+};
+for(const [name,e] of Object.entries(RACE_CELLS)){
+  test(`race outcome: chat ${name.replace(' x ',' × local ')}`,async t=>{
+    const [chat,local]=name.split(' x ');
+    const run=await runCell(t,chat,local,'race');
+    const {app,job}=run;
+    assert.equal(job.status,e.status,`${name}: status`);
+    assert.equal(app.localRequests.length,e.requests,`${name}: local requests`);
+    if(e.status==='skipped'){assert.equal(app.reviews.length,0,`${name}: no review`);return;}
+    assertPosted(`race ${name}`,e,run,app.reviews[0].body);
+    const incomplete=[...(job.incompleteProviders??[])];
+    assert.deepEqual(incomplete,e.converged?[]:[e.raw.includes('CHAT-RAW')?'chatgpt':'local'],`${name}: the reviewer without a complete verdict`);
+  });
+}
+
+// ChatGPT clean beside a Grok reply the gate rejects: Grok returned no verdict, so the result is not
+// clean and never starts (or passes) a verification round. Grok's reply is evidence, posted verbatim.
+test('verify-clean outcome: clean ChatGPT beside a gate-rejected Grok is evidence, never verified-clean or CONVERGED',async t=>{
   const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
   app.env.ASHLAR_LOCAL_LLM_STREAM='false';
-  const out=await app.mention('matrix-credit');
+  const out=await app.mention('matrix-rejected-peer');
   const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
   await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
   assert.equal(job().reviewProviders.join(','),'chatgpt,grok,local');
-  await app.harbor.submitHarborChat(out.jobId,cleanJson,[{provider:'chatgpt',raw:cleanJson},{provider:'grok',raw:CHAT.none}]);
-  await eventually(()=>app.localRequests.length===1,'clean chatgpt did not start the verification round');
-  app.localResponses[0].end(envelope(cleanJson));
-  await eventually(()=>app.reviews.length===1,'the verified review was not posted');
-  assert.match(app.reviews[0].body,/\nchatgpt found nothing; local verification agreed\.\n/);
-  assert.doesNotMatch(app.reviews[0].body,/grok found nothing/);
+  const grok='{"findings":"GROK-RAW P1 a.ts:1 duplicate write","merge_recommendation":"REQUEST_CHANGES"}';
+  await app.harbor.submitHarborChat(out.jobId,cleanJson,[{provider:'chatgpt',raw:cleanJson},{provider:'grok',raw:grok}]);
+  await eventually(()=>app.reviews.length===1,'the review was not posted');
+  await new Promise(resolve=>setTimeout(resolve,150));
+  const body=app.reviews[0].body;
+  assert.equal(app.localRequests.length,0,'no verification round for a result with a rejected reviewer');
+  assert.equal(body.split('\n')[0],SUMMARY,'not the clean first line');
+  assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MR,'raw marker, never total=0');
+  assert.equal(converged(body),false,'never CONVERGED');
+  assert.doesNotMatch(body,/didn't find any major issues|local verification agreed/i);
+  const start=body.indexOf(REVIEW_RAW_START);
+  assert.ok(start>=0&&body.indexOf('GROK-RAW P1 a.ts:1 duplicate write')>start,'the rejected reply is kept in the raw block');
+  assert.deepEqual([...job().incompleteProviders],['grok'],'grok gave no complete verdict');
+  assert.deepEqual({...job().rawCauses},{grok:'not-a-verdict'});
+  assert.match(body,/- No complete review from grok \(reply posted as evidence\)/);
+  assert.equal(job().localVerifyStartedAt,undefined,'local stays held');
 });
 
 // chat clean with a skipped chat peer (grok quota) × local: the round is incomplete whatever local

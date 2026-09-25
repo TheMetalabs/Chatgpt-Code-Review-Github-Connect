@@ -7,6 +7,9 @@ export type OpsCommentInput = {
   providers: ReviewProvider[];
   /** The job's pinned local role; "verify-clean" reads "local verifies a clean result". */
   role?: LocalReviewRole;
+  /** The job released local as the chat-down fallback (Job.localFallbackAt): it reads "local runs as
+   * the fallback" whatever the role, never that it verifies a clean result. */
+  localFallback?: boolean;
   notes: string[];
 };
 
@@ -24,7 +27,7 @@ export function llmWorkAllowed(job: { trigger: Trigger }): boolean {
 }
 
 export function buildOpsComment(input: OpsCommentInput): string {
-  const reviewers = describeEnabledReviewers(input.providers, input.role);
+  const reviewers = describeEnabledReviewers(input.providers, input.role, input.localFallback);
   const status =
     input.phase === "blocked"
       ? "blocked — a reviewer is unavailable; others continue"

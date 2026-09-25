@@ -374,6 +374,7 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
     phase,
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
     role: job.localReviewRole,
+    localFallback: Boolean(job.localFallbackAt),
     notes: [`Job: ${job.id}`, ...notes],
   });
   try {

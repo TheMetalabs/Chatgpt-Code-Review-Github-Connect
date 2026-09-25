@@ -430,7 +430,9 @@ export type RawCause = "unparseable" | "unread-rows" | "not-a-verdict";
 
 export const LOCAL_REVIEW_ROLES: LocalReviewRole[] = ["race", "verify-clean"];
 
-export function describeEnabledReviewers(providers: readonly ReviewProvider[], role?: LocalReviewRole): string {
+/** `localFallback`: the job released local as the chat-down fallback (Job.localFallbackAt), so local
+ * runs as an ordinary reviewer whatever its configured role; that release wins over `role`. */
+export function describeEnabledReviewers(providers: readonly ReviewProvider[], role?: LocalReviewRole, localFallback = false): string {
   const chat = chatProvidersOf(providers as ReviewProvider[]);
   const local = providers.includes("local");
   const chatBit = !chat.length
@@ -438,7 +440,8 @@ export function describeEnabledReviewers(providers: readonly ReviewProvider[], r
     : chat.length === 1
       ? `${chat[0]} (Chrome)`
       : `${chat.join(" + ")} in parallel (Chrome)`;
-  const localBit = !local ? "" : !chat.length ? "local only" : role === "verify-clean" ? "local verifies a clean result" : "local racing";
+  const localBit = !local ? "" : !chat.length ? "local only" : localFallback ? "local runs as the fallback"
+    : role === "verify-clean" ? "local verifies a clean result" : "local racing";
   return [chatBit, localBit].filter(Boolean).join("; ") || "none configured";
 }
 

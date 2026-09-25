@@ -130,6 +130,8 @@ export interface Job {
   /** Ownership lease only, never a deadline for queueing or generation. */
   bridgeLeaseId?: string;
   bridgeClientId?: string;
+  /** First heartbeat of the current unbroken run of binding-less heartbeats, per chat leg (BINDING_LOST_MS). */
+  bindingLostAt?: Partial<Record<ReviewProvider, number>>;
   providerProgress?: Partial<Record<ReviewProvider, ProviderProgress>>;
   providerErrors?: Partial<Record<ReviewProvider, ProviderError>>;
   reviewProviders?: ReviewProvider[];
@@ -472,6 +474,10 @@ export function claimedReviewerNote(providers: readonly ReviewProvider[]): strin
 
 /** Heartbeat ownership lease only. Expiry permits resuming, never failing/restarting generation. */
 export const BRIDGE_CLAIM_MS = 20 * 60_000;
+/** A chat leg whose worker reports its original binding unavailable (ping `disconnected`) and
+ * reports no bound run again for this long, measured from the first binding-less heartbeat, is
+ * settled as a provider failure: the heartbeats keep its claim fresh, so it is never re-offered. */
+export const BINDING_LOST_MS = 10 * 60_000;
 /** Chrome MV3 alarms are ≥1 minute; keep connected across that gap. */
 export const BRIDGE_CONNECTED_MS = 120_000;
 

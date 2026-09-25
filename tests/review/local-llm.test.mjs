@@ -58,6 +58,13 @@ test('a completed reply with text around its JSON keeps that reply as residual e
     assert.equal(out.residualReplies, undefined, `nothing discarded from ${JSON.stringify(only.slice(0, 8))}`);
     assert.equal(out.raw, raw);
   }
+  // prose on the opener's own line is its info string, and a marker indented four spaces is a code
+  // line: neither is the object's fence, so the whole reply is kept
+  for (const reply of [`~~~ ${prose} ${raw}\n~~~`, `\`\`\`${prose} ${raw}\n\`\`\``, `~~~ ${prose} ${raw}`, `    ~~~ ${prose}\n${raw}\n~~~`]) {
+    const out = await local([reply]).context.runLocalLlm('review', settings);
+    assert.equal(out.residualReplies, reply, `kept: ${JSON.stringify(reply.slice(0, 12))}`);
+    assert.equal(out.raw, raw);
+  }
   // the JSON correction's own reply is checked the same way
   const corrected = await local(['prose', mixed]).context.runLocalLlm('review', settings);
   assert.equal(corrected.residualReplies, mixed);

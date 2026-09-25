@@ -95,6 +95,24 @@ describe("extractChatJsonParts: what canonicalizing a reply to its review JSON d
     assert.equal(extractChatJsonParts(`\`\`\` json \`review\`\n${PAYLOAD}\n\`\`\``)?.residual, "``` json `review`");
   });
 
+  it("an object on its opener's line is not inside the block: the text before it on that line is residual", () => {
+    // CommonMark: the rest of the opener's line is its info string, and the block starts on the next line
+    const prose = "P1 a.ts:1 duplicate request writes twice";
+    assert.equal(extractChatJsonParts(`~~~ ${prose} ${PAYLOAD}\n~~~`)?.residual, `~~~ ${prose}`);
+    assert.equal(extractChatJsonParts(`\`\`\`${prose} ${PAYLOAD}\n\`\`\``)?.residual, `\`\`\`${prose}`);
+    assert.equal(extractChatJsonParts(`~~~ ${prose} ${PAYLOAD}`)?.residual, `~~~ ${prose}`, "unclosed");
+    assert.equal(extractChatJsonParts(`\`\`\`json ${PAYLOAD}\n\`\`\``)?.residual, "```json", "a language tag there is info string too");
+    // a bare marker glued to the object is still read as its fence
+    assert.deepEqual(extractChatJsonParts(`\`\`\` ${PAYLOAD}\n\`\`\``), { json: PAYLOAD, residual: "" });
+  });
+
+  it("a marker indented four or more spaces, or by a tab, is an indented code line, not the object's fence", () => {
+    const prose = "~~~ P1 a.ts:1 dup";
+    assert.equal(extractChatJsonParts(`    ${prose}\n${PAYLOAD}\n~~~`)?.residual, prose);
+    assert.equal(extractChatJsonParts(`\t\`\`\`json\n${PAYLOAD}\n\`\`\``)?.residual, "```json");
+    assert.deepEqual(extractChatJsonParts(`   \`\`\`json\n${PAYLOAD}\n   \`\`\``), { json: PAYLOAD, residual: "" }, "three spaces is still a fence");
+  });
+
   it("nothing when the object's fence runs to the end of the reply (CommonMark closes it there)", () => {
     for (const open of ["```json", "````", "~~~"]) {
       for (const end of ["", "\n", "\r\n", "\n  \n"]) {

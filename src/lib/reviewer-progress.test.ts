@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress.ts";
+import { sanitizeProgressEvents } from "./review-progress.ts";
 import type { Job } from "./types.ts";
 
 function job(partial: Partial<Job>): Job {
@@ -246,6 +247,53 @@ describe("buildReviewerLanes", () => {
       assert.match(r.skipReason, /could not complete/i);
       assert.doesNotMatch(r.ops[0], /finished without JSON/i);
     }
+  });
+
+  it("emptyReviewSkip does not read a usage limit into the name of a stage that has no label", () => {
+    // The extension's own stage name reaches the lane detail under the unlabelled fallback; a word in
+    // it ("quota") is not the provider reporting a usage limit.
+    const [event] = sanitizeProgressEvents([{source: "page", sequence: 1, stage: "quota_banner_dismissed", at: 1}]);
+    const lanes = buildReviewerLanes(job({
+      reviewProviders: ["chatgpt"],
+      generating: {chatgpt: false},
+      providerErrors: {chatgpt: {code: "error", message: "context_lost: the page lost the conversation"}},
+      providerProgress: {chatgpt: {runId: "run", stage: event.stage, observedAt: 1, receivedAt: 1}},
+    }));
+    assert.equal(lanes[0].detail, "Unlabelled step · quota_banner_dismissed");
+    const skip = emptyReviewSkip(lanes);
+    assert.equal(skip.usageLimited, false);
+    assert.equal(skip.skipReason, "reviewers could not complete — see per-reviewer details");
+    assert.doesNotMatch(skip.ops[0], /usage limit/i);
+  });
+
+  it("emptyReviewSkip reads the usage limit the lane was built with, not a detail's wording", () => {
+    // Each place a lane learns of a usage limit marks it: the provider's own quota stage, a quota skip
+    // note, a usage-limit error note, and a job skipped for a usage limit.
+    const cases = {
+      quotaStage: job({
+        reviewProviders: ["chatgpt"],
+        generating: {chatgpt: false},
+        providerErrors: {chatgpt: {code: "error", message: "stopped"}},
+        providerProgress: {chatgpt: {runId: "run", stage: "quota", observedAt: 1, receivedAt: 1}},
+      }),
+      quotaSkipNote: job({reviewProviders: ["grok"], assumptions: ["Skipped grok: quota: You've reached the limit"]}),
+      localErrorNote: job({reviewProviders: ["local"], generating: {local: false}, assumptions: ["local usage limit"]}),
+      skippedJob: job({status: "skipped", reviewProviders: ["chatgpt"], skipReason: "reviewers could not complete — usage limit reached"}),
+    };
+    for (const [name, value] of Object.entries(cases)) {
+      const lanes = buildReviewerLanes(value);
+      assert.equal(lanes[0].usageLimited, true, name);
+      assert.equal(emptyReviewSkip(lanes).usageLimited, true, name);
+    }
+    const labelled = buildReviewerLanes(job({
+      reviewProviders: ["chatgpt"],
+      generating: {chatgpt: false},
+      providerErrors: {chatgpt: {code: "error", message: "stopped"}},
+      providerProgress: {chatgpt: {runId: "run", stage: "waiting_for_json", observedAt: 1, receivedAt: 1}},
+    }));
+    assert.equal(labelled[0].usageLimited, false, "another stage does not mark the lane");
+    // A hand-built lane whose text only mentions a limit is not marked.
+    assert.equal(emptyReviewSkip([{provider: "chatgpt", label: "ChatGPT", state: "empty", detail: "usage limit", answered: false}]).usageLimited, false);
   });
 
 });

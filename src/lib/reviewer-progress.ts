@@ -37,13 +37,25 @@ function providerErrorNote(
   return rows.find(row => !/\b(chatgpt|grok|local)\b/i.test(row) && /bridge|disconnected/i.test(row))?.trim();
 }
 
+/** A usage-limit cause in text the server wrote: a provider error note, a skip note, a job's skip reason.
+ * Only a lane builder reads it, where it knows the text is one of those; emptyReviewSkip reads the lane's
+ * flag, never its detail, because a detail can also carry an extension-recorded stage name. */
+const USAGE_LIMIT_NOTE = /usage limit|quota|한도/i;
+
+function usageLimitNote(
+  job: Pick<Job, "assumptions" | "githubError" | "skipReason" | "providerErrors">,
+  provider: ReviewProvider,
+): boolean {
+  return USAGE_LIMIT_NOTE.test(providerErrorNote(job, provider) ?? "");
+}
+
 function emptyProviderDetail(
   job: Pick<Job, "assumptions" | "githubError" | "skipReason" | "bridgeClaimedAt" | "providerErrors">,
   provider: ReviewProvider,
   now: number,
 ): string {
+  if (usageLimitNote(job, provider)) return "usage limit";
   const note = providerErrorNote(job, provider) ?? "";
-  if (/quota|usage limit|한도/i.test(note)) return "usage limit";
   if (/disconnected|bridge|claim|not connected/i.test(note)) return "connection unknown · waiting for reconnection";
   if (/tab_closed/i.test(note)) return "review tab closed";
   if (/cancelled/i.test(note)) return "cancelled";
@@ -160,6 +172,7 @@ export function buildReviewerLanes(
         label,
         detail: skipNote ?? "skipped",
         answered: false,
+        usageLimited: USAGE_LIMIT_NOTE.test(skipNote ?? ""),
       };
     }
 
@@ -170,6 +183,7 @@ export function buildReviewerLanes(
         label,
         detail: job.skipReason ?? job.status,
         answered: false,
+        usageLimited: USAGE_LIMIT_NOTE.test(job.skipReason ?? ""),
       };
     }
 
@@ -198,6 +212,7 @@ export function buildReviewerLanes(
           label,
           detail: emptyProviderDetail(job, provider, now),
           answered: false,
+          usageLimited: usageLimitNote(job, provider),
         };
       }
       return { provider, state: "waiting", label, detail: "local in the race", answered: false };
@@ -208,13 +223,16 @@ export function buildReviewerLanes(
     }
     const progress=job.providerProgress?.[provider];
     if(progress) {
-      return {provider,state:progress.stage==="generating"?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false};
+      // The flag comes from the stage itself: an unlabelled stage's name reaches the detail as it was
+      // recorded, and a word in it is not the provider reporting a limit.
+      return {provider,state:progress.stage==="generating"?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false,
+        usageLimited:progress.stage==="quota"};
     }
     if (g === true) {
       return { provider, state: "waiting", label, detail: "Chrome task pending · submission not confirmed", answered: false };
     }
     if (g === false) {
-      return { provider, state: "empty", label, detail: emptyProviderDetail(job, provider, now), answered: false };
+      return { provider, state: "empty", label, detail: emptyProviderDetail(job, provider, now), answered: false, usageLimited: usageLimitNote(job, provider) };
     }
     if (job.status === "awaiting_chat" && claimed(job, now)) {
       return { provider, state: "waiting", label, detail: "Chrome claimed · waiting for JSON", answered: false };
@@ -263,7 +281,7 @@ export function emptyReviewSkip(lanes: readonly ReviewerLane[]): {
   skipReason: string;
   ops: string[];
 } {
-  const usageLimited = lanes.some((lane) => /usage limit|quota|한도/i.test(lane.detail));
+  const usageLimited = lanes.some((lane) => lane.usageLimited === true);
   // Reserve "finished without JSON" for a genuinely empty reply. Any lane whose detail is NOT that
   // explicit empty signal is some other terminal failure — a skip note in raw code form
   // (`tab_closed`, `cancelled`, `context_lost`, …) or a humanized detail — so bias toward "could not

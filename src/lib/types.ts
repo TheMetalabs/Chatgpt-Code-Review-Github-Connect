@@ -175,6 +175,9 @@ export interface ReviewerLane {
   answered: boolean;
   jsonChars?: number;
   findingCount?: number;
+  /** The reviewer stopped on a usage limit. Set where the lane is built, from the provider's quota stage
+   * or a server-written note; never read back out of the detail text. */
+  usageLimited?: boolean;
 }
 
 export interface PostedComment {

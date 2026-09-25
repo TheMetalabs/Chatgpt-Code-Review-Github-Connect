@@ -169,7 +169,6 @@ export type LoopStepResult =
 
 const SUPERSEDED = "superseded (head moved)";
 const ALREADY_ESCALATED = "already escalated on this head";
-const STEP_IN_FLIGHT = "another loop step is in flight for this head";
 /** A later step for this head replaced this one while it waited: the newer one runs. */
 const STEP_REPLACED = "replaced by a newer loop step for this head (the newer one runs)";
 /** The step this one waited behind already ran this head's round for the same session, mode and
@@ -215,7 +214,6 @@ export const SILENT_REASONS: readonly string[] = [
   "no findings (converged)",
   SUPERSEDED,
   ALREADY_ESCALATED,
-  STEP_IN_FLIGHT,
   STEP_REPLACED,
   ROUND_ALREADY_RUN,
   NO_SESSION,

@@ -2004,6 +2004,13 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.equal(suggestions(f.posted).length, 1);
   });
 
+  it("no step is silently dropped behind another: the back-off reason is gone, and one revived by a merge is logged", () => {
+    // A step for a head in flight WAITS (or is replaced by a newer one that runs). The old back-off
+    // left an active session with nothing running; it must never come back as a quiet exit.
+    assert.ok(!SILENT_REASONS.includes("another loop step is in flight for this head"));
+    assert.ok(!SILENT_REASONS.some((r) => /in flight for this head/.test(r)), SILENT_REASONS.join(" | "));
+  });
+
   it("latest wins: a later step replaces the waiting one, which returns at once; the running step is never preempted", async (t) => {
     const f = fakeDeps({ rounds: [3] });
     const hold = holdFirst(t, f);

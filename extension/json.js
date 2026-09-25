@@ -263,6 +263,10 @@ function currentRepairSource() {
   const tracker = state.running && !tracksSource ? (state.repairProbeTracker ||= {}) : state;
   if (!state.running || !tracksSource) trackCompletedSource(tracker, bound, done, text);
   if (tracker.completedSource?.text !== text || tracker.completedSource.responseId !== bound.responseId) return null;
+  // The regeneration pager as it was when this completed source was first taken: an answer secured by
+  // a capture or a repair (ashlar-capture-accepted / ashlar-repair-accepted read it here) never
+  // settled in the native collector, which records it otherwise (settleStableAnswer). Kept once.
+  if (typeof state.collectedVariant !== "string") state.collectedVariant = responseVariant(bound.root);
   return {text, totalChars:text.length, truncated:false, responseId:bound.responseId, context:reviewPageContext(), completed:true, stable:true};
 }
 
@@ -338,14 +342,16 @@ function answerCompleted(state) {
  * answer: a Stop control or a streaming flag is back, or the variant pager differs from the one at
  * collection. Neither Ashlar nor a provider redraw starts a generation cycle on a finished answer; the
  * user's regenerate or retry does (Ashlar 4101062754). A redraw that only changes the answer's text,
- * fences, labels or message id is not one. */
+ * fences, labels or message id is not one. With no pager recorded at collection (collectedVariant is
+ * recorded by the native collector, and by the first completed source a capture or repair took), any
+ * pager on the bound response counts: a kept tab is recoverable, a closed one is not. */
 function regeneratedAfterCompletion(state, submission) {
   if (!answerCompleted(state) || typeof boundReviewResponse !== "function") return false;
   const bound = boundReviewResponse(submission);
   if (typeof stopButtonVisible === "function" && stopButtonVisible()) return true;
   if (!bound.root) return false;
   if (typeof responseStreaming === "function" && responseStreaming(bound.root)) return true;
-  return typeof state.collectedVariant === "string" && responseVariant(bound.root) !== state.collectedVariant;
+  return responseVariant(bound.root) !== (typeof state.collectedVariant === "string" ? state.collectedVariant : "");
 }
 
 /** One poll of the response bound to this run's sent prompt: the completion evidence both

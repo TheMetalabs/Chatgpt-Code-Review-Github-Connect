@@ -334,3 +334,44 @@ test('P1: a streaming flag back on a repaired (secured) response keeps its tab (
  const out=await page.evaluate(()=>message('ashlar-can-close'));assert.deepEqual({canClose:out.canClose,cause:out.cause},{canClose:false,cause:'regenerated'});
  await page.locator('[data-streaming-response-status]').evaluate(n=>n.remove());assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,false,'still the user\'s');
 });
+// Ashlar 4101062754, reopened on the repair and capture paths: the native collector never settles a
+// prose or invalid-JSON answer, so it never recorded the regeneration pager; the pager check was
+// skipped and the user's finished regeneration (a new message id, a "2/2" pager, no Stop) closed the
+// tab the user was reading. The pager is now recorded from the first completed source a capture or a
+// repair took, and a page with none recorded counts any pager as a regeneration (kept).
+const regenerated='<div class="flex"><button aria-label="Previous response" style="width:20px;height:20px">‹</button><div class="tabular-nums">2/2</div><button aria-label="Next response" style="width:20px;height:20px">›</button></div>';
+const finishRegeneration=page=>page.evaluate(pager=>{const a=document.querySelector('[data-message-author-role="assistant"]');a.dataset.messageId='response-B';a.querySelector('.markdown').textContent='A different answer.';document.querySelector('#answer').insertAdjacentHTML('beforeend',pager);},regenerated);
+const prose='The review found nothing to report in a.ts.';
+for(const [name,secure] of [
+ ['repaired',page=>page.evaluate(({prose,raw})=>message('ashlar-repair-accepted',{committed:true,repairId:'regen-repair',responseId:'response-A',text:prose,raw}),{prose,raw})],
+ ['captured',page=>page.evaluate(prose=>message('ashlar-capture-accepted',{committed:true,captureId:'regen-capture',responseId:'response-A',text:prose,context:reviewPageContext()}),prose)],
+])test(`P1: a ${name} prose answer the user regenerated to completion (new id, 2/2 pager, no Stop) keeps its tab (regenerated)`,async t=>{
+ const page=await pageFixture(t,{text:prose});
+ assert.equal((await secure(page)).accepted,true,`the ${name} source is secured`);
+ assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true,'control: the secured response as it was');
+ await finishRegeneration(page);
+ const out=await page.evaluate(()=>message('ashlar-can-close'));
+ assert.deepEqual({canClose:out.canClose,reason:out.reason,cause:out.cause},{canClose:false,reason:'repurposed',cause:'regenerated'});
+});
+test('P1 worker/HTTP: the user regenerates a repaired answer to completion before the cleanup: the worker keeps the tab (preserve_regenerated)',async t=>{
+ const f=await workerFixture(t);await f.cycle();await eventually(()=>f.app.localRequests.length===1,'repair not started');
+ let regeneration;const send=f.worker.chrome.tabs.sendMessage;
+ f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
+  if(msg.type!=='ashlar-can-close')return send(id,msg,cb);
+  regeneration ||= finishRegeneration(f.page);
+  void regeneration.then(()=>send(id,msg,cb));
+ };
+ f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:raw}}]}));
+ await eventually(async()=>{await f.cycle();return !f.worker.local.state.pendingReviewJobs[f.job.jobId];},'the repaired leg did not retire');
+ assert.ok(regeneration);assert.deepEqual(f.worker.closedTabs,[],'the tab the user is reading is never closed');
+ assert.equal(f.app.reviews.length,1,'the acknowledged review stands');
+ const events=f.worker.calls.filter(c=>c.action==='progress').at(-1)?.progress?.chatgpt?.events.map(e=>`${e.source}:${e.stage}`)||[];
+ assert.ok(events.includes('worker:preserve_regenerated')&&events.includes('worker:tab_preserved'),`${events}`);
+});
+test('control: a repaired answer that already showed its pager when its source was taken still closes (the pager recorded then is the baseline)',async t=>{
+ const page=await pageFixture(t,{text:prose});
+ await page.evaluate(pager=>document.querySelector('#answer').insertAdjacentHTML('beforeend',pager),regenerated);await page.clock.runFor(2400);
+ assert.equal((await page.evaluate(({prose,raw})=>message('ashlar-repair-accepted',{committed:true,repairId:'regen-repair',responseId:'response-A',text:prose,raw}),{prose,raw})).accepted,true);
+ const out=await page.evaluate(()=>message('ashlar-can-close'));
+ assert.deepEqual({canClose:out.canClose,reason:out.reason},{canClose:true,reason:'complete'});
+});

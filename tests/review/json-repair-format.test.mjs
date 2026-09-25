@@ -145,3 +145,19 @@ test('the stray-quote scan does not depend on the wording of JSON.parse errors',
  JSON.parse=function(...args){try{return parse.apply(this,args);}catch{throw new SyntaxError('Unexpected token');}};
  try{assert.equal(escapeStrayQuotes(labelledOriginal),handFixed);}finally{JSON.parse=parse;}
 });
+
+test('a capture cut inside the final coverage member is closed by brackets only; a cut in findings is not (#93)',()=>{
+ const full={...value,coverage:[{file:'a.ts',status:'cleared',reason:'read it'}]};
+ const text=JSON.stringify(full,null,2);
+ const cut='JSON\n\n'+text.slice(0,text.lastIndexOf('"read it"')+'"read it"'.length);
+ assert.equal(inspectReviewFormat(cut,'review').ok,false);
+ const out=validateRepairCandidate(cut,text,'review');
+ assert.equal(out.ok,true,JSON.stringify(out.errors));assert.deepEqual(JSON.parse(out.raw).findings,full.findings);
+ // Content may not be added past the cut: an extra coverage row is rejected.
+ const extra={...full,coverage:[...full.coverage,{file:'b.ts',status:'cleared',reason:'x'}]};
+ assert.equal(validateRepairCandidate(cut,JSON.stringify(extra),'review').ok,false);
+ // A cut inside findings (findings last) could hide findings: never closed.
+ const {coverage,...noCov}=full; const t2=JSON.stringify(noCov,null,2);
+ const cut2=t2.slice(0,t2.lastIndexOf('}'));
+ assert.equal(validateRepairCandidate(cut2,t2,'review').ok,false);
+});

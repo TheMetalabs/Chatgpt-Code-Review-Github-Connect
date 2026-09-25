@@ -167,11 +167,19 @@ function ordered(value: unknown): unknown {
  * whitespace outside strings, missing/trailing commas and escaped versus rendered
  * punctuation inside strings. Values/field order must otherwise match. This narrow
  * subset rejects prose, changed evidence, missing rows and ambiguous restructuring.
+ * One truncation is tolerated: a source that ends inside a LAST top-level `coverage`
+ * member (#93: a capture that lost its final "}]}") may be closed by closing brackets
+ * only. Every source character is still aligned, and no finding can be lost this way:
+ * `findings` precedes it complete. A lost coverage row only leaves that file not cleared.
  */
 function alignsWithRenderedSource(source: string, value: unknown): boolean {
-  let pos=0,depth=0;
+  let pos=0,depth=0,inLastMember=false;
   const whitespace=()=>{while(pos<source.length && /\s/.test(source[pos]))pos++;};
-  const token=(want:string)=>{whitespace();if(source.slice(pos,pos+want.length)!==want)throw Error("source_mismatch");pos+=want.length;};
+  const token=(want:string)=>{
+    whitespace();
+    if(inLastMember && pos===source.length && (want==="]" || want==="}"))return;
+    if(source.slice(pos,pos+want.length)!==want)throw Error("source_mismatch");pos+=want.length;
+  };
   const string=(text:string)=>{
     token('"');
     const start = pos;
@@ -200,7 +208,12 @@ function alignsWithRenderedSource(source: string, value: unknown): boolean {
     if(++depth>64)throw Error("too_deep");
     if(typeof v === "string")string(v);
     else if(Array.isArray(v)){token("[");v.forEach((item,index)=>{if(index)comma();walk(item);});comma();token("]");}
-    else if(object(v)){token("{");Object.entries(v).forEach(([key,item],index)=>{if(index)comma();string(key);token(":");walk(item);});comma();token("}");}
+    else if(object(v)){
+      const top=depth===1, entries=Object.entries(v);
+      token("{");
+      entries.forEach(([key,item],index)=>{if(index)comma();string(key);token(":");if(top && index===entries.length-1 && key==="coverage")inLastMember=true;walk(item);});
+      comma();token("}");
+    }
     else token(JSON.stringify(v));
     depth--;
   };

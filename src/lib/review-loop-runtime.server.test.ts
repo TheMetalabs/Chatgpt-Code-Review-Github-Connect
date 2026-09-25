@@ -1851,6 +1851,33 @@ describe("the branch ref moves only while the round is still wanted (#79 K2-7 wr
     assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed", JSON.stringify(r));
     assert.match(escalations(f.posted)[0], /commit-failed after 1 attempt\(s\): GitHub pull 502/);
   });
+
+  it("a ref update whose response was lost is recognized through the guarded API's readBranchRef: applied, continued and reported", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    let branch = HEAD; // the live branch ref (and so the PR head)
+    let lost = false;
+    const head = f.deps.gh.fetchPullHeadRef;
+    f.deps.gh.fetchPullHeadRef = async (...a) => ({ ...(await head(...a)), sha: branch });
+    const api = f.deps.gh.gitDataApi;
+    f.deps.gh.gitDataApi = (...a) => ({
+      ...api(...a),
+      async updateBranchRef(_branch: string, sha: string, expected: string) {
+        if (branch !== expected) throw new Error("branch moved; refusing to update");
+        branch = sha; // the PATCH lands...
+        if (!lost) {
+          lost = true;
+          throw new Error("PATCH ref: socket hang up"); // ...but its response is lost
+        }
+      },
+      async readBranchRef() {
+        return branch;
+      },
+    });
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.commitSha === NEW_SHA && r.continued, JSON.stringify(r));
+    assert.equal(f.posted.filter((b) => b.startsWith("### Ashlar fix agent")).length, 1, "the landed fix is reported");
+    assert.equal(escalations(f.posted).length, 0);
+  });
 });
 
 describe("a second step for the same head waits for the running one (#79 K2-8, K2-9 step half, R7 4092621920)", () => {

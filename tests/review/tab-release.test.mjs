@@ -391,6 +391,19 @@ test('worker status lists the recently retired legs (closed and preserved) with 
   assert.doesNotMatch(JSON.stringify(retired), /PROMPT|https?:/, 'no prompt or URL text');
   assert.deepEqual(b.closedTabs, [10]);
 });
+// Ashlar 4101062772: the ring is diagnostics only; it is written inside the retirement's storage
+// sequence, so a failed ring write must not leave the cleaned job in the registry (retried as
+// recovery work, holding a capacity slot).
+for (const failing of ['set', 'get']) test(`a cleaned job retires even when the recent-retired ring ${failing === 'set' ? 'write' : 'read'} fails`, async () => {
+  const b = worker(leg('review', secured('review')), {handler: () => owned});
+  const {get, set} = b.local;
+  if (failing === 'set') b.local.set = async values => { if ('bridgeRecentRetired' in values) throw new Error('QUOTA_BYTES quota exceeded'); return set(values); };
+  else b.local.get = async keys => { if ([].concat(keys ?? []).includes('bridgeRecentRetired')) throw new Error('storage unavailable'); return get(keys); };
+  await b.tick();
+  assert.deepEqual(b.closedTabs, [10], 'the secured tab is closed');
+  assert.equal(b.pending(), undefined, 'the job is removed from pendingReviewJobs: capacity released');
+  assert.equal(b.local.state.bridgeRecentRetired, undefined, 'the diagnostic entry is lost, nothing else');
+});
 
 // ── tab_lost (#82 step 0): tab_closed in review history says the worker closed the tab. A tab that is
 // gone otherwise (the user or the browser closed it, its creation is unknown, or it can no longer be

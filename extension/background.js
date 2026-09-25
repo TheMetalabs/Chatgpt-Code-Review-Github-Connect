@@ -312,7 +312,8 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
     const relevant = Object.values(jobs).filter(job => job.origin === origin);
     const phase = relevant.some(activelyReviewing) ? "reviewing" : relevant.length ? "recovering" : "idle";
     const admission = admissionReports.get(origin);
-    const retired = (await chrome.storage.local.get([RECENT_RETIRED_KEY]))[RECENT_RETIRED_KEY];
+    // Diagnostics only: an unreadable ring shows no recent legs, it never fails the status write.
+    const retired = await chrome.storage.local.get([RECENT_RETIRED_KEY]).then(got => got[RECENT_RETIRED_KEY], () => []);
     await chrome.storage.local.set({[WORKER_STATUS_KEY]: {
       origin, checkedAt: Date.now(), phase, capacity,
       admissionPhase: admission?.phase || "not_checked",
@@ -1329,6 +1330,21 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
   await closeProvenTab(job, provider, jobs, tab.id, url => samePage(url, bound), closed);
 }
 
+/** Add the job's legs to the recent-retired ring (RECENT_RETIRED_KEY). Diagnostics only, so best
+ * effort: a failed read or write loses the entry, never the retirement it describes (the job is
+ * still deleted from the registry and its capacity released). */
+async function rememberRetired(job) {
+  try {
+    const ring = (await chrome.storage.local.get([RECENT_RETIRED_KEY]))[RECENT_RETIRED_KEY];
+    const retired = job.providers.map(provider => {
+      const state = job.states[provider];
+      return {jobId: job.jobId, kind: job.kind === "fix" ? "fix" : "review", provider, tabId: state.tabId,
+        stage: state.workerEvents?.at(-1)?.stage || "", cause: state.preserveCause, note: state.cleanupNote, at: Date.now()};
+    });
+    await chrome.storage.local.set({[RECENT_RETIRED_KEY]: [...(Array.isArray(ring) ? ring : []), ...retired].slice(-16)});
+  } catch { /* the diagnostic entry is lost; the retirement goes on */ }
+}
+
 async function retireCleanJob(job, jobs, forgotten = false, signal) {
   if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
   // Final trace uploading terminal events (result_saved, tab_closed) to review history. Detach it ONLY
@@ -1350,13 +1366,7 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
     for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
     await chrome.storage.session.set({tabs});
     await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
-    const ring = (await chrome.storage.local.get([RECENT_RETIRED_KEY]))[RECENT_RETIRED_KEY];
-    const retired = job.providers.map(provider => {
-      const state = job.states[provider];
-      return {jobId: job.jobId, kind: job.kind === "fix" ? "fix" : "review", provider, tabId: state.tabId,
-        stage: state.workerEvents?.at(-1)?.stage || "", cause: state.preserveCause, note: state.cleanupNote, at: Date.now()};
-    });
-    await chrome.storage.local.set({[RECENT_RETIRED_KEY]: [...(Array.isArray(ring) ? ring : []), ...retired].slice(-16)});
+    await rememberRetired(job);
   });
   // writeInOrder above is itself an unabortable storage sequence that can outlive the sweep watchdog.
   // Recheck before the registry delete/persist so an abandoned sweep can't delete jobs[jobId] and rewrite

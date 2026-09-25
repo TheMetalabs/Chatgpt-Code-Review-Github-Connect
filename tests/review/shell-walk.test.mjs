@@ -23,7 +23,9 @@ function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let
 /** Replays `events` on one leg (`kind`, starting `start`) and returns the first violated invariant ('' if none). */
 async function run(kind, start, events) {
   const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
-  const state = start === 'secured' ? {delivered: true, cleanupPending: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}, conversation: URL_TAB, pageUrl: URL_TAB}
+  // secured: the answer acknowledged by the server (answerDelivered: the worker's record of the
+  // complete ACK, which a fix needs to take its proven-success path, #77; a review ignores it)
+  const state = start === 'secured' ? {delivered: true, cleanupPending: true, answerDelivered: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}, conversation: URL_TAB, pageUrl: URL_TAB}
     : start === 'undispatched' ? {started: false} : {};
   const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
     providers: ['chatgpt'], reasoning: {chatgpt: 'pro'}, states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', ...state}}};
@@ -68,12 +70,16 @@ async function run(kind, start, events) {
   b.chrome.scripting.executeScript = async ({target}) => { if (w.mode === 'noReceiver' || b.tabs.get(target.tabId)?.discarded) throw new Error('Cannot access contents of the page'); };
   const pending = () => b.local.state.pendingReviewJobs?.[jobId];
   const settles = async operation => { let settled = false; operation().then(() => { settled = true; }); return until(() => settled, 2000); };
+  // A fix tab may close only on the proven-success path (#77): here, only a leg whose answer was
+  // delivered before the walk (this harness never delivers a new one). A review closes untouched.
+  const mayClose = kind === 'review' || start === 'secured';
   const tick = async () => {
     const userBefore = w.user || w.reused;
     const closedBefore = b.closedTabs.length;
     if (!await settles(() => b.tick())) return 'tick_never_settles';
     if (w.frozenMessaged) return 'messaged_frozen_tab';
     if (b.closedTabs.length > closedBefore && userBefore) return 'closed_user_tab';
+    if (b.closedTabs.length > closedBefore && !mayClose) return 'closed_undelivered_fix';
     return '';
   };
   const apply = async ev => {
@@ -83,7 +89,11 @@ async function run(kind, start, events) {
       case 'later': w.now += 45_000; return '';
       case 'cancel': if (w.status === 'awaiting_chat') w.status = 'cancelled'; return '';
       case 'missing': w.status = 'missing'; return '';
-      case 'sweep': return await settles(() => b.context.autoSweepStuckJobs()) ? '' : 'sweep_never_settles';
+      case 'sweep': {
+        const closedBefore = b.closedTabs.length;
+        if (!await settles(() => b.context.autoSweepStuckJobs())) return 'sweep_never_settles';
+        return b.closedTabs.length > closedBefore && !mayClose ? 'closed_undelivered_fix' : '';
+      }
       case 'followup': if (t && !w.reused) { w.user = true; } return '';
       case 'navigate': if (t && !w.reused) { w.user = true; t.url = OTHER; } return '';
       case 'userClose': if (t) await b.closeTab(w.id); return '';
@@ -110,7 +120,7 @@ async function run(kind, start, events) {
   if (pending() && w.status === 'awaiting_chat') w.status = 'cancelled';
   for (let i = 0; i < 8 && pending(); i++) { w.now += 60_000; const v = await tick() || await apply('sweep'); if (v) return v; }
   if (pending()) return `not_terminal(${pending().states.chatgpt.cleanupWaitReason || pending().states.chatgpt.connectionError || ''})`;
-  if (w.clean && !w.user && b.tabs.has(w.id)) return 'untouched_reachable_tab_preserved';
+  if (w.clean && !w.user && b.tabs.has(w.id) && mayClose) return 'untouched_reachable_tab_preserved';
   return '';
 }
 

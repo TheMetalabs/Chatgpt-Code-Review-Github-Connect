@@ -13,7 +13,9 @@ const OTHER_TAB = 'https://chatgpt.com/c/users-own'; // a conversation the user 
 const ANSWER = {review: raw, fix: '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'};
 const LATER_MS = 3 * 60_000; // past the fix ownership wait
 // A delivered (secured) leg carries its outcome; delivered with none is an abandoned leg (#82).
-const secured = kind => ({delivered: true, cleanupPending: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}});
+// answerDelivered: the worker's record that the server acknowledged the answer (deliverOutcome, on
+// the complete ACK), which a fix needs to take the proven-success path (#77); a review ignores it.
+const secured = kind => ({delivered: true, cleanupPending: true, answerDelivered: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}});
 
 function item(kind, patch = {}, state = {}) {
   return {jobId: kind === 'fix' ? 'fix-A' : 'job-A', ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A',
@@ -94,19 +96,23 @@ const ROWS = [
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
-  {id: 'W7', name: 'server cancelled while the answer is still pending', same: true,
-    // A cancelled run can never be delivered (#82): its positively owned tab is closed (the cancel
-    // exit also stops its page) and the job retires, whatever kind it is.
-    expect: {closed: 1, retired: true},
+  {id: 'W7', name: 'server cancelled while the answer is still pending',
+    // Intended: a cancelled run can never be delivered, so the job retires and its run is stopped,
+    // whatever kind it is (#82). A review's positively owned tab is closed by the cancel exit's
+    // verdict (#82); a fix tab is closed only on the proven-success path, so it is preserved
+    // (released) even when the page would vouch for it (#77).
+    expect: {review: {closed: 1, retired: true}, fix: {closed: 0, retired: true}},
     async run(kind) {
       const b = worker(kind, {api: cancelled, handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
-  {id: 'W8', name: 'server cancelled while the tab never finishes loading', same: true,
-    // A tab that cannot answer is never held forever (#82): preserved after the ownership wait, and
-    // the page completes the release handshake once it can answer (never counted as an orphan).
-    expect: {firstTick: true, afterWait: false, closed: 0},
+  {id: 'W8', name: 'server cancelled while the tab never finishes loading',
+    // Intended: a tab that cannot answer is never held forever (#82). A review is preserved after the
+    // ownership wait; a cancelled fix is preserved at once (nothing is waited for: no page verdict can
+    // authorise a close on a cancel, #77). Either way the page completes the release handshake once
+    // it can answer (never counted as an orphan).
+    expect: {review: {firstTick: true, afterWait: false, closed: 0}, fix: {firstTick: false, afterWait: false, closed: 0}},
     async run(kind) {
       const b = worker(kind, {api: cancelled, status: 'loading', handler: () => ({ok: true, canClose: true, owned: true, url: URL_TAB})});
       await b.tick();
@@ -134,9 +140,12 @@ const ROWS = [
       await b.tick();b.later();await b.tick();
       return {afterWait: Boolean(b.pending()), closed: b.closedTabs.length, otherRecord: b.session.state['ashlar:tab:10']?.jobId === 'job-B'};
     }},
-  {id: 'W15', name: 'server cancelled after the tab was opened but before the run was dispatched', same: true,
-    // The undispatched blank tab is closed while it holds nothing of the user's (either kind).
-    expect: {retired: true, closed: 1},
+  {id: 'W15', name: 'server cancelled after the tab was opened but before the run was dispatched',
+    // Intended: both jobs retire. A review's undispatched blank tab (the one this browser session
+    // created) is closed while it holds nothing of the user's (#82, review flag R1 resolved); a fix's
+    // is preserved (a fix tab is closed only on the proven-success path, and no fix page is ever asked
+    // to vouch for an unbound tab, #77).
+    expect: {review: {retired: true, closed: 1}, fix: {retired: true, closed: 0}},
     async run(kind) {
       const OPENED = 'https://chatgpt.com/?temporary-chat=true';
       const job = item(kind, {}, {started: false});
@@ -181,9 +190,10 @@ const ROWS = [
       await b.tick();
       return {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true)};
     }},
-  {id: 'W25', name: 'server cancelled; the bound conversation identity was never established', same: true,
-    // Not established = unknown ownership: asked again, then preserved (never closed).
-    expect: {firstTick: true, afterWait: false, closed: 0},
+  {id: 'W25', name: 'server cancelled; the bound conversation identity was never established',
+    // Not established = unknown ownership: a review is asked again, then preserved (never closed,
+    // #82); a cancelled fix is preserved at once, whatever the page says (#77).
+    expect: {review: {firstTick: true, afterWait: false, closed: 0}, fix: {firstTick: false, afterWait: false, closed: 0}},
     async run(kind) {
       const b = worker(kind, {api: cancelled, handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB} : {ok: true, canClose: false, reason: 'pending', url: URL_TAB}});
       await b.tick();
@@ -248,61 +258,82 @@ const ROWS = [
     // a review closes on canClose as today.
     expect: {review: {closed: 1}, fix: {closed: 0}},
     async run(kind) {
-      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, outcome: {ok: true, raw: ANSWER[kind]}}),
+      const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, answerDelivered: true, conversation: URL_TAB, outcome: {ok: true, raw: ANSWER[kind]}}),
         handler: () => ({ok: true, canClose: true, url: URL_TAB, conversation: URL_TAB})});
       await b.tick();
       return {closed: b.closedTabs.length};
     }},
   {id: 'W32', name: 'after a delivered FAILURE (no answer), the tab close decision',
-    // Intended: a fix with no answer has no completion to prove, so its tab closes only on the
-    // cancel-phase ownership proof (ashlar-fix-cancel, stored conversation), never on can-close;
-    // a review closes on can-close as today.
-    expect: {review: {closed: 1, askedCancel: false}, fix: {closed: 1, askedCancel: true}},
+    // Intended: a fix with no delivered answer never reaches the proven-success path, so its tab is
+    // preserved (released) and the job retires, whatever the page says; a review closes on
+    // can-close as today.
+    expect: {review: {closed: 1, retired: true}, fix: {closed: 0, retired: true}},
     async run(kind) {
       const b = worker(kind, {api: active, job: item(kind, {}, {delivered: true, cleanupPending: true, conversation: URL_TAB, outcome: {ok: false, code: 'quota', error: 'limit'}}),
-        handler: (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', url: URL_TAB, conversation: URL_TAB} : {ok: true, canClose: kind === 'review', reason: 'complete', url: URL_TAB}});
+        handler: () => ({ok: true, owned: true, ownership: 'owned', canClose: true, reason: 'complete', url: URL_TAB, conversation: URL_TAB})});
       await b.tick();
-      return {closed: b.closedTabs.length, askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel')};
+      return {closed: b.closedTabs.length, retired: !b.pending()};
     }},
-  // W33-W35 (round 12, Ashlar 4097631101, under #82's release rule): whether a leg whose answer was
-  // collected closes never follows the server status. The server settling or forgetting the item (a
-  // restart or a terminal-retention prune reports an unknown fix id as cancelled) after the answer
-  // was collected releases the tab by the page's verdict alone, for both kinds: closed when Ashlar's,
-  // kept (and released) when the user's. The page mock answers BOTH exits with the same verdict, as
-  // json.js does (tabOwnership); only the cancel exit also stops the page's run (tab-release.test.mjs
-  // pins which legs are stopped). That verdict compares nothing about the answer, so a regenerated
-  // or replaced answer with no user signal closes (browser.e2e "a delivered fix whose server then
-  // reports ..."). (`serverStatus`: what an earlier heartbeat stored; cleanup runs before the tick's
-  // own heartbeat.)
-  {id: 'W33', name: 'an answer was collected, then the server reports cancelled / unknown, and the page\'s verdict is the user\'s: the tab is kept', same: true,
-    expect: {cancelled: {closed: 0, retired: true, released: true}, unknown: {closed: 0, retired: true, released: true}},
+  // W33-W35, W41 (round 12, Ashlar 4097631101, under #82's release rule and #77's proven-success
+  // path): whether a leg whose answer was collected closes never follows the server status. The
+  // server settling or forgetting the item (a restart or a terminal-retention prune reports an
+  // unknown fix id as cancelled) after the answer was collected releases the tab by the page's verdict
+  // alone: closed when Ashlar's, kept (and released) when the user's. The page mock answers BOTH exits
+  // with the same verdict, as json.js does for a review (tabOwnership). Which exit is asked differs by
+  // kind: a cancelled review takes the cancel exit (it also stops the page's run, #82); a fix whose
+  // answer was DELIVERED (answerDelivered, the worker's own record of the complete ACK) asks can-close
+  // whatever the server says since (its run already ended with that answer; a fix page's cancel reply
+  // carries no verdict), and a fix whose answer was never delivered is never closed (W35, W41, #77).
+  // The verdict compares nothing about the answer, so a regenerated or replaced answer with no user
+  // signal closes (browser.e2e "a delivered fix whose server then reports ..."). (`serverStatus`: what
+  // an earlier heartbeat stored; cleanup runs before the tick's own heartbeat.)
+  {id: 'W33', name: 'an answer was delivered, then the server reports cancelled / unknown, and the page\'s verdict is the user\'s: the tab is kept',
+    expect: {review: {cancelled: {askedCancel: true, closed: 0, retired: true, released: true}, unknown: {askedCancel: false, closed: 0, retired: true, released: true}},
+      fix: {cancelled: {askedCancel: false, closed: 0, retired: true, released: true}, unknown: {askedCancel: false, closed: 0, retired: true, released: true}}},
     async run(kind) {
       const got = {};
       for (const status of ['cancelled', 'unknown']) {
-        const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
+        const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, answerDelivered: true, conversation: URL_TAB,
           outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
         handler: sameVerdict({ok: true, releaseProtocol: 1, ownership: 'takenOver', cause: 'user_turn', url: URL_TAB})});
         await b.tick();await b.tick();
-        got[status] = {closed: b.closedTabs.length, retired: !b.pending(), released: b.messages.some(m => m.preserve === true)};
+        got[status] = {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs.length, retired: !b.pending(),
+          released: b.messages.some(m => m.preserve === true)};
       }
       return got;
     }},
-  {id: 'W34', name: 'an answer was collected, then the server reports cancelled / unknown, and the page\'s verdict is Ashlar\'s: the tab closes (control)', same: true,
-    expect: {cancelled: {closed: [10], retired: true}, unknown: {closed: [10], retired: true}},
+  {id: 'W34', name: 'an answer was delivered, then the server reports cancelled / unknown, and the page\'s verdict is Ashlar\'s: the tab closes (control)',
+    expect: {review: {cancelled: {askedCancel: true, closed: [10], retired: true}, unknown: {askedCancel: false, closed: [10], retired: true}},
+      fix: {cancelled: {askedCancel: false, closed: [10], retired: true}, unknown: {askedCancel: false, closed: [10], retired: true}}},
     async run(kind) {
       const got = {};
       for (const status of ['cancelled', 'unknown']) {
-        const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
+        const b = worker(kind, {api: ping(status, false), job: item(kind, {serverStatus: status}, {delivered: true, cleanupPending: true, answerDelivered: true, conversation: URL_TAB,
           outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
         handler: sameVerdict({ok: true, releaseProtocol: 1, ownership: 'owned', url: URL_TAB, conversation: URL_TAB})});
         await b.tick();await b.tick();
-        got[status] = {closed: b.closedTabs, retired: !b.pending()};
+        got[status] = {askedCancel: b.messages.some(m => m.type === 'ashlar-fix-cancel' && !m.preserve), closed: b.closedTabs, retired: !b.pending()};
       }
       return got;
     }},
-  {id: 'W35', name: 'a collected answer the server rejected (400: its outcome became a failure): the page\'s verdict decides, kept when the user\'s, closed when Ashlar\'s', same: true,
-    // The collected answer is proven locally by rejectedRaw: the leg is released like a secured one.
-    expect: {takenOver: {closed: 0, retired: true}, owned: {closed: 1, retired: true}},
+  {id: 'W41', name: 'an answer was collected but no acknowledged delivery is recorded (the leg ended by a cancel), completion unchanged',
+    // Intended: a review is released by the page's verdict (#82: closed when Ashlar's); a fix without
+    // its delivery record never reaches the proven-success path: preserved (released), never closed,
+    // the job retires (#77).
+    expect: {review: {closed: 1, retired: true}, fix: {closed: 0, retired: true}},
+    async run(kind) {
+      const b = worker(kind, {api: cancelled, job: item(kind, {serverStatus: 'cancelled'}, {delivered: true, cleanupPending: true, conversation: URL_TAB,
+        outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind], completion: {responseId: 'response-A', context: URL_TAB}}}),
+      handler: () => ({ok: true, canClose: true, reason: 'complete', ownership: 'owned', url: URL_TAB, conversation: URL_TAB})});
+      await b.tick();
+      return {closed: b.closedTabs.length, retired: !b.pending()};
+    }},
+  {id: 'W35', name: 'a collected answer the server rejected (400: its outcome became a failure): a review is released by the page\'s verdict, a fix is never closed',
+    // Intended: a review's collected answer is proven locally by rejectedRaw, so the leg is released
+    // like a secured one: kept when the user's, closed when Ashlar's (#82). A rejected fix answer was
+    // never delivered: the fix tab is preserved whatever the page says (#77).
+    expect: {review: {takenOver: {closed: 0, retired: true}, owned: {closed: 1, retired: true}},
+      fix: {takenOver: {closed: 0, retired: true}, owned: {closed: 0, retired: true}}},
     async run(kind) {
       const got = {};
       for (const ownership of ['takenOver', 'owned']) {

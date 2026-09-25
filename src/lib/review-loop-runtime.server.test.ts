@@ -285,7 +285,7 @@ describe("the loop is OFF unless Settings enable it (no other path turns it on)"
     readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
       e.isDirectory() ? sources(join(dir, e.name)) : /\.tsx?$/.test(e.name) && !/\.test\.tsx?$/.test(e.name) ? [join(dir, e.name)] : [],
     );
-  const withProvider = (fix: Record<string, unknown>) => sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "script-apply", ...fix } });
+  const withProvider = (fix: Record<string, unknown>) => sanitizeBotSettings({ fixAgent: { provider: "chatgpt", delivery: "script-apply", mode: "suggest", ...fix } });
 
   it("default settings → off: no switch, no provider", () => {
     assert.equal(DEFAULT_SETTINGS.fixAgent.enabled, false);
@@ -316,6 +316,18 @@ describe("the loop is OFF unless Settings enable it (no other path turns it on)"
       assert.deepEqual(await runPostReviewLoop("t", job(), sample, s, f.deps, ENV), { ran: false, reason: "disabled" });
       assert.equal(f.prompts.length, 0, "no fix request");
     }
+  });
+
+  it("a loaded document whose stored provider / delivery / mode was invalid never runs, even where load repaired the value (Ashlar 4099509084)", async () => {
+    const valid = { enabled: true, provider: "chatgpt", delivery: "script-apply", mode: "apply" };
+    for (const stored of [{ ...valid, provider: "skynet" }, { ...valid, delivery: "teleport" }, { ...valid, mode: "yolo" }, { ...valid, provider: "local", delivery: "chat-push" }]) {
+      const s = sanitizeBotSettings({ fixAgent: stored });
+      assert.equal(loopEnabled(s), false, JSON.stringify(stored));
+      const f = fakeDeps({ start: "apply", rounds: [3] });
+      assert.deepEqual(await runPostReviewLoop("t", job(), sample, s, f.deps, ENV), { ran: false, reason: "disabled" });
+      assert.equal(f.prompts.length, 0, "no fix request");
+    }
+    assert.equal(loopEnabled(sanitizeBotSettings({ fixAgent: valid })), true, "control: the valid stored configuration runs");
   });
 
   it("only a literal true switches it on (the switch fails closed)", () => {
@@ -1297,7 +1309,7 @@ describe("stopLoop (the fixed STOPPED acknowledgement)", () => {
   });
 });
 
-describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per PR)", () => {
+describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; grok is not a fix provider)", () => {
   const chat = (provider: "chatgpt" | "grok", delivery: "script-apply" | "chat-push" = "script-apply"): BotSettings => ({
     ...DEFAULT_SETTINGS,
     fixAgent: { ...DEFAULT_SETTINGS.fixAgent, enabled: true, provider, delivery, mode: "suggest" },
@@ -1311,15 +1323,28 @@ describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per 
         return "ANSWER TEXT";
       },
     });
-    for (const provider of ["chatgpt", "grok"] as const) {
-      assert.equal(await requestChatFix(chat(provider), { owner: "o", repo: "r", pr: 7 }, provider, "FIX PROMPT", { loadBridge: loader }), "ANSWER TEXT");
-    }
+    assert.equal(await requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", "FIX PROMPT", { loadBridge: loader }), "ANSWER TEXT");
     // the page reads fenced code only, so the chat prompt asks for exactly one ```json fence
     const fenced = `FIX PROMPT\n\n${CHAT_FIX_FENCE_RULE}`;
-    assert.deepEqual(calls, [
-      { owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: fenced },
-      { owner: "o", repo: "r", pr: 7, provider: "grok", prompt: fenced },
-    ]);
+    assert.deepEqual(calls, [{ owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: fenced }]);
+  });
+
+  it("grok is refused as a fix provider at run time: the loop stays off and the transport never reaches the bridge", async () => {
+    const s = chat("grok");
+    assert.equal(s.fixAgent.enabled, true);
+    assert.equal(loopEnabled(s), false, "a (hand-edited) enabled grok fix agent never runs");
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    assert.deepEqual(await runPostReviewLoop("t", job(), sample, s, f.deps, ENV), { ran: false, reason: "disabled" });
+    assert.equal(f.prompts.length, 0, "no fix request");
+    let loaded = false;
+    const loadBridge = async () => {
+      loaded = true;
+      return { requestBridgeFix: async () => "never" };
+    };
+    await assert.rejects(productionRequestFix(s, { owner: "o", repo: "r", pr: 7 }, { loadBridge })("p"), /^Error: grok is not supported as a fix provider yet/);
+    assert.equal(loaded, false, "no bridge item is ever queued for grok");
+    assert.equal(FIX_PROVIDER_CAPS.grok.wired, false);
+    assert.equal(FIX_PROVIDER_CAPS.grok.transport, "none");
   });
 
   it("a bridge rejection surfaces as a thrown Error (the round's request-failed path)", async () => {
@@ -1360,7 +1385,7 @@ describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per 
     });
     await assert.rejects(out, /head moved/);
     assert.ok(signal, "the chat transport received the watcher's signal");
-    assert.equal(signal.aborted, true, "the bridge item is cancelled, so the extension closes its tab");
+    assert.equal(signal.aborted, true, "the bridge item is cancelled, so the extension stops its run (the tab is preserved)");
   });
 
   it("delivery chat-push fails closed instead of silently becoming a server-side apply", async () => {
@@ -1370,8 +1395,8 @@ describe("chat fix transport (chatgpt / grok → one Chrome-bridge fix item per 
       return { requestBridgeFix: async () => "never" };
     };
     await assert.rejects(
-      requestChatFix(chat("grok", "chat-push"), { owner: "o", repo: "r", pr: 7 }, "grok", "p", { loadBridge: loader }),
-      /fix delivery chat-push is not wired for grok \(script-apply only\)/,
+      requestChatFix(chat("chatgpt", "chat-push"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", "p", { loadBridge: loader }),
+      /fix delivery chat-push is not wired for chatgpt \(script-apply only\)/,
     );
     assert.equal(loaded, false);
   });
@@ -1666,7 +1691,7 @@ describe("fixGenerationMs: the bridge deadline governs a chat fix, never the loc
   });
 
   it("a chat fix waits a margin past the bridge's own deadline; the local-LLM knob takes no part", () => {
-    for (const provider of ["chatgpt", "grok"] as const) {
+    for (const provider of ["chatgpt"] as const) {
       assert.equal(fixGenerationMs(fix({ provider, chatTimeoutMs: 120 * MIN })), 121 * MIN, provider);
       assert.equal(fixGenerationMs(fix({ provider, timeoutMs: 15 * MIN })), 31 * MIN, "a low local deadline never undercuts the bridge's (default 30 min)");
       assert.equal(fixGenerationMs(fix({ provider, timeoutMs: 6 * 60 * MIN, chatTimeoutMs: 10 * MIN })), 11 * MIN, "a high local deadline never outlasts the bridge's");
@@ -1683,8 +1708,6 @@ describe("provider capabilities: activity and the governing deadline come from t
     { provider: "local", streaming: false, reportsActivity: false, governs: "timeoutMs", generationMs: 60 * MIN },
     { provider: "chatgpt", streaming: true, reportsActivity: false, governs: "chatTimeoutMs", generationMs: 31 * MIN },
     { provider: "chatgpt", streaming: false, reportsActivity: false, governs: "chatTimeoutMs", generationMs: 31 * MIN },
-    { provider: "grok", streaming: true, reportsActivity: false, governs: "chatTimeoutMs", generationMs: 31 * MIN },
-    { provider: "grok", streaming: false, reportsActivity: false, governs: "chatTimeoutMs", generationMs: 31 * MIN },
   ] as const;
   for (const row of TABLE) {
     it(`${row.provider}, local streaming ${row.streaming ? "on" : "off"} → reportsActivity=${row.reportsActivity}, ${row.governs} governs`, async () => {

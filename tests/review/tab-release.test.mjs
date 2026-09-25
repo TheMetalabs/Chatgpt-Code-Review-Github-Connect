@@ -73,7 +73,9 @@ function worker(job, {handler, status = 'awaiting_chat', tab = {id: 10, url: URL
   b.jobs = async () => b.context.workerJobs('http://bridge');
   return b;
 }
-const secured = kind => ({delivered: true, cleanupPending: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}});
+// A secured leg: its answer acknowledged by the server (answerDelivered is the worker's record of the
+// complete ACK, which a fix needs for its proven-success path, #77; a review ignores it).
+const secured = kind => ({delivered: true, cleanupPending: true, answerDelivered: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}});
 
 for (const kind of ['review', 'fix']) {
   test(`${kind}: an abandoned leg whose tab is gone finishes by absence (no closeRequested needed)`, async () => {
@@ -127,9 +129,12 @@ const ABANDONED_AFTER_COLLECT = [
   ['review', 'its answer collected, never ACKed', {outcome: {ok: true, raw, originalText: raw}, ...abandonedAs}],
   ['fix', 'its answer collected, never ACKed', {outcome: {ok: true, raw: ANSWER.fix, originalText: ANSWER.fix}, ...abandonedAs}],
 ];
+// A FIX is the exception to the close (#77): a fix tab is closed only on the proven-success path (its
+// answer delivered), so a cancelled fix leg is stopped and its tab kept whatever its page says.
 for (const [kind, what, state, patch = {}] of ABANDONED_AFTER_COLLECT) {
   for (const verdict of ['owned', 'takenOver']) {
-    test(`${kind}: a cancelled leg with ${what} is stopped, and its tab ${verdict === 'owned' ? 'closed as nobody\'s result' : 'kept'} by the page's verdict`, async () => {
+    const closes = verdict === 'owned' && kind !== 'fix';
+    test(`${kind}: a cancelled leg with ${what} is stopped, and its tab ${closes ? 'closed as nobody\'s result' : 'kept'} ${kind === 'fix' ? `(page: ${verdict}; a fix tab closes only after a delivered answer)` : 'by the page\'s verdict'}`, async () => {
       const page = pageExits(verdict === 'owned' ? owned : {ok: true, releaseProtocol: 1, ownership: 'takenOver', cause: 'user_turn', url: URL_TAB});
       const job = leg(kind, state, {serverStatus: 'cancelled', ...patch});
       const b = worker(job, {status: 'cancelled', handler: page.handler});
@@ -137,9 +142,10 @@ for (const [kind, what, state, patch = {}] of ABANDONED_AFTER_COLLECT) {
       assert.equal(page.stopped, true, 'the cancel exit stopped the page\'s run');
       assert.equal(b.messages.some(m => m.type === 'ashlar-can-close'), false);
       assert.equal(b.pending(), undefined, 'retired');
-      assert.deepEqual(b.closedTabs, verdict === 'owned' ? [10] : []);
+      assert.deepEqual(b.closedTabs, closes ? [10] : []);
       const note = (b.local.state.bridgeRecentRetired || []).find(entry => entry.jobId === job.jobId)?.note;
-      assert.equal(note, verdict === 'owned' ? 'no result wanted; tab closed' : 'the user took over the tab; tab preserved', 'a result never secured is not reported as secured');
+      assert.equal(note, kind === 'fix' ? 'fix ended without a delivered answer (answer delivery unconfirmed); tab preserved'
+        : verdict === 'owned' ? 'no result wanted; tab closed' : 'the user took over the tab; tab preserved', 'a result never secured is not reported as secured');
     });
   }
 }
@@ -181,6 +187,19 @@ for (const kind of ['review', 'fix']) {
       const b = worker(job, {status: 'missing', tab: {id: 10, url: URL_TAB, ...tab},
         handler: (_id, m) => (m.type === 'ashlar-tab-status' ? {ok: true, ownershipProtocol: 1, jobId: job.jobId, runId: 'run-A', provider: 'chatgpt', released: false, url: URL_TAB} : owned)});
       await b.tick();await b.tick();
+      if (kind === 'fix') {
+        // A forgotten fix never reaches a verdict (#77): preserved at once, its page not woken to answer.
+        assert.equal(b.pending(), undefined, 'retired at once');assert.deepEqual(b.closedTabs, []);
+        // (only the inventory's release handshake may reach it once it answers: never a verdict request)
+        assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-can-close' || (m.type === 'ashlar-fix-cancel' && m.preserve !== true)), [], 'never asked for a verdict');
+        assert.equal(b.tabs.get(10).status, tab.status, 'the page is not woken up to answer');
+        assert.ok(uploaded(b).includes('worker:preserve_undelivered') && uploaded(b).includes('worker:tab_preserved'));
+        assert.ok(b.session.state[`ashlar:preserved:${job.jobId}:chatgpt:run-A`], 'the preserved backstop');
+        b.tabs.get(10).status = 'complete';
+        await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+        assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 0, 'the kept binding never holds capacity as an orphan');
+        return;
+      }
       const state = b.pending().states.chatgpt;
       assert.equal(state.cleanupWaitReason, reason, 'the blocker names the tab state, not the stale reason');
       assert.equal(state.workerEvents.filter(e => e.stage === 'cleanup_waiting_page').length, 1, 'one step per reason change');
@@ -213,7 +232,9 @@ const TEMP = 'https://chatgpt.com/?temporary-chat=true';
 const expiresAtOnce = () => ({promise: new Promise((_resolve, reject) => setImmediate(() => reject(new Error('the page did not answer in time')))), cancel() {}});
 for (const kind of ['review', 'fix']) {
   for (const [mode, state, status] of [['secured', secured(kind), 'awaiting_chat'], ['cancelled', {}, 'cancelled']]) {
-    test(`${kind}: a ${mode} leg whose page never answers the release message is preserved after the wait, never held`, async () => {
+    // (A cancelled fix is not waited on: it is preserved at once, #77; its page is still told to stop.)
+    const atOnce = kind === 'fix' && mode === 'cancelled';
+    test(`${kind}: a ${mode} leg whose page never answers the release message is ${atOnce ? 'preserved at once' : 'preserved after the wait'}, never held`, async () => {
       const b = worker(leg(kind, {...state, conversation: TEMP, pageUrl: TEMP}), {status, tab: {id: 10, url: TEMP, status: 'complete'}});
       b.chrome.tabs.sendMessage = (id, msg) => { b.messages.push({id, ...msg}); }; // accepted, never answered
       b.context.pageReplyDeadline = expiresAtOnce;
@@ -222,6 +243,11 @@ for (const kind of ['review', 'fix']) {
       assert.ok(await until(() => settled), 'the tick settles: an unanswered page does not hold the cleanup lane');
       await ticked;
       assert.ok(b.messages.some(m => m.type === (mode === 'secured' ? 'ashlar-can-close' : 'ashlar-fix-cancel')), 'the page was asked');
+      if (atOnce) {
+        assert.equal(b.pending(), undefined, 'retired at once');assert.deepEqual(b.closedTabs, []);
+        assert.ok(uploaded(b).includes('worker:preserve_undelivered') && uploaded(b).includes('worker:tab_preserved'), `${uploaded(b)}`);
+        return;
+      }
       assert.equal(b.pending()?.states.chatgpt.cleanupWaitReason, 'page_unreachable', 'the blocker says why');
       b.later();await b.tick();
       assert.equal(b.pending(), undefined, 'retired after the wait');assert.deepEqual(b.closedTabs, [], 'never closed unproven');
@@ -252,6 +278,18 @@ function reloadSpy(b) {
 }
 for (const kind of ['review', 'fix']) {
   for (const [mode, state, status] of [['secured', {...secured(kind), conversation: TEMP, pageUrl: TEMP}, 'awaiting_chat'], ['cancelled (still waiting to send)', {pageUrl: TEMP}, 'cancelled']]) {
+    if (kind === 'fix' && mode !== 'secured') {
+      // A cancelled fix never reaches a verdict (#77): nothing is woken to answer, and nothing closes.
+      test(`fix: a ${mode} leg whose temporary chat Chrome discarded is preserved at once, never woken`, async () => {
+        const b = worker(leg(kind, state), {status, session: createdHere(kind), tab: discardedTab(TEMP), handler: blankVerdict});
+        const {reloads} = reloadSpy(b);
+        await b.tick();
+        assert.deepEqual(reloads, []);assert.deepEqual(b.closedTabs, []);assert.equal(b.pending(), undefined);
+        assert.deepEqual(b.messages.filter(m => m.type !== 'ashlar-tab-status'), [], 'a discarded page is not asked');
+        assert.ok(uploaded(b).includes('worker:preserve_undelivered'), `${uploaded(b)}`);
+      });
+      continue;
+    }
     test(`${kind}: a ${mode} leg whose temporary chat Chrome discarded is woken once, then closed on its page's verdict`, async () => {
       const b = worker(leg(kind, state), {status, session: createdHere(kind), tab: discardedTab(TEMP), handler: blankVerdict});
       const {reloads, loaded} = reloadSpy(b);
@@ -504,7 +542,7 @@ function replacedDuringLookup(b, tab) {
   };
 }
 for (const kind of ['review', 'fix']) {
-  test(`${kind}: a cancelled leg whose tab Chrome replaced during its cleanup's lookup is not retired as lost; it closes the tab under its new id`, async () => {
+  test(`${kind}: a cancelled leg whose tab Chrome replaced during its cleanup's lookup is not retired as lost; it ${kind === 'fix' ? 'keeps the tab under its new id (a cancelled fix is never closed, #77)' : 'closes the tab under its new id'}`, async () => {
     const b = worker(leg(kind, {pageUrl: TEMP}), {status: 'cancelled', session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: blankVerdict});
     noPageWhileDiscarded(b);
     b.chrome.tabs.reload = async id => { Object.assign(b.tabs.get(id), {discarded: false, status: 'loading'}); };
@@ -515,6 +553,12 @@ for (const kind of ['review', 'fix']) {
     await b.rekeyed;
     assert.equal(b.pending().states.chatgpt.tabId, 11);
     await b.tick();
+    if (kind === 'fix') {
+      assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, [], 'kept, not leaked: its binding is released');
+      assert.ok(b.session.state['ashlar:preserved:fix-A:chatgpt:run-A']?.tabId === 11, 'the preserved backstop names the new id');
+      assert.deepEqual(historyOf(b), ['worker:tab_preserved']);
+      return;
+    }
     b.tabs.get(11).status = 'complete';
     await b.tick();
     assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, [11], 'closed, not leaked');

@@ -238,7 +238,7 @@ test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/
  assert.equal(await pageA.evaluate(()=>window.sends),1);assert.equal(app.reviews.length,1);
 });
 
-test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a superseded fix tab is force-closed',async t=>{
+test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a superseded fix tab is preserved, never closed',async t=>{
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
  const profile=await mkdtemp(join(tmpdir(),'ashlar-fix-e2e-'));
  const proxy=await chatFixtureProxy(html);t.after(()=>proxy.close());
@@ -273,18 +273,29 @@ test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a 
  await eventually(async()=>{await worker.evaluate(()=>tick());return page.isClosed();},'answered fix tab was not closed');
  assert.equal(app.bridge.getBridgePublic().pendingFixes,0);
  assert.equal(app.reviews.length,0);assert.equal(app.harbor.getHarbor().jobs.length,0,'a fix is never a harbor review job');
- // 2) A newer request for the same PR supersedes a still-generating fix: that tab is force-closed.
+ // 2) A newer request for the same PR supersedes a still-generating fix: that tab is PRESERVED (a
+ // fix tab is closed only on the proven-success path), its managed slot released, its leg retired.
  let firstError;
  request(2,'FIX PROMPT A for fixture#2').catch(error=>{firstError=error;});
  let pageA;
  await eventually(async()=>{await worker.evaluate(()=>tick());pageA=chatPages()[0];return pageA&&pageA.evaluate(()=>window.sends===1).catch(()=>false);},'first fix prompt was not submitted');
+ const pending=()=>worker.evaluate(async()=>(await chrome.storage.local.get('pendingReviewJobs')).pendingReviewJobs||{});
+ const jobA=Object.keys(await pending()).find(id=>id.startsWith('fix-'));
+ assert.ok(jobA,'the first fix is a worker job');
  request(2,'FIX PROMPT B for fixture#2').catch(()=>{});
  await eventually(()=>firstError!==undefined,'the older fix was not superseded');
  assert.match(firstError.message,/superseded by a newer request for the same PR/);
- await eventually(async()=>{await worker.evaluate(()=>tick());return pageA.isClosed();},'superseded fix tab was not force-closed');
+ await eventually(async()=>{await worker.evaluate(()=>tick());return !(jobA in await pending());},'the superseded fix leg did not retire');
+ assert.equal(pageA.isClosed(),false,'the superseded fix tab is preserved, never closed');
+ await eventually(()=>worker.evaluate(async id=>{
+  await refreshTabInventory();
+  const report=await tabCapacityReport((await chrome.storage.local.get('pendingReviewJobs')).pendingReviewJobs||{});
+  return report.orphanTabs===0 && !report.blockers.some(blocker=>blocker.jobId===id);
+ },jobA),'the preserved fix tab still holds a managed slot');
  let pageB;
- await eventually(async()=>{await worker.evaluate(()=>tick());pageB=chatPages()[0];return pageB&&pageB.evaluate(()=>window.sends===1).catch(()=>false);},'the newer fix did not start');
+ await eventually(async()=>{await worker.evaluate(()=>tick());pageB=chatPages().find(p=>p!==pageA);return pageB&&pageB.evaluate(()=>window.sends===1).catch(()=>false);},'the newer fix did not start');
  assert.match(await userText(pageB),/FIX PROMPT B for fixture#2/);
+ assert.equal(await pageA.evaluate(()=>window.sends),1,'the preserved tab is never sent anything again');
 });
 
 // ── Tab release (#82) with the real unpacked extension. The worker's own scheduling (its 2.5 s

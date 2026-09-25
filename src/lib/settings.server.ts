@@ -20,7 +20,7 @@ import {
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
-import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixLoopRunnable, fixPairCompatible, settingsProblem, type SettingsIntField } from "./settings-rules.ts";
+import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, storedFixLoopOn, type SettingsIntField } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
 
 function envStr(key: string): string | undefined {
@@ -201,12 +201,14 @@ function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
     provider = null;
     delivery = d.delivery;
   }
-  // Only a literal true enables the loop ("true", 1, … stay off), and only for a configuration the
-  // runtime can execute (fixLoopRunnable — the rule a save enforces): a stored or hand-edited
-  // enabled=true on a non-wired pair (a pre-#77 chat-push save, no provider) loads OFF, which is
-  // what the runtime already did, so the loaded document is one a save accepts and an unrelated
-  // save is never rejected for a switch the operator did not touch.
-  const enabled = p.enabled === true && fixLoopRunnable({ provider, delivery });
+  // The switch is decided on the RAW stored values, never on the normalized ones above
+  // (storedFixLoopOn): only a literal true ("true", 1, … stay off) whose stored provider, delivery
+  // and mode are each valid and together a runnable pair survives. A stored or hand-edited
+  // enabled=true on anything else (a corrupted delivery load would default to script-apply, a
+  // non-wired pair such as a pre-#77 chat-push save or grok, no provider) loads OFF, so
+  // normalization never turns an unsafe configuration into a runnable one, the loaded document is
+  // one a save accepts, and an unrelated save is never rejected for a switch the operator did not touch.
+  const enabled = storedFixLoopOn(p);
   const knobs = Object.fromEntries(
     (Object.keys(FIX_AGENT_KNOBS) as FixAgentKnob[]).map((key) => [key, fixKnob({ [key]: num(p[key], FIX_AGENT_KNOBS[key].def) }, key)]),
   ) as Record<FixAgentKnob, number>;

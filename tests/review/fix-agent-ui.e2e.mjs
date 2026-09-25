@@ -46,7 +46,7 @@ test('Settings UI: the review loop is OFF by default, validated, and saved from 
  assert.equal(await section.getByLabel('fix_agent.provider').inputValue(),'','default: no provider');
  await section.getByText('Loop OFF (default)',{exact:false}).waitFor();
  const provider=section.getByLabel('fix_agent.provider');
- assert.deepEqual(await provider.locator('option').evaluateAll(os=>os.map(o=>o.value)),['','chatgpt','grok','local'],'only wired providers are offered');
+ assert.deepEqual(await provider.locator('option').evaluateAll(os=>os.map(o=>o.value)),['','chatgpt','local'],'only wired providers are offered (grok is not a fix provider)');
  assert.deepEqual(await section.getByLabel('fix_agent.delivery').locator('option').evaluateAll(os=>os.map(o=>o.value)),['script-apply'],'only the wired delivery');
  const save=page.getByRole('button',{name:'Save settings',exact:true});
 
@@ -58,7 +58,7 @@ test('Settings UI: the review loop is OFF by default, validated, and saved from 
 
  // An out-of-range number: refused on the page (the input's own bounds, then the section's check),
  // nothing posted.
- await provider.selectOption('grok');
+ await provider.selectOption('chatgpt');
  const attempts=section.getByLabel('fix_agent.attempts');
  await attempts.fill('9');
  await save.click();
@@ -78,9 +78,9 @@ test('Settings UI: the review loop is OFF by default, validated, and saved from 
  await save.click();
  await page.getByText('Saved',{exact:true}).waitFor();
  assert.equal(posts.length,1);
- assert.deepEqual(posts[0].fixAgent,{enabled:true,provider:'grok',delivery:'script-apply',mode:'apply',parallelPrs:20,roundCap:4,attempts:3,
+ assert.deepEqual(posts[0].fixAgent,{enabled:true,provider:'chatgpt',delivery:'script-apply',mode:'apply',parallelPrs:20,roundCap:4,attempts:3,
   timeoutMs:60*60_000,queueMaxMs:6*60*60_000,chatTimeoutMs:45*60_000,chatMaxPromptChars:100_000});
- await section.getByText('Loop ON: Grok (Chrome bridge) fixes, mode apply.',{exact:true}).waitFor();
+ await section.getByText('Loop ON: ChatGPT (Chrome bridge) fixes, mode apply.',{exact:true}).waitFor();
 
  // A reload shows the saved state; switching OFF is one toggle + save.
  await page.reload();
@@ -88,7 +88,7 @@ test('Settings UI: the review loop is OFF by default, validated, and saved from 
  assert.equal(await section.getByLabel('fix_agent.round_cap').inputValue(),'4');
  await enabled.click();await save.click();await page.getByText('Saved',{exact:true}).waitFor();
  assert.equal(posts.at(-1).fixAgent.enabled,false);
- assert.equal(posts.at(-1).fixAgent.provider,'grok','turning the loop off keeps the chosen provider');
+ assert.equal(posts.at(-1).fixAgent.provider,'chatgpt','turning the loop off keeps the chosen provider');
 });
 
 test('Settings UI: a legacy delivery cannot be switched on, and a server-side save failure is shown, not reported as saved',async t=>{
@@ -138,6 +138,34 @@ test('Settings UI: a legacy delivery cannot be switched on, and a server-side sa
  assert.equal(posts.at(-1).fixAgent.enabled,false);
  await page.reload();
  assert.equal(await section.getByRole('button',{name:'fix_agent.enabled'}).getAttribute('aria-pressed'),'true');
+});
+
+test('Settings UI: grok is not offered as a fix provider; a stored grok stays visible, cannot be switched on, and nothing is posted',async t=>{
+ const context=await browser.newContext();t.after(()=>context.close());
+ // A legacy save {provider: grok, enabled: true} loads OFF (settings.server normalizeFixAgent).
+ const savedFix={enabled:false,provider:'grok',delivery:'script-apply',mode:'apply',parallelPrs:3,roundCap:5,attempts:2,
+  timeoutMs:60*60_000,queueMaxMs:6*60*60_000,chatTimeoutMs:30*60_000,chatMaxPromptChars:100_000};
+ const posts=[];
+ await context.route('https://fix-agent.fixture/**',async route=>{
+  const url=new URL(route.request().url());
+  if(url.pathname==='/')return route.fulfill({contentType:'text/html; charset=utf-8',body:`<div id="root"></div><script>window.savedFix=${JSON.stringify(savedFix)};</script><script>${bundle.replace(/<\/script/gi,'<\\/script')}</script>`});
+  if(url.pathname==='/api/harbor'&&route.request().method()==='POST'){posts.push(route.request().postDataJSON());return route.fulfill({contentType:'application/json',body:'{"ok":true}'});}
+  return route.fulfill({contentType:'application/json',body:'{"ok":true}'});
+ });
+ const page=await context.newPage();page.on('pageerror',error=>console.error('Fix agent UI fixture page error:',error.message));
+ await page.goto('https://fix-agent.fixture/');
+ const section=page.getByRole('region',{name:'Fix agent / review loop'});
+ await section.waitFor();
+ const provider=section.getByLabel('fix_agent.provider');
+ assert.equal(await provider.inputValue(),'grok','the stored value stays visible');
+ assert.deepEqual(await provider.locator('option').evaluateAll(os=>os.map(o=>[o.value,o.disabled])),[['',false],['chatgpt',false],['local',false],['grok',true]]);
+ const enabled=section.getByRole('button',{name:'fix_agent.enabled'});
+ assert.equal(await enabled.getAttribute('aria-pressed'),'false');
+ await enabled.click();
+ await section.getByText('Loop stays OFF: grok is not supported as a fix provider yet: choose chatgpt, local to enable the review loop.',{exact:true}).waitFor();
+ await page.getByRole('button',{name:'Save settings',exact:true}).click();
+ await page.getByText(/^grok is not supported as a fix provider yet: choose chatgpt, local to enable the review loop$/).waitFor();
+ assert.equal(posts.length,0,'rejected on the page: nothing posted');
 });
 
 // One validity domain (settings-rules): the minutes inputs represent every server-valid ms value.

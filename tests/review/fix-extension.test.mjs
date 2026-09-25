@@ -1,6 +1,7 @@
 // Extension handling of review-loop FIX items: the page runner harvests plain text (no review
-// JSON), the worker delivers it via complete, skips every review-JSON lane, and force-closes a
-// cancelled fix tab only with positive page ownership (a cancelled review takes the same exit, #82).
+// JSON), the worker delivers it via complete, skips every review-JSON lane, and closes a fix tab
+// only on the proven-success path (every other end preserves it; a cancelled review is still
+// released by the page's verdict, #82). Review behavior is asserted unchanged.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {webcrypto} from 'node:crypto';
@@ -10,7 +11,9 @@ import {content, background, storage, flush, until, source} from './helpers.mjs'
 const PARTS = ['I guarded the null path.', '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'];
 // A fix is read from the answer's fenced code only (literal text; see assistantCodeBlocks).
 const ANSWER = PARTS[1];
-const URL_FIX = 'https://chatgpt.com/c/fix';
+// ChatGPT's temporary chat: the page every fix tab opens on (background.js providerUrl), whose URL
+// never changes; a fix is proven only there (json.js fixChatPage).
+const URL_FIX = 'https://chatgpt.com/?temporary-chat=true';
 const run = (extra = {}) => ({type: 'ashlar-run', jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', kind: 'fix', prompt: 'FIX PROMPT', ...extra});
 const msg = (type, extra = {}) => ({type, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', kind: 'fix', ...extra});
 
@@ -98,6 +101,11 @@ const COLLECT_VERDICTS = {
   unestablished: {permanent: true, journal: {conversation: undefined}},
   unreadableLocation: {permanent: true, set: c => { c.location = {href: ''}; }},
   turnUnrendered: {permanent: false, set: c => { c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  // round 15: a permanent verdict is decided BEFORE the response must be identified: moved away with
+  // the old DOM gone, or the sent turn replaced (no response binds to it any more)
+  movedUnrendered: {permanent: true, set: c => { c.location = {href: 'https://chatgpt.com/c/users-own'}; c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  replacedUnrendered: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  movedComposerEcho: {permanent: true, set: c => { c.location = {href: 'https://chatgpt.com/c/users-own'}; c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
   composerEcho: {permanent: false, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
 };
 for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
@@ -119,6 +127,23 @@ for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
       assert.match(out.message, /test-only polling guard/, 'still polling');
       assert.notEqual(p.state().slotReleased, true);
     }
+  });
+}
+
+// Round 15 (Ashlar 4100156796) drift guard: the page proves a fix only in json.js fixChatPage();
+// the worker opens every fix tab at background.js providerUrl(provider, reasoning). Today providerUrl
+// ignores the reasoning (never a model slug in the URL), so both are the same page for every value;
+// this pins that, using the URL the worker actually opens, so a future per-reasoning URL cannot
+// silently turn every fix into taken_over.
+const CHATGPT_REASONING = JSON.parse(source('src/lib/reasoning.ts').match(/CHATGPT_REASONING = (\[[^\]]*\])/)[1]);
+for (const reasoning of [...CHATGPT_REASONING, undefined]) {
+  test(`page: an untouched confirmed fix on the tab the worker opens for reasoning ${reasoning} is owned`, async () => {
+    const opened = background().context.providerUrl('chatgpt', reasoning);
+    const p = page();
+    const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: opened};
+    Object.assign(p.c.context, {location: {href: opened}, readSubmissionJournal: async () => journal, savedSubmission: () => journal});
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    assert.equal(p.c.context.fixOwnershipProof(p.state(), {phase: 'collect', journal}).ownership, 'owned', opened);
   });
 }
 
@@ -150,7 +175,7 @@ test('worker: a taken_over page outcome is delivered as a failure at once; the t
 
 test('worker: a delivered fix whose page never proves ownership is preserved after the wait, so its leg ends too', async () => {
   // The item is DONE on the server; only the leg (and its tab slot) could linger forever.
-  const b = worker([fixJob({states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', delivered: true, cleanupPending: true, conversation: URL_FIX, outcome: {ok: true, raw: ANSWER}}}})],
+  const b = worker([fixJob({states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', delivered: true, cleanupPending: true, answerDelivered: true, conversation: URL_FIX, outcome: {ok: true, raw: ANSWER}}}})],
     {api: active, handler: (_id, m) => (m.type === 'ashlar-can-close' ? {ok: true, canClose: false, reason: 'pending', ownership: 'unknown', url: URL_FIX} : {ok: true})});
   await b.tick();
   assert.ok(b.local.state.pendingReviewJobs['fix-A'], 'asked again first');
@@ -180,34 +205,37 @@ test('page: a kind:fix run is routed to the fix collector and harvested as its p
   assert.equal(review.c.message(msg('ashlar-harvest', {jobId: 'job-A', kind: undefined})).ok, false);
 });
 
-test('page: ashlar-fix-cancel needs a positive binding, reports ownership and stops the collector', async () => {
+test('page: ashlar-fix-cancel needs a positive binding; it stops the collector and releases the slot, and authorises nothing (no ownership verdict)', async () => {
   const p = page({limit: 500});
   Object.assign(p.c.context, {stopButtonVisible: () => true, replyDoneVisible: () => false, savedSubmission: () => null});
-  assert.equal(p.c.message(msg('ashlar-fix-cancel')).code, 'job_mismatch', 'an unbound page is never Ashlar-owned');
+  assert.equal(p.c.message(msg('ashlar-fix-cancel')).code, 'job_mismatch', 'an unbound page is never touched');
+  assert.equal(p.c.message(msg('ashlar-fix-cancel', {undispatched: true})).code, 'job_mismatch', 'no page answers for an unbound tab');
   p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');
   p.c.message(run());
   await flush();
   assert.equal(p.c.message(msg('ashlar-fix-cancel', {jobId: 'fix-B'})).code, 'job_mismatch');
   assert.equal(p.c.message(msg('ashlar-fix-cancel', {runId: 'run-B'})).code, 'job_mismatch');
+  assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, false);
   const out = p.c.message(msg('ashlar-fix-cancel'));
-  assert.equal(out.ok, true);assert.equal(out.owned, true, 'nothing sent yet and no user turn: only Ashlar work in the tab');
-  assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, false, 'an owned tab keeps its managed slot until closed');
-  await settled(p.c);
-  assert.equal(p.c.message(msg('ashlar-harvest')).code, 'cancelled');
-  p.state().tabRepurposed = true;
-  assert.equal(p.c.message(msg('ashlar-fix-cancel')).owned, false, 'a tab the user took over is never owned');
+  assert.equal(out.ok, true);assert.equal(out.released, true);
+  for (const key of ['owned', 'ownership', 'blank', 'unsent', 'identity']) assert.equal(key in out, false, `the reply carries no ${key}`);
   assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, 'the preserved tab frees its slot (not counted against capacity)');
+  await settled(p.c);
+  assert.equal(p.c.message(msg('ashlar-harvest')).code, 'cancelled', 'the collector stopped');
 });
 
-test('page: an undispatched fix tab (never bound) answers for itself only when the worker says so', async () => {
+test('page: an undispatched tab (never bound) answers the cancel exit for itself only for a REVIEW, and only when the worker says so; no fix page vouches for an unbound tab', async () => {
   const p = page();
-  assert.equal(p.c.message(msg('ashlar-fix-cancel')).code, 'job_mismatch', 'unbound, no claim: never Ashlar-owned');
-  const out = p.c.message(msg('ashlar-fix-cancel', {undispatched: true}));
-  assert.equal(out.ok, true);assert.equal(out.owned, true, 'a blank chat page with no turn or draft');
+  const review = (extra = {}) => msg('ashlar-fix-cancel', {jobId: 'job-A', kind: undefined, ...extra});
+  assert.equal(p.c.message(review()).code, 'job_mismatch', 'unbound, no claim: never Ashlar-owned');
+  const out = p.c.message(review({undispatched: true}));
+  assert.equal(out.ok, true);assert.equal(out.owned, true, 'a blank chat page with no turn or draft (#82: a cancelled review\'s own tab)');
   assert.ok(!out.jobId && !out.runId, 'the reply carries no binding');
+  // a fix: the worker preserves its undispatched tab and never asks (#77)
+  assert.equal(p.c.message(msg('ashlar-fix-cancel', {undispatched: true})).code, 'job_mismatch', 'a fix page never answers for an unbound tab');
 });
 
-test('page: fix-cancel ownership is "unknown" when it cannot be established yet; only takeover or preserve frees the slot', async () => {
+test('page: a fix page\'s release verdict (can-close) is "unknown" while it cannot be established and frees no slot; the cancel exit always frees it', async () => {
   const p = page({limit: 500});
   Object.assign(p.c.context, {stopButtonVisible: () => true, replyDoneVisible: () => false, savedSubmission: () => null});
   p.c.context.runPrompt = async () => p.c.context.waitUntilReviewOrQuota('ChatGPT');
@@ -216,19 +244,20 @@ test('page: fix-cancel ownership is "unknown" when it cannot be established yet;
   const status = () => p.c.message({type: 'ashlar-tab-status'}).released;
   // the journal is unreadable
   p.c.context.savedSubmission = () => { throw new Error('storage unavailable'); };
-  let out = p.c.message(msg('ashlar-fix-cancel'));
+  let out = p.c.message(msg('ashlar-can-close'));
   assert.equal(out.ownership, 'unknown');assert.equal(out.owned, false);assert.equal(status(), false, 'unknown never frees the slot');
   // sent (its conversation recorded at send), but the bound turn is not rendered yet (reload / hydration)
   Object.assign(p.c.context, {savedSubmission: () => ({phase: 'sent', expected: 'FIX PROMPT', conversation: URL_FIX}), boundReviewResponse: () => ({identified: false, followup: false})});
-  out = p.c.message(msg('ashlar-fix-cancel'));
+  out = p.c.message(msg('ashlar-can-close'));
   assert.equal(out.ownership, 'unknown');assert.equal(out.identity, undefined);assert.equal(status(), false);
-  // the worker gives up identifying it: preserve frees the slot
+  // the worker keeps the tab (preserve): the cancel exit frees the slot and states no verdict
   out = p.c.message(msg('ashlar-fix-cancel', {preserve: true}));
-  assert.equal(out.owned, false);assert.equal(status(), true);
+  assert.equal(out.released, true);assert.equal('owned' in out, false);assert.equal(status(), true);
   await settled(p.c);
+  assert.equal(p.c.message(msg('ashlar-harvest')).code, 'cancelled', 'the collector stopped');
 });
 
-test('page: fix-cancel on a sent journal with no send-time conversation is permanent: "unestablished", slot freed at once', async () => {
+test('page: a fix page\'s release verdict on a sent journal with no send-time conversation is permanent: "unestablished", slot freed at once', async () => {
   // Round 13 (#77): a fix records its conversation only when its send is proven, so a sent journal
   // without one (legacy, or confirmed only after a reload) can never establish it: never owned,
   // never closed (the worker preserves it at once), even before its turn renders. (Rendered rows:
@@ -239,7 +268,7 @@ test('page: fix-cancel on a sent journal with no send-time conversation is perma
   p.c.message(run());
   await flush();
   Object.assign(p.c.context, {savedSubmission: () => ({phase: 'sent', expected: 'FIX PROMPT'}), boundReviewResponse: () => ({identified: false, followup: false})});
-  const out = p.c.message(msg('ashlar-fix-cancel'));
+  const out = p.c.message(msg('ashlar-can-close'));
   assert.deepEqual({ownership: out.ownership, identity: out.identity, owned: out.owned, canClose: out.canClose}, {ownership: 'unknown', identity: 'unestablished', owned: false, canClose: false});
   assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, 'a permanent verdict frees the managed slot');
   await settled(p.c);
@@ -286,43 +315,149 @@ test('worker: fix items skip observation/capture/repair lanes; the same page sta
   assert.ok(review.messages.some(m => m.jobId) && review.messages.every(m => !('kind' in m)), 'review tab messages are unchanged (no kind field)');
 });
 
-test('worker: a cancelled fix is force-closed via ashlar-fix-cancel even while its answer is pending', async () => {
+// ── A fix tab is closed ONLY on the proven-success path (background.js forceCloseFixTab) ───────────
+// Every end of a fix leg × every state its page can be in. The leg's end decides whether the answer
+// was delivered; the page condition decides what the page says when asked (`owned`: the page itself
+// would allow the close, the strongest temptation). The only cell that closes is a delivered answer
+// whose page proves the close (control). Every other cell: the tab is never removed, its managed
+// slot is released (the page is told when it can be messaged, and the worker's preserved-run record
+// keeps the binding out of the capacity count either way) and the job retires.
+const TEMP = URL_FIX;
+const ANSWER_OUTCOME = {ok: true, raw: ANSWER, originalText: ANSWER, completion: {responseId: 'response-A', context: TEMP}};
+const cancelledPing = status => async (_path, body) => body?.action === 'ping'
+  ? {ok: true, active: false, accepted: false, status, bridge: {captureProtocol: 1, localJsonRepairEnabled: false}} : {ok: true, job: null};
+// How each end reaches the worker. The server reports cancelled for a timeout, a supersede and an
+// abort alike (one item state, CANCELLED; the worker cannot tell them apart, and must not need to).
+const FIX_ENDS = {
+  cancelled: {api: cancelledPing('cancelled'), state: {}},
+  superseded: {api: cancelledPing('cancelled'), state: {}},
+  deadline: {api: cancelledPing('cancelled'), state: {}},
+  // a run that failed (quota, a runner error): the failure is delivered, then the tab is preserved
+  failure: {api: active, state: {outcome: {ok: false, code: 'error', error: 'composer unavailable'}}},
+  // a permanent page verdict ended the run (json.js endFixRun): delivered as a failure at once
+  taken_over: {api: active, state: {outcome: {ok: false, code: 'taken_over', error: 'fix run ended: the user took over the fix tab (draft); tab preserved'}}},
+  // the answer was collected but the server rejected it (400): no delivered answer
+  rejected: {api: active, state: {delivered: true, cleanupPending: true, rejectedRaw: ANSWER, outcome: {ok: false, code: 'error', error: 'completed review was rejected: HTTP 400'}}},
+  // the answer was collected, but no acknowledged delivery was recorded (the leg ended by a cancel)
+  lost_delivery_record: {api: cancelledPing('cancelled'), state: {delivered: true, cleanupPending: true, conversation: TEMP, outcome: ANSWER_OUTCOME}},
+};
+const DELIVERED = {api: active, state: {delivered: true, cleanupPending: true, answerDelivered: true, conversation: TEMP, outcome: ANSWER_OUTCOME}};
+const PAGE_CONDITIONS = {
+  owned: {reply: {ok: true, owned: true, ownership: 'owned', canClose: true, reason: 'complete', url: TEMP, conversation: TEMP, released: true}},
+  taken_over: {reply: {ok: true, owned: false, ownership: 'takenOver', canClose: false, reason: 'repurposed', url: TEMP, conversation: TEMP}},
+  unknown_ownership: {reply: {ok: true, owned: false, ownership: 'unknown', canClose: false, reason: 'pending', url: TEMP, conversation: TEMP}},
+  other_binding: {reply: {ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B', provider: 'chatgpt'}, other: true},
+  unreachable: {reply: null},
+  loading: {reply: {ok: true, owned: true, ownership: 'owned', canClose: true, reason: 'complete', url: TEMP, conversation: TEMP}, loading: true},
+};
+async function fixEnd(end, condition) {
+  const page = PAGE_CONDITIONS[condition];
+  const binding = page.other ? {jobId: 'job-B', runId: 'run-B'} : {jobId: 'fix-A', runId: 'run-A'};
+  const tabStatus = {ok: true, ownershipProtocol: 1, ...binding, provider: 'chatgpt', released: false, url: TEMP};
+  const b = worker([fixJob({states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', ...end.state}}})],
+    {api: end.api, url: TEMP, status: page.loading ? 'loading' : 'complete', handler: (_id, m) => (m.type === 'ashlar-tab-status' ? tabStatus : page.reply)});
+  const chrome = b.context.chrome;
+  if (!page.reply) {
+    // No receiver for any job message, and reinjection fails too (the inventory probe still answers later).
+    const send = chrome.tabs.sendMessage;
+    chrome.tabs.sendMessage = (id, msg, cb) => {
+      if (msg.type === 'ashlar-tab-status') return send(id, msg, cb);
+      b.messages.push({id, ...msg});
+      chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'};cb();chrome.runtime.lastError = null;
+    };
+    chrome.scripting.executeScript = async () => { throw new Error('Cannot access contents of the page'); };
+  }
+  await b.tick();
+  const RealDate = b.context.Date || Date;
+  const later = RealDate.now() + 3 * 60_000; // past the success path's bounded re-ask
+  b.context.Date = class extends RealDate { static now() { return later; } };
+  await b.tick();
+  const releaseSent = b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true && m.jobId === 'fix-A');
+  // the page finishes loading later and still reports its binding unreleased (it never handled a release)
+  if (b.tabs.has(10)) b.tabs.get(10).status = 'complete';
+  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  const report = await b.context.tabCapacityReport({});
+  return {
+    closed: b.closedTabs.length, tabOpen: b.tabs.has(10), retired: !b.local.state.pendingReviewJobs['fix-A'],
+    // released: the worker's preserved-run record (and, for a messageable page, the release message)
+    // keeps this run's binding out of the capacity count; another binding keeps counting as its own
+    preservedRecord: Boolean(b.session.state['ashlar:preserved:fix-A:chatgpt:run-A']),
+    releaseSent,
+    counted: page.other ? report.orphanTabs : report.orphanTabs + report.managedTabs,
+  };
+}
+for (const [endName, end] of Object.entries({...FIX_ENDS, delivered: DELIVERED})) {
+  for (const condition of Object.keys(PAGE_CONDITIONS)) {
+    const control = endName === 'delivered' && condition === 'owned';
+    test(`fix end ${endName} × page ${condition}: ${control ? 'the proven-success path closes the tab (control)' : 'never closed; slot released; job retired'}`, async () => {
+      const got = await fixEnd(end, condition);
+      const page = PAGE_CONDITIONS[condition];
+      assert.deepEqual(got, control
+        ? {closed: 1, tabOpen: false, retired: true, preservedRecord: false, releaseSent: false, counted: 0}
+        : {closed: 0, tabOpen: true, retired: true, preservedRecord: true,
+          // a loading tab is never messaged, and another binding is never asked to release by the success path
+          releaseSent: !page.loading && !(endName === 'delivered' && (page.other || !page.reply)),
+          counted: page.other ? 1 : 0});
+    });
+  }
+}
+
+// ── The same cancelled ends for both kinds (#82 rows, restated): a cancelled REVIEW is stopped and
+// released by its page's verdict (closed unless the user took it over; asked again, then preserved,
+// while ownership cannot be proven); a cancelled FIX never reaches a verdict (the table above): it is
+// preserved at once, its run stopped and its slot released.
+const legOf = (kind, patch = {}) => fixJob(kind === 'fix' ? patch : {jobId: 'job-A', kind: undefined, ...patch});
+const legJobId = kind => (kind === 'fix' ? 'fix-A' : 'job-A');
+const pastOwnershipWait = b => { const RealDate = b.context.Date || Date; const at = RealDate.now() + 3 * 60_000; b.context.Date = class extends RealDate { static now() { return at; } }; };
+
+test('worker: a cancelled leg while its answer is pending: a review is closed by its cancel exit\'s verdict (#82); a fix is preserved at once, its run stopped and its slot released (#77)', async () => {
   const handler = (_id, m) => m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, url: URL_FIX, conversation: URL_FIX} : {ok: true, canClose: false, reason: 'pending'};
   const b = worker([fixJob()], {api: cancelled, handler});
   await b.tick();
-  assert.deepEqual(b.closedTabs, [10]);assert.deepEqual(b.local.state.pendingReviewJobs, {});
-  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.jobId === 'fix-A' && m.runId === 'run-A'));
+  assert.deepEqual(b.closedTabs, []);assert.deepEqual(b.local.state.pendingReviewJobs, {});
+  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true && m.jobId === 'fix-A' && m.runId === 'run-A'), 'the fix page is told to stop and release');
   assert.equal(b.calls.some(c => c.action === 'complete' || c.action === 'failure'), false);
-  // A cancelled REVIEW has no use for its tab either (#82): the same cancel exit closes it.
-  const review = worker([fixJob({jobId: 'job-A', kind: undefined})], {api: cancelled, handler});
+  // A cancelled REVIEW has no use for its tab either (#82): the cancel exit stops it and its verdict closes it.
+  const review = worker([legOf('review')], {api: cancelled, handler});
   await review.tick();
   assert.deepEqual(review.closedTabs, [10]);assert.deepEqual(review.local.state.pendingReviewJobs, {});
-  assert.ok(review.messages.some(m => m.type === 'ashlar-fix-cancel' && m.jobId === 'job-A'));
+  assert.ok(review.messages.some(m => m.type === 'ashlar-fix-cancel' && m.jobId === 'job-A' && m.preserve !== true));
 });
 
-test('worker: an unknown ownership is asked again, then the tab is preserved (slot freed) after the wait', async () => {
-  const b = worker([fixJob()], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', url: URL_FIX} : {ok: true})});
-  await b.tick();
-  assert.equal(b.closedTabs.length, 0);
-  const pending = b.local.state.pendingReviewJobs['fix-A'];
-  assert.ok(pending, 'not retired while ownership is unknown');
-  assert.equal(typeof pending.states.chatgpt.ownershipUnknownAt, 'number');
-  assert.equal(b.messages.some(m => m.preserve), false);
-  const RealDate = b.context.Date || Date;
-  const later = RealDate.now() + 3 * 60_000; // the wait has passed
-  b.context.Date = class extends RealDate { static now() { return later; } };
-  await b.tick();
-  assert.equal(b.closedTabs.length, 0, 'never closed on a guess');assert.ok(b.tabs.has(10));
-  assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
-  assert.deepEqual(b.local.state.pendingReviewJobs, {});
+test('worker: a cancelled REVIEW with a pending page keeps its tab within the bounded ownership wait (its run stopped by the cancel exit, #82), then preserves it', async () => {
+  const handler = () => ({ok: true, canClose: false, reason: 'pending', url: URL_FIX});
+  const review = worker([legOf('review')], {api: cancelled, handler});
+  await review.tick();
+  assert.equal(review.closedTabs.length, 0);assert.ok(review.local.state.pendingReviewJobs['job-A']);
+  assert.ok(review.messages.some(m => m.type === 'ashlar-fix-cancel' && m.jobId === 'job-A'), 'the cancel exit stops the run');
+  pastOwnershipWait(review);await review.tick();
+  assert.equal(review.closedTabs.length, 0);assert.deepEqual(review.local.state.pendingReviewJobs, {}, 'preserved after the wait, never held');
 });
 
-test('worker: a cancelled fix whose run was never sent closes its blank tab and retires', async () => {
-  const OPENED = 'https://chatgpt.com/?temporary-chat=true'; // providerUrl: the page a fix tab opens on
+for (const kind of ['review', 'fix']) {
+  test(`worker (${kind}): a cancelled leg whose page cannot prove ownership ${kind === 'fix' ? 'is preserved at once (nothing can close a cancelled fix, so nothing waits)' : 'is asked again, then preserved (slot freed) after the wait'}`, async () => {
+    const b = worker([legOf(kind)], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-fix-cancel' ? {ok: true, owned: false, ownership: 'unknown', url: URL_FIX} : {ok: true})});
+    await b.tick();
+    assert.equal(b.closedTabs.length, 0);
+    if (kind === 'review') {
+      const pending = b.local.state.pendingReviewJobs['job-A'];
+      assert.ok(pending, 'not retired while ownership is unknown');
+      assert.equal(typeof pending.states.chatgpt.ownershipUnknownAt, 'number');
+      assert.equal(b.messages.some(m => m.preserve), false);
+      pastOwnershipWait(b);await b.tick();
+    }
+    assert.equal(b.closedTabs.length, 0, 'never closed on a guess');assert.ok(b.tabs.has(10));
+    assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
+    assert.deepEqual(b.local.state.pendingReviewJobs, {});
+  });
+}
+
+test('worker: a cancelled REVIEW whose run was never sent closes its blank tab (the one this browser session created) and retires (#82); a fix never claims it (below)', async () => {
+  const OPENED = 'https://chatgpt.com/?temporary-chat=true'; // providerUrl: the page every tab opens on
   const blank = (url) => (_id, m) => (m.type === 'ashlar-fix-cancel' && m.undispatched ? {ok: true, owned: true, ownership: 'owned', url, jobId: '', runId: '', provider: 'chatgpt'} : {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'});
-  const unsent = () => [fixJob({states: {chatgpt: {tabId: 10, started: false, runId: 'run-A'}}})];
+  const unsent = () => [legOf('review', {states: {chatgpt: {tabId: 10, started: false, runId: 'run-A'}}})];
   // this browser session created tab 10 for the leg (allocateProviderTab's record)
-  const session = () => storage({'ashlar:tab:10': {jobId: 'fix-A', provider: 'chatgpt', runId: 'run-A', closedKey: 'ashlar:closed:fix-A:chatgpt:run-A', closing: false}});
+  const session = () => storage({'ashlar:tab:10': {jobId: 'job-A', provider: 'chatgpt', runId: 'run-A', closedKey: 'ashlar:closed:job-A:chatgpt:run-A', closing: false}});
   const b = worker(unsent(), {api: cancelled, handler: blank(OPENED), url: OPENED, session: session()});
   await b.tick();
   assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.undispatched === true));
@@ -340,97 +475,114 @@ test('worker: a cancelled fix whose run was never sent closes its blank tab and 
   const hashed = worker(unsent(), {api: cancelled, handler: blank(`${OPENED}#x`), url: `${OPENED}#x`, session: session()});
   await hashed.tick();
   assert.deepEqual(hashed.closedTabs, [10]);
-  const handler = blank(OPENED);
   // a started run never takes the undispatched path
-  const started = worker([fixJob()], {api: cancelled, handler});
+  const started = worker([legOf('review')], {api: cancelled, handler: blank(OPENED)});
   await started.tick();
   assert.equal(started.messages.some(m => m.undispatched), false);assert.equal(started.closedTabs.length, 0);
 });
 
-test('worker: a started fix whose page is owned only by being blank must still be on its allocation page', async () => {
+test('worker: a started cancelled REVIEW whose page is owned only by being blank must still be on its allocation page (#82); the same fix page is preserved (#77)', async () => {
   const OPENED = 'https://chatgpt.com/?temporary-chat=true';
   // the run was dispatched (started) but its send is not confirmed: the page answers owned+blank
   const blank = (url) => (_id, m) => (m.type === 'ashlar-fix-cancel' ? {ok: true, owned: true, ownership: 'owned', blank: true, url} : {ok: true, canClose: false, reason: 'pending'});
   let inventory = null; // what the page reports to the inventory probe
   const movedHandler = (id, m) => (m.type === 'ashlar-tab-status' && inventory ? inventory : blank('https://chatgpt.com/c/other')(id, m));
-  const moved = worker([fixJob()], {api: cancelled, handler: movedHandler, url: 'https://chatgpt.com/c/other'});
+  const moved = worker([legOf('review')], {api: cancelled, handler: movedHandler, url: 'https://chatgpt.com/c/other'});
   await moved.tick();
   assert.equal(moved.closedTabs.length, 0, 'an empty conversation the user moved to is preserved');
   assert.deepEqual(moved.local.state.pendingReviewJobs, {}, 'the job still retires');
   assert.ok(moved.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), 'the page is told to free its slot');
   // the page still reports its binding unreleased (it never handled the preserve): not an orphan
-  inventory = {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: 'https://chatgpt.com/c/other'};
+  inventory = {ok: true, ownershipProtocol: 1, jobId: 'job-A', runId: 'run-A', provider: 'chatgpt', released: false, url: 'https://chatgpt.com/c/other'};
   await moved.context.refreshTabInventory();await until(() => false, 200);
   assert.equal((await moved.context.tabCapacityReport({})).orphanTabs, 0, 'the preserved run is released worker-side');
   // the query is not the page (origin + path, #82): a plain "/" is the temporary chat's page too
-  const plain = worker([fixJob()], {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/'});
+  const plain = worker([legOf('review')], {api: cancelled, handler: blank('https://chatgpt.com/'), url: 'https://chatgpt.com/'});
   await plain.tick();
   assert.deepEqual(plain.closedTabs, [10]);
-  const home = worker([fixJob()], {api: cancelled, handler: blank(OPENED), url: OPENED});
+  const home = worker([legOf('review')], {api: cancelled, handler: blank(OPENED), url: OPENED});
   await home.tick();
-  assert.deepEqual(home.closedTabs, [10], 'still the page the fix opened: closed');
+  assert.deepEqual(home.closedTabs, [10], 'still the page the review opened: closed');
+  const fix = worker([fixJob()], {api: cancelled, handler: blank(OPENED), url: OPENED});
+  await fix.tick();
+  assert.deepEqual(fix.closedTabs, [], 'a cancelled fix is never closed, even on its own blank page');
+  assert.deepEqual(fix.local.state.pendingReviewJobs, {});
 });
 
-test('worker: a cancelled fix tab stuck loading is preserved after the wait (never closed unproven)', async () => {
-  let status = null; // what the page reports to the inventory probe once it answers
-  const b = worker([fixJob()], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-tab-status' && status ? status : {ok: true, owned: true, url: URL_FIX}), status: 'loading'});
-  await b.tick();
-  assert.equal(b.closedTabs.length, 0);assert.ok(b.local.state.pendingReviewJobs['fix-A'], 'waits while loading');
-  assert.equal(b.messages.some(m => m.type === 'ashlar-fix-cancel'), false, 'a loading page is not asked');
-  const RealDate = b.context.Date || Date;
-  const later = RealDate.now() + 3 * 60_000;
-  b.context.Date = class extends RealDate { static now() { return later; } };
-  await b.tick();
-  assert.equal(b.closedTabs.length, 0);assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'retired, capacity released');
-  // the page finishes loading later and still reports its unreleased binding: not an orphan
-  b.tabs.get(10).status = 'complete';
-  status = {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: URL_FIX};
-  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
-  const report = await b.context.tabCapacityReport({});
-  assert.equal(report.orphanTabs, 0, 'the preserved run is released worker-side');
-});
+for (const kind of ['review', 'fix']) {
+  test(`worker (${kind}): a cancelled tab stuck loading is ${kind === 'fix' ? 'preserved at once' : 'preserved after the wait'} (never closed unproven)`, async () => {
+    let status = null; // what the page reports to the inventory probe once it answers
+    const b = worker([legOf(kind)], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-tab-status' && status ? status : {ok: true, owned: true, url: URL_FIX}), status: 'loading'});
+    await b.tick();
+    assert.equal(b.closedTabs.length, 0);
+    assert.equal(b.messages.some(m => m.type === 'ashlar-fix-cancel'), false, 'a loading page is not asked');
+    if (kind === 'review') {
+      assert.ok(b.local.state.pendingReviewJobs['job-A'], 'waits while loading');
+      pastOwnershipWait(b);await b.tick();
+    }
+    assert.equal(b.closedTabs.length, 0);assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'retired, capacity released');
+    // the page finishes loading later and still reports its unreleased binding: not an orphan
+    b.tabs.get(10).status = 'complete';
+    status = {ok: true, ownershipProtocol: 1, jobId: legJobId(kind), runId: 'run-A', provider: 'chatgpt', released: false, url: URL_FIX};
+    await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+    const report = await b.context.tabCapacityReport({});
+    assert.equal(report.orphanTabs, 0, 'the preserved run is released worker-side');
+  });
 
-test('worker: a loaded cancelled fix tab that cannot be messaged is preserved after the wait, and the job retires', async () => {
-  let status = null; // what the page reports to the inventory probe once it answers
-  const b = worker([fixJob()], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-tab-status' && status ? status : {ok: true, owned: true, url: URL_FIX})});
-  const chrome = b.context.chrome;
-  const send = chrome.tabs.sendMessage;
-  // No receiver for the cancel, and reinjection fails too.
-  chrome.tabs.sendMessage = (id, msg, cb) => {
-    if (msg.type !== 'ashlar-fix-cancel') return send(id, msg, cb);
-    b.messages.push({id, ...msg});
-    chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'};cb();chrome.runtime.lastError = null;
-  };
-  chrome.scripting.executeScript = async () => { throw new Error('Cannot access contents of the page'); };
-  await b.tick();
-  assert.equal(b.closedTabs.length, 0);
-  const pending = b.local.state.pendingReviewJobs['fix-A'];
-  assert.ok(pending, 'waits while the page cannot answer');
-  assert.equal(typeof pending.states.chatgpt.ownershipUnknownAt, 'number');
-  const RealDate = b.context.Date || Date;
-  const later = RealDate.now() + 3 * 60_000;
-  b.context.Date = class extends RealDate { static now() { return later; } };
-  await b.tick();
-  assert.equal(b.closedTabs.length, 0, 'never closed unproven');assert.ok(b.tabs.has(10));
-  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'retired, capacity released');
-  assert.equal(b.messages.some(m => m.preserve === true), false, 'an unreachable page is not messaged to preserve');
-  status = {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: 'run-A', provider: 'chatgpt', released: false, url: URL_FIX};
-  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
-  assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 0, 'the preserved run is released worker-side');
-});
+  test(`worker (${kind}): a loaded cancelled tab that cannot be messaged is ${kind === 'fix' ? 'preserved at once' : 'preserved after the wait'}, and the job retires`, async () => {
+    let status = null; // what the page reports to the inventory probe once it answers
+    const b = worker([legOf(kind)], {api: cancelled, handler: (_id, m) => (m.type === 'ashlar-tab-status' && status ? status : {ok: true, owned: true, url: URL_FIX})});
+    const chrome = b.context.chrome;
+    const send = chrome.tabs.sendMessage;
+    // No receiver for the cancel, and reinjection fails too.
+    chrome.tabs.sendMessage = (id, msg, cb) => {
+      if (msg.type !== 'ashlar-fix-cancel') return send(id, msg, cb);
+      b.messages.push({id, ...msg});
+      chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'};cb();chrome.runtime.lastError = null;
+    };
+    chrome.scripting.executeScript = async () => { throw new Error('Cannot access contents of the page'); };
+    await b.tick();
+    assert.equal(b.closedTabs.length, 0);
+    if (kind === 'review') {
+      const pending = b.local.state.pendingReviewJobs['job-A'];
+      assert.ok(pending, 'waits while the page cannot answer');
+      assert.equal(typeof pending.states.chatgpt.ownershipUnknownAt, 'number');
+      pastOwnershipWait(b);await b.tick();
+      assert.equal(b.messages.some(m => m.preserve === true), false, 'a page that never answered is not messaged to preserve');
+    } else {
+      // a cancelled fix is released without asking for a verdict: the release is attempted once, and its failure ignored
+      assert.ok(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true));
+    }
+    assert.equal(b.closedTabs.length, 0, 'never closed unproven');assert.ok(b.tabs.has(10));
+    assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'retired, capacity released');
+    status = {ok: true, ownershipProtocol: 1, jobId: legJobId(kind), runId: 'run-A', provider: 'chatgpt', released: false, url: URL_FIX};
+    await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+    assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 0, 'the preserved run is released worker-side');
+  });
 
-test('worker: a cancelled fix tab the user took over is preserved, never closed', async () => {
-  const b = worker([fixJob()], {api: cancelled, handler: () => ({ok: true, owned: false, url: URL_FIX})});
-  await b.tick();
-  assert.equal(b.closedTabs.length, 0);assert.ok(b.tabs.has(10));
-  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the slot is released without closing the tab');
-});
+  test(`worker (${kind}): a cancelled tab the user took over is preserved, never closed`, async () => {
+    const b = worker([legOf(kind)], {api: cancelled, handler: () => ({ok: true, owned: false, url: URL_FIX})});
+    await b.tick();
+    assert.equal(b.closedTabs.length, 0);assert.ok(b.tabs.has(10));
+    assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the slot is released without closing the tab');
+  });
 
-test('worker: a cancelled fix tab without a matching page binding is never closed', async () => {
-  const b = worker([fixJob()], {api: cancelled, handler: () => ({ok: false, code: 'job_mismatch', jobId: 'fix-B'})});
+  test(`worker (${kind}): a cancelled tab without a matching page binding is never closed${kind === 'fix' ? ' (the fix leg retires at once)' : ' (asked again first)'}`, async () => {
+    const b = worker([legOf(kind)], {api: cancelled, handler: () => ({ok: false, code: 'job_mismatch', jobId: 'job-B'})});
+    await b.tick();
+    assert.equal(b.closedTabs.length, 0);
+    if (kind === 'review') assert.match(b.local.state.pendingReviewJobs['job-A'].states.chatgpt.cleanupError, /ownership does not match/);
+    else assert.deepEqual(b.local.state.pendingReviewJobs, {});
+  });
+}
+
+test('worker: a cancelled fix whose run was never dispatched keeps its (blank) tab: preserved, never closed, the job retires', async () => {
+  const b = worker([fixJob({states: {chatgpt: {tabId: 10, started: false, runId: 'run-A'}}})],
+    {api: cancelled, url: TEMP, handler: () => ({ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'})});
   await b.tick();
-  assert.equal(b.closedTabs.length, 0);
-  assert.match(b.local.state.pendingReviewJobs['fix-A'].states.chatgpt.cleanupError, /ownership does not match/);
+  assert.deepEqual(b.closedTabs, []);assert.ok(b.tabs.has(10));
+  assert.deepEqual(b.local.state.pendingReviewJobs, {});
+  assert.equal(b.messages.some(m => 'undispatched' in m), false, 'no page is ever asked to vouch for an unbound tab');
 });
 
 test('worker: take opts into fix items, and a kind:fix payload runs with its kind and prompt', async () => {
@@ -445,6 +597,22 @@ test('worker: take opts into fix items, and a kind:fix payload runs with its kin
   const started = b.messages.find(m => m.type === 'ashlar-run');
   assert.equal(started.kind, 'fix');assert.equal(started.jobId, 'fix-A');assert.equal(started.prompt, 'FIX PROMPT');
   assert.equal(b.local.state.pendingReviewJobs['fix-A'].kind, 'fix');
+  // the fix tab opens on ChatGPT's temporary chat, the only page a fix can be proven in
+  assert.deepEqual([...b.tabs.values()].map(tab => tab.url), [URL_FIX]);
+});
+
+test('page: a fix whose send-time conversation is not the temporary chat is never collected: its run ends (taken_over)', async () => {
+  for (const where of ['https://chatgpt.com/c/fix', 'https://chatgpt.com/', 'https://chatgpt.com/?temporary-chat=false']) {
+    const p = page();
+    // the page shows exactly the conversation the send was proven in, but it is not the temporary chat
+    p.c.context.location = {href: where};
+    const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: where};
+    Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    await assert.rejects(p.c.context.waitUntilFixOrQuota('ChatGPT'), error => error.code === 'taken_over' && /cannot be identified/.test(error.message), where);
+    assert.equal(p.state().nativeCompletion, undefined, `${where}: nothing collected`);
+    assert.equal(p.c.message({type: 'ashlar-tab-status'}).released, true, `${where}: the slot is freed`);
+  }
 });
 
 // Review round 11 (4096523047): the server hands a claimed, run-less fix to its own profile again
@@ -483,6 +651,66 @@ test('worker: overlapping admission triggers never create two tabs for one fix j
   await deaf.tick();
   assert.equal(b.tabs.size, 1);assert.equal(runs(deaf).length, 0);
   assert.equal(deaf.local.state.pendingReviewJobs['fix-A'], undefined, 'the duplicate delivery is not admitted');
+});
+
+// Ashlar 4099509094, over the REAL fix registry: only take / recover hand out a delivery. A released,
+// unpinned item is never claimed back (409 take_required, nothing minted); the next take hands the
+// worker D2 in its offer, the worker journals it before opening the tab, and a lost registry plus the
+// server's replay of D2 still opens at most one tab (one prompt) for D2.
+test('worker + real registry: release before progress, a refused claim, D2 by take; registry loss + replay opens one tab for D2', async () => {
+  const {createFixRegistry} = await import('../../src/lib/bridge-fix.server.ts');
+  let ids = 0;
+  const reg = createFixRegistry({now: () => 1_000_000, newId: () => `n${++ids}`, parallelLimit: () => 2, reasoning: () => ({chatgpt: 'pro', grok: 'heavy'}),
+    timeoutMs: () => 30 * 60_000, maxPromptChars: () => 100_000, claimMs: 5 * 60_000, submitWindowMs: 60_000, setTimer: () => 0, clearTimer() {}});
+  reg.request({owner: 'o', repo: 'r', pr: 1, provider: 'chatgpt', prompt: 'FIX PROMPT'}).catch(() => {});
+  const id = reg.peek().id;
+  const d1 = reg.take(id, 'chrome-1');
+  assert.equal(reg.release(id, d1.leaseId), true, 'an older worker released it before any progress');
+  assert.equal(reg.claim(id, 'chrome-1').code, 'take_required');
+  assert.equal(reg.snapshot(id).deliveryId, d1.deliveryId, 'the refused claim minted nothing');
+  const offers = [];
+  // The /api/bridge route over that registry, for profile chrome-1 (`honourExclude` false: a server
+  // that replays whatever the worker lists).
+  const serve = ({honourExclude = true} = {}) => async (_path, body) => {
+    if (body?.action === 'take') {
+      const next = reg.peek(honourExclude ? body.excludeJobIds : [], 'chrome-1');
+      const offer = next ? reg.take(next.id, 'chrome-1') : null;
+      if (offer) offers.push(offer);
+      return {ok: true, job: offer};
+    }
+    if (body?.action === 'claim') {
+      const out = reg.claim(body.jobId, 'chrome-1');
+      if (!out.ok) throw Object.assign(new Error(`HTTP 409 ${out.code}`), {status: 409, code: out.code});
+      return out;
+    }
+    if (body?.action === 'ping') {
+      const accepted = reg.refresh(body.jobId, body.leaseId, body.generating);
+      return {ok: true, accepted, ...reg.state(body.jobId), bridge: {captureProtocol: 1, localJsonRepairEnabled: false}};
+    }
+    return {ok: true, job: null};
+  };
+  const handler = () => ({ok: false, code: 'busy', retry: true});
+  const b = background({api: serve(), handler});
+  b.context.crypto = webcrypto;b.context.TextEncoder = TextEncoder;
+  await b.tick();await b.tick();
+  assert.equal(offers.length, 1);
+  assert.deepEqual([offers[0].offerKind, offers[0].deliveryId !== d1.deliveryId], ['fresh', true], 'the take handed out D2');
+  const d2 = offers[0].deliveryId;
+  assert.equal(b.tabs.size, 1, 'one tab for D2');
+  assert.equal(b.local.state['ashlar:fixDeliveries'][id]?.deliveryId, d2, 'the worker journaled D2 from the take offer');
+  const runs = w => w.messages.filter(m => m.type === 'ashlar-run' && m.jobId === id && !m.resume);
+  assert.equal(runs(b).length, 1, 'the prompt was sent once');
+  // The job registry is lost (hard reset), the tab keeps the run; the server replays D2 (T3: the
+  // worker does not list it), and a server that ignores the list offers it anyway.
+  for (const honourExclude of [true, false]) {
+    await b.local.set({pendingReviewJobs: {}});
+    const reloaded = background({local: b.local, session: b.session, tabs: b.tabs, api: serve({honourExclude}), handler});
+    reloaded.context.crypto = webcrypto;reloaded.context.TextEncoder = TextEncoder;
+    await reloaded.tick();await reloaded.tick();
+    assert.equal(b.tabs.size, 1, `no second tab for D2 (server ${honourExclude ? 'honours' : 'ignores'} the list)`);
+    assert.equal(runs(reloaded).length, 0, 'the prompt is never submitted again');
+  }
+  assert.ok(offers.slice(1).every(offer => offer.deliveryId === d2 && offer.offerKind === 'replay'), 'every later offer is the same delivery D2 (replay)');
 });
 
 // Round 12 (Ashlar 4097631112): the delivery record is two-phase. `creating` (the intent) is written
@@ -614,7 +842,100 @@ test('worker: after an extension reload (session cleared, same tab ids) a create
   assert.equal(b.local.state[DELIVERIES]['fix-A']?.tabId, 10);
 });
 
-test('worker: a cancelled fix tab that now carries another binding retires after the wait, leaving that binding untouched', async () => {
+// Round 15 (Ashlar 4100156779): the delivery record says `created` BEFORE state.tabId is durably
+// saved (allocateProviderTab promotes, then saves). A worker that stops in between leaves
+// `allocating` with no tabId and a `created` record. The record is validated, never trusted: its
+// tab still open in this browser session (or the page the inventory binds to this run) is restored
+// and the run continues in it; a recorded tab that is gone (and no owned record, no bound page) is
+// proven absent: the stale record is dropped and exactly one replacement is allocated, instead of
+// waiting on "tab creation outcome unknown" until the fix deadline.
+/** A page that has not been sent a run is bound to no job; once run, it is busy generating. */
+const UNBOUND_UNTIL_RUN = () => { const bound = new Set();
+  return (id, m) => { if (m.type === 'ashlar-run') bound.add(id);
+    return bound.has(id) ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle', jobId: '', runId: ''}; }; };
+const STOPPED = () => fixJob({deliveryId: 'delivery-1', states: {chatgpt: {runId: 'run-A', allocating: true}}});
+const CREATED = (tabId, session = 'boot-1') => ({deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'created', tabId, session, runId: 'run-A', at: Date.now()});
+for (const row of [
+  {name: 'its recorded tab is gone', tabs: [], record: CREATED(77), want: {tabs: 1, runs: 1, restored: false}},
+  {name: 'its recorded tab was recorded in an earlier browser session (the ID now names another tab)', tabs: [[77, {id: 77, url: URL_FIX, status: 'complete'}]],
+    record: CREATED(77, 'boot-0'), want: {tabs: 2, runs: 1, restored: false}},
+  {name: 'its recorded tab is still open (control)', tabs: [[77, {id: 77, url: URL_FIX, status: 'complete'}]], record: CREATED(77), want: {tabs: 1, runs: 1, restored: true}},
+]) {
+  test(`worker: a stop after the delivery was promoted, before its tabId was saved, and ${row.name}: ${row.want.restored ? 'resumed in that tab, no second tab' : 'exactly one replacement tab'}`, async () => {
+    const tabs = new Map(row.tabs);
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': STOPPED()}, [DELIVERIES]: {'fix-A': row.record}}),
+      // an undispatched tab's page carries no binding: it answers a harvest for no job
+      session: storage({'ashlar:browserSession': 'boot-1'}), tabs, api: active, handler: UNBOUND_UNTIL_RUN()});
+    b.context.crypto = webcrypto;
+    await b.tick();await b.tick();await b.tick();
+    const state = b.local.state.pendingReviewJobs['fix-A'].states.chatgpt;
+    const runs = runsOf(b);
+    assert.deepEqual({tabs: tabs.size, runs: runs.length, restored: runs[0]?.id === 77}, row.want);
+    assert.equal(state.connectionError, undefined, 'never "tab creation outcome unknown"');
+    assert.equal(state.allocating, undefined);
+    assert.equal(state.tabId, runs[0].id, 'the run continues in the tab it was dispatched to');
+    const record = b.local.state[DELIVERIES]['fix-A'];
+    assert.deepEqual({phase: record.phase, tabId: record.tabId, session: record.session}, {phase: 'created', tabId: state.tabId, session: 'boot-1'});
+    assert.ok(b.session.state[`ashlar:tab:${state.tabId}`]?.runId === 'run-A', 'the tab carries its owned record');
+  });
+}
+
+test('worker: a promoted fix delivery whose tab the user explicitly closed before its tabId was saved ends the run (tab_closed), no replacement', async () => {
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': STOPPED()}, [DELIVERIES]: {'fix-A': CREATED(77)}}),
+    session: storage({'ashlar:browserSession': 'boot-1', 'ashlar:closed:fix-A:chatgpt:run-A': true}), api: active, handler: () => ({ok: false, code: 'busy', retry: true})});
+  b.context.crypto = webcrypto;
+  await b.tick();
+  assert.equal(b.tabs.size, 0, 'no replacement for a tab the user closed');
+  assert.equal(runsOf(b).length, 0);
+  assert.ok(b.calls.some(c => c.action === 'failure' && /explicitly closed/.test(c.error)), 'the run ends now, not at the deadline');
+});
+
+// Round 15 (Ashlar 4100156790): runId is part of a binding's identity (matchesJob, preservedKey,
+// closedKey), so every ownership comparison of a binding includes it. An older run's leg never
+// removes, proves or frees what a newer run of the same job and provider holds. Shared review code:
+// asserted for both kinds. Control: the matching run.
+const ownedRecord = runId => ({jobId: 'fix-A', provider: 'chatgpt', runId, closedKey: `ashlar:closed:fix-A:chatgpt:${runId}`, closing: false});
+for (const kind of ['review', 'fix']) for (const tabRun of ['run-B', 'run-A']) {
+  test(`worker (${kind}): a retiring leg of run-A ${tabRun === 'run-A' ? 'removes its own tab record (control)' : "keeps the newer run-B's record of that tab"}`, async () => {
+    const job = fixJob(kind === 'fix' ? {} : {kind: undefined});
+    const b = worker([job], {api: active});
+    await b.session.set({'ashlar:tab:10': ownedRecord(tabRun)});
+    const jobs = b.local.state.pendingReviewJobs;
+    await b.context.finishTabCleanup(jobs['fix-A'], 'chatgpt', jobs, 'test');
+    assert.deepEqual(b.session.state['ashlar:tab:10'], tabRun === 'run-A' ? undefined : ownedRecord('run-B'));
+  });
+}
+for (const bindingRun of ['run-0', 'run-A']) {
+  test(`worker: a delivery record of run-A is ${bindingRun === 'run-A' ? 'proven by its own run\'s binding (control)' : 'not proven by an older run\'s binding of the job'}`, async () => {
+    const {api, takes} = replayingServer();
+    const tabs = new Map([[101, {id: 101, url: URL_FIX, status: 'complete'}]]);
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {},
+      [DELIVERIES]: {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', runId: 'run-A', at: Date.now()}}}),
+    session: storage({'ashlar:tab:101': ownedRecord(bindingRun)}), tabs, api, handler: () => ({ok: false, code: 'busy', retry: true})});
+    const proven = await b.context.reconcileFixDeliveries({});
+    assert.equal(Boolean(proven['fix-A']), bindingRun === 'run-A');
+    assert.equal(Boolean(b.local.state[DELIVERIES]['fix-A']), bindingRun === 'run-A', 'an unproven record is cleared (replayed once)');
+    assert.equal(takes.length, 0);
+  });
+  test(`worker: a tab bound to ${bindingRun} of a job whose run-A leg retired ${bindingRun === 'run-A' ? 'is free (control)' : 'still counts against capacity'}`, async () => {
+    const job = fixJob({states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', delivered: true, cleanupDone: true}}});
+    const b = worker([job], {api: active, handler: (_id, m) => m.type === 'ashlar-tab-status'
+      ? {ok: true, ownershipProtocol: 1, jobId: 'fix-A', runId: bindingRun, provider: 'chatgpt', released: false, url: URL_FIX} : {ok: false, code: 'busy'}});
+    await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+    const report = await b.context.tabCapacityReport(b.local.state.pendingReviewJobs);
+    assert.equal(report.orphanTabs, bindingRun === 'run-A' ? 0 : 1);
+  });
+}
+test('worker: retiring a fix job forgets only its own delivery record', async () => {
+  const b = worker([], {api: active});
+  await b.local.set({[DELIVERIES]: {'fix-A': {deliveryId: 'delivery-2', provider: 'chatgpt', phase: 'creating', at: Date.now()}}});
+  await b.context.forgetFixDelivery(fixJob({deliveryId: 'delivery-1'}));
+  assert.equal(b.local.state[DELIVERIES]['fix-A']?.deliveryId, 'delivery-2', 'a newer delivery keeps its record');
+  await b.context.forgetFixDelivery(fixJob({deliveryId: 'delivery-2'}));
+  assert.equal(b.local.state[DELIVERIES]['fix-A'], undefined);
+});
+
+test('worker: a cancelled fix tab that now carries another binding retires at once, leaving that binding untouched', async () => {
   const other = {ok: false, code: 'job_mismatch', jobId: 'job-B', runId: 'run-B', provider: 'chatgpt'};
   const handler = (_id, m) => (m.type === 'ashlar-tab-status'
     ? {ok: true, ownershipProtocol: 1, jobId: 'job-B', runId: 'run-B', provider: 'chatgpt', released: false, url: URL_FIX}
@@ -623,16 +944,11 @@ test('worker: a cancelled fix tab that now carries another binding retires after
   const otherRecord = {jobId: 'job-B', provider: 'chatgpt', runId: 'run-B', closedKey: 'ashlar:closed:job-B:chatgpt:run-B', closing: false};
   await b.session.set({'ashlar:tab:10': otherRecord});
   await b.tick();
-  assert.equal(b.closedTabs.length, 0);
-  assert.match(b.local.state.pendingReviewJobs['fix-A'].states.chatgpt.cleanupError, /ownership does not match/, 'waits first');
-  const RealDate = b.context.Date || Date;
-  const later = RealDate.now() + 3 * 60_000;
-  b.context.Date = class extends RealDate { static now() { return later; } };
-  await b.tick();
   assert.equal(b.closedTabs.length, 0, 'never closed');assert.ok(b.tabs.has(10));
   assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the old fix leg retired: its prompt is gone and its slot released');
   assert.deepEqual(b.session.state['ashlar:tab:10'], otherRecord, "the other binding's tab record is intact");
-  assert.equal(b.messages.some(m => m.type === 'ashlar-fix-cancel' && m.preserve === true), false, "another binding's page is never told to release");
+  // the release names this fix's run only: the other binding's page refuses it (job_mismatch)
+  assert.ok(b.messages.filter(m => m.type === 'ashlar-fix-cancel').every(m => m.jobId === 'fix-A' && m.runId === 'run-A'));
   await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
   assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 1, 'the other binding still counts against capacity');
 });

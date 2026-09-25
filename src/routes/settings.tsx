@@ -65,13 +65,13 @@ const FIX_KNOB_HINT: Record<FixAgentKnob, string> = {
   attempts: "tries per round for an unusable reply",
   timeoutMs: "Local LLM generation deadline, from first output",
   queueMaxMs: "Local LLM: give up on a fix still queued this long",
-  chatTimeoutMs: "ChatGPT/Grok fix deadline, queue + generation",
-  chatMaxPromptChars: "bigger ChatGPT/Grok fix prompts fail at once (use Local)",
+  chatTimeoutMs: "ChatGPT fix deadline, queue + generation",
+  chatMaxPromptChars: "bigger ChatGPT fix prompts fail at once (use Local)",
 };
 
 const FIX_PROVIDER_LABEL: Record<FixAgentProvider, string> = {
   chatgpt: "ChatGPT (Chrome bridge)",
-  grok: "Grok (Chrome bridge)",
+  grok: "Grok (not supported for fixes yet)",
   local: "Local LLM",
   "coding-agent": "coding-agent (not wired)",
 };

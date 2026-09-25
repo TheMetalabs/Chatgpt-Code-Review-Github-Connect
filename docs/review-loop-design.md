@@ -254,17 +254,30 @@ fixAgent: {
 
 - **기본값(안전 우선):** `enabled: false` · `provider` 없음(루프·fix 항목 없음) · `delivery: "script-apply"` ·
   `mode: "suggest"` · `parallelPrs`는 bridge capacity 내. → 명시적으로 켜야 자동 수정이 돈다.
-- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인). `local`은
+- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인; grok은 fix 미연결). `local`은
   `script-apply`(grokbot `qwen_openai_edit.py` 재사용). `coding-agent`는 `coding-agent`.
 - **권한:** 어떤 provider든 push하려면 §2의 write-권한 게이트를 통과해야 한다. `apply` 모드는 명시적으로만.
+- **채팅 fix provider는 ChatGPT(임시 채팅)뿐:** fix 탭은 항상 `https://chatgpt.com/?temporary-chat=true`에서 열리고,
+  이 URL은 전송 후에도 바뀌지 않으므로 전송 시점 대화를 이후 모든 결정에서 비교할 수 있다. `grok`은 fix provider로
+  연결돼 있지 않다(전송 후 URL이 바뀔 수 있음): 설정 검증·Settings 화면·런타임 모두 "grok is not supported as a fix
+  provider yet"로 거부하고, 저장된 `{provider:"grok", enabled:true}`는 OFF로 로드된다. Grok **리뷰**는 그대로다.
 
-**채팅 fix 전송(구현, `bridge-fix.server.ts`):** `chatgpt`/`grok` + `script-apply`는 harbor Job이 아니라 bridge의
+**채팅 fix 전송(구현, `bridge-fix.server.ts`):** `chatgpt` + `script-apply`는 harbor Job이 아니라 bridge의
 **fix 항목**으로 간다(harbor Job은 PR별 supersede·리뷰 JSON 검증을 하므로 fix 답변을 거부/재작성한다). 확장이
 채팅 탭에 프롬프트를 붙여 넣고 **답변 전문(텍스트)**을 돌려주면, 파싱은 서버가 결정적으로 한다(`fix-apply`).
-- **PR당 live 항목 1개:** 같은 PR의 새 요청이 이전 항목을 취소(`superseded`)하고, 확장은 그 탭을 강제로 닫는다.
-- **데드라인:** 대기+생성 합산 기본 30분(설정 `fixAgent.chatTimeoutMs`, 1분~6시간). 만료 → 취소 → 탭 강제 종료 →
-  런타임 재시도 후 `fix-failed` ESCALATE. 리뷰와 달리 fix 탭만 "답변 없이" 닫히며, 사용자가 탭을 넘겨받았으면
-  (후속 턴·미전송 초안·다른 대화) 보존한다. 런타임 watcher는 chat fix를 이 데드라인과
+- **fix 탭은 증명된 성공 경로에서만 닫는다:** 답변이 전달(서버 ACK를 워커가 기록)되었고, 닫는 시점에 페이지의
+  해제 판정(`tabOwnership`: 전송한 임시 채팅 그대로, 정확한 전송 턴, 초안·후속 턴 없음)이 탭을 Ashlar 것으로 볼
+  때만. ChatGPT가 완료된 답변을 스스로 다시 그리는 것은 사용자 활동이 아니다(#82: 답변 텍스트는 다시 비교하지
+  않는다). 그 밖의 모든
+  종료(취소·supersede·데드라인·실패·taken_over·소유 불명·다른 바인딩·응답 없음·로딩 중·전달 기록 없음)는 탭을
+  **보존**하고 관리 슬롯만 해제한 뒤 작업을 끝낸다. 사용자의 로그인된 채팅 프로필에서 DOM 추론으로 탭을 강제로
+  닫지 않는다. 영구 판정(전송 시점 대화에서 이동·미확정, 전송 턴의 편집·교체, 후속 턴, 초안)은 응답 식별 여부를
+  기다리지 않고 **일시적 판정보다 먼저** 내린다 — 이전 DOM이 사라졌거나 턴이 통째로 바뀌어도 데드라인이 아니라
+  즉시 `taken_over`로 끝난다.
+- **PR당 live 항목 1개:** 같은 PR의 새 요청이 이전 항목을 취소(`superseded`)하고, 확장은 그 탭의 실행을 멈추고
+  슬롯을 해제한다(탭은 보존).
+- **데드라인:** 대기+생성 합산 기본 30분(설정 `fixAgent.chatTimeoutMs`, 1분~6시간). 만료 → 취소 → 탭 보존·슬롯
+  해제 → 런타임 재시도 후 `fix-failed` ESCALATE. 런타임 watcher는 chat fix를 이 데드라인과
   `fixAgent.timeoutMs` 중 긴 쪽 + 1분까지 기다린다 — 로컬 LLM용 생성 데드라인이 chat fix를 먼저 끊지 않는다.
 - **동시성:** `parallelPrs`개까지만 claim, 나머지는 대기. 리뷰와는 요청 시각이 빠른 쪽이 먼저(서로 굶기지 않음).
 - **호환:** `take`에 `fixProtocol:1`을 보내는 확장(1.1.23+)에만 fix 항목을 준다 — 확장 재로드 필요.

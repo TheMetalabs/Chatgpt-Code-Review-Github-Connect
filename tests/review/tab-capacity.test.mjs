@@ -61,6 +61,30 @@ test('released matching job tab does not consume managed capacity while server-s
 });
 
 
+test('a tab the page released in its cleanup answer is not an orphan once the leg retires, whatever the older inventory said',async()=>{
+ const job={...makeJob('A',10),states:{chatgpt:{started:true,runId:'run-A',tabId:10,delivered:true,cleanupPending:true,outcome:{ok:true,raw}}}};
+ const tabs=new Map([[10,{id:10,url:'https://chatgpt.com/c/A',status:'complete'}]]);
+ let released=false;
+ const b=background({local:storage({origin:'http://bridge',token:'token',maxReviewTabs:1,pendingReviewJobs:{A:job}}),tabs,
+  handler:(_id,msg)=>{
+   if(msg.type==='ashlar-tab-status')return {ok:true,ownershipProtocol:1,jobId:'A',provider:'chatgpt',runId:'run-A',released,url:tabs.get(10).url};
+   // The user continued the chat: the page keeps the tab and frees its managed slot in this same answer.
+   if(msg.type==='ashlar-can-close'){released=true;return {ok:true,canClose:false,reason:'repurposed',url:tabs.get(10).url};}
+   return {ok:false,code:'job_mismatch'};
+  }});
+ // The inventory's last snapshot predates the release.
+ await b.context.refreshTabInventory();await flush();await flush();
+ assert.equal((await b.context.tabCapacityReport({A:job},true)).used,1);
+ const jobs=await b.context.workerJobs('http://bridge');
+ await b.context.cleanupProvider(jobs.A,'chatgpt',jobs);
+ assert.equal(jobs.A.states.chatgpt.cleanupDone,true);assert.equal(b.closedTabs.length,0,'a user-continued tab is preserved');
+ assert.equal(await b.context.retireCleanJob(jobs.A,jobs),true);assert.equal(jobs.A,undefined);
+ // No further inventory probe: the page's own cleanup answer is already the recorded ownership.
+ const out=await b.context.tabCapacityReport(jobs,true);
+ assert.equal(out.orphanTabs,0,'the released tab is not an untracked binding');assert.equal(out.used,0);
+ assert.equal(await b.context.tabCapacityAvailable(jobs,true),true);
+});
+
 test('late sibling binding merges into an already recovered job without replacement generation',async()=>{
  const tabs=new Map([[10,{id:10,url:'https://chatgpt.com/c/A',status:'complete'}]]);
  let recoveries=0;

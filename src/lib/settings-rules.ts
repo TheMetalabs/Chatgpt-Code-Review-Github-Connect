@@ -38,6 +38,7 @@ import {
   type FixAgentProvider,
   type FixAgentSettings,
   type FixDelivery,
+  type FixMode,
 } from "./types.ts";
 import { CHATGPT_REASONING, GROK_REASONING } from "./reasoning.ts";
 
@@ -62,9 +63,12 @@ export interface FixProviderCaps {
   deadline: "timeoutMs" | "chatTimeoutMs";
 }
 
+/** The chat fix provider is ChatGPT only: a fix tab opens on its temporary chat, whose URL never
+ * changes, so the conversation a fix was sent in can be compared at every later decision. Grok is
+ * not wired as a fix provider (its URL can change after the send); Grok reviews are unaffected. */
 export const FIX_PROVIDER_CAPS: Readonly<Record<FixAgentProvider, FixProviderCaps>> = {
   chatgpt: { wired: true, deliveries: ["script-apply", "chat-push"], transport: "chrome-bridge", activity: "never", deadline: "chatTimeoutMs" },
-  grok: { wired: true, deliveries: ["script-apply", "chat-push"], transport: "chrome-bridge", activity: "never", deadline: "chatTimeoutMs" },
+  grok: { wired: false, deliveries: ["script-apply", "chat-push"], transport: "none", activity: "never", deadline: "timeoutMs" },
   local: { wired: true, deliveries: ["script-apply"], transport: "local-llm", activity: "local-streaming", deadline: "timeoutMs" },
   "coding-agent": { wired: false, deliveries: ["coding-agent"], transport: "none", activity: "never", deadline: "timeoutMs" },
 };
@@ -97,6 +101,12 @@ export const WIRED_FIX_PROVIDERS: readonly FixAgentProvider[] = FIX_AGENT_PROVID
 /** Deliveries the loop can execute today: the server applies the fix (script-apply). */
 export const WIRED_FIX_DELIVERIES: readonly FixDelivery[] = ["script-apply"];
 
+/** Why the review loop cannot run with this provider (the Settings validator, the Settings screen
+ * and the runtime all say the same). */
+export function fixProviderUnsupported(provider: FixAgentProvider | null | undefined): string {
+  return `${provider ?? "none"} is not supported as a fix provider yet: choose ${WIRED_FIX_PROVIDERS.join(", ")} to enable the review loop`;
+}
+
 /** The provider supports this delivery at all (wired or not). */
 export function fixPairCompatible(provider: FixAgentProvider, delivery: FixDelivery): boolean {
   return FIX_PROVIDER_CAPS[provider]?.deliveries.includes(delivery) ?? false;
@@ -109,6 +119,19 @@ export function fixLoopRunnable(fix: Pick<FixAgentSettings, "provider" | "delive
   const delivery = fix?.delivery;
   if (delivery === undefined || !WIRED_FIX_DELIVERIES.includes(delivery)) return false;
   return WIRED_FIX_PROVIDERS.includes(provider) && fixPairCompatible(provider, delivery);
+}
+
+/** Whether a STORED fixAgent block (raw: as read from disk or an env seed, BEFORE any
+ * normalization) may load with the loop ON. Load normalization never makes an unsafe configuration
+ * runnable: the switch survives only as a literal true whose raw provider, delivery and mode are
+ * each valid as stored and together a wired, compatible pair (fixLoopRunnable). A value load would
+ * repair (an invalid delivery defaulted to script-apply, an invalid mode defaulted to suggest, an
+ * unknown provider) or a missing one turns the loop OFF; the rest may still be normalized. */
+export function storedFixLoopOn(raw: unknown): boolean {
+  if (!isObject(raw) || raw.enabled !== true) return false;
+  if (!FIX_MODES.includes(raw.mode as FixMode)) return false;
+  // fixLoopRunnable reads the raw provider and delivery: each must be a known value, and the pair wired.
+  return fixLoopRunnable({ provider: raw.provider as FixAgentProvider, delivery: raw.delivery as FixDelivery });
 }
 
 /** The loop is ON: the switch is a literal true AND the configuration is runnable. */
@@ -237,9 +260,7 @@ export function fixAgentProblem(raw: unknown): string | null {
   }
   if (raw.enabled === true) {
     if (provider === null) return "choose a fix provider to enable the review loop";
-    if (!WIRED_FIX_PROVIDERS.includes(provider)) {
-      return `fix_agent.provider ${provider} is not wired yet: choose ${WIRED_FIX_PROVIDERS.join(", ")} to enable the review loop`;
-    }
+    if (!WIRED_FIX_PROVIDERS.includes(provider)) return fixProviderUnsupported(provider);
     if (!WIRED_FIX_DELIVERIES.includes(delivery)) {
       return `fix_agent.delivery ${delivery} is not wired yet: choose ${WIRED_FIX_DELIVERIES.join(", ")} to enable the review loop`;
     }

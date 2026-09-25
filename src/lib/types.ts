@@ -316,9 +316,9 @@ export interface FixAgentSettings {
   timeoutMs: number;
   /** Backstop for a fix request still queued at the provider (ms). */
   queueMaxMs: number;
-  /** chatgpt / grok: a chat fix item's deadline, queue + generation (ms). */
+  /** chatgpt: a chat fix item's deadline, queue + generation (ms). */
   chatTimeoutMs: number;
-  /** chatgpt / grok: the largest inline fix prompt (chars); bigger is rejected up front. */
+  /** chatgpt: the largest inline fix prompt (chars); bigger is rejected up front. */
   chatMaxPromptChars: number;
 }
 

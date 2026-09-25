@@ -81,6 +81,15 @@ function splitAttachments(raw) {
   return {prompt, files};
 }
 
+/** The text to type and the files to upload for this run's prompt. A FIX run's prompt is delivered
+ * VERBATIM, byte-exact: it inlines whole source files, so a line that looks like an attachment
+ * envelope (a `<<<ASHLAR_ATTACHMENTS_V2>>>` sentinel, a legacy `<<<ATTACH:…>>>` block) is file
+ * content, never transport, and nothing is uploaded or trimmed. Only a review prompt carries
+ * attachments (splitAttachments). The run's kind is set by ashlar-run before the runner starts. */
+function promptParts(raw) {
+  return globalThis.__ashlarRunnerState?.kind === "fix" ? {prompt: String(raw ?? ""), files: []} : splitAttachments(raw);
+}
+
 async function attachFiles(files) {
   if (!files.length) return false;
   const input =
@@ -101,7 +110,7 @@ async function attachFiles(files) {
 }
 
 async function fillComposer(el, text) {
-  const parts = splitAttachments(text);
+  const parts = promptParts(text);
   let body = parts.prompt || (parts.files.length ? "" : text);
   const state = globalThis.__ashlarRunnerState;
   if (state) state.pendingAttachments = [];
@@ -371,7 +380,7 @@ async function resumeSubmission(findSend, findComposer, prompt) {
   const record = await readSubmissionJournal();
   if (record) return clickSend(findSend, findComposer, record.expected);
   // Legacy pages have no durable send journal. Observe, but never guess and re-send.
-  const expected = normalizePrompt(splitAttachments(prompt).prompt);
+  const expected = normalizePrompt(promptParts(prompt).prompt);
   for (;;) {
     globalThis.throwIfStopped?.();
     const turns = userTurns();

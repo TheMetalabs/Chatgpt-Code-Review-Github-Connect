@@ -34,8 +34,14 @@ async function fixture(t,{fallback=true,text=invalid}={}){
   if(id!==10){cb({ok:false,code:'busy',jobId:msg.jobId,runId:msg.runId,provider:msg.provider});return;}
   page.evaluate(msg=>new Promise(resolve=>{const async=receiver(msg,null,resolve);if(async!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/A'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});
  };
+ // The job's leg exactly as the worker persisted it when its tab cleanup completed. Salvage delivery
+ // and tab cleanup are independent lanes: a leg delivered first retires (and is compacted) in the SAME
+ // tick its cleanup finishes, so the live registry may never show `cleanupDone` to a per-cycle check.
+ // finishTabCleanup's first write is the journal of the release itself, before any compaction.
+ let cleaned;const set=worker.local.set;
+ worker.local.set=async values=>{await set(values);const leg=values["pendingReviewJobs"]?.[job.jobId]?.states?.chatgpt;if(leg?.cleanupDone===true)cleaned??=structuredClone(leg);};
  const cycle=async()=>{await worker.tick();await flush();await page.clock.runFor(1000);};
- return {app,job,page,worker,cycle,api};
+ return {app,job,page,worker,cycle,api,cleaned:()=>cleaned};
 }
 
 test('completed malformed source frees the only tab slot before Local finishes, then repairs without a tab',async t=>{
@@ -58,7 +64,8 @@ test('completed malformed source frees the only tab slot before Local finishes, 
 
 test('fallback OFF salvages the completed original into a posted review and releases capacity',async t=>{
  const f=await fixture(t,{fallback:false});
- await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'disabled formatter did not salvage the captured original into a review');
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length>0 && f.worker.closedTabs.includes(10);},'disabled formatter did not salvage the captured original into a review');
+ assert.equal(f.app.reviews.length,1);
  assert.equal(f.app.localRequests.length,0,'salvage must not call the repair formatter');
  assert.ok(f.worker.closedTabs.includes(10),'completed tab must be released after salvage');
  assert.equal(f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId).status,'posted');
@@ -102,7 +109,7 @@ test('captured-source cleanup restores a freshly reloaded page from the saved re
   void reloaded.then(page=>page.evaluate(msg=>new Promise(resolve=>{const pending=receiver(msg,null,resolve);if(pending!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg))
    .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{})}));
  };
- await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'capture ACK lost its cleanup state across page reload');
+ await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1 && f.app.reviews.length>0;},'capture ACK lost its cleanup state across page reload');
  assert.ok(reloaded);assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,1,'salvage posts the captured original after the reload-restored cleanup');
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1);assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
 });
@@ -118,7 +125,7 @@ for(const change of ['followup','draft'])test(`source receipt releases managed o
   }
   send(id,msg,cb);
  };
- await eventually(async()=>{await f.cycle();return f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.cleanupDone;},'user-owned tab did not release managed capacity');
+ await eventually(async()=>{await f.cycle();return Boolean(f.cleaned());},'user-owned tab did not release managed capacity');
  assert.equal(f.worker.closedTabs.length,0);assert.equal(f.worker.tabs.size,1);
  const status=await f.page.evaluate(()=>message('ashlar-tab-status'));assert.equal(status.released,true);
  await f.cycle();assert.equal(f.worker.local.state.bridgeWorkerStatus.capacity.used,0);
@@ -137,8 +144,8 @@ test('source change after durable archive keeps the archived original, closes th
   }
   send(id,msg,cb);
  };
- await eventually(async()=>{await f.cycle();return f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.cleanupDone;},'changed source did not release the managed slot');
- const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
+ await eventually(async()=>{await f.cycle();return Boolean(f.cleaned());},'changed source did not release the managed slot');
+ const state=f.cleaned();
  assert.equal(state.sourceCapture?.archiveDurable,true);assert.notEqual(state.sourceCapture?.cleanupProofConfirmed,true);assert.ok(state.sourceCapture?.id);
  assert.equal(state.sourceCapture.text,invalid,'unresolved repair must retain the exact local archived-source fallback');
  assert.deepEqual(f.worker.closedTabs,[10],'a changed answer is not a user takeover: the secured tab closes');
@@ -268,7 +275,7 @@ test('lost server source ACK retries the same archive, then salvages it without 
   if(body?.action==='capture' && !dropped){dropped=true;throw Error('response lost after archive write');}
   return out;
  };
- await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'idempotent source ACK retry did not finish');
+ await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1 && f.app.reviews.length>0;},'idempotent source ACK retry did not finish');
  assert.ok(dropped);assert.equal(f.app.history.getJob(f.job.jobId,true).captures.length,1);
  assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,1,'archive is salvaged into a review with repair off');
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
@@ -276,7 +283,8 @@ test('lost server source ACK retries the same archive, then salvages it without 
 
 test('salvage posts the archived original once; a worker restart never re-posts it',async t=>{
  const f=await fixture(t,{fallback:false});
- await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'first worker did not salvage the archived source');
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length>0 && f.worker.closedTabs.includes(10);},'first worker did not salvage the archived source');
+ assert.equal(f.app.reviews.length,1);
  assert.equal(f.app.localRequests.length,0);assert.ok(f.worker.closedTabs.includes(10));
  // A restarted worker inheriting the same storage must not salvage or post a second time.
  const local=storage(structuredClone(f.worker.local.state));

@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetDotenvLoadedForTests } from "./dotenv-file.server.ts";
@@ -144,7 +144,7 @@ describe("sanitizeBotSettings", () => {
   it("fixAgent round-trips every Settings field unchanged", () => {
     const full = {
       enabled: true,
-      provider: "grok",
+      provider: "chatgpt",
       delivery: "script-apply",
       mode: "apply",
       parallelPrs: 4,
@@ -182,7 +182,7 @@ describe("sanitizeBotSettings", () => {
       Object.assign(process.env, { ASHLAR_FIX_PROVIDER: "grok", ASHLAR_LOOP_ROUND_CAP: "7", ASHLAR_FIX_CHAT_TIMEOUT_MS: "120000", ASHLAR_FIX_AGENT: "1" });
       const seeded = sanitizeBotSettings(overlayEnv({})).fixAgent;
       assert.deepEqual([seeded.enabled, seeded.provider, seeded.roundCap, seeded.chatTimeoutMs], [false, "grok", 7, 120_000]);
-      const disk = { fixAgent: sanitizeBotSettings({ fixAgent: { enabled: true, provider: "local", roundCap: 3 } }).fixAgent };
+      const disk = { fixAgent: sanitizeBotSettings({ fixAgent: { enabled: true, provider: "local", delivery: "script-apply", mode: "suggest", roundCap: 3 } }).fixAgent };
       const loaded = sanitizeBotSettings(diskFixAgentWins(disk, overlayEnv(disk))).fixAgent;
       assert.deepEqual([loaded.enabled, loaded.provider, loaded.roundCap, loaded.chatTimeoutMs], [true, "local", 3, DEFAULT_SETTINGS.fixAgent.chatTimeoutMs]);
       assert.equal("ASHLAR_FIX_ENABLED" in botSettingsToEnv(sanitizeBotSettings(disk)), false);
@@ -204,7 +204,7 @@ describe("sanitizeBotSettings", () => {
     const fresh = run("console.log(JSON.stringify(settings.loadBotSettings().fixAgent))");
     assert.equal(fresh.status, 0, fresh.stderr);
     assert.deepEqual(JSON.parse(fresh.stdout).enabled, false);
-    const saved = run('settings.saveBotSettings(settings.sanitizeBotSettings({fixAgent:{enabled:true,provider:"chatgpt",roundCap:2}}));');
+    const saved = run('settings.saveBotSettings(settings.sanitizeBotSettings({fixAgent:{enabled:true,provider:"chatgpt",delivery:"script-apply",mode:"suggest",roundCap:2}}));');
     assert.equal(saved.status, 0, saved.stderr);
     const restored = run("console.log(JSON.stringify(settings.loadBotSettings().fixAgent))");
     assert.equal(restored.status, 0, restored.stderr);
@@ -247,7 +247,7 @@ describe("prompt budgets", () => {
 type FixRow = { key: keyof FixAgentSettings; base?: Partial<FixAgentSettings>; good: unknown; next: unknown; bad: unknown; label: RegExp; env?: { name: string; raw: string; seeded: unknown } };
 const K = FIX_AGENT_KNOBS;
 const FIX_ROWS: FixRow[] = [
-  { key: "enabled", base: { provider: "grok" }, good: true, next: false, bad: "true", label: /fix_agent\.enabled/ },
+  { key: "enabled", base: { provider: "chatgpt" }, good: true, next: false, bad: "true", label: /fix_agent\.enabled/ },
   { key: "provider", good: "local", next: "grok", bad: "skynet", label: /fix_agent\.provider/, env: { name: "ASHLAR_FIX_PROVIDER", raw: "grok", seeded: "grok" } },
   { key: "delivery", base: { provider: "chatgpt" }, good: "chat-push", next: "script-apply", bad: "teleport", label: /fix_agent\.delivery/, env: { name: "ASHLAR_FIX_DELIVERY", raw: "chat-push", seeded: "chat-push" } },
   { key: "mode", good: "apply", next: "suggest", bad: "yolo", label: /fix_agent\.mode/, env: { name: "ASHLAR_FIX_MODE", raw: "apply", seeded: "apply" } },
@@ -376,13 +376,67 @@ describe("fixAgent: one validator, durable only via the settings JSON (every fie
     ];
     for (const pair of legacy) {
       const enabled = { ...DEFAULT_SETTINGS.fixAgent, ...pair, enabled: true };
-      assert.match(fixAgentProblem(enabled) ?? "", /not wired yet/, JSON.stringify(pair));
+      assert.match(fixAgentProblem(enabled) ?? "", /not wired yet|is not supported as a fix provider yet/, JSON.stringify(pair));
       assert.equal(saveError(() => saveBotSettings(box.doc(enabled))).status, 400);
       assert.equal(fixLoopOn(enabled), false, "the runtime rule fails closed on the same pair");
       // Stored while OFF is fine (the screen keeps showing it); switching it on is not.
       assert.equal(fixAgentProblem({ ...enabled, enabled: false }), null);
     }
     assert.equal(existsSync(join(box.cwd, ".data", "ashlar-settings.json")), false);
+  });
+
+  it("grok is not a fix provider: enabling the fix agent with it is refused by the screen rule, the save and the runtime", (t) => {
+    const box = sandbox(t);
+    const grok = { ...DEFAULT_SETTINGS.fixAgent, provider: "grok" as const, delivery: "script-apply" as const, enabled: true };
+    assert.equal(fixAgentProblem(grok), "grok is not supported as a fix provider yet: choose chatgpt, local to enable the review loop");
+    const err = saveError(() => saveBotSettings(box.doc(grok)));
+    assert.equal(err.status, 400);
+    assert.match(err.message, /^grok is not supported as a fix provider yet/);
+    assert.equal(fixLoopOn(grok), false, "the runtime rule refuses it too");
+    assert.equal(existsSync(join(box.cwd, ".data", "ashlar-settings.json")), false, "nothing written");
+    // Grok reviews are unaffected: a grok reviewer with the fix agent on chatgpt saves.
+    assert.equal(saveBotSettings({ ...box.doc({ ...grok, provider: "chatgpt" }), reviewGrok: true }).reviewGrok, true);
+  });
+
+  // Ashlar 4099509084: load normalization never makes an unsafe configuration runnable. The switch
+  // survives a load only when the RAW stored provider, delivery and mode were each valid and
+  // together a wired, compatible pair; the rest may still be normalized.
+  const VALID = { enabled: true, provider: "chatgpt", delivery: "script-apply", mode: "apply" };
+  const STORED_ROWS: [string, Record<string, unknown>, boolean][] = [
+    ["valid (control)", VALID, true],
+    ["invalid provider", { ...VALID, provider: "skynet" }, false],
+    ["invalid delivery (would default to script-apply)", { ...VALID, delivery: "teleport" }, false],
+    ["invalid mode (would default to suggest)", { ...VALID, mode: "yolo" }, false],
+    ["incompatible pair", { ...VALID, provider: "local", delivery: "chat-push" }, false],
+    ["non-wired delivery", { ...VALID, delivery: "chat-push" }, false],
+    ["unwired provider (grok)", { ...VALID, provider: "grok" }, false],
+    ["missing delivery", { enabled: true, provider: "chatgpt", mode: "apply" }, false],
+    ["missing mode", { enabled: true, provider: "chatgpt", delivery: "script-apply" }, false],
+    ["non-string delivery", { ...VALID, delivery: ["script-apply"] }, false],
+  ];
+  for (const [name, stored, on] of STORED_ROWS) {
+    it(`a stored enabled fix agent with ${name} loads ${on ? "ON" : "OFF"} (sanitize, disk load, runtime rule)`, (t) => {
+      const box = sandbox(t);
+      mkdirSync(join(box.cwd, ".data"), { recursive: true });
+      writeFileSync(join(box.cwd, ".data", "ashlar-settings.json"), JSON.stringify({ fixAgent: stored }));
+      const loaded = box.restart().fixAgent;
+      const sanitized = sanitizeBotSettings({ fixAgent: stored }).fixAgent;
+      assert.deepEqual([loaded.enabled, sanitized.enabled, fixLoopOn(loaded), fixLoopOn(sanitized)], [on, on, on, on]);
+      // whatever load yields is a document a save accepts
+      assert.equal(settingsProblem(box.restart()), null);
+    });
+  }
+
+  it("a saved legacy {provider: grok, enabled: true} loads OFF (the provider stays visible), like any non-runnable pair", (t) => {
+    const box = sandbox(t);
+    mkdirSync(join(box.cwd, ".data"), { recursive: true });
+    writeFileSync(join(box.cwd, ".data", "ashlar-settings.json"), JSON.stringify({ fixAgent: { enabled: true, provider: "grok", delivery: "script-apply", mode: "apply" } }));
+    const loaded = box.restart().fixAgent;
+    assert.deepEqual([loaded.enabled, loaded.provider, loaded.delivery], [false, "grok", "script-apply"]);
+    assert.equal(fixLoopOn(loaded), false);
+    assert.equal(sanitizeBotSettings({ fixAgent: { enabled: true, provider: "grok", delivery: "script-apply" } }).fixAgent.enabled, false);
+    // an unrelated save of the loaded document is accepted (the loaded switch is off)
+    assert.equal(saveBotSettings({ ...box.restart(), maxTurns: 3 }).maxTurns, 3);
   });
 
   // A real process restart, both directions: before the fix, a failed JSON write with a working
@@ -396,7 +450,7 @@ describe("fixAgent: one validator, durable only via the settings JSON (every fie
       const run = (code: string) =>
         spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `import * as settings from ${JSON.stringify(module)};${code}`], { cwd, env, encoding: "utf8" });
       const save = (enabled: boolean) =>
-        run(`try{settings.saveBotSettings(settings.sanitizeBotSettings({fixAgent:{enabled:${enabled},provider:"grok"}}));console.log("saved")}catch(e){console.log("failed",e.status)}`);
+        run(`try{settings.saveBotSettings(settings.sanitizeBotSettings({fixAgent:{enabled:${enabled},provider:"chatgpt",delivery:"script-apply",mode:"suggest"}}));console.log("saved")}catch(e){console.log("failed",e.status)}`);
       assert.equal(save(from).stdout.trim(), "saved");
       renameSync(join(cwd, ".data"), join(cwd, ".data.bak"));
       writeFileSync(join(cwd, ".data"), "not a directory");

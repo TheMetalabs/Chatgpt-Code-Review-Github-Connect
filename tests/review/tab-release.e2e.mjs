@@ -173,22 +173,38 @@ for(const kind of ['review','fix'])test(`${kind}: a secured tab moved in-page to
 // legacy journal, or a send confirmed only after a reload) can never establish it, so its tab is
 // never closed: "unestablished", slot freed (the worker preserves it at once). A REVIEW journal
 // without one is `unpinned` (#82: a review sent on a new chat pins later, and the worker checks the
-// page it observed), so the same page closes. Both exits answer the same verdict.
+// page it observed), so the same page closes. A review's two exits answer the same verdict; a fix
+// page's cancel exit carries none (#77: a cancel never closes a fix tab), it only releases the slot.
 for(const kind of ['review','fix'])test(`${kind}: a sent journal that recorded no conversation ${kind==='fix'?'is never closed ("unestablished", slot freed)':'is unpinned: the worker decides by the page it observed'}`,async t=>{
  const tab=await chatTab(t,{kind,thread:userTurn()+answerTurn(),journal:sentJournal({conversation:undefined})});
  for(const type of ['ashlar-can-close','ashlar-fix-cancel']){
   const out=await tab.send(type,{allocationUrl:TEMP_URL});
   assert.deepEqual({canClose:out.canClose,ownership:out.ownership,identity:out.identity,unpinned:out.unpinned},
-   kind==='fix'?{canClose:false,ownership:'unknown',identity:'unestablished',unpinned:undefined}:{canClose:true,ownership:'owned',identity:undefined,unpinned:true},type);
+   kind==='fix'?(type==='ashlar-can-close'?{canClose:false,ownership:'unknown',identity:'unestablished',unpinned:undefined}:{canClose:undefined,ownership:undefined,identity:undefined,unpinned:undefined})
+    :{canClose:true,ownership:'owned',identity:undefined,unpinned:true},type);
  }
  assert.equal(await tab.released(),kind==='fix'?'true':null);
 });
 
 // The query is not the page (#82: origin + path): ChatGPT's `?temporary-chat=true` names a mode, not
 // another conversation, so a run bound on one form of the new-chat URL is still in its conversation
-// on the other (json.js samePage).
+// on the other (json.js samePage). A FIX is the exception at its send only (#77): it is proven only
+// when it was sent in the temporary chat (json.js fixSentInTemporaryChat), so a fix sent on the bare
+// "/" is never collected, and its tab never closed, whatever the URL reads later.
 const QUERY_FORMS=[[TEMP_URL,'https://chatgpt.com/'],['https://chatgpt.com/',TEMP_URL]];
+test('fix: a run sent on https://chatgpt.com/ (not the temporary chat) is never collected, whatever its URL reads later; its tab is never closed',async t=>{
+ const tab=await chatTab(t,{kind:'fix',url:'https://chatgpt.com/',thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+ await tab.send('ashlar-run',{resume:true});await tab.page.clock.runFor(1600);
+ await tab.page.evaluate(url=>history.replaceState(history.state,'',url),TEMP_URL);
+ await finish(tab.page);await tab.page.clock.runFor(2400);
+ const out=await tab.send('ashlar-harvest');
+ assert.deepEqual({ok:out.ok,code:out.code},{ok:false,code:'taken_over'},'the run ends: the send-time identity is not the temporary chat');
+ // its run ended on the permanent verdict (json.js endFixRun), so the tab is the user's for good
+ assert.deepEqual(verdict(await canClose(tab)),{canClose:false,reason:'repurposed',cause:'ownership_unknown'});
+ assert.equal(await tab.released(),'true','its managed slot is freed');
+});
 for(const kind of ['review','fix'])for(const [from,to] of QUERY_FORMS){
+ if(kind==='fix'&&from!==TEMP_URL)continue; // a fix is sent only in the temporary chat (the row above)
  test(`${kind}: a secured tab bound on ${from} may still close once its URL reads ${to}`,async t=>{
   const {tab}=await collected(t,{kind,url:from});
   assert.equal(await pinnedIn(tab),from);
@@ -208,12 +224,14 @@ for(const kind of ['review','fix'])for(const [from,to] of QUERY_FORMS){
 }
 
 // A reloaded ACKed temporary chat renders nothing: blank on the page it was opened on, so it closes.
-for(const kind of ['review','fix'])test(`${kind}: a secured temporary chat reloaded blank still closes; a conversation page not rendered yet waits`,async t=>{
+for(const kind of ['review','fix'])test(`${kind}: a secured temporary chat reloaded blank still closes${kind==='review'?'; a conversation page not rendered yet waits':''}`,async t=>{
  const {tab}=await collected(t,{kind});
  tab.served.thread='';
  await tab.reload();
  const out=await canClose(tab);
  assert.deepEqual({...verdict(out),blank:out.blank},{canClose:true,reason:'complete',blank:true});
+ // (a fix is never secured on a conversation page: it is proven only in the temporary chat, #77)
+ if(kind==='fix')return;
  const conv=await collected(t,{kind,url:CONV_URL});
  conv.tab.served.thread='';await conv.tab.reload();
  assert.deepEqual(verdict(await canClose(conv.tab)),{canClose:false,reason:'pending',cause:'not_rendered'},'nothing rendered on a conversation page proves nothing: asked again');
@@ -389,24 +407,29 @@ for(const [name,provider,from,to,how] of PROVIDER_MOVES){
 }
 
 // ── Legs nobody wants any more (cancelled, superseded, forgotten): the tab has no use either. The
-// cancel exit stops the page (no send, no collect) and closes the tab unless the user took it over.
+// cancel exit stops the page (no send, no collect) and closes a REVIEW tab unless the user took it
+// over. A FIX tab is closed only on the proven-success path (#77): a cancelled fix leg's page is
+// stopped and released the same way, in the same tick, and its tab is kept (preserve_undelivered).
 const generatingTab=(t,extra={})=>chatTab(t,{thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal(),...extra});
-for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while its answer is still generating is closed at once, and its page stops`,async t=>{
+for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while its answer is still generating is ${kind==='fix'?'preserved':'closed'} at once, and its page stops`,async t=>{
  const tab=await generatingTab(t,{kind});
  const w=wire(tab,{kind});
  await w.tick();await tab.page.clock.runFor(1600);
  assert.equal((await tab.runner()).running,true,'generating');
  w.server.value='cancelled';
  await w.tick();
- assert.deepEqual(w.b.closedTabs,[10],'closed in the same tick, without waiting for the answer');
+ assert.deepEqual(w.b.closedTabs,kind==='fix'?[]:[10],`${kind==='fix'?'kept':'closed'} in the same tick, without waiting for the answer`);
  assert.equal(w.state(),undefined,'the job retired');
  const cancel=w.b.messages.find(m=>m.type==='ashlar-fix-cancel');
- assert.ok(cancel&&cancel.allocationUrl===TEMP_URL&&!cancel.undispatched,'the cancel exit, naming the allocation page');
+ assert.ok(cancel&&!cancel.undispatched&&(kind==='fix'?cancel.preserve===true:cancel.allocationUrl===TEMP_URL),
+  kind==='fix'?'the cancel exit as a release (no verdict is asked)':'the cancel exit, naming the allocation page');
  await tab.page.clock.runFor(1000);
  assert.deepEqual(await tab.runner(),{running:false,code:'cancelled'},'the page collector stopped');
  assert.equal(await tab.clicks(),0);
  const steps=uploadedSteps(w);
- assert.ok(steps.includes('page:cancelled')&&steps.includes('worker:tab_closed'),`the stop and the close reach history: ${steps}`);
+ const end=kind==='fix'?['worker:preserve_undelivered','worker:tab_preserved']:['worker:tab_closed'];
+ assert.ok(steps.includes('page:cancelled')&&end.every(stage=>steps.includes(stage)),`the stop and the ${kind==='fix'?'preserve':'close'} reach history: ${steps}`);
+ if(kind==='fix')assert.equal(await tab.released(),'true','the kept tab frees its managed slot');
 });
 for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while generating is preserved when the user staged a file in its composer`,async t=>{
  const tab=await generatingTab(t,{kind});
@@ -416,25 +439,26 @@ for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while 
  w.server.value='cancelled';
  await w.tick();
  assert.deepEqual(w.b.closedTabs,[],'the staged file is the user\'s draft');assert.equal(w.state(),undefined,'the job retired');
- assert.ok(uploadedSteps(w).includes('worker:preserve_draft'));
+ // (a cancelled fix is kept whatever its page shows: its cause is the undelivered answer, #77)
+ assert.ok(uploadedSteps(w).includes(kind==='fix'?'worker:preserve_undelivered':'worker:preserve_draft'));
 });
-for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while its own attachment is still uploading is closed (its own file is not a draft)`,async t=>{
+for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled while its own attachment is still uploading is ${kind==='fix'?'preserved, its run stopped':'closed (its own file is not a draft)'}`,async t=>{
  const tab=await chatTab(t,{kind,composer:PROMPT,sendDisabled:true,uploading:true,chips:['diff.patch'],journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:['diff.patch']}});
  const w=wire(tab,{kind});
  await w.tick();await tab.page.clock.runFor(1000);
  assert.equal((await tab.runner()).running,true,'waiting for its attachment upload');
  w.server.value='cancelled';
  await w.tick();
- assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
+ assert.deepEqual(w.b.closedTabs,kind==='fix'?[]:[10]);assert.equal(w.state(),undefined);
 });
-for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled after dispatch but before its prompt was sent is closed, and never sends it`,async t=>{
+for(const kind of ['review','fix'])test(`worker, ${kind}: a leg cancelled after dispatch but before its prompt was sent is ${kind==='fix'?'preserved':'closed'}, and never sends it`,async t=>{
  const tab=await chatTab(t,{kind,composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
  const w=wire(tab,{kind});
  await w.tick();await tab.page.clock.runFor(1000);
  assert.equal((await tab.runner()).running,true,'waiting for its attachment upload');
  w.server.value='cancelled';
  await w.tick();
- assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
+ assert.deepEqual(w.b.closedTabs,kind==='fix'?[]:[10]);assert.equal(w.state(),undefined);
  await tab.enableSend();await tab.page.clock.runFor(2000);
  assert.equal(await tab.clicks(),0,'the cancelled prompt is never submitted');
 });
@@ -463,8 +487,9 @@ for(const kind of ['review','fix'])for(const url of ['https://chatgpt.com/',TEMP
  assert.equal(w.b.session.state['ashlar:tab:10'],undefined,'fixture: this browser session never created tab 10');
  assert.deepEqual(w.b.closedTabs,[]);
  assert.equal(w.b.messages.some(m=>m.undispatched===true),false,'the unbound page is never claimed as Ashlar\'s');
- w.later();await w.tick();
- assert.deepEqual(w.b.closedTabs,[],'never closed');assert.equal(w.state(),undefined,'the leg retires after the ownership wait');
+ // (a review is asked again within the ownership wait; a cancelled fix is kept at once, #77)
+ if(kind==='review'){w.later();await w.tick();}
+ assert.deepEqual(w.b.closedTabs,[],'never closed');assert.equal(w.state(),undefined,'the leg retires');
  assert.equal(w.b.messages.some(m=>m.preserve===true),false,'the user\'s page is never told to release a binding');
  assert.equal(w.b.messages.some(m=>m.type==='ashlar-run'),false);
 });
@@ -480,7 +505,21 @@ test('sweep: a forgotten ("missing") undispatched leg never closes the user\'s b
 // A background tab Chrome discarded while it waited (job 649: attachments_waiting for 10+ minutes)
 // holds no page. It is woken once (the tab this browser session created, still on its page) and its
 // reloaded page gives the verdict: what the provider keeps across a reload is still respected.
-for(const kind of ['review','fix'])for(const [name,restored,closed] of [['the reloaded temporary chat is blank: closed','',[10]],['the provider restores a draft on reload: preserved','my restored question',[]]])test(`worker, ${kind}: a cancelled leg's discarded tab is woken once: ${name}`,async t=>{
+test('worker, fix: a cancelled leg\'s discarded tab is kept at once, never woken (a cancelled fix never reaches a verdict, #77)',async t=>{
+ const tab=await chatTab(t,{kind:'fix',composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
+ const w=wire(tab,{kind:'fix'});
+ await w.tick();await tab.page.clock.runFor(1000);
+ assert.equal((await tab.runner()).running,true,'waiting for its attachment upload');
+ Object.assign(w.b.tabs.get(10),{status:'unloaded',discarded:true});
+ const reloads=[];
+ w.b.chrome.tabs.reload=async id=>{reloads.push(id);};
+ w.server.value='cancelled';
+ await w.tick({syncUrl:false});
+ assert.deepEqual(reloads,[],'never woken');assert.deepEqual(w.b.closedTabs,[]);assert.equal(w.state(),undefined,'the job retired');
+ assert.ok(uploadedSteps(w).includes('worker:preserve_undelivered'));
+ assert.ok(w.b.session.state['ashlar:preserved:fix-A:chatgpt:run-A'],'the preserved-run record releases it once its page answers again');
+});
+for(const kind of ['review'])for(const [name,restored,closed] of [['the reloaded temporary chat is blank: closed','',[10]],['the provider restores a draft on reload: preserved','my restored question',[]]])test(`worker, ${kind}: a cancelled leg's discarded tab is woken once: ${name}`,async t=>{
  const tab=await chatTab(t,{kind,composer:PROMPT,sendDisabled:true,uploading:true,journal:{phase:'prepared',expected:PROMPT,baseline:0,attachments:[]}});
  const w=wire(tab,{kind});
  await w.tick();await tab.page.clock.runFor(1000);

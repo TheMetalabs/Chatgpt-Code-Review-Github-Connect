@@ -42,6 +42,7 @@ export const PROGRESS_LABELS = {
     preserve_ownership_unknown: "Tab preserved · its ownership could not be proven in time",
     preserve_unreachable: "Tab preserved · the page could not be reached or never finished loading",
     preserve_other_binding: "Tab preserved · it now belongs to another job",
+    preserve_undelivered: "Tab preserved · the fix ended without a delivered answer (a fix tab closes only after its answer is delivered)",
     preserve_unknown: "Tab preserved · cause not reported",
     cleanup_waiting_page: "Tab cleanup waiting on the page · loading, discarded, unreachable or ownership not yet proven",
     disconnected: "Tab connection unknown · waiting for reconnection",

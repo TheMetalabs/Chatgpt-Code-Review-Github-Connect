@@ -442,14 +442,21 @@ function conversationIdentity(href) {
  * reload) is `identity:"unestablished"` for good: never harvested, never closed. The identity is
  * persisted with the journal (sessionStorage), so it survives a reload.
  *
- * A fix whose page changes path after the send is `identity:"changed"`, whoever moved it. Fix tabs
- * open on ChatGPT's `/?temporary-chat=true`, which keeps its path only while ChatGPT honours the
- * temporary chat. When it does not, ChatGPT itself moves the new chat to /c/<id>, as Grok does from
- * its home (#77: a Grok fix whose URL changes after the send cannot complete). Such a fix run ends
- * `taken_over` ("the tab moved to another conversation") and its tab is preserved as navigated,
- * although the user did nothing. This is a known #77 vs #82 contradiction: the send-time identity
- * cannot tell the provider's move from the user's in-page move to their own conversation while the
- * old DOM is still rendered, which is the case it guards (a review on a new chat pins instead, below).
+ * A FIX is proven only in ChatGPT's temporary chat (#77: the chat fix provider is ChatGPT only, and
+ * every fix tab opens on `/?temporary-chat=true`, fixChatPage). A fix whose send-time identity is
+ * not exactly that page (sent on a bare new chat, `?temporary-chat=false`, an existing conversation)
+ * is `identity:"unestablished"` too, even where the page never moved: never collected, its run ends
+ * `taken_over`, its tab is preserved. The query is part of that send-time check (it names the mode
+ * the fix was sent in); after the send, the page is compared by samePage (origin and path, the query
+ * ignored, #82), for both kinds.
+ *
+ * A fix whose page changes path after the send is `identity:"changed"`, whoever moved it. The
+ * temporary chat keeps its path only while ChatGPT honours it. When it does not, ChatGPT itself
+ * moves the new chat to /c/<id>, and such a fix run ends `taken_over` ("the tab moved to another
+ * conversation") and its tab is preserved as navigated, although the user did nothing. This is a
+ * known #77 vs #82 contradiction: the send-time identity cannot tell the provider's move from the
+ * user's in-page move to their own conversation while the old DOM is still rendered, which is the
+ * case it guards (a review on a new chat pins instead, below).
  *
  * The one exception (#82) is a REVIEW whose journal has no send-time conversation: a review sent on
  * a new chat (namesNoConversation: ChatGPT's "/" or a temporary chat it does not honour, Grok's home,
@@ -495,6 +502,17 @@ function namesNoConversation(href) {
   try { return new URL(href).pathname.replace(/\/+$/, "") === ""; } catch { return false; }
 }
 
+/** The only conversation a fix run can be proven in (#77): ChatGPT's temporary chat, the page every
+ * fix tab is opened on (background.js providerUrl). A function, so the content script stays
+ * re-injectable. */
+function fixChatPage() { return "https://chatgpt.com/?temporary-chat=true"; }
+
+/** Whether a fix run was sent in the temporary chat (its send-time identity is exactly fixChatPage):
+ * the only send a fix answer can be proven for, and the only one whose tab may close. */
+function fixSentInTemporaryChat(submission) {
+  return submission?.conversation === fixChatPage();
+}
+
 /** Whether the page still shows the conversation its run was bound in (samePage). Not established = false. */
 function fixConversationHolds(submission) {
   return Boolean(submission?.conversation) && samePage(submission.conversation, globalThis.location?.href);
@@ -523,17 +541,20 @@ function storedFixCompletion(state) {
  * tabOwnership instead, which asks for positive user evidence only. `journal`: the submission
  * journal the caller just read (default: the confirmed or saved one).
  *
- * owned = the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact"), no
- * follow-up turn, no user draft, the page still shows the conversation its send was made in and
- * ("complete") an answer was collected. Nothing about the answer itself is compared: ChatGPT keeps
- * redrawing a finished answer (the closing code fence after the action bar, labels, re-keyed ids,
- * streaming flags), and requiring the collected text again would keep the answer, and then the tab,
- * forever (#82). takenOver = the user's (follow-up, edited turn, draft: typed text or a staged file);
- * unknown = not provable now (journal unreadable, turn not rendered, the just-sent prompt still
- * echoed in the composer, identity not recorded at send or moved: `identity` "unestablished" |
- * "changed"). Every takenOver verdict is PERMANENT: it marks the tab repurposed for good (a draft the
- * user later clears, or an edit the user undoes, does not hand the tab back); see
- * fixVerdictPermanent for what ends a run. */
+ * owned = the fix was sent in the temporary chat (fixSentInTemporaryChat, #77) and the page still
+ * shows it, the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact"), no
+ * follow-up turn, no user draft and ("complete") an answer was collected. Nothing about the answer
+ * itself is compared: ChatGPT keeps redrawing a finished answer (the closing code fence after the
+ * action bar, labels, re-keyed ids, streaming flags), and requiring the collected text again would
+ * keep the answer, and then the tab, forever (#82). takenOver = the user's (follow-up, edited turn,
+ * draft: typed text or a staged file); unknown = not provable now (journal unreadable, turn not
+ * rendered, the just-sent prompt still echoed in the composer, identity not recorded at send, not
+ * the temporary chat, or moved: `identity` "unestablished" | "changed"). PERMANENT verdicts are
+ * decided before any transient one (#77): the conversation and the exact sent turn need no rendered
+ * response, so no transient wait (a turn not rendered or resolved yet, the prompt echoed in the
+ * composer) hides them until the fix deadline. Every takenOver verdict is PERMANENT: it marks the
+ * tab repurposed for good (a draft the user later clears, or an edit the user undoes, does not hand
+ * the tab back); see fixVerdictPermanent for what ends a run. */
 function fixOwnershipProof(state, {phase, journal} = {}) {
   const verdict = (ownership, reason, extra = {}) => ({ownership, reason, ...extra});
   const takeOver = (reason, cause) => {
@@ -547,18 +568,26 @@ function fixOwnershipProof(state, {phase, journal} = {}) {
   }
   // Nothing was sent: there is no answer to collect or to hand out.
   if (submission?.phase !== "sent") return verdict("unknown", "not_sent");
+  // 1. The conversation. The rendered turn proves its content only; an in-page (SPA) move to another
+  // conversation can leave this DOM on screen under the new URL, or remove it: the proof holds only
+  // in the conversation recorded when the send was proven (composer.js submissionConfirmed), which
+  // must be the temporary chat; a journal without one never gains it.
+  if (!fixSentInTemporaryChat(submission)) return verdict("unknown", "unestablished", {identity: "unestablished"});
+  if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
+  // 2. The journal-addressable sent turn (its message ID, else its recorded position) holds EXACTLY
+  // Ashlar's prompt. boundReviewResponse only proves the turn CONTAINS it, and finds no turn at all
+  // once the user replaced its text: an edited or replaced turn is the user's, even if undone later.
   const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  const integrity = journaledTurnIntegrity(submission, users);
+  if (integrity === "edited") return takeOver("edited", "edited");
   const bound = boundReviewResponse(submission);
   if (bound.followup) return takeOver("followup", "user_turn");
   if (!bound.identified) {
-    // A collected answer whose sent turn no longer holds Ashlar's prompt: the user edited it.
+    // A collected answer whose sent turn no longer holds Ashlar's prompt: the user edited it. Still in
+    // the recorded conversation with no addressable turn before that: not rendered yet (transient).
     return phase === "complete" ? takeOver("turn_changed", "edited") : verdict("unknown", "turn_unrendered");
   }
-  // The bound match only proves the sent turn CONTAINS Ashlar's prompt; an edited turn (a prefix
-  // or suffix the user added) is the user's, even if the edit is later undone.
-  const integrity = journaledTurnIntegrity(submission, users);
   if (integrity === "unknown") return verdict("unknown", "turn_unresolved");
-  if (integrity === "edited") return takeOver("edited", "edited");
   const draftText = composerDraftText();
   const staged = composerStagedFiles(state, submission);
   if (draftText || staged.length) {
@@ -567,11 +596,6 @@ function fixOwnershipProof(state, {phase, journal} = {}) {
     if (!staged.length && normalizePrompt(draftText) === submission.expected) return verdict("unknown", "composer_echo");
     return takeOver("draft", "draft");
   }
-  // The rendered turn proves its content only. An in-page (SPA) move to another conversation can
-  // leave this DOM on screen under the new URL: the proof holds only in the conversation recorded
-  // when the send was proven (composer.js submissionConfirmed); a journal without one never gains it.
-  if (!submission.conversation) return verdict("unknown", "unestablished", {identity: "unestablished"});
-  if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
   if (phase === "complete" && !storedFixCompletion(state)) return verdict("unknown", "no_completion", {conversation: submission.conversation});
   return verdict("owned", "exact", {conversation: submission.conversation});
 }
@@ -723,11 +747,12 @@ function tabOwnership(state, allocationUrl, fix = false) {
   // run's conversation is recorded (at send, or a new-chat review's pin), the page must still show it.
   const pinned = typeof submission.conversation === "string" ? submission.conversation : "";
   if (pinned && !samePage(pinned, href)) return {ownership: "unknown", identity: "changed", cause: "navigated", conversation: pinned};
-  // A FIX records its conversation only when its send is proven (composer.js submissionConfirmed):
-  // a sent fix journal without one (a legacy journal, a send confirmed only after a reload) can never
-  // establish it, so its tab is never closed (#77). The worker preserves it at once. A review has no
-  // such rule: it may pin later (pinNewChatReview), and until then it is `unpinned`.
-  const unestablished = fix && !pinned ? {ownership: "unknown", identity: "unestablished", cause: "ownership_unknown"} : null;
+  // A FIX records its conversation only when its send is proven (composer.js submissionConfirmed),
+  // and only the temporary chat proves it (#77, fixSentInTemporaryChat): a sent fix journal without
+  // one (a legacy journal, a send confirmed only after a reload) or with another page can never
+  // establish it, so its tab is never closed. The worker preserves it at once. A review has no such
+  // rule: it may pin later (pinNewChatReview), and until then it is `unpinned`.
+  const unestablished = fix && !fixSentInTemporaryChat(submission) ? {ownership: "unknown", identity: "unestablished", cause: "ownership_unknown"} : null;
   // The journaled turn: its message ID (one match), else its recorded position (a provider that
   // re-keys the turn is not the user).
   let turn;
@@ -913,9 +938,13 @@ function installReviewRunner(name, run) {
     // Also retry after collection is cached: there may no longer be a polling loop.
     if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();
     if (msg.type === "ashlar-can-close" || msg.type === "ashlar-fix-cancel") {
-      // A secured leg asks can-close; a cancelled or forgotten one asks ashlar-fix-cancel, which also
-      // stops the run. Both get the same ownership verdict (tabOwnership).
-      if (msg.type === "ashlar-fix-cancel" && msg.undispatched === true && !state.jobId && !state.runId) {
+      // A secured leg asks can-close; a cancelled or forgotten review asks ashlar-fix-cancel, which also
+      // stops the run. Both get the same ownership verdict (tabOwnership). A FIX tab is closed only on
+      // the proven-success path (#77, background.js forceCloseFixTab): its page is asked to cancel
+      // only when the worker keeps the tab, so that reply stops the run, frees the managed slot and
+      // authorises nothing (no ownership verdict), and no fix page ever answers for an unbound tab.
+      const fixRun = msg.kind === "fix" || state.kind === "fix";
+      if (msg.type === "ashlar-fix-cancel" && msg.undispatched === true && !fixRun && !state.jobId && !state.runId) {
         // Positive binding only: an unbound page is never evidence that this tab is Ashlar's, except
         // the tab the worker opened for a run it never sent (undispatched): Ashlar's only while it
         // holds nothing of the user's (no turn, no draft). A late run message for it stays stopped.
@@ -929,8 +958,14 @@ function installReviewRunner(name, run) {
       if (!state.jobId || msg.jobId !== state.jobId || (state.runId || "") !== (msg.runId || "")) {
         reply({ok:false,code:"job_mismatch"});return;
       }
+      if (msg.type === "ashlar-fix-cancel" && fixRun) {
+        if (!state.runId) { reply({ok:false,code:"job_mismatch"});return; } // positive binding only
+        stopRun(state);
+        releaseManagedSlot(state);
+        reply({ok:true,released:true,stopped:true,url:globalThis.location?.href || ""});return;
+      }
       if (msg.type === "ashlar-fix-cancel") stopRun(state);
-      const verdict = tabOwnership(state, msg.allocationUrl, msg.kind === "fix" || state.kind === "fix");
+      const verdict = tabOwnership(state, msg.allocationUrl, fixRun);
       const owned = verdict.ownership === "owned";
       // A tab on a permanent verdict (taken over, moved off its recorded conversation, or a fix whose
       // send recorded none: fixVerdictPermanent) or one the worker gives up identifying (preserve)

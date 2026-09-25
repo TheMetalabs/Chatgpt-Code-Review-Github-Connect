@@ -457,7 +457,7 @@ export function refreshBridgeClaim(
   return true;
 }
 
-export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId: string} | {ok: false; error: string} {
+export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId: string} | {ok: false; error: string; code?: string} {
   if (isFixItemId(jobId)) {
     const out = fixes().claim(jobId, clientId);
     if (out.ok) {

@@ -11,7 +11,7 @@ import {settingsHarness as harness} from './settings-harness.mjs';
 test('fixAgent round-trips through the Settings API and is live at once', async () => {
   const h = harness();
   assert.equal((await h.get()).fixAgent.enabled, false, 'default: the loop is off');
-  const wanted = {enabled: true, provider: 'grok', delivery: 'script-apply', mode: 'apply', parallelPrs: 2,
+  const wanted = {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'apply', parallelPrs: 2,
     roundCap: 4, attempts: 3, timeoutMs: 30 * 60_000, queueMaxMs: 60 * 60_000, chatTimeoutMs: 45 * 60_000, chatMaxPromptChars: 200_000};
   const res = await h.post({fixAgent: wanted});
   assert.equal(res.status, 200);
@@ -52,7 +52,7 @@ test('every invalid fixAgent value is rejected (400) and nothing is saved', asyn
 // The route passes every supplied field RAW to the shared validator. Before, a non-object fixAgent
 // was dropped by the route and the request answered 200 with nothing changed.
 test('a supplied non-object fixAgent (null / false / "off" / [] …) is a 400; the enabled loop stays as stored, live and persisted', async () => {
-  const h = harness({fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply'}});
+  const h = harness({fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'suggest'}});
   assert.equal(h.state.settings.fixAgent.enabled, true, 'fixture: the loop is ON and stored');
   const live = structuredClone(h.state.settings);
   for (const value of [null, false, 'off', [], 0, '', true, 'on', [{enabled: false}]]) {
@@ -158,7 +158,7 @@ test('enabling a legacy delivery is rejected (400): the API refuses what the run
   for (const pair of [{provider: 'chatgpt', delivery: 'chat-push'}, {provider: 'grok', delivery: 'chat-push'}, {provider: 'coding-agent', delivery: 'coding-agent'}]) {
     const res = await h.post({fixAgent: {...pair, enabled: true}});
     assert.equal(res.status, 400, JSON.stringify(pair));
-    assert.match((await res.json()).error, /not wired yet/);
+    assert.match((await res.json()).error, /not wired yet|is not supported as a fix provider yet/);
   }
   // An incompatible pair is rejected even while OFF (it has no execution path at all).
   assert.equal((await h.post({fixAgent: {provider: 'local', delivery: 'chat-push'}})).status, 400);
@@ -173,7 +173,7 @@ test('enabling a legacy delivery is rejected (400): the API refuses what the run
 
 test('a save whose JSON store cannot be written fails (500), both for enable and disable, and the live settings stay', async () => {
   const h = harness();
-  assert.equal((await h.post({fixAgent: {provider: 'grok'}})).status, 200);
+  assert.equal((await h.post({fixAgent: {provider: 'chatgpt'}})).status, 200);
   for (const enabled of [true, false]) {
     if (h.state.settings.fixAgent.enabled === enabled) {
       h.state.persistFails = false;
@@ -195,7 +195,8 @@ const STORED = [
   {fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'chat-push'}}, // a pre-#77 save
   {fixAgent: {enabled: true, provider: 'coding-agent', delivery: 'coding-agent'}},
   {fixAgent: {enabled: true, provider: null}},
-  {fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply', timeoutMs: 90_000.7, chatTimeoutMs: 1, roundCap: 1e9}},
+  {fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply', mode: 'apply'}}, // grok was a fix provider before
+  {fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'suggest', timeoutMs: 90_000.7, chatTimeoutMs: 1, roundCap: 1e9}},
   {maxTurns: 2.5, exploreTurns: -3, maxInlineComments: 99.9, localReviewMaxTokens: 0, contextPadLines: 1e300, promptDiffMaxChars: -1},
   {username: '  ', mention: ['', 42, ' @x '], reviewOrder: ['grok', 'bogus'], chatgptReasoning: 'turbo', localReviewMode: 'x', publishMinSeverity: 'P7'},
   {reviewChatgpt: false, reviewGrok: false, reviewLocal: false},
@@ -214,8 +215,25 @@ test('what load yields (disk or env seed), a save accepts: an unrelated save suc
   }
   // The loop stays OFF by default and for every non-runnable stored switch.
   assert.equal(harness().state.settings.fixAgent.enabled, false);
-  for (const stored of STORED.slice(0, 3)) assert.equal(harness(stored).state.settings.fixAgent.enabled, false, JSON.stringify(stored));
-  assert.equal(harness(STORED[3]).state.settings.fixAgent.enabled, true, 'a runnable stored switch stays ON');
+  for (const stored of STORED.slice(0, 4)) assert.equal(harness(stored).state.settings.fixAgent.enabled, false, JSON.stringify(stored));
+  assert.equal(harness(STORED[3]).state.settings.fixAgent.provider, 'grok', 'a legacy grok fix provider stays visible (OFF)');
+  assert.equal(harness(STORED[4]).state.settings.fixAgent.enabled, true, 'a runnable stored switch stays ON');
+});
+
+test('grok is refused as a fix provider by the Settings API (400, nothing saved); grok reviews are unaffected', async () => {
+  const h = harness();
+  const live = structuredClone(h.state.settings);
+  for (const delivery of ['script-apply', 'chat-push']) {
+    const res = await h.post({fixAgent: {enabled: true, provider: 'grok', delivery}});
+    assert.equal(res.status, 400, delivery);
+    assert.equal((await res.json()).error, 'grok is not supported as a fix provider yet: choose chatgpt, local to enable the review loop');
+  }
+  assert.equal(h.saves.length, 0);
+  assert.deepEqual(h.state.settings, live);
+  // a grok REVIEWER still saves, and the fix agent on chatgpt next to it too
+  const ok = await h.post({reviewGrok: true, fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply'}});
+  assert.equal(ok.status, 200);
+  assert.equal(h.state.settings.reviewGrok, true);assert.equal(h.state.settings.fixAgent.provider, 'chatgpt');
 });
 
 test('env seed: every whole-number env knob loads into the save domain', async (t) => {
@@ -237,7 +255,7 @@ test('env seed: every whole-number env knob loads into the save domain', async (
 // as fixAgent.paralellPrs) is a 400 before anything is merged or validated — never merged, ignored
 // by the value rules, dropped by sanitize and answered 200 with nothing applied.
 test('fixAgent: {paralellPrs: 9} (a typo) is a 400; nothing persisted, live settings unchanged', async () => {
-  const h = harness({fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply', parallelPrs: 2}});
+  const h = harness({fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'suggest', parallelPrs: 2}});
   const live = structuredClone(h.state.settings);
   const res = await h.post({fixAgent: {paralellPrs: 9}});
   assert.equal(res.status, 400);

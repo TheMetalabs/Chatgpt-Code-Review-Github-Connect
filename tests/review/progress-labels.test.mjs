@@ -645,19 +645,43 @@ function misuses(tokens, k, name, aliases, ctx) {
   return handed.length ? `${MISUSE} (${[name, ...handed].join('.')} holds what ${below(handed).by} aliases)` : MISUSE;
 }
 
+/** Never a scope of its own (see shadowing). */
+const NO_SHADOW = () => -1;
+
 /** The first token of `tokens[from..to)`, groups and template substitutions included, that misuses
- * `name`, as {token, why}, or null. `ctx` is what surrounds `tokens` (innerContext). */
-function firstMisuse(tokens, from, to, name, aliases, ctx = {}) {
+ * `name`, as {token, why}, or null. `ctx` is what surrounds `tokens` (innerContext). A scope `shadowed`
+ * ends past `tokens[k]` binds its own `name` and is skipped (shadowing). */
+function firstMisuse(tokens, from, to, name, aliases, ctx = {}, shadowed = NO_SHADOW) {
   for (let k = from; k < to; k += 1) {
+    const end = shadowed(tokens, k);
+    if (end > k) { k = end - 1; continue; }
     const why = misuses(tokens, k, name, aliases, ctx);
     if (why) return {token: tokens[k], why};
     const token = tokens[k];
     for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) {
-      const hit = firstMisuse(inner, 0, inner.length, name, aliases, token.kind === 'group' ? innerContext(tokens, k, ctx) : {});
+      const hit = firstMisuse(inner, 0, inner.length, name, aliases, token.kind === 'group' ? innerContext(tokens, k, ctx) : {}, shadowed);
       if (hit) return hit;
     }
   }
   return null;
+}
+
+/** For a bound `name` read at the end of `path`: where a scope that starts at `tokens[k]` and binds its own
+ * `name` ends, or -1. Such a scope is a function's, method's or catch's parameter list with its body when
+ * the parameters (or a function expression's own name) bind it, a block (a function body too) that
+ * declares it, or an arrow whose parameters bind it, with its body. The name in there is that binding,
+ * not the one the read sees; a scope that holds the read is not skipped, so a shadow over the read still
+ * fails. As in boundLocally, a call followed by a block with no `;` between reads as a function head. */
+function shadowing(path, name) {
+  const holders = new Set(path.map(({tokens, index}) => tokens[index]));
+  return (tokens, k) => {
+    const token = tokens[k];
+    let end = -1;
+    if (isPunct(tokens[k + 1], '=>')) end = bindingNames(token).includes(name) ? functionAt(tokens, k + 1).to : -1;
+    else if (token.open === '(' && tokens[k + 1]?.open === '{') end = headNames(tokens, k).includes(name) ? k + 2 : -1;
+    else if (token.open === '{') end = [...headNames(tokens, k), ...declaredNames(token.tokens)].includes(name) ? k + 1 : -1;
+    return end > k && !tokens.slice(k, end).some(inner => holders.has(inner)) ? end : -1;
+  };
 }
 
 /** Words whose parenthesised head is followed by a block that runs where it stands. */
@@ -680,13 +704,19 @@ function functionAt(tokens, k) {
   return classBody(tokens, k) ? {from: k, to: k + 1} : null;
 }
 
-/** The functions and classes anywhere in `level` (functionAt), as {tokens, from, to}. */
-function functionRanges(level) {
+/** The functions and classes anywhere in `level` (functionAt), as {tokens, from, to}, save those inside a
+ * scope `shadowed` skips (a function whose body alone declares the name keeps its parameters). */
+function functionRanges(level, shadowed = NO_SHADOW) {
   const ranges = [];
-  walkTokens(level, (token, tokens, k) => {
-    const range = functionAt(tokens, k);
-    if (range) ranges.push({tokens, ...range});
-  });
+  const walk = tokens => {
+    for (let k = 0; k < tokens.length; k += 1) {
+      const range = functionAt(tokens, k), token = tokens[k], end = shadowed(tokens, k);
+      if (range) ranges.push({tokens, ...range});
+      if (end > k) { k = end - 1; continue; }
+      for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walk(inner);
+    }
+  };
+  walk(level);
   return ranges;
 }
 
@@ -713,39 +743,40 @@ function loopAround(tokens, index, start) {
  * around the read, whose next pass runs its whole statement before the read again; and, when the read is
  * itself in a function there, the rest of the block after the declaration. `contexts` is what surrounds
  * each level of `path` (innerContext). */
-function runsLater(path, decl, name, aliases, contexts) {
+function runsLater(path, decl, name, aliases, contexts, shadowed) {
   const block = path[decl.frame].tokens;
   let hit = null, deferred = false;
   for (let frame = decl.frame; frame < path.length; frame += 1) {
     const {tokens, index} = path[frame], loop = loopAround(tokens, index, frame === decl.frame ? decl.at + 1 : 0);
-    if (loop) hit ||= firstMisuse(tokens, loop.from, loop.to, name, aliases, contexts[frame]);
+    if (loop) hit ||= firstMisuse(tokens, loop.from, loop.to, name, aliases, contexts[frame], shadowed);
     deferred ||= tokens.some((token, k) => { const range = functionAt(tokens, k); return Boolean(range) && range.from <= index && index < range.to; });
   }
-  if (deferred) hit ||= firstMisuse(block, decl.at + 1, block.length, name, aliases, contexts[decl.frame]);
-  for (const range of functionRanges(block)) hit ||= firstMisuse(range.tokens, range.from, range.to, name, aliases);
+  if (deferred) hit ||= firstMisuse(block, decl.at + 1, block.length, name, aliases, contexts[decl.frame], shadowed);
+  for (const range of functionRanges(block, shadowed)) hit ||= firstMisuse(range.tokens, range.from, range.to, name, aliases, {}, shadowed);
   return hit;
 }
 
 /** What could change or shadow `name` between its declaration `decl` and the read at the end of `path`:
  * the first misuse in the code between them (an earlier substitution of a template the read is in
  * included), or in code that runs between them from elsewhere (runsLater), or a function declaration of
- * the name in a level the read sits in, hoisted over it. */
+ * the name in a level the read sits in, hoisted over it. A scope that binds its own `name` and does not
+ * hold the read is not scanned (shadowing). */
 function changedBetween(path, decl, name, aliases) {
-  const contexts = [{}];
+  const contexts = [{}], shadowed = shadowing(path, name);
   for (let frame = 1; frame < path.length; frame += 1) {
     const {tokens, index} = path[frame - 1];
     contexts.push(tokens[index].kind === 'group' ? innerContext(tokens, index, contexts[frame - 1]) : {});
   }
-  let hit = firstMisuse(path[decl.frame].tokens, decl.at + 1, path[decl.frame].index, name, aliases, contexts[decl.frame]);
+  let hit = firstMisuse(path[decl.frame].tokens, decl.at + 1, path[decl.frame].index, name, aliases, contexts[decl.frame], shadowed);
   for (let frame = decl.frame + 1; frame < path.length; frame += 1) {
     const holder = path[frame - 1].tokens[path[frame - 1].index], level = path[frame].tokens;
     for (const prior of holder.kind === 'tpl' ? holder.substs.slice(0, holder.substs.indexOf(level)) : []) {
-      hit ||= firstMisuse(prior, 0, prior.length, name, aliases);
+      hit ||= firstMisuse(prior, 0, prior.length, name, aliases, {}, shadowed);
     }
     const hoisted = level.find((token, k) => token.kind === 'word' && token.text === name && level[k - 1]?.text === 'function');
-    hit ||= firstMisuse(level, 0, path[frame].index, name, aliases, contexts[frame]) || (hoisted && {token: hoisted, why: MISUSE});
+    hit ||= firstMisuse(level, 0, path[frame].index, name, aliases, contexts[frame], shadowed) || (hoisted && {token: hoisted, why: MISUSE});
   }
-  return hit || runsLater(path, decl, name, aliases, contexts);
+  return hit || runsLater(path, decl, name, aliases, contexts, shadowed);
 }
 
 /** What a `const` declared by `by` with initialiser `init` aliases: the object its leading member chain
@@ -1102,6 +1133,13 @@ test('repair_${status.status} takes the RepairStatus values only where status is
   // a loop after it, functions that only read either name and another block's own status change nothing.
   assert.deepEqual(problems(`${REPAIR_REPLY}${record};\nstatus.status = "late";\nfor (const row of rows) response.repair.status = row;\n` +
     'const peek = () => status.status;\nfunction later() { return response.repair.id; }\nif (ok) { const status = {}; status.status = "x"; }'), []);
+  // A scope that binds its own status or response (a parameter, an arrow's, a catch binding, a local
+  // declaration) is another binding than the read's, before the read or after it, nested or not.
+  assert.deepEqual(problems(`${REPAIR_REPLY}${record};\nfunction helper(status) { return status.status; }\nfunction reset(status) { status.status = "local"; }\n` +
+    'function other() { const status = {}; status.status = "local"; }\nfunction outer(response) { return () => { response.repair = null; }; }\n' +
+    'const hooks = {reset(status) { status.status = "local"; }};'), []);
+  assert.deepEqual(problems(`${REPAIR_REPLY}rows.forEach(status => { status.status = "x"; });\ntry { run(); } catch (status) { status.status = "x"; }\n` +
+    `if (ok) { let status = {}; status.status = "x"; }\nfunction helper(status) { status.status = "x"; }\n${record};`), []);
   const reply = REPAIR_REPLY;
   for (const [body, problem] of [
     // Another binding named status, or none.
@@ -1191,6 +1229,11 @@ test('repair_${status.status} takes the RepairStatus values only where status is
     [`${reply}do {\n  if (ok) ${record};\n  response.repair = patch;\n} while (next());`, 'reads response, which line 6 uses'],
     [`${reply}setTimeout(() => ${record});\nstatus.status = "stalled";`, 'reads status, which line 5 uses'],
     [`${reply}const later = () => {\n  ${record};\n};\nresponse.repair = patch;\nlater();`, 'reads response, which line 7 uses'],
+    // A scope that binds another name, or binds the name only in its body, is still the read's binding
+    // around it: a default parameter, a closure in a function with other parameters, another name's write.
+    [`${reply}${record};\nfunction helper(late = status.status = "stalled") { const status = {}; }`, 'reads status, which line 5 uses'],
+    [`${reply}${record};\nfunction outer(row) { return () => { status.status = row; }; }`, 'reads status, which line 5 uses'],
+    [`${reply}${record};\nfunction helper(status) { response.repair.status = status; }`, 'reads response, which line 5 uses'],
   ]) {
     const found = problems(body);
     assert.equal(found.length, 1, `${body}\n: ${found.join('\n')}`);

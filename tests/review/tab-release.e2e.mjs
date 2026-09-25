@@ -166,6 +166,36 @@ for(const kind of ['review','fix'])for(const [name,regenerate] of REGENERATIONS)
  assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
  assert.ok((await tab.steps()).includes('context_changed'));
 });
+// Ashlar finding on 5d646137 (R2): the regeneration evidence lived only in the page's memory. A page
+// reloaded after the answer was secured (Chrome discarded the tab and the cleanup's own wake reloaded
+// it, or an extension update re-injected the scripts) has a fresh runner that never completed the
+// answer, so a Stop, a streaming flag or a pager was ignored and the tab closed during the user's
+// regeneration. The worker asks can-close only for a secured answer and says so (`secured`).
+const RELOADED_REGENERATIONS=[
+ ['the regeneration finished (a 2/2 pager)',async tab=>{
+  await tab.page.evaluate(pager=>{const a=document.querySelector('[data-message-author-role="assistant"]');a.dataset.messageId='answer-B';a.querySelector('#code').textContent='{"findings":[],"merge_recommendation":"COMMENT"}';document.querySelector('[aria-label="Response actions"]').insertAdjacentHTML('beforeend',pager);},pager);
+  tab.served.thread=await tab.page.evaluate(()=>document.getElementById('thread').innerHTML);
+  await tab.reload();
+ }],
+ ['the regeneration is still streaming (Stop and a streaming flag)',async tab=>{
+  tab.served.thread=await tab.page.evaluate(()=>document.getElementById('thread').innerHTML);tab.served.after=stopButton;
+  await tab.reload();
+  await tab.page.evaluate(()=>{document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('afterbegin','<div data-streaming-response-status="streaming" style="width:60px;height:20px">…</div>');});
+ }],
+];
+for(const kind of ['review','fix'])for(const [name,regenerateAndReload] of RELOADED_REGENERATIONS)test(`${kind}: a secured tab reloaded after the user regenerated (${name}) is preserved as regenerated`,async t=>{
+ const {tab}=await collected(t,{kind});
+ await regenerateAndReload(tab);
+ assert.equal(await tab.page.evaluate(()=>Boolean(__ashlarRunnerState.result||__ashlarRunnerState.nativeCompletion)),false,'fixture: the reloaded page never completed the answer itself');
+ assert.deepEqual(verdict(await tab.send('ashlar-can-close',{allocationUrl:TEMP_URL,secured:true})),{canClose:false,reason:'repurposed',cause:'regenerated'});
+ assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
+});
+for(const kind of ['review','fix'])test(`${kind}: control: a secured tab reloaded with no regeneration still closes`,async t=>{
+ const {tab}=await collected(t,{kind});
+ tab.served.thread=await tab.page.evaluate(()=>document.getElementById('thread').innerHTML);
+ await tab.reload();
+ assert.deepEqual(verdict(await tab.send('ashlar-can-close',{allocationUrl:TEMP_URL,secured:true})),{canClose:true,reason:'complete'});
+});
 const TAKEOVERS=[
  ['a follow-up turn','user_turn',p=>p.evaluate(html=>document.getElementById('thread').insertAdjacentHTML('beforeend',html),userTurn('user-B','my own question'))],
  ['a draft in the composer','draft',p=>p.evaluate(()=>{document.getElementById('prompt-textarea').textContent='my unsent question';})],
@@ -742,6 +772,30 @@ test('worker, review: a generating leg whose tab Chrome discards again after its
  assert.equal(w.b.calls.some(c=>c.action==='failure'),false,'never failed as tab_discarded');
  assert.deepEqual(w.b.closedTabs,[10],`closed once the answer was secured: ${uploadedSteps(w)}`);assert.equal(w.state(),undefined);
  assert.equal(await tab.clicks(),0,'the prompt is never sent again');
+});
+// R2 end to end: the review was collected but its delivery failed (the bridge was down); the user
+// regenerated it to completion; Chrome discarded the tab; the bridge came back and ACKed the answer.
+// The cleanup's own wake reloads the tab: its fresh page must still keep the user's regeneration.
+test('worker, review: delivery delayed, the user regenerates, Chrome discards the tab, the cleanup wakes it: kept as regenerated, never closed',async t=>{
+ let down=true;
+ const tab=await chatTab(t,{url:CONV_URL,thread:userTurn()+answerTurn(),journal:sentJournal({conversation:CONV_URL})});
+ const w=wire(tab,{session:createdHere(),onComplete:async()=>{if(down)throw Object.assign(new Error('bridge down'),{status:503});}});
+ await w.tick();await tab.page.clock.runFor(2400);
+ await w.tick();
+ assert.equal(w.state().delivered,undefined,'fixture: the delivery failed');assert.equal(w.state().outcome?.ok,true,'the answer was collected');
+ await tab.page.evaluate(pager=>{const a=document.querySelector('[data-message-author-role="assistant"]');a.dataset.messageId='answer-B';a.querySelector('#code').textContent='{"findings":[],"merge_recommendation":"COMMENT"}';document.querySelector('[aria-label="Response actions"]').insertAdjacentHTML('beforeend',pager);},pager);
+ tab.served.thread=await tab.page.evaluate(()=>document.getElementById('thread').innerHTML);
+ Object.assign(w.b.tabs.get(10),{status:'unloaded',discarded:true});
+ const reloads=[];
+ w.b.chrome.tabs.reload=async id=>{reloads.push(id);Object.assign(w.b.tabs.get(id),{discarded:false,status:'loading'});await tab.reload();};
+ down=false;
+ await w.tick({syncUrl:false});
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');assert.deepEqual(reloads,[10],'the cleanup woke the tab');
+ w.b.tabs.get(10).status='complete';
+ await w.tick();
+ assert.ok(w.b.messages.some(m=>m.type==='ashlar-can-close'&&m.secured===true),'the cleanup says the answer was secured');
+ assert.deepEqual(w.b.closedTabs,[],'the tab the user regenerated in is never closed');assert.equal(w.state(),undefined,'the job retired');
+ assert.ok(uploadedSteps(w).includes('worker:preserve_regenerated'),`${uploadedSteps(w)}`);
 });
 // Ashlar 4101062759, reopened: a page loaded again after a discard is not proof that the run goes on.
 // A reload keeps the submission journal but not the page: the prompt Ashlar entered but never sent

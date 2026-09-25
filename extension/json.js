@@ -344,9 +344,11 @@ function answerCompleted(state) {
  * user's regenerate or retry does (Ashlar 4101062754). A redraw that only changes the answer's text,
  * fences, labels or message id is not one. With no pager recorded at collection (collectedVariant is
  * recorded by the native collector, and by the first completed source a capture or repair took), any
- * pager on the bound response counts: a kept tab is recoverable, a closed one is not. */
-function regeneratedAfterCompletion(state, submission) {
-  if (!answerCompleted(state) || typeof boundReviewResponse !== "function") return false;
+ * pager on the bound response counts: a kept tab is recoverable, a closed one is not. `secured`: the
+ * worker's word that this run's answer was completed and taken, for a page that no longer remembers
+ * it (reloaded, or re-injected, after the answer was secured: a fresh runner). */
+function regeneratedAfterCompletion(state, submission, secured = false) {
+  if (!(secured || answerCompleted(state)) || typeof boundReviewResponse !== "function") return false;
   const bound = boundReviewResponse(submission);
   if (typeof stopButtonVisible === "function" && stopButtonVisible()) return true;
   if (!bound.root) return false;
@@ -773,8 +775,9 @@ async function waitUntilFixOrQuota(name) {
  *  - a user turn after Ashlar's journaled turn ("user_turn"), or that turn edited ("edited");
  *  - a composer draft that is not Ashlar's own prompt ("draft");
  *  - another conversation or site (samePage against the pinned conversation: "navigated");
- *  - the answer generated again after this page completed it ("regenerated": a Stop control or a
- *    streaming flag back, or a new variant pager; regeneratedAfterCompletion).
+ *  - the answer generated again after this page completed it, or after the worker says it was
+ *    secured (`secured`, for a page reloaded since) ("regenerated": a Stop control or a streaming flag
+ *    back, or a new variant pager; regeneratedAfterCompletion).
  * Nothing else about the ANSWER is compared (text, fences, labels, message id): ChatGPT keeps
  * redrawing a finished answer, and that is not the user's activity.
  * "owned" carries how it was proven: `blank` (nothing on the page), `unsent` (only Ashlar's
@@ -784,7 +787,7 @@ async function waitUntilFixOrQuota(name) {
  * turns after a reload), `identity: "changed"`, or (`fix`: a fix run's tab) `identity:
  * "unestablished"`, a sent fix whose send recorded no conversation; the worker asks again or
  * preserves the tab. */
-function tabOwnership(state, allocationUrl, fix = false) {
+function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   if (state.tabRepurposed) return {ownership: "takenOver", cause: state.takeoverCause || "user_turn"};
   // Every takeover is permanent (as for a fix run's answer, fixOwnershipProof): a draft the user
   // clears again or an edit the user undoes does not hand the tab back.
@@ -861,7 +864,7 @@ function tabOwnership(state, allocationUrl, fix = false) {
   // 4101062732). Any other text is an edit.
   if (sent !== submission.expected) return takeOver("edited");
   if (users.indexOf(turn) < users.length - 1) return takeOver("user_turn");
-  if (regeneratedAfterCompletion(state, submission)) return takeOver("regenerated");
+  if (regeneratedAfterCompletion(state, submission, secured)) return takeOver("regenerated");
   if (unestablished) return unestablished;
   return pinned ? {ownership: "owned", conversation: pinned} : {ownership: "owned", unpinned: true};
 }
@@ -1068,7 +1071,7 @@ function installReviewRunner(name, run) {
         reply({ok:true,released:true,stopped:true,url:globalThis.location?.href || ""});return;
       }
       if (msg.type === "ashlar-fix-cancel") stopRun(state);
-      const verdict = tabOwnership(state, msg.allocationUrl, fixRun);
+      const verdict = tabOwnership(state, msg.allocationUrl, fixRun, msg.secured === true);
       const owned = verdict.ownership === "owned";
       // A tab on a permanent verdict (taken over, moved off its recorded conversation, or a fix whose
       // send recorded none: fixVerdictPermanent) or one the worker gives up identifying (preserve)

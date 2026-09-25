@@ -1384,8 +1384,12 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     const known = state.conversation || answeredPage(state, provider);
     if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
   }
+  // `secured`: this run's answer was completed and taken (collected, or its full source archived):
+  // a page that no longer remembers that (reloaded, for one by this cleanup's own wake, or re-injected
+  // after an update) still reads a generation on it as the user's (json.js regeneratedAfterCompletion).
+  const secured = state.outcome?.ok === true || sourceArchiveDurable(state);
   const message = {...tabMessage(job, provider, cancelled ? "ashlar-fix-cancel" : "ashlar-can-close"),
-    allocationUrl: providerUrl(provider), ...(undispatched ? {undispatched: true} : {})};
+    allocationUrl: providerUrl(provider), ...(undispatched ? {undispatched: true} : {}), ...(secured ? {secured: true} : {})};
   let result;
   try { result = await askPage(tab.id, message, contentFiles(provider)); } catch {
     // No receiver and reinjection failed, or no answer in time (askPage): ownership is unknown and

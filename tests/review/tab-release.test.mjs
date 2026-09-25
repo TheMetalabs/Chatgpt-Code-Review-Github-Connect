@@ -449,3 +449,35 @@ test('a leg whose tab the worker closed is not revived by a late replace naming 
   assert.equal(states.chatgpt.tabId, 10);assert.deepEqual(states.chatgpt.workerEvents.map(e => e.stage), ['tab_closed']);
   assert.equal(states.grok.tabId, 20);assert.equal(states.grok.workerEvents, undefined);
 });
+/** Chrome already swapped tab 10's page into `tab`, but the onReplaced event reaches the worker only
+ * while it searches for the leg's tab (findOriginalTab's query), after the old id's lookup failed. */
+function replacedDuringLookup(b, tab) {
+  b.tabs.delete(10);b.tabs.set(tab.id, tab);
+  const query = b.chrome.tabs.query;let delivered = false;
+  b.chrome.tabs.query = async filter => { if (filter?.url && !delivered) { delivered = true;await b.context.rekeyReplacedTab(tab.id, 10); } return query(filter); };
+}
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a cancelled leg whose tab Chrome replaced during its cleanup's lookup is not retired as lost; it closes the tab under its new id`, async () => {
+    const b = worker(leg(kind, {pageUrl: TEMP}), {status: 'cancelled', session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: blankVerdict});
+    noPageWhileDiscarded(b);
+    b.chrome.tabs.reload = async id => { Object.assign(b.tabs.get(id), {discarded: false, status: 'loading'}); };
+    replacedDuringLookup(b, {id: 11, url: TEMP, status: 'unloaded', discarded: true});
+    await b.tick();
+    assert.ok(b.pending(), 'not retired: the tab is not absent, it has a new id');
+    assert.equal(b.pending().states.chatgpt.tabId, 11);
+    assert.deepEqual(historyOf(b), [], 'no tab_lost');
+    await b.tick();
+    b.tabs.get(11).status = 'complete';
+    await b.tick();
+    assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, [11], 'closed, not leaked');
+    assert.deepEqual(historyOf(b), ['worker:tab_closed']);
+  });
+  test(`${kind}: a stalled leg whose tab Chrome replaced during the sweep's lookup is not gone`, async () => {
+    const b = worker(leg(kind, {}), {session: createdHere(kind), tab: {id: 10, url: URL_TAB, status: 'complete'}});
+    noPageWhileDiscarded(b);
+    replacedDuringLookup(b, {id: 11, url: URL_TAB, status: 'unloaded', discarded: true});
+    const jobs = await b.jobs();
+    assert.equal(await b.context.providerTabGone(jobs[leg(kind).jobId], 'chatgpt'), false, 'the sweep keeps a leg whose tab lives on');
+    assert.equal(jobs[leg(kind).jobId].states.chatgpt.tabId, 11);
+  });
+}

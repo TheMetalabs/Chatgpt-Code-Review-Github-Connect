@@ -859,10 +859,14 @@ async function cleanupProviderBody(job, provider, jobs) {
   }
   try {
     let tab;
-    try { tab = await chrome.tabs.get(state.tabId); }
+    const lookedUp = state.tabId;
+    try { tab = await chrome.tabs.get(lookedUp); }
     catch {
       tab = await findOriginalTab(job, provider);
       if (!tab) {
+        // Chrome replaced the tab while it was looked up (rekeyReplacedTab moved the leg to the new
+        // id): it is not absent. The next tick asks it under its new id.
+        if (state.tabId !== lookedUp) return;
         // Once the full source receipt is durably local+server stored, tab absence
         // cannot strand repair. It also cannot authorize closing a replacement.
         if (sourceArchiveDurable(state)) return finishTabCleanup(job, provider, jobs, "archived source durable; original tab absent");
@@ -1654,13 +1658,16 @@ async function repairProvider(job, provider, jobs) {
 async function providerTabGone(job, provider) {
   const state = job.states[provider];
   if (!state.tabId && !state.started) return true;
-  if (state.tabId) {
+  const lookedUp = state.tabId;
+  if (lookedUp) {
     try {
-      const tab = await chrome.tabs.get(state.tabId);
+      const tab = await chrome.tabs.get(lookedUp);
       if (allowedTab(tab, provider)) return false;
     } catch { /* recorded tab is gone; fall through to a full owned-tab search */ }
   }
-  return !(await findOriginalTab(job, provider));
+  const found = await findOriginalTab(job, provider);
+  // A tab Chrome replaced meanwhile (rekeyReplacedTab moved the leg to its new id) is not gone.
+  return !found && state.tabId === lookedUp;
 }
 
 /** The bridge job registry is in-memory only, so a job the server used to own that now

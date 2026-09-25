@@ -109,7 +109,7 @@ It is called only on an **explicit terminal signal** of the chat round:
 
 | Signal | Release | Caller |
 | --- | --- | --- |
-| The merged chat result is `verify` (§1: structured, 0 findings, no raw) | verification round (`localVerifyChat` = the chat reviewers whose structured result was clean) | `submitHarborChat` |
+| The merged chat result is `verify` (§1: 0 findings, no raw, every chat payload a complete verdict) | verification round (`localVerifyChat` = the chat reviewers whose complete verdict was clean) | `submitHarborChat` |
 | Every chat leg finished without a usable payload (no valid JSON) | fallback | `submitHarborChat` |
 | Every chat leg reached an explicit terminal outcome (quota, empty, tab closed, error) with no payload | fallback | watcher |
 | The Chrome bridge reports disconnected for at least `BRIDGE_CONNECTED_MS`, measured from the disconnect, with no chat progress | fallback | watcher (`chatStalled`) |

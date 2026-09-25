@@ -103,8 +103,8 @@ function callGraph(text) {
 }
 
 /** Tab effects reached from outside the queue, as `caller→callee` edges (or `fn` for a direct
- * effect), until their lanes move into it: the stall sweep (commit 7). */
-const OUTSIDE_QUEUE_UNTIL_MOVED = new Set(['providerTabGone→findOriginalTab']);
+ * effect): none. */
+const OUTSIDE_QUEUE_UNTIL_MOVED = new Set([]);
 test('guard (I1): every tab effect is reached only from inside a tab operation', () => {
   const {fns, opBodies, effectful, inside} = callGraph(source('extension/background.js'));
   assert.ok(opBodies.has('pollProviderBody') && opBodies.has('cleanupProviderBody') && opBodies.has('probeTabOwner'), 'sanity: the operation bodies are found');
@@ -448,3 +448,65 @@ for (const [what, shape] of Object.entries(Q2_SHAPES)) {
     assert.deepEqual(found, []);
   });
 }
+
+// ── The sweep, retirement and the hard reset (commit 7).
+
+// W1: the sweep abandons a job whose poll is between its run message and saving `started`. The
+// abandon is an operation: it runs after that poll, so the release that follows sees the dispatched
+// run (it stops it with fix-cancel, never the undispatched fence), and nothing else ends the leg.
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: the sweep's abandon of a job whose poll is sending its run waits for that poll; the release stops the dispatched run`, async () => {
+    const job = {...leg({tabId: 10, started: false}), ...(kind === 'fix' ? {kind: 'fix'} : {})};
+    const server = {status: 'awaiting_chat'};
+    let reply;
+    const b = worker(job, {session: createdHere(), tab: {id: 10, url: TEMP, status: 'complete'},
+      handler: (_id, m) => (m.type === 'ashlar-tab-status' ? {ok: true}
+        : m.type === 'ashlar-can-close' || m.type === 'ashlar-fix-cancel' ? {ok: true, releaseProtocol: 1, ownership: 'owned', url: TEMP} : {ok: false, code: 'busy', retry: true})});
+    b.context.api = (orig => async (path, body, ...rest) => { await orig(path, body, ...rest);
+      return body?.action === 'ping' ? (server.status === 'awaiting_chat' ? {ok: true, active: true, accepted: true, status: server.status} : {ok: true, active: false, status: server.status}) : {ok: true, job: null}; })(b.context.api);
+    const send = b.chrome.tabs.sendMessage;
+    b.chrome.tabs.sendMessage = (id, msg, cb) => {
+      if (msg.type === 'ashlar-run' && !reply) { b.messages.push({id, ...msg}); reply = () => send(id, msg, cb); return; }
+      return send(id, msg, cb);
+    };
+    const ticking = b.tick();
+    assert.ok(await until(() => reply), 'the poll sent its run message');
+    // The server cancels the job; the next heartbeat records it, and the sweep takes it.
+    server.status = 'cancelled';
+    await b.context.heartbeatTick();
+    const sweeping = b.context.clearStuckJobs();
+    for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+    const jobs = await b.jobs();
+    assert.equal(jobs['job-A'].states.chatgpt.abandoned, undefined, 'the abandon waits for the poll');
+    reply();
+    await Promise.all([ticking, sweeping]);
+    await b.queueIdle();
+    const stops = b.messages.filter(m => m.id === 10 && m.type === 'ashlar-fix-cancel');
+    assert.ok(stops.length >= 1, 'the dispatched run is stopped');
+    assert.equal(b.messages.some(m => m.undispatched === true), false, 'never the undispatched fence');
+    assert.equal(b.calls.some(c => c.action === 'failure' || c.action === 'complete'), false, 'nothing else ends the leg');
+    const state = (await b.jobs())['job-A']?.states.chatgpt;
+    assert.ok(!state || (state.started === true && state.abandoned === true), 'abandoned after the poll recorded its dispatch');
+  });
+}
+// W12: a hard reset is an operation: every later operation does nothing, and no registry write from
+// a lane that still holds the old registry lands after it (the reload follows).
+test('operations queued behind a hard reset do nothing, and no registry write lands after it', async () => {
+  const b = worker(leg({tabId: 10, started: false}), {session: createdHere(), tab: {id: 10, url: TEMP, status: 'complete'}});
+  const jobs = await b.jobs();
+  let release;
+  const held = b.op(() => new Promise(resolve => { release = resolve; }));
+  assert.ok(await until(() => release));
+  const reset = b.context.hardReset();
+  const polled = b.context.pollProvider(jobs['job-A'], 'chatgpt', jobs);
+  release();
+  await held;
+  assert.equal((await reset)?.ok, true);
+  await polled;
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'the registry is empty');
+  assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run'), [], 'the queued poll did nothing');
+  jobs['job-A'].states.chatgpt.note = 'late';
+  await b.context.saveJobs(jobs);
+  assert.deepEqual(b.local.state.pendingReviewJobs, {}, 'a lane holding the old registry writes nothing');
+  assert.equal(Object.keys(await b.context.workerJobs('http://bridge')).length, 0, 'the cached registry is empty');
+});

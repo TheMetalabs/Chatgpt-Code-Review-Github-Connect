@@ -65,8 +65,12 @@ let maintenanceTail = Promise.resolve();
 const TAB_OP_BUDGET_MS = 30_000;
 let tabTail = Promise.resolve();
 let activeOp = null; // {kind, deadline} of the running operation
+/** A hard reset ran (hardReset): no later operation runs and no registry write lands until the
+ * reload (lanes still holding the old registry can neither persist it again nor act on a tab). */
+let resetting = false;
 function tabOp(kind, body) {
   const run = tabTail.then(async () => {
+    if (resetting) return undefined;
     activeOp = {kind, deadline: Date.now() + TAB_OP_BUDGET_MS};
     try { return await body(); } finally { activeOp = null; }
   });
@@ -569,6 +573,7 @@ function contentFiles(provider) {
  * An unacknowledged outcome is replayed to the bridge, never to the model.
  */
 async function saveJobs(jobs) {
+  if (resetting) return; // the registry was reset: nothing from before it is written again
   // Snapshot now, write in invocation order. Later snapshots include other lanes'
   // mutations because they reference the same registry throughout this worker.
   const snapshot = JSON.parse(JSON.stringify(jobs));
@@ -1346,6 +1351,18 @@ function abandonLegs(job, providers, status) {
   }
 }
 
+/** abandonLegs for every leg of `job` (and, for the sweep, `closeRequested`: it confirmed the job is
+ * gone), saved, as one `abandon` operation in the tab queue: after the leg's poll that may be between
+ * its run message and saving `started` (W1), so the release that follows sees what it dispatched. */
+function abandonJobLegs(job, jobs, status, closeRequested = false) {
+  return tabOp("abandon", async () => {
+    if (jobs[job.jobId] !== job) return;
+    abandonLegs(job, job.providers, status);
+    if (closeRequested) for (const provider of job.providers) job.states[provider].closeRequested = true;
+    await saveJobs(jobs);
+  });
+}
+
 /** A tab Chrome discarded to save memory (or has not loaded since) holds no page: nothing in it can
  * answer, and no follow-up, draft or edit is readable in it until it loads again (then its page
  * renders what the provider kept, and gives the verdict). Its URL is still readable: on another
@@ -1647,8 +1664,11 @@ async function rememberRetired(job) {
   } catch { /* the diagnostic entry is lost; the retirement goes on */ }
 }
 
+function retirable(job) {
+  return job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone);
+}
 async function retireCleanJob(job, jobs, forgotten = false, signal) {
-  if (!job.providers.every(p => job.states[p].delivered && job.states[p].cleanupDone)) return false;
+  if (!retirable(job)) return false;
   // Final trace uploading terminal events (result_saved, tab_closed) to review history. Detach it ONLY
   // for a job the caller FRESHLY confirmed the server has forgotten (missing/unknown): recordBridgeProgress
   // can't find the evicted job so the upload is rejected, and the bridge fetch is unbounded — awaiting it
@@ -1662,24 +1682,29 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
   // the session/local deletions below are NOT signal-abortable, so run them here and they would overlap
   // the next alarm's sweep. Recheck the signal and bail before deleting under a newer sweep's ownership.
   if (signal?.aborted) return false;
-  await writeInOrder(async () => {
-    const old = await chrome.storage.session.get(["tabs"]);
-    const tabs = {...old.tabs};
-    for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
-    await chrome.storage.session.set({tabs});
-    await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
-    await rememberRetired(job);
+  // The retirement itself is one `retire` operation in the tab queue: after every operation of the
+  // job queued before it, and only while the job is still registered and retirable, so the job lane
+  // and the sweep never both retire it (W5).
+  return tabOp("retire", async () => {
+    if (jobs[job.jobId] !== job || !retirable(job)) return false;
+    await writeInOrder(async () => {
+      const old = await chrome.storage.session.get(["tabs"]);
+      const tabs = {...old.tabs};
+      for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
+      await chrome.storage.session.set({tabs});
+      await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
+      await rememberRetired(job);
+    });
+    // writeInOrder above is itself an unabortable storage sequence that can outlive the sweep watchdog.
+    // Recheck before the registry delete/persist. (delete + saveJobs is sync-then-await, so no abort
+    // can interleave between them once we pass this fence.)
+    if (signal?.aborted) return false;
+    delete jobs[job.jobId];
+    await saveJobs(jobs);
+    // Its item is settled on the server: no replay of its delivery can come any more.
+    await forgetFixDelivery(job).catch(() => {});
+    return true;
   });
-  // writeInOrder above is itself an unabortable storage sequence that can outlive the sweep watchdog.
-  // Recheck before the registry delete/persist so an abandoned sweep can't delete jobs[jobId] and rewrite
-  // pendingReviewJobs concurrently with the next alarm's sweep. (delete + saveJobs is sync-then-await, so
-  // no abort can interleave between them once we pass this fence.)
-  if (signal?.aborted) return false;
-  delete jobs[job.jobId];
-  await saveJobs(jobs);
-  // Its item is settled on the server: no replay of its delivery can come any more.
-  await forgetFixDelivery(job).catch(() => {});
-  return true;
 }
 
 function connectionErrors(job) {
@@ -2040,6 +2065,12 @@ function repairBody(job, provider, action, attempt) {
   return {action, jobId:job.jobId, leaseId:job.leaseId, provider, runId:job.states[provider].runId,
     repairId:attempt.id, responseId:attempt.responseId, sourceHash:attempt.sourceHash};
 }
+/** A durable capture as the local registry holds it (its text: the exact local copy, if kept). */
+function localArchivedSource(state) {
+  const saved=state.sourceCapture;
+  return {text:saved.text,totalChars:saved.totalChars,truncated:false,completed:true,stable:true,
+    responseId:saved.responseId,sourceHash:saved.sourceHash,captureId:saved.id,context:saved.context};
+}
 async function readRepairSource(job, provider, full = true) {
   const state=job.states[provider];
   if(sourceArchiveDurable(state)) {
@@ -2068,8 +2099,7 @@ async function readRepairSource(job, provider, full = true) {
       }
       if(typeof text!=="string")return null;
     }
-    return {text,totalChars:saved.totalChars,truncated:false,completed:true,stable:true,
-      responseId:saved.responseId,sourceHash:saved.sourceHash,captureId:saved.id,context:saved.context};
+    return {...localArchivedSource(state),text};
   }
   return tabOp("sourceRead",()=>readPageSource(job,provider));
 }
@@ -2311,10 +2341,8 @@ async function providerTabGone(job, provider) {
 async function abandonForgottenJob(job, jobs, status, signal) {
   // status is the FRESH probe verdict from the clear sweep.
   if (signal?.aborted) return false;
-  abandonLegs(job, job.providers, status);
   // A confirmed-absent tab finishes cleanup instead of waiting for a reconnection that never comes.
-  for (const provider of job.providers) job.states[provider].closeRequested = true;
-  await saveJobs(jobs);
+  await abandonJobLegs(job, jobs, status, true);
   await joinLanes(job.providers.map(provider => cleanupProvider(job, provider, jobs)));
   // Detach the final trace only for a freshly-confirmed missing/unknown job (server evicted it → upload
   // rejected and the fetch may hang); a cancelled job keeps its lease, so its trace is awaited.
@@ -2349,6 +2377,70 @@ function jobStale(job, staleMs, now = Date.now()) {
   return latest > 0 && now - latest > staleMs;
 }
 
+/** The stalled sweep's decisions for one job (runStuckSweep), inside a `stall` operation. True when
+ * they were saved (the caller then delivers, cleans up and retires). */
+async function settleStalledJob(job, jobs, signal) {
+  if (jobs[job.jobId] !== job || signal?.aborted) return false;
+  for (const provider of job.providers) {
+    const state = job.states[provider];
+    // Fully done — the server ACKed AND tab cleanup finished. Nothing to do.
+    if (state.delivered && state.cleanupDone) continue;
+    // A durably-archived source is owned by the repair pipeline ONLY while a repair is actively
+    // running or committable (prepared/running/ready): its tab was closed ON PURPOSE and repair may
+    // run arbitrarily long without events, so settling would cancel a live repair. But a repair in a
+    // terminal non-accepted state (needs_attention/interrupted/disabled/superseded), or a durable leg
+    // with no active repair, is dead — repairProvider won't retry or settle it, so the job would sit
+    // forever. Salvage the archived original instead (deliver it verbatim as raw_review, the same
+    // terminal path as repair-off); a fabricated tab_closed failure would be dropped by deliverOutcome's
+    // durable guard anyway.
+    if (sourceArchiveDurable(state)) {
+      // accepted is a resumable SUCCESS (the commit landed; acceptRepairReceipt records the receipt on
+      // the next tick even if the worker stopped before it did). Salvaging it would collide with the
+      // server's already-stored repaired leg (lease_conflict) and clear the lease. Exempt it too.
+      if (["prepared", "running", "ready", "accepted"].includes(state.repairAttempt?.status)) continue;
+      if (!state.outcome) {
+        const salvage = localArchivedSource(state); // local archived copy — no fetch, no page, no hang
+        if (salvage?.text) {
+          // Repair is enabled here (the leg had a repair attempt), so the server would re-demand
+          // repair on the raw text. Deliver the canonicalized raw_review envelope instead.
+          state.outcome = { ok: true, raw: salvageReviewEnvelope(salvage.text), originalText: salvage.text, salvaged: true };
+          delete state.formatError;
+          workerStep(job, provider, "salvaged_no_repair");
+        }
+      }
+      continue; // salvaged (delivered in the post-loop) or nothing local to salvage — never fabricate a failure
+    }
+    // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
+    // stalled one — providerTabGone reports it "gone", but touching it would misreport a reviewer that
+    // never ran. Only act on a leg that actually started or held a tab that is now gone. (Job-level
+    // staleness can trip on a different leg's old events, so the per-leg guard is essential.)
+    if (!state.started && !state.tabId) continue;
+    if (!(await providerTabGone(job, provider))) continue;
+    if (state.delivered) {
+      // Result already ACKed, but cleanup stalled: the tab closed before closeRequested was persisted,
+      // so cleanupProviderBody loops on "original tab unavailable" and retireCleanJob never releases
+      // the job — it keeps consuming tab capacity. Confirm tab absence so cleanup can finish; the
+      // outcome is already delivered, so leave it untouched (never re-report it as a failure).
+      state.closeRequested = true;
+    } else if (state.outcome && !state.formatError) {
+      // A NORMAL saved outcome (a valid response, or an explicit failure) is handled by the delivery
+      // flow — never fabricate a tab_closed over a valid saved review.
+      continue;
+    } else {
+      // No outcome, or a formatError outcome (server returned 422 json_repair_required) whose source
+      // never became durable and whose tab is now gone — it can NEVER be repaired or delivered
+      // (readRepairSource has no tab, delivery loops on 422), so a sole-provider job would sit
+      // awaiting_chat forever. Settle it with a terminal failure.
+      state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
+      delete state.formatError;
+      state.closeRequested = true;
+    }
+  }
+  if (signal?.aborted) return false; // a slow providerTabGone/storage read may have outlived the watchdog
+  await saveJobs(jobs);
+  return true;
+}
+
 /** Sweep for jobs the server has forgotten (missing/unknown) or cancelled — their tabs are released by
  * the page's verdict (closed unless the user took them over) — and, when includeStalled, tab-gone jobs
  * that progressed then went quiet past staleMs (a wedged generating/repair leg that can never finish).
@@ -2363,16 +2455,14 @@ async function clearStuckJobs(opts = {}) {
   // shared with the still-running work so a timeout still reports partial progress. Never throws.
   const { deadlineMs = 15_000, includeStalled = false, staleMs = STALL_MS } = opts;
   const TIMED_OUT = Symbol("clear-timeout");
-  const controller = new AbortController();
   let timer;
-  const counter = { cleared: 0, total: 0 };
+  // One sweep at a time (W2): a sweep already running (the alarm's) is joined, never run beside.
+  const {work, counter, controller} = sweepOnce({includeStalled, staleMs});
   // On timeout, ABORT the work — don't just return. Otherwise the detached runStuckSweep keeps running
   // unfenced and the "click again" the popup suggests starts another sweep over the same registry, so
   // repeated attempts accumulate pending ops that later resume concurrently. Aborting fences it (its
   // fetches reject, its per-mutation signal checks bail), so a re-click never overlaps the timed-out sweep.
   const deadline = new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve(TIMED_OUT); }, deadlineMs); });
-  const work = runStuckSweep({ includeStalled, staleMs, signal: controller.signal }, counter)
-    .catch(error => ({ ok: false, error: String(error?.message || error || "clear failed") }));
   const result = await Promise.race([work, deadline]);
   clearTimeout(timer);
   const kept = Math.max(0, counter.total - counter.cleared);
@@ -2426,63 +2516,10 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
       // it re-sticks. REPORT a terminal failure instead (deliverOutcome sends action:"failure"), which
       // settles the server leg; the record is retired only once every leg is delivered (ACKed), and
       // retained if the server is unreachable. A live-tab provider is left alone (may still answer).
-      for (const provider of job.providers) {
-        const state = job.states[provider];
-        // Fully done — the server ACKed AND tab cleanup finished. Nothing to do.
-        if (state.delivered && state.cleanupDone) continue;
-        // A durably-archived source is owned by the repair pipeline ONLY while a repair is actively
-        // running or committable (prepared/running/ready): its tab was closed ON PURPOSE and repair may
-        // run arbitrarily long without events, so settling would cancel a live repair. But a repair in a
-        // terminal non-accepted state (needs_attention/interrupted/disabled/superseded), or a durable leg
-        // with no active repair, is dead — repairProvider won't retry or settle it, so the job would sit
-        // forever. Salvage the archived original instead (deliver it verbatim as raw_review, the same
-        // terminal path as repair-off); a fabricated tab_closed failure would be dropped by deliverOutcome's
-        // durable guard anyway.
-        if (sourceArchiveDurable(state)) {
-          // accepted is a resumable SUCCESS (the commit landed; acceptRepairReceipt records the receipt on
-          // the next tick even if the worker stopped before it did). Salvaging it would collide with the
-          // server's already-stored repaired leg (lease_conflict) and clear the lease. Exempt it too.
-          if (["prepared", "running", "ready", "accepted"].includes(state.repairAttempt?.status)) continue;
-          if (!state.outcome) {
-            const salvage = await readRepairSource(job, provider, false); // local archived copy — no fetch, no hang
-            if (salvage?.text) {
-              // Repair is enabled here (the leg had a repair attempt), so the server would re-demand
-              // repair on the raw text. Deliver the canonicalized raw_review envelope instead.
-              state.outcome = { ok: true, raw: salvageReviewEnvelope(salvage.text), originalText: salvage.text, salvaged: true };
-              delete state.formatError;
-              workerStep(job, provider, "salvaged_no_repair");
-            }
-          }
-          continue; // salvaged (delivered in the post-loop) or nothing local to salvage — never fabricate a failure
-        }
-        // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
-        // stalled one — providerTabGone reports it "gone", but touching it would misreport a reviewer that
-        // never ran. Only act on a leg that actually started or held a tab that is now gone. (Job-level
-        // staleness can trip on a different leg's old events, so the per-leg guard is essential.)
-        if (!state.started && !state.tabId) continue;
-        if (!(await providerTabGone(job, provider))) continue;
-        if (state.delivered) {
-          // Result already ACKed, but cleanup stalled: the tab closed before closeRequested was persisted,
-          // so cleanupProviderBody loops on "original tab unavailable" and retireCleanJob never releases
-          // the job — it keeps consuming tab capacity. Confirm tab absence so cleanup can finish; the
-          // outcome is already delivered, so leave it untouched (never re-report it as a failure).
-          state.closeRequested = true;
-        } else if (state.outcome && !state.formatError) {
-          // A NORMAL saved outcome (a valid response, or an explicit failure) is handled by the delivery
-          // flow — never fabricate a tab_closed over a valid saved review.
-          continue;
-        } else {
-          // No outcome, or a formatError outcome (server returned 422 json_repair_required) whose source
-          // never became durable and whose tab is now gone — it can NEVER be repaired or delivered
-          // (readRepairSource has no tab, delivery loops on 422), so a sole-provider job would sit
-          // awaiting_chat forever. Settle it with a terminal failure.
-          state.outcome = failure("tab_closed", "review tab closed before a result (stalled)");
-          delete state.formatError;
-          state.closeRequested = true;
-        }
-      }
-      if (signal?.aborted) return; // a slow providerTabGone/storage read may have outlived the watchdog
-      await saveJobs(jobs);
+      // The per-leg decisions (the salvage from the local archive, the tab lookup, the outcome and
+      // closeRequested writes) are one `stall` operation in the tab queue; delivery, cleanup and
+      // retirement follow outside it.
+      if (!await tabOp("stall", () => settleStalledJob(job, jobs, signal))) return;
       if (signal?.aborted) return;
       // Deliver a newly-stamped failure (deliverOutcome sends it + cleans up on ACK); for an
       // already-delivered leg whose closeRequested we just set, deliverOutcome early-returns, so finish its
@@ -2510,11 +2547,24 @@ async function runStuckSweep({ includeStalled = false, staleMs = STALL_MS, signa
 // signal, so the sweep unwinds and settles — releasing the lock only once the cancellation lands (never
 // leaving it wedged for the worker's lifetime, and never overlapping the next run). No popup waits on it.
 const AUTO_SWEEP_WATCHDOG_MS = 45_000;
-let autoSweepInFlight = false;
+/** The one sweep in flight (the popup's Clear stuck and the alarm's share it, W2): {work, counter,
+ * controller}. It is released once its work ended, or once it was aborted (a watchdog or the popup's
+ * deadline): an aborted sweep only finishes the operation it is in, and enqueues nothing more. */
+let sweepFlight = null;
+function sweepOnce({includeStalled, staleMs = STALL_MS}) {
+  if (sweepFlight) return sweepFlight;
+  const controller = new AbortController(), counter = {cleared: 0, total: 0};
+  const flight = {controller, counter};
+  const release = () => { if (sweepFlight === flight) sweepFlight = null; };
+  controller.signal.addEventListener("abort", release, {once: true});
+  flight.work = runStuckSweep({includeStalled, staleMs, signal: controller.signal}, counter)
+    .catch(error => ({ ok: false, error: String(error?.message || error || "clear failed") }))
+    .finally(release);
+  sweepFlight = flight;
+  return flight;
+}
 async function autoSweepStuckJobs(watchdogMs = AUTO_SWEEP_WATCHDOG_MS) {
-  if (autoSweepInFlight) return;
-  autoSweepInFlight = true;
-  const controller = new AbortController();
+  const {work, controller} = sweepOnce({includeStalled: true});
   const watchdog = setTimeout(() => controller.abort(), watchdogMs);
   try {
     // Race the WHOLE sweep against the watchdog's abort so the lock always releases — even when the hang
@@ -2523,10 +2573,10 @@ async function autoSweepStuckJobs(watchdogMs = AUTO_SWEEP_WATCHDOG_MS) {
     // detached remainder can no longer mutate the registry: no overlap with the next sweep, no wedge for
     // the worker's lifetime.
     await Promise.race([
-      runStuckSweep({ includeStalled: true, signal: controller.signal }).catch(() => {}),
+      work,
       new Promise((resolve) => { controller.signal.addEventListener("abort", () => resolve(), { once: true }); }),
     ]);
-  } finally { clearTimeout(watchdog); autoSweepInFlight = false; }
+  } finally { clearTimeout(watchdog); }
 }
 
 async function advanceJob(job, jobs) {
@@ -2537,8 +2587,7 @@ async function advanceJob(job, jobs) {
   if (!active && job.serverStatus === "cancelled") {
     // Explicit cancellation, never elapsed time or 404. Persisted before cleanup: a later
     // "missing" (the harbor forgot the cancelled job) still takes the cancel exit.
-    abandonLegs(job, job.providers, "cancelled");
-    await saveJobs(jobs);
+    await abandonJobLegs(job, jobs, "cancelled");
     await joinLanes(job.providers.map(p => cleanupProvider(job, p, jobs)));
     await retireCleanJob(job, jobs); // default (await): cancelled keeps its lease, so its trace still uploads
     return;
@@ -2810,6 +2859,19 @@ async function clearCommittedMaintenanceOnWorkerStart() {
   });
 }
 
+/** The popup's hard reset (see its message handler), as a `reset` operation in the tab queue: after
+ * the operation running now, it drops the cached registry and persists an empty one; from then on no
+ * operation runs and no registry write lands until the reload (W12: lanes still holding the old
+ * registry would persist it again, or act on a tab). */
+function hardReset() {
+  return tabOp("reset", async () => {
+    resetting = true;
+    registryPromise = Promise.resolve({});
+    await writeInOrder(() => chrome.storage.local.set({ [PENDING_JOBS]: {} }));
+    return { ok: true };
+  });
+}
+
 function loop() {
   chrome.alarms.create("ashlar-poll", { periodInMinutes: 1 });
   void heartbeatTick();
@@ -2837,17 +2899,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     // cached registry AND persist an empty one so any tick that races the reload writes {} rather than the
     // stale 30, then reload the extension so all in-flight lane closures holding the old jobs object are torn
     // down. Never throws: reload runs after the reply regardless.
-    (async () => {
-      try {
-        registryPromise = Promise.resolve({});
-        await writeInOrder(() => chrome.storage.local.set({ [PENDING_JOBS]: {} }));
-        sendResponse({ ok: true });
-      } catch (error) {
-        sendResponse({ ok: false, error: String(error?.message || error) });
-      } finally {
-        setTimeout(() => chrome.runtime.reload(), 150);
-      }
-    })();
+    hardReset().then(sendResponse, error => sendResponse({ ok: false, error: String(error?.message || error) }))
+      .finally(() => setTimeout(() => chrome.runtime.reload(), 150));
     return true;
   }
   if (message?.type === "ashlar-maintenance-acquire") {

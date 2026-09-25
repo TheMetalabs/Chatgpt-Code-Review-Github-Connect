@@ -16,7 +16,7 @@ const EVENTS = ['tick', 'tick', 'tick', 'later', 'cancel', 'missing', 'sweep', '
   'freeze', 'thaw', 'discard', 'discardSwap', 'loading', 'loaded', 'hang', 'noReceiver', 'pageOk', 'notRendered', 'rendered', 'browserRestart'];
 const START = ['secured', 'generating', 'undispatched'];
 /** The operation kinds allowed to perform each tab effect (the tab queue, #85). */
-const PAGE_OPS = ['poll', 'release', 'probe', 'sourceRead', 'captureCommit', 'repairReceipt'];
+const PAGE_OPS = ['poll', 'release', 'probe', 'sourceRead', 'captureCommit', 'repairReceipt', 'stall'];
 const TAB_EFFECT_OPS = {message: PAGE_OPS, inject: PAGE_OPS, create: ['poll'], remove: ['release'], reload: ['poll', 'release']};
 /** A page reply deadline that expires at once (the real one is PAGE_REPLY_MS). */
 const expiresAtOnce = () => ({promise: new Promise((_resolve, reject) => setImmediate(() => reject(new Error('the page did not answer in time')))), cancel() {}});
@@ -79,7 +79,7 @@ async function run(kind, start, events) {
   // delivered before the walk (this harness never delivers a new one). A review closes untouched.
   const mayClose = kind === 'review' || start === 'secured';
   // Q1 (#85): every tab effect runs inside an operation of a kind allowed to perform it (the tab
-  // queue), and no two operations ever run at once. (The sweep still reaches tabs outside the queue.)
+  // queue), and no two operations ever run at once.
   const queued = outsideAllowed => {
     if (b.queue.overlapped) return 'tab_ops_overlapped';
     if (b.queue.bridgeInOp.length) return `bridge_call_in_tab_op(${b.queue.bridgeInOp})`;
@@ -109,7 +109,7 @@ async function run(kind, start, events) {
       case 'sweep': {
         const closedBefore = b.closedTabs.length;
         if (!await settles(() => b.context.autoSweepStuckJobs())) return 'sweep_never_settles';
-        return queued(true) || (b.closedTabs.length > closedBefore && !mayClose ? 'closed_undelivered_fix' : '');
+        return queued(false) || (b.closedTabs.length > closedBefore && !mayClose ? 'closed_undelivered_fix' : '');
       }
       case 'followup': if (t && !w.reused) { w.user = true; } return '';
       case 'navigate': if (t && !w.reused) { w.user = true; t.url = OTHER; } return '';

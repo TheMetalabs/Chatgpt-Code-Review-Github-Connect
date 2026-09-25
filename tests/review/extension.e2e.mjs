@@ -313,7 +313,11 @@ const attachHtml=`<!doctype html><html><body>
  document.querySelector('input[type=file]').addEventListener('change',async event=>{for(const file of event.target.files){
   window.uploads.push({name:file.name,text:await file.text()});
   const chip=document.createElement('div');chip.dataset.fileName=file.name;chip.style.cssText='width:80px;height:20px';chip.textContent=file.name;document.querySelector('#chips').append(chip);}});
- document.querySelector('button').onclick=()=>{window.sends++;const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';const user=document.createElement('div');user.dataset.messageAuthorRole='user';user.textContent=composer.value;turn.append(user);document.querySelector('#turns').append(turn);composer.value='';document.querySelector('#chips').replaceChildren();};
+ document.querySelector('button').onclick=()=>{window.sends++;const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';const user=document.createElement('div');user.dataset.messageAuthorRole='user';
+  // the sent turn shows the file as ChatGPT does: a card with its name and type, then the typed line
+  for(const chip of document.querySelectorAll('#chips [data-file-name]'))user.insertAdjacentHTML('beforeend','<div class="file-card"><div class="truncate">'+chip.dataset.fileName+'</div><div>Document</div></div>');
+  const text=document.createElement('div');text.className='whitespace-pre-wrap';text.textContent=composer.value;user.append(text);
+  turn.append(user);document.querySelector('#turns').append(turn);composer.value='';document.querySelector('#chips').replaceChildren();};
  window.reply=(raw,done,code)=>{document.querySelector('#answer')?.remove();const turn=document.createElement('section');turn.id='answer';turn.dataset.testid='conversation-turn-2';const message=document.createElement('div');message.dataset.messageAuthorRole='assistant';const md=document.createElement('div');md.className='markdown';md.textContent=raw;if(code!==undefined){const pre=document.createElement('pre');const c=document.createElement('code');c.textContent=code;pre.append(c);md.append(pre);}message.append(md);turn.append(message);if(done){const button=document.createElement('button');button.dataset.testid='copy-turn-action-button';button.ariaLabel='Copy response';button.textContent='copy';turn.append(button);}document.querySelector('#turns').append(turn);};
  </script></body></html>`;
 
@@ -346,7 +350,7 @@ test('MV3 fix E2E (#93): the fix source is uploaded byte-exact as its hashed att
  const sha=createHash('sha256').update(expected,'utf8').digest('hex');
  const uploads=await page.evaluate(()=>window.uploads);
  assert.deepEqual(uploads,[{name:'ashlar-fix-request.txt',text:expected}],'one upload: the whole request, byte-exact');
- const typed=await page.evaluate(()=>document.querySelector('[data-message-author-role="user"]').textContent);
+ const typed=await page.evaluate(()=>document.querySelector('[data-message-author-role="user"] .whitespace-pre-wrap').textContent);
  assert.ok(typed.includes(`SHA-256 ${sha}`),typed);
  assert.equal(typed,typed.replace(/\s+/g,' ').trim(),'one canonical line');
  assert.ok(!typed.includes('def f(x)'),'no source in the typed body');

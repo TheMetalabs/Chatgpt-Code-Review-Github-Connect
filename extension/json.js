@@ -516,17 +516,17 @@ function journaledTurnIntegrity(submission, users) {
     turn = users[submission.submittedUsers - 1];
   }
   if (!turn) return "unknown";
-  if (typeof submission.exact === "string") return fixTurnExact(turn, submission.exact) ? "exact" : "edited";
+  if (typeof submission.exact === "string") return fixTurnExact(turn, submission.exact, submission.attachments) ? "exact" : "edited";
   return normalizePrompt(messagePromptText(turn)) === submission.expected ? "exact" : "edited";
 }
 
 /** Whether a fix's sent turn holds its prompt's lossless form `exact` (composer.js fixPromptForm). A
  * rich-text turn's block boundaries read two ways: one <p> per blank-line paragraph with a <br> per
  * line break (messagePromptText), or one <p> per line, the composer's own structure (losslessText).
- * Either reading can prove it exact; any other whitespace difference is an edit. */
-function fixTurnExact(turn, exact) {
-  const body = turn.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
-  return [messagePromptText(turn), losslessText(body)].some(text => fixPromptForm(text) === exact);
+ * Either reading can prove it exact; any other whitespace difference is an edit. The file cards of
+ * the run's own attachments `names` are not the prompt (composer.js fixTurnHolds). */
+function fixTurnExact(turn, exact, names = []) {
+  return fixTurnHolds(turn, exact, Array.isArray(names) ? names : []);
 }
 
 /** The identity of the conversation a page shows: its URL without the fragment (the path names the
@@ -878,7 +878,10 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   try { submission = state.confirmedSubmission?.record || (typeof savedSubmission === "function" ? savedSubmission() : null); }
   catch { return {ownership: "unknown", cause: "journal_unreadable"}; }
   const norm = text => typeof normalizePrompt === "function" ? normalizePrompt(text) : String(text || "").replace(/\s+/g, " ").trim();
-  const promptOf = turn => norm(typeof messagePromptText === "function" ? messagePromptText(turn) : turn.textContent);
+  // A fix turn's file cards (its own attachment, composer.js turnAttachments) are not its prompt.
+  const cardsOf = turn => fix && typeof turnAttachments === "function" && Array.isArray(submission?.attachments)
+    ? turnAttachments(turn, submission.attachments).cards : undefined;
+  const promptOf = turn => norm(typeof messagePromptText === "function" ? messagePromptText(turn, cardsOf(turn)) : turn.textContent);
   const href = globalThis.location?.href || "";
   const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
   // Ashlar's own prompt in the composer (before or after the send) is not a user draft; anything
@@ -947,7 +950,7 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   if (sent !== submission.expected) return takeOver("edited");
   // A fix turn is also held to its prompt's lossless form (#77, fixTurnExact): a fix prompt inlines
   // source whose whitespace is content, so a turn whose whitespace alone changed is an edit too.
-  if (fix && typeof submission.exact === "string" && typeof fixPromptForm === "function" && !fixTurnExact(turn, submission.exact)) {
+  if (fix && typeof submission.exact === "string" && typeof fixPromptForm === "function" && !fixTurnExact(turn, submission.exact, submission.attachments)) {
     return takeOver("edited");
   }
   if (users.indexOf(turn) < users.length - 1) return takeOver("user_turn");

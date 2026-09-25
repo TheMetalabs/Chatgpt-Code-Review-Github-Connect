@@ -34,7 +34,7 @@ function readComposer(el) {
  * except the <br> that ends a block (the editor's placeholder that keeps an empty or newline-ended line
  * visible). innerText is not lossless there: it separates <p> blocks by a blank line (ChatGPT's
  * composer holds one <p> per line) and collapses spaces outside pre-wrap. */
-function losslessText(el) {
+function losslessText(el, skip) {
   if (!el) return "";
   if ((typeof HTMLTextAreaElement === "function" && el instanceof HTMLTextAreaElement) ||
       (typeof HTMLInputElement === "function" && el instanceof HTMLInputElement)) return el.value || "";
@@ -42,7 +42,7 @@ function losslessText(el) {
     const parts = [];
     for (const child of node.childNodes || []) {
       if (child.nodeType === 3) parts.push({text: child.nodeValue || ""});
-      else if (child.nodeType !== 1 || child.matches('script, style, [hidden], [aria-hidden="true"]')) continue;
+      else if (child.nodeType !== 1 || skip?.has(child) || child.matches('script, style, [hidden], [aria-hidden="true"]')) continue;
       else if (child.tagName === "BR") parts.push({text: "\n", br: true});
       else {
         const inner = /^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE)$/.test(child.tagName);
@@ -332,18 +332,76 @@ async function fillComposer(el, text) {
 }
 
 /** textContent drops <br>/<p> boundaries; innerText can omit collapsed text.
- * Read the message body, not attachment chips, copy controls or hidden UI. */
-function messagePromptText(turn) {
+ * Read the message body, not attachment chips, copy controls or hidden UI. `skip`: elements left
+ * out too (a sent fix turn's file cards, turnAttachments). */
+function messagePromptText(turn, skip) {
   const root = turn?.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
   const walk = node => {
     if (node.nodeType === 3) return node.nodeValue || "";
-    if (node.nodeType !== 1) return "";
+    if (node.nodeType !== 1 || skip?.has(node)) return "";
     if (node.matches('button, svg, script, style, [hidden], [aria-hidden="true"], [data-file-name], [role="group"][aria-label]')) return "";
     if (node.tagName === "BR") return "\n";
     const text = [...node.childNodes].map(walk).join("");
     return /^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE|TR)$/.test(node.tagName) ? `\n${text}\n` : text;
   };
   return root?.childNodes ? walk(root).trim() : root?.textContent || root?.innerText || "";
+}
+
+/** Where a sent user turn renders: its conversation-turn section or article (ChatGPT can render a
+ * file card beside the message node, not inside it), else the message node itself. */
+function turnContainer(turn) {
+  return turn?.closest?.('[data-testid^="conversation-turn"], [data-turn="user"], article') || turn;
+}
+
+/** The file cards a sent user turn shows for the run's own attachments `names`, and whether every
+ * name has one. ChatGPT renders a sent file as a card holding its name and its type or size as
+ * plain text (no data-file-name), in or beside the message node. A card is an element that names
+ * the file (data-file-name, aria-label, title, or its own text) outside the typed text, widened to
+ * the largest ancestor that still holds only the card's short text. A name inside the typed text
+ * (the fix line names its file) is part of that text, never a card. */
+function turnAttachments(turn, names = []) {
+  const CARD_TEXT_MAX = 80;
+  const cards = new Set(), found = new Set();
+  const container = turnContainer(turn);
+  if (!container?.querySelectorAll || !names.length) return {cards, shown: names.length === 0};
+  const residual = el => names.reduce((text, name) => text.split(name).join(" "), normalizePrompt(el.textContent)).trim();
+  const named = el => names.filter(name => el.getAttribute("data-file-name") === name ||
+    (el.getAttribute("aria-label") || "").includes(name) || (el.getAttribute("title") || "").includes(name) ||
+    [...el.childNodes].some(child => child.nodeType === 3 && (child.nodeValue || "").includes(name)));
+  const textBody = '.whitespace-pre-wrap, .rich-text-user-turn';
+  for (const seed of container.querySelectorAll("*")) {
+    const hits = named(seed);
+    if (!hits.length) continue;
+    const block = seed.closest(`${textBody}, p, li, pre, blockquote`);
+    if (residual(seed).length > CARD_TEXT_MAX || (block && container.contains(block) && residual(block).length > CARD_TEXT_MAX)) continue;
+    let card = seed;
+    for (let up = card.parentElement; up && up !== container && up !== turn && container.contains(up); up = up.parentElement) {
+      if (up.matches(textBody) || up.querySelector(textBody) || residual(up).length > CARD_TEXT_MAX) break;
+      card = up;
+    }
+    cards.add(card);
+    hits.forEach(name => found.add(name));
+  }
+  for (const card of cards) if ([...cards].some(other => other !== card && other.contains(card))) cards.delete(card);
+  return {cards, shown: names.every(name => found.has(name))};
+}
+
+/** Whether a sent user turn holds EXACTLY a fix's typed prompt (its lossless form `exact`, read two
+ * ways as json.js fixTurnExact does) once its file cards are left out. */
+function fixTurnHolds(turn, exact, names = []) {
+  const {cards} = turnAttachments(turn, names);
+  const body = turn.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
+  return [messagePromptText(turn, cards), losslessText(body, cards)].some(text => fixPromptForm(text) === exact);
+}
+
+/** A fix's send is proven by a user turn after the baseline that shows each of its attachments
+ * (turnAttachments) and, with their cards left out, is its typed prompt: equal once whitespace is
+ * normalized. That locates the send; whether the turn is the prompt EXACTLY (its lossless form, a
+ * whitespace change is an edit) is json.js journaledTurnIntegrity's verdict on the located turn. */
+function fixTurnSent(turn, record) {
+  const names = record.attachments || [];
+  const {cards, shown} = turnAttachments(turn, names);
+  return shown && normalizePrompt(messagePromptText(turn, cards)) === record.expected;
 }
 
 function renderedControl(el) {
@@ -579,13 +637,18 @@ function stillShowsConversation(conversation) {
 
 function submissionConfirmed(record) {
   const turns = userTurns();
-  // Composer clearing and Stop alone are not proof that THIS request was accepted.
-  const match = turns.slice(record.baseline).find(turn => normalizePrompt(messagePromptText(turn)).includes(record.expected));
+  const state = globalThis.__ashlarRunnerState;
+  const fix = state?.kind === "fix";
+  // Composer clearing and Stop alone are not proof that THIS request was accepted. A fix turn must
+  // be exactly its typed line (its file cards left out) and show its attachment (fixTurnSent); a
+  // review turn, or a legacy fix journal with no lossless form (never proven exact: json.js
+  // tabOwnership "unestablished"), contains its prompt.
+  const match = turns.slice(record.baseline).find(turn => fix && typeof record.exact === "string" ? fixTurnSent(turn, record) :
+    normalizePrompt(messagePromptText(turn)).includes(record.expected));
   if (!record.expected || !match) return false;
   record.phase = "sent";
   record.submittedUsers = turns.indexOf(match) + 1;
   record.messageId = match.getAttribute("data-message-id") || "";
-  const state = globalThis.__ashlarRunnerState;
   // A run's conversation is a fact of THIS moment: recorded once, here, and never later (every
   // later decision compares the location with it). Only a send this page instance clicked,
   // confirmed while the page still shows the conversation it was clicked in, establishes it. A
@@ -597,7 +660,6 @@ function submissionConfirmed(record) {
   // its release verdict holds a recorded conversation to): a review sent on a new chat has no
   // conversation yet and pins where the provider puts it (json.js pinNewChatReview, #82).
   const attempt = state?.sendAttempt;
-  const fix = state?.kind === "fix";
   const reviewNamed = !fix && typeof namesNoConversation === "function" && Boolean(attempt?.conversation) &&
     !namesNoConversation(attempt.conversation) && normalizePrompt(messagePromptText(match)) === record.expected;
   if ((fix || reviewNamed) && !record.conversation && attempt?.key === submissionKey() && attempt.conversation &&
@@ -609,6 +671,85 @@ function submissionConfirmed(record) {
   step("prompt_submitted");
   retrySubmissionPersistence();
   return true;
+}
+
+/** Diagnostic (1.1.31, live send_unconfirmed on a temporary-chat fix with its attachment): the
+ * shape of the page's last user turn at about 1, 5, 15, 30 and 60 s after a fix's Send click.
+ * Stored locally only (chrome.storage.local "sendProbes", last 20). Never raw text: lengths, an
+ * 8-hex hash of the first 40 characters, match flags, counts and a URL shape. Off with
+ * chrome.storage.local {sendProbe:false}. A probe never affects the run. */
+function sendProbeHash(text) {
+  let hash = 0x811c9dc5;
+  for (const ch of String(text ?? "")) { hash ^= ch.codePointAt(0); hash = Math.imul(hash, 0x01000193) >>> 0; }
+  return hash.toString(16).padStart(8, "0");
+}
+function sendProbeUrl(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname === "/" ? "/" : u.pathname.startsWith("/c/") ? "/c/*" : `/${u.pathname.split("/")[1] || ""}/*`;
+    return `${u.host}${path}${u.searchParams.has("temporary-chat") ? `?temporary-chat=${u.searchParams.get("temporary-chat") === "true"}` : ""}`;
+  } catch { return "unparsable"; }
+}
+function sendProbeShape(record, clickedAt, label) {
+  const turns = userTurns(), names = record.attachments || [];
+  const userSections = [...document.querySelectorAll('[data-turn="user"]')];
+  const shape = {at: Date.now(), label, sinceClickMs: Date.now() - clickedAt, url: sendProbeUrl(globalThis.location?.href),
+    before: record.baseline, users: turns.length, grew: turns.length > record.baseline, userSections: userSections.length,
+    sections: document.querySelectorAll('[data-testid^="conversation-turn"]').length, attachments: names.length};
+  const last = turns.at(-1) || userSections.at(-1);
+  if (!last) return shape;
+  const container = turnContainer(last);
+  const {cards, shown} = turnAttachments(last, names);
+  const text = messagePromptText(last), withoutCards = messagePromptText(last, cards);
+  const exact = typeof record.exact === "string" ? record.exact : "";
+  shape.last = {byRole: turns.includes(last), container: container === last ? "turn" : "section",
+    chips: [...container.querySelectorAll(fileChipSelector())].filter(chip => !chip.matches(composerControlSelector())).length,
+    cards: cards.size, cardInTurn: [...cards].some(card => last.contains(card)), namesAttachment: names.length > 0 && shown,
+    nameInContainer: names.some(name => (container.textContent || "").includes(name)),
+    textLength: text.length, textHead: sendProbeHash(text.slice(0, 40)),
+    withoutCardsLength: withoutCards.length, withoutCardsHead: sendProbeHash(withoutCards.slice(0, 40)),
+    expectedLength: exact.length, expectedHead: sendProbeHash(exact.slice(0, 40)),
+    exact: fixPromptForm(text) === exact, normalized: normalizePrompt(text) === record.expected,
+    contains: normalizePrompt(text).includes(record.expected), chipExcluded: fixTurnHolds(last, exact, names),
+    sent: fixTurnSent(last, record)};
+  return shape;
+}
+async function startSendProbe(record) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    if ((await local.get(["sendProbe"]))?.sendProbe === false) return;
+    const state = globalThis.__ashlarRunnerState;
+    const clickedAt = record.attemptedAt || Date.now(), job = state?.jobId, run = state?.runId;
+    const save = async label => {
+      try {
+        const shape = {job, run, ...sendProbeShape(record, clickedAt, label)};
+        globalThis.__ashlarSendProbeWrites = (globalThis.__ashlarSendProbeWrites || Promise.resolve()).then(async () => {
+          const stored = (await local.get(["sendProbes"]))?.sendProbes;
+          await local.set({sendProbes: [...(Array.isArray(stored) ? stored : []), shape].slice(-20)});
+        }).catch(() => {});
+        await globalThis.__ashlarSendProbeWrites;
+      } catch { /* diagnostics never affect the run */ }
+    };
+    for (const seconds of [1, 5, 15, 30, 60]) setTimeout(() => save(`${seconds}s`), Math.max(0, clickedAt + seconds * 1000 - Date.now()));
+    // HTML snapshot of the conversation area (the user asked for the live DOM, #93): fix runs only,
+    // which carry Ashlar's own prompt. Scripts, styles and SVG paths are dropped; capped; last 3 kept.
+    if (state?.kind === "fix" && (await local.get(["sendProbeHtmlOff"]))?.sendProbeHtmlOff !== true) {
+      for (const seconds of [5, 60]) setTimeout(() => {
+        try {
+          const area = document.querySelector("main") || document.body;
+          const clone = area.cloneNode(true);
+          for (const node of clone.querySelectorAll("script,style,noscript,svg path,img")) node.remove();
+          const html = clone.outerHTML.slice(0, 200_000);
+          globalThis.__ashlarSendProbeWrites = (globalThis.__ashlarSendProbeWrites || Promise.resolve()).then(async () => {
+            const stored = (await local.get(["sendProbeHtml"]))?.sendProbeHtml;
+            const list = Array.isArray(stored) ? stored : [];
+            await local.set({sendProbeHtml: [...list, {job, run, label: `${seconds}s`, at: Date.now(), url: location.href.split("?")[0], html}].slice(-3)});
+          }).catch(() => {});
+        } catch { /* diagnostics never affect the run */ }
+      }, Math.max(0, clickedAt + seconds * 1000 - Date.now()));
+    }
+  } catch { /* diagnostics never affect the run */ }
 }
 
 async function clickSend(findSend, findComposer, expectedText) {
@@ -675,6 +816,7 @@ async function clickSend(findSend, findComposer, expectedText) {
         if (runner) { runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()}; runner.freshPage = undefined; }
         step("send_attempted");
         try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
+        if (fix) startSendProbe(record);
       }
     }
     // Cadence only: no upload, send acknowledgement, queue or model deadline.

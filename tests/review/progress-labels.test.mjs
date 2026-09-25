@@ -186,20 +186,25 @@ function returnedList(files, name) {
   return values;
 }
 
-/** The values of a template stage, keyed by its static prefix. `source` reads the list the code itself
- * draws the value from (null when there is none); `declared` holds values labelled ahead of the code.
- * A recorded template stage expands to both, so a value added only in the code still needs a label. A
- * recorded template whose prefix is missing here, or whose list is not found in source, fails the guard. */
+/** The values of a template stage, keyed by its static prefix and then by the whole `${...}` expression
+ * it substitutes. The prefix says nothing about the value: `preserve_${row.cause}` does not take
+ * preserveCauses()'s values because it starts with preserve_. So each expression the extension records
+ * is declared here with a reader of its value domain, the list the code draws that expression's value
+ * from (null when it is not in source); `declared` holds values labelled ahead of the code. A recorded
+ * template expands to both, so a value added only in the code still needs a label. A recorded template
+ * whose prefix or expression is not declared here, or whose list is not found in source, fails the guard. */
 const TEMPLATE_STAGES = {
-  repair_: {declared: [], source: () => unionMembers('src/lib/json-repair-types.ts', 'RepairStatus')},
-  // Tab release (#82): finishTabCleanup records preserve_<cause>, the cause one of preserveCauses().
-  preserve_: {source: files => returnedList(files, 'preserveCauses'),
+  // background.js: `status` is the bridge's repair reply, whose status is a RepairStatus.
+  repair_: {declared: [], expressions: {'status.status': () => unionMembers('src/lib/json-repair-types.ts', 'RepairStatus')}},
+  // Tab release (#82): finishTabCleanup sets state.preserveCause to one of preserveCauses(), then records
+  // preserve_${state.preserveCause}.
+  preserve_: {expressions: {'state.preserveCause': files => returnedList(files, 'preserveCauses')},
     declared: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown',
       // Tab Lease (Phase 1+): the takeover and restart causes of a preserved tab.
       'user_input', 'user_moved', 'browser_restart']},
   // Tab Lease (Phase 1+): a lease that runs out records lease_expired_<phase>. Nothing lists the phases in
-  // code yet: when the extension records this template, it needs a list here that reads its phases.
-  lease_expired_: {source: () => null, declared: ['creating', 'opening', 'sending', 'generating', 'answered', 'releasing']},
+  // code yet: when the extension records this template, its expression goes here with a reader of its phases.
+  lease_expired_: {expressions: {}, declared: ['creating', 'opening', 'sending', 'generating', 'answered', 'releasing']},
 };
 
 /** Every stage a recorded template can produce, given the extension's scripts. */
@@ -207,8 +212,11 @@ function expandTemplate(template, files) {
   const prefix = template.slice(0, template.indexOf('${'));
   assert.ok(Object.hasOwn(TEMPLATE_STAGES, prefix), `template stage \`${template}\` has no declared expansion in TEMPLATE_STAGES`);
   assert.match(template, /^[a-z_]+\$\{[^}]+\}$/, `template stage \`${template}\` is exactly <prefix>\${value}`);
-  const {declared, source: read} = TEMPLATE_STAGES[prefix];
-  const values = read(files);
+  const {declared, expressions} = TEMPLATE_STAGES[prefix];
+  const expression = template.slice(prefix.length + 2, -1).trim();
+  assert.ok(Object.hasOwn(expressions, expression),
+    `template stage \`${template}\`: \`${expression}\` is not a declared ${prefix} expression, so the values it can take are unknown`);
+  const values = expressions[expression](files);
   assert.ok(values, `template stage \`${template}\` is recorded, but the list of its values was not found in source`);
   return [...new Set([...declared, ...values])].map(value => prefix + value);
 }
@@ -286,8 +294,26 @@ test('a preserve_ cause added only to preserveCauses() fails the guard: the expa
   assert.deepEqual(kept(['preserve_staged']), [], 'its event would be dropped from history');
   assert.throws(() => guardedStages(files('...LEGACY')), /string literals only/);
   assert.throws(() => guardedStages({'background.js': recorder}), /not found in source/, 'no list, no expansion');
-  assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `lease_expired_${phase}`);'}), /not found in source/,
-    'Tab Lease: recording lease_expired_<phase> needs a list of the phases in code');
+  assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `lease_expired_${phase}`);'}),
+    /`phase` is not a declared lease_expired_ expression/,
+    'Tab Lease: recording lease_expired_<phase> needs its expression declared with a list of the phases in code');
+});
+
+test('a template stage takes its declared list only through a declared expression, not through its prefix', () => {
+  // preserveCauses() lists only labelled causes, so expanding by prefix would pass; row.cause is not drawn
+  // from it and can be preserve_staged, which sanitizeProgressEvents drops.
+  const causes = 'function preserveCauses() {\n  return ["navigated", "draft", "unknown"];\n}\n';
+  const recorded = expression => ({'background.js': `${causes}workerStep(job, provider, \`preserve_\${${expression}}\`);`});
+  assert.deepEqual(unlabelled(guardedStages(recorded('state.preserveCause')).stages), []);
+  assert.deepEqual(unlabelled(guardedStages(recorded(' state.preserveCause ')).stages), [], 'spacing inside ${} is not the expression');
+  for (const expression of ['row.cause', 'cause', 'state.preserveCause || row.cause', 'state.preserveCause.trim()', 'state?.preserveCause']) {
+    assert.throws(() => guardedStages(recorded(expression)), /is not a declared preserve_ expression/, `preserve_\${${expression}}`);
+  }
+  assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `repair_${response.status}`);'}),
+    /`response.status` is not a declared repair_ expression/, 'the same for repair_: RepairStatus is the domain of status.status only');
+  assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `repair_${status.state}`);'}), /not a declared repair_ expression/);
+  const {stages} = guardedStages({'background.js': 'workerStep(job, provider, `repair_${status.status}`);'});
+  assert.deepEqual(stages.sort(), unionMembers('src/lib/json-repair-types.ts', 'RepairStatus').map(value => `repair_${value}`).sort());
 });
 
 test('a stage argument the guard cannot read fails it instead of passing unchecked', () => {

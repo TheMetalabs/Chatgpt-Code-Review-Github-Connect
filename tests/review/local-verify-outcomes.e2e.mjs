@@ -477,3 +477,35 @@ for(const role of ['race','verify-clean'])for(const [shape,leg] of Object.entrie
     assert.equal(archived.json,cleanJson);
   });
 }
+
+// The same scope for a chat leg that is not a verdict: its evidence is the JSON its client submitted,
+// never the page capture beside it. Overflow JSON is stored as submitted with JSON repair off; a
+// malformed or rejected one reaches the gate only when repair is on (off, the bridge salvages the
+// submitted text); a rejected one is posted as evidence beside local's usable result.
+const CHAT_DEFECTS={
+  overflow:{label:'an overflowing',raw:CHAT.overflow,repair:false,cause:'unread-rows'},
+  malformed:{label:'a malformed',raw:CHAT.malformed,repair:true,cause:'not-a-verdict'},
+  rejected:{label:'a rejected',raw:CHAT.none,repair:true,cause:'not-a-verdict'},
+};
+for(const role of ['race','verify-clean'])for(const [defect,{label,raw,repair,cause}] of Object.entries(CHAT_DEFECTS)){
+  test(`${role} outcome: ${label} chat leg posts the JSON it submitted as evidence, never its page capture`,async t=>{
+    const app=await appFixture({localReviewRole:role,localJsonRepairEnabled:repair},{});t.after(()=>app.close());
+    app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+    const out=await app.mention(`scope-chat-capture-evidence-${role}-${defect}`);
+    const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+    await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+    app.bridge.bridgeHeartbeat();
+    const take=app.bridge.takeNextBridgeJob('scope-client');
+    const originalText='Thought for 12s\nP1 a.ts:1 CAPTURE-PROSE: a duplicate request writes twice\njson\n'+raw;
+    assert.equal((await app.bridge.completeBridgeJob(out.jobId,raw,[{provider:'chatgpt',raw,originalText}],take.leaseId)).ok,true);
+    let answered=0;
+    await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(envelope(cleanJson));return app.reviews.length===1;},'the review was not posted');
+    const body=app.reviews[0].body;
+    const start=body.indexOf(REVIEW_RAW_START),end=body.indexOf(REVIEW_RAW_END);
+    assert.ok(start>=0&&end>start,'the chat leg posts as raw evidence');
+    assert.ok(body.slice(start,end).includes('CHAT-RAW'),'the submitted JSON is the evidence');
+    assert.equal(job().rawCauses?.chatgpt,cause,'converted at the gate, not salvaged by the bridge');
+    assert.doesNotMatch(body,/CAPTURE-PROSE|Thought for 12s/,'the page capture is not posted');
+    assert.ok(app.history.getJob(out.jobId,true).responses.chatgpt.original.includes('CAPTURE-PROSE'),'review history keeps the capture');
+  });
+}

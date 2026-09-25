@@ -170,13 +170,18 @@ export function gateUnreadRows(gate: { ok: true; overflow?: number; rawReview?: 
 }
 
 /** What to gate in place of a reply that is not a complete verdict (incompleteVerdict): whatever
- * parsed, with every completed reply attached verbatim as raw_review, so it posts as evidence and
- * never counts as a verdict. */
+ * parsed, with the reviewer's own reply attached verbatim as raw_review, so it posts as evidence and
+ * never counts as a verdict. For a local leg that is every completed reply the model wrote. A chat
+ * leg's reply is the JSON its client submitted (`raw`): its originalText is the page capture around
+ * it (rendered labels, reasoning summaries, page text), archived in review history and never posted
+ * as the reviewer's evidence. */
 export function verdictEvidence(
   parsed: Record<string, unknown> | null,
-  leg: { raw: string; originalText?: string; unparsedText?: string; residualReplies?: string },
+  leg: { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string },
 ): Record<string, unknown> {
-  const replies = localReplies({ unparsedText: leg.unparsedText, residualReplies: leg.residualReplies, originalText: leg.originalText || leg.raw });
+  const replies = isChatProvider(leg.provider)
+    ? leg.raw
+    : localReplies({ unparsedText: leg.unparsedText, residualReplies: leg.residualReplies, originalText: leg.originalText || leg.raw });
   const salvaged = JSON.parse(salvageReviewJson(replies));
   return { ...salvaged, ...(parsed ?? {}), raw_review: salvaged.raw_review };
 }

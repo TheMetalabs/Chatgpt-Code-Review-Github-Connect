@@ -235,23 +235,35 @@ describe("incompleteVerdict / verdictEvidence: a reviewer reply is a complete ve
 
   it("evidence keeps a reply that carried text outside its JSON, once when it is also the original", () => {
     const reply = 'P1 a.ts:1 PROSE-FINDING\n{"findings":[]}';
-    const single = verdictEvidence({ findings: [] }, { raw: '{"findings":[]}', originalText: reply, residualReplies: reply });
+    const single = verdictEvidence({ findings: [] }, { provider: "local", raw: '{"findings":[]}', originalText: reply, residualReplies: reply });
     assert.equal(String(single.raw_review).split("PROSE-FINDING").length - 1, 1);
     // the multi-turn loop has no original text: its group replies are the evidence
-    const loop = verdictEvidence({ findings: [] }, { raw: '{"findings":[]}', residualReplies: `Review group (a.ts):\n${reply}` });
+    const loop = verdictEvidence({ findings: [] }, { provider: "local", raw: '{"findings":[]}', residualReplies: `Review group (a.ts):\n${reply}` });
     assert.match(String(loop.raw_review), /Review group \(a\.ts\):\nP1 a\.ts:1 PROSE-FINDING[\s\S]*\n---\n\n\{"findings":\[\]\}$/);
   });
 
   it("evidence keeps what parsed and attaches every completed reply verbatim", () => {
     const parsed = { findings: [{ title: "partial" }], merge_recommendation: "REQUEST_CHANGES" };
-    const out = verdictEvidence(parsed, { raw: "{}", originalText: "P1 a.ts:1 FULL-REPLY", unparsedText: "P1 FIRST-REPLY" });
+    const out = verdictEvidence(parsed, { provider: "local", raw: "{}", originalText: "P1 a.ts:1 FULL-REPLY", unparsedText: "P1 FIRST-REPLY" });
     assert.deepEqual(out.findings, parsed.findings);
     assert.match(String(out.raw_review), /Detected severity markers: P1\.[\s\S]*FIRST-REPLY[\s\S]*\n---\n[\s\S]*FULL-REPLY/);
   });
 
   it("with no parsed object or original text the leg's JSON itself is the evidence", () => {
-    const out = verdictEvidence(null, { raw: '{"findings":"P1 a.ts:1 IN-JSON"}' });
+    const out = verdictEvidence(null, { provider: "local", raw: '{"findings":"P1 a.ts:1 IN-JSON"}' });
     assert.deepEqual(out.findings, []);
     assert.match(String(out.raw_review), /IN-JSON/);
+  });
+
+  it("a chat leg's evidence is the JSON its client submitted, never the page capture archived beside it", () => {
+    const raw = '{"findings":[{"title":"P1 a.ts:1 SUBMITTED-JSON"}],"merge_recommendation":"REQUEST_CHANGES"}';
+    const leg = { raw, originalText: `Thought for 12s\nP1 a.ts:1 CAPTURE-PROSE\njson\n${raw}`, unparsedText: "P1 UNPARSED", residualReplies: "P1 RESIDUAL" };
+    for (const provider of ["chatgpt", "grok"] as const) {
+      const out = String(verdictEvidence(JSON.parse(raw), { provider, ...leg }).raw_review);
+      assert.match(out, /SUBMITTED-JSON/, provider);
+      assert.doesNotMatch(out, /CAPTURE-PROSE|UNPARSED|RESIDUAL/, provider);
+    }
+    const local = String(verdictEvidence(JSON.parse(raw), { provider: "local", ...leg }).raw_review);
+    assert.match(local, /UNPARSED[\s\S]*RESIDUAL[\s\S]*CAPTURE-PROSE/, "a local leg keeps every completed reply");
   });
 });

@@ -75,8 +75,10 @@ Rules the table encodes:
   (rejection, a finding dropped for its shape, unread rows) apply to chat and local alike. The
   chat-capture scope tests pin this. A reply that lost a finding for its shape
   or left one unread, or had a reply or text set aside, is gated as evidence instead (`verdictEvidence`
-  in `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block, with
-  `<provider>: <why> (reply posted verbatim)` among the assumptions. A reply the gate rejects (for
+  in `submitHarborChat`): whatever parsed, plus the reviewer's own reply verbatim as the raw block, with
+  `<provider>: <why> (reply posted verbatim)` among the assumptions. For a local leg that is every
+  completed reply; for a chat leg it is the JSON its client submitted, never the page capture
+  (`originalText`), which stays in review history only (the chat-capture evidence tests). A reply the gate rejects (for
   example a `findings` that is not a list, or an empty result without `investigated_safe`) is
   evidence the same way whenever the merge posts: always for a released held local leg, and for any
   other leg once another leg passed the gate; when no leg passed, it stays rejected, so chat with

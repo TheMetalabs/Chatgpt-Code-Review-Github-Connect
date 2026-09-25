@@ -879,6 +879,30 @@ export async function commitFilesToBranch(
   });
 }
 
+/** Open PRs of the App's installed repositories (most recently updated first), each with its
+ * installation's token: at most `max` PRs from at most `max` repositories, one page per list — the
+ * bounded boot sweep's census (review-loop-runtime sweepCutFixRounds). Throws on a failed list. */
+export async function listInstalledOpenPulls(max: number): Promise<Array<{ owner: string; repo: string; pr: number; token: string }>> {
+  const installs = await ghHttps("GET", "/app/installations?per_page=100", { Authorization: `Bearer ${await appJwt()}` });
+  if (installs.status < 200 || installs.status >= 300) throw new Error(`list installations ${installs.status}: ${installs.text.slice(0, 180)}`);
+  const out: Array<{ owner: string; repo: string; pr: number; token: string }> = [];
+  let repos = 0;
+  for (const { id } of JSON.parse(installs.text || "[]") as Array<{ id: number }>) {
+    const token = await installationToken(id);
+    const list = await gh<{ repositories?: Array<{ name?: string; owner?: { login?: string } }> }>(token, "/installation/repositories?per_page=100");
+    if (!list.ok) throw new Error(`list installation repositories (${list.status}): ${list.text}`);
+    for (const r of list.data.repositories ?? []) {
+      if (out.length >= max || repos++ >= max) return out;
+      const [owner, repo] = [r.owner?.login, r.name];
+      if (!owner || !repo) continue;
+      const pulls = await gh<Array<{ number?: number }>>(token, `/repos/${owner}/${repo}/pulls?state=open&sort=updated&direction=desc&per_page=${max}`);
+      if (!pulls.ok || !Array.isArray(pulls.data)) throw new Error(`list open pulls of ${owner}/${repo} (${pulls.status}): ${pulls.text}`);
+      for (const p of pulls.data) if (Number.isInteger(p.number) && out.length < max) out.push({ owner, repo, pr: Number(p.number), token });
+    }
+  }
+  return out;
+}
+
 /** Head branch name + fork flag for the fix agent's push (a fork branch can't be pushed with the
  * installation token). Reads /pulls/{pr}; loaded only via dynamic import from the loop runtime. */
 export async function fetchPullHeadRef(

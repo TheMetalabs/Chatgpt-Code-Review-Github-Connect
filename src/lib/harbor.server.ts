@@ -47,6 +47,7 @@ import {
   runPostReviewLoop,
   SILENT_REASONS,
   stopLoop,
+  sweepCutFixRounds,
   type ControlResult,
 } from "./review-loop-runtime.server.ts";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
@@ -1500,4 +1501,12 @@ export function ingestGitHubWebhook(opts: {
     hmac: "ok",
     untrustedBody: parsed.untrustedBody,
   });
+}
+
+// Boot, once per process: hand off the fix rounds a restart cut — sessions left at FIXING with
+// nothing running them (review-loop-runtime sweepCutFixRounds). Loop OFF: no GitHub call; never throws.
+const BOOT_SWEPT = Symbol.for("ashlar.review-loop.boot-sweep");
+if (!(globalThis as Record<symbol, unknown>)[BOOT_SWEPT]) {
+  (globalThis as Record<symbol, unknown>)[BOOT_SWEPT] = true;
+  void sweepCutFixRounds(state.settings);
 }

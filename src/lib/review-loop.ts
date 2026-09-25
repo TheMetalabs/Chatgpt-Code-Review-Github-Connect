@@ -337,6 +337,45 @@ export function fixingComment(c: { round: number; pr: number; head: string }): s
   return `<!-- ashlar-loop-fixing round=${c.round} pr=${c.pr} head=${c.head} -->\n\n${REVIEW_LOOP_FIXING_HUMAN} (round ${c.round} on \`${c.head.slice(0, 7)}\`).`;
 }
 
+const FIXING_MARKER_RE = /^\s*<!--\s*ashlar-loop-fixing\s+round=(\d{1,4})\s+pr=(\d{1,9})\s+head=([^\s>]+)\s*-->/;
+// The round's own report (review-loop-runtime renderFixReport): a suggestion round ends with only
+// this report — the session then waits for the human's push; it was not cut.
+const FIX_REPORT_RE = /^\s*### Ashlar fix agent — /;
+
+/** What the App's loop comments say about the session's progress (a bare stop RECORD of an older
+ * session's stop says nothing about this one: the session fold decides whether it ended). */
+export type LoopCommentKind = "start" | "fixing" | "report" | "continue" | "escalate" | "stopped";
+
+/** The kind of a loop comment the caller has proven the App authored; null for any other comment. */
+export function loopCommentKind(body: string | null | undefined): LoopCommentKind | null {
+  const bot = { authoredByBot: true };
+  if (FIXING_MARKER_RE.test(body || "")) return "fixing";
+  if (FIX_REPORT_RE.test(body || "")) return "report";
+  if (parseStartMarker(body, bot)) return "start";
+  if (parseContinueMarker(body, bot)) return "continue";
+  if (isEscalateComment(body, bot)) return "escalate";
+  return isStoppedComment(body, bot) ? "stopped" : null;
+}
+
+/**
+ * The App's NEWEST loop comment on a PR (by creation time, then comment id). "fixing" newest means a
+ * fix round started and nothing followed it: the round is running — or a restart cut it and nothing
+ * will (review-loop-runtime sweepCutFixRounds; scripts/loop-fixing.mjs lists these before a deploy).
+ */
+export function newestLoopComment<T extends { id?: number; userLogin: string; body: string; createdAt?: string }>(
+  rows: readonly T[],
+  botLogin: string = DEFAULT_ASHLAR_BOT_LOGIN,
+): { kind: LoopCommentKind; row: T; round?: number; head?: string } | null {
+  let best: { kind: LoopCommentKind; row: T } | null = null;
+  const later = (a: T, b: T) => (isoMs(a.createdAt) || 0) - (isoMs(b.createdAt) || 0) || (a.id ?? 0) - (b.id ?? 0);
+  for (const row of rows) {
+    const kind = isSelfLogin(row.userLogin, botLogin) ? loopCommentKind(row.body) : null;
+    if (kind && (!best || later(row, best.row) >= 0)) best = { kind, row };
+  }
+  const m = best?.kind === "fixing" ? FIXING_MARKER_RE.exec(best.row.body) : null;
+  return best && m ? { ...best, round: Number(m[1]), head: m[3] } : best;
+}
+
 export interface LoopContinuation {
   mode: ReviewLoopMode;
   round: number; // the review round being requested (1-based, within the session)

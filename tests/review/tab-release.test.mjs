@@ -391,7 +391,7 @@ for (const kind of ['review', 'fix']) {
     const state = b.pending().states.chatgpt;
     assert.equal(state.tabId, 11, 'the leg follows its tab');
     assert.ok(stagesOf(state.workerEvents).includes('worker:tab_rekeyed'), 'the replace reaches history');
-    assert.ok(b.session.state['ashlar:tab:11'] && !b.session.state['ashlar:tab:10'], 'the ownership record moved with it');
+    assert.equal(b.session.state['ashlar:tab:11']?.jobId, leg(kind).jobId, 'the ownership record names the new id');
     await b.tick();
     assert.deepEqual(reloads, [11], 'woken: the tab is still the one this browser session created for the leg');
     b.tabs.get(11).status = 'complete';
@@ -479,5 +479,41 @@ for (const kind of ['review', 'fix']) {
     const jobs = await b.jobs();
     assert.equal(await b.context.providerTabGone(jobs[leg(kind).jobId], 'chatgpt'), false, 'the sweep keeps a leg whose tab lives on');
     assert.equal(jobs[leg(kind).jobId].states.chatgpt.tabId, 11);
+  });
+}
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: an undispatched leg whose tab is replaced while it reads its creation record still sends into that tab`, async () => {
+    const unbound = (_id, m) => (m.type === 'ashlar-run' ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle', jobId: '', runId: '', provider: 'chatgpt'});
+    const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: unbound});
+    // Chrome swaps the tab, and the worker receives onReplaced while the poll reads the old id's record.
+    const get = b.session.get;let delivered = false;
+    b.session.get = async keys => {
+      if (!delivered && [].concat(keys ?? []).includes('ashlar:tab:10')) {
+        delivered = true;b.tabs.delete(10);b.tabs.set(11, {id: 11, url: TEMP, status: 'complete'});
+        await b.context.rekeyReplacedTab(11, 10);
+      }
+      return get(keys);
+    };
+    await b.tick();await b.tick();
+    assert.ok(delivered, 'the replace raced the record read');
+    assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' && !m.resume).map(m => m.id), [11], 'dispatched once, into the replaced tab');
+    assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');
+  });
+}
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a poll that runs while a replace is being recorded never sees the new id without its creation record`, async () => {
+    const unbound = (_id, m) => (m.type === 'ashlar-run' ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle', jobId: '', runId: '', provider: 'chatgpt'});
+    const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: unbound});
+    // The re-key is held while it writes the new id's records; a tick runs meanwhile.
+    const set = b.session.set;let release, held = false;const gate = new Promise(resolve => { release = resolve; });
+    b.session.set = async values => { if ('ashlar:tab:11' in values) { held = true;await gate; } return set(values); };
+    b.tabs.delete(10);b.tabs.set(11, {id: 11, url: TEMP, status: 'complete'});
+    const rekeyed = b.context.rekeyReplacedTab(11, 10);
+    assert.ok(await until(() => held), 'the re-key is writing its records');
+    await b.tick();
+    release();await rekeyed;
+    await b.tick();
+    assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' && !m.resume).map(m => m.id), [11], 'dispatched once, into the replaced tab');
+    assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');
   });
 }

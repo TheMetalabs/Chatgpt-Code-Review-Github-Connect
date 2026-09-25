@@ -118,14 +118,26 @@ async function rememberClosedTab(tabId, info) {
  * off, a prerender activation): onReplaced(added, removed) fires and onRemoved does not, so every
  * record keyed by the old id names a tab that is gone while the leg's tab lives on under the new one.
  * Its cleanup then took it for absent and never closed it, and an undispatched leg lost the record
- * that lets it send into the tab it created. The leg follows its tab: its state.tabId (recorded as a
- * tab_rekeyed step), the session ownership record, a preserved backstop and a fix delivery record
- * move to the new id. A leg that already released its tab (cleanupDone: closed or preserved) is left
+ * that lets it send into the tab it created. The leg follows its tab: the session ownership record
+ * (copied: the old id's record is kept, so a lane still checking the old id finds it, and Chrome never
+ * reuses a tab id), a preserved backstop and a fix delivery record name the new id first, then the
+ * leg's state.tabId moves (recorded as a tab_rekeyed step): a lane that reads the new id finds its
+ * records in place. A leg that already released its tab (cleanupDone: closed or preserved) is left
  * as it is: following the tab would not make it Ashlar's again. */
 async function rekeyReplacedTab(addedTabId, removedTabId) {
   if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return;
   invalidateTabInventory(removedTabId);
   invalidateTabInventory(addedTabId);
+  const session = await chrome.storage.session.get(null);
+  const owned = session[OWNED_PREFIX + removedTabId], records = {};
+  if (owned) records[OWNED_PREFIX + addedTabId] = owned;
+  for (const [key, value] of Object.entries(session)) {
+    if (key.startsWith(PRESERVED_PREFIX) && value?.tabId === removedTabId) records[key] = {...value, tabId: addedTabId};
+  }
+  if (Object.keys(records).length) await chrome.storage.session.set(records);
+  if (Object.values(await fixDeliveries()).some(record => record.tabId === removedTabId)) {
+    await updateFixDeliveries(all => { for (const record of Object.values(all)) if (record.tabId === removedTabId) record.tabId = addedTabId; });
+  }
   const jobs = await workerJobs((await settings()).origin);
   let moved = false;
   for (const job of Object.values(jobs)) {
@@ -136,17 +148,6 @@ async function rekeyReplacedTab(addedTabId, removedTabId) {
       workerStep(job, provider, "tab_rekeyed");
       moved = true;
     }
-  }
-  const session = await chrome.storage.session.get(null);
-  const owned = session[OWNED_PREFIX + removedTabId], moves = {};
-  if (owned) moves[OWNED_PREFIX + addedTabId] = owned;
-  for (const [key, value] of Object.entries(session)) {
-    if (key.startsWith(PRESERVED_PREFIX) && value?.tabId === removedTabId) moves[key] = {...value, tabId: addedTabId};
-  }
-  if (Object.keys(moves).length) await chrome.storage.session.set(moves);
-  if (owned) await chrome.storage.session.remove([OWNED_PREFIX + removedTabId]);
-  if (Object.values(await fixDeliveries()).some(record => record.tabId === removedTabId)) {
-    await updateFixDeliveries(all => { for (const record of Object.values(all)) if (record.tabId === removedTabId) record.tabId = addedTabId; });
   }
   if (moved) await saveJobs(jobs);
 }

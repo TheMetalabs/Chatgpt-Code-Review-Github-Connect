@@ -1358,7 +1358,10 @@ test('real DOM: a fix Send click records five send probes of the sent turn\'s sh
  assert.equal(first.last.withoutCardsHead,first.last.expectedHead,'the card-free text starts as the typed line');
  assert.match(first.last.textHead,/^[0-9a-f]{8}$/);
  assert.ok(first.last.textLength>typed.length,'the raw reading holds the card text too');
- const stored=JSON.stringify(await page.evaluate(()=>[...window.__local.entries()]));
+ // The HTML snapshots (sendProbeHtml) hold the page's own markup by design; the shape probes never do.
+ const html=await page.evaluate(()=>window.__local.get('sendProbeHtml'));
+ assert.deepEqual(html.map(h=>h.label),['5s','60s']);assert.ok(html.every(h=>h.html.includes('ashlar-fix-request')&&!/<script/i.test(h.html)));
+ const stored=JSON.stringify(await page.evaluate(()=>[...window.__local.entries()].filter(([k])=>k!=='sendProbeHtml')));
  for(const secret of [typed.slice(0,40),'Ashlar fix request',attachment.sha256,'def f(x)','Document · 1.2 KB','summary'])assert.ok(!stored.includes(secret),`no raw text: ${secret}`);
  const off=await attachmentPage(t,{render:'card',probe:false});
  await off.fill(text,62_000);

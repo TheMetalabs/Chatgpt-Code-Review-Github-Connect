@@ -4,6 +4,12 @@ const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
 const CLOSED_PREFIX = "ashlar:closed:";
 const OWNED_PREFIX = "ashlar:tab:";
+// The tab a leg's run was dispatched into, written when the page accepted it ({jobId, provider,
+// runId, tabId, at}): chrome.storage.session survives a stopped or suspended worker (a tab id is
+// meaningful only within one browser session). It is the proof that lets the worker re-bind that
+// tab's page when the page lost its binding (rebindDispatchedPage), never any other tab.
+const DISPATCH_PREFIX = "ashlar:dispatched:";
+const dispatchKey = (jobId, provider) => `${DISPATCH_PREFIX}${jobId}:${provider}`;
 // A fix run whose tab the worker preserved without the page's own release (it never answered):
 // the inventory treats that page's binding as released, so it is never an orphan holding capacity,
 // and completes the release handshake as soon as the page can answer (see completePreservedRelease).
@@ -1720,6 +1726,7 @@ async function retireCleanJob(job, jobs, forgotten = false, signal) {
       const tabs = {...old.tabs};
       for (const p of job.providers) delete tabs[`${job.jobId}:${p}`];
       await chrome.storage.session.set({tabs});
+      await chrome.storage.session.remove(job.providers.map(p => dispatchKey(job.jobId, p)));
       await chrome.storage.local.remove(["ashlar:job:" + job.jobId]);
       await rememberRetired(job);
     });
@@ -1803,6 +1810,25 @@ async function unrecordedTabWait(job, provider, jobs) {
   delete state.unrecordedTabSince;
   state.outcome = failure("tab_unreachable", "the chat tab could not be asked whether it already holds this run; the prompt was not sent again");
   await saveJobs(jobs);
+}
+
+/** A page that answers unbound (no jobId: a new document that lost its session binding, e.g. after
+ * ChatGPT reloaded it or moved it to /c/<id>) in the tab this browser session dispatched the leg's
+ * run into (dispatchKey) is re-bound to that run: it is sent the run as a RESUME (adoptLegacy), so it
+ * observes the conversation and never types or sends the prompt again. Only that exact tab and run
+ * qualify; a page bound to anything else answers job_mismatch and is left alone. The page's reply,
+ * or null when the tab does not qualify or the page did not answer. */
+async function rebindDispatchedPage(job, provider, run, result) {
+  const state = job.states[provider];
+  if (!state.started || result?.jobId !== "" || !Number.isInteger(state.tabId)) return null;
+  const key = dispatchKey(job.jobId, provider);
+  const record = (await chrome.storage.session.get([key]))[key];
+  if (record?.runId !== state.runId || record.tabId !== state.tabId || record.provider !== provider) return null;
+  try {
+    const reply = await askPage(state.tabId, {...run, resume: true, adoptLegacy: true}, contentFiles(provider));
+    if (matchesJob(reply, job, provider)) workerStep(job, provider, "run_rebound");
+    return reply;
+  } catch { return null; }
 }
 
 /** Why a page refused a new run message (json.js, before it binds anything): "taken_over" (its tab
@@ -1981,6 +2007,8 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
         state.started = true;
         workerStep(job,provider,"run_dispatched");
         await saveJobs(jobs);
+        await chrome.storage.session.set({[dispatchKey(job.jobId, provider)]:
+          {jobId: job.jobId, provider, runId: state.runId, tabId: state.tabId, at: Date.now()}});
       }
     } else {
       result = await askPage(state.tabId, tabMessage(job, provider, "ashlar-harvest"), contentFiles(provider));
@@ -2008,6 +2036,10 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   // into the same tab, with a new deadline.
   if (refused === "stale_run") return;
   if (await discardWaitOver(job, provider, jobs, matchesJob(result, job, provider) && discardedRunProven(result, dispatched))) return;
+  if (!observeOnly && (result?.code === "disconnected" || !matchesJob(result, job, provider))) {
+    const rebound = await rebindDispatchedPage(job, provider, run, result);
+    if (rebound) result = rebound;
+  }
   if (result?.code === "disconnected" || !matchesJob(result, job, provider)) {
     state.connectionError = "original job binding unavailable; waiting for reconnection";
     const original = await findOriginalTab(job, provider);

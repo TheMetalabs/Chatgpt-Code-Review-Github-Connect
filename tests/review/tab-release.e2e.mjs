@@ -482,11 +482,11 @@ test('an unbound page never answers for a job: can-close and a cancel without th
 // in tab 10, whose URL follows the page (an in-page pushState is a tab URL update in Chrome) when
 // `tick` syncs it. `server.value` is the job status the bridge reports; `onComplete` runs before
 // the bridge ACKs a delivered result.
-function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true,jobId=tab.job,runId=tab.run,state={},job:extra={},session}={}){
+function wire(tab,{kind,server={value:'awaiting_chat'},onComplete,started=true,jobId=tab.job,runId=tab.run,state={},job:extra={},session,local}={}){
  const provider=tab.provider||'chatgpt';
  const job={jobId,...(kind==='fix'?{kind:'fix'}:{}),origin:'http://bridge',leaseId:'lease-A',prompt:PROMPT,providers:[provider],
   reasoning:{chatgpt:'pro',grok:'heavy'},states:{[provider]:{tabId:10,started,runId,...state}},...extra};
- const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{[job.jobId]:job}}),session,
+ const b=background({local:local||storage({origin:'http://bridge',token:'token',pendingReviewJobs:{[job.jobId]:job}}),session,
   tabs:new Map([[10,{id:10,url:tab.page.url(),status:'complete'}]]),
   api:async(_path,body)=>{
    if(body?.action==='ping')return {ok:true,active:server.value==='awaiting_chat',accepted:server.value==='awaiting_chat',status:server.value,bridge:{captureProtocol:1,localJsonRepairEnabled:false}};
@@ -1173,4 +1173,54 @@ test('fresh run, control: a run left on its new chat types and clicks Send once'
  assert.equal((await tab.send('ashlar-run',{prompt:PROMPT,allocationUrl:TEMP_URL})).code,'busy');
  await tab.page.clock.runFor(3000);
  assert.equal(await tab.clicks(),1);
+});
+
+// A leg whose page lost its binding after the dispatch (a new document without the run's session
+// keys: ChatGPT reloaded the tab, or moved its new chat to /c/<id>), seen by a worker that restarted
+// meanwhile (a suspended or stopped service worker reads its registry and session records again). The
+// page answers unbound; the worker used to wait "for reconnection" forever. The tab this browser
+// session dispatched the run into is re-bound as a resume: observed, never sent again.
+for(const kind of ['review','fix'])test(`worker, ${kind}: a restarted worker re-binds the page that lost its binding in the tab it dispatched the run into`,async t=>{
+ const tab=await chatTab(t,{kind,bound:false});
+ const w=wire(tab,{kind,started:false,session:createdHere(tab.job)});
+ await w.tick();await tab.page.clock.runFor(3000);
+ assert.equal(await tab.clicks(),1,'the prompt was sent once');
+ assert.equal(w.state().started,true);
+ Object.assign(tab.served,{thread:userTurn()+answerTurn()});
+ await tab.page.evaluate(()=>sessionStorage.clear());
+ await tab.page.goto(kind==='fix'?TEMP_URL:CONV_URL);await tab.inject();
+ const again=wire(tab,{kind,local:w.b.local,session:w.b.session});
+ await again.tick();await tab.page.clock.runFor(2400);await again.tick();
+ assert.ok(again.b.messages.some(m=>m.type==='ashlar-run'&&m.resume===true&&m.adoptLegacy===true),'the dispatched tab is re-bound as a resume');
+ assert.equal(await tab.clicks(),0,'the re-bound page never sends the prompt again');
+ assert.equal(again.b.messages.some(m=>m.type==='ashlar-run'&&m.resume!==true),false,'never a fresh run');
+ assert.equal(again.state()?.connectionError,undefined,'no longer waiting for reconnection');
+ // A review answer is collected and delivered. A fix answer is proven only with its send journal,
+ // which the lost session took along: the re-bound page observes it until the fix deadline.
+ if(kind==='review')assert.ok(again.b.calls.some(c=>c.action==='complete'),'the review is delivered');
+ else assert.ok(again.state().pageEvents.some(e=>e.stage==='legacy_observation'),'the fix page observes its run again');
+});
+// Only the tab this browser session dispatched the run into is ever re-bound (no record after a
+// browser restart: storage.session is gone).
+test('worker: an unbound page in a tab with no dispatch record of the run is never re-bound',async t=>{
+ const tab=await chatTab(t,{bound:false,url:CONV_URL,thread:userTurn()+answerTurn()});
+ const w=wire(tab,{});
+ await w.tick();await w.tick();
+ assert.equal(w.b.messages.some(m=>m.type==='ashlar-run'&&m.adoptLegacy===true),false);
+ assert.match(w.state().connectionError||'',/original job binding unavailable/);
+});
+// Control: a page that keeps its session binding across the move to /c/<id> (a reload) is found by
+// the restarted worker as it is, and delivers; nothing is re-bound.
+test('worker, review: a restarted worker harvests a run whose new chat moved to /c/<id> and reloaded after the dispatch',async t=>{
+ const tab=await chatTab(t,{bound:false});
+ const w=wire(tab,{started:false,session:createdHere(tab.job)});
+ await w.tick();await tab.page.clock.runFor(3000);
+ assert.equal(await tab.clicks(),1);
+ Object.assign(tab.served,{thread:userTurn()+answerTurn()});
+ await tab.page.goto(CONV_URL);await tab.inject();
+ const again=wire(tab,{local:w.b.local,session:w.b.session});
+ await again.tick();await tab.page.clock.runFor(2400);await again.tick();
+ assert.ok(again.b.calls.some(c=>c.action==='complete'),`delivered: ${JSON.stringify(again.state())}`);
+ assert.equal(again.b.messages.some(m=>m.adoptLegacy===true),false,'a bound page needs no re-binding');
+ assert.equal(await tab.clicks(),0);
 });

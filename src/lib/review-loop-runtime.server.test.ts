@@ -12,6 +12,7 @@ import {
   ashlarBotLogin,
   builtinValidate,
   continueLoopOnPush,
+  controlResultLogged,
   effectiveLoopMode,
   loopEnabled,
   loopPostedReview,
@@ -24,6 +25,7 @@ import {
   requestChatFix,
   runPostReviewLoop,
   SILENT_REASONS,
+  START_UNRESOLVED,
   startLoop,
   stopLoop,
   type LoopRuntimeDeps,
@@ -120,6 +122,9 @@ function fakeDeps(
     liveSha?: string;
     movedDuringFix?: boolean;
     refMovedAtWrite?: boolean;
+    // the first N reads of the PR head after an applied round's commit still show its parent
+    // (GitHub syncs a PR's head.sha after a ref update); Infinity: no read of the call catches up
+    lagHeadReads?: number;
     commitSha?: string;
     lastHead?: string; // head of the latest reconstructed round (default: the reviewed HEAD)
     additions?: number;
@@ -146,6 +151,7 @@ function fakeDeps(
   let replyAttempts = 0;
   let sleeps = 0;
   let clock = 0;
+  let laggedHeadReads = 0;
   const start = opts.start === undefined ? "suggest" : opts.start;
   const issues: IssueRow[] = [
     ...(start ? [recorded(start, "alice", START_AT)] : []),
@@ -190,8 +196,11 @@ function fakeDeps(
         return { id: posted.length };
       },
       async fetchPullHeadRef() {
-        // movedDuringFix: the head moves once the fix request was sent (a push during the fix)
-        const sha = moved || (opts.movedDuringFix && prompts.length > 0) ? MOVED : (opts.liveSha ?? HEAD);
+        // movedDuringFix: the head moves once the fix request was sent (a push during the fix);
+        // an applied round's commit is the head from then on — once a read has caught up with it
+        const lags = committed && laggedHeadReads < (opts.lagHeadReads ?? 0);
+        if (lags) laggedHeadReads += 1;
+        const sha = committed && !lags ? (opts.commitSha ?? NEW_SHA) : moved || (opts.movedDuringFix && prompts.length > 0) ? MOVED : (opts.liveSha ?? HEAD);
         return {
           ref: "feature",
           sha,
@@ -265,6 +274,9 @@ function fakeDeps(
     },
     get replyAttempts() {
       return replyAttempts;
+    },
+    get laggedHeadReads() {
+      return laggedHeadReads;
     },
     get sleeps() {
       return sleeps;
@@ -396,6 +408,26 @@ describe("the loop is OFF unless Settings enable it (no other path turns it on)"
       .filter((file) => /from\s+["'][^"']*review-loop-engine\.server/.test(readFileSync(file, "utf8")))
       .map((file) => relative(SRC, file));
     assert.deepEqual(importers, ["lib/review-loop-runtime.server.ts"]);
+  });
+
+  it("the control-write gate is reached only through the gated engine and runtime", () => {
+    const importers = sources(SRC)
+      .filter((file) => /from\s+["'][^"']*review-loop-control(\.ts)?["']/.test(readFileSync(file, "utf8")))
+      .map((file) => relative(SRC, file))
+      .sort();
+    assert.deepEqual(importers, ["lib/review-loop-engine.server.ts", "lib/review-loop-runtime.server.ts"]);
+  });
+
+  it("control markers reach GitHub only through emitControl (one POST site); the runtime posts only progress and reports", () => {
+    const posts = (file: string) =>
+      readFileSync(join(SRC, file), "utf8")
+        .split("\n")
+        .filter((l) => !isComment(l) && /\.createIssueComment\(/.test(l));
+    assert.deepEqual(posts("lib/review-loop-engine.server.ts"), [], "the engine never POSTs a comment itself");
+    assert.equal(posts("lib/review-loop-control.ts").length, 1, "emitControl's one POST");
+    const runtime = posts("lib/review-loop-runtime.server.ts");
+    assert.ok(runtime.length > 0);
+    for (const l of runtime) assert.match(l, /body: (fixingComment|renderFixReport)\(/, `a control marker posted around the gate: ${l.trim()}`);
   });
 
   it("every loop entry point is inert without the Settings switch or without a provider: no GitHub or provider call", async () => {
@@ -576,6 +608,23 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.ok(f.posted[2].includes(NEW_SHA));
     assert.match(f.posted[2], /Loop continues/);
     assert.ok(!f.posted.some((b) => /@ashlar/i.test(b)), "no bot @-mention posted");
+  });
+
+  it("the App's own commit is no moved head: a read of the PR head that still shows its parent (GitHub syncs it after the ref update) keeps the continuation owed", async () => {
+    // one lagging read (the continuation's own decision), or none that catches up in the call —
+    // a fake that never moves the head on the commit
+    for (const lagHeadReads of [1, Infinity]) {
+      const f = fakeDeps({ start: "apply", rounds: [3], lagHeadReads });
+      const r = await run(f, "apply");
+      assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.continued === true, `${lagHeadReads}: ${JSON.stringify(r)}`);
+      assert.ok(f.laggedHeadReads >= 1, `${lagHeadReads}: a read after the commit showed its parent`);
+      const continuations = f.posted.map((b) => parseContinueMarker(b, { authoredByBot: true })).filter((c) => c !== null);
+      assert.deepEqual(continuations, [{ mode: "apply", round: 2, pr: 7, head: NEW_SHA }], `${lagHeadReads}: the commit's review is requested once`);
+      const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+      assert.match(report, /Loop continues/, `${lagHeadReads}: the report`);
+      assert.ok(!/head moved/i.test(report), `${lagHeadReads}: the report says the head moved`);
+      assert.equal(escalations(f.posted).length, 0, `${lagHeadReads}: no handoff`);
+    }
   });
 
   it("a retryable failure is retried with the rejection fed back, then succeeds", async () => {
@@ -916,6 +965,57 @@ describe("round-5: durable stop records, exact session scoping, prompt boundary,
     assert.deepEqual(await continueLoopOnPush("t", push, settings("apply"), f.deps, ENV), { posted: true, reason: "continued" });
     assert.deepEqual(await continueLoopOnPush("t", push, settings("apply"), f.deps, ENV), { posted: false, reason: "already continued" });
     assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 1);
+  });
+
+  it("a continuation whose POST outcome is unknown is never re-sent and never contradicted by a handoff", async () => {
+    const pushed = "b".repeat(40);
+    const f = fakeDeps({ start: "apply", rounds: [3], liveSha: pushed });
+    const listed = f.deps.gh.listIssueComments;
+    let frozen: Awaited<ReturnType<typeof listed>> | undefined;
+    f.deps.gh.listIssueComments = async (...a) => (frozen ??= await listed(...a)); // the list never catches up
+    const create = f.deps.gh.createIssueComment;
+    f.deps.gh.createIssueComment = async (...a) => {
+      const out = await create(...a); // GitHub created it...
+      if (a[1].body.includes("ashlar-loop-continue")) {
+        // ...but answered 502: the write contract reports an unknown outcome
+        throw Object.assign(new Error("GitHub issue comment 502: Bad Gateway"), { name: "GithubWriteError", status: 502, outcome: "unknown" });
+      }
+      return out;
+    };
+    const push = { owner: "o", repo: "r", pr: 7, headSha: pushed, actor: "alice" };
+    const first = await continueLoopOnPush("t", push, settings("apply"), f.deps, ENV);
+    assert.equal(first.posted, false);
+    assert.match(first.reason, /continuation outcome unknown.*no handoff/);
+    assert.equal(first.unresolved, true, "harbor logs it");
+    // a redelivered push while the list still lags: still unknown — never reported as "already continued"
+    const again = await continueLoopOnPush("t", push, settings("apply"), f.deps, ENV);
+    assert.equal(again.posted, false);
+    assert.match(again.reason, /continuation outcome unknown.*no handoff/);
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 1, "one POST only");
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-escalate")).length, 0, "no loop-error handoff against a continuation that may exist");
+  });
+
+  it("an applied round whose continuation POST outcome is unknown: one POST, no handoff, the report says unknown, not continued", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const listed = f.deps.gh.listIssueComments;
+    f.deps.gh.listIssueComments = async (...a) => (await listed(...a)).filter((c) => !c.body.includes("ashlar-loop-continue")); // the row never shows
+    const create = f.deps.gh.createIssueComment;
+    f.deps.gh.createIssueComment = async (...a) => {
+      const out = await create(...a);
+      if (a[1].body.includes("ashlar-loop-continue")) {
+        throw Object.assign(new Error("GitHub issue comment 502: Bad Gateway"), { name: "GithubWriteError", status: 502, outcome: "unknown" });
+      }
+      return out;
+    };
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied");
+    assert.notEqual(r.continued, true, "an unknown continuation is never reported as continued");
+    assert.equal(f.committed, true);
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 1, "exactly one continuation POST");
+    assert.equal(escalations(f.posted).length, 0, "no handoff against a continuation that may exist");
+    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+    assert.match(report, /Continuation outcome unknown/);
+    assert.ok(!/next review is requested/.test(report), "never claims the next review is requested");
   });
 
   it("a rejected reply's text reaches the retry ONLY as a JSON-encoded untrusted field", async () => {
@@ -1403,6 +1503,17 @@ describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; gro
 });
 
 describe("helpers", () => {
+  it("harbor logs every failed or unresolved control result through one predicate", () => {
+    assert.equal(controlResultLogged({ posted: false, reason: `${START_UNRESOLVED}: GitHub issue comment 502`, unresolved: true }), true);
+    assert.equal(controlResultLogged({ posted: false, reason: "stop failed: GitHub issue comment 422 (honored in this process until recorded)" }), true);
+    for (const reason of ["started", "start already recorded", "stopped", "stop already recorded", "continued", "already continued", "no active loop session", "disabled"]) {
+      assert.equal(controlResultLogged({ posted: reason === "started" || reason === "stopped" || reason === "continued", reason }), false, reason);
+    }
+    const harbor = readFileSync(join(new URL(".", import.meta.url).pathname, "harbor.server.ts"), "utf8");
+    assert.equal(harbor.match(/if \(controlResultLogged\(r\)\) console\.warn/g)?.length, 2, "the start record and every webhook control step log through it");
+    assert.ok(!/\/failed\/\.test\(r\.reason\)\)\s*console\.warn/.test(harbor), "no second logging rule");
+  });
+
   it("ashlarBotLogin: ASHLAR_BOT_LOGIN only in the App-reserved <slug>[bot] shape", () => {
     assert.equal(ashlarBotLogin({} as NodeJS.ProcessEnv), BOT);
     assert.equal(ashlarBotLogin({ ASHLAR_BOT_LOGIN: "other-app[bot]" } as NodeJS.ProcessEnv), "other-app[bot]");
@@ -1789,4 +1900,148 @@ describe("provider capabilities: activity and the governing deadline come from t
     const limits = fixWatchLimits(s, deps, {});
     assert.deepEqual([limits.reportsActivity, limits.queueMaxMs, limits.generationMs], [true, 10 * MIN, 30 * MIN]);
   });
+});
+
+describe("ambiguous control writes: journaled with no expiry, never read as posted", () => {
+  const unknownErr = () => Object.assign(new Error("GitHub issue comment 502: Bad Gateway"), { name: "GithubWriteError", status: 502, outcome: "unknown" });
+  /** Every POST whose body matches `hit` fails with an UNKNOWN outcome and creates no row (the list stays stale). */
+  const unknownFor = (f: ReturnType<typeof fakeDeps>, hit: (body: string) => boolean) => {
+    const orig = f.deps.gh.createIssueComment;
+    let attempts = 0;
+    f.deps.gh.createIssueComment = async (t, o) => {
+      if (!hit(o.body)) return orig(t, o);
+      attempts += 1;
+      throw unknownErr();
+    };
+    return () => attempts;
+  };
+  /** Every POST whose body matches `hit` CREATES its row, then fails with an UNKNOWN outcome (a 502
+   * after creation): the retry schedule's re-check lists it. */
+  const landedFor = (f: ReturnType<typeof fakeDeps>, hit: (body: string) => boolean) => {
+    const orig = f.deps.gh.createIssueComment;
+    let attempts = 0;
+    f.deps.gh.createIssueComment = async (t, o) => {
+      if (!hit(o.body)) return orig(t, o);
+      attempts += 1;
+      await orig(t, o);
+      throw unknownErr();
+    };
+    return () => attempts;
+  };
+  const stopReq = { owner: "o", repo: "r", pr: 7, actor: "bob", stopAt: "2026-01-20T00:00:00Z" };
+
+  it("an applied round whose loop-error handoff answered 502 but landed handed off: its report and replies follow", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], failContinuation: true, threads: [{ id: 50, path: "src/a.ts", body: "finding" }] });
+    const attempts = landedFor(f, (b) => b.includes("ashlar-loop-escalate"));
+    const posted: PostedLoopReview = { githubId: 9, comments: [{ findingId: "f1", file: "src/a.ts", body: "finding" }], published: ["f1"] };
+    const r = await runPostReviewLoop("t", job(), sample, settings("apply"), f.deps, ENV, posted);
+    assert.equal(f.committed, true);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    assert.equal(attempts(), 1, "one handoff POST");
+    assert.equal(escalations(f.posted).length, 1);
+    assert.ok(f.posted.some((b) => b.startsWith("### Ashlar fix agent — applied")), "the pushed commit is reported");
+    assert.equal(f.replies.length, 1, "the finding thread gets its disposition");
+  });
+
+  it("a no-change round whose fix-declined handoff answered 502 but landed handed off: its report follows, not a silent 'already escalated'", async () => {
+    const f = fakeDeps({ start: "suggest", rounds: [3], reply: '{"summary":"false positive","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"n"}]}' });
+    const attempts = landedFor(f, (b) => b.includes("ashlar-loop-escalate"));
+    const r = await run(f, "suggest");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-declined", JSON.stringify(r));
+    assert.equal(attempts(), 1, "one handoff POST");
+    assert.ok(f.posted.some((b) => b.startsWith("### Ashlar fix agent — no change")), "the rationale is reported");
+  });
+
+  it("a round whose session this process's own unknown handoff ended mid-fix exits logged, not as a quiet 'ended by a handoff'", async () => {
+    const f = fakeDeps({ start: "suggest", rounds: [3], failContinuation: true });
+    const attempts = unknownFor(f, (b) => b.includes("ashlar-loop-escalate"));
+    const fix = f.deps.requestFix;
+    f.deps.requestFix = async (p, ctl) => {
+      // a late push event for this very head: its continuation is refused, its loop-error handoff's outcome is unknown
+      await continueLoopOnPush("t", { owner: "o", repo: "r", pr: 7, headSha: HEAD, actor: "alice" }, settings(), f.deps, ENV);
+      return fix(p, ctl);
+    };
+    const r = await run(f, "suggest");
+    assert.equal(attempts(), 1, "one handoff POST");
+    assert.ok(!r.ran && r.reason.startsWith("handed off (outcome unknown)"), JSON.stringify(r));
+    assert.ok(!SILENT_REASONS.includes(r.reason), "logged");
+    assert.ok(!f.posted.some((b) => b.includes("Ashlar fix agent — suggestion")), "the moot suggestion is not posted");
+  });
+
+  it("a stop whose record has an unknown outcome: one POST, a redelivery is not 'recorded', the stop stays honored", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const attempts = unknownFor(f, (b) => b.startsWith(STOPPED_MARKER));
+    const first = await stopLoop("t", stopReq, settings(), f.deps, ENV);
+    assert.equal(first.posted, false);
+    assert.match(first.reason, /outcome unknown.*honored in this process until recorded/);
+    assert.equal(first.unresolved, true, "harbor logs it");
+    const again = await stopLoop("t", stopReq, settings(), f.deps, ENV);
+    assert.equal(again.posted, false);
+    assert.notEqual(again.reason, "stop already recorded", "a write that may not have landed is not a recorded stop");
+    assert.match(again.reason, /outcome unknown.*honored in this process until recorded/);
+    assert.equal(attempts(), 1, "one POST only");
+    // the stop is still honored (write-ahead): a later session read is ended, no fix runs
+    assert.deepEqual(await run(f, "apply"), { ran: false, reason: "no active loop session" });
+    assert.equal(f.prompts.length, 0);
+    assert.equal(f.committed, false);
+  });
+
+  it("no time-based expiry: more than 24 h later, with the list still stale, a redelivery still does not POST", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const attempts = unknownFor(f, (b) => b.startsWith(STOPPED_MARKER));
+    await stopLoop("t", stopReq, settings(), f.deps, ENV);
+    const realNow = Date.now;
+    const later = realNow() + 25 * 60 * 60_000;
+    Date.now = () => later;
+    try {
+      const again = await stopLoop("t", stopReq, settings(), f.deps, ENV);
+      assert.equal(again.posted, false);
+      assert.match(again.reason, /outcome unknown/);
+    } finally {
+      Date.now = realNow;
+    }
+    assert.equal(attempts(), 1, "still one POST");
+  });
+
+  it("a start record with an unknown outcome is never re-sent or reported recorded, and is folded as the human's start", async () => {
+    const f = fakeDeps({ start: null, rounds: [3] });
+    const attempts = unknownFor(f, (b) => b.includes("ashlar-loop-start"));
+    const req = { owner: "o", repo: "r", pr: 7, actor: "alice", mode: "suggest" as const, at: "2025-12-31T00:00:00Z" };
+    const first = await startLoop("t", req, settings(), f.deps, ENV);
+    assert.equal(first.posted, false);
+    assert.ok(first.reason.startsWith(START_UNRESOLVED), first.reason);
+    assert.equal(first.unresolved, true, "harbor logs it");
+    const again = await startLoop("t", req, settings(), f.deps, ENV);
+    assert.equal(again.posted, false);
+    assert.ok(again.reason.startsWith(START_UNRESOLVED), `never "start already recorded": ${again.reason}`);
+    assert.equal(again.unresolved, true);
+    assert.ok(!SILENT_REASONS.includes(START_UNRESOLVED), "logged, not silent");
+    // the loop step for the review that start requested runs on the folded start: no re-POST
+    const j = job({ thread: { kind: "mention", commentId: 5, userText: "/review-loop", loop: { kind: "start", mode: "suggest" }, eventAt: req.at } });
+    const r = await run(f, "suggest", ENV, j);
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested", JSON.stringify(r));
+    assert.equal(attempts(), 1, "one POST only");
+  });
+
+  for (const [name, opts] of [
+    ["fix-declined", { reply: '{"summary":"false positive","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"n"}]}' }],
+    ["fix-failed", { reply: '{"summary":"edit policy","files":[{"path":"docs/POLICY.md","content":"tampered"}]}' }],
+  ] as const) {
+    it(`a ${name} handoff with an unknown outcome is terminal here: a redelivered review runs no second fix and posts no second handoff`, async () => {
+      const f = fakeDeps({ start: "apply", rounds: [3], ...opts });
+      const attempts = unknownFor(f, (b) => b.includes("ashlar-loop-escalate"));
+      const first = await run(f, "apply");
+      assert.equal(first.ran, false);
+      assert.match(first.ran ? "" : first.reason, new RegExp(`ESCALATE ${name}: handed off \\(outcome unknown\\)`));
+      const prompts = f.prompts.length;
+      assert.ok(prompts >= 1);
+      const again = await run(f, "apply"); // the same review, redelivered, while the list still lags
+      assert.equal(again.ran, false);
+      assert.match(again.ran ? "" : again.reason, /^handed off \(outcome unknown\)/);
+      assert.ok(!SILENT_REASONS.includes(again.ran ? "" : again.reason), "logged, not silent");
+      assert.equal(f.prompts.length, prompts, "the fix provider is not invoked again");
+      assert.equal(attempts(), 1, "one handoff POST");
+      assert.equal(f.committed, false);
+    });
+  }
 });

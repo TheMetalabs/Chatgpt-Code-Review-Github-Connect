@@ -103,10 +103,13 @@
  *   - the prompt is delivered VERBATIM, byte-exact, from request() to the composer: the route never
  *     converts it to an attachment protocol (routes/api/bridge.ts promptsForClient) and the page
  *     never splits, uploads or trims it (extension/composer.js promptParts), so a file line that looks
- *     like an attachment envelope stays file content. The only intended changes are the runtime's
- *     fence rule appended before request() (review-loop-runtime requestChatFix) and the
- *     whitespace-normalized COMPARISON that confirms the send (normalizePrompt; the typed text is not
- *     changed by it);
+ *     like an attachment envelope stays file content. The only intended change is the runtime's
+ *     fence rule appended before request() (review-loop-runtime requestChatFix). The page verifies
+ *     the prompt LOSSLESSLY (composer.js fixPromptForm: only CRLF->LF and the whitespace at the two
+ *     ends of the whole prompt): the composer draft before Send (a draft whose whitespace the editor
+ *     changed is never sent: `prompt_altered`) and the sent turn after it (json.js
+ *     journaledTurnIntegrity against the journal's `exact` form). The whitespace-normalized
+ *     comparison (normalizePrompt) only locates the sent turn;
  *   - the extension types the WHOLE prompt into the chat composer and confirms the send by finding
  *     that text in the rendered user message. A prompt over maxPromptChars() (default 100k chars,
  *     Settings fix_agent.chat_max_prompt_chars) is rejected up front instead of risking a submission that

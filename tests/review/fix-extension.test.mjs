@@ -24,7 +24,7 @@ function page({parts = PARTS, blocks = [PARTS[1]], limit = 50, bound = true} = {
   c.context.location = {href: URL_FIX}; // the page still shows the conversation the fix was sent in
   let polls = 0;
   // conversation: recorded by composer.js submissionConfirmed when the send was proven
-  const journal = bound ? {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX} : null;
+  const journal = bound ? {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX} : null;
   Object.assign(c.context, {
     readSubmissionJournal: async () => journal,
     // every later fix decision re-reads the same journal (fixOwnershipProof)
@@ -91,6 +91,8 @@ test('page: a visible quota notice ends a fix only before an answer is visible',
 // Round 11 lifecycle (review 5307890587, P1): a PERMANENT ownership verdict ends the collector on
 // the observation that sees it (no further poll), with the distinct terminal code `taken_over`, the
 // tab marked the user's for good and its managed slot freed. A transient "unknown" keeps polling.
+/** A composer holding `value` (no DOM otherwise): what composerDraftText reads. */
+const draftOn = (c, value) => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); };
 const COLLECT_VERDICTS = {
   followup: {permanent: true, set: c => { c.boundReviewResponse = () => ({identified: true, followup: true, root: {}, responseId: 'response-A'}); }},
   edited: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; }},
@@ -99,6 +101,9 @@ const COLLECT_VERDICTS = {
   // round 13: a sent journal with no send-time identity (legacy, or confirmed only after a reload)
   // never gains one: the collector never records it from the current location
   unestablished: {permanent: true, journal: {conversation: undefined}},
+  // R17 (Ashlar 4101855330): a fix journal without its prompt's lossless form (composer.js clickSend
+  // records `exact`) can never prove its sent turn exact
+  noLosslessForm: {permanent: true, journal: {exact: undefined}},
   unreadableLocation: {permanent: true, set: c => { c.location = {href: ''}; }},
   turnUnrendered: {permanent: false, set: c => { c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
   // round 15: a permanent verdict is decided BEFORE the response must be identified: moved away with
@@ -107,12 +112,17 @@ const COLLECT_VERDICTS = {
   replacedUnrendered: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
   movedComposerEcho: {permanent: true, set: c => { c.location = {href: 'https://chatgpt.com/c/users-own'}; c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
   composerEcho: {permanent: false, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
+  // R17 (Ashlar 4101855338): a user draft is decided BEFORE the transient waits: seen while the sent
+  // turn is not rendered or not resolvable yet, it still ends the run. Ashlar's own echo does not.
+  draftTurnUnrendered: {permanent: true, set: c => { draftOn(c, 'my own question'); c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  draftTurnUnresolved: {permanent: true, set: c => { draftOn(c, 'my own question'); c.journaledTurnIntegrity = () => 'unknown'; }},
+  composerEchoTurnUnresolved: {permanent: false, set: c => { draftOn(c, 'FIX PROMPT'); c.journaledTurnIntegrity = () => 'unknown'; }},
 };
 for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
   test(`page: collect verdict "${name}" ${verdict.permanent ? 'ends the fix run at once (taken_over), slot freed' : 'is transient: the collector keeps polling'}`, async () => {
     const p = page({limit: 12});
     if (verdict.journal) {
-      const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX, ...verdict.journal};
+      const journal = {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: URL_FIX, ...verdict.journal};
       Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
     }
     verdict.set?.(p.c.context);
@@ -130,6 +140,98 @@ for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
   });
 }
 
+// R17 (Ashlar 4101855338): a draft seen on ONE poll while the sent turn was unresolved latches the
+// takeover for good. The user then clears it and the turn resolves again: every later decision
+// (collect, hand-out, can-close, restore after a reload) still says the tab is the user's.
+test('page: a draft typed and cleared while the sent turn is unresolved keeps the tab taken over at every later decision', async () => {
+  const p = page();
+  const c = p.c.context;
+  let draft = 'my own question', integrity = 'unknown';
+  draftOn(c, '');
+  Object.assign(c, {composer: () => ({value: draft}), journaledTurnIntegrity: () => integrity});
+  Object.assign(p.state(), {kind: 'fix', jobId: 'fix-A', runId: 'run-A', running: false});
+  const first = c.fixOwnershipProof(p.state(), {phase: 'collect'});
+  assert.deepEqual([first.ownership, first.reason], ['takenOver', 'draft'], 'decided on the poll that saw the draft');
+  draft = ''; integrity = 'exact';
+  const later = {
+    collect: c.fixOwnershipProof(p.state(), {phase: 'collect'}).ownership,
+    handOut: c.fixOwnershipProof(p.state(), {phase: 'complete', completion: {responseId: 'response-A', text: ANSWER}}).ownership,
+  };
+  p.state().result = {ok: true, raw: ANSWER, responseText: ANSWER};
+  const close = c.fixCanClose(p.state());
+  p.state().result = null;
+  const restored = p.c.message(msg('ashlar-result-saved', {committed: true, raw: ANSWER, text: ANSWER, completion: {responseId: 'response-A', context: '[]'}}));
+  assert.deepEqual({...later, canClose: close.canClose, closeReason: close.reason, restore: restored.code},
+    {collect: 'takenOver', handOut: 'takenOver', canClose: false, closeReason: 'repurposed', restore: 'completion_changed'});
+  assert.equal(p.state().slotReleased, true, 'the managed slot is freed');
+});
+
+// R17 (Ashlar 4101855318, P1): the collector pins the response of its first answered observation.
+// The user regenerates it before the second stable observation: boundReviewResponse now binds the
+// newest reply, which must end the run (taken_over, tab preserved), never become the fix answer. With
+// no response ID the assistant message node is the pin; a re-render of the pinned ID, or the same
+// node, is still the same response (controls).
+const REGENERATED = '{"summary":"regenerated","files":[],"dispositions":[]}';
+const PIN_CASES = {
+  regenerated: {ids: ['response-A', 'response-B'], newNode: true, want: {code: 'taken_over'}},
+  regeneratedNoId: {ids: ['', ''], newNode: true, want: {code: 'taken_over'}},
+  rerenderedSameId: {ids: ['response-A', 'response-A'], newNode: true, same: true, want: {raw: ANSWER}},
+  sameNodeNoId: {ids: ['', ''], newNode: false, same: true, want: {raw: ANSWER}},
+  // R18: the pinned node itself gains its response ID after it was first answered (a late ID): the
+  // same response, collected under that ID (control)
+  idAssignedLate: {ids: ['', 'response-A'], newNode: false, same: true, want: {raw: ANSWER}, completionId: 'response-A'},
+  // ... but an ID-less pin never adopts the ID of ANOTHER node
+  regeneratedWithId: {ids: ['', 'response-B'], newNode: true, want: {code: 'taken_over'}},
+};
+for (const [name, cell] of Object.entries(PIN_CASES)) {
+  test(`page: a fix response ${name} after its first answered observation ${cell.want.code ? 'ends the run (taken_over), never collected' : 'is still collected (control)'}`, async () => {
+    const p = page({limit: 12});
+    // the turn container (root) stays; the assistant message node inside it is what regenerates
+    const root = {}, first = {}, later = () => (cell.newNode ? {} : first);
+    Object.assign(p.c.context, {
+      boundReviewResponse: () => (p.polls() < 1
+        ? {identified: true, followup: false, root, message: first, responseId: cell.ids[0]}
+        : {identified: true, followup: false, root, message: later(), responseId: cell.ids[1]}),
+      assistantCodeBlocks: () => [p.polls() < 1 || cell.same ? ANSWER : REGENERATED],
+    });
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    const out = await p.c.context.waitUntilFixOrQuota('ChatGPT').then(raw => ({raw}), error => ({code: error.code}));
+    assert.deepEqual(out, cell.want);
+    assert.equal(p.polls(), 1, 'decided on the poll after the first answered observation');
+    if (cell.completionId) assert.equal(p.state().nativeCompletion?.responseId, cell.completionId);
+    if (cell.want.code) {
+      assert.equal(p.state().nativeCompletion, undefined, 'nothing collected');
+      assert.equal(p.state().responseText, undefined, 'the regenerated text is never the answer');
+      assert.equal(p.state().tabRepurposed, true, 'the tab is the user\'s for good');
+      assert.equal(p.state().slotReleased, true);
+    }
+  });
+}
+
+// R18: the ID appears only after the answer was collected with none. The hand-out and close proofs
+// (phase "complete") identify an ID-less completion by its text, as they always did: the late ID alone
+// does not make it another response (control); another text still does.
+for (const [name, cell] of Object.entries({sameText: {text: ANSWER, owned: true}, otherText: {text: REGENERATED, owned: false}})) {
+  test(`page: a fix collected with no response ID whose ID appears before hand-out, ${name}: ${cell.owned ? 'handed out and closable' : 'taken over, never closed'}`, async () => {
+    const p = page({limit: 12});
+    const root = {}, node = {};
+    let id = '', block = ANSWER;
+    Object.assign(p.c.context, {
+      boundReviewResponse: () => ({identified: true, followup: false, root, message: node, responseId: id}),
+      assistantCodeBlocks: () => [block],
+    });
+    Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+    const raw = await p.c.context.waitUntilFixOrQuota('ChatGPT');
+    assert.equal(p.state().nativeCompletion, undefined, 'collected with no response ID');
+    Object.assign(p.state(), {running: false, result: {ok: true, raw, responseText: raw}});
+    id = 'response-A'; block = cell.text;
+    const handOut = p.c.context.fixOwnershipProof(p.state(), {phase: 'complete'});
+    const close = p.c.context.fixCanClose(p.state());
+    assert.deepEqual({handOut: handOut.ownership, canClose: close.canClose},
+      cell.owned ? {handOut: 'owned', canClose: true} : {handOut: 'takenOver', canClose: false});
+  });
+}
+
 // Round 15 (Ashlar 4100156796) drift guard: the page proves a fix only in json.js fixChatPage();
 // the worker opens every fix tab at background.js providerUrl(provider, reasoning). Today providerUrl
 // ignores the reasoning (never a model slug in the URL), so both are the same page for every value;
@@ -140,7 +242,7 @@ for (const reasoning of [...CHATGPT_REASONING, undefined]) {
   test(`page: an untouched confirmed fix on the tab the worker opens for reasoning ${reasoning} is owned`, async () => {
     const opened = background().context.providerUrl('chatgpt', reasoning);
     const p = page();
-    const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: opened};
+    const journal = {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: opened};
     Object.assign(p.c.context, {location: {href: opened}, readSubmissionJournal: async () => journal, savedSubmission: () => journal});
     Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
     assert.equal(p.c.context.fixOwnershipProof(p.state(), {phase: 'collect', journal}).ownership, 'owned', opened);
@@ -621,7 +723,7 @@ test('page: a fix whose send-time conversation is not the temporary chat is neve
     const p = page();
     // the page shows exactly the conversation the send was proven in, but it is not the temporary chat
     p.c.context.location = {href: where};
-    const journal = {phase: 'sent', expected: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: where};
+    const journal = {phase: 'sent', expected: 'FIX PROMPT', exact: 'FIX PROMPT', baseline: 0, messageId: 'user-A', conversation: where};
     Object.assign(p.c.context, {readSubmissionJournal: async () => journal, savedSubmission: () => journal});
     Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
     await assert.rejects(p.c.context.waitUntilFixOrQuota('ChatGPT'), error => error.code === 'taken_over' && /cannot be identified/.test(error.message), where);
@@ -895,6 +997,35 @@ for (const row of [
   });
 }
 
+// Round 16: the recorded tab of run-A that now carries ANOTHER run's binding of the same job and
+// provider (its page binding in the inventory, or this session's owned record) is not run-A's: it is
+// never restored for run-A, and run-B's ownership of it is left untouched (no adoption, no close).
+for (const evidence of ['inventory', 'owned record', 'inventory and owned record']) {
+  test(`worker: a stop after the delivery was promoted, whose recorded tab now carries run-B's ${evidence}: not restored for run-A, run-B keeps it`, async () => {
+    const tabs = new Map([[77, {id: 77, url: URL_FIX, status: 'complete'}]]);
+    const inventory = evidence.includes('inventory'), owned = evidence.includes('owned');
+    const fresh = UNBOUND_UNTIL_RUN();
+    const handler = (id, m) => {
+      if (id !== 77) return fresh(id, m);
+      const binding = inventory ? {jobId: 'fix-A', runId: 'run-B', provider: 'chatgpt'} : {jobId: '', runId: ''};
+      return m.type === 'ashlar-tab-status' ? {ok: true, ownershipProtocol: 1, released: false, url: URL_FIX, provider: 'chatgpt', ...binding}
+        : {ok: false, code: inventory ? 'busy' : 'idle', retry: true, ...binding};
+    };
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': STOPPED()}, [DELIVERIES]: {'fix-A': CREATED(77)}}),
+      session: storage({'ashlar:browserSession': 'boot-1', ...(owned ? {'ashlar:tab:77': ownedRecord('run-B')} : {})}), tabs, api: active, handler});
+    b.context.crypto = webcrypto;
+    await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+    const verdict = await b.context.fixAllocationEvidence(b.local.state.pendingReviewJobs['fix-A'], 'chatgpt');
+    assert.notEqual(verdict.verdict, 'restore', 'another run\'s tab is not run-A\'s evidence');
+    await b.tick();await b.tick();await b.tick();
+    const state = b.local.state.pendingReviewJobs['fix-A'].states.chatgpt;
+    assert.notEqual(state.tabId, 77, 'run-A does not adopt run-B\'s tab');
+    assert.equal(runsOf(b).some(m => m.id === 77), false, 'no run-A prompt reaches run-B\'s tab');
+    assert.ok(tabs.has(77) && !b.closedTabs.includes(77), 'run-B\'s tab is never closed');
+    assert.deepEqual(b.session.state['ashlar:tab:77'], owned ? ownedRecord('run-B') : undefined, 'run-B\'s owned record is unchanged');
+  });
+}
+
 test('worker: a promoted fix delivery whose tab the user explicitly closed before its tabId was saved ends the run (tab_closed), no replacement', async () => {
   const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'fix-A': STOPPED()}, [DELIVERIES]: {'fix-A': CREATED(77)}}),
     session: storage({'ashlar:browserSession': 'boot-1', 'ashlar:closed:fix-A:chatgpt:run-A': true}), api: active, handler: () => ({ok: false, code: 'busy', retry: true})});
@@ -941,6 +1072,104 @@ for (const bindingRun of ['run-0', 'run-A']) {
     assert.equal(report.orphanTabs, bindingRun === 'run-A' ? 0 : 1);
   });
 }
+// Round 16: a `creating` record that reconcile promotes because a binding proves its tab is stamped
+// with THIS browser session. A session-less record is never re-proven by whatever tab later has its
+// ID: Chrome reuses tab IDs after a browser restart, so an unrelated tab must not keep the delivery out.
+test('worker: a delivery promoted by its binding records its browser session; after a restart an unrelated tab with the reused ID proves nothing', async () => {
+  const tabs1 = new Map([[77, {id: 77, url: URL_FIX, status: 'complete'}]]);
+  const local = storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {},
+    [DELIVERIES]: {'fix-A': {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', runId: 'run-A', at: Date.now()}}});
+  const boot1 = background({local, session: storage({'ashlar:browserSession': 'boot-1', 'ashlar:tab:77': ownedRecord('run-A')}), tabs: tabs1,
+    api: active, handler: () => ({ok: false, code: 'busy', retry: true})});
+  const proven1 = await boot1.context.reconcileFixDeliveries({});
+  assert.deepEqual({phase: proven1['fix-A']?.phase, tabId: proven1['fix-A']?.tabId, session: proven1['fix-A']?.session}, {phase: 'created', tabId: 77, session: 'boot-1'});
+  assert.equal(local.state[DELIVERIES]['fix-A'].session, 'boot-1', 'the promoted record names the session its tab ID belongs to');
+  // Browser restart: only local storage survives; tab 77 is now an unrelated, unbound ChatGPT tab.
+  const tabs2 = new Map([[77, {id: 77, url: 'https://chatgpt.com/c/other', status: 'complete'}]]);
+  const boot2 = background({local, session: storage({'ashlar:browserSession': 'boot-2'}), tabs: tabs2, api: active,
+    handler: () => ({ok: false, code: 'idle', jobId: '', runId: ''})});
+  await boot2.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  const proven2 = await boot2.context.reconcileFixDeliveries({});
+  assert.equal(proven2['fix-A'], undefined, 'a reused tab ID does not prove the delivery');
+  assert.equal(local.state[DELIVERIES]['fix-A'], undefined, 'the unproven record is cleared (replayed once)');
+});
+// Round 17: EVERY candidate a fix delivery/allocation accepts is vetoed when another run claims the
+// tab (tabClaimedByOtherRun: the tab inventory or this session's owned record naming another jobId,
+// provider or runId). A claimed candidate is skipped; the other run's tab and owned record are never
+// modified, and nothing is closed.
+/** A worker whose tab 77 (a live ChatGPT tab in browser session boot-1) has the page binding
+ * `inventory` (or none) and the owned record `owned` (or none). A harvest never identifies run-A,
+ * so direct recovery (findOriginalTab) cannot establish it. */
+async function claimedTab77({inventory, owned, pending = {}, record}) {
+  const tabs = new Map([[77, {id: 77, url: URL_FIX, status: 'complete'}]]);
+  const fresh = UNBOUND_UNTIL_RUN();
+  const binding = {jobId: '', runId: '', ...inventory};
+  const handler = (id, m) => id !== 77 ? fresh(id, m) : m.type === 'ashlar-tab-status'
+    ? {ok: true, ownershipProtocol: 1, released: false, url: URL_FIX, provider: 'chatgpt', ...binding}
+    : {ok: false, code: 'busy', retry: true, jobId: '', runId: ''};
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: pending, ...(record ? {[DELIVERIES]: {'fix-A': record}} : {})}),
+    session: storage({'ashlar:browserSession': 'boot-1', ...(owned ? {'ashlar:tab:77': owned} : {})}), tabs, api: active, handler});
+  b.context.crypto = webcrypto;
+  await b.context.refreshTabInventory();for (let i = 0; i < 20; i++) await flush();
+  return b;
+}
+const RUN_A = {jobId: 'fix-A', provider: 'chatgpt', runId: 'run-A'};
+
+test('worker: an allocating fix run-A whose tab 77 the inventory binds to run-A but whose owned record names run-B: 77 is not restored, run-A never owns it', async () => {
+  const b = await claimedTab77({inventory: RUN_A, owned: ownedRecord('run-B'), pending: {'fix-A': STOPPED()}});
+  const verdict = await b.context.fixAllocationEvidence(b.local.state.pendingReviewJobs['fix-A'], 'chatgpt');
+  assert.notEqual(verdict.tabId, 77, 'a tab another run claims is not run-A\'s evidence');
+  assert.equal(verdict.verdict, 'absent');
+  await b.tick();await b.tick();await b.tick();
+  assert.notEqual(b.local.state.pendingReviewJobs['fix-A'].states.chatgpt.tabId, 77, 'run-A does not adopt run-B\'s tab');
+  assert.equal(runsOf(b).some(m => m.id === 77), false, 'no run-A prompt reaches run-B\'s tab');
+  assert.deepEqual(b.session.state['ashlar:tab:77'], ownedRecord('run-B'), 'run-A\'s ownership is never recorded on 77');
+  assert.ok(b.tabs.has(77) && !b.closedTabs.includes(77), 'run-B\'s tab is never closed');
+});
+
+for (const evidence of ['inventory', 'owned record', 'inventory and owned record']) {
+  test(`worker: a created delivery of run-A whose live recorded tab carries run-B's ${evidence} is not proven: removed, run-B's tab untouched`, async () => {
+    const b = await claimedTab77({inventory: evidence.includes('inventory') ? {...RUN_A, runId: 'run-B'} : undefined,
+      owned: evidence.includes('owned') ? ownedRecord('run-B') : undefined, record: CREATED(77)});
+    const proven = await b.context.reconcileFixDeliveries({});
+    assert.equal(proven['fix-A'], undefined, 'the delivery is not kept out of the replay');
+    assert.equal(b.local.state[DELIVERIES]['fix-A'], undefined, 'the unproven record is removed (replayed once)');
+    assert.deepEqual(b.session.state['ashlar:tab:77'], evidence.includes('owned') ? ownedRecord('run-B') : undefined, 'run-B\'s owned record is unchanged');
+    assert.ok(b.tabs.has(77) && !b.closedTabs.includes(77), 'nothing is closed');
+  });
+}
+
+// Every candidate path, fed each conflicting owner (another runId, jobId or provider in the inventory or
+// the owned record). A path added later without the veto fails here. Controls: the conflict-free binding.
+test('worker: every fix candidate path (inventory fast path, recorded tab, created fast path, boundTab) skips a tab another run claims', async () => {
+  const OTHERS = {
+    inventory: [{...RUN_A, runId: 'run-B'}, {...RUN_A, jobId: 'fix-B'}],
+    owned: [ownedRecord('run-B'), {...ownedRecord('run-A'), jobId: 'fix-B'}, {...ownedRecord('run-A'), provider: 'grok'}],
+  };
+  const creating = {deliveryId: 'delivery-1', provider: 'chatgpt', phase: 'creating', runId: 'run-A', at: Date.now()};
+  const allocation = async b => (await b.context.fixAllocationEvidence(b.local.state.pendingReviewJobs['fix-A'], 'chatgpt')).tabId === 77;
+  const reconcile = async b => (await b.context.reconcileFixDeliveries({}))['fix-A']?.tabId === 77;
+  const PATHS = [
+    // the candidate comes from the named source; the conflict is fed through the other one (or either)
+    {name: 'allocation inventory fast path', check: allocation, pending: true, candidate: {inventory: RUN_A}, conflicts: ['owned']},
+    {name: 'allocation recorded tab', check: allocation, pending: true, record: CREATED(77), candidate: {}, conflicts: ['inventory', 'owned']},
+    {name: 'reconcile created fast path', check: reconcile, record: CREATED(77), candidate: {}, conflicts: ['inventory', 'owned']},
+    {name: 'reconcile boundTab (owned record)', check: reconcile, record: creating, candidate: {owned: ownedRecord('run-A')}, conflicts: ['inventory']},
+    {name: 'reconcile boundTab (inventory)', check: reconcile, record: creating, candidate: {inventory: RUN_A}, conflicts: ['owned']},
+  ];
+  const failures = [];
+  for (const path of PATHS) {
+    const setup = extra => claimedTab77({pending: path.pending ? {'fix-A': STOPPED()} : {}, record: path.record, ...path.candidate, ...extra});
+    if (!await path.check(await setup({}))) failures.push(`${path.name}: control not accepted`);
+    for (const source of path.conflicts) for (const other of OTHERS[source]) {
+      const b = await setup({[source]: other});
+      if (await path.check(b)) failures.push(`${path.name}: accepted a tab whose ${source} names ${JSON.stringify(other)}`);
+      if (source === 'owned') assert.deepEqual(b.session.state['ashlar:tab:77'], other, 'the other run\'s owned record is unchanged');
+      assert.ok(b.tabs.has(77) && !b.closedTabs.includes(77), 'nothing is closed');
+    }
+  }
+  assert.deepEqual(failures, []);
+});
 test('worker: retiring a fix job forgets only its own delivery record', async () => {
   const b = worker([], {api: active});
   await b.local.set({[DELIVERIES]: {'fix-A': {deliveryId: 'delivery-2', provider: 'chatgpt', phase: 'creating', at: Date.now()}}});

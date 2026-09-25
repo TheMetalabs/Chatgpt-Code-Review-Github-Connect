@@ -209,7 +209,7 @@ function boundReviewResponse(submission) {
   // is safe only when it contains no user or unrelated response messages.
   const root = container && [...container.querySelectorAll('[data-message-author-role]')].every(node => replies.includes(node))
     ? container : message;
-  return {root, followup: next >= 0, identified: true, responseId: message.getAttribute("data-message-id") || ""};
+  return {root, followup: next >= 0, identified: true, responseId: message.getAttribute("data-message-id") || "", message};
 }
 
 /** Each call is a fresh observation; the tracker also runs after native JSON
@@ -474,7 +474,9 @@ async function waitUntilReviewOrQuota(name) {
  * turn by containment, so a turn the user edited (a prefix or suffix around the prompt) still
  * binds. "exact": the turn (by its journaled message ID when exactly one matches, else by its
  * recorded position) is the prompt; "edited": it holds more or other text, so it is the user's;
- * "unknown": the turn is not rendered/resolvable. Independent of the composer draft. */
+ * "unknown": the turn is not rendered/resolvable. Independent of the composer draft. A fix journal
+ * compares its prompt's lossless form (`exact`, composer.js fixPromptForm): a turn whose whitespace
+ * differs from the prompt in any other way is not it; a review journal compares normalized text. */
 function journaledTurnIntegrity(submission, users) {
   if (!submission?.expected) return "unknown";
   let turn;
@@ -485,7 +487,17 @@ function journaledTurnIntegrity(submission, users) {
     turn = users[submission.submittedUsers - 1];
   }
   if (!turn) return "unknown";
+  if (typeof submission.exact === "string") return fixTurnExact(turn, submission.exact) ? "exact" : "edited";
   return normalizePrompt(messagePromptText(turn)) === submission.expected ? "exact" : "edited";
+}
+
+/** Whether a fix's sent turn holds its prompt's lossless form `exact` (composer.js fixPromptForm). A
+ * rich-text turn's block boundaries read two ways: one <p> per blank-line paragraph with a <br> per
+ * line break (messagePromptText), or one <p> per line, the composer's own structure (losslessText).
+ * Either reading can prove it exact; any other whitespace difference is an edit. */
+function fixTurnExact(turn, exact) {
+  const body = turn.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
+  return [messagePromptText(turn), losslessText(body)].some(text => fixPromptForm(text) === exact);
 }
 
 /** The identity of the conversation a page shows: its URL without the fragment (the path names the
@@ -628,23 +640,28 @@ function storedFixCompletion(state) {
 /** THE ownership proof a fix ANSWER needs: collecting it (phase "collect") and handing a collected
  * answer to the worker ("complete"). The tab-release decisions (can-close, cancel) of both kinds use
  * tabOwnership instead, which asks for positive user evidence only. `journal`: the submission
- * journal the caller just read (default: the confirmed or saved one).
+ * journal the caller just read (default: the confirmed or saved one). `pinned` ("collect"): the
+ * response the collector pinned at its first answered observation (waitUntilFixOrQuota).
  *
  * owned = the fix was sent in the temporary chat (fixSentInTemporaryChat, #77) and the page still
- * shows it, the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact"), no
- * follow-up turn, no user draft and ("complete") an answer was collected. Nothing about the answer
+ * shows it, the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact", in
+ * its lossless form `exact`), no follow-up turn, no user draft, ("collect") the bound response is
+ * still the pinned one and ("complete") an answer was collected. Nothing about the collected answer
  * itself is compared: ChatGPT keeps redrawing a finished answer (the closing code fence after the
  * action bar, labels, re-keyed ids, streaming flags), and requiring the collected text again would
- * keep the answer, and then the tab, forever (#82). takenOver = the user's (follow-up, edited turn,
- * draft: typed text or a staged file); unknown = not provable now (journal unreadable, turn not
- * rendered, the just-sent prompt still echoed in the composer, identity not recorded at send, not
- * the temporary chat, or moved: `identity` "unestablished" | "changed"). PERMANENT verdicts are
- * decided before any transient one (#77): the conversation and the exact sent turn need no rendered
- * response, so no transient wait (a turn not rendered or resolved yet, the prompt echoed in the
- * composer) hides them until the fix deadline. Every takenOver verdict is PERMANENT: it marks the
- * tab repurposed for good (a draft the user later clears, or an edit the user undoes, does not hand
- * the tab back); see fixVerdictPermanent for what ends a run. */
-function fixOwnershipProof(state, {phase, journal} = {}) {
+ * keep the answer, and then the tab, forever (#82). The collector's pin is no such comparison: it
+ * names WHICH response is collected (its ID, else its message node) while the run collects, never
+ * its text. takenOver = the user's (follow-up, edited turn, draft: typed text or a staged file,
+ * another response while collecting); unknown = not provable now (journal unreadable, turn not
+ * rendered, the just-sent prompt still echoed in the composer, identity or lossless form not
+ * recorded at send, not the temporary chat, or moved: `identity` "unestablished" | "changed").
+ * PERMANENT verdicts are decided before any transient one (#77): the conversation, the exact sent
+ * turn and a user draft need no rendered response, so no transient wait (a turn not rendered or
+ * resolved yet, the prompt echoed in the composer) hides them until the fix deadline. Every
+ * takenOver verdict is PERMANENT: it marks the tab repurposed for good (a draft the user later
+ * clears, or an edit the user undoes, does not hand the tab back); see fixVerdictPermanent for what
+ * ends a run. */
+function fixOwnershipProof(state, {phase, journal, pinned} = {}) {
   const verdict = (ownership, reason, extra = {}) => ({ownership, reason, ...extra});
   const takeOver = (reason, cause) => {
     if (!state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = cause; recordReviewStep("context_changed"); }
@@ -660,8 +677,12 @@ function fixOwnershipProof(state, {phase, journal} = {}) {
   // 1. The conversation. The rendered turn proves its content only; an in-page (SPA) move to another
   // conversation can leave this DOM on screen under the new URL, or remove it: the proof holds only
   // in the conversation recorded when the send was proven (composer.js submissionConfirmed), which
-  // must be the temporary chat; a journal without one never gains it.
-  if (!fixSentInTemporaryChat(submission)) return verdict("unknown", "unestablished", {identity: "unestablished"});
+  // must be the temporary chat; a journal without one never gains it. Nor does one without its
+  // prompt's lossless form (`exact`, recorded by composer.js clickSend when the send is prepared):
+  // its turn can never be proven exact.
+  if (!fixSentInTemporaryChat(submission) || typeof submission.exact !== "string") {
+    return verdict("unknown", "unestablished", {identity: "unestablished"});
+  }
   if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
   // 2. The journal-addressable sent turn (its message ID, else its recorded position) holds EXACTLY
   // Ashlar's prompt. boundReviewResponse only proves the turn CONTAINS it, and finds no turn at all
@@ -671,20 +692,34 @@ function fixOwnershipProof(state, {phase, journal} = {}) {
   if (integrity === "edited") return takeOver("edited", "edited");
   const bound = boundReviewResponse(submission);
   if (bound.followup) return takeOver("followup", "user_turn");
+  // 3. A draft in the composer: typed text or a staged file (after a confirmed send every file chip
+  // is the user's, composerStagedFiles). The just-sent prompt can linger there a moment after the
+  // send is confirmed: that text (the journal's own expected prompt) is Ashlar's, not evidence of a
+  // user. Any other draft is the user's, decided on the poll that sees it and BEFORE the transient
+  // waits below (turn not rendered or not resolvable yet): a draft typed and cleared while the turn
+  // is briefly unresolved still latches the takeover.
+  const draftText = composerDraftText();
+  const staged = composerStagedFiles(state, submission);
+  if (staged.length || (draftText && normalizePrompt(draftText) !== submission.expected)) return takeOver("draft", "draft");
+  // 4. ("collect") The pinned response. boundReviewResponse always binds the LAST reply after the
+  // sent turn, so a response regenerated after the first answered observation would bind instead:
+  // any other response (another ID; with no ID, another assistant message node) is the user's.
+  // An ID-less pin adopts the ID its own node gains later (renderers can assign it after mounting
+  // the text): the same node is the same response, never another one.
+  if (pinned && bound.root) {
+    if (!pinned.responseId && bound.responseId && bound.message === pinned.message) pinned.responseId = bound.responseId;
+    if ((bound.responseId || "") !== pinned.responseId || (!pinned.responseId && bound.message !== pinned.message)) {
+      return takeOver("response_changed", "regenerated");
+    }
+  }
   if (!bound.identified) {
     // A collected answer whose sent turn no longer holds Ashlar's prompt: the user edited it. Still in
     // the recorded conversation with no addressable turn before that: not rendered yet (transient).
     return phase === "complete" ? takeOver("turn_changed", "edited") : verdict("unknown", "turn_unrendered");
   }
   if (integrity === "unknown") return verdict("unknown", "turn_unresolved");
-  const draftText = composerDraftText();
-  const staged = composerStagedFiles(state, submission);
-  if (draftText || staged.length) {
-    // The just-sent prompt can linger in the composer a moment after the send is confirmed: that
-    // text is Ashlar's own, not evidence of a user (transient). Any other draft is the user's.
-    if (!staged.length && normalizePrompt(draftText) === submission.expected) return verdict("unknown", "composer_echo");
-    return takeOver("draft", "draft");
-  }
+  // Only Ashlar's own just-sent prompt can still be in the composer here (a user draft latched above).
+  if (draftText) return verdict("unknown", "composer_echo");
   if (phase === "complete" && !storedFixCompletion(state)) return verdict("unknown", "no_completion", {conversation: submission.conversation});
   return verdict("owned", "exact", {conversation: submission.conversation});
 }
@@ -743,7 +778,10 @@ function fixAnswerReply(state, msg, value, busy) {
  * wait: the fix deadline bounds it.
  */
 async function waitUntilFixOrQuota(name) {
-  const stability = {stable: "", hits: 0};
+  // `pinned`: the response this run collects, fixed at its first answered observation and never
+  // replaced (a regenerated response ends the run: fixOwnershipProof "collect"); an ID-less pin only
+  // gains the ID its own node is assigned later.
+  const stability = {stable: "", hits: 0, pinned: undefined};
   for (;;) {
     throwIfStopped();
     // Same completion evidence, quota rule and stability as a review (shared helpers above).
@@ -755,7 +793,7 @@ async function waitUntilFixOrQuota(name) {
     // or no identified response the page-global fallbacks would read whatever chat is on screen:
     // never an answer (a review keeps its legacy unbound observation). An edited turn repurposes
     // the tab for good; after an in-page move the lingering DOM is not harvested there.
-    const proof = runner ? fixOwnershipProof(runner, {phase: "collect", journal: poll.submission}) : {ownership: "unknown"};
+    const proof = runner ? fixOwnershipProof(runner, {phase: "collect", journal: poll.submission, pinned: stability.pinned}) : {ownership: "unknown"};
     // A permanent verdict ends the run NOW (endFixRun: slot freed, `taken_over`); only a transient
     // "unknown" keeps polling, bounded by the server's fix deadline.
     if (runner && fixVerdictPermanent(proof)) {
@@ -773,6 +811,8 @@ async function waitUntilFixOrQuota(name) {
     if (!answered) recordReviewStep(!done && (stop || streaming) ? "generating" : "waiting_for_response");
     throwIfQuota(name, bound, answered);
     if (answered) {
+      // Its ID (its message node when it has none): the only response a later poll may collect.
+      stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
       if (settleStableAnswer(stability, text, poll, {text, raw: text})) return text;
     } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
@@ -849,9 +889,12 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   // A FIX records its conversation only when its send is proven (composer.js submissionConfirmed),
   // and only the temporary chat proves it (#77, fixSentInTemporaryChat): a sent fix journal without
   // one (a legacy journal, a send confirmed only after a reload) or with another page can never
-  // establish it, so its tab is never closed. The worker preserves it at once. A review has no such
-  // rule: it may pin later (pinNewChatReview), and until then it is `unpinned`.
-  const unestablished = fix && !fixSentInTemporaryChat(submission) ? {ownership: "unknown", identity: "unestablished", cause: "ownership_unknown"} : null;
+  // establish it, so its tab is never closed. The worker preserves it at once. Nor can one without its
+  // prompt's lossless form (`exact`, #77: recorded by composer.js clickSend), whose turn can never be
+  // proven exact. A review has no such rule: it may pin later (pinNewChatReview), and until then it
+  // is `unpinned`.
+  const unestablished = fix && (!fixSentInTemporaryChat(submission) || typeof submission.exact !== "string")
+    ? {ownership: "unknown", identity: "unestablished", cause: "ownership_unknown"} : null;
   // The journaled turn: its message ID (one match), else its recorded position (a provider that
   // re-keys the turn is not the user).
   let turn;
@@ -873,6 +916,11 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   // unpinned turn that merely contains the prompt may be the user's edit around it (Ashlar
   // 4101062732). Any other text is an edit.
   if (sent !== submission.expected) return takeOver("edited");
+  // A fix turn is also held to its prompt's lossless form (#77, fixTurnExact): a fix prompt inlines
+  // source whose whitespace is content, so a turn whose whitespace alone changed is an edit too.
+  if (fix && typeof submission.exact === "string" && typeof fixPromptForm === "function" && !fixTurnExact(turn, submission.exact)) {
+    return takeOver("edited");
+  }
   if (users.indexOf(turn) < users.length - 1) return takeOver("user_turn");
   if (regeneratedAfterCompletion(state, submission, secured)) return takeOver("regenerated");
   if (unestablished) return unestablished;

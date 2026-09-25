@@ -54,3 +54,28 @@ then be deleted, so they are handed over:
 - #77 adds no new lifecycle abstractions: no new modules, record types or cross-cutting helpers for
   tab identity, verdicts or journals.
 - A finding in a section 1 or section 3 class gets a reply pointing to this document.
+
+## 5. Practical scope (#77 and #85)
+
+This is the user's rule. #77 and #85 judge findings the same way.
+
+- **In scope.** Review findings are fixed until the loop works in real use: real users on the real
+  provider pages.
+- **Out of scope.** A finding is out of scope when it only happens in an unrealistic interleaving.
+  Examples:
+  - a user action timed to within a second of a poll or a send;
+  - several rare coincidences that must all happen at once.
+- **What an out-of-scope finding gets.**
+  - A thread reply that cites this section, not a code change.
+  - A Tab Lease trace in #82, so the lifecycle model covers the finding.
+- **Cheap, safe fixes are still taken**, even when the finding is out of scope. A cheap, safe fix is
+  small and local, and it comes with a regression test that fails without it (section 4).
+
+## 6. Recorded scope limits of the fix collector
+
+A limit listed here is known and is not fixed in #77. Its finding gets a reply that points here and a
+Tab Lease trace in #82.
+
+| Limit | Why #77 does not fix it | Where it goes |
+|---|---|---|
+| The collector pins the response of its first *answered* observation (`json.js` waitUntilFixOrQuota, fixOwnershipProof "collect"). Suppose the user stops the fix while it is still generating, then regenerates it or picks another model. The new response is collected and delivered, and its tab is closed. | The delivered answer is still an answer to Ashlar's exact, unedited prompt: the sent-turn, follow-up and draft proofs all hold, so nothing the user wrote is delivered. Pinning earlier, during generation, needs the streaming response's node and ID to stay the same on the real page until it completes. Stream-start placeholders, late IDs and the reasoning phase all threaten that, and it cannot be shown offline. A false positive would end every fix run as `taken_over` after its prompt was sent. | #82: a regeneration during generation is a `touch`. The variant pager (#85 `responseVariant`) is the evidence that does not depend on the node or the ID. The live fix run records whether the node and ID stay stable while generating. |

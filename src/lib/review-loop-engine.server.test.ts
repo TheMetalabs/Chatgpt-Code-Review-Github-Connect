@@ -11,6 +11,7 @@ import {
   type ReviewLoopGithub,
 } from "./review-loop-engine.server.ts";
 import { continueComment, startComment, stoppedComment } from "./review-loop.ts";
+import { sessionRef } from "./review-loop-session.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 
@@ -147,7 +148,7 @@ describe("maybeEscalate — provenance, session boundary, fail-closed (round-1 f
     };
     const all = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "new0000", roundCap: 8 });
     assert.equal(all.rounds.length, 2);
-    const scoped = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "new0000", roundCap: 8, sinceIso: "2026-05-01T00:00:00Z" });
+    const scoped = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: "new0000", roundCap: 8, session: { at: "2026-05-01T00:00:00Z" } });
     assert.equal(scoped.rounds.length, 1, "only the in-session review counts");
   });
 
@@ -316,7 +317,7 @@ describe("round-cap handoff keeps the trend pattern in its detail", () => {
       async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
     };
     const r = await maybeEscalate(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: heads[2], roundCap: 2 });
-    assert.equal(r.reason, "round-cap");
+    assert.ok(r.reason, "the stuck reason is still reported");
     assert.match(posted[0], /reason=round-cap/);
     assert.match(posted[0], /Detail: fix-round budget spent; the finding trend also shows whack-a-mole/);
   });
@@ -332,12 +333,12 @@ describe("escalateNow: one handoff per head per session, even when the history i
       async listIssueComments(): Promise<Array<{ userLogin: string; body: string }>> { throw new Error("502"); },
       async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
     };
-    const opts = { owner: "o", repo: "r", pr: 9, head: "e".repeat(40), reason: "fix-failed" as const, detail: "x", rounds: [], roundCap: 5, sinceIso: "2026-01-01T00:00:00Z" };
+    const opts = { owner: "o", repo: "r", pr: 9, head: "e".repeat(40), reason: "fix-failed" as const, detail: "x", rounds: [], roundCap: 5, session: { at: "2026-01-01T00:00:00Z" } };
     assert.equal((await escalateNow(gh as never, "t", opts)).escalated, true);
     assert.equal((await escalateNow(gh as never, "t", opts)).escalated, false);
     assert.equal(posted.length, 1);
     // a NEW session (a later anchor) on the same head may hand off again
-    assert.equal((await escalateNow(gh as never, "t", { ...opts, sinceIso: "2026-02-01T00:00:00Z" })).escalated, true);
+    assert.equal((await escalateNow(gh as never, "t", { ...opts, session: { at: "2026-02-01T00:00:00Z" } })).escalated, true);
     assert.equal(posted.length, 2);
     void bot;
   });
@@ -444,7 +445,7 @@ describe("round-3: instants, not strings; the trailing findings marker only", ()
     const marker = `<!-- ashlar-loop-escalate reason=fix-failed round=1 pr=1 head=${A} -->`;
     const { gh, posted } = fakeGh([], []);
     gh.listIssueComments = async () => [{ userLogin: BOT, body: marker, createdAt: "2026-01-01T00:00:00Z" }];
-    const r = await escalateNow(gh, "t", { owner: "o", repo: "r", pr: 1, head: A, reason: "fix-failed", rounds: [], roundCap: 5, sinceIso: "2026-01-01T00:00:00.500Z" });
+    const r = await escalateNow(gh, "t", { owner: "o", repo: "r", pr: 1, head: A, reason: "fix-failed", rounds: [], roundCap: 5, session: { at: "2026-01-01T00:00:00.500Z" } });
     assert.equal(r.escalated, true, "the pre-session handoff is out of scope");
     assert.equal(posted.length, 1);
   });
@@ -490,7 +491,7 @@ describe("round-5: exact session scoping and read-after-write lag", () => {
     const session = await readLoopSession(gh as never, "t", "o", "r", 1);
     assert.equal(session.active, true);
     assert.equal(session.startSeq, 11);
-    const r = await escalateNow(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed", rounds: [], roundCap: 5, sinceIso: session.startIso, sinceSeq: session.startSeq });
+    const r = await escalateNow(gh as never, "t", { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed", rounds: [], roundCap: 5, session: sessionRef(session) });
     assert.equal(r.escalated, true, "B gets its own handoff");
     assert.equal(posted.length, 1);
   });
@@ -510,7 +511,7 @@ describe("round-5: exact session scoping and read-after-write lag", () => {
 
   it("a just-posted handoff counts while a readable list still omits it (no duplicate)", async () => {
     const { gh, posted } = client([]); // the list never shows what was posted
-    const opts = { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed" as const, rounds: [], roundCap: 5, sinceIso: T, sinceSeq: 11 };
+    const opts = { owner: "o", repo: "r", pr: 1, head: H, reason: "fix-failed" as const, rounds: [], roundCap: 5, session: { at: T, seq: 11 } };
     assert.equal((await escalateNow(gh as never, "t", opts)).escalated, true);
     assert.equal((await escalateNow(gh as never, "t", opts)).escalated, false);
     assert.equal(posted.length, 1);
@@ -527,7 +528,7 @@ describe("round-5: exact session scoping and read-after-write lag", () => {
   });
 });
 
-describe("round-6: both handoff paths share the just-posted cache", () => {
+describe("round-6: both handoff paths share the control-write journal", () => {
   it("maybeEscalate never double-posts a stuck handoff while the list still omits the first", async () => {
     const H = "c".repeat(40);
     const posted: string[] = [];
@@ -538,7 +539,7 @@ describe("round-6: both handoff paths share the just-posted cache", () => {
       async listIssueComments() { return []; }, // never catches up
       async createIssueComment(_t: string, o: { body: string }) { posted.push(o.body); return { id: 1 }; },
     };
-    const opts = { owner: "o", repo: "r", pr: 3, head: H, roundCap: 5, sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
+    const opts = { owner: "o", repo: "r", pr: 3, head: H, roundCap: 5, session: { at: "2026-01-01T00:00:00Z", seq: 1 } };
     assert.equal((await maybeEscalate(gh as never, "t", opts)).escalated, true);
     const again = await maybeEscalate(gh as never, "t", opts);
     assert.equal(again.escalated, false);
@@ -559,7 +560,7 @@ describe("round-6: the two handoff paths see each other's just-posted handoff", 
     };
     return { gh, posted };
   };
-  const session = { sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
+  const session = { session: { at: "2026-01-01T00:00:00Z", seq: 1 } };
 
   it("escalateNow first, then maybeEscalate: one handoff", async () => {
     const { gh, posted } = stuck();
@@ -579,9 +580,10 @@ describe("round-6: the two handoff paths see each other's just-posted handoff", 
 
 describe("terminal handoffs retry a transient POST failure (a handoff has no other poster)", () => {
   const H = "e".repeat(40);
-  const session = { sinceIso: "2026-01-01T00:00:00Z", sinceSeq: 1 };
-  /** `plan[i]`: attempt i "ok", "fail" (GitHub rejected it), or "lost" (accepted, response lost). */
-  const flaky = (plan: Array<"ok" | "fail" | "lost">, stuck = false) => {
+  const session = { session: { at: "2026-01-01T00:00:00Z", seq: 1 } };
+  /** `plan[i]`: attempt i "ok", "fail" (GitHub rejected it), "lost" (accepted, response lost), or
+   * "unknown" (accepted, then a GithubWriteError with outcome unknown — e.g. a 502 after creation). */
+  const flaky = (plan: Array<"ok" | "fail" | "lost" | "unknown">, stuck = false, stale = false) => {
     const stored: Array<{ id: number; userLogin: string; body: string; createdAt: string; updatedAt: string }> = [];
     const sleeps: number[] = [];
     let attempts = 0;
@@ -591,13 +593,14 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     const gh = {
       async listPullReviews() { return reviews; },
       async listReviewComments() { return reviews.map((r) => ({ userLogin: BOT, path: "a.ts", commitId: r.commitId, createdAt: r.submittedAt })); },
-      async listIssueComments() { return [...stored]; },
+      async listIssueComments() { return stale ? [] : [...stored]; },
       async createIssueComment(_t: string, o: { body: string }) {
         const outcome = plan[Math.min(attempts++, plan.length - 1)];
         if (outcome === "fail") throw new Error("comment POST 502");
         const at = `2026-02-01T00:00:0${stored.length + 1}Z`;
         stored.push({ id: stored.length + 10, userLogin: BOT, body: o.body, createdAt: at, updatedAt: at });
         if (outcome === "lost") throw new Error("GitHub API timeout");
+        if (outcome === "unknown") throw Object.assign(new Error("GitHub issue comment 502: Bad Gateway"), { name: "GithubWriteError", status: 502, outcome: "unknown" });
         return { id: stored.length + 9 };
       },
     };
@@ -618,6 +621,67 @@ describe("terminal handoffs retry a transient POST failure (a handoff has no oth
     const f = flaky(["lost", "ok"]);
     assert.deepEqual(await now(f, 12), { escalated: false });
     assert.equal(f.attempts(), 1, "the retry's scan saw the accepted handoff");
+    assert.equal(f.stored.length, 1);
+  });
+
+  it("an unknown write outcome is never POSTed again, even while the list stays stale (and on re-entry)", async () => {
+    const f = flaky(["unknown", "ok"], false, true);
+    const r = await now(f, 15);
+    assert.equal(r.escalated, false);
+    assert.equal(r.ambiguous, true);
+    assert.match(r.error ?? "", /outcome is unknown/);
+    assert.equal(f.attempts(), 1, "it may have landed: one POST only");
+    // a later caller for the same head + session (a redelivery, the push path) while the list still lags
+    const again = await now(f, 15);
+    assert.equal(again.escalated, false);
+    assert.equal(f.attempts(), 1, "the journal stops the re-entry too");
+    assert.equal(f.stored.length, 1);
+  });
+
+  it("an unknown handoff outcome never expires: more than 24 h later, the list still stale, no second POST", async () => {
+    const f = flaky(["unknown", "ok"], false, true);
+    assert.equal((await now(f, 18)).ambiguous, true);
+    const realNow = Date.now;
+    const later = realNow() + 25 * 60 * 60_000;
+    Date.now = () => later;
+    try {
+      const again = await now(f, 18);
+      assert.equal(again.escalated, false);
+      assert.equal(again.ambiguous, true, "still unknown, never reported as an existing handoff");
+    } finally {
+      Date.now = realNow;
+    }
+    assert.equal(f.attempts(), 1, "one POST only");
+  });
+
+  it("the round-cap handoff (maybeEscalate) with an unknown outcome returns ambiguous instead of throwing", async () => {
+    const f = flaky(["unknown", "ok"], true, true);
+    const r = await maybeEscalate(f.gh as never, "t", { owner: "o", repo: "r", pr: 17, head: H, roundCap: 5, ...session, sleep: f.sleep });
+    assert.equal(r.escalated, false);
+    assert.equal(r.ambiguous, true);
+    assert.ok(r.reason, "the stuck reason is still reported");
+    const again = await maybeEscalate(f.gh as never, "t", { owner: "o", repo: "r", pr: 17, head: H, roundCap: 5, ...session, sleep: f.sleep });
+    assert.equal(again.escalated, false);
+    assert.equal(f.attempts(), 1);
+  });
+
+  it("the journal never evicts an unresolved entry: 600 later unknown writes cannot re-enable a POST", async () => {
+    const f = flaky(["unknown"], false, true); // every POST outcome unknown, every list scan stale
+    const first = await now(f, 1000);
+    assert.equal(first.escalated, false);
+    assert.equal(first.ambiguous, true);
+    for (let pr = 1001; pr <= 1600; pr++) await now(f, pr); // 600 more distinct ambiguous keys
+    assert.equal(f.attempts(), 601);
+    const again = await now(f, 1000); // redelivery of the first one
+    assert.equal(again.escalated, false);
+    assert.equal(again.ambiguous, true, "still reported ambiguous");
+    assert.equal(f.attempts(), 601, "the first key's POST count stays one");
+  });
+
+  it("an unknown write outcome whose handoff becomes visible is this call's handoff: escalated, without another POST", async () => {
+    const f = flaky(["unknown", "ok"]);
+    assert.deepEqual(await now(f, 16), { escalated: true }, "never 'already escalated': the caller's report and replies follow");
+    assert.equal(f.attempts(), 1);
     assert.equal(f.stored.length, 1);
   });
 

@@ -44,7 +44,8 @@ export interface LoopEvent {
   actor?: string; // start / stop author
   /** converged: the reviewed commit; continue / push: the head the loop moved to. */
   head?: string;
-  /** The issue comment's id (monotonic): a start record's id identifies its session exactly. */
+  /** The issue comment's id (monotonic): a start record's id scopes its session's own control
+   * rows exactly (it does not name the session: see SessionRef). */
   seq?: number;
 }
 
@@ -112,4 +113,28 @@ export function deriveLoopSession(events: readonly LoopEvent[], opts: { liveHead
     }
   }
   return s;
+}
+
+/**
+ * A session as its own writes name it: the anchor INSTANT is its identity — at one instant ORDER
+ * places every start together (terminal records before, human stops after), so the first opens
+ * the session and every later start of that second re-issues it: no two sessions are ever anchored
+ * in one second. The anchor start RECORD is not: which of a second's starts anchors depends on
+ * what a read lists (the first listed record, else the first stand-in), so it changes as the list
+ * catches up or relapses. Its comment id (seq) only scopes the session's own control rows
+ * (review-loop-control controlInSession).
+ */
+export interface SessionRef {
+  at?: string;
+  seq?: number;
+}
+
+export function sessionRef(s: Pick<LoopSession, "startIso" | "startSeq">): SessionRef {
+  return { at: s.startIso, seq: s.startSeq };
+}
+
+/** THE session comparison: the same anchor instant (never its spelling, nor its start record). */
+export function sameSession(a: SessionRef | undefined, b: SessionRef | undefined): boolean {
+  const [x, y] = [isoMs(a?.at), isoMs(b?.at)];
+  return x === y || (Number.isNaN(x) && Number.isNaN(y));
 }

@@ -59,8 +59,28 @@ const admissionReports = new Map();
 let registryPromise;
 let clientPromise;
 let storageTail = Promise.resolve();
-let allocationTail = Promise.resolve();
 let maintenanceTail = Promise.resolve();
+
+/** The tab queue (#85): every operation on a tab (a leg's poll, its release, the tab inventory and
+ * its probes) runs one at a time, first in first out, from its first read to its last write, so no
+ * other operation acts on a tab between what one read and what it does. Each await inside is
+ * bounded (a page message by its reply window: pageWindow; the whole operation by TAB_OP_BUDGET_MS),
+ * so nothing holds the queue, and it is never released while an operation still runs. Bridge calls
+ * never run inside an operation (their lanes stay outside), and an operation never awaits another
+ * one: it may schedule one (`void tabOp(...)`), which runs after it. */
+const TAB_OP_BUDGET_MS = 30_000;
+let tabTail = Promise.resolve();
+let activeOp = null; // {kind, deadline} of the running operation
+function tabOp(kind, body) {
+  const run = tabTail.then(async () => {
+    activeOp = {kind, deadline: Date.now() + TAB_OP_BUDGET_MS};
+    try { return await body(); } finally { activeOp = null; }
+  });
+  tabTail = run.catch(() => {}); // a failed operation must not block the next one
+  return run;
+}
+/** Resolves once every operation queued so far (and any they queued) has ended (tests). */
+async function tabQueueIdle() { for (let tail; tail !== tabTail;) { tail = tabTail; await tail; } }
 
 function singleFlight(lanes, key, operation) {
   if (lanes.has(key)) return lanes.get(key);
@@ -204,9 +224,9 @@ function replacedSince(state, lookedUp) {
   return state.tabId !== lookedUp || replacingTabs.has(lookedUp);
 }
 
-async function rememberOwnedTab(job, provider, closing = false) {
+/** The session record that `tabId` (by default the leg's tab) is this leg's tab (tabCreatedForLeg). */
+async function rememberOwnedTab(job, provider, closing = false, tabId = job.states[provider].tabId) {
   const state = job.states[provider];
-  const tabId = state.tabId;
   if (!tabId) return;
   await chrome.storage.session.set({[OWNED_PREFIX + tabId]: {
     jobId: job.jobId, provider, runId: state.runId, closedKey: closedKey(job, provider), closing,
@@ -441,8 +461,8 @@ async function sendToTab(tabId, msg, files, live = () => true) {
 /** How long any worker-to-page message may go unanswered (every page handler replies at once, the
  * long model call runs detached in the page): a page that accepted it but never runs its handler (a
  * frozen tab, a hung page) then counts as unreachable (and is backed off: PAGE_BACKOFF_MS), instead
- * of holding its single-flight lane (a job's poll, its cleanup and the bounded ownership wait that
- * only starts after a reply, a capture or repair receipt, an inventory probe) forever. */
+ * of holding the tab queue (a job's poll, its cleanup and the bounded ownership wait that only
+ * starts after a reply, an inventory probe) and its lane (a capture or repair receipt) forever. */
 const PAGE_REPLY_MS = 15_000;
 
 /** How long a tab whose page did not answer in time (PAGE_REPLY_MS) is not messaged again, by any
@@ -456,7 +476,16 @@ const PAGE_BACKOFF_MS = 30_000;
  * waiting for) starts nothing (json.js: stale_run). It ends this long before the reply deadline, so
  * a page that accepts it still answers while the worker waits. */
 const RUN_UNTIL_SLACK_MS = 5_000;
+/** A new run is not dispatched with less reply window than this left in its poll operation (its
+ * `until` would leave the page too little time): the next poll dispatches it. */
+const MIN_DISPATCH_WINDOW_MS = 8_000;
 const pageBackoff = new Map(); // tabId -> the time until which it is not messaged
+
+/** How long the page message sent now may wait for its reply: PAGE_REPLY_MS, capped by what is
+ * left of the running operation's budget (<= 0: spent, nothing is sent). */
+function pageWindow() {
+  return activeOp ? Math.min(PAGE_REPLY_MS, activeOp.deadline - Date.now()) : PAGE_REPLY_MS;
+}
 
 /** One reply deadline (a function so tests can replace the timer; cancelled once the reply came). */
 function pageReplyDeadline(ms = PAGE_REPLY_MS) {
@@ -473,12 +502,16 @@ function pageSilent(error) {
 }
 
 /** `start(live)` (a page message, or a script injection into the page) bounded by
- * pageReplyDeadline: the page that does not answer in time is backed off (PAGE_BACKOFF_MS), and one
- * still backed off is not asked at all. `live()` is true until the deadline gave up. */
+ * pageReplyDeadline over the reply window it has (pageWindow): the page that does not answer in
+ * time is backed off (PAGE_BACKOFF_MS), and one still backed off is not asked at all. `live()` is
+ * true until the deadline gave up. */
 async function withinPageReply(tabId, start) {
   if ((pageBackoff.get(tabId) || 0) > Date.now()) throw pageSilent(new Error("the page did not answer in time recently; it is not asked again yet"));
   pageBackoff.delete(tabId);
-  const deadline = pageReplyDeadline();
+  // The operation's budget is spent: the page is not asked now (not evidence about the tab either).
+  const replyWindow = pageWindow();
+  if (replyWindow <= 0) throw pageSilent(new Error("the tab operation's time budget is spent; the page was not asked"));
+  const deadline = pageReplyDeadline(replyWindow);
   let phase = "waiting";
   const expired = deadline.promise.then(undefined, error => {
     if (phase === "waiting") { phase = "expired"; pageBackoff.set(tabId, Date.now() + PAGE_BACKOFF_MS); }
@@ -691,26 +724,45 @@ function knownTabOwner(tab) {
 /** Ownership-only probes have independent lanes. An unresponsive tab remains
  * uncertain; it cannot hold the admission/cleanup scheduler or cause fan-out.
  */
+/** The tab inventory, one operation in the tab queue (the query, and the cache entries and preserved
+ * records of tabs that are gone: no re-key can run between the query and those drops), then one probe
+ * operation per provider tab whose page can answer (single-flight per tab), waited for so the caller
+ * reads what they found. */
 async function refreshTabInventory() {
+  const ids=await tabOp("inventory", refreshTabInventoryBody);
+  await Promise.allSettled(ids.map(id=>inventoryLanes.get(id) || singleFlight(inventoryLanes,id,()=>tabOp("probe",()=>probeTabNow(id)))));
+}
+async function refreshTabInventoryBody() {
   const tabs=await chrome.tabs.query({});
   const live=new Set(tabs.map(tab=>tab.id));
   for(const id of tabOwners.keys())if(!live.has(id))invalidateTabInventory(id);
   // Removed IDs need no permanent tombstone once their single-flight probe ended.
   for(const id of tabEpochs.keys())if(!live.has(id) && !inventoryLanes.has(id)){tabEpochs.delete(id);inventoryUpgrades.delete(id);}
-  for(const tab of tabs) {
-    const provider=["chatgpt","grok"].find(p=>allowedTab(tab,p));
-    // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws: a probe
-    // would only time out (erasing the owner read there while it ran) and every refresh would queue
-    // another. Its page cannot change while it is frozen, so what was read there stands.
-    if(!provider || tab.status === "loading" || tab.pendingUrl || tab.frozen === true || inventoryLanes.has(tab.id))continue;
-    const epoch=tabEpochs.get(tab.id) || 0;
-    void singleFlight(inventoryLanes,tab.id,()=>probeTabOwner(tab,provider,epoch))
-      .catch(()=>{if((tabEpochs.get(tab.id) || 0)===epoch)tabOwners.delete(tab.id);});
-  }
   // A preserved record whose tab is gone has nothing left to release.
   const session=await chrome.storage.session.get(null);
   const stale=Object.entries(session).filter(([key,value])=>key.startsWith(PRESERVED_PREFIX) && Number.isInteger(value?.tabId) && !live.has(value.tabId)).map(([key])=>key);
   if(stale.length)await chrome.storage.session.remove(stale);
+  return tabs.filter(probeable).map(tab=>tab.id);
+}
+
+/** The provider a tab's page can be probed for now (undefined: none). A frozen tab (energy saver, a
+ * collapsed tab group) runs no handler until it thaws: a probe would only time out (erasing the owner
+ * read there while it ran) and every refresh would queue another. Its page cannot change while it is
+ * frozen, so what was read there stands. */
+function probeable(tab) {
+  const provider=["chatgpt","grok"].find(p=>allowedTab(tab,p));
+  return provider && tab.status !== "loading" && !tab.pendingUrl && tab.frozen !== true ? provider : undefined;
+}
+/** A scheduled probe, as its operation starts: the tab and its epoch are read now, not when the
+ * inventory scheduled it (the tab may have changed or gone in between). */
+async function probeTabNow(tabId) {
+  const epoch=tabEpochs.get(tabId) || 0;
+  let tab;
+  try { tab=await chrome.tabs.get(tabId); } catch { return; }
+  const provider=probeable(tab);
+  if(!provider)return;
+  try { await probeTabOwner(tab,provider,epoch); }
+  catch { if((tabEpochs.get(tabId) || 0)===epoch)tabOwners.delete(tabId); }
 }
 
 /** One ownership probe of `tab`, recorded only while the tab's inventory epoch is still `epoch`: a
@@ -994,36 +1046,44 @@ async function reconcileFixDeliveries(jobs) {
   return proven;
 }
 
+/** Open the leg's tab, inside its poll operation: the capacity check, the intent, the create and
+ * the records run with no other tab operation in between (the tab queue), so two allocations never
+ * both pass one capacity check. The tab's evidence is written before the leg names it (CE-2):
+ * saveJobs persists the shared registry whenever any lane saves, so a state.tabId set before its
+ * owned-tab record would be persisted without it, and after a worker stop that tab could not be
+ * proven the leg's (tabCreatedForLeg). */
 async function allocateProviderTab(job, provider, jobs) {
-  // Serialize only the short capacity/create boundary, never model or bridge RPCs.
-  const operation = allocationTail.then(async () => {
-    const state = job.states[provider];
-    if (state.tabId || state.allocating || await maintenanceHeld() || !await tabCapacityAvailable(jobs)) return;
-    state.allocating = true;
-    try { await saveJobs(jobs); }
-    catch (error) { delete state.allocating; throw error; } // No create was attempted.
-    try { await beginFixDelivery(job, provider); }
-    catch (error) { delete state.allocating; await saveJobs(jobs).catch(() => {}); throw error; } // No create was attempted.
-    try {
-      const created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
+  const state = job.states[provider];
+  if (state.tabId || state.allocating || await maintenanceHeld() || !await tabCapacityAvailable(jobs)) return;
+  state.allocating = true;
+  try { await saveJobs(jobs); }
+  catch (error) { delete state.allocating; throw error; } // No create was attempted.
+  try { await beginFixDelivery(job, provider); }
+  catch (error) { delete state.allocating; await saveJobs(jobs).catch(() => {}); throw error; } // No create was attempted.
+  let created;
+  try {
+    created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
+    await rememberOwnedTab(job, provider, false, created.id);
+    // The delivery record says `created` only now that the tab exists and carries its owned record.
+    // A failed promotion is not fatal: that owned record proves the tab (reconcileFixDeliveries).
+    await promoteFixDelivery(job, provider, created.id).then(() => followReplacedTab(created.id)).catch(() => {});
+    // (Where a replace Chrome made meanwhile moved those records.)
+    state.tabId = liveTabId(created.id);
+    workerStep(job,provider,"tab_created");
+    delete state.allocating;
+    await saveJobs(jobs); // Durable binding before any prompt dispatch.
+  } catch (error) {
+    if (!created) {
+      delete state.allocating; await saveJobs(jobs);
+      await forgetFixDelivery(job).catch(() => {}); // the create failed: no tab holds this delivery
+    } else if (!state.tabId) {
+      // The tab exists but a write after the create failed: the leg names it (in memory; the intent
+      // stays until a save lands), never opens another for this allocation.
       state.tabId = created.id;
       workerStep(job,provider,"tab_created");
-      await rememberOwnedTab(job, provider);
-      // The delivery record says `created` only now that the tab exists and carries its owned record.
-      // A failed promotion is not fatal: that owned record proves the tab (reconcileFixDeliveries).
-      await promoteFixDelivery(job, provider, created.id).then(() => followReplacedTab(created.id)).catch(() => {});
-      delete state.allocating;
-      await saveJobs(jobs); // Durable binding before any prompt dispatch.
-    } catch (error) {
-      if (!state.tabId) {
-        delete state.allocating; await saveJobs(jobs);
-        await forgetFixDelivery(job).catch(() => {}); // the create failed: no tab holds this delivery
-      }
-      throw error;
     }
-  });
-  allocationTail = operation.catch(() => {});
-  return operation;
+    throw error;
+  }
 }
 
 function compactFinalCapturedSource(state) {
@@ -1092,9 +1152,11 @@ async function finishTabCleanup(job, provider, jobs, reason, cause) {
  * Never delete the last ownership record before remove() has succeeded.
  */
 function cleanupProvider(job, provider, jobs) {
-  return singleFlight(cleanupLanes,`${job.origin}:${job.jobId}:${provider}`,()=>cleanupProviderBody(job,provider,jobs));
+  return singleFlight(cleanupLanes,`${job.origin}:${job.jobId}:${provider}`,()=>tabOp("release",()=>cleanupProviderBody(job,provider,jobs)));
 }
 async function cleanupProviderBody(job, provider, jobs) {
+  // Nothing for a job that retired (or was reset) while this operation waited in the queue.
+  if (jobs[job.jobId] !== job) return;
   const state = job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`;
   if (capturePersistence.has(key) || (!state.delivered && !sourceArchiveDurable(state)) || state.cleanupDone || state.repairReceiptPending) return;
   // No tab id and no run: nothing to look up or close (a leg that never had a tab ends with no tab
@@ -1711,7 +1773,13 @@ async function takenBeforeSend(job, provider, jobs, cause) {
   await saveJobs(jobs);
 }
 
-async function pollProvider(job, provider, jobs, observeOnly = false) {
+/** A leg's poll, one operation in the tab queue (allocation, dispatch, harvest and their records). */
+function pollProvider(job, provider, jobs, observeOnly = false) {
+  return tabOp("poll", () => pollProviderBody(job, provider, jobs, observeOnly));
+}
+async function pollProviderBody(job, provider, jobs, observeOnly) {
+  // Nothing for a job that retired (or was reset) while this operation waited in the queue.
+  if (jobs[job.jobId] !== job) return;
   const state = job.states[provider];
   if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
   if (!state.runId) state.runId = crypto.randomUUID();
@@ -1843,8 +1911,11 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     if (!state.started && !observeOnly) {
       // The page runner deduplicates a retried start when its acknowledgement was lost (or late:
       // askPage gives up on it, and the next tick asks again). A copy that reaches an unbound page
-      // after `until` starts nothing there (X4, #85).
-      result = await askPage(state.tabId, {...run, until: Date.now() + PAGE_REPLY_MS - RUN_UNTIL_SLACK_MS}, contentFiles(provider));
+      // after `until`, computed from the reply window this send has, starts nothing there (X4, #85):
+      // a page starts a run only while the worker that sent it still waits for the reply.
+      const replyWindow = pageWindow();
+      if (replyWindow < MIN_DISPATCH_WINDOW_MS) return;
+      result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS}, contentFiles(provider));
       // A page that refused the new run bound nothing: the run was never started.
       if (!refusedRun(result, job, provider)) {
         dispatched = true;
@@ -2627,8 +2698,9 @@ async function tickBody() {
   const jobs = await workerJobs(cfg.origin);
   void refreshTabInventory().catch(()=>{});
   await recordWorkerStatus(jobs, cfg.origin);
-  // There is deliberately NO global work lock or "any active job" return. A later
-  // wakeup can advance B/admit C even while A's short transport attempt is pending.
+  // Bridge work has no global lock and no "any active job" return: a later wakeup can advance B or
+  // admit C while A's bridge call is pending. Tab work runs in the tab queue (tabOp), one operation
+  // at a time, each bounded.
   const work = Object.values(jobs).filter(job=>job.origin===cfg.origin).flatMap(job=>job.providers
     .filter(provider=>(job.states[provider].delivered || sourceArchiveDurable(job.states[provider])) && !job.states[provider].cleanupDone &&
       !cleanupLanes.has(`${job.origin}:${job.jobId}:${provider}`))
@@ -2663,10 +2735,13 @@ async function heartbeatTick() {
 async function maintenanceSnapshot(id) {
   const cfg=await settings();
   const jobs=cfg.origin ? await workerJobs(cfg.origin) : {};
-  await Promise.allSettled([...admissionLanes.values(), allocationTail]);
-  const current=await maintenanceState();
-  if(!current || current.id!==id)return {ok:false,error:"maintenance lock lost"};
-  const capacity=await tabCapacityReport(jobs,true);
+  await Promise.allSettled([...admissionLanes.values()]);
+  // Read in the tab queue, after every allocation queued before it (a leg's poll operation opens its tab).
+  const capacity=await tabOp("maintenance",async()=>{
+    const current=await maintenanceState();
+    return current?.id===id ? tabCapacityReport(jobs,true) : null;
+  });
+  if(!capacity)return {ok:false,error:"maintenance lock lost"};
   const pendingCleanup=Object.values(jobs).filter(job=>!cfg.origin || job.origin===cfg.origin)
     .reduce((n,job)=>n+job.providers.filter(p=>(job.states[p].delivered || sourceArchiveDurable(job.states[p])) && !job.states[p].cleanupDone).length,0);
   if(cfg.origin)await recordWorkerStatus(jobs,cfg.origin,"maintenance");

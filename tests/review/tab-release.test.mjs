@@ -355,6 +355,8 @@ for (const [kind, what, state, pageState, status, cancelled] of PRESERVED_HISTOR
 // reply is bounded (pageReplyDeadline, replaced here by one that expires at once), so the cleanup
 // lane is never held and the bounded ownership wait applies.
 const TEMP = 'https://chatgpt.com/?temporary-chat=true';
+/** A current page's answer to the inventory's read-only status probe (bound to `jobId`'s run-A). */
+const statusProbe = (jobId, url) => ({ok: true, ownershipProtocol: 1, jobId, runId: 'run-A', provider: 'chatgpt', released: false, url});
 const expiresAtOnce = () => ({promise: new Promise((_resolve, reject) => setImmediate(() => reject(new Error('the page did not answer in time')))), cancel() {}});
 for (const kind of ['review', 'fix']) {
   for (const [mode, state, status] of [['secured', secured(kind), 'awaiting_chat'], ['cancelled', {}, 'cancelled']]) {
@@ -362,7 +364,9 @@ for (const kind of ['review', 'fix']) {
     const atOnce = kind === 'fix' && mode === 'cancelled';
     test(`${kind}: a ${mode} leg whose page never answers the release message is ${atOnce ? 'preserved at once' : 'preserved after the wait'}, never held`, async () => {
       const b = worker(leg(kind, {...state, conversation: TEMP, pageUrl: TEMP}), {status, tab: {id: 10, url: TEMP, status: 'complete'}});
-      b.chrome.tabs.sendMessage = (id, msg) => { b.messages.push({id, ...msg}); }; // accepted, never answered
+      // accepted, never answered (but its read-only status probe: the release is the lane under test,
+      // and in the tab queue the inventory's probe of a hung page would back it off first)
+      b.chrome.tabs.sendMessage = (id, msg, cb) => { b.messages.push({id, ...msg}); if (msg.type === 'ashlar-tab-status') cb(statusProbe(leg(kind).jobId, TEMP)); };
       b.context.pageReplyDeadline = expiresAtOnce;
       let settled = false;
       const ticked = b.tick().then(() => { settled = true; });

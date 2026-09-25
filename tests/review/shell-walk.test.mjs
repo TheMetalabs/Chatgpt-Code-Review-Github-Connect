@@ -15,6 +15,8 @@ const ANSWER = {review: raw, fix: '{"summary":"guard","files":[{"path":"a.ts","c
 const EVENTS = ['tick', 'tick', 'tick', 'later', 'cancel', 'missing', 'sweep', 'followup', 'navigate', 'userClose',
   'freeze', 'thaw', 'discard', 'discardSwap', 'loading', 'loaded', 'hang', 'noReceiver', 'pageOk', 'notRendered', 'rendered', 'browserRestart'];
 const START = ['secured', 'generating', 'undispatched'];
+/** The operation kinds allowed to perform each tab effect (the tab queue, #85). */
+const TAB_EFFECT_OPS = {message: ['poll', 'release', 'probe'], inject: ['poll', 'release', 'probe'], create: ['poll'], remove: ['release'], reload: ['poll', 'release']};
 /** A page reply deadline that expires at once (the real one is PAGE_REPLY_MS). */
 const expiresAtOnce = () => ({promise: new Promise((_resolve, reject) => setImmediate(() => reject(new Error('the page did not answer in time')))), cancel() {}});
 
@@ -75,10 +77,21 @@ async function run(kind, start, events) {
   // A fix tab may close only on the proven-success path (#77): here, only a leg whose answer was
   // delivered before the walk (this harness never delivers a new one). A review closes untouched.
   const mayClose = kind === 'review' || start === 'secured';
+  // Q1 (#85): every tab effect runs inside an operation of a kind allowed to perform it (the tab
+  // queue), and no two operations ever run at once. (The sweep still reaches tabs outside the queue.)
+  const queued = outsideAllowed => {
+    if (b.queue.overlapped) return 'tab_ops_overlapped';
+    for (const {effect, kind} of b.effects.splice(0)) {
+      if (kind === undefined ? !outsideAllowed : !TAB_EFFECT_OPS[effect]?.includes(kind)) return `tab_effect_${effect}_in_${kind || 'no_op'}`;
+    }
+    return '';
+  };
   const tick = async () => {
     const userBefore = w.user || w.reused;
     const closedBefore = b.closedTabs.length;
     if (!await settles(() => b.tick())) return 'tick_never_settles';
+    const outside = queued(false);
+    if (outside) return outside;
     if (w.frozenMessaged) return 'messaged_frozen_tab';
     if (b.closedTabs.length > closedBefore && userBefore) return 'closed_user_tab';
     if (b.closedTabs.length > closedBefore && !mayClose) return 'closed_undelivered_fix';
@@ -94,7 +107,7 @@ async function run(kind, start, events) {
       case 'sweep': {
         const closedBefore = b.closedTabs.length;
         if (!await settles(() => b.context.autoSweepStuckJobs())) return 'sweep_never_settles';
-        return b.closedTabs.length > closedBefore && !mayClose ? 'closed_undelivered_fix' : '';
+        return queued(true) || (b.closedTabs.length > closedBefore && !mayClose ? 'closed_undelivered_fix' : '');
       }
       case 'followup': if (t && !w.reused) { w.user = true; } return '';
       case 'navigate': if (t && !w.reused) { w.user = true; t.url = OTHER; } return '';
@@ -259,6 +272,9 @@ for (const kind of ['review', 'fix']) {
     b.chrome.tabs.sendMessage = (id, msg, cb) => {
       b.messages.push({id, ...msg});
       if (msg.type === 'ashlar-harvest') cb({ok: false, code: 'idle', jobId: msg.jobId, runId: msg.runId, provider: msg.provider});
+      // (the read-only status probe is answered: in the tab queue the inventory's probe of a hung page
+      // would back it off before the poll under test asks it)
+      if (msg.type === 'ashlar-tab-status') cb({ok: true, ownershipProtocol: 1, jobId, runId: 'run-A', provider: 'chatgpt', released: false, url: URL_TAB});
       // the resume (like every other message) is accepted and never answered
     };
     const resumes = () => b.messages.filter(m => m.id === 10 && m.type === 'ashlar-run' && m.resume === true).length;
@@ -297,7 +313,10 @@ function legOnTab(kind, states, answer, url = URL_TAB) {
 for (const kind of ['review', 'fix']) {
   test(`${kind}: a run message whose first send found no receiver is not sent again after its reply deadline`, async () => {
     const delivered = [];
-    const b = legOnTab(kind, {started: false}, msg => (msg.type === 'ashlar-tab-status' ? {ok: true} : undefined), 'https://chatgpt.com/?temporary-chat=true');
+    // (A current page answers the read-only status probe: no injection there holds the tab queue.)
+    const b = legOnTab(kind, {started: false}, msg => (msg.type === 'ashlar-tab-status'
+      ? {ok: true, ownershipProtocol: 1, jobId: '', runId: '', provider: 'chatgpt', released: false, url: 'https://chatgpt.com/?temporary-chat=true'} : undefined),
+    'https://chatgpt.com/?temporary-chat=true');
     const realSend = b.chrome.tabs.sendMessage;
     let injected = 0;
     b.chrome.tabs.sendMessage = (id, msg, cb) => {
@@ -331,7 +350,9 @@ test('a tab that did not answer is messaged by no lane until its back-off ended,
   b.context.pageReplyDeadline = expiresAtOnce;
   const asked = () => b.messages.filter(m => m.id === 10).length;
   await b.tick();
-  assert.ok(await until(() => b.messages.some(m => m.type === 'ashlar-harvest')), 'the poll asked the page');
+  // (The first lane to meet the silent page may be the inventory's probe or the poll: one at a time,
+  // in the tab queue. Whichever it is backs the tab off for all.)
+  assert.ok(await until(() => asked() > 0), 'a lane asked the page');
   assert.ok(await idle(b));
   const before = asked();
   await b.tick();
@@ -344,7 +365,7 @@ test('a tab that did not answer is messaged by no lane until its back-off ended,
   assert.equal(asked(), before, 'nor does a lookup of the leg\'s tab');
   later(b, 30_000);
   await b.tick();
-  assert.ok(b.messages.slice(before).some(m => m.id === 10 && m.type === 'ashlar-harvest'), 'asked again once the back-off ended');
+  assert.ok(b.messages.slice(before).some(m => m.id === 10), 'asked again once the back-off ended');
   // A page that loaded again is a new page: asked at once.
   assert.ok(await idle(b));
   const again = asked();

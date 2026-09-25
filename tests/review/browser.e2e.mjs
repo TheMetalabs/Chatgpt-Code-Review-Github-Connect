@@ -1187,14 +1187,17 @@ const FIX_SOURCE='Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\
 // attributes) inside the message node, or beside it in the turn's section; 'none': no file shown.
 // The page stays on the temporary chat URL after the send (ChatGPT does not move it).
 const FILE_CARD=name=>`<div class="group relative inline-block text-sm"><div class="relative overflow-hidden rounded-2xl border"><div class="p-2 w-80"><div class="flex flex-row items-center gap-2"><div class="relative h-10 w-10 shrink-0"><svg viewBox="0 0 36 36" style="width:36px;height:36px"><rect width="36" height="36"></rect></svg></div><div class="overflow-hidden"><div class="truncate font-semibold">${name}</div><div class="truncate text-token-text-secondary">Document · 1.2 KB</div></div></div></div></div></div>`;
-async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false,render='tile'}={}){
+async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false,render='tile',probe}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await setFixContent(page,`<main></main><form data-type="unified-composer">${fileInput?'<input type="file" multiple>':''}<div id="chips"></div><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>`);
- await page.evaluate(({stop,upload,collapse,swallow,render,card})=>{
+ await page.evaluate(({stop,upload,collapse,swallow,probe,render,card})=>{
   const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A']]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.__saved=saved;window.sends=0;window.clicks=0;window.uploads=[];window.uploading=false;
-  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+  const local=new Map(probe===undefined?[]:[['sendProbe',probe]]);window.__local=local;
+  const pick=keys=>Object.fromEntries(keys.filter(k=>local.has(k)).map(k=>[k,JSON.parse(JSON.stringify(local.get(k)))]));
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}},
+   storage:{local:{get:async keys=>pick(keys),set:async items=>{for(const [k,v] of Object.entries(items))local.set(k,JSON.parse(JSON.stringify(v)));}}}};
   const composer=document.querySelector('#prompt-textarea');
   // the real composer's whitespace handling: every whitespace run becomes one space
   if(collapse)composer.addEventListener('input',()=>{composer.value=composer.value.replace(/\s+/g,' ');});
@@ -1256,7 +1259,7 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swall
    turn.append(userTurn);document.querySelector('main').append(turn);
    composer.value='';document.querySelector('#chips').replaceChildren();event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
   });
- },{stop,upload,collapse,swallow,render,card:FILE_CARD('__NAME__')});
+ },{stop,upload,collapse,swallow,probe,render,card:FILE_CARD('__NAME__')});
  for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(()=>{Object.assign(__ashlarRunnerState,{kind:'fix',jobId:'fix-A',runId:'run-A',running:true});});
  const fill=async(delivery,ms=1600)=>{
@@ -1334,6 +1337,32 @@ test('real DOM: a temporary-chat fix whose sent turn shows ChatGPT\'s file card 
  got.none={sent:[none.sends,none.sent,none.code],clicks:await page.evaluate(()=>window.clicks),phase:(await journal()).phase};
  const shown={sent:[1,true,undefined],url:TEMP_URL,journal:['sent',1,true,[attachment.name]],answer:'harvested'};
  assert.deepEqual(got,{card:shown,'card-rich':shown,beside:shown,none:{sent:[1,false,'send_unconfirmed'],clicks:1,phase:'attempted'}});
+});
+
+// Diagnostic (1.1.31): after a fix's Send click the page records the last user turn's shape at about
+// 1, 5, 15, 30 and 60 s in chrome.storage.local "sendProbes" (last 20): counts, card flags, lengths, a
+// hash of the first 40 characters, match flags and a URL shape. Never the prompt, the answer or the
+// attachment. Off with {sendProbe:false}.
+test('real DOM: a fix Send click records five send probes of the sent turn\'s shape, with no raw text; sendProbe:false records none',async t=>{
+ const {attachment,typed,text}=await fixDelivery();
+ const {page,fill}=await attachmentPage(t,{render:'card',collapse:true});
+ await fill(text,62_000);
+ const probes=await page.evaluate(()=>window.__local.get('sendProbes'));
+ assert.deepEqual(probes.map(p=>p.label),['1s','5s','15s','30s','60s']);
+ const [first]=probes;
+ assert.deepEqual({...first,at:0,sinceClickMs:0,last:{...first.last,textHead:0,withoutCardsHead:0,expectedHead:0}},{
+  job:'fix-A',run:'run-A',at:0,label:'1s',sinceClickMs:0,url:'chatgpt.com/?temporary-chat=true',before:0,users:1,grew:true,userSections:0,sections:1,attachments:1,
+  last:{byRole:true,container:'section',chips:0,cards:1,cardInTurn:true,namesAttachment:true,nameInContainer:true,
+   textLength:first.last.textLength,textHead:0,withoutCardsLength:typed.length,withoutCardsHead:0,expectedLength:typed.length,expectedHead:0,
+   exact:false,normalized:false,contains:true,chipExcluded:true,sent:true}});
+ assert.equal(first.last.withoutCardsHead,first.last.expectedHead,'the card-free text starts as the typed line');
+ assert.match(first.last.textHead,/^[0-9a-f]{8}$/);
+ assert.ok(first.last.textLength>typed.length,'the raw reading holds the card text too');
+ const stored=JSON.stringify(await page.evaluate(()=>[...window.__local.entries()]));
+ for(const secret of [typed.slice(0,40),'Ashlar fix request',attachment.sha256,'def f(x)','Document · 1.2 KB','summary'])assert.ok(!stored.includes(secret),`no raw text: ${secret}`);
+ const off=await attachmentPage(t,{render:'card',probe:false});
+ await off.fill(text,62_000);
+ assert.equal(await off.page.evaluate(()=>window.__local.get('sendProbes')),undefined);
 });
 
 for(const [name,opts,ms,detail] of [

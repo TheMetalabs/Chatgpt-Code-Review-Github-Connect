@@ -673,6 +673,68 @@ function submissionConfirmed(record) {
   return true;
 }
 
+/** Diagnostic (1.1.31, live send_unconfirmed on a temporary-chat fix with its attachment): the
+ * shape of the page's last user turn at about 1, 5, 15, 30 and 60 s after a fix's Send click.
+ * Stored locally only (chrome.storage.local "sendProbes", last 20). Never raw text: lengths, an
+ * 8-hex hash of the first 40 characters, match flags, counts and a URL shape. Off with
+ * chrome.storage.local {sendProbe:false}. A probe never affects the run. */
+function sendProbeHash(text) {
+  let hash = 0x811c9dc5;
+  for (const ch of String(text ?? "")) { hash ^= ch.codePointAt(0); hash = Math.imul(hash, 0x01000193) >>> 0; }
+  return hash.toString(16).padStart(8, "0");
+}
+function sendProbeUrl(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname === "/" ? "/" : u.pathname.startsWith("/c/") ? "/c/*" : `/${u.pathname.split("/")[1] || ""}/*`;
+    return `${u.host}${path}${u.searchParams.has("temporary-chat") ? `?temporary-chat=${u.searchParams.get("temporary-chat") === "true"}` : ""}`;
+  } catch { return "unparsable"; }
+}
+function sendProbeShape(record, clickedAt, label) {
+  const turns = userTurns(), names = record.attachments || [];
+  const userSections = [...document.querySelectorAll('[data-turn="user"]')];
+  const shape = {at: Date.now(), label, sinceClickMs: Date.now() - clickedAt, url: sendProbeUrl(globalThis.location?.href),
+    before: record.baseline, users: turns.length, grew: turns.length > record.baseline, userSections: userSections.length,
+    sections: document.querySelectorAll('[data-testid^="conversation-turn"]').length, attachments: names.length};
+  const last = turns.at(-1) || userSections.at(-1);
+  if (!last) return shape;
+  const container = turnContainer(last);
+  const {cards, shown} = turnAttachments(last, names);
+  const text = messagePromptText(last), withoutCards = messagePromptText(last, cards);
+  const exact = typeof record.exact === "string" ? record.exact : "";
+  shape.last = {byRole: turns.includes(last), container: container === last ? "turn" : "section",
+    chips: [...container.querySelectorAll(fileChipSelector())].filter(chip => !chip.matches(composerControlSelector())).length,
+    cards: cards.size, cardInTurn: [...cards].some(card => last.contains(card)), namesAttachment: names.length > 0 && shown,
+    nameInContainer: names.some(name => (container.textContent || "").includes(name)),
+    textLength: text.length, textHead: sendProbeHash(text.slice(0, 40)),
+    withoutCardsLength: withoutCards.length, withoutCardsHead: sendProbeHash(withoutCards.slice(0, 40)),
+    expectedLength: exact.length, expectedHead: sendProbeHash(exact.slice(0, 40)),
+    exact: fixPromptForm(text) === exact, normalized: normalizePrompt(text) === record.expected,
+    contains: normalizePrompt(text).includes(record.expected), chipExcluded: fixTurnHolds(last, exact, names),
+    sent: fixTurnSent(last, record)};
+  return shape;
+}
+async function startSendProbe(record) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    if ((await local.get(["sendProbe"]))?.sendProbe === false) return;
+    const state = globalThis.__ashlarRunnerState;
+    const clickedAt = record.attemptedAt || Date.now(), job = state?.jobId, run = state?.runId;
+    const save = async label => {
+      try {
+        const shape = {job, run, ...sendProbeShape(record, clickedAt, label)};
+        globalThis.__ashlarSendProbeWrites = (globalThis.__ashlarSendProbeWrites || Promise.resolve()).then(async () => {
+          const stored = (await local.get(["sendProbes"]))?.sendProbes;
+          await local.set({sendProbes: [...(Array.isArray(stored) ? stored : []), shape].slice(-20)});
+        }).catch(() => {});
+        await globalThis.__ashlarSendProbeWrites;
+      } catch { /* diagnostics never affect the run */ }
+    };
+    for (const seconds of [1, 5, 15, 30, 60]) setTimeout(() => save(`${seconds}s`), Math.max(0, clickedAt + seconds * 1000 - Date.now()));
+  } catch { /* diagnostics never affect the run */ }
+}
+
 async function clickSend(findSend, findComposer, expectedText) {
   let record = await readSubmissionJournal();
   // A fix journal also carries its prompt's lossless form (`exact`, fixPromptForm): the draft is sent
@@ -737,6 +799,7 @@ async function clickSend(findSend, findComposer, expectedText) {
         if (runner) { runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()}; runner.freshPage = undefined; }
         step("send_attempted");
         try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
+        if (fix) startSendProbe(record);
       }
     }
     // Cadence only: no upload, send acknowledgement, queue or model deadline.

@@ -367,6 +367,28 @@ for (const kind of ['review', 'fix']) {
     assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, []);
     assert.deepEqual(historyOf(b), ['worker:tab_lost']);
   });
+  // A write the close makes before its remove fails (a storage quota, a transient error): no remove
+  // was issued, so the tab the user then closes is not the worker's close either.
+  const failsOnce = (store, failing) => { const set = store.set;let failed = false;
+    store.set = async values => { if (!failed && failing(values)) { failed = true;throw new Error('QUOTA_BYTES quota exceeded'); } return set(values); };
+    return () => failed; };
+  const WRITES = [
+    ['the closing ownership record', b => failsOnce(b.session, values => values['ashlar:tab:10']?.closing === true)],
+    ['the leg registry', b => failsOnce(b.local, values => values.pendingReviewJobs?.[leg(kind).jobId]?.states?.chatgpt?.closeIssued === true)],
+  ];
+  for (const [write, failing] of WRITES) {
+    test(`${kind}: a close whose write of ${write} failed before its remove is not the worker's close: the tab the user then closes is tab_lost`, async () => {
+      const b = worker(leg(kind, {...secured(kind), conversation: URL_TAB}), {session: createdHere(kind), handler: () => owned});
+      const failed = failing(b);
+      await b.tick();
+      assert.ok(failed(), `the write of ${write} failed`);assert.deepEqual(b.closedTabs, [], 'no remove was issued');
+      assert.ok(b.pending(), 'not closed yet');assert.equal(b.pending().states.chatgpt.closeIssued, undefined);
+      await b.closeTab(10);
+      await b.tick();
+      assert.equal(b.pending(), undefined);assert.deepEqual(b.closedTabs, []);
+      assert.deepEqual(historyOf(b), ['worker:tab_lost']);
+    });
+  }
   test(`${kind}: control: a remove that failed once and then succeeded is tab_closed`, async () => {
     const b = worker(leg(kind, {...secured(kind), conversation: URL_TAB}), {session: createdHere(kind), handler: () => owned});
     const remove = b.chrome.tabs.remove;

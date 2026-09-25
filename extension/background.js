@@ -939,12 +939,13 @@ async function closeProvenTab(job, provider, jobs, tabId, proven, reason) {
   state.closeRequested = true;
   // The worker's own close (a sweep also sets closeRequested, to accept an absence it confirmed).
   state.closeIssued = true;
-  await saveJobs(jobs);
-  await rememberOwnedTab(job, provider, true);
-  try { await chrome.tabs.remove(tabId); }
-  catch (error) {
-    // Not closed (the user is dragging the tab, or it is already gone): whoever ends it next, it is
-    // not the worker's close unless a later remove succeeds.
+  try {
+    await saveJobs(jobs);
+    await rememberOwnedTab(job, provider, true);
+    await chrome.tabs.remove(tabId);
+  } catch (error) {
+    // Not closed (a write before the remove failed, the user is dragging the tab, or it is already
+    // gone): whoever ends it next, it is not the worker's close unless a later remove succeeds.
     delete state.closeIssued;
     await saveJobs(jobs).catch(() => {});
     throw error;

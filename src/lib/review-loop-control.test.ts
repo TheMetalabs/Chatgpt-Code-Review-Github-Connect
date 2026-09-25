@@ -368,10 +368,10 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal((await handoffOn(1)).ambiguous, true, "PR 1: the handoff's outcome is unknown");
     // PR 2: a stop that ends an active session (its record is the session's last control write)
     byPr.set(2, [{ id: ++id, userLogin: BOT, body: startComment({ mode: "suggest", by: "alice", at: START_AT }), createdAt: START_AT }]);
-    const settings: BotSettings = { ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode: "suggest", parallelPrs: 3 } };
+    const settings: BotSettings = { ...DEFAULT_SETTINGS, fixAgent: { ...DEFAULT_SETTINGS.fixAgent, enabled: true, provider: "local", delivery: "script-apply", mode: "suggest", parallelPrs: 3 } };
     const deps = { gh, requestFix: async () => "", validate: async () => ({ ok: true }), ...clock } as unknown as LoopRuntimeDeps;
     const STOP_AT = "2026-02-21T00:00:00Z";
-    const env = { ASHLAR_FIX_AGENT: "1" } as NodeJS.ProcessEnv;
+    const env = {} as NodeJS.ProcessEnv; // the Settings switch alone turns the loop on
     assert.deepEqual(await stopLoop("t", { owner: "o", repo: "r", pr: 2, actor: "bob", stopAt: STOP_AT }, settings, deps, env), { posted: true, reason: "stopped" });
     const stopKey = controlKey({ kind: "stop", ref: ref(2), by: "bob", at: STOP_AT });
     assert.equal(journal.state(stopKey), "posted");
@@ -701,9 +701,9 @@ describe("session identity: one continuation and one handoff per head per SESSIO
       return '{"summary":"guard added","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}';
     };
     const deps = { gh, requestFix, validate: async () => ({ ok: true }), sleep: async (ms: number) => void (clock += ms), now: () => clock } as unknown as LoopRuntimeDeps;
-    const settingsOf = (mode: "suggest" | "apply"): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } });
+    const settingsOf = (mode: "suggest" | "apply"): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { ...DEFAULT_SETTINGS.fixAgent, enabled: true, provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } });
     const settings = settingsOf("suggest");
-    const env = { ASHLAR_FIX_AGENT: "1" } as NodeJS.ProcessEnv;
+    const env = {} as NodeJS.ProcessEnv; // the Settings switch alone turns the loop on
     const finding: Finding = {
       id: "f1",
       status: "accepted",

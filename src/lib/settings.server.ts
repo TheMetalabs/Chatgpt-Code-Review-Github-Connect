@@ -1,15 +1,18 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server.ts";
 import {
   DEFAULT_SETTINGS,
+  FIX_AGENT_KNOBS,
   FIX_AGENT_PROVIDERS,
   FIX_DELIVERIES,
   FIX_MODES,
   LOCAL_REVIEW_MODES,
+  fixKnob,
   normalizeReviewOrder,
   providersFromSettings,
   type BotSettings,
+  type FixAgentKnob,
   type FixAgentProvider,
   type FixDelivery,
   type FixMode,
@@ -17,6 +20,7 @@ import {
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
+import { SETTINGS_INT_FIELDS, SettingsError, clampInt, fixPairCompatible, settingsProblem, storedFixLoopOn, type SettingsIntField } from "./settings-rules.ts";
 import { normalizeChatgptReasoning, normalizeGrokReasoning } from "./reasoning.ts";
 
 function envStr(key: string): string | undefined {
@@ -97,13 +101,19 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (promptContextMax !== undefined) o.promptContextMaxChars = promptContextMax;
   const promptPolicyMax = envNum("ASHLAR_PROMPT_POLICY_MAX_CHARS");
   if (promptPolicyMax !== undefined) o.promptPolicyMaxChars = promptPolicyMax;
-  // Read the provider EMPTY-PRESERVING (not via envStr, which collapses "" -> undefined): an
-  // explicit ASHLAR_FIX_PROVIDER="" is the disable sentinel and must override a persisted provider.
+  // Fix agent: env SEEDS these fields only until the operator saves Settings — a saved fixAgent
+  // wins at load (diskFixAgentWins). `enabled` has NO env var: the Settings screen is the only
+  // switch for the review loop. The provider is read EMPTY-PRESERVING (not via envStr, which
+  // collapses "" -> undefined): an explicit ASHLAR_FIX_PROVIDER="" seeds "no provider".
   const fixProviderRaw = process.env.ASHLAR_FIX_PROVIDER;
   const fixDelivery = envStr("ASHLAR_FIX_DELIVERY");
   const fixMode = envStr("ASHLAR_FIX_MODE");
-  const fixParallel = envNum("ASHLAR_FIX_PARALLEL_PRS");
-  if (fixProviderRaw !== undefined || fixDelivery || fixMode || fixParallel !== undefined) {
+  const fixKnobs: Record<string, number> = {};
+  for (const [key, knob] of Object.entries(FIX_AGENT_KNOBS)) {
+    const n = envNum(knob.env);
+    if (n !== undefined) fixKnobs[key] = n;
+  }
+  if (fixProviderRaw !== undefined || fixDelivery || fixMode || Object.keys(fixKnobs).length) {
     const baseFix = (o.fixAgent as Record<string, unknown> | undefined) ?? {};
     o.fixAgent = {
       ...baseFix,
@@ -111,7 +121,7 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
         fixProviderRaw !== undefined ? (fixProviderRaw.trim() === "" ? null : fixProviderRaw.trim()) : baseFix.provider,
       ...(fixDelivery ? { delivery: fixDelivery } : {}),
       ...(fixMode ? { mode: fixMode } : {}),
-      ...(fixParallel !== undefined ? { parallelPrs: fixParallel } : {}),
+      ...fixKnobs,
     };
   }
   const contextPad = envNum("ASHLAR_CONTEXT_PAD_LINES");
@@ -149,10 +159,9 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_PROMPT_CONTEXT_MAX_CHARS: String(s.promptContextMaxChars),
     ASHLAR_PROMPT_POLICY_MAX_CHARS: String(s.promptPolicyMaxChars),
     ASHLAR_CONTEXT_PAD_LINES: String(s.contextPadLines),
-    ASHLAR_FIX_PROVIDER: s.fixAgent.provider ?? "",
-    ASHLAR_FIX_DELIVERY: s.fixAgent.delivery,
-    ASHLAR_FIX_MODE: s.fixAgent.mode,
-    ASHLAR_FIX_PARALLEL_PRS: String(s.fixAgent.parallelPrs),
+    // fixAgent is deliberately NOT mirrored (no field of it): the settings JSON is its only
+    // durable store, and a saved fixAgent wins over env at load (diskFixAgentWins). An env
+    // ASHLAR_FIX_* var only seeds a field that was never saved; no env var can switch the loop on.
   };
 }
 
@@ -168,19 +177,16 @@ function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
+/** A whole-number field, normalized INTO its save domain (settings-rules SETTINGS_INT_FIELDS): a
+ * stored or env-seeded value outside it is clamped here, so the loaded document is one a save
+ * accepts (an unrelated save never fails on a value the operator did not touch). */
+function intField(p: Record<string, unknown>, key: SettingsIntField): number {
+  return clampInt(SETTINGS_INT_FIELDS[key], p[key], DEFAULT_SETTINGS[key]);
+}
+
 function severity(v: unknown, fallback: Severity): Severity {
   return v === "P0" || v === "P1" || v === "P2" ? v : fallback;
 }
-
-// design §6b: which delivery each provider supports. An incompatible pair has no valid
-// execution path, so we DISABLE the fix agent (provider=null) rather than persist a config
-// that would silently never run — a visible, safe rejection of operator misconfiguration.
-const FIX_DELIVERY_BY_PROVIDER: Record<FixAgentProvider, readonly FixDelivery[]> = {
-  chatgpt: ["script-apply", "chat-push"],
-  grok: ["script-apply", "chat-push"],
-  local: ["script-apply"],
-  "coding-agent": ["coding-agent"],
-};
 
 function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
   const d = DEFAULT_SETTINGS.fixAgent;
@@ -188,13 +194,25 @@ function normalizeFixAgent(raw: unknown): BotSettings["fixAgent"] {
   let provider = FIX_AGENT_PROVIDERS.includes(p.provider as FixAgentProvider) ? (p.provider as FixAgentProvider) : d.provider;
   let delivery = FIX_DELIVERIES.includes(p.delivery as FixDelivery) ? (p.delivery as FixDelivery) : d.delivery;
   const mode = FIX_MODES.includes(p.mode as FixMode) ? (p.mode as FixMode) : d.mode;
-  const parallelPrs = Math.max(1, Math.min(20, Math.floor(num(p.parallelPrs, d.parallelPrs))));
-  // Enforce the provider→delivery matrix: an incompatible pair disables the fix agent.
-  if (provider !== null && !FIX_DELIVERY_BY_PROVIDER[provider].includes(delivery)) {
+  // Load-time normalization of a stored document (a save is VALIDATED first — settings-rules —
+  // and never reaches here with an incompatible pair): an incompatible pair (design §6b matrix)
+  // has no execution path, so it disables the fix agent (provider=null), failing closed.
+  if (provider !== null && !fixPairCompatible(provider, delivery)) {
     provider = null;
     delivery = d.delivery;
   }
-  return { provider, delivery, mode, parallelPrs };
+  // The switch is decided on the RAW stored values, never on the normalized ones above
+  // (storedFixLoopOn): only a literal true ("true", 1, … stay off) whose stored provider, delivery
+  // and mode are each valid and together a runnable pair survives. A stored or hand-edited
+  // enabled=true on anything else (a corrupted delivery load would default to script-apply, a
+  // non-wired pair such as a pre-#77 chat-push save or grok, no provider) loads OFF, so
+  // normalization never turns an unsafe configuration into a runnable one, the loaded document is
+  // one a save accepts, and an unrelated save is never rejected for a switch the operator did not touch.
+  const enabled = storedFixLoopOn(p);
+  const knobs = Object.fromEntries(
+    (Object.keys(FIX_AGENT_KNOBS) as FixAgentKnob[]).map((key) => [key, fixKnob({ [key]: num(p[key], FIX_AGENT_KNOBS[key].def) }, key)]),
+  ) as Record<FixAgentKnob, number>;
+  return { enabled, provider, delivery, mode, ...knobs };
 }
 
 export function sanitizeBotSettings(raw: unknown): BotSettings {
@@ -208,9 +226,9 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     mention: mention.length ? mention : [...DEFAULT_SETTINGS.mention],
     skipForks: bool(p.skipForks, DEFAULT_SETTINGS.skipForks),
     skipDrafts: bool(p.skipDrafts, DEFAULT_SETTINGS.skipDrafts),
-    maxInlineComments: Math.max(0, Math.min(20, Math.floor(num(p.maxInlineComments, DEFAULT_SETTINGS.maxInlineComments)))),
-    maxTurns: num(p.maxTurns, DEFAULT_SETTINGS.maxTurns),
-    exploreTurns: num(p.exploreTurns, DEFAULT_SETTINGS.exploreTurns),
+    maxInlineComments: intField(p, "maxInlineComments"),
+    maxTurns: intField(p, "maxTurns"),
+    exploreTurns: intField(p, "exploreTurns"),
     publishMinSeverity: severity(p.publishMinSeverity, DEFAULT_SETTINGS.publishMinSeverity),
     requestChangesMin: severity(p.requestChangesMin, DEFAULT_SETTINGS.requestChangesMin),
     precisionOverRecall: bool(p.precisionOverRecall, DEFAULT_SETTINGS.precisionOverRecall),
@@ -223,18 +241,18 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localLlmBaseUrl: str(p.localLlmBaseUrl, DEFAULT_SETTINGS.localLlmBaseUrl).trim(),
     localLlmApiKey: str(p.localLlmApiKey, DEFAULT_SETTINGS.localLlmApiKey),
     localLlmModel: str(p.localLlmModel, DEFAULT_SETTINGS.localLlmModel).trim(),
-    localReviewMaxTokens: Math.max(1, Math.floor(num(p.localReviewMaxTokens, DEFAULT_SETTINGS.localReviewMaxTokens))),
+    localReviewMaxTokens: intField(p, "localReviewMaxTokens"),
     localReviewMode: LOCAL_REVIEW_MODES.includes(p.localReviewMode as LocalReviewMode)
       ? (p.localReviewMode as LocalReviewMode)
       : DEFAULT_SETTINGS.localReviewMode,
-    localReviewSingleTurnMaxTokens: Math.max(1, Math.floor(num(p.localReviewSingleTurnMaxTokens, DEFAULT_SETTINGS.localReviewSingleTurnMaxTokens))),
+    localReviewSingleTurnMaxTokens: intField(p, "localReviewSingleTurnMaxTokens"),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),
     grokReasoning: normalizeGrokReasoning(p.grokReasoning),
-    promptDiffMaxChars: Math.max(0, Math.floor(num(p.promptDiffMaxChars, DEFAULT_SETTINGS.promptDiffMaxChars))),
-    promptContextMaxChars: Math.max(0, Math.floor(num(p.promptContextMaxChars, DEFAULT_SETTINGS.promptContextMaxChars))),
-    promptPolicyMaxChars: Math.max(0, Math.floor(num(p.promptPolicyMaxChars, DEFAULT_SETTINGS.promptPolicyMaxChars))),
-    contextPadLines: Math.max(0, Math.floor(num(p.contextPadLines, DEFAULT_SETTINGS.contextPadLines))),
+    promptDiffMaxChars: intField(p, "promptDiffMaxChars"),
+    promptContextMaxChars: intField(p, "promptContextMaxChars"),
+    promptPolicyMaxChars: intField(p, "promptPolicyMaxChars"),
+    contextPadLines: intField(p, "contextPadLines"),
   };
   if (!providersFromSettings(next).length) next.reviewChatgpt = true;
   return next;
@@ -258,10 +276,22 @@ function readJsonObject(path: string): Record<string, unknown> {
   }
 }
 
+/** Atomic: a crash or a full disk mid-write leaves the previous file intact, never a torn one. */
 function writeJson(path: string, value: BotSettings) {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (e) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* the tmp file may not exist */
+    }
+    throw e;
+  }
 }
 
 function readDiskSettings(): Record<string, unknown> {
@@ -290,22 +320,45 @@ export function diskReviewerFlagsWin(disk: Record<string, unknown>, merged: Reco
   return out;
 }
 
+/** A saved fixAgent wins over the env seed field by field: the Settings screen, not a process
+ * env var, operates the review loop (env only fills what was never saved). */
+export function diskFixAgentWins(disk: Record<string, unknown>, merged: Record<string, unknown>): Record<string, unknown> {
+  const saved = disk.fixAgent;
+  if (!saved || typeof saved !== "object" || Array.isArray(saved)) return merged;
+  const seeded = merged.fixAgent && typeof merged.fixAgent === "object" ? (merged.fixAgent as Record<string, unknown>) : {};
+  return { ...merged, fixAgent: { ...seeded, ...(saved as Record<string, unknown>) } };
+}
+
 export function loadBotSettings(): BotSettings {
   loadDotenvFile();
   const disk = readDiskSettings();
-  return sanitizeBotSettings(diskReviewerFlagsWin(disk, overlayEnv(disk)));
+  return sanitizeBotSettings(diskFixAgentWins(disk, diskReviewerFlagsWin(disk, overlayEnv(disk))));
 }
 
+/**
+ * Validate and persist a Settings save. The settings JSON (.data/ashlar-settings.json) is the ONE
+ * durable store: it must be written for the save to count. If it cannot be written the save FAILS
+ * (SettingsError 500) and nothing else is touched — no .env patch — so the caller keeps its live
+ * settings and the operator sees the error; after a restart load returns the last successful save.
+ * The legacy JSON copy and the .env mirror are supplemental (best effort): load reads the primary
+ * JSON over both (readDiskSettings, diskFixAgentWins). A document the rules reject (settings-rules)
+ * throws SettingsError 400 before anything is written.
+ */
 export function saveBotSettings(settings: BotSettings) {
+  const problem = settingsProblem(settings);
+  if (problem) throw new SettingsError(problem, 400);
   const runtime = sanitizeBotSettings(settings);
   const disk = persistableSettings(runtime);
-  let persisted = false;
   try {
     writeJson(settingsPath(), disk);
+  } catch (e) {
+    const why = e instanceof Error && "code" in e ? ` (${String((e as NodeJS.ErrnoException).code)})` : "";
+    throw new SettingsError(`could not save settings: ${settingsPath()} is not writable${why}; nothing was changed`, 500);
+  }
+  try {
     writeJson(legacySettingsPath(), disk);
-    persisted = true;
   } catch {
-    /* env file may still succeed */
+    /* supplemental: the primary JSON is read over the legacy copy */
   }
   try {
     const envPatch: Record<string, string | undefined> = botSettingsToEnv(disk);
@@ -316,12 +369,8 @@ export function saveBotSettings(settings: BotSettings) {
       envPatch.ASHLAR_WEBHOOK_SECRET = undefined;
     }
     writeEnvPatch(envPatch);
-    persisted = true;
   } catch {
-    /* json may still have been written */
+    /* supplemental: the JSON is the durable store */
   }
-  if (!persisted) throw new Error("settings persist failed");
   return runtime;
 }
-
-

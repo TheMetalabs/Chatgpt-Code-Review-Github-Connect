@@ -26,7 +26,8 @@ jobs:
       # Independent of legacy template tests; requires no npm dependencies or LLM spend.
       - run: npm run test:review-regressions
       - name: Signed mention admission and lifecycle fixtures
-        run: node --experimental-strip-types --experimental-vm-modules --test tests/review/mentions.e2e.mjs tests/review/parallel.e2e.mjs tests/review/long-wait.e2e.mjs tests/review/observability.e2e.mjs tests/review/json-repair.e2e.mjs tests/review/source-capture.e2e.mjs
+        # package.json is the e2e file registry (scripts/e2e-registration.test.mjs).
+        run: npm run test:e2e
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -74,7 +75,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          node --experimental-strip-types --experimental-vm-modules --test tests/review/browser.e2e.mjs tests/review/submission.e2e.mjs tests/review/captured-dom-shapes.e2e.mjs tests/review/history-ui.e2e.mjs tests/review/json-repair-browser.e2e.mjs tests/review/capacity-browser.e2e.mjs tests/review/json-repair-ui.e2e.mjs 2>&1 | tee /tmp/review-browser-tests.log
+          npm run test:browser:dom 2>&1 | tee /tmp/review-browser-tests.log
       - name: Preserve browser assertion logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -85,4 +86,4 @@ jobs:
           retention-days: 7
       - name: MV3 and application integration fixtures
         if: ${{ !cancelled() && steps.browser.outcome == 'success' }}
-        run: node --experimental-strip-types --experimental-vm-modules --test tests/review/extension.e2e.mjs
+        run: npm run test:browser:mv3

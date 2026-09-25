@@ -83,7 +83,7 @@ const FRESH = "f".repeat(40); // a human push after the write (later: push / mov
 const STALE = "9".repeat(40); // a head the loop had left, whose clean review lands late (prior: stale-resume)
 const T0 = Date.parse("2026-03-01T00:00:00Z"); // the world clock starts here
 const ALICE_AT = "2026-02-20T00:00:00Z"; // alice's start directive; review rounds follow it
-const ENV = { ASHLAR_FIX_AGENT: "1", ASHLAR_LOOP_ROUND_CAP: "5" } as NodeJS.ProcessEnv;
+const ENV = {} as NodeJS.ProcessEnv; // the Settings switch alone turns the loop on (fixAgent.roundCap default 5)
 const EDIT = '{"summary":"guard removed","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}';
 const iso = (ms: number) => new Date(ms).toISOString();
 /** GitHub's one-second resolution (rows and webhook event times). */
@@ -311,7 +311,7 @@ const finding: Finding = {
   recommendedTest: "add a test",
 } as Finding;
 const sample = { changedPaths: ["src/a.ts"], files: [{ path: "src/a.ts", content: "export const a = 1;\n", language: "ts" }] } as unknown as SamplePr;
-const settings = (mode: "suggest" | "apply"): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } });
+const settings = (mode: "suggest" | "apply"): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { ...DEFAULT_SETTINGS.fixAgent, enabled: true, provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } });
 
 function job(pr: number, over: Partial<Job> = {}): Job {
   return {

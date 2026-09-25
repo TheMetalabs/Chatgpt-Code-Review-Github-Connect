@@ -18,8 +18,10 @@ const REGEX_AFTER = new Set(['return', 'typeof', 'case', 'in', 'of', 'new', 'del
 /** Statements whose parenthesised head is followed by a statement, which may start with a regex. */
 const HEADED = new Set(['if', 'while', 'for', 'with']);
 /** Punctuators read whole, longest first. An operator read in pieces changes what follows it: after
- * `i++` a `/` divides, while after `+` it starts a regex that would swallow the code up to the next `/`. */
-const PUNCTUATORS = ['??', '?.', '||', '++', '--'];
+ * `i++` a `/` divides, while after `+` it starts a regex that would swallow the code up to the next `/`;
+ * and `a = b` assigns where `a == b`, `a <= b` and `a => b` do not. */
+const PUNCTUATORS = ['>>>=', '...', '===', '!==', '**=', '<<=', '>>=', '>>>', '&&=', '||=', '??=',
+  '=>', '==', '!=', '<=', '>=', '&&', '||', '??', '?.', '++', '--', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '**', '<<', '>>'];
 
 /** An escape that spells an identifier character (`st\u0061ge` is the name stage): the character and
  * the escape's length at `i`, or null. */
@@ -163,7 +165,7 @@ function forwardsUnchanged(tokens, param) {
   return tokens.every((token, k) => {
     const prev = tokens[k - 1];
     if (token.kind === 'word') {
-      const property = isPunct(prev, '?.') || (isPunct(prev, '.') && !isPunct(tokens[k - 2], '.'));
+      const property = isPunct(prev, '?.') || isPunct(prev, '.');
       return property || (token.text !== param && !INDIRECT.has(token.text));
     }
     if (token.kind === 'tpl') return token.substs.every(inner => forwardsUnchanged(inner, param));
@@ -550,6 +552,14 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
     'fixture.js:2 recordReviewStep(): stage `stage = computeStage()` is not a literal, so its value cannot be checked for a label',
     'fixture.js:3 recordReviewStep(): stage `stage` is not a literal, so its value cannot be checked for a label',
   ]);
+});
+
+test('the tokenizer reads every multi-character operator whole', () => {
+  const text = 'a >>>= b ... c === d !== e **= f <<= g >>= h >>> i &&= j ||= k ??= l => m == n != o <= p >= q && r || s ?? t ' +
+    '?. u ++ v -- w += x -= y *= z %= a &= b |= c ^= d ** e << f >> g /= h = i < j > k ! l';
+  assert.deepEqual(tokenize(text, 0).tokens.filter(token => token.kind === 'punct').map(token => token.text), ['>>>=', '...', '===',
+    '!==', '**=', '<<=', '>>=', '>>>', '&&=', '||=', '??=', '=>', '==', '!=', '<=', '>=', '&&', '||', '??', '?.', '++', '--', '+=',
+    '-=', '*=', '%=', '&=', '|=', '^=', '**', '<<', '>>', '/=', '=', '<', '>', '!']);
 });
 
 test('a file the tokenizer cannot read is a problem that names the file, not a blame on its forwarder', () => {

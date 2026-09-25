@@ -316,6 +316,55 @@ describe("buildReviewerLanes", () => {
     assert.equal(emptyReviewSkip([{provider: "chatgpt", label: "ChatGPT", state: "empty", detail: "usage limit", answered: false}]).usageLimited, false);
   });
 
+  it("a progress stage recorded before the provider's quota error does not mask it", () => {
+    // Reported: ChatGPT had reached waiting_for_json when the server recorded its quota error. The lane
+    // is built by the progress branch, and its flag still comes from the provider's error.
+    const lanes = buildReviewerLanes(job({
+      reviewProviders: ["chatgpt"],
+      generating: {chatgpt: false},
+      providerErrors: {chatgpt: {code: "quota", message: "You've reached the limit"}},
+      providerProgress: {chatgpt: {runId: "run", stage: "waiting_for_json", observedAt: 1, receivedAt: 1}},
+    }));
+    assert.equal(lanes[0].detail, "Response visible · waiting for valid review JSON", "the progress branch built it");
+    assert.equal(lanes[0].usageLimited, true);
+    const skip = emptyReviewSkip(lanes);
+    assert.equal(skip.usageLimited, true);
+    assert.equal(skip.skipReason, "reviewers could not complete — usage limit reached");
+  });
+
+  it("every lane branch reads a usage limit from the same evidence", () => {
+    // The provider's quota error code, or a usage limit its error message reports, marks the lane whichever
+    // branch builds it: a skip note or a skipped job's reason that names another cause does not hide it.
+    const errors = {
+      code: {chatgpt: {code: "quota", message: "You've reached the limit"}},
+      message: {chatgpt: {code: "error", message: "usage limit reached for this model"}},
+    } as const;
+    for (const [evidence, providerErrors] of Object.entries(errors)) {
+      const branches = {
+        progress: job({reviewProviders: ["chatgpt"], generating: {chatgpt: false}, providerErrors,
+          providerProgress: {chatgpt: {runId: "run", stage: "generating", observedAt: 1, receivedAt: 1}}}),
+        skipNote: job({reviewProviders: ["chatgpt"], providerErrors, assumptions: ["Skipped chatgpt: tab_closed: review tab was explicitly closed"]}),
+        skippedJob: job({status: "cancelled", reviewProviders: ["chatgpt"], providerErrors, skipReason: "cancelled by operator"}),
+        empty: job({reviewProviders: ["chatgpt"], generating: {chatgpt: false}, providerErrors}),
+        pending: job({reviewProviders: ["chatgpt"], generating: {chatgpt: true}, providerErrors}),
+      };
+      for (const [branch, value] of Object.entries(branches)) {
+        const lanes = buildReviewerLanes(value);
+        assert.equal(lanes[0].usageLimited, true, `${evidence} · ${branch}`);
+        assert.equal(emptyReviewSkip(lanes).usageLimited, true, `${evidence} · ${branch}`);
+      }
+    }
+    // A skip note that names the limit counts beside a structured error that does not.
+    const noted = buildReviewerLanes(job({reviewProviders: ["chatgpt"], providerErrors: {chatgpt: {code: "error", message: "stopped"}},
+      assumptions: ["Skipped chatgpt: quota: You've reached the limit"]}));
+    assert.equal(noted[0].usageLimited, true);
+    // Another provider's quota error is not this lane's.
+    const other = buildReviewerLanes(job({reviewProviders: ["chatgpt", "grok"], generating: {chatgpt: false, grok: false},
+      providerErrors: {grok: {code: "quota", message: "limit"}},
+      providerProgress: {chatgpt: {runId: "run", stage: "waiting_for_json", observedAt: 1, receivedAt: 1}}}));
+    assert.deepEqual(other.map((lane) => lane.usageLimited), [false, true]);
+  });
+
 });
 
 describe("ProgressStage", () => {

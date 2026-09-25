@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {bridgeHarness,job,json,types,parser,fallback,loadTs} from './load-source.mjs';
+import * as reviewProgress from '../../src/lib/review-progress.ts';
 const old=()=>Date.now()-24*3600_000;
 test('stale heartbeat does not hold a lease forever just because generating=true',()=>{
  const {bridge}=bridgeHarness([job({bridgeClaimedAt:old(),generating:{chatgpt:true}})]);
@@ -48,7 +49,8 @@ test('false without a terminal outcome is not sufficient to end generation',()=>
 test('claim endpoint enforces mention-only policy too',()=>{
  const {bridge}=bridgeHarness([job({trigger:'pull_request.opened'})]);assert.equal(bridge.claimBridgeJob('job1').ok,false);
 });
-const progress=()=>loadTs('src/lib/reviewer-progress.ts',{...types,...parser,...fallback});
+// Every lane reads the provider's progress stage for its usage-limit flag, so the stage helpers come along.
+const progress=()=>loadTs('src/lib/reviewer-progress.ts',{...types,...parser,...fallback,...reviewProgress});
 test('quota note is never borrowed from another provider',()=>{
  const lanes=progress().buildReviewerLanes(job({reviewProviders:['chatgpt','grok'],generating:{chatgpt:false,grok:false},assumptions:['chatgpt usage limit','grok finished without JSON']}));
  assert.equal(lanes[1].detail,'finished without JSON');

@@ -175,8 +175,9 @@ export interface ReviewerLane {
   answered: boolean;
   jsonChars?: number;
   findingCount?: number;
-  /** The reviewer stopped on a usage limit. Set where the lane is built, from the provider's quota stage
-   * or a server-written note; never read back out of the detail text. */
+  /** The reviewer stopped on a usage limit. Set on every lane by one derivation (laneUsageLimited) from the
+   * provider's quota stage, its quota error code or a server-written note; never read back out of the
+   * detail text. */
   usageLimited?: boolean;
 }
 

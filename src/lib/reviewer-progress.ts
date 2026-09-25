@@ -38,8 +38,9 @@ function providerErrorNote(
 }
 
 /** A usage-limit cause in text the server wrote: a provider error note, a skip note, a job's skip reason.
- * Only a lane builder reads it, where it knows the text is one of those; emptyReviewSkip reads the lane's
- * flag, never its detail, because a detail can also carry an extension-recorded stage's label. */
+ * Only laneUsageLimited and an empty lane's detail read it, where the text is known to be one of those;
+ * emptyReviewSkip reads the lane's flag, never its detail, because a detail can also carry an
+ * extension-recorded stage's label. */
 const USAGE_LIMIT_NOTE = /usage limit|quota|한도/i;
 
 function usageLimitNote(
@@ -47,6 +48,31 @@ function usageLimitNote(
   provider: ReviewProvider,
 ): boolean {
   return USAGE_LIMIT_NOTE.test(providerErrorNote(job, provider) ?? "");
+}
+
+/** The note that says why a provider was skipped, if one does. */
+function skipNoteOf(job: Pick<Job, "assumptions">, provider: ReviewProvider): string | undefined {
+  return (job.assumptions ?? []).find((a) =>
+    provider === "local" ? /^Skipped local/i.test(a) : new RegExp(`Skipped ${provider}`, "i").test(a),
+  );
+}
+
+const ENDED: JobStatus[] = ["skipped", "cancelled", "dlq"];
+
+/** Whether a provider stopped on a usage limit. One derivation for every lane, whichever branch builds it,
+ * so one piece of evidence cannot mask another (a progress stage recorded before the provider's quota
+ * error must not hide that error). The evidence is the provider's quota stage, or a usage-limit cause in
+ * text the server wrote: the provider's error note (a structured error reads `<code>: <message>`, so a
+ * quota code counts whatever its message says), its skip note, or the skip reason of a job that ended.
+ * It never reads the lane's detail, which can show an extension-recorded stage. */
+function laneUsageLimited(
+  job: Pick<Job, "status" | "assumptions" | "githubError" | "skipReason" | "providerErrors" | "providerProgress">,
+  provider: ReviewProvider,
+): boolean {
+  return stageIs(job.providerProgress?.[provider]?.stage, "quota") ||
+    usageLimitNote(job, provider) ||
+    USAGE_LIMIT_NOTE.test(skipNoteOf(job, provider) ?? "") ||
+    (ENDED.includes(job.status) && USAGE_LIMIT_NOTE.test(job.skipReason ?? ""));
 }
 
 function emptyProviderDetail(
@@ -134,13 +160,11 @@ export function buildReviewerLanes(
   const now = opts?.now ?? Date.now();
   const staleMs = opts?.staleMs ?? 300_000;
   const providers = (job.reviewProviders?.length ? job.reviewProviders : opts?.enabled ?? []) as ReviewProvider[];
-  return providers.map((provider) => {
+  const laneOf = (provider: ReviewProvider): ReviewerLane => {
     const label = PROVIDER_LABEL[provider];
     const raw = job.storedLegs?.find((l) => l.provider === provider)?.raw?.trim() ?? "";
     const skip = skippedProvider(job.assumptions, provider);
-    const skipNote = (job.assumptions ?? []).find((a) =>
-      provider === "local" ? /^Skipped local/i.test(a) : new RegExp(`Skipped ${provider}`, "i").test(a),
-    );
+    const skipNote = skipNoteOf(job, provider);
 
     const pendingLocal = provider === "local" && Boolean(opts?.localInFlight || job.generating?.local === true);
     if (pendingLocal) {
@@ -172,18 +196,16 @@ export function buildReviewerLanes(
         label,
         detail: skipNote ?? "skipped",
         answered: false,
-        usageLimited: USAGE_LIMIT_NOTE.test(skipNote ?? ""),
       };
     }
 
-    if (job.status === "skipped" || job.status === "cancelled" || job.status === "dlq") {
+    if (ENDED.includes(job.status)) {
       return {
         provider,
         state: "skipped" as const,
         label,
         detail: job.skipReason ?? job.status,
         answered: false,
-        usageLimited: USAGE_LIMIT_NOTE.test(job.skipReason ?? ""),
       };
     }
 
@@ -212,7 +234,6 @@ export function buildReviewerLanes(
           label,
           detail: emptyProviderDetail(job, provider, now),
           answered: false,
-          usageLimited: usageLimitNote(job, provider),
         };
       }
       return { provider, state: "waiting", label, detail: "local in the race", answered: false };
@@ -223,15 +244,13 @@ export function buildReviewerLanes(
     }
     const progress=job.providerProgress?.[provider];
     if(progress) {
-      // The flag comes from the stage itself, never from the detail it is shown as.
-      return {provider,state:stageIs(progress.stage,"generating")?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false,
-        usageLimited:stageIs(progress.stage,"quota")};
+      return {provider,state:stageIs(progress.stage,"generating")?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false};
     }
     if (g === true) {
       return { provider, state: "waiting", label, detail: "Chrome task pending · submission not confirmed", answered: false };
     }
     if (g === false) {
-      return { provider, state: "empty", label, detail: emptyProviderDetail(job, provider, now), answered: false, usageLimited: usageLimitNote(job, provider) };
+      return { provider, state: "empty", label, detail: emptyProviderDetail(job, provider, now), answered: false };
     }
     if (job.status === "awaiting_chat" && claimed(job, now)) {
       return { provider, state: "waiting", label, detail: "Chrome claimed · waiting for JSON", answered: false };
@@ -249,7 +268,8 @@ export function buildReviewerLanes(
       detail: isChatProvider(provider) ? "waiting for Chrome" : "waiting",
       answered: false,
     };
-  });
+  };
+  return providers.map((provider) => ({ ...laneOf(provider), usageLimited: laneUsageLimited(job, provider) }));
 }
 
 export function laneTone(state: ReviewerLaneState): "ok" | "warn" | "danger" | "accent" | "muted" {

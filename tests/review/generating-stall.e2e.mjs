@@ -204,3 +204,25 @@ test('runner: an expired lease ends the review leg as a stalled result with the 
   assert.equal(result.code,'stalled');assert.equal(result.ok,false);
   assert.equal(result.progress.events.at(-1).stage,'lease_expired_generating');
 });
+// Field B after the verdict: the worker delivers `stalled`, then asks to close. The Stop that never
+// clears keeps the close unproven forever, so the page frees its managed slot and the tab is kept.
+const tabStatus=page=>page.evaluate(()=>new Promise(resolve=>runnerMessage({type:'ashlar-tab-status'},null,resolve)));
+async function stalledUnderStop(t){
+  const page=await pageFor(t,user);await page.evaluate(stop(true));await runViaRunner(page);
+  await page.clock.fastForward(29.5*MIN);await mount(page,'<p></p>',{done:false});await page.clock.runFor(2400);
+  await page.clock.runFor(16*MIN);
+  assert.equal((await page.evaluate(()=>message('ashlar-harvest'))).code,'stalled');
+  assert.equal((await tabStatus(page)).released,false,'the harvest alone never releases the slot');
+  return page;
+}
+test('runner: a stalled leg under a Stop that never clears is kept with its managed slot freed',async t=>{
+  const page=await stalledUnderStop(t);
+  const close=await page.evaluate(()=>message('ashlar-can-close'));t.diagnostic(JSON.stringify({canClose:close.canClose,reason:close.reason}));
+  assert.equal(close.canClose,false,'Stop is still visible: no close');assert.equal(close.reason,'stalled');
+  assert.equal((await tabStatus(page)).released,true,'the kept tab no longer counts against tab capacity');
+});
+test('runner: a stalled leg whose Stop has cleared still closes as complete',async t=>{
+  const page=await stalledUnderStop(t);await page.evaluate(stop(false));
+  const close=await page.evaluate(()=>message('ashlar-can-close'));
+  assert.equal(close.canClose,true);assert.equal(close.reason,'complete');assert.equal((await tabStatus(page)).released,false);
+});

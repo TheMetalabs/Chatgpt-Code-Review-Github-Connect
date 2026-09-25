@@ -944,9 +944,12 @@ function installReviewRunner(name, run) {
         Boolean((captured || native) && bound?.root && !replyDoneVisible(bound.root));
       // User follow-ups/navigation transfer the tab back to the user. Do not close it.
       const hasDraft = Boolean(composerDraftText());
-      if (!pending && (!unchanged || hasDraft)) releaseManagedSlot(state);
+      // A leg the generating lease failed (#87) under a Stop that never clears can never prove a
+      // close: the tab is kept, and its managed slot freed so it stops holding tab capacity.
+      const stalledBusy = !pending && unchanged && !hasDraft && busyNow && state.result?.code === "stalled";
+      if (!pending && (!unchanged || hasDraft || stalledBusy)) releaseManagedSlot(state);
       reply({ok: true, canClose: !pending && unchanged && !busyNow && !hasDraft,
-        reason: pending ? "pending" : !unchanged || hasDraft ? "repurposed" : busyNow ? "pending" : "complete",
+        reason: pending ? "pending" : !unchanged || hasDraft ? "repurposed" : stalledBusy ? "stalled" : busyNow ? "pending" : "complete",
         url: globalThis.location?.href || ""});
       return;
     }

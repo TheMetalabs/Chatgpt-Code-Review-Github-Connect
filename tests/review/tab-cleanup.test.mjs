@@ -81,6 +81,18 @@ test('navigate-away and reused numeric tab IDs are never auto-closed',async()=>{
     await b.tick();assert.equal(b.closedTabs.length,0,mode);
   }
 });
+test('a review leg that stalled under a stuck Stop keeps its tab and retires (#87)',async()=>{
+  const j=work();Object.assign(j.states.chatgpt,{delivered:true,cleanupPending:true,outcome:{ok:false,code:'stalled',error:'ChatGPT answer unchanged for 15 min without completion controls'}});
+  let released=false;
+  const b=scenario([j],{handler:(id,msg)=>{
+    if(msg.type==='ashlar-can-close'){released=true;return {ok:true,jobId:'A',runId:'A-chatgpt',provider:'chatgpt',canClose:false,reason:'stalled',url:'https://chatgpt.com/c/A'};}
+    return {ok:true,ownershipProtocol:1,jobId:'A',runId:'A-chatgpt',provider:'chatgpt',released,url:'https://chatgpt.com/c/A'};
+  }});
+  await b.tick();
+  assert.equal(b.closedTabs.length,0,'never closed while Stop is visible');assert.ok(b.tabs.has(10));
+  assert.equal(b.local.state.pendingReviewJobs.A,undefined,'the leg retires instead of waiting forever for a close');
+  assert.equal((await b.context.tabCapacityReport({})).managedTabs,0,'the kept tab holds no tab capacity');
+});
 test('manual close tracking ignores unrelated tabs and completed auto-cleanup leaves no markers',async()=>{
   const b=scenario();for(let i=1000;i<1100;i++)await b.closeTab(i);
   assert.equal(Object.keys(b.local.state).filter(k=>k.startsWith('ashlar:closed:')).length,0);

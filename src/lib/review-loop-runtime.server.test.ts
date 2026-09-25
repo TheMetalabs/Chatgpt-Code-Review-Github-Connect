@@ -2159,6 +2159,23 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.equal(escalations(f.posted).length, 0);
   });
 
+  it("the restart's own review is never taken for a stale one: its start anchors the session, whatever this host's clock says", async (t) => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    f.deps.now = () => Date.parse("2025-12-31T11:58:00Z"); // this host's clock runs behind GitHub's
+    const hold = holdFirst(t, f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+    f.issues.push(recorded("apply", "alice", "2025-12-31T12:00:00Z")); // harbor recorded the restart at admission
+    const restart = job({ id: "job-B", thread: { kind: "mention", commentId: 3, userText: "/review-loop apply", loop: { kind: "start", mode: "apply" }, eventAt: "2025-12-31T12:00:00Z" } });
+    const b = run(f, "apply", ENV_ON, restart);
+    hold.release();
+    const [ra, rb] = await settles(Promise.all([a, b]));
+    assert.deepEqual(ra, { ran: false, reason: NEWER });
+    assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "applied", `the restarted round runs: ${JSON.stringify(rb)}`);
+    assert.equal(f.committed, true);
+  });
+
   it("a waiting restart whose start record harbor could not post, replaced by a plain review: the replacing step records it and runs the round", async (t) => {
     const f = fakeDeps({ start: "apply", rounds: [3] });
     const hold = holdFirst(t, f);

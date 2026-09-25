@@ -1,13 +1,16 @@
 /**
  * The control-write MATRIX (#79 K1): every way a control comment is written (11 entry paths over
- * the 4 control kinds) × what its POST did × what the list shows × what happens next, checked
- * against what the loop owes a human:
+ * the 4 control kinds) × what its POST did × what the list shows × what happens next — and, for a
+ * continuation or handoff, × how its session's anchor start is known (listed, lagging, lost) × a
+ * peer start in the anchor's second (none, before or after the write) — checked against what the
+ * loop owes a human:
  *   I1 exactly once — a write that may have landed is never POSTed again (≤ 1 row);
  *   I2 never silent — an unresolved result is always logged (never a SILENT_REASONS exit);
  *   I3 closed outcome — each entry point reports the outcome the cell implies;
  *   I4 reconcile — a row that shows up later confirms the write: one event, no leftover stand-in;
  *      and a later read that lags behind that row again still shows the write once, and the same
- *      session (a replica behind the one that listed it);
+ *      session (a replica behind the one that listed it — and behind the session's start records,
+ *      so the anchor may move to another start of its second);
  *   I5 read-your-writes — the loop acts on its own write before the list shows it;
  *   I6 a newer session is never ended by an older record — also one started in the same second
  *      as the older write's POST (GitHub orders events at one-second resolution);
@@ -40,7 +43,7 @@ import {
   type LoopRuntimeDeps,
   type LoopStepResult,
 } from "./review-loop-runtime.server.ts";
-import type { LoopEvent } from "./review-loop-session.ts";
+import { sessionRef, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
 
 const BOT = "ashlar-bot-review-loop[bot]";
 const HEAD = "a".repeat(40); // the reviewed head
@@ -87,8 +90,16 @@ type Later =
   | "push"
   | "moved"
   | "stop-restart";
+/** How the session's anchor start is known (a continuation or handoff cell): alice's start record
+ * listed from the first read (row 1); stored with its response lost and the call's reads behind
+ * the session's start records (an id-less stand-in, then listed); or lost (an id-less stand-in for
+ * the life of the process — a read that lists bob's record anchors there, one behind it at hers). */
+type Anchor = "listed" | "lagging" | "lost";
+/** bob's start in alice's second — a re-issue of her session, whose record a read may list first
+ * and so anchor there — recorded before the write's call or after it. */
+type Peer = "none" | "before" | "after";
 type Phase = "call" | "view" | "again" | "follow";
-type Cell = { via: Via; write: Write; list: List; later: Later };
+type Cell = { via: Via; write: Write; list: List; later: Later; anchor: Anchor; peer: Peer };
 type Result = ControlResult | LoopStepResult;
 /** posted / exists / unknown / rejected as the entry point reports it; `ran` a step that ran
  * (the self-heal); `resolved` a step result that needs nothing more (posted and exists collapse). */
@@ -110,6 +121,8 @@ const VIAS: Via[] = [
 const WRITES: Write[] = ["success", "rejected", "unknown-landed", "unknown-lost"];
 const LISTS: List[] = ["normal", "lagging", "failing"];
 const LATERS: Later[] = ["redelivery", "newer-start", "same-second-start", "25h", "row-appears", "row-relapses", "push", "moved", "stop-restart"];
+const ANCHORS: Anchor[] = ["listed", "lagging", "lost"];
+const PEERS: Peer[] = ["none", "before", "after"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
@@ -120,6 +133,11 @@ function applies(via: Via, later: Later): boolean {
   if (later === "push" || later === "moved") return kindOf(via) === "handoff";
   return true;
 }
+/** Only a continuation or handoff names its session (its anchor start). */
+const sessionScoped = (via: Via) => kindOf(via) === "continue" || kindOf(via) === "handoff";
+/** The call's reads are behind the session's start records (from the first one stored). */
+const callBehindStarts = (c: Cell) => c.anchor === "lagging";
+
 /** The head a continuation under test is for. */
 const CONTINUE_HEAD: Partial<Record<Via, string>> = {
   "continue:push": PUSHED,
@@ -213,8 +231,13 @@ class World {
   /** The first comment id at or after the write under test's first POST. */
   private writeFrom?: number;
   committed = false;
+  /** The session the write under test is emitted in, as the call reads it. */
+  callSession?: SessionRef;
   private nextId = 1;
   private lagFrom = Infinity;
+  /** The list is behind the session's start records (from the first one stored). */
+  private startsHidden = false;
+  private firstStartId?: number;
   private failing = false;
   private hook?: () => Promise<void>;
   readonly deps: LoopRuntimeDeps;
@@ -228,14 +251,14 @@ class World {
     this.ref = { owner: "o", repo: "r", pr };
     const { via } = cell;
     if (this.sameSecond()) this.clock = T0 + 250; // a sub-second clock: attempts are not on a second boundary
-    if (kindOf(via) !== "start") this.store(BOT, startComment({ mode: this.mode(), by: "alice", at: ALICE_AT }), ALICE_AT);
+    if (kindOf(via) !== "start" && cell.anchor === "listed") this.store(BOT, startComment({ mode: this.mode(), by: "alice", at: ALICE_AT }), ALICE_AT);
     const rounds = via === "handoff:stuck" ? [5, 4, 3, 2, 2, 2] : [3];
     rounds.forEach((total, i) => this.reviews.push({ head: i === rounds.length - 1 ? HEAD : String(i).repeat(40), total, at: reviewDay(i) }));
     const read = () => {
       if (this.failing) throw new Error("list 502");
     };
     const gh: LoopRuntimeDeps["gh"] = {
-      listIssueComments: async () => (read(), this.issues.filter((r) => r.id < this.lagFrom).map((r) => ({ ...r }))),
+      listIssueComments: async () => (read(), this.issues.filter((r) => r.id < this.visibleBefore()).map((r) => ({ ...r }))),
       listPullReviews: async () => (read(), this.reviews.map((r) => ({ userLogin: BOT, body: `<!-- ashlar-findings total=${r.total} -->`, commitId: r.head, submittedAt: r.at }))),
       listReviewComments: async () => (read(), this.reviews.map((r) => ({ userLogin: BOT, path: "src/a.ts", commitId: r.head, createdAt: r.at, body: "finding" }))),
       createIssueComment: async (_t, o) => this.create(o.body),
@@ -270,6 +293,35 @@ class World {
     this.deps = Object.assign(base, clock);
   }
 
+  /** The first row id a read does not list (the list is prefix-consistent). */
+  private visibleBefore(): number {
+    return Math.min(this.lagFrom, this.startsHidden ? (this.firstStartId ?? Infinity) : Infinity);
+  }
+
+  /** The session's anchor start (alice's) as the cell has it, and bob's peer start before the call. */
+  async setup(): Promise<void> {
+    if (!sessionScoped(this.cell.via)) return;
+    this.startsHidden = callBehindStarts(this.cell);
+    if (this.cell.anchor !== "listed") await startLoop("t", { ...this.ref, actor: "alice", mode: this.mode(), at: ALICE_AT }, settings(this.mode()), this.deps, ENV);
+    if (this.cell.peer === "before") await this.startPeer();
+  }
+
+  /** After the call: the list lists the session's start records; bob's peer start after the write
+   * (recorded whatever the list does meanwhile). */
+  async afterCall(): Promise<void> {
+    this.startsHidden = false;
+    if (this.cell.peer !== "after") return;
+    const failing = this.failing;
+    this.failing = false;
+    await this.startPeer();
+    this.failing = failing;
+  }
+
+  private async startPeer(): Promise<void> {
+    const r = await startLoop("t", { ...this.ref, actor: "bob", mode: this.mode(), at: ALICE_AT }, settings(this.mode()), this.deps, ENV);
+    assert.equal(r.posted, true, `bob's start: ${JSON.stringify(r)}`);
+  }
+
   /** GitHub stamps a row in the second its request left (not a second later), and carol's newer
    * start is in that same second: only GitHub's 1 s resolution orders the two. */
   sameSecond(): boolean {
@@ -298,10 +350,10 @@ class World {
     }
   }
 
-  /** The journal key of the write under test (alice's session: her start record is row 1). */
+  /** The journal key of the write under test (in the session its call read). */
   key(): string {
     const ref = this.ref;
-    const session = { at: ALICE_AT, seq: 1, by: "alice", mode: this.mode() };
+    const session = this.callSession;
     switch (kindOf(this.cell.via)) {
       case "start":
         return controlKey({ kind: "start", ref, by: "alice", at: ALICE_AT, mode: "suggest" });
@@ -343,6 +395,15 @@ class World {
     const at = this.sameSecond() ? second(sentAt) : iso(this.clock);
     const refused = REFUSED_CONTINUATION[this.cell.via];
     if (refused && canonicalContinuation(body, { authoredByBot: true })?.head === refused) throw writeError("rejected", 422);
+    const start = parseStartMarker(body, { authoredByBot: true });
+    if (start && sessionScoped(this.cell.via) && isoMs(start.at) === isoMs(ALICE_AT)) {
+      // the session's start records: alice's follows the cell's anchor, bob's lands
+      if (start.by === "alice" && this.cell.anchor === "lost") throw writeError("unknown", 502);
+      const row = this.store(BOT, body, at);
+      this.firstStartId ??= row.id;
+      if (start.by === "alice" && this.cell.anchor === "lagging") throw writeError("unknown", 502);
+      return row;
+    }
     if (!this.underTestPost(body)) return this.store(BOT, body, at);
     if (this.underTest.length === 0) {
       this.firstAttemptMs = sentAt;
@@ -377,12 +438,15 @@ class World {
   catchUp(): void {
     this.lagFrom = Infinity;
     this.failing = false;
+    this.startsHidden = false;
   }
 
-  /** A read served by a replica behind the write under test again, after one listed its row. */
+  /** A read served by a replica behind the write under test again, after one listed its row —
+   * and, where the session's start records were not always listed, behind those too. */
   relapse(): void {
     this.failing = false;
     this.lagFrom = this.writeFrom ?? this.nextId;
+    this.startsHidden = this.cell.anchor !== "listed";
   }
 
   async injectCarol(): Promise<void> {
@@ -502,8 +566,10 @@ function norm(via: Via, e: Cls, when: "first" | "again"): Cls {
 
 function expectFirst(c: Cell): Cls {
   if (c.via === "start:self-heal" && c.list === "failing" && c.write !== "rejected") return "unreadable"; // re-reads after the emit
-  // a POST that answered "unknown" and whose row the re-check lists was posted by this call
-  const e: Cls = c.write === "success" || (c.write === "unknown-landed" && c.list === "normal") ? "posted" : c.write === "rejected" ? "rejected" : "unknown";
+  // a POST that answered "unknown" and whose row the re-check lists was posted by this call (a
+  // list behind the session's start records is behind the write's row too)
+  const listed = c.list === "normal" && !callBehindStarts(c);
+  const e: Cls = c.write === "success" || (c.write === "unknown-landed" && listed) ? "posted" : c.write === "rejected" ? "rejected" : "unknown";
   return norm(c.via, e, "first");
 }
 
@@ -571,7 +637,11 @@ async function assertReconciled(w: World, relapse: boolean): Promise<void> {
   w.relapse();
   const behind = (await w.eventsOfWrite()).length;
   assert.equal(behind, expected, `I4: ${behind} events for the write in a read behind its listed row`);
-  assert.deepEqual(await w.session(), listed, "I4: a read behind the listed row changed the session");
+  // the same session — whichever start of its second the read anchors at
+  const identity = (s: LoopSession) => [s.active, isoMs(s.startIso), s.mode, s.endedBy, isoMs(s.endedAt)];
+  const relapsed = await w.session();
+  assert.deepEqual(identity(relapsed), identity(listed), `I4: a read behind the listed row changed the session: ${JSON.stringify([listed, relapsed])}`);
+  if (w.cell.anchor === "listed" && w.cell.peer === "none") assert.deepEqual(relapsed, listed, "I4: a read behind the listed row changed the session");
 }
 
 /** I2 across kinds: the session a handoff ended is read by the next head's handlers too. */
@@ -633,11 +703,14 @@ async function runCell(c: Cell, pr: number): Promise<void> {
   Date.now = () => w.clock; // defeats any wall-clock TTL in the 25 h cells
   console.info = () => {}; // the step trace is noise here
   try {
+    await w.setup();
+    if (sessionScoped(c.via)) w.callSession = sessionRef(await w.session());
     const first = await w.enter();
     const cls = classify(w, first);
     assert.equal(cls, expectFirst(c), `I3 first: ${JSON.stringify(first)}`);
     assertLogged(w, first, cls, "first");
     w.disarm();
+    await w.afterCall();
     if (w.newerStart()) {
       await w.injectCarol(); // a success had no backoff to inject it in
       await assertNewerSessionLives(w);
@@ -668,15 +741,18 @@ async function runCell(c: Cell, pr: number): Promise<void> {
   }
 }
 
-describe("control writes: kind × write result × list read × later event (#79 K1)", () => {
+describe("control writes: kind × write result × list read × later event (× anchor start × peer start) (#79 K1)", () => {
   let row = 0;
   for (const via of VIAS)
     for (const write of WRITES)
       for (const list of LISTS)
-        for (const later of LATERS) {
-          if (!applies(via, later)) continue;
-          const cell = { via, write, list, later };
-          const pr = 1000 + row++;
-          it(`${via} | ${write} | ${list} | ${later}`, () => runCell(cell, pr));
-        }
+        for (const later of LATERS)
+          for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
+            for (const peer of sessionScoped(via) ? PEERS : (["none"] as const)) {
+              if (!applies(via, later)) continue;
+              const cell = { via, write, list, later, anchor, peer };
+              const pr = 1000 + row++;
+              const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
+              it(`${via} | ${write} | ${list} | ${later}${session}`, () => runCell(cell, pr));
+            }
 });

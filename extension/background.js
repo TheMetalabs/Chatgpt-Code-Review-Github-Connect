@@ -114,6 +114,43 @@ async function rememberClosedTab(tabId, info) {
   await chrome.storage.session.remove([key]);
 }
 
+/** Chrome can swap a tab's page into a new tab id (a discard while its WebContentsDiscard study is
+ * off, a prerender activation): onReplaced(added, removed) fires and onRemoved does not, so every
+ * record keyed by the old id names a tab that is gone while the leg's tab lives on under the new one.
+ * Its cleanup then took it for absent and never closed it, and an undispatched leg lost the record
+ * that lets it send into the tab it created. The leg follows its tab: its state.tabId (recorded as a
+ * tab_rekeyed step), the session ownership record, a preserved backstop and a fix delivery record
+ * move to the new id. A leg that already released its tab (cleanupDone: closed or preserved) is left
+ * as it is: following the tab would not make it Ashlar's again. */
+async function rekeyReplacedTab(addedTabId, removedTabId) {
+  if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return;
+  invalidateTabInventory(removedTabId);
+  invalidateTabInventory(addedTabId);
+  const jobs = await workerJobs((await settings()).origin);
+  let moved = false;
+  for (const job of Object.values(jobs)) {
+    for (const provider of job.providers || []) {
+      const state = job.states?.[provider];
+      if (state?.tabId !== removedTabId || state.cleanupDone) continue;
+      state.tabId = addedTabId;
+      workerStep(job, provider, "tab_rekeyed");
+      moved = true;
+    }
+  }
+  const session = await chrome.storage.session.get(null);
+  const owned = session[OWNED_PREFIX + removedTabId], moves = {};
+  if (owned) moves[OWNED_PREFIX + addedTabId] = owned;
+  for (const [key, value] of Object.entries(session)) {
+    if (key.startsWith(PRESERVED_PREFIX) && value?.tabId === removedTabId) moves[key] = {...value, tabId: addedTabId};
+  }
+  if (Object.keys(moves).length) await chrome.storage.session.set(moves);
+  if (owned) await chrome.storage.session.remove([OWNED_PREFIX + removedTabId]);
+  if (Object.values(await fixDeliveries()).some(record => record.tabId === removedTabId)) {
+    await updateFixDeliveries(all => { for (const record of Object.values(all)) if (record.tabId === removedTabId) record.tabId = addedTabId; });
+  }
+  if (moved) await saveJobs(jobs);
+}
+
 async function rememberOwnedTab(job, provider, closing = false) {
   const state = job.states[provider];
   if (state.tabId) await chrome.storage.session.set({[OWNED_PREFIX + state.tabId]: {
@@ -2184,6 +2221,8 @@ chrome.tabs.onUpdated?.addListener((id, change) => {
   if(change.url || change.status)invalidateTabInventory(id);
 });
 chrome.tabs.onRemoved.addListener((id, info) => void rememberClosedTab(id, info));
+// Top level like the others, so a replace (never followed by onRemoved) also wakes a stopped worker.
+chrome.tabs.onReplaced.addListener((added, removed) => void rekeyReplacedTab(added, removed).catch(() => {}));
 chrome.runtime.onInstalled.addListener(loop);
 chrome.runtime.onStartup.addListener(loop);
 void clearCommittedMaintenanceOnWorkerStart();

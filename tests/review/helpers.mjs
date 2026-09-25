@@ -42,13 +42,14 @@ export function content(provider = 'chatgpt', persisted = new Map()) {
   return { context, listeners, message(msg) { let reply; listeners[0](msg, {}, r => { reply = r; }); return reply; } };
 }
 export function background({ local = storage({ origin: 'http://bridge', token: 'token' }), session = storage(), handler, tabs = new Map(), api } = {}) {
-  const messages = [], calls = [], closedTabs = []; const removed = [];
+  const messages = [], calls = [], closedTabs = []; const removed = [], replaced = [];
   let nextTab = Math.max(100, ...tabs.keys());
   const chrome = {
     storage: { local, session }, runtime: { lastError: null },
     alarms: { create: async () => {}, clear: async () => {} },
     tabs: {
       onRemoved: { addListener: fn => removed.push(fn) },
+      onReplaced: { addListener: fn => replaced.push(fn) },
       remove: async id => { if (!tabs.has(id)) throw new Error(`No tab with id: ${id}.`); closedTabs.push(id); tabs.delete(id); for (const fn of removed) await fn(id, {isWindowClosing:false}); },
       query: async () => [...tabs.values()],
       get: async id => { if (!tabs.has(id)) throw new Error(`No tab with id: ${id}.`); return tabs.get(id); },
@@ -71,10 +72,14 @@ export function background({ local = storage({ origin: 'http://bridge', token: '
   const code = source('extension/background.js');
   vm.runInContext(code.slice(0, code.indexOf('\nchrome.alarms.onAlarm.addListener')), context, { filename: 'background.js' });
   if (context.rememberClosedTab) chrome.tabs.onRemoved.addListener(context.rememberClosedTab);
+  if (context.rekeyReplacedTab) chrome.tabs.onReplaced.addListener(context.rekeyReplacedTab);
   context.waitTab = async () => {};
   let sleeps = 0;
   context.sleep = async () => { if (++sleeps > 8) throw new Error("test-only polling guard: tick did not return"); };
   const rpc = context.api;
   context.api = async (path, body, origin, signal) => { calls.push({ path, ...body }); return api ? api(path, body, origin, signal) : { ok: true, job: null }; };
-  return { context, rpc, local, session, tabs, messages, calls, closedTabs, chrome, closeTab: async id => { tabs.delete(id); for (const fn of removed) await fn(id, {isWindowClosing:false}); }, tick: () => context.tick() };
+  return { context, rpc, local, session, tabs, messages, calls, closedTabs, chrome, closeTab: async id => { tabs.delete(id); for (const fn of removed) await fn(id, {isWindowClosing:false}); },
+    // Chrome swapped tab `removedId`'s page into `tab` (a new id): onReplaced(added, removed), no onRemoved.
+    replaceTab: async (removedId, tab) => { tabs.delete(removedId); tabs.set(tab.id, tab); for (const fn of replaced) await fn(tab.id, removedId); },
+    tick: () => context.tick() };
 }

@@ -365,3 +365,87 @@ test('review: a durably archived leg whose tab is gone releases it as tab_lost',
   assert.equal(jobs['job-A'].states.chatgpt.cleanupDone, true, 'released: repair no longer needs the tab');
   assert.deepEqual([...stagesOf(jobs['job-A'].states.chatgpt.workerEvents)].filter(stage => /^worker:tab_/.test(stage)), ['worker:tab_lost']);
 });
+
+// ── onReplaced (#82 step 0): Chrome can swap a tab's page into a new tab id (a discard while its
+// WebContentsDiscard study is off): onReplaced(added, removed) fires and onRemoved does not. The leg
+// follows its tab; a leg that already released its tab is not revived by it.
+/** A discarded (or not yet loaded) tab holds no page: nothing answers in it and nothing is injected. */
+function noPageWhileDiscarded(b) {
+  const send = b.chrome.tabs.sendMessage;
+  b.chrome.tabs.sendMessage = (id, msg, cb) => {
+    if (!b.tabs.get(id)?.discarded) return send(id, msg, cb);
+    b.messages.push({id, ...msg});b.chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'};cb();b.chrome.runtime.lastError = null;
+  };
+  b.chrome.scripting.executeScript = async ({target}) => { if (b.tabs.get(target.tabId)?.discarded) throw new Error('Cannot access contents of the page'); };
+}
+test('the onReplaced listener is registered at the worker\'s top level (a replace never fires onRemoved)', () => {
+  assert.match(source('extension/background.js'), /^chrome\.tabs\.onReplaced\.addListener\(\(added, removed\) => void rekeyReplacedTab\(added, removed\)/m);
+});
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a secured leg whose tab Chrome replaced on discard follows it: woken under the new id, then closed`, async () => {
+    const b = worker(leg(kind, {...secured(kind), conversation: TEMP, pageUrl: TEMP}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: blankVerdict});
+    noPageWhileDiscarded(b);
+    const reloads = [];
+    b.chrome.tabs.reload = async id => { reloads.push(id); Object.assign(b.tabs.get(id), {discarded: false, status: 'loading'}); };
+    await b.replaceTab(10, {id: 11, url: TEMP, status: 'unloaded', discarded: true});
+    const state = b.pending().states.chatgpt;
+    assert.equal(state.tabId, 11, 'the leg follows its tab');
+    assert.ok(stagesOf(state.workerEvents).includes('worker:tab_rekeyed'), 'the replace reaches history');
+    assert.ok(b.session.state['ashlar:tab:11'] && !b.session.state['ashlar:tab:10'], 'the ownership record moved with it');
+    await b.tick();
+    assert.deepEqual(reloads, [11], 'woken: the tab is still the one this browser session created for the leg');
+    b.tabs.get(11).status = 'complete';
+    await b.tick();
+    assert.deepEqual(b.closedTabs, [11], 'closed on its page\'s verdict, not leaked');
+    assert.equal(b.pending(), undefined);
+    assert.ok(uploaded(b).includes('worker:tab_closed'), `${uploaded(b)}`);
+  });
+  test(`${kind}: an undispatched leg whose tab Chrome replaced sends its prompt into that tab, not a new one`, async () => {
+    // An unbound page answers with no binding: only the creation record proves the tab is the leg's.
+    const unbound = (_id, m) => (m.type === 'ashlar-run' ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle', jobId: '', runId: '', provider: 'chatgpt'});
+    const b = worker(leg(kind, {started: false}), {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: unbound});
+    await b.replaceTab(10, {id: 11, url: TEMP, status: 'complete'});
+    await b.tick();
+    const runs = b.messages.filter(m => m.type === 'ashlar-run');
+    assert.deepEqual(runs.map(m => [m.id, m.prompt]), [[11, 'PROMPT']], 'dispatched once, into the replaced tab');
+    assert.equal(b.pending().states.chatgpt.started, true);
+    assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');
+  });
+}
+test('fix: a created fix delivery record follows its tab (it keeps proving that tab)', async () => {
+  const b = worker(leg('fix', {}, {deliveryId: 'delivery-A'}), {session: createdHere('fix')});
+  b.local.state['ashlar:fixDeliveries'] = {'fix-A': {deliveryId: 'delivery-A', provider: 'chatgpt', phase: 'created', tabId: 10, at: Date.now()}};
+  await b.replaceTab(10, {id: 11, url: URL_TAB, status: 'complete'});
+  assert.equal(b.local.state['ashlar:fixDeliveries']['fix-A'].tabId, 11);
+});
+test('review: a leg that already released its tab is not revived by a replace; its preserved backstop follows the tab', async () => {
+  // Released while its repair continues: the original is archived, the tab was kept for the user.
+  const released = {sourceCapture: archived, cleanupDone: true, cleanupPending: false, preserveCause: 'draft',
+    workerSequence: 1, workerEvents: [{source: 'worker', sequence: 1, stage: 'tab_preserved', at: 1}]};
+  const backstop = 'ashlar:preserved:job-A:chatgpt:run-A';
+  const b = worker(leg('review', released, {captureProtocol: 1}), {session: storage({[backstop]: {tabId: 10}}),
+    handler: (_id, m) => (m.type === 'ashlar-tab-status' ? {ok: true, ownershipProtocol: 1, jobId: 'job-A', runId: 'run-A', provider: 'chatgpt', released: false, url: URL_TAB} : {ok: true})});
+  await b.replaceTab(10, {id: 11, url: URL_TAB, status: 'complete'});
+  const state = b.pending().states.chatgpt;
+  assert.equal(state.tabId, 10, 'a released leg keeps its record as it was');
+  assert.deepEqual(state.workerEvents.map(e => e.stage), ['tab_preserved'], 'no tab_rekeyed after its terminal step');
+  assert.equal(b.session.state['ashlar:tab:11'], undefined, 'no ownership record is created for the new id');
+  assert.deepEqual(b.session.state[backstop], {tabId: 11}, 'the preserved backstop names the tab it keeps');
+  await b.tick();
+  assert.deepEqual(b.messages.filter(m => m.type !== 'ashlar-tab-status' && m.type !== 'ashlar-fix-cancel'), [], 'the kept tab is never asked to run or collect');
+  assert.deepEqual(b.closedTabs, []);
+  await b.context.refreshTabInventory();
+  assert.ok(await until(() => b.messages.some(m => m.id === 11 && m.type === 'ashlar-tab-status')));
+  for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await b.context.tabCapacityReport({})).orphanTabs, 0, 'the kept binding never becomes an orphan holding capacity');
+});
+test('a leg whose tab the worker closed is not revived by a late replace naming that id; its sibling is untouched', async () => {
+  const job = {...leg('review', {...secured('review'), cleanupDone: true, cleanupPending: false, closeRequested: true, closeIssued: true,
+    workerSequence: 1, workerEvents: [{source: 'worker', sequence: 1, stage: 'tab_closed', at: 1}]}), providers: ['chatgpt', 'grok']};
+  job.states.grok = {tabId: 20, started: true, runId: 'run-B'};
+  const b = worker(job, {tab: {id: 20, url: 'https://grok.com/c/managed', status: 'complete'}});
+  await b.replaceTab(10, {id: 11, url: URL_TAB, status: 'complete'});
+  const states = b.pending().states;
+  assert.equal(states.chatgpt.tabId, 10);assert.deepEqual(states.chatgpt.workerEvents.map(e => e.stage), ['tab_closed']);
+  assert.equal(states.grok.tabId, 20);assert.equal(states.grok.workerEvents, undefined);
+});

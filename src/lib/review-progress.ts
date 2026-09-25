@@ -35,6 +35,7 @@ export const PROGRESS_LABELS = {
     cleanup_pending: "Response secured · tab cleanup pending",
     tab_closed: "Review tab closed",
     tab_lost: "Tab gone · Ashlar did not close it (closed by the user or browser, or never opened)",
+    tab_rekeyed: "Chrome replaced the tab under a new tab id · the run follows it",
     tab_preserved: "Tab preserved · see the preserve cause",
     preserve_navigated: "Tab preserved · the user moved it to another conversation or site",
     preserve_user_turn: "Tab preserved · the user sent a follow-up turn",

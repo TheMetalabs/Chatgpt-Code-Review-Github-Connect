@@ -350,14 +350,30 @@ function nameOnly(level, k, container, path) {
     (k === 0 || isPunct(before, ';') || before.open === '{' || isWord(before, 'static'));
 }
 
+/** Whether the bracket group holding the level at the end of `path` is a destructuring pattern, whose keys
+ * read the value it takes apart: one followed by `=`, `of` or `in`, an element of a function's, arrow's
+ * or catch's parameter list, or one nested in a pattern. An object literal's keys define properties. */
+function destructuring(path) {
+  const holder = path.at(-1), outer = path.at(-2);
+  if (!holder) return false;
+  const {tokens, index} = holder, after = tokens[index + 1], group = outer?.tokens[outer.index];
+  if (isPunct(after, '=') || isWord(after, 'of') || isWord(after, 'in')) return true;
+  if (group?.open === '(') {
+    const element = index === 0 || isPunct(tokens[index - 1], ',') || isPunct(tokens[index - 1], '...');
+    return element && (isPunct(outer.tokens[outer.index + 1], '=>') || outer.tokens[outer.index + 1]?.open === '{');
+  }
+  return (group?.open === '{' || group?.open === '[') && destructuring(path.slice(0, -1));
+}
+
 /** Whether `level[k]` (inside the levels `path`) refers to the global object: one of GLOBAL_NAMES that
  * names a variable (nameOnly) the code does not bind where it stands (a declaration, a parameter or a
  * catch binding of that name makes it a local), with `this` anywhere but in a class body (strict code,
  * whose `this` is never the global object); or a `defaultView` property (a document's window) however
- * its name is spelled. */
+ * its name is spelled, read as a member or by a destructuring pattern (an object literal's key, a class
+ * field or a label of that name reads nothing). */
 function globalReference(level, k, container, path) {
-  const token = level[k];
-  if (propertyName(level, k, container) === 'defaultView') return true;
+  const token = level[k], member = computedMember(level, k) || isPunct(level[k - 1], '.') || isPunct(level[k - 1], '?.');
+  if (propertyName(level, k, container) === 'defaultView') return member || destructuring(path);
   if (token.kind !== 'word' || !GLOBAL_NAMES.has(token.text) || nameOnly(level, k, container, path)) return false;
   if (token.text === 'this') return !path.some(({tokens, index}) => classBody(tokens, index));
   return !boundLocally(path, level, k, token.text);
@@ -1310,6 +1326,14 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     ['const {defaultView: w} = document;\nw[name]("unlabelled_view");', global(1, 'defaultView'), called(2, '[name]')],
     ['const {"defaultView": w} = document;', global(1, '"defaultView"')],
     ['const {["defaultView"]: w} = document;', global(1, '["defaultView"]')],
+    // A parameter pattern, a for head's pattern, a nested pattern and an assignment pattern read it too.
+    ['function f({defaultView}) {}', global(1, 'defaultView')],
+    ['rows.map(({defaultView}) => defaultView);', global(1, 'defaultView')],
+    ['try {} catch ({defaultView}) {}', global(1, 'defaultView')],
+    ['for (const {defaultView} of docs) {}', global(1, 'defaultView')],
+    ['const [{defaultView}] = docs;', global(1, 'defaultView')],
+    ['const {a: {defaultView: w}} = doc;', global(1, 'defaultView')],
+    ['({defaultView} = document);', global(1, 'defaultView')],
     // The global object as a value can be searched for a recorder by any name.
     ['const g = globalThis;\ng[name]("unlabelled_alias");', global(1, 'globalThis'), called(2, '[name]')],
     ['Reflect.get(self, name)("unlabelled_lookup");', global(1, 'self')],
@@ -1370,6 +1394,10 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     'const box = {top: rect.top, window: 1}; node.parent[key] = rect.top + 1; const view = document.defaultView.innerWidth;\n' +
     'globalThis.recordReviewStep?.("optional_call"); const doc = "workerStep(job, provider, stage)"; note("steps", "Step");\n' +
     'note(window.this);'), []);
+  // A key named defaultView that an object literal, a class or a label defines reads no document's window.
+  assert.deepEqual(problems('const local = 1; const options = {defaultView: local}; const defaultView = 1; const more = {defaultView};\n' +
+    'class V { defaultView = 1; } const o = {defaultView() { return 1; }, "defaultView": 2, ["defaultView"]: 3}; f({defaultView: 1});\n' +
+    'function g(opts = {defaultView: 1}) {} if (ok) { defaultView: for (;;) break defaultView; }'), []);
   // A local of a global name is not the global object: a declaration (a pattern's too), a parameter (an
   // arrow's, a catch's, a function expression's own name), a for head's declaration, a method's name or
   // an object key; nor is `this` in a class body.

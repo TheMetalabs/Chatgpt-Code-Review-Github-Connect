@@ -22,6 +22,7 @@ import {
   startLoop,
   stopLoop,
   type LoopRuntimeDeps,
+  type LoopStepResult,
   type PostedLoopReview,
 } from "./review-loop-runtime.server.ts";
 
@@ -538,6 +539,99 @@ describe("an incomplete review owes its loop-error handoff durably (the INCOMPLE
     const r = await run(f, "apply", ENV_ON, job());
     assert.ok(r.ran && r.step === "fix", JSON.stringify(r));
     assert.equal(escalations(f.posted).length, 0);
+  });
+});
+
+describe("a not-clean review of the head a fix round is running for: the handoff it owes is never dropped", () => {
+  type Review = { body: string; commitId: string; submittedAt: string };
+  const incompleteJob = () => job({ id: "job-2", findings: [], reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: [] });
+  /** A second review of HEAD (an @-mention, say) is posted as incomplete between the fake's last post and
+   * its next one, and harbor fires that review's own loop step without awaiting it. */
+  const landIncomplete = (f: ReturnType<typeof fakeDeps>, reviews: Review[], mode: "suggest" | "apply") => {
+    reviews.push({ body: reviewSummaryBody(incompleteJob(), [], BOT), commitId: HEAD, submittedAt: `2026-02-01T00:00:${String(f.posted.length).padStart(2, "0")}.500Z` });
+    return runPostReviewLoop("t", incompleteJob(), sample, settings(mode), f.deps, ENV_ON);
+  };
+  const quiet = (r: LoopStepResult) => !r.ran && SILENT_REASONS.includes(r.reason);
+
+  for (const mode of ["suggest", "apply"] as const) {
+    it(`${mode}: it lands while the fix request runs, and the round ends by posting its handoff for the head, never as an operator stop`, async () => {
+      const reviews: Review[] = [];
+      const f = fakeDeps({ start: mode, rounds: [3], reviews });
+      let own: Promise<LoopStepResult> | undefined;
+      const requestFix = f.deps.requestFix;
+      f.deps.requestFix = (...a: Parameters<typeof requestFix>) => {
+        own ??= landIncomplete(f, reviews, mode);
+        return requestFix(...a);
+      };
+      const r = await run(f, mode);
+      assert.notEqual(!r.ran && r.reason, "loop stopped by operator", "never misreported as an operator stop");
+      assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+      const handoffs = escalations(f.posted);
+      assert.equal(handoffs.length, 1, "exactly one handoff");
+      assert.ok(handoffs[0].includes(`head=${HEAD}`), "for the head both reviews are of");
+      assert.ok(handoffs[0].includes(INCOMPLETE_RECOVERED_DETAIL));
+      assert.equal(f.committed, false, "nothing is committed past it");
+      assert.ok(!f.posted.some((b) => b.startsWith("### Ashlar fix agent")), "a moot round posts no report");
+      const ownStep = await own!;
+      assert.ok(quiet(ownStep), `the review's own step, run after the round, finds it settled: ${JSON.stringify(ownStep)}`);
+      assert.equal(escalations(f.posted).length, 1, "posted once");
+    });
+  }
+
+  it("suggest: it lands after the round's last check, while the suggestion posts: its own step waits for the round, then posts its own handoff", async () => {
+    const reviews: Review[] = [];
+    const f = fakeDeps({ rounds: [3], reviews });
+    let own: Promise<LoopStepResult> | undefined;
+    const create = f.deps.gh.createIssueComment;
+    f.deps.gh.createIssueComment = (t, o) => {
+      if (o.body.startsWith("### Ashlar fix agent — suggestion")) own ??= landIncomplete(f, reviews, "suggest");
+      return create(t, o);
+    };
+    const r = await run(f, "suggest");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested", JSON.stringify(r));
+    const ownStep = await own!;
+    assert.ok(ownStep.ran && ownStep.step === "escalated" && ownStep.reason === "loop-error", `never backed off as a step in flight: ${JSON.stringify(ownStep)}`);
+    const handoffs = escalations(f.posted);
+    assert.equal(handoffs.length, 1);
+    assert.ok(handoffs[0].includes(`head=${HEAD}`));
+    assert.match(handoffs[0], /this review is not a clean pass \(a reviewer did not run\)/, "with its own job's detail");
+  });
+
+  it("a review with findings still backs off from a step in flight for its head (one fix round per head)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], requestDelayMs: 20 });
+    const [a, b] = await Promise.all([run(f, "apply"), run(f, "apply")]);
+    assert.equal(f.prompts.length, 1);
+    assert.deepEqual([a, b].filter((x) => !x.ran), [{ ran: false, reason: "another loop step is in flight for this head" }]);
+  });
+
+  it("apply: it lands after the commit, before the continuation: its handoff is posted first, the report says the loop ended at it, and nothing continues", async () => {
+    const reviews: Review[] = [];
+    const f = fakeDeps({ start: "apply", rounds: [3], reviews });
+    let own: Promise<LoopStepResult> | undefined;
+    const gitDataApi = f.deps.gh.gitDataApi;
+    f.deps.gh.gitDataApi = (...a: Parameters<typeof gitDataApi>) => {
+      const git = gitDataApi(...a);
+      return {
+        ...git,
+        async updateBranchRef(...b: Parameters<typeof git.updateBranchRef>) {
+          await git.updateBranchRef(...b);
+          own ??= landIncomplete(f, reviews, "apply");
+        },
+      };
+    };
+    const r = await run(f, "apply");
+    assert.equal(f.committed, true);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    const handoffs = escalations(f.posted);
+    assert.equal(handoffs.length, 1);
+    assert.ok(handoffs[0].includes(`head=${HEAD}`), "for the not-clean review's head");
+    assert.ok(handoffs[0].includes(INCOMPLETE_RECOVERED_DETAIL));
+    assert.ok(!f.posted.some((b) => b.includes("ashlar-loop-continue")), "no continuation past it");
+    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+    assert.match(report, /The loop ended meanwhile \(the loop session ended at a review that is not a clean pass\): no further review is requested\./);
+    assert.doesNotMatch(report, /stopped/, "never reported as an operator stop");
+    assert.ok(f.posted.indexOf(handoffs[0]) < f.posted.indexOf(report), "the signal goes out before the report");
+    assert.ok(quiet(await own!), "its own step finds it settled");
   });
 });
 

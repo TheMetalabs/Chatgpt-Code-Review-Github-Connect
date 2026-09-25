@@ -156,6 +156,7 @@ const NO_SESSION = "no active loop session";
 const STOPPED_QUIET = "loop stopped by operator";
 const ENDED_BY_HANDOFF = "the loop session ended with a handoff";
 const ENDED_CONVERGED = "the loop session converged";
+const ENDED_NOT_CLEAN = "the loop session ended at a review that is not a clean pass";
 const NEWER_REQUEST = "superseded by a newer loop request (a new session, another starter, or apply downgraded to suggest)";
 /** NOT silent (logged): a concurrent handoff for this head outlived one backoff. */
 const HANDOFF_IN_FLIGHT = "a handoff for this head is still being posted by another loop step; this step did not run";
@@ -173,6 +174,7 @@ export const SILENT_REASONS: readonly string[] = [
   STOPPED_QUIET,
   ENDED_BY_HANDOFF,
   ENDED_CONVERGED,
+  ENDED_NOT_CLEAN,
   NEWER_REQUEST,
 ];
 
@@ -246,8 +248,8 @@ const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 // One loop step per PR head at a time (in-process): a second posted review of the same head
 // (re-request, redelivery) must not run a parallel fix round. Different heads never block each
 // other — the older one is superseded at its head checks. Cross-process coordination is a
-// NON-GOAL (single harbor instance; see the engine header).
-const inFlightSteps = new Set<string>();
+// NON-GOAL (single harbor instance; see the engine header). Each entry settles when its step ends.
+const inFlightSteps = new Map<string, Promise<void>>();
 
 function envOf(): NodeJS.ProcessEnv | undefined {
   return typeof process !== "undefined" ? process.env : undefined;
@@ -485,18 +487,22 @@ export function sanitizeModelText(text: string | undefined, opts: { oneLine?: bo
 
 /** Why a round became moot mid-flight: the head moved, the session ended, or a newer request
  * (a new session, or apply downgraded to suggest) took over. */
-type Moot = "head" | "stopped" | "handoff" | "converged" | "newer";
+type Moot = "head" | "stopped" | "handoff" | "converged" | "not-clean" | "newer";
 const MOOT_TEXT: Record<Moot, string> = {
   head: "the PR head moved",
   stopped: "the loop was stopped",
   handoff: "the loop session ended with a handoff",
   converged: "the loop session converged",
+  "not-clean": ENDED_NOT_CLEAN,
   newer: "a newer loop request took over",
 };
 
-/** Why an inactive session ended, as a moot reason (never guess "stopped" for a handoff). */
+/** Why an inactive session ended, as a moot reason (never guess "stopped" for a handoff, or for a
+ * not-clean review whose handoff the session still owes). */
 function endedWhy(s: LoopSession): Exclude<Moot, "head" | "newer"> {
-  return s.endedBy === "escalate" ? "handoff" : s.endedBy === "converged" ? "converged" : "stopped";
+  if (s.endedBy === "escalate") return "handoff";
+  if (s.endedBy === "converged") return "converged";
+  return s.endedBy === "not-clean" ? "not-clean" : "stopped";
 }
 
 /** How an applied round's report ends: continued, the session ended meanwhile (why), or why the
@@ -764,8 +770,15 @@ export async function runPostReviewLoop(
   };
 
   const stepKey = `${owner}/${repo}#${pr}@${headSha}`;
-  if (inFlightSteps.has(stepKey)) return { ran: false, reason: STEP_IN_FLIGHT };
-  inFlightSteps.add(stepKey);
+  // A not-clean review never runs a fix round, only its handoff: it waits for the step in flight for
+  // its head instead of backing off. That step's round may already be past its last relevance check
+  // (posting its suggestion) when this review lands, and would then never see the handoff it owes.
+  for (let held = inFlightSteps.get(stepKey); held; held = inFlightSteps.get(stepKey)) {
+    if (!notClean) return { ran: false, reason: STEP_IN_FLIGHT };
+    await held;
+  }
+  let stepDone!: () => void;
+  inFlightSteps.set(stepKey, new Promise<void>((done) => (stepDone = done)));
   try {
     d = deps ?? (await productionDeps(settings));
     const gh = d.gh;
@@ -926,12 +939,18 @@ export async function runPostReviewLoop(
       return why;
     };
     // A moot round ends quietly: a moved head continues on the live head (idempotent); a stop or
-    // a newer request already decides what comes next.
+    // a newer request already decides what comes next. A session that ended at a not-clean review
+    // (another review of this head, landed while the round ran) owes that review's handoff: the round
+    // posts it, since that review's own step was waiting on this one.
     const quietExit = async (why: Moot): Promise<LoopStepResult> => {
       if (why === "stopped") return { ran: false, reason: STOPPED_QUIET };
       if (why === "handoff") return { ran: false, reason: ENDED_BY_HANDOFF };
       if (why === "converged") return { ran: false, reason: ENDED_CONVERGED };
       if (why === "newer") return { ran: false, reason: NEWER_REQUEST };
+      if (why === "not-clean") {
+        const owed = (await sessionOf(gh, token, ref, head, botLogin)).owedHandoff;
+        return owed ? await settleOwed(owed) : { ran: false, reason: ENDED_NOT_CLEAN };
+      }
       const live = await gh.fetchPullHeadRef(token, owner, repo, pr).catch(() => null);
       if (live) await continueOn(live);
       return { ran: false, reason: SUPERSEDED };
@@ -1057,8 +1076,11 @@ export async function runPostReviewLoop(
       // not block: the next review re-checks it).
       const now = await sessionOf(gh, token, ref, newHead ? { ...head, sha: newHead } : head, botLogin).catch(() => null);
       let status: ContinuationStatus;
+      let owed: LoopStepResult | undefined; // the handoff a not-clean review that ended the session owes
       if (now && !now.active) {
         status = { ok: false, ended: endedWhy(now) };
+        // The fixed signal goes out first, like the continuation it replaces.
+        if (now.owedHandoff) owed = await settleOwed(now.owedHandoff);
       } else if (now && now.startIso !== session.startIso) {
         status = { ok: false, ended: "newer" };
       } else if (!newHead) {
@@ -1085,6 +1107,9 @@ export async function runPostReviewLoop(
         /* the report is informational; the continuation / handoff carries the signal */
       });
       if (handoff) return handoff;
+      // The owed handoff's own result when it landed or failed (a failure is logged); an existing one
+      // leaves the round's.
+      if (owed && (owed.ran || !SILENT_REASONS.includes(owed.reason))) return owed;
       if (status.ok) trace(job.id, "continued", { commit: newHead?.slice(0, 7), round: rounds.length + 1 });
       return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead ?? done.commitSha, continued: status.ok, attempts: tries };
     };
@@ -1118,6 +1143,7 @@ export async function runPostReviewLoop(
     return requested ? await escalate("loop-error", reason) : { ran: false, reason };
   } finally {
     inFlightSteps.delete(stepKey);
+    stepDone();
   }
 }
 

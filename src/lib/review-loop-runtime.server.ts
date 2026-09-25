@@ -38,7 +38,7 @@
  * github.server stub) is untouched and the fix path never runs in tests unless injected.
  */
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
-import type { GitDataApi } from "./fix-commit.ts";
+import { BranchMovedError, type GitDataApi } from "./fix-commit.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
@@ -966,9 +966,10 @@ export async function runPostReviewLoop(
       reviewer: settings.fixAgent.provider ?? undefined,
     });
     // ONE relevance predicate for every checkpoint of the round — before it starts, while queued,
-    // at generation start, before a retry, before the commit and before a report: the PR head,
-    // the session and (for apply) the session's mode must still be the ones this step started
-    // from. Fresh reads, never cached: the world moves while a slow fix request runs.
+    // at generation start, before a retry, before the commit, right before the branch ref moves
+    // and before a report: the PR head, the session and (for apply) the session's mode must still
+    // be the ones this step started from. Fresh reads, never cached: the world moves while a slow
+    // fix request runs.
     const relevance = async (): Promise<Moot | null> => {
       if ((await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha) return "head";
       const now = await sessionOf(gh, token, ref, head, botLogin);
@@ -1011,6 +1012,26 @@ export async function runPostReviewLoop(
         if (authFailure) return { ok: false, error: authFailure };
       }
       return { ok: true };
+    };
+    // The LAST check before the branch moves: blob, tree and commit creation take seconds for a
+    // multi-file fix, and a stop or a downgrade landing meanwhile must not move the ref. A moot
+    // round refuses the write (a BranchMovedError is never retried over; the round then exits
+    // quietly below). A failed read throws: no ref is written without a successful check. Residual
+    // (K5): a stop arriving inside updateBranchRef's own read→PATCH round trip (under a second).
+    const guardRef = (api: GitDataApi): GitDataApi => {
+      const readBranchRef = api.readBranchRef?.bind(api);
+      return {
+        baseTreeSha: (commitSha) => api.baseTreeSha(commitSha),
+        createBlob: (content) => api.createBlob(content),
+        createTree: (baseTreeSha, entries) => api.createTree(baseTreeSha, entries),
+        createCommit: (message, treeSha, parentSha) => api.createCommit(message, treeSha, parentSha),
+        updateBranchRef: async (branch, commitSha, expectedOldSha) => {
+          const why = await checkpoint();
+          if (why) throw new BranchMovedError(`${MOOT_TEXT[why]} before the branch ref update; not moved`);
+          return api.updateBranchRef(branch, commitSha, expectedOldSha);
+        },
+        ...(readBranchRef ? { readBranchRef } : {}),
+      };
     };
     // Per-finding thread replies: a transient failure is retried with the continuation's backoff —
     // the thread list (a read) always, a reply only when GitHub cannot have created it (its error
@@ -1086,7 +1107,7 @@ export async function runPostReviewLoop(
       const t0 = Date.now();
       trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, provider: settings.fixAgent.provider ?? "none" });
       res = await runFixRound(
-        { requestFix, api: gh.gitDataApi(token, owner, repo), validate },
+        { requestFix, api: guardRef(gh.gitDataApi(token, owner, repo)), validate },
         {
           prompt,
           mode,

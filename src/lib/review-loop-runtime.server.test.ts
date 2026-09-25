@@ -1753,3 +1753,93 @@ describe("ambiguous control writes: journaled with no expiry, never read as post
     });
   }
 });
+
+describe("the branch ref moves only while the round is still wanted (#79 K2-7 write half)", () => {
+  /** One ordered log of the commit's Git Data calls; `beforeBlob` runs before each blob is created
+   * (blob, tree and commit creation take seconds for a multi-file fix in production). */
+  const spyGit = (f: ReturnType<typeof fakeDeps>, beforeBlob?: () => Promise<void> | void) => {
+    const calls: string[] = [];
+    const orig = f.deps.gh.gitDataApi;
+    f.deps.gh.gitDataApi = (...a) => {
+      const api = orig(...a);
+      return {
+        baseTreeSha: async (sha) => (calls.push("baseTree"), api.baseTreeSha(sha)),
+        createBlob: async (content) => {
+          await beforeBlob?.();
+          calls.push("blob");
+          return api.createBlob(content);
+        },
+        createTree: async (base, entries) => (calls.push("tree"), api.createTree(base, entries)),
+        createCommit: async (message, tree, parent) => (calls.push("commit"), api.createCommit(message, tree, parent)),
+        updateBranchRef: async (branch, sha, expected) => (calls.push("ref"), api.updateBranchRef(branch, sha, expected)),
+      };
+    };
+    return calls;
+  };
+  /** The next `n` PR head reads right after the commit object is created fail (a 502). */
+  const failReadsAfterCommit = (f: ReturnType<typeof fakeDeps>, git: string[], n: number) => {
+    const read = f.deps.gh.fetchPullHeadRef;
+    let failed = 0;
+    f.deps.gh.fetchPullHeadRef = async (...a) => {
+      if (git.at(-1) === "commit" && failed < n) {
+        failed += 1;
+        git.push("read-failed");
+        throw new Error("GitHub pull 502");
+      }
+      return read(...a);
+    };
+    return () => failed;
+  };
+
+  it("K2-7 write half (R7 4092621907): a stop acknowledged while the blobs are created → the ref never moves, quiet", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    let stop: Awaited<ReturnType<typeof stopLoop>> | undefined;
+    const git = spyGit(f, async () => {
+      stop ??= await stopLoop("t", { owner: "o", repo: "r", pr: 7, actor: "alice", stopAt: "2026-01-03T00:00:00Z" }, settings("apply"), f.deps, ENV_ON);
+    });
+    const r = await run(f, "apply");
+    assert.deepEqual(stop, { posted: true, reason: "stopped" });
+    assert.equal(f.posted.filter((b) => b.startsWith(STOPPED_MARKER)).length, 1);
+    assert.deepEqual(git, ["baseTree", "blob", "tree", "commit"], "no ref write after STOPPED");
+    assert.equal(f.committed, false);
+    assert.deepEqual(r, { ran: false, reason: "loop stopped by operator" });
+    assert.equal(escalations(f.posted).length, 0);
+  });
+
+  it("an apply → suggest downgrade recorded while the blobs are created → the ref never moves, quiet (newer request)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    let downgraded = false;
+    const git = spyGit(f, () => {
+      if (downgraded) return;
+      downgraded = true;
+      f.issues.push(recorded("suggest", "alice", "2026-01-30T00:00:00Z")); // re-issued, suggest
+    });
+    assert.deepEqual(await run(f, "apply"), { ran: false, reason: NEWER });
+    assert.deepEqual(git, ["baseTree", "blob", "tree", "commit"], "no ref write for a round a newer request took over");
+    assert.equal(f.committed, false);
+    assert.equal(f.prompts.length, 1, "a moot round is not retried");
+  });
+
+  it("fails closed: a relevance read that fails right before the ref write writes no ref; the retry re-checks, then writes", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const git = spyGit(f);
+    const failed = failReadsAfterCommit(f, git, 1);
+    const r = await run(f, "apply");
+    assert.equal(failed(), 1, "the ref write is preceded by a relevance read");
+    assert.deepEqual(git, ["baseTree", "blob", "tree", "commit", "read-failed", "baseTree", "blob", "tree", "commit", "ref"]);
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.attempts === 1, JSON.stringify(r));
+    assert.equal(f.committed, true);
+  });
+
+  it("fails closed: a relevance read that keeps failing never writes the ref; the round hands off (fix-failed)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const git = spyGit(f);
+    const failed = failReadsAfterCommit(f, git, 2);
+    const r = await run(f, "apply");
+    assert.equal(failed(), 2, "one failed check per commit attempt");
+    assert.ok(!git.includes("ref"), `no ref write without a successful check: ${git.join(",")}`);
+    assert.equal(f.committed, false);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed", JSON.stringify(r));
+    assert.match(escalations(f.posted)[0], /commit-failed after 1 attempt\(s\): GitHub pull 502/);
+  });
+});

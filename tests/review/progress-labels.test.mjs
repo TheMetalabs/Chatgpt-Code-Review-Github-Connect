@@ -1,6 +1,16 @@
 // sanitizeProgressEvents keeps a well-formed stage that has no PROGRESS_LABELS entry, but review history
 // and the live reviewer status can only show it as "Unlabelled step · <stage>". These rows pin that every
 // stage the extension can record is labelled — including the ones built from a template.
+//
+// Threat model. The guard catches accidental omissions in the ways the extension actually records
+// stages: a direct call of a recorder (workerStep, recordReviewStep, step) with a literal stage or a
+// template whose expression is declared in TEMPLATE_STAGES, and a recorder that forwards its stage
+// parameter unchanged. Its other rules (a recorder's name in a string, a computed call it cannot read,
+// the global object read by a computed name) fail closed on the common ways to lose sight of a call.
+// Deliberate indirection is out of scope: JavaScript can always hide a call from a token scan (an alias
+// of a computed member, a key built by concatenation, an applier spelled as a computed member), and such
+// a stage is no longer lost — the server keeps it and history shows it as an unlabelled step. So a
+// finding that only names another way to hide a call does not get another rule here.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync} from 'node:fs';

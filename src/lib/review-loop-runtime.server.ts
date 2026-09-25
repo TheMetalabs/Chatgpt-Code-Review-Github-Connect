@@ -45,9 +45,10 @@
  *   - local: one OpenAI-compatible chat request;
  *   - chatgpt: one Chrome-bridge fix item per PR (bridge-fix.server.ts; grok is not a fix
  *     provider, settings-rules FIX_PROVIDER_CAPS) — the extension
- *     types the prompt into a chat tab and hands back the full answer. A newer request for the
- *     PR supersedes the older; a deadline (fixAgent.chatTimeoutMs, default 30 min) and an
- *     inline-prompt ceiling (fixAgent.chatMaxPromptChars, default 100k chars) turn a stuck
+ *     uploads the full request as a file (fix-attachment.ts), types one line naming its SHA-256
+ *     into a chat tab and hands back the full answer. A newer request for the
+ *     PR supersedes the older; a deadline (fixAgent.chatTimeoutMs, default 30 min) and the
+ *     attachment cap (FIX_ATTACHMENT_MAX_BYTES, 512 KiB) turn a stuck
  *     tab or an oversized PR into a rejected request → retry, then ESCALATE fix-failed (never a
  *     hang). The watcher's abort (head moved, loop stopped, its deadline) cancels the item, so
  *     the extension stops the run and preserves the tab (a fix tab is closed only after a
@@ -57,6 +58,7 @@
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import { BranchMovedError, type GitDataApi } from "./fix-commit.ts";
 import type { FixRequest } from "./bridge-fix.server.ts";
+import { fixAttachment, fixTypedPrompt } from "./fix-attachment.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
@@ -805,9 +807,13 @@ export async function requestChatFix(
   if (!WIRED_FIX_DELIVERIES.includes(settings.fixAgent.delivery)) {
     throw new Error(`fix delivery ${settings.fixAgent.delivery} is not wired for ${provider} (${WIRED_FIX_DELIVERIES.join(", ")} only)`);
   }
+  // The full request travels as a file (the composer does not keep typed whitespace, #93); the
+  // typed prompt is one canonical line naming it and its SHA-256. Over the cap this throws before
+  // any bridge item exists (request-failed → fix-failed with the cap in the reason).
+  const attachment = fixAttachment(`${prompt}\n\n${CHAT_FIX_FENCE_RULE}`);
+  const typed = fixTypedPrompt(attachment, CHAT_FIX_FENCE_RULE);
   const bridge = await (opts.loadBridge ?? (() => import("./bridge.server.ts")))();
-  const fenced = `${prompt}\n\n${CHAT_FIX_FENCE_RULE}`;
-  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt: fenced, ...(opts.signal ? { signal: opts.signal } : {}) });
+  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt: typed, attachment, ...(opts.signal ? { signal: opts.signal } : {}) });
 }
 
 /** Production provider routing (productionDeps' requestFix). local is a plain request/response;

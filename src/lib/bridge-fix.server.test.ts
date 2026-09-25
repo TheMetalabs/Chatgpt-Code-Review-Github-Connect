@@ -12,6 +12,18 @@ import {
   type FixRegistryDeps,
   type FixRequest,
 } from "./bridge-fix.server.ts";
+import { createHash } from "node:crypto";
+import {
+  FIX_ATTACHMENT_BEGIN,
+  FIX_ATTACHMENT_END,
+  FIX_ATTACHMENT_MAX_BYTES,
+  FIX_ATTACHMENT_NAME,
+  FixAttachmentError,
+  fixAttachment,
+  fixDeliveryText,
+  fixTypedPrompt,
+  isCanonicalLine,
+} from "./fix-attachment.ts";
 
 const CLAIM_MS = 20 * 60_000;
 const SUBMIT_MS = 3 * 60_000;
@@ -848,5 +860,55 @@ describe("bridge fix registry: summaries (read-only /api/harbor observability)",
     const done = h.reg.summaries().find((row) => row.state === "done");
     assert.ok(done);
     assert.equal(done.deadlineInSec, null);
+  });
+});
+
+describe("bridge fix registry: the source travels as a hashed attachment (#93)", () => {
+  const SOURCE = 'Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\\treturn \\"a  b\\"\\n"\n\n\n  trailing  spaces  ';
+  const RULE = "Chat delivery: one ```json fence.";
+
+  it("the offer (and the prompt GET) carry the one typed line, then the frame holding the exact bytes and their SHA-256", async () => {
+    const attachment = fixAttachment(SOURCE);
+    const typed = fixTypedPrompt(attachment, RULE);
+    assert.equal(isCanonicalLine(typed), true, "one line, single spaces: nothing for a composer to collapse");
+    assert.ok(typed.includes(attachment.sha256) && typed.includes(FIX_ATTACHMENT_NAME));
+    assert.equal(attachment.sha256, createHash("sha256").update(Buffer.from(SOURCE, "utf8")).digest("hex"));
+    const h = harness();
+    const { promise, offer } = queueAndTake(h, { prompt: typed, attachment });
+    const text = fixDeliveryText(typed, attachment);
+    assert.equal(offer.prompt, text);
+    assert.deepEqual(h.reg.prompt(offer.jobId), { prompt: text });
+    const [line, blank, begin, entry, end, ...rest] = text.split("\n");
+    assert.deepEqual([line, blank, begin, end, rest], [typed, "", FIX_ATTACHMENT_BEGIN, FIX_ATTACHMENT_END, []]);
+    assert.deepEqual(JSON.parse(entry), { name: FIX_ATTACHMENT_NAME, sha256: attachment.sha256, bytes: attachment.bytes, body: SOURCE });
+    h.reg.complete(offer.jobId, "chatgpt", "answer", offer.leaseId);
+    await promise;
+    assert.equal(h.reg.snapshot(offer.jobId)?.attachment, undefined, "settlement drops the source file too");
+  });
+
+  it("an attachment over the cap is refused before any item exists, with the cap in the reason", async () => {
+    assert.ok(FIX_ATTACHMENT_MAX_BYTES >= 400 * 1024, "room for an aicc PR of 15 files / ~1,500 changed lines");
+    const body = `SECRET-SOURCE ${"한".repeat(Math.ceil(FIX_ATTACHMENT_MAX_BYTES / 3))}`;
+    assert.throws(() => fixAttachment(body), (error: FixAttachmentError) => {
+      assert.equal(error.code, "attachment_too_large");
+      assert.match(error.message, new RegExp(`^attachment_too_large: the fix request is ${Buffer.byteLength(body)} bytes; .* at most ${FIX_ATTACHMENT_MAX_BYTES} bytes`));
+      assert.doesNotMatch(error.message, /SECRET-SOURCE/);
+      return true;
+    });
+    // a hand-built oversized attachment is refused by the registry too
+    const h = harness();
+    const sha256 = createHash("sha256").update(body).digest("hex");
+    await assert.rejects(h.reg.request({ ...REQ, prompt: `see ${sha256}`, attachment: { name: FIX_ATTACHMENT_NAME, body, sha256, bytes: Buffer.byteLength(body) } }), /^Error: attachment_too_large: /);
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0, active: 0 });
+  });
+
+  it("a typed line that is not canonical, does not name the hash, or a hash that does not match the bytes is refused", async () => {
+    const h = harness();
+    const attachment = fixAttachment(SOURCE);
+    const typed = fixTypedPrompt(attachment, RULE);
+    await assert.rejects(h.reg.request({ ...REQ, prompt: `${typed}\nmore`, attachment }), /one whitespace-canonical line/);
+    await assert.rejects(h.reg.request({ ...REQ, prompt: "Fix it, see the attachment.", attachment }), /does not name the attachment's SHA-256/);
+    await assert.rejects(h.reg.request({ ...REQ, prompt: typed, attachment: { ...attachment, body: `${SOURCE} ` } }), /size or SHA-256 does not match/);
+    assert.deepEqual(h.reg.counts(), { queued: 0, claimed: 0, active: 0 });
   });
 });

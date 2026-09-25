@@ -1,4 +1,4 @@
-// Every fix operation requires the worker's fixProtocol:1 opt-in, at ONE entry (the /api/bridge
+// Every fix operation requires the worker's fixProtocol:2 opt-in, at ONE entry (the /api/bridge
 // route's fixOperationRefused gate), over the real bridge server and fix registry. One row per
 // bridge operation, each run without and with the opt-in; review operations are unchanged.
 import test from 'node:test';
@@ -26,9 +26,9 @@ function server(jobs = [], {bridgePromptText = text => text} = {}) {
 async function takenFix(jobs) {
   const s = server(jobs);
   s.pending = s.h.bridge.requestBridgeFix(FIX);s.pending.catch(() => {});
-  const offer = (await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 1})).body.job;
+  const offer = (await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 2})).body.job;
   assert.equal(offer?.kind, 'fix');
-  assert.equal((await s.post({action: 'progress', jobId: offer.jobId, leaseId: offer.leaseId, progress: progress('run-A'), fixProtocol: 1})).status, 200);
+  assert.equal((await s.post({action: 'progress', jobId: offer.jobId, leaseId: offer.leaseId, progress: progress('run-A'), fixProtocol: 2})).status, 200);
   s.offer = offer;
   return s;
 }
@@ -41,7 +41,7 @@ const ROWS = [
     opted: (out, s) => out.status === 200 && out.body.leaseId === s.offer.leaseId},
   {op: 'ping', run: (s, fixProtocol) => s.post({action: 'ping', jobId: s.offer.jobId, leaseId: s.offer.leaseId, generating: {chatgpt: true}, fixProtocol}),
     opted: out => out.status === 200 && out.body.accepted === true && out.body.status === 'awaiting_chat'},
-  {op: 'prompt (GET)', run: (s, fixProtocol) => s.get(`jobId=${s.offer.jobId}&attachmentProtocol=2${fixProtocol ? '&fixProtocol=1' : ''}`),
+  {op: 'prompt (GET)', run: (s, fixProtocol) => s.get(`jobId=${s.offer.jobId}&attachmentProtocol=2${fixProtocol ? `&fixProtocol=${fixProtocol}` : ""}`),
     opted: out => out.status === 200 && out.body.prompt === FIX.prompt},
   {op: 'progress', run: (s, fixProtocol) => s.post({action: 'progress', jobId: s.offer.jobId, leaseId: s.offer.leaseId, progress: progress('run-A'), fixProtocol}),
     opted: out => out.status === 200 && out.body.ok === true},
@@ -60,26 +60,29 @@ const ROWS = [
 ];
 
 for (const row of ROWS) {
-  test(`fix protocol gate: ${row.op} is refused without fixProtocol:1 and never touches the item; served with it`, async () => {
+  test(`fix protocol gate: ${row.op} is refused without fixProtocol:2 and never touches the item; served with it`, async () => {
     const s = await takenFix([]);
     const out = await row.run(s, undefined);
     assert.ok(refused(out), `${row.op} without the opt-in: ${JSON.stringify(out)}`);
+    // a protocol-1 worker (before #93) would type the attachment frame inline: refused too
+    const legacy = await row.run(s, 1);
+    assert.ok(refused(legacy), `${row.op} with fixProtocol:1: ${JSON.stringify(legacy)}`);
     // the item is exactly as the opted-in worker left it: still claimed under its lease, unsettled
     assert.equal(s.h.bridge.bridgeJobState(s.offer.jobId).status, 'awaiting_chat');
     assert.equal(s.h.bridge.refreshBridgeClaim(s.offer.jobId, {chatgpt: true}, undefined, s.offer.leaseId), true, 'its lease is still live');
-    const served = await row.run(s, 1);
+    const served = await row.run(s, 2);
     assert.ok(row.opted(served, s), `${row.op} with the opt-in: ${JSON.stringify(served)}`);
   });
 }
 
-test('fix protocol gate: take offers a fix only with fixProtocol:1', async () => {
+test('fix protocol gate: take offers a fix only with fixProtocol:2', async () => {
   const s = server([]);
   s.h.bridge.requestBridgeFix(FIX).catch(() => {});
   assert.equal((await s.post({action: 'take', clientId: 'chrome-1'})).body.job, null);
-  assert.equal((await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 1})).body.job?.kind, 'fix');
+  assert.equal((await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 2})).body.job?.kind, 'fix');
 });
 
-test('fix protocol gate: recover skips fix bindings without fixProtocol:1 (a review binding still recovers); resumes with it', async () => {
+test('fix protocol gate: recover skips fix bindings without fixProtocol:2 (a review binding still recovers); resumes with it', async () => {
   // a review this profile already runs (live claim): not offered by take, recoverable by its binding
   const review = makeJob({id: 'job-R', createdAt: Date.now() - 60_000, bridgeClientId: 'chrome-1', bridgeClaimedAt: Date.now(), bridgeLeaseId: 'lease-R', attemptedProviders: ['chatgpt'],
     providerProgress: {chatgpt: {runId: 'run-R', stage: 'generating', observedAt: 1, receivedAt: 1}}});
@@ -89,12 +92,12 @@ test('fix protocol gate: recover skips fix bindings without fixProtocol:1 (a rev
   assert.equal((await s.post({action: 'recover', clientId: 'chrome-1', bindings: [fixBinding]})).body.job, null, 'an old worker never receives a fix via recovery');
   const mixed = (await s.post({action: 'recover', clientId: 'chrome-1', bindings: [fixBinding, reviewBinding]})).body.job;
   assert.equal(mixed?.jobId, 'job-R', 'review recovery is unchanged');assert.equal('kind' in mixed, false);
-  const resumed = (await s.post({action: 'recover', clientId: 'chrome-1', bindings: [fixBinding], fixProtocol: 1})).body.job;
+  const resumed = (await s.post({action: 'recover', clientId: 'chrome-1', bindings: [fixBinding], fixProtocol: 2})).body.job;
   assert.equal(resumed?.jobId, s.offer.jobId);assert.equal(resumed.kind, 'fix');
   assert.deepEqual(resumed.bindings, [fixBinding]);
 });
 
-test('fix protocol gate: review operations are unchanged without fixProtocol:1', async () => {
+test('fix protocol gate: review operations are unchanged without fixProtocol:2', async () => {
   const s = server([makeJob({id: 'job-A', createdAt: Date.now()})]);
   const offer = (await s.post({action: 'take', clientId: 'chrome-1'})).body.job;
   assert.equal(offer?.jobId, 'job-A');
@@ -112,17 +115,17 @@ test('fix protocol gate: review operations are unchanged without fixProtocol:1',
 test('route: a direct claim of a released, unpinned fix is refused (409 take_required); the next take hands out D2', async () => {
   const s = server();
   s.pending = s.h.bridge.requestBridgeFix(FIX);s.pending.catch(() => {});
-  const d1 = (await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 1})).body.job;
+  const d1 = (await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 2})).body.job;
   assert.equal(d1?.offerKind, 'fresh');
-  assert.equal((await s.post({action: 'release', jobId: d1.jobId, leaseId: d1.leaseId, fixProtocol: 1})).status, 200);
-  const claim = await s.post({action: 'claim', jobId: d1.jobId, clientId: 'chrome-1', fixProtocol: 1});
+  assert.equal((await s.post({action: 'release', jobId: d1.jobId, leaseId: d1.leaseId, fixProtocol: 2})).status, 200);
+  const claim = await s.post({action: 'claim', jobId: d1.jobId, clientId: 'chrome-1', fixProtocol: 2});
   assert.equal(claim.status, 409);
   assert.equal(claim.body.code, 'take_required');assert.equal(claim.body.leaseId, undefined, 'no lease, no delivery');
-  const d2 = (await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 1})).body.job;
+  const d2 = (await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 2})).body.job;
   assert.equal(d2?.jobId, d1.jobId);assert.equal(d2.offerKind, 'fresh');
   assert.ok(d2.deliveryId && d2.deliveryId !== d1.deliveryId, 'the new delivery reaches the worker in the take offer');
   // a claim now only renews the lease that take handed out
-  assert.deepEqual((await s.post({action: 'claim', jobId: d2.jobId, clientId: 'chrome-1', fixProtocol: 1})).body, {ok: true, leaseId: d2.leaseId});
+  assert.deepEqual((await s.post({action: 'claim', jobId: d2.jobId, clientId: 'chrome-1', fixProtocol: 2})).body, {ok: true, leaseId: d2.leaseId});
 });
 
 // Ashlar 4099509090: a fix prompt is delivered verbatim, byte-exact, through take, recover and the
@@ -135,13 +138,13 @@ test('route: a fix prompt with envelope-looking file content is served byte-exac
   for (const attachmentProtocol of [1, 2]) {
     const s = server([], {bridgePromptText});
     s.h.bridge.requestBridgeFix({...FIX, prompt}).catch(() => {});
-    const taken = await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 1, attachmentProtocol});
+    const taken = await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 2, attachmentProtocol});
     assert.equal(taken.status, 200);assert.equal(taken.body.job?.prompt, prompt, `take, protocol ${attachmentProtocol}`);
     const offer = taken.body.job;
-    const got = await s.get(`jobId=${encodeURIComponent(offer.jobId)}&fixProtocol=1${attachmentProtocol === 2 ? '&attachmentProtocol=2' : ''}`);
+    const got = await s.get(`jobId=${encodeURIComponent(offer.jobId)}&fixProtocol=2${attachmentProtocol === 2 ? '&attachmentProtocol=2' : ''}`);
     assert.equal(got.status, 200);assert.equal(got.body.prompt, prompt, `GET, protocol ${attachmentProtocol}`);
-    await s.post({action: 'progress', jobId: offer.jobId, leaseId: offer.leaseId, progress: progress('run-A'), fixProtocol: 1});
-    const recovered = await s.post({action: 'recover', clientId: 'chrome-1', bindings: [{jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}], fixProtocol: 1, attachmentProtocol});
+    await s.post({action: 'progress', jobId: offer.jobId, leaseId: offer.leaseId, progress: progress('run-A'), fixProtocol: 2});
+    const recovered = await s.post({action: 'recover', clientId: 'chrome-1', bindings: [{jobId: offer.jobId, provider: 'chatgpt', runId: 'run-A'}], fixProtocol: 2, attachmentProtocol});
     assert.equal(recovered.body.job?.prompt, prompt, `recover, protocol ${attachmentProtocol}`);
   }
   // control: a review prompt with a real V2 envelope is still converted for an old worker

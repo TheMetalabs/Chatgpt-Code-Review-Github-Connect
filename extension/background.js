@@ -327,12 +327,12 @@ async function api(path, body, expectedOrigin, signal) {
     // Browser/network failures retain the outbox; separate per-job/heartbeat lanes
     // keep unrelated work moving. Server ACK is independent of publication below.
     // A caller MAY pass a signal to cancel (e.g. the periodic sweep's watchdog); normal callers omit it.
-    // fixProtocol:1 on EVERY bridge request: this worker handles review-loop fix items, and the
+    // fixProtocol:2 on EVERY bridge request: this worker handles review-loop fix items, and the
     // server refuses every fix operation (and skips fix recovery) without it. Review requests ignore it.
-    res = await fetch(body ? `${origin}${path}` : `${origin}${path}${path.includes("?") ? "&" : "?"}fixProtocol=1`, {
+    res = await fetch(body ? `${origin}${path}` : `${origin}${path}${path.includes("?") ? "&" : "?"}fixProtocol=2`, {
       method: body ? "POST" : "GET",
       headers: {"content-type": "application/json", "x-ashlar-bridge-token": token},
-      body: body ? JSON.stringify({...body, fixProtocol: 1, token}) : undefined,
+      body: body ? JSON.stringify({...body, fixProtocol: 2, token}) : undefined,
       signal: requestSignal,
     });
   } catch (cause) {
@@ -682,7 +682,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.28";
+const WORKER_BUILD = "1.1.29";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2884,9 +2884,9 @@ function admitJob(cfg, jobs) {
     // the server never replays it here even when the job registry lost it (hard reset); an intent
     // that never became a tab, or a record whose tab holds no binding of it, is cleared and replayed.
     const delivered = await reconcileFixDeliveries(jobs);
-    // fixProtocol:1 opts this worker into review-loop fix items (an older worker is never offered one).
+    // fixProtocol:2 (the fix source as a file attachment, #93) opts this worker into review-loop fix items (an older worker is never offered one).
     const payload = await api("/api/bridge", {
-      action: "take", attachmentProtocol: 2, fixProtocol: 1, clientId: await clientId(),
+      action: "take", attachmentProtocol: 2, fixProtocol: 2, clientId: await clientId(),
       excludeJobIds: [...new Set([...Object.keys(jobs), ...Object.keys(delivered)])],
     }, cfg.origin).catch(async error => {
       await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;

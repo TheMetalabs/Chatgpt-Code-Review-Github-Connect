@@ -320,7 +320,7 @@ fixAgent: {
   해제 → 런타임 재시도 후 `fix-failed` ESCALATE. 런타임 watcher는 chat fix를 이 데드라인과
   `fixAgent.timeoutMs` 중 긴 쪽 + 1분까지 기다린다 — 로컬 LLM용 생성 데드라인이 chat fix를 먼저 끊지 않는다.
 - **동시성:** `parallelPrs`개까지만 claim, 나머지는 대기. 리뷰와는 요청 시각이 빠른 쪽이 먼저(서로 굶기지 않음).
-- **호환:** `take`에 `fixProtocol:1`을 보내는 확장(1.1.23+)에만 fix 항목을 준다 — 확장 재로드 필요.
+- **호환:** `take`에 `fixProtocol:2`를 보내는 확장(1.1.29+, fix 소스를 첨부 파일로 보냄 #93)에만 fix 항목을 준다 — 확장 재로드 필요. `fixProtocol:1`(1.1.23–1.1.28) 워커는 첨부 프레임을 본문에 그대로 붙여넣을 수 있어 거부된다.
 - **프롬프트 한도:** 프롬프트 전체를 composer에 입력하고 전송 확인도 그 텍스트로 하므로, 파일 내용을 첨부
   봉투(`<<<ASHLAR_ATTACHMENTS_V2>>>`)로 빼지 않는다(첨부는 부분 열람될 수 있어 full-file 재작성이 틀어진다).
   대신 기본 10만 자(설정 `fixAgent.chatMaxPromptChars`, 1만~100만) 초과는 즉시 실패 → ESCALATE. 큰 PR은 `local`.

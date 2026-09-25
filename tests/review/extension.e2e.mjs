@@ -298,6 +298,64 @@ test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a 
  assert.equal(await pageA.evaluate(()=>window.sends),1,'the preserved tab is never sent anything again');
 });
 
+// #93 through the real unpacked extension: a chatgpt fix (review-loop-runtime requestChatFix)
+// reaches the tab as its typed line plus its one hashed attachment. The fixture composer collapses
+// typed whitespace like the real one; the upload input records the bytes and renders a named chip.
+const attachHtml=`<!doctype html><html><body>
+ <div id="turns"></div><form data-type="unified-composer" onsubmit="return false">
+ <input type="file" multiple><div id="chips"></div>
+ <textarea id="prompt-textarea" style="width:500px;height:100px"></textarea>
+ <button data-testid="send-button" aria-label="Send prompt" type="button">Send</button></form>
+ <script>
+ window.sends=0;window.uploads=[];
+ const composer=document.querySelector('textarea');
+ composer.addEventListener('input',()=>{composer.value=composer.value.replace(/\\s+/g,' ');});
+ document.querySelector('input[type=file]').addEventListener('change',async event=>{for(const file of event.target.files){
+  window.uploads.push({name:file.name,text:await file.text()});
+  const chip=document.createElement('div');chip.dataset.fileName=file.name;chip.style.cssText='width:80px;height:20px';chip.textContent=file.name;document.querySelector('#chips').append(chip);}});
+ document.querySelector('button').onclick=()=>{window.sends++;const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';const user=document.createElement('div');user.dataset.messageAuthorRole='user';user.textContent=composer.value;turn.append(user);document.querySelector('#turns').append(turn);composer.value='';document.querySelector('#chips').replaceChildren();};
+ window.reply=(raw,done,code)=>{document.querySelector('#answer')?.remove();const turn=document.createElement('section');turn.id='answer';turn.dataset.testid='conversation-turn-2';const message=document.createElement('div');message.dataset.messageAuthorRole='assistant';const md=document.createElement('div');md.className='markdown';md.textContent=raw;if(code!==undefined){const pre=document.createElement('pre');const c=document.createElement('code');c.textContent=code;pre.append(c);md.append(pre);}message.append(md);turn.append(message);if(done){const button=document.createElement('button');button.dataset.testid='copy-turn-action-button';button.ariaLabel='Copy response';button.textContent='copy';turn.append(button);}document.querySelector('#turns').append(turn);};
+ </script></body></html>`;
+
+test('MV3 fix E2E (#93): the fix source is uploaded byte-exact as its hashed attachment; a whitespace-collapsing composer still sends the typed line',async t=>{
+ const {requestChatFix,CHAT_FIX_FENCE_RULE}=await import('../../src/lib/review-loop-runtime.server.ts');
+ const {DEFAULT_SETTINGS}=await import('../../src/lib/types.ts');
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
+ const profile=await mkdtemp(join(tmpdir(),'ashlar-fixatt-e2e-'));
+ const proxy=await chatFixtureProxy(attachHtml);t.after(()=>proxy.close());
+ const extension=join(root,'extension');
+ const context=await chromium.launchPersistentContext(profile,{headless:true,proxy:{server:proxy.server,bypass:'127.0.0.1,localhost'},ignoreHTTPSErrors:true,
+   channel:process.env.CHROMIUM_PATH?undefined:'chromium',executablePath:process.env.CHROMIUM_PATH||undefined,ignoreDefaultArgs:['--disable-extensions'],
+   args:['--no-sandbox','--enable-unsafe-extension-debugging',certificatePin(proxy),`--disable-extensions-except=${extension}`,`--load-extension=${extension}`]});
+ t.after(async()=>{await context.close();await rm(profile,{recursive:true,force:true});});
+ const manager=await context.newPage();await manager.goto('chrome://extensions');
+ const developerMode=manager.locator('#devMode');await developerMode.waitFor({state:'visible'});
+ if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
+ const worker=await extensionWorker(context,manager);
+ await manager.close();
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true}),app.origin);
+ const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
+ const source='Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\\treturn \\"a  b\\"\\n"\n\n\n    pass  # two  spaces';
+ const settings={...DEFAULT_SETTINGS,fixAgent:{...DEFAULT_SETTINGS.fixAgent,enabled:true,provider:'chatgpt',delivery:'script-apply',mode:'suggest'}};
+ let result;
+ requestChatFix(settings,{owner:'fixture',repo:'fixture',pr:1},'chatgpt',source,{loadBridge:async()=>app.bridge})
+  .then(value=>{result={value};},error=>{result={error};});
+ let page;
+ await eventually(async()=>{await worker.evaluate(()=>tick());page=chatPages()[0];return page&&page.evaluate(()=>window.sends===1).catch(()=>false);},'fix prompt was not submitted');
+ const expected=`${source}\n\n${CHAT_FIX_FENCE_RULE}`;
+ const sha=createHash('sha256').update(expected,'utf8').digest('hex');
+ const uploads=await page.evaluate(()=>window.uploads);
+ assert.deepEqual(uploads,[{name:'ashlar-fix-request.txt',text:expected}],'one upload: the whole request, byte-exact');
+ const typed=await page.evaluate(()=>document.querySelector('[data-message-author-role="user"]').textContent);
+ assert.ok(typed.includes(`SHA-256 ${sha}`),typed);
+ assert.equal(typed,typed.replace(/\s+/g,' ').trim(),'one canonical line');
+ assert.ok(!typed.includes('def f(x)'),'no source in the typed body');
+ const answer='{"summary":"s","files":[],"dispositions":[{"finding":"F1","action":"decline","note":"n"}]}';
+ await page.evaluate(code=>window.reply('Done.',true,code),answer);
+ await eventually(async()=>{await worker.evaluate(()=>tick());return result!==undefined;},'fix answer was not delivered');
+ assert.equal(result.error,undefined,String(result.error));assert.equal(result.value,answer);
+});
+
 // ── Tab release (#82) with the real unpacked extension. The worker's own scheduling (its 2.5 s
 // interval, alarm and poll-now all call the global `tick`) is gated so the test decides when the
 // real tick body runs; nothing else about the worker, the content scripts or the bridge is replaced.

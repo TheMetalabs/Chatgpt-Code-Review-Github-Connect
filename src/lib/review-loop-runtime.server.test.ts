@@ -4,10 +4,14 @@ import { DEFAULT_SETTINGS, type BotSettings, type FixAgentSettings, type Finding
 import { continueComment, fixingComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
+import { buildFixPrompt } from "./fix-agent.ts";
 import { FIX_PROVIDER_CAPS, fixDeadline } from "./settings-rules.ts";
 import { botSettingsToEnv, overlayEnv, sanitizeBotSettings } from "./settings.server.ts";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { createHash } from "node:crypto";
+import { FIX_ATTACHMENT_MAX_BYTES, FIX_ATTACHMENT_NAME, fixAttachment, fixTypedPrompt } from "./fix-attachment.ts";
+import type { FixRequest } from "./bridge-fix.server.ts";
 import {
   ashlarBotLogin,
   builtinValidate,
@@ -1457,9 +1461,37 @@ describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; gro
       },
     });
     assert.equal(await requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", "FIX PROMPT", { loadBridge: loader }), "ANSWER TEXT");
-    // the page reads fenced code only, so the chat prompt asks for exactly one ```json fence
+    // the full request (with the fence rule: the page reads fenced code only) is the attachment;
+    // the typed prompt is one canonical line naming it and its SHA-256 (#93)
     const fenced = `FIX PROMPT\n\n${CHAT_FIX_FENCE_RULE}`;
-    assert.deepEqual(calls, [{ owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: fenced }]);
+    const attachment = fixAttachment(fenced);
+    assert.deepEqual(calls, [{ owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: fixTypedPrompt(attachment, CHAT_FIX_FENCE_RULE), attachment }]);
+  });
+
+  it("builds the fix prompt as an attachment plus its hash: the source bytes exact in the file, the typed line canonical", async () => {
+    const calls: FixRequest[] = [];
+    const loader = async () => ({ requestBridgeFix: async (request: FixRequest) => (calls.push(request), "ANSWER") });
+    const source = buildFixPrompt({ findings: "F1 [P1] tabs  and  spaces", files: [{ path: "src/a.py", content: "def f(x):\n\tif x:\n\t\treturn 'a  b'\n\n\n" }] });
+    await requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", source, { loadBridge: loader });
+    const [req] = calls;
+    assert.ok(req.attachment, "the source travels as a file");
+    assert.equal(req.attachment.body, `${source}\n\n${CHAT_FIX_FENCE_RULE}`, "byte-exact");
+    assert.equal(req.attachment.sha256, createHash("sha256").update(req.attachment.body, "utf8").digest("hex"));
+    assert.equal(req.attachment.name, FIX_ATTACHMENT_NAME);
+    assert.equal(req.prompt, req.prompt.replace(/\s+/g, " ").trim(), "the typed line survives any whitespace collapsing");
+    assert.ok(req.prompt.includes(`SHA-256 ${req.attachment.sha256}`), "the typed prompt names the hash");
+    assert.match(req.prompt, /authoritative/);
+    assert.ok(!req.prompt.includes("def f(x)") && !req.prompt.includes("tabs  and"), "no source or finding in the typed body");
+    assert.ok(req.prompt.includes(CHAT_FIX_FENCE_RULE));
+  });
+
+  it("a fix request over the attachment cap fails fast with a clear reason, never reaching the bridge", async () => {
+    let loaded = false;
+    const loader = async () => ((loaded = true), { requestBridgeFix: async () => "never" });
+    const huge = "x".repeat(FIX_ATTACHMENT_MAX_BYTES);
+    await assert.rejects(requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", huge, { loadBridge: loader }),
+      new RegExp(`^Error: attachment_too_large: .*at most ${FIX_ATTACHMENT_MAX_BYTES} bytes`));
+    assert.equal(loaded, false);
   });
 
   it("grok is refused as a fix provider at run time: the loop stays off and the transport never reaches the bridge", async () => {

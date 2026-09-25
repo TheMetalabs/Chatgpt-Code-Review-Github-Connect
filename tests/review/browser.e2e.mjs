@@ -1170,3 +1170,132 @@ test('real popup: a running review and tab-capacity blocker are shown together',
  assert.match(await page.locator('#worker').textContent(),/Current review in progress/);
  assert.doesNotMatch(await page.locator('#worker').textContent(),/capacity reached/);
 });
+
+// #93: ChatGPT's composer does not keep a typed prompt's whitespace, so a chatgpt fix sends its
+// source as ONE hashed file attachment and types one canonical line naming it (src/lib/
+// fix-attachment.ts). A temporary-chat page with an upload input: a staged file renders a named chip
+// (upload='ok'), no chip (upload='none') or a chip whose upload never ends (upload='stuck'); the
+// composer may collapse typed whitespace like the real one (collapse).
+const FIX_SOURCE='Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\\treturn \\"a  b\\"\\n"\n\n\n    pass  # two  spaces\t\n';
+async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true}={}){
+ const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
+ await setFixContent(page,`<main></main><form data-type="unified-composer">${fileInput?'<input type="file" multiple>':''}<div id="chips"></div><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>`);
+ await page.evaluate(({stop,upload,collapse})=>{
+  const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A']]);
+  Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
+  window.__saved=saved;window.sends=0;window.uploads=[];
+  window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
+  const composer=document.querySelector('#prompt-textarea');
+  // the real composer's whitespace handling: every whitespace run becomes one space
+  if(collapse)composer.addEventListener('input',()=>{composer.value=composer.value.replace(/\s+/g,' ');});
+  document.querySelector('input[type=file]')?.addEventListener('change',async event=>{
+   for(const file of event.target.files){
+    window.uploads.push({name:file.name,bytes:[...new Uint8Array(await file.arrayBuffer())]});
+    if(upload==='none')continue;
+    const chip=document.createElement('div');chip.dataset.fileName=file.name;chip.style.cssText='width:80px;height:20px';chip.textContent=file.name;
+    if(upload==='stuck'){const bar=document.createElement('div');bar.setAttribute('role','progressbar');bar.style.cssText='width:40px;height:4px';chip.append(bar);}
+    document.querySelector('#chips').append(chip);
+   }
+   event.target.value='';
+  });
+  document.querySelector('[data-testid="send-button"]').addEventListener('click',event=>{
+   window.sends++;
+   window.atClick={text:composer.value,chips:[...document.querySelectorAll('#chips [data-file-name]')].map(chip=>chip.dataset.fileName)};
+   const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';
+   const userTurn=document.createElement('div');userTurn.dataset.messageAuthorRole='user';userTurn.dataset.messageId='user-A';
+   const tile=document.createElement('div');tile.dataset.fileName=window.atClick.chips[0]||'';tile.textContent=window.atClick.chips[0]||'';
+   const text=document.createElement('div');text.textContent=composer.value;userTurn.append(tile,text);
+   turn.append(userTurn);document.querySelector('main').append(turn);
+   composer.value='';document.querySelector('#chips').replaceChildren();event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
+  });
+ },{stop,upload,collapse});
+ for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ await page.evaluate(()=>{Object.assign(__ashlarRunnerState,{kind:'fix',jobId:'fix-A',runId:'run-A',running:true});});
+ const fill=async(delivery,ms=1600)=>{
+  await page.evaluate(delivery=>{window.filled={pending:true};
+   fillComposer(composer(),delivery).then(text=>{window.filled={text};return clickSend(sendButton,composer,text);})
+    .then(()=>{window.sent=true;},e=>{window.filled={error:e.message,code:e.code};});},delivery);
+  await page.clock.runFor(ms);
+  return page.evaluate(()=>({...window.filled,sends:window.sends,sent:window.sent===true,composer:document.querySelector('#prompt-textarea').value}));
+ };
+ const journal=()=>page.evaluate(()=>JSON.parse(window.__saved.get('ashlar:submission:fix-A:run-A')||'null'));
+ const uploads=()=>page.evaluate(()=>window.uploads);
+ return {page,fill,journal,uploads};
+}
+const attachmentLib=()=>import('../../src/lib/fix-attachment.ts');
+async function fixDelivery(source=FIX_SOURCE){
+ const {fixAttachment,fixTypedPrompt,fixDeliveryText}=await attachmentLib();
+ const attachment=fixAttachment(source);
+ const typed=fixTypedPrompt(attachment,'Chat delivery: put that JSON object inside exactly one ```json fenced code block.');
+ return {attachment,typed,text:fixDeliveryText(typed,attachment)};
+}
+
+test('real DOM (#93): a composer that collapses typed whitespace still sends the fix: the typed line survives, the attachment bytes are exact, the answer is harvested',async t=>{
+ const {createHash}=await import('node:crypto');
+ const {attachment,typed,text}=await fixDelivery();
+ const {page,fill,journal,uploads}=await attachmentPage(t,{collapse:true});
+ assert.deepEqual(await fill(text),{text:typed,sends:1,sent:true,composer:''},'staged, typed, sent');
+ assert.deepEqual(await page.evaluate(()=>window.atClick),{text:typed,chips:[attachment.name]},'at the click: exactly the typed line, and the attachment chip');
+ const [uploaded,...more]=await uploads();
+ assert.equal(more.length,0,'one upload');
+ assert.equal(uploaded.name,attachment.name);
+ const bytes=Buffer.from(uploaded.bytes);
+ assert.equal(bytes.toString('utf8'),FIX_SOURCE,'the source, tabs, runs of spaces and blank lines, byte-exact');
+ assert.equal(createHash('sha256').update(bytes).digest('hex'),attachment.sha256,'the bytes the typed line names');
+ const j=await journal();
+ assert.deepEqual([j.phase,j.exact,j.attachments],['sent',typed,[attachment.name]]);
+ const code='{"summary":"s","files":[],"dispositions":[]}';
+ await page.evaluate(({code,toolbar})=>{
+  document.querySelector('[data-testid="stop-button"]').remove();
+  document.querySelector('main').insertAdjacentHTML('beforeend',`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><pre><code>${code}</code></pre></div></div>${toolbar}</section>`);
+  window.fixOut={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={code:e.code};});
+ },{code,toolbar});
+ await page.clock.runFor(3200);
+ assert.deepEqual(await page.evaluate(()=>window.fixOut),{raw:code},'the sent turn (file tile + typed line) proves the fix');
+});
+
+for(const [name,opts,ms,detail] of [
+ ['no upload input',{fileInput:false},1600,/the composer has no file input/],
+ ['an upload that never shows its file',{upload:'none'},3*60_000+2000,/was not shown as uploaded within 3 minutes/],
+ ['an upload that never finishes',{upload:'stuck'},3*60_000+2000,/was not shown as uploaded within 3 minutes/],
+]){
+ test(`real DOM (#93): ${name} ends the fix as attachment_failed; nothing is typed or sent, and the source is never pasted`,async t=>{
+  const {text}=await fixDelivery();
+  const {fill,journal}=await attachmentPage(t,opts);
+  const out=await fill(text,ms);
+  assert.equal(out.code,'attachment_failed',JSON.stringify(out));
+  assert.match(out.error,detail);assert.match(out.error,/nothing was sent$/);
+  assert.deepEqual([out.sends,out.sent,out.composer],[0,false,''],'nothing typed, nothing sent');
+  assert.equal(await journal(),null,'nothing prepared');
+ });
+}
+
+test('real DOM (#93): a fix attachment whose bytes do not match the hash, a typed line without the hash, or a broken frame is never staged or sent',async t=>{
+ const {attachment,typed,text}=await fixDelivery();
+ const {fixDeliveryText}=await attachmentLib();
+ const cases={
+  tampered:fixDeliveryText(typed,{...attachment,body:FIX_SOURCE.replace('a  b','a b')}),
+  unnamed:fixDeliveryText('Fix the attachment.',attachment),
+  broken:text.replace(/\n<<<END_ASHLAR_FIX_ATTACHMENT_V1>>>$/,''),
+ };
+ const got={};
+ for(const [name,delivery] of Object.entries(cases)){
+  const {fill,uploads}=await attachmentPage(t);
+  const out=await fill(delivery);
+  got[name]=[out.code,out.sends,out.composer,(await uploads()).length];
+ }
+ assert.deepEqual(got,{tampered:['attachment_failed',0,'',0],unnamed:['attachment_failed',0,'',0],broken:['attachment_failed',0,'',0]});
+});
+
+test('real DOM (#93): a fix attachment over the 512 KiB cap is refused before any upload (attachment_too_large)',async t=>{
+ const {createHash}=await import('node:crypto');
+ const {fixDeliveryText,FIX_ATTACHMENT_MAX_BYTES,FIX_ATTACHMENT_NAME}=await attachmentLib();
+ const body='x'.repeat(FIX_ATTACHMENT_MAX_BYTES+1);
+ const sha256=createHash('sha256').update(body).digest('hex');
+ const delivery=fixDeliveryText(`Ashlar fix request. SHA-256 ${sha256}`,{name:FIX_ATTACHMENT_NAME,body,sha256,bytes:body.length});
+ const {fill,uploads}=await attachmentPage(t);
+ const out=await fill(delivery);
+ assert.equal(out.code,'attachment_too_large');
+ assert.match(out.error,new RegExp(`is ${body.length} bytes; at most ${FIX_ATTACHMENT_MAX_BYTES} bytes`));
+ assert.deepEqual([out.sends,out.composer,(await uploads()).length],[0,'',0]);
+});

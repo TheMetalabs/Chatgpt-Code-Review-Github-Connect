@@ -130,22 +130,114 @@ function splitAttachments(raw) {
   return {prompt, files};
 }
 
-/** The text to type and the files to upload for this run's prompt. A FIX run's prompt is delivered
- * VERBATIM, byte-exact: it inlines whole source files, so a line that looks like an attachment
- * envelope (a `<<<ASHLAR_ATTACHMENTS_V2>>>` sentinel, a legacy `<<<ATTACH:…>>>` block) is file
- * content, never transport, and nothing is uploaded or trimmed. Only a review prompt carries
- * attachments (splitAttachments). The run's kind is set by ashlar-run before the runner starts. */
-function promptParts(raw) {
-  return globalThis.__ashlarRunnerState?.kind === "fix" ? {prompt: String(raw ?? ""), files: []} : splitAttachments(raw);
+/** A FIX run's delivery split into its typed line and its one attachment (src/lib/fix-attachment.ts
+ * fixDeliveryText): the frame ends the text and its entry is ONE JSON line (every line break in
+ * the source is escaped), so no source line can end it. null: no frame (a prompt typed verbatim);
+ * {error}: a frame marker that is not a well-formed frame (never typed, never guessed at). The
+ * review V2 envelope is not a fix frame: a fix never uploads through splitAttachments. */
+function fixFrame(raw) {
+  const source = String(raw ?? "");
+  const frame = /\r?\n<<<ASHLAR_FIX_ATTACHMENT_V1>>>\r?\n([^\r\n]*)\r?\n<<<END_ASHLAR_FIX_ATTACHMENT_V1>>>[ \t\r\n]*$/.exec(source);
+  if (!frame) return /^<<<(?:END_)?ASHLAR_FIX_ATTACHMENT_V1>>>/m.test(source) ? {error: "its frame is malformed"} : null;
+  return {prompt: source.slice(0, frame.index).trim(), entry: frame[1]};
 }
 
-async function attachFiles(files) {
-  if (!files.length) return false;
+/** The text to type and the files to upload for this run's prompt. A FIX run's source travels as
+ * its one attachment (fixFrame; staged by fillComposer, never through this list) and only its
+ * typed line is typed; a fix prompt with no frame is typed VERBATIM, byte-exact: a line in it that
+ * looks like a review envelope (a `<<<ASHLAR_ATTACHMENTS_V2>>>` sentinel, a legacy `<<<ATTACH:…>>>`
+ * block) is content, never transport. Only a review prompt carries review attachments
+ * (splitAttachments). The run's kind is set by ashlar-run before the runner starts. */
+function promptParts(raw) {
+  if (globalThis.__ashlarRunnerState?.kind !== "fix") return splitAttachments(raw);
+  const frame = fixFrame(raw);
+  return {prompt: frame?.prompt ?? String(raw ?? ""), files: []};
+}
+
+/** A fix run ends before anything is sent when its attachment cannot be staged exactly: it is
+ * never replaced by pasting the source into the typed prompt (#93). */
+function fixAttachmentFailed(detail) {
+  const error = new Error(`the fix attachment could not be staged: ${detail}; nothing was sent`);
+  error.code = "attachment_failed";
+  return error;
+}
+
+/** Lowercase hex SHA-256 of a string's UTF-8 bytes or of a buffer. */
+async function sha256Hex(data) {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** A fix run's attachment, checked before anything is uploaded or typed: a well-formed entry, at
+ * most the cap (src/lib/fix-attachment.ts FIX_ATTACHMENT_MAX_BYTES, checked again here: a page
+ * never uploads what the server would refuse), bytes that match their SHA-256, and a typed line
+ * that names that hash. null: a prompt with no frame. Limits are locals, not top-level consts:
+ * composer.js is re-injected into a page that already ran it. */
+async function fixAttachmentParts(raw) {
+  const MAX_BYTES = 512 * 1024;
+  const frame = fixFrame(raw);
+  if (!frame) return null;
+  if (frame.error) throw fixAttachmentFailed(frame.error);
+  let entry;
+  try { entry = JSON.parse(frame.entry); } catch { throw fixAttachmentFailed("its entry is not JSON"); }
+  if (!entry || typeof entry.name !== "string" || !/^[\w.-]+$/.test(entry.name) || typeof entry.body !== "string" ||
+      typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(entry.sha256)) throw fixAttachmentFailed("its entry is malformed");
+  const bytes = new TextEncoder().encode(entry.body).length;
+  if (bytes > MAX_BYTES) {
+    const error = new Error(`the fix attachment is ${bytes} bytes; at most ${MAX_BYTES} bytes are uploaded; nothing was sent`);
+    error.code = "attachment_too_large";
+    throw error;
+  }
+  if (await sha256Hex(entry.body) !== entry.sha256) throw fixAttachmentFailed("its bytes do not match their SHA-256");
+  if (!frame.prompt.includes(entry.sha256)) throw fixAttachmentFailed("the typed prompt does not name its SHA-256");
+  return {prompt: frame.prompt, file: {name: entry.name, body: entry.body, sha256: entry.sha256}};
+}
+
+function composerFileInput() {
   const input =
     document.querySelector("form[data-type='unified-composer'] input[type='file']") ||
     document.querySelector("form input[type='file'][multiple]") ||
     document.querySelector("input[type='file']");
-  if (!(input instanceof HTMLInputElement)) return false;
+  return input instanceof HTMLInputElement ? input : null;
+}
+
+/** Hand the fix attachment to the composer's upload input: the File's own bytes are hashed first,
+ * so what is uploaded is exactly the bytes the typed line names. */
+async function stageFixAttachment(file) {
+  const input = composerFileInput();
+  if (!input) throw fixAttachmentFailed("the composer has no file input");
+  const staged = new File([file.body], file.name, {type: "text/plain"});
+  if (await sha256Hex(await staged.arrayBuffer()) !== file.sha256) throw fixAttachmentFailed("the staged bytes do not match their SHA-256");
+  // The stop fence, in the same task as the upload.
+  globalThis.throwIfStopped?.();
+  const dt = new DataTransfer();
+  dt.items.add(staged);
+  input.files = dt.files;
+  input.dispatchEvent(new Event("input", {bubbles: true}));
+  input.dispatchEvent(new Event("change", {bubbles: true}));
+}
+
+/** Wait until the composer shows the fix attachment's chip with no upload in progress
+ * (attachmentsReady, the send barrier's own rule). A chip that never settles within the window is
+ * an upload that failed: the run ends (attachment_failed) before any text is typed. */
+async function waitFixAttachmentStaged(name) {
+  const STAGE_MS = 3 * 60 * 1000;
+  const deadline = Date.now() + STAGE_MS;
+  for (;;) {
+    globalThis.throwIfStopped?.();
+    const form = (typeof composer === "function" ? composer() : null)?.closest("form") || composerFileInput()?.closest("form");
+    if (form && attachmentsReady(form, [name])) return;
+    if (Date.now() >= deadline) throw fixAttachmentFailed(`${name} was not shown as uploaded within ${STAGE_MS / 60000} minutes`);
+    step("attachments_waiting");
+    await waitForPageChange(250);
+  }
+}
+
+async function attachFiles(files) {
+  if (!files.length) return false;
+  const input = composerFileInput();
+  if (!input) return false;
   const dt = new DataTransfer();
   for (const f of files) {
     dt.items.add(new File([f.body], f.name, { type: "text/plain" }));
@@ -159,15 +251,25 @@ async function attachFiles(files) {
 }
 
 async function fillComposer(el, text) {
+  const state = globalThis.__ashlarRunnerState;
+  // A fix's source is its one attachment, checked before anything is uploaded or typed.
+  const fixAttachment = state?.kind === "fix" ? await fixAttachmentParts(text) : null;
   const parts = promptParts(text);
   let body = parts.prompt || (parts.files.length ? "" : text);
-  const state = globalThis.__ashlarRunnerState;
   // A fix prompt must be held exactly (fixPromptForm, read losslessly); a review prompt normalized.
   const exact = state?.kind === "fix" ? fixPromptForm(body) : null;
   const holds = editor => exact === null ? normalizePrompt(readComposer(editor)) === normalizePrompt(body) : composerHoldsFix(editor, exact);
   // Held only once whitespace is collapsed: the editor changed the fix prompt (fixPromptAltered).
   const altered = editor => exact !== null && normalizePrompt(readComposer(editor)) === normalizePrompt(body);
   if (state) state.pendingAttachments = [];
+  if (fixAttachment) {
+    // Staged and shown as uploaded before the typed line exists: a failure sends nothing, and is
+    // never answered by pasting the source into the typed prompt.
+    globalThis.throwIfStopped?.();
+    await stageFixAttachment(fixAttachment.file);
+    if (state) state.pendingAttachments = [fixAttachment.file.name];
+    await waitFixAttachmentStaged(fixAttachment.file.name);
+  }
   if (parts.files.length) {
     // The stop fence, in the same task as the upload: no file is staged in a composer the user opened
     // in the tab meanwhile (their next send would upload it).

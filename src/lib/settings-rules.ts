@@ -364,6 +364,7 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   reviewLocal: bool("review_local"),
   fixAgent: fixAgentProblem,
   localJsonRepairEnabled: bool("local_json_repair_enabled"),
+  localRepairNoThinking: bool("local_repair_no_thinking"),
   chatgptReasoning: oneOf("chatgpt_reasoning", CHATGPT_REASONING),
   grokReasoning: oneOf("grok_reasoning", GROK_REASONING),
   localLlmBaseUrl: text("local_llm.base_url"),

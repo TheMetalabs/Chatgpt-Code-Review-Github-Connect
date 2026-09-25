@@ -3,8 +3,9 @@
 // that every stage the extension can record is labelled — including the ones built from a template.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readdirSync} from 'node:fs';
-import {join} from 'node:path';
+import {mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {dirname, join, sep} from 'node:path';
 import {root, source} from './load-source.mjs';
 import {background, storage} from './helpers.mjs';
 import {PROGRESS_LABELS, sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
@@ -195,10 +196,11 @@ function recordedStages(text, file = 'source') {
   return found;
 }
 
-/** The extension's scripts, {name: text}. */
-function extensionFiles() {
-  const names = readdirSync(join(root, 'extension')).filter(name => name.endsWith('.js'));
-  return Object.fromEntries(names.map(name => [name, source(`extension/${name}`)]));
+/** The extension's scripts at any depth under `dir`, {path relative to it: text}. A recorder call in
+ * a script below the top level records stages too. */
+function extensionFiles(dir = join(root, 'extension')) {
+  const paths = readdirSync(dir, {recursive: true}).filter(path => /\.[cm]?js$/.test(path) && statSync(join(dir, path)).isFile());
+  return Object.fromEntries(paths.sort().map(path => [path.split(sep).join('/'), readFileSync(join(dir, path), 'utf8')]));
 }
 
 function extensionStages(files) {
@@ -292,6 +294,22 @@ test('every stage the extension records has a history label (sanitizeProgressEve
   assert.deepEqual(unlabelled(stages), [], 'recorded stages without a PROGRESS_LABELS entry never reach review history');
   assert.deepEqual(kept(stages, 'worker'), stages);
   assert.deepEqual(kept(stages, 'page'), stages);
+});
+
+test('the scan reads extension scripts below the top level, keyed by their path', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'ashlar-extension-'));
+  t.after(() => rmSync(dir, {recursive: true, force: true}));
+  const write = (path, text) => { mkdirSync(dirname(join(dir, path)), {recursive: true}); writeFileSync(join(dir, path), text); };
+  write('background.js', 'workerStep(job, provider, "tab_created");');
+  write('runtime/lease.js', '\nworkerStep(job, provider, "lease_nested_unlabelled");');
+  write('runtime/page/steps.mjs', 'recordReviewStep(pageStage);');
+  write('runtime/notes.txt', 'workerStep(job, provider, "not_a_script");');
+  const files = extensionFiles(dir);
+  assert.deepEqual(Object.keys(files), ['background.js', 'runtime/lease.js', 'runtime/page/steps.mjs']);
+  const {stages, problems} = guardedStages(files);
+  assert.deepEqual(unlabelled(stages), ['lease_nested_unlabelled'], 'a nested script\'s unlabelled stage fails the guard');
+  assert.deepEqual(problems, ['runtime/page/steps.mjs:1 recordReviewStep(): stage `pageStage` is not a literal, so its value cannot be checked for a label']);
+  assert.ok(Object.keys(extensionFiles()).includes('background.js'), 'the top-level scripts keep their names');
 });
 
 test('salvaged_no_repair (worker: invalid reply delivered as a raw review, no accepted repair) reaches history', () => {

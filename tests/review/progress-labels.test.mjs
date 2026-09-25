@@ -15,9 +15,10 @@ const STAGE_NAME = /^[a-z][a-z0-9_]*$/;
 const CLOSERS = {'(': ')', '[': ']', '{': '}'};
 const REGEX_AFTER = new Set(['return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'throw', 'instanceof', 'do', 'else', 'yield', 'await']);
 
-/** One bracket level of JavaScript from `i` up to `close`, as tokens: str, tpl (with `subst` when it
- * has a ${}), regex, word, punct (`??`, `?.` and `||` whole) and group (a bracketed run holding its own
- * tokens). Comments and whitespace are dropped. A closer that does not match throws. */
+/** One bracket level of JavaScript from `i` up to `close` (the end of `text` when there is none), as
+ * tokens: str, tpl (`substs` holds the tokens of each ${}), regex, word, punct (`??`, `?.` and `||`
+ * whole) and group (a bracketed run holding its own tokens). Comments and whitespace are dropped. A
+ * closer that does not match throws. */
 function tokenize(text, i, close) {
   const tokens = [];
   const push = (kind, from, to, extra = {}) => { tokens.push({kind, at: from, text: text.slice(from, to), ...extra}); return to; };
@@ -31,13 +32,17 @@ function tokenize(text, i, close) {
       while (j < text.length && text[j] !== c) j += text[j] === '\\' ? 2 : 1;
       i = push('str', i, j + 1, {value: text.slice(i + 1, j)});
     } else if (c === '`') {
-      let j = i + 1, subst = false;
+      let j = i + 1;
+      const substs = [];
       while (j < text.length && text[j] !== '`') {
         if (text[j] === '\\') j += 2;
-        else if (text.startsWith('${', j)) { subst = true; j = tokenize(text, j + 2, '}').end + 1; }
-        else j += 1;
+        else if (text.startsWith('${', j)) {
+          const inner = tokenize(text, j + 2, '}');
+          substs.push(inner.tokens);
+          j = inner.end + 1;
+        } else j += 1;
       }
-      i = push('tpl', i, j + 1, {value: text.slice(i + 1, j), subst});
+      i = push('tpl', i, j + 1, {value: text.slice(i + 1, j), substs});
     } else if (c === '/' && (!prev || prev.kind === 'punct' || (prev.kind === 'word' && REGEX_AFTER.has(prev.text)))) {
       let j = i + 1, inClass = false;
       for (; j < text.length && (text[j] !== '/' || inClass); j += 1) {
@@ -61,7 +66,14 @@ function tokenize(text, i, close) {
   return {tokens, end: i};
 }
 
-const isPunct = (token, text) => token.kind === 'punct' && token.text === text;
+const isPunct = (token, text) => token?.kind === 'punct' && token.text === text;
+
+/** The comma-separated arguments of a call's token run. */
+function argumentsOf(tokens) {
+  const args = [[]];
+  for (const token of tokens) isPunct(token, ',') ? args.push([]) : args.at(-1).push(token);
+  return args;
+}
 
 /** Adds the stages a stage-argument expression can take to `found`: a string or template literal,
  * through parentheses, both arms of a conditional (its test is not a stage) and each operand of || and
@@ -85,7 +97,7 @@ function stageValues(text, tokens, found, where) {
     return stageValues(text, tokens.slice(or + 1), found, where);
   }
   const [only] = tokens;
-  if (tokens.length === 1 && only.kind === 'tpl' && only.subst) return found.templates.add(only.value);
+  if (tokens.length === 1 && only.kind === 'tpl' && only.substs.length) return found.templates.add(only.value);
   if (tokens.length === 1 && (only.kind === 'str' || only.kind === 'tpl')) {
     if (STAGE_NAME.test(only.value)) return found.literals.add(only.value);
     return found.problems.push(`${where}: ${only.text} is not a stage name (${STAGE_NAME})`);
@@ -94,17 +106,51 @@ function stageValues(text, tokens, found, where) {
   found.problems.push(`${where}: stage \`${expression}\` is not a literal, so its value cannot be checked for a label`);
 }
 
-/** The bodies of the recorders declared in `text`, with the name of their stage parameter. Passing that
- * parameter on to another recorder is safe: every call of the enclosing recorder is itself checked. */
+/** Names that reach a binding without naming it: a sloppy-mode `arguments[i] = x` rebinds a parameter,
+ * and eval and with can reassign or shadow one. */
+const INDIRECT = new Set(['arguments', 'eval', 'with']);
+
+/** Whether a recorder body (`tokens`) passes its stage parameter `param` on unchanged. The name may
+ * appear only as the whole stage argument of recorder calls: an assignment, a declaration, a nested
+ * function's parameter or a catch binding of it is another appearance, so the body is not trusted to
+ * forward it. Property names (`x.stage`) are not the binding; a spread (`...stage`) is. */
+function forwardsUnchanged(tokens, param) {
+  return tokens.every((token, k) => {
+    const prev = tokens[k - 1];
+    if (token.kind === 'word') {
+      const property = isPunct(prev, '?.') || (isPunct(prev, '.') && !isPunct(tokens[k - 2], '.'));
+      return property || (token.text !== param && !INDIRECT.has(token.text));
+    }
+    if (token.kind === 'tpl') return token.substs.every(inner => forwardsUnchanged(inner, param));
+    if (token.kind !== 'group') return true;
+    const call = token.open === '(' && prev?.kind === 'word' && Object.hasOwn(RECORDERS, prev.text) && tokens[k - 2]?.text !== 'function';
+    const [stage, ...rest] = call ? argumentsOf(token.tokens)[RECORDERS[prev.text]] ?? [] : [];
+    const forwarded = !rest.length && stage?.kind === 'word' && stage.text === param ? stage : null;
+    return forwardsUnchanged(token.tokens.filter(inner => inner !== forwarded), param);
+  });
+}
+
+/** The bodies of the recorders declared in `text`, found by walking its tokens (a declaration in a
+ * comment or a string is none), each with the name of its stage parameter when the body passes it on
+ * unchanged, else null. Forwarding that parameter to another recorder is safe: every call of the
+ * enclosing recorder is itself checked. Its parameters must be plain names, the stage one once: a
+ * default value can reassign it, and a repeated name binds the last one. */
 function recorderBodies(text) {
+  let tokens;
+  try { ({tokens} = tokenize(text, 0)); } catch { return []; } // an unreadable file forwards nothing
   const bodies = [];
-  for (const match of text.matchAll(/\bfunction\s+(workerStep|recordReviewStep|step)\s*\(([^)]*)\)\s*\{/g)) {
-    const open = match.index + match[0].length - 1;
-    try {
-      const {end} = tokenize(text, open + 1, '}');
-      bodies.push({param: match[2].split(',')[RECORDERS[match[1]]]?.trim(), from: open, to: end});
-    } catch { /* an unbalanced body forwards nothing */ }
-  }
+  const walk = level => level.forEach((token, k) => {
+    const [name, params, body] = level.slice(k + 1, k + 4);
+    if (token.kind === 'word' && token.text === 'function' && name?.kind === 'word' && Object.hasOwn(RECORDERS, name.text) &&
+        params?.kind === 'group' && params.open === '(' && body?.kind === 'group' && body.open === '{') {
+      const names = argumentsOf(params.tokens).map(param => param.length === 1 && param[0].kind === 'word' ? param[0].text : null);
+      const param = names[RECORDERS[name.text]];
+      const plain = param && names.every(Boolean) && names.filter(other => other === param).length === 1;
+      bodies.push({param: plain && forwardsUnchanged(body.tokens, param) ? param : null, from: body.at, to: body.at + body.text.length});
+    }
+    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walk(inner);
+  });
+  walk(tokens);
   return bodies;
 }
 
@@ -141,9 +187,7 @@ function recordedStages(text, file = 'source') {
       found.problems.push(`${where}: arguments could not be read (${error.message})`);
       continue;
     }
-    const args = [[]];
-    for (const token of tokens) isPunct(token, ',') ? args.push([]) : args.at(-1).push(token);
-    const arg = args[RECORDERS[call[1]]] ?? [];
+    const arg = argumentsOf(tokens)[RECORDERS[call[1]]] ?? [];
     const forwarded = arg.length === 1 && arg[0].kind === 'word' &&
       bodies.some(body => body.from < call.index && call.index < body.to && body.param === arg[0].text);
     if (!forwarded) stageValues(text, arg, found, where);
@@ -351,6 +395,41 @@ test('the guard reads the stage argument by position: other arguments, a conditi
   // composer.js: step() forwards its own stage parameter; every step() call is checked instead.
   assert.deepEqual(read('function step(stage) {\n  if (typeof recordReviewStep === "function") recordReviewStep(stage);\n}\nstep("composer_waiting");'),
     {literals: ['composer_waiting'], templates: [], problems: []});
+});
+
+test('a recorder forwards its stage parameter only when nothing in its body can change or shadow it', () => {
+  const problems = text => recordedStages(text, 'fixture.js').problems;
+  const forwarding = body => `function step(stage) {\n  ${body}\n}\nstep("composer_waiting");`;
+  // Still forwarding: the parameter reaches the recorder as is; x.stage and row?.stage are other names.
+  for (const body of ['recordReviewStep(stage);', 'if (x.stage && row?.stage !== "a") recordReviewStep(stage);',
+    'setTimeout(() => recordReviewStep(stage), 0);', 'recordReviewStep(stage); recordReviewStep(stage);']) {
+    assert.deepEqual(problems(forwarding(body)), [], body);
+  }
+  for (const text of [
+    forwarding('stage = computeStage();\n  recordReviewStep(stage);'),
+    forwarding('stage ??= fallback;\n  recordReviewStep(stage);'),
+    forwarding('if (late) stage += "_late";\n  recordReviewStep(stage);'),
+    forwarding('[...stage] = parts;\n  recordReviewStep(stage);'),
+    forwarding('var stage = row.stage;\n  recordReviewStep(stage);'),
+    forwarding('log(`${stage = computeStage()}`);\n  recordReviewStep(stage);'),
+    forwarding('arguments[0] = computeStage();\n  recordReviewStep(stage);'),
+    forwarding('eval(patch);\n  recordReviewStep(stage);'),
+    forwarding('with (row) recordReviewStep(stage);'),
+    // A nested binding of the same name shadows the parameter.
+    forwarding('rows.forEach(stage => recordReviewStep(stage));'),
+    forwarding('function inner(stage) { recordReviewStep(stage); }\n  inner(computeStage());'),
+    forwarding('try { run(); } catch (stage) { recordReviewStep(stage); }'),
+    // A default value can reassign the parameter before the body runs; a repeated name binds the last one.
+    'function step(stage, late = stage += "_late") {\n  recordReviewStep(stage);\n}\nstep("composer_waiting");',
+    'function step(stage, stage) {\n  recordReviewStep(stage);\n}\nstep("composer_waiting");',
+    // A declaration in a comment or a string is not a recorder.
+    'function note(stage) {\n  // function step(stage) {\n  recordReviewStep(stage);\n}',
+    'function note(stage) {\n  const doc = "function step(stage) {";\n  recordReviewStep(stage);\n}',
+  ]) {
+    const found = problems(text);
+    assert.equal(found.length, 1, `${text}\n: the forwarded stage is a problem, not a silent pass`);
+    assert.match(found[0], /recordReviewStep\(\): stage `stage` is not a literal/);
+  }
 });
 
 test('the tab-release (#82) stages have history labels and survive sanitize', () => {

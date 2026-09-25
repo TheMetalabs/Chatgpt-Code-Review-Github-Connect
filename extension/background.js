@@ -119,18 +119,23 @@ async function rememberClosedTab(tabId, info) {
  * record keyed by the old id names a tab that is gone while the leg's tab lives on under the new one.
  * Its cleanup then took it for absent and never closed it, and an undispatched leg lost the record
  * that lets it send into the tab it created. The leg follows its tab: the session ownership record
- * (copied: the old id's record is kept, so a lane still checking the old id finds it, and Chrome never
- * reuses a tab id), a preserved backstop and a fix delivery record name the new id first, then the
- * leg's state.tabId moves (recorded as a tab_rekeyed step): a lane that reads the new id finds its
- * records in place. A leg that already released its tab (cleanupDone: closed or preserved) is left
- * as it is: following the tab would not make it Ashlar's again. */
+ * (copied: the old id's record is kept, marked replacedBy, so a lane still checking the old id finds
+ * it; Chrome never reuses a tab id), a preserved backstop and a fix delivery record name the new id
+ * first, then the leg's state.tabId moves (recorded as a tab_rekeyed step): a lane that reads the new
+ * id finds its records in place. A leg that already released its tab (cleanupDone: closed or
+ * preserved) is left as it is: following the tab would not make it Ashlar's again. */
 async function rekeyReplacedTab(addedTabId, removedTabId) {
   if (!Number.isInteger(addedTabId) || !Number.isInteger(removedTabId) || addedTabId === removedTabId) return;
   invalidateTabInventory(removedTabId);
   invalidateTabInventory(addedTabId);
   const session = await chrome.storage.session.get(null);
   const owned = session[OWNED_PREFIX + removedTabId], records = {};
-  if (owned) records[OWNED_PREFIX + addedTabId] = owned;
+  if (owned) {
+    const {replacedBy: _replaced, ...record} = owned;
+    records[OWNED_PREFIX + addedTabId] = record;
+    // Still proves what the old id was, but no longer names the leg's tab (allocation recovery).
+    records[OWNED_PREFIX + removedTabId] = {...record, replacedBy: addedTabId};
+  }
   for (const [key, value] of Object.entries(session)) {
     if (key.startsWith(PRESERVED_PREFIX) && value?.tabId === removedTabId) records[key] = {...value, tabId: addedTabId};
   }
@@ -1245,8 +1250,9 @@ async function pollProvider(job, provider, jobs, observeOnly = false) {
     // Creation may have succeeded before a worker restart. Recover a recorded owner;
     // if none can be established, keep the intent instead of opening another tab.
     const session = await chrome.storage.session.get(null);
+    // (A record Chrome replaced the tab of names the old id: its copy names the tab's current one.)
     const owner = Object.entries(session).find(([key, value]) => key.startsWith(OWNED_PREFIX) &&
-      value?.jobId === job.jobId && value.provider === provider && value.runId === state.runId);
+      value?.jobId === job.jobId && value.provider === provider && value.runId === state.runId && value.replacedBy === undefined);
     if (owner) state.tabId = Number(owner[0].slice(OWNED_PREFIX.length));
     else {
       const original = await findOriginalTab(job, provider);

@@ -517,3 +517,18 @@ for (const kind of ['review', 'fix']) {
     assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');
   });
 }
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: an allocation recovered after its tab was replaced takes the tab's current id, not the replaced one`, async () => {
+    // The worker stopped right after chrome.tabs.create (its tab id never reached the registry), and
+    // Chrome replaced that tab before the worker polled the leg again.
+    const unbound = (_id, m) => (m.type === 'ashlar-run' ? {ok: false, code: 'busy', retry: true} : {ok: false, code: 'idle', jobId: '', runId: '', provider: 'chatgpt'});
+    const job = leg(kind, {started: false, tabId: undefined, allocating: true}, kind === 'fix' ? {deliveryId: 'delivery-A'} : {});
+    const b = worker(job, {session: createdHere(kind), tab: {id: 10, url: TEMP, status: 'complete'}, handler: unbound});
+    if (kind === 'fix') b.local.state['ashlar:fixDeliveries'] = {'fix-A': {deliveryId: 'delivery-A', provider: 'chatgpt', phase: 'created', tabId: 10, at: Date.now()}};
+    await b.replaceTab(10, {id: 11, url: TEMP, status: 'complete'});
+    await b.tick();
+    assert.equal(b.pending().states.chatgpt.tabId, 11);
+    assert.deepEqual(b.messages.filter(m => m.type === 'ashlar-run' && !m.resume).map(m => m.id), [11], 'dispatched into the replaced tab');
+    assert.equal(b.tabs.size, 1, 'no second tab was opened for the leg');
+  });
+}

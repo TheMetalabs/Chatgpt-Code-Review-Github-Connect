@@ -307,8 +307,8 @@ function composerDraftText() {
  * are every shape the send barrier accepts (composer.js fileChipSelector, shared with
  * attachmentsReady, title-only chips included: Ashlar 4101623051), in the composer's own form, and a
  * chip is the run's own when any name it gives matches, as the barrier reads it. A group that wraps
- * the editor or the send control is the composer, not a file, and a named element inside a chip (its
- * remove control's title) is part of that chip, not another file. */
+ * the editor or the send control is the composer, not a file, and a named element inside a chip that
+ * names a file (its remove control's title) is part of that chip, not another file. */
 function composerStagedFiles(state, submission) {
   const editor = typeof composer === "function" && globalThis.document ? composer() : null;
   const form = editor?.closest?.("form");
@@ -316,12 +316,16 @@ function composerStagedFiles(state, submission) {
   const own = new Set(submission?.phase === "sent" ? [] : [...(Array.isArray(submission?.attachments) ? submission.attachments : []),
     ...(Array.isArray(state?.pendingAttachments) ? state.pendingAttachments : [])]);
   const shown = chip => (typeof renderedControl === "function" ? renderedControl(chip) : !hiddenNode(chip));
-  const chips = [...form.querySelectorAll(fileChipSelector())]
-    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button') && shown(chip));
-  return chips.filter(chip => !chips.some(outer => outer !== chip && outer.contains(chip)))
-    .map(chip => fileChipNames(chip).filter(name => name.trim()))
-    .filter(names => names.length && !names.some(name => own.has(name)))
-    .map(names => names[0]);
+  // Names first, then the fold: only a chip that names a file takes in the elements inside it. An
+  // unnamed element (an empty or blank title or label) is no chip, so a wrapper like that never hides
+  // the named chip inside it (Ashlar, review of 5af999fd: the user's staged file closed with the tab).
+  const named = [...form.querySelectorAll(fileChipSelector())]
+    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button') && shown(chip))
+    .map(chip => ({chip, names: fileChipNames(chip).filter(name => name.trim())}))
+    .filter(({names}) => names.length);
+  return named.filter(({chip}) => !named.some(outer => outer.chip !== chip && outer.chip.contains(chip)))
+    .filter(({names}) => !names.some(name => own.has(name)))
+    .map(({names}) => names[0]);
 }
 
 /** The response's variant pager: what the provider shows on an answer once it was regenerated (a

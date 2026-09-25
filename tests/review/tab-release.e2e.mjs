@@ -251,6 +251,31 @@ for(const [shape,chip] of CHIP_SHAPES){
   assert.deepEqual(w.b.closedTabs,[10]);assert.equal(w.state(),undefined);
  });
 }
+// Ashlar, review of 5af999fd: only a chip that names a file takes in the elements inside it. An
+// element in a chip shape that names nothing (an empty or blank title, an empty group label) is no
+// chip, so a wrapper like that never hides the user's named chip inside it: the tab is kept.
+const UNNAMED_WRAPPERS=[
+ ['an empty-title wrapper',html=>`<div title="" style="display:flex">${html}</div>`],
+ ['a whitespace-title wrapper',html=>`<div title=" " style="display:flex">${html}</div>`],
+ ['an empty-label group',html=>`<div role="group" aria-label="" style="display:flex">${html}</div>`],
+];
+const tileChip=CHIP_SHAPES.find(([shape])=>shape==='a data-file-name tile')[1];
+for(const [wrapper,wrap] of UNNAMED_WRAPPERS){
+ const wrapped=name=>wrap(tileChip(name));
+ for(const kind of ['review','fix'])test(`${kind}: a secured tab where the user's staged file sits inside ${wrapper} is preserved as a draft, never closed`,async t=>{
+  const {tab}=await collected(t,{kind});
+  await stageChip(tab.page,wrapped,'my-notes.pdf');
+  assert.deepEqual(await tab.page.evaluate(()=>composerStagedFiles(null,{phase:'sent'})),['my-notes.pdf']);
+  const out=await tab.send('ashlar-can-close',{allocationUrl:TEMP_URL,secured:true});
+  assert.deepEqual({...verdict(out),ownership:out.ownership},{canClose:false,reason:'repurposed',cause:'draft',ownership:'takenOver'});
+ });
+ test(`review: an undispatched page where the user's staged file sits inside ${wrapper} is not blank: never claimed as Ashlar's`,async t=>{
+  const tab=await chatTab(t,{bound:false});
+  await stageChip(tab.page,wrapped,'my-notes.pdf');
+  const out=await tab.send('ashlar-fix-cancel',{allocationUrl:TEMP_URL,undispatched:true});
+  assert.deepEqual({owned:out.owned,canClose:out.canClose,ownership:out.ownership,blank:out.blank,cause:out.cause},{owned:false,canClose:false,ownership:'takenOver',blank:false,cause:'draft'});
+ });
+}
 for(const kind of ['review','fix'])test(`${kind}: a secured tab moved in-page to another conversation (old DOM still rendered) is the user's`,async t=>{
  const {tab}=await collected(t,{kind});
  assert.equal((await canClose(tab)).canClose,true,'control: still in its own conversation');

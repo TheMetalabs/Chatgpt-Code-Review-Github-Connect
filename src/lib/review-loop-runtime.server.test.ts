@@ -481,6 +481,37 @@ describe("an incomplete review owes its loop-error handoff durably (the INCOMPLE
     assert.equal(f.prompts.length, 0, "no fix round past the incomplete review");
   });
 
+  it("the head moved and its push was missed: a review step that finds it moved recovers the owed handoff instead of returning superseded", async () => {
+    const f = fakeDeps({ reviews: [postedReview()], liveSha: MOVED });
+    const r = await run(f, "suggest", ENV_ON, job()); // a later review of HEAD, with a finding
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    const handoff = escalations(f.posted);
+    assert.equal(handoff.length, 1);
+    assert.ok(handoff[0].includes(`head=${HEAD}`), "for the incomplete review's head");
+    assert.ok(handoff[0].includes(INCOMPLETE_RECOVERED_DETAIL));
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 0, "the ended loop is not continued");
+    assert.equal(f.prompts.length, 0, "no fix round");
+    assert.deepEqual(await run(f, "suggest", ENV_ON, job()), { ran: false, reason: "superseded (head moved)" }, "settled: a later step is quiet");
+    assert.equal(escalations(f.posted).length, 1, "posted once");
+  });
+
+  it("the head moves during a fix round while an incomplete review of it ends the session: the round's superseded exit posts the handoff", async () => {
+    const reviews: Array<{ body: string; commitId: string; submittedAt: string }> = [];
+    const f = fakeDeps({ start: "apply", rounds: [3], reviews, movedDuringFix: true });
+    const requestFix = f.deps.requestFix;
+    f.deps.requestFix = (...a: Parameters<typeof requestFix>) => {
+      if (!reviews.length) reviews.push(postedReview(`2026-02-01T00:00:${String(f.posted.length).padStart(2, "0")}.500Z`));
+      return requestFix(...a);
+    };
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    assert.equal(f.committed, false);
+    const handoff = escalations(f.posted);
+    assert.equal(handoff.length, 1);
+    assert.ok(handoff[0].includes(`head=${HEAD}`));
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 0, "no continuation for the moved head past the ended loop");
+  });
+
   it("a later clean review of the head settles it: nothing is owed and nothing is posted", async () => {
     const clean = { body: "<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->", commitId: HEAD, submittedAt: "2026-01-11T00:00:00Z" };
     const f = fakeDeps({ reviews: [postedReview(), clean], liveSha: MOVED });

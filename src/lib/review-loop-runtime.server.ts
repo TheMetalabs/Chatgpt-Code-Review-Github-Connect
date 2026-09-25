@@ -784,21 +784,22 @@ export async function runPostReviewLoop(
     const gh = d.gh;
     // A moved head supersedes this review: the LIVE head's review drives the loop. The push handler
     // (or the round that pushed) normally requested it already; asking again is idempotent, so a
-    // missed push event can never stall an active loop.
-    const continueOn = async (live: PullHead): Promise<void> => {
-      if (live.sha === headSha) return;
+    // missed push event can never stall an active loop. Nor can it strand a handoff: a session that
+    // ended at a not-clean review owing one gets it here, as that push would have posted it.
+    // Returns the handoff's result when it posts one.
+    const continueOn = async (live: PullHead): Promise<LoopStepResult | undefined> => {
+      if (live.sha === headSha) return undefined;
       const now = await sessionOf(gh, token, ref, live, botLogin).catch(() => null);
-      if (!now?.active) return;
+      if (now && !now.active && now.owedHandoff) return await settleOwed(now.owedHandoff);
+      if (!now?.active) return undefined;
       const r = await ensureContinuation(gh, token, ref, { head: live.sha, mode: now.mode ?? "suggest", sinceIso: now.startIso, sinceSeq: now.startSeq, botLogin, sleep });
       trace(job.id, "superseded", { live: live.sha.slice(0, 7), continuation: r.posted ? "posted" : r.exists ? "exists" : `failed: ${r.error}` });
+      return undefined;
     };
     const head = await gh.fetchPullHeadRef(token, owner, repo, pr);
     // Also the fork-push guard: a commit parented on a stale SHA would fast-forward over a
     // contributor's backward force-push.
-    if (head.sha !== headSha) {
-      await continueOn(head);
-      return { ran: false, reason: SUPERSEDED };
-    }
+    if (head.sha !== headSha) return (await continueOn(head)) ?? { ran: false, reason: SUPERSEDED };
     let session = await sessionOf(gh, token, ref, head, botLogin);
     // This review was requested by a fresh human start whose record harbor could not post at
     // admission: record it now (idempotent — an existing record, e.g. one a later stop ended,
@@ -952,8 +953,7 @@ export async function runPostReviewLoop(
         return owed ? await settleOwed(owed) : { ran: false, reason: ENDED_NOT_CLEAN };
       }
       const live = await gh.fetchPullHeadRef(token, owner, repo, pr).catch(() => null);
-      if (live) await continueOn(live);
-      return { ran: false, reason: SUPERSEDED };
+      return (live && (await continueOn(live))) || { ran: false, reason: SUPERSEDED };
     };
     const before = await checkpoint();
     if (before) return await quietExit(before);

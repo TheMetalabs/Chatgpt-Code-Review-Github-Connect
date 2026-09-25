@@ -119,7 +119,8 @@ GitHub가 영속하는 이벤트(App의 기록·마커, 사람의 stop 코멘트
 findings 마커 플래그(`raw=1`, `unverified=1`)이고, `notCleanOutcomeOf`(`review-loop.ts`)가 네 결과를 한 곳에서 판별한다 —
 그렇지 않으면 핸드오프가 유실된 raw 리뷰 뒤의 push가 루프를 조용히 이어가고, suggest 모드에서는 이미 리뷰된 head를
 기다리며 멈춘다.
-그 리뷰 자신의 루프 단계가 핸드오프를 달고, 유실됐다면 PR의 **다음 루프 단계**(push, 다음 리뷰)가 영속 마커에서 복구해
+그 리뷰 자신의 루프 단계가 핸드오프를 달고, 유실됐다면 PR의 **다음 루프 단계**(push, 다음 리뷰, head가 움직인 걸
+발견한 리뷰 단계·라운드 — 놓친 push 웹훅 대신)가 영속 마커에서 복구해
 결과를 밝힌 고정 detail로 **한 번** 단다(수정 라운드·연속 요청은 없다 — 루프는 거기서 끝났다). 의무는 그 head의 봇 핸드오프, 사람의
 stop, 그 head(또는 live head)의 이후 clean 리뷰로 해소되고, 새 start는 새 세션을 연다. 루프가 이미 다른 head로 넘어간 뒤
 도착한 옛 head의 not-clean 리뷰는 stale clean 리뷰와 똑같이 무시된다(§2b).

@@ -68,16 +68,33 @@ export function extractChatJson(text: string): string | null {
 }
 
 /** extractChatJson plus what canonicalizing the reply to that object discards: the text the model
- * wrote around it, without markdown code-fence markers or surrounding whitespace. Empty when the
- * reply was only the object (fenced or not); anything else is text the accepted JSON does not carry. */
+ * wrote around it, verbatim, without the one complete code fence wrapping the object or surrounding
+ * whitespace. Empty when the reply was only the object (fenced or not); anything else is text the
+ * accepted JSON does not carry. */
 export function extractChatJsonParts(text: string): { json: string; residual: string } | null {
   const s = String(text || "");
   if (!s.trim()) return null;
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
   const span = lastJsonObjectSpan(s, isReviewObject);
   if (!span) return null;
-  const residual = `${s.slice(0, span.start)}\n${s.slice(span.end)}`.replace(/```[\w-]*/g, "").trim();
-  return { json: s.slice(span.start, span.end), residual };
+  const around = unwrapFence(s.slice(0, span.start), s.slice(span.end));
+  return { json: s.slice(span.start, span.end), residual: `${around.before}\n${around.after}`.trim() };
+}
+
+/** Remove the complete code fence directly around the accepted object, and nothing else: an opening
+ * run of three or more backticks (or tildes), at a line start, with an optional info string, right
+ * before it, and a closing run of the same character at least as long (CommonMark) right after it.
+ * Any fence length counts, so a four-backtick fence is not left behind as residual text; a lone or
+ * mismatched marker is not a fence pair and stays, as does every fence marker elsewhere in the reply. */
+function unwrapFence(before: string, after: string): { before: string; after: string } {
+  const head = before.trimEnd();
+  const lineStart = head.lastIndexOf("\n") + 1;
+  const open = /^[ \t]*(`{3,}|~{3,})[ \t]*[\w-]*$/.exec(head.slice(lineStart));
+  if (!open) return { before, after };
+  const tail = after.trimStart();
+  const close = new RegExp(`^${open[1][0]}{${open[1].length},}[ \\t]*(?=\\r?\\n|$)`).exec(tail);
+  if (!close) return { before, after };
+  return { before: head.slice(0, lineStart), after: tail.slice(close[0].length) };
 }
 
 /**

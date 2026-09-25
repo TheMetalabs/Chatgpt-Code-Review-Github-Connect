@@ -47,6 +47,8 @@ const fail500=res=>{res.writeHead(500,{'content-type':'application/json'});res.e
 const answer=(...replies)=>(res,i)=>{const r=replies[Math.min(i,replies.length-1)];typeof r==='function'?r(res):res.end(envelope(r));};
 const LOCAL={
   clean:{answer:answer(cleanJson)},
+  // the clean object alone inside one complete four-backtick fence: nothing outside it was discarded
+  fencedClean:{answer:answer('````json\n'+cleanJson+'\n````')},
   assumesSkipped:{answer:answer(assumesSkippedJson)},
   findings:{answer:answer(dirtyJson)},
   unparseable:{answer:answer(LOCAL_RAW)},
@@ -89,6 +91,7 @@ const RESIDUAL_NOTE=/could not be used as a review \(a completed reply carried t
 // [chat, local] → expected. stamp: which release the held local leg got (verify round / fallback / none).
 const CELLS={
   'clean x clean':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
+  'clean x fencedClean':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
   'clean x assumesSkipped':posted(CLEAN,M0,1,{note:/chatgpt found nothing; local verification agreed\./,stamp:'verify'}),
   'clean x findings':posted(SUMMARY,MF,1,{note:/chatgpt found nothing; local verification found 1\./,stamp:'verify'}),
   'clean x unparseable':posted(SUMMARY,MRU,2,{raw:['LOCAL-RAW'],note:RAW_NOTE,stamp:'verify'}),
@@ -110,6 +113,7 @@ const CELLS={
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`overflow x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_UNREAD}):chatRaw(WHY_UNREAD)])),
   // local as the chat-down fallback is an ordinary reviewer: race parity, no verification note
   'none x clean':posted(CLEAN,M0,1,{stamp:'fallback'}),
+  'none x fencedClean':posted(CLEAN,M0,1,{stamp:'fallback'}),
   'none x assumesSkipped':posted(CLEAN,M0,1,{stamp:'fallback'}),
   'none x findings':posted(SUMMARY,MF,1,{stamp:'fallback'}),
   'none x unparseable':posted(SUMMARY,MR,2,{raw:['LOCAL-RAW'],stamp:'fallback',why:WHY_UNPARSEABLE}),

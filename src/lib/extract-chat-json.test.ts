@@ -77,6 +77,22 @@ describe("extractChatJsonParts: what canonicalizing a reply to its review JSON d
     assert.deepEqual(extractChatJsonParts(`\`\`\`${PAYLOAD}\`\`\``), { json: PAYLOAD, residual: "" });
   });
 
+  it("nothing when the object's one complete fence is longer than three markers, or tildes", () => {
+    const fence = (open: string, close = open) => extractChatJsonParts(`${open}json\n${PAYLOAD}\n${close}`);
+    assert.deepEqual(fence("````"), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(fence("`````", "``````"), { json: PAYLOAD, residual: "" }, "a closing run may be longer");
+    assert.deepEqual(fence("~~~"), { json: PAYLOAD, residual: "" });
+  });
+
+  it("a fence that is not a matching pair around the object is kept, as is every fence in the prose", () => {
+    // three backticks do not close a four-backtick fence (CommonMark), so neither run is a fence pair
+    assert.match(extractChatJsonParts(`\`\`\`\`json\n${PAYLOAD}\n\`\`\``)?.residual ?? "", /^````json\s+```$/);
+    assert.match(extractChatJsonParts(`~~~\n${PAYLOAD}\n\`\`\``)?.residual ?? "", /^~~~\s+```$/);
+    // prose outside the fence keeps its own fence markers verbatim
+    const prose = "P1 a.ts:1 see ```ts\nwrite(twice)\n``` above";
+    assert.equal(extractChatJsonParts(`${prose}\n\`\`\`\`json\n${PAYLOAD}\n\`\`\`\``)?.residual, prose);
+  });
+
   it("the prose around the accepted object, before or after it", () => {
     const before = extractChatJsonParts(`P1 a.ts:1 PROSE-FINDING: a duplicate request writes twice\n\`\`\`json\n${PAYLOAD}\n\`\`\``);
     assert.equal(before?.json, PAYLOAD);

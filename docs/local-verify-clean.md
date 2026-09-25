@@ -50,7 +50,9 @@ Rules the table encodes:
   aside to get it: the one JSON correction never sees the first reply, so a clean correction says
   nothing about the finding that first reply may carry (`unparsedText`). Nor may any text of the reply
   itself be set aside: when canonicalizing a completed reply to its review JSON discards substantive
-  text around the object (`extractChatJsonParts`; code-fence markers and whitespace do not count), the
+  text around the object (`extractChatJsonParts`; whitespace and the one complete code fence wrapping the
+  object do not count — any run of three or more backticks or tildes, closed by a run of the same
+  character at least as long — while any other fence marker is kept as text; cell `clean × fencedClean`), the
   reply is kept verbatim (`residualReplies`, one-shot and multi-turn alike) and the object is not a
   verdict — prose before a clean object can be the finding. A reply the gate rejects (for
   example a `findings` that is not a list, or an empty result without `investigated_safe`) or one

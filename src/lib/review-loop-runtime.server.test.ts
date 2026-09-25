@@ -2250,4 +2250,60 @@ describe("a second step for the same head waits for the running one (#79 K2-8, K
     assert.equal(f.prompts.length, 1);
     assert.equal(f.committed, true);
   });
+
+  it("a waiter chain inherits the round that ran: a re-trigger arriving while the admitted waiter reads runs no second round", async (t) => {
+    const f = fakeDeps({ rounds: [3] });
+    const hold = holdFirst(t, f);
+    let suggested = false; // A posted its suggestion: the next head read is B's first, once admitted
+    const post = f.deps.gh.createIssueComment;
+    f.deps.gh.createIssueComment = async (tk, o) => {
+      const r = await post(tk, o);
+      if (o.body.startsWith("### Ashlar fix agent — suggestion")) suggested = true;
+      return r;
+    };
+    let releaseB!: () => void;
+    const heldB = new Promise<void>((res) => (releaseB = res));
+    t.after(() => releaseB());
+    let reachedB!: () => void;
+    const bReads = new Promise<void>((res) => (reachedB = res));
+    let heldOnce = false;
+    const head = f.deps.gh.fetchPullHeadRef;
+    f.deps.gh.fetchPullHeadRef = async (...a) => {
+      if (suggested && !heldOnce) {
+        heldOnce = true;
+        reachedB();
+        await heldB;
+      }
+      return head(...a);
+    };
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" }));
+    await settles(hold.generating);
+    const b = run(f, "suggest", ENV_ON, job({ id: "job-B" }));
+    hold.release();
+    await settles(bReads); // A finished; B was admitted and is on its first read
+    const d = run(f, "suggest", ENV_ON, job({ id: "job-D" })); // waits behind B
+    releaseB();
+    const [ra, rb, rd] = await settles(Promise.all([a, b, d]));
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", JSON.stringify(ra));
+    assert.deepEqual(rb, { ran: false, reason: ROUND_ALREADY_RUN });
+    assert.deepEqual(rd, { ran: false, reason: ROUND_ALREADY_RUN }, "B handed on the round A ran");
+    assert.equal(f.prompts.length, 1);
+    assert.equal(fixings(f.posted).length, 1);
+    assert.equal(suggestions(f.posted).length, 1);
+  });
+
+  it("the signature compares the EFFECTIVE mode: an apply re-issued under a suggest ceiling mid-round is the same round", async (t) => {
+    const f = fakeDeps({ rounds: [3] }); // session: suggest by alice
+    const hold = holdFirst(t, f);
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" })); // settings ceiling: suggest
+    await settles(hold.generating);
+    f.issues.push(recorded("apply", "alice", "2026-01-30T00:00:00Z")); // the ceiling keeps it suggest
+    const b = run(f, "suggest", ENV_ON, job({ id: "job-B" }));
+    hold.release();
+    const [ra, rb] = await settles(Promise.all([a, b]));
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", JSON.stringify(ra));
+    assert.deepEqual(rb, { ran: false, reason: ROUND_ALREADY_RUN });
+    assert.equal(f.prompts.length, 1);
+    assert.equal(suggestions(f.posted).length, 1);
+  });
 });

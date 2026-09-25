@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, rmSync, openSync, closeSync, fsyncSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type { Job, PostedReview, ReviewProvider, WebhookLog } from "./types.ts";
-import { sanitizeProgressEvents } from "./review-progress.server.ts";
+import { keptStage, sanitizeProgressEvents } from "./review-progress.server.ts";
 type Summary = {
     id: string;
     owner: string;
@@ -180,11 +180,22 @@ export class ReviewHistoryStore {
         if (++this.writes % 32 === 0)
             this.prune();
     }
+    /** A job's stored steps, each page or worker stage read back through keptStage: a label key or a
+     * sentinel as it is, another stage name (written before stages were kept as sentinels) as its
+     * sentinel, anything else dropped. Every read of the log goes through here, so a rewrite of it
+     * leaves no name behind either. */
+    private steps(id: string): { items: Step[]; dropped: number } {
+        const log = this.read<{ items: Step[]; dropped: number }>(this.jobKey(id, "steps")) || { items: [], dropped: 0 };
+        const items = log.items.flatMap(item => {
+            if (item.source !== "page" && item.source !== "worker")
+                return [item];
+            const stage = keptStage(item.stage);
+            return stage ? [{ ...item, stage }] : [];
+        });
+        return { items, dropped: log.dropped };
+    }
     private append(id: string, step: Step) {
-        const key = this.jobKey(id, "steps"), old = this.read<{
-            items: Step[];
-            dropped: number;
-        }>(key) || { items: [], dropped: 0 };
+        const key = this.jobKey(id, "steps"), old = this.steps(id);
         if (old.items.some(item => item.id === step.id))
             return;
         old.items.push(step);
@@ -202,10 +213,7 @@ export class ReviewHistoryStore {
     recordProgress(id: string, provider: ReviewProvider, runId: string, values: unknown) {
         if (!this.read<Summary>(this.jobKey(id)))
             return;
-        const key = this.jobKey(id, "steps"), log = this.read<{
-            items: Step[];
-            dropped: number;
-        }>(key) || { items: [], dropped: 0 };
+        const key = this.jobKey(id, "steps"), log = this.steps(id);
         const ids = new Set(log.items.map(item => item.id));
         let changed = false;
         for (const event of sanitizeProgressEvents(values)) {
@@ -327,10 +335,7 @@ export class ReviewHistoryStore {
         const job = this.read<Summary>(this.jobKey(id));
         if (!job)
             return null;
-        const log = this.read<{
-            items: Step[];
-            dropped: number;
-        }>(this.jobKey(id, "steps"));
+        const log = this.steps(id);
         const responses: Partial<Record<ReviewProvider, StoredResponse>> = {};
         if (includeResponses)
             for (const p of ["chatgpt", "grok", "local"] as const) {
@@ -353,7 +358,7 @@ export class ReviewHistoryStore {
             const {text, ...metadata} = record;
             return includeResponses ? {...record,totalChars:text.length} : {...metadata, totalChars:text.length};
         });
-        return { job, repairs, captures, steps: log?.items || [], droppedSteps: log?.dropped || 0, review: this.read(this.jobKey(id, "review")),
+        return { job, repairs, captures, steps: log.items, droppedSteps: log.dropped || 0, review: this.read(this.jobKey(id, "review")),
             ...(includeResponses ? { responses, observations } : {}), historical: true };
     }
     private page<T extends {

@@ -43,6 +43,26 @@ test('history: a well-formed stage without a label survives a restart as a hash 
  assert.equal(stepLabel({source:'server',stage:'job.awaiting_chat'}),'job.awaiting_chat','a server step is shown by its own name');
  assert.equal(unlabelledStep({source:'server',stage:'job.awaiting_chat'}),false);
 });
+test('history: a stored page or worker stage is read back only as a label key or a sentinel, and a rewrite keeps no name',async t=>{
+ // A steps file written before stages were kept as sentinels (or edited on disk) can hold a stage name
+ // without a label. Every read of it keeps a label key or a sentinel as it is, shows another stage name
+ // only as its sentinel, and drops anything else; a server step keeps its own name.
+ const {h,Store,dir}=await store(t);h.recordJob(job('A'));
+ const {createHash}=await import('node:crypto');const path=join(dir,'jobs',createHash('sha256').update('A').digest('hex'),'steps.json');
+ const stored=JSON.parse(readFileSync(path,'utf8'));
+ const row=(id,source,stage)=>({id,source,stage,at:1,provider:'chatgpt',runId:'run-A'});
+ stored.items.push(row('w1','worker','secret_token_abc123'),row('w2','page','generating'),row('w3','page','unlabelled:6fac6376'),
+  row('w4','worker','Secret Prompt'),row('w5','page','unlabelled:secret'),row('w6','worker',null),row('w7','page','constructor'));
+ writeFileSync(path,JSON.stringify(stored));
+ const expected=['job.awaiting_chat','unlabelled:9699b893','generating','unlabelled:6fac6376','unlabelled:e3c1703a'];
+ const restored=new Store(dir);
+ assert.deepEqual(restored.getJob('A').steps.map(x=>x.stage),expected);
+ assert.equal(JSON.stringify(restored.getJob('A',true)).includes('secret'),false);
+ assert.equal(JSON.stringify(restored.getJob('A',true)).toLowerCase().includes('prompt'),false);
+ restored.recordProgress('A','chatgpt','run-A',[{source:'page',sequence:9,stage:'json_observed',at:2}]);
+ assert.deepEqual(new Store(dir).getJob('A').steps.map(x=>x.stage),[...expected,'json_observed']);
+ assert.equal(/secret|Prompt/i.test(readFileSync(path,'utf8')),false,'the rewrite leaves no name on disk');
+});
 test('history: private responses are separate from lists/default detail and survive restart',async t=>{
  const {h,Store,dir}=await store(t);h.recordJob(job('A'));h.recordResponse('A','chatgpt','{"findings":[]}', 'PRIVATE ORIGINAL');
  assert.equal(JSON.stringify(h.listJobs({})).includes('PRIVATE'),false);assert.equal(JSON.stringify(h.getJob('A')).includes('PRIVATE'),false);

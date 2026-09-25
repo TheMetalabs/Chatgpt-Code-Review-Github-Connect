@@ -21,13 +21,22 @@ const HEADED = new Set(['if', 'while', 'for', 'with']);
  * `i++` a `/` divides, while after `+` it starts a regex that would swallow the code up to the next `/`. */
 const PUNCTUATORS = ['??', '?.', '||', '++', '--'];
 
+/** An escape that spells an identifier character (`st\u0061ge` is the name stage): the character and
+ * the escape's length at `i`, or null. */
+function escapeAt(text, i) {
+  const escape = /\\u(?:\{([\da-f]+)\}|([\da-f]{4}))/iy;
+  escape.lastIndex = i;
+  const match = escape.exec(text);
+  return match && {char: String.fromCodePoint(parseInt(match[1] ?? match[2], 16)), length: match[0].length};
+}
+
 /** One bracket level of JavaScript from `i` up to `close` (the end of `text` when there is none), as
- * tokens: str, tpl (`substs` holds the tokens of each ${}), regex, word, punct (PUNCTUATORS whole) and
- * group (a bracketed run holding its own tokens). Comments and whitespace are dropped. A closer that does
- * not match throws. */
+ * tokens: str, tpl (`substs` holds the tokens of each ${}), regex, word (its text is the name, escapes
+ * decoded), punct (PUNCTUATORS whole) and group (a bracketed run holding its own tokens), each spanning
+ * `at` to `end` in `text`. Comments and whitespace are dropped. A closer that does not match throws. */
 function tokenize(text, i, close) {
   const tokens = [];
-  const push = (kind, from, to, extra = {}) => { tokens.push({kind, at: from, text: text.slice(from, to), ...extra}); return to; };
+  const push = (kind, from, to, extra = {}) => { tokens.push({kind, at: from, end: to, text: text.slice(from, to), ...extra}); return to; };
   while (i < text.length && text[i] !== close) {
     const c = text[i], prev = tokens.at(-1);
     if (/\s/.test(c)) i += 1;
@@ -64,10 +73,14 @@ function tokenize(text, i, close) {
       if (text[inner.end] !== CLOSERS[c]) throw new Error(`unclosed ${c}`);
       i = push('group', i, inner.end + 1, {open: c, tokens: inner.tokens});
     } else if (')]}'.includes(c)) throw new Error(`unexpected ${c}`);
-    else if (/[\w$]/.test(c)) {
-      let j = i;
-      while (j < text.length && /[\w$]/.test(text[j])) j += 1;
-      i = push('word', i, j);
+    else if (/[\w$]/.test(c) || escapeAt(text, i)) {
+      let j = i, name = '';
+      for (let escape; j < text.length; ) {
+        if ((escape = escapeAt(text, j))) { name += escape.char; j += escape.length; }
+        else if (/[\w$]/.test(text[j])) name += text[j++];
+        else break;
+      }
+      i = push('word', i, j, {text: name});
     } else i = push('punct', i, i + (PUNCTUATORS.find(op => text.startsWith(op, i)) ?? c).length);
   }
   return {tokens, end: i};
@@ -109,7 +122,7 @@ function stageValues(text, tokens, found, where) {
     if (STAGE_NAME.test(only.value)) return found.literals.add(only.value);
     return found.problems.push(`${where}: ${only.text} is not a stage name (${STAGE_NAME})`);
   }
-  const expression = tokens.length ? text.slice(tokens[0].at, tokens.at(-1).at + tokens.at(-1).text.length) : '(missing)';
+  const expression = tokens.length ? text.slice(tokens[0].at, tokens.at(-1).end) : '(missing)';
   found.problems.push(`${where}: stage \`${expression}\` is not a literal, so its value cannot be checked for a label`);
 }
 
@@ -153,7 +166,7 @@ function recorderBodies(text) {
       const names = argumentsOf(params.tokens).map(param => param.length === 1 && param[0].kind === 'word' ? param[0].text : null);
       const param = names[RECORDERS[name.text]];
       const plain = param && names.every(Boolean) && names.filter(other => other === param).length === 1;
-      bodies.push({param: plain && forwardsUnchanged(body.tokens, param) ? param : null, from: body.at, to: body.at + body.text.length});
+      bodies.push({param: plain && forwardsUnchanged(body.tokens, param) ? param : null, from: body.at, to: body.end});
     }
     for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walk(inner);
   });
@@ -401,6 +414,7 @@ test('a stage argument the guard cannot read fails it instead of passing uncheck
   ]) assert.equal(problems(text).length, 1, `${text} is a problem, not a silent pass`);
   assert.match(problems('workerStep(job, provider, "dom_drift:follow_up");')[0], /not a stage name/);
   assert.match(problems('step(`Tab_Lost`);')[0], /not a stage name/);
+  assert.match(problems('recordReviewStep(st\\u0061ge);')[0], /stage `st\\u0061ge` is not a literal/, 'the problem quotes the source');
 });
 
 test('the guard reads the stage argument by position: other arguments, a conditional test and a forwarding recorder are not stages', () => {
@@ -440,6 +454,9 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
     // `++` and `--` are one operator: the `/` after them divides, so it does not hide the assignment.
     forwarding('n = i++ / 2; stage = computeStage(); m = n / 2;\n  recordReviewStep(stage);'),
     forwarding('n = i-- / 2; stage = computeStage(); m = n / 2;\n  recordReviewStep(stage);'),
+    // An escape in an identifier spells the same name.
+    forwarding('st\\u0061ge = computeStage();\n  recordReviewStep(stage);'),
+    forwarding('st\\u{61}ge = computeStage();\n  recordReviewStep(stage);'),
     forwarding('var stage = row.stage;\n  recordReviewStep(stage);'),
     forwarding('log(`${stage = computeStage()}`);\n  recordReviewStep(stage);'),
     forwarding('arguments[0] = computeStage();\n  recordReviewStep(stage);'),

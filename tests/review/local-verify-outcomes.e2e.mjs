@@ -441,6 +441,56 @@ for(const [name,grok] of Object.entries(LATE_GROK)){
   });
 }
 
+// The raw block is held under GitHub's body limit per reply, never by cutting the concatenation: a
+// late Grok reply longer than the whole limit, ahead of local verification's in the block, used to
+// take all of it, and the body still said local's reply was posted verbatim. The outcome, header, note
+// and handoff describe the block as posted.
+const LONG_GROK=`P1 a.ts:1 GROK-RAW ${'g'.repeat(70_000)} GROK-END`;
+const TRUNCATED_LOCAL={
+  // local's reply is short: it keeps its whole reply, so the block is local verification's reply
+  short:{reply:LOCAL_RAW,marker:MRU,localInFull:true},
+  // local's reply is long too: both are cut to equal shares, so the block holds neither in full
+  long:{reply:`${LOCAL_RAW} ${'l'.repeat(40_000)} LOCAL-END`,marker:MR,localInFull:false},
+};
+for(const [name,local] of Object.entries(TRUNCATED_LOCAL)){
+  test(`verify-clean outcome: a late grok reply over the body limit never crowds out a ${name} local verification reply, and the body says what it holds`,async t=>{
+    const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
+    app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+    const out=await app.mention(`matrix-late-grok-long-${name}`);
+    const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+    await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+    app.bridge.bridgeHeartbeat();
+    const take=app.bridge.takeNextBridgeJob('matrix-client');
+    assert.equal(app.bridge.failBridgeProvider(out.jobId,'grok','quota: usage limit reached',take.leaseId),true);
+    assert.equal((await app.bridge.completeBridgeJob(out.jobId,cleanJson,[{provider:'chatgpt',raw:cleanJson}],take.leaseId)).ok,true);
+    await eventually(()=>app.localRequests.length===1,'clean chatgpt did not start the verification round');
+    assert.equal((await app.bridge.completeBridgeJob(out.jobId,LONG_GROK,[{provider:'grok',raw:LONG_GROK}],take.leaseId)).ok,true);
+    await eventually(()=>job().storedLegs.some(l=>l.provider==='grok'),'the late grok reply was not kept');
+    let answered=0;
+    await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(envelope(local.reply));return app.reviews.length===1;},'the review was not posted');
+    const body=app.reviews[0].body;
+    const raw=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
+    assert.match(raw,/\*\*Grok:\*\*\n\nDetected severity markers: P1\.\n\nP1 a\.ts:1 GROK-RAW g+\n\n…\(Grok reply truncated to fit GitHub's review body limit/,'grok\'s reply keeps its start and its own marker');
+    assert.doesNotMatch(raw,/GROK-END/);
+    assert.ok(raw.includes('LOCAL-RAW'),'local verification\'s reply is in the block, never crowded out');
+    assert.equal(raw.includes(local.reply),local.localInFull,'local\'s reply is whole iff it fits its share');
+    assert.deepEqual([...(job().rawTruncated??[])],local.localInFull?['grok']:['grok','local']);
+    assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],local.marker);
+    assert.equal(converged(body),false);
+    const handoff=notCleanDetail(job(),postedOutcome(job(),0));
+    if(local.localInFull){
+      assert.match(body,/Local verification reply posted verbatim — it could not be used as a review\./);
+      assert.match(job().localVerifyNote,/local verification's reply could not be used as a review \([^)]*\); it is posted verbatim below\./);
+    }else{
+      assert.doesNotMatch(body,/Local verification reply posted verbatim/,'a cut reply is never called local verification\'s verbatim reply');
+      assert.match(body,/\*\*⚠️ Review posted verbatim — Grok: the reply was not valid review JSON \(truncated below[^)]*\); Local LLM: the reply was not valid review JSON \(truncated below to fit GitHub's review body limit, full original in review history\)\.\*\*/);
+      assert.equal(job().localVerifyNote,"chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); grok's reply could not be used as a review either; posted below (grok + local verification truncated to fit GitHub's review body limit, full originals in review history). Not a clean pass.");
+      assert.match(handoff,/^posted verbatim: Grok: [^;]*truncated below[^;]*; Local LLM: [^(]*\(truncated below/,'the loop handoff names the cut too');
+    }
+    assert.ok(body.includes(`\n${job().localVerifyNote}\n`),'the body carries the note');
+  });
+}
+
 // Scope of the residual-text rule (docs §1): it is local-only. A chat leg's verdict is the review JSON
 // its client submits. The extension picks that object out of the page and sends the turn capture
 // beside it (originalText): rendered code-block labels, reasoning summaries and page text the server

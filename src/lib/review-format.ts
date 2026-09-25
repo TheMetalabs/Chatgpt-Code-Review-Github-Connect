@@ -103,7 +103,7 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     // `Didn.t …` — any single char, so `Didnʼt`/backtick variants are covered) so a salvaged body can't
     // read as clean, then neutralize markers so the reply can't forge/break the raw wrapper or marker.
     raw: neutralizeMarkers((job.rawReview ?? "").trim().replace(/didn.t find any major issues\.?/gi, "(the model reported no major issues)")),
-    rawWhy: rawCauseText(job.rawCauses),
+    rawWhy: rawCauseText(job.rawCauses, job.rawTruncated),
   };
   switch (outcome) {
     case "findings":

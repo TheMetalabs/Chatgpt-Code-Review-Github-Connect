@@ -1109,7 +1109,10 @@ export async function submitHarborChat(
   // Verbatim reply(ies) from any leg whose JSON could not be parsed — surfaced in the review body so
   // the fixing agent can act instead of the job pending forever. Every leg's salvaged reply is
   // combined, a verifier's included: no review is silently discarded.
-  const rawReview = salvagedReview([...byProvider].map(([provider, g]) => ({ provider, rawReview: g.rawReview })), MAX_RAW_REVIEW_BODY);
+  const salvaged = salvagedReview([...byProvider].map(([provider, g]) => ({ provider, rawReview: g.rawReview })), MAX_RAW_REVIEW_BODY);
+  const rawReview = salvaged?.text;
+  // The legs the block holds only in part: the outcome, header and note describe the block as posted.
+  const rawTruncated = salvaged?.truncated.length ? salvaged.truncated : undefined;
   // Only a complete verdict counts (gateLeg), never payload presence or the absence of raw text:
   // that decides both whether local verified and which chat reviewers were clean.
   const structured = [...complete];
@@ -1125,7 +1128,7 @@ export async function submitHarborChat(
   // the same settings), so this count is the one the posted body renders.
   // Skipped reviewers come from provider state (`skipped`), never from the merged assumptions, which
   // also carry the reviewers' own free-form text.
-  const outcome = reviewOutcome({ ...job, rawReview, rawCauses, localVerified, assumptions: nextAssumptions, skippedProviders: skipped, incompleteProviders }, merged.findings.length);
+  const outcome = reviewOutcome({ ...job, rawReview, rawCauses, rawTruncated, localVerified, assumptions: nextAssumptions, skippedProviders: skipped, incompleteProviders }, merged.findings.length);
   // Credit only the chat reviewers that produced the clean structured result (pinned when the
   // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
   const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
@@ -1143,7 +1146,7 @@ export async function submitHarborChat(
   // Each merged reviewer's accepted finding count: the note credits findings to the leg that reported them.
   const findingsBy: Partial<Record<ReviewProvider, number>> = Object.fromEntries([...byProvider].map(([p, g]) => [p, g.findings.length]));
   const rawBy = [...byProvider].filter(([, g]) => g.rawReview).map(([p]) => p);
-  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified, rawBy });
+  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified, rawBy, rawTruncated });
   transitionJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,
@@ -1152,6 +1155,7 @@ export async function submitHarborChat(
     highestRisk: merged.highestRisk,
     rawReview,
     rawCauses: rawReview ? rawCauses : undefined,
+    rawTruncated,
     investigatedSafe: merged.investigatedSafe,
     assumptions: nextAssumptions,
     skippedProviders: skipped,

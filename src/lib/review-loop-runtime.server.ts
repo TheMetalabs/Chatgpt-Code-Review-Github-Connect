@@ -191,8 +191,8 @@ const NOT_CLEAN_DETAIL: Partial<Record<PostedOutcome, string>> = {
 /** The handoff detail for a non-converged zero-finding outcome. A raw review says why it is posted
  * verbatim from the causes its merge stamped (the same fixed text as the body's raw header), so a
  * reply whose unread rows made it evidence is never handed off as a parse failure. */
-export function notCleanDetail(job: Partial<Pick<Job, "rawCauses" | "skippedProviders" | "incompleteProviders">>, outcome: PostedOutcome): string {
-  if (outcome === "raw") return `posted verbatim: ${rawCauseText(job.rawCauses)}`;
+export function notCleanDetail(job: Partial<Pick<Job, "rawCauses" | "rawTruncated" | "skippedProviders" | "incompleteProviders">>, outcome: PostedOutcome): string {
+  if (outcome === "raw") return `posted verbatim: ${rawCauseText(job.rawCauses, job.rawTruncated)}`;
   // Incomplete from provider state: a reviewer that returned something, but no complete verdict, ran.
   if (outcome === "incomplete" && !job.skippedProviders?.length && job.incompleteProviders?.length) return "a reviewer returned no complete review";
   return NOT_CLEAN_DETAIL[outcome] ?? outcome;

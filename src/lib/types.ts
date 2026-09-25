@@ -114,6 +114,9 @@ export interface Job {
   /** Why each salvaged leg in rawReview is posted verbatim, stamped by the merge that salvaged it.
    * The body's raw header and the loop's handoff read the cause from here, never from the outcome. */
   rawCauses?: Partial<Record<ReviewProvider, RawCause>>;
+  /** The salvaged legs whose reply rawReview holds only in part (cut to fit GitHub's review body
+   * limit). Outcome, header and note describe the block as posted, never the replies before the cut. */
+  rawTruncated?: ReviewProvider[];
   investigatedSafe: string[];
   assumptions: string[];
   postedReviewId?: string;

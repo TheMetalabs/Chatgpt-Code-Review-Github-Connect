@@ -12,6 +12,7 @@ import {
 } from "./review-format.ts";
 import { OUTCOME_SHAPE, REVIEW_OUTCOMES, outcomeNote, postedOutcome, rawCauseText, reviewOutcome, salvagedReview, type OutcomeJob, type PostedOutcome, type ReviewOutcome } from "./review-outcome.ts";
 import { isConvergedFindings, parseFindingsTotal } from "./review-loop.ts";
+import { SALVAGE_TRUNCATED_MARK, salvageReviewJson } from "./extract-chat-json.ts";
 import type { Finding, Job, ReviewProvider } from "./types.ts";
 
 const CL: ReviewProvider[] = ["chatgpt", "local"];
@@ -67,6 +68,9 @@ describe("reviewOutcome: the one decision point", () => {
     ["D32 local verified, a late chat reply is raw evidence", verifying({ reviewProviders: CGL, localVerified: true, rawReview: "GROK-RAW", rawCauses: { grok: "unparseable" }, incompleteProviders: ["grok"] }), 0, "raw"],
     ["D33 local's reply and a late chat reply are both raw evidence", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "x", rawCauses: { grok: "unparseable", local: "not-a-verdict" } }), 0, "raw-unverified"],
     ["D34 no salvaged leg recorded: never attributed to local", verifying({ localVerified: false, rawReview: "x" }), 0, "raw"],
+    // ... and in the block in full: a local reply cut to fit the body limit is plain raw.
+    ["D35 local's reply cut to fit the body limit: plain raw", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "x", rawCauses: { grok: "unparseable", local: "unparseable" }, rawTruncated: ["local"] }), 0, "raw"],
+    ["D36 only the late chat reply cut: local's is in full", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "x", rawCauses: { grok: "unparseable", local: "unparseable" }, rawTruncated: ["grok"] }), 0, "raw-unverified"],
   ];
   for (const [name, j, findings, expected] of rows) {
     it(name, () => assert.equal(reviewOutcome(j, findings), expected));
@@ -188,6 +192,28 @@ describe("the raw header says why, from the cause the merge stamped (never from 
       "ChatGPT: the reply was not valid review JSON; Local LLM: the reply parsed, but its findings past the gate's row cap were not inspected",
     );
   });
+
+  it("a leg the block holds only in part says so in its clause", () => {
+    const cut = "truncated below to fit GitHub's review body limit, full original in review history";
+    assert.equal(rawCauseText({ local: "unparseable" }, ["local"]), `the reply was not valid review JSON (${cut})`);
+    assert.equal(
+      rawCauseText({ grok: "unparseable", local: "not-a-verdict" }, ["local"]),
+      `Grok: the reply was not valid review JSON; Local LLM: the reply could not be used as a complete structured review (${cut})`,
+    );
+    assert.equal(rawCauseText(undefined, ["chatgpt"]), `a reply could not be used as structured review JSON (${cut})`);
+    assert.equal(rawCauseText({ chatgpt: "unparseable" }, ["local"]), `the reply was not valid review JSON (${cut})`, "a cut leg with no cause is not hidden");
+  });
+
+  it("a verification round whose local reply is cut renders as raw: the header names the cut, never local's reply as posted verbatim", () => {
+    const body = reviewSummaryBody(
+      { ...verifying({ reviewProviders: CGL, localVerified: false, rawReview: "GROK-RAW\n\n---\n\nLOCAL-RAW", rawCauses: { grok: "unparseable", local: "unparseable" }, rawTruncated: ["local"] }), headSha: "abc1234ffff", coverage: [] },
+      [],
+      "ashlar-bot",
+    );
+    assert.doesNotMatch(body, /Local verification reply posted verbatim/);
+    assert.match(body, /Review posted verbatim — Grok: the reply was not valid review JSON; Local LLM: the reply was not valid review JSON \(truncated below to fit GitHub's review body limit, full original in review history\)\./);
+    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0");
+  });
 });
 
 describe("invariants over the closed enum", () => {
@@ -267,17 +293,59 @@ describe("outcomeNote", () => {
     );
     assert.doesNotMatch(outcomeNote("raw", { ...late, rawBy: [] }), /local verification's reply/);
   });
+  // The block holds a reply only in part: the note names it and never says the block is verbatim.
+  it("N13 raw in a verification round names the replies cut to fit, local's included", () => {
+    const round = { chat, verifying: true, findings: 0, findingsBy: {}, localVerified: false, localError: "not review JSON" };
+    assert.equal(
+      outcomeNote("raw", { ...round, rawBy: ["grok", "local"], rawTruncated: ["local"] }),
+      "chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); grok's reply could not be used as a review either; posted below (local verification truncated to fit GitHub's review body limit, full originals in review history). Not a clean pass.",
+    );
+    assert.equal(
+      outcomeNote("raw", { ...round, localError: "local LLM HTTP 500", rawBy: ["grok"], rawTruncated: ["grok"] }),
+      "chatgpt found nothing; local verification did not complete (local LLM HTTP 500); grok's reply could not be used as a review and is posted below (grok truncated to fit GitHub's review body limit, full originals in review history). Not a clean pass.",
+    );
+  });
 });
 
 describe("salvagedReview", () => {
   it("keeps every salvaged leg, the verifier's included, labeled when more than one", () => {
-    assert.equal(salvagedReview([{ provider: "chatgpt" }, { provider: "local", rawReview: "LOCAL-RAW" }], 100), "LOCAL-RAW");
-    const both = salvagedReview([{ provider: "chatgpt", rawReview: "CHAT-RAW" }, { provider: "local", rawReview: "LOCAL-RAW" }], 1000) ?? "";
-    assert.match(both, /\*\*ChatGPT:\*\*\n\nCHAT-RAW\n\n---\n\n\*\*Local LLM:\*\*\n\nLOCAL-RAW/);
+    assert.deepEqual(salvagedReview([{ provider: "chatgpt" }, { provider: "local", rawReview: "LOCAL-RAW" }], 100), { text: "LOCAL-RAW", truncated: [] });
+    const both = salvagedReview([{ provider: "chatgpt", rawReview: "CHAT-RAW" }, { provider: "local", rawReview: "LOCAL-RAW" }], 1000);
+    assert.match(both?.text ?? "", /\*\*ChatGPT:\*\*\n\nCHAT-RAW\n\n---\n\n\*\*Local LLM:\*\*\n\nLOCAL-RAW/);
+    assert.deepEqual(both?.truncated, []);
   });
 
   it("is undefined with nothing salvaged, and truncates past the limit", () => {
     assert.equal(salvagedReview([{ provider: "chatgpt" }], 100), undefined);
-    assert.match(salvagedReview([{ provider: "local", rawReview: "x".repeat(50) }], 10) ?? "", /^x{10}\n\n…\(truncated/);
+    const one = salvagedReview([{ provider: "local", rawReview: "x".repeat(50) }], 10);
+    assert.match(one?.text ?? "", /^x{10}\n\n…\(truncated/);
+    assert.deepEqual(one?.truncated, ["local"]);
+  });
+
+  // A late chat reply ahead of local's in a verification round: cutting the concatenation let the
+  // earlier reply take the whole limit and drop local's, while the outcome still credited local.
+  it("a long earlier reply never crowds a later one out: each leg keeps its share, and a cut one says so", () => {
+    const chat = `CHAT-START ${"c".repeat(5_000)} CHAT-END`;
+    const local = "P1 a.ts:1 LOCAL-RAW duplicate write";
+    const out = salvagedReview([{ provider: "grok", rawReview: chat }, { provider: "local", rawReview: local }], 1_000);
+    assert.ok(out?.text.includes(`**Local LLM:**\n\n${local}`), "local's short reply is kept in full");
+    assert.match(out?.text ?? "", /^\*\*Grok:\*\*\n\nCHAT-START c+\n\n…\(Grok reply truncated to fit GitHub's review body limit/);
+    assert.doesNotMatch(out?.text ?? "", /CHAT-END/);
+    assert.deepEqual(out?.truncated, ["grok"]);
+    // both over their share: each keeps its start and ends in its own marker
+    const long = salvagedReview([{ provider: "grok", rawReview: chat }, { provider: "local", rawReview: `LOCAL-START ${"l".repeat(5_000)}` }], 1_000);
+    assert.match(long?.text ?? "", /\*\*Grok:\*\*\n\nCHAT-START c+\n\n…\(Grok reply truncated[^)]*\)\n\n---\n\n\*\*Local LLM:\*\*\n\nLOCAL-START l+\n\n…\(Local LLM reply truncated/);
+    assert.deepEqual(long?.truncated, ["grok", "local"]);
+    const kept = (long?.text ?? "").split("\n\n---\n\n").map((part) => part.replace(/^\*\*[^*]+:\*\*\n\n/, "").replace(/\n\n…\([^)]*\)$/, "").length);
+    assert.ok(Math.abs(kept[0] - kept[1]) <= 1, `equal shares: ${kept}`);
+    assert.ok((long?.text ?? "").replace(/\n\n…\([^)]*\)/g, "").length <= 1_000, "the replies and their frame stay within the limit");
+  });
+
+  it("a reply the salvage already cut counts as cut even when it fits", () => {
+    const cut = JSON.parse(salvageReviewJson(`P1 LOCAL-RAW ${"x".repeat(70_000)}`)).raw_review as string;
+    assert.ok(cut.length <= 60_000 && cut.endsWith(SALVAGE_TRUNCATED_MARK), "the salvage marks its own cut");
+    assert.deepEqual(salvagedReview([{ provider: "local", rawReview: cut }], 60_000), { text: cut, truncated: ["local"] });
+    const whole = JSON.parse(salvageReviewJson("P1 LOCAL-RAW")).raw_review as string;
+    assert.deepEqual(salvagedReview([{ provider: "local", rawReview: whole }], 60_000)?.truncated, []);
   });
 });

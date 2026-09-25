@@ -275,6 +275,40 @@ const ROWS=[
       assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
       return s;
     }},
+  // Every authenticated bridge request under the owner's lease speaks for the owner before its action
+  // runs (noteBridgeRequest): a submit the server cannot archive yet is still the owner, alive.
+  {name:'L25 the owner\'s submits fail on history storage for minutes: each is heard from the owner first, so local stays held, and the run completes once storage is back',expect:{status:'posted',requests:0,reviews:1,reviewers:VERIFIER,ops:VERIFIER_OPS},
+    async run(t){
+      const fault={on:false};
+      const failing=new Set(['recordJob','recordResponse']);
+      const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({reviewHistory(){
+        const history=real.reviewHistory();
+        return fault.on?new Proxy(history,{get(target,prop){
+          if(failing.has(prop))return()=>{throw new Error('history store unavailable');};
+          const value=target[prop];return typeof value==='function'?value.bind(target):value;
+        }}):history;
+      }})}};
+      const s=await start(t,{githubOptions,delivery:'lifecycle-history-submits'});
+      s.app.bridge.bridgeHeartbeat();
+      const take=s.app.bridge.takeNextBridgeJob('client-a');
+      assert.equal(take?.jobId,s.jobId,'client A claims the job');
+      const submit=()=>fetch(s.app.origin+'/api/bridge',{method:'POST',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},
+        body:JSON.stringify({action:'complete',jobId:s.jobId,leaseId:take.leaseId,results:[{provider:'chatgpt',raw:dirty}]})}).then(async r=>({status:r.status,...await r.json()}));
+      fault.on=true;
+      // 5 min past the claim, past BRIDGE_CONNECTED_MS (2 min): A's only requests are submits that fail
+      for(let i=0;i<5;i++){
+        s.app.clock.now+=60_000;
+        const out=await submit();
+        assert.equal(out.status,503,'the submit is refused until its archive is saved');
+        assert.equal(out.code,'history_unavailable');
+        assert.equal(s.app.bridge.chatBridgeLink(s.job()).connected,true,'the owner stays connected');
+        await new Promise(resolve=>setTimeout(resolve,60)); // a few watcher ticks at each step
+      }
+      assert.equal(s.app.localRequests.length,0,'no verify-clean fallback while the owner submits');
+      fault.on=false; // history storage restored: the owner's retry lands
+      assert.equal((await submit()).status,200);
+      return s;
+    }},
   {name:'L13 a bridge token rotation waits the grace from the rotation, not from an older unseen bridge',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,reviewers:FALLBACK_ONLY,ops:FALLBACK_OPS},
     async run(t){
       // Job A is admitted while the bridge has never been seen, then the bridge connects and stays
@@ -474,6 +508,10 @@ test('chat bridge link: an owned job follows its owner, an unowned one the serve
   assert.deepEqual(link('client-a'),{connected:false,disconnectedAt:claimedAt+120_000},'offline when its own window closed');
   assert.equal(app.bridge.recoverBridgeJob('client-a',[]),null,'nothing to recover');
   assert.equal(link('client-a').connected,true,'a recover request is heard from its profile');
+  app.clock.now+=120_001;
+  assert.equal(link('client-a').connected,false);
+  assert.equal(app.bridge.recoverBridgeJob('client-a','malformed'),null,'a malformed recover');
+  assert.equal(link('client-a').connected,true,'is heard from its profile too');
   app.clock.now+=10_000;
   app.bridge.rotateBridgeToken();
   assert.deepEqual(link('client-a'),{connected:false,disconnectedAt:app.clock.now},'offline at the rotation, as an unseen bridge is');

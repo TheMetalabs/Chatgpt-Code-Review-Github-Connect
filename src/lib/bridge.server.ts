@@ -50,8 +50,8 @@ function loadToken(): string {
 }
 
 let meta: BridgeMeta = { token: loadToken(), lastSeen: 0, unseenSince: Date.now() };
-/** When each Chrome profile (clientId) was last heard from: a request naming it (take, claim,
- * recover) or a lease ping for a job it owns. Kept apart from meta.lastSeen, which any profile
+/** When each Chrome profile (clientId) was last heard from: an authenticated request naming it (take,
+ * claim, recover) or carrying its lease for a job it owns (noteBridgeRequest). Kept apart from meta.lastSeen, which any profile
  * refreshes, because a claimed job's chat run can be resumed only by its owner. */
 const clientSeen = new Map<string, number>();
 const MAX_TRACKED_CLIENTS = 256;
@@ -104,6 +104,24 @@ function noteClientSeen(clientId: string | undefined) {
   clientSeen.delete(clientId);
   clientSeen.set(clientId, Date.now());
   if (clientSeen.size > MAX_TRACKED_CLIENTS) clientSeen.delete(clientSeen.keys().next().value!);
+}
+
+/** Only a request under the owner's own lease speaks for the owner. */
+function noteLeaseOwner(job: Pick<Job, "bridgeLeaseId" | "bridgeClientId"> | undefined, leaseId: unknown) {
+  if (job?.bridgeLeaseId && job.bridgeLeaseId === leaseId) noteClientSeen(job.bridgeClientId);
+}
+
+/** Owner liveness comes from the authenticated request itself, recorded before the action runs: a
+ * request naming its profile (take, claim, recover) or carrying the owner's lease for its job (ping,
+ * submit, failure, progress, observation, capture, repair, release). Nothing the action does after
+ * that (a job patch, a history write that fails) can turn a live owner into a disconnect, which
+ * would release a verify-clean job's local leg as the fallback under a chat run that is still going.
+ * The bridge route calls this for every authenticated POST. */
+export function noteBridgeRequest(body: { clientId?: unknown; jobId?: unknown; leaseId?: unknown }) {
+  if (typeof body.clientId === "string") noteClientSeen(body.clientId);
+  if (typeof body.jobId === "string" && typeof body.leaseId === "string") {
+    noteLeaseOwner(getHarbor().jobs.find((j) => j.id === body.jobId), body.leaseId);
+  }
 }
 
 /** The bridge link a job's chat run depends on. A claimed job (bridgeClientId) can be resumed only by
@@ -262,8 +280,8 @@ export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[
  * This is NOT a capacity bypass for take/new generation and never widens providers.
  */
 export function recoverBridgeJob(clientId: string, values: unknown) {
+  noteClientSeen(clientId); // the request is heard from its profile whatever it asks for
   if (!clientId || !Array.isArray(values) || values.length > 16) return null;
-  noteClientSeen(clientId);
   const bindings = values.filter((item): item is {jobId:string;provider:"chatgpt"|"grok";runId:string} =>
     Boolean(item && typeof item === "object" && typeof item.jobId === "string" && item.jobId.length <= 160 &&
       isChatProvider(item.provider) && typeof item.runId === "string" && item.runId.length > 0 && item.runId.length <= 128));
@@ -344,6 +362,8 @@ export function refreshBridgeClaim(
 ): boolean {
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return false;
+  // Before the patch: the ping speaks for its owner whatever the patch or its history write does.
+  noteLeaseOwner(job, leaseId);
   patchHarborJob(jobId, current => {
     const nextGenerating = {...current.generating};
     const nextErrors = {...current.providerErrors};
@@ -362,8 +382,6 @@ export function refreshBridgeClaim(
     }
     return {...current, bridgeClaimedAt: Date.now(), generating: nextGenerating, providerErrors: nextErrors, updatedAt: Date.now()};
   });
-  // Only a ping under the owner's own lease speaks for the owner.
-  if (job.bridgeLeaseId && job.bridgeLeaseId === leaseId) noteClientSeen(job.bridgeClientId);
   meta.lastJobId = jobId;
   return true;
 }

@@ -243,7 +243,10 @@ export function buildReviewerLanes(
       return {provider, state: "waiting", label, detail: "connection unknown · waiting for reconnection", answered: false};
     }
     const progress=job.providerProgress?.[provider];
-    if(progress) {
+    // A provider that stopped with an error the server recorded has ended (a disconnect returned above):
+    // its last progress stage is stale, so the error builds the lane ("usage limit", "review tab closed").
+    const ended = g === false && Boolean(job.providerErrors?.[provider]);
+    if(progress && !ended) {
       return {provider,state:stageIs(progress.stage,"generating")?"generating":"waiting",label,detail:progressLabel(progress.stage),answered:false};
     }
     if (g === true) {

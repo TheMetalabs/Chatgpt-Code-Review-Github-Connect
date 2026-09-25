@@ -271,12 +271,11 @@ describe("buildReviewerLanes", () => {
 
   it("emptyReviewSkip does not read a usage limit into a stage that has no label", () => {
     // A stage without a label is not the provider reporting a usage limit, whatever its name says
-    // ("quota"); the lane shows only its hash.
+    // ("quota"); the lane of a provider still in flight shows only its hash.
     const [event] = sanitizeProgressEvents([{source: "page", sequence: 1, stage: "quota_banner_dismissed", at: 1}]);
     const lanes = buildReviewerLanes(job({
       reviewProviders: ["chatgpt"],
-      generating: {chatgpt: false},
-      providerErrors: {chatgpt: {code: "error", message: "context_lost: the page lost the conversation"}},
+      generating: {chatgpt: true},
       providerProgress: {chatgpt: {runId: "run", stage: event.stage, observedAt: 1, receivedAt: 1}},
     }));
     assert.equal(lanes[0].detail, "Unlabelled step · #0cb42f85");
@@ -317,19 +316,32 @@ describe("buildReviewerLanes", () => {
   });
 
   it("a progress stage recorded before the provider's quota error does not mask it", () => {
-    // Reported: ChatGPT had reached waiting_for_json when the server recorded its quota error. The lane
-    // is built by the progress branch, and its flag still comes from the provider's error.
-    const lanes = buildReviewerLanes(job({
-      reviewProviders: ["chatgpt"],
-      generating: {chatgpt: false},
-      providerErrors: {chatgpt: {code: "quota", message: "You've reached the limit"}},
-      providerProgress: {chatgpt: {runId: "run", stage: "waiting_for_json", observedAt: 1, receivedAt: 1}},
-    }));
-    assert.equal(lanes[0].detail, "Response visible · waiting for valid review JSON", "the progress branch built it");
-    assert.equal(lanes[0].usageLimited, true);
-    const skip = emptyReviewSkip(lanes);
+    // Reported: ChatGPT had reached waiting_for_json when the server recorded its quota error. The
+    // provider has ended, so the error builds the lane, its flag and the ops line the headline points to.
+    const stopped = (error: {code: "quota" | "tab_closed" | "error"; message: string}, stage: "waiting_for_json" | "generating") =>
+      buildReviewerLanes(job({
+        reviewProviders: ["chatgpt"],
+        generating: {chatgpt: false},
+        providerErrors: {chatgpt: error},
+        providerProgress: {chatgpt: {runId: "run", stage, observedAt: 1, receivedAt: 1}},
+      }));
+    const quota = stopped({code: "quota", message: "You've reached the limit"}, "waiting_for_json");
+    assert.deepEqual([quota[0].state, quota[0].detail, quota[0].usageLimited], ["empty", "usage limit", true]);
+    const skip = emptyReviewSkip(quota);
     assert.equal(skip.usageLimited, true);
     assert.equal(skip.skipReason, "reviewers could not complete — usage limit reached");
+    assert.deepEqual(skip.ops, ["No review posted — a reviewer hit its usage limit before returning JSON.", "ChatGPT: usage limit"]);
+    // The same holds for another terminal error, whichever stage was recorded last.
+    const closed = stopped({code: "tab_closed", message: "review tab was explicitly closed"}, "generating");
+    assert.deepEqual([closed[0].state, closed[0].detail, closed[0].usageLimited], ["empty", "review tab closed", false]);
+    assert.deepEqual(emptyReviewSkip(closed).ops,
+      ["No review posted — reviewers could not complete (see per-reviewer details).", "ChatGPT: review tab closed"]);
+    const lost = stopped({code: "error", message: "context_lost: the page lost the conversation"}, "waiting_for_json");
+    assert.deepEqual([lost[0].state, lost[0].detail, lost[0].usageLimited], ["empty", "error: context_lost: the page lost the conversation", false]);
+    // A provider still marked generating is in flight: its progress stage builds the lane.
+    const inFlight = buildReviewerLanes(job({reviewProviders: ["chatgpt"], generating: {chatgpt: true},
+      providerProgress: {chatgpt: {runId: "run", stage: "waiting_for_json", observedAt: 1, receivedAt: 1}}}));
+    assert.deepEqual([inFlight[0].state, inFlight[0].detail], ["waiting", "Response visible · waiting for valid review JSON"]);
   });
 
   it("every lane branch reads a usage limit from the same evidence", () => {
@@ -341,7 +353,8 @@ describe("buildReviewerLanes", () => {
     } as const;
     for (const [evidence, providerErrors] of Object.entries(errors)) {
       const branches = {
-        progress: job({reviewProviders: ["chatgpt"], generating: {chatgpt: false}, providerErrors,
+        // A provider still marked generating is the one whose progress stage builds the lane.
+        progress: job({reviewProviders: ["chatgpt"], generating: {chatgpt: true}, providerErrors,
           providerProgress: {chatgpt: {runId: "run", stage: "generating", observedAt: 1, receivedAt: 1}}}),
         skipNote: job({reviewProviders: ["chatgpt"], providerErrors, assumptions: ["Skipped chatgpt: tab_closed: review tab was explicitly closed"]}),
         skippedJob: job({status: "cancelled", reviewProviders: ["chatgpt"], providerErrors, skipReason: "cancelled by operator"}),

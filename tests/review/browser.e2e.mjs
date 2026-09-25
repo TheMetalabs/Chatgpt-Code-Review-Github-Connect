@@ -1322,6 +1322,19 @@ for(const [name,upload,ms,detail] of [
  });
 }
 
+test('real DOM: a Send click that produces no user turn ends as send_unconfirmed within a minute, with no second click',async t=>{
+ const {text}=await fixDelivery();
+ const {page,fill,journal}=await attachmentPage(t,{swallow:true});
+ const early=await fill(text,30_000);
+ assert.deepEqual([early.code,early.sent,await page.evaluate(()=>window.clicks)],[undefined,false,1],'clicked once, still waiting for the turn at 30 s');
+ await page.clock.runFor(35_000);
+ const out=await page.evaluate(()=>({...window.filled,clicks:window.clicks}));
+ assert.equal(out.code,'send_unconfirmed',JSON.stringify(out));
+ assert.match(out.error,/no sent turn appeared within 60 seconds/);
+ assert.equal(out.clicks,1,'never clicked again');
+ assert.equal((await journal()).phase,'attempted');
+});
+
 test('real DOM (#93): a fix attachment whose bytes do not match the hash, a typed line without the hash, or a broken frame is never staged or sent',async t=>{
  const {attachment,typed,text}=await fixDelivery();
  const {fixDeliveryText}=await attachmentLib();

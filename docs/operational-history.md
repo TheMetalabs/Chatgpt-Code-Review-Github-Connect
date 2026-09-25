@@ -23,10 +23,10 @@ has no duration deadline; a fix attachment has 3 minutes.
 A click, an empty composer, a Stop control or elapsed time cannot confirm receipt.
 
 Once a click might have reached the site, it is not automatically repeated. A
-missing acknowledgement is `send_unconfirmed`; an old page without a send journal
-is `submission_unknown`. Inspect the original tab and, only after confirming that
-it still contains the unsent draft, submit manually there. The observer can then
-confirm the matching message. Never open a replacement review or reset storage to
+missing acknowledgement is `send_unconfirmed`: if no matching user turn renders
+within 60 s of the click, the run ends with that code (1.1.30; before, it waited out
+the whole run deadline). An old page without a send journal is `submission_unknown`.
+Inspect the original tab; the ended run does not observe a manual submit. Never open a replacement review or reset storage to
 recover an ambiguous send. This is deliberately not a promise of exactly-once
 submission across an arbitrary provider/browser failure.
 

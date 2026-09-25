@@ -619,6 +619,10 @@ async function clickSend(findSend, findComposer, expectedText) {
     saveSubmission(record);
     step("prompt_prepared");
   }
+  // The window after a Send click for its user turn to render. Past it the click was not taken (e.g.
+  // ChatGPT dropping a click mid-upload): the run ends as send_unconfirmed, never re-sent.
+  const CONFIRM_MS = 60 * 1000;
+  let attemptSeen = null;
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
     // After the confirmation check, so an accepted send is still journaled as sent; before any
@@ -630,6 +634,13 @@ async function clickSend(findSend, findComposer, expectedText) {
     if (record.phase === "attempted") {
       // Delivery is ambiguous. Never automatically replay a possibly accepted prompt.
       step("send_unconfirmed");
+      attemptSeen ??= Number.isSafeInteger(record.attemptedAt) ? record.attemptedAt : Date.now();
+      if (Date.now() - attemptSeen >= CONFIRM_MS) {
+        const error = new Error(`Send was clicked but no sent turn appeared within ${CONFIRM_MS / 1000} seconds; ` +
+          "the prompt is not sent again; inspect the tab");
+        error.code = "send_unconfirmed";
+        throw error;
+      }
     } else {
       const editor = findComposer(), button = findSend();
       const form = editor?.closest("form");
@@ -649,6 +660,7 @@ async function clickSend(findSend, findComposer, expectedText) {
       if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
           !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
         record.phase = "attempted";
+        record.attemptedAt = Date.now();
         saveSubmission(record); // durable intent BEFORE invoking the site's handler
         // In memory only: the conversation this page instance clicked in (submissionConfirmed
         // records it once the send is proven, and only if the page still shows it then). The

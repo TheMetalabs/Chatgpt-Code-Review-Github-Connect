@@ -27,11 +27,20 @@ test('submission: disabled upload/send controls may wait for days without fallin
  await acknowledge(page);await page.clock.runFor(500);assert.equal((await page.evaluate(()=>result)).submitted,true);
 });
 
-test('submission: a no-op click is not confirmation, and delayed ACK never resends',async t=>{
+test('submission: a no-op click is not confirmation, and a delayed ACK within the window never resends',async t=>{
  const page=await fixture(t);await start(page);await page.clock.runFor(500);
  assert.equal((await page.evaluate(()=>result)).pending,true,'click is only an attempt, not provider receipt');
- await page.clock.fastForward(365*24*3600_000);assert.equal(await page.evaluate(()=>clicks),1);
+ await page.clock.runFor(45_000);assert.equal(await page.evaluate(()=>clicks),1);
  await acknowledge(page);await page.clock.runFor(500);assert.equal((await page.evaluate(()=>result)).submitted,true);assert.equal(await page.evaluate(()=>clicks),1);
+});
+
+// The live 1.1.29 run sat in send_unconfirmed for 10+ minutes after a click ChatGPT dropped.
+test('submission: a click whose turn never renders ends as send_unconfirmed after 60 s and is never resent',async t=>{
+ const page=await fixture(t);await start(page);await page.clock.runFor(59_000);
+ assert.equal((await page.evaluate(()=>result)).pending,true);
+ await page.clock.runFor(2_000);
+ assert.match((await page.evaluate(()=>result)).error||'',/no sent turn appeared within 60 seconds/);
+ assert.equal(await page.evaluate(()=>clicks),1);
 });
 
 test('submission: a cleared composer or a different user turn is not the owned request',async t=>{

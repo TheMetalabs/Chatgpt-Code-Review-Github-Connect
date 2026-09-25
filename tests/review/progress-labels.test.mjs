@@ -352,26 +352,78 @@ function constBefore(path, name) {
   return null;
 }
 
-/** Whether `tokens[k]` uses `name` other than as the object of a member read (`name.x` or `name?.x`,
- * not assigned, updated or deleted): a rebinding, an assignment, an argument or an alias can change what
- * `name.x` holds later. with, eval and arguments reach a binding without naming it. */
-function misuses(tokens, k, name) {
-  const token = tokens[k], before = tokens[k - 1], after = tokens[k + 3];
-  if (token.kind !== 'word' || isPunct(before, '.') || isPunct(before, '?.')) return false;
-  if (INDIRECT.has(token.text)) return true;
-  if (token.text !== name) return false;
-  const member = (isPunct(tokens[k + 1], '.') || isPunct(tokens[k + 1], '?.')) && tokens[k + 2]?.kind === 'word';
-  const written = after?.kind === 'punct' && (ASSIGN.has(after.text) || after.text === '++' || after.text === '--');
-  const prefixed = isPunct(before, '++') || isPunct(before, '--') || (before?.kind === 'word' && before.text === 'delete');
-  return !member || written || prefixed;
+const MISUSE = 'uses other than as a member read';
+
+const isWord = (token, text) => token?.kind === 'word' && token.text === text;
+
+/** Whether an expression followed by `after` is a target: of an assignment, of a for-of head, or of a
+ * for-in head when it starts one (`head`; elsewhere `in` is an operator). */
+const assignedBy = (after, head) => (after?.kind === 'punct' && ASSIGN.has(after.text)) || isWord(after, 'of') || (head && isWord(after, 'in'));
+
+/** Whether an expression between `before` and `after` is written: a target, updated or deleted. */
+const written = (before, after, head) => assignedBy(after, head) || isPunct(after, '++') || isPunct(after, '--') ||
+  isPunct(before, '++') || isPunct(before, '--') || isWord(before, 'delete');
+
+/** What surrounds the tokens inside the group `tokens[k]`, given `ctx` around `tokens`: whether they are
+ * a for head; through parentheses, the tokens around the whole parenthesised run (`(a.b) = x` assigns
+ * a.b); and whether they are in an assignment pattern (`[a.b] = x`, `for ({v: a.b} of rows)`), where any
+ * member chain can be a target. */
+function innerContext(tokens, k, ctx) {
+  const group = tokens[k], head = ctx.forHead && k === 0;
+  if (group.open !== '(') return {pattern: ctx.pattern || assignedBy(tokens[k + 1], head)};
+  const forHead = isWord(tokens[k - 1], 'for') || (isWord(tokens[k - 1], 'await') && isWord(tokens[k - 2], 'for'));
+  return {forHead, pattern: ctx.pattern, around: tokens.length === 1 && ctx.around ? ctx.around : {before: tokens[k - 1], after: tokens[k + 1], head}};
 }
 
-/** The first token of `tokens[from..to)`, groups and template substitutions included, that misuses `name`. */
-function firstMisuse(tokens, from, to, name) {
+/** The member chain after the name at `tokens[k]` (`.a`, `?.a`, `[k]`, calls and tags) up to `end`, and
+ * `handed`: the static member names up to the object that `holds` says still holds what the binding does
+ * ([] for the name itself) when that object is handed on — as the chain's value, or to a call, a tag or
+ * a computed member applied to it — else null. A call or a tag receives the object its function is read from. */
+function memberChain(tokens, k, holds) {
+  const names = [];
+  let j = k + 1, handed = null, broken = false;
+  for (;;) {
+    const dot = isPunct(tokens[j], '.') || isPunct(tokens[j], '?.'), next = dot ? tokens[j + 1] : tokens[j];
+    if (dot && next?.kind === 'word') {
+      if (!broken) names.push(next.text);
+    } else if (next?.open === '(' || next?.open === '[' || (next?.kind === 'tpl' && !dot)) {
+      const object = next.open === '[' ? names : names.slice(0, -1);
+      if (!broken && holds(object)) handed ??= object;
+      broken = true;
+    } else return {end: j, handed: handed ?? (!broken && holds(names) ? names : null)};
+    j += dot ? 2 : 1;
+  }
+}
+
+/** Why `tokens[k]` may change what `name.x` holds from then on, or null. `name` may appear only as the
+ * object of a member chain that is read, not written: a write anywhere along it (assigned, updated,
+ * deleted, a pattern or for-in/of target, through parentheses) changes what it reaches. Nor may what the
+ * binding holds be handed on: the name itself as a value, or a call, a tag or a computed member on it. For
+ * `aliases` of `name` (`const status = response.repair`: the object at `response.repair` is status's), the
+ * members down to the aliased object are the binding's too, save in the alias's own initialiser (`skip`).
+ * with, eval and arguments reach a binding without naming it. */
+function misuses(tokens, k, name, aliases, ctx) {
+  const token = tokens[k];
+  if (token.kind !== 'word' || isPunct(tokens[k - 1], '.') || isPunct(tokens[k - 1], '?.')) return null;
+  if (INDIRECT.has(token.text)) return MISUSE;
+  if (token.text !== name) return null;
+  const below = names => aliases.find(({path}) => names.length <= path.length && names.every((part, i) => part === path[i]));
+  const {end, handed} = memberChain(tokens, k, names => !names.length || Boolean(below(names)));
+  const {before, after, head} = k === 0 && end === tokens.length && ctx.around ? ctx.around : {before: tokens[k - 1], after: tokens[end], head: ctx.forHead && k === 0};
+  if (ctx.pattern || written(before, after, head)) return MISUSE;
+  if (!handed || aliases.some(alias => alias.skip === token)) return null;
+  return handed.length ? `${MISUSE} (${[name, ...handed].join('.')} holds what ${below(handed).by} aliases)` : MISUSE;
+}
+
+/** The first token of `tokens[from..to)`, groups and template substitutions included, that misuses
+ * `name`, as {token, why}, or null. `ctx` is what surrounds `tokens` (innerContext). */
+function firstMisuse(tokens, from, to, name, aliases, ctx = {}) {
   for (let k = from; k < to; k += 1) {
-    if (misuses(tokens, k, name)) return tokens[k];
-    for (const inner of tokens[k].kind === 'group' ? [tokens[k].tokens] : tokens[k].substs ?? []) {
-      const hit = firstMisuse(inner, 0, inner.length, name);
+    const why = misuses(tokens, k, name, aliases, ctx);
+    if (why) return {token: tokens[k], why};
+    const token = tokens[k];
+    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) {
+      const hit = firstMisuse(inner, 0, inner.length, name, aliases, token.kind === 'group' ? innerContext(tokens, k, ctx) : {});
       if (hit) return hit;
     }
   }
@@ -381,31 +433,47 @@ function firstMisuse(tokens, from, to, name) {
 /** What could change or shadow `name` between its declaration `decl` and the read at the end of `path`:
  * the first misuse in the code between them (an earlier substitution of a template the read is in
  * included), or a function declaration of the name in a level the read sits in, hoisted over it. */
-function changedBetween(path, decl, name) {
-  let hit = firstMisuse(path[decl.frame].tokens, decl.at + 1, path[decl.frame].index, name);
+function changedBetween(path, decl, name, aliases) {
+  const contexts = [{}];
+  for (let frame = 1; frame < path.length; frame += 1) {
+    const {tokens, index} = path[frame - 1];
+    contexts.push(tokens[index].kind === 'group' ? innerContext(tokens, index, contexts[frame - 1]) : {});
+  }
+  let hit = firstMisuse(path[decl.frame].tokens, decl.at + 1, path[decl.frame].index, name, aliases, contexts[decl.frame]);
   for (let frame = decl.frame + 1; frame < path.length; frame += 1) {
     const holder = path[frame - 1].tokens[path[frame - 1].index], level = path[frame].tokens;
     for (const prior of holder.kind === 'tpl' ? holder.substs.slice(0, holder.substs.indexOf(level)) : []) {
-      hit ||= firstMisuse(prior, 0, prior.length, name);
+      hit ||= firstMisuse(prior, 0, prior.length, name, aliases);
     }
-    hit ||= firstMisuse(level, 0, path[frame].index, name) ||
-      level.find((token, k) => token.kind === 'word' && token.text === name && level[k - 1]?.text === 'function');
+    const hoisted = level.find((token, k) => token.kind === 'word' && token.text === name && level[k - 1]?.text === 'function');
+    hit ||= firstMisuse(level, 0, path[frame].index, name, aliases, contexts[frame]) || (hoisted && {token: hoisted, why: MISUSE});
   }
   return hit;
 }
 
+/** What a `const` declared by `by` with initialiser `init` aliases: the object its leading member chain
+ * reaches (`response.repair` for `const status = response.repair`), as {root, path, by, skip}; `skip` is
+ * that chain's root token, the alias itself rather than a use of the root. */
+function aliasOf(init, by) {
+  const [root] = init, path = [];
+  for (let j = 1; (isPunct(init[j], '.') || isPunct(init[j], '?.')) && init[j + 1]?.kind === 'word'; j += 2) path.push(init[j + 1].text);
+  return {root: root?.kind === 'word' ? root.text : null, path, by, skip: root};
+}
+
 /** The problem with a recorded template whose expression reads names bound as `bound` lists, if any.
  * Each name must be the nearest enclosing `const` before the read (for a later name, before the previous
- * name's declaration), initialised as listed, and neither changed nor shadowed up to the read. */
+ * name's declaration), initialised as listed, and neither changed nor shadowed up to the read, nor may
+ * what an earlier name aliases through it (`status` is `response.repair`) be. */
 function boundProblems(site, bound) {
-  const path = [...site.path, ...pathTo(site.level, site.token)];
+  const path = [...site.path, ...pathTo(site.level, site.token)], aliases = [];
   let from = path;
   for (const {name, init, is} of bound) {
     const decl = constBefore(from, name), read = `${site.where}: \`${site.template}\` reads ${name}`;
     if (!decl) return [`${read}, which no \`const ${name} = ...\` before it in an enclosing block declares, so its values are unknown`];
     if (!init.test(render(decl.init))) return [`${read} = \`${render(decl.init)}\`, not ${is}, so its values are unknown`];
-    const changed = changedBetween(path, decl, name);
-    if (changed) return [`${read}, which line ${lineOf(site.text, changed)} uses other than as a member read, so it may not hold ${is} there`];
+    const changed = changedBetween(path, decl, name, aliases.filter(alias => alias.root === name));
+    if (changed) return [`${read}, which line ${lineOf(site.text, changed.token)} ${changed.why}, so it may not hold ${is} there`];
+    aliases.push(aliasOf(decl.init, name));
     from = [...path.slice(0, decl.frame), {tokens: path[decl.frame].tokens, index: decl.at}];
   }
   return [];
@@ -730,6 +798,9 @@ test('repair_${status.status} takes the RepairStatus values only where status is
   assert.deepEqual(problems(`${REPAIR_REPLY}if (typeof status.id !== "string" || row?.status) return;\nif (ok) {\n  ${record};\n  function helper() {}\n}`), []);
   assert.deepEqual(problems('const response = await api("/api/bridge", {...repairBody(job, provider, "repair", attempt), source}, job.origin);\n' +
     `const status = response.repair;\nif (status?.id && status.runId === attempt.runId) {\n  attempt.id = status.id;\n  ${record};\n}`), []);
+  // Reading values below either name, a method of such a value, and writes elsewhere change neither.
+  assert.deepEqual(problems(`${REPAIR_REPLY}note(response.repair.id, response?.repair?.runId, response.ok, status.status.trim(), [status.id], status.id in row);\n` +
+    `attempt.status = response.repair.status; attempt.repair = {detail: status.status}; row.response.repair = null;\n${record};`), []);
   const reply = REPAIR_REPLY;
   for (const [body, problem] of [
     // Another binding named status, or none.
@@ -764,6 +835,38 @@ test('repair_${status.status} takes the RepairStatus values only where status is
     [`${reply}with (row) ${record};`, 'line 4 uses'],
     [`${reply}eval(patch);\n${record};`, 'line 4 uses'],
     [`${reply}log(\`\${status.status = "stalled"} \${${record}}\`);`, 'line 4 uses'],
+    // A write anywhere along a chain from the name, the same through parentheses, a pattern or a for head.
+    [`${reply}status.detail.status = "stalled";\n${record};`, 'reads status, which line 4 uses other than as a member read'],
+    [`${reply}(status.status) = "stalled";\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}delete ((status.status));\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}[status.status] = ["stalled"];\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}({late: status.status} = patch);\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for (status.status of ["stalled"]) break;\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for (status.status in row) break;\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for await ((status.status) of rows) break;\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for ((status.status) in row) break;\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for ([status.status] in row) break;\n${record};`, 'reads status, which line 4 uses'],
+    // status is the object at response.repair, so a write through that source changes status.status too,
+    // before status is declared as well as after.
+    [`${reply}response.repair.status = "stalled";\n${record};`, 'reads response, which line 4 uses other than as a member read, so it may not hold the bridge'],
+    [`${reply}response.repair.status += "_late";\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}++response.repair.status;\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}response?.repair.status--;\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}delete response.repair.status;\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}response.repair.status ??= "stalled";\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}response.repair = patch;\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}response.repair[key] = "stalled";\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}[response.repair.status] = ["stalled"];\n${record};`, 'reads response, which line 4 uses'],
+    [reply.replace('\nconst status', '\nresponse.repair.status = "stalled";\nconst status') + `${record};`, 'reads response, which line 3 uses'],
+    // Handing that object on lets other code write it: an argument, an alias, a method call on it.
+    [`${reply}Object.assign(response.repair, patch);\n${record};`,
+      'reads response, which line 4 uses other than as a member read (response.repair holds what status aliases), so it may not hold the bridge'],
+    [`${reply}const alias = response.repair;\nalias.status = "stalled";\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}normalize(response?.repair);\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}response.repair.reset();\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}(response.repair).status = "stalled";\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [reply.replace('\nconst status', '\nObject.assign(response.repair, patch);\nconst status') + `${record};`,
+      'line 3 uses other than as a member read (response.repair holds what status aliases)'],
   ]) {
     const found = problems(body);
     assert.equal(found.length, 1, `${body}\n: ${found.join('\n')}`);

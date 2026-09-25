@@ -50,7 +50,11 @@
  *     PR supersedes the older; a deadline (fixAgent.chatTimeoutMs, default 30 min) and the
  *     attachment cap (FIX_ATTACHMENT_MAX_BYTES, 512 KiB) turn a stuck
  *     tab or an oversized PR into a rejected request → retry, then ESCALATE fix-failed (never a
- *     hang). The watcher's abort (head moved, loop stopped, its deadline) cancels the item, so
+ *     hang). FALLBACK (fixSource=github, fix-source-github.ts): an attachment over the cap, or one
+ *     the page could not stage (attachment_failed), sends a short typed request instead and ChatGPT
+ *     reads the files at the head SHA through its GitHub connector; a failed connector check ends
+ *     the round (connector_unavailable → fix-failed), a stale baseBlobSha or an out-of-scope path is
+ *     rejected before any commit. The watcher's abort (head moved, loop stopped, its deadline) cancels the item, so
  *     the extension stops the run and preserves the tab (a fix tab is closed only after a
  *     delivered, re-proven answer) instead of generating an answer nobody reads. Only delivery
  *     "script-apply" is wired; "chat-push" fails closed.
@@ -58,7 +62,8 @@
 import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, type RequestFix } from "./fix-agent.ts";
 import { BranchMovedError, type GitDataApi } from "./fix-commit.ts";
 import type { FixRequest } from "./bridge-fix.server.ts";
-import { fixAttachment, fixTypedPrompt } from "./fix-attachment.ts";
+import { FixAttachmentError, fixAttachment, fixTypedPrompt, type FixAttachment } from "./fix-attachment.ts";
+import { attachmentSwitch, isConnectorUnavailable, requestConnectorFix, type GithubFixSource } from "./fix-source-github.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
@@ -802,18 +807,44 @@ export async function requestChatFix(
   ref: PrRef,
   provider: "chatgpt",
   prompt: string,
-  opts: { signal?: AbortSignal; loadBridge?: BridgeFixLoader } = {},
+  opts: { signal?: AbortSignal; loadBridge?: BridgeFixLoader; github?: GithubFixSource } = {},
 ): Promise<string> {
   if (!WIRED_FIX_DELIVERIES.includes(settings.fixAgent.delivery)) {
     throw new Error(`fix delivery ${settings.fixAgent.delivery} is not wired for ${provider} (${WIRED_FIX_DELIVERIES.join(", ")} only)`);
   }
+  const github = opts.github;
+  const signal = opts.signal ? { signal: opts.signal } : {};
+  const load = () => (opts.loadBridge ?? (() => import("./bridge.server.ts")))();
+  // fixSource=github (fix-source-github.ts) is the FALLBACK: only for a round that carries its GitHub
+  // source, and only once the attachment is over its cap or the page could not stage it.
+  const viaGithub = async (): Promise<string> => {
+    const bridge = await load();
+    return requestConnectorFix((r) => bridge.requestBridgeFix(r), github!, CHAT_FIX_FENCE_RULE, opts.signal);
+  };
+  if (github?.switched.reason) return viaGithub();
   // The full request travels as a file (the composer does not keep typed whitespace, #93); the
   // typed prompt is one canonical line naming it and its SHA-256. Over the cap this throws before
-  // any bridge item exists (request-failed → fix-failed with the cap in the reason).
-  const attachment = fixAttachment(`${prompt}\n\n${CHAT_FIX_FENCE_RULE}`);
+  // any bridge item exists (request-failed → fix-failed with the cap in the reason), unless the
+  // round can fall back to the GitHub source.
+  let attachment: FixAttachment;
+  try {
+    attachment = fixAttachment(`${prompt}\n\n${CHAT_FIX_FENCE_RULE}`);
+  } catch (e) {
+    if (!github || !(e instanceof FixAttachmentError) || e.code !== "attachment_too_large") throw e;
+    github.switched.reason = "attachment_too_large";
+    return viaGithub();
+  }
   const typed = fixTypedPrompt(attachment, CHAT_FIX_FENCE_RULE);
-  const bridge = await (opts.loadBridge ?? (() => import("./bridge.server.ts")))();
-  return bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt: typed, attachment, ...(opts.signal ? { signal: opts.signal } : {}) });
+  const bridge = await load();
+  try {
+    return await bridge.requestBridgeFix({ owner: ref.owner, repo: ref.repo, pr: ref.pr, provider, prompt: typed, attachment, ...signal });
+  } catch (e) {
+    // The page could not stage the file (nothing was sent): retry once through the GitHub source.
+    const why = github && !opts.signal?.aborted ? attachmentSwitch((e as Error)?.message ?? String(e)) : undefined;
+    if (!why) throw e;
+    github!.switched.reason = why;
+    return viaGithub();
+  }
 }
 
 /** Production provider routing (productionDeps' requestFix). local is a plain request/response;
@@ -826,7 +857,7 @@ export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { 
     const provider = settings.fixAgent.provider;
     const transport = fixProviderCaps(provider).transport;
     if (transport === "chrome-bridge") {
-      return requestChatFix(settings, ref, "chatgpt", prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge });
+      return requestChatFix(settings, ref, "chatgpt", prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge, ...(ctl?.github ? { github: ctl.github } : {}) });
     }
     if (transport !== "local-llm") throw new Error(fixProviderUnsupported(provider));
     const local = await import("./local-chat-request.server.ts");
@@ -1371,8 +1402,34 @@ export async function runPostReviewLoop(
     // The provider call runs under the watcher: the deadline excludes queue time, and a queued (or
     // just-started) request whose head moved or whose session ended is cancelled instead of
     // generated in full.
+    // The round's GitHub source (fix-source-github.ts): the chatgpt transport falls back to it when
+    // the attachment cannot be delivered. The head tree's blobs are read once, only if it is used.
+    const editablePaths = files.map((f) => f.path);
+    let headBlobs: Promise<ReadonlyMap<string, string>> | undefined;
+    const githubSource = {
+      owner,
+      repo,
+      pr,
+      headSha,
+      paths: editablePaths,
+      findings: renderFindings(findings),
+      ...(settings.fixAgent.provider ? { reviewer: settings.fixAgent.provider } : {}),
+      headBlobs: () => {
+        const api = gh.gitDataApi(token, owner, repo);
+        if (!api.blobShas) return Promise.reject(new Error("the GitHub client cannot read the head tree's blobs"));
+        headBlobs ??= api.blobShas(headSha, editablePaths).catch((e) => {
+          headBlobs = undefined; // a failed read is retried by the next attempt
+          throw e;
+        });
+        return headBlobs;
+      },
+      switched: {},
+    } satisfies GithubFixSource;
     const requestFix: RequestFix = (p) =>
-      watchFixRequest((prompt, ctl) => deps2.requestFix(prompt, ctl), p, {
+      watchFixRequest((prompt, ctl) => {
+        const retryNote = prompt.startsWith(basePrompt) ? prompt.slice(basePrompt.length).trim() : "";
+        return deps2.requestFix(prompt, { ...ctl, github: { ...githubSource, ...(retryNote ? { retryNote } : {}) } });
+      }, p, {
         ...fixWatchLimits(settings, deps2, env),
         stillWanted: async () => {
           const why = await checkpoint();
@@ -1401,7 +1458,7 @@ export async function runPostReviewLoop(
           branch: head.ref,
           baseCommitSha: headSha,
           message: `fix: apply ashlar review (PR #${pr}, ${headSha.slice(0, 7)})`,
-          allowedPaths: files.map((f) => f.path),
+          allowedPaths: editablePaths,
           findingCount: findings.length,
         },
       );
@@ -1410,6 +1467,8 @@ export async function runPostReviewLoop(
       // a commit refused because the starter lost write access.
       if (moot && res.outcome !== "applied") return await quietExit(moot);
       if (authFailure && res.outcome !== "applied") return await escalate("loop-error", authFailure);
+      // No GitHub connector (or it read another commit): another attempt would fail the same way.
+      if (res.outcome === "request-failed" && isConnectorUnavailable(res.error)) break;
       if (!RETRYABLE.has(res.outcome) || attempts >= maxAttempts) break;
       const why = await checkpoint();
       if (why) return await quietExit(why);

@@ -838,6 +838,22 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
       if (!out.ok || !out.data.sha) throw new Error(out.ok ? "commit has no sha" : `create commit failed (${out.status}): ${out.text}`);
       return out.data.sha;
     },
+    async blobShas(commitSha: string, paths: readonly string[]): Promise<Map<string, string>> {
+      // One contents read per path (at most the PR's changed files): unlike a recursive tree read it
+      // is never truncated in a large repository. A path that is not a file there is left out.
+      const out = new Map<string, string>();
+      for (const path of paths) {
+        const safe = isSafeRepoPath(path);
+        if (!safe) continue;
+        const res = await gh<{ sha?: string; type?: string }>(
+          token,
+          `/repos/${owner}/${repo}/contents/${encodeURIComponent(safe).replaceAll("%2F", "/")}?ref=${encodeURIComponent(commitSha)}`,
+        );
+        if (res.ok && res.data.type === "file" && typeof res.data.sha === "string") out.set(path, res.data.sha);
+        else if (!res.ok && res.status !== 404) throw new Error(`read blob of ${path} failed (${res.status}): ${res.text}`);
+      }
+      return out;
+    },
     async readBranchRef(branch: string): Promise<string> {
       const cur = await gh<{ object?: { sha?: string } }>(token, `${base}/ref/heads/${branch}`);
       if (!cur.ok || !cur.data.object?.sha) throw new Error(`read ref failed (${cur.ok ? "no sha" : cur.status})`);

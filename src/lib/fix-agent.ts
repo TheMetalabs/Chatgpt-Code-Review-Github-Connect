@@ -17,6 +17,7 @@
  */
 import { isSensitivePath, parseFixResponse, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { commitFiles, type GitDataApi } from "./fix-commit.ts";
+import type { GithubFixSource } from "./fix-source-github.ts";
 
 export type FixMode = "suggest" | "apply";
 
@@ -25,7 +26,13 @@ export type FixMode = "suggest" | "apply";
  * exclude queue time and a stale request can be cancelled (fix-request-watch.ts). */
 export type RequestFix = (
   prompt: string,
-  ctl?: { signal?: AbortSignal; onActivity?: (phase: "queued" | "generating") => void },
+  ctl?: {
+    signal?: AbortSignal;
+    onActivity?: (phase: "queued" | "generating") => void;
+    /** The round's GitHub source: a chatgpt fix falls back to it when its attachment cannot be
+     * delivered (fix-source-github.ts). Other transports ignore it. */
+    github?: GithubFixSource;
+  },
 ) => Promise<string>;
 
 export interface FixRoundResult {
@@ -49,6 +56,48 @@ export interface FixPromptFile {
   content: string; // head-pinned CURRENT content (the authoritative base for a full-file rewrite)
 }
 
+/** Rule 4 differs by where the model reads the current content: inline in the prompt, or through
+ * its GitHub connector at the pinned head (fix-source-github.ts). Every other rule is shared. */
+const RULE_4_INLINE = [
+  "4. Return the COMPLETE new content of each changed file by EDITING the CURRENT CONTENT",
+  "   shown below — never a diff, never elisions like '// ... rest unchanged', never",
+  "   reconstruct from memory. Only the paths shown below may be changed; any other path is",
+  "   rejected. Unsafe/absolute/`..` paths are rejected.",
+];
+const RULE_4_GITHUB = [
+  "4. Return the COMPLETE new content of each changed file by EDITING the file exactly as you",
+  "   read it at the pinned commit — never a diff, never elisions like '// ... rest unchanged', never",
+  "   reconstruct from memory. Only the editable paths may be changed; any other path is",
+  "   rejected. Unsafe/absolute/`..` paths are rejected.",
+];
+
+/** The fix rules, as prompt lines. */
+export function fixRules(source: "inline" | "github"): string[] {
+  return [
+    "1. Classify each finding by CONTENT, ignoring its P-tag: Fix / Push-back (rebut with",
+    "   evidence) / Decline (reason + evidence) / Defer (issue# + code marker). Do NOT 'fix' a false",
+    "   positive — you would plant a real bug to satisfy a fake one.",
+    "2. Re-audit the WHOLE flagged file plus siblings; fix every instance of the finding's",
+    "   defect class in one pass, with a call-site census of every entry point a guard protects.",
+    "3. Nth same-class finding → remove the bad state (root cause), do not add another guard.",
+    ...(source === "inline" ? RULE_4_INLINE : RULE_4_GITHUB),
+    "5. For EVERY finding ID below (F1, F2, …) add one \"dispositions\" entry: action fixed |",
+    "   pushback | decline | defer, and a one-sentence note — what you changed, or the evidence",
+    "   / reason you did not. It is posted as the reply in that finding's review thread.",
+    "6. Scope: change only what the flagged defect classes need. No renames, reformatting,",
+    "   refactors or comment edits outside the fix; keep the diff outside the defect class minimal.",
+    "7. Reuse first: prefer the existing proven helpers/guards in the files below. Add ONE shared",
+    "   helper (in one in-scope file) only when the same defect class appears in 2+ places; no",
+    "   other new abstractions.",
+    "8. Bounds: for every guard or clamp you add, the note states what it bounds and what happens",
+    "   when the condition never trips.",
+    "9. Tests: if the code's test file is in scope, add a regression test there; otherwise the",
+    "   note says \"test needed: <test file or location>\".",
+    "10. A decline or defer MUST cite evidence in its note: an issue number (#123), a file:line,",
+    "   or a quoted code reference. Without it the disposition is invalid and the reply is rejected.",
+  ];
+}
+
 export function buildFixPrompt(input: {
   findings: string; // the posted review findings (verbatim)
   files: FixPromptFile[]; // in-scope files with their current content — the ONLY editable paths
@@ -65,30 +114,7 @@ export function buildFixPrompt(input: {
     "return ONLY a JSON object with the full new content of every file you change.",
     "",
     "Rules (do not skip):",
-    "1. Classify each finding by CONTENT, ignoring its P-tag: Fix / Push-back (rebut with",
-    "   evidence) / Decline (reason + evidence) / Defer (issue# + code marker). Do NOT 'fix' a false",
-    "   positive — you would plant a real bug to satisfy a fake one.",
-    "2. Re-audit the WHOLE flagged file plus siblings; fix every instance of the finding's",
-    "   defect class in one pass, with a call-site census of every entry point a guard protects.",
-    "3. Nth same-class finding → remove the bad state (root cause), do not add another guard.",
-    "4. Return the COMPLETE new content of each changed file by EDITING the CURRENT CONTENT",
-    "   shown below — never a diff, never elisions like '// ... rest unchanged', never",
-    "   reconstruct from memory. Only the paths shown below may be changed; any other path is",
-    "   rejected. Unsafe/absolute/`..` paths are rejected.",
-    "5. For EVERY finding ID below (F1, F2, …) add one \"dispositions\" entry: action fixed |",
-    "   pushback | decline | defer, and a one-sentence note — what you changed, or the evidence",
-    "   / reason you did not. It is posted as the reply in that finding's review thread.",
-    "6. Scope: change only what the flagged defect classes need. No renames, reformatting,",
-    "   refactors or comment edits outside the fix; keep the diff outside the defect class minimal.",
-    "7. Reuse first: prefer the existing proven helpers/guards in the files below. Add ONE shared",
-    "   helper (in one in-scope file) only when the same defect class appears in 2+ places; no",
-    "   other new abstractions.",
-    "8. Bounds: for every guard or clamp you add, the note states what it bounds and what happens",
-    "   when the condition never trips.",
-    "9. Tests: if the code's test file is in scope, add a regression test there; otherwise the",
-    "   note says \"test needed: <test file or location>\".",
-    "10. A decline or defer MUST cite evidence in its note: an issue number (#123), a file:line,",
-    "   or a quoted code reference. Without it the disposition is invalid and the reply is rejected.",
+    ...fixRules("inline"),
     "",
     // JSON array, never raw text: a repository-controlled path must stay data in this section.
     `Editable files in scope (JSON): ${JSON.stringify(paths)}`,

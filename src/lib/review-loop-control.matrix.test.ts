@@ -18,7 +18,9 @@
  *      process's own write that may not be durable;
  *   I8 a stop stays the boundary before a newer session — its record is owed while it is not
  *      posted: a redelivery sends a refused one and only looks for an unknown one, and once it
- *      landed a restart anchors the newer session at its own start.
+ *      landed a restart anchors the newer session at its own start; posted while that session
+ *      runs, the record is no terminal signal (no STOPPED marker, no STOPPED sentence), while a
+ *      record posted with no session running is the STOPPED acknowledgement.
  * One table instead of one test per bug: each review round found another cell of this space.
  */
 import { describe, it } from "node:test";
@@ -27,9 +29,11 @@ import { DEFAULT_SETTINGS, type BotSettings, type Finding, type Job, type Sample
 import {
   canonicalContinuation,
   isoMs,
+  isStoppedComment,
   parseEscalateMarker,
   parseStartMarker,
   parseStopRecord,
+  REVIEW_LOOP_STOPPED_HUMAN,
   startComment,
 } from "./review-loop.ts";
 import { readLoopEvents, readLoopSession, reconstructRounds } from "./review-loop-engine.server.ts";
@@ -246,6 +250,8 @@ class World {
   readonly prompts: string[] = [];
   /** The phase of every POST of the write under test. */
   readonly underTest: Phase[] = [];
+  /** The body of every POST of the write under test (in the order of underTest). */
+  readonly underTestBodies: string[] = [];
   rowsForWrite = 0;
   carolAt?: string;
   /** The PR's head after a human push (later: push / moved). */
@@ -397,8 +403,8 @@ class World {
     switch (kindOf(this.cell.via)) {
       case "start":
         return parseStartMarker(body, bot)?.by === "alice";
-      case "stop":
-        return parseStopRecord(body, bot)?.by === "bob";
+      case "stop": // by its text, not by the parser under test (assertStopRecordForms parses it)
+        return body.includes(`<!-- ashlar-loop-stop at=${iso(T0)} by=bob -->`);
       case "continue":
         return canonicalContinuation(body, bot)?.head === CONTINUE_HEAD[this.cell.via];
       case "handoff":
@@ -446,6 +452,7 @@ class World {
       this.outage();
     }
     this.underTest.push(this.phase);
+    this.underTestBodies.push(body);
     const { write, shape, stamp } = this.cell;
     if (write === "rejected" && !this.refusalPassed()) throw writeError("rejected", 422);
     if (write === "unknown-lost") throw writeError("unknown", 502);
@@ -749,6 +756,21 @@ async function assertStopBoundaryOwed(w: World): Promise<void> {
   assert.equal(rounds.length, 0, "I8: a round from before the stop counts in carol's session");
 }
 
+/** I8 (the record's form): bob's record, whenever it is sent, records his stop; it is the STOPPED
+ * acknowledgement — the terminal signal watchers detect by its marker — except when it is sent
+ * while carol's newer session runs (the redelivery after her start): then it opens with the record
+ * line alone and says nothing a STOPPED detector matches. */
+function assertStopRecordForms(w: World): void {
+  const bot = { authoredByBot: true };
+  w.underTestBodies.forEach((body, i) => {
+    const phase = w.underTest[i];
+    assert.deepEqual(parseStopRecord(body, bot), { at: iso(T0), by: "bob" }, `I8: the ${phase} POST does not record bob's stop`);
+    const newerRuns = w.cell.later === "newer-start-redelivery" && phase === "again";
+    assert.equal(isStoppedComment(body, bot), !newerRuns, `I8: the ${phase} POST ${newerRuns ? "is a STOPPED signal while carol's session runs" : "is no STOPPED acknowledgement"}: ${body}`);
+    if (newerRuns) assert.ok(!body.includes(REVIEW_LOOP_STOPPED_HUMAN) && !body.includes("ashlar-loop-stopped"), `I8: a STOPPED detector matches it: ${body}`);
+  });
+}
+
 /** I6: carol's newer start is never ended by an older record; a step in her session runs. */
 async function assertNewerSessionLives(w: World): Promise<void> {
   const { via, write } = w.cell;
@@ -813,6 +835,7 @@ async function runCell(c: Cell, pr: number): Promise<void> {
       assertLogged(w, again, againCls, "again");
     }
     assertExactlyOnce(w);
+    if (kindOf(c.via) === "stop") assertStopRecordForms(w);
   } finally {
     Date.now = realNow;
     console.info = realInfo;

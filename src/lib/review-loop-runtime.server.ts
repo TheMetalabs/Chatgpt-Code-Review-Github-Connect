@@ -74,6 +74,7 @@ import {
   sanitizeUntrusted,
   startComment,
   stoppedComment,
+  stopRecordComment,
   type EscalateReason,
   type ReviewLoopMode,
   type RoundSummary,
@@ -1268,6 +1269,8 @@ function endedByStop(s: LoopSession, at: string): boolean {
  * loop-start review for the PR), or when the session it finds ended only in this process (an own
  * write that may not be durable). A stop that stopped nothing posts nothing. A repeated stop finds
  * its record and posts nothing; one whose record's outcome is unknown is only looked for again.
+ * The record is the STOPPED acknowledgement while no session runs; posted while a newer session is
+ * active it is the bare record (stopRecordComment), never a terminal signal for that session.
  * Never throws.
  */
 export async function stopLoop(
@@ -1290,9 +1293,11 @@ export async function stopLoop(
   try {
     d = deps ?? (await productionDeps(settings));
     let body = "";
+    let recordOnly = "";
     let malformed: string | undefined; // a record the parser would reject is never posted
     try {
       body = stoppedComment({ by: stop.actor, at });
+      recordOnly = stopRecordComment({ by: stop.actor, at });
     } catch (e) {
       malformed = (e as Error)?.message ?? String(e);
     }
@@ -1320,7 +1325,11 @@ export async function stopLoop(
       return { posted: false, reason: NO_SESSION };
     }
     if (malformed) return { posted: false, reason: `stop failed: ${malformed} (honored in this process until recorded)` };
-    const out = await emitControl(controlCtx(d, token, botLogin), write);
+    // The record's form, chosen at this read: the STOPPED acknowledgement — a terminal signal that
+    // watchers detect by its marker alone — only while no session runs once the stop is folded;
+    // with a newer session active (the stop ended only one before it) the bare record, which the
+    // fold places the same way and no watcher reads as "the loop stopped".
+    const out = await emitControl(controlCtx(d, token, botLogin), session.active ? stopWrite(ref, { by: stop.actor, at }, recordOnly) : write);
     switch (out.status) {
       case "posted":
         return { posted: true, reason: "stopped" };

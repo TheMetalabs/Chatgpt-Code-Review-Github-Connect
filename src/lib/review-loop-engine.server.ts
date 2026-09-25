@@ -416,8 +416,9 @@ function appEvent(c: { id?: number; body: string; createdAt?: string }, pr: numb
  *   comment body, the PR body — is never replayed as a start: an edit cannot plant a backdated one.
  * - A human contributes STOP directives from UNEDITED issue and inline comments (at creation).
  *   An edited stop, and a stop added to the PR body, reach the loop through the webhook at their
- *   edit time; the App's STOPPED acknowledgement RECORDS them (review-loop.ts stoppedComment),
- *   placed at the stop's own time — never at the acknowledgement's.
+ *   edit time; the App's STOPPED acknowledgement RECORDS them (review-loop.ts stoppedComment) —
+ *   or, posted while a newer session runs, its bare record (stopRecordComment) — placed at the
+ *   stop's own time, never at the record's.
  * - ONLY the App contributes escalate / stopped markers, its canonical continuation for THIS PR
  *   (the head the loop moved to), and converged (total=0) reviews with their commit.
  * - The App's own control writes that the list does not show yet come from its journal

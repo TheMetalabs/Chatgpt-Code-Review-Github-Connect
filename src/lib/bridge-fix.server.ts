@@ -40,7 +40,7 @@
  *   #    from     operation (who)                    to     offer   bookkeeping set
  *   T1   -        request                            Q0     -       createdAt, deadlineAt, timer;
  *                                                                    older live item of the PR → CANCELLED "superseded"
- *   T2   Q0       take / claim (any profile, slot)   CU     fresh   lease + clientId; submitAt=now, generating=false,
+ *   T2   Q0       take (any profile, slot)           CU     fresh   lease + clientId; submitAt=now, generating=false,
  *                                                                    deliveryId=new
  *   T3   CU       take (owner, not in exclude)       CU     replay  same lease (renewed only if stale), SAME deliveryId;
  *                                                                    submitAt=now (re-armed for that one delivery)
@@ -51,13 +51,15 @@
  *   T8   CU|CP    claim (owner: lease renewal)       same   -       same lease, or a new one if stale; nothing else
  *   T9   CU       release (holder)                   QU     -       lease, claimedAt, submitAt cleared; owner kept
  *   T10  CP       release (holder)                   QP     -       lease, claimedAt, submitAt cleared; owner, run kept
- *   T11  QU       take / claim (owner, slot)         CU     fresh   lease; submitAt=now, generating=false, deliveryId=new
- *   T12  QP       take / claim (owner, slot)         CP     resume  lease only: submitAt stays unset, generating as it was
+ *   T11  QU       take (owner, slot)                 CU     fresh   lease; submitAt=now, generating=false, deliveryId=new
+ *   T12  QP       take (owner, slot)                 CP     resume  lease only: submitAt stays unset, generating as it was
  *   T13  QU|QP    recover(runId) (owner, slot)       CP     resume  lease; runId pinned (QU) / matched (QP)
  *   T14  CU|CP    complete (holder)                  DONE   -       answerDigest; prompt dropped
  *   T15  CU|CP    fail (holder)                      FAILED -       reason; prompt dropped
  *   T16  live     deadline | newer request | abort   CANCELLED -    "timeout" | "superseded" | "aborted"
- *   refused: another profile (any owned state), no free slot (T2/T11-T13, a stale T3/T8), a
+ *   refused: a claim of a queued item (Q0, QU, QP: `take_required`; only take and recover hand out a
+ *   delivery, and only their response carries the offer the worker journals), another profile (any
+ *   owned state), no free slot (T2/T11-T13, a stale T3/T8), a
  *   different run (T5/T6/T13), a take of CP (only recover resumes a run), anything past deadlineAt.
  *
  * TERMINAL verdicts: the server's DONE / FAILED / CANCELLED, and on the page every PERMANENT
@@ -78,7 +80,8 @@
  *   - ONE live (queued | claimed) item per PR: a newer request for the same PR cancels the older
  *     one (its promise rejects "superseded"; the extension preserves that tab and frees its slot);
  *   - at most parallelLimit() (fixAgent.parallelPrs) items are claimed at once; the rest wait
- *     queued (the cap is enforced at claim, so neither take nor a direct claim can exceed it);
+ *     queued (the cap is enforced in lease(), so neither take, recover nor a stale lease renewal can
+ *     exceed it; a direct claim never hands out a queued item at all);
  *   - every request settles exactly once: resolve on complete, reject on failure / timeout /
  *     supersede / abort (an aborted item is cancelled like a superseded one, so the extension
  *     stops its run and preserves its tab instead of generating an answer nobody reads). The deadline (default 30 min, Settings fix_agent.chat_timeout_minutes) spans queue AND
@@ -220,6 +223,8 @@ export interface FixRegistryDeps {
 }
 
 export type FixCompleteResult = { ok: true } | { ok: false; code: "lease_conflict" | "invalid"; error: string };
+/** A claim only renews a lease; `take_required`: a queued item is handed out by take / recover only. */
+export type FixClaimResult = { ok: true; leaseId: string } | { ok: false; code: "not_waiting" | "take_required" | "lease_conflict"; error: string };
 
 function clampInt(raw: unknown, fallback: number, min: number, max: number): number {
   if (raw === undefined || raw === null || raw === "") return fallback;
@@ -421,16 +426,17 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     item.deliveryId = deps.newId();
   }
 
-  /** The claim action: a lease for a live item. On a queued item it is that item's hand-out
-   * (fresh without a run: T2/T11; resume with one: T12); on a claimed item it is a renewal (T8),
-   * which is never a submission. */
-  function claim(id: string, clientId = ""): { ok: true; leaseId: string } | { ok: false; error: string } {
+  /** The claim action: ONLY the renewal of a lease the caller's profile already holds (T8), never a
+   * hand-out. Only take and recover hand out a delivery, because only their response carries the
+   * offer (deliveryId, offerKind, binding) the worker journals before it opens a tab; a claim answers
+   * with a lease alone. A queued item (Q0, QU, QP) is therefore refused (`take_required`): the next
+   * take (or recover of a pinned run) hands it out. */
+  function claim(id: string, clientId = ""): FixClaimResult {
     const item = current(id);
-    if (!item || !live(item)) return { ok: false, error: "fix item is not waiting for chat" };
-    const kind = item.state === "queued" ? offerKindOf(item) : undefined;
+    if (!item || !live(item)) return { ok: false, code: "not_waiting", error: "fix item is not waiting for chat" };
+    if (item.state === "queued") return { ok: false, code: "take_required", error: "a queued fix item is handed out only by take or recover" };
     const out = lease(item, clientId);
-    if (out.ok && kind) beginSubmission(item, kind);
-    return out;
+    return out.ok ? out : { ok: false, code: "lease_conflict", error: out.error };
   }
 
   /** The take/recover payload. A resume offer always names its binding (the pinned run); fresh

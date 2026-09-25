@@ -105,3 +105,22 @@ test('fix protocol gate: review operations are unchanged without fixProtocol:1',
   assert.equal((await s.post({action: 'progress', jobId: 'job-A', leaseId: offer.leaseId, progress: progress('run-R')})).status, 200);
   assert.equal((await s.post({action: 'release', jobId: 'job-A', leaseId: offer.leaseId})).status, 200);
 });
+
+// Ashlar 4099509094: only take / recover hand out a fix delivery (their offer carries the deliveryId
+// the worker journals before it opens a tab). A direct claim of a queued item is refused (409
+// take_required) and mints nothing; the next take hands out the new delivery.
+test('route: a direct claim of a released, unpinned fix is refused (409 take_required); the next take hands out D2', async () => {
+  const s = server();
+  s.pending = s.h.bridge.requestBridgeFix(FIX);s.pending.catch(() => {});
+  const d1 = (await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 1})).body.job;
+  assert.equal(d1?.offerKind, 'fresh');
+  assert.equal((await s.post({action: 'release', jobId: d1.jobId, leaseId: d1.leaseId, fixProtocol: 1})).status, 200);
+  const claim = await s.post({action: 'claim', jobId: d1.jobId, clientId: 'chrome-1', fixProtocol: 1});
+  assert.equal(claim.status, 409);
+  assert.equal(claim.body.code, 'take_required');assert.equal(claim.body.leaseId, undefined, 'no lease, no delivery');
+  const d2 = (await s.post({action: 'take', clientId: 'chrome-1', fixProtocol: 1})).body.job;
+  assert.equal(d2?.jobId, d1.jobId);assert.equal(d2.offerKind, 'fresh');
+  assert.ok(d2.deliveryId && d2.deliveryId !== d1.deliveryId, 'the new delivery reaches the worker in the take offer');
+  // a claim now only renews the lease that take handed out
+  assert.deepEqual((await s.post({action: 'claim', jobId: d2.jobId, clientId: 'chrome-1', fixProtocol: 1})).body, {ok: true, leaseId: d2.leaseId});
+});

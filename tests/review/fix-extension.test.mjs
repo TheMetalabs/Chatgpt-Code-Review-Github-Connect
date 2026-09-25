@@ -414,6 +414,66 @@ test('worker: overlapping admission triggers never create two tabs for one fix j
   assert.equal(deaf.local.state.pendingReviewJobs['fix-A'], undefined, 'the duplicate delivery is not admitted');
 });
 
+// Ashlar 4099509094, over the REAL fix registry: only take / recover hand out a delivery. A released,
+// unpinned item is never claimed back (409 take_required, nothing minted); the next take hands the
+// worker D2 in its offer, the worker journals it before opening the tab, and a lost registry plus the
+// server's replay of D2 still opens at most one tab (one prompt) for D2.
+test('worker + real registry: release before progress, a refused claim, D2 by take; registry loss + replay opens one tab for D2', async () => {
+  const {createFixRegistry} = await import('../../src/lib/bridge-fix.server.ts');
+  let ids = 0;
+  const reg = createFixRegistry({now: () => 1_000_000, newId: () => `n${++ids}`, parallelLimit: () => 2, reasoning: () => ({chatgpt: 'pro', grok: 'heavy'}),
+    timeoutMs: () => 30 * 60_000, maxPromptChars: () => 100_000, claimMs: 5 * 60_000, submitWindowMs: 60_000, setTimer: () => 0, clearTimer() {}});
+  reg.request({owner: 'o', repo: 'r', pr: 1, provider: 'chatgpt', prompt: 'FIX PROMPT'}).catch(() => {});
+  const id = reg.peek().id;
+  const d1 = reg.take(id, 'chrome-1');
+  assert.equal(reg.release(id, d1.leaseId), true, 'an older worker released it before any progress');
+  assert.equal(reg.claim(id, 'chrome-1').code, 'take_required');
+  assert.equal(reg.snapshot(id).deliveryId, d1.deliveryId, 'the refused claim minted nothing');
+  const offers = [];
+  // The /api/bridge route over that registry, for profile chrome-1 (`honourExclude` false: a server
+  // that replays whatever the worker lists).
+  const serve = ({honourExclude = true} = {}) => async (_path, body) => {
+    if (body?.action === 'take') {
+      const next = reg.peek(honourExclude ? body.excludeJobIds : [], 'chrome-1');
+      const offer = next ? reg.take(next.id, 'chrome-1') : null;
+      if (offer) offers.push(offer);
+      return {ok: true, job: offer};
+    }
+    if (body?.action === 'claim') {
+      const out = reg.claim(body.jobId, 'chrome-1');
+      if (!out.ok) throw Object.assign(new Error(`HTTP 409 ${out.code}`), {status: 409, code: out.code});
+      return out;
+    }
+    if (body?.action === 'ping') {
+      const accepted = reg.refresh(body.jobId, body.leaseId, body.generating);
+      return {ok: true, accepted, ...reg.state(body.jobId), bridge: {captureProtocol: 1, localJsonRepairEnabled: false}};
+    }
+    return {ok: true, job: null};
+  };
+  const handler = () => ({ok: false, code: 'busy', retry: true});
+  const b = background({api: serve(), handler});
+  b.context.crypto = webcrypto;b.context.TextEncoder = TextEncoder;
+  await b.tick();await b.tick();
+  assert.equal(offers.length, 1);
+  assert.deepEqual([offers[0].offerKind, offers[0].deliveryId !== d1.deliveryId], ['fresh', true], 'the take handed out D2');
+  const d2 = offers[0].deliveryId;
+  assert.equal(b.tabs.size, 1, 'one tab for D2');
+  assert.equal(b.local.state['ashlar:fixDeliveries'][id]?.deliveryId, d2, 'the worker journaled D2 from the take offer');
+  const runs = w => w.messages.filter(m => m.type === 'ashlar-run' && m.jobId === id && !m.resume);
+  assert.equal(runs(b).length, 1, 'the prompt was sent once');
+  // The job registry is lost (hard reset), the tab keeps the run; the server replays D2 (T3: the
+  // worker does not list it), and a server that ignores the list offers it anyway.
+  for (const honourExclude of [true, false]) {
+    await b.local.set({pendingReviewJobs: {}});
+    const reloaded = background({local: b.local, session: b.session, tabs: b.tabs, api: serve({honourExclude}), handler});
+    reloaded.context.crypto = webcrypto;reloaded.context.TextEncoder = TextEncoder;
+    await reloaded.tick();await reloaded.tick();
+    assert.equal(b.tabs.size, 1, `no second tab for D2 (server ${honourExclude ? 'honours' : 'ignores'} the list)`);
+    assert.equal(runs(reloaded).length, 0, 'the prompt is never submitted again');
+  }
+  assert.ok(offers.slice(1).every(offer => offer.deliveryId === d2 && offer.offerKind === 'replay'), 'every later offer is the same delivery D2 (replay)');
+});
+
 // Round 12 (Ashlar 4097631112): the delivery record is two-phase. `creating` (the intent) is written
 // before chrome.tabs.create and becomes `created` (with the tabId) only after the tab exists; only a
 // record a tab still proves keeps the delivery out of the server's replay. A worker that stops

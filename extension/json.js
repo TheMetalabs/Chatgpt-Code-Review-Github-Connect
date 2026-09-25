@@ -523,18 +523,19 @@ function fixOwnershipProof(state, {phase, completion, journal} = {}) {
   const bound = boundReviewResponse(submission);
   const answered = phase === "complete";
   if (bound.followup) return takeOver("followup");
+  // 3. A draft in the composer. The just-sent prompt can linger there a moment after the send is
+  // confirmed: that text (the journal's own expected prompt) is Ashlar's, not evidence of a user.
+  // Any other draft is the user's, decided on the poll that sees it and BEFORE the transient waits
+  // below (turn not rendered or not resolvable yet): a draft typed and cleared while the turn is
+  // briefly unresolved still latches the takeover.
+  if (draftText && normalizePrompt(draftText) !== submission.expected) return takeOver("draft");
   if (!bound.identified) {
     // A collected answer whose turn is gone was replaced (edited, regenerated or deleted). Still in
     // the recorded conversation with no addressable turn: not rendered yet (transient).
     return answered ? takeOver("response_changed") : verdict("unknown", "turn_unrendered");
   }
   if (integrity === "unknown") return verdict("unknown", "turn_unresolved");
-  if (draftText) {
-    // The just-sent prompt can linger in the composer a moment after the send is confirmed: that
-    // text is Ashlar's own, not evidence of a user (transient). Any other draft is the user's.
-    if (normalizePrompt(draftText) === submission.expected) return verdict("unknown", "composer_echo");
-    return takeOver("draft");
-  }
+  if (draftText) return verdict("unknown", "composer_echo");
   if (answered) {
     const stored = completion || storedFixCompletion(state);
     if (!stored) return verdict("unknown", "no_completion", {conversation: submission.conversation});

@@ -582,6 +582,26 @@ test('real DOM lifecycle: the sent turn not rendered in the recorded conversatio
  assert.equal(await ctx.page.evaluate(()=>__ashlarRunnerState.running),true,'still collecting');
 });
 
+// R17 (Ashlar 4101855338): the same absent turn, while the user types a draft of their own and clears it
+// before the turn renders again. The draft was seen: the run ends taken_over on that poll, the tab is
+// preserved, and the restored turn with an empty composer never hands it back.
+test('real DOM lifecycle: a draft typed and cleared while the sent turn is not rendered ends the fix (taken_over), tab preserved',async t=>{
+ const ctx=await conversationPage(t,'fix');
+ const server={value:'awaiting_chat'};
+ const {b,state}=wiredWorker(ctx.page,server);
+ await b.tick();
+ await ctx.page.evaluate(()=>{window.turns=document.querySelector('main').innerHTML;document.querySelector('main').innerHTML='';
+  document.querySelector('#prompt-textarea').textContent='my own question';});
+ await ctx.page.clock.runFor(1600);
+ await ctx.page.evaluate(()=>{document.querySelector('#prompt-textarea').textContent='';document.querySelector('main').innerHTML=window.turns;});
+ await ctx.complete();
+ await ctx.page.clock.runFor(3200);await b.tick();
+ const failure=b.calls.find(c=>c.action==='failure');
+ assert.deepEqual({takenOver:/^taken_over: /.test(failure?.error||''),delivered:b.calls.some(c=>c.action==='complete'),closed:b.closedTabs.length,
+  retired:state()===undefined,released:(await ctx.send('ashlar-tab-status')).released,canClose:(await ctx.send('ashlar-can-close')).canClose},
+  {takenOver:true,delivered:false,closed:0,retired:true,released:true,canClose:false});
+});
+
 // Round 15 class sibling (Ashlar 4100156785): restoring a completion after a reload
 // (ashlar-result-saved) decides the permanent verdicts before it asks whether the response is
 // available, so a tab the user took over answers `completion_changed` (the worker preserves it at

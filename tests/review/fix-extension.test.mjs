@@ -90,6 +90,8 @@ test('page: a visible quota notice ends a fix only before an answer is visible',
 // Round 11 lifecycle (review 5307890587, P1): a PERMANENT ownership verdict ends the collector on
 // the observation that sees it (no further poll), with the distinct terminal code `taken_over`, the
 // tab marked the user's for good and its managed slot freed. A transient "unknown" keeps polling.
+/** A composer holding `value` (no DOM otherwise): what composerDraftText reads. */
+const draftOn = (c, value) => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); };
 const COLLECT_VERDICTS = {
   followup: {permanent: true, set: c => { c.boundReviewResponse = () => ({identified: true, followup: true, root: {}, responseId: 'response-A'}); }},
   edited: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; }},
@@ -106,6 +108,11 @@ const COLLECT_VERDICTS = {
   replacedUnrendered: {permanent: true, set: c => { c.journaledTurnIntegrity = () => 'edited'; c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
   movedComposerEcho: {permanent: true, set: c => { c.location = {href: 'https://chatgpt.com/c/users-own'}; c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
   composerEcho: {permanent: false, set: c => { c.document = {querySelectorAll: () => []}; c.responseStreaming = () => false; c.composer = () => ({value: 'FIX PROMPT'}); c.normalizePrompt = text => String(text || '').replace(/\s+/g, ' ').trim(); }},
+  // R17 (Ashlar 4101855338): a user draft is decided BEFORE the transient waits: seen while the sent
+  // turn is not rendered or not resolvable yet, it still ends the run. Ashlar's own echo does not.
+  draftTurnUnrendered: {permanent: true, set: c => { draftOn(c, 'my own question'); c.boundReviewResponse = () => ({identified: false, followup: false, root: null}); }},
+  draftTurnUnresolved: {permanent: true, set: c => { draftOn(c, 'my own question'); c.journaledTurnIntegrity = () => 'unknown'; }},
+  composerEchoTurnUnresolved: {permanent: false, set: c => { draftOn(c, 'FIX PROMPT'); c.journaledTurnIntegrity = () => 'unknown'; }},
 };
 for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
   test(`page: collect verdict "${name}" ${verdict.permanent ? 'ends the fix run at once (taken_over), slot freed' : 'is transient: the collector keeps polling'}`, async () => {
@@ -128,6 +135,32 @@ for (const [name, verdict] of Object.entries(COLLECT_VERDICTS)) {
     }
   });
 }
+
+// R17 (Ashlar 4101855338): a draft seen on ONE poll while the sent turn was unresolved latches the
+// takeover for good. The user then clears it and the turn resolves again: every later decision
+// (collect, hand-out, can-close, restore after a reload) still says the tab is the user's.
+test('page: a draft typed and cleared while the sent turn is unresolved keeps the tab taken over at every later decision', async () => {
+  const p = page();
+  const c = p.c.context;
+  let draft = 'my own question', integrity = 'unknown';
+  draftOn(c, '');
+  Object.assign(c, {composer: () => ({value: draft}), journaledTurnIntegrity: () => integrity});
+  Object.assign(p.state(), {kind: 'fix', jobId: 'fix-A', runId: 'run-A', running: false});
+  const first = c.fixOwnershipProof(p.state(), {phase: 'collect'});
+  assert.deepEqual([first.ownership, first.reason], ['takenOver', 'draft'], 'decided on the poll that saw the draft');
+  draft = ''; integrity = 'exact';
+  const later = {
+    collect: c.fixOwnershipProof(p.state(), {phase: 'collect'}).ownership,
+    handOut: c.fixOwnershipProof(p.state(), {phase: 'complete', completion: {responseId: 'response-A', text: ANSWER}}).ownership,
+  };
+  p.state().result = {ok: true, raw: ANSWER, responseText: ANSWER};
+  const close = c.fixCanClose(p.state());
+  p.state().result = null;
+  const restored = p.c.message(msg('ashlar-result-saved', {committed: true, raw: ANSWER, text: ANSWER, completion: {responseId: 'response-A', context: '[]'}}));
+  assert.deepEqual({...later, canClose: close.canClose, closeReason: close.reason, restore: restored.code},
+    {collect: 'takenOver', handOut: 'takenOver', canClose: false, closeReason: 'repurposed', restore: 'completion_changed'});
+  assert.equal(p.state().slotReleased, true, 'the managed slot is freed');
+});
 
 // Round 15 (Ashlar 4100156796) drift guard: the page proves a fix only in json.js fixChatPage();
 // the worker opens every fix tab at background.js providerUrl(provider, reasoning). Today providerUrl

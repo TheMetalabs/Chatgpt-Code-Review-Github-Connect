@@ -89,6 +89,8 @@ function tokenize(text, i, close) {
 }
 
 const isPunct = (token, text) => token?.kind === 'punct' && token.text === text;
+/** The operators that assign to their left side. */
+const ASSIGN = new Set(['=', '+=', '-=', '*=', '/=', '%=', '**=', '<<=', '>>=', '>>>=', '&=', '|=', '^=', '&&=', '||=', '??=']);
 
 /** The comma-separated arguments of a call's token run. */
 function argumentsOf(tokens) {
@@ -99,9 +101,14 @@ function argumentsOf(tokens) {
 
 /** Adds the stages a stage-argument expression can take to `found`: a string or template literal,
  * through parentheses, both arms of a conditional (its test is not a stage) and each operand of || and
- * ??. Anything else (a variable, a call, a concatenation) is a problem: the guard cannot see its value. */
+ * ??. Anything else (a variable, a call, a concatenation) is a problem: the guard cannot see its value.
+ * So is an assignment: it binds looser than a conditional, so `x += late ? "a" : "b"` records x + "a". */
 function stageValues(text, tokens, found, where) {
   if (tokens.length === 1 && tokens[0].kind === 'group' && tokens[0].open === '(') return stageValues(text, tokens[0].tokens, found, where);
+  const expression = tokens.length ? text.slice(tokens[0].at, tokens.at(-1).end) : '(missing)';
+  if (tokens.some(token => token.kind === 'punct' && ASSIGN.has(token.text))) {
+    return found.problems.push(`${where}: stage \`${expression}\` assigns, so what it records is the assigned value, which cannot be checked for a label`);
+  }
   const question = tokens.findIndex(token => isPunct(token, '?'));
   if (question >= 0) {
     let nested = 0, colon = -1;
@@ -124,7 +131,6 @@ function stageValues(text, tokens, found, where) {
     if (STAGE_NAME.test(only.value)) return found.literals.add(only.value);
     return found.problems.push(`${where}: ${only.text} is not a stage name (${STAGE_NAME})`);
   }
-  const expression = tokens.length ? text.slice(tokens[0].at, tokens.at(-1).end) : '(missing)';
   found.problems.push(`${where}: stage \`${expression}\` is not a literal, so its value cannot be checked for a label`);
 }
 
@@ -427,6 +433,12 @@ test('a stage argument the guard cannot read fails it instead of passing uncheck
     'workerStep(job, provider);',
   ]) assert.equal(problems(text).length, 1, `${text} is a problem, not a silent pass`);
   assert.match(problems('workerStep(job, provider, "dom_drift:follow_up");')[0], /not a stage name/);
+  // An assignment binds looser than a conditional: the stage is the assigned value, not an arm.
+  for (const op of ['=', '+=', '-=', '*=', '/=', '%=', '**=', '<<=', '>>=', '>>>=', '&=', '|=', '^=', '&&=', '||=', '??=']) {
+    assert.deepEqual(problems(`workerStep(job, provider, stage ${op} late ? "tab_lost" : "tab_closed");`), [`fixture.js:1 workerStep(): stage ` +
+      `\`stage ${op} late ? "tab_lost" : "tab_closed"\` assigns, so what it records is the assigned value, which cannot be checked for a label`], op);
+  }
+  assert.deepEqual(problems('workerStep(job, provider, (stage = next()) ? "tab_lost" : "tab_closed");'), [], 'an assignment in the test is not the stage');
   assert.match(problems('step(`Tab_Lost`);')[0], /not a stage name/);
   assert.match(problems('recordReviewStep(st\\u0061ge);')[0], /stage `st\\u0061ge` is not a literal/, 'the problem quotes the source');
 });
@@ -549,7 +561,7 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
   // A forwarded stage is the whole stage argument: `stage = computeStage()` starts with the name and
   // reassigns it, so the call after it does not forward either.
   assert.deepEqual(problems(forwarding('recordReviewStep(stage = computeStage());\n  recordReviewStep(stage);')), [
-    'fixture.js:2 recordReviewStep(): stage `stage = computeStage()` is not a literal, so its value cannot be checked for a label',
+    'fixture.js:2 recordReviewStep(): stage `stage = computeStage()` assigns, so what it records is the assigned value, which cannot be checked for a label',
     'fixture.js:3 recordReviewStep(): stage `stage` is not a literal, so its value cannot be checked for a label',
   ]);
 });

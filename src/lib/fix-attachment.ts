@@ -58,6 +58,15 @@ export class FixAttachmentError extends Error {
 
 export const sha256Hex = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
 
+/** `text` without the characters ChatGPT's Markdown rendering would drop or restyle (backticks, emphasis
+ * asterisks, a leading heading or quote marker), whitespace re-collapsed. */
+export function plainMarkdownLine(text: string): string {
+  return text.replace(/[`*]/g, "").replace(/^[#>\s]+/, "").replace(/\s+/g, " ").trim();
+}
+
+/** Whether `text` renders as typed: no Markdown-active characters (plainMarkdownLine leaves it unchanged). */
+export const rendersAsTyped = (text: string) => plainMarkdownLine(text) === text;
+
 /** Whether `text` survives any whitespace collapsing unchanged: one line, single spaces, trimmed. */
 export const isCanonicalLine = (text: string) => typeof text === "string" && text.length > 0 && text === text.replace(/\s+/g, " ").trim();
 
@@ -81,7 +90,10 @@ export function fixTypedPrompt(attachment: Pick<FixAttachment, "name" | "sha256"
     "Read the whole attachment, not an excerpt, and follow its instructions; this message adds nothing else.",
     deliveryRule,
   ].join(" ").replace(/\s+/g, " ").trim();
-  return line;
+  // ChatGPT renders the sent turn as Markdown: "```json" showed as "json" live (#93), so the turn never
+  // matched the typed line and every fix ended send_unconfirmed. The attachment carries the full rule;
+  // the typed line drops Markdown-active characters so it renders as typed.
+  return plainMarkdownLine(line);
 }
 
 /** Why a typed prompt and its attachment cannot be delivered (undefined = deliverable). Never

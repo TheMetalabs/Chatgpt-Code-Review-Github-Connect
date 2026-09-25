@@ -106,10 +106,27 @@ function isLive(status: Job["status"]) {
   return LIVE_INFLIGHT_STATUSES.includes(status);
 }
 
-function trimJobs(jobs: Job[]) {
-  // UI retention may drop completed cache entries, never live queue/generation work.
-  return [...jobs.filter(j => isLive(j.status)), ...jobs.filter(j => !isLive(j.status)).slice(0, CAP)]
-    .sort((a,b) => b.createdAt - a.createdAt);
+/** UI retention: the completed cache keeps the newest CAP jobs. Live queue/generation work is never
+ * over capacity (the invariant): a live job leaves state only after ending through transitionJob. */
+function overCapacity(jobs: readonly Job[]): Job[] {
+  return jobs.filter((j) => !isLive(j.status)).sort((a, b) => b.createdAt - a.createdAt).slice(CAP);
+}
+
+/** Insert a new job (newest first); what capacity then drops leaves through removeJobs. */
+function insertJob(job: Job) {
+  state = { ...state, jobs: [job, ...state.jobs].sort((a, b) => b.createdAt - a.createdAt) };
+  removeJobs(overCapacity(state.jobs));
+}
+
+/** The only way a job leaves state (capacity retention, an operator reset). Each job goes through
+ * releaseJob, the release its terminal edge runs, so nothing it held outlives it: a local leg still
+ * running for it (a job that ended while its leg ran keeps that leg until then) is aborted, and its
+ * snapshot, activity and liveness are freed; its watcher exits on its next tick (the job is gone). */
+function removeJobs(drop: readonly Job[]) {
+  if (!drop.length) return;
+  const ids = new Set(drop.map((j) => j.id));
+  state = { ...state, jobs: state.jobs.filter((j) => !ids.has(j.id)) };
+  for (const job of drop) releaseJob(job, "removed");
 }
 
 function trim<T>(xs: T[]) {
@@ -153,15 +170,9 @@ export function patchHarborSettings(patch: Partial<BotSettings>) {
 
 export function resetHarbor() {
   cancelLocalJsonRepairs("superseded");
-  for (const controller of localControllers.values()) controller.abort();
-  localControllers.clear();
-  localInFlight.clear();
-  localSamples.clear();
-  localActivity.clear();
-  for (const l of localLiveness.values()) l.clear();
-  localLiveness.clear();
   for (const job of state.jobs) noteJobHistory(isLive(job.status)
     ? {...job, status: "cancelled", skipReason: "operator reset", updatedAt: Date.now()} : job);
+  removeJobs(state.jobs);
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
 }
 
@@ -202,30 +213,33 @@ export function cancelHarborJob(jobId: string) {
   );
 }
 
-/** The only writer of an existing job record (resetHarbor drops every job wholesale; a new job is
- * inserted with trimJobs). Every path that ends a job goes through here, so terminal cleanup runs in
- * exactly one place: on the live → terminal edge. Returns the written job. */
+/** The only writer of an existing job record (a new job is inserted with insertJob; a job leaves state
+ * only through removeJobs). Every path that ends a job goes through here, so terminal cleanup runs on
+ * the live → terminal edge, and removal runs the same release. Returns the written job. */
 function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
   const before = state.jobs.find((j) => j.id === jobId);
   if (!before) return undefined;
   const after = next(before);
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? after : j)) };
   // Cleanup before the history write: the edge is crossed once, so it runs whatever the write does.
-  if (isLive(before.status) && !isLive(after.status)) releaseTerminalJob(after);
+  if (isLive(before.status) && !isLive(after.status)) releaseJob(after, "terminal");
   // Never throws: every caller continues past its write (the lease ping's owner liveness, a local
   // leg's request, the review that follows), so a history failure cannot half-apply a transition.
   noteJobHistory(after);
   return after;
 }
 
-/** A terminal status is an explicit terminal signal (docs/local-verify-clean.md §3): the job never
- * needs its local snapshot again (a verify-clean job whose local leg never ran would otherwise keep
- * it forever). An in-flight local leg holds its own reference and frees the entry in its finally.
- * Only a cancellation (operator or supersession) stops that leg; a posted or skipped job never
- * aborts local generation. */
-function releaseTerminalJob(job: Job) {
-  if (!localInFlight.has(job.id)) localSamples.delete(job.id);
-  if (job.status !== "cancelled") return;
+/** The single release of what a job holds locally, run on its live → terminal edge (transitionJob)
+ * and when it leaves state (removeJobs). A terminal status is an explicit terminal signal
+ * (docs/local-verify-clean.md §3): the job never needs its local snapshot again (a verify-clean job
+ * whose local leg never ran would otherwise keep it forever). An in-flight local leg holds its own
+ * reference and frees the entry in its finally. Only a cancellation (operator or supersession) or a
+ * removal stops that leg (a removed job has no one left to use its result); a posted or skipped job
+ * still in state never aborts local generation. */
+function releaseJob(job: Job, edge: "terminal" | "removed") {
+  const stop = edge === "removed" || job.status === "cancelled";
+  if (edge === "removed" || !localInFlight.has(job.id)) localSamples.delete(job.id);
+  if (!stop) return;
   localControllers.get(job.id)?.abort();
   localActivity.delete(job.id);
   localLiveness.get(job.id)?.clear();
@@ -240,6 +254,12 @@ export function hasLocalSample(jobId: string): boolean {
 /** Test seam: whether a job still has local-leg activity or liveness state (a cancellation clears it). */
 export function hasLocalLegState(jobId: string): boolean {
   return localActivity.has(jobId) || localLiveness.has(jobId);
+}
+
+/** Test seam: ids holding local state (snapshot, leg, activity, liveness, watcher) with no job in state. */
+export function orphanedLocalState(): string[] {
+  const ids = new Set([...localSamples.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...watching]);
+  return [...ids].filter((id) => !state.jobs.some((j) => j.id === id));
 }
 
 /** Test seam: whether a reviewer watcher is still running for a job. */
@@ -1477,7 +1497,8 @@ function enqueueFromDecision(
     };
     noteJobHistory(skipJob);
     noteDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
-    state = { ...state, jobs: trimJobs([skipJob, ...state.jobs]), events: trim([ev, ...state.events]) };
+    insertJob(skipJob);
+    state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: decision.skip ?? "filtered", jobId: skipJob.id, queued: false };
   }
 
@@ -1517,7 +1538,8 @@ function enqueueFromDecision(
   for (const id of superseded) {
     transitionJob(id, (j) => ({ ...j, status: "cancelled", skipReason: `superseded by ${job.id}`, updatedAt: Date.now() }));
   }
-  state = { ...state, jobs: trimJobs([job, ...state.jobs]), events: trim([ev, ...state.events]) };
+  insertJob(job);
+  state = { ...state, events: trim([ev, ...state.events]) };
 
   noteDeliveryHistory(ev,{owner:job.owner,repo:job.repo,pr:job.pr,commentId:job.thread?.commentId});
   noteJobHistory(job);

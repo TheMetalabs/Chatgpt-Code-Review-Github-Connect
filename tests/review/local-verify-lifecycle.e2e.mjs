@@ -554,3 +554,60 @@ test('history: an operator reset whose history write fails still drops every job
   assertHistoryFault(app,jobId);
   await eventually(()=>!app.harbor.isWatchingJob(jobId),'the reviewer watcher never stopped');
 });
+
+// Capacity retention (80 completed jobs) and removal: a live job is never dropped, and a job that
+// leaves state goes through the same release its terminal edge runs (removeJobs → releaseJob).
+const CAPACITY=80;
+/** A mention on another PR of the fixture repo (a mention on PR 1 would supersede the job under test). */
+function mentionOn(app,pr,deliveryId){
+  return app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId,event:'issue_comment',payload:{action:'created',installation:{id:1},
+    repository:{full_name:'fixture/fixture'},sender:{login:'author'},issue:{number:pr,pull_request:{},title:'fixture'},comment:{id:1000+pr,body:'@ashlar-bot review'}}});
+}
+/** Push `count` newer completed jobs through capacity: mentions on PR 9, each superseding (cancelling)
+ * the one before, and the last one cancelled too. */
+async function flood(app,count,tag){
+  let last;
+  for(let i=0;i<count;i++){app.clock.now+=1;last=mentionOn(app,9,`${tag}-${i}`).jobId;}
+  app.harbor.cancelHarborJob(last);
+  await eventually(()=>app.harbor.getHarbor().jobs.filter(j=>j.pr===9).every(j=>TERMINAL.includes(j.status)),'the flood never settled');
+}
+
+test('capacity: a held verify-clean job is never dropped; it keeps its snapshot and watcher past the cap',async t=>{
+  const {app,jobId,job}=await start(t,{delivery:'capacity-held'});
+  await flood(app,CAPACITY+5,'capacity-held-flood');
+  // trimmed at each insert: the last flood job, cancelled after the last insert, is the one over the cap
+  assert.equal(app.harbor.getHarbor().jobs.filter(j=>j.pr===9).length,CAPACITY+1,'the older completed jobs were trimmed');
+  assert.equal(job()?.status,'awaiting_chat','the live held job is retained beyond the cap');
+  assert.equal(app.harbor.hasLocalSample(jobId),true,'with its snapshot');
+  assert.equal(app.harbor.isWatchingJob(jobId),true,'and its watcher');
+  assert.equal(app.localRequests.length,0,'local stays held');
+  assert.deepEqual([...app.harbor.orphanedLocalState()],[],'no local state outlives a dropped job');
+  app.harbor.cancelHarborJob(jobId);
+});
+
+test('capacity: a verify-clean job trimmed while its local verifier still holds the snapshot is aborted, and its snapshot, liveness and watcher are released',async t=>{
+  const {app,jobId,job}=await start(t,{delivery:'capacity-trimmed'});
+  app.env.ASHLAR_LOCAL_LLM_STREAM='true'; // arms the leg's liveness watchdog
+  await app.harbor.submitHarborChat(jobId,clean);
+  await eventually(()=>app.localRequests.length===1,'verification round did not start');
+  const abort=trackAbort(app.localResponses[0]);
+  // The job ends while its verifier runs (a skip written through the job writer): a skip never
+  // aborts local generation, so the running leg still holds the snapshot and its liveness.
+  app.harbor.patchHarborJob(jobId,j=>({...j,status:'skipped',skipReason:'ended while local verified',updatedAt:Date.now()}));
+  assert.equal(app.harbor.hasLocalSample(jobId),true,'the running leg keeps the snapshot');
+  assert.equal(app.harbor.hasLocalLegState(jobId),true,'and its liveness');
+  await flood(app,CAPACITY+1,'capacity-trimmed-flood');
+  assert.equal(job(),undefined,'the oldest completed job is trimmed');
+  assert.equal(app.harbor.hasLocalSample(jobId),false,'its snapshot is released');
+  assert.equal(app.harbor.hasLocalLegState(jobId),false,'its activity and liveness are released');
+  await eventually(()=>abort.aborted,'its local request was not aborted');
+  await eventually(()=>!app.harbor.isWatchingJob(jobId),'its watcher never stopped');
+  await eventually(()=>app.harbor.orphanedLocalState().length===0,'local state outlived a trimmed job');
+  // Again: a second held job through another flood leaves nothing behind either.
+  const again=await mentionOn(app,2,'capacity-trimmed-again');
+  await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===again.jobId)?.status==='awaiting_chat','second job not ready');
+  app.harbor.cancelHarborJob(again.jobId);
+  await flood(app,CAPACITY+1,'capacity-trimmed-flood-2');
+  await eventually(()=>app.harbor.orphanedLocalState().length===0,'local state outlived the second trimmed job');
+  assert.equal(app.localRequests.length,1,'no other local request ran');
+});

@@ -428,7 +428,13 @@ function journaledTurnIntegrity(submission, users) {
     turn = users[submission.submittedUsers - 1];
   }
   if (!turn) return "unknown";
-  if (typeof submission.exact === "string") return fixPromptForm(messagePromptText(turn)) === submission.exact ? "exact" : "edited";
+  if (typeof submission.exact === "string") {
+    // A rich-text turn's block boundaries read two ways: one <p> per blank-line paragraph with a <br>
+    // per line break (messagePromptText), or one <p> per line, the composer's own structure
+    // (losslessText). Either reading can prove it exact; any other whitespace difference is an edit.
+    const body = turn.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
+    return [messagePromptText(turn), losslessText(body)].some(text => fixPromptForm(text) === submission.exact) ? "exact" : "edited";
+  }
   return normalizePrompt(messagePromptText(turn)) === submission.expected ? "exact" : "edited";
 }
 

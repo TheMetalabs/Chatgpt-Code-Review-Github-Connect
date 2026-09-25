@@ -1012,6 +1012,42 @@ test('real DOM: a fix prompt with tabs, runs of spaces and blank lines, sent thr
  await page.clock.runFor(3200);
  assert.deepEqual(await page.evaluate(()=>window.fixOut),{raw:code});
 });
+// R18: ChatGPT renders the sent user turn as rich text (captured-dom-shapes.e2e.mjs:
+// collapsible-user-message-content > .rich-text-user-turn.markdown), whose blocks can be read two ways:
+// one <p> per blank-line paragraph with a <br> per line break (the captured shape), or one <p> per line
+// (the composer's own structure). The composer held the prompt exactly and the send delivered it: either
+// shape is the prompt, harvested; a whitespace sequence changed in the rendered turn is not, in either.
+const RICH_TURN_SHAPES=['paragraphsWithBreaks','paragraphPerLine'];
+async function richSentTurn(t,shape,rendered){
+ const {page,fill}=await whitespacePage(t);
+ assert.deepEqual(await fill(),{text:WS_PROMPT,sends:1,sent:true},'the composer held the prompt exactly; the send is confirmed');
+ const code='{"summary":"s","files":[],"dispositions":[]}';
+ await page.evaluate(({shape,text,code,toolbar})=>{
+  const block=lines=>{const p=document.createElement('p');
+   lines.forEach((line,i)=>{if(i)p.append(document.createElement('br'));if(line)p.append(line);});
+   if(lines.length===1&&!lines[0])p.append(document.createElement('br'));return p;};
+  const blocks=shape==='paragraphPerLine'?text.split('\n').map(line=>[line]):text.split('\n\n').map(par=>par.split('\n'));
+  const body=document.createElement('div');body.className='rich-text-user-turn markdown';body.append(...blocks.map(block));
+  const content=document.createElement('div');content.dataset.testid='collapsible-user-message-content';content.append(body);
+  document.querySelector('[data-message-id="user-A"]').replaceChildren(content);
+  document.querySelector('[data-testid="stop-button"]').remove();
+  document.querySelector('main').insertAdjacentHTML('beforeend',`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><pre><code>${code}</code></pre></div></div>${toolbar}</section>`);
+  window.fixOut={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={code:e.code};});
+ },{shape,text:rendered,code,toolbar});
+ await page.clock.runFor(3200);
+ return {out:await page.evaluate(()=>window.fixOut),code};
+}
+for(const shape of RICH_TURN_SHAPES){
+ test(`real DOM: a fix whose sent turn renders the prompt as rich text (${shape}) is harvested`,async t=>{
+  const {out,code}=await richSentTurn(t,shape,WS_PROMPT);
+  assert.deepEqual(out,{raw:code});
+ });
+ test(`real DOM: a fix whose rich-text sent turn (${shape}) has one whitespace sequence changed is never harvested`,async t=>{
+  const got={};
+  for(const [name,alter] of Object.entries(WS_ALTERATIONS))got[name]=(await richSentTurn(t,shape,alter(WS_PROMPT))).out;
+  assert.deepEqual(got,Object.fromEntries(Object.keys(WS_ALTERATIONS).map(name=>[name,{code:'taken_over'}])));
+ });
+}
 // ChatGPT's composer is a rich editor holding one <p> per line (an empty line: <p><br class=
 // "ProseMirror-trailingBreak"></p>). Its innerText separates the <p> blocks by a blank line, so the
 // lossless reading is structural (composer.js losslessText); a changed whitespace sequence still fails.

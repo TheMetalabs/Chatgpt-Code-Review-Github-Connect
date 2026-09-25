@@ -439,10 +439,17 @@ function conversationIdentity(href) {
  * is (the user can move in-page while the old DOM is still rendered), and neither provider's DOM
  * ties a conversation id to the sent turn or its response (both expose only per-message ids). A fix
  * journal without it (legacy, recorded before this rule, or a confirmation seen only after a
- * reload) is `identity:"unestablished"` for good: never harvested, never closed. A fix whose page
- * changes URL after the send (a bare new-chat root the provider later names /c/<id>) is
- * `identity:"changed"`. Fix tabs open on a page whose identity never changes (ChatGPT:
- * `/?temporary-chat=true`). Persisted with the journal (sessionStorage), so it survives a reload.
+ * reload) is `identity:"unestablished"` for good: never harvested, never closed. The identity is
+ * persisted with the journal (sessionStorage), so it survives a reload.
+ *
+ * A fix whose page changes path after the send is `identity:"changed"`, whoever moved it. Fix tabs
+ * open on ChatGPT's `/?temporary-chat=true`, which keeps its path only while ChatGPT honours the
+ * temporary chat. When it does not, ChatGPT itself moves the new chat to /c/<id>, as Grok does from
+ * its home (#77: a Grok fix whose URL changes after the send cannot complete). Such a fix run ends
+ * `taken_over` ("the tab moved to another conversation") and its tab is preserved as navigated,
+ * although the user did nothing. This is a known #77 vs #82 contradiction: the send-time identity
+ * cannot tell the provider's move from the user's in-page move to their own conversation while the
+ * old DOM is still rendered, which is the case it guards (a review on a new chat pins instead, below).
  *
  * The one exception (#82) is a REVIEW whose journal has no send-time conversation: a review sent on
  * a new chat (namesNoConversation: ChatGPT's "/" or a temporary chat it does not honour, Grok's home,

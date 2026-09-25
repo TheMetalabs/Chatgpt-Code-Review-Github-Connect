@@ -13,7 +13,7 @@ import { llmWorkAllowed } from "./ops-comment";
 import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
 import { BRIDGE_TOKEN_ENV, resolveBridgeToken } from "./bridge-token";
-import { createFixRegistry, isFixItemId, type FixOffer, type FixRequest } from "./bridge-fix.server";
+import { createFixRegistry, isFixItemId, type FixItemSummary, type FixOffer, type FixRequest } from "./bridge-fix.server";
 import { createdBefore } from "./creation-seq";
 
 type BridgeMeta = {
@@ -72,6 +72,8 @@ export type BridgePublic = Omit<BridgeStatus, "token"> & {
   localJsonRepairEnabled: boolean;
   /** Live review-loop fix items (queued + claimed); never counted in pendingJobs. */
   pendingFixes: number;
+  /** Every fix item the registry still holds (live and recently settled): state and timing only. */
+  fixItems: FixItemSummary[];
 };
 
 export function getBridgeStatus(): BridgeStatus {
@@ -92,6 +94,7 @@ export function getBridgePublic(): BridgePublic {
     repairProtocol: 1, captureProtocol: 1, recoveryProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
     pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && pendingChatProviders(job).length > 0).length,
     pendingFixes: fixLiveCount(),
+    fixItems: fixes().summaries(),
   };
 }
 

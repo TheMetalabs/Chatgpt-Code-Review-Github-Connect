@@ -1,4 +1,3 @@
-import {reviewHistory} from "@/lib/review-history.server";
 import { createFileRoute } from "@tanstack/react-router";
 import { getBridgePublic, bridgeTokenOk } from "@/lib/bridge.server";
 import { buildChatPrompt } from "@/lib/chat-prompt";
@@ -6,6 +5,7 @@ import {
   cancelHarborJob,
   getHarbor,
   githubStatus,
+  historyHealth,
   lastGithubInstallationId,
   patchHarborSettings,
   previewChatPaste,
@@ -51,7 +51,7 @@ export const Route = createFileRoute("/api/harbor")({
           settings: publicSettings(harbor.settings),
           github: githubStatus(),
           bridge: getBridgePublic(),
-          history: reviewHistory().health(),
+          history: historyHealth(),
         }, {headers:{"Cache-Control":"no-store"}});
       },
       POST: async ({ request }) => {

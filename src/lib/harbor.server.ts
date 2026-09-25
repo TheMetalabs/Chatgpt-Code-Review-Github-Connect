@@ -160,9 +160,39 @@ export function resetHarbor() {
   localActivity.clear();
   for (const l of localLiveness.values()) l.clear();
   localLiveness.clear();
-  for (const job of state.jobs) recordJobHistory(isLive(job.status)
+  for (const job of state.jobs) noteJobHistory(isLive(job.status)
     ? {...job, status: "cancelled", skipReason: "operator reset", updatedAt: Date.now()} : job);
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
+}
+
+/** The last job or delivery history write that failed. Non-fatal: what it recorded was applied. */
+let historyFault: { id: string; at: number; error: string } | undefined;
+
+/** Every job and delivery history write in harbor goes through here. History records a transition,
+ * it is never part of one: a write that throws is caught, logged and surfaced (historyHealth), so it
+ * can never abort or half-apply the state change it records (a job patched but its lease ping, local
+ * leg start or review start never reached). A later successful write clears the fault, as the store
+ * clears its own. */
+function noteHistory(id: string, write: () => void) {
+  try {
+    write();
+    historyFault = undefined;
+  } catch (e) {
+    const error = (e instanceof Error ? e.message : String(e)).slice(0, 240);
+    historyFault = { id, at: Date.now(), error };
+    console.warn(`[harbor] history write failed for ${id} (the state change was applied): ${error}`);
+  }
+}
+const noteJobHistory = (job: Job) => noteHistory(job.id, () => recordJobHistory(job));
+const noteDeliveryHistory = (ev: WebhookLog, target?: Parameters<typeof recordDeliveryHistory>[1]) =>
+  noteHistory(ev.id, () => recordDeliveryHistory(ev, target));
+
+/** History storage health for the dashboard: the store's own, plus a history write that failed
+ * outside it (a non-fatal history error; the job state is current). */
+export function historyHealth() {
+  const store = reviewHistory().health();
+  if (!historyFault || !store.ok) return store;
+  return { ...store, ok: false, error: "history_write_failed", failedId: historyFault.id, failedAt: historyFault.at };
 }
 
 export function cancelHarborJob(jobId: string) {
@@ -180,10 +210,11 @@ function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
   if (!before) return undefined;
   const after = next(before);
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? after : j)) };
-  // Cleanup before the history write: the edge is crossed once, so a write that throws here must not
-  // strand the in-flight local request or the held snapshot (the store reports its own health).
+  // Cleanup before the history write: the edge is crossed once, so it runs whatever the write does.
   if (isLive(before.status) && !isLive(after.status)) releaseTerminalJob(after);
-  recordJobHistory(after);
+  // Never throws: every caller continues past its write (the lease ping's owner liveness, a local
+  // leg's request, the review that follows), so a history failure cannot half-apply a transition.
+  noteJobHistory(after);
   return after;
 }
 
@@ -1389,7 +1420,7 @@ function enqueueFromDecision(
       summary: `${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr} rejected`,
       rejectReason: decision.reason,
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 403, reject: decision.reason, queued: false };
   }
@@ -1399,7 +1430,7 @@ function enqueueFromDecision(
     if (!isBotMention(opts.thread?.userText, state.settings) || /^duplicate delivery_id/.test(decision.skip || "")) {
       const ev: WebhookLog = {id:nid("ev"),deliveryId:opts.deliveryId,event:opts.eventName,action:"ignored",hmac:"ok",
         httpStatus:202,at:Date.now(),summary:`${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr} ignored`,skipReason:decision.skip || "filtered"};
-      recordDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
+      noteDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
       state={...state,events:trim([ev,...state.events])};
       return {httpStatus:202,skip:decision.skip || "filtered",queued:false};
     }
@@ -1444,8 +1475,8 @@ function enqueueFromDecision(
       skipReason: decision.skip ?? "filtered",
       jobId: skipJob.id,
     };
-    recordJobHistory(skipJob);
-    recordDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
+    noteJobHistory(skipJob);
+    noteDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
     state = { ...state, jobs: trimJobs([skipJob, ...state.jobs]), events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: decision.skip ?? "filtered", jobId: skipJob.id, queued: false };
   }
@@ -1488,8 +1519,8 @@ function enqueueFromDecision(
   }
   state = { ...state, jobs: trimJobs([job, ...state.jobs]), events: trim([ev, ...state.events]) };
 
-  recordDeliveryHistory(ev,{owner:job.owner,repo:job.repo,pr:job.pr,commentId:job.thread?.commentId});
-  recordJobHistory(job);
+  noteDeliveryHistory(ev,{owner:job.owner,repo:job.repo,pr:job.pr,commentId:job.thread?.commentId});
+  noteJobHistory(job);
   // A superseded job's ops comment keeps its last "running" state and looks stuck
   // forever. Mark those comments terminal so a re-trigger doesn't leave a phantom
   // in-flight review. Best-effort — never blocks or fails the newly enqueued job.
@@ -1633,7 +1664,7 @@ export function ingestGitHubWebhook(opts: {
       summary: "GitHub delivery rejected",
       rejectReason: "HMAC mismatch",
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 403, reject: "HMAC mismatch", queued: false };
   }
@@ -1650,7 +1681,7 @@ export function ingestGitHubWebhook(opts: {
       summary: "GitHub delivery skipped",
       skipReason: parsed.reason,
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false };
   }
@@ -1666,7 +1697,7 @@ export function ingestGitHubWebhook(opts: {
       at: Date.now(),
       summary: "GitHub ping",
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, queued: false, pong: true };
   }
@@ -1683,7 +1714,7 @@ export function ingestGitHubWebhook(opts: {
       summary: `${opts.event} ignored`,
       skipReason: parsed.reason,
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false, ignored: parsed.reason };
   }

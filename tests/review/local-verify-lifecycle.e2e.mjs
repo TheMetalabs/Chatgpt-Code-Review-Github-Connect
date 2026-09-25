@@ -82,12 +82,27 @@ async function startFaulted(t,{verifying,delivery}){
   }
   return s;
 }
-/** The throwing write surfaced to the caller, and the edge's cleanup had already run by then. */
-function assertCleanedDespiteHistory(s,thrown){
-  assert.match(String(thrown?.message),/history store unavailable/,'the history failure reaches the caller');
+/** Collects console.warn lines (the fixture realm shares this console) until the test ends. */
+function warnings(t){
+  const lines=[],warn=console.warn;
+  console.warn=(...args)=>{lines.push(args.join(' '));};
+  t.after(()=>{console.warn=warn;});
+  return lines;
+}
+/** The failed write is surfaced as a non-fatal history error on the dashboard's health. */
+function assertHistoryFault(app,id){
+  const health=app.harbor.historyHealth();
+  assert.equal(health.ok,false,'surfaced as a history error');
+  assert.equal(health.error,'history_write_failed');
+  assert.equal(health.failedId,id);
+}
+/** The throwing write never reached the caller: it was logged, and the edge's cleanup ran. */
+function assertCleanedDespiteHistory(s,thrown,logged){
+  assert.equal(thrown,undefined,'a history failure never aborts the transition it records');
   assert.equal(s.fault.thrown,1,'the cancelled record write failed');
   assert.equal(s.job().status,'cancelled','the job is terminal');
   assert.equal(s.app.harbor.hasLocalLegState(s.jobId),false,'activity and liveness cleared on the edge');
+  assert.ok(logged.some(l=>l.includes(s.jobId)&&/history store unavailable/.test(l)),'the failure is logged');
 }
 
 // expect: status, skip (regex or undefined), requests (total local requests), reviews, aborted, and
@@ -230,6 +245,36 @@ const ROWS=[
       assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
       return s;
     }},
+  // A history write that fails is never a bridge disconnect: every ping is applied and speaks for its owner.
+  {name:'L24 history writes fail through a long claimed chat run: the owner\'s lease pings are applied, it stays connected, local stays held, and the run completes',expect:{status:'posted',requests:0,reviews:1,reviewers:VERIFIER,ops:VERIFIER_OPS},
+    async run(t){
+      const fault={on:false,thrown:0};
+      const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({recordJobHistory(job){
+        if(fault.on){fault.thrown++;throw new Error('history store unavailable');}
+        return real.recordJobHistory(job);
+      }})}};
+      const s=await start(t,{githubOptions,delivery:'lifecycle-history-pings'});
+      s.app.bridge.bridgeHeartbeat();
+      const take=s.app.bridge.takeNextBridgeJob('client-a');
+      assert.equal(take?.jobId,s.jobId,'client A claims the job');
+      const logged=warnings(t);
+      fault.on=true;
+      // 5 min of pings, past BRIDGE_CONNECTED_MS (2 min), while every job history write fails
+      for(let i=0;i<5;i++){
+        s.app.clock.now+=60_000;s.app.bridge.bridgeHeartbeat();
+        assert.equal(s.app.bridge.refreshBridgeClaim(s.jobId,{chatgpt:true},{},take.leaseId),true,'A\'s lease ping is accepted');
+        assert.equal(s.job().bridgeClaimedAt,s.app.clock.now,'and applied');
+        assert.equal(s.app.bridge.chatBridgeLink(s.job()).connected,true,'the owner stays connected');
+        await new Promise(resolve=>setTimeout(resolve,60)); // a few watcher ticks at each step
+      }
+      assert.ok(fault.thrown>=5,'every ping\'s history write failed');
+      assert.ok(logged.some(l=>/history write failed/.test(l)),'the failures are logged');
+      assertHistoryFault(s.app,s.jobId);
+      assert.equal(s.app.localRequests.length,0,'no verify-clean fallback while the owner pings');
+      fault.on=false; // history storage restored
+      assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
+      return s;
+    }},
   {name:'L13 a bridge token rotation waits the grace from the rotation, not from an older unseen bridge',expect:{status:'posted',requests:1,reviews:1,body:/Skipped chatgpt/,reviewers:FALLBACK_ONLY,ops:FALLBACK_OPS},
     async run(t){
       // Job A is admitted while the bridge has never been seen, then the bridge connects and stays
@@ -313,12 +358,15 @@ const ROWS=[
       assert.equal((await s.app.bridge.completeBridgeJob(s.jobId,dirty,[{provider:'chatgpt',raw:dirty}],take.leaseId)).ok,true);
       return s;
     }},
-  // Terminal cleanup runs on the live → terminal edge even when that edge's history write throws.
+  // Terminal cleanup runs on the live → terminal edge even when that edge's history write throws, and
+  // the throw never reaches the caller: it is logged and surfaced as a non-fatal history error.
   {name:'L18 operator cancel while local verifies, history write throws: still aborted and released',expect:{status:'cancelled',skip:/cancelled by operator/,requests:1,reviews:0,aborted:true},
     async run(t){
       const s=await startFaulted(t,{verifying:true,delivery:'lifecycle-history-cancel-verifying'});
+      const logged=warnings(t);
       let thrown;try{s.app.harbor.cancelHarborJob(s.jobId);}catch(e){thrown=e;}
-      assertCleanedDespiteHistory(s,thrown);
+      assertCleanedDespiteHistory(s,thrown,logged);
+      assertHistoryFault(s.app,s.jobId);
       await eventually(()=>s.abort.aborted,'the in-flight local request was not aborted');
       return s;
     }},
@@ -326,24 +374,28 @@ const ROWS=[
     async run(t){
       const s=await startFaulted(t,{verifying:false,delivery:'lifecycle-history-cancel-held'});
       assert.equal(s.app.harbor.hasLocalSample(s.jobId),true,'the held job keeps its snapshot');
+      const logged=warnings(t);
       let thrown;try{s.app.harbor.cancelHarborJob(s.jobId);}catch(e){thrown=e;}
-      assertCleanedDespiteHistory(s,thrown);
+      assertCleanedDespiteHistory(s,thrown,logged);
+      assertHistoryFault(s.app,s.jobId);
       assert.equal(s.app.harbor.hasLocalSample(s.jobId),false,'released on the edge');
       return s;
     }},
   {name:'L20 superseded while local verifies, history write throws: still aborted and released',expect:{status:'cancelled',skip:/superseded by/,requests:1,reviews:0,aborted:true},
     async run(t){
       const s=await startFaulted(t,{verifying:true,delivery:'lifecycle-history-supersede-verifying'});
+      const logged=warnings(t);
       let thrown;try{await s.app.mention('lifecycle-history-supersede-verifying-next');}catch(e){thrown=e;}
-      assertCleanedDespiteHistory(s,thrown);
+      assertCleanedDespiteHistory(s,thrown,logged);
       await eventually(()=>s.abort.aborted,'the superseded job\'s local request was not aborted');
       return s;
     }},
   {name:'L21 superseded while held, history write throws: the snapshot is still released',expect:{status:'cancelled',skip:/superseded by/,requests:0,reviews:0},
     async run(t){
       const s=await startFaulted(t,{verifying:false,delivery:'lifecycle-history-supersede-held'});
+      const logged=warnings(t);
       let thrown;try{await s.app.mention('lifecycle-history-supersede-held-next');}catch(e){thrown=e;}
-      assertCleanedDespiteHistory(s,thrown);
+      assertCleanedDespiteHistory(s,thrown,logged);
       assert.equal(s.app.harbor.hasLocalSample(s.jobId),false,'released on the edge');
       return s;
     }},
@@ -426,4 +478,41 @@ test('chat bridge link: an owned job follows its owner, an unowned one the serve
   app.bridge.rotateBridgeToken();
   assert.deepEqual(link('client-a'),{connected:false,disconnectedAt:app.clock.now},'offline at the rotation, as an unseen bridge is');
   app.harbor.cancelHarborJob(jobId);
+});
+
+test('history: a new job whose delivery and job history writes fail still starts its review, and the failure never reaches the webhook',async t=>{
+  const thrown=[];
+  const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({
+    recordJobHistory(job){if(job.status==='queued'){thrown.push('job');throw new Error('history store unavailable');}return real.recordJobHistory(job);},
+    recordDeliveryHistory(){thrown.push('delivery');throw new Error('history store unavailable');},
+  })}};
+  const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false},githubOptions);t.after(()=>app.close());
+  const logged=warnings(t);
+  let out,error;try{out=app.mention('history-new-job');}catch(e){error=e;}
+  assert.equal(error,undefined,'the webhook is accepted');
+  assert.equal(out.queued,true);
+  assert.deepEqual(thrown,['delivery','job'],'both writes failed');
+  assert.equal(logged.filter(l=>/history write failed/.test(l)).length,2,'each failure is logged');
+  await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId)?.status==='awaiting_chat','the review never started');
+  assert.equal(app.harbor.hasLocalSample(out.jobId),true,'the held verify-clean job has its snapshot');
+});
+
+test('history: an operator reset whose history write fails still drops every job and releases its local state',async t=>{
+  const fault={on:false,thrown:0};
+  const githubOptions={wrap:{'src/lib/review-history.server.ts':real=>({recordJobHistory(job){
+    if(fault.on&&job.skipReason==='operator reset'){fault.thrown++;throw new Error('history store unavailable');}
+    return real.recordJobHistory(job);
+  }})}};
+  const {app,jobId}=await start(t,{githubOptions,delivery:'history-reset'});
+  assert.equal(app.harbor.hasLocalSample(jobId),true,'the held job keeps its snapshot');
+  const logged=warnings(t);
+  fault.on=true;
+  let error;try{app.harbor.resetHarbor();}catch(e){error=e;}
+  assert.equal(error,undefined,'the reset completes');
+  assert.equal(fault.thrown,1,'the cancelled record write failed');
+  assert.equal(app.harbor.getHarbor().jobs.length,0,'every job is dropped');
+  assert.equal(app.harbor.hasLocalSample(jobId),false,'its snapshot is released');
+  assert.ok(logged.some(l=>l.includes(jobId)),'the failure is logged');
+  assertHistoryFault(app,jobId);
+  await eventually(()=>!app.harbor.isWatchingJob(jobId),'the reviewer watcher never stopped');
 });

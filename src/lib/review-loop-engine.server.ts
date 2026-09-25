@@ -41,7 +41,9 @@ import {
   inSession,
   ownWrites,
   type ControlWrite,
+  type Decision,
   type EmitOutcome,
+  type Supersession,
 } from "./review-loop-control.ts";
 
 // Single source of the App identity lives in review-loop.ts (shared with the webhook parser's
@@ -141,13 +143,26 @@ export async function reconstructRounds(
 }
 
 /** `session`: the loop session (its anchor start, see SessionRef) — it scopes the rounds, and the
- * handoff is one per head in it. */
-type HandoffTarget = { owner: string; repo: string; pr: number; head: string; session?: SessionRef };
+ * handoff is one per head in it. `superseded`: the caller's fresh read, right before each POST
+ * attempt of the handoff, of why its session is no longer the active one (null: still owed) — the
+ * loop runtime always passes it; without it the handoff is owed as long as it is emitted. */
+type HandoffTarget = {
+  owner: string;
+  repo: string;
+  pr: number;
+  head: string;
+  session?: SessionRef;
+  superseded?: () => Promise<Supersession | null>;
+};
 
 /** THE handoff of a head in a session: one, whichever path (stuck classification or a terminal
- * failure) posts it. */
+ * failure) posts it — decided at each POST attempt (review-loop-control ControlWrite.decide). */
 function handoffWrite(o: HandoffTarget, body: string): ControlWrite {
-  return { key: { kind: "handoff", ref: { owner: o.owner, repo: o.repo, pr: o.pr }, head: o.head, session: o.session }, body };
+  const decide = async (): Promise<Decision> => {
+    const why = o.superseded ? await o.superseded() : null;
+    return why ? { status: "superseded", why } : { status: "owed", body };
+  };
+  return { key: { kind: "handoff", ref: { owner: o.owner, repo: o.repo, pr: o.pr }, head: o.head, session: o.session }, decide };
 }
 
 /** True if a bot-authored escalate handoff for this head is LISTED in this session (idempotency;
@@ -172,6 +187,8 @@ export interface EscalateResult {
   rounds: RoundSummary[];
   /** Set when history was incomplete/failed and escalation was skipped fail-closed. */
   error?: string;
+  /** The handoff was no longer owed when a POST attempt was decided (why): nothing was sent. */
+  superseded?: Supersession;
 }
 
 /** The reviewed head is not the latest reconstructed round: the history does not (yet) show
@@ -205,6 +222,8 @@ export async function maybeEscalate(
     botLogin?: string;
     /** The loop session: rounds after its anchor, one handoff per head in it (see SessionRef). */
     session?: SessionRef;
+    /** Why the session is no longer the active one, read fresh before each handoff POST attempt. */
+    superseded?: () => Promise<Supersession | null>;
     /** Fail closed (error CURRENT_ROUND_MISSING) unless the reviewed head IS the latest round —
      * including a history with ZERO attributable rounds, which then can never "pass" the budget.
      * The loop runtime always sets it; a lenient caller only classifies a history it can see and
@@ -278,6 +297,8 @@ async function maybeEscalateInner(
       return { escalated: false, ambiguous: true, reason, rounds };
     case "rejected": // nothing landed: the loop step hands off loop-error for this head instead
       throw new Error(out.error);
+    case "superseded": // the session it would end is over, or a newer one runs: nothing to hand off
+      return { escalated: false, superseded: out.why, reason, rounds };
     default:
       return assertNever(out);
   }
@@ -289,7 +310,9 @@ const defaultSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, 
  * POST a terminal handoff through the control gate: a refused POST is retried with backoff (a
  * handoff has no other poster, so one transient failure must not leave the session active with no
  * signal), and one whose outcome is unknown is never sent again — its attempt time stands in for
- * it in every session read until the row is listed. The caller has just scanned the history.
+ * it in every session read until the row is listed. Each attempt is decided at that attempt (the
+ * caller's `superseded`): a handoff whose session is over is never sent. The caller has just
+ * scanned the history.
  */
 function emitHandoff(
   gh: ReviewLoopGithub,
@@ -307,7 +330,9 @@ function emitHandoff(
  * loop-error) on this head. One handoff per head: shares the in-flight guard and the marker
  * idempotency with maybeEscalate. Unlike classification, a failed idempotency READ does not
  * suppress the post — the failure itself is the signal, and a duplicate handoff is harmless
- * next to a loop that stops silently.
+ * next to a loop that stops silently. Whether the handoff is still OWED is another read: the
+ * caller's `superseded`, made right before each POST attempt (a handoff that ended a newer session
+ * would not be harmless); one that cannot be made sends nothing.
  */
 export async function escalateNow(
   gh: ReviewLoopGithub,
@@ -325,12 +350,14 @@ export async function escalateNow(
     botLogin?: string;
     /** The loop session: only handoffs posted in it count for idempotency (see SessionRef). */
     session?: SessionRef;
+    /** Why the session is no longer the active one, read fresh before each handoff POST attempt. */
+    superseded?: () => Promise<Supersession | null>;
     /** Waits between handoff POST retries (injectable for tests). */
     sleep?: (ms: number) => Promise<void>;
     /** The clock a handoff attempt is stamped with (injectable for tests). */
     now?: () => number;
   },
-): Promise<{ escalated: boolean; ambiguous?: boolean; error?: string }> {
+): Promise<{ escalated: boolean; ambiguous?: boolean; error?: string; superseded?: Supersession }> {
   const botLogin = opts.botLogin ?? DEFAULT_ASHLAR_BOT_LOGIN;
   const key = `${opts.owner}/${opts.repo}#${opts.pr}@${opts.head}`;
   if (inFlightEscalate.has(key)) return { escalated: false, error: ESCALATE_IN_FLIGHT };
@@ -358,6 +385,8 @@ export async function escalateNow(
         return { escalated: false, ambiguous: true, error: HANDOFF_OUTCOME_UNKNOWN };
       case "rejected":
         return { escalated: false, error: out.error };
+      case "superseded": // no longer owed at an attempt: nothing was sent
+        return { escalated: false, superseded: out.why };
       default:
         return assertNever(out);
     }

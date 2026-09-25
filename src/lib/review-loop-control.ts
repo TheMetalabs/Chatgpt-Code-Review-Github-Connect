@@ -9,8 +9,15 @@
  * state at every call site separately left one gap per site: a write sent twice, an "ok" that was
  * not, a session that ended or stayed open on a guess. Here it is handled once:
  * - emitControl POSTs a write at most once while its outcome may have landed, joins concurrent
- *   emits of the same key, and returns a CLOSED outcome (posted | exists | unknown | rejected) that
- *   every caller handles in an exhaustive switch.
+ *   emits of the same key, and returns a CLOSED outcome (posted | exists | unknown | rejected |
+ *   superseded) that every caller handles in an exhaustive switch.
+ * - Every POST attempt is DECIDED at that attempt: emitControl calls the write's decide() — the
+ *   caller's fresh read of the session — right before each POST (the first one too: a caller's
+ *   own read may predate another write's backoff), never on a decision taken before a wait. It
+ *   answers the text to send now (a stop's form depends on whether a newer session runs) or that
+ *   the write is superseded — no longer owed (a continuation or handoff whose session is over, or
+ *   a continuation whose head is no longer the PR's): nothing more is sent and nothing stands in
+ *   for it. A decide() that cannot read decides nothing: that attempt is not sent.
  * - OwnWrites journals every write. Every session read reconciles it against the listed history (a
  *   listed row the event collector reads confirms its entry) and folds the entries the list does
  *   not show as stand-in events: the loop reads its own writes — also when a later read lags behind
@@ -89,11 +96,32 @@ export function controlKey(k: ControlKey): string {
   }
 }
 
+/**
+ * Why a write is no longer owed when an attempt is decided: its session is not the active one — it
+ * ended (stopped, handed off, handed off by this process's own write whose outcome is unknown, or
+ * converged) or a newer one runs — or, for a continuation, the PR head moved off the head it
+ * requests (the live head's own request drives the loop).
+ */
+export type Supersession = "head" | "stopped" | "handoff" | "handoff-unknown" | "converged" | "newer";
+
+/** A write as decided at one POST attempt: owed, with the text to send now; or superseded. */
+export type Decision = { status: "owed"; body: string } | { status: "superseded"; why: Supersession };
+
 export interface ControlWrite {
   key: ControlKey;
-  /** Lazy so a continuation computes its round only when a POST is really sent — and so a caller
-   * reaches emitControl with no await (the single-flight join point). */
-  body: string | (() => Promise<string>);
+  /**
+   * Decides the write right before each POST attempt (see the header): the caller's FRESH read —
+   * never a decision taken before a backoff — answers whether it is still owed and in which text.
+   * Lazy, so a caller reaches emitControl with no await (the single-flight join point) and a
+   * continuation computes its round only for a POST really sent. A throw sends nothing then.
+   */
+  decide: () => Promise<Decision>;
+}
+
+/** The decision of a write owed as `body` at every attempt: a start record, placed at its own time
+ * and the same in every session (no read can change it). */
+export function owedAs(body: string): () => Promise<Decision> {
+  return async () => ({ status: "owed", body });
 }
 
 /** In-session test for a REVIEW row (a round): strictly after the anchor, compared as instants.
@@ -189,19 +217,22 @@ export function collectable(w: ControlWrite, row: ControlRow): boolean {
 }
 
 /**
- * posted   — THIS emit created the row: its POST returned it, or answered "unknown" and a re-check
- *            then listed it (the gate is exclusive per key, so that row is this emit's);
- * exists   — a matching row was listed before this emit sent anything, or an earlier emit wrote it;
- * unknown  — a POST may have landed and no list shows it: it is never sent again;
- * rejected — nothing was created (every attempt refused, or never sent).
+ * posted     — THIS emit created the row: its POST returned it, or answered "unknown" and a
+ *              re-check then listed it (the gate is exclusive per key, so that row is this emit's);
+ * exists     — a matching row was listed before this emit sent anything, or an earlier emit wrote it;
+ * unknown    — a POST may have landed and no list shows it: it is never sent again;
+ * rejected   — nothing was created (every attempt refused, or not sent: undecided or unrenderable);
+ * superseded — an attempt's decide() found the write no longer owed (`why`): nothing was created
+ *              (only refused attempts came before) and nothing stands in for it.
  */
 export type EmitOutcome =
   | { status: "posted" }
   | { status: "exists" }
   | { status: "unknown"; attemptAt: string; error: string }
-  | { status: "rejected"; error: string };
+  | { status: "rejected"; error: string }
+  | { status: "superseded"; why: Supersession };
 
-type WriteState = "intent" | "sending" | "posted" | "unknown" | "rejected";
+type WriteState = "intent" | "sending" | "posted" | "unknown" | "rejected" | "superseded";
 
 interface OwnWrite {
   /** Its journal key: controlKey of its write (never changes: see controlKey). */
@@ -269,13 +300,14 @@ function standInEvent(e: OwnWrite): LoopEvent {
 export const LANDED_KEPT = 1_000;
 
 /**
- * Done with, so dropped at once: a write that neither landed nor folds (refused or unsent, not
- * write-ahead). Never while an emit is in flight. A landed write is retired by landing order
- * (LANDED_KEPT); an unknown write, and a write-ahead one whose record is not posted, never are.
+ * Done with, so dropped at once: a write that neither landed nor folds (refused, unsent or
+ * superseded, not write-ahead). Never while an emit is in flight. A landed write is retired by
+ * landing order (LANDED_KEPT); an unknown write, and a write-ahead one whose record is not posted,
+ * never are.
  */
 function settled(e: OwnWrite): boolean {
   if (e.inflight) return false;
-  return !e.writeAhead && (e.state === "rejected" || e.state === "intent");
+  return !e.writeAhead && (e.state === "rejected" || e.state === "intent" || e.state === "superseded");
 }
 
 /** The control writes one GitHub client made in this process, retained by STATE: an entry that may
@@ -495,6 +527,7 @@ async function emitOnce(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
       return recheck(ctx, e);
     case "intent":
     case "rejected":
+    case "superseded":
       return send(ctx, e);
     default:
       return assertNever(e.state);
@@ -526,12 +559,21 @@ async function recheck(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
   return { status: "exists" };
 }
 
+/** The write decided for THIS attempt (a throw: undecided — the attempt is not sent). */
+async function decideAttempt(e: OwnWrite): Promise<Decision> {
+  try {
+    return await e.write.decide();
+  } catch (err) {
+    throw new Error(`not sent: the write could not be decided (${message(err)})`); // never an "unknown" outcome
+  }
+}
+
 async function send(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
   const { ref } = e.write.key;
   const where = { owner: ref.owner, repo: ref.repo, pr: ref.pr };
-  let body: string | undefined;
   let mayHaveLanded = false; // one of THIS emit's POSTs answered "unknown"
-  const r = await retryWrite({
+  let refusal: unknown; // the last POST GitHub refused
+  const r = await retryWrite<Supersession>({
     delays: CONTROL_RETRY_DELAYS_MS,
     sleep: ctx.sleep,
     scanFirst: ctx.scanFirst,
@@ -542,16 +584,19 @@ async function send(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
       return !!hit;
     },
     post: async () => {
-      const w = e.write.body;
-      body ??= typeof w === "string" ? w : await w();
+      // Decided now, after any backoff and before this attempt is stamped: a write no longer owed
+      // is never sent — and so never leaves an unknown stand-in in a session it was not decided for.
+      const decision = await decideAttempt(e);
+      if (decision.status === "superseded") return { withdrawn: decision.why };
       e.attemptAt = attemptSecond(ctx.now());
       e.state = "sending";
       try {
-        e.row = await ctx.gh.createIssueComment(ctx.token, { ...where, body });
+        e.row = await ctx.gh.createIssueComment(ctx.token, { ...where, body: decision.body });
         e.state = "posted";
       } catch (err) {
         e.state = writeOutcomeUnknown(err) ? "unknown" : "rejected";
         mayHaveLanded ||= e.state === "unknown";
+        if (e.state === "rejected") refusal = err;
         e.error = message(err);
         throw err;
       }
@@ -561,7 +606,13 @@ async function send(ctx: EmitContext, e: OwnWrite): Promise<EmitOutcome> {
   // Listed after this emit's own unknown POST: that row is the POST's. Callers read "exists" as
   // someone else's write (a handoff caller then skips its report and replies silently).
   if ("exists" in r) return { status: mayHaveLanded ? "posted" : "exists" };
+  if ("withdrawn" in r) {
+    e.state = "superseded"; // only refused attempts came before: nothing to stand in for
+    return { status: "superseded", why: r.withdrawn };
+  }
   if (e.state === "unknown") return unknownOutcome(e);
-  e.state = "rejected"; // also a body that could not be rendered: nothing was sent
-  return { status: "rejected", error: message(r.error) };
+  e.state = "rejected"; // also a write that could not be decided or rendered: nothing was sent
+  // a refusal, then attempts not sent: both say why nothing was created
+  const last = message(r.error);
+  return { status: "rejected", error: refusal !== undefined && refusal !== r.error ? `${message(refusal)}; ${last}` : last };
 }

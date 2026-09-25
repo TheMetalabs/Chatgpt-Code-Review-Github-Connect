@@ -45,12 +45,15 @@ import { localLivenessMs } from "./local-leg-activity.ts";
 import {
   assertNever,
   emitControl,
+  owedAs,
   ownWrites,
   prKey,
   type ControlWrite,
+  type Decision,
   type EmitContext,
   type EmitOutcome,
   type PrRef,
+  type Supersession,
 } from "./review-loop-control.ts";
 import {
   CURRENT_ROUND_MISSING,
@@ -467,9 +470,10 @@ export function sanitizeModelText(text: string | undefined, opts: { oneLine?: bo
   return sanitizeUntrusted(text, opts);
 }
 
-/** Why a round became moot mid-flight: the head moved, the session ended, or a newer request
- * (a new session, or apply downgraded to suggest) took over. */
-type Moot = "head" | "stopped" | "handoff" | "handoff-unknown" | "converged" | "newer";
+/** Why a round became moot mid-flight — or a control write, decided at a POST attempt, is no
+ * longer owed: the head moved, the session ended, or a newer request (a new session, or apply
+ * downgraded to suggest) took over. */
+type Moot = Supersession;
 const MOOT_TEXT: Record<Moot, string> = {
   head: "the PR head moved",
   stopped: "the loop was stopped",
@@ -495,12 +499,60 @@ function endedWhy(gh: object, ref: PrRef, s: LoopSession): Exclude<Moot, "head" 
   return s.endedBy === "escalate" ? "handoff" : s.endedBy === "converged" ? "converged" : "stopped";
 }
 
+/** Why `session` is not the one `now` shows running (null: it still runs) — ended, or a newer one
+ * (a start in its own second re-issues it: see SessionRef). */
+function sessionMoot(gh: object, ref: PrRef, now: LoopSession, session: SessionRef): Moot | null {
+  if (!now.active) return endedWhy(gh, ref, now);
+  return sameSession(sessionRef(now), session) ? null : "newer";
+}
+
+/**
+ * THE decision a continuation or handoff for `session` takes right before each of its POST attempts
+ * (review-loop-control ControlWrite.decide): a FRESH read of the live head and the session (with
+ * this process's own writes, and `extra`: the caller's known events, e.g. a push). Moot when the
+ * session no longer runs — or, given `head` (a continuation's), when the PR head moved off it: the
+ * live head's own request drives the loop. A failed read throws (that attempt is not sent).
+ */
+async function freshMoot(
+  gh: LoopRuntimeGithub,
+  token: string,
+  ref: PrRef,
+  botLogin: string,
+  o: { session: SessionRef; head?: string; extra?: LoopEvent[] },
+): Promise<Moot | null> {
+  const live = await gh.fetchPullHeadRef(token, ref.owner, ref.repo, ref.pr);
+  if (o.head !== undefined && live.sha !== o.head) return "head";
+  return sessionMoot(gh, ref, await sessionOf(gh, token, ref, live, botLogin, o.extra), o.session);
+}
+
+/** A step (or its handoff) gone moot for any reason but a moved head (quietExit continues on the
+ * live head): the quiet exit naming how the session ended — logged when only this process's own
+ * unresolved handoff ended it. */
+function endedStep(why: Moot): LoopStepResult {
+  switch (why) {
+    case "stopped":
+      return { ran: false, reason: STOPPED_QUIET };
+    case "handoff":
+      return { ran: false, reason: ENDED_BY_HANDOFF };
+    case "handoff-unknown":
+      return { ran: false, reason: HANDED_OFF_UNKNOWN };
+    case "converged":
+      return { ran: false, reason: ENDED_CONVERGED };
+    case "newer":
+      return { ran: false, reason: NEWER_REQUEST };
+    case "head": // a handoff is never superseded by a moved head (its session decides)
+      return { ran: false, reason: SUPERSEDED };
+    default:
+      return assertNever(why);
+  }
+}
+
 /** How an applied round's report ends: continued, the session ended meanwhile (why), the
  * continuation's outcome is UNKNOWN (it may have landed: not confirmed, not re-sent, no handoff),
  * or why the next review could not be requested. */
 type ContinuationStatus =
   | { ok: true }
-  | { ok: false; ended: Exclude<Moot, "head"> }
+  | { ok: false; ended: Moot }
   | { ok: false; unknown: true; error: string }
   | { ok: false; error: string };
 
@@ -524,7 +576,9 @@ function renderFixReport(
           : "ended" in continuation
           ? continuation.ended === "stopped"
             ? "Loop stopped by the operator: no further review is requested."
-            : `The loop ended meanwhile (${MOOT_TEXT[continuation.ended]}): no further review is requested.`
+            : continuation.ended === "head"
+              ? "The PR head moved meanwhile: the live head's review drives the loop, so this commit's review is not requested."
+              : `The loop ended meanwhile (${MOOT_TEXT[continuation.ended]}): no further review is requested.`
           : `The next review could not be requested (${sanitizeModelText(continuation.error, { oneLine: true, max: 300 })}); see the loop handoff.`;
       return `### Ashlar fix agent — applied\n\nCommitted \`${res.commitSha ?? "(unknown)"}\` (mode: ${mode}${tries}).\n\n${summary}\n\nChanged:\n${files}\n\n${tail}${threads}`;
     }
@@ -605,24 +659,28 @@ function sessionOf(gh: LoopRuntimeGithub, token: string, ref: PrRef, head: PullH
  * Request the next review of `head` with the fixed continuation marker — ONE per (PR, head,
  * session): the push handler, a step whose head moved and an applied round can each ask, and the
  * gate joins concurrent callers and finds a later caller this process's own or the listed one. An
- * unreadable history fails toward posting (a duplicate request is only superseded by harbor, a
- * missing one would stall the loop); a POST that may have landed is never sent again. The body is
+ * unreadable ROUND history fails toward posting (a duplicate request is only superseded by harbor,
+ * a missing one would stall the loop); a POST that may have landed is never sent again. Each POST
+ * attempt is decided by a fresh read (freshMoot, `extra` included): superseded once the session no
+ * longer runs or the PR head moved off `head`, and not sent when that read fails. The decision is
  * lazy — the round is computed only for a real POST — so the gate is reached with no await (the
  * single-flight join point). Never throws.
  */
 function ensureContinuation(
   ctl: EmitContext,
-  gh: ReviewLoopGithub,
+  gh: LoopRuntimeGithub,
   ref: PrRef,
-  c: { head: string; mode: ReviewLoopMode; session: SessionRef; round?: number },
+  c: { head: string; mode: ReviewLoopMode; session: SessionRef; round?: number; extra?: LoopEvent[] },
 ): Promise<EmitOutcome> {
   if (!FULL_SHA_RE.test(c.head)) return Promise.resolve({ status: "rejected", error: "the head is not a full commit SHA" });
-  const body = async () => {
+  const decide = async (): Promise<Decision> => {
+    const why = await freshMoot(gh, ctl.token, ref, ctl.botLogin, c);
+    if (why) return { status: "superseded", why };
     const round =
       c.round ?? (await reconstructRounds(gh, ctl.token, ref.owner, ref.repo, ref.pr, { botLogin: ctl.botLogin, sinceIso: c.session.at }).catch(() => [])).length + 1;
-    return continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head });
+    return { status: "owed", body: continueComment({ mode: c.mode, round: Math.min(Math.max(1, round), MAX_CONTINUE_ROUND), pr: ref.pr, head: c.head }) };
   };
-  return emitControl(ctl, { key: { kind: "continue", ref, head: c.head, session: c.session }, body });
+  return emitControl(ctl, { key: { kind: "continue", ref, head: c.head, session: c.session }, decide });
 }
 
 /** What a superseded step's request for the live head's review came to: skipped when none was
@@ -645,6 +703,8 @@ function supersededResult(r: ContinueOnResult): LoopStepResult {
       return { ran: false, reason: `${SUPERSEDED_UNREADABLE}: ${r.error}` };
     case "handed-off-unknown":
       return { ran: false, reason: SUPERSEDED_HANDED_OFF };
+    case "superseded": // the live head moved again, or the session no longer runs: not owed
+      return { ran: false, reason: r.why === "handoff-unknown" ? SUPERSEDED_HANDED_OFF : SUPERSEDED };
     default:
       return assertNever(r);
   }
@@ -660,6 +720,8 @@ function continuationStatus(c: EmitOutcome): ContinuationStatus {
       return { ok: false, unknown: true, error: c.error };
     case "rejected":
       return { ok: false, error: c.error };
+    case "superseded": // not owed when its POST was decided: the session is over, or the head moved
+      return { ok: false, ended: c.why };
     default:
       return assertNever(c);
   }
@@ -716,7 +778,11 @@ export async function runPostReviewLoop(
   // the NEW head.
   const escalate = async (reason: EscalateReason, detail: string, head: string = headSha): Promise<LoopStepResult> => {
     if (!d) return { ran: false, reason: `ESCALATE ${reason} not posted (no GitHub client): ${detail}` };
-    const post = () => escalateNow(d!.gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, session: since, sleep, now: d!.now });
+    const gh = d.gh;
+    const session = since;
+    // each handoff POST attempt is decided by a fresh read of the session it ends
+    const superseded = session ? () => freshMoot(gh, token, ref, botLogin, { session }) : undefined;
+    const post = () => escalateNow(gh, token, { owner, repo, pr, head, reason, detail, rounds, roundCap: cap, diffLines, botLogin, session, superseded, sleep, now: d!.now });
     try {
       let r = await post();
       if (r.error === ESCALATE_IN_FLIGHT) {
@@ -726,6 +792,8 @@ export async function runPostReviewLoop(
         r = await post();
         if (r.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: `ESCALATE ${reason} not posted: another handoff for this head is in flight (detail: ${detail})` };
       }
+      // Not owed any more (its session is over or a newer one runs): the quiet exit that says how.
+      if (r.superseded) return endedStep(r.superseded);
       // Before the generic error branch: a handoff that may have landed is terminal here, logged.
       if (r.ambiguous) return { ran: false, reason: `ESCALATE ${reason}: ${HANDED_OFF_UNKNOWN} (detail: ${detail})` };
       if (r.error) return { ran: false, reason: `ESCALATE ${reason} failed to post: ${r.error} (detail: ${detail})` };
@@ -783,13 +851,16 @@ export async function runPostReviewLoop(
           break;
         case "rejected": // a LOGGED reason, never a silent no-session for a started loop
           return { ran: false, reason: `start failed: ${out.error}` };
+        case "superseded": // unreachable: a start record is owed in every session (owedAs); never silent
+          return { ran: false, reason: `start failed: superseded (${MOOT_TEXT[out.why]})` };
         default:
           return assertNever(out);
       }
     }
     if (!session.active) return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
     requested = true;
-    since = sessionRef(session);
+    const current = sessionRef(session); // the step's session, as every later check compares it
+    since = current;
     trace(job.id, "step", { pr, head: headSha.slice(0, 7), findings: findings.length });
     diffLines = diffLinesOf(head);
     if (unshown) {
@@ -812,7 +883,8 @@ export async function runPostReviewLoop(
       diffLines,
       botLogin,
       requireCurrentRound: true,
-      session: since,
+      session: current,
+      superseded: () => freshMoot(gh, token, ref, botLogin, { session: current }),
       sleep,
       now: d.now,
     };
@@ -831,6 +903,8 @@ export async function runPostReviewLoop(
     }
     rounds = esc.rounds;
     if (esc.escalated) return { ran: true, step: "escalated", reason: esc.reason ?? "stuck" };
+    // The handoff was no longer owed when its POST was decided: the session is over, or newer.
+    if (esc.superseded) return endedStep(esc.superseded);
     // The handoff may have landed: never fix past it, never post a second one. Logged, not silent.
     if (esc.ambiguous) return { ran: false, reason: `ESCALATE ${esc.reason ?? "stuck"}: ${HANDOFF_OUTCOME_UNKNOWN}` };
     // Stuck, but a handoff for this head already exists: never fix past an ESCALATE.
@@ -889,9 +963,8 @@ export async function runPostReviewLoop(
     const relevance = async (): Promise<Moot | null> => {
       if ((await gh.fetchPullHeadRef(token, owner, repo, pr)).sha !== headSha) return "head";
       const now = await sessionOf(gh, token, ref, head, botLogin);
-      if (!now.active) return endedWhy(gh, ref, now);
-      // a newer session (a start in this one's own second re-issues it: see SessionRef)
-      if (!sameSession(sessionRef(now), since)) return "newer";
+      const gone = sessionMoot(gh, ref, now, current); // ended, or a newer session
+      if (gone) return gone;
       // apply acts on the starter's authority: a re-issued start by someone else, or a downgrade
       // to suggest, takes the round over
       if (mode === "apply" && (effectiveLoopMode(now.mode, settings) !== "apply" || (now.starter ?? "") !== starter)) return "newer";
@@ -906,11 +979,7 @@ export async function runPostReviewLoop(
     // A moot round ends quietly: a moved head continues on the live head (idempotent); a stop or
     // a newer request already decides what comes next.
     const quietExit = async (why: Moot): Promise<LoopStepResult> => {
-      if (why === "stopped") return { ran: false, reason: STOPPED_QUIET };
-      if (why === "handoff") return { ran: false, reason: ENDED_BY_HANDOFF };
-      if (why === "handoff-unknown") return { ran: false, reason: HANDED_OFF_UNKNOWN };
-      if (why === "converged") return { ran: false, reason: ENDED_CONVERGED };
-      if (why === "newer") return { ran: false, reason: NEWER_REQUEST };
+      if (why !== "head") return endedStep(why);
       let live: PullHead;
       try {
         live = await gh.fetchPullHeadRef(token, owner, repo, pr);
@@ -1037,19 +1106,19 @@ export async function runPostReviewLoop(
     const afterCommit = async (done: FixRoundResult, tries: number): Promise<LoopStepResult> => {
       const newHead = done.commitSha && FULL_SHA_RE.test(done.commitSha) ? done.commitSha : undefined;
       // Our own commit moved the head, so only the SESSION decides here (an unreadable one does
-      // not block: the next review re-checks it).
+      // not end the round: the continuation's own decision reads it again, and sends nothing
+      // undecided).
       const now = await sessionOf(gh, token, ref, newHead ? { ...head, sha: newHead } : head, botLogin).catch(() => null);
+      const gone = now ? sessionMoot(gh, ref, now, current) : null;
       let status: ContinuationStatus;
-      if (now && !now.active) {
-        status = { ok: false, ended: endedWhy(gh, ref, now) };
-      } else if (now && !sameSession(sessionRef(now), since)) {
-        status = { ok: false, ended: "newer" };
+      if (gone) {
+        status = { ok: false, ended: gone };
       } else if (!newHead) {
         status = { ok: false, error: "the commit sha was not returned" };
       } else {
         // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
         // budget — the round-cap handoff.
-        const c = await ensureContinuation(ctl, gh, ref, { head: newHead, mode, session: sessionRef(session), round: rounds.length + 1 });
+        const c = await ensureContinuation(ctl, gh, ref, { head: newHead, mode, session: current, round: rounds.length + 1 });
         if (c.status === "unknown") trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
         status = continuationStatus(c);
       }
@@ -1138,7 +1207,7 @@ export async function continueLoopOnPush(
       return endedByUnresolvedHandoff(d.gh, push, session) ? { posted: false, reason: HANDED_OFF_UNKNOWN, unresolved: true } : { posted: false, reason: NO_SESSION };
     }
     const since = sessionRef(session);
-    const c = await ensureContinuation(controlCtx(d, token, botLogin), d.gh, push, { head: push.headSha, mode: session.mode ?? "suggest", session: since });
+    const c = await ensureContinuation(controlCtx(d, token, botLogin), d.gh, push, { head: push.headSha, mode: session.mode ?? "suggest", session: since, extra: moved });
     // The next review cannot be requested: end the loop with the fixed handoff instead of stalling.
     const handOff = async (error: string) => {
       const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: session.startIso }).catch(() => []);
@@ -1153,10 +1222,13 @@ export async function continueLoopOnPush(
         roundCap: roundCap(env),
         botLogin,
         session: since,
+        superseded: () => freshMoot(d.gh, token, push, botLogin, { session: since, extra: moved }),
         sleep: d.sleep,
         now: d.now,
       });
-      return { posted: false, reason: `continue on push failed: ${error}${handoffTail(handoff)}`, ...(handoff.ambiguous ? { unresolved: true as const } : {}) };
+      // unresolved: the handoff may have landed, or only this process's own such handoff ended the session
+      const unresolved = handoff.ambiguous || handoff.superseded === "handoff-unknown";
+      return { posted: false, reason: `continue on push failed: ${error}${handoffTail(handoff)}`, ...(unresolved ? { unresolved: true as const } : {}) };
     };
     switch (c.status) {
       case "posted":
@@ -1167,6 +1239,8 @@ export async function continueLoopOnPush(
         return { posted: false, reason: `continuation outcome unknown (${c.error}); not re-sent, no handoff`, unresolved: true };
       case "rejected":
         return await handOff(c.error);
+      case "superseded": // decided at a later attempt: what the gates above say for that read
+        return supersededPush(c.why);
       default:
         return assertNever(c);
     }
@@ -1175,12 +1249,32 @@ export async function continueLoopOnPush(
   }
 }
 
+/** The push handler's result for a continuation no longer owed when its POST was decided: what its
+ * own gates report for the same read (an end by this process's own unresolved handoff is logged). */
+function supersededPush(why: Moot): ControlResult {
+  switch (why) {
+    case "head":
+      return { posted: false, reason: SUPERSEDED };
+    case "handoff-unknown":
+      return { posted: false, reason: HANDED_OFF_UNKNOWN, unresolved: true };
+    case "newer": // the newer session's own start requested the live head's review
+      return { posted: false, reason: NEWER_REQUEST };
+    case "stopped":
+    case "handoff":
+    case "converged":
+      return { posted: false, reason: NO_SESSION };
+    default:
+      return assertNever(why);
+  }
+}
+
 /** How the push handler's loop-error handoff ended, for its result. One that may have landed is
  * UNKNOWN (the result is unresolved: logged), never "failed" — it is not re-sent, and it ends the
- * session in this process. */
-function handoffTail(h: { escalated: boolean; ambiguous?: boolean; error?: string }): string {
+ * session in this process. One no longer owed says why (the session is over, or a newer one runs). */
+function handoffTail(h: { escalated: boolean; ambiguous?: boolean; error?: string; superseded?: Moot }): string {
   if (h.escalated) return "; handoff posted";
   if (h.ambiguous) return "; handoff outcome unknown (it may have landed; not re-sent)";
+  if (h.superseded) return `; handoff superseded (${MOOT_TEXT[h.superseded]})`;
   return h.error ? `; handoff failed: ${h.error}` : "";
 }
 
@@ -1196,7 +1290,7 @@ async function recordStart(token: string, start: StartRequest, d: LoopRuntimeDep
     return { status: "rejected", error: (e as Error)?.message ?? String(e) };
   }
   const ref = { owner: start.owner, repo: start.repo, pr: start.pr };
-  return emitControl(controlCtx(d, token, botLogin), { key: { kind: "start", ref, by: start.actor, at: start.at, mode: start.mode }, body });
+  return emitControl(controlCtx(d, token, botLogin), { key: { kind: "start", ref, by: start.actor, at: start.at, mode: start.mode }, decide: owedAs(body) });
 }
 
 /**
@@ -1228,6 +1322,8 @@ export async function startLoop(
         return { posted: false, reason: `${START_UNRESOLVED}: ${out.error}`, unresolved: true };
       case "rejected":
         return { posted: false, reason: `start failed: ${out.error}` };
+      case "superseded": // unreachable: a start record is owed in every session (owedAs); never silent
+        return { posted: false, reason: `start failed: superseded (${MOOT_TEXT[out.why]})` };
       default:
         return assertNever(out);
     }
@@ -1242,9 +1338,9 @@ export function loopStartAt(job: Pick<Job, "thread" | "createdAt">): string {
   return job.thread?.eventAt ?? new Date(job.createdAt).toISOString();
 }
 
-/** The STOPPED acknowledgement that RECORDS a stop (who, and the stop's own time). */
-function stopWrite(ref: PrRef, stop: { by: string; at: string }, body: string): ControlWrite {
-  return { key: { kind: "stop", ref, by: stop.by, at: stop.at }, body };
+/** The record of a stop (who, and the stop's own time), in the form `decide` picks at each attempt. */
+function stopWrite(ref: PrRef, stop: { by: string; at: string }, decide: ControlWrite["decide"]): ControlWrite {
+  return { key: { kind: "stop", ref, by: stop.by, at: stop.at }, decide };
 }
 
 // In-process serialization so concurrent stop deliveries for one PR post the record at most once
@@ -1312,7 +1408,7 @@ export async function stopLoop(
     } catch (e) {
       malformed = (e as Error)?.message ?? String(e);
     }
-    const write = stopWrite(ref, { by: stop.actor, at }, body);
+    const write = stopWrite(ref, { by: stop.actor, at }, owedAs(body));
     // Write-ahead: honored in this process from the first moment, before any read that could
     // fail, and until its record is listed — whatever its POST does.
     ownWrites(d.gh).intend(write);
@@ -1344,7 +1440,7 @@ export async function stopLoop(
     // watchers detect by its marker alone — only while no session runs once the stop is folded;
     // with a newer session active (the stop ended only one before it) the bare record, which the
     // fold places the same way and no watcher reads as "the loop stopped".
-    const out = await emitControl(controlCtx(d, token, botLogin), session.active ? stopWrite(ref, { by: stop.actor, at }, recordOnly) : write);
+    const out = await emitControl(controlCtx(d, token, botLogin), session.active ? stopWrite(ref, { by: stop.actor, at }, owedAs(recordOnly)) : write);
     switch (out.status) {
       case "posted":
         return { posted: true, reason: "stopped" };
@@ -1354,6 +1450,8 @@ export async function stopLoop(
         return { posted: false, reason: `stop record outcome unknown (${out.error}; not re-sent; honored in this process until recorded)`, unresolved: true };
       case "rejected":
         return { posted: false, reason: `stop failed: ${out.error} (honored in this process until recorded)` };
+      case "superseded": // unreachable: a stop's record is owed once it changes the fold; never silent
+        return { posted: false, reason: `stop failed: superseded (${MOOT_TEXT[out.why]}) (honored in this process until recorded)` };
       default:
         return assertNever(out);
     }

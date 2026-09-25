@@ -23,6 +23,12 @@
  *      landed a restart anchors the newer session at its own start; posted while that session
  *      runs, the record is no terminal signal (no STOPPED marker, no STOPPED sentence), while a
  *      record posted with no session running is the STOPPED acknowledgement.
+ *   I9 every POST attempt is decided against a fresh read — × what happens BETWEEN the write's
+ *      first POST (refused) and its retry: nothing, a stop and a newer start, a start alone (it
+ *      re-issues the running session), a push that moves the PR head. A continuation or handoff
+ *      whose session is over, or a continuation whose head moved, is never sent again: no row,
+ *      no event (an unknown retry's stand-in neither), no journal entry, and the newer session
+ *      runs on; a retry that cannot read the session is not sent at all.
  * One table instead of one test per bug: each review round found another cell of this space.
  */
 import { describe, it } from "node:test";
@@ -75,6 +81,7 @@ const reviewDay = (i: number) => iso(Date.parse("2026-02-21T00:00:00Z") + i * 86
 
 // Reason strings the classifier keys on (the runtime keeps them private).
 const SUPERSEDED = "superseded (head moved)";
+const NEWER = "superseded by a newer loop request (a new session, another starter, or apply downgraded to suggest)";
 const ALREADY_ESCALATED = "already escalated on this head";
 const NO_SESSION = "no active loop session";
 
@@ -125,12 +132,23 @@ type Peer = "none" | "before" | "after";
  * driver's continuation for the live head, which resumes the session, landing after the stop's own
  * time and before its webhook is handled: only the stop keeps the session over. */
 type Prior = "none" | "stale-resume";
+/** What happens between the write's first POST — which GitHub then refuses — and its retry, whose
+ * result is the cell's `write` (I9): nothing (the cell's write result from the first POST on); dave
+ * stops the session and carol starts a newer one; carol starts alone (a re-issue of the running
+ * session); a human push moves the PR head (its push handler runs). A cell with an event reads the
+ * list caught up afterwards (later: row-appears). */
+type Between = "nothing" | "stop+new-start" | "new-start-only" | "head-moved";
+/** Where the event comes: between the write's attempts (its first POST refused), or before its
+ * FIRST attempt — while the stuck step waits for a lagging history to show its review (the step's
+ * read of the session is older than that wait); the write's result then applies from its first
+ * POST. */
+type BetweenAt = "retry" | "first";
 type Phase = "call" | "view" | "again" | "follow";
-type Cell = { via: Via; write: Write; shape: Shape; stamp: Stamp; list: List; later: Later; anchor: Anchor; peer: Peer; prior: Prior };
+type Cell = { via: Via; write: Write; shape: Shape; stamp: Stamp; list: List; later: Later; anchor: Anchor; peer: Peer; prior: Prior; between: Between; betweenAt: BetweenAt };
 type Result = ControlResult | LoopStepResult;
 /** posted / exists / unknown / rejected as the entry point reports it; `ran` a step that ran
  * (the self-heal); `resolved` a step result that needs nothing more (posted and exists collapse). */
-type Cls = "posted" | "exists" | "unknown" | "rejected" | "unreadable" | "ran" | "resolved";
+type Cls = "posted" | "exists" | "unknown" | "rejected" | "unreadable" | "ran" | "resolved" | "superseded";
 
 const VIAS: Via[] = [
   "start:admission",
@@ -159,6 +177,7 @@ const LATERS: Later[] = ["redelivery", "newer-start", "newer-start-redelivery", 
 const ANCHORS: Anchor[] = ["listed", "lagging", "lost"];
 const PEERS: Peer[] = ["none", "before", "after"];
 const PRIORS: Prior[] = ["none", "stale-resume"];
+const BETWEENS: Between[] = ["nothing", "stop+new-start", "new-start-only", "head-moved"];
 
 const kindOf = (via: Via) => via.slice(0, via.indexOf(":")) as ControlKey["kind"];
 /** A later event that means nothing for a path is not a cell: a newer start in the same second as
@@ -173,6 +192,30 @@ function applies(via: Via, later: Later): boolean {
 }
 /** Only a continuation or handoff names its session (its anchor start). */
 const sessionScoped = (via: Via) => kindOf(via) === "continue" || kindOf(via) === "handoff";
+/** Every POST attempt of a write of this kind is decided by a fresh read of the session (a start
+ * record is owed in every session: nothing to read). */
+const decidedByRead = (via: Via) => sessionScoped(via);
+/** A refused continuation of a push or an applied round is followed by the loop-error handoff for
+ * its head, decided by a fresh read of the session like every control POST: sent only when the
+ * list is readable — a list failing through the call decides (so sends) neither. */
+const refusalHandedOff = (c: Cell) => c.write === "rejected" && (c.via === "continue:push" || c.via === "continue:applied") && c.list !== "failing";
+/** The events between the attempts of a write of this kind (I9). */
+const betweens = (via: Via): readonly Between[] => (decidedByRead(via) ? BETWEENS : ["nothing"]);
+/** Where an event can come for this path: before the first attempt only where the path waits before
+ * it (the stuck step's history re-reads). */
+const betweenAts = (via: Via, between: Between): readonly BetweenAt[] => (between !== "nothing" && via === "handoff:stuck" ? ["retry", "first"] : ["retry"]);
+
+/** What the write's retry is, decided after the event between its attempts (I9): still owed (sent,
+ * with the cell's write result), superseded (never sent again), or undecided (the session could not
+ * be read: not sent). A continuation's moved head decides it with no session read. */
+type Fate = "owed" | "superseded" | "undecided";
+function fateAtRetry(c: Cell): Fate {
+  if (c.between === "nothing") return "owed";
+  if (c.between === "head-moved" && kindOf(c.via) === "continue") return "superseded";
+  // the list outage starts at the write's first POST: a first attempt's read is not behind it
+  if (decidedByRead(c.via) && c.list === "failing" && c.betweenAt === "retry") return "undecided";
+  return c.between === "stop+new-start" && sessionScoped(c.via) ? "superseded" : "owed";
+}
 /** The call's reads are behind the session's start records (from the first one stored). */
 const callBehindStarts = (c: Cell) => c.anchor === "lagging";
 
@@ -279,6 +322,8 @@ class World {
   private startsHidden = false;
   private firstStartId?: number;
   private failing = false;
+  /** The step's review is not in the history yet (a lagging list): before the first attempt. */
+  private reviewLags = false;
   private hook?: () => Promise<void>;
   readonly deps: LoopRuntimeDeps;
   readonly ref: { owner: string; repo: string; pr: number };
@@ -304,8 +349,8 @@ class World {
     };
     const gh: LoopRuntimeDeps["gh"] = {
       listIssueComments: async () => (read(), this.issues.filter((r) => r.id < this.visibleBefore()).map((r) => ({ ...r }))),
-      listPullReviews: async () => (read(), this.reviews.map((r) => ({ userLogin: BOT, body: `<!-- ashlar-findings total=${r.total} -->`, commitId: r.head, submittedAt: r.at }))),
-      listReviewComments: async () => (read(), this.reviews.map((r) => ({ userLogin: BOT, path: "src/a.ts", commitId: r.head, createdAt: r.at, body: "finding" }))),
+      listPullReviews: async () => (read(), this.history().map((r) => ({ userLogin: BOT, body: `<!-- ashlar-findings total=${r.total} -->`, commitId: r.head, submittedAt: r.at }))),
+      listReviewComments: async () => (read(), this.history().map((r) => ({ userLogin: BOT, path: "src/a.ts", commitId: r.head, createdAt: r.at, body: "finding" }))),
       createIssueComment: async (_t, o) => this.create(o.body),
       fetchPullHeadRef: async () => ({ ref: "feature", sha: this.live(), fork: false, sameRepo: true }),
       fetchUserPermission: async () => "write",
@@ -336,6 +381,22 @@ class World {
     // The control-write clock (a non-literal object, so this compiles before the field exists).
     const clock = { now: () => this.clock };
     this.deps = Object.assign(base, clock);
+  }
+
+  /** The reviews a read lists: all of them, or — lagging — not yet the step's own. */
+  private history() {
+    return this.reviewLags ? this.reviews.slice(0, -1) : this.reviews;
+  }
+
+  /** Before the first attempt (I9): the history lags behind the step's review, so the step waits and
+   * re-reads it; the event comes during that wait, and the review shows up with it. */
+  armFirstAttempt(): void {
+    if (this.cell.between === "nothing" || this.cell.betweenAt !== "first") return;
+    this.reviewLags = true;
+    this.hook = async () => {
+      this.reviewLags = false;
+      await this.betweenAttempts();
+    };
   }
 
   /** The first row id a read does not list (the list is prefix-consistent). */
@@ -468,6 +529,10 @@ class World {
     }
     this.underTest.push(this.phase);
     this.underTestBodies.push(body);
+    if (this.cell.between !== "nothing" && this.cell.betweenAt === "retry" && this.underTest.length === 1) {
+      this.hook = () => this.betweenAttempts(); // during the backoff before the retry
+      throw writeError("rejected", 422);
+    }
     const { write, shape, stamp } = this.cell;
     if (write === "rejected" && !this.refusalPassed()) throw writeError("rejected", 422);
     if (write === "unknown-lost") throw writeError("unknown", 502);
@@ -511,6 +576,30 @@ class World {
     this.startsHidden = this.cell.anchor !== "listed";
   }
 
+  /** The cell's event between the write's refused first POST and its retry (I9). */
+  private async betweenAttempts(): Promise<void> {
+    switch (this.cell.between) {
+      case "nothing":
+        return;
+      case "stop+new-start": // dave's stop ends the session; carol's start, a second later, opens a newer one
+        this.clock += 1_000;
+        await stopLoop("t", { ...this.ref, actor: "dave", stopAt: iso(this.clock) }, settings(this.mode()), this.deps, ENV);
+        this.clock += 1_000;
+        this.carolAt = iso(this.clock);
+        await startLoop("t", { ...this.ref, actor: "carol", mode: "suggest", at: this.carolAt }, settings("suggest"), this.deps, ENV);
+        return;
+      case "new-start-only": // carol's start re-issues the running session
+        this.clock += 1_000;
+        this.carolAt = iso(this.clock);
+        await startLoop("t", { ...this.ref, actor: "carol", mode: "suggest", at: this.carolAt }, settings("suggest"), this.deps, ENV);
+        return;
+      case "head-moved": // a human push; its handler asks for the pushed head's review
+        this.pushedHead = FRESH;
+        await continueLoopOnPush("t", { ...this.ref, headSha: FRESH, actor: "alice" }, settings(this.mode()), this.deps, ENV);
+        return;
+    }
+  }
+
   async injectCarol(): Promise<void> {
     if (this.carolAt) return;
     // carol's directive time: now, or — same-second — the second the write under test left in
@@ -550,8 +639,8 @@ class World {
 
   /** The events that stand for the write under test — only those the fold can place (it drops an
    * event whose time is no real instant). */
-  async eventsOfWrite(): Promise<LoopEvent[]> {
-    const events = await readLoopEvents(this.deps.gh, "t", "o", "r", this.pr, { botLogin: BOT, pr: { sha: this.live() } });
+  async eventsOfWrite(gh: LoopRuntimeDeps["gh"] = this.deps.gh): Promise<LoopEvent[]> {
+    const events = await readLoopEvents(gh, "t", "o", "r", this.pr, { botLogin: BOT, pr: { sha: this.live() } });
     return events.filter((e) => {
       if (Number.isNaN(isoMs(e.at))) return false;
       switch (kindOf(this.cell.via)) {
@@ -584,13 +673,13 @@ function controlClass(w: World, r: ControlResult): string {
   const why = r.reason;
   if (/list 502/.test(why)) return "unreadable";
   // the push handler's refused continuation: its result's tail is the loop-error handoff under test
-  const tail = /^continue on push failed: .*; handoff (posted|failed|outcome unknown)/.exec(why)?.[1];
-  if (w.cell.via === "handoff:push-loop-error" && tail) return tail === "posted" ? "posted" : tail === "failed" ? "rejected" : "unknown";
+  const tail = /^continue on push failed: .*; handoff (posted|failed|superseded|outcome unknown)/.exec(why)?.[1];
+  if (w.cell.via === "handoff:push-loop-error" && tail) return ({ posted: "posted", failed: "rejected", superseded: "superseded" } as Record<string, string>)[tail] ?? "unknown";
   if (why === "started" || why === "stopped" || why === "continued") return r.posted ? "posted" : `other: ${why}`;
   if (/already (recorded|continued)$/.test(why)) return "exists";
   if (why.startsWith(START_UNRESOLVED) || /outcome unknown/.test(why)) return "unknown";
   if (/^(start failed|stop failed|continue on push failed)/.test(why)) return "rejected";
-  if (why === NO_SESSION || why === SUPERSEDED) return "resolved";
+  if (why === NO_SESSION || why === SUPERSEDED || why === NEWER) return "resolved";
   return `other: ${why}`;
 }
 
@@ -605,6 +694,7 @@ function stepClass(w: World, r: LoopStepResult): string {
     if (r.continued === true) return "resolved";
     const report = w.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
     const handoffs = w.posted.filter((b) => b.startsWith("<!-- ashlar-loop-escalate")).length;
+    if (/The loop ended meanwhile|The PR head moved meanwhile/.test(report) && handoffs === 0) return "superseded";
     return /Continuation outcome unknown/.test(report) && handoffs === 0 ? "unknown" : `other: ${JSON.stringify(r)}`;
   }
   if (r.ran) return `other: ${JSON.stringify(r)}`;
@@ -613,7 +703,7 @@ function stepClass(w: World, r: LoopStepResult): string {
   // before "rejected": a post-commit handoff's detail quotes the refused continuation
   if (why.startsWith(START_UNRESOLVED) || /outcome is unknown|handed off \(outcome unknown\)/.test(why)) return "unknown";
   if (/^start failed|could not be requested|failed to post/.test(why)) return "rejected";
-  if (why === SUPERSEDED || why === ALREADY_ESCALATED || why === NO_SESSION) return "resolved";
+  if (why === SUPERSEDED || why === ALREADY_ESCALATED || why === NO_SESSION || why === NEWER) return "resolved";
   return `other: ${why}`;
 }
 
@@ -630,6 +720,10 @@ function norm(via: Via, e: Cls, when: "first" | "again"): Cls {
 
 function expectFirst(c: Cell): Cls {
   if (c.via === "start:self-heal" && c.list === "failing" && c.write !== "rejected") return "unreadable"; // re-reads after the emit
+  // a control entry point whose refused write cannot be decided again (nor its loop-error handoff)
+  // reports the unreadable list; a step reports the handoff that failed to post
+  const entry = c.via === "continue:push" || c.via === "handoff:push-loop-error";
+  if (entry && decidedByRead(c.via) && c.write === "rejected" && c.list === "failing") return "unreadable";
   // a POST that answered "unknown" and whose row the re-check lists was posted by this call (a
   // list behind the session's start records is behind the write's row too)
   const listed = c.list === "normal" && !callBehindStarts(c);
@@ -637,13 +731,30 @@ function expectFirst(c: Cell): Cls {
   return norm(c.via, e, "first");
 }
 
+/** The first call of a cell with an event between its write's attempts (I9): a retry still owed
+ * reports its write result; one not sent (undecided) reports the refusal; a superseded write reports
+ * the quiet exit its path takes — or, where the path owed more (the push handler's loop-error
+ * handoff, an applied round's report), that it was superseded. */
+function expectFirstBetween(c: Cell): Cls {
+  switch (fateAtRetry(c)) {
+    case "owed":
+      return expectFirst(c);
+    case "undecided":
+      return expectFirst({ ...c, write: "rejected" });
+    case "superseded":
+      return c.via === "handoff:push-loop-error" || c.via === "continue:applied" ? "superseded" : "resolved";
+  }
+}
+
 function expectAgain(c: Cell, caughtUp: boolean): Cls {
   const list = caughtUp ? "normal" : c.list;
   if (list === "failing" && c.via !== "start:admission") return "unreadable"; // it reads the session before emitting
   let e: Cls = c.write === "success" ? "exists" : c.write === "rejected" ? "rejected" : c.write === "unknown-landed" && list === "normal" ? "exists" : "unknown";
   // A refused continuation of a push or an applied round ended the session with a loop-error
-  // handoff for that head: the redelivery has nothing left to do.
-  if (c.write === "rejected" && (c.via === "continue:push" || c.via === "continue:applied")) e = "resolved";
+  // handoff for that head: the redelivery has nothing left to do — unless the list failed through
+  // the call, which decided no handoff: then the redelivery asks again, and is refused again (the
+  // push handler hands off now; the step's continuation for the moved head only reports it).
+  if (c.write === "rejected" && (c.via === "continue:push" || c.via === "continue:applied")) e = refusalHandedOff(c) ? "resolved" : "rejected";
   return norm(c.via, e, "again");
 }
 
@@ -658,9 +769,11 @@ function assertLogged(w: World, r: Result, cls: string, label: string): void {
   assert.ok(logged, `I2 ${label}: an unresolved result is silent: ${JSON.stringify(r)}`);
 }
 
-/** I1: no POST of the write after one that may have landed; at most one row. */
+/** I1: no POST of the write after one that may have landed; at most one row. (A cell with an
+ * event between the attempts has its first POST refused: at most one more.) */
 function assertExactlyOnce(w: World): void {
-  if (w.cell.write !== "rejected") assert.ok(w.underTest.length <= 1, `I1: ${w.underTest.length} POSTs (${w.underTest.join(", ")})`);
+  const refused = w.cell.between !== "nothing" && w.cell.betweenAt === "retry" ? 1 : 0;
+  if (w.cell.write !== "rejected") assert.ok(w.underTest.length <= 1 + refused, `I1: ${w.underTest.length} POSTs (${w.underTest.join(", ")})`);
   assert.ok(w.rowsForWrite <= 1, `I1: ${w.rowsForWrite} rows`);
 }
 
@@ -791,7 +904,7 @@ async function assertNewerSessionLives(w: World): Promise<void> {
   const { via, write } = w.cell;
   if (w.cell.list === "failing") w.catchUp();
   const s = await w.session();
-  if (write === "rejected" && (via === "continue:push" || via === "continue:applied")) {
+  if (refusalHandedOff(w.cell)) {
     // the loop-error handoff for the refused continuation came AFTER carol's start: it ends her
     // (re-issued) session legitimately — it is not an older record
     assert.ok(!s.active && s.endedBy === "escalate", `I6: ${JSON.stringify(s)}`);
@@ -809,6 +922,35 @@ async function assertNewerSessionLives(w: World): Promise<void> {
   else assert.equal(s.starter, "carol", `I6: carol's start is not the latest: ${JSON.stringify(s)}`);
 }
 
+/** I9: the write's retry was decided after the event between its attempts. A write superseded or
+ * undecided there is never POSTed again and leaves nothing: no row, no event (an unknown retry's
+ * stand-in neither), no journal entry — in this process and after a restart; one still owed stands
+ * as its write result says. carol's newer session (stop+new-start) runs on, anchored at her start,
+ * and a step in it runs. */
+async function assertBetween(w: World): Promise<void> {
+  const c = w.cell;
+  const fate = fateAtRetry(c);
+  if (fate !== "owed") {
+    const refused = c.betweenAt === "retry" ? 1 : 0; // only a refused first POST came before
+    assert.equal(w.underTest.length, refused, `I9: a write ${fate} at its retry was POSTed (${w.underTest.join(", ")})`);
+    assert.equal(ownWrites(w.deps.gh).state(w.key()), undefined, `I9: a write ${fate} at its retry left a journal entry`);
+  }
+  w.catchUp();
+  const here = (await w.eventsOfWrite()).length;
+  assert.equal(here, fate === "owed" && c.write !== "rejected" ? 1 : 0, `I9: ${here} events of the write in this process`);
+  const restarted = { ...w.deps.gh }; // another client object: an empty journal
+  const durable = (await w.eventsOfWrite(restarted)).length;
+  assert.equal(durable, w.rowsForWrite, `I9: ${durable} events of the write after a restart`);
+  if (c.between !== "stop+new-start") return;
+  const s = await w.session();
+  assert.ok(s.active && isoMs(s.startIso) === isoMs(w.carolAt), `I9: carol's newer session does not run as her own: ${JSON.stringify(s)}`);
+  w.clock += 1_000;
+  w.reviews.push({ head: w.live(), total: 3, at: iso(w.clock) });
+  w.phase = "follow";
+  const r = await w.plainStep(w.live(), "follow");
+  assert.equal(r.ran, true, `I9: a step in carol's newer session did not run: ${JSON.stringify(r)}`);
+}
+
 async function runCell(c: Cell, pr: number): Promise<void> {
   const w = new World(c, pr);
   const realNow = Date.now;
@@ -818,13 +960,16 @@ async function runCell(c: Cell, pr: number): Promise<void> {
   try {
     await w.setup();
     if (sessionScoped(c.via)) w.callSession = sessionRef(await w.session());
+    w.armFirstAttempt();
     const first = await w.enter();
     const cls = classify(w, first);
-    assert.equal(cls, expectFirst(c), `I3 first: ${JSON.stringify(first)}`);
+    assert.equal(cls, c.between === "nothing" ? expectFirst(c) : expectFirstBetween(c), `I3 first: ${JSON.stringify(first)}`);
     assertLogged(w, first, cls, "first");
     w.disarm();
     await w.afterCall();
-    if (w.newerStart()) {
+    if (c.between !== "nothing") {
+      await assertBetween(w);
+    } else if (w.newerStart()) {
       await w.injectCarol(); // a success had no backoff to inject it in
       await assertNewerSessionLives(w);
     } else if (c.later === "push" || c.later === "moved") {
@@ -857,7 +1002,7 @@ async function runCell(c: Cell, pr: number): Promise<void> {
   }
 }
 
-describe("control writes: kind (× a stop's prior session) × write result (× 2xx body × created_at) × list read × later event (× anchor start × peer start) (#79 K1)", () => {
+describe("control writes: kind (× a stop's prior session) × write result (× 2xx body × created_at) × list read × later event, or what happens between the write's attempts (× anchor start × peer start) (#79 K1)", () => {
   let row = 0;
   for (const via of VIAS)
     for (const prior of kindOf(via) === "stop" ? PRIORS : (["none"] as const))
@@ -865,16 +1010,20 @@ describe("control writes: kind (× a stop's prior session) × write result (× 2
         for (const shape of SHAPES[write])
           for (const stamp of shape === "row" ? STAMPS : (["valid"] as const))
             for (const list of LISTS)
-              for (const later of LATERS)
-                for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
-                  for (const peer of sessionScoped(via) ? PEERS : (["none"] as const)) {
-                    if (!applies(via, later)) continue;
-                    const cell = { via, write, shape, stamp, list, later, anchor, peer, prior };
-                    const pr = 1000 + row++;
-                    const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
-                    const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
-                    const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
-                    const before = prior === "none" ? "" : ` | prior ${prior}`;
-                    it(`${via} | ${write}${answer}${time} | ${list} | ${later}${session}${before}`, () => runCell(cell, pr));
-                  }
+              for (const between of betweens(via))
+                for (const betweenAt of betweenAts(via, between))
+                  for (const later of between === "nothing" ? LATERS : (["row-appears"] as const))
+                    for (const anchor of sessionScoped(via) ? ANCHORS : (["listed"] as const))
+                      for (const peer of sessionScoped(via) ? PEERS : (["none"] as const)) {
+                        if (!applies(via, later)) continue;
+                        const cell = { via, write, shape, stamp, list, later, anchor, peer, prior, between, betweenAt };
+                        const pr = 1000 + row++;
+                        const answer = shape === SHAPES[write][0] ? "" : ` (2xx ${shape})`;
+                        const time = stamp === "valid" ? "" : ` (created_at ${stamp})`;
+                        const where = betweenAt === "retry" ? "between attempts" : "before the first attempt";
+                        const next = between === "nothing" ? later : `${where}: ${between}`;
+                        const session = anchor === "listed" && peer === "none" ? "" : ` | anchor ${anchor}, peer ${peer}`;
+                        const before = prior === "none" ? "" : ` | prior ${prior}`;
+                        it(`${via} | ${write}${answer}${time} | ${list} | ${next}${session}${before}`, () => runCell(cell, pr));
+                      }
 });

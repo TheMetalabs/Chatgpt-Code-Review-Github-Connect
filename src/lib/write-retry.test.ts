@@ -55,6 +55,22 @@ describe("retryWrite (control writes under the GitHub write contract)", () => {
     assert.equal(scans, 0);
   });
 
+  it("an attempt that withdraws the write ends the schedule: nothing more is scanned or sent", async () => {
+    let posts = 0;
+    let scans = 0;
+    const r = await retryWrite<string>({
+      delays: [0, 2_000, 5_000],
+      sleep: noSleep,
+      seen: async () => (scans++, false),
+      post: async () => {
+        if (++posts === 1) throw rejected;
+        return { withdrawn: "newer" };
+      },
+    });
+    assert.deepEqual(r, { withdrawn: "newer" });
+    assert.deepEqual([posts, scans], [2, 2], "the refused attempt, then the one that withdrew it");
+  });
+
   it("rejected on every attempt: the last error, not ambiguous", async () => {
     const h = harness([rejected, rejected, rejected]);
     const r = await h.run();

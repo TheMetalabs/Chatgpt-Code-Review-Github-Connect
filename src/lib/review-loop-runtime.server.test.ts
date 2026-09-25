@@ -181,8 +181,9 @@ function fakeDeps(
         return { id: posted.length };
       },
       async fetchPullHeadRef() {
-        // movedDuringFix: the head moves once the fix request was sent (a push during the fix)
-        const sha = moved || (opts.movedDuringFix && prompts.length > 0) ? MOVED : (opts.liveSha ?? HEAD);
+        // movedDuringFix: the head moves once the fix request was sent (a push during the fix);
+        // an applied round's commit is the head from then on
+        const sha = committed ? (opts.commitSha ?? NEW_SHA) : moved || (opts.movedDuringFix && prompts.length > 0) ? MOVED : (opts.liveSha ?? HEAD);
         return {
           ref: "feature",
           sha,

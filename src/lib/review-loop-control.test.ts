@@ -5,6 +5,7 @@ import {
   controlKey,
   emitControl,
   LANDED_KEPT,
+  owedAs,
   ownWrites,
   type ControlKind,
   type ControlRow,
@@ -26,9 +27,10 @@ const ref = (pr = 1) => ({ owner: "o", repo: "r", pr });
 const unknownErr = () => Object.assign(new Error("GitHub issue comment 502: Bad Gateway"), { outcome: "unknown", status: 502 });
 const rejectedErr = () => Object.assign(new Error("GitHub issue comment 422"), { outcome: "rejected", status: 422 });
 
+const handoffText = (pr = 1) => `${escalateMarker({ reason: "fix-failed", round: 1, pr, head: HEAD })}\n\nhandoff`;
 const handoff = (pr = 1, session: SessionRef = { at: SESSION }): ControlWrite => ({
   key: { kind: "handoff", ref: ref(pr), head: HEAD, session },
-  body: `${escalateMarker({ reason: "fix-failed", round: 1, pr, head: HEAD })}\n\nhandoff`,
+  decide: owedAs(handoffText(pr)),
 });
 
 /** One write of each kind on PR 1, after the session anchor (ANCHOR). */
@@ -38,11 +40,11 @@ function writeOfEachKind(): Record<ControlKind, ControlWrite> {
   // handoff row is matched by its id, as in production once the start is listed.
   const session = { at: SESSION, seq: 0 };
   return {
-    start: { key: { kind: "start", ref: ref(), by: "bob", at: LATER, mode: "apply" }, body: startComment({ mode: "apply", by: "bob", at: LATER }) },
-    stop: { key: { kind: "stop", ref: ref(), by: "bob", at: LATER }, body: stoppedComment({ by: "bob", at: LATER }) },
+    start: { key: { kind: "start", ref: ref(), by: "bob", at: LATER, mode: "apply" }, decide: owedAs(startComment({ mode: "apply", by: "bob", at: LATER })) },
+    stop: { key: { kind: "stop", ref: ref(), by: "bob", at: LATER }, decide: owedAs(stoppedComment({ by: "bob", at: LATER })) },
     continue: {
       key: { kind: "continue", ref: ref(), head: HEAD, session },
-      body: continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD }),
+      decide: owedAs(continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD })),
     },
     handoff: handoff(1, session),
   };
@@ -115,14 +117,14 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(controlKey({ ...k, session: { at: "2026-02-20T00:00:00Z" } }), controlKey({ ...k, session: { at: "2026-02-20T00:00:00.000Z" } }));
   });
 
-  it("a session read while an emit is in flight (refused and backing off, or rendering its body) keeps its entry: a concurrent emit joins it", async () => {
+  it("a session read while an emit is in flight (refused and backing off, or deciding its attempt) keeps its entry: a concurrent emit joins it", async () => {
     const until = async (done: () => boolean) => {
       for (let i = 0; i < 100 && !done(); i++) await new Promise((r) => setImmediate(r));
       assert.ok(done(), "the first emit reached its pause");
     };
-    const continuation = (body: ControlWrite["body"]): ControlWrite => ({
+    const continuation = (decide: ControlWrite["decide"]): ControlWrite => ({
       key: { kind: "continue", ref: ref(), head: HEAD, session: { at: SESSION } },
-      body,
+      decide,
     });
     const text = continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD });
     for (const pause of ["backoff", "body"] as const) {
@@ -134,10 +136,10 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
         paused = true;
         await gate;
       };
-      // backoff: the first POST is refused and the retry waits (state "rejected"); body: the lazy
-      // body is still being computed (state "intent")
+      // backoff: the first POST is refused and the retry waits (state "rejected"); body: the
+      // attempt is still being decided (state "intent")
       const ctx: EmitContext = { ...f.ctx, sleep: pause === "backoff" ? hold : f.ctx.sleep };
-      const w = continuation(pause === "body" ? async () => (await hold(), text) : text);
+      const w = continuation(pause === "body" ? async () => (await hold(), { status: "owed", body: text }) : owedAs(text));
       const first = emitControl(ctx, w);
       await until(() => paused);
       assert.deepEqual(ownWrites(f.gh).standIns(ref(), f.rows, BOT), [], `${pause}: a session read meanwhile`);
@@ -197,7 +199,7 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
 
     assert.equal((await emitControl(ctx, handoff(1))).status, "unknown");
     // A refused write-ahead stop: honored until recorded.
-    const stop: ControlWrite = { key: { kind: "stop", ref: ref(2), by: "bob", at: "2026-03-01T00:00:00Z" }, body: stoppedComment({ by: "bob", at: "2026-03-01T00:00:00Z" }) };
+    const stop: ControlWrite = { key: { kind: "stop", ref: ref(2), by: "bob", at: "2026-03-01T00:00:00Z" }, decide: owedAs(stoppedComment({ by: "bob", at: "2026-03-01T00:00:00Z" })) };
     journal.intend(stop);
     refused.add(2);
     assert.equal((await emitControl(ctx, stop)).status, "rejected");
@@ -384,9 +386,44 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(controlKey({ ...k, session: { at: "yesterday" } }), controlKey({ ...k, session: {} }));
   });
 
+  it("every POST attempt is decided right before it, the first included: superseded, nothing more is sent and nothing is left; undecided, that attempt is not sent", async () => {
+    const writes = writeOfEachKind();
+    for (const kind of Object.keys(writes) as ControlKind[]) {
+      const owed = writes[kind].decide;
+      for (const at of [1, 2, 3]) {
+        const label = `${kind} | superseded at attempt ${at}`;
+        const f = world(["rejected"]); // every POST before it is refused
+        let decided = 0;
+        const w: ControlWrite = { key: writes[kind].key, decide: async () => (++decided === at ? { status: "superseded", why: "newer" } : owed()) };
+        assert.deepEqual(await emitControl(f.ctx, w), { status: "superseded", why: "newer" }, label);
+        assert.deepEqual([decided, f.posts()], [at, at - 1], `${label}: decided before each attempt; none sent from then on`);
+        assert.deepEqual(ownWrites(f.gh).standIns(ref(), [], BOT), [], `${label}: nothing stands in for it`);
+        assert.equal(ownWrites(f.gh).state(controlKey(w.key)), undefined, `${label}: no journal entry`);
+      }
+      // A POST whose outcome is unknown is never decided again (only looked for).
+      const lost = world(["lost"]);
+      let decided = 0;
+      const w: ControlWrite = { key: writes[kind].key, decide: async () => (decided++, owed()) };
+      assert.equal((await emitControl(lost.ctx, w)).status, "unknown", kind);
+      assert.deepEqual([decided, lost.posts()], [1, 1], `${kind}: an unknown attempt is final`);
+      // A decision that cannot be made sends nothing then; the schedule goes on.
+      const fails = (...at: number[]) => {
+        let n = 0;
+        return async () => (at.includes(++n) ? Promise.reject(new Error("list 502")) : owed());
+      };
+      const f = world(["rejected", "ok"]);
+      assert.deepEqual(await emitControl(f.ctx, { key: writes[kind].key, decide: fails(1) }), { status: "posted" }, `${kind}: attempt 1 undecided`);
+      assert.equal(f.posts(), 2, `${kind}: attempt 1 not sent, attempt 2 refused, attempt 3 posted`);
+      const g = world(["rejected"]);
+      const out = await emitControl(g.ctx, { key: writes[kind].key, decide: fails(2, 3) });
+      assert.equal(g.posts(), 1, `${kind}: undecided retries are not sent`);
+      assert.ok(out.status === "rejected" && /422/.test(out.error) && /could not be decided \(list 502\)/.test(out.error), `${kind}: ${JSON.stringify(out)}`);
+    }
+  });
+
   it("a write-ahead intent folds at once; abandon drops only an unsent entry; the outcome switch is exhaustive", async () => {
     const f = world(["ok"]);
-    const stop: ControlWrite = { key: { kind: "stop", ref: ref(), by: "bob", at: "2026-03-01T00:00:00Z" }, body: stoppedComment({ by: "bob", at: "2026-03-01T00:00:00Z" }) };
+    const stop: ControlWrite = { key: { kind: "stop", ref: ref(), by: "bob", at: "2026-03-01T00:00:00Z" }, decide: owedAs(stoppedComment({ by: "bob", at: "2026-03-01T00:00:00Z" })) };
     ownWrites(f.gh).intend(stop);
     assert.deepEqual(ownWrites(f.gh).standIns(ref(), [], BOT), [{ at: "2026-03-01T00:00:00Z", kind: "stop", actor: "bob" }]);
     ownWrites(f.gh).abandon(stop);
@@ -448,9 +485,10 @@ describe("session identity: one continuation and one handoff per head per SESSIO
   const START = "2026-02-20T00:00:00Z"; // alice's and bob's start directives: the same second
   const PUSHED = "b".repeat(40);
   const bot = { authoredByBot: true };
+  const continuationText = continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD });
   const continuation = (session: SessionRef): ControlWrite => ({
     key: { kind: "continue", ref: ref(), head: HEAD, session },
-    body: continueComment({ mode: "suggest", round: 2, pr: 1, head: HEAD }),
+    decide: owedAs(continuationText),
   });
   const escalateIn = (f: ReturnType<typeof world>, session: SessionRef) =>
     escalateNow(f.gh, "t", { owner: "o", repo: "r", pr: 1, head: HEAD, reason: "fix-failed", rounds: [], roundCap: 3, botLogin: BOT, session, sleep: f.ctx.sleep, now: f.ctx.now });
@@ -545,7 +583,7 @@ describe("session identity: one continuation and one handoff per head per SESSIO
       assert.equal((await emitControl(f.ctx, continuation(listed))).status, "unknown", label);
       // the last session's continuation for the head: posted after alice's directive but before her
       // start record (id 4 < 5), so it is in her session by time (and by the looser id) only
-      f.rows.push({ id: 4, userLogin: BOT, body: continuation(listed).body as string, createdAt: "2026-02-20T00:00:01Z" });
+      f.rows.push({ id: 4, userLogin: BOT, body: continuationText, createdAt: "2026-02-20T00:00:01Z" });
       assert.equal((await emitControl(f.ctx, continuation(caller))).status, "unknown", `${label}: the older row never confirms this session's write`);
       assert.equal((await emitControl(f.ctx, continuation(listed))).status, "unknown", label);
       assert.equal(f.posts(), 1, label);
@@ -559,7 +597,7 @@ describe("session identity: one continuation and one handoff per head per SESSIO
     assert.equal((await escalateIn(f, listed)).ambiguous, true);
     // the last session's handoff for the head: posted after alice's directive but before her start
     // record (id 3 < 5), so it is in her session by time only
-    f.rows.push({ id: 3, userLogin: BOT, body: handoff(1, listed).body as string, createdAt: "2026-02-20T00:00:01Z" });
+    f.rows.push({ id: 3, userLogin: BOT, body: handoffText(1), createdAt: "2026-02-20T00:00:01Z" });
     for (const session of [{ at: START }, listed]) {
       const r = await escalateIn(f, session);
       assert.deepEqual([r.escalated, r.ambiguous], [false, true], `${JSON.stringify(session)}: ${JSON.stringify(r)}`);

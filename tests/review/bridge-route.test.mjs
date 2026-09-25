@@ -8,7 +8,7 @@ function route() {
   const c = vm.createContext({ Response, URL,
     createFileRoute: () => config => config,
     bridgeTokenOk: token => token === 'valid-token', bridgeHeartbeat() {},
-    fixOperationRefused: () => false,
+    fixOperationRefused: () => false, FIX_PROTOCOL: 2,
     failBridgeProvider: (...args) => { failures.push(args); return true; },
   });
   const s = source('src/routes/api/bridge.ts').replace(/^import[\s\S]*?;\n/gm, '').replace('export const Route', 'globalThis.Route');
@@ -35,7 +35,7 @@ function routeWith(mocks) {
     bridgeTokenOk: token => token === 'valid-token', bridgeHeartbeat() {}, getBridgePublic: () => ({}), bridgePromptText: text => text,
     isBridgeFixId: id => typeof id === 'string' && id.startsWith('fix-'),
     // the production gate's rule (bridge.server.ts fixOperationRefused; bridge-fix-protocol.test.mjs runs the real one)
-    fixOperationRefused: (id, protocol) => typeof id === 'string' && id.startsWith('fix-') && protocol !== 1,
+    fixOperationRefused: (id, protocol) => typeof id === 'string' && id.startsWith('fix-') && protocol !== 2, FIX_PROTOCOL: 2,
     completeBridgeFix: spy('completeBridgeFix', mocks.completeBridgeFix ?? { ok: true }),
     bridgeFormatErrors: spy('bridgeFormatErrors', mocks.bridgeFormatErrors ?? []),
     completeBridgeJob: spy('completeBridgeJob', mocks.completeBridgeJob ?? { ok: true }),
@@ -48,7 +48,7 @@ function routeWith(mocks) {
   }) });
   return { calls, post, names: () => calls.map(call => call[0]) };
 }
-const completeBody = (jobId, text) => ({ action: 'complete', repairProtocol: 1, captureProtocol: 1, fixProtocol: 1, jobId, leaseId: 'L', raw: text,
+const completeBody = (jobId, text) => ({ action: 'complete', repairProtocol: 1, captureProtocol: 1, fixProtocol: 2, jobId, leaseId: 'L', raw: text,
   results: [{ provider: 'chatgpt', raw: text, originalText: text }] });
 
 test('complete: a fix answer bypasses review validation and resolves as plain text', async () => {
@@ -80,9 +80,9 @@ test('complete: a review answer still gets the 422 format gate, then review comp
   assert.deepEqual(r.names(), ['bridgeFormatErrors', 'completeBridgeJob']);
 });
 
-test('take: only a worker that sends fixProtocol:1 opts into fix items', async () => {
+test('take: only a worker that sends fixProtocol:2 opts into fix items', async () => {
   const r = routeWith({});
-  await r.post({ action: 'take', clientId: 'c', fixProtocol: 1, excludeJobIds: ['x', 7] });
+  await r.post({ action: 'take', clientId: 'c', fixProtocol: 2, excludeJobIds: ['x', 7] });
   await r.post({ action: 'take', clientId: 'c' });
   assert.deepEqual(r.calls.map(call => JSON.stringify(call.slice(1))), [
     JSON.stringify(['c', ['x'], { fixes: true }]),

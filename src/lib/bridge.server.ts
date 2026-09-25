@@ -183,7 +183,8 @@ export function isBridgeFixId(jobId: unknown): boolean {
 }
 
 /** THE fix-protocol gate: every operation on a review-loop fix item needs the worker's
- * fixProtocol:1 opt-in (a worker without it cannot harvest a plain-text fix answer and would wait
+ * fixProtocol:2 opt-in (FIX_PROTOCOL; a worker without it cannot harvest a plain-text fix answer
+ * and would wait
  * for review JSON forever). The route applies it once, before dispatching any action:
  * - per-id operations on a `fix-` id (claim, ping, prompt, progress, release, failure, complete and
  *   the review-only observe/capture/repair lanes) are refused (409 fix_protocol_required) and
@@ -192,8 +193,13 @@ export function isBridgeFixId(jobId: unknown): boolean {
  * - recover skips fix bindings for a worker that has not opted in (recoverBridgeJob `fixes`);
  *   its review bindings are recovered as before.
  * Review operations are unchanged. True when the operation must be refused. */
+/** 2 since #93: a fix request carries its source as a file attachment (fix-attachment.ts). A
+ * protocol-1 worker would type that frame into the composer, pasting the source inline, so it is
+ * never offered, nor allowed to operate, a fix item. */
+export const FIX_PROTOCOL = 2;
+
 export function fixOperationRefused(jobId: unknown, fixProtocol: unknown): boolean {
-  return isFixItemId(jobId) && fixProtocol !== 1;
+  return isFixItemId(jobId) && fixProtocol !== FIX_PROTOCOL;
 }
 
 /** A fix answer is plain text for the runtime's deterministic parser: resolved as-is (the page's
@@ -346,7 +352,7 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
 
 export type BridgeOffer = NonNullable<ReturnType<typeof nextBridgeJob>> | FixOffer;
 
-/** `fixes` is the worker's fixProtocol:1 opt-in: a worker that cannot harvest a plain-text fix
+/** `fixes` is the worker's fixProtocol:2 opt-in: a worker that cannot harvest a plain-text fix
  * answer (it would wait for review JSON forever) is never offered a fix item. */
 export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = [], options: {fixes?: boolean} = {}): BridgeOffer | null {
   meta.lastTakeAt = Date.now();

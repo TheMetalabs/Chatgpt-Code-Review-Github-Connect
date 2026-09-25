@@ -716,7 +716,7 @@ test('worker: take opts into fix items, and a kind:fix payload runs with its kin
   const b = background({api, handler: () => ({ok: false, code: 'busy', retry: true})});
   await b.tick();
   const take = b.calls.find(c => c.action === 'take');
-  assert.equal(take.fixProtocol, 1);assert.equal(take.attachmentProtocol, 2);
+  assert.equal(take.fixProtocol, 2);assert.equal(take.attachmentProtocol, 2);
   const started = b.messages.find(m => m.type === 'ashlar-run');
   assert.equal(started.kind, 'fix');assert.equal(started.jobId, 'fix-A');assert.equal(started.prompt, 'FIX PROMPT');
   assert.equal(b.local.state.pendingReviewJobs['fix-A'].kind, 'fix');
@@ -1238,7 +1238,7 @@ test('worker: a fix tab preserved while it could not answer completes the releas
   assert.equal(b.session.state['ashlar:preserved:fix-Z:chatgpt:run-Z'], undefined);
 });
 
-test('worker: every bridge request carries the fixProtocol:1 opt-in (the server gates every fix operation on it)', async () => {
+test('worker: every bridge request carries the fixProtocol:2 opt-in (the server gates every fix operation on it)', async () => {
   const b = worker([], {api: active});
   const seen = [];
   b.context.fetch = async (url, init) => { seen.push({url, body: init.body ? JSON.parse(init.body) : undefined}); return {ok: true, status: 200, json: async () => ({ok: true})}; };
@@ -1247,8 +1247,8 @@ test('worker: every bridge request carries the fixProtocol:1 opt-in (the server 
   await b.rpc('/api/bridge?jobId=fix-A&attachmentProtocol=2');
   await b.rpc('/api/bridge');
   assert.equal(seen.length, 10);
-  assert.ok(seen.filter(s => s.body).every(s => s.body.fixProtocol === 1), JSON.stringify(seen));
-  assert.deepEqual(seen.filter(s => !s.body).map(s => new URL(s.url).searchParams.get('fixProtocol')), ['1', '1']);
+  assert.ok(seen.filter(s => s.body).every(s => s.body.fixProtocol === 2), JSON.stringify(seen));
+  assert.deepEqual(seen.filter(s => !s.body).map(s => new URL(s.url).searchParams.get('fixProtocol')), ['2', '2']);
 });
 
 // ── Round 13 (Ashlar 4099207116): composer.js submissionConfirmed records the conversation the
@@ -1364,7 +1364,7 @@ test('worker: a collected review the server forgot never blocks admission of a q
   const b = worker([lost], {api, url: 'https://chatgpt.com/c/lost', handler: () => ({ok: false, code: 'busy', retry: true})});
   await b.tick();await b.tick();
   assert.ok(takes.length, 'admission reaches take while the forgotten result is undeliverable');
-  assert.equal(takes[0].fixProtocol, 1);assert.ok(takes[0].excludeJobIds.includes('job-lost'));
+  assert.equal(takes[0].fixProtocol, 2);assert.ok(takes[0].excludeJobIds.includes('job-lost'));
   assert.equal(b.local.state.pendingReviewJobs['fix-A']?.kind, 'fix', 'the fix is admitted');
   assert.equal(runsOf(b).length, 1, 'its prompt goes to a new tab');
   assert.ok(b.local.state.pendingReviewJobs['job-lost'], 'the forgotten review is kept, not dropped');

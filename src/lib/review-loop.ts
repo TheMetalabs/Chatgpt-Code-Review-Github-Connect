@@ -14,6 +14,9 @@
 
 export const REVIEW_LOOP_ESCALATE_HUMAN = "Ashlar review-loop halted — human review required";
 export const REVIEW_LOOP_STOPPED_HUMAN = "Ashlar review-loop stopped by operator";
+/** The sentence of a stop record posted while a NEWER session runs (stopRecordComment): not a
+ * terminal signal, so it never contains REVIEW_LOOP_STOPPED_HUMAN or the STOPPED marker. */
+export const REVIEW_LOOP_STOP_RECORD_HUMAN = "Ashlar review-loop records an earlier stop; a loop session started after it is active and this record does not stop it";
 
 export const STOPPED_MARKER = "<!-- ashlar-loop-stopped -->";
 
@@ -223,10 +226,23 @@ export function escalateComment(s: EscalateState): string {
  * placed correctly even when it arrived as an edit that the session fold cannot replay. */
 export function stoppedComment(stop?: LoopStop): string {
   if (!stop) return `${STOPPED_MARKER}\n\n${REVIEW_LOOP_STOPPED_HUMAN}`;
+  return `${STOPPED_MARKER}\n${stopRecordLine(stop)}\n\n${REVIEW_LOOP_STOPPED_HUMAN} (stop by ${stop.by}).`;
+}
+
+/** The record of a stop that ended only a session BEFORE the active one — posted while a newer
+ * session runs (a record that was refused until then, or a stop racing a start in flight). The
+ * record line alone opens it: the fold places it exactly as the STOPPED acknowledgement's record
+ * (parseStopRecord), but it carries no STOPPED marker, which every watcher reads as "the loop
+ * stopped" while the newer session keeps running. */
+export function stopRecordComment(stop: LoopStop): string {
+  return `${stopRecordLine(stop)}\n\n${REVIEW_LOOP_STOP_RECORD_HUMAN} (stop by ${stop.by} at ${stop.at}).`;
+}
+
+function stopRecordLine(stop: LoopStop): string {
   if (!LOGIN_RE.test(stop.by) || !ISO_UTC_RE.test(stop.at) || Number.isNaN(Date.parse(stop.at))) {
     throw new Error(`invalid loop stop (by=${stop.by} at=${stop.at})`);
   }
-  return `${STOPPED_MARKER}\n<!-- ashlar-loop-stop at=${stop.at} by=${stop.by} -->\n\n${REVIEW_LOOP_STOPPED_HUMAN} (stop by ${stop.by}).`;
+  return `<!-- ashlar-loop-stop at=${stop.at} by=${stop.by} -->`;
 }
 
 export interface LoopStop {
@@ -234,12 +250,14 @@ export interface LoopStop {
   at: string; // the stop's own event time (ISO-8601 UTC)
 }
 
+// The record line, opening the comment — alone, or right after the STOPPED marker.
 const STOP_RECORD_RE =
-  /^\s*<!--\s*ashlar-loop-stopped\s*-->[ \t]*\r?\n[ \t]*<!--\s*ashlar-loop-stop\s+at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)\s+by=([A-Za-z0-9-]{1,39})\s*-->/;
+  /^\s*(?:<!--\s*ashlar-loop-stopped\s*-->[ \t]*\r?\n[ \t]*)?<!--\s*ashlar-loop-stop\s+at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)\s+by=([A-Za-z0-9-]{1,39})\s*-->/;
 
-/** The stop recorded in a STOPPED acknowledgement the caller has proven the App authored (anchored:
- * the STOPPED marker opens the comment, the record is the very next line). Null otherwise —
- * including a bare legacy acknowledgement without a record. */
+/** The stop recorded in a STOPPED acknowledgement, or in a bare stop record (stopRecordComment), the
+ * caller has proven the App authored (anchored: the record line opens the comment, or is the very
+ * next line after the STOPPED marker that does). Null otherwise — including a bare legacy
+ * acknowledgement without a record. */
 export function parseStopRecord(body: string | null | undefined, source: CommentSource): LoopStop | null {
   if (!source.authoredByBot) return null;
   const m = STOP_RECORD_RE.exec(body || "");

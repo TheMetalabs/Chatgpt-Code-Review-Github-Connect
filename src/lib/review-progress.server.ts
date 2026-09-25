@@ -8,8 +8,8 @@ const STAGE_NAME = /^[a-z][a-z0-9_]{0,78}$/;
 
 /** The sentinel a stage without a label is kept as: the first 8 hex digits of the SHA-256 of its name.
  * A stage name passes a lexical check only, so it can still spell something that must not be retained
- * (a token, a user's text in snake_case); the sentinel keeps the event and none of the name. The
- * progress-labels test prints the hash of every stage the extension records, to map one back. */
+ * (a token, a user's text in snake_case); the sentinel keeps the event and none of the name. To map a
+ * hash back, `npm run stage-hashes` prints the hash of every stage the extension records. */
 export const unlabelledSentinel = (stage: string): UnlabelledStage =>
     `${UNLABELLED_PREFIX}${createHash("sha256").update(stage).digest("hex").slice(0, 8)}` as UnlabelledStage;
 

@@ -21,7 +21,7 @@ import {createHash} from 'node:crypto';
 import {root, source} from './load-source.mjs';
 import {background, storage} from './helpers.mjs';
 import {PROGRESS_LABELS, progressLabel} from '../../src/lib/review-progress.ts';
-import {sanitizeProgressEvents} from '../../src/lib/review-progress.server.ts';
+import {sanitizeProgressEvents, unlabelledSentinel} from '../../src/lib/review-progress.server.ts';
 
 /** The progress recorders and the position of their stage argument. */
 const RECORDERS = {workerStep: 2, recordReviewStep: 0, step: 0};
@@ -968,6 +968,26 @@ test('every stage the extension records has a history label (an unlabelled one s
   assert.deepEqual(unlabelled(stages), [], 'recorded stages without a PROGRESS_LABELS entry reach review history only as unlabelled steps');
   assert.deepEqual(kept(stages, 'worker'), stages);
   assert.deepEqual(kept(stages, 'page'), stages);
+});
+
+test('a hash in history maps back to its stage: every stage the extension records has its own', t => {
+  // History keeps a stage without a label only as `unlabelled:<first 8 hex digits of its SHA-256>`. This
+  // prints the hash of every stage the extension records (and every labelled one, in case its label is
+  // removed): `npm run stage-hashes` for all of them, STAGE_HASHES=<hash> npm run stage-hashes for one,
+  // REVIEW_SOURCE_ROOT=<tree> for another checkout's extension.
+  const {stages} = guardedStages(extensionFiles());
+  const names = [...new Set([...stages, ...Object.keys(PROGRESS_LABELS)])].sort();
+  const rows = names.map(stage => ({hash: createHash('sha256').update(stage).digest('hex').slice(0, 8), stage}));
+  assert.deepEqual(rows.map(({stage}) => unlabelledSentinel(stage)), rows.map(({hash}) => `unlabelled:${hash}`),
+    'the printed hash is the one the server keeps');
+  assert.deepEqual(kept(['tab_woken']), [unlabelledSentinel('tab_woken')], 'and a stage without a label is kept as it');
+  const byHash = Map.groupBy(rows, row => row.hash);
+  assert.deepEqual([...byHash.values()].filter(group => group.length > 1), [], 'no two stages share a hash, so each maps back to one');
+  const want = process.env.STAGE_HASHES?.replace(/^(?:unlabelled:|#)/, '');
+  if (!want) return;
+  const shown = /^[0-9a-f]{8}$/.test(want) ? byHash.get(want) ?? [] : rows;
+  if (!shown.length) t.diagnostic(`no stage the extension records has hash ${want}`);
+  for (const {hash, stage} of shown) t.diagnostic(`unlabelled:${hash}  ${stage}`);
 });
 
 test('the scan reads extension scripts below the top level, keyed by their path', t => {

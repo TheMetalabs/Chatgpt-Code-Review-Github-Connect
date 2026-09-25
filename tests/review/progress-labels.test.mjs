@@ -135,10 +135,10 @@ function forwardsUnchanged(tokens, param) {
  * comment or a string is none), each with the name of its stage parameter when the body passes it on
  * unchanged, else null. Forwarding that parameter to another recorder is safe: every call of the
  * enclosing recorder is itself checked. Its parameters must be plain names, the stage one once: a
- * default value can reassign it, and a repeated name binds the last one. */
+ * default value can reassign it, and a repeated name binds the last one. A file the tokenizer cannot
+ * read throws: its recorders forward nothing, and the caller says why. */
 function recorderBodies(text) {
-  let tokens;
-  try { ({tokens} = tokenize(text, 0)); } catch { return []; } // an unreadable file forwards nothing
+  const {tokens} = tokenize(text, 0);
   const bodies = [];
   const walk = level => level.forEach((token, k) => {
     const [name, params, body] = level.slice(k + 1, k + 4);
@@ -174,7 +174,10 @@ function commentedOut(before) {
  * literals, the template literals verbatim, and a problem for each stage argument the guard cannot read. */
 function recordedStages(text, file = 'source') {
   const found = {literals: new Set(), templates: new Set(), problems: []};
-  const bodies = recorderBodies(text);
+  let bodies = [];
+  try { bodies = recorderBodies(text); } catch (error) {
+    found.problems.push(`${file}: could not be tokenized (${error.message}), so its recorders forward nothing`);
+  }
   for (const call of text.matchAll(/\b(workerStep|recordReviewStep|step)\s*\(/g)) {
     const before = text.slice(text.lastIndexOf('\n', call.index) + 1, call.index);
     if (commentedOut(before) || /\bfunction\s*$/.test(before)) continue; // a comment or the declaration
@@ -448,6 +451,14 @@ test('a recorder forwards its stage parameter only when nothing in its body can 
     assert.equal(found.length, 1, `${text}\n: the forwarded stage is a problem, not a silent pass`);
     assert.match(found[0], /recordReviewStep\(\): stage `stage` is not a literal/);
   }
+});
+
+test('a file the tokenizer cannot read is a problem that names the file, not only a blame on its forwarder', () => {
+  // Valid JavaScript the tokenizer misreads: after a block's `}` it takes `/` for division, so the
+  // regex's `)` closes nothing. The guard cannot read the file, and says so.
+  const text = 'function step(stage) {\n  recordReviewStep(stage);\n}\nfunction probe(b) {}\n/\\)/.test(b);\nstep("composer_waiting");';
+  const {problems} = recordedStages(text, 'composer.js');
+  assert.ok(problems.includes('composer.js: could not be tokenized (unexpected )), so its recorders forward nothing'), problems.join('\n'));
 });
 
 test('the tab-release (#82) stages have history labels and survive sanitize', () => {

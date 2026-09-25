@@ -194,12 +194,44 @@ const literalValue = token => token?.kind === 'str' || (token?.kind === 'tpl' &&
 /** Names whose value is the global object. A recorder declared at the top of a script is a property of it. */
 const GLOBAL_NAMES = new Set(['globalThis', 'self', 'window', 'frames', 'top', 'parent', 'this']);
 
+/** Whether the `[` group at `level[k]` is a computed member (`x[k]`, `f()[k]`, `x?.[k]`) rather than an
+ * array literal: it follows `?.` or the end of an operand. */
+function computedMember(level, k) {
+  const token = level[k], before = level[k - 1];
+  if (token?.open !== '[' || !before) return false;
+  if (before.kind === 'punct') return before.text === '?.';
+  if (before.kind === 'word') return !REGEX_AFTER.has(before.text) && !['const', 'let', 'var'].includes(before.text);
+  if (before.kind === 'group') return before.open === '[' || (before.open === '(' && !HEADED.has(level[k - 2]?.text));
+  return true; // after a string, a template or a regex
+}
+
+/** The key of a computed member's `[...]` when the guard can read it: a string, a template without
+ * substitutions, or a number (never a recorder's name). Otherwise undefined. */
+function memberKey(group) {
+  const [only, ...rest] = group.tokens;
+  if (rest.length) return undefined;
+  return only?.kind === 'word' && /^\d/.test(only.text) ? only.text : literalValue(only);
+}
+
+/** The property name `level[k]` spells, or undefined: a word after `.` or `?.`, a computed member's
+ * readable key (`x["defaultView"]`), or an object key or pattern key (`{defaultView}`, `{"defaultView": v}`,
+ * `{["defaultView"]: v}`, a method's name). */
+function propertyName(level, k, container) {
+  const token = level[k], before = level[k - 1], after = level[k + 1];
+  if (computedMember(level, k)) return memberKey(token);
+  if (isPunct(before, '.') || isPunct(before, '?.')) return token.kind === 'word' ? token.text : undefined;
+  if (container?.open !== '{' || (k > 0 && !isPunct(before, ','))) return undefined;
+  if (token.kind === 'word') return !after || isPunct(after, ':') || isPunct(after, ',') || isPunct(after, '=') || after.open === '(' ? token.text : undefined;
+  const keyed = isPunct(after, ':') || after?.open === '(';
+  return !keyed ? undefined : token.open === '[' ? memberKey(token) : literalValue(token);
+}
+
 /** Whether `level[k]` refers to the global object: one of GLOBAL_NAMES that is not a property name or an
- * object key, or a `.defaultView` property (a document's window). */
+ * object key, or a `defaultView` property (a document's window) however its name is spelled. */
 function globalReference(level, k, container) {
   const token = level[k], before = level[k - 1];
-  if (token.kind !== 'word') return false;
-  if (isPunct(before, '.') || isPunct(before, '?.')) return token.text === 'defaultView';
+  if (propertyName(level, k, container) === 'defaultView') return true;
+  if (token.kind !== 'word' || isPunct(before, '.') || isPunct(before, '?.')) return false;
   const key = container?.open === '{' && (k === 0 || isPunct(before, ',')) && isPunct(level[k + 1], ':');
   return GLOBAL_NAMES.has(token.text) && !key;
 }
@@ -212,20 +244,41 @@ function staticGlobalRead(level, k) {
   for (let j = k + 1; ; ) {
     const dot = isPunct(level[j], '.') || isPunct(level[j], '?.'), member = dot ? level[j + 1] : level[j];
     const computed = member?.open === '[';
-    const name = computed ? (member.tokens.length === 1 ? literalValue(member.tokens[0]) : undefined) : dot && member?.kind === 'word' ? member.text : undefined;
+    const name = computed ? memberKey(member) : dot && member?.kind === 'word' ? member.text : undefined;
     if (name === undefined) return !computed && level[k - 1]?.text === 'typeof';
     if (!GLOBAL_NAMES.has(name) || name === 'this') return true;
     j += dot ? 2 : 1;
   }
 }
 
+/** Names of the calls that call the function they are handed first (`Reflect.apply(f, ...)`,
+ * `Function.prototype.call.call(f, ...)`), and of the methods that call or bind the function they are on. */
+const APPLIERS = new Set(['apply', 'call', 'bind', 'construct']);
+
+/** Whether the value that ends at `level[k]` is called: `(...)`, `?.(...)` or a template after it, a
+ * .call, .apply or .bind on it, or handed first to a call of an APPLIERS name. `path` holds `level`. */
+function calledAt(level, k, path) {
+  const next = isPunct(level[k + 1], '?.') ? level[k + 2] : level[k + 1];
+  if (next?.open === '(' || level[k + 1]?.kind === 'tpl') return true;
+  if ((isPunct(level[k + 1], '.') || isPunct(level[k + 1], '?.')) && APPLIERS.has(level[k + 2]?.text)) return true;
+  const holder = path.at(-1), callee = holder?.tokens[holder.index - 1];
+  const first = level.findIndex(token => isPunct(token, ','));
+  return holder?.tokens[holder.index].open === '(' && callee?.kind === 'word' && APPLIERS.has(callee.text) &&
+    (first < 0 ? level.length : first) === k + 1;
+}
+
 /** Why `level[k]` reaches a recorder by a name the tokens never spell as one, or null: a string whose
- * value is a recorder's name (`globalThis["workerStep"]`, `Reflect.get(self, "step")`), or the global
- * object read other than by a static member name (`globalThis[name]`). */
-function reachedByName(level, k, container) {
+ * value is a recorder's name (`globalThis["workerStep"]`, `Reflect.get(self, "step")`), a call through a
+ * computed member whose name the guard cannot read, on any object (`e.currentTarget[name](...)`: the
+ * global object can arrive as any value), or the global object read other than by a static member name
+ * (`globalThis[name]`). */
+function reachedByName(level, k, container, path) {
   const token = level[k], value = literalValue(token);
-  if (value !== undefined) {
-    return Object.hasOwn(RECORDERS, value) ? 'a string naming a recorder can reach it through a computed member or a lookup, so the stages it records there cannot be checked' : null;
+  if (value !== undefined && Object.hasOwn(RECORDERS, value)) {
+    return 'a string naming a recorder can reach it through a computed member or a lookup, so the stages it records there cannot be checked';
+  }
+  if (computedMember(level, k) && memberKey(token) === undefined && calledAt(level, k, path)) {
+    return 'a call through a computed member whose name the guard cannot read can call a recorder on any object that holds one (the global object holds them all), so the stage it records cannot be checked';
   }
   if (!globalReference(level, k, container) || staticGlobalRead(level, k)) return null;
   return 'the global object, which holds every recorder declared at the top of a script, is read other than by a static member name, so a recorder reached there records stages that cannot be checked';
@@ -283,8 +336,8 @@ function recorderBodies(tokens) {
  * comment or a regex before it. A file the tokenizer cannot read is itself a problem. So is any other
  * use of a recorder's name than a call, its function declaration or `typeof name`: a recorder passed as
  * a value, aliased, or called through .call or .apply records a stage no call here shows. So is a way to
- * reach a recorder without its name as a word (reachedByName): a string that names it, or a computed
- * read of the global object. */
+ * reach a recorder without its name as a word (reachedByName): a string that names it, a call through
+ * a computed member the guard cannot read, or a computed read of the global object. */
 function recordedStages(text, file = 'source') {
   const found = {literals: new Set(), templates: new Set(), sites: [], problems: []};
   let tokens;
@@ -294,7 +347,7 @@ function recordedStages(text, file = 'source') {
   }
   const bodies = recorderBodies(tokens);
   walkTokens(tokens, (token, level, k, container, path) => {
-    const reached = reachedByName(level, k, container);
+    const reached = reachedByName(level, k, container, path);
     if (reached) return found.problems.push(`${file}:${lineOf(text, token)} ${token.text}: ${reached}`);
     if (token.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text)) return;
     const group = recorderCall(level, k), before = level[k - 1];
@@ -964,13 +1017,14 @@ test('a recorder is reached only by its calls: a recorder used as a value, an al
   assert.deepEqual(problems('const ready = true;\nfunction step(stage) {\n  recordReviewStep(stage);\n}\nstep("composer_waiting");'), []);
 });
 
-test('a recorder is reached only by its name: a string naming one or a computed read of the global object is a problem', () => {
+test('a recorder is reached only by its name: a string naming one, a call through a computed member it cannot read or a computed read of the global object is a problem', () => {
   const problems = text => recordedStages(text, 'fixture.js').problems;
   const named = (line, token) => `fixture.js:${line} ${token}: a string naming a recorder can reach it through a computed member or a lookup, so the stages it records there cannot be checked`;
   const global = (line, token) => `fixture.js:${line} ${token}: the global object, which holds every recorder declared at the top of a script, is read other than by a static member name, so a recorder reached there records stages that cannot be checked`;
+  const called = (line, token) => `fixture.js:${line} ${token}: a call through a computed member whose name the guard cannot read can call a recorder on any object that holds one (the global object holds them all), so the stage it records cannot be checked`;
   // Every recorder is a top-level function declaration, so a property of the global object: a computed
   // member reaches it with no recorder-name word, and its stage would go unchecked.
-  for (const [text, problem] of [
+  for (const [text, ...expected] of [
     ['globalThis["recordReviewStep"]("unlabelled_computed");', named(1, '"recordReviewStep"')],
     ['globalThis["workerStep"](job, provider, "unlabelled_computed");', named(1, '"workerStep"')],
     ['self[`step`]("unlabelled_computed");', named(1, '`step`')],
@@ -979,22 +1033,42 @@ test('a recorder is reached only by its name: a string naming one or a computed 
     ['const recorders = {"workerStep": note};', named(1, '"workerStep"')],
     ['log(`${"st\\u0065p"}`);', named(1, '"st\\u0065p"')],
     // A name the guard cannot read fails closed.
-    ['globalThis[name]("unlabelled_computed");', global(1, 'globalThis')],
-    ['\nglobalThis?.[name]?.(job, provider, "unlabelled_computed");', global(2, 'globalThis')],
-    ['globalThis[`record${kind}`]("unlabelled_computed");', global(1, 'globalThis')],
-    ['globalThis["record" + kind]("unlabelled_computed");', global(1, 'globalThis')],
-    ['window.self[name]("unlabelled_computed");', global(1, 'window')],
-    ['globalThis["window"][name]("unlabelled_computed");', global(1, 'globalThis')],
-    ['top[name]("unlabelled_computed");', global(1, 'top')],
-    ['this[name]("unlabelled_computed");', global(1, 'this')],
-    ['document.defaultView[name]("unlabelled_computed");', global(1, 'defaultView')],
+    ['globalThis[name]("unlabelled_computed");', global(1, 'globalThis'), called(1, '[name]')],
+    ['\nglobalThis?.[name]?.(job, provider, "unlabelled_computed");', global(2, 'globalThis'), called(2, '[name]')],
+    ['globalThis[`record${kind}`]("unlabelled_computed");', global(1, 'globalThis'), called(1, '[`record${kind}`]')],
+    ['globalThis["record" + kind]("unlabelled_computed");', global(1, 'globalThis'), called(1, '["record" + kind]')],
+    ['window.self[name]("unlabelled_computed");', global(1, 'window'), called(1, '[name]')],
+    ['globalThis["window"][name]("unlabelled_computed");', global(1, 'globalThis'), called(1, '[name]')],
+    ['top[name]("unlabelled_computed");', global(1, 'top'), called(1, '[name]')],
+    ['this[name]("unlabelled_computed");', global(1, 'this'), called(1, '[name]')],
+    ['document.defaultView[name]("unlabelled_computed");', global(1, 'defaultView'), called(1, '[name]')],
+    // A document's window however its name is spelled: a string key or a destructured key.
+    ['document["defaultView"][name]("unlabelled_view");', global(1, '["defaultView"]'), called(1, '[name]')],
+    ['const w = document?.[`defaultView`];', global(1, '[`defaultView`]')],
+    ['const {defaultView} = document;\ndefaultView[name](job, provider, "unlabelled_view");', global(1, 'defaultView'), called(2, '[name]')],
+    ['const {defaultView: w} = document;\nw[name]("unlabelled_view");', global(1, 'defaultView'), called(2, '[name]')],
+    ['const {"defaultView": w} = document;', global(1, '"defaultView"')],
+    ['const {["defaultView"]: w} = document;', global(1, '["defaultView"]')],
     // The global object as a value can be searched for a recorder by any name.
-    ['const g = globalThis;\ng[name]("unlabelled_alias");', global(1, 'globalThis')],
+    ['const g = globalThis;\ng[name]("unlabelled_alias");', global(1, 'globalThis'), called(2, '[name]')],
     ['Reflect.get(self, name)("unlabelled_lookup");', global(1, 'self')],
     ['Object.values(window).forEach(record => record("unlabelled_each"));', global(1, 'window')],
     ['const {[name]: record} = globalThis;', global(1, 'globalThis')],
     ['const current = globalThis.window;', global(1, 'globalThis')],
-  ]) assert.deepEqual(problems(text), [problem], text);
+    // The global object arrives as other values too (a method that returns its receiver, an event's
+    // target), so a call through a computed member the guard cannot read fails on any object.
+    ['const name = ["worker", "Step"].join("");\nglobalThis.valueOf()[name](job, provider, "unlabelled_valueof");', called(2, '[name]')],
+    ['self.addEventListener("message", e => e.currentTarget[e.data.fn](job, provider, "unlabelled_event"));', called(1, '[e.data.fn]')],
+    ['e.view[name]?.("unlabelled_event");', called(1, '[name]')],
+    ['e.source?.[name].call(null, "unlabelled_event");', called(1, '[name]')],
+    ['handlers[kind].apply(null, ["unlabelled_apply"]);', called(1, '[kind]')],
+    ['const record = handlers[kind].bind(null);\nrecord("unlabelled_bind");', called(1, '[kind]')],
+    ['Reflect.apply(e.source[name], null, ["unlabelled_reflect"]);', called(1, '[name]')],
+    ['Function.prototype.call.call(handlers[kind], null, "unlabelled_call");', called(1, '[kind]')],
+    ['handlers[kind]`unlabelled_tag`;', called(1, '[kind]')],
+    ['new handlers[kind]("unlabelled_new");', called(1, '[kind]')],
+    ['f()[i](job, provider, "unlabelled_result");', called(1, '[i]')],
+  ]) assert.deepEqual(problems(text), expected, text);
   assert.deepEqual(problems('const {recordReviewStep: record} = globalThis;'), [
     'fixture.js:1 recordReviewStep: the recorder is used other than by a call, so the stages it records through that use cannot be checked',
     global(1, 'globalThis')]);
@@ -1003,6 +1077,10 @@ test('a recorder is reached only by its name: a string naming one or a computed 
     'const saved = globalThis["__ashlarRunnerState"]; if (typeof window === "undefined") note(self.location?.href);\n' +
     'const box = {top: rect.top, window: 1}; node.parent[key] = rect.top + 1; const view = document.defaultView.innerWidth;\n' +
     'globalThis.recordReviewStep?.("optional_call"); const doc = "workerStep(job, provider, stage)"; note("steps", "Step");'), []);
+  // A computed member the guard can read, one that is not called, or an array literal calls no recorder
+  // by a hidden name.
+  assert.deepEqual(problems('handlers["open"](row); rows[0](); const state = job.states[provider]; job.states[provider].runId = id;\n' +
+    'note(job.states[provider], rows[i]); if (ok) [a, b].forEach(note); Reflect.apply(note, null, [rows[i]]); return [a](b);'), []);
 });
 
 test('a recorder forwards its stage parameter only when nothing in its body can change or shadow it', () => {

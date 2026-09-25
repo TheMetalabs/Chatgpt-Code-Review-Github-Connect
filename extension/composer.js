@@ -276,7 +276,9 @@ function findEligibleSendButton(selectors) {
 }
 
 /** The identity of the conversation this page shows: its URL without the fragment (the same rule
- * as json.js conversationIdentity, which compares against what is recorded here). */
+ * as json.js conversationIdentity). What is recorded from it is later compared with the location by
+ * samePage (origin and path: json.js fixConversationHolds, tabOwnership; stillShowsConversation
+ * below), never by exact equality. */
 function shownConversation() {
   const href = globalThis.location?.href;
   return typeof href === "string" ? href.split("#")[0] : "";

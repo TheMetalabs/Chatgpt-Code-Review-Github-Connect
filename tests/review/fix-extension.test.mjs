@@ -687,11 +687,14 @@ test('worker: every bridge request carries the fixProtocol:1 opt-in (the server 
 // send was made in at the moment the send is proven, exactly once. Only a send this page instance
 // clicked (the in-memory `sendAttempt`) confirmed while the page still shows the conversation it
 // was clicked in establishes it; nothing records it later.
-function composerPage(href) {
+function composerPage(href, {json = false} = {}) {
   const saved = new Map();
-  const context = vm.createContext({console, location: {href},
+  const context = vm.createContext({console, URL, location: {href},
     sessionStorage: {getItem: k => saved.get(k) ?? null, setItem: (k, v) => { if (context.failWrites) throw new Error('quota'); saved.set(k, v); }}});
   vm.runInContext(source('extension/composer.js'), context, {filename: 'composer.js'});
+  // `json`: the page's json.js too, as every Ashlar tab loads it after composer.js (its samePage and
+  // namesNoConversation decide what the send records; without them only the exact identity does).
+  if (json) vm.runInContext(source('extension/json.js'), context, {filename: 'json.js'});
   const turn = text => ({textContent: text, querySelector: () => null, getAttribute: n => (n === 'data-message-id' ? 'user-A' : null)});
   context.turns = [];
   context.userTurns = () => context.turns;
@@ -725,7 +728,7 @@ const UNESTABLISHED = {
   otherRun: p => p.click('run-B'),
   movedBeforeConfirm: p => { p.click();p.context.location.href = 'https://chatgpt.com/c/users-own'; }, // the old DOM renders the turn under the user's URL
   noLocation: p => { p.click();p.context.location = undefined; },
-  reviewRun: p => { p.context.__ashlarRunnerState.kind = undefined;p.click(); }, // a review journal stays exactly as before
+  reviewRun: p => { p.context.__ashlarRunnerState.kind = undefined;p.click(); }, // a review sent on a new chat records none at send: it pins later (json.js pinNewChatReview)
 };
 for (const [name, setup] of Object.entries(UNESTABLISHED)) {
   test(`page: submissionConfirmed proves the send but records no conversation (${name})`, () => {
@@ -737,6 +740,30 @@ for (const [name, setup] of Object.entries(UNESTABLISHED)) {
     assert.equal(record.phase, 'sent');
     assert.equal(record.conversation, undefined, 'no send-time identity (json.js: identity "unestablished")');
     assert.equal('conversation' in p.stored(), false);
+  });
+}
+// With json.js loaded (every Ashlar tab): the send-time record compares the location with the clicked
+// conversation by samePage (origin and path), and a review records one only when it was sent on a
+// page that names a conversation, with its exact prompt (json.js namesNoConversation).
+const SEND_TIME_WITH_JSON = [
+  // [name, kind, clicked on, confirmed on, sent turn text, recorded conversation]
+  ['a fix clicked on the temporary chat, confirmed on "/" (the same page)', 'fix', 'https://chatgpt.com/?temporary-chat=true', 'https://chatgpt.com/', 'fix prompt', 'https://chatgpt.com/?temporary-chat=true'],
+  ['a fix clicked on the temporary chat, confirmed on another conversation', 'fix', 'https://chatgpt.com/?temporary-chat=true', 'https://chatgpt.com/c/users-own', 'fix prompt', undefined],
+  ['a review on a conversation page with its exact prompt', 'review', 'https://chatgpt.com/c/x', 'https://chatgpt.com/c/x', 'fix prompt', 'https://chatgpt.com/c/x'],
+  ['a review on a conversation page whose turn is not exactly its prompt', 'review', 'https://chatgpt.com/c/x', 'https://chatgpt.com/c/x', 'fix prompt and more', undefined],
+  ['a review on the new chat "/"', 'review', 'https://chatgpt.com/', 'https://chatgpt.com/', 'fix prompt', undefined],
+];
+for (const [name, kind, clicked, confirmed, sent, recorded] of SEND_TIME_WITH_JSON) {
+  test(`page (with json.js): ${name}: ${recorded ? 'the conversation is recorded at send' : 'the send is proven, no conversation is recorded'}`, () => {
+    const p = composerPage(clicked, {json: true});
+    if (kind === 'review') p.context.__ashlarRunnerState.kind = undefined;
+    const record = p.record();
+    p.click();
+    p.context.location.href = confirmed;
+    p.context.turns.push(p.turn(sent));
+    assert.equal(p.context.submissionConfirmed(record), true, 'the send itself is proven');
+    assert.equal(record.conversation, recorded);
+    assert.equal(p.stored().conversation, recorded);
   });
 }
 test('page: a sent journal whose write failed keeps the send-time conversation for the retry, whatever the location later is', () => {

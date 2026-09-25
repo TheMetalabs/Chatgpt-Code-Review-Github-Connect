@@ -295,15 +295,18 @@ function composerDraftText() {
   return (draft && (draft.value || draft.innerText || draft.textContent || "") || "").trim();
 }
 
-/** Files staged in the chat composer that are not this run's own attachments (its journal's or the
- * ones fillComposer is uploading, by name): a file the user added before typing is a draft too. The
- * chips are the named shapes the send barrier recognises (attachmentsReady), in the composer's own
- * form; a group that wraps the editor or the send control is the composer, not a file. */
+/** Files staged in the chat composer that are not this run's own attachments: a file the user added
+ * before typing is a draft too. Only BEFORE the send is confirmed can a chip be the run's own (by
+ * name: its journal's, or the ones fillComposer is uploading). A confirmed send took its attachments
+ * out of the composer with the sent turn, so afterwards every chip there is the user's, whatever its
+ * name: a file named like the run's old upload is the user's new one (Ashlar 4101062749). The chips
+ * are the named shapes the send barrier recognises (attachmentsReady), in the composer's own form; a
+ * group that wraps the editor or the send control is the composer, not a file. */
 function composerStagedFiles(state, submission) {
   const editor = typeof composer === "function" && globalThis.document ? composer() : null;
   const form = editor?.closest?.("form");
   if (!form) return [];
-  const own = new Set([...(Array.isArray(submission?.attachments) ? submission.attachments : []),
+  const own = new Set(submission?.phase === "sent" ? [] : [...(Array.isArray(submission?.attachments) ? submission.attachments : []),
     ...(Array.isArray(state?.pendingAttachments) ? state.pendingAttachments : [])]);
   const shown = chip => (typeof renderedControl === "function" ? renderedControl(chip) : !hiddenNode(chip));
   return [...form.querySelectorAll('[data-file-name], [role="group"][aria-label]')]

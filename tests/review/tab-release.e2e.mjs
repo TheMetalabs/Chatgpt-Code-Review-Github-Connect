@@ -359,6 +359,28 @@ for(const kind of ['review','fix'])for(const [name,cause,takeover] of TAKEOVERS)
  for(const stage of ['page:context_changed',`worker:preserve_${cause}`,'worker:tab_preserved'])assert.ok(steps.includes(stage),`${stage} in ${steps}`);
  assert.equal(steps.includes('page:cancelled'),false,`a secured leg is never reported as cancelled: ${steps}`);
 });
+// Ashlar 4101062749: a review sent with an attachment named diff.patch, its result secured; the user
+// then stages their own file with that name. A confirmed send took Ashlar's attachment out of the
+// composer, so the chip is the user's draft: the name of the run's old upload is no exemption.
+const withAttachment={journal:sentJournal({attachments:['diff.patch']})};
+const ownUploads=page=>page.evaluate(()=>{__ashlarRunnerState.pendingAttachments=['diff.patch'];}); // as fillComposer left them
+test('review: a secured tab where the user staged a file named like the run\'s sent attachment is preserved as a draft',async t=>{
+ const {tab}=await collected(t,withAttachment);
+ await ownUploads(tab.page);
+ assert.deepEqual(verdict(await canClose(tab)),{canClose:true,reason:'complete'},'control: nothing staged');
+ await tab.page.evaluate(html=>document.querySelector('form').insertAdjacentHTML('afterbegin',html),fileChip('diff.patch'));
+ assert.deepEqual(verdict(await canClose(tab)),{canClose:false,reason:'repurposed',cause:'draft'});
+ assert.equal(await tab.released(),'true');
+});
+test('worker, review: an ACKed tab where the user staged a file named like the run\'s sent attachment is preserved, never closed',async t=>{
+ const {tab,w}=await collectedLeg(t,withAttachment);
+ await ownUploads(tab.page);
+ await tab.page.evaluate(html=>document.querySelector('form').insertAdjacentHTML('afterbegin',html),fileChip('diff.patch'));
+ await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
+ assert.deepEqual(w.b.closedTabs,[],'the user\'s staged file is not lost with the tab');assert.equal(w.state(),undefined,'the job retired');
+ assert.ok(uploadedSteps(w).includes('worker:preserve_draft'),`${uploadedSteps(w)}`);
+});
 test('worker: an ACKed tab whose URL differs from its bound conversation only in the query closes',async t=>{
  const {tab,w}=await collectedLeg(t,{});
  assert.equal(await pinnedIn(tab),TEMP_URL);

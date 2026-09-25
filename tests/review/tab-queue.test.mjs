@@ -103,10 +103,8 @@ function callGraph(text) {
 }
 
 /** Tab effects reached from outside the queue, as `caller→callee` edges (or `fn` for a direct
- * effect), until their lanes move into it: capture and repair (commit 5), the stall sweep (commit 7). */
-const OUTSIDE_QUEUE_UNTIL_MOVED = new Set([
-  'captureProvider→askPage', 'notifyRepairReceipt→askPage', 'readRepairSource→askPage', 'providerTabGone→findOriginalTab',
-]);
+ * effect), until their lanes move into it: the stall sweep (commit 7). */
+const OUTSIDE_QUEUE_UNTIL_MOVED = new Set(['providerTabGone→findOriginalTab']);
 test('guard (I1): every tab effect is reached only from inside a tab operation', () => {
   const {fns, opBodies, effectful, inside} = callGraph(source('extension/background.js'));
   assert.ok(opBodies.has('pollProviderBody') && opBodies.has('cleanupProviderBody') && opBodies.has('probeTabOwner'), 'sanity: the operation bodies are found');
@@ -245,4 +243,68 @@ test('operations run one at a time, in the order they were queued', async () => 
   // A failed operation does not block the next.
   await assert.rejects(b.op(async () => { throw new Error('boom'); }));
   assert.equal(await b.op(async () => 'next'), 'next');
+});
+
+// ── Capture and repair (the review-JSON lanes): their bridge calls stay outside the queue, their
+// page steps (the source read, the capture receipt, the repair receipt) run inside it.
+const TEXT = 'not json at all';
+const durable = {id: 'capture-A', archiveDurable: true, responseId: 'response-A', text: TEXT, context: '[]', sourceHash: 'h', totalChars: TEXT.length};
+const pageSource = {text: TEXT, totalChars: TEXT.length, truncated: false, completed: true, stable: true, responseId: 'response-A', context: '[]'};
+function reviewLeg(state) {
+  return {...leg({tabId: 10, started: true, ...state}), captureProtocol: 1};
+}
+const pageAnswers = (_id, m) => (m.type === 'ashlar-repair-source' ? {ok: true, source: pageSource}
+  : m.type === 'ashlar-capture-accepted' || m.type === 'ashlar-repair-accepted' ? {ok: true, accepted: true}
+    : m.type === 'ashlar-can-close' ? {ok: true, releaseProtocol: 1, ownership: 'owned', url: 'https://chatgpt.com/c/managed', conversation: 'https://chatgpt.com/c/managed'}
+      : m.type === 'ashlar-tab-status' ? {ok: true} : {ok: false, code: 'busy', retry: true});
+const kindsOf = (b, type) => [...new Set(b.effects.filter(e => e.type === type).map(e => e.kind))];
+const captureApi = async (_path, body) => (body?.action === 'capture'
+  ? {ok: true, capture: {id: 'capture-A', jobId: body.jobId, provider: body.provider, runId: body.runId, responseId: body.responseId, sourceHash: body.sourceHash, totalChars: body.source.text.length}}
+  : body?.action === 'ping' ? {ok: true, active: true, accepted: true, status: 'awaiting_chat', bridge: {captureProtocol: 1, localJsonRepairEnabled: false}} : {ok: true, job: null});
+for (const [what, state, run, types] of [
+  ['the source read and the capture receipt', {observation: {state: 'response_completed_json_invalid', text: TEXT}},
+    (b, jobs) => b.context.captureProvider(jobs['job-A'], 'chatgpt', jobs), {'ashlar-repair-source': 'sourceRead', 'ashlar-capture-accepted': 'captureCommit'}],
+  ['a committed capture receipt', {formatError: true, outcome: {ok: true, raw: TEXT}, sourceCapture: durable},
+    (b, jobs) => b.context.captureProvider(jobs['job-A'], 'chatgpt', jobs), {'ashlar-capture-accepted': 'captureCommit'}],
+  ['the repair receipt', {delivered: true, repairReceiptPending: true, outcome: {ok: true, raw: '{}'}, repairAttempt: {id: 'repair-A', raw: '{}', text: TEXT, responseId: 'response-A', sourceHash: 'h', status: 'accepted'}},
+    (b, jobs) => b.context.notifyRepairReceipt(jobs['job-A'], 'chatgpt', jobs), {'ashlar-repair-accepted': 'repairReceipt'}],
+]) {
+  test(`${what}: the page is messaged only inside the tab queue, and no bridge call runs inside an operation`, async () => {
+    const b = worker(reviewLeg(state), {session: createdHere(), tab: {id: 10, url: 'https://chatgpt.com/c/managed', status: 'complete'}, handler: pageAnswers});
+    b.context.api = (orig => async (path, body, ...rest) => { await orig(path, body, ...rest); return captureApi(path, body); })(b.context.api);
+    const jobs = await b.jobs();
+    await run(b, jobs);
+    for (const [type, kind] of Object.entries(types)) assert.deepEqual(kindsOf(b, type), [kind], `${type} runs in ${kind}`);
+    assert.deepEqual(b.queue.bridgeInOp, [], 'no bridge call inside an operation');
+    assert.deepEqual(kindsOf(b, 'ashlar-can-close'), ['release'], 'the release it enables follows in its own operation');
+  });
+}
+// W3: the capture lane against the next tick's poll of the same leg. The poll waits for its harvest
+// reply; the capture lane's page messages (and the release they enable) wait for it: no message to
+// the tab while another is unanswered, the tab closed once, and no owned record left for it.
+test('a capture commit and the next tick\'s harvest of the same leg never interleave: the tab is closed once, and no owned record survives it', async () => {
+  const b = worker(reviewLeg({observation: {state: 'response_completed_json_invalid', text: TEXT}}), {session: createdHere(),
+    tab: {id: 10, url: 'https://chatgpt.com/c/managed', status: 'complete'}, handler: pageAnswers});
+  b.context.api = (orig => async (path, body, ...rest) => { await orig(path, body, ...rest); return captureApi(path, body); })(b.context.api);
+  const jobs = await b.jobs();
+  const send = b.chrome.tabs.sendMessage;
+  let held, outstanding = 0;
+  const overlapping = [];
+  b.chrome.tabs.sendMessage = (id, msg, cb) => {
+    if (outstanding) overlapping.push(msg.type);
+    if (msg.type === 'ashlar-harvest' && !held) { outstanding++; b.messages.push({id, ...msg}); held = () => { outstanding--; send(id, msg, cb); }; return; }
+    return send(id, msg, cb);
+  };
+  const ticked = b.tick();
+  assert.ok(await until(() => held), 'the poll waits for its harvest reply');
+  const lanes = vm.runInContext('captureLanes', b.context);
+  const captured = b.context.singleFlight(lanes, 'http://bridge:job-A:chatgpt', () => b.context.captureProvider(jobs['job-A'], 'chatgpt', jobs));
+  for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(overlapping, [], 'the capture lane waits for the poll');
+  held();
+  await Promise.all([ticked, captured]);
+  await b.queueIdle();
+  assert.deepEqual(overlapping, [], 'no page message while another is unanswered');
+  assert.deepEqual(b.closedTabs, [10], 'closed once');
+  assert.equal(b.session.state['ashlar:tab:10'], undefined, 'no owned record survives the closed tab');
 });

@@ -82,11 +82,15 @@ export function background({ local = storage({ origin: 'http://bridge', token: '
   vm.runInContext(code.slice(0, code.indexOf('\nchrome.alarms.onAlarm.addListener')), context, { filename: 'background.js' });
   // The tab queue (#85): each tab effect is recorded with the kind of operation it ran in (undefined:
   // none), and `queue.overlapped` says whether two operation bodies ever ran at once.
-  const opContext = new AsyncLocalStorage(), effects = [], queue = {overlapped: false, running: 0};
+  // `queue.bridgeInOp`: bridge calls made inside an operation (R2: none, but the detached progress flush).
+  const opContext = new AsyncLocalStorage(), effects = [], queue = {overlapped: false, running: 0, bridgeInOp: []};
   const recorded = (target, name, effect) => {
     let fn = target[name];
     Object.defineProperty(target, name, {configurable: true, enumerable: true, set: value => { fn = value; },
-      get: () => { const current = fn; return current && ((...args) => { effects.push({effect, kind: opContext.getStore()?.kind}); return current(...args); }); }});
+      get: () => { const current = fn; return current && ((...args) => {
+        effects.push({effect, kind: opContext.getStore()?.kind, ...(effect === 'message' ? {type: args[1]?.type} : {})});
+        return current(...args);
+      }); }});
   };
   for (const [name, effect] of [['sendMessage', 'message'], ['create', 'create'], ['remove', 'remove'], ['reload', 'reload']]) recorded(chrome.tabs, name, effect);
   recorded(chrome.scripting, 'executeScript', 'inject');
@@ -103,7 +107,10 @@ export function background({ local = storage({ origin: 'http://bridge', token: '
   let sleeps = 0;
   context.sleep = async () => { if (++sleeps > 8) throw new Error("test-only polling guard: tick did not return"); };
   const rpc = context.api;
-  context.api = async (path, body, origin, signal) => { calls.push({ path, ...body }); return api ? api(path, body, origin, signal) : { ok: true, job: null }; };
+  context.api = async (path, body, origin, signal) => {
+    const kind = opContext.getStore()?.kind;
+    if (kind && body?.action !== 'progress') queue.bridgeInOp.push(`${body?.action || path}@${kind}`);
+    calls.push({ path, ...body }); return api ? api(path, body, origin, signal) : { ok: true, job: null }; };
   return { context, rpc, local, session, tabs, messages, calls, closedTabs, chrome, effects, queue,
     /** Run `fn` as one operation in the tab queue (a direct call of an operation body). */
     op: (fn, kind = 'test') => context.tabOp(kind, fn),

@@ -2071,6 +2071,11 @@ async function readRepairSource(job, provider, full = true) {
     return {text,totalChars:saved.totalChars,truncated:false,completed:true,stable:true,
       responseId:saved.responseId,sourceHash:saved.sourceHash,captureId:saved.id,context:saved.context};
   }
+  return tabOp("sourceRead",()=>readPageSource(job,provider));
+}
+/** The page's completed source for the leg's run (read-only), one operation in the tab queue. */
+async function readPageSource(job, provider) {
+  const state=job.states[provider];
   if(!state.tabId)return null;
   const result=await askPage(state.tabId,tabMessage(job,provider,"ashlar-repair-source"),contentFiles(provider));
   const source=result?.source;
@@ -2086,10 +2091,9 @@ async function readRepairSource(job, provider, full = true) {
  * Capturing releases a browser resource; it never marks delivered or posts JSON.
  */
 async function captureProvider(job, provider, jobs) {
-  const state=job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`;
+  const state=job.states[provider];
   if(state.delivered || state.cleanupDone || sourceCleanupProofConfirmed(state) || job.captureProtocol!==1)return;
-  let saved=state.sourceCapture;
-  if(!saved?.id) {
+  if(!state.sourceCapture?.id) {
     if(!state.formatError && state.observation?.state!=="response_completed_json_invalid")return;
     const source=await readRepairSource(job,provider);
     if(!source || typeof source.context!=="string")return;
@@ -2100,10 +2104,19 @@ async function captureProvider(job, provider, jobs) {
     const receipt=response.capture;
     if(!receipt?.id || receipt.jobId!==job.jobId || receipt.provider!==provider || receipt.runId!==state.runId ||
         receipt.responseId!==source.responseId || receipt.sourceHash!==source.sourceHash || receipt.totalChars!==source.text.length)return;
-    saved={...source,...receipt,archiveDurable:false,cleanupProofConfirmed:false};
-    state.sourceCapture=saved;
+    state.sourceCapture={...source,...receipt,archiveDurable:false,cleanupProofConfirmed:false};
     workerStep(job,provider,"source_archive_saved");
   }
+  // The receipt's commit (its durable writes and the page's acknowledgement) is one operation in the
+  // tab queue; the release it enables runs after it.
+  if(await tabOp("captureCommit",()=>commitCapture(job,provider,jobs)))await cleanupProvider(job,provider,jobs);
+}
+/** Commit the capture receipt the bridge just returned (state.sourceCapture), inside the tab queue:
+ * persist it, mark it durable, and hand it to the page. True when the leg's tab may be released now. */
+async function commitCapture(job, provider, jobs) {
+  if(jobs[job.jobId]!==job)return false;
+  const state=job.states[provider], key=`${job.origin}:${job.jobId}:${provider}`, saved=state.sourceCapture;
+  if(!saved?.id)return false;
   // Server archive success and local receipt persistence are the durability
   // barrier for repair. Page revalidation is only cleanup authorization.
   if(!sourceArchiveDurable(state)) {
@@ -2126,41 +2139,47 @@ async function captureProvider(job, provider, jobs) {
   } else {
     await saveJobs(jobs);
   }
-  if(state.delivered || (state.outcome?.ok && !state.formatError) || state.cleanupDone)return;
-  if(!state.tabId) return finishTabCleanup(job,provider,jobs,"archived source durable; original tab absent");
+  if(state.delivered || (state.outcome?.ok && !state.formatError) || state.cleanupDone)return false;
+  if(!state.tabId) { await finishTabCleanup(job,provider,jobs,"archived source durable; original tab absent"); return false; }
   let result;
   try {
     result=await askPage(state.tabId,{...tabMessage(job,provider,"ashlar-capture-accepted"),committed:true,
       captureId:saved.id,responseId:saved.responseId,text:saved.text,context:saved.context},contentFiles(provider));
   } catch {
-    return; // Repair can proceed from archive; cleanup retries independently.
+    return false; // Repair can proceed from archive; cleanup retries independently.
   }
-  if(!matchesJob(result,job,provider))return;
+  if(!matchesJob(result,job,provider))return false;
   ingestPageProgress(state,result);
   if(result.code==="capture_source_changed") {
     // The original is durably archived (secured); a changed page is not the user's by itself.
     state.cleanupPending=true;
     delete state.captureError;
     await saveJobs(jobs);
-    return cleanupProvider(job,provider,jobs);
+    return true;
   }
-  if(!result.accepted)return;
+  if(!result.accepted)return false;
   saved.cleanupProofConfirmed=true;
   saved.confirmed=true; // Backward-compatible alias for pre-split persisted states.
   state.cleanupPending=true;
   delete state.captureError;
   await saveJobs(jobs);
-  await cleanupProvider(job,provider,jobs);
+  return true;
 }
+/** Hand the accepted repair to the page (one operation in the tab queue), then release the tab. */
 async function notifyRepairReceipt(job, provider, jobs) {
+  if(await tabOp("repairReceipt",()=>commitRepairReceipt(job,provider,jobs)))await cleanupProvider(job,provider,jobs);
+}
+/** True when the leg's tab may be released now. */
+async function commitRepairReceipt(job, provider, jobs) {
+  if(jobs[job.jobId]!==job)return false;
   const state=job.states[provider], attempt=state.repairAttempt;
-  if(!state.repairReceiptPending || !attempt?.raw || !attempt.text)return;
+  if(!state.repairReceiptPending || !attempt?.raw || !attempt.text)return false;
   // A prior outbox write may have failed after mutating the shared registry.
   // Re-establish durability on EVERY receipt retry, before notifying the page.
   await saveJobs(jobs);
   const result=await askPage(state.tabId,{...tabMessage(job,provider,"ashlar-repair-accepted"),
     committed:true,repairId:attempt.id,responseId:attempt.responseId,text:attempt.text,raw:attempt.raw},contentFiles(provider));
-  if(!matchesJob(result,job,provider))return;
+  if(!matchesJob(result,job,provider))return false;
   ingestPageProgress(state,result);
   if(!result.accepted) {
     if(["repair_source_changed","repair_source_unavailable"].includes(result.code)) {
@@ -2168,14 +2187,14 @@ async function notifyRepairReceipt(job, provider, jobs) {
       // user's activity: the release verdict decides who holds the tab.
       state.repairReceiptPending=false;
       await saveJobs(jobs);
-      await cleanupProvider(job,provider,jobs);
+      return true;
     }
-    return;
+    return false;
   }
   state.repairReceiptPending=false;
   workerStep(job,provider,"repair_accepted");
   await saveJobs(jobs);
-  await cleanupProvider(job,provider,jobs);
+  return true;
 }
 async function acceptRepairReceipt(job, provider, jobs, result) {
   const state=job.states[provider], attempt=state.repairAttempt;

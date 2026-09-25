@@ -16,7 +16,8 @@ const EVENTS = ['tick', 'tick', 'tick', 'later', 'cancel', 'missing', 'sweep', '
   'freeze', 'thaw', 'discard', 'discardSwap', 'loading', 'loaded', 'hang', 'noReceiver', 'pageOk', 'notRendered', 'rendered', 'browserRestart'];
 const START = ['secured', 'generating', 'undispatched'];
 /** The operation kinds allowed to perform each tab effect (the tab queue, #85). */
-const TAB_EFFECT_OPS = {message: ['poll', 'release', 'probe'], inject: ['poll', 'release', 'probe'], create: ['poll'], remove: ['release'], reload: ['poll', 'release']};
+const PAGE_OPS = ['poll', 'release', 'probe', 'sourceRead', 'captureCommit', 'repairReceipt'];
+const TAB_EFFECT_OPS = {message: PAGE_OPS, inject: PAGE_OPS, create: ['poll'], remove: ['release'], reload: ['poll', 'release']};
 /** A page reply deadline that expires at once (the real one is PAGE_REPLY_MS). */
 const expiresAtOnce = () => ({promise: new Promise((_resolve, reject) => setImmediate(() => reject(new Error('the page did not answer in time')))), cancel() {}});
 
@@ -81,6 +82,7 @@ async function run(kind, start, events) {
   // queue), and no two operations ever run at once. (The sweep still reaches tabs outside the queue.)
   const queued = outsideAllowed => {
     if (b.queue.overlapped) return 'tab_ops_overlapped';
+    if (b.queue.bridgeInOp.length) return `bridge_call_in_tab_op(${b.queue.bridgeInOp})`;
     for (const {effect, kind} of b.effects.splice(0)) {
       if (kind === undefined ? !outsideAllowed : !TAB_EFFECT_OPS[effect]?.includes(kind)) return `tab_effect_${effect}_in_${kind || 'no_op'}`;
     }

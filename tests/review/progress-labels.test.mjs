@@ -1,6 +1,16 @@
-// sanitizeProgressEvents keeps only stages that are PROGRESS_LABELS keys, so a stage the extension
-// records without a label never reaches review history or the live reviewer status. These rows pin
-// that every stage the extension can record is labelled — including the ones built from a template.
+// sanitizeProgressEvents keeps a well-formed stage that has no PROGRESS_LABELS entry, but review history
+// and the live reviewer status can only show it as "Unlabelled step · <stage>". These rows pin that every
+// stage the extension can record is labelled — including the ones built from a template.
+//
+// Threat model. The guard catches accidental omissions in the ways the extension actually records
+// stages: a direct call of a recorder (workerStep, recordReviewStep, step) with a literal stage or a
+// template whose expression is declared in TEMPLATE_STAGES, and a recorder that forwards its stage
+// parameter unchanged. Its other rules (a recorder's name in a string, a computed call it cannot read,
+// the global object read by a computed name) fail closed on the common ways to lose sight of a call.
+// Deliberate indirection is out of scope: JavaScript can always hide a call from a token scan (an alias
+// of a computed member, a key built by concatenation, an applier spelled as a computed member), and such
+// a stage is no longer lost — the server keeps it and history shows it as an unlabelled step. So a
+// finding that only names another way to hide a call does not get another rule here.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync} from 'node:fs';
@@ -8,7 +18,7 @@ import {tmpdir} from 'node:os';
 import {dirname, join, sep} from 'node:path';
 import {root, source} from './load-source.mjs';
 import {background, storage} from './helpers.mjs';
-import {PROGRESS_LABELS, sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
+import {PROGRESS_LABELS, progressLabel, sanitizeProgressEvents} from '../../src/lib/review-progress.ts';
 
 /** The progress recorders and the position of their stage argument. */
 const RECORDERS = {workerStep: 2, recordReviewStep: 0, step: 0};
@@ -179,6 +189,278 @@ function recorderCall(level, k) {
 const startsStatement = (level, k, container) => (!container || container.open === '{') &&
   (k === 0 || isPunct(level[k - 1], ';') || level[k - 1].kind === 'group');
 
+const SINGLE_ESCAPES = {b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v'};
+
+/** A string literal's value from its source between the quotes: `"workerSt\x65p"` is "workerStep". */
+function stringValue(raw) {
+  return raw.replace(/\\(?:u\{([\da-f]+)\}|u([\da-f]{4})|x([\da-f]{2})|([0-3][0-7]{0,2}|[4-7][0-7]?)|(\r\n|[\s\S]))/gi,
+    (_, braced, four, two, octal, other) => (braced ?? four ?? two) ? String.fromCodePoint(parseInt(braced ?? four ?? two, 16))
+      : octal ? String.fromCharCode(parseInt(octal, 8)) : /^[\r\n\u2028\u2029]/.test(other) ? '' : SINGLE_ESCAPES[other] ?? other);
+}
+
+/** The value of a string literal or a template literal without substitutions, else undefined. */
+const literalValue = token => token?.kind === 'str' || (token?.kind === 'tpl' && !token.substs.length) ? stringValue(token.value) : undefined;
+
+/** Names whose value is the global object. A recorder declared at the top of a script is a property of it. */
+const GLOBAL_NAMES = new Set(['globalThis', 'self', 'window', 'frames', 'top', 'parent', 'this']);
+
+/** Whether the `[` group at `level[k]` is a computed member (`x[k]`, `f()[k]`, `x?.[k]`, `{a: f}[k]`) rather
+ * than an array literal: it follows `?.` or the end of an operand. A `{...}` after an operator or a keyword
+ * that starts an expression (`return {a: f}[k]`) is an object literal; one at the start of a statement,
+ * after `=>`, `do` or `else` is a block. */
+function computedMember(level, k) {
+  const token = level[k], before = level[k - 1];
+  if (token?.open !== '[' || !before) return false;
+  if (before.kind === 'punct') return before.text === '?.';
+  if (before.kind === 'word') return !REGEX_AFTER.has(before.text) && !['const', 'let', 'var'].includes(before.text);
+  if (before.open === '{') {
+    const lead = level[k - 2];
+    return lead?.kind === 'punct' ? !['=>', ';'].includes(lead.text) : lead?.kind === 'word' && REGEX_AFTER.has(lead.text) && !['do', 'else'].includes(lead.text);
+  }
+  if (before.kind === 'group') return before.open === '[' || (before.open === '(' && !HEADED.has(level[k - 2]?.text));
+  return true; // after a string, a template or a regex
+}
+
+/** The key of a computed member's `[...]` when the guard can read it: a string, a template without
+ * substitutions, or a number (never a recorder's name). Otherwise undefined. */
+function memberKey(group) {
+  const [only, ...rest] = group.tokens;
+  if (rest.length) return undefined;
+  return only?.kind === 'word' && /^\d/.test(only.text) ? only.text : literalValue(only);
+}
+
+/** The property name `level[k]` spells, or undefined: a word after `.` or `?.`, a computed member's
+ * readable key (`x["defaultView"]`), or an object key or pattern key (`{defaultView}`, `{"defaultView": v}`,
+ * `{["defaultView"]: v}`, a method's name). */
+function propertyName(level, k, container) {
+  const token = level[k], before = level[k - 1], after = level[k + 1];
+  if (computedMember(level, k)) return memberKey(token);
+  if (isPunct(before, '.') || isPunct(before, '?.')) return token.kind === 'word' ? token.text : undefined;
+  if (container?.open !== '{' || (k > 0 && !isPunct(before, ','))) return undefined;
+  if (token.kind === 'word') return !after || isPunct(after, ':') || isPunct(after, ',') || isPunct(after, '=') || after.open === '(' ? token.text : undefined;
+  const keyed = isPunct(after, ':') || after?.open === '(';
+  return !keyed ? undefined : token.open === '[' ? memberKey(token) : literalValue(token);
+}
+
+/** The names a binding target binds: a name, or each name in a destructuring pattern or a parameter
+ * list (`a, {b, c: [d]}, e = 1, ...f`): an element up to its default value, the value after a key's `:`,
+ * a rest element. */
+function bindingNames(target) {
+  if (target?.kind === 'word') return [target.text];
+  if (!['{', '[', '('].includes(target?.open)) return [];
+  return argumentsOf(target.tokens).flatMap(element => {
+    let part = isPunct(element[0], '...') ? element.slice(1) : element;
+    const colon = part.findIndex(token => isPunct(token, ':')), eq = part.findIndex(token => isPunct(token, '='));
+    if (colon >= 0 && (eq < 0 || colon < eq)) part = part.slice(colon + 1);
+    return bindingNames(part[0]);
+  });
+}
+
+/** The names `tokens` declares at its own level: each const, let or var declarator's name or pattern,
+ * and a function or class declaration's name (an expression's name binds only inside it). */
+function declaredNames(tokens) {
+  return tokens.flatMap((token, k) => {
+    const before = tokens[k - 1];
+    if (token.kind !== 'word' || isPunct(before, '.') || isPunct(before, '?.')) return [];
+    if (['const', 'let', 'var'].includes(token.text)) return argumentsOf(until(tokens, k + 1, [';'])).flatMap(([target]) => bindingNames(target));
+    if (token.text !== 'function' && token.text !== 'class') return [];
+    const lead = isWord(before, 'async') ? tokens[k - 2] : before, name = tokens[k + (isPunct(tokens[k + 1], '*') ? 2 : 1)];
+    const declaration = !lead || isPunct(lead, ';') || lead.kind === 'group' || isWord(lead, 'export') || isWord(lead, 'default');
+    return declaration && name?.kind === 'word' && name.text !== 'extends' ? [name.text] : [];
+  });
+}
+
+/** Where the statement at `tokens[from]` ends: after its block when it is one; after the statement an
+ * if, for, while or with head governs (an if's else arm included); after a do's while head, a try's or a
+ * switch's last block, or the statement a label names; else after its `;`, else at the end of the level. */
+function statementEnd(tokens, from) {
+  const token = tokens[from], head = isWord(tokens[from + 1], 'await') ? from + 2 : from + 1;
+  if (token?.open === '{') return from + 1;
+  if (['if', 'for', 'while', 'with'].some(word => isWord(token, word)) && tokens[head]?.open === '(') {
+    const end = statementEnd(tokens, head + 1);
+    return isWord(token, 'if') && isWord(tokens[end], 'else') ? statementEnd(tokens, end + 1) : end;
+  }
+  if (isWord(token, 'do')) {
+    const end = statementEnd(tokens, from + 1);
+    return isWord(tokens[end], 'while') ? end + (isPunct(tokens[end + 2], ';') ? 3 : 2) : end;
+  }
+  if (isWord(token, 'try')) {
+    let end = from + 2;
+    if (isWord(tokens[end], 'catch')) end += tokens[end + 1]?.open === '(' ? 3 : 2;
+    return isWord(tokens[end], 'finally') ? end + 2 : end;
+  }
+  if (isWord(token, 'switch')) return from + 3;
+  if (token?.kind === 'word' && isPunct(tokens[from + 1], ':')) return statementEnd(tokens, from + 2);
+  for (let j = from; j < tokens.length; j += 1) if (isPunct(tokens[j], ';')) return j + 1;
+  return tokens.length;
+}
+
+/** The names bound inside the group at `tokens[index]` by the head in front of it: a function's,
+ * method's or catch's parameters (and a function expression's own name) for its body, and for the
+ * parameter list itself. The head of an if, while, with, switch or for binds none there. */
+function headNames(tokens, index) {
+  const group = tokens[index];
+  const head = group.open === '{' && tokens[index - 1]?.open === '(' ? index - 1 : group.open === '(' && tokens[index + 1]?.open === '{' ? index : -1;
+  if (head < 0 || ['if', 'while', 'with', 'switch', 'for', 'await'].includes(tokens[head - 1]?.text)) return [];
+  return [...(isWord(tokens[head - 2], 'function') ? bindingNames(tokens[head - 1]) : []), ...bindingNames(tokens[head])];
+}
+
+/** The parameters of the arrows in `tokens` that `tokens[index]` is a parameter of or in the body of: an
+ * arrow before it whose body runs to it without a `,` or `;` between. */
+function arrowNames(tokens, index) {
+  const names = [];
+  for (let a = isPunct(tokens[index + 1], '=>') ? index + 1 : index - 1; a > 0 && !isPunct(tokens[a], ',') && !isPunct(tokens[a], ';'); a -= 1) {
+    if (isPunct(tokens[a], '=>')) names.push(...bindingNames(tokens[a - 1]));
+  }
+  return names;
+}
+
+/** The names the for heads in `tokens` declare for the loop statements that hold `tokens[index]`. */
+function forNames(tokens, index) {
+  return tokens.slice(0, index).flatMap((token, j) => {
+    const head = isWord(tokens[j + 1], 'await') ? j + 2 : j + 1;
+    return isWord(token, 'for') && tokens[head]?.open === '(' && index < statementEnd(tokens, head + 1) ? declaredNames(tokens[head].tokens) : [];
+  });
+}
+
+/** Whether the word `name` at `level[k]`, inside the levels `path`, is bound by the code rather than
+ * being the global object's: declared in a level that holds it, a parameter of a function, method, arrow
+ * or catch whose head or body holds it, or declared by a for head over it. A binding site binds itself. */
+function boundLocally(path, level, k, name) {
+  const frames = [...path, {tokens: level, index: k}];
+  return frames.some(({tokens, index}, f) => [...declaredNames(tokens), ...arrowNames(tokens, index), ...forNames(tokens, index),
+    ...(f < frames.length - 1 ? headNames(tokens, index) : [])].includes(name));
+}
+
+/** Whether the `{` group at `tokens[index]` is a class body: `class`, a name and an extends clause before it. */
+function classBody(tokens, index) {
+  let j = index - 1;
+  while (j >= 0 && !isWord(tokens[j], 'class') && (tokens[j].kind === 'word' || isPunct(tokens[j], '.') || tokens[j].open === '(' || tokens[j].open === '[')) j -= 1;
+  return tokens[index]?.open === '{' && isWord(tokens[j], 'class');
+}
+
+/** Whether the word at `level[k]` (inside the levels `path`) names something other than a variable: a
+ * property (`.top`, `#top`), an object key or a method, a class field, or a label. */
+function nameOnly(level, k, container, path) {
+  const before = level[k - 1], after = level[k + 1], holder = path.at(-1);
+  if (['.', '?.', '#'].some(text => isPunct(before, text)) || isWord(before, 'break') || isWord(before, 'continue')) return true;
+  if (after?.open === '(' && level[k + 2]?.open === '{') return true;
+  if (isPunct(after, ':') && ((container?.open === '{' && (k === 0 || isPunct(before, ','))) || startsStatement(level, k, container))) return true;
+  return Boolean(holder) && classBody(holder.tokens, holder.index) && (!after || isPunct(after, '=') || isPunct(after, ';')) &&
+    (k === 0 || isPunct(before, ';') || before.open === '{' || isWord(before, 'static'));
+}
+
+/** Whether the bracket group holding the level at the end of `path` is a destructuring pattern, whose keys
+ * read the value it takes apart: one followed by `=`, `of` or `in`, an element of a function's, arrow's
+ * or catch's parameter list, or one nested in a pattern. An object literal's keys define properties. */
+function destructuring(path) {
+  const holder = path.at(-1), outer = path.at(-2);
+  if (!holder) return false;
+  const {tokens, index} = holder, after = tokens[index + 1], group = outer?.tokens[outer.index];
+  if (isPunct(after, '=') || isWord(after, 'of') || isWord(after, 'in')) return true;
+  if (group?.open === '(') {
+    const element = index === 0 || isPunct(tokens[index - 1], ',') || isPunct(tokens[index - 1], '...');
+    return element && (isPunct(outer.tokens[outer.index + 1], '=>') || outer.tokens[outer.index + 1]?.open === '{');
+  }
+  return (group?.open === '{' || group?.open === '[') && destructuring(path.slice(0, -1));
+}
+
+/** Whether `level[k]` (inside the levels `path`) refers to the global object: one of GLOBAL_NAMES that
+ * names a variable (nameOnly) the code does not bind where it stands (a declaration, a parameter or a
+ * catch binding of that name makes it a local), with `this` anywhere but in a class body (strict code,
+ * whose `this` is never the global object); or a `defaultView` property (a document's window) however
+ * its name is spelled, read as a member or by a destructuring pattern (an object literal's key, a class
+ * field or a label of that name reads nothing). */
+function globalReference(level, k, container, path) {
+  const token = level[k], member = computedMember(level, k) || isPunct(level[k - 1], '.') || isPunct(level[k - 1], '?.');
+  if (propertyName(level, k, container) === 'defaultView') return member || destructuring(path);
+  if (token.kind !== 'word' || !GLOBAL_NAMES.has(token.text) || nameOnly(level, k, container, path)) return false;
+  if (token.text === 'this') return !path.some(({tokens, index}) => classBody(tokens, index));
+  return !boundLocally(path, level, k, token.text);
+}
+
+/** Whether the global object at `level[k]` is read only by a static member name (`globalThis.x`,
+ * `window?.["x"]`, on through `.window`, `.self` and the like) or by typeof. A computed name can be any
+ * recorder's, and the object as a value (an alias, an argument, a destructuring source) can be searched
+ * for one. */
+function staticGlobalRead(level, k) {
+  for (let j = k + 1; ; ) {
+    const dot = isPunct(level[j], '.') || isPunct(level[j], '?.'), member = dot ? level[j + 1] : level[j];
+    const computed = member?.open === '[';
+    const name = computed ? memberKey(member) : dot && member?.kind === 'word' ? member.text : undefined;
+    if (name === undefined) return !computed && level[k - 1]?.text === 'typeof';
+    if (!GLOBAL_NAMES.has(name) || name === 'this') return true;
+    j += dot ? 2 : 1;
+  }
+}
+
+/** Names of the calls that call the function they are handed first (`Reflect.apply(f, ...)`,
+ * `Function.prototype.call.call(f, ...)`), and of the methods that call or bind the function they are on. */
+const APPLIERS = new Set(['apply', 'call', 'bind', 'construct']);
+
+/** Whether `new` applies to the member chain that ends at `level[k]` (`new x.y[k]`, not `new f()[k]`). */
+function constructed(level, k) {
+  let j = k;
+  for (;;) {
+    if (computedMember(level, j)) j -= isPunct(level[j - 1], '?.') ? 2 : 1;
+    else if (level[j]?.kind === 'word' && (isPunct(level[j - 1], '.') || isPunct(level[j - 1], '?.'))) j -= 2;
+    else return isWord(level[j - 1], 'new');
+  }
+}
+
+/** Whether the `(` group at `tokens[i]` is a parenthesised expression, whose value is one of its operands:
+ * not a call's arguments, a function's or an arrow's parameters, or the head of a statement. */
+function parenthesised(tokens, i) {
+  const before = tokens[i - 1];
+  if (isPunct(tokens[i + 1], '=>')) return false;
+  if (!before || before.kind === 'punct') return true;
+  if (before.kind === 'word') return REGEX_AFTER.has(before.text);
+  return before.open === '{';
+}
+
+/** Whether the value that ends at `level[k]` is called: `(...)`, `?.(...)` or a template after it, `new`
+ * on its chain, a .call, .apply or .bind on it, or handed first to a call of an APPLIERS name; the same
+ * for a parenthesised expression it ends an operand of (`(x[k])()`, `(0, x[k])()`), whose value it can be.
+ * `path` holds `level`. */
+function calledAt(level, k, path) {
+  const next = isPunct(level[k + 1], '?.') ? level[k + 2] : level[k + 1];
+  if (next?.open === '(' || level[k + 1]?.kind === 'tpl' || constructed(level, k)) return true;
+  if ((isPunct(level[k + 1], '.') || isPunct(level[k + 1], '?.')) && APPLIERS.has(level[k + 2]?.text)) return true;
+  const holder = path.at(-1), group = holder?.tokens[holder.index], callee = holder?.tokens[holder.index - 1];
+  if (group?.open !== '(') return false;
+  if (parenthesised(holder.tokens, holder.index)) {
+    const ends = !level[k + 1] || (level[k + 1].kind === 'punct' && !isPunct(level[k + 1], '.') && !isPunct(level[k + 1], '?.'));
+    return ends && calledAt(holder.tokens, holder.index, path.slice(0, -1));
+  }
+  const first = level.findIndex(token => isPunct(token, ','));
+  return callee?.kind === 'word' && APPLIERS.has(callee.text) && (first < 0 ? level.length : first) === k + 1;
+}
+
+/** The equality operators: a string compared by one (`kind === "step"`) yields a boolean, not a key. */
+const EQUALITY = new Set(['===', '!==', '==', '!=']);
+
+/** Whether the string at `level[k]` is only compared: an operand of an equality or a `case` label. */
+const compared = (level, k) => isWord(level[k - 1], 'case') ||
+  [level[k - 1], level[k + 1]].some(token => token?.kind === 'punct' && EQUALITY.has(token.text));
+
+/** Why `level[k]` reaches a recorder by a name the tokens never spell as one, or null: a string whose
+ * value is a recorder's name and that is not only compared (`globalThis["workerStep"]`,
+ * `Reflect.get(self, "step")`, an argument or a stored value that may reach such a lookup), a call through a
+ * computed member whose name the guard cannot read, on any object (`e.currentTarget[name](...)`: the
+ * global object can arrive as any value), or the global object read other than by a static member name
+ * (`globalThis[name]`). */
+function reachedByName(level, k, container, path) {
+  const token = level[k], value = literalValue(token);
+  if (value !== undefined && Object.hasOwn(RECORDERS, value) && !compared(level, k)) {
+    return 'a string naming a recorder can reach it through a computed member or a lookup, so the stages it records there cannot be checked';
+  }
+  if (computedMember(level, k) && memberKey(token) === undefined && calledAt(level, k, path)) {
+    return 'a call through a computed member whose name the guard cannot read can call a recorder on any object that holds one (the global object holds them all), so the stage it records cannot be checked';
+  }
+  if (staticGlobalRead(level, k) || !globalReference(level, k, container, path)) return null;
+  return 'the global object, which holds every recorder declared at the top of a script, is read other than by a static member name, so a recorder reached there records stages that cannot be checked';
+}
+
 /** Names that reach a binding without naming it: a sloppy-mode `arguments[i] = x` rebinds a parameter,
  * and eval and with can reassign or shadow one. */
 const INDIRECT = new Set(['arguments', 'eval', 'with']);
@@ -230,7 +512,9 @@ function recorderBodies(tokens) {
  * Calls are found in the tokens, so a comment or a string is never one, and one is never hidden by a
  * comment or a regex before it. A file the tokenizer cannot read is itself a problem. So is any other
  * use of a recorder's name than a call, its function declaration or `typeof name`: a recorder passed as
- * a value, aliased, or called through .call or .apply records a stage no call here shows. */
+ * a value, aliased, or called through .call or .apply records a stage no call here shows. So is a way to
+ * reach a recorder without its name as a word (reachedByName): a string that names it, a call through
+ * a computed member the guard cannot read, or a computed read of the global object. */
 function recordedStages(text, file = 'source') {
   const found = {literals: new Set(), templates: new Set(), sites: [], problems: []};
   let tokens;
@@ -240,6 +524,8 @@ function recordedStages(text, file = 'source') {
   }
   const bodies = recorderBodies(tokens);
   walkTokens(tokens, (token, level, k, container, path) => {
+    const reached = reachedByName(level, k, container, path);
+    if (reached) return found.problems.push(`${file}:${lineOf(text, token)} ${token.text}: ${reached}`);
     if (token.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text)) return;
     const group = recorderCall(level, k), before = level[k - 1];
     const where = `${file}:${lineOf(text, token)} ${token.text}`;
@@ -296,60 +582,226 @@ function constBefore(path, name) {
   return null;
 }
 
-/** Whether `tokens[k]` uses `name` other than as the object of a member read (`name.x` or `name?.x`,
- * not assigned, updated or deleted): a rebinding, an assignment, an argument or an alias can change what
- * `name.x` holds later. with, eval and arguments reach a binding without naming it. */
-function misuses(tokens, k, name) {
-  const token = tokens[k], before = tokens[k - 1], after = tokens[k + 3];
-  if (token.kind !== 'word' || isPunct(before, '.') || isPunct(before, '?.')) return false;
-  if (INDIRECT.has(token.text)) return true;
-  if (token.text !== name) return false;
-  const member = (isPunct(tokens[k + 1], '.') || isPunct(tokens[k + 1], '?.')) && tokens[k + 2]?.kind === 'word';
-  const written = after?.kind === 'punct' && (ASSIGN.has(after.text) || after.text === '++' || after.text === '--');
-  const prefixed = isPunct(before, '++') || isPunct(before, '--') || (before?.kind === 'word' && before.text === 'delete');
-  return !member || written || prefixed;
+const MISUSE = 'uses other than as a member read';
+
+const isWord = (token, text) => token?.kind === 'word' && token.text === text;
+
+/** Whether an expression followed by `after` is a target: of an assignment, of a for-of head, or of a
+ * for-in head when it starts one (`head`; elsewhere `in` is an operator). */
+const assignedBy = (after, head) => (after?.kind === 'punct' && ASSIGN.has(after.text)) || isWord(after, 'of') || (head && isWord(after, 'in'));
+
+/** Whether an expression between `before` and `after` is written: a target, updated or deleted. */
+const written = (before, after, head) => assignedBy(after, head) || isPunct(after, '++') || isPunct(after, '--') ||
+  isPunct(before, '++') || isPunct(before, '--') || isWord(before, 'delete');
+
+/** What surrounds the tokens inside the group `tokens[k]`, given `ctx` around `tokens`: whether they are
+ * a for head; through parentheses, the tokens around the whole parenthesised run (`(a.b) = x` assigns
+ * a.b); and whether they are in an assignment pattern (`[a.b] = x`, `for ({v: a.b} of rows)`), where any
+ * member chain can be a target. */
+function innerContext(tokens, k, ctx) {
+  const group = tokens[k], head = ctx.forHead && k === 0;
+  if (group.open !== '(') return {pattern: ctx.pattern || assignedBy(tokens[k + 1], head)};
+  const forHead = isWord(tokens[k - 1], 'for') || (isWord(tokens[k - 1], 'await') && isWord(tokens[k - 2], 'for'));
+  return {forHead, pattern: ctx.pattern, around: tokens.length === 1 && ctx.around ? ctx.around : {before: tokens[k - 1], after: tokens[k + 1], head}};
 }
 
-/** The first token of `tokens[from..to)`, groups and template substitutions included, that misuses `name`. */
-function firstMisuse(tokens, from, to, name) {
+/** The member chain after the name at `tokens[k]` (`.a`, `?.a`, `[k]`, calls and tags) up to `end`, and
+ * `handed`: the static member names up to the object that `holds` says still holds what the binding does
+ * ([] for the name itself) when that object is handed on — as the chain's value, or to a call, a tag or
+ * a computed member applied to it — else null. A call or a tag receives the object its function is read from. */
+function memberChain(tokens, k, holds) {
+  const names = [];
+  let j = k + 1, handed = null, broken = false;
+  for (;;) {
+    const dot = isPunct(tokens[j], '.') || isPunct(tokens[j], '?.'), next = dot ? tokens[j + 1] : tokens[j];
+    if (dot && next?.kind === 'word') {
+      if (!broken) names.push(next.text);
+    } else if (next?.open === '(' || next?.open === '[' || (next?.kind === 'tpl' && !dot)) {
+      const object = next.open === '[' ? names : names.slice(0, -1);
+      if (!broken && holds(object)) handed ??= object;
+      broken = true;
+    } else return {end: j, handed: handed ?? (!broken && holds(names) ? names : null)};
+    j += dot ? 2 : 1;
+  }
+}
+
+/** Why `tokens[k]` may change what `name.x` holds from then on, or null. `name` may appear only as the
+ * object of a member chain that is read, not written: a write anywhere along it (assigned, updated,
+ * deleted, a pattern or for-in/of target, through parentheses) changes what it reaches. Nor may what the
+ * binding holds be handed on: the name itself as a value, or a call, a tag or a computed member on it. For
+ * `aliases` of `name` (`const status = response.repair`: the object at `response.repair` is status's), the
+ * members down to the aliased object are the binding's too, save in the alias's own initialiser (`skip`).
+ * with, eval and arguments reach a binding without naming it. */
+function misuses(tokens, k, name, aliases, ctx) {
+  const token = tokens[k];
+  if (token.kind !== 'word' || isPunct(tokens[k - 1], '.') || isPunct(tokens[k - 1], '?.')) return null;
+  if (INDIRECT.has(token.text)) return MISUSE;
+  if (token.text !== name) return null;
+  const below = names => aliases.find(({path}) => names.length <= path.length && names.every((part, i) => part === path[i]));
+  const {end, handed} = memberChain(tokens, k, names => !names.length || Boolean(below(names)));
+  const {before, after, head} = k === 0 && end === tokens.length && ctx.around ? ctx.around : {before: tokens[k - 1], after: tokens[end], head: ctx.forHead && k === 0};
+  if (ctx.pattern || written(before, after, head)) return MISUSE;
+  if (!handed || aliases.some(alias => alias.skip === token)) return null;
+  return handed.length ? `${MISUSE} (${[name, ...handed].join('.')} holds what ${below(handed).by} aliases)` : MISUSE;
+}
+
+/** Never a scope of its own (see shadowing). */
+const NO_SHADOW = () => -1;
+
+/** The first token of `tokens[from..to)`, groups and template substitutions included, that misuses
+ * `name`, as {token, why}, or null. `ctx` is what surrounds `tokens` (innerContext). A scope `shadowed`
+ * ends past `tokens[k]` binds its own `name` and is skipped (shadowing). */
+function firstMisuse(tokens, from, to, name, aliases, ctx = {}, shadowed = NO_SHADOW) {
   for (let k = from; k < to; k += 1) {
-    if (misuses(tokens, k, name)) return tokens[k];
-    for (const inner of tokens[k].kind === 'group' ? [tokens[k].tokens] : tokens[k].substs ?? []) {
-      const hit = firstMisuse(inner, 0, inner.length, name);
+    const end = shadowed(tokens, k);
+    if (end > k) { k = end - 1; continue; }
+    const why = misuses(tokens, k, name, aliases, ctx);
+    if (why) return {token: tokens[k], why};
+    const token = tokens[k];
+    for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) {
+      const hit = firstMisuse(inner, 0, inner.length, name, aliases, token.kind === 'group' ? innerContext(tokens, k, ctx) : {}, shadowed);
       if (hit) return hit;
     }
   }
   return null;
 }
 
+/** For a bound `name` read at the end of `path`: where a scope that starts at `tokens[k]` and binds its own
+ * `name` ends, or -1. Such a scope is a function's, method's or catch's parameter list with its body when
+ * the parameters (or a function expression's own name) bind it, a block (a function body too) that
+ * declares it, or an arrow whose parameters bind it, with its body. The name in there is that binding,
+ * not the one the read sees; a scope that holds the read is not skipped, so a shadow over the read still
+ * fails. As in boundLocally, a call followed by a block with no `;` between reads as a function head. */
+function shadowing(path, name) {
+  const holders = new Set(path.map(({tokens, index}) => tokens[index]));
+  return (tokens, k) => {
+    const token = tokens[k];
+    let end = -1;
+    if (isPunct(tokens[k + 1], '=>')) end = bindingNames(token).includes(name) ? functionAt(tokens, k + 1).to : -1;
+    else if (token.open === '(' && tokens[k + 1]?.open === '{') end = headNames(tokens, k).includes(name) ? k + 2 : -1;
+    else if (token.open === '{') end = [...headNames(tokens, k), ...declaredNames(token.tokens)].includes(name) ? k + 1 : -1;
+    return end > k && !tokens.slice(k, end).some(inner => holders.has(inner)) ? end : -1;
+  };
+}
+
+/** Words whose parenthesised head is followed by a block that runs where it stands. */
+const STATEMENT_HEADS = new Set(['if', 'for', 'while', 'with', 'switch', 'catch', 'await']);
+
+/** The range of `tokens` that a function or class starting at `tokens[k]` spans, as {from, to}, or null:
+ * a `(...)` and the `{...}` after it (a function declaration or expression, or a method, but not an if,
+ * for, while, with, switch or catch), an arrow's parameters and body (an expression body runs to the
+ * next `,` or `;`), or a class body. Its code runs when it is called, not where it stands. */
+function functionAt(tokens, k) {
+  const token = tokens[k];
+  if (isPunct(token, '=>')) {
+    if (tokens[k + 1]?.open === '{') return {from: k - 1, to: k + 2};
+    let to = k + 1;
+    while (to < tokens.length && !isPunct(tokens[to], ',') && !isPunct(tokens[to], ';')) to += 1;
+    return {from: k - 1, to};
+  }
+  if (token.open !== '{') return null;
+  if (tokens[k - 1]?.open === '(' && !STATEMENT_HEADS.has(tokens[k - 2]?.text)) return {from: k - 1, to: k + 1};
+  return classBody(tokens, k) ? {from: k, to: k + 1} : null;
+}
+
+/** The functions and classes anywhere in `level` (functionAt), as {tokens, from, to}, save those inside a
+ * scope `shadowed` skips (a function whose body alone declares the name keeps its parameters). */
+function functionRanges(level, shadowed = NO_SHADOW) {
+  const ranges = [];
+  const walk = tokens => {
+    for (let k = 0; k < tokens.length; k += 1) {
+      const range = functionAt(tokens, k), token = tokens[k], end = shadowed(tokens, k);
+      if (range) ranges.push({tokens, ...range});
+      if (end > k) { k = end - 1; continue; }
+      for (const inner of token.kind === 'group' ? [token.tokens] : token.substs ?? []) walk(inner);
+    }
+  };
+  walk(level);
+  return ranges;
+}
+
+/** The loop at or after `tokens[start]` whose statement holds `tokens[index]`, as {from, to}, or null: a
+ * for, while or do loop with its head (a for's update runs between passes) and its body. */
+function loopAround(tokens, index, start) {
+  for (let j = start; j < index; j += 1) {
+    let to = -1;
+    if (isWord(tokens[j], 'do')) {
+      to = statementEnd(tokens, j + 1);
+      if (isWord(tokens[to], 'while')) to += 2;
+    } else if (isWord(tokens[j], 'for') || isWord(tokens[j], 'while')) {
+      const head = isWord(tokens[j + 1], 'await') ? j + 2 : j + 1;
+      if (tokens[head]?.open === '(') to = statementEnd(tokens, head + 1);
+    }
+    if (index < to) return {from: j, to};
+  }
+  return null;
+}
+
+/** The first misuse of `name` in code of the block that declares it (`decl`) that can run between the
+ * declaration and the read at the end of `path` without standing between them: a function anywhere in
+ * the block, called at any time (before the declaration or after the read as well); a loop in the block
+ * around the read, whose next pass runs its whole statement before the read again; and, when the read is
+ * itself in a function there, the rest of the block after the declaration. `contexts` is what surrounds
+ * each level of `path` (innerContext). */
+function runsLater(path, decl, name, aliases, contexts, shadowed) {
+  const block = path[decl.frame].tokens;
+  let hit = null, deferred = false;
+  for (let frame = decl.frame; frame < path.length; frame += 1) {
+    const {tokens, index} = path[frame], loop = loopAround(tokens, index, frame === decl.frame ? decl.at + 1 : 0);
+    if (loop) hit ||= firstMisuse(tokens, loop.from, loop.to, name, aliases, contexts[frame], shadowed);
+    deferred ||= tokens.some((token, k) => { const range = functionAt(tokens, k); return Boolean(range) && range.from <= index && index < range.to; });
+  }
+  if (deferred) hit ||= firstMisuse(block, decl.at + 1, block.length, name, aliases, contexts[decl.frame], shadowed);
+  for (const range of functionRanges(block, shadowed)) hit ||= firstMisuse(range.tokens, range.from, range.to, name, aliases, {}, shadowed);
+  return hit;
+}
+
 /** What could change or shadow `name` between its declaration `decl` and the read at the end of `path`:
  * the first misuse in the code between them (an earlier substitution of a template the read is in
- * included), or a function declaration of the name in a level the read sits in, hoisted over it. */
-function changedBetween(path, decl, name) {
-  let hit = firstMisuse(path[decl.frame].tokens, decl.at + 1, path[decl.frame].index, name);
+ * included), or in code that runs between them from elsewhere (runsLater), or a function declaration of
+ * the name in a level the read sits in, hoisted over it. A scope that binds its own `name` and does not
+ * hold the read is not scanned (shadowing). */
+function changedBetween(path, decl, name, aliases) {
+  const contexts = [{}], shadowed = shadowing(path, name);
+  for (let frame = 1; frame < path.length; frame += 1) {
+    const {tokens, index} = path[frame - 1];
+    contexts.push(tokens[index].kind === 'group' ? innerContext(tokens, index, contexts[frame - 1]) : {});
+  }
+  let hit = firstMisuse(path[decl.frame].tokens, decl.at + 1, path[decl.frame].index, name, aliases, contexts[decl.frame], shadowed);
   for (let frame = decl.frame + 1; frame < path.length; frame += 1) {
     const holder = path[frame - 1].tokens[path[frame - 1].index], level = path[frame].tokens;
     for (const prior of holder.kind === 'tpl' ? holder.substs.slice(0, holder.substs.indexOf(level)) : []) {
-      hit ||= firstMisuse(prior, 0, prior.length, name);
+      hit ||= firstMisuse(prior, 0, prior.length, name, aliases, {}, shadowed);
     }
-    hit ||= firstMisuse(level, 0, path[frame].index, name) ||
-      level.find((token, k) => token.kind === 'word' && token.text === name && level[k - 1]?.text === 'function');
+    const hoisted = level.find((token, k) => token.kind === 'word' && token.text === name && level[k - 1]?.text === 'function');
+    hit ||= firstMisuse(level, 0, path[frame].index, name, aliases, contexts[frame], shadowed) || (hoisted && {token: hoisted, why: MISUSE});
   }
-  return hit;
+  return hit || runsLater(path, decl, name, aliases, contexts, shadowed);
+}
+
+/** What a `const` declared by `by` with initialiser `init` aliases: the object its leading member chain
+ * reaches (`response.repair` for `const status = response.repair`), as {root, path, by, skip}; `skip` is
+ * that chain's root token, the alias itself rather than a use of the root. */
+function aliasOf(init, by) {
+  const [root] = init, path = [];
+  for (let j = 1; (isPunct(init[j], '.') || isPunct(init[j], '?.')) && init[j + 1]?.kind === 'word'; j += 2) path.push(init[j + 1].text);
+  return {root: root?.kind === 'word' ? root.text : null, path, by, skip: root};
 }
 
 /** The problem with a recorded template whose expression reads names bound as `bound` lists, if any.
  * Each name must be the nearest enclosing `const` before the read (for a later name, before the previous
- * name's declaration), initialised as listed, and neither changed nor shadowed up to the read. */
+ * name's declaration), initialised as listed, and neither changed nor shadowed up to the read, nor may
+ * what an earlier name aliases through it (`status` is `response.repair`) be. */
 function boundProblems(site, bound) {
-  const path = [...site.path, ...pathTo(site.level, site.token)];
+  const path = [...site.path, ...pathTo(site.level, site.token)], aliases = [];
   let from = path;
   for (const {name, init, is} of bound) {
     const decl = constBefore(from, name), read = `${site.where}: \`${site.template}\` reads ${name}`;
     if (!decl) return [`${read}, which no \`const ${name} = ...\` before it in an enclosing block declares, so its values are unknown`];
     if (!init.test(render(decl.init))) return [`${read} = \`${render(decl.init)}\`, not ${is}, so its values are unknown`];
-    const changed = changedBetween(path, decl, name);
-    if (changed) return [`${read}, which line ${lineOf(site.text, changed)} uses other than as a member read, so it may not hold ${is} there`];
+    const changed = changedBetween(path, decl, name, aliases.filter(alias => alias.root === name));
+    if (changed) return [`${read}, which line ${lineOf(site.text, changed.token)} ${changed.why}, so it may not hold ${is} there`];
+    aliases.push(aliasOf(decl.init, name));
     from = [...path.slice(0, decl.frame), {tokens: path[decl.frame].tokens, index: decl.at}];
   }
   return [];
@@ -503,14 +955,14 @@ function kept(stages, sourceName = 'worker') {
   return sanitizeProgressEvents(events).map(event => event.stage);
 }
 
-test('every stage the extension records has a history label (sanitizeProgressEvents drops unlabelled ones)', () => {
+test('every stage the extension records has a history label (an unlabelled one shows only under the fallback)', () => {
   const {literals, templates, problems, stages} = guardedStages(extensionFiles());
   assert.deepEqual(problems, [], 'every stage argument is a literal the guard can check');
   assert.ok(literals.has('tab_closed') && literals.has('generating') && literals.has('prompt_submitted'),
     'sanity: the scan sees worker, page and composer stages');
   assert.equal(literals.has('preserved'), false, 'a nested call argument is not a stage');
   assert.ok(templates.has('repair_${status.status}'), 'sanity: the scan sees template stages');
-  assert.deepEqual(unlabelled(stages), [], 'recorded stages without a PROGRESS_LABELS entry never reach review history');
+  assert.deepEqual(unlabelled(stages), [], 'recorded stages without a PROGRESS_LABELS entry reach review history only as unlabelled steps');
   assert.deepEqual(kept(stages, 'worker'), stages);
   assert.deepEqual(kept(stages, 'page'), stages);
 });
@@ -573,7 +1025,7 @@ test('a preserve_ cause added only to preserveCauses() fails the guard: the expa
   assert.deepEqual(unlabelled(guardedStages(files('"unknown"')).stages), []);
   assert.deepEqual(unlabelled(guardedStages(files('"staged"')).stages), ['preserve_staged'],
     'a cause the extension can record, labelled nowhere');
-  assert.deepEqual(kept(['preserve_staged']), [], 'its event would be dropped from history');
+  assert.deepEqual(kept(['preserve_staged']).map(progressLabel), ['Unlabelled step · preserve_staged'], 'history would show it only as an unlabelled step');
   assert.throws(() => guardedStages(files('...LEGACY')), /string literals only/);
   assert.throws(() => guardedStages({'background.js': recorder}), /not found in source/, 'no list, no expansion');
   assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `lease_expired_${phase}`);'}),
@@ -649,7 +1101,7 @@ test('preserve_${state.preserveCause} records a listed cause only while every wr
 
 test('a template stage takes its declared list only through a declared expression, not through its prefix', () => {
   // preserveCauses() lists only labelled causes, so expanding by prefix would pass; row.cause is not drawn
-  // from it and can be preserve_staged, which sanitizeProgressEvents drops.
+  // from it and can be preserve_staged, which history shows only as an unlabelled step.
   const causes = 'function preserveCauses() {\n  return ["navigated", "draft", "unknown"];\n}\n';
   const recorded = expression => ({'background.js': `${causes}workerStep(job, provider, \`preserve_\${${expression}}\`);`});
   assert.deepEqual(unlabelled(guardedStages(recorded('state.preserveCause')).stages), []);
@@ -674,6 +1126,20 @@ test('repair_${status.status} takes the RepairStatus values only where status is
   assert.deepEqual(problems(`${REPAIR_REPLY}if (typeof status.id !== "string" || row?.status) return;\nif (ok) {\n  ${record};\n  function helper() {}\n}`), []);
   assert.deepEqual(problems('const response = await api("/api/bridge", {...repairBody(job, provider, "repair", attempt), source}, job.origin);\n' +
     `const status = response.repair;\nif (status?.id && status.runId === attempt.runId) {\n  attempt.id = status.id;\n  ${record};\n}`), []);
+  // Reading values below either name, a method of such a value, and writes elsewhere change neither.
+  assert.deepEqual(problems(`${REPAIR_REPLY}note(response.repair.id, response?.repair?.runId, response.ok, status.status.trim(), [status.id], status.id in row);\n` +
+    `attempt.status = response.repair.status; attempt.repair = {detail: status.status}; row.response.repair = null;\n${record};`), []);
+  // Code after the read runs after it unless a loop or a function brings it back: a write after the read,
+  // a loop after it, functions that only read either name and another block's own status change nothing.
+  assert.deepEqual(problems(`${REPAIR_REPLY}${record};\nstatus.status = "late";\nfor (const row of rows) response.repair.status = row;\n` +
+    'const peek = () => status.status;\nfunction later() { return response.repair.id; }\nif (ok) { const status = {}; status.status = "x"; }'), []);
+  // A scope that binds its own status or response (a parameter, an arrow's, a catch binding, a local
+  // declaration) is another binding than the read's, before the read or after it, nested or not.
+  assert.deepEqual(problems(`${REPAIR_REPLY}${record};\nfunction helper(status) { return status.status; }\nfunction reset(status) { status.status = "local"; }\n` +
+    'function other() { const status = {}; status.status = "local"; }\nfunction outer(response) { return () => { response.repair = null; }; }\n' +
+    'const hooks = {reset(status) { status.status = "local"; }};'), []);
+  assert.deepEqual(problems(`${REPAIR_REPLY}rows.forEach(status => { status.status = "x"; });\ntry { run(); } catch (status) { status.status = "x"; }\n` +
+    `if (ok) { let status = {}; status.status = "x"; }\nfunction helper(status) { status.status = "x"; }\n${record};`), []);
   const reply = REPAIR_REPLY;
   for (const [body, problem] of [
     // Another binding named status, or none.
@@ -708,6 +1174,66 @@ test('repair_${status.status} takes the RepairStatus values only where status is
     [`${reply}with (row) ${record};`, 'line 4 uses'],
     [`${reply}eval(patch);\n${record};`, 'line 4 uses'],
     [`${reply}log(\`\${status.status = "stalled"} \${${record}}\`);`, 'line 4 uses'],
+    // A write anywhere along a chain from the name, the same through parentheses, a pattern or a for head.
+    [`${reply}status.detail.status = "stalled";\n${record};`, 'reads status, which line 4 uses other than as a member read'],
+    [`${reply}(status.status) = "stalled";\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}delete ((status.status));\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}[status.status] = ["stalled"];\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}({late: status.status} = patch);\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for (status.status of ["stalled"]) break;\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for (status.status in row) break;\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for await ((status.status) of rows) break;\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for ((status.status) in row) break;\n${record};`, 'reads status, which line 4 uses'],
+    [`${reply}for ([status.status] in row) break;\n${record};`, 'reads status, which line 4 uses'],
+    // status is the object at response.repair, so a write through that source changes status.status too,
+    // before status is declared as well as after.
+    [`${reply}response.repair.status = "stalled";\n${record};`, 'reads response, which line 4 uses other than as a member read, so it may not hold the bridge'],
+    [`${reply}response.repair.status += "_late";\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}++response.repair.status;\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}response?.repair.status--;\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}delete response.repair.status;\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}response.repair.status ??= "stalled";\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}response.repair = patch;\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}response.repair[key] = "stalled";\n${record};`, 'reads response, which line 4 uses'],
+    [`${reply}[response.repair.status] = ["stalled"];\n${record};`, 'reads response, which line 4 uses'],
+    [reply.replace('\nconst status', '\nresponse.repair.status = "stalled";\nconst status') + `${record};`, 'reads response, which line 3 uses'],
+    // Handing that object on lets other code write it: an argument, an alias, a method call on it.
+    [`${reply}Object.assign(response.repair, patch);\n${record};`,
+      'reads response, which line 4 uses other than as a member read (response.repair holds what status aliases), so it may not hold the bridge'],
+    [`${reply}const alias = response.repair;\nalias.status = "stalled";\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}normalize(response?.repair);\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}response.repair.reset();\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}(response.repair).status = "stalled";\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [reply.replace('\nconst status', '\nObject.assign(response.repair, patch);\nconst status') + `${record};`,
+      'line 3 uses other than as a member read (response.repair holds what status aliases)'],
+    // A tag receives the object its function is read from; an earlier substitution of the read's own
+    // template runs first; a pattern around the read makes the member before it a target.
+    [`${reply}status.fmt\`x\`;\n${record};`, 'reads status, which line 4 uses other than as a member read'],
+    [`${reply}response.repair.fmt\`x\`;\n${record};`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}log(\`\${Object.assign(response.repair, patch)} \${${record}}\`);`, 'line 4 uses other than as a member read (response.repair holds what status aliases)'],
+    [`${reply}[status.status, row[${record}]] = ["stalled", 0];`, 'reads status, which line 4 uses'],
+    // Code that runs between them without standing between them: a function anywhere in the block, called
+    // at any time (declared after the read and hoisted, or before the declarations); a loop around the
+    // read, whose next pass runs its whole statement first; and the rest of the block when the read is
+    // itself in a function.
+    [`${reply}mutate();\n${record};\nfunction mutate() { status.status = "stalled"; }`, 'reads status, which line 6 uses'],
+    [`${reply}mutate();\n${record};\nfunction mutate(late = status.status = "stalled") {}`, 'reads status, which line 6 uses'],
+    [`function mutate() { response.repair.status = "stalled"; }\n${reply}mutate();\n${record};`, 'reads response, which line 2 uses'],
+    [`const mutate = () => response.repair.status = "stalled";\n${reply}mutate();\n${record};`, 'reads response, which line 2 uses'],
+    [`const hooks = {reset() { response.repair = null; }};\n${reply}hooks.reset();\n${record};`, 'reads response, which line 2 uses'],
+    [`class Hooks { static reset() { status.status = "stalled"; } }\n${reply}Hooks.reset();\n${record};`, 'reads status, which line 2 uses'],
+    [`${reply}for (const row of rows) {\n  ${record};\n  response.repair.status = "stalled";\n}`, 'reads response, which line 6 uses'],
+    [`${reply}for (const row of rows) {\n  ${record};\n  status.status = row;\n}`, 'reads status, which line 6 uses'],
+    [`${reply}for (let i = 0; i < 2; status.status = "stalled", i += 1) ${record};`, 'reads status, which line 4 uses'],
+    [`${reply}while (next()) ${record}, status.status = "stalled";`, 'reads status, which line 4 uses'],
+    [`${reply}do {\n  if (ok) ${record};\n  response.repair = patch;\n} while (next());`, 'reads response, which line 6 uses'],
+    [`${reply}setTimeout(() => ${record});\nstatus.status = "stalled";`, 'reads status, which line 5 uses'],
+    [`${reply}const later = () => {\n  ${record};\n};\nresponse.repair = patch;\nlater();`, 'reads response, which line 7 uses'],
+    // A scope that binds another name, or binds the name only in its body, is still the read's binding
+    // around it: a default parameter, a closure in a function with other parameters, another name's write.
+    [`${reply}${record};\nfunction helper(late = status.status = "stalled") { const status = {}; }`, 'reads status, which line 5 uses'],
+    [`${reply}${record};\nfunction outer(row) { return () => { status.status = row; }; }`, 'reads status, which line 5 uses'],
+    [`${reply}${record};\nfunction helper(status) { response.repair.status = status; }`, 'reads response, which line 5 uses'],
   ]) {
     const found = problems(body);
     assert.equal(found.length, 1, `${body}\n: ${found.join('\n')}`);
@@ -782,7 +1308,7 @@ test('a recorder is reached only by its calls: a recorder used as a value, an al
     ['["unlabelled_cb"].forEach(step);', 1, 'step'],
     ['setTimeout(step, 0, "unlabelled_timer");', 1, 'step'],
     ['const record = workerStep;\nrecord(job, provider, "unlabelled_alias");', 1, 'workerStep'],
-    ['const {recordReviewStep: record} = globalThis;\nrecord("unlabelled_alias");', 1, 'recordReviewStep'],
+    ['const {recordReviewStep: record} = api;\nrecord("unlabelled_alias");', 1, 'recordReviewStep'],
     ['workerStep.call(null, job, provider, "unlabelled_call");', 1, 'workerStep'],
     ['\nworkerStep.apply(null, [job, provider, "unlabelled_apply"]);', 2, 'workerStep'],
     ['globalThis.recordReviewStep = stage => post(stage);', 1, 'recordReviewStep'],
@@ -803,6 +1329,138 @@ test('a recorder is reached only by its calls: a recorder used as a value, an al
   // typeof and the declaration's own name are not uses that record; a declaration starts a statement.
   assert.deepEqual(problems('function step(stage) {\n  if (typeof recordReviewStep === "function") recordReviewStep(stage);\n}\nstep("composer_waiting");'), []);
   assert.deepEqual(problems('const ready = true;\nfunction step(stage) {\n  recordReviewStep(stage);\n}\nstep("composer_waiting");'), []);
+});
+
+test('a recorder is reached only by its name: a string naming one, a call through a computed member it cannot read or a computed read of the global object is a problem', () => {
+  const problems = text => recordedStages(text, 'fixture.js').problems;
+  const named = (line, token) => `fixture.js:${line} ${token}: a string naming a recorder can reach it through a computed member or a lookup, so the stages it records there cannot be checked`;
+  const global = (line, token) => `fixture.js:${line} ${token}: the global object, which holds every recorder declared at the top of a script, is read other than by a static member name, so a recorder reached there records stages that cannot be checked`;
+  const called = (line, token) => `fixture.js:${line} ${token}: a call through a computed member whose name the guard cannot read can call a recorder on any object that holds one (the global object holds them all), so the stage it records cannot be checked`;
+  // Every recorder is a top-level function declaration, so a property of the global object: a computed
+  // member reaches it with no recorder-name word, and its stage would go unchecked.
+  for (const [text, ...expected] of [
+    ['globalThis["recordReviewStep"]("unlabelled_computed");', named(1, '"recordReviewStep"')],
+    ['globalThis["workerStep"](job, provider, "unlabelled_computed");', named(1, '"workerStep"')],
+    ['self[`step`]("unlabelled_computed");', named(1, '`step`')],
+    ['window?.[\'workerSt\\x65p\'](job, provider, "unlabelled_computed");', named(1, '\'workerSt\\x65p\'')],
+    ['const record = Reflect.get(api, "recordReviewStep");\nrecord("unlabelled_lookup");', named(1, '"recordReviewStep"')],
+    ['const recorders = {"workerStep": note};', named(1, '"workerStep"')],
+    ['log(`${"st\\u0065p"}`);', named(1, '"st\\u0065p"')],
+    // A line continuation and a legacy octal escape spell a recorder's name too.
+    ['globalThis[\'workerStep\\\n\'](job, provider, "unlabelled_computed");', named(1, '\'workerStep\\\n\'')],
+    ['globalThis["workerSte\\160"](job, provider, "unlabelled_computed");', named(1, '"workerSte\\160"')],
+    // Passed or stored, a recorder's name may reach a lookup the guard cannot see.
+    ['note("step");', named(1, '"step"')],
+    ['const kinds = ["workerStep"];', named(1, '"workerStep"')],
+    // A name the guard cannot read fails closed.
+    ['globalThis[name]("unlabelled_computed");', global(1, 'globalThis'), called(1, '[name]')],
+    ['\nglobalThis?.[name]?.(job, provider, "unlabelled_computed");', global(2, 'globalThis'), called(2, '[name]')],
+    ['globalThis[`record${kind}`]("unlabelled_computed");', global(1, 'globalThis'), called(1, '[`record${kind}`]')],
+    ['globalThis["record" + kind]("unlabelled_computed");', global(1, 'globalThis'), called(1, '["record" + kind]')],
+    ['window.self[name]("unlabelled_computed");', global(1, 'window'), called(1, '[name]')],
+    ['globalThis["window"][name]("unlabelled_computed");', global(1, 'globalThis'), called(1, '[name]')],
+    ['top[name]("unlabelled_computed");', global(1, 'top'), called(1, '[name]')],
+    ['this[name]("unlabelled_computed");', global(1, 'this'), called(1, '[name]')],
+    ['document.defaultView[name]("unlabelled_computed");', global(1, 'defaultView'), called(1, '[name]')],
+    // A document's window however its name is spelled: a string key or a destructured key.
+    ['document["defaultView"][name]("unlabelled_view");', global(1, '["defaultView"]'), called(1, '[name]')],
+    ['const w = document?.[`defaultView`];', global(1, '[`defaultView`]')],
+    ['const {defaultView} = document;\ndefaultView[name](job, provider, "unlabelled_view");', global(1, 'defaultView'), called(2, '[name]')],
+    ['const {defaultView: w} = document;\nw[name]("unlabelled_view");', global(1, 'defaultView'), called(2, '[name]')],
+    ['const {"defaultView": w} = document;', global(1, '"defaultView"')],
+    ['const {["defaultView"]: w} = document;', global(1, '["defaultView"]')],
+    // A parameter pattern, a for head's pattern, a nested pattern and an assignment pattern read it too.
+    ['function f({defaultView}) {}', global(1, 'defaultView')],
+    ['rows.map(({defaultView}) => defaultView);', global(1, 'defaultView')],
+    ['try {} catch ({defaultView}) {}', global(1, 'defaultView')],
+    ['for (const {defaultView} of docs) {}', global(1, 'defaultView')],
+    ['const [{defaultView}] = docs;', global(1, 'defaultView')],
+    ['const {a: {defaultView: w}} = doc;', global(1, 'defaultView')],
+    ['({defaultView} = document);', global(1, 'defaultView')],
+    // The global object as a value can be searched for a recorder by any name.
+    ['const g = globalThis;\ng[name]("unlabelled_alias");', global(1, 'globalThis'), called(2, '[name]')],
+    ['Reflect.get(self, name)("unlabelled_lookup");', global(1, 'self')],
+    ['Object.values(window).forEach(record => record("unlabelled_each"));', global(1, 'window')],
+    ['const {[name]: record} = globalThis;', global(1, 'globalThis')],
+    ['const current = globalThis.window;', global(1, 'globalThis')],
+    // A global name is a local only where the code binds it: not past an arrow's body, outside a sibling
+    // block, a function's parameters or a function expression. A shorthand key reads the name too, and
+    // `this` outside a class body is the global object when its function is called plainly.
+    ['note({parent, id});', global(1, 'parent')],
+    ['rows.map(parent => 0), note(parent);', global(1, 'parent')],
+    ['if (ok) { const top = 1; }\nnote(top);', global(2, 'top')],
+    ['function f(top) {}\nnote(top);', global(2, 'top')],
+    ['const f = function top() {};\nnote(top);', global(2, 'top')],
+    ['function pick(key) {\n  return note(this);\n}', global(2, 'this')],
+    ['class B { top = 1; m() { return note(top); } }', global(1, 'top')],
+    ['const o = {a: ok ? top : 0};', global(1, 'top')],
+    // A for head binds for its loop statement only, however that statement is built.
+    ['for (const top of rows) if (ok) {} note(top);', global(1, 'top')],
+    ['for (const top of rows) if (ok) {} else note(top); note(top);', global(1, 'top')],
+    ['for (const top of rows) while (ok) {} note(top);', global(1, 'top')],
+    ['for (const top of rows) do {} while (ok); note(top);', global(1, 'top')],
+    ['for (const top of rows) try {} catch {} finally {} note(top);', global(1, 'top')],
+    ['for (const top of rows) switch (top) {} note(top);', global(1, 'top')],
+    ['for (const top of rows) next: for (;;) {} note(top);', global(1, 'top')],
+    // The global object arrives as other values too (a method that returns its receiver, an event's
+    // target), so a call through a computed member the guard cannot read fails on any object.
+    ['const name = ["worker", "Step"].join("");\nglobalThis.valueOf()[name](job, provider, "unlabelled_valueof");', called(2, '[name]')],
+    ['self.addEventListener("message", e => e.currentTarget[e.data.fn](job, provider, "unlabelled_event"));', called(1, '[e.data.fn]')],
+    ['e.view[name]?.("unlabelled_event");', called(1, '[name]')],
+    ['e.source?.[name].call(null, "unlabelled_event");', called(1, '[name]')],
+    ['handlers[kind].apply(null, ["unlabelled_apply"]);', called(1, '[kind]')],
+    ['const record = handlers[kind].bind(null);\nrecord("unlabelled_bind");', called(1, '[kind]')],
+    ['Reflect.apply(e.source[name], null, ["unlabelled_reflect"]);', called(1, '[name]')],
+    ['Function.prototype.call.call(handlers[kind], null, "unlabelled_call");', called(1, '[kind]')],
+    ['handlers[kind]`unlabelled_tag`;', called(1, '[kind]')],
+    ['new handlers[kind]("unlabelled_new");', called(1, '[kind]')],
+    ['f()[i](job, provider, "unlabelled_result");', called(1, '[i]')],
+    ['const f = {a: note}[kind](job, provider, "unlabelled_object");', called(1, '[kind]')],
+    // An object literal after a keyword that starts an expression is one too.
+    ['function f() { return {a: note}[kind]("unlabelled_object"); }', called(1, '[kind]')],
+    ['throw {a: note}[kind]("unlabelled_object");', called(1, '[kind]')],
+    ['async function f() { await {a: note}[kind]("unlabelled_object"); }', called(1, '[kind]')],
+    // Through parentheses, whose value the member can be, and through new, which calls what it constructs.
+    ['(e.view[name])("unlabelled_paren");', called(1, '[name]')],
+    ['(0, e.view[name])("unlabelled_comma");', called(1, '[name]')],
+    ['(e.view[name] || note)("unlabelled_either");', called(1, '[name]')],
+    ['Reflect.apply((e.view[name]), null, ["unlabelled_reflect"]);', called(1, '[name]')],
+    ['new e.view[name];', called(1, '[name]')],
+    ['new (e.view?.[name]);', called(1, '[name]')],
+  ]) assert.deepEqual(problems(text), expected, text);
+  assert.deepEqual(problems('const {recordReviewStep: record} = globalThis;'), [
+    'fixture.js:1 recordReviewStep: the recorder is used other than by a call, so the stages it records through that use cannot be checked',
+    global(1, 'globalThis')]);
+  // Static member names, typeof, an object key and another object's properties reach no recorder.
+  assert.deepEqual(problems('window.getComputedStyle(node); globalThis.__ashlarRunnerState = state; globalThis.window?.getComputedStyle(el);\n' +
+    'const saved = globalThis["__ashlarRunnerState"]; if (typeof window === "undefined") note(self.location?.href);\n' +
+    'const box = {top: rect.top, window: 1}; node.parent[key] = rect.top + 1; const view = document.defaultView.innerWidth;\n' +
+    'globalThis.recordReviewStep?.("optional_call"); const doc = "workerStep(job, provider, stage)"; note("steps", "Step");\n' +
+    'note(window.this);'), []);
+  // A key named defaultView that an object literal, a class or a label defines reads no document's window.
+  assert.deepEqual(problems('const local = 1; const options = {defaultView: local}; const defaultView = 1; const more = {defaultView};\n' +
+    'class V { defaultView = 1; } const o = {defaultView() { return 1; }, "defaultView": 2, ["defaultView"]: 3}; f({defaultView: 1});\n' +
+    'function g(opts = {defaultView: 1}) {} if (ok) { defaultView: for (;;) break defaultView; }'), []);
+  // A local of a global name is not the global object: a declaration (a pattern's too), a parameter (an
+  // arrow's, a catch's, a function expression's own name), a for head's declaration, a method's name or
+  // an object key; nor is `this` in a class body.
+  assert.deepEqual(problems('const {top, left} = rect; const frames = []; note(frames, top, left);\n' +
+    'function f(parent) { return parent.id + note(parent); }\nfunction g(parent, id) { return {parent, id}; }\n' +
+    'rows.map(self => note(self)); rows.map((window, i) => note(window, i)); rows.map(({top}) => note(top));\n' +
+    'try { run(); } catch (window) { note(window); }\nfor (const top of rows) note(top);\nfor (const [parent] of rows) { note(parent); }\n' +
+    'for (const top of rows) if (ok) { note(top); } else if (top) note(top); else do note(top); while (ok);\n' +
+    'class A { m(key) { return note(this[key]); } static n() { return this; } }\nconst o = {top() { return 1; }, parent(x) { return x; }};\n' +
+    'const pick = function self(n) { return n ? self(n - 1) : note(self); };\n' +
+    'top: for (const row of rows) { if (row) continue top; break top; }\nclass B { #top = 1; top = 2; static parent; frames; m() { return this.#top; } }'), []);
+  // A recorder's name only compared is a boolean's operand, never a key.
+  assert.deepEqual(problems('if (kind === "step") go(); if ("workerStep" !== row.kind) skip(); ok = kind == `step`;\n' +
+    'switch (kind) { case "recordReviewStep": break; }'), []);
+  // A computed member the guard can read, one that is not called, or an array literal calls no recorder
+  // by a hidden name.
+  assert.deepEqual(problems('handlers["open"](row); rows[0](); const state = job.states[provider]; job.states[provider].runId = id;\n' +
+    'note(job.states[provider], rows[i]); if (ok) [a, b].forEach(note); Reflect.apply(note, null, [rows[i]]); return [a](b);\n' +
+    'const state = (job.states[provider]); note((rows[i]).id, (0, rows[i])); f(a)(rows[i]); new Row(rows[i]); new f()[i];\n' +
+    'if (ok) {}\n[a, b].forEach(note);\nx = y => {};\n[a](b);\nfunction f() {}\n[kind](x);\nif (ok) {} else {}\n[kind](x);'), []);
 });
 
 test('a recorder forwards its stage parameter only when nothing in its body can change or shadow it', () => {
@@ -899,8 +1557,8 @@ test('tab_preserved points at a preserve cause only when the extension records o
     `tab_preserved (${PROGRESS_LABELS.tab_preserved}) points at a preserve cause the extension never records`);
 });
 
-/** The stages the Tab Lease redesign (Phase 1+) records. Labelled before the extension ships them:
- * a stage recorded ahead of its label is dropped by sanitizeProgressEvents for good. */
+/** The stages the Tab Lease redesign (Phase 1+) records. Labelled before the extension ships them, so
+ * history never shows them under the unlabelled fallback. */
 const TAB_LEASE_STAGES = ['tab_lost', 'tab_rekeyed', 'user_touched', 'dom_drift', 'dom_evidence_without_touch',
   'lifecycle_diverged', 'group_expanded', 'preserve_user_input', 'preserve_user_moved', 'preserve_browser_restart',
   ...declaredStages('lease_expired_')];
@@ -913,10 +1571,24 @@ test('the Tab Lease stages have history labels and survive sanitize from either 
   for (const stage of TAB_LEASE_STAGES) assert.ok(PROGRESS_LABELS[stage].trim(), `${stage} has a non-empty label`);
 });
 
-test('the stage allow-list stays closed: a detail suffix or an undeclared phase is still dropped', () => {
-  // The redesign doc writes dom_drift:<kind> and lifecycle_diverged:<ours>/<legacy>; only the bare
-  // stage is a label key, so the detail has to travel outside the stage name.
-  assert.deepEqual(kept(['dom_drift:follow_up', 'lifecycle_diverged:closed/preserved', 'lease_expired_unknown', 'preserve_']), []);
+test('a well-formed stage without a label is kept under the fallback label; a malformed stage is dropped', () => {
+  // The redesign doc writes dom_drift:<kind> and lifecycle_diverged:<ours>/<legacy>; a stage name is
+  // snake_case only, so the detail has to travel outside it. An undeclared phase or an empty cause is a
+  // well-formed name the extension may record ahead of its label: history keeps it and flags it.
+  assert.deepEqual(kept(['dom_drift:follow_up', 'lifecycle_diverged:closed/preserved', 'Tab_lost', 'tab lost', '_tab', '9tab', '', 'tab-lost']), []);
+  const early = ['lease_expired_unknown', 'preserve_', 'tab_woken'];
+  assert.deepEqual(kept(early), early);
+  assert.deepEqual(early.map(progressLabel), early.map(stage => `Unlabelled step · ${stage}`));
+  assert.equal(progressLabel('tab_closed'), PROGRESS_LABELS.tab_closed);
+  assert.deepEqual(kept(['constructor']).map(progressLabel), ['Unlabelled step · constructor'], 'an inherited Object property is not a label');
+});
+
+test('a well-formed page stage the worker forwards is never lost to the server\'s length bound', () => {
+  const bound = Number(source('extension/background.js').match(/\be\.stage\.length\s*<\s*(\d+)/)[1]);
+  const longest = 'a'.repeat(bound - 1);
+  assert.deepEqual(kept([longest], 'page'), [longest]);
+  assert.deepEqual(kept(['a'.repeat(bound)], 'page'), [], 'a stage the worker would not forward is not a stage name');
+  assert.deepEqual(Object.keys(PROGRESS_LABELS).filter(stage => !kept([stage]).length), [], 'every labelled stage is a well-formed stage name');
 });
 
 test('every labelled stage fits the bound the worker puts on page stage names', () => {

@@ -18,6 +18,20 @@ test('observability: trace endpoint rejects a foreign lease and accepts bound su
  assert.ok(app.history.getJob(job.jobId).steps.some(e=>e.stage==='send_unconfirmed'));
  assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===job.jobId).status,'awaiting_chat');
 });
+test('observability: a well-formed stage without a label reaches the lane and history under the fallback; a malformed one is dropped',async t=>{
+ const app=await appFixture({reviewLocal:false});t.after(()=>app.close());const job=await ready(app);
+ const {buildReviewerLanes}=await import('../../src/lib/reviewer-progress.ts');const {stepLabel}=await import('../../src/lib/review-progress.ts');
+ const at=Date.now();
+ const progress={chatgpt:{runId:'run-A',events:[{source:'page',sequence:1,stage:'send_unconfirmed',at},
+   {source:'worker',sequence:1,stage:'tab_woken',at:at+1},{source:'worker',sequence:2,stage:'lifecycle_diverged:closed/preserved',at:at+2}]}};
+ assert.equal((await post(app,{action:'progress',jobId:job.jobId,leaseId:job.leaseId,progress})).ok,true);
+ const live=app.harbor.getHarbor().jobs.find(j=>j.id===job.jobId);
+ assert.equal(live.providerProgress.chatgpt.stage,'tab_woken','the latest well-formed stage is the live one, labelled or not');
+ assert.equal(buildReviewerLanes(live).find(l=>l.provider==='chatgpt').detail,'Unlabelled step · tab_woken');
+ const steps=Array.from(app.history.getJob(job.jobId).steps).filter(e=>e.runId==='run-A');
+ assert.deepEqual(steps.map(e=>e.stage),['send_unconfirmed','tab_woken']);
+ assert.equal(stepLabel(steps[1]),'Unlabelled step · tab_woken');
+});
 test('observability: history requires token and keeps response text out of default metadata',async t=>{
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());const job=await ready(app);
  const noToken=await fetch(app.origin+'/api/history');assert.equal(noToken.status,401);

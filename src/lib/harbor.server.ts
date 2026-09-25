@@ -1113,6 +1113,7 @@ export async function submitHarborChat(
   const rawReview = salvaged?.text;
   // The legs the block holds only in part: the outcome, header and note describe the block as posted.
   const rawTruncated = salvaged?.truncated.length ? salvaged.truncated : undefined;
+  const rawLegs = salvaged?.legs;
   // Only a complete verdict counts (gateLeg), never payload presence or the absence of raw text:
   // that decides both whether local verified and which chat reviewers were clean.
   const structured = [...complete];
@@ -1156,6 +1157,7 @@ export async function submitHarborChat(
     rawReview,
     rawCauses: rawReview ? rawCauses : undefined,
     rawTruncated,
+    rawLegs,
     investigatedSafe: merged.investigatedSafe,
     assumptions: nextAssumptions,
     skippedProviders: skipped,

@@ -1,5 +1,5 @@
-import type { Finding, Job, ReviewProvider, Severity } from "./types.ts";
-import { OUTCOME_SHAPE, postedOutcome, rawCauseText, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
+import type { Finding, Job, RawLeg, ReviewProvider, Severity } from "./types.ts";
+import { OUTCOME_SHAPE, RAW_TRUNCATED_TEXT, postedOutcome, rawCauseText, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
 import { neutralizeMarkers, rawBodyText } from "./review-raw-text.ts";
 
 const BADGE: Record<Severity, string> = {
@@ -68,7 +68,7 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses">>;
+type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs">>;
 
 /** Everything a body helper reads, computed once so every kind renders the same fields the same way. */
 type SummaryParts = {
@@ -99,10 +99,10 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
   };
   switch (outcome) {
     case "findings":
-      return findingsBody(job, parts, findings, username, unanchored);
+      return fitBody(job, parts, findings.length, (p) => findingsBody(job, p, findings, username, unanchored));
     case "raw":
     case "raw-unverified":
-      return rawOnlyBody(parts);
+      return fitBody(job, parts, findings.length, rawOnlyBody);
     case "clean":
     case "verified-clean":
     case "unverified-clean":
@@ -114,6 +114,53 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
       return unhandled;
     }
   }
+}
+
+const RAW_CUT_MARK = "\n\n…(truncated to fit GitHub's review body limit; full original responses retained in review history)";
+
+/** Keep a body with a verbatim block under GitHub's limit. The merge sized the block (salvagedReview),
+ * but the rest of the body (unanchored findings, the note) can still push it over, and capReviewBody
+ * cuts from the end, which lands in the block first while its header still calls it verbatim. So
+ * that cut is made here, inside the block: the rest of the body survives, the block ends in its own
+ * marker, and the replies the cut reaches join rawTruncated for this body. The header names them, and
+ * a local verification reply that did not survive whole is plain `raw`, never "posted verbatim". The
+ * stored note described the block the merge fitted, so a raw body cut further drops it and its header
+ * alone describes the block; a findings note is about findings and stays. */
+function fitBody(job: SummaryJob, parts: SummaryParts, findings: number, render: (p: SummaryParts) => string): string {
+  let body = render(parts);
+  if (body.length <= MAX_REVIEW_BODY || !parts.raw) return capReviewBody(body);
+  const legs = renderedLegEnds(job);
+  let keep = parts.raw.length - (body.length - MAX_REVIEW_BODY) - RAW_CUT_MARK.length;
+  // A pass can only name more replies (a longer header), so one pass per leg is enough.
+  for (let pass = 0; pass <= legs.length + 1; pass += 1) {
+    keep = Math.max(0, keep);
+    const rawTruncated = [...new Set([...(job.rawTruncated ?? []), ...legs.filter((l) => l.end > keep).map((l) => l.provider)])];
+    const outcome = postedOutcome({ ...job, rawTruncated }, findings);
+    // no leg recorded at all: the header still names the cut
+    const unnamed = legs.length || job.rawTruncated?.length ? "" : ` (${RAW_TRUNCATED_TEXT})`;
+    body = render({
+      ...parts,
+      outcome,
+      noteLine: outcome === "findings" ? parts.noteLine : "",
+      raw: `${parts.raw.slice(0, keep)}${RAW_CUT_MARK}`,
+      rawWhy: `${rawCauseText(job.rawCauses, rawTruncated)}${unnamed}`,
+    });
+    if (body.length <= MAX_REVIEW_BODY) return body;
+    keep -= body.length - MAX_REVIEW_BODY;
+  }
+  return capReviewBody(body);
+}
+
+/** Where each salvaged leg ends in the rendered block (SummaryParts.raw), from the merge's rawLegs.
+ * Without a consistent record (a job merged before they were stored) every leg with a stamped cause
+ * counts as reaching the end: a cut then names them all, never calling a reply whole that may not be. */
+function renderedLegEnds(job: SummaryJob): RawLeg[] {
+  const text = job.rawReview ?? "";
+  const lead = text.length - text.trimStart().length;
+  const legs = job.rawLegs ?? [];
+  const valid = legs.length > 0 && legs.at(-1)?.end === text.length && legs.every((l, i) => l.end > lead && (i === 0 || l.end > legs[i - 1].end));
+  if (valid) return legs.map((l) => ({ provider: l.provider, end: rawBodyText(text.slice(lead, l.end)).length }));
+  return (Object.keys(job.rawCauses ?? {}) as ReviewProvider[]).map((provider) => ({ provider, end: Infinity }));
 }
 
 /** The trailing machine marker (the loop's CONVERGED side); an incomplete review carries none. */
@@ -145,10 +192,10 @@ function rawBlock(p: SummaryParts): string {
  * are listed too, so a raw-only body is not mistaken for complete multi-provider coverage. */
 function rawOnlyBody(p: SummaryParts): string {
   const skipNote = p.skipped.length ? `\n${p.skipped.map((s) => `- ${s}`).join("\n")}\n` : "";
-  return capReviewBody(`${REVIEW_SUMMARY_MARK}
+  return `${REVIEW_SUMMARY_MARK}
 ${p.noteLine}${rawBlock(p)}${skipNote}
 **Reviewed commit:** \`${p.sha}\`
-${findingsMarker(p.outcome, [], [])}`);
+${findingsMarker(p.outcome, [], [])}`;
 }
 
 function incompleteBody(p: SummaryParts): string {
@@ -208,7 +255,7 @@ function fallbackReviewersLine(job: SummaryJob, chat: ReviewProvider[], local: b
 
 function findingsBody(job: SummaryJob, p: SummaryParts, findings: Finding[], username: string, unanchored: Finding[]): string {
   const n = countBySeverity(findings);
-  return capReviewBody(`${REVIEW_SUMMARY_MARK}
+  return `${REVIEW_SUMMARY_MARK}
 
 ### 💡 Ashlar Review
 
@@ -234,5 +281,5 @@ Inline comments use P0 / P1 / P2 badges. Failures in one reviewer are skipped; r
 
 — ${neutralizeMarkers(username)}
 ${findingsMarker(p.outcome, findings, unanchored)}
-`);
+`;
 }

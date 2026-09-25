@@ -1,4 +1,4 @@
-import type { Job, RawCause, ReviewProvider } from "./types.ts";
+import type { Job, RawCause, RawLeg, ReviewProvider } from "./types.ts";
 import { PROVIDER_LABEL } from "./types.ts";
 import { localVerifies } from "./local-fallback.ts";
 import { SALVAGE_TRUNCATED_MARK } from "./extract-chat-json.ts";
@@ -63,7 +63,8 @@ const RAW_CAUSE_TEXT: Record<RawCause, string> = {
   "not-a-verdict": "the reply could not be used as a complete structured review",
 };
 
-const TRUNCATED_TEXT = "truncated below to fit GitHub's review body limit, full original in review history";
+/** The clause a raw header adds for a reply the block holds only in part. */
+export const RAW_TRUNCATED_TEXT = "truncated below to fit GitHub's review body limit, full original in review history";
 
 /** Why a review's verbatim block is posted, from the causes its merge stamped (Job.rawCauses): one
  * clause per salvaged leg, labeled with its reviewer when there is more than one. Fixed text only,
@@ -74,10 +75,10 @@ export function rawCauseText(causes: Job["rawCauses"], truncated: readonly Revie
   const rows = Object.entries(causes ?? {}).filter(
     (row): row is [ReviewProvider, RawCause] => Object.hasOwn(PROVIDER_LABEL, row[0]) && Object.hasOwn(RAW_CAUSE_TEXT, String(row[1])),
   );
-  const cut = (p: ReviewProvider) => (truncated.includes(p) ? ` (${TRUNCATED_TEXT})` : "");
+  const cut = (p: ReviewProvider) => (truncated.includes(p) ? ` (${RAW_TRUNCATED_TEXT})` : "");
   // A truncated leg with no recorded cause still gets its clause: the header never hides a cut.
   const unlisted = truncated.filter((p) => !rows.some(([provider]) => provider === p));
-  const tail = unlisted.length ? ` (${TRUNCATED_TEXT})` : "";
+  const tail = unlisted.length ? ` (${RAW_TRUNCATED_TEXT})` : "";
   if (!rows.length) return `a reply could not be used as structured review JSON${tail}`;
   if (rows.length === 1) return `${RAW_CAUSE_TEXT[rows[0][1]]}${cut(rows[0][0])}${tail}`;
   return `${rows.map(([provider, cause]) => `${PROVIDER_LABEL[provider]}: ${RAW_CAUSE_TEXT[cause]}${cut(provider)}`).join("; ")}${tail}`;
@@ -204,11 +205,12 @@ function verificationFindingsNote(input: Parameters<typeof outcomeNote>[1]): str
  * describe the block as posted. Lengths are the body's (rawBodyText), never the reply's own: the body
  * neutralizes each `<!--` / `-->` and rewords the clean sentinel, so a reply that fits by its own
  * length can still overflow the body and be cut there unannounced. The full originals stay in review
- * history. */
+ * history. `legs` is where each leg's piece (its label, reply and any marker) ends in `text`, in block
+ * order, so a body that must cut the block further names exactly the replies the cut reaches. */
 export function salvagedReview(
   legs: ReadonlyArray<{ provider: ReviewProvider; rawReview?: string }>,
   max: number,
-): { text: string; truncated: ReviewProvider[] } | undefined {
+): { text: string; truncated: ReviewProvider[]; legs: RawLeg[] } | undefined {
   const salvaged = legs.filter((l): l is { provider: ReviewProvider; rawReview: string } => Boolean(l.rawReview));
   if (!salvaged.length) return undefined;
   const labeled = salvaged.length > 1;
@@ -218,18 +220,18 @@ export function salvagedReview(
   const lengths = salvaged.map((l) => rawBodyText(l.rawReview).length);
   const shares = fairShares(lengths, Math.max(0, max - frame));
   const truncated: ReviewProvider[] = [];
-  const text = salvaged
-    .map((l, i) => {
-      if (lengths[i] <= shares[i]) {
-        if (l.rawReview.endsWith(SALVAGE_TRUNCATED_MARK.trim())) truncated.push(l.provider);
-        return `${heads[i]}${l.rawReview}`;
-      }
-      truncated.push(l.provider);
-      const whose = labeled ? `${PROVIDER_LABEL[l.provider]} reply truncated` : "truncated";
-      return `${heads[i]}${l.rawReview.slice(0, renderedPrefix(l.rawReview, shares[i]))}\n\n…(${whose} to fit GitHub's review body limit; full original responses retained in review history)`;
-    })
-    .join(SEPARATOR);
-  return { text, truncated };
+  const pieces = salvaged.map((l, i) => {
+    if (lengths[i] <= shares[i]) {
+      if (l.rawReview.endsWith(SALVAGE_TRUNCATED_MARK.trim())) truncated.push(l.provider);
+      return `${heads[i]}${l.rawReview}`;
+    }
+    truncated.push(l.provider);
+    const whose = labeled ? `${PROVIDER_LABEL[l.provider]} reply truncated` : "truncated";
+    return `${heads[i]}${l.rawReview.slice(0, renderedPrefix(l.rawReview, shares[i]))}\n\n…(${whose} to fit GitHub's review body limit; full original responses retained in review history)`;
+  });
+  let end = -SEPARATOR.length;
+  const ends = pieces.map((piece, i) => ({ provider: salvaged[i].provider, end: (end += SEPARATOR.length + piece.length) }));
+  return { text: pieces.join(SEPARATOR), truncated, legs: ends };
 }
 
 /** The longest prefix of `s` whose body rendering (rawBodyText) is at most `room` characters. */

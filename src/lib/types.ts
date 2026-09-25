@@ -117,6 +117,9 @@ export interface Job {
   /** The salvaged legs whose reply rawReview holds only in part (cut to fit GitHub's review body
    * limit). Outcome, header and note describe the block as posted, never the replies before the cut. */
   rawTruncated?: ReviewProvider[];
+  /** Where each salvaged leg's piece ends in rawReview, in block order (salvagedReview). A body that
+   * has to cut the block further to fit GitHub's limit names exactly the replies its cut reaches. */
+  rawLegs?: RawLeg[];
   investigatedSafe: string[];
   assumptions: string[];
   postedReviewId?: string;
@@ -435,6 +438,9 @@ export type LocalReviewRole = "race" | "verify-clean";
  * findings past its row cap aside unread; `not-a-verdict` — a released held local reply the gate
  * could not use in full (docs/local-verify-clean.md §1). */
 export type RawCause = "unparseable" | "unread-rows" | "not-a-verdict";
+
+/** One salvaged leg's place in Job.rawReview: its piece ends at `end` (exclusive). */
+export type RawLeg = { provider: ReviewProvider; end: number };
 
 export const LOCAL_REVIEW_ROLES: LocalReviewRole[] = ["race", "verify-clean"];
 

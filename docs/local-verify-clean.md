@@ -130,6 +130,14 @@ Rules the table encodes:
   a cut local reply is `raw`; the header's clause for a cut leg says `(truncated below …)`, as does
   the loop handoff; and the note says whose replies are posted and which were cut, never "verbatim"
   for a cut one (the late-Grok truncation tests).
+- The rest of the body (unanchored findings, the note) can still push a body with a raw block past
+  GitHub's 65,000 characters, and a cut from the end lands in the block first. The body makes that
+  cut itself, inside the block (`fitBody`): the rest survives, the block ends in its own
+  `…(truncated …)` marker, and the replies the cut reaches, from where the merge recorded each one
+  ends (`Job.rawLegs`), join `rawTruncated` for that body: the header names them, a local
+  verification reply that did not survive whole is plain `raw`, and a raw body drops the merge's note
+  (written for the block before the cut). Without recorded legs every reply with a stamped cause
+  counts as cut.
 - `unverified=1` is never CONVERGED, and only `clean` / `verified-clean` print the clean sentinel.
   `postedOutcome` renders a `verify` that somehow reaches the poster as `unverified-clean`.
 - Local as the chat-down fallback is an ordinary reviewer, the same as race: chat that returned no

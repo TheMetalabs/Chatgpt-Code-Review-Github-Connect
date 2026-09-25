@@ -486,6 +486,11 @@ for(const [name,local] of Object.entries(TRUNCATED_LOCAL)){
     assert.ok(raw.includes('LOCAL-RAW'),'local verification\'s reply is in the block, never crowded out');
     assert.equal(raw.includes(local.reply),local.localInFull,'local\'s reply is whole iff it fits its share');
     assert.deepEqual([...(job().rawTruncated??[])],local.localInFull?['grok']:['grok','local']);
+    // where each reply ends in the block, so a body cut further names exactly whose
+    const legs=job().rawLegs??[];
+    assert.deepEqual([...legs.map(l=>l.provider)],['grok','local']);
+    assert.equal(legs[1].end,job().rawReview.length);
+    assert.match(job().rawReview.slice(0,legs[0].end),/…\(Grok reply truncated[^)]*\)$/);
     assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],local.marker);
     assert.equal(converged(body),false);
     const handoff=notCleanDetail(job(),postedOutcome(job(),0));

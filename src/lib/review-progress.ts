@@ -52,6 +52,23 @@ export const PROGRESS_LABELS = {
     error: "Provider or submission reported an explicit error",
     local_queued: "Local LLM request sent · waiting in the model queue (server alive, no output yet)",
     local_generating: "Local LLM generating output",
+    // Tab Lease (Phase 1+). Labelled ahead of the extension: a stage without a label is dropped.
+    tab_lost: "Tab lost · it disappeared without Ashlar closing it (vanished, creation unknown or browser restart)",
+    tab_rekeyed: "Browser replaced the tab's ID · the lease follows the new ID",
+    user_touched: "User input on the tab · it is the user's now; Ashlar will not type, send or close it",
+    dom_drift: "Page changed without user input · diagnostic only; the tab stays Ashlar's",
+    dom_evidence_without_touch: "Shadow check · legacy kept the tab on page evidence, but no user input was recorded",
+    lifecycle_diverged: "Shadow check · tab lease and legacy cleanup reached different verdicts",
+    preserve_user_input: "Tab preserved · the user typed, clicked, pasted or dropped something in it",
+    preserve_user_moved: "Tab preserved · the user moved it out of the Ashlar group or window, or pinned it",
+    preserve_browser_restart: "Tab preserved · the browser restarted mid-run; Ashlar no longer messages or closes it",
+    group_expanded: "Ashlar tab group re-expanded · a collapsed group can freeze a live run",
+    lease_expired_creating: "Lease expired while creating the tab · creation outcome unknown",
+    lease_expired_opening: "Lease expired while opening · the page never became ready; run stopped",
+    lease_expired_sending: "Lease expired before the send was confirmed · run stopped; no resend in this tab",
+    lease_expired_generating: "Lease expired while generating · no progress or past the deadline; run stopped",
+    lease_expired_answered: "Answer lease expired · tab released; the local outbox keeps delivering",
+    lease_expired_releasing: "Release lease expired · tab closed if never shown, otherwise preserved",
 } as const;
 export type ProgressStage = keyof typeof PROGRESS_LABELS;
 export type ProgressEvent = {

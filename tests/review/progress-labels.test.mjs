@@ -60,7 +60,11 @@ function unionMembers(path, name) {
 const TEMPLATE_STAGES = {
   repair_: unionMembers('src/lib/json-repair-types.ts', 'RepairStatus'),
   // Tab release (#82): finishTabCleanup records preserve_<cause> just before tab_preserved.
-  preserve_: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown'],
+  preserve_: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown',
+    // Tab Lease (Phase 1+): the takeover and restart causes of a preserved tab.
+    'user_input', 'user_moved', 'browser_restart'],
+  // Tab Lease (Phase 1+): a lease that runs out records lease_expired_<phase>.
+  lease_expired_: ['creating', 'opening', 'sending', 'generating', 'answered', 'releasing'],
 };
 
 function expandTemplate(template) {
@@ -111,4 +115,30 @@ test('the tab-release (#82) stages have history labels and survive sanitize', ()
 
 test('tab_preserved names no cause of its own: the worker preserves for non-user reasons too, and preserve_<cause> carries why', () => {
   assert.doesNotMatch(PROGRESS_LABELS.tab_preserved, /user|repurpos/i);
+});
+
+/** The stages the Tab Lease redesign (Phase 1+) records. Labelled before the extension ships them:
+ * a stage recorded ahead of its label is dropped by sanitizeProgressEvents for good. */
+const TAB_LEASE_STAGES = ['tab_lost', 'tab_rekeyed', 'user_touched', 'dom_drift', 'dom_evidence_without_touch',
+  'lifecycle_diverged', 'group_expanded', 'preserve_user_input', 'preserve_user_moved', 'preserve_browser_restart',
+  ...expandTemplate('lease_expired_${phase}')];
+
+test('the Tab Lease stages have history labels and survive sanitize from either source', () => {
+  assert.equal(TAB_LEASE_STAGES.length, 16);
+  assert.deepEqual(unlabelled(TAB_LEASE_STAGES), []);
+  assert.deepEqual(kept(TAB_LEASE_STAGES, 'worker'), TAB_LEASE_STAGES);
+  assert.deepEqual(kept(TAB_LEASE_STAGES, 'page'), TAB_LEASE_STAGES);
+  for (const stage of TAB_LEASE_STAGES) assert.ok(PROGRESS_LABELS[stage].trim(), `${stage} has a non-empty label`);
+});
+
+test('the stage allow-list stays closed: a detail suffix or an undeclared phase is still dropped', () => {
+  // The redesign doc writes dom_drift:<kind> and lifecycle_diverged:<ours>/<legacy>; only the bare
+  // stage is a label key, so the detail has to travel outside the stage name.
+  assert.deepEqual(kept(['dom_drift:follow_up', 'lifecycle_diverged:closed/preserved', 'lease_expired_unknown', 'preserve_']), []);
+});
+
+test('every labelled stage fits the bound the worker puts on page stage names', () => {
+  const bound = source('extension/background.js').match(/\be\.stage\.length\s*<\s*(\d+)/);
+  assert.ok(bound, 'the worker bounds the length of a page-reported stage');
+  assert.deepEqual(Object.keys(PROGRESS_LABELS).filter(stage => stage.length >= Number(bound[1])), []);
 });

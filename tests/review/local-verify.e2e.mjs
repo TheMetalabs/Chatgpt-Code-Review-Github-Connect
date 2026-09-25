@@ -48,6 +48,24 @@ test('verify-clean: the first unparseable reply is kept as evidence even when th
   assert.equal(converged(body),false);
 });
 
+test('verify-clean multi-turn: residual text past the posted raw cap is archived whole in review history',async t=>{
+  const {app,jobId}=await setup(t,'verify-clean',{localJsonRepairEnabled:false,localReviewMode:'multiturn'});
+  await app.harbor.submitHarborChat(jobId,clean);
+  await eventually(()=>app.localRequests.length===1,'clean chat did not start local verification');
+  // one group's accepted reply: a clean review JSON object after >60,000 chars of prose whose finding
+  // marker sits past the posted raw_review cap
+  const prose='P1 a.ts:1 a duplicate request writes twice. '+'x'.repeat(70_000)+' RESIDUAL-TAIL-MARK: the second write';
+  app.localResponses[0].end(reply(`${prose}\n${clean}`));
+  await eventually(()=>app.reviews.length===1,'the review was not posted');
+  const body=app.reviews[0].body;
+  assert.ok(body.includes(REVIEW_RAW_START)&&body.includes('P1 a.ts:1 a duplicate request'),'the residual is posted as evidence');
+  assert.equal(body.includes('RESIDUAL-TAIL-MARK'),false,'the posted raw block is capped');
+  assert.equal(converged(body),false);
+  const archived=app.history.getJob(jobId,true);
+  const kept=[archived.observations?.local?.text,archived.responses?.local?.original].filter(Boolean).join('\n');
+  assert.ok(kept.includes('RESIDUAL-TAIL-MARK'),'review history keeps the uncapped residual reply');
+});
+
 test('race (default): local still starts with the chat leg',async t=>{
   const {app,job}=await setup(t,'race');
   assert.equal(job().localReviewRole,'race');

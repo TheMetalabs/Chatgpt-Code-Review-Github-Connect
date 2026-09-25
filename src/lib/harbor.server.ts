@@ -863,8 +863,13 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     const local = await generateLocalLeg(jobId, prompt);
     try {
       reviewHistory().recordServerStep(jobId,local.ok?"local.response_received":"local.failed");
-      // Every completed reply that was not review JSON is archived, including one a later reply replaced.
-      const unparsed = local.ok ? local.unparsedText?.trim() : localReplies(local);
+      // Every completed reply the leg's JSON does not carry is archived whole: one that was not review
+      // JSON (including one a later reply replaced), and one whose accepted JSON left text outside it.
+      // The posted evidence is capped, so this is where the rest of it lives. A multi-turn leg has no
+      // originalText, so recordResponse never sees its replies; a single-turn residual reply IS its
+      // originalText, which recordResponse archives, so it is not repeated here.
+      const residual = local.ok && local.residualReplies !== local.originalText ? local.residualReplies : undefined;
+      const unparsed = local.ok ? localReplies({ unparsedText: local.unparsedText, residualReplies: residual }) : localReplies(local);
       if(unparsed)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,unparsed,unparsed.length,unparsed.length>128_000);
     } catch { /* metadata storage failure is visible without starting another model */ }
     if (!local.ok) {

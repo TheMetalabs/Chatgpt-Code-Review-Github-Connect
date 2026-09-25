@@ -179,6 +179,58 @@ function recorderCall(level, k) {
 const startsStatement = (level, k, container) => (!container || container.open === '{') &&
   (k === 0 || isPunct(level[k - 1], ';') || level[k - 1].kind === 'group');
 
+const SINGLE_ESCAPES = {b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v'};
+
+/** A string literal's value from its source between the quotes: `"workerSt\x65p"` is "workerStep". */
+function stringValue(raw) {
+  return raw.replace(/\\(?:u\{([\da-f]+)\}|u([\da-f]{4})|x([\da-f]{2})|([0-3][0-7]{0,2}|[4-7][0-7]?)|(\r\n|[\s\S]))/gi,
+    (_, braced, four, two, octal, other) => (braced ?? four ?? two) ? String.fromCodePoint(parseInt(braced ?? four ?? two, 16))
+      : octal ? String.fromCharCode(parseInt(octal, 8)) : /^[\r\n\u2028\u2029]/.test(other) ? '' : SINGLE_ESCAPES[other] ?? other);
+}
+
+/** The value of a string literal or a template literal without substitutions, else undefined. */
+const literalValue = token => token?.kind === 'str' || (token?.kind === 'tpl' && !token.substs.length) ? stringValue(token.value) : undefined;
+
+/** Names whose value is the global object. A recorder declared at the top of a script is a property of it. */
+const GLOBAL_NAMES = new Set(['globalThis', 'self', 'window', 'frames', 'top', 'parent', 'this']);
+
+/** Whether `level[k]` refers to the global object: one of GLOBAL_NAMES that is not a property name or an
+ * object key, or a `.defaultView` property (a document's window). */
+function globalReference(level, k, container) {
+  const token = level[k], before = level[k - 1];
+  if (token.kind !== 'word') return false;
+  if (isPunct(before, '.') || isPunct(before, '?.')) return token.text === 'defaultView';
+  const key = container?.open === '{' && (k === 0 || isPunct(before, ',')) && isPunct(level[k + 1], ':');
+  return GLOBAL_NAMES.has(token.text) && !key;
+}
+
+/** Whether the global object at `level[k]` is read only by a static member name (`globalThis.x`,
+ * `window?.["x"]`, on through `.window`, `.self` and the like) or by typeof. A computed name can be any
+ * recorder's, and the object as a value (an alias, an argument, a destructuring source) can be searched
+ * for one. */
+function staticGlobalRead(level, k) {
+  for (let j = k + 1; ; ) {
+    const dot = isPunct(level[j], '.') || isPunct(level[j], '?.'), member = dot ? level[j + 1] : level[j];
+    const computed = member?.open === '[';
+    const name = computed ? (member.tokens.length === 1 ? literalValue(member.tokens[0]) : undefined) : dot && member?.kind === 'word' ? member.text : undefined;
+    if (name === undefined) return !computed && level[k - 1]?.text === 'typeof';
+    if (!GLOBAL_NAMES.has(name) || name === 'this') return true;
+    j += dot ? 2 : 1;
+  }
+}
+
+/** Why `level[k]` reaches a recorder by a name the tokens never spell as one, or null: a string whose
+ * value is a recorder's name (`globalThis["workerStep"]`, `Reflect.get(self, "step")`), or the global
+ * object read other than by a static member name (`globalThis[name]`). */
+function reachedByName(level, k, container) {
+  const token = level[k], value = literalValue(token);
+  if (value !== undefined) {
+    return Object.hasOwn(RECORDERS, value) ? 'a string naming a recorder can reach it through a computed member or a lookup, so the stages it records there cannot be checked' : null;
+  }
+  if (!globalReference(level, k, container) || staticGlobalRead(level, k)) return null;
+  return 'the global object, which holds every recorder declared at the top of a script, is read other than by a static member name, so a recorder reached there records stages that cannot be checked';
+}
+
 /** Names that reach a binding without naming it: a sloppy-mode `arguments[i] = x` rebinds a parameter,
  * and eval and with can reassign or shadow one. */
 const INDIRECT = new Set(['arguments', 'eval', 'with']);
@@ -230,7 +282,9 @@ function recorderBodies(tokens) {
  * Calls are found in the tokens, so a comment or a string is never one, and one is never hidden by a
  * comment or a regex before it. A file the tokenizer cannot read is itself a problem. So is any other
  * use of a recorder's name than a call, its function declaration or `typeof name`: a recorder passed as
- * a value, aliased, or called through .call or .apply records a stage no call here shows. */
+ * a value, aliased, or called through .call or .apply records a stage no call here shows. So is a way to
+ * reach a recorder without its name as a word (reachedByName): a string that names it, or a computed
+ * read of the global object. */
 function recordedStages(text, file = 'source') {
   const found = {literals: new Set(), templates: new Set(), sites: [], problems: []};
   let tokens;
@@ -240,6 +294,8 @@ function recordedStages(text, file = 'source') {
   }
   const bodies = recorderBodies(tokens);
   walkTokens(tokens, (token, level, k, container, path) => {
+    const reached = reachedByName(level, k, container);
+    if (reached) return found.problems.push(`${file}:${lineOf(text, token)} ${token.text}: ${reached}`);
     if (token.kind !== 'word' || !Object.hasOwn(RECORDERS, token.text)) return;
     const group = recorderCall(level, k), before = level[k - 1];
     const where = `${file}:${lineOf(text, token)} ${token.text}`;
@@ -782,7 +838,7 @@ test('a recorder is reached only by its calls: a recorder used as a value, an al
     ['["unlabelled_cb"].forEach(step);', 1, 'step'],
     ['setTimeout(step, 0, "unlabelled_timer");', 1, 'step'],
     ['const record = workerStep;\nrecord(job, provider, "unlabelled_alias");', 1, 'workerStep'],
-    ['const {recordReviewStep: record} = globalThis;\nrecord("unlabelled_alias");', 1, 'recordReviewStep'],
+    ['const {recordReviewStep: record} = api;\nrecord("unlabelled_alias");', 1, 'recordReviewStep'],
     ['workerStep.call(null, job, provider, "unlabelled_call");', 1, 'workerStep'],
     ['\nworkerStep.apply(null, [job, provider, "unlabelled_apply"]);', 2, 'workerStep'],
     ['globalThis.recordReviewStep = stage => post(stage);', 1, 'recordReviewStep'],
@@ -803,6 +859,47 @@ test('a recorder is reached only by its calls: a recorder used as a value, an al
   // typeof and the declaration's own name are not uses that record; a declaration starts a statement.
   assert.deepEqual(problems('function step(stage) {\n  if (typeof recordReviewStep === "function") recordReviewStep(stage);\n}\nstep("composer_waiting");'), []);
   assert.deepEqual(problems('const ready = true;\nfunction step(stage) {\n  recordReviewStep(stage);\n}\nstep("composer_waiting");'), []);
+});
+
+test('a recorder is reached only by its name: a string naming one or a computed read of the global object is a problem', () => {
+  const problems = text => recordedStages(text, 'fixture.js').problems;
+  const named = (line, token) => `fixture.js:${line} ${token}: a string naming a recorder can reach it through a computed member or a lookup, so the stages it records there cannot be checked`;
+  const global = (line, token) => `fixture.js:${line} ${token}: the global object, which holds every recorder declared at the top of a script, is read other than by a static member name, so a recorder reached there records stages that cannot be checked`;
+  // Every recorder is a top-level function declaration, so a property of the global object: a computed
+  // member reaches it with no recorder-name word, and its stage would go unchecked.
+  for (const [text, problem] of [
+    ['globalThis["recordReviewStep"]("unlabelled_computed");', named(1, '"recordReviewStep"')],
+    ['globalThis["workerStep"](job, provider, "unlabelled_computed");', named(1, '"workerStep"')],
+    ['self[`step`]("unlabelled_computed");', named(1, '`step`')],
+    ['window?.[\'workerSt\\x65p\'](job, provider, "unlabelled_computed");', named(1, '\'workerSt\\x65p\'')],
+    ['const record = Reflect.get(api, "recordReviewStep");\nrecord("unlabelled_lookup");', named(1, '"recordReviewStep"')],
+    ['const recorders = {"workerStep": note};', named(1, '"workerStep"')],
+    ['log(`${"st\\u0065p"}`);', named(1, '"st\\u0065p"')],
+    // A name the guard cannot read fails closed.
+    ['globalThis[name]("unlabelled_computed");', global(1, 'globalThis')],
+    ['\nglobalThis?.[name]?.(job, provider, "unlabelled_computed");', global(2, 'globalThis')],
+    ['globalThis[`record${kind}`]("unlabelled_computed");', global(1, 'globalThis')],
+    ['globalThis["record" + kind]("unlabelled_computed");', global(1, 'globalThis')],
+    ['window.self[name]("unlabelled_computed");', global(1, 'window')],
+    ['globalThis["window"][name]("unlabelled_computed");', global(1, 'globalThis')],
+    ['top[name]("unlabelled_computed");', global(1, 'top')],
+    ['this[name]("unlabelled_computed");', global(1, 'this')],
+    ['document.defaultView[name]("unlabelled_computed");', global(1, 'defaultView')],
+    // The global object as a value can be searched for a recorder by any name.
+    ['const g = globalThis;\ng[name]("unlabelled_alias");', global(1, 'globalThis')],
+    ['Reflect.get(self, name)("unlabelled_lookup");', global(1, 'self')],
+    ['Object.values(window).forEach(record => record("unlabelled_each"));', global(1, 'window')],
+    ['const {[name]: record} = globalThis;', global(1, 'globalThis')],
+    ['const current = globalThis.window;', global(1, 'globalThis')],
+  ]) assert.deepEqual(problems(text), [problem], text);
+  assert.deepEqual(problems('const {recordReviewStep: record} = globalThis;'), [
+    'fixture.js:1 recordReviewStep: the recorder is used other than by a call, so the stages it records through that use cannot be checked',
+    global(1, 'globalThis')]);
+  // Static member names, typeof, an object key and another object's properties reach no recorder.
+  assert.deepEqual(problems('window.getComputedStyle(node); globalThis.__ashlarRunnerState = state; globalThis.window?.getComputedStyle(el);\n' +
+    'const saved = globalThis["__ashlarRunnerState"]; if (typeof window === "undefined") note(self.location?.href);\n' +
+    'const box = {top: rect.top, window: 1}; node.parent[key] = rect.top + 1; const view = document.defaultView.innerWidth;\n' +
+    'globalThis.recordReviewStep?.("optional_call"); const doc = "workerStep(job, provider, stage)"; note("steps", "Step");'), []);
 });
 
 test('a recorder forwards its stage parameter only when nothing in its body can change or shadow it', () => {

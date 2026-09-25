@@ -55,15 +55,25 @@ Rules the table encodes:
   every finding it reported inspected and intact (`LiveGateResult.overflow` is 0: no row past the
   gate's `GATED_FINDINGS_CAP` rows went unread; `malformed` is 0), and no completed reply was set
   aside to get it: the one JSON correction never sees the first reply, so a clean correction says
-  nothing about the finding that first reply may carry (`unparsedText`). Nor may any text of the reply
-  itself be set aside: when canonicalizing a completed reply to its review JSON discards substantive
+  nothing about the finding that first reply may carry (`unparsedText`). Nor may any text of a local
+  reply itself be set aside: when canonicalizing a completed reply to its review JSON discards substantive
   text around the object (`extractChatJsonParts`; whitespace and the one complete code fence wrapping the
   object do not count — any run of three or more backticks or tildes, closed by a run of the same
   character at least as long, or left open with nothing after the object (CommonMark closes it at the
   end of the reply), and a bare fence line that is the only text after the object (an empty block) —
   while any other fence marker is kept as text; cells `clean × fencedClean`, `clean × unclosedFence`), the
   reply is kept verbatim (`residualReplies`, one-shot and multi-turn alike) and the object is not a
-  verdict — prose before a clean object can be the finding. A reply that lost a finding for its shape
+  verdict — prose before a clean object can be the finding. These two reply-text rules (`unparsedText`,
+  `residualReplies`) are local-only, because only a local leg's reply is the model's own completion
+  text. A chat leg's verdict is the review JSON its client submits: the Chrome extension picks that
+  object out of the page (the turn's last review object) and sends the turn capture beside it as
+  `originalText`, and that capture carries rendered code-block labels (`json` above the object),
+  reasoning summaries and other page text the model did not write as its reply. The server cannot
+  tell dropped prose from page text there, nor in a chat reply submitted as text (a paste, the
+  bridge's own canonicalization), so it archives that text in review history (`recordResponse`) and
+  does not judge it; judging it would make every rendered ChatGPT reply evidence. The gate rules
+  (rejection, a finding dropped for its shape, unread rows) apply to chat and local alike. The
+  chat-capture scope tests pin this. A reply that lost a finding for its shape
   or left one unread, or had a reply or text set aside, is gated as evidence instead (`verdictEvidence`
   in `submitHarborChat`): whatever parsed, plus every completed reply verbatim as the raw block, with
   `<provider>: <why> (reply posted verbatim)` among the assumptions. A reply the gate rejects (for

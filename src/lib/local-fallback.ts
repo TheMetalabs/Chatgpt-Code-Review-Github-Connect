@@ -142,8 +142,11 @@ export function heldLocalReleased(
  * did not return a clean result. No completed reply may have been set aside to get it: the JSON
  * correction does not see the first reply, so a clean correction says nothing about the finding that
  * reply may carry. Nor may any text of the reply itself be set aside: prose the model wrote outside
- * the accepted JSON object (`residualReplies`) can be a finding that object does not carry. Every row
- * it reported must have been inspected, too: a finding past the gate's row cap (`overflow`) was set
+ * the accepted JSON object (`residualReplies`) can be a finding that object does not carry. Those two
+ * reply-text inputs are local-only: only a local leg's reply is the model's own completion text. A
+ * chat leg's verdict is the JSON its client submitted; the page capture around it (rendered labels,
+ * reasoning summaries, page text) is archived as originalText, never judged here. Every row it
+ * reported must have been inspected, too: a finding past the gate's row cap (`overflow`) was set
  * aside unread. A reply the gate rejected is no verdict at all. */
 export function incompleteVerdict(
   gate: { ok: true; malformed?: number; overflow?: number; rawReview?: string } | { ok: false; reason: string },

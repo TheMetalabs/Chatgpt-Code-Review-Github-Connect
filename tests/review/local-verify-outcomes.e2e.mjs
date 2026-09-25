@@ -440,3 +440,40 @@ for(const [name,grok] of Object.entries(LATE_GROK)){
     assert.match(handoff,/^posted verbatim: /);
   });
 }
+
+// Scope of the residual-text rule (docs §1): it is local-only. A chat leg's verdict is the review JSON
+// its client submits. The extension picks that object out of the page and sends the turn capture
+// beside it (originalText): rendered code-block labels, reasoning summaries and page text the server
+// cannot tell from prose, so the capture is archived in review history and never judged. Text around
+// the JSON of a chat reply submitted as text is archived the same way. If this scope changes, the
+// docs change with it.
+const CAPTURE='Thought for 12s\nP1 a.ts:1 CAPTURE-PROSE: a duplicate request writes twice\njson\n'+cleanJson;
+const CHAT_SHAPES={
+  // what the extension sends: the harvested object, the page capture beside it
+  'page capture':{raw:cleanJson,originalText:CAPTURE},
+  // a reply submitted as text: the bridge canonicalizes it to its object
+  'submitted reply text':{raw:'P1 a.ts:1 CAPTURE-PROSE: a duplicate request writes twice\n```json\n'+cleanJson+'\n```'},
+};
+for(const role of ['race','verify-clean'])for(const [shape,leg] of Object.entries(CHAT_SHAPES)){
+  test(`${role} outcome: a chat leg's verdict is the JSON it submitted; the ${shape} around it is archived, not judged`,async t=>{
+    const app=await appFixture({localReviewRole:role,localJsonRepairEnabled:false});t.after(()=>app.close());
+    app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+    const out=await app.mention(`scope-chat-capture-${role}-${shape.replace(/ /g,'-')}`);
+    const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+    await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+    app.bridge.bridgeHeartbeat();
+    const take=app.bridge.takeNextBridgeJob('scope-client');
+    assert.equal((await app.bridge.completeBridgeJob(out.jobId,leg.raw,[{provider:'chatgpt',...leg}],take.leaseId)).ok,true);
+    let answered=0;
+    await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(envelope(cleanJson));return app.reviews.length===1;},'the review was not posted');
+    const body=app.reviews[0].body;
+    assert.equal(app.localRequests.length,1,role==='race'?'local raced':'the chat verdict started the verification round');
+    assert.equal(body.split('\n')[0],CLEAN,'the submitted JSON is the chat verdict');
+    assert.equal(converged(body),true);
+    assert.deepEqual([...(job().incompleteProviders??[])],[]);
+    assert.doesNotMatch(body,/CAPTURE-PROSE/,'the capture is not posted as evidence');
+    const archived=app.history.getJob(out.jobId,true).responses.chatgpt;
+    assert.ok(archived.original.includes('CAPTURE-PROSE'),'the whole reply is archived in review history');
+    assert.equal(archived.json,cleanJson);
+  });
+}

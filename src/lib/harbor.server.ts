@@ -1168,8 +1168,9 @@ export async function submitHarborChat(
 /** Gate one reviewer leg and decide its complete-verdict state (docs/local-verify-clean.md §1). Every
  * leg, chat or local, race or verify-clean: a reply is its reviewer's verdict only when it passed the
  * gate with nothing set aside (incompleteVerdict: no finding dropped for its shape or left unread past
- * the row cap, no completed reply or text around the accepted JSON discarded to get it) and was not
- * salvaged verbatim. Any other reply is gated as evidence instead (verdictEvidence): what parsed, plus
+ * the row cap, and for a local leg no completed reply or text around the accepted JSON discarded to
+ * get it; a chat leg's verdict is the JSON its client submitted, its page capture archived, not
+ * judged) and was not salvaged verbatim. Any other reply is gated as evidence instead (verdictEvidence): what parsed, plus
  * its complete text verbatim, so it posts and nothing it reported is lost. A reply the gate rejects
  * outright becomes evidence only with `rejectedEvidence` (the caller decides: see submitHarborChat).
  * `cause` says why a leg posts verbatim: a reply salvaged before the gate (the bridge's, or a failed

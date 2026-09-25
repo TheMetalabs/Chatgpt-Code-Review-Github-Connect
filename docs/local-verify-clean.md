@@ -82,6 +82,13 @@ Rules the table encodes:
   as one system line. It is never inferred from assumptions, which also carry the reviewers' own
   free text: a clean review assuming "generated fixtures were skipped" stays `clean` /
   `verified-clean` and CONVERGED, on race and verify-clean alike (rows R3, L15).
+- The verification note (`outcomeNote`) credits every finding to the reviewer whose gated reply
+  carried it: the merge passes each reviewer's accepted finding count (`findingsBy`). A chat run that
+  started before the round can land during it, so with findings in a verification round the note
+  reads e.g. `chatgpt found nothing; grok found 1; local verification found nothing.` — local is
+  credited only with its own, a pinned clean chat reviewer is called clean only while it reports none,
+  and with no reviewer to credit the wording is provider-neutral (`… the review found N.`). The late
+  Grok test pins it.
 - `unverified=1` is never CONVERGED, and only `clean` / `verified-clean` print the clean sentinel.
   `postedOutcome` renders a `verify` that somehow reaches the poster as `unverified-clean`.
 - Local as the chat-down fallback is an ordinary reviewer, the same as race: chat that returned no

@@ -100,10 +100,19 @@ export function postedOutcome(job: OutcomeJob, findings: number): PostedOutcome 
 }
 
 /** The review/ops line naming which reviewer produced a verification round's result. `chat` is
- * only the chat reviewers whose structured result was clean (a skipped one found nothing by absence). */
+ * only the chat reviewers whose structured result was clean (a skipped one found nothing by absence).
+ * `findingsBy` is each merged reviewer's accepted (gated) finding count, so findings are attributed to
+ * the reviewer that reported them. */
 export function outcomeNote(
   outcome: ReviewOutcome,
-  input: { chat: readonly ReviewProvider[]; verifying: boolean; findings: number; localError?: string; localVerified?: boolean },
+  input: {
+    chat: readonly ReviewProvider[];
+    verifying: boolean;
+    findings: number;
+    findingsBy: Partial<Record<ReviewProvider, number>>;
+    localError?: string;
+    localVerified?: boolean;
+  },
 ): string {
   const chat = input.chat.join(" + ") || "chat";
   if (outcome === "verified-clean") return `${chat} found nothing; local verification agreed.`;
@@ -114,7 +123,7 @@ export function outcomeNote(
       ? `${chat} found nothing; local verification agreed.`
       : `${chat} found nothing; local verification did not complete (${input.localError || "unavailable"}).`;
   }
-  if (outcome === "findings" && input.verifying) return `${chat} found nothing; local verification found ${input.findings}.`;
+  if (outcome === "findings" && input.verifying) return verificationFindingsNote(input);
   if (outcome === "unverified-clean") {
     return `${chat} found nothing; local verification did not complete (${input.localError || "unavailable"}), so this is ${chat}'s unverified clean result.`;
   }
@@ -122,6 +131,24 @@ export function outcomeNote(
     return `${chat} found nothing; local verification's reply could not be used as a review (${input.localError || "not review JSON"}); it is posted verbatim below. Not a clean pass.`;
   }
   return "";
+}
+
+/** A verification round's findings, each credited to the reviewer whose gated reply carried it: a
+ * chat run that started before the round can land during it, so local verification is credited only
+ * with its own findings, and a clean chat reviewer is named clean only while it reports none. With no
+ * reviewer to credit, the wording is provider-neutral. */
+function verificationFindingsNote(input: Parameters<typeof outcomeNote>[1]): string {
+  const count = (p: ReviewProvider) => input.findingsBy[p] ?? 0;
+  const clean = input.chat.filter((p) => !count(p));
+  const others = (Object.keys(input.findingsBy) as ReviewProvider[]).filter((p) => p !== "local" && count(p) > 0);
+  const cleanPart = clean.length ? `${clean.join(" + ")} found nothing` : "";
+  if (!others.length && !count("local")) return `${cleanPart || "chat found nothing"}; the review found ${input.findings}.`;
+  const localPart = count("local")
+    ? `local verification found ${count("local")}`
+    : input.localVerified
+      ? "local verification found nothing"
+      : `local verification did not return a verdict (${input.localError || "unavailable"})`;
+  return `${[cleanPart, ...others.map((p) => `${p} found ${count(p)}`), localPart].filter(Boolean).join("; ")}.`;
 }
 
 /** The verbatim block posted for every leg whose reply could not be parsed, labeled when more than

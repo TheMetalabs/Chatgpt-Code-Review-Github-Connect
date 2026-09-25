@@ -213,24 +213,38 @@ describe("invariants over the closed enum", () => {
 
 describe("outcomeNote", () => {
   const chat: ReviewProvider[] = ["chatgpt"];
-  it("N1 verified-clean", () => assert.equal(outcomeNote("verified-clean", { chat, verifying: true, findings: 0 }), "chatgpt found nothing; local verification agreed."));
-  it("N2 local findings in the verification round", () => assert.equal(outcomeNote("findings", { chat, verifying: true, findings: 2 }), "chatgpt found nothing; local verification found 2."));
-  it("N3 chat findings (no verification round)", () => assert.equal(outcomeNote("findings", { chat, verifying: false, findings: 2 }), ""));
-  it("N4 unverified-clean names the failure", () => assert.match(outcomeNote("unverified-clean", { chat, verifying: true, findings: 0, localError: "x" }), /did not complete \(x\)/));
+  it("N1 verified-clean", () => assert.equal(outcomeNote("verified-clean", { chat, verifying: true, findings: 0, findingsBy: {} }), "chatgpt found nothing; local verification agreed."));
+  it("N2 local findings in the verification round", () => assert.equal(outcomeNote("findings", { chat, verifying: true, findings: 2, findingsBy: { chatgpt: 0, local: 2 } }), "chatgpt found nothing; local verification found 2."));
+  it("N3 chat findings (no verification round)", () => assert.equal(outcomeNote("findings", { chat, verifying: false, findings: 2, findingsBy: { chatgpt: 2 } }), ""));
+  it("N4 unverified-clean names the failure", () => assert.match(outcomeNote("unverified-clean", { chat, verifying: true, findings: 0, findingsBy: {}, localError: "x" }), /did not complete \(x\)/));
   it("N5 raw-unverified names why the reply was unusable, says it is posted verbatim and is not clean", () => {
-    const note = outcomeNote("raw-unverified", { chat, verifying: true, findings: 0 });
+    const note = outcomeNote("raw-unverified", { chat, verifying: true, findings: 0, findingsBy: {} });
     assert.match(note, /could not be used as a review \(not review JSON\); it is posted verbatim below\. Not a clean pass\./);
-    assert.match(outcomeNote("raw-unverified", { chat, verifying: true, findings: 0, localError: "1 finding(s) missing required fields" }), /\(1 finding\(s\) missing required fields\)/);
+    assert.match(outcomeNote("raw-unverified", { chat, verifying: true, findings: 0, findingsBy: {}, localError: "1 finding(s) missing required fields" }), /\(1 finding\(s\) missing required fields\)/);
   });
   it("N6 credits only the chat reviewers pinned as clean (a skipped grok found nothing by absence)", () => {
-    assert.equal(outcomeNote("verified-clean", { chat: ["chatgpt"], verifying: true, findings: 0 }).startsWith("chatgpt found nothing"), true);
+    assert.equal(outcomeNote("verified-clean", { chat: ["chatgpt"], verifying: true, findings: 0, findingsBy: {} }).startsWith("chatgpt found nothing"), true);
   });
   it("N7 clean, raw and incomplete carry no note outside a verification round", () => {
-    for (const kind of ["clean", "raw", "incomplete"] as const) assert.equal(outcomeNote(kind, { chat, verifying: false, findings: 0 }), "", kind);
+    for (const kind of ["clean", "raw", "incomplete"] as const) assert.equal(outcomeNote(kind, { chat, verifying: false, findings: 0, findingsBy: {} }), "", kind);
   });
   it("N8 incomplete in a verification round still says whether local verified", () => {
-    assert.equal(outcomeNote("incomplete", { chat, verifying: true, findings: 0, localVerified: true }), "chatgpt found nothing; local verification agreed.");
-    assert.equal(outcomeNote("incomplete", { chat, verifying: true, findings: 0, localVerified: false, localError: "HTTP 500" }), "chatgpt found nothing; local verification did not complete (HTTP 500).");
+    assert.equal(outcomeNote("incomplete", { chat, verifying: true, findings: 0, findingsBy: {}, localVerified: true }), "chatgpt found nothing; local verification agreed.");
+    assert.equal(outcomeNote("incomplete", { chat, verifying: true, findings: 0, findingsBy: {}, localVerified: false, localError: "HTTP 500" }), "chatgpt found nothing; local verification did not complete (HTTP 500).");
+  });
+  // A chat run that started before the round can land during it: its findings are its own, never local's.
+  it("N9 a late chat reviewer's findings are credited to it, and local only with its own", () => {
+    const late = { chat, verifying: true, findings: 1, localVerified: true };
+    assert.equal(outcomeNote("findings", { ...late, findingsBy: { chatgpt: 0, grok: 1, local: 0 } }), "chatgpt found nothing; grok found 1; local verification found nothing.");
+    assert.equal(outcomeNote("findings", { ...late, findings: 3, findingsBy: { chatgpt: 0, grok: 1, local: 2 } }), "chatgpt found nothing; grok found 1; local verification found 2.");
+    assert.equal(outcomeNote("findings", { ...late, localVerified: false, localError: "HTTP 500", findingsBy: { chatgpt: 0, grok: 1 } }), "chatgpt found nothing; grok found 1; local verification did not return a verdict (HTTP 500).");
+  });
+  it("N10 a pinned clean chat reviewer that now reports findings is not called clean", () => {
+    assert.equal(outcomeNote("findings", { chat, verifying: true, findings: 1, localVerified: true, findingsBy: { chatgpt: 1, local: 0 } }), "chatgpt found 1; local verification found nothing.");
+  });
+  it("N11 with no reviewer to credit the wording is provider-neutral, never local's", () => {
+    const note = outcomeNote("findings", { chat, verifying: true, findings: 1, localVerified: true, findingsBy: { chatgpt: 0, local: 0 } });
+    assert.equal(note, "chatgpt found nothing; the review found 1.");
   });
 });
 

@@ -353,3 +353,35 @@ for(const [local,e] of Object.entries(SKIPPED_PEER)){
     await eventually(()=>(app.ops.at(-1)??'').includes(note),'the ops comment does not carry the same note');
   });
 }
+
+// A chat run that started before the verification round can land during it (Grok here, after its
+// quota report let ChatGPT's clean result start the round). Its finding posts, and the note credits it
+// to Grok: local verification is never said to have found what another reviewer reported.
+test('verify-clean outcome: a late chat finding during the verification round is attributed to its reviewer, never to local',async t=>{
+  const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const out=await app.mention('matrix-late-grok');
+  const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+  app.bridge.bridgeHeartbeat();
+  const take=app.bridge.takeNextBridgeJob('matrix-client');
+  assert.equal(take?.jobId,out.jobId,'the bridge claims the job');
+  assert.equal(app.bridge.failBridgeProvider(out.jobId,'grok','quota: usage limit reached',take.leaseId),true);
+  assert.equal((await app.bridge.completeBridgeJob(out.jobId,cleanJson,[{provider:'chatgpt',raw:cleanJson}],take.leaseId)).ok,true);
+  await eventually(()=>app.localRequests.length===1,'clean chatgpt did not start the verification round');
+  assert.deepEqual([...job().localVerifyChat],['chatgpt']);
+  // Grok's already-started run lands while local is still verifying.
+  assert.equal((await app.bridge.completeBridgeJob(out.jobId,dirtyJson,[{provider:'grok',raw:dirtyJson}],take.leaseId)).ok,true);
+  await eventually(()=>job().storedLegs.some(l=>l.provider==='grok'),'the late grok result was not kept');
+  await new Promise(resolve=>setTimeout(resolve,100));
+  assert.equal(app.reviews.length,0,'nothing posts while local verifies');
+  app.localResponses[0].end(envelope(cleanJson));
+  await eventually(()=>app.reviews.length===1,'the review was not posted');
+  const body=app.reviews[0].body;
+  assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MF,'grok\'s P1 posts');
+  assert.doesNotMatch(body,/local verification found 1/,'the finding is never credited to local');
+  const note='chatgpt found nothing; grok found 1; local verification found nothing.';
+  assert.equal(job().localVerifyNote,note);
+  assert.ok(body.includes(`\n${note}\n`),'the body carries the attributed note');
+  await eventually(()=>(app.ops.at(-1)??'').includes(note),'the ops comment does not carry the same note');
+});

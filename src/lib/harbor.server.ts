@@ -1138,7 +1138,9 @@ export async function submitHarborChat(
     (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
     invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
     (byProvider.get("local")?.rawReview ? "not review JSON" : undefined);
-  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, localError, localVerified });
+  // Each merged reviewer's accepted finding count: the note credits findings to the leg that reported them.
+  const findingsBy: Partial<Record<ReviewProvider, number>> = Object.fromEntries([...byProvider].map(([p, g]) => [p, g.findings.length]));
+  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified });
   transitionJob(jobId, (j) => ({
     ...j,
     findings: merged.findings,

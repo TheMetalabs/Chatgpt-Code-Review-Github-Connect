@@ -306,17 +306,26 @@ function classBody(tokens, index) {
   return tokens[index]?.open === '{' && isWord(tokens[j], 'class');
 }
 
-/** Whether `level[k]` (inside the levels `path`) refers to the global object: one of GLOBAL_NAMES that is
- * not a property name, an object key or a method's name, nor bound by the code where it stands (a
- * declaration, a parameter or a catch binding of that name makes it a local), with `this` anywhere but in
- * a class body (strict code, whose `this` is never the global object); or a `defaultView` property (a
- * document's window) however its name is spelled. */
+/** Whether the word at `level[k]` (inside the levels `path`) names something other than a variable: a
+ * property (`.top`, `#top`), an object key or a method, a class field, or a label. */
+function nameOnly(level, k, container, path) {
+  const before = level[k - 1], after = level[k + 1], holder = path.at(-1);
+  if (['.', '?.', '#'].some(text => isPunct(before, text)) || isWord(before, 'break') || isWord(before, 'continue')) return true;
+  if (after?.open === '(' && level[k + 2]?.open === '{') return true;
+  if (isPunct(after, ':') && ((container?.open === '{' && (k === 0 || isPunct(before, ','))) || startsStatement(level, k, container))) return true;
+  return Boolean(holder) && classBody(holder.tokens, holder.index) && (!after || isPunct(after, '=') || isPunct(after, ';')) &&
+    (k === 0 || isPunct(before, ';') || before.open === '{' || isWord(before, 'static'));
+}
+
+/** Whether `level[k]` (inside the levels `path`) refers to the global object: one of GLOBAL_NAMES that
+ * names a variable (nameOnly) the code does not bind where it stands (a declaration, a parameter or a
+ * catch binding of that name makes it a local), with `this` anywhere but in a class body (strict code,
+ * whose `this` is never the global object); or a `defaultView` property (a document's window) however
+ * its name is spelled. */
 function globalReference(level, k, container, path) {
-  const token = level[k], before = level[k - 1];
+  const token = level[k];
   if (propertyName(level, k, container) === 'defaultView') return true;
-  if (token.kind !== 'word' || !GLOBAL_NAMES.has(token.text) || isPunct(before, '.') || isPunct(before, '?.')) return false;
-  const key = container?.open === '{' && (k === 0 || isPunct(before, ',')) && isPunct(level[k + 1], ':');
-  if (key || (level[k + 1]?.open === '(' && level[k + 2]?.open === '{')) return false;
+  if (token.kind !== 'word' || !GLOBAL_NAMES.has(token.text) || nameOnly(level, k, container, path)) return false;
   if (token.text === 'this') return !path.some(({tokens, index}) => classBody(tokens, index));
   return !boundLocally(path, level, k, token.text);
 }
@@ -1282,6 +1291,8 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     ['function f(top) {}\nnote(top);', global(2, 'top')],
     ['const f = function top() {};\nnote(top);', global(2, 'top')],
     ['function pick(key) {\n  return note(this);\n}', global(2, 'this')],
+    ['class B { top = 1; m() { return note(top); } }', global(1, 'top')],
+    ['const o = {a: ok ? top : 0};', global(1, 'top')],
     // The global object arrives as other values too (a method that returns its receiver, an event's
     // target), so a call through a computed member the guard cannot read fails on any object.
     ['const name = ["worker", "Step"].join("");\nglobalThis.valueOf()[name](job, provider, "unlabelled_valueof");', called(2, '[name]')],
@@ -1320,7 +1331,8 @@ test('a recorder is reached only by its name: a string naming one, a call throug
     'rows.map(self => note(self)); rows.map((window, i) => note(window, i)); rows.map(({top}) => note(top));\n' +
     'try { run(); } catch (window) { note(window); }\nfor (const top of rows) note(top);\nfor (const [parent] of rows) { note(parent); }\n' +
     'class A { m(key) { return note(this[key]); } static n() { return this; } }\nconst o = {top() { return 1; }, parent(x) { return x; }};\n' +
-    'const pick = function self(n) { return n ? self(n - 1) : note(self); };'), []);
+    'const pick = function self(n) { return n ? self(n - 1) : note(self); };\n' +
+    'top: for (const row of rows) { if (row) continue top; break top; }\nclass B { #top = 1; top = 2; static parent; frames; m() { return this.#top; } }'), []);
   // A recorder's name only compared is a boolean's operand, never a key.
   assert.deepEqual(problems('if (kind === "step") go(); if ("workerStep" !== row.kind) skip(); ok = kind == `step`;\n' +
     'switch (kind) { case "recordReviewStep": break; }'), []);

@@ -82,6 +82,9 @@ test('a logged-out ChatGPT page pauses new chatgpt legs ~10 min: the next leg fa
  assert.ok(failB,'the next chatgpt leg fails at once while paused');
  assert.match(failB.error,/^logged_out: /);
  assert.equal(b.effects.filter(e=>e.effect==='create').length,tabsBefore,'no tab is opened for a paused provider');
+ // Grok still open: jobs are taken, but the phase stays logged_out so the coordinator's watch asks for a login.
+ await b.tick();await flush();
+ assert.equal(b.local.state.bridgeWorkerStatus.admissionPhase,'logged_out','one provider paused shows logged_out');
  // Grok also unavailable: admission takes nothing and says why.
  await b.local.set({quota:{grok:Date.now()+60*60_000}});
  const takes=b.calls.filter(c=>c.action==='take').length;

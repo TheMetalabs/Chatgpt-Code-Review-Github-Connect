@@ -700,7 +700,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.34";
+const WORKER_BUILD = "1.1.35";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2894,6 +2894,10 @@ function admitJob(cfg, jobs) {
       const loggedOut = ["chatgpt", "grok"].some(p => providerOpen(quota, p));
       await recordWorkerStatus(jobs, cfg.origin, loggedOut ? "logged_out" : "provider_quota"); return null;
     }
+    // A provider paused as logged out keeps the phase logged_out while the others still work (the
+    // coordinator's watch asks the user to log in on this value). Only a provider that ran and hit
+    // the login page is paused, so an unconfigured provider never counts.
+    const pausedPhase = ["chatgpt", "grok"].some(p => !providerOpen(loginPause, p)) ? "logged_out" : "";
     // A stale service worker (Chrome kept the previous build's script after the files on disk were
     // replaced; #93 validation) would drive pages that inject the NEW content scripts: its run
     // messages lack what they require, and every run it starts loses its binding. It takes nothing.
@@ -2902,7 +2906,7 @@ function admitJob(cfg, jobs) {
       await chrome.storage.local.set({lastError: `stale service worker: running build ${WORKER_BUILD}, files on disk ${chrome.runtime.getManifest?.().version}; reload the extension`});
       return null;
     }
-    await recordWorkerStatus(jobs, cfg.origin, "polling");
+    await recordWorkerStatus(jobs, cfg.origin, pausedPhase || "polling");
     // One take in flight per origin: this lane (singleFlight on admissionLanes, and tickBody never
     // queues a second waiter) serializes every admission trigger of this worker (alarm, interval,
     // poll-now). A fix delivery this profile PROVABLY opened a tab for (reconcileFixDeliveries: a tab
@@ -2918,7 +2922,7 @@ function admitJob(cfg, jobs) {
       await recordWorkerStatus(jobs, cfg.origin, "disconnected"); throw error;
     });
     if (!payload.job || jobs[payload.job.jobId]) {
-      await recordWorkerStatus(jobs, cfg.origin, payload.job ? "duplicate_job" : "idle");
+      await recordWorkerStatus(jobs, cfg.origin, payload.job ? "duplicate_job" : pausedPhase || "idle");
       return null;
     }
     // At most one tab per fix jobId + deliveryId: a delivery (fresh, or its replay) whose tab this

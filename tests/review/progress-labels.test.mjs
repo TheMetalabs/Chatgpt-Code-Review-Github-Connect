@@ -151,11 +151,16 @@ function recordedStages(text, file = 'source') {
   return found;
 }
 
-function extensionStages() {
-  const files = readdirSync(join(root, 'extension')).filter(name => name.endsWith('.js'));
+/** The extension's scripts, {name: text}. */
+function extensionFiles() {
+  const names = readdirSync(join(root, 'extension')).filter(name => name.endsWith('.js'));
+  return Object.fromEntries(names.map(name => [name, source(`extension/${name}`)]));
+}
+
+function extensionStages(files) {
   const literals = new Set(), templates = new Set(), problems = [];
-  for (const name of files) {
-    const found = recordedStages(source(`extension/${name}`), name);
+  for (const [name, text] of Object.entries(files)) {
+    const found = recordedStages(text, name);
     found.literals.forEach(stage => literals.add(stage));
     found.templates.forEach(template => templates.add(template));
     problems.push(...found.problems);
@@ -170,23 +175,51 @@ function unionMembers(path, name) {
   return [...match[1].matchAll(/"([^"]+)"/g)].map(m => m[1]);
 }
 
-/** Every value a template stage can take, keyed by its static prefix. A template stage whose prefix
- * is not listed here fails the guard: declare its expansion so each value is checked for a label. */
+/** The strings of `function name() { return [...]; }` in any of `files`, or null when none defines it. */
+function returnedList(files, name) {
+  const pattern = new RegExp(`\\bfunction\\s+${name}\\s*\\(\\s*\\)\\s*\\{\\s*return\\s*\\[([^\\]]*)\\]\\s*;?\\s*\\}`);
+  const match = Object.values(files).map(text => text.match(pattern)).find(Boolean);
+  if (!match) return null;
+  const items = match[1].split(',').map(item => item.trim()).filter(Boolean);
+  const values = items.map(item => /^"([^"\\]*)"$|^'([^'\\]*)'$/.exec(item)).map(m => m && (m[1] ?? m[2]));
+  assert.ok(values.every(value => typeof value === 'string'), `${name}() returns a list of string literals only`);
+  return values;
+}
+
+/** The values of a template stage, keyed by its static prefix. `source` reads the list the code itself
+ * draws the value from (null when there is none); `declared` holds values labelled ahead of the code.
+ * A recorded template stage expands to both, so a value added only in the code still needs a label. A
+ * recorded template whose prefix is missing here, or whose list is not found in source, fails the guard. */
 const TEMPLATE_STAGES = {
-  repair_: unionMembers('src/lib/json-repair-types.ts', 'RepairStatus'),
-  // Tab release (#82): finishTabCleanup records preserve_<cause> just before tab_preserved.
-  preserve_: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown',
-    // Tab Lease (Phase 1+): the takeover and restart causes of a preserved tab.
-    'user_input', 'user_moved', 'browser_restart'],
-  // Tab Lease (Phase 1+): a lease that runs out records lease_expired_<phase>.
-  lease_expired_: ['creating', 'opening', 'sending', 'generating', 'answered', 'releasing'],
+  repair_: {declared: [], source: () => unionMembers('src/lib/json-repair-types.ts', 'RepairStatus')},
+  // Tab release (#82): finishTabCleanup records preserve_<cause>, the cause one of preserveCauses().
+  preserve_: {source: files => returnedList(files, 'preserveCauses'),
+    declared: ['navigated', 'user_turn', 'edited', 'draft', 'ownership_unknown', 'unreachable', 'other_binding', 'unknown',
+      // Tab Lease (Phase 1+): the takeover and restart causes of a preserved tab.
+      'user_input', 'user_moved', 'browser_restart']},
+  // Tab Lease (Phase 1+): a lease that runs out records lease_expired_<phase>. Nothing lists the phases in
+  // code yet: when the extension records this template, it needs a list here that reads its phases.
+  lease_expired_: {source: () => null, declared: ['creating', 'opening', 'sending', 'generating', 'answered', 'releasing']},
 };
 
-function expandTemplate(template) {
+/** Every stage a recorded template can produce, given the extension's scripts. */
+function expandTemplate(template, files) {
   const prefix = template.slice(0, template.indexOf('${'));
   assert.ok(Object.hasOwn(TEMPLATE_STAGES, prefix), `template stage \`${template}\` has no declared expansion in TEMPLATE_STAGES`);
   assert.match(template, /^[a-z_]+\$\{[^}]+\}$/, `template stage \`${template}\` is exactly <prefix>\${value}`);
-  return TEMPLATE_STAGES[prefix].map(value => prefix + value);
+  const {declared, source: read} = TEMPLATE_STAGES[prefix];
+  const values = read(files);
+  assert.ok(values, `template stage \`${template}\` is recorded, but the list of its values was not found in source`);
+  return [...new Set([...declared, ...values])].map(value => prefix + value);
+}
+
+/** The stages labelled ahead of the code for a template prefix. */
+const declaredStages = prefix => TEMPLATE_STAGES[prefix].declared.map(value => prefix + value);
+
+/** Every stage `files` can record, and the stage arguments the guard could not read. */
+function guardedStages(files) {
+  const {literals, templates, problems} = extensionStages(files);
+  return {literals, templates, problems, stages: [...literals, ...[...templates].flatMap(template => expandTemplate(template, files))]};
 }
 
 const unlabelled = stages => [...new Set(stages)].filter(stage => !Object.hasOwn(PROGRESS_LABELS, stage)).sort();
@@ -198,13 +231,12 @@ function kept(stages, sourceName = 'worker') {
 }
 
 test('every stage the extension records has a history label (sanitizeProgressEvents drops unlabelled ones)', () => {
-  const {literals, templates, problems} = extensionStages();
+  const {literals, templates, problems, stages} = guardedStages(extensionFiles());
   assert.deepEqual(problems, [], 'every stage argument is a literal the guard can check');
   assert.ok(literals.has('tab_closed') && literals.has('generating') && literals.has('prompt_submitted'),
     'sanity: the scan sees worker, page and composer stages');
   assert.equal(literals.has('preserved'), false, 'a nested call argument is not a stage');
   assert.ok(templates.has('repair_${status.status}'), 'sanity: the scan sees template stages');
-  const stages = [...literals, ...[...templates].flatMap(expandTemplate)];
   assert.deepEqual(unlabelled(stages), [], 'recorded stages without a PROGRESS_LABELS entry never reach review history');
   assert.deepEqual(kept(stages, 'worker'), stages);
   assert.deepEqual(kept(stages, 'page'), stages);
@@ -243,6 +275,19 @@ test('a template stage without a declared expansion fails the guard instead of p
   assert.throws(() => expandTemplate('repair_${status.status}_late'), /exactly <prefix>/);
   const {templates} = recordedStages('workerStep(job, provider, `repair_${status.status}`);');
   assert.deepEqual([...templates], ['repair_${status.status}']);
+});
+
+test('a preserve_ cause added only to preserveCauses() fails the guard: the expansion reads the extension\'s own list', () => {
+  const recorder = 'function finish(state) { workerStep(job, provider, `preserve_${state.preserveCause}`); }\n';
+  const files = cause => ({'background.js': `function preserveCauses() {\n  return ["navigated", "draft", ${cause}];\n}\n${recorder}`});
+  assert.deepEqual(unlabelled(guardedStages(files('"unknown"')).stages), []);
+  assert.deepEqual(unlabelled(guardedStages(files('"staged"')).stages), ['preserve_staged'],
+    'a cause the extension can record, labelled nowhere');
+  assert.deepEqual(kept(['preserve_staged']), [], 'its event would be dropped from history');
+  assert.throws(() => guardedStages(files('...LEGACY')), /string literals only/);
+  assert.throws(() => guardedStages({'background.js': recorder}), /not found in source/, 'no list, no expansion');
+  assert.throws(() => guardedStages({'background.js': 'workerStep(job, provider, `lease_expired_${phase}`);'}), /not found in source/,
+    'Tab Lease: recording lease_expired_<phase> needs a list of the phases in code');
 });
 
 test('a stage argument the guard cannot read fails it instead of passing unchecked', () => {
@@ -284,7 +329,7 @@ test('the guard reads the stage argument by position: other arguments, a conditi
 
 test('the tab-release (#82) stages have history labels and survive sanitize', () => {
   const stages = ['cancelled', 'cleanup_waiting_page', 'tab_preserved', 'tab_closed',
-    ...expandTemplate('preserve_${state.preserveCause}')];
+    ...declaredStages('preserve_')];
   assert.deepEqual(unlabelled(stages), []);
   assert.deepEqual(kept(stages, 'worker'), stages);
   assert.deepEqual(kept(['cancelled'], 'page'), ['cancelled'], '#82: the page records cancelled when its run is stopped');
@@ -298,7 +343,7 @@ test('tab_preserved names no cause of its own: the worker preserves for non-user
  * a stage recorded ahead of its label is dropped by sanitizeProgressEvents for good. */
 const TAB_LEASE_STAGES = ['tab_lost', 'tab_rekeyed', 'user_touched', 'dom_drift', 'dom_evidence_without_touch',
   'lifecycle_diverged', 'group_expanded', 'preserve_user_input', 'preserve_user_moved', 'preserve_browser_restart',
-  ...expandTemplate('lease_expired_${phase}')];
+  ...declaredStages('lease_expired_')];
 
 test('the Tab Lease stages have history labels and survive sanitize from either source', () => {
   assert.equal(TAB_LEASE_STAGES.length, 16);

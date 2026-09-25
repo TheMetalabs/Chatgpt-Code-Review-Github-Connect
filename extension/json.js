@@ -315,6 +315,39 @@ function composerStagedFiles(state, submission) {
     .filter(name => name.trim() && !own.has(name));
 }
 
+/** The response's variant pager: what the provider shows on an answer once it was regenerated (a
+ * "2/2" counter between Previous/Next response buttons), "" when there is none. Read outside the
+ * message text (never the answer's own content). Compared with the pager at collection only. */
+function responseVariant(root) {
+  if (!root?.querySelectorAll) return "";
+  const buttons = [...root.querySelectorAll("button[aria-label], [role='button'][aria-label]")]
+    .some(el => /previous response|next response|이전 응답|다음 응답/i.test(el.getAttribute("aria-label") || ""));
+  const counters = [...root.querySelectorAll("div, span")]
+    .filter(el => !el.children.length && !el.closest("[data-message-author-role], pre, code") && /^\d+\s*\/\s*\d+$/.test((el.textContent || "").trim()))
+    .map(el => el.textContent.replace(/\s+/g, ""));
+  return [...(buttons ? ["pager"] : []), ...counters].join(" ");
+}
+
+/** Whether this page completed Ashlar's answer for its run (collected, repaired or archived): what
+ * the provider generates in the tab after that is a new cycle, not Ashlar's run. */
+function answerCompleted(state) {
+  return Boolean(state.nativeCompletion || state.result?.ok === true || repairedCollectionResult(state) || sourceReceiptFor(state));
+}
+
+/** Whether the bound response is being generated again, or was, after this page completed Ashlar's
+ * answer: a Stop control or a streaming flag is back, or the variant pager differs from the one at
+ * collection. Neither Ashlar nor a provider redraw starts a generation cycle on a finished answer; the
+ * user's regenerate or retry does (Ashlar 4101062754). A redraw that only changes the answer's text,
+ * fences, labels or message id is not one. */
+function regeneratedAfterCompletion(state, submission) {
+  if (!answerCompleted(state) || typeof boundReviewResponse !== "function") return false;
+  const bound = boundReviewResponse(submission);
+  if (typeof stopButtonVisible === "function" && stopButtonVisible()) return true;
+  if (!bound.root) return false;
+  if (typeof responseStreaming === "function" && responseStreaming(bound.root)) return true;
+  return typeof state.collectedVariant === "string" && responseVariant(bound.root) !== state.collectedVariant;
+}
+
 /** One poll of the response bound to this run's sent prompt: the completion evidence both
  * collectors (review JSON, fix code) decide on. A follow-up turn marks the tab repurposed. A
  * later request's global Stop cannot end or block this older response: completion needs the
@@ -351,6 +384,8 @@ function settleStableAnswer(stability, key, poll, {text, raw}) {
   const {runner, bound} = poll;
   if (runner) {
     runner.responseText = text;
+    // The regeneration pager as it was when the answer was collected (tabOwnership: "regenerated").
+    runner.collectedVariant = responseVariant(bound?.root);
     if (bound?.identified && bound.responseId) runner.nativeCompletion = Object.freeze({
       jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
       responseId:bound.responseId,context:reviewPageContext(),text,raw,
@@ -698,9 +733,11 @@ async function waitUntilFixOrQuota(name) {
  * provider never changes by itself:
  *  - a user turn after Ashlar's journaled turn ("user_turn"), or that turn edited ("edited");
  *  - a composer draft that is not Ashlar's own prompt ("draft");
- *  - another conversation or site (samePage against the pinned conversation: "navigated").
- * Nothing about the ANSWER is compared (text, fences, labels, message id, Stop or streaming):
- * ChatGPT keeps redrawing a finished answer, and that is not the user's activity.
+ *  - another conversation or site (samePage against the pinned conversation: "navigated");
+ *  - the answer generated again after this page completed it ("regenerated": a Stop control or a
+ *    streaming flag back, or a new variant pager; regeneratedAfterCompletion).
+ * Nothing else about the ANSWER is compared (text, fences, labels, message id): ChatGPT keeps
+ * redrawing a finished answer, and that is not the user's activity.
  * "owned" carries how it was proven: `blank` (nothing on the page), `unsent` (only Ashlar's
  * just-clicked prompt), `legacy` (a run observed without a journal), `unpinned` (a review sent,
  * no pinned conversation) or the recorded `conversation`; the worker then checks the page it
@@ -778,6 +815,7 @@ function tabOwnership(state, allocationUrl, fix = false) {
   // still contain it.
   if (pinned ? sent !== submission.expected : !sent.includes(submission.expected)) return takeOver("edited");
   if (users.indexOf(turn) < users.length - 1) return takeOver("user_turn");
+  if (regeneratedAfterCompletion(state, submission)) return takeOver("regenerated");
   if (unestablished) return unestablished;
   return pinned ? {ownership: "owned", conversation: pinned} : {ownership: "owned", unpinned: true};
 }

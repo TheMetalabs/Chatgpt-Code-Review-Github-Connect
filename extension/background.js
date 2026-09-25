@@ -916,7 +916,7 @@ function compactFinalCapturedSource(state) {
 
 /** Why a tab is kept open (the preserve_<cause> history stage; a function so tests can read it). */
 function preserveCauses() {
-  return ["navigated", "user_turn", "edited", "draft", "ownership_unknown", "unreachable", "other_binding", "undelivered", "unknown"];
+  return ["navigated", "user_turn", "edited", "draft", "regenerated", "ownership_unknown", "unreachable", "other_binding", "undelivered", "unknown"];
 }
 
 /** Whether a leg ever had a tab, or may have one: an id it opened or adopted, a dispatched run, a

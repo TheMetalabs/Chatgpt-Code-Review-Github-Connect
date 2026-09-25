@@ -318,11 +318,15 @@ test('P1 worker/HTTP: a response the provider replaced after the server receipt 
  assert.ok(replacement);assert.deepEqual(f.worker.closedTabs,[10]);assert.equal(f.app.localRequests.length,1);assert.equal(f.app.reviews.length,1);
  assert.equal((await f.page.evaluate(()=>message('ashlar-harvest'))).raw,raw);
 });
-test('P1: a streaming flag on a repaired (secured) response does not hold its tab',async t=>{
+// Ashlar 4101062754: the answer generating again after its original was secured (here repaired) is the
+// user's regenerate or retry: the tab is kept, and for good (a takeover is permanent). Before #85 r1
+// a streaming flag was treated as a provider redraw and the tab closed.
+test('P1: a streaming flag back on a repaired (secured) response keeps its tab (the user regenerated it)',async t=>{
  const invalid=JSON.stringify({findings:[],investigated_safe:'checked'});const page=await pageFixture(t,{text:invalid});
  const receipt={committed:true,repairId:'streaming-repair',responseId:'response-A',text:invalid,raw};
  assert.equal((await page.evaluate(r=>message('ashlar-repair-accepted',r),receipt)).accepted,true);
+ assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true,'control: the secured response as repaired');
  await page.evaluate(()=>{const status=document.createElement('div');status.dataset.streamingResponseStatus='';status.textContent='Generating';document.querySelector('#answer').prepend(status);});
- const out=await page.evaluate(()=>message('ashlar-can-close'));assert.equal(out.canClose,true);assert.equal(out.reason,'complete');
- await page.locator('[data-streaming-response-status]').evaluate(n=>n.remove());assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true);
+ const out=await page.evaluate(()=>message('ashlar-can-close'));assert.deepEqual({canClose:out.canClose,cause:out.cause},{canClose:false,cause:'regenerated'});
+ await page.locator('[data-streaming-response-status]').evaluate(n=>n.remove());assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,false,'still the user\'s');
 });

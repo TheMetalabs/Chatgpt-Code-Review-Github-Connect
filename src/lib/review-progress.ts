@@ -39,6 +39,7 @@ export const PROGRESS_LABELS = {
     preserve_user_turn: "Tab preserved · the user sent a follow-up turn",
     preserve_edited: "Tab preserved · the user edited Ashlar's prompt",
     preserve_draft: "Tab preserved · the user typed a draft in the composer",
+    preserve_regenerated: "Tab preserved · the answer was generated again after Ashlar collected it (the user regenerated or retried it)",
     preserve_ownership_unknown: "Tab preserved · its ownership could not be proven in time",
     preserve_unreachable: "Tab preserved · the page could not be reached or never finished loading",
     preserve_other_binding: "Tab preserved · it now belongs to another job",

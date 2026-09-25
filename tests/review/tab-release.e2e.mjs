@@ -135,7 +135,18 @@ const REDRAWS=[
  ['a late code-block label and an Edit affordance render','',p=>p.locator('#lang').evaluate(el=>{el.textContent='json';el.insertAdjacentHTML('afterend','<span>Edit</span>');})],
  ['the provider re-keys its assistant message id','',p=>p.evaluate(()=>{document.querySelector('[data-message-author-role="assistant"]').dataset.messageId='answer-B';})],
  ['the provider replaces the answer text (no new user turn)','',p=>p.locator('#code').evaluate(el=>{el.textContent='{"findings":[],"merge_recommendation":"REQUEST_CHANGES"}';})],
- ['a streaming indicator and Stop reappear','',p=>p.evaluate(stop=>{document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('afterbegin','<div data-streaming-response-status="streaming" style="width:60px;height:20px">…</div>');document.body.insertAdjacentHTML('beforeend',stop);},stopButton)],
+ ['the provider replaces the answer under a new message id (no Stop, no variant pager)','',p=>p.evaluate(()=>{const a=document.querySelector('[data-message-author-role="assistant"]');a.dataset.messageId='answer-B';a.querySelector('#code').textContent='{"findings":[],"merge_recommendation":"COMMENT"}';})],
+];
+// Ashlar 4101062754: a generation cycle on the answer AFTER the page collected it is the user's
+// regenerate or retry (neither Ashlar nor a redraw starts one): a Stop control or a streaming flag
+// back on the finished answer, or a variant pager ("2/2") it did not have. Preserved, cause
+// "regenerated". (The rows above, which change the answer with neither, still close.)
+const stopAndStream=p=>p.evaluate(stop=>{document.querySelector('[data-testid="conversation-turn-2"]').insertAdjacentHTML('afterbegin','<div data-streaming-response-status="streaming" style="width:60px;height:20px">…</div>');document.body.insertAdjacentHTML('beforeend',stop);},stopButton);
+const pager='<div class="flex"><button aria-label="Previous response" style="width:20px;height:20px">‹</button><div class="tabular-nums">2/2</div><button aria-label="Next response" style="width:20px;height:20px">›</button></div>';
+const REGENERATIONS=[
+ ['a streaming indicator and Stop reappear on the finished answer',stopAndStream],
+ ['the user regenerates: a new answer streams under a new message id',p=>p.evaluate(()=>{const a=document.querySelector('[data-message-author-role="assistant"]');a.dataset.messageId='answer-B';a.querySelector('#code').textContent='{"findings":[';}).then(()=>stopAndStream(p))],
+ ['the user regenerated and the new answer already finished (the variant pager shows 2/2)',p=>p.evaluate(pager=>{const a=document.querySelector('[data-message-author-role="assistant"]');a.dataset.messageId='answer-B';a.querySelector('#code').textContent='{"findings":[],"merge_recommendation":"COMMENT"}';document.querySelector('[aria-label="Response actions"]').insertAdjacentHTML('beforeend',pager);},pager)],
 ];
 for(const kind of ['review','fix'])for(const [name,tail,redraw] of REDRAWS)test(`${kind}: a secured tab may close after ${name}`,async t=>{
  const {tab,out}=await collected(t,{kind,tail});
@@ -148,6 +159,13 @@ for(const kind of ['review','fix'])for(const [name,tail,redraw] of REDRAWS)test(
 
 // Positive evidence the user took the tab over: preserved (slot freed), with the cause.
 const stageFile=p=>p.evaluate(html=>document.querySelector('form').insertAdjacentHTML('afterbegin',html),fileChip('my-notes.pdf'));
+for(const kind of ['review','fix'])for(const [name,regenerate] of REGENERATIONS)test(`${kind}: a secured tab where ${name} is preserved as regenerated`,async t=>{
+ const {tab}=await collected(t,{kind});
+ await regenerate(tab.page);
+ assert.deepEqual(verdict(await canClose(tab)),{canClose:false,reason:'repurposed',cause:'regenerated'});
+ assert.equal(await tab.released(),'true','the preserved tab frees its managed slot');
+ assert.ok((await tab.steps()).includes('context_changed'));
+});
 const TAKEOVERS=[
  ['a follow-up turn','user_turn',p=>p.evaluate(html=>document.getElementById('thread').insertAdjacentHTML('beforeend',html),userTurn('user-B','my own question'))],
  ['a draft in the composer','draft',p=>p.evaluate(()=>{document.getElementById('prompt-textarea').textContent='my unsent question';})],
@@ -380,6 +398,15 @@ test('worker, review: an ACKed tab where the user staged a file named like the r
  assert.ok(w.b.calls.some(c=>c.action==='complete'),'delivered');
  assert.deepEqual(w.b.closedTabs,[],'the user\'s staged file is not lost with the tab');assert.equal(w.state(),undefined,'the job retired');
  assert.ok(uploadedSteps(w).includes('worker:preserve_draft'),`${uploadedSteps(w)}`);
+});
+for(const kind of ['review','fix'])for(const [name,regenerate] of REGENERATIONS)test(`worker, ${kind}: an ACKed tab where ${name} is preserved, never closed`,async t=>{
+ const {tab,w}=await collectedLeg(t,{kind});
+ await regenerate(tab.page);
+ await w.tick();
+ assert.ok(w.b.calls.some(c=>c.action==='complete'),'Ashlar\'s collected answer is delivered');
+ assert.deepEqual(w.b.closedTabs,[],'the user\'s regeneration is not closed');assert.equal(w.state(),undefined,'the job retired');
+ assert.equal(await tab.released(),'true');
+ assert.ok(uploadedSteps(w).includes('worker:preserve_regenerated'),`${uploadedSteps(w)}`);
 });
 test('worker: an ACKed tab whose URL differs from its bound conversation only in the query closes',async t=>{
  const {tab,w}=await collectedLeg(t,{});

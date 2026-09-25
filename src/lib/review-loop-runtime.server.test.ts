@@ -21,6 +21,7 @@ import {
   startLoop,
   stopLoop,
   type LoopRuntimeDeps,
+  type LoopStepResult,
   type PostedLoopReview,
 } from "./review-loop-runtime.server.ts";
 
@@ -693,13 +694,14 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.equal(escalations(f.posted).length, 1);
   });
 
-  it("two steps for the SAME head never run two fix rounds (the second backs off)", async () => {
+  it("two steps for the SAME head never run two fix rounds (the second waits, then finds the head at the App's commit)", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3], requestDelayMs: 20 });
     const [a, b] = await Promise.all([run(f, "apply"), run(f, "apply")]);
     assert.equal(f.prompts.length, 1, "one fix request");
     const quiet = [a, b].filter((x) => !x.ran);
     assert.equal(quiet.length, 1);
-    assert.deepEqual(quiet[0], { ran: false, reason: "another loop step is in flight for this head" });
+    // the continuation for the App's commit already exists: the waiting step is superseded, idempotently
+    assert.deepEqual(quiet[0], { ran: false, reason: "superseded (head moved)" });
   });
 
   it("a suggestion for a head that moved during the fix request is never posted (superseded)", async () => {
@@ -1841,5 +1843,173 @@ describe("the branch ref moves only while the round is still wanted (#79 K2-7 wr
     assert.equal(f.committed, false);
     assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed", JSON.stringify(r));
     assert.match(escalations(f.posted)[0], /commit-failed after 1 attempt\(s\): GitHub pull 502/);
+  });
+});
+
+describe("a second step for the same head waits for the running one (#79 K2-8, K2-9 step half, R7 4092621920)", () => {
+  const STEP_REPLACED = "replaced by a newer loop step for this head (the newer one runs)";
+  const ROUND_ALREADY_RUN = "this head's fix round already ran for this session, mode and starter";
+  /** Holds the FIRST provider request (its round is mid-generation) until released. Every test
+   * releases it: the watcher's interval keeps the runner alive while a request is in flight. */
+  const holdFirst = (f: ReturnType<typeof fakeDeps>) => {
+    let release!: () => void;
+    const held = new Promise<void>((res) => (release = res));
+    let reached!: () => void;
+    const generating = new Promise<void>((res) => (reached = res));
+    const orig = f.deps.requestFix;
+    let calls = 0;
+    f.deps.requestFix = async (p, ctl) => {
+      if (++calls === 1) {
+        reached();
+        await held;
+      }
+      return orig(p, ctl);
+    };
+    return { generating, release };
+  };
+  /** Only for a step expected to return at once (replaced, or its wait expired): never awaited past a hold. */
+  const soon = <T>(p: Promise<T>): Promise<T | "still waiting"> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<"still waiting">((res) => (timer = setTimeout(() => res("still waiting"), 2_000)));
+    return Promise.race([p, bound]).finally(() => clearTimeout(timer));
+  };
+  const reasonOfStep = (r: LoopStepResult | "still waiting") => (r === "still waiting" ? r : r.ran ? `ran: ${JSON.stringify(r)}` : r.reason);
+  const suggestions = (posted: string[]) => posted.filter((b) => b.startsWith("### Ashlar fix agent — suggestion"));
+  const fixings = (posted: string[]) => posted.filter((b) => b.startsWith("<!-- ashlar-loop-fixing"));
+
+  it("stop, then restart, mid-round: the restarted round runs once the stopped one ends (no silent stall)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    f.issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2025-12-31T06:00:00Z" });
+    f.issues.push(recorded("apply", "alice", "2025-12-31T12:00:00Z")); // the restart: a new session, this review in it
+    const b = run(f, "apply", ENV_ON, job({ id: "job-B" })); // the restart's review of the same head
+    hold.release();
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.deepEqual(ra, { ran: false, reason: NEWER }, "the stopped round ends quietly, uncommitted");
+    assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "applied", JSON.stringify(rb));
+    assert.equal(f.committed, true);
+    assert.equal(f.prompts.length, 2);
+  });
+
+  it("an apply → suggest downgrade mid-round: the apply round ends quietly, the suggest round runs", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    f.issues.push(recorded("suggest", "alice", "2026-01-30T00:00:00Z")); // re-issued, suggest
+    const b = run(f, "apply", ENV_ON, job({ id: "job-B" }));
+    hold.release();
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.deepEqual(ra, { ran: false, reason: NEWER });
+    assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "suggested", JSON.stringify(rb));
+    assert.equal(f.committed, false);
+    assert.equal(suggestions(f.posted).length, 1);
+  });
+
+  it("K2-8 (I5): a suggest → apply upgrade mid-round is not dropped: the suggestion is posted, then the apply round commits", async () => {
+    const f = fakeDeps({ start: "suggest", rounds: [3] });
+    const hold = holdFirst(f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    f.issues.push(recorded("apply", "alice", "2026-01-30T00:00:00Z"));
+    const upgrade = job({ id: "job-B", thread: { kind: "mention", commentId: 2, userText: "/review-loop apply", loop: { kind: "start", mode: "apply" }, eventAt: "2026-01-30T00:00:00Z" } });
+    const b = run(f, "apply", ENV_ON, upgrade);
+    hold.release();
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", JSON.stringify(ra));
+    assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "applied", JSON.stringify(rb));
+    assert.equal(f.committed, true, "the operator's apply request runs");
+  });
+
+  it("R7 4092621920: another starter re-issuing apply mid-round: the first round ends quietly, the new starter's round commits", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3] });
+    const hold = holdFirst(f);
+    const a = run(f, "apply", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    f.issues.push(recorded("apply", "bob", "2026-01-30T00:00:00Z"));
+    const b = run(f, "apply", ENV_ON, job({ id: "job-B", sender: "bob" }));
+    hold.release();
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.deepEqual(ra, { ran: false, reason: NEWER });
+    assert.ok(rb.ran && rb.step === "fix" && rb.outcome === "applied", JSON.stringify(rb));
+    assert.equal(f.committed, true, "the session does not stall with nothing in flight");
+    assert.equal(f.permissionChecks.at(-1), "bob", "the commit is on the new starter's authority");
+  });
+
+  it("K2-8 (key case): the slot key is case-insensitive — 'O/r' waits for 'o/r' and runs no second round", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    const hold = holdFirst(f);
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    const b = run(f, "suggest", ENV_ON, job({ id: "job-B", owner: "O" }));
+    hold.release();
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", JSON.stringify(ra));
+    assert.deepEqual(rb, { ran: false, reason: ROUND_ALREADY_RUN });
+    assert.equal(f.prompts.length, 1, "one fix round for one PR head");
+  });
+
+  it("a plain re-trigger mid-round waits and runs no second round: one FIXING, one prompt, one suggestion (K1-8 concurrent half)", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    const hold = holdFirst(f);
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    const b = run(f, "suggest", ENV_ON, job({ id: "job-B", thread: { kind: "mention", commentId: 9, userText: "@ashlar-bot review" } }));
+    hold.release();
+    const [ra, rb] = await Promise.all([a, b]);
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", JSON.stringify(ra));
+    assert.deepEqual(rb, { ran: false, reason: ROUND_ALREADY_RUN });
+    assert.ok(SILENT_REASONS.includes(ROUND_ALREADY_RUN), "the earlier round's report is the visible result");
+    assert.equal(fixings(f.posted).length, 1);
+    assert.equal(f.prompts.length, 1);
+    assert.equal(suggestions(f.posted).length, 1);
+  });
+
+  it("latest wins: a later step replaces the waiting one, which returns at once; the running step is never preempted", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    const hold = holdFirst(f);
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    const b = run(f, "suggest", ENV_ON, job({ id: "job-B" }));
+    const c = run(f, "suggest", ENV_ON, job({ id: "job-C" }));
+    const rb = await soon(b);
+    hold.release();
+    const [ra, rc] = await Promise.all([a, c]);
+    assert.equal(reasonOfStep(rb), STEP_REPLACED);
+    assert.ok(SILENT_REASONS.includes(STEP_REPLACED), "the newer step runs: nothing to report");
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", "the running step finished its round");
+    assert.deepEqual(rc, { ran: false, reason: ROUND_ALREADY_RUN }, "same session, mode and starter as the round that ran");
+    assert.equal(f.prompts.length, 1);
+  });
+
+  it("K2-9 (step half): slots are per GitHub client — a held step on one client never blocks another client's step", async () => {
+    const f1 = fakeDeps({ rounds: [3] });
+    const hold = holdFirst(f1);
+    const a = run(f1, "suggest", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    const f2 = fakeDeps({ rounds: [3] }); // a fresh client, the same coordinates
+    const rb = await soon(run(f2, "suggest", ENV_ON, job({ id: "job-B" })));
+    hold.release();
+    await a;
+    assert.ok(rb !== "still waiting" && rb.ran && rb.step === "fix" && rb.outcome === "suggested", reasonOfStep(rb));
+    assert.equal(f2.prompts.length, 1);
+  });
+
+  it("the wait is bounded: past it the waiting step returns a LOGGED reason and never runs; the running step is not released", async () => {
+    const f = fakeDeps({ rounds: [3] });
+    const hold = holdFirst(f);
+    const a = run(f, "suggest", ENV_ON, job({ id: "job-A" }));
+    await hold.generating;
+    f.deps.stepWaitMaxMs = 20;
+    const rb = await soon(run(f, "suggest", ENV_ON, job({ id: "job-B" })));
+    hold.release();
+    const ra = await a;
+    const reason = reasonOfStep(rb);
+    assert.match(reason, /outlived the wait bound/);
+    assert.ok(!SILENT_REASONS.includes(reason), "logged, not silent");
+    assert.ok(ra.ran && ra.step === "fix" && ra.outcome === "suggested", "the running step finishes its round");
+    assert.equal(f.prompts.length, 1, "the expired step sent no prompt");
   });
 });

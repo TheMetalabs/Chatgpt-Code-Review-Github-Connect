@@ -24,7 +24,8 @@
  * round N+1 verifies the N-th fix (clean → CONVERGED, else round-cap). The ONLY quiet exits are
  * supersession (a newer head drives the loop — its review is requested once, idempotently; a
  * request that did not settle is logged, not quiet), an operator stop, a newer loop request (a
- * new session, or apply downgraded to suggest), and an existing handoff on this head. One
+ * new session, or apply downgraded to suggest), an existing handoff on this head, and a second
+ * step for this head that a newer one replaced or whose round the step it waited behind ran. One
  * relevance check guards every checkpoint of a round, and a round that went moot is never
  * retried. Apply also requires the session starter's write permission (design §2).
  * Everything is gated OFF by default:
@@ -152,6 +153,9 @@ export interface LoopRuntimeDeps {
   sleep?: (ms: number) => Promise<void>;
   /** The clock a control write's attempt is stamped with (injected by tests). */
   now?: () => number;
+  /** Bound on a second step's wait for the running step of its head (tests); production derives it
+   * from the fix request's own deadlines (stepWaitMaxMs). */
+  stepWaitMaxMs?: number;
 }
 
 export type LoopStepResult =
@@ -162,6 +166,14 @@ export type LoopStepResult =
 const SUPERSEDED = "superseded (head moved)";
 const ALREADY_ESCALATED = "already escalated on this head";
 const STEP_IN_FLIGHT = "another loop step is in flight for this head";
+/** A later step for this head replaced this one while it waited: the newer one runs. */
+const STEP_REPLACED = "replaced by a newer loop step for this head (the newer one runs)";
+/** The step this one waited behind already ran this head's round for the same session, mode and
+ * starter (a re-trigger mid-round): that round's report or handoff is the result. */
+const ROUND_ALREADY_RUN = "this head's fix round already ran for this session, mode and starter";
+/** NOT silent (logged): the running step for this head outlived the wait bound — a bug, since every
+ * await in a step is bounded. This step did not run; the running one is never force-released. */
+const STEP_WAIT_EXPIRED = "another loop step for this head outlived the wait bound; this step did not run";
 const NO_SESSION = "no active loop session";
 const STOPPED_QUIET = "loop stopped by operator";
 const ENDED_BY_HANDOFF = "the loop session ended with a handoff";
@@ -200,6 +212,8 @@ export const SILENT_REASONS: readonly string[] = [
   SUPERSEDED,
   ALREADY_ESCALATED,
   STEP_IN_FLIGHT,
+  STEP_REPLACED,
+  ROUND_ALREADY_RUN,
   NO_SESSION,
   STOPPED_QUIET,
   ENDED_BY_HANDOFF,
@@ -231,10 +245,81 @@ function controlCtx(d: LoopRuntimeDeps, token: string, botLogin: string): EmitCo
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
 // One loop step per PR head at a time (in-process): a second posted review of the same head
-// (re-request, redelivery) must not run a parallel fix round. Different heads never block each
-// other — the older one is superseded at its head checks. Cross-process coordination is a
-// NON-GOAL (single harbor instance; see the engine header).
-const inFlightSteps = new Set<string>();
+// (re-request, redelivery, a restart after a stop, a mode change) never runs a parallel fix round.
+// It WAITS for the running step instead of being dropped — dropped, it left an active session with
+// nothing running once the running round went moot. At most one waiter: a later arrival replaces
+// it (latest wins), and the running step is never preempted. Different heads never wait on each
+// other — the older one is superseded at its head checks. Slots are per GitHub client (production
+// has one: harbor's calls). Cross-process coordination is a NON-GOAL (single harbor instance; see
+// the engine header).
+type StepTurn = { status: "run"; prior?: string } | { status: "replaced" } | { status: "expired" };
+type StepSlot = {
+  /** The roundSignature of the last round that reached the provider while the slot was held,
+   * handed to the next owner (a waiter) — never kept once the slot is free. */
+  sig?: string;
+  waiter?: (turn: StepTurn) => void;
+};
+const productionStepSlots = new Map<string, StepSlot>();
+const stepSlotsByClient = new WeakMap<object, Map<string, StepSlot>>();
+const MAX_TIMER_MS = 2_147_483_647;
+
+function stepSlots(deps: LoopRuntimeDeps | undefined): Map<string, StepSlot> {
+  if (!deps) return productionStepSlots;
+  let slots = stepSlotsByClient.get(deps.gh);
+  if (!slots) stepSlotsByClient.set(deps.gh, (slots = new Map()));
+  return slots;
+}
+
+/** Take a head's slot, synchronously (before any await): free → run now; held → wait for its
+ * release, replacing a step that already waits, for at most `waitMaxMs`. */
+function claimStep(slots: Map<string, StepSlot>, key: string, waitMaxMs: number): StepTurn | Promise<StepTurn> {
+  const slot = slots.get(key);
+  if (!slot) {
+    slots.set(key, {});
+    return { status: "run" };
+  }
+  slot.waiter?.({ status: "replaced" });
+  return new Promise<StepTurn>((resolve) => {
+    const timer = setTimeout(() => {
+      if (slot.waiter === admit) slot.waiter = undefined;
+      resolve({ status: "expired" });
+    }, waitMaxMs);
+    (timer as { unref?: () => void }).unref?.();
+    const admit = (turn: StepTurn) => {
+      clearTimeout(timer);
+      resolve(turn);
+    };
+    slot.waiter = admit;
+  });
+}
+
+/** Release a head's slot: the waiter, if any, becomes the owner and learns the last round run. */
+function releaseStep(slots: Map<string, StepSlot>, key: string): void {
+  const slot = slots.get(key);
+  const next = slot?.waiter;
+  if (!slot || !next) {
+    slots.delete(key);
+    return;
+  }
+  slot.waiter = undefined;
+  next({ status: "run", prior: slot.sig });
+}
+
+/** A fix round's identity for a step that waited behind another: the session anchor, the effective
+ * mode and the starter. A stop → restart (a new anchor), a mode change or another starter is a new
+ * round; anything else is a re-trigger of the round that already ran. */
+function roundSignature(session: LoopSession, settings: BotSettings): string {
+  return `${isoMs(session.startIso)}|${effectiveLoopMode(session.mode, settings)}|${(session.starter ?? "").toLowerCase()}`;
+}
+
+/** How long a second step waits for its head's running step: that step's own worst case (every
+ * attempt queued to the ceiling, then generating twice its deadline). Every await in a step is
+ * bounded (transport timeouts, the fix watcher's deadlines, fixed sleeps), so this fires only on a
+ * bug. */
+function stepWaitMaxMs(deps: LoopRuntimeDeps | undefined, env: NodeJS.ProcessEnv | undefined): number {
+  const own = fixAttempts(env) * ((deps?.fixWatch?.queueMaxMs ?? fixQueueMaxMs(env)) + 2 * (deps?.fixTimeoutMs ?? fixTimeoutMs(env)));
+  return Math.min(Math.max(0, deps?.stepWaitMaxMs ?? own), MAX_TIMER_MS);
+}
 
 function envOf(): NodeJS.ProcessEnv | undefined {
   return typeof process !== "undefined" ? process.env : undefined;
@@ -815,9 +900,14 @@ export async function runPostReviewLoop(
     }
   };
 
-  const stepKey = `${owner}/${repo}#${pr}@${headSha}`;
-  if (inFlightSteps.has(stepKey)) return { ran: false, reason: STEP_IN_FLIGHT };
-  inFlightSteps.add(stepKey);
+  const stepKey = `${prKey(ref)}@${headSha}`;
+  const slots = stepSlots(deps);
+  const claimed = claimStep(slots, stepKey, stepWaitMaxMs(deps, env));
+  if (claimed instanceof Promise) trace(job.id, "step-waits", { pr, head: headSha.slice(0, 7) });
+  const turn = claimed instanceof Promise ? await claimed : claimed;
+  if (turn.status === "replaced") return { ran: false, reason: STEP_REPLACED };
+  if (turn.status === "expired") return { ran: false, reason: STEP_WAIT_EXPIRED };
+  const prior = turn.prior; // the round the step this one waited behind ran, if any
   try {
     d = deps ?? (await productionDeps(settings));
     const gh = d.gh;
@@ -867,6 +957,11 @@ export async function runPostReviewLoop(
       }
     }
     if (!session.active) return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
+    // A step that waited behind a round of this very session, mode and starter (a re-trigger
+    // mid-round): that round's report or handoff is the result — no second FIXING, provider call
+    // or suggestion. A new session, mode or starter runs its own round on these fresh reads.
+    const sig = roundSignature(session, settings);
+    if (prior !== undefined && prior === sig) return { ran: false, reason: ROUND_ALREADY_RUN };
     requested = true;
     const current = sessionRef(session); // the step's session, as every later check compares it
     since = current;
@@ -1096,6 +1191,10 @@ export async function runPostReviewLoop(
           return why ? MOOT_TEXT[why] : null;
         },
       });
+    // The round reaches the provider: a step waiting behind this one runs no second round for the
+    // same session, mode and starter.
+    const slot = slots.get(stepKey);
+    if (slot) slot.sig = sig;
     // Progress signal: the fix can wait long in a busy provider queue — a driver must be able to
     // tell "in progress" from "dead". Best effort: it never blocks or fails the round.
     await gh.createIssueComment(token, { owner, repo, pr, body: fixingComment({ round: rounds.length, pr, head: headSha }) }).catch(() => {});
@@ -1201,7 +1300,7 @@ export async function runPostReviewLoop(
     // server-side error (no PR noise on a PR that never asked for a loop).
     return requested ? await escalate("loop-error", reason) : { ran: false, reason };
   } finally {
-    inFlightSteps.delete(stepKey);
+    releaseStep(slots, stepKey);
   }
 }
 

@@ -8,7 +8,7 @@ import {sanitizeProgressEvents} from "./review-progress";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider, ProviderError } from "./types";
-import { BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, fixKnob, isChatProvider, providersFromSettings } from "./types";
+import { BINDING_LOST_MS, BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, fixKnob, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
 import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
 import { loadDotenvFile, writeEnvPatch } from "./dotenv-file.server";
@@ -158,6 +158,7 @@ function fixes() {
     maxPromptChars: () => fixKnob(getHarbor().settings.fixAgent, "chatMaxPromptChars"),
     claimMs: BRIDGE_CLAIM_MS,
     submitWindowMs: SUBMIT_WINDOW_MS,
+    bindingLostMs: BINDING_LOST_MS,
     // unref: a pending fix deadline must never keep the server (or a test runner) alive.
     setTimer: (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
     clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -255,6 +256,38 @@ function pendingChatProviders(job: Job): ReviewProvider[] {
   );
 }
 
+/** The leg's binding has been reported unavailable for BINDING_LOST_MS with no bound run since. */
+function bindingLostExpired(job: Job, provider: ReviewProvider, now: number): boolean {
+  const since = job.bindingLostAt?.[provider];
+  return since !== undefined && now - since >= BINDING_LOST_MS && job.providerErrors?.[provider]?.code === "disconnected";
+}
+
+/** Settle every leg whose original binding stayed unavailable past BINDING_LOST_MS as a provider
+ * failure, so its job ends instead of waiting unboundedly: the worker's heartbeats keep the claim
+ * fresh (never re-offered) and `disconnected` is not terminal. Runs on each heartbeat and on each
+ * take, so a worker that stopped heartbeating is bounded too. */
+function settleLostBindings(jobs: readonly Job[]) {
+  const now = Date.now();
+  for (const job of [...jobs]) {
+    if (job.status !== "awaiting_chat") continue;
+    const lost = pendingChatProviders(job).filter(provider => bindingLostExpired(job, provider, now));
+    if (!lost.length) continue;
+    const message = `original job binding unavailable for ${Math.round(BINDING_LOST_MS / 60_000)} min with no bound run reported`;
+    patchHarborJob(job.id, current => {
+      const next = {...current, generating: {...current.generating}, providerErrors: {...current.providerErrors},
+        bindingLostAt: {...current.bindingLostAt}, assumptions: [...(current.assumptions ?? [])], updatedAt: now};
+      for (const provider of lost) {
+        next.generating[provider] = false;
+        next.providerErrors[provider] = {code: "error", message};
+        delete next.bindingLostAt[provider];
+        next.assumptions = [...next.assumptions.filter(note => !note.startsWith(`Skipped ${provider}:`)), `Skipped ${provider}: ${message}`];
+      }
+      return next;
+    });
+    for (const provider of lost) cancelLocalJsonRepairs("superseded", job.id, provider);
+  }
+}
+
 export function bridgeJobState(jobId: string) {
   if (isFixItemId(jobId)) return fixes().state(jobId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
@@ -314,6 +347,7 @@ export type BridgeOffer = NonNullable<ReturnType<typeof nextBridgeJob>> | FixOff
  * answer (it would wait for review JSON forever) is never offered a fix item. */
 export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = [], options: {fixes?: boolean} = {}): BridgeOffer | null {
   meta.lastTakeAt = Date.now();
+  settleLostBindings(getHarbor().jobs);
   // A fix tab pastes its prompt in the foreground exactly like a review tab: one submission per
   // Chrome profile across BOTH kinds (see SUBMIT_WINDOW_MS).
   if (fixes().submitting(clientId, excludeJobIds)) return null;
@@ -428,8 +462,9 @@ export function refreshBridgeClaim(
   leaseId?: string,
 ): boolean {
   if (isFixItemId(jobId)) {
-    // Provider errors on a fix are terminal only via the explicit failure action.
-    const accepted = fixes().refresh(jobId, leaseId, generating);
+    // Provider errors on a fix are terminal only via the explicit failure action, or once its
+    // binding has stayed unavailable past BINDING_LOST_MS (a heartbeat must not hold it forever).
+    const accepted = fixes().refresh(jobId, leaseId, generating, errors);
     if (accepted) meta.lastJobId = jobId;
     return accepted;
   }
@@ -438,21 +473,27 @@ export function refreshBridgeClaim(
   patchHarborJob(jobId, current => {
     const nextGenerating = {...current.generating};
     const nextErrors = {...current.providerErrors};
+    const lostAt = {...current.bindingLostAt};
     const enabled = pendingChatProviders(current);
     for (const provider of enabled) {
       const error = errors?.[provider];
       if (error) {
         nextErrors[provider] = error;
         nextGenerating[provider] = error.code === "disconnected";
+        // The bound starts at the FIRST binding-less heartbeat of an unbroken run of them.
+        if (error.code === "disconnected") lostAt[provider] ??= Date.now();
+        else delete lostAt[provider];
       } else if (generating?.[provider] === true) {
         delete nextErrors[provider];
+        delete lostAt[provider];
         nextGenerating[provider] = true;
       }
       // A bare false flag says nothing about completion. Final JSON is stored by complete;
       // terminal failures require their explicit provider-specific outcome.
     }
-    return {...current, bridgeClaimedAt: Date.now(), generating: nextGenerating, providerErrors: nextErrors, updatedAt: Date.now()};
+    return {...current, bridgeClaimedAt: Date.now(), generating: nextGenerating, providerErrors: nextErrors, bindingLostAt: lostAt, updatedAt: Date.now()};
   });
+  settleLostBindings(getHarbor().jobs.filter(job => job.id === jobId));
   meta.lastJobId = jobId;
   return true;
 }

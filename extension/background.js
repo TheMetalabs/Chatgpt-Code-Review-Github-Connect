@@ -700,7 +700,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.51";
+const WORKER_BUILD = "1.1.52";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2203,10 +2203,18 @@ async function deliverOutcome(job, provider, jobs, signal) {
   workerStep(job, provider, "delivery_pending");
   await saveJobs(jobs);
   const body = out.ok
-    ? {action: "complete", repairProtocol: 1, captureProtocol:job.captureProtocol, jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw, originalText: out.originalText}]}
+    ? {action: "complete", repairProtocol: 1, captureProtocol:job.captureProtocol, salvaged: out.salvaged === true, jobId: job.jobId, leaseId: job.leaseId, raw: out.raw, results: [{provider, raw: out.raw, originalText: out.originalText}]}
     : {action: "failure", jobId: job.jobId, leaseId: job.leaseId, provider, error: `${out.code}: ${out.error}`};
   try { await api("/api/bridge", body, job.origin, signal); }
   catch (e) {
+    // A salvaged leg has no repair left to wait for: a server that still demands one ends the leg
+    // (live aicc #457 looped delivery_pending/repair_needs_attention for 3 h and never went stale).
+    if (e.status === 422 && e.code === "json_repair_required" && out.ok && out.salvaged) {
+      // Still the salvage's own terminal outcome: the durable-archive guard above must let it through.
+      state.outcome = {...failure("json_invalid", "the review answer was not valid JSON and its repair needs attention"), salvaged: true};
+      await saveJobs(jobs);
+      return deliverOutcome(job, provider, jobs, signal); // a failure is never sent back: this ends once
+    }
     if (e.status === 422 && e.code === "json_repair_required" && out.ok) {
       state.formatError = true; // Preserve the original outbox; never turn it into an empty leg.
       await saveJobs(jobs);

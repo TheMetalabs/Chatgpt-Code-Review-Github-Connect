@@ -21,7 +21,7 @@
  * Per-finding `dispositions` are ADVISORY metadata for the thread replies (design §5 step 6):
  * malformed entries are dropped, never a parse failure — they cannot gate or change a push.
  */
-import { lastJsonObject } from "./extract-chat-json.ts";
+import { CHAT_CITATION_MARKER, lastJsonObject } from "./extract-chat-json.ts";
 import { escapeStrayQuotes } from "./review-json-repair.ts";
 import { FIX_ATTACHMENT_MISMATCH_REPLY } from "./fix-attachment.ts";
 
@@ -113,10 +113,9 @@ function repairedFixJson(text: string): string | null {
   return fixed ? lastJsonObject(fixed, isFixObject) : null;
 }
 
-/** ChatGPT's citation marker (live aicc #455 job-muikyyt7-185): the model wrote
- * `:chatgpt-content-reference{index="0"}` inside a JSON string of its fenced answer, and the marker's
- * bare quotes broke the JSON. It cites the attachment and is never part of a fix. */
-const CITATION_MARKER = /[ \t]*:chatgpt-content-reference\{[^{}\n]*\}/g;
+// Live aicc #455 (job-muikyyt7-185): the model wrote ChatGPT's citation marker inside a JSON string
+// of its fenced fix answer (extract-chat-json.ts CHAT_CITATION_MARKER).
+const CITATION_MARKER = CHAT_CITATION_MARKER;
 
 /** How a reply's fix JSON was found: as written, once the chat's citation markers were removed,
  * by the stray-quote repair, or not at all. */

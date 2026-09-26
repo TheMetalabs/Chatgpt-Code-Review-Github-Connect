@@ -218,6 +218,7 @@ describe("buildFixPrompt fix discipline", () => {
     ["defer scope creep [C Pitfalls]", /Deferred to an issue instead of ballooning the change/],
     ["evidence contract", /A decline or defer MUST cite evidence in its note: an issue number \(#123\), a file:line, or a quoted code reference\. Without it the disposition is invalid/],
     ["TDD [A6][C4]", /9\. TDD: every fix comes with a failing-first regression test .* "test needed: <test file or location>"/],
+    ["pinned tests follow the behavior change [A One round 5][C4][C5b] (aicc #455 0b756d0d)", /9\. TDD: .* Before changing a behavior, find the existing tests that pin it\. Either update them to the new contract in this reply, with the reason in the disposition note \(not a weakened assertion\), or do not change that behavior\./],
     ["centralize shared fixes [C Pitfalls]", /10\. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not per call-site/],
     ["doc sync [C round zero 2]", /11\. Doc sync: .* update it in the same reply/],
     ["one round = one commit [A6][C4]", /12\. One round = one commit/],

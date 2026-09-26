@@ -137,10 +137,17 @@ export function fixRules(source: "inline" | "github"): string[] {
     "   instead of ballooning the change. A decline or defer MUST cite evidence in its note: an issue",
     "   number (#123), a file:line, or a quoted code reference. Without it the disposition is invalid",
     "   and the reply is rejected.",
-    // [A] Fix recipe 6 · [C] The Loop 3 table (Fix = TDD) + 4 + Round zero 3 (tests + error paths).
+    // [A] Fix recipe 6 ("TDD (failing test first)") · [C] The Loop 3 table (Fix = "TDD the fix
+    // (failing test first), then code") + 4 ("Fix valid findings with TDD") + Round zero 3 ("Tests +
+    // error paths for any logic change"). The pinned-test clause applies [A] One round 5 ("touched-unit
+    // tests every push") and [C] The Loop 5b ("Touched-file Jest ... Expect new regressions — fixes
+    // routinely introduce the next round's findings") to a single reply that cannot run tests: aicc
+    // #455 0b756d0d changed a behavior and left the same file's regression test pinning the old one.
     "9. TDD: every fix comes with a failing-first regression test (error paths included for a logic",
     "   change) in the code's test file if it is editable; otherwise the note says",
-    "   \"test needed: <test file or location>\".",
+    "   \"test needed: <test file or location>\". Before changing a behavior, find the existing",
+    "   tests that pin it. Either update them to the new contract in this reply, with the reason in",
+    "   the disposition note (not a weakened assertion), or do not change that behavior.",
     // [C] Pitfalls ("Centralize shared fixes").
     "10. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not",
     "   per call-site.",

@@ -1004,9 +1004,13 @@ function submissionConfirmed(record) {
   const attempt = state?.sendAttempt;
   const reviewNamed = !fix && typeof namesNoConversation === "function" && Boolean(attempt?.conversation) &&
     !namesNoConversation(attempt.conversation) && normalizePrompt(messagePromptText(match)) === record.expected;
+  // A fix clicked on the temporary chat may already show the /c/<id>?temporary-chat=true ChatGPT
+  // moved that send to (live 1.1.42): that is the conversation it was sent in (json.js
+  // providerMovedTemporaryChat); a move anywhere else records nothing.
+  const moved = fix && typeof providerMovedTemporaryChat === "function" && providerMovedTemporaryChat(attempt?.conversation, globalThis.location?.href);
   if ((fix || reviewNamed) && !record.conversation && attempt?.key === submissionKey() && attempt.conversation &&
-      stillShowsConversation(attempt.conversation)) {
-    record.conversation = attempt.conversation;
+      (moved || stillShowsConversation(attempt.conversation))) {
+    record.conversation = moved ? shownConversation() : attempt.conversation;
   }
   state.confirmedSubmission = {key: submissionKey(), record};
   state.submissionPersistencePending = true;

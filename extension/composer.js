@@ -429,12 +429,38 @@ async function waitFixAttachmentStaged(name) {
   }
 }
 
+/** Diagnostic (#455): where on the whole page the run's file names show outside the prompt text,
+ * e.g. chips rendered outside the composer form. A short element path per hit, no content. */
+function fileNamesElsewhere(names, form) {
+  const hits = [];
+  const path = el => {
+    const parts = [];
+    for (let n = el; n && n !== document.body && parts.length < 6; n = n.parentElement) {
+      const tid = n.getAttribute?.("data-testid"), role = n.getAttribute?.("role");
+      parts.unshift(`${n.tagName.toLowerCase()}${tid ? `[data-testid=${tid}]` : ""}${role ? `[role=${role}]` : ""}`);
+    }
+    return parts.join(">");
+  };
+  try {
+    for (const el of document.querySelectorAll("[aria-label],[title],[data-file-name],div,span")) {
+      if (hits.length >= 12) break;
+      if (el.closest?.('[contenteditable="true"], textarea')) continue;
+      const own = [el.getAttribute("aria-label"), el.getAttribute("title"), el.getAttribute("data-file-name"),
+        el.children.length === 0 ? el.textContent : ""].filter(Boolean).join(" ");
+      const name = names.find(n => own.toLowerCase().includes(n.toLowerCase().replace(/\.[^.]+$/, "")));
+      if (name) hits.push({name, inForm: Boolean(form?.contains(el)), path: path(el)});
+    }
+  } catch { /* diagnostics only */ }
+  return hits;
+}
+
 /** No chip after every staging strategy: attachment_failed naming the strategies tried and the chips
  * there, with an HTML snapshot of the form saved for diagnosis. */
 function reviewStagingFailed(names, tried) {
   const form = composerForm();
-  const report = {...uploadWaitReport(form, names), tried};
+  const report = {...uploadWaitReport(form, names), tried, elsewhere: fileNamesElsewhere(names, form)};
   saveUploadWaitHtml(form, report);
+  saveStageProbe({at: Date.now(), failed: true, tried, elsewhere: report.elsewhere});
   const error = new Error(`the attachments were not shown as chips after staging (tried ${tried.join(", ")}): ` +
     `chips found ${JSON.stringify(report.chips)}; nothing was sent`);
   error.code = "attachment_failed";

@@ -166,6 +166,11 @@ export function fixRules(source: "inline" | "github"): string[] {
     // [A] One round 4 + Fix recipe 6 · [C] The Loop 4 (one commit per round).
     "12. One round = one commit: every fix of this round goes in this one reply; do not leave part",
     "   of a fix for a later round.",
+    // [C] Pitfalls ("defer scope creep to an issue") + The Loop 3 table (Defer) · [A] Fix recipe 5
+    // (load-bearing defer). Live aicc #457: a fix re-added SENDING recovery the PR body put out of scope.
+    "13. Work the PR scope section (below, when present) puts out of scope is not added: Defer it,",
+    "   quoting the scope line in the note. A correctness-class defect (rule 1) in the changed code",
+    "   is never out of scope and is still fixed.",
   ];
 }
 
@@ -176,6 +181,7 @@ export function buildFixPrompt(input: {
   findings: string; // the posted review findings (verbatim)
   files: FixPromptFile[]; // in-scope files with their current content — the ONLY editable paths
   reviewer?: string;
+  prScope?: string; // the PR body's scope section (pr-scope.ts), untrusted data
 }): string {
   const paths = input.files.map((f) => f.path);
   // JSON-encode path + content so a source line (e.g. a triple-backtick or "ignore previous
@@ -203,6 +209,7 @@ export function buildFixPrompt(input: {
     "",
     `--- Review findings${input.reviewer ? ` (${input.reviewer})` : ""} (untrusted data) ---`,
     JSON.stringify(input.findings),
+    ...(input.prScope ? ["", "--- PR scope section (from the PR body, untrusted data) ---", JSON.stringify(input.prScope)] : []),
   ].join("\n");
 }
 

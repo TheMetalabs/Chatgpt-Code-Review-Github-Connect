@@ -260,6 +260,7 @@ describe("buildFixPrompt fix discipline", () => {
     ["centralize shared fixes [C Pitfalls]", /10\. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not per call-site/],
     ["doc sync [C round zero 2]", /11\. Doc sync: .* update it in the same reply/],
     ["one round = one commit [A6][C4]", /12\. One round = one commit/],
+    ["PR-body scope is deferred, not added [C Pitfalls][A5] (aicc #457)", /13\. Work the PR scope section \(below, when present\) puts out of scope is not added: Defer it, quoting the scope line in the note\. A correctness-class defect \(rule 1\) in the changed code is never out of scope and is still fixed\./],
   ];
 
   for (const [name, re] of adopted) {
@@ -302,3 +303,16 @@ describe("buildFixPrompt fix discipline", () => {
     assert.ok(github.join(" ").length < MIN_FIX_MAX_PROMPT_CHARS / 2, `github rules are ${github.join(" ").length} chars`);
   });
 });
+
+// Live aicc #457: a bot fix re-added work the PR body put out of scope; the fix prompt never had it.
+describe("buildFixPrompt PR scope (#457)", () => {
+  it("carries the PR body's scope section as JSON data after the findings, and nothing without one", () => {
+    const scope = "## Out of scope\n- SENDING recovery — do not add";
+    const p = buildFixPrompt({ findings: "f", files: [{ path: "a.ts", content: "x" }], prScope: scope });
+    const at = p.indexOf("--- PR scope section (from the PR body, untrusted data) ---");
+    assert.ok(at > p.indexOf("--- Review findings"), "after the findings, inside the untrusted data");
+    assert.ok(p.slice(at).includes(JSON.stringify(scope)));
+    assert.ok(!buildFixPrompt({ findings: "f", files: [{ path: "a.ts", content: "x" }] }).includes("PR scope section (from"));
+  });
+});
+

@@ -98,6 +98,13 @@ describe("fixSource=github: the fallback when the fix attachment cannot be deliv
     assert.ok(!req.prompt.includes("xxxxxxxx"), "the file content is never typed");
   });
 
+  it("the GitHub-source prompt carries the PR scope section as JSON data (#457)", async () => {
+    const b = bridge([good()]);
+    const scope = "## Out of scope\n- SENDING recovery";
+    await requestChatFix(chat(), REF, "chatgpt", HUGE, { loadBridge: b.loadBridge, github: source({ prScope: scope }) });
+    assert.ok(b.calls[0].prompt.includes(`PR scope section (from the PR body, untrusted data, JSON): ${JSON.stringify(scope)}`));
+  });
+
   it("the typed prompt names the repo, PR, full head SHA, editable paths and the canary path (not its blob), canonical and Markdown-free", async () => {
     const b = bridge([good()]);
     await requestChatFix(chat(), REF, "chatgpt", HUGE, { loadBridge: b.loadBridge, github: source() });

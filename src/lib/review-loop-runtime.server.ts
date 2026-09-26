@@ -63,6 +63,7 @@ import { buildFixPrompt, runFixRound, type FixRoundResult, type FixValidate, typ
 import { BranchMovedError, type GitDataApi } from "./fix-commit.ts";
 import type { FixRequest } from "./bridge-fix.server.ts";
 import { FixAttachmentError, fixAttachment, fixTypedPrompt, type FixAttachment } from "./fix-attachment.ts";
+import { prScopeSection } from "./pr-scope.ts";
 import { attachmentSwitch, isConnectorUnavailable, requestConnectorFix, type GithubFixSource } from "./fix-source-github.ts";
 import { ANSWER_AS_FILE, fixAnswerDiagnosis, isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
@@ -1300,10 +1301,12 @@ export async function runPostReviewLoop(
       .filter((f) => changed.has(f.path) && isSafeFixPath(f.path))
       .map((f) => ({ path: f.path, content: f.content }));
     if (files.length === 0) return await escalate("loop-error", "no editable changed files in the snapshot");
+    const prScope = prScopeSection(sample.body ?? "");
     const basePrompt = buildFixPrompt({
       findings: renderFindings(findings),
       files,
       reviewer: settings.fixAgent.provider ?? undefined,
+      ...(prScope ? { prScope } : {}),
     });
     // ONE relevance predicate for every checkpoint of the round — before it starts, while queued,
     // at generation start, before a retry, before the commit, right before the branch ref moves
@@ -1435,6 +1438,7 @@ export async function runPostReviewLoop(
       paths: editablePaths,
       findings: renderFindings(findings),
       ...(settings.fixAgent.provider ? { reviewer: settings.fixAgent.provider } : {}),
+      ...(prScope ? { prScope } : {}),
       headBlobs: () => {
         const api = gh.gitDataApi(token, owner, repo);
         if (!api.blobShas) return Promise.reject(new Error("the GitHub client cannot read the head tree's blobs"));
@@ -1470,7 +1474,7 @@ export async function runPostReviewLoop(
     for (;;) {
       attempts += 1;
       const t0 = Date.now();
-      trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, provider: settings.fixAgent.provider ?? "none" });
+      trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, prScopeChars: prScope.length, provider: settings.fixAgent.provider ?? "none" });
       res = await runFixRound(
         {
           requestFix,

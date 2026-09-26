@@ -152,7 +152,7 @@ export interface Job {
   attemptedProviders?: ReviewProvider[];
   generating?: Partial<Record<ReviewProvider, boolean>>;
   /** Review-coverage: prompt attachment sizes, measured at prompt assembly. */
-  promptStats?: { diffChars: number; contextChars: number; policyChars: number; diffFilesFull: number; diffFilesTotal: number };
+  promptStats?: { diffChars: number; contextChars: number; policyChars: number; diffFilesFull: number; diffFilesTotal: number; scopeChars?: number };
   /** Review-coverage: model-reported per-file coverage. Never affects the verdict. */
   coverage?: { file: string; status: "cleared" | "not_cleared"; reason: string }[];
   /** Review-coverage: deterministic (harness) coverage per changed code file. */

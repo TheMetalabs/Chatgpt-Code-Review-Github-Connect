@@ -87,6 +87,35 @@ describe("runFixRound", () => {
     assert.equal(f.committed, false);
   });
 
+  // Live aicc #439: the replies the prompts ask for, and an answer given as a file, are told apart
+  // from an unparseable reply.
+  it("ATTACHMENT_MISMATCH is a request failure (attachment_mismatch), never parse-failed; CONNECTOR_UNAVAILABLE ends as connector_unavailable", async () => {
+    const f = fakeApi();
+    const unfenced = (text: string) => `<<<ASHLAR_UNFENCED_ANSWER>>> {"unfenced":true,"fileLinks":0,"canvas":false,"formatted":0,"truncated":false}\n${text}`;
+    const mismatch = await runFixRound({ requestFix: async () => unfenced("ATTACHMENT_MISMATCH"), api: f.api }, { ...base, mode: "apply" });
+    assert.deepEqual([mismatch.ok, mismatch.outcome], [false, "request-failed"]);
+    assert.match(mismatch.error ?? "", /^attachment_mismatch: /);
+    const connector = await runFixRound({ requestFix: async () => "CONNECTOR_UNAVAILABLE", api: f.api }, { ...base, mode: "apply" });
+    assert.deepEqual([connector.outcome, /^connector_unavailable: /.test(connector.error ?? "")], ["request-failed", true]);
+    assert.equal(f.committed, false);
+  });
+
+  it("an answer given as a download link is parse-failed with answer_as_file (the retry is told to put the JSON in the chat)", async () => {
+    const f = fakeApi();
+    const raw = '<<<ASHLAR_UNFENCED_ANSWER>>> {"unfenced":true,"fileLinks":1,"canvas":false,"formatted":1,"truncated":false}\nThe fix is ready: ashlar-fix.json';
+    const res = await runFixRound({ requestFix: async () => raw, api: f.api }, { ...base, mode: "apply" });
+    assert.deepEqual([res.ok, res.outcome], [false, "parse-failed"]);
+    assert.match(res.error ?? "", /^answer_as_file: /);
+    assert.equal(f.committed, false);
+  });
+
+  it("an unfenced JSON answer is parsed and applied", async () => {
+    const f = fakeApi();
+    const raw = `<<<ASHLAR_UNFENCED_ANSWER>>> {"unfenced":true,"fileLinks":0,"canvas":false,"formatted":0,"truncated":false}\nChecked the hash.\n${FIX_JSON}`;
+    const res = await runFixRound({ requestFix: async () => raw, api: f.api, validate: async () => ({ ok: true }) }, { ...base, mode: "apply" });
+    assert.equal(res.outcome, "applied", res.error);
+  });
+
   it("rejects an out-of-scope path before any commit (scope containment)", async () => {
     const f = fakeApi();
     const oos = '{"summary":"x","newFiles":[{"path":"src/other.ts","content":"pwn"}]}';

@@ -21,11 +21,11 @@
  *   - fix-apply.ts stays the only parser of the reply (canary and baseBlobSha included).
  */
 import { fixRules } from "./fix-agent.ts";
-import { fixReplyCanary, parseFixResponse, type FixCanary } from "./fix-apply.ts";
+import { CONNECTOR_UNAVAILABLE_REPLY, fixReplyCanary, parseFixResponse, type FixCanary } from "./fix-apply.ts";
 import { plainMarkdownLine } from "./fix-attachment.ts";
 
 /** The one reply the prompt asks for when the model cannot read the repository at that commit. */
-export const CONNECTOR_UNAVAILABLE_REPLY = "CONNECTOR_UNAVAILABLE";
+export { CONNECTOR_UNAVAILABLE_REPLY };
 export const CONNECTOR_UNAVAILABLE = "connector_unavailable";
 
 export type FixSourceSwitch = "attachment_too_large" | "attachment_failed";

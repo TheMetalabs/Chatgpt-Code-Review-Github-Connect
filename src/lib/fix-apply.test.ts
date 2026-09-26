@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { applyFixEdits, FIX_BLOCK_BREAK, fixReplyCanary, isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
+import { applyFixEdits, FIX_BLOCK_BREAK, FIX_UNFENCED_MARK, fixAnswerParts, fixReplyCanary, fixReplySignal, isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
 
 const ok = (raw: string) => {
   const r = parseFixResponse(raw);
@@ -254,5 +254,44 @@ describe("dispositions (advisory per-finding verdicts for the thread replies)", 
   it("notes are capped", () => {
     const [d] = parseDispositions([{ finding: "F1", action: "fixed", note: "x".repeat(5000) }]);
     assert.equal(d.note.length, 1000);
+  });
+});
+
+// Live aicc #439 (job-muigs9hp-171, extension 1.1.49): three chatgpt fix answers had no fenced code
+// block, the page delivered a placeholder and the server parse-failed twice on it. The page now
+// delivers the visible text under FIX_UNFENCED_MARK and its flags (extension/json.js boundAnswerText).
+describe("unfenced chat fix answers (#439)", () => {
+  const unfenced = (text: string, flags: Record<string, unknown> = {}) =>
+    `${FIX_UNFENCED_MARK} ${JSON.stringify({ unfenced: true, fileLinks: 0, canvas: false, formatted: 0, truncated: false, ...flags })}\n${text}`;
+  const FIX = '{"summary":"guard","edits":[{"path":"src/a.ts","search":"const a = 1;","replace":"const a = 2;"}],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
+
+  it("an unfenced JSON answer is parsed (prose around it, the mark line stripped)", () => {
+    const r = parseFixResponse(unfenced(`I verified the SHA-256.\n\n${FIX}\n\nDone.`));
+    assert.equal(r.ok, true, r.ok ? "" : r.error);
+    assert.deepEqual(r.ok && r.fix.edits.map((e) => e.replace), ["const a = 2;"]);
+    assert.deepEqual(fixAnswerParts(unfenced("x")), { body: "x", shape: { unfenced: true, fileLinks: 0, canvas: false, formatted: 0, truncated: false } });
+    assert.deepEqual(fixAnswerParts(FIX), { body: FIX }, "a fenced harvest has no mark");
+  });
+
+  it("an unfenced answer whose text the chat rendered as Markdown is never applied (retried)", () => {
+    const r = parseFixResponse(unfenced(FIX, { formatted: 2 }));
+    assert.equal(r.ok, false);
+    assert.match(r.ok ? "" : r.error, /^unfenced_rewritten: .*```json block/);
+  });
+
+  it("exactly ATTACHMENT_MISMATCH or CONNECTOR_UNAVAILABLE says what it is; a mention in prose does not", () => {
+    for (const raw of ["ATTACHMENT_MISMATCH", unfenced("ATTACHMENT_MISMATCH"), unfenced("`ATTACHMENT_MISMATCH`."), "ATTACHMENT_MISMATCH\n"]) {
+      assert.equal(fixReplySignal(raw), "attachment_mismatch", raw);
+    }
+    assert.equal(fixReplySignal(unfenced("CONNECTOR_UNAVAILABLE")), "connector_unavailable");
+    assert.equal(fixReplySignal(unfenced("The SHA-256 matches, so no ATTACHMENT_MISMATCH. Working on it.")), undefined);
+    assert.equal(fixReplySignal("sorry, I cannot"), undefined);
+  });
+
+  it("an answer given as a file, a download link or a canvas with no JSON in the chat is answer_as_file", () => {
+    assert.equal(fixReplySignal(unfenced("Here is the fix file: ashlar-fix.json", { fileLinks: 1 })), "answer_as_file");
+    assert.equal(fixReplySignal(unfenced("I wrote the fix in the canvas.", { canvas: true })), "answer_as_file");
+    assert.equal(fixReplySignal("Download it: sandbox:/mnt/data/fix.json"), "answer_as_file");
+    assert.equal(fixReplySignal(unfenced(`${FIX} (also as a file)`, { fileLinks: 1 })), undefined, "a JSON in the chat is parsed, not a file");
   });
 });

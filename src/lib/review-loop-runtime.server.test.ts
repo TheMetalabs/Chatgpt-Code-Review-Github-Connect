@@ -680,6 +680,16 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.equal(kept.sha256, createHash("sha256").update("not json at all").digest("hex"));
   });
 
+  it("an answer given as a download link gets the one feedback retry telling it to put the JSON in the chat (#439)", async () => {
+    const asFile = '<<<ASHLAR_UNFENCED_ANSWER>>> {"unfenced":true,"fileLinks":1,"canvas":false,"formatted":0,"truncated":false}\nDownload the fix: ashlar-fix.json';
+    const f = fakeDeps({ start: "apply", rounds: [3], reply: [asFile, '{"summary":"ok","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 3;"}]}'] });
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.attempts === 2, JSON.stringify(r));
+    assert.match(f.prompts[1], /PREVIOUS ATTEMPT REJECTED \(parse-failed\)/);
+    assert.match(f.prompts[1], /write the fix JSON object itself in this chat message as one ```json block/);
+    assert.match(f.prompts[1], /answer_as_file/);
+  });
+
   it("a search that is missing or not unique is retried with the reason (validation-failed)", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3], reply: ['{"summary":"s","edits":[{"path":"src/a.ts","search":"export const b = 1;","replace":"x"}]}', '{"summary":"ok","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}'] });
     const r = await run(f, "apply");
@@ -1555,6 +1565,10 @@ describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; gro
     assert.ok(req.attachment.body.endsWith(CHAT_FIX_FENCE_DETAIL));
     assert.match(CHAT_FIX_FENCE_DETAIL, /ENTIRE JSON object in exactly one ```json fenced code block/);
     assert.match(CHAT_FIX_FENCE_DETAIL, /\\u0060\\u0060\\u0060/);
+    // Live aicc #439: an answer given as a file or canvas is never read; the attachment says so.
+    assert.match(CHAT_FIX_FENCE_DETAIL, /You may read and verify the attachment, but write the answer in this chat message as one ```json block/);
+    assert.match(CHAT_FIX_FENCE_DETAIL, /never return it as a file, a download link or a canvas, and never only describe it/);
+    assert.ok(!req.prompt.includes("download link"), "the typed line is unchanged");
     assert.ok(!req.prompt.includes("ENTIRE") && !req.prompt.includes("u0060"), "the detail is not typed");
   });
 

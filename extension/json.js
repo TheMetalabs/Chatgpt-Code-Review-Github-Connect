@@ -209,16 +209,101 @@ function renderedIn(el, root) {
   return true;
 }
 
+/** The first line of a fix answer delivered WITHOUT a fenced block (src/lib/fix-apply.ts
+ * FIX_UNFENCED_MARK), then one JSON object of flags; the answer's visible text follows. A function:
+ * content scripts are re-injected. */
+function fixUnfencedMark() {
+  return "<<<ASHLAR_UNFENCED_ANSWER>>>";
+}
+
+/** The most visible text an unfenced fix answer delivers (UTF-8 bytes). */
+function fixUnfencedMaxBytes() {
+  return 256 * 1024;
+}
+
+/** `text` cut to at most `max` UTF-8 bytes, on a character boundary. */
+function clipUtf8(text, max) {
+  let bytes = 0, at = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (bytes > max) return text.slice(0, at);
+    at += ch.length;
+  }
+  return text;
+}
+
+/** What a fix answer holds besides text (live aicc #439: an answer with no fenced block): links or
+ * buttons to a file (sandbox:/files links, a download attribute, a 다운로드/Download control), a
+ * canvas (textdoc), and inline formatting outside code (rendered Markdown, which may have rewritten
+ * JSON text). Counts only, never content. */
+function fixAnswerShape(root) {
+  const shape = {fileLinks: 0, canvas: false, formatted: 0};
+  if (!root?.matches || !root.querySelectorAll) return shape;
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
+  for (const turn of turns) {
+    for (const a of turn.querySelectorAll("a")) {
+      const href = a.getAttribute("href") || "";
+      if (a.hasAttribute("download") || /^sandbox:/i.test(href) || /files\.oaiusercontent|\/backend-api\/(files|estuary)|\/mnt\/data\//i.test(href)) shape.fileLinks += 1;
+    }
+    for (const b of turn.querySelectorAll("button, [role='button']")) {
+      if (/다운로드|download/i.test(`${b.textContent || ""} ${b.getAttribute("aria-label") || ""}`)) shape.fileLinks += 1;
+    }
+    shape.canvas ||= Boolean(turn.querySelector("[id^='textdoc'], [data-testid*='canvas'], [data-testid*='textdoc']"));
+    shape.formatted += [...turn.querySelectorAll("em, strong, del, s, a, code")].filter(el => !el.closest("pre")).length;
+  }
+  return shape;
+}
+
+/** The assistant turn's HTML for diagnosis, without scripts, styles, icons, inline handlers and
+ * data: sources, cut to 200 KB. */
+function strippedAnswerHtml(root) {
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
+  const html = turns.map(turn => {
+    const clone = turn.cloneNode(true);
+    for (const node of clone.querySelectorAll("script, style, svg, noscript, template")) node.remove();
+    for (const el of [clone, ...clone.querySelectorAll("*")]) {
+      for (const attr of [...el.attributes]) {
+        if (/^on|^style$/i.test(attr.name) || (attr.name === "src" && /^data:/i.test(attr.value))) el.removeAttribute(attr.name);
+      }
+    }
+    return clone.outerHTML;
+  }).join("\n");
+  return clipUtf8(html, 200 * 1024);
+}
+
+/** Diagnostic: the collected fix answer's turn HTML, in chrome.storage.local "fixAnswerHtml" (last 3);
+ * "fixAnswerHtmlOff" true turns it off. Never affects the run. */
+function saveFixAnswerHtml(root, meta) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local || !root?.matches || !root.querySelectorAll) return;
+    const html = strippedAnswerHtml(root);
+    globalThis.__ashlarFixHarvestProbeWrites = (globalThis.__ashlarFixHarvestProbeWrites || Promise.resolve()).then(async () => {
+      const got = await local.get(["fixAnswerHtml", "fixAnswerHtmlOff"]);
+      if (got?.fixAnswerHtmlOff === true) return;
+      const stored = Array.isArray(got?.fixAnswerHtml) ? got.fixAnswerHtml : [];
+      await local.set({fixAnswerHtml: [...stored, {...meta, html}].slice(-3)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
 /** A bound response's canonical answer text, what its collector harvested and what every later
- * completion proof must match: a review's full rendered corpus, a fix's fenced code only (or a
- * fixed no-JSON line when it has none, so the server's fix parser fails closed). */
+ * completion proof must match: a review's full rendered corpus, a fix's fenced code only. A fix
+ * answer with no fenced block (live aicc #439) delivers its visible text instead, under the
+ * unfenced mark and its flags, bounded to fixUnfencedMaxBytes: the server parses a JSON object in
+ * it or reports what the answer was (a file, ATTACHMENT_MISMATCH), never a placeholder. */
 function boundAnswerText(kind, root, stats) {
   const prose = assistantCorpus(root).join("\n\n");
   if (kind !== "fix" || !prose.trim()) return prose;
   const blocks = assistantCodeBlocks(root, stats);
+  const shape = fixAnswerShape(root);
+  if (stats) Object.assign(stats, {textChars: prose.length, fileLinks: shape.fileLinks, canvas: shape.canvas, unfenced: !blocks.length});
   // Blocks in order, split by a line no JSON contains: one JSON the page rendered over two blocks
   // is joined back by the server's parser.
-  return blocks.length ? blocks.join(`\n${fixBlockBreak()}\n`) : "(no fenced code block in the answer; the fix JSON must be inside a ```json fence)";
+  if (blocks.length) return blocks.join(`\n${fixBlockBreak()}\n`);
+  const text = clipUtf8(prose, fixUnfencedMaxBytes());
+  return `${fixUnfencedMark()} ${JSON.stringify({unfenced: true, ...shape, truncated: text.length < prose.length})}\n${text}`;
 }
 
 function harvestJson(opts) {
@@ -1080,7 +1165,7 @@ function fixAnswerReply(state, msg, value, busy) {
 
 /** A review-loop FIX answer is plain text for the server's deterministic fix parser: harvest
  * the bound response's fenced code blocks (literal text, see assistantCodeBlocks) — or, when it
- * has none, a fixed no-JSON line — after the same positive completion controls and two identical stable
+ * has none, its visible text under the unfenced mark (boundAnswerText) — after the same positive completion controls and two identical stable
  * observations as a review, with no review-JSON requirement and no capture/repair evidence (a
  * fix item has neither lane). It ends on the answer, on quota, on a PERMANENT ownership verdict
  * (fixVerdictPermanent: `taken_over` at once, never at the deadline) or when the server settles the
@@ -1129,7 +1214,9 @@ async function waitUntilFixOrQuota(name) {
       stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
       if (settleStableAnswer(stability, text, poll, {text, raw: text})) {
         saveFixHarvestProbe({at: Date.now(), jobId: runner?.jobId, runId: runner?.runId, blocks: harvest.blocks || 0,
-          totalChars: harvest.totalChars || 0, answerChars: text.length, collapsed: Boolean(harvest.collapsed), expanded: stability.expanded});
+          totalChars: harvest.totalChars || 0, answerChars: text.length, collapsed: Boolean(harvest.collapsed), expanded: stability.expanded,
+          unfenced: Boolean(harvest.unfenced), fileLinks: harvest.fileLinks || 0, canvas: Boolean(harvest.canvas), textChars: harvest.textChars || 0});
+        saveFixAnswerHtml(own, {at: Date.now(), jobId: runner?.jobId, runId: runner?.runId});
         return text;
       }
     } else { stability.hits = 0; stability.stable = ""; }

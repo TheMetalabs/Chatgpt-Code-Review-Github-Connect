@@ -64,7 +64,7 @@ import { BranchMovedError, type GitDataApi } from "./fix-commit.ts";
 import type { FixRequest } from "./bridge-fix.server.ts";
 import { FixAttachmentError, fixAttachment, fixTypedPrompt, type FixAttachment } from "./fix-attachment.ts";
 import { attachmentSwitch, isConnectorUnavailable, requestConnectorFix, type GithubFixSource } from "./fix-source-github.ts";
-import { ANSWER_AS_FILE, isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
+import { ANSWER_AS_FILE, fixAnswerDiagnosis, isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { archiveFixRaw, defaultFixRawDir } from "./fix-raw-archive.server.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
@@ -1478,6 +1478,7 @@ export async function runPostReviewLoop(
           validate,
           // A rejected answer is kept locally (bounded) and its shape logged: live aicc #455 failed
           // twice with "no fix JSON object found" and nothing to tell the harvest from the model.
+          onAnswer: (raw) => trace(job.id, "fix-answer", { attempt: attempts, ...fixAnswerDiagnosis(raw) }),
           onParseFailure: (raw, error) => {
             const { record, file, writeError } = archiveFixRaw(defaultFixRawDir(), { jobId: job.id, attempt: attempts, raw, error });
             trace(job.id, "fix-raw", { attempt: attempts, chars: record.chars, sha256: record.sha256.slice(0, 16), file, writeError });

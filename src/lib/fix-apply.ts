@@ -113,19 +113,59 @@ function repairedFixJson(text: string): string | null {
   return fixed ? lastJsonObject(fixed, isFixObject) : null;
 }
 
-/** The fix JSON object of a reply, wherever it sits: prose around it, split over blocks, or with a
- * stray-quote slip the review repair also fixes. null when none of these yields one. */
-export function findFixJson(raw: string): string | null {
+/** ChatGPT's citation marker (live aicc #455 job-muikyyt7-185): the model wrote
+ * `:chatgpt-content-reference{index="0"}` inside a JSON string of its fenced answer, and the marker's
+ * bare quotes broke the JSON. It cites the attachment and is never part of a fix. */
+const CITATION_MARKER = /[ \t]*:chatgpt-content-reference\{[^{}\n]*\}/g;
+
+/** How a reply's fix JSON was found: as written, once the chat's citation markers were removed,
+ * by the stray-quote repair, or not at all. */
+export type FixJsonVia = "plain" | "cleaned" | "repaired" | "none";
+
+function locateFixJson(raw: string): { json: string | null; via: FixJsonVia } {
   const candidates = fixJsonCandidates(fixAnswerParts(raw).body);
   for (const c of candidates) {
     const json = lastJsonObject(c, isFixObject);
-    if (json) return json;
+    if (json) return { json, via: "plain" };
   }
-  for (const c of candidates) {
+  // Only a reply that did not parse as written is cleaned: a valid one keeps every byte.
+  const cleaned = candidates.filter((c) => c.search(CITATION_MARKER) >= 0).map((c) => c.replace(CITATION_MARKER, ""));
+  for (const c of cleaned) {
+    const json = lastJsonObject(c, isFixObject);
+    if (json) return { json, via: "cleaned" };
+  }
+  for (const c of [...candidates, ...cleaned]) {
     const json = repairedFixJson(c);
-    if (json) return json;
+    if (json) return { json, via: "repaired" };
   }
-  return null;
+  return { json: null, via: "none" };
+}
+
+/** The fix JSON object of a reply, wherever it sits: prose around it, split over blocks, with the
+ * chat's citation markers in it, or with a stray-quote slip the review repair also fixes. null when
+ * none of these yields one. */
+export function findFixJson(raw: string): string | null {
+  return locateFixJson(raw).json;
+}
+
+/** One fix answer's shape for the log, never its content: how the page delivered it (code blocks
+ * or unfenced text), its size, what the chat did to it (Markdown formatting, file links, a canvas,
+ * citation markers) and how its JSON was found. Each parse failure today had a different cause
+ * (no block, a block without <pre>, rendered Markdown, a citation marker); this line tells them apart. */
+export function fixAnswerDiagnosis(raw: string): Record<string, string | number | boolean> {
+  const text = String(raw ?? "");
+  const { body, shape } = fixAnswerParts(text);
+  return {
+    mode: shape ? "unfenced" : "blocks",
+    blocks: shape ? 0 : body.split(FIX_BLOCK_BREAK).length,
+    chars: body.length,
+    formatted: shape?.formatted ?? 0,
+    fileLinks: shape?.fileLinks ?? 0,
+    canvas: shape?.canvas ?? false,
+    truncated: shape?.truncated ?? false,
+    citations: (body.match(CITATION_MARKER) ?? []).length,
+    json: locateFixJson(text).via,
+  };
 }
 
 export interface FixFile {

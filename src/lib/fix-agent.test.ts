@@ -255,6 +255,7 @@ describe("buildFixPrompt fix discipline", () => {
     ["defer scope creep [C Pitfalls]", /Deferred to an issue instead of ballooning the change/],
     ["evidence contract", /A decline or defer MUST cite evidence in its note: an issue number \(#123\), a file:line, or a quoted code reference\. Without it the disposition is invalid/],
     ["TDD [A6][C4]", /9\. TDD: every fix comes with a failing-first regression test .* "test needed: <test file or location>"/],
+    ["callee contract, real-contract mocks, network assertion [A6][A One round 5][C Pitfalls] (aicc #464 6e36222e)", /9\. TDD: .* Read each callee's implementation before relying on its return value or side effect\. A test mock returns what the real function returns, never what the fix needs; a test that a destructive action is sent asserts the network\/API call itself \(method and path\)\./],
     ["pinned tests follow the behavior change [A One round 5][C4][C5b] (aicc #455 0b756d0d)", /9\. TDD: .* Before changing a behavior, find the existing tests that pin it\. Either update them to the new contract in this reply, with the reason in the disposition note \(not a weakened assertion\), or do not change that behavior\./],
     ["centralize shared fixes [C Pitfalls]", /10\. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not per call-site/],
     ["doc sync [C round zero 2]", /11\. Doc sync: .* update it in the same reply/],
@@ -284,7 +285,9 @@ describe("buildFixPrompt fix discipline", () => {
   });
 
   it("the fixed instructions stay far under the prompt-size floor and the attachment cap", () => {
-    assert.ok(instructions.length < MIN_FIX_MAX_PROMPT_CHARS / 2, `instructions are ${instructions.length} chars`);
+    // 60% of the floor: the rules grew with the adopted skill guidance (rule 9, aicc #464); at the
+    // floor the file contents still get 4 KB, and real fix prompts are 100-300 KB.
+    assert.ok(instructions.length < MIN_FIX_MAX_PROMPT_CHARS * 0.6, `instructions are ${instructions.length} chars`);
     assert.ok(Buffer.byteLength(instructions, "utf8") < FIX_ATTACHMENT_MAX_BYTES / 64);
   });
 

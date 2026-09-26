@@ -688,14 +688,38 @@ function fixSentInTemporaryChat(submission) {
  * or to another temporary chat (its turn is not ours). Returns "adopted"; "pending" while that
  * proof cannot be read yet (a reloaded page not yet showing the turn or its card: transient, not a
  * move away); else "". */
+/** Diagnostic (#93, 1.1.44–45 live "tab moved"): why a moved temporary fix page was not adopted.
+ * chrome.storage.local "fixMoveProbes", last 10; URL shapes and flags only. */
+function shapeOf(url) {
+  try { const u = new URL(String(url || "")); return `${u.host}${u.pathname.startsWith("/c/") ? "/c/*" : u.pathname}${u.search}`; }
+  catch { return url ? "unparsable" : "none"; }
+}
+function fixMoveProbe(state, submission, href, reason) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local || state?.lastMoveProbe === reason) return;
+    if (state) state.lastMoveProbe = reason;
+    const record = {at: Date.now(), job: state?.jobId, reason, url: shapeOf(href), sendAttempt: Boolean(state?.sendAttempt),
+      phase: submission?.phase, users: typeof userTurnEls === "function" ? userTurnEls().length : -1};
+    globalThis.__ashlarMoveProbeWrites = (globalThis.__ashlarMoveProbeWrites || Promise.resolve()).then(async () => {
+      const stored = (await local.get(["fixMoveProbes"]))?.fixMoveProbes;
+      await local.set({fixMoveProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-10)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
 function adoptMovedTemporaryChat(state, submission) {
-  if (submission?.phase !== "sent" || submission.conversation !== fixChatPage() || !state || state.tabRepurposed) return "";
-  let key;
-  try { key = submissionKey(); } catch { return ""; }
   const href = globalThis.location?.href;
-  if (state.temporaryChatAdopted === key || !temporaryChatConversation(conversationIdentity(href))) return "";
+  const probe = reason => { fixMoveProbe(state, submission, href, reason); return reason; };
+  if (submission?.phase !== "sent") return probe("not_sent"), "";
+  if (submission.conversation !== fixChatPage()) return probe(`identity_not_bare:${shapeOf(submission.conversation)}|want:${shapeOf(fixChatPage())}`), "";
+  if (!state || state.tabRepurposed) return probe("repurposed"), "";
+  let key;
+  try { key = submissionKey(); } catch { return probe("no_key"), ""; }
+  if (state.temporaryChatAdopted === key) return probe("already_adopted"), "";
+  if (!temporaryChatConversation(conversationIdentity(href))) return probe(`not_temp_conversation:${shapeOf(conversationIdentity(href))}`), "";
   const clean = temporaryChatMoveClean(state, submission);
-  if (clean !== "clean") return clean === "pending" ? "pending" : "";
+  if (clean !== "clean") { probe(`move_not_clean:${state.moveCleanWhy || clean}`); return clean === "pending" ? "pending" : ""; }
   submission.conversation = conversationIdentity(href);
   state.temporaryChatAdopted = key;
   if (state.confirmedSubmission?.record === submission) {
@@ -715,22 +739,26 @@ function adoptMovedTemporaryChat(state, submission) {
  * id is rebound here when the moved page renders the same turn under another (or no) id, so later
  * proofs (journaledTurnIntegrity) keep finding it. */
 function temporaryChatMoveClean(state, submission) {
+  state.moveCleanWhy = "";
   const names = submission.attachments;
-  if (typeof submission.exact !== "string" || !Array.isArray(names) || !names.length || submission.submittedUsers !== 1) return "user";
+  if (typeof submission.exact !== "string" || !Array.isArray(names) || !names.length || submission.submittedUsers !== 1)
+    return (state.moveCleanWhy = `journal exact:${typeof submission.exact} names:${Array.isArray(names) ? names.length : "-"} submittedUsers:${submission.submittedUsers}`), "user";
   const draft = composerDraftText();
-  if (composerStagedFiles(state, submission).length || (draft && normalizePrompt(draft) !== submission.expected)) return "user";
+  if (composerStagedFiles(state, submission).length || (draft && normalizePrompt(draft) !== submission.expected))
+    return (state.moveCleanWhy = `draft staged:${composerStagedFiles(state, submission).length} draftLen:${(draft || "").length}`), "user";
   const users = userTurnEls();
-  if (!users.length) return "pending";
-  if (users.length !== 1 || !fixTurnExact(users[0], submission.exact, names)) return "user";
-  if (typeof turnAttachments === "function" && !turnAttachments(users[0], names).shown) return "pending";
+  if (!users.length) return (state.moveCleanWhy = "no_user_turn"), "pending";
+  if (users.length !== 1 || !fixTurnExact(users[0], submission.exact, names))
+    return (state.moveCleanWhy = `users:${users.length} exact:${users.length ? fixTurnExact(users[0], submission.exact, names) : "-"} textLen:${users.length ? ((typeof turnTextRoot === "function" ? turnTextRoot(users[0]) : users[0])?.textContent || "").length : "-"} wantLen:${submission.exact.length}`), "user";
+  if (typeof turnAttachments === "function" && !turnAttachments(users[0], names).shown) return (state.moveCleanWhy = "card_not_shown"), "pending";
   if (journaledTurnIntegrity(submission, users) !== "exact") {
     const {messageId: _stale, ...rebound} = submission;
     const id = turnMessageId(users[0]);
     if (id) rebound.messageId = id;
-    if (journaledTurnIntegrity(rebound, users) !== "exact") return "user";
+    if (journaledTurnIntegrity(rebound, users) !== "exact") return (state.moveCleanWhy = `integrity:${journaledTurnIntegrity(rebound, users)}`), "user";
     if (id) submission.messageId = id; else delete submission.messageId;
   }
-  if (boundReviewResponse(submission).followup) return "user";
+  if (boundReviewResponse(submission).followup) return (state.moveCleanWhy = "followup"), "user";
   return "clean";
 }
 

@@ -72,13 +72,31 @@ export function selectPriorThreads(rows: readonly ReviewCommentRow[], botLogin: 
     });
 }
 
-/** Untrusted text must not close the block or open another marker. */
-function flat(text: string, max: number): string {
-  const t = String(text ?? "").replace(/<<</g, "‹‹‹").replace(/>>>/g, "›››").replace(/\s+/g, " ").trim();
+/**
+ * Untrusted text as render-stable plain text. ChatGPT renders a sent user turn as Markdown, and the
+ * extension binds the turn by its text (composer.js reviewTurnHolds), so nothing here may be
+ * transformed by that rendering: links keep their text and URL, `<`/`>` (HTML, autolinks, the
+ * block markers) become ‹ ›, backslash escapes and entities are defused, emphasis and code markers
+ * are dropped, and all whitespace collapses to one line so no content starts a Markdown block.
+ */
+function plain(text: string, max: number): string {
+  const t = String(text ?? "")
+    .replace(/!?\[([^\]\n]*)\]\(([^()\s]*)\)/g, "$1 ($2)")
+    .replace(/</g, "‹").replace(/>/g, "›")
+    .replace(/\\/g, "∖")
+    .replace(/&(?=#?\w+;)/g, "& ")
+    .replace(/[`]/g, "'")
+    .replace(/[*~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
   return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
-/** The thread lines, newest first, bounded by count and total chars (whole entries only). */
+/**
+ * The thread lines, newest first, bounded by count and total chars (whole entries only). Each entry
+ * starts with a fixed word, never a list, heading or quote marker (aicc #455: the Markdown list form
+ * rendered as <li>, whose text drops the `- ` the sent prompt holds).
+ */
 export function formatPriorThreads(
   threads: readonly PriorThread[],
   opts: { maxThreads?: number; maxChars?: number; replyMax?: number } = {},
@@ -88,9 +106,9 @@ export function formatPriorThreads(
   const replyMax = opts.replyMax ?? PRIOR_REPLY_MAX_CHARS;
   const out: string[] = [];
   let used = 0;
-  for (const t of threads.slice(0, maxThreads)) {
-    const where = `${flat(t.file, 200)}${t.line ? `:${t.line}` : ""}`;
-    const entry = `- ${where} — ${flat(t.title, 200)}\n  reply (${flat(t.replyBy, 60)}): ${flat(t.reply, replyMax)}`;
+  for (const [i, t] of threads.slice(0, maxThreads).entries()) {
+    const where = `${plain(t.file, 200)}${t.line ? `:${t.line}` : ""}`;
+    const entry = `Thread ${i + 1} — ${where} — ${plain(t.title, 200)}\nReply by ${plain(t.replyBy, 60)}: ${plain(t.reply, replyMax)}`;
     if (used + entry.length + 1 > maxChars) break;
     out.push(entry);
     used += entry.length + 1;

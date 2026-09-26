@@ -112,6 +112,7 @@ describe("fixSource=github: the fallback when the fix attachment cannot be deliv
     assert.match(prompt, /"baseBlobSha"/, "the schema asks for each file's base blob");
     assert.match(prompt, /"edits": \[\{"path": "<an editable path>", "baseBlobSha": "[^"]+", "search": "[^"]+", "replace"/, "targeted edits, not whole files");
     assert.match(prompt, /Never return an existing file whole/);
+    assert.match(prompt, /11\. Preserve: keep every existing comment, test and the file's formatting/);
     assert.match(prompt, /a is wrong/, "the findings");
     assert.ok(isCanonicalLine(prompt), "one whitespace-canonical line (#103)");
     assert.ok(rendersAsTyped(prompt), "no Markdown-active characters");
@@ -184,7 +185,7 @@ describe("fixSource=github: server validation before the commit (runFixRound, ap
     const git = gitApi();
     const res = await runFixRound(
       { requestFix: (p) => requestChatFix(chat(), REF, "chatgpt", p, { loadBridge: b.loadBridge, github: source() }), api: git.api, validate: async () => ({ ok: true }) },
-      { prompt: HUGE, mode: "apply", branch: "feature", baseCommitSha: HEAD, message: "fix", allowedPaths: [A, B, NEW_PATH], baseFiles: new Map(Object.entries(HEAD_FILES)), findingCount: 1 },
+      { prompt: HUGE, mode: "apply", branch: "feature", baseCommitSha: HEAD, message: "fix", allowedPaths: [A, B, NEW_PATH], baseFiles: new Map(Object.entries(HEAD_FILES)), flagged: [{ path: A, line: 1 }], findingCount: 1 },
     );
     return { res, git };
   };

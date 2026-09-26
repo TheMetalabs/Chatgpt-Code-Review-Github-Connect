@@ -5,12 +5,14 @@
  * and `GitDataApi` (the push) are injected, so this unit-tests without the server graph and
  * the transport/wiring is chosen by the caller (harbor) per `fixAgent` settings. The fix is
  * a set of targeted search/replace edits (full content only for new files), parsed and applied
- * against the head-pinned content deterministically (fix-apply); `suggest` mode returns the change
- * set for a proposal, `apply` mode commits it atomically (fix-commit).
+ * against the head-pinned content deterministically (fix-apply), then checked by the scope guard
+ * (fix-scope-guard); `suggest` mode returns the change set for a proposal, `apply` mode commits it
+ * atomically (fix-commit).
  *
  * INVARIANTS (fail-closed): request-failed on transport error; parse-failed on a bad reply;
  * scope-violation on an out-of-scope OR sensitive path (independent of allowedPaths);
- * validation-failed when an edit does not apply (search missing / not unique / overlapping), if no
+ * validation-failed when an edit does not apply (search missing / not unique / overlapping), when
+ * the scope guard rejects the diff (comments or tests removed, a reformat, a mass deletion), if no
  * validator is supplied or the candidate fails it; commit-failed if the atomic push throws. Every
  * validation-failed carries a precise reason the runtime feeds back for one retry. The branch ref
  * moves ONLY on a fully validated candidate.
@@ -20,6 +22,7 @@
  */
 import { applyFixEdits, isSensitivePath, parseFixResponse, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { commitFiles, type GitDataApi } from "./fix-commit.ts";
+import { checkFixScope, type FlaggedLine } from "./fix-scope-guard.ts";
 import type { GithubFixSource } from "./fix-source-github.ts";
 
 export type FixMode = "suggest" | "apply";
@@ -104,6 +107,10 @@ export function fixRules(source: "inline" | "github"): string[] {
     "   note says \"test needed: <test file or location>\".",
     "10. A decline or defer MUST cite evidence in its note: an issue number (#123), a file:line,",
     "   or a quoted code reference. Without it the disposition is invalid and the reply is rejected.",
+    "11. Preserve: keep every existing comment, test and the file's formatting. Never reformat,",
+    "   re-indent, re-quote or delete comments or tests; change only the lines the fix needs. The",
+    "   server rejects a change that removes comments or tests outside the flagged lines,",
+    "   reformats lines, or deletes far more than it adds.",
   ];
 }
 
@@ -165,6 +172,8 @@ export async function runFixRound(
     /** Head-pinned content of every existing editable file (path → content at baseCommitSha): the
      * base every edit is applied to. A path absent here is a new file. */
     baseFiles: ReadonlyMap<string, string>;
+    /** The findings' file:line, the ranges the scope guard lets the fix rewrite freely. */
+    flagged?: readonly FlaggedLine[];
     /** Findings the prompt listed (F1..Fn): a no-change answer must classify every one. */
     findingCount?: number;
   },
@@ -200,6 +209,14 @@ export async function runFixRound(
   const applied = applyFixEdits(parsed.fix, opts.baseFiles);
   if (!applied.ok) return { ok: false, outcome: "validation-failed", error: applied.error, summary, dispositions };
   const files = applied.files;
+
+  // Deterministic scope guard on the resulting diff, in both modes: a proposal that drops comments
+  // or tests is as wrong as a commit that does.
+  const scope = checkFixScope(
+    files.map((f) => ({ path: f.path, before: applied.before.get(f.path), after: f.content })),
+    opts.flagged ?? [],
+  );
+  if (!scope.ok) return { ok: false, outcome: "validation-failed", error: scope.error, files, summary, dispositions };
 
   if (opts.mode === "suggest") {
     return { ok: true, outcome: "suggested", files, summary, dispositions };

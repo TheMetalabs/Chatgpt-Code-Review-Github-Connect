@@ -977,6 +977,16 @@ function reviewTurnHolds(turnText, expected) {
   return want.length > 400 && shown.includes(want.slice(0, 160)) && shown.includes(want.slice(-160));
 }
 
+/** Whether a rendered user turn is EXACTLY a review prompt: the same normalized text, or (Markdown
+ * having restyled it) the same plain rendering. The 2026-09 page renders a sent prompt's `code`
+ * spans as <code> (live 1.1.47, aicc #439 and #93: a review-loop round prompt quoting `f02ec26`). */
+function reviewTurnExact(turnText, expected) {
+  if (!expected) return false;
+  if (normalizePrompt(turnText) === expected) return true;
+  const want = renderedPlain(expected);
+  return Boolean(want) && renderedPlain(turnText) === want;
+}
+
 function submissionConfirmed(record) {
   const turns = userTurns();
   const state = globalThis.__ashlarRunnerState;

@@ -176,7 +176,11 @@ function boundReviewResponse(submission) {
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
     user = users[submission.submittedUsers - 1];
   }
-  if (!user || !submission.expected || !normalizePrompt(typeof messagePromptText === "function" ? messagePromptText(user) : user.textContent || user.innerText).includes(submission.expected)) {
+  // The containment rule the send was confirmed by (composer.js reviewTurnHolds): a rendered turn
+  // restyles Markdown in the prompt (`code` spans shown as <code>), and a stricter rule here left a
+  // confirmed send never bound (live 1.1.47: waiting_for_response for 100+ min, aicc #439).
+  const shown = !user ? "" : typeof messagePromptText === "function" ? messagePromptText(user) : user.textContent || user.innerText;
+  if (!user || !submission.expected || !(typeof reviewTurnHolds === "function" ? reviewTurnHolds(shown, submission.expected) : normalizePrompt(shown).includes(submission.expected))) {
     return {root: null, followup: false, identified: false};
   }
   // Some renderers assign message IDs after mounting the text. Pin that identity
@@ -524,7 +528,8 @@ function journaledTurnIntegrity(submission, users) {
   }
   if (!turn) return "unknown";
   if (typeof submission.exact === "string") return fixTurnExact(turn, submission.exact, submission.attachments) ? "exact" : "edited";
-  return normalizePrompt(messagePromptText(turn)) === submission.expected ? "exact" : "edited";
+  const shown = messagePromptText(turn);
+  return (typeof reviewTurnExact === "function" ? reviewTurnExact(shown, submission.expected) : normalizePrompt(shown) === submission.expected) ? "exact" : "edited";
 }
 
 /** Whether a fix's sent turn holds its prompt's lossless form `exact` (composer.js fixPromptForm). A
@@ -1013,6 +1018,10 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   const cardsOf = turn => fix && typeof turnAttachments === "function" && Array.isArray(submission?.attachments)
     ? turnAttachments(turn, submission.attachments).cards : undefined;
   const promptOf = turn => norm(typeof messagePromptText === "function" ? messagePromptText(turn, cardsOf(turn)) : turn.textContent);
+  // A review turn is exactly its prompt also when Markdown restyled it (composer.js reviewTurnExact:
+  // `code` spans rendered as <code>); a fix turn is held to its normalized text (and `exact`, below).
+  const promptIs = (turn, expected) => !fix && typeof reviewTurnExact === "function" && typeof messagePromptText === "function"
+    ? reviewTurnExact(messagePromptText(turn), expected) : promptOf(turn) === expected;
   const href = globalThis.location?.href || "";
   const users = userTurnEls();
   // Ashlar's own prompt in the composer (before or after the send) is not a user draft; anything
@@ -1035,7 +1044,7 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
     // (content proves nothing about WHICH page this is). The just-clicked turn, exactly the prompt:
     // `unsent`. The worker also requires the page the tab was opened on for both.
     if (!users.length) return {ownership: "owned", blank: true};
-    if (submission?.baseline === 0 && users.length === 1 && promptOf(users[0]) === submission.expected) return {ownership: "owned", unsent: true};
+    if (submission?.baseline === 0 && users.length === 1 && promptIs(users[0], submission.expected)) return {ownership: "owned", unsent: true};
     return takeOver("user_turn");
   }
   // An in-page (SPA) move can leave this DOM on screen under another conversation's URL: once the
@@ -1081,7 +1090,7 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   // send-time record and its pin need an exact turn, a fix's collector ends on any other, and an
   // unpinned turn that merely contains the prompt may be the user's edit around it (Ashlar
   // 4101062732). Any other text is an edit.
-  if (sent !== submission.expected) return takeOver("edited");
+  if (!promptIs(turn, submission.expected)) return takeOver("edited");
   // A fix turn is also held to its prompt's lossless form (#77, fixTurnExact): a fix prompt inlines
   // source whose whitespace is content, so a turn whose whitespace alone changed is an edit too.
   if (fix && typeof submission.exact === "string" && typeof fixPromptForm === "function" && !fixTurnExact(turn, submission.exact, submission.attachments)) {

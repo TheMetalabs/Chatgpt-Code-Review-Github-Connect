@@ -80,38 +80,71 @@ const RULE_4_GITHUB = [
   "   rejected. Unsafe/absolute/`..` paths are rejected.",
 ];
 
-/** The fix rules, as prompt lines. */
+/**
+ * The fix rules, as prompt lines: a single-shot adaptation of the two review-loop skills, not
+ * rules invented per case. Sources (cited per rule below):
+ *   [A] ashlar-review-loop SKILL.md — "Fix recipe", "One round".
+ *   [C] codex-review-loop-to-convergence SKILL.md — "The Loop" steps 2/3/3b/3c/4, "Round zero"
+ *       steps 2/3, "Pitfalls".
+ * Dropped because a single chat reply cannot do them: requesting reviews, polling, CI and
+ * touched-test runs, DIRTY checks, pushing, shadow/subagent re-audits, live-smoke, merge and
+ * ESCALATE. The in-thread reply and the single commit are done by the runtime from this reply.
+ * Rules 4 and 5 and the evidence clause of rule 8 are the output contract (fix-apply parses them).
+ */
 export function fixRules(source: "inline" | "github"): string[] {
   return [
-    "0. MINIMAL CHANGE. Make only the smallest change that resolves each finding. Everything else in",
-    "   every file stays byte-for-byte as it is: comments (especially WHY comments), docblocks, tests,",
-    "   formatting, blank lines, imports, names and unrelated code. Never delete, rewrite, reorder or",
-    "   reformat a line you are not fixing, however large the file. Never delete or weaken an existing",
-    "   test. A reply that removes comments, tests or unrelated lines is wrong even if it compiles.",
+    // [A] Fix recipe 1 · [C] The Loop 2 (triage by content) + 3 (four outcomes).
     "1. Classify each finding by CONTENT, ignoring its P-tag: Fix / Push-back (rebut with",
-    "   evidence) / Decline (reason + evidence) / Defer (issue# + code marker). Do NOT 'fix' a false",
-    "   positive — you would plant a real bug to satisfy a fake one.",
-    "2. Root cause once: re-audit the flagged file plus siblings for the SAME defect class and fix",
-    "   every instance in this pass (a call-site census of every entry point a guard protects), each",
-    "   as its own small targeted edit. Reading the whole file is for finding instances, never a",
-    "   licence to rewrite it.",
-    "3. Nth same-class finding → remove the bad state (root cause), do not add another guard.",
+    "   evidence) / Decline (reason + trace) / Defer (issue# + code marker). Correctness-class",
+    "   (scope/tenant/permission leak, data loss/corruption, security, crash) must be fixed whatever",
+    "   the tag; behavior-class (stale state, wrong endpoint, error-handling gap) is fixed unless",
+    "   provably intended; mechanical/cosmetic (doc-sync, naming, fixture drift) is folded in",
+    "   alongside the other fixes, never a round of its own.",
+    // [A] Fix recipe 1 · [C] The Loop 3 ("verify, do not perform agreement") + Pitfalls (stale commit).
+    "2. Verify the premise against the current content before accepting. Do NOT 'fix' a false",
+    "   positive — you would plant a real bug to satisfy a fake one. A finding already resolved in",
+    "   the current content is answered with the file:line that resolves it, not re-fixed.",
+    // [A] Fix recipe 2 · [C] The Loop 3b (full-file re-audit, call-site census) + Pitfalls (fixes cause the next round).
+    "3. (Highest yield) Re-audit the whole flagged file + sibling files and fix the entire defect",
+    "   class in this one reply — plus a call-site census of every entry point a guard protects",
+    "   (every writer, caller, transition of the operation family), each covered here. The reviewer",
+    "   leaks one defect per file per pass; a narrow line fix = exactly one more round. Re-read your",
+    "   own edits the same way: fixes cause the next round.",
     ...(source === "inline" ? RULE_4_INLINE : RULE_4_GITHUB),
+    // Output contract · [C] The Loop 7 (one reply per finding, census on the originating finding).
     "5. For EVERY finding ID below (F1, F2, …) add one \"dispositions\" entry: action fixed |",
-    "   pushback | decline | defer, and a one-sentence note — what you changed, or the evidence",
-    "   / reason you did not. It is posted as the reply in that finding's review thread.",
-    "6. Scope: change only what the flagged defect classes need. No renames, reformatting,",
-    "   refactors or comment edits outside the fix; keep the diff outside the defect class minimal.",
-    "7. Reuse first: prefer the existing proven helpers/guards in the files below. Add ONE shared",
-    "   helper (in one in-scope file) only when the same defect class appears in 2+ places; no",
-    "   other new abstractions.",
-    "8. Bounds: for every guard or clamp you add, the note states what it bounds and what happens",
-    "   when the condition never trips.",
-    "9. Tests: for each fixed finding add one regression test that fails without the fix, in the",
-    "   code's test file if it is in scope (added as new lines; existing tests untouched); otherwise the",
-    "   note says \"test needed: <test file or location>\".",
-    "10. A decline or defer MUST cite evidence in its note: an issue number (#123), a file:line,",
-    "   or a quoted code reference. Without it the disposition is invalid and the reply is rejected.",
+    "   pushback | decline | defer, and a one-sentence note — what you changed (with the census",
+    "   entry points covered), or the evidence / reason you did not. It is posted as the reply in",
+    "   that finding's review thread.",
+    // [A] Fix recipe 3 · [C] The Loop 3c.
+    "6. Nth same-class finding → remove the bad state, don't add another guard (a guard makes the",
+    "   bad state survivable; a root-cause fix makes it unreachable).",
+    // [A] Fix recipe 4 · [C] The Loop 3b (bounds paragraph).
+    "7. For every bound/clamp/budget you add, the note records what it limits and what the same",
+    "   operation does if the condition never fires — even when the answer is \"nothing, fine because X\".",
+    // [A] Fix recipe 5 · [C] The Loop 3 (load-bearing deferral) + Pitfalls (push back with proof,
+    // decline ≠ ignore, defer scope creep to an issue). The evidence clause is the output contract.
+    "8. Defer/Decline must be load-bearing: cite a tracked issue # and, where feasible, leave a code",
+    "   marker (`// deferred: see #NNN`); bare ones are re-flagged. Push back with proof (file:line,",
+    "   algebraic + edge cases), cite code, not assertions; adopt-with-pushback only for clarity and",
+    "   say so. A design-conflicting fix (e.g. a nonce where the contract mandates a fixed literal) is",
+    "   a Decline, not a Fix. Out-of-scope work (e.g. a concurrency TOCTOU) is Deferred to an issue",
+    "   instead of ballooning the change. A decline or defer MUST cite evidence in its note: an issue",
+    "   number (#123), a file:line, or a quoted code reference. Without it the disposition is invalid",
+    "   and the reply is rejected.",
+    // [A] Fix recipe 6 · [C] The Loop 3 table (Fix = TDD) + 4 + Round zero 3 (tests + error paths).
+    "9. TDD: every fix comes with a failing-first regression test (error paths included for a logic",
+    "   change) in the code's test file if it is editable; otherwise the note says",
+    "   \"test needed: <test file or location>\".",
+    // [C] Pitfalls ("Centralize shared fixes").
+    "10. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not",
+    "   per call-site.",
+    // [C] Round zero 2 (doc-sync lint) + 4 (nearest scoped CLAUDE.md contracts).
+    "11. Doc sync: when an editable doc (nearest scoped CLAUDE.md / AGENTS.md / README, changelog)",
+    "   states the behavior you change, update it in the same reply; honor the contracts it states.",
+    // [A] One round 4 + Fix recipe 6 · [C] The Loop 4 (one commit per round).
+    "12. One round = one commit: every fix of this round goes in this one reply; do not leave part",
+    "   of a fix for a later round.",
   ];
 }
 

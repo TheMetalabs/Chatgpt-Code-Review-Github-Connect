@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildFixPrompt, FIX_SCHEMA_INLINE, runFixRound } from "./fix-agent.ts";
+import { buildFixPrompt, FIX_SCHEMA_INLINE, fixRules, runFixRound } from "./fix-agent.ts";
 import { MIN_FIX_MAX_PROMPT_CHARS } from "./bridge-fix.server.ts";
 import { FIX_ATTACHMENT_MAX_BYTES } from "./fix-attachment.ts";
 import type { GitDataApi } from "./fix-commit.ts";
@@ -197,20 +197,43 @@ describe("buildFixPrompt fix discipline", () => {
   const p = buildFixPrompt({ findings: "[F1] [P1] a.ts:1 — x", files: [{ path: "a.ts", content: "x" }] });
   const instructions = p.split("--- Current file contents")[0];
 
-  it("carries the scope, reuse, bounds, tests and evidence rules", () => {
-    assert.match(instructions, /6\. Scope: change only what the flagged defect classes need\. No renames, reformatting,\n\s+refactors or comment edits outside the fix/);
-    assert.match(instructions, /7\. Reuse first: prefer the existing proven helpers\/guards[\s\S]*ONE shared\n\s+helper \(in one in-scope file\) only when the same defect class appears in 2\+ places/);
-    assert.match(instructions, /8\. Bounds: for every guard or clamp you add, the note states what it bounds and what happens\n\s+when the condition never trips/);
-    assert.match(instructions, /9\. Tests: for each fixed finding add one regression test that fails without the fix[\s\S]*existing tests untouched[\s\S]*"test needed: <test file or location>"/);
-    assert.match(instructions, /10\. A decline or defer MUST cite evidence in its note: an issue number \(#123\), a file:line,\n\s+or a quoted code reference/);
+  // The rules adapt the two review-loop skills ([A] ashlar-review-loop, [C] codex-review-loop-to-
+  // convergence); each phrase below is the skill's own wording for that rule.
+  const flat = instructions.replace(/\s+/g, " ");
+  const adopted: [string, RegExp][] = [
+    ["triage by content [A1][C2]", /1\. Classify each finding by CONTENT, ignoring its P-tag: Fix \/ Push-back \(rebut with evidence\) \/ Decline \(reason \+ trace\) \/ Defer \(issue# \+ code marker\)/],
+    ["correctness class fixed whatever the tag [C2]", /Correctness-class .* must be fixed whatever the tag; behavior-class .* is fixed unless provably intended; mechanical\/cosmetic .* folded in alongside/],
+    ["verify the premise [A1][C3]", /2\. Verify the premise .* Do NOT 'fix' a false positive — you would plant a real bug to satisfy a fake one/],
+    ["stale finding not re-fixed [C Pitfalls]", /already resolved in the current content is answered with the file:line that resolves it, not re-fixed/],
+    ["whole-class re-audit + census [A2][C3b]", /3\. \(Highest yield\) Re-audit the whole flagged file \+ sibling files and fix the entire defect class .* call-site census of every entry point a guard protects/],
+    ["narrow fix = one more round [A2]", /a narrow line fix = exactly one more round/],
+    ["fixes cause the next round [C Pitfalls]", /fixes cause the next round/],
+    ["remove the bad state [A3][C3c]", /6\. Nth same-class finding → remove the bad state, don't add another guard/],
+    ["bounds [A4][C3b]", /7\. For every bound\/clamp\/budget you add, the note records what it limits and what the same operation does if the condition never fires/],
+    ["load-bearing defer/decline [A5][C3]", /8\. Defer\/Decline must be load-bearing: cite a tracked issue # and, where feasible, leave a code marker/],
+    ["push back with proof [C Pitfalls]", /Push back with proof .* cite code, not assertions/],
+    ["design conflict is a Decline [A5]", /A design-conflicting fix .* is a Decline, not a Fix/],
+    ["defer scope creep [C Pitfalls]", /Deferred to an issue instead of ballooning the change/],
+    ["evidence contract", /A decline or defer MUST cite evidence in its note: an issue number \(#123\), a file:line, or a quoted code reference\. Without it the disposition is invalid/],
+    ["TDD [A6][C4]", /9\. TDD: every fix comes with a failing-first regression test .* "test needed: <test file or location>"/],
+    ["centralize shared fixes [C Pitfalls]", /10\. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not per call-site/],
+    ["doc sync [C round zero 2]", /11\. Doc sync: .* update it in the same reply/],
+    ["one round = one commit [A6][C4]", /12\. One round = one commit/],
+  ];
+
+  for (const [name, re] of adopted) {
+    it(`adopts the skill rule: ${name}`, () => assert.match(flat, re));
+  }
+
+  it("orders the rules as the skills do (triage → premise → re-audit → edits → dispositions → root cause → bounds → evidence → TDD)", () => {
+    const at = (n: string) => flat.indexOf(` ${n}. `);
+    const order = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"].map(at);
+    assert.ok(order.every((i) => i >= 0), `every rule is numbered: ${order}`);
+    assert.deepEqual([...order].sort((a, b) => a - b), order);
   });
 
-  it("puts the minimal-change rule first: comments, tests, formatting and unrelated code stay byte-for-byte (#439 P0)", () => {
-    assert.match(instructions, /0\. MINIMAL CHANGE\. Make only the smallest change that resolves each finding\./);
-    assert.match(instructions, /comments \(especially WHY comments\), docblocks, tests,\n\s+formatting, blank lines, imports, names and unrelated code/);
-    assert.match(instructions, /Never delete or weaken an existing\n\s+test/);
-    assert.match(instructions, /never a\n\s+licence to rewrite it/);
-    assert.ok(instructions.indexOf("0. MINIMAL CHANGE") < instructions.indexOf("1. Classify"), "rule 0 comes first");
+  it("drops the ad-hoc minimal-change / scope / reuse-helper rules the skills do not state", () => {
+    assert.doesNotMatch(flat, /MINIMAL CHANGE|byte-for-byte|licence to rewrite|Reuse first|No renames, reformatting/);
   });
 
   it("asks for targeted edits (full content only for new files) and the preserve rule", () => {
@@ -223,5 +246,16 @@ describe("buildFixPrompt fix discipline", () => {
   it("the fixed instructions stay far under the prompt-size floor and the attachment cap", () => {
     assert.ok(instructions.length < MIN_FIX_MAX_PROMPT_CHARS / 2, `instructions are ${instructions.length} chars`);
     assert.ok(Buffer.byteLength(instructions, "utf8") < FIX_ATTACHMENT_MAX_BYTES / 64);
+  });
+
+  it("the GitHub-source rules share every adopted rule and swap only rule 4 (baseBlobSha)", () => {
+    const inline = fixRules("inline");
+    const github = fixRules("github");
+    const gh = github.join(" ").replace(/\s+/g, " ");
+    for (const [, re] of adopted) assert.match(gh, re);
+    assert.match(gh, /4\. Change an existing file ONLY through "edits": each edit is \{path, baseBlobSha, search, replace\}/);
+    const withoutRule4 = (lines: string[]) => [...lines.slice(0, lines.findIndex((l) => l.startsWith("4."))), ...lines.slice(lines.findIndex((l) => l.startsWith("5.")))];
+    assert.deepEqual(withoutRule4(github), withoutRule4(inline));
+    assert.ok(github.join(" ").length < MIN_FIX_MAX_PROMPT_CHARS / 2, `github rules are ${github.join(" ").length} chars`);
   });
 });

@@ -153,9 +153,10 @@ export function fixRules(source: "inline" | "github"): string[] {
     "   \"test needed: <test file or location>\". Before changing a behavior, find the existing",
     "   tests that pin it. Either update them to the new contract in this reply, with the reason in",
     "   the disposition note (not a weakened assertion), or do not change that behavior.",
-    "   Read each callee's implementation before relying on its return value or side effect. A test",
-    "   mock returns what the real function returns, never what the fix needs; a test that a",
-    "   destructive action is sent asserts the network/API call itself (method and path).",
+    "   Read each callee's implementation before relying on its return value or side effect (one not",
+    "   shown: do not rely on it; note \"callee not in scope: <path>\"). A test mock returns what the",
+    "   real function returns, never what the fix needs; a test that a destructive action is sent",
+    "   asserts the network/API call itself (method and path).",
     // [C] Pitfalls ("Centralize shared fixes").
     "10. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not",
     "   per call-site.",

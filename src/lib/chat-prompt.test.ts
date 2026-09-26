@@ -6,6 +6,7 @@ import {
   CHAT_JSON_HINT,
   MERGE_FALLBACK_NOTE,
   PRIOR_THREAD_RULE,
+  PR_SCOPE_RULE,
   REVIEW_INSTRUCTIONS,
   REVIEW_OFFLINE_RULE,
   buildChatParts,
@@ -488,3 +489,19 @@ describe("prior finding threads (aicc #455)", () => {
     assert.equal(withThreads.replace(section, ""), base, "the block is purely additive");
   });
 });
+
+// Live aicc #457: the PR body put SENDING recovery out of scope; the review saw only its first 800
+// chars as UNTRUSTED_PR_BODY, and a later round added the work back.
+describe("PR scope block (#457)", () => {
+  const scoped = { ...SAMPLE_PRS["pay-412"], body: "## Summary\nx\n\n## Out of scope\n- SENDING recovery (#470)\n\n## Test plan\n- jest" };
+  it("the review prompt carries the PR body's scope section with its rule", () => {
+    const p = buildChatPrompt({ sample: scoped });
+    assert.ok(p.includes(`${PR_SCOPE_RULE}\n<<<UNTRUSTED_PR_SCOPE>>>\n## Out of scope\n- SENDING recovery (#470)\n<<<END>>>`));
+  });
+  it("a PR body without a scope statement leaves the prompt unchanged", () => {
+    const plain = { ...SAMPLE_PRS["pay-412"], body: "## Summary\nfix" };
+    assert.ok(!buildChatPrompt({ sample: plain }).includes("UNTRUSTED_PR_SCOPE"));
+    assert.equal(buildChatPrompt({ sample: plain }), buildChatPrompt({ sample: { ...plain, body: "" } }));
+  });
+});
+

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {source,json} from './load-source.mjs';
 import {background,storage} from './helpers.mjs';
 import {unitTurn,unitAnswer,renderUnitAnswer,unitCodeBlock} from './unit-dom.mjs';
-import {parseFixResponse} from '../../src/lib/fix-apply.ts';
+import {fixReplySignal,parseFixResponse} from '../../src/lib/fix-apply.ts';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;
 before(async()=>{browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});});
@@ -878,10 +878,61 @@ test('real DOM: a fix is read from its fenced code block literally, never from r
  const page=await fixture(t,user+answer(`<p>Here is the fix.</p>${code}`,true));
  assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),[literal]);
  const unfenced=await fixPage(t,`<p>${prose}</p>`);
- assert.deepEqual(await unfenced.evaluate(()=>assistantCodeBlocks()),[],'rendered prose is never read as a fix');
+ assert.deepEqual(await unfenced.evaluate(()=>assistantCodeBlocks()),[],'rendered prose is never read as fenced code');
  await unfenced.clock.runFor(3200);
  const out=await unfenced.evaluate(()=>window.fixOut);
- assert.match(out.raw,/no fenced code block/);assert.ok(!out.raw.includes('{'),'no JSON reaches the fix parser');
+ // #439: the visible text is delivered under the unfenced mark; its Markdown formatting is counted,
+ // and the server never applies edits read from rewritten text.
+ assert.ok(out.raw.startsWith('<<<ASHLAR_UNFENCED_ANSWER>>> {"unfenced":true,"fileLinks":0,"canvas":false,"formatted":2,'),out.raw.slice(0,120));
+ assert.equal(parseFixResponse(out.raw).ok,false,'the rewritten legacy answer is never applied');
+});
+
+// Live aicc #439 (job-muigs9hp-171, extension 1.1.49): three fix answers had no fenced block; the page
+// delivered a placeholder and the server parse-failed twice. The answer's own text now reaches the
+// server, with what else it held; the turn's HTML is kept locally for diagnosis.
+const PLAIN_FIX='{"summary":"guard","edits":[{"path":"src/a.ts","search":"const a = 1;","replace":"const a = 2;"}],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
+test('real DOM (#439): an unfenced plain JSON answer is delivered and parses; the probe and the HTML snapshot record it',async t=>{
+ const page=await fixPage(t,`<p>SHA-256 matches.</p><p>${PLAIN_FIX}</p><script>1</script><p style="color:red" onclick="x()">end</p>`);
+ await withProbes(page);
+ await page.clock.runFor(3200);
+ const {raw}=await page.evaluate(()=>window.fixOut);
+ assert.ok(raw.startsWith('<<<ASHLAR_UNFENCED_ANSWER>>> '));
+ assert.deepEqual(parsedFix(raw).edits.map(e=>e.replace),['const a = 2;']);
+ await page.evaluate(()=>globalThis.__ashlarFixHarvestProbeWrites);
+ const [probe]=await page.evaluate(()=>window.__local.get('fixHarvestProbes'));
+ assert.deepEqual([probe.blocks,probe.totalChars,probe.unfenced,probe.fileLinks,probe.canvas],[0,0,true,0,false]);
+ assert.ok(probe.textChars>PLAIN_FIX.length,'the text length');
+ const snaps=await page.evaluate(()=>window.__local.get('fixAnswerHtml'));
+ assert.equal(snaps.length,1);assert.equal(snaps[0].jobId,'fix-A');
+ assert.match(snaps[0].html,/data-message-id="response-A"/);assert.ok(snaps[0].html.includes('SHA-256 matches.'));
+ assert.ok(!/<script|style=|onclick/.test(snaps[0].html),'stripped');
+});
+
+test('real DOM (#439): a download-link answer is flagged and ends answer_as_file; a canvas is flagged',async t=>{
+ const page=await fixPage(t,'<p>The fix is ready: <a href="sandbox:/mnt/data/ashlar-fix.json">ashlar-fix.json</a></p><button aria-label="&#xB2E4;&#xC6B4;&#xB85C;&#xB4DC;"></button>');
+ await withProbes(page);
+ await page.clock.runFor(3200);
+ const {raw}=await page.evaluate(()=>window.fixOut);
+ assert.match(raw,/^<<<ASHLAR_UNFENCED_ANSWER>>> \{"unfenced":true,"fileLinks":2,"canvas":false/);
+ assert.equal(fixReplySignal(raw),'answer_as_file');
+ await page.evaluate(()=>globalThis.__ashlarFixHarvestProbeWrites);
+ const [probe]=await page.evaluate(()=>window.__local.get('fixHarvestProbes'));
+ assert.deepEqual([probe.unfenced,probe.fileLinks,probe.canvas],[true,2,false]);
+ const canvas=await fixPage(t,'<p>I put the fix in the canvas.</p><div id="textdoc-message-1">…</div>');
+ await canvas.clock.runFor(3200);
+ const out=(await canvas.evaluate(()=>window.fixOut)).raw;
+ assert.match(out,/"canvas":true/);assert.equal(fixReplySignal(out),'answer_as_file');
+});
+
+test('real DOM (#439): exactly ATTACHMENT_MISMATCH reaches the server as itself; fixAnswerHtmlOff turns the snapshot off',async t=>{
+ const page=await fixPage(t,'<p>ATTACHMENT_MISMATCH</p>');
+ await withProbes(page);
+ await page.evaluate(()=>window.__local.set('fixAnswerHtmlOff',true));
+ await page.clock.runFor(3200);
+ const {raw}=await page.evaluate(()=>window.fixOut);
+ assert.equal(fixReplySignal(raw),'attachment_mismatch');
+ await page.evaluate(()=>globalThis.__ashlarFixHarvestProbeWrites);
+ assert.equal(await page.evaluate(()=>window.__local.get('fixAnswerHtml')),undefined);
 });
 
 // Live aicc #455 (job-muiae0es-23): a long chatgpt fix answer on the 2026-09 DOM ended "no fix JSON

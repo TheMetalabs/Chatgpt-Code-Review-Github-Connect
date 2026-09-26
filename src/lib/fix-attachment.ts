@@ -33,8 +33,9 @@ export const FIX_ATTACHMENT_NAME = "ashlar-fix-request.txt";
 export const FIX_ATTACHMENT_MAX_BYTES = 512 * 1024;
 export const FIX_ATTACHMENT_BEGIN = "<<<ASHLAR_FIX_ATTACHMENT_V1>>>";
 export const FIX_ATTACHMENT_END = "<<<END_ASHLAR_FIX_ATTACHMENT_V1>>>";
-/** The one reply the typed prompt asks for when the attachment is missing or does not match: it is
- * not a fix JSON object, so the round ends parse-failed and nothing is committed. */
+/** The one reply the typed prompt asks for when the attachment is missing or does not match: nothing
+ * is committed, and the round records it as `attachment_mismatch` (request-failed, fix-agent.ts), a
+ * delivery failure the next attempt re-uploads, never parse-failed. */
 export const FIX_ATTACHMENT_MISMATCH_REPLY = "ATTACHMENT_MISMATCH";
 
 export interface FixAttachment {

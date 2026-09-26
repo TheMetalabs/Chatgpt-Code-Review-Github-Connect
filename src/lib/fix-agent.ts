@@ -18,7 +18,7 @@
  * fork PRs and choosing the coding-agent fallback for oversized files are the caller's gate;
  * provider-output *correctness* is not guaranteed — only mechanical fidelity + the gates above.
  */
-import { applyFixEdits, isSensitivePath, parseFixResponse, type FixDisposition, type FixFile } from "./fix-apply.ts";
+import { ANSWER_AS_FILE, ATTACHMENT_MISMATCH, applyFixEdits, fixReplySignal, isSensitivePath, parseFixResponse, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { commitFiles, type GitDataApi } from "./fix-commit.ts";
 import type { GithubFixSource } from "./fix-source-github.ts";
 
@@ -197,6 +197,23 @@ export function buildFixPrompt(input: {
   ].join("\n");
 }
 
+/** The result of a reply with no usable fix JSON: what the reply said it was (fixReplySignal), else
+ * parse-failed. ATTACHMENT_MISMATCH is a delivery failure (request-failed: the next attempt uploads
+ * the file again), CONNECTOR_UNAVAILABLE ends the round (the runtime never retries it), and an answer
+ * given as a file is parse-failed with a directive the retry feedback carries. */
+function unparsedReply(raw: string, error: string): FixRoundResult {
+  switch (fixReplySignal(raw)) {
+    case ATTACHMENT_MISMATCH:
+      return { ok: false, outcome: "request-failed", error: `${ATTACHMENT_MISMATCH}: the model reported the fix attachment missing, unreadable, truncated or not matching its SHA-256` };
+    case "connector_unavailable":
+      return { ok: false, outcome: "request-failed", error: "connector_unavailable: the model reported no GitHub connector access" };
+    case ANSWER_AS_FILE:
+      return { ok: false, outcome: "parse-failed", error: `${ANSWER_AS_FILE}: the answer was a file, download link or canvas, not the fix JSON in the chat message` };
+    default:
+      return { ok: false, outcome: "parse-failed", error };
+  }
+}
+
 /**
  * Run one fix round: request a fix from the provider, parse it deterministically, and in
  * `apply` mode commit it atomically. Fails closed — a parse failure or commit failure never
@@ -244,7 +261,7 @@ export async function runFixRound(
     } catch {
       /* diagnostics never change the round's outcome */
     }
-    return { ok: false, outcome: "parse-failed", error: parsed.error };
+    return unparsedReply(raw, parsed.error);
   }
   const { summary, dispositions } = parsed.fix;
 

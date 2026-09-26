@@ -73,11 +73,25 @@ test('page: a fix collector waits through generation and empty completed turns, 
   assert.equal(p.polls(), 11);
 });
 
-test('page: an answer with no fenced block harvests a fixed no-JSON line (the server fails closed)', async () => {
-  const p = page({blocks: []}); // the JSON is only in rendered prose, where markdown may have rewritten it
+// Live aicc #439 (extension 1.1.49): an answer with no fenced block delivered a placeholder, so the
+// server could not tell a plain-text JSON, ATTACHMENT_MISMATCH or a file answer apart.
+test('page: an answer with no fenced block delivers its visible text under the unfenced mark and flags', async () => {
+  const p = page({blocks: []}); // the JSON is only in rendered prose
   const out = await p.c.context.waitUntilFixOrQuota('ChatGPT');
-  assert.match(out, /no fenced code block/);
-  assert.ok(!out.includes('{'), 'no JSON object for the fix parser to read');
+  const [first, ...rest] = out.split('\n');
+  assert.ok(first.startsWith('<<<ASHLAR_UNFENCED_ANSWER>>> '));
+  assert.deepEqual(JSON.parse(first.slice('<<<ASHLAR_UNFENCED_ANSWER>>> '.length)), {unfenced: true, fileLinks: 0, canvas: false, formatted: 0, truncated: false});
+  assert.equal(rest.join('\n'), PARTS.join('\n\n'));
+  assert.ok(!out.includes('no fenced code block'), 'never the placeholder');
+});
+
+test('page: an unfenced answer is bounded to 256 KB of UTF-8 and says it was cut', async () => {
+  const long = '가'.repeat(100_000); // 300,000 bytes
+  const p = page({blocks: [], parts: [long]});
+  const out = await p.c.context.waitUntilFixOrQuota('ChatGPT');
+  const nl = out.indexOf('\n');
+  assert.equal(JSON.parse(out.slice('<<<ASHLAR_UNFENCED_ANSWER>>> '.length, nl)).truncated, true);
+  assert.equal(Buffer.byteLength(out.slice(nl + 1), 'utf8'), Math.floor(256 * 1024 / 3) * 3);
 });
 
 test('page: a visible quota notice ends a fix only before an answer is visible', async () => {

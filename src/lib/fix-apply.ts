@@ -23,6 +23,63 @@
  */
 import { lastJsonObject } from "./extract-chat-json.ts";
 import { escapeStrayQuotes } from "./review-json-repair.ts";
+import { FIX_ATTACHMENT_MISMATCH_REPLY } from "./fix-attachment.ts";
+
+/** The one reply the GitHub-source prompt asks for when the model cannot read the repository at that
+ * commit (fix-source-github.ts re-exports it). */
+export const CONNECTOR_UNAVAILABLE_REPLY = "CONNECTOR_UNAVAILABLE";
+
+/** The first line of a chat fix answer the page delivered WITHOUT a fenced block (extension/json.js
+ * boundAnswerText, live aicc #439): the mark, one JSON object of flags, then the answer's visible
+ * text (bounded to 256 KB). The flags say what the answer held besides text. */
+export const FIX_UNFENCED_MARK = "<<<ASHLAR_UNFENCED_ANSWER>>>";
+
+export interface FixAnswerShape {
+  unfenced: boolean;
+  /** Links or controls to a file (sandbox:/files links, a download attribute, a Download button). */
+  fileLinks: number;
+  /** A ChatGPT canvas in the answer. */
+  canvas: boolean;
+  /** Inline Markdown formatting outside code (the rendered text may differ from what was written). */
+  formatted: number;
+  truncated: boolean;
+}
+
+/** The answer text without the page's unfenced mark line, and that line's flags (a fenced or
+ * non-chat answer has none). */
+export function fixAnswerParts(raw: string): { body: string; shape?: FixAnswerShape } {
+  const text = String(raw ?? "");
+  const m = /^<<<ASHLAR_UNFENCED_ANSWER>>> (\{[^\n]*\})(?:\n|$)/.exec(text);
+  if (!m) return { body: text };
+  let flags: Record<string, unknown> = {};
+  try {
+    flags = JSON.parse(m[1]) as Record<string, unknown>;
+  } catch {
+    /* an unreadable flag line still marks the answer unfenced */
+  }
+  const count = (v: unknown) => (Number.isFinite(Number(v)) ? Math.max(0, Math.floor(Number(v))) : 0);
+  const shape = { unfenced: true, fileLinks: count(flags.fileLinks), canvas: flags.canvas === true, formatted: count(flags.formatted), truncated: flags.truncated === true };
+  return { body: text.slice(m[0].length), shape };
+}
+
+/** Fixed error codes of a fix reply that is not a fix JSON object but says what it is. */
+export const ATTACHMENT_MISMATCH = "attachment_mismatch";
+export const ANSWER_AS_FILE = "answer_as_file";
+export type FixReplySignal = typeof ATTACHMENT_MISMATCH | "connector_unavailable" | typeof ANSWER_AS_FILE;
+
+/** What a reply with no usable fix JSON said instead: exactly ATTACHMENT_MISMATCH or
+ * CONNECTOR_UNAVAILABLE (the replies the prompts ask for; quotes, backticks and a final period
+ * aside), or the answer as a file (a download link, a file card or a canvas) with no fix JSON in
+ * the chat. undefined otherwise. */
+export function fixReplySignal(raw: string): FixReplySignal | undefined {
+  const { body, shape } = fixAnswerParts(raw);
+  const bare = body.replace(/[\s`*"'.]/g, "");
+  if (bare === FIX_ATTACHMENT_MISMATCH_REPLY) return ATTACHMENT_MISMATCH;
+  if (bare === CONNECTOR_UNAVAILABLE_REPLY) return "connector_unavailable";
+  if (findFixJson(body)) return undefined;
+  if ((shape && (shape.fileLinks > 0 || shape.canvas)) || /\bsandbox:\/|\/mnt\/data\//.test(body)) return ANSWER_AS_FILE;
+  return undefined;
+}
 
 /** The line the chat page puts between two fenced code blocks of one fix answer (extension/json.js
  * boundAnswerText): the reply's blocks joined back in order are one more candidate for the JSON. */
@@ -59,7 +116,7 @@ function repairedFixJson(text: string): string | null {
 /** The fix JSON object of a reply, wherever it sits: prose around it, split over blocks, or with a
  * stray-quote slip the review repair also fixes. null when none of these yields one. */
 export function findFixJson(raw: string): string | null {
-  const candidates = fixJsonCandidates(String(raw ?? ""));
+  const candidates = fixJsonCandidates(fixAnswerParts(raw).body);
   for (const c of candidates) {
     const json = lastJsonObject(c, isFixObject);
     if (json) return json;
@@ -272,6 +329,7 @@ function parseNewFiles(raw: unknown[]): { ok: true; files: FixFile[] } | { ok: f
 export function parseFixResponse(raw: string, opts: { findingCount?: number } = {}): FixParse {
   const json = findFixJson(String(raw ?? ""));
   if (!json) return { ok: false, error: "no fix JSON object found (deterministic path; caller may json-repair)" };
+  const shape = fixAnswerParts(raw).shape;
   const parsed: unknown = JSON.parse(json); // lastJsonObject only returns a slice that already parsed
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { ok: false, error: "response is not a JSON object" };
@@ -308,6 +366,11 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
     const bare = dispositions.filter((d) => (d.action === "decline" || d.action === "defer") && !citesEvidence(d.note)).map((d) => d.finding);
     if (bare.length) return { ok: false, error: `decline/defer without evidence (issue #, file:line or quote) for ${bare.join(", ")}` };
     return { ok: true, fix: { summary: summaryRaw, edits: [], newFiles: [], dispositions, ...extra } };
+  }
+  // An unfenced answer was read from rendered Markdown: inline formatting there means the text may
+  // no longer be what the model wrote (emphasis markers dropped), so its edits are never applied.
+  if (shape?.formatted) {
+    return { ok: false, error: `unfenced_rewritten: the fix JSON was not in a code block and the chat rendered it as Markdown (${shape.formatted} formatted spans), so its edits cannot be trusted; put the JSON object in one \`\`\`json block` };
   }
   const edits = parseEdits(editsRaw);
   if (!edits.ok) return edits;

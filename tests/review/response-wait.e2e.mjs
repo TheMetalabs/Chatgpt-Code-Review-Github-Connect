@@ -75,6 +75,28 @@ test('new DOM: a sent prompt whose `code` spans render as <code> binds, and its 
   assert.equal(s.received?.raw,ANSWER);assert.equal(s.stages.at(-1),'response_collected');
 });
 
+test('no answer ever bound: response_timeout at 35 min after the send, with the page saved',async t=>{
+  const page=await pageFor(t);await collect(page);
+  await page.clock.runFor(34*MIN);
+  const mid=await snap(page);
+  assert.equal(mid.received,null,'34 min: still waiting');assert.equal(mid.stages.at(-1),'waiting_for_response');assert.equal(mid.saved,null);
+  await page.clock.runFor(MIN+2400);
+  const end=await snap(page);t.diagnostic(JSON.stringify({received:end.received,stages:end.stages}));
+  assert.equal(end.received?.code,'response_timeout',`collector still pending past 35 min: ${JSON.stringify(end.received)}`);
+  assert.equal(end.stages.at(-1),'response_timeout');
+  assert.equal(end.saved?.length,1);
+  const [shot]=end.saved;
+  assert.equal(shot.job,'A');assert.equal(shot.run,'run-A');assert.equal(shot.identified,true);
+  assert.match(shot.html,/^<main/);assert.match(shot.html,/data-chatgpt-agent-turn-start/);assert.ok(shot.html.length<=200_000);
+});
+
+test('no answer ever bound, snapshots off: response_timeout, nothing saved',async t=>{
+  const page=await pageFor(t,{off:true});await collect(page);
+  await page.clock.runFor(35*MIN+2400);
+  const end=await snap(page);
+  assert.equal(end.received?.code,'response_timeout');assert.equal(end.saved,null);
+});
+
 test('guard: a long thinking run whose answer lands at 28 min is still collected',async t=>{
   const page=await pageFor(t);await collect(page);
   for(let i=0;i<28;i+=1)await page.clock.runFor(MIN);

@@ -84,6 +84,7 @@ export const PROGRESS_LABELS = {
     lease_expired_opening: "Lease expired while opening · the page never became ready; run stopped",
     lease_expired_sending: "Lease expired before the send was confirmed · run stopped; no resend in this tab",
     lease_expired_generating: "Lease expired while generating · no progress or past the deadline; run stopped",
+    response_timeout: "No answer bound to the sent prompt within 35 min of the send · run failed; page saved for inspection",
     lease_expired_answered: "Answer lease expired · tab released; the local outbox keeps delivering",
     lease_expired_releasing: "Release lease expired · tab closed if never shown, otherwise preserved",
 } as const;

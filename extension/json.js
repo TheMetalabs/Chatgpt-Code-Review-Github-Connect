@@ -433,6 +433,56 @@ function expireGeneratingLease(lease, name, {bound, stop, streaming, done}, text
   }
 }
 
+/** Response wait (live 1.1.47: two reviews sat in waiting_for_response for 100-158 min), review runs
+ * only. Until an answer is bound to the sent prompt the generating lease has nothing to hold, so the
+ * wait itself is bounded: no bound answer 35 min after the send (ChatGPT ends a reasoning run at
+ * ~29.5 min, #87) fails the run as `response_timeout`, with the page saved for inspection
+ * (saveResponseWaitHtml). Measured from the journaled Send click (a reloaded page keeps it), else
+ * from the first poll. Once an answer is bound the wait is over for good: the lease governs it. Only
+ * observed time counts, as for the lease: a poll gap over 3 min (a host sleep, a frozen tab) moves
+ * the deadline by that gap. */
+function expireResponseWait(wait, name, {bound, submission}) {
+  // Declared here, not at top level: content scripts are re-injected.
+  const RESPONSE_WAIT_MS = 35 * 60_000, POLLING_SUSPENDED_MS = 3 * 60_000;
+  const now = Date.now(), gap = wait.polled ? now - wait.polled : 0;
+  wait.polled = now;
+  // Only a send journaled as sent has a prompt to bind an answer to (a page with no journal reads
+  // the page's latest answer, never bound: its wait has no deadline, as before).
+  if (wait.answered || submission?.phase !== "sent") return;
+  if (bound?.root) { wait.answered = true; return; }
+  if (!wait.at) {
+    const sent = submission?.attemptedAt;
+    wait.at = Number.isSafeInteger(sent) && sent <= now ? sent : now;
+  } else if (gap > POLLING_SUSPENDED_MS) wait.at += gap;
+  if (now - wait.at < RESPONSE_WAIT_MS) return;
+  saveResponseWaitHtml(bound);
+  const error = new Error(`${name} bound no answer to the sent prompt within ${RESPONSE_WAIT_MS / 60_000} min of the send`);
+  error.code = "response_timeout"; throw error;
+}
+
+/** Diagnostic: the page a response wait timed out on, in chrome.storage.local "responseWaitHtml"
+ * (last 3). The main area (or body) without scripts, styles, images and SVG paths, capped at 200 KB;
+ * the URL without its query; whether the sent turn was identified. Off with
+ * {responseWaitHtmlOff:true}. Never affects the run. */
+function saveResponseWaitHtml(bound) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    const state = globalThis.__ashlarRunnerState;
+    const area = document.querySelector("main") || document.body;
+    const clone = area.cloneNode(true);
+    for (const node of clone.querySelectorAll("script,style,noscript,img,svg path")) node.remove();
+    const record = {job: state?.jobId, run: state?.runId, at: Date.now(), identified: Boolean(bound?.identified),
+      url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: clone.outerHTML.slice(0, 200_000)};
+    globalThis.__ashlarResponseWaitWrites = (globalThis.__ashlarResponseWaitWrites || Promise.resolve()).then(async () => {
+      const flags = await local.get(["responseWaitHtmlOff", "responseWaitHtml"]);
+      if (flags?.responseWaitHtmlOff === true) return;
+      const list = Array.isArray(flags?.responseWaitHtml) ? flags.responseWaitHtml : [];
+      await local.set({responseWaitHtml: [...list, record].slice(-3)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
 /** Collection needs two identical stable observations (`key`). On the second one the runner
  * records the answer and, for an identified response, its native completion proof. */
 function settleStableAnswer(stability, key, poll, {text, raw}) {
@@ -461,9 +511,11 @@ async function waitUntilReviewOrQuota(name) {
   if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
   const stability = {stable: "", hits: 0};
   const lease = {state: "", chars: 0, at: 0, polled: 0};
-  // No poll-count failure and no deadline before the answer mounts (expireGeneratingLease bounds
-  // only a mounted answer that stops progressing). Controls can appear before response text is
-  // observable. A missing/invalid JSON slice is an observation, never an empty reply.
+  const wait = {at: 0, polled: 0, answered: false};
+  // No poll-count failure. Before the answer mounts the wait is bounded from the send
+  // (expireResponseWait); a mounted answer that stops progressing, by the lease
+  // (expireGeneratingLease). Controls can appear before response text is observable. A
+  // missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
     throwIfStopped();
     // The full original was secured, not accepted as a review. The worker owns
@@ -503,6 +555,7 @@ async function waitUntilReviewOrQuota(name) {
       json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response");
     throwIfQuota(name, bound, Boolean(json));
     expireGeneratingLease(lease, name, poll, text);
+    expireResponseWait(wait, name, poll);
     if (done && json) {
       if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) return json;
     } else { stability.hits = 0; stability.stable = ""; }
@@ -1417,7 +1470,8 @@ function installReviewRunner(name, run) {
         if (takenOver && !state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = e.takeoverCause || "navigated"; }
         const leaseExpired = e?.code === "stalled"; // expireGeneratingLease (#87)
         recordReviewStep(e?.code === "quota" ? "quota" : e?.code === "cancelled" ? "cancelled" : takenOver ? "context_changed" :
-          leaseExpired ? "lease_expired_generating" : e?.code === "presend_stalled" ? "presend_stalled" : e?.code === "logged_out" ? "logged_out" : "error");
+          leaseExpired ? "lease_expired_generating" : e?.code === "response_timeout" ? "response_timeout" :
+          e?.code === "presend_stalled" ? "presend_stalled" : e?.code === "logged_out" ? "logged_out" : "error");
         state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })

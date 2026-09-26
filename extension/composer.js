@@ -11,7 +11,7 @@ function waitForPageChange(ms = 800) {
     const finish = () => { observer.disconnect(); clearTimeout(timer); document.removeEventListener("visibilitychange", finish); resolve(); };
     const observer = new MutationObserver(finish);
     observer.observe(document.documentElement, {subtree: true, childList: true, characterData: true,
-      attributes: true, attributeFilter: ["data-message-id", "disabled", "aria-disabled", "aria-busy", "data-state", "data-streaming-response-status", "style", "class"]});
+      attributes: true, attributeFilter: ["data-message-id", "data-chatgpt-search-message-ids", "disabled", "aria-disabled", "aria-busy", "data-state", "data-streaming-response-status", "style", "class"]});
     document.addEventListener("visibilitychange", finish, {once: true});
     timer = setTimeout(finish, ms);
   });
@@ -220,27 +220,188 @@ function composerFileInput(names = []) {
   return null;
 }
 
-/** Hand files to the composer's upload input, one DataTransfer for all of them: the one way both a
- * fix attachment and a review's files are staged. */
-function stageComposerFiles(input, files) {
-  markUploadAlerts();
+/** A DataTransfer holding `files`: what an input, a paste and a drop each carry. */
+function filesTransfer(files) {
   const dt = new DataTransfer();
   for (const file of files) dt.items.add(file);
-  input.files = dt.files;
+  return dt;
+}
+
+/** Strategy (a): the files on an upload input, with the input and change events its handler reads. */
+function stageViaInput(input, files) {
+  input.files = filesTransfer(files).files;
   input.dispatchEvent(new Event("input", {bubbles: true}));
   input.dispatchEvent(new Event("change", {bubbles: true}));
 }
 
-/** Hand the fix attachment to the composer's upload input: the File's own bytes are hashed first,
- * so what is uploaded is exactly the bytes the typed line names. */
+/** Strategy (b): the files pasted into the editor (ProseMirror hands a paste to the page's handler). */
+function stageViaPaste(editor, files) {
+  editor.focus?.();
+  editor.dispatchEvent(new ClipboardEvent("paste", {clipboardData: filesTransfer(files), bubbles: true, cancelable: true}));
+}
+
+/** Strategy (c), on one target: the files dragged in and dropped. */
+function stageViaDrop(target, files) {
+  const dt = filesTransfer(files);
+  for (const type of ["dragenter", "dragover", "drop"]) {
+    target.dispatchEvent(new DragEvent(type, {dataTransfer: dt, bubbles: true, cancelable: true}));
+  }
+}
+
+/** The composer's form: the editor's, else the upload input's, else a known composer form. */
+function composerForm() {
+  const editor = typeof composer === "function" ? composer() : null;
+  return editor?.closest("form") || composerFileInput()?.closest("form") ||
+    document.querySelector("form[data-chatgpt-composer], form[data-type='unified-composer']");
+}
+
+/** The composer's "add files" menu button (파일 등 추가, the "+"). */
+function composerAddButton(form) {
+  const selector = '[data-composer-navigation-target="add-context"], button[aria-label="파일 등 추가"], ' +
+    'button[aria-label*="add files" i], button[aria-label*="attach" i], #composer-plus-btn, [data-testid="composer-plus-btn"]';
+  return [...(form || document).querySelectorAll(selector)].find(renderedControl) || null;
+}
+
+/** Whether any of the run's files shows a chip in the composer (uploading or ready). */
+function runChipShown(names) {
+  const form = composerForm();
+  return Boolean(form) && attachmentStates(form, names).some(entry => entry.state !== "missing");
+}
+
+/** After a strategy dispatched: "chip" once any of the run's chips shows, "failed" once the page
+ * reports the upload failed (uploadFailure), null when neither happens within `ms`. */
+async function waitStagedChip(names, ms) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    globalThis.throwIfStopped?.();
+    if (runChipShown(names)) return "chip";
+    if (uploadFailure(composerForm(), names)) return "failed";
+    if (Date.now() >= deadline) return null;
+    await waitForPageChange(250);
+  }
+}
+
+/** The page step for the strategy whose chip showed (literal stages: the progress labels are pinned). */
+function stepStagedVia(id) {
+  if (id === "a") step("attachments_staged_via_a");
+  else if (id === "b") step("attachments_staged_via_b");
+  else if (id === "c") step("attachments_staged_via_c");
+  else if (id === "d") step("attachments_staged_via_d");
+}
+
+/** What a staging attempt saw of the composer: its file inputs (count, accept values) and whether
+ * the editor was found. Never a file's content. */
+function stageProbeShape(strategy, outcome, extra = {}) {
+  const form = composerForm();
+  const inputs = [...(form || document).querySelectorAll("input[type='file']")];
+  return {strategy, chip: outcome === "chip", failed: outcome === "failed", inputs: inputs.length,
+    accepts: inputs.map(input => input.getAttribute("accept") ?? ""), documentInputs: document.querySelectorAll("input[type='file']").length,
+    editor: Boolean(typeof composer === "function" && composer()), form: Boolean(form), ...extra};
+}
+
+/** Diagnostic: one staging chain's attempts, in chrome.storage.local "stageProbes" (last 10). Never
+ * affects the run. */
+function saveStageProbe(record) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    globalThis.__ashlarStageProbeWrites = (globalThis.__ashlarStageProbeWrites || Promise.resolve()).then(async () => {
+      const stored = (await local.get(["stageProbes"]))?.stageProbes;
+      await local.set({stageProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-10)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
+/** Stage the run's files in the composer, one strategy after another, until one of the run's chips
+ * shows (live 1.1.37: the new home composer showed no chip for files set on its 파일 첨부 input):
+ * (a) the accepting upload input's files and input/change events; (b) a paste of the files into
+ * the editor; (c) a drag and drop of them onto the editor, then onto the form; (d) the "+" menu
+ * opened and (a) retried on an input it adds. Each waits up to STRATEGY_MS for a chip. A chip of
+ * the run's files, once shown, ends the chain: nothing is staged twice. The strategy that produced
+ * it is recorded (attachments_staged_via_<id>, stageProbes). A page-reported upload failure ends
+ * the chain too (its caller reports it). No chip after every strategy: `exhausted(tried)` is thrown. */
+async function stageComposerFiles(input, files, exhausted) {
+  const STRATEGY_MS = 8000, DROP_MS = 4000, MENU_MS = 1500;
+  const state = globalThis.__ashlarRunnerState;
+  const names = files.map(file => file.name);
+  const probe = {job: state?.jobId, run: state?.runId, kind: state?.kind || "review", at: Date.now(), files: names.length, attempts: []};
+  const tried = [];
+  const attempt = async (dispatch, ms) => {
+    globalThis.throwIfStopped?.(); // the stop fence, in the same task as the upload
+    dispatch();
+    return waitStagedChip(names, ms);
+  };
+  const strategies = {
+    a: async () => attempt(() => stageViaInput(input, files), STRATEGY_MS),
+    b: async () => {
+      const editor = typeof composer === "function" ? composer() : null;
+      if (!editor) return {skipped: "no editor"};
+      return attempt(() => stageViaPaste(editor, files), STRATEGY_MS);
+    },
+    c: async () => {
+      const targets = [typeof composer === "function" ? composer() : null, composerForm()].filter(Boolean);
+      if (!targets.length) return {skipped: "no editor or form"};
+      let outcome = null;
+      for (const target of targets) {
+        outcome = await attempt(() => stageViaDrop(target, files), DROP_MS);
+        if (outcome) break;
+      }
+      return outcome;
+    },
+    d: async () => {
+      const button = composerAddButton(composerForm());
+      if (!button) return {skipped: "no add button"};
+      const before = new Set(document.querySelectorAll("input[type='file']"));
+      const fits = el => el instanceof HTMLInputElement && names.every(name => acceptsTextFile(el, name));
+      globalThis.throwIfStopped?.();
+      button.click();
+      try {
+        const until = Date.now() + MENU_MS;
+        let fresh = null;
+        for (;;) {
+          fresh = [...document.querySelectorAll("input[type='file']")].find(el => !before.has(el) && fits(el)) || null;
+          if (fresh || Date.now() >= until) break;
+          await waitForPageChange(250);
+        }
+        if (!fresh) return {skipped: "no new input"};
+        return await attempt(() => stageViaInput(fresh, files), STRATEGY_MS);
+      } finally {
+        // Close the menu this opened (Radix closes on Escape); a button that shows no open menu is left.
+        if (button.getAttribute("aria-expanded") === "true") (document.activeElement || document.body).dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", code: "Escape", bubbles: true, cancelable: true}));
+      }
+    },
+  };
+  markUploadAlerts();
+  if (state) state.pendingAttachments = names;
+  let via = null, failed = false;
+  try {
+    for (const [id, run] of Object.entries(strategies)) {
+      // Dedupe: a chip of the run's files already there ends the chain before anything more is staged.
+      if (runChipShown(names)) { probe.existing = tried.length === 0; break; }
+      const outcome = await run();
+      const skipped = outcome && typeof outcome === "object" ? outcome.skipped : null;
+      tried.push(skipped ? `${id} (${skipped})` : id);
+      probe.attempts.push(stageProbeShape(id, skipped ? null : outcome, skipped ? {skipped} : {}));
+      if (outcome === "chip") { via = id; break; }
+      if (outcome === "failed") { failed = true; break; }
+    }
+  } finally {
+    saveStageProbe({...probe, via, failed, tried});
+  }
+  if (via) stepStagedVia(via);
+  else if (!failed && !probe.existing && !runChipShown(names)) throw exhausted(tried);
+  return {via, failed, tried};
+}
+
+/** Hand the fix attachment to the composer (stageComposerFiles): the File's own bytes are hashed
+ * first, so what is uploaded is exactly the bytes the typed line names. */
 async function stageFixAttachment(file) {
   const input = composerFileInput([file.name]);
   if (!input) throw fixAttachmentFailed("the composer has no file input");
   const staged = new File([file.body], file.name, {type: "text/plain"});
   if (await sha256Hex(await staged.arrayBuffer()) !== file.sha256) throw fixAttachmentFailed("the staged bytes do not match their SHA-256");
-  // The stop fence, in the same task as the upload.
-  globalThis.throwIfStopped?.();
-  stageComposerFiles(input, [staged]);
+  await stageComposerFiles(input, [staged],
+    tried => fixAttachmentFailed(`${file.name} was not shown as a chip after staging (tried ${tried.join(", ")})`));
 }
 
 /** Wait until the composer shows the fix attachment's chip with no upload in progress
@@ -255,7 +416,7 @@ async function waitFixAttachmentStaged(name) {
   let readySince = null;
   for (;;) {
     globalThis.throwIfStopped?.();
-    const form = (typeof composer === "function" ? composer() : null)?.closest("form") || composerFileInput()?.closest("form");
+    const form = composerForm();
     const failed = uploadFailure(form, [name]);
     if (failed) throw fixAttachmentFailed(`the page reported the upload of ${name} failed (${failed})`);
     if (form && attachmentsReady(form, [name])) {
@@ -268,13 +429,54 @@ async function waitFixAttachmentStaged(name) {
   }
 }
 
+/** Diagnostic (#455): where on the whole page the run's file names show outside the prompt text,
+ * e.g. chips rendered outside the composer form. A short element path per hit, no content. */
+function fileNamesElsewhere(names, form) {
+  const hits = [];
+  const path = el => {
+    const parts = [];
+    for (let n = el; n && n !== document.body && parts.length < 6; n = n.parentElement) {
+      const tid = n.getAttribute?.("data-testid"), role = n.getAttribute?.("role");
+      parts.unshift(`${n.tagName.toLowerCase()}${tid ? `[data-testid=${tid}]` : ""}${role ? `[role=${role}]` : ""}`);
+    }
+    return parts.join(">");
+  };
+  try {
+    for (const el of document.querySelectorAll("[aria-label],[title],[data-file-name],div,span")) {
+      if (hits.length >= 12) break;
+      if (el.closest?.('[contenteditable="true"], textarea')) continue;
+      const own = [el.getAttribute("aria-label"), el.getAttribute("title"), el.getAttribute("data-file-name"),
+        el.children.length === 0 ? el.textContent : ""].filter(Boolean).join(" ");
+      const name = names.find(n => own.toLowerCase().includes(n.toLowerCase().replace(/\.[^.]+$/, "")));
+      if (name) hits.push({name, inForm: Boolean(form?.contains(el)), path: path(el)});
+    }
+  } catch { /* diagnostics only */ }
+  return hits;
+}
+
+/** No chip after every staging strategy: attachment_failed naming the strategies tried and the chips
+ * there, with an HTML snapshot of the form saved for diagnosis. */
+function reviewStagingFailed(names, tried) {
+  const form = composerForm();
+  const report = {...uploadWaitReport(form, names), tried, elsewhere: fileNamesElsewhere(names, form)};
+  saveUploadWaitHtml(form, report);
+  saveStageProbe({at: Date.now(), failed: true, tried, elsewhere: report.elsewhere});
+  const error = new Error(`the attachments were not shown as chips after staging (tried ${tried.join(", ")}): ` +
+    `chips found ${JSON.stringify(report.chips)}; nothing was sent`);
+  error.code = "attachment_failed";
+  error.detail = report;
+  return error;
+}
+
 async function attachFiles(files) {
   if (!files.length) return false;
   const input = composerFileInput(files.map(file => file.name));
   if (!input) return false;
-  stageComposerFiles(input, files.map(file => new File([file.body], file.name, {type: "text/plain"})));
-  // Input filling does not depend on upload completion. Send has its own
-  // named-chip + progress + enabled-control gate in the current composer form.
+  const names = files.map(file => file.name);
+  await stageComposerFiles(input, files.map(file => new File([file.body], file.name, {type: "text/plain"})),
+    tried => reviewStagingFailed(names, tried));
+  // Typing waits only for a chip to show, never for the upload: Send has its own named-chip +
+  // progress + enabled-control gate in the current composer form.
   return true;
 }
 
@@ -352,7 +554,7 @@ async function fillComposer(el, text) {
  * Read the message body, not attachment chips, copy controls or hidden UI. `skip`: elements left
  * out too (a sent fix turn's file cards, turnAttachments). */
 function messagePromptText(turn, skip) {
-  const root = turn?.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
+  const root = turnTextRoot(turn);
   const walk = node => {
     if (node.nodeType === 3) return node.nodeValue || "";
     if (node.nodeType !== 1 || skip?.has(node)) return "";
@@ -367,6 +569,7 @@ function messagePromptText(turn, skip) {
 /** Where a sent user turn renders: its conversation-turn section or article (ChatGPT can render a
  * file card beside the message node, not inside it), else the message node itself. */
 function turnContainer(turn) {
+  if (unitTurn(turn)) return unitWrapper(turn) || turn;
   return turn?.closest?.('[data-testid^="conversation-turn"], [data-turn="user"], article') || turn;
 }
 
@@ -407,8 +610,10 @@ function turnAttachments(turn, names = []) {
  * ways as json.js fixTurnExact does) once its file cards are left out. */
 function fixTurnHolds(turn, exact, names = []) {
   const {cards} = turnAttachments(turn, names);
-  const body = turn.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
-  return [messagePromptText(turn, cards), losslessText(body, cards)].some(text => fixPromptForm(text) === exact);
+  const body = turnTextRoot(turn);
+  // The unit DOM's bubble holds its own controls (a "Show more" button): not the prompt.
+  const skip = body?.matches?.("[data-user-message-bubble]") ? new Set([...cards, ...body.querySelectorAll("button")]) : cards;
+  return [messagePromptText(turn, cards), losslessText(body, skip)].some(text => fixPromptForm(text) === exact);
 }
 
 /** A fix's send is proven by a user turn after the baseline that shows each of its attachments
@@ -452,12 +657,22 @@ function composerControlSelector() {
  * a data-file-name tile is a chip whatever element renders it. The barrier and the verdict both read
  * this list, so neither takes a control's tooltip for a file (Ashlar, review of 5af999fd). */
 function fileChips(form) {
-  return [...form.querySelectorAll(fileChipSelector())]
+  const named = [...form.querySelectorAll(fileChipSelector())]
     .filter(chip => chip.matches('[role="group"][aria-label], [data-file-name]') || !chip.matches(composerControlSelector()));
+  // The new home composer (live #93, 1.1.39 probe) renders a staged file as a card whose file name is
+  // plain leaf text (span>span>span>span), with no aria-label, title or data attribute to select.
+  const textual = [...form.querySelectorAll("span, div")].filter(el => el.children.length === 0 &&
+    !el.closest('[contenteditable="true"], textarea, [aria-hidden="true"]') &&
+    // One token with an extension, or an ellipsis-truncated one (local: this file is re-injected).
+    /^[^\s/\\]{1,120}(?:\.[A-Za-z0-9]{1,8}|…[^\s]{0,12})$/.test((el.textContent || "").trim()));
+  return [...new Set([...named, ...textual])];
 }
+
 /** Every name a file chip gives its file, in its shapes' order (data-file-name, aria-label, title). */
 function fileChipNames(chip) {
-  return ["data-file-name", "aria-label", "title"].map(name => chip.getAttribute(name)).filter(name => name !== null);
+  const names = ["data-file-name", "aria-label", "title"].map(name => chip.getAttribute(name)).filter(name => name !== null);
+  if (!names.length && chip.children.length === 0) names.push((chip.textContent || "").trim());
+  return names;
 }
 
 /** A staged file's chip is still uploading while it (or anything in it) shows progress: a spinner, a
@@ -684,7 +899,7 @@ function retrySubmissionPersistence() {
 }
 
 function userTurns() {
-  return [...document.querySelectorAll('[data-message-author-role="user"]')];
+  return userTurnEls();
 }
 
 function step(stage) {
@@ -775,7 +990,7 @@ function submissionConfirmed(record) {
   if (!record.expected || !match) return false;
   record.phase = "sent";
   record.submittedUsers = turns.indexOf(match) + 1;
-  record.messageId = match.getAttribute("data-message-id") || "";
+  record.messageId = turnMessageId(match);
   // A run's conversation is a fact of THIS moment: recorded once, here, and never later (every
   // later decision compares the location with it). Only a send this page instance clicked,
   // confirmed while the page still shows the conversation it was clicked in, establishes it. A
@@ -861,7 +1076,7 @@ async function startSendProbe(record) {
     for (const seconds of [1, 5, 15, 30, 60]) setTimeout(() => save(`${seconds}s`), Math.max(0, clickedAt + seconds * 1000 - Date.now()));
     // HTML snapshot of the conversation area (the user asked for the live DOM, #93): fix runs only,
     // which carry Ashlar's own prompt. Scripts, styles and SVG paths are dropped; capped; last 3 kept.
-    if (state?.kind === "fix" && (await local.get(["sendProbeHtmlOff"]))?.sendProbeHtmlOff !== true) {
+    if ((await local.get(["sendProbeHtmlOff"]))?.sendProbeHtmlOff !== true) {
       for (const seconds of [5, 60]) setTimeout(() => {
         try {
           const area = document.querySelector("main") || document.body;
@@ -949,7 +1164,7 @@ async function clickSend(findSend, findComposer, expectedText) {
         if (runner) { runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()}; runner.freshPage = undefined; }
         step("send_attempted");
         try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
-        if (fix) startSendProbe(record);
+        startSendProbe(record); // reviews too: #93 review send_unconfirmed on 1.1.40
       }
     }
     // Cadence only: no upload, send acknowledgement, queue or model deadline.

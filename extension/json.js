@@ -62,7 +62,8 @@ function visibleText(el) {
   const walk = node => {
     if (node.nodeType === 3) return node.nodeValue || "";
     if (node.nodeType !== 1) return "";
-    if (node.matches("button, [role='button'], svg, script, style, [data-content-reference-start]") || hiddenNode(node)) return "";
+    // The unit DOM's sr-only role heading ("ChatGPT said:") inside the assistant unit is not the answer.
+    if (node.matches("button, [role='button'], svg, script, style, [data-content-reference-start], :is(h1, h2, h3, h4, h5, h6)[data-conversation-role]") || hiddenNode(node)) return "";
     if (node.tagName === "BR") return "\n";
     const text = [...node.childNodes].map(walk).join("");
     return /^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE|TR)$/.test(node.tagName) ? `\n${text}\n` : text;
@@ -77,9 +78,7 @@ function cleanTurnText(el) {
 
 function assistantCorpus(root = currentAssistantRoot()) {
   if (!root) return [];
-  const turns = root.matches('[data-message-author-role="assistant"]')
-    ? [root]
-    : [...root.querySelectorAll('[data-message-author-role="assistant"]')];
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
   const chunks = [];
   for (const turn of turns) {
     const text = cleanTurnText(turn);
@@ -93,9 +92,7 @@ function assistantCorpus(root = currentAssistantRoot()) {
  * parses as JSON, so a fix is read from code blocks only. */
 function assistantCodeBlocks(root = currentAssistantRoot()) {
   if (!root) return [];
-  const turns = root.matches('[data-message-author-role="assistant"]')
-    ? [root]
-    : [...root.querySelectorAll('[data-message-author-role="assistant"]')];
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
   const blocks = [];
   for (const turn of turns) {
     for (const pre of turn.querySelectorAll("pre")) {
@@ -170,12 +167,11 @@ function reviewProgress() {
  * Older pages without IDs require both the recorded position and matching text.
  */
 function boundReviewResponse(submission) {
-  const messages = [...document.querySelectorAll('[data-message-author-role]')]
-    .filter(node => ["user", "assistant"].includes(node.getAttribute("data-message-author-role")));
-  const users = messages.filter(node => node.getAttribute("data-message-author-role") === "user");
+  const messages = conversationTurnEls();
+  const users = messages.filter(node => turnRole(node) === "user");
   let user;
   if (submission.messageId) {
-    const matches = users.filter(node => node.getAttribute("data-message-id") === submission.messageId);
+    const matches = users.filter(node => turnMessageId(node) === submission.messageId);
     if (matches.length === 1) user = matches[0];
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
     user = users[submission.submittedUsers - 1];
@@ -190,9 +186,9 @@ function boundReviewResponse(submission) {
   // conversation (samePage: the query is not the page): after an in-page move the
   // turn at the recorded position proves nothing about the send. A journal with no
   // conversation yet (a review on a new chat before its pin): unchanged.
-  if (!submission.messageId && user.getAttribute("data-message-id") &&
+  if (!submission.messageId && turnMessageId(user) &&
       (!submission.conversation || fixConversationHolds(submission))) {
-    submission.messageId = user.getAttribute("data-message-id");
+    submission.messageId = turnMessageId(user);
     const state = globalThis.__ashlarRunnerState;
     if (state?.confirmedSubmission?.record === submission) {
       state.submissionPersistencePending = true;
@@ -200,16 +196,25 @@ function boundReviewResponse(submission) {
     }
   }
   const start = messages.indexOf(user) + 1;
-  const next = messages.findIndex((node, index) => index >= start && node.getAttribute("data-message-author-role") === "user");
+  const next = messages.findIndex((node, index) => index >= start && turnRole(node) === "user");
   const replies = messages.slice(start, next < 0 ? messages.length : next);
   const message = replies.at(-1);
   if (!message) return {root: null, followup: next >= 0, identified: true};
+  return {root: responseRoot(message, replies, user), followup: next >= 0, identified: true, responseId: turnMessageId(message), message};
+}
+
+/** The root a bound response is observed in. Completion controls may be siblings of the assistant
+ * node. A surrounding root is safe only when it contains no user or unrelated response messages; the
+ * unit DOM's turn container (its action row sits there, outside every unit) also holds the bound
+ * user message `user` itself, and nothing else. */
+function responseRoot(message, replies, user) {
+  if (unitTurn(message)) {
+    const turn = message.closest("[data-content-search-turn-key]");
+    return turn && [...turn.querySelectorAll("[data-content-search-unit-key]")].every(node => node === user || replies.includes(node)) ? turn : message;
+  }
   const container = message.closest('[data-testid^="conversation-turn-"], article, section');
-  // Completion controls may be siblings of the assistant node. A surrounding root
-  // is safe only when it contains no user or unrelated response messages.
-  const root = container && [...container.querySelectorAll('[data-message-author-role]')].every(node => replies.includes(node))
+  return container && [...container.querySelectorAll(turnNodeSelector())].every(node => replies.includes(node))
     ? container : message;
-  return {root, followup: next >= 0, identified: true, responseId: message.getAttribute("data-message-id") || "", message};
 }
 
 /** Each call is a fresh observation; the tracker also runs after native JSON
@@ -339,7 +344,7 @@ function responseVariant(root) {
   const buttons = [...root.querySelectorAll("button[aria-label], [role='button'][aria-label]")]
     .some(el => /previous response|next response|이전 응답|다음 응답/i.test(el.getAttribute("aria-label") || ""));
   const counters = [...root.querySelectorAll("div, span")]
-    .filter(el => !el.children.length && !el.closest("[data-message-author-role], pre, code") && /^\d+\s*\/\s*\d+$/.test((el.textContent || "").trim()))
+    .filter(el => !el.children.length && !el.closest(`${turnAreaSelector()}, pre, code`) && /^\d+\s*\/\s*\d+$/.test((el.textContent || "").trim()))
     .map(el => el.textContent.replace(/\s+/g, ""));
   return [...(buttons ? ["pager"] : []), ...counters].join(" ");
 }
@@ -479,7 +484,7 @@ async function waitUntilReviewOrQuota(name) {
     // 4101062732): no pin, and the release verdict keeps the tab. On the new chat itself it pins
     // once its answer is complete (the page it was collected on).
     if (bound?.identified && !runner?.tabRepurposed && !submission.conversation &&
-        journaledTurnIntegrity(submission, globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : []) === "exact") {
+        journaledTurnIntegrity(submission, userTurnEls()) === "exact") {
       if (newChatPin(runner, done, Boolean(bound.root))) pinNewChatReview(submission);
     }
     const text = assistantCorpus(bound?.root).join("\n\n");
@@ -512,7 +517,7 @@ function journaledTurnIntegrity(submission, users) {
   if (!submission?.expected) return "unknown";
   let turn;
   if (submission.messageId) {
-    const matches = users.filter(node => node.getAttribute("data-message-id") === submission.messageId);
+    const matches = users.filter(node => turnMessageId(node) === submission.messageId);
     if (matches.length === 1) turn = matches[0];
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
     turn = users[submission.submittedUsers - 1];
@@ -718,7 +723,7 @@ function fixOwnershipProof(state, {phase, journal, pinned} = {}) {
   // 2. The journal-addressable sent turn (its message ID, else its recorded position) holds EXACTLY
   // Ashlar's prompt. boundReviewResponse only proves the turn CONTAINS it, and finds no turn at all
   // once the user replaced its text: an edited or replaced turn is the user's, even if undone later.
-  const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  const users = userTurnEls();
   const integrity = journaledTurnIntegrity(submission, users);
   if (integrity === "edited") return takeOver("edited", "edited");
   const bound = boundReviewResponse(submission);
@@ -885,7 +890,7 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
     ? turnAttachments(turn, submission.attachments).cards : undefined;
   const promptOf = turn => norm(typeof messagePromptText === "function" ? messagePromptText(turn, cardsOf(turn)) : turn.textContent);
   const href = globalThis.location?.href || "";
-  const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  const users = userTurnEls();
   // Ashlar's own prompt in the composer (before or after the send) is not a user draft; anything
   // else there is the user's, including Ashlar's prompt with text added around it.
   const draft = composerDraftText();
@@ -933,7 +938,7 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   // re-keys the turn is not the user).
   let turn;
   if (submission.messageId) {
-    const matches = users.filter(node => node.getAttribute("data-message-id") === submission.messageId);
+    const matches = users.filter(node => turnMessageId(node) === submission.messageId);
     if (matches.length === 1) turn = matches[0];
   }
   if (!turn && Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) turn = users[submission.submittedUsers - 1];
@@ -965,10 +970,10 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
  * State survives script reinjection and retains terminal outcomes for a restarted worker.
  */
 function reviewPageContext() {
-  const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  const users = userTurnEls();
   const last = users.at(-1);
   return JSON.stringify([globalThis.location?.href || "", users.length,
-    last?.getAttribute("data-message-id") || "", last?.textContent || ""]);
+    turnMessageId(last), last?.textContent || ""]);
 }
 
 /** The server no longer wants this run (cancelled, superseded, forgotten): nothing is sent or
@@ -1004,7 +1009,7 @@ function runStoppedFor(jobId, runId) {
  * typing (composer.js fillComposer: composerTyping; clickSend sends only the exact prompt). */
 function freshPageLeft(page, state) {
   if (!samePage(globalThis.location?.href || "", page)) return "navigated";
-  if (globalThis.document?.querySelector('[data-message-author-role="user"]')) return "user_turn";
+  if (hasUserTurn()) return "user_turn";
   if (composerStagedFiles(state, null).length) return "draft";
   return !state?.composerTyping && composerDraftText() ? "draft" : "";
 }
@@ -1169,7 +1174,7 @@ function installReviewRunner(name, run) {
         // Positive binding only: an unbound page is never evidence that this tab is Ashlar's, except
         // the tab the worker opened for a review it never sent: Ashlar's only while it holds nothing
         // of the user's (no turn, no draft).
-        const turns = globalThis.document ? document.querySelectorAll('[data-message-author-role="user"]').length : 0;
+        const turns = userTurnEls().length;
         const draft = Boolean(composerDraftText()) || composerStagedFiles(null, null).length > 0;
         const blank = !turns && !draft;
         reply({ok:true,releaseProtocol:1,owned:blank,canClose:blank,ownership:blank ? "owned" : "takenOver",

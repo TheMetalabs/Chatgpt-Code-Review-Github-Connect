@@ -2,6 +2,7 @@ import {test,before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import {source,json} from './load-source.mjs';
 import {background,storage} from './helpers.mjs';
+import {unitTurn,unitAnswer,renderUnitAnswer} from './unit-dom.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;
 before(async()=>{browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});});
@@ -13,7 +14,7 @@ function answer(content='',done=false){return `<section data-testid="conversatio
 async function fixture(t,html){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();await page.setContent(html);
  await page.evaluate(()=>{window.chrome={runtime:{onMessage:{addListener(fn){window.handler=fn;}}}};window.sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));window.findingsJsonTooThin=()=>false;});
- for(const path of ['extension/quota.js','extension/json.js'])await page.addScriptTag({content:source(path)});
+ for(const path of ['extension/turns.js','extension/quota.js','extension/json.js'])await page.addScriptTag({content:source(path)});
  return page;
 }
 async function startWait(page){await page.evaluate(()=>{window.waitResult={pending:true};waitUntilReviewOrQuota('ChatGPT').then(raw=>window.waitResult={raw},e=>window.waitResult={code:e.code,error:e.message});});}
@@ -152,7 +153,7 @@ for(const leadingProse of [false,true])test(`operator example structure: paragra
 test('real DOM recovery: missing job resumes its bound observer without a new prompt',async t=>{
  const page=await fixture(t,user+answer(json,true));
  // PR39 also restores the accepted-submission journal before its real collector.
- await page.addScriptTag({content:source('extension/composer.js')});
+ await page.addScriptTag({content:source('extension/turns.js')});await page.addScriptTag({content:source('extension/composer.js')});
  await page.evaluate(()=>{
   const saved=new Map([['ashlar:submission:A:run-A',JSON.stringify({phase:'sent',expected:'review me',baseline:0,submittedUsers:1,messageId:''})]]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:key=>saved.get(key)||null,setItem:(key,value)=>saved.set(key,value)}});
@@ -216,7 +217,7 @@ test(`real DOM: ashlar-fix-cancel on a ${name} fix page releases the slot and st
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
  },cell.journal);
- for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix',...extra});
  assert.equal((await send('ashlar-fix-cancel',{jobId:'fix-B'})).code,'job_mismatch','another run is never touched');
  const out=await send('ashlar-fix-cancel',{preserve:true});
@@ -269,7 +270,7 @@ async function conversationPage(t,kind,{url=kind==='fix'?TEMP_URL:CONV_URL,jobId
    event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
   });
  },{jobId,journal:journals[sent],turns,stop});
- for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  if(gated)await page.evaluate(()=>{
   window.collectGate=new Promise(resolve=>{window.openCollect=resolve;});
   // content-chatgpt.js's resume path (resumeSubmission, then the collector) with a pause between.
@@ -737,7 +738,7 @@ async function fixPage(t,inner,journal={phase:'sent',expected:'fix prompt',exact
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
  },journal);
- for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(()=>{const s=__ashlarRunnerState;s.kind='fix';s.running=true;window.fixOut={pending:true};
   waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={error:e.message};});});
  return page;
@@ -758,7 +759,7 @@ async function kindPage(t,kind,{done=true,journal={phase:'sent',expected:'fix pr
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
  },journal);
- for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId:'job-A',runId:'run-A',provider:'chatgpt',...(kind==='fix'?{kind}:{}),...extra});
  await send('ashlar-run',{resume:true,prompt:'fix prompt'});
  return {page,send,harvest:()=>send('ashlar-harvest')};
@@ -930,7 +931,7 @@ test(`real DOM: a fix prompt whose inlined source holds ${name} reaches the comp
    composer.value='';event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
   });
  },{stop});
- for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(prompt=>{
   const s=__ashlarRunnerState;Object.assign(s,{kind:'fix',jobId:'fix-A',runId:'run-A',running:true});
   window.filled={pending:true};
@@ -990,7 +991,7 @@ async function whitespacePage(t,{kind='fix',editor=null,render=null}={}){
    composer.value='';event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
   });
  },{stop,editor:editor&&editor.toString(),render:render&&render.toString()});
- for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(kind=>{Object.assign(__ashlarRunnerState,{kind:kind==='fix'?'fix':undefined,jobId:'fix-A',runId:'run-A',running:true});},kind);
  const journal=()=>page.evaluate(()=>JSON.parse(window.__saved.get('ashlar:submission:fix-A:run-A')||'null'));
  const fill=async(prompt=WS_PROMPT)=>{
@@ -1106,7 +1107,7 @@ for(const shape of RICH_TURN_SHAPES){
 test('real DOM: a rich-editor composer holding the fix prompt one <p> per line reads back exactly; one changed sequence does not',async t=>{
  const page=await browser.newPage();t.after(()=>page.close());
  await page.setContent('<form><div id="prompt-textarea" contenteditable="true" class="ProseMirror" style="white-space:pre-wrap;width:400px;min-height:60px"></div></form>');
- await page.addScriptTag({content:source('extension/composer.js')});
+ await page.addScriptTag({content:source('extension/turns.js')});await page.addScriptTag({content:source('extension/composer.js')});
  const read=text=>page.evaluate(text=>{
   const el=document.querySelector('#prompt-textarea');el.replaceChildren();
   for(const line of text.split('\n')){const p=document.createElement('p');if(line)p.textContent=line;else{const br=document.createElement('br');br.className='ProseMirror-trailingBreak';p.append(br);}el.append(p);}
@@ -1126,7 +1127,7 @@ test('real DOM: a rich-editor composer holding the fix prompt one <p> per line r
 test('real DOM: a fix prompt typed into a pre-wrap rich editor is held exactly (control)',async t=>{
  const page=await browser.newPage();t.after(()=>page.close());
  await page.setContent('<form><div id="prompt-textarea" contenteditable="true" style="white-space:pre-wrap;width:400px;min-height:60px"></div></form>');
- await page.addScriptTag({content:source('extension/composer.js')});
+ await page.addScriptTag({content:source('extension/turns.js')});await page.addScriptTag({content:source('extension/composer.js')});
  const out=await page.evaluate(async prompt=>{
   window.__ashlarRunnerState={kind:'fix'};window.composer=()=>document.querySelector('#prompt-textarea');
   const filled=await fillComposer(composer(),prompt).catch(e=>e.code);
@@ -1144,7 +1145,7 @@ test('real DOM: a completed fix with prose around its fence still proves its own
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
  });
- for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(()=>{const s=__ashlarRunnerState;s.kind='fix';s.running=true;window.fixOut={pending:true};
   waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};s.running=false;s.result={ok:true,raw,responseText:raw};},e=>{window.fixOut={error:e.message};});});
  await page.clock.runFor(3200);
@@ -1185,12 +1186,14 @@ const FIX_SOURCE='Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\
 // render: how the sent user turn shows the file. 'tile': a data-file-name tile in the message node;
 // 'card'/'beside': ChatGPT's file card (the name and its type and size as plain text, no data
 // attributes) inside the message node, or beside it in the turn's section; 'none': no file shown.
-// The page stays on the temporary chat URL after the send (ChatGPT does not move it).
+// 'unit': ChatGPT's 2026-09 unit DOM (no author role or message id; the card beside the bubble in the
+// user unit's wrapper, the id on the wrapper). The page stays on the temporary chat URL after the send
+// (ChatGPT does not move it).
 const FILE_CARD=name=>`<div class="group relative inline-block text-sm"><div class="relative overflow-hidden rounded-2xl border"><div class="p-2 w-80"><div class="flex flex-row items-center gap-2"><div class="relative h-10 w-10 shrink-0"><svg viewBox="0 0 36 36" style="width:36px;height:36px"><rect width="36" height="36"></rect></svg></div><div class="overflow-hidden"><div class="truncate font-semibold">${name}</div><div class="truncate text-token-text-secondary">Document · 1.2 KB</div></div></div></div></div></div>`;
-async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false,render='tile',probe}={}){
+async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false,render='tile',probe,via='change'}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await setFixContent(page,`<main></main><form data-type="unified-composer">${fileInput?'<input type="file" multiple>':''}<div id="chips"></div><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>`);
- await page.evaluate(({stop,upload,collapse,swallow,probe,render,card})=>{
+ await page.evaluate(({stop,upload,collapse,swallow,probe,render,card,unit,via})=>{
   const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A']]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.__saved=saved;window.sends=0;window.clicks=0;window.uploads=[];window.uploading=false;
@@ -1201,8 +1204,11 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swall
   const composer=document.querySelector('#prompt-textarea');
   // the real composer's whitespace handling: every whitespace run becomes one space
   if(collapse)composer.addEventListener('input',()=>{composer.value=composer.value.replace(/\s+/g,' ');});
-  document.querySelector('input[type=file]')?.addEventListener('change',async event=>{
-   for(const file of event.target.files){
+  // via: how the page takes the files, its input's change or (as the new home composer may) a paste
+  // into the editor; the other hand-off is ignored, and counted.
+  window.ignored=[];
+  const take=async files=>{
+   for(const file of files){
     window.uploads.push({name:file.name,bytes:[...new Uint8Array(await file.arrayBuffer())]});
     if(upload==='none')continue;
     const send=document.querySelector('[data-testid="send-button"]');
@@ -1226,12 +1232,28 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swall
     if(upload==='stuck'){const bar=document.createElement('div');bar.setAttribute('role','progressbar');bar.style.cssText='width:40px;height:4px';chip.append(bar);}
     document.querySelector('#chips').append(chip);
    }
-   event.target.value='';
+  };
+  document.querySelector('input[type=file]')?.addEventListener('change',event=>{
+   const files=[...event.target.files];event.target.value='';
+   if(via!=='change'){window.ignored.push('change');return;}
+   take(files);
+  });
+  composer.addEventListener('paste',event=>{
+   const files=[...(event.clipboardData?.files||[])];
+   if(!files.length)return;
+   if(via!=='paste'){window.ignored.push('paste');return;}
+   event.preventDefault();take(files);
   });
   document.querySelector('[data-testid="send-button"]').addEventListener('click',event=>{
    event.preventDefault();window.clicks++;if(window.uploading||swallow)return;
    window.sends++;
    window.atClick={text:composer.value,chips:[...document.querySelectorAll('#chips [data-file-name]')].map(chip=>chip.dataset.fileName)};
+   if(render==='unit'){
+    const text=composer.value.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    document.querySelector('main').insertAdjacentHTML('beforeend',unit.replace('__TEXT__',()=>text).replace(/__NAME__/g,window.atClick.chips[0]||''));
+    composer.value='';document.querySelector('#chips').replaceChildren();event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
+    return;
+   }
    const turn=document.createElement('section');turn.dataset.testid='conversation-turn-1';
    const userTurn=document.createElement('div');userTurn.dataset.messageAuthorRole='user';userTurn.dataset.messageId='user-A';
    const name=window.atClick.chips[0]||'';
@@ -1259,8 +1281,8 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swall
    turn.append(userTurn);document.querySelector('main').append(turn);
    composer.value='';document.querySelector('#chips').replaceChildren();event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
   });
- },{stop,upload,collapse,swallow,probe,render,card:FILE_CARD('__NAME__')});
- for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+ },{stop,upload,collapse,swallow,probe,render,card:FILE_CARD('__NAME__'),unit:unitTurn({text:'__TEXT__',files:['__NAME__']}),via});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(()=>{Object.assign(__ashlarRunnerState,{kind:'fix',jobId:'fix-A',runId:'run-A',running:true});});
  const fill=async(delivery,ms=1600)=>{
   await page.evaluate(delivery=>{window.filled={pending:true};
@@ -1339,6 +1361,30 @@ test('real DOM: a temporary-chat fix whose sent turn shows ChatGPT\'s file card 
  assert.deepEqual(got,{card:shown,'card-rich':shown,beside:shown,none:{sent:[1,false,'send_unconfirmed'],clicks:1,phase:'attempted'}});
 });
 
+// Live 1.1.41: ChatGPT's 2026-09 unit DOM has no author role and no message id; the fix's card sits
+// beside the bubble in the user unit's wrapper. The sent unit is still the fix's send (its typed line
+// once the card is left out, and the card shows the file); its fenced answer is harvested from the
+// assistant unit once the turn's action row shows, and the release verdict closes the tab.
+test('real DOM: a temporary-chat fix on the 2026-09 unit DOM (its card beside the bubble) is confirmed, harvested and closable',async t=>{
+ const {attachment,typed,text}=await fixDelivery();
+ const {page,fill,journal}=await attachmentPage(t,{render:'unit',collapse:true});
+ const sent=await fill(text);
+ assert.deepEqual([sent.sends,sent.sent,sent.code],[1,true,undefined],JSON.stringify(sent));
+ const j=await journal();
+ assert.deepEqual([j.phase,j.submittedUsers,j.messageId,j.exact===typed,j.attachments,j.conversation],['sent',1,'user-A',true,[attachment.name],TEMP_URL]);
+ assert.deepEqual(await page.evaluate(names=>{const turn=userTurnEls()[0];const {cards,shown}=turnAttachments(turn,names);
+  return {shown,cards:cards.size,sent:fixTurnHolds(turn,__ashlarRunnerState.confirmedSubmission.record.exact,names)};},[attachment.name]),{shown:true,cards:1,sent:true});
+ const code='{"summary":"s","files":[],"dispositions":[]}';
+ await page.evaluate(()=>document.querySelector('[data-testid="stop-button"]').remove());
+ await renderUnitAnswer(page,unitAnswer({id:'response-A',code,prose:'Here is the fix.'}));
+ await page.evaluate(()=>{window.fixOut={pending:true};waitUntilFixOrQuota('ChatGPT').then(raw=>{window.fixOut={raw};},e=>{window.fixOut={code:e.code};});});
+ await page.clock.runFor(3200);
+ assert.deepEqual(await page.evaluate(()=>window.fixOut),{raw:code},'the fenced JSON only');
+ assert.equal(await page.evaluate(()=>__ashlarRunnerState.nativeCompletion?.responseId),'response-A');
+ const out=await page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type:'ashlar-can-close',jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix'});
+ assert.equal(out.canClose,true,JSON.stringify(out));
+});
+
 // Diagnostic (1.1.31): after a fix's Send click the page records the last user turn's shape at about
 // 1, 5, 15, 30 and 60 s in chrome.storage.local "sendProbes" (last 20): counts, card flags, lengths, a
 // hash of the first 40 characters, match flags and a URL shape. Never the prompt, the answer or the
@@ -1370,7 +1416,7 @@ test('real DOM: a fix Send click records five send probes of the sent turn\'s sh
 
 for(const [name,opts,ms,detail] of [
  ['no upload input',{fileInput:false},1600,/the composer has no file input/],
- ['an upload that never shows its file',{upload:'none'},3*60_000+2000,/was not shown as uploaded within 3 minutes/],
+ ['an upload that never shows its file',{upload:'none'},30_000,/was not shown as a chip after staging \(tried a, b, c, d \(no add button\)\)/],
  ['an upload that never finishes',{upload:'stuck'},3*60_000+2000,/was not shown as uploaded within 3 minutes/],
 ]){
  test(`real DOM (#93): ${name} ends the fix as attachment_failed; nothing is typed or sent, and the source is never pasted`,async t=>{
@@ -1383,6 +1429,24 @@ for(const [name,opts,ms,detail] of [
   assert.equal(await journal(),null,'nothing prepared');
  });
 }
+
+// Live 1.1.37: a composer that shows no chip for files set on its input. The fix attachment goes
+// through the same staging chain as a review's files: the paste strategy stages it, once, with the
+// bytes its typed line names, and the fix is sent.
+test('real DOM: a composer that takes the fix attachment only by paste: staged via (b), once, bytes exact, sent',async t=>{
+ const {createHash}=await import('node:crypto');
+ const {attachment,typed,text}=await fixDelivery();
+ const {page,fill,uploads}=await attachmentPage(t,{via:'paste'});
+ assert.deepEqual(await fill(text,12_000),{text:typed,sends:1,sent:true,composer:''},'staged, typed, sent');
+ assert.deepEqual(await page.evaluate(()=>window.ignored),['change'],'the input change was tried first, and nothing after the paste');
+ const [uploaded,...more]=await uploads();
+ assert.equal(more.length,0,'one upload');
+ assert.equal(createHash('sha256').update(Buffer.from(uploaded.bytes)).digest('hex'),attachment.sha256,'the bytes the typed line names');
+ const steps=await page.evaluate(()=>__ashlarRunnerState.steps?.events.map(e=>e.stage)||[]);
+ assert.ok(steps.includes('attachments_staged_via_b'),JSON.stringify(steps));
+ const [probe]=await page.evaluate(()=>window.__local.get('stageProbes'));
+ assert.deepEqual([probe.kind,probe.via,probe.tried],['fix','b',['a','b']]);
+});
 
 // The live 1.1.29 failure (temporary chat): attachments_waiting resolved 27 ms before prompt_prepared,
 // Send was clicked while the upload was still running, and the run sat in send_unconfirmed for its
@@ -1459,7 +1523,7 @@ test('real DOM (#93): a fix attachment over the 512 KiB cap is refused before an
 test('real DOM: a stray disabled Send earlier in DOM order does not hide the real enabled one (same selector)',async t=>{
  const page=await fixture(t,'');
  await page.evaluate(()=>{document.body.insertAdjacentHTML('beforeend','<form><div id="prompt-textarea" contenteditable="true"></div><button type="button" aria-label="Send prompt" id="stray" disabled>Send</button><button type="button" aria-label="Send prompt" id="real">Send</button></form>');});
- await page.addScriptTag({content:source('extension/composer.js')});
+ await page.addScriptTag({content:source('extension/turns.js')});await page.addScriptTag({content:source('extension/composer.js')});
  const id=await page.evaluate(()=>findEligibleSendButton(['button[aria-label*="Send"]'])?.id||null);
  assert.equal(id,'real');
  // Only a disabled Send under the selector: no looser selector is tried.
@@ -1469,7 +1533,7 @@ test('real DOM: a stray disabled Send earlier in DOM order does not hide the rea
 
 test('real DOM (#93): a review prompt that ChatGPT renders as Markdown still counts as its sent turn',async t=>{
  const page=await fixture(t,'');
- await page.addScriptTag({content:source('extension/composer.js')});
+ await page.addScriptTag({content:source('extension/turns.js')});await page.addScriptTag({content:source('extension/composer.js')});
  const out=await page.evaluate(()=>{
   const prompt='Review this diff.\n\n```diff\n- const a = 1;\n+ const a = 2;\n```\n\n**Rules:** use `json` only.\n'+'context line '.repeat(60);
   // What the rendered user turn reads as: fences, backticks and emphasis gone.

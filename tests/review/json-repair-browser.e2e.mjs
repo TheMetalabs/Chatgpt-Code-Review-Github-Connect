@@ -22,7 +22,7 @@ async function pageFixture(t,{jobId='A',text=original,streaming=false,manual=fal
   document.querySelector('.markdown').textContent=text;window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}}};
   if(streaming){const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Stop generating';document.querySelector('form').append(stop);}
  },{jobId,text,streaming});
- for(const file of ['composer.js','quota.js','model.js','json.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js'])await page.addScriptTag({content:source('extension/'+file)});
  if(legacy)await page.addScriptTag({content:source('tests/review/fixtures/legacy-collector-v2.js')});
  await page.addScriptTag({content:source('extension/content-chatgpt.js')});
  await page.evaluate(jobId=>{window.message=(type,extra={})=>{let out;receiver({type,jobId,runId:'run-A',provider:'chatgpt',...extra},null,value=>out=value);return out || {ok:false,code:'unhandled'};};},jobId);

@@ -49,7 +49,7 @@ async function pageFor(t,html=''){
     window.__ashlarRunnerState={jobId:'A',runId:'run-A',provider:'chatgpt',running:true};
     window.chrome={runtime:{onMessage:{addListener(){},removeListener(){}}}};
   });
-  for(const file of ['composer.js','quota.js','model.js','json.js'])await page.addScriptTag({content:source('extension/'+file)});
+  for(const file of ['turns.js','composer.js','quota.js','model.js','json.js'])await page.addScriptTag({content:source('extension/'+file)});
   await page.evaluate(()=>{window.composer=()=>document.querySelector('#prompt-textarea');});
   return page;
 }

@@ -16,7 +16,7 @@ before(async()=>{browser=await chromium.launch({headless:true,executablePath:pro
 after(async()=>{await browser?.close();});
 
 const MIN=60_000;
-const MANIFEST=['composer.js','quota.js','overlay.js','model.js','json.js','content-chatgpt.js'];
+const MANIFEST=['turns.js','composer.js','quota.js','overlay.js','model.js','json.js','content-chatgpt.js'];
 const URL_='https://chatgpt.com/?temporary-chat=true';
 const PROMPT='Review fixture PR #1 at abc123. Return the review JSON.';
 const FILES=['ashlar-diff.patch','ashlar-snapshot.md','ashlar-policy.md'];
@@ -37,17 +37,20 @@ const RENDER={
  // ChatGPT's own renderings: a changed case, a middle-truncated name, the name with its type apart.
  real:name=>({'ashlar-diff.patch':card('Ashlar-Diff.patch','File'),'ashlar-snapshot.md':card('ashlar-snaps…md','Document'),
   'ashlar-policy.md':card('ashlar-policy','Markdown')})[name],
+ // Live 1.1.39 probe (#93): the new home composer's card shows the name as bare leaf text in nested
+ // spans, with no title, aria-label or data attribute, plus a remove button.
+ leaf:name=>`<div style="display:flex;width:180px;height:40px"><div><span><span><span><span>${name}</span></span></span></span></div><div><span><span><button type="button" aria-label="파일 제거" style="width:10px;height:10px">x</button></span></span></div></div>`,
  stuck:name=>name==='ashlar-snapshot.md'?card(name,'File','<svg class="animate-spin" role="progressbar" style="width:16px;height:16px"><circle r="4"></circle></svg>'):card(name,'File'),
 };
 
-async function chatTab(t,{render='exact',stray=false,local:initial={},home=false}={}){
+async function chatTab(t,{render='exact',stray=false,local:initial={},home=false,accepts='change'}={}){
  const composerForm=home?homeForm:unifiedForm;
  const page=await browser.newPage();t.after(()=>page.close());
  await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html; charset=utf-8',body:`<html><body><main id="thread"></main>${composerForm}</body></html>`}));
  await page.clock.install();
  await page.goto(URL_);
  const chips=Object.fromEntries(FILES.map(name=>[name,RENDER[render](name)]));
- await page.evaluate(({initial,stopButton,chips,stray})=>{
+ await page.evaluate(({initial,stopButton,chips,stray,accepts})=>{
   const local=new Map(Object.entries(initial));window.__local=local;
   const pick=keys=>Object.fromEntries(keys.filter(k=>local.has(k)).map(k=>[k,JSON.parse(JSON.stringify(local.get(k)))]));
   window.chrome={runtime:{onMessage:{addListener(fn){window.receiver=fn;},removeListener(){}}},
@@ -56,12 +59,37 @@ async function chatTab(t,{render='exact',stray=false,local:initial={},home=false
   document.querySelector('form').addEventListener('submit',e=>e.preventDefault());
   // A spinner that is not an upload: a busy tool button beside Send, there for the whole run.
   if(stray)document.getElementById('toolbar').insertAdjacentHTML('afterbegin','<span class="animate-spin" role="progressbar" aria-busy="true" style="width:16px;height:16px;display:inline-block"></span>');
-  // The upload: each staged file's chip renders a moment after the input changes.
+  // The upload: each staged file's chip renders a moment after the page takes the files, by the one
+  // way this composer takes them (`accepts`): its input's change, a paste into the editor, or a drop.
+  // Every hand-off is counted, taken or not, so a second staging shows.
+  window.stagings=[];
+  const render=names=>setTimeout(()=>{for(const name of names)document.getElementById('chips').insertAdjacentHTML('beforeend',chips[name]);},500);
   for(const input of document.querySelectorAll('input[type=file]'))input.addEventListener('change',event=>{
    const accept=event.currentTarget.getAttribute('accept')||'';
+   window.stagings.push(['change',[...event.currentTarget.files].map(file=>file.name)]);
+   if(accepts!=='change')return;
    // An image/video input drops text files, with no chip (what the page did live).
-   const names=[...event.currentTarget.files].filter(file=>!accept||accept.split(',').some(a=>file.type.startsWith(a.replace('*','')))).map(file=>file.name);
-   setTimeout(()=>{for(const name of names)document.getElementById('chips').insertAdjacentHTML('beforeend',chips[name]);},500);
+   render([...event.currentTarget.files].filter(file=>!accept||accept.split(',').some(a=>file.type.startsWith(a.replace('*','')))).map(file=>file.name));
+  });
+  document.getElementById('prompt-textarea').addEventListener('paste',event=>{
+   const names=[...(event.clipboardData?.files||[])].map(file=>file.name);
+   if(!names.length)return;
+   window.stagings.push(['paste',names]);
+   if(accepts==='paste'){event.preventDefault();render(names);}
+  });
+  const form=document.querySelector('form');
+  // 'menu': only the input the "파일 등 추가" menu mounts when opened takes files.
+  if(accepts==='menu')document.querySelector('[aria-label="파일 등 추가"]').addEventListener('click',event=>{
+   event.currentTarget.setAttribute('aria-expanded','true');
+   const input=document.createElement('input');input.type='file';input.multiple=true;input.hidden=true;form.append(input);
+   input.addEventListener('change',()=>{window.stagings.push(['menu',[...input.files].map(file=>file.name)]);render([...input.files].map(file=>file.name));});
+  });
+  document.addEventListener('keydown',event=>{if(event.key==='Escape')window.menuClosed=true;});
+  form.addEventListener('dragover',event=>{if(accepts==='drop')event.preventDefault();});
+  form.addEventListener('drop',event=>{
+   const names=[...(event.dataTransfer?.files||[])].map(file=>file.name);
+   window.stagings.push(['drop',names]);
+   if(accepts==='drop'){event.preventDefault();render(names);}
   });
   document.getElementById('composer-submit-button').addEventListener('click',event=>{
    window.sendClicks++;
@@ -70,7 +98,7 @@ async function chatTab(t,{render='exact',stray=false,local:initial={},home=false
    document.getElementById('prompt-textarea').textContent='';document.getElementById('chips').innerHTML='';
    event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stopButton);
   });
- },{initial,stopButton,chips,stray});
+ },{initial,stopButton,chips,stray,accepts});
  for(const file of MANIFEST)await page.addScriptTag({content:source('extension/'+file)});
  const send=(type,extra={})=>page.evaluate(msg=>new Promise(resolve=>{if(msg.type==='ashlar-run')msg.until=Date.now()+10_000;receiver(msg,null,resolve);}),
   {type,jobId:'job-A',runId:'run-A',provider:'chatgpt',...extra});
@@ -105,6 +133,52 @@ test('the new home composer (image input first, 파일 첨부 last): all three r
  assert.ok(steps.includes('prompt_submitted'),`the prompt is not sent: ${JSON.stringify(steps)} ${JSON.stringify(await tab.runner())}`);
  assert.deepEqual(await tab.view(),{sendClicks:1,sent:PROMPT});
  assert.equal(await tab.local('uploadWaitHtml'),undefined);
+});
+
+// Live 1.1.37: on the new home composer, files set on the 파일 첨부 input and its input/change events
+// still showed no chip. Staging is an ordered chain, (a) the input, (b) a paste into the editor, (c) a
+// drop on the editor then the form, (d) the "+" menu's new input, that stops at the first strategy
+// whose chip shows, never stages again once one did, and records which one worked.
+for(const [name,opts,via,stagings] of [
+ ['a composer that ignores the input change but takes a paste',{home:true,accepts:'paste'},'b',[['change',FILES],['paste',FILES]]],
+ ['a composer that takes only a drop',{home:true,accepts:'drop'},'c',[['change',FILES],['paste',FILES],['drop',FILES]]],
+ ['the old composer, which takes the input change',{accepts:'change'},'a',[['change',FILES]]],
+ ['a composer whose "+" menu mounts the input that takes files',{home:true,accepts:'menu'},'d',[['change',FILES],['paste',FILES],['drop',FILES],['drop',FILES],['menu',FILES]]],
+]){
+ test(`staging chain: ${name} is staged via (${via}), once, and Send is clicked`,async t=>{
+  const tab=await chatTab(t,opts);
+  await tab.start();
+  await tab.page.clock.runFor(40_000);
+  const steps=await tab.steps();t.diagnostic(JSON.stringify(steps));
+  assert.ok(steps.includes(`attachments_staged_via_${via}`),`not staged via ${via}: ${JSON.stringify(steps)} ${JSON.stringify(await tab.runner())}`);
+  assert.deepEqual(steps.filter(s=>s.startsWith('attachments_staged_via_')),[`attachments_staged_via_${via}`]);
+  assert.deepEqual(await tab.page.evaluate(()=>window.stagings),stagings,'each strategy hands the files over once, and none after the chip showed');
+  assert.ok(steps.includes('prompt_submitted'),`the prompt is not sent: ${JSON.stringify(steps)}`);
+  assert.deepEqual(await tab.view(),{sendClicks:1,sent:PROMPT});
+  const [probe,...more]=await tab.local('stageProbes');
+  assert.equal(more.length,0,'one probe per staging chain');
+  assert.deepEqual({job:probe.job,run:probe.run,via:probe.via,tried:probe.tried,files:probe.files},
+   {job:'job-A',run:'run-A',via,tried:['a','b','c','d'].slice(0,['a','b','c','d'].indexOf(via)+1),files:3});
+  if(via==='d')assert.equal(await tab.page.evaluate(()=>window.menuClosed),true,'the menu it opened is closed');
+  assert.deepEqual(probe.attempts.map(a=>[a.strategy,a.chip,a.editor]),probe.tried.map(id=>[id,id===via,true]));
+  assert.deepEqual(probe.attempts[0].accepts,opts.home?['image/*,video/*','image/*','']:['']);
+  assert.equal(probe.attempts[0].inputs,opts.home?3:1);
+  assert.ok(!JSON.stringify(probe).includes('body of'),'no file content in the probe');
+ });
+}
+
+test('staging chain: no strategy shows a chip: attachment_failed naming the strategies tried, nothing sent, no second staging past the chain',async t=>{
+ const tab=await chatTab(t,{home:true,accepts:'none'});
+ await tab.start();
+ await tab.page.clock.runFor(60_000);
+ const out=await tab.runner();t.diagnostic(JSON.stringify(out));
+ assert.equal(out.code,'attachment_failed');
+ assert.match(out.error,/not shown as chips after staging \(tried a, b, c, d \(no new input\)\)/);
+ assert.match(out.error,/nothing was sent$/);
+ assert.equal((await tab.view()).sendClicks,0);
+ assert.deepEqual((await tab.page.evaluate(()=>window.stagings)).map(([via])=>via),['change','paste','drop','drop']);
+ const [probe]=await tab.local('stageProbes');
+ assert.deepEqual([probe.via,probe.tried],[null,['a','b','c','d (no new input)']]);
 });
 
 test('a stray spinner outside the chips does not hold the send',async t=>{
@@ -151,4 +225,15 @@ test('uploadWaitHtmlOff:true records no snapshot; snapshots keep the last 3',asy
  const tab=await chatTab(t,{render:'stuck',local:{uploadWaitHtml:old}});
  await tab.start();await tab.page.clock.runFor(3*MIN+15_000);
  assert.deepEqual((await tab.local('uploadWaitHtml')).map(s=>s.run),['r1','r2','run-A']);
+});
+
+test('live 1.1.39 card shape: a staged file whose name is bare leaf text is its chip, staged once, and Send is clicked',async t=>{
+ const tab=await chatTab(t,{home:true,render:'leaf'});
+ await tab.start();
+ await tab.page.clock.runFor(10_000);
+ const steps=await tab.steps();
+ assert.ok(steps.includes('attachments_staged_via_a'),`staged by the input: ${JSON.stringify(steps)}`);
+ assert.ok(steps.includes('prompt_submitted'),`sent: ${JSON.stringify(steps)} ${JSON.stringify(await tab.runner())}`);
+ assert.deepEqual(await tab.view(),{sendClicks:1,sent:PROMPT});
+ assert.ok(!steps.some(s=>/^attachments_staged_via_[bcd]$/.test(s)),'no second strategy once the leaf-text chips showed');
 });

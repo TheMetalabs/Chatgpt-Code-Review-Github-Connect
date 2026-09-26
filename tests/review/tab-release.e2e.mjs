@@ -18,9 +18,9 @@ test('composer.js can be injected twice into one page (the worker re-injects on 
  const page=await browser.newPage();t.after(()=>page.close());
  const errors=[];page.on('pageerror',error=>errors.push(error.message));
  await page.setContent('<main></main>');
- await page.addScriptTag({content:source('extension/composer.js')});
+ await page.addScriptTag({content:source('extension/turns.js')});await page.addScriptTag({content:source('extension/composer.js')});
  await page.evaluate(()=>{window.first={clickSend,fillComposer,waitUntilComposer};});
- await page.addScriptTag({content:source('extension/composer.js')});
+ await page.addScriptTag({content:source('extension/turns.js')});await page.addScriptTag({content:source('extension/composer.js')});
  assert.deepEqual(errors,[],'a re-injected composer.js must not throw (a top-level const/let redeclaration aborts the whole script)');
  assert.deepEqual(await page.evaluate(()=>Object.entries(window.first).filter(([name,fn])=>globalThis[name]===fn).map(([name])=>name)),[],
   'the re-injected definitions replace the old ones, so new checks (the stop fence) apply to later calls');
@@ -28,7 +28,7 @@ test('composer.js can be injected twice into one page (the worker re-injects on 
 
 // ── A provider tab served at a real chatgpt.com URL (real sessionStorage, reloadable), running the
 // manifest content scripts in manifest order. `view` is what the next (re)load serves.
-const MANIFEST=['composer.js','quota.js','overlay.js','model.js','json.js','content-chatgpt.js'];
+const MANIFEST=['turns.js','composer.js','quota.js','overlay.js','model.js','json.js','content-chatgpt.js'];
 const TEMP_URL='https://chatgpt.com/?temporary-chat=true',CONV_URL='https://chatgpt.com/c/ashlar-conv',OTHER_URL='https://chatgpt.com/c/users-own';
 const PROMPT='Review fixture PR #1 at abc123. Return the review JSON.';
 const ANSWER=JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['fixture checked']},null,2);

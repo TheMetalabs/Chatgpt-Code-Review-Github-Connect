@@ -600,8 +600,8 @@ async function markLoggedOut(provider) {
 
 function contentFiles(provider) {
   return provider === "grok"
-    ? ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-grok.js"]
-    : ["composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-chatgpt.js"];
+    ? ["turns.js", "composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-grok.js"]
+    : ["turns.js", "composer.js", "quota.js", "overlay.js", "model.js", "json.js", "content-chatgpt.js"];
 }
 
 /** A tick only exchanges short messages. The content page owns the long model call.
@@ -700,7 +700,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.37";
+const WORKER_BUILD = "1.1.42";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;

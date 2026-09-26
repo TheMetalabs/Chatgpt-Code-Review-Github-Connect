@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ashlar Chat Bridge",
-  "version": "1.1.37",
+  "version": "1.1.42",
   "description": "Runs Ashlar PR reviews in the ChatGPT or Grok tab you are already signed into.",
   "permissions": [
     "storage",
@@ -37,6 +37,7 @@
         "https://chat.openai.com/*"
       ],
       "js": [
+        "turns.js",
         "composer.js",
         "quota.js",
         "overlay.js",
@@ -51,6 +52,7 @@
         "https://grok.com/*"
       ],
       "js": [
+        "turns.js",
         "composer.js",
         "quota.js",
         "overlay.js",

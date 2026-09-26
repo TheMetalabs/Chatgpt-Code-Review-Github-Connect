@@ -325,7 +325,9 @@ function composerStagedFiles(state, submission) {
     .map(chip => ({chip, names: fileChipNames(chip).filter(name => name.trim())}))
     .filter(({names}) => names.length);
   return named.filter(({chip}) => !named.some(outer => outer.chip !== chip && outer.chip.contains(chip)))
-    .filter(({names}) => !names.some(name => own.has(name)))
+    // Own by the barrier's own name rule (composer.js chipShowsFile: any case, a truncated or
+    // extensionless name), so a chip the barrier waits on is never read as the user's draft.
+    .filter(({chip, names}) => ![...own].some(name => typeof chipShowsFile === "function" ? chipShowsFile(chip, name) : names.includes(name)))
     .map(({names}) => names[0]);
 }
 

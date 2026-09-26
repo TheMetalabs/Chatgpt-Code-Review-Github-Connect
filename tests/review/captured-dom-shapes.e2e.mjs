@@ -86,7 +86,8 @@ test('visible attachment progress keeps send pending without delaying prompt ent
   document.querySelector('input[type=file]').onchange=()=>{const chip=document.createElement('div');chip.setAttribute('role','group');chip.ariaLabel='diff.patch';chip.innerHTML='diff.patch<span class="animate-spin" style="display:inline-block;width:20px;height:20px">uploading</span>';document.querySelector('form').append(chip);};
   window.filled=null;fillComposer(composer(),'Review\n\n<<<ATTACH:diff.patch>>>\nfile body\n<<<END_ATTACH>>>').then(text=>{window.filled=text;return clickSend(()=>document.querySelector('#composer-submit-button'),composer,text);});
  });await page.clock.runFor(100);assert.equal(await page.evaluate(()=>filled),'Review');assert.equal(await page.evaluate(()=>clicks),0);
- await page.clock.fastForward(24*3600_000);assert.equal(await page.evaluate(()=>clicks),0);
+ // Inside the 3-min upload bound (past it: attachment_failed, tests/review/upload-wait.e2e.mjs).
+ await page.clock.runFor(2*60_000);assert.equal(await page.evaluate(()=>clicks),0);
  const stages=await page.evaluate(()=>__ashlarRunnerState.steps.events.map(e=>e.stage));
  assert.equal(stages.filter(s=>s==='attachments_waiting').length,1,'unchanged upload wait must not churn the journal');
  await page.locator('.animate-spin').evaluate(el=>el.style.display='none');await page.clock.runFor(500);assert.equal(await page.evaluate(()=>clicks),1);

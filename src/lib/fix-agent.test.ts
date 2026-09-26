@@ -201,8 +201,16 @@ describe("buildFixPrompt fix discipline", () => {
     assert.match(instructions, /6\. Scope: change only what the flagged defect classes need\. No renames, reformatting,\n\s+refactors or comment edits outside the fix/);
     assert.match(instructions, /7\. Reuse first: prefer the existing proven helpers\/guards[\s\S]*ONE shared\n\s+helper \(in one in-scope file\) only when the same defect class appears in 2\+ places/);
     assert.match(instructions, /8\. Bounds: for every guard or clamp you add, the note states what it bounds and what happens\n\s+when the condition never trips/);
-    assert.match(instructions, /9\. Tests: if the code's test file is in scope, add a regression test there; otherwise the\n\s+note says "test needed: <test file or location>"/);
+    assert.match(instructions, /9\. Tests: for each fixed finding add one regression test that fails without the fix[\s\S]*existing tests untouched[\s\S]*"test needed: <test file or location>"/);
     assert.match(instructions, /10\. A decline or defer MUST cite evidence in its note: an issue number \(#123\), a file:line,\n\s+or a quoted code reference/);
+  });
+
+  it("puts the minimal-change rule first: comments, tests, formatting and unrelated code stay byte-for-byte (#439 P0)", () => {
+    assert.match(instructions, /0\. MINIMAL CHANGE\. Make only the smallest change that resolves each finding\./);
+    assert.match(instructions, /comments \(especially WHY comments\), docblocks, tests,\n\s+formatting, blank lines, imports, names and unrelated code/);
+    assert.match(instructions, /Never delete or weaken an existing\n\s+test/);
+    assert.match(instructions, /never a\n\s+licence to rewrite it/);
+    assert.ok(instructions.indexOf("0. MINIMAL CHANGE") < instructions.indexOf("1. Classify"), "rule 0 comes first");
   });
 
   it("asks for targeted edits (full content only for new files) and the preserve rule", () => {

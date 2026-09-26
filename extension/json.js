@@ -89,11 +89,13 @@ function assistantCorpus(root = currentAssistantRoot()) {
 
 /** The fenced code blocks of the assistant turn(s) as LITERAL text. A fix answer carries file
  * content, and rendered markdown rewrites it (backslash escapes, emphasis, links) while it still
- * parses as JSON, so a fix is read from code blocks only. */
-function assistantCodeBlocks(root = currentAssistantRoot()) {
+ * parses as JSON, so a fix is read from code blocks only. `stats` (optional) receives what the
+ * harvest saw: the block count, their total length and whether any block looked collapsed. */
+function assistantCodeBlocks(root = currentAssistantRoot(), stats) {
   if (!root) return [];
   const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
   const blocks = [];
+  let collapsed = false;
   for (const turn of turns) {
     for (const pre of turn.querySelectorAll("pre")) {
       if (!renderedIn(pre, turn)) continue; // a hidden/stale block the renderer kept is not the answer
@@ -102,13 +104,101 @@ function assistantCodeBlocks(root = currentAssistantRoot()) {
       // text is read with the same visibility rule as a review's corpus (visibleText).
       const codes = [...pre.querySelectorAll("code")];
       const visible = codes.length ? codes.filter(code => renderedIn(code, turn) && !codes.some(outer => outer !== code && outer.contains(code))) : [pre];
+      // A collapsed block (live aicc #455: a long fix answer never parsed) shows only part of its
+      // code; its visible code element's full text is the answer then, hidden tail included.
+      const folded = codeBlockCollapsed(pre, turn);
+      collapsed ||= folded;
       for (const source of visible) {
-        const text = visibleText(source);
+        const text = folded ? fullCodeText(source) : visibleText(source);
         if (text) blocks.push(text);
       }
     }
   }
+  if (stats) Object.assign(stats, {blocks: blocks.length, totalChars: blocks.reduce((n, b) => n + b.length, 0), collapsed});
   return blocks;
+}
+
+/** All the code text in `el`, hidden parts included (a collapsed block hides its tail), with the
+ * line breaks visibleText gives block elements; controls and graphics are still not code. */
+function fullCodeText(el) {
+  const walk = node => {
+    if (node.nodeType === 3) return node.nodeValue || "";
+    if (node.nodeType !== 1 || node.matches("button, [role='button'], svg, script, style")) return "";
+    if (node.tagName === "BR") return "\n";
+    const text = [...node.childNodes].map(walk).join("");
+    return /^(P|DIV|PRE|LI)$/.test(node.tagName) ? `\n${text}\n` : text;
+  };
+  return el ? walk(el).trim() : "";
+}
+
+/** A code block's frame: the renderer's code-block container around `pre` inside `turn`, else `pre`. */
+function codeBlockBox(pre, turn) {
+  const box = pre.closest?.("[data-markdown-copy='code-block'], .CodeBlock, [data-testid='code-block']");
+  return box && turn.contains(box) ? box : pre;
+}
+
+/** The expander controls of a code block that shows only part of its code ("더 보기", "Show more",
+ * "Expand", or any control with aria-expanded="false"); never its copy, wrap or scroll controls. */
+function codeBlockExpanders(pre, turn) {
+  const expand = /더\s*보기|펼치기|전체\s*보기|모두\s*보기|show\s*(more|all|full)|expand|see\s*more|view\s*(more|all)/i;
+  return [...codeBlockBox(pre, turn).querySelectorAll("button, [role='button']")].filter(control => {
+    const label = `${control.getAttribute("aria-label") || ""} ${control.textContent || ""}`;
+    if (/copy|복사|wrap|줄\s*바꿈|scroll|스크롤/i.test(label)) return false;
+    return control.getAttribute("aria-expanded") === "false" || expand.test(label);
+  });
+}
+
+/** Whether a code block shows only part of its code: an expander, or code clipped by a container
+ * that hides its overflow (a scrolling container shows all of it on scroll and is not collapsed). */
+function codeBlockCollapsed(pre, turn) {
+  if (codeBlockExpanders(pre, turn).length) return true;
+  const box = codeBlockBox(pre, turn);
+  const code = pre.querySelector("code") || pre;
+  for (let node = code; node && node !== box.parentElement; node = node.parentElement) {
+    const style = globalThis.window?.getComputedStyle ? window.getComputedStyle(node) : null;
+    if (style && /hidden|clip/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 1) return true;
+  }
+  return false;
+}
+
+/** Open every collapsed code block of a fix answer once (its expander clicked), so the next
+ * observation reads the whole code. A control already clicked is never clicked again (a second
+ * click would fold it back). Returns how many were clicked. */
+function expandCollapsedCodeBlocks(root) {
+  if (!root?.matches || !root.querySelectorAll) return 0;
+  const clicked = globalThis.__ashlarExpandedCode ||= new WeakSet();
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
+  let count = 0;
+  for (const turn of turns) {
+    for (const pre of turn.querySelectorAll("pre")) {
+      for (const control of codeBlockExpanders(pre, turn)) {
+        if (clicked.has(control)) continue;
+        clicked.add(control);
+        try { control.click(); count += 1; } catch { /* a control that cannot be clicked keeps the full-text read */ }
+      }
+    }
+  }
+  return count;
+}
+
+/** The line between two code blocks of one fix answer: the server joins the blocks back in order
+ * when the JSON spans them (src/lib/fix-apply.ts FIX_BLOCK_BREAK). A function: content scripts are
+ * re-injected. */
+function fixBlockBreak() {
+  return "<<<ASHLAR_CODE_BLOCK_BREAK>>>";
+}
+
+/** Diagnostic: one fix harvest's shape, in chrome.storage.local "fixHarvestProbes" (last 10). Never
+ * content: counts, lengths and flags only. Never affects the run. */
+function saveFixHarvestProbe(record) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    globalThis.__ashlarFixHarvestProbeWrites = (globalThis.__ashlarFixHarvestProbeWrites || Promise.resolve()).then(async () => {
+      const stored = (await local.get(["fixHarvestProbes"]))?.fixHarvestProbes;
+      await local.set({fixHarvestProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-10)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
 }
 
 /** Whether `el` and every ancestor up to `root` is visible (hiddenNode). */
@@ -122,11 +212,13 @@ function renderedIn(el, root) {
 /** A bound response's canonical answer text, what its collector harvested and what every later
  * completion proof must match: a review's full rendered corpus, a fix's fenced code only (or a
  * fixed no-JSON line when it has none, so the server's fix parser fails closed). */
-function boundAnswerText(kind, root) {
+function boundAnswerText(kind, root, stats) {
   const prose = assistantCorpus(root).join("\n\n");
   if (kind !== "fix" || !prose.trim()) return prose;
-  const blocks = assistantCodeBlocks(root);
-  return blocks.length ? blocks.join("\n\n") : "(no fenced code block in the answer; the fix JSON must be inside a ```json fence)";
+  const blocks = assistantCodeBlocks(root, stats);
+  // Blocks in order, split by a line no JSON contains: one JSON the page rendered over two blocks
+  // is joined back by the server's parser.
+  return blocks.length ? blocks.join(`\n${fixBlockBreak()}\n`) : "(no fenced code block in the answer; the fix JSON must be inside a ```json fence)";
 }
 
 function harvestJson(opts) {
@@ -1019,7 +1111,11 @@ async function waitUntilFixOrQuota(name) {
       const error = new Error(ended.error); error.code = ended.code; throw error;
     }
     const own = proof.ownership === "owned" && bound?.identified ? bound.root : null;
-    const text = done && own ? boundAnswerText("fix", own) : "";
+    // A collapsed code block is opened first (live aicc #455); the harvest then reads it whole.
+    const expanded = done && own ? expandCollapsedCodeBlocks(own) : 0;
+    stability.expanded = (stability.expanded || 0) + expanded;
+    const harvest = {};
+    const text = done && own ? boundAnswerText("fix", own, harvest) : "";
     const answered = done && Boolean(text.trim());
     // Local diagnostics only: the answer text is never copied into an observation.
     if (runner?.running) runner.observation = {
@@ -1031,7 +1127,11 @@ async function waitUntilFixOrQuota(name) {
     if (answered) {
       // Its ID (its message node when it has none): the only response a later poll may collect.
       stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
-      if (settleStableAnswer(stability, text, poll, {text, raw: text})) return text;
+      if (settleStableAnswer(stability, text, poll, {text, raw: text})) {
+        saveFixHarvestProbe({at: Date.now(), jobId: runner?.jobId, runId: runner?.runId, blocks: harvest.blocks || 0,
+          totalChars: harvest.totalChars || 0, answerChars: text.length, collapsed: Boolean(harvest.collapsed), expanded: stability.expanded});
+        return text;
+      }
     } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
   }

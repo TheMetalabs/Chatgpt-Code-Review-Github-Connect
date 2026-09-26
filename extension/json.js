@@ -562,13 +562,15 @@ function conversationIdentity(href) {
  * the fix was sent in); after the send, the page is compared by samePage (origin and path, the query
  * ignored, #82), for both kinds.
  *
- * A fix whose page changes path after the send is `identity:"changed"`, whoever moved it. The
- * temporary chat keeps its path only while ChatGPT honours it. When it does not, ChatGPT itself
- * moves the new chat to /c/<id>, and such a fix run ends `taken_over` ("the tab moved to another
- * conversation") and its tab is preserved as navigated, although the user did nothing. This is a
- * known #77 vs #82 contradiction: the send-time identity cannot tell the provider's move from the
- * user's in-page move to their own conversation while the old DOM is still rendered, which is the
- * case it guards (a review on a new chat pins instead, below).
+ * A fix whose page changes path after the send is `identity:"changed"`, whoever moved it, with one
+ * exception (live 1.1.42): ChatGPT now moves a sent temporary chat to /c/<id>?temporary-chat=true.
+ * The page instance that clicked Send on fixChatPage binds its fix to that temporary conversation
+ * (providerMovedTemporaryChat: at the send confirmation, or adoptMovedTemporaryChat while it
+ * collects), never to a page that is not a temporary chat (the user's own conversations never are).
+ * When ChatGPT moves the new chat to a plain /c/<id>, such a fix run still ends `taken_over` ("the
+ * tab moved to another conversation") and its tab is preserved as navigated: the known #77 vs #82
+ * contradiction (the send-time identity cannot tell that move from the user's in-page move to their
+ * own conversation while the old DOM is still rendered; a review on a new chat pins instead, below).
  *
  * The one exception (#82) is a REVIEW whose journal has no send-time conversation: a review sent on
  * a new chat (namesNoConversation: ChatGPT's "/" or a temporary chat it does not honour, Grok's home,
@@ -644,10 +646,47 @@ function namesNoConversation(href) {
  * re-injectable. */
 function fixChatPage() { return "https://chatgpt.com/?temporary-chat=true"; }
 
-/** Whether a fix run was sent in the temporary chat (its send-time identity is exactly fixChatPage):
- * the only send a fix answer can be proven for, and the only one whose tab may close. */
+/** Whether `href` is the conversation ChatGPT moves a sent temporary chat to: /c/<id> with exactly
+ * `?temporary-chat=true` (live 1.1.42 send probes: `chatgpt.com/c/*?temporary-chat=true` within a
+ * second of a fix's Send click). The user's own conversations are never temporary chats. */
+function temporaryChatConversation(href) {
+  try {
+    const url = new URL(href), home = new URL(fixChatPage());
+    return url.origin === home.origin && url.search === home.search && /^\/c\/[^/]+\/?$/.test(url.pathname);
+  } catch { return false; }
+}
+
+/** Whether a fix clicked on the temporary chat (`clickedIn`, exactly fixChatPage) now shows the
+ * temporary conversation ChatGPT moved it to (`href`): the provider's move, only ever adopted by the
+ * page instance that clicked Send (composer.js sendAttempt, in memory). */
+function providerMovedTemporaryChat(clickedIn, href) {
+  return clickedIn === fixChatPage() && temporaryChatConversation(conversationIdentity(href));
+}
+
+/** Whether a fix run was sent in the temporary chat (its send-time identity is exactly fixChatPage,
+ * or the temporary conversation ChatGPT moved that send to): the only send a fix answer can be
+ * proven for, and the only one whose tab may close. */
 function fixSentInTemporaryChat(submission) {
-  return submission?.conversation === fixChatPage();
+  return submission?.conversation === fixChatPage() || temporaryChatConversation(submission?.conversation);
+}
+
+/** Bind a fix recorded on the temporary chat (fixChatPage) to the conversation ChatGPT moved it to,
+ * when THIS page instance clicked its Send there (sendAttempt) and now shows that move while the
+ * answer is collected: the move can land after the send is confirmed. Once, never replaced: a later
+ * location is compared with it (samePage). A reloaded page (no sendAttempt) never adopts one. */
+function adoptMovedTemporaryChat(state, submission) {
+  if (submission?.phase !== "sent" || submission.conversation !== fixChatPage()) return;
+  let key;
+  try { key = submissionKey(); } catch { return; }
+  const attempt = state?.sendAttempt;
+  if (attempt?.key !== key || !providerMovedTemporaryChat(attempt.conversation, globalThis.location?.href)) return;
+  submission.conversation = conversationIdentity(globalThis.location?.href);
+  if (state.confirmedSubmission?.record === submission) {
+    state.submissionPersistencePending = true;
+    if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();
+  } else {
+    try { sessionStorage.setItem(key, JSON.stringify(submission)); } catch { /* adopted again from memory next poll */ }
+  }
 }
 
 /** Whether the page still shows the conversation its run was bound in (samePage). Not established = false. */
@@ -716,6 +755,7 @@ function fixOwnershipProof(state, {phase, journal, pinned} = {}) {
   // must be the temporary chat; a journal without one never gains it. Nor does one without its
   // prompt's lossless form (`exact`, recorded by composer.js clickSend when the send is prepared):
   // its turn can never be proven exact.
+  if (phase === "collect") adoptMovedTemporaryChat(state, submission);
   if (!fixSentInTemporaryChat(submission) || typeof submission.exact !== "string") {
     return verdict("unknown", "unestablished", {identity: "unestablished"});
   }

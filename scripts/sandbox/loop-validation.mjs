@@ -18,3 +18,8 @@ export function average(xs) {
 export function isFullSha(s) {
   return /^[0-9a-f]{40}$/.test(s);
 }
+
+/** Last `n` items of the list (n >= 0). */
+export function lastN(items, n) {
+  return items.slice(items.length - n - 1);
+}

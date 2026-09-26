@@ -21,5 +21,5 @@ export function isFullSha(s) {
 
 /** Last `n` items of the list (n >= 0). */
 export function lastN(items, n) {
-  return items.slice(items.length - n - 1);
+  return items.slice(items.length - n);
 }

@@ -16,7 +16,7 @@ export function average(xs) {
 
 /** Whether `s` is a 40-hex commit SHA. */
 export function isFullSha(s) {
-  return /^[0-9a-f]{40}$/.test(s);
+  return /^[0-9a-f]{40}$/i.test(s);
 }
 
 /** Last `n` items of the list (n >= 0). */

@@ -1474,7 +1474,7 @@ export async function runPostReviewLoop(
     for (;;) {
       attempts += 1;
       const t0 = Date.now();
-      trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, provider: settings.fixAgent.provider ?? "none" });
+      trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, prScopeChars: prScope.length, provider: settings.fixAgent.provider ?? "none" });
       res = await runFixRound(
         {
           requestFix,

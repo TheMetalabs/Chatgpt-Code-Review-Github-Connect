@@ -251,6 +251,8 @@ function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
     diffChars: diffBody.length,
     contextChars: contextBody.length,
     policyChars: policyBody.length,
+    // The PR body's scope section the review carried (chat-prompt.ts PR_SCOPE_RULE), 0 when none.
+    scopeChars: /<<<UNTRUSTED_PR_SCOPE>>>\n([\s\S]*?)\n<<<END>>>/.exec(prompt)?.[1].length ?? 0,
     diffFilesFull: sample.changedPaths.length - (sample.diffDroppedPaths?.length ?? 0),
     diffFilesTotal: sample.changedPaths.length,
   };

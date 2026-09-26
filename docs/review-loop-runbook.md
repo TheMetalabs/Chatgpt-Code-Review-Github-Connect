@@ -6,6 +6,11 @@ or restart during a round cuts it: the PR's newest loop comment stays at FIXING
 
 ## Deploy or restart
 
+**Deploy only with `npm run deploy:server`** (`scripts/deploy-server.sh`). It runs the FIXING and idle
+gates below, before and right before the restart, and exits before touching the checkout or pm2 when
+either fails. `--from-ref origin/<branch>` predeploys a PR head (detached); `--revert` returns to
+`origin/main`; `--check` runs the gates only.
+
 1. **Before any Ashlar deploy or restart, confirm 0 sessions at FIXING.**
 
    ```sh

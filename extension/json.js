@@ -712,16 +712,24 @@ function adoptMovedTemporaryChat(state, submission) {
   const href = globalThis.location?.href;
   const probe = reason => { fixMoveProbe(state, submission, href, reason); return reason; };
   if (submission?.phase !== "sent") return probe("not_sent"), "";
-  if (submission.conversation !== fixChatPage()) return probe(`identity_not_bare:${shapeOf(submission.conversation)}|want:${shapeOf(fixChatPage())}`), "";
+  // Live 1.1.46 (fixMoveProbes): the recorded identity is already a temporary /c/<id>, and the run
+  // still ended "moved" to another /c/<id>: ChatGPT re-keys a temporary chat (a local id first, then
+  // the server's). A move between temporary conversations is adopted on the same proof as the first.
+  const fromTemporary = submission.conversation === fixChatPage() || temporaryChatConversation(submission.conversation);
+  if (!fromTemporary) return probe(`identity_not_temporary:${shapeOf(submission.conversation)}`), "";
+  if (samePage(submission.conversation, href)) return "";
   if (!state || state.tabRepurposed) return probe("repurposed"), "";
   let key;
   try { key = submissionKey(); } catch { return probe("no_key"), ""; }
-  if (state.temporaryChatAdopted === key) return probe("already_adopted"), "";
+  // Bounded: the bare page to a local id to the server's id is two moves; a third is not ChatGPT's.
+  const adopted = state.temporaryChatAdoptions?.key === key ? state.temporaryChatAdoptions.count : 0;
+  if (adopted >= 2) return probe("adoptions_exhausted"), "";
   if (!temporaryChatConversation(conversationIdentity(href))) return probe(`not_temp_conversation:${shapeOf(conversationIdentity(href))}`), "";
   const clean = temporaryChatMoveClean(state, submission);
   if (clean !== "clean") { probe(`move_not_clean:${state.moveCleanWhy || clean}`); return clean === "pending" ? "pending" : ""; }
   submission.conversation = conversationIdentity(href);
   state.temporaryChatAdopted = key;
+  state.temporaryChatAdoptions = {key, count: adopted + 1};
   if (state.confirmedSubmission?.record === submission) {
     state.submissionPersistencePending = true;
     if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();

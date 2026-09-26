@@ -1451,13 +1451,22 @@ for(const [name,{second,probeFirst,draft}={}] of [['then answers there'],
   }
   assert.deepEqual(await page.evaluate(()=>window.fixOut),{pending:true},'still waiting for the response');
   assert.equal((await journal()).conversation,TEMP_CONV,'bound to the moved temporary conversation');
+  let bound=TEMP_CONV;
   if(second){
    await page.evaluate(url=>history.pushState({},'',url),second);
    await page.clock.runFor(1600);
-   const out=await page.evaluate(()=>window.fixOut);
-   assert.equal(out.code,'taken_over');assert.match(out.error,/tab moved/);
-   assert.equal((await journal()).conversation,TEMP_CONV,'never re-bound');
-   return;
+   if(second===TEMP_CONV_2){
+    // Live 1.1.46: ChatGPT re-keys a temporary chat (a local id, then the server's). The page still
+    // shows our exact sent turn: adopted again (bounded to two adoptions), and a third move ends it.
+    assert.deepEqual(await page.evaluate(()=>window.fixOut),{pending:true},'still collecting after the re-key');
+    assert.equal((await journal()).conversation,TEMP_CONV_2,'re-bound to the re-keyed temporary conversation');
+    bound=TEMP_CONV_2;
+   } else {
+    const out=await page.evaluate(()=>window.fixOut);
+    assert.equal(out.code,'taken_over');assert.match(out.error,/tab moved/);
+    assert.equal((await journal()).conversation,TEMP_CONV,'never re-bound');
+    return;
+   }
   }
   const code='{"summary":"s","files":[],"dispositions":[]}';
   await page.evaluate(()=>document.querySelector('[data-testid="stop-button"]').remove());
@@ -1467,9 +1476,24 @@ for(const [name,{second,probeFirst,draft}={}] of [['then answers there'],
   const done=await ask('ashlar-harvest');
   assert.deepEqual([done.ok,done.raw,done.code],[true,code,undefined],JSON.stringify(done));
   const out=await ask('ashlar-can-close');
-  assert.deepEqual([out.canClose,out.conversation],[true,TEMP_CONV],JSON.stringify(out));
+  assert.deepEqual([out.canClose,out.conversation],[true,bound],JSON.stringify(out));
  });
 }
+test('real DOM (live 1.1.46): a third temporary-chat re-key is not ChatGPT\'s: the fix ends taken_over',async t=>{
+ const {text}=await fixDelivery();
+ const {page,fill,journal}=await attachmentPage(t,{render:'unit',collapse:true,moveTo:TEMP_CONV,moveAfter:600});
+ await page.evaluate(()=>{const s=__ashlarRunnerState;window.fixOut={pending:true};
+  (async()=>{while(!window.sent)await new Promise(r=>setTimeout(r,10));return waitUntilFixOrQuota('ChatGPT');})()
+   .then(raw=>{window.fixOut={raw};},e=>{window.fixOut={code:e.code,error:e.message};});});
+ await fill(text);
+ await page.clock.runFor(1600);
+ for(const url of [TEMP_CONV_2,'https://chatgpt.com/c/third-temp?temporary-chat=true']){
+  await page.evaluate(u=>history.pushState({},'',u),url);await page.clock.runFor(1600);
+ }
+ const out=await page.evaluate(()=>window.fixOut);
+ assert.equal(out.code,'taken_over',JSON.stringify(out));
+ assert.equal((await journal()).conversation,TEMP_CONV_2,'bound at most twice');
+});
 // Live 1.1.44 (#93 apply, twice): on ChatGPT's new UI the move from /?temporary-chat=true to
 // /c/<id>?temporary-chat=true after the confirmed send is a real navigation: the content scripts are
 // injected again, the page instance that clicked Send (its in-memory sendAttempt) is gone, and the run

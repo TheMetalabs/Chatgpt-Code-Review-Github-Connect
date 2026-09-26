@@ -292,3 +292,12 @@ test('HTTP: a salvaged leg (its repair is over) is posted, never sent back for a
  await eventually(()=>app.reviews.length===1,'salvaged review not posted');
  assert.match(app.reviews[0].body,/prose, not JSON/);
 });
+
+test('HTTP: a salvaged leg whose raw is the verbatim prose (repair-off salvage, repair since turned on) is posted, not 400',async t=>{
+ const {app,binding}=await setup(t);
+ const prose='prose with no JSON at all';
+ const out=await post(app,{action:'complete',repairProtocol:1,captureProtocol:1,salvaged:true,jobId:binding.jobId,leaseId:binding.leaseId,raw:prose,results:[{provider:'chatgpt',raw:prose,originalText:prose}]});
+ assert.equal(out.http,200,JSON.stringify(out));
+ await eventually(()=>app.reviews.length===1,'salvaged prose not posted');
+ assert.match(app.reviews[0].body,/prose with no JSON at all/);
+});

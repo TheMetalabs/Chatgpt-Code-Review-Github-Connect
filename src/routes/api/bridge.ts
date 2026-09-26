@@ -228,7 +228,7 @@ export const Route = createFileRoute("/api/bridge")({
             const errors = bridgeFormatErrors(body.jobId, String(body.raw ?? ""), legs, body.leaseId, body.captureProtocol === 1);
             if (errors.length) return Response.json({ok:false,code:"json_repair_required",error:"completed response requires format repair",errors},{status:422,headers});
           }
-          const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
+          const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId, body.salvaged === true);
           if (!out.ok) return Response.json(out, { status: "code" in out && out.code === "history_unavailable" ? 503 : "code" in out && out.code === "lease_conflict" ? 409 : 400, headers });
           return Response.json({ ok: true }, { headers });
         }

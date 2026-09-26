@@ -322,7 +322,7 @@ const attachHtml=`<!doctype html><html><body>
  </script></body></html>`;
 
 test('MV3 fix E2E (#93): the fix source is uploaded byte-exact as its hashed attachment; a whitespace-collapsing composer still sends the typed line',async t=>{
- const {requestChatFix,CHAT_FIX_FENCE_RULE}=await import('../../src/lib/review-loop-runtime.server.ts');
+ const {requestChatFix,CHAT_FIX_FENCE_RULE,chatFixAttachmentBody}=await import('../../src/lib/review-loop-runtime.server.ts');
  const {DEFAULT_SETTINGS}=await import('../../src/lib/types.ts');
  const app=await appFixture({reviewLocal:false});t.after(()=>app.close());
  const profile=await mkdtemp(join(tmpdir(),'ashlar-fixatt-e2e-'));
@@ -346,7 +346,7 @@ test('MV3 fix E2E (#93): the fix source is uploaded byte-exact as its hashed att
   .then(value=>{result={value};},error=>{result={error};});
  let page;
  await eventually(async()=>{await worker.evaluate(()=>tick());page=chatPages()[0];return page&&page.evaluate(()=>window.sends===1).catch(()=>false);},'fix prompt was not submitted');
- const expected=`${source}\n\n${CHAT_FIX_FENCE_RULE}`;
+ const expected=chatFixAttachmentBody(source);
  const sha=createHash('sha256').update(expected,'utf8').digest('hex');
  const uploads=await page.evaluate(()=>window.uploads);
  assert.deepEqual(uploads,[{name:'ashlar-fix-request.txt',text:expected}],'one upload: the whole request, byte-exact');

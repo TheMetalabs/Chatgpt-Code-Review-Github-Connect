@@ -803,6 +803,19 @@ export type BridgeFixLoader = () => Promise<{ requestBridgeFix(request: FixReque
 export const CHAT_FIX_FENCE_RULE =
   "Chat delivery: put that JSON object inside exactly one ```json fenced code block. Only fenced code is read; text outside it is ignored.";
 
+/** The attachment's own delivery detail (never the typed line, which stays Markdown-free, #103): the
+ * whole object in ONE block, and no string that could close the fence (live aicc #455: a long fix
+ * answer never parsed). \u0060 is a JSON escape, so the parsed strings are unchanged. */
+export const CHAT_FIX_FENCE_DETAIL = [
+  "Put the ENTIRE JSON object in exactly one ```json fenced code block: never split it across several",
+  "code blocks, never add a second code block, and write no text inside the block other than the JSON.",
+  "Inside JSON strings, escape every run of three or more backticks as JSON unicode escapes (```",
+  "becomes \\u0060\\u0060\\u0060): a literal ``` inside the block can end the fence and cut the JSON.",
+].join("\n");
+
+/** The chatgpt fix attachment's text: the fix request, then the chat delivery rule and its detail. */
+export const chatFixAttachmentBody = (prompt: string) => `${prompt}\n\n${CHAT_FIX_FENCE_RULE}\n${CHAT_FIX_FENCE_DETAIL}`;
+
 export async function requestChatFix(
   settings: BotSettings,
   ref: PrRef,
@@ -829,7 +842,7 @@ export async function requestChatFix(
   // round can fall back to the GitHub source.
   let attachment: FixAttachment;
   try {
-    attachment = fixAttachment(`${prompt}\n\n${CHAT_FIX_FENCE_RULE}`);
+    attachment = fixAttachment(chatFixAttachmentBody(prompt));
   } catch (e) {
     if (!github || !(e instanceof FixAttachmentError) || e.code !== "attachment_too_large") throw e;
     github.switched.reason = "attachment_too_large";

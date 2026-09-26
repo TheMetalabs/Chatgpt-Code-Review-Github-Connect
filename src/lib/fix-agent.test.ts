@@ -87,6 +87,14 @@ describe("runFixRound", () => {
     assert.equal(f.committed, false);
   });
 
+  it("every answer reaches onAnswer before parsing; a throwing hook never changes the outcome", async () => {
+    const seen: string[] = [];
+    const res = await runFixRound({ requestFix: async () => "sorry, I cannot", api: fakeApi().api, onAnswer: (raw) => seen.push(raw) }, { ...base, mode: "apply" });
+    assert.deepEqual([seen, res.outcome], [["sorry, I cannot"], "parse-failed"]);
+    const thrown = await runFixRound({ requestFix: async () => FIX_JSON, api: fakeApi().api, onAnswer: () => { throw new Error("log"); } }, { ...base, mode: "suggest" });
+    assert.equal(thrown.ok, true);
+  });
+
   // Live aicc #439: the replies the prompts ask for, and an answer given as a file, are told apart
   // from an unparseable reply.
   it("ATTACHMENT_MISMATCH is a request failure (attachment_mismatch), never parse-failed; CONNECTOR_UNAVAILABLE ends as connector_unavailable", async () => {

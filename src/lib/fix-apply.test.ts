@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { applyFixEdits, FIX_BLOCK_BREAK, FIX_UNFENCED_MARK, fixAnswerParts, fixReplyCanary, fixReplySignal, isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
+import { applyFixEdits, FIX_BLOCK_BREAK, FIX_UNFENCED_MARK, fixAnswerDiagnosis, fixAnswerParts, fixReplyCanary, fixReplySignal, isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
 
 const ok = (raw: string) => {
   const r = parseFixResponse(raw);
@@ -293,5 +293,39 @@ describe("unfenced chat fix answers (#439)", () => {
     assert.equal(fixReplySignal(unfenced("I wrote the fix in the canvas.", { canvas: true })), "answer_as_file");
     assert.equal(fixReplySignal("Download it: sandbox:/mnt/data/fix.json"), "answer_as_file");
     assert.equal(fixReplySignal(unfenced(`${FIX} (also as a file)`, { fileLinks: 1 })), undefined, "a JSON in the chat is parsed, not a file");
+  });
+});
+
+// Live aicc #455 (job-muikyyt7-185, extension 1.1.51): the fenced answer was harvested whole
+// (blocks=1), but the model wrote ChatGPT's citation marker inside the summary string; its bare
+// quotes broke the JSON and both attempts parse-failed "no fix JSON object found".
+describe("chat citation markers in a fix answer (#455)", () => {
+  const edit = { path: "src/a.ts", search: "const a = 1;", replace: "const a = 2;" };
+  const cited = `{\n  "summary": "Guarded the refund path. :chatgpt-content-reference{index="0"}",\n  "edits": ${JSON.stringify([edit])},\n  "dispositions": [{"finding":"F1","action":"fixed","note":"guarded :chatgpt-content-reference{index="1"}"}]\n}`;
+
+  it("a JSON broken only by citation markers parses once they are removed", () => {
+    const r = parseFixResponse(cited, { findingCount: 1 });
+    assert.ok(r.ok, r.ok ? "" : r.error);
+    if (!r.ok) return;
+    assert.equal(r.fix.summary, "Guarded the refund path.");
+    assert.deepEqual(r.fix.edits, [edit]);
+    assert.equal(r.fix.dispositions[0].note, "guarded");
+  });
+
+  it("a valid JSON keeps every byte, a marker inside a string included", () => {
+    const valid = JSON.stringify({ summary: 's :chatgpt-content-reference{index="0"}', edits: [edit], dispositions: [{ finding: "F1", action: "fixed", note: "n" }] });
+    const r = parseFixResponse(valid, { findingCount: 1 });
+    assert.ok(r.ok);
+    if (r.ok) assert.equal(r.fix.summary, 's :chatgpt-content-reference{index="0"}');
+  });
+
+  it("the answer's shape is logged without its content, and names how the JSON was found", () => {
+    const d = fixAnswerDiagnosis(cited);
+    assert.deepEqual(d, { mode: "blocks", blocks: 1, chars: cited.length, formatted: 0, fileLinks: 0, canvas: false, truncated: false, citations: 2, json: "cleaned" });
+    assert.equal(fixAnswerDiagnosis(`{"a":1}${"\n" + FIX_BLOCK_BREAK + "\n"}{"b":2}`).blocks, 2);
+    assert.equal(fixAnswerDiagnosis(JSON.stringify({ summary: "s", edits: [edit] })).json, "plain");
+    assert.equal(fixAnswerDiagnosis("no json here").json, "none");
+    const unfenced = fixAnswerDiagnosis(`${FIX_UNFENCED_MARK} {"unfenced":true,"fileLinks":1,"canvas":false,"formatted":3,"truncated":false}\nprose`);
+    assert.deepEqual([unfenced.mode, unfenced.blocks, unfenced.formatted, unfenced.fileLinks, unfenced.chars], ["unfenced", 0, 3, 1, 5]);
   });
 });

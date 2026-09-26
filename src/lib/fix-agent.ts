@@ -229,6 +229,9 @@ export async function runFixRound(
     /** Called with the raw answer the parser rejected (parse-failed), before the round returns, so
      * the caller can keep it for diagnosis (fix-raw-archive.server.ts). Must not throw. */
     onParseFailure?: (raw: string, error: string) => void;
+    /** Called with every answer the provider returned, before it is parsed (the caller logs its
+     * shape: fix-apply.ts fixAnswerDiagnosis). Must not throw. */
+    onAnswer?: (raw: string) => void;
   },
   opts: {
     prompt: string;
@@ -253,6 +256,11 @@ export async function runFixRound(
     raw = await deps.requestFix(opts.prompt);
   } catch (e) {
     return { ok: false, outcome: "request-failed", error: (e as Error)?.message ?? String(e) };
+  }
+  try {
+    deps.onAnswer?.(raw);
+  } catch {
+    /* diagnostics never change the round's outcome */
   }
   const parsed = parseFixResponse(raw, { findingCount: opts.findingCount });
   if (!parsed.ok) {

@@ -61,7 +61,7 @@ code, so a future skill or change can find the rule instead of re-learning it.
 ### Diagnose before fixing
 
 - **One diagnosis beats several guesses.** Extension 1.1.38–1.1.45 went through guessed fixes. What
-  worked: predeploy the PR head (server `deploy:server --from-ref`, extension `ext_update.sh --from`),
+  worked: predeploy the PR head (server `deploy:server --from-ref`, extension: the coordinator's `ext_update.sh --from` on the host, outside this repo),
   run it once on sandbox PR #93, record the rejection condition in a probe, then fix from the evidence.
 - **Keep the evidence locally, never the content in logs.** The extension keeps bounded snapshots in
   `chrome.storage.local` (`fixAnswerHtml`, `responseWaitHtml`, `uploadWaitHtml`, `presendStallHtml`,
@@ -81,9 +81,9 @@ code, so a future skill or change can find the rule instead of re-learning it.
   prompt renders as Markdown (backticks become `<code>`), so matching it must be Markdown-aware
   (#104, #116).
 - **The model writes UI artifacts into its answer.** `:chatgpt-content-reference{index="N"}` appears
-  inside JSON strings and its bare quotes break the JSON. One constant (`CHAT_CITATION_MARKER`,
-  `src/lib/extract-chat-json.ts`) is removed only when the text does not parse as written, for review
-  (#122) and fix (#121) answers alike.
+  inside JSON strings and its bare quotes break the JSON. The markers are removed only when the text does not parse as written: fix
+  answers since #121, review answers since #122, which made it one constant (`CHAT_CITATION_MARKER`,
+  `src/lib/extract-chat-json.ts`).
 - **A temporary chat moves.** `/?temporary-chat=true` becomes `/c/<id>?temporary-chat=true` with a real
   navigation; the run is re-bound from a sessionStorage journal and the sent turn's evidence (#114).
 - **Logged out is a state, not a stall.** A logged-out page fails at once as `logged_out` and pauses the
@@ -96,7 +96,7 @@ code, so a future skill or change can find the rule instead of re-learning it.
 - **A retry loop must end too.** aicc #457 answered in 2 minutes, then its salvaged delivery was sent
   back for a JSON repair that would never run (the strict review schema rejects `raw_review`) every
   2.5 s for 3 h. The worker's own events kept the job fresh, so no stall sweep came back. A salvaged
-  leg is now posted (`salvaged: true`, `src/routes/api/bridge.ts`), and a server that still refuses it
+  leg is now posted (the extension sends `salvaged: true`, `src/routes/api/bridge.ts` skips the repair gate for it), and a server that still refuses it
   ends the leg as `json_invalid` once (#122). A test's fake server that is laxer than the real route
   hides this class: mirror the real gate.
 

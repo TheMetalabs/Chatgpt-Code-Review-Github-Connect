@@ -1073,7 +1073,7 @@ async function startSendProbe(record) {
     for (const seconds of [1, 5, 15, 30, 60]) setTimeout(() => save(`${seconds}s`), Math.max(0, clickedAt + seconds * 1000 - Date.now()));
     // HTML snapshot of the conversation area (the user asked for the live DOM, #93): fix runs only,
     // which carry Ashlar's own prompt. Scripts, styles and SVG paths are dropped; capped; last 3 kept.
-    if (state?.kind === "fix" && (await local.get(["sendProbeHtmlOff"]))?.sendProbeHtmlOff !== true) {
+    if ((await local.get(["sendProbeHtmlOff"]))?.sendProbeHtmlOff !== true) {
       for (const seconds of [5, 60]) setTimeout(() => {
         try {
           const area = document.querySelector("main") || document.body;
@@ -1161,7 +1161,7 @@ async function clickSend(findSend, findComposer, expectedText) {
         if (runner) { runner.sendAttempt = {key: submissionKey(), conversation: shownConversation()}; runner.freshPage = undefined; }
         step("send_attempted");
         try { button.click(); } catch { /* Ambiguous click stays observable, never replayed. */ }
-        if (fix) startSendProbe(record);
+        startSendProbe(record); // reviews too: #93 review send_unconfirmed on 1.1.40
       }
     }
     // Cadence only: no upload, send acknowledgement, queue or model deadline.

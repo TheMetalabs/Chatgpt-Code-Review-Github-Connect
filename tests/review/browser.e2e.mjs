@@ -1409,6 +1409,67 @@ for(const [name,move,bound] of [['stays on the temporary chat',{},TEMP_URL],
   assert.deepEqual([moved.canClose,moved.identity],[false,'changed'],JSON.stringify(moved));
  });
 }
+// Live 1.1.43 (#93 apply): the send is confirmed while the page still shows the temporary chat "/",
+// and ChatGPT moves it to /c/<id>?temporary-chat=true about 0.6 s later, while the fix still waits
+// for its response (no answer yet). That move is the provider's (this page clicked Send there, the
+// sent turn is intact, no follow-up, no draft): the fix is bound to the moved conversation once,
+// whichever check sees the move first (the collector, or a release check that reaches the page
+// before its next poll), and its answer, arriving later, is collected, completed and closable there.
+// A second move still ends it; a draft at the move is the user's and is never adopted.
+const TEMP_CONV_2='https://chatgpt.com/c/other-temp?temporary-chat=true';
+for(const [name,{second,probeFirst,draft}={}] of [['then answers there'],
+ ['then answers there, a release check seeing the move first',{probeFirst:true}],
+ ['then moves again',{second:OTHER_URL}],['then moves to another temporary conversation',{second:TEMP_CONV_2}],
+ ['with a user draft in the composer',{draft:'my own note'}]]){
+ test(`real DOM: a temporary-chat fix confirmed on "/" and moved to /c/<id>?temporary-chat=true 600 ms later while waiting ${name}`,async t=>{
+  const {text}=await fixDelivery();
+  const {page,fill,journal}=await attachmentPage(t,{render:'unit',collapse:true,...(probeFirst||draft?{}:{moveTo:TEMP_CONV,moveAfter:600})});
+  // The collector starts as soon as the send is confirmed (on "/"), as the run does: the move lands
+  // while it waits for the response (the Stop control still shows).
+  await page.evaluate(()=>{const s=__ashlarRunnerState;window.fixOut={pending:true};
+   (async()=>{while(!window.sent)await new Promise(r=>setTimeout(r,10));window.collectFrom=location.href;return waitUntilFixOrQuota('ChatGPT');})()
+    .then(raw=>{window.fixOut={raw};s.running=false;s.result={ok:true,raw,responseText:raw};},e=>{window.fixOut={code:e.code,error:e.message};});});
+  const sent=await fill(text);
+  assert.deepEqual([sent.sends,sent.sent],[1,true],JSON.stringify(sent));
+  const ask=type=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{type,jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix'});
+  if(probeFirst||draft){
+   assert.equal((await journal()).conversation,TEMP_URL,'confirmed on the temporary chat');
+   // The move, and at once (before the collector's next poll) the check that sees it first.
+   await page.evaluate(({url,draft})=>{if(draft)document.querySelector('#prompt-textarea').value=draft;history.pushState({},'',url);},{url:TEMP_CONV,draft});
+   if(probeFirst){
+    const early=await ask('ashlar-can-close');
+    assert.deepEqual([early.identity,early.conversation],[undefined,TEMP_CONV],JSON.stringify(early));
+   }
+  }
+  assert.deepEqual(await page.evaluate(()=>[window.collectFrom,location.href]),[TEMP_URL,TEMP_CONV],'collecting on "/" when the move landed');
+  await page.clock.runFor(1600);
+  if(draft){
+   const out=await page.evaluate(()=>window.fixOut);
+   assert.equal(out.code,'taken_over',JSON.stringify(out));
+   assert.equal((await journal()).conversation,TEMP_URL,'never adopted');
+   return;
+  }
+  assert.deepEqual(await page.evaluate(()=>window.fixOut),{pending:true},'still waiting for the response');
+  assert.equal((await journal()).conversation,TEMP_CONV,'bound to the moved temporary conversation');
+  if(second){
+   await page.evaluate(url=>history.pushState({},'',url),second);
+   await page.clock.runFor(1600);
+   const out=await page.evaluate(()=>window.fixOut);
+   assert.equal(out.code,'taken_over');assert.match(out.error,/tab moved/);
+   assert.equal((await journal()).conversation,TEMP_CONV,'never re-bound');
+   return;
+  }
+  const code='{"summary":"s","files":[],"dispositions":[]}';
+  await page.evaluate(()=>document.querySelector('[data-testid="stop-button"]').remove());
+  await renderUnitAnswer(page,unitAnswer({id:'response-A',code,prose:'Here is the fix.'}));
+  await page.clock.runFor(3200);
+  assert.deepEqual(await page.evaluate(()=>window.fixOut),{raw:code});
+  const done=await ask('ashlar-harvest');
+  assert.deepEqual([done.ok,done.raw,done.code],[true,code,undefined],JSON.stringify(done));
+  const out=await ask('ashlar-can-close');
+  assert.deepEqual([out.canClose,out.conversation],[true,TEMP_CONV],JSON.stringify(out));
+ });
+}
 // The takeover side: a page this fix's send left for a conversation that is not a temporary chat
 // (the user's own) is never adopted: the fix ends taken_over and its tab is kept.
 test('real DOM: a unit-DOM temporary-chat fix whose page moves to a non-temporary conversation at the send is never identified; the run ends taken_over',async t=>{

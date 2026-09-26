@@ -31,10 +31,24 @@ describe("prScopeSection", () => {
     assert.equal(prScopeSection("## Summary\nfix a bug"), "");
     assert.equal(prScopeSection(""), "");
     const long = `## Scope\n${"x".repeat(PR_SCOPE_MAX_CHARS * 2)}`;
-    assert.equal(prScopeSection(long).length, PR_SCOPE_MAX_CHARS);
+    assert.ok(prScopeSection(long).length <= PR_SCOPE_MAX_CHARS);
   });
 
-  it("ignores a scope word inside a fenced code block", () => {
+  it("ignores a scope word inside a fenced code block, a ~~~ line inside ``` included", () => {
     assert.equal(prScopeSection("## Notes\n```\n## Scope\nnot a heading\n```"), "");
+    assert.equal(prScopeSection("```\n~~~\n## Out of scope\n- x\n```"), "");
+  });
+
+  it("does not take words that only contain 'scope', or a sentence that merely mentions it", () => {
+    assert.equal(prScopeSection("## Microscope support\nx\n### Scoped storage\ny\n## Telescope\nz"), "");
+    assert.equal(prScopeSection("Fixes an out-of-scope variable read."), "");
+  });
+
+  it("takes an indented heading, and cuts an overlong section on a line boundary with a mark", () => {
+    assert.equal(prScopeSection("   ## Scope\n- a\n## Next\nb"), "## Scope\n- a");
+    const long = `## Scope\n${Array.from({ length: 400 }, (_, i) => `- item ${i}`).join("\n")}`;
+    const cut = prScopeSection(long);
+    assert.ok(cut.length <= PR_SCOPE_MAX_CHARS);
+    assert.match(cut, /\n- item \d+\n\(scope section truncated\)$/);
   });
 });

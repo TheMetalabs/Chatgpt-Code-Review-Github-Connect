@@ -260,7 +260,7 @@ describe("buildFixPrompt fix discipline", () => {
     ["centralize shared fixes [C Pitfalls]", /10\. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not per call-site/],
     ["doc sync [C round zero 2]", /11\. Doc sync: .* update it in the same reply/],
     ["one round = one commit [A6][C4]", /12\. One round = one commit/],
-    ["PR-body scope is deferred, not added [C Pitfalls][A5] (aicc #457)", /13\. Work the PR scope section \(below, when present\) puts out of scope is not added: Defer it, quoting the scope line in the note\. A defect in the changed code is still fixed\./],
+    ["PR-body scope is deferred, not added [C Pitfalls][A5] (aicc #457)", /13\. Work the PR scope section \(below, when present\) puts out of scope is not added: Defer it, quoting the scope line in the note\. A correctness-class defect \(rule 1\) in the changed code is never out of scope and is still fixed\./],
   ];
 
   for (const [name, re] of adopted) {

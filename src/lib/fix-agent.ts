@@ -169,7 +169,8 @@ export function fixRules(source: "inline" | "github"): string[] {
     // [C] Pitfalls ("defer scope creep to an issue") + The Loop 3 table (Defer) · [A] Fix recipe 5
     // (load-bearing defer). Live aicc #457: a fix re-added SENDING recovery the PR body put out of scope.
     "13. Work the PR scope section (below, when present) puts out of scope is not added: Defer it,",
-    "   quoting the scope line in the note. A defect in the changed code is still fixed.",
+    "   quoting the scope line in the note. A correctness-class defect (rule 1) in the changed code",
+    "   is never out of scope and is still fixed.",
   ];
 }
 

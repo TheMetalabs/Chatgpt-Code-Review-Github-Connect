@@ -1187,10 +1187,10 @@ const FIX_SOURCE='Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\
 // attributes) inside the message node, or beside it in the turn's section; 'none': no file shown.
 // The page stays on the temporary chat URL after the send (ChatGPT does not move it).
 const FILE_CARD=name=>`<div class="group relative inline-block text-sm"><div class="relative overflow-hidden rounded-2xl border"><div class="p-2 w-80"><div class="flex flex-row items-center gap-2"><div class="relative h-10 w-10 shrink-0"><svg viewBox="0 0 36 36" style="width:36px;height:36px"><rect width="36" height="36"></rect></svg></div><div class="overflow-hidden"><div class="truncate font-semibold">${name}</div><div class="truncate text-token-text-secondary">Document · 1.2 KB</div></div></div></div></div></div>`;
-async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false,render='tile',probe}={}){
+async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swallow=false,render='tile',probe,via='change'}={}){
  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
  await setFixContent(page,`<main></main><form data-type="unified-composer">${fileInput?'<input type="file" multiple>':''}<div id="chips"></div><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>`);
- await page.evaluate(({stop,upload,collapse,swallow,probe,render,card})=>{
+ await page.evaluate(({stop,upload,collapse,swallow,probe,render,card,via})=>{
   const saved=new Map([['ashlar:job','fix-A'],['ashlar:run','run-A']]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});
   window.__saved=saved;window.sends=0;window.clicks=0;window.uploads=[];window.uploading=false;
@@ -1201,8 +1201,11 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swall
   const composer=document.querySelector('#prompt-textarea');
   // the real composer's whitespace handling: every whitespace run becomes one space
   if(collapse)composer.addEventListener('input',()=>{composer.value=composer.value.replace(/\s+/g,' ');});
-  document.querySelector('input[type=file]')?.addEventListener('change',async event=>{
-   for(const file of event.target.files){
+  // via: how the page takes the files, its input's change or (as the new home composer may) a paste
+  // into the editor; the other hand-off is ignored, and counted.
+  window.ignored=[];
+  const take=async files=>{
+   for(const file of files){
     window.uploads.push({name:file.name,bytes:[...new Uint8Array(await file.arrayBuffer())]});
     if(upload==='none')continue;
     const send=document.querySelector('[data-testid="send-button"]');
@@ -1226,7 +1229,17 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swall
     if(upload==='stuck'){const bar=document.createElement('div');bar.setAttribute('role','progressbar');bar.style.cssText='width:40px;height:4px';chip.append(bar);}
     document.querySelector('#chips').append(chip);
    }
-   event.target.value='';
+  };
+  document.querySelector('input[type=file]')?.addEventListener('change',event=>{
+   const files=[...event.target.files];event.target.value='';
+   if(via!=='change'){window.ignored.push('change');return;}
+   take(files);
+  });
+  composer.addEventListener('paste',event=>{
+   const files=[...(event.clipboardData?.files||[])];
+   if(!files.length)return;
+   if(via!=='paste'){window.ignored.push('paste');return;}
+   event.preventDefault();take(files);
   });
   document.querySelector('[data-testid="send-button"]').addEventListener('click',event=>{
    event.preventDefault();window.clicks++;if(window.uploading||swallow)return;
@@ -1259,7 +1272,7 @@ async function attachmentPage(t,{upload='ok',collapse=false,fileInput=true,swall
    turn.append(userTurn);document.querySelector('main').append(turn);
    composer.value='';document.querySelector('#chips').replaceChildren();event.currentTarget.remove();document.body.insertAdjacentHTML('beforeend',stop);
   });
- },{stop,upload,collapse,swallow,probe,render,card:FILE_CARD('__NAME__')});
+ },{stop,upload,collapse,swallow,probe,render,card:FILE_CARD('__NAME__'),via});
  for(const file of ['composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(()=>{Object.assign(__ashlarRunnerState,{kind:'fix',jobId:'fix-A',runId:'run-A',running:true});});
  const fill=async(delivery,ms=1600)=>{
@@ -1370,7 +1383,7 @@ test('real DOM: a fix Send click records five send probes of the sent turn\'s sh
 
 for(const [name,opts,ms,detail] of [
  ['no upload input',{fileInput:false},1600,/the composer has no file input/],
- ['an upload that never shows its file',{upload:'none'},3*60_000+2000,/was not shown as uploaded within 3 minutes/],
+ ['an upload that never shows its file',{upload:'none'},30_000,/was not shown as a chip after staging \(tried a, b, c, d \(no add button\)\)/],
  ['an upload that never finishes',{upload:'stuck'},3*60_000+2000,/was not shown as uploaded within 3 minutes/],
 ]){
  test(`real DOM (#93): ${name} ends the fix as attachment_failed; nothing is typed or sent, and the source is never pasted`,async t=>{
@@ -1383,6 +1396,24 @@ for(const [name,opts,ms,detail] of [
   assert.equal(await journal(),null,'nothing prepared');
  });
 }
+
+// Live 1.1.37: a composer that shows no chip for files set on its input. The fix attachment goes
+// through the same staging chain as a review's files: the paste strategy stages it, once, with the
+// bytes its typed line names, and the fix is sent.
+test('real DOM: a composer that takes the fix attachment only by paste: staged via (b), once, bytes exact, sent',async t=>{
+ const {createHash}=await import('node:crypto');
+ const {attachment,typed,text}=await fixDelivery();
+ const {page,fill,uploads}=await attachmentPage(t,{via:'paste'});
+ assert.deepEqual(await fill(text,12_000),{text:typed,sends:1,sent:true,composer:''},'staged, typed, sent');
+ assert.deepEqual(await page.evaluate(()=>window.ignored),['change'],'the input change was tried first, and nothing after the paste');
+ const [uploaded,...more]=await uploads();
+ assert.equal(more.length,0,'one upload');
+ assert.equal(createHash('sha256').update(Buffer.from(uploaded.bytes)).digest('hex'),attachment.sha256,'the bytes the typed line names');
+ const steps=await page.evaluate(()=>__ashlarRunnerState.steps?.events.map(e=>e.stage)||[]);
+ assert.ok(steps.includes('attachments_staged_via_b'),JSON.stringify(steps));
+ const [probe]=await page.evaluate(()=>window.__local.get('stageProbes'));
+ assert.deepEqual([probe.kind,probe.via,probe.tried],['fix','b',['a','b']]);
+});
 
 // The live 1.1.29 failure (temporary chat): attachments_waiting resolved 27 ms before prompt_prepared,
 // Send was clicked while the upload was still running, and the run sat in send_unconfirmed for its

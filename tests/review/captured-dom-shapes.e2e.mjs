@@ -53,9 +53,12 @@ test('completed paragraph JSON with lost quote escapes is diagnosed, not endless
  // Corrected DOM may still become observable; the first bad fragment is not cached terminal.
  await page.locator('.markdown p').evaluate((el,text)=>el.textContent=text,valid);await page.clock.runFor(2400);assert.equal(await page.evaluate(()=>received),valid);
 });
-test('attach then fill does not wait for delayed chips or paste whole file bodies',async t=>{
+// Staging waits for the file's chip to show (the staging chain stops at the first strategy whose
+// chip shows), never for its upload to finish: the chip here keeps its progress ring.
+test('attach then fill waits for the chip to show, not for its upload, types into the remounted editor, and never pastes file bodies',async t=>{
  const page=await pageFor(t);await page.evaluate(()=>{
-  document.querySelector('input[type=file]').onchange=()=>{window.attached=true;const old=composer();old.replaceWith(old.cloneNode());};
+  document.querySelector('input[type=file]').onchange=()=>{window.attached=true;const old=composer();old.replaceWith(old.cloneNode());
+   const chip=document.createElement('div');chip.setAttribute('role','group');chip.ariaLabel='diff.patch';chip.innerHTML='diff.patch<span class="animate-spin" style="display:inline-block;width:20px;height:20px">uploading</span>';document.querySelector('form').append(chip);};
   window.filled=null;fillComposer(composer(),'Review fixture\n\n<<<ATTACH:diff.patch>>>\nsecret fixture body\n<<<END_ATTACH>>>').then(text=>window.filled=text,e=>window.filled=e.message);
  });await page.clock.runFor(150);
  assert.equal(await page.evaluate(()=>filled),'Review fixture','body fill waited for fixed attachment sleep or used stale editor');
@@ -66,9 +69,10 @@ test('own attachment confirmation gates Send, old transcript filenames cannot sa
  await page.evaluate(()=>{
   window.filled=null;fillComposer(composer(),'Review fixture\n\n<<<ATTACH:diff.patch>>>\nfile body\n<<<END_ATTACH>>>').then(text=>{window.filled=text;return clickSend(()=>document.querySelector('#composer-submit-button'),composer,text);});
  });await page.clock.runFor(1200);assert.equal(await page.evaluate(()=>clicks),0);
- assert.equal(await page.evaluate(()=>filled),'Review fixture');
+ // The transcript's chip is not the run's: staging still waits for the composer's own chip.
+ assert.equal(await page.evaluate(()=>filled),null);
  await page.evaluate(()=>{const chip=document.createElement('div');chip.setAttribute('role','group');chip.setAttribute('aria-label','diff.patch');chip.textContent='diff.patch';document.querySelector('form').append(chip);});
- await page.clock.runFor(500);assert.equal(await page.evaluate(()=>clicks),1);
+ await page.clock.runFor(1000);assert.equal(await page.evaluate(()=>filled),'Review fixture');assert.equal(await page.evaluate(()=>clicks),1);
 });
 test('scoped editor insertion never replaces unrelated selected page text',async t=>{
  const page=await pageFor(t,'<div id="personal">personal text</div>');

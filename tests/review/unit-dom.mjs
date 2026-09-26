@@ -19,3 +19,12 @@ export const renderUnitAnswer=(page,a,{turn=0,done=true}={})=>page.evaluate(({a,
  box.insertAdjacentHTML('beforeend',a.block);if(done)box.insertAdjacentHTML('afterend',a.actions);
 },{a,turn,done});
 
+/** One fenced code block as the unit DOM renders it (language row with its wrap and copy controls,
+ * the code, the scroll control). `collapsedAt`: the block shows only `code`'s first `collapsedAt`
+ * chars, the rest sits in a hidden tail behind a "더 보기" expander (aria-expanded="false") whose
+ * click shows it; `inert`: the expander does nothing. */
+export const unitCodeBlock=(code,{collapsedAt,inert=false}={})=>{
+ const shown=collapsedAt===undefined?code:code.slice(0,collapsedAt),tail=collapsedAt===undefined?'':code.slice(collapsedAt);
+ const expander=collapsedAt===undefined?'':`<button type="button" aria-expanded="false" data-expander${inert?' data-inert':''} onclick="if(!this.hasAttribute('data-inert')){this.closest('.CodeBlock').querySelector('[data-tail]').hidden=false;this.setAttribute('aria-expanded','true');}"><span>더 보기</span></button>`;
+ return `<div class="CodeBlock"><div data-markdown-copy="code-block" data-search-result-target=""><div data-markdown-copy="exclude"><svg aria-hidden="true"></svg><div>JSON</div><div><span class="contents"><button type="button" aria-label="자동 줄 바꿈 사용" aria-pressed="false">w</button></span><span class="contents"><button type="button" aria-label="복사">c</button></span></div></div><div><div><div dir="ltr"><div><pre><code><span>${esc(shown)}</span>${tail?`<span hidden data-tail>${esc(tail)}</span>`:''}</code></pre></div></div></div>${expander}</div><button aria-hidden="true" aria-label="맨 아래로 스크롤" tabindex="-1" type="button">v</button></div></div>`;
+};

@@ -1,5 +1,6 @@
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { recentFixRawAnswers } from "./fix-raw-archive.server.ts";
 import { DEFAULT_SETTINGS, type BotSettings, type FixAgentSettings, type Finding, type Job, type SamplePr } from "./types.ts";
 import { continueComment, fixingComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
@@ -23,6 +24,8 @@ import {
   loopStepGateForTests,
   renderFindings,
   CHAT_FIX_FENCE_RULE,
+  CHAT_FIX_FENCE_DETAIL,
+  chatFixAttachmentBody,
   fixGenerationMs,
   fixWatchLimits,
   providerFixDeps,
@@ -669,6 +672,12 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.attempts === 2);
     assert.match(f.prompts[1], /PREVIOUS ATTEMPT REJECTED \(parse-failed\)/);
     assert.ok(f.prompts[1].startsWith(f.prompts[0]), "the retry keeps the full original prompt");
+    // Live aicc #455: the rejected answer is kept (locally, bounded) with its length and hash.
+    const kept = recentFixRawAnswers().at(-1);
+    assert.ok(kept, "the parse-failed answer is archived");
+    assert.deepEqual([kept.text, kept.chars, kept.attempt, kept.truncated], ["not json at all", 15, 1, false]);
+    assert.match(kept.error, /no fix JSON object found/);
+    assert.equal(kept.sha256, createHash("sha256").update("not json at all").digest("hex"));
   });
 
   it("a search that is missing or not unique is retried with the reason (validation-failed)", async () => {
@@ -1516,7 +1525,7 @@ describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; gro
     assert.equal(await requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", "FIX PROMPT", { loadBridge: loader }), "ANSWER TEXT");
     // the full request (with the fence rule: the page reads fenced code only) is the attachment;
     // the typed prompt is one canonical line naming it and its SHA-256 (#93)
-    const fenced = `FIX PROMPT\n\n${CHAT_FIX_FENCE_RULE}`;
+    const fenced = chatFixAttachmentBody("FIX PROMPT");
     const attachment = fixAttachment(fenced);
     assert.deepEqual(calls, [{ owner: "o", repo: "r", pr: 7, provider: "chatgpt", prompt: fixTypedPrompt(attachment, CHAT_FIX_FENCE_RULE), attachment }]);
   });
@@ -1528,7 +1537,7 @@ describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; gro
     await requestChatFix(chat("chatgpt"), { owner: "o", repo: "r", pr: 7 }, "chatgpt", source, { loadBridge: loader });
     const [req] = calls;
     assert.ok(req.attachment, "the source travels as a file");
-    assert.equal(req.attachment.body, `${source}\n\n${CHAT_FIX_FENCE_RULE}`, "byte-exact");
+    assert.equal(req.attachment.body, chatFixAttachmentBody(source), "byte-exact");
     assert.equal(req.attachment.sha256, createHash("sha256").update(req.attachment.body, "utf8").digest("hex"));
     assert.equal(req.attachment.name, FIX_ATTACHMENT_NAME);
     assert.equal(req.prompt, req.prompt.replace(/\s+/g, " ").trim(), "the typed line survives any whitespace collapsing");
@@ -1541,6 +1550,12 @@ describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; gro
     assert.ok(rendersAsTyped(req.prompt));
     assert.ok(req.prompt.includes(plainMarkdownLine(CHAT_FIX_FENCE_RULE)));
     assert.ok(req.attachment.body.includes(CHAT_FIX_FENCE_RULE), "the attachment keeps the rule verbatim");
+    // Live aicc #455: the one-block and backtick-escape detail is in the attachment only; the
+    // typed line stays one Markdown-free sentence (#103).
+    assert.ok(req.attachment.body.endsWith(CHAT_FIX_FENCE_DETAIL));
+    assert.match(CHAT_FIX_FENCE_DETAIL, /ENTIRE JSON object in exactly one ```json fenced code block/);
+    assert.match(CHAT_FIX_FENCE_DETAIL, /\\u0060\\u0060\\u0060/);
+    assert.ok(!req.prompt.includes("ENTIRE") && !req.prompt.includes("u0060"), "the detail is not typed");
   });
 
   it("a fix request over the attachment cap fails fast with a clear reason, never reaching the bridge", async () => {

@@ -193,7 +193,14 @@ export function buildFixPrompt(input: {
 export type FixValidate = (files: FixFile[]) => Promise<{ ok: boolean; error?: string }>;
 
 export async function runFixRound(
-  deps: { requestFix: RequestFix; api: GitDataApi; validate?: FixValidate },
+  deps: {
+    requestFix: RequestFix;
+    api: GitDataApi;
+    validate?: FixValidate;
+    /** Called with the raw answer the parser rejected (parse-failed), before the round returns, so
+     * the caller can keep it for diagnosis (fix-raw-archive.server.ts). Must not throw. */
+    onParseFailure?: (raw: string, error: string) => void;
+  },
   opts: {
     prompt: string;
     mode: FixMode;
@@ -219,7 +226,14 @@ export async function runFixRound(
     return { ok: false, outcome: "request-failed", error: (e as Error)?.message ?? String(e) };
   }
   const parsed = parseFixResponse(raw, { findingCount: opts.findingCount });
-  if (!parsed.ok) return { ok: false, outcome: "parse-failed", error: parsed.error };
+  if (!parsed.ok) {
+    try {
+      deps.onParseFailure?.(raw, parsed.error);
+    } catch {
+      /* diagnostics never change the round's outcome */
+    }
+    return { ok: false, outcome: "parse-failed", error: parsed.error };
+  }
   const { summary, dispositions } = parsed.fix;
 
   // A valid no-change round (every finding pushed-back / declined / deferred): nothing to commit.

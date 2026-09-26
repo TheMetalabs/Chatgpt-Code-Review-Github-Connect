@@ -66,6 +66,7 @@ import { FixAttachmentError, fixAttachment, fixTypedPrompt, type FixAttachment }
 import { attachmentSwitch, isConnectorUnavailable, requestConnectorFix, type GithubFixSource } from "./fix-source-github.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
+import { archiveFixRaw, defaultFixRawDir } from "./fix-raw-archive.server.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
 import {
   assertNever,
@@ -802,6 +803,19 @@ export type BridgeFixLoader = () => Promise<{ requestBridgeFix(request: FixReque
 export const CHAT_FIX_FENCE_RULE =
   "Chat delivery: put that JSON object inside exactly one ```json fenced code block. Only fenced code is read; text outside it is ignored.";
 
+/** The attachment's own delivery detail (never the typed line, which stays Markdown-free, #103): the
+ * whole object in ONE block, and no string that could close the fence (live aicc #455: a long fix
+ * answer never parsed). \u0060 is a JSON escape, so the parsed strings are unchanged. */
+export const CHAT_FIX_FENCE_DETAIL = [
+  "Put the ENTIRE JSON object in exactly one ```json fenced code block: never split it across several",
+  "code blocks, never add a second code block, and write no text inside the block other than the JSON.",
+  "Inside JSON strings, escape every run of three or more backticks as JSON unicode escapes (```",
+  "becomes \\u0060\\u0060\\u0060): a literal ``` inside the block can end the fence and cut the JSON.",
+].join("\n");
+
+/** The chatgpt fix attachment's text: the fix request, then the chat delivery rule and its detail. */
+export const chatFixAttachmentBody = (prompt: string) => `${prompt}\n\n${CHAT_FIX_FENCE_RULE}\n${CHAT_FIX_FENCE_DETAIL}`;
+
 export async function requestChatFix(
   settings: BotSettings,
   ref: PrRef,
@@ -828,7 +842,7 @@ export async function requestChatFix(
   // round can fall back to the GitHub source.
   let attachment: FixAttachment;
   try {
-    attachment = fixAttachment(`${prompt}\n\n${CHAT_FIX_FENCE_RULE}`);
+    attachment = fixAttachment(chatFixAttachmentBody(prompt));
   } catch (e) {
     if (!github || !(e instanceof FixAttachmentError) || e.code !== "attachment_too_large") throw e;
     github.switched.reason = "attachment_too_large";
@@ -1451,7 +1465,19 @@ export async function runPostReviewLoop(
       const t0 = Date.now();
       trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, provider: settings.fixAgent.provider ?? "none" });
       res = await runFixRound(
-        { requestFix, api: guardRef(gh.gitDataApi(token, owner, repo)), validate },
+        {
+          requestFix,
+          api: guardRef(gh.gitDataApi(token, owner, repo)),
+          validate,
+          // A rejected answer is kept locally (bounded) and its shape logged: live aicc #455 failed
+          // twice with "no fix JSON object found" and nothing to tell the harvest from the model.
+          onParseFailure: (raw, error) => {
+            const { record, file, writeError } = archiveFixRaw(defaultFixRawDir(), { jobId: job.id, attempt: attempts, raw, error });
+            trace(job.id, "fix-raw", { attempt: attempts, chars: record.chars, sha256: record.sha256.slice(0, 16), file, writeError });
+            trace(job.id, "fix-raw-head", { head: JSON.stringify(record.head) });
+            trace(job.id, "fix-raw-tail", { tail: JSON.stringify(record.tail) });
+          },
+        },
         {
           prompt,
           mode,

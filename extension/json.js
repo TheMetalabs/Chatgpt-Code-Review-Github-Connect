@@ -89,11 +89,13 @@ function assistantCorpus(root = currentAssistantRoot()) {
 
 /** The fenced code blocks of the assistant turn(s) as LITERAL text. A fix answer carries file
  * content, and rendered markdown rewrites it (backslash escapes, emphasis, links) while it still
- * parses as JSON, so a fix is read from code blocks only. */
-function assistantCodeBlocks(root = currentAssistantRoot()) {
+ * parses as JSON, so a fix is read from code blocks only. `stats` (optional) receives what the
+ * harvest saw: the block count, their total length and whether any block looked collapsed. */
+function assistantCodeBlocks(root = currentAssistantRoot(), stats) {
   if (!root) return [];
   const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
   const blocks = [];
+  let collapsed = false;
   for (const turn of turns) {
     for (const pre of turn.querySelectorAll("pre")) {
       if (!renderedIn(pre, turn)) continue; // a hidden/stale block the renderer kept is not the answer
@@ -102,13 +104,101 @@ function assistantCodeBlocks(root = currentAssistantRoot()) {
       // text is read with the same visibility rule as a review's corpus (visibleText).
       const codes = [...pre.querySelectorAll("code")];
       const visible = codes.length ? codes.filter(code => renderedIn(code, turn) && !codes.some(outer => outer !== code && outer.contains(code))) : [pre];
+      // A collapsed block (live aicc #455: a long fix answer never parsed) shows only part of its
+      // code; its visible code element's full text is the answer then, hidden tail included.
+      const folded = codeBlockCollapsed(pre, turn);
+      collapsed ||= folded;
       for (const source of visible) {
-        const text = visibleText(source);
+        const text = folded ? fullCodeText(source) : visibleText(source);
         if (text) blocks.push(text);
       }
     }
   }
+  if (stats) Object.assign(stats, {blocks: blocks.length, totalChars: blocks.reduce((n, b) => n + b.length, 0), collapsed});
   return blocks;
+}
+
+/** All the code text in `el`, hidden parts included (a collapsed block hides its tail), with the
+ * line breaks visibleText gives block elements; controls and graphics are still not code. */
+function fullCodeText(el) {
+  const walk = node => {
+    if (node.nodeType === 3) return node.nodeValue || "";
+    if (node.nodeType !== 1 || node.matches("button, [role='button'], svg, script, style")) return "";
+    if (node.tagName === "BR") return "\n";
+    const text = [...node.childNodes].map(walk).join("");
+    return /^(P|DIV|PRE|LI)$/.test(node.tagName) ? `\n${text}\n` : text;
+  };
+  return el ? walk(el).trim() : "";
+}
+
+/** A code block's frame: the renderer's code-block container around `pre` inside `turn`, else `pre`. */
+function codeBlockBox(pre, turn) {
+  const box = pre.closest?.("[data-markdown-copy='code-block'], .CodeBlock, [data-testid='code-block']");
+  return box && turn.contains(box) ? box : pre;
+}
+
+/** The expander controls of a code block that shows only part of its code ("더 보기", "Show more",
+ * "Expand", or any control with aria-expanded="false"); never its copy, wrap or scroll controls. */
+function codeBlockExpanders(pre, turn) {
+  const expand = /더\s*보기|펼치기|전체\s*보기|모두\s*보기|show\s*(more|all|full)|expand|see\s*more|view\s*(more|all)/i;
+  return [...codeBlockBox(pre, turn).querySelectorAll("button, [role='button']")].filter(control => {
+    const label = `${control.getAttribute("aria-label") || ""} ${control.textContent || ""}`;
+    if (/copy|복사|wrap|줄\s*바꿈|scroll|스크롤/i.test(label)) return false;
+    return control.getAttribute("aria-expanded") === "false" || expand.test(label);
+  });
+}
+
+/** Whether a code block shows only part of its code: an expander, or code clipped by a container
+ * that hides its overflow (a scrolling container shows all of it on scroll and is not collapsed). */
+function codeBlockCollapsed(pre, turn) {
+  if (codeBlockExpanders(pre, turn).length) return true;
+  const box = codeBlockBox(pre, turn);
+  const code = pre.querySelector("code") || pre;
+  for (let node = code; node && node !== box.parentElement; node = node.parentElement) {
+    const style = globalThis.window?.getComputedStyle ? window.getComputedStyle(node) : null;
+    if (style && /hidden|clip/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 1) return true;
+  }
+  return false;
+}
+
+/** Open every collapsed code block of a fix answer once (its expander clicked), so the next
+ * observation reads the whole code. A control already clicked is never clicked again (a second
+ * click would fold it back). Returns how many were clicked. */
+function expandCollapsedCodeBlocks(root) {
+  if (!root?.matches || !root.querySelectorAll) return 0;
+  const clicked = globalThis.__ashlarExpandedCode ||= new WeakSet();
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
+  let count = 0;
+  for (const turn of turns) {
+    for (const pre of turn.querySelectorAll("pre")) {
+      for (const control of codeBlockExpanders(pre, turn)) {
+        if (clicked.has(control)) continue;
+        clicked.add(control);
+        try { control.click(); count += 1; } catch { /* a control that cannot be clicked keeps the full-text read */ }
+      }
+    }
+  }
+  return count;
+}
+
+/** The line between two code blocks of one fix answer: the server joins the blocks back in order
+ * when the JSON spans them (src/lib/fix-apply.ts FIX_BLOCK_BREAK). A function: content scripts are
+ * re-injected. */
+function fixBlockBreak() {
+  return "<<<ASHLAR_CODE_BLOCK_BREAK>>>";
+}
+
+/** Diagnostic: one fix harvest's shape, in chrome.storage.local "fixHarvestProbes" (last 10). Never
+ * content: counts, lengths and flags only. Never affects the run. */
+function saveFixHarvestProbe(record) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    globalThis.__ashlarFixHarvestProbeWrites = (globalThis.__ashlarFixHarvestProbeWrites || Promise.resolve()).then(async () => {
+      const stored = (await local.get(["fixHarvestProbes"]))?.fixHarvestProbes;
+      await local.set({fixHarvestProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-10)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
 }
 
 /** Whether `el` and every ancestor up to `root` is visible (hiddenNode). */
@@ -122,11 +212,13 @@ function renderedIn(el, root) {
 /** A bound response's canonical answer text, what its collector harvested and what every later
  * completion proof must match: a review's full rendered corpus, a fix's fenced code only (or a
  * fixed no-JSON line when it has none, so the server's fix parser fails closed). */
-function boundAnswerText(kind, root) {
+function boundAnswerText(kind, root, stats) {
   const prose = assistantCorpus(root).join("\n\n");
   if (kind !== "fix" || !prose.trim()) return prose;
-  const blocks = assistantCodeBlocks(root);
-  return blocks.length ? blocks.join("\n\n") : "(no fenced code block in the answer; the fix JSON must be inside a ```json fence)";
+  const blocks = assistantCodeBlocks(root, stats);
+  // Blocks in order, split by a line no JSON contains: one JSON the page rendered over two blocks
+  // is joined back by the server's parser.
+  return blocks.length ? blocks.join(`\n${fixBlockBreak()}\n`) : "(no fenced code block in the answer; the fix JSON must be inside a ```json fence)";
 }
 
 function harvestJson(opts) {
@@ -176,7 +268,11 @@ function boundReviewResponse(submission) {
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
     user = users[submission.submittedUsers - 1];
   }
-  if (!user || !submission.expected || !normalizePrompt(typeof messagePromptText === "function" ? messagePromptText(user) : user.textContent || user.innerText).includes(submission.expected)) {
+  // The containment rule the send was confirmed by (composer.js reviewTurnHolds): a rendered turn
+  // restyles Markdown in the prompt (`code` spans shown as <code>), and a stricter rule here left a
+  // confirmed send never bound (live 1.1.47: waiting_for_response for 100+ min, aicc #439).
+  const shown = !user ? "" : typeof messagePromptText === "function" ? messagePromptText(user) : user.textContent || user.innerText;
+  if (!user || !submission.expected || !(typeof reviewTurnHolds === "function" ? reviewTurnHolds(shown, submission.expected) : normalizePrompt(shown).includes(submission.expected))) {
     return {root: null, followup: false, identified: false};
   }
   // Some renderers assign message IDs after mounting the text. Pin that identity
@@ -429,6 +525,56 @@ function expireGeneratingLease(lease, name, {bound, stop, streaming, done}, text
   }
 }
 
+/** Response wait (live 1.1.47: two reviews sat in waiting_for_response for 100-158 min), review runs
+ * only. Until an answer is bound to the sent prompt the generating lease has nothing to hold, so the
+ * wait itself is bounded: no bound answer 35 min after the send (ChatGPT ends a reasoning run at
+ * ~29.5 min, #87) fails the run as `response_timeout`, with the page saved for inspection
+ * (saveResponseWaitHtml). Measured from the journaled Send click (a reloaded page keeps it), else
+ * from the first poll. Once an answer is bound the wait is over for good: the lease governs it. Only
+ * observed time counts, as for the lease: a poll gap over 3 min (a host sleep, a frozen tab) moves
+ * the deadline by that gap. */
+function expireResponseWait(wait, name, {bound, submission}) {
+  // Declared here, not at top level: content scripts are re-injected.
+  const RESPONSE_WAIT_MS = 35 * 60_000, POLLING_SUSPENDED_MS = 3 * 60_000;
+  const now = Date.now(), gap = wait.polled ? now - wait.polled : 0;
+  wait.polled = now;
+  // Only a send journaled as sent has a prompt to bind an answer to (a page with no journal reads
+  // the page's latest answer, never bound: its wait has no deadline, as before).
+  if (wait.answered || submission?.phase !== "sent") return;
+  if (bound?.root) { wait.answered = true; return; }
+  if (!wait.at) {
+    const sent = submission?.attemptedAt;
+    wait.at = Number.isSafeInteger(sent) && sent <= now ? sent : now;
+  } else if (gap > POLLING_SUSPENDED_MS) wait.at += gap;
+  if (now - wait.at < RESPONSE_WAIT_MS) return;
+  saveResponseWaitHtml(bound);
+  const error = new Error(`${name} bound no answer to the sent prompt within ${RESPONSE_WAIT_MS / 60_000} min of the send`);
+  error.code = "response_timeout"; throw error;
+}
+
+/** Diagnostic: the page a response wait timed out on, in chrome.storage.local "responseWaitHtml"
+ * (last 3). The main area (or body) without scripts, styles, images and SVG paths, capped at 200 KB;
+ * the URL without its query; whether the sent turn was identified. Off with
+ * {responseWaitHtmlOff:true}. Never affects the run. */
+function saveResponseWaitHtml(bound) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    const state = globalThis.__ashlarRunnerState;
+    const area = document.querySelector("main") || document.body;
+    const clone = area.cloneNode(true);
+    for (const node of clone.querySelectorAll("script,style,noscript,img,svg path")) node.remove();
+    const record = {job: state?.jobId, run: state?.runId, at: Date.now(), identified: Boolean(bound?.identified),
+      url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: clone.outerHTML.slice(0, 200_000)};
+    globalThis.__ashlarResponseWaitWrites = (globalThis.__ashlarResponseWaitWrites || Promise.resolve()).then(async () => {
+      const flags = await local.get(["responseWaitHtmlOff", "responseWaitHtml"]);
+      if (flags?.responseWaitHtmlOff === true) return;
+      const list = Array.isArray(flags?.responseWaitHtml) ? flags.responseWaitHtml : [];
+      await local.set({responseWaitHtml: [...list, record].slice(-3)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
 /** Collection needs two identical stable observations (`key`). On the second one the runner
  * records the answer and, for an identified response, its native completion proof. */
 function settleStableAnswer(stability, key, poll, {text, raw}) {
@@ -457,9 +603,11 @@ async function waitUntilReviewOrQuota(name) {
   if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
   const stability = {stable: "", hits: 0};
   const lease = {state: "", chars: 0, at: 0, polled: 0};
-  // No poll-count failure and no deadline before the answer mounts (expireGeneratingLease bounds
-  // only a mounted answer that stops progressing). Controls can appear before response text is
-  // observable. A missing/invalid JSON slice is an observation, never an empty reply.
+  const wait = {at: 0, polled: 0, answered: false};
+  // No poll-count failure. Before the answer mounts the wait is bounded from the send
+  // (expireResponseWait); a mounted answer that stops progressing, by the lease
+  // (expireGeneratingLease). Controls can appear before response text is observable. A
+  // missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
     throwIfStopped();
     // The full original was secured, not accepted as a review. The worker owns
@@ -499,6 +647,7 @@ async function waitUntilReviewOrQuota(name) {
       json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response");
     throwIfQuota(name, bound, Boolean(json));
     expireGeneratingLease(lease, name, poll, text);
+    expireResponseWait(wait, name, poll);
     if (done && json) {
       if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) return json;
     } else { stability.hits = 0; stability.stable = ""; }
@@ -524,7 +673,8 @@ function journaledTurnIntegrity(submission, users) {
   }
   if (!turn) return "unknown";
   if (typeof submission.exact === "string") return fixTurnExact(turn, submission.exact, submission.attachments) ? "exact" : "edited";
-  return normalizePrompt(messagePromptText(turn)) === submission.expected ? "exact" : "edited";
+  const shown = messagePromptText(turn);
+  return (typeof reviewTurnExact === "function" ? reviewTurnExact(shown, submission.expected) : normalizePrompt(shown) === submission.expected) ? "exact" : "edited";
 }
 
 /** Whether a fix's sent turn holds its prompt's lossless form `exact` (composer.js fixPromptForm). A
@@ -961,7 +1111,11 @@ async function waitUntilFixOrQuota(name) {
       const error = new Error(ended.error); error.code = ended.code; throw error;
     }
     const own = proof.ownership === "owned" && bound?.identified ? bound.root : null;
-    const text = done && own ? boundAnswerText("fix", own) : "";
+    // A collapsed code block is opened first (live aicc #455); the harvest then reads it whole.
+    const expanded = done && own ? expandCollapsedCodeBlocks(own) : 0;
+    stability.expanded = (stability.expanded || 0) + expanded;
+    const harvest = {};
+    const text = done && own ? boundAnswerText("fix", own, harvest) : "";
     const answered = done && Boolean(text.trim());
     // Local diagnostics only: the answer text is never copied into an observation.
     if (runner?.running) runner.observation = {
@@ -973,7 +1127,11 @@ async function waitUntilFixOrQuota(name) {
     if (answered) {
       // Its ID (its message node when it has none): the only response a later poll may collect.
       stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
-      if (settleStableAnswer(stability, text, poll, {text, raw: text})) return text;
+      if (settleStableAnswer(stability, text, poll, {text, raw: text})) {
+        saveFixHarvestProbe({at: Date.now(), jobId: runner?.jobId, runId: runner?.runId, blocks: harvest.blocks || 0,
+          totalChars: harvest.totalChars || 0, answerChars: text.length, collapsed: Boolean(harvest.collapsed), expanded: stability.expanded});
+        return text;
+      }
     } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
   }
@@ -1013,6 +1171,10 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   const cardsOf = turn => fix && typeof turnAttachments === "function" && Array.isArray(submission?.attachments)
     ? turnAttachments(turn, submission.attachments).cards : undefined;
   const promptOf = turn => norm(typeof messagePromptText === "function" ? messagePromptText(turn, cardsOf(turn)) : turn.textContent);
+  // A review turn is exactly its prompt also when Markdown restyled it (composer.js reviewTurnExact:
+  // `code` spans rendered as <code>); a fix turn is held to its normalized text (and `exact`, below).
+  const promptIs = (turn, expected) => !fix && typeof reviewTurnExact === "function" && typeof messagePromptText === "function"
+    ? reviewTurnExact(messagePromptText(turn), expected) : promptOf(turn) === expected;
   const href = globalThis.location?.href || "";
   const users = userTurnEls();
   // Ashlar's own prompt in the composer (before or after the send) is not a user draft; anything
@@ -1035,7 +1197,7 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
     // (content proves nothing about WHICH page this is). The just-clicked turn, exactly the prompt:
     // `unsent`. The worker also requires the page the tab was opened on for both.
     if (!users.length) return {ownership: "owned", blank: true};
-    if (submission?.baseline === 0 && users.length === 1 && promptOf(users[0]) === submission.expected) return {ownership: "owned", unsent: true};
+    if (submission?.baseline === 0 && users.length === 1 && promptIs(users[0], submission.expected)) return {ownership: "owned", unsent: true};
     return takeOver("user_turn");
   }
   // An in-page (SPA) move can leave this DOM on screen under another conversation's URL: once the
@@ -1081,7 +1243,7 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   // send-time record and its pin need an exact turn, a fix's collector ends on any other, and an
   // unpinned turn that merely contains the prompt may be the user's edit around it (Ashlar
   // 4101062732). Any other text is an edit.
-  if (sent !== submission.expected) return takeOver("edited");
+  if (!promptIs(turn, submission.expected)) return takeOver("edited");
   // A fix turn is also held to its prompt's lossless form (#77, fixTurnExact): a fix prompt inlines
   // source whose whitespace is content, so a turn whose whitespace alone changed is an edit too.
   if (fix && typeof submission.exact === "string" && typeof fixPromptForm === "function" && !fixTurnExact(turn, submission.exact, submission.attachments)) {
@@ -1408,7 +1570,8 @@ function installReviewRunner(name, run) {
         if (takenOver && !state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = e.takeoverCause || "navigated"; }
         const leaseExpired = e?.code === "stalled"; // expireGeneratingLease (#87)
         recordReviewStep(e?.code === "quota" ? "quota" : e?.code === "cancelled" ? "cancelled" : takenOver ? "context_changed" :
-          leaseExpired ? "lease_expired_generating" : e?.code === "presend_stalled" ? "presend_stalled" : e?.code === "logged_out" ? "logged_out" : "error");
+          leaseExpired ? "lease_expired_generating" : e?.code === "response_timeout" ? "response_timeout" :
+          e?.code === "presend_stalled" ? "presend_stalled" : e?.code === "logged_out" ? "logged_out" : "error");
         state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })

@@ -22,6 +22,54 @@
  * malformed entries are dropped, never a parse failure — they cannot gate or change a push.
  */
 import { lastJsonObject } from "./extract-chat-json.ts";
+import { escapeStrayQuotes } from "./review-json-repair.ts";
+
+/** The line the chat page puts between two fenced code blocks of one fix answer (extension/json.js
+ * boundAnswerText): the reply's blocks joined back in order are one more candidate for the JSON. */
+export const FIX_BLOCK_BREAK = "<<<ASHLAR_CODE_BLOCK_BREAK>>>";
+
+/** The bodies of the ```fenced blocks in `text`, in order (a local or raw reply that kept its fences). */
+function fencedBodies(text: string): string[] {
+  return [...text.matchAll(/^[ \t]*```[^\n`]*\n([\s\S]*?)\n?[ \t]*```[ \t]*$/gm)].map((m) => m[1]);
+}
+
+/** The texts the fix JSON is looked for in, in order: the reply as it is, then its blocks joined
+ * back (the page's FIX_BLOCK_BREAK, or ``` fences in the raw text) with nothing and with a newline
+ * (live aicc #455: a long fix answer never parsed; one JSON split over two blocks is one cause). */
+function fixJsonCandidates(raw: string): string[] {
+  const out = [raw];
+  const join = (parts: string[]) => {
+    if (parts.length > 1) out.push(parts.join(""), parts.join("\n"));
+  };
+  if (raw.includes(FIX_BLOCK_BREAK)) join(raw.split(FIX_BLOCK_BREAK).map((p) => p.replace(/^\n/, "").replace(/\n$/, "")));
+  join(fencedBodies(raw.split(FIX_BLOCK_BREAK).join("\n")));
+  return out;
+}
+
+/** The deterministic JSON repair the review path already uses (review-json-repair
+ * escapeStrayQuotes: a `\\"` whose quote lost its escape), applied to the fix object's span. */
+function repairedFixJson(text: string): string | null {
+  const start = text.search(/\{\s*"(?:summary|edits|newFiles|dispositions|canary)"\s*:/);
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end < start) return null;
+  const fixed = escapeStrayQuotes(text.slice(start, end + 1));
+  return fixed ? lastJsonObject(fixed, isFixObject) : null;
+}
+
+/** The fix JSON object of a reply, wherever it sits: prose around it, split over blocks, or with a
+ * stray-quote slip the review repair also fixes. null when none of these yields one. */
+export function findFixJson(raw: string): string | null {
+  const candidates = fixJsonCandidates(String(raw ?? ""));
+  for (const c of candidates) {
+    const json = lastJsonObject(c, isFixObject);
+    if (json) return json;
+  }
+  for (const c of candidates) {
+    const json = repairedFixJson(c);
+    if (json) return json;
+  }
+  return null;
+}
 
 export interface FixFile {
   path: string;
@@ -76,7 +124,7 @@ function canaryOf(raw: unknown): FixCanary | undefined {
 /** The canary echo of a reply's fix JSON object, read even when the rest of the object would not
  * parse as a fix (a truncated file still proves the connector read the canary). */
 export function fixReplyCanary(raw: string): FixCanary | undefined {
-  const json = lastJsonObject(String(raw ?? ""), isFixObject);
+  const json = findFixJson(String(raw ?? ""));
   return json ? canaryOf((JSON.parse(json) as { canary?: unknown }).canary) : undefined;
 }
 
@@ -222,7 +270,7 @@ function parseNewFiles(raw: unknown[]): { ok: true; files: FixFile[] } | { ok: f
 /** `findingCount`: the findings the prompt listed (F1..Fn). A no-change response must then give
  * every one of them exactly one pushback / decline / defer disposition. */
 export function parseFixResponse(raw: string, opts: { findingCount?: number } = {}): FixParse {
-  const json = lastJsonObject(String(raw ?? ""), isFixObject);
+  const json = findFixJson(String(raw ?? ""));
   if (!json) return { ok: false, error: "no fix JSON object found (deterministic path; caller may json-repair)" };
   const parsed: unknown = JSON.parse(json); // lastJsonObject only returns a slice that already parsed
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {

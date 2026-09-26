@@ -2,7 +2,8 @@ import {test,before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import {source,json} from './load-source.mjs';
 import {background,storage} from './helpers.mjs';
-import {unitTurn,unitAnswer,renderUnitAnswer} from './unit-dom.mjs';
+import {unitTurn,unitAnswer,renderUnitAnswer,unitCodeBlock} from './unit-dom.mjs';
+import {parseFixResponse} from '../../src/lib/fix-apply.ts';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;
 before(async()=>{browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']});});
@@ -881,6 +882,60 @@ test('real DOM: a fix is read from its fenced code block literally, never from r
  await unfenced.clock.runFor(3200);
  const out=await unfenced.evaluate(()=>window.fixOut);
  assert.match(out.raw,/no fenced code block/);assert.ok(!out.raw.includes('{'),'no JSON reaches the fix parser');
+});
+
+// Live aicc #455 (job-muiae0es-23): a long chatgpt fix answer on the 2026-09 DOM ended "no fix JSON
+// object found" twice, while a short one parsed. A long code block the page shows collapsed, or one
+// JSON the page renders over two blocks, is still the whole answer.
+const LONG_FIX=JSON.stringify({summary:'guard the refund path',edits:Array.from({length:40},(_,i)=>({path:'src/a.ts',search:`const v${i} = ${i};`,replace:`const v${i} = ${i + 1}; // \`tick\``})),
+ dispositions:[{finding:'F1',action:'fixed',note:'guarded every writer'}]},null,2);
+const withProbes=page=>page.evaluate(()=>{const local=new Map();window.__local=local;
+ window.chrome.storage={local:{get:async keys=>Object.fromEntries(keys.filter(k=>local.has(k)).map(k=>[k,local.get(k)])),set:async o=>{for(const [k,v] of Object.entries(o))local.set(k,v);}}};});
+const parsedFix=raw=>{const r=parseFixResponse(raw);assert.equal(r.ok,true,r.ok?'':`${r.error}: ${raw.slice(0,200)}`);return r.fix;};
+
+test('real DOM, 2026-09 code block: a long fix block shown collapsed is opened and harvested whole; the harvest probe records its shape',async t=>{
+ const cut=Math.floor(LONG_FIX.length/3);
+ const page=await fixPage(t,`<p>I re-audited the file.</p>${unitCodeBlock(LONG_FIX,{collapsedAt:cut})}`);
+ await withProbes(page);
+ await page.clock.runFor(3200);
+ const out=await page.evaluate(()=>window.fixOut);
+ assert.equal(out.raw,LONG_FIX,'the whole code, not the part the collapsed block showed');
+ assert.equal(parsedFix(out.raw).edits.length,40);
+ assert.equal(await page.evaluate(()=>document.querySelector('[data-expander]').getAttribute('aria-expanded')),'true','the expander was clicked');
+ assert.equal(await page.evaluate(()=>{expandCollapsedCodeBlocks(document.querySelector('[data-message-author-role="assistant"]'));return document.querySelector('[data-expander]').getAttribute('aria-expanded');}),'true','an opened block is never folded back');
+ const probes=await page.evaluate(()=>window.__local.get('fixHarvestProbes'));
+ assert.equal(probes.length,1);
+ const [probe]=probes;
+ assert.deepEqual([probe.blocks,probe.totalChars,probe.answerChars,probe.expanded,probe.jobId],[1,LONG_FIX.length,LONG_FIX.length,1,'fix-A']);
+ assert.equal(typeof probe.collapsed,'boolean');
+ assert.ok(!JSON.stringify(probe).includes('guard the refund'),'no content in the probe');
+});
+
+test('real DOM, 2026-09 code block: a collapsed block whose expander does nothing is still read whole (its hidden tail)',async t=>{
+ const cut=Math.floor(LONG_FIX.length/2);
+ const page=await fixPage(t,unitCodeBlock(LONG_FIX,{collapsedAt:cut,inert:true}));
+ const stats=await page.evaluate(()=>{const s={};const b=assistantCodeBlocks(undefined,s);return {...s,first:b[0]};});
+ assert.deepEqual([stats.blocks,stats.collapsed,stats.first],[1,true,LONG_FIX]);
+ await page.clock.runFor(3200);
+ assert.equal((await page.evaluate(()=>window.fixOut)).raw,LONG_FIX);
+});
+
+test('real DOM, 2026-09 code block: one fix JSON rendered over two blocks is harvested in order and parses',async t=>{
+ const cut=LONG_FIX.indexOf('"dispositions"');
+ const page=await fixPage(t,`<p>Part one:</p>${unitCodeBlock(LONG_FIX.slice(0,cut))}<p>and the rest:</p>${unitCodeBlock(LONG_FIX.slice(cut))}`);
+ await page.clock.runFor(3200);
+ const {raw}=await page.evaluate(()=>window.fixOut);
+ assert.ok(raw.includes('<<<ASHLAR_CODE_BLOCK_BREAK>>>'),'the blocks are kept apart by the break line');
+ assert.ok(!raw.includes('Part one'),'prose is never read');
+ assert.deepEqual(parsedFix(raw).dispositions,[{finding:'F1',action:'fixed',note:'guarded every writer'}]);
+});
+
+test('real DOM, 2026-09 code block: prose around one fenced fix block harvests the block and parses',async t=>{
+ const page=await fixPage(t,`<p>Here is the fix {as asked}.</p>${unitCodeBlock(LONG_FIX)}<p>The test covers the {edge} case.</p>`);
+ await page.clock.runFor(3200);
+ const {raw}=await page.evaluate(()=>window.fixOut);
+ assert.equal(raw,LONG_FIX);
+ assert.equal(parsedFix(raw).summary,'guard the refund path');
 });
 
 test('real DOM: a hidden or stale code block the renderer kept is never part of a fix answer',async t=>{

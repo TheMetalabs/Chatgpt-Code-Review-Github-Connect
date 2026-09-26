@@ -584,7 +584,18 @@ export function failBridgeProvider(jobId: string, provider: ReviewProvider, erro
   return true;
 }
 
-export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatLeg[], leaseId?: string) {
+/** A salvage envelope (extract-chat-json.ts salvageReviewJson, background.js salvageReviewEnvelope):
+ * no findings and the verbatim reply in raw_review. */
+function isSalvageEnvelope(json: string): boolean {
+  try {
+    const o = JSON.parse(json) as Record<string, unknown>;
+    return Array.isArray(o.findings) && o.findings.length === 0 && typeof o.raw_review === "string";
+  } catch {
+    return false;
+  }
+}
+
+export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatLeg[], leaseId?: string, salvaged = false) {
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job) return {ok: false, error: "job not found"};
   const repairAvailable = localJsonRepairAvailable(getHarbor().settings);
@@ -592,10 +603,13 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
   // can fix it, salvage into a raw_review review. Doing this BEFORE the replay/dup check makes a
   // lost-ack retry of the same prose normalize identically to the stored salvage (idempotent), and
   // catches schema-invalid (not only syntactically broken) replies so none is silently dropped.
+  // A salvaged leg (the extension's repair is over, live aicc #457) is posted like repair-off: its
+  // raw_review envelope as sent, anything else salvaged here, never left for a repair.
   const canonicalLegRaw = (text: string): string => {
     const parsed = extractChatJson(text);
-    if (repairAvailable) return parsed ?? text; // route 422s schema errors for a real repair
-    return parsed && inspectReviewFormat(parsed, "review").ok ? parsed : salvageReviewJson(text);
+    if (repairAvailable && !salvaged) return parsed ?? text; // route 422s schema errors for a real repair
+    if (parsed && inspectReviewFormat(parsed, "review").ok) return parsed;
+    return salvaged && parsed && isSalvageEnvelope(parsed) ? parsed : salvageReviewJson(text);
   };
   const incoming = (legs?.length ? legs : raw.trim() ? [{provider: "chatgpt" as const, raw}] : [])
     .map(leg => {

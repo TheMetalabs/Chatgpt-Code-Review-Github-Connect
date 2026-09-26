@@ -96,3 +96,18 @@ describe("salvageReviewJson", () => {
     }
   });
 });
+
+// Live aicc #457 (job-muir6f31-729): the review JSON carried ChatGPT's citation markers inside its
+// strings; their bare quotes broke it and the review sat at repair needs_attention.
+describe("citation markers in a review answer (#457)", () => {
+  const cited = '{"merge_recommendation":"REQUEST_CHANGES","highest_risk":"writes sentAt. :chatgpt-content-reference{index="0"} :chatgpt-content-reference{index="1"}","findings":[]}';
+  it("a review broken only by citation markers is read once they are removed", () => {
+    const json = extractChatJson(`JSON\n\n${cited}`);
+    assert.ok(json);
+    assert.equal(JSON.parse(json!).highest_risk, "writes sentAt.");
+  });
+  it("a valid review keeps a marker inside a string byte for byte", () => {
+    const valid = JSON.stringify({ findings: [], highest_risk: 'x :chatgpt-content-reference{index="0"}' });
+    assert.equal(extractChatJson(valid), valid);
+  });
+});

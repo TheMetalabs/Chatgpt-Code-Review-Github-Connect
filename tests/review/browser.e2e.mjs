@@ -1012,6 +1012,14 @@ test('real DOM: a <pre> block and a pre-less block in one answer are both read, 
  assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),['{"a":1',',"b":2}','{"c":3}']);
 });
 
+test('extension extractChatJson (#457): a review broken only by citation markers is read once they are removed; a valid one is untouched',async t=>{
+ const page=await fixture(t,user);
+ const cited='{"merge_recommendation":"COMMENT","highest_risk":"r. :chatgpt-content-reference{index="0"}","findings":[]}';
+ assert.equal(await page.evaluate(s=>JSON.parse(extractChatJson(s)).highest_risk,cited),'r.');
+ const valid=JSON.stringify({findings:[],highest_risk:'x :chatgpt-content-reference{index="0"}'});
+ assert.equal(await page.evaluate(s=>extractChatJson(s),valid),valid);
+});
+
 test('real DOM: a hidden or stale code block the renderer kept is never part of a fix answer',async t=>{
  const visible='{"summary":"new","files":[]}';
  const page=await fixture(t,user+answer(`<pre hidden><code>{"summary":"stale-hidden"}</code></pre><div style="display:none"><pre><code>{"summary":"stale-none"}</code></pre></div><pre style="opacity:0"><code>{"summary":"stale-transparent"}</code></pre><pre><code>${visible}</code></pre>`,true));

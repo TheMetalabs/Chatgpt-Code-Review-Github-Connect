@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { applyFixEdits, isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
+import { applyFixEdits, FIX_BLOCK_BREAK, fixReplyCanary, isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
 
 const ok = (raw: string) => {
   const r = parseFixResponse(raw);
@@ -14,6 +14,42 @@ const err = (raw: string) => {
 };
 
 describe("parseFixResponse", () => {
+  // Live aicc #455 (job-muiae0es-23): a long chatgpt fix answer ended "no fix JSON object found"
+  // twice. The JSON is found wherever the reply puts it, never only as one intact object.
+  const FIX = { summary: "guard the refund", edits: [{ path: "src/a.ts", search: "const a = 1;", replace: "const a = 2;" }], dispositions: [{ finding: "F1", action: "fixed", note: "guarded" }] };
+  const pretty = JSON.stringify(FIX, null, 2);
+
+  it("parses a fix JSON split across two code blocks (the page's block break), cut between tokens or inside a string", () => {
+    const betweenTokens = pretty.indexOf('"dispositions"');
+    const insideString = pretty.indexOf("refund") + 3;
+    for (const cut of [betweenTokens, insideString]) {
+      const raw = `${pretty.slice(0, cut)}\n${FIX_BLOCK_BREAK}\n${pretty.slice(cut)}`;
+      assert.deepEqual(ok(raw).edits, FIX.edits, `cut at ${cut}`);
+    }
+  });
+
+  it("parses a fix JSON split across two ``` fenced blocks with prose between them", () => {
+    const cut = pretty.indexOf('"dispositions"');
+    const raw = `Here is the fix:\n\`\`\`json\n${pretty.slice(0, cut)}\n\`\`\`\nand the rest:\n\`\`\`json\n${pretty.slice(cut)}\n\`\`\`\nDone.`;
+    assert.equal(ok(raw).summary, FIX.summary);
+  });
+
+  it("parses prose around a fenced fix block", () => {
+    const raw = `I re-audited the file {see below}.\n\n\`\`\`json\n${pretty}\n\`\`\`\n\nThe test covers the {edge} case.`;
+    assert.deepEqual(ok(raw).dispositions, FIX.dispositions);
+  });
+
+  it("repairs the review path's stray-quote slip in a fix answer (escapeStrayQuotes)", () => {
+    const slipped = '{"summary":"s","edits":[{"path":"src/a.ts","search":"const a = 1;","replace":"const re = \\\\"x\\\\";"}]}';
+    assert.throws(() => JSON.parse(slipped), "the answer itself is not JSON");
+    assert.equal(ok(slipped).edits[0].replace, 'const re = \\"x\\";');
+    assert.equal(fixReplyCanary(slipped), undefined);
+  });
+
+  it("still fails closed when no candidate holds a fix object", () => {
+    assert.match(err(`prose only\n${FIX_BLOCK_BREAK}\n{"summary":"no edits key"}`), /no fix JSON object found/);
+  });
+
   it("parses targeted edits and new files (bare JSON)", () => {
     const fix = ok('{"summary":"fix null deref","edits":[{"path":"src/a.ts","search":"const a = 1;","replace":"const a = 2;"}],"newFiles":[{"path":"src/b.ts","content":"export const b = 1;\\n"}]}');
     assert.equal(fix.summary, "fix null deref");

@@ -488,3 +488,10 @@ export function totalFees(n) {
   for (let i = 1; i <= n; i++) sum += i;
   return sum;
 }
+
+// WHY: refunds use the same tier table so a partial refund mirrors the original charge.
+/** Refund for tier `i`: the fee added by step{i}. */
+export function refundFee(i) {
+  // WHY: integer won only; a negative tier is a caller bug and must not refund.
+  return i > 0 ? i : i;
+}

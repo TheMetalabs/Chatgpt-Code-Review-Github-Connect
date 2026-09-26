@@ -171,7 +171,7 @@ function fakeDeps(
   const lastHead = opts.lastHead ?? HEAD;
   const replies = Array.isArray(opts.reply)
     ? opts.reply
-    : [opts.reply ?? '{"summary":"guard removed","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}'];
+    : [opts.reply ?? '{"summary":"guard removed","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}'];
   const deps: LoopRuntimeDeps = {
     gh: {
       async listPullReviews() {
@@ -664,11 +664,19 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
   });
 
   it("a retryable failure is retried with the rejection fed back, then succeeds", async () => {
-    const f = fakeDeps({ start: "apply", rounds: [3], reply: ["not json at all", '{"summary":"ok","files":[{"path":"src/a.ts","content":"export const a = 3;\\n"}]}'] });
+    const f = fakeDeps({ start: "apply", rounds: [3], reply: ["not json at all", '{"summary":"ok","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 3;"}]}'] });
     const r = await run(f, "apply");
     assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.attempts === 2);
     assert.match(f.prompts[1], /PREVIOUS ATTEMPT REJECTED \(parse-failed\)/);
     assert.ok(f.prompts[1].startsWith(f.prompts[0]), "the retry keeps the full original prompt");
+  });
+
+  it("a search that is missing or not unique is retried with the reason (validation-failed)", async () => {
+    const f = fakeDeps({ start: "apply", rounds: [3], reply: ['{"summary":"s","edits":[{"path":"src/a.ts","search":"export const b = 1;","replace":"x"}]}', '{"summary":"ok","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}'] });
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.attempts === 2);
+    assert.match(f.prompts[1], /PREVIOUS ATTEMPT REJECTED \(validation-failed\)/);
+    assert.match(f.prompts[1], /search\\" not found in the current file/);
   });
 
   it("a transport failure is retried; exhausting the attempts hands off (fix-failed)", async () => {
@@ -693,7 +701,7 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
   });
 
   it("fixSource=github: every attempt carries the round's GitHub source (head, editable paths, head-tree blobs, retry note)", async () => {
-    const f = fakeDeps({ start: "apply", rounds: [3], reply: ["not json", '{"summary":"s","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}'] });
+    const f = fakeDeps({ start: "apply", rounds: [3], reply: ["not json", '{"summary":"s","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}'] });
     const api = f.deps.gh.gitDataApi;
     const blobReads: Array<{ sha: string; paths: readonly string[] }> = [];
     f.deps.gh.gitDataApi = (...a) => ({
@@ -733,7 +741,7 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
   });
 
   it("K3: a policy/context file is NOT editable (scope-violation → retried → fix-failed, no push)", async () => {
-    const f = fakeDeps({ start: "apply", rounds: [3], reply: '{"summary":"edit policy","files":[{"path":"docs/POLICY.md","content":"tampered"}]}' });
+    const f = fakeDeps({ start: "apply", rounds: [3], reply: '{"summary":"edit policy","newFiles":[{"path":"docs/POLICY.md","content":"tampered"}]}' });
     const r = await run(f, "apply");
     assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-failed");
     assert.match(escalations(f.posted)[0], /scope-violation/);
@@ -1105,7 +1113,7 @@ describe("round-5: durable stop records, exact session scoping, prompt boundary,
     const f = fakeDeps({
       start: "apply",
       rounds: [3],
-      reply: [JSON.stringify({ summary: "s", files: [{ path: evil, content: "x" }] }), '{"summary":"ok","files":[{"path":"src/a.ts","content":"export const a = 3;\\n"}]}'],
+      reply: [JSON.stringify({ summary: "s", newFiles: [{ path: evil, content: "x" }] }), '{"summary":"ok","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 3;"}]}'],
     });
     const r = await run(f, "apply");
     assert.ok(r.ran && r.step === "fix" && r.attempts === 2);
@@ -1814,7 +1822,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     { id: 102, path: "src/a.ts", body: "BODY-B" },
   ];
   const withDispositions = (files: string, dispositions: string) =>
-    `{"summary":"s","files":${files},"dispositions":${dispositions}}`;
+    `{"summary":"s","edits":${files},"dispositions":${dispositions}}`;
   const runWith = (f: ReturnType<typeof fakeDeps>, mode: "suggest" | "apply", posted: PostedLoopReview = postedReview) =>
     runPostReviewLoop("t", job({ findings: two }), sample, settings(mode), f.deps, ENV, posted);
 
@@ -1823,7 +1831,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
       start: "apply",
       rounds: [2],
       threads,
-      reply: withDispositions('[{"path":"src/a.ts","content":"export const a = 9;\\n"}]', '[{"finding":"F1","action":"fixed","note":"guarded the null path"}]'),
+      reply: withDispositions('[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 9;"}]', '[{"finding":"F1","action":"fixed","note":"guarded the null path"}]'),
     });
     const r = await runWith(f, "apply");
     assert.ok(r.ran && r.step === "fix" && r.outcome === "applied");
@@ -1934,7 +1942,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
       rounds: [2],
       threads,
       reply: withDispositions(
-        '[{"path":"src/a.ts","content":"export const a = 9;\\n"}]',
+        '[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 9;"}]',
         '[{"finding":"F1","action":"fixed","note":"ok <!-- ashlar-loop-stopped --> cc @alice\\nsecond line"}]',
       ),
     });
@@ -2012,7 +2020,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
       start: "apply",
       rounds: [2],
       threads: roots,
-      reply: withDispositions('[{"path":"src/a.ts","content":"export const a = 9;\\n"}]', '[{"finding":"F1","action":"fixed","note":"fixed A"},{"finding":"F2","action":"defer","note":"later B"}]'),
+      reply: withDispositions('[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 9;"}]', '[{"finding":"F1","action":"fixed","note":"fixed A"},{"finding":"F2","action":"defer","note":"later B"}]'),
     });
     await runPostReviewLoop("t", job({ findings: same }), sample, settings("apply"), f.deps, ENV, posted);
     assert.deepEqual(f.replies.map((x) => [x.id, x.body.split(": ")[1]]), [[101, "fixed A"], [102, "later B"]]);
@@ -2268,7 +2276,7 @@ describe("ambiguous control writes: journaled with no expiry, never read as post
 
   for (const [name, opts] of [
     ["fix-declined", { reply: '{"summary":"false positive","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"n"}]}' }],
-    ["fix-failed", { reply: '{"summary":"edit policy","files":[{"path":"docs/POLICY.md","content":"tampered"}]}' }],
+    ["fix-failed", { reply: '{"summary":"edit policy","newFiles":[{"path":"docs/POLICY.md","content":"tampered"}]}' }],
   ] as const) {
     it(`a ${name} handoff with an unknown outcome is terminal here: a redelivered review runs no second fix and posts no second handoff`, async () => {
       const f = fakeDeps({ start: "apply", rounds: [3], ...opts });

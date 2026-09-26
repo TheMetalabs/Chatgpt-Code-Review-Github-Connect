@@ -1,16 +1,21 @@
 /**
  * Fix-agent response parsing (design §6 mechanism A: script-apply, LLM-free).
  *
- * The fix provider (chat/local) returns a FULL-FILE schema — path + complete new content
- * per changed file — NOT a diff (diffs apply unreliably). Extraction reuses the review
- * JSON extractor (extract-chat-json), so the same tolerant fence/prose handling applies;
- * the caller falls back (json-repair → another provider → coding agent → ESCALATE) when
- * this returns { ok: false }. Parsing is deterministic; the §7 CI/test gate is what
- * catches a well-formed-but-wrong fix — this only guarantees mechanical fidelity.
+ * The fix provider (chat/local) returns TARGETED EDITS — per change, the path, an exact snippet of
+ * the current file (`search`, unique in that file) and its replacement — plus full content only for
+ * NEW files. It never returns an existing file whole: a whole-file rewrite of a 2,754-line file
+ * dropped every WHY comment on aicc PR #439 (f02ec26c, +155/-1046) for a one-clause fix. The edits
+ * are applied here, server-side, against the head-pinned content (applyFixEdits). Extraction reuses
+ * the review JSON extractor (extract-chat-json); the caller falls back (json-repair → another
+ * provider → coding agent → ESCALATE) when this returns { ok: false }. Parsing is deterministic; the
+ * scope guard (fix-scope-guard) and the §7 CI/test gate catch a well-formed-but-wrong fix.
  *
- * INVARIANTS (fail-closed): parse returns { ok:false } on ANY anomaly — unparseable JSON,
- * no files, unsafe/traversal/absolute path, a sensitive repo-control path, empty/duplicate/
- * truncated content, or content over the size cap. It never partially accepts.
+ * INVARIANTS (fail-closed): parse returns { ok:false } on ANY anomaly — unparseable JSON, a legacy
+ * full-file `files` entry, unsafe/traversal/absolute path, a sensitive repo-control path, an empty
+ * search or a no-op edit, empty/duplicate/truncated new-file content, or content over the size cap.
+ * applyFixEdits returns { ok:false } when a search snippet is missing or not unique, when edits
+ * overlap, when an edit targets a file absent at the head or a new file already exists. Neither
+ * ever partially accepts.
  * NON-GOALS (owned elsewhere): semantic correctness of the fix (the validate/CI gate, §7);
  * choosing script-apply vs the coding-agent fallback for oversized files (the caller/§6).
  * Per-finding `dispositions` are ADVISORY metadata for the thread replies (design §5 step 6):
@@ -20,7 +25,14 @@ import { lastJsonObject } from "./extract-chat-json.ts";
 
 export interface FixFile {
   path: string;
-  content: string; // the COMPLETE new file content (overwrite), never a diff
+  content: string; // the COMPLETE file content to commit (a new file, or an existing one after its edits)
+}
+
+/** One targeted edit: replace the ONE occurrence of `search` in the head content of `path`. */
+export interface FixEdit {
+  path: string;
+  search: string;
+  replace: string;
   /** GitHub-source fixes only (fix-source-github.ts): the git blob SHA of the file the model read
    * and edited. The server checks it against the head tree before any commit (stale read = reject). */
   baseBlobSha?: string;
@@ -43,7 +55,10 @@ export interface FixDisposition {
 
 export interface FixResponse {
   summary: string;
-  files: FixFile[];
+  /** Targeted edits of existing files, in reply order. */
+  edits: FixEdit[];
+  /** Full content of files that do not exist at the head. */
+  newFiles: FixFile[];
   dispositions: FixDisposition[];
   /** Present only when the reply carries a well-formed `canary` echo (GitHub-source fixes). */
   canary?: FixCanary;
@@ -102,7 +117,7 @@ function isFixObject(value: unknown): boolean {
     !!value &&
     typeof value === "object" &&
     !Array.isArray(value) &&
-    Array.isArray((value as { files?: unknown }).files)
+    ["edits", "newFiles", "files"].some((k) => Array.isArray((value as Record<string, unknown>)[k]))
   );
 }
 
@@ -152,10 +167,57 @@ function looksTruncated(content: string): boolean {
   return LAST_LINE_TRUNCATION.some((re) => re.test(last));
 }
 
+/** Why a path cannot be written, or null. */
+function pathProblem(path: unknown): string | null {
+  if (!isSafeFixPath(path)) return `unsafe or missing path: ${JSON.stringify(String(path).slice(0, 80))}`;
+  if (isSensitivePath(path)) return `sensitive repo-control path: ${path}`;
+  return null;
+}
+
+function parseEdits(raw: unknown[]): { ok: true; edits: FixEdit[] } | { ok: false; error: string } {
+  const edits: FixEdit[] = [];
+  for (const [i, entry] of raw.entries()) {
+    if (!entry || typeof entry !== "object") return { ok: false, error: `edit #${i + 1} is not an object` };
+    const { path, search, replace, baseBlobSha } = entry as Record<string, unknown>;
+    const bad = pathProblem(path);
+    if (bad) return { ok: false, error: `edit #${i + 1}: ${bad}` };
+    const p = path as string;
+    if (typeof search !== "string" || search.length === 0) return { ok: false, error: `edit #${i + 1} (${p}): empty or missing "search" — quote the exact current lines to replace` };
+    if (typeof replace !== "string") return { ok: false, error: `edit #${i + 1} (${p}): missing "replace" (use "" to delete the lines)` };
+    if (search === replace) return { ok: false, error: `edit #${i + 1} (${p}): "replace" equals "search" (the edit changes nothing)` };
+    if (Buffer.byteLength(search, "utf8") > MAX_FILE_BYTES || Buffer.byteLength(replace, "utf8") > MAX_FILE_BYTES) {
+      return { ok: false, error: `edit #${i + 1} (${p}) exceeds ${MAX_FILE_BYTES} bytes` };
+    }
+    if (baseBlobSha !== undefined && (typeof baseBlobSha !== "string" || !BLOB_SHA_RE.test(baseBlobSha))) {
+      return { ok: false, error: `baseBlobSha for ${p} is not a 40-hex git blob SHA` };
+    }
+    edits.push({ path: p, search, replace, ...(typeof baseBlobSha === "string" ? { baseBlobSha: baseBlobSha.toLowerCase() } : {}) });
+  }
+  return { ok: true, edits };
+}
+
+function parseNewFiles(raw: unknown[]): { ok: true; files: FixFile[] } | { ok: false; error: string } {
+  const seen = new Set<string>();
+  const files: FixFile[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") return { ok: false, error: "newFiles entry is not an object" };
+    const { path, content } = entry as Record<string, unknown>;
+    const bad = pathProblem(path);
+    if (bad) return { ok: false, error: bad };
+    const p = path as string;
+    if (seen.has(p)) return { ok: false, error: `duplicate path: ${p}` };
+    if (typeof content !== "string" || content.length === 0) return { ok: false, error: `empty/non-string content for ${p} (possible truncation)` };
+    if (looksTruncated(content)) return { ok: false, error: `content for ${p} looks truncated/elided` };
+    if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) return { ok: false, error: `content for ${p} exceeds ${MAX_FILE_BYTES} bytes` };
+    seen.add(p);
+    files.push({ path: p, content });
+  }
+  return { ok: true, files };
+}
+
 /**
- * Parse a fix provider's reply into a validated full-file change set, LLM-free. Returns
- * { ok: false, error } on any anomaly (unparseable, no files, unsafe path, empty/truncated
- * content) so the caller can fall back rather than push a bad tree.
+ * Parse a fix provider's reply into validated edits + new files, LLM-free. Returns
+ * { ok: false, error } on any anomaly so the caller can retry or fall back rather than push a bad tree.
  */
 /** `findingCount`: the findings the prompt listed (F1..Fn). A no-change response must then give
  * every one of them exactly one pushback / decline / defer disposition. */
@@ -166,19 +228,25 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { ok: false, error: "response is not a JSON object" };
   }
-  const filesRaw = (parsed as { files?: unknown }).files;
-  if (!Array.isArray(filesRaw)) {
-    return { ok: false, error: "no files array in fix response" };
+  const obj = parsed as Record<string, unknown>;
+  // The retired full-file schema: an existing file must never come back whole (it is how a fix
+  // silently drops comments, tests and formatting). An empty legacy array is just "no change".
+  if (Array.isArray(obj.files) && obj.files.length > 0) {
+    return { ok: false, error: 'full-file "files" output is not accepted: change existing files with "edits" (search/replace) and put only files that do not exist yet in "newFiles"' };
   }
-  const summaryRaw = typeof (parsed as { summary?: unknown }).summary === "string" ? (parsed as { summary: string }).summary : "";
-  const dispositions = parseDispositions((parsed as { dispositions?: unknown }).dispositions);
-  const canary = canaryOf((parsed as { canary?: unknown }).canary);
+  const editsRaw = obj.edits === undefined ? [] : obj.edits;
+  const newRaw = obj.newFiles === undefined ? [] : obj.newFiles;
+  if (!Array.isArray(editsRaw)) return { ok: false, error: '"edits" is not an array' };
+  if (!Array.isArray(newRaw)) return { ok: false, error: '"newFiles" is not an array' };
+  const summaryRaw = typeof obj.summary === "string" ? obj.summary : "";
+  const dispositions = parseDispositions(obj.dispositions);
+  const canary = canaryOf(obj.canary);
   const extra = canary ? { canary } : {};
-  if (filesRaw.length === 0) {
+  if (editsRaw.length === 0 && newRaw.length === 0) {
     // A no-change round is valid ONLY when the agent gave a rationale (push-back/decline/defer of
     // every finding); a bare empty response with no summary is malformed → fail closed. Nothing
     // changed, so no finding can be "fixed": a response that says so contradicts itself (retry).
-    if (summaryRaw.trim().length === 0) return { ok: false, error: "empty response (no files, no rationale)" };
+    if (summaryRaw.trim().length === 0) return { ok: false, error: "empty response (no edits, no rationale)" };
     const claimed = dispositions.filter((d) => d.action === "fixed").map((d) => d.finding);
     if (claimed.length) return { ok: false, error: `no files changed, yet ${claimed.join(", ")} marked fixed` };
     // Every finding must be classified (a dropped malformed entry counts as missing): an incomplete
@@ -191,36 +259,73 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
     // whole answer, so it is malformed (retried) rather than a terminal fix-declined handoff.
     const bare = dispositions.filter((d) => (d.action === "decline" || d.action === "defer") && !citesEvidence(d.note)).map((d) => d.finding);
     if (bare.length) return { ok: false, error: `decline/defer without evidence (issue #, file:line or quote) for ${bare.join(", ")}` };
-    return { ok: true, fix: { summary: summaryRaw, files: [], dispositions, ...extra } };
+    return { ok: true, fix: { summary: summaryRaw, edits: [], newFiles: [], dispositions, ...extra } };
   }
-  const seen = new Set<string>();
-  const files: FixFile[] = [];
-  for (const entry of filesRaw) {
-    if (!entry || typeof entry !== "object") return { ok: false, error: "file entry is not an object" };
-    const path = (entry as { path?: unknown }).path;
-    const content = (entry as { content?: unknown }).content;
-    const baseBlobSha = (entry as { baseBlobSha?: unknown }).baseBlobSha;
-    if (!isSafeFixPath(path)) return { ok: false, error: `unsafe or missing path: ${JSON.stringify(String(path).slice(0, 80))}` };
-    if (isSensitivePath(path)) return { ok: false, error: `sensitive repo-control path: ${path}` };
-    if (seen.has(path)) return { ok: false, error: `duplicate path: ${path}` };
-    if (typeof content !== "string" || content.length === 0) {
-      return { ok: false, error: `empty/non-string content for ${path} (possible truncation)` };
-    }
-    if (looksTruncated(content)) {
-      return { ok: false, error: `content for ${path} looks truncated/elided` };
-    }
-    if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) {
-      return { ok: false, error: `content for ${path} exceeds ${MAX_FILE_BYTES} bytes` };
-    }
-    if (baseBlobSha !== undefined && (typeof baseBlobSha !== "string" || !BLOB_SHA_RE.test(baseBlobSha))) {
-      return { ok: false, error: `baseBlobSha for ${path} is not a 40-hex git blob SHA` };
-    }
-    seen.add(path);
-    files.push({ path, content, ...(typeof baseBlobSha === "string" ? { baseBlobSha: baseBlobSha.toLowerCase() } : {}) });
-  }
-  const totalBytes = files.reduce((n, f) => n + Buffer.byteLength(f.content, "utf8"), 0);
+  const edits = parseEdits(editsRaw);
+  if (!edits.ok) return edits;
+  const newFiles = parseNewFiles(newRaw);
+  if (!newFiles.ok) return newFiles;
+  const both = newFiles.files.map((f) => f.path).filter((p) => edits.edits.some((e) => e.path === p));
+  if (both.length) return { ok: false, error: `path both edited and created: ${both.join(", ")}` };
+  const totalBytes =
+    newFiles.files.reduce((n, f) => n + Buffer.byteLength(f.content, "utf8"), 0) + edits.edits.reduce((n, e) => n + Buffer.byteLength(e.replace, "utf8"), 0);
   if (totalBytes > MAX_TOTAL_BYTES) {
     return { ok: false, error: `change set exceeds ${MAX_TOTAL_BYTES} bytes total` };
   }
-  return { ok: true, fix: { summary: summaryRaw, files, dispositions, ...extra } };
+  return { ok: true, fix: { summary: summaryRaw, edits: edits.edits, newFiles: newFiles.files, dispositions, ...extra } };
+}
+
+/** The start index of every occurrence of `needle` in `hay` (overlapping ones too), up to `cap`. */
+function occurrences(hay: string, needle: string, cap: number): number[] {
+  const at: number[] = [];
+  for (let i = hay.indexOf(needle); i >= 0 && at.length < cap; i = hay.indexOf(needle, i + 1)) at.push(i);
+  return at;
+}
+
+export type FixMaterialized =
+  | { ok: true; files: FixFile[]; before: ReadonlyMap<string, string> }
+  | { ok: false; error: string };
+
+/**
+ * Apply parsed edits to the head-pinned contents (`base`: path → head content), deterministically.
+ * Every search is located in the ORIGINAL head content and must occur exactly once; edits of one
+ * file must not overlap. The result is the full content of every changed file (for the commit) and
+ * the head content it came from (for the scope guard). New files must not exist at the head.
+ */
+export function applyFixEdits(fix: Pick<FixResponse, "edits" | "newFiles">, base: ReadonlyMap<string, string>): FixMaterialized {
+  const byPath = new Map<string, FixEdit[]>();
+  for (const e of fix.edits) byPath.set(e.path, [...(byPath.get(e.path) ?? []), e]);
+  const files: FixFile[] = [];
+  const before = new Map<string, string>();
+  for (const [path, edits] of byPath) {
+    const head = base.get(path);
+    if (head === undefined) return { ok: false, error: `edit for ${path}: the file does not exist at the head; a new file goes in "newFiles"` };
+    const spans: Array<{ from: number; to: number; replace: string; n: number }> = [];
+    for (const [i, e] of edits.entries()) {
+      const at = occurrences(head, e.search, 2);
+      const which = `edit #${i + 1} for ${path}`;
+      if (at.length === 0) return { ok: false, error: `${which}: "search" not found in the current file — copy the lines exactly (whitespace included) from the current content: ${JSON.stringify(e.search.slice(0, 120))}` };
+      if (at.length > 1) return { ok: false, error: `${which}: "search" matches more than one place — add surrounding lines until it is unique: ${JSON.stringify(e.search.slice(0, 120))}` };
+      spans.push({ from: at[0], to: at[0] + e.search.length, replace: e.replace, n: i + 1 });
+    }
+    spans.sort((a, b) => a.from - b.from);
+    for (let i = 1; i < spans.length; i += 1) {
+      if (spans[i].from < spans[i - 1].to) return { ok: false, error: `edits #${spans[i - 1].n} and #${spans[i].n} for ${path} overlap — merge them into one edit` };
+    }
+    let out = "";
+    let cursor = 0;
+    for (const s of spans) {
+      out += head.slice(cursor, s.from) + s.replace;
+      cursor = s.to;
+    }
+    out += head.slice(cursor);
+    if (Buffer.byteLength(out, "utf8") > MAX_FILE_BYTES) return { ok: false, error: `content for ${path} exceeds ${MAX_FILE_BYTES} bytes after the edits` };
+    files.push({ path, content: out });
+    before.set(path, head);
+  }
+  for (const f of fix.newFiles) {
+    if (base.has(f.path)) return { ok: false, error: `newFiles entry ${f.path} already exists at the head; change it with "edits"` };
+    files.push(f);
+  }
+  return { ok: true, files, before };
 }

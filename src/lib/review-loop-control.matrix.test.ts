@@ -84,7 +84,7 @@ const STALE = "9".repeat(40); // a head the loop had left, whose clean review la
 const T0 = Date.parse("2026-03-01T00:00:00Z"); // the world clock starts here
 const ALICE_AT = "2026-02-20T00:00:00Z"; // alice's start directive; review rounds follow it
 const ENV = {} as NodeJS.ProcessEnv; // the Settings switch alone turns the loop on (fixAgent.roundCap default 5)
-const EDIT = '{"summary":"guard removed","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}';
+const EDIT = '{"summary":"guard removed","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}';
 const iso = (ms: number) => new Date(ms).toISOString();
 /** GitHub's one-second resolution (rows and webhook event times). */
 const second = (ms: number) => iso(Math.floor(ms / 1000) * 1000);

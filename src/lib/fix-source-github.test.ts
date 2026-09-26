@@ -22,6 +22,7 @@ const B = "src/b.ts";
 const HEAD_FILES: Record<string, string> = { [A]: "export const a = 1;\n", [B]: "export const b = 1;\n" };
 const HEAD_BLOBS = new Map(Object.entries(HEAD_FILES).map(([p, c]) => [p, blobSha(c)]));
 const REF = { owner: "o", repo: "r", pr: 7 };
+const NEW_PATH = "src/c.ts";
 
 const chat = (): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { ...DEFAULT_SETTINGS.fixAgent, enabled: true, provider: "chatgpt", delivery: "script-apply", mode: "apply" } });
 
@@ -29,7 +30,7 @@ function source(over: Partial<GithubFixSource> = {}): GithubFixSource {
   return {
     ...REF,
     headSha: HEAD,
-    paths: [A, B],
+    paths: [A, B, NEW_PATH],
     findings: "[F1] [P1] src/a.ts:1 — `a` is wrong\n  fix: set it to **2**",
     headBlobs: async () => HEAD_BLOBS,
     switched: {},
@@ -55,8 +56,9 @@ function bridge(script: Array<string | Error | ((r: FixRequest) => string)>) {
 const reply = (o: Record<string, unknown>) => "```json\n" + JSON.stringify(o) + "\n```";
 const canary = (sha = HEAD_BLOBS.get(A)!, path = A) => ({ path, blobSha: sha });
 const NEW_A = "export const a = 2;\n";
+const EDIT_A = { path: A, baseBlobSha: HEAD_BLOBS.get(A), search: "export const a = 1;", replace: "export const a = 2;" };
 const good = (over: Record<string, unknown> = {}) =>
-  reply({ summary: "a fixed", canary: canary(), files: [{ path: A, baseBlobSha: HEAD_BLOBS.get(A), content: NEW_A }], dispositions: [{ finding: "F1", action: "fixed", note: "set a to 2" }], ...over });
+  reply({ summary: "a fixed", canary: canary(), edits: [EDIT_A], dispositions: [{ finding: "F1", action: "fixed", note: "set a to 2" }], ...over });
 
 const ATTACHMENT_FAILED = new Error("chatgpt fix request failed: attachment_failed: the fix attachment could not be staged: upload failed; nothing was sent");
 const HUGE = "x".repeat(FIX_ATTACHMENT_MAX_BYTES);
@@ -103,11 +105,13 @@ describe("fixSource=github: the fallback when the fix attachment cannot be deliv
     assert.ok(prompt.includes("o/r"), "the repository");
     assert.ok(prompt.includes("pull request #7"), "the PR number");
     assert.ok(prompt.includes(`at commit ${HEAD} exactly`), "the FULL head SHA");
-    assert.ok(prompt.includes(`Editable files (JSON): ${JSON.stringify([A, B])}`), "the editable paths");
+    assert.ok(prompt.includes(`Editable files (JSON): ${JSON.stringify([A, B, NEW_PATH])}`), "the editable paths");
     assert.ok(prompt.includes(`Connector check: read ${JSON.stringify(A)} at that commit`), "the canary path");
     assert.ok(!prompt.includes(HEAD_BLOBS.get(A)!), "the canary's blob SHA is read by the model, never given to it");
     assert.ok(prompt.includes(CONNECTOR_UNAVAILABLE_REPLY));
     assert.match(prompt, /"baseBlobSha"/, "the schema asks for each file's base blob");
+    assert.match(prompt, /"edits": \[\{"path": "<an editable path>", "baseBlobSha": "[^"]+", "search": "[^"]+", "replace"/, "targeted edits, not whole files");
+    assert.match(prompt, /Never return an existing file whole/);
     assert.match(prompt, /a is wrong/, "the findings");
     assert.ok(isCanonicalLine(prompt), "one whitespace-canonical line (#103)");
     assert.ok(rendersAsTyped(prompt), "no Markdown-active characters");
@@ -167,9 +171,9 @@ describe("fixSource=github: the fallback when the fix attachment cannot be deliv
   it("parsing stays in fix-apply: baseBlobSha and the canary are read there, a malformed baseBlobSha fails the parse", () => {
     const ok = parseFixResponse(good());
     assert.ok(ok.ok);
-    assert.deepEqual(ok.fix.files, [{ path: A, baseBlobSha: HEAD_BLOBS.get(A), content: NEW_A }]);
+    assert.deepEqual(ok.fix.edits, [EDIT_A]);
     assert.deepEqual(ok.fix.canary, canary());
-    const bad = parseFixResponse(good({ files: [{ path: A, baseBlobSha: "not-a-sha", content: NEW_A }] }));
+    const bad = parseFixResponse(good({ edits: [{ ...EDIT_A, baseBlobSha: "not-a-sha" }] }));
     assert.ok(!bad.ok && /baseBlobSha/.test(bad.error));
   });
 });
@@ -180,7 +184,7 @@ describe("fixSource=github: server validation before the commit (runFixRound, ap
     const git = gitApi();
     const res = await runFixRound(
       { requestFix: (p) => requestChatFix(chat(), REF, "chatgpt", p, { loadBridge: b.loadBridge, github: source() }), api: git.api, validate: async () => ({ ok: true }) },
-      { prompt: HUGE, mode: "apply", branch: "feature", baseCommitSha: HEAD, message: "fix", allowedPaths: [A, B], findingCount: 1 },
+      { prompt: HUGE, mode: "apply", branch: "feature", baseCommitSha: HEAD, message: "fix", allowedPaths: [A, B, NEW_PATH], baseFiles: new Map(Object.entries(HEAD_FILES)), findingCount: 1 },
     );
     return { res, git };
   };
@@ -195,21 +199,21 @@ describe("fixSource=github: server validation before the commit (runFixRound, ap
   });
 
   it("a baseBlobSha that is not the head blob is stale content: rejected, nothing committed", async () => {
-    const { res, git } = await round(good({ files: [{ path: A, baseBlobSha: blobSha("export const a = 0;\n"), content: NEW_A }] }));
+    const { res, git } = await round(good({ edits: [{ ...EDIT_A, baseBlobSha: blobSha("export const a = 0;\n") }] }));
     assert.equal(res.outcome, "request-failed");
     assert.match(res.error ?? "", /stale content for "src\/a\.ts"/);
     assert.deepEqual([git.blobs.size, git.trees.length, git.refUpdates.length], [0, 0, 0]);
   });
 
   it("a missing baseBlobSha is rejected, nothing committed", async () => {
-    const { res, git } = await round(good({ files: [{ path: A, content: NEW_A }] }));
+    const { res, git } = await round(good({ edits: [{ path: A, search: EDIT_A.search, replace: EDIT_A.replace }] }));
     assert.equal(res.outcome, "request-failed");
     assert.match(res.error ?? "", /has no baseBlobSha/);
     assert.equal(git.refUpdates.length, 0);
   });
 
   it("a path outside the editable list is rejected, nothing committed", async () => {
-    const { res, git } = await round(good({ files: [{ path: "src/other.ts", baseBlobSha: "1".repeat(40), content: "x\n" }] }));
+    const { res, git } = await round(good({ edits: [{ ...EDIT_A, path: "src/other.ts", baseBlobSha: "1".repeat(40) }] }));
     assert.equal(res.outcome, "request-failed");
     assert.match(res.error ?? "", /out-of-scope paths rejected: "src\/other\.ts"/);
     assert.deepEqual([git.blobs.size, git.refUpdates.length], [0, 0]);
@@ -220,5 +224,23 @@ describe("fixSource=github: server validation before the commit (runFixRound, ap
     assert.equal(res.outcome, "request-failed");
     assert.match(res.error ?? "", /^connector_unavailable: /);
     assert.equal(git.refUpdates.length, 0);
+  });
+
+  it("a search that is not in the head blob is rejected (validation-failed, retryable), nothing committed", async () => {
+    const { res, git } = await round(good({ edits: [{ ...EDIT_A, search: "export const a = 0;" }] }));
+    assert.equal(res.outcome, "validation-failed");
+    assert.match(res.error ?? "", /"search" not found in the current file/);
+    assert.deepEqual([git.blobs.size, git.refUpdates.length], [0, 0]);
+  });
+
+  it("a new file needs no baseBlobSha and commits; a newFiles entry for an existing file is rejected", async () => {
+    const created = "export const c = 1;\n";
+    const { res, git } = await round(good({ edits: [EDIT_A], newFiles: [{ path: NEW_PATH, content: created }] }));
+    assert.equal(res.outcome, "applied");
+    assert.deepEqual(git.trees[0].entries, [{ path: A, sha: blobSha(NEW_A) }, { path: NEW_PATH, sha: blobSha(created) }]);
+    const whole = await round(good({ edits: [], newFiles: [{ path: A, content: NEW_A }] }));
+    assert.equal(whole.res.outcome, "request-failed");
+    assert.match(whole.res.error ?? "", /"src\/a\.ts" exists at that commit; change it with edits/);
+    assert.equal(whole.git.refUpdates.length, 0);
   });
 });

@@ -944,7 +944,7 @@ test(`real DOM: a fix prompt whose inlined source holds ${name} reaches the comp
  const journal=JSON.parse(await page.evaluate(()=>window.__saved.get('ashlar:submission:fix-A:run-A')));
  assert.deepEqual([journal.phase,journal.conversation,journal.attachments],['sent',TEMP_URL,[]]);
  // the answer completes and is read by the fix collector, then parsed by the server's fix parser
- const code='{"summary":"guarded","files":[{"path":"src/a.ts","content":"export const a = 1;\\n"}],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
+ const code='{"summary":"guarded","edits":[{"path":"src/a.ts","search":"export const a = 0;","replace":"export const a = 1;"}],"newFiles":[],"dispositions":[{"finding":"F1","action":"fixed","note":"guarded"}]}';
  await page.evaluate(({code,toolbar})=>{
   document.querySelector('[data-testid="stop-button"]').remove();
   document.querySelector('main').insertAdjacentHTML('beforeend',`<section data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"><pre><code>${code}</code></pre></div></div>${toolbar}</section>`);

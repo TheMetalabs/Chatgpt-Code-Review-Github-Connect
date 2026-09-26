@@ -40,11 +40,21 @@ function lastReviewJson(text) {
   return null;
 }
 
+/** ChatGPT's citation marker (live aicc #457 job-muir6f31-729): the model wrote
+ * `:chatgpt-content-reference{index="0"}` inside a review JSON string and its bare quotes broke the
+ * JSON (src/lib/extract-chat-json.ts CHAT_CITATION_MARKER). A function: content scripts are re-injected. */
+function chatCitationMarker() {
+  return /[ \t]*:chatgpt-content-reference\{[^{}\n]*\}/g;
+}
+
 function extractChatJson(text) {
   const s = String(text || "");
   if (!s.trim()) return null;
-  // The last complete object wins, not an older fenced example.
-  return lastReviewJson(s);
+  // The last complete object wins, not an older fenced example. Only a text that yields nothing as
+  // written is read again without the chat's citation markers.
+  const plain = lastReviewJson(s);
+  if (plain || s.search(chatCitationMarker()) < 0) return plain;
+  return lastReviewJson(s.replace(chatCitationMarker(), ""));
 }
 
 /** Whether `node` itself is hidden from the reader: the ONE visibility rule every harvest shares

@@ -57,11 +57,25 @@ export function lastReviewJson(text: string): string | null {
   return lastJsonObject(text, isReviewObject);
 }
 
+/** ChatGPT's citation marker (live aicc #455/#457): the model writes
+ * `:chatgpt-content-reference{index="0"}` inside a JSON string, and its bare quotes break the JSON.
+ * It cites an attachment and is never part of a review or a fix. */
+export const CHAT_CITATION_MARKER = /[ \t]*:chatgpt-content-reference\{[^{}\n]*\}/g;
+
+/** `text` without the chat's citation markers, or null when it has none. */
+export function withoutCitationMarkers(text: string): string | null {
+  return text.search(CHAT_CITATION_MARKER) >= 0 ? text.replace(CHAT_CITATION_MARKER, "") : null;
+}
+
 export function extractChatJson(text: string): string | null {
   const s = String(text || "");
   if (!s.trim()) return null;
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
-  return lastReviewJson(s);
+  // Only a transcript that yields nothing as written is read again without citation markers.
+  const plain = lastReviewJson(s);
+  if (plain) return plain;
+  const cleaned = withoutCitationMarkers(s);
+  return cleaned ? lastReviewJson(cleaned) : null;
 }
 
 /**

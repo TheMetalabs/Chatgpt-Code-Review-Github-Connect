@@ -97,13 +97,13 @@ function assistantCodeBlocks(root = currentAssistantRoot(), stats) {
   const blocks = [];
   let collapsed = false;
   for (const turn of turns) {
-    for (const pre of turn.querySelectorAll("pre")) {
+    for (const pre of codeBlockEls(turn)) {
       if (!renderedIn(pre, turn)) continue; // a hidden/stale block the renderer kept is not the answer
       // Only a code element that is itself visible is the answer (a renderer can keep a stale,
       // hidden <code> beside the live one); a block whose code is all hidden yields nothing. Its
       // text is read with the same visibility rule as a review's corpus (visibleText).
       const codes = [...pre.querySelectorAll("code")];
-      const visible = codes.length ? codes.filter(code => renderedIn(code, turn) && !codes.some(outer => outer !== code && outer.contains(code))) : [pre];
+      const visible = codes.length ? codes.filter(code => renderedIn(code, turn) && !codes.some(outer => outer !== code && outer.contains(code))) : pre.tagName === "PRE" ? [pre] : [];
       // A collapsed block (live aicc #455: a long fix answer never parsed) shows only part of its
       // code; its visible code element's full text is the answer then, hidden tail included.
       const folded = codeBlockCollapsed(pre, turn);
@@ -116,6 +116,12 @@ function assistantCodeBlocks(root = currentAssistantRoot(), stats) {
   }
   if (stats) Object.assign(stats, {blocks: blocks.length, totalChars: blocks.reduce((n, b) => n + b.length, 0), collapsed});
   return blocks;
+}
+
+/** A turn's code blocks in order: every <pre>, and every code-block container that has none (live
+ * aicc #455: ChatGPT renders a fenced block as the copy container around a block <code>, no <pre>). */
+function codeBlockEls(turn) {
+  return [...turn.querySelectorAll("pre, [data-markdown-copy='code-block']")].filter(el => el.tagName === "PRE" || !el.querySelector("pre"));
 }
 
 /** All the code text in `el`, hidden parts included (a collapsed block hides its tail), with the
@@ -170,7 +176,7 @@ function expandCollapsedCodeBlocks(root) {
   const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
   let count = 0;
   for (const turn of turns) {
-    for (const pre of turn.querySelectorAll("pre")) {
+    for (const pre of codeBlockEls(turn)) {
       for (const control of codeBlockExpanders(pre, turn)) {
         if (clicked.has(control)) continue;
         clicked.add(control);
@@ -250,7 +256,7 @@ function fixAnswerShape(root) {
       if (/다운로드|download/i.test(`${b.textContent || ""} ${b.getAttribute("aria-label") || ""}`)) shape.fileLinks += 1;
     }
     shape.canvas ||= Boolean(turn.querySelector("[id^='textdoc'], [data-testid*='canvas'], [data-testid*='textdoc']"));
-    shape.formatted += [...turn.querySelectorAll("em, strong, del, s, a, code")].filter(el => !el.closest("pre")).length;
+    shape.formatted += [...turn.querySelectorAll("em, strong, del, s, a, code")].filter(el => !el.closest("pre, [data-markdown-copy='code-block']")).length;
   }
   return shape;
 }

@@ -989,6 +989,29 @@ test('real DOM, 2026-09 code block: prose around one fenced fix block harvests t
  assert.equal(parsedFix(raw).summary,'guard the refund path');
 });
 
+// Live aicc #455 (job-muiityw0-57, extension 1.1.50): ChatGPT rendered a fenced ```json block as
+// the copy container with a block <code> and NO <pre>; the harvest found 0 blocks and delivered the
+// answer as rewritten Markdown (unfenced_rewritten) twice. Captured shape (fixAnswerHtml), trimmed.
+const preLessBlock=code=>`<div><div data-markdown-copy="code-block"><div data-markdown-copy="exclude"><div>JSON</div><span><button aria-label="자동 줄 바꿈 사용"></button></span><span><button aria-label="복사"></button></span></div><div dir="ltr"><code class="whitespace-pre! block text-size-code"><span>${code.replace(/</g,'&lt;')}</span></code></div></div></div>`;
+test('real DOM (#455): a code block rendered without <pre> is a fenced block, read literally',async t=>{
+ const literal='{"summary":"s","edits":[{"path":"a.py","search":"x = 1","replace":"print(\\"a\\\\nb\\") # *x* __init__"}]}';
+ const page=await fixPage(t,`${preLessBlock(literal)}<div><span><button aria-label="분석 보기"></button></span></div>`);
+ await withProbes(page);
+ assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),[literal]);
+ assert.equal(await page.evaluate(()=>fixAnswerShape(assistantTurnEls(document)[0]).formatted),0,'code in a code block is not rendered Markdown');
+ await page.clock.runFor(3200);
+ const {raw}=await page.evaluate(()=>window.fixOut);
+ assert.equal(raw,literal);
+ await page.evaluate(()=>globalThis.__ashlarFixHarvestProbeWrites);
+ const [probe]=await page.evaluate(()=>window.__local.get('fixHarvestProbes'));
+ assert.deepEqual([probe.blocks,probe.unfenced],[1,false]);
+});
+
+test('real DOM: a <pre> block and a pre-less block in one answer are both read, in order, never twice',async t=>{
+ const page=await fixture(t,user+answer(`<pre><code>{"a":1</code></pre>${preLessBlock(',"b":2}')}<div data-markdown-copy="code-block"><pre><code>{"c":3}</code></pre></div>`,true));
+ assert.deepEqual(await page.evaluate(()=>assistantCodeBlocks()),['{"a":1',',"b":2}','{"c":3}']);
+});
+
 test('real DOM: a hidden or stale code block the renderer kept is never part of a fix answer',async t=>{
  const visible='{"summary":"new","files":[]}';
  const page=await fixture(t,user+answer(`<pre hidden><code>{"summary":"stale-hidden"}</code></pre><div style="display:none"><pre><code>{"summary":"stale-none"}</code></pre></div><pre style="opacity:0"><code>{"summary":"stale-transparent"}</code></pre><pre><code>${visible}</code></pre>`,true));

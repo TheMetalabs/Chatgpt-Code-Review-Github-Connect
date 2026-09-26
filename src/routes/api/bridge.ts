@@ -97,6 +97,7 @@ export const Route = createFileRoute("/api/bridge")({
           attachmentProtocol?: number;
           fixProtocol?: number;
           repairProtocol?: number;
+          salvaged?: boolean;
           captureProtocol?: number;
           captureId?: string; repairId?: string; responseId?: string; sourceHash?: string;
           source?: {captureId?: unknown; text?: unknown; totalChars?: unknown; truncated?: unknown; responseId?: unknown; completed?: unknown; stable?: unknown};
@@ -220,7 +221,10 @@ export const Route = createFileRoute("/api/bridge")({
             if (!out.ok) return Response.json(out, { status: out.code === "lease_conflict" ? 409 : 400, headers });
             return Response.json({ ok: true }, { headers });
           }
-          if (body.repairProtocol === 1) {
+          // A salvaged leg (extension settleStalledJob: its repair ended needs_attention/interrupted/
+          // disabled/superseded) is the verbatim original as raw_review: no repair will ever run for it,
+          // so demanding one is a livelock (live aicc #457: 422 every 2.5 s for 3 h, never stale).
+          if (body.repairProtocol === 1 && body.salvaged !== true) {
             const errors = bridgeFormatErrors(body.jobId, String(body.raw ?? ""), legs, body.leaseId, body.captureProtocol === 1);
             if (errors.length) return Response.json({ok:false,code:"json_repair_required",error:"completed response requires format repair",errors},{status:422,headers});
           }

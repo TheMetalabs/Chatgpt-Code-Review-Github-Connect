@@ -464,11 +464,10 @@ test('clearStuckJobs({includeStalled}) salvages a durable-source leg whose repai
     tabs: new Map(), // tab gone
     handler: () => ({ ok: false, code: 'job_mismatch' }),
     api: async (_p, body) => {
-      // Mirror the bridge route: a repairProtocol:1 complete whose raw is not valid review JSON is 422'd.
-      if (body?.action === 'complete' && body.repairProtocol === 1) {
-        let valid = false;
-        try { const p = JSON.parse(String(body.raw ?? '')); valid = p && Array.isArray(p.findings); } catch { /* invalid */ }
-        if (!valid) { const e = new Error('completed response requires format repair'); e.status = 422; e.code = 'json_repair_required'; throw e; }
+      // Mirror the bridge route: the strict review schema has no raw_review field (live aicc #457), so
+      // a repairProtocol:1 complete is 422'd unless it is marked salvaged.
+      if (body?.action === 'complete' && body.repairProtocol === 1 && body.salvaged !== true) {
+        const e = new Error('completed response requires format repair'); e.status = 422; e.code = 'json_repair_required'; throw e;
       }
       return { ok: true };
     },
@@ -478,7 +477,30 @@ test('clearStuckJobs({includeStalled}) salvages a durable-source leg whose repai
   assert.equal(res.cleared, 1, 'the terminally-failed-repair leg is salvaged (canonicalized) and retired — not looping on 422');
   const complete = b.calls.find((c) => c.action === 'complete' && c.jobId === 'A');
   assert.ok(complete && JSON.parse(complete.raw).raw_review.includes('prose, not JSON'), 'the original is delivered inside a valid raw_review envelope');
+  assert.equal(complete.salvaged, true, 'marked salvaged: the route posts it instead of demanding a repair');
   assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
+});
+
+test('a salvaged leg a server still sends back for repair ends as a failure, never loops (#457)', async () => {
+  // Live aicc #457: 422 on every salvaged delivery for 3 h; the worker's own events kept the job fresh,
+  // so the stall sweep never came back to it.
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.sourceCapture = { archiveDurable: true, text: 'prose, not JSON', totalChars: 15, sourceHash: 'h', responseId: 'r', id: 'cap' };
+  job.states.chatgpt.repairAttempt = { id: 'ra', status: 'needs_attention', sourceHash: 'h', responseId: 'r' };
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token', pendingReviewJobs: { A: job } }),
+    tabs: new Map(),
+    handler: () => ({ ok: false, code: 'job_mismatch' }),
+    api: async (_p, body) => {
+      if (body?.action === 'complete') { const e = new Error('completed response requires format repair'); e.status = 422; e.code = 'json_repair_required'; throw e; }
+      return { ok: true };
+    },
+  });
+  await b.context.clearStuckJobs({ includeStalled: true });
+  const failure = b.calls.find((c) => c.action === 'failure' && c.jobId === 'A');
+  assert.ok(failure, 'the leg is delivered as a failure');
+  assert.match(failure.error, /^json_invalid: /);
+  assert.equal(b.calls.filter((c) => c.action === 'complete').length, 1, 'the envelope is sent once, not in a loop');
 });
 
 test('clearStuckJobs({includeStalled}) leaves a durable-source leg with an ACTIVE repair alone', async () => {

@@ -277,3 +277,18 @@ test('HTTP: a review whose inline anchors GitHub refused is recorded without the
  const stored=app.harbor.getHarbor().reviews[0];
  assert.equal(stored.githubId,2);assert.equal(stored.comments.length,0,'GitHub created no inline comment');assert.ok(stored.body);
 });
+
+// Live aicc #457 (job-muir6f31-729): the local repair ended needs_attention, the extension salvaged the
+// archived original into a raw_review envelope, and the server demanded a repair of that envelope
+// (raw_review is not a review field) with 422 every 2.5 s for 3 h. A salvaged leg is posted.
+test('HTTP: a salvaged leg (its repair is over) is posted, never sent back for a repair',async t=>{
+ const {app,binding}=await setup(t);
+ const envelope=JSON.stringify({findings:[],merge_recommendation:'COMMENT',raw_review:'prose, not JSON'});
+ const complete=salvaged=>post(app,{action:'complete',repairProtocol:1,captureProtocol:1,...(salvaged===undefined?{}:{salvaged}),jobId:binding.jobId,leaseId:binding.leaseId,raw:envelope,results:[{provider:'chatgpt',raw:envelope,originalText:'prose, not JSON'}]});
+ const refused=await complete(undefined);
+ assert.deepEqual([refused.http,refused.code],[422,'json_repair_required'],'an unmarked envelope is still gated');
+ assert.equal((await complete(false)).http,422);
+ const out=await complete(true);assert.equal(out.http,200,JSON.stringify(out));
+ await eventually(()=>app.reviews.length===1,'salvaged review not posted');
+ assert.match(app.reviews[0].body,/prose, not JSON/);
+});

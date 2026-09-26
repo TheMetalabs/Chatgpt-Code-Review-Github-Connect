@@ -485,6 +485,6 @@ export function step60(amount) {
 export function totalFees(n) {
   let sum = 0;
   // WHY: tiers are 1-based to match the invoice line numbers.
-  for (let i = 1; i < n; i++) sum += i;
+  for (let i = 1; i <= n; i++) sum += i;
   return sum;
 }

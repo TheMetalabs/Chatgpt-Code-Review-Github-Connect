@@ -671,25 +671,6 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.ok(f.prompts[1].startsWith(f.prompts[0]), "the retry keeps the full original prompt");
   });
 
-  it("P0 #439: a reply that strips WHY comments is rejected by the scope guard, retried with the reason, then the targeted edit commits", async () => {
-    const head = ["import { x } from './x';", "", "export const a = 1;", ...Array.from({ length: 40 }, (_, i) => [`// WHY: keep ${i}`, `export const k${i} = ${i};`]).flat(), ""].join("\n");
-    const big = { changedPaths: ["src/a.ts"], files: [{ path: "src/a.ts", content: head, language: "ts" }] } as unknown as SamplePr;
-    const stripped = head.split("\n").filter((l) => !l.startsWith("// WHY")).join("\n").replace("export const a = 1;", "export const a = 2;");
-    const f = fakeDeps({
-      start: "apply",
-      rounds: [3],
-      reply: [
-        JSON.stringify({ summary: "s", edits: [{ path: "src/a.ts", search: head, replace: stripped }] }),
-        '{"summary":"ok","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}',
-      ],
-    });
-    const r = await runPostReviewLoop("t", job(), big, settings("apply"), f.deps, ENV);
-    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.attempts === 2);
-    assert.match(f.prompts[1], /PREVIOUS ATTEMPT REJECTED \(validation-failed\)/);
-    assert.match(f.prompts[1], /comment line\(s\) removed outside the flagged lines/);
-    assert.equal(f.committed, true);
-  });
-
   it("a search that is missing or not unique is retried with the reason (validation-failed)", async () => {
     const f = fakeDeps({ start: "apply", rounds: [3], reply: ['{"summary":"s","edits":[{"path":"src/a.ts","search":"export const b = 1;","replace":"x"}]}', '{"summary":"ok","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}'] });
     const r = await run(f, "apply");

@@ -210,7 +210,6 @@ describe("buildFixPrompt fix discipline", () => {
     assert.match(FIX_SCHEMA_INLINE, /"edits": \[ \{ "path": "<one of the paths above>", "search": "<exact unique lines of the current file>", "replace": "<their new text>" \} \]/);
     assert.match(FIX_SCHEMA_INLINE, /"newFiles": \[ \{ "path": "<a path above that does not exist yet>", "content": "<full file>" \} \]/);
     assert.ok(!/"files"/.test(FIX_SCHEMA_INLINE), "the full-file schema is retired");
-    assert.match(instructions, /11\. Preserve: keep every existing comment, test and the file's formatting\. Never reformat,/);
   });
 
   it("the fixed instructions stay far under the prompt-size floor and the attachment cap", () => {

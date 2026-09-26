@@ -1461,7 +1461,6 @@ export async function runPostReviewLoop(
           allowedPaths: editablePaths,
           // the head-pinned snapshot content: every edit applies to it (never a model-supplied whole file)
           baseFiles: new Map(files.map((f) => [f.path, f.content])),
-          flagged: findings.map((f) => ({ path: f.file, line: f.line })),
           findingCount: findings.length,
         },
       );

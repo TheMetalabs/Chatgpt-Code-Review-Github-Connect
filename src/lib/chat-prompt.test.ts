@@ -19,7 +19,13 @@ import {
 describe("REVIEW_INSTRUCTIONS recall guidance", () => {
   it("does not let an uncleared helper suppress a finding", () => {
     assert.match(REVIEW_INSTRUCTIONS, /never justifies withholding a finding/);
+    assert.match(REVIEW_INSTRUCTIONS, /never justifies withholding a finding whose defect is in the diff or snapshot/);
     assert.match(REVIEW_INSTRUCTIONS, /name the unverified helper\/dependency in evidence/);
+    assert.doesNotMatch(REVIEW_INSTRUCTIONS, /Under-report nothing/, "recall no longer overrides the premise check");
+  });
+  it("binds the premise check: a defect in code not shown is verified or goes to assumptions, never P0/P1 (aicc #455)", () => {
+    assert.match(REVIEW_INSTRUCTIONS, /A finding whose defect depends on code NOT in the diff or snapshot .* is a premise you must verify by reading that code — with a tool or connector if this review mode provides one\./);
+    assert.match(REVIEW_INSTRUCTIONS, /If you cannot read it, list it in assumptions, not findings, and never as P0\/P1/);
   });
   it("keeps a far-from-hunk finding reportable instead of anchor-only", () => {
     assert.match(REVIEW_INSTRUCTIONS, /still report it: set line to the nearest changed line/);

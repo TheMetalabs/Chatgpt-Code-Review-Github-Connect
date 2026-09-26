@@ -204,6 +204,8 @@ describe("buildFixPrompt fix discipline", () => {
     ["triage by content [A1][C2]", /1\. Classify each finding by CONTENT, ignoring its P-tag: Fix \/ Push-back \(rebut with evidence\) \/ Decline \(reason \+ trace\) \/ Defer \(issue# \+ code marker\)/],
     ["correctness class fixed whatever the tag [C2]", /Correctness-class .* must be fixed whatever the tag; behavior-class .* is fixed unless provably intended; mechanical\/cosmetic .* folded in alongside/],
     ["verify the premise [A1][C3]", /2\. Verify the premise .* Do NOT 'fix' a false positive — you would plant a real bug to satisfy a fake one/],
+    ["unverifiable premise → pushback or defer [A1][C3]", /If the premise is false, or cannot be verified from the current content, Push back \(with evidence\) or Defer — never change behavior to satisfy it/],
+    ["no behavior beyond the finding, no weakened assertion (aicc #455)", /Change no behavior beyond the finding, and never delete or weaken an existing test assertion/],
     ["stale finding not re-fixed [C Pitfalls]", /already resolved in the current content is answered with the file:line that resolves it, not re-fixed/],
     ["whole-class re-audit + census [A2][C3b]", /3\. \(Highest yield\) Re-audit the whole flagged file \+ sibling files and fix the entire defect class .* call-site census of every entry point a guard protects/],
     ["narrow fix = one more round [A2]", /a narrow line fix = exactly one more round/],

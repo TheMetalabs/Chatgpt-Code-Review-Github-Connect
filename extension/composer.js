@@ -654,12 +654,22 @@ function composerControlSelector() {
  * a data-file-name tile is a chip whatever element renders it. The barrier and the verdict both read
  * this list, so neither takes a control's tooltip for a file (Ashlar, review of 5af999fd). */
 function fileChips(form) {
-  return [...form.querySelectorAll(fileChipSelector())]
+  const named = [...form.querySelectorAll(fileChipSelector())]
     .filter(chip => chip.matches('[role="group"][aria-label], [data-file-name]') || !chip.matches(composerControlSelector()));
+  // The new home composer (live #93, 1.1.39 probe) renders a staged file as a card whose file name is
+  // plain leaf text (span>span>span>span), with no aria-label, title or data attribute to select.
+  const textual = [...form.querySelectorAll("span, div")].filter(el => el.children.length === 0 &&
+    !el.closest('[contenteditable="true"], textarea, [aria-hidden="true"]') &&
+    // One token with an extension, or an ellipsis-truncated one (local: this file is re-injected).
+    /^[^\s/\\]{1,120}(?:\.[A-Za-z0-9]{1,8}|…[^\s]{0,12})$/.test((el.textContent || "").trim()));
+  return [...new Set([...named, ...textual])];
 }
+
 /** Every name a file chip gives its file, in its shapes' order (data-file-name, aria-label, title). */
 function fileChipNames(chip) {
-  return ["data-file-name", "aria-label", "title"].map(name => chip.getAttribute(name)).filter(name => name !== null);
+  const names = ["data-file-name", "aria-label", "title"].map(name => chip.getAttribute(name)).filter(name => name !== null);
+  if (!names.length && chip.children.length === 0) names.push((chip.textContent || "").trim());
+  return names;
 }
 
 /** A staged file's chip is still uploading while it (or anything in it) shows progress: a spinner, a

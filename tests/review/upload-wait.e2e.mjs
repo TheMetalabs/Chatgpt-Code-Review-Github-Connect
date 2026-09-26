@@ -37,6 +37,9 @@ const RENDER={
  // ChatGPT's own renderings: a changed case, a middle-truncated name, the name with its type apart.
  real:name=>({'ashlar-diff.patch':card('Ashlar-Diff.patch','File'),'ashlar-snapshot.md':card('ashlar-snaps…md','Document'),
   'ashlar-policy.md':card('ashlar-policy','Markdown')})[name],
+ // Live 1.1.39 probe (#93): the new home composer's card shows the name as bare leaf text in nested
+ // spans, with no title, aria-label or data attribute, plus a remove button.
+ leaf:name=>`<div style="display:flex;width:180px;height:40px"><div><span><span><span><span>${name}</span></span></span></span></div><div><span><span><button type="button" aria-label="파일 제거" style="width:10px;height:10px">x</button></span></span></div></div>`,
  stuck:name=>name==='ashlar-snapshot.md'?card(name,'File','<svg class="animate-spin" role="progressbar" style="width:16px;height:16px"><circle r="4"></circle></svg>'):card(name,'File'),
 };
 
@@ -222,4 +225,15 @@ test('uploadWaitHtmlOff:true records no snapshot; snapshots keep the last 3',asy
  const tab=await chatTab(t,{render:'stuck',local:{uploadWaitHtml:old}});
  await tab.start();await tab.page.clock.runFor(3*MIN+15_000);
  assert.deepEqual((await tab.local('uploadWaitHtml')).map(s=>s.run),['r1','r2','run-A']);
+});
+
+test('live 1.1.39 card shape: a staged file whose name is bare leaf text is its chip, staged once, and Send is clicked',async t=>{
+ const tab=await chatTab(t,{home:true,render:'leaf'});
+ await tab.start();
+ await tab.page.clock.runFor(10_000);
+ const steps=await tab.steps();
+ assert.ok(steps.includes('attachments_staged_via_a'),`staged by the input: ${JSON.stringify(steps)}`);
+ assert.ok(steps.includes('prompt_submitted'),`sent: ${JSON.stringify(steps)} ${JSON.stringify(await tab.runner())}`);
+ assert.deepEqual(await tab.view(),{sendClicks:1,sent:PROMPT});
+ assert.ok(!steps.some(s=>/^attachments_staged_via_[bcd]$/.test(s)),'no second strategy once the leaf-text chips showed');
 });

@@ -480,9 +480,18 @@ export function step60(amount) {
   return amount + 60;
 }
 
+const MIN_TIER = 1;
+const MAX_TIER = 60;
+
+// WHY: every ledger operation must address one of the integer tiers defined by step1..step60.
+function isSupportedTier(i) {
+  return Number.isInteger(i) && i >= MIN_TIER && i <= MAX_TIER;
+}
+
 // WHY: the total must include every tier exactly once; the reconciliation job compares it.
-/** Sum of fees for tiers 1..n (n >= 1). */
+/** Sum of fees for tiers 1..n; unsupported tier counts return 0. */
 export function totalFees(n) {
+  if (!isSupportedTier(n)) return 0;
   let sum = 0;
   // WHY: tiers are 1-based to match the invoice line numbers.
   for (let i = 1; i <= n; i++) sum += i;
@@ -490,8 +499,7 @@ export function totalFees(n) {
 }
 
 // WHY: refunds use the same tier table so a partial refund mirrors the original charge.
-/** Refund for tier `i`: the fee added by step{i}. */
+/** Refund for tier `i`: the fee added by step{i}; unsupported tiers return 0. */
 export function refundFee(i) {
-  // WHY: integer won only; a non-positive tier is a caller bug and must not refund.
-  return i > 0 ? i : 0;
+  return isSupportedTier(i) ? i : 0;
 }

@@ -16,7 +16,7 @@ before(async()=>{browser=await chromium.launch({headless:true,executablePath:pro
 after(async()=>{await browser?.close();});
 
 const MIN=60_000;
-const MANIFEST=['composer.js','quota.js','overlay.js','model.js','json.js','content-chatgpt.js'];
+const MANIFEST=['turns.js','composer.js','quota.js','overlay.js','model.js','json.js','content-chatgpt.js'];
 const URL_='https://chatgpt.com/?temporary-chat=true';
 const PROMPT='Review fixture PR #1 at abc123. Return the review JSON.';
 const FILES=['ashlar-diff.patch','ashlar-snapshot.md','ashlar-policy.md'];

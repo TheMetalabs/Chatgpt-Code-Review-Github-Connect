@@ -14,7 +14,7 @@ async function fixture(t,{disabled=false,hidden=false}={}) {
  // DOM fixture only. Browser navigation is policy-blocked locally; no policy changes.
  await page.evaluate(()=>{const saved=new Map();Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});});
  await page.evaluate(()=>{window.clicks=0;document.querySelector('form').addEventListener('submit',e=>e.preventDefault());document.querySelector('#composer-submit-button').addEventListener('click',()=>window.clicks++);window.chrome={runtime:{onMessage:{addListener(){}}}};window.__ashlarRunnerState={jobId:'A',runId:'run-A',provider:'chatgpt',running:true};});
- await page.addScriptTag({content:src('extension/composer.js')});return page;
+ await page.addScriptTag({content:src('extension/turns.js')});await page.addScriptTag({content:src('extension/composer.js')});return page;
 }
 async function start(page) {await page.evaluate(()=>{window.result={pending:true};clickSend(()=>document.querySelector('#composer-submit-button'),()=>document.querySelector('textarea'),'owned review prompt').then(()=>window.result={submitted:true},e=>window.result={error:e.message});});}
 async function acknowledge(page,text='owned review prompt') {await page.evaluate(text=>{const el=document.createElement('div');el.dataset.messageAuthorRole='user';el.textContent=text;document.querySelector('#turns').append(el);document.querySelector('textarea').value='';},text);}

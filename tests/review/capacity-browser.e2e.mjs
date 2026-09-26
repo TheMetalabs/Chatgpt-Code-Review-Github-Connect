@@ -19,7 +19,7 @@ async function makePage(t,jobId,{text=invalid,runId='run-A',start=true}={}){
   window.chrome={runtime:{onMessage:{addListener:fn=>window.receiver=fn,removeListener(){}}}};document.querySelector('.markdown').textContent=text;
   window.clicks=0;document.querySelector('form').onsubmit=ev=>{ev.preventDefault();window.clicks++;};
  },{jobId,runId,text});
- for(const name of ['composer','quota','model','json','content-chatgpt'])await page.addScriptTag({content:source(`extension/${name}.js`)});
+ for(const name of ['turns','composer','quota','model','json','content-chatgpt'])await page.addScriptTag({content:source(`extension/${name}.js`)});
  await page.evaluate(({jobId,runId})=>{window.message=(type,extra={})=>new Promise(resolve=>{const wait=receiver({type,jobId,runId,provider:'chatgpt',...extra},null,resolve);if(wait!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));});},{jobId,runId});
  if(start)await page.evaluate(()=>message('ashlar-run',{resume:true,prompt:'owned prompt'}));await page.clock.runFor(2400);
  return page;

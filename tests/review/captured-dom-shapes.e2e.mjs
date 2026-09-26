@@ -16,7 +16,7 @@ async function pageFor(t,html=''){
   window.chrome={runtime:{onMessage:{addListener(){},removeListener(){}}}};
   window.clicks=0;document.querySelector('form').onsubmit=e=>e.preventDefault();document.querySelector('#composer-submit-button').onclick=()=>window.clicks++;
  });
- for(const file of ['composer.js','quota.js','model.js','json.js'])await page.addScriptTag({content:source('extension/'+file)});
+ for(const file of ['turns.js','composer.js','quota.js','model.js','json.js'])await page.addScriptTag({content:source('extension/'+file)});
  await page.evaluate(()=>{window.composer=()=>document.querySelector('#prompt-textarea');});return page;
 }
 const user='<section data-testid="conversation-turn-1" data-turn="user"><div data-message-author-role="user" data-message-id="user-A"><div data-testid="collapsible-user-message-content"><div class="rich-text-user-turn markdown"><p>Review fixture.<br>Head: abc123</p><p>Only inspect changed files.</p></div></div></div><button data-testid="copy-turn-action-button" aria-label="메시지 복사">user copy</button></section>';

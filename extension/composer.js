@@ -11,7 +11,7 @@ function waitForPageChange(ms = 800) {
     const finish = () => { observer.disconnect(); clearTimeout(timer); document.removeEventListener("visibilitychange", finish); resolve(); };
     const observer = new MutationObserver(finish);
     observer.observe(document.documentElement, {subtree: true, childList: true, characterData: true,
-      attributes: true, attributeFilter: ["data-message-id", "disabled", "aria-disabled", "aria-busy", "data-state", "data-streaming-response-status", "style", "class"]});
+      attributes: true, attributeFilter: ["data-message-id", "data-chatgpt-search-message-ids", "disabled", "aria-disabled", "aria-busy", "data-state", "data-streaming-response-status", "style", "class"]});
     document.addEventListener("visibilitychange", finish, {once: true});
     timer = setTimeout(finish, ms);
   });
@@ -554,7 +554,7 @@ async function fillComposer(el, text) {
  * Read the message body, not attachment chips, copy controls or hidden UI. `skip`: elements left
  * out too (a sent fix turn's file cards, turnAttachments). */
 function messagePromptText(turn, skip) {
-  const root = turn?.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
+  const root = turnTextRoot(turn);
   const walk = node => {
     if (node.nodeType === 3) return node.nodeValue || "";
     if (node.nodeType !== 1 || skip?.has(node)) return "";
@@ -569,6 +569,7 @@ function messagePromptText(turn, skip) {
 /** Where a sent user turn renders: its conversation-turn section or article (ChatGPT can render a
  * file card beside the message node, not inside it), else the message node itself. */
 function turnContainer(turn) {
+  if (unitTurn(turn)) return unitWrapper(turn) || turn;
   return turn?.closest?.('[data-testid^="conversation-turn"], [data-turn="user"], article') || turn;
 }
 
@@ -609,8 +610,10 @@ function turnAttachments(turn, names = []) {
  * ways as json.js fixTurnExact does) once its file cards are left out. */
 function fixTurnHolds(turn, exact, names = []) {
   const {cards} = turnAttachments(turn, names);
-  const body = turn.querySelector?.('[data-testid="collapsible-user-message-content"]') || turn;
-  return [messagePromptText(turn, cards), losslessText(body, cards)].some(text => fixPromptForm(text) === exact);
+  const body = turnTextRoot(turn);
+  // The unit DOM's bubble holds its own controls (a "Show more" button): not the prompt.
+  const skip = body?.matches?.("[data-user-message-bubble]") ? new Set([...cards, ...body.querySelectorAll("button")]) : cards;
+  return [messagePromptText(turn, cards), losslessText(body, skip)].some(text => fixPromptForm(text) === exact);
 }
 
 /** A fix's send is proven by a user turn after the baseline that shows each of its attachments
@@ -896,7 +899,7 @@ function retrySubmissionPersistence() {
 }
 
 function userTurns() {
-  return [...document.querySelectorAll('[data-message-author-role="user"]')];
+  return userTurnEls();
 }
 
 function step(stage) {
@@ -987,7 +990,7 @@ function submissionConfirmed(record) {
   if (!record.expected || !match) return false;
   record.phase = "sent";
   record.submittedUsers = turns.indexOf(match) + 1;
-  record.messageId = match.getAttribute("data-message-id") || "";
+  record.messageId = turnMessageId(match);
   // A run's conversation is a fact of THIS moment: recorded once, here, and never later (every
   // later decision compares the location with it). Only a send this page instance clicked,
   // confirmed while the page still shows the conversation it was clicked in, establishes it. A

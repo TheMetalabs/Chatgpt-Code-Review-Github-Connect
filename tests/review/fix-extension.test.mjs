@@ -1259,6 +1259,7 @@ function composerPage(href, {json = false} = {}) {
   const saved = new Map();
   const context = vm.createContext({console, URL, location: {href},
     sessionStorage: {getItem: k => saved.get(k) ?? null, setItem: (k, v) => { if (context.failWrites) throw new Error('quota'); saved.set(k, v); }}});
+  vm.runInContext(source('extension/turns.js'), context, {filename: 'turns.js'});
   vm.runInContext(source('extension/composer.js'), context, {filename: 'composer.js'});
   // `json`: the page's json.js too, as every Ashlar tab loads it after composer.js (its samePage and
   // namesNoConversation decide what the send records; without them only the exact identity does).

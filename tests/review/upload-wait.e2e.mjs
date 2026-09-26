@@ -22,7 +22,12 @@ const PROMPT='Review fixture PR #1 at abc123. Return the review JSON.';
 const FILES=['ashlar-diff.patch','ashlar-snapshot.md','ashlar-policy.md'];
 const ENVELOPE=`${PROMPT}\n<<<ASHLAR_ATTACHMENTS_V2>>>\n${JSON.stringify(FILES.map(name=>({name,body:`body of ${name}`})))}\n<<<END_ASHLAR_ATTACHMENTS_V2>>>\n`;
 const stopButton='<button data-testid="stop-button" aria-label="Stop generating" style="width:32px;height:32px">Stop</button>';
-const composerForm=`<form data-type="unified-composer"><div id="chips" style="display:flex"></div><input type="file" multiple style="width:1px;height:1px"><div contenteditable="true" id="prompt-textarea" style="width:300px;min-height:40px"></div><div id="toolbar" style="display:flex"><button id="composer-submit-button" aria-label="Send prompt" style="width:32px;height:32px">send</button></div></form>`;
+const unifiedForm=`<form data-type="unified-composer"><div id="chips" style="display:flex"></div><input type="file" multiple style="width:1px;height:1px"><div contenteditable="true" id="prompt-textarea" style="width:300px;min-height:40px"></div><div id="toolbar" style="display:flex"><button id="composer-submit-button" aria-label="Send prompt" style="width:32px;height:32px">send</button></div></form>`;
+
+// The new home composer (live 1.1.36 snapshot): no data-type, three hidden file inputs in one form,
+// the image/video one first, the "파일 등 추가" menu button, a ProseMirror textbox and a 보내기 Send.
+// Like the page, only the 파일 첨부 input (no accept filter) turns text files into chips.
+const homeForm=`<form class="relative flex flex-col gap-2" data-composer-placement="home" data-chatgpt-composer="" data-thread-find-composer="true"><div data-above-composer-portal="true" data-above-composer-conversation-id="chatgpt:local-chatgpt:c803197f-ee32-4978-be88-406380caf1e9"></div><div data-composer-layout="multiline" role="presentation"><div class="relative w-full flex-col gap-2 flex"><input id="_r_bn_" accept="image/*,video/*" aria-label="사진 또는 동영상 첨부" class="hidden" style="display:none" multiple="" type="file"><input id="_r_bm_" class="hidden" style="display:none" accept="image/*" aria-label="사진 첨부" multiple="" type="file"><input id="_r_bl_" class="hidden" style="display:none" aria-label="파일 첨부" multiple="" type="file"><div data-composer-body=""><div id="chips" data-composer-attachments="" style="display:flex"></div><div contenteditable="true" role="textbox" class="ProseMirror" aria-label="ChatGPT에게 물어보세요" id="prompt-textarea" style="width:300px;min-height:40px"></div><div id="toolbar" style="display:flex"><button type="button" aria-label="파일 등 추가" style="width:32px;height:32px">+</button><button type="button" id="composer-submit-button" aria-label="보내기" style="width:32px;height:32px">send</button></div></div></div></div></form>`;
 
 /** How the page renders a staged file's chip. `display(name)`: the name the chip shows; `spin`: a
  * progress ring in the chip's card that never goes away. */
@@ -35,9 +40,10 @@ const RENDER={
  stuck:name=>name==='ashlar-snapshot.md'?card(name,'File','<svg class="animate-spin" role="progressbar" style="width:16px;height:16px"><circle r="4"></circle></svg>'):card(name,'File'),
 };
 
-async function chatTab(t,{render='exact',stray=false,local:initial={}}={}){
+async function chatTab(t,{render='exact',stray=false,local:initial={},home=false}={}){
+ const composerForm=home?homeForm:unifiedForm;
  const page=await browser.newPage();t.after(()=>page.close());
- await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',body:`<html><body><main id="thread"></main>${composerForm}</body></html>`}));
+ await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html; charset=utf-8',body:`<html><body><main id="thread"></main>${composerForm}</body></html>`}));
  await page.clock.install();
  await page.goto(URL_);
  const chips=Object.fromEntries(FILES.map(name=>[name,RENDER[render](name)]));
@@ -51,8 +57,10 @@ async function chatTab(t,{render='exact',stray=false,local:initial={}}={}){
   // A spinner that is not an upload: a busy tool button beside Send, there for the whole run.
   if(stray)document.getElementById('toolbar').insertAdjacentHTML('afterbegin','<span class="animate-spin" role="progressbar" aria-busy="true" style="width:16px;height:16px;display:inline-block"></span>');
   // The upload: each staged file's chip renders a moment after the input changes.
-  document.querySelector('input[type=file]').addEventListener('change',event=>{
-   const names=[...event.currentTarget.files].map(file=>file.name);
+  for(const input of document.querySelectorAll('input[type=file]'))input.addEventListener('change',event=>{
+   const accept=event.currentTarget.getAttribute('accept')||'';
+   // An image/video input drops text files, with no chip (what the page did live).
+   const names=[...event.currentTarget.files].filter(file=>!accept||accept.split(',').some(a=>file.type.startsWith(a.replace('*','')))).map(file=>file.name);
    setTimeout(()=>{for(const name of names)document.getElementById('chips').insertAdjacentHTML('beforeend',chips[name]);},500);
   });
   document.getElementById('composer-submit-button').addEventListener('click',event=>{
@@ -83,6 +91,19 @@ test('chips named as ChatGPT renders them (case, truncated with an ellipsis, no 
  assert.ok(steps.includes('prompt_submitted'),`the prompt is not sent: ${JSON.stringify(steps)}`);
  assert.deepEqual(await tab.view(),{sendClicks:1,sent:PROMPT});
  assert.equal((await tab.runner()).running,true,'now collecting the answer');
+ assert.equal(await tab.local('uploadWaitHtml'),undefined);
+});
+
+test('the new home composer (image input first, 파일 첨부 last): all three review files become chips and Send is clicked',async t=>{
+ const tab=await chatTab(t,{home:true});
+ await tab.start();
+ await tab.page.clock.runFor(10_000);
+ const steps=await tab.steps();t.diagnostic(JSON.stringify(steps));
+ const staged=await tab.page.evaluate(()=>[...document.querySelectorAll('input[type=file]')].map(i=>[i.getAttribute('aria-label'),[...i.files].map(f=>f.name)]));
+ t.diagnostic(JSON.stringify(staged));
+ assert.deepEqual(staged.find(([label])=>label==='파일 첨부')?.[1],FILES,'the review files go to the 파일 첨부 input');
+ assert.ok(steps.includes('prompt_submitted'),`the prompt is not sent: ${JSON.stringify(steps)} ${JSON.stringify(await tab.runner())}`);
+ assert.deepEqual(await tab.view(),{sendClicks:1,sent:PROMPT});
  assert.equal(await tab.local('uploadWaitHtml'),undefined);
 });
 

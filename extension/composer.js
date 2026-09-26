@@ -194,29 +194,53 @@ async function fixAttachmentParts(raw) {
   return {prompt: frame.prompt, file: {name: entry.name, body: entry.body, sha256: entry.sha256}};
 }
 
-function composerFileInput() {
-  const input =
-    document.querySelector("form[data-type='unified-composer'] input[type='file']") ||
-    document.querySelector("form input[type='file'][multiple]") ||
-    document.querySelector("input[type='file']");
-  return input instanceof HTMLInputElement ? input : null;
+/** Whether a file input's `accept` admits a text file (.patch/.md/.txt as text/plain): an input with
+ * no filter, a wildcard, a text type or a matching extension. The home composer (live 1.1.36) has
+ * three hidden inputs in one form, and the first is 사진 또는 동영상 첨부 (accept="image/*,video/*"):
+ * files handed to it are dropped by the page with no chip. */
+function acceptsTextFile(input, name) {
+  const accept = (input.getAttribute("accept") || "").trim();
+  if (!accept) return true;
+  const ext = /\.[^.]+$/.exec(name || "")?.[0]?.toLowerCase();
+  return accept.split(",").map(item => item.trim().toLowerCase()).some(item =>
+    item === "*" || item === "*/*" || item === "text/*" || item === "text/plain" || (ext && item === ext));
+}
+
+/** The composer's upload input for `names`: inside the composer's own form first, and only an input
+ * whose `accept` admits every file (acceptsTextFile), never the first image/video input. */
+function composerFileInput(names = []) {
+  const editor = typeof composer === "function" ? composer() : null;
+  const scopes = [editor?.closest("form"), document.querySelector("form[data-type='unified-composer']"),
+    document.querySelector("form[data-chatgpt-composer]"), document].filter(Boolean);
+  const fits = input => input instanceof HTMLInputElement && (names.length ? names : ["file.txt"]).every(name => acceptsTextFile(input, name));
+  for (const scope of scopes) {
+    const input = [...scope.querySelectorAll("input[type='file']")].find(fits);
+    if (input) return input;
+  }
+  return null;
+}
+
+/** Hand files to the composer's upload input, one DataTransfer for all of them: the one way both a
+ * fix attachment and a review's files are staged. */
+function stageComposerFiles(input, files) {
+  markUploadAlerts();
+  const dt = new DataTransfer();
+  for (const file of files) dt.items.add(file);
+  input.files = dt.files;
+  input.dispatchEvent(new Event("input", {bubbles: true}));
+  input.dispatchEvent(new Event("change", {bubbles: true}));
 }
 
 /** Hand the fix attachment to the composer's upload input: the File's own bytes are hashed first,
  * so what is uploaded is exactly the bytes the typed line names. */
 async function stageFixAttachment(file) {
-  const input = composerFileInput();
+  const input = composerFileInput([file.name]);
   if (!input) throw fixAttachmentFailed("the composer has no file input");
   const staged = new File([file.body], file.name, {type: "text/plain"});
   if (await sha256Hex(await staged.arrayBuffer()) !== file.sha256) throw fixAttachmentFailed("the staged bytes do not match their SHA-256");
   // The stop fence, in the same task as the upload.
   globalThis.throwIfStopped?.();
-  markUploadAlerts();
-  const dt = new DataTransfer();
-  dt.items.add(staged);
-  input.files = dt.files;
-  input.dispatchEvent(new Event("input", {bubbles: true}));
-  input.dispatchEvent(new Event("change", {bubbles: true}));
+  stageComposerFiles(input, [staged]);
 }
 
 /** Wait until the composer shows the fix attachment's chip with no upload in progress
@@ -246,16 +270,9 @@ async function waitFixAttachmentStaged(name) {
 
 async function attachFiles(files) {
   if (!files.length) return false;
-  const input = composerFileInput();
+  const input = composerFileInput(files.map(file => file.name));
   if (!input) return false;
-  markUploadAlerts();
-  const dt = new DataTransfer();
-  for (const f of files) {
-    dt.items.add(new File([f.body], f.name, { type: "text/plain" }));
-  }
-  input.files = dt.files;
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.dispatchEvent(new Event("change", { bubbles: true }));
+  stageComposerFiles(input, files.map(file => new File([file.body], file.name, {type: "text/plain"})));
   // Input filling does not depend on upload completion. Send has its own
   // named-chip + progress + enabled-control gate in the current composer form.
   return true;

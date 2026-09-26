@@ -66,6 +66,7 @@ import { FixAttachmentError, fixAttachment, fixTypedPrompt, type FixAttachment }
 import { attachmentSwitch, isConnectorUnavailable, requestConnectorFix, type GithubFixSource } from "./fix-source-github.ts";
 import { isSafeFixPath, type FixDisposition, type FixFile } from "./fix-apply.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
+import { archiveFixRaw, defaultFixRawDir } from "./fix-raw-archive.server.ts";
 import { localLivenessMs } from "./local-leg-activity.ts";
 import {
   assertNever,
@@ -1451,7 +1452,19 @@ export async function runPostReviewLoop(
       const t0 = Date.now();
       trace(job.id, "fix-request", { attempt: attempts, promptChars: prompt.length, provider: settings.fixAgent.provider ?? "none" });
       res = await runFixRound(
-        { requestFix, api: guardRef(gh.gitDataApi(token, owner, repo)), validate },
+        {
+          requestFix,
+          api: guardRef(gh.gitDataApi(token, owner, repo)),
+          validate,
+          // A rejected answer is kept locally (bounded) and its shape logged: live aicc #455 failed
+          // twice with "no fix JSON object found" and nothing to tell the harvest from the model.
+          onParseFailure: (raw, error) => {
+            const { record, file, writeError } = archiveFixRaw(defaultFixRawDir(), { jobId: job.id, attempt: attempts, raw, error });
+            trace(job.id, "fix-raw", { attempt: attempts, chars: record.chars, sha256: record.sha256.slice(0, 16), file, writeError });
+            trace(job.id, "fix-raw-head", { head: JSON.stringify(record.head) });
+            trace(job.id, "fix-raw-tail", { tail: JSON.stringify(record.tail) });
+          },
+        },
         {
           prompt,
           mode,

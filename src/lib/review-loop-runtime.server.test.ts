@@ -1,5 +1,6 @@
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { recentFixRawAnswers } from "./fix-raw-archive.server.ts";
 import { DEFAULT_SETTINGS, type BotSettings, type FixAgentSettings, type Finding, type Job, type SamplePr } from "./types.ts";
 import { continueComment, fixingComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
@@ -669,6 +670,12 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.attempts === 2);
     assert.match(f.prompts[1], /PREVIOUS ATTEMPT REJECTED \(parse-failed\)/);
     assert.ok(f.prompts[1].startsWith(f.prompts[0]), "the retry keeps the full original prompt");
+    // Live aicc #455: the rejected answer is kept (locally, bounded) with its length and hash.
+    const kept = recentFixRawAnswers().at(-1);
+    assert.ok(kept, "the parse-failed answer is archived");
+    assert.deepEqual([kept.text, kept.chars, kept.attempt, kept.truncated], ["not json at all", 15, 1, false]);
+    assert.match(kept.error, /no fix JSON object found/);
+    assert.equal(kept.sha256, createHash("sha256").update("not json at all").digest("hex"));
   });
 
   it("a search that is missing or not unique is retried with the reason (validation-failed)", async () => {

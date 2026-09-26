@@ -1470,6 +1470,68 @@ for(const [name,{second,probeFirst,draft}={}] of [['then answers there'],
   assert.deepEqual([out.canClose,out.conversation],[true,TEMP_CONV],JSON.stringify(out));
  });
 }
+// Live 1.1.44 (#93 apply, twice): on ChatGPT's new UI the move from /?temporary-chat=true to
+// /c/<id>?temporary-chat=true after the confirmed send is a real navigation: the content scripts are
+// injected again, the page instance that clicked Send (its in-memory sendAttempt) is gone, and the run
+// ended taken_over "the tab moved to another conversation (now chatgpt.com/c/*?temporary-chat=true)".
+// The reloaded page holds only sessionStorage (the journal: sent and confirmed on the temporary chat,
+// never moved) and the worker's observe-only resume. It adopts the move on durable proof: its one
+// user turn is EXACTLY the journaled typed line (which names the attachment's SHA-256) with the
+// ashlar-fix-request.txt card, no other turn, no draft. Another temporary chat whose turn is not ours
+// is never adopted.
+for(const [name,other] of [['showing our exact sent turn',false],['showing another temporary chat\'s turn',true]]){
+ test(`real DOM: a temporary-chat fix confirmed on "/" whose page RELOADS into /c/<id>?temporary-chat=true ${name} ${other?'ends taken_over':'is adopted, collected, completed and closable'}`,async t=>{
+  const {attachment,typed,text}=await fixDelivery();
+  const first=await attachmentPage(t,{render:'unit',collapse:true});
+  const sent=await first.fill(text);
+  assert.deepEqual([sent.sends,sent.sent],[1,true],JSON.stringify(sent));
+  const j=await first.journal();
+  assert.deepEqual([j.phase,j.conversation,j.exact===typed,j.attachments],['sent',TEMP_URL,true,[attachment.name]]);
+  const saved=await first.page.evaluate(()=>[...window.__saved]);
+  const turn=other?unitTurn({id:'user-X',text:typed.replace(/[0-9a-f]{64}/,'0'.repeat(64)),files:[attachment.name]}):await first.page.evaluate(()=>document.querySelector('main').innerHTML);
+  await first.page.close();
+  // The reload: a new document at the moved URL, rendered from the server (the same sent turn, the
+  // answer still generating), with only sessionStorage kept.
+  const page=await browser.newPage();t.after(()=>page.close());await page.clock.install();
+  await page.route('https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',body:`<html><body><main>${turn}</main><form data-type="unified-composer"><div id="chips"></div><textarea id="prompt-textarea" style="width:300px;height:60px"></textarea><button data-testid="send-button" aria-label="Send prompt" style="width:60px;height:30px">Send</button></form>${stop}</body></html>`}));
+  await page.goto(TEMP_CONV);
+  await page.evaluate(saved=>{
+   const map=new Map(saved);window.__saved=map;window.clicks=0;
+   Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>map.get(k)??null,setItem:(k,v)=>map.set(k,v),removeItem:k=>map.delete(k)}});
+   const local=new Map();
+   window.chrome={runtime:{onMessage:{addListener:f=>window.receiver=f,removeListener(){}}},
+    storage:{local:{get:async keys=>Object.fromEntries(keys.filter(k=>local.has(k)).map(k=>[k,local.get(k)])),set:async items=>{for(const [k,v] of Object.entries(items))local.set(k,v);}}}};
+   document.querySelector('[data-testid="send-button"]').addEventListener('click',()=>window.clicks++);
+  },saved);
+  for(const file of ['turns.js','composer.js','quota.js','model.js','json.js','content-chatgpt.js'])await page.addScriptTag({content:source('extension/'+file)});
+  const journal=()=>page.evaluate(()=>JSON.parse(window.__saved.get('ashlar:submission:fix-A:run-A')||'null'));
+  const msg={jobId:'fix-A',runId:'run-A',provider:'chatgpt',kind:'fix'};
+  const ask=type=>page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),{...msg,type});
+  assert.deepEqual(await page.evaluate(()=>[__ashlarRunnerState.jobId,__ashlarRunnerState.sendAttempt]),['fix-A',undefined],'bound from sessionStorage only');
+  // The worker's poll finds the reloaded page idle and resumes it: observe only, never a resend.
+  assert.equal((await ask('ashlar-harvest')).code,'idle');
+  await page.evaluate(({msg,text})=>{window.resumed=new Promise(resolve=>receiver({...msg,type:'ashlar-run',resume:true,prompt:text},null,resolve));},{msg,text});
+  await page.clock.runFor(1600);
+  if(other){
+   const out=await ask('ashlar-harvest');
+   assert.equal(out.code,'taken_over',JSON.stringify(out));
+   assert.match(out.error,/tab moved to another conversation/);
+   assert.equal((await journal()).conversation,TEMP_URL,'never adopted');
+   assert.equal(await page.evaluate(()=>window.clicks),0,'never re-sent');
+   return;
+  }
+  assert.equal((await journal()).conversation,TEMP_CONV,'bound to the moved temporary conversation');
+  const code='{"summary":"s","files":[],"dispositions":[]}';
+  await page.evaluate(()=>document.querySelector('[data-testid="stop-button"]').remove());
+  await renderUnitAnswer(page,unitAnswer({id:'response-A',code,prose:'Here is the fix.'}));
+  await page.clock.runFor(3200);
+  const done=await ask('ashlar-harvest');
+  assert.deepEqual([done.ok,done.raw,done.code],[true,code,undefined],JSON.stringify(done));
+  const out=await ask('ashlar-can-close');
+  assert.deepEqual([out.canClose,out.conversation],[true,TEMP_CONV],JSON.stringify(out));
+  assert.equal(await page.evaluate(()=>window.clicks),0,'never re-sent');
+ });
+}
 // The takeover side: a page this fix's send left for a conversation that is not a temporary chat
 // (the user's own) is never adopted: the fix ends taken_over and its tab is kept.
 test('real DOM: a unit-DOM temporary-chat fix whose page moves to a non-temporary conversation at the send is never identified; the run ends taken_over',async t=>{

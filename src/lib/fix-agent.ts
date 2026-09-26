@@ -143,11 +143,20 @@ export function fixRules(source: "inline" | "github"): string[] {
     // tests every push") and [C] The Loop 5b ("Touched-file Jest ... Expect new regressions — fixes
     // routinely introduce the next round's findings") to a single reply that cannot run tests: aicc
     // #455 0b756d0d changed a behavior and left the same file's regression test pinning the old one.
+    // The callee/mock/network clause applies [A] One round 5 ("Green CI ≠ converged") and [C]
+    // Pitfalls ("unit tests routinely mock the very layer where the subtle bugs live (DB/query-builder,
+    // network)"; "Identify what your test layer mocks") to the failing-first test: aicc #464 6e36222e
+    // relied on `await refetch()` returning data (it returns undefined), so the cancel POST never ran,
+    // and its test mocked refetch to return data — a contract that does not exist — and passed.
     "9. TDD: every fix comes with a failing-first regression test (error paths included for a logic",
     "   change) in the code's test file if it is editable; otherwise the note says",
     "   \"test needed: <test file or location>\". Before changing a behavior, find the existing",
     "   tests that pin it. Either update them to the new contract in this reply, with the reason in",
     "   the disposition note (not a weakened assertion), or do not change that behavior.",
+    "   Read each callee's implementation before relying on its return value or side effect (one not",
+    "   shown: do not rely on it; note \"callee not in scope: <path>\"). A test mock returns what the",
+    "   real function returns, never what the fix needs; a test that a destructive action is sent",
+    "   asserts the network/API call itself (method and path).",
     // [C] Pitfalls ("Centralize shared fixes").
     "10. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not",
     "   per call-site.",

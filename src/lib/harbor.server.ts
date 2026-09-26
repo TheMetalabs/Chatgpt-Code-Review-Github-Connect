@@ -15,8 +15,9 @@ import {
 } from "./samples";
 import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
-import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
+import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
+import { selectPriorThreads, type PriorThread } from "./prior-threads";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
@@ -594,10 +595,21 @@ async function playGithub(jobId: string, untrustedBody: string) {
     return;
   }
   const extra = current()?.thread?.userText ?? "";
+  // Prior finding threads and their answers (aicc #455). Best effort: a listing failure only drops
+  // the context block — the review itself must not fail on it.
+  let priorThreads: PriorThread[] = [];
+  try {
+    priorThreads = selectPriorThreads(await listReviewComments(token, sample.owner, sample.repo, sample.pr), ashlarBotLogin());
+  } catch {
+    priorThreads = [];
+  }
+  const live1 = current();
+  if (!live1 || live1.status === "cancelled") return;
   const prompt = buildChatPrompt({
     sample,
     extra,
     untrustedBody,
+    priorThreads,
     contextMaxChars: state.settings.promptContextMaxChars,
     contextPadLines: state.settings.contextPadLines,
     policyMaxChars: state.settings.promptPolicyMaxChars,

@@ -455,15 +455,107 @@ function chipUploading(chip) {
   return /uploading|업로드 중/i.test(chip.innerText ?? chip.textContent ?? "");
 }
 
+/** Whether a name a chip shows (`shown`) is the staged file `name`, as ChatGPT really renders file
+ * names: any case; truncated with an ellipsis ("ashlar-snaps…md": the name's start and its end,
+ * extension included); or without its extension (the chip shows the type apart). A FIX's file must be
+ * shown exactly: its chip is also its send's proof (turnAttachments, json.js composerStagedFiles),
+ * and it already stages under the exact rule. */
+function fileNameShown(shown, name) {
+  const raw = String(shown ?? "").replace(/\s+/g, " ").trim();
+  if (raw === name) return true;
+  if (globalThis.__ashlarRunnerState?.kind === "fix") return false;
+  const have = raw.normalize("NFC").toLowerCase(), want = String(name).normalize("NFC").toLowerCase();
+  if (!have || !want) return false;
+  if (have === want) return true;
+  const cut = /…|\.{3}/.exec(have);
+  if (cut) {
+    const head = have.slice(0, cut.index).trim(), tail = have.slice(cut.index + cut[0].length).trim();
+    const ext = /\.([^.]+)$/.exec(want)?.[1] || "";
+    // The tail holds at least the whole extension: "…md" and "….md" do, "…d" does not.
+    return head.length >= 3 && ext.length > 0 && tail.length >= ext.length && head.length + tail.length < want.length &&
+      want.startsWith(head) && want.endsWith(tail);
+  }
+  const dot = want.lastIndexOf(".");
+  return dot > 0 && have === want.slice(0, dot);
+}
+/** Every name a chip shows its file under: its attributes (fileChipNames) and the short text of the
+ * elements inside it (the visible, possibly truncated, name line). */
+function chipShownNames(chip) {
+  const texts = [...chip.querySelectorAll("*")].filter(el => !el.children.length)
+    .map(el => (el.textContent || "").replace(/\s+/g, " ").trim()).filter(text => text && text.length <= 120);
+  return [...fileChipNames(chip), ...texts];
+}
+/** Whether a chip is the staged file `name`'s (fileNameShown on any name it shows). */
+function chipShowsFile(chip, name) {
+  return chipShownNames(chip).some(shown => fileNameShown(shown, name));
+}
+/** The rendered chips in a form that could be a staged file's: never an element that holds the editor
+ * or the send control (that is the composer, not a file). */
+function stagedChips(form) {
+  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"]';
+  return fileChips(form).filter(chip => renderedControl(chip) && !chip.matches(editorish) && !chip.querySelector(editorish));
+}
+/** A chip's card: the largest ancestor inside the form that holds this chip and no other file chip,
+ * editor or send control. A file's progress ring can sit beside its named element in that card. */
+function chipCard(chip, form, chips) {
+  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"]';
+  let card = chip;
+  for (let up = chip.parentElement; up && up !== form && form.contains(up); up = up.parentElement) {
+    if (up.querySelector(editorish) || chips.some(other => !chip.contains(other) && !other.contains(chip) && up.contains(other))) break;
+    card = up;
+  }
+  return card;
+}
+/** Readiness per staged name: "ready", "uploading" (its chip or card shows progress) or "missing" (no
+ * chip shows it). Progress is read only in the run's own chips' cards: a spinner elsewhere in the form
+ * (a model pill, a dictation or tool button) is not an upload and must not hold the send (live 1.1.35:
+ * a review sat in attachments_waiting for 13+ minutes under the old form-wide check). */
+function attachmentStates(form, names = []) {
+  const chips = form ? stagedChips(form) : [];
+  return names.map(name => {
+    const own = chips.filter(chip => chipShowsFile(chip, name));
+    if (!own.length) return {name, state: "missing"};
+    return {name, state: own.some(chip => chipUploading(chipCard(chip, form, chips))) ? "uploading" : "ready"};
+  });
+}
 function attachmentsReady(form, names = []) {
   if (!form) return names.length === 0;
-  const progress = form.querySelectorAll('[aria-busy="true"], [role="progressbar"], progress, [data-state="uploading"], [class*="animate-spin"]');
-  if ([...progress].some(renderedControl)) return false;
-  const chips = fileChips(form).filter(renderedControl);
-  return names.every(name => {
-    const own = chips.filter(chip => fileChipNames(chip).includes(name));
-    return own.length > 0 && !own.some(chipUploading);
-  });
+  return attachmentStates(form, names).every(entry => entry.state === "ready");
+}
+/** What an upload wait that ran out saw: the names not ready, the chips there (their names), and
+ * whether progress showed in a chip or anywhere in the form. */
+function uploadWaitReport(form, names = []) {
+  const busy = '[aria-busy="true"], [role="progressbar"], progress, [data-state="uploading"], [class*="animate-spin"]';
+  const chips = form ? stagedChips(form) : [];
+  const states = attachmentStates(form, names);
+  return {
+    notReady: states.filter(entry => entry.state !== "ready").map(entry => `${entry.name} (${entry.state})`),
+    chips: chips.map(chip => [...new Set(chipShownNames(chip))].slice(0, 4).join(" | ")).slice(0, 20),
+    progressInChips: chips.some(chip => chipUploading(chipCard(chip, form, chips))),
+    progressInForm: Boolean(form) && [...form.querySelectorAll(busy)].some(renderedControl),
+  };
+}
+
+/** Diagnostic: the composer form (and its chips) as an upload wait that ran out left it, in
+ * chrome.storage.local "uploadWaitHtml" (last 3), without scripts, styles, images and SVG paths,
+ * capped at 200 KB. Off with {uploadWaitHtmlOff:true}. Never affects the run. */
+function saveUploadWaitHtml(form, report) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    const state = globalThis.__ashlarRunnerState;
+    const area = form || document.querySelector("main") || document.body;
+    const clone = area.cloneNode(true);
+    for (const node of clone.querySelectorAll("script,style,noscript,img,svg path")) node.remove();
+    const record = {job: state?.jobId, run: state?.runId, at: Date.now(), ...report,
+      url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: clone.outerHTML.slice(0, 200_000)};
+    globalThis.__ashlarUploadWaitWrites = (globalThis.__ashlarUploadWaitWrites || Promise.resolve()).then(async () => {
+      const flags = await local.get(["uploadWaitHtmlOff", "uploadWaitHtml"]);
+      if (flags?.uploadWaitHtmlOff === true) return;
+      const list = Array.isArray(flags?.uploadWaitHtml) ? flags.uploadWaitHtml : [];
+      await local.set({uploadWaitHtml: [...list, record].slice(-3)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
 }
 
 /** The alerts and toasts on the page that could report an upload's failure. */
@@ -487,7 +579,7 @@ function uploadFailure(form, names = []) {
   if (!names.length) return null;
   const failedChip = '[data-state="error"], [data-state="failed"], [data-status="error"], [aria-invalid="true"], [role="alert"]';
   for (const chip of form ? fileChips(form).filter(renderedControl) : []) {
-    if (!names.some(name => fileChipNames(chip).includes(name))) continue;
+    if (!names.some(name => chipShowsFile(chip, name))) continue;
     const error = [...chip.querySelectorAll(failedChip)].find(renderedControl) || (chip.matches(failedChip) ? chip : null);
     const said = (error?.innerText ?? error?.textContent ?? "").replace(/\s+/g, " ").trim();
     if (error) return `its chip shows an error${said ? `: ${said.slice(0, 160)}` : ""}`;
@@ -787,7 +879,11 @@ async function clickSend(findSend, findComposer, expectedText) {
   // The window after a Send click for its user turn to render. Past it the click was not taken (e.g.
   // ChatGPT dropping a click mid-upload): the run ends as send_unconfirmed, never re-sent.
   const CONFIRM_MS = 60 * 1000;
-  let attemptSeen = null;
+  // The window for the run's attachments to show as uploaded, from the first attachments_waiting
+  // (reset once they are): past it the run ends as attachment_failed, never a silent endless wait
+  // (live 1.1.35: a review sat in attachments_waiting for 13+ minutes and never clicked Send).
+  const UPLOAD_MS = 3 * 60 * 1000;
+  let attemptSeen = null, uploadWaitSince = null;
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
     // After the confirmation check, so an accepted send is still journaled as sent; before any
@@ -817,6 +913,8 @@ async function clickSend(findSend, findComposer, expectedText) {
       }
       const uploadBusy = !attachmentsReady(form, record.attachments || []);
       step(uploadBusy ? "attachments_waiting" : "send_waiting");
+      uploadWaitSince = uploadBusy ? uploadWaitSince ?? Date.now() : null;
+      if (uploadBusy && Date.now() - uploadWaitSince >= UPLOAD_MS) throw uploadWaitExpired(form, record.attachments || [], UPLOAD_MS);
       const otherTurn = userTurns().length !== record.baseline;
       const drafted = normalizePrompt(readComposer(editor)) === record.expected;
       // A fix draft that is the prompt only once whitespace is collapsed (or a fix journal with no
@@ -840,6 +938,19 @@ async function clickSend(findSend, findComposer, expectedText) {
     // Cadence only: no upload, send acknowledgement, queue or model deadline.
     await waitForPageChange(250);
   }
+}
+
+/** The upload wait ran out: attachment_failed naming what was not ready, the chips that were there
+ * and where progress showed, with an HTML snapshot of the form saved for diagnosis. */
+function uploadWaitExpired(form, names, ms) {
+  const report = uploadWaitReport(form, names);
+  saveUploadWaitHtml(form, report);
+  const error = new Error(`the attachments were not shown as uploaded within ${ms / 60000} minutes: ` +
+    `not ready ${report.notReady.join(", ") || "none"}; chips found ${JSON.stringify(report.chips)}; ` +
+    `progress ${report.progressInChips ? "in a chip" : report.progressInForm ? "in the form outside the chips" : "not seen"}; nothing was sent`);
+  error.code = "attachment_failed";
+  error.detail = report;
+  return error;
 }
 
 async function resumeSubmission(findSend, findComposer, prompt) {

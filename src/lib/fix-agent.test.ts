@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildFixPrompt, runFixRound } from "./fix-agent.ts";
+import { buildFixPrompt, FIX_SCHEMA_INLINE, runFixRound } from "./fix-agent.ts";
 import { MIN_FIX_MAX_PROMPT_CHARS } from "./bridge-fix.server.ts";
 import { FIX_ATTACHMENT_MAX_BYTES } from "./fix-attachment.ts";
 import type { GitDataApi } from "./fix-commit.ts";
@@ -27,14 +27,14 @@ function fakeApi(): { api: GitDataApi; committed: boolean } {
   return { api, get committed() { return state.committed; } } as { api: GitDataApi; committed: boolean };
 }
 
-const FIX_JSON = '{"summary":"remove bad state","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}';
+const FIX_JSON = '{"summary":"remove bad state","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}';
 
 describe("buildFixPrompt", () => {
   it("embeds the findings, the schema, and the §6 rules", () => {
     const p = buildFixPrompt({ findings: "P1: null deref at a.ts:3", files: [{ path: "src/a.ts", content: "export const a = 1;\n" }], reviewer: "chatgpt" });
     assert.match(p, /null deref at a\.ts:3/);
-    assert.match(p, /"files": \[ \{ "path"/);
-    assert.match(p, /never a diff/);
+    assert.match(p, /"edits": \[ \{ "path"/);
+    assert.match(p, /Never return an\n\s+existing file whole/);
     assert.match(p, /src\/a\.ts/);
     assert.match(p, /export const a = 1;/); // head-pinned content embedded
     assert.match(p, /\(chatgpt\)/);
@@ -59,7 +59,7 @@ describe("buildFixPrompt", () => {
 });
 
 describe("runFixRound", () => {
-  const base = { prompt: "p", branch: "feat", baseCommitSha: "base1", message: "fix: x", allowedPaths: ["src/a.ts"] };
+  const base = { prompt: "p", branch: "feat", baseCommitSha: "base1", message: "fix: x", allowedPaths: ["src/a.ts"], baseFiles: new Map([["src/a.ts", "export const a = 1;\n"]]) };
 
   it("apply mode commits the parsed change set and returns the commit sha", async () => {
     const { api, committed } = fakeApi();
@@ -89,7 +89,7 @@ describe("runFixRound", () => {
 
   it("rejects an out-of-scope path before any commit (scope containment)", async () => {
     const f = fakeApi();
-    const oos = '{"summary":"x","files":[{"path":"src/other.ts","content":"pwn"}]}';
+    const oos = '{"summary":"x","newFiles":[{"path":"src/other.ts","content":"pwn"}]}';
     const res = await runFixRound({ requestFix: async () => oos, api: f.api, validate: async () => ({ ok: true }) }, { ...base, mode: "apply" });
     assert.equal(res.ok, false);
     assert.equal(res.outcome, "scope-violation");
@@ -140,7 +140,7 @@ describe("runFixRound", () => {
 
   it("H3: a sensitive path is denied even when the caller allows it (rejected at the parser)", async () => {
     const f = fakeApi();
-    const wf = '{"summary":"x","files":[{"path":".github/workflows/ci.yml","content":"pwn"}]}';
+    const wf = '{"summary":"x","newFiles":[{"path":".github/workflows/ci.yml","content":"pwn"}]}';
     const res = await runFixRound(
       { requestFix: async () => wf, api: f.api, validate: async () => ({ ok: true }) },
       { ...base, mode: "apply", allowedPaths: [".github/workflows/ci.yml"] },
@@ -205,8 +205,11 @@ describe("buildFixPrompt fix discipline", () => {
     assert.match(instructions, /10\. A decline or defer MUST cite evidence in its note: an issue number \(#123\), a file:line,\n\s+or a quoted code reference/);
   });
 
-  it("keeps the output schema unchanged (no new JSON fields)", () => {
-    assert.ok(instructions.includes('{ "summary": "<what you changed and why>", "files": [ { "path": "<one of the paths above>", "content": "<full new file>" } ], "dispositions": [ { "finding": "F1", "action": "fixed|pushback|decline|defer", "note": "<one sentence>" } ] }'));
+  it("asks for targeted edits (full content only for new files) and the preserve rule", () => {
+    assert.ok(instructions.includes(FIX_SCHEMA_INLINE));
+    assert.match(FIX_SCHEMA_INLINE, /"edits": \[ \{ "path": "<one of the paths above>", "search": "<exact unique lines of the current file>", "replace": "<their new text>" \} \]/);
+    assert.match(FIX_SCHEMA_INLINE, /"newFiles": \[ \{ "path": "<a path above that does not exist yet>", "content": "<full file>" \} \]/);
+    assert.ok(!/"files"/.test(FIX_SCHEMA_INLINE), "the full-file schema is retired");
   });
 
   it("the fixed instructions stay far under the prompt-size floor and the attachment cap", () => {

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
+import { applyFixEdits, isSafeFixPath, parseDispositions, parseFixResponse } from "./fix-apply.ts";
 
 const ok = (raw: string) => {
   const r = parseFixResponse(raw);
@@ -14,16 +14,34 @@ const err = (raw: string) => {
 };
 
 describe("parseFixResponse", () => {
-  it("parses a full-file change set (bare JSON)", () => {
-    const fix = ok('{"summary":"fix null deref","files":[{"path":"src/a.ts","content":"export const a = 1;\\n"}]}');
+  it("parses targeted edits and new files (bare JSON)", () => {
+    const fix = ok('{"summary":"fix null deref","edits":[{"path":"src/a.ts","search":"const a = 1;","replace":"const a = 2;"}],"newFiles":[{"path":"src/b.ts","content":"export const b = 1;\\n"}]}');
     assert.equal(fix.summary, "fix null deref");
-    assert.deepEqual(fix.files, [{ path: "src/a.ts", content: "export const a = 1;\n" }]);
+    assert.deepEqual(fix.edits, [{ path: "src/a.ts", search: "const a = 1;", replace: "const a = 2;" }]);
+    assert.deepEqual(fix.newFiles, [{ path: "src/b.ts", content: "export const b = 1;\n" }]);
+  });
+
+  it("rejects the retired full-file schema: an existing file never comes back whole (aicc #439)", () => {
+    assert.match(err('{"summary":"s","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}'), /full-file "files" output is not accepted/);
+    // an empty legacy array is still a plain no-change answer
+    assert.equal(parseFixResponse('{"summary":"all pushed back","files":[]}').ok, true);
+  });
+
+  it("rejects a malformed edit: empty search, missing replace, a no-op, a bad path or a bad baseBlobSha", () => {
+    const edit = (e: Record<string, unknown>) => err(JSON.stringify({ summary: "s", edits: [{ path: "a.ts", search: "x", replace: "y", ...e }] }));
+    assert.match(edit({ search: "" }), /empty or missing "search"/);
+    assert.match(edit({ replace: undefined }), /missing "replace"/);
+    assert.match(edit({ replace: "x" }), /changes nothing/);
+    assert.match(edit({ path: "../x.ts" }), /unsafe or missing path/);
+    assert.match(edit({ path: ".github/workflows/ci.yml" }), /sensitive/);
+    assert.match(edit({ baseBlobSha: "nope" }), /baseBlobSha/);
+    assert.match(err(JSON.stringify({ summary: "s", edits: [{ path: "a.ts", search: "x", replace: "y" }], newFiles: [{ path: "a.ts", content: "z" }] })), /both edited and created/);
   });
 
   it("extracts JSON from a fenced chat reply (reuses the review extractor)", () => {
-    const raw = "Sure, here is the fix:\n```json\n{\"files\":[{\"path\":\"x.ts\",\"content\":\"y\"}]}\n```\nDone.";
+    const raw = "Sure, here is the fix:\n```json\n{\"newFiles\":[{\"path\":\"x.ts\",\"content\":\"y\"}]}\n```\nDone.";
     const fix = ok(raw);
-    assert.deepEqual(fix.files, [{ path: "x.ts", content: "y" }]);
+    assert.deepEqual(fix.newFiles, [{ path: "x.ts", content: "y" }]);
   });
 
   it("rejects an unparseable reply (caller falls back)", () => {
@@ -32,7 +50,7 @@ describe("parseFixResponse", () => {
 
   it("accepts a no-change round (files:[] WITH a rationale) but rejects a bare empty response (J3)", () => {
     const fix = ok('{"summary":"all findings are false positives; pushed back","files":[]}');
-    assert.deepEqual(fix.files, []);
+    assert.deepEqual(fix.newFiles, []);
     assert.match(err('{"summary":"","files":[]}'), /no rationale/);
     assert.match(err('{"files":[]}'), /no rationale/);
   });
@@ -73,49 +91,80 @@ describe("parseFixResponse", () => {
     const fixedNoFiles = '{"summary":"done","files":[],"dispositions":[{"finding":"F1","action":"fixed","note":"done"},{"finding":"F2","action":"pushback","note":"n"}]}';
     assert.match(err(fixedNoFiles), /no files changed, yet F1 marked fixed/);
     const declined = ok('{"summary":"false positive","files":[],"dispositions":[{"finding":"F1","action":"pushback","note":"n"}]}');
-    assert.deepEqual(declined.files, []);
+    assert.deepEqual(declined.newFiles, []);
   });
 
   it("rejects a sensitive repo-control path at the parser boundary (J6)", () => {
-    assert.match(err('{"files":[{"path":".github/workflows/ci.yml","content":"x"}]}'), /sensitive/);
-    assert.match(err('{"files":[{"path":".github/actions/x/action.yml","content":"x"}]}'), /sensitive/);
+    assert.match(err('{"newFiles":[{"path":".github/workflows/ci.yml","content":"x"}]}'), /sensitive/);
+    assert.match(err('{"newFiles":[{"path":".github/actions/x/action.yml","content":"x"}]}'), /sensitive/);
   });
 
   it("rejects unsafe paths (traversal, absolute, drive, backslash)", () => {
     for (const p of ["../etc/passwd", "/abs/x.ts", "C:/win.ts", "a\\\\b.ts", "~/x"]) {
-      assert.match(err(`{"files":[{"path":"${p}","content":"x"}]}`), /unsafe or missing path/, p);
+      assert.match(err(`{"newFiles":[{"path":"${p}","content":"x"}]}`), /unsafe or missing path/, p);
     }
   });
 
   it("rejects empty content (likely truncation)", () => {
-    assert.match(err('{"files":[{"path":"a.ts","content":""}]}'), /empty|truncation/);
+    assert.match(err('{"newFiles":[{"path":"a.ts","content":""}]}'), /empty|truncation/);
   });
 
   it("rejects content that looks elided/truncated", () => {
-    assert.match(err('{"files":[{"path":"a.ts","content":"const x = 1;\\n// ... rest unchanged"}]}'), /truncated|elided/);
-    assert.match(err('{"files":[{"path":"a.ts","content":"line\\n..."}]}'), /truncated|elided/);
+    assert.match(err('{"newFiles":[{"path":"a.ts","content":"const x = 1;\\n// ... rest unchanged"}]}'), /truncated|elided/);
+    assert.match(err('{"newFiles":[{"path":"a.ts","content":"line\\n..."}]}'), /truncated|elided/);
   });
 
   it("H7: allows consecutive dots in a filename but still rejects traversal segments", () => {
-    ok('{"files":[{"path":"src/archive..old.ts","content":"x"}]}');
-    assert.match(err('{"files":[{"path":"../../etc/passwd","content":"x"}]}'), /unsafe or missing path/);
-    assert.match(err('{"files":[{"path":"src/../secret","content":"x"}]}'), /unsafe or missing path/);
+    ok('{"newFiles":[{"path":"src/archive..old.ts","content":"x"}]}');
+    assert.match(err('{"newFiles":[{"path":"../../etc/passwd","content":"x"}]}'), /unsafe or missing path/);
+    assert.match(err('{"newFiles":[{"path":"src/../secret","content":"x"}]}'), /unsafe or missing path/);
   });
 
   it("H8: does not flag a legit trailing '...' string or a mid-file elision comment", () => {
-    ok('{"files":[{"path":"a.ts","content":"console.log(\\"Loading...\\")\\n"}]}');
-    ok('{"files":[{"path":"a.ts","content":"// remaining work in #42\\nexport const x = 1;\\n"}]}');
+    ok('{"newFiles":[{"path":"a.ts","content":"console.log(\\"Loading...\\")\\n"}]}');
+    ok('{"newFiles":[{"path":"a.ts","content":"// remaining work in #42\\nexport const x = 1;\\n"}]}');
     // a genuine trailing truncation is still caught
-    assert.match(err('{"files":[{"path":"a.ts","content":"const y = 1;\\n// ... rest unchanged"}]}'), /truncated|elided/);
+    assert.match(err('{"newFiles":[{"path":"a.ts","content":"const y = 1;\\n// ... rest unchanged"}]}'), /truncated|elided/);
   });
 
   it("rejects content over the per-file size cap (bounded resource use)", () => {
     const huge = "x".repeat(1_000_001);
-    assert.match(err(JSON.stringify({ files: [{ path: "a.ts", content: huge }] })), /exceeds .* bytes/);
+    assert.match(err(JSON.stringify({ newFiles: [{ path: "a.ts", content: huge }] })), /exceeds .* bytes/);
   });
 
   it("rejects duplicate paths", () => {
-    assert.match(err('{"files":[{"path":"a.ts","content":"1"},{"path":"a.ts","content":"2"}]}'), /duplicate/);
+    assert.match(err('{"newFiles":[{"path":"a.ts","content":"1"},{"path":"a.ts","content":"2"}]}'), /duplicate/);
+  });
+});
+
+describe("applyFixEdits (server-side, against the head content)", () => {
+  const head = new Map([["src/a.ts", "const a = 1;\nconst b = 1;\nconst b2 = 1;\n"]]);
+  const apply = (edits: Array<{ search: string; replace: string }>, newFiles: Array<{ path: string; content: string }> = []) =>
+    applyFixEdits({ edits: edits.map((e) => ({ path: "src/a.ts", ...e })), newFiles }, head);
+
+  it("replaces each unique snippet and keeps every other byte", () => {
+    const r = apply([{ search: "const a = 1;", replace: "const a = 2;" }, { search: "const b2 = 1;", replace: "" }]);
+    assert.ok(r.ok);
+    if (r.ok) {
+      assert.deepEqual(r.files, [{ path: "src/a.ts", content: "const a = 2;\nconst b = 1;\n\n" }]);
+      assert.equal(r.before.get("src/a.ts"), head.get("src/a.ts"));
+    }
+  });
+
+  it("rejects a missing or non-unique search, and overlapping edits, with a reason the model can act on", () => {
+    const e = (r: ReturnType<typeof apply>) => (r.ok ? "" : r.error);
+    assert.match(e(apply([{ search: "const c = 1;", replace: "x" }])), /"search" not found in the current file/);
+    assert.match(e(apply([{ search: "const b", replace: "x" }])), /matches more than one place/);
+    assert.match(e(apply([{ search: "const a = 1;\nconst b", replace: "x" }, { search: "b = 1;\nconst b2", replace: "y" }])), /overlap/);
+  });
+
+  it("an edit needs an existing file; a new file must not exist", () => {
+    const r1 = applyFixEdits({ edits: [{ path: "src/new.ts", search: "a", replace: "b" }], newFiles: [] }, head);
+    assert.ok(!r1.ok && /does not exist at the head/.test(r1.error));
+    const r2 = apply([], [{ path: "src/a.ts", content: "x" }]);
+    assert.ok(!r2.ok && /already exists at the head/.test(r2.error));
+    const r3 = apply([], [{ path: "src/new.ts", content: "export const n = 1;\n" }]);
+    assert.ok(r3.ok && r3.files[0].path === "src/new.ts" && !r3.before.has("src/new.ts"));
   });
 });
 
@@ -135,7 +184,7 @@ describe("isSafeFixPath", () => {
 describe("dispositions (advisory per-finding verdicts for the thread replies)", () => {
   it("are parsed alongside files and on a no-change round", () => {
     const withFiles = parseFixResponse(
-      '{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":[{"finding":"F1","action":"fixed","note":"  guarded  "}]}',
+      '{"summary":"s","newFiles":[{"path":"a.ts","content":"x"}],"dispositions":[{"finding":"F1","action":"fixed","note":"  guarded  "}]}',
     );
     assert.ok(withFiles.ok);
     if (withFiles.ok) assert.deepEqual(withFiles.fix.dispositions, [{ finding: "F1", action: "fixed", note: "guarded" }]);
@@ -161,7 +210,7 @@ describe("dispositions (advisory per-finding verdicts for the thread replies)", 
         { finding: "F4", action: "defer", note: "" },
       ],
     );
-    const r = parseFixResponse('{"summary":"s","files":[{"path":"a.ts","content":"x"}],"dispositions":"garbage"}');
+    const r = parseFixResponse('{"summary":"s","newFiles":[{"path":"a.ts","content":"x"}],"dispositions":"garbage"}');
     assert.ok(r.ok, "a garbage dispositions field does not fail the parse");
     if (r.ok) assert.deepEqual(r.fix.dispositions, []);
   });

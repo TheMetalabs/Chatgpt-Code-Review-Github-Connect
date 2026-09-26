@@ -698,7 +698,7 @@ describe("session identity: one continuation and one handoff per head per SESSIO
     };
     const requestFix = async () => {
       await view.onFix();
-      return '{"summary":"guard added","files":[{"path":"src/a.ts","content":"export const a = 2;\\n"}]}';
+      return '{"summary":"guard added","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}';
     };
     const deps = { gh, requestFix, validate: async () => ({ ok: true }), sleep: async (ms: number) => void (clock += ms), now: () => clock } as unknown as LoopRuntimeDeps;
     const settingsOf = (mode: "suggest" | "apply"): BotSettings => ({ ...DEFAULT_SETTINGS, fixAgent: { ...DEFAULT_SETTINGS.fixAgent, enabled: true, provider: "local", delivery: "script-apply", mode, parallelPrs: 3 } });

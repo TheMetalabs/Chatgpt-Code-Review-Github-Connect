@@ -100,10 +100,15 @@ export function fixRules(source: "inline" | "github"): string[] {
     "   the tag; behavior-class (stale state, wrong endpoint, error-handling gap) is fixed unless",
     "   provably intended; mechanical/cosmetic (doc-sync, naming, fixture drift) is folded in",
     "   alongside the other fixes, never a round of its own.",
-    // [A] Fix recipe 1 · [C] The Loop 3 ("verify, do not perform agreement") + Pitfalls (stale commit).
-    "2. Verify the premise against the current content before accepting. Do NOT 'fix' a false",
-    "   positive — you would plant a real bug to satisfy a fake one. A finding already resolved in",
-    "   the current content is answered with the file:line that resolves it, not re-fixed.",
+    // [A] Fix recipe 1 · [C] The Loop 3 ("verify, do not perform agreement"; Push back = "finding is
+    // wrong/over-stated", Defer rows) + Pitfalls (stale commit). The test-assertion clause is stated
+    // by neither skill; minimal statement after aicc #455 (cedfb476 deleted an assertion to fit a finding).
+    "2. Verify the premise against the current content before accepting — verify, do not perform",
+    "   agreement. Do NOT 'fix' a false positive — you would plant a real bug to satisfy a fake one.",
+    "   If the premise is false, or cannot be verified from the current content, Push back (with",
+    "   evidence) or Defer — never change behavior to satisfy it. A finding already resolved in the",
+    "   current content is answered with the file:line that resolves it, not re-fixed. Change no",
+    "   behavior beyond the finding, and never delete or weaken an existing test assertion.",
     // [A] Fix recipe 2 · [C] The Loop 3b (full-file re-audit, call-site census) + Pitfalls (fixes cause the next round).
     "3. (Highest yield) Re-audit the whole flagged file + sibling files and fix the entire defect",
     "   class in this one reply — plus a call-site census of every entry point a guard protects",
@@ -132,10 +137,17 @@ export function fixRules(source: "inline" | "github"): string[] {
     "   instead of ballooning the change. A decline or defer MUST cite evidence in its note: an issue",
     "   number (#123), a file:line, or a quoted code reference. Without it the disposition is invalid",
     "   and the reply is rejected.",
-    // [A] Fix recipe 6 · [C] The Loop 3 table (Fix = TDD) + 4 + Round zero 3 (tests + error paths).
+    // [A] Fix recipe 6 ("TDD (failing test first)") · [C] The Loop 3 table (Fix = "TDD the fix
+    // (failing test first), then code") + 4 ("Fix valid findings with TDD") + Round zero 3 ("Tests +
+    // error paths for any logic change"). The pinned-test clause applies [A] One round 5 ("touched-unit
+    // tests every push") and [C] The Loop 5b ("Touched-file Jest ... Expect new regressions — fixes
+    // routinely introduce the next round's findings") to a single reply that cannot run tests: aicc
+    // #455 0b756d0d changed a behavior and left the same file's regression test pinning the old one.
     "9. TDD: every fix comes with a failing-first regression test (error paths included for a logic",
     "   change) in the code's test file if it is editable; otherwise the note says",
-    "   \"test needed: <test file or location>\".",
+    "   \"test needed: <test file or location>\". Before changing a behavior, find the existing",
+    "   tests that pin it. Either update them to the new contract in this reply, with the reason in",
+    "   the disposition note (not a weakened assertion), or do not change that behavior.",
     // [C] Pitfalls ("Centralize shared fixes").
     "10. Centralize shared fixes: when two surfaces share a bug, fix it in the shared code once, not",
     "   per call-site.",

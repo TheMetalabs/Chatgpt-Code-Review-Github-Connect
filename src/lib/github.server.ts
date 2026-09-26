@@ -749,13 +749,17 @@ export async function listReviewComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; updatedAt: string; body: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null; updated_at?: string | null; body?: string | null }>(
+): Promise<Array<{ id: number; inReplyToId?: number; line?: number; userLogin: string; userType: string; path: string; commitId: string; createdAt: string; updatedAt: string; body: string }>> {
+  const rows = await ghListAll<{ id?: number; in_reply_to_id?: number | null; line?: number | null; original_line?: number | null; user?: { login?: string; type?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null; updated_at?: string | null; body?: string | null }>(
     token,
     `/repos/${owner}/${repo}/pulls/${pr}/comments`,
   );
   return rows.map((c) => ({
+    id: Number(c.id ?? 0),
+    inReplyToId: typeof c.in_reply_to_id === "number" ? c.in_reply_to_id : undefined,
+    line: typeof c.line === "number" ? c.line : typeof c.original_line === "number" ? c.original_line : undefined,
     userLogin: String(c.user?.login ?? ""),
+    userType: String(c.user?.type ?? ""),
     path: String(c.path ?? ""),
     commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
     createdAt: String(c.created_at ?? ""),

@@ -57,6 +57,8 @@ export async function appFixture(options={}, githubOptions={}) {
     // 'getFile'"), every appFixture test throws, and the leaked Chromium handle hangs the process to
     // the CI 10-min timeout. Fixtures are snapshot-only, so head reads return null.
     getFile:async()=>githubOptions.getFile?githubOptions.getFile():null,
+    // Prior finding threads for the review prompt (aicc #455): none unless a test supplies rows.
+    listReviewComments:async()=>githubOptions.listReviewComments?githubOptions.listReviewComments():[],
     // Loop-runtime GitHub calls a test opts into (the runtime loads github.server lazily).
     ...(githubOptions.api||{}),
   }],

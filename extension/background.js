@@ -700,7 +700,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.53";
+const WORKER_BUILD = "1.1.54";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2768,72 +2768,71 @@ function sweepOnce({includeStalled, staleMs = STALL_MS}) {
   sweepFlight = flight;
   return flight;
 }
-/** How long a preserved review tab waits before the idle worker asks its page again
- * (reclaimPreservedTabs). */
-const RECLAIM_AFTER_MS = 10 * 60_000;
-const RECLAIM_EVERY_MS = 5 * 60_000;
+/** Ashlar's temporary-chat tabs of finished jobs (live P0 2026-09-27: 85 tabs left open, 126 of 131
+ * reviews kept as "navigated"). The user never uses temporary chats in this Chrome (user decision via
+ * the coordinator, 2026-09-27), so #82's "a touched tab is the user's" does not hold for them: a
+ * temporary-chat tab Ashlar opened (its page reports an Ashlar binding, or a preserved record names
+ * it) whose job is no longer in the worker registry is closed TEMP_TAB_CLOSE_AFTER_MS after it was
+ * first seen finished, and while more than TEMP_TAB_CAP temporary-chat tabs are open the oldest
+ * finished ones are closed first. A tab of a job in progress, a tab the worker still tracks, and any
+ * non-temporary conversation are never touched. */
+const TEMP_TAB_CLOSE_AFTER_MS = 10 * 60_000;
+const TEMP_TAB_CAP = 8;
+const FINISHED_SEEN_KEY = "ashlar:tempTabFinishedSeen";
 let reclaimFlight = null;
-
-/** Close the preserved REVIEW tabs whose page now proves them Ashlar's (live P0 2026-09-27: 85 tabs
- * left open, 126 of 131 preserved as "navigated" after ChatGPT re-keyed their temporary chat). Only
- * while the worker is idle (no job in its registry), one tab operation per record. Each page is asked
- * the same can-close verdict a settled leg gets (json.js tabOwnership, which now follows the re-key):
- * a tab is closed only on an owned verdict for its own job and run, in the conversation the page
- * names, and still showing it; a user turn, a draft, a follow-up, another conversation or no answer
- * keeps it. A fix tab is never reclaimed (#77: only its delivered-answer path closes it). `force`
- * skips the age wait (the popup's button). Returns {closed, kept, skipped}. */
-let reclaimRanAt = 0;
 function reclaimPreservedTabs({force = false} = {}) {
-  // The alarm asks every minute; the tabs are probed at most every RECLAIM_EVERY_MS unless forced.
-  if (!force && !reclaimFlight && Date.now() - reclaimRanAt < RECLAIM_EVERY_MS) return Promise.resolve({ok: true, closed: 0, kept: 0, skipped: 0});
-  reclaimFlight ||= (reclaimRanAt = Date.now(), reclaimPreservedBody(force).finally(() => { reclaimFlight = null; }));
+  reclaimFlight ||= reclaimPreservedBody(force).finally(() => { reclaimFlight = null; });
   return reclaimFlight;
 }
+
+/** A ChatGPT temporary chat: the bare page or the /c/<id> it moves to. */
+function temporaryChatTab(url) {
+  return samePage(url, providerUrl("chatgpt")) && String(url).includes("temporary-chat=true") || temporaryChatConversation(url);
+}
+
 async function reclaimPreservedBody(force) {
   const cfg = await settings();
-  const counts = {closed: 0, kept: 0, skipped: 0};
+  const counts = {closed: 0, kept: 0, open: 0};
   if (!cfg.enabled || !cfg.origin) return {ok: false, error: "the worker is not configured", ...counts};
   const registry = await workerJobs(cfg.origin);
-  if (Object.keys(registry).length) return {ok: false, error: "the worker is busy", ...counts};
-  // Candidates: every provider tab whose page reports a released review binding (the read-only
-  // inventory handshake). The session's preserved records only date a preserve: an extension update
-  // clears them, and the tabs it left must still be found.
+  const tracked = new Set(Object.values(registry).flatMap(job => job.providers.map(p => job.states[p]?.tabId)).filter(Number.isInteger));
+  const temp = (await chrome.tabs.query({})).filter(tab => allowedTab(tab, "chatgpt") && temporaryChatTab(tab.url));
+  counts.open = temp.length;
   const session = await chrome.storage.session.get(null);
-  for (const tab of await chrome.tabs.query({})) {
-    const provider = probeable(tab);
-    if (!provider) continue;
-    let status;
-    try { status = await tabOp("reclaim-status", () => askPage(tab.id, {type: "ashlar-tab-status"}, contentFiles(provider))); } catch { continue; }
-    const jobId = typeof status?.jobId === "string" ? status.jobId : "", runId = typeof status?.runId === "string" ? status.runId : "";
-    if (status?.ownershipProtocol !== 1 || status.released !== true || !jobId || !runId || status.provider !== provider) continue;
-    const key = preservedKey(jobId, provider, runId);
-    if (jobId.startsWith("fix-") || registry[jobId] ||
-        (!force && Number.isFinite(session[key]?.at) && Date.now() - session[key].at < RECLAIM_AFTER_MS)) { counts.skipped += 1; continue; }
-    const closed = await tabOp("reclaim", () => reclaimPreservedTab(key, tab.id, jobId, provider, runId));
-    counts[closed === true ? "closed" : closed === false ? "kept" : "skipped"] += 1;
+  const recorded = new Map(Object.entries(session).filter(([key, v]) => key.startsWith(PRESERVED_PREFIX) && Number.isInteger(v?.tabId)).map(([key, v]) => [v.tabId, {key, at: v.at}]));
+  const seen = session[FINISHED_SEEN_KEY] && typeof session[FINISHED_SEEN_KEY] === "object" ? {...session[FINISHED_SEEN_KEY]} : {};
+  const now = Date.now(), finished = [];
+  for (const tab of temp) {
+    if (tracked.has(tab.id)) continue;
+    let status = null;
+    if (probeable(tab) === "chatgpt") {
+      try { status = await tabOp("reclaim-status", () => askPage(tab.id, {type: "ashlar-tab-status"}, contentFiles("chatgpt"))); } catch { status = null; }
+    }
+    const jobId = typeof status?.jobId === "string" ? status.jobId : "";
+    if (jobId && registry[jobId]) continue; // its job is in progress
+    if (!jobId && !recorded.has(tab.id)) continue; // not a tab Ashlar can name as its own
+    const since = Number.isFinite(recorded.get(tab.id)?.at) ? recorded.get(tab.id).at : (seen[tab.id] ??= now);
+    finished.push({tab, since});
   }
-  return {ok: true, ...counts};
-}
-/** One preserved tab: true closed, false kept, undefined not askable now (gone, loading, frozen). */
-async function reclaimPreservedTab(key, tabId, jobId, provider, runId) {
-  let tab;
-  try { tab = await chrome.tabs.get(tabId); } catch { await chrome.storage.session.remove(key); return undefined; }
-  if (!allowedTab(tab, provider) || tab.pendingUrl || tab.status !== "complete" || tab.discarded === true || tab.frozen === true) return undefined;
-  let result;
-  try {
-    result = await askPage(tabId, {type: "ashlar-can-close", jobId, runId, provider, kind: "review", secured: true,
-      allocationUrl: providerUrl(provider)}, contentFiles(provider));
-  } catch { return undefined; }
-  const conversation = typeof result?.conversation === "string" ? result.conversation : "";
-  const owned = result?.ok === true && result.canClose === true && result.jobId === jobId && result.runId === runId &&
-    result.blank !== true && result.unsent !== true && result.unpinned !== true && result.legacy !== true &&
-    result.legacyReply !== true && conversation && samePage(result.url, conversation) && samePage(tab.url, conversation);
-  if (!owned) return false;
-  const current = await chrome.tabs.get(tabId).catch(() => null);
-  if (!current || current.pendingUrl || !samePage(current.url, conversation)) return false;
-  await chrome.tabs.remove(tabId);
-  await chrome.storage.session.remove(key);
-  return true;
+  for (const id of Object.keys(seen)) if (!finished.some(f => String(f.tab.id) === id)) delete seen[id];
+  finished.sort((a, b) => a.since - b.since);
+  let open = temp.length;
+  for (const {tab, since} of finished) {
+    const due = force || now - since >= TEMP_TAB_CLOSE_AFTER_MS || open > TEMP_TAB_CAP;
+    if (!due) { counts.kept += 1; continue; }
+    const closed = await tabOp("reclaim", async () => {
+      const current = await chrome.tabs.get(tab.id).catch(() => null);
+      if (!current || !temporaryChatTab(current.url) || current.pendingUrl) return false;
+      await chrome.tabs.remove(tab.id);
+      return true;
+    }).catch(() => false);
+    if (!closed) { counts.kept += 1; continue; }
+    counts.closed += 1; open -= 1; delete seen[tab.id];
+    const record = recorded.get(tab.id);
+    if (record) await chrome.storage.session.remove(record.key);
+  }
+  await chrome.storage.session.set({[FINISHED_SEEN_KEY]: seen});
+  return {ok: true, ...counts, open};
 }
 
 async function autoSweepStuckJobs(watchdogMs = AUTO_SWEEP_WATCHDOG_MS) {

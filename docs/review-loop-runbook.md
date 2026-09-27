@@ -117,6 +117,19 @@ code, so a future skill or change can find the rule instead of re-learning it.
   as search/replace against head content (#115), and fall back to the GitHub connector source when the
   attachment cannot be delivered (#107).
 
+### Tabs
+
+- **A temporary chat re-keys its id.** A review pins the first `/c/<id>?temporary-chat=true` it lands
+  on (a `local-chatgpt:` id) and ChatGPT then moves it to the server id; the page and the worker follow
+  that move on the same proof as a fix (#126). Before that, 126 of 131 reviews kept their tab as
+  "navigated" and 85 tabs piled up.
+- **Temporary-chat tabs of finished jobs are closed on a timer** (#126, user decision 2026-09-27: the
+  user never uses temporary chats in this Chrome, so #82's "a touched tab is the user's" does not apply
+  to them). `reclaimPreservedTabs` closes a temporary-chat tab Ashlar opened 10 min after its job left
+  the worker registry, and the oldest finished ones first while more than 8 Ashlar temporary tabs are
+  open. A job in progress, a tab with no Ashlar binding and any non-temporary conversation are never
+  touched. Run it at once with the extension message `ashlar-reclaim-preserved`.
+
 ### Deploys
 
 - Server: only `npm run deploy:server` (#118). A hand-built `a && b; c` chain once restarted the server

@@ -337,3 +337,25 @@ test('a loop stop whose first attempt failed is retried when GitHub redelivers i
   // must run the stop again, even though the first delivery left a 202 event behind.
   await eventually(async()=>{await deliver(app,'issue_comment',stop,'stop-1');return reads>=2;},'the redelivered stop was not retried');
 });
+
+// Live aicc #515 (job-mujhi85p-3002): the reviewer answered empty findings with no investigated_safe
+// (an Instant-tier skip) and the job ended skipped, but its ops comment stayed "running / Waiting for
+// provider response": that skip path never updated it, so a lane tool read the job as in progress for
+// hours. Every terminal status now reaches the ops comment.
+test('a job that ends skipped on a reply with no valid review JSON leaves its ops comment terminal, never running',async t=>{
+  const app=await fixture(t,{pull:{draft:false}});
+  const out=await deliver(app,'issue_comment',comment());
+  const job=await settled(app,out.jobId);
+  assert.equal(job.status,'awaiting_chat');
+  const bridgePost=body=>fetch(app.origin+'/api/bridge',{method:'POST',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},body:JSON.stringify(body)}).then(r=>r.json());
+  const lease=(await bridgePost({action:'take',clientId:'fixture'})).job;
+  const raw=JSON.stringify({findings:[],merge_recommendation:'COMMENT'});
+  const res=await fetch(app.origin+'/api/bridge',{method:'POST',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},
+    body:JSON.stringify({action:'complete',jobId:job.id,leaseId:lease.leaseId,raw,results:[{provider:'chatgpt',raw}]})});
+  const reply=await res.json();
+  await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===job.id)?.status==='skipped',`job not skipped: ${res.status} ${JSON.stringify(reply)} ${app.harbor.getHarbor().jobs.find(j=>j.id===job.id)?.status}`);
+  await eventually(()=>{const last=app.ops.filter(b=>b.includes(job.id)).at(-1)||'';return /Status:\*\* skipped/.test(last);},
+    `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
+  const last=app.ops.filter(b=>b.includes(job.id)).at(-1);
+  assert.match(last,/Instant-tier skip/,'names why nothing was posted');
+});

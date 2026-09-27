@@ -194,6 +194,32 @@ function patchJob(jobId: string, fn: (j: Job) => Job) {
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? fn(j) : j)) };
   const job = state.jobs.find(j => j.id === jobId);
   if (job) recordJobHistory(job);
+  if (job && needsTerminalOps(job)) setTimeout(() => void finishOpsComment(jobId), 0);
+}
+
+const TERMINAL_OPS: readonly string[] = ["posted", "skipped", "failed"];
+
+/** A GitHub job that ended (skipped, dlq, cancelled) while its ops comment still says running or
+ * blocked (live aicc #515: an Instant-tier skip left "Waiting for provider response" for hours, and a
+ * lane tool read the job as in progress). A path that reports its own terminal phase has already set
+ * opsPhase when this runs (upsertOpsComment sets it before its first await). */
+function needsTerminalOps(job: Job): boolean {
+  return job.origin === "github" && Boolean(job.opsCommentId) && ["skipped", "dlq", "cancelled"].includes(job.status) &&
+    !TERMINAL_OPS.includes(job.opsPhase ?? "");
+}
+
+async function finishOpsComment(jobId: string) {
+  const job = state.jobs.find((j) => j.id === jobId);
+  if (!job || !needsTerminalOps(job) || !job.installationId) return;
+  const reason = job.skipReason || job.githubError || "";
+  const phase: OpsPhase = job.status === "dlq" ? "failed" : "skipped";
+  const note = job.status === "cancelled" ? `Cancelled${reason ? `: ${reason}` : "."} No review posted.`
+    : `No review posted${reason ? `: ${reason}` : "."}`;
+  try {
+    await upsertOpsComment(await installationToken(job.installationId), jobId, phase, [note]);
+  } catch {
+    /* never fail the job on its status comment */
+  }
 }
 
 export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
@@ -359,6 +385,10 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || job.origin !== "github") return;
   if (!opsCommentAllowed(job)) return;
+  // Recorded before the write: a terminal phase another path is writing is never overwritten by the
+  // generic one (finishOpsComment), nor a terminal one by a late "running".
+  if (TERMINAL_OPS.includes(job.opsPhase ?? "") && !TERMINAL_OPS.includes(phase)) return;
+  state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? { ...j, opsPhase: phase } : j)) };
   const body = buildOpsComment({
     phase,
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),

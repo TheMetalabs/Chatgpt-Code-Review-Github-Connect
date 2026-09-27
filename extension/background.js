@@ -700,7 +700,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.52";
+const WORKER_BUILD = "1.1.54";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -1380,9 +1380,28 @@ function answeredPage(state, provider) {
  * never with a URL echoed by the same reply. True if it was stored now. */
 function adoptFixConversation(state, result) {
   const seen = typeof result?.conversation === "string" && result.conversation.length <= 4096 ? result.conversation : "";
-  if (!seen || state.conversation) return false;
+  if (!seen || (state.conversation && !temporaryChatRekey(state, seen))) return false;
+  if (state.conversation) state.conversationRekeys = (state.conversationRekeys || 0) + 1;
   state.conversation = seen;
   return true;
+}
+
+/** A temporary chat's conversation (ChatGPT's /c/<id>?temporary-chat=true). */
+function temporaryChatConversation(url) {
+  try {
+    const u = new URL(url), home = new URL(providerUrl("chatgpt"));
+    return u.origin === home.origin && u.search === home.search && /^\/c\/[^/]+\/?$/.test(u.pathname);
+  } catch { return false; }
+}
+
+/** Whether the page's reported conversation `seen` is ChatGPT re-keying the stored temporary one (a
+ * local id, then the server's; live P0 2026-09-27: every review tab was preserved as "navigated"
+ * after it). The page reports a new identity only after adopting it on its own proof (json.js
+ * adoptMovedTemporaryChat: its exact sent turn only, no follow-up, no draft), and it adopts at most
+ * two moves: the worker follows it within the same bound. */
+function temporaryChatRekey(state, seen) {
+  return !samePage(seen, state.conversation) && (state.conversationRekeys || 0) < 2 &&
+    temporaryChatConversation(state.conversation) && temporaryChatConversation(seen);
 }
 
 /** How long a settled leg's tab whose ownership cannot be proven (loading, discarded, unreachable,
@@ -1429,7 +1448,7 @@ async function preserveFixTab(job, provider, jobs, reason, tab, cause, extra) {
     if (abandonedLeg(job, state) && matchesJob(released, job, provider)) ingestPageProgress(state, released);
   }
   const preservedTabId = state.tabId;
-  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: preservedTabId}});
+  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: preservedTabId, at: Date.now()}});
   if (tab) await reprobePreservedTab(tab.id, provider);
   return finishTabCleanup(job, provider, jobs, reason, cause);
 }
@@ -1671,7 +1690,9 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     // The tab's own URL first: the conversation the run was bound in, else the page where this run
     // last answered (answeredPage).
     const known = state.conversation || answeredPage(state, provider);
-    if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
+    // A temporary chat ChatGPT re-keyed is asked: only its page can prove the move was ChatGPT's.
+    const rekeyed = known && temporaryChatConversation(known) && temporaryChatConversation(tab.url);
+    if (known && !samePage(tab.url, known) && !rekeyed) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
   }
   // `secured`: this run's answer was completed and taken (collected, or its full source archived):
   // a page that no longer remembers that (reloaded, for one by this cleanup's own wake, or re-injected
@@ -2747,6 +2768,73 @@ function sweepOnce({includeStalled, staleMs = STALL_MS}) {
   sweepFlight = flight;
   return flight;
 }
+/** Ashlar's temporary-chat tabs of finished jobs (live P0 2026-09-27: 85 tabs left open, 126 of 131
+ * reviews kept as "navigated"). The user never uses temporary chats in this Chrome (user decision via
+ * the coordinator, 2026-09-27), so #82's "a touched tab is the user's" does not hold for them: a
+ * temporary-chat tab Ashlar opened (its page reports an Ashlar binding, or a preserved record names
+ * it) whose job is no longer in the worker registry is closed TEMP_TAB_CLOSE_AFTER_MS after it was
+ * first seen finished, and while more than TEMP_TAB_CAP temporary-chat tabs are open the oldest
+ * finished ones are closed first. A tab of a job in progress, a tab the worker still tracks, and any
+ * non-temporary conversation are never touched. */
+const TEMP_TAB_CLOSE_AFTER_MS = 10 * 60_000;
+const TEMP_TAB_CAP = 8;
+const FINISHED_SEEN_KEY = "ashlar:tempTabFinishedSeen";
+let reclaimFlight = null;
+function reclaimPreservedTabs({force = false} = {}) {
+  reclaimFlight ||= reclaimPreservedBody(force).finally(() => { reclaimFlight = null; });
+  return reclaimFlight;
+}
+
+/** A ChatGPT temporary chat: the bare page or the /c/<id> it moves to. */
+function temporaryChatTab(url) {
+  return samePage(url, providerUrl("chatgpt")) && String(url).includes("temporary-chat=true") || temporaryChatConversation(url);
+}
+
+async function reclaimPreservedBody(force) {
+  const cfg = await settings();
+  const counts = {closed: 0, kept: 0, open: 0};
+  if (!cfg.enabled || !cfg.origin) return {ok: false, error: "the worker is not configured", ...counts};
+  const registry = await workerJobs(cfg.origin);
+  const tracked = new Set(Object.values(registry).flatMap(job => job.providers.map(p => job.states[p]?.tabId)).filter(Number.isInteger));
+  const temp = (await chrome.tabs.query({})).filter(tab => allowedTab(tab, "chatgpt") && temporaryChatTab(tab.url));
+  counts.open = temp.length;
+  const session = await chrome.storage.session.get(null);
+  const recorded = new Map(Object.entries(session).filter(([key, v]) => key.startsWith(PRESERVED_PREFIX) && Number.isInteger(v?.tabId)).map(([key, v]) => [v.tabId, {key, at: v.at}]));
+  const seen = session[FINISHED_SEEN_KEY] && typeof session[FINISHED_SEEN_KEY] === "object" ? {...session[FINISHED_SEEN_KEY]} : {};
+  const now = Date.now(), finished = [];
+  for (const tab of temp) {
+    if (tracked.has(tab.id)) continue;
+    let status = null;
+    if (probeable(tab) === "chatgpt") {
+      try { status = await tabOp("reclaim-status", () => askPage(tab.id, {type: "ashlar-tab-status"}, contentFiles("chatgpt"))); } catch { status = null; }
+    }
+    const jobId = typeof status?.jobId === "string" ? status.jobId : "";
+    if (jobId && registry[jobId]) continue; // its job is in progress
+    if (!jobId && !recorded.has(tab.id)) continue; // not a tab Ashlar can name as its own
+    const since = Number.isFinite(recorded.get(tab.id)?.at) ? recorded.get(tab.id).at : (seen[tab.id] ??= now);
+    finished.push({tab, since});
+  }
+  for (const id of Object.keys(seen)) if (!finished.some(f => String(f.tab.id) === id)) delete seen[id];
+  finished.sort((a, b) => a.since - b.since);
+  let open = temp.length;
+  for (const {tab, since} of finished) {
+    const due = force || now - since >= TEMP_TAB_CLOSE_AFTER_MS || open > TEMP_TAB_CAP;
+    if (!due) { counts.kept += 1; continue; }
+    const closed = await tabOp("reclaim", async () => {
+      const current = await chrome.tabs.get(tab.id).catch(() => null);
+      if (!current || !temporaryChatTab(current.url) || current.pendingUrl) return false;
+      await chrome.tabs.remove(tab.id);
+      return true;
+    }).catch(() => false);
+    if (!closed) { counts.kept += 1; continue; }
+    counts.closed += 1; open -= 1; delete seen[tab.id];
+    const record = recorded.get(tab.id);
+    if (record) await chrome.storage.session.remove(record.key);
+  }
+  await chrome.storage.session.set({[FINISHED_SEEN_KEY]: seen});
+  return {ok: true, ...counts, open};
+}
+
 async function autoSweepStuckJobs(watchdogMs = AUTO_SWEEP_WATCHDOG_MS) {
   const {work, controller} = sweepOnce({includeStalled: true});
   const watchdog = setTimeout(() => controller.abort(), watchdogMs);
@@ -3077,7 +3165,7 @@ function loop() {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); void autoSweepStuckJobs(); }
+  if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); void autoSweepStuckJobs(); void reclaimPreservedTabs().catch(() => {}); }
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "ashlar-poll-now") {
@@ -3087,6 +3175,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "ashlar-clear-stuck") {
     // The button clears the same set the periodic sweep does, including stalled tab-gone jobs.
     clearStuckJobs({ includeStalled: true }).then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
+    return true;
+  }
+  if (message?.type === "ashlar-reclaim-preserved") {
+    reclaimPreservedTabs({force: true}).then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
     return true;
   }
   if (message?.type === "ashlar-hard-reset") {

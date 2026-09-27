@@ -286,12 +286,15 @@ async function conversationPage(t,kind,{url=kind==='fix'?TEMP_URL:CONV_URL,jobId
  return {page,send,journal,move,complete,harvest:()=>send('ashlar-harvest'),openCollect:()=>page.evaluate(()=>window.openCollect())};
 }
 /** The real worker wired to that page over the message protocol: the fix job is started in tab 10. */
-function wiredWorker(page,serverStatus){
- const job={jobId:'fix-A',kind:'fix',origin:'http://bridge',leaseId:'lease-A',prompt:'fix prompt',providers:['chatgpt'],reasoning:{chatgpt:'pro',grok:'heavy'},
+function wiredWorker(page,serverStatus,{kind='fix',jobId=kind==='fix'?'fix-A':'job-A'}={}){
+ const job={jobId,...(kind==='fix'?{kind:'fix'}:{}),origin:'http://bridge',leaseId:'lease-A',prompt:'fix prompt',providers:['chatgpt'],reasoning:{chatgpt:'pro',grok:'heavy'},
   states:{chatgpt:{tabId:10,started:true,runId:'run-A'}}};
- const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{'fix-A':job}}),
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{[jobId]:job}}),
   tabs:new Map([[10,{id:10,url:page.url(),status:'complete'}]]),
-  api:async(_path,body)=>body?.action==='ping'?{ok:true,active:serverStatus.value==='awaiting_chat',accepted:serverStatus.value==='awaiting_chat',status:serverStatus.value,bridge:{captureProtocol:1,localJsonRepairEnabled:false}}:{ok:true,job:null}});
+  api:async(_path,body)=>{
+   if(body?.action==='complete')serverStatus.value='posted';
+   return body?.action==='ping'?{ok:true,active:serverStatus.value==='awaiting_chat',accepted:serverStatus.value==='awaiting_chat',status:serverStatus.value,bridge:{captureProtocol:1,localJsonRepairEnabled:false}}:{ok:true,job:null};
+  }});
  b.chrome.tabs.sendMessage=(id,msg,callback)=>{
   b.messages.push({id,...msg});
   page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),msg).then(callback,error=>{
@@ -300,7 +303,7 @@ function wiredWorker(page,serverStatus){
  };
  // The tab's URL follows the page (an in-page pushState is a tab URL update in Chrome).
  const sync=()=>{b.tabs.get(10).url=page.url();};
- return {b,sync,state:()=>b.local.state.pendingReviewJobs['fix-A']?.states.chatgpt};
+ return {b,sync,state:()=>b.local.state.pendingReviewJobs[jobId]?.states.chatgpt};
 }
 for(const moved of [true,false]){
 const url=TEMP_URL; // a fix tab always opens on the temporary chat
@@ -430,6 +433,58 @@ test('real DOM send-time identity (review on a new chat): nothing recorded at se
  const out=await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL});
  assert.deepEqual({canClose:out.canClose,conversation:out.conversation},{canClose:true,conversation:CONV_URL});
 });
+
+// Live P0 2026-09-27 (73 of 81 harbor jobs tab_preserved, 85 tabs left open; 126 of 131 recent
+// histories end preserve_navigated): a review sent on the temporary chat pins the first
+// /c/<id>?temporary-chat=true it is moved to, a local id; ChatGPT then re-keys it to the server's id
+// (live #457: /c/local-chatgpt%3A…, then /c/6ab81601-…). Only a fix page adopted that re-key, so every
+// review's can-close read the re-key as a move away and its tab was preserved. A review adopts it on
+// the same proof as a fix (its exact sent turn only, no follow-up, no draft), at most twice.
+const LOCAL_CONV='https://chatgpt.com/c/local-chatgpt%3A11064951-b83e?temporary-chat=true';
+for(const [name,{draft,extra,third}={}] of [['re-keyed to the server id: closable there'],
+ ['re-keyed with a user draft in the composer: kept',{draft:'my own note'}],
+ ['re-keyed with a user turn added: kept',{extra:true}],
+ ['re-keyed a third time: kept',{third:true}]]){
+ test(`real DOM (P0 tab leak): a review on the temporary chat, pinned on its local id, ${name}`,async t=>{
+  const ctx=await conversationPage(t,'review',{url:TEMP_URL,gated:true});
+  // A review journal carries no lossless form (composer.js keeps `exact` for a fix only).
+  await ctx.page.evaluate(()=>{const k=submissionKey();const j=JSON.parse(sessionStorage.getItem(k));delete j.exact;sessionStorage.setItem(k,JSON.stringify(j));
+   const st=__ashlarRunnerState;if(st?.confirmedSubmission?.record)delete st.confirmedSubmission.record.exact;});
+  await ctx.move(LOCAL_CONV); // the provider assigns the local temporary id (no user action)
+  await ctx.openCollect();await ctx.page.clock.runFor(1600);
+  assert.equal((await ctx.journal()).conversation,LOCAL_CONV,'pinned on the local id while answering');
+  await ctx.complete();await ctx.page.clock.runFor(3200);
+  if(draft)await ctx.page.evaluate(d=>{document.querySelector('#prompt-textarea').value=d;},draft);
+  if(extra)await ctx.page.evaluate(()=>{const u=document.querySelector('[data-message-author-role="user"]');u.parentElement.insertAdjacentHTML('beforeend','<div data-message-author-role="user" data-message-id="user-B">my question</div>');});
+  await ctx.move(TEMP_CONV); // ChatGPT re-keys to the server id
+  if(third){await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL});await ctx.move(TEMP_CONV_2);await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL});await ctx.move('https://chatgpt.com/c/third?temporary-chat=true');}
+  const out=await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL});
+  const owned=!draft&&!extra&&!third;
+  assert.deepEqual({canClose:out.canClose===true,conversation:out.conversation},
+   owned?{canClose:true,conversation:TEMP_CONV}:{canClose:false,conversation:out.conversation},JSON.stringify(out));
+  if(owned)assert.equal((await ctx.journal()).conversation,TEMP_CONV,'re-bound to the server id');
+ });
+}
+
+for(const rekey of [true,false]){
+ test(`real DOM + worker (P0 tab leak): a posted review whose temporary chat ${rekey?'ChatGPT re-keyed after the answer is closed':'moved to the user\'s conversation is kept'}`,async t=>{
+  const ctx=await conversationPage(t,'review',{url:TEMP_URL,gated:true});
+  await ctx.page.evaluate(()=>{const k=submissionKey();const j=JSON.parse(sessionStorage.getItem(k));delete j.exact;sessionStorage.setItem(k,JSON.stringify(j));
+   const st=__ashlarRunnerState;if(st?.confirmedSubmission?.record)delete st.confirmedSubmission.record.exact;});
+  const server={value:'awaiting_chat'};
+  const {b,sync,state}=wiredWorker(ctx.page,server,{kind:'review'});
+  await ctx.move(LOCAL_CONV);sync();
+  await ctx.openCollect();await ctx.page.clock.runFor(1600);
+  await b.tick();
+  assert.equal(state().conversation,LOCAL_CONV,'the worker keeps the local id the page pinned');
+  await ctx.complete();await ctx.page.clock.runFor(3200);
+  await ctx.move(rekey?TEMP_CONV:OTHER_URL);sync();
+  for(let i=0;i<4 && state();i++)await b.tick();
+  assert.equal(b.calls.some(c=>c.action==='complete'),true,'delivered');
+  assert.equal(state(),undefined,'retired');
+  assert.deepEqual(b.closedTabs,rekey?[10]:[],rekey?'the re-keyed tab is closed':'the user\'s tab is kept');
+ });
+}
 
 // Ashlar 4096068000: a completed fix whose sent turn the user edits after collection is never
 // handed out or closed; its tab is released and preserved (fixOwnershipProof "complete").

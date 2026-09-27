@@ -700,7 +700,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.52";
+const WORKER_BUILD = "1.1.53";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -1380,9 +1380,28 @@ function answeredPage(state, provider) {
  * never with a URL echoed by the same reply. True if it was stored now. */
 function adoptFixConversation(state, result) {
   const seen = typeof result?.conversation === "string" && result.conversation.length <= 4096 ? result.conversation : "";
-  if (!seen || state.conversation) return false;
+  if (!seen || (state.conversation && !temporaryChatRekey(state, seen))) return false;
+  if (state.conversation) state.conversationRekeys = (state.conversationRekeys || 0) + 1;
   state.conversation = seen;
   return true;
+}
+
+/** A temporary chat's conversation (ChatGPT's /c/<id>?temporary-chat=true). */
+function temporaryChatConversation(url) {
+  try {
+    const u = new URL(url), home = new URL(providerUrl("chatgpt"));
+    return u.origin === home.origin && u.search === home.search && /^\/c\/[^/]+\/?$/.test(u.pathname);
+  } catch { return false; }
+}
+
+/** Whether the page's reported conversation `seen` is ChatGPT re-keying the stored temporary one (a
+ * local id, then the server's; live P0 2026-09-27: every review tab was preserved as "navigated"
+ * after it). The page reports a new identity only after adopting it on its own proof (json.js
+ * adoptMovedTemporaryChat: its exact sent turn only, no follow-up, no draft), and it adopts at most
+ * two moves: the worker follows it within the same bound. */
+function temporaryChatRekey(state, seen) {
+  return !samePage(seen, state.conversation) && (state.conversationRekeys || 0) < 2 &&
+    temporaryChatConversation(state.conversation) && temporaryChatConversation(seen);
 }
 
 /** How long a settled leg's tab whose ownership cannot be proven (loading, discarded, unreachable,
@@ -1429,7 +1448,7 @@ async function preserveFixTab(job, provider, jobs, reason, tab, cause, extra) {
     if (abandonedLeg(job, state) && matchesJob(released, job, provider)) ingestPageProgress(state, released);
   }
   const preservedTabId = state.tabId;
-  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: preservedTabId}});
+  await chrome.storage.session.set({[preservedKey(job.jobId, provider, state.runId)]: {tabId: preservedTabId, at: Date.now()}});
   if (tab) await reprobePreservedTab(tab.id, provider);
   return finishTabCleanup(job, provider, jobs, reason, cause);
 }
@@ -1671,7 +1690,9 @@ async function forceCloseFixTab(job, provider, jobs, tab) {
     // The tab's own URL first: the conversation the run was bound in, else the page where this run
     // last answered (answeredPage).
     const known = state.conversation || answeredPage(state, provider);
-    if (known && !samePage(tab.url, known)) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
+    // A temporary chat ChatGPT re-keyed is asked: only its page can prove the move was ChatGPT's.
+    const rekeyed = known && temporaryChatConversation(known) && temporaryChatConversation(tab.url);
+    if (known && !samePage(tab.url, known) && !rekeyed) return preserveFixTab(job, provider, jobs, "the tab moved to another conversation; tab preserved", tab, "navigated");
   }
   // `secured`: this run's answer was completed and taken (collected, or its full source archived):
   // a page that no longer remembers that (reloaded, for one by this cleanup's own wake, or re-injected
@@ -2747,6 +2768,74 @@ function sweepOnce({includeStalled, staleMs = STALL_MS}) {
   sweepFlight = flight;
   return flight;
 }
+/** How long a preserved review tab waits before the idle worker asks its page again
+ * (reclaimPreservedTabs). */
+const RECLAIM_AFTER_MS = 10 * 60_000;
+const RECLAIM_EVERY_MS = 5 * 60_000;
+let reclaimFlight = null;
+
+/** Close the preserved REVIEW tabs whose page now proves them Ashlar's (live P0 2026-09-27: 85 tabs
+ * left open, 126 of 131 preserved as "navigated" after ChatGPT re-keyed their temporary chat). Only
+ * while the worker is idle (no job in its registry), one tab operation per record. Each page is asked
+ * the same can-close verdict a settled leg gets (json.js tabOwnership, which now follows the re-key):
+ * a tab is closed only on an owned verdict for its own job and run, in the conversation the page
+ * names, and still showing it; a user turn, a draft, a follow-up, another conversation or no answer
+ * keeps it. A fix tab is never reclaimed (#77: only its delivered-answer path closes it). `force`
+ * skips the age wait (the popup's button). Returns {closed, kept, skipped}. */
+let reclaimRanAt = 0;
+function reclaimPreservedTabs({force = false} = {}) {
+  // The alarm asks every minute; the tabs are probed at most every RECLAIM_EVERY_MS unless forced.
+  if (!force && !reclaimFlight && Date.now() - reclaimRanAt < RECLAIM_EVERY_MS) return Promise.resolve({ok: true, closed: 0, kept: 0, skipped: 0});
+  reclaimFlight ||= (reclaimRanAt = Date.now(), reclaimPreservedBody(force).finally(() => { reclaimFlight = null; }));
+  return reclaimFlight;
+}
+async function reclaimPreservedBody(force) {
+  const cfg = await settings();
+  const counts = {closed: 0, kept: 0, skipped: 0};
+  if (!cfg.enabled || !cfg.origin) return {ok: false, error: "the worker is not configured", ...counts};
+  const registry = await workerJobs(cfg.origin);
+  if (Object.keys(registry).length) return {ok: false, error: "the worker is busy", ...counts};
+  // Candidates: every provider tab whose page reports a released review binding (the read-only
+  // inventory handshake). The session's preserved records only date a preserve: an extension update
+  // clears them, and the tabs it left must still be found.
+  const session = await chrome.storage.session.get(null);
+  for (const tab of await chrome.tabs.query({})) {
+    const provider = probeable(tab);
+    if (!provider) continue;
+    let status;
+    try { status = await tabOp("reclaim-status", () => askPage(tab.id, {type: "ashlar-tab-status"}, contentFiles(provider))); } catch { continue; }
+    const jobId = typeof status?.jobId === "string" ? status.jobId : "", runId = typeof status?.runId === "string" ? status.runId : "";
+    if (status?.ownershipProtocol !== 1 || status.released !== true || !jobId || !runId || status.provider !== provider) continue;
+    const key = preservedKey(jobId, provider, runId);
+    if (jobId.startsWith("fix-") || registry[jobId] ||
+        (!force && Number.isFinite(session[key]?.at) && Date.now() - session[key].at < RECLAIM_AFTER_MS)) { counts.skipped += 1; continue; }
+    const closed = await tabOp("reclaim", () => reclaimPreservedTab(key, tab.id, jobId, provider, runId));
+    counts[closed === true ? "closed" : closed === false ? "kept" : "skipped"] += 1;
+  }
+  return {ok: true, ...counts};
+}
+/** One preserved tab: true closed, false kept, undefined not askable now (gone, loading, frozen). */
+async function reclaimPreservedTab(key, tabId, jobId, provider, runId) {
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); } catch { await chrome.storage.session.remove(key); return undefined; }
+  if (!allowedTab(tab, provider) || tab.pendingUrl || tab.status !== "complete" || tab.discarded === true || tab.frozen === true) return undefined;
+  let result;
+  try {
+    result = await askPage(tabId, {type: "ashlar-can-close", jobId, runId, provider, kind: "review", secured: true,
+      allocationUrl: providerUrl(provider)}, contentFiles(provider));
+  } catch { return undefined; }
+  const conversation = typeof result?.conversation === "string" ? result.conversation : "";
+  const owned = result?.ok === true && result.canClose === true && result.jobId === jobId && result.runId === runId &&
+    result.blank !== true && result.unsent !== true && result.unpinned !== true && result.legacy !== true &&
+    result.legacyReply !== true && conversation && samePage(result.url, conversation) && samePage(tab.url, conversation);
+  if (!owned) return false;
+  const current = await chrome.tabs.get(tabId).catch(() => null);
+  if (!current || current.pendingUrl || !samePage(current.url, conversation)) return false;
+  await chrome.tabs.remove(tabId);
+  await chrome.storage.session.remove(key);
+  return true;
+}
+
 async function autoSweepStuckJobs(watchdogMs = AUTO_SWEEP_WATCHDOG_MS) {
   const {work, controller} = sweepOnce({includeStalled: true});
   const watchdog = setTimeout(() => controller.abort(), watchdogMs);
@@ -3077,7 +3166,7 @@ function loop() {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); void autoSweepStuckJobs(); }
+  if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); void autoSweepStuckJobs(); void reclaimPreservedTabs().catch(() => {}); }
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "ashlar-poll-now") {
@@ -3087,6 +3176,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "ashlar-clear-stuck") {
     // The button clears the same set the periodic sweep does, including stalled tab-gone jobs.
     clearStuckJobs({ includeStalled: true }).then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
+    return true;
+  }
+  if (message?.type === "ashlar-reclaim-preserved") {
+    reclaimPreservedTabs({force: true}).then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
     return true;
   }
   if (message?.type === "ashlar-hard-reset") {

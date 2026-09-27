@@ -1000,15 +1000,19 @@ function adoptMovedTemporaryChat(state, submission) {
 function temporaryChatMoveClean(state, submission) {
   state.moveCleanWhy = "";
   const names = submission.attachments;
-  if (typeof submission.exact !== "string" || !Array.isArray(names) || !names.length || submission.submittedUsers !== 1)
+  // A review journal has no lossless form: its sent turn is proven by journaledTurnIntegrity (the
+  // normalized prompt, Markdown-aware), the same proof its collector and can-close rest on.
+  const review = typeof submission.exact !== "string";
+  // A review sent with no attachment has no card to show; a fix always sends its file.
+  if ((review && typeof submission.expected !== "string") || !Array.isArray(names) || (!review && !names.length) || submission.submittedUsers !== 1)
     return (state.moveCleanWhy = `journal exact:${typeof submission.exact} names:${Array.isArray(names) ? names.length : "-"} submittedUsers:${submission.submittedUsers}`), "user";
   const draft = composerDraftText();
   if (composerStagedFiles(state, submission).length || (draft && normalizePrompt(draft) !== submission.expected))
     return (state.moveCleanWhy = `draft staged:${composerStagedFiles(state, submission).length} draftLen:${(draft || "").length}`), "user";
   const users = userTurnEls();
   if (!users.length) return (state.moveCleanWhy = "no_user_turn"), "pending";
-  if (users.length !== 1 || !fixTurnExact(users[0], submission.exact, names))
-    return (state.moveCleanWhy = `users:${users.length} exact:${users.length ? fixTurnExact(users[0], submission.exact, names) : "-"} textLen:${users.length ? ((typeof turnTextRoot === "function" ? turnTextRoot(users[0]) : users[0])?.textContent || "").length : "-"} wantLen:${submission.exact.length}`), "user";
+  if (users.length !== 1 || (!review && !fixTurnExact(users[0], submission.exact, names)))
+    return (state.moveCleanWhy = `users:${users.length} exact:${users.length ? fixTurnExact(users[0], submission.exact, names) : "-"} textLen:${users.length ? ((typeof turnTextRoot === "function" ? turnTextRoot(users[0]) : users[0])?.textContent || "").length : "-"} wantLen:${(review ? submission.expected : submission.exact).length}`), "user";
   if (typeof turnAttachments === "function" && !turnAttachments(users[0], names).shown) return (state.moveCleanWhy = "card_not_shown"), "pending";
   if (journaledTurnIntegrity(submission, users) !== "exact") {
     const {messageId: _stale, ...rebound} = submission;
@@ -1307,7 +1311,9 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   // run's conversation is recorded (at send, or a new-chat review's pin), the page must still show it.
   // A fix's temporary chat ChatGPT moved to its own /c/<id>?temporary-chat=true (fixOwnershipProof):
   // the same adoption, whichever check sees the move first.
-  if (fix && adoptMovedTemporaryChat(state, submission) === "pending") return {ownership: "unknown", cause: "not_rendered"};
+  // A review pinned on the local id its temporary chat got first is re-keyed the same way (live P0
+  // 2026-09-27: 126 of 131 review tabs preserved as "navigated" after the re-key).
+  if ((fix || submission?.conversation) && adoptMovedTemporaryChat(state, submission) === "pending") return {ownership: "unknown", cause: "not_rendered"};
   const pinned = typeof submission.conversation === "string" ? submission.conversation : "";
   if (pinned && !samePage(pinned, href)) return {ownership: "unknown", identity: "changed", cause: "navigated", conversation: pinned};
   // A review with no pin has no trustworthy conversation: it is Ashlar's only on the new chat its tab

@@ -602,16 +602,18 @@ async function markLoggedOut(provider) {
     const loginPause = await loginPauseMap();
     loginPause[provider] = Date.now() + LOGIN_PAUSE_MS;
     const probe = (await chrome.storage.local.get(["loginProbe"])).loginProbe || {};
-    await chrome.storage.local.set({ loginPause, loginProbe: {...probe, [provider]: true} });
+    // The time of the logout: only a job admitted after it can prove the login is back.
+    await chrome.storage.local.set({ loginPause, loginProbe: {...probe, [provider]: Date.now()} });
     return loginPause[provider];
   });
 }
 
-/** A provider answered after a logout: the login is back, and admission leaves probe mode. */
-async function clearLoginProbe(provider) {
+/** A provider answered a job admitted after its logout: the login is back, and admission leaves
+ * probe mode. A job sent before the logout proves nothing about the session now. */
+async function clearLoginProbe(provider, job) {
   return writeInOrder(async () => {
     const probe = (await chrome.storage.local.get(["loginProbe"])).loginProbe || {};
-    if (!probe[provider]) return;
+    if (!probe[provider] || !(Number(job?.admittedAt) >= Number(probe[provider]))) return;
     delete probe[provider];
     await chrome.storage.local.set({ loginProbe: probe });
   });
@@ -625,10 +627,14 @@ async function chatgptPace(jobs, loginPause) {
   // chrome.storage.local "chatgptPacing" {maxInFlight, gapMs} tunes the defaults without a release.
   const maxInFlight = Number.isInteger(chatgptPacing?.maxInFlight) && chatgptPacing.maxInFlight > 0 ? chatgptPacing.maxInFlight : CHATGPT_MAX_IN_FLIGHT;
   const gapMs = Number.isFinite(chatgptPacing?.gapMs) && chatgptPacing.gapMs >= 0 ? chatgptPacing.gapMs : CHATGPT_ADMIT_GAP_MS;
+  // A leg whose answer is archived and waiting on the server's JSON repair no longer uses ChatGPT
+  // (activelyReviewing's rule): it never holds a slot, however long the repair queue takes.
   const inFlight = Object.values(jobs).filter(job => job.providers?.includes("chatgpt") && !job.serverStatus &&
-    (() => { const s = job.states?.chatgpt || {}; return !s.delivered && !s.outcome; })()).length;
+    (() => { const s = job.states?.chatgpt || {}; return !s.delivered && !s.outcome && !sourceArchiveDurable(s); })()).length;
   if (inFlight >= (loginProbe.chatgpt ? 1 : maxInFlight)) return loginProbe.chatgpt ? "login_probe" : "chatgpt_in_flight";
-  if (Date.now() - Number(chatgptAdmittedAt || 0) < gapMs) return "chatgpt_spacing";
+  // A time in the future (the clock went back) never holds admission.
+  const since = Date.now() - Number(chatgptAdmittedAt || 0);
+  if (since >= 0 && since < gapMs) return "chatgpt_spacing";
   return "";
 }
 
@@ -2237,7 +2243,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       completion:typeof result.completion?.responseId === "string" && typeof result.completion?.context === "string"
         ? {responseId:result.completion.responseId,context:result.completion.context} : undefined };
     workerStep(job,provider,"response_collected");
-    await clearLoginProbe(provider);
+    await clearLoginProbe(provider, job);
   } else if (result?.code && result.code !== "idle") {
     state.outcome = failure(result.code, String(result.error || "chat review failed"));
   } else {
@@ -2475,6 +2481,7 @@ async function acceptRepairReceipt(job, provider, jobs, result) {
      result.sourceHash!==attempt.sourceHash || result.responseId!==attempt.responseId || typeof result.raw!=="string" || !result.raw.trim())return;
   attempt.raw=result.raw;attempt.status="accepted";
   state.outcome={ok:true,raw:result.raw,originalText:attempt.text};
+  await clearLoginProbe(provider, job); // the page answered: repaired or not, the login worked
   state.delivered=true;state.repairReceiptPending=!sourceArchiveDurable(state);
   state.cleanupPending=!state.cleanupDone;
   delete state.formatError;delete state.repairError;
@@ -3072,7 +3079,8 @@ function admitJob(cfg, jobs) {
       .filter(p => ["chatgpt", "grok"].includes(p));
     if (!job.providers.length) throw new Error("bridge returned no supported review providers");
     for (const p of job.providers) job.states[p] = {};
-    if (job.providers.includes("chatgpt")) await chrome.storage.local.set({chatgptAdmittedAt: Date.now()});
+    job.admittedAt = Date.now();
+    if (job.providers.includes("chatgpt")) await chrome.storage.local.set({chatgptAdmittedAt: job.admittedAt});
     jobs[job.jobId] = job;
     await saveJobs(jobs); // Provider intents reserve admission space before this lock opens.
     await chrome.storage.local.set({lastJobId: job.jobId, lastError: ""});

@@ -138,7 +138,7 @@ test('ChatGPT pacing: after a logout nothing is taken until the pause ends, then
    :mode==='ok'?{ok:true,raw:json}:{ok:false,code:'busy'}});
  for(let i=0;i<6 && !b.calls.some(c=>c.action==='failure'&&c.jobId==='A');i++){await b.tick();await flush();}
  assert.ok(b.local.state.loginPause?.chatgpt>Date.now(),'paused');
- assert.equal(b.local.state.loginProbe?.chatgpt,true);
+ assert.ok(Number.isFinite(b.local.state.loginProbe?.chatgpt),'probe mode records the logout time');
  const failedBefore=b.calls.filter(c=>c.action==='failure').length, takesBefore=taken(b);
  await ticks(b);
  assert.equal(taken(b),takesBefore,'nothing is taken while paused');
@@ -156,4 +156,21 @@ test('ChatGPT pacing: after a logout nothing is taken until the pause ends, then
  // A and B were both in flight when the logout showed: only they fail; the probe (C) and D answer.
  assert.deepEqual(b.calls.filter(c=>['complete','failure'].includes(c.action)).map(c=>[c.action,c.jobId]),
   [['failure','A'],['failure','B'],['complete','C'],['complete','D']]);
+});
+
+test('ChatGPT pacing (#128 review): a leg waiting on the server JSON repair holds no slot; an answer sent before the logout does not end probe mode',async()=>{
+ const archived={sourceCapture:{archiveDurable:true,text:'x',totalChars:1,sourceHash:'h',responseId:'r',id:'c'},repairAttempt:{id:'ra',status:'running'},runId:'r1',started:true};
+ const waiting=id=>({jobId:id,origin:'http://bridge',providers:['chatgpt'],states:{chatgpt:{...archived}}});
+ const offers=[offer('C')];
+ const api=async(_p,body)=>body?.action==='take'?{ok:true,job:offers.shift()??null}:{ok:true,prompt:'p',active:true,accepted:true,status:'awaiting_chat'};
+ const b=background({local:storage({origin:'http://bridge',token:'token',chatgptPacing:{maxInFlight:2,gapMs:0},pendingReviewJobs:{A:waiting('A'),B:waiting('B')}}),api,handler:()=>({ok:false,code:'busy'})});
+ await ticks(b,3);
+ assert.ok(b.local.state.pendingReviewJobs.C,`C admitted beside two legs in repair: ${b.local.state.bridgeWorkerStatus?.admissionPhase}`);
+ // Probe mode set at a logout; an answer from a job admitted before it keeps probe mode.
+ const at=Date.now();
+ await b.local.set({loginProbe:{chatgpt:at}});
+ await b.context.clearLoginProbe('chatgpt',{admittedAt:at-60_000});
+ assert.equal(b.local.state.loginProbe.chatgpt,at,'a pre-logout answer proves nothing');
+ await b.context.clearLoginProbe('chatgpt',{admittedAt:at+1});
+ assert.equal(b.local.state.loginProbe.chatgpt,undefined,'a post-logout answer ends probe mode');
 });

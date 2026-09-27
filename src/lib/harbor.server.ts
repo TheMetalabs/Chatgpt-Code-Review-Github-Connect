@@ -206,7 +206,7 @@ const TERMINAL_OPS: readonly string[] = ["posted", "skipped", "failed"];
  * lane tool read the job as in progress). A path that reports its own terminal phase has already set
  * opsPhase when this runs (upsertOpsComment sets it before its first await). */
 function needsTerminalOps(job: Job): boolean {
-  return job.origin === "github" && Boolean(job.opsCommentId) && ["skipped", "dlq", "cancelled"].includes(job.status) &&
+  return job.origin === "github" && Boolean(job.opsCommentId || job.opsPhase) && ["posted", "skipped", "dlq", "cancelled"].includes(job.status) &&
     !TERMINAL_OPS.includes(job.opsPhase ?? "");
 }
 
@@ -214,8 +214,9 @@ async function finishOpsComment(jobId: string) {
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || !needsTerminalOps(job) || !job.installationId) return;
   const reason = job.skipReason || job.githubError || "";
-  const phase: OpsPhase = job.status === "dlq" ? "failed" : "skipped";
-  const note = job.status === "cancelled" ? `Cancelled${reason ? `: ${reason}` : "."} No review posted.`
+  const phase: OpsPhase = job.status === "dlq" ? "failed" : job.status === "posted" ? "posted" : "skipped";
+  const note = job.status === "posted" ? "Review posted."
+    : job.status === "cancelled" ? `Cancelled${reason ? `: ${reason}` : "."} No review posted.`
     : `No review posted${reason ? `: ${reason}` : "."}`;
   try {
     await upsertOpsComment(await installationToken(job.installationId), jobId, phase, [note]);
@@ -399,13 +400,17 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   // One write at a time per job, in call order: a slow "running" write can no longer land after the
   // terminal one, and a write queued behind the comment's creation updates it instead of creating a
   // second comment.
-  const previous = job.opsPhase;
   const run = (opsWrites.get(jobId) ?? Promise.resolve()).then(async () => {
-    if (await writeOpsComment(token, jobId, body)) return;
+    if (await writeOpsComment(token, jobId, body)) {
+      state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? { ...j, opsWritten: phase } : j)) };
+      if (TERMINAL_OPS.includes(phase)) opsRetries.delete(jobId);
+      return;
+    }
     // Not written: a terminal phase must not stand as reported, or finishOpsComment never writes it
-    // (live aicc #539). The job's comment keeps its last phase, and the terminal write is retried.
+    // (live aicc #539). The phase falls back to the last one GitHub took, and the terminal write is
+    // retried.
     if (!TERMINAL_OPS.includes(phase)) return;
-    state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId && j.opsPhase === phase ? { ...j, opsPhase: previous } : j)) };
+    state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId && j.opsPhase === phase ? { ...j, opsPhase: j.opsWritten } : j)) };
     scheduleOpsRetry(jobId);
   });
   const settled = run.then(() => {}, () => {});
@@ -433,8 +438,11 @@ async function writeOpsComment(token: string, jobId: string, body: string): Prom
   try {
     await write(token);
     return true;
-  } catch {
-    /* retried below with a fresh token */
+  } catch (e) {
+    // Only an auth failure is retried here: a create that timed out may have been stored, and a second
+    // one would duplicate the comment (the bounded terminal retry covers the rest).
+    const status = (e as { status?: number })?.status;
+    if (!(status === 401 || /\b401\b|Bad credentials/i.test(String((e as Error)?.message ?? "")))) return false;
   }
   try {
     const installationId = state.jobs.find((j) => j.id === jobId)?.installationId;
@@ -452,6 +460,7 @@ const opsRetries = new Map<string, number>();
 
 /** Retry a terminal ops write that GitHub did not take, a bounded number of times. */
 function scheduleOpsRetry(jobId: string) {
+  if (!state.jobs.some((j) => j.id === jobId)) { opsRetries.delete(jobId); return; }
   const n = (opsRetries.get(jobId) ?? 0) + 1;
   if (n > OPS_RETRY_MAX) { opsRetries.delete(jobId); return; }
   opsRetries.set(jobId, n);

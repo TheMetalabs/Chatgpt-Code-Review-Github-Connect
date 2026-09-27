@@ -241,7 +241,7 @@ test('live 1.1.39 card shape: a staged file whose name is bare leaf text is its 
 // Live aicc #539 (09-27 22:50/23:06 KST): two reviews reached send_waiting (files ready) while ChatGPT
 // ended the session, Send never became clickable, and they sat there for 16 and 84 min until their
 // tabs were gone (tab_closed "stalled"). send_waiting is bounded at 3 min (presend_stalled, nothing
-// sent, retried), and a logged-out page ends it at once as logged_out.
+// sent; the reviewer is reported failed), and a logged-out page ends it at once as logged_out.
 for(const [name,{loggedOut}={}] of [['Send never clickable: presend_stalled after 3 min, nothing sent'],['the page logs out: logged_out at once',{loggedOut:true}]]){
  test(`send_waiting (${name})`,async t=>{
   const tab=await chatTab(t);

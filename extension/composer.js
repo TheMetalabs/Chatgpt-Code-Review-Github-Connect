@@ -1130,9 +1130,10 @@ async function clickSend(findSend, findComposer, expectedText) {
   // (live 1.1.35: a review sat in attachments_waiting for 13+ minutes and never clicked Send).
   const UPLOAD_MS = 3 * 60 * 1000;
   // The window for Send to become clickable once the uploads are done. Past it nothing was sent and
-  // the run ends as presend_stalled (retried), never a silent endless wait (live aicc #539: two
-  // reviews sat in send_waiting for 16 and 84 min after ChatGPT ended the session, until their tabs
-  // were gone). A logged-out page ends it at once as logged_out.
+  // the run ends as presend_stalled (the reviewer is reported failed, and the lane asks again), never a
+  // silent endless wait (live aicc #539: two reviews sat in send_waiting for 16 and 84 min after
+  // ChatGPT ended the session, until their tabs were gone). A logged-out page ends it at once as
+  // logged_out.
   const SEND_WAIT_MS = 3 * 60 * 1000;
   let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null;
   for (;;) {
@@ -1168,7 +1169,9 @@ async function clickSend(findSend, findComposer, expectedText) {
       if (uploadBusy && Date.now() - uploadWaitSince >= UPLOAD_MS) throw uploadWaitExpired(form, record.attachments || [], UPLOAD_MS);
       if (typeof throwIfLoggedOut === "function") throwIfLoggedOut();
       sendWaitSince = uploadBusy ? null : sendWaitSince ?? Date.now();
-      if (!uploadBusy && Date.now() - sendWaitSince >= SEND_WAIT_MS) {
+      // Only while Send is still not clickable this tick: a tab that slept past the bound with Send
+      // ready clicks it instead.
+      if (!uploadBusy && !actionableSend(button) && Date.now() - sendWaitSince >= SEND_WAIT_MS) {
         if (typeof savePresendStallHtml === "function") savePresendStallHtml("send_waiting");
         throw presendStalled("send_waiting");
       }

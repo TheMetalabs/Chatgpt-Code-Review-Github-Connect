@@ -188,6 +188,8 @@ export function cancelHarborJob(jobId: string) {
     ),
   };
   const job=state.jobs.find(j=>j.id===jobId);if(job)recordJobHistory(job);
+  // An operator (or a lane's stop) cancel ends the job too: its comment must not stay running.
+  if (job && needsTerminalOps(job)) setTimeout(() => void finishOpsComment(jobId), 0);
 }
 
 function patchJob(jobId: string, fn: (j: Job) => Job) {
@@ -394,6 +396,21 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
     notes: [`Job: ${job.id}`, ...notes],
   });
+  // One write at a time per job, in call order: a slow "running" write can no longer land after the
+  // terminal one, and a write queued behind the comment's creation updates it instead of creating a
+  // second comment.
+  const run = (opsWrites.get(jobId) ?? Promise.resolve()).then(() => writeOpsComment(token, jobId, body));
+  const settled = run.then(() => {}, () => {});
+  opsWrites.set(jobId, settled);
+  void settled.then(() => { if (opsWrites.get(jobId) === settled) opsWrites.delete(jobId); });
+  await settled;
+}
+
+const opsWrites = new Map<string, Promise<void>>();
+
+async function writeOpsComment(token: string, jobId: string, body: string) {
+  const job = state.jobs.find((j) => j.id === jobId);
+  if (!job) return;
   try {
     if (job.opsCommentId) {
       await updateIssueComment(token, {

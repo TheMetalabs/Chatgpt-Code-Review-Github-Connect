@@ -359,3 +359,15 @@ test('a job that ends skipped on a reply with no valid review JSON leaves its op
   const last=app.ops.filter(b=>b.includes(job.id)).at(-1);
   assert.match(last,/Instant-tier skip/,'names why nothing was posted');
 });
+
+test('an operator (lane stop) cancel leaves the ops comment terminal, never running',async t=>{
+  const app=await fixture(t,{pull:{draft:false}});
+  const out=await deliver(app,'issue_comment',comment());
+  const job=await settled(app,out.jobId);
+  assert.equal(job.status,'awaiting_chat');
+  await eventually(()=>app.ops.some(b=>b.includes(job.id)),'no ops comment yet');
+  app.harbor.cancelHarborJob(job.id);
+  await eventually(()=>/Status:\*\* skipped/.test(app.ops.filter(b=>b.includes(job.id)).at(-1)||''),
+    `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
+  assert.match(app.ops.filter(b=>b.includes(job.id)).at(-1),/Cancelled: cancelled by operator/);
+});

@@ -3,6 +3,14 @@ const QUOTA_MS = { chatgpt: 5 * 60 * 60 * 1000, grok: 7 * 24 * 60 * 60 * 1000 };
 // A page that reported its provider logged out (#455) pauses that provider's new legs this long,
 // then the next leg opens a tab and checks again.
 const LOGIN_PAUSE_MS = 10 * 60 * 1000;
+/** ChatGPT pacing (live 2026-09-27: bursts of ~8 reviews + ~6 fixes in 3 min, 7 provider tabs, were
+ * followed each time by ChatGPT ending the session: cf_clearance reissued, the session cookie
+ * deleted, every later job logged_out). At most CHATGPT_MAX_IN_FLIGHT ChatGPT jobs (review and fix
+ * together) run at once, a new one is admitted at least CHATGPT_ADMIT_GAP_MS after the previous one,
+ * and after a logout the worker takes nothing until the pause ends, then one job at a time (the
+ * probe) until one succeeds. The rest wait in the server's queue. */
+const CHATGPT_MAX_IN_FLIGHT = 2;
+const CHATGPT_ADMIT_GAP_MS = 45_000;
 const LOGGED_OUT_ERROR = "ChatGPT is logged out in this Chrome profile; log in and retry (nothing was typed or sent)";
 const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
@@ -593,9 +601,35 @@ async function markLoggedOut(provider) {
   return writeInOrder(async () => {
     const loginPause = await loginPauseMap();
     loginPause[provider] = Date.now() + LOGIN_PAUSE_MS;
-    await chrome.storage.local.set({ loginPause });
+    const probe = (await chrome.storage.local.get(["loginProbe"])).loginProbe || {};
+    await chrome.storage.local.set({ loginPause, loginProbe: {...probe, [provider]: true} });
     return loginPause[provider];
   });
+}
+
+/** A provider answered after a logout: the login is back, and admission leaves probe mode. */
+async function clearLoginProbe(provider) {
+  return writeInOrder(async () => {
+    const probe = (await chrome.storage.local.get(["loginProbe"])).loginProbe || {};
+    if (!probe[provider]) return;
+    delete probe[provider];
+    await chrome.storage.local.set({ loginProbe: probe });
+  });
+}
+
+/** Why no ChatGPT job may be admitted now ("" when one may): paused as logged out, the in-flight
+ * cap (1 while probing after a logout), or the gap since the last admission. */
+async function chatgptPace(jobs, loginPause) {
+  if (!providerOpen(loginPause, "chatgpt")) return "logged_out";
+  const {loginProbe = {}, chatgptAdmittedAt = 0, chatgptPacing} = await chrome.storage.local.get(["loginProbe", "chatgptAdmittedAt", "chatgptPacing"]);
+  // chrome.storage.local "chatgptPacing" {maxInFlight, gapMs} tunes the defaults without a release.
+  const maxInFlight = Number.isInteger(chatgptPacing?.maxInFlight) && chatgptPacing.maxInFlight > 0 ? chatgptPacing.maxInFlight : CHATGPT_MAX_IN_FLIGHT;
+  const gapMs = Number.isFinite(chatgptPacing?.gapMs) && chatgptPacing.gapMs >= 0 ? chatgptPacing.gapMs : CHATGPT_ADMIT_GAP_MS;
+  const inFlight = Object.values(jobs).filter(job => job.providers?.includes("chatgpt") && !job.serverStatus &&
+    (() => { const s = job.states?.chatgpt || {}; return !s.delivered && !s.outcome; })()).length;
+  if (inFlight >= (loginProbe.chatgpt ? 1 : maxInFlight)) return loginProbe.chatgpt ? "login_probe" : "chatgpt_in_flight";
+  if (Date.now() - Number(chatgptAdmittedAt || 0) < gapMs) return "chatgpt_spacing";
+  return "";
 }
 
 function contentFiles(provider) {
@@ -700,7 +734,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.54";
+const WORKER_BUILD = "1.1.55";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2203,6 +2237,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       completion:typeof result.completion?.responseId === "string" && typeof result.completion?.context === "string"
         ? {responseId:result.completion.responseId,context:result.completion.context} : undefined };
     workerStep(job,provider,"response_collected");
+    await clearLoginProbe(provider);
   } else if (result?.code && result.code !== "idle") {
     state.outcome = failure(result.code, String(result.error || "chat review failed"));
   } else {
@@ -2994,6 +3029,9 @@ function admitJob(cfg, jobs) {
     // coordinator's watch asks the user to log in on this value). Only a provider that ran and hit
     // the login page is paused, so an unconfigured provider never counts.
     const pausedPhase = ["chatgpt", "grok"].some(p => !providerOpen(loginPause, p)) ? "logged_out" : "";
+    // ChatGPT is the provider in use: its pace gates every take (a take cannot pick its provider).
+    const paced = await chatgptPace(jobs, loginPause);
+    if (paced) { await recordWorkerStatus(jobs, cfg.origin, paced); return null; }
     // A stale service worker (Chrome kept the previous build's script after the files on disk were
     // replaced; #93 validation) would drive pages that inject the NEW content scripts: its run
     // messages lack what they require, and every run it starts loses its binding. It takes nothing.
@@ -3034,6 +3072,7 @@ function admitJob(cfg, jobs) {
       .filter(p => ["chatgpt", "grok"].includes(p));
     if (!job.providers.length) throw new Error("bridge returned no supported review providers");
     for (const p of job.providers) job.states[p] = {};
+    if (job.providers.includes("chatgpt")) await chrome.storage.local.set({chatgptAdmittedAt: Date.now()});
     jobs[job.jobId] = job;
     await saveJobs(jobs); // Provider intents reserve admission space before this lock opens.
     await chrome.storage.local.set({lastJobId: job.jobId, lastError: ""});

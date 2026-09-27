@@ -399,7 +399,15 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   // One write at a time per job, in call order: a slow "running" write can no longer land after the
   // terminal one, and a write queued behind the comment's creation updates it instead of creating a
   // second comment.
-  const run = (opsWrites.get(jobId) ?? Promise.resolve()).then(() => writeOpsComment(token, jobId, body));
+  const previous = job.opsPhase;
+  const run = (opsWrites.get(jobId) ?? Promise.resolve()).then(async () => {
+    if (await writeOpsComment(token, jobId, body)) return;
+    // Not written: a terminal phase must not stand as reported, or finishOpsComment never writes it
+    // (live aicc #539). The job's comment keeps its last phase, and the terminal write is retried.
+    if (!TERMINAL_OPS.includes(phase)) return;
+    state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId && j.opsPhase === phase ? { ...j, opsPhase: previous } : j)) };
+    scheduleOpsRetry(jobId);
+  });
   const settled = run.then(() => {}, () => {});
   opsWrites.set(jobId, settled);
   void settled.then(() => { if (opsWrites.get(jobId) === settled) opsWrites.delete(jobId); });
@@ -408,29 +416,46 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
 
 const opsWrites = new Map<string, Promise<void>>();
 
-async function writeOpsComment(token: string, jobId: string, body: string) {
-  const job = state.jobs.find((j) => j.id === jobId);
-  if (!job) return;
-  try {
+/** Write the job's ops comment; true when GitHub took it. A caller's installation token can be over
+ * an hour old (a job ends long after it started, live aicc #539: GitHub expires them after 1 h), so a
+ * failed write is retried once with a fresh token. Never throws. */
+async function writeOpsComment(token: string, jobId: string, body: string): Promise<boolean> {
+  const write = async (t: string) => {
+    const job = state.jobs.find((j) => j.id === jobId);
+    if (!job) return;
     if (job.opsCommentId) {
-      await updateIssueComment(token, {
-        owner: job.owner,
-        repo: job.repo,
-        commentId: job.opsCommentId,
-        body,
-      });
+      await updateIssueComment(t, { owner: job.owner, repo: job.repo, commentId: job.opsCommentId, body });
       return;
     }
-    const created = await createIssueComment(token, {
-      owner: job.owner,
-      repo: job.repo,
-      pr: job.pr,
-      body,
-    });
+    const created = await createIssueComment(t, { owner: job.owner, repo: job.repo, pr: job.pr, body });
     patchJob(jobId, (j) => ({ ...j, opsCommentId: created.id, updatedAt: Date.now() }));
+  };
+  try {
+    await write(token);
+    return true;
   } catch {
-    /* same as reactions: never fail the review if the status comment cannot post */
+    /* retried below with a fresh token */
   }
+  try {
+    const installationId = state.jobs.find((j) => j.id === jobId)?.installationId;
+    if (!installationId) return false;
+    await write(await installationToken(installationId));
+    return true;
+  } catch {
+    return false; // never fail the review if the status comment cannot post
+  }
+}
+
+const OPS_RETRY_MS = 60_000;
+const OPS_RETRY_MAX = 5;
+const opsRetries = new Map<string, number>();
+
+/** Retry a terminal ops write that GitHub did not take, a bounded number of times. */
+function scheduleOpsRetry(jobId: string) {
+  const n = (opsRetries.get(jobId) ?? 0) + 1;
+  if (n > OPS_RETRY_MAX) { opsRetries.delete(jobId); return; }
+  opsRetries.set(jobId, n);
+  setTimeout(() => void finishOpsComment(jobId), OPS_RETRY_MS).unref?.();
 }
 
 async function bridgeSnapshot() {

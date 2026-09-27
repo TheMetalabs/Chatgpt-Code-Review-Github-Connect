@@ -237,3 +237,23 @@ test('live 1.1.39 card shape: a staged file whose name is bare leaf text is its 
  assert.deepEqual(await tab.view(),{sendClicks:1,sent:PROMPT});
  assert.ok(!steps.some(s=>/^attachments_staged_via_[bcd]$/.test(s)),'no second strategy once the leaf-text chips showed');
 });
+
+// Live aicc #539 (09-27 22:50/23:06 KST): two reviews reached send_waiting (files ready) while ChatGPT
+// ended the session, Send never became clickable, and they sat there for 16 and 84 min until their
+// tabs were gone (tab_closed "stalled"). send_waiting is bounded at 3 min (presend_stalled, nothing
+// sent, retried), and a logged-out page ends it at once as logged_out.
+for(const [name,{loggedOut}={}] of [['Send never clickable: presend_stalled after 3 min, nothing sent'],['the page logs out: logged_out at once',{loggedOut:true}]]){
+ test(`send_waiting (${name})`,async t=>{
+  const tab=await chatTab(t);
+  await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=true;});
+  await tab.start();
+  await tab.page.clock.runFor(10_000);
+  assert.ok((await tab.steps()).includes('send_waiting'),JSON.stringify(await tab.steps()));
+  if(loggedOut)await tab.page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<button data-testid="login-button" style="width:60px;height:30px">Log in</button>'));
+  await tab.page.clock.runFor(loggedOut?5_000:3*MIN+5_000);
+  const r=await tab.runner();
+  assert.equal(r.code,loggedOut?'logged_out':'presend_stalled',JSON.stringify(r));
+  assert.equal((await tab.view()).sendClicks,0,'nothing was sent');
+  if(!loggedOut)assert.match(r.error,/send_waiting/);
+ });
+}

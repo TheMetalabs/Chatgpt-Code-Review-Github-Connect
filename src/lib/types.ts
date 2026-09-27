@@ -151,6 +151,8 @@ export interface Job {
   opsCommentId?: number;
   /** The phase the ops comment was last written with (or is being written with). */
   opsPhase?: "running" | "blocked" | "posted" | "skipped" | "failed";
+  /** The phase GitHub last took (opsPhase is the one being written). */
+  opsWritten?: "running" | "blocked" | "posted" | "skipped" | "failed";
   attemptedProviders?: ReviewProvider[];
   generating?: Partial<Record<ReviewProvider, boolean>>;
   /** Review-coverage: prompt attachment sizes, measured at prompt assembly. */

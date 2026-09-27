@@ -43,14 +43,14 @@ export async function appFixture(options={}, githubOptions={}) {
   saveBotSettings:s=>githubOptions.saveBotSettings?githubOptions.saveBotSettings(s):s,sanitizeBotSettings:s=>s}],
   [resolve(root,'src/lib/utils.ts'),{sleep:()=>new Promise(resolve=>setTimeout(resolve,25))}],
   [resolve(root,'src/lib/github.server.ts'),{
-    githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=> 'fixture-not-a-real-token',
+    githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=>githubOptions.installationToken?.() ?? 'fixture-not-a-real-token',
     githubWebhookSecret:()=> 'fixture-webhook-secret',
     fetchPullHead:async()=>{githubCalls.head++;githubCalls.timeline.push('head');await githubOptions.beforeHead?.();if(githubOptions.headError)throw githubOptions.headError;return {...sample,draft:false,fork:false,...githubOptions.pull};},
     fetchPullSnapshot:async(_token,target)=>{githubCalls.snapshot++;githubCalls.timeline.push('snapshot');if(githubOptions.snapshotError)throw githubOptions.snapshotError;return {...sample,...target};},
     reactOnDelivery:async(_token,job,content)=>{githubCalls.reactions.push({jobId:job.id,thread:job.thread,content});githubCalls.timeline.push('reaction:'+content);},
     formatGithubError:error=>String(error),
     createIssueComment:async(_token,input)=>{ops.push(input.body);return {id:1};},
-    updateIssueComment:async(_token,input)=>{ops.push(input.body);},
+    updateIssueComment:async(token,input)=>{await githubOptions.beforeOpsUpdate?.(token,input);ops.push(input.body);},
     createPullReview:async(_token,input)=>{await githubOptions.beforeReview?.();reviews.push(input);return {id:2,inlineDropped:Boolean(githubOptions.inlineDropped)};},
     // #61 added a cross-file head reader (harbor's makeHeadReader → getFile) to the import graph the
     // fixture links. Without this export the vm linker fails ("does not provide an export named

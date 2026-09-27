@@ -1129,7 +1129,13 @@ async function clickSend(findSend, findComposer, expectedText) {
   // (reset once they are): past it the run ends as attachment_failed, never a silent endless wait
   // (live 1.1.35: a review sat in attachments_waiting for 13+ minutes and never clicked Send).
   const UPLOAD_MS = 3 * 60 * 1000;
-  let attemptSeen = null, uploadWaitSince = null;
+  // The window for Send to become clickable once the uploads are done. Past it nothing was sent and
+  // the run ends as presend_stalled (the reviewer is reported failed, and the lane asks again), never a
+  // silent endless wait (live aicc #539: two reviews sat in send_waiting for 16 and 84 min after
+  // ChatGPT ended the session, until their tabs were gone). A logged-out page ends it at once as
+  // logged_out.
+  const SEND_WAIT_MS = 3 * 60 * 1000;
+  let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null;
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
     // After the confirmation check, so an accepted send is still journaled as sent; before any
@@ -1161,6 +1167,14 @@ async function clickSend(findSend, findComposer, expectedText) {
       step(uploadBusy ? "attachments_waiting" : "send_waiting");
       uploadWaitSince = uploadBusy ? uploadWaitSince ?? Date.now() : null;
       if (uploadBusy && Date.now() - uploadWaitSince >= UPLOAD_MS) throw uploadWaitExpired(form, record.attachments || [], UPLOAD_MS);
+      if (typeof throwIfLoggedOut === "function") throwIfLoggedOut();
+      sendWaitSince = uploadBusy ? null : sendWaitSince ?? Date.now();
+      // Only while Send is still not clickable this tick: a tab that slept past the bound with Send
+      // ready clicks it instead.
+      if (!uploadBusy && !actionableSend(button) && Date.now() - sendWaitSince >= SEND_WAIT_MS) {
+        if (typeof savePresendStallHtml === "function") savePresendStallHtml("send_waiting");
+        throw presendStalled("send_waiting");
+      }
       const otherTurn = userTurns().length !== record.baseline;
       const drafted = normalizePrompt(readComposer(editor)) === record.expected;
       // A fix draft that is the prompt only once whitespace is collapsed (or a fix journal with no

@@ -371,3 +371,25 @@ test('an operator (lane stop) cancel leaves the ops comment terminal, never runn
     `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
   assert.match(app.ops.filter(b=>b.includes(job.id)).at(-1),/Cancelled: cancelled by operator/);
 });
+
+// Live aicc #539 (job-mujw6woi-571): the job ended skipped 85 min after it started; the watcher wrote
+// "skipped" with the installation token it took at the start (GitHub expires them after 1 h), the write
+// failed silently, and because the phase was already recorded as terminal the fallback never wrote it:
+// the comment stayed "running" and lane_loop waited 2 h. A failed write retries with a fresh token, and a
+// phase counts as written only once GitHub took it.
+test('an ops write whose token expired retries with a fresh token; the terminal status still lands',async t=>{
+  let tokens=0;
+  const app=await fixture(t,{pull:{draft:false},installationToken:()=>`token-${++tokens}`,
+    beforeOpsUpdate:async token=>{if(token==='token-1'&&expired)throw Object.assign(new Error('Bad credentials'),{status:401});}});
+  let expired=false;
+  const out=await deliver(app,'issue_comment',comment());
+  const job=await settled(app,out.jobId);
+  await eventually(()=>app.ops.some(b=>b.includes(job.id)),'no ops comment yet');
+  expired=true; // the job's first token has expired by the time it ends
+  const bridgePost=body=>fetch(app.origin+'/api/bridge',{method:'POST',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},body:JSON.stringify(body)}).then(r=>r.json());
+  const lease=(await bridgePost({action:'take',clientId:'fixture'})).job;
+  await bridgePost({action:'failure',jobId:job.id,leaseId:lease.leaseId,provider:'chatgpt',error:'tab_closed: review tab closed before a result (stalled)'});
+  await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===job.id)?.status==='skipped','job not skipped');
+  await eventually(()=>/Status:\*\* skipped/.test(app.ops.filter(b=>b.includes(job.id)).at(-1)||''),
+    `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
+});

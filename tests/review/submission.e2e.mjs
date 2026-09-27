@@ -19,12 +19,18 @@ async function fixture(t,{disabled=false,hidden=false}={}) {
 async function start(page) {await page.evaluate(()=>{window.result={pending:true};clickSend(()=>document.querySelector('#composer-submit-button'),()=>document.querySelector('textarea'),'owned review prompt').then(()=>window.result={submitted:true},e=>window.result={error:e.message});});}
 async function acknowledge(page,text='owned review prompt') {await page.evaluate(text=>{const el=document.createElement('div');el.dataset.messageAuthorRole='user';el.textContent=text;document.querySelector('#turns').append(el);document.querySelector('textarea').value='';},text);}
 
-test('submission: disabled upload/send controls may wait for days without falling through',async t=>{
- const page=await fixture(t,{disabled:true});await start(page);await page.clock.fastForward(3*24*3600_000);
+// A disabled Send never falls through into response-waiting and is never clicked. It used to wait
+// without end ("for days"); live aicc #539 sat in send_waiting 16 and 84 min after ChatGPT ended the
+// session, so the wait is now bounded at 3 min: presend_stalled, nothing sent (the reviewer is reported failed).
+test('submission: disabled send controls never fall through; Send enabled within 3 min is clicked, else presend_stalled',async t=>{
+ const page=await fixture(t,{disabled:true});await start(page);await page.clock.runFor(2*60_000);
  assert.equal((await page.evaluate(()=>result)).pending,true,'disabled send must not become response-waiting');assert.equal(await page.evaluate(()=>clicks),0);
  await page.evaluate(()=>document.querySelector('#composer-submit-button').disabled=false);await page.clock.runFor(500);
  assert.equal(await page.evaluate(()=>clicks),1);assert.equal((await page.evaluate(()=>result)).pending,true);
  await acknowledge(page);await page.clock.runFor(500);assert.equal((await page.evaluate(()=>result)).submitted,true);
+ const stuck=await fixture(t,{disabled:true});await start(stuck);await stuck.clock.runFor(3*60_000+1_000);
+ assert.match((await stuck.evaluate(()=>result)).error||'',/presend_stalled: the pre-send stage "send_waiting"/);
+ assert.equal(await stuck.evaluate(()=>clicks),0,'nothing was sent');
 });
 
 test('submission: a no-op click is not confirmation, and a delayed ACK within the window never resends',async t=>{

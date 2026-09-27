@@ -1263,11 +1263,12 @@ async function waitUntilFixOrQuota(name) {
  * "unestablished"`, a sent fix whose send recorded no conversation; the worker asks again or
  * preserves the tab. */
 function tabOwnership(state, allocationUrl, fix = false, secured = false) {
-  if (state.tabRepurposed) return {ownership: "takenOver", cause: state.takeoverCause || "user_turn"};
+  if (state.tabRepurposed) { persistTakeover(state); return {ownership: "takenOver", cause: state.takeoverCause || "user_turn"}; }
   // Every takeover is permanent (as for a fix run's answer, fixOwnershipProof): a draft the user
   // clears again or an edit the user undoes does not hand the tab back.
   const takeOver = cause => {
     if (!state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = cause; recordReviewStep("context_changed"); }
+    persistTakeover(state);
     return {ownership: "takenOver", cause};
   };
   let submission;
@@ -1428,6 +1429,14 @@ function throwIfStopped() {
   error.code = "taken_over"; error.takeoverCause = left; throw error;
 }
 
+/** A takeover outlives this page instance (an extension update re-injects the page, and a tab kept
+ * for a takeover is asked again by background.js reclaimPreservedTabs): a draft the user typed and
+ * cleared must not read as Ashlar's again (#126 review). */
+function persistTakeover(state) {
+  if (!state?.tabRepurposed || !state.jobId || !state.runId) return;
+  try { sessionStorage.setItem(`ashlar:takenover:${state.jobId}:${state.runId}`, state.takeoverCause || "user_turn"); } catch { /* in-memory only */ }
+}
+
 function releaseManagedSlot(state) {
   state.slotReleased = true;
   try { sessionStorage.setItem(`ashlar:released:${state.jobId}:${state.runId}`, "true"); } catch { /* Only causes conservative recount on reload. */ }
@@ -1445,6 +1454,10 @@ function installReviewRunner(name, run) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
   try { state.slotReleased ||= sessionStorage.getItem(`ashlar:released:${state.jobId}:${state.runId}`) === "true"; } catch { /* Unknown remains managed. */ }
+  try {
+    const takenOver = state.jobId && state.runId ? sessionStorage.getItem(`ashlar:takenover:${state.jobId}:${state.runId}`) : null;
+    if (takenOver && !state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = takenOver; }
+  } catch { /* the in-memory verdict stands */ }
   state.runStopped ||= runStoppedFor(state.jobId, state.runId);
   if (state.listener && state.protocol === "observed-submission-v8") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);

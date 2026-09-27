@@ -488,10 +488,11 @@ for(const rekey of [true,false]){
 
 // P0 clean-up: the tabs already preserved by the re-key bug. The idle worker asks each preserved
 // review tab's page the can-close verdict again and closes only an owned one.
-for(const [name,{draft,jobId='job-A',busy,young,noRecord}={}] of [['re-keyed, untouched: closed'],
+for(const [name,{draft,jobId='job-A',busy,young,noRecord,cleared}={}] of [['re-keyed, untouched: closed'],
  ['re-keyed, with a user draft: kept',{draft:'mine'}],['a fix tab: never reclaimed',{jobId:'fix-A'}],
  ['while the worker is busy: not asked',{busy:true}],['preserved a minute ago, automatic run: not yet',{young:true}],
- ['with no preserved record (an extension update cleared it), automatic run: closed',{noRecord:true}]]){
+ ['with no preserved record (an extension update cleared it), automatic run: closed',{noRecord:true}],
+ ['taken over by a draft the user then cleared, page re-injected: kept (#126 review)',{cleared:true}]]){
  test(`real DOM + worker (P0 tab leak, reclaim): a preserved review tab ${name}`,async t=>{
   const ctx=await conversationPage(t,'review',{url:TEMP_URL,gated:true,jobId});
   await ctx.page.evaluate(()=>{const k=submissionKey();const j=JSON.parse(sessionStorage.getItem(k));delete j.exact;sessionStorage.setItem(k,JSON.stringify(j));
@@ -499,8 +500,17 @@ for(const [name,{draft,jobId='job-A',busy,young,noRecord}={}] of [['re-keyed, un
   await ctx.move(LOCAL_CONV);
   await ctx.openCollect();await ctx.page.clock.runFor(1600);
   await ctx.complete();await ctx.page.clock.runFor(3200);
+  if(cleared){
+   // The user types a follow-up draft: the cleanup's verdict is a takeover (preserved, released).
+   await ctx.page.evaluate(()=>{document.querySelector('#prompt-textarea').value='my follow-up';});
+   assert.equal((await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL,preserve:true})).ownership,'takenOver');
+   // ...then clears it, and an update re-injects the page: a fresh runner from sessionStorage.
+   await ctx.page.evaluate(()=>{document.querySelector('#prompt-textarea').value='';
+    const st=__ashlarRunnerState;delete st.tabRepurposed;delete st.takeoverCause;delete st.protocol;installReviewRunner('ChatGPT',st.run);});
+  } else {
   // Preserved by the old worker (its slot released), then ChatGPT re-keyed the chat.
   await ctx.send('ashlar-can-close',{allocationUrl:TEMP_URL,preserve:true});
+  }
   await ctx.move(TEMP_CONV);
   if(draft)await ctx.page.evaluate(d=>{document.querySelector('#prompt-textarea').value=d;},draft);
   const session=storage(noRecord?{}:{[`ashlar:preserved:${jobId}:chatgpt:run-A`]:{tabId:10,...(young?{at:Date.now()}:{})}});
@@ -510,7 +520,7 @@ for(const [name,{draft,jobId='job-A',busy,young,noRecord}={}] of [['re-keyed, un
   b.chrome.tabs.sendMessage=(id,msg,callback)=>{ctx.page.evaluate(msg=>new Promise(resolve=>receiver(msg,null,resolve)),msg).then(callback,()=>callback());};
   b.chrome.tabs.query=async()=>[...b.tabs.values()];
   const out=await b.context.reclaimPreservedTabs({force:!young&&!noRecord});
-  const closed=!draft&&jobId==='job-A'&&!busy&&!young;
+  const closed=!draft&&jobId==='job-A'&&!busy&&!young&&!cleared;
   assert.deepEqual(b.closedTabs,closed?[10]:[],JSON.stringify(out));
   if(busy)assert.equal(out.error,'the worker is busy');
   if(jobId!=='job-A'||young)assert.equal(out.skipped,1,JSON.stringify(out));

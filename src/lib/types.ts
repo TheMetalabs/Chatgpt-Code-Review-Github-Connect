@@ -149,6 +149,8 @@ export interface Job {
   storedLegs?: { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt }[];
   reviewOrder?: ReviewProvider[];
   opsCommentId?: number;
+  /** The phase the ops comment was last written with (or is being written with). */
+  opsPhase?: "running" | "blocked" | "posted" | "skipped" | "failed";
   attemptedProviders?: ReviewProvider[];
   generating?: Partial<Record<ReviewProvider, boolean>>;
   /** Review-coverage: prompt attachment sizes, measured at prompt assembly. */

@@ -174,3 +174,16 @@ test('ChatGPT pacing (#128 review): a leg waiting on the server JSON repair hold
  await b.context.clearLoginProbe('chatgpt',{admittedAt:at+1});
  assert.equal(b.local.state.loginProbe.chatgpt,undefined,'a post-logout answer ends probe mode');
 });
+
+test('the ChatGPT submission log records each admission (kind, temporary chat) and each logout',async()=>{
+ const offers=[offer('A'),offer('fix-B','fix')];
+ const api=async(_p,body)=>body?.action==='take'?{ok:true,job:offers.shift()??null}:{ok:true,prompt:'p'};
+ const b=background({local:storage({origin:'http://bridge',token:'token',chatgptPacing:{maxInFlight:2,gapMs:0}}),api,handler:()=>({ok:false,code:'busy'})});
+ await ticks(b,4);
+ const log=b.local.state.chatgptSubmitLog;
+ assert.deepEqual(log.map(e=>[e.event,e.kind,e.temporary]),[['submit','review',true],['submit','fix',true]]);
+ await b.context.markLoggedOut('chatgpt');
+ assert.equal(b.local.state.chatgptSubmitLog.at(-1).event,'logged_out');
+ await b.context.recordWorkerStatus(b.local.state.pendingReviewJobs,'http://bridge');
+ assert.equal(b.local.state.bridgeWorkerStatus.chatgptLog.sinceLogout.review,0,'counted from the logout');
+});

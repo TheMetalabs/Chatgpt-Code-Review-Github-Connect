@@ -10,7 +10,14 @@ const LOGIN_PAUSE_MS = 10 * 60 * 1000;
  * and after a logout the worker takes nothing until the pause ends, then one job at a time (the
  * probe) until one succeeds. The rest wait in the server's queue. */
 const CHATGPT_MAX_IN_FLIGHT = 2;
-const CHATGPT_ADMIT_GAP_MS = 45_000;
+// 75 s (was 45 s): under 1.1.55 the session still ended after 3.5 h and 78 reviews (02:32 KST).
+const CHATGPT_ADMIT_GAP_MS = 75_000;
+/** The ChatGPT submission log (chrome.storage.local, last CHATGPT_LOG_MAX entries): every admission
+ * {at, event:"submit", kind, temporary} and every logout {at, event:"logged_out"}, so a logout can be
+ * read against the load before it (per hour, or since the last login). A summary rides the worker
+ * status to the server (/api/harbor bridge.workerStatus.chatgptLog). */
+const CHATGPT_LOG_KEY = "chatgptSubmitLog";
+const CHATGPT_LOG_MAX = 1000;
 const LOGGED_OUT_ERROR = "ChatGPT is logged out in this Chrome profile; log in and retry (nothing was typed or sent)";
 const PENDING_JOBS = "pendingReviewJobs";
 const CLIENT_KEY = "ashlar:client";
@@ -381,6 +388,8 @@ function probeBridge() {
         checkedAt: local.checkedAt, admissionPhase: local.admissionPhase,
         activeJobs: local.activeJobs, pendingCleanup: local.pendingCleanup,
         sourceCaptured: local.sourceCaptured, waitingForJson: local.waitingForJson,
+        // Counts and times only (chatgptLogSummary): no job ids, prompts or URLs.
+        ...(local.chatgptLog ? {chatgptLog: local.chatgptLog} : {}),
         capacity: Object.fromEntries(["limit","used","managedTabs","reserved","restorationReserved","providerTabs","unverifiedTabs","orphanTabs","unknownReserved"].map(key=>[key,capacity[key]])),
       } : undefined;
       const result = await api("/api/bridge", {action: "ping", extensionVersion, workerStatus}, cfg.origin);
@@ -434,6 +443,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       origin, checkedAt: Date.now(), phase, capacity,
       admissionPhase: admission?.phase || "not_checked",
       admissionCheckedAt: admission?.checkedAt,
+      chatgptLog: chatgptLogSummary((await chrome.storage.local.get([CHATGPT_LOG_KEY]))[CHATGPT_LOG_KEY]),
       sourceCaptured: relevant.reduce((n,job)=>n+job.providers.filter(p=>sourceArchiveDurable(job.states[p]) && !job.states[p].delivered).length,0),
       activeJobs: relevant.filter(activelyReviewing).length,
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
@@ -601,11 +611,39 @@ async function markLoggedOut(provider) {
   return writeInOrder(async () => {
     const loginPause = await loginPauseMap();
     loginPause[provider] = Date.now() + LOGIN_PAUSE_MS;
+    if (provider === "chatgpt") await appendChatgptLog({at: Date.now(), event: "logged_out"});
     const probe = (await chrome.storage.local.get(["loginProbe"])).loginProbe || {};
     // The time of the logout: only a job admitted after it can prove the login is back.
     await chrome.storage.local.set({ loginPause, loginProbe: {...probe, [provider]: Date.now()} });
     return loginPause[provider];
   });
+}
+
+/** Append to the ChatGPT submission log (inside writeInOrder callers, or alone). */
+async function appendChatgptLog(entry) {
+  try {
+    const log = (await chrome.storage.local.get([CHATGPT_LOG_KEY]))[CHATGPT_LOG_KEY];
+    await chrome.storage.local.set({[CHATGPT_LOG_KEY]: [...(Array.isArray(log) ? log : []), entry].slice(-CHATGPT_LOG_MAX)});
+  } catch { /* diagnostics never block admission */ }
+}
+
+/** The log's summary for the worker status: submissions per hour (UTC, last 24 h) by kind, the count
+ * since the last logout (and when it was), and the last logout times. */
+function chatgptLogSummary(log, now = Date.now()) {
+  const rows = Array.isArray(log) ? log : [];
+  const hourly = {};
+  for (const e of rows) {
+    if (e?.event !== "submit" || now - e.at > 24 * 3600_000) continue;
+    const hour = new Date(e.at).toISOString().slice(0, 13);
+    const h = hourly[hour] ||= {review: 0, fix: 0};
+    h[e.kind === "fix" ? "fix" : "review"] += 1;
+  }
+  const logouts = rows.filter(e => e?.event === "logged_out").map(e => e.at);
+  const last = logouts.at(-1) || 0;
+  const since = rows.filter(e => e?.event === "submit" && e.at > last);
+  return {hourly: Object.entries(hourly).map(([hour, n]) => ({hour, ...n})),
+    sinceLogout: {from: last, review: since.filter(e => e.kind !== "fix").length, fix: since.filter(e => e.kind === "fix").length},
+    logouts: logouts.slice(-5)};
 }
 
 /** A provider answered a job admitted after its logout: the login is back, and admission leaves
@@ -740,7 +778,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.56";
+const WORKER_BUILD = "1.1.57";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -3080,7 +3118,11 @@ function admitJob(cfg, jobs) {
     if (!job.providers.length) throw new Error("bridge returned no supported review providers");
     for (const p of job.providers) job.states[p] = {};
     job.admittedAt = Date.now();
-    if (job.providers.includes("chatgpt")) await chrome.storage.local.set({chatgptAdmittedAt: job.admittedAt});
+    if (job.providers.includes("chatgpt")) {
+      await chrome.storage.local.set({chatgptAdmittedAt: job.admittedAt});
+      await writeInOrder(() => appendChatgptLog({at: job.admittedAt, event: "submit", kind: job.kind === "fix" ? "fix" : "review",
+        temporary: providerUrl("chatgpt").includes("temporary-chat=true")}));
+    }
     jobs[job.jobId] = job;
     await saveJobs(jobs); // Provider intents reserve admission space before this lock opens.
     await chrome.storage.local.set({lastJobId: job.jobId, lastError: ""});

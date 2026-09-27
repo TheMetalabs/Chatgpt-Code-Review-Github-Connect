@@ -1,5 +1,8 @@
 /** Bounded diagnostic metadata only. No field here authorizes cleanup or generation. */
-const ADMISSION_PHASES = ["not_checked", "polling", "admitted", "recovered", "idle", "tab_capacity", "provider_quota", "logged_out", "disconnected", "duplicate_job"] as const;
+// Every phase the worker reports (extension/background.js recordWorkerStatus): a report with an
+// unknown one is dropped whole, so a missing phase hides the worker (the #128 pacing phases were).
+const ADMISSION_PHASES = ["not_checked", "polling", "admitted", "recovered", "idle", "tab_capacity", "provider_quota", "logged_out",
+  "disconnected", "duplicate_job", "maintenance", "stale_worker", "chatgpt_in_flight", "chatgpt_spacing", "login_probe"] as const;
 type AdmissionPhase = typeof ADMISSION_PHASES[number];
 export type WorkerStatus = {
   observedAt: number;
@@ -14,7 +17,26 @@ export type WorkerStatus = {
     limit: number; used: number; managedTabs: number; reserved: number;
     restorationReserved: number; providerTabs: number; unverifiedTabs: number; orphanTabs: number; unknownReserved: number;
   };
+  /** The ChatGPT submission log's summary (background.js chatgptLogSummary). */
+  chatgptLog?: ChatgptLog;
 };
+export type ChatgptLog = {
+  hourly: {hour: string; review: number; fix: number}[];
+  sinceLogout: {from: number; review: number; fix: number};
+  logouts: number[];
+};
+function chatgptLog(value: unknown): ChatgptLog | undefined {
+  const row = object(value), since = object(row?.sinceLogout);
+  if (!row || !since || !Array.isArray(row.hourly) || !Array.isArray(row.logouts)) return;
+  const time = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined);
+  const hourly = row.hourly.slice(0, 48).flatMap((h) => {
+    const o = object(h);
+    return o && typeof o.hour === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}$/.test(o.hour) && count(o.review) !== undefined && count(o.fix) !== undefined
+      ? [{hour: o.hour, review: o.review as number, fix: o.fix as number}] : [];
+  });
+  return {hourly, sinceLogout: {from: time(since.from) ?? 0, review: count(since.review) ?? 0, fix: count(since.fix) ?? 0},
+    logouts: row.logouts.slice(-5).flatMap((t) => (time(t) === undefined ? [] : [t as number]))};
+}
 function object(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -38,7 +60,8 @@ export function sanitizeWorkerStatus(value: unknown, version: unknown, receivedA
     sourceCaptured: count(row.sourceCaptured) ?? 0, waitingForJson: count(row.waitingForJson) ?? 0,
     capacity: {limit, used, managedTabs: capacity.managedTabs as number, reserved: capacity.reserved as number,
       restorationReserved: capacity.restorationReserved as number, providerTabs: capacity.providerTabs as number,
-      unverifiedTabs: capacity.unverifiedTabs as number, orphanTabs: count(capacity.orphanTabs) ?? 0, unknownReserved: count(capacity.unknownReserved) ?? 0}};
+      unverifiedTabs: capacity.unverifiedTabs as number, orphanTabs: count(capacity.orphanTabs) ?? 0, unknownReserved: count(capacity.unknownReserved) ?? 0},
+    ...(chatgptLog(row.chatgptLog) ? {chatgptLog: chatgptLog(row.chatgptLog)} : {})};
 }
 export function workerStatusLabel(status: WorkerStatus | undefined, fresh: boolean): string {
   if (!status) return "Heartbeat only · admission state not reported";

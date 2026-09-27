@@ -53,3 +53,32 @@ test('changed observation with the same millisecond timestamp is still new telem
  const changed=mergeWorkerStatus(first,{...base,admissionPhase:'admitted',activeJobs:1,capacity:{...base.capacity,used:1,managedTabs:1}},'1.1.21',120);
  assert.equal(changed.receivedAt,120,'same Date.now millisecond must not hide a changed report');
 });
+
+// #128 pacing reported chatgpt_in_flight / chatgpt_spacing / login_probe, which the server did not
+// know: every such report was dropped whole and the dashboard kept a stale phase. Every phase the
+// worker reports is accepted.
+test('every admission phase the worker reports is accepted, including the pacing ones',()=>{
+ const {sanitizeWorkerStatus}=load();
+ for(const admissionPhase of ['chatgpt_in_flight','chatgpt_spacing','login_probe','maintenance','stale_worker']){
+  const out=sanitizeWorkerStatus({checkedAt:10,admissionPhase,capacity:{limit:4,used:1,providerTabs:1,managedTabs:1,reserved:0,restorationReserved:0,unverifiedTabs:0}},'1.1.57',100);
+  assert.equal(out?.admissionPhase,admissionPhase);
+ }
+});
+
+// Live 2026-09-28: the session ended again after 3.5 h and 78 reviews under 1.1.55. The worker keeps a
+// submission log (time, review/fix, temporary chat, logouts) and its summary rides the worker status.
+test('the ChatGPT submission log: per-hour counts by kind, counts since the last logout, the last logouts; sanitized on the server',async()=>{
+ const H=3600_000,now=Date.UTC(2026,8,28,3,0,0);
+ const log=[{at:now-3*H+60_000,event:'submit',kind:'review',temporary:true},{at:now-3*H+120_000,event:'submit',kind:'fix',temporary:true},
+  {at:now-2*H,event:'logged_out'},{at:now-H+1,event:'submit',kind:'review',temporary:true},{at:now-60_000,event:'submit',kind:'review',temporary:true},
+  {at:now-30*H,event:'submit',kind:'review'}];
+ const b=background();
+ const sum=b.context.chatgptLogSummary(log,now);
+ assert.deepEqual(JSON.parse(JSON.stringify(sum)),{hourly:[{hour:'2026-09-28T00',review:1,fix:1},{hour:'2026-09-28T02',review:2,fix:0}],
+  sinceLogout:{from:now-2*H,review:2,fix:0},logouts:[now-2*H]});
+ const {sanitizeWorkerStatus}=load();
+ const out=sanitizeWorkerStatus({checkedAt:10,admissionPhase:'polling',chatgptLog:{...sum,jobId:'PRIVATE'},
+  capacity:{limit:4,used:1,providerTabs:1,managedTabs:1,reserved:0,restorationReserved:0,unverifiedTabs:0}},'1.1.57',100);
+ assert.deepEqual(JSON.parse(JSON.stringify(out.chatgptLog)),JSON.parse(JSON.stringify(sum)));
+ assert.equal(JSON.stringify(out).includes('PRIVATE'),false);
+});

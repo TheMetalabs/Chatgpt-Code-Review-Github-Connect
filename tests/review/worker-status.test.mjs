@@ -82,3 +82,11 @@ test('the ChatGPT submission log: per-hour counts by kind, counts since the last
  assert.deepEqual(JSON.parse(JSON.stringify(out.chatgptLog)),JSON.parse(JSON.stringify(sum)));
  assert.equal(JSON.stringify(out).includes('PRIVATE'),false);
 });
+
+test('a logout pushed out of the submission ring still anchors "since logout" (#130 review)',()=>{
+ const b=background();const now=Date.UTC(2026,8,28,3,0,0);
+ const log=Array.from({length:3},(_,i)=>({at:now-1000*(3-i),event:'submit',kind:'review'}));
+ const sum=b.context.chatgptLogSummary(log,now,[now-5000]);
+ assert.deepEqual(JSON.parse(JSON.stringify(sum.sinceLogout)),{from:now-5000,review:3,fix:0});
+ assert.deepEqual([...sum.logouts],[now-5000]);
+});

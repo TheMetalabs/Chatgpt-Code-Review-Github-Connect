@@ -443,7 +443,7 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       origin, checkedAt: Date.now(), phase, capacity,
       admissionPhase: admission?.phase || "not_checked",
       admissionCheckedAt: admission?.checkedAt,
-      chatgptLog: chatgptLogSummary((await chrome.storage.local.get([CHATGPT_LOG_KEY]))[CHATGPT_LOG_KEY]),
+      chatgptLog: await chrome.storage.local.get([CHATGPT_LOG_KEY, "chatgptLogouts"]).then(got => chatgptLogSummary(got[CHATGPT_LOG_KEY], Date.now(), got.chatgptLogouts)),
       sourceCaptured: relevant.reduce((n,job)=>n+job.providers.filter(p=>sourceArchiveDurable(job.states[p]) && !job.states[p].delivered).length,0),
       activeJobs: relevant.filter(activelyReviewing).length,
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
@@ -611,7 +611,13 @@ async function markLoggedOut(provider) {
   return writeInOrder(async () => {
     const loginPause = await loginPauseMap();
     loginPause[provider] = Date.now() + LOGIN_PAUSE_MS;
-    if (provider === "chatgpt") await appendChatgptLog({at: Date.now(), event: "logged_out"});
+    if (provider === "chatgpt") {
+      const at = Date.now();
+      await appendChatgptLog({at, event: "logged_out"});
+      // Kept apart from the submission ring, which a long run of submissions would push them out of.
+      const {chatgptLogouts} = await chrome.storage.local.get(["chatgptLogouts"]);
+      await chrome.storage.local.set({chatgptLogouts: [...(Array.isArray(chatgptLogouts) ? chatgptLogouts : []), at].slice(-20)});
+    }
     const probe = (await chrome.storage.local.get(["loginProbe"])).loginProbe || {};
     // The time of the logout: only a job admitted after it can prove the login is back.
     await chrome.storage.local.set({ loginPause, loginProbe: {...probe, [provider]: Date.now()} });
@@ -629,7 +635,7 @@ async function appendChatgptLog(entry) {
 
 /** The log's summary for the worker status: submissions per hour (UTC, last 24 h) by kind, the count
  * since the last logout (and when it was), and the last logout times. */
-function chatgptLogSummary(log, now = Date.now()) {
+function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
   const rows = Array.isArray(log) ? log : [];
   const hourly = {};
   for (const e of rows) {
@@ -638,7 +644,7 @@ function chatgptLogSummary(log, now = Date.now()) {
     const h = hourly[hour] ||= {review: 0, fix: 0};
     h[e.kind === "fix" ? "fix" : "review"] += 1;
   }
-  const logouts = rows.filter(e => e?.event === "logged_out").map(e => e.at);
+  const logouts = Array.isArray(logoutTimes) ? logoutTimes : rows.filter(e => e?.event === "logged_out").map(e => e.at);
   const last = logouts.at(-1) || 0;
   const since = rows.filter(e => e?.event === "submit" && e.at > last);
   return {hourly: Object.entries(hourly).map(([hour, n]) => ({hour, ...n})),

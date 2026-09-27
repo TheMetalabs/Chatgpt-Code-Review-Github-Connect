@@ -51,6 +51,9 @@ export function content(provider = 'chatgpt', persisted = new Map()) {
   return { context, listeners, message(msg) { let reply; listeners[0](stamp(msg), {}, r => { reply = r; }); return reply; } };
 }
 export function background({ local = storage({ origin: 'http://bridge', token: 'token' }), session = storage(), handler, tabs = new Map(), api } = {}) {
+  // ChatGPT pacing (background.js chatgptPace) is off unless a test sets it: most tests admit several
+  // jobs within milliseconds to exercise parallelism, capacity and recovery.
+  if (local.state && local.state.chatgptPacing === undefined) local.state.chatgptPacing = { maxInFlight: 99, gapMs: 0 };
   const messages = [], calls = [], closedTabs = []; const removed = [], replaced = [];
   let nextTab = Math.max(100, ...tabs.keys());
   const chrome = {

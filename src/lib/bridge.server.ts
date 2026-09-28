@@ -325,13 +325,27 @@ function pendingChatProviders(job: Job): ReviewProvider[] {
   );
 }
 
+/** True when this chat provider already has an in-flight or previously-started run on the job
+ * (attempted take, live generating flag, progress runId, or a lost binding being tracked). Used to
+ * distinguish resume/recovery from a fresh generation start. */
+function chatRunStarted(job: Job, provider: ReviewProvider): boolean {
+  if (job.attemptedProviders?.includes(provider)) return true;
+  if (job.generating?.[provider] === true) return true;
+  if (job.providerProgress?.[provider]?.runId) return true;
+  if (job.bindingLostAt?.[provider] !== undefined) return true;
+  return false;
+}
+
 /** The chat providers a take may hand the extension. While a fallback release waives chat
  * (fallbackWaivesChat) the job does not wait on it, so it starts no fresh chat generation: only a run
- * that already started may resume, and its result is merged only if it lands before local posts.
- * Once that fallback ends with no payload, chat is awaited again and offered as fresh work. */
+ * that already started may resume (active lease / binding / generating / attempted), and its result
+ * is merged only if it lands before local posts. Once that fallback ends with no usable verdict,
+ * chat is awaited again and offered as fresh work. */
 function offerableChatProviders(job: Job): ReviewProvider[] {
   const pending = pendingChatProviders(job);
-  return fallbackWaivesChat(job) ? pending.filter(provider => job.attemptedProviders?.includes(provider)) : pending;
+  if (!fallbackWaivesChat(job)) return pending;
+  // Suppress fresh starts; still return providers with an already-started run for recovery.
+  return pending.filter((provider) => chatRunStarted(job, provider));
 }
 
 /** The leg's binding has been reported unavailable for BINDING_LOST_MS with no bound run since. */
@@ -471,8 +485,10 @@ export function recoverBridgeJob(clientId: string, values: unknown, options: {fi
     if (!job || job.status!=="awaiting_chat" || !llmWorkAllowed(job) || job.bridgeClientId!==clientId ||
         job.chatFpRound || job.fpProviders?.length) continue;
     const pending=pendingChatProviders(job);
+    // A matching progress runId proves the run started — do not also require attemptedProviders
+    // (a reconnect during verify-clean fallback must still recover an in-flight chat binding).
     const matched=bindings.filter(item=>item.jobId===id && pending.includes(item.provider) &&
-      job.attemptedProviders?.includes(item.provider) && job.providerProgress?.[item.provider]?.runId===item.runId);
+      job.providerProgress?.[item.provider]?.runId===item.runId);
     if (!matched.length) continue;
     const claim=claimBridgeJob(id,clientId);
     if (!claim.ok) continue;

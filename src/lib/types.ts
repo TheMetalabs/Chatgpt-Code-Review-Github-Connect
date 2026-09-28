@@ -146,6 +146,9 @@ export interface Job {
   reviewProviders?: ReviewProvider[];
   /** settings.localReviewRole pinned at snapshot; a later settings/env change never alters this job. */
   localReviewRole?: LocalReviewRole;
+  /** Monotonic ownership token for the validator phase. Bumped on each awaiting_chat → validator
+   * transition; release/merge/skip from that submission must still see the same generation or no-op. */
+  validatorGeneration?: number;
   /** verify-clean: set when the merged chat result was clean and the local verification round began. */
   localVerifyStartedAt?: number;
   /** The chat reviewers whose STRUCTURED result was clean when verification started (the only

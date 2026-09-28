@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
+import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
 import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
@@ -327,5 +327,71 @@ describe("incompleteVerdict / verdictEvidence: a reviewer reply is a complete ve
     }
     const local = String(verdictEvidence(JSON.parse(raw), { provider: "local", ...leg }).raw_review);
     assert.match(local, /UNPARSED[\s\S]*RESIDUAL[\s\S]*CAPTURE-PROSE/, "a local leg keeps every completed reply");
+  });
+});
+
+
+describe("validator generation ownership (held-local release race)", () => {
+  it("ownsValidatorGeneration is true only for the matching validator generation", () => {
+    assert.equal(ownsValidatorGeneration({ status: "validator", validatorGeneration: 3 }, 3), true);
+    assert.equal(ownsValidatorGeneration({ status: "validator", validatorGeneration: 3 }, 2), false);
+    assert.equal(ownsValidatorGeneration({ status: "awaiting_chat", validatorGeneration: 3 }, 3), false);
+    assert.equal(ownsValidatorGeneration(undefined, 1), false);
+  });
+
+  it("watcher can release only while awaiting_chat; validator requires matching generation", () => {
+    assert.equal(canReleaseHeldLocal({ status: "awaiting_chat" }), true, "watcher path");
+    assert.equal(
+      canReleaseHeldLocal({ status: "validator", validatorGeneration: 1 }),
+      false,
+      "watcher must not steal an in-flight validator",
+    );
+    assert.equal(
+      canReleaseHeldLocal({ status: "validator", validatorGeneration: 1 }, { validatorGeneration: 1 }),
+      true,
+      "owning validator may release",
+    );
+    assert.equal(
+      canReleaseHeldLocal({ status: "validator", validatorGeneration: 2 }, { validatorGeneration: 1 }),
+      false,
+      "stale validator generation no-ops",
+    );
+  });
+
+  it("concurrency: release before stale validator completion rejects overwrite of fallback stamp", () => {
+    // Simulate: submitHarborChat locks validator gen=1; concurrent watcher cannot release while
+    // validating; an earlier awaiting_chat release stamps fallback; stale gen=1 no longer owns.
+    let job: {
+      status: "awaiting_chat" | "validator" | "skipped";
+      validatorGeneration?: number;
+      localFallbackAt?: number;
+      localVerifyStartedAt?: number;
+      skipReason?: string;
+    } = { status: "awaiting_chat" };
+
+    job = { ...job, status: "validator", validatorGeneration: 1 };
+    const myGen = 1;
+    assert.equal(ownsValidatorGeneration(job, myGen), true);
+    assert.equal(canReleaseHeldLocal(job), false, "watcher without gen cannot steal validator");
+
+    // Model a release that already returned the job to awaiting_chat with a fallback stamp.
+    job = { ...job, status: "awaiting_chat", localFallbackAt: 42, validatorGeneration: 1 };
+    assert.equal(ownsValidatorGeneration(job, myGen), false, "stale validator lost ownership");
+    assert.equal(canReleaseHeldLocal(job, { validatorGeneration: myGen }), false, "already released");
+
+    // Stale validator completion must not overwrite fallback with skip/findings.
+    if (ownsValidatorGeneration(job, myGen)) {
+      job = { ...job, status: "skipped", skipReason: "no valid review JSON" };
+    }
+    assert.equal(job.localFallbackAt, 42);
+    assert.equal(job.status, "awaiting_chat");
+    assert.equal(job.skipReason, undefined);
+  });
+
+  it("owning validator may release as verify/fallback; mismatched generation cannot", () => {
+    const job = { status: "validator" as const, validatorGeneration: 7 };
+    assert.equal(canReleaseHeldLocal(job, { validatorGeneration: 7 }), true);
+    assert.equal(canReleaseHeldLocal(job, { validatorGeneration: 6 }), false);
+    assert.equal(canReleaseHeldLocal({ ...job, localVerifyStartedAt: 1 }, { validatorGeneration: 7 }), false);
   });
 });

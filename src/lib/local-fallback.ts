@@ -220,6 +220,29 @@ export function heldLocalReleased(
   return released && localVerifies({ role: job.localReviewRole, providers: job.reviewProviders ?? [] });
 }
 
+/** Whether this job still owns the validator phase stamped at `generation`. A concurrent held-local
+ * release (or a newer submit) leaves the phase; stale validator completion must no-op. */
+export function ownsValidatorGeneration(
+  job: Pick<Job, "status" | "validatorGeneration"> | undefined,
+  generation: number,
+): boolean {
+  return Boolean(job && job.status === "validator" && job.validatorGeneration === generation);
+}
+
+/** Whether a held-local release may stamp for this job snapshot.
+ * - awaiting_chat: watcher / non-validator path (no generation required).
+ * - validator: only the submission that owns `opts.validatorGeneration` (stale validator no-ops). */
+export function canReleaseHeldLocal(
+  job: Pick<Job, "status" | "localVerifyStartedAt" | "localFallbackAt" | "validatorGeneration">,
+  opts?: { validatorGeneration?: number },
+): boolean {
+  if (job.localVerifyStartedAt || job.localFallbackAt) return false;
+  if (job.status === "validator") {
+    return opts?.validatorGeneration != null && job.validatorGeneration === opts.validatorGeneration;
+  }
+  return job.status === "awaiting_chat";
+}
+
 /** Why a reviewer leg's gated reply is not its reviewer's complete verdict (docs/local-verify-clean.md
  * §1), or undefined when it is one. Every leg, chat or local, on race or verify-clean: only a
  * complete verdict earns clean credit (a clean result, a verification round, verified-clean), and

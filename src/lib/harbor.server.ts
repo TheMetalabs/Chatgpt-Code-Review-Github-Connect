@@ -33,7 +33,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
+import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
@@ -855,6 +855,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     chatPrompt: prompt,
     reviewProviders: providers,
     localReviewRole,
+    validatorGeneration: undefined,
     localVerifyStartedAt: undefined,
     localFallbackAt: undefined,
     localReleasePrompt: undefined,
@@ -1164,20 +1165,27 @@ export async function submitHarborChat(
   );
 
   let locked = false;
+  let validatorGeneration = 0;
   transitionJob(jobId, (j) => {
     if (j.status !== "awaiting_chat") return j;
     locked = true;
-    return { ...j, status: "validator", updatedAt: Date.now() };
+    validatorGeneration = (j.validatorGeneration ?? 0) + 1;
+    return { ...j, status: "validator", validatorGeneration, updatedAt: Date.now() };
   });
   if (!locked) return { ok: false, error: "job is not waiting for a chat review" };
 
   const revert = (error: string) => {
     transitionJob(jobId, (j) =>
-      j.status === "validator"
+      ownsValidatorGeneration(j, validatorGeneration)
         ? { ...j, status: "awaiting_chat", githubError: error, updatedAt: Date.now() }
         : j,
     );
     return { ok: false as const, error };
+  };
+  /** Stale validator completion must not merge or release after ownership moved (held-local race). */
+  const stillOwnsValidator = () => {
+    const cur = state.jobs.find((j) => j.id === jobId);
+    return ownsValidatorGeneration(cur, validatorGeneration);
   };
 
   let token: string;
@@ -1203,6 +1211,9 @@ export async function submitHarborChat(
   const still = state.jobs.find((j) => j.id === jobId);
   if (!still || still.status === "cancelled") {
     return { ok: false, error: "cancelled" };
+  }
+  if (!ownsValidatorGeneration(still, validatorGeneration)) {
+    return { ok: false, error: "stale validator" };
   }
 
   const gates: LiveGateResult[] = [];
@@ -1238,18 +1249,23 @@ export async function submitHarborChat(
 
   if (!gates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
     // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
-    releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned no valid JSON; local runs as the fallback.", incoming);
+    if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+    releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned no valid JSON; local runs as the fallback.", incoming, { validatorGeneration });
     return { ok: true };
   }
   if (!gates.length) {
-    transitionJob(jobId, (j) => ({
-      ...j,
-      status: "skipped",
-      skipReason: invalid.join("; ") || "no valid review JSON",
-      githubError: invalid.join("; ") || "no valid review JSON",
-      plan: "Did not post — no reviewer returned valid JSON.",
-      updatedAt: Date.now(),
-    }));
+    if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+    transitionJob(jobId, (j) => {
+      if (!ownsValidatorGeneration(j, validatorGeneration)) return j;
+      return {
+        ...j,
+        status: "skipped",
+        skipReason: invalid.join("; ") || "no valid review JSON",
+        githubError: invalid.join("; ") || "no valid review JSON",
+        plan: "Did not post — no reviewer returned valid JSON.",
+        updatedAt: Date.now(),
+      };
+    });
     return { ok: false, error: invalid.join("; ") || "no valid review JSON" };
   }
 
@@ -1296,7 +1312,8 @@ export async function submitHarborChat(
   if (outcome === "verify") {
     // Chat parsed clean: hold the post and run local on the same prompt as the verification round.
     const plan = `${cleanChat.join(" + ") || "chat"} found nothing; local verification round running.`;
-    releaseHeldLocal(jobId, token, { kind: "verify", verifyChat: cleanChat }, plan, incoming);
+    if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+    releaseHeldLocal(jobId, token, { kind: "verify", verifyChat: cleanChat }, plan, incoming, { validatorGeneration });
     return { ok: true };
   }
   const localError =
@@ -1308,27 +1325,34 @@ export async function submitHarborChat(
   const findingsBy: Partial<Record<ReviewProvider, number>> = Object.fromEntries([...byProvider].map(([p, g]) => [p, g.findings.length]));
   const rawBy = [...byProvider].filter(([, g]) => g.rawReview).map(([p]) => p);
   const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified, rawBy, rawTruncated });
-  transitionJob(jobId, (j) => ({
-    ...j,
-    findings: merged.findings,
-    candidates: merged.findings,
-    mergeRecommendation: merged.mergeRecommendation,
-    highestRisk: merged.highestRisk,
-    rawReview,
-    rawCauses: rawReview ? rawCauses : undefined,
-    rawTruncated,
-    rawLegs,
-    investigatedSafe: merged.investigatedSafe,
-    assumptions: nextAssumptions,
-    skippedProviders: skipped,
-    incompleteProviders,
-    coverage: [...coverageByFile.values()],
-    droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
-    plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
-    localVerifyNote: localVerifyNote || undefined,
-    localVerified,
-    updatedAt: Date.now(),
-  }));
+  if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+  let stamped = false;
+  transitionJob(jobId, (j) => {
+    if (!ownsValidatorGeneration(j, validatorGeneration)) return j;
+    stamped = true;
+    return {
+      ...j,
+      findings: merged.findings,
+      candidates: merged.findings,
+      mergeRecommendation: merged.mergeRecommendation,
+      highestRisk: merged.highestRisk,
+      rawReview,
+      rawCauses: rawReview ? rawCauses : undefined,
+      rawTruncated,
+      rawLegs,
+      investigatedSafe: merged.investigatedSafe,
+      assumptions: nextAssumptions,
+      skippedProviders: skipped,
+      incompleteProviders,
+      coverage: [...coverageByFile.values()],
+      droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
+      plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
+      localVerifyNote: localVerifyNote || undefined,
+      localVerified,
+      updatedAt: Date.now(),
+    };
+  });
+  if (!stamped) return { ok: false, error: "stale validator" };
   await finishJob(jobId, sample, token);
   return finishResult(jobId);
 }
@@ -1365,12 +1389,21 @@ type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kin
  * signal of the chat round (docs/local-verify-clean.md §2): a clean structured chat result starts
  * the verification round; chat finishing with nothing usable, or a bridge disconnected past its
  * grace, starts the fallback. It releases once (a stamp is set), returns the job to awaiting_chat
- * with the chat legs kept, starts local and makes sure a watcher waits for it. */
-function releaseHeldLocal(jobId: string, token: string, release: HeldLocalRelease, plan: string, legs: ChatLeg[] = []): boolean {
+ * with the chat legs kept, starts local and makes sure a watcher waits for it.
+ * A validator-phase caller must pass the generation it locked with; without a matching generation,
+ * status===validator is refused so a concurrent watcher cannot steal an in-flight validation. */
+function releaseHeldLocal(
+  jobId: string,
+  token: string,
+  release: HeldLocalRelease,
+  plan: string,
+  legs: ChatLeg[] = [],
+  opts?: { validatorGeneration?: number },
+): boolean {
   let released = false;
   let pinnedPrompt = "";
   const job = transitionJob(jobId, (j) => {
-    if ((j.status !== "validator" && j.status !== "awaiting_chat") || j.localVerifyStartedAt || j.localFallbackAt) return j;
+    if (!canReleaseHeldLocal(j, opts)) return j;
     released = true;
     // Pin prompt + triggering chat legs in the same transaction that stamps the release, so a
     // concurrent mutation of chatPrompt/storedLegs cannot retarget the local verification run.
@@ -1384,6 +1417,18 @@ function releaseHeldLocal(jobId: string, token: string, release: HeldLocalReleas
   void kickLocalRace(jobId, pinnedPrompt);
   void watchReviewers(jobId, token);
   return true;
+}
+
+/** Test seam: held-local release with optional validator-generation ownership. */
+export function releaseHeldLocalForTest(
+  jobId: string,
+  token: string,
+  release: HeldLocalRelease,
+  plan: string,
+  legs: ChatLeg[] = [],
+  opts?: { validatorGeneration?: number },
+): boolean {
+  return releaseHeldLocal(jobId, token, release, plan, legs, opts);
 }
 
 /** Store incoming legs over the stored ones, one per provider (a newer leg replaces an older one). */

@@ -256,6 +256,7 @@ export const useAshlar = create<AshlarState>()((set, get) => ({
       reviewGrok: next.reviewGrok,
       reviewLocal: next.reviewLocal,
       localJsonRepairEnabled: next.localJsonRepairEnabled,
+      localReviewRole: next.localReviewRole,
       localLlmBaseUrl: next.localLlmBaseUrl,
       localLlmModel: next.localLlmModel,
       reviewOrder: next.reviewOrder,

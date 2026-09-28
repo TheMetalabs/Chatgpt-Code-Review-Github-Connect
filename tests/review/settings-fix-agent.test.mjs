@@ -95,6 +95,7 @@ const TOP_LEVEL = {
   localLlmModel: {bad: [42, null, []], good: 'qwen'},
   localReviewMaxTokens: {bad: ['100', null, 0, 1.5, -5], good: 4096},
   localReviewMode: {bad: ['turbo', 1, null], good: 'multiturn'},
+  localReviewRole: {bad: ['turbo', 'verify', 1, null], good: 'verify-clean'},
   localReviewSingleTurnMaxTokens: {bad: ['100', null, 0, 2.5], good: 8000},
   reviewOrder: {bad: ['local', ['grok'], ['local', 'local', 'grok'], ['local', 'chatgpt', 'bing'], [], null, ['local', 'chatgpt', 'grok', 'grok']], good: ['grok', 'chatgpt', 'local']},
   promptDiffMaxChars: {bad: ['10', null, -1, 0.5], good: 12345},
@@ -199,7 +200,7 @@ const STORED = [
   {fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply', mode: 'apply'}}, // grok was a fix provider before
   {fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'suggest', timeoutMs: 90_000.7, chatTimeoutMs: 1, roundCap: 1e9}},
   {maxTurns: 2.5, exploreTurns: -3, maxInlineComments: 99.9, localReviewMaxTokens: 0, contextPadLines: 1e300, promptDiffMaxChars: -1},
-  {username: '  ', mention: ['', 42, ' @x '], reviewOrder: ['grok', 'bogus'], chatgptReasoning: 'turbo', localReviewMode: 'x', publishMinSeverity: 'P7'},
+  {username: '  ', mention: ['', 42, ' @x '], reviewOrder: ['grok', 'bogus'], chatgptReasoning: 'turbo', localReviewMode: 'x', localReviewRole: 'turbo', publishMinSeverity: 'P7'},
   {reviewChatgpt: false, reviewGrok: false, reviewLocal: false},
   'not an object', null, [],
 ];

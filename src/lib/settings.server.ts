@@ -8,6 +8,7 @@ import {
   FIX_DELIVERIES,
   FIX_MODES,
   LOCAL_REVIEW_MODES,
+  LOCAL_REVIEW_ROLES,
   fixKnob,
   normalizeReviewOrder,
   providersFromSettings,
@@ -17,6 +18,7 @@ import {
   type FixDelivery,
   type FixMode,
   type LocalReviewMode,
+  type LocalReviewRole,
   type ReviewProvider,
   type Severity,
 } from "./types.ts";
@@ -89,6 +91,8 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (localMaxTokens !== undefined) o.localReviewMaxTokens = localMaxTokens;
   const localMode = envStr("ASHLAR_LOCAL_REVIEW_MODE");
   if (localMode) o.localReviewMode = localMode as LocalReviewMode;
+  const localRole = envStr("ASHLAR_LOCAL_REVIEW_ROLE");
+  if (localRole) o.localReviewRole = localRole;
   const localSingleTurnMax = envNum("ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS");
   if (localSingleTurnMax !== undefined) o.localReviewSingleTurnMaxTokens = localSingleTurnMax;
   const order = envStr("ASHLAR_REVIEW_ORDER");
@@ -154,6 +158,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_LLM_API_KEY: s.localLlmApiKey,
     ASHLAR_LOCAL_REVIEW_MAX_TOKENS: String(s.localReviewMaxTokens),
     ASHLAR_LOCAL_REVIEW_MODE: s.localReviewMode,
+    ASHLAR_LOCAL_REVIEW_ROLE: s.localReviewRole,
     ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS: String(s.localReviewSingleTurnMaxTokens),
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
     ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
@@ -249,6 +254,9 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localReviewMode: LOCAL_REVIEW_MODES.includes(p.localReviewMode as LocalReviewMode)
       ? (p.localReviewMode as LocalReviewMode)
       : DEFAULT_SETTINGS.localReviewMode,
+    localReviewRole: LOCAL_REVIEW_ROLES.includes(p.localReviewRole as LocalReviewRole)
+      ? (p.localReviewRole as LocalReviewRole)
+      : DEFAULT_SETTINGS.localReviewRole,
     localReviewSingleTurnMaxTokens: intField(p, "localReviewSingleTurnMaxTokens"),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),

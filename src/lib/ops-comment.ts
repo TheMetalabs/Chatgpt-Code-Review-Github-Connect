@@ -7,7 +7,8 @@ export type OpsCommentInput = {
   providers: ReviewProvider[];
   /** The job's pinned local role; "verify-clean" reads "local verifies a clean result". */
   role?: LocalReviewRole;
-  /** The job released local as the chat-down fallback (Job.localFallbackAt). */
+  /** The job released local as the chat-down fallback (Job.localFallbackAt): it reads "local runs as
+   * the fallback" whatever the role, never that it verifies a clean result. */
   localFallback?: boolean;
   notes: string[];
 };

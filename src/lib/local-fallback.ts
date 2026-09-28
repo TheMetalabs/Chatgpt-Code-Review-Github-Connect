@@ -93,14 +93,13 @@ export function usableLocalFallbackLeg(
  * verdict (failure, "Skipped local", incomplete / raw-only evidence), chat is the only reviewer left
  * and is awaited / offered to the bridge again. */
 export function fallbackWaivesChat(
-  job: Pick<Job, "localFallbackAt" | "storedLegs" | "assumptions" | "providerErrors" | "incompleteProviders" | "rawCauses">,
+  job: Pick<Job, "localFallbackAt" | "storedLegs" | "assumptions" | "providerErrors">,
 ): boolean {
   if (!job.localFallbackAt) return false;
   const local = (job.storedLegs ?? []).find((l) => l.provider === "local" && l.raw.trim());
-  if (local) {
-    if (job.incompleteProviders?.includes("local") || job.rawCauses?.local) return false;
-    return usableLocalFallbackLeg(local);
-  }
+  // Derive usability from the stored leg alone — do not wait for incompleteProviders/rawCauses,
+  // which are only stamped at merge and may be absent when the bridge decides whether to re-offer chat.
+  if (local) return usableLocalFallbackLeg(local);
   const error = job.providerErrors?.local;
   return !skippedProvider(job.assumptions, "local") && !(error && error.code !== "disconnected");
 }

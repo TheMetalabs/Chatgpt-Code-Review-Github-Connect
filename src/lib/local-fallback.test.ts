@@ -162,10 +162,14 @@ describe("verify-clean local role", () => {
       false,
       "salvaged raw_review is evidence, not a verdict",
     );
+    // Salvaged / incomplete local evidence clears the waiver even when merge metadata is absent.
     assert.equal(
-      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: "{}" }], incompleteProviders: ["local"] }),
+      fallbackWaivesChat({
+        ...at,
+        storedLegs: [{ provider: "local", raw: '{"findings":[],"merge_recommendation":"COMMENT","raw_review":"prose only"}' }],
+      }),
       false,
-      "incompleteProviders clears waiver",
+      "salvaged leg without incompleteProviders/rawCauses still re-offers chat",
     );
     // A spent fallback makes the chat reviewers required again.
     const fallback = { role: "verify-clean" as const, providers: ["chatgpt", "local"] as ReviewProvider[], localReleased: true };

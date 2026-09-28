@@ -1,6 +1,6 @@
 import { bridgePromptText } from "./chat-prompt.ts";
 import type { BotSettings } from "./types.ts";
-import { extractChatJson } from "./extract-chat-json.ts";
+import { extractChatJsonRange } from "./extract-chat-json.ts";
 import { requestLocalJson, requestLocalChat, type LocalChatMessage, type LocalRequestOptions } from "./local-chat-request.server.ts";
 
 function localConfig(settings: BotSettings) {
@@ -82,12 +82,13 @@ export type LocalLegResult =
 
 
 /** Non-whitespace text of a completed reply that sits outside the accepted JSON slice. When present,
- * the leg is evidence (residualReplies), not a complete verdict — incompleteVerdict reads this. */
-export function residualOutsideJson(reply: string, acceptedJson: string): string | undefined {
-  const idx = reply.indexOf(acceptedJson);
-  if (idx < 0) return undefined;
-  const before = reply.slice(0, idx).trim();
-  const after = reply.slice(idx + acceptedJson.length).trim();
+ * the leg is evidence (residualReplies), not a complete verdict — incompleteVerdict reads this.
+ * `start`/`end` must be the accepted occurrence's offsets into `reply` (from extractChatJsonRange);
+ * searching the reply by string equality can latch onto an earlier identical copy in prose. */
+export function residualOutsideJson(reply: string, start: number, end: number): string | undefined {
+  if (start < 0 || end < start || end > reply.length) return undefined;
+  const before = reply.slice(0, start).trim();
+  const after = reply.slice(end).trim();
   const residual = [before, after].filter(Boolean).join("\n\n");
   return residual || undefined;
 }
@@ -114,10 +115,10 @@ export async function runLocalLlm(
       { role: "user", content: prompt },
     ]);
     if (!raw.trim()) return { ok: false, error: "local LLM returned empty" };
-    const firstJson = extractChatJson(raw);
-    if (firstJson) {
-      const residual = residualOutsideJson(raw, firstJson);
-      return { ok: true, raw: firstJson, originalText: raw, ...(residual ? { residualReplies: residual } : {}) };
+    const first = extractChatJsonRange(raw);
+    if (first) {
+      const residual = residualOutsideJson(raw, first.start, first.end);
+      return { ok: true, raw: first.json, originalText: raw, ...(residual ? { residualReplies: residual } : {}) };
     }
 
     // Exactly one semantic retry, and only after an actual completed non-JSON reply. Do NOT echo the
@@ -135,12 +136,12 @@ export async function runLocalLlm(
         content: "Your previous reply was not extractable review JSON. Reply again with ONLY the JSON object (findings/merge_recommendation/keep). No markdown.",
       },
     ]);
-    const corrected = extractChatJson(raw2);
+    const corrected = extractChatJsonRange(raw2);
     if (!corrected) {
       return {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, unparsedText: raw};
     }
-    const residual = residualOutsideJson(raw2, corrected);
-    return {ok: true, raw: corrected, originalText: raw2, unparsedText: raw, ...(residual ? { residualReplies: residual } : {})};
+    const residual = residualOutsideJson(raw2, corrected.start, corrected.end);
+    return {ok: true, raw: corrected.json, originalText: raw2, unparsedText: raw, ...(residual ? { residualReplies: residual } : {})};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

@@ -111,7 +111,7 @@ export function usableLocalFallbackLeg(
  * verdict (failure, "Skipped local", incomplete / raw-only evidence), chat is the only reviewer left
  * and is awaited / offered to the bridge again. */
 export function fallbackWaivesChat(
-  job: Pick<Job, "localFallbackAt" | "storedLegs" | "assumptions" | "providerErrors">,
+  job: Pick<Job, "localFallbackAt" | "storedLegs" | "assumptions" | "providerErrors" | "generating" | "providerProgress">,
 ): boolean {
   if (!job.localFallbackAt) return false;
   const local = (job.storedLegs ?? []).find((l) => l.provider === "local" && l.raw.trim());
@@ -119,7 +119,17 @@ export function fallbackWaivesChat(
   // which are only stamped at merge and may be absent when the bridge decides whether to re-offer chat.
   if (local) return usableLocalFallbackLeg(local);
   const error = job.providerErrors?.local;
-  return !skippedProvider(job.assumptions, "local") && !(error && error.code !== "disconnected");
+  if (skippedProvider(job.assumptions, "local") || (error && error.code !== "disconnected")) return false;
+  // Authoritative local lifecycle: still generating, or progress not yet terminal → wait on local.
+  if (job.generating?.local === true) return true;
+  const stage = job.providerProgress?.local?.stage;
+  if (stage === "response_collected" || stage === "error") {
+    // Terminal local progress without a usable stored leg (torn / rejected transition window):
+    // do not keep chat suppressed — bridge must be able to re-offer recovery.
+    return false;
+  }
+  // Not started yet, queued, generating, or unknown: local can still deliver.
+  return true;
 }
 
 /** Chat prompt captured at held-local release (verify or fallback). Later mutations of chatPrompt must

@@ -183,6 +183,17 @@ describe("verify-clean local role", () => {
     assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spent) }), payloads: ["chatgpt"], assumptions: spent.assumptions, localInFlight: false }), false, "chat delivered: posts");
     const spentIncomplete = { ...at, storedLegs: [incompleteRaw] };
     assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spentIncomplete) }), payloads: [], assumptions: [], localInFlight: false }), true, "incomplete local: waits on chat");
+    // Terminal local progress without a stored usable leg must not keep chat waived (bridge poll race).
+    assert.equal(
+      fallbackWaivesChat({ ...at, generating: { local: false }, providerProgress: { local: { runId: "local:x", stage: "response_collected", observedAt: 1, receivedAt: 1 } } }),
+      false,
+      "response_collected without stored leg re-offers chat",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, generating: { local: true } }),
+      true,
+      "actively generating still waives",
+    );
   });
 
   it("pins the held-local release prompt so a later chatPrompt mutation cannot retarget local", () => {

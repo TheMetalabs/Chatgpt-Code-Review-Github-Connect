@@ -1,6 +1,6 @@
 import { bridgePromptText } from "./chat-prompt.ts";
 import type { BotSettings } from "./types.ts";
-import { extractChatJsonRange } from "./extract-chat-json.ts";
+import { extractChatJsonParts, extractChatJsonRange } from "./extract-chat-json.ts";
 import { requestLocalJson, requestLocalChat, type LocalChatMessage, type LocalRequestOptions } from "./local-chat-request.server.ts";
 
 function localConfig(settings: BotSettings) {
@@ -84,9 +84,13 @@ export type LocalLegResult =
 /** Non-whitespace text of a completed reply that sits outside the accepted JSON slice. When present,
  * the leg is evidence (residualReplies), not a complete verdict — incompleteVerdict reads this.
  * `start`/`end` must be the accepted occurrence's offsets into `reply` (from extractChatJsonRange);
- * searching the reply by string equality can latch onto an earlier identical copy in prose. */
+ * searching the reply by string equality can latch onto an earlier identical copy in prose.
+ * Fence-aware via extractChatJsonParts: a complete markdown fence around the object is not residual. */
 export function residualOutsideJson(reply: string, start: number, end: number): string | undefined {
   if (start < 0 || end < start || end > reply.length) return undefined;
+  const accepted = reply.slice(start, end);
+  const parts = extractChatJsonParts(reply);
+  if (parts && parts.json === accepted) return parts.residual || undefined;
   const before = reply.slice(0, start).trim();
   const after = reply.slice(end).trim();
   const residual = [before, after].filter(Boolean).join("\n\n");
@@ -109,6 +113,9 @@ export async function runLocalLlm(
     signal,
     opts,
   );
+  // The first completed reply, kept outside the try: a correction that then fails (HTTP 500,
+  // transport error, liveness or deadline abort) must not lose it.
+  let firstUnparsed: string | undefined;
   try {
     const raw = await call([
       { role: "system", content: "You are Ashlar. Return ONLY a JSON object. No markdown fences." },
@@ -120,6 +127,7 @@ export async function runLocalLlm(
       const residual = residualOutsideJson(raw, first.start, first.end);
       return { ok: true, raw: first.json, originalText: raw, ...(residual ? { residualReplies: residual } : {}) };
     }
+    firstUnparsed = raw;
 
     // Exactly one semantic retry, and only after an actual completed non-JSON reply. Do NOT echo the
     // prior reply back: adding it on top of the full prompt and the same max_tokens budget could
@@ -144,6 +152,6 @@ export async function runLocalLlm(
     return {ok: true, raw: corrected.json, originalText: raw2, unparsedText: raw, ...(residual ? { residualReplies: residual } : {})};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, error: msg.slice(0, 240) };
+    return { ok: false, error: msg.slice(0, 240), ...(firstUnparsed ? { unparsedText: firstUnparsed } : {}) };
   }
 }

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractChatJson, htmlChatToText, salvageReviewJson } from "./extract-chat-json.ts";
+import { extractChatJson, extractChatJsonParts, htmlChatToText, salvageReviewJson } from "./extract-chat-json.ts";
 
 const PAYLOAD = `{
 "merge_recommendation": "APPROVE",
@@ -67,6 +67,97 @@ describe("extractChatJson", () => {
     const parsed = JSON.parse(hit);
     assert.equal(parsed.merge_recommendation, "REQUEST_CHANGES");
     assert.ok(Array.isArray(parsed.findings) && parsed.findings.length >= 1);
+  });
+});
+
+describe("extractChatJsonParts: what canonicalizing a reply to its review JSON discards", () => {
+  it("nothing when the reply is only the object, bare or fenced", () => {
+    assert.deepEqual(extractChatJsonParts(PAYLOAD), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(extractChatJsonParts(`  \n\`\`\`json\n${PAYLOAD}\n\`\`\`\n`), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(extractChatJsonParts(`\`\`\`${PAYLOAD}\`\`\``), { json: PAYLOAD, residual: "" });
+  });
+
+  it("nothing when the object's one complete fence is longer than three markers, or tildes", () => {
+    const fence = (open: string, close = open) => extractChatJsonParts(`${open}json\n${PAYLOAD}\n${close}`);
+    assert.deepEqual(fence("````"), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(fence("`````", "``````"), { json: PAYLOAD, residual: "" }, "a closing run may be longer");
+    assert.deepEqual(fence("~~~"), { json: PAYLOAD, residual: "" });
+  });
+
+  it("nothing when the object's fence carries any CommonMark info string", () => {
+    for (const info of ["application/json", "json title=\"review.json\"", " json ", "{.json #review}", "c++", "json;charset=utf-8"]) {
+      assert.deepEqual(extractChatJsonParts(`\`\`\`${info}\n${PAYLOAD}\n\`\`\``), { json: PAYLOAD, residual: "" }, info);
+      assert.deepEqual(extractChatJsonParts(`~~~~${info}\n${PAYLOAD}\n~~~~`), { json: PAYLOAD, residual: "" }, `~ ${info}`);
+      assert.deepEqual(extractChatJsonParts(`\`\`\`${info}\n${PAYLOAD}\n`), { json: PAYLOAD, residual: "" }, `unclosed ${info}`);
+    }
+    // a tilde fence's info string may hold backticks; a backtick run followed by one is inline code, not a fence
+    assert.deepEqual(extractChatJsonParts(`~~~ json \`review\`\n${PAYLOAD}\n~~~`), { json: PAYLOAD, residual: "" });
+    assert.equal(extractChatJsonParts(`\`\`\` json \`review\`\n${PAYLOAD}\n\`\`\``)?.residual, "``` json `review`");
+  });
+
+  it("an object on its opener's line is not inside the block: the text before it on that line is residual", () => {
+    // CommonMark: the rest of the opener's line is its info string, and the block starts on the next line
+    const prose = "P1 a.ts:1 duplicate request writes twice";
+    assert.equal(extractChatJsonParts(`~~~ ${prose} ${PAYLOAD}\n~~~`)?.residual, `~~~ ${prose}`);
+    assert.equal(extractChatJsonParts(`\`\`\`${prose} ${PAYLOAD}\n\`\`\``)?.residual, `\`\`\`${prose}`);
+    assert.equal(extractChatJsonParts(`~~~ ${prose} ${PAYLOAD}`)?.residual, `~~~ ${prose}`, "unclosed");
+    assert.equal(extractChatJsonParts(`\`\`\`json ${PAYLOAD}\n\`\`\``)?.residual, "```json", "a language tag there is info string too");
+    // a bare marker glued to the object is still read as its fence
+    assert.deepEqual(extractChatJsonParts(`\`\`\` ${PAYLOAD}\n\`\`\``), { json: PAYLOAD, residual: "" });
+  });
+
+  it("a marker indented four or more spaces, or by a tab, is an indented code line, not the object's fence", () => {
+    const prose = "~~~ P1 a.ts:1 dup";
+    assert.equal(extractChatJsonParts(`    ${prose}\n${PAYLOAD}\n~~~`)?.residual, prose);
+    assert.equal(extractChatJsonParts(`\t\`\`\`json\n${PAYLOAD}\n\`\`\``)?.residual, "```json");
+    assert.deepEqual(extractChatJsonParts(`   \`\`\`json\n${PAYLOAD}\n   \`\`\``), { json: PAYLOAD, residual: "" }, "three spaces is still a fence");
+  });
+
+  it("nothing when the object's fence runs to the end of the reply (CommonMark closes it there)", () => {
+    for (const open of ["```json", "````", "~~~"]) {
+      for (const end of ["", "\n", "\r\n", "\n  \n"]) {
+        assert.deepEqual(extractChatJsonParts(`${open}\n${PAYLOAD}${end}`), { json: PAYLOAD, residual: "" }, JSON.stringify(open + end));
+      }
+    }
+  });
+
+  it("nothing when a bare fence line is the only text after the object (it opens an empty block)", () => {
+    assert.deepEqual(extractChatJsonParts(`${PAYLOAD}\n\`\`\``), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(extractChatJsonParts(`${PAYLOAD}\n~~~~\n`), { json: PAYLOAD, residual: "" });
+    assert.deepEqual(extractChatJsonParts(`\`\`\`json\n${PAYLOAD}\n\`\`\`\n\`\`\``), { json: PAYLOAD, residual: "" }, "after a complete pair");
+    // a marker with an info string names content, and prose beside a stray marker is still prose
+    assert.equal(extractChatJsonParts(`${PAYLOAD}\n\`\`\`json`)?.residual, "```json");
+    assert.match(extractChatJsonParts(`P1 a.ts:1 BEFORE\n${PAYLOAD}\n\`\`\``)?.residual ?? "", /^P1 a\.ts:1 BEFORE$/);
+  });
+
+  it("an unclosed fence with text after the object is not the object's block: that text is residual", () => {
+    assert.match(extractChatJsonParts(`\`\`\`json\n${PAYLOAD}\nP1 a.ts:1 AFTER`)?.residual ?? "", /P1 a\.ts:1 AFTER/);
+    assert.match(extractChatJsonParts(`\`\`\`json\n${PAYLOAD}\n~~~`)?.residual ?? "", /^```json\s+~~~$/);
+  });
+
+  it("a fence that is not a matching pair around the object is kept, as is every fence in the prose", () => {
+    // three backticks do not close a four-backtick fence (CommonMark), so neither run is a fence pair
+    assert.match(extractChatJsonParts(`\`\`\`\`json\n${PAYLOAD}\n\`\`\``)?.residual ?? "", /^````json\s+```$/);
+    assert.match(extractChatJsonParts(`~~~\n${PAYLOAD}\n\`\`\``)?.residual ?? "", /^~~~\s+```$/);
+    // prose outside the fence keeps its own fence markers verbatim
+    const prose = "P1 a.ts:1 see ```ts\nwrite(twice)\n``` above";
+    assert.equal(extractChatJsonParts(`${prose}\n\`\`\`\`json\n${PAYLOAD}\n\`\`\`\``)?.residual, prose);
+  });
+
+  it("the prose around the accepted object, before or after it", () => {
+    const before = extractChatJsonParts(`P1 a.ts:1 PROSE-FINDING: a duplicate request writes twice\n\`\`\`json\n${PAYLOAD}\n\`\`\``);
+    assert.equal(before?.json, PAYLOAD);
+    assert.equal(before?.residual, "P1 a.ts:1 PROSE-FINDING: a duplicate request writes twice");
+    assert.equal(extractChatJsonParts(`${PAYLOAD}\nAlso P1 b.ts:2 AFTER`)?.residual, "Also P1 b.ts:2 AFTER");
+    // an earlier object the extractor did not take is residual text too
+    assert.match(extractChatJsonParts(`{"findings":[{"title":"EARLIER"}]}\n${PAYLOAD}`)?.residual ?? "", /EARLIER/);
+  });
+
+  it("the JSON is exactly what extractChatJson returns; no review object is null", () => {
+    const text = `Thinking { "scratch": true }\n${PAYLOAD}\nDone.`;
+    assert.equal(extractChatJsonParts(text)?.json, extractChatJson(text));
+    assert.equal(extractChatJsonParts('{"foo":1}'), null);
+    assert.equal(extractChatJsonParts("  "), null);
   });
 });
 

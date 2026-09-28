@@ -41,4 +41,11 @@ describe("local JSON acceptance keeps residual reply text", () => {
     assert.match(afterOnly, /trailing finding outside the final object/);
     assert.doesNotMatch(afterOnly, /merge_recommendation/);
   });
+
+  it("a complete markdown fence around the object is not residual", () => {
+    const json = '{"findings":[],"merge_recommendation":"COMMENT"}';
+    const reply = "```json\n" + json + "\n```";
+    const hit = extractChatJsonRange(reply)!;
+    assert.equal(residualOutsideJson(reply, hit.start, hit.end), undefined);
+  });
 });

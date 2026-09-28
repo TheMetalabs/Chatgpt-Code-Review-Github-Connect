@@ -30,6 +30,7 @@ import {
   FIX_DELIVERIES,
   FIX_MODES,
   LOCAL_REVIEW_MODES,
+  LOCAL_REVIEW_ROLES,
   fixKnob,
   isMaskedSecret,
   providersFromSettings,
@@ -372,6 +373,7 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   localLlmModel: text("local_llm.model"),
   localReviewMaxTokens: int("localReviewMaxTokens"),
   localReviewMode: oneOf("local_review.mode", LOCAL_REVIEW_MODES),
+  localReviewRole: oneOf("local_review.role", LOCAL_REVIEW_ROLES),
   localReviewSingleTurnMaxTokens: int("localReviewSingleTurnMaxTokens"),
   reviewOrder: (v) =>
     Array.isArray(v) && v.length === DEFAULT_REVIEW_ORDER.length && DEFAULT_REVIEW_ORDER.every((p) => v.includes(p))

@@ -75,12 +75,17 @@ export async function pingLocalLlm(
   }
 }
 
+/** Tip-compatible result shape for harbor (unparsedText/residualReplies optional on main path). */
+export type LocalLegResult =
+  | { ok: true; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string }
+  | { ok: false; error: string; originalText?: string; unparsedText?: string };
+
 export async function runLocalLlm(
   prompt: string,
   settings: BotSettings,
   signal?: AbortSignal,
   opts?: LocalRequestOptions,
-): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
+): Promise<LocalLegResult> {
   const ready = localConfig(settings);
   if (!ready.ok) return ready;
   prompt = bridgePromptText(prompt); // Native API input remains readable source text, not escaped transport JSON.

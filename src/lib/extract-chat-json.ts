@@ -90,8 +90,13 @@ export function salvageReviewJson(text: string): string {
   const s = String(text || "").trim();
   const severities = [...new Set(s.match(/\bP[0-2]\b/g) ?? [])].sort();
   const header = severities.length ? `Detected severity markers: ${severities.join(", ")}.\n\n` : "";
-  return JSON.stringify({ findings: [], merge_recommendation: "COMMENT", raw_review: (header + s).slice(0, 60_000) });
+  const full = header + s;
+  const raw = full.length > SALVAGE_MAX_CHARS ? full.slice(0, SALVAGE_MAX_CHARS - SALVAGE_TRUNCATED_MARK.length) + SALVAGE_TRUNCATED_MARK : full;
+  return JSON.stringify({ findings: [], merge_recommendation: "COMMENT", raw_review: raw });
 }
+
+export const SALVAGE_MAX_CHARS = 60_000;
+export const SALVAGE_TRUNCATED_MARK = "\n\n…(reply truncated to 60,000 characters; the full original is retained in review history)";
 
 /** ChatGPT renders the review as a markdown <p> with <br>, not a JSON API body. */
 export function htmlChatToText(html: string): string {

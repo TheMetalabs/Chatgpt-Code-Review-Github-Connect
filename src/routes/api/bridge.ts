@@ -10,6 +10,7 @@ import {
   recordBridgeProgress,
   recordBridgeObservation,
   bridgeHeartbeat,
+  noteBridgeRequest,
   bridgeJobState,
   bridgeTokenOk,
   claimBridgeJob,
@@ -124,6 +125,9 @@ export const Route = createFileRoute("/api/bridge")({
           return Response.json({ ok: false, error: "bad token" }, { status: 401, headers });
         }
         bridgeHeartbeat(body.workerStatus, body.extensionVersion);
+        // Owner liveness from the authenticated request itself, before any action patches the job or
+        // writes history (either can fail without the owner having gone anywhere).
+        noteBridgeRequest(body);
         // One gate for every operation on a fix item (see fixOperationRefused): an un-opted worker
         // never claims, pings, reads, reports on, releases, fails or completes one.
         if (fixOperationRefused(body.jobId, body.fixProtocol)) {

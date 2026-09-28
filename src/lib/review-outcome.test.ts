@@ -1,0 +1,453 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { FINDING_412 } from "./samples.ts";
+import {
+  CLEAN_REVIEW_BODY,
+  REVIEW_RAW_END,
+  REVIEW_RAW_START,
+  REVIEW_SUMMARY_MARK,
+  UNVERIFIED_CLEAN_REVIEW_BODY,
+  redactSalvagedReviewBody,
+  reviewSummaryBody,
+} from "./review-format.ts";
+import { OUTCOME_SHAPE, REVIEW_OUTCOMES, outcomeNote, postedOutcome, rawCauseText, reviewOutcome, salvagedReview, type OutcomeJob, type PostedOutcome, type ReviewOutcome } from "./review-outcome.ts";
+import { isConvergedFindings, parseFindingsTotal } from "./review-loop.ts";
+import { SALVAGE_TRUNCATED_MARK, salvageReviewJson } from "./extract-chat-json.ts";
+import { rawBodyText } from "./review-raw-text.ts";
+import type { Finding, Job, ReviewProvider } from "./types.ts";
+
+const CL: ReviewProvider[] = ["chatgpt", "local"];
+const CGL: ReviewProvider[] = ["chatgpt", "grok", "local"];
+const VC = "verify-clean" as const;
+type RowJob = OutcomeJob & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs">>;
+const job = (patch: Partial<RowJob> = {}): RowJob => ({ reviewProviders: CL, assumptions: [], ...patch });
+const held = (patch: Partial<RowJob> = {}) => job({ localReviewRole: VC, ...patch });
+const verifying = (patch: Partial<RowJob> = {}) => held({ localVerifyStartedAt: 1, ...patch });
+const ASSUMES_SKIPPED = "Generated fixtures were skipped because they are irrelevant.";
+
+describe("reviewOutcome: the one decision point", () => {
+  const rows: Array<[string, OutcomeJob, number, ReviewOutcome]> = [
+    ["D1 race findings", job({ localReviewRole: "race" }), 1, "findings"],
+    ["D2 race raw", job({ localReviewRole: "race", rawReview: "P1 x" }), 0, "raw"],
+    ["D3 race skipped local", job({ localReviewRole: "race", skippedProviders: ["local"] }), 0, "incomplete"],
+    ["D4 race clean", job({ localReviewRole: "race" }), 0, "clean"],
+    ["D5 legacy/tape job without a role", job({ reviewProviders: ["chatgpt"] }), 0, "clean"],
+    ["D6 FP round merges as race", held({ chatFpRound: true }), 0, "clean"],
+    ["D7 verify-clean, chat only", held({ reviewProviders: ["chatgpt"] }), 0, "clean"],
+    ["D8 verify-clean, local only", held({ reviewProviders: ["local"] }), 0, "clean"],
+    ["D9 held, chat findings post now", held(), 1, "findings"],
+    ["D10 held, chat raw is not clean", held({ rawReview: "P1 x" }), 0, "raw"],
+    ["D11 held, chat clean starts verification", held(), 0, "verify"],
+    ["D12 held, a skipped chat reviewer still verifies", held({ reviewProviders: CGL, skippedProviders: ["grok"] }), 0, "verify"],
+    ["D13 local verified clean", verifying({ localVerified: true }), 0, "verified-clean"],
+    ["D14 local verified with findings", verifying({ localVerified: true }), 1, "findings"],
+    ["D15 local reply unparseable", verifying({ localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW", rawCauses: { local: "unparseable" } }), 0, "raw-unverified"],
+    ["D16 local failed", verifying({ localVerified: false }), 0, "unverified-clean"],
+    ["D17 local never stamped", verifying(), 0, "unverified-clean"],
+    ["D18 verified but a chat reviewer skipped", verifying({ reviewProviders: CGL, localVerified: true, skippedProviders: ["grok"] }), 0, "incomplete"],
+    ["D19 local as the chat-down fallback, clean", held({ localFallbackAt: 1 }), 0, "clean"],
+    ["D20 local as the chat-down fallback, raw", held({ localFallbackAt: 1, rawReview: "P1 x" }), 0, "raw"],
+    // A skipped reviewer is structured provider state; a reviewer's own assumption that says
+    // "skipped" is free text and never makes a complete review incomplete (race or verify-clean).
+    ["D21 race clean, a reviewer assumption says skipped", job({ localReviewRole: "race", assumptions: [ASSUMES_SKIPPED] }), 0, "clean"],
+    ["D22 verified clean, a reviewer assumption says skipped", verifying({ localVerified: true, assumptions: [ASSUMES_SKIPPED] }), 0, "verified-clean"],
+    ["D23 held clean, a reviewer assumption says skipped, still verifies", held({ assumptions: [ASSUMES_SKIPPED] }), 0, "verify"],
+    ["D24 an empty skipped list is nothing skipped", job({ localReviewRole: "race", skippedProviders: [] }), 0, "clean"],
+    // A reviewer whose payload was not its complete verdict (Job.incompleteProviders) never leaves a
+    // result clean, starts or passes a verification round, on race or verify-clean. Its reply normally
+    // posts as evidence (raw); these rows pin the classification even without that evidence.
+    ["D25 race, a reviewer with no complete verdict", job({ localReviewRole: "race", incompleteProviders: ["chatgpt"] }), 0, "incomplete"],
+    ["D26 held, a chat reviewer with no complete verdict never starts verification", held({ reviewProviders: CGL, incompleteProviders: ["grok"] }), 0, "incomplete"],
+    ["D27 verified, but a chat reviewer returned no complete verdict", verifying({ reviewProviders: CGL, localVerified: true, incompleteProviders: ["grok"] }), 0, "incomplete"],
+    ["D28 fallback clean beside chat with no complete verdict", held({ localFallbackAt: 1, incompleteProviders: ["chatgpt"] }), 0, "incomplete"],
+    ["D29 its evidence posted: raw", job({ localReviewRole: "race", incompleteProviders: ["chatgpt"], rawReview: "P1 x" }), 0, "raw"],
+    ["D30 an empty incomplete list is nothing incomplete", job({ localReviewRole: "race", incompleteProviders: [] }), 0, "clean"],
+    // raw-unverified says the raw block is local verification's own reply: it needs local's leg among
+    // the salvaged ones. A chat run that landed during the round with evidence of its own, while local
+    // returned nothing, is plain raw (its reply is never credited to local).
+    ["D31 local failed, a late chat reply is the only raw evidence", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "GROK-RAW", rawCauses: { grok: "not-a-verdict" }, incompleteProviders: ["grok"] }), 0, "raw"],
+    ["D32 local verified, a late chat reply is raw evidence", verifying({ reviewProviders: CGL, localVerified: true, rawReview: "GROK-RAW", rawCauses: { grok: "unparseable" }, incompleteProviders: ["grok"] }), 0, "raw"],
+    ["D33 local's reply and a late chat reply are both raw evidence", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "x", rawCauses: { grok: "unparseable", local: "not-a-verdict" } }), 0, "raw-unverified"],
+    ["D34 no salvaged leg recorded: never attributed to local", verifying({ localVerified: false, rawReview: "x" }), 0, "raw"],
+    // ... and in the block in full: a local reply cut to fit the body limit is plain raw.
+    ["D35 local's reply cut to fit the body limit: plain raw", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "x", rawCauses: { grok: "unparseable", local: "unparseable" }, rawTruncated: ["local"] }), 0, "raw"],
+    ["D36 only the late chat reply cut: local's is in full", verifying({ reviewProviders: CGL, localVerified: false, rawReview: "x", rawCauses: { grok: "unparseable", local: "unparseable" }, rawTruncated: ["grok"] }), 0, "raw-unverified"],
+  ];
+  for (const [name, j, findings, expected] of rows) {
+    it(name, () => assert.equal(reviewOutcome(j, findings), expected));
+  }
+
+  it("G1 a held result that reaches the renderer never renders as a clean pass", () => {
+    assert.equal(postedOutcome(held(), 0), "unverified-clean");
+    const body = reviewSummaryBody({ ...held(), headSha: "abc1234ffff", coverage: [] }, [], "ashlar-bot");
+    assert.equal(body.split("\n")[0], UNVERIFIED_CLEAN_REVIEW_BODY);
+    assert.equal(isConvergedFindings(body), false);
+  });
+});
+
+const finding: Finding = { ...FINDING_412, id: "f1" };
+const RAW = "P1 a.ts:1 LOCAL-RAW duplicate request writes twice";
+/** One job per posted kind, used by the render rows and by the invariants over the whole enum. */
+const RENDER: Record<PostedOutcome, { job: RowJob; findings: Finding[] }> = {
+  findings: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses: { chatgpt: "unparseable" } }), findings: [finding] },
+  raw: { job: job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses: { chatgpt: "unparseable" } }), findings: [] },
+  "raw-unverified": { job: verifying({ localVerified: false, rawReview: RAW, rawCauses: { local: "unparseable" }, localVerifyNote: "chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); it is posted verbatim below. Not a clean pass." }), findings: [] },
+  clean: { job: job({ localReviewRole: "race" }), findings: [] },
+  "verified-clean": { job: verifying({ localVerified: true, localVerifyNote: "chatgpt found nothing; local verification agreed." }), findings: [] },
+  "unverified-clean": { job: verifying({ localVerified: false, localVerifyNote: "chatgpt found nothing; local verification did not complete (x), so this is chatgpt's unverified clean result." }), findings: [] },
+  incomplete: { job: job({ localReviewRole: "race", skippedProviders: ["local"] }), findings: [] },
+};
+const render = (kind: PostedOutcome) => reviewSummaryBody({ ...RENDER[kind].job, headSha: "abc1234ffff", coverage: [] }, RENDER[kind].findings, "ashlar-bot");
+const trailer = (body: string) => /<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1] ?? null;
+
+describe("reviewSummaryBody: every part of the body comes from the outcome", () => {
+  it("findings: summary, the findings marker, and a salvaged block alongside", () => {
+    const body = render("findings");
+    assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
+    assert.equal(trailer(body), "total=1 inline=1 body=0 p0=0 p1=1 p2=0");
+    assert.ok(body.includes(REVIEW_RAW_START) && body.includes("P1 chat raw"));
+  });
+
+  it("raw: summary with the raw marker", () => {
+    const body = render("raw");
+    assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
+    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0");
+    assert.match(body, /Review posted verbatim — the reply was not valid review JSON/);
+  });
+
+  it("raw-unverified: the verifier's reply is kept verbatim inside the raw block, flagged unverified", () => {
+    const body = render("raw-unverified");
+    assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
+    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 unverified=1");
+    assert.match(body, /local verification's reply could not be used as a review/);
+    assert.match(body, /Local verification reply posted verbatim — it could not be used as a review\./);
+    const block = body.slice(body.indexOf(REVIEW_RAW_START), body.indexOf(REVIEW_RAW_END));
+    assert.ok(block.includes(RAW), "the verifier's finding text is inside the raw block");
+  });
+
+  it("clean and verified-clean: the clean sentinel first line and a zero marker", () => {
+    for (const kind of ["clean", "verified-clean"] as const) {
+      const body = render(kind);
+      assert.equal(body.split("\n")[0], CLEAN_REVIEW_BODY, kind);
+      assert.equal(trailer(body), "total=0 inline=0 body=0 p0=0 p1=0 p2=0", kind);
+    }
+    assert.match(render("verified-clean"), /local verification agreed/);
+  });
+
+  it("unverified-clean: never the sentinel, and the marker is flagged", () => {
+    const body = render("unverified-clean");
+    assert.equal(body.split("\n")[0], UNVERIFIED_CLEAN_REVIEW_BODY);
+    assert.equal(trailer(body), "total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1");
+  });
+
+  it("incomplete: summary and no marker at all", () => {
+    const body = render("incomplete");
+    assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
+    assert.match(body, /did not finish a full review/);
+    assert.equal(parseFindingsTotal(body), null);
+  });
+
+  it("incomplete for a reviewer without a complete verdict: named from provider state, never the sentinel or a marker", () => {
+    const body = reviewSummaryBody({ ...job({ localReviewRole: "race", incompleteProviders: ["grok"] }), headSha: "abc1234ffff", coverage: [] }, [], "ashlar-bot");
+    assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
+    assert.match(body, /- No complete review from grok \(reply posted as evidence\)/);
+    assert.match(body, /not every reviewer returned a complete review/);
+    assert.equal(parseFindingsTotal(body), null);
+    assert.equal(isConvergedFindings(body), false);
+  });
+});
+
+describe("the raw header says why, from the cause the merge stamped (never from the outcome)", () => {
+  const rawBody = (rawCauses: Job["rawCauses"], findings: Finding[] = []) =>
+    reviewSummaryBody({ ...job({ localReviewRole: "race", rawReview: "P1 chat raw", rawCauses }), headSha: "abc1234ffff", coverage: [] }, findings, "ashlar-bot");
+  const header = (body: string) => /\*\*⚠️ Review posted verbatim — ([^*]*)\*\*/.exec(body)?.[1];
+
+  it("a salvage before the gate says the reply was not valid review JSON (it may have parsed and failed the schema), and nothing about local repair", () => {
+    const body = rawBody({ chatgpt: "unparseable" });
+    assert.equal(header(body), "the reply was not valid review JSON.");
+    assert.doesNotMatch(body, /not parseable|local repair/i);
+  });
+
+  it("rows past the gate's cap: the reply parsed, its unread rows are why; never a parse failure or local repair", () => {
+    for (const body of [rawBody({ chatgpt: "unread-rows" }), rawBody({ chatgpt: "unread-rows" }, [finding])]) {
+      assert.equal(header(body), "the reply parsed, but its findings past the gate's row cap were not inspected.");
+      assert.doesNotMatch(body, /not parseable|not valid review JSON|local repair/i);
+    }
+  });
+
+  it("a released held local reply that is not a verdict says so", () => {
+    assert.equal(header(rawBody({ local: "not-a-verdict" })), "the reply could not be used as a complete structured review.");
+  });
+
+  it("no recorded cause is cause-neutral: it claims neither a parse failure nor unread rows", () => {
+    for (const causes of [undefined, {}, { chatgpt: "bogus" } as unknown as Job["rawCauses"], { toString: "unparseable" } as unknown as Job["rawCauses"]]) {
+      const body = rawBody(causes);
+      assert.equal(header(body), "a reply could not be used as structured review JSON.");
+      assert.doesNotMatch(body, /not parseable|not valid review JSON|local repair|row cap/i);
+    }
+  });
+
+  it("several salvaged legs: one labeled clause each, in merge order", () => {
+    assert.equal(
+      rawCauseText({ chatgpt: "unparseable", local: "unread-rows" }),
+      "ChatGPT: the reply was not valid review JSON; Local LLM: the reply parsed, but its findings past the gate's row cap were not inspected",
+    );
+  });
+
+  it("a leg the block holds only in part says so in its clause", () => {
+    const cut = "truncated below to fit GitHub's review body limit, full original in review history";
+    assert.equal(rawCauseText({ local: "unparseable" }, ["local"]), `the reply was not valid review JSON (${cut})`);
+    assert.equal(
+      rawCauseText({ grok: "unparseable", local: "not-a-verdict" }, ["local"]),
+      `Grok: the reply was not valid review JSON; Local LLM: the reply could not be used as a complete structured review (${cut})`,
+    );
+    assert.equal(rawCauseText(undefined, ["chatgpt"]), `a reply could not be used as structured review JSON (${cut})`);
+    assert.equal(rawCauseText({ chatgpt: "unparseable" }, ["local"]), `the reply was not valid review JSON (${cut})`, "a cut leg with no cause is not hidden");
+  });
+
+  it("a verification round whose local reply is cut renders as raw: the header names the cut, never local's reply as posted verbatim", () => {
+    const body = reviewSummaryBody(
+      { ...verifying({ reviewProviders: CGL, localVerified: false, rawReview: "GROK-RAW\n\n---\n\nLOCAL-RAW", rawCauses: { grok: "unparseable", local: "unparseable" }, rawTruncated: ["local"] }), headSha: "abc1234ffff", coverage: [] },
+      [],
+      "ashlar-bot",
+    );
+    assert.doesNotMatch(body, /Local verification reply posted verbatim/);
+    assert.match(body, /Review posted verbatim — Grok: the reply was not valid review JSON; Local LLM: the reply was not valid review JSON \(truncated below to fit GitHub's review body limit, full original in review history\)\./);
+    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0");
+  });
+});
+
+// The merge sizes the block, but the rest of the body (unanchored rows, neutralized markers in a job
+// the merge did not size) can still pass GitHub's limit. capReviewBody cut from the end, into the
+// block, under a header that still called it verbatim; the body now makes that cut itself and says so.
+describe("a body over GitHub's limit cuts inside the raw block and its header names the cut", () => {
+  const CUT = /\(truncated below to fit GitHub's review body limit, full original in review history\)/;
+  const unanchoredRow = (i: number, size: number): Finding => ({ ...finding, id: `u${i}`, title: `UNANCHORED-${i}`, failureScenario: `${"s".repeat(size)} ROW-END-${i}` });
+  const rendered = (j: RowJob, rows: Finding[] = []) =>
+    reviewSummaryBody({ ...j, headSha: "abc1234ffff", coverage: [] }, rows, "ashlar-bot", rows);
+  const assertFits = (body: string, name: string) => {
+    assert.ok(body.length <= 65_000, `${name}: ${body.length}`);
+    assert.ok(body.includes(REVIEW_RAW_END), `${name}: the block is closed`);
+    assert.doesNotMatch(body, /review body truncated to fit GitHub's limit/, `${name}: GitHub's cap never cut it`);
+    const raw = body.slice(body.indexOf(REVIEW_RAW_START), body.indexOf(REVIEW_RAW_END));
+    assert.match(raw, /\n\n…\(truncated to fit GitHub's review body limit; full original responses retained in review history\)\n$/, `${name}: the block ends in its own marker`);
+  };
+
+  it("findings beside a salvaged reply: every unanchored row survives, and the header names the cut reply", () => {
+    const rows = Array.from({ length: 8 }, (_, i) => unanchoredRow(i, 500));
+    const reply = `P1 a.ts:1 GROK-RAW ${"g".repeat(59_000)} GROK-END`;
+    for (const legs of [[{ provider: "grok" as const, end: reply.length }], undefined]) {
+      const body = rendered(job({ reviewProviders: ["chatgpt", "grok"], localReviewRole: "race", rawReview: reply, rawCauses: { grok: "unparseable" }, rawLegs: legs }), rows);
+      const name = legs ? "recorded legs" : "no recorded legs";
+      assertFits(body, name);
+      assert.doesNotMatch(body, /GROK-END/);
+      for (let i = 0; i < 8; i += 1) assert.ok(body.includes(`ROW-END-${i}`), `${name}: unanchored row ${i}`);
+      assert.match(body, new RegExp(`\\*\\*⚠️ Review posted verbatim — the reply was not valid review JSON ${CUT.source}\\.\\*\\*`), name);
+      assert.equal(trailer(body), "total=8 inline=0 body=8 p0=0 p1=8 p2=0", `${name}: the findings marker`);
+    }
+  });
+
+  it("a local verification reply the body lengthens is plain raw once cut: never posted verbatim, its note dropped", () => {
+    const reply = `P1 a.ts:1 LOCAL-RAW\n${"A --> B\n".repeat(6_500)}LOCAL-END`;
+    const note = "chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); it is posted verbatim below. Not a clean pass.";
+    const whole = verifying({ localVerified: false, rawReview: reply, rawCauses: { local: "unparseable" }, localVerifyNote: note });
+    assert.equal(postedOutcome(whole, 0), "raw-unverified", "the merge's outcome, before the body's cut");
+    const body = rendered({ ...whole, rawLegs: [{ provider: "local", end: reply.length }] });
+    assertFits(body, "local");
+    assert.doesNotMatch(body, /LOCAL-END/);
+    assert.doesNotMatch(body, /Local verification reply posted verbatim|posted verbatim below/);
+    assert.match(body, new RegExp(`\\*\\*⚠️ Review posted verbatim — the reply was not valid review JSON ${CUT.source}\\.\\*\\*`));
+    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0", "raw, never unverified=1 for a cut reply");
+    // the same reply short enough to survive whole keeps its raw-unverified body and note
+    const short = rendered({ ...whole, rawReview: "P1 a.ts:1 LOCAL-RAW A --> B LOCAL-END", rawLegs: [{ provider: "local", end: 37 }] });
+    assert.match(short, /Local verification reply posted verbatim/);
+    assert.ok(short.includes(note) && short.includes("LOCAL-END"));
+  });
+
+  it("names exactly the replies the cut reaches, from the merge's recorded legs", () => {
+    const salvaged = salvagedReview([{ provider: "grok", rawReview: `GROK-START ${"g".repeat(25_000)} GROK-END` }, { provider: "local", rawReview: `LOCAL-START ${"l".repeat(30_000)} LOCAL-END` }], 60_000);
+    assert.deepEqual(salvaged?.truncated, []);
+    const base = verifying({ reviewProviders: CGL, localVerified: false, rawReview: salvaged?.text, rawCauses: { grok: "unparseable", local: "unparseable" }, rawLegs: salvaged?.legs });
+    assert.equal(postedOutcome(base, 0), "raw-unverified");
+    // ~16,000 characters of unanchored rows: the cut stays inside local's reply, the last in the block
+    const localOnly = rendered(base, Array.from({ length: 8 }, (_, i) => unanchoredRow(i, 2_000)));
+    assertFits(localOnly, "local only");
+    assert.ok(localOnly.includes("GROK-END") && !localOnly.includes("LOCAL-END"));
+    assert.match(localOnly, new RegExp(`Review posted verbatim — Grok: the reply was not valid review JSON; Local LLM: the reply was not valid review JSON ${CUT.source}\\.`));
+    // ~40,000: the cut reaches back into grok's reply too
+    const both = rendered(base, Array.from({ length: 8 }, (_, i) => unanchoredRow(i, 5_000)));
+    assertFits(both, "both");
+    assert.ok(!both.includes("GROK-END") && both.includes("GROK-START"));
+    assert.match(both, new RegExp(`Review posted verbatim — Grok: the reply was not valid review JSON ${CUT.source}; Local LLM: the reply was not valid review JSON ${CUT.source}\\.`));
+    // without a recorded leg every stamped reply counts as cut, never one called whole that may not be
+    const unrecorded = rendered({ ...base, rawLegs: undefined }, Array.from({ length: 8 }, (_, i) => unanchoredRow(i, 2_000)));
+    assert.match(unrecorded, new RegExp(`Grok: the reply was not valid review JSON ${CUT.source}; Local LLM`));
+  });
+
+  it("an anonymous reply (no cause, no leg recorded) still gets the truncation clause", () => {
+    const body = rendered(job({ reviewProviders: ["chatgpt"], rawReview: "x".repeat(200_000) }));
+    assertFits(body, "anonymous");
+    assert.match(body, new RegExp(`Review posted verbatim — a reply could not be used as structured review JSON ${CUT.source}\\.`));
+  });
+});
+
+describe("invariants over the closed enum", () => {
+  for (const kind of REVIEW_OUTCOMES) {
+    it(`${kind}`, () => {
+      if (kind === "verify") {
+        assert.equal(postedOutcome(held(), 0), "unverified-clean", "verify is a hold, never a rendered kind");
+        return;
+      }
+      const row = RENDER[kind];
+      assert.ok(row, `no render row for ${kind}: add one and decide its OUTCOME_SHAPE`);
+      assert.equal(postedOutcome(row.job, row.findings.length), kind, "the row exercises its kind");
+      const body = render(kind);
+      const shape = OUTCOME_SHAPE[kind];
+      assert.equal(isConvergedFindings(body), shape.converged, "CONVERGED is the declared shape");
+      assert.equal(body.toLowerCase().includes("didn't find any major issues"), shape.converged, "clean sentinel iff converged");
+      assert.equal(/(?:^|\s)unverified=1(?:\s|$)/.test(trailer(body) ?? ""), shape.unverified, "unverified flag iff declared");
+      const raw = row.job.rawReview;
+      if (raw) {
+        assert.ok(body.includes(raw), "a salvaged reply is never filtered out of the body");
+        const pub = redactSalvagedReviewBody(body);
+        assert.equal(pub.includes(raw), false, "public snapshot redacts it");
+        assert.equal(trailer(pub), trailer(body), "and keeps the marker");
+      } else {
+        assert.equal(body.includes(REVIEW_RAW_START), false, "no raw block without a salvaged reply");
+      }
+    });
+  }
+});
+
+describe("outcomeNote", () => {
+  const chat: ReviewProvider[] = ["chatgpt"];
+  it("N1 verified-clean", () => assert.equal(outcomeNote("verified-clean", { chat, verifying: true, findings: 0, findingsBy: {} }), "chatgpt found nothing; local verification agreed."));
+  it("N2 local findings in the verification round", () => assert.equal(outcomeNote("findings", { chat, verifying: true, findings: 2, findingsBy: { chatgpt: 0, local: 2 } }), "chatgpt found nothing; local verification found 2."));
+  it("N3 chat findings (no verification round)", () => assert.equal(outcomeNote("findings", { chat, verifying: false, findings: 2, findingsBy: { chatgpt: 2 } }), ""));
+  it("N4 unverified-clean names the failure", () => assert.match(outcomeNote("unverified-clean", { chat, verifying: true, findings: 0, findingsBy: {}, localError: "x" }), /did not complete \(x\)/));
+  it("N5 raw-unverified names why the reply was unusable, says it is posted verbatim and is not clean", () => {
+    const note = outcomeNote("raw-unverified", { chat, verifying: true, findings: 0, findingsBy: {} });
+    assert.match(note, /could not be used as a review \(not review JSON\); it is posted verbatim below\. Not a clean pass\./);
+    assert.match(outcomeNote("raw-unverified", { chat, verifying: true, findings: 0, findingsBy: {}, localError: "1 finding(s) missing required fields" }), /\(1 finding\(s\) missing required fields\)/);
+  });
+  it("N6 credits only the chat reviewers pinned as clean (a skipped grok found nothing by absence)", () => {
+    assert.equal(outcomeNote("verified-clean", { chat: ["chatgpt"], verifying: true, findings: 0, findingsBy: {} }).startsWith("chatgpt found nothing"), true);
+  });
+  it("N7 clean, raw and incomplete carry no note outside a verification round", () => {
+    for (const kind of ["clean", "raw", "incomplete"] as const) assert.equal(outcomeNote(kind, { chat, verifying: false, findings: 0, findingsBy: {} }), "", kind);
+  });
+  it("N8 incomplete in a verification round still says whether local verified", () => {
+    assert.equal(outcomeNote("incomplete", { chat, verifying: true, findings: 0, findingsBy: {}, localVerified: true }), "chatgpt found nothing; local verification agreed.");
+    assert.equal(outcomeNote("incomplete", { chat, verifying: true, findings: 0, findingsBy: {}, localVerified: false, localError: "HTTP 500" }), "chatgpt found nothing; local verification did not complete (HTTP 500).");
+  });
+  // A chat run that started before the round can land during it: its findings are its own, never local's.
+  it("N9 a late chat reviewer's findings are credited to it, and local only with its own", () => {
+    const late = { chat, verifying: true, findings: 1, localVerified: true };
+    assert.equal(outcomeNote("findings", { ...late, findingsBy: { chatgpt: 0, grok: 1, local: 0 } }), "chatgpt found nothing; grok found 1; local verification found nothing.");
+    assert.equal(outcomeNote("findings", { ...late, findings: 3, findingsBy: { chatgpt: 0, grok: 1, local: 2 } }), "chatgpt found nothing; grok found 1; local verification found 2.");
+    assert.equal(outcomeNote("findings", { ...late, localVerified: false, localError: "HTTP 500", findingsBy: { chatgpt: 0, grok: 1 } }), "chatgpt found nothing; grok found 1; local verification did not return a verdict (HTTP 500).");
+  });
+  it("N10 a pinned clean chat reviewer that now reports findings is not called clean", () => {
+    assert.equal(outcomeNote("findings", { chat, verifying: true, findings: 1, localVerified: true, findingsBy: { chatgpt: 1, local: 0 } }), "chatgpt found 1; local verification found nothing.");
+  });
+  it("N11 with no reviewer to credit the wording is provider-neutral, never local's", () => {
+    const note = outcomeNote("findings", { chat, verifying: true, findings: 1, localVerified: true, findingsBy: { chatgpt: 0, local: 0 } });
+    assert.equal(note, "chatgpt found nothing; the review found 1.");
+  });
+  // A late chat reply is the raw block of a verification round: the note names whose reply it is and
+  // what local verification did, never that local's reply is posted.
+  it("N12 raw in a verification round credits the raw reply to its reviewer and states local's result", () => {
+    const late = { chat, verifying: true, findings: 0, findingsBy: {}, rawBy: ["grok"] as ReviewProvider[] };
+    assert.equal(
+      outcomeNote("raw", { ...late, localVerified: false, localError: "local LLM HTTP 500" }),
+      "chatgpt found nothing; local verification did not complete (local LLM HTTP 500); grok's reply could not be used as a review and is posted verbatim below. Not a clean pass.",
+    );
+    assert.equal(
+      outcomeNote("raw", { ...late, localVerified: true }),
+      "chatgpt found nothing; local verification found nothing; grok's reply could not be used as a review and is posted verbatim below. Not a clean pass.",
+    );
+    assert.doesNotMatch(outcomeNote("raw", { ...late, rawBy: [] }), /local verification's reply/);
+  });
+  // The block holds a reply only in part: the note names it and never says the block is verbatim.
+  it("N13 raw in a verification round names the replies cut to fit, local's included", () => {
+    const round = { chat, verifying: true, findings: 0, findingsBy: {}, localVerified: false, localError: "not review JSON" };
+    assert.equal(
+      outcomeNote("raw", { ...round, rawBy: ["grok", "local"], rawTruncated: ["local"] }),
+      "chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); grok's reply could not be used as a review either; posted below (local verification truncated to fit GitHub's review body limit, full originals in review history). Not a clean pass.",
+    );
+    assert.equal(
+      outcomeNote("raw", { ...round, localError: "local LLM HTTP 500", rawBy: ["grok"], rawTruncated: ["grok"] }),
+      "chatgpt found nothing; local verification did not complete (local LLM HTTP 500); grok's reply could not be used as a review and is posted below (grok truncated to fit GitHub's review body limit, full originals in review history). Not a clean pass.",
+    );
+  });
+});
+
+describe("salvagedReview", () => {
+  it("keeps every salvaged leg, the verifier's included, labeled when more than one", () => {
+    assert.deepEqual(salvagedReview([{ provider: "chatgpt" }, { provider: "local", rawReview: "LOCAL-RAW" }], 100), { text: "LOCAL-RAW", truncated: [], legs: [{ provider: "local", end: 9 }] });
+    const both = salvagedReview([{ provider: "chatgpt", rawReview: "CHAT-RAW" }, { provider: "local", rawReview: "LOCAL-RAW" }], 1000);
+    assert.match(both?.text ?? "", /\*\*ChatGPT:\*\*\n\nCHAT-RAW\n\n---\n\n\*\*Local LLM:\*\*\n\nLOCAL-RAW/);
+    assert.deepEqual(both?.truncated, []);
+    // where each leg's piece ends in the block, so a body that must cut it further names exactly whose
+    const text = both?.text ?? "";
+    assert.deepEqual(both?.legs, [{ provider: "chatgpt", end: text.indexOf("\n\n---\n\n") }, { provider: "local", end: text.length }]);
+    assert.ok(text.slice(0, both?.legs[0].end).endsWith("CHAT-RAW"));
+  });
+
+  it("is undefined with nothing salvaged, and truncates past the limit", () => {
+    assert.equal(salvagedReview([{ provider: "chatgpt" }], 100), undefined);
+    const one = salvagedReview([{ provider: "local", rawReview: "x".repeat(50) }], 10);
+    assert.match(one?.text ?? "", /^x{10}\n\n…\(truncated/);
+    assert.deepEqual(one?.truncated, ["local"]);
+  });
+
+  // A late chat reply ahead of local's in a verification round: cutting the concatenation let the
+  // earlier reply take the whole limit and drop local's, while the outcome still credited local.
+  it("a long earlier reply never crowds a later one out: each leg keeps its share, and a cut one says so", () => {
+    const chat = `CHAT-START ${"c".repeat(5_000)} CHAT-END`;
+    const local = "P1 a.ts:1 LOCAL-RAW duplicate write";
+    const out = salvagedReview([{ provider: "grok", rawReview: chat }, { provider: "local", rawReview: local }], 1_000);
+    assert.ok(out?.text.includes(`**Local LLM:**\n\n${local}`), "local's short reply is kept in full");
+    assert.match(out?.text ?? "", /^\*\*Grok:\*\*\n\nCHAT-START c+\n\n…\(Grok reply truncated to fit GitHub's review body limit/);
+    assert.doesNotMatch(out?.text ?? "", /CHAT-END/);
+    assert.deepEqual(out?.truncated, ["grok"]);
+    // both over their share: each keeps its start and ends in its own marker
+    const long = salvagedReview([{ provider: "grok", rawReview: chat }, { provider: "local", rawReview: `LOCAL-START ${"l".repeat(5_000)}` }], 1_000);
+    assert.match(long?.text ?? "", /\*\*Grok:\*\*\n\nCHAT-START c+\n\n…\(Grok reply truncated[^)]*\)\n\n---\n\n\*\*Local LLM:\*\*\n\nLOCAL-START l+\n\n…\(Local LLM reply truncated/);
+    assert.deepEqual(long?.truncated, ["grok", "local"]);
+    const kept = (long?.text ?? "").split("\n\n---\n\n").map((part) => part.replace(/^\*\*[^*]+:\*\*\n\n/, "").replace(/\n\n…\([^)]*\)$/, "").length);
+    assert.ok(Math.abs(kept[0] - kept[1]) <= 1, `equal shares: ${kept}`);
+    assert.ok((long?.text ?? "").replace(/\n\n…\([^)]*\)/g, "").length <= 1_000, "the replies and their frame stay within the limit");
+  });
+
+  it("a reply the salvage already cut counts as cut even when it fits", () => {
+    const cut = JSON.parse(salvageReviewJson(`P1 LOCAL-RAW ${"x".repeat(70_000)}`)).raw_review as string;
+    assert.ok(cut.length <= 60_000 && cut.endsWith(SALVAGE_TRUNCATED_MARK), "the salvage marks its own cut");
+    assert.deepEqual(salvagedReview([{ provider: "local", rawReview: cut }], 60_000), { text: cut, truncated: ["local"], legs: [{ provider: "local", end: cut.length }] });
+    const whole = JSON.parse(salvageReviewJson("P1 LOCAL-RAW")).raw_review as string;
+    assert.deepEqual(salvagedReview([{ provider: "local", rawReview: whole }], 60_000)?.truncated, []);
+  });
+
+  // The body neutralizes each `-->` (+3) and rewords the clean sentinel: a reply that fits by its own
+  // length used to overflow the body there, cut unannounced under a header that called it verbatim.
+  it("sizes each reply as the body renders it, never by its own length", () => {
+    const chart = `LOCAL-START ${"A --> B\n".repeat(100)}LOCAL-END`;
+    assert.ok(chart.length <= 1_000 && rawBodyText(chart).length > 1_000, "fits by its own length only");
+    const out = salvagedReview([{ provider: "local", rawReview: chart }], 1_000);
+    assert.deepEqual(out?.truncated, ["local"]);
+    assert.doesNotMatch(out?.text ?? "", /LOCAL-END/);
+    const kept = (out?.text ?? "").replace(/\n\n…\([^)]*\)$/, "");
+    assert.ok(rawBodyText(kept).length <= 1_000, `as posted: ${rawBodyText(kept).length}`);
+    assert.ok(rawBodyText(chart.slice(0, kept.length + 1)).length > 1_000, "the longest prefix that fits");
+    // shares are split by rendered length too: the neutralized reply is the longer one
+    // 1,900 of room after the labels and separator: grok's 900 fits its 950, and local is left 1,000,
+    // which holds its own 821 characters but not the 1,121 the body renders
+    const frame = "**Grok:**\n\n".length + "**Local LLM:**\n\n".length + "\n\n---\n\n".length;
+    const two = salvagedReview([{ provider: "grok", rawReview: "g".repeat(900) }, { provider: "local", rawReview: chart }], frame + 1_900);
+    assert.deepEqual(two?.truncated, ["local"]);
+    assert.ok(two?.text.includes("g".repeat(900)), "grok's reply is whole");
+    const sentinel = "Didn't find any major issues. ".repeat(40);
+    assert.deepEqual(salvagedReview([{ provider: "local", rawReview: sentinel }], sentinel.length)?.truncated, ["local"], "the reworded sentinel is longer");
+    assert.deepEqual(salvagedReview([{ provider: "local", rawReview: chart }], rawBodyText(chart).length)?.truncated, [], "exactly the rendered length fits");
+  });
+});

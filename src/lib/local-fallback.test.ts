@@ -140,9 +140,14 @@ describe("verify-clean local role", () => {
       "local delivered usable clean JSON",
     );
     assert.equal(
-      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[{"severity":"P1","title":"t","file":"a.ts","line":1,"body":"b","confidence":0.9}]}' }] }),
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[{"title":"t","failure_scenario":"fs","root_cause":"rc","evidence":"ev","recommended_fix":"rf","recommended_test":"rt","file":"a.ts","line":1,"severity":"P1"}]}' }] }),
       true,
-      "local delivered findings JSON",
+      "local delivered structurally valid findings JSON",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[{}]}' }] }),
+      false,
+      "malformed findings [{}] must not waive chat",
     );
     assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Skipped local (HTTP 500)"] }), false, "local failed");
     assert.equal(fallbackWaivesChat({ ...at, providerErrors: { local: { code: "error", message: "HTTP 500" } } }), false, "local errored");

@@ -57,6 +57,23 @@ export function localVerifies(input: { role?: LocalReviewRole; providers: readon
  * JSON with no incompleteness markers (unparsedText / residualReplies) and is not salvaged verbatim
  * (`raw_review`). Raw presence alone is not enough: incomplete / raw-only evidence cannot keep chat
  * waived. */
+/** Same required fields as poster.asFinding — a finding row is structurally postable only when these
+ * are present. Used by usableLocalFallbackLeg so a malformed findings array cannot keep chat waived. */
+function findingStructurallyValid(row: unknown): boolean {
+  if (!row || typeof row !== "object") return false;
+  const f = row as Record<string, unknown>;
+  const title = String(f.title ?? "").trim();
+  const failureScenario = String(f.failure_scenario ?? f.failureScenario ?? "").trim();
+  const rootCause = String(f.root_cause ?? f.rootCause ?? "").trim();
+  const evidence = String(f.evidence ?? "").trim();
+  const recommendedFix = String(f.recommended_fix ?? f.recommendedFix ?? "").trim();
+  const recommendedTest = String(f.recommended_test ?? f.recommendedTest ?? "").trim();
+  const file = String(f.file ?? "").trim();
+  const line = Number(f.line);
+  if (!title || !failureScenario || !rootCause || !evidence || !recommendedFix || !recommendedTest || !file) return false;
+  return Number.isFinite(line) && line >= 1;
+}
+
 export function usableLocalFallbackLeg(
   leg: { provider: ReviewProvider; raw: string; unparsedText?: string; residualReplies?: string },
 ): boolean {
@@ -69,6 +86,8 @@ export function usableLocalFallbackLeg(
     // Salvaged verbatim evidence is never a usable verdict.
     const rawReview = typeof o.raw_review === "string" ? o.raw_review.trim() : "";
     if (rawReview) return false;
+    // Require review-shaped keys (findings / merge_recommendation / keep / investigated_safe).
+    if (!("findings" in o || "merge_recommendation" in o || "keep" in o || "investigated_safe" in o)) return false;
     // Same Instant-tier empty guard as gateLiveSubmission: empty findings without investigated_safe
     // is not a review (a bare {} / non-review object must not keep chat waived).
     const findings = Array.isArray(o.findings) ? o.findings : [];
@@ -76,11 +95,10 @@ export function usableLocalFallbackLeg(
       const safe = Array.isArray(o.investigated_safe)
         ? (o.investigated_safe as unknown[]).map((x) => String(x).trim()).filter(Boolean)
         : [];
-      if (!safe.length) return false;
+      return safe.length > 0;
     }
-    // Require review-shaped keys (findings / merge_recommendation / keep / investigated_safe).
-    if (!("findings" in o || "merge_recommendation" in o || "keep" in o || "investigated_safe" in o)) return false;
-    return true;
+    // Every finding must pass the publish-gate structural schema (asFinding required fields).
+    return findings.every(findingStructurallyValid);
   } catch {
     return false;
   }

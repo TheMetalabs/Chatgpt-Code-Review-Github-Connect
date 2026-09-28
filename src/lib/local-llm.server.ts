@@ -80,6 +80,18 @@ export type LocalLegResult =
   | { ok: true; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string }
   | { ok: false; error: string; originalText?: string; unparsedText?: string };
 
+
+/** Non-whitespace text of a completed reply that sits outside the accepted JSON slice. When present,
+ * the leg is evidence (residualReplies), not a complete verdict — incompleteVerdict reads this. */
+export function residualOutsideJson(reply: string, acceptedJson: string): string | undefined {
+  const idx = reply.indexOf(acceptedJson);
+  if (idx < 0) return undefined;
+  const before = reply.slice(0, idx).trim();
+  const after = reply.slice(idx + acceptedJson.length).trim();
+  const residual = [before, after].filter(Boolean).join("\n\n");
+  return residual || undefined;
+}
+
 export async function runLocalLlm(
   prompt: string,
   settings: BotSettings,
@@ -103,7 +115,10 @@ export async function runLocalLlm(
     ]);
     if (!raw.trim()) return { ok: false, error: "local LLM returned empty" };
     const firstJson = extractChatJson(raw);
-    if (firstJson) return { ok: true, raw: firstJson, originalText: raw };
+    if (firstJson) {
+      const residual = residualOutsideJson(raw, firstJson);
+      return { ok: true, raw: firstJson, originalText: raw, ...(residual ? { residualReplies: residual } : {}) };
+    }
 
     // Exactly one semantic retry, and only after an actual completed non-JSON reply. Do NOT echo the
     // prior reply back: adding it on top of the full prompt and the same max_tokens budget could
@@ -121,8 +136,11 @@ export async function runLocalLlm(
       },
     ]);
     const corrected = extractChatJson(raw2);
-    return corrected ? {ok: true, raw: corrected, originalText: raw2, unparsedText: raw}
-      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, unparsedText: raw};
+    if (!corrected) {
+      return {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, unparsedText: raw};
+    }
+    const residual = residualOutsideJson(raw2, corrected);
+    return {ok: true, raw: corrected, originalText: raw2, unparsedText: raw, ...(residual ? { residualReplies: residual } : {})};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

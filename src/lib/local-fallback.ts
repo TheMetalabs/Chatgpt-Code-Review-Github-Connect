@@ -65,8 +65,21 @@ export function usableLocalFallbackLeg(
   try {
     const parsed = JSON.parse(leg.raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    const rawReview = (parsed as Record<string, unknown>).raw_review;
-    if (typeof rawReview === "string" && rawReview.trim()) return false;
+    const o = parsed as Record<string, unknown>;
+    // Salvaged verbatim evidence is never a usable verdict.
+    const rawReview = typeof o.raw_review === "string" ? o.raw_review.trim() : "";
+    if (rawReview) return false;
+    // Same Instant-tier empty guard as gateLiveSubmission: empty findings without investigated_safe
+    // is not a review (a bare {} / non-review object must not keep chat waived).
+    const findings = Array.isArray(o.findings) ? o.findings : [];
+    if (findings.length === 0) {
+      const safe = Array.isArray(o.investigated_safe)
+        ? (o.investigated_safe as unknown[]).map((x) => String(x).trim()).filter(Boolean)
+        : [];
+      if (!safe.length) return false;
+    }
+    // Require review-shaped keys (findings / merge_recommendation / keep / investigated_safe).
+    if (!("findings" in o || "merge_recommendation" in o || "keep" in o || "investigated_safe" in o)) return false;
     return true;
   } catch {
     return false;

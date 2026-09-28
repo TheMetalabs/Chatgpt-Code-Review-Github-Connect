@@ -133,7 +133,17 @@ describe("verify-clean local role", () => {
   it("a fallback release waives chat only while local can still deliver a usable verdict; once local ends with nothing usable, chat is awaited again", () => {
     const at = { localFallbackAt: 1, assumptions: [] as string[] };
     assert.equal(fallbackWaivesChat({ ...at }), true, "local running");
-    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: "{}" }] }), true, "local delivered usable JSON");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: "{}" }] }), false, "schema-invalid {} is not a usable verdict");
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[],"investigated_safe":["ok"],"merge_recommendation":"COMMENT"}' }] }),
+      true,
+      "local delivered usable clean JSON",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[{"severity":"P1","title":"t","file":"a.ts","line":1,"body":"b","confidence":0.9}]}' }] }),
+      true,
+      "local delivered findings JSON",
+    );
     assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Skipped local (HTTP 500)"] }), false, "local failed");
     assert.equal(fallbackWaivesChat({ ...at, providerErrors: { local: { code: "error", message: "HTTP 500" } } }), false, "local errored");
     assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Generated fixtures were skipped"] }), true, "reviewer text is not a skipped local");

@@ -130,7 +130,8 @@ describe("review-format", () => {
       [],
     );
     assert.ok(body.length <= 65_000, `body too long: ${body.length}`);
-    assert.match(body, /ashlar-findings total=1/);
+    assert.match(body, /ashlar-findings total=0/);
+    assert.match(body, /raw=1/);
     assert.match(body, /truncated to fit/);
   });
 
@@ -298,7 +299,7 @@ describe("review-format", () => {
     it("only the trailing marker counts, and a finding count or a clean pass is not a not-clean outcome", () => {
       assert.equal(notCleanOutcomeOf(`${quoted}\nquoted, then more text`), null);
       assert.equal(notCleanOutcomeOf(`text\n${quoted}\n`), "raw-unverified");
-      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->"), "raw");
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->"), "raw");
       assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1 -->"), "unverified-clean");
       assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=2 inline=2 body=0 p0=0 p1=2 p2=0 -->"), null);
       assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->"), null);

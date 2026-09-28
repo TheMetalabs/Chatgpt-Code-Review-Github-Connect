@@ -169,7 +169,10 @@ function renderedLegEnds(job: SummaryJob): RawLeg[] {
 export function findingsMarker(outcome: PostedOutcome, findings: Finding[], unanchored: Finding[]): string {
   const flag = OUTCOME_SHAPE[outcome].unverified ? " unverified=1" : "";
   if (outcome === "incomplete") return "";
-  if (outcome === "raw" || outcome === "raw-unverified") return `<!-- ashlar-findings total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0${flag} -->`;
+  // total=0: raw evidence is not a structured finding count. Consumers must read raw=1 (and
+  // unverified=1) rather than treating total as a resolved findings workflow. isConvergedFindings
+  // rejects raw=1 so total=0 here never means CONVERGED.
+  if (outcome === "raw" || outcome === "raw-unverified") return `<!-- ashlar-findings total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0${flag} -->`;
   if (outcome !== "findings") return `<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0${flag} -->`;
   const n = countBySeverity(findings);
   return `<!-- ashlar-findings total=${findings.length} inline=${findings.length - unanchored.length} body=${unanchored.length} p0=${n.P0} p1=${n.P1} p2=${n.P2}${flag} -->`;

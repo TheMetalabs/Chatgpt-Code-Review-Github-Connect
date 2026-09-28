@@ -111,14 +111,14 @@ describe("reviewSummaryBody: every part of the body comes from the outcome", () 
   it("raw: summary with the raw marker", () => {
     const body = render("raw");
     assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
-    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0");
+    assert.equal(trailer(body), "total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0");
     assert.match(body, /Review posted verbatim — the reply was not valid review JSON/);
   });
 
   it("raw-unverified: the verifier's reply is kept verbatim inside the raw block, flagged unverified", () => {
     const body = render("raw-unverified");
     assert.equal(body.split("\n")[0], REVIEW_SUMMARY_MARK);
-    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 unverified=1");
+    assert.equal(trailer(body), "total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 unverified=1");
     assert.match(body, /local verification's reply could not be used as a review/);
     assert.match(body, /Local verification reply posted verbatim — it could not be used as a review\./);
     const block = body.slice(body.indexOf(REVIEW_RAW_START), body.indexOf(REVIEW_RAW_END));
@@ -213,7 +213,7 @@ describe("the raw header says why, from the cause the merge stamped (never from 
     );
     assert.doesNotMatch(body, /Local verification reply posted verbatim/);
     assert.match(body, /Review posted verbatim — Grok: the reply was not valid review JSON; Local LLM: the reply was not valid review JSON \(truncated below to fit GitHub's review body limit, full original in review history\)\./);
-    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0");
+    assert.equal(trailer(body), "total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0");
   });
 });
 
@@ -257,7 +257,7 @@ describe("a body over GitHub's limit cuts inside the raw block and its header na
     assert.doesNotMatch(body, /LOCAL-END/);
     assert.doesNotMatch(body, /Local verification reply posted verbatim|posted verbatim below/);
     assert.match(body, new RegExp(`\\*\\*⚠️ Review posted verbatim — the reply was not valid review JSON ${CUT.source}\\.\\*\\*`));
-    assert.equal(trailer(body), "total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0", "raw, never unverified=1 for a cut reply");
+    assert.equal(trailer(body), "total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0", "raw, never unverified=1 for a cut reply");
     // the same reply short enough to survive whole keeps its raw-unverified body and note
     const short = rendered({ ...whole, rawReview: "P1 a.ts:1 LOCAL-RAW A --> B LOCAL-END", rawLegs: [{ provider: "local", end: 37 }] });
     assert.match(short, /Local verification reply posted verbatim/);

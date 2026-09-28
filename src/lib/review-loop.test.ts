@@ -277,6 +277,9 @@ describe("isZeroFindings (CONVERGED machine side)", () => {
     assert.equal(isZeroFindings("", BOT), false);
     // a user-authored comment carrying the marker is not a convergence signal
     assert.equal(isZeroFindings("<!-- ashlar-findings total=0 -->", USER), false);
+    // raw evidence uses total=0 + raw=1 and must NOT look like a structured/converged result
+    assert.equal(isZeroFindings("<!-- ashlar-findings total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->", BOT), false);
+    assert.equal(isZeroFindings("<!-- ashlar-findings total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 unverified=1 -->", BOT), false);
   });
 
   it("reads ONLY the trailing marker: one quoted earlier in the body is prose, never a count", () => {

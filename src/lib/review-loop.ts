@@ -41,6 +41,8 @@ export function parseFindingsTotal(body: string | null | undefined): number | nu
 export function isConvergedFindings(body: string | null | undefined): boolean {
   if (parseFindingsTotal(body) !== 0) return false;
   const m = FINDINGS_TRAILER_RE.exec(body || "");
+  // raw=1 is salvaged evidence, not a clean pass — even with total=0.
+  if (m && /(?:^|\s)raw=1(?=\s|$)/.test(m[1])) return false;
   return !(m && /(?:^|\s)unverified=1(?=\s|$)/.test(m[1]));
 }
 

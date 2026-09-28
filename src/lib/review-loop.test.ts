@@ -11,6 +11,7 @@ import {
   stoppedComment,
   stopRecordComment,
   isoMs,
+  isConvergedFindings,
   isZeroFindings,
   parseFindingsTotal,
   parseStopRecord,
@@ -290,6 +291,16 @@ describe("isZeroFindings (CONVERGED machine side)", () => {
     assert.equal(parseFindingsTotal("<!-- ashlar-findings total=0 --> then more prose"), null, "not trailing → no count");
     assert.equal(parseFindingsTotal("<!-- ashlar-findings inline=2 -->"), null, "no total");
   });
+
+  it("an unverified clean result (verify-clean local round did not complete) is never CONVERGED", () => {
+    const unverified = "Didn't find any major issues.\n<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1 -->";
+    assert.equal(parseFindingsTotal(unverified), 0);
+    assert.equal(isConvergedFindings(unverified), false);
+    assert.equal(isZeroFindings(unverified, BOT), false);
+    assert.equal(isConvergedFindings("<!-- ashlar-findings total=0 inline=0 -->"), true);
+    assert.equal(isConvergedFindings("quoting unverified=1 in prose\n<!-- ashlar-findings total=0 -->"), true, "only the trailing marker counts");
+  });
+
 });
 
 describe("isoMs (session boundaries are instants)", () => {

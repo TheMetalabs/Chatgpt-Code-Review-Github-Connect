@@ -1,13 +1,14 @@
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { recentFixRawAnswers } from "./fix-raw-archive.server.ts";
-import { DEFAULT_SETTINGS, type BotSettings, type FixAgentSettings, type Finding, type Job, type SamplePr } from "./types.ts";
-import { continueComment, fixingComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment } from "./review-loop.ts";
+import { DEFAULT_SETTINGS, type BotSettings, type FixAgentSettings, type Finding, type Job, type ReviewProvider, type SamplePr } from "./types.ts";
+import { continueComment, fixingComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment, type NotCleanOutcome } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { buildFixPrompt } from "./fix-agent.ts";
 import { FIX_PROVIDER_CAPS, fixDeadline } from "./settings-rules.ts";
 import { botSettingsToEnv, overlayEnv, sanitizeBotSettings } from "./settings.server.ts";
+import { reviewSummaryBody } from "./review-format.ts";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { createHash } from "node:crypto";
@@ -19,8 +20,10 @@ import {
   continueLoopOnPush,
   controlResultLogged,
   effectiveLoopMode,
+  INCOMPLETE_RECOVERED_DETAIL,
   loopEnabled,
   loopPostedReview,
+  recoveredHandoffDetail,
   loopStepGateForTests,
   renderFindings,
   CHAT_FIX_FENCE_RULE,
@@ -152,6 +155,7 @@ function fakeDeps(
     replyFails?: boolean;
     replyFailures?: number; // the first N thread-reply POSTs fail (transient)
     listThreadsFails?: boolean; // listReviewThreadRoots throws (a failed page)
+    reviews?: Array<{ body: string; commitId: string; submittedAt: string }>; // extra durable bot reviews
   } = {},
 ) {
   const posted: string[] = [];
@@ -178,12 +182,15 @@ function fakeDeps(
   const deps: LoopRuntimeDeps = {
     gh: {
       async listPullReviews() {
-        return rounds.map((n, i) => ({
-          userLogin: BOT,
-          body: `<!-- ashlar-findings total=${n} -->`,
-          commitId: i === rounds.length - 1 ? lastHead : `c${i}`.padEnd(40, "0"),
-          submittedAt: dayIso(i),
-        }));
+        return [
+          ...rounds.map((n, i) => ({
+            userLogin: BOT,
+            body: `<!-- ashlar-findings total=${n} -->`,
+            commitId: i === rounds.length - 1 ? lastHead : `c${i}`.padEnd(40, "0"),
+            submittedAt: dayIso(i),
+          })),
+          ...(opts.reviews ?? []).map((r) => ({ userLogin: BOT, ...r })),
+        ];
       },
       async listReviewComments() {
         return rounds.map((_n, i) => ({
@@ -527,6 +534,298 @@ describe("runPostReviewLoop gates", () => {
     const f = fakeDeps({ rounds: [3] });
     const r = await run(f, "suggest", {}, job({ thread: { kind: "mention", commentId: 9, userText: "@ashlar-bot review" } }));
     assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested");
+  });
+});
+
+describe("CONVERGED is the posted outcome, not \"no findings\" (docs/local-verify-clean.md §1)", () => {
+  const VC = { reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", localVerifyStartedAt: 2, localVerifyChat: ["chatgpt"] } as Partial<Job>;
+  const notClean: Array<[string, Partial<Job>, RegExp]> = [
+    ["raw (a chat reply posted verbatim)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW", rawCauses: { chatgpt: "unparseable" } }, /posted verbatim: the reply was not valid review JSON\)/],
+    ["raw (a parsed chat reply with rows past the gate's cap)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW", rawCauses: { chatgpt: "unread-rows" } }, /posted verbatim: the reply parsed, but its findings past the gate's row cap were not inspected\)/],
+    ["raw (no cause recorded)", { reviewProviders: ["chatgpt"], rawReview: "P1 a.ts:1 CHAT-RAW" }, /posted verbatim: a reply could not be used as structured review JSON\)/],
+    ["raw-unverified", { ...VC, localVerified: false, rawReview: "P1 a.ts:1 LOCAL-RAW", rawCauses: { local: "unparseable" } }, /local verification's reply could not be used/],
+    // a chat reply that landed during a verification round that returned nothing: never local's reply
+    ["raw (a late chat reply in a failed verification round)", { ...VC, reviewProviders: ["chatgpt", "grok", "local"], localVerified: false, rawReview: "GROK-RAW", rawCauses: { grok: "not-a-verdict" } }, /posted verbatim: the reply could not be used as a complete structured review\)/],
+    ["unverified-clean", { ...VC, localVerified: false }, /local verification did not complete/],
+    ["incomplete", { reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: ["Skipped grok (quota or unavailable)"] }, /a reviewer did not run/],
+    ["incomplete (a reviewer returned no complete verdict)", { reviewProviders: ["chatgpt", "local"], localReviewRole: "race", incompleteProviders: ["chatgpt"] }, /a reviewer returned no complete review/],
+  ];
+  for (const [name, patch, detail] of notClean) {
+    it(`${name}: an active session gets one fixed handoff, never a silent stop`, async () => {
+      const f = fakeDeps({ rounds: [1] });
+      const r = await run(f, "suggest", {}, job({ findings: [], ...patch }));
+      assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+      assert.equal(escalations(f.posted).length, 1);
+      assert.match(escalations(f.posted)[0], detail);
+      // Only a recorded pre-gate salvage is handed off as one: never unread rows or an unknown cause.
+      if (patch.rawReview && patch.rawCauses?.chatgpt !== "unparseable") assert.doesNotMatch(escalations(f.posted)[0], /not parseable|not valid review JSON|local repair/i);
+      assert.equal(f.prompts.length, 0, "nothing structured reaches the fix agent");
+      const none = fakeDeps({ start: null, rounds: [1] });
+      assert.deepEqual(await run(none, "suggest", {}, job({ findings: [], ...patch })), { ran: false, reason: "no active loop session" });
+    });
+  }
+
+  // A reviewer's own assumption that says "skipped" is not a reviewer that did not run.
+  const ASSUMES_SKIPPED = { assumptions: ["Generated fixtures were skipped because they are irrelevant."], skippedProviders: [] as ReviewProvider[] };
+  for (const [name, patch] of [
+    ["clean", {}],
+    ["verified-clean", { ...VC, localVerified: true }],
+    ["clean, a reviewer assumption says skipped", ASSUMES_SKIPPED],
+    ["verified-clean, a reviewer assumption says skipped", { ...VC, localVerified: true, ...ASSUMES_SKIPPED }],
+  ] as const) {
+    it(`${name}: silent convergence`, async () => {
+      const f = fakeDeps({ rounds: [0] });
+      assert.deepEqual(await run(f, "suggest", {}, job({ findings: [], ...patch })), { ran: false, reason: "no findings (converged)" });
+      assert.equal(f.posted.length, 0);
+    });
+  }
+});
+
+describe("an incomplete review owes its loop-error handoff durably (the INCOMPLETE marker)", () => {
+  const INCOMPLETE = { findings: [], reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: ["Skipped grok (quota or unavailable)"] } as Partial<Job>;
+  const incompleteJob = () => job(INCOMPLETE);
+  // The body GitHub keeps, rendered by the real formatter: reconstruction reads what was posted.
+  const postedReview = (at = "2026-01-10T00:00:00Z") => ({ body: reviewSummaryBody(incompleteJob(), [], BOT), commitId: HEAD, submittedAt: at });
+  const pushTo = (headSha: string, pushedAt: string) => ({ owner: "o", repo: "r", pr: 7, headSha, actor: "alice", pushedAt });
+  const session = (f: ReturnType<typeof fakeDeps>, sha: string) => readLoopSession(f.deps.gh, "t", "o", "r", 7, { botLogin: BOT, pr: { sha } });
+
+  it("the history already lists the review: its own loop step still posts the handoff, with the job's own detail", async () => {
+    const f = fakeDeps({ reviews: [postedReview()] });
+    assert.equal((await session(f, HEAD)).owedHandoff?.head, HEAD, "the listed review ended the session");
+    const r = await run(f, "suggest", {}, incompleteJob());
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    assert.equal(escalations(f.posted).length, 1);
+    assert.match(escalations(f.posted)[0], /this review is not a clean pass \(a reviewer did not run\)/);
+    assert.ok(escalations(f.posted)[0].includes(`head=${HEAD}`));
+    assert.equal((await session(f, HEAD)).owedHandoff, undefined, "settled by its handoff");
+  });
+
+  it("a crash or a failed post between the review and its handoff: a fresh runtime reads the marker as owing the handoff, and the next push posts it once instead of continuing", async () => {
+    const opts: Parameters<typeof fakeDeps>[0] = { reviews: [postedReview()], failHandoff: true };
+    const f = fakeDeps(opts);
+    const r = await run(f, "suggest", {}, incompleteJob());
+    assert.ok(!r.ran && /^ESCALATE loop-error failed to post/.test(r.reason), JSON.stringify(r));
+    assert.equal(escalations(f.posted).length, 0, "the handoff was lost");
+    // Recreated from durable GitHub events only: not CONVERGED, not an active session waiting on the head.
+    const lost = await session(f, HEAD);
+    assert.equal(lost.active, false);
+    assert.equal(lost.endedBy, "not-clean");
+    assert.equal(lost.owedHandoff?.head, HEAD, "the loop-error handoff is owed for the reviewed head");
+    assert.equal(lost.owedHandoff?.outcome, "incomplete");
+    // Storage is back and a contributor pushes: the loop ended at the incomplete review, so the push
+    // recovers its handoff (never a continuation of a loop that ended).
+    opts.failHandoff = false;
+    opts.liveSha = MOVED;
+    const pushed = await continueLoopOnPush("t", pushTo(MOVED, "2026-01-11T00:00:00Z"), settings(), f.deps, ENV);
+    assert.deepEqual(pushed, { posted: false, reason: "the loop ended at a review that is not a clean pass (incomplete); handoff posted" });
+    const handoff = escalations(f.posted);
+    assert.equal(handoff.length, 1);
+    assert.equal(reasonOf(handoff[0]), "loop-error");
+    assert.ok(handoff[0].includes(`head=${HEAD}`), "for the incomplete review's head");
+    assert.ok(handoff[0].includes(INCOMPLETE_RECOVERED_DETAIL), "with the fixed recovered detail");
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 0, "the ended loop is not continued");
+    assert.equal((await session(f, MOVED)).owedHandoff, undefined, "settled");
+    const again = await continueLoopOnPush("t", pushTo(MOVED, "2026-01-12T00:00:00Z"), settings(), f.deps, ENV);
+    assert.deepEqual(again, { posted: false, reason: "no active loop session" });
+    assert.equal(escalations(f.posted).length, 1, "posted once");
+  });
+
+  it("the next review step on the PR recovers the owed handoff instead of running a fix round past it", async () => {
+    const f = fakeDeps({ reviews: [postedReview()] });
+    const r = await run(f, "apply", {}, job()); // a later review of the same head with a finding
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    assert.equal(escalations(f.posted).length, 1);
+    assert.ok(escalations(f.posted)[0].includes(INCOMPLETE_RECOVERED_DETAIL));
+    assert.equal(f.prompts.length, 0, "no fix round past the incomplete review");
+  });
+
+  it("the head moved and its push was missed: a review step that finds it moved recovers the owed handoff instead of returning superseded", async () => {
+    const f = fakeDeps({ reviews: [postedReview()], liveSha: MOVED });
+    const r = await run(f, "suggest", {}, job()); // a later review of HEAD, with a finding
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    const handoff = escalations(f.posted);
+    assert.equal(handoff.length, 1);
+    assert.ok(handoff[0].includes(`head=${HEAD}`), "for the incomplete review's head");
+    assert.ok(handoff[0].includes(INCOMPLETE_RECOVERED_DETAIL));
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 0, "the ended loop is not continued");
+    assert.equal(f.prompts.length, 0, "no fix round");
+    assert.deepEqual(await run(f, "suggest", {}, job()), { ran: false, reason: "superseded (head moved)" }, "settled: a later step is quiet");
+    assert.equal(escalations(f.posted).length, 1, "posted once");
+  });
+
+  it("the head moves during a fix round while an incomplete review of it ends the session: the round's superseded exit posts the handoff", async () => {
+    const reviews: Array<{ body: string; commitId: string; submittedAt: string }> = [];
+    const f = fakeDeps({ start: "apply", rounds: [3], reviews, movedDuringFix: true });
+    const requestFix = f.deps.requestFix;
+    f.deps.requestFix = (...a: Parameters<typeof requestFix>) => {
+      if (!reviews.length) reviews.push(postedReview(`2026-02-01T00:00:${String(f.posted.length).padStart(2, "0")}.500Z`));
+      return requestFix(...a);
+    };
+    const r = await run(f, "apply");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    assert.equal(f.committed, false);
+    const handoff = escalations(f.posted);
+    assert.equal(handoff.length, 1);
+    assert.ok(handoff[0].includes(`head=${HEAD}`));
+    assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 0, "no continuation for the moved head past the ended loop");
+  });
+
+  it("a later clean review of the head settles it: nothing is owed and nothing is posted", async () => {
+    const clean = { body: "<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->", commitId: HEAD, submittedAt: "2026-01-11T00:00:00Z" };
+    const f = fakeDeps({ reviews: [postedReview(), clean], liveSha: MOVED });
+    assert.equal((await session(f, MOVED)).owedHandoff, undefined);
+    assert.deepEqual(await continueLoopOnPush("t", pushTo(MOVED, "2026-01-12T00:00:00Z"), settings(), f.deps, ENV), { posted: false, reason: "no active loop session" });
+    assert.equal(f.posted.length, 0);
+  });
+
+  // The sibling outcomes that are not a clean pass: their findings marker is the durable record.
+  const verifying = { reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", localVerifyStartedAt: 1, localVerified: false } as Partial<Job>;
+  const SIBLINGS: Array<[NotCleanOutcome, Partial<Job>]> = [
+    ["raw", { findings: [], reviewProviders: ["chatgpt"], rawReview: "P1 the guard is missing", rawCauses: { chatgpt: "unparseable" }, assumptions: [] }],
+    ["raw-unverified", { ...verifying, findings: [], rawReview: "P1 the guard is missing", rawCauses: { local: "unparseable" }, assumptions: [] }],
+    ["unverified-clean", { ...verifying, findings: [], assumptions: [] }],
+  ];
+  for (const [outcome, over] of SIBLINGS) {
+    const siblingJob = () => job(over);
+    const siblingReview = () => ({ body: reviewSummaryBody(siblingJob(), [], BOT), commitId: HEAD, submittedAt: "2026-01-10T00:00:00Z" });
+
+    it(`${outcome}: a lost handoff leaves the session ended owing it, and the next push posts it once, naming the outcome, instead of continuing`, async () => {
+      const opts: Parameters<typeof fakeDeps>[0] = { reviews: [siblingReview()], failHandoff: true };
+      const f = fakeDeps(opts);
+      const r = await run(f, "suggest", {}, siblingJob());
+      assert.ok(!r.ran && /^ESCALATE loop-error failed to post/.test(r.reason), JSON.stringify(r));
+      const lost = await session(f, HEAD);
+      assert.equal(lost.active, false, "never an active session waiting on the reviewed head");
+      assert.equal(lost.owedHandoff?.head, HEAD);
+      assert.equal(lost.owedHandoff?.outcome, outcome);
+      opts.failHandoff = false;
+      opts.liveSha = MOVED;
+      const pushed = await continueLoopOnPush("t", pushTo(MOVED, "2026-01-11T00:00:00Z"), settings(), f.deps, ENV);
+      assert.deepEqual(pushed, { posted: false, reason: `the loop ended at a review that is not a clean pass (${outcome}); handoff posted` });
+      const handoff = escalations(f.posted);
+      assert.equal(handoff.length, 1);
+      assert.equal(reasonOf(handoff[0]), "loop-error");
+      assert.ok(handoff[0].includes(`head=${HEAD}`), "for the reviewed head");
+      assert.ok(handoff[0].includes(recoveredHandoffDetail(outcome)), "with the fixed detail naming the outcome");
+      assert.equal(f.posted.filter((b) => b.includes("ashlar-loop-continue")).length, 0, "the ended loop is not continued");
+      assert.equal((await session(f, MOVED)).owedHandoff, undefined, "settled");
+    });
+
+    it(`${outcome}: the review's own step posts the handoff with its job's own detail when the history already lists it`, async () => {
+      const f = fakeDeps({ reviews: [siblingReview()] });
+      const r = await run(f, "suggest", {}, siblingJob());
+      assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+      assert.equal(escalations(f.posted).length, 1);
+      assert.match(escalations(f.posted)[0], /this review is not a clean pass \(/);
+      assert.equal((await session(f, HEAD)).owedHandoff, undefined, "settled by its handoff");
+    });
+  }
+
+  it("a new start opens a new session: the old handoff is no longer owed and the loop runs", async () => {
+    const round = { body: "<!-- ashlar-findings total=1 -->", commitId: HEAD, submittedAt: "2026-01-12T00:00:00Z" }; // this review, in the new session
+    const f = fakeDeps({ reviews: [postedReview(), round], issues: [recorded("apply", "bob", "2026-01-11T00:00:00Z")] });
+    assert.equal((await session(f, HEAD)).active, true);
+    const r = await run(f, "apply", {}, job());
+    assert.ok(r.ran && r.step === "fix", JSON.stringify(r));
+    assert.equal(escalations(f.posted).length, 0);
+  });
+});
+
+describe("a not-clean review of the head a fix round is running for: the handoff it owes is never dropped", () => {
+  type Review = { body: string; commitId: string; submittedAt: string };
+  const incompleteJob = () => job({ id: "job-2", findings: [], reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: [] });
+  /** A second review of HEAD (an @-mention, say) is posted as incomplete between the fake's last post and
+   * its next one, and harbor fires that review's own loop step without awaiting it. */
+  const landIncomplete = (f: ReturnType<typeof fakeDeps>, reviews: Review[], mode: "suggest" | "apply") => {
+    reviews.push({ body: reviewSummaryBody(incompleteJob(), [], BOT), commitId: HEAD, submittedAt: `2026-02-01T00:00:${String(f.posted.length).padStart(2, "0")}.500Z` });
+    return runPostReviewLoop("t", incompleteJob(), sample, settings(mode), f.deps, ENV);
+  };
+  const quiet = (r: LoopStepResult) => !r.ran && SILENT_REASONS.includes(r.reason);
+
+  for (const mode of ["suggest", "apply"] as const) {
+    it(`${mode}: it lands while the fix request runs, and the round ends by posting its handoff for the head, never as an operator stop`, async () => {
+      const reviews: Review[] = [];
+      const f = fakeDeps({ start: mode, rounds: [3], reviews });
+      let own: Promise<LoopStepResult> | undefined;
+      const requestFix = f.deps.requestFix;
+      f.deps.requestFix = (...a: Parameters<typeof requestFix>) => {
+        own ??= landIncomplete(f, reviews, mode);
+        return requestFix(...a);
+      };
+      const r = await run(f, mode);
+      assert.notEqual(!r.ran && r.reason, "loop stopped by operator", "never misreported as an operator stop");
+      assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+      const handoffs = escalations(f.posted);
+      assert.equal(handoffs.length, 1, "exactly one handoff");
+      assert.ok(handoffs[0].includes(`head=${HEAD}`), "for the head both reviews are of");
+      assert.ok(handoffs[0].includes(INCOMPLETE_RECOVERED_DETAIL));
+      assert.equal(f.committed, false, "nothing is committed past it");
+      assert.ok(!f.posted.some((b) => b.startsWith("### Ashlar fix agent")), "a moot round posts no report");
+      const ownStep = await own!;
+      assert.ok(quiet(ownStep), `the review's own step, run after the round, finds it settled: ${JSON.stringify(ownStep)}`);
+      assert.equal(escalations(f.posted).length, 1, "posted once");
+    });
+  }
+
+  it("suggest: it lands after the round's last check, while the suggestion posts: its own step waits for the round, then posts its own handoff", async () => {
+    const reviews: Review[] = [];
+    const f = fakeDeps({ rounds: [3], reviews });
+    let own: Promise<LoopStepResult> | undefined;
+    const create = f.deps.gh.createIssueComment;
+    f.deps.gh.createIssueComment = (t, o) => {
+      if (o.body.startsWith("### Ashlar fix agent — suggestion")) own ??= landIncomplete(f, reviews, "suggest");
+      return create(t, o);
+    };
+    const r = await run(f, "suggest");
+    assert.ok(r.ran && r.step === "fix" && r.outcome === "suggested", JSON.stringify(r));
+    const ownStep = await own!;
+    assert.ok(ownStep.ran && ownStep.step === "escalated" && ownStep.reason === "loop-error", `never backed off as a step in flight: ${JSON.stringify(ownStep)}`);
+    const handoffs = escalations(f.posted);
+    assert.equal(handoffs.length, 1);
+    assert.ok(handoffs[0].includes(`head=${HEAD}`));
+    assert.match(handoffs[0], /this review is not a clean pass \(a reviewer did not run\)/, "with its own job's detail");
+  });
+
+  it("a review with findings still shares one fix round per head (the second waits; only one provider call)", async () => {
+    // Main's step gate WAITS instead of the old STEP_IN_FLIGHT backoff: one round runs, the
+    // waiter either inherits its result (superseded / already-run) or is replaced — never two prompts.
+    const f = fakeDeps({ start: "apply", rounds: [3], requestDelayMs: 20 });
+    const [a, b] = await settles(Promise.all([run(f, "apply"), run(f, "apply")]));
+    assert.equal(f.prompts.length, 1, "one fix round per head");
+    assert.equal([a, b].filter((x) => x.ran).length, 1, "exactly one step runs the round");
+    const quiet = [a, b].filter((x) => !x.ran);
+    assert.equal(quiet.length, 1);
+    assert.ok(SILENT_REASONS.includes(quiet[0].reason), `quiet exit: ${JSON.stringify(quiet[0])}`);
+  });
+
+  it("apply: it lands after the commit, before the continuation: its handoff is posted first, the report says the loop ended at it, and nothing continues", async () => {
+    const reviews: Review[] = [];
+    const f = fakeDeps({ start: "apply", rounds: [3], reviews });
+    let own: Promise<LoopStepResult> | undefined;
+    const gitDataApi = f.deps.gh.gitDataApi;
+    f.deps.gh.gitDataApi = (...a: Parameters<typeof gitDataApi>) => {
+      const git = gitDataApi(...a);
+      return {
+        ...git,
+        async updateBranchRef(...b: Parameters<typeof git.updateBranchRef>) {
+          await git.updateBranchRef(...b);
+          own ??= landIncomplete(f, reviews, "apply");
+        },
+      };
+    };
+    const r = await run(f, "apply");
+    assert.equal(f.committed, true);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error", JSON.stringify(r));
+    const handoffs = escalations(f.posted);
+    assert.equal(handoffs.length, 1);
+    assert.ok(handoffs[0].includes(`head=${HEAD}`), "for the not-clean review's head");
+    assert.ok(handoffs[0].includes(INCOMPLETE_RECOVERED_DETAIL));
+    assert.ok(!f.posted.some((b) => b.includes("ashlar-loop-continue")), "no continuation past it");
+    const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
+    assert.match(report, /The loop ended meanwhile \(the loop session ended at a review that is not a clean pass\): no further review is requested\./);
+    assert.doesNotMatch(report, /stopped/, "never reported as an operator stop");
+    assert.ok(f.posted.indexOf(handoffs[0]) < f.posted.indexOf(report), "the signal goes out before the report");
+    assert.ok(quiet(await own!), "its own step finds it settled");
   });
 });
 

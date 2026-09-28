@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import { chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
 import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
@@ -130,19 +130,51 @@ describe("verify-clean local role", () => {
     assert.deepEqual(racingProviders({ ...fallback, role: "race" }), ["chatgpt", "grok", "local"], "race is unchanged");
   });
 
-  it("a fallback release waives chat only while local can still deliver; once local ends with nothing, chat is awaited again", () => {
+  it("a fallback release waives chat only while local can still deliver a usable verdict; once local ends with nothing usable, chat is awaited again", () => {
     const at = { localFallbackAt: 1, assumptions: [] as string[] };
     assert.equal(fallbackWaivesChat({ ...at }), true, "local running");
-    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: "{}" }] }), true, "local delivered");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: "{}" }] }), true, "local delivered usable JSON");
     assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Skipped local (HTTP 500)"] }), false, "local failed");
     assert.equal(fallbackWaivesChat({ ...at, providerErrors: { local: { code: "error", message: "HTTP 500" } } }), false, "local errored");
     assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Generated fixtures were skipped"] }), true, "reviewer text is not a skipped local");
     assert.equal(fallbackWaivesChat({ assumptions: [] }), false, "no fallback release");
+    // Incomplete / raw-only local evidence is not a usable verdict: chat is offered again.
+    const incompleteRaw = { provider: "local" as const, raw: '{"findings":[]}', unparsedText: "P1 a.ts:1 FIRST-REPLY" };
+    assert.equal(usableLocalFallbackLeg(incompleteRaw), false, "unparsedText marks incomplete");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [incompleteRaw] }), false, "incomplete local: offer chat");
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[]}', residualReplies: "P1 prose" }] }),
+      false,
+      "residualReplies marks incomplete",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[],"merge_recommendation":"COMMENT","raw_review":"prose evidence"}' }] }),
+      false,
+      "salvaged raw_review is evidence, not a verdict",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: "{}" }], incompleteProviders: ["local"] }),
+      false,
+      "incompleteProviders clears waiver",
+    );
     // A spent fallback makes the chat reviewers required again.
     const fallback = { role: "verify-clean" as const, providers: ["chatgpt", "local"] as ReviewProvider[], localReleased: true };
     const spent = { ...at, assumptions: ["Skipped local (HTTP 500)"] };
     assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spent) }), payloads: [], assumptions: spent.assumptions, localInFlight: false }), true, "waits on chat");
     assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spent) }), payloads: ["chatgpt"], assumptions: spent.assumptions, localInFlight: false }), false, "chat delivered: posts");
+    const spentIncomplete = { ...at, storedLegs: [incompleteRaw] };
+    assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spentIncomplete) }), payloads: [], assumptions: [], localInFlight: false }), true, "incomplete local: waits on chat");
+  });
+
+  it("pins the held-local release prompt so a later chatPrompt mutation cannot retarget local", () => {
+    const before = { chatPrompt: "VERIFY-PROMPT-AT-RELEASE", chatPromptByProvider: { chatgpt: "VERIFY-PROMPT-AT-RELEASE" } };
+    const pinned = releaseLocalPrompt(before);
+    assert.equal(pinned, "VERIFY-PROMPT-AT-RELEASE");
+    // Race window: chatPrompt/settings mutate after the release transaction stamped localReleasePrompt.
+    const afterMutate = { ...before, chatPrompt: "MUTATED-AFTER-RELEASE", localReleasePrompt: pinned };
+    assert.equal(localExecutionPrompt(afterMutate), "VERIFY-PROMPT-AT-RELEASE", "pinned prompt wins");
+    assert.equal(localExecutionPrompt({ chatPrompt: "LIVE-ONLY" }), "LIVE-ONLY", "unreleased jobs use live prompt");
+    assert.equal(localExecutionPrompt({ chatPromptByProvider: { grok: "GROK-PROMPT" } }), "GROK-PROMPT");
   });
 
   it("releases local as today's fallback only when chat finished without a usable result", () => {

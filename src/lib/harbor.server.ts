@@ -33,7 +33,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
+import { chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
@@ -317,7 +317,7 @@ export function publicJobs(jobs: Job[]) {
   return jobs.map((j) => {
     // rawReview is verbatim model output that can echo private PR source — treat it like storedLegs
     // and never expose it on the unauthenticated /api/harbor; surface only a bounded boolean.
-    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, rawReview: _raw, ...rest } = j;
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, localReleasePrompt: _lrp, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, rawReview: _raw, ...rest } = j;
     return {
       ...rest,
       hasRawReview: Boolean(j.rawReview),
@@ -598,7 +598,7 @@ async function watchReviewersLoop(jobId: string, token: string) {
     const chat = (job.reviewProviders ?? []).filter(isChatProvider);
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
     const localSkip = (job.assumptions ?? []).find((a) => a.startsWith("Skipped local"));
-    const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "";
+    const prompt = localExecutionPrompt(job);
     const role = job.localReviewRole;
     const localReleased = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
     if (
@@ -857,6 +857,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     localReviewRole,
     localVerifyStartedAt: undefined,
     localFallbackAt: undefined,
+    localReleasePrompt: undefined,
     localVerifyNote: undefined,
     localVerified: undefined,
     skippedProviders: undefined,
@@ -883,10 +884,12 @@ async function playGithub(jobId: string, untrustedBody: string) {
 
 /** One in-flight generate per job. playGithub + watch both call this. */
 async function kickLocalRace(jobId: string, prompt: string) {
-  if (!prompt.trim()) return;
   if (localInFlight.has(jobId)) return;
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || job.status !== "awaiting_chat") return;
+  // Once held-local released, the prompt pinned in that transaction wins over any later mutation.
+  const runPrompt = localExecutionPrompt({ ...job, chatPrompt: prompt || job.chatPrompt });
+  if (!runPrompt.trim()) return;
   if ((job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim())) return;
   if ((job.assumptions ?? []).some((a) => /^Skipped local/i.test(a))) return;
   localInFlight.add(jobId);
@@ -903,7 +906,7 @@ async function kickLocalRace(jobId: string, prompt: string) {
     providerProgress: {...j.providerProgress, local: localLegProgress(leg, `local:${jobId}`, startedAt)},
     updatedAt: startedAt}));
   try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
-  void attachLocalLeg(jobId, prompt, { submit: true });
+  void attachLocalLeg(jobId, runPrompt, { submit: true });
 }
 
 /** Feed one activity observation into the leg's tracker and flush it (throttled) to the job. The
@@ -1365,16 +1368,20 @@ type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kin
  * with the chat legs kept, starts local and makes sure a watcher waits for it. */
 function releaseHeldLocal(jobId: string, token: string, release: HeldLocalRelease, plan: string, legs: ChatLeg[] = []): boolean {
   let released = false;
+  let pinnedPrompt = "";
   const job = transitionJob(jobId, (j) => {
     if ((j.status !== "validator" && j.status !== "awaiting_chat") || j.localVerifyStartedAt || j.localFallbackAt) return j;
     released = true;
+    // Pin prompt + triggering chat legs in the same transaction that stamps the release, so a
+    // concurrent mutation of chatPrompt/storedLegs cannot retarget the local verification run.
+    pinnedPrompt = releaseLocalPrompt(j);
     const stamp = release.kind === "verify"
-      ? { localVerifyStartedAt: Date.now(), localVerifyChat: release.verifyChat }
-      : { localFallbackAt: Date.now() };
+      ? { localVerifyStartedAt: Date.now(), localVerifyChat: release.verifyChat, localReleasePrompt: pinnedPrompt }
+      : { localFallbackAt: Date.now(), localReleasePrompt: pinnedPrompt };
     return { ...j, ...stamp, status: "awaiting_chat", storedLegs: upsertLegs(j.storedLegs, legs), plan, updatedAt: Date.now() };
   });
   if (!released || !job) return false;
-  void kickLocalRace(jobId, job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "");
+  void kickLocalRace(jobId, pinnedPrompt);
   void watchReviewers(jobId, token);
   return true;
 }

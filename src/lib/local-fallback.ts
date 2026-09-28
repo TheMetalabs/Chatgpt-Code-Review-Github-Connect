@@ -53,18 +53,64 @@ export function localVerifies(input: { role?: LocalReviewRole; providers: readon
   return input.role === "verify-clean" && input.providers.includes("local") && input.providers.some(isChatProvider);
 }
 
-/** Whether a job released as the chat-down fallback (Job.localFallbackAt) waives chat: true while
- * that local leg can still produce a payload (running, or finished with one). The release itself is
- * permanent, whatever the bridge does later (a reconnect included), but the waiver lasts only as long
- * as local can still deliver the review: once local ends with no payload (a failure, "Skipped local"),
- * chat is the only reviewer left, so it is awaited and offered to the bridge again. */
+/** A stored local leg is a usable complete verdict for fallback delivery only when its raw is review
+ * JSON with no incompleteness markers (unparsedText / residualReplies) and is not salvaged verbatim
+ * (`raw_review`). Raw presence alone is not enough: incomplete / raw-only evidence cannot keep chat
+ * waived. */
+export function usableLocalFallbackLeg(
+  leg: { provider: ReviewProvider; raw: string; unparsedText?: string; residualReplies?: string },
+): boolean {
+  if (leg.provider !== "local" || !leg.raw.trim()) return false;
+  if (leg.unparsedText?.trim() || leg.residualReplies?.trim()) return false;
+  try {
+    const parsed = JSON.parse(leg.raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const rawReview = (parsed as Record<string, unknown>).raw_review;
+    if (typeof rawReview === "string" && rawReview.trim()) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a job released as the chat-down fallback (Job.localFallbackAt) keeps chat waived: true
+ * while that local leg can still deliver a usable complete verdict (still running, or finished with
+ * one). The release itself is permanent, whatever the bridge does later (a reconnect included), but
+ * chat stays waived only while local can still deliver that verdict: once local ends with no usable
+ * verdict (failure, "Skipped local", incomplete / raw-only evidence), chat is the only reviewer left
+ * and is awaited / offered to the bridge again. */
 export function fallbackWaivesChat(
-  job: Pick<Job, "localFallbackAt" | "storedLegs" | "assumptions" | "providerErrors">,
+  job: Pick<Job, "localFallbackAt" | "storedLegs" | "assumptions" | "providerErrors" | "incompleteProviders" | "rawCauses">,
 ): boolean {
   if (!job.localFallbackAt) return false;
-  if ((job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim())) return true;
+  const local = (job.storedLegs ?? []).find((l) => l.provider === "local" && l.raw.trim());
+  if (local) {
+    if (job.incompleteProviders?.includes("local") || job.rawCauses?.local) return false;
+    return usableLocalFallbackLeg(local);
+  }
   const error = job.providerErrors?.local;
   return !skippedProvider(job.assumptions, "local") && !(error && error.code !== "disconnected");
+}
+
+/** Chat prompt captured at held-local release (verify or fallback). Later mutations of chatPrompt must
+ * not retarget the local verification / fallback run. */
+export function releaseLocalPrompt(
+  job: Pick<Job, "chatPrompt" | "chatPromptByProvider">,
+): string {
+  return (
+    job.chatPrompt?.trim() ||
+    job.chatPromptByProvider?.chatgpt?.trim() ||
+    job.chatPromptByProvider?.grok?.trim() ||
+    ""
+  );
+}
+
+/** Prompt the local leg must execute with after a held-local release: the prompt pinned at release
+ * wins over any later live chatPrompt mutation. */
+export function localExecutionPrompt(
+  job: Pick<Job, "localReleasePrompt" | "chatPrompt" | "chatPromptByProvider">,
+): string {
+  return job.localReleasePrompt?.trim() || releaseLocalPrompt(job);
 }
 
 /** The providers the job waits on right now: a held-back local leg counts only once it is released.

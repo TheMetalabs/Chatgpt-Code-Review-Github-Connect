@@ -153,6 +153,9 @@ export interface Job {
   localVerifyChat?: ReviewProvider[];
   /** verify-clean: set when the chat reviewers produced no usable result, so local ran as the fallback. */
   localFallbackAt?: number;
+  /** verify-clean: chat prompt pinned at held-local release (verify or fallback). Local execution
+   * must use this even if chatPrompt is mutated afterward; cleared when a new snapshot starts. */
+  localReleasePrompt?: string;
   /** verify-clean: summary line naming which reviewer produced the posted result (outcomeNote). */
   localVerifyNote?: string;
   /** verify-clean: local returned a STRUCTURED result in its verification round. Stamped at that

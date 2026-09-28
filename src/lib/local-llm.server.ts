@@ -121,8 +121,8 @@ export async function runLocalLlm(
       },
     ]);
     const corrected = extractChatJson(raw2);
-    return corrected ? {ok: true, raw: corrected, originalText: raw2}
-      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2};
+    return corrected ? {ok: true, raw: corrected, originalText: raw2, unparsedText: raw}
+      : {ok: false, error: "local LLM completed without valid review JSON after one correction", originalText: raw2, unparsedText: raw};
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg.slice(0, 240) };

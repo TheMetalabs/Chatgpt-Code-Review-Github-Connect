@@ -6,7 +6,7 @@ import {bridgeHarness,job,loadTs,parser} from './load-source.mjs';
 
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};}
 
-test('bridge control/result RPC has no application abort deadline, including delayed body receipt',async t=>{
+test('bridge result delivery RPC (complete) has no application abort deadline, including delayed body receipt',async t=>{
  const b=background(),headers=deferred(),body=deferred();let init,settled=false;
  b.context.fetch=async(_url,options)=>{init=options;await headers.promise;return {ok:true,status:200,json:()=>body.promise};};
  t.mock.timers.enable({apis:['Date','setTimeout']});

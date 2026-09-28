@@ -67,11 +67,15 @@ test('active=false in validator is not permission to close an unacknowledged gen
   const b=scenario([work()],{api:async()=>({ok:true,active:false,status:'validator',accepted:false}),handler:()=>({ok:false,code:'busy',jobId:'A',provider:'chatgpt',runId:'A-chatgpt'})});
   await b.tick();assert.ok(b.local.state.pendingReviewJobs.A);assert.equal(b.closedTabs.length,0);assert.equal(b.messages.some(m=>m.type==='ashlar-run'),false);
 });
-test('explicit cancellation retires only owned terminal tabs, never an unfinished answer',async()=>{
-  const b=scenario([work()],{api:async()=>({ok:true,active:false,status:'cancelled',accepted:false})});
+test('explicit cancellation closes a tab its page proves Ashlar\'s, even unfinished; an unproven page is asked again, never closed on a guess',async()=>{
+  const cancelled=async()=>({ok:true,active:false,status:'cancelled',accepted:false});
+  const url='https://chatgpt.com/c/A',page={jobId:'A',runId:'A-chatgpt',provider:'chatgpt'};
+  const b=scenario([work()],{api:cancelled,handler:(_id,msg)=>msg.type==='ashlar-fix-cancel'
+    ?{...page,ok:true,ownership:'owned',conversation:url,running:true,url}:{...page,ok:false,code:'busy'}});
   await b.tick();assert.deepEqual(b.closedTabs,[10]);assert.equal(b.calls.some(c=>c.action==='complete'),false);
-  const r=scenario([work()],{api:async()=>({ok:true,active:false,status:'cancelled',accepted:false}),handler:()=>({ok:true,jobId:'A',runId:'A-chatgpt',provider:'chatgpt',canClose:false,reason:'pending'})});
-  await r.tick();assert.equal(r.closedTabs.length,0);assert.ok(r.local.state.pendingReviewJobs.A);
+  assert.deepEqual(b.local.state.pendingReviewJobs,{});
+  const r=scenario([work()],{api:cancelled,handler:()=>({...page,ok:true,ownership:'unknown',running:true,url})});
+  await r.tick();assert.equal(r.closedTabs.length,0);assert.ok(r.local.state.pendingReviewJobs.A,'asked again next tick');
 });
 test('navigate-away and reused numeric tab IDs are never auto-closed',async()=>{
   for(const mode of ['url','identity','repurposed']){
@@ -80,6 +84,18 @@ test('navigate-away and reused numeric tab IDs are never auto-closed',async()=>{
     if(mode==='url')b.tabs.get(10).url='https://example.com/personal';
     await b.tick();assert.equal(b.closedTabs.length,0,mode);
   }
+});
+test('a review leg that stalled under a stuck Stop keeps its tab and retires (#87)',async()=>{
+  const j=work();Object.assign(j.states.chatgpt,{delivered:true,cleanupPending:true,outcome:{ok:false,code:'stalled',error:'ChatGPT answer unchanged for 15 min without completion controls'}});
+  let released=false;
+  const b=scenario([j],{handler:(id,msg)=>{
+    if(msg.type==='ashlar-can-close'){released=true;return {ok:true,jobId:'A',runId:'A-chatgpt',provider:'chatgpt',canClose:false,reason:'stalled',url:'https://chatgpt.com/c/A'};}
+    return {ok:true,ownershipProtocol:1,jobId:'A',runId:'A-chatgpt',provider:'chatgpt',released,url:'https://chatgpt.com/c/A'};
+  }});
+  await b.tick();
+  assert.equal(b.closedTabs.length,0,'never closed while Stop is visible');assert.ok(b.tabs.has(10));
+  assert.equal(b.local.state.pendingReviewJobs.A,undefined,'the leg retires instead of waiting forever for a close');
+  assert.equal((await b.context.tabCapacityReport({})).managedTabs,0,'the kept tab holds no tab capacity');
 });
 test('manual close tracking ignores unrelated tabs and completed auto-cleanup leaves no markers',async()=>{
   const b=scenario();for(let i=1000;i<1100;i++)await b.closeTab(i);
@@ -108,16 +124,21 @@ test('automatic output extraction never reads a shared system clipboard',async()
   c.context.sleep=async()=>{if(++polls===20)throw stop;};
   await assert.rejects(c.context.waitUntilReviewOrQuota('ChatGPT'),e=>e===stop);assert.equal(reads,0);
 });
-test('runner close permission rejects a fresh user turn, busy generation, and wrong run',async()=>{
-  const c=content();let text='review A';
-  c.context.location={href:'https://chatgpt.com/c/A'};
+test('runner close permission rejects a fresh user turn and a wrong run; a busy page is not user activity',async()=>{
+  // The run starts on the new chat its tab opened (X2, #85); its send moves the page to /c/A.
+  const c=content();const users=[];
   c.context.composer=()=>null;
-  c.context.document={querySelectorAll:()=>[{textContent:text,getAttribute:()=>null}]};
-  c.context.runPrompt=async()=>raw;c.context.stopButtonVisible=()=>false;
+  c.context.document={querySelectorAll:()=>users,querySelector:()=>users[0]||null};
+  c.context.runPrompt=async()=>{users.push({textContent:'review A',getAttribute:()=>null});c.context.location={href:'https://chatgpt.com/c/A'};return raw;};
+  c.context.stopButtonVisible=()=>false;
   c.message({type:'ashlar-run',jobId:'A',runId:'run-A',provider:'chatgpt',prompt:'review'});await flush();
   const msg={type:'ashlar-can-close',jobId:'A',runId:'run-A',provider:'chatgpt'};
   assert.equal(c.message(msg)?.canClose,true);
-  text='personal follow-up';assert.equal(c.message(msg)?.canClose,false);
+  // The provider redrawing its own answer (or a Stop control) after the result is secured does not keep the tab.
+  c.context.stopButtonVisible=()=>true;assert.equal(c.message(msg)?.canClose,true);
+  users.push({textContent:'personal follow-up',getAttribute:()=>null});
+  const followup=c.message(msg);
+  assert.equal(followup?.canClose,false);assert.equal(followup?.reason,'repurposed');assert.equal(followup?.cause,'user_turn');
   assert.equal(c.message({...msg,runId:'run-B'})?.code,'job_mismatch');
 });
 

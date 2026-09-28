@@ -13,12 +13,12 @@ function quotaHit() {
     '[role="alert"], [role="status"], [role="dialog"], [data-testid*="quota" i], [class*="toast" i], [class*="banner" i], [class*="notice" i]',
   );
   for (const el of notices) {
-    if (!elVisible(el) || el.closest('[data-message-author-role="user"], .markdown, pre, code')) continue;
+    if (!elVisible(el) || el.closest(`${turnAreaSelector("user")}, .markdown, pre, code`)) continue;
     const text = (el.textContent || "").trim();
     if (text.length <= 400 && quotaHitText(text)) return true;
   }
   for (const el of document.querySelectorAll("span, button, [class*='card']")) {
-    if (!elVisible(el) || el.closest('[data-message-author-role], [data-testid^="conversation-turn-"], pre, code')) continue;
+    if (!elVisible(el) || el.closest(`${turnAreaSelector()}, [data-testid^="conversation-turn-"], pre, code`)) continue;
     const text = (el.textContent || "").trim();
     if (text.length <= 240 && quotaHitText(text)) return true;
   }
@@ -58,24 +58,36 @@ function currentAssistantRoot() {
   const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
   if (turns.length) {
     const last = turns[turns.length - 1];
-    return last.querySelector('[data-message-author-role="assistant"]') ? last : null;
+    return last.querySelector(turnSelector("assistant")) ? last : null;
   }
-  const messages = [...document.querySelectorAll('[data-message-author-role]')];
+  const messages = [...document.querySelectorAll(turnNodeSelector())];
   const last = messages[messages.length - 1];
-  if (last?.getAttribute("data-message-author-role") !== "assistant") return null;
-  return last.closest("article, section") || last;
+  if (turnRole(last) !== "assistant") return null;
+  // The unit DOM renders the answer's action row beside the unit, in its turn container.
+  return (unitTurn(last) && last.closest("[data-content-search-turn-key]")) || last.closest("article, section") || last;
 }
 
 /** Current assistant-turn copy/feedback only, never hidden or previous-turn controls. */
 function replyDoneVisible(root = currentAssistantRoot()) {
   if (!root) return false;
   if (elVisible(root.querySelector('[aria-label="응답 작업"], [aria-label="Response actions"]'))) return true;
+  if (unitActionsVisible(root)) return true;
   for (const el of root.querySelectorAll('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]')) {
     const aria = el.getAttribute("aria-label") || "";
     if (/메시지 복사|copy message|내 메시지/i.test(aria)) continue;
     if (elVisible(el) && /응답|copy response|feedback|평가/i.test(aria)) return true;
   }
   return false;
+}
+
+/** The unit DOM's answer actions (no test ids): a rate or regenerate control of the answer, outside
+ * every unit (a code block's own copy button and the user's message controls are inside one). Only
+ * for a root that holds an assistant unit. */
+function unitActionsVisible(root) {
+  const unit = "[data-content-search-unit-key]";
+  if (!(root.matches(`${unit}[data-content-search-unit-key$=":assistant"]`) || root.querySelector(`${unit}[data-content-search-unit-key$=":assistant"]`))) return false;
+  return [...root.querySelectorAll("button[aria-label], [role='button'][aria-label]")]
+    .some(el => !el.closest(unit) && /응답 평가|응답 다시 생성|rate (this )?response|regenerate/i.test(el.getAttribute("aria-label") || "") && elVisible(el));
 }
 
 function responseStreaming(root = currentAssistantRoot()) {

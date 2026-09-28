@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {background,storage,flush} from './helpers.mjs';
+import {background,storage,flush,until} from './helpers.mjs';
 
 const response=id=>JSON.stringify({findings:[],keep:[id],merge_recommendation:'APPROVE'});
 const request=(id,providers=['chatgpt'])=>({jobId:id,providers,provider:providers[0],prompt:'review '+id,leaseId:'lease-'+id});
@@ -37,15 +37,19 @@ test('parallel: running A does not prevent B admission with free slots',async()=
   assert.equal(b.closedTabs.length,0);
 });
 
-test('parallel: blocked A transport cannot delay B completion or the next C admission',async()=>{
+// Tab operations run one at a time (the tab queue, #85): a page that never answers costs the others
+// at most its reply window (here expiring at once), then it is backed off. It never holds them.
+const expiresAtOnce=()=>({promise:new Promise((_resolve,reject)=>setImmediate(()=>reject(new Error('the page did not answer in time')))),cancel(){}});
+test('parallel: blocked A transport delays B completion and the next C admission by its reply window at most, never holds them',async()=>{
   const b=fixture([pending('A',10)],[request('B'),request('C')]);
-  const send=b.chrome.tabs.sendMessage,held=[];b.chrome.tabs.sendMessage=(id,msg,cb)=>msg.jobId==='A'?held.push(()=>send(id,msg,cb)):send(id,msg,cb);
+  b.context.pageReplyDeadline=expiresAtOnce;
+  const send=b.chrome.tabs.sendMessage,held=[];b.chrome.tabs.sendMessage=(id,msg,cb)=>msg.jobId==='A'||id===10?held.push(()=>send(id,msg,cb)):send(id,msg,cb);
   const first=b.tick();let second;
   try {
-    await reached(()=>b.messages.some(m=>m.jobId==='B'&&m.type==='ashlar-run'),'A transport held up B admission');
+    assert.ok(await until(()=>b.messages.some(m=>m.jobId==='B'&&m.type==='ashlar-run')),'A transport held up B admission');
     b.done.add('B');second=b.tick();
-    await reached(()=>b.calls.some(c=>c.action==='complete'&&c.jobId==='B'),'B completion waited for A');
-    await reached(()=>b.messages.some(m=>m.jobId==='C'&&m.type==='ashlar-run'),'C admission waited for A');
+    assert.ok(await until(()=>b.calls.some(c=>c.action==='complete'&&c.jobId==='B')),'B completion waited for A');
+    assert.ok(await until(()=>b.messages.some(m=>m.jobId==='C'&&m.type==='ashlar-run')),'C admission waited for A');
     assert.ok(b.tabs.has(10));assert.equal(b.calls.some(c=>c.action==='failure'),false);
   } finally {b.chrome.tabs.sendMessage=send;for(const release of held)release();await Promise.all([first,second]);}
 });
@@ -150,8 +154,9 @@ test('parallel: server ignoring exclusions cannot replace an existing job identi
 test('parallel: independent heartbeat renews the actual jobs during slow DOM work',async()=>{
   const b=fixture([pending('A',10),pending('B',20)]);const send=b.chrome.tabs.sendMessage,held=[];
   b.chrome.tabs.sendMessage=(id,msg,cb)=>held.push(Object.assign(()=>send(id,msg,cb),{message:msg}));
+  // (One page message at a time is in flight: the tab queue. The heartbeat is a bridge lane, outside it.)
   const running=b.tick();try {
-    await reached(()=>held.filter(r=>r.message.type!=='ashlar-tab-status').length===2,'both jobs must be independently observed');
+    await reached(()=>held.length>=1,'the DOM work is under way');
     assert.equal(typeof b.context.heartbeatTick,'function');const before=b.calls.length;
     await b.context.heartbeatTick();
     const pings=b.calls.slice(before).filter(c=>c.action==='ping'&&c.jobId);
@@ -175,9 +180,10 @@ test('parallel: new wakeups do not accumulate waiters behind an already running 
   b.chrome.tabs.sendMessage=(id,msg,cb)=>held.push(Object.assign(()=>send(id,msg,cb),{message:msg}));
   const first=b.tick();let later;
   try {
-    await reached(()=>held.filter(r=>r.message.type!=='ashlar-tab-status').length===1,'A did not start');let done=false;
+    // (The first held message may be the inventory's probe: one tab operation at a time.)
+    await reached(()=>held.length>=1,'A did not start');let done=false;
     later=b.tick().then(()=>{done=true;});await reached(()=>done,'later wakeup joined a blocked old lane');
-    assert.equal(held.filter(r=>r.message.type!=='ashlar-tab-status').length,1);
+    assert.ok(held.filter(r=>r.message.type!=='ashlar-tab-status').length<=1,'no second waiter on A\'s lane');
     assert.ok(held.filter(r=>r.message.type==='ashlar-tab-status').length<=1,'inventory probes also stay single-flight');
   } finally {b.chrome.tabs.sendMessage=send;for(const release of held)release();await Promise.all([first,later]);}
 });
@@ -204,7 +210,7 @@ test('parallel: restored provider tab with changed numeric ID still reserves cap
 });
 
 test('parallel: one failed cleanup never releases the job lock while its sibling is running',async()=>{
-  const a=pending('A',10,['chatgpt','grok']);for(const s of Object.values(a.states))s.delivered=true;
+  const a=pending('A',10,['chatgpt','grok']);for(const s of Object.values(a.states)){s.delivered=true;s.outcome={ok:true,raw:response('A')};}
   const b=fixture([a]);b.done.add('A');const set=b.local.set;let fail=true;
   b.local.set=async values=>{if(fail&&values.pendingReviewJobs?.A?.states.chatgpt.cleanupPending){fail=false;throw Error('write failed');}return set(values);};
   const remove=b.chrome.tabs.remove,hold=gate();let removing=false;

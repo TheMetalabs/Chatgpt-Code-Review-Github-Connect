@@ -66,10 +66,18 @@ GitHub가 영속하는 이벤트(App의 기록·마커, 사람의 stop 코멘트
 - **작성자 강제:** start 기록·마커·CONVERGED는 봇(App 로그인)만, 사람은 **편집되지 않은** 코멘트의 stop만(작성 시각).
   편집된 코멘트의 stop과 PR 본문 stop은 웹훅이 **편집 시각**에 처리하고, STOPPED 확인 코멘트가 그 정지를 **기록**한다
   (첫 줄은 고정 STOPPED 마커 그대로, 둘째 줄 `<!-- ashlar-loop-stop at= by= -->` — `at`은 정지 자체의 시각이지 확인
-  코멘트의 시각이 아님). 기록 게시는 재스캔 후 재시도하고, 기록이 영속화되기 전(재시도 중·실패)에는 이 프로세스의 모든
-  세션 조회가 그 정지를 반영한다 — 정지 뒤에 커밋되는 라운드는 없다. 같은 정지를 다시 받아도 기록은 한 번. 기록(= STOPPED 확인)은 그 정지가 세션을
-  **끝냈을 때**, 또는 그 PR의 loop-start 리뷰가 진행 중이라 start 기록이 나중에 더 이른 시각으로 도착할 수 있을 때만 —
-  아무것도 멈추지 않은 정지는 아무것도 게시하지 않는다. 같은 초의 사람 stop은 start 뒤로 정렬된다(정지가 이긴다).
+  코멘트의 시각이 아님). 그 정지가 끝낸 세션 **뒤에** 더 새 세션이 이미 진행 중일 때 게시하는 기록(예: 거절됐던 기록을
+  새 start 뒤에 재전송, 또는 거절 뒤 백오프 중에 새 start가 들어온 재시도)은 STOPPED 마커 없이 기록 줄
+  `<!-- ashlar-loop-stop at= by= -->` 로 시작한다 — 세션 fold는 같은 정지로 읽지만, 진행 중인 새 세션을 두고 «루프 정지»
+  종착 신호를 내지 않는다(§3). 형식은 **POST 시도마다** 그 직전의 새 조회로 고른다(아래 «제어 쓰기» 참고).
+  기록 게시는 재스캔 후 재시도하고, 기록이 영속화되기 전(재시도 중·실패)에는 이 프로세스의 모든
+  세션 조회가 그 정지를 반영한다 — 정지 뒤에 커밋되는 라운드는 없다. 같은 정지를 다시 받아도 기록은 한 번. 기록은 그 정지가
+  **세션 fold를 바꿀 때** 남는다 — 세션을 **끝냈을 때**, 또는 어느 세션이 진행 중인지를 정할 때(새 start 앞의 세션을
+  끝냈다: 기록이 없으면 그 start가 끝난 세션을 재발행하고 정지 전 라운드까지 센다 / stale clean 리뷰로 끝난 세션을 정지
+  뒤의 연속 마커가 재개하지 못하게 한다). 이 비교는 이 프로세스가 읽는 이력과, 재시작이 읽을 **영속 이력**(이 프로세스의
+  아직 영속되지 않았을 수 있는 쓰기 — 기록 전인 다른 정지, 결과 불명의 핸드오프 — 를 뺀 것) 양쪽에서 한다. 그 PR의
+  loop-start 리뷰가 진행 중이라 start 기록이 나중에 더 이른 시각으로 도착할 수 있을 때도 남긴다. fold를 바꾸지 않는
+  정지는 아무것도 게시하지 않는다. 같은 초의 사람 stop은 start 뒤로 정렬된다(정지가 이긴다).
   봇 산문·사람이 쓴 마커는 무시.
 - **세션 범위 판정:** 세션 자신의 제어 코멘트(핸드오프·연속 마커)는 **start 기록의 코멘트 id 이후**인 것만 그 세션 것이다
   (초 단위 시각은 이전 세션의 핸드오프와 같은 초에 겹칠 수 있다). 라운드(리뷰)는 start 시각보다 **엄격히 이후**인 것만.
@@ -89,6 +97,34 @@ GitHub가 영속하는 이벤트(App의 기록·마커, 사람의 stop 코멘트
   무의미해져 조용히 끝난다(새 요청이 이어받음). suggest는 쓰지 않으므로 권한 확인이 없다.
 - **연속 게시 실패:** 백오프 재시도 후에도 다음 리뷰를 요청하지 못하면 push된 head에 대한 `loop-error` 핸드오프로 끝난다
   (조용한 정지 없음). App 자신의 push도 같은 경로를 타서, 커밋 직후 프로세스가 죽어 연속 마커가 없으면 보충한다.
+- **제어 쓰기는 POST 시도마다 새로 결정한다 (`review-loop-control.ts` `emitControl`):** start·stop 기록, 연속 마커,
+  핸드오프는 모두 한 게이트를 지나고, 결과는 닫힌 5종(`posted`·`exists`·`unknown`·`rejected`·`superseded`)이며 모든
+  호출부가 망라 switch로 처리한다. 게이트는 **매 POST 시도 직전** — 첫 시도도 — 호출자의 `decide()`를 부른다(호출자의
+  조회는 다른 쓰기의 백오프나 이력 재조회 대기보다 오래됐을 수 있다). `decide()`는 live head와 세션을 (이 프로세스의
+  저널 대조 포함) **새로 읽어** 지금 보낼 본문을 돌려주거나, 그 쓰기를 더는 빚지지 않는다고(`superseded`) 답한다:
+  - 연속 마커: 세션이 끝났거나 더 새 세션이 진행 중이면, 또는 PR head가 그 마커의 head에서 움직였으면 superseded
+    (live head의 요청이 루프를 이끈다). 단 App 자신의 커밋(적용 라운드)의 연속 마커는, head 조회가 아직 그 커밋의
+    **부모**를 보이면 이동으로 보지 않는다 — GitHub는 ref 갱신 뒤 PR의 head(`GET /pulls/:n`의 `head.sha`)를
+    비동기로 동기화하므로(뒤이어 `synchronize`를 보내는 그 동기화) 커밋 직후의 조회는 부모를 보일 수 있다. 이때는 커밋을
+    head로 두고 세션만으로 정한다. 커밋도 부모도 아닌 head만 그 연속 마커를 무효로 한다.
+  - 핸드오프: 세션이 끝났거나 더 새 세션이 진행 중이면 superseded. head 이동은 핸드오프를 무효로 하지 않는다(세션의
+    종착 신호다). 거절된 연속 마커 뒤의 `loop-error` 핸드오프도 같은 규칙을 따른다.
+  - stop 기록: superseded되지 않는다(한 번 빚지면 영속될 때까지 빚진다). 대신 시도마다 형식을 고른다 — 그 조회에서
+    (정지를 접은 뒤) 진행 중인 세션이 없으면 STOPPED 확인, 있으면 기록 줄만(백오프 중 새 start가 들어오면 재시도는
+    기록 줄만 보낸다).
+  - start 기록: 자기 시각에 놓이고 어느 세션에서나 같으므로 늘 그대로 빚진다.
+
+  superseded된 쓰기는 다시 보내지 않고 저널 항목도 대체 이벤트도 남기지 않는다 — 앞선 시도는 모두 거절이라 만들어진
+  행이 없고, 결과 불명(`unknown`)으로 끝날 재시도가 결정되지 않은 세션에 대체 이벤트를 심지도 않는다. 새 조회가 실패한
+  시도는 **보내지 않는다**(거절로 치고 일정은 계속, 끝내 못 정하면 `rejected` — 결정하지 못한 제어 쓰기는 없다). 그래서
+  목록 조회가 계속 실패하는 동안에는 거절된 연속 마커 뒤의 핸드오프도 나가지 않고, 그 결과가 로그로 남는다. 결과가 불명인
+  POST 뒤에는 더 결정하지 않는다(다시 보내지 않고 찾기만 한다).
+
+  같은 키의 동시 emit(예: 적용 라운드의 연속 마커와 App 자신의 push에 대한 `synchronize` 핸들러)은 진행 중인 emit에
+  **합류**해 그 결과를 나눈다 — 단 **보낸 것**의 결과만이다. `superseded`는 합류당한 호출자 **자신의** 조회(그만 아는
+  이벤트, 그에게만 뒤처진 복제본)로 내린 결정이고 아무것도 보내지 않았으므로, 합류자는 그 결과를 물려받지 않고 다시
+  emit해 **자기** `decide()`로 정한다(정리된 항목은 이미 지워져 새로 시작하거나, 다른 합류자의 emit에 합류한다). 그래서
+  자기 조회로는 쓰기를 빚진 호출자가 남의 판단 때문에 조용히 `superseded`로 끝나는 일은 없다.
 - **정지 사유 구분:** 세션이 끝나 라운드가 무의미해졌을 때의 조용한 사유는 끝난 방식(운영자 stop / 핸드오프 / 수렴)을
   그대로 말한다 — 핸드오프를 "operator stop"으로 부르지 않는다.
 
@@ -126,6 +162,10 @@ stop, 그 head(또는 live head)의 이후 clean 리뷰로 해소되고, 새 sta
 도착한 옛 head의 not-clean 리뷰는 stale clean 리뷰와 똑같이 무시된다(§2b).
 런타임도 지적 개수가 아니라 같은 게시 결과(`postedOutcome`)로 판정한다: 구조화 지적이 0건이어도 clean pass가 아닌 리뷰(raw / raw-unverified / unverified-clean / incomplete)는 활성 세션에서 고정 ESCALATE `loop-error` 하나로 넘기며, 조용히 멈추지 않는다.
 
+STOPPED 마커(첫 줄)는 기록의 **각 POST 시도 직전 조회**에서 **진행 중인 세션이 없을 때만** 나간다. 정지 기록 줄
+`<!-- ashlar-loop-stop at= by= -->` 로 **시작하는** 봇 코멘트(STOPPED 마커·문구 없음)는 종착 신호가 아니다 — 더 새
+세션이 진행 중일 때, 그보다 앞선 세션을 끝낸 정지를 `at=` 시각에 기록할 뿐이다(세션 fold 전용, §2b).
+
 연속(비종착) 제어 신호 — 루프가 다음 라운드로 넘어갈 때 드라이버가 방출:
 
 | 신호 | 고정 마커(머신) | 고정 문구(사람) | 감지 |
@@ -139,8 +179,8 @@ FIXING은 수정 요청 직전에 단다(수정은 바쁜 provider 큐에서 오
 
 **수정 요청 감시(`fix-request-watch.ts`):** 로컬 LLM은 리뷰와 수정을 한 줄로 처리하므로 수정 요청은 큐에서 오래
 기다릴 수 있다. 스트리밍 신호로 "대기(keepalive)"와 "생성(첫 출력)"을 구분해:
-- 생성 deadline(`ASHLAR_FIX_TIMEOUT_MS`, 기본 60분)은 **첫 출력부터** 센다 — 대기 시간 제외(부하 중 거짓
-  `fix-failed` 방지). 대기 상한은 별도(`ASHLAR_FIX_QUEUE_MAX_MS`, 기본 6시간), 신호 두절(liveness)도 중단.
+- 생성 deadline(설정 `fixAgent.timeoutMs`, 기본 60분)은 **첫 출력부터** 센다 — 대기 시간 제외(부하 중 거짓
+  `fix-failed` 방지). 대기 상한은 별도(설정 `fixAgent.queueMaxMs`, 기본 6시간), 신호 두절(liveness)도 중단.
 - **관련성 검사는 하나**(head 이동 · 세션 종료 · 새 세션 · apply→suggest 강등)이고, 라운드 시작 직전, 대기 중 2분마다,
   생성 시작 순간, 재시도 전, 커밋 직전, 리포트 전에 같은 검사를 쓴다 — 해당하면 abort(대기열 자리 반환·생성 조기 차단)하고
   조용히 끝난다(superseded / stopped / newer request). 이렇게 무의미해진 라운드는 **재시도하지 않는다.**
@@ -201,10 +241,10 @@ ashlar 자신의 파서는 마커가 **코멘트 맨 앞**에 있을 때만 신�
 CONVERGED(clean 리뷰 `total=0`), ESCALATE(reason 코드), STOPPED(운영자 정지). 조용한 정지·자유 문장 종료는 없다.
 suggest 모드의 라운드는 고정 "suggestion" 리포트로 사람에게 넘기고, 사람이 적용·push하면 세션이 이어진다(§2b).
 
-- **수정 라운드 예산** `ASHLAR_LOOP_ROUND_CAP`(기본 **5**): 리뷰 라운드 k(≤5) 뒤에 수정 라운드 k. 리뷰 라운드
+- **수정 라운드 예산** 설정 `fixAgent.roundCap`(기본 **5**): 리뷰 라운드 k(≤5) 뒤에 수정 라운드 k. 리뷰 라운드
   6은 5번째 수정의 **검증 리뷰** — clean이면 CONVERGED, 지적이 남으면 `round-cap` ESCALATE(추세와 무관한 하드 상한).
 - applied 라운드는 **항상** 다음 리뷰를 요청한다(연속 마커). 예산 판정은 다음 리뷰에서 한다.
-- 수정 라운드 실패는 라운드 안에서 재시도(`ASHLAR_FIX_ATTEMPTS`, 기본 2 — request/parse/scope/validation 실패) 후
+- 수정 라운드 실패는 라운드 안에서 재시도(설정 `fixAgent.attempts`, 기본 2 — request/parse/scope/validation 실패) 후
   `fix-failed`. 재시도 지시문은 **고정 문장**(거절 코드만 포함)이고, 거절 사유(모델 출력·저장소 경로를 인용할 수 있음)는
   **JSON 인코딩된 비신뢰 데이터 필드**로만 되먹인다. 변경 없음은 `fix-declined`, 그 밖의 진행 불가는 `loop-error`.
 - 조용한 종료는 셋뿐: **supersede**(리뷰 후 head가 움직임 — 새 head의 리뷰가 루프를 이어받음; 제안(suggest)도
@@ -266,18 +306,57 @@ fix 주체는 **설정 가능**하다(§6b). 채팅 리뷰어(ChatGPT/Grok)도 *
 
 ```
 fixAgent: {
+  enabled: boolean,                   // 루프의 유일한 스위치 (기본 false)
   provider: "chatgpt" | "grok" | "local" | "coding-agent",  // 누가 수정하나
   delivery: "script-apply" | "chat-push" | "coding-agent",  // 어떻게 push 하나 (§6 A/B/C)
   mode: "suggest" | "apply",          // suggest=제안/초안(사람 1클릭), apply=자동 push
   parallelPrs: number,                // 서로 다른 PR 동시 fix 상한 (리뷰 capacity와 공유)
+  roundCap, attempts, timeoutMs, queueMaxMs, chatTimeoutMs, chatMaxPromptChars,  // 루프 수치 (아래)
 }
 ```
 
-- **기본값(안전 우선):** `provider` 없음(루프 미설정 시 fix 안 함) · `delivery: "script-apply"` ·
+- **운영은 Settings 화면에서만(재시작 없음):** Settings의 "Fix agent / review loop" 섹션이 위 필드를 **전부**
+  다룬다. 루프는 `enabled === true` **그리고** `provider != null`일 때만 돈다(`loopEnabled`). 환경변수로 루프를 켜는
+  경로는 없다(예전 `ASHLAR_FIX_AGENT`는 제거됨 — 설정해도 무시). 저장하면 harbor의 메모리 설정이 즉시 바뀌고, 모든
+  진입점(리뷰 게시 후 단계·start·push 연속·stop)과 수치(라운드 예산·재시도·deadline·프롬프트 한도·parallelPrs)는
+  **호출마다** 현재 설정을 읽는다 — 다음 단계부터 적용. 이미 진행 중인 수정 라운드는 시작 시점의 설정으로 끝난다.
+- **env는 초기값만:** `ASHLAR_FIX_PROVIDER`/`_DELIVERY`/`_MODE`/`_PARALLEL_PRS`, `ASHLAR_LOOP_ROUND_CAP`,
+  `ASHLAR_FIX_ATTEMPTS`/`_TIMEOUT_MS`/`_QUEUE_MAX_MS`/`_CHAT_TIMEOUT_MS`/`_CHAT_MAX_PROMPT_CHARS`는 한 번도 저장하지
+  않은 필드의 **시드**일 뿐이다. 저장된 `fixAgent`가 있으면 재시작 시에도 저장값이 이긴다. `enabled`에는 env가 없다.
+
+- **기본값(안전 우선):** `enabled: false` · `provider` 없음(루프·fix 항목 없음) · `delivery: "script-apply"` ·
   `mode: "suggest"` · `parallelPrs`는 bridge capacity 내. → 명시적으로 켜야 자동 수정이 돈다.
-- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인). `local`은
+- **provider→delivery 제약:** `chatgpt`/`grok`는 `script-apply`(응답 파싱) 또는 `chat-push`(플러그인; grok은 fix 미연결). `local`은
   `script-apply`(grokbot `qwen_openai_edit.py` 재사용). `coding-agent`는 `coding-agent`.
 - **권한:** 어떤 provider든 push하려면 §2의 write-권한 게이트를 통과해야 한다. `apply` 모드는 명시적으로만.
+- **채팅 fix provider는 ChatGPT(임시 채팅)뿐:** fix 탭은 항상 `https://chatgpt.com/?temporary-chat=true`에서 열리고,
+  이 URL은 전송 후에도 바뀌지 않으므로 전송 시점 대화를 이후 모든 결정에서 비교할 수 있다. `grok`은 fix provider로
+  연결돼 있지 않다(전송 후 URL이 바뀔 수 있음): 설정 검증·Settings 화면·런타임 모두 "grok is not supported as a fix
+  provider yet"로 거부하고, 저장된 `{provider:"grok", enabled:true}`는 OFF로 로드된다. Grok **리뷰**는 그대로다.
+
+**채팅 fix 전송(구현, `bridge-fix.server.ts`):** `chatgpt` + `script-apply`는 harbor Job이 아니라 bridge의
+**fix 항목**으로 간다(harbor Job은 PR별 supersede·리뷰 JSON 검증을 하므로 fix 답변을 거부/재작성한다). 확장이
+채팅 탭에 프롬프트를 붙여 넣고 **답변 전문(텍스트)**을 돌려주면, 파싱은 서버가 결정적으로 한다(`fix-apply`).
+- **fix 탭은 증명된 성공 경로에서만 닫는다:** 답변이 전달(서버 ACK를 워커가 기록)되었고, 닫는 시점에 페이지의
+  해제 판정(`tabOwnership`: 전송한 임시 채팅 그대로, 정확한 전송 턴, 초안·후속 턴 없음)이 탭을 Ashlar 것으로 볼
+  때만. ChatGPT가 완료된 답변을 스스로 다시 그리는 것은 사용자 활동이 아니다(#82: 답변 텍스트는 다시 비교하지
+  않는다). 그 밖의 모든
+  종료(취소·supersede·데드라인·실패·taken_over·소유 불명·다른 바인딩·응답 없음·로딩 중·전달 기록 없음)는 탭을
+  **보존**하고 관리 슬롯만 해제한 뒤 작업을 끝낸다. 사용자의 로그인된 채팅 프로필에서 DOM 추론으로 탭을 강제로
+  닫지 않는다. 영구 판정(전송 시점 대화에서 이동·미확정, 전송 턴의 편집·교체, 후속 턴, 초안)은 응답 식별 여부를
+  기다리지 않고 **일시적 판정보다 먼저** 내린다 — 이전 DOM이 사라졌거나 턴이 통째로 바뀌어도 데드라인이 아니라
+  즉시 `taken_over`로 끝난다.
+- **PR당 live 항목 1개:** 같은 PR의 새 요청이 이전 항목을 취소(`superseded`)하고, 확장은 그 탭의 실행을 멈추고
+  슬롯을 해제한다(탭은 보존).
+- **데드라인:** 대기+생성 합산 기본 30분(설정 `fixAgent.chatTimeoutMs`, 1분~6시간). 만료 → 취소 → 탭 보존·슬롯
+  해제 → 런타임 재시도 후 `fix-failed` ESCALATE. 런타임 watcher는 chat fix를 이 데드라인과
+  `fixAgent.timeoutMs` 중 긴 쪽 + 1분까지 기다린다 — 로컬 LLM용 생성 데드라인이 chat fix를 먼저 끊지 않는다.
+- **동시성:** `parallelPrs`개까지만 claim, 나머지는 대기. 리뷰와는 요청 시각이 빠른 쪽이 먼저(서로 굶기지 않음).
+- **호환:** `take`에 `fixProtocol:2`를 보내는 확장(1.1.29+, fix 소스를 첨부 파일로 보냄 #93)에만 fix 항목을 준다 — 확장 재로드 필요. `fixProtocol:1`(1.1.23–1.1.28) 워커는 첨부 프레임을 본문에 그대로 붙여넣을 수 있어 거부된다.
+- **프롬프트 한도:** 프롬프트 전체를 composer에 입력하고 전송 확인도 그 텍스트로 하므로, 파일 내용을 첨부
+  봉투(`<<<ASHLAR_ATTACHMENTS_V2>>>`)로 빼지 않는다(첨부는 부분 열람될 수 있어 full-file 재작성이 틀어진다).
+  대신 기본 10만 자(설정 `fixAgent.chatMaxPromptChars`, 1만~100만) 초과는 즉시 실패 → ESCALATE. 큰 PR은 `local`.
+- `chat-push`(탭 자율 push)는 미구현 — 설정돼 있으면 fail-closed로 ESCALATE.
 
 ## 7. 2단계 검증 (비용 최적화 — 정본 스킬의 핵심 추가)
 

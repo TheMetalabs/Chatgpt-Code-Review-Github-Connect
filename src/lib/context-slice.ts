@@ -375,14 +375,27 @@ function definitionRange(lines: string[], exported: string, requireExport = fals
  * analog of the multi-turn loop's on-demand file_read.
  *
  * SCOPE (deliberate, best-effort, strictly ADDITIVE): covers RELATIVE ESM imports — named, aliased,
- * and default — of functions/vars/members and class/enum/interface/type declarations. That is the
- * overwhelming common case in this codebase. Intentionally OUT OF SCOPE, because fully reimplementing
- * TS/JS module resolution here is an unbounded long tail: barrel/`export … from` re-exports, namespace
- * imports (`import * as ns` + `ns.member()`), CommonJS `require()`, dynamic `import()`, and tsconfig
- * path aliases. A miss is not a defect — the reviewer simply falls back to the diff + hunk snapshot
- * (no worse than before this feature), and the LOCAL reviewer's on-demand pull (readFileAtHead) is the
- * complete-coverage path for anything this static approximation does not resolve.
+ * and default — of functions/vars/members and class/enum/interface/type declarations, plus NestJS-style
+ * DI field calls (`this.adminWrite.run(` / `adminWrite.run(`) when the receiver is a class property /
+ * constructor parameter typed as an imported binding. That is the overwhelming common case in this
+ * codebase. Intentionally OUT OF SCOPE, because fully reimplementing TS/JS module resolution here is
+ * an unbounded long tail: dynamic `import()`, and tsconfig path aliases. (Barrels, namespace imports,
+ * and CommonJS `require` are already handled best-effort above.) A miss is not a defect — the reviewer
+ * simply falls back to the diff + hunk snapshot (no worse than before this feature), and the LOCAL
+ * reviewer's on-demand pull (readFileAtHead) is the complete-coverage path for anything this static
+ * approximation does not resolve.
  */
+
+/** NestJS / TS parameter-property map: field name → imported type local name.
+ * Matches `private readonly adminWrite: StoreAdminWriteService` (constructor or class field). */
+function injectedFieldTypes(content: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const re =
+    /(?:(?:private|protected|public|readonly)\s+)+([A-Za-z_$][\w$]*)\s*(?:!\s*)?:\s*([A-Za-z_$][\w$]*)\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(String(content || ""))) !== null) out.set(m[1], m[2]);
+  return out;
+}
 /** Find an exported symbol's definition across candidate modules, following barrel re-exports
  * (`export { X } from './real'`, `export * from './real'`) to the module that actually declares it.
  * Depth-capped so a re-export cycle cannot loop. */
@@ -448,6 +461,7 @@ export function crossFileDefs(
     if (remaining <= 0 || count >= MAX_DEFS) break;
     const bindings = new Map(importGraph(origin.path, origin.content).map((b) => [b.local, b]));
     if (!bindings.size) continue;
+    const injected = injectedFieldTypes(origin.content);
     const hunkText = extractHunkLines(origin.patch).join("\n");
     // Plain calls / constructions: `helper(`, `new Entity(`. The negative lookbehind excludes member
     // calls (`items.map(`, `this.run(`) so a receiver method is not mistaken for a same-named import.
@@ -464,9 +478,15 @@ export function crossFileDefs(
     // Qualified calls `X.member(`: a namespace member (`import * as ns; ns.member()`) looks the member
     // up in the namespace module; a static/object member on a named or default import
     // (`import { Parser }; Parser.parse()`) attaches the receiver's own definition (the class/object).
+    // NestJS DI: `this.adminWrite.run(` / `adminWrite.run(` — receiver is a field typed as an
+    // imported class; resolve field → type → import binding, then attach that class (includes run()).
     for (const q of hunkText.matchAll(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(/g)) {
       if (remaining <= 0 || count >= MAX_DEFS) break;
-      const b = bindings.get(q[1]);
+      let b = bindings.get(q[1]);
+      if (!b) {
+        const typeName = injected.get(q[1]);
+        if (typeName) b = bindings.get(typeName);
+      }
       if (!b) continue;
       const hit =
         b.kind === "namespace"

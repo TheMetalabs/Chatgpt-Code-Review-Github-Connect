@@ -6,7 +6,16 @@ import { isSafeRepoPath, isSandboxPolicyFile, policyPathsFor, snapshotFileRef } 
 import { DEFAULT_EXPORT, hunkReferencedNames, importGraph, reExportsOf } from "./import-resolve";
 import { isReviewLineError } from "./review-diff";
 import { parseDohA } from "./github-dns";
-import { GithubTransportError, mayResendOnOtherHost, trackRequestSent } from "./github-transport";
+import {
+  GithubTransportError,
+  GithubWriteError,
+  githubWriteOutcome,
+  mayResendOnOtherHost,
+  postedIssueComment,
+  postedReviewRow,
+  trackRequestSent,
+  type PostedIssueComment,
+} from "./github-transport";
 import { ashlarPublicHost, ashlarWebhookUrl } from "./ashlar-env";
 import { getSecrets, normalizePem } from "./secrets.server";
 import type { ForkStatus, GithubReady, PostedComment, SamplePr, SnapshotFile } from "./types";
@@ -79,8 +88,9 @@ export function formatGithubError(e: unknown): string {
   if (!(e instanceof Error)) return String(e).slice(0, 240);
   const parts = [e.message];
   const cause = (e as Error & { cause?: unknown }).cause;
+  // a wrapper that already quotes its cause (a write's transport failure) must not show it twice
   if (cause instanceof Error) {
-    parts.push(cause.message);
+    if (!e.message.includes(cause.message)) parts.push(cause.message);
     const code = (cause as NodeJS.ErrnoException).code;
     if (code) parts.push(String(code));
   } else if (cause) {
@@ -340,11 +350,18 @@ export async function probeGithub(installationId?: number): Promise<{
   }
 }
 
+export type PostedReview = { id: number; inlineDropped: boolean; userLogin: string; submittedAt: string; commitId: string };
+
+/** A write's failure, classified by `githubWriteOutcome` (the message prefix is unchanged). */
+function writeError(message: string, out: { status: number; notSent?: boolean; cause?: unknown }): GithubWriteError {
+  return new GithubWriteError(message, out.status, githubWriteOutcome(out.status, out.notSent), out.cause);
+}
+
 async function gh<T>(
   token: string,
   path: string,
   init?: { method?: string; body?: string; headers?: Record<string, string> },
-): Promise<{ ok: true; data: T } | { ok: false; status: number; text: string; notSent?: boolean }> {
+): Promise<{ ok: true; status: number; text: string; data: T } | { ok: false; status: number; text: string; notSent?: boolean; cause?: unknown }> {
   let out: GhRes;
   try {
     out = await ghHttps(
@@ -358,10 +375,22 @@ async function gh<T>(
     );
   } catch (e) {
     // notSent: the connection never came up, so the request cannot have reached GitHub
-    return { ok: false, status: 0, text: formatGithubError(e), notSent: e instanceof GithubTransportError && !e.requestSent };
+    return {
+      ok: false,
+      status: 0,
+      text: formatGithubError(e),
+      notSent: e instanceof GithubTransportError && !e.requestSent,
+      cause: e,
+    };
   }
   if (out.status < 200 || out.status >= 300) return { ok: false, status: out.status, text: out.text.slice(0, 400) };
-  return { ok: true, data: (out.text ? JSON.parse(out.text) : {}) as T };
+  try {
+    return { ok: true, status: out.status, text: out.text, data: (out.text ? JSON.parse(out.text) : {}) as T };
+  } catch (e) {
+    // GitHub accepted the request but the body is truncated or not JSON (an intermediary, a cut
+    // connection): no usable response. For a write the outcome is unknown, never a retryable miss.
+    return { ok: false, status: 0, text: `malformed ${out.status} response: ${out.text.slice(0, 200)}`, notSent: false, cause: e };
+  }
 }
 
 export async function fetchPullHead(
@@ -639,10 +668,10 @@ export async function createPullReview(
     body: string;
     comments: PostedComment[];
   },
-): Promise<{ id: number; inlineDropped: boolean }> {
+): Promise<PostedReview> {
   let comments = opts.comments;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
+    const out = await gh(token, `/repos/${opts.owner}/${opts.repo}/pulls/${opts.pr}/reviews`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -658,15 +687,19 @@ export async function createPullReview(
       }),
     });
     if (out.ok) {
-      if (!out.data.id) throw new Error("review missing id");
-      // true when GitHub refused an inline anchor and the review went out without ANY inline comment
-      return { id: out.data.id, inlineDropped: comments.length < opts.comments.length };
+      return {
+        ...postedReviewRow(out.status, out.text),
+        // true when GitHub refused an inline anchor and the review went out without ANY inline comment
+        inlineDropped: comments.length < opts.comments.length,
+      };
     }
-    if (comments.length && isReviewLineError(out.text)) {
+    // Drop the inline comments and re-send only after GitHub definitely REFUSED the review for an
+    // anchor (422, nothing created). A 5xx or no response may have created it: never re-send.
+    if (comments.length && out.status === 422 && isReviewLineError(out.text)) {
       comments = [];
       continue;
     }
-    throw new Error(`GitHub Reviews API ${out.status}: ${out.text}`);
+    throw writeError(`GitHub Reviews API ${out.status}: ${out.text}`, out);
   }
   throw new Error("GitHub Reviews API failed");
 }
@@ -680,7 +713,9 @@ async function ghListAll<T>(token: string, pathBase: string): Promise<T[]> {
     const sep = pathBase.includes("?") ? "&" : "?";
     const out = await gh<T[]>(token, `${pathBase}${sep}per_page=100&page=${page}`);
     if (!out.ok) throw new Error(`list ${pathBase} failed (${out.status}): ${out.text}`);
-    const batch = out.data ?? [];
+    // a page that is not a JSON array (null, an object, an empty body) is no page: never "no rows"
+    if (!Array.isArray(out.data)) throw new Error(`list ${pathBase} failed (${out.status}): not a list: ${out.text.slice(0, 200) || "(empty body)"}`);
+    const batch = out.data;
     all.push(...batch);
     if (batch.length < 100) return all; // exhausted
     if (page === MAX_PAGES) {
@@ -714,13 +749,17 @@ export async function listReviewComments(
   owner: string,
   repo: string,
   pr: number,
-): Promise<Array<{ userLogin: string; path: string; commitId: string; createdAt: string; updatedAt: string; body: string }>> {
-  const rows = await ghListAll<{ user?: { login?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null; updated_at?: string | null; body?: string | null }>(
+): Promise<Array<{ id: number; inReplyToId?: number; line?: number; userLogin: string; userType: string; path: string; commitId: string; createdAt: string; updatedAt: string; body: string }>> {
+  const rows = await ghListAll<{ id?: number; in_reply_to_id?: number | null; line?: number | null; original_line?: number | null; user?: { login?: string; type?: string }; path?: string | null; commit_id?: string | null; original_commit_id?: string | null; created_at?: string | null; updated_at?: string | null; body?: string | null }>(
     token,
     `/repos/${owner}/${repo}/pulls/${pr}/comments`,
   );
   return rows.map((c) => ({
+    id: Number(c.id ?? 0),
+    inReplyToId: typeof c.in_reply_to_id === "number" ? c.in_reply_to_id : undefined,
+    line: typeof c.line === "number" ? c.line : typeof c.original_line === "number" ? c.original_line : undefined,
     userLogin: String(c.user?.login ?? ""),
+    userType: String(c.user?.type ?? ""),
     path: String(c.path ?? ""),
     commitId: String(c.original_commit_id ?? c.commit_id ?? ""),
     createdAt: String(c.created_at ?? ""),
@@ -803,6 +842,22 @@ export function gitDataApi(token: string, owner: string, repo: string): GitDataA
       if (!out.ok || !out.data.sha) throw new Error(out.ok ? "commit has no sha" : `create commit failed (${out.status}): ${out.text}`);
       return out.data.sha;
     },
+    async blobShas(commitSha: string, paths: readonly string[]): Promise<Map<string, string>> {
+      // One contents read per path (at most the PR's changed files): unlike a recursive tree read it
+      // is never truncated in a large repository. A path that is not a file there is left out.
+      const out = new Map<string, string>();
+      for (const path of paths) {
+        const safe = isSafeRepoPath(path);
+        if (!safe) continue;
+        const res = await gh<{ sha?: string; type?: string }>(
+          token,
+          `/repos/${owner}/${repo}/contents/${encodeURIComponent(safe).replaceAll("%2F", "/")}?ref=${encodeURIComponent(commitSha)}`,
+        );
+        if (res.ok && res.data.type === "file" && typeof res.data.sha === "string") out.set(path, res.data.sha);
+        else if (!res.ok && res.status !== 404) throw new Error(`read blob of ${path} failed (${res.status}): ${res.text}`);
+      }
+      return out;
+    },
     async readBranchRef(branch: string): Promise<string> {
       const cur = await gh<{ object?: { sha?: string } }>(token, `${base}/ref/heads/${branch}`);
       if (!cur.ok || !cur.data.object?.sha) throw new Error(`read ref failed (${cur.ok ? "no sha" : cur.status})`);
@@ -842,6 +897,30 @@ export async function commitFilesToBranch(
     message: opts.message,
     files: opts.files,
   });
+}
+
+/** Open PRs of the App's installed repositories (most recently updated first), each with its
+ * installation's token: at most `max` PRs from at most `max` repositories, one page per list — the
+ * bounded boot sweep's census (review-loop-runtime sweepCutFixRounds). Throws on a failed list. */
+export async function listInstalledOpenPulls(max: number): Promise<Array<{ owner: string; repo: string; pr: number; token: string }>> {
+  const installs = await ghHttps("GET", "/app/installations?per_page=100", { Authorization: `Bearer ${await appJwt()}` });
+  if (installs.status < 200 || installs.status >= 300) throw new Error(`list installations ${installs.status}: ${installs.text.slice(0, 180)}`);
+  const out: Array<{ owner: string; repo: string; pr: number; token: string }> = [];
+  let repos = 0;
+  for (const { id } of JSON.parse(installs.text || "[]") as Array<{ id: number }>) {
+    const token = await installationToken(id);
+    const list = await gh<{ repositories?: Array<{ name?: string; owner?: { login?: string } }> }>(token, "/installation/repositories?per_page=100");
+    if (!list.ok) throw new Error(`list installation repositories (${list.status}): ${list.text}`);
+    for (const r of list.data.repositories ?? []) {
+      if (out.length >= max || repos++ >= max) return out;
+      const [owner, repo] = [r.owner?.login, r.name];
+      if (!owner || !repo) continue;
+      const pulls = await gh<Array<{ number?: number }>>(token, `/repos/${owner}/${repo}/pulls?state=open&sort=updated&direction=desc&per_page=${max}`);
+      if (!pulls.ok || !Array.isArray(pulls.data)) throw new Error(`list open pulls of ${owner}/${repo} (${pulls.status}): ${pulls.text}`);
+      for (const p of pulls.data) if (Number.isInteger(p.number) && out.length < max) out.push({ owner, repo, pr: Number(p.number), token });
+    }
+  }
+  return out;
 }
 
 /** Head branch name + fork flag for the fix agent's push (a fork branch can't be pushed with the
@@ -947,15 +1026,14 @@ export async function fetchUserPermission(token: string, owner: string, repo: st
 export async function createIssueComment(
   token: string,
   opts: { owner: string; repo: string; pr: number; body: string },
-): Promise<{ id: number }> {
-  const out = await gh<{ id?: number }>(token, `/repos/${opts.owner}/${opts.repo}/issues/${opts.pr}/comments`, {
+): Promise<PostedIssueComment> {
+  const out = await gh(token, `/repos/${opts.owner}/${opts.repo}/issues/${opts.pr}/comments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ body: opts.body }),
   });
-  if (!out.ok) throw new Error(`GitHub issue comment ${out.status}: ${out.text}`);
-  if (!out.data.id) throw new Error("comment missing id");
-  return { id: out.data.id };
+  if (!out.ok) throw writeError(`GitHub issue comment ${out.status}: ${out.text}`, out);
+  return postedIssueComment(out.status, out.text);
 }
 
 export async function updateIssueComment(

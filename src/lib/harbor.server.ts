@@ -1,4 +1,5 @@
 import {cancelLocalJsonRepairs} from "./json-repair.server";
+import { ignoredTarget } from "./webhook-target.ts";
 import type {RepairReceipt} from "./json-repair-types.ts";
 import {reviewHistory} from "./review-history.server";
 import {
@@ -14,8 +15,9 @@ import {
 } from "./samples";
 import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarget } from "./ingress";
 import { parseGitHubPayload } from "./github-payload";
-import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
+import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
+import { selectPriorThreads, type PriorThread } from "./prior-threads";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
@@ -33,12 +35,14 @@ import {
 import { sleep } from "./utils";
 import { chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localReplies, localVerifies, racingProviders, releaseLocalAsFallback, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
+import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
 import type { BotSettings, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import {
   ashlarBotLogin,
   continueLoopOnPush,
+  controlResultLogged,
   loopPostedReview,
   loopStartAt,
   startLoop,
@@ -46,8 +50,11 @@ import {
   runPostReviewLoop,
   SILENT_REASONS,
   stopLoop,
+  sweepCutFixRounds,
+  type ControlResult,
 } from "./review-loop-runtime.server.ts";
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
+import { validatedSettingsPatch } from "./settings-rules";
 import { redactSalvagedReviewBody } from "./review-format";
 import {
   BRIDGE_CLAIM_MS,
@@ -153,12 +160,13 @@ export function githubStatus() {
   return githubReady();
 }
 
+/** Validate, persist, THEN swap the live settings. The rules (settings-rules settingsProblem)
+ * run on the document as the operator sent it, before any normalization, so an input the runtime
+ * would refuse (e.g. the loop enabled on a non-wired delivery) is rejected (SettingsError 400)
+ * instead of being clamped or rewritten. A failed persist (SettingsError 500) leaves the live
+ * settings unchanged: what runs is always what a restart would load. */
 export function patchHarborSettings(patch: Partial<BotSettings>) {
-  const next = sanitizeBotSettings({ ...state.settings, ...patch });
-  if (!providersFromSettings(next).length) {
-    throw new Error("at least one configured reviewer is required");
-  }
-  const saved = saveBotSettings(next);
+  const saved = saveBotSettings(sanitizeBotSettings(validatedSettingsPatch(state.settings, patch)));
   const previousSettings = state.settings;
   state = { ...state, settings: saved };
   if (!saved.localJsonRepairEnabled || previousSettings.localLlmBaseUrl !== saved.localLlmBaseUrl ||
@@ -227,6 +235,7 @@ function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
   // Never throws: every caller continues past its write (the lease ping's owner liveness, a local
   // leg's request, the review that follows), so a history failure cannot half-apply a transition.
   noteJobHistory(after);
+  if (needsTerminalOps(after)) setTimeout(() => void finishOpsComment(jobId), 0);
   return after;
 }
 
@@ -266,6 +275,37 @@ export function orphanedLocalState(): string[] {
 /** Test seam: whether a reviewer watcher is still running for a job. */
 export function isWatchingJob(jobId: string): boolean {
   return watching.has(jobId);
+}
+
+const TERMINAL_OPS: readonly string[] = ["posted", "skipped", "failed"];
+
+/** A GitHub job that ended (skipped, dlq, cancelled) while its ops comment still says running or
+ * blocked (live aicc #515: an Instant-tier skip left "Waiting for provider response" for hours, and a
+ * lane tool read the job as in progress). A path that reports its own terminal phase has already set
+ * opsPhase when this runs (upsertOpsComment sets it before its first await). */
+function needsTerminalOps(job: Job): boolean {
+  return job.origin === "github" && Boolean(job.opsCommentId || job.opsPhase) && ["posted", "skipped", "dlq", "cancelled"].includes(job.status) &&
+    !TERMINAL_OPS.includes(job.opsPhase ?? "");
+}
+
+async function finishOpsComment(jobId: string) {
+  const job = state.jobs.find((j) => j.id === jobId);
+  if (!job || !needsTerminalOps(job) || !job.installationId) return;
+  const reason = job.skipReason || job.githubError || "";
+  const phase: OpsPhase = job.status === "dlq" ? "failed" : job.status === "posted" ? "posted" : "skipped";
+  const note = job.status === "posted" ? "Review posted."
+    : job.status === "cancelled" ? `Cancelled${reason ? `: ${reason}` : "."} No review posted.`
+    : `No review posted${reason ? `: ${reason}` : "."}`;
+  try {
+    await upsertOpsComment(await installationToken(job.installationId), jobId, phase, [note]);
+  } catch {
+    /* never fail the job on its status comment */
+  }
+}
+
+/** Alias: every job write goes through transitionJob (verify-clean release + history). */
+function patchJob(jobId: string, fn: (j: Job) => Job) {
+  transitionJob(jobId, fn);
 }
 
 export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
@@ -323,6 +363,8 @@ function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
     diffChars: diffBody.length,
     contextChars: contextBody.length,
     policyChars: policyBody.length,
+    // The PR body's scope section the review carried (chat-prompt.ts PR_SCOPE_RULE), 0 when none.
+    scopeChars: /<<<UNTRUSTED_PR_SCOPE>>>\n([\s\S]*?)\n<<<END>>>/.exec(prompt)?.[1].length ?? 0,
     diffFilesFull: sample.changedPaths.length - (sample.diffDroppedPaths?.length ?? 0),
     diffFilesTotal: sample.changedPaths.length,
   };
@@ -429,6 +471,10 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || job.origin !== "github") return;
   if (!opsCommentAllowed(job)) return;
+  // Recorded before the write: a terminal phase another path is writing is never overwritten by the
+  // generic one (finishOpsComment), nor a terminal one by a late "running".
+  if (TERMINAL_OPS.includes(job.opsPhase ?? "") && !TERMINAL_OPS.includes(phase)) return;
+  state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? { ...j, opsPhase: phase } : j)) };
   const body = buildOpsComment({
     phase,
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
@@ -436,26 +482,74 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
     localFallback: Boolean(job.localFallbackAt),
     notes: [`Job: ${job.id}`, ...notes],
   });
-  try {
-    if (job.opsCommentId) {
-      await updateIssueComment(token, {
-        owner: job.owner,
-        repo: job.repo,
-        commentId: job.opsCommentId,
-        body,
-      });
+  // One write at a time per job, in call order: a slow "running" write can no longer land after the
+  // terminal one, and a write queued behind the comment's creation updates it instead of creating a
+  // second comment.
+  const run = (opsWrites.get(jobId) ?? Promise.resolve()).then(async () => {
+    if (await writeOpsComment(token, jobId, body)) {
+      state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? { ...j, opsWritten: phase } : j)) };
+      if (TERMINAL_OPS.includes(phase)) opsRetries.delete(jobId);
       return;
     }
-    const created = await createIssueComment(token, {
-      owner: job.owner,
-      repo: job.repo,
-      pr: job.pr,
-      body,
-    });
+    // Not written: a terminal phase must not stand as reported, or finishOpsComment never writes it
+    // (live aicc #539). The phase falls back to the last one GitHub took, and the terminal write is
+    // retried.
+    if (!TERMINAL_OPS.includes(phase)) return;
+    state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId && j.opsPhase === phase ? { ...j, opsPhase: j.opsWritten } : j)) };
+    scheduleOpsRetry(jobId);
+  });
+  const settled = run.then(() => {}, () => {});
+  opsWrites.set(jobId, settled);
+  void settled.then(() => { if (opsWrites.get(jobId) === settled) opsWrites.delete(jobId); });
+  await settled;
+}
+
+const opsWrites = new Map<string, Promise<void>>();
+
+/** Write the job's ops comment; true when GitHub took it. A caller's installation token can be over
+ * an hour old (a job ends long after it started, live aicc #539: GitHub expires them after 1 h), so a
+ * failed write is retried once with a fresh token. Never throws. */
+async function writeOpsComment(token: string, jobId: string, body: string): Promise<boolean> {
+  const write = async (t: string) => {
+    const job = state.jobs.find((j) => j.id === jobId);
+    if (!job) return;
+    if (job.opsCommentId) {
+      await updateIssueComment(t, { owner: job.owner, repo: job.repo, commentId: job.opsCommentId, body });
+      return;
+    }
+    const created = await createIssueComment(t, { owner: job.owner, repo: job.repo, pr: job.pr, body });
     transitionJob(jobId, (j) => ({ ...j, opsCommentId: created.id, updatedAt: Date.now() }));
-  } catch {
-    /* same as reactions: never fail the review if the status comment cannot post */
+  };
+  try {
+    await write(token);
+    return true;
+  } catch (e) {
+    // Only an auth failure is retried here: a create that timed out may have been stored, and a second
+    // one would duplicate the comment (the bounded terminal retry covers the rest).
+    const status = (e as { status?: number })?.status;
+    if (!(status === 401 || /\b401\b|Bad credentials/i.test(String((e as Error)?.message ?? "")))) return false;
   }
+  try {
+    const installationId = state.jobs.find((j) => j.id === jobId)?.installationId;
+    if (!installationId) return false;
+    await write(await installationToken(installationId));
+    return true;
+  } catch {
+    return false; // never fail the review if the status comment cannot post
+  }
+}
+
+const OPS_RETRY_MS = 60_000;
+const OPS_RETRY_MAX = 5;
+const opsRetries = new Map<string, number>();
+
+/** Retry a terminal ops write that GitHub did not take, a bounded number of times. */
+function scheduleOpsRetry(jobId: string) {
+  if (!state.jobs.some((j) => j.id === jobId)) { opsRetries.delete(jobId); return; }
+  const n = (opsRetries.get(jobId) ?? 0) + 1;
+  if (n > OPS_RETRY_MAX) { opsRetries.delete(jobId); return; }
+  opsRetries.set(jobId, n);
+  setTimeout(() => void finishOpsComment(jobId), OPS_RETRY_MS).unref?.();
 }
 
 async function bridgeSnapshot() {
@@ -721,10 +815,21 @@ async function playGithub(jobId: string, untrustedBody: string) {
     return;
   }
   const extra = current()?.thread?.userText ?? "";
+  // Prior finding threads and their answers (aicc #455). Best effort: a listing failure only drops
+  // the context block — the review itself must not fail on it.
+  let priorThreads: PriorThread[] = [];
+  try {
+    priorThreads = selectPriorThreads(await listReviewComments(token, sample.owner, sample.repo, sample.pr), ashlarBotLogin());
+  } catch {
+    priorThreads = [];
+  }
+  const live1 = current();
+  if (!live1 || live1.status === "cancelled") return;
   const prompt = buildChatPrompt({
     sample,
     extra,
     untrustedBody,
+    priorThreads,
     contextMaxChars: state.settings.promptContextMaxChars,
     contextPadLines: state.settings.contextPadLines,
     policyMaxChars: state.settings.promptPolicyMaxChars,
@@ -1396,8 +1501,9 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
   if (postedJob.localVerifyNote) notes.unshift(postedJob.localVerifyNote);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
-  // Review-loop step (design §5 4–8): gated OFF by default (ASHLAR_FIX_AGENT + fixAgent.provider,
-  // and only for /review-loop-triggered reviews). Best-effort — never un-posts the review.
+  // Review-loop step (design §5 4–8): gated OFF by default (Settings fixAgent.enabled +
+  // fixAgent.provider, read from the live state.settings, so a saved toggle applies here with no
+  // restart). Best-effort — never un-posts the review.
   // Never start a fix round on a stale head: a commit parented on the reviewed SHA would
   // fast-forward over (and undo) a contributor's backward force-push. The runtime re-checks
   // the live head right before committing as well.
@@ -1511,6 +1617,7 @@ function enqueueFromDecision(
     id: nid("job"),
     status: "queued",
     createdAt: Date.now(),
+    createdSeq: nextCreationSeq(),
     updatedAt: Date.now(),
     ingressMs: opts.ingressMs,
     traces: [],
@@ -1614,7 +1721,7 @@ function recordLoopStart(token: string, job: Job): void {
   const start = { owner: job.owner, repo: job.repo, pr: job.pr, actor: job.sender, mode: job.thread.loop.mode, at: loopStartAt(job) };
   void startLoop(token, start, state.settings).then(
     (r) => {
-      if (!r.posted && /failed/.test(r.reason)) console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${r.reason}`);
+      if (controlResultLogged(r)) console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${r.reason}`);
     },
     (e) => console.warn(`[review-loop] start ${job.owner}/${job.repo}#${job.pr}: ${formatGithubError(e)}`),
   );
@@ -1631,14 +1738,12 @@ function applyLoopControl(parsed: Extract<ReturnType<typeof parseGitHubPayload>,
   if (!loopControlClaims.claim(deliveryId)) return;
   const installationId = parsed.installationId;
   const { owner, repo, pr, headSha } = parsed.target;
-  const run = (label: string, step: (token: string) => Promise<{ posted: boolean; reason: string }>) => {
+  const run = (label: string, step: (token: string) => Promise<ControlResult>) => {
     void (async () => {
       try {
         const r = await step(await installationToken(installationId));
-        if (!r.posted && /failed|in flight/.test(r.reason)) {
-          loopControlClaims.release(deliveryId); // a redelivery may retry what did not land
-          if (/failed/.test(r.reason)) console.warn(`[review-loop] ${label}: ${r.reason}`);
-        }
+        if (!r.posted && /failed|in flight/.test(r.reason)) loopControlClaims.release(deliveryId); // a redelivery may retry what did not land
+        if (controlResultLogged(r)) console.warn(`[review-loop] ${label}: ${r.reason}`);
       } catch (e) {
         loopControlClaims.release(deliveryId);
         console.warn(`[review-loop] ${label}: ${formatGithubError(e)}`);
@@ -1734,7 +1839,9 @@ export function ingestGitHubWebhook(opts: {
       hmac: "ok",
       httpStatus: 202,
       at: Date.now(),
-      summary: `${opts.event} ignored`,
+      // The PR the ignored delivery is about (bot comments, reviews, pushes): lane tooling filters
+      // webhook-driven signals by repo#pr, and a bare "<event> ignored" could not be attributed.
+      summary: `${ignoredTarget(opts.payload)}${opts.event} ignored`,
       skipReason: parsed.reason,
     };
     noteDeliveryHistory(ev);
@@ -1769,3 +1876,12 @@ export function ingestGitHubWebhook(opts: {
     untrustedBody: parsed.untrustedBody,
   });
 }
+
+// Boot, once per process: hand off the fix rounds a restart cut — sessions left at FIXING with
+// nothing running them (review-loop-runtime sweepCutFixRounds). Loop OFF: no GitHub call; never throws.
+const BOOT_SWEPT = Symbol.for("ashlar.review-loop.boot-sweep");
+if (!(globalThis as Record<symbol, unknown>)[BOOT_SWEPT]) {
+  (globalThis as Record<symbol, unknown>)[BOOT_SWEPT] = true;
+  void sweepCutFixRounds(state.settings);
+}
+

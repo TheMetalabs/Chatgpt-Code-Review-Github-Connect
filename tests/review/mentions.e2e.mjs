@@ -53,6 +53,17 @@ test('new body mention edit queues once; retained mention and a redelivery never
   assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===first.jobId).status,'awaiting_chat');
   assert.equal(app.githubCalls.snapshot,1);
 });
+test('a webhook review and a fix created in the same ms are taken in creation order (one sequence for both kinds)',async t=>{
+  const app=await fixture(t);
+  const out=await deliver(app,'issue_comment',comment());const job=await settled(app,out.jobId);
+  assert.ok(Number.isSafeInteger(job.createdSeq),'harbor stamps the shared creation sequence');
+  // The fixture clock is frozen: the fix is created in the review's millisecond.
+  app.bridge.requestBridgeFix({owner:'fixture',repo:'fixture',pr:2,provider:'chatgpt',prompt:'FIX'}).catch(()=>{});
+  const first=app.bridge.takeNextBridgeJob('fixture-client',[],{fixes:true});
+  assert.equal(first.jobId,job.id,'the review requested first is taken first');
+  app.bridge.refreshBridgeClaim(first.jobId,{chatgpt:true},undefined,first.leaseId);
+  assert.match(app.bridge.takeNextBridgeJob('fixture-client',[job.id],{fixes:true}).jobId,/^fix-/);
+});
 test('fork policy discovered from a comment is checked before snapshot or eyes and explains the skip',async t=>{
   const app=await fixture(t,{pull:{draft:true,fork:true}});
   const out=await deliver(app,'issue_comment',comment());const job=await settled(app,out.jobId);
@@ -271,18 +282,114 @@ test('self-trigger guard is wired end-to-end with the configured App login (ASHL
   assert.equal(other.queued,true,'not self under the configured identity');
 });
 
-test('a loop stop whose first attempt failed is retried when GitHub redelivers it (the claim is the only guard)',async t=>{
+// The review loop's only switch is Settings (fixAgent.enabled + a provider), read live by harbor.
+const FIX_ON={enabled:true,provider:'local',delivery:'script-apply',mode:'suggest',parallelPrs:3};
+const loopStop=(id,at)=>({...comment(),sender:{login:'alice'},comment:{id,body:'/review-loop stop',created_at:at,updated_at:at,user:{login:'alice'}}});
+
+test('the loop is OFF unless Settings enable it; saving the toggle applies to the next delivery with no restart',async t=>{
   let reads=0;
-  const app=await appFixture({reviewLocal:false,fixAgent:{provider:'local',delivery:'script-apply',mode:'suggest',parallelPrs:3}},
+  const app=await appFixture({reviewLocal:false,fixAgent:{...FIX_ON,enabled:false}},
     {api:{fetchPullHeadRef:async()=>{reads++;throw new Error('GitHub API timeout');}}});
   t.after(()=>app.close());
+  const settle=()=>new Promise(resolve=>setTimeout(resolve,150));
+  // The old env flag alone does nothing: the saved switch is off.
   app.env.ASHLAR_FIX_AGENT='1';
+  assert.equal((await deliver(app,'issue_comment',loopStop(80,'2026-01-20T00:00:00Z'),'off-1')).status,202);
+  await settle();assert.equal(reads,0,'switch off: no loop control ran');
+  // Switched on in Settings (same process, no restart): the next delivery runs loop control.
+  app.harbor.patchHarborSettings({fixAgent:{...FIX_ON}});
+  await deliver(app,'issue_comment',loopStop(81,'2026-01-20T00:01:00Z'),'on-1');
+  await eventually(()=>reads===1,'the enabled switch did not reach loop control');
+  // Switched off again: the next delivery is inert again.
+  app.harbor.patchHarborSettings({fixAgent:{...FIX_ON,enabled:false}});
+  await deliver(app,'issue_comment',loopStop(82,'2026-01-20T00:02:00Z'),'off-2');
+  await settle();assert.equal(reads,1,'switched off: no further loop control');
+});
+
+test('Settings saves run the production rules: a legacy delivery cannot be enabled, and a failed persist changes nothing live',async t=>{
+  let persistFails=false;
+  const app=await appFixture({reviewLocal:false,fixAgent:{...FIX_ON,provider:'chatgpt',delivery:'chat-push',enabled:false}},
+    {saveBotSettings:s=>{if(persistFails)throw Object.assign(new Error('could not save settings: fixture store is not writable'),{status:500});return s;}});
+  t.after(()=>app.close());
+  const live=()=>app.harbor.getHarbor().settings.fixAgent;
+  // The runtime refuses chat-push, so the save does too — the switch stays off.
+  assert.throws(()=>app.harbor.patchHarborSettings({fixAgent:{...live(),enabled:true}}),e=>e.status===400&&/not wired yet/.test(e.message));
+  assert.equal(live().enabled,false);
+  app.harbor.patchHarborSettings({fixAgent:{...live(),enabled:true,delivery:'script-apply'}});
+  assert.equal(live().enabled,true);
+  // The JSON store cannot be written: the disable fails and the live switch stays as last saved.
+  persistFails=true;
+  assert.throws(()=>app.harbor.patchHarborSettings({fixAgent:{...live(),enabled:false}}),e=>e.status===500);
+  assert.equal(live().enabled,true,'a failed persist leaves the live settings unchanged');
+});
+
+test('a loop stop whose first attempt failed is retried when GitHub redelivers it (the claim is the only guard)',async t=>{
+  let reads=0;
+  const app=await appFixture({reviewLocal:false,fixAgent:{...FIX_ON}},
+    {api:{fetchPullHeadRef:async()=>{reads++;throw new Error('GitHub API timeout');}}});
+  t.after(()=>app.close());
   const at='2026-01-20T00:00:00Z';
-  const stop={...comment(),sender:{login:'alice'},comment:{id:77,body:'/review-loop stop',created_at:at,updated_at:at,user:{login:'alice'}}};
+  const stop=loopStop(77,at);
   const first=await deliver(app,'issue_comment',stop,'stop-1');
   assert.equal(first.status,202);
   await eventually(()=>reads===1,'the stop never ran');
   // The first attempt failed and released its claim; the same delivery id (GitHub's redelivery)
   // must run the stop again, even though the first delivery left a 202 event behind.
   await eventually(async()=>{await deliver(app,'issue_comment',stop,'stop-1');return reads>=2;},'the redelivered stop was not retried');
+});
+
+// Live aicc #515 (job-mujhi85p-3002): the reviewer answered empty findings with no investigated_safe
+// (an Instant-tier skip) and the job ended skipped, but its ops comment stayed "running / Waiting for
+// provider response": that skip path never updated it, so a lane tool read the job as in progress for
+// hours. Every terminal status now reaches the ops comment.
+test('a job that ends skipped on a reply with no valid review JSON leaves its ops comment terminal, never running',async t=>{
+  const app=await fixture(t,{pull:{draft:false}});
+  const out=await deliver(app,'issue_comment',comment());
+  const job=await settled(app,out.jobId);
+  assert.equal(job.status,'awaiting_chat');
+  const bridgePost=body=>fetch(app.origin+'/api/bridge',{method:'POST',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},body:JSON.stringify(body)}).then(r=>r.json());
+  const lease=(await bridgePost({action:'take',clientId:'fixture'})).job;
+  const raw=JSON.stringify({findings:[],merge_recommendation:'COMMENT'});
+  const res=await fetch(app.origin+'/api/bridge',{method:'POST',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},
+    body:JSON.stringify({action:'complete',jobId:job.id,leaseId:lease.leaseId,raw,results:[{provider:'chatgpt',raw}]})});
+  const reply=await res.json();
+  await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===job.id)?.status==='skipped',`job not skipped: ${res.status} ${JSON.stringify(reply)} ${app.harbor.getHarbor().jobs.find(j=>j.id===job.id)?.status}`);
+  await eventually(()=>{const last=app.ops.filter(b=>b.includes(job.id)).at(-1)||'';return /Status:\*\* skipped/.test(last);},
+    `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
+  const last=app.ops.filter(b=>b.includes(job.id)).at(-1);
+  assert.match(last,/Instant-tier skip/,'names why nothing was posted');
+});
+
+test('an operator (lane stop) cancel leaves the ops comment terminal, never running',async t=>{
+  const app=await fixture(t,{pull:{draft:false}});
+  const out=await deliver(app,'issue_comment',comment());
+  const job=await settled(app,out.jobId);
+  assert.equal(job.status,'awaiting_chat');
+  await eventually(()=>app.ops.some(b=>b.includes(job.id)),'no ops comment yet');
+  app.harbor.cancelHarborJob(job.id);
+  await eventually(()=>/Status:\*\* skipped/.test(app.ops.filter(b=>b.includes(job.id)).at(-1)||''),
+    `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
+  assert.match(app.ops.filter(b=>b.includes(job.id)).at(-1),/Cancelled: cancelled by operator/);
+});
+
+// Live aicc #539 (job-mujw6woi-571): the job ended skipped 85 min after it started; the watcher wrote
+// "skipped" with the installation token it took at the start (GitHub expires them after 1 h), the write
+// failed silently, and because the phase was already recorded as terminal the fallback never wrote it:
+// the comment stayed "running" and lane_loop waited 2 h. A failed write retries with a fresh token, and a
+// phase counts as written only once GitHub took it.
+test('an ops write whose token expired retries with a fresh token; the terminal status still lands',async t=>{
+  let tokens=0;
+  const app=await fixture(t,{pull:{draft:false},installationToken:()=>`token-${++tokens}`,
+    beforeOpsUpdate:async token=>{if(token==='token-1'&&expired)throw Object.assign(new Error('Bad credentials'),{status:401});}});
+  let expired=false;
+  const out=await deliver(app,'issue_comment',comment());
+  const job=await settled(app,out.jobId);
+  await eventually(()=>app.ops.some(b=>b.includes(job.id)),'no ops comment yet');
+  expired=true; // the job's first token has expired by the time it ends
+  const bridgePost=body=>fetch(app.origin+'/api/bridge',{method:'POST',headers:{'content-type':'application/json','x-ashlar-bridge-token':'fixture-token'},body:JSON.stringify(body)}).then(r=>r.json());
+  const lease=(await bridgePost({action:'take',clientId:'fixture'})).job;
+  await bridgePost({action:'failure',jobId:job.id,leaseId:lease.leaseId,provider:'chatgpt',error:'tab_closed: review tab closed before a result (stalled)'});
+  await eventually(()=>app.harbor.getHarbor().jobs.find(j=>j.id===job.id)?.status==='skipped','job not skipped');
+  await eventually(()=>/Status:\*\* skipped/.test(app.ops.filter(b=>b.includes(job.id)).at(-1)||''),
+    `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
 });

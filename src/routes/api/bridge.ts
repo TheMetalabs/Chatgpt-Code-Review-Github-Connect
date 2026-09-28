@@ -14,19 +14,27 @@ import {
   bridgeJobState,
   bridgeTokenOk,
   claimBridgeJob,
+  completeBridgeFix,
   completeBridgeJob,
   failBridgeProvider,
+  fixOperationRefused,
   getBridgePublic,
   getBridgeStatus,
+  isBridgeFixId,
   promptForJob,
   refreshBridgeClaim,
+  FIX_PROTOCOL,
   releaseBridgeJob,
   rotateBridgeToken,
   takeNextBridgeJob,
 } from "@/lib/bridge.server";
 
-function promptsForClient<T extends {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>}>(value: T | null, protocol: unknown): T | null {
+/** A review prompt in the worker's attachment protocol (bridgePromptText). A FIX prompt is
+ * delivered verbatim, byte-exact, whatever the protocol: it inlines whole source files, so an
+ * envelope-looking line in a file is content, never an attachment to convert or reject. */
+function promptsForClient<T extends {prompt: string; prompts?: Partial<Record<ReviewProvider, string>>; kind?: string}>(value: T | null, protocol: unknown, fix = value?.kind === "fix"): T | null {
   if (!value) return null;
+  if (fix) return value;
   return {...value, prompt: bridgePromptText(value.prompt, protocol),
     ...(value.prompts ? {prompts: Object.fromEntries(Object.entries(value.prompts).map(([provider, text]) => [provider, bridgePromptText(text || "", protocol)]))} : {})};
 }
@@ -68,8 +76,12 @@ export const Route = createFileRoute("/api/bridge")({
         }
         bridgeHeartbeat();
         const jobId = new URL(request.url).searchParams.get("jobId");
+        // A fix item's prompt is served only to a worker that opted into fix items.
+        if (fixOperationRefused(jobId, new URL(request.url).searchParams.get("fixProtocol") === String(FIX_PROTOCOL) ? FIX_PROTOCOL : undefined)) {
+          return Response.json({ ok: false, code: "fix_protocol_required", error: `fix items need fixProtocol:${FIX_PROTOCOL}` }, { status: 409, headers });
+        }
         if (jobId) {
-          const prompt = promptsForClient(promptForJob(jobId), new URL(request.url).searchParams.get("attachmentProtocol") === "2" ? 2 : 1);
+          const prompt = promptsForClient(promptForJob(jobId), new URL(request.url).searchParams.get("attachmentProtocol") === "2" ? 2 : 1, isBridgeFixId(jobId));
           if (!prompt) return Response.json({ ok: false, error: "no prompt" }, { status: 404, headers });
           return Response.json({ ok: true, ...prompt }, { headers });
         }
@@ -84,7 +96,9 @@ export const Route = createFileRoute("/api/bridge")({
           workerStatus?: unknown;
           extensionVersion?: unknown;
           attachmentProtocol?: number;
+          fixProtocol?: number;
           repairProtocol?: number;
+          salvaged?: boolean;
           captureProtocol?: number;
           captureId?: string; repairId?: string; responseId?: string; sourceHash?: string;
           source?: {captureId?: unknown; text?: unknown; totalChars?: unknown; truncated?: unknown; responseId?: unknown; completed?: unknown; stable?: unknown};
@@ -114,6 +128,11 @@ export const Route = createFileRoute("/api/bridge")({
         // Owner liveness from the authenticated request itself, before any action patches the job or
         // writes history (either can fail without the owner having gone anywhere).
         noteBridgeRequest(body);
+        // One gate for every operation on a fix item (see fixOperationRefused): an un-opted worker
+        // never claims, pings, reads, reports on, releases, fails or completes one.
+        if (fixOperationRefused(body.jobId, body.fixProtocol)) {
+          return Response.json({ ok: false, code: "fix_protocol_required", error: `fix items need fixProtocol:${FIX_PROTOCOL}` }, { status: 409, headers });
+        }
         if (body.action === "rotate") {
           return Response.json({ ok: true, token: rotateBridgeToken().token, bridge: getBridgePublic() }, { headers });
         }
@@ -171,10 +190,10 @@ export const Route = createFileRoute("/api/bridge")({
         }
         if (body.action === "recover") {
           return Response.json({ok:true,bridge:getBridgePublic(),job:promptsForClient(
-            recoverBridgeJob(String(body.clientId || ""),body.bindings),body.attachmentProtocol)}, {headers});
+            recoverBridgeJob(String(body.clientId || ""),body.bindings,{ fixes: body.fixProtocol === FIX_PROTOCOL }),body.attachmentProtocol)}, {headers});
         }
         if (body.action === "take") {
-          return Response.json({ ok: true, bridge: getBridgePublic(), job: promptsForClient(takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : []), body.attachmentProtocol) }, { headers });
+          return Response.json({ ok: true, bridge: getBridgePublic(), job: promptsForClient(takeNextBridgeJob(String(body.clientId ?? ""), Array.isArray(body.excludeJobIds) ? body.excludeJobIds.filter(id => typeof id === "string") : [], { fixes: body.fixProtocol === FIX_PROTOCOL }), body.attachmentProtocol) }, { headers });
         }
         if (body.action === "claim" && body.jobId) {
           const out = claimBridgeJob(body.jobId, String(body.clientId ?? ""));
@@ -198,11 +217,22 @@ export const Route = createFileRoute("/api/bridge")({
                 .filter((r) => r.provider === "chatgpt" || r.provider === "grok")
                 .map((r) => ({ provider: r.provider as "chatgpt" | "grok", raw: String(r.raw ?? ""), originalText: typeof r.originalText === "string" ? r.originalText : undefined }))
             : undefined;
-          if (body.repairProtocol === 1) {
+          // A review-loop fix answer is plain TEXT for the runtime's deterministic parser. Branch
+          // BEFORE any review validation: the 422 format gate, review-JSON extraction and salvage
+          // would reject or rewrite it.
+          if (isBridgeFixId(body.jobId)) {
+            const out = completeBridgeFix(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
+            if (!out.ok) return Response.json(out, { status: out.code === "lease_conflict" ? 409 : 400, headers });
+            return Response.json({ ok: true }, { headers });
+          }
+          // A salvaged leg (extension settleStalledJob: its repair ended needs_attention/interrupted/
+          // disabled/superseded) is the verbatim original as raw_review: no repair will ever run for it,
+          // so demanding one is a livelock (live aicc #457: 422 every 2.5 s for 3 h, never stale).
+          if (body.repairProtocol === 1 && body.salvaged !== true) {
             const errors = bridgeFormatErrors(body.jobId, String(body.raw ?? ""), legs, body.leaseId, body.captureProtocol === 1);
             if (errors.length) return Response.json({ok:false,code:"json_repair_required",error:"completed response requires format repair",errors},{status:422,headers});
           }
-          const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId);
+          const out = await completeBridgeJob(body.jobId, String(body.raw ?? ""), legs, body.leaseId, body.salvaged === true);
           if (!out.ok) return Response.json(out, { status: "code" in out && out.code === "history_unavailable" ? 503 : "code" in out && out.code === "lease_conflict" ? 409 : 400, headers });
           return Response.json({ ok: true }, { headers });
         }

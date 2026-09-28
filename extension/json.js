@@ -40,42 +40,286 @@ function lastReviewJson(text) {
   return null;
 }
 
+/** ChatGPT's citation marker (live aicc #457 job-muir6f31-729): the model wrote
+ * `:chatgpt-content-reference{index="0"}` inside a review JSON string and its bare quotes broke the
+ * JSON (src/lib/extract-chat-json.ts CHAT_CITATION_MARKER). A function: content scripts are re-injected. */
+function chatCitationMarker() {
+  return /[ \t]*:chatgpt-content-reference\{[^{}\n]*\}/g;
+}
+
 function extractChatJson(text) {
   const s = String(text || "");
   if (!s.trim()) return null;
-  // The last complete object wins, not an older fenced example.
-  return lastReviewJson(s);
+  // The last complete object wins, not an older fenced example. Only a text that yields nothing as
+  // written is read again without the chat's citation markers.
+  const plain = lastReviewJson(s);
+  if (plain || s.search(chatCitationMarker()) < 0) return plain;
+  return lastReviewJson(s.replace(chatCitationMarker(), ""));
 }
 
-/** Read all rendered blocks from the current assistant message. A detached clone's
- * textContent includes hidden duplicate text and the first markdown may be prose.
- */
-function cleanTurnText(el) {
-  if (!el) return "";
+/** Whether `node` itself is hidden from the reader: the ONE visibility rule every harvest shares
+ * (review corpus, fix code blocks): hidden, aria-hidden, template, display:none,
+ * visibility:hidden, opacity 0. */
+function hiddenNode(node) {
+  if (node.matches?.("[hidden], [aria-hidden='true'], template")) return true;
+  const style = globalThis.window?.getComputedStyle ? window.getComputedStyle(node) : null;
+  return Boolean(style && (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0));
+}
+
+/** The text a reader sees in `el`: every hidden descendant, control and reference marker is
+ * dropped (a detached clone's textContent includes hidden duplicate text). */
+function visibleText(el) {
   const walk = node => {
     if (node.nodeType === 3) return node.nodeValue || "";
     if (node.nodeType !== 1) return "";
-    if (node.matches("button, [role='button'], svg, script, style, template, [hidden], [aria-hidden='true'], [data-content-reference-start]")) return "";
-    const style = window.getComputedStyle(node);
-    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return "";
+    // The unit DOM's sr-only role heading ("ChatGPT said:") inside the assistant unit is not the answer.
+    if (node.matches("button, [role='button'], svg, script, style, [data-content-reference-start], :is(h1, h2, h3, h4, h5, h6)[data-conversation-role]") || hiddenNode(node)) return "";
     if (node.tagName === "BR") return "\n";
     const text = [...node.childNodes].map(walk).join("");
     return /^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE|TR)$/.test(node.tagName) ? `\n${text}\n` : text;
   };
-  return walk(el).trim();
+  return el ? walk(el).trim() : "";
+}
+
+/** Read all rendered blocks from the current assistant message; the first markdown may be prose. */
+function cleanTurnText(el) {
+  return visibleText(el);
 }
 
 function assistantCorpus(root = currentAssistantRoot()) {
   if (!root) return [];
-  const turns = root.matches('[data-message-author-role="assistant"]')
-    ? [root]
-    : [...root.querySelectorAll('[data-message-author-role="assistant"]')];
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
   const chunks = [];
   for (const turn of turns) {
     const text = cleanTurnText(turn);
     if (text) chunks.push(text);
   }
   return chunks;
+}
+
+/** The fenced code blocks of the assistant turn(s) as LITERAL text. A fix answer carries file
+ * content, and rendered markdown rewrites it (backslash escapes, emphasis, links) while it still
+ * parses as JSON, so a fix is read from code blocks only. `stats` (optional) receives what the
+ * harvest saw: the block count, their total length and whether any block looked collapsed. */
+function assistantCodeBlocks(root = currentAssistantRoot(), stats) {
+  if (!root) return [];
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
+  const blocks = [];
+  let collapsed = false;
+  for (const turn of turns) {
+    for (const pre of codeBlockEls(turn)) {
+      if (!renderedIn(pre, turn)) continue; // a hidden/stale block the renderer kept is not the answer
+      // Only a code element that is itself visible is the answer (a renderer can keep a stale,
+      // hidden <code> beside the live one); a block whose code is all hidden yields nothing. Its
+      // text is read with the same visibility rule as a review's corpus (visibleText).
+      const codes = [...pre.querySelectorAll("code")];
+      const visible = codes.length ? codes.filter(code => renderedIn(code, turn) && !codes.some(outer => outer !== code && outer.contains(code))) : pre.tagName === "PRE" ? [pre] : [];
+      // A collapsed block (live aicc #455: a long fix answer never parsed) shows only part of its
+      // code; its visible code element's full text is the answer then, hidden tail included.
+      const folded = codeBlockCollapsed(pre, turn);
+      collapsed ||= folded;
+      for (const source of visible) {
+        const text = folded ? fullCodeText(source) : visibleText(source);
+        if (text) blocks.push(text);
+      }
+    }
+  }
+  if (stats) Object.assign(stats, {blocks: blocks.length, totalChars: blocks.reduce((n, b) => n + b.length, 0), collapsed});
+  return blocks;
+}
+
+/** A turn's code blocks in order: every <pre>, and every code-block container that has none (live
+ * aicc #455: ChatGPT renders a fenced block as the copy container around a block <code>, no <pre>). */
+function codeBlockEls(turn) {
+  return [...turn.querySelectorAll("pre, [data-markdown-copy='code-block']")].filter(el => el.tagName === "PRE" || !el.querySelector("pre"));
+}
+
+/** All the code text in `el`, hidden parts included (a collapsed block hides its tail), with the
+ * line breaks visibleText gives block elements; controls and graphics are still not code. */
+function fullCodeText(el) {
+  const walk = node => {
+    if (node.nodeType === 3) return node.nodeValue || "";
+    if (node.nodeType !== 1 || node.matches("button, [role='button'], svg, script, style")) return "";
+    if (node.tagName === "BR") return "\n";
+    const text = [...node.childNodes].map(walk).join("");
+    return /^(P|DIV|PRE|LI)$/.test(node.tagName) ? `\n${text}\n` : text;
+  };
+  return el ? walk(el).trim() : "";
+}
+
+/** A code block's frame: the renderer's code-block container around `pre` inside `turn`, else `pre`. */
+function codeBlockBox(pre, turn) {
+  const box = pre.closest?.("[data-markdown-copy='code-block'], .CodeBlock, [data-testid='code-block']");
+  return box && turn.contains(box) ? box : pre;
+}
+
+/** The expander controls of a code block that shows only part of its code ("더 보기", "Show more",
+ * "Expand", or any control with aria-expanded="false"); never its copy, wrap or scroll controls. */
+function codeBlockExpanders(pre, turn) {
+  const expand = /더\s*보기|펼치기|전체\s*보기|모두\s*보기|show\s*(more|all|full)|expand|see\s*more|view\s*(more|all)/i;
+  return [...codeBlockBox(pre, turn).querySelectorAll("button, [role='button']")].filter(control => {
+    const label = `${control.getAttribute("aria-label") || ""} ${control.textContent || ""}`;
+    if (/copy|복사|wrap|줄\s*바꿈|scroll|스크롤/i.test(label)) return false;
+    return control.getAttribute("aria-expanded") === "false" || expand.test(label);
+  });
+}
+
+/** Whether a code block shows only part of its code: an expander, or code clipped by a container
+ * that hides its overflow (a scrolling container shows all of it on scroll and is not collapsed). */
+function codeBlockCollapsed(pre, turn) {
+  if (codeBlockExpanders(pre, turn).length) return true;
+  const box = codeBlockBox(pre, turn);
+  const code = pre.querySelector("code") || pre;
+  for (let node = code; node && node !== box.parentElement; node = node.parentElement) {
+    const style = globalThis.window?.getComputedStyle ? window.getComputedStyle(node) : null;
+    if (style && /hidden|clip/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 1) return true;
+  }
+  return false;
+}
+
+/** Open every collapsed code block of a fix answer once (its expander clicked), so the next
+ * observation reads the whole code. A control already clicked is never clicked again (a second
+ * click would fold it back). Returns how many were clicked. */
+function expandCollapsedCodeBlocks(root) {
+  if (!root?.matches || !root.querySelectorAll) return 0;
+  const clicked = globalThis.__ashlarExpandedCode ||= new WeakSet();
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
+  let count = 0;
+  for (const turn of turns) {
+    for (const pre of codeBlockEls(turn)) {
+      for (const control of codeBlockExpanders(pre, turn)) {
+        if (clicked.has(control)) continue;
+        clicked.add(control);
+        try { control.click(); count += 1; } catch { /* a control that cannot be clicked keeps the full-text read */ }
+      }
+    }
+  }
+  return count;
+}
+
+/** The line between two code blocks of one fix answer: the server joins the blocks back in order
+ * when the JSON spans them (src/lib/fix-apply.ts FIX_BLOCK_BREAK). A function: content scripts are
+ * re-injected. */
+function fixBlockBreak() {
+  return "<<<ASHLAR_CODE_BLOCK_BREAK>>>";
+}
+
+/** Diagnostic: one fix harvest's shape, in chrome.storage.local "fixHarvestProbes" (last 10). Never
+ * content: counts, lengths and flags only. Never affects the run. */
+function saveFixHarvestProbe(record) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    globalThis.__ashlarFixHarvestProbeWrites = (globalThis.__ashlarFixHarvestProbeWrites || Promise.resolve()).then(async () => {
+      const stored = (await local.get(["fixHarvestProbes"]))?.fixHarvestProbes;
+      await local.set({fixHarvestProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-10)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
+/** Whether `el` and every ancestor up to `root` is visible (hiddenNode). */
+function renderedIn(el, root) {
+  for (let node = el; node && node !== root.parentElement; node = node.parentElement) {
+    if (hiddenNode(node)) return false;
+  }
+  return true;
+}
+
+/** The first line of a fix answer delivered WITHOUT a fenced block (src/lib/fix-apply.ts
+ * FIX_UNFENCED_MARK), then one JSON object of flags; the answer's visible text follows. A function:
+ * content scripts are re-injected. */
+function fixUnfencedMark() {
+  return "<<<ASHLAR_UNFENCED_ANSWER>>>";
+}
+
+/** The most visible text an unfenced fix answer delivers (UTF-8 bytes). */
+function fixUnfencedMaxBytes() {
+  return 256 * 1024;
+}
+
+/** `text` cut to at most `max` UTF-8 bytes, on a character boundary. */
+function clipUtf8(text, max) {
+  let bytes = 0, at = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (bytes > max) return text.slice(0, at);
+    at += ch.length;
+  }
+  return text;
+}
+
+/** What a fix answer holds besides text (live aicc #439: an answer with no fenced block): links or
+ * buttons to a file (sandbox:/files links, a download attribute, a 다운로드/Download control), a
+ * canvas (textdoc), and inline formatting outside code (rendered Markdown, which may have rewritten
+ * JSON text). Counts only, never content. */
+function fixAnswerShape(root) {
+  const shape = {fileLinks: 0, canvas: false, formatted: 0};
+  if (!root?.matches || !root.querySelectorAll) return shape;
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
+  for (const turn of turns) {
+    for (const a of turn.querySelectorAll("a")) {
+      const href = a.getAttribute("href") || "";
+      if (a.hasAttribute("download") || /^sandbox:/i.test(href) || /files\.oaiusercontent|\/backend-api\/(files|estuary)|\/mnt\/data\//i.test(href)) shape.fileLinks += 1;
+    }
+    for (const b of turn.querySelectorAll("button, [role='button']")) {
+      if (/다운로드|download/i.test(`${b.textContent || ""} ${b.getAttribute("aria-label") || ""}`)) shape.fileLinks += 1;
+    }
+    shape.canvas ||= Boolean(turn.querySelector("[id^='textdoc'], [data-testid*='canvas'], [data-testid*='textdoc']"));
+    shape.formatted += [...turn.querySelectorAll("em, strong, del, s, a, code")].filter(el => !el.closest("pre, [data-markdown-copy='code-block']")).length;
+  }
+  return shape;
+}
+
+/** The assistant turn's HTML for diagnosis, without scripts, styles, icons, inline handlers and
+ * data: sources, cut to 200 KB. */
+function strippedAnswerHtml(root) {
+  const turns = root.matches(turnSelector("assistant")) ? [root] : assistantTurnEls(root);
+  const html = turns.map(turn => {
+    const clone = turn.cloneNode(true);
+    for (const node of clone.querySelectorAll("script, style, svg, noscript, template")) node.remove();
+    for (const el of [clone, ...clone.querySelectorAll("*")]) {
+      for (const attr of [...el.attributes]) {
+        if (/^on|^style$/i.test(attr.name) || (attr.name === "src" && /^data:/i.test(attr.value))) el.removeAttribute(attr.name);
+      }
+    }
+    return clone.outerHTML;
+  }).join("\n");
+  return clipUtf8(html, 200 * 1024);
+}
+
+/** Diagnostic: the collected fix answer's turn HTML, in chrome.storage.local "fixAnswerHtml" (last 3);
+ * "fixAnswerHtmlOff" true turns it off. Never affects the run. */
+function saveFixAnswerHtml(root, meta) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local || !root?.matches || !root.querySelectorAll) return;
+    const html = strippedAnswerHtml(root);
+    globalThis.__ashlarFixHarvestProbeWrites = (globalThis.__ashlarFixHarvestProbeWrites || Promise.resolve()).then(async () => {
+      const got = await local.get(["fixAnswerHtml", "fixAnswerHtmlOff"]);
+      if (got?.fixAnswerHtmlOff === true) return;
+      const stored = Array.isArray(got?.fixAnswerHtml) ? got.fixAnswerHtml : [];
+      await local.set({fixAnswerHtml: [...stored, {...meta, html}].slice(-3)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
+/** A bound response's canonical answer text, what its collector harvested and what every later
+ * completion proof must match: a review's full rendered corpus, a fix's fenced code only. A fix
+ * answer with no fenced block (live aicc #439) delivers its visible text instead, under the
+ * unfenced mark and its flags, bounded to fixUnfencedMaxBytes: the server parses a JSON object in
+ * it or reports what the answer was (a file, ATTACHMENT_MISMATCH), never a placeholder. */
+function boundAnswerText(kind, root, stats) {
+  const prose = assistantCorpus(root).join("\n\n");
+  if (kind !== "fix" || !prose.trim()) return prose;
+  const blocks = assistantCodeBlocks(root, stats);
+  const shape = fixAnswerShape(root);
+  if (stats) Object.assign(stats, {textChars: prose.length, fileLinks: shape.fileLinks, canvas: shape.canvas, unfenced: !blocks.length});
+  // Blocks in order, split by a line no JSON contains: one JSON the page rendered over two blocks
+  // is joined back by the server's parser.
+  if (blocks.length) return blocks.join(`\n${fixBlockBreak()}\n`);
+  const text = clipUtf8(prose, fixUnfencedMaxBytes());
+  return `${fixUnfencedMark()} ${JSON.stringify({unfenced: true, ...shape, truncated: text.length < prose.length})}\n${text}`;
 }
 
 function harvestJson(opts) {
@@ -116,23 +360,32 @@ function reviewProgress() {
  * Older pages without IDs require both the recorded position and matching text.
  */
 function boundReviewResponse(submission) {
-  const messages = [...document.querySelectorAll('[data-message-author-role]')]
-    .filter(node => ["user", "assistant"].includes(node.getAttribute("data-message-author-role")));
-  const users = messages.filter(node => node.getAttribute("data-message-author-role") === "user");
+  const messages = conversationTurnEls();
+  const users = messages.filter(node => turnRole(node) === "user");
   let user;
   if (submission.messageId) {
-    const matches = users.filter(node => node.getAttribute("data-message-id") === submission.messageId);
+    const matches = users.filter(node => turnMessageId(node) === submission.messageId);
     if (matches.length === 1) user = matches[0];
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
     user = users[submission.submittedUsers - 1];
   }
-  if (!user || !submission.expected || !normalizePrompt(typeof messagePromptText === "function" ? messagePromptText(user) : user.textContent || user.innerText).includes(submission.expected)) {
+  // The containment rule the send was confirmed by (composer.js reviewTurnHolds): a rendered turn
+  // restyles Markdown in the prompt (`code` spans shown as <code>), and a stricter rule here left a
+  // confirmed send never bound (live 1.1.47: waiting_for_response for 100+ min, aicc #439).
+  const shown = !user ? "" : typeof messagePromptText === "function" ? messagePromptText(user) : user.textContent || user.innerText;
+  if (!user || !submission.expected || !(typeof reviewTurnHolds === "function" ? reviewTurnHolds(shown, submission.expected) : normalizePrompt(shown).includes(submission.expected))) {
     return {root: null, followup: false, identified: false};
   }
   // Some renderers assign message IDs after mounting the text. Pin that identity
-  // when it appears rather than staying on the weaker positional fallback.
-  if (!submission.messageId && user.getAttribute("data-message-id")) {
-    submission.messageId = user.getAttribute("data-message-id");
+  // when it appears rather than staying on the weaker positional fallback. A journal
+  // that carries its conversation (a fix's or a review's, recorded at send or pinned
+  // by a new-chat review) records it only while the page still shows that
+  // conversation (samePage: the query is not the page): after an in-page move the
+  // turn at the recorded position proves nothing about the send. A journal with no
+  // conversation yet (a review on a new chat before its pin): unchanged.
+  if (!submission.messageId && turnMessageId(user) &&
+      (!submission.conversation || fixConversationHolds(submission))) {
+    submission.messageId = turnMessageId(user);
     const state = globalThis.__ashlarRunnerState;
     if (state?.confirmedSubmission?.record === submission) {
       state.submissionPersistencePending = true;
@@ -140,16 +393,25 @@ function boundReviewResponse(submission) {
     }
   }
   const start = messages.indexOf(user) + 1;
-  const next = messages.findIndex((node, index) => index >= start && node.getAttribute("data-message-author-role") === "user");
+  const next = messages.findIndex((node, index) => index >= start && turnRole(node) === "user");
   const replies = messages.slice(start, next < 0 ? messages.length : next);
   const message = replies.at(-1);
   if (!message) return {root: null, followup: next >= 0, identified: true};
+  return {root: responseRoot(message, replies, user), followup: next >= 0, identified: true, responseId: turnMessageId(message), message};
+}
+
+/** The root a bound response is observed in. Completion controls may be siblings of the assistant
+ * node. A surrounding root is safe only when it contains no user or unrelated response messages; the
+ * unit DOM's turn container (its action row sits there, outside every unit) also holds the bound
+ * user message `user` itself, and nothing else. */
+function responseRoot(message, replies, user) {
+  if (unitTurn(message)) {
+    const turn = message.closest("[data-content-search-turn-key]");
+    return turn && [...turn.querySelectorAll("[data-content-search-unit-key]")].every(node => node === user || replies.includes(node)) ? turn : message;
+  }
   const container = message.closest('[data-testid^="conversation-turn-"], article, section');
-  // Completion controls may be siblings of the assistant node. A surrounding root
-  // is safe only when it contains no user or unrelated response messages.
-  const root = container && [...container.querySelectorAll('[data-message-author-role]')].every(node => replies.includes(node))
+  return container && [...container.querySelectorAll(turnNodeSelector())].every(node => replies.includes(node))
     ? container : message;
-  return {root, followup: next >= 0, identified: true, responseId: message.getAttribute("data-message-id") || ""};
 }
 
 /** Each call is a fresh observation; the tracker also runs after native JSON
@@ -188,7 +450,7 @@ function currentRepairSource() {
   if (submission?.phase !== "sent") return unavailable();
   const bound = boundReviewResponse(submission);
   if (!bound.identified || !bound.root || !bound.responseId) return unavailable();
-  if (bound.followup) state.tabRepurposed = true;
+  if (bound.followup) { state.tabRepurposed = true; state.takeoverCause ||= "user_turn"; }
   const stop = bound.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
   const done = !stop && !responseStreaming(bound.root) && replyDoneVisible(bound.root);
   const text = done ? assistantCorpus(bound.root).join("\n\n") : "";
@@ -203,51 +465,19 @@ function currentRepairSource() {
   const tracker = state.running && !tracksSource ? (state.repairProbeTracker ||= {}) : state;
   if (!state.running || !tracksSource) trackCompletedSource(tracker, bound, done, text);
   if (tracker.completedSource?.text !== text || tracker.completedSource.responseId !== bound.responseId) return null;
+  // The regeneration pager as it was when this completed source was first taken: an answer secured by
+  // a capture or a repair (ashlar-capture-accepted / ashlar-repair-accepted read it here) never
+  // settled in the native collector, which records it otherwise (settleStableAnswer). Kept once.
+  if (typeof state.collectedVariant !== "string") state.collectedVariant = responseVariant(bound.root);
   return {text, totalChars:text.length, truncated:false, responseId:bound.responseId, context:reviewPageContext(), completed:true, stable:true};
 }
 
-/** Repair acceptance does not transfer ownership of a later user conversation.
- * Preserve the context validated at receipt even across a suspended collector,
- * its completion microtask, and duplicate acknowledgement delivery.
- */
-function preserveRepairContext(state) {
-  let bound;
-  try {
-    const submission = state.confirmedSubmission?.record || savedSubmission();
-    if (submission?.phase === "sent") bound = boundReviewResponse(submission);
-  } catch { /* Unknown identity preserves the tab, not permission to close it. */ }
-  const receipt = state.repairReceipt;
-  const context = receipt?.context || state.repairedContext;
-  const responseId = receipt?.responseId || state.repairedResponseId;
-  if (!state.tabRepurposed && (!context || context !== reviewPageContext() ||
-      !bound?.identified || !bound.root || bound.followup || bound.responseId !== responseId ||
-      (receipt && assistantCorpus(bound.root).join("\n\n") !== receipt.text))) {
-    state.tabRepurposed = true;
-    recordReviewStep("context_changed");
-  }
-  return bound;
-}
-
-/** A source archive receipt or native completion proof pins the original
- * response separately from mutable collector fields. Capture is NOT parsed JSON.
+/** A source archive receipt pins the original response separately from mutable collector
+ * fields. Capture is NOT parsed JSON.
  */
 function sourceReceiptFor(state) {
   const value = state?.captureReceipt;
   return value && value.jobId === state.jobId && value.runId === state.runId && value.provider === state.provider ? value : null;
-}
-function preserveSourceContext(state, receipt) {
-  let bound;
-  try {
-    const submission = state.confirmedSubmission?.record || savedSubmission();
-    if (submission?.phase === "sent") bound = boundReviewResponse(submission);
-  } catch { /* Unknown ownership never authorizes closure. */ }
-  if (!state.tabRepurposed && (!bound?.identified || !bound.root || bound.followup ||
-      bound.responseId !== receipt.responseId || receipt.context !== reviewPageContext() ||
-      assistantCorpus(bound.root).join("\n\n") !== receipt.text)) {
-    state.tabRepurposed = true;
-    recordReviewStep("context_changed");
-  }
-  return bound;
 }
 function nativeCleanupProof(state) {
   const proof = state.nativeCompletion;
@@ -265,34 +495,247 @@ function repairedCollectionResult(state) {
     ? receipt.result : null;
 }
 
+/** Unsent text in the chat composer ("" when none): a user draft is the user's, never Ashlar's. */
+function composerDraftText() {
+  const draft = typeof composer === "function" && globalThis.document ? composer() : null;
+  return (draft && (draft.value || draft.innerText || draft.textContent || "") || "").trim();
+}
+
+/** Files staged in the chat composer that are not this run's own attachments: a file the user added
+ * before typing is a draft too. Only BEFORE the send is confirmed can a chip be the run's own (by
+ * name: its journal's, or the ones fillComposer is uploading). A confirmed send took its attachments
+ * out of the composer with the sent turn, so afterwards every chip there is the user's, whatever its
+ * name: a file named like the run's old upload is the user's new one (Ashlar 4101062749). The chips
+ * are every chip the send barrier accepts (composer.js fileChips, shared with attachmentsReady:
+ * title-only chips included, Ashlar 4101623051, a control's tooltip title never), in the composer's
+ * own form, and a chip is the run's own when any name it gives matches, as the barrier reads it. A
+ * group that wraps the editor or the send control is the composer, not a file, and a named element
+ * inside a chip that names a file (its remove control's title) is part of that chip, not another
+ * file. */
+function composerStagedFiles(state, submission) {
+  const editor = typeof composer === "function" && globalThis.document ? composer() : null;
+  const form = editor?.closest?.("form");
+  if (!form) return [];
+  const own = new Set(submission?.phase === "sent" ? [] : [...(Array.isArray(submission?.attachments) ? submission.attachments : []),
+    ...(Array.isArray(state?.pendingAttachments) ? state.pendingAttachments : [])]);
+  const shown = chip => (typeof renderedControl === "function" ? renderedControl(chip) : !hiddenNode(chip));
+  // Names first, then the fold: only a chip that names a file takes in the elements inside it. An
+  // unnamed element (an empty or blank title or label) is no chip, so a wrapper like that never hides
+  // the named chip inside it (Ashlar, review of 5af999fd: the user's staged file closed with the tab).
+  const named = fileChips(form)
+    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button') && shown(chip))
+    .map(chip => ({chip, names: fileChipNames(chip).filter(name => name.trim())}))
+    .filter(({names}) => names.length);
+  return named.filter(({chip}) => !named.some(outer => outer.chip !== chip && outer.chip.contains(chip)))
+    // Own by the barrier's own name rule (composer.js chipShowsFile: any case, a truncated or
+    // extensionless name), so a chip the barrier waits on is never read as the user's draft.
+    .filter(({chip, names}) => ![...own].some(name => typeof chipShowsFile === "function" ? chipShowsFile(chip, name) : names.includes(name)))
+    .map(({names}) => names[0]);
+}
+
+/** The response's variant pager: what the provider shows on an answer once it was regenerated (a
+ * "2/2" counter between Previous/Next response buttons), "" when there is none. Read outside the
+ * message text (never the answer's own content). Compared with the pager at collection only. */
+function responseVariant(root) {
+  if (!root?.querySelectorAll) return "";
+  const buttons = [...root.querySelectorAll("button[aria-label], [role='button'][aria-label]")]
+    .some(el => /previous response|next response|이전 응답|다음 응답/i.test(el.getAttribute("aria-label") || ""));
+  const counters = [...root.querySelectorAll("div, span")]
+    .filter(el => !el.children.length && !el.closest(`${turnAreaSelector()}, pre, code`) && /^\d+\s*\/\s*\d+$/.test((el.textContent || "").trim()))
+    .map(el => el.textContent.replace(/\s+/g, ""));
+  return [...(buttons ? ["pager"] : []), ...counters].join(" ");
+}
+
+/** Whether this page completed Ashlar's answer for its run (collected, repaired or archived): what
+ * the provider generates in the tab after that is a new cycle, not Ashlar's run. */
+function answerCompleted(state) {
+  return Boolean(state.nativeCompletion || state.result?.ok === true || repairedCollectionResult(state) || sourceReceiptFor(state));
+}
+
+/** Whether the bound response is being generated again, or was, after this page completed Ashlar's
+ * answer: a Stop control or a streaming flag is back, or the variant pager differs from the one at
+ * collection. Neither Ashlar nor a provider redraw starts a generation cycle on a finished answer; the
+ * user's regenerate or retry does (Ashlar 4101062754). A redraw that only changes the answer's text,
+ * fences, labels or message id is not one. With no pager recorded at collection (collectedVariant is
+ * recorded by the native collector, and by the first completed source a capture or repair took), any
+ * pager on the bound response counts: a kept tab is recoverable, a closed one is not. `secured`: the
+ * worker's word that this run's answer was completed and taken, for a page that no longer remembers
+ * it (reloaded, or re-injected, after the answer was secured: a fresh runner). */
+function regeneratedAfterCompletion(state, submission, secured = false) {
+  if (!(secured || answerCompleted(state)) || typeof boundReviewResponse !== "function") return false;
+  const bound = boundReviewResponse(submission);
+  if (typeof stopButtonVisible === "function" && stopButtonVisible()) return true;
+  if (!bound.root) return false;
+  if (typeof responseStreaming === "function" && responseStreaming(bound.root)) return true;
+  return responseVariant(bound.root) !== (typeof state.collectedVariant === "string" ? state.collectedVariant : "");
+}
+
+/** One poll of the response bound to this run's sent prompt: the completion evidence both
+ * collectors (review JSON, fix code) decide on. A follow-up turn marks the tab repurposed. A
+ * later request's global Stop cannot end or block this older response: completion needs the
+ * positive controls on the original response itself. */
+async function pollBoundResponse() {
+  const runner = globalThis.__ashlarRunnerState;
+  const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
+  const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : undefined;
+  // The run's sent turn is on this page: its response can be observed here (the worker's proof that
+  // a page loaded again after a discard resumed the run, background.js discardedRunProven).
+  if (bound?.identified && runner) runner.boundObserved = true;
+  if (bound?.followup && runner && !runner.tabRepurposed) {
+    runner.tabRepurposed = true;
+    runner.takeoverCause = "user_turn";
+    recordReviewStep("context_changed");
+  }
+  const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
+  const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
+  const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
+  return {runner, bound, stop, streaming, done, submission};
+}
+
+/** A quota banner ends the run only while no answer is in hand and the banner can belong to it
+ * (no bound response yet, or the identified response with no follow-up). */
+function throwIfQuota(name, bound, answered) {
+  if ((!bound || (bound.identified && !bound.followup)) && quotaHit() && !answered) {
+    const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
+  }
+}
+
+/** Generating lease (#82 section 4.5, #87), review runs only. Once the bound answer is mounted and
+ * not yet complete, its response ID or Stop/streaming state must change, or its text grow past its
+ * longest length so far, within 15 min; otherwise the run fails as `stalled`. ChatGPT ends a
+ * reasoning run at ~29.5 min by mounting a turn that never gets completion controls (8/8 field
+ * runs). Healthy runs: answer mount to completion took at most 154 s in 367 runs. Growth, not any
+ * text change: a label re-rendered in place (a ticking timer) is not progress. No bound answer yet
+ * (thinking), a follow-up or a completed turn clears the lease: none of them has a deadline.
+ * Only observed time counts: a poll gap over 3 min is a host sleep or a frozen tab, whose first
+ * poll on resume still sees the pre-pause answer, so the lease moves forward by that gap. Chrome
+ * wakes a hidden tab's timers about once a minute, so throttled polls still count. */
+function expireGeneratingLease(lease, name, {bound, stop, streaming, done}, text) {
+  // Declared here, not at top level: content scripts are re-injected.
+  const GENERATING_LEASE_MS = 15 * 60_000, POLLING_SUSPENDED_MS = 3 * 60_000;
+  const now = Date.now(), gap = lease.polled ? now - lease.polled : 0;
+  lease.polled = now;
+  if (gap > POLLING_SUSPENDED_MS) lease.at += gap;
+  if (done || !bound?.root || bound.followup) { lease.state = ""; return; }
+  const state = JSON.stringify([bound.responseId || "", Boolean(stop), Boolean(streaming)]);
+  if (state !== lease.state) Object.assign(lease, {state, chars: text.length, at: now});
+  else if (text.length > lease.chars) Object.assign(lease, {chars: text.length, at: now});
+  else if (now - lease.at >= GENERATING_LEASE_MS) {
+    const error = new Error(`${name} answer unchanged for ${GENERATING_LEASE_MS / 60_000} min without completion controls`);
+    error.code = "stalled"; throw error;
+  }
+}
+
+/** Response wait (live 1.1.47: two reviews sat in waiting_for_response for 100-158 min), review runs
+ * only. Until an answer is bound to the sent prompt the generating lease has nothing to hold, so the
+ * wait itself is bounded: no bound answer 35 min after the send (ChatGPT ends a reasoning run at
+ * ~29.5 min, #87) fails the run as `response_timeout`, with the page saved for inspection
+ * (saveResponseWaitHtml). Measured from the journaled Send click (a reloaded page keeps it), else
+ * from the first poll. Once an answer is bound the wait is over for good: the lease governs it. Only
+ * observed time counts, as for the lease: a poll gap over 3 min (a host sleep, a frozen tab) moves
+ * the deadline by that gap. */
+function expireResponseWait(wait, name, {bound, submission}) {
+  // Declared here, not at top level: content scripts are re-injected.
+  const RESPONSE_WAIT_MS = 35 * 60_000, POLLING_SUSPENDED_MS = 3 * 60_000;
+  const now = Date.now(), gap = wait.polled ? now - wait.polled : 0;
+  wait.polled = now;
+  // Only a send journaled as sent has a prompt to bind an answer to (a page with no journal reads
+  // the page's latest answer, never bound: its wait has no deadline, as before).
+  if (wait.answered || submission?.phase !== "sent") return;
+  if (bound?.root) { wait.answered = true; return; }
+  if (!wait.at) {
+    const sent = submission?.attemptedAt;
+    wait.at = Number.isSafeInteger(sent) && sent <= now ? sent : now;
+  } else if (gap > POLLING_SUSPENDED_MS) wait.at += gap;
+  if (now - wait.at < RESPONSE_WAIT_MS) return;
+  saveResponseWaitHtml(bound);
+  const error = new Error(`${name} bound no answer to the sent prompt within ${RESPONSE_WAIT_MS / 60_000} min of the send`);
+  error.code = "response_timeout"; throw error;
+}
+
+/** Diagnostic: the page a response wait timed out on, in chrome.storage.local "responseWaitHtml"
+ * (last 3). The main area (or body) without scripts, styles, images and SVG paths, capped at 200 KB;
+ * the URL without its query; whether the sent turn was identified. Off with
+ * {responseWaitHtmlOff:true}. Never affects the run. */
+function saveResponseWaitHtml(bound) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local) return;
+    const state = globalThis.__ashlarRunnerState;
+    const area = document.querySelector("main") || document.body;
+    const clone = area.cloneNode(true);
+    for (const node of clone.querySelectorAll("script,style,noscript,img,svg path")) node.remove();
+    const record = {job: state?.jobId, run: state?.runId, at: Date.now(), identified: Boolean(bound?.identified),
+      url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: clone.outerHTML.slice(0, 200_000)};
+    globalThis.__ashlarResponseWaitWrites = (globalThis.__ashlarResponseWaitWrites || Promise.resolve()).then(async () => {
+      const flags = await local.get(["responseWaitHtmlOff", "responseWaitHtml"]);
+      if (flags?.responseWaitHtmlOff === true) return;
+      const list = Array.isArray(flags?.responseWaitHtml) ? flags.responseWaitHtml : [];
+      await local.set({responseWaitHtml: [...list, record].slice(-3)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
+/** Collection needs two identical stable observations (`key`). On the second one the runner
+ * records the answer and, for an identified response, its native completion proof. */
+function settleStableAnswer(stability, key, poll, {text, raw}) {
+  stability.hits = stability.stable === key ? stability.hits + 1 : 1;
+  stability.stable = key;
+  if (stability.hits < 2) return false;
+  const {runner, bound} = poll;
+  if (runner) {
+    runner.responseText = text;
+    // The regeneration pager as it was when the answer was collected (tabOwnership: "regenerated").
+    runner.collectedVariant = responseVariant(bound?.root);
+    if (bound?.identified && bound.responseId) runner.nativeCompletion = Object.freeze({
+      jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
+      responseId:bound.responseId,context:reviewPageContext(),text,raw,
+    });
+  }
+  recordReviewStep("response_collected");
+  return true;
+}
+
 async function waitUntilReviewOrQuota(name) {
+  // A review-loop fix item is harvested as plain text; everything below is review-only.
+  if (globalThis.__ashlarRunnerState?.kind === "fix") return waitUntilFixOrQuota(name);
   const owner = globalThis.__ashlarRunnerState;
   // Stamp the executing loop, never installReviewRunner's listener replacement.
   if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
-  let stable = "", hits = 0;
-  // No poll-count/elapsed-time failure. Controls can appear before response text is
-  // observable. A missing/invalid JSON slice is an observation, never an empty reply.
+  const stability = {stable: "", hits: 0};
+  const lease = {state: "", chars: 0, at: 0, polled: 0};
+  const wait = {at: 0, polled: 0, answered: false};
+  // No poll-count failure. Before the answer mounts the wait is bounded from the send
+  // (expireResponseWait); a mounted answer that stops progressing, by the lease
+  // (expireGeneratingLease). Controls can appear before response text is observable. A
+  // missing/invalid JSON slice is an observation, never an empty reply.
   for (;;) {
+    throwIfStopped();
     // The full original was secured, not accepted as a review. The worker owns
     // further formatting; no page loop or new model request is needed.
     if (sourceReceiptFor(globalThis.__ashlarRunnerState)) return null;
     if (globalThis.__ashlarRunnerState?.repairedResult) {
-      preserveRepairContext(globalThis.__ashlarRunnerState);
       recordReviewStep("repair_accepted");
       return globalThis.__ashlarRunnerState.repairedResult;
     }
-    const submission = typeof readSubmissionJournal === "function" ? await readSubmissionJournal() : null;
-    const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : undefined;
-    const runner = globalThis.__ashlarRunnerState;
-    if (bound?.followup && runner && !runner.tabRepurposed) {
-      runner.tabRepurposed = true;
-      recordReviewStep("context_changed");
+    const poll = await pollBoundResponse();
+    const {runner, bound, stop, streaming, done, submission} = poll;
+    // Like a fix run, a review is bound to a conversation: a later page in another conversation is
+    // the user's (tab release). A review sent on a conversation page recorded it at its send
+    // (composer.js submissionConfirmed). A review sent on a new chat (namesNoConversation: ChatGPT's
+    // "/", Grok's home) had none to record: the provider moves that URL to the conversation it
+    // assigns while it answers, which is not the user's doing (#82). Only a move this page saw
+    // happen while the run was in flight is pinned (newChatPin): its exact sent turn shown on the
+    // new chat after the send (or its Send clicked there), then on a conversation page before the
+    // answer completed. A conversation URL first seen with the answer complete, or by a collector
+    // that never saw the new chat after the send (a resumed or reloaded page), is not a URL the
+    // send produced (the user may have moved in-page while the old DOM was still rendered, Ashlar
+    // 4101062732): no pin, and the release verdict keeps the tab. On the new chat itself it pins
+    // once its answer is complete (the page it was collected on).
+    if (bound?.identified && !runner?.tabRepurposed && !submission.conversation &&
+        journaledTurnIntegrity(submission, userTurnEls()) === "exact") {
+      if (newChatPin(runner, done, Boolean(bound.root))) pinNewChatReview(submission);
     }
-    // A later request's global Stop/quota cannot end or block this older response.
-    // Require positive completion controls on the original response itself.
-    const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
-    const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
-    const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
     const text = assistantCorpus(bound?.root).join("\n\n");
     const json = done ? harvestJson({allowThin: true, root: bound?.root}) : null;
     if (runner) trackCompletedSource(runner, bound, done, text);
@@ -303,36 +746,695 @@ async function waitUntilReviewOrQuota(name) {
     };
     recordReviewStep(!done ? (stop || streaming ? "generating" : "waiting_for_response") :
       json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response");
-    if ((!bound || (bound.identified && !bound.followup)) && quotaHit() && !json) {
-      const error = new Error(`${name} usage limit`); error.code = "quota"; throw error;
-    }
+    throwIfQuota(name, bound, Boolean(json));
+    expireGeneratingLease(lease, name, poll, text);
+    expireResponseWait(wait, name, poll);
     if (done && json) {
-      const current = JSON.stringify([json, text]);
-      hits = stable === current ? hits + 1 : 1; stable = current;
-      if (hits >= 2) {
-        if (runner) {
-          runner.responseText = text;
-          if (bound?.identified && bound.responseId) runner.nativeCompletion = Object.freeze({
-            jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
-            responseId:bound.responseId,context:reviewPageContext(),text,raw:json,
-          });
-        }
-        recordReviewStep("response_collected");
-        return json;
-      }
-    } else { hits = 0; stable = ""; }
+      if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) return json;
+    } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
   }
+}
+
+/** Does the journaled sent turn hold EXACTLY Ashlar's prompt? boundReviewResponse identifies the
+ * turn by containment, so a turn the user edited (a prefix or suffix around the prompt) still
+ * binds. "exact": the turn (by its journaled message ID when exactly one matches, else by its
+ * recorded position) is the prompt; "edited": it holds more or other text, so it is the user's;
+ * "unknown": the turn is not rendered/resolvable. Independent of the composer draft. A fix journal
+ * compares its prompt's lossless form (`exact`, composer.js fixPromptForm): a turn whose whitespace
+ * differs from the prompt in any other way is not it; a review journal compares normalized text. */
+function journaledTurnIntegrity(submission, users) {
+  if (!submission?.expected) return "unknown";
+  let turn;
+  if (submission.messageId) {
+    const matches = users.filter(node => turnMessageId(node) === submission.messageId);
+    if (matches.length === 1) turn = matches[0];
+  } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
+    turn = users[submission.submittedUsers - 1];
+  }
+  if (!turn) return "unknown";
+  if (typeof submission.exact === "string") return fixTurnExact(turn, submission.exact, submission.attachments) ? "exact" : "edited";
+  const shown = messagePromptText(turn);
+  return (typeof reviewTurnExact === "function" ? reviewTurnExact(shown, submission.expected) : normalizePrompt(shown) === submission.expected) ? "exact" : "edited";
+}
+
+/** Whether a fix's sent turn holds its prompt's lossless form `exact` (composer.js fixPromptForm). A
+ * rich-text turn's block boundaries read two ways: one <p> per blank-line paragraph with a <br> per
+ * line break (messagePromptText), or one <p> per line, the composer's own structure (losslessText).
+ * Either reading can prove it exact; any other whitespace difference is an edit. The file cards of
+ * the run's own attachments `names` are not the prompt (composer.js fixTurnHolds). */
+function fixTurnExact(turn, exact, names = []) {
+  return fixTurnHolds(turn, exact, Array.isArray(names) ? names : []);
+}
+
+/** The identity of the conversation a page shows: its URL without the fragment (the path names the
+ * conversation; the query is part of it too, e.g. ChatGPT's temporary chat). */
+function conversationIdentity(href) {
+  return typeof href === "string" ? href.split("#")[0] : "";
+}
+
+/* A run's conversation identity is recorded ONCE, when its send is proven: composer.js
+ * submissionConfirmed writes `conversation` into the submission journal from the location at that
+ * instant (only for a send this page instance clicked, still shown where it was clicked). A fix
+ * always records it there; so does a review sent on a page that names a conversation. Every later
+ * decision only COMPARES the current location with it (samePage); none records one. There is no
+ * location-based pin or upgrade after the send: a later URL is no evidence of whose conversation it
+ * is (the user can move in-page while the old DOM is still rendered), and neither provider's DOM
+ * ties a conversation id to the sent turn or its response (both expose only per-message ids). A fix
+ * journal without it (legacy, recorded before this rule, or a confirmation seen only after a
+ * reload) is `identity:"unestablished"` for good: never harvested, never closed. The identity is
+ * persisted with the journal (sessionStorage), so it survives a reload.
+ *
+ * A FIX is proven only in ChatGPT's temporary chat (#77: the chat fix provider is ChatGPT only, and
+ * every fix tab opens on `/?temporary-chat=true`, fixChatPage). A fix whose send-time identity is
+ * not exactly that page (sent on a bare new chat, `?temporary-chat=false`, an existing conversation)
+ * is `identity:"unestablished"` too, even where the page never moved: never collected, its run ends
+ * `taken_over`, its tab is preserved. The query is part of that send-time check (it names the mode
+ * the fix was sent in); after the send, the page is compared by samePage (origin and path, the query
+ * ignored, #82), for both kinds.
+ *
+ * A fix whose page changes path after the send is `identity:"changed"`, whoever moved it, with one
+ * exception (live 1.1.42): ChatGPT now moves a sent temporary chat to /c/<id>?temporary-chat=true.
+ * A fix confirmed on fixChatPage is bound to that temporary conversation (providerMovedTemporaryChat:
+ * at the send confirmation, or adoptMovedTemporaryChat in any later phase: waiting, generating,
+ * collecting, completing, a release check, and after a reload: on durable proof, the journal and our
+ * exact sent turn), never to a page that is not a temporary chat (the user's own conversations never
+ * are).
+ * When ChatGPT moves the new chat to a plain /c/<id>, such a fix run still ends `taken_over` ("the
+ * tab moved to another conversation") and its tab is preserved as navigated: the known #77 vs #82
+ * contradiction (the send-time identity cannot tell that move from the user's in-page move to their
+ * own conversation while the old DOM is still rendered; a review on a new chat pins instead, below).
+ *
+ * The one exception (#82) is a REVIEW whose journal has no send-time conversation: a review sent on
+ * a new chat (namesNoConversation: ChatGPT's "/" or a temporary chat it does not honour, Grok's home,
+ * the page every Ashlar tab opens on) has no conversation yet when its send is proven; the provider
+ * assigns one while it answers, which is not the user's doing. It pins where the provider put it
+ * (pinNewChatReview), but only when this page saw that move happen while the run was in flight
+ * (newChatPin); a URL it did not see the send produce is never pinned. A review without a pinned
+ * conversation is released as `unpinned` only on the new chat its tab was opened on; on any other
+ * page it has left it with no trustworthy identity and is kept (`identity: "changed"`), never
+ * "unestablished". */
+
+/** Whether a review collector poll may pin its new-chat run's conversation here (the journaled turn
+ * is shown, EXACTLY Ashlar's prompt): on the new chat once the answer is complete; on a conversation
+ * page only while the answer is still in flight, and only when this page instance saw the run on the
+ * new chat after its send (sawNewChatAfterSend): the provider's move, observed as it happened. A
+ * poll on the new chat while generating records that sighting. */
+function newChatPin(runner, done, answered) {
+  if (namesNoConversation(globalThis.location?.href)) {
+    if (!done && runner) { try { runner.newChatSeen = submissionKey(); } catch { /* unbound: no sighting */ } }
+    return done && answered;
+  }
+  return !done && sawNewChatAfterSend(runner);
+}
+
+/** Whether this page instance saw its run on a new-chat page after the send: it clicked Send there
+ * (composer.js sendAttempt), or a collector poll found the exact sent turn there while generating.
+ * In memory only: a reloaded page has not seen it (its later URL is no evidence of the move). */
+function sawNewChatAfterSend(runner) {
+  let key;
+  try { key = submissionKey(); } catch { return false; }
+  return runner?.newChatSeen === key ||
+    (runner?.sendAttempt?.key === key && namesNoConversation(runner.sendAttempt.conversation));
+}
+
+/** Pin a review's conversation identity that its send did not record (see above): only the review
+ * collector calls it (newChatPin): on the conversation page the provider moved the run to while this
+ * page watched it answer, or on the new chat once its answer is complete. Pinned ONCE and never
+ * replaced: a later URL is compared with it (samePage). A fix never pins here: its identity is the
+ * send-time one. */
+function pinNewChatReview(submission) {
+  if (!submission || submission.phase !== "sent" || submission.conversation) return;
+  const identity = conversationIdentity(globalThis.location?.href);
+  if (!identity) return;
+  submission.conversation = identity;
+  const state = globalThis.__ashlarRunnerState;
+  if (state?.confirmedSubmission?.record === submission) {
+    state.submissionPersistencePending = true;
+    if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();
+  } else {
+    try { sessionStorage.setItem(submissionKey(), JSON.stringify(submission)); } catch { /* re-pinned from memory next poll */ }
+  }
+}
+
+/** Whether two URLs show the same page for tab ownership: origin and path (trailing slashes
+ * ignored). The query and fragment are not the page (ChatGPT's `?temporary-chat=true` names a
+ * mode, not another conversation), so a plain "/" and the temporary chat are the same page. */
+function samePage(a, b) {
+  try {
+    const x = new URL(a), y = new URL(b);
+    const path = url => url.pathname.replace(/\/+$/, "");
+    return x.origin === y.origin && path(x) === path(y);
+  } catch { return false; }
+}
+
+/** Whether `href` is a provider's new-chat page, which names no conversation (its path is the site
+ * root: ChatGPT's "/" with or without `?temporary-chat=true`, Grok's home). */
+function namesNoConversation(href) {
+  try { return new URL(href).pathname.replace(/\/+$/, "") === ""; } catch { return false; }
+}
+
+/** The only conversation a fix run can be proven in (#77): ChatGPT's temporary chat, the page every
+ * fix tab is opened on (background.js providerUrl). A function, so the content script stays
+ * re-injectable. */
+function fixChatPage() { return "https://chatgpt.com/?temporary-chat=true"; }
+
+/** Whether `href` is the conversation ChatGPT moves a sent temporary chat to: /c/<id> with exactly
+ * `?temporary-chat=true` (live 1.1.42 send probes: `chatgpt.com/c/*?temporary-chat=true` within a
+ * second of a fix's Send click). The user's own conversations are never temporary chats. */
+function temporaryChatConversation(href) {
+  try {
+    const url = new URL(href), home = new URL(fixChatPage());
+    return url.origin === home.origin && url.search === home.search && /^\/c\/[^/]+\/?$/.test(url.pathname);
+  } catch { return false; }
+}
+
+/** Whether a fix clicked on the temporary chat (`clickedIn`, exactly fixChatPage) now shows the
+ * temporary conversation ChatGPT moved it to (`href`): the provider's move, as the page instance that
+ * clicked Send sees it at the confirmation (composer.js sendAttempt). Later phases, and a reloaded
+ * page, adopt it on durable proof instead (adoptMovedTemporaryChat). */
+function providerMovedTemporaryChat(clickedIn, href) {
+  return clickedIn === fixChatPage() && temporaryChatConversation(conversationIdentity(href));
+}
+
+/** Whether a fix run was sent in the temporary chat (its send-time identity is exactly fixChatPage,
+ * or the temporary conversation ChatGPT moved that send to): the only send a fix answer can be
+ * proven for, and the only one whose tab may close. */
+function fixSentInTemporaryChat(submission) {
+  return submission?.conversation === fixChatPage() || temporaryChatConversation(submission?.conversation);
+}
+
+/** Bind a fix recorded on the temporary chat (fixChatPage) to the conversation ChatGPT moved it to,
+ * in ANY phase after its send is confirmed (live 1.1.43: the move lands ~0.6 s after the
+ * confirmation, while the fix still waits for its response). Live 1.1.44: on ChatGPT's new UI that
+ * move can be a real navigation, so the page instance that clicked Send (its in-memory sendAttempt)
+ * is gone and a re-injected page resumes the run (observe-only) from its journal. Adoption therefore
+ * rests on durable proof, never on memory: the journal (sessionStorage, which survives a same-tab
+ * reload) says the fix was sent and confirmed on exactly fixChatPage and never moved since; the page
+ * now shows /c/<id>?temporary-chat=true (temporaryChatConversation); and the page shows OUR send
+ * only (temporaryChatMoveClean: its one user turn is EXACTLY the journaled typed line, which names
+ * the attachment's unique SHA-256, with the run's file card; no other user turn, no follow-up, no
+ * draft). Once, never replaced: the new identity is journaled and every later location is compared
+ * with it (samePage), so a second move still ends the run, as does a move to a non-temporary chat
+ * or to another temporary chat (its turn is not ours). Returns "adopted"; "pending" while that
+ * proof cannot be read yet (a reloaded page not yet showing the turn or its card: transient, not a
+ * move away); else "". */
+/** Diagnostic (#93, 1.1.44–45 live "tab moved"): why a moved temporary fix page was not adopted.
+ * chrome.storage.local "fixMoveProbes", last 10; URL shapes and flags only. */
+function shapeOf(url) {
+  try { const u = new URL(String(url || "")); return `${u.host}${u.pathname.startsWith("/c/") ? "/c/*" : u.pathname}${u.search}`; }
+  catch { return url ? "unparsable" : "none"; }
+}
+function fixMoveProbe(state, submission, href, reason) {
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    if (!local || state?.lastMoveProbe === reason) return;
+    if (state) state.lastMoveProbe = reason;
+    const record = {at: Date.now(), job: state?.jobId, reason, url: shapeOf(href), sendAttempt: Boolean(state?.sendAttempt),
+      phase: submission?.phase, users: typeof userTurnEls === "function" ? userTurnEls().length : -1};
+    globalThis.__ashlarMoveProbeWrites = (globalThis.__ashlarMoveProbeWrites || Promise.resolve()).then(async () => {
+      const stored = (await local.get(["fixMoveProbes"]))?.fixMoveProbes;
+      await local.set({fixMoveProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-10)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect the run */ }
+}
+
+function adoptMovedTemporaryChat(state, submission) {
+  const href = globalThis.location?.href;
+  const probe = reason => { fixMoveProbe(state, submission, href, reason); return reason; };
+  if (submission?.phase !== "sent") return probe("not_sent"), "";
+  // Live 1.1.46 (fixMoveProbes): the recorded identity is already a temporary /c/<id>, and the run
+  // still ended "moved" to another /c/<id>: ChatGPT re-keys a temporary chat (a local id first, then
+  // the server's). A move between temporary conversations is adopted on the same proof as the first.
+  const fromTemporary = submission.conversation === fixChatPage() || temporaryChatConversation(submission.conversation);
+  if (!fromTemporary) return probe(`identity_not_temporary:${shapeOf(submission.conversation)}`), "";
+  if (samePage(submission.conversation, href)) return "";
+  if (!state || state.tabRepurposed) return probe("repurposed"), "";
+  let key;
+  try { key = submissionKey(); } catch { return probe("no_key"), ""; }
+  // Bounded: the bare page to a local id to the server's id is two moves; a third is not ChatGPT's.
+  const adopted = state.temporaryChatAdoptions?.key === key ? state.temporaryChatAdoptions.count : 0;
+  if (adopted >= 2) return probe("adoptions_exhausted"), "";
+  if (!temporaryChatConversation(conversationIdentity(href))) return probe(`not_temp_conversation:${shapeOf(conversationIdentity(href))}`), "";
+  const clean = temporaryChatMoveClean(state, submission);
+  if (clean !== "clean") { probe(`move_not_clean:${state.moveCleanWhy || clean}`); return clean === "pending" ? "pending" : ""; }
+  submission.conversation = conversationIdentity(href);
+  state.temporaryChatAdopted = key;
+  state.temporaryChatAdoptions = {key, count: adopted + 1};
+  if (state.confirmedSubmission?.record === submission) {
+    state.submissionPersistencePending = true;
+    if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();
+  } else {
+    try { sessionStorage.setItem(key, JSON.stringify(submission)); } catch { /* the in-memory identity holds for this page */ }
+  }
+  return "adopted";
+}
+
+/** Whether a moved fix page shows only Ashlar's send (adoptMovedTemporaryChat): "clean" (its only
+ * user turn is the journaled one, EXACTLY the typed line with the run's file card, no follow-up, no
+ * draft: typed text other than the just-sent prompt's echo, or a staged file), "user" (anything else
+ * is on the page: another user turn, another text, a draft) or "pending" (no user turn or not its
+ * card rendered yet). The sent turn is located by its content, not by the journaled message id: that
+ * id is rebound here when the moved page renders the same turn under another (or no) id, so later
+ * proofs (journaledTurnIntegrity) keep finding it. */
+function temporaryChatMoveClean(state, submission) {
+  state.moveCleanWhy = "";
+  const names = submission.attachments;
+  // A review journal has no lossless form: its sent turn is proven by journaledTurnIntegrity (the
+  // normalized prompt, Markdown-aware), the same proof its collector and can-close rest on.
+  const review = typeof submission.exact !== "string";
+  // A review sent with no attachment has no card to show; a fix always sends its file.
+  if ((review && typeof submission.expected !== "string") || !Array.isArray(names) || (!review && !names.length) || submission.submittedUsers !== 1)
+    return (state.moveCleanWhy = `journal exact:${typeof submission.exact} names:${Array.isArray(names) ? names.length : "-"} submittedUsers:${submission.submittedUsers}`), "user";
+  const draft = composerDraftText();
+  if (composerStagedFiles(state, submission).length || (draft && normalizePrompt(draft) !== submission.expected))
+    return (state.moveCleanWhy = `draft staged:${composerStagedFiles(state, submission).length} draftLen:${(draft || "").length}`), "user";
+  const users = userTurnEls();
+  if (!users.length) return (state.moveCleanWhy = "no_user_turn"), "pending";
+  if (users.length !== 1 || (!review && !fixTurnExact(users[0], submission.exact, names)))
+    return (state.moveCleanWhy = `users:${users.length} exact:${users.length ? fixTurnExact(users[0], submission.exact, names) : "-"} textLen:${users.length ? ((typeof turnTextRoot === "function" ? turnTextRoot(users[0]) : users[0])?.textContent || "").length : "-"} wantLen:${(review ? submission.expected : submission.exact).length}`), "user";
+  if (typeof turnAttachments === "function" && !turnAttachments(users[0], names).shown) return (state.moveCleanWhy = "card_not_shown"), "pending";
+  if (journaledTurnIntegrity(submission, users) !== "exact") {
+    const {messageId: _stale, ...rebound} = submission;
+    const id = turnMessageId(users[0]);
+    if (id) rebound.messageId = id;
+    if (journaledTurnIntegrity(rebound, users) !== "exact") return (state.moveCleanWhy = `integrity:${journaledTurnIntegrity(rebound, users)}`), "user";
+    if (id) submission.messageId = id; else delete submission.messageId;
+  }
+  if (boundReviewResponse(submission).followup) return (state.moveCleanWhy = "followup"), "user";
+  return "clean";
+}
+
+/** Whether the page still shows the conversation its run was bound in (samePage). Not established = false. */
+function fixConversationHolds(submission) {
+  return Boolean(submission?.conversation) && samePage(submission.conversation, globalThis.location?.href);
+}
+
+/** The conversation this page's run is bound to (recorded at send, or a new-chat review's pin): ""
+ * when none is established or readable. */
+function sentFixConversation(state) {
+  try {
+    const submission = state.confirmedSubmission?.record || savedSubmission();
+    return typeof submission?.conversation === "string" ? submission.conversation : "";
+  } catch { return ""; }
+}
+
+/** The answer this fix run collected (what the worker delivers): the native completion proof when
+ * the response carried an ID, else the collected text. */
+function storedFixCompletion(state) {
+  const proof = state.nativeCompletion;
+  if (proof && proof.jobId === state.jobId && proof.runId === state.runId && proof.provider === state.provider &&
+      typeof proof.text === "string") return {responseId: proof.responseId || "", text: proof.text};
+  return state.result?.ok === true && typeof state.result.responseText === "string" ? {responseId: "", text: state.result.responseText} : null;
+}
+
+/** THE ownership proof a fix ANSWER needs: collecting it (phase "collect") and handing a collected
+ * answer to the worker ("complete"). The tab-release decisions (can-close, cancel) of both kinds use
+ * tabOwnership instead, which asks for positive user evidence only. `journal`: the submission
+ * journal the caller just read (default: the confirmed or saved one). `pinned` ("collect"): the
+ * response the collector pinned at its first answered observation (waitUntilFixOrQuota).
+ *
+ * owned = the fix was sent in the temporary chat (fixSentInTemporaryChat, #77) and the page still
+ * shows it, the journaled sent turn is EXACTLY Ashlar's prompt (journaledTurnIntegrity "exact", in
+ * its lossless form `exact`), no follow-up turn, no user draft, ("collect") the bound response is
+ * still the pinned one and ("complete") an answer was collected. Nothing about the collected answer
+ * itself is compared: ChatGPT keeps redrawing a finished answer (the closing code fence after the
+ * action bar, labels, re-keyed ids, streaming flags), and requiring the collected text again would
+ * keep the answer, and then the tab, forever (#82). The collector's pin is no such comparison: it
+ * names WHICH response is collected (its ID, else its message node) while the run collects, never
+ * its text. takenOver = the user's (follow-up, edited turn, draft: typed text or a staged file,
+ * another response while collecting); unknown = not provable now (journal unreadable, turn not
+ * rendered, the just-sent prompt still echoed in the composer, identity or lossless form not
+ * recorded at send, not the temporary chat, or moved: `identity` "unestablished" | "changed").
+ * PERMANENT verdicts are decided before any transient one (#77): the conversation, the exact sent
+ * turn and a user draft need no rendered response, so no transient wait (a turn not rendered or
+ * resolved yet, the prompt echoed in the composer) hides them until the fix deadline. Every
+ * takenOver verdict is PERMANENT: it marks the tab repurposed for good (a draft the user later
+ * clears, or an edit the user undoes, does not hand the tab back); see fixVerdictPermanent for what
+ * ends a run. */
+function fixOwnershipProof(state, {phase, journal, pinned} = {}) {
+  const verdict = (ownership, reason, extra = {}) => ({ownership, reason, ...extra});
+  const takeOver = (reason, cause) => {
+    if (!state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = cause; recordReviewStep("context_changed"); }
+    return verdict("takenOver", reason);
+  };
+  if (state.tabRepurposed) return verdict("takenOver", "repurposed");
+  let submission = journal;
+  if (!submission) {
+    try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { return verdict("unknown", "journal_unreadable"); }
+  }
+  // Nothing was sent: there is no answer to collect or to hand out.
+  if (submission?.phase !== "sent") return verdict("unknown", "not_sent");
+  // 1. The conversation. The rendered turn proves its content only; an in-page (SPA) move to another
+  // conversation can leave this DOM on screen under the new URL, or remove it: the proof holds only
+  // in the conversation recorded when the send was proven (composer.js submissionConfirmed), which
+  // must be the temporary chat; a journal without one never gains it. Nor does one without its
+  // prompt's lossless form (`exact`, recorded by composer.js clickSend when the send is prepared):
+  // its turn can never be proven exact.
+  if (adoptMovedTemporaryChat(state, submission) === "pending") return verdict("unknown", "move_unverified");
+  if (!fixSentInTemporaryChat(submission) || typeof submission.exact !== "string") {
+    return verdict("unknown", "unestablished", {identity: "unestablished"});
+  }
+  if (!fixConversationHolds(submission)) return verdict("unknown", "moved", {identity: "changed", conversation: submission.conversation});
+  // 2. The journal-addressable sent turn (its message ID, else its recorded position) holds EXACTLY
+  // Ashlar's prompt. boundReviewResponse only proves the turn CONTAINS it, and finds no turn at all
+  // once the user replaced its text: an edited or replaced turn is the user's, even if undone later.
+  const users = userTurnEls();
+  const integrity = journaledTurnIntegrity(submission, users);
+  if (integrity === "edited") return takeOver("edited", "edited");
+  const bound = boundReviewResponse(submission);
+  if (bound.followup) return takeOver("followup", "user_turn");
+  // 3. A draft in the composer: typed text or a staged file (after a confirmed send every file chip
+  // is the user's, composerStagedFiles). The just-sent prompt can linger there a moment after the
+  // send is confirmed: that text (the journal's own expected prompt) is Ashlar's, not evidence of a
+  // user. Any other draft is the user's, decided on the poll that sees it and BEFORE the transient
+  // waits below (turn not rendered or not resolvable yet): a draft typed and cleared while the turn
+  // is briefly unresolved still latches the takeover.
+  const draftText = composerDraftText();
+  const staged = composerStagedFiles(state, submission);
+  if (staged.length || (draftText && normalizePrompt(draftText) !== submission.expected)) return takeOver("draft", "draft");
+  // 4. ("collect") The pinned response. boundReviewResponse always binds the LAST reply after the
+  // sent turn, so a response regenerated after the first answered observation would bind instead:
+  // any other response (another ID; with no ID, another assistant message node) is the user's.
+  // An ID-less pin adopts the ID its own node gains later (renderers can assign it after mounting
+  // the text): the same node is the same response, never another one.
+  if (pinned && bound.root) {
+    if (!pinned.responseId && bound.responseId && bound.message === pinned.message) pinned.responseId = bound.responseId;
+    if ((bound.responseId || "") !== pinned.responseId || (!pinned.responseId && bound.message !== pinned.message)) {
+      return takeOver("response_changed", "regenerated");
+    }
+  }
+  if (!bound.identified) {
+    // A collected answer whose sent turn no longer holds Ashlar's prompt: the user edited it. Still in
+    // the recorded conversation with no addressable turn before that: not rendered yet (transient).
+    return phase === "complete" ? takeOver("turn_changed", "edited") : verdict("unknown", "turn_unrendered");
+  }
+  if (integrity === "unknown") return verdict("unknown", "turn_unresolved");
+  // Only Ashlar's own just-sent prompt can still be in the composer here (a user draft latched above).
+  if (draftText) return verdict("unknown", "composer_echo");
+  if (phase === "complete" && !storedFixCompletion(state)) return verdict("unknown", "no_completion", {conversation: submission.conversation});
+  return verdict("owned", "exact", {conversation: submission.conversation});
+}
+
+/** Whether a fix ownership verdict can never turn back into "owned" (bridge-fix.server.ts
+ * LIFECYCLE, terminal verdicts): the user's (takenOver: follow-up, edited turn, draft, replaced
+ * response), the page moved off the conversation its send was made in (a recorded identity never
+ * comes back by waiting), or its sent journal carries no send-time identity (recorded only when the
+ * send is proven, so it can never be established later). The same in every phase. Everything else
+ * "unknown" is transient (journal unreadable, turn not rendered yet, still generating, the sent
+ * prompt still echoed in the composer). */
+function fixVerdictPermanent(proof) {
+  return proof.ownership === "takenOver" || proof.identity === "changed" || proof.identity === "unestablished";
+}
+
+/** End a fix run on a permanent verdict, at once: the tab is the user's for good (every later proof
+ * says so), its managed slot is freed, and the run's outcome is a distinct terminal `taken_over`
+ * failure the worker delivers right away (the server fails the item and the runtime retries or
+ * escalates now, not at the fix deadline). Returns that outcome. */
+function endFixRun(state, proof) {
+  if (!state.tabRepurposed) {
+    state.tabRepurposed = true;
+    // Why the tab is kept (the release verdict's cause; takeOver already named a takenOver one).
+    state.takeoverCause ||= proof.identity === "changed" ? "navigated" : proof.identity === "unestablished" ? "ownership_unknown" : "user_turn";
+    recordReviewStep("context_changed");
+  }
+  releaseManagedSlot(state);
+  // The moved-to page's shape only (host, "/c/*", the temporary-chat flag; never its id): which
+  // page defeated the temporary-chat adoption, when a live run ends here.
+  const seen = typeof sendProbeUrl === "function" ? ` (now ${sendProbeUrl(globalThis.location?.href || "")})` : "";
+  const detail = proof.identity === "changed" ? `the tab moved to another conversation${seen}` :
+    proof.identity === "unestablished" ? "the fix conversation cannot be identified" : `the user took over the fix tab (${proof.reason})`;
+  return {ok: false, code: "taken_over", error: `fix run ended: ${detail}; tab preserved`, proof: proof.reason};
+}
+
+/** A collected fix answer is handed to the worker only while the tab still proves it
+ * (fixOwnershipProof "complete"); a transient verdict tells the worker to wait, a permanent one
+ * ends the run (taken_over), so an answer is never delivered from a tab the user took over and the
+ * run never waits for its deadline instead. Review results pass through unchanged. */
+function fixAnswerReply(state, msg, value, busy) {
+  if (value?.ok !== true || !(msg.kind === "fix" || state.kind === "fix")) return value;
+  const proof = fixOwnershipProof(state, {phase: "complete"});
+  if (fixVerdictPermanent(proof)) {
+    state.result = endFixRun(state, proof);
+    state.nativeCompletion = undefined;
+    return {...state.result, ownership: proof.ownership};
+  }
+  if (proof.ownership !== "owned") return {...busy(), ownership: proof.ownership, proof: proof.reason};
+  return {...value, ownership: "owned"};
+}
+
+/** A review-loop FIX answer is plain text for the server's deterministic fix parser: harvest
+ * the bound response's fenced code blocks (literal text, see assistantCodeBlocks) — or, when it
+ * has none, its visible text under the unfenced mark (boundAnswerText) — after the same positive completion controls and two identical stable
+ * observations as a review, with no review-JSON requirement and no capture/repair evidence (a
+ * fix item has neither lane). It ends on the answer, on quota, on a PERMANENT ownership verdict
+ * (fixVerdictPermanent: `taken_over` at once, never at the deadline) or when the server settles the
+ * item (the worker's ashlar-fix-cancel stops it: throwIfStopped); no page timer ends a transient
+ * wait: the fix deadline bounds it.
+ */
+async function waitUntilFixOrQuota(name) {
+  // `pinned`: the response this run collects, fixed at its first answered observation and never
+  // replaced (a regenerated response ends the run: fixOwnershipProof "collect"); an ID-less pin only
+  // gains the ID its own node is assigned later.
+  const stability = {stable: "", hits: 0, pinned: undefined};
+  for (;;) {
+    throwIfStopped();
+    // Same completion evidence, quota rule and stability as a review (shared helpers above).
+    const poll = await pollBoundResponse();
+    const {runner, bound, stop, streaming, done} = poll;
+    // Only the response identified as the answer to THIS run's sent prompt, in a tab the full
+    // ownership proof holds for right now, is a fix answer (fixOwnershipProof "collect": exact
+    // journaled turn, send-time conversation still shown, no follow-up, no draft). With no sent journal
+    // or no identified response the page-global fallbacks would read whatever chat is on screen:
+    // never an answer (a review keeps its legacy unbound observation). An edited turn repurposes
+    // the tab for good; after an in-page move the lingering DOM is not harvested there.
+    const proof = runner ? fixOwnershipProof(runner, {phase: "collect", journal: poll.submission, pinned: stability.pinned}) : {ownership: "unknown"};
+    // A permanent verdict ends the run NOW (endFixRun: slot freed, `taken_over`); only a transient
+    // "unknown" keeps polling, bounded by the server's fix deadline.
+    if (runner && fixVerdictPermanent(proof)) {
+      const ended = endFixRun(runner, proof);
+      const error = new Error(ended.error); error.code = ended.code; throw error;
+    }
+    const own = proof.ownership === "owned" && bound?.identified ? bound.root : null;
+    // A collapsed code block is opened first (live aicc #455); the harvest then reads it whole.
+    const expanded = done && own ? expandCollapsedCodeBlocks(own) : 0;
+    stability.expanded = (stability.expanded || 0) + expanded;
+    const harvest = {};
+    const text = done && own ? boundAnswerText("fix", own, harvest) : "";
+    const answered = done && Boolean(text.trim());
+    // Local diagnostics only: the answer text is never copied into an observation.
+    if (runner?.running) runner.observation = {
+      state: !done ? "generating_or_queued" : answered ? "answer_observed" : "waiting_for_response",
+      text: "", totalChars: text.length, truncated: false,
+    };
+    if (!answered) recordReviewStep(!done && (stop || streaming) ? "generating" : "waiting_for_response");
+    throwIfQuota(name, bound, answered);
+    if (answered) {
+      // Its ID (its message node when it has none): the only response a later poll may collect.
+      stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
+      if (settleStableAnswer(stability, text, poll, {text, raw: text})) {
+        saveFixHarvestProbe({at: Date.now(), jobId: runner?.jobId, runId: runner?.runId, blocks: harvest.blocks || 0,
+          totalChars: harvest.totalChars || 0, answerChars: text.length, collapsed: Boolean(harvest.collapsed), expanded: stability.expanded,
+          unfenced: Boolean(harvest.unfenced), fileLinks: harvest.fileLinks || 0, canvas: Boolean(harvest.canvas), textChars: harvest.textChars || 0});
+        saveFixAnswerHtml(own, {at: Date.now(), jobId: runner?.jobId, runId: runner?.runId});
+        return text;
+      }
+    } else { stability.hits = 0; stability.stable = ""; }
+    await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
+  }
+}
+
+/** Who holds this run's tab (review or fix), by one rule: once its result is secured or unwanted
+ * the tab is Ashlar's to close unless the user positively took it over, shown by signals the
+ * provider never changes by itself:
+ *  - a user turn after Ashlar's journaled turn ("user_turn"), or that turn edited ("edited");
+ *  - a composer draft that is not Ashlar's own prompt ("draft");
+ *  - another conversation or site (samePage against the pinned conversation: "navigated");
+ *  - the answer generated again after this page completed it, or after the worker says it was
+ *    secured (`secured`, for a page reloaded since) ("regenerated": a Stop control or a streaming flag
+ *    back, or a new variant pager; regeneratedAfterCompletion).
+ * Nothing else about the ANSWER is compared (text, fences, labels, message id): ChatGPT keeps
+ * redrawing a finished answer, and that is not the user's activity.
+ * "owned" carries how it was proven: `blank` (nothing on the page), `unsent` (only Ashlar's
+ * just-clicked prompt), `legacy` (a run observed without a journal), `unpinned` (a review sent,
+ * no pinned conversation) or the recorded `conversation`; the worker then checks the page it
+ * expects. "unknown": not provable yet (the journal is unreadable, or the page has not rendered its
+ * turns after a reload), `identity: "changed"`, or (`fix`: a fix run's tab) `identity:
+ * "unestablished"`, a sent fix whose send recorded no conversation; the worker asks again or
+ * preserves the tab. */
+function tabOwnership(state, allocationUrl, fix = false, secured = false) {
+  if (state.tabRepurposed) { persistTakeover(state); return {ownership: "takenOver", cause: state.takeoverCause || "user_turn"}; }
+  // Every takeover is permanent (as for a fix run's answer, fixOwnershipProof): a draft the user
+  // clears again or an edit the user undoes does not hand the tab back.
+  const takeOver = cause => {
+    if (!state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = cause; recordReviewStep("context_changed"); }
+    persistTakeover(state);
+    return {ownership: "takenOver", cause};
+  };
+  let submission;
+  try { submission = state.confirmedSubmission?.record || (typeof savedSubmission === "function" ? savedSubmission() : null); }
+  catch { return {ownership: "unknown", cause: "journal_unreadable"}; }
+  const norm = text => typeof normalizePrompt === "function" ? normalizePrompt(text) : String(text || "").replace(/\s+/g, " ").trim();
+  // A fix turn's file cards (its own attachment, composer.js turnAttachments) are not its prompt.
+  const cardsOf = turn => fix && typeof turnAttachments === "function" && Array.isArray(submission?.attachments)
+    ? turnAttachments(turn, submission.attachments).cards : undefined;
+  const promptOf = turn => norm(typeof messagePromptText === "function" ? messagePromptText(turn, cardsOf(turn)) : turn.textContent);
+  // A review turn is exactly its prompt also when Markdown restyled it (composer.js reviewTurnExact:
+  // `code` spans rendered as <code>); a fix turn is held to its normalized text (and `exact`, below).
+  const promptIs = (turn, expected) => !fix && typeof reviewTurnExact === "function" && typeof messagePromptText === "function"
+    ? reviewTurnExact(messagePromptText(turn), expected) : promptOf(turn) === expected;
+  const href = globalThis.location?.href || "";
+  const users = userTurnEls();
+  // Ashlar's own prompt in the composer (before or after the send) is not a user draft; anything
+  // else there is the user's, including Ashlar's prompt with text added around it.
+  const draft = composerDraftText();
+  if (draft && norm(draft) !== norm(submission?.expected || state.pendingPrompt || "")) return takeOver("draft");
+  if (composerStagedFiles(state, submission).length) return takeOver("draft");
+  if (submission?.phase !== "sent") {
+    if (!submission && typeof state.finishedContext === "string") {
+      // A run observed without a journal (a legacy page): compare with what it recorded when it finished.
+      let recorded;
+      try { recorded = JSON.parse(state.finishedContext); } catch { recorded = null; }
+      if (Array.isArray(recorded)) {
+        if (users.length > recorded[1]) return takeOver("user_turn");
+        if (!samePage(href, recorded[0])) return takeOver("navigated");
+        return {ownership: "owned", legacy: true};
+      }
+    }
+    // Before the send is confirmed the page holds at most Ashlar's own prompt. No turn: `blank`
+    // (content proves nothing about WHICH page this is). The just-clicked turn, exactly the prompt:
+    // `unsent`. The worker also requires the page the tab was opened on for both.
+    if (!users.length) return {ownership: "owned", blank: true};
+    if (submission?.baseline === 0 && users.length === 1 && promptIs(users[0], submission.expected)) return {ownership: "owned", unsent: true};
+    return takeOver("user_turn");
+  }
+  // An in-page (SPA) move can leave this DOM on screen under another conversation's URL: once the
+  // run's conversation is recorded (at send, or a new-chat review's pin), the page must still show it.
+  // A fix's temporary chat ChatGPT moved to its own /c/<id>?temporary-chat=true (fixOwnershipProof):
+  // the same adoption, whichever check sees the move first.
+  // A review pinned on the local id its temporary chat got first is re-keyed the same way (live P0
+  // 2026-09-27: 126 of 131 review tabs preserved as "navigated" after the re-key).
+  if ((fix || submission?.conversation) && adoptMovedTemporaryChat(state, submission) === "pending") return {ownership: "unknown", cause: "not_rendered"};
+  const pinned = typeof submission.conversation === "string" ? submission.conversation : "";
+  if (pinned && !samePage(pinned, href)) return {ownership: "unknown", identity: "changed", cause: "navigated", conversation: pinned};
+  // A review with no pin has no trustworthy conversation: it is Ashlar's only on the new chat its tab
+  // was opened on. Any other page is one its send was not seen to produce (a move the collector did
+  // not watch happen in flight, or the user's own conversation with the old DOM still on screen,
+  // Ashlar 4101062732): kept, never closed on the page's word. (A fix without one: unestablished.)
+  if (!pinned && !fix && !(namesNoConversation(href) && (!allocationUrl || samePage(href, allocationUrl)))) {
+    return {ownership: "unknown", identity: "changed", cause: "navigated"};
+  }
+  // A FIX records its conversation only when its send is proven (composer.js submissionConfirmed),
+  // and only the temporary chat proves it (#77, fixSentInTemporaryChat): a sent fix journal without
+  // one (a legacy journal, a send confirmed only after a reload) or with another page can never
+  // establish it, so its tab is never closed. The worker preserves it at once. Nor can one without its
+  // prompt's lossless form (`exact`, #77: recorded by composer.js clickSend), whose turn can never be
+  // proven exact. A review has no such rule: it may pin later (pinNewChatReview), and until then it
+  // is `unpinned`.
+  const unestablished = fix && (!fixSentInTemporaryChat(submission) || typeof submission.exact !== "string")
+    ? {ownership: "unknown", identity: "unestablished", cause: "ownership_unknown"} : null;
+  // The journaled turn: its message ID (one match), else its recorded position (a provider that
+  // re-keys the turn is not the user).
+  let turn;
+  if (submission.messageId) {
+    const matches = users.filter(node => turnMessageId(node) === submission.messageId);
+    if (matches.length === 1) turn = matches[0];
+  }
+  if (!turn && Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) turn = users[submission.submittedUsers - 1];
+  const sent = turn ? promptOf(turn) : "";
+  if (!sent) {
+    // A reloaded temporary chat renders nothing: blank on the page it was opened on. A conversation
+    // page that has not rendered its turns yet proves nothing. (A fix with no send-time identity is
+    // never closed, blank or not.)
+    if (unestablished) return unestablished;
+    return !users.length && samePage(href, allocationUrl) ? {ownership: "owned", blank: true} : {ownership: "unknown", cause: "not_rendered"};
+  }
+  // The journaled turn must hold EXACTLY Ashlar's prompt (normalized), pinned or not: a review's
+  // send-time record and its pin need an exact turn, a fix's collector ends on any other, and an
+  // unpinned turn that merely contains the prompt may be the user's edit around it (Ashlar
+  // 4101062732). Any other text is an edit.
+  if (!promptIs(turn, submission.expected)) return takeOver("edited");
+  // A fix turn is also held to its prompt's lossless form (#77, fixTurnExact): a fix prompt inlines
+  // source whose whitespace is content, so a turn whose whitespace alone changed is an edit too.
+  if (fix && typeof submission.exact === "string" && typeof fixPromptForm === "function" && !fixTurnExact(turn, submission.exact, submission.attachments)) {
+    return takeOver("edited");
+  }
+  if (users.indexOf(turn) < users.length - 1) return takeOver("user_turn");
+  if (regeneratedAfterCompletion(state, submission, secured)) return takeOver("regenerated");
+  if (unestablished) return unestablished;
+  return pinned ? {ownership: "owned", conversation: pinned} : {ownership: "owned", unpinned: true};
 }
 
 /** Short message replies keep MV3 workers recoverable; the page owns the long model call.
  * State survives script reinjection and retains terminal outcomes for a restarted worker.
  */
 function reviewPageContext() {
-  const users = globalThis.document ? [...document.querySelectorAll('[data-message-author-role="user"]')] : [];
+  const users = userTurnEls();
   const last = users.at(-1);
   return JSON.stringify([globalThis.location?.href || "", users.length,
-    last?.getAttribute("data-message-id") || "", last?.textContent || ""]);
+    turnMessageId(last), last?.textContent || ""]);
+}
+
+/** The server no longer wants this run (cancelled, superseded, forgotten): nothing is sent or
+ * collected for it again. The marker is per (job, run) in sessionStorage, so a reload that
+ * re-binds the page (and a late "ashlar-run" for the same run) stays stopped. */
+function stopRun(state) {
+  if (!state.runStopped) recordReviewStep("cancelled");
+  state.runStopped = true;
+  try { sessionStorage.setItem(`ashlar:stopped:${state.jobId}:${state.runId}`, "true"); } catch { /* in-memory stop remains */ }
+}
+
+/** Stop a run this page is not bound to: the tab the worker opened for a run it never sent
+ * (undispatched), either kind. A late "ashlar-run" for it (a dispatch the worker gave up on) binds
+ * the page stopped (runStoppedFor), also when the marker cannot be written. */
+function fenceRun(state, jobId, runId) {
+  if (!jobId || !runId) return;
+  state.fencedRuns = [...(state.fencedRuns || []), JSON.stringify([jobId, runId])].slice(-16);
+  try { sessionStorage.setItem(`ashlar:stopped:${jobId}:${runId}`, "true"); } catch { /* the in-memory fence remains */ }
+}
+
+function runStoppedFor(jobId, runId) {
+  if (!jobId || !runId) return false;
+  if (globalThis.__ashlarRunnerState?.fencedRuns?.includes(JSON.stringify([jobId, runId]))) return true;
+  try { return sessionStorage.getItem(`ashlar:stopped:${jobId}:${runId}`) === "true"; }
+  catch { return false; }
+}
+
+/** Why this page is no longer the fresh page a new run may start on (X2, #85; `page`: the page its
+ * tab was opened on, or the one the run was accepted on): "navigated" when it shows another page,
+ * "user_turn" once it holds a user turn (a message the user sent there), "draft" once its composer
+ * holds the user's unsent text or file (Ashlar 4103758186: never typed over, never sent along);
+ * "" while it still is. Ashlar's own attachments are not a draft, nor its own text once it started
+ * typing (composer.js fillComposer: composerTyping; clickSend sends only the exact prompt). */
+function freshPageLeft(page, state) {
+  if (!samePage(globalThis.location?.href || "", page)) return "navigated";
+  if (hasUserTurn()) return "user_turn";
+  if (composerStagedFiles(state, null).length) return "draft";
+  return !state?.composerTyping && composerDraftText() ? "draft" : "";
+}
+
+/** The one stop fence: every send and collect loop (composer.js and both collectors) calls it
+ * before acting, so a stopped run ends as "cancelled" instead of clicking Send or harvesting. A new
+ * run also ends ("taken_over") once its tab stops being the fresh page it was accepted on, until its
+ * Send is clicked (composer.js clickSend clears freshPage then): nothing more is typed or clicked in
+ * a conversation the user opened, or wrote in, meanwhile. */
+function throwIfStopped() {
+  const state = globalThis.__ashlarRunnerState;
+  if (state?.runStopped) {
+    const error = new Error("the run was stopped: its job was cancelled or forgotten"); error.code = "cancelled"; throw error;
+  }
+  const left = state?.freshPage ? freshPageLeft(state.freshPage, state) : "";
+  if (!left) return;
+  const error = new Error(`${left === "user_turn" ? "a user message appeared in the tab" : left === "draft" ? "a user draft appeared in the tab" : "the tab left its new chat"} before the prompt was sent; nothing was sent`);
+  error.code = "taken_over"; error.takeoverCause = left; throw error;
+}
+
+/** A takeover outlives this page instance (an extension update re-injects the page, and a tab kept
+ * for a takeover is asked again by background.js reclaimPreservedTabs): a draft the user typed and
+ * cleared must not read as Ashlar's again (#126 review). */
+function persistTakeover(state) {
+  if (!state?.tabRepurposed || !state.jobId || !state.runId) return;
+  try { sessionStorage.setItem(`ashlar:takenover:${state.jobId}:${state.runId}`, state.takeoverCause || "user_turn"); } catch { /* in-memory only */ }
 }
 
 function releaseManagedSlot(state) {
@@ -352,10 +1454,16 @@ function installReviewRunner(name, run) {
     try { state.runId = sessionStorage.getItem("ashlar:run") || ""; } catch { /* unavailable storage */ }
   }
   try { state.slotReleased ||= sessionStorage.getItem(`ashlar:released:${state.jobId}:${state.runId}`) === "true"; } catch { /* Unknown remains managed. */ }
-  if (state.listener && state.protocol === "observed-submission-v6") return;
+  try {
+    const takenOver = state.jobId && state.runId ? sessionStorage.getItem(`ashlar:takenover:${state.jobId}:${state.runId}`) : null;
+    if (takenOver && !state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = takenOver; }
+  } catch { /* the in-memory verdict stands */ }
+  state.runStopped ||= runStoppedFor(state.jobId, state.runId);
+  if (state.listener && state.protocol === "observed-submission-v8") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
-  state.protocol = "observed-submission-v6";
-  const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation });
+  state.protocol = "observed-submission-v8";
+  const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation,
+    observing: state.boundObserved === true });
   state.listener = (msg, _sender, reply) => {
     // Read-only inventory: never adopt a page, collect a prompt, or start a run.
     if (msg?.type === "ashlar-tab-status") {
@@ -363,9 +1471,12 @@ function installReviewRunner(name, run) {
         released:Boolean(state.slotReleased),url:globalThis.location?.href || ""});return;
     }
     if (!["ashlar-run", "ashlar-harvest", "ashlar-can-close", "ashlar-repair-source", "ashlar-repair-accepted",
-      "ashlar-capture-accepted", "ashlar-result-saved"].includes(msg?.type)) return;
+      "ashlar-capture-accepted", "ashlar-fix-cancel"].includes(msg?.type)) return;
     const respond = reply;
-    reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId, progress: reviewProgress()});
+    reply = value => respond({...value, jobId: state.jobId, provider: state.provider, runId: state.runId, progress: reviewProgress(),
+      // A run (review or fix) reports the conversation it was bound in (once recorded) so the worker keeps it.
+      ...(!value?.conversation && state.jobId && msg.jobId === state.jobId && state.runId && msg.runId === state.runId && sentFixConversation(state)
+        ? {conversation: sentFixConversation(state)} : {})});
     if (!msg.jobId) {
       reply({ ok: false, code: "job_mismatch", error: "jobId is required" });
       return;
@@ -376,69 +1487,46 @@ function installReviewRunner(name, run) {
       reply({ ok: false, code: "job_mismatch", error: "tab belongs to another job" });
       return;
     }
-    if (["ashlar-capture-accepted", "ashlar-result-saved"].includes(msg.type)) {
+    // Capture and JSON repair are review-JSON machinery: a fix run never takes part in them.
+    if (["ashlar-capture-accepted", "ashlar-repair-source", "ashlar-repair-accepted"].includes(msg.type) && (msg.kind === "fix" || state.kind === "fix")) {
+      reply({ok:false,code:"job_mismatch",error:"a fix run has no capture or repair lane"});return;
+    }
+    if (msg.type === "ashlar-capture-accepted") {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider || msg.committed !== true) {
         reply({ok:false,code:"job_mismatch"});return;
       }
-      if (msg.type === "ashlar-capture-accepted") {
-        const receipt = sourceReceiptFor(state);
-        if (receipt) {
-          preserveSourceContext(state,receipt);
-          reply(receipt.id === msg.captureId && receipt.responseId === msg.responseId && receipt.text === msg.text && receipt.context === msg.context
-            ? {ok:true,accepted:true} : {ok:false,code:"capture_source_changed"});return;
-        }
-        const source = currentRepairSource();
-        if (!source) {
-          // A fresh/reloaded page can need another identical observation before
-          // source stability is established. Distinguish that from a genuinely
-          // repurposed or regenerated response so cleanup can safely preserve it.
-          let submission, bound, currentText = "";
-          try {
-            submission = state.confirmedSubmission?.record || savedSubmission();
-            if (submission?.phase === "sent") bound = boundReviewResponse(submission);
-            if (bound?.root && !bound.followup && replyDoneVisible(bound.root) && !stopButtonVisible() && !responseStreaming(bound.root))
-              currentText = assistantCorpus(bound.root).join("\n\n");
-          } catch { /* unavailable remains retryable */ }
-          if (typeof msg.context === "string" && (msg.context !== reviewPageContext() || bound?.followup ||
-              (currentText && currentText !== msg.text))) {
-            releaseManagedSlot(state);
-            reply({ok:false,code:"capture_source_changed"});return;
-          }
-          reply({ok:false,code:"capture_source_unavailable"});return;
-        }
-        if (!msg.captureId || typeof msg.context !== "string") {reply({ok:false,code:"capture_source_changed"});return;}
-        if (source.responseId !== msg.responseId || source.text !== msg.text) {
-          // The worker secured its original elsewhere. The replacement is user-owned.
-          releaseManagedSlot(state);
+      const receipt = sourceReceiptFor(state);
+      if (receipt) {
+        reply(receipt.id === msg.captureId && receipt.responseId === msg.responseId && receipt.text === msg.text && receipt.context === msg.context
+          ? {ok:true,accepted:true} : {ok:false,code:"capture_source_changed"});return;
+      }
+      const source = currentRepairSource();
+      if (!source) {
+        // A fresh/reloaded page can need another identical observation before
+        // source stability is established. A changed page answers "changed"; neither
+        // answer decides who holds the tab (the release verdict does).
+        let submission, bound, currentText = "";
+        try {
+          submission = state.confirmedSubmission?.record || savedSubmission();
+          if (submission?.phase === "sent") bound = boundReviewResponse(submission);
+          if (bound?.root && !bound.followup && replyDoneVisible(bound.root) && !stopButtonVisible() && !responseStreaming(bound.root))
+            currentText = assistantCorpus(bound.root).join("\n\n");
+        } catch { /* unavailable remains retryable */ }
+        if (typeof msg.context === "string" && (msg.context !== reviewPageContext() || bound?.followup ||
+            (currentText && currentText !== msg.text))) {
           reply({ok:false,code:"capture_source_changed"});return;
         }
-        state.captureReceipt = Object.freeze({id:msg.captureId,jobId:state.jobId,runId:state.runId,provider:state.provider,
-          responseId:source.responseId,text:source.text,context:msg.context});
-        preserveSourceContext(state,state.captureReceipt);
-        recordReviewStep("source_archived");
-        reply({ok:true,accepted:true});return;
+        reply({ok:false,code:"capture_source_unavailable"});return;
       }
-      // Restore only a previously collected+ACKed exact response, not another run
-      // or a new DOM result selected just because it happens to be the newest.
-      let submission;
-      try { submission = state.confirmedSubmission?.record || savedSubmission(); } catch { /* preserved */ }
-      const bound = submission?.phase === "sent" ? boundReviewResponse(submission) : null;
-      if (!bound?.identified || !bound.root || !replyDoneVisible(bound.root) || stopButtonVisible() || responseStreaming(bound.root)) {
-        reply({ok:false,code:"completion_unavailable"});return;
+      if (!msg.captureId || typeof msg.context !== "string") {reply({ok:false,code:"capture_source_changed"});return;}
+      if (source.responseId !== msg.responseId || source.text !== msg.text) {
+        // The worker secured its original elsewhere; who holds the tab is the release verdict's call.
+        reply({ok:false,code:"capture_source_changed"});return;
       }
-      const proof=msg.completion;
-      if (!proof?.responseId || typeof proof.context !== "string" || typeof msg.text !== "string" ||
-          typeof msg.raw !== "string" || !extractChatJson(msg.raw) || extractChatJson(msg.raw) !== extractChatJson(msg.text) || bound.followup ||
-          bound.responseId !== proof.responseId || proof.context !== reviewPageContext() || assistantCorpus(bound.root).join("\n\n") !== msg.text) {
-        releaseManagedSlot(state);
-        reply({ok:false,code:"completion_changed"});return;
-      }
-      state.nativeCompletion = Object.freeze({jobId:state.jobId,provider:state.provider,runId:state.runId,
-        responseId:proof.responseId,context:proof.context,text:msg.text,raw:msg.raw});
-      state.restoredCompletion = true;
-      state.finishedContext = proof.context;
-      state.result = {ok:true,raw:msg.raw,responseText:msg.text,completion:nativeCleanupProof(state)};
-      recordReviewStep("cleanup_restored");reply({ok:true,accepted:true});return;
+      state.captureReceipt = Object.freeze({id:msg.captureId,jobId:state.jobId,runId:state.runId,provider:state.provider,
+        responseId:source.responseId,text:source.text,context:msg.context});
+      recordReviewStep("source_archived");
+      reply({ok:true,accepted:true});return;
     }
     if (["ashlar-repair-source", "ashlar-repair-accepted"].includes(msg.type)) {
       if (!state.jobId || !state.runId || msg.runId !== state.runId || msg.provider !== state.provider) {
@@ -448,7 +1536,6 @@ function installReviewRunner(name, run) {
         const receipt = state.repairReceipt;
         const same = msg.committed === true && msg.repairId === receipt.repairId &&
           msg.responseId === receipt.responseId && msg.text === receipt.text && msg.raw === receipt.result.raw;
-        preserveRepairContext(state);
         reply(same ? {ok:true,accepted:true} : {ok:false,code:"repair_source_changed"});
         return;
       }
@@ -468,7 +1555,6 @@ function installReviewRunner(name, run) {
       state.repairReceipt = Object.freeze({jobId: state.jobId, runId: state.runId, provider: state.provider,
         repairId: msg.repairId, context: state.repairedContext, responseId: state.repairedResponseId, text: source.text,
         result: Object.freeze({ok:true,raw:msg.raw,responseText:source.text})});
-      preserveRepairContext(state);
       recordReviewStep("repair_accepted");
       // Receipt handoff does not wait for an older collector to understand the
       // new protocol. Preserve running as invocation liveness, not result state.
@@ -483,37 +1569,61 @@ function installReviewRunner(name, run) {
     }
     // Also retry after collection is cached: there may no longer be a polling loop.
     if (typeof retrySubmissionPersistence === "function") retrySubmissionPersistence();
-    if (msg.type === "ashlar-can-close") {
-      // Final authorization must recheck the assistant, not just URL/user turns.
-      // A cached result can outlive its collector and the displayed response.
-      const repaired = repairedCollectionResult(state);
-      const captured = sourceReceiptFor(state);
-      const native = nativeCleanupProof(state) ? state.nativeCompletion : undefined;
-      const bound = (repaired || state.repairedResult) ? preserveRepairContext(state)
-        : captured || native ? preserveSourceContext(state,captured || native) : undefined;
-      const context = repaired ? state.repairReceipt.context : captured?.context || native?.context || state.finishedContext;
-      const pending = (!repaired && !captured && !state.restoredCompletion && state.running) ||
-        !(repaired || captured || state.result) || !context || state.submissionPersistencePending;
-      const unchanged = !state.tabRepurposed && context === reviewPageContext();
-      const busyNow = (typeof stopButtonVisible === "function" && stopButtonVisible()) ||
-        Boolean(bound?.root && typeof responseStreaming === "function" && responseStreaming(bound.root)) ||
-        Boolean((captured || native) && bound?.root && !replyDoneVisible(bound.root));
-      // User follow-ups/navigation transfer the tab back to the user. Do not close it.
-      const draft = typeof composer === "function" && globalThis.document ? composer() : null;
-      const hasDraft = Boolean(draft && (draft.value || draft.innerText || draft.textContent || "").trim());
-      if (!pending && (!unchanged || hasDraft)) releaseManagedSlot(state);
-      reply({ok: true, canClose: !pending && unchanged && !busyNow && !hasDraft,
-        reason: pending ? "pending" : !unchanged || hasDraft ? "repurposed" : busyNow ? "pending" : "complete",
-        url: globalThis.location?.href || ""});
+    if (msg.type === "ashlar-can-close" || msg.type === "ashlar-fix-cancel") {
+      // A secured leg asks can-close; a cancelled or forgotten review asks ashlar-fix-cancel, which also
+      // stops the run. Both get the same ownership verdict (tabOwnership). A FIX tab is closed only on
+      // the proven-success path (#77, background.js forceCloseFixTab): its page is asked to cancel
+      // only when the worker keeps the tab, so that reply stops the run, frees the managed slot and
+      // authorises nothing (no ownership verdict), and no fix page ever answers for an unbound tab.
+      const fixRun = msg.kind === "fix" || state.kind === "fix";
+      if (msg.type === "ashlar-fix-cancel" && msg.undispatched === true && !state.jobId && !state.runId) {
+        // The tab the worker opened for a run it never sent (undispatched), either kind: a late run
+        // message for it stays stopped. A fix page stops there: the worker keeps an undispatched fix
+        // tab (#77), so the page refuses the release like any unbound page and vouches for nothing.
+        fenceRun(state, msg.jobId, msg.runId);
+        if (fixRun) { reply({ok:false,code:"job_mismatch"});return; }
+        // Positive binding only: an unbound page is never evidence that this tab is Ashlar's, except
+        // the tab the worker opened for a review it never sent: Ashlar's only while it holds nothing
+        // of the user's (no turn, no draft).
+        const turns = userTurnEls().length;
+        const draft = Boolean(composerDraftText()) || composerStagedFiles(null, null).length > 0;
+        const blank = !turns && !draft;
+        reply({ok:true,releaseProtocol:1,owned:blank,canClose:blank,ownership:blank ? "owned" : "takenOver",
+          ...(blank ? {} : {cause: draft ? "draft" : "user_turn"}),blank,unsent:false,url:globalThis.location?.href || ""});return;
+      }
+      if (!state.jobId || msg.jobId !== state.jobId || (state.runId || "") !== (msg.runId || "")) {
+        reply({ok:false,code:"job_mismatch"});return;
+      }
+      if (msg.type === "ashlar-fix-cancel" && fixRun) {
+        if (!state.runId) { reply({ok:false,code:"job_mismatch"});return; } // positive binding only
+        stopRun(state);
+        releaseManagedSlot(state);
+        reply({ok:true,released:true,stopped:true,url:globalThis.location?.href || ""});return;
+      }
+      if (msg.type === "ashlar-fix-cancel") stopRun(state);
+      const verdict = tabOwnership(state, msg.allocationUrl, fixRun, msg.secured === true);
+      const owned = verdict.ownership === "owned";
+      // A tab on a permanent verdict (taken over, moved off its recorded conversation, or a fix whose
+      // send recorded none: fixVerdictPermanent) or one the worker gives up identifying (preserve)
+      // stays open but is no longer Ashlar's: free its managed slot, or it counts against tab
+      // capacity (untracked binding) until the user closes it by hand.
+      const permanent = fixVerdictPermanent(verdict);
+      // A review leg the generating lease failed (#87) under a Stop that never clears can never prove
+      // a close: the tab is kept ("stalled", preserved and retired like a takeover), and its managed
+      // slot freed so it stops holding tab capacity.
+      const stalled = owned && !fixRun && msg.type === "ashlar-can-close" && state.result?.code === "stalled" &&
+        typeof stopButtonVisible === "function" && stopButtonVisible();
+      if (permanent || stalled || msg.preserve === true) releaseManagedSlot(state);
+      reply({ok:true,releaseProtocol:1,blank:false,unsent:false,...verdict,owned:owned && !stalled,canClose:owned && !stalled,
+        reason:stalled ? "stalled" : owned ? "complete" : permanent ? "repurposed" : "pending",
+        running:Boolean(state.running),hasResult:Boolean(state.result || repairedCollectionResult(state) || sourceReceiptFor(state)),
+        stopped:Boolean(state.runStopped),url:globalThis.location?.href || ""});
       return;
     }
     const repaired = repairedCollectionResult(state);
     if (repaired) { reply(repaired); return; }
     if (sourceReceiptFor(state)) {reply({ok:false,code:"captured",observation:{state:"source_archived"}});return;}
-    if (state.restoredCompletion && state.nativeCompletion) {
-      reply({ok:true,raw:state.nativeCompletion.raw,responseText:state.nativeCompletion.text,completion:nativeCleanupProof(state)});return;
-    }
-    if (state.result) { reply(state.result); return; }
+    if (state.result) { reply(fixAnswerReply(state, msg, state.result, busy)); return; }
     if (state.running) { reply(busy()); return; }
     if (msg.type === "ashlar-harvest") {
       reply({ ok: false, code: "idle", error: "no active review in this page" });
@@ -523,14 +1633,41 @@ function installReviewRunner(name, run) {
       reply({ok: false, code: "disconnected", error: "original job binding is unavailable"});
       return;
     }
+    // A new run message that arrives after its `until` (a delivery the worker stopped waiting for:
+    // X4, #85) starts nothing: nothing is bound, stored or fenced, and the worker asks again. A
+    // resume, or a copy for the run this page is already bound to, is not a new run.
+    if (!msg.resume && !state.jobId && !(Number(msg.until) >= Date.now())) {
+      reply({ok: false, code: "stale_run", retry: true, error: "the run message arrived after the worker stopped waiting for it; nothing was started"});
+      return;
+    }
+    // A new ChatGPT run starts only on the fresh page its tab was opened on (the worker's
+    // allocationUrl), with no user turn (X2, #85): a tab the user moved to their own conversation, or
+    // sent a message in, before Ashlar's prompt went out is theirs. Nothing is bound, typed or sent
+    // there, and the run is fenced, so a later copy of this message binds stopped. (Grok's runner
+    // starts a new chat itself.)
+    let freshPage;
+    if (!msg.resume && !state.jobId && state.provider === "chatgpt") {
+      const cause = freshPageLeft(msg.allocationUrl, null);
+      if (cause) {
+        fenceRun(state, msg.jobId, msg.runId);
+        reply({ok: false, code: "taken_over", cause, error: "the tab is no longer the new chat it was opened on; nothing was sent"});
+        return;
+      }
+      freshPage = globalThis.location?.href || "";
+    }
     const resume = Boolean(msg.resume || state.jobId);
+    state.freshPage = freshPage;
     state.jobId = String(msg.jobId);
     state.runId = state.runId || String(msg.runId || "");
     try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
     try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
     state.running = true;
+    // Only a fix item's run message carries its kind; review runs keep kind undefined.
+    state.kind = msg.kind === "fix" ? "fix" : undefined;
+    // A page is bound to one (job, run) for life: a stop already taken (even one whose marker could
+    // not be written) holds, and a reload re-reads the marker.
+    state.runStopped ||= runStoppedFor(state.jobId, state.runId);
     state.nativeCompletion = undefined;
-    state.restoredCompletion = false;
     state.sourceTrackingOwner = undefined;
     state.repairProbeTracker = undefined;
     state.repairReceipt = undefined;
@@ -543,12 +1680,20 @@ function installReviewRunner(name, run) {
     Promise.resolve().then(() => state.run(String(msg.prompt || ""), msg.reasoning, resume))
       .then(raw => {
         if (sourceReceiptFor(state)) return; // Captured original is not parsed JSON.
-        if (state.repairedResult) preserveRepairContext(state);
         state.finishedContext = state.repairedContext || state.nativeCompletion?.context || reviewPageContext();
         state.result = { ok: true, raw, responseText: state.responseText, completion:nativeCleanupProof(state) };
       })
       .catch(e => {
-        recordReviewStep(e?.code === "quota" ? "quota" : "error");
+        // A new run whose tab stopped being its fresh page before the send (throwIfStopped).
+        const takenOver = e?.code === "taken_over";
+        // Positive evidence, permanent (tabOwnership): a run that ended before its Send wrote no
+        // journal, so the release verdict must not re-derive ownership from this page's finished
+        // state, which already holds the user's turn or draft (Ashlar 4103758194).
+        if (takenOver && !state.tabRepurposed) { state.tabRepurposed = true; state.takeoverCause = e.takeoverCause || "navigated"; }
+        const leaseExpired = e?.code === "stalled"; // expireGeneratingLease (#87)
+        recordReviewStep(e?.code === "quota" ? "quota" : e?.code === "cancelled" ? "cancelled" : takenOver ? "context_changed" :
+          leaseExpired ? "lease_expired_generating" : e?.code === "response_timeout" ? "response_timeout" :
+          e?.code === "presend_stalled" ? "presend_stalled" : e?.code === "logged_out" ? "logged_out" : "error");
         state.finishedContext = reviewPageContext();
         state.result = { ok: false, error: e instanceof Error ? e.message : String(e), code: e?.code || "error" };
       })

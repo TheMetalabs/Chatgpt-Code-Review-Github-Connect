@@ -38,23 +38,27 @@ export async function appFixture(options={}, githubOptions={}) {
    process:{env:{NODE_TEST_CONTEXT:'review-fixture',ASHLAR_BRIDGE_TOKEN:'fixture-token',ASHLAR_HISTORY_TOKEN:'fixture-history-token-32-characters-long'}}});
  const mocks=new Map([
   [resolve(root,'src/lib/dotenv-file.server.ts'),{loadDotenvFile(){},writeEnvPatch(){}}],
-  [resolve(root,'src/lib/settings.server.ts'),{loadBotSettings:()=>settings,saveBotSettings:s=>s,sanitizeBotSettings:s=>s}],
+  // Persistence is an adapter; a test can make a save fail (githubOptions.saveBotSettings).
+  [resolve(root,'src/lib/settings.server.ts'),{loadBotSettings:()=>settings,
+  saveBotSettings:s=>githubOptions.saveBotSettings?githubOptions.saveBotSettings(s):s,sanitizeBotSettings:s=>s}],
   [resolve(root,'src/lib/utils.ts'),{sleep:()=>new Promise(resolve=>setTimeout(resolve,25))}],
   [resolve(root,'src/lib/github.server.ts'),{
-    githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=> 'fixture-not-a-real-token',
+    githubReady:()=>({appId:'fixture',privateKey:'fixture'}),installationToken:async()=>githubOptions.installationToken?.() ?? 'fixture-not-a-real-token',
     githubWebhookSecret:()=> 'fixture-webhook-secret',
     fetchPullHead:async()=>{githubCalls.head++;githubCalls.timeline.push('head');await githubOptions.beforeHead?.();if(githubOptions.headError)throw githubOptions.headError;return {...sample,draft:false,fork:false,...githubOptions.pull};},
     fetchPullSnapshot:async(_token,target)=>{githubCalls.snapshot++;githubCalls.timeline.push('snapshot');if(githubOptions.snapshotError)throw githubOptions.snapshotError;return {...sample,...target};},
     reactOnDelivery:async(_token,job,content)=>{githubCalls.reactions.push({jobId:job.id,thread:job.thread,content});githubCalls.timeline.push('reaction:'+content);},
     formatGithubError:error=>String(error),
     createIssueComment:async(_token,input)=>{ops.push(input.body);return {id:1};},
-    updateIssueComment:async(_token,input)=>{ops.push(input.body);},
+    updateIssueComment:async(token,input)=>{await githubOptions.beforeOpsUpdate?.(token,input);ops.push(input.body);},
     createPullReview:async(_token,input)=>{await githubOptions.beforeReview?.();reviews.push(input);return {id:2,inlineDropped:Boolean(githubOptions.inlineDropped)};},
     // #61 added a cross-file head reader (harbor's makeHeadReader → getFile) to the import graph the
     // fixture links. Without this export the vm linker fails ("does not provide an export named
     // 'getFile'"), every appFixture test throws, and the leaked Chromium handle hangs the process to
     // the CI 10-min timeout. Fixtures are snapshot-only, so head reads return null.
     getFile:async()=>githubOptions.getFile?githubOptions.getFile():null,
+    // Prior finding threads for the review prompt (aicc #455): none unless a test supplies rows.
+    listReviewComments:async()=>githubOptions.listReviewComments?githubOptions.listReviewComments():[],
     // Loop-runtime GitHub calls a test opts into (the runtime loads github.server lazily).
     ...(githubOptions.api||{}),
   }],

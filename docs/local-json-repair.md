@@ -28,6 +28,17 @@ even across OFF -> ON changes. It does not cancel the original browser review,
 clear responses, add a Local reviewer, or retract results already committed.
 Changing the endpoint/model/credential fences outstanding candidates as well.
 
+A repair request sets `max_tokens` to `max(8192, ceil(original length / 2) + 4096)`,
+since the candidate re-emits the whole original and a server default (omlx: 8192,
+thinking included) cannot; a short original never gets less than that default.
+A server that refuses the budget before generating anything (HTTP 400/422, as
+vLLM/SGLang do when prompt + `max_tokens` exceeds the context window) gets the same
+request once more without `max_tokens`, so it fills whatever context is left, as
+every repair did before the budget existed. No other failure is resent. `ASHLAR_LOCAL_REPAIR_NO_THINKING=true` also sends
+`chat_template_kwargs: {enable_thinking: false}`; it is off by default because a
+strict OpenAI-schema server may reject the field. A reply cut off by the server is
+recorded as `finish_reason_<reason>` (for example `finish_reason_length`).
+
 ## Flow and trust boundaries
 
 1. A new-capability extension offers a full source only after the bound user and

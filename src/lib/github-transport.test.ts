@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as http from "node:http";
 import * as net from "node:net";
 import * as https from "node:https";
-import { GithubTransportError, mayResendOnOtherHost, trackRequestSent } from "./github-transport.ts";
+import { GithubTransportError, GithubWriteError, githubWriteOutcome, mayResendOnOtherHost, trackRequestSent } from "./github-transport.ts";
 
 /** Runs one request against 127.0.0.1:port and reports whether its bytes may have been sent. */
 function sentOnError(port: number, opts: { tls?: boolean; timeoutMs?: number } = {}): Promise<boolean> {
@@ -49,6 +49,26 @@ describe("mayResendOnOtherHost (a write whose request may have reached GitHub is
       assert.equal(mayResendOnOtherHost(m, new GithubTransportError("GitHub API timeout", true)), false, m);
       assert.equal(mayResendOnOtherHost(m, new Error("unknown failure")), false, `${m}: unknown → not re-sent`);
     }
+  });
+});
+
+describe("githubWriteOutcome (did a failed write create nothing, or may it have landed?)", () => {
+  it("a GitHub answer below 500 is a definite rejection; a 5xx may have been applied", () => {
+    for (const s of [301, 400, 403, 404, 409, 422, 429]) assert.equal(githubWriteOutcome(s), "rejected", String(s));
+    for (const s of [500, 502, 503, 504]) assert.equal(githubWriteOutcome(s), "unknown", String(s));
+  });
+
+  it("no response: rejected only when the request never left", () => {
+    assert.equal(githubWriteOutcome(0, true), "rejected");
+    assert.equal(githubWriteOutcome(0, false), "unknown");
+    assert.equal(githubWriteOutcome(0), "unknown", "unsure → unknown");
+  });
+
+  it("GithubWriteError carries status, outcome and cause", () => {
+    const cause = new GithubTransportError("GitHub API timeout", true);
+    const e = new GithubWriteError("GitHub issue comment 0: GitHub API timeout", 0, "unknown", cause);
+    assert.ok(e instanceof Error);
+    assert.deepEqual([e.name, e.status, e.outcome, e.cause], ["GithubWriteError", 0, "unknown", cause]);
   });
 });
 

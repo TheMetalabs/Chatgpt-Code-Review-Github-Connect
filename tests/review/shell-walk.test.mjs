@@ -1,0 +1,450 @@
+// Generated interleavings against the REAL worker (extension/background.js) in the repo's vm harness:
+// a seeded random walk over server, tab, page and user events, invariants after every step, bounded
+// termination at quiescence, and greedy shrinking of a failing walk. It found the #82 residual: a
+// page that accepts a message but never answers ([hang, tick]) or a frozen tab ([freeze, tick]) held
+// the job's lane forever, because the poll sent its page messages without a reply deadline. A tab
+// Chrome swaps into a new id ([discardSwap]) must still be followed and released.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {webcrypto} from 'node:crypto';
+import vm from 'node:vm';
+import {background, storage, raw, until, flush} from './helpers.mjs';
+
+const URL_TAB = 'https://chatgpt.com/c/managed', OTHER = 'https://chatgpt.com/c/users-own';
+const ANSWER = {review: raw, fix: '{"summary":"guard","files":[{"path":"a.ts","content":"x"}],"dispositions":[]}'};
+const EVENTS = ['tick', 'tick', 'tick', 'later', 'cancel', 'missing', 'sweep', 'followup', 'navigate', 'userClose',
+  'freeze', 'thaw', 'discard', 'discardSwap', 'loading', 'loaded', 'hang', 'noReceiver', 'pageOk', 'notRendered', 'rendered', 'browserRestart'];
+const START = ['secured', 'generating', 'undispatched'];
+/** The operation kinds allowed to perform each tab effect (the tab queue, #85). */
+const PAGE_OPS = ['poll', 'release', 'probe', 'sourceRead', 'captureCommit', 'repairReceipt', 'stall'];
+const TAB_EFFECT_OPS = {message: PAGE_OPS, inject: PAGE_OPS, create: ['poll'], remove: ['release'], reload: ['poll', 'release']};
+/** A page reply deadline that expires at once (the real one is PAGE_REPLY_MS). */
+const expiresAtOnce = () => ({promise: new Promise((_resolve, reject) => setImmediate(() => reject(new Error('the page did not answer in time')))), cancel() {}});
+
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+/** Replays `events` on one leg (`kind`, starting `start`) and returns the first violated invariant ('' if none). */
+async function run(kind, start, events) {
+  const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
+  // secured: the answer acknowledged by the server (answerDelivered: the worker's record of the
+  // complete ACK, which a fix needs to take its proven-success path, #77; a review ignores it)
+  const state = start === 'secured' ? {delivered: true, cleanupPending: true, answerDelivered: true, outcome: {ok: true, raw: ANSWER[kind], originalText: ANSWER[kind]}, conversation: URL_TAB, pageUrl: URL_TAB}
+    // generating: dispatched, and its poll recorded the page its run answered on (pageUrl, every
+    // successful reply records it): the conversation page the tab shows
+    : start === 'undispatched' ? {started: false} : {pageUrl: URL_TAB};
+  const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
+    providers: ['chatgpt'], reasoning: {chatgpt: 'pro'}, states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', ...state}}};
+  const session = storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}});
+  const tab = {id: 10, url: start === 'undispatched' ? 'https://chatgpt.com/?temporary-chat=true' : URL_TAB, status: 'complete'};
+  // w.id: the leg's tab id, which a discardSwap moves (Chrome's onReplaced).
+  const w = {id: 10, status: 'awaiting_chat', mode: 'ok', user: false, reused: false, notRendered: false, clean: true, now: Date.now()};
+  const page = {bound: start !== 'undispatched', sent: start !== 'undispatched'};
+  const handler = (_id, m) => {
+    if (w.reused) return {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'}; // the user's tab now
+    if (m.type === 'ashlar-tab-status') return {ok: true};
+    if (m.type === 'ashlar-run') page.bound = true;
+    if (m.type === 'ashlar-can-close' || m.type === 'ashlar-fix-cancel') {
+      const url = b.tabs.get(w.id)?.url;
+      if (w.user) return {ok: true, releaseProtocol: 1, ownership: 'takenOver', cause: 'user_turn', url, conversation: URL_TAB};
+      if (!page.bound && !m.undispatched) return {ok: false, code: 'job_mismatch', jobId: '', runId: '', provider: 'chatgpt'};
+      if (!page.bound) return {ok: true, releaseProtocol: 1, ownership: 'owned', blank: true, url, jobId: '', runId: '', provider: 'chatgpt'};
+      if (!page.sent) return {ok: true, releaseProtocol: 1, ownership: 'owned', blank: true, url};
+      if (w.notRendered) return {ok: true, releaseProtocol: 1, ownership: 'unknown', cause: 'not_rendered', url};
+      return {ok: true, releaseProtocol: 1, ownership: 'owned', conversation: URL_TAB, url};
+    }
+    return {ok: false, code: 'busy', retry: true};
+  };
+  const api = async (_path, body) => (body?.action === 'ping'
+    ? {ok: true, active: w.status === 'awaiting_chat', accepted: w.status === 'awaiting_chat', status: w.status, bridge: {captureProtocol: 1, localJsonRepairEnabled: false}}
+    : {ok: true, job: null});
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[jobId]: job}}), session, tabs: new Map([[10, tab]]), api, handler});
+  b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+  const RealDate = Date; b.context.Date = class extends RealDate { static now() { return w.now; } };
+  b.context.pageReplyDeadline = expiresAtOnce;
+  b.chrome.tabs.reload = async id => { const t = b.tabs.get(id); if (t) Object.assign(t, {status: 'complete', discarded: false}); };
+  const realSend = b.chrome.tabs.sendMessage;
+  b.chrome.tabs.sendMessage = (id, msg, cb) => {
+    const t = b.tabs.get(id);
+    // A frozen page runs no handler: nothing is sent to it (not even the read-only inventory probe).
+    if (t?.frozen) w.frozenMessaged = true;
+    if (t && (w.mode === 'hang' || t.frozen)) { b.messages.push({id, ...msg}); return; } // accepted, never answered
+    // a discarded tab holds no page: nothing answers and nothing can be injected
+    if (t && (w.mode === 'noReceiver' || t.discarded)) { b.messages.push({id, ...msg}); b.chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'}; cb(); b.chrome.runtime.lastError = null; return; }
+    return realSend(id, msg, cb);
+  };
+  b.chrome.scripting.executeScript = async ({target}) => { if (w.mode === 'noReceiver' || b.tabs.get(target.tabId)?.discarded) throw new Error('Cannot access contents of the page'); };
+  const pending = () => b.local.state.pendingReviewJobs?.[jobId];
+  const settles = async operation => { let settled = false; operation().then(() => { settled = true; }); return until(() => settled, 2000); };
+  // A fix tab may close only on the proven-success path (#77): here, only a leg whose answer was
+  // delivered before the walk (this harness never delivers a new one). A review closes untouched.
+  const mayClose = kind === 'review' || start === 'secured';
+  // Q1 (#85): every tab effect runs inside an operation of a kind allowed to perform it (the tab
+  // queue), and no two operations ever run at once.
+  const queued = outsideAllowed => {
+    if (b.queue.overlapped) return 'tab_ops_overlapped';
+    if (b.queue.bridgeInOp.length) return `bridge_call_in_tab_op(${b.queue.bridgeInOp})`;
+    for (const {effect, kind} of b.effects.splice(0)) {
+      if (kind === undefined ? !outsideAllowed : !TAB_EFFECT_OPS[effect]?.includes(kind)) return `tab_effect_${effect}_in_${kind || 'no_op'}`;
+    }
+    return '';
+  };
+  const tick = async () => {
+    const userBefore = w.user || w.reused;
+    const closedBefore = b.closedTabs.length;
+    if (!await settles(() => b.tick())) return 'tick_never_settles';
+    const outside = queued(false);
+    if (outside) return outside;
+    if (w.frozenMessaged) return 'messaged_frozen_tab';
+    if (b.closedTabs.length > closedBefore && userBefore) return 'closed_user_tab';
+    if (b.closedTabs.length > closedBefore && !mayClose) return 'closed_undelivered_fix';
+    return '';
+  };
+  const apply = async ev => {
+    const t = b.tabs.get(w.id);
+    switch (ev) {
+      case 'tick': return tick();
+      case 'later': w.now += 45_000; return '';
+      case 'cancel': if (w.status === 'awaiting_chat') w.status = 'cancelled'; return '';
+      case 'missing': w.status = 'missing'; return '';
+      case 'sweep': {
+        const closedBefore = b.closedTabs.length;
+        if (!await settles(() => b.context.autoSweepStuckJobs())) return 'sweep_never_settles';
+        return queued(false) || (b.closedTabs.length > closedBefore && !mayClose ? 'closed_undelivered_fix' : '');
+      }
+      case 'followup': if (t && !w.reused) { w.user = true; } return '';
+      case 'navigate': if (t && !w.reused) { w.user = true; t.url = OTHER; } return '';
+      case 'userClose': if (t) await b.closeTab(w.id); return '';
+      case 'freeze': if (t) { t.frozen = true; w.clean = false; } return '';
+      case 'thaw': if (t) t.frozen = false; return '';
+      case 'discard': if (t) { Object.assign(t, {discarded: true, status: 'unloaded'}); w.clean = false; } return '';
+      // Chrome swaps the page into a new tab id (onReplaced, no onRemoved): the leg must follow it.
+      case 'discardSwap': if (t) { w.id += 1; await b.replaceTab(t.id, {...t, id: w.id, discarded: true, status: 'unloaded'}); } return '';
+      case 'loading': if (t) { t.status = 'loading'; w.clean = false; } return '';
+      case 'loaded': if (t && !t.discarded) t.status = 'complete'; return '';
+      case 'hang': w.mode = 'hang'; w.clean = false; return '';
+      case 'noReceiver': w.mode = 'noReceiver'; w.clean = false; return '';
+      case 'pageOk': w.mode = 'ok'; return '';
+      case 'notRendered': w.notRendered = true; w.clean = false; return '';
+      case 'rendered': w.notRendered = false; return '';
+      case 'browserRestart': // storage.session is cleared; tab id 10 may now be a tab the user opened
+        if (t) { for (const k of Object.keys(b.session.state)) delete b.session.state[k]; w.reused = true; w.clean = false; }
+        return '';
+    }
+    return '';
+  };
+  for (const ev of events) { const v = await apply(ev); if (v) return v; }
+  // Quiescence: the user is away. A leg the server still wants is ended by the server's own deadline.
+  if (pending() && w.status === 'awaiting_chat') w.status = 'cancelled';
+  for (let i = 0; i < 8 && pending(); i++) { w.now += 60_000; const v = await tick() || await apply('sweep'); if (v) return v; }
+  if (pending()) return `not_terminal(${pending().states.chatgpt.cleanupWaitReason || pending().states.chatgpt.connectionError || ''})`;
+  if (w.clean && !w.user && b.tabs.has(w.id) && mayClose) return 'untouched_reachable_tab_preserved';
+  return '';
+}
+
+async function shrink(kind, start, events, violation) {
+  let cur = events;
+  for (let changed = true; changed;) {
+    changed = false;
+    for (let i = 0; i < cur.length; i++) {
+      const cand = cur.slice(0, i).concat(cur.slice(i + 1));
+      if ((await run(kind, start, cand)) === violation) { cur = cand; changed = true; break; }
+    }
+  }
+  return cur;
+}
+
+// The shrunk traces the walk found on #82 (fc3fae26): each held the job's lane forever (or left the tab).
+for (const kind of ['review', 'fix']) {
+  for (const start of START) {
+    for (const trace of [['hang', 'tick'], ['hang', 'missing'], ['hang', 'cancel', 'tick'], ['hang', 'tick', 'pageOk', 'tick'],
+      ['freeze', 'tick'], ['freeze', 'tick', 'thaw', 'tick'], ['freeze', 'missing'],
+      // A tab Chrome swapped into a new id (onReplaced, no onRemoved) was left open as absent.
+      ['discardSwap'], ['tick', 'discardSwap', 'tick'], ['discardSwap', 'cancel', 'tick'], ['discardSwap', 'missing', 'sweep']]) {
+      test(`${kind} ${start}: [${trace.join(', ')}] settles every tick, ends the leg and holds every invariant`, async () => {
+        assert.equal(await run(kind, start, trace), '');
+      });
+    }
+  }
+}
+
+test('generated interleavings against the real worker: invariants and bounded termination', {timeout: 120_000}, async () => {
+  const found = new Map();
+  const SEEDS = Number(process.env.WALK_SEEDS || 400);
+  for (let seed = 1; seed <= SEEDS; seed++) {
+    const r = rng(seed);
+    const kind = r() < 0.5 ? 'review' : 'fix';
+    const start = START[Math.floor(r() * START.length)];
+    const events = Array.from({length: 4 + Math.floor(r() * 10)}, () => EVENTS[Math.floor(r() * EVENTS.length)]);
+    const v = await run(kind, start, events);
+    if (v && !found.has(`${kind}:${start}:${v}`)) found.set(`${kind}:${start}:${v}`, {seed, minimal: await shrink(kind, start, events, v)});
+  }
+  assert.deepEqual([...found].map(([key, {seed, minimal}]) => `${key} seed=${seed} minimal=[${minimal.join(', ')}]`), []);
+});
+
+// Every other page message the worker sends is bounded the same way: a page that accepts it but
+// never answers leaves the lane (a capture or repair receipt, a repair source read, an inventory
+// probe) free for the next attempt instead of holding it for the worker's lifetime.
+function unanswered(states, patch = {}) {
+  const job = {jobId: 'job-A', origin: 'http://bridge', leaseId: 'lease-A', providers: ['chatgpt'], captureProtocol: 1,
+    states: {chatgpt: {tabId: 10, started: true, runId: 'run-A', ...states}}, ...patch};
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {'job-A': job}}),
+    tabs: new Map([[10, {id: 10, url: URL_TAB, status: 'complete'}]])});
+  b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+  b.chrome.tabs.sendMessage = (id, msg) => { b.messages.push({id, ...msg}); }; // accepted, never answered
+  b.context.pageReplyDeadline = expiresAtOnce;
+  b.settles = async operation => { let settled = false; operation().then(() => { settled = true; }, () => { settled = true; }); return until(() => settled, 2000); };
+  return b;
+}
+const durable = {id: 'capture-A', archiveDurable: true, responseId: 'response-A', text: 'not json', context: '[]', sourceHash: 'h', totalChars: 8};
+const RECEIPTS = [
+  ['the repair source read', 'ashlar-repair-source', {formatError: true, outcome: {ok: true, raw: 'not json'}}, (b, jobs) => b.context.readRepairSource(jobs['job-A'], 'chatgpt', jobs)],
+  ['the capture receipt', 'ashlar-capture-accepted', {sourceCapture: durable}, (b, jobs) => b.context.captureProvider(jobs['job-A'], 'chatgpt', jobs)],
+  ['the repair receipt', 'ashlar-repair-accepted', {delivered: true, repairReceiptPending: true, repairAttempt: {id: 'repair-A', raw, text: 'original', responseId: 'response-A', sourceHash: 'h', status: 'accepted'}},
+    (b, jobs) => b.context.notifyRepairReceipt(jobs['job-A'], 'chatgpt', jobs)],
+];
+for (const [what, type, states, send] of RECEIPTS) {
+  test(`${what} to a page that never answers settles (bounded like the release path)`, async () => {
+    const b = unanswered(states);
+    const jobs = await b.context.workerJobs('http://bridge');
+    assert.ok(await b.settles(() => send(b, jobs)), `${what} does not hold its lane`);
+    assert.ok(b.messages.some(m => m.type === type), 'the page was asked');
+  });
+}
+/** The worker's clock moved on by `ms` (past a page back-off, PAGE_BACKOFF_MS). */
+function later(b, ms) {
+  const RealDate = Date, at = (b.context.Date || RealDate).now() + ms;
+  b.context.Date = class extends RealDate { static now() { return at; } };
+}
+const idle = b => until(() => vm.runInContext('inventoryLanes.size', b.context) === 0);
+test('an inventory probe of a page that never answers ends, and the tab is probed again once its back-off ended', async () => {
+  const b = unanswered({});
+  const probes = () => b.messages.filter(m => m.type === 'ashlar-tab-status').length;
+  await b.context.refreshTabInventory();
+  assert.ok(await until(() => probes() === 1), 'probed');
+  // The probe's lane is single-flight per tab: a second probe is sent only once the first ended.
+  assert.ok(await idle(b), 'the unanswered probe ended');
+  await b.context.refreshTabInventory();
+  assert.ok(await idle(b));
+  assert.equal(probes(), 1, 'a page that did not answer is not asked again while it is backed off');
+  later(b, 30_000);
+  await b.context.refreshTabInventory();
+  assert.equal(probes(), 2, 'the unanswered probe released its lane, and the back-off ended');
+});
+test('an inventory probe re-sent after injecting the content scripts, and never answered, ends too', async () => {
+  const b = unanswered({});
+  // An older page answers without the ownership protocol; after the injection nothing answers.
+  b.chrome.tabs.sendMessage = (id, msg, cb) => { b.messages.push({id, ...msg}); if (b.messages.length === 1) cb({ok: true}); };
+  const injected = [];
+  b.chrome.scripting.executeScript = async ({target}) => { injected.push(target.tabId); };
+  const probes = () => b.messages.filter(m => m.type === 'ashlar-tab-status').length;
+  await b.context.refreshTabInventory();
+  assert.ok(await until(() => vm.runInContext('inventoryLanes.size', b.context) === 0, 2000), 'the unanswered probe after the injection ended');
+  assert.deepEqual([injected, probes()], [[10], 2], 'injected once, then probed again');
+  await b.context.refreshTabInventory();
+  assert.ok(await idle(b));
+  assert.equal(probes(), 2, 'not asked again while it is backed off');
+  later(b, 30_000);
+  await b.context.refreshTabInventory();
+  assert.equal(probes(), 3, 'its lane is free for the next refresh once the back-off ended');
+});
+test('an inventory probe whose script injection the page never completes ends within the reply deadline', async () => {
+  const b = unanswered({});
+  // An older page answers without the ownership protocol; a hung page never runs the injection.
+  b.chrome.tabs.sendMessage = (id, msg, cb) => { b.messages.push({id, ...msg}); cb({ok: true}); };
+  b.chrome.scripting.executeScript = () => new Promise(() => {});
+  await b.context.refreshTabInventory();
+  assert.ok(await until(() => vm.runInContext('inventoryLanes.size', b.context) === 0, 2000), 'the probe ended');
+  await b.context.refreshTabInventory();
+  assert.ok(await idle(b));
+  assert.equal(b.messages.filter(m => m.type === 'ashlar-tab-status').length, 1, 'the page that did not run the injection is backed off');
+});
+// A reloaded page holds no collector (harvest answers idle), so the poll asks it to resume: that
+// message is bounded too, or a page that never answers it would hold the job's lane forever.
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a resume the page never answers settles the tick, and a tick after the page's back-off asks again`, async () => {
+    const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
+    const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
+      providers: ['chatgpt'], states: {chatgpt: {tabId: 10, started: true, runId: 'run-A'}}};
+    const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[jobId]: job}}),
+      session: storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}}),
+      tabs: new Map([[10, {id: 10, url: URL_TAB, status: 'complete'}]]),
+      api: async (_path, body) => (body?.action === 'ping' ? {ok: true, active: true, accepted: true, status: 'awaiting_chat'} : {ok: true, job: null})});
+    b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+    b.context.pageReplyDeadline = expiresAtOnce;
+    b.chrome.tabs.sendMessage = (id, msg, cb) => {
+      b.messages.push({id, ...msg});
+      if (msg.type === 'ashlar-harvest') cb({ok: false, code: 'idle', jobId: msg.jobId, runId: msg.runId, provider: msg.provider});
+      // (the read-only status probe is answered: in the tab queue the inventory's probe of a hung page
+      // would back it off before the poll under test asks it)
+      if (msg.type === 'ashlar-tab-status') cb({ok: true, ownershipProtocol: 1, jobId, runId: 'run-A', provider: 'chatgpt', released: false, url: URL_TAB});
+      // the resume (like every other message) is accepted and never answered
+    };
+    const resumes = () => b.messages.filter(m => m.id === 10 && m.type === 'ashlar-run' && m.resume === true).length;
+    const settles = async () => { let settled = false; b.tick().then(() => { settled = true; }, () => { settled = true; }); return until(() => settled, 2000); };
+    assert.ok(await settles(), 'the tick settles');
+    assert.equal(resumes(), 1, 'the page was asked to resume');
+    assert.ok(await settles(), 'the next tick settles');
+    assert.equal(resumes(), 1, 'not asked again while the page is backed off');
+    later(b, 30_000);
+    assert.ok(await settles(), 'a tick after the back-off settles');
+    assert.equal(resumes(), 2, 'and asks again');
+  });
+}
+/** A leg on tab 10 (`states`), its page answering every message with `answer(msg)` (undefined: never
+ * answered), the tab recorded as created for the leg in this browser session. */
+function legOnTab(kind, states, answer, url = URL_TAB) {
+  const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
+  const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
+    providers: ['chatgpt'], states: {chatgpt: {tabId: 10, runId: 'run-A', ...states}}};
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[jobId]: job}}),
+    session: storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}}),
+    tabs: new Map([[10, {id: 10, url, status: 'complete'}]]),
+    api: async (_path, body) => (body?.action === 'ping' ? {ok: true, active: true, accepted: true, status: 'awaiting_chat'} : {ok: true, job: null})});
+  b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+  b.chrome.tabs.sendMessage = (id, msg, cb) => {
+    b.messages.push({id, ...msg});
+    const reply = answer(msg);
+    if (reply) cb({jobId: msg.jobId, runId: msg.runId, provider: msg.provider, ...reply});
+  };
+  b.pending = () => b.local.state.pendingReviewJobs[jobId];
+  return b;
+}
+// X4 (a late page message): after a first send that found no receiver, sendToTab injects the scripts
+// again and sends a second time. Once askPage gave up on the reply, neither happens: a page must never
+// receive a run the worker stopped waiting for (it would start it unseen, Ashlar 4101623037).
+for (const kind of ['review', 'fix']) {
+  test(`${kind}: a run message whose first send found no receiver is not sent again after its reply deadline`, async () => {
+    const delivered = [];
+    // (A current page answers the read-only status probe: no injection there holds the tab queue.)
+    const b = legOnTab(kind, {started: false}, msg => (msg.type === 'ashlar-tab-status'
+      ? {ok: true, ownershipProtocol: 1, jobId: '', runId: '', provider: 'chatgpt', released: false, url: 'https://chatgpt.com/?temporary-chat=true'} : undefined),
+    'https://chatgpt.com/?temporary-chat=true');
+    const realSend = b.chrome.tabs.sendMessage;
+    let injected = 0;
+    b.chrome.tabs.sendMessage = (id, msg, cb) => {
+      if (msg.type !== 'ashlar-run') return realSend(id, msg, cb);
+      b.messages.push({id, ...msg});
+      if (!injected) { b.chrome.runtime.lastError = {message: 'Could not establish connection. Receiving end does not exist.'}; cb(); b.chrome.runtime.lastError = null; return; }
+      delivered.push(msg); // the re-injected page received it (it would start the run)
+    };
+    let injection;
+    b.chrome.scripting.executeScript = () => new Promise(resolve => { injection = () => { injected++; resolve(); }; });
+    const deadlines = [];
+    b.context.pageReplyDeadline = () => { let reject; const promise = new Promise((_resolve, fail) => { reject = fail; }); deadlines.push(() => reject(new Error('the page did not answer in time'))); return {promise, cancel() {}}; };
+    const runs = () => b.messages.filter(m => m.type === 'ashlar-run').length;
+    let settled = false;
+    b.tick().then(() => { settled = true; }, () => { settled = true; });
+    assert.ok(await until(() => runs() === 1 && injection), 'the first send found no receiver; the scripts are being injected again');
+    for (const expire of deadlines) expire();
+    assert.ok(await until(() => settled), 'the tick ends once askPage gave up');
+    injection();
+    for (let i = 0; i < 5; i++) await flush();
+    assert.deepEqual([runs(), delivered.length], [1, 0], 'the run message is never sent after its deadline');
+    assert.equal(b.pending().states.chatgpt.started, false, 'nothing was dispatched');
+  });
+}
+// A tab whose page did not answer in time is backed off: no lane messages it for PAGE_BACKOFF_MS (a
+// hung page would otherwise cost every lane that asks it the full reply deadline, every tick). A
+// message to it meanwhile fails at once, as the timeout did; a lookup of the leg's tab reads it as
+// "unknown", never as absent.
+test('a tab that did not answer is messaged by no lane until its back-off ended, or its page loaded again', async () => {
+  const b = legOnTab('review', {started: true}, () => undefined);
+  b.context.pageReplyDeadline = expiresAtOnce;
+  const asked = () => b.messages.filter(m => m.id === 10).length;
+  await b.tick();
+  // (The first lane to meet the silent page may be the inventory's probe or the poll: one at a time,
+  // in the tab queue. Whichever it is backs the tab off for all.)
+  assert.ok(await until(() => asked() > 0), 'a lane asked the page');
+  assert.ok(await idle(b));
+  const before = asked();
+  await b.tick();
+  await b.context.refreshTabInventory();
+  assert.ok(await idle(b));
+  assert.equal(asked(), before, 'the next poll and the inventory do not message it');
+  assert.match(b.pending().states.chatgpt.connectionError, /not asked again yet/);
+  const jobs = await b.context.workerJobs('http://bridge');
+  assert.equal(await b.context.findOriginalTab(jobs['job-A'], 'chatgpt'), undefined, 'a lookup reads the silent page as unknown, not absent');
+  assert.equal(asked(), before, 'nor does a lookup of the leg\'s tab');
+  later(b, 30_000);
+  await b.tick();
+  assert.ok(b.messages.slice(before).some(m => m.id === 10), 'asked again once the back-off ended');
+  // A page that loaded again is a new page: asked at once.
+  assert.ok(await idle(b));
+  const again = asked();
+  b.context.noteTabUpdated(10, {status: 'loading'});
+  await b.tick();
+  assert.equal(asked(), again, 'still backed off while it loads');
+  b.context.noteTabUpdated(10, {status: 'complete'});
+  await b.tick();
+  assert.ok(asked() > again, 'asked at once after the load');
+});
+test('control: a page that answers is never backed off', async () => {
+  const b = legOnTab('review', {started: true}, msg => (msg.type === 'ashlar-tab-status' ? {ok: true} : {ok: false, code: 'busy', retry: true}));
+  b.context.pageReplyDeadline = expiresAtOnce;
+  for (let i = 0; i < 3; i++) await b.tick();
+  assert.equal(b.messages.filter(m => m.type === 'ashlar-harvest').length, 3, 'asked every tick');
+});
+// A frozen tab (energy saver, a collapsed tab group) is not probed by the inventory: a probe would
+// only time out, erasing the owner read there while it ran (the user's own frozen tabs then took
+// every review slot as unverified), and each refresh would queue another unanswered message.
+function frozenUserTabs(ids) {
+  const tabs = new Map(ids.map(id => [id, {id, url: `https://chatgpt.com/c/users-own-${id}`, status: 'complete'}]));
+  const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {}}), tabs});
+  b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+  b.chrome.tabs.sendMessage = (id, msg, cb) => {
+    b.messages.push({id, ...msg});
+    if (tabs.get(id)?.frozen) return; // accepted, never answered
+    cb({ok: true, ownershipProtocol: 1, jobId: '', runId: '', provider: 'chatgpt', released: false, url: tabs.get(id).url});
+  };
+  b.context.pageReplyDeadline = expiresAtOnce;
+  b.refresh = async () => { await b.context.refreshTabInventory(); return until(() => vm.runInContext('inventoryLanes.size', b.context) === 0); };
+  return b;
+}
+test('the user\'s own tabs read as unbound keep that reading while frozen: they take no review capacity', async () => {
+  const b = frozenUserTabs([50, 51, 52, 53]);
+  assert.ok(await b.refresh());
+  const before = await b.context.tabCapacityReport({});
+  assert.deepEqual([before.used, before.available], [0, 4], 'read as the user\'s own');
+  for (const tab of b.tabs.values()) tab.frozen = true;
+  for (let i = 0; i < 3; i++) assert.ok(await b.refresh());
+  const after = await b.context.tabCapacityReport({});
+  assert.deepEqual([after.used, after.unknownReserved, after.available], [0, 0, 4], 'frozen user tabs leave every slot available');
+});
+test('a frozen tab is not probed by the inventory, and is probed again once it thaws', async () => {
+  const b = frozenUserTabs([50]);
+  b.tabs.get(50).frozen = true;
+  const probes = () => b.messages.filter(m => m.id === 50 && m.type === 'ashlar-tab-status').length;
+  for (let i = 0; i < 10; i++) assert.ok(await b.refresh());
+  assert.equal(probes(), 0, 'no unanswered probe piles up on a frozen tab');
+  b.tabs.get(50).frozen = false;
+  assert.ok(await b.refresh());
+  assert.equal(probes(), 1, 'probed once it can answer');
+  assert.equal((await b.context.tabCapacityReport({})).available, 4);
+});
+
+// The poll never asks a page that cannot run a handler: a frozen tab until it thaws, a discarded one
+// until it loads again (the tab's own state, read without messaging it).
+for (const kind of ['review', 'fix']) {
+  for (const [what, asleep, awake] of [['frozen', {frozen: true}, {frozen: false}], ['discarded', {discarded: true}, {discarded: false}]]) {
+    for (const started of [true, false]) {
+      test(`${kind}: the poll of ${started ? 'a generating' : 'an undispatched'} leg skips its ${what} tab, and asks it once it is back`, async () => {
+        const jobId = kind === 'fix' ? 'fix-A' : 'job-A';
+        const job = {jobId, ...(kind === 'fix' ? {kind: 'fix'} : {}), origin: 'http://bridge', leaseId: 'lease-A', prompt: 'PROMPT',
+          providers: ['chatgpt'], states: {chatgpt: {tabId: 10, started, runId: 'run-A'}}};
+        // (An undispatched leg's tab still shows the new chat it was opened on: X2, #85.)
+        const tab = {id: 10, url: started ? URL_TAB : 'https://chatgpt.com/?temporary-chat=true', status: 'complete', ...asleep};
+        const b = background({local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {[jobId]: job}}),
+          session: storage({'ashlar:tab:10': {jobId, provider: 'chatgpt', runId: 'run-A', closedKey: `ashlar:closed:${jobId}:chatgpt:run-A`, closing: false}}),
+          tabs: new Map([[10, tab]]), api: async (_path, body) => (body?.action === 'ping' ? {ok: true, active: true, accepted: true, status: 'awaiting_chat'} : {ok: true, job: null})});
+        b.context.crypto = webcrypto; b.context.TextEncoder = TextEncoder;
+        const asked = () => b.messages.filter(m => m.id === 10 && ['ashlar-run', 'ashlar-harvest'].includes(m.type)).length;
+        await b.tick();
+        assert.equal(asked(), 0, `a ${what} tab is not messaged`);
+        assert.equal(b.local.state.pendingReviewJobs[jobId].states.chatgpt.started, started, 'nothing was dispatched');
+        Object.assign(tab, awake);
+        await b.tick();
+        assert.equal(asked(), 1, 'asked once it is back');
+      });
+    }
+  }
+}

@@ -14,29 +14,52 @@ async function fixture(t,{disabled=false,hidden=false}={}) {
  // DOM fixture only. Browser navigation is policy-blocked locally; no policy changes.
  await page.evaluate(()=>{const saved=new Map();Object.defineProperty(window,'sessionStorage',{value:{getItem:k=>saved.get(k)||null,setItem:(k,v)=>saved.set(k,v),removeItem:k=>saved.delete(k)}});});
  await page.evaluate(()=>{window.clicks=0;document.querySelector('form').addEventListener('submit',e=>e.preventDefault());document.querySelector('#composer-submit-button').addEventListener('click',()=>window.clicks++);window.chrome={runtime:{onMessage:{addListener(){}}}};window.__ashlarRunnerState={jobId:'A',runId:'run-A',provider:'chatgpt',running:true};});
- await page.addScriptTag({content:src('extension/composer.js')});return page;
+ await page.addScriptTag({content:src('extension/turns.js')});await page.addScriptTag({content:src('extension/composer.js')});return page;
 }
 async function start(page) {await page.evaluate(()=>{window.result={pending:true};clickSend(()=>document.querySelector('#composer-submit-button'),()=>document.querySelector('textarea'),'owned review prompt').then(()=>window.result={submitted:true},e=>window.result={error:e.message});});}
 async function acknowledge(page,text='owned review prompt') {await page.evaluate(text=>{const el=document.createElement('div');el.dataset.messageAuthorRole='user';el.textContent=text;document.querySelector('#turns').append(el);document.querySelector('textarea').value='';},text);}
 
-test('submission: disabled upload/send controls may wait for days without falling through',async t=>{
- const page=await fixture(t,{disabled:true});await start(page);await page.clock.fastForward(3*24*3600_000);
+// A disabled Send never falls through into response-waiting and is never clicked. It used to wait
+// without end ("for days"); live aicc #539 sat in send_waiting 16 and 84 min after ChatGPT ended the
+// session, so the wait is now bounded at 3 min: presend_stalled, nothing sent (the reviewer is reported failed).
+test('submission: disabled send controls never fall through; Send enabled within 3 min is clicked, else presend_stalled',async t=>{
+ const page=await fixture(t,{disabled:true});await start(page);await page.clock.runFor(2*60_000);
  assert.equal((await page.evaluate(()=>result)).pending,true,'disabled send must not become response-waiting');assert.equal(await page.evaluate(()=>clicks),0);
  await page.evaluate(()=>document.querySelector('#composer-submit-button').disabled=false);await page.clock.runFor(500);
  assert.equal(await page.evaluate(()=>clicks),1);assert.equal((await page.evaluate(()=>result)).pending,true);
  await acknowledge(page);await page.clock.runFor(500);assert.equal((await page.evaluate(()=>result)).submitted,true);
+ const stuck=await fixture(t,{disabled:true});await start(stuck);await stuck.clock.runFor(3*60_000+1_000);
+ assert.match((await stuck.evaluate(()=>result)).error||'',/presend_stalled: the pre-send stage "send_waiting"/);
+ assert.equal(await stuck.evaluate(()=>clicks),0,'nothing was sent');
 });
 
-test('submission: a no-op click is not confirmation, and delayed ACK never resends',async t=>{
+test('submission: a no-op click is not confirmation, and a delayed ACK within the window never resends',async t=>{
  const page=await fixture(t);await start(page);await page.clock.runFor(500);
  assert.equal((await page.evaluate(()=>result)).pending,true,'click is only an attempt, not provider receipt');
- await page.clock.fastForward(365*24*3600_000);assert.equal(await page.evaluate(()=>clicks),1);
+ await page.clock.runFor(45_000);assert.equal(await page.evaluate(()=>clicks),1);
  await acknowledge(page);await page.clock.runFor(500);assert.equal((await page.evaluate(()=>result)).submitted,true);assert.equal(await page.evaluate(()=>clicks),1);
+});
+
+// The live 1.1.29 run sat in send_unconfirmed for 10+ minutes after a click ChatGPT dropped.
+test('submission: a click whose turn never renders ends as send_unconfirmed after 60 s and is never resent',async t=>{
+ const page=await fixture(t);await start(page);await page.clock.runFor(59_000);
+ assert.equal((await page.evaluate(()=>result)).pending,true);
+ await page.clock.runFor(2_000);
+ assert.match((await page.evaluate(()=>result)).error||'',/no sent turn appeared within 60 seconds/);
+ assert.equal(await page.evaluate(()=>clicks),1);
 });
 
 test('submission: a cleared composer or a different user turn is not the owned request',async t=>{
  const page=await fixture(t);await start(page);await acknowledge(page,'personal message');await page.clock.runFor(1000);
  assert.equal((await page.evaluate(()=>result)).pending,true);assert.equal(await page.evaluate(()=>clicks),1);
+});
+
+test('submission: a rendered but disabled Send stops the search; a looser selector never finds another button',async t=>{
+ const page=await fixture(t,{disabled:true});
+ await page.evaluate(()=>{document.querySelector('form').insertAdjacentHTML('beforeend','<button type="submit" id="other" style="width:40px;height:20px">x</button>');window.composer=()=>document.querySelector('textarea');});
+ assert.equal(await page.evaluate(()=>findEligibleSendButton(['#composer-submit-button','button[type="submit"]'])?.id??null),null);
+ await page.evaluate(()=>{document.querySelector('#composer-submit-button').disabled=false;});
+ assert.equal(await page.evaluate(()=>findEligibleSendButton(['#composer-submit-button','button[type="submit"]']).id),'composer-submit-button');
 });
 
 test('submission: hidden matching controls are skipped in favor of the visible owned form button',async t=>{
@@ -127,11 +150,13 @@ for(const provider of ['ChatGPT','Grok']) {
  });
 }
 
-test('a collected result stays available but cannot close its tab while the confirmed journal is unsaved',async t=>{
+test('a collected result stays available and may close its tab even while the confirmed journal write keeps failing',async t=>{
+ // The confirmed identity is held in memory; a pending local write is not the user's activity and
+ // must not hold a secured tab (it could hold it forever).
  const page=await fixture(t);await rejectSentWrites(page);await installCollector(page);await confirmWithId(page);
  await appendAnswer(page,originalJson);await page.clock.runFor(2400);
  assert.equal((await page.evaluate(()=>message())).raw,originalJson);
- assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,false);
+ assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true);
  await page.evaluate(()=>window.rejectSent=false);
  assert.equal((await page.evaluate(()=>message('ashlar-can-close'))).canClose,true);
  assert.equal(await page.evaluate(()=>clicks),1);
@@ -240,7 +265,7 @@ function connectWorker(page) {
  worker.chrome.tabs.sendMessage=(id,msg,callback)=>{
   worker.messages.push({id,...msg});
   page.evaluate(msg=>new Promise(resolve=>runnerMessage(msg,null,resolve)),msg)
-   .then(result=>callback({...result,...(result.url!==undefined?{url:'https://chatgpt.com/c/fixture-A'}:{})}),error=>{
+   .then(result=>callback({...result,...(result.url!==undefined?{url:'https://chatgpt.com/c/fixture-A'}:{}),...(result.conversation!==undefined?{conversation:'https://chatgpt.com/c/fixture-A'}:{})}),error=>{
     worker.chrome.runtime.lastError={message:error.message};callback();worker.chrome.runtime.lastError=null;
    });
  };
@@ -255,11 +280,11 @@ test('worker delivers the bound result once and preserves the follow-up tab afte
  assert.equal(worker.closedTabs.length,0);assert.equal(page.isClosed(),false);assert.equal(await page.evaluate(()=>clicks),1);
 });
 
-test('worker ACK cannot remove a tab with an unsaved sent journal; persistence retry does not redeliver',async t=>{
+test('worker ACK closes the secured tab even while its sent-journal write keeps failing; nothing is redelivered or re-sent',async t=>{
  const page=await fixture(t);await rejectSentWrites(page);await installCollector(page);await confirmWithId(page);await appendAnswer(page,originalJson);await page.clock.runFor(2400);
  const {worker,received}=connectWorker(page);await worker.tick();
- assert.equal(received.length,1);assert.equal(worker.closedTabs.length,0);
- assert.equal(worker.local.state.pendingReviewJobs.A.states.chatgpt.cleanupPending,true);
- await page.evaluate(()=>window.rejectSent=false);await worker.tick();await worker.tick();
- assert.equal(received.length,1);assert.deepEqual(worker.closedTabs,[10]);assert.equal(await page.evaluate(()=>clicks),1);
+ assert.equal(received.length,1);assert.deepEqual(worker.closedTabs,[10]);
+ assert.equal(worker.local.state.pendingReviewJobs.A,undefined,'the delivered leg retired');
+ await worker.tick();
+ assert.equal(received.length,1);assert.equal(await page.evaluate(()=>clicks),1);
 });

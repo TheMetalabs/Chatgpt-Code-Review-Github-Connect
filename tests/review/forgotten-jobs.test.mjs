@@ -53,13 +53,15 @@ test('clearStuckJobs retires forgotten jobs whose tabs are gone (concurrently; a
   assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
 });
 
-test('clearStuckJobs KEEPS a forgotten job whose tab is still open', async () => {
+test('clearStuckJobs KEEPS a forgotten job whose open tab has not proven its ownership yet', async () => {
+  // Every leg of a forgotten job is abandoned and its tab released by the page's verdict (#82). This
+  // page answers job_mismatch: never closed on a guess, asked again until the bounded ownership wait.
   const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing' })], new Map([[10, { id: 10, url: 'https://chatgpt.com/c/A', status: 'complete' }]]));
   const res = await b.context.clearStuckJobs();
   assert.equal(res.ok, true);
   assert.equal(res.cleared, 0);
   assert.equal(res.kept, 1);
-  assert.ok(b.tabs.has(10), 'an open tab (possible unharvested answer) is preserved');
+  assert.ok(b.tabs.has(10), 'an open tab whose ownership is unproven is never closed');
 });
 
 test('clearStuckJobs never touches a job the server still owns', async () => {
@@ -462,11 +464,10 @@ test('clearStuckJobs({includeStalled}) salvages a durable-source leg whose repai
     tabs: new Map(), // tab gone
     handler: () => ({ ok: false, code: 'job_mismatch' }),
     api: async (_p, body) => {
-      // Mirror the bridge route: a repairProtocol:1 complete whose raw is not valid review JSON is 422'd.
-      if (body?.action === 'complete' && body.repairProtocol === 1) {
-        let valid = false;
-        try { const p = JSON.parse(String(body.raw ?? '')); valid = p && Array.isArray(p.findings); } catch { /* invalid */ }
-        if (!valid) { const e = new Error('completed response requires format repair'); e.status = 422; e.code = 'json_repair_required'; throw e; }
+      // Mirror the bridge route: the strict review schema has no raw_review field (live aicc #457), so
+      // a repairProtocol:1 complete is 422'd unless it is marked salvaged.
+      if (body?.action === 'complete' && body.repairProtocol === 1 && body.salvaged !== true) {
+        const e = new Error('completed response requires format repair'); e.status = 422; e.code = 'json_repair_required'; throw e;
       }
       return { ok: true };
     },
@@ -476,7 +477,30 @@ test('clearStuckJobs({includeStalled}) salvages a durable-source leg whose repai
   assert.equal(res.cleared, 1, 'the terminally-failed-repair leg is salvaged (canonicalized) and retired — not looping on 422');
   const complete = b.calls.find((c) => c.action === 'complete' && c.jobId === 'A');
   assert.ok(complete && JSON.parse(complete.raw).raw_review.includes('prose, not JSON'), 'the original is delivered inside a valid raw_review envelope');
+  assert.equal(complete.salvaged, true, 'marked salvaged: the route posts it instead of demanding a repair');
   assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0);
+});
+
+test('a salvaged leg a server still sends back for repair ends as a failure, never loops (#457)', async () => {
+  // Live aicc #457: 422 on every salvaged delivery for 3 h; the worker's own events kept the job fresh,
+  // so the stall sweep never came back to it.
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.sourceCapture = { archiveDurable: true, text: 'prose, not JSON', totalChars: 15, sourceHash: 'h', responseId: 'r', id: 'cap' };
+  job.states.chatgpt.repairAttempt = { id: 'ra', status: 'needs_attention', sourceHash: 'h', responseId: 'r' };
+  const b = background({
+    local: storage({ origin: 'http://bridge', token: 'token', pendingReviewJobs: { A: job } }),
+    tabs: new Map(),
+    handler: () => ({ ok: false, code: 'job_mismatch' }),
+    api: async (_p, body) => {
+      if (body?.action === 'complete') { const e = new Error('completed response requires format repair'); e.status = 422; e.code = 'json_repair_required'; throw e; }
+      return { ok: true };
+    },
+  });
+  await b.context.clearStuckJobs({ includeStalled: true });
+  const failure = b.calls.find((c) => c.action === 'failure' && c.jobId === 'A');
+  assert.ok(failure, 'the leg is delivered as a failure');
+  assert.match(failure.error, /^json_invalid: /);
+  assert.equal(b.calls.filter((c) => c.action === 'complete').length, 1, 'the envelope is sent once, not in a loop');
 });
 
 test('clearStuckJobs({includeStalled}) leaves a durable-source leg with an ACTIVE repair alone', async () => {
@@ -565,4 +589,31 @@ test('clearStuckJobs({includeStalled}) leaves an ACCEPTED durable repair for rep
   assert.equal(res.cleared, 0, 'an accepted durable repair is left for repairProvider');
   assert.equal(b.calls.filter((c) => c.action === 'complete' || c.action === 'failure').length, 0, 'no settle over an accepted repair');
   assert.ok('A' in (b.local.state.pendingReviewJobs ?? {}));
+});
+
+// ── The tab queue (#85): the sweep's decisions, the abandon and the retirement are operations in it.
+test('Clear stuck and the alarm sweep started together run one sweep (W2)', { timeout: 5000 }, async () => {
+  const b = harness([makeJob('A', { tabId: 10, serverStatus: 'missing', lastEventAt: STALE })]);
+  let sweeps = 0;
+  const run = b.context.runStuckSweep;
+  b.context.runStuckSweep = (...args) => { sweeps++; return run(...args); };
+  const [cleared] = await Promise.all([b.context.clearStuckJobs({ includeStalled: true }), b.context.autoSweepStuckJobs()]);
+  assert.equal(sweeps, 1, 'the second request joined the sweep in flight');
+  assert.equal(cleared.ok, true);
+  assert.equal(cleared.cleared, 1, 'the popup reports what the shared sweep cleared');
+  assert.equal(b.local.state.pendingReviewJobs.A, undefined);
+  // Once it ended, the next request runs a sweep of its own.
+  await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(sweeps, 2);
+});
+test('the job lane and the sweep never both retire one job (W5)', { timeout: 5000 }, async () => {
+  const done = makeJob('J', { tabId: 10, serverStatus: 'missing' });
+  Object.assign(done.states.chatgpt, { delivered: true, cleanupDone: true });
+  const b = harness([done]);
+  const jobs = await b.context.workerJobs('http://bridge');
+  const job = jobs.J;
+  const retired = await Promise.all([b.context.retireCleanJob(job, jobs), b.context.retireCleanJob(job, jobs, true)]);
+  assert.deepEqual(retired.filter(Boolean).length, 1, 'exactly one retirement');
+  assert.equal(b.local.state.bridgeRecentRetired.filter((entry) => entry.jobId === 'J').length, 1, 'one retired entry');
+  assert.equal(jobs.J, undefined);
 });

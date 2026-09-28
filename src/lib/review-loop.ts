@@ -14,6 +14,9 @@
 
 export const REVIEW_LOOP_ESCALATE_HUMAN = "Ashlar review-loop halted — human review required";
 export const REVIEW_LOOP_STOPPED_HUMAN = "Ashlar review-loop stopped by operator";
+/** The sentence of a stop record posted while a NEWER session runs (stopRecordComment): not a
+ * terminal signal, so it never contains REVIEW_LOOP_STOPPED_HUMAN or the STOPPED marker. */
+export const REVIEW_LOOP_STOP_RECORD_HUMAN = "Ashlar review-loop records an earlier stop; a loop session started after it is active and this record does not stop it";
 
 export const STOPPED_MARKER = "<!-- ashlar-loop-stopped -->";
 
@@ -268,10 +271,23 @@ export function escalateComment(s: EscalateState): string {
  * placed correctly even when it arrived as an edit that the session fold cannot replay. */
 export function stoppedComment(stop?: LoopStop): string {
   if (!stop) return `${STOPPED_MARKER}\n\n${REVIEW_LOOP_STOPPED_HUMAN}`;
+  return `${STOPPED_MARKER}\n${stopRecordLine(stop)}\n\n${REVIEW_LOOP_STOPPED_HUMAN} (stop by ${stop.by}).`;
+}
+
+/** The record of a stop that ended only a session BEFORE the active one — posted while a newer
+ * session runs (a record that was refused until then, or a stop racing a start in flight). The
+ * record line alone opens it: the fold places it exactly as the STOPPED acknowledgement's record
+ * (parseStopRecord), but it carries no STOPPED marker, which every watcher reads as "the loop
+ * stopped" while the newer session keeps running. */
+export function stopRecordComment(stop: LoopStop): string {
+  return `${stopRecordLine(stop)}\n\n${REVIEW_LOOP_STOP_RECORD_HUMAN} (stop by ${stop.by} at ${stop.at}).`;
+}
+
+function stopRecordLine(stop: LoopStop): string {
   if (!LOGIN_RE.test(stop.by) || !ISO_UTC_RE.test(stop.at) || Number.isNaN(Date.parse(stop.at))) {
     throw new Error(`invalid loop stop (by=${stop.by} at=${stop.at})`);
   }
-  return `${STOPPED_MARKER}\n<!-- ashlar-loop-stop at=${stop.at} by=${stop.by} -->\n\n${REVIEW_LOOP_STOPPED_HUMAN} (stop by ${stop.by}).`;
+  return `<!-- ashlar-loop-stop at=${stop.at} by=${stop.by} -->`;
 }
 
 export interface LoopStop {
@@ -279,12 +295,14 @@ export interface LoopStop {
   at: string; // the stop's own event time (ISO-8601 UTC)
 }
 
+// The record line, opening the comment — alone, or right after the STOPPED marker.
 const STOP_RECORD_RE =
-  /^\s*<!--\s*ashlar-loop-stopped\s*-->[ \t]*\r?\n[ \t]*<!--\s*ashlar-loop-stop\s+at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)\s+by=([A-Za-z0-9-]{1,39})\s*-->/;
+  /^\s*(?:<!--\s*ashlar-loop-stopped\s*-->[ \t]*\r?\n[ \t]*)?<!--\s*ashlar-loop-stop\s+at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)\s+by=([A-Za-z0-9-]{1,39})\s*-->/;
 
-/** The stop recorded in a STOPPED acknowledgement the caller has proven the App authored (anchored:
- * the STOPPED marker opens the comment, the record is the very next line). Null otherwise —
- * including a bare legacy acknowledgement without a record. */
+/** The stop recorded in a STOPPED acknowledgement, or in a bare stop record (stopRecordComment), the
+ * caller has proven the App authored (anchored: the record line opens the comment, or is the very
+ * next line after the STOPPED marker that does). Null otherwise — including a bare legacy
+ * acknowledgement without a record. */
 export function parseStopRecord(body: string | null | undefined, source: CommentSource): LoopStop | null {
   if (!source.authoredByBot) return null;
   const m = STOP_RECORD_RE.exec(body || "");
@@ -362,6 +380,45 @@ export function parseStartMarker(body: string | null | undefined, source: Commen
  * can wait long behind a busy provider. It ends in the fix report + continuation, or a handoff. */
 export function fixingComment(c: { round: number; pr: number; head: string }): string {
   return `<!-- ashlar-loop-fixing round=${c.round} pr=${c.pr} head=${c.head} -->\n\n${REVIEW_LOOP_FIXING_HUMAN} (round ${c.round} on \`${c.head.slice(0, 7)}\`).`;
+}
+
+const FIXING_MARKER_RE = /^\s*<!--\s*ashlar-loop-fixing\s+round=(\d{1,4})\s+pr=(\d{1,9})\s+head=([^\s>]+)\s*-->/;
+// The round's own report (review-loop-runtime renderFixReport): a suggestion round ends with only
+// this report — the session then waits for the human's push; it was not cut.
+const FIX_REPORT_RE = /^\s*### Ashlar fix agent — /;
+
+/** What the App's loop comments say about the session's progress (a bare stop RECORD of an older
+ * session's stop says nothing about this one: the session fold decides whether it ended). */
+export type LoopCommentKind = "start" | "fixing" | "report" | "continue" | "escalate" | "stopped";
+
+/** The kind of a loop comment the caller has proven the App authored; null for any other comment. */
+export function loopCommentKind(body: string | null | undefined): LoopCommentKind | null {
+  const bot = { authoredByBot: true };
+  if (FIXING_MARKER_RE.test(body || "")) return "fixing";
+  if (FIX_REPORT_RE.test(body || "")) return "report";
+  if (parseStartMarker(body, bot)) return "start";
+  if (parseContinueMarker(body, bot)) return "continue";
+  if (isEscalateComment(body, bot)) return "escalate";
+  return isStoppedComment(body, bot) ? "stopped" : null;
+}
+
+/**
+ * The App's NEWEST loop comment on a PR (by creation time, then comment id). "fixing" newest means a
+ * fix round started and nothing followed it: the round is running — or a restart cut it and nothing
+ * will (review-loop-runtime sweepCutFixRounds; scripts/loop-fixing.mjs lists these before a deploy).
+ */
+export function newestLoopComment<T extends { id?: number; userLogin: string; body: string; createdAt?: string }>(
+  rows: readonly T[],
+  botLogin: string = DEFAULT_ASHLAR_BOT_LOGIN,
+): { kind: LoopCommentKind; row: T; round?: number; head?: string } | null {
+  let best: { kind: LoopCommentKind; row: T } | null = null;
+  const later = (a: T, b: T) => (isoMs(a.createdAt) || 0) - (isoMs(b.createdAt) || 0) || (a.id ?? 0) - (b.id ?? 0);
+  for (const row of rows) {
+    const kind = isSelfLogin(row.userLogin, botLogin) ? loopCommentKind(row.body) : null;
+    if (kind && (!best || later(row, best.row) >= 0)) best = { kind, row };
+  }
+  const m = best?.kind === "fixing" ? FIXING_MARKER_RE.exec(best.row.body) : null;
+  return best && m ? { ...best, round: Number(m[1]), head: m[3] } : best;
 }
 
 export interface LoopContinuation {

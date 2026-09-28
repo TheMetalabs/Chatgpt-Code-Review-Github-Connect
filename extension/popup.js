@@ -43,9 +43,11 @@ async function refreshDiagnostics() {
     admitted: "New review assigned", recovered: "Original bound review recovered without a new tab", idle: "No new job assigned at the last poll",
     tab_capacity: "New tabs paused: review-tab capacity reached",
     provider_quota: "New work paused: provider quota",
+    logged_out: "New work paused: ChatGPT is logged out in this Chrome profile; log in (re-checked every 10 min)",
     disconnected: "Server unavailable; preserving pending work",
     maintenance: "Extension update lock active; new review admission paused",
     duplicate_job: "Server repeated an existing job; original work preserved",
+    stale_worker: "Stale service worker: files on disk are newer; reload the extension",
   };
   const admission = work.admissionPhase
     ? `\nNew requests: ${admissionPhases[work.admissionPhase] || work.admissionPhase}` +
@@ -59,9 +61,12 @@ Archived sources awaiting processing: ${work.sourceCaptured || 0}.` : "\nCapacit
   const blockers = (capacity?.blockers || []).map(item=>`${item.jobId} / ${item.provider}: ${item.reason}`).join("\n");
   const stages=(work.stages||[]).map(s=>`${s.jobId} / ${s.provider}: ${s.stage}`).join("\n");
   const recovery = (work.recovery || []).map(j => `${j.jobId}: ${j.status}`).join("\n");
+  // Why a recently finished leg's tab was closed or kept (the job itself is gone).
+  const retired = (work.retired || []).slice(-4).map(r => `${r.jobId} / ${r.provider}: ${r.stage}${r.cause ? ` (${r.cause})` : ""}`).join("\n");
   workerEl.textContent = `${phases[work.phase] || work.phase}${admission}\nActive: ${work.activeJobs}; recovery: ${work.recoveringJobs}; cleanup: ${work.pendingCleanup}; saved replies: ${work.savedReplies}; JSON pending: ${work.waitingForJson || 0}` +
     slots + (blockers ? `\nSlot reasons:\n${blockers}` : "") +
-    (stages ? `\n${stages}` : "") + (recovery ? `\n${recovery}` : "") + (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
+    (stages ? `\n${stages}` : "") + (recovery ? `\n${recovery}` : "") + (retired ? `\nRecently retired:\n${retired}` : "") +
+    (work.checkedAt ? `\nLast poll: ${new Date(work.checkedAt).toLocaleTimeString()}` : "");
 }
 
 (async () => {
@@ -229,7 +234,7 @@ async function requestClearStuck() {
   statusEl.textContent = res?.ok
     ? (res.timedOut
         ? `Cleared ${res.cleared} so far — the sweep timed out (bridge or a tab is slow). Click again to finish the rest.`
-        : `Cleared ${res.cleared} stuck/stalled job(s) (${res.kept} kept). Jobs with a live tab were left alone; long-stalled tab-gone legs (including server-owned ones) were reported failed.`)
+        : `Cleared ${res.cleared} stuck/stalled job(s) (${res.kept} kept). Cancelled or forgotten jobs were abandoned: a review tab still open was released by its page's check, closed unless you had used it (then kept), and a fix tab without a delivered answer was kept. A stalled job with an open tab was left alone; long-stalled tab-gone legs (including server-owned ones) were reported failed.`)
     : !res
       ? "No response from the worker after several tries — reload the extension from chrome://extensions, then retry."
       : `Could not clear stuck jobs: ${res.error || "no eligible jobs"}`;

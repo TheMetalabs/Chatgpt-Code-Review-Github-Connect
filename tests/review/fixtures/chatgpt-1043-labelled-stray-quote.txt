@@ -1,0 +1,291 @@
+JSON
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+{
+  "merge_recommendation": "REQUEST_CHANGES",
+  "highest_risk": "Fix-tab ownership and prompt-integrity proofs can accept a user-regenerated model response or whitespace-altered inline source, allowing apply-mode fixes to act on content that is not the managed run's exact input/output.",
+  "investigated_safe": [
+    "src/lib/creation-seq.ts: the entire new helper was present; the process-wide monotonic sequence and createdBefore tie-break are internally consistent.",
+    "extension/manifest.json: the only supplied change is the extension version bump from 1.1.22 to 1.1.23.",
+    "tests/review/browser-proxy.mjs: the complete changed helper path was present; the certificate bytes used for the SPKI pin and the existing proxy teardown remain consistent.",
+    "tests/review/helpers.mjs: the complete changed until() helper was present; it remains bounded by its supplied timeout and leaves final assertions to callers."
+  ],
+  "assumptions": [
+    "ashlar-policy.md was named in the request but was not present in the supplied attachments, so repository-specific severity overrides and cross-cutting invariants from that file could not be applied.",
+    "The supplied ashlar-diff.patch contains sections for 25 of the 45 paths listed as changed. Changed code/config paths missing from that patch are treated as unverified and marked not_cleared rather than reconstructed from outside sources.",
+    "ashlar-snapshot.md is partial by design. Where a changed path calls helpers whose definitions were not included, coverage is not_cleared; material unverified helpers are named in finding evidence when relevant."
+  ],
+  "findings": [
+    {
+      "severity": "P1",
+      "file": "extension/json.js",
+      "line": 541,
+      "side": "RIGHT",
+      "title": "Regenerated fix responses retain managed ownership",
+      "failure_scenario": "A fix response A starts streaming and is observed by the collector. Before the second stable observation, the user regenerates the answer, producing response B under the same sent user turn. There is no follow-up, draft, or conversation move, so collect-phase ownership still returns owned; boundReviewResponse selects B as the latest assistant reply, B is harvested, delivered, and can be applied even though the user replaced the managed response.",
+      "root_cause": "The collect-phase ownership proof never pins or compares the assistant response identity. The responseId baseline is first stored only after stable answer collection, while boundReviewResponse always chooses the latest assistant reply associated with the sent turn.",
+      "evidence": "extension/json.js:524 \"const answered = phase === \\\"complete\\\";\"; extension/json.js:541 \"if (!bound.root || (bound.responseId || \\\"\\\") !== (stored.responseId || \\\"\\\")) return takeOver(\\\"response_changed\\\");\" shows response identity is checked only in complete phase. extension/json.js:367-369 stores nativeCompletion.responseId only inside settleStableAnswer after stability succeeds. extension/json.js:203 \"const message = replies.at(-1);\" makes a replacement response become the bound response.",
+      "recommended_fix": "Pin the first identified assistant response identity for a fix run as soon as that response is observed, including while it is streaming. Every later collect, hand-out, restore, and close proof must require the same response identity; a different response must become the permanent takenOver/response_changed verdict. If a stable immutable response identity is unavailable, fail closed instead of adopting a later response.",
+      "recommended_test": "Start a fix with responseId A, poll once while A is streaming, then replace the DOM response with responseId B without adding a user turn, draft, or navigation. Assert the run ends taken_over, releases its managed slot, never delivers B, and never authorizes close. Also assert an unchanged A can complete normally."
+    },
+    {
+      "severity": "P1",
+      "file": "extension/composer.js",
+      "line": 90,
+      "side": "RIGHT",
+      "title": "Byte-exact fix prompts are verified with whitespace-collapsing equality",
+      "failure_scenario": "A fix prompt contains whitespace-significant source such as tabs, repeated spaces, blank lines, or whitespace inside literal file content. When the editor or rendered user turn changes only that whitespace, fillComposer and submission confirmation still declare the prompt correct because both sides are normalized. The model then receives source bytes different from the prompt constructed by the fix runtime, while the run proceeds as a valid fix.",
+      "root_cause": "The new fix path promises verbatim byte-exact prompt delivery but reuses normalizePrompt for composer verification and sent-turn confirmation. normalizePrompt collapses every whitespace run and trims the text, so distinct source byte sequences compare equal.",
+      "evidence": "extension/composer.js:90 \"return globalThis.__ashlarRunnerState?.kind === \\\"fix\\\" ? {prompt: String(raw ?? \\\"\\\"), files: []} : splitAttachments(raw);\" establishes the verbatim fix path. extension/composer.js:143 \"if (normalizePrompt(readComposer(el)) === normalizePrompt(body)) return body;\" and extension/composer.js:149 repeat the normalized equality gate. extension/composer.js:188-189 defines normalizePrompt as \"return String(text || \\\"\\\").replace(/\\\\s+/g, \\\" \\").trim();\". extension/composer.js:292 confirms the rendered send with normalized containment. The snapshot does not include the implementations of insertPrompt and readComposer, so the exact DOM transformation path remains unverified; the shown equality gates nevertheless accept every whitespace-only corruption.",
+      "recommended_fix": "Use a fix-specific exact comparator for both composer verification and sent-turn confirmation. For kind fix, require the recovered composer text and the confirmed rendered user-message text to preserve the exact prompt content instead of passing through normalizePrompt. Keep whitespace normalization only for review prompts unless a provider-specific reversible representation proves the original bytes.",
+      "recommended_test": "Exercise a fix prompt containing tabs, multiple spaces, consecutive blank lines, trailing spaces, and attachment-sentinel-looking source lines. Make the composer/readback and separately the rendered sent turn alter one whitespace sequence. Assert neither altered form is accepted as the managed submission, while the byte-identical form proceeds."
+    },
+    {
+      "severity": "P2",
+      "file": "src/lib/bridge-fix.server.ts",
+      "line": 409,
+      "side": "RIGHT",
+      "title": "Lease renewal leaves the old staleness timestamp",
+      "failure_scenario": "With parallelPrs set to 1, fix A is claimed at t0. Its owning profile renews the claim or receives a replay at t0 plus claimMs minus one millisecond. lease returns the existing lease without updating claimedAt. Immediately after the original stale boundary, A no longer counts toward the active limit, so fix B can be claimed while A is still generating. A's old lease still satisfies holds and its completion remains accepted, so two generations run despite the configured limit of one.",
+      "root_cause": "The non-stale same-owner fast path returns the existing lease before refreshing claimedAt. The function and claim action describe this path as lease renewal, but the timestamp used by stale and claimedCount is only updated on paths that mint a new lease.",
+      "evidence": "src/lib/bridge-fix.server.ts:277 \"const stale = (item: FixItem) => item.claimedAt !== undefined && deps.now() - item.claimedAt > deps.claimMs;\"; src/lib/bridge-fix.server.ts:409 \"if (!stale(item) && item.leaseId) return { ok: true, leaseId: item.leaseId };\" returns before src/lib/bridge-fix.server.ts:424 \"item.claimedAt = deps.now();\". src/lib/bridge-fix.server.ts:439 describes claim as renewal, and refresh later rejects revival past the limit only after the item has already become stale.",
+      "recommended_fix": "Before returning the existing lease on the same-owner non-stale path, set item.claimedAt to deps.now(). Preserve the leaseId and leave submitAt, generating, deliveryId, and other submission bookkeeping unchanged.",
+      "recommended_test": "Use a controlled clock with parallelLimit 1. Claim A, advance to claimMs minus one millisecond, renew A, then advance past the original stale boundary but before the renewed boundary. Assert A still counts active and B cannot be taken. Then advance beyond the renewed boundary and assert normal stale behavior resumes."
+    }
+  ],
+  "coverage": [
+    {
+      "file": ".github/workflows/review-regressions.yml",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but no section for this path is present in the supplied ashlar-diff.patch or snapshot."
+    },
+    {
+      "file": "extension/background.js",
+      "status": "not_cleared",
+      "reason": "All supplied diff hunks were reviewed, but the snapshot does not fully define called helpers and state machinery including allowedTab, knownTabOwner, sendToTab, saveJobs, and several recovery paths."
+    },
+    {
+      "file": "extension/composer.js",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed and a prompt-integrity finding is reported; insertPrompt, readComposer, and portions of submission persistence are not defined in the supplied snapshot."
+    },
+    {
+      "file": "extension/json.js",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed and an ownership finding is reported; provider DOM helpers including replyDoneVisible, responseStreaming, savedSubmission, and related rendering behavior are not fully defined in the snapshot."
+    },
+    {
+      "file": "extension/manifest.json",
+      "status": "cleared",
+      "reason": "The complete supplied change is a version-only update with no permission, script, or behavior change."
+    },
+    {
+      "file": "package.json",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but no section for this path is present in the supplied ashlar-diff.patch or snapshot."
+    },
+    {
+      "file": "scripts/e2e-registration.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "src/lib/bridge-fix.server.test.ts",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "src/lib/bridge-fix.server.ts",
+      "status": "cleared",
+      "reason": "The complete new file was supplied and reviewed; its repository helper creation-seq.ts was also fully supplied. A lease-renewal finding is reported."
+    },
+    {
+      "file": "src/lib/bridge.server.ts",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but the snapshot contains only selected ranges and does not fully expose the existing review-claim, submission-flight, and completion helpers that the changed cross-kind dispatch calls."
+    },
+    {
+      "file": "src/lib/creation-seq.ts",
+      "status": "cleared",
+      "reason": "The entire new file was supplied and reviewed; it has no unverified repository helper calls."
+    },
+    {
+      "file": "src/lib/harbor.server.ts",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but the large existing harbor lifecycle and several helpers reached by changed settings and loop integration are only partially present in the snapshot."
+    },
+    {
+      "file": "src/lib/review-loop-runtime.server.test.ts",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "src/lib/review-loop-runtime.server.ts",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but called transport/watch helpers including watchFixRequest and local provider implementations are not fully supplied."
+    },
+    {
+      "file": "src/lib/settings-rules.ts",
+      "status": "not_cleared",
+      "reason": "The entire new file was reviewed, but imported repository helpers including providersFromSettings and isMaskedSecret are not defined in the supplied snapshot."
+    },
+    {
+      "file": "src/lib/settings.server.test.ts",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "src/lib/settings.server.ts",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but the snapshot omits portions of persistence/load normalization and helpers used by those paths."
+    },
+    {
+      "file": "src/lib/store.ts",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but the complete store module and imported secret/settings helpers are not all present."
+    },
+    {
+      "file": "src/lib/types.ts",
+      "status": "not_cleared",
+      "reason": "All supplied changed ranges were reviewed, but definitions surrounding the new fix-agent knob table and some helpers referenced by other changed files are not completely present."
+    },
+    {
+      "file": "src/routes/api/bridge.ts",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but the route dispatch calls many bridge.server operations whose full implementations and all route branches are not available in the snapshot."
+    },
+    {
+      "file": "src/routes/api/harbor.ts",
+      "status": "not_cleared",
+      "reason": "The supplied route ranges were reviewed, but helpers such as publicSettings and the complete harbor mutation surface are not fully supplied."
+    },
+    {
+      "file": "src/routes/settings.tsx",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but only partial component context and supporting form/state helpers are available."
+    },
+    {
+      "file": "tests/review/app-fixture.mjs",
+      "status": "not_cleared",
+      "reason": "The changed fixture hunk was reviewed, but it links mocked application modules whose behavior is not fully present in the supplied snapshot."
+    },
+    {
+      "file": "tests/review/bridge-fix-protocol.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/bridge-fix.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/bridge-lease-conformance.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials; therefore the claimed lease-lifecycle conformance coverage cannot be verified."
+    },
+    {
+      "file": "tests/review/bridge-route.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/browser-proxy.mjs",
+      "status": "cleared",
+      "reason": "The complete changed proxy helper path was supplied and reviewed."
+    },
+    {
+      "file": "tests/review/browser.e2e.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/capacity-browser.e2e.mjs",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but only partial browser fixture and capacity helper context is available."
+    },
+    {
+      "file": "tests/review/extension.e2e.mjs",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but the complete browser-extension harness and provider-page dependencies are not present."
+    },
+    {
+      "file": "tests/review/fix-agent-ui.e2e.mjs",
+      "status": "not_cleared",
+      "reason": "The new test file was supplied, but its settings harness is itself listed as changed and absent from the supplied diff, so the test's server/UI fixture cannot be fully verified."
+    },
+    {
+      "file": "tests/review/fix-extension.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/helpers.mjs",
+      "status": "cleared",
+      "reason": "The complete changed helper implementation was supplied and reviewed."
+    },
+    {
+      "file": "tests/review/kind-conformance.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/load-source.mjs",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but loader helpers and all dynamically loaded source dependencies are not fully present."
+    },
+    {
+      "file": "tests/review/mentions.e2e.mjs",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but only partial mention/loop test harness context is available."
+    },
+    {
+      "file": "tests/review/observation-lane.test.mjs",
+      "status": "not_cleared",
+      "reason": "All supplied hunks were reviewed, but the background harness and observation-lane dependencies are only partially supplied."
+    },
+    {
+      "file": "tests/review/settings-fix-agent.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/settings-harness.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials; this also prevents fully clearing tests that depend on this harness."
+    },
+    {
+      "file": "tests/review/settings-ms-domain.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/settings-ui-server-domain.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials."
+    },
+    {
+      "file": "tests/review/tab-capacity.test.mjs",
+      "status": "not_cleared",
+      "reason": "Listed as changed, but its diff and source are absent from the supplied materials; therefore preserved-tab and capacity regression coverage cannot be verified."
+    }
+  ]
+}

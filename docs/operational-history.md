@@ -12,15 +12,21 @@ particular button/upload state occurred on the operator's machine.
 The new flow is: persisted job/run identity → composer/attachments → persisted
 send intent → one eligible send click → a new matching user message → response
 observation → local outbox → private server archive → receipt → safe tab cleanup.
-Send selectors enumerate controls, ignore hidden/disabled/Stop buttons, and prefer
-the current composer's form. Upload/send availability has no duration deadline.
+Send selectors enumerate controls, ignore hidden/disabled/Stop buttons (including a
+Send disabled only by styling: `data-disabled`, `pointer-events: none`), prefer the
+current composer's form, and never fall through to a looser selector while the real
+Send is rendered but disabled. A staged file is ready only when its own chip shows no
+progress (spinner, ring, bar, busy/loading state, "uploading" label); a fix attachment
+must also hold that for 1 s, and a chip error or a new upload-error alert/toast ends
+the run as `attachment_failed` before anything is sent. Review upload/send availability
+has no duration deadline; a fix attachment has 3 minutes.
 A click, an empty composer, a Stop control or elapsed time cannot confirm receipt.
 
 Once a click might have reached the site, it is not automatically repeated. A
-missing acknowledgement is `send_unconfirmed`; an old page without a send journal
-is `submission_unknown`. Inspect the original tab and, only after confirming that
-it still contains the unsent draft, submit manually there. The observer can then
-confirm the matching message. Never open a replacement review or reset storage to
+missing acknowledgement is `send_unconfirmed`: if no matching user turn renders
+within 60 s of the click, the run ends with that code (1.1.30; before, it waited out
+the whole run deadline). An old page without a send journal is `submission_unknown`.
+Inspect the original tab; the ended run does not observe a manual submit. Never open a replacement review or reset storage to
 recover an ambiguous send. This is deliberately not a promise of exactly-once
 submission across an arbitrary provider/browser failure.
 

@@ -11,12 +11,15 @@ async function makePage(t,jobId,{text=invalid,runId='run-A',start=true}={}){
  const context=await browser.newContext();t.after(()=>context.close());await context.route('**/*',route=>route.abort());const page=await context.newPage();
  await page.setContent('<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">owned prompt</div></section><section id="answer" data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"></div></div><button aria-label="Copy response" data-testid="copy-turn-action-button">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div><button data-testid="send-button" aria-label="Send prompt" disabled>Send</button></form>');
  await page.clock.install();await page.evaluate(({jobId,runId,text})=>{
-  const values=new Map([['ashlar:job',jobId],['ashlar:run',runId],[`ashlar:submission:${jobId}:${runId}`,JSON.stringify({phase:'sent',expected:'owned prompt',baseline:0,submittedUsers:1,messageId:'user-A'})]]);
+  // Sent on the conversation page it shows (logically /c/A, see fixture): the send recorded it
+  // (composer.js submissionConfirmed). #85 r1 (Ashlar 4101062732): a collector pins a conversation only
+  // from a provider move it watched in flight, so the fixture records it at send.
+  const values=new Map([['ashlar:job',jobId],['ashlar:run',runId],[`ashlar:submission:${jobId}:${runId}`,JSON.stringify({phase:'sent',expected:'owned prompt',baseline:0,submittedUsers:1,messageId:'user-A',conversation:location.href})]]);
   Object.defineProperty(window,'sessionStorage',{value:{getItem:key=>values.get(key)||null,setItem:(key,value)=>values.set(key,value),removeItem:key=>values.delete(key)}});
   window.chrome={runtime:{onMessage:{addListener:fn=>window.receiver=fn,removeListener(){}}}};document.querySelector('.markdown').textContent=text;
   window.clicks=0;document.querySelector('form').onsubmit=ev=>{ev.preventDefault();window.clicks++;};
  },{jobId,runId,text});
- for(const name of ['composer','quota','model','json','content-chatgpt'])await page.addScriptTag({content:source(`extension/${name}.js`)});
+ for(const name of ['turns','composer','quota','model','json','content-chatgpt'])await page.addScriptTag({content:source(`extension/${name}.js`)});
  await page.evaluate(({jobId,runId})=>{window.message=(type,extra={})=>new Promise(resolve=>{const wait=receiver({type,jobId,runId,provider:'chatgpt',...extra},null,resolve);if(wait!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));});},{jobId,runId});
  if(start)await page.evaluate(()=>message('ashlar-run',{resume:true,prompt:'owned prompt'}));await page.clock.runFor(2400);
  return page;
@@ -32,10 +35,16 @@ async function fixture(t,{fallback=true,text=invalid}={}){
  worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
   worker.messages.push({id,...msg});
   if(id!==10){cb({ok:false,code:'busy',jobId:msg.jobId,runId:msg.runId,provider:msg.provider});return;}
-  page.evaluate(msg=>new Promise(resolve=>{const async=receiver(msg,null,resolve);if(async!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});
+  page.evaluate(msg=>new Promise(resolve=>{const async=receiver(msg,null,resolve);if(async!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg).then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/A'}:{})}),error=>{worker.chrome.runtime.lastError={message:error.message};cb();worker.chrome.runtime.lastError=null;});
  };
+ // The job's leg exactly as the worker persisted it when its tab cleanup completed. Salvage delivery
+ // and tab cleanup are independent lanes: a leg delivered first retires (and is compacted) in the SAME
+ // tick its cleanup finishes, so the live registry may never show `cleanupDone` to a per-cycle check.
+ // finishTabCleanup's first write is the journal of the release itself, before any compaction.
+ let cleaned;const set=worker.local.set;
+ worker.local.set=async values=>{await set(values);const leg=values["pendingReviewJobs"]?.[job.jobId]?.states?.chatgpt;if(leg?.cleanupDone===true)cleaned??=structuredClone(leg);};
  const cycle=async()=>{await worker.tick();await flush();await page.clock.runFor(1000);};
- return {app,job,page,worker,cycle,api};
+ return {app,job,page,worker,cycle,api,cleaned:()=>cleaned};
 }
 
 test('completed malformed source frees the only tab slot before Local finishes, then repairs without a tab',async t=>{
@@ -58,7 +67,8 @@ test('completed malformed source frees the only tab slot before Local finishes, 
 
 test('fallback OFF salvages the completed original into a posted review and releases capacity',async t=>{
  const f=await fixture(t,{fallback:false});
- await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'disabled formatter did not salvage the captured original into a review');
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length>0 && f.worker.closedTabs.includes(10);},'disabled formatter did not salvage the captured original into a review');
+ assert.equal(f.app.reviews.length,1);
  assert.equal(f.app.localRequests.length,0,'salvage must not call the repair formatter');
  assert.ok(f.worker.closedTabs.includes(10),'completed tab must be released after salvage');
  assert.equal(f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId).status,'posted');
@@ -75,10 +85,19 @@ test('full source archive failure retains tab and blocks admission until recover
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'storage recovery did not release source');
 });
 
-test('a full pool of genuinely generating tabs stays pending without capture or forced eviction',async t=>{
+// #87: the generating lease bounds a mounted answer that stops progressing. Still pending at 14 min
+// (no capture, no forced eviction); at 16 min the leg fails as `stalled`, and its tab, whose Stop
+// never clears, is kept (never closed) while the leg retires and frees its slot.
+test('a full pool of genuinely generating tabs stays pending until the generating lease fails them as stalled',async t=>{
  const f=await fixture(t);await f.page.evaluate(()=>{const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.textContent='Stop';document.querySelector('form').append(stop);});await f.page.clock.runFor(1000);
- await f.cycle();await f.page.clock.fastForward(365*24*3600_000);await f.cycle();
+ await f.cycle();await f.page.clock.runFor(14*60_000);await f.cycle();
  assert.equal(f.worker.closedTabs.length,0);assert.equal(f.worker.calls.some(c=>c.action==='capture'),false);assert.equal(f.app.localRequests.length,0);
+ assert.equal(f.worker.calls.some(c=>c.action==='failure'),false,'still pending at 14 min');
+ await f.page.clock.runFor(2*60_000);
+ await eventually(async()=>{await f.cycle();return f.worker.calls.some(c=>c.action==='failure'&&/^stalled:/.test(c.error));},'the lease never failed the stalled leg');
+ await eventually(async()=>{await f.cycle();return !f.worker.local.state.pendingReviewJobs[f.job.jobId];},'the stalled leg never retired');
+ assert.equal(f.worker.closedTabs.length,0,'kept under its Stop');assert.equal(f.worker.calls.some(c=>c.action==='capture'),false);assert.equal(f.app.localRequests.length,0);
+ assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true,'the kept tab holds no tab capacity');
 });
 
 test('native result cleanup can rehydrate an ACKed page without restarting its collector',async t=>{
@@ -100,9 +119,9 @@ test('captured-source cleanup restores a freshly reloaded page from the saved re
   }
   if(!reloaded)return send(id,msg,cb);
   void reloaded.then(page=>page.evaluate(msg=>new Promise(resolve=>{const pending=receiver(msg,null,resolve);if(pending!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg))
-   .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{})}));
+   .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/A'}:{})}));
  };
- await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'capture ACK lost its cleanup state across page reload');
+ await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1 && f.app.reviews.length>0;},'capture ACK lost its cleanup state across page reload');
  assert.ok(reloaded);assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,1,'salvage posts the captured original after the reload-restored cleanup');
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1);assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
 });
@@ -118,7 +137,7 @@ for(const change of ['followup','draft'])test(`source receipt releases managed o
   }
   send(id,msg,cb);
  };
- await eventually(async()=>{await f.cycle();return f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.cleanupDone;},'user-owned tab did not release managed capacity');
+ await eventually(async()=>{await f.cycle();return Boolean(f.cleaned());},'user-owned tab did not release managed capacity');
  assert.equal(f.worker.closedTabs.length,0);assert.equal(f.worker.tabs.size,1);
  const status=await f.page.evaluate(()=>message('ashlar-tab-status'));assert.equal(status.released,true);
  await f.cycle();assert.equal(f.worker.local.state.bridgeWorkerStatus.capacity.used,0);
@@ -127,7 +146,9 @@ for(const change of ['followup','draft'])test(`source receipt releases managed o
 
 
 
-test('source change after durable archive preserves the receipt, releases capacity, and salvages the archived original',async t=>{
+// The original is durably archived (secured): the provider changing its answer afterwards is not the
+// user's activity, so the tab closes (#82) while the archived original, not the page, is salvaged.
+test('source change after durable archive keeps the archived original, closes the secured tab, and salvages that original',async t=>{
  const f=await fixture(t,{fallback:false});let changed=false;const send=f.worker.chrome.tabs.sendMessage;
  f.worker.chrome.tabs.sendMessage=(id,msg,cb)=>{
   if(msg.type==='ashlar-capture-accepted' && !changed) {
@@ -135,12 +156,11 @@ test('source change after durable archive preserves the receipt, releases capaci
   }
   send(id,msg,cb);
  };
- await eventually(async()=>{await f.cycle();return f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt.cleanupDone;},'changed source did not release the managed slot');
- const state=f.worker.local.state.pendingReviewJobs[f.job.jobId].states.chatgpt;
+ await eventually(async()=>{await f.cycle();return Boolean(f.cleaned());},'changed source did not release the managed slot');
+ const state=f.cleaned();
  assert.equal(state.sourceCapture?.archiveDurable,true);assert.notEqual(state.sourceCapture?.cleanupProofConfirmed,true);assert.ok(state.sourceCapture?.id);
  assert.equal(state.sourceCapture.text,invalid,'unresolved repair must retain the exact local archived-source fallback');
- assert.equal(f.worker.closedTabs.length,0,'repurposed page must be preserved');
- assert.equal((await f.page.evaluate(()=>message('ashlar-tab-status'))).released,true);
+ assert.deepEqual(f.worker.closedTabs,[10],'a changed answer is not a user takeover: the secured tab closes');
  await f.cycle();assert.equal(f.worker.local.state.bridgeWorkerStatus.capacity.used,0);
  assert.equal(f.worker.calls.filter(c=>c.action==='capture').length,1,'replacement DOM must not be archived as the original run');
  await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'archived original was not salvaged into a review with repair off');
@@ -158,9 +178,10 @@ test('durable archive repairs after original tab disappears before cleanup proof
   if(msg.type==='ashlar-capture-accepted') {
    if(!removed) {
     removed=true;
-    void f.worker.closeTab(id).then(()=>{
-      f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
-    });
+    // The user closes the tab while the receipt is in flight. Its removal is queued behind this
+    // operation (the tab queue, #85): the listener fires now, and the queue is not awaited here.
+    f.worker.tabs.delete(id);f.worker.context.rememberClosedTab(id,{isWindowClosing:false});
+    f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
     return;
    }
    f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
@@ -222,9 +243,10 @@ test('capture-read failure after tab loss falls back to the durable local source
   if(msg.type==='ashlar-capture-accepted') {
    if(!removed) {
     removed=true;
-    void f.worker.closeTab(id).then(()=>{
-      f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
-    });
+    // The user closes the tab while the receipt is in flight. Its removal is queued behind this
+    // operation (the tab queue, #85): the listener fires now, and the queue is not awaited here.
+    f.worker.tabs.delete(id);f.worker.context.rememberClosedTab(id,{isWindowClosing:false});
+    f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
     return;
    }
    f.worker.chrome.runtime.lastError={message:`No tab with id: ${id}.`};cb();f.worker.chrome.runtime.lastError=null;
@@ -267,7 +289,7 @@ test('lost server source ACK retries the same archive, then salvages it without 
   if(body?.action==='capture' && !dropped){dropped=true;throw Error('response lost after archive write');}
   return out;
  };
- await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'idempotent source ACK retry did not finish');
+ await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1 && f.app.reviews.length>0;},'idempotent source ACK retry did not finish');
  assert.ok(dropped);assert.equal(f.app.history.getJob(f.job.jobId,true).captures.length,1);
  assert.equal(f.app.localRequests.length,0);assert.equal(f.app.reviews.length,1,'archive is salvaged into a review with repair off');
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'),false);
@@ -275,7 +297,8 @@ test('lost server source ACK retries the same archive, then salvages it without 
 
 test('salvage posts the archived original once; a worker restart never re-posts it',async t=>{
  const f=await fixture(t,{fallback:false});
- await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'first worker did not salvage the archived source');
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length>0 && f.worker.closedTabs.includes(10);},'first worker did not salvage the archived source');
+ assert.equal(f.app.reviews.length,1);
  assert.equal(f.app.localRequests.length,0);assert.ok(f.worker.closedTabs.includes(10));
  // A restarted worker inheriting the same storage must not salvage or post a second time.
  const local=storage(structuredClone(f.worker.local.state));
@@ -301,7 +324,7 @@ test('native saved response recovers cleanup in a different document using only 
   if(msg.type==='ashlar-can-close' && !replacement)replacement=makePage(t,f.job.jobId,{text:valid,start:false});
   if(!replacement)return send(id,msg,cb);
   void replacement.then(page=>page.evaluate(msg=>new Promise(resolve=>{const pending=receiver(msg,null,resolve);if(pending!==true)queueMicrotask(()=>resolve({ok:false,code:'unhandled'}));}),msg))
-   .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{})}));
+   .then(out=>cb({...out,...(out.url!==undefined?{url:'https://chatgpt.com/c/A'}:{}),...(out.conversation!==undefined?{conversation:'https://chatgpt.com/c/A'}:{})}));
  };
  await eventually(async()=>{await f.cycle();return f.worker.closedTabs.length===1;},'new document could not restore native cleanup proof');
  assert.ok(replacement);assert.equal(f.app.reviews.length,1);assert.equal(f.worker.calls.filter(c=>c.action==='complete').length,1);

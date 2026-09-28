@@ -4,6 +4,10 @@ import {JsonRepairService} from '../../src/lib/json-repair.server.ts';
 import {ReviewHistoryStore} from '../../src/lib/review-history.server.ts';
 import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 import {createHash} from 'node:crypto';
+import {readFileSync} from 'node:fs';
+import http from 'node:http';
+import {requestLocalChat} from '../../src/lib/local-chat-request.server.ts';
+import {overlayEnv, sanitizeBotSettings, botSettingsToEnv} from '../../src/lib/settings.server.ts';
 const value={findings:[],investigated_safe:['a.ts: checked "condition"']};
 const raw=JSON.stringify(value),original=raw.replace(/\\"/g,'"');
 const hash=text=>createHash('sha256').update(text).digest('hex');
@@ -102,4 +106,83 @@ test('a temporary result archive failure retries commit, never Local generation'
  const started=f.service.start(input);await flush();assert.equal(f.service.status('A',started.id).status,'ready');
  assert.equal((await f.service.commit('A',started.id)).status,'ready');assert.equal(f.calls.length,1);
  fail=false;assert.equal((await f.service.commit('A',started.id)).status,'accepted');assert.equal(f.calls.length,1);assert.equal(commits,2);
+});
+
+test('a stray-quote slip is repaired without a Local call and its commit is accepted',async t=>{
+ const text=readFileSync(new URL('./fixtures/chatgpt-1043-labelled-stray-quote.txt',import.meta.url),'utf8');
+ const f=fixture(t);const started=f.service.start({...input,original:text,sourceHash:hash(text)});await flush();
+ assert.equal(f.service.status('A',started.id).status,'ready');assert.equal(f.calls.length,0,'the Local model was called');
+ assert.equal((await f.service.commit('A',started.id)).status,'accepted');
+ assert.deepEqual(JSON.parse(f.accepted[0].raw).findings.map(finding=>finding.severity),['P1','P1','P2']);
+});
+
+// #87 failure A2(i): with no max_tokens the server's 8192-token default (thinking included) ended
+// every repair before it could re-emit the original, and the record said only "failed".
+test('the Local request carries a token budget for re-emitting the original, and thinking stays on by default',async t=>{
+ const long=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "condition"','b.ts: '+'x'.repeat(20000)]}).replace(/\\"/g,'"');
+ const f=fixture(t);f.service.start({...input,original:long,sourceHash:hash(long)});await flush();
+ assert.equal(f.calls[0][2].max_tokens,Math.ceil(long.length/2)+4096);
+ assert.equal('chat_template_kwargs' in f.calls[0][2],false);
+});
+// Before #87 no budget was sent and omlx used its 8192-token default; a short original (the common
+// zero-to-two-finding review) must never get less than that, since thinking shares the budget.
+test('a short original still gets at least the 8192 tokens the server default used to give it',async t=>{
+ assert.ok(Math.ceil(original.length/2)+4096<8192);
+ const f=fixture(t);f.service.start(input);await flush();
+ assert.equal(f.calls[0][2].max_tokens,8192);
+});
+test('ASHLAR_LOCAL_REPAIR_NO_THINKING turns thinking off for the Local repair request only when set',async t=>{
+ assert.equal(DEFAULT_SETTINGS.localRepairNoThinking,false);
+ const saved=process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;t.after(()=>{if(saved===undefined)delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;else process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING=saved;});
+ process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING='true';
+ const flagged=sanitizeBotSettings(overlayEnv({}));assert.equal(flagged.localRepairNoThinking,true);
+ assert.equal(botSettingsToEnv(flagged).ASHLAR_LOCAL_REPAIR_NO_THINKING,'true');
+ delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;assert.equal(sanitizeBotSettings(overlayEnv({})).localRepairNoThinking,false);
+ const f=fixture(t);f.settings.localRepairNoThinking=true;f.service.start(input);await flush();
+ assert.deepEqual(f.calls[0][2].chat_template_kwargs,{enable_thinking:false});
+ assert.equal(f.calls[0][2].max_tokens,8192);
+});
+test('a Local reply cut off at the token limit is recorded as finish_reason_length',async t=>{
+ const server=http.createServer((req,res)=>{req.resume();req.on('end',()=>{
+  res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'needs_attention');assert.deepEqual(done.errors,['finish_reason_length']);assert.equal(f.calls.length,1);
+});
+
+// vLLM/SGLang answer HTTP 400 when prompt + max_tokens exceeds max_model_len, before generating
+// anything. Without a budget they fill whatever context is left, which is the request every repair
+// sent before #87; the budget must not turn a repair that used to run into a rejected one.
+async function contextServer(t,reject) {
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);const status=reject(body);
+  if(status){res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify({object:'error',type:'BadRequestError',code:status,
+   message:"This model's maximum context length is 32768 tokens. However, you requested 37000 tokens (12904 in the messages, 24096 in the completion)."}));return;}
+  res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:raw}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ return {bodies,done:f.service.status('A',started.id)};
+}
+test('a budget rejected against the context window is sent once more without max_tokens',async t=>{
+ const {bodies,done}=await contextServer(t,body=>'max_tokens' in body ? 400 : 0);
+ assert.equal(done.status,'ready');assert.equal(bodies.length,2);
+ assert.equal(bodies[0].max_tokens,8192);assert.equal('max_tokens' in bodies[1],false);
+ assert.deepEqual(bodies[1].messages,bodies[0].messages);
+});
+test('the unbudgeted request is sent at most once, and other failures are never resent',async t=>{
+ const rejected=await contextServer(t,()=>400);
+ assert.equal(rejected.bodies.length,2);assert.equal(rejected.done.status,'needs_attention');
+ assert.deepEqual(rejected.done.errors,['local_request_failed_or_incomplete_no_automatic_retry']);
+ const failed=await contextServer(t,()=>500);
+ assert.equal(failed.bodies.length,1);assert.deepEqual(failed.done.errors,['local_request_failed_or_incomplete_no_automatic_retry']);
 });

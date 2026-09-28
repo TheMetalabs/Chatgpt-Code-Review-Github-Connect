@@ -48,6 +48,10 @@ export interface GitDataApi {
   /** The branch ref's current commit — lets a retry recognize a ref update that landed although its
    * response was lost. Optional: without it a lost response is reported as a failure. */
   readBranchRef?(branch: string): Promise<string>;
+  /** path → git blob SHA of each path in a commit's tree (a path that is not a blob there is
+   * absent). Optional: the GitHub fix source (fix-source-github.ts) needs it; without it that
+   * fallback is unavailable. */
+  blobShas?(commitSha: string, paths: readonly string[]): Promise<Map<string, string>>;
 }
 
 export type CommitResult = { ok: true; commitSha: string } | { ok: false; error: string };

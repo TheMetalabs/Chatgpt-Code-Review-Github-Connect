@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { deriveLoopSession, type LoopEvent } from "./review-loop-session.ts";
+import { deriveLoopSession, sameSession, sessionRef, type LoopEvent } from "./review-loop-session.ts";
 
 const ev = (at: string, kind: LoopEvent["kind"], extra: Partial<LoopEvent> = {}): LoopEvent => ({ at, kind, ...extra });
 
@@ -194,5 +194,20 @@ describe("deriveLoopSession: a not-clean review ends the session and owes the lo
       assert.deepEqual(fold([ev(t(2), kind, { head: B }), ev(t(3), "not-clean", { head: A, outcome: "incomplete" })], B), ACTIVE, kind);
     }
     assert.deepEqual(fold([ev(t(2), "not-clean", { head: A, outcome: "incomplete" }), ev(t(3), "continue", { head: B })], B), ACTIVE, "resumed, nothing owed");
+  });
+});
+
+describe("sameSession: a session is its anchor instant", () => {
+  it("two anchors in one second are one session, whichever start record each read lists first; another second is another session", () => {
+    const t = "2026-01-01T00:00:00Z";
+    // the same session read twice: bob's record (id 7) listed first, or alice's (id 3; or id-less)
+    const viaBob = sessionRef(deriveLoopSession([ev(t, "start", { actor: "bob", mode: "apply", seq: 7 }), ev(t, "start", { actor: "alice", mode: "suggest" })]));
+    for (const alice of [{ seq: 3 }, {}]) {
+      const viaAlice = sessionRef(deriveLoopSession([ev(t, "start", { actor: "alice", mode: "suggest", ...alice }), ev(t, "start", { actor: "bob", mode: "apply", seq: 7 })]));
+      assert.notDeepEqual(viaAlice, viaBob, "the anchor records differ");
+      assert.equal(sameSession(viaAlice, viaBob), true, JSON.stringify(alice));
+    }
+    assert.equal(sameSession({ at: t, seq: 3 }, { at: "2026-01-01T00:00:00.000Z", seq: 3 }), true, "the instant, not its spelling");
+    assert.equal(sameSession({ at: t, seq: 3 }, { at: "2026-01-01T00:00:01Z", seq: 3 }), false);
   });
 });

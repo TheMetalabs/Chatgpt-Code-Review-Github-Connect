@@ -1296,15 +1296,23 @@ export async function runPostReviewLoop(
     // Editable set = the PR's CHANGED files only. sample.files also carries policy/reference
     // context fetched for the review; those stay read-only and never enter allowedPaths.
     // A path the fix could never write (control characters, traversal) is not editable either.
+    // aicc #514: pass referenceFiles into the fix prompt as READ-ONLY context so the agent can
+    // verify wrappers (e.g. StoreAdminWriteService.run → dataSource.transaction) and push back —
+    // still never editable (security/auth/tx helpers must not be rewritten by the fix agent).
     const changed = new Set(sample.changedPaths ?? []);
     const files = (sample.files ?? [])
       .filter((f) => changed.has(f.path) && isSafeFixPath(f.path))
       .map((f) => ({ path: f.path, content: f.content }));
     if (files.length === 0) return await escalate("loop-error", "no editable changed files in the snapshot");
+    const editablePathSet = new Set(files.map((f) => f.path));
+    const referenceFiles = (sample.referenceFiles ?? [])
+      .filter((f) => f?.path && typeof f.content === "string" && !editablePathSet.has(f.path))
+      .map((f) => ({ path: f.path, content: f.content }));
     const prScope = prScopeSection(sample.body ?? "");
     const basePrompt = buildFixPrompt({
       findings: renderFindings(findings),
       files,
+      ...(referenceFiles.length ? { referenceFiles } : {}),
       reviewer: settings.fixAgent.provider ?? undefined,
       ...(prScope ? { prScope } : {}),
     });

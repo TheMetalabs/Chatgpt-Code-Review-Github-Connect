@@ -482,4 +482,116 @@ describe("crossFileDefs", () => {
     const calc = { path: "src/calc.ts", content: ["export function compute() {", "  return 2; // cjs required def", "}"].join("\n") };
     assert.match(crossFileDefs(changedCjs, [calc], 10_000), /cjs required def/);
   });
+
+  it("attaches a NestJS DI field call's class (this.adminWrite.run → imported StoreAdminWriteService)", () => {
+    // aicc #514: this.adminWrite.run( is not an import-named call; the receiver is a constructor
+    // parameter-property typed as the imported class. Without DI resolution the transaction wrapper
+    // never lands in CROSS_FILE_DEFINITIONS and reviewers file false P1 tx-boundary findings.
+    const changed = [{
+      path: "src/reconcile.service.ts",
+      content: [
+        "import { StoreAdminWriteService } from './store-admin-write.service';",
+        "@Injectable()",
+        "export class ReconcileService {",
+        "  constructor(private readonly adminWrite: StoreAdminWriteService) {}",
+        "  async match(userId: number, storeId: number) {",
+        "    return await this.adminWrite.run(userId, storeId, async (manager) => {",
+        "      return manager;",
+        "    });",
+        "  }",
+        "}",
+      ].join("\n"),
+      patch: [
+        "--- src/reconcile.service.ts",
+        "@@ -4,2 +4,6 @@",
+        "   async match(userId: number, storeId: number) {",
+        "+    return await this.adminWrite.run(userId, storeId, async (manager) => {",
+        "+      return manager;",
+        "+    });",
+        "   }",
+      ].join("\n"),
+    }];
+    const writeSvc = {
+      path: "src/store-admin-write.service.ts",
+      content: [
+        "import { DataSource, EntityManager } from 'typeorm';",
+        "export class StoreAdminWriteService {",
+        "  constructor(private readonly dataSource: DataSource) {}",
+        "  async run<T>(userId: number, storeId: number, write: (m: EntityManager) => Promise<T>): Promise<T> {",
+        "    return await this.dataSource.transaction((manager) => write(manager)); // di tx boundary",
+        "  }",
+        "}",
+      ].join("\n"),
+    };
+    const out = crossFileDefs(changed, [writeSvc], 10_000);
+    assert.match(out, /di tx boundary/);
+    assert.match(out, /dataSource\.transaction/);
+  });
+
+  it("resolves a DI field call without this. when the receiver is the field name", () => {
+    const changed = [{
+      path: "src/reconcile.service.ts",
+      content: [
+        "import { StoreAdminWriteService } from './store-admin-write.service';",
+        "export class ReconcileService {",
+        "  private readonly adminWrite: StoreAdminWriteService;",
+        "  constructor(adminWrite: StoreAdminWriteService) { this.adminWrite = adminWrite; }",
+        "  async match() {",
+        "    return await adminWrite.run(1, 2, async (m) => m);",
+        "  }",
+        "}",
+      ].join("\n"),
+      patch: [
+        "--- src/reconcile.service.ts",
+        "@@ -3,2 +3,3 @@",
+        "   async match() {",
+        "+    return await adminWrite.run(1, 2, async (m) => m);",
+        "   }",
+      ].join("\n"),
+    }];
+    const writeSvc = {
+      path: "src/store-admin-write.service.ts",
+      content: [
+        "export class StoreAdminWriteService {",
+        "  async run() { return 1; /* field-name di */ }",
+        "}",
+      ].join("\n"),
+    };
+    assert.match(crossFileDefs(changed, [writeSvc], 10_000), /field-name di/);
+  });
+
+  it("does not attach via DI when the receiver is an unrelated local alias", () => {
+    const changed = [{
+      path: "src/reconcile.service.ts",
+      content: [
+        "import { StoreAdminWriteService } from './store-admin-write.service';",
+        "export class ReconcileService {",
+        "  constructor(private readonly adminWrite: StoreAdminWriteService) {}",
+        "  async match() {",
+        "    const w = this.adminWrite;",
+        "    return await w.run(1, 2, async (m) => m);",
+        "  }",
+        "}",
+      ].join("\n"),
+      patch: [
+        "--- src/reconcile.service.ts",
+        "@@ -3,2 +3,4 @@",
+        "   async match() {",
+        "+    const w = this.adminWrite;",
+        "+    return await w.run(1, 2, async (m) => m);",
+        "   }",
+      ].join("\n"),
+    }];
+    const writeSvc = {
+      path: "src/store-admin-write.service.ts",
+      content: [
+        "export class StoreAdminWriteService {",
+        "  async run() { return this.dataSource.transaction(() => 1); // bare receiver di",
+        "  }",
+        "}",
+      ].join("\n"),
+    };
+    assert.doesNotMatch(crossFileDefs(changed, [writeSvc], 10_000), /bare receiver di/);
+  });
+
 });

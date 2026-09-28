@@ -104,7 +104,7 @@ export function controlKey(k: ControlKey): string {
  * converged) or a newer one runs — or, for a continuation, the PR head moved off the head it
  * requests (the live head's own request drives the loop).
  */
-export type Supersession = "head" | "stopped" | "handoff" | "handoff-unknown" | "converged" | "newer";
+export type Supersession = "head" | "stopped" | "handoff" | "handoff-unknown" | "converged" | "not-clean" | "newer";
 
 /** A write as decided at one POST attempt: owed, with the text to send now; or superseded. */
 export type Decision = { status: "owed"; body: string } | { status: "superseded"; why: Supersession };
@@ -285,7 +285,7 @@ function standInEvent(e: OwnWrite): LoopEvent {
     case "continue":
       return { at: standInAt(e), kind: "continue", head: k.head };
     case "handoff":
-      return { at: standInAt(e), kind: "escalate" };
+      return { at: standInAt(e), kind: "escalate", head: k.head };
     default:
       return assertNever(k);
   }

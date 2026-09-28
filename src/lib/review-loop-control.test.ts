@@ -101,7 +101,7 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
     assert.equal(out.status === "unknown" && out.attemptAt, attempt2);
     assert.equal(f.clock(), T0 + 9_000, "the schedule ran on past the attempt");
     const events = ownWrites(f.gh).standIns(ref(), [], BOT);
-    assert.deepEqual(events, [{ at: attempt2, kind: "escalate" }], "folded at its attempt");
+    assert.deepEqual(events, [{ at: attempt2, kind: "escalate", head: HEAD }], "folded at its attempt");
   });
 
   it("two concurrent emits of one key make one POST and share its outcome", async () => {
@@ -412,7 +412,7 @@ describe("emitControl + OwnWrites (#79 K1: one gate, one journal)", () => {
         f.w.hidden = true; // the list lags: only the journal knows the row
         assert.deepEqual(await emitControl({ ...f.ctx, gh, scanFirst: false }, writeOfEachKind()[kind]), { status: "posted" }, label);
         const events = ownWrites(gh).standIns(ref(), [], BOT);
-        const expected: LoopEvent = kind === "handoff" ? { at: attempt, kind: "escalate" } : { at: attempt, kind: "continue", head: HEAD };
+        const expected: LoopEvent = kind === "handoff" ? { at: attempt, kind: "escalate", head: HEAD } : { at: attempt, kind: "continue", head: HEAD };
         assert.deepEqual(events, [expected], `${label}: an undatable stand-in would be dropped by the fold`);
         const session = deriveLoopSession([ANCHOR, ...events]);
         assert.equal(session.active, kind === "continue", `${label}: the posted handoff ends the session in this process`);

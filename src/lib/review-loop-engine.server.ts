@@ -26,6 +26,8 @@ import {
   stuckPattern,
   parseEscalateMarker,
   parseFindingsTotal,
+  isConvergedFindings,
+  notCleanOutcomeOf,
   parseReviewLoopDirective,
   parseStartMarker,
   parseStopRecord,
@@ -428,7 +430,8 @@ function appEvent(c: { id?: number; body: string; createdAt?: string }, pr: numb
   const at = datable(c.createdAt) ? c.createdAt : undefined;
   const start = parseStartMarker(c.body, bot);
   if (start) return { at: start.at, kind: "start", mode: start.mode, actor: start.by, ...(c.id ? { seq: c.id } : {}) };
-  if (parseEscalateMarker(c.body, bot)) return at ? { at, kind: "escalate" } : undefined;
+  const handoff = parseEscalateMarker(c.body, bot);
+  if (handoff) return at ? { at, kind: "escalate", head: handoff.head } : undefined;
   // A recorded stop is placed at the stop's own time (an edit or a PR-body stop the fold cannot
   // replay); a bare legacy acknowledgement is an event at its own creation.
   const stopRecord = parseStopRecord(c.body, bot);
@@ -448,8 +451,10 @@ function appEvent(c: { id?: number; body: string; createdAt?: string }, pr: numb
  *   edit time; the App's STOPPED acknowledgement RECORDS them (review-loop.ts stoppedComment) —
  *   or, posted while a newer session runs, its bare record (stopRecordComment) — placed at the
  *   stop's own time, never at the record's.
- * - ONLY the App contributes escalate / stopped markers, its canonical continuation for THIS PR
- *   (the head the loop moved to), and converged (total=0) reviews with their commit.
+ * - ONLY the App contributes escalate / stopped markers (a handoff with its head), its canonical
+ *   continuation for THIS PR (the head the loop moved to), and converged (total=0) and not-clean
+ *   (review-loop.ts notCleanOutcomeOf: incomplete, raw, raw-unverified, unverified-clean) reviews
+ *   with their commit.
  * - The App's own control writes that the list does not show yet come from its journal
  *   (review-loop-control.ts OwnWrites): a lagging list never hides what this process wrote.
  * Reads fail closed: a list error throws (the caller must not act on a partial history).
@@ -499,8 +504,11 @@ export async function readLoopHistory(
     if (!isSelfLogin(c.userLogin, botLogin)) pushStop(events, c);
   }
   for (const r of reviews) {
-    if (isSelfLogin(r.userLogin, botLogin) && r.submittedAt && parseFindingsTotal(r.body) === 0) {
-      events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
+    if (!isSelfLogin(r.userLogin, botLogin) || !r.submittedAt) continue;
+    if (isConvergedFindings(r.body)) events.push({ at: r.submittedAt, kind: "converged", head: r.commitId || undefined });
+    else {
+      const outcome = notCleanOutcomeOf(r.body);
+      if (outcome) events.push({ at: r.submittedAt, kind: "not-clean", outcome, head: r.commitId || undefined });
     }
   }
   // Read-your-writes: this process's control writes the list does not show yet stand in for their

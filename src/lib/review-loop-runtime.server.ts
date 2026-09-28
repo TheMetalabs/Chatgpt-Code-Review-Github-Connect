@@ -107,10 +107,12 @@ import {
   stoppedComment,
   stopRecordComment,
   type EscalateReason,
+  type NotCleanOutcome,
   type ReviewLoopMode,
   type RoundSummary,
 } from "./review-loop.ts";
-import { deriveLoopSession, sameSession, sessionRef, type LoopEvent, type LoopSession, type SessionRef } from "./review-loop-session.ts";
+import { deriveLoopSession, sameSession, sessionRef, type LoopEvent, type LoopSession, type OwedHandoff, type SessionRef } from "./review-loop-session.ts";
+import { OUTCOME_SHAPE, postedOutcome, rawCauseText, type PostedOutcome } from "./review-outcome.ts";
 import { fixKnob, type BotSettings, type Finding, type Job, type SamplePr } from "./types.ts";
 import { WIRED_FIX_DELIVERIES, fixDeadline, fixLoopOn, fixProviderCaps, fixProviderUnsupported, fixReportsActivity } from "./settings-rules.ts";
 
@@ -209,6 +211,7 @@ const NO_SESSION = "no active loop session";
 const STOPPED_QUIET = "loop stopped by operator";
 const ENDED_BY_HANDOFF = "the loop session ended with a handoff";
 const ENDED_CONVERGED = "the loop session converged";
+const ENDED_NOT_CLEAN = "the loop session ended at a review that is not a clean pass";
 const NEWER_REQUEST = "superseded by a newer loop request (a new session, another starter, or apply downgraded to suggest)";
 /** NOT silent (logged): a concurrent handoff for this head outlived one backoff. */
 const HANDOFF_IN_FLIGHT = "a handoff for this head is still being posted by another loop step; this step did not run";
@@ -248,8 +251,58 @@ export const SILENT_REASONS: readonly string[] = [
   STOPPED_QUIET,
   ENDED_BY_HANDOFF,
   ENDED_CONVERGED,
+  ENDED_NOT_CLEAN,
   NEWER_REQUEST,
 ];
+
+/** The posted outcome of a zero-finding review when it is NOT a clean pass, else undefined. */
+function notCleanOutcome(job: Job): PostedOutcome | undefined {
+  const outcome = postedOutcome(job, 0);
+  return OUTCOME_SHAPE[outcome].converged ? undefined : outcome;
+}
+
+/** Fixed handoff detail per non-converged zero-finding outcome (never free text). */
+const NOT_CLEAN_DETAIL: Partial<Record<PostedOutcome, string>> = {
+  "raw-unverified": "local verification's reply could not be used as a review and is posted verbatim",
+  "unverified-clean": "chat found nothing, but local verification did not complete",
+  incomplete: "a reviewer did not run",
+};
+
+/** The handoff detail for a non-converged zero-finding outcome. A raw review says why it is posted
+ * verbatim from the causes its merge stamped (the same fixed text as the body's raw header), so a
+ * reply whose unread rows made it evidence is never handed off as a parse failure. */
+export function notCleanDetail(job: Partial<Pick<Job, "rawCauses" | "rawTruncated" | "skippedProviders" | "incompleteProviders">>, outcome: PostedOutcome): string {
+  if (outcome === "raw") return `posted verbatim: ${rawCauseText(job.rawCauses, job.rawTruncated)}`;
+  // Incomplete from provider state: a reviewer that returned something, but no complete verdict, ran.
+  if (outcome === "incomplete" && !job.skippedProviders?.length && job.incompleteProviders?.length) return "a reviewer returned no complete review";
+  return NOT_CLEAN_DETAIL[outcome] ?? outcome;
+}
+
+/** The fixed handoff for a posted review that is not a clean pass and carries no structured finding. */
+function notCleanHandoff(job: Job, outcome: PostedOutcome): string {
+  return `this review is not a clean pass (${notCleanDetail(job, outcome)}) and carries no structured finding the fix agent can act on`;
+}
+
+/** Why each not-clean outcome is not a clean pass, as far as its durable marker tells (a raw marker
+ * records no cause, so its text is cause-neutral, as rawCauseText's is without one). */
+const RECOVERED_WHY: Record<NotCleanOutcome, string> = {
+  incomplete: "a reviewer did not run or returned no complete review",
+  raw: `posted verbatim: ${rawCauseText(undefined)}`,
+  "raw-unverified": NOT_CLEAN_DETAIL["raw-unverified"]!,
+  "unverified-clean": NOT_CLEAN_DETAIL["unverified-clean"]!,
+};
+
+/** The fixed handoff a not-clean review owes when a later loop step recovers it from the review's
+ * durable marker (review-loop-session.ts owedHandoff): that review's job state is gone, so it names
+ * the outcome the marker records. */
+export function recoveredHandoffDetail(outcome: NotCleanOutcome | undefined): string {
+  const review = outcome ? `the ${outcome} review of this head (not a clean pass: ${RECOVERED_WHY[outcome]})` : "a review of this head that is not a clean pass";
+  return `${review} carries no structured finding the fix agent can act on, and its handoff was not recorded`;
+}
+export const INCOMPLETE_RECOVERED_DETAIL = recoveredHandoffDetail("incomplete");
+
+/** What a push reports when the session it finds ended at a not-clean review. */
+const endedNotClean = (owed: OwedHandoff) => `the loop ended at a review that is not a clean pass (${owed.outcome ?? "not clean"})`;
 
 /** Write-capable repository permissions (legacy field; `maintain` reports as `write`). */
 const WRITE_PERMISSIONS = new Set(["admin", "write"]);
@@ -672,6 +725,7 @@ const MOOT_TEXT: Record<Moot, string> = {
   handoff: "the loop session ended with a handoff",
   "handoff-unknown": "the loop session ended with a handoff whose outcome is unknown",
   converged: "the loop session converged",
+  "not-clean": ENDED_NOT_CLEAN,
   newer: "a newer loop request took over",
 };
 
@@ -688,7 +742,10 @@ function endedByUnresolvedHandoff(gh: object, ref: PrRef, s: LoopSession): boole
 /** Why an inactive session ended, as a moot reason (never guess "stopped" for a handoff). */
 function endedWhy(gh: object, ref: PrRef, s: LoopSession): Exclude<Moot, "head" | "newer"> {
   if (endedByUnresolvedHandoff(gh, ref, s)) return "handoff-unknown";
-  return s.endedBy === "escalate" ? "handoff" : s.endedBy === "converged" ? "converged" : "stopped";
+  if (s.endedBy === "escalate") return "handoff";
+  if (s.endedBy === "converged") return "converged";
+  if (s.endedBy === "not-clean") return "not-clean";
+  return "stopped";
 }
 
 /** Why `session` is not the one `now` shows running (null: it still runs) — ended, or a newer one
@@ -738,6 +795,8 @@ function endedStep(why: Moot): LoopStepResult {
       return { ran: false, reason: HANDED_OFF_UNKNOWN };
     case "converged":
       return { ran: false, reason: ENDED_CONVERGED };
+    case "not-clean":
+      return { ran: false, reason: ENDED_NOT_CLEAN };
     case "newer":
       return { ran: false, reason: NEWER_REQUEST };
     case "head": // a handoff is never superseded by a moved head (its session decides)
@@ -989,7 +1048,7 @@ function ensureContinuation(
 /** What a superseded step's request for the live head's review came to: skipped when none was
  * needed (the head did not move, or the session is over), unreadable when it could not be decided,
  * handed-off-unknown when only this process's own unresolved handoff ended the session. */
-type ContinueOnResult = EmitOutcome | { status: "skipped" } | { status: "unreadable"; error: string } | { status: "handed-off-unknown" };
+type ContinueOnResult = EmitOutcome | { status: "skipped" } | { status: "unreadable"; error: string } | { status: "handed-off-unknown" } | { status: "owed"; owed: OwedHandoff };
 
 /** A superseded step is quiet only when the live head's review is requested or not needed. */
 function supersededResult(r: ContinueOnResult): LoopStepResult {
@@ -1006,6 +1065,8 @@ function supersededResult(r: ContinueOnResult): LoopStepResult {
       return { ran: false, reason: `${SUPERSEDED_UNREADABLE}: ${r.error}` };
     case "handed-off-unknown":
       return { ran: false, reason: SUPERSEDED_HANDED_OFF };
+    case "owed": // call sites settle via settleOwed; never a quiet supersession
+      return { ran: false, reason: ENDED_NOT_CLEAN };
     case "superseded": // the live head moved again, or the session no longer runs: not owed
       return { ran: false, reason: r.why === "handoff-unknown" ? SUPERSEDED_HANDED_OFF : SUPERSEDED };
     default:
@@ -1063,7 +1124,11 @@ export async function runPostReviewLoop(
   // findings, or it shows findings that all share ids and cannot be attributed.
   const unshown = findings.length === 0 && posted?.inlineDropped === true && (job.findings?.length ?? 0) > 0;
   const unattributable = findings.length === 0 && shown.length > 0;
-  if (findings.length === 0 && !unshown && !unattributable) return { ran: false, reason: "no findings (converged)" };
+  // A third: the posted review is not a clean pass (raw, unverified, incomplete) although it has no
+  // structured finding. CONVERGED is decided by the posted outcome, the same one the body's marker
+  // carries, never by "no findings". Every review reaching this check posted zero findings.
+  const notClean = findings.length === 0 && !unshown && !unattributable ? notCleanOutcome(job) : undefined;
+  if (findings.length === 0 && !unshown && !unattributable && !notClean) return { ran: false, reason: "no findings (converged)" };
 
   const { owner, repo, pr, headSha } = job;
   const ref: PrRef = { owner, repo, pr };
@@ -1106,6 +1171,41 @@ export async function runPostReviewLoop(
     } catch (e) {
       // escalateNow reports failures as {error}; even so a rejection never escapes (never throws).
       return { ran: false, reason: `ESCALATE ${reason} failed to post: ${(e as Error)?.message ?? String(e)} (detail: ${detail})` };
+    }
+  };
+
+  // The loop-error handoff a session that ended at a not-clean review owes, settled once for that head
+  // and scoped to the session it ended; never a fix round past it. With this review's own detail when
+  // it is that review (its job is here), else the fixed detail recovered from the durable marker.
+  // The session's own not-clean end must NOT supersede this handoff (that end is why it is owed).
+  const settleOwed = async (owed: OwedHandoff): Promise<LoopStepResult> => {
+    const session = { at: owed.startIso, seq: owed.startSeq };
+    since = session;
+    const owedHead = owed.head ?? headSha;
+    const own = notClean !== undefined && owedHead === headSha && notClean === (owed.outcome ?? notClean);
+    const detail = own ? notCleanHandoff(job, notClean!) : recoveredHandoffDetail(owed.outcome);
+    if (!d) return { ran: false, reason: `ESCALATE loop-error not posted (no GitHub client): ${detail}` };
+    const gh = d.gh;
+    const superseded = async (): Promise<Supersession | null> => {
+      const why = await freshMoot(gh, token, ref, botLogin, { session });
+      return why === "not-clean" ? null : why;
+    };
+    const post = () => escalateNow(gh, token, { owner, repo, pr, head: owedHead, reason: "loop-error", detail, rounds, roundCap: cap, diffLines, botLogin, session, superseded, sleep, now: d!.now });
+    try {
+      let r = await post();
+      if (r.error === ESCALATE_IN_FLIGHT) {
+        await sleep(ESCALATE_BACKOFF_MS);
+        r = await post();
+        if (r.error === ESCALATE_IN_FLIGHT) return { ran: false, reason: `ESCALATE loop-error not posted: another handoff for this head is in flight (detail: ${detail})` };
+      }
+      if (r.superseded) return endedStep(r.superseded);
+      if (r.ambiguous) return { ran: false, reason: `ESCALATE loop-error: ${HANDED_OFF_UNKNOWN} (detail: ${detail})` };
+      if (r.error) return { ran: false, reason: `ESCALATE loop-error failed to post: ${r.error} (detail: ${detail})` };
+      if (!r.escalated) return { ran: false, reason: ALREADY_ESCALATED };
+      trace(job.id, "handoff", { reason: "loop-error", head: owedHead.slice(0, 7) });
+      return { ran: true, step: "escalated", reason: "loop-error", detail };
+    } catch (e) {
+      return { ran: false, reason: `ESCALATE loop-error failed to post: ${(e as Error)?.message ?? String(e)} (detail: ${detail})` };
     }
   };
 
@@ -1159,7 +1259,10 @@ export async function runPostReviewLoop(
       } catch (e) {
         return { status: "unreadable", error: (e as Error)?.message ?? String(e) };
       }
-      if (!now.active) return endedByUnresolvedHandoff(gh, ref, now) ? { status: "handed-off-unknown" } : { status: "skipped" };
+      if (!now.active) {
+        if (now.owedHandoff) return { status: "owed", owed: now.owedHandoff };
+        return endedByUnresolvedHandoff(gh, ref, now) ? { status: "handed-off-unknown" } : { status: "skipped" };
+      }
       const r = await ensureContinuation(ctl, gh, ref, { head: live.sha, mode: now.mode ?? "suggest", session: sessionRef(now) });
       trace(job.id, "superseded", { live: live.sha.slice(0, 7), continuation: r.status });
       return r;
@@ -1167,7 +1270,11 @@ export async function runPostReviewLoop(
     const head = await gh.fetchPullHeadRef(token, owner, repo, pr);
     // Also the fork-push guard: a commit parented on a stale SHA would fast-forward over a
     // contributor's backward force-push.
-    if (head.sha !== headSha) return supersededResult(await continueOn(head));
+    if (head.sha !== headSha) {
+      const moved = await continueOn(head);
+      if (moved.status === "owed") return await settleOwed(moved.owed);
+      return supersededResult(moved);
+    }
     let session = await sessionOf(gh, token, ref, head, botLogin);
     // This review (or a waiting step it replaced) was requested by a fresh human start whose record
     // harbor could not post at admission: record it now (idempotent — an existing record, e.g. one a
@@ -1194,7 +1301,14 @@ export async function runPostReviewLoop(
       session = await sessionOf(gh, token, ref, head, botLogin);
     }
     dropStarts(state, prKey(ref), startRequests); // recorded, or the session they would open runs
-    if (!session.active) return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
+    if (!session.active) {
+      const owed = session.owedHandoff;
+      if (owed) {
+        requested = true;
+        return await settleOwed(owed);
+      }
+      return { ran: false, reason: endedByUnresolvedHandoff(gh, ref, session) ? HANDED_OFF_UNKNOWN : NO_SESSION };
+    }
     // A step that waited acts only for a session its review can belong to. One anchored after the
     // step was called (a stop → restart during the wait) started after this review was posted, so
     // its rounds never include it: the history check below would hand the restarted session off
@@ -1219,6 +1333,7 @@ export async function runPostReviewLoop(
     if (unattributable) {
       return await escalate("loop-error", "every finding of this review shares its id with another, so none can be attributed to its thread; the loop does not fix what it cannot attribute");
     }
+    if (notClean) return await escalate("loop-error", notCleanHandoff(job, notClean));
     if (!sample) return await escalate("loop-error", "no head-pinned snapshot for this review");
 
     // 1) Stuck or budget spent? Rounds are counted from the durable session anchor, so a
@@ -1340,6 +1455,13 @@ export async function runPostReviewLoop(
     // A moot round ends quietly: a moved head continues on the live head (idempotent); a stop or
     // a newer request already decides what comes next.
     const quietExit = async (why: Moot): Promise<LoopStepResult> => {
+      // A session that ended at a not-clean review (another review of this head, landed while the
+      // round ran) owes that review's handoff: this round posts it, since that review's own step
+      // was waiting on this one.
+      if (why === "not-clean") {
+        const owed = (await sessionOf(gh, token, ref, head, botLogin)).owedHandoff;
+        return owed ? await settleOwed(owed) : { ran: false, reason: ENDED_NOT_CLEAN };
+      }
       if (why !== "head") return endedStep(why);
       let live: PullHead;
       try {
@@ -1347,7 +1469,9 @@ export async function runPostReviewLoop(
       } catch (e) {
         return { ran: false, reason: `${SUPERSEDED_UNREADABLE}: ${(e as Error)?.message ?? String(e)}` };
       }
-      return supersededResult(await continueOn(live));
+      const moved = await continueOn(live);
+      if (moved.status === "owed") return await settleOwed(moved.owed);
+      return supersededResult(moved);
     };
     const before = await checkpoint();
     if (before) return await quietExit(before);
@@ -1536,8 +1660,10 @@ export async function runPostReviewLoop(
       const now = await sessionOf(gh, token, ref, newHead ? { ...head, sha: newHead } : head, botLogin).catch(() => null);
       const gone = now ? sessionMoot(gh, ref, now, current) : null;
       let status: ContinuationStatus;
+      let owed: LoopStepResult | undefined; // the handoff a not-clean review that ended the session owes
       if (gone) {
         status = { ok: false, ended: gone };
+        if (now?.owedHandoff) owed = await settleOwed(now.owedHandoff);
       } else if (!newHead) {
         status = { ok: false, error: "the commit sha was not returned" };
       } else {
@@ -1563,6 +1689,9 @@ export async function runPostReviewLoop(
         /* the report is informational; the continuation / handoff carries the signal */
       });
       if (handoff) return handoff;
+      // The owed handoff's own result when it landed or failed (a failure is logged); an existing one
+      // leaves the round's.
+      if (owed && (owed.ran || !SILENT_REASONS.includes(owed.reason))) return owed;
       if (status.ok) trace(job.id, "continued", { commit: newHead?.slice(0, 7), round: rounds.length + 1 });
       return { ran: true, step: "fix", outcome: done.outcome, commitSha: newHead ?? done.commitSha, continued: status.ok, attempts: tries };
     };
@@ -1630,7 +1759,37 @@ export async function continueLoopOnPush(
     const moved = push.pushedAt ? [{ at: push.pushedAt, kind: "push" as const, head: push.headSha }] : [];
     const session = await sessionOf(d.gh, token, push, head, botLogin, moved);
     if (!session.active) {
-      return endedByUnresolvedHandoff(d.gh, push, session) ? { posted: false, reason: HANDED_OFF_UNKNOWN, unresolved: true } : { posted: false, reason: NO_SESSION };
+      // A session that ended at a not-clean review whose handoff was lost is not continued by a push
+      // (the loop ended there): the push recovers the handoff it owes instead.
+      const owed = session.owedHandoff;
+      if (!owed) {
+        return endedByUnresolvedHandoff(d.gh, push, session) ? { posted: false, reason: HANDED_OFF_UNKNOWN, unresolved: true } : { posted: false, reason: NO_SESSION };
+      }
+      const owedHead = owed.head ?? push.headSha;
+      const rounds = await reconstructRounds(d.gh, token, push.owner, push.repo, push.pr, { botLogin, sinceIso: owed.startIso }).catch(() => []);
+      const sinceOwed = { at: owed.startIso, seq: owed.startSeq };
+      const handoff = await escalateNow(d.gh, token, {
+        owner: push.owner,
+        repo: push.repo,
+        pr: push.pr,
+        head: owedHead,
+        reason: "loop-error",
+        detail: recoveredHandoffDetail(owed.outcome),
+        rounds,
+        roundCap: roundCap(settings),
+        botLogin,
+        session: sinceOwed,
+        // The session's own not-clean end is why this handoff is owed — never a supersession of it.
+        superseded: async () => {
+          const why = await freshMoot(d.gh, token, push, botLogin, { session: sinceOwed, extra: moved });
+          return why === "not-clean" ? null : why;
+        },
+        sleep: d.sleep,
+        now: d.now,
+      });
+      const outcome = handoff.escalated ? "handoff posted" : handoff.ambiguous ? "handoff outcome unknown" : handoff.error ? `handoff failed: ${handoff.error}` : "handoff already posted";
+      const unresolved = handoff.ambiguous || handoff.superseded === "handoff-unknown";
+      return { posted: false, reason: `${endedNotClean(owed)}; ${outcome}`, ...(unresolved ? { unresolved: true as const } : {}) };
     }
     const since = sessionRef(session);
     const c = await ensureContinuation(controlCtx(d, token, botLogin), d.gh, push, { head: push.headSha, mode: session.mode ?? "suggest", session: since, extra: moved });
@@ -1688,6 +1847,7 @@ function supersededPush(why: Moot): ControlResult {
     case "stopped":
     case "handoff":
     case "converged":
+    case "not-clean":
       return { posted: false, reason: NO_SESSION };
     default:
       return assertNever(why);

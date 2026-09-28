@@ -3,12 +3,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { stripTypeScriptTypes } from 'node:module';
-import { extractChatJson, extractChatJsonRange } from '../../src/lib/extract-chat-json.ts';
+import { extractChatJson, extractChatJsonParts, extractChatJsonRange } from '../../src/lib/extract-chat-json.ts';
 import { source, raw } from './helpers.mjs';
 const settings = { localLlmBaseUrl: 'http://local/v1/', localLlmApiKey: ' secret ', localLlmModel: ' model ' };
 function local(responses) {
   const calls = [], clients = [], probes = [];
-  const context = vm.createContext({ console, extractChatJson, extractChatJsonRange, bridgePromptText,
+  const context = vm.createContext({ console, extractChatJson, extractChatJsonParts, extractChatJsonRange, bridgePromptText,
     AbortSignal: {timeout: ms => ({timeout: ms})},
     requestLocalJson: async (...args) => {probes.push(args);return {};},
     requestLocalChat: async (...args) => { calls.push(args); const next = responses.shift(); if (next instanceof Error) throw next; return next; },

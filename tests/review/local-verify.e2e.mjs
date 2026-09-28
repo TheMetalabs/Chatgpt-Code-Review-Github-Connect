@@ -48,8 +48,7 @@ test('verify-clean: the first unparseable reply is kept as evidence even when th
   assert.equal(converged(body),false);
 });
 
-// Deferred to #81-6 (tip extractChatJsonParts / residual archive path; main is ahead on extract-chat-json differently).
-test.skip('verify-clean multi-turn: residual text past the posted raw cap is archived whole in review history',async t=>{
+test('verify-clean multi-turn: residual text past the posted raw cap is archived whole in review history',async t=>{
   const {app,jobId}=await setup(t,'verify-clean',{localJsonRepairEnabled:false,localReviewMode:'multiturn'});
   await app.harbor.submitHarborChat(jobId,clean);
   await eventually(()=>app.localRequests.length===1,'clean chat did not start local verification');
@@ -68,7 +67,7 @@ test.skip('verify-clean multi-turn: residual text past the posted raw cap is arc
   assert.equal(archived.responses.local.truncated,false);
 });
 
-test.skip('race (default) multi-turn: a parsed local leg\'s residual text is its archived original, never an unparsed observation',async t=>{
+test('race (default) multi-turn: a parsed local leg\'s residual text is its archived original, never an unparsed observation',async t=>{
   const {app,jobId,job}=await setup(t,'race',{localJsonRepairEnabled:false,localReviewMode:'multiturn'});
   await eventually(()=>app.localRequests.length===1,'race mode did not start local at snapshot');
   app.localResponses[0].end(reply(`RACE-RESIDUAL-MARK some thoughts first.\n${dirty}`));

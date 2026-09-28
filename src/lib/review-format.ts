@@ -35,10 +35,14 @@ export function redactSalvagedReviewBody(body: string): string {
   return `${s.slice(0, start)}_(verbatim salvaged review redacted from the public snapshot; posted to the PR)_${s.slice(end)}`;
 }
 
-/** Keep the rendered body under GitHub's limit, preserving the trailing findings marker. */
+/** Keep the rendered body under GitHub's limit, preserving the trailing terminal marker
+ * (ashlar-findings, or ashlar-outcome incomplete). Without this, truncating an oversized incomplete
+ * body from the start can drop INCOMPLETE_OUTCOME_MARKER and leave the loop session unresolved. */
 function capReviewBody(body: string): string {
   if (body.length <= MAX_REVIEW_BODY) return body;
-  const markerAt = body.lastIndexOf("<!-- ashlar-findings");
+  const findingsAt = body.lastIndexOf("<!-- ashlar-findings");
+  const incompleteAt = body.lastIndexOf(INCOMPLETE_OUTCOME_MARKER);
+  const markerAt = Math.max(findingsAt, incompleteAt);
   const marker = markerAt >= 0 ? body.slice(markerAt) : "";
   const note = "\n\n…(review body truncated to fit GitHub's limit; full details in review history)\n";
   return body.slice(0, Math.max(0, MAX_REVIEW_BODY - marker.length - note.length)) + note + marker;
@@ -109,7 +113,7 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     case "unverified-clean":
       return cleanBody(job, parts);
     case "incomplete":
-      return incompleteBody(parts);
+      return capReviewBody(incompleteBody(parts));
     default: {
       const unhandled: never = outcome;
       return unhandled;

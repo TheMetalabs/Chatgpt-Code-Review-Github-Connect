@@ -268,6 +268,28 @@ describe("review-format", () => {
       assert.equal(isIncompleteOutcome(`text\n${INCOMPLETE_OUTCOME_MARKER}\n`), true);
       assert.equal(isIncompleteOutcome(undefined), false);
     });
+
+    it("preserves the incomplete terminal marker when an oversized body is capped", () => {
+      const body = reviewSummaryBody(
+        {
+          headSha: "abc1234ffff",
+          reviewProviders: ["chatgpt", "local"],
+          localReviewRole: "race",
+          incompleteProviders: ["chatgpt"],
+          assumptions: [],
+          coverage: [],
+          localVerifyNote: "NOTE-" + "x".repeat(80_000),
+        },
+        [],
+        "ashlar-bot",
+        [],
+      );
+      assert.ok(body.length <= 65_000, `body too long: ${body.length}`);
+      assert.equal(isIncompleteOutcome(body), true, "incomplete marker must survive truncation");
+      assert.equal(body.trimEnd().endsWith(INCOMPLETE_OUTCOME_MARKER), true);
+      assert.equal(isConvergedFindings(body), false);
+      assert.equal(body.includes("<!-- ashlar-findings"), false);
+    });
   });
 
   describe("every posted body tells the loop whether it is a not-clean outcome (the durable side of its handoff)", () => {

@@ -1,5 +1,6 @@
-import type { Job, ReviewProvider, ProviderError } from "./types.ts";
+import type { Job, LocalReviewRole, ReviewProvider, ProviderError } from "./types.ts";
 import { isChatProvider } from "./types.ts";
+import { salvageReviewJson } from "./extract-chat-json.ts";
 
 export function shouldStartLocalRace(input: {
   providers: readonly ReviewProvider[];
@@ -41,4 +42,273 @@ export function stillRacing(input: {
     return true;
   }
   return false;
+}
+
+// settings.localReviewRole = "verify-clean" (pinned on the job at snapshot as Job.localReviewRole):
+// the chat reviewers run first, local is held back and is "released" either as a verification round
+// (merged chat result parsed clean) or as today's fallback (chat produced no usable result).
+
+/** Local is a verifier only when the job's role says so AND both a chat reviewer and local are enabled. */
+export function localVerifies(input: { role?: LocalReviewRole; providers: readonly ReviewProvider[] }): boolean {
+  return input.role === "verify-clean" && input.providers.includes("local") && input.providers.some(isChatProvider);
+}
+
+/** A stored local leg is a usable complete verdict for fallback delivery only when its raw is review
+ * JSON with no incompleteness markers (unparsedText / residualReplies) and is not salvaged verbatim
+ * (`raw_review`). Raw presence alone is not enough: incomplete / raw-only evidence cannot keep chat
+ * waived. */
+/** Same required fields as poster.asFinding — a finding row is structurally postable only when these
+ * are present. Used by usableLocalFallbackLeg so a malformed findings array cannot keep chat waived. */
+function findingStructurallyValid(row: unknown): boolean {
+  if (!row || typeof row !== "object") return false;
+  const f = row as Record<string, unknown>;
+  const title = String(f.title ?? "").trim();
+  const failureScenario = String(f.failure_scenario ?? f.failureScenario ?? "").trim();
+  const rootCause = String(f.root_cause ?? f.rootCause ?? "").trim();
+  const evidence = String(f.evidence ?? "").trim();
+  const recommendedFix = String(f.recommended_fix ?? f.recommendedFix ?? "").trim();
+  const recommendedTest = String(f.recommended_test ?? f.recommendedTest ?? "").trim();
+  const file = String(f.file ?? "").trim();
+  const line = Number(f.line);
+  if (!title || !failureScenario || !rootCause || !evidence || !recommendedFix || !recommendedTest || !file) return false;
+  return Number.isFinite(line) && line >= 1;
+}
+
+export function usableLocalFallbackLeg(
+  leg: { provider: ReviewProvider; raw: string; unparsedText?: string; residualReplies?: string },
+): boolean {
+  if (leg.provider !== "local" || !leg.raw.trim()) return false;
+  if (leg.unparsedText?.trim() || leg.residualReplies?.trim()) return false;
+  try {
+    const parsed = JSON.parse(leg.raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const o = parsed as Record<string, unknown>;
+    // Salvaged verbatim evidence is never a usable verdict.
+    const rawReview = typeof o.raw_review === "string" ? o.raw_review.trim() : "";
+    if (rawReview) return false;
+    // Require review-shaped keys (findings / merge_recommendation / keep / investigated_safe).
+    if (!("findings" in o || "merge_recommendation" in o || "keep" in o || "investigated_safe" in o)) return false;
+    // Same Instant-tier empty guard as gateLiveSubmission: empty findings without investigated_safe
+    // is not a review (a bare {} / non-review object must not keep chat waived).
+    const findings = Array.isArray(o.findings) ? o.findings : [];
+    if (findings.length === 0) {
+      const safe = Array.isArray(o.investigated_safe)
+        ? (o.investigated_safe as unknown[]).map((x) => String(x).trim()).filter(Boolean)
+        : [];
+      return safe.length > 0;
+    }
+    // Every finding must pass the publish-gate structural schema (asFinding required fields).
+    return findings.every(findingStructurallyValid);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a job released as the chat-down fallback (Job.localFallbackAt) keeps chat waived: true
+ * while that local leg can still deliver a usable complete verdict (still running, or finished with
+ * one). The release itself is permanent, whatever the bridge does later (a reconnect included), but
+ * chat stays waived only while local can still deliver that verdict: once local ends with no usable
+ * verdict (failure, "Skipped local", incomplete / raw-only evidence), chat is the only reviewer left
+ * and is awaited / offered to the bridge again. */
+export function fallbackWaivesChat(
+  job: Pick<Job, "localFallbackAt" | "storedLegs" | "assumptions" | "providerErrors" | "generating" | "providerProgress">,
+): boolean {
+  if (!job.localFallbackAt) return false;
+  const local = (job.storedLegs ?? []).find((l) => l.provider === "local" && l.raw.trim());
+  // Derive usability from the stored leg alone — do not wait for incompleteProviders/rawCauses,
+  // which are only stamped at merge and may be absent when the bridge decides whether to re-offer chat.
+  if (local) return usableLocalFallbackLeg(local);
+  const error = job.providerErrors?.local;
+  if (skippedProvider(job.assumptions, "local") || (error && error.code !== "disconnected")) return false;
+  // Authoritative local lifecycle: still generating, or progress not yet terminal → wait on local.
+  if (job.generating?.local === true) return true;
+  const stage = job.providerProgress?.local?.stage;
+  if (stage === "response_collected" || stage === "error") {
+    // Terminal local progress without a usable stored leg (torn / rejected transition window):
+    // do not keep chat suppressed — bridge must be able to re-offer recovery.
+    return false;
+  }
+  // Not started yet, queued, generating, or unknown: local can still deliver.
+  return true;
+}
+
+/** Chat prompt captured at held-local release (verify or fallback). Later mutations of chatPrompt must
+ * not retarget the local verification / fallback run. */
+export function releaseLocalPrompt(
+  job: Pick<Job, "chatPrompt" | "chatPromptByProvider">,
+): string {
+  return (
+    job.chatPrompt?.trim() ||
+    job.chatPromptByProvider?.chatgpt?.trim() ||
+    job.chatPromptByProvider?.grok?.trim() ||
+    ""
+  );
+}
+
+/** Prompt the local leg must execute with after a held-local release: the prompt pinned at release
+ * wins over any later live chatPrompt mutation. */
+export function localExecutionPrompt(
+  job: Pick<Job, "localReleasePrompt" | "chatPrompt" | "chatPromptByProvider">,
+): string {
+  return job.localReleasePrompt?.trim() || releaseLocalPrompt(job);
+}
+
+/** The providers the job waits on right now: a held-back local leg counts only once it is released.
+ * While a fallback release waives chat (`localFallback` = fallbackWaivesChat), the job waits only on
+ * local: a chat payload that still lands before local posts is merged; it is never waited for. */
+export function racingProviders(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  localReleased: boolean;
+  localFallback?: boolean;
+}): ReviewProvider[] {
+  if (!localVerifies(input)) return [...input.providers];
+  if (input.localFallback) return input.providers.filter((p) => !isChatProvider(p));
+  if (input.localReleased) return [...input.providers];
+  return input.providers.filter((p) => p !== "local");
+}
+
+/** Race: start local alongside chat (as today). Verify-clean: start it only once it is released. */
+export function shouldStartLocalLeg(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  localReleased: boolean;
+  status: Job["status"];
+  localDone: boolean;
+  localStarted: boolean;
+}): boolean {
+  if (localVerifies(input) && !input.localReleased) return false;
+  return shouldStartLocalRace(input);
+}
+
+/** Chat finished without a usable result (quota / disconnected / no JSON), or it is stalled with no
+ * progress because the Chrome bridge is offline / never claimed the job: release local as the fallback. */
+export function releaseLocalAsFallback(input: {
+  role?: LocalReviewRole;
+  providers: readonly ReviewProvider[];
+  localReleased: boolean;
+  chatRacing: boolean;
+  usableChat: boolean;
+  /** chatStalled(): chat is nominally racing but cannot progress (bridge offline / job unclaimed). */
+  chatStalled?: boolean;
+}): boolean {
+  return localVerifies(input) && !input.localReleased && !input.usableChat && (!input.chatRacing || Boolean(input.chatStalled));
+}
+
+/** A held verify-clean chat leg that has made no progress (no payload, not generating) while the
+ * bridge has been disconnected for at least `graceMs`, measured from the moment it disconnected
+ * (never from job age). A connected bridge never releases local by time: BRIDGE_CLAIM_MS is an
+ * ownership lease, not a reviewer deadline. stillRacing treats `disconnected` as non-terminal, so
+ * without this the held local leg would never be released while the bridge is offline. */
+export function chatStalled(input: {
+  chatProgress: boolean;
+  connected: boolean;
+  /** When the bridge disconnected (epoch ms); undefined when unknown. */
+  disconnectedAt?: number;
+  now: number;
+  graceMs: number;
+}): boolean {
+  if (input.chatProgress || input.connected || input.disconnectedAt === undefined) return false;
+  return input.now - input.disconnectedAt >= input.graceMs;
+}
+
+/** A verify-clean job's held local leg that has been released (verification round or fallback). */
+export function heldLocalReleased(
+  job: Pick<Job, "localReviewRole" | "reviewProviders" | "localVerifyStartedAt" | "localFallbackAt">,
+): boolean {
+  const released = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
+  return released && localVerifies({ role: job.localReviewRole, providers: job.reviewProviders ?? [] });
+}
+
+/** Whether this job still owns the validator phase stamped at `generation`. A concurrent held-local
+ * release (or a newer submit) leaves the phase; stale validator completion must no-op. */
+export function ownsValidatorGeneration(
+  job: Pick<Job, "status" | "validatorGeneration"> | undefined,
+  generation: number,
+): boolean {
+  return Boolean(job && job.status === "validator" && job.validatorGeneration === generation);
+}
+
+/** Whether a held-local release may stamp for this job snapshot.
+ * - awaiting_chat: watcher / non-validator path (no generation required).
+ * - validator: only the submission that owns `opts.validatorGeneration` (stale validator no-ops). */
+export function canReleaseHeldLocal(
+  job: Pick<Job, "status" | "localVerifyStartedAt" | "localFallbackAt" | "validatorGeneration">,
+  opts?: { validatorGeneration?: number },
+): boolean {
+  if (job.localVerifyStartedAt || job.localFallbackAt) return false;
+  if (job.status === "validator") {
+    return opts?.validatorGeneration != null && job.validatorGeneration === opts.validatorGeneration;
+  }
+  return job.status === "awaiting_chat";
+}
+
+/** Why a reviewer leg's gated reply is not its reviewer's complete verdict (docs/local-verify-clean.md
+ * §1), or undefined when it is one. Every leg, chat or local, on race or verify-clean: only a
+ * complete verdict earns clean credit (a clean result, a verification round, verified-clean), and
+ * a leg that is not one is gated as evidence (verdictEvidence) and posted verbatim. It must pass the
+ * gate with every finding it reported intact: a reviewer whose finding the gate dropped for its shape
+ * did not return a clean result. No completed reply may have been set aside to get it: the JSON
+ * correction does not see the first reply, so a clean correction says nothing about the finding that
+ * reply may carry. Nor may any text of the reply itself be set aside: prose the model wrote outside
+ * the accepted JSON object (`residualReplies`) can be a finding that object does not carry. Those two
+ * reply-text inputs are local-only: only a local leg's reply is the model's own completion text. A
+ * chat leg's verdict is the JSON its client submitted; the page capture around it (rendered labels,
+ * reasoning summaries, page text) is archived as originalText, never judged here. Every row it
+ * reported must have been inspected, too: a finding past the gate's row cap (`overflow`) was set
+ * aside unread. A reply the gate rejected is no verdict at all. */
+export function incompleteVerdict(
+  gate: { ok: true; malformed?: number; overflow?: number; rawReview?: string } | { ok: false; reason: string },
+  leg: { unparsedText?: string; residualReplies?: string },
+): string | undefined {
+  if (!gate.ok) return gate.reason;
+  if (gate.rawReview) return undefined; // already salvaged verbatim
+  if (leg.unparsedText?.trim()) return "a completed reply was not review JSON";
+  if (leg.residualReplies?.trim()) return "a completed reply carried text outside its review JSON";
+  if (gate.malformed) return `${gate.malformed} finding(s) missing required fields`;
+  return gateUnreadRows(gate);
+}
+
+/** Why ANY leg's gated result (chat or local, race or verify-clean) is not its reviewer's full verdict
+ * because the gate set rows past its cap (`overflow`) aside unread, or undefined. Such a leg is gated
+ * as evidence (verdictEvidence): an unread row may be the finding, so a result that skipped one can
+ * never read as clean, start or support a verification round, or converge. */
+export function gateUnreadRows(gate: { ok: true; overflow?: number; rawReview?: string } | { ok: false; reason: string }): string | undefined {
+  if (!gate.ok || gate.rawReview || !gate.overflow) return undefined;
+  return `${gate.overflow} finding(s) past the gate's row cap were not inspected`;
+}
+
+/** What to gate in place of a reply that is not a complete verdict (incompleteVerdict): whatever
+ * parsed, with the reviewer's own reply attached verbatim as raw_review, so it posts as evidence and
+ * never counts as a verdict. For a local leg that is every completed reply the model wrote. A chat
+ * leg's reply is the JSON its client submitted (`raw`): its originalText is the page capture around
+ * it (rendered labels, reasoning summaries, page text), archived in review history and never posted
+ * as the reviewer's evidence. */
+export function verdictEvidence(
+  parsed: Record<string, unknown> | null,
+  leg: { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string },
+): Record<string, unknown> {
+  const replies = isChatProvider(leg.provider)
+    ? leg.raw
+    : localReplies({ unparsedText: leg.unparsedText, residualReplies: leg.residualReplies, originalText: leg.originalText || leg.raw });
+  const salvaged = JSON.parse(salvageReviewJson(replies));
+  return { ...salvaged, ...(parsed ?? {}), raw_review: salvaged.raw_review };
+}
+
+/** Every completed reply of a local leg, each once, in the order the model wrote them. */
+export function localReplies(leg: { unparsedText?: string; residualReplies?: string; originalText?: string }): string {
+  return [...new Set([leg.unparsedText, leg.residualReplies, leg.originalText].map((t) => t?.trim() ?? "").filter(Boolean))].join("\n\n---\n\n");
+}
+
+/** A local leg that failed after the model completed a reply that is not review JSON, on any role
+ * (race, or a released held leg: verification round or chat-down fallback): that reply is the only
+ * evidence it produced, possibly a real finding, so it becomes a salvaged leg (posted verbatim)
+ * instead of a "Skipped local". The same first reply is evidence when its JSON correction parses
+ * (incompleteVerdict), so a correction that fails cannot lose it. Both the failed JSON correction
+ * (`originalText`) and the reply before it (`unparsedText`) count, so a correction that itself fails
+ * (HTTP 500, transport error, abort) still keeps the first reply. A failure with no completed reply
+ * stays a failure. */
+export function failedLocalSalvage(failure: { originalText?: string; unparsedText?: string }): string | undefined {
+  const replies = localReplies(failure);
+  return replies ? salvageReviewJson(replies) : undefined;
 }

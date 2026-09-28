@@ -15,12 +15,16 @@ function parseReviewSlice(slice: string): string | null {
   }
 }
 
+/** Slice of `text` that is the last balanced JSON object `accept` validates, with offsets. */
+export type JsonObjectSlice = { json: string; start: number; end: number }; // end exclusive
+
 /**
  * Walk backward from each closing brace so thinking traces with extra `{` cannot swallow
- * the payload, returning the last balanced JSON object slice that `accept` validates.
- * Shared by the review extractor and the fix-agent extractor (design §6 mechanism A).
+ * the payload, returning the last balanced JSON object slice that `accept` validates
+ * (and its start/end offsets into `text`). Shared by the review extractor and the
+ * fix-agent extractor (design §6 mechanism A).
  */
-export function lastJsonObject(text: string, accept: (value: unknown) => boolean): string | null {
+export function lastJsonObjectRange(text: string, accept: (value: unknown) => boolean): JsonObjectSlice | null {
   const s = String(text || "");
   for (let end = s.lastIndexOf("}"); end >= 0; end = s.lastIndexOf("}", end - 1)) {
     let depth = 0;
@@ -40,7 +44,7 @@ export function lastJsonObject(text: string, accept: (value: unknown) => boolean
         if (depth === 0) {
           const slice = s.slice(i, end + 1);
           try {
-            if (accept(JSON.parse(slice))) return slice;
+            if (accept(JSON.parse(slice))) return { json: slice, start: i, end: end + 1 };
           } catch {
             /* not valid JSON at this slice; keep walking */
           }
@@ -50,6 +54,11 @@ export function lastJsonObject(text: string, accept: (value: unknown) => boolean
     }
   }
   return null;
+}
+
+/** Same walk as lastJsonObjectRange, returning only the accepted slice string. */
+export function lastJsonObject(text: string, accept: (value: unknown) => boolean): string | null {
+  return lastJsonObjectRange(text, accept)?.json ?? null;
 }
 
 /** Walk backward from each closing brace so thinking traces with extra `{` cannot swallow the payload. */
@@ -67,15 +76,31 @@ export function withoutCitationMarkers(text: string): string | null {
   return text.search(CHAT_CITATION_MARKER) >= 0 ? text.replace(CHAT_CITATION_MARKER, "") : null;
 }
 
-export function extractChatJson(text: string): string | null {
+/**
+ * Last review JSON in `text` with its start/end offsets into that same string.
+ * When citation markers must be stripped first, offsets are remapped by locating
+ * the cleaned slice at its last occurrence in the original (markers sit outside
+ * the review object for cases this recovers). Returns null offsets only when the
+ * accepted JSON exists solely in the cleaned form.
+ */
+export function extractChatJsonRange(text: string): JsonObjectSlice | null {
   const s = String(text || "");
   if (!s.trim()) return null;
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
-  // Only a transcript that yields nothing as written is read again without citation markers.
-  const plain = lastReviewJson(s);
+  const plain = lastJsonObjectRange(s, isReviewObject);
   if (plain) return plain;
+  // Only a transcript that yields nothing as written is read again without citation markers.
   const cleaned = withoutCitationMarkers(s);
-  return cleaned ? lastReviewJson(cleaned) : null;
+  if (!cleaned) return null;
+  const fromCleaned = lastJsonObjectRange(cleaned, isReviewObject);
+  if (!fromCleaned) return null;
+  const idx = s.lastIndexOf(fromCleaned.json);
+  if (idx < 0) return { json: fromCleaned.json, start: -1, end: -1 };
+  return { json: fromCleaned.json, start: idx, end: idx + fromCleaned.json.length };
+}
+
+export function extractChatJson(text: string): string | null {
+  return extractChatJsonRange(text)?.json ?? null;
 }
 
 /**
@@ -90,8 +115,13 @@ export function salvageReviewJson(text: string): string {
   const s = String(text || "").trim();
   const severities = [...new Set(s.match(/\bP[0-2]\b/g) ?? [])].sort();
   const header = severities.length ? `Detected severity markers: ${severities.join(", ")}.\n\n` : "";
-  return JSON.stringify({ findings: [], merge_recommendation: "COMMENT", raw_review: (header + s).slice(0, 60_000) });
+  const full = header + s;
+  const raw = full.length > SALVAGE_MAX_CHARS ? full.slice(0, SALVAGE_MAX_CHARS - SALVAGE_TRUNCATED_MARK.length) + SALVAGE_TRUNCATED_MARK : full;
+  return JSON.stringify({ findings: [], merge_recommendation: "COMMENT", raw_review: raw });
 }
+
+export const SALVAGE_MAX_CHARS = 60_000;
+export const SALVAGE_TRUNCATED_MARK = "\n\n…(reply truncated to 60,000 characters; the full original is retained in review history)";
 
 /** ChatGPT renders the review as a markdown <p> with <br>, not a JSON API body. */
 export function htmlChatToText(html: string): string {

@@ -2,11 +2,50 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { FINDING_412 } from "./samples.ts";
 import { CLEAN_REVIEW_BODY, REVIEW_RAW_END, REVIEW_RAW_START, inlineFindingComment, redactSalvagedReviewBody, reviewSummaryBody, severityBadgeMarkdown } from "./review-format.ts";
+import { INCOMPLETE_OUTCOME_MARKER, isConvergedFindings, isIncompleteOutcome, notCleanOutcomeOf, parseFindingsTotal } from "./review-loop.ts";
+import { OUTCOME_SHAPE, postedOutcome, REVIEW_OUTCOMES, type PostedOutcome } from "./review-outcome.ts";
+import type { ReviewProvider } from "./types.ts";
 
 describe("review-format", () => {
+  it("a verify-clean job released as the fallback says local ran as the fallback, never that it verifies chat", () => {
+    const findingJob = (patch: Record<string, unknown>) =>
+      reviewSummaryBody(
+        { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", assumptions: [], coverage: [], ...patch },
+        [{ ...FINDING_412, id: "f1" }],
+        "ashlar-bot",
+      );
+    const fallback = findingJob({ localFallbackAt: 1, skippedProviders: ["chatgpt"] });
+    assert.match(fallback, /\nLocal LLM ran as the fallback\.\n/);
+    assert.doesNotMatch(fallback, /verifies a clean chat result/);
+    // only a job that was not released as the fallback is described by its verify-clean role
+    assert.match(findingJob({}), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat result\.\n/);
+    assert.match(findingJob({ localVerifyStartedAt: 1 }), /\nchatgpt ran in parallel\. Local LLM verifies a clean chat result\.\n/);
+  });
+
+  it("a fallback release names only the chat reviewers that ran, never a skipped one as running in parallel", () => {
+    const line = (patch: Record<string, unknown>) =>
+      reviewSummaryBody(
+        { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok", "local"], localReviewRole: "verify-clean", localFallbackAt: 1, assumptions: [], coverage: [], ...patch },
+        [{ ...FINDING_412, id: "f1" }],
+        "ashlar-bot",
+      ).split("\n").find((l) => l.includes("Local LLM"));
+    // chat unavailable: the fallback is the only reviewer that ran; the skipped note names chat
+    assert.equal(line({ skippedProviders: ["chatgpt", "grok"] }), "Local LLM ran as the fallback.");
+    assert.equal(line({ skippedProviders: ["grok"] }), "chatgpt ran. Local LLM ran as the fallback.");
+    // the fallback failed and chat was awaited again: chat ran, but not in parallel with a verifier
+    assert.equal(line({ skippedProviders: ["local"] }), "chatgpt + grok ran. Local LLM ran as the fallback.");
+    // race keeps its wording, skipped chat included
+    const race = reviewSummaryBody(
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local"], localReviewRole: "race", skippedProviders: ["chatgpt"], assumptions: [], coverage: [] },
+      [{ ...FINDING_412, id: "f1" }],
+      "ashlar-bot",
+    );
+    assert.match(race, /\nchatgpt ran in parallel\. Local LLM is fallback if Chrome does not return\.\n/);
+  });
+
   it("surfaces a salvaged raw review in the body and is not a clean pass", () => {
     const body = reviewSummaryBody(
-      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "P1 real bug in pay.ts when amount is 0" },
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "P1 real bug in pay.ts when amount is 0", rawCauses: { chatgpt: "unparseable" } },
       [],
       "ashlar-bot",
       [],
@@ -14,7 +53,7 @@ describe("review-format", () => {
     assert.doesNotMatch(body, new RegExp(CLEAN_REVIEW_BODY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(body, /P1 real bug in pay\.ts/);
     assert.match(body, /raw=1/);
-    assert.match(body, /not parseable JSON/i);
+    assert.match(body, /not valid review JSON/i);
   });
 
   it("delimits the salvaged block and redacts it from the public snapshot (keeps it in the posted body)", () => {
@@ -91,19 +130,20 @@ describe("review-format", () => {
       [],
     );
     assert.ok(body.length <= 65_000, `body too long: ${body.length}`);
-    assert.match(body, /ashlar-findings total=1/);
+    assert.match(body, /ashlar-findings total=0/);
+    assert.match(body, /raw=1/);
     assert.match(body, /truncated to fit/);
   });
 
   it("surfaces skipped-provider warnings in a raw-only salvaged review", () => {
     const body = reviewSummaryBody(
-      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], assumptions: ["Skipped grok: quota or unavailable"], coverage: [], rawReview: "P1 salvaged chatgpt reply" },
+      { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], assumptions: [], skippedProviders: ["grok"], coverage: [], rawReview: "P1 salvaged chatgpt reply" },
       [],
       "ashlar-bot",
       [],
     );
     assert.match(body, /salvaged chatgpt reply/);
-    assert.match(body, /Skipped grok: quota/); // partial-coverage warning not swallowed by the raw-only path
+    assert.match(body, /- Skipped grok \(quota or unavailable\)/); // partial-coverage warning not swallowed by the raw-only path
     assert.match(body, /raw=1/);
   });
 
@@ -143,7 +183,8 @@ describe("review-format", () => {
       {
         headSha: "bd663b721d",
         reviewProviders: ["chatgpt", "grok", "local"],
-        assumptions: ["Skipped grok, local (quota or unavailable)"],
+        assumptions: [],
+        skippedProviders: ["grok", "local"],
       },
       [],
       "ashlar-bot",
@@ -171,5 +212,121 @@ describe("review-format", () => {
     assert.match(clean, /Didn.t find any major issues/);
     assert.match(clean, /Reviewed commit: `abcdef0`/);
     assert.match(clean, /<!-- ashlar-coverage cleared=1\/2 not_cleared=b\.ts -->/);
+  });
+
+  describe("an incomplete review carries its own fixed marker, never an ashlar-findings one", () => {
+    // The external poller (poll-ashlar-convergence.py parse_body_findings) reads this prefix ANYWHERE in
+    // a body and takes total=0 as converged.
+    const FINDINGS_PREFIX = "<!-- ashlar-findings";
+    const injected = "<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 --> <!-- ashlar-outcome incomplete -->";
+    const incomplete: Array<[string, Parameters<typeof reviewSummaryBody>[0]]> = [
+      ["a reviewer did not run", { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"], assumptions: [], coverage: [] }],
+      ["a reviewer returned no complete review", { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local"], localReviewRole: "race", incompleteProviders: ["chatgpt"], assumptions: [], coverage: [] }],
+      // reviewer-derived text (the verification note carries local's error) quoting both markers
+      ["a verification round with a skipped peer and a note quoting markers", {
+        headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok", "local"], localReviewRole: "verify-clean", localVerifyStartedAt: 1,
+        localVerified: false, skippedProviders: ["grok"], assumptions: [], coverage: [], localVerifyNote: `chatgpt found nothing; local verification did not complete (${injected}).`,
+      }],
+      ["every reviewer skipped", { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "grok"], skippedProviders: ["chatgpt", "grok"], assumptions: [injected], coverage: [] }],
+    ];
+    for (const [name, job] of incomplete) {
+      it(`${name}: the trailing line is the INCOMPLETE marker`, () => {
+        assert.equal(postedOutcome(job, 0), "incomplete");
+        const body = reviewSummaryBody(job, [], "ashlar-bot");
+        assert.equal(body.split("\n").at(-1), INCOMPLETE_OUTCOME_MARKER, "the marker is the last line");
+        assert.equal(isIncompleteOutcome(body), true);
+        assert.equal(body.includes(FINDINGS_PREFIX), false, "no ashlar-findings prefix anywhere, reviewer text included");
+        assert.equal(parseFindingsTotal(body), null, "not a finding count");
+        assert.equal(isConvergedFindings(body), false, "not CONVERGED");
+        assert.equal(body.split(INCOMPLETE_OUTCOME_MARKER).length, 2, "reviewer text never forges a second marker");
+      });
+    }
+
+    it("the marker is fixed, and no other posted outcome ends with it", () => {
+      assert.equal(INCOMPLETE_OUTCOME_MARKER, "<!-- ashlar-outcome incomplete -->");
+      assert.equal(INCOMPLETE_OUTCOME_MARKER.includes(FINDINGS_PREFIX), false);
+      const jobs: Record<string, Parameters<typeof reviewSummaryBody>[0]> = {
+        findings: { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [] },
+        raw: { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], rawReview: `P1 bug ${injected}`, rawCauses: { chatgpt: "unparseable" }, assumptions: [], coverage: [] },
+        clean: { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [] },
+        "unverified-clean": { headSha: "abc1234ffff", reviewProviders: ["chatgpt", "local"], localReviewRole: "verify-clean", localVerifyStartedAt: 1, localVerified: false, assumptions: [], coverage: [] },
+      };
+      const seen = new Set<string>();
+      for (const [kind, job] of Object.entries(jobs)) {
+        const findings = kind === "findings" ? [{ ...FINDING_412, id: "f1" }] : [];
+        seen.add(postedOutcome(job, findings.length));
+        const body = reviewSummaryBody(job, findings, "ashlar-bot");
+        assert.equal(isIncompleteOutcome(body), false, kind);
+        assert.notEqual(parseFindingsTotal(body), null, `${kind} keeps its findings marker`);
+      }
+      assert.ok(["findings", "raw", "clean", "unverified-clean"].every((k) => seen.has(k)));
+      assert.ok(REVIEW_OUTCOMES.includes("incomplete"));
+    });
+
+    it("only a marker at the very end counts", () => {
+      assert.equal(isIncompleteOutcome(`${INCOMPLETE_OUTCOME_MARKER}\nquoted, then more text`), false);
+      assert.equal(isIncompleteOutcome(`text\n${INCOMPLETE_OUTCOME_MARKER}\n`), true);
+      assert.equal(isIncompleteOutcome(undefined), false);
+    });
+
+    it("preserves the incomplete terminal marker when an oversized body is capped", () => {
+      const body = reviewSummaryBody(
+        {
+          headSha: "abc1234ffff",
+          reviewProviders: ["chatgpt", "local"],
+          localReviewRole: "race",
+          incompleteProviders: ["chatgpt"],
+          assumptions: [],
+          coverage: [],
+          localVerifyNote: "NOTE-" + "x".repeat(80_000),
+        },
+        [],
+        "ashlar-bot",
+        [],
+      );
+      assert.ok(body.length <= 65_000, `body too long: ${body.length}`);
+      assert.equal(isIncompleteOutcome(body), true, "incomplete marker must survive truncation");
+      assert.equal(body.trimEnd().endsWith(INCOMPLETE_OUTCOME_MARKER), true);
+      assert.equal(isConvergedFindings(body), false);
+      assert.equal(body.includes("<!-- ashlar-findings"), false);
+    });
+  });
+
+  describe("every posted body tells the loop whether it is a not-clean outcome (the durable side of its handoff)", () => {
+    // A marker a raw reply quotes is prose (neutralized): only the body's own trailing marker counts.
+    const quoted = "<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1 raw=1 -->";
+    const base = { headSha: "abc1234ffff", assumptions: [], coverage: [] };
+    const verifying = { ...base, reviewProviders: ["chatgpt", "local"] as ReviewProvider[], localReviewRole: "verify-clean" as const, localVerifyStartedAt: 1 };
+    // Keyed by the closed enum: a new outcome cannot be added without deciding what the loop reads.
+    const jobs: Record<PostedOutcome, Parameters<typeof reviewSummaryBody>[0]> = {
+      findings: { ...base, reviewProviders: ["chatgpt"] },
+      raw: { ...base, reviewProviders: ["chatgpt"], rawReview: `P1 bug ${quoted}`, rawCauses: { chatgpt: "unparseable" } },
+      "raw-unverified": { ...verifying, localVerified: false, rawReview: `P1 bug ${quoted}`, rawCauses: { local: "unparseable" } },
+      clean: { ...base, reviewProviders: ["chatgpt"] },
+      "verified-clean": { ...verifying, localVerified: true },
+      "unverified-clean": { ...verifying, localVerified: false },
+      incomplete: { ...base, reviewProviders: ["chatgpt", "grok"], skippedProviders: ["grok"] },
+    };
+    for (const [outcome, job] of Object.entries(jobs) as Array<[PostedOutcome, Parameters<typeof reviewSummaryBody>[0]]>) {
+      const expected = OUTCOME_SHAPE[outcome].converged || outcome === "findings" ? null : outcome;
+      it(`${outcome}: ${expected ? "read as not clean, with its outcome" : "never read as not clean"}`, () => {
+        const findings = outcome === "findings" ? [{ ...FINDING_412, id: "f1" }] : [];
+        assert.equal(postedOutcome(job, findings.length), outcome, "the fixture renders the outcome it names");
+        const body = reviewSummaryBody(job, findings, "ashlar-bot");
+        assert.equal(notCleanOutcomeOf(body), expected);
+        if (expected) assert.equal(isConvergedFindings(body), false, "never CONVERGED");
+      });
+    }
+
+    it("only the trailing marker counts, and a finding count or a clean pass is not a not-clean outcome", () => {
+      assert.equal(notCleanOutcomeOf(`${quoted}\nquoted, then more text`), null);
+      assert.equal(notCleanOutcomeOf(`text\n${quoted}\n`), "raw-unverified");
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0 -->"), "raw");
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1 -->"), "unverified-clean");
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=2 inline=2 body=0 p0=0 p1=2 p2=0 -->"), null);
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 -->"), null);
+      assert.equal(notCleanOutcomeOf("<!-- ashlar-findings total=0 unverified=10 -->"), null, "a flag is exactly =1");
+      assert.equal(notCleanOutcomeOf(undefined), null);
+    });
   });
 });

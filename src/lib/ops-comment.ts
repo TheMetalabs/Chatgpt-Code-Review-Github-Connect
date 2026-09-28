@@ -1,10 +1,14 @@
-import { describeEnabledReviewers, type Job, type ReviewProvider, type Trigger } from "./types.ts";
+import { describeEnabledReviewers, type Job, type LocalReviewRole, type ReviewProvider, type Trigger } from "./types.ts";
 
 export type OpsPhase = "running" | "blocked" | "posted" | "skipped" | "failed";
 
 export type OpsCommentInput = {
   phase: OpsPhase;
   providers: ReviewProvider[];
+  /** The job's pinned local role; "verify-clean" reads "local verifies a clean result". */
+  role?: LocalReviewRole;
+  /** The job released local as the chat-down fallback (Job.localFallbackAt). */
+  localFallback?: boolean;
   notes: string[];
 };
 
@@ -22,7 +26,7 @@ export function llmWorkAllowed(job: { trigger: Trigger }): boolean {
 }
 
 export function buildOpsComment(input: OpsCommentInput): string {
-  const reviewers = describeEnabledReviewers(input.providers);
+  const reviewers = describeEnabledReviewers(input.providers, input.role, input.localFallback);
   const status =
     input.phase === "blocked"
       ? "blocked — a reviewer is unavailable; others continue"

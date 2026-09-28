@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { shouldStartLocalRace, stillRacing } from "./local-fallback.ts";
+import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, verdictEvidence, failedLocalSalvage, incompleteVerdict, localExecutionPrompt, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, shouldStartLocalRace, stillRacing, usableLocalFallbackLeg } from "./local-fallback.ts";
+import type { ReviewProvider } from "./types.ts";
 
 describe("shouldStartLocalRace", () => {
   it("starts local immediately when the setting is on", () => {
@@ -84,5 +85,313 @@ describe("stillRacing", () => {
       }),
       true,
     );
+  });
+});
+
+describe("verify-clean local role", () => {
+  const both = ["chatgpt", "local"] as const;
+  const base = { status: "awaiting_chat" as const, localDone: false, localStarted: false };
+
+  it("is a verifier only with the role AND both a chat reviewer and local (race / missing role = today)", () => {
+    assert.equal(localVerifies({ role: "verify-clean", providers: [...both] }), true);
+    assert.equal(localVerifies({ role: "race", providers: [...both] }), false);
+    assert.equal(localVerifies({ role: undefined, providers: [...both] }), false);
+    assert.equal(localVerifies({ role: "verify-clean", providers: ["local"] }), false, "local only behaves as today");
+    assert.equal(localVerifies({ role: "verify-clean", providers: ["chatgpt", "grok"] }), false, "no local: nothing to verify");
+  });
+
+  it("holds local back until it is released; race starts it at once", () => {
+    assert.equal(shouldStartLocalLeg({ role: "race", providers: [...both], localReleased: false, ...base }), true);
+    assert.equal(shouldStartLocalLeg({ role: "verify-clean", providers: [...both], localReleased: false, ...base }), false);
+    assert.equal(shouldStartLocalLeg({ role: "verify-clean", providers: [...both], localReleased: true, ...base }), true);
+    assert.equal(shouldStartLocalLeg({ role: "verify-clean", providers: ["local"], localReleased: false, ...base }), true);
+    assert.equal(shouldStartLocalLeg({ role: "verify-clean", providers: [...both], localReleased: true, ...base, localDone: true }), false);
+  });
+
+  it("does not wait on a held-back local leg; waits on it once released", () => {
+    assert.deepEqual(racingProviders({ role: "verify-clean", providers: [...both], localReleased: false }), ["chatgpt"]);
+    assert.deepEqual(racingProviders({ role: "verify-clean", providers: [...both], localReleased: true }), ["chatgpt", "local"]);
+    assert.deepEqual(racingProviders({ role: "race", providers: [...both], localReleased: false }), ["chatgpt", "local"]);
+    // The job may post (nothing racing) once chat is done, before local ever started...
+    assert.equal(stillRacing({ providers: racingProviders({ role: "verify-clean", providers: [...both], localReleased: false }), payloads: ["chatgpt"], localInFlight: false }), false);
+    // ...but not while the released verification leg is still running.
+    assert.equal(stillRacing({ providers: racingProviders({ role: "verify-clean", providers: [...both], localReleased: true }), payloads: ["chatgpt"], localInFlight: true }), true);
+  });
+
+  it("a fallback release never requires chat again, whatever the chat leg's state (a reconnect included)", () => {
+    const fallback = { role: "verify-clean" as const, providers: ["chatgpt", "grok", "local"] as ReviewProvider[], localReleased: true, localFallback: true };
+    assert.deepEqual(racingProviders(fallback), ["local"]);
+    // A reconnected bridge: chat is pending again (no payload, no terminal error, generating).
+    const reconnected = { generating: { chatgpt: true, grok: true }, providerErrors: {} };
+    assert.equal(stillRacing({ providers: racingProviders(fallback), ...reconnected, payloads: ["local"], localInFlight: false }), false, "local done: the job posts");
+    assert.equal(stillRacing({ providers: racingProviders(fallback), ...reconnected, payloads: [], localInFlight: true }), true, "still waits on local itself");
+    // A verification round is not a fallback: chat already answered and stays part of the merge.
+    assert.deepEqual(racingProviders({ ...fallback, localFallback: false }), ["chatgpt", "grok", "local"]);
+    assert.deepEqual(racingProviders({ ...fallback, role: "race" }), ["chatgpt", "grok", "local"], "race is unchanged");
+  });
+
+  it("a fallback release waives chat only while local can still deliver a usable verdict; once local ends with nothing usable, chat is awaited again", () => {
+    const at = { localFallbackAt: 1, assumptions: [] as string[] };
+    assert.equal(fallbackWaivesChat({ ...at }), true, "local running");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: "{}" }] }), false, "schema-invalid {} is not a usable verdict");
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[],"investigated_safe":["ok"],"merge_recommendation":"COMMENT"}' }] }),
+      true,
+      "local delivered usable clean JSON",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[{"title":"t","failure_scenario":"fs","root_cause":"rc","evidence":"ev","recommended_fix":"rf","recommended_test":"rt","file":"a.ts","line":1,"severity":"P1"}]}' }] }),
+      true,
+      "local delivered structurally valid findings JSON",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[{}]}' }] }),
+      false,
+      "malformed findings [{}] must not waive chat",
+    );
+    assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Skipped local (HTTP 500)"] }), false, "local failed");
+    assert.equal(fallbackWaivesChat({ ...at, providerErrors: { local: { code: "error", message: "HTTP 500" } } }), false, "local errored");
+    assert.equal(fallbackWaivesChat({ ...at, assumptions: ["Generated fixtures were skipped"] }), true, "reviewer text is not a skipped local");
+    assert.equal(fallbackWaivesChat({ assumptions: [] }), false, "no fallback release");
+    // Incomplete / raw-only local evidence is not a usable verdict: chat is offered again.
+    const incompleteRaw = { provider: "local" as const, raw: '{"findings":[]}', unparsedText: "P1 a.ts:1 FIRST-REPLY" };
+    assert.equal(usableLocalFallbackLeg(incompleteRaw), false, "unparsedText marks incomplete");
+    assert.equal(fallbackWaivesChat({ ...at, storedLegs: [incompleteRaw] }), false, "incomplete local: offer chat");
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[]}', residualReplies: "P1 prose" }] }),
+      false,
+      "residualReplies marks incomplete",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, storedLegs: [{ provider: "local", raw: '{"findings":[],"merge_recommendation":"COMMENT","raw_review":"prose evidence"}' }] }),
+      false,
+      "salvaged raw_review is evidence, not a verdict",
+    );
+    // Salvaged / incomplete local evidence clears the waiver even when merge metadata is absent.
+    assert.equal(
+      fallbackWaivesChat({
+        ...at,
+        storedLegs: [{ provider: "local", raw: '{"findings":[],"merge_recommendation":"COMMENT","raw_review":"prose only"}' }],
+      }),
+      false,
+      "salvaged leg without incompleteProviders/rawCauses still re-offers chat",
+    );
+    // A spent fallback makes the chat reviewers required again.
+    const fallback = { role: "verify-clean" as const, providers: ["chatgpt", "local"] as ReviewProvider[], localReleased: true };
+    const spent = { ...at, assumptions: ["Skipped local (HTTP 500)"] };
+    assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spent) }), payloads: [], assumptions: spent.assumptions, localInFlight: false }), true, "waits on chat");
+    assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spent) }), payloads: ["chatgpt"], assumptions: spent.assumptions, localInFlight: false }), false, "chat delivered: posts");
+    const spentIncomplete = { ...at, storedLegs: [incompleteRaw] };
+    assert.equal(stillRacing({ providers: racingProviders({ ...fallback, localFallback: fallbackWaivesChat(spentIncomplete) }), payloads: [], assumptions: [], localInFlight: false }), true, "incomplete local: waits on chat");
+    // Terminal local progress without a stored usable leg must not keep chat waived (bridge poll race).
+    assert.equal(
+      fallbackWaivesChat({ ...at, generating: { local: false }, providerProgress: { local: { runId: "local:x", stage: "response_collected", observedAt: 1, receivedAt: 1 } } }),
+      false,
+      "response_collected without stored leg re-offers chat",
+    );
+    assert.equal(
+      fallbackWaivesChat({ ...at, generating: { local: true } }),
+      true,
+      "actively generating still waives",
+    );
+  });
+
+  it("pins the held-local release prompt so a later chatPrompt mutation cannot retarget local", () => {
+    const before = { chatPrompt: "VERIFY-PROMPT-AT-RELEASE", chatPromptByProvider: { chatgpt: "VERIFY-PROMPT-AT-RELEASE" } };
+    const pinned = releaseLocalPrompt(before);
+    assert.equal(pinned, "VERIFY-PROMPT-AT-RELEASE");
+    // Race window: chatPrompt/settings mutate after the release transaction stamped localReleasePrompt.
+    const afterMutate = { ...before, chatPrompt: "MUTATED-AFTER-RELEASE", localReleasePrompt: pinned };
+    assert.equal(localExecutionPrompt(afterMutate), "VERIFY-PROMPT-AT-RELEASE", "pinned prompt wins");
+    assert.equal(localExecutionPrompt({ chatPrompt: "LIVE-ONLY" }), "LIVE-ONLY", "unreleased jobs use live prompt");
+    assert.equal(localExecutionPrompt({ chatPromptByProvider: { grok: "GROK-PROMPT" } }), "GROK-PROMPT");
+  });
+
+  it("releases local as today's fallback only when chat finished without a usable result", () => {
+    const v = { role: "verify-clean" as const, providers: [...both], localReleased: false };
+    assert.equal(releaseLocalAsFallback({ ...v, chatRacing: false, usableChat: false }), true);
+    assert.equal(releaseLocalAsFallback({ ...v, chatRacing: true, usableChat: false }), false, "chat still running");
+    assert.equal(releaseLocalAsFallback({ ...v, chatRacing: false, usableChat: true }), false, "chat has a result to judge");
+    assert.equal(releaseLocalAsFallback({ ...v, localReleased: true, chatRacing: false, usableChat: false }), false);
+    assert.equal(releaseLocalAsFallback({ ...v, role: "race", chatRacing: false, usableChat: false }), false);
+    assert.equal(releaseLocalAsFallback({ ...v, chatRacing: true, usableChat: false, chatStalled: true }), true, "stalled chat (bridge offline) releases local");
+    assert.equal(releaseLocalAsFallback({ ...v, chatRacing: true, usableChat: true, chatStalled: true }), false, "a usable chat result is judged, not replaced");
+  });
+
+  it("treats chat as stalled only after the bridge has been disconnected past the grace (never by job age or claim lease)", () => {
+    const G = 120_000;
+    const s = { chatProgress: false, connected: false, disconnectedAt: 1_000_000, now: 1_000_000, graceMs: G };
+    assert.equal(chatStalled(s), false, "just disconnected: within the grace");
+    assert.equal(chatStalled({ ...s, now: 1_000_000 + G }), true, "disconnected past BRIDGE_CONNECTED_MS");
+    assert.equal(chatStalled({ ...s, now: 1_000_000 + G, chatProgress: true }), false, "progress is never stalled");
+    assert.equal(chatStalled({ ...s, disconnectedAt: undefined, now: 9_999_999_999 }), false, "unknown disconnect time never stalls");
+    // A connected bridge never releases local by time: past BRIDGE_CLAIM_MS, stale lease, or old job.
+    assert.equal(chatStalled({ ...s, connected: true, disconnectedAt: undefined, now: 1_000_000 + 20 * 60_000 + 1 }), false, "connected, no payload, past BRIDGE_CLAIM_MS");
+    assert.equal(chatStalled({ ...s, connected: true, disconnectedAt: 0, now: 9_999_999_999 }), false, "connected with a stale claim lease");
+    // Job older than the grace, but the bridge only just disconnected: waits for the disconnect itself.
+    const now = 5_000_000;
+    assert.equal(chatStalled({ ...s, disconnectedAt: now - 1, now }), false, "job age is not the basis");
+    assert.equal(chatStalled({ ...s, disconnectedAt: now - 1, now: now - 1 + G }), true);
+  });
+});
+
+describe("failedLocalSalvage", () => {
+  const text = "P1 a.ts:1 LOCAL-RAW: a duplicate request writes twice";
+  const rawOf = (s: string | undefined) => (s ? (JSON.parse(s) as { raw_review: string }).raw_review : undefined);
+
+  it("keeps a failed leg's completed non-JSON reply verbatim", () => {
+    const raw = rawOf(failedLocalSalvage({ originalText: text }));
+    assert.ok(raw?.includes(text));
+    assert.match(raw ?? "", /Detected severity markers: P1\./);
+  });
+
+  it("keeps the first reply as well when the JSON correction replied differently; identical replies once", () => {
+    const raw = rawOf(failedLocalSalvage({ unparsedText: "P1 a.ts:1 FIRST-REPLY-MARK", originalText: "still prose" })) ?? "";
+    assert.match(raw, /FIRST-REPLY-MARK[\s\S]*\n---\n[\s\S]*still prose/);
+    const same = rawOf(failedLocalSalvage({ unparsedText: text, originalText: text })) ?? "";
+    assert.equal(same.split(text).length - 1, 1);
+  });
+
+  it("keeps the first reply when the JSON correction itself failed (no completed correction)", () => {
+    const raw = rawOf(failedLocalSalvage({ unparsedText: "P1 a.ts:1 FIRST-REPLY-MARK" })) ?? "";
+    assert.match(raw, /FIRST-REPLY-MARK/);
+  });
+
+  it("a failure with no completed reply (HTTP 500, transport error) stays a failure", () => {
+    assert.equal(failedLocalSalvage({}), undefined);
+    assert.equal(failedLocalSalvage({ originalText: "  " }), undefined);
+  });
+});
+
+describe("incompleteVerdict / verdictEvidence: a reviewer reply is a complete verdict only when the gate used all of it", () => {
+  const ok = { ok: true as const, malformed: 0 };
+  it("a clean gate is a verdict; an already salvaged reply is left as it is", () => {
+    assert.equal(incompleteVerdict(ok, {}), undefined);
+    assert.equal(incompleteVerdict({ ...ok, malformed: 1, rawReview: "x" }, { unparsedText: "P1 x" }), undefined);
+  });
+
+  it("a rejected gate or a finding dropped for its shape is not", () => {
+    assert.equal(incompleteVerdict({ ok: false, reason: "empty findings without investigated_safe" }, {}), "empty findings without investigated_safe");
+    assert.equal(incompleteVerdict({ ...ok, malformed: 2 }, {}), "2 finding(s) missing required fields");
+  });
+
+  it("a clean gate reached only after a reply that was not review JSON is not", () => {
+    assert.equal(incompleteVerdict(ok, { unparsedText: "P1 a.ts:1 FIRST-REPLY" }), "a completed reply was not review JSON");
+    assert.equal(incompleteVerdict(ok, { unparsedText: "  " }), undefined);
+  });
+
+  it("a gate that never inspected every reported finding (rows past its cap) is not", () => {
+    assert.equal(incompleteVerdict({ ...ok, overflow: 1 }, {}), "1 finding(s) past the gate's row cap were not inspected");
+    assert.equal(incompleteVerdict({ ...ok, overflow: 0 }, {}), undefined);
+    // Unread rows disqualify every leg, not only the held local one (chat, race).
+    assert.equal(gateUnreadRows({ ...ok, overflow: 1 }), "1 finding(s) past the gate's row cap were not inspected");
+    assert.equal(gateUnreadRows({ ...ok, overflow: 0 }), undefined);
+    assert.equal(gateUnreadRows({ ...ok, overflow: 1, rawReview: "x" }), undefined, "already salvaged verbatim");
+    assert.equal(gateUnreadRows({ ok: false, reason: "r" }), undefined);
+  });
+
+  it("a clean gate whose reply also carried text outside the accepted JSON is not", () => {
+    assert.equal(incompleteVerdict(ok, { residualReplies: "P1 a.ts:1 PROSE\n{}" }), "a completed reply carried text outside its review JSON");
+    assert.equal(incompleteVerdict(ok, { residualReplies: " " }), undefined);
+  });
+
+  it("evidence keeps a reply that carried text outside its JSON, once when it is also the original", () => {
+    const reply = 'P1 a.ts:1 PROSE-FINDING\n{"findings":[]}';
+    const single = verdictEvidence({ findings: [] }, { provider: "local", raw: '{"findings":[]}', originalText: reply, residualReplies: reply });
+    assert.equal(String(single.raw_review).split("PROSE-FINDING").length - 1, 1);
+    // the multi-turn loop has no original text: its group replies are the evidence
+    const loop = verdictEvidence({ findings: [] }, { provider: "local", raw: '{"findings":[]}', residualReplies: `Review group (a.ts):\n${reply}` });
+    assert.match(String(loop.raw_review), /Review group \(a\.ts\):\nP1 a\.ts:1 PROSE-FINDING[\s\S]*\n---\n\n\{"findings":\[\]\}$/);
+  });
+
+  it("evidence keeps what parsed and attaches every completed reply verbatim", () => {
+    const parsed = { findings: [{ title: "partial" }], merge_recommendation: "REQUEST_CHANGES" };
+    const out = verdictEvidence(parsed, { provider: "local", raw: "{}", originalText: "P1 a.ts:1 FULL-REPLY", unparsedText: "P1 FIRST-REPLY" });
+    assert.deepEqual(out.findings, parsed.findings);
+    assert.match(String(out.raw_review), /Detected severity markers: P1\.[\s\S]*FIRST-REPLY[\s\S]*\n---\n[\s\S]*FULL-REPLY/);
+  });
+
+  it("with no parsed object or original text the leg's JSON itself is the evidence", () => {
+    const out = verdictEvidence(null, { provider: "local", raw: '{"findings":"P1 a.ts:1 IN-JSON"}' });
+    assert.deepEqual(out.findings, []);
+    assert.match(String(out.raw_review), /IN-JSON/);
+  });
+
+  it("a chat leg's evidence is the JSON its client submitted, never the page capture archived beside it", () => {
+    const raw = '{"findings":[{"title":"P1 a.ts:1 SUBMITTED-JSON"}],"merge_recommendation":"REQUEST_CHANGES"}';
+    const leg = { raw, originalText: `Thought for 12s\nP1 a.ts:1 CAPTURE-PROSE\njson\n${raw}`, unparsedText: "P1 UNPARSED", residualReplies: "P1 RESIDUAL" };
+    for (const provider of ["chatgpt", "grok"] as const) {
+      const out = String(verdictEvidence(JSON.parse(raw), { provider, ...leg }).raw_review);
+      assert.match(out, /SUBMITTED-JSON/, provider);
+      assert.doesNotMatch(out, /CAPTURE-PROSE|UNPARSED|RESIDUAL/, provider);
+    }
+    const local = String(verdictEvidence(JSON.parse(raw), { provider: "local", ...leg }).raw_review);
+    assert.match(local, /UNPARSED[\s\S]*RESIDUAL[\s\S]*CAPTURE-PROSE/, "a local leg keeps every completed reply");
+  });
+});
+
+
+describe("validator generation ownership (held-local release race)", () => {
+  it("ownsValidatorGeneration is true only for the matching validator generation", () => {
+    assert.equal(ownsValidatorGeneration({ status: "validator", validatorGeneration: 3 }, 3), true);
+    assert.equal(ownsValidatorGeneration({ status: "validator", validatorGeneration: 3 }, 2), false);
+    assert.equal(ownsValidatorGeneration({ status: "awaiting_chat", validatorGeneration: 3 }, 3), false);
+    assert.equal(ownsValidatorGeneration(undefined, 1), false);
+  });
+
+  it("watcher can release only while awaiting_chat; validator requires matching generation", () => {
+    assert.equal(canReleaseHeldLocal({ status: "awaiting_chat" }), true, "watcher path");
+    assert.equal(
+      canReleaseHeldLocal({ status: "validator", validatorGeneration: 1 }),
+      false,
+      "watcher must not steal an in-flight validator",
+    );
+    assert.equal(
+      canReleaseHeldLocal({ status: "validator", validatorGeneration: 1 }, { validatorGeneration: 1 }),
+      true,
+      "owning validator may release",
+    );
+    assert.equal(
+      canReleaseHeldLocal({ status: "validator", validatorGeneration: 2 }, { validatorGeneration: 1 }),
+      false,
+      "stale validator generation no-ops",
+    );
+  });
+
+  it("concurrency: release before stale validator completion rejects overwrite of fallback stamp", () => {
+    // Simulate: submitHarborChat locks validator gen=1; concurrent watcher cannot release while
+    // validating; an earlier awaiting_chat release stamps fallback; stale gen=1 no longer owns.
+    let job: {
+      status: "awaiting_chat" | "validator" | "skipped";
+      validatorGeneration?: number;
+      localFallbackAt?: number;
+      localVerifyStartedAt?: number;
+      skipReason?: string;
+    } = { status: "awaiting_chat" };
+
+    job = { ...job, status: "validator", validatorGeneration: 1 };
+    const myGen = 1;
+    assert.equal(ownsValidatorGeneration(job, myGen), true);
+    assert.equal(canReleaseHeldLocal(job), false, "watcher without gen cannot steal validator");
+
+    // Model a release that already returned the job to awaiting_chat with a fallback stamp.
+    job = { ...job, status: "awaiting_chat", localFallbackAt: 42, validatorGeneration: 1 };
+    assert.equal(ownsValidatorGeneration(job, myGen), false, "stale validator lost ownership");
+    assert.equal(canReleaseHeldLocal(job, { validatorGeneration: myGen }), false, "already released");
+
+    // Stale validator completion must not overwrite fallback with skip/findings.
+    if (ownsValidatorGeneration(job, myGen)) {
+      job = { ...job, status: "skipped", skipReason: "no valid review JSON" };
+    }
+    assert.equal(job.localFallbackAt, 42);
+    assert.equal(job.status, "awaiting_chat");
+    assert.equal(job.skipReason, undefined);
+  });
+
+  it("owning validator may release as verify/fallback; mismatched generation cannot", () => {
+    const job = { status: "validator" as const, validatorGeneration: 7 };
+    assert.equal(canReleaseHeldLocal(job, { validatorGeneration: 7 }), true);
+    assert.equal(canReleaseHeldLocal(job, { validatorGeneration: 6 }), false);
+    assert.equal(canReleaseHeldLocal({ ...job, localVerifyStartedAt: 1 }, { validatorGeneration: 7 }), false);
   });
 });

@@ -35,6 +35,53 @@ export function parseFindingsTotal(body: string | null | undefined): number | nu
   return t ? Number(t[1]) : null;
 }
 
+/** CONVERGED (machine side): the trailing marker says total=0 AND it is not flagged `unverified=1`.
+ * A verify-clean job whose local verification round did not complete posts chat's clean result
+ * with `unverified=1`: a transient local failure must never end the loop as converged. */
+export function isConvergedFindings(body: string | null | undefined): boolean {
+  if (parseFindingsTotal(body) !== 0) return false;
+  const m = FINDINGS_TRAILER_RE.exec(body || "");
+  // raw=1 is salvaged evidence, not a clean pass — even with total=0.
+  if (m && /(?:^|\s)raw=1(?=\s|$)/.test(m[1])) return false;
+  return !(m && /(?:^|\s)unverified=1(?=\s|$)/.test(m[1]));
+}
+
+/** INCOMPLETE (machine side): the trailing line of an incomplete review (review-format.ts), a review
+ * that is neither a clean pass nor a finding count (a reviewer did not run, or returned no complete
+ * review). It is its own fixed marker and NEVER contains the `<!-- ashlar-findings` prefix: external
+ * pollers read that prefix anywhere in a body and take total=0 as converged. Loop reconstruction reads
+ * it, like every NOT CLEAN outcome (notCleanOutcomeOf), as the end of the session owing the fixed
+ * loop-error handoff (design §3). */
+export const INCOMPLETE_OUTCOME_MARKER = "<!-- ashlar-outcome incomplete -->";
+const INCOMPLETE_TRAILER_RE = /<!--\s*ashlar-outcome\s+incomplete\s*-->\s*$/;
+
+/** Whether a review body ends with the INCOMPLETE marker. Only a marker at the very end counts, as for
+ * the findings marker: one quoted earlier in a body is prose. */
+export function isIncompleteOutcome(body: string | null | undefined): boolean {
+  return INCOMPLETE_TRAILER_RE.test(body || "");
+}
+
+/** The posted outcomes (review-outcome.ts) with no structured finding that are NOT a clean pass. */
+export type NotCleanOutcome = "raw" | "raw-unverified" | "unverified-clean" | "incomplete";
+
+/**
+ * NOT CLEAN (machine side): which of those outcomes a review body's trailing marker records, else null
+ * (a clean pass, a finding count, or no marker). incomplete ends with its INCOMPLETE marker; raw and
+ * raw-unverified with the findings marker flagged `raw=1` (and `unverified=1`); unverified-clean with
+ * `total=0` flagged `unverified=1` (review-format.ts findingsMarker). Loop reconstruction reads each as
+ * the end of the session, owing the fixed loop-error handoff (review-loop-session.ts owedHandoff) that
+ * the review's own loop step posts, or the next step on the PR when a crash or a failed post lost it:
+ * without it, a lost handoff leaves the session active and waiting on a head that was already reviewed.
+ */
+export function notCleanOutcomeOf(body: string | null | undefined): NotCleanOutcome | null {
+  if (isIncompleteOutcome(body)) return "incomplete";
+  const m = FINDINGS_TRAILER_RE.exec(body || "");
+  if (!m) return null;
+  const flagged = (name: string) => new RegExp(`(?:^|\\s)${name}=1(?=\\s|$)`).test(m[1]);
+  if (flagged("raw")) return flagged("unverified") ? "raw-unverified" : "raw";
+  return parseFindingsTotal(body) === 0 && flagged("unverified") ? "unverified-clean" : null;
+}
+
 /** Epoch ms of an ISO-8601 timestamp; NaN when absent or unparseable. Session boundaries are
  * compared as instants, never as strings: GitHub timestamps are second-precision ("…00Z") while
  * Date#toISOString carries milliseconds ("…00.500Z"), and lexically "…00Z" sorts after "…00.500Z". */
@@ -61,7 +108,7 @@ export interface CommentSource {
 }
 
 export function isZeroFindings(body: string | null | undefined, source: CommentSource): boolean {
-  return source.authoredByBot && parseFindingsTotal(body) === 0;
+  return source.authoredByBot && isConvergedFindings(body);
 }
 
 // ── ESCALATE reason → directive (§8) ─────────────────────────────────────────

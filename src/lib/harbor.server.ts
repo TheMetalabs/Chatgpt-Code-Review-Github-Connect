@@ -1,7 +1,7 @@
 import {cancelLocalJsonRepairs} from "./json-repair.server";
 import { ignoredTarget } from "./webhook-target.ts";
 import type {RepairReceipt} from "./json-repair-types.ts";
-import {recordJobHistory, recordDeliveryHistory, reviewHistory} from "./review-history.server";
+import {reviewHistory} from "./review-history.server";
 import {
   CANDIDATE_412_DROPPED,
   FINDING_412,
@@ -19,7 +19,7 @@ import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot,
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
 import { selectPriorThreads, type PriorThread } from "./prior-threads";
 import { rankChangedFile } from "./review-budget";
-import { runLocalLlm } from "./local-llm.server";
+import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
@@ -33,11 +33,12 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
+import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
+import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { nextCreationSeq } from "./creation-seq";
-import { stillRacing, shouldStartLocalRace } from "./local-fallback";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
-import type { BotSettings, Job, PostedReview, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import type { BotSettings, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import {
   ashlarBotLogin,
   continueLoopOnPush,
@@ -57,8 +58,8 @@ import { validatedSettingsPatch } from "./settings-rules";
 import { redactSalvagedReviewBody } from "./review-format";
 import {
   BRIDGE_CLAIM_MS,
+  BRIDGE_CONNECTED_MS,
   LIVE_INFLIGHT_STATUSES,
-  PROVIDER_LABEL,
   isChatProvider,
   normalizeReviewOrder,
   providersFromSettings,
@@ -112,10 +113,27 @@ function isLive(status: Job["status"]) {
   return LIVE_INFLIGHT_STATUSES.includes(status);
 }
 
-function trimJobs(jobs: Job[]) {
-  // UI retention may drop completed cache entries, never live queue/generation work.
-  return [...jobs.filter(j => isLive(j.status)), ...jobs.filter(j => !isLive(j.status)).slice(0, CAP)]
-    .sort((a,b) => b.createdAt - a.createdAt);
+/** UI retention: the completed cache keeps the newest CAP jobs. Live queue/generation work is never
+ * over capacity (the invariant): a live job leaves state only after ending through transitionJob. */
+function overCapacity(jobs: readonly Job[]): Job[] {
+  return jobs.filter((j) => !isLive(j.status)).sort((a, b) => b.createdAt - a.createdAt).slice(CAP);
+}
+
+/** Insert a new job (newest first); what capacity then drops leaves through removeJobs. */
+function insertJob(job: Job) {
+  state = { ...state, jobs: [job, ...state.jobs].sort((a, b) => b.createdAt - a.createdAt) };
+  removeJobs(overCapacity(state.jobs));
+}
+
+/** The only way a job leaves state (capacity retention, an operator reset). Each job goes through
+ * releaseJob, the release its terminal edge runs, so nothing it held outlives it: a local leg still
+ * running for it (a job that ended while its leg ran keeps that leg until then) is aborted, and its
+ * snapshot, activity and liveness are freed; its watcher exits on its next tick (the job is gone). */
+function removeJobs(drop: readonly Job[]) {
+  if (!drop.length) return;
+  const ids = new Set(drop.map((j) => j.id));
+  state = { ...state, jobs: state.jobs.filter((j) => !ids.has(j.id)) };
+  for (const job of drop) releaseJob(job, "removed");
 }
 
 function trim<T>(xs: T[]) {
@@ -160,43 +178,103 @@ export function patchHarborSettings(patch: Partial<BotSettings>) {
 
 export function resetHarbor() {
   cancelLocalJsonRepairs("superseded");
-  for (const controller of localControllers.values()) controller.abort();
-  localControllers.clear();
-  localInFlight.clear();
-  localSamples.clear();
-  localActivity.clear();
-  for (const l of localLiveness.values()) l.clear();
-  localLiveness.clear();
-  for (const job of state.jobs) recordJobHistory(isLive(job.status)
+  for (const job of state.jobs) noteJobHistory(isLive(job.status)
     ? {...job, status: "cancelled", skipReason: "operator reset", updatedAt: Date.now()} : job);
+  removeJobs(state.jobs);
   state = { settings: state.settings, jobs: [], events: [], reviews: [] };
+}
+
+/** The last job or delivery history write that failed. Non-fatal: what it recorded was applied. */
+let historyFault: { id: string; at: number; error: string } | undefined;
+
+/** Every job and delivery history write in harbor goes through here, straight to the store: this is
+ * the one boundary where a failed write stops. The store throws on a failed write (after recording
+ * its own health error); here it is caught, logged and surfaced (historyHealth) with the record it
+ * failed for. History records a transition, it is never part of one, so a failure never aborts the
+ * state change it records. A later successful write clears the fault, as the store clears its own. */
+function noteHistory(id: string, write: () => void) {
+  try {
+    write();
+    historyFault = undefined;
+  } catch (e) {
+    const error = (e instanceof Error ? e.message : String(e)).slice(0, 240);
+    historyFault = { id, at: Date.now(), error };
+    console.warn(`[harbor] history write failed for ${id} (the state change was applied): ${error}`);
+  }
+}
+const noteJobHistory = (job: Job) => noteHistory(job.id, () => reviewHistory().recordJob(job));
+const noteDeliveryHistory = (ev: WebhookLog, target?: Parameters<ReturnType<typeof reviewHistory>["recordDelivery"]>[1]) =>
+  noteHistory(ev.id, () => reviewHistory().recordDelivery(ev, target));
+
+/** History storage health for the dashboard: the store's own, and the record whose write failed (a
+ * non-fatal history error; the job state is current). A failure the store's own health does not
+ * record (a throw outside its disk I/O) is surfaced as a failed write. */
+export function historyHealth() {
+  const store = reviewHistory().health();
+  if (!historyFault) return store;
+  return { ...store, ok: false, error: store.error ?? "history_write_failed", failedId: historyFault.id, failedAt: historyFault.at };
 }
 
 export function cancelHarborJob(jobId: string) {
   cancelLocalJsonRepairs("superseded", jobId);
-  localControllers.get(jobId)?.abort();
-  localSamples.delete(jobId);
-  localActivity.delete(jobId);
-  localLiveness.get(jobId)?.clear();
-  localLiveness.delete(jobId);
-  state = {
-    ...state,
-    jobs: state.jobs.map((j) =>
-      j.id === jobId && isLive(j.status)
-        ? { ...j, status: "cancelled" as const, skipReason: "cancelled by operator", updatedAt: Date.now() }
-        : j,
-    ),
-  };
-  const job=state.jobs.find(j=>j.id===jobId);if(job)recordJobHistory(job);
-  // An operator (or a lane's stop) cancel ends the job too: its comment must not stay running.
-  if (job && needsTerminalOps(job)) setTimeout(() => void finishOpsComment(jobId), 0);
+  transitionJob(jobId, (j) =>
+    isLive(j.status) ? { ...j, status: "cancelled", skipReason: "cancelled by operator", updatedAt: Date.now() } : j,
+  );
 }
 
-function patchJob(jobId: string, fn: (j: Job) => Job) {
-  state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? fn(j) : j)) };
-  const job = state.jobs.find(j => j.id === jobId);
-  if (job) recordJobHistory(job);
-  if (job && needsTerminalOps(job)) setTimeout(() => void finishOpsComment(jobId), 0);
+/** The only writer of an existing job record (a new job is inserted with insertJob; a job leaves state
+ * only through removeJobs). Every path that ends a job goes through here, so terminal cleanup runs on
+ * the live → terminal edge, and removal runs the same release. Returns the written job. */
+function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
+  const before = state.jobs.find((j) => j.id === jobId);
+  if (!before) return undefined;
+  const after = next(before);
+  state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? after : j)) };
+  // Cleanup before the history write: the edge is crossed once, so it runs whatever the write does.
+  if (isLive(before.status) && !isLive(after.status)) releaseJob(after, "terminal");
+  // Never throws: every caller continues past its write (the lease ping's owner liveness, a local
+  // leg's request, the review that follows), so a history failure cannot half-apply a transition.
+  noteJobHistory(after);
+  if (needsTerminalOps(after)) setTimeout(() => void finishOpsComment(jobId), 0);
+  return after;
+}
+
+/** The single release of what a job holds locally, run on its live → terminal edge (transitionJob)
+ * and when it leaves state (removeJobs). A terminal status is an explicit terminal signal
+ * (docs/local-verify-clean.md §3): the job never needs its local snapshot again (a verify-clean job
+ * whose local leg never ran would otherwise keep it forever). An in-flight local leg holds its own
+ * reference and frees the entry in its finally. Only a cancellation (operator or supersession) or a
+ * removal stops that leg (a removed job has no one left to use its result); a posted or skipped job
+ * still in state never aborts local generation. */
+function releaseJob(job: Job, edge: "terminal" | "removed") {
+  const stop = edge === "removed" || job.status === "cancelled";
+  if (edge === "removed" || !localInFlight.has(job.id)) localSamples.delete(job.id);
+  if (!stop) return;
+  localControllers.get(job.id)?.abort();
+  localActivity.delete(job.id);
+  localLiveness.get(job.id)?.clear();
+  localLiveness.delete(job.id);
+}
+
+/** Test seam: whether a job still retains its local snapshot. */
+export function hasLocalSample(jobId: string): boolean {
+  return localSamples.has(jobId);
+}
+
+/** Test seam: whether a job still has local-leg activity or liveness state (a cancellation clears it). */
+export function hasLocalLegState(jobId: string): boolean {
+  return localActivity.has(jobId) || localLiveness.has(jobId);
+}
+
+/** Test seam: ids holding local state (snapshot, leg, activity, liveness, watcher) with no job in state. */
+export function orphanedLocalState(): string[] {
+  const ids = new Set([...localSamples.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...watching]);
+  return [...ids].filter((id) => !state.jobs.some((j) => j.id === id));
+}
+
+/** Test seam: whether a reviewer watcher is still running for a job. */
+export function isWatchingJob(jobId: string): boolean {
+  return watching.has(jobId);
 }
 
 const TERMINAL_OPS: readonly string[] = ["posted", "skipped", "failed"];
@@ -225,8 +303,13 @@ async function finishOpsComment(jobId: string) {
   }
 }
 
+/** Alias: every job write goes through transitionJob (verify-clean release + history). */
+function patchJob(jobId: string, fn: (j: Job) => Job) {
+  transitionJob(jobId, fn);
+}
+
 export function patchHarborJob(jobId: string, fn: (j: Job) => Job) {
-  patchJob(jobId, fn);
+  transitionJob(jobId, fn);
 }
 
 export function publicJobs(jobs: Job[]) {
@@ -234,7 +317,7 @@ export function publicJobs(jobs: Job[]) {
   return jobs.map((j) => {
     // rawReview is verbatim model output that can echo private PR source — treat it like storedLegs
     // and never expose it on the unauthenticated /api/harbor; surface only a bounded boolean.
-    const { chatPrompt: _prompt, chatPromptByProvider: _by, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, rawReview: _raw, ...rest } = j;
+    const { chatPrompt: _prompt, chatPromptByProvider: _by, localReleasePrompt: _lrp, storedLegs: _legs, bridgeLeaseId: _lease, bridgeClientId: _client, coverage: _cov, coverageDeterministic: _covd, promptStats: _ps, rawReview: _raw, ...rest } = j;
     return {
       ...rest,
       hasRawReview: Boolean(j.rawReview),
@@ -285,7 +368,7 @@ function recordReviewCoverage(jobId: string, prompt: string, sample: SamplePr) {
     diffFilesFull: sample.changedPaths.length - (sample.diffDroppedPaths?.length ?? 0),
     diffFilesTotal: sample.changedPaths.length,
   };
-  patchJob(jobId, (j) => ({ ...j, promptStats, coverageDeterministic, updatedAt: Date.now() }));
+  transitionJob(jobId, (j) => ({ ...j, promptStats, coverageDeterministic, updatedAt: Date.now() }));
 }
 
 async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
@@ -298,12 +381,12 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
     await sleep(st === "snapshot" ? 280 : st === "explorer" ? 520 : st === "reviewer" ? 640 : 420);
     const live = current();
     if (!live || live.status === "cancelled") return;
-    patchJob(jobId, (j) => ({ ...j, status: st, updatedAt: Date.now() }));
+    transitionJob(jobId, (j) => ({ ...j, status: st, updatedAt: Date.now() }));
   }
   const live = current();
   if (!live || live.status === "cancelled") return;
   if (opts.forceDlq) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "dlq",
       skipReason: "validator timeout — job moved to DLQ",
@@ -319,7 +402,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
   const now = Date.now();
 
   if (mention && live.sampleKey === "pay-412") {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       traces: tracesForMention(now - 200),
       plan: "Prior findings + user line only. Do not reload the full thread.",
@@ -333,7 +416,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
     const naming = settings.precisionOverRecall
       ? CANDIDATE_412_DROPPED
       : { ...CANDIDATE_412_DROPPED, status: "accepted" as const, dropReason: undefined };
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       traces: tracesFor412(now - 1100),
       plan: "Investigate capture + fulfill replay against payment invariants.",
@@ -349,7 +432,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
       assumptions: ["Stripe at-least-once delivery"],
     }));
   } else if (live.sampleKey === "pay-418") {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       traces: tracesFor418(now - 420),
       plan: "New invoices route. Confirm auth guard. Findings forbidden until concrete failure.",
@@ -359,7 +442,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
       assumptions: [],
     }));
   } else if (live.sampleKey === "pay-421") {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       traces: tracesFor421(now - 300),
       plan: "Untrusted PR body quoted, not loaded. Investigate missing auth guard.",
@@ -374,7 +457,7 @@ async function playTape(jobId: string, opts: { forceDlq?: boolean } = {}) {
   await finishJob(jobId, sample);
 }
 
-export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string; repair?: RepairReceipt };
+export type ChatLeg = { provider: ReviewProvider; raw: string; originalText?: string; unparsedText?: string; residualReplies?: string; repair?: RepairReceipt };
 
 async function reactQuiet(token: string, job: Job, content: GithubReaction) {
   try {
@@ -395,6 +478,8 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
   const body = buildOpsComment({
     phase,
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
+    role: job.localReviewRole,
+    localFallback: Boolean(job.localFallbackAt),
     notes: [`Job: ${job.id}`, ...notes],
   });
   // One write at a time per job, in call order: a slow "running" write can no longer land after the
@@ -433,7 +518,7 @@ async function writeOpsComment(token: string, jobId: string, body: string): Prom
       return;
     }
     const created = await createIssueComment(t, { owner: job.owner, repo: job.repo, pr: job.pr, body });
-    patchJob(jobId, (j) => ({ ...j, opsCommentId: created.id, updatedAt: Date.now() }));
+    transitionJob(jobId, (j) => ({ ...j, opsCommentId: created.id, updatedAt: Date.now() }));
   };
   try {
     await write(token);
@@ -468,8 +553,8 @@ function scheduleOpsRetry(jobId: string) {
 }
 
 async function bridgeSnapshot() {
-  const { getBridgePublic } = await import("./bridge.server");
-  return getBridgePublic();
+  const { getBridgePublic, chatBridgeLink } = await import("./bridge.server");
+  return { bridge: getBridgePublic(), chatBridgeLink };
 }
 
 const WATCH_TICK_MS = 5_000;
@@ -485,11 +570,25 @@ function localStaleNoteMs(): number {
   return Number.isFinite(n) ? n : 300_000;
 }
 
+// One watcher per job. submitHarborChat restarts it when a verify-clean job returns to awaiting_chat
+// for its local verification round (the watcher may have exited during the brief validator phase).
+const watching = new Set<string>();
+
 async function watchReviewers(jobId: string, token: string) {
+  if (watching.has(jobId)) return;
+  watching.add(jobId);
+  try {
+    await watchReviewersLoop(jobId, token);
+  } finally {
+    watching.delete(jobId);
+  }
+}
+
+async function watchReviewersLoop(jobId: string, token: string) {
   let lastNotes = "";
   let localStarted = false;
   for (;;) {
-    const bridge = await bridgeSnapshot();
+    const { bridge, chatBridgeLink } = await bridgeSnapshot();
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
     if (job.status === "cancelled" || job.status === "posted" || job.status === "skipped" || job.status === "dlq") return;
@@ -499,10 +598,14 @@ async function watchReviewers(jobId: string, token: string) {
     const chat = (job.reviewProviders ?? []).filter(isChatProvider);
     const localLeg = (job.storedLegs ?? []).find((l) => l.provider === "local");
     const localSkip = (job.assumptions ?? []).find((a) => a.startsWith("Skipped local"));
-    const prompt = job.chatPrompt || job.chatPromptByProvider?.chatgpt || job.chatPromptByProvider?.grok || "";
+    const prompt = localExecutionPrompt(job);
+    const role = job.localReviewRole;
+    const localReleased = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
     if (
-      shouldStartLocalRace({
+      shouldStartLocalLeg({
+        role,
         providers: job.reviewProviders ?? [],
+        localReleased,
         status: job.status,
         localDone: Boolean(localLeg?.raw.trim() || localSkip),
         localStarted: localStarted || localInFlight.has(jobId),
@@ -512,8 +615,22 @@ async function watchReviewers(jobId: string, token: string) {
       void kickLocalRace(jobId, prompt);
     }
     const stored = job.storedLegs ?? [];
+    // verify-clean: a chat leg with no progress while the bridge is offline / never claims the job
+    // (a stale `generating` flag from before the bridge went away is not progress). A claimed job is
+    // judged by its owning profile's link: no other profile can resume its run.
+    const link = chatBridgeLink(job);
+    const stalled = localVerifies({ role, providers: job.reviewProviders ?? [] }) && chatStalled({
+      chatProgress: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()) || (link.connected && chat.some((p) => job.generating?.[p])),
+      connected: link.connected,
+      disconnectedAt: link.disconnectedAt,
+      now: Date.now(),
+      graceMs: BRIDGE_CONNECTED_MS,
+    });
+    // While local runs as the fallback the job does not wait on chat, even if the bridge reconnects
+    // (chat is reported as skipped); a chat result that still arrives first is merged as usual. Once
+    // that fallback ends with no payload, chat is awaited again (fallbackWaivesChat).
     const racing = stillRacing({
-      providers: job.reviewProviders ?? [],
+      providers: racingProviders({ role, providers: job.reviewProviders ?? [], localReleased, localFallback: fallbackWaivesChat(job) }),
       payloads: stored.filter((l) => l.raw.trim()).map((l) => l.provider),
       assumptions: job.assumptions,
       localInFlight: localInFlight.has(jobId),
@@ -522,6 +639,22 @@ async function watchReviewers(jobId: string, token: string) {
       claimed,
       connected: bridge.connected,
     });
+    if (
+      job.status === "awaiting_chat" &&
+      releaseLocalAsFallback({
+        role,
+        providers: job.reviewProviders ?? [],
+        localReleased,
+        chatRacing: racing,
+        usableChat: stored.some((l) => isChatProvider(l.provider) && l.raw.trim()),
+        chatStalled: stalled,
+      })
+    ) {
+      // Chat is down (quota / disconnected / nothing returned): never lose the review — local runs
+      // as today's fallback, not as a verifier. Re-check at once only after a real release, so a
+      // release that did not apply can never spin this loop without its tick.
+      if (releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned nothing usable; local runs as the fallback.")) continue;
+    }
     if (job.status === "awaiting_chat" && !racing) {
       const legs = stored.filter((l) => l.raw.trim());
       if (legs.length) await submitHarborChat(jobId, legs[0].raw, legs, { force: true });
@@ -529,7 +662,7 @@ async function watchReviewers(jobId: string, token: string) {
         // Report the real per-reviewer reason (usage limit / connection / genuinely empty) rather
         // than a blanket "finished without JSON" that hid infra causes like a quota block.
         const skip = emptyReviewSkip(buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId) }));
-        patchJob(jobId, (j) => ({
+        transitionJob(jobId, (j) => ({
           ...j,
           status: "skipped",
           skipReason: skip.skipReason,
@@ -542,10 +675,13 @@ async function watchReviewers(jobId: string, token: string) {
     if (state.jobs.find(j=>j.id===jobId)?.status !== job.status) continue;
     const lanes = buildReviewerLanes(job, { localInFlight: localInFlight.has(jobId), staleMs: localStaleNoteMs() });
     const notes: string[] = [];
-    if (chat.length && !bridge.connected && !claimed) {
-      notes.push(
-        `Chrome bridge is not connected. ${chat.map((p) => (p === "grok" ? "Grok" : "ChatGPT")).join(" / ")} start when the extension reconnects.`,
-      );
+    const chatNames = chat.map((p) => (p === "grok" ? "Grok" : "ChatGPT")).join(" / ");
+    // While a fallback release waives chat, a reconnect gets no fresh chat work and the job does not
+    // wait on chat, so the note must not promise that chat starts when the extension reconnects.
+    if (chat.length && fallbackWaivesChat(job)) {
+      notes.push(`Chat was unavailable, so local runs as the fallback. ${chatNames} is not awaited, even if the extension reconnects.`);
+    } else if (chat.length && !bridge.connected && !claimed) {
+      notes.push(`Chrome bridge is not connected. ${chatNames} start when the extension reconnects.`);
     }
     // Local leg visibility (never auto-abort): queued at the server vs generating vs no sign of
     // life. Stable state text only — a live age would rewrite the GitHub ops comment every tick.
@@ -553,6 +689,7 @@ async function watchReviewers(jobId: string, token: string) {
       const note = localLegNote(job.providerProgress?.local, Date.now(), localStaleNoteMs());
       if (note) notes.push(note);
     }
+    if (job.localVerifyStartedAt) notes.push("Chat review found nothing; the local LLM is verifying before the review posts.");
     for (const lane of lanes) notes.push(`${lane.label}: ${lane.detail}`);
 
     const phase: OpsPhase = racing ? (chat.length && !bridge.connected && !claimed ? "blocked" : "running") : "running";
@@ -571,10 +708,10 @@ async function playGithub(jobId: string, untrustedBody: string) {
   const live0 = current();
   if (!live0 || live0.status === "cancelled") return;
 
-  patchJob(jobId, (j) => ({ ...j, status: "snapshot", updatedAt: Date.now() }));
+  transitionJob(jobId, (j) => ({ ...j, status: "snapshot", updatedAt: Date.now() }));
   const ready = githubReady();
   if ((!ready.appId && !ready.clientId) || !ready.privateKey || !live0.installationId) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "GitHub App credentials missing — cannot snapshot head SHA",
@@ -589,7 +726,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
     token = await installationToken(live0.installationId);
   } catch (e) {
     const msg = formatGithubError(e);
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "GitHub snapshot failed",
@@ -623,7 +760,7 @@ async function playGithub(jobId: string, untrustedBody: string) {
         isDraft: pull.draft,
         isFork: pull.fork,
       };
-      patchJob(jobId, (j) => ({
+      transitionJob(jobId, (j) => ({
         ...j,
         headSha: target.headSha,
         baseSha: target.baseSha,
@@ -638,14 +775,14 @@ async function playGithub(jobId: string, untrustedBody: string) {
     if (!resolved || resolved.status === "cancelled") return;
     const skip = reviewSkipReason({ sample: target, trigger: resolved.trigger, thread: resolved.thread, settings: state.settings });
     if (skip) {
-      patchJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
+      transitionJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
       await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
       return;
     }
     sample = await fetchPullSnapshot(token, target, { diffMaxChars: state.settings.promptDiffMaxChars });
   } catch (e) {
     const msg = formatGithubError(e);
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "GitHub snapshot failed",
@@ -662,14 +799,14 @@ async function playGithub(jobId: string, untrustedBody: string) {
   // Settings may have changed while snapshot I/O was in flight.
   const skip = reviewSkipReason({ sample: gated, trigger: gated.trigger, thread: gated.thread, settings: state.settings });
   if (skip) {
-    patchJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
+    transitionJob(jobId, j => ({ ...j, status: "skipped", skipReason: skip, updatedAt: Date.now() }));
     await upsertOpsComment(token, jobId, "skipped", [`Review not started: ${skip}`]);
     return;
   }
 
   const providers = providersFromSettings(state.settings);
   if (!providers.length) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "no review chat enabled",
@@ -700,18 +837,32 @@ async function playGithub(jobId: string, untrustedBody: string) {
   recordReviewCoverage(jobId, prompt, sample);
   const order = normalizeReviewOrder(state.settings.reviewOrder);
   const chatProviders = providers.filter(isChatProvider);
+  // Pinned once here like reviewProviders: a later settings change never alters a review in flight.
+  const localReviewRole = state.settings.localReviewRole ?? "race";
+  const verifier = localVerifies({ role: localReviewRole, providers });
 
 
-  patchJob(jobId, (j) => ({
+  transitionJob(jobId, (j) => ({
     ...j,
     status: "awaiting_chat",
-    plan: providers.includes("local")
+    plan: verifier
+      ? `Snapshot loaded. ${chatProviders.join(" + ")} review first; local verifies a clean result.`
+      : providers.includes("local")
       ? `Snapshot loaded. ${[...chatProviders, "local"].join(" + ")} race in parallel. Schema-merge when each finishes.`
       : chatProviders.length > 1
         ? `Snapshot loaded. ${chatProviders.join(" + ")} race in parallel. Schema-merge when each finishes.`
         : `Snapshot loaded. The Chrome bridge will send this to ${chatProviders[0] ?? "chat"} on this machine.`,
     chatPrompt: prompt,
     reviewProviders: providers,
+    localReviewRole,
+    validatorGeneration: undefined,
+    localVerifyStartedAt: undefined,
+    localFallbackAt: undefined,
+    localReleasePrompt: undefined,
+    localVerifyNote: undefined,
+    localVerified: undefined,
+    skippedProviders: undefined,
+    incompleteProviders: undefined,
     reviewOrder: order,
     storedLegs: [],
     updatedAt: Date.now(),
@@ -727,16 +878,19 @@ async function playGithub(jobId: string, untrustedBody: string) {
   if (providers.includes("local")) {
     // The loop reads files from this snapshot; harmless for single-turn mode (unused there).
     localSamples.set(jobId, sample);
-    void kickLocalRace(jobId, prompt);
+    // verify-clean: no local generation now; submitHarborChat starts it only after a clean chat result.
+    if (!verifier) void kickLocalRace(jobId, prompt);
   }
 }
 
 /** One in-flight generate per job. playGithub + watch both call this. */
 async function kickLocalRace(jobId: string, prompt: string) {
-  if (!prompt.trim()) return;
   if (localInFlight.has(jobId)) return;
   const job = state.jobs.find((j) => j.id === jobId);
   if (!job || job.status !== "awaiting_chat") return;
+  // Once held-local released, the prompt pinned in that transaction wins over any later mutation.
+  const runPrompt = localExecutionPrompt({ ...job, chatPrompt: prompt || job.chatPrompt });
+  if (!runPrompt.trim()) return;
   if ((job.storedLegs ?? []).some((l) => l.provider === "local" && l.raw.trim())) return;
   if ((job.assumptions ?? []).some((a) => /^Skipped local/i.test(a))) return;
   localInFlight.add(jobId);
@@ -749,11 +903,11 @@ async function kickLocalRace(jobId: string, prompt: string) {
   const startedAt = Date.now();
   const leg = startLocalLeg(startedAt);
   localActivity.set(jobId, leg);
-  patchJob(jobId, j => ({...j, generating: {...j.generating, local: true},
+  transitionJob(jobId, j => ({...j, generating: {...j.generating, local: true},
     providerProgress: {...j.providerProgress, local: localLegProgress(leg, `local:${jobId}`, startedAt)},
     updatedAt: startedAt}));
   try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
-  void attachLocalLeg(jobId, prompt, { submit: true });
+  void attachLocalLeg(jobId, runPrompt, { submit: true });
 }
 
 /** Feed one activity observation into the leg's tracker and flush it (throttled) to the job. The
@@ -769,7 +923,7 @@ function noteLocalActivity(jobId: string, kind: LocalLegActivityKind) {
   if (next.accepted) { try { reviewHistory().recordServerStep(jobId, "local.accepted"); } catch { /* visible history health */ } }
   if (next.generated) { try { reviewHistory().recordServerStep(jobId, "local.generating"); } catch { /* visible history health */ } }
   if (!next.flush) return;
-  patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+  transitionJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
     ...j,
     providerProgress: { ...j.providerProgress, local: localLegProgress(next.state, `local:${jobId}`, now) },
   }));
@@ -811,7 +965,7 @@ function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string
 async function generateLocalLeg(
   jobId: string,
   prompt: string,
-): Promise<{ ok: true; raw: string; originalText?: string } | { ok: false; error: string; originalText?: string }> {
+): Promise<LocalLegResult> {
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
   const job = state.jobs.find((j) => j.id === jobId);
@@ -842,6 +996,12 @@ async function generateLocalLeg(
     return { ok: false, error: "local skipped: no snapshot for multiturn and prompt too large for single-turn" };
   }
   return runLocalLlm(prompt, state.settings, signal, { onActivity: (a) => noteLocalActivity(jobId, a.kind) });
+}
+
+/** Store the local leg's payload on the job (replacing any earlier one) and mark it collected. */
+function collectLocalLeg(j: Job, raw: string, originalText?: string, evidence?: { unparsedText?: string; residualReplies?: string }): Job {
+  const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw, originalText, ...evidence }];
+  return { ...j, storedLegs: next, generating: {...j.generating, local: false}, providerProgress: {...j.providerProgress, local: {runId: `local:${j.id}`, stage: "response_collected", observedAt: Date.now(), receivedAt: Date.now()}}, updatedAt: Date.now() };
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
@@ -875,25 +1035,38 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     const local = await generateLocalLeg(jobId, prompt);
     try {
       reviewHistory().recordServerStep(jobId,local.ok?"local.response_received":"local.failed");
-      if(!local.ok && local.originalText)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,local.originalText,local.originalText.length,local.originalText.length>128_000);
+      // Every completed reply that was not review JSON is archived, including one a later reply replaced.
+      const unparsed = local.ok ? local.unparsedText?.trim() : localReplies(local);
+      if(unparsed)reviewHistory().recordObservation(jobId,"local",`local:${jobId}`,unparsed,unparsed.length,unparsed.length>128_000);
+      // A reply whose accepted JSON left text outside it WAS parsed: it is the leg's original reply, kept
+      // under the response cap where a single-turn reply's originalText is (the posted evidence is capped
+      // lower, so this is where the rest of it lives). A multi-turn leg has no originalText, so its
+      // residual group replies are that original; the submit's recordResponse (same JSON, no original)
+      // keeps it. Never an "unparsed" observation: the reply parsed (its gate posts it as evidence).
+      if(local.ok&&!local.originalText&&local.residualReplies?.trim())reviewHistory().recordResponse(jobId,"local",local.raw,local.residualReplies);
     } catch { /* metadata storage failure is visible without starting another model */ }
     if (!local.ok) {
-      patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
-        ...j, generating: {...j.generating, local: false},
-        providerErrors: {...j.providerErrors, local: {code: "error", message: local.error}},
-        providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now()}},
-        assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12), updatedAt: Date.now(),
-      }));
-    } else {
-      patchJob(jobId, (j) => {
+      transitionJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
-        const next = [...(j.storedLegs ?? []).filter((l) => l.provider !== "local"), { provider: "local" as const, raw: local.raw, originalText: local.originalText }];
-        return { ...j, storedLegs: next, generating: {...j.generating, local: false}, providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "response_collected", observedAt: Date.now(), receivedAt: Date.now()}}, updatedAt: Date.now() };
+        // A completed non-JSON reply is evidence on any role: kept as a salvaged leg.
+        const salvage = failedLocalSalvage(local);
+        if (salvage) return collectLocalLeg(j, salvage, localReplies(local));
+        return {
+          ...j, generating: {...j.generating, local: false},
+          providerErrors: {...j.providerErrors, local: {code: "error", message: local.error}},
+          providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now()}},
+          assumptions: [...(j.assumptions ?? []), `Skipped local (${local.error})`].slice(0, 12), updatedAt: Date.now(),
+        };
       });
+    } else {
+      // Every leg's gate reads unparsedText / residualReplies (race or held alike): a reply set aside to
+      // reach the accepted JSON is evidence, so that JSON is never the leg's complete verdict.
+      const evidence = { unparsedText: local.unparsedText, residualReplies: local.residualReplies };
+      transitionJob(jobId, (j) => (j.status !== "awaiting_chat" ? j : collectLocalLeg(j, local.raw, local.originalText, evidence)));
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    patchJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
+    transitionJob(jobId, j => j.status !== "awaiting_chat" ? j : ({
       ...j, generating: {...j.generating, local: false},
       providerErrors: {...j.providerErrors, local: {code: "error", message: msg.slice(0, 160)}},
       providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "error", observedAt: Date.now(), receivedAt: Date.now()}},
@@ -937,6 +1110,9 @@ export async function submitHarborChat(
     return { ok: false, error: "not a GitHub job" };
   }
   const providers = job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings);
+  // The role pinned at snapshot (never live settings); an FP round always merges as today.
+  const role = job.chatFpRound ? "race" : job.localReviewRole;
+  const localReleased = Boolean(job.localVerifyStartedAt || job.localFallbackAt);
   const incoming: ChatLeg[] =
     legs && legs.length
       ? legs.filter((l) => providers.includes(l.provider) && l.raw.trim())
@@ -953,7 +1129,7 @@ export async function submitHarborChat(
     for (const leg of incoming) reviewHistory().recordResponse(jobId,leg.provider,leg.raw,leg.originalText || "");
   } catch {
     // Stored Local legs remain available to the watcher; never repeat generation.
-    patchJob(jobId,j=>({...j,githubError:"Response history storage unavailable; result retained for retry"}));
+    transitionJob(jobId,j=>({...j,githubError:"Response history storage unavailable; result retained for retry"}));
     return {ok:false,error:"Response history storage unavailable; result retained for retry"};
   }
   if (!opts?.force && !job.chatFpRound) {
@@ -961,7 +1137,7 @@ export async function submitHarborChat(
     const haveChat = payloads.some((l) => isChatProvider(l.provider));
     if (
       stillRacing({
-        providers,
+        providers: racingProviders({ role, providers, localReleased, localFallback: fallbackWaivesChat(job) }),
         payloads: payloads.map((l) => l.provider),
         assumptions: job.assumptions,
         localInFlight: localInFlight.has(jobId),
@@ -969,17 +1145,11 @@ export async function submitHarborChat(
         providerErrors: job.providerErrors,
       })
     ) {
-      patchJob(jobId, (j) => {
+      transitionJob(jobId, (j) => {
         if (j.status !== "awaiting_chat") return j;
-        const next = [...(j.storedLegs ?? [])];
-        for (const leg of incoming) {
-          const i = next.findIndex((l) => l.provider === leg.provider);
-          if (i >= 0) next[i] = leg;
-          else next.push(leg);
-        }
         return {
           ...j,
-          storedLegs: next,
+          storedLegs: upsertLegs(j.storedLegs, incoming),
           plan: haveChat && !haveLocal ? "Waiting for remaining racers before schema-merge." : "Waiting for remaining racers before schema-merge.",
           updatedAt: Date.now(),
         };
@@ -987,23 +1157,35 @@ export async function submitHarborChat(
       return { ok: true };
     }
   }
-  const skipped = providers.filter((p) => !payloads.some((l) => l.provider === p) && !(job.chatFpRound && p === "local"));
+  // A verifier local leg that was held back (chat had findings) or whose verification did not
+  // complete is not a "skipped reviewer": the latter is reported by the verify note instead.
+  const verifierLocal = localVerifies({ role, providers }) && !job.localFallbackAt;
+  const skipped = providers.filter(
+    (p) => !payloads.some((l) => l.provider === p) && !(job.chatFpRound && p === "local") && !(verifierLocal && p === "local"),
+  );
 
   let locked = false;
-  patchJob(jobId, (j) => {
+  let validatorGeneration = 0;
+  transitionJob(jobId, (j) => {
     if (j.status !== "awaiting_chat") return j;
     locked = true;
-    return { ...j, status: "validator", updatedAt: Date.now() };
+    validatorGeneration = (j.validatorGeneration ?? 0) + 1;
+    return { ...j, status: "validator", validatorGeneration, updatedAt: Date.now() };
   });
   if (!locked) return { ok: false, error: "job is not waiting for a chat review" };
 
   const revert = (error: string) => {
-    patchJob(jobId, (j) =>
-      j.status === "validator"
+    transitionJob(jobId, (j) =>
+      ownsValidatorGeneration(j, validatorGeneration)
         ? { ...j, status: "awaiting_chat", githubError: error, updatedAt: Date.now() }
         : j,
     );
     return { ok: false as const, error };
+  };
+  /** Stale validator completion must not merge or release after ownership moved (held-local race). */
+  const stillOwnsValidator = () => {
+    const cur = state.jobs.find((j) => j.id === jobId);
+    return ownsValidatorGeneration(cur, validatorGeneration);
   };
 
   let token: string;
@@ -1030,30 +1212,60 @@ export async function submitHarborChat(
   if (!still || still.status === "cancelled") {
     return { ok: false, error: "cancelled" };
   }
+  if (!ownsValidatorGeneration(still, validatorGeneration)) {
+    return { ok: false, error: "stale validator" };
+  }
 
   const gates: LiveGateResult[] = [];
   const byProvider = new Map<ReviewProvider, LiveGateResult>();
   const invalid: string[] = [];
-  for (const leg of payloads) {
-    const parsed = parseChatSubmission(leg.raw);
-    const gate = gateLiveSubmission(parsed, sample, state.settings);
+  const heldLocal = !job.chatFpRound && heldLocalReleased(job);
+  let localUnusable: string | undefined;
+  const unusableNotes: string[] = [];
+  // Why each salvaged leg is posted verbatim, kept for the body and the loop handoff (Job.rawCauses).
+  const rawCauses: Partial<Record<ReviewProvider, RawCause>> = {};
+  // Each reviewer's complete-verdict state (gateLeg): only these earn clean credit.
+  const complete = new Set<ReviewProvider>();
+  // A released held local leg's rejected reply is always evidence (docs §1). Any other leg the gate
+  // rejected becomes evidence once another leg passed (the merge posts, so its reply is never dropped);
+  // when none did, it stays rejected, so chat with nothing usable still releases the fallback or skips.
+  const first = payloads.map((leg) => ({ leg, ...gateLeg(leg, sample, heldLocal && leg.provider === "local") }));
+  const posts = first.some((g) => g.gate.ok);
+  for (const g of first) {
+    const { leg, gate, verdict, unusable, cause } = !g.gate.ok && posts ? { leg: g.leg, ...gateLeg(g.leg, sample, true) } : g;
+    if (unusable) unusableNotes.push(`${leg.provider}: ${unusable} (reply posted verbatim)`);
+    if (unusable && leg.provider === "local") localUnusable = unusable;
     if (!gate.ok) {
       invalid.push(`${leg.provider}: ${gate.reason}`);
       continue;
     }
     gates.push(gate);
     byProvider.set(leg.provider, gate);
+    if (verdict) complete.add(leg.provider);
+    if (gate.rawReview && cause) rawCauses[leg.provider] = cause;
   }
+  // Every reviewer that returned a payload but no complete verdict, a rejected one included.
+  const incompleteProviders = [...new Set(payloads.map((l) => l.provider))].filter((p) => !complete.has(p));
 
+  if (!gates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
+    // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
+    if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+    releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned no valid JSON; local runs as the fallback.", incoming, { validatorGeneration });
+    return { ok: true };
+  }
   if (!gates.length) {
-    patchJob(jobId, (j) => ({
-      ...j,
-      status: "skipped",
-      skipReason: invalid.join("; ") || "no valid review JSON",
-      githubError: invalid.join("; ") || "no valid review JSON",
-      plan: "Did not post — no reviewer returned valid JSON.",
-      updatedAt: Date.now(),
-    }));
+    if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+    transitionJob(jobId, (j) => {
+      if (!ownsValidatorGeneration(j, validatorGeneration)) return j;
+      return {
+        ...j,
+        status: "skipped",
+        skipReason: invalid.join("; ") || "no valid review JSON",
+        githubError: invalid.join("; ") || "no valid review JSON",
+        plan: "Did not post — no reviewer returned valid JSON.",
+        updatedAt: Date.now(),
+      };
+    });
     return { ok: false, error: invalid.join("; ") || "no valid review JSON" };
   }
 
@@ -1070,40 +1282,164 @@ export async function submitHarborChat(
       if (!prev || (prev.status === "cleared" && c.status === "not_cleared")) coverageByFile.set(c.file, c);
     }
   }
-  // Verbatim reply(ies) from any leg whose JSON could not be parsed (local repair off) — surfaced in
-  // the review body so the fixing agent can act instead of the job pending forever. Combine every
-  // provider's salvaged reply (labeled when more than one) so no review is silently discarded.
-  const salvaged = [...byProvider.entries()].filter(([, g]) => g.rawReview);
-  const combinedRaw = salvaged
-    .map(([provider, g]) => (salvaged.length > 1 ? `**${PROVIDER_LABEL[provider]}:**\n\n${g.rawReview}` : g.rawReview))
-    .join("\n\n---\n\n");
-  // Keep the posted review body under GitHub's 65,535-char limit (each leg alone can be ~60 KB, so a
-  // multi-provider concatenation can overflow and DLQ the job); the full originals stay in history.
-  const rawReview = !combinedRaw
-    ? undefined
-    : combinedRaw.length > MAX_RAW_REVIEW_BODY
-      ? `${combinedRaw.slice(0, MAX_RAW_REVIEW_BODY)}\n\n…(truncated to fit GitHub's review body limit; full original responses retained in review history)`
-      : combinedRaw;
-  patchJob(jobId, (j) => ({
-    ...j,
-    findings: merged.findings,
-    candidates: merged.findings,
-    mergeRecommendation: merged.mergeRecommendation,
-    highestRisk: merged.highestRisk,
-    rawReview,
-    investigatedSafe: merged.investigatedSafe,
-    assumptions: [
-      skipped.length ? `Skipped ${skipped.join(", ")} (quota or unavailable)` : "",
-      ...invalid,
-      ...merged.assumptions,
-    ].filter(Boolean),
-    coverage: [...coverageByFile.values()],
-    droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
-    plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
-    updatedAt: Date.now(),
-  }));
+  // Verbatim reply(ies) from any leg whose JSON could not be parsed — surfaced in the review body so
+  // the fixing agent can act instead of the job pending forever. Every leg's salvaged reply is
+  // combined, a verifier's included: no review is silently discarded.
+  const salvaged = salvagedReview([...byProvider].map(([provider, g]) => ({ provider, rawReview: g.rawReview })), MAX_RAW_REVIEW_BODY);
+  const rawReview = salvaged?.text;
+  // The legs the block holds only in part: the outcome, header and note describe the block as posted.
+  const rawTruncated = salvaged?.truncated.length ? salvaged.truncated : undefined;
+  const rawLegs = salvaged?.legs;
+  // Only a complete verdict counts (gateLeg), never payload presence or the absence of raw text:
+  // that decides both whether local verified and which chat reviewers were clean.
+  const structured = [...complete];
+  const verifying = Boolean(job.localVerifyStartedAt) && !job.localFallbackAt;
+  const localVerified = verifying ? structured.includes("local") : undefined;
+  const nextAssumptions = [
+    skipped.length ? skippedNote(skipped) : "",
+    ...invalid,
+    ...unusableNotes,
+    ...merged.assumptions,
+  ].filter(Boolean);
+  // merged.findings is already publish-gated (gateLiveSubmission applies the poster's partition with
+  // the same settings), so this count is the one the posted body renders.
+  // Skipped reviewers come from provider state (`skipped`), never from the merged assumptions, which
+  // also carry the reviewers' own free-form text.
+  const outcome = reviewOutcome({ ...job, rawReview, rawCauses, rawTruncated, localVerified, assumptions: nextAssumptions, skippedProviders: skipped, incompleteProviders }, merged.findings.length);
+  // Credit only the chat reviewers that produced the clean structured result (pinned when the
+  // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
+  const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
+  if (outcome === "verify") {
+    // Chat parsed clean: hold the post and run local on the same prompt as the verification round.
+    const plan = `${cleanChat.join(" + ") || "chat"} found nothing; local verification round running.`;
+    if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+    releaseHeldLocal(jobId, token, { kind: "verify", verifyChat: cleanChat }, plan, incoming, { validatorGeneration });
+    return { ok: true };
+  }
+  const localError =
+    localUnusable ||
+    (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
+    invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
+    (byProvider.get("local")?.rawReview ? "not review JSON" : undefined);
+  // Each merged reviewer's accepted finding count: the note credits findings to the leg that reported them.
+  const findingsBy: Partial<Record<ReviewProvider, number>> = Object.fromEntries([...byProvider].map(([p, g]) => [p, g.findings.length]));
+  const rawBy = [...byProvider].filter(([, g]) => g.rawReview).map(([p]) => p);
+  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified, rawBy, rawTruncated });
+  if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+  let stamped = false;
+  transitionJob(jobId, (j) => {
+    if (!ownsValidatorGeneration(j, validatorGeneration)) return j;
+    stamped = true;
+    return {
+      ...j,
+      findings: merged.findings,
+      candidates: merged.findings,
+      mergeRecommendation: merged.mergeRecommendation,
+      highestRisk: merged.highestRisk,
+      rawReview,
+      rawCauses: rawReview ? rawCauses : undefined,
+      rawTruncated,
+      rawLegs,
+      investigatedSafe: merged.investigatedSafe,
+      assumptions: nextAssumptions,
+      skippedProviders: skipped,
+      incompleteProviders,
+      coverage: [...coverageByFile.values()],
+      droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
+      plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
+      localVerifyNote: localVerifyNote || undefined,
+      localVerified,
+      updatedAt: Date.now(),
+    };
+  });
+  if (!stamped) return { ok: false, error: "stale validator" };
   await finishJob(jobId, sample, token);
   return finishResult(jobId);
+}
+
+/** Gate one reviewer leg and decide its complete-verdict state (docs/local-verify-clean.md §1). Every
+ * leg, chat or local, race or verify-clean: a reply is its reviewer's verdict only when it passed the
+ * gate with nothing set aside (incompleteVerdict: no finding dropped for its shape or left unread past
+ * the row cap, and for a local leg no completed reply or text around the accepted JSON discarded to
+ * get it; a chat leg's verdict is the JSON its client submitted, its page capture archived, not
+ * judged) and was not salvaged verbatim. Any other reply is gated as evidence instead (verdictEvidence): what parsed, plus
+ * its complete text verbatim, so it posts and nothing it reported is lost. A reply the gate rejects
+ * outright becomes evidence only with `rejectedEvidence` (the caller decides: see submitHarborChat).
+ * `cause` says why a leg posts verbatim: a reply salvaged before the gate (the bridge's, or a failed
+ * held local leg's) was not valid review JSON; a converted one is evidence for unread rows alone or
+ * for another reason it is not a verdict. */
+function gateLeg(
+  leg: ChatLeg,
+  sample: SamplePr,
+  rejectedEvidence: boolean,
+): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause } {
+  const parsed = parseChatSubmission(leg.raw);
+  const gate = gateLiveSubmission(parsed, sample, state.settings);
+  if (gate.ok && gate.rawReview) return { gate, verdict: false, cause: "unparseable" };
+  const unusable = incompleteVerdict(gate, leg);
+  if (!unusable) return { gate, verdict: gate.ok };
+  if (!gate.ok && !rejectedEvidence) return { gate, verdict: false };
+  const cause: RawCause = unusable === gateUnreadRows(gate) ? "unread-rows" : "not-a-verdict";
+  return { gate: gateLiveSubmission(verdictEvidence(parsed, leg), sample, state.settings), verdict: false, unusable, cause };
+}
+
+type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kind: "fallback" };
+
+/** verify-clean: the single release point of a held local leg, called only on an explicit terminal
+ * signal of the chat round (docs/local-verify-clean.md §2): a clean structured chat result starts
+ * the verification round; chat finishing with nothing usable, or a bridge disconnected past its
+ * grace, starts the fallback. It releases once (a stamp is set), returns the job to awaiting_chat
+ * with the chat legs kept, starts local and makes sure a watcher waits for it.
+ * A validator-phase caller must pass the generation it locked with; without a matching generation,
+ * status===validator is refused so a concurrent watcher cannot steal an in-flight validation. */
+function releaseHeldLocal(
+  jobId: string,
+  token: string,
+  release: HeldLocalRelease,
+  plan: string,
+  legs: ChatLeg[] = [],
+  opts?: { validatorGeneration?: number },
+): boolean {
+  let released = false;
+  let pinnedPrompt = "";
+  const job = transitionJob(jobId, (j) => {
+    if (!canReleaseHeldLocal(j, opts)) return j;
+    released = true;
+    // Pin prompt + triggering chat legs in the same transaction that stamps the release, so a
+    // concurrent mutation of chatPrompt/storedLegs cannot retarget the local verification run.
+    pinnedPrompt = releaseLocalPrompt(j);
+    const stamp = release.kind === "verify"
+      ? { localVerifyStartedAt: Date.now(), localVerifyChat: release.verifyChat, localReleasePrompt: pinnedPrompt }
+      : { localFallbackAt: Date.now(), localReleasePrompt: pinnedPrompt };
+    return { ...j, ...stamp, status: "awaiting_chat", storedLegs: upsertLegs(j.storedLegs, legs), plan, updatedAt: Date.now() };
+  });
+  if (!released || !job) return false;
+  void kickLocalRace(jobId, pinnedPrompt);
+  void watchReviewers(jobId, token);
+  return true;
+}
+
+/** Test seam: held-local release with optional validator-generation ownership. */
+export function releaseHeldLocalForTest(
+  jobId: string,
+  token: string,
+  release: HeldLocalRelease,
+  plan: string,
+  legs: ChatLeg[] = [],
+  opts?: { validatorGeneration?: number },
+): boolean {
+  return releaseHeldLocal(jobId, token, release, plan, legs, opts);
+}
+
+/** Store incoming legs over the stored ones, one per provider (a newer leg replaces an older one). */
+function upsertLegs(stored: Job["storedLegs"], incoming: ChatLeg[]): NonNullable<Job["storedLegs"]> {
+  const next = [...(stored ?? [])];
+  for (const leg of incoming) {
+    const i = next.findIndex((l) => l.provider === leg.provider);
+    if (i >= 0) next[i] = leg;
+    else next.push(leg);
+  }
+  return next;
 }
 
 function finishResult(jobId: string): { ok: true } | { ok: false; error: string } {
@@ -1126,7 +1462,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   const review = buildReview(after, inline, unanchored, policy);
 
   if (!review) {
-    patchJob(jobId, (j) => ({
+    transitionJob(jobId, (j) => ({
       ...j,
       status: "skipped",
       skipReason: "poster: zero findings (precision policy)",
@@ -1135,11 +1471,11 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       updatedAt: Date.now(),
     }));
     if (token) void reactQuiet(token, after, "+1");
-    if (token) void upsertOpsComment(token, jobId, "skipped", ["No findings passed the precision policy. No review posted."]);
+    if (token) void upsertOpsComment(token, jobId, "skipped", [after.localVerifyNote ?? "", "No findings passed the precision policy. No review posted."].filter(Boolean));
     return;
   }
 
-  patchJob(jobId, (j) => ({ ...j, status: "posting", updatedAt: Date.now() }));
+  transitionJob(jobId, (j) => ({ ...j, status: "posting", updatedAt: Date.now() }));
 
   let githubId: number | undefined;
   let githubError: string | undefined;
@@ -1163,7 +1499,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       postedToGithub = true;
     } catch (e) {
       githubError = formatGithubError(e);
-      patchJob(jobId, (j) => ({
+      transitionJob(jobId, (j) => ({
         ...j,
         status: "dlq",
         skipReason: "GitHub Reviews API failed — not marked posted",
@@ -1189,22 +1525,16 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
           : r,
       ),
     ]),
-    jobs: state.jobs.map((j) =>
-      j.id === jobId
-        ? {
-            ...j,
-            status: "posted" as const,
-            postedReviewId: review.id,
-            postedToGithub,
-            githubError,
-            updatedAt: Date.now(),
-            mergeRecommendation: review.event,
-            findings: j.findings,
-          }
-        : j,
-    ),
   };
-  const finished=state.jobs.find(j=>j.id===jobId);if(finished)recordJobHistory(finished);
+  transitionJob(jobId, (j) => ({
+    ...j,
+    status: "posted",
+    postedReviewId: review.id,
+    postedToGithub,
+    githubError,
+    updatedAt: Date.now(),
+    mergeRecommendation: review.event,
+  }));
   try {reviewHistory().recordReview(stored);} catch { /* storage health remains visible */ }
   if (token) void reactQuiet(token, after, "+1");
   let headMovedTo: string | undefined;
@@ -1213,7 +1543,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
       const head = await fetchPullHead(token, after.owner, after.repo, after.pr);
       if (head.headSha.slice(0, 7) !== after.headSha.slice(0, 7)) {
         headMovedTo = head.headSha;
-        patchJob(jobId, (j) => ({ ...j, headMovedTo: head.headSha, updatedAt: Date.now() }));
+        transitionJob(jobId, (j) => ({ ...j, headMovedTo: head.headSha, updatedAt: Date.now() }));
       }
     } catch {
       /* ops note is best-effort — never fail the posted review over a HEAD check */
@@ -1221,6 +1551,7 @@ async function finishJob(jobId: string, sample: SamplePr | undefined, token?: st
   }
   const postedJob = state.jobs.find((j) => j.id === jobId) ?? after;
   const notes = reviewPostedNotes({ ...postedJob, headMovedTo }, inline.length + unanchored.length, unanchored.length);
+  if (postedJob.localVerifyNote) notes.unshift(postedJob.localVerifyNote);
   if (token) void upsertOpsComment(token, jobId, "posted", notes.length ? notes : ["Review posted."]);
   // Review-loop step (design §5 4–8): gated OFF by default (Settings fixAgent.enabled +
   // fixAgent.provider, read from the live state.settings, so a saved toggle applies here with no
@@ -1268,7 +1599,7 @@ function enqueueFromDecision(
       summary: `${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr} rejected`,
       rejectReason: decision.reason,
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 403, reject: decision.reason, queued: false };
   }
@@ -1278,7 +1609,7 @@ function enqueueFromDecision(
     if (!isBotMention(opts.thread?.userText, state.settings) || /^duplicate delivery_id/.test(decision.skip || "")) {
       const ev: WebhookLog = {id:nid("ev"),deliveryId:opts.deliveryId,event:opts.eventName,action:"ignored",hmac:"ok",
         httpStatus:202,at:Date.now(),summary:`${opts.sample.owner}/${opts.sample.repo}#${opts.sample.pr} ignored`,skipReason:decision.skip || "filtered"};
-      recordDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
+      noteDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
       state={...state,events:trim([ev,...state.events])};
       return {httpStatus:202,skip:decision.skip || "filtered",queued:false};
     }
@@ -1323,9 +1654,10 @@ function enqueueFromDecision(
       skipReason: decision.skip ?? "filtered",
       jobId: skipJob.id,
     };
-    recordJobHistory(skipJob);
-    recordDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
-    state = { ...state, jobs: trimJobs([skipJob, ...state.jobs]), events: trim([ev, ...state.events]) };
+    noteJobHistory(skipJob);
+    noteDeliveryHistory(ev,{owner:opts.sample.owner,repo:opts.sample.repo,pr:opts.sample.pr,commentId:opts.thread?.commentId});
+    insertJob(skipJob);
+    state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: decision.skip ?? "filtered", jobId: skipJob.id, queued: false };
   }
 
@@ -1358,23 +1690,19 @@ function enqueueFromDecision(
     summary: `${job.owner}/${job.repo}#${job.pr} ${opts.trigger}`,
     jobId: job.id,
   };
-  state = {
-    ...state,
-    jobs: trimJobs([
-      job,
-      ...state.jobs.map((j) =>
-        j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status)
-          ? { ...j, status: "cancelled" as const, skipReason: `superseded by ${job.id}`, updatedAt: Date.now() }
-          : j,
-      ),
-    ]),
-    events: trim([ev, ...state.events]),
-  };
+  // Supersession is an explicit cancellation, not a timer: each live job for the same PR ends through
+  // transitionJob, which aborts its local leg and frees its snapshot.
+  const superseded = state.jobs
+    .filter((j) => j.owner === job.owner && j.repo === job.repo && j.pr === job.pr && isLive(j.status))
+    .map((j) => j.id);
+  for (const id of superseded) {
+    transitionJob(id, (j) => ({ ...j, status: "cancelled", skipReason: `superseded by ${job.id}`, updatedAt: Date.now() }));
+  }
+  insertJob(job);
+  state = { ...state, events: trim([ev, ...state.events]) };
 
-  recordDeliveryHistory(ev,{owner:job.owner,repo:job.repo,pr:job.pr,commentId:job.thread?.commentId});
-  for (const item of state.jobs) if (item.id === job.id || item.skipReason === `superseded by ${job.id}`) recordJobHistory(item);
-  // Supersession is an explicit cancellation, not a timer.
-  for (const previous of state.jobs) if (previous.status === "cancelled") localControllers.get(previous.id)?.abort();
+  noteDeliveryHistory(ev,{owner:job.owner,repo:job.repo,pr:job.pr,commentId:job.thread?.commentId});
+  noteJobHistory(job);
   // A superseded job's ops comment keeps its last "running" state and looks stuck
   // forever. Mark those comments terminal so a re-trigger doesn't leave a phantom
   // in-flight review. Best-effort — never blocks or fails the newly enqueued job.
@@ -1516,7 +1844,7 @@ export function ingestGitHubWebhook(opts: {
       summary: "GitHub delivery rejected",
       rejectReason: "HMAC mismatch",
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 403, reject: "HMAC mismatch", queued: false };
   }
@@ -1533,7 +1861,7 @@ export function ingestGitHubWebhook(opts: {
       summary: "GitHub delivery skipped",
       skipReason: parsed.reason,
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false };
   }
@@ -1549,7 +1877,7 @@ export function ingestGitHubWebhook(opts: {
       at: Date.now(),
       summary: "GitHub ping",
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, queued: false, pong: true };
   }
@@ -1568,7 +1896,7 @@ export function ingestGitHubWebhook(opts: {
       summary: `${ignoredTarget(opts.payload)}${opts.event} ignored`,
       skipReason: parsed.reason,
     };
-    recordDeliveryHistory(ev);
+    noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, skip: parsed.reason, queued: false, ignored: parsed.reason };
   }

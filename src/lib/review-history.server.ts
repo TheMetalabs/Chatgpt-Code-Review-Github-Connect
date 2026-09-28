@@ -428,19 +428,3 @@ let singleton: ReviewHistoryStore | undefined;
 export function reviewHistory() {
     return singleton ||= new ReviewHistoryStore(process.env.ASHLAR_HISTORY_DIR || (process.env.NODE_TEST_CONTEXT ? null : ".data/review-history"));
 }
-/** Operational metadata may degrade visibly; failed archival never gets a result ACK. */
-export function recordJobHistory(job: Job) { try {
-    reviewHistory().recordJob(job);
-}
-catch { /* exposed through health(), no silent success claim */ } }
-export function recordDeliveryHistory(event: WebhookLog, target?: {
-    owner?: string;
-    repo?: string;
-    pr?: number;
-    commentId?: number;
-}) {
-    try {
-        reviewHistory().recordDelivery(event, target);
-    }
-    catch { /* health() retains the failure */ }
-}

@@ -229,7 +229,7 @@ terminal status is an explicit terminal signal:
 - Only `cancelled` (operator or supersession) aborts the in-flight local request and clears its
   activity and liveness state. `posted`, `skipped` and `dlq` never abort local generation, so race
   behavior is unchanged.
-- The reviewer watcher is not stopped here: it exits on its next tick that sees a terminal status.
+- The reviewer watcher is not stopped here: it sleeps through a temporary `validator` phase and exits only on a terminal status (`posted` / `cancelled` / `skipped` / `dlq`), so a snapshot revert back to `awaiting_chat` can resubmit stored legs.
 
 `tests/review/local-verify-lifecycle.e2e.mjs` has one row per terminal path (posted, cancelled while
 held or while local runs, superseded while held or while local runs, dlq, skipped fallback, race)

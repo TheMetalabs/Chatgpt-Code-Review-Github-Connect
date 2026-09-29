@@ -75,6 +75,8 @@ function grokStreamVisible(root = document) {
   }
   for (const el of form.querySelectorAll("span, div, p")) {
     if (el.children.length || (el.textContent || "").trim() !== "Generating" || !elVisible(el)) continue;
+    // The draft editor's own text is the prompt, never provider status.
+    if (el.closest('[contenteditable]:not([contenteditable="false"]), textarea, input')) continue;
     if (root === document || root === document.documentElement) markGrokStream();
     return true;
   }

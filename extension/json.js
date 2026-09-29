@@ -529,7 +529,7 @@ function composerStagedFiles(state, submission) {
   // unnamed element (an empty or blank title or label) is no chip, so a wrapper like that never hides
   // the named chip inside it (Ashlar, review of 5af999fd: the user's staged file closed with the tab).
   const named = fileChips(form)
-    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], [data-testid="chat-submit"], #composer-submit-button') && shown(chip))
+    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], [data-testid="chat-submit"], #composer-submit-button, #model-select-trigger') && shown(chip))
     .map(chip => ({chip, names: fileChipNames(chip).filter(name => name.trim())}))
     .filter(({names}) => names.length);
   return named.filter(({chip}) => !named.some(outer => outer.chip !== chip && outer.chip.contains(chip)))

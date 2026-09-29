@@ -225,6 +225,38 @@ test('a generic stop label in the grok composer records the stream, so an idle c
   }
 });
 
+test('grok draft text that reads Generating is not a stream; a real banner outside the editor is', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
+    <form data-composer="true">
+      <div contenteditable="true" aria-label="Ask Grok anything" style="width:320px;min-height:48px"><p>Review this diff.</p><p>Generating</p><p>more prompt text</p></div>
+      <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button>
+    </form>`);
+  const out = await page.evaluate(() => {
+    delete globalThis.__ashlarGrokSawStream;
+    const draft = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
+    document.querySelector('form').insertAdjacentHTML('beforeend', '<span id="banner">Generating</span>');
+    return {draft, banner: grokStreamVisible()};
+  });
+  assert.deepEqual(out, {draft: {grok: false, stop: false, marked: null}, banner: true});
+});
+
+test('a grok model-picker wrapper is neither a staged chip nor the user\'s file; a real file beside it still is', async t => {
+  for (const wrapper of ['<div role="group" aria-label="Model">', '<div title="Model">']) {
+    const page = await openGrok(t, `<form data-composer="true">
+      ${wrapper}<button type="button" id="model-select-trigger" aria-label="Model select" style="width:88px;height:32px">Expert</button></div>
+      <textarea aria-label="Ask Grok anything" style="width:320px;height:48px"></textarea>
+      <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button>
+    </form>`);
+    const out = await page.evaluate(() => {
+      const form = document.querySelector('form');
+      const empty = {chips: stagedChips(form).length, foreign: composerStagedFiles({}, {})};
+      form.insertAdjacentHTML('afterbegin', '<div role="group" aria-label="notes.txt" style="width:120px;height:32px">notes.txt</div>');
+      return {empty, withFile: composerStagedFiles({}, {})};
+    });
+    assert.deepEqual(out, {empty: {chips: 0, foreign: []}, withFile: ['notes.txt']}, wrapper);
+  }
+});
+
 test('review on the grok DOM: the sent turn is confirmed, the stream is not collected, then the fenced JSON is', async t => {
   const page = await browser.newPage();
   t.after(() => page.close());

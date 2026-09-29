@@ -67,6 +67,7 @@ export const PROGRESS_LABELS = {
     salvaged_no_repair: "JSON invalid · original delivered as a raw review (no accepted repair)",
     quota: "Provider reported a usage limit",
     error: "Provider or submission reported an explicit error",
+    local_lease_waiting: "Waiting for local model · another review or local call holds it (FIFO); nothing sent yet",
     local_queued: "Local LLM request sent · waiting in the model queue (server alive, no output yet)",
     local_generating: "Local LLM generating output",
     // Tab Lease (Phase 1+). Labelled ahead of the extension: a stage without a label is dropped.
@@ -105,6 +106,8 @@ export type ProviderProgress = {
      * chunk or output). observedAt stays "last real progress", so queued-but-alive is distinguishable
      * from no-response. */
     keepaliveAt?: number;
+    /** Local leg only, stage local_lease_waiting: 1-based position in Ashlar's local-model FIFO. */
+    queuePosition?: number;
 };
 export function sanitizeProgressEvents(value: unknown): ProgressEvent[] {
     if (!Array.isArray(value))

@@ -36,6 +36,10 @@ const ALLOW = new Set([
   // keepaliveAt stamp, review-history.server.ts gains two local.* server steps. Chat/bridge stages
   // and step recording are untouched.
   "src/lib/local-leg-activity.ts",
+  // Process-wide FIFO lease a review's local leg holds across all its turns (+ its tests).
+  "src/lib/local-model-lease.ts",
+  "tests/review/local-model-lease.test.mjs",
+  "tests/review/local-model-lease.e2e.mjs",
   "src/lib/local-leg-activity.test.ts",
   "src/lib/review-progress.ts",
   "src/lib/review-history.server.ts",

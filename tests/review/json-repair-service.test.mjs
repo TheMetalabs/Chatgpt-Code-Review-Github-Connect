@@ -6,7 +6,7 @@ import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import http from 'node:http';
-import {requestLocalChat} from '../../src/lib/local-chat-request.server.ts';
+import {requestLocalChat, LocalChatCutOff} from '../../src/lib/local-chat-request.server.ts';
 import {overlayEnv, sanitizeBotSettings, botSettingsToEnv} from '../../src/lib/settings.server.ts';
 const value={findings:[],investigated_safe:['a.ts: checked "condition"']};
 const raw=JSON.stringify(value),original=raw.replace(/\\"/g,'"');
@@ -234,6 +234,38 @@ async function contextServer(t,reject) {
  for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
  return {bodies,done:f.service.status('A',started.id)};
 }
+
+test('a length cut-off does not retry after status() accepted the repair',async t=>{
+ let rejectPending;const pending=new Promise((_resolve,reject)=>{rejectPending=reject;});
+ const f=fixture(t,{response:()=>pending});
+ const started=f.service.start(input);await flush();
+ assert.equal(f.calls.length,1);
+ f.accepted.push(f.history.getRepair('A',started.id));
+ assert.equal(f.service.status('A',started.id).status,'accepted');
+ rejectPending(new LocalChatCutOff('length'));
+ await flush();
+ for(let n=0;n<50;n++)await flush();
+ assert.equal(f.calls.length,1,'no bumped retry after accepted');
+ assert.equal(f.history.getRepair('A',started.id).status,'accepted');
+ assert.equal(f.service.status('A',started.id).status,'accepted');
+});
+
+test('a length cut-off does not retry after status() superseded the repair',async t=>{
+ let rejectPending;const pending=new Promise((_resolve,reject)=>{rejectPending=reject;});
+ const f=fixture(t,{response:()=>pending});
+ const started=f.service.start(input);await flush();
+ assert.equal(f.calls.length,1);
+ f.setCurrent(false);
+ assert.equal(f.service.status('A',started.id).status,'superseded');
+ // Source may look current again later; the persisted terminal state must still block a retry.
+ f.setCurrent(true);
+ rejectPending(new LocalChatCutOff('length'));
+ await flush();
+ for(let n=0;n<50;n++)await flush();
+ assert.equal(f.calls.length,1,'no bumped retry after superseded');
+ assert.equal(f.history.getRepair('A',started.id).status,'superseded');
+});
+
 test('a budget rejected against the context window is sent once more without max_tokens',async t=>{
  const {bodies,done}=await contextServer(t,body=>'max_tokens' in body ? 400 : 0);
  assert.equal(done.status,'ready');assert.equal(bodies.length,2);

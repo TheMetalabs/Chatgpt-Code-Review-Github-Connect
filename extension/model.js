@@ -80,8 +80,11 @@ async function selectReasoning(provider, level, deadline = Date.now() + 60_000) 
   globalThis.throwIfStopped?.();
   if (Date.now() >= deadline) { escape(); return "skipped"; }
   items = reasoningMenuItems();
+  // A disabled entry (native, aria, or Radix data-disabled) drops the click; the next fallback is tried.
+  const pickable = (n) => n instanceof HTMLElement && !n.disabled && n.getAttribute("aria-disabled") !== "true" &&
+    (n.getAttribute("data-disabled") === null || n.getAttribute("data-disabled") === "false");
   for (const key of fallback) {
-    const el = items.find((n) => n?.getAttribute?.("aria-disabled") !== "true" && hit(key, pillText(n)));
+    const el = items.find((n) => pickable(n) && hit(key, pillText(n)));
     if (el instanceof HTMLElement) {
       el.click();
       await sleep(400);

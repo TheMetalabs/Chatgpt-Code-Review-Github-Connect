@@ -92,7 +92,8 @@ function grokPrivateOn() {
   const link = grokPrivateToggle();
   const fill = link?.querySelector?.("[data-testid='pi-incognito-fill']");
   if (!fill) return false;
-  return !/\bopacity-0\b/.test(fill.className || "");
+  // The class attribute, not className: on an SVG icon that is an SVGAnimatedString.
+  return !/\bopacity-0\b/.test(fill.getAttribute("class") || "");
 }
 
 /** A review tab must be the top-bar private chat, the way ChatGPT opens ?temporary-chat=true.

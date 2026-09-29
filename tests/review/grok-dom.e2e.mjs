@@ -305,6 +305,37 @@ test('a grok model-picker wrapper is neither a staged chip nor the user\'s file;
   }
 });
 
+test('an off-state grok pill with an SVG icon is not private; the click that turns it on is taken once', async t => {
+  const svgPill = on => `<a href="${on ? '/c' : '/c#private'}" aria-label="Private" style="display:inline-flex;width:86px;height:40px"><svg data-testid="pi-incognito" class="${on ? 'absolute opacity-0' : 'absolute'}" width="20" height="20"></svg><svg data-testid="pi-incognito-fill" class="${on ? 'absolute' : 'absolute opacity-0'}" width="20" height="20"></svg><span>개인</span></a>`;
+  const page = await openGrok(t, `${svgPill(false)}<form data-composer="true"><textarea style="width:320px;height:48px"></textarea></form>`);
+  const out = await page.evaluate(async on => {
+    const off = grokPrivateOn();
+    let clicks = 0;
+    const link = document.querySelector('a');
+    link.addEventListener('click', e => { e.preventDefault(); clicks++; setTimeout(() => { link.outerHTML = on; }, 200); });
+    await startFresh(Date.now() + 5000);
+    return {off, clicks, on: grokPrivateOn()};
+  }, svgPill(true));
+  assert.deepEqual(out, {off: false, clicks: 1, on: true});
+});
+
+test('grok model selection skips a disabled Build entry and falls back to Expert', async t => {
+  for (const disabled of ['disabled', 'aria-disabled="true"', 'data-disabled=""']) {
+    const page = await openGrok(t, `<form data-composer="true"><button type="button" id="model-select-trigger" aria-label="Model select" style="width:88px;height:32px">Fast</button><textarea style="width:320px;height:48px"></textarea></form>`);
+    const out = await page.evaluate(async disabled => {
+      const pill = document.getElementById('model-select-trigger');
+      const clicked = [];
+      pill.addEventListener('click', () => {
+        document.body.insertAdjacentHTML('beforeend', `<div role="menu"><button role="menuitem" id="build" ${disabled} style="width:120px;height:32px">Build</button><button role="menuitem" id="expert" style="width:120px;height:32px">Expert</button></div>`);
+        for (const el of document.querySelectorAll('[role="menuitem"]')) el.addEventListener('click', () => { clicked.push(el.id); pill.textContent = el.textContent; });
+      });
+      const result = await selectReasoning('grok', 'build', Date.now() + 5000);
+      return {result, clicked, pill: pill.textContent};
+    }, disabled);
+    assert.deepEqual(out, {result: 'selected', clicked: ['expert'], pill: 'Expert'}, disabled);
+  }
+});
+
 test('review on the grok DOM: the sent turn is confirmed, the stream is not collected, then the fenced JSON is', async t => {
   const page = await browser.newPage();
   t.after(() => page.close());

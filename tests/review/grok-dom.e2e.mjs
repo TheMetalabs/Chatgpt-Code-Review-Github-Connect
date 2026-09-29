@@ -286,6 +286,23 @@ test('grok draft text that reads Generating is not a stream; a real banner outsi
     return {draft, banner: grokStreamVisible()};
   });
   assert.deepEqual(out, {draft: {grok: false, stop: false, marked: null}, banner: true});
+
+  // An attachment chip named "Generating" (named group, data-file-name, or title tile) is a file, not status.
+  for (const chip of ['<div role="group" aria-label="Generating" style="width:120px;height:32px"><span>Generating</span></div>',
+    '<div data-file-name="Generating" style="width:120px;height:32px"><span>Generating</span></div>',
+    '<div title="Generating" style="width:120px;height:32px"><span>Generating</span></div>']) {
+    const filePage = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
+      <form data-composer="true">${chip}
+      <textarea style="width:320px;height:48px">Review this diff.</textarea>
+      <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`);
+    const file = await filePage.evaluate(() => {
+      delete globalThis.__ashlarGrokSawStream;
+      const chipOnly = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
+      document.querySelector('form').insertAdjacentHTML('beforeend', '<span>Generating</span>');
+      return {chipOnly, banner: grokStreamVisible()};
+    });
+    assert.deepEqual(file, {chipOnly: {grok: false, stop: false, marked: null}, banner: true}, chip);
+  }
 });
 
 test('a grok model-picker wrapper is neither a staged chip nor the user\'s file; a real file beside it still is', async t => {

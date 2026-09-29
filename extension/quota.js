@@ -77,6 +77,8 @@ function grokStreamVisible(root = document) {
     if (el.children.length || (el.textContent || "").trim() !== "Generating" || !elVisible(el)) continue;
     // The draft editor's own text is the prompt, never provider status.
     if (el.closest('[contenteditable]:not([contenteditable="false"]), textarea, input')) continue;
+    // Nor is an attachment chip's name: a file may be called "Generating" (composer.js fileChips).
+    if (typeof fileChips === "function" && fileChips(form).some(chip => chip.contains(el))) continue;
     if (root === document || root === document.documentElement) markGrokStream();
     return true;
   }

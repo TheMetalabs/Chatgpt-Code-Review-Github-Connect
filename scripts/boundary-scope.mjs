@@ -67,7 +67,10 @@ export function outsideDeclarations(oldText, newText, names, file = "scoped.ts")
 
 /** null when `newText` keeps every line of `oldText`, in order (only additions); otherwise the reason. */
 export function notAdditionsOnly(oldText, newText) {
-  const oldLines = lf(oldText).split("\n"), newLines = lf(newText).split("\n");
+  // Logical lines: a terminal newline ends the last line (no synthetic empty line after it) and empty
+  // text has no lines; real blank lines are kept.
+  const lines = (t) => { const s = lf(t); if (s === "") return []; const l = s.split("\n"); if (l[l.length - 1] === "") l.pop(); return l; };
+  const oldLines = lines(oldText), newLines = lines(newText);
   let j = 0;
   for (let i = 0; i < oldLines.length; i++) {
     while (j < newLines.length && newLines[j] !== oldLines[i]) j++;

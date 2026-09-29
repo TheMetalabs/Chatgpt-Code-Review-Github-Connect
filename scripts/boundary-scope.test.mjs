@@ -68,6 +68,11 @@ test("notAdditionsOnly accepts inserted lines and flags any removed or changed l
   assert.match(notAdditionsOnly("a\nb\nc", "a\nc"), /line 2/);
   assert.match(notAdditionsOnly("a\nb", "b\na"), /line 2/);
   assert.equal(notAdditionsOnly("a\nb", "a\r\nb\r\nc"), null, "CRLF alone is not a change");
+  // #142 review: a terminal newline is not an existing blank line; empty text has no lines.
+  assert.equal(notAdditionsOnly("a\nb\n", "a\nb\nc"), null);
+  assert.equal(notAdditionsOnly("a\r\nb\r\n", "a\r\nb\r\nc"), null);
+  assert.equal(notAdditionsOnly("", "c"), null);
+  assert.match(notAdditionsOnly("a\n\nb\n", "a\nb\n"), /line 2/, "removing a real blank line is still a change");
 });
 
 // End to end: the real checker on a throwaway repository whose scoped runtime file is edited with a
@@ -129,6 +134,26 @@ test("check-local-llm-boundary rejects a binary-diffed scoped edit outside produ
     assert.notEqual(r.status, 0);
     assert.match(r.stdout + r.stderr, /staged version is not a regular file \(mode 120000, symbolic link\)/);
     g("reset", "-q", "--", "src/lib/review-loop-runtime.server.test.ts");
+    // #142 review: a staged deletion (git rm --cached) is rejected whatever the working tree holds.
+    g("rm", "-q", "--cached", "src/lib/review-loop-runtime.server.ts");
+    r = run();
+    assert.notEqual(r.status, 0);
+    assert.match(r.stdout + r.stderr, /review-loop-runtime\.server\.ts.*staged for deletion/);
+    writeFileSync(file, OLD.replace("  return local();", "  return local2();")); // an in-scope tree edit
+    r = run();
+    assert.notEqual(r.status, 0, "an in-scope working-tree copy does not clear the staged deletion");
+    g("add", "src/lib/review-loop-runtime.server.ts");
+    writeFileSync(file, OLD);
+    g("add", "src/lib/review-loop-runtime.server.ts");
+    g("rm", "-q", "--cached", "src/lib/review-loop-runtime.server.test.ts");
+    r = run();
+    assert.match(r.stdout + r.stderr, /review-loop-runtime\.server\.test\.ts.*staged for deletion/);
+    g("add", "src/lib/review-loop-runtime.server.test.ts");
+    // An appended test without a final newline is additions-only.
+    writeFileSync(test, "a\nb\nc");
+    r = run();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    writeFileSync(test, "a\nb\n");
     // #142 review: a CRLF checkout of an LF blob with only an appended line is additions-only...
     writeFileSync(test, "a\r\nb\r\nc\r\n");
     r = run();

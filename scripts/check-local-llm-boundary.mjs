@@ -114,8 +114,13 @@ function scopeViolation(file) {
   try { oldText = execFileSync("git", ["cat-file", "blob", `${BASE}:${file}`], { encoding: "utf8" }); }
   catch { return "not present at the base (a scoped file must already exist)"; }
   // Index: the staged entry's mode must be a regular file (100644/100755), and its blob in scope.
-  const entry = execFileSync("git", ["ls-files", "-s", "--", file], { encoding: "utf8" }).trim();
-  if (entry) {
+  // A scoped file exists at the base, so it must still have exactly one stage-0 index entry: none is a
+  // staged deletion (git rm --cached), whatever the working tree holds.
+  const entries = execFileSync("git", ["ls-files", "-s", "--", file], { encoding: "utf8" }).split("\n").filter(Boolean);
+  if (entries.length === 0) return "staged for deletion (no index entry)";
+  if (entries.length !== 1 || entries[0].split(/\s+/)[2] !== "0") return "has an unmerged index entry";
+  const entry = entries[0];
+  {
     const mode = entry.split(/\s+/, 1)[0];
     if (mode !== "100644" && mode !== "100755") return `staged version is not a regular file (mode ${mode}${mode === "120000" ? ", symbolic link" : ""})`;
     const staged = execFileSync("git", ["cat-file", "blob", `:${file}`], { encoding: "utf8" });

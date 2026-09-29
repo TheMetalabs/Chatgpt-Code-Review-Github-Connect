@@ -94,6 +94,8 @@ const chatFindings=posted(SUMMARY,MF,0,{stamp:'none'});
 const WHY_UNPARSEABLE='the reply was not valid review JSON.';
 const WHY_UNREAD="the reply parsed, but its findings past the gate's row cap were not inspected.";
 const WHY_NOT_VERDICT='the reply could not be used as a complete structured review.';
+const WHY_BOTH_UNPARSEABLE='ChatGPT: the reply was not valid review JSON; Local LLM: the reply was not valid review JSON.';
+const WHY_CHAT_UNPARSEABLE='ChatGPT: the reply was not valid review JSON; Local LLM: ';
 const chatRaw=why=>posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'none',why});
 // local as the fallback beside chat's rejected reply: the merge posts, so that reply is evidence too
 const fallback=(first,marker,requests,extra={})=>posted(first,marker,requests,{stamp:'fallback',...extra,raw:['CHAT-RAW',...(extra.raw??[])]});
@@ -124,7 +126,30 @@ const CELLS={
   'clean x offline':posted(UNVERIFIED,M0U,0,{note:/local verification did not complete \(/,stamp:'verify'}),
   'clean x notRun':posted(CLEAN,M0,0),
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`findings x ${local}`,local==='notRun'?posted(SUMMARY,MF,0):chatFindings])),
-  ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`unparseable x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_UNPARSEABLE}):chatRaw(WHY_UNPARSEABLE)])),
+  // chat salvage (findings=0, pre-gate unparseable / salvaged_no_repair) under verify-clean releases
+  // local as the fallback so Instant/invalid JSON cannot post raw alone and trip loop-error (aicc #598).
+  // Salvage is never CONVERGED. notRun keeps local off, so the salvage posts alone (stamp none).
+  'unparseable x clean':fallback(SUMMARY,MR,1,{why:WHY_UNPARSEABLE}),
+  'unparseable x fencedClean':fallback(SUMMARY,MR,1,{why:WHY_UNPARSEABLE}),
+  'unparseable x unclosedFence':fallback(SUMMARY,MR,1,{why:WHY_UNPARSEABLE}),
+  'unparseable x mimeFencedClean':fallback(SUMMARY,MR,1,{why:WHY_UNPARSEABLE}),
+  'unparseable x sameLineFenceProse':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
+  'unparseable x assumesSkipped':fallback(SUMMARY,MR,1,{why:WHY_UNPARSEABLE}),
+  'unparseable x findings':fallback(SUMMARY,MF,1),
+  'unparseable x unparseable':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW'],why:WHY_BOTH_UNPARSEABLE}),
+  'unparseable x proseThen500':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW']}),
+  'unparseable x multiturnProse':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
+  'unparseable x schemaInvalid':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
+  'unparseable x malformed':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_CHAT_UNPARSEABLE+WHY_NOT_VERDICT}),
+  'unparseable x proseThenClean':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW']}),
+  'unparseable x proseThenMinimal':fallback(SUMMARY,MR,2,{raw:['LOCAL-RAW']}),
+  'unparseable x overflow':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW'],why:WHY_CHAT_UNPARSEABLE+WHY_UNREAD}),
+  'unparseable x proseAndClean':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
+  'unparseable x multiturnProseAndClean':fallback(SUMMARY,MR,1,{raw:['LOCAL-RAW']}),
+  // local ended with nothing usable: chat salvage still posts (gates had the envelope), stamp fallback
+  'unparseable x error':posted(SUMMARY,MR,1,{raw:['CHAT-RAW'],stamp:'fallback',why:WHY_UNPARSEABLE}),
+  'unparseable x offline':posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],stamp:'fallback',why:WHY_UNPARSEABLE}),
+  'unparseable x notRun':posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_UNPARSEABLE}),
   // chat's unread rows are evidence: never verify / verified-clean / clean, local stays held
   ...Object.fromEntries(Object.keys(LOCAL).map(local=>[`overflow x ${local}`,local==='notRun'?posted(SUMMARY,MR,0,{raw:['CHAT-RAW'],why:WHY_UNREAD}):chatRaw(WHY_UNREAD)])),
   // a P1 the gate dropped for its shape leaves chat without a complete verdict: evidence, local held

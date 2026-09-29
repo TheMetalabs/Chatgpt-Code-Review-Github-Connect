@@ -94,11 +94,14 @@ export class JsonRepairService {
     }
   }
   private async requestCandidate(record:RepairRecord,settings:BotSettings,signal:AbortSignal) {
-    const send=(budgeted:boolean)=>(this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
+    // Thinking shares the completion budget (#87). Headroom 8192 (was 4096) leaves room for a
+    // reasoning model to finish re-emitting the original; a length cut-off gets one bumped retry.
+    const budget=(bumped:boolean)=>Math.max(SERVER_DEFAULT_BUDGET,Math.ceil(record.original.length/(bumped?1:2))+(bumped?16384:8192));
+    const send=(budgeted:boolean,bumped=false)=>(this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
       model:record.model,temperature:0,
       // The candidate re-emits the whole original; without a budget omlx stops at its 8192-token
       // default, which includes the model's thinking (#87). A short original never gets less than it.
-      ...(budgeted ? {max_tokens:Math.max(SERVER_DEFAULT_BUDGET,Math.ceil(record.original.length/2)+4096)} : {}),
+      ...(budgeted ? {max_tokens:budget(bumped)} : {}),
       ...(settings.localRepairNoThinking ? {chat_template_kwargs:{enable_thinking:false}} : {}),
       messages:[{
         role:"system",content:[
@@ -115,11 +118,18 @@ export class JsonRepairService {
     },signal);
     try {return await send(true);}
     catch(error){
+      if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw error;
       // vLLM/SGLang refuse prompt + max_tokens beyond the context window before generating anything.
       // Unbudgeted, they fill what is left: the request every repair sent before #87. Sent once only.
-      if(!(error instanceof LocalChatHttpError) || ![400,422].includes(error.status) || signal.aborted || this.fenced.has(record.id) ||
-         !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw error;
-      return await send(false);
+      if(error instanceof LocalChatHttpError && [400,422].includes(error.status))return await send(false);
+      // A length cut-off often means thinking ate the first budget: one retry with a larger one.
+      // Still never more than one automatic retry, and never a replay of an uncertain inference.
+      if(error instanceof LocalChatCutOff && error.finishReason==="length"){
+        const current=this.deps.history().getRepair(record.jobId,record.id);
+        if(current && current.status==="running")this.write({...current,attempts:Math.max(current.attempts,2),updatedAt:Date.now()});
+        return await send(true,true);
+      }
+      throw error;
     }
   }
   status(jobId:string,id:string) {

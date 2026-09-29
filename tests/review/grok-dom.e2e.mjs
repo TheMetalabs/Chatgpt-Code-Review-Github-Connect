@@ -450,6 +450,63 @@ test('a grok stream seen before the user turn had an id still settles once it ge
   assert.deepEqual(out, {during: false, marked: 'n:1', after: true, next: false});
 });
 
+test('a composer wrapper with its editor unmounted is no file and hides no stream', async t => {
+  for (const wrapper of ['<div role="group" aria-label="Composer">', '<div title="Composer">']) {
+    const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
+      <form data-composer="true">${wrapper}<span id="gen">Generating</span>
+      <button type="button" id="stop" aria-label="Stop model response" style="width:64px;height:32px">x</button></div></form>`);
+    const out = await page.evaluate(() => {
+      delete globalThis.__ashlarGrokSawStream;
+      const during = {editor: composer(), files: composerStagedFiles({}, {}), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
+      document.getElementById('gen').remove();
+      document.getElementById('stop').remove();
+      document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
+      document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
+      return {during, after: chatGenerationFinished()};
+    });
+    assert.deepEqual(out, {during: {editor: null, files: [], stop: true, marked: 'user-A'}, after: true}, wrapper);
+  }
+});
+
+test('an id-less grok stream observation is not inherited by a replacement bubble at the same count', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="u1" role="article">review</div></main>
+    <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
+    <button type="button" id="stop" aria-label="Stop model response" style="width:64px;height:32px">x</button></form>`);
+  const out = await page.evaluate(() => {
+    delete globalThis.__ashlarGrokSawStream;
+    chatGenerationFinished();
+    const marked = globalThis.__ashlarGrokSawStream;
+    document.getElementById('stop').remove();
+    document.getElementById('u1').replaceWith(Object.assign(document.createElement('div'), {id: 'u2', textContent: 'other'}));
+    document.getElementById('u2').setAttribute('data-testid', 'user-message');
+    document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" role="article">an answer</div>');
+    document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
+    return {marked, saw: grokSawCurrentStream(), done: chatGenerationFinished()};
+  });
+  assert.deepEqual(out, {marked: 'n:1', saw: false, done: false});
+});
+
+test('a hidden grok private pill earlier in the page never masks the visible one', async t => {
+  const hiddenPill = style => `<a href="/c#private" ${style} class="w-[86px]"><div data-testid="pi-incognito"></div><div data-testid="pi-incognito-fill" class="opacity-0"></div><span>개인</span></a>`;
+  const variants = ['style="display:none;width:86px;height:40px"', 'style="display:inline-flex;visibility:hidden;width:86px;height:40px"', 'aria-hidden="true" style="display:inline-flex;width:86px;height:40px"'];
+  for (const hidden of variants) {
+    for (const on of [true, false]) {
+      const page = await openGrok(t, `${hiddenPill(hidden)}${privatePill(on)}<form data-composer="true"><textarea style="width:320px;height:48px"></textarea></form>`);
+      const out = await page.evaluate(async onPill => {
+        const clicks = [];
+        for (const a of document.querySelectorAll('a')) a.addEventListener('click', e => {
+          e.preventDefault();
+          clicks.push(a.getAttribute('style') || '');
+          setTimeout(() => { a.outerHTML = onPill; }, 200);
+        });
+        await startFresh(Date.now() + 5000);
+        return {clicks: clicks.length, visibleClicked: clicks.every(style => style.startsWith('display:inline-flex;width:86px')), on: grokPrivateOn()};
+      }, privatePill(true));
+      assert.deepEqual(out, {clicks: on ? 0 : 1, visibleClicked: true, on: true}, `${hidden} on=${on}`);
+    }
+  }
+});
+
 test('review on the grok DOM: the sent turn is confirmed, the stream is not collected, then the fenced JSON is', async t => {
   const page = await browser.newPage();
   t.after(() => page.close());

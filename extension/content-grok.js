@@ -82,12 +82,19 @@ function clickExact(labels) {
  * in both states. Off links to /c#private; on links to /c and shows the filled hat (no opacity-0).
  * Clicking the on state leaves private chat, so that control is never used to "start fresh". */
 function grokPrivateToggle() {
-  const icon = document.querySelector("[data-testid='pi-incognito'], [data-testid='pi-incognito-fill']");
-  const link = icon?.closest?.("a");
-  if (!link) return null;
-  const box = link.getBoundingClientRect?.();
-  if (box && (box.width < 24 || box.height < 24)) return null;
-  return link;
+  // Every pill on the page, each link once: a hidden copy (display:none, visibility:hidden,
+  // aria-hidden, or too small) earlier in the DOM never masks the visible top-bar pill.
+  const seen = new Set();
+  for (const icon of document.querySelectorAll("[data-testid='pi-incognito'], [data-testid='pi-incognito-fill']")) {
+    const link = icon.closest?.("a");
+    if (!link || seen.has(link)) continue;
+    seen.add(link);
+    const box = link.getBoundingClientRect?.();
+    if (box && (box.width < 24 || box.height < 24)) continue;
+    if (typeof elVisible === "function" && !elVisible(link)) continue;
+    return link;
+  }
+  return null;
 }
 
 function grokPrivateOn() {

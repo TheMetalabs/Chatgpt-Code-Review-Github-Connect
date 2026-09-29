@@ -532,7 +532,10 @@ function composerStagedFiles(state, submission) {
   const named = fileChips(form)
     .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], [data-testid="chat-submit"], #composer-submit-button, #model-select-trigger') && shown(chip))
     .map(chip => ({chip, names: fileChipNames(chip).filter(name => name.trim())}))
-    .filter(({names}) => names.length);
+    .filter(({names}) => names.length)
+    // While the editor is unmounted (Grok remount) a wrapper no longer shows it holds the composer, so
+    // only a file-shaped chip counts then: a data-file-name tile or a name with an extension.
+    .filter(({chip, names}) => editor || chip.matches("[data-file-name]") || names.some(name => /\.[A-Za-z0-9]{1,8}$/.test(name.trim())));
   return named.filter(({chip}) => !named.some(outer => outer.chip !== chip && outer.chip.contains(chip)))
     // Own by the barrier's own name rule (composer.js chipShowsFile: any case, a truncated or
     // extensionless name), so a chip the barrier waits on is never read as the user's draft.

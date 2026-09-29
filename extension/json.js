@@ -520,7 +520,8 @@ function composerDraftText() {
  * file. */
 function composerStagedFiles(state, submission) {
   const editor = typeof composer === "function" && globalThis.document ? composer() : null;
-  const form = editor?.closest?.("form");
+  // Grok's composer form stays authoritative while its editor is unmounted (composer() is null then).
+  const form = editor?.closest?.("form") || globalThis.document?.querySelector?.("form[data-composer]");
   if (!form) return [];
   const own = new Set(submission?.phase === "sent" ? [] : [...(Array.isArray(submission?.attachments) ? submission.attachments : []),
     ...(Array.isArray(state?.pendingAttachments) ? state.pendingAttachments : [])]);

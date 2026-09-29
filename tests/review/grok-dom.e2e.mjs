@@ -336,6 +336,50 @@ test('grok model selection skips a disabled Build entry and falls back to Expert
   }
 });
 
+test('a user file in the grok composer form is still seen while its editor is unmounted', async t => {
+  const page = await openGrok(t, `<form data-composer="true">
+    <div role="group" aria-label="notes.txt" style="width:120px;height:32px">notes.txt</div>
+    <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`);
+  const out = await page.evaluate(() => {
+    const gap = {editor: composer(), files: composerStagedFiles({}, {})};
+    document.querySelector('form').insertAdjacentHTML('beforeend', '<textarea style="width:320px;height:48px"></textarea>');
+    return {gap, mounted: composerStagedFiles({}, {})};
+  });
+  assert.deepEqual(out, {gap: {editor: null, files: ['notes.txt']}, mounted: ['notes.txt']});
+});
+
+test('grok fallback composer and model pill are signed-in evidence despite a Log in link', async t => {
+  for (const label of ['Model select', '모델 선택']) {
+    const page = await openGrok(t, `<form><textarea style="width:320px;height:48px"></textarea>
+      <button type="button" id="pill" style="width:88px;height:32px">Expert</button></form>
+      <a href="https://accounts.x.com/login" style="width:80px;height:24px">Log in</a>`);
+    // Set from script: the fixture HTML is served without a charset, so a Korean attribute would be mangled.
+    assert.deepEqual(await page.evaluate(label => { document.getElementById('pill').setAttribute('aria-label', label); return {editor: Boolean(composer()), pill: Boolean(grokPill()), loggedOut: grokLoggedOut()}; }, label),
+      {editor: true, pill: true, loggedOut: false}, label);
+  }
+});
+
+test('a transcript stop-button neither hides the grok composer stream nor counts as one', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div>
+    <button type="button" id="old-stop" data-testid="stop-button" style="width:64px;height:32px">x</button></main>
+    <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
+    <button type="button" id="stop" aria-label="Stop model response" style="width:64px;height:32px">x</button></form>`);
+  const out = await page.evaluate(() => {
+    delete globalThis.__ashlarGrokSawStream;
+    const during = chatGenerationFinished();
+    const marked = globalThis.__ashlarGrokSawStream;
+    document.getElementById('stop').remove();
+    const transcriptOnly = stopButtonVisible();
+    document.getElementById('old-stop').remove();
+    document.querySelector('main').insertAdjacentHTML('beforeend',
+      '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
+    document.querySelector('form').insertAdjacentHTML('beforeend',
+      '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
+    return {during, marked, transcriptOnly, after: chatGenerationFinished()};
+  });
+  assert.deepEqual(out, {during: false, marked: 'user-A', transcriptOnly: false, after: true});
+});
+
 test('review on the grok DOM: the sent turn is confirmed, the stream is not collected, then the fenced JSON is', async t => {
   const page = await browser.newPage();
   t.after(() => page.close());

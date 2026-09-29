@@ -128,7 +128,8 @@ test('runner close permission rejects a fresh user turn and a wrong run; a busy 
   // The run starts on the new chat its tab opened (X2, #85); its send moves the page to /c/A.
   const c=content();const users=[];
   c.context.composer=()=>null;
-  c.context.document={querySelectorAll:()=>users,querySelector:()=>users[0]||null};
+  // No composer form on this page (the fake returns user turns for turn selectors only).
+  c.context.document={querySelectorAll:()=>users,querySelector:sel=>/form\[/.test(sel)?null:users[0]||null};
   c.context.runPrompt=async()=>{users.push({textContent:'review A',getAttribute:()=>null});c.context.location={href:'https://chatgpt.com/c/A'};return raw;};
   c.context.stopButtonVisible=()=>false;
   c.message({type:'ashlar-run',jobId:'A',runId:'run-A',provider:'chatgpt',prompt:'review'});await flush();

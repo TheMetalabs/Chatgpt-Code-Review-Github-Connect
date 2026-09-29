@@ -84,20 +84,26 @@ function grokStreamVisible(root = document) {
 }
 
 function stopButtonVisible(root = document) {
-  // A Grok composer stop is this turn's stream even when a generic check sees it first.
-  const seen = el => {
-    if (el.closest?.("form[data-composer]") && (root === document || root === document.documentElement)) markGrokStream();
+  // A Grok page: its composer decides. The composer probe runs first, and a generic stop control only
+  // counts inside the composer, so a transcript control neither hides nor fakes this turn's stream.
+  const grokForm = root.querySelector?.("form[data-composer]");
+  if (grokForm && grokStreamVisible(root)) return true;
+  const counts = el => elVisible(el) && (!grokForm || grokForm.contains(el));
+  const seen = () => {
+    if (grokForm && (root === document || root === document.documentElement)) markGrokStream();
     return true;
   };
-  const stop = root.querySelector('[data-testid="stop-button"]');
-  if (elVisible(stop)) return seen(stop);
+  for (const stop of root.querySelectorAll('[data-testid="stop-button"]')) {
+    if (counts(stop)) return seen();
+    if (!grokForm) break; // Generic layouts: the first stop-button only, as before.
+  }
   for (const el of root.querySelectorAll("button, [role='button']")) {
     const t = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${el.textContent || ""}`.toLowerCase();
     if (!/stop generating|stop streaming|abort|생성 중지|답변 중지/.test(t)) continue;
-    if (!elVisible(el)) continue;
-    return seen(el);
+    if (!counts(el)) continue;
+    return seen();
   }
-  return grokStreamVisible(root);
+  return false;
 }
 
 /** Ancestors of a Grok bubble that hold this answer's action row and no other turn. The composer

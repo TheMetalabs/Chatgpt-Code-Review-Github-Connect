@@ -40,6 +40,8 @@ function sendButton() {
  * positive pauses the grok lane; a miss ends as presend_stalled instead, which is recoverable. */
 function grokLoggedOut() {
   if (document.querySelector('form[data-composer], #model-select-trigger')) return false;
+  // The runner's own composer and model-pill fallbacks are signed-in evidence too.
+  if (composer() || (typeof grokPill === "function" && grokPill())) return false;
   const controls = [...document.querySelectorAll("a[href], button, [role='button']")].filter(el => typeof visible === "function" ? visible(el) : el);
   const hrefOf = el => el.getAttribute("href") || "";
   if (controls.some(el => /accounts\.x\.com|x\.com\/i\/flow\/login|\/sign-in|\/login/i.test(hrefOf(el)))) return true;

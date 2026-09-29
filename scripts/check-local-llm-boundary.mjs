@@ -40,6 +40,10 @@ const ALLOW = new Set([
   "src/lib/local-model-lease.ts",
   "tests/review/local-model-lease.test.mjs",
   "tests/review/local-model-lease.e2e.mjs",
+  // The local fix call only (requestLocalFix): it takes the same lease in the "fix" lane. The chat
+  // (Chrome-bridge) fix path in this file is unchanged.
+  "src/lib/review-loop-runtime.server.ts",
+  "src/lib/review-loop-runtime.server.test.ts",
   "src/lib/local-leg-activity.test.ts",
   "src/lib/review-progress.ts",
   "src/lib/review-history.server.ts",

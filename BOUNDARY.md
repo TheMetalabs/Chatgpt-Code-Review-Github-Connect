@@ -52,6 +52,7 @@ stages and step recording are unchanged.
 | `src/lib/reviewer-progress.ts` | **only** the local provider's in-flight lane (heartbeat freshness); chat/Grok branches stay frozen |
 | `src/lib/reviewer-progress.test.ts` | local-lane rendering tests (chat-lane cases are the frozen-behavior guard) |
 | `src/lib/local-model-lease.ts` (+ `tests/review/local-model-lease.{test,e2e}.mjs`) | **new** — process-wide FIFO lease one review's local leg holds across all its turns; `local_lease_waiting` label + `queuePosition`, `local.lease_acquired` step |
+| `src/lib/review-loop-runtime.server.ts` (+ `.test.ts`) | **only** the local fix call (`requestLocalFix` under `productionRequestFix`): it holds the local-model lease in the `fix` lane; the chat fix path is untouched |
 | `src/lib/local-leg-activity.ts` (+ test) | **new** — local-leg liveness tracker + `ASHLAR_LOCAL_REVIEW_DEADLINE_MS` |
 | `src/lib/review-progress.ts` | **only** the `local_queued` / `local_generating` labels and the optional `keepaliveAt` field |
 | `src/lib/review-history.server.ts` | **only** the `local.accepted` / `local.generating` server-step names |

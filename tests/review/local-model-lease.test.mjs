@@ -109,3 +109,54 @@ test('a granted-but-not-yet-resumed holder is revoked by releaseOwner without it
   assert.deepEqual(lease.snapshot().active, ['C']);
   hc.release();
 });
+
+test('fix lane: a queued fix waits for the holding review, then goes before every queued review', async () => {
+  const lease = new LocalModelLease();
+  const holder = await lease.acquire('R1');
+  const order = [];
+  const take = (owner, lane) => lease.acquire(owner, lane ? {lane} : {}).then(h => { order.push(owner); return h; });
+  const r2 = take('R2');
+  const f1 = take('F1', 'fix');
+  const r3 = take('R3');
+  const f2 = take('F2', 'fix');
+  assert.deepEqual(lease.snapshot(), {active: ['R1'], queued: ['F1', 'F2', 'R2', 'R3']}, 'fixes queue ahead of reviews, FIFO within a lane');
+  await tick();
+  assert.deepEqual(order, [], 'a fix never preempts the review that holds the model');
+  holder.release();
+  for (const p of [f1, f2, r2, r3]) (await p).release();
+  assert.deepEqual(order, ['F1', 'F2', 'R2', 'R3']);
+  assert.deepEqual(lease.snapshot(), {active: [], queued: []});
+});
+
+test('fix lane: queue positions shift when a fix jumps ahead of waiting reviews', async () => {
+  const lease = new LocalModelLease();
+  const holder = await lease.acquire('R1');
+  const seen = [];
+  const r2 = lease.acquire('R2', {onPosition: p => seen.push(p)});
+  const f = lease.acquire('F', {lane: 'fix'});
+  assert.deepEqual(seen, [1, 2], 'the waiting review is told it moved back behind the fix');
+  holder.release();
+  (await f).release();
+  (await r2).release();
+  assert.deepEqual(seen, [1, 2, 1]);
+});
+
+test('fix lane: abort while queued leaves the queue, the reviews behind it keep their order', async () => {
+  const lease = new LocalModelLease();
+  const holder = await lease.acquire('R1');
+  const ctl = new AbortController();
+  const f = lease.acquire('F', {lane: 'fix', signal: ctl.signal});
+  const r2 = lease.acquire('R2');
+  ctl.abort(new Error('fix cancelled'));
+  await assert.rejects(f, /fix cancelled/);
+  assert.deepEqual(lease.snapshot(), {active: ['R1'], queued: ['R2']});
+  holder.release();
+  (await r2).release();
+});
+
+test('fix lane: an idle model is granted to a fix at once', async () => {
+  const lease = new LocalModelLease();
+  const f = await lease.acquire('F', {lane: 'fix'});
+  assert.deepEqual(lease.snapshot(), {active: ['F'], queued: []});
+  f.release();
+});

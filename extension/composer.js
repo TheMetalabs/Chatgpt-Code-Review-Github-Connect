@@ -635,6 +635,30 @@ function renderedControl(el) {
   const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0;
 }
 
+/** Grok's composer (grok.com bundle, 2026-09) marks its attachments by structure: the form holds ONE
+ * list, [role="list"] (aria-label "Conversation attachments", localized), whose [role="listitem"]
+ * children are the file chips: an "Open attachment" button with the icon and span.truncate (the file
+ * name), then Remove/Retry buttons. The editor, the model picker and the streaming strip are siblings
+ * of that list, never inside it, so on Grok a chip is a list item and nothing else: no label-text or
+ * title guessing (that is the ChatGPT heuristic below), no dependency on the editor being mounted. */
+function grokComposerForm(form) {
+  return Boolean(form?.matches?.("form[data-composer]"));
+}
+function grokAttachmentItems(form) {
+  return [...form.querySelectorAll('[role="list"] > [role="listitem"]')];
+}
+function grokAttachmentItem(el) {
+  return Boolean(el?.matches?.('[role="listitem"]') && el.parentElement?.matches?.('[role="list"]') && el.closest?.("form[data-composer]"));
+}
+/** A Grok chip's file name: its span.truncate, else the first text leaf of its first button. */
+function grokAttachmentName(item) {
+  const norm = el => (el?.textContent || "").replace(/\s+/g, " ").trim();
+  const label = item.querySelector("span.truncate");
+  if (norm(label)) return norm(label);
+  const leaf = [...(item.querySelector("button")?.querySelectorAll("*") || [])].find(el => !el.children.length && norm(el));
+  return norm(leaf);
+}
+
 /** The file-chip shapes a composer renders for a staged attachment: a named group, a data-file-name
  * tile, or an element that names its file only in its title. ONE list (fileChips) for the send
  * barrier (attachmentsReady: the run's own files are there) and the release verdict (json.js
@@ -650,14 +674,14 @@ function composerControlSelector() {
   const roles = ["button", "link", "menuitem", "menuitemcheckbox", "menuitemradio", "switch", "checkbox", "radio", "combobox",
     "option", "tab", "textbox", "slider"].map(role => `[role="${role}"]`);
   return ["button", "a[href]", "input", "select", "textarea", "label", "summary", "[aria-haspopup]", ...roles,
-    "#composer-submit-button", '[data-testid="send-button"]', '[data-testid="stop-button"]',
-    '[data-testid="chat-submit"]', '[data-testid="bot-voice-call-start"]', "#model-select-trigger"].join(", ");
+    "#composer-submit-button", '[data-testid="send-button"]', '[data-testid="stop-button"]'].join(", ");
 }
 /** The file chips in a composer form: every element in a fileChipSelector shape, except a control
  * that is a chip only by its title (its tooltip: "Send prompt", "Start voice mode"). A named group or
  * a data-file-name tile is a chip whatever element renders it. The barrier and the verdict both read
  * this list, so neither takes a control's tooltip for a file (Ashlar, review of 5af999fd). */
 function fileChips(form) {
+  if (grokComposerForm(form)) return grokAttachmentItems(form);
   const named = [...form.querySelectorAll(fileChipSelector())]
     .filter(chip => chip.matches('[role="group"][aria-label], [data-file-name]') || !chip.matches(composerControlSelector()));
   // The new home composer (live #93, 1.1.39 probe) renders a staged file as a card whose file name is
@@ -671,6 +695,10 @@ function fileChips(form) {
 
 /** Every name a file chip gives its file, in its shapes' order (data-file-name, aria-label, title). */
 function fileChipNames(chip) {
+  if (grokAttachmentItem(chip)) {
+    const name = grokAttachmentName(chip);
+    return name ? [name] : [];
+  }
   const names = ["data-file-name", "aria-label", "title"].map(name => chip.getAttribute(name)).filter(name => name !== null);
   if (!names.length && chip.children.length === 0) names.push((chip.textContent || "").trim());
   return names;
@@ -685,6 +713,8 @@ function chipUploading(chip) {
     '[class*="animate-spin"], [class*="spinner" i], [class*="loading" i], [class*="progress" i], ' +
     '[aria-label*="uploading" i], [aria-label*="loading" i], [aria-label*="업로드 중"], circle[stroke-dashoffset]';
   if (chip.matches(busy) || [...chip.querySelectorAll(busy)].some(renderedControl)) return true;
+  // Grok pulses a chip whose upload has no metadata yet.
+  if (grokAttachmentItem(chip) && (chip.matches('[class*="animate-pulse"]') || chip.querySelector('[class*="animate-pulse"]'))) return true;
   return /uploading|업로드 중/i.test(chip.innerText ?? chip.textContent ?? "");
 }
 
@@ -714,6 +744,7 @@ function fileNameShown(shown, name) {
 /** Every name a chip shows its file under: its attributes (fileChipNames) and the short text of the
  * elements inside it (the visible, possibly truncated, name line). */
 function chipShownNames(chip) {
+  if (grokAttachmentItem(chip)) return fileChipNames(chip);
   const texts = [...chip.querySelectorAll("*")].filter(el => !el.children.length)
     .map(el => (el.textContent || "").replace(/\s+/g, " ").trim()).filter(text => text && text.length <= 120);
   return [...fileChipNames(chip), ...texts];
@@ -725,13 +756,15 @@ function chipShowsFile(chip, name) {
 /** The rendered chips in a form that could be a staged file's: never an element that holds the editor
  * or the send control (that is the composer, not a file). */
 function stagedChips(form) {
-  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"], [data-testid="chat-submit"], #model-select-trigger';
+  if (grokComposerForm(form)) return grokAttachmentItems(form).filter(renderedControl);
+  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"]';
   return fileChips(form).filter(chip => renderedControl(chip) && !chip.matches(editorish) && !chip.querySelector(editorish));
 }
 /** A chip's card: the largest ancestor inside the form that holds this chip and no other file chip,
  * editor or send control. A file's progress ring can sit beside its named element in that card. */
 function chipCard(chip, form, chips) {
-  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"], [data-testid="chat-submit"], #model-select-trigger';
+  if (grokAttachmentItem(chip)) return chip;
+  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"]';
   let card = chip;
   for (let up = chip.parentElement; up && up !== form && form.contains(up); up = up.parentElement) {
     if (up.querySelector(editorish) || chips.some(other => !chip.contains(other) && !other.contains(chip) && up.contains(other))) break;

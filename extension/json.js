@@ -520,22 +520,22 @@ function composerDraftText() {
  * file. */
 function composerStagedFiles(state, submission) {
   const editor = typeof composer === "function" && globalThis.document ? composer() : null;
-  // Grok's composer form stays authoritative while its editor is unmounted (composer() is null then).
-  const form = editor?.closest?.("form") || globalThis.document?.querySelector?.("form[data-composer]");
+  // Grok's composer form is found by itself, so its attachment list is read while the editor remounts.
+  const grokForm = globalThis.document?.querySelector?.("form[data-composer]");
+  const form = grokForm || editor?.closest?.("form");
   if (!form) return [];
+  const grok = typeof grokComposerForm === "function" && grokComposerForm(form);
   const own = new Set(submission?.phase === "sent" ? [] : [...(Array.isArray(submission?.attachments) ? submission.attachments : []),
     ...(Array.isArray(state?.pendingAttachments) ? state.pendingAttachments : [])]);
   const shown = chip => (typeof renderedControl === "function" ? renderedControl(chip) : !hiddenNode(chip));
   // Names first, then the fold: only a chip that names a file takes in the elements inside it. An
   // unnamed element (an empty or blank title or label) is no chip, so a wrapper like that never hides
   // the named chip inside it (Ashlar, review of 5af999fd: the user's staged file closed with the tab).
+  // Grok's chips are its attachment list items (composer.js grokAttachmentItems): no wrapper test.
   const named = fileChips(form)
-    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], [data-testid="chat-submit"], #composer-submit-button, #model-select-trigger') && shown(chip))
+    .filter(chip => (grok || (!chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button'))) && shown(chip))
     .map(chip => ({chip, names: fileChipNames(chip).filter(name => name.trim())}))
-    .filter(({names}) => names.length)
-    // While the editor is unmounted (Grok remount) a wrapper no longer shows it holds the composer, so
-    // only a file-shaped chip counts then: a data-file-name tile or a name with an extension.
-    .filter(({chip, names}) => editor || chip.matches("[data-file-name]") || names.some(name => /\.[A-Za-z0-9]{1,8}$/.test(name.trim())));
+    .filter(({names}) => names.length);
   return named.filter(({chip}) => !named.some(outer => outer.chip !== chip && outer.chip.contains(chip)))
     // Own by the barrier's own name rule (composer.js chipShowsFile: any case, a truncated or
     // extensionless name), so a chip the barrier waits on is never read as the user's draft.

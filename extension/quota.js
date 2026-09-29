@@ -72,53 +72,44 @@ function grokSawCurrentStream() {
   return Boolean(turn && turn.isConnected && turn === users[users.length - 1] && saw === `n:${users.length}`);
 }
 
-/** Whether `el` is a staged file chip's own name (composer.js stagedChips / fileChipNames): a file
- * named "Stop" or "Generating" is no status. Only the chip's name counts, so a composer wrapper whose
- * label differs (a named group around the editor, even while it is unmounted) hides nothing. */
-function inGrokFileChip(form, el, shown) {
-  if (typeof stagedChips !== "function" || typeof fileChipNames !== "function") return false;
-  const want = String(shown || "").replace(/\s+/g, " ").trim();
-  return Boolean(want) && stagedChips(form).some(chip => chip.contains(el) &&
-    fileChipNames(chip).some(name => String(name).replace(/\s+/g, " ").trim() === want));
+/** Grok's in-flight composer, read by structure (grok.com bundle, 2026-09). While a reply streams, the
+ * form's content opens with a strip holding the loader, div[role="status"][aria-live] whose text is
+ * "Generating" (hardcoded English), and the stop button (aria-label "Stop model response", localized
+ * "모델 응답 중지"); the action slot beside the editor may become an abort button with the same label.
+ * The attachment list ([role="list"]) and the draft editor are never status: a file named
+ * "Generating" or "Stop" and a prompt line are just content there. */
+function grokNotStatusArea(el) {
+  return Boolean(el.closest('[role="list"], [contenteditable]:not([contenteditable="false"]), textarea, input'));
 }
-
-/** Grok's in-flight composer (grok.com, 2026-09). Submit is removed while generating; the form shows
- * a stop control ("Stop model response", localized) and a leaf whose text is exactly "Generating"
- * (hardcoded English, not the locale catalog). Scoped to the composer so a transcript that says
- * "stop" is not a stream, and so a later request's stop is not inside an older answer. */
+function grokStatusStrip(form) {
+  for (const status of form.querySelectorAll('[role="status"]')) {
+    if (grokNotStatusArea(status) || !elVisible(status)) continue;
+    if (/^Generating\b/.test((status.textContent || "").trim())) return status;
+  }
+  return null;
+}
+function grokStopControl(form) {
+  for (const el of form.querySelectorAll("button, [role='button']")) {
+    const label = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    if (!/^(?:stop model response|모델 응답 중지)$/i.test(label) || grokNotStatusArea(el) || !elVisible(el)) continue;
+    return el;
+  }
+  return null;
+}
 function grokStreamVisible(root = document) {
   const form = root.querySelector?.("form[data-composer]");
-  if (!form) return false;
-  const stopLabel = /stop model response|stop generating|stop streaming|^abort$|중지|중단|정지|^stop$/i;
-  for (const el of form.querySelectorAll("button, [role='button']")) {
-    if (el.id === "model-select-trigger") continue;
-    const testid = el.getAttribute("data-testid") || "";
-    if (testid === "chat-submit" || testid === "bot-voice-call-start") continue;
-    const label = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-    if (!label || label.length > 48 || !stopLabel.test(label) || !elVisible(el)) continue;
-    if (inGrokFileChip(form, el, label)) continue;
-    if (root === document || root === document.documentElement) markGrokStream();
-    return true;
-  }
-  for (const el of form.querySelectorAll("span, div, p")) {
-    if (el.children.length || (el.textContent || "").trim() !== "Generating" || !elVisible(el)) continue;
-    // The draft editor's own text is the prompt, never provider status.
-    if (el.closest('[contenteditable]:not([contenteditable="false"]), textarea, input')) continue;
-    // Nor is an attachment chip's name: a file may be called "Generating".
-    if (inGrokFileChip(form, el, "Generating")) continue;
-    if (root === document || root === document.documentElement) markGrokStream();
-    return true;
-  }
-  return false;
+  if (!form || !(grokStatusStrip(form) || grokStopControl(form))) return false;
+  if (root === document || root === document.documentElement) markGrokStream();
+  return true;
 }
 
 function stopButtonVisible(root = document) {
   // A Grok page: its composer decides. The composer probe runs first, and a generic stop control only
-  // counts inside the composer, so a transcript control neither hides nor fakes this turn's stream.
+  // counts inside the composer and outside its attachment list and editor, so neither a transcript
+  // control nor a file's name fakes (or hides) this turn's stream.
   const grokForm = root.querySelector?.("form[data-composer]");
   if (grokForm && grokStreamVisible(root)) return true;
-  const counts = el => elVisible(el) && (!grokForm || (grokForm.contains(el) &&
-    !inGrokFileChip(grokForm, el, el.getAttribute("aria-label") || el.getAttribute("data-file-name") || el.textContent)));
+  const counts = el => elVisible(el) && (!grokForm || (grokForm.contains(el) && !grokNotStatusArea(el)));
   const seen = () => {
     if (grokForm && (root === document || root === document.documentElement)) markGrokStream();
     return true;

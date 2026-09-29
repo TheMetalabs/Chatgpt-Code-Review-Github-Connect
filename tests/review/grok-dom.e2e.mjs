@@ -1,7 +1,11 @@
-// Grok's 2026-09 composer and transcript (grok.com bundle): form[data-composer], submit
-// data-testid=chat-submit (aria-label localized, often "제출"), bubbles data-testid
-// user-message / assistant-message, and a stream that removes Submit and shows "Stop model
-// response" (or "모델 응답 중지") plus a leaf "Generating". A synthetic page, never a live chat.
+// Grok's 2026-09 composer and transcript, built to the structure of the grok.com bundle and the live
+// page (probed read-only 2026-09-29): form[data-composer]; the attachment list [role="list"] whose
+// [role="listitem"] chips hold an "Open attachment" button with span.truncate (the file name); the
+// editor in [data-testid="chat-input"]; the model picker div[data-query-bar-mode-select] >
+// #model-select-trigger; submit data-testid=chat-submit (aria-label localized, often "제출"); and,
+// while a reply streams, a strip with div[role="status"][aria-live] "Generating" (plus dots) and the
+// stop button "Stop model response" (or "모델 응답 중지"). Bubbles are data-testid user-message /
+// assistant-message. A synthetic page, never a live chat.
 import {test, before, after} from 'node:test';
 import assert from 'node:assert/strict';
 import {source} from './load-source.mjs';
@@ -28,11 +32,27 @@ async function openGrok(t, body, url = HOME) {
   return page;
 }
 
+/** Grok's streaming strip: the loader (role=status, "Generating" + three dots) and the stop button. */
+function grokStrip(stop = 'Stop model response') {
+  return `<div class="w-full flex justify-center" id="grok-strip"><div class="h-8 rounded-t-xl" style="display:flex;width:320px;height:32px">` +
+    `<div role="status" aria-live="polite" id="grok-generating" style="display:inline-flex"><span>Generating</span><span><span>.</span><span>.</span><span>.</span></span></div>` +
+    `<button type="button" id="grok-stop" aria-label="${stop}" style="width:32px;height:32px">x</button></div></div>`;
+}
+/** One Grok attachment chip (list item) showing `name`; `uploading` pulses it as Grok does before metadata. */
+function grokChip(name, {uploading = false} = {}) {
+  return `<div role="listitem" class="max-w-full"><div class="group/chip${uploading ? ' animate-pulse' : ''}" style="display:inline-flex;width:220px;height:32px">` +
+    `<button type="button" aria-label="Open attachment" style="display:inline-flex;width:180px;height:32px"><svg width="16" height="16"></svg><span class="truncate">${name}</span></button>` +
+    `<button type="button" aria-label="Remove" style="width:20px;height:20px">x</button></div></div>`;
+}
+function grokList(chips = []) {
+  return `<div role="list" aria-label="Conversation attachments" style="display:flex">${chips.join('')}</div>`;
+}
+
 const COMPOSER = `<form data-composer="true">
+  ${grokList([grokChip('ashlar-diff.patch')])}
   <button id="model-select-trigger" aria-label="Model select" style="width:88px;height:32px">Heavy</button>
   <textarea aria-label="Ask Grok anything" style="width:320px;height:48px"></textarea>
   <button type="submit" data-testid="chat-submit" aria-label="제출" title="Submit" style="width:64px;height:32px">제출</button>
-  <span>ashlar-diff.patch</span>
   <a href="https://accounts.x.com/login" style="width:80px;height:24px">Log in</a>
 </form>
 <button type="submit" id="decoy" aria-label="Send" style="width:64px;height:32px">Send</button>`;
@@ -83,15 +103,14 @@ test('grok transcript, stream, and composer: roles, code, submit, and done only 
   assert.deepEqual(idle, {done: false, streaming: false});
 
   // Korean stop label and the hardcoded Generating banner both count, and neither finishes the answer.
-  const streaming = await page.evaluate(() => {
+  const streaming = await page.evaluate(strip => {
     document.querySelector('[data-testid="chat-submit"]').remove();
-    document.querySelector('form').insertAdjacentHTML('beforeend',
-      '<button type="button" id="grok-stop" aria-label="모델 응답 중지" style="width:64px;height:32px">x</button><span id="grok-generating">Generating</span>');
+    document.querySelector('form').insertAdjacentHTML('afterbegin', strip);
     const withButton = stopButtonVisible();
     document.getElementById('grok-stop').remove();
     const bannerOnly = stopButtonVisible();
     return {withButton, bannerOnly, done: replyDoneVisible(), marked: globalThis.__ashlarGrokSawStream};
-  });
+  }, grokStrip('모델 응답 중지'));
   assert.equal(streaming.withButton, true);
   assert.equal(streaming.bannerOnly, true);
   assert.equal(streaming.done, false);
@@ -273,53 +292,60 @@ test('grok private-chat entry never clicks past its deadline', async t => {
   }
 });
 
-test('grok draft text that reads Generating is not a stream; a real banner outside the editor is', async t => {
+test('grok stream status is the composer\'s status strip and stop button, never the draft or an attachment name', async t => {
   const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
-    <form data-composer="true">
-      <div contenteditable="true" aria-label="Ask Grok anything" style="width:320px;min-height:48px"><p>Review this diff.</p><p>Generating</p><p>more prompt text</p></div>
+    <form data-composer="true">${grokList(['Generating', 'Generating.txt', 'Stop', 'Stop model response', 'Abort'].map(name => grokChip(name)))}
+      <div data-testid="chat-input"><div contenteditable="true" role="textbox" aria-label="Ask Grok anything" style="width:320px;min-height:48px"><p>Review this diff.</p><p>Generating</p><p>Stop model response</p></div></div>
       <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button>
     </form>`);
-  const out = await page.evaluate(() => {
+  const out = await page.evaluate(strip => {
     delete globalThis.__ashlarGrokSawStream;
-    const draft = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
-    document.querySelector('form').insertAdjacentHTML('beforeend', '<span id="banner">Generating</span>');
-    return {draft, banner: grokStreamVisible()};
-  });
-  assert.deepEqual(out, {draft: {grok: false, stop: false, marked: null}, banner: true});
+    const idle = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null,
+      ready: attachmentStates(document.querySelector('form'), ['Generating.txt'])[0].state};
+    document.querySelector('form').insertAdjacentHTML('afterbegin', strip);
+    const streaming = {grok: grokStreamVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
+    document.getElementById('grok-stop').remove();
+    const statusOnly = grokStreamVisible();
+    document.getElementById('grok-generating').remove();
+    return {idle, streaming, statusOnly, after: grokStreamVisible()};
+  }, grokStrip());
+  assert.deepEqual(out, {idle: {grok: false, stop: false, marked: null, ready: 'ready'}, streaming: {grok: true, marked: 'user-A'}, statusOnly: true, after: false});
+});
 
-  // An attachment chip named "Generating" (named group, data-file-name, or title tile) is a file, not status.
-  for (const chip of ['<div role="group" aria-label="Generating" style="width:120px;height:32px"><span>Generating</span></div>',
-    '<div data-file-name="Generating" style="width:120px;height:32px"><span>Generating</span></div>',
-    '<div title="Generating" style="width:120px;height:32px"><span>Generating</span></div>']) {
-    const filePage = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
-      <form data-composer="true">${chip}
-      <textarea style="width:320px;height:48px">Review this diff.</textarea>
-      <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`);
-    const file = await filePage.evaluate(() => {
-      delete globalThis.__ashlarGrokSawStream;
-      const chipOnly = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
-      document.querySelector('form').insertAdjacentHTML('beforeend', '<span>Generating</span>');
-      return {chipOnly, banner: grokStreamVisible()};
-    });
-    assert.deepEqual(file, {chipOnly: {grok: false, stop: false, marked: null}, banner: true}, chip);
+test('grok attachment chips are the attachment list items: not the model picker or a composer wrapper, with or without the editor', async t => {
+  const picker = [
+    '<div data-query-bar-mode-select="true"><button type="button" id="model-select-trigger" aria-label="모델 선택" style="width:88px;height:32px">자동</button></div>',
+    '<div role="group" aria-label="Model" style="width:100px;height:32px"><button type="button" aria-label="Model select" style="width:88px;height:32px">Expert</button></div>',
+  ];
+  for (const model of picker) {
+    const page = await openGrok(t, `<form data-composer="true"><div role="group" aria-label="Composer" title="Composer" style="width:400px;height:120px">
+      ${grokList()}<div data-testid="chat-input"><textarea id="editor" style="width:320px;height:48px"></textarea></div>${model}</div></form>`);
+    const out = await page.evaluate(({chips}) => {
+      const form = document.querySelector('form');
+      const empty = {chips: stagedChips(form).length, foreign: composerStagedFiles({}, {})};
+      document.querySelector('[role="list"]').insertAdjacentHTML('beforeend', chips);
+      const withFiles = composerStagedFiles({}, {});
+      document.getElementById('editor').remove();
+      const remount = {editor: composer(), foreign: composerStagedFiles({}, {})};
+      form.querySelector('[data-testid="chat-input"]').insertAdjacentHTML('beforeend', '<textarea style="width:320px;height:48px"></textarea>');
+      return {empty, withFiles, remount, mounted: composerStagedFiles({}, {}), sent: composerStagedFiles({}, {phase: 'sent', attachments: ['notes']})};
+    }, {chips: ['notes', 'README', 'ashlar-diff.patch'].map(name => grokChip(name)).join('')});
+    const all = ['notes', 'README', 'ashlar-diff.patch'];
+    assert.deepEqual(out, {empty: {chips: 0, foreign: []}, withFiles: all, remount: {editor: null, foreign: all}, mounted: all, sent: all}, model);
   }
 });
 
-test('a grok model-picker wrapper is neither a staged chip nor the user\'s file; a real file beside it still is', async t => {
-  for (const wrapper of ['<div role="group" aria-label="Model">', '<div title="Model">']) {
-    const page = await openGrok(t, `<form data-composer="true">
-      ${wrapper}<button type="button" id="model-select-trigger" aria-label="Model select" style="width:88px;height:32px">Expert</button></div>
-      <textarea aria-label="Ask Grok anything" style="width:320px;height:48px"></textarea>
-      <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button>
-    </form>`);
-    const out = await page.evaluate(() => {
-      const form = document.querySelector('form');
-      const empty = {chips: stagedChips(form).length, foreign: composerStagedFiles({}, {})};
-      form.insertAdjacentHTML('afterbegin', '<div role="group" aria-label="notes.txt" style="width:120px;height:32px">notes.txt</div>');
-      return {empty, withFile: composerStagedFiles({}, {})};
-    });
-    assert.deepEqual(out, {empty: {chips: 0, foreign: []}, withFile: ['notes.txt']}, wrapper);
-  }
+test('the run\'s own grok chip is ready once its pulse stops; a user file beside it stays foreign', async t => {
+  const page = await openGrok(t, `<form data-composer="true">${grokList([grokChip('ashlar-diff.patch', {uploading: true}), grokChip('notes')])}
+    <div data-testid="chat-input"><textarea style="width:320px;height:48px"></textarea></div></form>`);
+  const out = await page.evaluate(() => {
+    const form = document.querySelector('form');
+    const before = attachmentStates(form, ['ashlar-diff.patch'])[0].state;
+    form.querySelector('.animate-pulse').classList.remove('animate-pulse');
+    return {before, after: attachmentStates(form, ['ashlar-diff.patch'])[0].state,
+      foreign: composerStagedFiles({}, {phase: 'prepared', attachments: ['ashlar-diff.patch']})};
+  });
+  assert.deepEqual(out, {before: 'uploading', after: 'ready', foreign: ['notes']});
 });
 
 test('an off-state grok pill with an SVG icon is not private; the click that turns it on is taken once', async t => {
@@ -351,18 +377,6 @@ test('grok model selection skips a disabled Build entry and falls back to Expert
     }, disabled);
     assert.deepEqual(out, {result: 'selected', clicked: ['expert'], pill: 'Expert'}, disabled);
   }
-});
-
-test('a user file in the grok composer form is still seen while its editor is unmounted', async t => {
-  const page = await openGrok(t, `<form data-composer="true">
-    <div role="group" aria-label="notes.txt" style="width:120px;height:32px">notes.txt</div>
-    <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`);
-  const out = await page.evaluate(() => {
-    const gap = {editor: composer(), files: composerStagedFiles({}, {})};
-    document.querySelector('form').insertAdjacentHTML('beforeend', '<textarea style="width:320px;height:48px"></textarea>');
-    return {gap, mounted: composerStagedFiles({}, {})};
-  });
-  assert.deepEqual(out, {gap: {editor: null, files: ['notes.txt']}, mounted: ['notes.txt']});
 });
 
 test('grok fallback composer and model pill are signed-in evidence despite a Log in link', async t => {
@@ -397,38 +411,6 @@ test('a transcript stop-button neither hides the grok composer stream nor counts
   assert.deepEqual(out, {during: false, marked: 'user-A', transcriptOnly: false, after: true});
 });
 
-test('a grok file chip named Stop or Abort is not a stop control; a real stop beside it still is', async t => {
-  for (const name of ['Stop', 'Abort', 'Stop generating']) {
-    const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
-      <form data-composer="true"><button type="button" data-file-name="${name}" aria-label="${name}" style="width:120px;height:32px">${name}</button>
-      <textarea style="width:320px;height:48px">Review this diff.</textarea>
-      <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`);
-    const out = await page.evaluate(() => {
-      delete globalThis.__ashlarGrokSawStream;
-      const file = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
-      document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" aria-label="Stop model response" style="width:64px;height:32px">x</button>');
-      return {file, real: stopButtonVisible()};
-    });
-    assert.deepEqual(out, {file: {grok: false, stop: false, marked: null}, real: true}, name);
-  }
-});
-
-test('a real Generating banner inside a composer wrapper is the stream, and the answer then settles', async t => {
-  for (const wrapper of ['<div role="group" aria-label="Composer">', '<div title="Composer">']) {
-    const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
-      <form data-composer="true">${wrapper}<textarea style="width:320px;height:48px"></textarea><span id="gen">Generating</span></div></form>`);
-    const out = await page.evaluate(() => {
-      delete globalThis.__ashlarGrokSawStream;
-      const during = {stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
-      document.getElementById('gen').remove();
-      document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
-      document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
-      return {during, after: chatGenerationFinished()};
-    });
-    assert.deepEqual(out, {during: {stop: true, marked: 'user-A'}, after: true}, wrapper);
-  }
-});
-
 test('a grok stream seen before the user turn had an id still settles once it gets one; a later turn does not inherit it', async t => {
   const page = await openGrok(t, `<main><div data-testid="user-message" id="u1" role="article">review</div></main>
     <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
@@ -448,24 +430,6 @@ test('a grok stream seen before the user turn had an id still settles once it ge
     return {during, marked, after, next: chatGenerationFinished()};
   });
   assert.deepEqual(out, {during: false, marked: 'n:1', after: true, next: false});
-});
-
-test('a composer wrapper with its editor unmounted is no file and hides no stream', async t => {
-  for (const wrapper of ['<div role="group" aria-label="Composer">', '<div title="Composer">']) {
-    const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
-      <form data-composer="true">${wrapper}<span id="gen">Generating</span>
-      <button type="button" id="stop" aria-label="Stop model response" style="width:64px;height:32px">x</button></div></form>`);
-    const out = await page.evaluate(() => {
-      delete globalThis.__ashlarGrokSawStream;
-      const during = {editor: composer(), files: composerStagedFiles({}, {}), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
-      document.getElementById('gen').remove();
-      document.getElementById('stop').remove();
-      document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
-      document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
-      return {during, after: chatGenerationFinished()};
-    });
-    assert.deepEqual(out, {during: {editor: null, files: [], stop: true, marked: 'user-A'}, after: true}, wrapper);
-  }
 });
 
 test('an id-less grok stream observation is not inherited by a replacement bubble at the same count', async t => {
@@ -514,7 +478,7 @@ test('review on the grok DOM: the sent turn is confirmed, the stream is not coll
     `<main id="thread"></main><form data-composer="true"><button id="model-select-trigger" aria-label="Model select" style="width:88px;height:32px">Heavy</button><textarea id="prompt" aria-label="Ask Grok anything" style="width:320px;height:48px">${PROMPT}</textarea><button id="chat-submit" type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`)}));
   await page.clock.install();
   await page.goto(HOME);
-  await page.evaluate(({prompt}) => {
+  await page.evaluate(({prompt, strip}) => {
     sessionStorage.setItem('ashlar:job', 'job-A');
     sessionStorage.setItem('ashlar:run', 'run-A');
     sessionStorage.setItem('ashlar:submission:job-A:run-A', JSON.stringify({phase: 'prepared', expected: prompt, baseline: 0, attachments: []}));
@@ -528,9 +492,9 @@ test('review on the grok DOM: the sent turn is confirmed, the stream is not coll
       document.getElementById('thread').insertAdjacentHTML('beforeend', `<div data-testid="user-message" id="response-user-A" role="article" aria-label="You">${text}</div>`);
       editor.value = '';
       document.getElementById('chat-submit').remove();
-      document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" id="grok-stop" aria-label="Stop model response" style="width:64px;height:32px">x</button><span id="grok-generating">Generating</span>');
+      document.querySelector('form').insertAdjacentHTML('afterbegin', strip);
     });
-  }, {prompt: PROMPT});
+  }, {prompt: PROMPT, strip: grokStrip()});
   for (const file of MANIFEST) await page.addScriptTag({content: source('extension/' + file)});
   const send = (type, extra = {}) => page.evaluate(msg => new Promise(resolve => { if (msg.type === 'ashlar-run') msg.until = Date.now() + 10_000; receiver(msg, null, resolve); }), {type, jobId: 'job-A', runId: 'run-A', provider: 'grok', ...extra});
   const journal = () => page.evaluate(() => JSON.parse(sessionStorage.getItem('ashlar:submission:job-A:run-A') || 'null'));

@@ -348,6 +348,22 @@ test('the run\'s own grok chip is ready once its pulse stops; a user file beside
   assert.deepEqual(out, {before: 'uploading', after: 'ready', foreign: ['notes']});
 });
 
+test('grok attachment names are never upload progress or a quota notice', async t => {
+  const names = ['uploading.md', '업로드 중.txt', 'out of quota.txt', 'too many requests.md'];
+  const page = await openGrok(t, `<form data-composer="true">${grokList()}
+    <div data-testid="chat-input"><textarea style="width:320px;height:48px"></textarea></div>
+    <button type="submit" data-testid="chat-submit" aria-label="Submit" style="width:64px;height:32px">Submit</button></form>`);
+  // Chips go in from script: the fixture HTML is served without a charset (a Korean name would be mangled).
+  const out = await page.evaluate(({names, chips}) => {
+    const form = document.querySelector('form');
+    form.querySelector('[role="list"]').insertAdjacentHTML('beforeend', chips);
+    const before = {states: attachmentStates(form, names).map(entry => entry.state), ready: attachmentsReady(form, names), quota: quotaHit()};
+    document.body.insertAdjacentHTML('beforeend', '<div role="alert" style="width:300px;height:40px">You\'ve reached your usage limit</div>');
+    return {before, notice: quotaHit()};
+  }, {names, chips: names.map(name => grokChip(name)).join('')});
+  assert.deepEqual(out, {before: {states: names.map(() => 'ready'), ready: true, quota: false}, notice: true});
+});
+
 test('an off-state grok pill with an SVG icon is not private; the click that turns it on is taken once', async t => {
   const svgPill = on => `<a href="${on ? '/c' : '/c#private'}" aria-label="Private" style="display:inline-flex;width:86px;height:40px"><svg data-testid="pi-incognito" class="${on ? 'absolute opacity-0' : 'absolute'}" width="20" height="20"></svg><svg data-testid="pi-incognito-fill" class="${on ? 'absolute' : 'absolute opacity-0'}" width="20" height="20"></svg><span>개인</span></a>`;
   const page = await openGrok(t, `${svgPill(false)}<form data-composer="true"><textarea style="width:320px;height:48px"></textarea></form>`);

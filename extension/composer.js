@@ -713,8 +713,9 @@ function chipUploading(chip) {
     '[class*="animate-spin"], [class*="spinner" i], [class*="loading" i], [class*="progress" i], ' +
     '[aria-label*="uploading" i], [aria-label*="loading" i], [aria-label*="업로드 중"], circle[stroke-dashoffset]';
   if (chip.matches(busy) || [...chip.querySelectorAll(busy)].some(renderedControl)) return true;
-  // Grok pulses a chip whose upload has no metadata yet.
-  if (grokAttachmentItem(chip) && (chip.matches('[class*="animate-pulse"]') || chip.querySelector('[class*="animate-pulse"]'))) return true;
+  // Grok: structure only. It pulses a chip whose upload has no metadata yet; the chip's text is its file
+  // name (a file may be called "uploading.md"), never read as status.
+  if (grokAttachmentItem(chip)) return Boolean(chip.matches('[class*="animate-pulse"]') || chip.querySelector('[class*="animate-pulse"]'));
   return /uploading|업로드 중/i.test(chip.innerText ?? chip.textContent ?? "");
 }
 

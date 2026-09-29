@@ -10,10 +10,13 @@ function composer() {
     ".tiptap[contenteditable='true']",
     '[contenteditable="true"]',
   ];
-  const roots = form ? [form, document] : [document];
-  for (const root of roots) {
-    for (const sel of selectors) {
-      const el = root.querySelector(sel);
+  // With a composer form, only its own editor counts: a lazy editor not mounted yet is "no composer",
+  // never a transcript edit box elsewhere. Without one, never a transcript node either.
+  const root = form || document;
+  const transcript = !form && typeof turnAreaSelector === "function" ? turnAreaSelector() : "";
+  for (const sel of selectors) {
+    for (const el of root.querySelectorAll(sel)) {
+      if (transcript && el.closest(transcript)) continue;
       if (visible(el)) return el;
     }
   }
@@ -110,6 +113,8 @@ async function startFresh(deadline) {
       const enter = grokPrivateToggle();
       const href = enter?.getAttribute("href") || "";
       globalThis.throwIfStopped?.();
+      // A late continuation past the pre-send bound never navigates the tab.
+      if (Date.now() >= end) throw presendStalled("private_chat");
       if (enter && href.includes("#private")) {
         enter.click();
         tried = true;

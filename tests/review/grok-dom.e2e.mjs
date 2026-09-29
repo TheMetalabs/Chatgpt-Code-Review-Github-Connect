@@ -206,10 +206,11 @@ test('grok private-chat entry: the stop fence runs before every click', async t 
 });
 
 test('a generic stop label in the grok composer records the stream, so an idle composer later settles', async t => {
-  for (const label of ['Stop generating', 'Stop streaming', 'Abort']) {
+  const stops = ['Stop generating', 'Stop streaming', 'Abort'].map(label => `aria-label="${label}"`).concat('data-testid="stop-button"');
+  for (const label of stops) {
     const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
       <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
-      <button type="button" id="stop" aria-label="${label}" style="width:64px;height:32px">x</button></form>`);
+      <button type="button" id="stop" ${label} style="width:64px;height:32px">x</button></form>`);
     const out = await page.evaluate(() => {
       delete globalThis.__ashlarGrokSawStream;
       const during = chatGenerationFinished();
@@ -222,6 +223,53 @@ test('a generic stop label in the grok composer records the stream, so an idle c
       return {during, marked, after: chatGenerationFinished()};
     });
     assert.deepEqual(out, {during: false, marked: 'user-A', after: true}, label);
+  }
+  // The same controls outside the composer (a transcript) never record a Grok stream.
+  const transcript = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div>
+    <button type="button" data-testid="stop-button" style="width:64px;height:32px">x</button>
+    <button type="button" aria-label="Stop generating" style="width:64px;height:32px">x</button></main>
+    <form data-composer="true"><textarea style="width:320px;height:48px"></textarea></form>`);
+  assert.equal(await transcript.evaluate(() => { delete globalThis.__ashlarGrokSawStream; stopButtonVisible(); return globalThis.__ashlarGrokSawStream ?? null; }), null);
+});
+
+test('grok composer lookup stays inside an existing composer form until its editor mounts', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">
+      <textarea id="edit" style="width:320px;height:48px">my draft edit</textarea></div></main>
+    <form data-composer="true"><button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`);
+  const out = await page.evaluate(async () => {
+    const before = composer()?.id ?? null;
+    let settled = 'pending';
+    waitUntilComposer(Date.now() + 5000).then(el => { settled = el.id; }, e => { settled = e.code || e.message; });
+    await new Promise(r => setTimeout(r, 400));
+    const whileAbsent = settled;
+    document.querySelector('form').insertAdjacentHTML('afterbegin', '<div id="real" contenteditable="true" role="textbox" style="width:320px;height:48px"></div>');
+    await new Promise(r => setTimeout(r, 1500));
+    return {before, whileAbsent, after: composer()?.id, settled, draft: document.getElementById('edit').value};
+  });
+  assert.deepEqual(out, {before: null, whileAbsent: 'pending', after: 'real', settled: 'real', draft: 'my draft edit'});
+  // No composer form at all: a transcript edit box is still never the composer.
+  const legacy = await openGrok(t, `<main><div data-testid="user-message" role="article"><textarea style="width:320px;height:48px"></textarea></div></main>`);
+  assert.equal(await legacy.evaluate(() => composer()), null);
+});
+
+test('grok private-chat entry never clicks past its deadline', async t => {
+  for (const body of [privatePill(false), '<button type="button" style="width:180px;height:32px">Create New Private Chat</button>']) {
+    const page = await openGrok(t, body);
+    assert.deepEqual(await page.evaluate(async () => {
+      let clicks = 0;
+      for (const el of document.querySelectorAll('a, button')) el.addEventListener('click', e => { e.preventDefault(); clicks++; });
+      try { await startFresh(Date.now() - 1); return {clicks, code: ''}; } catch (e) { return {clicks, code: e.code, stage: e.stage}; }
+    }), {clicks: 0, code: 'presend_stalled', stage: 'private_chat'});
+    // The control appears only after the deadline passed during a polling sleep: still no click.
+    const late = await openGrok(t, '<p>loading</p>');
+    assert.deepEqual(await late.evaluate(async html => {
+      let clicks = 0;
+      setTimeout(() => {
+        document.body.insertAdjacentHTML('beforeend', html);
+        for (const el of document.querySelectorAll('a, button')) el.addEventListener('click', e => { e.preventDefault(); clicks++; });
+      }, 500);
+      try { await startFresh(Date.now() + 300); return {clicks, code: ''}; } catch (e) { return {clicks, code: e.code}; }
+    }, body), {clicks: 0, code: 'presend_stalled'});
   }
 });
 

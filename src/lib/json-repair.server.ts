@@ -122,17 +122,25 @@ export class JsonRepairService {
       // Retries need a still-running persisted record: status() may have moved it to accepted /
       // superseded while this request was in flight; never issue another inference after that.
       const running=()=>{const cur=this.deps.history().getRepair(record.jobId,record.id);return Boolean(cur && cur.status==="running")?cur:null;};
+      let err: unknown = error;
       // vLLM/SGLang refuse prompt + max_tokens beyond the context window before generating anything.
       // Unbudgeted, they fill what is left: the request every repair sent before #87. Sent once only.
-      if(error instanceof LocalChatHttpError && [400,422].includes(error.status)){
-        if(!running())throw error;
-        return await send(false);
+      // A length cut-off on that unbudgeted reply must still reach the bumped retry below — do not
+      // return send(false) directly or a finish_reason=length escapes past the length handler.
+      if(err instanceof LocalChatHttpError && [400,422].includes(err.status)){
+        if(!running())throw err;
+        try {return await send(false);}
+        catch(unbudgeted){
+          if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw unbudgeted;
+          err = unbudgeted;
+        }
       }
       // A length cut-off often means thinking ate the first budget: one retry with a larger one.
       // Still never more than one automatic retry, and never a replay of an uncertain inference.
-      if(error instanceof LocalChatCutOff && error.finishReason==="length"){
+      // Covers both the first budgeted reply and the #87 unbudgeted fallback's first generation.
+      if(err instanceof LocalChatCutOff && err.finishReason==="length"){
         const current=running();
-        if(!current)throw error;
+        if(!current)throw err;
         this.write({...current,attempts:Math.max(current.attempts,2),updatedAt:Date.now()});
         // Bumped budget is the most likely of any request to exceed the context window; route a
         // 400/422 through the same unbudgeted #87 fallback as the first attempt (never hard-fail).
@@ -144,7 +152,7 @@ export class JsonRepairService {
           throw bumped;
         }
       }
-      throw error;
+      throw err;
     }
   }
   status(jobId:string,id:string) {

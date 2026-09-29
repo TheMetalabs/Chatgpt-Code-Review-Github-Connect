@@ -272,6 +272,64 @@ test('a budget rejected against the context window is sent once more without max
  assert.equal(bodies[0].max_tokens,Math.max(8192,Math.ceil(original.length/2)+8192));assert.equal('max_tokens' in bodies[1],false);
  assert.deepEqual(bodies[1].messages,bodies[0].messages);
 });
+
+test('a budgeted 400 then unbudgeted length gets one bumped retry',async t=>{
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);
+  // 1) budgeted → 400. 2) unbudgeted → length. 3) bumped → stop with valid JSON.
+  if('max_tokens' in body){
+   if(bodies.filter(b=>'max_tokens' in b).length===1){
+    res.writeHead(400,{'content-type':'application/json'});
+    res.end(JSON.stringify({object:'error',type:'BadRequestError',code:400,message:'context length'}));
+    return;
+   }
+   res.writeHead(200,{'content-type':'application/json'});
+   res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:raw}}]}));
+   return;
+  }
+  res.writeHead(200,{'content-type':'application/json'});
+  res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'ready',JSON.stringify(done));
+ assert.equal(bodies.length,3,'400 → unbudgeted length → bumped');
+ assert.ok('max_tokens' in bodies[0]);
+ assert.equal('max_tokens' in bodies[1],false);
+ assert.ok('max_tokens' in bodies[2]);
+ assert.ok(bodies[2].max_tokens>bodies[0].max_tokens);
+ assert.equal(f.history.getRepair('A',started.id).attempts,2);
+});
+
+test('a budgeted 400 then unbudgeted length then bumped length records finish_reason_length',async t=>{
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);
+  if('max_tokens' in body && bodies.filter(b=>'max_tokens' in b).length===1){
+   res.writeHead(400,{'content-type':'application/json'});
+   res.end(JSON.stringify({object:'error',type:'BadRequestError',code:400,message:'context length'}));
+   return;
+  }
+  res.writeHead(200,{'content-type':'application/json'});
+  res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'needs_attention');
+ assert.deepEqual(done.errors,['finish_reason_length']);
+ assert.equal(bodies.length,3);
+ assert.equal(f.history.getRepair('A',started.id).attempts,2);
+});
+
 test('the unbudgeted request is sent at most once, and other failures are never resent',async t=>{
  const rejected=await contextServer(t,()=>400);
  assert.equal(rejected.bodies.length,2);assert.equal(rejected.done.status,'needs_attention');

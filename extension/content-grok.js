@@ -95,17 +95,21 @@ function grokPrivateOn() {
 /** A review tab must be the top-bar private chat, the way ChatGPT opens ?temporary-chat=true.
  * Home with a composer is not enough: a new https://grok.com/ tab starts as a normal chat and
  * would land in the sidebar. One click only — a second click turns private mode off. A normal
- * "New Chat" is not a fallback; that control clears incognito. */
+ * "New Chat" is not a fallback; that control clears incognito. Resolves only once private mode is
+ * confirmed; a missing or ineffective control rejects before anything is staged, typed, or sent.
+ * The stop fence runs before every click, so a stopped or taken-over run never touches the tab. */
 async function startFresh(deadline) {
   const end = typeof deadline === "number" ? deadline : Date.now() + 60_000;
   const lookUntil = Math.min(end, Date.now() + 3_000);
   let tried = false;
-  while (Date.now() <= lookUntil) {
+  for (;;) {
+    globalThis.throwIfStopped?.();
     throwIfLoggedOut();
     if (grokPrivateOn()) break;
     if (!tried) {
       const enter = grokPrivateToggle();
       const href = enter?.getAttribute("href") || "";
+      globalThis.throwIfStopped?.();
       if (enter && href.includes("#private")) {
         enter.click();
         tried = true;
@@ -116,7 +120,8 @@ async function startFresh(deadline) {
         tried = true;
       }
     }
-    if (tried || grokPrivateOn() || Date.now() >= lookUntil) break;
+    if (!tried && Date.now() >= lookUntil) throw presendStalled("private_chat");
+    if (Date.now() >= end) throw presendStalled("private_chat");
     await sleep(200);
   }
   return waitUntilComposer(end, throwIfLoggedOut);

@@ -134,28 +134,95 @@ test('a signed-out grok landing is logged out; a private home is left alone; a n
     <button type="button" style="width:180px;height:32px">Unavailable in Private Chats</button>
     <button type="button" style="width:180px;height:32px">Create New Private Chat</button>
     <button type="button" style="width:120px;height:32px">New Chat</button>`;
-  const clicksOf = () => page => page.evaluate(async () => {
+  // effect: 'none' (canceled click, mode unchanged) or 'private' (the click turns private chat on).
+  const record = (page, {effect = 'private', deadline = 5000} = {}) => page.evaluate(async ({effect, deadline, onPill}) => {
     const clicks = [];
     for (const el of document.querySelectorAll('a, button')) {
       el.addEventListener('click', event => {
         event.preventDefault();
         clicks.push((el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim());
+        if (effect !== 'private') return;
+        // Grok's mode change lands a little after the click.
+        setTimeout(() => {
+          document.querySelector('[data-testid="pi-incognito"]')?.closest('a')?.remove();
+          document.body.insertAdjacentHTML('afterbegin', onPill);
+        }, 300);
       });
     }
-    await startFresh(Date.now() + 5000);
-    return clicks;
-  });
-  const record = clicksOf();
+    try {
+      await startFresh(Date.now() + deadline);
+      return {clicks, ok: true, private: grokPrivateOn()};
+    } catch (e) {
+      return {clicks, ok: false, code: e.code || e.message, stage: e.stage || ''};
+    }
+  }, {effect, deadline, onPill: privatePill(true)});
   const already = await openGrok(t, `${privatePill(true)}${decoys}`);
   assert.equal(await already.evaluate(() => grokPrivateOn()), true);
-  assert.deepEqual(await record(already), []);
+  assert.deepEqual(await record(already), {clicks: [], ok: true, private: true});
 
   const home = await openGrok(t, `${privatePill(false)}${decoys}`);
   assert.equal(await home.evaluate(() => grokPrivateOn()), false);
-  assert.deepEqual(await record(home), ['Switch to Private Chat']);
+  assert.deepEqual(await record(home), {clicks: ['Switch to Private Chat'], ok: true, private: true});
 
   const convo = await openGrok(t, decoys, 'https://grok.com/c/fixture');
-  assert.deepEqual(await record(convo), ['Create New Private Chat']);
+  assert.deepEqual(await record(convo), {clicks: ['Create New Private Chat'], ok: true, private: true});
+
+  // A canceled or ineffective click is never taken as private: one click, then reject before send.
+  const stuck = await openGrok(t, `${privatePill(false)}${decoys}`);
+  assert.deepEqual(await record(stuck, {effect: 'none', deadline: 1500}),
+    {clicks: ['Switch to Private Chat'], ok: false, code: 'presend_stalled', stage: 'private_chat'});
+
+  // A normal home with a composer and no private control at all rejects instead of sending there.
+  const bareHome = await openGrok(t, '<form data-composer="true"><textarea style="width:320px;height:48px"></textarea></form>');
+  assert.deepEqual(await record(bareHome, {deadline: 1500}),
+    {clicks: [], ok: false, code: 'presend_stalled', stage: 'private_chat'});
+});
+
+test('grok private-chat entry: the stop fence runs before every click', async t => {
+  for (const body of [privatePill(false), '<button type="button" style="width:180px;height:32px">Create New Private Chat</button>']) {
+    // Already stopped at the start: nothing is clicked.
+    const stopped = await openGrok(t, body);
+    assert.deepEqual(await stopped.evaluate(async () => {
+      let clicks = 0;
+      for (const el of document.querySelectorAll('a, button')) el.addEventListener('click', e => { e.preventDefault(); clicks++; });
+      globalThis.throwIfStopped = () => { throw new Error('stopped'); };
+      try { await startFresh(Date.now() + 2000); return {clicks, error: ''}; } catch (e) { return {clicks, error: e.message}; }
+    }), {clicks: 0, error: 'stopped'});
+
+    // Polling without a control, then the guard starts throwing as the control appears: zero clicks.
+    const later = await openGrok(t, '<p>loading</p>');
+    assert.deepEqual(await later.evaluate(async html => {
+      let clicks = 0;
+      let stop = false;
+      globalThis.throwIfStopped = () => { if (stop) throw new Error('taken over'); };
+      setTimeout(() => {
+        stop = true;
+        document.body.insertAdjacentHTML('beforeend', html);
+        for (const el of document.querySelectorAll('a, button')) el.addEventListener('click', e => { e.preventDefault(); clicks++; });
+      }, 300);
+      try { await startFresh(Date.now() + 2000); return {clicks, error: ''}; } catch (e) { return {clicks, error: e.message}; }
+    }, body), {clicks: 0, error: 'taken over'});
+  }
+});
+
+test('a generic stop label in the grok composer records the stream, so an idle composer later settles', async t => {
+  for (const label of ['Stop generating', 'Stop streaming', 'Abort']) {
+    const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
+      <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
+      <button type="button" id="stop" aria-label="${label}" style="width:64px;height:32px">x</button></form>`);
+    const out = await page.evaluate(() => {
+      delete globalThis.__ashlarGrokSawStream;
+      const during = chatGenerationFinished();
+      const marked = globalThis.__ashlarGrokSawStream;
+      document.getElementById('stop').remove();
+      document.querySelector('main').insertAdjacentHTML('beforeend',
+        '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
+      document.querySelector('form').insertAdjacentHTML('beforeend',
+        '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
+      return {during, marked, after: chatGenerationFinished()};
+    });
+    assert.deepEqual(out, {during: false, marked: 'user-A', after: true}, label);
+  }
 });
 
 test('review on the grok DOM: the sent turn is confirmed, the stream is not collected, then the fenced JSON is', async t => {

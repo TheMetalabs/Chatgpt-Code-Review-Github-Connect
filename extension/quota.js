@@ -88,6 +88,8 @@ function stopButtonVisible(root = document) {
     const t = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""} ${el.textContent || ""}`.toLowerCase();
     if (!/stop generating|stop streaming|abort|생성 중지|답변 중지/.test(t)) continue;
     if (!elVisible(el)) continue;
+    // A Grok composer stop is this turn's stream even when the generic scan sees it first.
+    if (el.closest?.("form[data-composer]") && (root === document || root === document.documentElement)) markGrokStream();
     return true;
   }
   return grokStreamVisible(root);

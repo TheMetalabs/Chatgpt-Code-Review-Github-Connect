@@ -69,11 +69,14 @@ function claimed(job: Pick<Job, "bridgeClaimedAt">, now: number): boolean {
  *  - `queued`       — accepted, waiting behind other jobs (server alive, no output yet — normal on a
  *                     concurrency-1 server); keepaliveAt is fresh
  *  - `no-response`  — queued/accepted but no sign of life for staleMs (server may be wedged)
+ *  - `lease-waiting` — not sent yet: waiting for Ashlar's local-model FIFO lease (another review holds
+ *                     the model for all its turns). Never stale: waiting is normal and has no deadline.
  * Only BINARY freshness (fresh vs stale) is derived, never the live elapsed age: these feed the
  * ops-comment change key, and a continuously changing value would rewrite the GitHub comment each tick. */
-export type LocalLegView = "generating" | "stale" | "queued" | "no-response";
+export type LocalLegView = "generating" | "stale" | "queued" | "no-response" | "lease-waiting";
 
 export function localLegView(progress: ProviderProgress | undefined, now: number, staleMs: number): LocalLegView {
+  if (progress?.stage === "local_lease_waiting") return "lease-waiting";
   if (progress?.stage === "local_queued") {
     const aliveAt = progress.keepaliveAt ?? progress.observedAt;
     return now - aliveAt > staleMs ? "no-response" : "queued";
@@ -82,15 +85,21 @@ export function localLegView(progress: ProviderProgress | undefined, now: number
   return observedAt !== undefined && now - observedAt > staleMs ? "stale" : "generating";
 }
 
-const LOCAL_LEG_DETAIL: Record<LocalLegView, string> = {
+const LOCAL_LEG_DETAIL: Record<Exclude<LocalLegView, "lease-waiting">, string> = {
   generating: "calling local LLM",
   stale: "calling local LLM · no recent progress",
   queued: "queued at local LLM · server alive, no output yet",
   "no-response": "waiting for local LLM · no response from server",
 };
 
+/** "waiting for local model (position N)"; the position is omitted when it is not known. */
+function leaseWaiting(progress: ProviderProgress | undefined): string {
+  const n = progress?.queuePosition;
+  return Number.isSafeInteger(n) && (n as number) > 0 ? `waiting for local model (position ${n})` : "waiting for local model";
+}
+
 // null = generating normally, no ops note needed.
-const LOCAL_LEG_NOTE: Record<LocalLegView, string | null> = {
+const LOCAL_LEG_NOTE: Record<Exclude<LocalLegView, "lease-waiting">, string | null> = {
   generating: null,
   stale: "local reviewer: no recent progress (still waiting; cancel manually if stalled)",
   queued: "local reviewer: queued at the local LLM (server alive, no output yet — a concurrency-1 server serves earlier jobs first)",
@@ -99,12 +108,14 @@ const LOCAL_LEG_NOTE: Record<LocalLegView, string | null> = {
 
 /** Reviewer-lane text for the in-flight local leg. */
 export function localLegDetail(progress: ProviderProgress | undefined, now: number, staleMs: number): string {
-  return LOCAL_LEG_DETAIL[localLegView(progress, now, staleMs)];
+  const view = localLegView(progress, now, staleMs);
+  return view === "lease-waiting" ? leaseWaiting(progress) : LOCAL_LEG_DETAIL[view];
 }
 
 /** Ops-comment note for an in-flight local leg, or null when it is generating normally. */
 export function localLegNote(progress: ProviderProgress | undefined, now: number, staleMs: number): string | null {
-  return LOCAL_LEG_NOTE[localLegView(progress, now, staleMs)];
+  const view = localLegView(progress, now, staleMs);
+  return view === "lease-waiting" ? `local reviewer: ${leaseWaiting(progress)} — another review holds it until all its turns finish` : LOCAL_LEG_NOTE[view];
 }
 
 export function buildReviewerLanes(

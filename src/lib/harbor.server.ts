@@ -23,6 +23,7 @@ import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
+import { localModelLease, type LocalModelLeaseHandle } from "./local-model-lease";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -251,6 +252,9 @@ function releaseJob(job: Job, edge: "terminal" | "removed") {
   if (edge === "removed" || !localInFlight.has(job.id)) localSamples.delete(job.id);
   if (!stop) return;
   localControllers.get(job.id)?.abort();
+  // A cancelled / removed job leaves the local-model queue and frees any lease it holds at once, so
+  // the next queued review starts without waiting for the aborted request to unwind.
+  localModelLease().releaseOwner(job.id);
   localActivity.delete(job.id);
   localLiveness.get(job.id)?.clear();
   localLiveness.delete(job.id);
@@ -917,6 +921,48 @@ async function kickLocalRace(jobId: string, prompt: string) {
   void attachLocalLeg(jobId, runPrompt, { submit: true });
 }
 
+/** Wait (FIFO, abort-aware) for the process-wide local-model lease, held by this review's local leg
+ * across ALL of its file groups and turns (released in attachLocalLeg's finally, or by releaseJob on
+ * cancel/removal). While waiting the leg shows "waiting for local model (position N)"; nothing has
+ * been sent, so neither the liveness watchdog nor the optional deadline is armed yet. */
+async function acquireLocalModel(jobId: string): Promise<LocalModelLeaseHandle> {
+  const signal = localControllers.get(jobId)?.signal;
+  let waited = false;
+  const handle = await localModelLease().acquire(jobId, {
+    signal,
+    onPosition: (position) => {
+      waited = true;
+      const now = Date.now();
+      transitionJob(jobId, (j) => j.status !== "awaiting_chat" ? j : ({
+        ...j,
+        providerProgress: {
+          ...j.providerProgress,
+          local: { runId: `local:${jobId}`, stage: "local_lease_waiting", observedAt: now, receivedAt: now, queuePosition: position },
+        },
+      }));
+    },
+  });
+  if (waited) {
+    // The model is ours now: the leg starts over as "queued at the server" from this moment.
+    const now = Date.now();
+    const leg = startLocalLeg(now);
+    localActivity.set(jobId, leg);
+    transitionJob(jobId, (j) => j.status !== "awaiting_chat" ? j : ({
+      ...j,
+      providerProgress: { ...j.providerProgress, local: localLegProgress(leg, `local:${jobId}`, now) },
+      updatedAt: now,
+    }));
+  }
+  // A cancellation (releaseJob) that lands between the grant and this continuation already revoked the
+  // lease: give it back and stop here, so a cancelled review never sends a request or holds the model.
+  if (signal?.aborted) {
+    handle.release();
+    throw signal.reason ?? new Error("local review cancelled before its first request");
+  }
+  try { reviewHistory().recordServerStep(jobId, "local.lease_acquired"); } catch { /* visible history health */ }
+  return handle;
+}
+
 /** Feed one activity observation into the leg's tracker and flush it (throttled) to the job. The
  * first server acceptance and the first output token are also recorded as history steps, so a
  * post-mortem can tell "never accepted", "accepted but never generated" and "generated" apart. */
@@ -1012,33 +1058,40 @@ function collectLocalLeg(j: Job, raw: string, originalText?: string, evidence?: 
 }
 
 async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: boolean }) {
-  // Two independent, both-optional aborts; neither fires for a healthy long review. Both honour the
-  // signal, so the leg falls into the catch below and fails cleanly. Cleared in finally on settle.
-  //
-  // 1. Liveness (default 10 min, streaming only): abort after TOTAL silence — no headers, no keepalive,
-  //    no token — for the window. Reset by noteLocalActivity on every sign of life, and the server
-  //    keepalives ~every 10s while queued or generating, so an hours-long queue is never touched; only
-  //    a genuinely wedged server trips it. This is what unblocks a finished peer review that would
-  //    otherwise wait forever on the in-flight local leg (stillRacing). A buffered leg has no
-  //    incremental signal, so liveness is armed only when streaming is on; it relies on the ceiling.
-  // 2. Total ceiling (ASHLAR_LOCAL_REVIEW_DEADLINE_MS; off by default): a hard wall-clock cap for
-  //    operators who want one, independent of activity.
-  const livenessMs = localStreamingDefault() ? localLivenessMs() : 0;
-  if (livenessMs > 0) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const fire = () => localControllers.get(jobId)?.abort(new Error(`local review: no response from the model server for ${Math.round(livenessMs / 60_000)} min (ASHLAR_LOCAL_REVIEW_LIVENESS_MS)`));
-    const arm = () => { timer = setTimeout(fire, livenessMs); };
-    arm();
-    localLiveness.set(jobId, { reset: () => { if (timer) clearTimeout(timer); arm(); }, clear: () => { if (timer) clearTimeout(timer); } });
-  }
-  const deadlineMs = localReviewDeadlineMs();
-  const deadline = deadlineMs > 0
-    ? setTimeout(
-      () => localControllers.get(jobId)?.abort(new Error(`local review exceeded the ${Math.round(deadlineMs / 60_000)} min ASHLAR_LOCAL_REVIEW_DEADLINE_MS ceiling`)),
-      deadlineMs,
-    )
-    : undefined;
+  let lease: LocalModelLeaseHandle | undefined;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
+    // One lease for the whole leg (every group and turn): another review cannot slip a request in
+    // between this review's turns and evict its prompt cache. Throws when the job is cancelled while
+    // queued (the abort reason becomes the leg's error below, a no-op on a job no longer awaiting chat).
+    lease = await acquireLocalModel(jobId);
+    // Two independent, both-optional aborts; neither fires for a healthy long review. Both honour the
+    // signal, so the leg falls into the catch below and fails cleanly. Cleared in finally on settle.
+    //
+    // 1. Liveness (default 10 min, streaming only): abort after TOTAL silence — no headers, no keepalive,
+    //    no token — for the window. Reset by noteLocalActivity on every sign of life, and the server
+    //    keepalives ~every 10s while queued or generating, so an hours-long queue is never touched; only
+    //    a genuinely wedged server trips it. This is what unblocks a finished peer review that would
+    //    otherwise wait forever on the in-flight local leg (stillRacing). A buffered leg has no
+    //    incremental signal, so liveness is armed only when streaming is on; it relies on the ceiling.
+    // 2. Total ceiling (ASHLAR_LOCAL_REVIEW_DEADLINE_MS; off by default): a hard wall-clock cap for
+    //    operators who want one, independent of activity. Both start once the lease is held: time spent
+    //    waiting for another review to finish is not this leg's model time.
+    const livenessMs = localStreamingDefault() ? localLivenessMs() : 0;
+    if (livenessMs > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const fire = () => localControllers.get(jobId)?.abort(new Error(`local review: no response from the model server for ${Math.round(livenessMs / 60_000)} min (ASHLAR_LOCAL_REVIEW_LIVENESS_MS)`));
+      const arm = () => { timer = setTimeout(fire, livenessMs); };
+      arm();
+      localLiveness.set(jobId, { reset: () => { if (timer) clearTimeout(timer); arm(); }, clear: () => { if (timer) clearTimeout(timer); } });
+    }
+    const deadlineMs = localReviewDeadlineMs();
+    deadline = deadlineMs > 0
+      ? setTimeout(
+        () => localControllers.get(jobId)?.abort(new Error(`local review exceeded the ${Math.round(deadlineMs / 60_000)} min ASHLAR_LOCAL_REVIEW_DEADLINE_MS ceiling`)),
+        deadlineMs,
+      )
+      : undefined;
     const local = await generateLocalLeg(jobId, prompt);
     try {
       reviewHistory().recordServerStep(jobId,local.ok?"local.response_received":"local.failed");
@@ -1080,6 +1133,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       assumptions: [...(j.assumptions ?? []), `Skipped local (${msg.slice(0, 160)})`].slice(0, 12), updatedAt: Date.now(),
     }));
   } finally {
+    lease?.release();
     if (deadline) clearTimeout(deadline);
     localLiveness.get(jobId)?.clear();
     localLiveness.delete(jobId);

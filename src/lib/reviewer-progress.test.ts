@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress.ts";
+import { buildReviewerLanes, emptyReviewSkip, localLegDetail, localLegNote } from "./reviewer-progress.ts";
 import type { Job } from "./types.ts";
 
 function job(partial: Partial<Job>): Job {
@@ -157,6 +157,16 @@ describe("buildReviewerLanes", () => {
     const lanes = buildReviewerLanes(job({ reviewProviders: ["local"], providerProgress: { local: progress } }), { localInFlight: true, now, staleMs: 300_000 });
     assert.equal(lanes.find((l) => l.provider === "local")?.detail, "waiting for local LLM · no response from server");
     assert.equal(localLegNote(progress, now, 300_000), "local reviewer: no response from the local LLM server (still waiting; cancel manually if stalled)");
+  });
+
+  it("a local leg waiting for the local-model lease shows its queue position and never reads as stale", () => {
+    const now = 10_000_000;
+    // Hours in the lease queue: nothing was sent, so there is no server silence to report.
+    const progress = { runId: "local:j1", stage: "local_lease_waiting" as const, observedAt: now - 7_200_000, receivedAt: now - 7_200_000, queuePosition: 2 };
+    const lanes = buildReviewerLanes(job({ reviewProviders: ["local"], providerProgress: { local: progress } }), { localInFlight: true, now, staleMs: 300_000 });
+    assert.equal(lanes.find((l) => l.provider === "local")?.detail, "waiting for local model (position 2)");
+    assert.equal(localLegNote(progress, now, 300_000), "local reviewer: waiting for local model (position 2) — another review holds it until all its turns finish");
+    assert.equal(localLegDetail({ ...progress, queuePosition: undefined }, now, 300_000), "waiting for local model");
   });
 
   it("a generating local leg with fresh output needs no ops note; stale output keeps the original note", () => {

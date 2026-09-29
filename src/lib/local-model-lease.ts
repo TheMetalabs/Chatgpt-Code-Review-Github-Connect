@@ -103,6 +103,8 @@ export class LocalModelLease {
     return { active: [...this.active.values()], queued: this.queue.map((w) => w.owner) };
   }
 
+  /** Ownership is registered HERE, synchronously, before the waiter's promise resolves: releaseOwner
+   * revokes a grant whose holder has not resumed yet, without depending on that continuation. */
   private grant(id: number, owner: string): LocalModelLeaseHandle {
     this.active.set(id, owner);
     return {

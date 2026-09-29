@@ -91,3 +91,21 @@ test('release is idempotent', async () => {
   hb.release();
   (await c).release();
 });
+
+test('a granted-but-not-yet-resumed holder is revoked by releaseOwner without its continuation running', async () => {
+  // Ownership is registered synchronously when the grant happens (before the waiter's promise
+  // resolves), so a cancellation landing before the holder resumes frees the model by itself.
+  const lease = new LocalModelLease();
+  const a = await lease.acquire('A');
+  const b = lease.acquire('B'); // never awaited below until the end: its continuation does not run
+  const c = lease.acquire('C');
+  a.release(); // B is granted now
+  assert.deepEqual(lease.snapshot(), {active: ['B'], queued: ['C']}, 'B owns the model before it resumes');
+  assert.equal(lease.releaseOwner('B'), 1); // cancel B in the same tick
+  assert.deepEqual(lease.snapshot(), {active: ['C'], queued: []}, 'C is granted without B resuming');
+  const hc = await c;
+  assert.equal(hc.owner, 'C');
+  (await b).release(); // B's late continuation gives back a handle that is already revoked: a no-op
+  assert.deepEqual(lease.snapshot().active, ['C']);
+  hc.release();
+});

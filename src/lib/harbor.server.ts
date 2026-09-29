@@ -570,8 +570,9 @@ function localStaleNoteMs(): number {
   return Number.isFinite(n) ? n : 300_000;
 }
 
-// One watcher per job. submitHarborChat restarts it when a verify-clean job returns to awaiting_chat
-// for its local verification round (the watcher may have exited during the brief validator phase).
+// One watcher per job. It stays alive across the brief validator phase (sleep + continue) so a
+// snapshot/revert back to awaiting_chat can resubmit stored legs without a second local generation.
+// releaseHeldLocal also restarts it when a verify-clean / fallback release returns to awaiting_chat.
 const watching = new Set<string>();
 
 async function watchReviewers(jobId: string, token: string) {
@@ -592,6 +593,12 @@ async function watchReviewersLoop(jobId: string, token: string) {
     const job = state.jobs.find((j) => j.id === jobId);
     if (!job) return;
     if (job.status === "cancelled" || job.status === "posted" || job.status === "skipped" || job.status === "dlq") return;
+    // validator is temporary: do not drop the watcher, or a revert to awaiting_chat orphans the job
+    // (attachLocalLeg already cleared localInFlight and discarded the failed submit).
+    if (job.status === "validator") {
+      await sleep(WATCH_TICK_MS);
+      continue;
+    }
     if (job.status !== "awaiting_chat" && job.status !== "reviewer") return;
 
     const claimed = Boolean(job.bridgeClaimedAt && Date.now() - job.bridgeClaimedAt < BRIDGE_CLAIM_MS);
@@ -1174,12 +1181,14 @@ export async function submitHarborChat(
   });
   if (!locked) return { ok: false, error: "job is not waiting for a chat review" };
 
-  const revert = (error: string) => {
+  const revert = (error: string, restartToken?: string) => {
     transitionJob(jobId, (j) =>
       ownsValidatorGeneration(j, validatorGeneration)
         ? { ...j, status: "awaiting_chat", githubError: error, updatedAt: Date.now() }
         : j,
     );
+    // If the watcher already exited on a prior validator tick, put it back so stored legs resubmit.
+    if (restartToken) void watchReviewers(jobId, restartToken);
     return { ok: false as const, error };
   };
   /** Stale validator completion must not merge or release after ownership moved (held-local race). */
@@ -1188,7 +1197,7 @@ export async function submitHarborChat(
     return ownsValidatorGeneration(cur, validatorGeneration);
   };
 
-  let token: string;
+  let token: string | undefined;
   let sample: SamplePr;
   try {
     token = await installationToken(job.installationId);
@@ -1205,7 +1214,8 @@ export async function submitHarborChat(
     }, { diffMaxChars: state.settings.promptDiffMaxChars });
   } catch (e) {
     const msg = formatGithubError(e);
-    return revert(msg.slice(0, 240));
+    // token is set only when installationToken succeeded before fetchPullSnapshot failed.
+    return revert(msg.slice(0, 240), token);
   }
 
   const still = state.jobs.find((j) => j.id === jobId);
@@ -1215,6 +1225,8 @@ export async function submitHarborChat(
   if (!ownsValidatorGeneration(still, validatorGeneration)) {
     return { ok: false, error: "stale validator" };
   }
+  // Snapshot succeeded: token is defined for the rest of this validation.
+  if (!token) return revert("missing installation token");
 
   const gates: LiveGateResult[] = [];
   const byProvider = new Map<ReviewProvider, LiveGateResult>();
@@ -1316,6 +1328,32 @@ export async function submitHarborChat(
     releaseHeldLocal(jobId, token, { kind: "verify", verifyChat: cleanChat }, plan, incoming, { validatorGeneration });
     return { ok: true };
   }
+  // verify-clean: a chat-only salvage (pre-gate unparseable / salvaged_no_repair, findings=0) is not a
+  // clean structured result and must not post while local stays held — that path left Instant/invalid
+  // JSON as raw with no Coverage(model) and tripped loop-error (aicc #598). Release local as the
+  // chat-down fallback so it still runs. Salvage is never CONVERGED / verified-clean (outcome stays
+  // raw / incomplete after the merge). Overflow/malformed (other raw causes) still post as today.
+  const chatSalvageOnly =
+    merged.findings.length === 0 &&
+    Boolean(rawReview) &&
+    !structured.some(isChatProvider) &&
+    Object.entries(rawCauses).some(([p]) => isChatProvider(p as ReviewProvider)) &&
+    Object.entries(rawCauses).filter(([p]) => isChatProvider(p as ReviewProvider)).every(([, c]) => c === "unparseable");
+  if (
+    chatSalvageOnly &&
+    releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })
+  ) {
+    if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+    releaseHeldLocal(
+      jobId,
+      token,
+      { kind: "fallback" },
+      "Chat reviewers returned no usable structured JSON; local runs as the fallback.",
+      incoming,
+      { validatorGeneration },
+    );
+    return { ok: true };
+  }
   const localError =
     localUnusable ||
     (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
@@ -1387,9 +1425,10 @@ type HeldLocalRelease = { kind: "verify"; verifyChat: ReviewProvider[] } | { kin
 
 /** verify-clean: the single release point of a held local leg, called only on an explicit terminal
  * signal of the chat round (docs/local-verify-clean.md §2): a clean structured chat result starts
- * the verification round; chat finishing with nothing usable, or a bridge disconnected past its
- * grace, starts the fallback. It releases once (a stamp is set), returns the job to awaiting_chat
- * with the chat legs kept, starts local and makes sure a watcher waits for it.
+ * the verification round; chat finishing with nothing usable (no valid JSON, or a findings=0
+ * pre-gate salvage / salvaged_no_repair), or a bridge disconnected past its grace, starts the
+ * fallback. It releases once (a stamp is set), returns the job to awaiting_chat with the chat legs
+ * kept, starts local and makes sure a watcher waits for it.
  * A validator-phase caller must pass the generation it locked with; without a matching generation,
  * status===validator is refused so a concurrent watcher cannot steal an in-flight validation. */
 function releaseHeldLocal(

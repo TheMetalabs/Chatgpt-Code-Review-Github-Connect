@@ -6,7 +6,7 @@ import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import http from 'node:http';
-import {requestLocalChat} from '../../src/lib/local-chat-request.server.ts';
+import {requestLocalChat, LocalChatCutOff} from '../../src/lib/local-chat-request.server.ts';
 import {overlayEnv, sanitizeBotSettings, botSettingsToEnv} from '../../src/lib/settings.server.ts';
 const value={findings:[],investigated_safe:['a.ts: checked "condition"']};
 const raw=JSON.stringify(value),original=raw.replace(/\\"/g,'"');
@@ -121,15 +121,16 @@ test('a stray-quote slip is repaired without a Local call and its commit is acce
 test('the Local request carries a token budget for re-emitting the original, and thinking stays on by default',async t=>{
  const long=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "condition"','b.ts: '+'x'.repeat(20000)]}).replace(/\\"/g,'"');
  const f=fixture(t);f.service.start({...input,original:long,sourceHash:hash(long)});await flush();
- assert.equal(f.calls[0][2].max_tokens,Math.ceil(long.length/2)+4096);
+ assert.equal(f.calls[0][2].max_tokens,Math.ceil(long.length/2)+8192);
  assert.equal('chat_template_kwargs' in f.calls[0][2],false);
 });
 // Before #87 no budget was sent and omlx used its 8192-token default; a short original (the common
 // zero-to-two-finding review) must never get less than that, since thinking shares the budget.
 test('a short original still gets at least the 8192 tokens the server default used to give it',async t=>{
- assert.ok(Math.ceil(original.length/2)+4096<8192);
+ const expected=Math.max(8192,Math.ceil(original.length/2)+8192);
  const f=fixture(t);f.service.start(input);await flush();
- assert.equal(f.calls[0][2].max_tokens,8192);
+ assert.equal(f.calls[0][2].max_tokens,expected);
+ assert.ok(expected>=8192);
 });
 test('ASHLAR_LOCAL_REPAIR_NO_THINKING turns thinking off for the Local repair request only when set',async t=>{
  assert.equal(DEFAULT_SETTINGS.localRepairNoThinking,false);
@@ -140,10 +141,12 @@ test('ASHLAR_LOCAL_REPAIR_NO_THINKING turns thinking off for the Local repair re
  delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;assert.equal(sanitizeBotSettings(overlayEnv({})).localRepairNoThinking,false);
  const f=fixture(t);f.settings.localRepairNoThinking=true;f.service.start(input);await flush();
  assert.deepEqual(f.calls[0][2].chat_template_kwargs,{enable_thinking:false});
- assert.equal(f.calls[0][2].max_tokens,8192);
+ assert.equal(f.calls[0][2].max_tokens,Math.max(8192,Math.ceil(original.length/2)+8192));
 });
-test('a Local reply cut off at the token limit is recorded as finish_reason_length',async t=>{
- const server=http.createServer((req,res)=>{req.resume();req.on('end',()=>{
+test('a Local reply cut off at the token limit is retried once with a larger budget, then recorded as finish_reason_length',async t=>{
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  bodies.push(JSON.parse(data));
   res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
  });});
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
@@ -152,9 +155,67 @@ test('a Local reply cut off at the token limit is recorded as finish_reason_leng
  const started=f.service.start(input);
  for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
  const done=f.service.status('A',started.id);
- assert.equal(done.status,'needs_attention');assert.deepEqual(done.errors,['finish_reason_length']);assert.equal(f.calls.length,1);
+ assert.equal(done.status,'needs_attention');assert.deepEqual(done.errors,['finish_reason_length']);
+ assert.equal(bodies.length,2,'one automatic length retry');
+ assert.equal(bodies[0].max_tokens,Math.max(8192,Math.ceil(original.length/2)+8192));
+ assert.equal(bodies[1].max_tokens,Math.max(8192,Math.ceil(original.length/1)+16384));
+ assert.equal(f.history.getRepair('A',started.id).attempts,2);
 });
 
+
+test('a length cut-off retry that completes is accepted',async t=>{
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);
+  // First attempt: cut off. Bumped retry (larger max_tokens): complete.
+  const bumped=bodies.length>1;
+  const content=bumped ? raw : '{"findings":[';
+  res.writeHead(200,{'content-type':'application/json'});
+  res.end(JSON.stringify({choices:[{finish_reason:bumped?'stop':'length',message:{content}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'ready',JSON.stringify(done));
+ assert.equal(bodies.length,2);
+ assert.ok(bodies[1].max_tokens>bodies[0].max_tokens);
+});
+
+test('a length cut-off bumped retry that the context window refuses falls back to the unbudgeted request',async t=>{
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);
+  // 1st: budgeted, finish_reason=length. 2nd: bumped budget refused 400. 3rd: unbudgeted succeeds.
+  if(!('max_tokens' in body)){
+   res.writeHead(200,{'content-type':'application/json'});
+   res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:raw}}]}));
+   return;
+  }
+  if(bodies.filter(b=>'max_tokens' in b).length===1){
+   res.writeHead(200,{'content-type':'application/json'});
+   res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
+   return;
+  }
+  res.writeHead(400,{'content-type':'application/json'});
+  res.end(JSON.stringify({object:'error',type:'BadRequestError',code:400,
+   message:"This model's maximum context length is 32768 tokens. However, you requested 37000 tokens."}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'ready',JSON.stringify(done));
+ assert.equal(bodies.length,3,'length retry then #87 unbudgeted fallback');
+ assert.ok('max_tokens' in bodies[0]);
+ assert.ok('max_tokens' in bodies[1]);
+ assert.ok(bodies[1].max_tokens>bodies[0].max_tokens);
+ assert.equal('max_tokens' in bodies[2],false);
+});
 // vLLM/SGLang answer HTTP 400 when prompt + max_tokens exceeds max_model_len, before generating
 // anything. Without a budget they fill whatever context is left, which is the request every repair
 // sent before #87; the budget must not turn a repair that used to run into a rejected one.
@@ -173,12 +234,102 @@ async function contextServer(t,reject) {
  for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
  return {bodies,done:f.service.status('A',started.id)};
 }
+
+test('a length cut-off does not retry after status() accepted the repair',async t=>{
+ let rejectPending;const pending=new Promise((_resolve,reject)=>{rejectPending=reject;});
+ const f=fixture(t,{response:()=>pending});
+ const started=f.service.start(input);await flush();
+ assert.equal(f.calls.length,1);
+ f.accepted.push(f.history.getRepair('A',started.id));
+ assert.equal(f.service.status('A',started.id).status,'accepted');
+ rejectPending(new LocalChatCutOff('length'));
+ await flush();
+ for(let n=0;n<50;n++)await flush();
+ assert.equal(f.calls.length,1,'no bumped retry after accepted');
+ assert.equal(f.history.getRepair('A',started.id).status,'accepted');
+ assert.equal(f.service.status('A',started.id).status,'accepted');
+});
+
+test('a length cut-off does not retry after status() superseded the repair',async t=>{
+ let rejectPending;const pending=new Promise((_resolve,reject)=>{rejectPending=reject;});
+ const f=fixture(t,{response:()=>pending});
+ const started=f.service.start(input);await flush();
+ assert.equal(f.calls.length,1);
+ f.setCurrent(false);
+ assert.equal(f.service.status('A',started.id).status,'superseded');
+ // Source may look current again later; the persisted terminal state must still block a retry.
+ f.setCurrent(true);
+ rejectPending(new LocalChatCutOff('length'));
+ await flush();
+ for(let n=0;n<50;n++)await flush();
+ assert.equal(f.calls.length,1,'no bumped retry after superseded');
+ assert.equal(f.history.getRepair('A',started.id).status,'superseded');
+});
+
 test('a budget rejected against the context window is sent once more without max_tokens',async t=>{
  const {bodies,done}=await contextServer(t,body=>'max_tokens' in body ? 400 : 0);
  assert.equal(done.status,'ready');assert.equal(bodies.length,2);
- assert.equal(bodies[0].max_tokens,8192);assert.equal('max_tokens' in bodies[1],false);
+ assert.equal(bodies[0].max_tokens,Math.max(8192,Math.ceil(original.length/2)+8192));assert.equal('max_tokens' in bodies[1],false);
  assert.deepEqual(bodies[1].messages,bodies[0].messages);
 });
+
+test('a budgeted 400 then unbudgeted length gets one bumped retry',async t=>{
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);
+  // 1) budgeted → 400. 2) unbudgeted → length. 3) bumped → stop with valid JSON.
+  if('max_tokens' in body){
+   if(bodies.filter(b=>'max_tokens' in b).length===1){
+    res.writeHead(400,{'content-type':'application/json'});
+    res.end(JSON.stringify({object:'error',type:'BadRequestError',code:400,message:'context length'}));
+    return;
+   }
+   res.writeHead(200,{'content-type':'application/json'});
+   res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:raw}}]}));
+   return;
+  }
+  res.writeHead(200,{'content-type':'application/json'});
+  res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'ready',JSON.stringify(done));
+ assert.equal(bodies.length,3,'400 → unbudgeted length → bumped');
+ assert.ok('max_tokens' in bodies[0]);
+ assert.equal('max_tokens' in bodies[1],false);
+ assert.ok('max_tokens' in bodies[2]);
+ assert.ok(bodies[2].max_tokens>bodies[0].max_tokens);
+ assert.equal(f.history.getRepair('A',started.id).attempts,2);
+});
+
+test('a budgeted 400 then unbudgeted length then bumped length records finish_reason_length',async t=>{
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);
+  if('max_tokens' in body && bodies.filter(b=>'max_tokens' in b).length===1){
+   res.writeHead(400,{'content-type':'application/json'});
+   res.end(JSON.stringify({object:'error',type:'BadRequestError',code:400,message:'context length'}));
+   return;
+  }
+  res.writeHead(200,{'content-type':'application/json'});
+  res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'needs_attention');
+ assert.deepEqual(done.errors,['finish_reason_length']);
+ assert.equal(bodies.length,3);
+ assert.equal(f.history.getRepair('A',started.id).attempts,2);
+});
+
 test('the unbudgeted request is sent at most once, and other failures are never resent',async t=>{
  const rejected=await contextServer(t,()=>400);
  assert.equal(rejected.bodies.length,2);assert.equal(rejected.done.status,'needs_attention');

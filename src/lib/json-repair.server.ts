@@ -94,11 +94,14 @@ export class JsonRepairService {
     }
   }
   private async requestCandidate(record:RepairRecord,settings:BotSettings,signal:AbortSignal) {
-    const send=(budgeted:boolean)=>(this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
+    // Thinking shares the completion budget (#87). Headroom 8192 (was 4096) leaves room for a
+    // reasoning model to finish re-emitting the original; a length cut-off gets one bumped retry.
+    const budget=(bumped:boolean)=>Math.max(SERVER_DEFAULT_BUDGET,Math.ceil(record.original.length/(bumped?1:2))+(bumped?16384:8192));
+    const send=(budgeted:boolean,bumped=false)=>(this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
       model:record.model,temperature:0,
       // The candidate re-emits the whole original; without a budget omlx stops at its 8192-token
       // default, which includes the model's thinking (#87). A short original never gets less than it.
-      ...(budgeted ? {max_tokens:Math.max(SERVER_DEFAULT_BUDGET,Math.ceil(record.original.length/2)+4096)} : {}),
+      ...(budgeted ? {max_tokens:budget(bumped)} : {}),
       ...(settings.localRepairNoThinking ? {chat_template_kwargs:{enable_thinking:false}} : {}),
       messages:[{
         role:"system",content:[
@@ -115,11 +118,41 @@ export class JsonRepairService {
     },signal);
     try {return await send(true);}
     catch(error){
+      if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw error;
+      // Retries need a still-running persisted record: status() may have moved it to accepted /
+      // superseded while this request was in flight; never issue another inference after that.
+      const running=()=>{const cur=this.deps.history().getRepair(record.jobId,record.id);return Boolean(cur && cur.status==="running")?cur:null;};
+      let err: unknown = error;
       // vLLM/SGLang refuse prompt + max_tokens beyond the context window before generating anything.
       // Unbudgeted, they fill what is left: the request every repair sent before #87. Sent once only.
-      if(!(error instanceof LocalChatHttpError) || ![400,422].includes(error.status) || signal.aborted || this.fenced.has(record.id) ||
-         !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw error;
-      return await send(false);
+      // A length cut-off on that unbudgeted reply must still reach the bumped retry below — do not
+      // return send(false) directly or a finish_reason=length escapes past the length handler.
+      if(err instanceof LocalChatHttpError && [400,422].includes(err.status)){
+        if(!running())throw err;
+        try {return await send(false);}
+        catch(unbudgeted){
+          if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw unbudgeted;
+          err = unbudgeted;
+        }
+      }
+      // A length cut-off often means thinking ate the first budget: one retry with a larger one.
+      // Still never more than one automatic retry, and never a replay of an uncertain inference.
+      // Covers both the first budgeted reply and the #87 unbudgeted fallback's first generation.
+      if(err instanceof LocalChatCutOff && err.finishReason==="length"){
+        const current=running();
+        if(!current)throw err;
+        this.write({...current,attempts:Math.max(current.attempts,2),updatedAt:Date.now()});
+        // Bumped budget is the most likely of any request to exceed the context window; route a
+        // 400/422 through the same unbudgeted #87 fallback as the first attempt (never hard-fail).
+        try {return await send(true,true);}
+        catch(bumped){
+          if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw bumped;
+          if(!running())throw bumped;
+          if(bumped instanceof LocalChatHttpError && [400,422].includes(bumped.status))return await send(false);
+          throw bumped;
+        }
+      }
+      throw err;
     }
   }
   status(jobId:string,id:string) {

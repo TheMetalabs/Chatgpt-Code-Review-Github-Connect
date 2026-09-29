@@ -42,9 +42,20 @@ function grokLoggedOut() {
   if (document.querySelector('form[data-composer], #model-select-trigger')) return false;
   // The runner's own composer and model-pill fallbacks are signed-in evidence too.
   if (composer() || (typeof grokPill === "function" && grokPill())) return false;
-  const controls = [...document.querySelectorAll("a[href], button, [role='button']")].filter(el => typeof visible === "function" ? visible(el) : el);
-  const hrefOf = el => el.getAttribute("href") || "";
-  if (controls.some(el => /accounts\.x\.com|x\.com\/i\/flow\/login|\/sign-in|\/login/i.test(hrefOf(el)))) return true;
+  // A link or label inside a chat bubble is message content, never the page's sign-in control.
+  const controls = [...document.querySelectorAll("a[href], button, [role='button']")]
+    .filter(el => !el.closest("[data-testid='user-message'], [data-testid='assistant-message']"))
+    .filter(el => typeof visible === "function" ? visible(el) : el);
+  // Only an X / Grok auth endpoint is sign-in evidence: an unrelated site's /login link is not.
+  const authHref = el => {
+    let url;
+    try { url = new URL(el.getAttribute("href") || "", location.href); } catch { return false; }
+    const host = url.hostname.toLowerCase(), path = url.pathname.toLowerCase();
+    if (/(?:^|\.)accounts\.x\.com$/.test(host)) return true;
+    if (/(?:^|\.)x\.com$/.test(host)) return path.startsWith("/i/flow/login");
+    return /(?:^|\.)grok\.com$/.test(host) && /^\/(?:sign-in|login)(?:\/|$)/.test(path);
+  };
+  if (controls.some(el => el.hasAttribute("href") && authHref(el))) return true;
   const label = el => (el.textContent || "").replace(/\s+/g, " ").trim();
   const exact = new Set(["Log in", "Sign in", "Sign up", "로그인", "가입"]);
   return controls.some(el => exact.has(label(el)));

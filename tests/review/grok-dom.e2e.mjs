@@ -154,6 +154,38 @@ test('grok answer actions never finish an answer while the composer shows a stre
   assert.deepEqual(result, {before: true, streaming: false, after: true});
 });
 
+test('grok stream strip: the Generating status matches any case and spacing', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>${COMPOSER}`);
+  const out = await page.evaluate(strip => {
+    document.querySelector('form').insertAdjacentHTML('afterbegin', strip);
+    document.getElementById('grok-stop').remove();
+    const seen = [];
+    for (const text of ['GENERATING', '  generating\n  ...', 'Generating']) {
+      document.getElementById('grok-generating').textContent = text;
+      seen.push(grokStreamVisible(document));
+    }
+    document.getElementById('grok-generating').textContent = 'Generated';
+    seen.push(grokStreamVisible(document));
+    return seen;
+  }, grokStrip());
+  assert.deepEqual(out, [true, true, true, false]);
+});
+
+test('grok sign-in evidence is an X / Grok auth link outside the chat bubbles, never an unrelated /login link', async t => {
+  const cases = [
+    ['<a href="https://example.com/login" style="width:120px;height:32px">docs</a>', false],
+    ['<a href="https://github.com/sign-in" style="width:120px;height:32px">gh</a>', false],
+    ['<div data-testid="assistant-message" role="article"><a href="https://accounts.x.com/login" style="width:120px;height:32px">Log in</a></div>', false],
+    ['<a href="https://accounts.x.com/i/flow/login" style="display:inline-block;width:120px;height:32px">x</a>', true],
+    ['<a href="https://x.com/i/flow/login?redirect=grok" style="display:inline-block;width:120px;height:32px">x</a>', true],
+    ['<a href="/sign-in?redirect=%2F" style="display:inline-block;width:120px;height:32px">go</a>', true],
+  ];
+  for (const [body, expected] of cases) {
+    const page = await openGrok(t, body);
+    assert.equal(await page.evaluate(() => grokLoggedOut()), expected, body);
+  }
+});
+
 function privatePill(on) {
   const href = on ? '/c' : '/c#private';
   const aria = on ? '기본 채팅으로 전환' : 'Switch to Private Chat';

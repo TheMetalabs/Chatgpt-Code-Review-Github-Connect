@@ -89,7 +89,7 @@ function grokNotStatusArea(el) {
 function grokStatusStrip(form) {
   for (const status of form.querySelectorAll('[role="status"]')) {
     if (grokNotStatusArea(status) || !elVisible(status)) continue;
-    if (/^Generating\b/.test((status.textContent || "").trim())) return status;
+    if (/^generating\b/i.test((status.textContent || "").replace(/\s+/g, " ").trim())) return status;
   }
   return null;
 }

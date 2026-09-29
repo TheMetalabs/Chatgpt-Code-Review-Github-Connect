@@ -162,13 +162,16 @@ function currentAssistantRoot() {
   return (unitTurn(last) && last.closest("[data-content-search-turn-key]")) || last.closest("article, section") || last;
 }
 
-/** Grok answer actions (copy / like / dislike / more), or, once a stream was actually seen, the
+/** Never while Grok's composer shows a stream. Then Grok answer actions (copy / like / dislike / more), or, once a stream was actually seen, the
  * composer idle again with text in the bubble. Idle before the stop control appears is not done:
  * Submit is showing the whole time until generation starts. */
 function grokReplyDoneVisible(root) {
   if (!root?.querySelectorAll) return false;
   const bubble = root.matches?.("[data-testid='assistant-message']") ? root : root.querySelector("[data-testid='assistant-message']");
   if (!bubble) return false;
+  // While the composer shows a stream, the answer is not done, whatever action row is still showing
+  // (a regenerate streams under the previous response's Copy / Like controls).
+  if (grokStreamVisible(document)) return false;
   const action = /^(?:copy response|copy|like|dislike|more actions|응답 복사|복사|좋아요|싫어요|더 보기|더보기|신고)$/i;
   for (const el of root.querySelectorAll("button, [role='button']")) {
     if (el.closest("pre, code, .chat-code-block")) continue;
@@ -177,7 +180,7 @@ function grokReplyDoneVisible(root) {
     return true;
   }
   const text = (bubble.innerText || bubble.textContent || "").trim();
-  if (text.length < 2 || grokStreamVisible(document)) return false;
+  if (text.length < 2) return false;
   if (!grokSawCurrentStream()) return false;
   const form = document.querySelector("form[data-composer]");
   if (!form) return false;

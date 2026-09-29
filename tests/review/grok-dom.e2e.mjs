@@ -135,6 +135,25 @@ test('grok transcript, stream, and composer: roles, code, submit, and done only 
   assert.equal(liveVoice, true);
 });
 
+test('grok answer actions never finish an answer while the composer shows a stream (a regenerate under the old Copy)', async t => {
+  const page = await openGrok(t, `<main>
+    <div data-testid="user-message" id="response-user-A" role="article" aria-label="You">review</div>
+    <div id="answer">
+      <div data-testid="assistant-message" id="response-answer-A" role="article" aria-label="Grok">previous answer text</div>
+      <button aria-label="Copy response" style="width:64px;height:32px">copy</button>
+      <button aria-label="Like" style="width:32px;height:32px">like</button>
+    </div>
+  </main>${COMPOSER}`);
+  const result = await page.evaluate(strip => {
+    const before = replyDoneVisible();
+    document.querySelector('form').insertAdjacentHTML('afterbegin', strip);
+    const streaming = replyDoneVisible();
+    document.getElementById('grok-strip').remove();
+    return {before, streaming, after: replyDoneVisible()};
+  }, grokStrip());
+  assert.deepEqual(result, {before: true, streaming: false, after: true});
+});
+
 function privatePill(on) {
   const href = on ? '/c' : '/c#private';
   const aria = on ? '기본 채팅으로 전환' : 'Switch to Private Chat';

@@ -47,6 +47,10 @@ export type LocalReviewDeps = {
   extra?: string;
   /** Optional: heartbeat callback at each turn boundary with group/iteration/stage info. */
   onProgress?: (p: { group: number; groups: number; iter: number; stage: string }) => void;
+  /** Optional: called at every turn boundary (before each request, including a group's first). The
+   * host lends the local model to waiting short jobs (JSON repair) here and resolves once it is back.
+   * Each request carries the whole history, so nothing of this review is lost by the pause. */
+  checkpoint?: () => Promise<void>;
   signal?: AbortSignal;
   log?: (line: string) => void;
   now?: () => number;
@@ -318,6 +322,11 @@ async function reviewGroup(
     Math.max(lastPromptTokens, Math.ceil(messages.reduce((n, m) => n + msgSize(m), 0) / CHARS_PER_TOKEN));
 
   for (let iter = 1; iter <= t.toolIterCap + 1; iter += 1) {
+    if (deps.checkpoint) {
+      await deps.checkpoint();
+      // Cancelled while the model was lent out: stop before sending (the caller records the abort).
+      if (deps.signal?.aborted) throw deps.signal.reason ?? new Error("local review cancelled at a turn boundary");
+    }
     deps.onProgress?.({ ...groupMeta, iter, stage: "generating" });
     injectNewPeers(messages, deps, injectedPeers);
     const forceFinal = iter > t.toolIterCap || (t.ctxCapTokens > 0 && contextTokens() > t.ctxCapTokens);

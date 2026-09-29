@@ -1,4 +1,5 @@
 import type {RepairRecord} from "@/lib/json-repair-types";
+import {repairWaitingLabel} from "@/lib/repair-status-label";
 export type RepairHistoryRow = Omit<RepairRecord,"original"> & {original?:string};
 const labels: Record<RepairRecord["status"],string> = {
   running:"Local formatting queued or running",
@@ -9,6 +10,9 @@ const labels: Record<RepairRecord["status"],string> = {
   interrupted:"Inference outcome unknown after restart; not automatically repeated",
   needs_attention:"Validation or transport failed; original retained",
 };
+function repairStatusLabel(repair: RepairHistoryRow): string {
+  return repairWaitingLabel(repair) ?? (labels[repair.status] || repair.status);
+}
 export function RepairHistory({repairs}:{repairs:RepairHistoryRow[]}) {
   if(!repairs.length)return null;
   return <section aria-label="Local JSON repair history" className="space-y-3">
@@ -16,7 +20,7 @@ export function RepairHistory({repairs}:{repairs:RepairHistoryRow[]}) {
     <p className="text-xs text-fg-muted">Formatting only, not an additional Local reviewer vote. The original is never replaced.
       Queue/generation duration is not limited. An uncertain or rejected attempt is not automatically repeated.</p>
     {repairs.map(repair=><details key={repair.id} className="rounded border border-line p-3">
-      <summary className="text-sm">{repair.provider} · {labels[repair.status] || repair.status}</summary>
+      <summary className="text-sm">{repair.provider} · {repairStatusLabel(repair)}</summary>
       <p className="mt-2 font-mono text-xs break-all">Model: {repair.model} · attempts: {repair.attempts}<br/>
         Schema: {repair.schema} / {repair.schemaVersion} · run: {repair.runId}<br/>
         Response: {repair.responseId}<br/>Source SHA-256: {repair.sourceHash}<br/>

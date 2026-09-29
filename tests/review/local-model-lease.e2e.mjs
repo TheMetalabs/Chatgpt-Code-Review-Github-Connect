@@ -114,8 +114,9 @@ test('a cancellation landing between the lease grant and the leg continuing send
         return handle;
       },
       releaseOwner:owner=>lease.releaseOwner(owner),position:owner=>lease.position(owner),snapshot:()=>lease.snapshot(),
+      checkpoint:(handle,cap)=>lease.checkpoint(handle,cap),
     };
-    return {localModelLease:()=>proxy};
+    return {...real,localModelLease:()=>proxy};
   }};
   app=await appFixture({reviewChatgpt:false,localReviewMode:'multiturn',localJsonRepairEnabled:false},{wrap});
   t.after(()=>app.close());
@@ -190,4 +191,36 @@ test('queued-without-output: buffered headers with no body abort and release the
   await eventually(()=>job(app,a)?.assumptions?.some(s=>/queued without output/i.test(s)),'A was not aborted for queued-without-output after headers with no body');
   await eventually(()=>app.localRequests.length===2||job(app,b)?.providerProgress?.local?.stage==='local_queued',
     'B did not take the lease after A released it');
+});
+
+test('short lane: a holding review lends the model to a waiting short job at its next turn boundary, then resumes ahead of queued reviews', async t=>{
+  // The app runs in its own module graph: reach ITS process-wide lease through the fixture's wrap hook.
+  let leaseModule;
+  const wrap={'src/lib/local-model-lease.ts':real=>{leaseModule=real;return real;}};
+  const app=await appFixture({reviewChatgpt:false,localReviewMode:'multiturn',localJsonRepairEnabled:false},{wrap});
+  t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const localModelLease=()=>leaseModule.localModelLease();
+  const a=await started(app,1);
+  await eventually(()=>app.localRequests.length===1,'A1 not sent');
+  const b=await started(app,2);
+  await eventually(()=>job(app,b)?.providerProgress?.local?.stage==='local_lease_waiting','B is not waiting');
+  // A JSON repair (short lane) arrives while A1 is generating: it never preempts A1.
+  let shortHandle;
+  const short=localModelLease().acquire('repair:e2e',{lane:'short'}).then(h=>{shortHandle=h;});
+  await settle();
+  assert.equal(shortHandle,undefined,'no preemption mid-turn');
+  assert.deepEqual([...localModelLease().snapshot().queued],['repair:e2e',b]);
+  await answer(app,0,toolTurn); // A1 completes; A's next turn boundary lends the model to the short job
+  await short;
+  assert.ok(shortHandle,'the short job was granted at A\'s turn boundary');
+  await settle();
+  assert.equal(app.localRequests.length,1,'A2 waits while the short job holds the lent model; B never cuts in');
+  shortHandle.release();
+  await eventually(()=>app.localRequests.length===2,'A did not resume after the short job');
+  await answer(app,1,final);
+  await eventually(()=>job(app,a)?.status==='posted','A did not post');
+  await eventually(()=>app.localRequests.length===3,'B1 not sent after A released');
+  await answer(app,2,final);
+  await eventually(()=>job(app,b)?.status==='posted','B did not post');
 });

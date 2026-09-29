@@ -4,6 +4,7 @@ import {MAX_REPAIR_CHARS, REPAIR_SCHEMA_VERSION, escapeStrayQuotes, inspectRevie
 import type {RepairRecord, RepairStatus} from "./json-repair-types.ts";
 import type {BotSettings} from "./types.ts";
 import type {ReviewHistoryStore} from "./review-history.server.ts";
+import {localModelLease, type LocalModelLease} from "./local-model-lease.ts";
 export type RepairInput = Pick<RepairRecord,"jobId"|"provider"|"runId"|"responseId"|"original"|"sourceHash"|"schema"|"headSha">;
 type Dependencies = {
   settings(): BotSettings;
@@ -12,6 +13,8 @@ type Dependencies = {
   isAccepted(record: RepairRecord): boolean;
   accept(record: RepairRecord): Promise<{ok:boolean; error?:string; code?:string}>;
   request?: typeof requestLocalChat;
+  /** The process-wide local-model lease (injected for tests). */
+  lease?: () => LocalModelLease;
 };
 /** The only policy switch is localJsonRepairEnabled. reviewLocal controls a
  * separate code-review job and must never authorize or inhibit format repair. */
@@ -46,6 +49,7 @@ export class JsonRepairService {
   private report(record:RepairRecord) {
     return {id:record.id,status:record.status,sourceHash:record.sourceHash,responseId:record.responseId,
       runId:record.runId,schema:record.schema,errors:record.errors,
+      ...(record.status==="running" && typeof record.modelQueuePosition==="number" ? {modelQueuePosition:record.modelQueuePosition} : {}),
       ...(["ready","accepted"].includes(record.status) ? {raw:record.raw} : {})};
   }
   start(input:RepairInput) {
@@ -76,7 +80,7 @@ export class JsonRepairService {
       if(controller.signal.aborted || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))return;
       const settings=this.deps.settings();
       // A known, deterministic slip needs no model; its result is validated below like any candidate.
-      const candidate=escapeStrayQuotes(record.original) ?? await this.requestCandidate(record,settings,controller.signal);
+      const candidate=escapeStrayQuotes(record.original) ?? await this.withModel(record,controller.signal,()=>this.requestCandidate(record,settings,controller.signal));
       const current=this.deps.history().getRepair(record.jobId,record.id);
       if(!current || current.status!=="running" || this.fenced.has(record.id))return;
       if(!localJsonRepairAvailable(this.deps.settings())){this.change(current,"disabled");return;}
@@ -92,6 +96,27 @@ export class JsonRepairService {
       this.change(current,"needs_attention",[error instanceof LocalChatCutOff ?
         `finish_reason_${error.finishReason.replace(/[^a-z_]/gi,"").slice(0,32)}` : "local_request_failed_or_incomplete_no_automatic_retry"]);
     }
+  }
+  /** Hold the shared local-model lease in the short lane across every request of this repair (1-3):
+   * granted before queued fix/review jobs, and lent by a review that holds the model at its next turn
+   * boundary. While waiting, the record shows its queue position ("repair waiting for local model").
+   * Abort-aware (a cancel leaves the queue at once); released in finally. */
+  private async withModel<T>(record:RepairRecord,signal:AbortSignal,work:()=>Promise<T>):Promise<T> {
+    const mark=(position?:number)=>{
+      try {
+        const cur=this.deps.history().getRepair(record.jobId,record.id);
+        if(!cur || cur.status!=="running" || this.fenced.has(record.id) || cur.modelQueuePosition===position)return;
+        const next={...cur,updatedAt:Date.now()};
+        if(position===undefined)delete next.modelQueuePosition;else next.modelQueuePosition=position;
+        this.write(next);
+      }catch{/* display only: an archive hiccup never blocks the repair */}
+    };
+    const handle=await (this.deps.lease?.() ?? localModelLease()).acquire(`repair:${record.id}`,{lane:"short",signal,onPosition:mark});
+    try {
+      mark(undefined);
+      if(signal.aborted)throw signal.reason ?? new Error("local JSON repair cancelled before its request");
+      return await work();
+    } finally {handle.release();}
   }
   private async requestCandidate(record:RepairRecord,settings:BotSettings,signal:AbortSignal) {
     // Thinking shares the completion budget (#87). Headroom 8192 (was 4096) leaves room for a

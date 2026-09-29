@@ -47,6 +47,17 @@ const ALLOW = new Set([
   "src/lib/local-fix-request.server.ts",
   "scripts/boundary-scope.mjs",
   "scripts/boundary-scope.test.mjs",
+  // JSON repair takes the lease in the short lane and shows "repair waiting for local model": an
+  // optional display-only field on the repair record, its label helper, and the history row.
+  "src/lib/json-repair-types.ts",
+  "src/lib/repair-status-label.ts",
+  "src/components/repair-history.tsx",
+  "tests/review/json-repair-service.test.mjs",
+  "tests/review/json-repair-lane.test.mjs",
+  // Test-only: repairs now take turns on the shared local model (serialized; lent at a local review's
+  // turn boundary). Receipt/commit assertions are unchanged.
+  "tests/review/json-repair.e2e.mjs",
+  "docs/local-json-repair.md",
   "src/lib/local-leg-activity.test.ts",
   "src/lib/review-progress.ts",
   "src/lib/review-history.server.ts",

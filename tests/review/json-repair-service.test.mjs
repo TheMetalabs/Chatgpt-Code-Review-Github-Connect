@@ -118,11 +118,11 @@ test('a stray-quote slip is repaired without a Local call and its commit is acce
 
 // #87 failure A2(i): with no max_tokens the server's 8192-token default (thinking included) ended
 // every repair before it could re-emit the original, and the record said only "failed".
-test('the Local request carries a token budget for re-emitting the original, and thinking stays on by default',async t=>{
+test('the Local request carries a token budget for re-emitting the original, and thinking is off by default',async t=>{
  const long=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "condition"','b.ts: '+'x'.repeat(20000)]}).replace(/\\"/g,'"');
  const f=fixture(t);f.service.start({...input,original:long,sourceHash:hash(long)});await flush();
  assert.equal(f.calls[0][2].max_tokens,Math.ceil(long.length/2)+8192);
- assert.equal('chat_template_kwargs' in f.calls[0][2],false);
+ assert.deepEqual(f.calls[0][2].chat_template_kwargs,{enable_thinking:false});
 });
 // Before #87 no budget was sent and omlx used its 8192-token default; a short original (the common
 // zero-to-two-finding review) must never get less than that, since thinking shares the budget.
@@ -132,16 +132,21 @@ test('a short original still gets at least the 8192 tokens the server default us
  assert.equal(f.calls[0][2].max_tokens,expected);
  assert.ok(expected>=8192);
 });
-test('ASHLAR_LOCAL_REPAIR_NO_THINKING turns thinking off for the Local repair request only when set',async t=>{
- assert.equal(DEFAULT_SETTINGS.localRepairNoThinking,false);
+test('thinking is off for the Local repair request by default; ASHLAR_LOCAL_REPAIR_NO_THINKING=false opts out',async t=>{
+ assert.equal(DEFAULT_SETTINGS.localRepairNoThinking,true);
  const saved=process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;t.after(()=>{if(saved===undefined)delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;else process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING=saved;});
- process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING='true';
- const flagged=sanitizeBotSettings(overlayEnv({}));assert.equal(flagged.localRepairNoThinking,true);
- assert.equal(botSettingsToEnv(flagged).ASHLAR_LOCAL_REPAIR_NO_THINKING,'true');
- delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;assert.equal(sanitizeBotSettings(overlayEnv({})).localRepairNoThinking,false);
- const f=fixture(t);f.settings.localRepairNoThinking=true;f.service.start(input);await flush();
- assert.deepEqual(f.calls[0][2].chat_template_kwargs,{enable_thinking:false});
+ delete process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING;
+ const unset=sanitizeBotSettings(overlayEnv({}));assert.equal(unset.localRepairNoThinking,true,'no env, no saved value: thinking off');
+ assert.equal(botSettingsToEnv(unset).ASHLAR_LOCAL_REPAIR_NO_THINKING,'true');
+ process.env.ASHLAR_LOCAL_REPAIR_NO_THINKING='false';
+ const optedOut=sanitizeBotSettings(overlayEnv({}));assert.equal(optedOut.localRepairNoThinking,false,'the opt-out is kept');
+ assert.equal(botSettingsToEnv(optedOut).ASHLAR_LOCAL_REPAIR_NO_THINKING,'false');
+ assert.equal(sanitizeBotSettings({localRepairNoThinking:false}).localRepairNoThinking,false,'a saved opt-out survives');
+ const f=fixture(t);f.service.start(input);await flush();
+ assert.deepEqual(f.calls[0][2].chat_template_kwargs,{enable_thinking:false},'default settings send enable_thinking:false');
  assert.equal(f.calls[0][2].max_tokens,Math.max(8192,Math.ceil(original.length/2)+8192));
+ const g=fixture(t,{response:raw});g.settings.localRepairNoThinking=false;g.service.start({...input,jobId:'A'});await flush();
+ assert.equal('chat_template_kwargs' in g.calls[0][2],false,'opted out: the field is not sent');
 });
 test('a Local reply cut off at the token limit is retried once with a larger budget, then recorded as finish_reason_length',async t=>{
  const bodies=[];

@@ -150,7 +150,9 @@ test('HTTP: terminating ChatGPT repair leaves the ready Grok repair usable',asyn
  const grok={...binding,provider:'grok',runId:'run-Grok',responseId:'response-Grok'};
  assert.equal((await post(app,{action:'progress',...grok,progress:{grok:{runId:grok.runId,events:[{source:'page',sequence:1,at:Date.now(),stage:'response_completed_json_invalid'}]}}})).ok,true);
  const b=await post(app,{action:'repair',...grok,source:{text:original,totalChars:original.length,truncated:false,responseId:grok.responseId,completed:true,stable:true}});
- await eventually(()=>app.localRequests.length===2,'parallel repairs not started');respond(app,raw,0);respond(app,raw,1);
+ // Both repairs share the local model (short lane of the local-model lease): the second starts once the first ends.
+ await eventually(()=>app.localRequests.length===1,'first repair not started');respond(app,raw,0);
+ await eventually(()=>app.localRequests.length===2,'second repair not started after the first');respond(app,raw,1);
  const get=(identity,id,action='repair-status')=>post(app,{action,...identity,repairId:id});
  await eventually(async()=>(await get(binding,a.repair.id)).repair.status==='ready' && (await get(grok,b.repair.id)).repair.status==='ready','both candidates not ready');
  assert.equal((await post(app,{action:'failure',...binding,error:'tab_closed: explicitly closed'})).ok,true);
@@ -164,10 +166,16 @@ test('HTTP: terminating ChatGPT repair leaves the ready Grok repair usable',asyn
 // A committed format repair must stay authoritative per provider, not merely
 // when every element of an incoming completion batch happens to be a duplicate.
 const plain=value=>JSON.parse(JSON.stringify(value));
+const isFormatter=request=>/formatting-only JSON repair/.test(request.messages?.[0]?.content||'');
+const formatterCalls=app=>app.localRequests.filter(isFormatter).length;
+/** Answer the independent Local review's latest (pending) request with its final review JSON. */
+const respondLocal=app=>respond(app,raw,app.localRequests.map((r,i)=>isFormatter(r)?-1:i).filter(i=>i>=0).at(-1));
 async function committedRepairFixture(t,provider='chatgpt') {
- const {app,binding:initial}=await setup(t,{reviewLocal:true,reviewGrok:true});
- // Keep the independent Local reviewer pending throughout the mixed deliveries.
- // The second HTTP request is format repair, not a second independent review.
+ const {app,binding:initial}=await setup(t,{reviewLocal:true,reviewGrok:true,localReviewMode:'multiturn'});
+ app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+ // Keep the independent Local reviewer pending throughout the mixed deliveries. It holds the shared
+ // local model (local-model lease); its first turn asks for a tool, and at that turn boundary it lends
+ // the model to the waiting format repair (short lane), then keeps its next turn pending.
  await eventually(()=>app.localRequests.length===1,'independent Local review did not start');
  const binding={...initial,provider,runId:provider===initial.provider?initial.runId:`run-${provider}`,responseId:`response-${provider}`};
  assert.equal((await post(app,{action:'progress',...binding,progress:{[provider]:{runId:binding.runId,
@@ -175,9 +183,15 @@ async function committedRepairFixture(t,provider='chatgpt') {
  const started=await post(app,{action:'repair',...binding,source:{text:original,totalChars:original.length,
   truncated:false,responseId:binding.responseId,completed:true,stable:true}});
  assert.equal(started.repair.status,'running');
+ await new Promise(resolve=>setTimeout(resolve,50));
+ assert.equal(app.localRequests.length,1,'the repair waits for the Local turn in flight');
+ app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{content:'',tool_calls:[
+  {id:'read-1',type:'function',function:{name:'file_read',arguments:JSON.stringify({file_path:'a.ts'})}}]}}],usage:{prompt_tokens:10}}));
  await eventually(()=>app.localRequests.length===2,'formatter request did not start');
+ assert.ok(isFormatter(app.localRequests[1]),'the turn boundary lent the model to the repair');
  assert.equal(JSON.parse(app.localRequests[1].messages[1].content).original,original);
  respond(app,raw,1);
+ await eventually(()=>app.localRequests.length===3,'the Local review did not resume after the repair');
  const repair=action=>post(app,{action,...binding,repairId:started.repair.id});
  await eventually(async()=>(await repair('repair-status')).repair.status==='ready','formatter candidate not ready');
  assert.equal((await repair('repair-commit')).repair.status,'accepted');
@@ -194,7 +208,8 @@ async function committedRepairFixture(t,provider='chatgpt') {
   const archived=app.history.getJob(binding.jobId,true).responses[provider];
   assert.equal(archived.json,expected.raw);assert.equal(archived.original,expected.originalText,'duplicate delivery changed the archived original');
   assert.equal(app.history.getRepair(binding.jobId,started.repair.id).status,'accepted');
-  assert.equal(app.localRequests.length,2,'delivery replay started an extra model call');
+  assert.equal(formatterCalls(app),1,'delivery replay started an extra model call');
+  assert.equal(app.localRequests.length,3,'no extra model call at all (Local turn 2 stays pending)');
  };
  return {app,binding,provider,peer,repair,live,stored,expected,complete,assertPreserved};
 }
@@ -211,7 +226,7 @@ for(const provider of ['chatgpt','grok'])for(const order of ['first','last'])
   const denied=await f.complete([conflicting]);assert.equal(denied.http,409);assert.equal(denied.code,'lease_conflict');
   f.assertPreserved();assert.equal((await f.repair('repair-commit')).repair.status,'accepted');
   assert.equal((await f.complete(batch)).ok,true);f.assertPreserved();
-  respond(f.app,raw,0);await eventually(()=>f.app.reviews.length===1,'pending Local completion did not publish');
+  respondLocal(f.app);await eventually(()=>f.app.reviews.length===1,'pending Local completion did not publish');
   f.assertPreserved();assert.deepEqual(Array.from(f.live().storedLegs,leg=>leg.provider).sort(),['chatgpt','grok','local']);
   assert.equal((await f.complete(batch)).ok,true);f.assertPreserved();assert.equal(f.app.reviews.length,1);
  });
@@ -226,7 +241,7 @@ for(const provider of ['chatgpt','grok'])test(`mixed receipt: ${provider} raw-on
 for(const stage of ['awaiting_chat','posted'])test(`mixed receipt: all-duplicate replay preserves archived original (${stage})`,async t=>{
  const f=await committedRepairFixture(t);
  if(stage==='posted'){
-  assert.equal((await f.complete([f.peer])).ok,true);respond(f.app,raw,0);
+  assert.equal((await f.complete([f.peer])).ok,true);respondLocal(f.app);
   await eventually(()=>f.app.reviews.length===1,'job not posted');assert.equal(f.live().status,'posted');
  }
  assert.equal((await f.complete([{provider:f.provider,raw,originalText:'untrusted duplicate text'}])).ok,true);
@@ -251,7 +266,7 @@ for(const failure of ['repaired','peer'])test(`mixed receipt: ${failure} archive
  assert.deepEqual(plain(f.live().storedLegs),before);f.assertPreserved();assert.equal(f.app.reviews.length,0);
  f.app.history.recordResponse=record;
  assert.equal((await f.complete(batch)).ok,true);f.assertPreserved();
- respond(f.app,raw,0);await eventually(()=>f.app.reviews.length===1,'retry did not unblock publication');f.assertPreserved();
+ respondLocal(f.app);await eventually(()=>f.app.reviews.length===1,'retry did not unblock publication');f.assertPreserved();
 });
 test('mixed receipt: repeated same-provider entries cannot add a vote or replace the stored original',async t=>{
  const f=await committedRepairFixture(t);

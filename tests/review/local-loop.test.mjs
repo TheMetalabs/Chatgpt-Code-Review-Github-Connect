@@ -543,3 +543,29 @@ test("a named watchdog abort reason is kept so the operator can tell queued-with
   assert.equal(out.ok, false);
   assert.match(out.error, /queued without output/);
 });
+
+test("checkpoint runs at every turn boundary, before each request (a group's first included)", async () => {
+  const log = [];
+  const { request: inner } = mock([
+    assistant("", [toolCall("file_read", { file_path: "src/pay.ts" })]),
+    assistant(REVIEW_JSON),
+  ]);
+  const request = async (...args) => { log.push("request"); return inner(...args); };
+  const checkpoint = async () => { log.push("checkpoint"); await new Promise((r) => setImmediate(r)); };
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request, checkpoint });
+  assert.equal(out.ok, true);
+  assert.deepEqual(log, ["checkpoint", "request", "checkpoint", "request"]);
+});
+
+test("a review cancelled while its checkpoint lent the model stops before sending", async () => {
+  const ac = new AbortController();
+  const { request, bodies } = mock([
+    assistant("", [toolCall("file_read", { file_path: "src/pay.ts" })]),
+    assistant(REVIEW_JSON),
+  ]);
+  let calls = 0;
+  const checkpoint = async () => { calls += 1; if (calls === 2) ac.abort(new Error("job cancelled")); };
+  const out = await runLocalReviewLoop(sampleWith(["src/pay.ts"]), settings, { request, checkpoint, signal: ac.signal });
+  assert.equal(bodies.length, 1, "no request after the checkpoint that saw the cancel");
+  assert.equal(out.ok, false);
+});

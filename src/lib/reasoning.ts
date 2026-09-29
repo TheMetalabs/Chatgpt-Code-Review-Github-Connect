@@ -5,9 +5,11 @@ export type ChatgptReasoning = (typeof CHATGPT_REASONING)[number];
 // real level instead of a dead one.
 export const DEFAULT_CHATGPT_REASONING: ChatgptReasoning = "extra_high";
 
-export const GROK_REASONING = ["auto", "fast", "expert", "heavy"] as const;
+export const GROK_REASONING = ["auto", "fast", "expert", "build", "heavy"] as const;
 export type GrokReasoning = (typeof GROK_REASONING)[number];
-export const DEFAULT_GROK_REASONING: GrokReasoning = "heavy";
+// Expert is the review default. Build is the in-chat app builder (and private chat can block it).
+// Heavy stays selectable for plans that have it; a saved Heavy is not rewritten.
+export const DEFAULT_GROK_REASONING: GrokReasoning = "expert";
 
 export const CHATGPT_REASONING_LABEL: Record<ChatgptReasoning, string> = {
   instant: "Instant",
@@ -21,6 +23,7 @@ export const GROK_REASONING_LABEL: Record<GrokReasoning, string> = {
   auto: "Auto / 자동",
   fast: "Fast / 빠른",
   expert: "Expert / 전문가",
+  build: "Build / 빌드",
   heavy: "Heavy / 헤비 (highest)",
 };
 
@@ -54,6 +57,7 @@ export function grokReasoningMatches(level: GrokReasoning, text: string): boolea
   const t = String(text || "").replace(/\s+/g, " ").trim();
   if (level === "heavy") return /(?:^|\s)(heavy|헤비)(?:\s|$)/i.test(t);
   if (level === "expert") return /(?:^|\s)(expert|전문가)(?:\s|$)/i.test(t);
+  if (level === "build") return /(?:^|\s)(build|빌드)(?:모드)?(?:\s|$)/i.test(t);
   if (level === "fast") return /(?:^|\s)(fast|빠른)(?:\s|$)/i.test(t);
   if (level === "auto") return /(?:^|\s)(auto|자동)(?:\s|$)/i.test(t);
   return false;

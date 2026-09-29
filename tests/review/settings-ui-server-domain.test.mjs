@@ -73,7 +73,7 @@ function samples(key) {
     localLlmBaseUrl: S,
     localLlmModel: S,
     chatgptReasoning: ['instant', 'medium', 'high', 'extra_high', 'pro', 'bogus', '', 3, null],
-    grokReasoning: ['auto', 'fast', 'expert', 'heavy', 'bogus', '', 3, null],
+    grokReasoning: ['auto', 'fast', 'expert', 'build', 'heavy', 'bogus', '', 3, null],
     localReviewMode: ['single', 'multiturn', 'auto', 'turbo', '', 1, null],
     reviewOrder: [['local', 'chatgpt', 'grok'], ['grok', 'chatgpt', 'local'], ['grok'], ['local', 'local', 'grok'], ['local', 'chatgpt', 'bing'],
       ['local', 'chatgpt', 'grok', 'grok'], [], 'local', null],

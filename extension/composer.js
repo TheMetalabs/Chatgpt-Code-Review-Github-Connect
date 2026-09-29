@@ -650,7 +650,8 @@ function composerControlSelector() {
   const roles = ["button", "link", "menuitem", "menuitemcheckbox", "menuitemradio", "switch", "checkbox", "radio", "combobox",
     "option", "tab", "textbox", "slider"].map(role => `[role="${role}"]`);
   return ["button", "a[href]", "input", "select", "textarea", "label", "summary", "[aria-haspopup]", ...roles,
-    "#composer-submit-button", '[data-testid="send-button"]', '[data-testid="stop-button"]'].join(", ");
+    "#composer-submit-button", '[data-testid="send-button"]', '[data-testid="stop-button"]',
+    '[data-testid="chat-submit"]', '[data-testid="bot-voice-call-start"]', "#model-select-trigger"].join(", ");
 }
 /** The file chips in a composer form: every element in a fileChipSelector shape, except a control
  * that is a chip only by its title (its tooltip: "Send prompt", "Start voice mode"). A named group or
@@ -724,13 +725,13 @@ function chipShowsFile(chip, name) {
 /** The rendered chips in a form that could be a staged file's: never an element that holds the editor
  * or the send control (that is the composer, not a file). */
 function stagedChips(form) {
-  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"]';
+  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"], [data-testid="chat-submit"], #model-select-trigger';
   return fileChips(form).filter(chip => renderedControl(chip) && !chip.matches(editorish) && !chip.querySelector(editorish));
 }
 /** A chip's card: the largest ancestor inside the form that holds this chip and no other file chip,
  * editor or send control. A file's progress ring can sit beside its named element in that card. */
 function chipCard(chip, form, chips) {
-  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"]';
+  const editorish = '[contenteditable="true"], textarea, #composer-submit-button, [data-testid="send-button"], [data-testid="chat-submit"], #model-select-trigger';
   let card = chip;
   for (let up = chip.parentElement; up && up !== form && form.contains(up); up = up.parentElement) {
     if (up.querySelector(editorish) || chips.some(other => !chip.contains(other) && !other.contains(chip) && up.contains(other))) break;

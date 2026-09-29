@@ -11,14 +11,16 @@ import {
 } from "./reasoning.ts";
 
 describe("reasoning defaults", () => {
-  it("defaults unknown values to the current highest tier (extra_high, since gpt-6-pro is gone)", () => {
+  it("defaults unknown ChatGPT values to extra_high and unknown Grok values to expert", () => {
     assert.equal(normalizeChatgptReasoning(undefined), "extra_high");
     assert.equal(normalizeChatgptReasoning("nope"), "extra_high");
     assert.equal(normalizeChatgptReasoning("high"), "high");
     assert.equal(DEFAULT_CHATGPT_REASONING, "extra_high");
-    assert.equal(normalizeGrokReasoning(""), "heavy");
+    assert.equal(normalizeGrokReasoning(""), "expert");
     assert.equal(normalizeGrokReasoning("expert"), "expert");
-    assert.equal(DEFAULT_GROK_REASONING, "heavy");
+    assert.equal(normalizeGrokReasoning("build"), "build");
+    assert.equal(normalizeGrokReasoning("heavy"), "heavy");
+    assert.equal(DEFAULT_GROK_REASONING, "expert");
   });
 
   it("never pins a model slug in the ChatGPT URL", () => {
@@ -41,5 +43,9 @@ describe("reasoning defaults", () => {
     assert.equal(grokReasoningMatches("fast", "빠른"), true);
     assert.equal(grokReasoningMatches("heavy", "헤비"), true);
     assert.equal(grokReasoningMatches("heavy", "빠른"), false);
+    assert.equal(grokReasoningMatches("expert", "전문가"), true);
+    assert.equal(grokReasoningMatches("build", "Build"), true);
+    assert.equal(grokReasoningMatches("build", "빌드"), true);
+    assert.equal(grokReasoningMatches("build", "Unavailable in Private Chats"), false);
   });
 });

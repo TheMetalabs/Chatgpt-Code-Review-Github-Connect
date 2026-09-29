@@ -54,7 +54,7 @@ describe("sanitizeBotSettings", () => {
     assert.equal(env.ASHLAR_LOCAL_LLM_MODEL, "qwen");
     const defaults = botSettingsToEnv(DEFAULT_SETTINGS);
     assert.equal(defaults.ASHLAR_CHATGPT_REASONING, "pro");
-    assert.equal(defaults.ASHLAR_GROK_REASONING, "heavy");
+    assert.equal(defaults.ASHLAR_GROK_REASONING, "expert");
   });
 
   it("persists skip/severity policy fields", () => {

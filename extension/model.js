@@ -16,6 +16,7 @@ function grokLevelHit(level, text) {
   const t = String(text || "").replace(/\s+/g, " ").trim();
   if (level === "heavy") return /(?:^|\s)(heavy|헤비)(?:\s|$)/i.test(t);
   if (level === "expert") return /(?:^|\s)(expert|전문가)(?:\s|$)/i.test(t);
+  if (level === "build") return /(?:^|\s)(build|빌드)(?:모드)?(?:\s|$)/i.test(t);
   if (level === "fast") return /(?:^|\s)(fast|빠른)(?:\s|$)/i.test(t);
   if (level === "auto") return /(?:^|\s)(auto|자동)(?:\s|$)/i.test(t);
   return false;
@@ -29,7 +30,9 @@ function chatgptPill() {
 }
 
 function grokPill() {
-  return document.querySelector("#model-select-trigger") || document.querySelector("button[aria-label='모델 선택']");
+  return document.querySelector("#model-select-trigger") ||
+    document.querySelector("button[aria-label='Model select']") ||
+    document.querySelector("button[aria-label='모델 선택']");
 }
 
 function reasoningMenuItems() {
@@ -44,12 +47,12 @@ function reasoningMenuItems() {
  * clicked, "skipped" when it cannot be picked by `deadline` (no pill, a menu that never opens, no
  * matching item): the run then continues with the current model, never waits on the menu. */
 async function selectReasoning(provider, level, deadline = Date.now() + 60_000) {
-  const want = String(level || (provider === "grok" ? "heavy" : "extra_high"));
+  const want = String(level || (provider === "grok" ? "expert" : "extra_high"));
   const hit = provider === "grok" ? grokLevelHit : chatgptLevelHit;
   const fallback =
     provider === "grok"
-      ? want === "heavy"
-        ? ["heavy", "expert"]
+      ? want === "heavy" || want === "build"
+        ? [want, "expert"]
         : [want]
       : want === "pro" || want === "extra_high"
         ? ["extra_high", "high", "medium"]
@@ -78,7 +81,7 @@ async function selectReasoning(provider, level, deadline = Date.now() + 60_000) 
   if (Date.now() >= deadline) { escape(); return "skipped"; }
   items = reasoningMenuItems();
   for (const key of fallback) {
-    const el = items.find((n) => hit(key, pillText(n)));
+    const el = items.find((n) => n?.getAttribute?.("aria-disabled") !== "true" && hit(key, pillText(n)));
     if (el instanceof HTMLElement) {
       el.click();
       await sleep(400);

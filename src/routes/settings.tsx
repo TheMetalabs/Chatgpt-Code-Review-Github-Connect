@@ -294,8 +294,9 @@ export function Settings() {
           </Field>
         </div>
         <p className="-mt-2 text-[12px] text-fg-subtle">
-          Temporary ChatGPT opens Instant; Grok often sits on Fast (빠른). Default is the highest available: 6 Pro and
-          Heavy. The bridge clicks those composer pills before sending the review prompt.
+          ChatGPT opens a temporary chat. Grok uses the top-bar personal private chat so the review stays
+          out of the sidebar. Grok's default is Expert (전문가). Heavy stays available, and Build is the
+          in-chat app builder rather than the review default. The bridge clicks that composer pill before sending.
         </p>
         <p className="-mt-2 text-[12px] text-fg-subtle">
           Up to three reviewers run the same snapshot in parallel. False-positive checks then run in the order

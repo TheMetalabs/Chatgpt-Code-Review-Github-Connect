@@ -432,7 +432,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localJsonRepairEnabled: true,
   localRepairNoThinking: false,
   chatgptReasoning: "pro",
-  grokReasoning: "heavy",
+  grokReasoning: "expert",
   localLlmBaseUrl: "http://127.0.0.1:11434/v1",
   localLlmApiKey: "",
   localLlmModel: "",

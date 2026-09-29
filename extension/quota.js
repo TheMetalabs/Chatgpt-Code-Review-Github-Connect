@@ -41,6 +41,46 @@ function elVisible(el) {
   return r.width > 0 && r.height > 0;
 }
 
+/** The user turn a Grok stream belongs to. The stop control lives in the composer, not on the bubble,
+ * so the mark is the turn, not the assistant node (that node mounts later, often without an id). */
+function grokStreamKey() {
+  if (typeof userTurnEls !== "function") return "";
+  const users = userTurnEls();
+  const last = users[users.length - 1];
+  const id = last && typeof turnMessageId === "function" ? turnMessageId(last) : "";
+  return id || `n:${users.length}`;
+}
+
+function markGrokStream() {
+  const key = grokStreamKey();
+  if (key && key !== "n:0") globalThis.__ashlarGrokSawStream = key;
+}
+
+/** Grok's in-flight composer (grok.com, 2026-09). Submit is removed while generating; the form shows
+ * a stop control ("Stop model response", localized) and a leaf whose text is exactly "Generating"
+ * (hardcoded English, not the locale catalog). Scoped to the composer so a transcript that says
+ * "stop" is not a stream, and so a later request's stop is not inside an older answer. */
+function grokStreamVisible(root = document) {
+  const form = root.querySelector?.("form[data-composer]");
+  if (!form) return false;
+  const stopLabel = /stop model response|stop generating|stop streaming|^abort$|중지|중단|정지|^stop$/i;
+  for (const el of form.querySelectorAll("button, [role='button']")) {
+    if (el.id === "model-select-trigger") continue;
+    const testid = el.getAttribute("data-testid") || "";
+    if (testid === "chat-submit" || testid === "bot-voice-call-start") continue;
+    const label = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    if (!label || label.length > 48 || !stopLabel.test(label) || !elVisible(el)) continue;
+    if (root === document || root === document.documentElement) markGrokStream();
+    return true;
+  }
+  for (const el of form.querySelectorAll("span, div, p")) {
+    if (el.children.length || (el.textContent || "").trim() !== "Generating" || !elVisible(el)) continue;
+    if (root === document || root === document.documentElement) markGrokStream();
+    return true;
+  }
+  return false;
+}
+
 function stopButtonVisible(root = document) {
   const stop = root.querySelector('[data-testid="stop-button"]');
   if (elVisible(stop)) return true;
@@ -50,7 +90,22 @@ function stopButtonVisible(root = document) {
     if (!elVisible(el)) continue;
     return true;
   }
-  return false;
+  return grokStreamVisible(root);
+}
+
+/** Ancestors of a Grok bubble that hold this answer's action row and no other turn. The composer
+ * stays out: its stop button belongs to whatever request is in flight, not to this answer. */
+function grokAnswerRoot(bubble) {
+  let node = bubble;
+  while (node?.parentElement && node.parentElement !== document.body && node.parentElement !== document.documentElement) {
+    const parent = node.parentElement;
+    if (parent.querySelector("form[data-composer]")) break;
+    const assistants = parent.querySelectorAll("[data-testid='assistant-message']");
+    const users = parent.querySelectorAll("[data-testid='user-message']");
+    if (assistants.length !== 1 || users.length !== 0) break;
+    node = parent;
+  }
+  return node;
 }
 
 /** Never reuse completion controls from an answer before the latest user turn. */
@@ -63,13 +118,40 @@ function currentAssistantRoot() {
   const messages = [...document.querySelectorAll(turnNodeSelector())];
   const last = messages[messages.length - 1];
   if (turnRole(last) !== "assistant") return null;
+  if (typeof grokTurn === "function" && grokTurn(last)) return grokAnswerRoot(last);
   // The unit DOM renders the answer's action row beside the unit, in its turn container.
   return (unitTurn(last) && last.closest("[data-content-search-turn-key]")) || last.closest("article, section") || last;
+}
+
+/** Grok answer actions (copy / like / dislike / more), or, once a stream was actually seen, the
+ * composer idle again with text in the bubble. Idle before the stop control appears is not done:
+ * Submit is showing the whole time until generation starts. */
+function grokReplyDoneVisible(root) {
+  if (!root?.querySelectorAll) return false;
+  const bubble = root.matches?.("[data-testid='assistant-message']") ? root : root.querySelector("[data-testid='assistant-message']");
+  if (!bubble) return false;
+  const action = /^(?:copy response|copy|like|dislike|more actions|응답 복사|복사|좋아요|싫어요|더 보기|더보기|신고)$/i;
+  for (const el of root.querySelectorAll("button, [role='button']")) {
+    if (el.closest("pre, code, .chat-code-block")) continue;
+    const label = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    if (!label || label.length > 48 || !action.test(label) || !elVisible(el)) continue;
+    return true;
+  }
+  const text = (bubble.innerText || bubble.textContent || "").trim();
+  if (text.length < 2 || grokStreamVisible(document)) return false;
+  if (globalThis.__ashlarGrokSawStream !== grokStreamKey()) return false;
+  const form = document.querySelector("form[data-composer]");
+  if (!form) return false;
+  const submit = form.querySelector('[data-testid="chat-submit"]');
+  const voice = form.querySelector('[data-testid="bot-voice-call-start"]') ||
+    [...form.querySelectorAll("button")].find((el) => /음성 모드 시작|start voice mode/i.test(el.getAttribute("aria-label") || ""));
+  return elVisible(submit) || elVisible(voice);
 }
 
 /** Current assistant-turn copy/feedback only, never hidden or previous-turn controls. */
 function replyDoneVisible(root = currentAssistantRoot()) {
   if (!root) return false;
+  if (grokReplyDoneVisible(root)) return true;
   if (elVisible(root.querySelector('[aria-label="응답 작업"], [aria-label="Response actions"]'))) return true;
   if (unitActionsVisible(root)) return true;
   for (const el of root.querySelectorAll('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]')) {

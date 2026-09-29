@@ -3,6 +3,8 @@
 // is outside the allowlist. Keeps ChatGPT/Grok/bridge/merge code frozen while the
 // local reviewer leg is reworked. See BOUNDARY.md.
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { hunksOutside, nonAdditiveHunks } from "./boundary-scope.mjs";
 
 // Measure this branch's own changes, not main's forward progress: diff from the merge-base so an
 // advancing origin/main (other sessions merging ChatGPT-path fixes) never looks like a violation.
@@ -40,10 +42,11 @@ const ALLOW = new Set([
   "src/lib/local-model-lease.ts",
   "tests/review/local-model-lease.test.mjs",
   "tests/review/local-model-lease.e2e.mjs",
-  // The local fix call only (requestLocalFix): it takes the same lease in the "fix" lane. The chat
-  // (Chrome-bridge) fix path in this file is unchanged.
-  "src/lib/review-loop-runtime.server.ts",
-  "src/lib/review-loop-runtime.server.test.ts",
+  // The local fix agent's model call (holds the local-model lease in the "fix" lane). The shared
+  // runtime file that routes to it is SCOPED below, not allowlisted whole.
+  "src/lib/local-fix-request.server.ts",
+  "scripts/boundary-scope.mjs",
+  "scripts/boundary-scope.test.mjs",
   "src/lib/local-leg-activity.test.ts",
   "src/lib/review-progress.ts",
   "src/lib/review-history.server.ts",
@@ -82,6 +85,32 @@ const ALLOW = new Set([
   "README.md",
 ]);
 
+// Shared files this branch may touch only within a sub-file scope (checked against the diff from BASE):
+// the rest of each file stays frozen and an edit there is a violation like any other.
+const SCOPED = {
+  // Only the productionRequestFix routing (its local-llm branch delegates to local-fix-request.server.ts).
+  // requestChatFix (the Chrome-bridge fix transport) and the loop control in this file stay frozen.
+  "src/lib/review-loop-runtime.server.ts": { declaration: "export function productionRequestFix(" },
+  // Tests for the local fix lane: new cases only; no existing line may change.
+  "src/lib/review-loop-runtime.server.test.ts": { additionsOnly: true },
+};
+
+function scopeViolation(file) {
+  const scope = SCOPED[file];
+  let oldText;
+  try { oldText = execFileSync("git", ["show", `${BASE}:${file}`], { encoding: "utf8" }); }
+  catch { return "not present at the base (a scoped file must already exist)"; }
+  let newText;
+  try { newText = readFileSync(file, "utf8"); } catch { return "deleted"; }
+  const diff = execFileSync("git", ["diff", "-U0", "--no-renames", BASE, "--", file], { encoding: "utf8" });
+  if (scope.additionsOnly) {
+    const bad = nonAdditiveHunks(diff);
+    return bad.length ? `changes existing lines (old line ${bad.map((h) => h.oldStart).join(", ")}); only additions are allowed` : null;
+  }
+  const outside = hunksOutside(diff, oldText, newText, scope.declaration);
+  return outside.length ? `edits outside \`${scope.declaration}…}\` (new line ${outside.map((h) => h.newStart).join(", ")})` : null;
+}
+
 // Never a real source change even though the symlink is not gitignored here.
 const IGNORE = new Set(["node_modules"]);
 
@@ -107,11 +136,14 @@ try {
   process.exit(1);
 }
 
-const offenders = [...changed].filter((f) => !ALLOW.has(f) && !IGNORE.has(f));
+const offenders = [...changed]
+  .filter((f) => !ALLOW.has(f) && !IGNORE.has(f))
+  .map((f) => ({ f, why: f in SCOPED ? scopeViolation(f) : "" }))
+  .filter(({ why }) => why !== null);
 
 if (offenders.length) {
   console.error(`✗ boundary violation: ${offenders.length} file(s) outside the local-LLM allowlist`);
-  for (const f of offenders) console.error(`   - ${f}`);
+  for (const { f, why } of offenders) console.error(`   - ${f}${why ? ` — scoped file ${why}` : ""}`);
   console.error("\nThese belong to the ChatGPT/Grok/bridge/merge path and are frozen on this branch.");
   console.error("If a change is genuinely local-LLM-only, add the path to ALLOW in scripts/check-local-llm-boundary.mjs and note it in BOUNDARY.md.");
   process.exit(1);

@@ -8,6 +8,10 @@
 // parser (syntactic extent, not a line pattern), and a file that does not parse fails closed.
 import ts from "typescript";
 
+// The base blob is canonical LF text; a text checkout may carry CRLF. Compare both as LF so a
+// line-ending conversion alone is never an edit (and never hides one: content still compares exactly).
+const lf = (text) => String(text).replace(/\r\n/g, "\n");
+
 function parse(text, file) {
   const sf = ts.createSourceFile(file, String(text), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const diags = sf.parseDiagnostics ?? [];
@@ -51,6 +55,7 @@ export function maskDeclarations(text, names, file = "scoped.ts") {
  * otherwise the reason. Fails closed: a parse error or a missing declaration is a violation. */
 export function outsideDeclarations(oldText, newText, names, file = "scoped.ts") {
   let a, b;
+  oldText = lf(oldText); newText = lf(newText);
   try { a = maskDeclarations(oldText, names, file); } catch (e) { return `base version ${e.message}`; }
   try { b = maskDeclarations(newText, names, file); } catch (e) { return `working version ${e.message}`; }
   if (a === b) return null;
@@ -62,7 +67,7 @@ export function outsideDeclarations(oldText, newText, names, file = "scoped.ts")
 
 /** null when `newText` keeps every line of `oldText`, in order (only additions); otherwise the reason. */
 export function notAdditionsOnly(oldText, newText) {
-  const oldLines = String(oldText).split("\n"), newLines = String(newText).split("\n");
+  const oldLines = lf(oldText).split("\n"), newLines = lf(newText).split("\n");
   let j = 0;
   for (let i = 0; i < oldLines.length; i++) {
     while (j < newLines.length && newLines[j] !== oldLines[i]) j++;

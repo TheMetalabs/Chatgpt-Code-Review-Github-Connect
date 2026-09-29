@@ -3,7 +3,7 @@
 // is outside the allowlist. Keeps ChatGPT/Grok/bridge/merge code frozen while the
 // local reviewer leg is reworked. See BOUNDARY.md.
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { notAdditionsOnly, outsideDeclarations } from "./boundary-scope.mjs";
 
 // Measure this branch's own changes, not main's forward progress: diff from the merge-base so an
@@ -107,8 +107,12 @@ function scopeViolation(file) {
   let oldText;
   try { oldText = execFileSync("git", ["cat-file", "blob", `${BASE}:${file}`], { encoding: "utf8" }); }
   catch { return "not present at the base (a scoped file must already exist)"; }
-  let newText;
-  try { newText = readFileSync(file, "utf8"); } catch { return "deleted"; }
+  // The path itself, not what it points to: a symlink (or any non-regular file) replacing a scoped
+  // file is a violation even when its target holds the base text.
+  let st;
+  try { st = lstatSync(file); } catch { return "deleted"; }
+  if (!st.isFile()) return `is no longer a regular file (${st.isSymbolicLink() ? "symbolic link" : "not a regular file"})`;
+  const newText = readFileSync(file, "utf8");
   if (scope.additionsOnly) return notAdditionsOnly(oldText, newText);
   return outsideDeclarations(oldText, newText, scope.declarations, file);
 }

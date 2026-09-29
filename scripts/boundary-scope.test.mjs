@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,6 +44,12 @@ test("statements appended on the declaration's closing line are outside it (#142
   assert.match(outsideDeclarations(OLD, lines.join("\n"), SCOPE), /edits outside/);
 });
 
+test("a CRLF checkout of an LF base is not an edit outside the scope; real edits still are", () => {
+  const crlf = OLD.replace(/\n/g, "\r\n");
+  assert.equal(outsideDeclarations(OLD, crlf, SCOPE), null);
+  assert.match(outsideDeclarations(OLD, crlf.replace("'chat'", "'CHAT'"), SCOPE), /edits outside/);
+});
+
 test("an unparsable or missing declaration fails closed", () => {
   assert.match(outsideDeclarations(OLD, OLD.replace("  return local();", "  return local(;"), SCOPE), /does not parse/);
   assert.match(outsideDeclarations(OLD, OLD.replace("productionRequestFix", "renamed"), SCOPE), /no top-level/);
@@ -61,6 +67,7 @@ test("notAdditionsOnly accepts inserted lines and flags any removed or changed l
   assert.match(notAdditionsOnly("a\nb\nc", "a\nB\nc"), /line 2/);
   assert.match(notAdditionsOnly("a\nb\nc", "a\nc"), /line 2/);
   assert.match(notAdditionsOnly("a\nb", "b\na"), /line 2/);
+  assert.equal(notAdditionsOnly("a\nb", "a\r\nb\r\nc"), null, "CRLF alone is not a change");
 });
 
 // End to end: the real checker on a throwaway repository whose scoped runtime file is edited with a
@@ -98,6 +105,26 @@ test("check-local-llm-boundary rejects a binary-diffed scoped edit outside produ
     r = run();
     assert.notEqual(r.status, 0);
     assert.match(r.stdout + r.stderr, /review-loop-runtime\.server\.test\.ts/);
+    // #142 review: a CRLF checkout of an LF blob with only an appended line is additions-only...
+    writeFileSync(test, "a\r\nb\r\nc\r\n");
+    r = run();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    // ...while changing an existing line is still rejected, CRLF or not.
+    writeFileSync(test, "a\r\nB\r\nc\r\n");
+    r = run();
+    assert.notEqual(r.status, 0);
+    // #142 review: a symlink to a byte-identical copy outside the repository replaces the scoped file.
+    const outside = mkdtempSync(join(tmpdir(), "boundary-target-"));
+    try {
+      writeFileSync(join(outside, "copy.ts"), "a\nb\n");
+      rmSync(test);
+      symlinkSync(join(outside, "copy.ts"), test);
+      r = run();
+      assert.notEqual(r.status, 0, "a symlinked scoped file must not pass");
+      assert.match(r.stdout + r.stderr, /review-loop-runtime\.server\.test\.ts.*symbolic link/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

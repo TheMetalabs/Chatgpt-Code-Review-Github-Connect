@@ -953,6 +953,12 @@ async function acquireLocalModel(jobId: string): Promise<LocalModelLeaseHandle> 
       updatedAt: now,
     }));
   }
+  // A cancellation (releaseJob) that lands between the grant and this continuation already revoked the
+  // lease: give it back and stop here, so a cancelled review never sends a request or holds the model.
+  if (signal?.aborted) {
+    handle.release();
+    throw signal.reason ?? new Error("local review cancelled before its first request");
+  }
   try { reviewHistory().recordServerStep(jobId, "local.lease_acquired"); } catch { /* visible history health */ }
   return handle;
 }

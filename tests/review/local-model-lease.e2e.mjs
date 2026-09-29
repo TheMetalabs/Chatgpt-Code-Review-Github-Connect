@@ -100,3 +100,37 @@ test('releaseJob frees the lease: cancelling the holder starts the next review w
   assert.equal(job(app,a).status,'cancelled');
   assert.equal(app.reviews.length,1,'only B posted');
 });
+
+test('a cancellation landing between the lease grant and the leg continuing sends nothing and frees the model', async t=>{
+  // Wrap the real lease so the first granted job is cancelled right after its grant resolves, before its
+  // local leg resumes (the window the #141 review named). Everything else is the production lease.
+  let app,armed=true;const cancelled=[];
+  const wrap={'src/lib/local-model-lease.ts':real=>{
+    const lease=real.localModelLease();
+    const proxy={
+      acquire:async(owner,opts)=>{
+        const handle=await lease.acquire(owner,opts);
+        if(armed){armed=false;cancelled.push(owner);app.harbor.cancelHarborJob(owner);}
+        return handle;
+      },
+      releaseOwner:owner=>lease.releaseOwner(owner),position:owner=>lease.position(owner),snapshot:()=>lease.snapshot(),
+    };
+    return {localModelLease:()=>proxy};
+  }};
+  app=await appFixture({reviewChatgpt:false,localReviewMode:'multiturn',localJsonRepairEnabled:false},{wrap});
+  t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const a=(await mentionPr(app,1)).jobId;
+  await eventually(()=>job(app,a)?.status==='cancelled','the job was not cancelled after its grant');
+  assert.deepEqual(cancelled,[a]);
+  await settle();
+  assert.equal(app.localRequests.length,0,'a review cancelled after its grant never sends a request');
+  // It stops AT the grant: it never records holding the model and never runs (and fails) a local leg.
+  const steps=(app.history.getJob(a,true)?.steps??[]).map(s=>s.stage);
+  assert.ok(!steps.includes('local.lease_acquired'),`cancelled job recorded a lease: ${steps}`);
+  assert.ok(!steps.includes('local.failed'),`cancelled job ran its local leg: ${steps}`);
+  const b=await started(app,2);
+  await answer(app,0,final);
+  await eventually(()=>job(app,b)?.status==='posted','the next review did not get the model');
+  assert.equal(app.localRequests.length,1);
+});

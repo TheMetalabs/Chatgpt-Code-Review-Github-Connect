@@ -1830,6 +1830,13 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
       })) as never;
     return { calls, requestLocalChat };
   };
+  /** Real-time wait (bounded) until the fix is queued at the lease: the route loads its module
+   * before acquiring, so one event-loop turn does not prove the fix has reached lease.acquire. */
+  const enqueued = async (lease: LocalModelLease) => {
+    const has = () => lease.snapshot().queued.some((o) => o.startsWith("fix:"));
+    for (let i = 0; i < 500 && !has(); i++) await new Promise((resolve) => setTimeout(resolve, 2));
+    assert.ok(has(), "the fix is queued at the lease");
+  };
   /** Real-time wait (bounded) for the fix to be dispatched: its continuation loads modules first
    * (under a loaded test run one setImmediate is not enough). */
   const dispatched = async (t: ReturnType<typeof transport>) => {
@@ -1844,7 +1851,7 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
     const order: string[] = [];
     const reviewB = lease.acquire("review-B").then((h) => { order.push("review-B"); return h; });
     const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("FIX PROMPT");
-    await tick();
+    await enqueued(lease);
     assert.equal(t.calls.length, 0, "no request while the review holds the model");
     assert.deepEqual(lease.snapshot().active, ["review-A"]);
     assert.equal(lease.snapshot().queued.length, 2);
@@ -1867,7 +1874,7 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
     const holder = await lease.acquire("review-A");
     const ac = new AbortController();
     const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("p", { signal: ac.signal });
-    await tick();
+    await enqueued(lease);
     assert.equal(lease.snapshot().queued.length, 1);
     ac.abort(new Error("head moved"));
     await assert.rejects(fix, /head moved/);
@@ -1882,9 +1889,10 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
     const holder = await lease.acquire("review-A");
     const ac = new AbortController();
     const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("p", { signal: ac.signal });
-    await tick();
+    await enqueued(lease); // the fix is queued, so releasing the holder below grants it
     const after = lease.acquire("review-B");
     holder.release(); // the fix is granted synchronously here...
+    assert.match(lease.snapshot().active[0] ?? "", /^fix:/, "granted before the abort (not cancelled while queued)");
     ac.abort(new Error("loop stopped")); // ...and cancelled before its continuation runs
     await assert.rejects(fix, /loop stopped/);
     (await after).release();
@@ -1919,6 +1927,7 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
     });
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(t.calls.length, 0, "still waiting for the model, not stopped as silent");
+    await enqueued(lease);
     holder.release();
     await dispatched(t);
     t.calls[0].answer("ANSWER");
@@ -1958,6 +1967,7 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
       await real(20);
       assert.equal(s.done, false, "not stopped by the generation deadline while waiting for the model");
       assert.equal(t.calls.length, 0, "not dispatched while the review holds the model");
+      await enqueued(lease);
       holder.release();
       await dispatched(t);
       clock.t += 50_000; // 50 s after dispatch: inside the 60 s budget
@@ -1976,7 +1986,7 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
       const out = start(lease, t, clock);
       const s = settle(out);
       clock.t = 120_000;
-      await real(20);
+      await enqueued(lease);
       holder.release();
       await dispatched(t);
       clock.t += 61_000;
@@ -1994,7 +2004,7 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
       const clock = { t: 0 };
       const holder = await lease.acquire("review-A");
       const out = start(lease, t, clock);
-      await tick();
+      await enqueued(lease);
       assert.equal(lease.snapshot().queued.length, 1);
       clock.t = 3_600_001;
       await assert.rejects(out, (e: unknown) => (e as { name?: string; why?: string }).name === "FixRequestStop" && (e as { why?: string }).why === "queue-deadline");

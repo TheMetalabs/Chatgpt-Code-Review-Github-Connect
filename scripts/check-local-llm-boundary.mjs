@@ -102,19 +102,32 @@ const SCOPED = {
   "src/lib/fix-agent.ts": { declarations: ["RequestFix"] },
 };
 
+function checkScope(scope, oldText, newText, file) {
+  return scope.additionsOnly ? notAdditionsOnly(oldText, newText) : outsideDeclarations(oldText, newText, scope.declarations, file);
+}
+
+// Both candidate versions are checked independently: the index (what the next commit records) and the
+// working tree. A permitted copy in one never clears a prohibited blob, mode or file type in the other.
 function scopeViolation(file) {
   const scope = SCOPED[file];
   let oldText;
   try { oldText = execFileSync("git", ["cat-file", "blob", `${BASE}:${file}`], { encoding: "utf8" }); }
   catch { return "not present at the base (a scoped file must already exist)"; }
-  // The path itself, not what it points to: a symlink (or any non-regular file) replacing a scoped
-  // file is a violation even when its target holds the base text.
+  // Index: the staged entry's mode must be a regular file (100644/100755), and its blob in scope.
+  const entry = execFileSync("git", ["ls-files", "-s", "--", file], { encoding: "utf8" }).trim();
+  if (entry) {
+    const mode = entry.split(/\s+/, 1)[0];
+    if (mode !== "100644" && mode !== "100755") return `staged version is not a regular file (mode ${mode}${mode === "120000" ? ", symbolic link" : ""})`;
+    const staged = execFileSync("git", ["cat-file", "blob", `:${file}`], { encoding: "utf8" });
+    const why = checkScope(scope, oldText, staged, file);
+    if (why) return `staged version ${why}`;
+  }
+  // Working tree: the path itself, not what it points to — a symlink (or any non-regular file)
+  // replacing a scoped file is a violation even when its target holds the base text.
   let st;
   try { st = lstatSync(file); } catch { return "deleted"; }
   if (!st.isFile()) return `is no longer a regular file (${st.isSymbolicLink() ? "symbolic link" : "not a regular file"})`;
-  const newText = readFileSync(file, "utf8");
-  if (scope.additionsOnly) return notAdditionsOnly(oldText, newText);
-  return outsideDeclarations(oldText, newText, scope.declarations, file);
+  return checkScope(scope, oldText, readFileSync(file, "utf8"), file);
 }
 
 // Never a real source change even though the symlink is not gitignored here.
@@ -133,6 +146,8 @@ try {
   // --no-renames: a rename is reported as delete(old)+add(new), so a frozen file renamed onto an
   // allowlisted path still surfaces its (forbidden) source path instead of hiding behind the destination.
   for (const f of git(["diff", "--name-only", "--no-renames", BASE])) changed.add(f);
+  // Staged vs the base: an index-only change whose working-tree copy was restored still counts.
+  for (const f of git(["diff", "--cached", "--name-only", "--no-renames", BASE])) changed.add(f);
   // Untracked files.
   for (const f of git(["ls-files", "--others", "--exclude-standard"])) changed.add(f);
 } catch (e) {

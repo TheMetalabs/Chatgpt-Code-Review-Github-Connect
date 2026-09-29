@@ -105,6 +105,30 @@ test("check-local-llm-boundary rejects a binary-diffed scoped edit outside produ
     r = run();
     assert.notEqual(r.status, 0);
     assert.match(r.stdout + r.stderr, /review-loop-runtime\.server\.test\.ts/);
+    // #142 review: the index is checked as well as the working tree.
+    writeFileSync(test, "a\nb\n");
+    writeFileSync(file, OLD.replace("'chat'", "'CHAT'"));
+    g("add", "src/lib/review-loop-runtime.server.ts"); // stage a frozen-transport edit...
+    writeFileSync(file, OLD.replace("  return local();", "  return local2();")); // ...then restore it in the tree
+    r = run();
+    assert.notEqual(r.status, 0, "a staged violation is not cleared by a permitted working-tree copy");
+    assert.match(r.stdout + r.stderr, /staged version edits outside/);
+    writeFileSync(file, OLD); // working tree exactly the base: an index-only violation
+    r = run();
+    assert.notEqual(r.status, 0, "an index-only violation is still found");
+    g("reset", "-q", "--", "src/lib/review-loop-runtime.server.ts");
+    r = run();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    // A staged symlink whose working-tree replacement is a regular file.
+    rmSync(test);
+    symlinkSync("elsewhere.ts", test);
+    g("add", "src/lib/review-loop-runtime.server.test.ts");
+    rmSync(test);
+    writeFileSync(test, "a\nb\n");
+    r = run();
+    assert.notEqual(r.status, 0);
+    assert.match(r.stdout + r.stderr, /staged version is not a regular file \(mode 120000, symbolic link\)/);
+    g("reset", "-q", "--", "src/lib/review-loop-runtime.server.test.ts");
     // #142 review: a CRLF checkout of an LF blob with only an appended line is additions-only...
     writeFileSync(test, "a\r\nb\r\nc\r\n");
     r = run();

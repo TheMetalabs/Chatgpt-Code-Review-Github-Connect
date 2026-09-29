@@ -23,9 +23,9 @@ let localFixSeq = 0;
  * take) for the whole call, in the "fix" lane: queued ahead of every queued review, but never
  * preempting the review that holds the model now. Abort-aware: a cancelled fix leaves the queue at
  * once, and a cancel that lands between the grant and this continuation gives the model back before
- * anything is sent. Released in finally. While it waits nothing is reported to the watcher: the wait
- * counts toward its queue ceiling (queueMaxMs, from send) and the liveness clock stays unarmed until
- * the server shows a sign of life. */
+ * anything is sent. Released in finally. The wait is announced to the watcher (ctl.waitForModel): it
+ * counts toward the queue ceiling (queueMaxMs, from send), never the generation deadline, and the
+ * liveness clock stays unarmed until the server shows a sign of life. */
 export async function requestLocalFix(
   settings: BotSettings,
   ref: PrRef,
@@ -35,11 +35,13 @@ export async function requestLocalFix(
 ): Promise<string> {
   const signal = ctl?.signal;
   const lease = deps.lease ? deps.lease() : (await import("./local-model-lease.ts")).localModelLease();
+  const dispatched = ctl?.waitForModel?.();
   const handle = await lease.acquire(`fix:${ref.owner}/${ref.repo}#${ref.pr}:${++localFixSeq}`, { signal, lane: "fix" });
   try {
     if (signal?.aborted) throw signal.reason ?? new Error("local fix cancelled before its request");
     const request = deps.requestLocalChat ?? (await import("./local-chat-request.server.ts")).requestLocalChat;
     const llm = await import("./local-llm.server.ts");
+    dispatched?.();
     return await request(
       settings.localLlmBaseUrl,
       settings.localLlmApiKey,

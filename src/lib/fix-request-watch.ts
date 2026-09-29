@@ -31,6 +31,12 @@ export type FixPhase = "queued" | "generating";
 export interface FixRequestControl {
   signal: AbortSignal;
   onActivity: (phase: FixPhase) => void;
+  /** Application-level queue: call before waiting for a shared resource that gates dispatch (the
+   * local-model lease), and call the returned function once the request is dispatched. The wait is
+   * charged to the queue ceiling (queueMaxMs, from send), never to the generation deadline — for a
+   * provider that reports no activity the generation clock starts at dispatch — and the liveness
+   * clock stays unarmed. Relevance checks run every checkEveryMs meanwhile. Optional for callers. */
+  waitForModel?: () => () => void;
 }
 
 export type WatchedRequest = (prompt: string, ctl: FixRequestControl) => Promise<string>;
@@ -133,6 +139,24 @@ export function watchFixRequest(request: WatchedRequest, prompt: string, cfg: Fi
         void check(); // the last cheap moment to skip a stale generation
       }
     };
+    const waitForModel = (): (() => void) => {
+      // Already generating (a reported first output): nothing to wait for.
+      if (done || (cfg.reportsActivity && phase === "generating")) return () => {};
+      phase = "queued";
+      generatingAt = undefined;
+      let dispatched = false;
+      return () => {
+        if (dispatched || done) return;
+        dispatched = true;
+        // A provider that reports activity stays queued until its first output; one that reports
+        // none is timed as generating from dispatch (not from send).
+        if (!cfg.reportsActivity) {
+          phase = "generating";
+          generatingAt = now();
+          void check(); // the last cheap moment to skip a stale generation
+        }
+      };
+    };
     handle.timer = setInterval(() => {
       if (done) return;
       const t = now();
@@ -155,7 +179,7 @@ export function watchFixRequest(request: WatchedRequest, prompt: string, cfg: Fi
     // runner) drains its event loop and abandons the request mid-flight.
     let pending: Promise<string>;
     try {
-      pending = request(prompt, { signal: ac.signal, onActivity });
+      pending = request(prompt, { signal: ac.signal, onActivity, waitForModel });
     } catch (error) {
       // A synchronous throw settles like a rejection: clear the timer, reject, abort.
       settle();

@@ -175,3 +175,74 @@ describe("watchFixRequest: no lost checks (round 6, pre-review)", () => {
     assert.ok(calls >= 2);
   });
 });
+
+describe("watchFixRequest: waiting for the model (application-level queue, #142 review)", () => {
+  /** A provider that waits for a gate (the lease) before it is dispatched. */
+  function gated() {
+    let open: () => void = () => {};
+    const gate = new Promise<void>((r) => (open = r));
+    let dispatchedAt: number | undefined;
+    let aborted = false;
+    let answer: (v: string) => void = () => {};
+    let activity: (p: FixPhase) => void = () => {};
+    const request: WatchedRequest = async (_prompt, ctl) => {
+      activity = ctl.onActivity;
+      ctl.signal.addEventListener("abort", () => (aborted = true));
+      const dispatched = ctl.waitForModel?.();
+      await gate;
+      dispatched?.();
+      dispatchedAt = Date.now();
+      return new Promise<string>((res, rej) => {
+        answer = res;
+        ctl.signal.addEventListener("abort", () => rej(new Error("aborted")));
+      });
+    };
+    return { request, open: () => open(), answer: (v: string) => answer(v), phase: (p: FixPhase) => activity(p), get dispatchedAt() { return dispatchedAt; }, get aborted() { return aborted; } };
+  }
+
+  it("no reported activity: the wait counts toward the queue ceiling; generation is timed from dispatch", async () => {
+    const clock = { t: 0 };
+    const p = gated();
+    let done = false;
+    const out = watchFixRequest(p.request, "x", { ...base, reportsActivity: false, generationMs: 60_000, queueMaxMs: 3_600_000, now: () => clock.t });
+    out.then(() => (done = true), () => (done = true));
+    clock.t = 120_000;
+    await wait(20);
+    assert.equal(done, false, "the generation deadline does not run while waiting for the model");
+    p.open();
+    await wait(5);
+    clock.t += 59_000;
+    await wait(20);
+    assert.equal(done, false, "the 60 s budget starts at dispatch");
+    clock.t += 2_000;
+    await assert.rejects(out, (e: unknown) => e instanceof FixRequestStop && e.why === "generation-deadline");
+    assert.equal(p.aborted, true);
+  });
+
+  it("the queue ceiling bounds the wait for the model and aborts it", async () => {
+    const clock = { t: 0 };
+    const p = gated();
+    const out = watchFixRequest(p.request, "x", { ...base, reportsActivity: false, generationMs: 60_000, queueMaxMs: 3_600_000, now: () => clock.t });
+    clock.t = 3_600_001;
+    await assert.rejects(out, (e: unknown) => e instanceof FixRequestStop && e.why === "queue-deadline");
+    assert.equal(p.aborted, true);
+  });
+
+  it("reported activity: liveness stays unarmed while waiting; first output still starts generation", async () => {
+    const p = gated();
+    const out = watchFixRequest(p.request, "x", { ...base, livenessMs: 5, generationMs: 10_000 });
+    await wait(30);
+    p.open();
+    await wait(5);
+    p.phase("generating");
+    p.answer("ok");
+    assert.equal(await out, "ok");
+  });
+
+  it("relevance is still checked while waiting for the model", async () => {
+    const p = gated();
+    const out = watchFixRequest(p.request, "x", { ...base, reportsActivity: false, checkEveryMs: 10, stillWanted: async () => "the PR head moved" });
+    await assert.rejects(out, (e: unknown) => e instanceof FixRequestStop && e.why === "cancelled");
+    assert.equal(p.dispatchedAt, undefined);
+  });
+});

@@ -1921,6 +1921,87 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
     assert.equal(await out, "ANSWER");
     assert.deepEqual(lease.snapshot(), { active: [], queued: [] });
   });
+
+  // #142 review: a non-streaming (reportsActivity:false) fix waiting behind a review must be charged
+  // to the queue ceiling, not the generation deadline, which starts only at dispatch.
+  describe("the real watcher, no reported activity, controlled clock", () => {
+    const settle = <T,>(p: Promise<T>) => {
+      const s: { done: boolean; value?: T; error?: unknown } = { done: false };
+      p.then((v) => { s.done = true; s.value = v; }, (e) => { s.done = true; s.error = e; });
+      return s;
+    };
+    const real = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const start = (lease: LocalModelLease, t: ReturnType<typeof transport>, clock: { t: number }) =>
+      watchFixRequest(productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat }), "p", {
+        generationMs: 60_000,
+        queueMaxMs: 3_600_000,
+        livenessMs: 0,
+        checkEveryMs: 3_600_000,
+        tickMs: 2,
+        reportsActivity: false,
+        stillWanted: async () => null,
+        now: () => clock.t,
+      });
+
+    it("waiting past generationMs (below queueMaxMs) keeps it queued; the generation budget starts at dispatch", async () => {
+      const lease = new LocalModelLease();
+      const t = transport();
+      const clock = { t: 0 };
+      const holder = await lease.acquire("review-A");
+      const out = start(lease, t, clock);
+      const s = settle(out);
+      clock.t = 120_000; // two minutes behind the review: twice the generation budget
+      await real(20);
+      assert.equal(s.done, false, "not stopped by the generation deadline while waiting for the model");
+      assert.equal(t.calls.length, 0, "not dispatched while the review holds the model");
+      holder.release();
+      await tick();
+      assert.equal(t.calls.length, 1);
+      clock.t += 50_000; // 50 s after dispatch: inside the 60 s budget
+      await real(20);
+      assert.equal(s.done, false);
+      t.calls[0].answer("ANSWER");
+      assert.equal(await out, "ANSWER");
+      assert.deepEqual(lease.snapshot(), { active: [], queued: [] });
+    });
+
+    it("after dispatch the generation deadline still applies", async () => {
+      const lease = new LocalModelLease();
+      const t = transport();
+      const clock = { t: 0 };
+      const holder = await lease.acquire("review-A");
+      const out = start(lease, t, clock);
+      const s = settle(out);
+      clock.t = 120_000;
+      await real(20);
+      holder.release();
+      await tick();
+      assert.equal(t.calls.length, 1);
+      clock.t += 61_000;
+      await assert.rejects(out, (e: unknown) => (e as { name?: string; why?: string }).name === "FixRequestStop" && (e as { why?: string }).why === "generation-deadline");
+      assert.equal(s.done, true);
+      assert.equal(t.calls[0].signal?.aborted, true, "the dispatched request is aborted");
+      t.calls[0].fail(new Error("aborted")); // the real transport rejects on abort
+      await tick();
+      assert.deepEqual(lease.snapshot(), { active: [], queued: [] }, "released in finally");
+    });
+
+    it("the queue ceiling still bounds the wait for the model", async () => {
+      const lease = new LocalModelLease();
+      const t = transport();
+      const clock = { t: 0 };
+      const holder = await lease.acquire("review-A");
+      const out = start(lease, t, clock);
+      await tick();
+      assert.equal(lease.snapshot().queued.length, 1);
+      clock.t = 3_600_001;
+      await assert.rejects(out, (e: unknown) => (e as { name?: string; why?: string }).name === "FixRequestStop" && (e as { why?: string }).why === "queue-deadline");
+      await tick();
+      assert.deepEqual(lease.snapshot(), { active: ["review-A"], queued: [] }, "the queued fix left the queue");
+      holder.release();
+      assert.equal(t.calls.length, 0);
+    });
+  });
 });
 
 describe("chat fix transport (chatgpt → one Chrome-bridge fix item per PR; grok is not a fix provider)", () => {

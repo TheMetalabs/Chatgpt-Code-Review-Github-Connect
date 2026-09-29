@@ -1,47 +1,73 @@
 // Sub-file scopes for the local-LLM edit boundary (scripts/check-local-llm-boundary.mjs). A path-level
-// allowlist cannot say "only this function of a shared file"; these helpers check a file's diff
-// against such a scope, so an edit outside it (e.g. the frozen chat fix transport or loop control in
-// review-loop-runtime.server.ts) still trips the boundary.
+// allowlist cannot say "only this function of a shared file"; these helpers compare a file's base and
+// working versions against such a scope, so an edit outside it (e.g. the frozen chat fix transport or
+// loop control in review-loop-runtime.server.ts) still trips the boundary.
+//
+// Both checks compare whole file texts, never `git diff` output: a diff that Git reports as binary,
+// or rewrites through a diff driver, cannot hide an edit. Declarations are located by the TypeScript
+// parser (syntactic extent, not a line pattern), and a file that does not parse fails closed.
+import ts from "typescript";
 
-/** Hunks of a `git diff -U0` for one file: old/new start line and line count (1-based). */
-export function hunkRanges(diff) {
-  const out = [];
-  for (const line of String(diff || "").split("\n")) {
-    const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
-    if (!m) continue;
-    out.push({
-      oldStart: Number(m[1]), oldCount: m[2] === undefined ? 1 : Number(m[2]),
-      newStart: Number(m[3]), newCount: m[4] === undefined ? 1 : Number(m[4]),
-    });
+function parse(text, file) {
+  const sf = ts.createSourceFile(file, String(text), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const diags = sf.parseDiagnostics ?? [];
+  if (diags.length) {
+    const d = diags[0];
+    throw new Error(`does not parse (${ts.flattenDiagnosticMessageText(d.messageText, " ")})`);
   }
+  return sf;
+}
+
+function declName(stmt) {
+  if (ts.isFunctionDeclaration(stmt) || ts.isInterfaceDeclaration(stmt) || ts.isTypeAliasDeclaration(stmt) || ts.isClassDeclaration(stmt)) {
+    return stmt.name?.text;
+  }
+  return undefined;
+}
+
+/** The file text with each named top-level declaration (its JSDoc included) replaced by a placeholder.
+ * Throws when the text does not parse, or a named declaration is missing or declared twice. */
+export function maskDeclarations(text, names, file = "scoped.ts") {
+  const sf = parse(text, file);
+  const want = new Set(names);
+  const spans = [];
+  const seen = new Map();
+  for (const stmt of sf.statements) {
+    const name = declName(stmt);
+    if (!name || !want.has(name)) continue;
+    seen.set(name, (seen.get(name) ?? 0) + 1);
+    spans.push({ name, start: stmt.getStart(sf, true), end: stmt.end });
+  }
+  for (const name of want) {
+    const n = seen.get(name) ?? 0;
+    if (n !== 1) throw new Error(n ? `declares \`${name}\` ${n} times` : `has no top-level \`${name}\``);
+  }
+  let out = sf.text;
+  for (const s of spans.sort((a, b) => b.start - a.start)) out = `${out.slice(0, s.start)}/*<scoped ${s.name}>*/${out.slice(s.end)}`;
   return out;
 }
 
-/** 1-based [first, last] lines of the top-level declaration whose line starts with `header`, through
- * the next line that is exactly "}" (the declaration's closing brace at column 0). null when absent. */
-export function declarationSpan(text, header) {
-  const lines = String(text || "").split("\n");
-  const first = lines.findIndex((l) => l.startsWith(header));
-  if (first < 0) return null;
-  for (let i = first + 1; i < lines.length; i++) if (lines[i] === "}") return [first + 1, i + 1];
+/** null when `newText` differs from `oldText` only inside the named top-level declarations;
+ * otherwise the reason. Fails closed: a parse error or a missing declaration is a violation. */
+export function outsideDeclarations(oldText, newText, names, file = "scoped.ts") {
+  let a, b;
+  try { a = maskDeclarations(oldText, names, file); } catch (e) { return `base version ${e.message}`; }
+  try { b = maskDeclarations(newText, names, file); } catch (e) { return `working version ${e.message}`; }
+  if (a === b) return null;
+  const al = a.split("\n"), bl = b.split("\n");
+  let i = 0;
+  while (i < al.length && i < bl.length && al[i] === bl[i]) i++;
+  return `edits outside ${names.map((n) => `\`${n}\``).join(", ")} (near line ${i + 1} with the scoped declarations masked)`;
+}
+
+/** null when `newText` keeps every line of `oldText`, in order (only additions); otherwise the reason. */
+export function notAdditionsOnly(oldText, newText) {
+  const oldLines = String(oldText).split("\n"), newLines = String(newText).split("\n");
+  let j = 0;
+  for (let i = 0; i < oldLines.length; i++) {
+    while (j < newLines.length && newLines[j] !== oldLines[i]) j++;
+    if (j === newLines.length) return `changes or removes existing line ${i + 1}; only additions are allowed`;
+    j++;
+  }
   return null;
-}
-
-const within = (span, a, b) => Boolean(span) && a >= span[0] && b <= span[1];
-
-/** Every hunk of `diff` stays inside the declaration `header` in both the old and the new text.
- * Returns the hunks that do not (empty = confined). A pure insertion sits after old line `oldStart`,
- * a pure deletion after new line `newStart`; both must fall inside the span as well. */
-export function hunksOutside(diff, oldText, newText, header) {
-  const oldSpan = declarationSpan(oldText, header), newSpan = declarationSpan(newText, header);
-  return hunkRanges(diff).filter((h) => {
-    const oldOk = h.oldCount > 0 ? within(oldSpan, h.oldStart, h.oldStart + h.oldCount - 1) : within(oldSpan, h.oldStart, h.oldStart);
-    const newOk = h.newCount > 0 ? within(newSpan, h.newStart, h.newStart + h.newCount - 1) : within(newSpan, h.newStart, h.newStart);
-    return !(oldOk && newOk);
-  });
-}
-
-/** Hunks of `diff` that remove or change existing lines (empty = the diff only adds lines). */
-export function nonAdditiveHunks(diff) {
-  return hunkRanges(diff).filter((h) => h.oldCount > 0);
 }

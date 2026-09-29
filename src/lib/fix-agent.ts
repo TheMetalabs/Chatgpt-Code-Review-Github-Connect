@@ -32,6 +32,9 @@ export type RequestFix = (
   ctl?: {
     signal?: AbortSignal;
     onActivity?: (phase: "queued" | "generating") => void;
+    /** Waiting for the local-model lease before dispatch: call first, call the result on dispatch
+     * (fix-request-watch.ts FixRequestControl.waitForModel). */
+    waitForModel?: () => () => void;
     /** The round's GitHub source: a chatgpt fix falls back to it when its attachment cannot be
      * delivered (fix-source-github.ts). Other transports ignore it. */
     github?: GithubFixSource;

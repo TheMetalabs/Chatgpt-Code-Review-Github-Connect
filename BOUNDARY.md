@@ -53,8 +53,11 @@ stages and step recording are unchanged.
 | `src/lib/reviewer-progress.test.ts` | local-lane rendering tests (chat-lane cases are the frozen-behavior guard) |
 | `src/lib/local-model-lease.ts` (+ `tests/review/local-model-lease.{test,e2e}.mjs`) | **new** — process-wide FIFO lease one review's local leg holds across all its turns; `local_lease_waiting` label + `queuePosition`, `local.lease_acquired` step |
 | `src/lib/local-fix-request.server.ts` | **new** — the local fix agent's model call; holds the local-model lease in the `fix` lane |
-| `src/lib/review-loop-runtime.server.ts` | **scoped, not allowlisted:** edits only inside `productionRequestFix` (its local-llm branch delegates to `local-fix-request.server.ts`). `check:boundary` rejects any hunk outside that declaration, so `requestChatFix` and the loop control stay frozen (`scripts/boundary-scope.mjs`) |
-| `src/lib/review-loop-runtime.server.test.ts` | **scoped:** additions only (new local-fix-lane cases); no existing line may change |
+| `src/lib/review-loop-runtime.server.ts` | **scoped, not allowlisted:** edits only inside `productionRequestFix` (its local-llm branch delegates to `local-fix-request.server.ts`). `check:boundary` compares the base blob with the working file with that declaration masked (TypeScript parser, fails closed on a parse error; never diff output, so a binary-classified diff cannot hide an edit), so `requestChatFix` and the loop control stay frozen (`scripts/boundary-scope.mjs`) |
+| `src/lib/review-loop-runtime.server.test.ts` | **scoped:** additions only (new local-fix-lane cases); every base line must survive in order |
+| `src/lib/fix-request-watch.ts` | **scoped:** only `FixRequestControl` and `watchFixRequest` — the optional `waitForModel` application queue, so a fix waiting for the local-model lease is charged to `queueMaxMs`, not the generation deadline |
+| `src/lib/fix-request-watch.test.ts` | **scoped:** additions only |
+| `src/lib/fix-agent.ts` | **scoped:** only the `RequestFix` type (the optional `waitForModel` control hook); the fix agent itself stays frozen |
 | `src/lib/local-leg-activity.ts` (+ test) | **new** — local-leg liveness tracker + `ASHLAR_LOCAL_REVIEW_DEADLINE_MS` |
 | `src/lib/review-progress.ts` | **only** the `local_queued` / `local_generating` labels and the optional `keepaliveAt` field |
 | `src/lib/review-history.server.ts` | **only** the `local.accepted` / `local.generating` server-step names |

@@ -4,7 +4,7 @@
 // local reviewer leg is reworked. See BOUNDARY.md.
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { hunksOutside, nonAdditiveHunks } from "./boundary-scope.mjs";
+import { notAdditionsOnly, outsideDeclarations } from "./boundary-scope.mjs";
 
 // Measure this branch's own changes, not main's forward progress: diff from the merge-base so an
 // advancing origin/main (other sessions merging ChatGPT-path fixes) never looks like a violation.
@@ -85,30 +85,32 @@ const ALLOW = new Set([
   "README.md",
 ]);
 
-// Shared files this branch may touch only within a sub-file scope (checked against the diff from BASE):
+// Shared files this branch may touch only within a sub-file scope, checked by comparing the base blob
+// with the working file (never diff output, which a binary classification or diff driver can empty):
 // the rest of each file stays frozen and an edit there is a violation like any other.
 const SCOPED = {
   // Only the productionRequestFix routing (its local-llm branch delegates to local-fix-request.server.ts).
   // requestChatFix (the Chrome-bridge fix transport) and the loop control in this file stay frozen.
-  "src/lib/review-loop-runtime.server.ts": { declaration: "export function productionRequestFix(" },
+  "src/lib/review-loop-runtime.server.ts": { declarations: ["productionRequestFix"] },
   // Tests for the local fix lane: new cases only; no existing line may change.
   "src/lib/review-loop-runtime.server.test.ts": { additionsOnly: true },
+  // The fix watcher learns an application-level queue (waiting for the local-model lease) so the wait is
+  // charged to queueMaxMs, not the generation deadline. Only the control type and the watcher itself.
+  "src/lib/fix-request-watch.ts": { declarations: ["FixRequestControl", "watchFixRequest"] },
+  "src/lib/fix-request-watch.test.ts": { additionsOnly: true },
+  // The fix transport's control type gains the optional waitForModel hook; the fix agent stays frozen.
+  "src/lib/fix-agent.ts": { declarations: ["RequestFix"] },
 };
 
 function scopeViolation(file) {
   const scope = SCOPED[file];
   let oldText;
-  try { oldText = execFileSync("git", ["show", `${BASE}:${file}`], { encoding: "utf8" }); }
+  try { oldText = execFileSync("git", ["cat-file", "blob", `${BASE}:${file}`], { encoding: "utf8" }); }
   catch { return "not present at the base (a scoped file must already exist)"; }
   let newText;
   try { newText = readFileSync(file, "utf8"); } catch { return "deleted"; }
-  const diff = execFileSync("git", ["diff", "-U0", "--no-renames", BASE, "--", file], { encoding: "utf8" });
-  if (scope.additionsOnly) {
-    const bad = nonAdditiveHunks(diff);
-    return bad.length ? `changes existing lines (old line ${bad.map((h) => h.oldStart).join(", ")}); only additions are allowed` : null;
-  }
-  const outside = hunksOutside(diff, oldText, newText, scope.declaration);
-  return outside.length ? `edits outside \`${scope.declaration}…}\` (new line ${outside.map((h) => h.newStart).join(", ")})` : null;
+  if (scope.additionsOnly) return notAdditionsOnly(oldText, newText);
+  return outsideDeclarations(oldText, newText, scope.declarations, file);
 }
 
 // Never a real source change even though the symlink is not gitignored here.

@@ -397,6 +397,59 @@ test('a transcript stop-button neither hides the grok composer stream nor counts
   assert.deepEqual(out, {during: false, marked: 'user-A', transcriptOnly: false, after: true});
 });
 
+test('a grok file chip named Stop or Abort is not a stop control; a real stop beside it still is', async t => {
+  for (const name of ['Stop', 'Abort', 'Stop generating']) {
+    const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
+      <form data-composer="true"><button type="button" data-file-name="${name}" aria-label="${name}" style="width:120px;height:32px">${name}</button>
+      <textarea style="width:320px;height:48px">Review this diff.</textarea>
+      <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`);
+    const out = await page.evaluate(() => {
+      delete globalThis.__ashlarGrokSawStream;
+      const file = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
+      document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" aria-label="Stop model response" style="width:64px;height:32px">x</button>');
+      return {file, real: stopButtonVisible()};
+    });
+    assert.deepEqual(out, {file: {grok: false, stop: false, marked: null}, real: true}, name);
+  }
+});
+
+test('a real Generating banner inside a composer wrapper is the stream, and the answer then settles', async t => {
+  for (const wrapper of ['<div role="group" aria-label="Composer">', '<div title="Composer">']) {
+    const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div></main>
+      <form data-composer="true">${wrapper}<textarea style="width:320px;height:48px"></textarea><span id="gen">Generating</span></div></form>`);
+    const out = await page.evaluate(() => {
+      delete globalThis.__ashlarGrokSawStream;
+      const during = {stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
+      document.getElementById('gen').remove();
+      document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
+      document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
+      return {during, after: chatGenerationFinished()};
+    });
+    assert.deepEqual(out, {during: {stop: true, marked: 'user-A'}, after: true}, wrapper);
+  }
+});
+
+test('a grok stream seen before the user turn had an id still settles once it gets one; a later turn does not inherit it', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="u1" role="article">review</div></main>
+    <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
+    <button type="button" id="stop" aria-label="Stop model response" style="width:64px;height:32px">x</button></form>`);
+  const out = await page.evaluate(() => {
+    delete globalThis.__ashlarGrokSawStream;
+    const during = chatGenerationFinished();
+    const marked = globalThis.__ashlarGrokSawStream;
+    // One update: the same bubble gets its id, the stop goes, the answer and the idle voice control mount.
+    document.getElementById('u1').id = 'response-user-A';
+    document.getElementById('stop').remove();
+    document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
+    document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
+    const after = chatGenerationFinished();
+    // A distinct later user turn with its own answer, never streamed: not done by the old observation.
+    document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="user-message" role="article">next</div><div data-testid="assistant-message" role="article">another answer</div>');
+    return {during, marked, after, next: chatGenerationFinished()};
+  });
+  assert.deepEqual(out, {during: false, marked: 'n:1', after: true, next: false});
+});
+
 test('review on the grok DOM: the sent turn is confirmed, the stream is not collected, then the fenced JSON is', async t => {
   const page = await browser.newPage();
   t.after(() => page.close());

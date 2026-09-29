@@ -53,7 +53,29 @@ function grokStreamKey() {
 
 function markGrokStream() {
   const key = grokStreamKey();
-  if (key && key !== "n:0") globalThis.__ashlarGrokSawStream = key;
+  if (!key || key === "n:0") return;
+  globalThis.__ashlarGrokSawStream = key;
+  // The observed user bubble itself, so the same turn gaining its response id keeps the observation.
+  const users = typeof userTurnEls === "function" ? userTurnEls() : [];
+  globalThis.__ashlarGrokSawStreamTurn = users[users.length - 1] || null;
+}
+
+/** A stream was seen for the current user turn: the same key, or an id-less (n:) observation of the
+ * very bubble that is still the latest user turn and has since received its id. */
+function grokSawCurrentStream() {
+  const saw = globalThis.__ashlarGrokSawStream;
+  if (!saw) return false;
+  if (saw === grokStreamKey()) return true;
+  if (!String(saw).startsWith("n:")) return false;
+  const users = typeof userTurnEls === "function" ? userTurnEls() : [];
+  const turn = globalThis.__ashlarGrokSawStreamTurn;
+  return Boolean(turn && turn.isConnected && turn === users[users.length - 1] && saw === `n:${users.length}`);
+}
+
+/** Controls and text of the composer's own staged files (composer.js stagedChips: wrappers holding
+ * the editor, send or model control are not files). A file named "Stop" or "Generating" is no status. */
+function inGrokFileChip(form, el) {
+  return typeof stagedChips === "function" && stagedChips(form).some(chip => chip.contains(el));
 }
 
 /** Grok's in-flight composer (grok.com, 2026-09). Submit is removed while generating; the form shows
@@ -70,6 +92,7 @@ function grokStreamVisible(root = document) {
     if (testid === "chat-submit" || testid === "bot-voice-call-start") continue;
     const label = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
     if (!label || label.length > 48 || !stopLabel.test(label) || !elVisible(el)) continue;
+    if (inGrokFileChip(form, el)) continue;
     if (root === document || root === document.documentElement) markGrokStream();
     return true;
   }
@@ -77,8 +100,8 @@ function grokStreamVisible(root = document) {
     if (el.children.length || (el.textContent || "").trim() !== "Generating" || !elVisible(el)) continue;
     // The draft editor's own text is the prompt, never provider status.
     if (el.closest('[contenteditable]:not([contenteditable="false"]), textarea, input')) continue;
-    // Nor is an attachment chip's name: a file may be called "Generating" (composer.js fileChips).
-    if (typeof fileChips === "function" && fileChips(form).some(chip => chip.contains(el))) continue;
+    // Nor is an attachment chip's name: a file may be called "Generating".
+    if (inGrokFileChip(form, el)) continue;
     if (root === document || root === document.documentElement) markGrokStream();
     return true;
   }
@@ -90,7 +113,7 @@ function stopButtonVisible(root = document) {
   // counts inside the composer, so a transcript control neither hides nor fakes this turn's stream.
   const grokForm = root.querySelector?.("form[data-composer]");
   if (grokForm && grokStreamVisible(root)) return true;
-  const counts = el => elVisible(el) && (!grokForm || grokForm.contains(el));
+  const counts = el => elVisible(el) && (!grokForm || (grokForm.contains(el) && !inGrokFileChip(grokForm, el)));
   const seen = () => {
     if (grokForm && (root === document || root === document.documentElement)) markGrokStream();
     return true;
@@ -154,7 +177,7 @@ function grokReplyDoneVisible(root) {
   }
   const text = (bubble.innerText || bubble.textContent || "").trim();
   if (text.length < 2 || grokStreamVisible(document)) return false;
-  if (globalThis.__ashlarGrokSawStream !== grokStreamKey()) return false;
+  if (!grokSawCurrentStream()) return false;
   const form = document.querySelector("form[data-composer]");
   if (!form) return false;
   const submit = form.querySelector('[data-testid="chat-submit"]');

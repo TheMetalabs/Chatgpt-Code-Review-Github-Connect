@@ -127,7 +127,14 @@ export class JsonRepairService {
       if(error instanceof LocalChatCutOff && error.finishReason==="length"){
         const current=this.deps.history().getRepair(record.jobId,record.id);
         if(current && current.status==="running")this.write({...current,attempts:Math.max(current.attempts,2),updatedAt:Date.now()});
-        return await send(true,true);
+        // Bumped budget is the most likely of any request to exceed the context window; route a
+        // 400/422 through the same unbudgeted #87 fallback as the first attempt (never hard-fail).
+        try {return await send(true,true);}
+        catch(bumped){
+          if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw bumped;
+          if(bumped instanceof LocalChatHttpError && [400,422].includes(bumped.status))return await send(false);
+          throw bumped;
+        }
       }
       throw error;
     }

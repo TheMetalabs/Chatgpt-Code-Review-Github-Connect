@@ -183,6 +183,39 @@ test('a length cut-off retry that completes is accepted',async t=>{
  assert.equal(bodies.length,2);
  assert.ok(bodies[1].max_tokens>bodies[0].max_tokens);
 });
+
+test('a length cut-off bumped retry that the context window refuses falls back to the unbudgeted request',async t=>{
+ const bodies=[];
+ const server=http.createServer((req,res)=>{let data='';req.on('data',c=>{data+=c;});req.on('end',()=>{
+  const body=JSON.parse(data);bodies.push(body);
+  // 1st: budgeted, finish_reason=length. 2nd: bumped budget refused 400. 3rd: unbudgeted succeeds.
+  if(!('max_tokens' in body)){
+   res.writeHead(200,{'content-type':'application/json'});
+   res.end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:raw}}]}));
+   return;
+  }
+  if(bodies.filter(b=>'max_tokens' in b).length===1){
+   res.writeHead(200,{'content-type':'application/json'});
+   res.end(JSON.stringify({choices:[{finish_reason:'length',message:{content:'{"findings":['}}]}));
+   return;
+  }
+  res.writeHead(400,{'content-type':'application/json'});
+  res.end(JSON.stringify({object:'error',type:'BadRequestError',code:400,
+   message:"This model's maximum context length is 32768 tokens. However, you requested 37000 tokens."}));
+ });});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());
+ const base=`http://127.0.0.1:${server.address().port}/v1`;
+ const f=fixture(t,{response:(_base,key,body,signal)=>requestLocalChat(base,key,body,signal,{stream:false})});
+ const started=f.service.start(input);
+ for(let n=0;n<500 && f.history.getRepair('A',started.id).status==='running';n++)await new Promise(r=>setTimeout(r,10));
+ const done=f.service.status('A',started.id);
+ assert.equal(done.status,'ready',JSON.stringify(done));
+ assert.equal(bodies.length,3,'length retry then #87 unbudgeted fallback');
+ assert.ok('max_tokens' in bodies[0]);
+ assert.ok('max_tokens' in bodies[1]);
+ assert.ok(bodies[1].max_tokens>bodies[0].max_tokens);
+ assert.equal('max_tokens' in bodies[2],false);
+});
 // vLLM/SGLang answer HTTP 400 when prompt + max_tokens exceeds max_model_len, before generating
 // anything. Without a budget they fill whatever context is left, which is the request every repair
 // sent before #87; the budget must not turn a repair that used to run into a rejected one.

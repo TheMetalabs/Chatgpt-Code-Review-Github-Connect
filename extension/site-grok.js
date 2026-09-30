@@ -178,12 +178,19 @@ function noteSawStream(submission, poll) {
 
 /** Reads the journal. An n:N mark still matches after that same counted turn gains an id. A later
  * user turn does not. The node itself is not stored. */
-function grokSawCurrentStream() {
+function grokSawCurrentStream(root) {
   let record;
-  try { record = savedSubmission(); } catch { return false; }
-  if (record?.sawStream !== true) return false;
+  try {
+    const confirmed = globalThis.__ashlarRunnerState?.confirmedSubmission;
+    record = confirmed?.key === submissionKey() ? confirmed.record : savedSubmission();
+  } catch { return false; }
+  if (record?.phase !== "sent" || record.sawStream !== true) return false;
+  const users = typeof userTurnEls === "function" ? userTurnEls() : [];
+  const lastUser = users[users.length - 1];
+  const shown = lastUser ? (typeof messagePromptText === "function" ? messagePromptText(lastUser) : lastUser.textContent || lastUser.innerText) : "";
+  if (!lastUser || !record.expected || (typeof reviewTurnHolds === "function" ? !reviewTurnHolds(shown, record.expected) : !normalizePrompt(shown).includes(record.expected))) return false;
   const saved = record.sawStreamKey;
-  if (!saved) return true;
+  if (!saved) return false;
   const current = grokStreamKey();
   if (saved === current) return true;
   if (String(saved).startsWith("n:") && current && !String(current).startsWith("n:")) {
@@ -282,7 +289,7 @@ function grokReplyDoneVisible(root) {
     return true;
   }
   const text = (bubble.innerText || bubble.textContent || "").trim();
-  if (text.length < 2 || !grokSawCurrentStream()) return false;
+  if (text.length < 2 || !grokSawCurrentStream(root)) return false;
   const form = document.querySelector("form[data-composer]");
   if (!form) return false;
   const submit = form.querySelector('[data-testid="chat-submit"]');

@@ -566,7 +566,7 @@ test('a grok stream mark is this submission, not a global: another send does not
     noteSawStream(savedSubmission(), {stop: stopButtonVisible(), streaming: false});
     const marked = savedSubmission().sawStreamKey;
     document.getElementById('stop').remove();
-    document.getElementById('u1').replaceWith(Object.assign(document.createElement('div'), {id: 'u2', textContent: 'other'}));
+    document.getElementById('u1').replaceWith(Object.assign(document.createElement('div'), {id: 'u2', textContent: 'review follow-up'}));
     document.getElementById('u2').setAttribute('data-testid', 'user-message');
     document.getElementById('u2').setAttribute('role', 'article');
     document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" role="article">an answer</div>');
@@ -722,4 +722,26 @@ test('captured grok.com DOM: idle private composer and a finished answer, earlie
     done: true,
     earlier: false,
   });
+});
+
+test('Grok idle completion uses the polled submission, not stale persisted stream evidence', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A">review</div><div data-testid="assistant-message" id="response-answer-A">answer text</div></main>${COMPOSER}`);
+  const out = await page.evaluate(async () => {
+    const stale = {phase: 'sent', expected: 'review', baseline: 0, submittedUsers: 1, messageId: 'user-A', sawStream: true, sawStreamKey: 'user-A'};
+    const active = {...stale, sawStream: false, sawStreamKey: undefined};
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok', confirmedSubmission: {key: 'ashlar:submission:job:run', record: active}};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify(stale));
+    const staleDone = (await pollBoundResponse()).done;
+    active.sawStream = true;
+    active.sawStreamKey = 'user-A';
+    const activeDone = (await pollBoundResponse()).done;
+    active.expected = 'different prompt';
+    const wrongPrompt = replyDoneVisible();
+    active.expected = 'review';
+    delete active.sawStreamKey;
+    const missingKey = replyDoneVisible();
+    document.querySelector('[data-testid="assistant-message"]').insertAdjacentHTML('beforeend', '<button aria-label="Copy response">copy</button>');
+    return {staleDone, activeDone, wrongPrompt, missingKey, actionDone: replyDoneVisible()};
+  });
+  assert.deepEqual(out, {staleDone: false, activeDone: true, wrongPrompt: false, missingKey: false, actionDone: true});
 });

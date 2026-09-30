@@ -1,15 +1,16 @@
 // The local fix agent's model call (the local-llm branch of review-loop-runtime's productionRequestFix).
 // Kept in its own module so the shared runtime (chat fix transport, loop control) stays untouched.
 import type { RequestFix } from "./fix-agent.ts";
-import type { requestLocalChat } from "./local-chat-request.server.ts";
 import type { LocalModelLease } from "./local-model-lease.ts";
 import type { BotSettings } from "./types.ts";
+
+type LocalChatRequest = typeof import("./local-chat-request.server.ts").requestLocalChat;
 
 export type LocalFixDeps = {
   /** The process-wide local-model lease (injected for tests). */
   lease?: () => LocalModelLease;
   /** The local chat transport (injected for tests). */
-  requestLocalChat?: typeof requestLocalChat;
+  requestLocalChat?: LocalChatRequest;
 };
 
 type RequestFixControl = Parameters<RequestFix>[1];

@@ -619,9 +619,15 @@ export async function runLocalReviewLoop(
     // -result from a genuine no-JSON run for the operator.
     const evidence = unparsed.length ? { unparsedText: unparsed.join("\n\n---\n\n") } : {};
     if (!raws.length) {
-      return { ok: false, error: aborted || deps.signal?.aborted
-        ? "local review aborted before any group completed (deadline or cancellation)"
-        : "local loop produced no review JSON", ...evidence };
+      if (aborted || deps.signal?.aborted) {
+        const reason = deps.signal?.reason;
+        const msg = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "";
+        // Node's default abort() reason is "This operation was aborted". Watchdogs pass an Error
+        // whose message names the policy (queued-without-output / liveness / deadline).
+        const named = /local review|ASHLAR_LOCAL_REVIEW/i.test(msg) ? msg.trim() : "";
+        return { ok: false, error: named || "local review aborted before any group completed (deadline or cancellation)", ...evidence };
+      }
+      return { ok: false, error: "local loop produced no review JSON", ...evidence };
     }
     const residual = residualReplies.length ? { residualReplies: residualReplies.join("\n\n---\n\n") } : {};
     return { ok: true, raw: mergeGroupResults(raws, failedGroups, unreviewablePaths(sample)), ...evidence, ...residual };

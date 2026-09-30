@@ -32,6 +32,21 @@ export function localLivenessMs(env: Record<string, string | undefined> | undefi
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 10 * 60_000;
 }
 
+/** Queued-without-output window, from ASHLAR_LOCAL_REVIEW_QUEUED_MS. 0 = off.
+ *
+ * Unlike liveness, keepalives do NOT reset this. It starts when HTTP is sent (`local_queued`) and
+ * clears on the first output token. A concurrency-1 server that is still generating a cancelled
+ * review (a ghost occupancy) will keepalive forever with nothing for us; liveness never fires, the
+ * Ashlar lease stays held, and every later review waits. This backstop aborts that request and
+ * releases the lease. Default 30 min; waiting for the FIFO lease itself is not counted (the timer
+ * is not armed until send). */
+export function localQueuedMs(env: Record<string, string | undefined> | undefined = typeof process !== "undefined" ? process.env : undefined): number {
+  const raw = env?.ASHLAR_LOCAL_REVIEW_QUEUED_MS;
+  if (raw == null || raw.trim() === "") return 30 * 60_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 30 * 60_000;
+}
+
 export type LocalLegPhase = "queued" | "generating";
 
 /** Per-leg activity tracker. `aliveAt` is the last sign the server is alive for this request
@@ -48,7 +63,7 @@ export type LocalLegState = {
   everGenerated: boolean;
 };
 
-export type LocalLegActivityKind = "keepalive" | "output" | "turn";
+export type LocalLegActivityKind = "sent" | "keepalive" | "output" | "turn";
 
 /** Throttle for heartbeat-only flushes: token deltas arrive many times a second. Phase changes
  * always flush immediately. */
@@ -67,7 +82,10 @@ export function applyLocalActivity(
   let next: LocalLegState = { ...prev, aliveAt: now };
   let accepted = false;
   let generated = false;
-  if (kind === "keepalive") {
+  if (kind === "sent") {
+    // HTTP dispatched: the request is in flight, still queued (no output, server has not accepted).
+    next = { ...next, phase: "queued" };
+  } else if (kind === "keepalive") {
     if (!prev.everAccepted) { accepted = true; next = { ...next, everAccepted: true }; }
   } else if (kind === "output") {
     if (!prev.everGenerated) { generated = true; }
@@ -77,7 +95,7 @@ export function applyLocalActivity(
     // be sent, so the leg is back to waiting for the server until output arrives again.
     next = { ...next, phase: "queued", progressAt: now };
   }
-  const flush = next.phase !== prev.phase || now - prev.writtenAt >= flushMs;
+  const flush = kind === "sent" || next.phase !== prev.phase || now - prev.writtenAt >= flushMs;
   if (flush) next = { ...next, writtenAt: now };
   return { state: next, flush, accepted, generated };
 }

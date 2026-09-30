@@ -22,7 +22,7 @@ import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
-import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
+import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
 import { localModelLease, type LocalModelLeaseHandle } from "./local-model-lease";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
@@ -79,6 +79,9 @@ const localActivity = new Map<string, LocalLegState>();
 // localLivenessMs). Armed only for streaming legs, which get ~10s keepalives; a buffered leg has no
 // incremental signal so it relies on the optional total ceiling instead.
 const localLiveness = new Map<string, { reset: () => void; clear: () => void }>();
+// Per-leg queued-without-output watchdog: armed on HTTP send, cleared on the first output token.
+// Keepalives do NOT reset it (a ghost occupancy keepalives forever). Fires abort + lease.release.
+const localQueued = new Map<string, { arm: (reset: boolean) => void; clear: () => void }>();
 // In-memory only (never persisted): the snapshot the local multi-turn loop reads files from.
 // Kept just for the life of the local leg so the loop's tools serve changed-file content without
 // re-fetching the PR. Chat legs never touch this.
@@ -258,6 +261,8 @@ function releaseJob(job: Job, edge: "terminal" | "removed") {
   localActivity.delete(job.id);
   localLiveness.get(job.id)?.clear();
   localLiveness.delete(job.id);
+  localQueued.get(job.id)?.clear();
+  localQueued.delete(job.id);
 }
 
 /** Test seam: whether a job still retains its local snapshot. */
@@ -267,12 +272,12 @@ export function hasLocalSample(jobId: string): boolean {
 
 /** Test seam: whether a job still has local-leg activity or liveness state (a cancellation clears it). */
 export function hasLocalLegState(jobId: string): boolean {
-  return localActivity.has(jobId) || localLiveness.has(jobId);
+  return localActivity.has(jobId) || localLiveness.has(jobId) || localQueued.has(jobId);
 }
 
 /** Test seam: ids holding local state (snapshot, leg, activity, liveness, watcher) with no job in state. */
 export function orphanedLocalState(): string[] {
-  const ids = new Set([...localSamples.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...watching]);
+  const ids = new Set([...localSamples.keys(), ...localInFlight, ...localControllers.keys(), ...localActivity.keys(), ...localLiveness.keys(), ...localQueued.keys(), ...watching]);
   return [...ids].filter((id) => !state.jobs.some((j) => j.id === id));
 }
 
@@ -908,14 +913,12 @@ async function kickLocalRace(jobId: string, prompt: string) {
   // A health probe can be delayed by the model queue. Never gate generation on that timer.
   const controller = new AbortController();
   localControllers.set(jobId, controller);
-  // The leg starts "queued": nothing has been sent yet, and on a concurrency-1 server the request
-  // then waits behind other jobs. The transport's heartbeat (headers / empty chunks) keeps it alive
-  // in that state; the first output token flips it to generating (see noteLocalActivity).
+  // The leg starts "waiting for the lease": nothing has been sent. local_queued is written only
+  // when the transport reports HTTP dispatched (see noteLocalActivity on "sent"). Showing queued
+  // here was a ghost: the lane said the request was at the server when it was still in Ashlar's FIFO.
   const startedAt = Date.now();
-  const leg = startLocalLeg(startedAt);
-  localActivity.set(jobId, leg);
   transitionJob(jobId, j => ({...j, generating: {...j.generating, local: true},
-    providerProgress: {...j.providerProgress, local: localLegProgress(leg, `local:${jobId}`, startedAt)},
+    providerProgress: {...j.providerProgress, local: {runId: `local:${jobId}`, stage: "local_lease_waiting", observedAt: startedAt, receivedAt: startedAt}},
     updatedAt: startedAt}));
   try {reviewHistory().recordServerStep(jobId,"local.requested");} catch { /* visible history health */ }
   void attachLocalLeg(jobId, runPrompt, { submit: true });
@@ -943,13 +946,12 @@ async function acquireLocalModel(jobId: string): Promise<LocalModelLeaseHandle> 
     },
   });
   if (waited) {
-    // The model is ours now: the leg starts over as "queued at the server" from this moment.
+    // The model is ours now, but nothing has been sent: stay on local_lease_waiting (drop the
+    // queue position) until the transport reports HTTP dispatched.
     const now = Date.now();
-    const leg = startLocalLeg(now);
-    localActivity.set(jobId, leg);
     transitionJob(jobId, (j) => j.status !== "awaiting_chat" ? j : ({
       ...j,
-      providerProgress: { ...j.providerProgress, local: localLegProgress(leg, `local:${jobId}`, now) },
+      providerProgress: { ...j.providerProgress, local: { runId: `local:${jobId}`, stage: "local_lease_waiting", observedAt: now, receivedAt: now } },
       updatedAt: now,
     }));
   }
@@ -968,9 +970,20 @@ async function acquireLocalModel(jobId: string): Promise<LocalModelLeaseHandle> 
  * post-mortem can tell "never accepted", "accepted but never generated" and "generated" apart. */
 function noteLocalActivity(jobId: string, kind: LocalLegActivityKind) {
   localLiveness.get(jobId)?.reset(); // any sign of life defers the hung-server abort
-  const prev = localActivity.get(jobId);
-  if (!prev) return;
+  // Queued-without-output: a new HTTP send (re)starts the timer; keepalives must NOT reset it;
+  // the first output token (or a completed turn) clears it.
+  if (kind === "sent") localQueued.get(jobId)?.arm(true);
+  else if (kind === "keepalive") localQueued.get(jobId)?.arm(false);
+  else if (kind === "output" || kind === "turn") localQueued.get(jobId)?.clear();
   const now = Date.now();
+  let prev = localActivity.get(jobId);
+  if (!prev) {
+    // First wire event (sent / keepalive / output): the tracker starts here so local_queued is
+    // never written before HTTP is dispatched. A turn with no tracker is a no-op.
+    if (kind === "turn") return;
+    prev = startLocalLeg(now);
+    localActivity.set(jobId, prev);
+  }
   const next = applyLocalActivity(prev, kind, now);
   localActivity.set(jobId, next.state);
   if (next.accepted) { try { reviewHistory().recordServerStep(jobId, "local.accepted"); } catch { /* visible history health */ } }
@@ -1065,7 +1078,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     // between this review's turns and evict its prompt cache. Throws when the job is cancelled while
     // queued (the abort reason becomes the leg's error below, a no-op on a job no longer awaiting chat).
     lease = await acquireLocalModel(jobId);
-    // Two independent, both-optional aborts; neither fires for a healthy long review. Both honour the
+    // Three independent, both-optional aborts; none fires for a healthy long review. All honour the
     // signal, so the leg falls into the catch below and fails cleanly. Cleared in finally on settle.
     //
     // 1. Liveness (default 10 min, streaming only): abort after TOTAL silence — no headers, no keepalive,
@@ -1074,8 +1087,12 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     //    a genuinely wedged server trips it. This is what unblocks a finished peer review that would
     //    otherwise wait forever on the in-flight local leg (stillRacing). A buffered leg has no
     //    incremental signal, so liveness is armed only when streaming is on; it relies on the ceiling.
-    // 2. Total ceiling (ASHLAR_LOCAL_REVIEW_DEADLINE_MS; off by default): a hard wall-clock cap for
-    //    operators who want one, independent of activity. Both start once the lease is held: time spent
+    // 2. Queued-without-output (default 30 min, ASHLAR_LOCAL_REVIEW_QUEUED_MS, 0=off): abort + lease.release
+    //    after HTTP sent with no output token, DESPITE keepalives. A ghost occupancy (a cancelled
+    //    request still generating) keepalives forever; liveness never fires and the lease stays held.
+    //    Armed on send, cleared on output; waiting for this FIFO lease is not counted.
+    // 3. Total ceiling (ASHLAR_LOCAL_REVIEW_DEADLINE_MS; off by default): a hard wall-clock cap for
+    //    operators who want one, independent of activity. All start once the lease is held: time spent
     //    waiting for another review to finish is not this leg's model time.
     const livenessMs = localStreamingDefault() ? localLivenessMs() : 0;
     if (livenessMs > 0) {
@@ -1084,6 +1101,25 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
       const arm = () => { timer = setTimeout(fire, livenessMs); };
       arm();
       localLiveness.set(jobId, { reset: () => { if (timer) clearTimeout(timer); arm(); }, clear: () => { if (timer) clearTimeout(timer); } });
+    }
+    const queuedMs = localQueuedMs();
+    if (queuedMs > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const fire = () => {
+        // Release the lease NOW, before the aborted HTTP unwinds, so the next waiter is not a ghost
+        // holder of a slot that is no longer producing output for us.
+        lease?.release();
+        const span = queuedMs >= 60_000 ? `${Math.round(queuedMs / 60_000)} min` : `${queuedMs} ms`;
+        localControllers.get(jobId)?.abort(new Error(`local review: queued without output for ${span} (ASHLAR_LOCAL_REVIEW_QUEUED_MS)`));
+      };
+      localQueued.set(jobId, {
+        arm: (reset) => {
+          if (timer && !reset) return;
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(fire, queuedMs);
+        },
+        clear: () => { if (timer) { clearTimeout(timer); timer = undefined; } },
+      });
     }
     const deadlineMs = localReviewDeadlineMs();
     deadline = deadlineMs > 0
@@ -1137,6 +1173,8 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
     if (deadline) clearTimeout(deadline);
     localLiveness.get(jobId)?.clear();
     localLiveness.delete(jobId);
+    localQueued.get(jobId)?.clear();
+    localQueued.delete(jobId);
     localInFlight.delete(jobId);
     localControllers.delete(jobId);
     localSamples.delete(jobId);

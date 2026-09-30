@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { applyLocalActivity, localLegProgress, localLivenessMs, localReviewDeadlineMs, startLocalLeg } from "./local-leg-activity.ts";
+import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg } from "./local-leg-activity.ts";
 
 describe("localReviewDeadlineMs", () => {
   it("defaults to no ceiling: a queued multi-turn review may legitimately take hours", () => {
@@ -13,6 +13,19 @@ describe("localReviewDeadlineMs", () => {
     assert.equal(localReviewDeadlineMs({ ASHLAR_LOCAL_REVIEW_DEADLINE_MS: "7200000" }), 7_200_000);
     assert.equal(localReviewDeadlineMs({ ASHLAR_LOCAL_REVIEW_DEADLINE_MS: "abc" }), 0);
     assert.equal(localReviewDeadlineMs({ ASHLAR_LOCAL_REVIEW_DEADLINE_MS: "-5" }), 0);
+  });
+});
+
+describe("localQueuedMs", () => {
+  it("defaults to a 30-min queued-without-output window (keepalives do not reset it)", () => {
+    assert.equal(localQueuedMs({}), 1_800_000);
+    assert.equal(localQueuedMs({ ASHLAR_LOCAL_REVIEW_QUEUED_MS: "" }), 1_800_000);
+  });
+
+  it("can be disabled with 0 and honours an explicit window; garbage falls back to the default", () => {
+    assert.equal(localQueuedMs({ ASHLAR_LOCAL_REVIEW_QUEUED_MS: "0" }), 0);
+    assert.equal(localQueuedMs({ ASHLAR_LOCAL_REVIEW_QUEUED_MS: "120000" }), 120_000);
+    assert.equal(localQueuedMs({ ASHLAR_LOCAL_REVIEW_QUEUED_MS: "abc" }), 1_800_000);
   });
 });
 
@@ -30,6 +43,16 @@ describe("localLivenessMs", () => {
 });
 
 describe("local leg activity tracker", () => {
+  it("flushes immediately on HTTP sent so the job can leave local_lease_waiting", () => {
+    const start = startLocalLeg(0);
+    const sent = applyLocalActivity(start, "sent", 10);
+    assert.equal(sent.accepted, false, "dispatch is not server acceptance");
+    assert.equal(sent.generated, false);
+    assert.equal(sent.state.phase, "queued");
+    assert.equal(sent.flush, true);
+    assert.equal(localLegProgress(sent.state, "local:j1", 10).stage, "local_queued");
+  });
+
   it("starts queued and reports the first server acceptance once, without a phase change", () => {
     const start = startLocalLeg(1_000);
     assert.equal(start.phase, "queued");

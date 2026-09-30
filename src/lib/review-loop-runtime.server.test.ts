@@ -14,6 +14,7 @@ import { join, relative } from "node:path";
 import { createHash } from "node:crypto";
 import { FIX_ATTACHMENT_MAX_BYTES, FIX_ATTACHMENT_NAME, fixAttachment, fixTypedPrompt, plainMarkdownLine, rendersAsTyped } from "./fix-attachment.ts";
 import type { FixRequest } from "./bridge-fix.server.ts";
+import { LocalModelLease } from "./local-model-lease.ts";
 import {
   ashlarBotLogin,
   builtinValidate,
@@ -1814,6 +1815,223 @@ describe("stopLoop (the fixed STOPPED acknowledgement)", () => {
     const f = fakeDeps({ rounds: [3] });
     assert.equal((await stopLoop("t", stopReq({ actor: BOT }), settings(), f.deps, ENV)).posted, false);
     assert.equal(none.posted.length + f.posted.length, 0);
+  });
+});
+
+describe("local fix transport holds the local-model lease (fix lane: ahead of queued reviews, never preempting)", () => {
+  const ref = { owner: "o", repo: "r", pr: 7 };
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  /** A fake local transport that records each call and answers when told to. */
+  const transport = () => {
+    const calls: { prompt: string; signal?: AbortSignal; answer: (text: string) => void; fail: (e: Error) => void }[] = [];
+    const requestLocalChat = ((_base: string, _key: string, body: { messages: { content: string }[] }, signal?: AbortSignal) =>
+      new Promise<string>((resolve, reject) => {
+        calls.push({ prompt: body.messages[1].content, signal, answer: resolve, fail: reject });
+      })) as never;
+    return { calls, requestLocalChat };
+  };
+  /** Real-time wait (bounded) until the fix is queued at the lease: the route loads its module
+   * before acquiring, so one event-loop turn does not prove the fix has reached lease.acquire. */
+  const enqueued = async (lease: LocalModelLease) => {
+    const has = () => lease.snapshot().queued.some((o) => o.startsWith("fix:"));
+    for (let i = 0; i < 500 && !has(); i++) await new Promise((resolve) => setTimeout(resolve, 2));
+    assert.ok(has(), "the fix is queued at the lease");
+  };
+  /** Real-time wait (bounded) for the fix to be dispatched: its continuation loads modules first
+   * (under a loaded test run one setImmediate is not enough). */
+  const dispatched = async (t: ReturnType<typeof transport>) => {
+    for (let i = 0; i < 500 && t.calls.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 2));
+    assert.equal(t.calls.length, 1, "dispatched once the model is granted");
+  };
+
+  it("a fix queued behind a holding review waits for it, then goes before other queued reviews", async () => {
+    const lease = new LocalModelLease();
+    const t = transport();
+    const holder = await lease.acquire("review-A");
+    const order: string[] = [];
+    const reviewB = lease.acquire("review-B").then((h) => { order.push("review-B"); return h; });
+    const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("FIX PROMPT");
+    await enqueued(lease);
+    assert.equal(t.calls.length, 0, "no request while the review holds the model");
+    assert.deepEqual(lease.snapshot().active, ["review-A"]);
+    assert.equal(lease.snapshot().queued.length, 2);
+    assert.match(lease.snapshot().queued[0], /^fix:o\/r#7:/, "the fix is queued ahead of the waiting review");
+    assert.equal(lease.snapshot().queued[1], "review-B");
+    holder.release();
+    await dispatched(t); // the fix is granted before the waiting review
+    assert.equal(t.calls[0].prompt, "FIX PROMPT");
+    assert.deepEqual(order, [], "the waiting review is still queued while the fix runs");
+    t.calls[0].answer("{\"files\":[]}");
+    assert.equal(await fix, "{\"files\":[]}");
+    (await reviewB).release();
+    assert.deepEqual(order, ["review-B"], "released in finally: the next review starts after the fix");
+    assert.deepEqual(lease.snapshot(), { active: [], queued: [] });
+  });
+
+  it("starts the watcher queue clock only after the lease registers the fix waiter", async () => {
+    const lease = new LocalModelLease();
+    const t = transport();
+    const holder = await lease.acquire("review-A");
+    const waitStates: number[] = [];
+    const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("p", {
+      waitForModel: () => {
+        waitStates.push(lease.snapshot().queued.length);
+        return () => {};
+      },
+    });
+    await enqueued(lease);
+    assert.deepEqual(waitStates, [1], "watcher starts after the fix is present in the lease queue");
+    holder.release();
+    await dispatched(t);
+    t.calls[0].answer("ANSWER");
+    assert.equal(await fix, "ANSWER");
+  });
+
+  it("abort while queued leaves the queue without sending anything", async () => {
+    const lease = new LocalModelLease();
+    const t = transport();
+    const holder = await lease.acquire("review-A");
+    const ac = new AbortController();
+    const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("p", { signal: ac.signal });
+    await enqueued(lease);
+    assert.equal(lease.snapshot().queued.length, 1);
+    ac.abort(new Error("head moved"));
+    await assert.rejects(fix, /head moved/);
+    assert.deepEqual(lease.snapshot(), { active: ["review-A"], queued: [] });
+    holder.release();
+    assert.equal(t.calls.length, 0);
+  });
+
+  it("a cancel landing between the grant and the fix resuming gives the model back before any request", async () => {
+    const lease = new LocalModelLease();
+    const t = transport();
+    const holder = await lease.acquire("review-A");
+    const ac = new AbortController();
+    const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("p", { signal: ac.signal });
+    await enqueued(lease); // the fix is queued, so releasing the holder below grants it
+    const after = lease.acquire("review-B");
+    holder.release(); // the fix is granted synchronously here...
+    assert.match(lease.snapshot().active[0] ?? "", /^fix:/, "granted before the abort (not cancelled while queued)");
+    ac.abort(new Error("loop stopped")); // ...and cancelled before its continuation runs
+    await assert.rejects(fix, /loop stopped/);
+    (await after).release();
+    assert.equal(t.calls.length, 0);
+    assert.deepEqual(lease.snapshot(), { active: [], queued: [] });
+  });
+
+  it("a failed request still releases the lease", async () => {
+    const lease = new LocalModelLease();
+    const t = transport();
+    const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("p");
+    await dispatched(t); // an idle model is granted at once
+    const next = lease.acquire("review-B");
+    t.calls[0].fail(new Error("local LLM HTTP 500: boom"));
+    await assert.rejects(fix, /HTTP 500/);
+    (await next).release();
+    assert.deepEqual(lease.snapshot(), { active: [], queued: [] });
+  });
+
+  it("the real watcher: queued time behind a review is not a liveness failure", async () => {
+    const lease = new LocalModelLease();
+    const t = transport();
+    const holder = await lease.acquire("review-A");
+    const out = watchFixRequest(productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat }), "p", {
+      generationMs: 60 * 60_000,
+      queueMaxMs: 60 * 60_000,
+      livenessMs: 1,
+      checkEveryMs: 60 * 60_000,
+      tickMs: 2,
+      reportsActivity: true,
+      stillWanted: async () => null,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(t.calls.length, 0, "still waiting for the model, not stopped as silent");
+    await enqueued(lease);
+    holder.release();
+    await dispatched(t);
+    t.calls[0].answer("ANSWER");
+    assert.equal(await out, "ANSWER");
+    assert.deepEqual(lease.snapshot(), { active: [], queued: [] });
+  });
+
+  // #142 review: a non-streaming (reportsActivity:false) fix waiting behind a review must be charged
+  // to the queue ceiling, not the generation deadline, which starts only at dispatch.
+  describe("the real watcher, no reported activity, controlled clock", () => {
+    const settle = <T,>(p: Promise<T>) => {
+      const s: { done: boolean; value?: T; error?: unknown } = { done: false };
+      p.then((v) => { s.done = true; s.value = v; }, (e) => { s.done = true; s.error = e; });
+      return s;
+    };
+    const real = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const start = (lease: LocalModelLease, t: ReturnType<typeof transport>, clock: { t: number }) =>
+      watchFixRequest(productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat }), "p", {
+        generationMs: 60_000,
+        queueMaxMs: 3_600_000,
+        livenessMs: 0,
+        checkEveryMs: 3_600_000,
+        tickMs: 2,
+        reportsActivity: false,
+        stillWanted: async () => null,
+        now: () => clock.t,
+      });
+
+    it("waiting past generationMs (below queueMaxMs) keeps it queued; the generation budget starts at dispatch", async () => {
+      const lease = new LocalModelLease();
+      const t = transport();
+      const clock = { t: 0 };
+      const holder = await lease.acquire("review-A");
+      const out = start(lease, t, clock);
+      const s = settle(out);
+      clock.t = 120_000; // two minutes behind the review: twice the generation budget
+      await real(20);
+      assert.equal(s.done, false, "not stopped by the generation deadline while waiting for the model");
+      assert.equal(t.calls.length, 0, "not dispatched while the review holds the model");
+      await enqueued(lease);
+      holder.release();
+      await dispatched(t);
+      clock.t += 50_000; // 50 s after dispatch: inside the 60 s budget
+      await real(20);
+      assert.equal(s.done, false);
+      t.calls[0].answer("ANSWER");
+      assert.equal(await out, "ANSWER");
+      assert.deepEqual(lease.snapshot(), { active: [], queued: [] });
+    });
+
+    it("after dispatch the generation deadline still applies", async () => {
+      const lease = new LocalModelLease();
+      const t = transport();
+      const clock = { t: 0 };
+      const holder = await lease.acquire("review-A");
+      const out = start(lease, t, clock);
+      const s = settle(out);
+      clock.t = 120_000;
+      await enqueued(lease);
+      holder.release();
+      await dispatched(t);
+      clock.t += 61_000;
+      await assert.rejects(out, (e: unknown) => (e as { name?: string; why?: string }).name === "FixRequestStop" && (e as { why?: string }).why === "generation-deadline");
+      assert.equal(s.done, true);
+      assert.equal(t.calls[0].signal?.aborted, true, "the dispatched request is aborted");
+      t.calls[0].fail(new Error("aborted")); // the real transport rejects on abort
+      await tick();
+      assert.deepEqual(lease.snapshot(), { active: [], queued: [] }, "released in finally");
+    });
+
+    it("the queue ceiling still bounds the wait for the model", async () => {
+      const lease = new LocalModelLease();
+      const t = transport();
+      const clock = { t: 0 };
+      const holder = await lease.acquire("review-A");
+      const out = start(lease, t, clock);
+      await enqueued(lease);
+      assert.equal(lease.snapshot().queued.length, 1);
+      clock.t = 3_600_001;
+      await assert.rejects(out, (e: unknown) => (e as { name?: string; why?: string }).name === "FixRequestStop" && (e as { why?: string }).why === "queue-deadline");
+      await tick();
+      assert.deepEqual(lease.snapshot(), { active: ["review-A"], queued: [] }, "the queued fix left the queue");
+      holder.release();
+      assert.equal(t.calls.length, 0);
+    });
   });
 });
 

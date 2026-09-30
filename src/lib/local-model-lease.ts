@@ -9,9 +9,18 @@
  * With the lease a review's local leg holds the model across ALL its file groups and turns; the next
  * queued review starts when it releases. Waiting is FIFO and abort-aware (a cancelled job leaves the
  * queue at once) and has no deadline: waiting behind another review is normal and may take hours.
- * Only the review local leg takes this lease; other local callers (JSON repair, fix agent, manual
- * run) are unchanged.
+ * The review local leg and the local fix agent take this lease; other local callers (JSON repair,
+ * manual run) are unchanged.
+ *
+ * Lanes: a waiter joins the queue in its lane. A queued "fix" waiter is granted before every queued
+ * "review" waiter (a fix round is one call that unblocks a PR, a review round can take hours), FIFO
+ * within a lane. A lane never preempts: the review that already holds the model keeps it until it
+ * releases.
  */
+
+/** Queue lane; a lower rank is granted first. */
+export type LocalModelLane = "fix" | "review";
+const LANE_RANK: Record<LocalModelLane, number> = { fix: 0, review: 1 };
 
 export type LocalModelLeaseHandle = {
   readonly owner: string;
@@ -21,6 +30,8 @@ export type LocalModelLeaseHandle = {
 
 export type LocalModelLeaseWait = {
   signal?: AbortSignal;
+  /** Queue lane (default "review"). */
+  lane?: LocalModelLane;
   /** Called with the 1-based queue position while waiting (only when it changes). Never throws out. */
   onPosition?: (position: number) => void;
 };
@@ -28,6 +39,7 @@ export type LocalModelLeaseWait = {
 type Waiter = {
   id: number;
   owner: string;
+  lane: LocalModelLane;
   lastPosition: number;
   onPosition?: (position: number) => void;
   resolve: (handle: LocalModelLeaseHandle) => void;
@@ -67,10 +79,15 @@ export class LocalModelLease {
         if (this.drop(id)) reject(abortReason(signal as AbortSignal));
       };
       signal?.addEventListener("abort", onAbort, { once: true });
-      this.queue.push({
-        id, owner, lastPosition: 0, onPosition: opts.onPosition, resolve, reject,
+      const lane = opts.lane ?? "review";
+      const waiter: Waiter = {
+        id, owner, lane, lastPosition: 0, onPosition: opts.onPosition, resolve, reject,
         detach: () => signal?.removeEventListener("abort", onAbort),
-      });
+      };
+      // Behind every waiter of the same or a higher-priority lane, ahead of every lower one.
+      const at = this.queue.findIndex((w) => LANE_RANK[w.lane] > LANE_RANK[lane]);
+      if (at < 0) this.queue.push(waiter);
+      else this.queue.splice(at, 0, waiter);
       this.notifyPositions();
     });
   }
@@ -99,6 +116,7 @@ export class LocalModelLease {
     return i < 0 ? undefined : i + 1;
   }
 
+  /** Holders and waiters in grant order (waiters listed as they will be granted). */
   snapshot(): { active: string[]; queued: string[] } {
     return { active: [...this.active.values()], queued: this.queue.map((w) => w.owner) };
   }
@@ -148,7 +166,7 @@ export class LocalModelLease {
 
 const GLOBAL_KEY = Symbol.for("ashlar.localModelLease");
 
-/** The one process-wide lease review local legs share (kept on globalThis so a module loaded twice —
+/** The one process-wide lease review local legs and local fix calls share (kept on globalThis so a module loaded twice —
  * e.g. Vite SSR — still shares a single queue). */
 export function localModelLease(): LocalModelLease {
   const g = globalThis as unknown as Record<symbol, LocalModelLease | undefined>;

@@ -933,7 +933,7 @@ export async function requestChatFix(
  * lifecycle) and come back as the same kind of answer text. The watcher's abort signal reaches
  * both, so an abandoned fix cancels its bridge item and the extension stops its run (the tab is
  * preserved, never closed on a cancel). */
-export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { loadBridge?: BridgeFixLoader } = {}): RequestFix {
+export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { loadBridge?: BridgeFixLoader } & import("./local-fix-request.server.ts").LocalFixDeps = {}): RequestFix {
   return async (prompt, ctl) => {
     const provider = settings.fixAgent.provider;
     const transport = fixProviderCaps(provider).transport;
@@ -941,24 +941,9 @@ export function productionRequestFix(settings: BotSettings, ref: PrRef, opts: { 
       return requestChatFix(settings, ref, "chatgpt", prompt, { signal: ctl?.signal, loadBridge: opts.loadBridge, ...(ctl?.github ? { github: ctl.github } : {}) });
     }
     if (transport !== "local-llm") throw new Error(fixProviderUnsupported(provider));
-    const local = await import("./local-chat-request.server.ts");
-    const llm = await import("./local-llm.server.ts");
-    return local.requestLocalChat(
-      settings.localLlmBaseUrl,
-      settings.localLlmApiKey,
-      {
-        model: settings.localLlmModel,
-        messages: [
-          { role: "system", content: "You are the Ashlar fix agent. Return ONLY the JSON object described in the prompt." },
-          { role: "user", content: prompt },
-        ],
-        // The review path's tuned sampling + budget: without it a reasoning model decodes greedily,
-        // loops, and ends at the token cap (finish_reason=length) before emitting the JSON.
-        ...llm.samplingRequestFields(llm.localGenerationParams(settings)),
-      },
-      ctl?.signal,
-      { onActivity: (a) => ctl?.onActivity?.(a.kind === "output" ? "generating" : "queued") },
-    );
+    // The local fix call holds the shared local-model lease in the "fix" lane (local-fix-request.server.ts).
+    const { requestLocalFix } = await import("./local-fix-request.server.ts");
+    return requestLocalFix(settings, ref, prompt, ctl, opts);
   };
 }
 

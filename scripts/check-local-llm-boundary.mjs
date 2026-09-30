@@ -3,6 +3,8 @@
 // is outside the allowlist. Keeps ChatGPT/Grok/bridge/merge code frozen while the
 // local reviewer leg is reworked. See BOUNDARY.md.
 import { execFileSync } from "node:child_process";
+import { lstatSync, readFileSync } from "node:fs";
+import { notAdditionsOnly, outsideDeclarations } from "./boundary-scope.mjs";
 
 // Measure this branch's own changes, not main's forward progress: diff from the merge-base so an
 // advancing origin/main (other sessions merging ChatGPT-path fixes) never looks like a violation.
@@ -40,6 +42,11 @@ const ALLOW = new Set([
   "src/lib/local-model-lease.ts",
   "tests/review/local-model-lease.test.mjs",
   "tests/review/local-model-lease.e2e.mjs",
+  // The local fix agent's model call (holds the local-model lease in the "fix" lane). The shared
+  // runtime file that routes to it is SCOPED below, not allowlisted whole.
+  "src/lib/local-fix-request.server.ts",
+  "scripts/boundary-scope.mjs",
+  "scripts/boundary-scope.test.mjs",
   "src/lib/local-leg-activity.test.ts",
   "src/lib/review-progress.ts",
   "src/lib/review-history.server.ts",
@@ -78,6 +85,56 @@ const ALLOW = new Set([
   "README.md",
 ]);
 
+// Shared files this branch may touch only within a sub-file scope, checked by comparing the base blob
+// with the working file (never diff output, which a binary classification or diff driver can empty):
+// the rest of each file stays frozen and an edit there is a violation like any other.
+const SCOPED = {
+  // Only the productionRequestFix routing (its local-llm branch delegates to local-fix-request.server.ts).
+  // requestChatFix (the Chrome-bridge fix transport) and the loop control in this file stay frozen.
+  "src/lib/review-loop-runtime.server.ts": { declarations: ["productionRequestFix"] },
+  // Tests for the local fix lane: new cases only; no existing line may change.
+  "src/lib/review-loop-runtime.server.test.ts": { additionsOnly: true },
+  // The fix watcher learns an application-level queue (waiting for the local-model lease) so the wait is
+  // charged to queueMaxMs, not the generation deadline. Only the control type and the watcher itself.
+  "src/lib/fix-request-watch.ts": { declarations: ["FixRequestControl", "watchFixRequest"] },
+  "src/lib/fix-request-watch.test.ts": { additionsOnly: true },
+  // The fix transport's control type gains the optional waitForModel hook; the fix agent stays frozen.
+  "src/lib/fix-agent.ts": { declarations: ["RequestFix"] },
+};
+
+function checkScope(scope, oldText, newText, file) {
+  return scope.additionsOnly ? notAdditionsOnly(oldText, newText) : outsideDeclarations(oldText, newText, scope.declarations, file);
+}
+
+// Both candidate versions are checked independently: the index (what the next commit records) and the
+// working tree. A permitted copy in one never clears a prohibited blob, mode or file type in the other.
+function scopeViolation(file) {
+  const scope = SCOPED[file];
+  let oldText;
+  try { oldText = execFileSync("git", ["cat-file", "blob", `${BASE}:${file}`], { encoding: "utf8" }); }
+  catch { return "not present at the base (a scoped file must already exist)"; }
+  // Index: the staged entry's mode must be a regular file (100644/100755), and its blob in scope.
+  // A scoped file exists at the base, so it must still have exactly one stage-0 index entry: none is a
+  // staged deletion (git rm --cached), whatever the working tree holds.
+  const entries = execFileSync("git", ["ls-files", "-s", "--", file], { encoding: "utf8" }).split("\n").filter(Boolean);
+  if (entries.length === 0) return "staged for deletion (no index entry)";
+  if (entries.length !== 1 || entries[0].split(/\s+/)[2] !== "0") return "has an unmerged index entry";
+  const entry = entries[0];
+  {
+    const mode = entry.split(/\s+/, 1)[0];
+    if (mode !== "100644" && mode !== "100755") return `staged version is not a regular file (mode ${mode}${mode === "120000" ? ", symbolic link" : ""})`;
+    const staged = execFileSync("git", ["cat-file", "blob", `:${file}`], { encoding: "utf8" });
+    const why = checkScope(scope, oldText, staged, file);
+    if (why) return `staged version ${why}`;
+  }
+  // Working tree: the path itself, not what it points to — a symlink (or any non-regular file)
+  // replacing a scoped file is a violation even when its target holds the base text.
+  let st;
+  try { st = lstatSync(file); } catch { return "deleted"; }
+  if (!st.isFile()) return `is no longer a regular file (${st.isSymbolicLink() ? "symbolic link" : "not a regular file"})`;
+  return checkScope(scope, oldText, readFileSync(file, "utf8"), file);
+}
+
 // Never a real source change even though the symlink is not gitignored here.
 const IGNORE = new Set(["node_modules"]);
 
@@ -94,6 +151,8 @@ try {
   // --no-renames: a rename is reported as delete(old)+add(new), so a frozen file renamed onto an
   // allowlisted path still surfaces its (forbidden) source path instead of hiding behind the destination.
   for (const f of git(["diff", "--name-only", "--no-renames", BASE])) changed.add(f);
+  // Staged vs the base: an index-only change whose working-tree copy was restored still counts.
+  for (const f of git(["diff", "--cached", "--name-only", "--no-renames", BASE])) changed.add(f);
   // Untracked files.
   for (const f of git(["ls-files", "--others", "--exclude-standard"])) changed.add(f);
 } catch (e) {
@@ -103,11 +162,14 @@ try {
   process.exit(1);
 }
 
-const offenders = [...changed].filter((f) => !ALLOW.has(f) && !IGNORE.has(f));
+const offenders = [...changed]
+  .filter((f) => !ALLOW.has(f) && !IGNORE.has(f))
+  .map((f) => ({ f, why: f in SCOPED ? scopeViolation(f) : "" }))
+  .filter(({ why }) => why !== null);
 
 if (offenders.length) {
   console.error(`✗ boundary violation: ${offenders.length} file(s) outside the local-LLM allowlist`);
-  for (const f of offenders) console.error(`   - ${f}`);
+  for (const { f, why } of offenders) console.error(`   - ${f}${why ? ` — scoped file ${why}` : ""}`);
   console.error("\nThese belong to the ChatGPT/Grok/bridge/merge path and are frozen on this branch.");
   console.error("If a change is genuinely local-LLM-only, add the path to ALLOW in scripts/check-local-llm-boundary.mjs and note it in BOUNDARY.md.");
   process.exit(1);

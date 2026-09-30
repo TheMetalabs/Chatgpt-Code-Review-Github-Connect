@@ -134,3 +134,44 @@ test('a cancellation landing between the lease grant and the leg continuing send
   await eventually(()=>job(app,b)?.status==='posted','the next review did not get the model');
   assert.equal(app.localRequests.length,1);
 });
+
+test('local_lease_waiting until HTTP is sent; local_queued only after dispatch', async t=>{
+  let releaseHttp=()=>{};
+  const gate=new Promise(resolve=>{releaseHttp=resolve;});
+  const wrap={'src/lib/local-chat-request.server.ts':real=>({
+    ...real,
+    requestLocalJson:async(...args)=>{await gate;return real.requestLocalJson(...args);},
+  })};
+  const app=await appFixture({reviewChatgpt:false,localReviewMode:'multiturn',localJsonRepairEnabled:false},{wrap});
+  t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const a=await started(app,1);
+  await eventually(()=>job(app,a)?.providerProgress?.local?.stage==='local_lease_waiting','A is not waiting for the lease before send');
+  assert.equal(app.localRequests.length,0,'HTTP must not be sent while local_lease_waiting');
+  releaseHttp();
+  await eventually(()=>app.localRequests.length===1,'HTTP was not dispatched after the gate opened');
+  assert.equal(job(app,a).providerProgress.local.stage,'local_queued');
+  await answer(app,0,final);
+  await eventually(()=>job(app,a)?.status==='posted','A did not post');
+});
+
+test('queued-without-output: keepalives do not save a ghost; abort releases the lease', async t=>{
+  const app=await fixture(t);
+  app.env.ASHLAR_LOCAL_LLM_STREAM='true';
+  app.env.ASHLAR_LOCAL_REVIEW_QUEUED_MS='200';
+  app.env.ASHLAR_LOCAL_REVIEW_LIVENESS_MS='60000';
+  const a=await started(app,1);
+  await eventually(()=>app.localRequests.length===1,'A1 not sent');
+  const res=app.localResponses[0];
+  res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache'});
+  const keepalive={id:'c1',object:'chat.completion.chunk',created:0,model:'keepalive',choices:[{index:0,delta:{role:'assistant',content:''},finish_reason:null}]};
+  const tick=setInterval(()=>{try{res.write(`data: ${JSON.stringify(keepalive)}\n\n`);}catch{/* aborted */}},20);
+  t.after(()=>{clearInterval(tick);try{res.end();}catch{/* already closed */}});
+  const b=await started(app,2);
+  await eventually(()=>job(app,b)?.providerProgress?.local?.stage==='local_lease_waiting','B is not waiting for the lease');
+  await eventually(()=>job(app,a)?.assumptions?.some(s=>/queued without output/i.test(s)),'A was not aborted for queued-without-output despite keepalives');
+  await eventually(()=>app.localRequests.length===2||job(app,b)?.providerProgress?.local?.stage==='local_queued',
+    'B did not take the lease after A released it');
+  await eventually(()=>app.localRequests.length===2||job(app,b)?.providerProgress?.local?.stage==='local_queued',
+    'B did not take the lease after A released it');
+});

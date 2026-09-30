@@ -41,12 +41,14 @@ export class LocalChatHttpError extends Error {
 }
 
 /** What the transport observed on an in-flight request.
+ * `sent`: the HTTP request was dispatched (req.end) — nothing received yet. This is when the leg
+ * may first show `local_queued`; before that it is waiting for Ashlar's lease and has sent nothing.
  * `keepalive`: the server answered (response headers, or an empty heartbeat chunk) but has produced
  * no output for THIS request yet — it is alive and the request is queued or still prefilling.
  * `output`: tokens (reasoning, content or a tool call) arrived — the model is generating for us.
  * A concurrency-1 local server serves other jobs first, so "queued for an hour" and "hung" look
  * identical without this signal; it is what lets the operator tell the two apart. */
-export type LocalRequestActivity = { kind: "keepalive" | "output"; at: number };
+export type LocalRequestActivity = { kind: "sent" | "keepalive" | "output"; at: number };
 
 export type LocalRequestOptions = {
   onActivity?: (activity: LocalRequestActivity) => void;
@@ -66,6 +68,85 @@ export function localStreamingDefault(
 function streamingEnabled(opts?: LocalRequestOptions): boolean {
   if (opts?.stream !== undefined) return opts.stream;
   return localStreamingDefault();
+}
+
+/** Optional process-wide HTTP slot for chat/completions, from ASHLAR_LOCAL_SLOT_LOCK=true.
+ *
+ * Off by default. When on, at most one chat/completions request is in flight: the next caller waits
+ * until the previous request has settled (end, error, or abort). Aligns Ashlar's send with a
+ * concurrency-1 server slot so a cancelled request that has not yet unwound cannot let the next
+ * lease-holder pile on (ghost occupancy). Health probes (non-chat paths) never take the slot. */
+export function localSlotLockEnabled(
+  env: Record<string, string | undefined> | undefined = typeof process !== "undefined" ? process.env : undefined,
+): boolean {
+  return env?.ASHLAR_LOCAL_SLOT_LOCK === "true";
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? Object.assign(new Error("local HTTP slot wait aborted"), { name: "AbortError" });
+}
+
+type SlotWaiter = {
+  resolve: (release: () => void) => void;
+  reject: (reason: unknown) => void;
+  detach: () => void;
+};
+
+/** Capacity-1 mutex around in-flight chat/completions HTTP. */
+export class LocalHttpSlot {
+  private holder: (() => void) | undefined;
+  private queue: SlotWaiter[] = [];
+
+  acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) return Promise.reject(abortReason(signal));
+    if (!this.holder && !this.queue.length) return Promise.resolve(this.grant());
+    return new Promise<() => void>((resolve, reject) => {
+      const onAbort = () => {
+        const i = this.queue.indexOf(waiter);
+        if (i < 0) return;
+        this.queue.splice(i, 1);
+        waiter.detach();
+        reject(abortReason(signal as AbortSignal));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const waiter: SlotWaiter = {
+        resolve, reject,
+        detach: () => signal?.removeEventListener("abort", onAbort),
+      };
+      this.queue.push(waiter);
+    });
+  }
+
+  snapshot(): { busy: boolean; queued: number } {
+    return { busy: Boolean(this.holder), queued: this.queue.length };
+  }
+
+  private grant(): () => void {
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (this.holder === release) this.holder = undefined;
+      this.pump();
+    };
+    this.holder = release;
+    return release;
+  }
+
+  private pump() {
+    if (this.holder || !this.queue.length) return;
+    const waiter = this.queue.shift() as SlotWaiter;
+    waiter.detach();
+    waiter.resolve(this.grant());
+  }
+}
+
+const SLOT_KEY = Symbol.for("ashlar.localHttpSlot");
+
+/** The one process-wide HTTP slot (kept on globalThis so a module loaded twice still shares it). */
+export function localHttpSlot(): LocalHttpSlot {
+  const g = globalThis as unknown as Record<symbol, LocalHttpSlot | undefined>;
+  return (g[SLOT_KEY] ??= new LocalHttpSlot());
 }
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -160,13 +241,32 @@ export function requestLocalJson(
   signal?: AbortSignal,
   opts?: LocalRequestOptions,
 ): Promise<unknown> {
+  const url = new URL(`${baseURL.replace(/\/$/, "")}/${path}`);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return Promise.reject(new Error("local LLM endpoint must use HTTP or HTTPS"));
+  }
+  const chat = path === "chat/completions" && body !== undefined && body !== null && typeof body === "object";
+  const dispatch = () => dispatchLocalJson(url, apiKey, chat, body, signal, opts);
+  // Optional HTTP slot: chat/completions only. Released when THIS request settles so the next
+  // lease-holder cannot send while a cancelled request is still occupying the server.
+  if (chat && localSlotLockEnabled()) {
+    return localHttpSlot().acquire(signal).then(async (release) => {
+      try { return await dispatch(); }
+      finally { release(); }
+    });
+  }
+  return dispatch();
+}
+
+function dispatchLocalJson(
+  url: URL,
+  apiKey: string,
+  chat: boolean,
+  body: unknown,
+  signal: AbortSignal | undefined,
+  opts: LocalRequestOptions | undefined,
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const url = new URL(`${baseURL.replace(/\/$/, "")}/${path}`);
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      reject(new Error("local LLM endpoint must use HTTP or HTTPS"));
-      return;
-    }
-    const chat = path === "chat/completions" && body !== undefined && body !== null && typeof body === "object";
     const stream = chat && streamingEnabled(opts);
     const payload = chat
       ? (stream
@@ -251,6 +351,8 @@ export function requestLocalJson(
     req.setSocketKeepAlive(true, 30_000);
     req.on("error", reject);
     req.end(data);
+    // Dispatched: the leg may now show local_queued. Before this it had sent nothing.
+    if (chat) activity("sent");
   });
 }
 

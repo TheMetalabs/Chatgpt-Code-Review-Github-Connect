@@ -534,3 +534,12 @@ test("abort before any group completes skips the leg with an abort-specific reas
   assert.equal(out.ok, false, "nothing was produced, so there is nothing to salvage");
   assert.match(out.error, /aborted before any group completed/);
 });
+
+test("a named watchdog abort reason is kept so the operator can tell queued-without-output from a cancel", async () => {
+  const controller = new AbortController();
+  controller.abort(new Error("local review: queued without output for 200 ms (ASHLAR_LOCAL_REVIEW_QUEUED_MS)"));
+  const request = async (_b, _k, path) => { if (path === "models") return { data: [] }; return assistant(REVIEW_JSON); };
+  const out = await runLocalReviewLoop(sampleWith(["src/a.ts"]), settings, { request, signal: controller.signal });
+  assert.equal(out.ok, false);
+  assert.match(out.error, /queued without output/);
+});

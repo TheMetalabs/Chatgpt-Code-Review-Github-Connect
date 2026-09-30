@@ -104,9 +104,10 @@ test('streaming chat: server heartbeats are queued activity, tokens are output, 
   assert.equal(sent.stream, true);
   assert.deepEqual(sent.stream_options, { include_usage: true });
   // Headers + two heartbeats + role-only chunk = alive but nothing for us yet; then output.
-  assert.deepEqual(seen.slice(0, 4), ['keepalive', 'keepalive', 'keepalive', 'keepalive']);
-  assert.equal(seen[4], 'output');
-  assert.ok(seen.slice(4, 7).every(k => k === 'output'));
+  assert.equal(seen[0], 'sent', 'HTTP dispatch is reported before any server bytes');
+  assert.deepEqual(seen.slice(1, 5), ['keepalive', 'keepalive', 'keepalive', 'keepalive']);
+  assert.equal(seen[5], 'output');
+  assert.ok(seen.slice(5, 8).every(k => k === 'output'));
 });
 
 test('streaming chat: tool_call deltas are reassembled by index and usage survives', async t => {
@@ -157,6 +158,7 @@ test('buffered chat (stream off, or server ignores stream) reports output activi
   const seenOff = [];
   assert.equal(await requestLocalChat(nonStream, '', payload, undefined, { stream: false, onActivity: a => seenOff.push(a.kind) }), 'ok');
   assert.ok(seenOff.includes('output'), 'buffered response must report output activity');
+  assert.equal(seenOff[0], 'sent');
   // Streaming requested but the server answered plain JSON: same buffered path, same signal.
   const ignoresStream = await listen(t, (req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end(reply); });
   const seenOn = [];
@@ -173,4 +175,51 @@ test('streaming chat: a server that ignores stream and answers plain JSON still 
   assert.equal(await requestLocalChat(nonStream, '', payload, undefined, { stream: false }), 'ok');
   assert.equal(sent.stream, false);
   assert.equal(sent.stream_options, undefined);
+});
+
+test('optional HTTP slot lock: a second chat request waits until the first settles; /models does not take the slot', async t => {
+  const prev = process.env.ASHLAR_LOCAL_SLOT_LOCK;
+  process.env.ASHLAR_LOCAL_SLOT_LOCK = 'true';
+  t.after(() => {
+    if (prev === undefined) delete process.env.ASHLAR_LOCAL_SLOT_LOCK;
+    else process.env.ASHLAR_LOCAL_SLOT_LOCK = prev;
+  });
+  const requestLocalChat = await transport();
+  const requestLocalJson = await transportJson();
+  const arrived = [];
+  const base = await listen(t, (req, res) => {
+    arrived.push({ url: req.url, res });
+    req.resume();
+  });
+  const a = new AbortController();
+  const first = requestLocalChat(base, '', payload, a.signal);
+  const rejected = assert.rejects(first, e => e.name === 'AbortError' || /abort/i.test(String(e)));
+  await new Promise((resolve, reject) => {
+    const deadline = Date.now() + 2_000;
+    const tick = () => { if (arrived.length >= 1) resolve(); else if (Date.now() > deadline) reject(new Error('first chat never arrived')); else setTimeout(tick, 10); };
+    tick();
+  });
+  const second = requestLocalChat(base, '', payload);
+  await flush();
+  await new Promise(r => setTimeout(r, 40));
+  assert.equal(arrived.filter(x => x.url === '/v1/chat/completions').length, 1, 'the second chat did not pile onto the occupied slot');
+  // A non-chat path never takes the slot, even while a chat request holds it.
+  const models = requestLocalJson(base, '', 'models');
+  await new Promise((resolve, reject) => {
+    const deadline = Date.now() + 2_000;
+    const tick = () => { if (arrived.some(x => x.url === '/v1/models')) resolve(); else if (Date.now() > deadline) reject(new Error('/models was blocked by the chat slot')); else setTimeout(tick, 10); };
+    tick();
+  });
+  arrived.find(x => x.url === '/v1/models').res.end('{"data":[]}');
+  await models;
+  a.abort();
+  await rejected;
+  await new Promise((resolve, reject) => {
+    const deadline = Date.now() + 2_000;
+    const tick = () => { if (arrived.filter(x => x.url === '/v1/chat/completions').length >= 2) resolve(); else if (Date.now() > deadline) reject(new Error('second chat did not send after the first settled')); else setTimeout(tick, 10); };
+    tick();
+  });
+  const chat = arrived.filter(x => x.url === '/v1/chat/completions');
+  chat[1].res.end('{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}');
+  assert.equal(await second, 'ok');
 });

@@ -133,7 +133,8 @@ describe("buildReviewerLanes", () => {
 
   it("a queued local leg whose server is alive is reported as queued, not stalled, however old its progress", () => {
     // Regression: a concurrency-1 server serves other jobs first. An hour in the queue with fresh
-    // keepalives is normal and must not read as "no recent progress" (nor be aborted).
+    // keepalives is still shown as queued (not "no recent progress"). A separate queued-without-output
+    // watchdog may abort that request; this assertion is the lane display only.
     const now = 10_000_000;
     const lanes = buildReviewerLanes(
       job({

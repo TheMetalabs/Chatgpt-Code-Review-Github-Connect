@@ -1,49 +1,34 @@
 // Loaded first on every provider page (manifest, background.js contentFiles): only function
 // declarations, no top-level state, so it can be injected again and loaded alone by any script.
 
-/* ChatGPT's transcript has two DOMs, and Grok's bubbles are a third. Every turn lookup (composer.js,
- * json.js, quota.js) goes through these helpers. Up to 2026-09 a ChatGPT message is the node with
- * data-message-author-role (its id in data-message-id). The 2026-09 unit DOM (live 1.1.41: a review
- * sent and answered, seen as 0 user turns, send_unconfirmed) has neither: a message is a search unit
- * keyed "<turn>:<n>:<role>" (data-content-search-unit-key). A user unit holds the bubble
- * ([data-user-message-bubble]) and sits in a same-keyed wrapper (data-chatgpt-search-unit-key) that
- * also holds the file cards and the message id (data-chatgpt-search-message-ids); its "You said:"
- * heading is an sr-only sibling. An assistant unit carries its ids itself ("<id> <id>") and its body
- * data-chatgpt-selection-message-id; the turn container (data-content-search-turn-key) holds the user
- * unit, the answer and, beside them outside every unit, the answer's action row.
- * Grok (grok.com, 2026-09) renders each message as role="article" with data-testid user-message or
- * assistant-message. The aria-label is the localized sender ("You" / "Grok"), so the test id is the
- * role. A response id, when the page puts one on the bubble, is id="response-<id>". */
+/* ChatGPT's transcript has two DOMs, and every turn lookup (composer.js, json.js, quota.js) goes through
+ * these helpers. Up to 2026-09 a message is the node with data-message-author-role (its id in
+ * data-message-id). The 2026-09 unit DOM (live 1.1.41: a review sent and answered, seen as 0 user
+ * turns, send_unconfirmed) has neither: a message is a search unit keyed "<turn>:<n>:<role>"
+ * (data-content-search-unit-key). A user unit holds the bubble ([data-user-message-bubble]) and sits
+ * in a same-keyed wrapper (data-chatgpt-search-unit-key) that also holds the file cards and the
+ * message id (data-chatgpt-search-message-ids); its "You said:" heading is an sr-only sibling. An
+ * assistant unit carries its ids itself ("<id> <id>") and its body data-chatgpt-selection-message-id;
+ * the turn container (data-content-search-turn-key) holds the user unit, the answer and, beside them
+ * outside every unit, the answer's action row. */
 
-/** Grok's message test id for `role` ("user" or "assistant"). */
-function grokTestId(role) {
-  return role === "user" ? "user-message" : "assistant-message";
-}
-
-/** Whether `el` is a Grok message bubble. */
-function grokTurn(el) {
-  const testid = el?.getAttribute?.("data-testid");
-  return testid === "user-message" || testid === "assistant-message";
-}
-
-/** The message nodes of `role` ("user", "assistant"; both when omitted), in any provider DOM. */
+/** The message nodes of `role` ("user", "assistant"; both when omitted), in either DOM. */
 function turnSelector(role) {
   return (role ? [role] : ["user", "assistant"])
-    .map(r => `[data-message-author-role="${r}"], [data-content-search-unit-key$=":${r}"], [data-testid="${grokTestId(r)}"]`).join(", ");
+    .map(r => `[data-message-author-role="${r}"], [data-content-search-unit-key$=":${r}"]`).join(", ");
 }
 
 /** Any message node, of any role (the old DOM's system or tool messages too). */
 function turnNodeSelector() {
-  return "[data-message-author-role], [data-content-search-unit-key], [data-testid='user-message'], [data-testid='assistant-message']";
+  return "[data-message-author-role], [data-content-search-unit-key]";
 }
 
 /** Anything inside a message of `role` (any role when omitted): the node, or the unit DOM's wrapper
  * that holds a user unit's file cards beside it. For "is this element transcript content" checks. */
 function turnAreaSelector(role) {
-  const grok = role ? `[data-testid="${grokTestId(role)}"]` : "[data-testid='user-message'], [data-testid='assistant-message']";
   return role
-    ? `[data-message-author-role="${role}"], [data-content-search-unit-key$=":${role}"], [data-chatgpt-search-unit-key$=":${role}"], ${grok}`
-    : `[data-message-author-role], [data-content-search-unit-key], [data-chatgpt-search-unit-key], ${grok}`;
+    ? `[data-message-author-role="${role}"], [data-content-search-unit-key$=":${role}"], [data-chatgpt-search-unit-key$=":${role}"]`
+    : "[data-message-author-role], [data-content-search-unit-key], [data-chatgpt-search-unit-key]";
 }
 
 /** Whether `el` is a unit DOM message node. */
@@ -68,7 +53,6 @@ function conversationTurnEls(root) { return turnEls(undefined, root); }
 function turnRole(el) {
   const role = el?.getAttribute?.("data-message-author-role");
   if (role) return role;
-  if (grokTurn(el)) return el.getAttribute("data-testid") === "user-message" ? "user" : "assistant";
   return /:(user|assistant)$/.exec(el?.getAttribute?.("data-content-search-unit-key") || "")?.[1] || "";
 }
 
@@ -85,17 +69,10 @@ function unitWrapper(el) {
 function turnMessageId(el) {
   const id = el?.getAttribute?.("data-message-id");
   if (id) return id;
-  if (unitTurn(el)) {
-    const first = node => (node?.getAttribute?.("data-chatgpt-search-message-ids") || "").trim().split(/\s+/)[0] || "";
-    return first(el) || first(unitWrapper(el)) ||
-      el.querySelector?.("[data-chatgpt-selection-message-id]")?.getAttribute("data-chatgpt-selection-message-id") || "";
-  }
-  if (!grokTurn(el)) return "";
-  const from = node => {
-    const value = node?.id || "";
-    return value.startsWith("response-") ? value.slice("response-".length) : "";
-  };
-  return from(el) || from(el.querySelector?.("[id^='response-']")) || "";
+  if (!unitTurn(el)) return "";
+  const first = node => (node?.getAttribute?.("data-chatgpt-search-message-ids") || "").trim().split(/\s+/)[0] || "";
+  return first(el) || first(unitWrapper(el)) ||
+    el.querySelector?.("[data-chatgpt-selection-message-id]")?.getAttribute("data-chatgpt-selection-message-id") || "";
 }
 
 /** Where a user message's typed text renders: the old DOM's collapsible content, the unit DOM's

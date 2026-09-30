@@ -131,7 +131,7 @@ function assistantCodeBlocks(root = currentAssistantRoot(), stats) {
 /** A turn's code blocks in order: every <pre>, and every code-block container that has none (live
  * aicc #455: ChatGPT renders a fenced block as the copy container around a block <code>, no <pre>). */
 function codeBlockEls(turn) {
-  return [...turn.querySelectorAll("pre, [data-markdown-copy='code-block'], .chat-code-block")].filter(el => el.tagName === "PRE" || !el.querySelector("pre"));
+  return [...turn.querySelectorAll("pre, [data-markdown-copy='code-block']")].filter(el => el.tagName === "PRE" || !el.querySelector("pre"));
 }
 
 /** All the code text in `el`, hidden parts included (a collapsed block hides its tail), with the
@@ -149,7 +149,7 @@ function fullCodeText(el) {
 
 /** A code block's frame: the renderer's code-block container around `pre` inside `turn`, else `pre`. */
 function codeBlockBox(pre, turn) {
-  const box = pre.closest?.("[data-markdown-copy='code-block'], .CodeBlock, [data-testid='code-block'], .chat-code-block");
+  const box = pre.closest?.("[data-markdown-copy='code-block'], .CodeBlock, [data-testid='code-block']");
   return box && turn.contains(box) ? box : pre;
 }
 
@@ -409,12 +409,6 @@ function responseRoot(message, replies, user) {
     const turn = message.closest("[data-content-search-turn-key]");
     return turn && [...turn.querySelectorAll("[data-content-search-unit-key]")].every(node => node === user || replies.includes(node)) ? turn : message;
   }
-  if (typeof grokTurn === "function" && grokTurn(message) && typeof grokAnswerRoot === "function") {
-    const climbed = grokAnswerRoot(message);
-    const nodes = [...climbed.querySelectorAll(turnNodeSelector())];
-    if (nodes.every(node => node === user || replies.includes(node))) return climbed;
-    return message;
-  }
   const container = message.closest('[data-testid^="conversation-turn-"], article, section');
   return container && [...container.querySelectorAll(turnNodeSelector())].every(node => replies.includes(node))
     ? container : message;
@@ -520,25 +514,21 @@ function composerDraftText() {
  * file. */
 function composerStagedFiles(state, submission) {
   const editor = typeof composer === "function" && globalThis.document ? composer() : null;
-  // Grok's composer form is found by itself, so its attachment list is read while the editor remounts.
-  const grokForm = globalThis.document?.querySelector?.("form[data-composer]");
-  const form = grokForm || editor?.closest?.("form");
+  const form = editor?.closest?.("form");
   if (!form) return [];
-  const grok = typeof grokComposerForm === "function" && grokComposerForm(form);
   const own = new Set(submission?.phase === "sent" ? [] : [...(Array.isArray(submission?.attachments) ? submission.attachments : []),
     ...(Array.isArray(state?.pendingAttachments) ? state.pendingAttachments : [])]);
   const shown = chip => (typeof renderedControl === "function" ? renderedControl(chip) : !hiddenNode(chip));
   // Names first, then the fold: only a chip that names a file takes in the elements inside it. An
   // unnamed element (an empty or blank title or label) is no chip, so a wrapper like that never hides
   // the named chip inside it (Ashlar, review of 5af999fd: the user's staged file closed with the tab).
-  // Grok's chips are its attachment list items (composer.js grokAttachmentItems): no wrapper test.
   const named = fileChips(form)
-    .filter(chip => (grok || (!chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button'))) && shown(chip))
+    .filter(chip => !chip.contains(editor) && !chip.querySelector('[contenteditable="true"], textarea, button[type="submit"], [data-testid="send-button"], #composer-submit-button') && shown(chip))
     .map(chip => ({chip, names: fileChipNames(chip).filter(name => name.trim())}))
     .filter(({names}) => names.length);
   return named.filter(({chip}) => !named.some(outer => outer.chip !== chip && outer.chip.contains(chip)))
     // Own by the barrier's own name rule (composer.js chipShowsFile: any case, a truncated or
-    // extensionless name; a Grok chip by its exact name), so a chip the barrier waits on is never read as the user's draft.
+    // extensionless name), so a chip the barrier waits on is never read as the user's draft.
     .filter(({chip, names}) => ![...own].some(name => typeof chipShowsFile === "function" ? chipShowsFile(chip, name) : names.includes(name)))
     .map(({names}) => names[0]);
 }
@@ -599,7 +589,10 @@ async function pollBoundResponse() {
   const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
   const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
   const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
-  return {runner, bound, stop, streaming, done, submission};
+  const poll = {runner, bound, stop, streaming, done, submission};
+  // The page records that this send saw a stream. ChatGPT defines no noteSawStream. Checks only read it.
+  if (typeof noteSawStream === "function") noteSawStream(submission, poll);
+  return poll;
 }
 
 /** A quota banner ends the run only while no answer is in hand and the banner can belong to it

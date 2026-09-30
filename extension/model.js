@@ -12,27 +12,11 @@ function chatgptLevelHit(level, text) {
   return false;
 }
 
-function grokLevelHit(level, text) {
-  const t = String(text || "").replace(/\s+/g, " ").trim();
-  if (level === "heavy") return /(?:^|\s)(heavy|헤비)(?:\s|$)/i.test(t);
-  if (level === "expert") return /(?:^|\s)(expert|전문가)(?:\s|$)/i.test(t);
-  if (level === "build") return /(?:^|\s)(build|빌드)(?:모드)?(?:\s|$)/i.test(t);
-  if (level === "fast") return /(?:^|\s)(fast|빠른)(?:\s|$)/i.test(t);
-  if (level === "auto") return /(?:^|\s)(auto|자동)(?:\s|$)/i.test(t);
-  return false;
-}
-
 function chatgptPill() {
   return (
     document.querySelector("button.__composer-pill[aria-haspopup='menu']") ||
     document.querySelector("form[data-type='unified-composer'] button[aria-haspopup='menu']")
   );
-}
-
-function grokPill() {
-  return document.querySelector("#model-select-trigger") ||
-    document.querySelector("button[aria-label='Model select']") ||
-    document.querySelector("button[aria-label='모델 선택']");
 }
 
 function reasoningMenuItems() {
@@ -46,18 +30,12 @@ function reasoningMenuItems() {
 /** Picks the reasoning level on the model pill: "current" when it already shows it, "selected" once
  * clicked, "skipped" when it cannot be picked by `deadline` (no pill, a menu that never opens, no
  * matching item): the run then continues with the current model, never waits on the menu. */
-async function selectReasoning(provider, level, deadline = Date.now() + 60_000) {
-  const want = String(level || (provider === "grok" ? "expert" : "extra_high"));
-  const hit = provider === "grok" ? grokLevelHit : chatgptLevelHit;
-  const fallback =
-    provider === "grok"
-      ? want === "heavy" || want === "build"
-        ? [want, "expert"]
-        : [want]
-      : want === "pro" || want === "extra_high"
-        ? ["extra_high", "high", "medium"]
-        : [want];
-  const pill = provider === "grok" ? grokPill() : chatgptPill();
+async function selectReasoning(_provider, level, deadline = Date.now() + 60_000) {
+  // ChatGPT's pill. A Grok page replaces this function (site-grok.js) before any call.
+  const want = String(level || "extra_high");
+  const hit = chatgptLevelHit;
+  const fallback = want === "pro" || want === "extra_high" ? ["extra_high", "high", "medium"] : [want];
+  const pill = chatgptPill();
   if (!pill) return "skipped";
   if (hit(want, pillText(pill))) return "current";
   const escape = () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -80,11 +58,8 @@ async function selectReasoning(provider, level, deadline = Date.now() + 60_000) 
   globalThis.throwIfStopped?.();
   if (Date.now() >= deadline) { escape(); return "skipped"; }
   items = reasoningMenuItems();
-  // A disabled entry (native, aria, or Radix data-disabled) drops the click; the next fallback is tried.
-  const pickable = (n) => n instanceof HTMLElement && !n.disabled && n.getAttribute("aria-disabled") !== "true" &&
-    (n.getAttribute("data-disabled") === null || n.getAttribute("data-disabled") === "false");
   for (const key of fallback) {
-    const el = items.find((n) => pickable(n) && hit(key, pillText(n)));
+    const el = items.find((n) => hit(key, pillText(n)));
     if (el instanceof HTMLElement) {
       el.click();
       await sleep(400);

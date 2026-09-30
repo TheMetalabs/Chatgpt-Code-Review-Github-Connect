@@ -16,7 +16,7 @@ after(async () => { await browser?.close(); });
 
 const PROMPT = 'Review fixture PR #1 at abc123. Return the review JSON.';
 const ANSWER = JSON.stringify({findings: [], merge_recommendation: 'APPROVE', investigated_safe: ['fixture checked']}, null, 2);
-const MANIFEST = ['turns.js', 'composer.js', 'quota.js', 'overlay.js', 'model.js', 'json.js', 'content-grok.js'];
+const MANIFEST = ['turns.js', 'composer.js', 'quota.js', 'overlay.js', 'model.js', 'json.js', 'site-grok.js', 'content-grok.js'];
 const HOME = 'https://grok.com/';
 
 function pageHtml(body) {
@@ -97,23 +97,28 @@ test('grok transcript, stream, and composer: roles, code, submit, and done only 
   // A code-block Copy, and Submit still showing before any stop control, is not a finished answer.
   const idle = await page.evaluate(() => {
     document.querySelector('[aria-label="Copy response"]').remove();
-    delete globalThis.__ashlarGrokSawStream;
     return {done: replyDoneVisible(), streaming: stopButtonVisible()};
   });
   assert.deepEqual(idle, {done: false, streaming: false});
 
   // Korean stop label and the hardcoded Generating banner both count, and neither finishes the answer.
+  // The check does not record the stream. The poll's noteSawStream does, on this submission.
   const streaming = await page.evaluate(strip => {
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'sent', expected: 'review', baseline: 0}));
     document.querySelector('[data-testid="chat-submit"]').remove();
     document.querySelector('form').insertAdjacentHTML('afterbegin', strip);
     const withButton = stopButtonVisible();
+    const unmarked = savedSubmission().sawStream === true;
+    noteSawStream(savedSubmission(), {stop: withButton, streaming: false});
     document.getElementById('grok-stop').remove();
     const bannerOnly = stopButtonVisible();
-    return {withButton, bannerOnly, done: replyDoneVisible(), marked: globalThis.__ashlarGrokSawStream};
+    return {withButton, bannerOnly, done: replyDoneVisible(), unmarked, marked: savedSubmission().sawStreamKey};
   }, grokStrip('모델 응답 중지'));
   assert.equal(streaming.withButton, true);
   assert.equal(streaming.bannerOnly, true);
   assert.equal(streaming.done, false);
+  assert.equal(streaming.unmarked, false);
   assert.equal(streaming.marked, 'user-A');
 
   // Stream ended and Submit is gone in favour of the voice control: the answer that streamed is done.
@@ -286,24 +291,32 @@ test('a generic stop label in the grok composer records the stream, so an idle c
       <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
       <button type="button" id="stop" ${label} style="width:64px;height:32px">x</button></form>`);
     const out = await page.evaluate(() => {
-      delete globalThis.__ashlarGrokSawStream;
+      globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+      sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'sent', expected: 'review', baseline: 0}));
       const during = chatGenerationFinished();
-      const marked = globalThis.__ashlarGrokSawStream;
+      const writtenByCheck = savedSubmission().sawStream === true;
+      noteSawStream(savedSubmission(), {stop: stopButtonVisible(), streaming: false});
+      const marked = savedSubmission().sawStreamKey;
       document.getElementById('stop').remove();
       document.querySelector('main').insertAdjacentHTML('beforeend',
         '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
       document.querySelector('form').insertAdjacentHTML('beforeend',
         '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
-      return {during, marked, after: chatGenerationFinished()};
+      return {during, writtenByCheck, marked, after: chatGenerationFinished()};
     });
-    assert.deepEqual(out, {during: false, marked: 'user-A', after: true}, label);
+    assert.deepEqual(out, {during: false, writtenByCheck: false, marked: 'user-A', after: true}, label);
   }
-  // The same controls outside the composer (a transcript) never record a Grok stream.
+  // The same controls outside the composer (a transcript) are not this turn's stream, so the poll records nothing.
   const transcript = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div>
     <button type="button" data-testid="stop-button" style="width:64px;height:32px">x</button>
     <button type="button" aria-label="Stop generating" style="width:64px;height:32px">x</button></main>
     <form data-composer="true"><textarea style="width:320px;height:48px"></textarea></form>`);
-  assert.equal(await transcript.evaluate(() => { delete globalThis.__ashlarGrokSawStream; stopButtonVisible(); return globalThis.__ashlarGrokSawStream ?? null; }), null);
+  assert.equal(await transcript.evaluate(() => {
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'sent', expected: 'review', baseline: 0}));
+    noteSawStream(savedSubmission(), {stop: stopButtonVisible(), streaming: false});
+    return savedSubmission().sawStream === true;
+  }), false);
 });
 
 test('grok composer lookup stays inside an existing composer form until its editor mounts', async t => {
@@ -354,17 +367,20 @@ test('grok stream status is the composer\'s status strip and stop button, never 
       <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button>
     </form>`);
   const out = await page.evaluate(strip => {
-    delete globalThis.__ashlarGrokSawStream;
-    const idle = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: globalThis.__ashlarGrokSawStream ?? null,
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'sent', expected: 'review', baseline: 0}));
+    const idle = {grok: grokStreamVisible(), stop: stopButtonVisible(), marked: savedSubmission().sawStream ?? null,
       ready: attachmentStates(document.querySelector('form'), ['Generating.txt'])[0].state};
     document.querySelector('form').insertAdjacentHTML('afterbegin', strip);
-    const streaming = {grok: grokStreamVisible(), marked: globalThis.__ashlarGrokSawStream ?? null};
+    const streaming = {grok: grokStreamVisible(), marked: savedSubmission().sawStream ?? null};
+    noteSawStream(savedSubmission(), {stop: stopButtonVisible(), streaming: false});
+    const recorded = savedSubmission().sawStreamKey;
     document.getElementById('grok-stop').remove();
     const statusOnly = grokStreamVisible();
     document.getElementById('grok-generating').remove();
-    return {idle, streaming, statusOnly, after: grokStreamVisible()};
+    return {idle, streaming, recorded, statusOnly, after: grokStreamVisible()};
   }, grokStrip());
-  assert.deepEqual(out, {idle: {grok: false, stop: false, marked: null, ready: 'ready'}, streaming: {grok: true, marked: 'user-A'}, statusOnly: true, after: false});
+  assert.deepEqual(out, {idle: {grok: false, stop: false, marked: null, ready: 'ready'}, streaming: {grok: true, marked: null}, recorded: 'user-A', statusOnly: true, after: false});
 });
 
 test('grok attachment chips are the attachment list items: not the model picker or a composer wrapper, with or without the editor', async t => {
@@ -497,9 +513,12 @@ test('a transcript stop-button neither hides the grok composer stream nor counts
     <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
     <button type="button" id="stop" aria-label="Stop model response" style="width:64px;height:32px">x</button></form>`);
   const out = await page.evaluate(() => {
-    delete globalThis.__ashlarGrokSawStream;
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'sent', expected: 'review', baseline: 0}));
     const during = chatGenerationFinished();
-    const marked = globalThis.__ashlarGrokSawStream;
+    const writtenByCheck = savedSubmission().sawStream === true;
+    noteSawStream(savedSubmission(), {stop: stopButtonVisible(), streaming: false});
+    const marked = savedSubmission().sawStreamKey;
     document.getElementById('stop').remove();
     const transcriptOnly = stopButtonVisible();
     document.getElementById('old-stop').remove();
@@ -507,9 +526,9 @@ test('a transcript stop-button neither hides the grok composer stream nor counts
       '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
     document.querySelector('form').insertAdjacentHTML('beforeend',
       '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
-    return {during, marked, transcriptOnly, after: chatGenerationFinished()};
+    return {during, writtenByCheck, marked, transcriptOnly, after: chatGenerationFinished()};
   });
-  assert.deepEqual(out, {during: false, marked: 'user-A', transcriptOnly: false, after: true});
+  assert.deepEqual(out, {during: false, writtenByCheck: false, marked: 'user-A', transcriptOnly: false, after: true});
 });
 
 test('a grok stream seen before the user turn had an id still settles once it gets one; a later turn does not inherit it', async t => {
@@ -517,38 +536,47 @@ test('a grok stream seen before the user turn had an id still settles once it ge
     <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
     <button type="button" id="stop" aria-label="Stop model response" style="width:64px;height:32px">x</button></form>`);
   const out = await page.evaluate(() => {
-    delete globalThis.__ashlarGrokSawStream;
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'sent', expected: 'review', baseline: 0}));
     const during = chatGenerationFinished();
-    const marked = globalThis.__ashlarGrokSawStream;
-    // One update: the same bubble gets its id, the stop goes, the answer and the idle voice control mount.
+    noteSawStream(savedSubmission(), {stop: stopButtonVisible(), streaming: false});
+    const marked = savedSubmission().sawStreamKey;
+    // The same bubble gets its id, the stop goes, the answer and the idle voice control mount.
     document.getElementById('u1').id = 'response-user-A';
     document.getElementById('stop').remove();
     document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" id="response-answer-A" role="article">final answer text</div>');
     document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
     const after = chatGenerationFinished();
-    // A distinct later user turn with its own answer, never streamed: not done by the old observation.
+    noteSawStream(savedSubmission(), {stop: false, streaming: true});
+    const upgraded = savedSubmission().sawStreamKey;
+    // A distinct later user turn with its own answer, never streamed: not done by this send's mark.
     document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="user-message" role="article">next</div><div data-testid="assistant-message" role="article">another answer</div>');
-    return {during, marked, after, next: chatGenerationFinished()};
+    return {during, marked, after, upgraded, next: chatGenerationFinished()};
   });
-  assert.deepEqual(out, {during: false, marked: 'n:1', after: true, next: false});
+  assert.deepEqual(out, {during: false, marked: 'n:1', after: true, upgraded: 'user-A', next: false});
 });
 
-test('an id-less grok stream observation is not inherited by a replacement bubble at the same count', async t => {
+test('a grok stream mark is this submission, not a global: another send does not inherit the counted turn', async t => {
   const page = await openGrok(t, `<main><div data-testid="user-message" id="u1" role="article">review</div></main>
     <form data-composer="true"><textarea style="width:320px;height:48px"></textarea>
     <button type="button" id="stop" aria-label="Stop model response" style="width:64px;height:32px">x</button></form>`);
   const out = await page.evaluate(() => {
-    delete globalThis.__ashlarGrokSawStream;
-    chatGenerationFinished();
-    const marked = globalThis.__ashlarGrokSawStream;
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'sent', expected: 'review', baseline: 0}));
+    noteSawStream(savedSubmission(), {stop: stopButtonVisible(), streaming: false});
+    const marked = savedSubmission().sawStreamKey;
     document.getElementById('stop').remove();
     document.getElementById('u1').replaceWith(Object.assign(document.createElement('div'), {id: 'u2', textContent: 'other'}));
     document.getElementById('u2').setAttribute('data-testid', 'user-message');
+    document.getElementById('u2').setAttribute('role', 'article');
     document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="assistant-message" role="article">an answer</div>');
     document.querySelector('form').insertAdjacentHTML('beforeend', '<button type="button" data-testid="bot-voice-call-start" style="width:64px;height:32px">voice</button>');
-    return {marked, saw: grokSawCurrentStream(), done: chatGenerationFinished()};
+    const sameSend = grokSawCurrentStream();
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'other', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:other', JSON.stringify({phase: 'sent', expected: 'review', baseline: 0}));
+    return {marked, sameSend, other: grokSawCurrentStream()};
   });
-  assert.deepEqual(out, {marked: 'n:1', saw: false, done: false});
+  assert.deepEqual(out, {marked: 'n:1', sameSend: true, other: false});
 });
 
 test('a hidden grok private pill earlier in the page never masks the visible one', async t => {
@@ -612,6 +640,9 @@ test('review on the grok DOM: the sent turn is confirmed, the stream is not coll
   await page.clock.runFor(1600);
   assert.equal((await send('ashlar-harvest')).ok, false, 'not collected while Generating is up');
   assert.ok((await steps()).includes('generating'), JSON.stringify(await steps()));
+  const marked = await journal();
+  assert.equal(marked.sawStream, true, 'the poll recorded the stream on this submission');
+  assert.equal(marked.sawStreamKey, 'user-A');
 
   await page.evaluate(code => {
     document.getElementById('grok-stop').remove();
@@ -629,4 +660,66 @@ test('review on the grok DOM: the sent turn is confirmed, the stream is not coll
   assert.deepEqual(verdict(await send('ashlar-can-close', {allocationUrl: HOME})), {canClose: true, reason: 'complete'});
   await page.evaluate(() => document.getElementById('thread').insertAdjacentHTML('beforeend', '<div data-testid="user-message" id="response-user-B" role="article">my own question</div>'));
   assert.deepEqual(verdict(await send('ashlar-can-close', {allocationUrl: HOME})), {canClose: false, reason: 'repurposed', cause: 'user_turn'});
+});
+
+// grok.com private composer and a finished answer, captured 2026-09-30. Message text is replaced.
+// The response id sits on the wrapper that also holds the action row. The last answer's controls
+// are opacity 1; an earlier answer's are opacity 0. The empty composer still renders a disabled
+// Submit, and its attachment list is present and empty.
+// Not on that page, so not in this fixture: a file chip, an upload in progress, an upload error,
+// a Generating strip, a regenerate streaming under the previous answer, a quota notice.
+const CAPTURED_IDLE = `<form data-composer="true">
+  <input class="hidden" multiple type="file" name="files">
+  <div role="list" aria-label="대화 첨부파일" class="hidden"></div>
+  <div data-testid="chat-input"><div contenteditable="true" role="textbox" aria-label="Ask Grok anything" class="tiptap ProseMirror" style="width:320px;height:48px"><p class="is-empty"></p></div></div>
+  <button type="button" data-testid="attach-button" aria-label="첨부" style="width:40px;height:40px"></button>
+  <div data-query-bar-mode-select="true"><button type="button" id="model-select-trigger" aria-label="모델 선택" style="width:88px;height:40px">전문가</button></div>
+  <button type="button" aria-label="받아쓰기 (⌃D)" style="width:40px;height:40px"></button>
+  <button type="submit" data-testid="chat-submit" aria-label="제출" disabled style="width:40px;height:40px"></button>
+</form>`;
+function capturedAnswer(id, {visible}) {
+  const opacity = visible ? '1' : '0';
+  return `<div id="response-${id}"><div data-testid="assistant-message" role="article" aria-label="Grok"><p>xx</p></div>
+    <div class="action-buttons"><button type="button" aria-label="응답 복사" style="opacity:${opacity};width:32px;height:32px"></button>
+    <button type="button" aria-label="Like" style="opacity:${opacity};width:32px;height:32px"></button>
+    <button type="button" aria-label="Dislike" style="opacity:${opacity};width:32px;height:32px"></button>
+    <button type="button" aria-label="Regenerate" style="opacity:${opacity};width:32px;height:32px"></button>
+    <button type="button" aria-label="More actions" style="opacity:${opacity};width:32px;height:32px"></button></div></div>`;
+}
+test('captured grok.com DOM: idle private composer and a finished answer, earlier actions invisible', async t => {
+  const page = await openGrok(t, `<main>
+    <div data-testid="user-message" role="article" aria-label="당신"><p>x</p></div>
+    ${capturedAnswer('prev', {visible: false})}
+    <div data-testid="user-message" id="response-user-live" role="article" aria-label="당신"><p>x</p></div>
+    ${capturedAnswer('last', {visible: true})}
+  </main>${CAPTURED_IDLE}`);
+  const out = await page.evaluate(() => {
+    const answers = [...document.querySelectorAll('[data-testid="assistant-message"]')];
+    return {
+      roles: conversationTurnEls().map(turnRole),
+      ids: answers.map(turnMessageId),
+      pill: grokPill()?.id || '',
+      editor: composer()?.getAttribute('role') || '',
+      send: sendButton()?.getAttribute('data-testid') || '',
+      chips: fileChips(document.querySelector('form')).length,
+      streaming: stopButtonVisible(),
+      quota: quotaHit(),
+      loggedOut: grokLoggedOut(),
+      done: replyDoneVisible(),
+      earlier: replyDoneVisible(document.getElementById('response-prev')),
+    };
+  });
+  assert.deepEqual(out, {
+    roles: ['user', 'assistant', 'user', 'assistant'],
+    ids: ['prev', 'last'],
+    pill: 'model-select-trigger',
+    editor: 'textbox',
+    send: '',
+    chips: 0,
+    streaming: false,
+    quota: false,
+    loggedOut: false,
+    done: true,
+    earlier: false,
+  });
 });

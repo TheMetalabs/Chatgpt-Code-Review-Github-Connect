@@ -177,6 +177,7 @@ test('buffered chat: response headers without a body are keepalive, not output',
   const pending = requestLocalChat(base, '', payload, undefined, { stream: false, onActivity: a => seen.push(a.kind) });
   await ready;
   body.writeHead(200, { 'content-type': 'application/json' });
+  body.flushHeaders();
   await new Promise((resolve, reject) => {
     const deadline = Date.now() + 2_000;
     const tick = () => {

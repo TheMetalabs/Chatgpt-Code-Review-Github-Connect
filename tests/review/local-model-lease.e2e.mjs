@@ -182,7 +182,9 @@ test('queued-without-output: buffered headers with no body abort and release the
   const a=await started(app,1);
   await eventually(()=>app.localRequests.length===1,'A1 not sent');
   // Headers only: a hang after 200 JSON with no body must not count as output.
-  app.localResponses[0].writeHead(200,{'content-type':'application/json'});
+  const hung=app.localResponses[0];
+  hung.writeHead(200,{'content-type':'application/json'});
+  hung.flushHeaders();
   const b=await started(app,2);
   await eventually(()=>job(app,b)?.providerProgress?.local?.stage==='local_lease_waiting','B is not waiting for the lease');
   await eventually(()=>job(app,a)?.assumptions?.some(s=>/queued without output/i.test(s)),'A was not aborted for queued-without-output after headers with no body');

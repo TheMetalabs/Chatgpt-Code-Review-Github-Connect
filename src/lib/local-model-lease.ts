@@ -26,16 +26,19 @@ const LANE_RANK: Record<LocalModelLane, number> = { short: 0, fix: 1, review: 2 
 
 /** Short jobs a holder lends the model to per checkpoint unless the caller says otherwise. */
 export const DEFAULT_SHORT_PER_CHECKPOINT = 2;
+/** Safety ceiling for one checkpoint so an operator setting cannot starve the review holder. */
+export const MAX_SHORT_PER_CHECKPOINT = 16;
 
 /** ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: short jobs (JSON repairs) a review lends the model to at
- * each turn boundary. Default 2; 0 turns lending off (repairs then wait for the review to finish). */
+ * each turn boundary. Default 2, capped at 16; 0 turns lending off (repairs then wait for the review
+ * to finish). */
 export function shortJobsPerCheckpoint(
   env: Record<string, string | undefined> | undefined = typeof process !== "undefined" ? process.env : undefined,
 ): number {
   const raw = env?.ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT;
   if (raw == null || raw.trim() === "") return DEFAULT_SHORT_PER_CHECKPOINT;
   const n = Math.floor(Number(raw));
-  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SHORT_PER_CHECKPOINT;
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, MAX_SHORT_PER_CHECKPOINT) : DEFAULT_SHORT_PER_CHECKPOINT;
 }
 
 export type LocalModelLeaseHandle = {

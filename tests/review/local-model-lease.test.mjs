@@ -162,7 +162,7 @@ test('fix lane: an idle model is granted to a fix at once', async () => {
 });
 
 // --- short lane + checkpoint (JSON repair runs between a holding review's turns) ---
-import {shortJobsPerCheckpoint, DEFAULT_SHORT_PER_CHECKPOINT} from '../../src/lib/local-model-lease.ts';
+import {shortJobsPerCheckpoint, DEFAULT_SHORT_PER_CHECKPOINT, MAX_SHORT_PER_CHECKPOINT} from '../../src/lib/local-model-lease.ts';
 
 test('short lane: queued ahead of fix and review waiters', async () => {
   const lease = new LocalModelLease();
@@ -296,10 +296,12 @@ test('checkpoint on a handle that no longer holds the model is a no-op', async (
 
 test('ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: default 2, 0 allowed, junk falls back to the default', () => {
   assert.equal(DEFAULT_SHORT_PER_CHECKPOINT, 2);
+  assert.equal(MAX_SHORT_PER_CHECKPOINT, 16);
   assert.equal(shortJobsPerCheckpoint({}), 2);
   assert.equal(shortJobsPerCheckpoint({ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: ''}), 2);
   assert.equal(shortJobsPerCheckpoint({ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: '0'}), 0);
   assert.equal(shortJobsPerCheckpoint({ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: '5'}), 5);
+  assert.equal(shortJobsPerCheckpoint({ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: '1000000000'}), 16);
   assert.equal(shortJobsPerCheckpoint({ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: '-1'}), 2);
   assert.equal(shortJobsPerCheckpoint({ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: 'lots'}), 2);
 });

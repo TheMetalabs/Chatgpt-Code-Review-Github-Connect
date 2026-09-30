@@ -56,8 +56,8 @@ in the **short** lane, across all of its 1-3 requests:
 - A waiting repair is granted before every queued fix and review job.
 - A repair never interrupts a request that is already generating. A local review
   holding the model calls a checkpoint at each turn boundary: it lends the model to
-  waiting repairs (at most `ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT` per boundary,
-  default 2; `0` disables lending) and then resumes ahead of every other queued job.
+  waiting repairs (at most `ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT`, capped at 16, per
+  boundary; default 2; `0` disables lending) and then resumes ahead of every other queued job.
   Each review request carries its whole history, so the pause loses nothing. The
   review's liveness watchdog is paused while the model is lent.
 - While waiting, the repair record shows **"Repair waiting for local model

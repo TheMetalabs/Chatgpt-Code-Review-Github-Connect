@@ -13,18 +13,31 @@ function grokAttachmentListSelector() {
   return 'form[data-composer] [role="list"]';
 }
 
+/** A quota candidate's text without any Grok attachment list inside it: a container that holds the
+ * list (a card, a dialog) never reads a staged file's name as its notice. */
+function quotaCandidateText(el) {
+  const list = grokAttachmentListSelector();
+  if (!el.querySelector(list)) return (el.textContent || "").trim();
+  let text = "";
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!node.parentElement?.closest(list)) text += node.nodeValue;
+  }
+  return text.trim();
+}
+
 function quotaHit() {
   const notices = document.querySelectorAll(
     '[role="alert"], [role="status"], [role="dialog"], [data-testid*="quota" i], [class*="toast" i], [class*="banner" i], [class*="notice" i]',
   );
   for (const el of notices) {
     if (!elVisible(el) || el.closest(`${turnAreaSelector("user")}, .markdown, pre, code, ${grokAttachmentListSelector()}`)) continue;
-    const text = (el.textContent || "").trim();
+    const text = quotaCandidateText(el);
     if (text.length <= 400 && quotaHitText(text)) return true;
   }
   for (const el of document.querySelectorAll("span, button, [class*='card']")) {
     if (!elVisible(el) || el.closest(`${turnAreaSelector()}, [data-testid^="conversation-turn-"], pre, code, ${grokAttachmentListSelector()}`)) continue;
-    const text = (el.textContent || "").trim();
+    const text = quotaCandidateText(el);
     if (text.length <= 240 && quotaHitText(text)) return true;
   }
   return false;

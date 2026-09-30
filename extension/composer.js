@@ -750,8 +750,15 @@ function chipShownNames(chip) {
     .map(el => (el.textContent || "").replace(/\s+/g, " ").trim()).filter(text => text && text.length <= 120);
   return [...fileChipNames(chip), ...texts];
 }
-/** Whether a chip is the staged file `name`'s (fileNameShown on any name it shows). */
+/** Whether a chip is the staged file `name`'s (fileNameShown on any name it shows; a Grok chip by its
+ * exact name). */
 function chipShowsFile(chip, name) {
+  // A Grok chip shows its file's full name (span.truncate clips it only visually): exact, so an
+  // extensionless or truncated alias never makes another file the run's own.
+  if (grokAttachmentItem(chip)) {
+    const norm = v => String(v ?? "").replace(/\s+/g, " ").trim().normalize("NFC");
+    return Boolean(norm(name)) && norm(grokAttachmentName(chip)) === norm(name);
+  }
   return chipShownNames(chip).some(shown => fileNameShown(shown, name));
 }
 /** The rendered chips in a form that could be a staged file's: never an element that holds the editor

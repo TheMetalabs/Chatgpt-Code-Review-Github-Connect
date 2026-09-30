@@ -419,6 +419,36 @@ test('grok attachment names are never upload progress or a quota notice', async 
   assert.deepEqual(out, {before: {states: names.map(() => 'ready'), ready: true, quota: false}, notice: true});
 });
 
+test('a grok chip is the run\'s own only under its exact name: an extensionless user file stays foreign, editor or not', async t => {
+  const page = await openGrok(t, `<form data-composer="true">${grokList([grokChip('ashlar-diff.patch'), grokChip('ashlar-diff')])}
+    <div data-testid="chat-input"><textarea id="editor" style="width:320px;height:48px"></textarea></div></form>`);
+  const out = await page.evaluate(() => {
+    const prepared = {phase: 'prepared', attachments: ['ashlar-diff.patch']};
+    const [own, other] = document.querySelectorAll('[role="listitem"]');
+    const matches = {own: chipShowsFile(own, 'ashlar-diff.patch'), other: chipShowsFile(other, 'ashlar-diff.patch')};
+    const both = composerStagedFiles({}, prepared);
+    document.getElementById('editor').remove();
+    const unmounted = composerStagedFiles({}, prepared);
+    own.remove();
+    return {matches, both, unmounted, alone: composerStagedFiles({}, prepared)};
+  });
+  assert.deepEqual(out, {matches: {own: true, other: false}, both: ['ashlar-diff'], unmounted: ['ashlar-diff'], alone: ['ashlar-diff']});
+});
+
+test('a container holding the grok attachment list never reads a file name as a quota notice; real notice text in it still counts', async t => {
+  const names = ['out of quota.txt', 'too many requests.md'];
+  for (const wrap of ['<div class="card" id="box" style="width:400px;height:120px">', '<div role="dialog" id="box" style="width:400px;height:120px">']) {
+    const page = await openGrok(t, `<form data-composer="true">${wrap}${grokList(names.map(name => grokChip(name)))}</div>
+      <div data-testid="chat-input"><textarea style="width:320px;height:48px"></textarea></div></form>`);
+    const out = await page.evaluate(() => {
+      const before = quotaHit();
+      document.getElementById('box').insertAdjacentText('beforeend', "You've reached your usage limit");
+      return {before, notice: quotaHit()};
+    });
+    assert.deepEqual(out, {before: false, notice: true}, wrap);
+  }
+});
+
 test('an off-state grok pill with an SVG icon is not private; the click that turns it on is taken once', async t => {
   const svgPill = on => `<a href="${on ? '/c' : '/c#private'}" aria-label="Private" style="display:inline-flex;width:86px;height:40px"><svg data-testid="pi-incognito" class="${on ? 'absolute opacity-0' : 'absolute'}" width="20" height="20"></svg><svg data-testid="pi-incognito-fill" class="${on ? 'absolute' : 'absolute opacity-0'}" width="20" height="20"></svg><span>개인</span></a>`;
   const page = await openGrok(t, `${svgPill(false)}<form data-composer="true"><textarea style="width:320px;height:48px"></textarea></form>`);

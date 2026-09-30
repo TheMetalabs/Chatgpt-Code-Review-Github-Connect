@@ -63,7 +63,9 @@ test("a NUL byte in a comment does not hide an edit outside the scope (#142 revi
 });
 
 test("notAdditionsOnly accepts inserted lines and flags any removed or changed line", () => {
+  // Inserted x, y and an appended z; every base line (a, b, c) survives in order.
   assert.equal(notAdditionsOnly("a\nb\nc", "a\nx\nb\ny\nc\nz"), null);
+  assert.match(notAdditionsOnly("a\nb\nc", "a\nx\nb\ny\nz"), /line 3/, "dropping base line c is flagged");
   assert.match(notAdditionsOnly("a\nb\nc", "a\nB\nc"), /line 2/);
   assert.match(notAdditionsOnly("a\nb\nc", "a\nc"), /line 2/);
   assert.match(notAdditionsOnly("a\nb", "b\na"), /line 2/);

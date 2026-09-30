@@ -46,6 +46,8 @@ export class LocalChatHttpError extends Error {
  * `keepalive`: the server answered (response headers, or an empty heartbeat chunk) but has produced
  * no output for THIS request yet — it is alive and the request is queued or still prefilling.
  * `output`: tokens (reasoning, content or a tool call) arrived — the model is generating for us.
+ * A buffered (non-SSE) chat reply reports `output` only after the full body is received successfully;
+ * response headers alone are keepalive, so the queued-without-output watchdog stays armed.
  * A concurrency-1 local server serves other jobs first, so "queued for an hour" and "hung" look
  * identical without this signal; it is what lets the operator tell the two apart. */
 export type LocalRequestActivity = { kind: "sent" | "keepalive" | "output"; at: number };
@@ -291,11 +293,10 @@ function dispatchLocalJson(
       const ok = Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 300);
       const sse = ok && stream && /^text\/event-stream/i.test(String(res.headers["content-type"] || ""));
       if (ok) activity("keepalive");
-      // A buffered chat response (streaming off, or the server ignored `stream` and answered JSON)
-      // holds the socket open while it generates and emits no incremental tokens, so there is no later
-      // signal to distinguish. Report it as generating from headers — the honest label for "the server
-      // accepted and is now producing this reply" — rather than leaving it stuck at "queued".
-      if (ok && chat && !sse) activity("output");
+      // Buffered chat (stream off, or the server ignored `stream` and answered JSON): headers mean
+      // the server accepted the request, not that it produced output. Emitting `output` here would
+      // clear the queued-without-output watchdog before any body exists; a hang after headers would
+      // then hold the lease forever. `output` is reported only after the full body is received.
       const chunks: Buffer[] = [];
       let bytes = 0;
       const assembler = sse ? new StreamAssembler() : null;
@@ -343,8 +344,11 @@ function dispatchLocalJson(
           reject(new LocalChatHttpError(res.statusCode ?? 0, text));
           return;
         }
-        try { resolve(JSON.parse(text)); }
-        catch { reject(new Error("local LLM returned an invalid JSON response")); }
+        try {
+          const parsed = JSON.parse(text);
+          if (chat) activity("output");
+          resolve(parsed);
+        } catch { reject(new Error("local LLM returned an invalid JSON response")); }
       });
     });
     req.setTimeout(0);

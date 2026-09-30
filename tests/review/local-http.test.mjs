@@ -149,21 +149,47 @@ test('streaming chat: [DONE] with no finish_reason is incomplete, not a resolved
   await assert.rejects(requestLocalChat(base, '', payload), /ended before completion/);
 });
 
-test('buffered chat (stream off, or server ignores stream) reports output activity so the lane is not stuck at queued', async t => {
+test('buffered chat (stream off, or server ignores stream) reports output only after the completed body', async t => {
   const requestLocalChat = await transport();
   const reply = '{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}';
-  // Non-stream request: the buffered branch must still emit an `output` signal, otherwise the leg
-  // shows "queued · server alive, no output yet" for the whole generation.
+  // Non-stream request: headers are keepalive; `output` is the completed body so the queued-without-
+  // output watchdog is not cleared before any tokens exist.
   const nonStream = await listen(t, (req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end(reply); });
   const seenOff = [];
   assert.equal(await requestLocalChat(nonStream, '', payload, undefined, { stream: false, onActivity: a => seenOff.push(a.kind) }), 'ok');
-  assert.ok(seenOff.includes('output'), 'buffered response must report output activity');
   assert.equal(seenOff[0], 'sent');
+  assert.ok(seenOff.includes('keepalive'), 'headers are keepalive, not output');
+  assert.equal(seenOff.at(-1), 'output', 'output is reported after the completed body');
   // Streaming requested but the server answered plain JSON: same buffered path, same signal.
   const ignoresStream = await listen(t, (req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end(reply); });
   const seenOn = [];
   assert.equal(await requestLocalChat(ignoresStream, '', payload, undefined, { onActivity: a => seenOn.push(a.kind) }), 'ok');
-  assert.ok(seenOn.includes('output'), 'a JSON reply to a stream request must still report output');
+  assert.ok(seenOn.includes('keepalive'));
+  assert.equal(seenOn.at(-1), 'output', 'a JSON reply to a stream request reports output after the body');
+});
+
+test('buffered chat: response headers without a body are keepalive, not output', async t => {
+  const requestLocalChat = await transport();
+  let body, arrived;
+  const ready = new Promise(resolve => { arrived = resolve; });
+  const base = await listen(t, (req, res) => { body = res; req.resume(); arrived(); });
+  const seen = [];
+  const pending = requestLocalChat(base, '', payload, undefined, { stream: false, onActivity: a => seen.push(a.kind) });
+  await ready;
+  body.writeHead(200, { 'content-type': 'application/json' });
+  await new Promise((resolve, reject) => {
+    const deadline = Date.now() + 2_000;
+    const tick = () => {
+      if (seen.includes('keepalive')) resolve();
+      else if (Date.now() > deadline) reject(new Error('headers never reported keepalive'));
+      else setTimeout(tick, 10);
+    };
+    tick();
+  });
+  assert.deepEqual(seen, ['sent', 'keepalive'], 'headers must not clear the queued-without-output watchdog');
+  body.end('{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}');
+  assert.equal(await pending, 'ok');
+  assert.equal(seen.at(-1), 'output');
 });
 
 test('streaming chat: a server that ignores stream and answers plain JSON still works; ASHLAR_LOCAL_LLM_STREAM=false sends a non-stream request', async t => {

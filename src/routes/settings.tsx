@@ -53,6 +53,7 @@ function hydrateDraft(saved: BotSettings): BotSettings {
     ...saved,
     fixAgent: { ...DEFAULT_SETTINGS.fixAgent, ...saved.fixAgent },
     localJsonRepairEnabled: saved.localJsonRepairEnabled ?? true,
+    localLeaseCapacity: saved.localLeaseCapacity ?? DEFAULT_SETTINGS.localLeaseCapacity,
     localLlmApiKey: saved.localLlmApiKeySet ? SECRET_MASK : "",
     webhookSecret: saved.webhookSecretSet ? SECRET_MASK : saved.webhookSecret,
   };
@@ -79,6 +80,7 @@ const FIX_PROVIDER_LABEL: Record<FixAgentProvider, string> = {
 
 /** The max_inline_comments input, derived from its shared domain (settings-rules). */
 const MAX_INLINE_ATTRS = formAttrs(SETTINGS_INT_FIELDS.maxInlineComments);
+const LEASE_CAPACITY_ATTRS = formAttrs(SETTINGS_INT_FIELDS.localLeaseCapacity);
 
 /** A numeric draft value as an input value: an emptied input (NaN) stays empty, not "NaN". */
 function formValue(v: number): number | "" {
@@ -137,6 +139,7 @@ export function Settings() {
     saved.localJsonRepairEnabled,
     saved.localLlmBaseUrl,
     saved.localLlmModel,
+    saved.localLeaseCapacity,
     saved.localLlmApiKeySet,
     saved.webhookSecretSet,
     saved.reviewOrder.join(","),
@@ -353,6 +356,22 @@ export function Settings() {
             />
           </Field>
         </div>
+        <Field label="local_llm.lease_capacity">
+          <input
+            type="number"
+            min={LEASE_CAPACITY_ATTRS.min}
+            max={LEASE_CAPACITY_ATTRS.max}
+            step={LEASE_CAPACITY_ATTRS.step}
+            value={formValue(draft.localLeaseCapacity)}
+            onChange={(e) => patch({ localLeaseCapacity: fromForm(LEASE_CAPACITY_ATTRS.unit, e.target.valueAsNumber) })}
+            className="h-11 w-full max-w-xs rounded-md border border-line bg-bg-elevated px-3 text-sm outline-none"
+          />
+          <p className="mt-2 text-[12px] text-fg-subtle">
+            How many local reviews, fixes, and JSON repairs may hold the model at once. Match the model
+            server (e.g. oMLX concurrent=3). Default 1, max 8. Raising grants waiters immediately; lowering
+            does not cancel in-flight holders — extra occupancy drains as they finish.
+          </p>
+        </Field>
         <Field label="Local JSON repair fallback">
           <Toggle label="파싱 실패 시 Local LLM으로 JSON 복구 (기본 켜짐)" checked={draft.localJsonRepairEnabled}
             onChange={(value) => patch({localJsonRepairEnabled: value})} />
@@ -477,6 +496,7 @@ review:
 local_llm:
   base_url: ${draft.localLlmBaseUrl || "—"}
   model: ${draft.localLlmModel || "—"}
+  lease_capacity: ${draft.localLeaseCapacity}
   json_repair_enabled: ${draft.localJsonRepairEnabled}
 fix_agent:  # review loop (experimental)
   enabled: ${draft.fixAgent.enabled}

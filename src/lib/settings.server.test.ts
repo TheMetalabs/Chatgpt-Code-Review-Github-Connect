@@ -148,6 +148,27 @@ describe("sanitizeBotSettings", () => {
     }
   });
 
+  it("defaults localLeaseCapacity to 1, clamps 1–8, and round-trips ASHLAR_LOCAL_LEASE_CAPACITY", () => {
+    assert.equal(DEFAULT_SETTINGS.localLeaseCapacity, 1);
+    assert.equal(sanitizeBotSettings({}).localLeaseCapacity, 1);
+    assert.equal(sanitizeBotSettings({ localLeaseCapacity: 3 }).localLeaseCapacity, 3);
+    assert.equal(sanitizeBotSettings({ localLeaseCapacity: 0 }).localLeaseCapacity, 1);
+    assert.equal(sanitizeBotSettings({ localLeaseCapacity: 99 }).localLeaseCapacity, 8);
+    assert.equal(sanitizeBotSettings({ localLeaseCapacity: 2.9 }).localLeaseCapacity, 2);
+    const env = botSettingsToEnv(sanitizeBotSettings({ localLeaseCapacity: 3 }));
+    assert.equal(env.ASHLAR_LOCAL_LEASE_CAPACITY, "3");
+    assert.equal(botSettingsToEnv(DEFAULT_SETTINGS).ASHLAR_LOCAL_LEASE_CAPACITY, "1");
+    const prev = process.env.ASHLAR_LOCAL_LEASE_CAPACITY;
+    try {
+      process.env.ASHLAR_LOCAL_LEASE_CAPACITY = "3";
+      assert.equal(sanitizeBotSettings(overlayEnv({})).localLeaseCapacity, 3);
+      process.env.ASHLAR_LOCAL_LEASE_CAPACITY = "lots";
+      assert.equal(sanitizeBotSettings(overlayEnv({ localLeaseCapacity: 2 })).localLeaseCapacity, 2);
+    } finally {
+      if (prev === undefined) delete process.env.ASHLAR_LOCAL_LEASE_CAPACITY; else process.env.ASHLAR_LOCAL_LEASE_CAPACITY = prev;
+    }
+  });
+
   it("never mirrors fixAgent into env: the settings JSON is its only durable store", () => {
     const s = sanitizeBotSettings({ fixAgent: { enabled: true, provider: "chatgpt", delivery: "chat-push", mode: "apply", parallelPrs: 4 } });
     const env = botSettingsToEnv(s);

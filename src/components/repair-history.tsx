@@ -18,7 +18,8 @@ export function RepairHistory({repairs}:{repairs:RepairHistoryRow[]}) {
   return <section aria-label="Local JSON repair history" className="space-y-3">
     <h3 className="text-sm font-semibold">Local JSON repair</h3>
     <p className="text-xs text-fg-muted">Formatting only, not an additional Local reviewer vote. The original is never replaced.
-      Queue/generation duration is not limited. An uncertain or rejected attempt is not automatically repeated.</p>
+      Queue wait has no deadline; after the model lease is granted, requests and retries are bounded by
+      ASHLAR_LOCAL_REPAIR_DEADLINE_MS. An uncertain or rejected attempt is not automatically repeated.</p>
     {repairs.map(repair=><details key={repair.id} className="rounded border border-line p-3">
       <summary className="text-sm">{repair.provider} · {repairStatusLabel(repair)}</summary>
       <p className="mt-2 font-mono text-xs break-all">Model: {repair.model} · attempts: {repair.attempts}<br/>

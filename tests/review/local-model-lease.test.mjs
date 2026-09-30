@@ -303,3 +303,59 @@ test('ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: default 2, 0 allowed, junk falls b
   assert.equal(shortJobsPerCheckpoint({ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: '-1'}), 2);
   assert.equal(shortJobsPerCheckpoint({ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT: 'lots'}), 2);
 });
+
+test('capacity 2: a lent slot is counted once, so a queued review takes the free slot while the short job runs (#143 review)', async () => {
+  const lease = new LocalModelLease(2);
+  const r1 = await lease.acquire('R1');
+  const r2 = await lease.acquire('R2');
+  let s;
+  const short = lease.acquire('S', {lane: 'short'}).then(h => (s = h));
+  let r3;
+  const third = lease.acquire('R3').then(h => (r3 = h));
+  const cp = lease.checkpoint(r1);
+  await tick();
+  assert.ok(s, 'the short job borrows R1\'s slot');
+  r2.release();
+  await tick();
+  assert.ok(r3, 'R3 gets the slot R2 freed before the short job ends');
+  assert.deepEqual(lease.snapshot(), {active: ['S', 'R3'], queued: [], parked: ['R1']});
+  s.release();
+  assert.equal(await cp, 1);
+  assert.deepEqual(lease.snapshot(), {active: ['R3', 'R1'], queued: []}, 'R1 resumes; capacity is never exceeded');
+  await short; await third;
+  r1.release(); r3.release();
+  assert.deepEqual(lease.snapshot(), {active: [], queued: []});
+});
+
+test('checkpoint honors the holder\'s abort while lent: returns at once, the borrower keeps its slot (#143 review)', async () => {
+  const lease = new LocalModelLease();
+  const review = await lease.acquire('review');
+  const short = lease.acquire('S', {lane: 'short'});
+  let next;
+  const queued = lease.acquire('review-B').then(h => (next = h));
+  const ac = new AbortController();
+  const cp = lease.checkpoint(review, 2, ac.signal);
+  const s = await short;
+  ac.abort(new Error('hard deadline'));
+  assert.equal(await cp, 1, 'settles without waiting for the borrower');
+  assert.deepEqual(lease.snapshot(), {active: ['S'], queued: ['review-B']}, 'the review\'s parked reservation is gone; the borrower stays active');
+  review.release(); // the review's finally: a no-op now
+  assert.deepEqual(lease.snapshot(), {active: ['S'], queued: ['review-B']});
+  s.release();
+  await tick();
+  assert.ok(next, 'the queue advances after the borrower');
+  await queued;
+  next.release();
+});
+
+test('checkpoint with an already-aborted signal lends nothing', async () => {
+  const lease = new LocalModelLease();
+  const review = await lease.acquire('review');
+  const short = lease.acquire('S', {lane: 'short'});
+  const ac = new AbortController();
+  ac.abort();
+  assert.equal(await lease.checkpoint(review, 2, ac.signal), 0);
+  assert.deepEqual(lease.snapshot(), {active: ['review'], queued: ['S']});
+  review.release();
+  (await short).release();
+});

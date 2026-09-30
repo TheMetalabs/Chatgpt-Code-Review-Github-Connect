@@ -1056,11 +1056,12 @@ async function generateLocalLeg(
       onProgress: (p) => noteLocalActivity(jobId, p.stage === "tool" ? "output" : "turn"),
       // Turn boundary: lend the model to waiting JSON repairs (short lane, capped), then resume ahead
       // of every other queued job. The liveness watchdog is paused meanwhile — this leg sends
-      // nothing while a repair runs, and that silence is not a wedged server.
+      // nothing while a repair runs, and that silence is not a wedged server. The wait honors the
+      // review's own abort (hard deadline, cancel): the review stops without waiting for the repair.
       ...(lease ? {
         checkpoint: async () => {
           localLiveness.get(jobId)?.clear();
-          try { await localModelLease().checkpoint(lease, shortJobsPerCheckpoint()); }
+          try { await localModelLease().checkpoint(lease, shortJobsPerCheckpoint(), signal); }
           finally { localLiveness.get(jobId)?.reset(); }
         },
       } : {}),

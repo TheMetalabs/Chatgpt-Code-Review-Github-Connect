@@ -110,3 +110,68 @@ test('a deterministic repair (stray quotes) needs no model and never touches the
   assert.equal(f.calls.length, 0);
   review.release();
 });
+
+// #143 review: a repair invalidated while it waits for the model never sends, and leaves the queue.
+test('a repair superseded while queued (status) leaves the queue at once and never sends', async t => {
+  const f = fixture(t);
+  let current = true;
+  f.service['deps'].isCurrent = () => current;
+  const review = await f.lease.acquire('review-A');
+  const started = f.service.start(input);
+  await flush();
+  assert.deepEqual(f.lease.snapshot().queued, [`repair:${started.id}`]);
+  current = false;
+  assert.equal(f.service.status('A', started.id).status, 'superseded');
+  await flush();
+  assert.deepEqual(f.lease.snapshot(), {active: ['review-A'], queued: []}, 'the waiter is gone immediately');
+  assert.equal(await f.lease.checkpoint(review), 0, 'nothing to lend to');
+  review.release();
+  await flush();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.history.getRepair('A', started.id).status, 'superseded');
+});
+
+test('a repair accepted while queued leaves the queue and never sends', async t => {
+  const f = fixture(t);
+  let accepted = false;
+  f.service['deps'].isAccepted = () => accepted;
+  const review = await f.lease.acquire('review-A');
+  const started = f.service.start(input);
+  await flush();
+  accepted = true;
+  assert.equal(f.service.status('A', started.id).status, 'accepted');
+  await flush();
+  assert.deepEqual(f.lease.snapshot(), {active: ['review-A'], queued: []});
+  review.release();
+  await flush();
+  assert.equal(f.calls.length, 0);
+});
+
+test('a repair that stops being current while granted gives the model back without sending', async t => {
+  const f = fixture(t);
+  let current = true;
+  f.service['deps'].isCurrent = () => current;
+  const review = await f.lease.acquire('review-A');
+  const started = f.service.start(input);
+  await flush();
+  current = false; // no status() call: the grant itself must re-check
+  review.release();
+  await flush(); await flush();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.history.getRepair('A', started.id).status, 'superseded');
+  assert.deepEqual(f.lease.snapshot(), {active: [], queued: []});
+});
+
+test('dispose leaves no outstanding waiter', async t => {
+  const f = fixture(t);
+  const review = await f.lease.acquire('review-A');
+  f.service.start(input);
+  await flush();
+  assert.equal(f.lease.snapshot().queued.length, 1);
+  f.service.dispose();
+  await flush();
+  assert.deepEqual(f.lease.snapshot(), {active: ['review-A'], queued: []});
+  review.release();
+  await flush();
+  assert.equal(f.calls.length, 0);
+});

@@ -37,7 +37,7 @@ export class JsonRepairService {
   private commits = new Map<string,Promise<ReturnType<JsonRepairService["report"]>>>();
   private deps: Dependencies;
   constructor(deps: Dependencies) {this.deps=deps;services.add(this);}
-  dispose() {this.cancel("superseded");services.delete(this);}
+  dispose() {this.cancel("superseded");for(const flight of this.flights.values())flight.abort();services.delete(this);}
   private track(record:RepairRecord) {
     if (["running","ready"].includes(record.status)) this.known.set(record.id,{id:record.id,jobId:record.jobId,provider:record.provider});
     else {this.known.delete(record.id);this.fenced.delete(record.id);}
@@ -82,6 +82,12 @@ export class JsonRepairService {
       // A known, deterministic slip needs no model; its result is validated below like any candidate.
       const candidate=escapeStrayQuotes(record.original) ?? await this.withModel(record,controller.signal,()=>this.requestCandidate(record,settings,controller.signal));
       const current=this.deps.history().getRepair(record.jobId,record.id);
+      if(candidate===null){ // no longer eligible once the model was granted: nothing was sent
+        if(!current || current.status!=="running" || this.fenced.has(record.id))return;
+        if(!localJsonRepairAvailable(this.deps.settings()))this.change(current,"disabled");
+        else this.change(current,"superseded");
+        return;
+      }
       if(!current || current.status!=="running" || this.fenced.has(record.id))return;
       if(!localJsonRepairAvailable(this.deps.settings())){this.change(current,"disabled");return;}
       if(!this.deps.isCurrent(record)){this.change(current,"superseded");return;}
@@ -100,8 +106,10 @@ export class JsonRepairService {
   /** Hold the shared local-model lease in the short lane across every request of this repair (1-3):
    * granted before queued fix/review jobs, and lent by a review that holds the model at its next turn
    * boundary. While waiting, the record shows its queue position ("repair waiting for local model").
-   * Abort-aware (a cancel leaves the queue at once); released in finally. */
-  private async withModel<T>(record:RepairRecord,signal:AbortSignal,work:()=>Promise<T>):Promise<T> {
+   * Abort-aware (a cancel leaves the queue at once); released in finally. Once granted, the repair is
+   * re-read: one that is no longer running, current, enabled and unfenced gives the model back without
+   * sending anything (null). */
+  private async withModel<T>(record:RepairRecord,signal:AbortSignal,work:()=>Promise<T>):Promise<T|null> {
     const mark=(position?:number)=>{
       try {
         const cur=this.deps.history().getRepair(record.jobId,record.id);
@@ -115,6 +123,9 @@ export class JsonRepairService {
     try {
       mark(undefined);
       if(signal.aborted)throw signal.reason ?? new Error("local JSON repair cancelled before its request");
+      const cur=this.deps.history().getRepair(record.jobId,record.id);
+      if(!cur || cur.status!=="running" || this.fenced.has(record.id) ||
+         !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))return null;
       return await work();
     } finally {handle.release();}
   }
@@ -184,11 +195,14 @@ export class JsonRepairService {
     let record=this.deps.history().getRepair(jobId,id);
     if(!record)throw Error("repair_not_found");
     this.track(record);
-    if(this.deps.isAccepted(record) && record.status!=="accepted")record=this.change(record,"accepted");
+    // A terminal transition while a flight is outstanding (queued for the model or requesting) aborts it:
+    // it leaves the model queue at once and sends nothing more.
+    const stopFlight=()=>{if(this.flights.has(id)){this.fenced.add(id);this.flights.get(id)?.abort();}};
+    if(this.deps.isAccepted(record) && record.status!=="accepted"){stopFlight();record=this.change(record,"accepted");}
     if(record.status==="accepted")return this.report(record);
     if(!localJsonRepairAvailable(this.deps.settings()) && ["running","ready"].includes(record.status)){
       this.fenced.add(id);this.flights.get(id)?.abort();record=this.change(record,"disabled");
-    }else if(!this.deps.isCurrent(record) && ["running","ready"].includes(record.status))record=this.change(record,"superseded");
+    }else if(!this.deps.isCurrent(record) && ["running","ready"].includes(record.status)){stopFlight();record=this.change(record,"superseded");}
     else if(record.status==="running" && !this.flights.has(id))record=this.change(record,"interrupted",["inference_outcome_unknown_no_automatic_retry"]);
     return this.report(record);
   }

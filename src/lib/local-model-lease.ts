@@ -121,13 +121,15 @@ export class LocalModelLease {
    * of them, then take it back ahead of every other queued job. Returns how many short jobs it lent to.
    * A no-op (0) when no short job is waiting or `handle` does not hold the model. When the holder is
    * revoked (releaseOwner / release) while its slot is lent, this returns at once; the short job
-   * keeps running and the slot goes to the next waiter when it finishes.
+   * keeps running and the slot goes to the next waiter when it finishes. `signal` (the holder's own
+   * cancellation) is honored before lending and while lent: an abort revokes the parked holder and
+   * returns at once, leaving the borrower active on its slot until its own release.
    */
-  async checkpoint(handle: LocalModelLeaseHandle, cap = DEFAULT_SHORT_PER_CHECKPOINT): Promise<number> {
+  async checkpoint(handle: LocalModelLeaseHandle, cap = DEFAULT_SHORT_PER_CHECKPOINT, signal?: AbortSignal): Promise<number> {
     const holderId = this.ids.get(handle);
     let served = 0;
     while (
-      holderId !== undefined && served < cap && this.active.has(holderId) && this.queue[0]?.lane === "short"
+      holderId !== undefined && served < cap && !signal?.aborted && this.active.has(holderId) && this.queue[0]?.lane === "short"
     ) {
       const owner = this.active.get(holderId) as string;
       const waiter = this.queue.shift() as Waiter;
@@ -139,7 +141,9 @@ export class LocalModelLease {
       this.lends.set(waiter.id, holderId);
       waiter.resolve(this.grant(waiter.id, waiter.owner));
       this.notifyPositions();
-      await back;
+      const onAbort = () => { this.unpark(holderId); this.pump(); };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try { await back; } finally { signal?.removeEventListener("abort", onAbort); }
       served += 1;
     }
     return served;
@@ -184,8 +188,13 @@ export class LocalModelLease {
     return out;
   }
 
+  /** Distinct slots in use. A parked holder's slot is the one its borrower runs on (counted once,
+   * through the active borrower); a parked holder without a live borrower still holds its slot. */
   private occupied(): number {
-    return this.active.size + this.parked.size;
+    const lent = new Set(this.lends.values());
+    let idle = 0;
+    for (const id of this.parked.keys()) if (!lent.has(id)) idle += 1;
+    return this.active.size + idle;
   }
 
   private grant(id: number, owner: string): LocalModelLeaseHandle {
@@ -214,6 +223,8 @@ export class LocalModelLease {
         this.parked.delete(lender);
         this.active.set(lender, parked.owner);
         parked.wake();
+        // The hand-back keeps occupancy unchanged; any spare slot (capacity > 1) still goes to waiters.
+        if (pump) this.pump();
         return;
       }
     }

@@ -172,6 +172,22 @@ test('queued-without-output: keepalives do not save a ghost; abort releases the 
   await eventually(()=>job(app,a)?.assumptions?.some(s=>/queued without output/i.test(s)),'A was not aborted for queued-without-output despite keepalives');
   await eventually(()=>app.localRequests.length===2||job(app,b)?.providerProgress?.local?.stage==='local_queued',
     'B did not take the lease after A released it');
+});
+
+test('queued-without-output: buffered headers with no body abort and release the lease', async t=>{
+  const app=await fixture(t);
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  app.env.ASHLAR_LOCAL_REVIEW_QUEUED_MS='200';
+  app.env.ASHLAR_LOCAL_REVIEW_LIVENESS_MS='60000';
+  const a=await started(app,1);
+  await eventually(()=>app.localRequests.length===1,'A1 not sent');
+  // Headers only: a hang after 200 JSON with no body must not count as output.
+  const hung=app.localResponses[0];
+  hung.writeHead(200,{'content-type':'application/json'});
+  hung.flushHeaders();
+  const b=await started(app,2);
+  await eventually(()=>job(app,b)?.providerProgress?.local?.stage==='local_lease_waiting','B is not waiting for the lease');
+  await eventually(()=>job(app,a)?.assumptions?.some(s=>/queued without output/i.test(s)),'A was not aborted for queued-without-output after headers with no body');
   await eventually(()=>app.localRequests.length===2||job(app,b)?.providerProgress?.local?.stage==='local_queued',
     'B did not take the lease after A released it');
 });

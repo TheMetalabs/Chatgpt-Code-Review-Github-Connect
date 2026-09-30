@@ -46,6 +46,12 @@ follows the OpenAI schema and rejects the field. An install whose saved settings
 `.env` already carry an explicit `false` (Settings → Save writes the value it had) keeps
 thinking on until that value is changed to `true` or removed. A reply that is still cut
 off after that retry is recorded as `finish_reason_length`.
+If a strict server rejects the non-standard `chat_template_kwargs` field, the existing
+400/422 compatibility retry removes that field as well as `max_tokens` and sends the
+same formatting request once more. `ASHLAR_LOCAL_REPAIR_DEADLINE_MS` bounds the whole
+model phase, including this retry, after the repair gets the shared lease (default
+10 minutes; invalid or non-positive values use the safety default). Expiry aborts the
+request, records the repair as needing attention, and releases the lease.
 
 ### Shared local model: the short lane
 
@@ -59,7 +65,8 @@ in the **short** lane, across all of its 1-3 requests:
   waiting repairs (at most `ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT`, capped at 16, per
   boundary; default 2; `0` disables lending) and then resumes ahead of every other queued job.
   Each review request carries its whole history, so the pause loses nothing. The
-  review's liveness watchdog is paused while the model is lent.
+  review's liveness watchdog is paused while the model is lent; the repair deadline still
+  applies so a stuck formatter cannot park the review forever.
 - While waiting, the repair record shows **"Repair waiting for local model
   (position N)"** in the history UI; the status report carries `modelQueuePosition`.
 - A cancelled or superseded repair leaves the queue at once; the lease is released
@@ -105,7 +112,9 @@ is not sent to GitHub until accepted and validated by the original review path.
 
 ## Failure and concurrency behavior
 
-- No application deadline on upload, queue, model generation or repair wait.
+- No application deadline on upload or queue wait. Once a repair gets the shared model
+  lease, its model request and retries have the independent `ASHLAR_LOCAL_REPAIR_DEADLINE_MS`
+  safety bound described above; review legs retain their separate deadline/liveness settings.
   Browser observer timers and test watchdogs are not production model deadlines.
 - One automatic attempt per job/provider/run/response/hash/schema/head, with
   at most eight stored repair identities per job. A changed completed original
@@ -120,7 +129,8 @@ is not sent to GitHub until accepted and validated by the original review path.
   diagnostic preview is never sent as if it were the full response. Oversized,
   truncated or missing source is not silently summarized.
 - The independent repair lane does not block normal heartbeat or other PRs. On the
-  shared local model it waits at most for the review turn (or fix call) in flight.
+  shared local model it waits at most for the review turn (or fix call) in flight, and
+  a stuck formatter returns the lent slot when its repair deadline expires.
   Existing per-profile review tab limits and ACK-gated cleanup remain.
 
 ## Compatibility and limits

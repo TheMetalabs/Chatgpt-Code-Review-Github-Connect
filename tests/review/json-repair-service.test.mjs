@@ -6,7 +6,7 @@ import {DEFAULT_SETTINGS} from '../../src/lib/types.ts';
 import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import http from 'node:http';
-import {requestLocalChat, LocalChatCutOff} from '../../src/lib/local-chat-request.server.ts';
+import {requestLocalChat, LocalChatCutOff, LocalChatHttpError} from '../../src/lib/local-chat-request.server.ts';
 import {overlayEnv, sanitizeBotSettings, botSettingsToEnv} from '../../src/lib/settings.server.ts';
 const value={findings:[],investigated_safe:['a.ts: checked "condition"']};
 const raw=JSON.stringify(value),original=raw.replace(/\\"/g,'"');
@@ -147,6 +147,18 @@ test('thinking is off for the Local repair request by default; ASHLAR_LOCAL_REPA
  assert.equal(f.calls[0][2].max_tokens,Math.max(8192,Math.ceil(original.length/2)+8192));
  const g=fixture(t,{response:raw});g.settings.localRepairNoThinking=false;g.service.start({...input,jobId:'A'});await flush();
  assert.equal('chat_template_kwargs' in g.calls[0][2],false,'opted out: the field is not sent');
+});
+test('a strict server can reject chat_template_kwargs and succeed on the compatibility retry',async t=>{
+ const f=fixture(t,{response:(_base,_key,body)=>{
+  if('chat_template_kwargs' in body)throw new LocalChatHttpError(400,'unknown field chat_template_kwargs');
+  return raw;
+ }});
+ const started=f.service.start(input);
+ for(let n=0;n<100 && f.history.getRepair('A',started.id).status==='running';n++)await flush();
+ assert.equal(f.service.status('A',started.id).status,'ready');
+ assert.equal(f.calls.length,2);
+ assert.deepEqual(f.calls[0][2].chat_template_kwargs,{enable_thinking:false});
+ assert.equal('chat_template_kwargs' in f.calls[1][2],false);
 });
 test('a Local reply cut off at the token limit is retried once with a larger budget, then recorded as finish_reason_length',async t=>{
  const bodies=[];

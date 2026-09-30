@@ -58,6 +58,35 @@ test('a repair queued behind a holding review shows its position, runs at the re
   (await queuedReview).release();
 });
 
+test('a lent repair that stops responding is aborted and hands the model back to the review', async t => {
+  const previous = process.env.ASHLAR_LOCAL_REPAIR_DEADLINE_MS;
+  process.env.ASHLAR_LOCAL_REPAIR_DEADLINE_MS = '10';
+  t.after(() => {
+    if (previous === undefined) delete process.env.ASHLAR_LOCAL_REPAIR_DEADLINE_MS;
+    else process.env.ASHLAR_LOCAL_REPAIR_DEADLINE_MS = previous;
+  });
+  const f = fixture(t, (_n, _base, _key, _body, signal) => new Promise((_resolve, reject) => {
+    const fail = () => reject(signal.reason ?? new Error('repair request aborted'));
+    if (signal.aborted) fail(); else signal.addEventListener('abort', fail, {once: true});
+  }));
+  const review = await f.lease.acquire('review-A');
+  const queuedReview = f.lease.acquire('review-B');
+  const started = f.service.start(input);
+  await flush();
+
+  const checkpoint = f.lease.checkpoint(review);
+  const resumed = await Promise.race([
+    checkpoint.then(() => true),
+    new Promise(resolve => setTimeout(() => resolve(false), 100)),
+  ]);
+
+  assert.equal(resumed, true, 'the repair deadline must return the borrowed slot to review-A');
+  assert.equal(f.history.getRepair('A', started.id).status, 'needs_attention');
+  assert.deepEqual(f.lease.snapshot(), {active: ['review-A'], queued: ['review-B']});
+  review.release();
+  (await queuedReview).release();
+});
+
 test('the repair holds the model across its retries (cut off, then bumped): no queued job gets in between', async t => {
   const f = fixture(t, n => { if (n === 1) throw new LocalChatCutOff('length'); return raw; });
   const holder = await f.lease.acquire('fix-X', {lane: 'fix'});

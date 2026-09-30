@@ -173,6 +173,19 @@ test('short lane: queued ahead of fix and review waiters', async () => {
   for (const w of [waits[2], waits[3], waits[1], waits[0]]) (await w).release();
 });
 
+test('short lane: a late repair moves ahead of already queued fix and review work', async () => {
+  const lease = new LocalModelLease();
+  const holder = await lease.acquire('R1');
+  const review = lease.acquire('R2');
+  const fix = lease.acquire('F', {lane: 'fix'});
+  const short = lease.acquire('S', {lane: 'short'});
+  assert.deepEqual(lease.snapshot().queued, ['S', 'F', 'R2']);
+  holder.release();
+  (await short).release();
+  (await fix).release();
+  (await review).release();
+});
+
 test('checkpoint lends the model to waiting short jobs, then the holder resumes ahead of queued fix/review', async () => {
   const lease = new LocalModelLease();
   const review = await lease.acquire('R1');

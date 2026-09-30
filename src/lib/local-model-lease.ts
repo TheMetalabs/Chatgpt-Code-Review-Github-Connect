@@ -23,6 +23,7 @@
 /** Queue lane; a lower rank is granted first. */
 export type LocalModelLane = "short" | "fix" | "review";
 const LANE_RANK: Record<LocalModelLane, number> = { short: 0, fix: 1, review: 2 };
+const lanePrecedes = (a: LocalModelLane, b: LocalModelLane): boolean => LANE_RANK[a] < LANE_RANK[b];
 
 /** Short jobs a holder lends the model to per checkpoint unless the caller says otherwise. */
 export const DEFAULT_SHORT_PER_CHECKPOINT = 2;
@@ -111,10 +112,9 @@ export class LocalModelLease {
         id, owner, lane, lastPosition: 0, onPosition: opts.onPosition, resolve, reject,
         detach: () => signal?.removeEventListener("abort", onAbort),
       };
-      // Behind every waiter of the same or a higher-priority lane, ahead of every lower one.
-      const at = this.queue.findIndex((w) => LANE_RANK[w.lane] > LANE_RANK[lane]);
-      if (at < 0) this.queue.push(waiter);
-      else this.queue.splice(at, 0, waiter);
+      // Insert before the first waiter this lane precedes; equal lanes stay FIFO.
+      const at = this.queue.findIndex((w) => lanePrecedes(lane, w.lane));
+      this.queue.splice(at < 0 ? this.queue.length : at, 0, waiter);
       this.notifyPositions();
     });
   }

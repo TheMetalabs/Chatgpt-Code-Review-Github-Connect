@@ -54,8 +54,9 @@ async function chatTab(t,{provider='chatgpt',url=provider==='grok'?'https://grok
  if(kind==='fix'&&journal&&!('exact' in journal))journal={...journal,exact:journal.expected};
  const page=await browser.newPage();t.after(()=>page.close());
  const served={thread:'',composer:'',sendDisabled:false,uploading:false,chips:[],after:'',...view};
+ const grokComposer=`<form data-composer="true">${served.after}<textarea id="prompt-textarea" style="width:300px;min-height:40px">${served.composer||''}</textarea><button id="composer-submit-button" data-testid="chat-submit" aria-label="Submit" type="submit" style="width:64px;height:32px"${served.sendDisabled?' disabled':''}>send</button></form>`;
  await page.route(provider==='grok'?'https://grok.com/**':'https://chatgpt.com/**',route=>route.fulfill({status:200,contentType:'text/html',
-  body:`<html><body><main id="thread">${served.thread}</main>${served.after}${composerHtml(served)}</body></html>`}));
+  body:provider==='grok'?`<html><body><main id="thread">${served.thread}</main>${grokComposer}</body></html>`:`<html><body><main id="thread">${served.thread}</main>${served.after}${composerHtml(served)}</body></html>`}));
  await page.clock.install();
  await page.goto(url);
  await page.evaluate(({job,run,bound,journal})=>{
@@ -68,7 +69,7 @@ async function chatTab(t,{provider='chatgpt',url=provider==='grok'?'https://grok
    window.sendClicks=0;document.querySelector('form').addEventListener('submit',e=>e.preventDefault());
    document.getElementById('composer-submit-button').addEventListener('click',()=>window.sendClicks++);
   });
-  for(const file of MANIFEST)await page.addScriptTag({content:source('extension/'+(provider==='grok'&&file==='content-chatgpt.js'?'content-grok.js':file))});
+  for(const file of MANIFEST.flatMap(name=>provider==='grok'&&name==='content-chatgpt.js'?['site-grok.js','content-grok.js']:[name]))await page.addScriptTag({content:source('extension/'+file)});
  };
  await inject();
  // A run message carries its deadline (until, X4 #85) as the worker's does, on the page's clock.
@@ -625,9 +626,13 @@ const PROVIDER_MOVES=[
  ['Grok','grok','https://grok.com/','https://grok.com/c/provider-assigned','replace'],
 ];
 const assign=(page,url,how)=>page.evaluate(([url,how])=>{if(how==='push')history.pushState({},'',url);else history.replaceState(history.state,'',url);},[url,how]);
+const grokGeneratingThread=()=>`<div data-testid="user-message" id="response-user-A" role="article">${PROMPT}</div><div data-testid="conversation-turn-2"><div data-testid="assistant-message" id="response-answer-A" role="article"><div class="markdown"><p>Review below.</p><pre><code>${ANSWER.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</code></pre></div></div></div>`;
+const grokStop='<button type="button" data-testid="stop-button" aria-label="Stop model response" style="width:32px;height:32px">Stop</button>';
 for(const [name,provider,from,to,how] of PROVIDER_MOVES){
+ const thread=provider==='grok'?grokGeneratingThread():userTurn()+answerTurn({done:false});
+ const after=provider==='grok'?grokStop:stopButton;
  test(`worker, review (${name}): the provider assigns the conversation URL while generating; the ACKed tab closes`,async t=>{
-  const tab=await chatTab(t,{provider,url:from,thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+  const tab=await chatTab(t,{provider,url:from,thread,after,journal:sentJournal()});
   const w=wire(tab);
   await w.tick();await tab.page.clock.runFor(1600);
   await assign(tab.page,to,how);await tab.page.clock.runFor(800);
@@ -640,7 +645,7 @@ for(const [name,provider,from,to,how] of PROVIDER_MOVES){
   assert.equal(await pinnedIn(tab),to,'pinned in the conversation the provider assigned');
  });
  for(const polled of [true,false])test(`worker, review (${name}): cancelled while generating after the provider assigned the conversation URL (${polled?'polled there':'not polled since'}); the tab closes`,async t=>{
-  const tab=await chatTab(t,{provider,url:from,thread:userTurn()+answerTurn({done:false}),after:stopButton,journal:sentJournal()});
+  const tab=await chatTab(t,{provider,url:from,thread,after,journal:sentJournal()});
   const w=wire(tab);
   await w.tick();await tab.page.clock.runFor(1600);
   await assign(tab.page,to,how);await tab.page.clock.runFor(800);

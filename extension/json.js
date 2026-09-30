@@ -589,7 +589,10 @@ async function pollBoundResponse() {
   const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
   const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
   const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
-  return {runner, bound, stop, streaming, done, submission};
+  const poll = {runner, bound, stop, streaming, done, submission};
+  // The page records that this send saw a stream. ChatGPT defines no noteSawStream. Checks only read it.
+  if (typeof noteSawStream === "function") noteSawStream(submission, poll);
+  return poll;
 }
 
 /** A quota banner ends the run only while no answer is in hand and the banner can belong to it

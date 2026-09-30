@@ -63,7 +63,8 @@ stages and step recording are unchanged.
 | `src/lib/review-history.server.ts` | **only** the `local.accepted` / `local.generating` server-step names |
 | `src/lib/settings.server.ts` | **only** local-LLM settings (`localLlm*`, `reviewLocal`) |
 | `src/lib/types.ts` | **only** local-LLM settings fields + `DEFAULT_SETTINGS` local values |
-| `src/lib/json-repair.server.ts` | **only** the transport call options (`max_tokens`) |
+| `src/lib/json-repair.server.ts` | **only** the transport call options (`max_tokens`, no-thinking default) and holding the local-model lease in the `short` lane across a repair's requests |
+| `src/lib/json-repair-types.ts`, `src/lib/repair-status-label.ts`, `src/components/repair-history.tsx` | **only** the optional display field `modelQueuePosition` and the "Repair waiting for local model (position N)" label |
 | `src/routes/api/harbor.ts` | **only** the Playground `local` action |
 | tests: `src/lib/local-llm.test.ts`, `tests/review/local-loop.test.mjs`, `tests/review/local*.test.mjs`, `src/lib/settings.server.test.ts` | local-leg tests |
 | `BOUNDARY.md`, `scripts/check-local-llm-boundary.mjs`, `package.json`, `README.md` | boundary infra + docs |

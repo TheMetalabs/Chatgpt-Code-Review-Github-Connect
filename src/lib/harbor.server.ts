@@ -23,7 +23,7 @@ import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
-import { localModelLease, type LocalModelLeaseHandle } from "./local-model-lease";
+import { localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -1031,6 +1031,7 @@ function makeHeadReader(job: Job | undefined): ((path: string) => Promise<string
 async function generateLocalLeg(
   jobId: string,
   prompt: string,
+  lease?: LocalModelLeaseHandle,
 ): Promise<LocalLegResult> {
   const signal = localControllers.get(jobId)?.signal;
   const sample = localSamples.get(jobId);
@@ -1053,6 +1054,17 @@ async function generateLocalLeg(
         requestLocalJson(base, key, path, body, sig, { onActivity: (a) => noteLocalActivity(jobId, a.kind) }),
       // Turn boundaries: a completed tool round is real progress; the next request starts queued again.
       onProgress: (p) => noteLocalActivity(jobId, p.stage === "tool" ? "output" : "turn"),
+      // Turn boundary: lend the model to waiting JSON repairs (short lane, capped), then resume ahead
+      // of every other queued job. The liveness watchdog is paused meanwhile — this leg sends
+      // nothing while a repair runs, and that silence is not a wedged server. The wait honors the
+      // review's own abort (hard deadline, cancel): the review stops without waiting for the repair.
+      ...(lease ? {
+        checkpoint: async () => {
+          localLiveness.get(jobId)?.clear();
+          try { await localModelLease().checkpoint(lease, shortJobsPerCheckpoint(), signal); }
+          finally { localLiveness.get(jobId)?.reset(); }
+        },
+      } : {}),
     });
   }
   // multiturn was chosen (a large PR) but the snapshot is gone (e.g. a late bridge-fallback kick
@@ -1128,7 +1140,7 @@ async function attachLocalLeg(jobId: string, prompt: string, opts?: { submit?: b
         deadlineMs,
       )
       : undefined;
-    const local = await generateLocalLeg(jobId, prompt);
+    const local = await generateLocalLeg(jobId, prompt, lease);
     try {
       reviewHistory().recordServerStep(jobId,local.ok?"local.response_received":"local.failed");
       // Every completed reply that was not review JSON is archived, including one a later reply replaced.
@@ -2067,4 +2079,3 @@ if (!(globalThis as Record<symbol, unknown>)[BOOT_SWEPT]) {
   (globalThis as Record<symbol, unknown>)[BOOT_SWEPT] = true;
   void sweepCutFixRounds(state.settings);
 }
-

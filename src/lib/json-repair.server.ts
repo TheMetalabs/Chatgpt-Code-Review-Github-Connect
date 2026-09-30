@@ -4,6 +4,7 @@ import {MAX_REPAIR_CHARS, REPAIR_SCHEMA_VERSION, escapeStrayQuotes, inspectRevie
 import type {RepairRecord, RepairStatus} from "./json-repair-types.ts";
 import type {BotSettings} from "./types.ts";
 import type {ReviewHistoryStore} from "./review-history.server.ts";
+import {localModelLease, type LocalModelLease} from "./local-model-lease.ts";
 export type RepairInput = Pick<RepairRecord,"jobId"|"provider"|"runId"|"responseId"|"original"|"sourceHash"|"schema"|"headSha">;
 type Dependencies = {
   settings(): BotSettings;
@@ -12,6 +13,8 @@ type Dependencies = {
   isAccepted(record: RepairRecord): boolean;
   accept(record: RepairRecord): Promise<{ok:boolean; error?:string; code?:string}>;
   request?: typeof requestLocalChat;
+  /** The process-wide local-model lease (injected for tests). */
+  lease?: () => LocalModelLease;
 };
 /** The only policy switch is localJsonRepairEnabled. reviewLocal controls a
  * separate code-review job and must never authorize or inhibit format repair. */
@@ -20,9 +23,19 @@ export function localJsonRepairAvailable(settings: BotSettings): boolean {
 }
 /** omlx's completion default, which every repair got before it sent a budget (#87). */
 const SERVER_DEFAULT_BUDGET=8192;
+/** A formatter must not hold the shared model forever if its endpoint stops responding. */
+export const DEFAULT_LOCAL_REPAIR_DEADLINE_MS=10*60_000;
+export function localRepairDeadlineMs(
+  env: Record<string,string|undefined> | undefined = typeof process !== "undefined" ? process.env : undefined,
+): number {
+  const raw=env?.ASHLAR_LOCAL_REPAIR_DEADLINE_MS;
+  if(raw == null || raw.trim() === "")return DEFAULT_LOCAL_REPAIR_DEADLINE_MS;
+  const n=Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_LOCAL_REPAIR_DEADLINE_MS;
+}
 export const repairSourceHash=(text:string)=>createHash("sha256").update(text).digest("hex");
 const services = new Set<JsonRepairService>();
-/** Explicit operator cancellation only; never called because of elapsed time. */
+/** Explicit operator cancellation and per-repair deadline cancellation. */
 export function cancelLocalJsonRepairs(reason: "disabled" | "superseded", jobId?:string, provider?:string) {
   for(const service of services)service.cancel(reason,jobId,provider);
 }
@@ -34,7 +47,7 @@ export class JsonRepairService {
   private commits = new Map<string,Promise<ReturnType<JsonRepairService["report"]>>>();
   private deps: Dependencies;
   constructor(deps: Dependencies) {this.deps=deps;services.add(this);}
-  dispose() {this.cancel("superseded");services.delete(this);}
+  dispose() {this.cancel("superseded");for(const flight of this.flights.values())flight.abort();services.delete(this);}
   private track(record:RepairRecord) {
     if (["running","ready"].includes(record.status)) this.known.set(record.id,{id:record.id,jobId:record.jobId,provider:record.provider});
     else {this.known.delete(record.id);this.fenced.delete(record.id);}
@@ -46,6 +59,7 @@ export class JsonRepairService {
   private report(record:RepairRecord) {
     return {id:record.id,status:record.status,sourceHash:record.sourceHash,responseId:record.responseId,
       runId:record.runId,schema:record.schema,errors:record.errors,
+      ...(record.status==="running" && typeof record.modelQueuePosition==="number" ? {modelQueuePosition:record.modelQueuePosition} : {}),
       ...(["ready","accepted"].includes(record.status) ? {raw:record.raw} : {})};
   }
   start(input:RepairInput) {
@@ -76,8 +90,15 @@ export class JsonRepairService {
       if(controller.signal.aborted || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))return;
       const settings=this.deps.settings();
       // A known, deterministic slip needs no model; its result is validated below like any candidate.
-      const candidate=escapeStrayQuotes(record.original) ?? await this.requestCandidate(record,settings,controller.signal);
+      const candidate=escapeStrayQuotes(record.original) ?? await this.withModel(record,controller.signal,
+        requestSignal=>this.requestCandidate(record,settings,requestSignal));
       const current=this.deps.history().getRepair(record.jobId,record.id);
+      if(candidate===null){ // no longer eligible once the model was granted: nothing was sent
+        if(!current || current.status!=="running" || this.fenced.has(record.id))return;
+        if(!localJsonRepairAvailable(this.deps.settings()))this.change(current,"disabled");
+        else this.change(current,"superseded");
+        return;
+      }
       if(!current || current.status!=="running" || this.fenced.has(record.id))return;
       if(!localJsonRepairAvailable(this.deps.settings())){this.change(current,"disabled");return;}
       if(!this.deps.isCurrent(record)){this.change(current,"superseded");return;}
@@ -93,16 +114,48 @@ export class JsonRepairService {
         `finish_reason_${error.finishReason.replace(/[^a-z_]/gi,"").slice(0,32)}` : "local_request_failed_or_incomplete_no_automatic_retry"]);
     }
   }
+  /** Hold the shared local-model lease in the short lane across every request of this repair (1-3):
+   * granted before queued fix/review jobs, and lent by a review that holds the model at its next turn
+   * boundary. While waiting, the record shows its queue position ("repair waiting for local model").
+   * Abort-aware (a cancel leaves the queue at once); released in finally. Once granted, the repair is
+   * re-read: one that is no longer running, current, enabled and unfenced gives the model back without
+   * sending anything (null). */
+  private async withModel<T>(record:RepairRecord,signal:AbortSignal,work:(requestSignal:AbortSignal)=>Promise<T>):Promise<T|null> {
+    const mark=(position?:number)=>{
+      try {
+        const cur=this.deps.history().getRepair(record.jobId,record.id);
+        if(!cur || cur.status!=="running" || this.fenced.has(record.id) || cur.modelQueuePosition===position)return;
+        const next={...cur,updatedAt:Date.now()};
+        if(position===undefined)delete next.modelQueuePosition;else next.modelQueuePosition=position;
+        this.write(next);
+      }catch{/* display only: an archive hiccup never blocks the repair */}
+    };
+    const handle=await (this.deps.lease?.() ?? localModelLease()).acquire(`repair:${record.id}`,{lane:"short",signal,onPosition:mark});
+    const requestController=new AbortController();
+    const relayAbort=()=>requestController.abort(signal.reason ?? new Error("local JSON repair cancelled"));
+    if(signal.aborted)relayAbort();else signal.addEventListener("abort",relayAbort,{once:true});
+    const deadline=setTimeout(()=>requestController.abort(new Error("local JSON repair deadline exceeded")),localRepairDeadlineMs());
+    try {
+      mark(undefined);
+      if(signal.aborted)throw signal.reason ?? new Error("local JSON repair cancelled before its request");
+      const cur=this.deps.history().getRepair(record.jobId,record.id);
+      if(!cur || cur.status!=="running" || this.fenced.has(record.id) ||
+         !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))return null;
+      return await work(requestController.signal);
+    } finally {
+      clearTimeout(deadline);signal.removeEventListener("abort",relayAbort);handle.release();
+    }
+  }
   private async requestCandidate(record:RepairRecord,settings:BotSettings,signal:AbortSignal) {
     // Thinking shares the completion budget (#87). Headroom 8192 (was 4096) leaves room for a
     // reasoning model to finish re-emitting the original; a length cut-off gets one bumped retry.
     const budget=(bumped:boolean)=>Math.max(SERVER_DEFAULT_BUDGET,Math.ceil(record.original.length/(bumped?1:2))+(bumped?16384:8192));
-    const send=(budgeted:boolean,bumped=false)=>(this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
+    const send=(budgeted:boolean,bumped=false,includeNoThinking=true)=>(this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
       model:record.model,temperature:0,
       // The candidate re-emits the whole original; without a budget omlx stops at its 8192-token
       // default, which includes the model's thinking (#87). A short original never gets less than it.
       ...(budgeted ? {max_tokens:budget(bumped)} : {}),
-      ...(settings.localRepairNoThinking ? {chat_template_kwargs:{enable_thinking:false}} : {}),
+      ...(settings.localRepairNoThinking && includeNoThinking ? {chat_template_kwargs:{enable_thinking:false}} : {}),
       messages:[{
         role:"system",content:[
           "You are a formatting-only JSON repair tool, NOT a code reviewer.",
@@ -129,7 +182,7 @@ export class JsonRepairService {
       // return send(false) directly or a finish_reason=length escapes past the length handler.
       if(err instanceof LocalChatHttpError && [400,422].includes(err.status)){
         if(!running())throw err;
-        try {return await send(false);}
+        try {return await send(false,false,false);}
         catch(unbudgeted){
           if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw unbudgeted;
           err = unbudgeted;
@@ -148,7 +201,7 @@ export class JsonRepairService {
         catch(bumped){
           if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw bumped;
           if(!running())throw bumped;
-          if(bumped instanceof LocalChatHttpError && [400,422].includes(bumped.status))return await send(false);
+          if(bumped instanceof LocalChatHttpError && [400,422].includes(bumped.status))return await send(false,false,false);
           throw bumped;
         }
       }
@@ -159,11 +212,14 @@ export class JsonRepairService {
     let record=this.deps.history().getRepair(jobId,id);
     if(!record)throw Error("repair_not_found");
     this.track(record);
-    if(this.deps.isAccepted(record) && record.status!=="accepted")record=this.change(record,"accepted");
+    // A terminal transition while a flight is outstanding (queued for the model or requesting) aborts it:
+    // it leaves the model queue at once and sends nothing more.
+    const stopFlight=()=>{if(this.flights.has(id)){this.fenced.add(id);this.flights.get(id)?.abort();}};
+    if(this.deps.isAccepted(record) && record.status!=="accepted"){stopFlight();record=this.change(record,"accepted");}
     if(record.status==="accepted")return this.report(record);
     if(!localJsonRepairAvailable(this.deps.settings()) && ["running","ready"].includes(record.status)){
       this.fenced.add(id);this.flights.get(id)?.abort();record=this.change(record,"disabled");
-    }else if(!this.deps.isCurrent(record) && ["running","ready"].includes(record.status))record=this.change(record,"superseded");
+    }else if(!this.deps.isCurrent(record) && ["running","ready"].includes(record.status)){stopFlight();record=this.change(record,"superseded");}
     else if(record.status==="running" && !this.flights.has(id))record=this.change(record,"interrupted",["inference_outcome_unknown_no_automatic_retry"]);
     return this.report(record);
   }

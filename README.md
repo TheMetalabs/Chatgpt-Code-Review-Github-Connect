@@ -241,6 +241,8 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 | `ASHLAR_LOCAL_REVIEW_LIVENESS_MS` | 600000 (10분) | 스트리밍 레그가 **완전 무신호**(헤더·keepalive·토큰 중 아무것도 없음)로 이 시간을 넘기면 중단. 신호가 하나라도 오면 리셋되고 서버가 ~10초마다 keepalive 를 보내므로, 몇 시간 큐 대기하는 정상 리뷰는 절대 걸리지 않고 **진짜 멈춘 서버만** 풀립니다(이때 끝난 다른 리뷰어 결과도 함께 게시됨). 0=끔. 비스트리밍 레그엔 증분 신호가 없어 적용 안 함(하드 상한만) |
 | `ASHLAR_LOCAL_REVIEW_QUEUED_MS` | 1800000 (30분) | **요청을 보낸 뒤** 출력 토큰이 이 시간 동안 없으면 keepalive 가 와도 중단하고 로컬 모델 리스를 즉시 해제. 취소된 요청이 서버 슬롯을 점유한 채 keepalive 만 오는 ghost occupancy 를 풉니다. 리스 대기 시간은 포함하지 않음(타이머는 HTTP dispatch 때 시작). 비스트리밍 JSON 의 응답 헤더는 keepalive 이지 출력이 아님(본문이 올 때까지 타이머 유지). 0=끔 |
 | `ASHLAR_LOCAL_SLOT_LOCK` | false | `true` 이면 chat/completions HTTP 를 프로세스 전역으로 1개만 보냄. 취소된 요청이 아직 닫히기 전에 다음 리스 보유자가 겹쳐 보내지 못하게 서버 슬롯과 맞춤. 기본 끔 |
+| `ASHLAR_LOCAL_REPAIR_DEADLINE_MS` | 600000 (10분) | JSON 수리가 공유 모델 lease를 얻은 뒤 허용되는 전체 요청/재시도 시간. 초과 시 요청을 취소하고 lease를 반환해 리뷰·fix 큐를 막지 않습니다. 0 또는 잘못된 값은 안전한 기본값으로 대체 |
+| `ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT` | 2 (최대 16) | 로컬 모델을 쥔 리뷰가 **턴 경계마다** 대기 중인 JSON repair(short lane)에 모델을 빌려주는 최대 개수. 한 checkpoint의 상한은 16이며, 빌려준 뒤 같은 리뷰가 다른 대기 잡보다 먼저 이어갑니다. 0=빌려주지 않음(repair는 리뷰 종료까지 대기) |
 | `ASHLAR_LOCAL_LLM_STREAM` | true | chat/completions 를 SSE 스트리밍으로 받아 토큰 단위 하트비트를 얻습니다. 응답은 비스트리밍 형태로 재조립되므로 동작은 같습니다. `false` 면 예전처럼 단일 JSON 응답(이 경우 큐/생성 구분·liveness 중단 없음) |
 
 로컬 레그는 `providerProgress.local`로 **하트비트 + 진행상황 신호**를 내보냅니다. 스트리밍 전송이

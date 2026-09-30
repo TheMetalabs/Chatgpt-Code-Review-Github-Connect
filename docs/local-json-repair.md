@@ -38,10 +38,39 @@ request once more without `max_tokens`, so it fills whatever context is left, as
 every repair did before the budget existed. A reply cut off at the token limit
 (`finish_reason=length`) gets one more attempt with a larger budget
 (`max(8192, original length + 16384)`). No other failure is resent.
-`ASHLAR_LOCAL_REPAIR_NO_THINKING=true` also sends
-`chat_template_kwargs: {enable_thinking: false}`; it is off by default because a
-strict OpenAI-schema server may reject the field. A reply that is still cut off
-after that retry is recorded as `finish_reason_length`.
+Every repair request also sends `chat_template_kwargs: {enable_thinking: false}` by
+default (`localRepairNoThinking`, default **on**): a formatting-only repair gains
+nothing from thinking, and thinking is most of its time on the shared local model.
+`ASHLAR_LOCAL_REPAIR_NO_THINKING=false` opts out, e.g. for a server that strictly
+follows the OpenAI schema and rejects the field. An install whose saved settings or
+`.env` already carry an explicit `false` (Settings → Save writes the value it had) keeps
+thinking on until that value is changed to `true` or removed. A reply that is still cut
+off after that retry is recorded as `finish_reason_length`.
+If a strict server rejects the non-standard `chat_template_kwargs` field, the existing
+400/422 compatibility retry removes that field as well as `max_tokens` and sends the
+same formatting request once more. `ASHLAR_LOCAL_REPAIR_DEADLINE_MS` bounds the whole
+model phase, including this retry, after the repair gets the shared lease (default
+10 minutes; invalid or non-positive values use the safety default). Expiry aborts the
+request, records the repair as needing attention, and releases the lease.
+
+### Shared local model: the short lane
+
+Repairs share the local model with local reviews and local fixes through the
+process-wide local-model lease (`src/lib/local-model-lease.ts`). A repair holds it,
+in the **short** lane, across all of its 1-3 requests:
+
+- A waiting repair is granted before every queued fix and review job.
+- A repair never interrupts a request that is already generating. A local review
+  holding the model calls a checkpoint at each turn boundary: it lends the model to
+  waiting repairs (at most `ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT`, capped at 16, per
+  boundary; default 2; `0` disables lending) and then resumes ahead of every other queued job.
+  Each review request carries its whole history, so the pause loses nothing. The
+  review's liveness watchdog is paused while the model is lent; the repair deadline still
+  applies so a stuck formatter cannot park the review forever.
+- While waiting, the repair record shows **"Repair waiting for local model
+  (position N)"** in the history UI; the status report carries `modelQueuePosition`.
+- A cancelled or superseded repair leaves the queue at once; the lease is released
+  in `finally`. A deterministic repair (stray-quote escape) never takes the lease.
 
 ## Flow and trust boundaries
 
@@ -83,7 +112,9 @@ is not sent to GitHub until accepted and validated by the original review path.
 
 ## Failure and concurrency behavior
 
-- No application deadline on upload, queue, model generation or repair wait.
+- No application deadline on upload or queue wait. Once a repair gets the shared model
+  lease, its model request and retries have the independent `ASHLAR_LOCAL_REPAIR_DEADLINE_MS`
+  safety bound described above; review legs retain their separate deadline/liveness settings.
   Browser observer timers and test watchdogs are not production model deadlines.
 - One automatic attempt per job/provider/run/response/hash/schema/head, with
   at most eight stored repair identities per job. A changed completed original
@@ -97,7 +128,9 @@ is not sent to GitHub until accepted and validated by the original review path.
 - Full originals have a 500,000-character safety limit. The 128,000-character
   diagnostic preview is never sent as if it were the full response. Oversized,
   truncated or missing source is not silently summarized.
-- The independent repair lane does not block normal heartbeat or other PRs.
+- The independent repair lane does not block normal heartbeat or other PRs. On the
+  shared local model it waits at most for the review turn (or fix call) in flight, and
+  a stuck formatter returns the lent slot when its repair deadline expires.
   Existing per-profile review tab limits and ACK-gated cleanup remain.
 
 ## Compatibility and limits

@@ -430,7 +430,9 @@ export const DEFAULT_SETTINGS: BotSettings = {
     chatMaxPromptChars: FIX_AGENT_KNOBS.chatMaxPromptChars.def,
   },
   localJsonRepairEnabled: true,
-  localRepairNoThinking: false,
+  // On by default: a repair only re-emits the original as valid JSON, so thinking only costs time
+  // on the shared local model. ASHLAR_LOCAL_REPAIR_NO_THINKING=false opts out (e.g. a strict server).
+  localRepairNoThinking: true,
   chatgptReasoning: "pro",
   grokReasoning: "expert",
   localLlmBaseUrl: "http://127.0.0.1:11434/v1",

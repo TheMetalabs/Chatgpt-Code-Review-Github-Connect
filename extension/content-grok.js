@@ -58,7 +58,8 @@ function grokLoggedOut() {
   if (controls.some(el => el.hasAttribute("href") && authHref(el))) return true;
   const label = el => (el.textContent || "").replace(/\s+/g, " ").trim();
   const exact = new Set(["Log in", "Sign in", "Sign up", "로그인", "가입"]);
-  return controls.some(el => exact.has(label(el)));
+  // A label counts only on a control with no destination: a link was judged by its href above.
+  return controls.some(el => !el.hasAttribute("href") && exact.has(label(el)));
 }
 
 function throwIfLoggedOut() {

@@ -175,6 +175,10 @@ test('grok sign-in evidence is an X / Grok auth link outside the chat bubbles, n
   const cases = [
     ['<a href="https://example.com/login" style="width:120px;height:32px">docs</a>', false],
     ['<a href="https://github.com/sign-in" style="width:120px;height:32px">gh</a>', false],
+    ['<a href="https://example.com/login" style="display:inline-block;width:120px;height:32px">Log in</a>', false],
+    ['<a href="https://example.com/sign-in" style="display:inline-block;width:120px;height:32px">Sign in</a>', false],
+    ['<a href="https://example.com/signup" style="display:inline-block;width:120px;height:32px">Sign up</a>', false],
+    ['<button type="button" style="width:120px;height:32px">Sign in</button>', true],
     ['<div data-testid="assistant-message" role="article"><a href="https://accounts.x.com/login" style="width:120px;height:32px">Log in</a></div>', false],
     ['<a href="https://accounts.x.com/i/flow/login" style="display:inline-block;width:120px;height:32px">x</a>', true],
     ['<a href="https://x.com/i/flow/login?redirect=grok" style="display:inline-block;width:120px;height:32px">x</a>', true],

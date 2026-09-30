@@ -35,8 +35,11 @@ export async function requestLocalFix(
 ): Promise<string> {
   const signal = ctl?.signal;
   const lease = deps.lease ? deps.lease() : (await import("./local-model-lease.ts")).localModelLease();
+  // Start acquisition first so the lease registers the waiter before the watcher starts charging
+  // queue time. acquire registers synchronously before its promise can await a grant.
+  const acquiring = lease.acquire(`fix:${ref.owner}/${ref.repo}#${ref.pr}:${++localFixSeq}`, { signal, lane: "fix" });
   const dispatched = ctl?.waitForModel?.();
-  const handle = await lease.acquire(`fix:${ref.owner}/${ref.repo}#${ref.pr}:${++localFixSeq}`, { signal, lane: "fix" });
+  const handle = await acquiring;
   try {
     if (signal?.aborted) throw signal.reason ?? new Error("local fix cancelled before its request");
     const request = deps.requestLocalChat ?? (await import("./local-chat-request.server.ts")).requestLocalChat;

@@ -1868,6 +1868,25 @@ describe("local fix transport holds the local-model lease (fix lane: ahead of qu
     assert.deepEqual(lease.snapshot(), { active: [], queued: [] });
   });
 
+  it("starts the watcher queue clock only after the lease registers the fix waiter", async () => {
+    const lease = new LocalModelLease();
+    const t = transport();
+    const holder = await lease.acquire("review-A");
+    const waitStates: number[] = [];
+    const fix = productionRequestFix(settings(), ref, { lease: () => lease, requestLocalChat: t.requestLocalChat })("p", {
+      waitForModel: () => {
+        waitStates.push(lease.snapshot().queued.length);
+        return () => {};
+      },
+    });
+    await enqueued(lease);
+    assert.deepEqual(waitStates, [1], "watcher starts after the fix is present in the lease queue");
+    holder.release();
+    await dispatched(t);
+    t.calls[0].answer("ANSWER");
+    assert.equal(await fix, "ANSWER");
+  });
+
   it("abort while queued leaves the queue without sending anything", async () => {
     const lease = new LocalModelLease();
     const t = transport();

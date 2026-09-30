@@ -97,6 +97,7 @@ const TOP_LEVEL = {
   localReviewMode: {bad: ['turbo', 1, null], good: 'multiturn'},
   localReviewRole: {bad: ['turbo', 'verify', 1, null], good: 'verify-clean'},
   localReviewSingleTurnMaxTokens: {bad: ['100', null, 0, 2.5], good: 8000},
+  localLeaseCapacity: {bad: ['3', null, 0, 1.5, 9, -1], good: 3},
   reviewOrder: {bad: ['local', ['grok'], ['local', 'local', 'grok'], ['local', 'chatgpt', 'bing'], [], null, ['local', 'chatgpt', 'grok', 'grok']], good: ['grok', 'chatgpt', 'local']},
   promptDiffMaxChars: {bad: ['10', null, -1, 0.5], good: 12345},
   promptContextMaxChars: {bad: ['10', null, -1, 0.5], good: 0},
@@ -199,7 +200,7 @@ const STORED = [
   {fixAgent: {enabled: true, provider: null}},
   {fixAgent: {enabled: true, provider: 'grok', delivery: 'script-apply', mode: 'apply'}}, // grok was a fix provider before
   {fixAgent: {enabled: true, provider: 'chatgpt', delivery: 'script-apply', mode: 'suggest', timeoutMs: 90_000.7, chatTimeoutMs: 1, roundCap: 1e9}},
-  {maxTurns: 2.5, exploreTurns: -3, maxInlineComments: 99.9, localReviewMaxTokens: 0, contextPadLines: 1e300, promptDiffMaxChars: -1},
+  {maxTurns: 2.5, exploreTurns: -3, maxInlineComments: 99.9, localReviewMaxTokens: 0, localLeaseCapacity: 99, contextPadLines: 1e300, promptDiffMaxChars: -1},
   {username: '  ', mention: ['', 42, ' @x '], reviewOrder: ['grok', 'bogus'], chatgptReasoning: 'turbo', localReviewMode: 'x', localReviewRole: 'turbo', publishMinSeverity: 'P7'},
   {reviewChatgpt: false, reviewGrok: false, reviewLocal: false},
   'not an object', null, [],
@@ -242,7 +243,7 @@ test('env seed: every whole-number env knob loads into the save domain', async (
   const {overlayEnv, sanitizeBotSettings} = await import('../../src/lib/settings.server.ts');
   const rules = await import('../../src/lib/settings-rules.ts');
   const env = {ASHLAR_MAX_TURNS: '2.5', ASHLAR_EXPLORE_TURNS: '-1', ASHLAR_MAX_INLINE_COMMENTS: '50', ASHLAR_LOCAL_REVIEW_MAX_TOKENS: '0',
-    ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS: '0.5', ASHLAR_PROMPT_DIFF_MAX_CHARS: '-5', ASHLAR_CONTEXT_PAD_LINES: '1e400',
+    ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS: '0.5', ASHLAR_LOCAL_LEASE_CAPACITY: '99', ASHLAR_PROMPT_DIFF_MAX_CHARS: '-5', ASHLAR_CONTEXT_PAD_LINES: '1e400',
     ASHLAR_FIX_TIMEOUT_MS: '90000.5', ASHLAR_FIX_PARALLEL_PRS: '0'};
   const prev = Object.fromEntries(Object.keys(env).map(k => [k, process.env[k]]));
   t.after(() => { for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
@@ -250,6 +251,7 @@ test('env seed: every whole-number env knob loads into the save domain', async (
   const seeded = sanitizeBotSettings(overlayEnv({}));
   assert.equal(rules.settingsProblem(seeded), null, JSON.stringify(seeded));
   assert.equal(seeded.maxTurns, 2);
+  assert.equal(seeded.localLeaseCapacity, 8);
   assert.equal(seeded.fixAgent.timeoutMs, 90_000);
 });
 

@@ -23,7 +23,7 @@ import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
 import { requestLocalJson, localStreamingDefault } from "./local-chat-request.server";
 import { runLocalReviewLoop, chooseLocalReviewMode } from "./local-review-loop.server";
 import { applyLocalActivity, localLegProgress, localLivenessMs, localQueuedMs, localReviewDeadlineMs, startLocalLeg, type LocalLegActivityKind, type LocalLegState } from "./local-leg-activity";
-import { localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
+import { applyLocalModelLeaseCapacity, localModelLease, shortJobsPerCheckpoint, type LocalModelLeaseHandle } from "./local-model-lease";
 import { buildOpsComment, opsCommentAllowed, reviewPostedNotes, type OpsPhase } from "./ops-comment";
 import {
   buildReview,
@@ -112,6 +112,7 @@ let state: HarborState = {
   events: [],
   reviews: [],
 };
+applyLocalModelLeaseCapacity(state.settings.localLeaseCapacity);
 
 function isLive(status: Job["status"]) {
   return LIVE_INFLIGHT_STATUSES.includes(status);
@@ -177,6 +178,7 @@ export function patchHarborSettings(patch: Partial<BotSettings>) {
       previousSettings.localLlmModel !== saved.localLlmModel || previousSettings.localLlmApiKey !== saved.localLlmApiKey) {
     cancelLocalJsonRepairs("disabled");
   }
+  applyLocalModelLeaseCapacity(saved.localLeaseCapacity);
   return state.settings;
 }
 

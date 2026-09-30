@@ -374,3 +374,85 @@ test('checkpoint with an already-aborted signal lends nothing', async () => {
   review.release();
   (await short).release();
 });
+
+import {
+  applyLocalModelLeaseCapacity,
+  localLeaseCapacity,
+  localModelLease,
+  clampLocalLeaseCapacity,
+  DEFAULT_LOCAL_LEASE_CAPACITY,
+  MAX_LOCAL_LEASE_CAPACITY,
+} from '../../src/lib/local-model-lease.ts';
+
+const LEASE_KEY = Symbol.for('ashlar.localModelLease');
+const CAP_KEY = Symbol.for('ashlar.localModelLease.capacity');
+function resetSingleton() {
+  delete globalThis[LEASE_KEY];
+  delete globalThis[CAP_KEY];
+}
+
+test('ASHLAR_LOCAL_LEASE_CAPACITY: default 1, clamped 1–8, junk falls back to the default', () => {
+  assert.equal(DEFAULT_LOCAL_LEASE_CAPACITY, 1);
+  assert.equal(MAX_LOCAL_LEASE_CAPACITY, 8);
+  assert.equal(localLeaseCapacity({}), 1);
+  assert.equal(localLeaseCapacity({ASHLAR_LOCAL_LEASE_CAPACITY: ''}), 1);
+  assert.equal(localLeaseCapacity({ASHLAR_LOCAL_LEASE_CAPACITY: '3'}), 3);
+  assert.equal(localLeaseCapacity({ASHLAR_LOCAL_LEASE_CAPACITY: '0'}), 1);
+  assert.equal(localLeaseCapacity({ASHLAR_LOCAL_LEASE_CAPACITY: '8'}), 8);
+  assert.equal(localLeaseCapacity({ASHLAR_LOCAL_LEASE_CAPACITY: '9'}), 8);
+  assert.equal(localLeaseCapacity({ASHLAR_LOCAL_LEASE_CAPACITY: '2.9'}), 2);
+  assert.equal(localLeaseCapacity({ASHLAR_LOCAL_LEASE_CAPACITY: '-1'}), 1);
+  assert.equal(localLeaseCapacity({ASHLAR_LOCAL_LEASE_CAPACITY: 'lots'}), 1);
+  assert.equal(clampLocalLeaseCapacity(99), 8);
+  assert.equal(clampLocalLeaseCapacity(NaN), 1);
+});
+
+test('constructor and setCapacity clamp; raising grants waiters; lowering does not revoke holders', async () => {
+  const lease = new LocalModelLease(99);
+  assert.equal(lease.getCapacity(), 8);
+  const a = await lease.acquire('A');
+  const b = await lease.acquire('B');
+  lease.setCapacity(1);
+  assert.equal(lease.getCapacity(), 1);
+  const c = lease.acquire('C');
+  await tick();
+  assert.deepEqual(lease.snapshot(), {active: ['A', 'B'], queued: ['C']}, 'in-flight holders keep their slots');
+  a.release();
+  await tick();
+  assert.deepEqual(lease.snapshot(), {active: ['B'], queued: ['C']}, 'occupancy still at the new cap');
+  b.release();
+  const hc = await c;
+  assert.equal(hc.owner, 'C');
+  const d = lease.acquire('D');
+  await tick();
+  assert.deepEqual(lease.snapshot(), {active: ['C'], queued: ['D']});
+  lease.setCapacity(3);
+  const hd = await d;
+  assert.deepEqual(lease.snapshot().active.sort(), ['C', 'D'], 'raising grants the waiter at once');
+  hc.release(); hd.release();
+});
+
+test('localModelLease singleton uses applyLocalModelLeaseCapacity (not a new instance)', async () => {
+  resetSingleton();
+  try {
+    applyLocalModelLeaseCapacity(3);
+    const lease = localModelLease();
+    assert.equal(lease.getCapacity(), 3);
+    const a = await lease.acquire('A');
+    const b = await lease.acquire('B');
+    const c = await lease.acquire('C');
+    const d = lease.acquire('D');
+    await tick();
+    assert.deepEqual(lease.snapshot(), {active: ['A', 'B', 'C'], queued: ['D']});
+    assert.equal(localModelLease(), lease, 'the same singleton');
+    applyLocalModelLeaseCapacity(1);
+    assert.equal(lease.getCapacity(), 1);
+    await tick();
+    assert.deepEqual(lease.snapshot(), {active: ['A', 'B', 'C'], queued: ['D']}, 'lowering does not recreate or revoke');
+    a.release(); b.release(); c.release();
+    const hd = await d;
+    hd.release();
+  } finally {
+    resetSingleton();
+  }
+});

@@ -300,6 +300,8 @@ export interface BotSettings {
   localReviewRole: LocalReviewRole;
   /** auto-mode cutoff: a single-turn prompt estimated at or below this many tokens stays single-turn. */
   localReviewSingleTurnMaxTokens: number;
+  /** Concurrent holders of the process-wide local-model lease (match the model server, e.g. oMLX concurrent=3). */
+  localLeaseCapacity: number;
   reviewOrder: ReviewProvider[];
   /** Review-coverage: char budgets for the three reviewer attachments + context pad. */
   promptDiffMaxChars: number;
@@ -442,6 +444,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localReviewMode: "auto",
   localReviewRole: "race",
   localReviewSingleTurnMaxTokens: 30_000,
+  localLeaseCapacity: 1,
   reviewOrder: ["local", "chatgpt", "grok"],
   promptDiffMaxChars: 300_000,
   promptContextMaxChars: 200_000,

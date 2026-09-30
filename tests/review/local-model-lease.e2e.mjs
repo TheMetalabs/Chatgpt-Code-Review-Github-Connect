@@ -86,6 +86,21 @@ test('abort while queued: a cancelled waiting review leaves the queue and never 
   assert.equal(job(app,b).status,'cancelled');
 });
 
+test('configured capacity 2: two local reviews hold the model at once', async t=>{
+  const app=await appFixture({reviewChatgpt:false,localReviewMode:'single',localJsonRepairEnabled:false,localLeaseCapacity:2});
+  t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const a=await started(app,1);
+  await eventually(()=>app.localRequests.length===1,'A1 not sent');
+  const b=await started(app,2);
+  await eventually(()=>app.localRequests.length===2,'B should send in parallel at capacity 2');
+  assert.notEqual(job(app,b)?.providerProgress?.local?.stage,'local_lease_waiting','B is not waiting behind A');
+  await answer(app,0,final);
+  await answer(app,1,final);
+  await eventually(()=>job(app,a)?.status==='posted','A did not post');
+  await eventually(()=>job(app,b)?.status==='posted','B did not post');
+});
+
 test('releaseJob frees the lease: cancelling the holder starts the next review without waiting for its request', async t=>{
   const app=await fixture(t);
   const a=await started(app,1);

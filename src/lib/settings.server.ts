@@ -95,6 +95,8 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (localRole) o.localReviewRole = localRole;
   const localSingleTurnMax = envNum("ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS");
   if (localSingleTurnMax !== undefined) o.localReviewSingleTurnMaxTokens = localSingleTurnMax;
+  const localLease = envNum("ASHLAR_LOCAL_LEASE_CAPACITY");
+  if (localLease !== undefined) o.localLeaseCapacity = localLease;
   const order = envStr("ASHLAR_REVIEW_ORDER");
   if (order) o.reviewOrder = order.split(",").map((s) => s.trim());
   const chatgptReasoning = envStr("ASHLAR_CHATGPT_REASONING");
@@ -160,6 +162,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_REVIEW_MODE: s.localReviewMode,
     ASHLAR_LOCAL_REVIEW_ROLE: s.localReviewRole,
     ASHLAR_LOCAL_REVIEW_SINGLE_TURN_MAX_TOKENS: String(s.localReviewSingleTurnMaxTokens),
+    ASHLAR_LOCAL_LEASE_CAPACITY: String(s.localLeaseCapacity),
     ASHLAR_REVIEW_ORDER: s.reviewOrder.join(","),
     ASHLAR_CHATGPT_REASONING: s.chatgptReasoning,
     ASHLAR_GROK_REASONING: s.grokReasoning,
@@ -258,6 +261,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
       ? (p.localReviewRole as LocalReviewRole)
       : DEFAULT_SETTINGS.localReviewRole,
     localReviewSingleTurnMaxTokens: intField(p, "localReviewSingleTurnMaxTokens"),
+    localLeaseCapacity: intField(p, "localLeaseCapacity"),
     reviewOrder: normalizeReviewOrder(p.reviewOrder as ReviewProvider[] | undefined),
     chatgptReasoning: normalizeChatgptReasoning(p.chatgptReasoning),
     grokReasoning: normalizeGrokReasoning(p.grokReasoning),

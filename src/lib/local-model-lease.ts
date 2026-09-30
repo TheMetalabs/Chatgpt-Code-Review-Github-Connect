@@ -1,16 +1,18 @@
 /**
  * Process-wide FIFO lease on the local model server, held by one review's local leg for its whole run.
  *
- * WHY: the local model server (concurrency 1) generates one request at a time. Without a lease every
- * review sent its own chat/completions calls straight to the server, so the server's queue interleaved
- * reviews turn by turn (A-turn1, B-turn1, A-turn2, …): each switch evicted the other conversation's
- * prompt cache, every turn re-prefilled its whole history, and every review finished late.
+ * WHY: a local model server generates a bounded number of requests at a time (often 1). Without a
+ * lease every review sent its own chat/completions calls straight to the server, so the server's
+ * queue interleaved reviews turn by turn (A-turn1, B-turn1, A-turn2, …): each switch evicted the
+ * other conversation's prompt cache, every turn re-prefilled its whole history, and every review
+ * finished late.
  *
- * With the lease a review's local leg holds the model across ALL its file groups and turns; the next
- * queued review starts when it releases. Waiting is FIFO and abort-aware (a cancelled job leaves the
+ * With the lease a review's local leg holds a slot across ALL its file groups and turns; the next
+ * queued review starts when a slot frees. Waiting is FIFO and abort-aware (a cancelled job leaves the
  * queue at once) and has no deadline: waiting behind another review is normal and may take hours.
  * The review local leg, the local fix agent and local JSON repair take this lease; the manual run is
- * unchanged.
+ * unchanged. Capacity (how many holders at once) is Settings `localLeaseCapacity` /
+ * ASHLAR_LOCAL_LEASE_CAPACITY, default 1, clamped 1–8 — match the model server (e.g. oMLX concurrent=3).
  *
  * Lanes: a waiter joins the queue in its lane and is granted before every waiter of a lower lane, FIFO
  * within a lane: "short" (JSON repair: 1-3 small calls) before "fix" (one call that unblocks a PR)
@@ -40,6 +42,26 @@ export function shortJobsPerCheckpoint(
   if (raw == null || raw.trim() === "") return DEFAULT_SHORT_PER_CHECKPOINT;
   const n = Math.floor(Number(raw));
   return Number.isFinite(n) && n >= 0 ? Math.min(n, MAX_SHORT_PER_CHECKPOINT) : DEFAULT_SHORT_PER_CHECKPOINT;
+}
+
+/** Concurrent holders of the process-wide local-model lease. Default 1; Settings and
+ * ASHLAR_LOCAL_LEASE_CAPACITY clamp into 1–8. */
+export const DEFAULT_LOCAL_LEASE_CAPACITY = 1;
+export const MAX_LOCAL_LEASE_CAPACITY = 8;
+
+export function clampLocalLeaseCapacity(n: unknown): number {
+  if (typeof n !== "number" || !Number.isFinite(n)) return DEFAULT_LOCAL_LEASE_CAPACITY;
+  return Math.min(MAX_LOCAL_LEASE_CAPACITY, Math.max(1, Math.floor(n)));
+}
+
+/** ASHLAR_LOCAL_LEASE_CAPACITY: how many local reviews/fixes/repairs may hold the model at once.
+ * Default 1; junk / empty → default; clamped to 1–8. */
+export function localLeaseCapacity(
+  env: Record<string, string | undefined> | undefined = typeof process !== "undefined" ? process.env : undefined,
+): number {
+  const raw = env?.ASHLAR_LOCAL_LEASE_CAPACITY;
+  if (raw == null || raw.trim() === "") return DEFAULT_LOCAL_LEASE_CAPACITY;
+  return clampLocalLeaseCapacity(Number(raw));
 }
 
 export type LocalModelLeaseHandle = {
@@ -90,10 +112,28 @@ export class LocalModelLease {
   private readonly lends = new Map<number, number>();
   private readonly ids = new WeakMap<LocalModelLeaseHandle, number>();
   private queue: Waiter[] = [];
-  private readonly capacity: number;
+  private capacity: number;
 
-  constructor(capacity = 1) {
-    this.capacity = Math.max(1, Math.floor(capacity) || 1);
+  constructor(capacity = DEFAULT_LOCAL_LEASE_CAPACITY) {
+    this.capacity = clampLocalLeaseCapacity(capacity);
+  }
+
+  /** Current grant ceiling. */
+  getCapacity(): number {
+    return this.capacity;
+  }
+
+  /**
+   * Change the grant ceiling (clamped 1–8). Raising grants queued waiters immediately. Lowering
+   * never revokes current holders: occupancy may sit above the new cap until they release, and new
+   * grants wait. The process-wide singleton is reconfigured in place (not recreated) so in-flight
+   * handles stay valid.
+   */
+  setCapacity(n: number): void {
+    const next = clampLocalLeaseCapacity(n);
+    if (next === this.capacity) return;
+    this.capacity = next;
+    this.pump();
   }
 
   /** Wait (by lane, FIFO within it) for the model. Resolves with a handle the caller must release. */
@@ -275,10 +315,35 @@ export class LocalModelLease {
 }
 
 const GLOBAL_KEY = Symbol.for("ashlar.localModelLease");
+const CAP_KEY = Symbol.for("ashlar.localModelLease.capacity");
+
+function configuredCapacity(): number {
+  const n = (globalThis as Record<symbol, unknown>)[CAP_KEY];
+  return typeof n === "number" ? n : localLeaseCapacity();
+}
+
+/** Point the process-wide singleton at Settings/env capacity. Call from harbor load and save.
+ * Does not recreate the lease (in-flight handles stay valid). See LocalModelLease.setCapacity. */
+export function applyLocalModelLeaseCapacity(n: number): void {
+  const g = globalThis as Record<symbol, unknown>;
+  const cap = clampLocalLeaseCapacity(n);
+  g[CAP_KEY] = cap;
+  const lease = g[GLOBAL_KEY];
+  if (lease && typeof (lease as LocalModelLease).setCapacity === "function") {
+    (lease as LocalModelLease).setCapacity(cap);
+  }
+}
 
 /** The one process-wide lease review local legs, local fix calls and JSON repairs share (kept on
- * globalThis so a module loaded twice — e.g. Vite SSR — still shares a single queue). */
+ * globalThis so a module loaded twice — e.g. Vite SSR — still shares a single queue). Capacity is
+ * the last applyLocalModelLeaseCapacity value, else ASHLAR_LOCAL_LEASE_CAPACITY / default 1. */
 export function localModelLease(): LocalModelLease {
-  const g = globalThis as unknown as Record<symbol, LocalModelLease | undefined>;
-  return (g[GLOBAL_KEY] ??= new LocalModelLease());
+  const g = globalThis as Record<symbol, unknown>;
+  const cap = configuredCapacity();
+  const existing = g[GLOBAL_KEY];
+  const lease = existing && typeof (existing as LocalModelLease).setCapacity === "function"
+    ? (existing as LocalModelLease)
+    : (g[GLOBAL_KEY] = new LocalModelLease(cap) as LocalModelLease);
+  lease.setCapacity(cap);
+  return lease;
 }

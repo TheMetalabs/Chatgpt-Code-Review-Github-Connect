@@ -344,11 +344,14 @@ function dispatchLocalJson(
           reject(new LocalChatHttpError(res.statusCode ?? 0, text));
           return;
         }
-        try {
-          const parsed = JSON.parse(text);
-          if (chat) activity("output");
-          resolve(parsed);
-        } catch { reject(new Error("local LLM returned an invalid JSON response")); }
+        let parsed: unknown;
+        try { parsed = JSON.parse(text); }
+        catch { reject(new Error("local LLM returned an invalid JSON response")); return; }
+        // Output is reported only after a successful parse. A throwing onActivity must reject with
+        // that error — not the parse-failure message, which would hide a valid body.
+        try { if (chat) activity("output"); }
+        catch (err) { reject(err); return; }
+        resolve(parsed);
       });
     });
     req.setTimeout(0);

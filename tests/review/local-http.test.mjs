@@ -193,6 +193,20 @@ test('buffered chat: response headers without a body are keepalive, not output',
   assert.equal(seen.at(-1), 'output');
 });
 
+test('buffered chat: a throwing onActivity on output is not reported as invalid JSON', async t => {
+  const requestLocalChat = await transport();
+  const reply = '{"choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}';
+  const base = await listen(t, (req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end(reply); });
+  const boom = new Error('activity failed');
+  await assert.rejects(
+    requestLocalChat(base, '', payload, undefined, {
+      stream: false,
+      onActivity: a => { if (a.kind === 'output') throw boom; },
+    }),
+    e => e === boom && !/invalid JSON response/.test(String(e)),
+  );
+});
+
 test('streaming chat: a server that ignores stream and answers plain JSON still works; ASHLAR_LOCAL_LLM_STREAM=false sends a non-stream request', async t => {
   const requestLocalChat = await transport();
   const plain = await listen(t, (req, res) => { req.resume(); res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"choices":[{"finish_reason":"stop","message":{"content":"plain"}}]}'); });

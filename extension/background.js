@@ -665,12 +665,16 @@ const PRESEND_WATCHDOG_MS = 17 * 60_000;
 
 /** Why the worker ends a leg whose frozen tab never sent ("" while it may wait). */
 function presendWatchdog(state, tab, now = Date.now()) {
-  if (tab?.frozen !== true || !Number.isFinite(state.runDispatchedAt)) return "";
+  // A leg dispatched by an older worker has no runDispatchedAt: its recorded run_dispatched step dates
+  // it (live 2026-10-02: two such legs, frozen for 3-7 h, held both ChatGPT slots when 1.1.61 arrived).
+  const dispatchedAt = Number.isFinite(state.runDispatchedAt) ? state.runDispatchedAt
+    : (state.workerEvents || []).find(e => e?.stage === "run_dispatched")?.at;
+  if (tab?.frozen !== true || !Number.isFinite(dispatchedAt)) return "";
   const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
   if (events.some(e => ["send_attempted", "prompt_submitted", "send_unconfirmed", "submission_persisted"].includes(e.stage))) return "";
-  if (now - state.runDispatchedAt < PRESEND_WATCHDOG_MS) return "";
+  if (now - dispatchedAt < PRESEND_WATCHDOG_MS) return "";
   const last = events.at(-1)?.stage || "no page step";
-  return `the tab was frozen in "${last}" for ${Math.round((now - state.runDispatchedAt) / 60_000)} min after dispatch, before its send; nothing was sent`;
+  return `the tab was frozen in "${last}" for ${Math.round((now - dispatchedAt) / 60_000)} min after dispatch, before its send; nothing was sent`;
 }
 
 /** A provider answered a job admitted after its logout: the login is back, and admission leaves

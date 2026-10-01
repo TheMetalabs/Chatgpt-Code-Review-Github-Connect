@@ -219,3 +219,15 @@ test('the run message carries the send deadline, 15 min after the first dispatch
  assert.ok(runs.length>=1);
  assert.equal(runs[0].presendDeadline,dispatched+15*60_000);
 });
+
+test('presend watchdog: a leg an older worker dispatched (no runDispatchedAt) is dated by its run_dispatched step',async()=>{
+ const at=Date.now()-3*3600_000;
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:{tabId:10,started:true,runId:'run-A',
+  workerEvents:[{source:'worker',sequence:1,at:at-2000,stage:'tab_created'},{source:'worker',sequence:2,at,stage:'run_dispatched'}],
+  pageEvents:[{source:'page',sequence:1,at:at+1000,stage:'send_waiting'}]}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete',active:false,frozen:true}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'busy'})});
+ await ticks(b,2);
+ assert.match(b.calls.find(c=>c.action==='failure'&&c.jobId==='A')?.error||'',/^presend_stalled: the tab was frozen in "send_waiting" for 180 min after dispatch/);
+});

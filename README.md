@@ -229,6 +229,14 @@ HTTP 429일 때만** 다음 alias로 같은 요청을 한 번 재시도합니다
 CLIProxyAPI 자체의 내부 재시도보다 이 우선순위를 먼저 적용하려면 프록시의 `routing.retry.request-retry`
 를 `0`으로 두세요.
 
+무료 모델의 호출 간격은 Settings의 `local_llm.model_rate_limits` 또는
+`ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS`에서 `model=duration`으로 지정할 수 있습니다. 예를 들어
+`gpt-4o-mini=60s`는 Ashlar 프로세스 안에서 해당 모델의 요청 시작 사이를 최소 60초로 만들고,
+`ashlar-review-qwen=20s`는 Qwen alias만 20초 간격으로 제한합니다. 쉼표·줄바꿈을 모두 사용할 수
+있고 `ms`, `s`, `m` 단위를 지원합니다. 같은 모델을 쓰는 리뷰·fix·JSON repair는 공유 대기열을
+사용하며, 429 응답의 `Retry-After`가 있으면 그 시간도 다음 호출에 반영합니다. 이 설정은 요청
+간격만 제어하므로 토큰 기준 TPM·일일 한도를 보장하지는 않습니다.
+
 로컬 레그만 SDK/HTTP 전송이라 **멀티턴 툴 루프**를 돕니다. ChatGPT/Grok은 브라우저 탭이라 계속 1회성입니다.
 루프는 파일을 읽고(`file_read`), 다른 변경 파일 diff를 보고(`file_read_diff`), 검색(`code_search`)한 뒤
 지적을 근거와 함께 확정합니다. **다른 리뷰어를 막거나 교차 검수하지 않습니다** — 실패하면 기존처럼
@@ -255,6 +263,7 @@ CLIProxyAPI 자체의 내부 재시도보다 이 우선순위를 먼저 적용�
 | `localLeaseCapacity` / `ASHLAR_LOCAL_LEASE_CAPACITY` | 1 (최대 8) | 로컬 모델 리스를 동시에 쥘 수 있는 개수(리뷰·fix·JSON repair). 모델 서버 동시성(예: oMLX concurrent=3)에 맞춥니다. Settings에서 바꾸면 프로세스 전역 싱글톤이 재생성되지 않고 재설정됩니다. 올리면 대기자가 즉시 들어가고, 내리면 진행 중인 holder는 끊기지 않으며 자리가 날 때까지 신규 grant가 기다립니다 |
 | `ASHLAR_LOCAL_LLM_STREAM` | true | chat/completions 를 SSE 스트리밍으로 받아 토큰 단위 하트비트를 얻습니다. 응답은 비스트리밍 형태로 재조립되므로 동작은 같습니다. `false` 면 예전처럼 단일 JSON 응답(이 경우 큐/생성 구분·liveness 중단 없음) |
 | `localLlmModelPriority` / `ASHLAR_LOCAL_LLM_MODEL_PRIORITY` | 빈 값 | primary 뒤에 시도할 CLIProxyAPI/OpenAI 호환 모델 alias 목록. 쉼표/줄바꿈 구분, HTTP 429에서만 다음 alias로 이동 |
+| `localLlmModelRateLimits` / `ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS` | 빈 값 | `model=duration`별 최소 요청 시작 간격. `ms`, `s`, `m` 지원. Settings에서도 입력 가능 |
 
 로컬 레그는 `providerProgress.local`로 **하트비트 + 진행상황 신호**를 내보냅니다. 스트리밍 전송이
 서버의 응답 헤더·빈 keepalive 청크·토큰을 관찰해 레그를 네 상태로 구분합니다.

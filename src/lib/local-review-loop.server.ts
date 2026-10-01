@@ -576,6 +576,7 @@ export async function runLocalReviewLoop(
   const route = createLocalModelRouter(
     parseLocalModelPriority(settings.localLlmModel, settings.localLlmModelPriority),
     deps.request ?? requestLocalJson,
+    { rateLimits: settings.localLlmModelRateLimits },
   );
   const request = route.request;
   const t = tuning();

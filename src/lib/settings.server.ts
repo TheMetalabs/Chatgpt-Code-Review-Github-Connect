@@ -87,6 +87,8 @@ export function overlayEnv(base: Record<string, unknown>): Record<string, unknow
   if (model) o.localLlmModel = model;
   const modelPriority = envStr("ASHLAR_LOCAL_LLM_MODEL_PRIORITY");
   if (modelPriority) o.localLlmModelPriority = modelPriority;
+  const modelRateLimits = envStr("ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS");
+  if (modelRateLimits) o.localLlmModelRateLimits = modelRateLimits;
   const key = process.env.ASHLAR_LOCAL_LLM_API_KEY;
   if (key !== undefined && key !== "") o.localLlmApiKey = key;
   const localMaxTokens = envNum("ASHLAR_LOCAL_REVIEW_MAX_TOKENS");
@@ -160,6 +162,7 @@ export function botSettingsToEnv(s: BotSettings): Record<string, string> {
     ASHLAR_LOCAL_LLM_BASE_URL: s.localLlmBaseUrl,
     ASHLAR_LOCAL_LLM_MODEL: s.localLlmModel,
     ASHLAR_LOCAL_LLM_MODEL_PRIORITY: s.localLlmModelPriority,
+    ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS: s.localLlmModelRateLimits,
     ASHLAR_LOCAL_LLM_API_KEY: s.localLlmApiKey,
     ASHLAR_LOCAL_REVIEW_MAX_TOKENS: String(s.localReviewMaxTokens),
     ASHLAR_LOCAL_REVIEW_MODE: s.localReviewMode,
@@ -257,6 +260,7 @@ export function sanitizeBotSettings(raw: unknown): BotSettings {
     localLlmApiKey: str(p.localLlmApiKey, DEFAULT_SETTINGS.localLlmApiKey),
     localLlmModel: str(p.localLlmModel, DEFAULT_SETTINGS.localLlmModel).trim(),
     localLlmModelPriority: str(p.localLlmModelPriority, DEFAULT_SETTINGS.localLlmModelPriority).trim(),
+    localLlmModelRateLimits: str(p.localLlmModelRateLimits, DEFAULT_SETTINGS.localLlmModelRateLimits).trim(),
     localReviewMaxTokens: intField(p, "localReviewMaxTokens"),
     localReviewMode: LOCAL_REVIEW_MODES.includes(p.localReviewMode as LocalReviewMode)
       ? (p.localReviewMode as LocalReviewMode)

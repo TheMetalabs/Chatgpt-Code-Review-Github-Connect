@@ -46,7 +46,11 @@ export async function requestLocalFix(
     if (signal?.aborted) throw signal.reason ?? new Error("local fix cancelled before its request");
     const request = deps.requestLocalChat ?? (await import("./local-chat-request.server.ts")).requestLocalChat;
     const llm = await import("./local-llm.server.ts");
-    const route = createLocalModelRouter(parseLocalModelPriority(settings.localLlmModel, settings.localLlmModelPriority));
+    const route = createLocalModelRouter(
+      parseLocalModelPriority(settings.localLlmModel, settings.localLlmModelPriority),
+      undefined,
+      { rateLimits: settings.localLlmModelRateLimits },
+    );
     dispatched?.();
     return await route.run((model) => request(
       settings.localLlmBaseUrl,
@@ -63,7 +67,7 @@ export async function requestLocalFix(
       },
       signal,
       { onActivity: (a) => ctl?.onActivity?.(a.kind === "output" ? "generating" : "queued") },
-    ));
+    ), signal);
   } finally {
     handle.release();
   }

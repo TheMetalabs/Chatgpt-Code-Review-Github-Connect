@@ -26,6 +26,7 @@ const BASE = mergeBase(REF);
 const ALLOW = new Set([
   "src/lib/local-llm.server.ts",
   "src/lib/local-model-routing.server.ts",
+  "src/lib/local-model-rate-limit.ts",
   "src/lib/local-chat-request.server.ts",
   "src/lib/local-review-loop.server.ts",
   "src/lib/local-fallback.ts",
@@ -94,6 +95,7 @@ const ALLOW = new Set([
   "tests/review/local.test.mjs",
   "tests/review/local-http.test.mjs",
   "tests/review/local-llm.test.mjs",
+  "tests/review/long-wait.test.mjs",
   "tests/review/local-model-routing.test.mjs",
   "tests/review/settings-fix-agent.test.mjs",
   "BOUNDARY.md",

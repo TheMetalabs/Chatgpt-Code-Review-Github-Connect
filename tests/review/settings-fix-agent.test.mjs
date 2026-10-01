@@ -94,6 +94,7 @@ const TOP_LEVEL = {
   localLlmApiKey: {bad: [42, null, {}], good: 'sk-new'},
   localLlmModel: {bad: [42, null, []], good: 'qwen'},
   localLlmModelPriority: {bad: [42, null, []], good: 'ashlar-review-gemini, ashlar-review-local'},
+  localLlmModelRateLimits: {bad: [42, null, []], good: 'gpt-4o-mini=60s, ashlar-review-qwen=20s'},
   localReviewMaxTokens: {bad: ['100', null, 0, 1.5, -5], good: 4096},
   localReviewMode: {bad: ['turbo', 1, null], good: 'multiturn'},
   localReviewRole: {bad: ['turbo', 'verify', 1, null], good: 'verify-clean'},

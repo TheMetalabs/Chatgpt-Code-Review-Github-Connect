@@ -140,6 +140,7 @@ export function Settings() {
     saved.localLlmBaseUrl,
     saved.localLlmModel,
     saved.localLlmModelPriority,
+    saved.localLlmModelRateLimits,
     saved.localLeaseCapacity,
     saved.localLlmApiKeySet,
     saved.webhookSecretSet,
@@ -369,6 +370,19 @@ export function Settings() {
               is used only when the proxy returns HTTP 429.
             </p>
           </Field>
+          <Field label="local_llm.model_rate_limits">
+            <textarea
+              rows={2}
+              value={draft.localLlmModelRateLimits}
+              onChange={(e) => patch({ localLlmModelRateLimits: e.target.value })}
+              placeholder={"gpt-4o-mini=60s\nashlar-review-qwen=20s"}
+              className="min-h-11 w-full rounded-md border border-line bg-bg-elevated px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-accent/40"
+            />
+            <p className="mt-2 text-[12px] text-fg-subtle">
+              Optional comma/newline-separated model=duration entries. Use ms, s, or m; Ashlar waits
+              before starting a request for that model (for example gpt-4o-mini=60s).
+            </p>
+          </Field>
         </div>
         <Field label="local_llm.lease_capacity">
           <input
@@ -511,6 +525,7 @@ local_llm:
   base_url: ${draft.localLlmBaseUrl || "—"}
   model: ${draft.localLlmModel || "—"}
   model_priority: ${draft.localLlmModelPriority || "—"}
+  model_rate_limits: ${draft.localLlmModelRateLimits || "—"}
   lease_capacity: ${draft.localLeaseCapacity}
   json_repair_enabled: ${draft.localJsonRepairEnabled}
 fix_agent:  # review loop (experimental)

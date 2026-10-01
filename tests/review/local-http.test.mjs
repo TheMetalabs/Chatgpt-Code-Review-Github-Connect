@@ -56,6 +56,11 @@ test('HTTP error, invalid JSON and broken response are explicit failures, not re
     assert.equal(count, 1);
   }
 });
+test('HTTP 429 preserves Retry-After seconds for the model router', async t => {
+  const requestLocalChat = await transport();
+  const base = await listen(t, (req, res) => { req.resume(); res.writeHead(429, { 'retry-after': '37' }); res.end('usage limit'); });
+  await assert.rejects(requestLocalChat(base, '', payload), e => e.status === 429 && e.retryAfterMs === 37_000);
+});
 test('request uses no implicit socket deadline and preserves endpoint path prefixes', async t => {
   const requestLocalChat = await transport();
   let captured;

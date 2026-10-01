@@ -33,11 +33,22 @@ export class LocalChatCutOff extends Error {
 /** The server refused the request with a non-2xx status before any reply existed. */
 export class LocalChatHttpError extends Error {
   readonly status: number;
-  constructor(status: number, body: string) {
+  readonly retryAfterMs?: number;
+  constructor(status: number, body: string, retryAfterMs?: number) {
     super(`local LLM HTTP ${status}: ${body.slice(0, 160)}`);
     this.name = "LocalChatHttpError";
     this.status = status;
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+function retryAfterMs(value: string | string[] | undefined): number | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
 }
 
 /** What the transport observed on an in-flight request.
@@ -341,7 +352,7 @@ function dispatchLocalJson(
         }
         const text = Buffer.concat(chunks).toString("utf8");
         if (!ok) {
-          reject(new LocalChatHttpError(res.statusCode ?? 0, text));
+          reject(new LocalChatHttpError(res.statusCode ?? 0, text, retryAfterMs(res.headers["retry-after"])));
           return;
         }
         let parsed: unknown;

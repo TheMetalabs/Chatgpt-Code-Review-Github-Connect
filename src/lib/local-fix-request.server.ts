@@ -3,6 +3,7 @@
 import type { RequestFix } from "./fix-agent.ts";
 import type { LocalModelLease } from "./local-model-lease.ts";
 import type { BotSettings } from "./types.ts";
+import { createLocalModelRouter, parseLocalModelPriority } from "./local-model-routing.server.ts";
 
 type LocalChatRequest = typeof import("./local-chat-request.server.ts").requestLocalChat;
 
@@ -45,12 +46,13 @@ export async function requestLocalFix(
     if (signal?.aborted) throw signal.reason ?? new Error("local fix cancelled before its request");
     const request = deps.requestLocalChat ?? (await import("./local-chat-request.server.ts")).requestLocalChat;
     const llm = await import("./local-llm.server.ts");
+    const route = createLocalModelRouter(parseLocalModelPriority(settings.localLlmModel, settings.localLlmModelPriority));
     dispatched?.();
-    return await request(
+    return await route.run((model) => request(
       settings.localLlmBaseUrl,
       settings.localLlmApiKey,
       {
-        model: settings.localLlmModel,
+        model,
         messages: [
           { role: "system", content: "You are the Ashlar fix agent. Return ONLY the JSON object described in the prompt." },
           { role: "user", content: prompt },
@@ -61,7 +63,7 @@ export async function requestLocalFix(
       },
       signal,
       { onActivity: (a) => ctl?.onActivity?.(a.kind === "output" ? "generating" : "queued") },
-    );
+    ));
   } finally {
     handle.release();
   }

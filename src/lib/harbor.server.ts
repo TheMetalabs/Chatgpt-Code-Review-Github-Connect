@@ -175,7 +175,9 @@ export function patchHarborSettings(patch: Partial<BotSettings>) {
   const previousSettings = state.settings;
   state = { ...state, settings: saved };
   if (!saved.localJsonRepairEnabled || previousSettings.localLlmBaseUrl !== saved.localLlmBaseUrl ||
-      previousSettings.localLlmModel !== saved.localLlmModel || previousSettings.localLlmApiKey !== saved.localLlmApiKey) {
+      previousSettings.localLlmModel !== saved.localLlmModel ||
+      previousSettings.localLlmModelPriority !== saved.localLlmModelPriority ||
+      previousSettings.localLlmApiKey !== saved.localLlmApiKey) {
     cancelLocalJsonRepairs("disabled");
   }
   applyLocalModelLeaseCapacity(saved.localLeaseCapacity);

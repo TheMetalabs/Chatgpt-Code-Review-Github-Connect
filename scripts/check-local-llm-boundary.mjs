@@ -25,6 +25,7 @@ const BASE = mergeBase(REF);
 // Allowlist: only these paths may change on this branch.
 const ALLOW = new Set([
   "src/lib/local-llm.server.ts",
+  "src/lib/local-model-routing.server.ts",
   "src/lib/local-chat-request.server.ts",
   "src/lib/local-review-loop.server.ts",
   "src/lib/local-fallback.ts",
@@ -77,6 +78,9 @@ const ALLOW = new Set([
   "src/lib/import-resolve.ts",
   "src/lib/import-resolve.test.ts",
   "src/lib/settings.server.ts",
+  "src/lib/settings-rules.ts",
+  "src/lib/store.ts",
+  "src/routes/settings.tsx",
   "src/lib/types.ts",
   "src/lib/json-repair.server.ts",
   "src/routes/api/harbor.ts",
@@ -90,6 +94,8 @@ const ALLOW = new Set([
   "tests/review/local.test.mjs",
   "tests/review/local-http.test.mjs",
   "tests/review/local-llm.test.mjs",
+  "tests/review/local-model-routing.test.mjs",
+  "tests/review/settings-fix-agent.test.mjs",
   "BOUNDARY.md",
   "scripts/check-local-llm-boundary.mjs",
   "package.json",

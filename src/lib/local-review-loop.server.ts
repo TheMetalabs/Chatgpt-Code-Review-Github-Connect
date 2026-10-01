@@ -11,6 +11,7 @@
 import { buildChatParts, parseChatSubmission, REVIEW_OFFLINE_RULE } from "./chat-prompt.ts";
 import { extractChatJsonParts } from "./extract-chat-json.ts";
 import { requestLocalJson } from "./local-chat-request.server.ts";
+import { createLocalModelRouter, parseLocalModelPriority } from "./local-model-routing.server.ts";
 import { localGenerationParams, samplingRequestFields, type LocalLegResult } from "./local-llm.server.ts";
 import { gateLiveSubmission } from "./poster.ts";
 import { orderFiles, rankChangedFile } from "./review-budget.ts";
@@ -572,7 +573,11 @@ export async function runLocalReviewLoop(
   settings: BotSettings,
   deps: LocalReviewDeps,
 ): Promise<LocalLegResult> {
-  const request = deps.request ?? requestLocalJson;
+  const route = createLocalModelRouter(
+    parseLocalModelPriority(settings.localLlmModel, settings.localLlmModelPriority),
+    deps.request ?? requestLocalJson,
+  );
+  const request = route.request;
   const t = tuning();
   try {
     const groups = groupChangedFiles(sample, t);

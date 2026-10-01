@@ -11,6 +11,26 @@ function localConfig(settings: BotSettings) {
   return { ok: true as const, baseURL, model, apiKey: settings.localLlmApiKey.trim() || "local" };
 }
 
+function localModelPriority(primary: string, configured?: string): string[] {
+  return [...new Set([primary, ...(configured ?? "").split(/[\n,]/)]
+    .map((model) => model.trim())
+    .filter(Boolean))];
+}
+
+function createLocalModelFallback(models: string[]) {
+  let index = 0;
+  return async function requestWithLocalModelFallback<T>(request: (model: string) => Promise<T>): Promise<T> {
+    while (true) {
+      try {
+        return await request(models[index] ?? "");
+      } catch (error) {
+        if (Number((error as { status?: unknown })?.status) !== 429 || index >= models.length - 1) throw error;
+        index += 1;
+      }
+    }
+  };
+}
+
 export type LocalGenerationParams = {
   maxTokens: number;
   temperature: number;
@@ -107,12 +127,15 @@ export async function runLocalLlm(
   if (!ready.ok) return ready;
   prompt = bridgePromptText(prompt); // Native API input remains readable source text, not escaped transport JSON.
   const params = localGenerationParams(settings);
-  const call = (messages: LocalChatMessage[]) => requestLocalChat(
-    ready.baseURL, ready.apiKey,
-    { model: ready.model, messages, ...samplingRequestFields(params) },
+  const models = localModelPriority(ready.model, settings.localLlmModelPriority);
+  const requestWithFallback = createLocalModelFallback(models);
+  const call = (messages: LocalChatMessage[]) => requestWithFallback((model) => requestLocalChat(
+    ready.baseURL,
+    ready.apiKey,
+    { model, messages, ...samplingRequestFields(params) },
     signal,
     opts,
-  );
+  ));
   // The first completed reply, kept outside the try: a correction that then fails (HTTP 500,
   // transport error, liveness or deadline abort) must not lose it.
   let firstUnparsed: string | undefined;

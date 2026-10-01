@@ -139,6 +139,7 @@ export function Settings() {
     saved.localJsonRepairEnabled,
     saved.localLlmBaseUrl,
     saved.localLlmModel,
+    saved.localLlmModelPriority,
     saved.localLeaseCapacity,
     saved.localLlmApiKeySet,
     saved.webhookSecretSet,
@@ -355,6 +356,19 @@ export function Settings() {
               className="h-11 w-full rounded-md border border-line bg-bg-elevated px-3 font-mono text-sm outline-none focus:ring-2 focus:ring-accent/40"
             />
           </Field>
+          <Field label="local_llm.model_priority">
+            <textarea
+              rows={2}
+              value={draft.localLlmModelPriority}
+              onChange={(e) => patch({ localLlmModelPriority: e.target.value })}
+              placeholder="ashlar-review-gemini, ashlar-review-qwen"
+              className="min-h-11 w-full rounded-md border border-line bg-bg-elevated px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-accent/40"
+            />
+            <p className="mt-2 text-[12px] text-fg-subtle">
+              Optional comma/newline-separated aliases. The primary model is tried first; the next alias
+              is used only when the proxy returns HTTP 429.
+            </p>
+          </Field>
         </div>
         <Field label="local_llm.lease_capacity">
           <input
@@ -496,6 +510,7 @@ review:
 local_llm:
   base_url: ${draft.localLlmBaseUrl || "—"}
   model: ${draft.localLlmModel || "—"}
+  model_priority: ${draft.localLlmModelPriority || "—"}
   lease_capacity: ${draft.localLeaseCapacity}
   json_repair_enabled: ${draft.localJsonRepairEnabled}
 fix_agent:  # review loop (experimental)

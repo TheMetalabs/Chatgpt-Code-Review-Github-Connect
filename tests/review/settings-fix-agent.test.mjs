@@ -93,6 +93,7 @@ const TOP_LEVEL = {
   localLlmBaseUrl: {bad: [42, null, {}], good: 'http://127.0.0.1:1234/v1'},
   localLlmApiKey: {bad: [42, null, {}], good: 'sk-new'},
   localLlmModel: {bad: [42, null, []], good: 'qwen'},
+  localLlmModelPriority: {bad: [42, null, []], good: 'ashlar-review-gemini, ashlar-review-local'},
   localReviewMaxTokens: {bad: ['100', null, 0, 1.5, -5], good: 4096},
   localReviewMode: {bad: ['turbo', 1, null], good: 'multiturn'},
   localReviewRole: {bad: ['turbo', 'verify', 1, null], good: 'verify-clean'},

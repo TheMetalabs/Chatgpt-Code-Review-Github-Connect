@@ -1664,6 +1664,12 @@ function installReviewRunner(name, run) {
     state.runId = state.runId || String(msg.runId || "");
     try { sessionStorage.setItem("ashlar:run", state.runId); } catch { /* in-memory binding remains */ }
     try { sessionStorage.setItem("ashlar:job", state.jobId); } catch { /* in-memory deduplication remains */ }
+    // The worker's deadline for this run's send (background.js PAGE_PRESEND_MS): kept once, so a
+    // reload or a re-injection checks the same one (composer.js presendDeadlinePassed).
+    try {
+      const key = `ashlar:presendDeadline:${state.jobId}:${state.runId}`;
+      if (Number.isFinite(msg.presendDeadline) && !sessionStorage.getItem(key)) sessionStorage.setItem(key, String(msg.presendDeadline));
+    } catch { /* no deadline: the page's own bounds still hold */ }
     state.running = true;
     // Only a fix item's run message carries its kind; review runs keep kind undefined.
     state.kind = msg.kind === "fix" ? "fix" : undefined;

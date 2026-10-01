@@ -258,20 +258,25 @@ for(const [name,{loggedOut}={}] of [['Send never clickable: presend_stalled afte
  });
 }
 
-// The page side of the watchdog: a page whose timers were frozen past the worker's 5-min watchdog
-// wakes with Send ready and never clicks it (the worker already ended the leg).
-test('send_waiting: a page that wakes past 5 min with Send ready never sends',async t=>{
- const tab=await chatTab(t);
- await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=true;});
- await tab.start();
- await tab.page.clock.runFor(10_000);
- assert.ok((await tab.steps()).includes('send_waiting'));
- // Frozen: the page's clock jumps 6 min with no timer run in between, and Send is ready when it wakes.
- const now=await tab.page.evaluate(()=>Date.now());
- await tab.page.clock.setSystemTime(now+6*MIN);
- await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=false;});
- await tab.page.clock.runFor(2_000);
- const r=await tab.runner();
- assert.equal(r.code,'presend_stalled',JSON.stringify(r));
- assert.equal((await tab.view()).sendClicks,0,'never sent after the watchdog');
-});
+// The page side: the run message carries the worker's deadline for its send (8 min after dispatch). A page
+// frozen past it (in any pre-send stage) wakes with Send ready and never clicks it; before it, it does.
+for(const [name,{late}] of [['past the deadline: never sends',{late:true}],['before the deadline: sends',{late:false}]]){
+ test(`presend deadline (${name})`,async t=>{
+  const tab=await chatTab(t);
+  await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=true;});
+  const now=await tab.page.evaluate(()=>Date.now());
+  await tab.send('ashlar-run',{prompt:ENVELOPE,reasoning:'extra_high',allocationUrl:URL_,presendDeadline:now+8*MIN});
+  await tab.page.clock.runFor(10_000);
+  assert.ok((await tab.steps()).includes('send_waiting'));
+  // Frozen: the clock jumps with no timer run in between, then Send is ready when the page wakes.
+  await tab.page.clock.setSystemTime(now+(late?9:1)*MIN);
+  await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=false;});
+  await tab.page.clock.runFor(2_000);
+  const r=await tab.runner();
+  if(late){
+   assert.equal(r.code,'presend_stalled',JSON.stringify(r));
+   assert.match(r.error,/presend_deadline/);
+   assert.equal((await tab.view()).sendClicks,0,'never sent past the deadline');
+  } else assert.equal((await tab.view()).sendClicks,1,JSON.stringify(r));
+ });
+}

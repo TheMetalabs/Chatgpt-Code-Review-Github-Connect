@@ -652,25 +652,23 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
     logouts: logouts.slice(-5)};
 }
 
-/** How long a leg's page may stay silent in a pre-send stage before the worker ends the leg (live
- * aicc #539/#602, 2026-10-01/02: legs sat in send_waiting 57-70+ min holding a ChatGPT slot, their
- * page timers frozen, so the page's own 3-min bounds never ran). Every pre-send wait the page bounds
- * itself ends well inside it. */
-const PRESEND_WATCHDOG_MS = 5 * 60_000;
-const PRESEND_STAGES = new Set(["overlays_dismissing", "composer_waiting", "composer_ready", "reasoning_selecting", "reasoning_selected",
-  "reasoning_skipped", "attachments_preparing", "attachments_staged_via_a", "attachments_staged_via_b", "attachments_staged_via_c",
-  "attachments_staged_via_d", "prompt_prepared", "attachments_waiting", "send_waiting"]);
+/** Pre-send deadlines (live aicc #539/#602, 2026-10-01/02: legs sat in send_waiting 57-70+ min
+ * holding a ChatGPT slot; Chrome had frozen their background tabs, so no page timer ran and the poll
+ * skipped them as frozen). The run message carries a deadline for its send, PAGE_PRESEND_MS after
+ * dispatch: past it the page never clicks Send (composer.js presendDeadlinePassed), whatever stage it
+ * slept in. The worker ends a leg whose tab Chrome still reports frozen PRESEND_WATCHDOG_MS after
+ * dispatch with no send seen: strictly after that deadline, so a page that wakes later cannot send. */
+const PAGE_PRESEND_MS = 8 * 60_000;
+const PRESEND_WATCHDOG_MS = 10 * 60_000;
 
-/** Why the worker ends a leg whose page went silent before its send ("" while it may wait): its last
- * page event is a pre-send stage, no send was attempted, and nothing came for PRESEND_WATCHDOG_MS.
- * The reason names whether Chrome reported the tab frozen or hidden (the likely cause). */
+/** Why the worker ends a leg whose frozen tab never sent ("" while it may wait). */
 function presendWatchdog(state, tab, now = Date.now()) {
+  if (tab?.frozen !== true || !Number.isFinite(state.runDispatchedAt)) return "";
   const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
-  const last = events.at(-1);
-  if (!last || !PRESEND_STAGES.has(last.stage) || events.some(e => e.stage === "send_attempted" || e.stage === "prompt_submitted")) return "";
-  if (now - Number(last.at || 0) < PRESEND_WATCHDOG_MS) return "";
-  const how = [tab?.frozen === true ? "frozen" : "", tab?.active === false ? "background" : ""].filter(Boolean).join(", ");
-  return `the page stopped reporting in "${last.stage}" for ${Math.round((now - last.at) / 60_000)} min before its send${how ? ` (tab ${how})` : ""}; nothing was sent`;
+  if (events.some(e => ["send_attempted", "prompt_submitted", "send_unconfirmed", "submission_persisted"].includes(e.stage))) return "";
+  if (now - state.runDispatchedAt < PRESEND_WATCHDOG_MS) return "";
+  const last = events.at(-1)?.stage || "no page step";
+  return `the tab was frozen in "${last}" for ${Math.round((now - state.runDispatchedAt) / 60_000)} min after dispatch, before its send; nothing was sent`;
 }
 
 /** A provider answered a job admitted after its logout: the login is back, and admission leaves
@@ -2202,9 +2200,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (tab.status && tab.status !== "complete") return;
   const stalled = presendWatchdog(state, tab);
   if (stalled) {
-    // The worker's own bound on a page that stopped reporting before its send: the leg ends and its
-    // slot is free; the tab is left to the cleanup policy, and the page itself never sends after
-    // this bound (composer.js SEND_ABANDON_MS).
+    // The worker's own bound on a frozen page that never sent: the leg ends and its slot is free;
+    // the tab is left to the cleanup policy, and the page never sends after its deadline
+    // (PAGE_PRESEND_MS, carried in the run message).
     state.outcome = failure("presend_stalled", stalled);
     workerStep(job, provider, "presend_watchdog");
     await saveJobs(jobs);
@@ -2244,7 +2242,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       // a page starts a run only while the worker that sent it still waits for the reply.
       const replyWindow = pageWindow();
       if (replyWindow < MIN_DISPATCH_WINDOW_MS) return;
-      result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS}, contentFiles(provider));
+      state.runDispatchedAt ??= Date.now();
+      result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS,
+        presendDeadline: state.runDispatchedAt + PAGE_PRESEND_MS}, contentFiles(provider));
       // A page that refused the new run bound nothing: the run was never started.
       if (!refusedRun(result, job, provider)) {
         dispatched = true;

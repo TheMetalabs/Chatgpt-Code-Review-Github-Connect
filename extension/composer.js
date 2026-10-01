@@ -1135,9 +1135,6 @@ async function clickSend(findSend, findComposer, expectedText) {
   // ChatGPT ended the session, until their tabs were gone). A logged-out page ends it at once as
   // logged_out.
   const SEND_WAIT_MS = 3 * 60 * 1000;
-  // Past the worker's watchdog (background.js PRESEND_WATCHDOG_MS) the leg is already ended: a page
-  // whose timers were frozen and that wakes later never sends, even with Send ready.
-  const SEND_ABANDON_MS = 5 * 60 * 1000;
   let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null;
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
@@ -1174,7 +1171,7 @@ async function clickSend(findSend, findComposer, expectedText) {
       sendWaitSince = uploadBusy ? null : sendWaitSince ?? Date.now();
       // Only while Send is still not clickable this tick: a tab that slept past the bound with Send
       // ready clicks it instead.
-      if (!uploadBusy && Date.now() - sendWaitSince >= (actionableSend(button) ? SEND_ABANDON_MS : SEND_WAIT_MS)) {
+      if (!uploadBusy && !actionableSend(button) && Date.now() - sendWaitSince >= SEND_WAIT_MS) {
         if (typeof savePresendStallHtml === "function") savePresendStallHtml("send_waiting");
         throw presendStalled("send_waiting");
       }
@@ -1185,6 +1182,12 @@ async function clickSend(findSend, findComposer, expectedText) {
       if (fix && drafted && !composerHoldsFix(editor, record.exact)) throw fixPromptAltered();
       if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
           !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
+        // Past the worker's deadline for this send the worker may have ended the leg (a tab frozen
+        // in any pre-send stage, background.js presendWatchdog): never send then.
+        if (presendDeadlinePassed()) {
+          if (typeof savePresendStallHtml === "function") savePresendStallHtml("presend_deadline");
+          throw presendStalled("presend_deadline");
+        }
         record.phase = "attempted";
         record.attemptedAt = Date.now();
         saveSubmission(record); // durable intent BEFORE invoking the site's handler
@@ -1253,6 +1256,16 @@ async function waitUntilComposer(deadline = Date.now() + 3 * 60 * 1000, guard) {
     if (Date.now() >= deadline) throw presendStalled("composer");
     await waitForPageChange(1000);
   }
+}
+
+/** Whether the worker's deadline for this run's send (json.js stores it from the run message) has
+ * passed. No deadline recorded (an older worker, unreadable storage): never. */
+function presendDeadlinePassed() {
+  try {
+    const state = globalThis.__ashlarRunnerState;
+    const deadline = Number(sessionStorage.getItem(`ashlar:presendDeadline:${state?.jobId}:${state?.runId}`));
+    return Number.isFinite(deadline) && deadline > 0 && Date.now() > deadline;
+  } catch { return false; }
 }
 
 function presendStalled(stage) {

@@ -963,14 +963,15 @@ export async function fetchPullHeadRef(
 }
 
 /** The top-level inline comments of ONE posted review — the finding threads the loop replies to.
- * Paginated; throws on a page error (a partial list would silently skip replies). */
+ * Reads the PR-wide comments endpoint because GitHub's review-specific endpoint omits later thread
+ * replies. Paginated; throws on a page error (a partial list would silently skip replies). */
 export async function listReviewThreadRoots(
   token: string,
   owner: string,
   repo: string,
   pr: number,
   reviewId: number,
-): Promise<Array<{ id: number; path: string; line?: number; body: string }>> {
+): Promise<Array<{ id: number; path: string; line?: number; body: string; replied: boolean }>> {
   const rows = await ghListAll<{
     id?: number;
     path?: string | null;
@@ -978,14 +979,21 @@ export async function listReviewThreadRoots(
     original_line?: number | null;
     body?: string | null;
     in_reply_to_id?: number | null;
-  }>(token, `/repos/${owner}/${repo}/pulls/${pr}/reviews/${reviewId}/comments`);
+    pull_request_review_id?: number | null;
+  }>(token, `/repos/${owner}/${repo}/pulls/${pr}/comments`);
   return rows
-    .filter((c) => Number.isFinite(c.id) && !c.in_reply_to_id)
+    .filter((c) => Number.isFinite(c.id) && !c.in_reply_to_id && c.pull_request_review_id === reviewId)
     .map((c) => {
       // The thread key is the line the comment was POSTED on (original_line): `line` follows later
       // commits (a fix inserting a line above moves it) and goes null once outdated.
       const line = c.original_line ?? c.line;
-      return { id: Number(c.id), path: String(c.path ?? ""), ...(Number.isFinite(line) ? { line: Number(line) } : {}), body: String(c.body ?? "") };
+      return {
+        id: Number(c.id),
+        path: String(c.path ?? ""),
+        ...(Number.isFinite(line) ? { line: Number(line) } : {}),
+        body: String(c.body ?? ""),
+        replied: rows.some((reply) => reply.in_reply_to_id === c.id),
+      };
     });
 }
 
@@ -1072,4 +1080,3 @@ export async function reactOnDelivery(
     throw new Error(`reaction ${content} ${out.status}: ${out.text}`);
   }
 }
-

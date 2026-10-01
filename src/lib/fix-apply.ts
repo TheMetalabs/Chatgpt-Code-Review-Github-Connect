@@ -188,7 +188,7 @@ export interface FixCanary {
   blobSha: string;
 }
 
-export type DispositionAction = "fixed" | "pushback" | "decline" | "defer";
+export type DispositionAction = "fixed" | "pushback" | "decline" | "defer" | "human";
 
 /** The agent's verdict on one finding (by its prompt ID "F<n>"), for the in-thread reply. */
 export interface FixDisposition {
@@ -224,7 +224,7 @@ export function fixReplyCanary(raw: string): FixCanary | undefined {
   return json ? canaryOf((JSON.parse(json) as { canary?: unknown }).canary) : undefined;
 }
 
-const DISPOSITION_ACTIONS: readonly DispositionAction[] = ["fixed", "pushback", "decline", "defer"];
+const DISPOSITION_ACTIONS: readonly DispositionAction[] = ["fixed", "pushback", "decline", "defer", "human"];
 const FINDING_ID_RE = /^F[1-9]\d{0,3}$/;
 const NOTE_MAX = 1000;
 
@@ -417,6 +417,8 @@ export function parseFixResponse(raw: string, opts: { findingCount?: number } = 
   if (!newFiles.ok) return newFiles;
   const both = newFiles.files.map((f) => f.path).filter((p) => edits.edits.some((e) => e.path === p));
   if (both.length) return { ok: false, error: `path both edited and created: ${both.join(", ")}` };
+  const human = dispositions.filter((d) => d.action === "human").map((d) => d.finding);
+  if (human.length) return { ok: false, error: `human-required disposition cannot include edits/newFiles (${human.join(", ")})` };
   const totalBytes =
     newFiles.files.reduce((n, f) => n + Buffer.byteLength(f.content, "utf8"), 0) + edits.edits.reduce((n, e) => n + Buffer.byteLength(e.replace, "utf8"), 0);
   if (totalBytes > MAX_TOTAL_BYTES) {

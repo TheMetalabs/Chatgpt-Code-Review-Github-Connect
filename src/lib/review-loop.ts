@@ -125,6 +125,7 @@ export type EscalateReason =
   // requested loop can stop maps to exactly one fixed reason — never to free text.
   | "fix-failed"
   | "fix-declined"
+  | "human-required"
   | "loop-error";
 
 const REASONS: readonly EscalateReason[] = [
@@ -137,6 +138,7 @@ const REASONS: readonly EscalateReason[] = [
   "round-cap",
   "fix-failed",
   "fix-declined",
+  "human-required",
   "loop-error",
 ];
 
@@ -164,6 +166,8 @@ export const ESCALATE_DIRECTIVE: Record<EscalateReason, string> = {
     "The fix agent could not produce an applicable fix within its retries (see Detail). Fix these findings manually, or resolve the cause and re-run the loop.",
   "fix-declined":
     "The fix agent changed nothing: it pushed back on, declined or deferred every finding (see Detail). Adjudicate each one — accept the push-back and resolve the thread, or fix it manually.",
+  "human-required":
+    "The fix agent found a product-contract or architectural decision it cannot make safely. Decide the direction, then start a new explicit review-loop round; no code was auto-applied.",
   "loop-error":
     "The loop could not run a fix round on this PR (see Detail), e.g. apply on a fork, no editable changed files, a missing snapshot or unreadable loop history. Resolve the cause, then re-run the loop.",
 };
@@ -340,6 +344,7 @@ export function isSelfLogin(login: string | null | undefined, botLogin: string =
 export const REVIEW_LOOP_CONTINUE_HUMAN = "Ashlar review-loop continues — requesting the next review";
 export const REVIEW_LOOP_FIXING_HUMAN = "Ashlar review-loop — fix round in progress";
 export const REVIEW_LOOP_START_HUMAN = "Ashlar review-loop start recorded";
+export const REVIEW_LOOP_ROUND_READY_HUMAN = "Ashlar review-loop round ready — findings addressed";
 
 // ── Recorded loop start (the durable start event) ───────────────────────────────
 // WHY: human comment bodies and the PR body are MUTABLE — rebuilding a session from their
@@ -481,6 +486,44 @@ export function canonicalContinuation(body: string | null | undefined, source: C
   let canonical: string;
   try {
     canonical = continueComment(parsed);
+  } catch {
+    return null;
+  }
+  return String(body ?? "").replace(/\s+$/, "") === canonical ? parsed : null;
+}
+
+export interface LoopRoundReady {
+  round: number;
+  pr: number;
+  head: string;
+}
+
+const ROUND_READY_MARKER_RE =
+  /^\s*<!--\s*ashlar-loop-round-ready\s+round=(\d{1,4})\s+pr=(\d{1,9})\s+head=([0-9a-f]{40})\s*-->/;
+
+export function roundReadyMarker(c: LoopRoundReady): string {
+  return `<!-- ashlar-loop-round-ready round=${c.round} pr=${c.pr} head=${c.head} -->`;
+}
+
+/** The durable fence written after every finding thread has a reply and a page-safe audit has
+ * confirmed those replies. A continuation may be repaired from this marker after a process crash. */
+export function roundReadyComment(c: LoopRoundReady): string {
+  if (!Number.isInteger(c.round) || c.round < 1 || c.round > MAX_CONTINUE_ROUND ||
+    !Number.isInteger(c.pr) || c.pr < 1 || c.pr > MAX_CONTINUE_PR || !FULL_SHA_RE.test(c.head)) {
+    throw new Error(`invalid loop round-ready (round=${c.round} pr=${c.pr} head=${c.head})`);
+  }
+  return `${roundReadyMarker(c)}\n\n${REVIEW_LOOP_ROUND_READY_HUMAN} (round ${c.round} on \`${c.head.slice(0, 7)}\`).`;
+}
+
+export function parseRoundReadyMarker(body: string | null | undefined, source: CommentSource): LoopRoundReady | null {
+  if (!source.authoredByBot) return null;
+  const m = ROUND_READY_MARKER_RE.exec(body || "");
+  if (!m) return null;
+  const parsed = { round: Number(m[1]), pr: Number(m[2]), head: m[3] };
+  if (parsed.round < 1 || parsed.round > MAX_CONTINUE_ROUND || parsed.pr < 1 || parsed.pr > MAX_CONTINUE_PR) return null;
+  let canonical: string;
+  try {
+    canonical = roundReadyComment(parsed);
   } catch {
     return null;
   }

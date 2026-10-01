@@ -234,6 +234,17 @@ describe("runFixRound", () => {
     assert.equal(f.committed, false);
   });
 
+  it("stops for a human architectural decision without committing", async () => {
+    const f = fakeApi();
+    const res = await runFixRound(
+      { requestFix: async () => '{"summary":"retry contract needs an owner decision","edits":[],"newFiles":[],"dispositions":[{"finding":"F1","action":"human","note":"choose the contract in src/a.ts:10"}]}', api: f.api, validate: async () => ({ ok: true }) },
+      { ...base, mode: "apply", findingCount: 1 },
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.outcome, "human-required");
+    assert.equal(f.committed, false);
+  });
+
   it("J4: a throwing validator returns validation-failed, not an unhandled rejection", async () => {
     const f = fakeApi();
     const res = await runFixRound(
@@ -263,7 +274,7 @@ describe("buildFixPrompt dispositions contract", () => {
   it("asks for one disposition per finding ID and shows it in the output schema", () => {
     const p = buildFixPrompt({ findings: "[F1] [P1] a.ts:1 — x", files: [{ path: "a.ts", content: "x" }] });
     assert.match(p, /For EVERY finding ID below \(F1, F2, …\) add one "dispositions" entry/);
-    assert.match(p, /"dispositions": \[ \{ "finding": "F1", "action": "fixed\|pushback\|decline\|defer"/);
+    assert.match(p, /"dispositions": \[ \{ "finding": "F1", "action": "fixed\|pushback\|decline\|defer\|human"/);
   });
 });
 
@@ -352,4 +363,3 @@ describe("buildFixPrompt PR scope (#457)", () => {
     assert.ok(!buildFixPrompt({ findings: "f", files: [{ path: "a.ts", content: "x" }] }).includes("PR scope section (from"));
   });
 });
-

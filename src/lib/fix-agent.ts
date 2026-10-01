@@ -48,10 +48,10 @@ export interface FixRoundResult {
   summary?: string;
   /** Set in apply mode on a successful push. */
   commitSha?: string;
-  /** The agent's per-finding verdicts (advisory; drive the in-thread replies). */
+  /** The agent's per-finding verdicts; drive thread replies and may require a human gate. */
   dispositions?: FixDisposition[];
   /** How the round ended, for logs / the loop driver. */
-  outcome: "applied" | "suggested" | "no-change" | "parse-failed" | "commit-failed" | "scope-violation" | "request-failed" | "validation-failed";
+  outcome: "applied" | "suggested" | "no-change" | "human-required" | "parse-failed" | "commit-failed" | "scope-violation" | "request-failed" | "validation-failed";
   error?: string;
 }
 
@@ -102,7 +102,7 @@ export function fixRules(source: "inline" | "github"): string[] {
     "   (scope/tenant/permission leak, data loss/corruption, security, crash) must be fixed whatever",
     "   the tag; behavior-class (stale state, wrong endpoint, error-handling gap) is fixed unless",
     "   provably intended; mechanical/cosmetic (doc-sync, naming, fixture drift) is folded in",
-    "   alongside the other fixes, never a round of its own.",
+    "   alongside fixes; human: product/architecture choice, no code.",
     // [A] Fix recipe 1 · [C] The Loop 3 ("verify, do not perform agreement"; Push back = "finding is
     // wrong/over-stated", Defer rows) + Pitfalls (stale commit). The test-assertion clause is stated
     // by neither skill; minimal statement after aicc #455 (cedfb476 deleted an assertion to fit a finding).
@@ -122,7 +122,7 @@ export function fixRules(source: "inline" | "github"): string[] {
     ...(source === "inline" ? RULE_4_INLINE : RULE_4_GITHUB),
     // Output contract · [C] The Loop 7 (one reply per finding, census on the originating finding).
     "5. For EVERY finding ID below (F1, F2, …) add one \"dispositions\" entry: action fixed |",
-    "   pushback | decline | defer, and a one-sentence note — what you changed (with the census",
+    "   pushback | decline | defer | human, and a one-sentence note — what you changed (with the census",
     "   entry points covered), or the evidence / reason you did not. It is posted as the reply in",
     "   that finding's review thread.",
     // [A] Fix recipe 3 · [C] The Loop 3c.
@@ -179,7 +179,7 @@ export function fixRules(source: "inline" | "github"): string[] {
 }
 
 export const FIX_SCHEMA_INLINE =
-  '{ "summary": "<what you changed and why>", "edits": [ { "path": "<one of the paths above>", "search": "<exact unique lines of the current file>", "replace": "<their new text>" } ], "newFiles": [ { "path": "<a path above that does not exist yet>", "content": "<full file>" } ], "dispositions": [ { "finding": "F1", "action": "fixed|pushback|decline|defer", "note": "<one sentence>" } ] }';
+  '{ "summary": "<what you changed and why>", "edits": [ { "path": "<one of the paths above>", "search": "<exact unique lines of the current file>", "replace": "<their new text>" } ], "newFiles": [ { "path": "<a path above that does not exist yet>", "content": "<full file>" } ], "dispositions": [ { "finding": "F1", "action": "fixed|pushback|decline|defer|human", "note": "<one sentence>" } ] }';
 
 /** Cap on read-only reference files attached to a fix prompt (imported helpers for pushback evidence). */
 export const FIX_REFERENCE_FILE_CAP = 16;
@@ -324,6 +324,13 @@ export async function runFixRound(
     return unparsedReply(raw, parsed.error);
   }
   const { summary, dispositions } = parsed.fix;
+
+  // A human-gated disposition is a terminal handoff, never a partial auto-fix. The parser already
+  // rejects it when edits/newFiles are present; keeping the decision here explicit prevents future
+  // callers from accidentally treating it as an ordinary no-change pushback.
+  if (dispositions.some((d) => d.action === "human")) {
+    return { ok: true, outcome: "human-required", files: [], summary, dispositions };
+  }
 
   // A valid no-change round (every finding pushed-back / declined / deferred): nothing to commit.
   if (parsed.fix.edits.length === 0 && parsed.fix.newFiles.length === 0) {

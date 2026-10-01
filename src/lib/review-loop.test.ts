@@ -33,6 +33,8 @@ import {
   continueMarker,
   parseContinueMarker,
   canonicalContinuation,
+  parseRoundReadyMarker,
+  roundReadyComment,
   MAX_CONTINUE_ROUND,
   MAX_CONTINUE_PR,
   REVIEW_LOOP_CONTINUE_HUMAN,
@@ -480,6 +482,17 @@ describe("canonicalContinuation (the only bot comment that may trigger)", () => 
 
   it("neutralizeMarkers defangs every comment delimiter", () => {
     assert.equal(neutralizeMarkers("a <!-- x --> b"), "a &lt;!-- x --&gt; b");
+  });
+});
+
+describe("round-ready fence", () => {
+  const c = { round: 2, pr: 7, head: "a".repeat(40) };
+  it("round-trips only as a canonical bot-authored comment", () => {
+    const body = roundReadyComment(c);
+    assert.deepEqual(parseRoundReadyMarker(body, { authoredByBot: true }), c);
+    assert.deepEqual(parseRoundReadyMarker(`${body}\n`, { authoredByBot: true }), c);
+    assert.equal(parseRoundReadyMarker(body, { authoredByBot: false }), null);
+    assert.equal(parseRoundReadyMarker(`${body}\nextra`, { authoredByBot: true }), null);
   });
 });
 

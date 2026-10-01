@@ -190,9 +190,9 @@ test('the ChatGPT submission log records each admission (kind, temporary chat) a
 
 // Live aicc #539/#602 (2026-10-01/02): legs sat in send_waiting 57-70+ min holding a ChatGPT slot; Chrome
 // had frozen their background tabs and the poll skipped them as frozen. The worker ends a leg whose tab is
-// still frozen 10 min after dispatch with no send seen (the page's own send deadline is 8 min).
-for(const [name,{ago,sent,frozen=true}] of [['frozen 11 min after dispatch: ended',{ago:11}],['frozen 6 min after dispatch: still waits',{ago:6}],
- ['not frozen 11 min after dispatch: the page answers for itself',{ago:11,frozen:false}],['frozen 11 min, but it sent: not a pre-send stall',{ago:11,sent:true}]]){
+// still frozen 17 min after dispatch with no send seen (the page's own send deadline is 15 min).
+for(const [name,{ago,sent,frozen=true}] of [['frozen 18 min after dispatch: ended',{ago:18}],['frozen 12 min after dispatch: still waits',{ago:12}],
+ ['not frozen 18 min after dispatch: the page answers for itself',{ago:18,frozen:false}],['frozen 18 min, but it sent: not a pre-send stall',{ago:18,sent:true}]]){
  test(`presend watchdog: ${name}`,async()=>{
   const at=Date.now()-ago*60_000;
   const pageEvents=[{source:'page',sequence:1,at:at+1000,stage:'prompt_prepared'},{source:'page',sequence:2,at:at+2000,stage:'send_waiting'},
@@ -203,12 +203,12 @@ for(const [name,{ago,sent,frozen=true}] of [['frozen 11 min after dispatch: ende
    api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'busy'})});
   await ticks(b,2);
   const failed=b.calls.find(c=>c.action==='failure'&&c.jobId==='A');
-  if(ago>=10&&!sent&&frozen)assert.match(failed?.error||'',/^presend_stalled: the tab was frozen in "send_waiting" for 11 min after dispatch, before its send; nothing was sent/);
+  if(ago>=17&&!sent&&frozen)assert.match(failed?.error||'',/^presend_stalled: the tab was frozen in "send_waiting" for 18 min after dispatch, before its send; nothing was sent/);
   else assert.equal(failed,undefined,JSON.stringify(failed));
  });
 }
 
-test('the run message carries the send deadline, 8 min after the first dispatch',async()=>{
+test('the run message carries the send deadline, 15 min after the first dispatch',async()=>{
  const offers=[offer('A')];const runs=[];
  const api=async(_p,body)=>body?.action==='take'?{ok:true,job:offers.shift()??null}:{ok:true,prompt:'p'};
  const b=background({local:storage({origin:'http://bridge',token:'token',chatgptPacing:{maxInFlight:2,gapMs:0}}),api,
@@ -217,5 +217,5 @@ test('the run message carries the send deadline, 8 min after the first dispatch'
  const dispatched=b.local.state.pendingReviewJobs.A.states.chatgpt.runDispatchedAt;
  assert.ok(Number.isFinite(dispatched));
  assert.ok(runs.length>=1);
- assert.equal(runs[0].presendDeadline,dispatched+8*60_000);
+ assert.equal(runs[0].presendDeadline,dispatched+15*60_000);
 });

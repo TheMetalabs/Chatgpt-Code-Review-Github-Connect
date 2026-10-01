@@ -658,8 +658,10 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
  * dispatch: past it the page never clicks Send (composer.js presendDeadlinePassed), whatever stage it
  * slept in. The worker ends a leg whose tab Chrome still reports frozen PRESEND_WATCHDOG_MS after
  * dispatch with no send seen: strictly after that deadline, so a page that wakes later cannot send. */
-const PAGE_PRESEND_MS = 8 * 60_000;
-const PRESEND_WATCHDOG_MS = 10 * 60_000;
+// Above the sum of the page's own pre-send bounds (overlays 1 + composer 3 + reasoning 1 + upload 3 +
+// send 3 = 11 min), so a slow but healthy run is never fenced at its click.
+const PAGE_PRESEND_MS = 15 * 60_000;
+const PRESEND_WATCHDOG_MS = 17 * 60_000;
 
 /** Why the worker ends a leg whose frozen tab never sent ("" while it may wait). */
 function presendWatchdog(state, tab, now = Date.now()) {

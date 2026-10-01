@@ -258,18 +258,18 @@ for(const [name,{loggedOut}={}] of [['Send never clickable: presend_stalled afte
  });
 }
 
-// The page side: the run message carries the worker's deadline for its send (8 min after dispatch). A page
+// The page side: the run message carries the worker's deadline for its send (15 min after dispatch). A page
 // frozen past it (in any pre-send stage) wakes with Send ready and never clicks it; before it, it does.
 for(const [name,{late}] of [['past the deadline: never sends',{late:true}],['before the deadline: sends',{late:false}]]){
  test(`presend deadline (${name})`,async t=>{
   const tab=await chatTab(t);
   await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=true;});
   const now=await tab.page.evaluate(()=>Date.now());
-  await tab.send('ashlar-run',{prompt:ENVELOPE,reasoning:'extra_high',allocationUrl:URL_,presendDeadline:now+8*MIN});
+  await tab.send('ashlar-run',{prompt:ENVELOPE,reasoning:'extra_high',allocationUrl:URL_,presendDeadline:now+15*MIN});
   await tab.page.clock.runFor(10_000);
   assert.ok((await tab.steps()).includes('send_waiting'));
   // Frozen: the clock jumps with no timer run in between, then Send is ready when the page wakes.
-  await tab.page.clock.setSystemTime(now+(late?9:1)*MIN);
+  await tab.page.clock.setSystemTime(now+(late?16:1)*MIN);
   await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=false;});
   await tab.page.clock.runFor(2_000);
   const r=await tab.runner();

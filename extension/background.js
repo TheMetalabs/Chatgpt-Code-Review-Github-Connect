@@ -652,6 +652,27 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
     logouts: logouts.slice(-5)};
 }
 
+/** Pre-send deadlines (live aicc #539/#602, 2026-10-01/02: legs sat in send_waiting 57-70+ min
+ * holding a ChatGPT slot; Chrome had frozen their background tabs, so no page timer ran and the poll
+ * skipped them as frozen). The run message carries a deadline for its send, PAGE_PRESEND_MS after
+ * dispatch: past it the page never clicks Send (composer.js presendDeadlinePassed), whatever stage it
+ * slept in. The worker ends a leg whose tab Chrome still reports frozen PRESEND_WATCHDOG_MS after
+ * dispatch with no send seen: strictly after that deadline, so a page that wakes later cannot send. */
+// Above the sum of the page's own pre-send bounds (overlays 1 + composer 3 + reasoning 1 + upload 3 +
+// send 3 = 11 min), so a slow but healthy run is never fenced at its click.
+const PAGE_PRESEND_MS = 15 * 60_000;
+const PRESEND_WATCHDOG_MS = 17 * 60_000;
+
+/** Why the worker ends a leg whose frozen tab never sent ("" while it may wait). */
+function presendWatchdog(state, tab, now = Date.now()) {
+  if (tab?.frozen !== true || !Number.isFinite(state.runDispatchedAt)) return "";
+  const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
+  if (events.some(e => ["send_attempted", "prompt_submitted", "send_unconfirmed", "submission_persisted"].includes(e.stage))) return "";
+  if (now - state.runDispatchedAt < PRESEND_WATCHDOG_MS) return "";
+  const last = events.at(-1)?.stage || "no page step";
+  return `the tab was frozen in "${last}" for ${Math.round((now - state.runDispatchedAt) / 60_000)} min after dispatch, before its send; nothing was sent`;
+}
+
 /** A provider answered a job admitted after its logout: the login is back, and admission leaves
  * probe mode. A job sent before the logout proves nothing about the session now. */
 async function clearLoginProbe(provider, job) {
@@ -784,7 +805,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.60";
+const WORKER_BUILD = "1.1.61";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2179,6 +2200,16 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     return wakeOrFailDiscardedTab(job, provider, jobs, tab);
   }
   if (tab.status && tab.status !== "complete") return;
+  const stalled = presendWatchdog(state, tab);
+  if (stalled) {
+    // The worker's own bound on a frozen page that never sent: the leg ends and its slot is free;
+    // the tab is left to the cleanup policy, and the page never sends after its deadline
+    // (PAGE_PRESEND_MS, carried in the run message).
+    state.outcome = failure("presend_stalled", stalled);
+    workerStep(job, provider, "presend_watchdog");
+    await saveJobs(jobs);
+    return;
+  }
   // A page loaded again after a discard is not yet proof that the run goes on: the time limit holds
   // until a reply proves it (discardedRunProven, below).
   if (!allowedTab(tab, provider)) {
@@ -2213,7 +2244,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       // a page starts a run only while the worker that sent it still waits for the reply.
       const replyWindow = pageWindow();
       if (replyWindow < MIN_DISPATCH_WINDOW_MS) return;
-      result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS}, contentFiles(provider));
+      state.runDispatchedAt ??= Date.now();
+      result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS,
+        presendDeadline: state.runDispatchedAt + PAGE_PRESEND_MS}, contentFiles(provider));
       // A page that refused the new run bound nothing: the run was never started.
       if (!refusedRun(result, job, provider)) {
         dispatched = true;

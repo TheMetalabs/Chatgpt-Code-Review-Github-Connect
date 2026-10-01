@@ -236,7 +236,12 @@ export function cancelHarborJob(jobId: string) {
 function transitionJob(jobId: string, next: (j: Job) => Job): Job | undefined {
   const before = state.jobs.find((j) => j.id === jobId);
   if (!before) return undefined;
-  const after = next(before);
+  let after = next(before);
+  // A job that ended is generating nothing: a stale flag kept its local lane "waiting for local model
+  // (position N)" after a cancel had already freed the queue (live #602 job-mupxbgja-1003).
+  if (isLive(before.status) && !isLive(after.status) && after.generating && Object.values(after.generating).some(Boolean)) {
+    after = { ...after, generating: Object.fromEntries(Object.keys(after.generating).map((k) => [k, false])) };
+  }
   state = { ...state, jobs: state.jobs.map((j) => (j.id === jobId ? after : j)) };
   // Cleanup before the history write: the edge is crossed once, so it runs whatever the write does.
   if (isLive(before.status) && !isLive(after.status)) releaseJob(after, "terminal");
@@ -1044,6 +1049,7 @@ async function generateLocalLeg(
   if (mode === "multiturn" && sample) {
     return runLocalReviewLoop(sample, state.settings, {
       signal,
+      log: (line) => console.info(`[local] ${jobId} ${line.replace(/\s+/g, " ").slice(0, 300)}`),
       // The multi-turn loop's edge over the one-shot chat legs: it can pull ANY file at the PR head
       // on demand (an imported helper/entity in an unchanged module the snapshot never captured) to
       // verify a semantic assumption before reporting. Bounded per leg (see makeHeadReader).
@@ -1975,7 +1981,7 @@ export function ingestGitHubWebhook(opts: {
   deliveryId: string;
   event: string;
   payload: unknown;
-}): HarborFireResult & { pong?: boolean; ignored?: string } {
+}): HarborFireResult & { pong?: boolean; ignored?: string; cancelled?: string[] } {
   const parsed = parseGitHubPayload(opts.event, opts.payload, state.settings, { botLogin: ashlarBotLogin() });
   const t0 = performance.now();
 
@@ -2027,6 +2033,28 @@ export function ingestGitHubWebhook(opts: {
     noteDeliveryHistory(ev);
     state = { ...state, events: trim([ev, ...state.events]) };
     return { httpStatus: 202, queued: false, pong: true };
+  }
+
+  if (parsed.kind === "closed") {
+    const why = `pull request ${parsed.merged ? "merged" : "closed"}`;
+    const live = state.jobs.filter((j) => j.owner === parsed.owner && j.repo === parsed.repo && j.pr === parsed.pr && isLive(j.status));
+    for (const j of live) {
+      cancelLocalJsonRepairs("superseded", j.id);
+      transitionJob(j.id, (cur) => (isLive(cur.status) ? { ...cur, status: "cancelled", skipReason: `cancelled: ${why}`, updatedAt: Date.now() } : cur));
+    }
+    const ev: WebhookLog = {
+      id: nid("ev"),
+      deliveryId: opts.deliveryId,
+      event: opts.event,
+      action: "closed",
+      hmac: "ok",
+      httpStatus: 202,
+      at: Date.now(),
+      summary: `${parsed.owner}/${parsed.repo}#${parsed.pr} ${why}: ${live.length} live job(s) cancelled`,
+    };
+    noteDeliveryHistory(ev);
+    state = { ...state, events: trim([ev, ...state.events]) };
+    return { httpStatus: 202, queued: false, cancelled: live.map((j) => j.id) };
   }
 
   if (parsed.kind === "ignore") {

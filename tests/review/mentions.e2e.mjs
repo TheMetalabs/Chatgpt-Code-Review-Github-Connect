@@ -393,3 +393,20 @@ test('an ops write whose token expired retries with a fresh token; the terminal 
   await eventually(()=>/Status:\*\* skipped/.test(app.ops.filter(b=>b.includes(job.id)).at(-1)||''),
     `ops comment not terminal: ${app.ops.filter(b=>b.includes(job.id)).at(-1)}`);
 });
+
+// Live #602: the PR was merged at 19:39Z while its job still held a local-model queue position. A closed
+// PR (merged or not) cancels its live jobs; a cancelled job also stops reading as "generating".
+test('a closed or merged PR cancels its live jobs and frees them; other PRs are untouched',async t=>{
+  const app=await fixture(t,{pull:{draft:false}});
+  const out=await deliver(app,'issue_comment',comment());
+  const job=await settled(app,out.jobId);
+  assert.equal(job.status,'awaiting_chat');
+  app.harbor.getHarbor().jobs.find(j=>j.id===job.id).generating={chatgpt:true,local:true};
+  const closed=await deliver(app,'pull_request',pr('closed','',{}),'delivery-closed');
+  assert.equal(closed.status,202);
+  const after=app.harbor.getHarbor().jobs.find(j=>j.id===job.id);
+  assert.deepEqual([after.status,after.skipReason],['cancelled','cancelled: pull request closed']);
+  assert.deepEqual(JSON.parse(JSON.stringify(after.generating)),{chatgpt:false,local:false},'an ended job generates nothing');
+  const other=await deliver(app,'pull_request',{...pr('closed'),pull_request:{...pr('closed').pull_request,number:9999,merged:true}},'delivery-other');
+  assert.equal(other.status,202);
+});

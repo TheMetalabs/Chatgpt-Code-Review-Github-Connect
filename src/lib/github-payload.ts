@@ -13,6 +13,8 @@ const PR_ACTIONS: Record<string, Trigger> = {
 export type ParsedDelivery =
   | { ok: true; kind: "ping" }
   | { ok: true; kind: "ignore"; reason: string }
+  /** The PR was closed (merged or not): its live jobs are cancelled (harbor.server.ts). */
+  | { ok: true; kind: "closed"; owner: string; repo: string; pr: number; merged: boolean }
   | {
       ok: true;
       kind: "review";
@@ -109,6 +111,11 @@ export function parseGitHubPayload(
     // directive it is not a command either (same invariant as comments). Its pushes
     // (synchronize) still parse as lifecycle events below.
     const bodyRequest = !selfAuthored && (bodyMention || freshLoop != null);
+    // A closed PR (merged or not) needs no review any more: its live jobs are cancelled, so they stop
+    // holding a ChatGPT slot or a local-model queue position (live #602: merged, its job still queued).
+    if (body.action === "closed" && repo && pr?.number) {
+      return { ok: true, kind: "closed", owner: repo.owner, repo: repo.repo, pr: pr.number, merged: Boolean((pr as { merged?: boolean }).merged) };
+    }
     const trigger: Trigger | undefined = bodyRequest ? "pull_request.body_mention" : PR_ACTIONS[body.action ?? ""];
     if (!trigger) return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"}; no new body mention)` };
     if (!repo || !pr?.number || !pr.head?.sha) return { ok: false, reason: "pull_request missing repo or head" };

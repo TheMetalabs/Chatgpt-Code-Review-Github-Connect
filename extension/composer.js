@@ -1182,6 +1182,12 @@ async function clickSend(findSend, findComposer, expectedText) {
       if (fix && drafted && !composerHoldsFix(editor, record.exact)) throw fixPromptAltered();
       if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
           !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
+        // Past the worker's deadline for this send the worker may have ended the leg (a tab frozen
+        // in any pre-send stage, background.js presendWatchdog): never send then.
+        if (presendDeadlinePassed()) {
+          if (typeof savePresendStallHtml === "function") savePresendStallHtml("presend_deadline");
+          throw presendStalled("presend_deadline");
+        }
         record.phase = "attempted";
         record.attemptedAt = Date.now();
         saveSubmission(record); // durable intent BEFORE invoking the site's handler
@@ -1250,6 +1256,16 @@ async function waitUntilComposer(deadline = Date.now() + 3 * 60 * 1000, guard) {
     if (Date.now() >= deadline) throw presendStalled("composer");
     await waitForPageChange(1000);
   }
+}
+
+/** Whether the worker's deadline for this run's send (json.js stores it from the run message) has
+ * passed. No deadline recorded (an older worker, unreadable storage): never. */
+function presendDeadlinePassed() {
+  try {
+    const state = globalThis.__ashlarRunnerState;
+    const deadline = Number(sessionStorage.getItem(`ashlar:presendDeadline:${state?.jobId}:${state?.runId}`));
+    return Number.isFinite(deadline) && deadline > 0 && Date.now() > deadline;
+  } catch { return false; }
 }
 
 function presendStalled(stage) {

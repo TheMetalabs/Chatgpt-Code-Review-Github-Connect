@@ -30,7 +30,7 @@ race.
 | --- | --- | --- | --- | --- |
 | `verify` | verifier, round not started, 0 findings, no raw | (not posted: local verification round starts) | — | — |
 | `findings` | any structured finding | summary mark | `total=N inline=… body=… p0 p1 p2` | no |
-| `raw` | a reply posted verbatim as evidence, none of it local verification's own in full (in a verification round: + note) | summary mark | `total=1 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` | no |
+| `raw` | a reply posted verbatim as evidence, none of it local verification's own in full (in a verification round: + note) | summary mark | `total=0 inline=0 body=1 raw=1 p0=0 p1=0 p2=0` (raw evidence is not a structured finding: read `raw=1`, never `total`) | no |
 | `raw-unverified` | verification round, local's own reply is in the raw block in full (`rawCauses.local`, not in `rawTruncated`): it could not be used as a review (below) | summary mark + note | raw marker + ` unverified=1` | no |
 | `incomplete` | 0 findings, no raw, a reviewer was skipped (`skippedProviders`) or returned no complete verdict (`incompleteProviders`) | summary mark (+ note in a verification round: agreed / did not complete) | `<!-- ashlar-outcome incomplete -->`, its own fixed marker: never an `ashlar-findings` one (an external poller reads that prefix anywhere as a count, total=0 as converged); loop reconstruction reads it as the end of the session owing a `loop-error` handoff ([review-loop-design.md §3](review-loop-design.md)) | no |
 | `clean` | not a verifier, 0 findings, nothing skipped, every reviewer's payload a complete verdict | `Didn't find any major issues.` | `total=0 …` | **yes** |

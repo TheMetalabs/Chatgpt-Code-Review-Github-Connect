@@ -53,6 +53,7 @@ import {
   parseEscalateMarker,
   parseStartMarker,
   parseStopRecord,
+  roundReadyComment,
   REVIEW_LOOP_STOPPED_HUMAN,
   startComment,
 } from "./review-loop.ts";
@@ -405,6 +406,10 @@ class World {
     this.ref = { owner: "o", repo: "r", pr };
     const { via } = cell;
     if (this.sameSecond()) this.clock = T0 + 250; // a sub-second clock: attempts are not on a second boundary
+    // The applied-round joiner represents a push whose post-commit phase already passed the
+    // durable thread-reply audit. Seed that fence before the anchor so lagging replicas still show
+    // the prerequisite to the bot-push readiness gate.
+    if (via === "continue:applied") this.store(BOT, roundReadyComment({ round: 1, pr, head: NEW_SHA }), iso(T0 - 1_000));
     if (kindOf(via) !== "start" && cell.anchor === "listed") this.store(BOT, startComment({ mode: this.mode(), by: "alice", at: ALICE_AT }), ALICE_AT);
     const rounds = via === "handoff:stuck" ? [5, 4, 3, 2, 2, 2] : [3];
     rounds.forEach((total, i) => this.reviews.push({ head: i === rounds.length - 1 ? HEAD : String(i).repeat(40), total, at: reviewDay(i) }));

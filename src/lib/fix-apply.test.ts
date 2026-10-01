@@ -229,6 +229,15 @@ describe("dispositions (advisory per-finding verdicts for the thread replies)", 
     if (none.ok) assert.equal(none.fix.dispositions[0].action, "pushback");
   });
 
+  it("accepts a human gate without edits but rejects a mixed human gate and code change", () => {
+    const gated = parseFixResponse('{"summary":"architecture decision required","edits":[],"newFiles":[],"dispositions":[{"finding":"F1","action":"human","note":"choose the retry contract in src/a.ts:10"}]}', { findingCount: 1 });
+    assert.ok(gated.ok);
+    if (gated.ok) assert.equal(gated.fix.dispositions[0].action, "human");
+    const mixed = parseFixResponse('{"summary":"decision required","edits":[{"path":"src/a.ts","search":"const a = 1;","replace":"const a = 2;"}],"newFiles":[],"dispositions":[{"finding":"F1","action":"human","note":"choose the contract"}]}');
+    assert.equal(mixed.ok, false);
+    if (!mixed.ok) assert.match(mixed.error, /human-required disposition cannot include edits/);
+  });
+
   it("malformed entries are DROPPED, never a parse failure (they cannot gate a push)", () => {
     assert.deepEqual(parseDispositions("nope"), []);
     assert.deepEqual(

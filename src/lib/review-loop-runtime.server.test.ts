@@ -2,7 +2,7 @@ import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { recentFixRawAnswers } from "./fix-raw-archive.server.ts";
 import { DEFAULT_SETTINGS, type BotSettings, type FixAgentSettings, type Finding, type Job, type ReviewProvider, type SamplePr } from "./types.ts";
-import { continueComment, fixingComment, parseContinueMarker, parseStartMarker, parseStopRecord, startComment, STOPPED_MARKER, stoppedComment, type NotCleanOutcome } from "./review-loop.ts";
+import { continueComment, fixingComment, parseContinueMarker, parseRoundReadyMarker, parseStartMarker, parseStopRecord, roundReadyComment, startComment, STOPPED_MARKER, stoppedComment, type NotCleanOutcome } from "./review-loop.ts";
 import { escalateNow, readLoopSession } from "./review-loop-engine.server.ts";
 import { watchFixRequest } from "./fix-request-watch.ts";
 import { buildFixPrompt } from "./fix-agent.ts";
@@ -156,6 +156,8 @@ function fakeDeps(
     replyFails?: boolean;
     replyFailures?: number; // the first N thread-reply POSTs fail (transient)
     listThreadsFails?: boolean; // listReviewThreadRoots throws (a failed page)
+    roundReady?: boolean; // seed a durable round-ready fence for an App-authored push repair
+    readyHead?: string;
     reviews?: Array<{ body: string; commitId: string; submittedAt: string }>; // extra durable bot reviews
   } = {},
 ) {
@@ -170,13 +172,14 @@ function fakeDeps(
   let clock = 0;
   let laggedHeadReads = 0;
   const start = opts.start === undefined ? "suggest" : opts.start;
+  const rounds = opts.rounds ?? [];
+  const lastHead = opts.lastHead ?? HEAD;
   const issues: IssueRow[] = [
     ...(start ? [recorded(start, "alice", START_AT)] : []),
+    ...(opts.roundReady ? [{ userLogin: BOT, body: roundReadyComment({ round: 1, pr: 7, head: opts.readyHead ?? lastHead }), createdAt: "2026-01-01T00:00:00Z" }] : []),
     ...(opts.issues ?? []),
   ];
   const stop = () => issues.push({ userLogin: "alice", body: "/review-loop stop", createdAt: "2026-01-31T00:00:00Z" });
-  const rounds = opts.rounds ?? [];
-  const lastHead = opts.lastHead ?? HEAD;
   const replies = Array.isArray(opts.reply)
     ? opts.reply
     : [opts.reply ?? '{"summary":"guard removed","edits":[{"path":"src/a.ts","search":"export const a = 1;","replace":"export const a = 2;"}]}'];
@@ -232,7 +235,7 @@ function fakeDeps(
       },
       async listReviewThreadRoots() {
         if (opts.listThreadsFails) throw new Error("review comments page 2 failed (502)");
-        return opts.threads ?? [];
+        return (opts.threads ?? []).map((thread) => ({ ...thread, replied: threadReplies.some((reply) => reply.id === thread.id) }));
       },
       async replyToReviewComment(_t, _o, _r, _pr, id, body) {
         replyAttempts += 1;
@@ -474,7 +477,7 @@ describe("the loop is OFF unless Settings enable it (no other path turns it on)"
     assert.equal(posts("lib/review-loop-control.ts").length, 1, "emitControl's one POST");
     const runtime = posts("lib/review-loop-runtime.server.ts");
     assert.ok(runtime.length > 0);
-    for (const l of runtime) assert.match(l, /body: (fixingComment|renderFixReport)\(/, `a control marker posted around the gate: ${l.trim()}`);
+    for (const l of runtime) assert.match(l, /body: (fixingComment|roundReadyComment|renderFixReport)\(/, `a control marker posted around the gate: ${l.trim()}`);
   });
 
   it("every loop entry point is inert without the Settings switch or without a provider: no GitHub or provider call", async () => {
@@ -940,12 +943,13 @@ describe("runPostReviewLoop: termination contract (every stop is CONVERGED, ESCA
     const r = await run(f, "apply");
     assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.commitSha === NEW_SHA && r.continued === true);
     assert.equal(f.committed, true);
-    // progress signal, then the control signal, then the report that states what happened
+    // progress signal, then the durable round-ready fence, the control signal, and the report
     assert.ok(f.posted[0].startsWith("<!-- ashlar-loop-fixing round=1 pr=7 "));
-    assert.deepEqual(parseContinueMarker(f.posted[1], { authoredByBot: true }), { mode: "apply", round: 2, pr: 7, head: NEW_SHA });
-    assert.ok(f.posted[2].startsWith("### Ashlar fix agent — applied"));
-    assert.ok(f.posted[2].includes(NEW_SHA));
-    assert.match(f.posted[2], /Loop continues/);
+    assert.deepEqual(parseRoundReadyMarker(f.posted[1], { authoredByBot: true }), { round: 1, pr: 7, head: NEW_SHA });
+    assert.deepEqual(parseContinueMarker(f.posted[2], { authoredByBot: true }), { mode: "apply", round: 2, pr: 7, head: NEW_SHA });
+    assert.ok(f.posted[3].startsWith("### Ashlar fix agent — applied"));
+    assert.ok(f.posted[3].includes(NEW_SHA));
+    assert.match(f.posted[3], /Loop continues/);
     assert.ok(!f.posted.some((b) => /@ashlar/i.test(b)), "no bot @-mention posted");
   });
 
@@ -1720,7 +1724,7 @@ describe("continueLoopOnPush (a push continues an active session)", () => {
 
   it("the App's own push repairs a missing continuation (a crash after the commit) and never duplicates one", async () => {
     const pushed = "b".repeat(40);
-    const f = fakeDeps({ start: "apply", rounds: [3], liveSha: pushed });
+    const f = fakeDeps({ start: "apply", rounds: [3], liveSha: pushed, roundReady: true, readyHead: pushed });
     const own = push({ actor: BOT, headSha: pushed });
     assert.deepEqual(await continueLoopOnPush("t", own, settings("apply"), f.deps, ENV), { posted: true, reason: "continued" });
     assert.deepEqual(await continueLoopOnPush("t", own, settings("apply"), f.deps, ENV), { posted: false, reason: "already continued" });
@@ -2400,6 +2404,21 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     assert.equal(f.replies[1].body, "Deferred by the Ashlar fix agent (round 1): tracked in #88");
   });
 
+  it("a human-required disposition hands off without a commit or continuation", async () => {
+    const f = fakeDeps({
+      start: "apply",
+      rounds: [2],
+      threads,
+      reply: withDispositions("[]", '[{"finding":"F1","action":"human","note":"choose the retry contract in src/a.ts:10"},{"finding":"F2","action":"human","note":"choose the API contract in src/a.ts:20"}]'),
+    });
+    const r = await runWith(f, "apply");
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "human-required");
+    assert.equal(f.committed, false);
+    assert.equal(f.posted.some((body) => body.includes("ashlar-loop-continue")), false);
+    assert.equal(f.replies.length, 2);
+    assert.ok(f.posted.some((body) => body.startsWith("### Ashlar fix agent — human review required")));
+  });
+
   it("suggest never replies (nothing landed); a posted finding with no live thread is a failed reply", async () => {
     const s1 = fakeDeps({ rounds: [2], threads });
     await runWith(s1, "suggest");
@@ -2411,11 +2430,10 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     assert.match(a.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "", /Thread replies: 1 posted, 1 failed\./);
   });
 
-  it("a failed reply is counted in the report and never fails the round", async () => {
+  it("a failed reply with no durable audit is a loop-error handoff, so the next review is withheld", async () => {
     const f = fakeDeps({ start: "apply", rounds: [2], threads, replyFails: true });
     const r = await runWith(f, "apply");
-    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.continued === true);
-    // posted[0] is the continuation (the control signal comes first); the report follows
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error");
     const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
     assert.match(report, /Thread replies: 0 posted, 2 failed\./);
     assert.equal(f.replyAttempts, 2, "an uncertain reply failure is never retried (it may already exist)");
@@ -2429,10 +2447,10 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     assert.ok(!/Thread replies:/.test(f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? ""), "no failure left to report");
   });
 
-  it("an unreadable thread list never fails the round: every reply is counted as failed", async () => {
+  it("an unreadable thread list with no durable audit is a loop-error handoff", async () => {
     const f = fakeDeps({ start: "apply", rounds: [2], threads, listThreadsFails: true });
     const r = await runWith(f, "apply");
-    assert.ok(r.ran && r.step === "fix" && r.outcome === "applied" && r.continued === true);
+    assert.ok(r.ran && r.step === "escalated" && r.reason === "loop-error");
     assert.equal(f.replies.length, 0);
     const report = f.posted.find((b) => b.startsWith("### Ashlar fix agent — applied")) ?? "";
     assert.match(report, /Thread replies: 0 posted, 2 failed\./);
@@ -2454,7 +2472,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     const r = await runWith(f, "apply");
     assert.ok(r.ran && r.step === "escalated" && r.reason === "fix-declined");
     assert.deepEqual(handoffsAtReply, [1, 1]);
-    // committed, but the next review cannot be requested → the loop-error handoff first, too
+    // committed, but thread replies are attempted before the continuation failure is handed off
     const g = fakeDeps({ start: "apply", rounds: [2], threads, failContinuation: true });
     const seen: number[] = [];
     const reply2 = g.deps.gh.replyToReviewComment;
@@ -2464,7 +2482,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     };
     const r2 = await runWith(g, "apply");
     assert.ok(r2.ran && r2.step === "escalated" && r2.reason === "loop-error", JSON.stringify(r2));
-    assert.deepEqual(seen, [1, 1]);
+    assert.deepEqual(seen, [0, 0]);
   });
 
   it("a handoff that did not land marks no thread addressed: no replies, no report", async () => {
@@ -2478,7 +2496,7 @@ describe("per-finding thread replies (design §5 step 6: each finding thread get
     const r2 = await runWith(committed, "apply");
     assert.equal(r2.ran, false);assert.match(r2.ran ? "" : r2.reason, /ESCALATE loop-error failed to post/);
     assert.equal(committed.committed, true);
-    assert.equal(committed.replies.length, 0);
+    assert.equal(committed.replies.length, 2);
     assert.equal(committed.posted.some((b) => b.startsWith("### Ashlar fix agent")), false);
   });
 

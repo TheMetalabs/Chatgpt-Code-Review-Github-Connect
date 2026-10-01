@@ -101,6 +101,8 @@ import {
   isSelfLogin,
   MAX_CONTINUE_ROUND,
   newestLoopComment,
+  parseRoundReadyMarker,
+  roundReadyComment,
   resolveBotLogin,
   sanitizeUntrusted,
   startComment,
@@ -591,6 +593,7 @@ const ACTION_LABEL: Record<FixDisposition["action"], string> = {
   pushback: "Pushed back",
   decline: "Declined",
   defer: "Deferred",
+  human: "Human review required",
 };
 
 /** One fixed-format reply per finding. `commitSha` is set when this round's commit landed. */
@@ -615,7 +618,7 @@ function duplicateIds(ids: readonly string[]): Set<string> {
 }
 
 /** A review thread's root comment: its file, line and body key the finding it was posted for. */
-export type ThreadRoot = { id: number; path: string; line?: number; body: string };
+export type ThreadRoot = { id: number; path: string; line?: number; body: string; replied?: boolean };
 
 const threadKey = (path: string, line: number | undefined, body: string) => JSON.stringify([path, line ?? null, body]);
 
@@ -845,6 +848,8 @@ function renderFixReport(
       return `### Ashlar fix agent — suggestion (mode: ${mode}${tries})\n\n${summary}\n\nProposed changes (not pushed):\n${files}\n\nApply them and push — the loop continues on your push (use apply mode to auto-commit).`;
     case "no-change":
       return `### Ashlar fix agent — no change\n\n${summary || "All findings were pushed back / declined / deferred."}${threads}`;
+    case "human-required":
+      return `### Ashlar fix agent — human review required\n\n${summary || "A product-contract or architectural decision is required before code can be changed."}${threads}`;
     default:
       return `### Ashlar fix agent — ${res.outcome}\n\n${sanitizeModelText(res.error, { oneLine: true, max: 500 })}`;
   }
@@ -1538,6 +1543,26 @@ export async function runPostReviewLoop(
       }
       return tally;
     };
+    /** Verify the durable state after posting replies. A continuation is unsafe until every
+     * finding from this review maps to a live root and GitHub shows at least one reply on it. */
+    const auditThreadReplies = async (): Promise<{ ok: true } | { ok: false; error: string }> => {
+      if (!posted?.githubId || posted.comments.length === 0) return { ok: true };
+      let roots: ThreadRoot[];
+      try {
+        roots = await withRetry(() => gh.listReviewThreadRoots(token, owner, repo, pr, posted.githubId!));
+      } catch (e) {
+        return { ok: false, error: `could not re-read finding threads after replies: ${(e as Error)?.message ?? String(e)}` };
+      }
+      const mapped = mapFindingThreads(posted.comments, roots);
+      if (mapped.unroutable > 0 || mapped.threads.size !== posted.comments.length) {
+        return { ok: false, error: `${mapped.unroutable || posted.comments.length - mapped.threads.size} finding thread(s) could not be mapped after replies` };
+      }
+      const byId = new Map(roots.map((root) => [root.id, root]));
+      const unreplied = [...mapped.threads.values()].filter((id) => byId.get(id)?.replied !== true);
+      return unreplied.length === 0
+        ? { ok: true }
+        : { ok: false, error: `${unreplied.length} finding thread(s) still have no durable reply` };
+    };
     const maxAttempts = fixKnob(settings.fixAgent, "attempts");
     const deps2 = d;
     // The provider call runs under the watcher: the deadline excludes queue time, and a queued (or
@@ -1633,9 +1658,8 @@ export async function runPostReviewLoop(
     }
 
     // 3) POST-COMMIT PHASE — the branch already moved, so from here every handoff names the NEW
-    //    head. Order: the continuation (the control signal) FIRST, then the report, whose last
-    //    line states what actually happened; a failure to continue is a loop-error handoff. An
-    //    operator stop that landed meanwhile means no continuation at all.
+    //    head. Replies and a page-safe audit come before the durable round-ready fence; only then
+    //    may the continuation be posted. A crash after the fence is repaired by continueLoopOnPush.
     const afterCommit = async (done: FixRoundResult, tries: number): Promise<LoopStepResult> => {
       const newHead = done.commitSha && FULL_SHA_RE.test(done.commitSha) ? done.commitSha : undefined;
       // Our own commit moved the head, so only the SESSION decides here (an unreadable one does
@@ -1644,34 +1668,50 @@ export async function runPostReviewLoop(
       // (GitHub syncs a PR's head after the ref update: `parent`, see freshMoot).
       const now = await sessionOf(gh, token, ref, newHead ? { ...head, sha: newHead } : head, botLogin).catch(() => null);
       const gone = now ? sessionMoot(gh, ref, now, current) : null;
-      let status: ContinuationStatus;
+      let status: ContinuationStatus = { ok: false, error: "the post-commit round has not been made ready" };
       let owed: LoopStepResult | undefined; // the handoff a not-clean review that ended the session owes
+      let handoff: LoopStepResult | undefined;
+
+      // The commit landed: every posted finding thread gets its disposition before any next-review
+      // signal. This ordering is the durable 0-UNADDRESSED gate.
+      const replies = await replyToThreads(done.dispositions, newHead ?? done.commitSha);
+      const failHandoff = async (detail: string, liveHead: string): Promise<boolean> => {
+        handoff = await escalate("loop-error", detail, liveHead);
+        return handedOff(handoff);
+      };
       if (gone) {
         status = { ok: false, ended: gone };
         if (now?.owedHandoff) owed = await settleOwed(now.owedHandoff);
       } else if (!newHead) {
         status = { ok: false, error: "the commit sha was not returned" };
+        if (!(await failHandoff("the commit sha was not returned", headSha))) return handoff!;
       } else {
-        // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
-        // budget — the round-cap handoff.
-        const c = await ensureContinuation(ctl, gh, ref, { head: newHead, parent: headSha, mode, session: current, round: rounds.length + 1 });
-        if (c.status === "unknown") trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
-        status = continuationStatus(c);
+        const audit = await auditThreadReplies();
+        if (!audit.ok) {
+          status = { ok: false, error: audit.error };
+          if (!(await failHandoff(`the fix was committed but continuation was withheld: ${audit.error}`, newHead))) return handoff!;
+        } else {
+          try {
+            await gh.createIssueComment(token, { owner, repo, pr, body: roundReadyComment({ round: Math.max(1, rounds.length), pr, head: newHead }) });
+          } catch (e) {
+            status = { ok: false, error: `could not post the round-ready fence: ${(e as Error)?.message ?? String(e)}` };
+            if (!(await failHandoff(`the fix was committed but the round-ready fence could not be posted: ${status.error}`, newHead))) return handoff!;
+          }
+          if (!handoff) {
+            // ALWAYS continue: the next review is CONVERGED, the next fix round, or — past the
+            // budget — the round-cap handoff.
+            const c = await ensureContinuation(ctl, gh, ref, { head: newHead, parent: headSha, mode, session: current, round: rounds.length + 1 });
+            if (c.status === "unknown") trace(job.id, "continuation-unknown", { head: newHead.slice(0, 7), error: c.error });
+            status = continuationStatus(c);
+          }
+        }
       }
-      // The fixed signal (continuation above, or this handoff) goes out BEFORE the informational
-      // replies and report: those are up to maxInlineComments slow calls that must never delay
-      // the signal, or lose it to a crash midway.
-      let handoff: LoopStepResult | undefined;
-      if (!status.ok && !("ended" in status) && !("unknown" in status)) {
+      if (!status.ok && !("ended" in status) && !("unknown" in status) && !handoff) {
         const live = newHead ?? (await gh.fetchPullHeadRef(token, owner, repo, pr).then((h) => h.sha).catch(() => headSha));
-        handoff = await escalate("loop-error", `the fix was committed but the next review could not be requested: ${status.error}`, live);
-        // No signal landed: mark no thread addressed (a later step or a human picks the session up).
-        if (!handedOff(handoff)) return handoff;
+        if (!(await failHandoff(`the fix was committed but the next review could not be requested: ${status.error}`, live))) return handoff!;
       }
-      // The commit landed: every posted finding thread gets its disposition (addressed).
-      const replies = await replyToThreads(done.dispositions, newHead ?? done.commitSha);
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(done, mode, tries, status, replies) }).catch(() => {
-        /* the report is informational; the continuation / handoff carries the signal */
+        /* the report is informational; the ready fence / handoff carries the signal */
       });
       if (handoff) return handoff;
       // The owed handoff's own result when it landed or failed (a failure is logged); an existing one
@@ -1689,6 +1729,15 @@ export async function runPostReviewLoop(
     if (res.outcome === "suggested") {
       await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts) });
       return { ran: true, step: "fix", outcome: res.outcome, continued: false, attempts };
+    }
+    if (res.outcome === "human-required") {
+      const handoff = await escalate("human-required", `human review required: ${sanitizeModelText(res.summary ?? "the fix agent needs an architectural or product-contract decision", { oneLine: true, max: 500 })}`);
+      if (!handedOff(handoff)) return handoff;
+      const replies = await replyToThreads(res.dispositions);
+      await gh.createIssueComment(token, { owner, repo, pr, body: renderFixReport(res, mode, attempts, undefined, replies) }).catch(() => {
+        /* informational; the human-required handoff carries the signal */
+      });
+      return handoff;
     }
     if (res.outcome === "no-change") {
       // The handoff (the fixed signal) first; then each thread gets the agent's push-back /
@@ -1775,6 +1824,23 @@ export async function continueLoopOnPush(
       const outcome = handoff.escalated ? "handoff posted" : handoff.ambiguous ? "handoff outcome unknown" : handoff.error ? `handoff failed: ${handoff.error}` : "handoff already posted";
       const unresolved = handoff.ambiguous || handoff.superseded === "handoff-unknown";
       return { posted: false, reason: `${endedNotClean(owed)}; ${outcome}`, ...(unresolved ? { unresolved: true as const } : {}) };
+    }
+    // A bot-authored push is normally the fix commit. It may only repair a missing continuation
+    // after the post-commit phase has durably replied to every finding. Without this fence a push
+    // webhook could bypass the 0-UNADDRESSED audit during a crash or a reordered delivery.
+    if (isSelfLogin(push.actor, botLogin)) {
+      let ready = false;
+      try {
+        const comments = await d.gh.listIssueComments(token, push.owner, push.repo, push.pr);
+        ready = comments.some((row) => {
+          if (!isSelfLogin(row.userLogin, botLogin)) return false;
+          const marker = parseRoundReadyMarker(row.body, { authoredByBot: true });
+          return marker?.pr === push.pr && marker.head === push.headSha;
+        });
+      } catch (e) {
+        return { posted: false, reason: `continue on push failed: could not verify round readiness (${(e as Error)?.message ?? String(e)})` };
+      }
+      if (!ready) return { posted: false, reason: "waiting for round replies audit" };
     }
     const since = sessionRef(session);
     const c = await ensureContinuation(controlCtx(d, token, botLogin), d.gh, push, { head: push.headSha, mode: session.mode ?? "suggest", session: since, extra: moved });

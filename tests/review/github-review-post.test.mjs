@@ -61,7 +61,7 @@ test('createPullReview: inlineDropped is false when every inline comment was acc
   assert.deepEqual(idAndDrop(await none.api.createPullReview('t', review([]))), { id: 8, inlineDropped: false });
 });
 
-test('listReviewThreadRoots keys each root by the line it was posted on (original_line) and drops replies', async () => {
+test('listReviewThreadRoots filters one review, keys original lines, and reports durable replies', async () => {
   const api = loadTs('src/lib/github.server.ts', {
     ...loadTs('src/lib/github-transport.ts', { TLSSocket }),
     ...loadTs('src/lib/review-diff.ts'),
@@ -73,11 +73,12 @@ test('listReviewThreadRoots keys each root by the line it was posted on (origina
         const response = new EventEmitter(); response.statusCode = 200;
         callback(response);
         response.emit('data', Buffer.from(JSON.stringify([
-          { id: 1, path: 'a.ts', line: 3, original_line: 3, body: 'A' },
-          { id: 2, path: 'a.ts', line: null, original_line: 9, body: 'B' },
-          { id: 5, path: 'a.ts', line: 10, original_line: 9, body: 'C' },
+          { id: 1, pull_request_review_id: 55, path: 'a.ts', line: 3, original_line: 3, body: 'A' },
+          { id: 2, pull_request_review_id: 55, path: 'a.ts', line: null, original_line: 9, body: 'B' },
+          { id: 5, pull_request_review_id: 55, path: 'a.ts', line: 10, original_line: 9, body: 'C' },
           { id: 3, path: 'a.ts', line: 3, body: 'reply', in_reply_to_id: 1 },
-          { id: 4, path: 'a.ts', body: 'no line' },
+          { id: 4, pull_request_review_id: 55, path: 'a.ts', body: 'no line' },
+          { id: 6, pull_request_review_id: 99, path: 'other.ts', line: 1, body: 'other review' },
         ])));
         response.emit('end');
       });
@@ -86,10 +87,10 @@ test('listReviewThreadRoots keys each root by the line it was posted on (origina
   });
   const roots = await api.listReviewThreadRoots('t', 'o', 'r', 1, 55);
   assert.deepEqual([...roots].map((r) => ({ ...r })), [
-    { id: 1, path: 'a.ts', line: 3, body: 'A' },
-    { id: 2, path: 'a.ts', line: 9, body: 'B' },
-    { id: 5, path: 'a.ts', line: 9, body: 'C' },
-    { id: 4, path: 'a.ts', body: 'no line' },
+    { id: 1, path: 'a.ts', line: 3, body: 'A', replied: true },
+    { id: 2, path: 'a.ts', line: 9, body: 'B', replied: false },
+    { id: 5, path: 'a.ts', line: 9, body: 'C', replied: false },
+    { id: 4, path: 'a.ts', body: 'no line', replied: false },
   ]);
 });
 

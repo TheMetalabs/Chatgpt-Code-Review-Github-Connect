@@ -292,6 +292,8 @@ export interface BotSettings {
   localLlmBaseUrl: string;
   localLlmApiKey: string;
   localLlmModel: string;
+  /** Comma/newline-separated model aliases tried after the primary model returns HTTP 429. */
+  localLlmModelPriority: string;
   /** Completion-token budget for a local generation; must clear a reasoning model's thinking + JSON. */
   localReviewMaxTokens: number;
   /** "single" = one-shot prompt; "multiturn" = SDK tool loop; "auto" = pick by PR size. */
@@ -440,6 +442,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localLlmBaseUrl: "http://127.0.0.1:11434/v1",
   localLlmApiKey: "",
   localLlmModel: "",
+  localLlmModelPriority: "",
   localReviewMaxTokens: 32_768,
   localReviewMode: "auto",
   localReviewRole: "race",

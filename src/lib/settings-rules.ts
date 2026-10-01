@@ -372,6 +372,7 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   localLlmBaseUrl: text("local_llm.base_url"),
   localLlmApiKey: text("local_llm.api_key"),
   localLlmModel: text("local_llm.model"),
+  localLlmModelPriority: text("local_llm.model_priority"),
   localReviewMaxTokens: int("localReviewMaxTokens"),
   localReviewMode: oneOf("local_review.mode", LOCAL_REVIEW_MODES),
   localReviewRole: oneOf("local_review.role", LOCAL_REVIEW_ROLES),

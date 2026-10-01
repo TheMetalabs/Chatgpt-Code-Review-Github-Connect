@@ -34,6 +34,13 @@ test('generation sends a completion budget and non-greedy sampling', async () =>
   assert.ok(body.max_tokens >= 8192, `max_tokens must clear thinking+JSON, got ${body.max_tokens}`);
   assert.ok(body.temperature > 0, 'temperature must be non-greedy to avoid repetition loops');
 });
+test('a pre-response 429 advances the local model alias for the same request', async () => {
+  const limited = Object.assign(new Error('rate limited'), {status: 429});
+  const settingsWithPriority = {...settings, localLlmModelPriority: 'fallback-model'};
+  const c = local([limited, 'prose', raw]);
+  assert.equal((await c.context.runLocalLlm('review', settingsWithPriority)).raw, raw);
+  assert.deepEqual(c.calls.map((call) => call[2].model), ['model', 'fallback-model', 'fallback-model']);
+});
 test('only completed non-JSON content gets one semantic retry', async () => {
   const c = local(['prose', raw]);
   assert.equal((await c.context.runLocalLlm('review', settings)).raw, raw);

@@ -5,6 +5,7 @@ import type {RepairRecord, RepairStatus} from "./json-repair-types.ts";
 import type {BotSettings} from "./types.ts";
 import type {ReviewHistoryStore} from "./review-history.server.ts";
 import {localModelLease, type LocalModelLease} from "./local-model-lease.ts";
+import {createLocalModelRouter, parseLocalModelPriority} from "./local-model-routing.server.ts";
 export type RepairInput = Pick<RepairRecord,"jobId"|"provider"|"runId"|"responseId"|"original"|"sourceHash"|"schema"|"headSha">;
 type Dependencies = {
   settings(): BotSettings;
@@ -150,8 +151,10 @@ export class JsonRepairService {
     // Thinking shares the completion budget (#87). Headroom 8192 (was 4096) leaves room for a
     // reasoning model to finish re-emitting the original; a length cut-off gets one bumped retry.
     const budget=(bumped:boolean)=>Math.max(SERVER_DEFAULT_BUDGET,Math.ceil(record.original.length/(bumped?1:2))+(bumped?16384:8192));
-    const send=(budgeted:boolean,bumped=false,includeNoThinking=true)=>(this.deps.request || requestLocalChat)(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
-      model:record.model,temperature:0,
+    const request = this.deps.request || requestLocalChat;
+    const route = createLocalModelRouter(parseLocalModelPriority(record.model, settings.localLlmModelPriority));
+    const send=(budgeted:boolean,bumped=false,includeNoThinking=true)=>route.run((model)=>request(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
+      model,temperature:0,
       // The candidate re-emits the whole original; without a budget omlx stops at its 8192-token
       // default, which includes the model's thinking (#87). A short original never gets less than it.
       ...(budgeted ? {max_tokens:budget(bumped)} : {}),
@@ -168,13 +171,13 @@ export class JsonRepairService {
         ].join("\n")},
         {role:"user",content:JSON.stringify({schema_version:REPAIR_SCHEMA_VERSION,kind:record.schema,target_schema:repairSchemaDefinition(record.schema),validation_errors:record.errors,original:record.original})},
       ],
-    },signal);
+    },signal));
     try {return await send(true);}
     catch(error){
       if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw error;
       // Retries need a still-running persisted record: status() may have moved it to accepted /
       // superseded while this request was in flight; never issue another inference after that.
-      const running=()=>{const cur=this.deps.history().getRepair(record.jobId,record.id);return Boolean(cur && cur.status==="running")?cur:null;};
+      const running=()=>{const cur=this.deps.history().getRepair(record.jobId,record.id);return cur && cur.status==="running"?cur:null;};
       let err: unknown = error;
       // vLLM/SGLang refuse prompt + max_tokens beyond the context window before generating anything.
       // Unbudgeted, they fill what is left: the request every repair sent before #87. Sent once only.

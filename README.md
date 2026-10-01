@@ -220,6 +220,15 @@ api_key   (없으면 아무 문자열)
 
 Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 
+CLIProxyAPI도 별도 Ashlar 어댑터 없이 사용할 수 있습니다. CLIProxyAPI의 OpenAI 호환 주소(기본
+`http://127.0.0.1:8317/v1`)를 `base_url`에 넣고, 프록시 설정에 등록한 첫 alias를 `model`에 넣습니다.
+Settings의 `local_llm.model_priority` 또는 `ASHLAR_LOCAL_LLM_MODEL_PRIORITY`에 나머지 alias를
+쉼표나 줄바꿈으로 적으면 됩니다. Ashlar는 각 논리 요청에서 primary부터 시도하고 **응답을 받기 전
+HTTP 429일 때만** 다음 alias로 같은 요청을 한 번 재시도합니다. 5xx, 네트워크 오류, 잘못된 JSON,
+정상 응답 뒤의 품질 문제는 자동으로 다른 모델에 넘기지 않아 중복 생성과 순서 뒤집힘을 막습니다.
+CLIProxyAPI 자체의 내부 재시도보다 이 우선순위를 먼저 적용하려면 프록시의 `routing.retry.request-retry`
+를 `0`으로 두세요.
+
 로컬 레그만 SDK/HTTP 전송이라 **멀티턴 툴 루프**를 돕니다. ChatGPT/Grok은 브라우저 탭이라 계속 1회성입니다.
 루프는 파일을 읽고(`file_read`), 다른 변경 파일 diff를 보고(`file_read_diff`), 검색(`code_search`)한 뒤
 지적을 근거와 함께 확정합니다. **다른 리뷰어를 막거나 교차 검수하지 않습니다** — 실패하면 기존처럼
@@ -245,6 +254,7 @@ Playground의 **Ask local LLM**으로 연결부터 확인하세요.
 | `ASHLAR_LOCAL_SHORT_JOBS_PER_CHECKPOINT` | 2 (최대 16) | 로컬 모델을 쥔 리뷰가 **턴 경계마다** 대기 중인 JSON repair(short lane)에 모델을 빌려주는 최대 개수. 한 checkpoint의 상한은 16이며, 빌려준 뒤 같은 리뷰가 다른 대기 잡보다 먼저 이어갑니다. 0=빌려주지 않음(repair는 리뷰 종료까지 대기) |
 | `localLeaseCapacity` / `ASHLAR_LOCAL_LEASE_CAPACITY` | 1 (최대 8) | 로컬 모델 리스를 동시에 쥘 수 있는 개수(리뷰·fix·JSON repair). 모델 서버 동시성(예: oMLX concurrent=3)에 맞춥니다. Settings에서 바꾸면 프로세스 전역 싱글톤이 재생성되지 않고 재설정됩니다. 올리면 대기자가 즉시 들어가고, 내리면 진행 중인 holder는 끊기지 않으며 자리가 날 때까지 신규 grant가 기다립니다 |
 | `ASHLAR_LOCAL_LLM_STREAM` | true | chat/completions 를 SSE 스트리밍으로 받아 토큰 단위 하트비트를 얻습니다. 응답은 비스트리밍 형태로 재조립되므로 동작은 같습니다. `false` 면 예전처럼 단일 JSON 응답(이 경우 큐/생성 구분·liveness 중단 없음) |
+| `localLlmModelPriority` / `ASHLAR_LOCAL_LLM_MODEL_PRIORITY` | 빈 값 | primary 뒤에 시도할 CLIProxyAPI/OpenAI 호환 모델 alias 목록. 쉼표/줄바꿈 구분, HTTP 429에서만 다음 alias로 이동 |
 
 로컬 레그는 `providerProgress.local`로 **하트비트 + 진행상황 신호**를 내보냅니다. 스트리밍 전송이
 서버의 응답 헤더·빈 keepalive 청크·토큰을 관찰해 레그를 네 상태로 구분합니다.

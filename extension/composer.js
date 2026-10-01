@@ -1135,6 +1135,9 @@ async function clickSend(findSend, findComposer, expectedText) {
   // ChatGPT ended the session, until their tabs were gone). A logged-out page ends it at once as
   // logged_out.
   const SEND_WAIT_MS = 3 * 60 * 1000;
+  // Past the worker's watchdog (background.js PRESEND_WATCHDOG_MS) the leg is already ended: a page
+  // whose timers were frozen and that wakes later never sends, even with Send ready.
+  const SEND_ABANDON_MS = 5 * 60 * 1000;
   let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null;
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
@@ -1171,7 +1174,7 @@ async function clickSend(findSend, findComposer, expectedText) {
       sendWaitSince = uploadBusy ? null : sendWaitSince ?? Date.now();
       // Only while Send is still not clickable this tick: a tab that slept past the bound with Send
       // ready clicks it instead.
-      if (!uploadBusy && !actionableSend(button) && Date.now() - sendWaitSince >= SEND_WAIT_MS) {
+      if (!uploadBusy && Date.now() - sendWaitSince >= (actionableSend(button) ? SEND_ABANDON_MS : SEND_WAIT_MS)) {
         if (typeof savePresendStallHtml === "function") savePresendStallHtml("send_waiting");
         throw presendStalled("send_waiting");
       }

@@ -187,3 +187,24 @@ test('the ChatGPT submission log records each admission (kind, temporary chat) a
  await b.context.recordWorkerStatus(b.local.state.pendingReviewJobs,'http://bridge');
  assert.equal(b.local.state.bridgeWorkerStatus.chatgptLog.sinceLogout.review,0,'counted from the logout');
 });
+
+// Live aicc #539/#602 (2026-10-01/02): legs sat in send_waiting 57-70+ min holding a ChatGPT slot; the
+// page's timers were frozen, so its own 3-min bound never ran. The worker ends a leg whose page went
+// silent in a pre-send stage for 5 min (presend_stalled), and leaves the tab to cleanup.
+for(const [name,{ago,sent,stage='send_waiting'}] of [['silent 6 min in send_waiting: ended',{ago:6}],['silent 2 min: still waits',{ago:2}],
+ ['silent 6 min after a send attempt: not a pre-send stall',{ago:6,sent:true}],['silent 6 min in attachments_waiting: ended',{ago:6,stage:'attachments_waiting'}]]){
+ test(`presend watchdog: ${name}`,async()=>{
+  const at=Date.now()-ago*60_000;
+  const pageEvents=[{source:'page',sequence:1,at:at-1000,stage:'prompt_prepared'},...(sent?[{source:'page',sequence:2,at:at-500,stage:'send_attempted'}]:[]),{source:'page',sequence:3,at,stage}];
+  const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:{tabId:10,started:true,runId:'run-A',pageEvents}}};
+  let asked=0;
+  const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+   tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete',active:false,frozen:true}]]),
+   api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>{asked++;return {ok:false,code:'busy'};}});
+  await ticks(b,2);
+  const failed=b.calls.find(c=>c.action==='failure'&&c.jobId==='A');
+  if(ago>=5&&!sent){
+   assert.match(failed?.error||'',new RegExp(`^presend_stalled: the page stopped reporting in "${stage}" for 6 min before its send \\(tab frozen, background\\); nothing was sent`));
+  } else assert.equal(failed,undefined,JSON.stringify(failed));
+ });
+}

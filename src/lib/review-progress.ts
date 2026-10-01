@@ -21,6 +21,7 @@ export const PROGRESS_LABELS = {
     reasoning_selecting: "Prompt not sent · selecting the reasoning level",
     reasoning_skipped: "Reasoning level could not be selected in time · continuing with the current model",
     presend_stalled: "A pre-send stage stalled past its bound · nothing was sent; run failed",
+    presend_watchdog: "The page stopped reporting before its send · the worker ended the leg; nothing was sent",
     logged_out: "ChatGPT is logged out in this Chrome profile · nothing was sent; log in and retry",
     attachments_waiting: "Prompt entered · waiting for named attachments to finish uploading",
     attachments_staged_via_a: "Attachments staged · the composer's file input took them (strategy a)",

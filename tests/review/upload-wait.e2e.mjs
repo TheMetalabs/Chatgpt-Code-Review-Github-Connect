@@ -257,3 +257,21 @@ for(const [name,{loggedOut}={}] of [['Send never clickable: presend_stalled afte
   if(!loggedOut)assert.match(r.error,/send_waiting/);
  });
 }
+
+// The page side of the watchdog: a page whose timers were frozen past the worker's 5-min watchdog
+// wakes with Send ready and never clicks it (the worker already ended the leg).
+test('send_waiting: a page that wakes past 5 min with Send ready never sends',async t=>{
+ const tab=await chatTab(t);
+ await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=true;});
+ await tab.start();
+ await tab.page.clock.runFor(10_000);
+ assert.ok((await tab.steps()).includes('send_waiting'));
+ // Frozen: the page's clock jumps 6 min with no timer run in between, and Send is ready when it wakes.
+ const now=await tab.page.evaluate(()=>Date.now());
+ await tab.page.clock.setSystemTime(now+6*MIN);
+ await tab.page.evaluate(()=>{document.getElementById('composer-submit-button').disabled=false;});
+ await tab.page.clock.runFor(2_000);
+ const r=await tab.runner();
+ assert.equal(r.code,'presend_stalled',JSON.stringify(r));
+ assert.equal((await tab.view()).sendClicks,0,'never sent after the watchdog');
+});

@@ -652,6 +652,27 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
     logouts: logouts.slice(-5)};
 }
 
+/** How long a leg's page may stay silent in a pre-send stage before the worker ends the leg (live
+ * aicc #539/#602, 2026-10-01/02: legs sat in send_waiting 57-70+ min holding a ChatGPT slot, their
+ * page timers frozen, so the page's own 3-min bounds never ran). Every pre-send wait the page bounds
+ * itself ends well inside it. */
+const PRESEND_WATCHDOG_MS = 5 * 60_000;
+const PRESEND_STAGES = new Set(["overlays_dismissing", "composer_waiting", "composer_ready", "reasoning_selecting", "reasoning_selected",
+  "reasoning_skipped", "attachments_preparing", "attachments_staged_via_a", "attachments_staged_via_b", "attachments_staged_via_c",
+  "attachments_staged_via_d", "prompt_prepared", "attachments_waiting", "send_waiting"]);
+
+/** Why the worker ends a leg whose page went silent before its send ("" while it may wait): its last
+ * page event is a pre-send stage, no send was attempted, and nothing came for PRESEND_WATCHDOG_MS.
+ * The reason names whether Chrome reported the tab frozen or hidden (the likely cause). */
+function presendWatchdog(state, tab, now = Date.now()) {
+  const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
+  const last = events.at(-1);
+  if (!last || !PRESEND_STAGES.has(last.stage) || events.some(e => e.stage === "send_attempted" || e.stage === "prompt_submitted")) return "";
+  if (now - Number(last.at || 0) < PRESEND_WATCHDOG_MS) return "";
+  const how = [tab?.frozen === true ? "frozen" : "", tab?.active === false ? "background" : ""].filter(Boolean).join(", ");
+  return `the page stopped reporting in "${last.stage}" for ${Math.round((now - last.at) / 60_000)} min before its send${how ? ` (tab ${how})` : ""}; nothing was sent`;
+}
+
 /** A provider answered a job admitted after its logout: the login is back, and admission leaves
  * probe mode. A job sent before the logout proves nothing about the session now. */
 async function clearLoginProbe(provider, job) {
@@ -784,7 +805,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.60";
+const WORKER_BUILD = "1.1.61";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2179,6 +2200,16 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     return wakeOrFailDiscardedTab(job, provider, jobs, tab);
   }
   if (tab.status && tab.status !== "complete") return;
+  const stalled = presendWatchdog(state, tab);
+  if (stalled) {
+    // The worker's own bound on a page that stopped reporting before its send: the leg ends and its
+    // slot is free; the tab is left to the cleanup policy, and the page itself never sends after
+    // this bound (composer.js SEND_ABANDON_MS).
+    state.outcome = failure("presend_stalled", stalled);
+    workerStep(job, provider, "presend_watchdog");
+    await saveJobs(jobs);
+    return;
+  }
   // A page loaded again after a discard is not yet proof that the run goes on: the time limit holds
   // until a reply proves it (discardedRunProven, below).
   if (!allowedTab(tab, provider)) {

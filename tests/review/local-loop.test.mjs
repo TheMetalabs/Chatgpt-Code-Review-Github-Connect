@@ -569,3 +569,15 @@ test("a review cancelled while its checkpoint lent the model stops before sendin
   assert.equal(bodies.length, 1, "no request after the checkpoint that saw the cancel");
   assert.equal(out.ok, false);
 });
+
+// Live aicc #608 (job-mupxcmvh-1026): the local leg failed in the second its lease was granted with
+// "local loop produced no review JSON" and nothing said why: every group's request threw, and the error
+// was dropped. The failure now carries the groups' errors, and they are logged.
+test("a leg whose every group request throws names the errors in its failure and logs them", async () => {
+  const logged = [];
+  const request = async () => { throw new Error("local LLM HTTP 400: This model's maximum context length is 32768 tokens"); };
+  const out = await runLocalReviewLoop(sampleWith(["src/a.ts"]), settings, { request, log: (l) => logged.push(l) });
+  assert.equal(out.ok, false);
+  assert.match(out.error, /^local loop produced no review JSON \(src\/a\.ts: local LLM HTTP 400: This model's maximum context length is 32768 tokens\)$/);
+  assert.ok(logged.some((l) => /group src\/a\.ts failed: local LLM HTTP 400/.test(l)), JSON.stringify(logged));
+});

@@ -589,6 +589,7 @@ export async function runLocalReviewLoop(
     // use): returned as unparsedText so a held leg posts it verbatim instead of dropping it.
     const unparsed: string[] = [];
     const residualReplies: string[] = [];
+    const groupErrors: string[] = [];
     let aborted = false;
     for (let i = 0; i < groups.length; i += 1) {
       if (deps.signal?.aborted) {
@@ -621,7 +622,9 @@ export async function runLocalReviewLoop(
           if (reply) unparsed.push(`Review group (${group.join(", ")}):\n${reply}`);
         }
       } catch (e) {
-        deps.log?.(`group ${group[0]} failed: ${e instanceof Error ? e.message : String(e)}`);
+        const message = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
+        deps.log?.(`group ${group[0]} failed: ${message}`);
+        groupErrors.push(`${group[0]}: ${message}`);
         failedGroups.push(group);
       }
     }
@@ -642,7 +645,10 @@ export async function runLocalReviewLoop(
         const named = /local review|ASHLAR_LOCAL_REVIEW/i.test(msg) ? msg.trim() : "";
         return { ok: false, error: named || "local review aborted before any group completed (deadline or cancellation)", ...evidence };
       }
-      return { ok: false, error: "local loop produced no review JSON", ...evidence };
+      // A group whose request threw left no reply: its error is the only evidence of why (live aicc
+      // #608: the leg failed in the second its lease was granted, and nothing said why).
+      const why = groupErrors.length ? ` (${groupErrors.slice(0, 3).join("; ")}${groupErrors.length > 3 ? `; +${groupErrors.length - 3} more` : ""})` : "";
+      return { ok: false, error: `local loop produced no review JSON${why}`, ...evidence };
     }
     const residual = residualReplies.length ? { residualReplies: residualReplies.join("\n\n---\n\n") } : {};
     return { ok: true, raw: mergeGroupResults(raws, failedGroups, unreviewablePaths(sample)), ...evidence, ...residual };

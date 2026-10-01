@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {background,content,flush,raw,source} from './helpers.mjs';
 import {bridgeHarness,job,loadTs,parser} from './load-source.mjs';
+import {createLocalModelRouter,parseLocalModelPriority} from '../../src/lib/local-model-routing.server.ts';
 
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};}
 
@@ -76,7 +77,7 @@ test('busy observation preserves non-JSON text under the matching PR/run and is 
 });
 test('Local review call waits for actual completion rather than an elapsed timeout signal',async()=>{
  const gate=deferred();let passedSignal;
- const local=loadTs('src/lib/local-llm.server.ts',{...parser,bridgePromptText,
+ const local=loadTs('src/lib/local-llm.server.ts',{...parser,bridgePromptText,createLocalModelRouter,parseLocalModelPriority,requestLocalJson:async()=>({}),
   requestLocalChat:async(...args)=>{passedSignal=args[3];return gate.promise;}});
  let done=false;const pending=local.runLocalLlm('review',{localLlmBaseUrl:'http://local/v1',localLlmApiKey:'key',localLlmModel:'model'}).then(result=>{done=true;return result;});
  await flush();assert.equal(done,false);assert.equal(passedSignal,undefined);

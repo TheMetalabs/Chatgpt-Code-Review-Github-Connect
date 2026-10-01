@@ -294,6 +294,8 @@ export interface BotSettings {
   localLlmModel: string;
   /** Comma/newline-separated model aliases tried after the primary model returns HTTP 429. */
   localLlmModelPriority: string;
+  /** Comma/newline-separated `model=duration` minimum request-start intervals. */
+  localLlmModelRateLimits: string;
   /** Completion-token budget for a local generation; must clear a reasoning model's thinking + JSON. */
   localReviewMaxTokens: number;
   /** "single" = one-shot prompt; "multiturn" = SDK tool loop; "auto" = pick by PR size. */
@@ -443,6 +445,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   localLlmApiKey: "",
   localLlmModel: "",
   localLlmModelPriority: "",
+  localLlmModelRateLimits: "",
   localReviewMaxTokens: 32_768,
   localReviewMode: "auto",
   localReviewRole: "race",

@@ -46,6 +46,8 @@ stages and step recording are unchanged.
 | --- | --- |
 | `src/lib/local-llm.server.ts` | the local reviewer entry (`runLocalLlm`, `pingLocalLlm`) |
 | `src/lib/local-model-routing.server.ts` | model alias priority and HTTP 429-only failover shared by local calls |
+| `src/lib/local-model-rate-limit.ts` | per-model request-start cooldown parser and process-wide gate shared by local calls |
+| `tests/review/local.test.mjs`, `tests/review/long-wait.test.mjs` | local-LLM VM fixtures inject the shared model router used by the production module |
 | `src/lib/local-chat-request.server.ts` | the native transport (add `max_tokens`, sampling, streaming) |
 | `src/lib/local-review-loop.server.ts` | **new** — the multi-turn tool loop |
 | `src/lib/local-fallback.ts` | local race/skip predicates (no chat semantics) |

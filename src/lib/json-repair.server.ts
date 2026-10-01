@@ -152,7 +152,11 @@ export class JsonRepairService {
     // reasoning model to finish re-emitting the original; a length cut-off gets one bumped retry.
     const budget=(bumped:boolean)=>Math.max(SERVER_DEFAULT_BUDGET,Math.ceil(record.original.length/(bumped?1:2))+(bumped?16384:8192));
     const request = this.deps.request || requestLocalChat;
-    const route = createLocalModelRouter(parseLocalModelPriority(record.model, settings.localLlmModelPriority));
+    const route = createLocalModelRouter(
+      parseLocalModelPriority(record.model, settings.localLlmModelPriority),
+      undefined,
+      { rateLimits: settings.localLlmModelRateLimits },
+    );
     const send=(budgeted:boolean,bumped=false,includeNoThinking=true)=>route.run((model)=>request(settings.localLlmBaseUrl.trim().replace(/\/$/,""),settings.localLlmApiKey.trim()||"local",{
       model,temperature:0,
       // The candidate re-emits the whole original; without a budget omlx stops at its 8192-token
@@ -171,7 +175,7 @@ export class JsonRepairService {
         ].join("\n")},
         {role:"user",content:JSON.stringify({schema_version:REPAIR_SCHEMA_VERSION,kind:record.schema,target_schema:repairSchemaDefinition(record.schema),validation_errors:record.errors,original:record.original})},
       ],
-    },signal));
+    },signal), signal);
     try {return await send(true);}
     catch(error){
       if(signal.aborted || this.fenced.has(record.id) || !localJsonRepairAvailable(this.deps.settings()) || !this.deps.isCurrent(record))throw error;

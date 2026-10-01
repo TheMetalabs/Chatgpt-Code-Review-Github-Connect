@@ -4,6 +4,14 @@ import {
   requestLocalJson,
   type LocalRequestOptions,
 } from "./local-chat-request.server.ts";
+import {
+  LocalModelRateLimiter,
+  localModelRateLimiter,
+  parseLocalModelRateLimits,
+  type ModelRateLimitMap,
+} from "./local-model-rate-limit.ts";
+
+export { LocalModelRateLimiter, modelRateLimitsProblem, parseLocalModelRateLimits } from "./local-model-rate-limit.ts";
 
 type ModelRequest<T> = (model: string) => Promise<T>;
 
@@ -27,9 +35,14 @@ export function parseLocalModelPriority(primary: string, configured: string | st
 export type LocalModelRouter = {
   currentModel: () => string;
   /** Run one logical request. A model is advanced only for a pre-response HTTP 429. */
-  run: <T>(request: ModelRequest<T>) => Promise<T>;
+  run: <T>(request: ModelRequest<T>, signal?: AbortSignal) => Promise<T>;
   /** JSON transport adapter used by the local review loop. */
   request: typeof requestLocalJson;
+};
+
+export type LocalModelRouterOptions = {
+  rateLimits?: string | ModelRateLimitMap;
+  limiter?: LocalModelRateLimiter;
 };
 
 export async function requestLocalChatWithModelFallback(
@@ -62,18 +75,27 @@ export async function requestLocalChatWithModelFallback(
 export function createLocalModelRouter(
   models: string[],
   requestJson: typeof requestLocalJson = requestLocalJson,
+  options: LocalModelRouterOptions = {},
 ): LocalModelRouter {
   const ordered = [...new Set(models.map((model) => model.trim()).filter(Boolean))];
+  const limiter = options.limiter ?? localModelRateLimiter();
+  limiter.configure(typeof options.rateLimits === "string"
+    ? parseLocalModelRateLimits(options.rateLimits)
+    : options.rateLimits ?? {});
   let index = 0;
 
-  const run = async <T>(request: ModelRequest<T>): Promise<T> => {
+  const run = async <T>(request: ModelRequest<T>, signal?: AbortSignal): Promise<T> => {
     while (true) {
+      const model = ordered[index] ?? "";
+      await limiter.wait(model, signal);
       try {
-        return await request(ordered[index] ?? "");
+        return await request(model);
       } catch (error) {
-        if (!isRateLimited(error) || index >= ordered.length - 1) {
+        if (!isRateLimited(error)) {
           throw error;
         }
+        limiter.noteRateLimit(model, error instanceof LocalChatHttpError ? error.retryAfterMs : undefined);
+        if (index >= ordered.length - 1) throw error;
         index += 1;
       }
     }
@@ -87,6 +109,6 @@ export function createLocalModelRouter(
         ? { ...(body as Record<string, unknown>), model }
         : body;
       return requestJson(baseURL, apiKey, path, routedBody, signal, opts);
-    }),
+    }, signal),
   };
 }

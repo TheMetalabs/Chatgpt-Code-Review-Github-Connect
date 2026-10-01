@@ -169,6 +169,22 @@ describe("sanitizeBotSettings", () => {
     }
   });
 
+  it("round-trips per-model local request intervals through Settings and env", () => {
+    assert.equal(DEFAULT_SETTINGS.localLlmModelRateLimits, "");
+    const configured = sanitizeBotSettings({ localLlmModelRateLimits: "qwen=60s\ngemini=0" });
+    assert.equal(configured.localLlmModelRateLimits, "qwen=60s\ngemini=0");
+    assert.equal(botSettingsToEnv(configured).ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS, "qwen=60s\ngemini=0");
+    const prev = process.env.ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS;
+    try {
+      process.env.ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS = "qwen=2s";
+      assert.equal(sanitizeBotSettings(overlayEnv({})).localLlmModelRateLimits, "qwen=2s");
+    } finally {
+      if (prev === undefined) delete process.env.ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS;
+      else process.env.ASHLAR_LOCAL_LLM_MODEL_RATE_LIMITS = prev;
+    }
+    assert.match(settingsProblem({ ...DEFAULT_SETTINGS, localLlmModelRateLimits: "qwen=bad" }) ?? "", /model rate limit/);
+  });
+
   it("never mirrors fixAgent into env: the settings JSON is its only durable store", () => {
     const s = sanitizeBotSettings({ fixAgent: { enabled: true, provider: "chatgpt", delivery: "chat-push", mode: "apply", parallelPrs: 4 } });
     const env = botSettingsToEnv(s);

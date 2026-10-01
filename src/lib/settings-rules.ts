@@ -42,6 +42,7 @@ import {
   type FixMode,
 } from "./types.ts";
 import { CHATGPT_REASONING, GROK_REASONING } from "./reasoning.ts";
+import { modelRateLimitsProblem } from "./local-model-rate-limit.ts";
 
 /** Per-provider facts every fix-agent decision reads (design §6b): the Settings rules, the loop
  * runtime's transport routing (productionRequestFix), and the fix watcher's deadlines
@@ -373,6 +374,7 @@ export const SETTINGS_FIELD_RULES: Readonly<Record<SettingsField, Rule>> = {
   localLlmApiKey: text("local_llm.api_key"),
   localLlmModel: text("local_llm.model"),
   localLlmModelPriority: text("local_llm.model_priority"),
+  localLlmModelRateLimits: (v) => modelRateLimitsProblem(v) ?? null,
   localReviewMaxTokens: int("localReviewMaxTokens"),
   localReviewMode: oneOf("local_review.mode", LOCAL_REVIEW_MODES),
   localReviewRole: oneOf("local_review.role", LOCAL_REVIEW_ROLES),

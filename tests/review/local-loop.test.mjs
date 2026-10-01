@@ -578,6 +578,7 @@ test("a leg whose every group request throws names the errors in its failure and
   const request = async () => { throw new Error("local LLM HTTP 400: This model's maximum context length is 32768 tokens"); };
   const out = await runLocalReviewLoop(sampleWith(["src/a.ts"]), settings, { request, log: (l) => logged.push(l) });
   assert.equal(out.ok, false);
-  assert.match(out.error, /^local loop produced no review JSON \(src\/a\.ts: local LLM HTTP 400: This model's maximum context length is 32768 tokens\)$/);
+  assert.match(out.error, /^local loop produced no review JSON \(src\/a\.ts: local LLM HTTP 400: This model's maximum context length is/);
+  assert.ok(out.error.length < 300, "bounded: it reaches GitHub-visible text");
   assert.ok(logged.some((l) => /group src\/a\.ts failed: local LLM HTTP 400/.test(l)), JSON.stringify(logged));
 });

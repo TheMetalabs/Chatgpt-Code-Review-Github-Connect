@@ -14,7 +14,7 @@ export type ParsedDelivery =
   | { ok: true; kind: "ping" }
   | { ok: true; kind: "ignore"; reason: string }
   /** The PR was closed (merged or not): its live jobs are cancelled (harbor.server.ts). */
-  | { ok: true; kind: "closed"; owner: string; repo: string; pr: number; merged: boolean }
+  | { ok: true; kind: "closed"; owner: string; repo: string; pr: number; merged: boolean; closedAt?: number }
   | {
       ok: true;
       kind: "review";
@@ -114,7 +114,9 @@ export function parseGitHubPayload(
     // A closed PR (merged or not) needs no review any more: its live jobs are cancelled, so they stop
     // holding a ChatGPT slot or a local-model queue position (live #602: merged, its job still queued).
     if (body.action === "closed" && repo && pr?.number) {
-      return { ok: true, kind: "closed", owner: repo.owner, repo: repo.repo, pr: pr.number, merged: Boolean((pr as { merged?: boolean }).merged) };
+      const closedAt = Date.parse(String((pr as { closed_at?: string }).closed_at ?? ""));
+      return { ok: true, kind: "closed", owner: repo.owner, repo: repo.repo, pr: pr.number, merged: Boolean((pr as { merged?: boolean }).merged),
+        ...(Number.isFinite(closedAt) ? { closedAt } : {}) };
     }
     const trigger: Trigger | undefined = bodyRequest ? "pull_request.body_mention" : PR_ACTIONS[body.action ?? ""];
     if (!trigger) return { ok: true, kind: "ignore", reason: `action ignored (${body.action ?? "none"}; no new body mention)` };

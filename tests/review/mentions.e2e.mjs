@@ -407,6 +407,10 @@ test('a closed or merged PR cancels its live jobs and frees them; other PRs are 
   const after=app.harbor.getHarbor().jobs.find(j=>j.id===job.id);
   assert.deepEqual([after.status,after.skipReason],['cancelled','cancelled: pull request closed']);
   assert.deepEqual(JSON.parse(JSON.stringify(after.generating)),{chatgpt:false,local:false},'an ended job generates nothing');
-  const other=await deliver(app,'pull_request',{...pr('closed'),pull_request:{...pr('closed').pull_request,number:9999,merged:true}},'delivery-other');
-  assert.equal(other.status,202);
+  // A closed event for another PR leaves this PR's new job alone; a stale close (before the job) too.
+  const again=await deliver(app,'issue_comment',{...comment(),comment:{id:43,body:'@ashlar-bot review'}},'delivery-again');
+  const second=await settled(app,again.jobId);
+  await deliver(app,'pull_request',{...pr('closed'),pull_request:{...pr('closed').pull_request,number:9999,merged:true}},'delivery-other');
+  await deliver(app,'pull_request',{...pr('closed'),pull_request:{...pr('closed').pull_request,closed_at:new Date(second.createdAt-60_000).toISOString()}},'delivery-stale');
+  assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===second.id).status,'awaiting_chat','another PR\'s close and a stale close cancel nothing');
 });

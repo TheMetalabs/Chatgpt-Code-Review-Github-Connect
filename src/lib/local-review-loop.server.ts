@@ -647,7 +647,9 @@ export async function runLocalReviewLoop(
       }
       // A group whose request threw left no reply: its error is the only evidence of why (live aicc
       // #608: the leg failed in the second its lease was granted, and nothing said why).
-      const why = groupErrors.length ? ` (${groupErrors.slice(0, 3).join("; ")}${groupErrors.length > 3 ? `; +${groupErrors.length - 3} more` : ""})` : "";
+      // Bounded: it reaches GitHub-visible text (assumptions, lane detail); the full errors are logged.
+      const first = groupErrors.slice(0, 2).map((e) => e.slice(0, 100)).join("; ");
+      const why = groupErrors.length ? ` (${first}${groupErrors.length > 2 ? `; +${groupErrors.length - 2} more` : ""})` : "";
       return { ok: false, error: `local loop produced no review JSON${why}`, ...evidence };
     }
     const residual = residualReplies.length ? { residualReplies: residualReplies.join("\n\n---\n\n") } : {};

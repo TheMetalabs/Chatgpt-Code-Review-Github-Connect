@@ -175,7 +175,9 @@ async function confirmAgeDialog() {
   const year = "2000";
   const dialog = ageDialog();
   if (!dialog) return false;
-  const input = dialog.querySelector("input:not([type='hidden']):not([type='checkbox']):not([type='radio'])");
+  // Exactly one plain input: a dialog asking for more (month, day) is not this one and is left alone.
+  const inputs = dialog.querySelectorAll("input:not([type='hidden']):not([type='checkbox']):not([type='radio'])");
+  const input = inputs.length === 1 ? inputs[0] : null;
   const confirm = [...dialog.querySelectorAll("button, [role='button']")].find(el =>
     /^(계속하기|계속|확인|continue|confirm)$/i.test((el.textContent || "").replace(/\s+/g, " ").trim()));
   if (!input || !confirm) return false;
@@ -203,7 +205,7 @@ async function clearSendBlock() {
 /** Why Grok did not take a send, read from the page (null when nothing says so). */
 function sendBlockedError() {
   if (!ageDialog()) return null;
-  const e = new Error("Grok asks to verify the account's age (a birth-year dialog) and it could not be confirmed; complete it once in the Grok tab, then retry (nothing was sent)");
+  const e = new Error("Grok asks to verify the account's age (a birth-year dialog) and it could not be confirmed; complete it once in the Grok tab, then retry");
   e.code = "age_verification";
   return e;
 }

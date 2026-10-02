@@ -154,19 +154,56 @@ async function startFresh(deadline) {
   return waitUntilComposer(end, throwIfLoggedOut);
 }
 
-/** Why Grok did not take a send, read from the page (null when nothing says so). Live 2026-10-02
- * (aicc #639, 1.1.62): right after Send, Grok opened its age-verification dialog
- * (role=dialog, data-analytics-name="age_verification": "나이를 확인해 주세요 · 태어난 연도를 선택하세요"),
- * consumed the prompt and sent nothing; the run waited 60 s as send_unconfirmed. A birth year is the
- * account owner's to give: the run never fills it, it ends saying what to do. */
-function sendBlockedError() {
-  // Every matching dialog is checked: a stale hidden one listed first never masks the open one.
-  const shown = [...document.querySelectorAll("[role='dialog']")].some(el =>
+/** The open age-verification dialog (null when none). Live 2026-10-02 (aicc #639, 1.1.62): right after
+ * Send, Grok opened role=dialog data-analytics-name="age_verification" ("나이를 확인해 주세요 · 태어난
+ * 연도를 선택하세요", a YYYY input pre-filled 2000, button 계속하기), consumed the prompt and sent nothing.
+ * Every matching dialog is checked: a stale hidden one listed first never masks the open one. */
+function ageDialog() {
+  return [...document.querySelectorAll("[role='dialog']")].find(el =>
     (el.getAttribute("data-analytics-name") === "age_verification" ||
       /나이를 확인|verify your age|태어난 연도|year of birth|birth year/i.test(el.textContent || "")) &&
-    (typeof elVisible !== "function" || elVisible(el) || el.getAttribute("data-state") === "open"));
-  if (!shown) return null;
-  const e = new Error("Grok asks to verify the account's age (a birth-year dialog); complete it once in the Grok tab, then retry (nothing was sent)");
+    (typeof elVisible !== "function" || elVisible(el) || el.getAttribute("data-state") === "open")) || null;
+}
+
+/** Answers the age dialog with year and presses its confirm button. True when the
+ * dialog is gone afterwards; false when it is not one this can answer (no plain year input, no
+ * confirm button) or stays open: the run then ends as age_verification, nothing else is touched. */
+async function confirmAgeDialog() {
+  // The account owner's own year, given in chat (2026-10-02, "나이는 2000년생으로 자동 넣으면돼"): only this
+  // dialog is ever answered, only with this year. Function-local: a re-injected content script re-runs
+  // top-level const declarations and throws.
+  const year = "2000";
+  const dialog = ageDialog();
+  if (!dialog) return false;
+  const input = dialog.querySelector("input:not([type='hidden']):not([type='checkbox']):not([type='radio'])");
+  const confirm = [...dialog.querySelectorAll("button, [role='button']")].find(el =>
+    /^(계속하기|계속|확인|continue|confirm)$/i.test((el.textContent || "").replace(/\s+/g, " ").trim()));
+  if (!input || !confirm) return false;
+  if (input.value !== year) {
+    // A React-controlled input only takes a value set through the native setter, then an input event.
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(input, year);
+    input.dispatchEvent(new Event("input", {bubbles: true}));
+    input.dispatchEvent(new Event("change", {bubbles: true}));
+    await sleep(200);
+  }
+  confirm.click();
+  const end = Date.now() + 5000;
+  while (Date.now() < end) {
+    if (!ageDialog()) return true;
+    await sleep(150);
+  }
+  return false;
+}
+
+/** composer.js hook: answers a blocking dialog this site knows how to answer (true = one was). */
+async function clearSendBlock() {
+  return confirmAgeDialog();
+}
+
+/** Why Grok did not take a send, read from the page (null when nothing says so). */
+function sendBlockedError() {
+  if (!ageDialog()) return null;
+  const e = new Error("Grok asks to verify the account's age (a birth-year dialog) and it could not be confirmed; complete it once in the Grok tab, then retry (nothing was sent)");
   e.code = "age_verification";
   return e;
 }
@@ -185,6 +222,7 @@ async function runPrompt(prompt, reasoning, resume = false) {
   await dismissOverlays();
   // Never click Send under an open menu or dialog (live 2026-10-02: two legs clicked Send with the page
   // aria-hidden behind a layer, and nothing was sent): closed first, or the run ends saying so.
+  if (await clearSendBlock()) step("age_confirmed");
   const ageGate = sendBlockedError();
   if (ageGate) throw ageGate;
   if (!await closeGrokLayers()) {

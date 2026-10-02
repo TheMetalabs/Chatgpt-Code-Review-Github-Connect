@@ -860,6 +860,19 @@ test('grok age dialog: only the year input and its own confirm button are touche
   assert.deepEqual(out, {ok: true, other: 0, none: false});
 });
 
+// The text fallback only detects an age-like dialog: a year is typed only where Grok marks the dialog as
+// the age check or the field itself is shaped like a year; any other dialog's input stays untouched.
+test('grok age dialog: a text-matched dialog with an unrelated input gets no year', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async () => {
+    document.body.insertAdjacentHTML('beforeend', '<div role="dialog" data-state="open" style="width:300px;height:120px"><p>Tell us your birth year for the survey</p><input aria-label="free text" value=""><button type="button">확인</button></div>');
+    let clicks = 0; document.querySelector('[role="dialog"] button').addEventListener('click', () => clicks++);
+    const ok = await confirmAgeDialog();
+    return {ok, value: document.querySelector('[aria-label="free text"]').value, clicks, stillAge: !!ageDialog()};
+  });
+  assert.deepEqual(out, {ok: false, value: '', clicks: 0, stillAge: true});
+});
+
 // Grok 2026-10-02: the live page is read step by step (as ChatGPT's was). Each stage of a Grok run keeps
 // one snapshot of <main> plus its open layers in chrome.storage.local "stageHtml" (bounded).
 test('each stage of a Grok run keeps one HTML snapshot with its open layers', async t => {

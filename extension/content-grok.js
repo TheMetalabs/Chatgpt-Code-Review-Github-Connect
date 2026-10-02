@@ -181,6 +181,10 @@ async function confirmAgeDialog() {
   const confirm = [...dialog.querySelectorAll("button, [role='button']")].find(el =>
     /^(계속하기|계속|확인|continue|confirm)$/i.test((el.textContent || "").replace(/\s+/g, " ").trim()));
   if (!input || !confirm) return false;
+  // The text fallback of ageDialog only detects: a year goes in only where Grok marks the dialog as the
+  // age check or the field itself is shaped like a year (YYYY placeholder, 4 characters).
+  const yearField = /^y{4}$/i.test(input.getAttribute("placeholder") || "") || input.getAttribute("maxlength") === "4";
+  if (dialog.getAttribute("data-analytics-name") !== "age_verification" && !yearField) return false;
   if (input.value !== year) {
     // A React-controlled input only takes a value set through the native setter, then an input event.
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(input, year);

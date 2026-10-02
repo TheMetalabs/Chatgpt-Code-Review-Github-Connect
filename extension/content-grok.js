@@ -160,10 +160,12 @@ async function startFresh(deadline) {
  * consumed the prompt and sent nothing; the run waited 60 s as send_unconfirmed. A birth year is the
  * account owner's to give: the run never fills it, it ends saying what to do. */
 function sendBlockedError() {
-  const dialog = [...document.querySelectorAll("[role='dialog']")].find(el =>
-    el.getAttribute("data-analytics-name") === "age_verification" ||
-    /나이를 확인|verify your age|태어난 연도|year of birth|birth year/i.test(el.textContent || ""));
-  if (!dialog || (typeof elVisible === "function" && !elVisible(dialog) && dialog.getAttribute("data-state") !== "open")) return null;
+  // Every matching dialog is checked: a stale hidden one listed first never masks the open one.
+  const shown = [...document.querySelectorAll("[role='dialog']")].some(el =>
+    (el.getAttribute("data-analytics-name") === "age_verification" ||
+      /나이를 확인|verify your age|태어난 연도|year of birth|birth year/i.test(el.textContent || "")) &&
+    (typeof elVisible !== "function" || elVisible(el) || el.getAttribute("data-state") === "open"));
+  if (!shown) return null;
   const e = new Error("Grok asks to verify the account's age (a birth-year dialog); complete it once in the Grok tab, then retry (nothing was sent)");
   e.code = "age_verification";
   return e;

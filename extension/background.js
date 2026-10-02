@@ -2307,7 +2307,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     if (lateReceipt) {
       if (persistedResultMayReplace(state, lateReceipt)) await ingestPersistedPageResult(job, provider, jobs, lateReceipt);
       else await discardPersistedPageResult(jobs, lateReceipt);
-      return;
+      if (state.outcome) return;
     }
     state.outcome = failure("presend_stalled", stalled);
     workerStep(job, provider, "presend_watchdog");
@@ -2329,7 +2329,11 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (late) {
     if (await settleClosedTab(job, provider, jobs)) return;
     const lateReceipt = await persistedPageResult(job, provider);
-    if (lateReceipt) { await ingestPersistedPageResult(job, provider, jobs, lateReceipt); return; }
+    if (lateReceipt) {
+      if (persistedResultMayReplace(state, lateReceipt)) await ingestPersistedPageResult(job, provider, jobs, lateReceipt);
+      else await discardPersistedPageResult(jobs, lateReceipt);
+      if (state.outcome) return;
+    }
     state.outcome = failure("response_timeout", late);
     workerStep(job, provider, "postsend_watchdog");
     await saveJobs(jobs);

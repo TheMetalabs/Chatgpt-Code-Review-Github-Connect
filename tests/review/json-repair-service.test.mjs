@@ -64,6 +64,12 @@ test('malformed or content-changing candidate is inspectable and not auto retrie
  const metadata=f.history.getJob('A');assert.ok(metadata.repairs.length);assert.equal(JSON.stringify(metadata).includes(original),false);
  const privateRecord=f.history.getJob('A',true).repairs[0];assert.equal(privateRecord.original,original);assert.ok(privateRecord.candidate.includes('invented'));
 });
+test('a formatter refusal is terminal and remains eligible for archived-source salvage',async t=>{
+ const f=fixture(t,{response:JSON.stringify({repair_failed:true})});const r=f.service.start(input);await flush();
+ assert.equal(f.service.status('A',r.id).status,'needs_attention');
+ assert.deepEqual(f.service.status('A',r.id).errors,['review:unknown_field','findings:required_array']);
+ f.service.start(input);await flush();assert.equal(f.calls.length,1);assert.equal(f.accepted.length,0);
+});
 test('original digest and size are checked, never truncated into repair input',async t=>{
  const f=fixture(t);assert.throws(()=>f.service.start({...input,sourceHash:'wrong'}),/source/);
  assert.throws(()=>f.service.start({...input,original:'x'.repeat(500001)}),/source/);assert.equal(f.calls.length,0);

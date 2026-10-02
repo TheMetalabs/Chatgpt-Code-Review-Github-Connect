@@ -27,6 +27,8 @@ type BridgeMeta = {
   lastError?: string;
   lastTakeAt?: number;
   workerStatus?: WorkerStatus;
+  /** In memory only: take offers nothing until this epoch ms, so the worker can drain for an extension update. */
+  drainUntil?: number;
 };
 
 function newToken() {
@@ -75,6 +77,8 @@ export type BridgePublic = Omit<BridgeStatus, "token"> & {
   serverInstanceId: string;
   pendingJobs: number;
   lastTakeAt?: number;
+  /** Epoch ms until which take offers nothing; absent when not draining. */
+  drainUntil?: number;
   repairProtocol: 1;
   captureProtocol: 1;
   recoveryProtocol: 1;
@@ -149,6 +153,7 @@ export function getBridgePublic(): BridgePublic {
   const { token: _t, ...rest } = getBridgeStatus();
   return {...rest, protocolVersion: 1, serverInstanceId, lastTakeAt: meta.lastTakeAt,
     workerStatus: meta.workerStatus,
+    drainUntil: meta.drainUntil && meta.drainUntil > Date.now() ? meta.drainUntil : undefined,
     workerStatusFresh: workerStatusIsFresh(meta.workerStatus, Date.now(), BRIDGE_CONNECTED_MS),
     repairProtocol: 1, captureProtocol: 1, recoveryProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
     pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && offerableChatProviders(job).length > 0).length,
@@ -438,10 +443,21 @@ export type BridgeOffer = NonNullable<ReturnType<typeof nextBridgeJob>> | FixOff
 
 /** `fixes` is the worker's fixProtocol:2 opt-in: a worker that cannot harvest a plain-text fix
  * answer (it would wait for review JSON forever) is never offered a fix item. */
+export const MAX_DRAIN_MINUTES = 120;
+
+/** Stop offering new work for `minutes` (0 ends it). The window expires by itself and a server restart
+ * clears it, so a forgotten drain can never leave the queue stopped. Claimed jobs keep running and
+ * recover as usual; only take is silent. */
+export function setBridgeDrain(minutes: number): number | undefined {
+  meta.drainUntil = minutes > 0 ? Date.now() + Math.min(minutes, MAX_DRAIN_MINUTES) * 60_000 : undefined;
+  return meta.drainUntil;
+}
+
 export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = [], options: {fixes?: boolean} = {}): BridgeOffer | null {
   meta.lastTakeAt = Date.now();
   noteClientSeen(clientId);
   settleLostBindings(getHarbor().jobs);
+  if (meta.drainUntil && meta.drainUntil > Date.now()) return null;
   // A fix tab pastes its prompt in the foreground exactly like a review tab: one submission per
   // Chrome profile across BOTH kinds (see SUBMIT_WINDOW_MS).
   if (fixes().submitting(clientId, excludeJobIds)) return null;

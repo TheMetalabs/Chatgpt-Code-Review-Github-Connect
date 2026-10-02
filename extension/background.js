@@ -880,7 +880,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.65";
+const WORKER_BUILD = "1.1.66";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2046,6 +2046,16 @@ async function refreshJobHeartbeat(job, jobs, signal) {
     return false; // Not equivalent to cancellation, receipt, or permission to close.
   }
   delete job.serverStatus;
+  // Legs the server ended while the job goes on (a stalled Grok past its cap, a reviewer turned off):
+  // their runs stop and their tabs release like a cancelled job's. A leg with an outcome of its own
+  // (a collected answer, a failure) still delivers it.
+  const ended = (Array.isArray(result.endedProviders) ? result.endedProviders : [])
+    .filter(provider => job.states[provider] && !job.states[provider].outcome && !job.states[provider].delivered);
+  if (ended.length) {
+    abandonLegs(job, ended, "ended");
+    for (const provider of ended) workerStep(job, provider, "cancelled");
+    await saveJobs(jobs);
+  }
   if (result.accepted === false || !job.leaseId) {
     const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()}, job.origin, signal);
     job.leaseId = claim.leaseId;

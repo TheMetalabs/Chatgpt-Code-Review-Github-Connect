@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { getBridgePublic, bridgeTokenOk, setBridgeDrain, MAX_DRAIN_MINUTES } from "@/lib/bridge.server";
+import { getBridgePublic, bridgeTokenOk, endDisabledChatLegs, setBridgeDrain, MAX_DRAIN_MINUTES } from "@/lib/bridge.server";
 import { buildChatPrompt } from "@/lib/chat-prompt";
 import {
   cancelHarborJob,
@@ -19,7 +19,7 @@ import { runLocalLlm } from "@/lib/local-llm.server";
 import { SAMPLE_PRS } from "@/lib/samples";
 import { probeGithub } from "@/lib/github.server";
 import { clearGithubSecrets, patchGithubSecrets } from "@/lib/secrets.server";
-import { isMaskedSecret } from "@/lib/types";
+import { isMaskedSecret, providersFromSettings } from "@/lib/types";
 import type { ReviewProvider } from "@/lib/types";
 
 function sameOrigin(request: Request) {
@@ -91,6 +91,7 @@ export const Route = createFileRoute("/api/harbor")({
           // (a non-object fixAgent, a wrong-typed flag, an out-of-range number, an unknown field)
           // is a 400 and changes nothing. A valid save applies in memory at once.
           const { action: _action, ...patch } = body as Record<string, unknown>;
+          const before = providersFromSettings(getHarbor().settings);
           if (Object.keys(patch).length) {
             try {
               patchHarborSettings(patch as Parameters<typeof patchHarborSettings>[0]);
@@ -101,6 +102,11 @@ export const Route = createFileRoute("/api/harbor")({
               const status = err?.status === 400 ? 400 : 500;
               return Response.json({ ok: false, error: msg }, { status });
             }
+          }
+          // The save already succeeded: a failure ending the turned-off reviewers' legs is not a failed save.
+          const off = before.filter(provider => !providersFromSettings(getHarbor().settings).includes(provider));
+          if (off.length) {
+            try { endDisabledChatLegs(off); } catch (e) { console.error("[harbor] could not end turned-off reviewer legs:", e); }
           }
           return Response.json({ ok: true, settings: publicSettings(getHarbor().settings), github: githubStatus(), bridge: getBridgePublic() });
         }

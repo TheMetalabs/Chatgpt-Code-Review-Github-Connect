@@ -558,6 +558,13 @@ export const BRIDGE_CLAIM_MS = 20 * 60_000;
  * reports no bound run again for this long, measured from the first binding-less heartbeat, is
  * settled as a provider failure: the heartbeats keep its claim fresh, so it is never re-offered. */
 export const BINDING_LOST_MS = 10 * 60_000;
+/** A chat leg that reported its prompt sent (a stage in POST_SEND_STAGES) and then no new stage for
+ * this long is settled as a provider failure by the server, whatever the page or worker still say:
+ * the page's own response wait ends at 35 min but needs a page that polls (a throttled or frozen
+ * background tab never does), and the worker's heartbeats keep the claim fresh. Only providers listed
+ * here are capped: Grok (live aicc #629/#648/#649/#657/#662/#663 sat in waiting_for_response 40-73 min
+ * on a finished ChatGPT leg); ChatGPT's long reasoning legitimately outlasts any such bound. */
+export const CHAT_LEG_STALL_MS: Partial<Record<ReviewProvider, number>> = { grok: 45 * 60_000 };
 /** Chrome MV3 alarms are ≥1 minute; keep connected across that gap. */
 export const BRIDGE_CONNECTED_MS = 120_000;
 

@@ -23,8 +23,11 @@ const CJS_BINDING_RE = /^([A-Za-z_$][\w$]*)(?:\s*:\s*([A-Za-z_$][\w$]*))?$/;
  * one real imports use); the import regexes are line-anchored, so an import inside a one-line string
  * (not at statement position) still does not match. */
 function withoutComments(text: string): string {
+  // The template-literal branches are disjoint (an escape `\\[\s\S]`, or any other character but a
+  // backslash or backtick): with overlapping branches an unterminated backtick followed by backslashes
+  // backtracked exponentially and hung the server (live 2026-10-02, importGraph ← fetchReferenceFiles).
   return String(text || "")
-    .replace(/`(?:\\.|[^`])*`/g, "``")
+    .replace(/`(?:\\[\s\S]|[^`\\])*`/g, "``")
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
 }

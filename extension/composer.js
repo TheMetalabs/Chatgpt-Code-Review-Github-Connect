@@ -1093,10 +1093,7 @@ async function startSendProbe(record) {
     if ((await local.get(["sendProbeHtmlOff"]))?.sendProbeHtmlOff !== true) {
       for (const seconds of [5, 60]) setTimeout(() => {
         try {
-          const area = document.querySelector("main") || document.body;
-          const clone = area.cloneNode(true);
-          for (const node of clone.querySelectorAll("script,style,noscript,svg path,img")) node.remove();
-          const html = clone.outerHTML.slice(0, 200_000);
+          const html = snapshotHtml();
           globalThis.__ashlarSendProbeWrites = (globalThis.__ashlarSendProbeWrites || Promise.resolve()).then(async () => {
             const stored = (await local.get(["sendProbeHtml"]))?.sendProbeHtml;
             const list = Array.isArray(stored) ? stored : [];
@@ -1182,6 +1179,12 @@ async function clickSend(findSend, findComposer, expectedText) {
       if (fix && drafted && !composerHoldsFix(editor, record.exact)) throw fixPromptAltered();
       if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
           !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
+        // Past the worker's deadline for this send the worker may have ended the leg (a tab frozen
+        // in any pre-send stage, background.js presendWatchdog): never send then.
+        if (presendDeadlinePassed()) {
+          if (typeof savePresendStallHtml === "function") savePresendStallHtml("presend_deadline");
+          throw presendStalled("presend_deadline");
+        }
         record.phase = "attempted";
         record.attemptedAt = Date.now();
         saveSubmission(record); // durable intent BEFORE invoking the site's handler
@@ -1252,6 +1255,16 @@ async function waitUntilComposer(deadline = Date.now() + 3 * 60 * 1000, guard) {
   }
 }
 
+/** Whether the worker's deadline for this run's send (json.js stores it from the run message) has
+ * passed. No deadline recorded (an older worker, unreadable storage): never. */
+function presendDeadlinePassed() {
+  try {
+    const state = globalThis.__ashlarRunnerState;
+    const deadline = Number(sessionStorage.getItem(`ashlar:presendDeadline:${state?.jobId}:${state?.runId}`));
+    return Number.isFinite(deadline) && deadline > 0 && Date.now() > deadline;
+  } catch { return false; }
+}
+
 function presendStalled(stage) {
   const e = new Error(`presend_stalled: the pre-send stage "${stage}" did not finish in time; nothing was sent`);
   e.code = "presend_stalled";
@@ -1306,16 +1319,29 @@ async function preparePresend(provider, reasoning, openComposer, guard) {
 /** Diagnostic: the page as a pre-send stall left it, in chrome.storage.local "presendStallHtml" (last
  * 3). The main area (or body) without scripts, styles, images and SVG paths, capped at 200 KB; the
  * URL without its query. Off with {presendStallHtmlOff:true}. Never affects the run. */
+/** The page area a diagnostic snapshot keeps: `main` plus every open dialog, menu or popover outside
+ * it (live Grok 2026-10-02: main was aria-hidden under a layer the main-only snapshot never showed).
+ * Scripts, styles, images and SVG paths are dropped. */
+function snapshotHtml(max = 200_000) {
+  const area = document.querySelector("main") || document.body;
+  const parts = [area];
+  for (const layer of document.querySelectorAll("[role='dialog'], [role='alertdialog'], [role='menu'], [role='listbox'], [data-radix-popper-content-wrapper]")) {
+    if (!area.contains(layer) && !parts.some(p => p.contains(layer))) parts.push(layer);
+  }
+  return parts.map(node => {
+    const clone = node.cloneNode(true);
+    for (const n of clone.querySelectorAll("script,style,noscript,img,svg path")) n.remove();
+    return clone.outerHTML;
+  }).join("\n<!-- layer -->\n").slice(0, max);
+}
+
 function savePresendStallHtml(stage) {
   try {
     const local = globalThis.chrome?.storage?.local;
     if (!local) return;
     const state = globalThis.__ashlarRunnerState;
-    const area = document.querySelector("main") || document.body;
-    const clone = area.cloneNode(true);
-    for (const node of clone.querySelectorAll("script,style,noscript,img,svg path")) node.remove();
     const record = {job: state?.jobId, run: state?.runId, stage, at: Date.now(),
-      url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: clone.outerHTML.slice(0, 200_000)};
+      url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: snapshotHtml()};
     globalThis.__ashlarPresendWrites = (globalThis.__ashlarPresendWrites || Promise.resolve()).then(async () => {
       const flags = await local.get(["presendStallHtmlOff", "presendStallHtml"]);
       if (flags?.presendStallHtmlOff === true) return;

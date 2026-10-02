@@ -94,6 +94,11 @@ test('submission: ProseMirror paragraphs read back as the original review prompt
  const got=await page.evaluate(()=>({normalized:normalizePrompt(readComposer(composer())),inner:normalizePrompt(composer().innerText)}));
  assert.equal(got.normalized,'first paragraph second paragraph third paragraph');
  assert.equal(got.inner,'first paragraph second paragraph third paragraphX');
+ await page.evaluate(prompt=>{window.result={pending:true};clickSend(()=>document.querySelector('#composer-submit-button'),composer,prompt)
+  .then(()=>window.result={submitted:true},e=>window.result={error:e.message});},prompt);
+ await page.clock.runFor(500);
+ assert.equal(await page.evaluate(()=>clicks),1,'the rich-editor prompt passes the Send gate');
+ assert.deepEqual(await page.evaluate(()=>result),{pending:true});
 });
 
 test('submission: actionable Send records the other click gates when the draft differs',async t=>{

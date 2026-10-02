@@ -724,6 +724,19 @@ test('captured grok.com DOM: idle private composer and a finished answer, earlie
   });
 });
 
+test('Grok binds the sent turn by position when its DOM user id is re-keyed', async t => {
+  const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div><div data-testid="assistant-message" id="response-answer-A" role="article"><p>answer</p></div><button aria-label="Copy response">copy</button></main>${COMPOSER}`);
+  const out = await page.evaluate(() => {
+    const submission = {phase:'sent', expected:'review', baseline:0, submittedUsers:1, messageId:'user-A'};
+    document.querySelector('[data-testid="user-message"]').id = 'response-user-B';
+    const bound = boundReviewResponse(submission);
+    document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="user-message" id="response-user-C" role="article">followup</div><div data-testid="assistant-message" id="response-answer-C" role="article">later answer</div>');
+    const guarded = boundReviewResponse(submission);
+    return {identified:bound.identified, followup:bound.followup, responseId:bound.responseId || '', userId:turnMessageId(bound.message), guardedFollowup:guarded.followup, guardedResponseId:guarded.responseId || ''};
+  });
+  assert.deepEqual(out, {identified:true, followup:false, responseId:'answer-A', userId:'answer-A', guardedFollowup:true, guardedResponseId:'answer-A'});
+});
+
 test('Grok idle completion uses the polled submission, not stale persisted stream evidence', async t => {
   const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A">review</div><div data-testid="assistant-message" id="response-answer-A">answer text</div></main>${COMPOSER}`);
   const out = await page.evaluate(async () => {

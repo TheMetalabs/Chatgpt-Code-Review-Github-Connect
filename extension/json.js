@@ -367,6 +367,11 @@ function boundReviewResponse(submission) {
   if (submission.messageId) {
     const matches = users.filter(node => turnMessageId(node) === submission.messageId);
     if (matches.length === 1) user = matches[0];
+    // Grok can re-key a user bubble while preserving transcript order. Fall back only to the
+    // journaled position; the exact prompt check below and the later-user followup fence still
+    // have to pass, so a newer user turn can never inherit this run.
+    else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline)
+      user = users[submission.submittedUsers - 1];
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
     user = users[submission.submittedUsers - 1];
   }

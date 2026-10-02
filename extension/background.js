@@ -2874,16 +2874,23 @@ async function repairProvider(job, provider, jobs) {
       // original completed answer is still the only trustworthy evidence, so deliver the same
       // canonical raw_review salvage used by the stalled sweep and let the bridge close this leg.
       if (!state.outcome) {
-        const salvage=await readRepairSource(job,provider);
-        if (salvage?.text) {
-          state.outcome={ok:true,raw:salvageReviewEnvelope(salvage.text),originalText:salvage.text,salvaged:true};
-          delete state.formatError;
-          workerStep(job,provider,"salvaged_no_repair");
-          await saveJobs(jobs);
+        const observed=await readRepairSource(job,provider);
+        if (observed && (observed.sourceHash!==attempt.sourceHash || observed.responseId!==attempt.responseId)) {
+          // A newer answer superseded this terminal attempt. Drop only the obsolete identity; the
+          // normal path below will start a fresh repair for the new source.
+          state.repairAttempt=undefined;attempt=undefined;await saveJobs(jobs);
+        } else {
+          const salvage=observed || (typeof attempt.text==="string" ? {text:attempt.text,sourceHash:attempt.sourceHash,responseId:attempt.responseId} : null);
+          if (salvage?.text) {
+            state.outcome={ok:true,raw:salvageReviewEnvelope(salvage.text),originalText:salvage.text,salvaged:true};
+            delete state.formatError;
+            workerStep(job,provider,"salvaged_no_repair");
+            await saveJobs(jobs);
+          }
         }
       }
       if (state.outcome) await deliverOutcome(job,provider,jobs);
-      return;
+      if (state.outcome || attempt) return;
     }
     if (["running","ready"].includes(status.status)) {
       const current=job.localJsonRepairEnabled ? await readRepairSource(job,provider,false) : null;

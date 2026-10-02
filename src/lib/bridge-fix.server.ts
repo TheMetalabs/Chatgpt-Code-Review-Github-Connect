@@ -214,6 +214,8 @@ export interface FixItem {
   /** Process-wide creation order shared with review jobs (creation-seq.ts): breaks a createdAt tie. */
   createdSeq: number;
   deadlineAt: number;
+  /** Time left on the deadline when a take drain froze it (hold); present only while held. */
+  heldMs?: number;
   state: FixItemState;
   leaseId?: string;
   clientId?: string;
@@ -259,6 +261,9 @@ export interface FixRegistryDeps {
   bindingLostMs?: number;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
+  /** Epoch ms a take drain lasts until (undefined when not draining): nothing can be taken before it,
+   * so a not-yet-running item's deadline is counted from it. */
+  holdUntil?(): number | undefined;
 }
 
 export type FixCompleteResult = { ok: true } | { ok: false; code: "lease_conflict" | "invalid"; error: string };
@@ -345,6 +350,36 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     settle(item, "cancelled", "timeout", { error });
   }
 
+  function rearm(item: FixItem, deadlineAt: number) {
+    item.deadlineAt = deadlineAt;
+    const waiter = waiters.get(item.id);
+    if (!waiter) return;
+    deps.clearTimer(waiter.timer);
+    waiter.timer = deps.setTimer(() => expire(item.id), Math.max(0, deadlineAt - deps.now()));
+  }
+
+  /** A take drain freezes the clock of every item that has not started a run: nothing can take it
+   * until `until`, so its remaining time is counted from there (a re-hold moves it with the window).
+   * Without this a drain longer than the item's timeout cancels fixes that never had a chance. */
+  function hold(until: number) {
+    const now = deps.now();
+    for (const item of items.values()) {
+      if (!live(item) || item.runId) continue;
+      item.heldMs ??= Math.max(0, item.deadlineAt - now);
+      rearm(item, Math.max(item.deadlineAt, until + item.heldMs));
+    }
+  }
+
+  /** The drain ended before its window: items resume with the time they had left. */
+  function unhold() {
+    const now = deps.now();
+    for (const item of items.values()) {
+      if (item.heldMs === undefined) continue;
+      if (live(item) && !item.runId) rearm(item, now + item.heldMs);
+      item.heldMs = undefined;
+    }
+  }
+
   function abort(id: string) {
     const item = items.get(id);
     if (!item || !live(item)) return;
@@ -384,6 +419,8 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     const now = deps.now();
     const timeoutMs =
       req.timeoutMs === undefined ? deps.timeoutMs() : clampInt(req.timeoutMs, DEFAULT_FIX_TIMEOUT_MS, MIN_FIX_TIMEOUT_MS, MAX_FIX_TIMEOUT_MS);
+    const holdUntil = deps.holdUntil?.();
+    const held = holdUntil !== undefined && holdUntil > now;
     const item: FixItem = {
       id: FIX_ID_PREFIX + deps.newId(),
       kind: "fix",
@@ -396,12 +433,13 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       ...(req.attachment ? { attachment: req.attachment } : {}),
       createdAt: now,
       createdSeq: nextCreationSeq(),
-      deadlineAt: now + timeoutMs,
+      deadlineAt: (held ? holdUntil : now) + timeoutMs,
+      ...(held ? { heldMs: timeoutMs } : {}),
       state: "queued",
     };
     items.set(item.id, item);
     const answer = new Promise<string>((resolve, reject) => {
-      waiters.set(item.id, { resolve, reject, timer: deps.setTimer(() => expire(item.id), timeoutMs) });
+      waiters.set(item.id, { resolve, reject, timer: deps.setTimer(() => expire(item.id), item.deadlineAt - now) });
     });
     req.signal?.addEventListener("abort", () => abort(item.id), { once: true });
     return answer;
@@ -689,5 +727,5 @@ export function createFixRegistry(deps: FixRegistryDeps) {
     return item && { ...item };
   };
 
-  return { request, peek, claim, take, recover, refresh, state, prompt, release, fail, complete, progress, submitting, counts, summaries, providerOf, snapshot };
+  return { request, hold, unhold, peek, claim, take, recover, refresh, state, prompt, release, fail, complete, progress, submitting, counts, summaries, providerOf, snapshot };
 }

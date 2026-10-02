@@ -153,7 +153,7 @@ export function getBridgePublic(): BridgePublic {
   const { token: _t, ...rest } = getBridgeStatus();
   return {...rest, protocolVersion: 1, serverInstanceId, lastTakeAt: meta.lastTakeAt,
     workerStatus: meta.workerStatus,
-    drainUntil: meta.drainUntil && meta.drainUntil > Date.now() ? meta.drainUntil : undefined,
+    drainUntil: draining(),
     workerStatusFresh: workerStatusIsFresh(meta.workerStatus, Date.now(), BRIDGE_CONNECTED_MS),
     repairProtocol: 1, captureProtocol: 1, recoveryProtocol: 1, localJsonRepairEnabled: localJsonRepairAvailable(getHarbor().settings),
     pendingJobs: getHarbor().jobs.filter(job => job.status === "awaiting_chat" && llmWorkAllowed(job) && offerableChatProviders(job).length > 0).length,
@@ -165,7 +165,7 @@ export function getBridgePublic(): BridgePublic {
 export function rotateBridgeToken() {
   const token = newToken();
   persistToken(token);
-  meta = { token, lastSeen: 0, unseenSince: Date.now() };
+  meta = { token, lastSeen: 0, unseenSince: Date.now(), drainUntil: meta.drainUntil };
   clientSeen.clear(); // every profile is offline until it gets the new token
   return getBridgeStatus();
 }
@@ -230,7 +230,11 @@ function fixes() {
     // unref: a pending fix deadline must never keep the server (or a test runner) alive.
     setTimer: (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref?.(); return timer; },
     clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+    holdUntil: draining,
   }));
+}
+function draining(): number | undefined {
+  return meta.drainUntil && meta.drainUntil > Date.now() ? meta.drainUntil : undefined;
 }
 function fixLiveCount() {
   const {queued, claimed} = fixes().counts();
@@ -441,8 +445,6 @@ export function nextBridgeJob(clientId = "", excludeJobIds: readonly string[] = 
 
 export type BridgeOffer = NonNullable<ReturnType<typeof nextBridgeJob>> | FixOffer;
 
-/** `fixes` is the worker's fixProtocol:2 opt-in: a worker that cannot harvest a plain-text fix
- * answer (it would wait for review JSON forever) is never offered a fix item. */
 export const MAX_DRAIN_MINUTES = 120;
 
 /** Stop offering new work for `minutes` (0 ends it). The window expires by itself and a server restart
@@ -450,14 +452,17 @@ export const MAX_DRAIN_MINUTES = 120;
  * recover as usual; only take is silent. */
 export function setBridgeDrain(minutes: number): number | undefined {
   meta.drainUntil = minutes > 0 ? Date.now() + Math.min(minutes, MAX_DRAIN_MINUTES) * 60_000 : undefined;
+  if (meta.drainUntil) fixes().hold(meta.drainUntil); else fixes().unhold();
   return meta.drainUntil;
 }
 
+/** `fixes` is the worker's fixProtocol:2 opt-in: a worker that cannot harvest a plain-text fix
+ * answer (it would wait for review JSON forever) is never offered a fix item. */
 export function takeNextBridgeJob(clientId = "", excludeJobIds: readonly string[] = [], options: {fixes?: boolean} = {}): BridgeOffer | null {
   meta.lastTakeAt = Date.now();
   noteClientSeen(clientId);
   settleLostBindings(getHarbor().jobs);
-  if (meta.drainUntil && meta.drainUntil > Date.now()) return null;
+  if (draining()) return null;
   // A fix tab pastes its prompt in the foreground exactly like a review tab: one submission per
   // Chrome profile across BOTH kinds (see SUBMIT_WINDOW_MS).
   if (fixes().submitting(clientId, excludeJobIds)) return null;
@@ -627,6 +632,8 @@ export function claimBridgeJob(jobId: string, clientId = ""): {ok: true; leaseId
   if (!job || job.status !== "awaiting_chat" || !llmWorkAllowed(job) || !(job.chatPrompt || job.chatPromptByProvider)) {
     return {ok: false, error: "job is not waiting for chat"};
   }
+  // A drain hands out no new work: only the owner renewing its own claim passes.
+  if (draining() && (!clientId || job.bridgeClientId !== clientId)) return {ok: false, error: "bridge is draining"};
   const attempted = new Set(job.attemptedProviders ?? []);
   if (job.bridgeClientId && job.bridgeClientId !== clientId &&
       pendingChatProviders(job).some(provider => attempted.has(provider))) {

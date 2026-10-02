@@ -217,7 +217,7 @@ export interface ProviderError {
   message: string;
 }
 
-export type ReviewerLaneState = "queued" | "waiting" | "generating" | "answered" | "skipped" | "empty";
+export type ReviewerLaneState = "queued" | "waiting" | "generating" | "answered" | "skipped" | "empty" | "raw";
 
 export interface ReviewerLane {
   provider: ReviewProvider;

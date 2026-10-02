@@ -8,19 +8,20 @@ export type { ReviewerLane, ReviewerLaneState };
 
 const PRE_CHAT: JobStatus[] = ["queued", "snapshot", "explorer"];
 
-function replyStats(raw: string): { jsonChars: number; findingCount?: number; parsed: boolean } {
+function replyStats(raw: string): { jsonChars: number; findingCount?: number; parsed: boolean; rawReview: boolean } {
   const jsonChars = raw.length;
   const slice = extractChatJson(raw);
-  if (!slice) return { jsonChars, parsed: false };
+  if (!slice) return { jsonChars, parsed: false, rawReview: false };
   try {
     const parsed: unknown = JSON.parse(slice);
+    const rawReview = Boolean(parsed && typeof parsed === "object" && typeof (parsed as {raw_review?: unknown}).raw_review === "string");
     const findings =
       parsed && typeof parsed === "object" && Array.isArray((parsed as { findings?: unknown }).findings)
         ? (parsed as { findings: unknown[] }).findings.length
         : undefined;
-    return { jsonChars, findingCount: findings, parsed: true };
+    return { jsonChars, findingCount: findings, parsed: true, rawReview };
   } catch {
-    return { jsonChars, parsed: false };
+    return { jsonChars, parsed: false, rawReview: false };
   }
 }
 
@@ -153,6 +154,16 @@ export function buildReviewerLanes(
     }
     if (raw) {
       const stats = replyStats(raw);
+      if (stats.rawReview) {
+        return {
+          provider,
+          state: "raw" as const,
+          label,
+          detail: "raw evidence · complete review unavailable",
+          answered: false,
+          jsonChars: stats.jsonChars,
+        };
+      }
       const findings =
         stats.findingCount === undefined
           ? stats.parsed
@@ -263,6 +274,7 @@ export function laneTone(state: ReviewerLaneState): "ok" | "warn" | "danger" | "
   if (state === "generating") return "accent";
   if (state === "waiting") return "warn";
   if (state === "skipped" || state === "empty") return "danger";
+  if (state === "raw") return "danger";
   return "muted";
 }
 
@@ -272,6 +284,7 @@ export function laneVerb(state: ReviewerLaneState): string {
   if (state === "waiting") return "waiting";
   if (state === "skipped") return "skipped";
   if (state === "empty") return "no JSON";
+  if (state === "raw") return "raw evidence";
   return "queued";
 }
 

@@ -217,6 +217,20 @@ describe("buildReviewerLanes", () => {
     assert.match(lanes[0].detail, /extract failed/i);
   });
 
+  it("labels a salvaged raw review as evidence, never an answered zero-finding review", () => {
+    const lanes = buildReviewerLanes(
+      job({
+        reviewProviders: ["grok"],
+        storedLegs: [{ provider: "grok", raw: JSON.stringify({ findings: [], merge_recommendation: "COMMENT", raw_review: "Analyzing only" }) }],
+      }),
+    );
+    assert.equal(lanes[0].state, "raw");
+    assert.equal(lanes[0].answered, false);
+    assert.equal(lanes[0].findingCount, undefined);
+    assert.match(lanes[0].detail, /raw evidence/i);
+    assert.equal(lanes[0].jsonChars > 0, true);
+  });
+
   it("keeps an old client's undelivered flag pending without claiming prompt submission", () => {
     const lane = buildReviewerLanes(job({reviewProviders: ["chatgpt"], generating: {chatgpt: true}}))[0];
     assert.equal(lane.state, "waiting");

@@ -140,6 +140,24 @@ test('grok transcript, stream, and composer: roles, code, submit, and done only 
   assert.equal(liveVoice, true);
 });
 
+test('grok reasoning controls do not finish a turn before the final answer mounts', async t => {
+  const page = await openGrok(t, `<main>
+    <div data-testid="user-message" id="response-user-A" role="article">review</div>
+    <div id="answer"><div data-testid="assistant-message" id="response-answer-A" role="article">
+      <p>Analyzing the changed files</p><p>Analyzing persisted state</p>
+    </div><button aria-label="Copy response" style="width:64px;height:32px">copy</button></div>
+  </main>${COMPOSER}`);
+  const out = await page.evaluate(answer => {
+    const record = {phase: 'sent', expected: 'review', baseline: 0, submittedUsers: 1, messageId: 'user-A', sawStream: true, sawStreamKey: 'user-A'};
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok', confirmedSubmission: {key: 'ashlar:submission:job:run', record}};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify(record));
+    const before = replyDoneVisible();
+    document.querySelector('[data-testid="assistant-message"]').insertAdjacentHTML('beforeend', `<p>${answer}</p>`);
+    return {before, after: replyDoneVisible()};
+  }, ANSWER);
+  assert.deepEqual(out, {before: false, after: true});
+});
+
 test('grok answer actions never finish an answer while the composer shows a stream (a regenerate under the old Copy)', async t => {
   const page = await openGrok(t, `<main>
     <div data-testid="user-message" id="response-user-A" role="article" aria-label="You">review</div>

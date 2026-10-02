@@ -281,6 +281,13 @@ function grokReplyDoneVisible(root) {
   const bubble = root.matches?.("[data-testid='assistant-message']") ? root : root.querySelector("[data-testid='assistant-message']");
   if (!bubble) return false;
   if (grokStreamVisible(document)) return false;
+  const text = (bubble.innerText || bubble.textContent || "").trim();
+  // Grok can expose copy/feedback controls for a collapsed reasoning turn before it has mounted
+  // the final answer. Those controls are not completion evidence: a transcript containing only
+  // "Analyzing …" lines and the elapsed-time label must keep polling for the late answer.
+  const reasoningLines = text.split(/\r?\n/).map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+  if (reasoningLines.length && reasoningLines.every(line => /^(?:analyzing\b|thinking\b|reasoning\b|분석 중\b|생각 중\b|추론 중\b)/i.test(line))) return false;
+  if (!text) return false;
   const action = /^(?:copy response|copy|like|dislike|more actions|응답 복사|복사|좋아요|싫어요|더 보기|더보기|신고)$/i;
   for (const el of root.querySelectorAll("button, [role='button']")) {
     if (el.closest("pre, code, .chat-code-block")) continue;
@@ -288,7 +295,6 @@ function grokReplyDoneVisible(root) {
     if (!label || label.length > 48 || !action.test(label) || !elVisible(el)) continue;
     return true;
   }
-  const text = (bubble.innerText || bubble.textContent || "").trim();
   if (text.length < 2 || !grokSawCurrentStream(root)) return false;
   const form = document.querySelector("form[data-composer]");
   if (!form) return false;

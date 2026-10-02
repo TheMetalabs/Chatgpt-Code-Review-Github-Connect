@@ -170,3 +170,20 @@ describe("import-shaped strings", () => {
     assert.ok(real[0].candidates.includes("src/real.ts"));
   });
 });
+
+// Live 2026-10-02 10:29 KST: the Ashlar server hung at 100% CPU inside withoutComments (importGraph ←
+// fetchReferenceFiles). The template-literal pattern /`(?:\\.|[^`])*`/ let a backslash match either
+// branch, so an unterminated backtick followed by many backslash pairs backtracked exponentially.
+describe("importGraph on a pathological file (catastrophic backtracking)", () => {
+  it("an unterminated template literal full of backslashes is read in linear time", () => {
+    const src = `import { a } from "./a";\nconst s = \`${"\\\\".repeat(40)}x\n`;
+    const t0 = Date.now();
+    const g = importGraph("src/x.ts", src);
+    assert.ok(Date.now() - t0 < 200, `took ${Date.now() - t0} ms`);
+    assert.deepEqual(g.map((b) => b.local), ["a"]);
+  });
+  it("a closed template literal (with escapes and an inner import-like text) is still blanked", () => {
+    const src = 'import { a } from "./a";\nconst s = `import { b } from "./b" \\` still`;\n';
+    assert.deepEqual(importGraph("src/x.ts", src).map((b) => b.local), ["a"]);
+  });
+});

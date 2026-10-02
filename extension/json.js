@@ -693,7 +693,7 @@ function saveResponseWaitHtml(bound) {
 }
 
 /** Collection needs two identical stable observations (`key`). On the second one the runner
- * records the answer and, for an identified response, its native completion proof. */
+ * records the answer and, when available, its native completion proof. */
 async function persistCollectedResult(runner, raw, text, ownership) {
   // A frozen page may finish its collector while the worker cannot receive the reply. Keep the
   // exact bound result in the extension session store so the worker can ingest it on its next poke.
@@ -714,7 +714,7 @@ async function persistCollectedResult(runner, raw, text, ownership) {
   } catch { /* session storage is a recovery hint; the live reply remains authoritative */ }
 }
 
-function settleStableAnswer(stability, key, poll, {text, raw, ownership}) {
+async function settleStableAnswer(stability, key, poll, {text, raw, ownership}) {
   stability.hits = stability.stable === key ? stability.hits + 1 : 1;
   stability.stable = key;
   if (stability.hits < 2) return false;
@@ -728,6 +728,7 @@ function settleStableAnswer(stability, key, poll, {text, raw, ownership}) {
       responseId:bound.responseId,context:reviewPageContext(),text,raw,
     });
     runner.persistedResult = persistCollectedResult(runner, raw, text, ownership);
+    await runner.persistedResult;
   }
   recordReviewStep("response_collected");
   return true;
@@ -787,8 +788,7 @@ async function waitUntilReviewOrQuota(name) {
     expireGeneratingLease(lease, name, poll, text);
     expireResponseWait(wait, name, poll);
     if (done && json) {
-      if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) {
-        if (runner?.persistedResult) await runner.persistedResult;
+      if (await settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) {
         return json;
       }
     } else { stability.hits = 0; stability.stable = ""; }
@@ -1272,8 +1272,7 @@ async function waitUntilFixOrQuota(name) {
     if (answered) {
       // Its ID (its message node when it has none): the only response a later poll may collect.
       stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
-      if (settleStableAnswer(stability, text, poll, {text, raw: text, ownership: proof.ownership})) {
-        if (runner?.persistedResult) await runner.persistedResult;
+      if (await settleStableAnswer(stability, text, poll, {text, raw: text, ownership: proof.ownership})) {
         saveFixHarvestProbe({at: Date.now(), jobId: runner?.jobId, runId: runner?.runId, blocks: harvest.blocks || 0,
           totalChars: harvest.totalChars || 0, answerChars: text.length, collapsed: Boolean(harvest.collapsed), expanded: stability.expanded,
           unfenced: Boolean(harvest.unfenced), fileLinks: harvest.fileLinks || 0, canvas: Boolean(harvest.canvas), textChars: harvest.textChars || 0});

@@ -221,6 +221,22 @@ for (const [name, cell] of Object.entries(PIN_CASES)) {
   });
 }
 
+test('page: a stable response without a response ID still persists a recovery receipt', async () => {
+  const p = page({limit: 12});
+  const stored = {};
+  const message = {};
+  p.c.context.chrome.storage = {session: {set: async values => Object.assign(stored, values)}};
+  Object.assign(p.c.context, {
+    boundReviewResponse: () => ({identified: true, followup: false, root: {}, message, responseId: ''}),
+  });
+  Object.assign(p.state(), {kind: 'fix', running: true, jobId: 'fix-A', runId: 'run-A'});
+  const raw = await p.c.context.waitUntilFixOrQuota('ChatGPT');
+  const receipt = stored['ashlar:result:fix-A:chatgpt:run-A'];
+  assert.equal(receipt.raw, raw);
+  assert.equal(receipt.responseText, raw);
+  assert.equal(receipt.ownership, 'owned');
+});
+
 // R18: the ID appears only after the answer was collected with none: the late ID alone does not make
 // it another response. Since #82 the hand-out proof (phase "complete") compares nothing about the
 // answer (ChatGPT keeps redrawing a finished one), so what is handed out is always the answer the

@@ -2213,9 +2213,25 @@ async function persistedPageResult(job, provider) {
       typeof record.raw !== "string" || !record.raw.trim() || (job.kind === "fix" && record.ownership !== "owned")) return undefined;
   return {ok:true, jobId:job.jobId, provider, runId:state.runId, raw:record.raw,
     responseText:typeof record.responseText === "string" ? record.responseText : "",
+    at:typeof record.at === "number" && Number.isFinite(record.at) ? record.at : 0,
     completion:record.completion && typeof record.completion.responseId === "string" && typeof record.completion.context === "string"
       ? {responseId:record.completion.responseId, context:record.completion.context} : undefined,
     persistedKey:key};
+}
+
+function persistedResultMayReplace(state, persisted) {
+  const code = state.outcome?.code;
+  if (state.outcome && !["response_timeout", "presend_stalled"].includes(code)) return false;
+  const collectedAt = [...(state.workerEvents || []), ...(state.pageEvents || [])]
+    .filter(event => event?.stage === "response_collected" && Number.isFinite(event.at))
+    .reduce((latest, event) => Math.max(latest, event.at), 0);
+  return !Number.isFinite(collectedAt) || persisted.at >= collectedAt;
+}
+
+async function discardPersistedPageResult(jobs, persisted) {
+  // Keep the receipt until the state save succeeds, even when it is stale and cannot replace the outcome.
+  await saveJobs(jobs);
+  await chrome.storage.session.remove([persisted.persistedKey]);
 }
 
 async function settleClosedTab(job, provider, jobs) {
@@ -2260,7 +2276,8 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   // the single source of truth for this run.
   const persisted = await persistedPageResult(job, provider);
   if (persisted) {
-    await ingestPersistedPageResult(job, provider, jobs, persisted);
+    if (persistedResultMayReplace(state, persisted)) await ingestPersistedPageResult(job, provider, jobs, persisted);
+    else await discardPersistedPageResult(jobs, persisted);
     return;
   }
   if (state.outcome) return;
@@ -2287,7 +2304,11 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (stalled) {
     if (await settleClosedTab(job, provider, jobs)) return;
     const lateReceipt = await persistedPageResult(job, provider);
-    if (lateReceipt) { await ingestPersistedPageResult(job, provider, jobs, lateReceipt); return; }
+    if (lateReceipt) {
+      if (persistedResultMayReplace(state, lateReceipt)) await ingestPersistedPageResult(job, provider, jobs, lateReceipt);
+      else await discardPersistedPageResult(jobs, lateReceipt);
+      return;
+    }
     state.outcome = failure("presend_stalled", stalled);
     workerStep(job, provider, "presend_watchdog");
     await saveJobs(jobs);

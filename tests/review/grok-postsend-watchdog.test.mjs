@@ -182,11 +182,50 @@ test('a receipt written after the timeout save replaces that timeout on the next
  const b = rig(grokLeg(31), {frozen:true, handler:()=>{throw new Error('frozen page cannot answer');}});
  await b.tick();
  assert.equal(b.local.state.pendingReviewJobs.A.states.grok.outcome?.code, 'response_timeout');
- await b.session.set({'ashlar:result:A:grok:run-A': {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'late'}});
+ await b.session.set({'ashlar:result:A:grok:run-A': {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'late',at:Date.now()}});
  await b.tick();
  const state = b.local.state.pendingReviewJobs.A.states.grok;
  assert.equal(state.outcome?.raw, raw);
  assert.equal(b.calls.some(call => call.action === 'complete' && call.results?.some(result => result.provider === 'grok')), true);
+});
+
+test('a stale receipt cannot overwrite an already durable success', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['durable']});
+ const job = grokLeg(10);
+ job.states.grok.outcome = {ok:true,raw,responseText:'durable'};
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw:'stale',responseText:'stale',at:Date.now()-MIN}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome.raw, raw);
+ assert.equal(b.calls.some(call => call.action === 'failure'), false);
+ assert.equal((await b.session.get([key]))[key], undefined);
+});
+
+test('a receipt older than response_collected cannot replace a timeout outcome', async () => {
+ const job = grokLeg(10);
+ const collectedAt = Date.now();
+ job.states.grok.outcome = {ok:false,code:'response_timeout',error:'old timeout'};
+ job.states.grok.workerEvents = [{source:'worker',sequence:1,stage:'response_collected',at:collectedAt}];
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw:'stale',responseText:'stale',at:collectedAt-1}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome.code, 'response_timeout');
+ assert.equal(state.outcome.raw, undefined);
+ assert.equal((await b.session.get([key]))[key], undefined);
 });
 
 test('a receipt for another run is ignored after a timeout', async () => {

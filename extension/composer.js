@@ -1179,6 +1179,7 @@ async function clickSend(findSend, findComposer, expectedText) {
   // logged_out.
   const SEND_WAIT_MS = 3 * 60 * 1000;
   let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null, blockCleared = false;
+  const loopStartedAt = Date.now();
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
     // After the confirmation check, so an accepted send is still journaled as sent; before any
@@ -1242,19 +1243,28 @@ async function clickSend(findSend, findComposer, expectedText) {
       if (uploadBusy && Date.now() - uploadWaitSince >= UPLOAD_MS) throw uploadWaitExpired(form, record.attachments || [], UPLOAD_MS);
       if (typeof throwIfLoggedOut === "function") throwIfLoggedOut();
       sendWaitSince = uploadBusy ? null : sendWaitSince ?? Date.now();
-      // Only while Send is still not clickable this tick: a tab that slept past the bound with Send
-      // ready clicks it instead.
-      if (!uploadBusy && !actionableSend(button) && Date.now() - sendWaitSince >= SEND_WAIT_MS) {
-        if (typeof savePresendStallHtml === "function") savePresendStallHtml("send_waiting");
-        throw presendStalled("send_waiting");
-      }
       const otherTurn = userTurns().length !== record.baseline;
-      const drafted = normalizePrompt(readComposer(editor)) === record.expected;
+      const typed = normalizePrompt(readComposer(editor));
+      const drafted = typed === record.expected;
+      const stopShown = typeof stopButtonVisible === "function" && stopButtonVisible();
+      const clickable = actionableSend(button);
+      // Everything the click below needs, named. Only a click leaves this loop: a draft that no longer
+      // matches, a user turn, a Stop button or an unclickable Send each keep it waiting, and the
+      // bound counts them all (live aicc #620, 1.1.67: send_waiting for 17 min on a reachable page
+      // whose Send was not the blocker, so the Send-only bound never fired).
+      const ready = !uploadBusy && !otherTurn && drafted && clickable && !stopShown;
+      // A tab that slept past the bound with everything ready clicks instead of stalling. The second
+      // bound is for an upload state that flaps and keeps resetting the first.
+      if (!ready && (!uploadBusy && Date.now() - sendWaitSince >= SEND_WAIT_MS ||
+          Date.now() - loopStartedAt >= UPLOAD_MS + SEND_WAIT_MS + 60_000)) {
+        const blockers = sendBlockers({button, clickable, drafted, otherTurn, stopShown, uploadBusy, typed, expected: record.expected});
+        if (typeof savePresendStallHtml === "function") savePresendStallHtml("send_waiting", {blockers, draft: draftDiff(typed, record.expected)});
+        throw presendStalled("send_waiting", blockers);
+      }
       // A fix draft that is the prompt only once whitespace is collapsed (or a fix journal with no
       // lossless form to check it against) is never sent.
       if (fix && drafted && !composerHoldsFix(editor, record.exact)) throw fixPromptAltered();
-      if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
-          !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
+      if (ready) {
         // Past the worker's deadline for this send the worker may have ended the leg (a tab frozen
         // in any pre-send stage, background.js presendWatchdog): never send then.
         if (presendDeadlinePassed()) {
@@ -1341,8 +1351,29 @@ function presendDeadlinePassed() {
   } catch { return false; }
 }
 
-function presendStalled(stage) {
-  const e = new Error(`presend_stalled: the pre-send stage "${stage}" did not finish in time; nothing was sent`);
+/** Where the composer's draft first differs from the prompt (both whitespace-normalized) and the text
+ * around it, so a "draft differs" stall says what the page changed. */
+function draftDiff(typed, expected) {
+  let i = 0;
+  while (i < typed.length && i < expected.length && typed[i] === expected[i]) i += 1;
+  return {typedLength: typed.length, expectedLength: expected.length, firstDifference: i,
+    typedNear: typed.slice(Math.max(0, i - 30), i + 60), expectedNear: expected.slice(Math.max(0, i - 30), i + 60)};
+}
+
+/** The pre-send blockers at a send_waiting stall, as a short sentence for the failure message. */
+function sendBlockers({button, clickable, drafted, otherTurn, stopShown, uploadBusy, typed, expected}) {
+  const parts = [];
+  if (uploadBusy) parts.push("attachments flapping");
+  if (!(button instanceof HTMLElement)) parts.push("no Send control");
+  else if (!clickable) parts.push("Send not clickable");
+  if (!drafted) parts.push(`draft differs (${typed.length} chars typed, ${expected.length} expected, first difference at ${draftDiff(typed, expected).firstDifference})`);
+  if (otherTurn) parts.push("a user turn appeared");
+  if (stopShown) parts.push("Stop button shown");
+  return parts.join("; ") || "unknown";
+}
+
+function presendStalled(stage, detail = "") {
+  const e = new Error(`presend_stalled: the pre-send stage "${stage}" did not finish in time; nothing was sent${detail ? ` (${detail})` : ""}`);
   e.code = "presend_stalled";
   e.stage = stage;
   return e;
@@ -1411,12 +1442,12 @@ function snapshotHtml(max = 200_000) {
   }).join("\n<!-- layer -->\n").slice(0, max);
 }
 
-function savePresendStallHtml(stage) {
+function savePresendStallHtml(stage, extra = {}) {
   try {
     const local = globalThis.chrome?.storage?.local;
     if (!local) return;
     const state = globalThis.__ashlarRunnerState;
-    const record = {job: state?.jobId, run: state?.runId, stage, at: Date.now(),
+    const record = {job: state?.jobId, run: state?.runId, stage, at: Date.now(), ...extra,
       url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: snapshotHtml()};
     globalThis.__ashlarPresendWrites = (globalThis.__ashlarPresendWrites || Promise.resolve()).then(async () => {
       const flags = await local.get(["presendStallHtmlOff", "presendStallHtml"]);

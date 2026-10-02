@@ -743,6 +743,9 @@ export function failBridgeProvider(jobId: string, provider: ReviewProvider, erro
   if (!job || job.status !== "awaiting_chat") return true;
   if (!llmWorkAllowed(job) || !ownsLease(job, leaseId)) return false;
   if (job.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim())) return true;
+  // A leg the server ended (reviewer turned off) is acknowledged and dropped: a refusal would make the
+  // worker retry it on every tick and keep its tab held.
+  if (job.endedLegs?.includes(provider)) return true;
   const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? [];
   if (!enabled.includes(provider)) return false;
   const prefix = error.split(":", 1)[0];
@@ -820,6 +823,7 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
   if (job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return {ok: false, error: "job is not claimed by this worker", code: "lease_conflict"};
   const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(getHarbor().settings);
   const accepted: ChatLeg[] = [];
+  const ended = incoming.filter(leg => job.endedLegs?.includes(leg.provider));
   for (const leg of incoming) {
     if (!isChatProvider(leg.provider) || !enabled.includes(leg.provider)) continue;
     try {
@@ -830,6 +834,8 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
     if (!parsed) return {ok: false, error: "completed response is not review JSON"};
     accepted.push({...leg, raw: parsed});
   }
+  // Only legs the server already ended: acknowledged, not stored (see failBridgeProvider).
+  if (!accepted.length && ended.length === incoming.length && ended.length) return {ok: true};
   if (!accepted.length) return {ok: false, error: "no enabled reviewer result"};
   patchHarborJob(jobId, current => {
     const storedLegs = [...(current.storedLegs ?? [])];

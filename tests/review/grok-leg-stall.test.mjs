@@ -171,3 +171,28 @@ test('a take poll after a long outage does not end the leg on stale time', () =>
   h.wait(2 * MIN, offer);
   assert.equal(row(h, 'R').providerErrors?.grok?.code, 'error');
 });
+
+// Review of #159: a result or failure the worker still holds for a leg the server ended must be
+// acknowledged, or the worker retries it every tick and keeps the tab held.
+test('a late result or failure for a leg ended by turning grok off is acknowledged and not stored', async () => {
+  const h = clocked([both()]);
+  const offer = h.bridge.takeNextBridgeJob('chrome-1');
+  h.bridge.endDisabledChatLegs(['grok']);
+  const raw = JSON.stringify({summary: 'ok', findings: [], verdict: 'clean'});
+  assert.equal(h.bridge.failBridgeProvider('R', 'grok', 'error: tab gone', offer.leaseId), true);
+  assert.equal(row(h, 'R').providerErrors?.grok, undefined, 'no failure recorded');
+  assert.deepEqual([...(row(h, 'R').assumptions ?? [])], []);
+  const out = await h.bridge.completeBridgeJob('R', raw, [{provider: 'grok', raw}], offer.leaseId);
+  assert.equal(out.ok, true);
+  assert.equal((row(h, 'R').storedLegs ?? []).length, 0, 'the ended leg is not stored');
+  assert.deepEqual([...row(h, 'R').reviewProviders], ['chatgpt']);
+});
+
+test('a leg that was never enabled still gets no acknowledgement', async () => {
+  const h = clocked([makeJob({id: 'R', createdAt: Date.now(), reviewProviders: ['chatgpt']})]);
+  const offer = h.bridge.takeNextBridgeJob('chrome-1');
+  assert.equal(h.bridge.failBridgeProvider('R', 'grok', 'error: x', offer.leaseId), false);
+  const raw = JSON.stringify({summary: 'ok', findings: [], verdict: 'clean'});
+  const out = await h.bridge.completeBridgeJob('R', raw, [{provider: 'grok', raw}], offer.leaseId);
+  assert.equal(out.ok, false);
+});

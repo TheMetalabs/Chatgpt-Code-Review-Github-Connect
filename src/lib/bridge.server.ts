@@ -368,9 +368,13 @@ const POST_SEND_STAGES: ReadonlySet<string> = new Set(["prompt_submitted", "wait
 
 const STALL_OUTAGE_MS = 5 * 60_000;
 
-/** The leg reported a post-send stage and no newer stage for its provider's CHAT_LEG_STALL_MS. */
+/** The leg reported a post-send stage and no newer stage for its provider's CHAT_LEG_STALL_MS, from a
+ * worker that has been heard from lately: a worker silent for longer than STALL_OUTAGE_MS (asleep,
+ * Chrome closed) says nothing about the leg, and its first heartbeat back restarts the clock
+ * (refreshBridgeClaim), so neither the take path nor a heartbeat fails a leg on time nobody watched. */
 function legStallExpired(job: Job, provider: ReviewProvider, now: number): boolean {
   const cap = CHAT_LEG_STALL_MS[provider], progress = job.providerProgress?.[provider];
+  if (job.bridgeClaimedAt !== undefined && now - job.bridgeClaimedAt > STALL_OUTAGE_MS) return false;
   return cap !== undefined && progress !== undefined && POST_SEND_STAGES.has(progress.stage) && now - progress.receivedAt >= cap;
 }
 
@@ -412,14 +416,28 @@ function settleLostBindings(jobs: readonly Job[]) {
   }
 }
 
-/** A reviewer turned off in settings: its unfinished legs on live jobs end (jobs keep the provider
- * list they were created with, so the switch alone never reached a job already waiting on it). */
+/** A reviewer turned off in settings: its unfinished legs on live jobs end, and the job then reads as
+ * one created with that reviewer off (jobs pin their provider list, so the switch alone never reached
+ * a job already waiting on it). The provider leaves the pinned lists instead of becoming a "Skipped"
+ * failure, so a clean verdict from the others still publishes clean. Only when no other reviewer
+ * would remain does the leg end as a failure, which is what that job is. */
 export function endDisabledChatLegs(providers: readonly ReviewProvider[]) {
   for (const job of [...getHarbor().jobs]) {
     if (job.status !== "awaiting_chat") continue;
-    const legs = pendingChatProviders(job).filter(provider => providers.includes(provider))
-      .map(provider => ({provider, code: "cancelled" as const, message: `${provider} was turned off in settings`}));
-    if (legs.length) settleChatLegs(job.id, legs);
+    const ended = pendingChatProviders(job).filter(provider => providers.includes(provider));
+    if (!ended.length) continue;
+    const list = job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? [];
+    if (!list.some(provider => !ended.includes(provider))) {
+      settleChatLegs(job.id, ended.map(provider => ({provider, code: "cancelled" as const, message: `${provider} was turned off in settings`})));
+      continue;
+    }
+    patchHarborJob(job.id, current => {
+      const keep = (all?: ReviewProvider[]) => all?.filter(provider => !ended.includes(provider));
+      return {...current, reviewProviders: keep(current.reviewProviders), fpProviders: keep(current.fpProviders),
+        generating: {...current.generating, ...Object.fromEntries(ended.map(provider => [provider, false]))},
+        endedLegs: [...new Set([...(current.endedLegs ?? []), ...ended])], updatedAt: Date.now()};
+    });
+    for (const provider of ended) cancelLocalJsonRepairs("superseded", job.id, provider);
   }
 }
 
@@ -428,11 +446,12 @@ export function bridgeJobState(jobId: string) {
   const job = getHarbor().jobs.find(j => j.id === jobId);
   // Legs the server ended (stall cap, reviewer turned off) while the job goes on for the others:
   // the worker stops them and releases their tabs (background.js refreshJobHeartbeat).
-  const endedProviders = job?.status === "awaiting_chat"
+  const failed = job?.status === "awaiting_chat"
     ? (job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? []).filter(isChatProvider).filter(provider =>
         job.providerErrors?.[provider] && job.providerErrors[provider]!.code !== "disconnected" &&
         !job.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim()))
     : [];
+  const endedProviders = [...new Set([...failed, ...(job?.status === "awaiting_chat" ? job.endedLegs ?? [] : [])])];
   return {active: job?.status === "awaiting_chat", status: job?.status ?? "missing", endedProviders};
 }
 

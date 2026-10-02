@@ -888,3 +888,24 @@ test('each stage of a Grok run keeps one HTML snapshot with its open layers', as
   });
   assert.deepEqual(out, {stages: ['prompt_prepared', 'send_waiting'], layer: true});
 });
+
+// Review of #159: the delayed after-send snapshots belong to the run that sent; once its slot is
+// released (or the tab is repurposed or reused) the page is someone else's and nothing is saved.
+test('delayed after-send snapshots stop once the run has left the tab', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async () => {
+    const local = new Map(); window.chrome.storage = {local: {get: async keys => Object.fromEntries([].concat(keys).filter(k => local.has(k)).map(k => [k, local.get(k)])), set: async o => { for (const [k, v] of Object.entries(o)) local.set(k, v); }}};
+    const state = {jobId: 'job', runId: 'run', provider: 'grok'};
+    globalThis.__ashlarRunnerState = state;
+    step('send_attempted');
+    await new Promise(r => setTimeout(r, 1300));
+    await globalThis.__ashlarStageHtmlWrites;
+    const live = (local.get('stageHtml') || []).map(e => e.stage);
+    state.slotReleased = true;
+    await new Promise(r => setTimeout(r, 2300));
+    await globalThis.__ashlarStageHtmlWrites;
+    return {live, after: (local.get('stageHtml') || []).map(e => e.stage)};
+  });
+  assert.deepEqual(out.live, ['send_attempted', 'after_send_1s']);
+  assert.deepEqual(out.after, ['send_attempted', 'after_send_1s'], 'the 3s snapshot was not taken');
+});

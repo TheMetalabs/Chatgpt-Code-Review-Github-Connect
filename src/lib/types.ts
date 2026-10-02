@@ -144,6 +144,8 @@ export interface Job {
   providerProgress?: Partial<Record<ReviewProvider, ProviderProgress>>;
   providerErrors?: Partial<Record<ReviewProvider, ProviderError>>;
   reviewProviders?: ReviewProvider[];
+  /** Chat legs ended because their reviewer was turned off; removed from the pinned lists, kept only so the worker is told to stop them. */
+  endedLegs?: ReviewProvider[];
   /** settings.localReviewRole pinned at snapshot; a later settings/env change never alters this job. */
   localReviewRole?: LocalReviewRole;
   /** Monotonic ownership token for the validator phase. Bumped on each awaiting_chat → validator

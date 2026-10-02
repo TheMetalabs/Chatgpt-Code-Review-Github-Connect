@@ -96,17 +96,28 @@ test('a collected or stored grok answer is never ended by the cap', () => {
   assert.deepEqual([...stored.bridge.bridgeJobState('R').endedProviders], []);
 });
 
-test('turning grok off ends its unfinished legs on live jobs, never a stored answer or another reviewer', () => {
+test('turning grok off reads as a job created with grok off, never a Skipped reviewer', () => {
   const h = clocked([both(),
     makeJob({id: 'S', createdAt: Date.now() + 1, reviewProviders: ['chatgpt', 'grok'], storedLegs: [{provider: 'grok', raw: '{"x":1}'}]}),
     makeJob({id: 'T', createdAt: Date.now() + 2, reviewProviders: ['chatgpt']})]);
   h.bridge.endDisabledChatLegs(['grok']);
+  assert.deepEqual([...row(h, 'R').reviewProviders], ['chatgpt']);
+  assert.equal(row(h, 'R').providerErrors?.grok, undefined, 'not a provider failure');
+  assert.deepEqual([...(row(h, 'R').assumptions ?? [])], [], 'no "Skipped grok" note, so a clean verdict stays clean');
+  assert.equal(row(h, 'R').generating.grok, false);
+  assert.deepEqual([...h.bridge.bridgeJobState('R').endedProviders], ['grok'], 'the worker is told to stop the leg');
+  assert.deepEqual([...row(h, 'S').reviewProviders], ['chatgpt', 'grok'], 'a stored answer stays');
+  assert.deepEqual([...h.bridge.bridgeJobState('S').endedProviders], []);
+  assert.deepEqual([...row(h, 'T').reviewProviders], ['chatgpt']);
+  assert.deepEqual([...h.bridge.bridgeJobState('T').endedProviders], []);
+});
+
+test('turning grok off on a job that waits only on grok ends it as a failure', () => {
+  const h = clocked([makeJob({id: 'R', reviewProviders: ['grok']})]);
+  h.bridge.endDisabledChatLegs(['grok']);
   assert.equal(row(h, 'R').providerErrors.grok.code, 'cancelled');
   assert.match(row(h, 'R').providerErrors.grok.message, /turned off/);
-  assert.equal(row(h, 'R').providerErrors.chatgpt, undefined);
   assert.deepEqual([...h.bridge.bridgeJobState('R').endedProviders], ['grok']);
-  assert.equal(row(h, 'S').providerErrors?.grok, undefined, 'a stored answer stays');
-  assert.equal(row(h, 'T').providerErrors, undefined);
 });
 
 test('endedProviders is empty for a transient disconnect and for a job that left awaiting_chat', () => {
@@ -144,4 +155,19 @@ test('a worker that was away for more than 5 min restarts the stall clock instea
   assert.equal(row(h, 'R').providerErrors?.grok, undefined);
   h.wait(2 * MIN, offer);
   assert.equal(row(h, 'R').providerErrors?.grok?.code, 'error', 'but a leg still silent 45 min later does end');
+});
+
+// Review of #159: the take path settles too, and must not fail a leg on time the worker was away.
+test('a take poll after a long outage does not end the leg on stale time', () => {
+  const h = clocked([both()]);
+  const offer = h.bridge.takeNextBridgeJob('chrome-1');
+  h.progress('R', 'grok', 'waiting_for_response');
+  h.advance(50 * MIN);
+  h.bridge.takeNextBridgeJob('chrome-1', ['R']);
+  assert.equal(row(h, 'R').providerErrors?.grok, undefined, 'nobody was watching those 50 min');
+  h.bridge.refreshBridgeClaim('R', {chatgpt: true, grok: true}, undefined, offer.leaseId);
+  h.wait(44 * MIN, offer);
+  assert.equal(row(h, 'R').providerErrors?.grok, undefined);
+  h.wait(2 * MIN, offer);
+  assert.equal(row(h, 'R').providerErrors?.grok?.code, 'error');
 });

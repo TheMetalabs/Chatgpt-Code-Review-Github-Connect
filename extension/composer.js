@@ -925,6 +925,8 @@ function saveStageHtml(stage) {
     seen[key] = true;
     const grok = /(^|\.)grok\.com$/.test(globalThis.location?.hostname || "");
     const save = label => {
+      // A delayed snapshot is the page after the run left it (released slot, repurposed or reused tab).
+      if (globalThis.__ashlarRunnerState !== state || state.slotReleased || state.tabRepurposed) return;
       const record = {job: state.jobId, run: state.runId, provider: state.provider, stage: label, at: Date.now(),
         visibility: String(globalThis.document?.visibilityState || ""), lifecycle: [...(state.pageLifecycle || [])],
         url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: snapshotHtml(60_000)};

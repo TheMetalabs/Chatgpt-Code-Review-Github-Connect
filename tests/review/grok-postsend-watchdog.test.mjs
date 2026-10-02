@@ -62,3 +62,30 @@ test('legs the server ended are abandoned inside the tab queue, and only if stil
  assert.ok(state?.abandoned===true&&state.abandonedAs==='ended',JSON.stringify(state));
  assert.equal(b.queue.overlapped,false);
 });
+
+// Review of #159: the cap asks the page once before ending the leg, and does not count unwatched time.
+test('at the cap the page is asked once; an answer or verdict it gives goes to the ordinary harvest',async()=>{
+ for(const frozen of [false,true]){
+  const b=rig(grokLeg(31),{frozen,handler:()=>({ok:false,code:'logged_out',error:'logged out'})});
+  await ticks(b);
+  assert.ok(b.messages.some(m=>m.type==='ashlar-harvest'),`frozen=${frozen}: the page was asked`);
+  assert.doesNotMatch(failure(b)?.error||'',/response_timeout/,`frozen=${frozen}`);
+ }
+});
+test('a page that is still busy at the cap does not save the leg',async()=>{
+ const b=rig(grokLeg(31));
+ await ticks(b);
+ assert.ok(b.messages.some(m=>m.type==='ashlar-harvest'));
+ assert.match(failure(b)?.error||'',/^response_timeout/);
+});
+test('time the worker was away is not counted against the cap',async()=>{
+ const away=rig(grokLeg(31,{extra:{lastPollAt:Date.now()-20*MIN}}));
+ await ticks(away);
+ assert.equal(failure(away),undefined,'a 20 min poll gap credits 16 min back: 15 min watched');
+ const credited=rig(grokLeg(40,{extra:{postsendSlackMs:15*MIN}}));
+ await ticks(credited);
+ assert.equal(failure(credited),undefined,'credit carried over from earlier gaps');
+ const watched=rig(grokLeg(31,{extra:{lastPollAt:Date.now()-3*MIN}}));
+ await ticks(watched);
+ assert.match(failure(watched)?.error||'',/^response_timeout/,'ordinary poll cadence is not a gap');
+});

@@ -718,6 +718,11 @@ const PRESEND_UNREACHABLE_GRACE_MS = 10 * 60_000;
  * legitimate there); FROZEN_POKE_MS lets one read-only poll through a frozen sent tab, which thaws it. */
 const POSTSEND_CAP_MS = {grok: 30 * 60_000};
 const FROZEN_POKE_MS = 3 * 60_000;
+// Poll gaps beyond this (the machine slept, Chrome was closed) are time nobody watched the leg; they are
+// credited back to its cap like the page credits its own wait (json.js), so an answer that finished
+// while the worker was away is harvested rather than cut off. Above FROZEN_POKE_MS so a frozen tab's
+// poke cadence never counts as a gap.
+const POSTSEND_GAP_MS = 4 * 60_000;
 function sentAt(state) {
   const times = (Array.isArray(state.pageEvents) ? state.pageEvents : []).filter(e => SENT_STAGES.includes(e.stage)).map(e => e.at);
   return times.length ? Math.min(...times) : undefined;
@@ -725,8 +730,15 @@ function sentAt(state) {
 /** Why the worker ends a sent leg that has no answer ("" while it may wait). */
 function postsendWatchdog(state, provider, now = Date.now()) {
   const cap = POSTSEND_CAP_MS[provider], at = sentAt(state);
-  if (cap === undefined || at === undefined || !state.started || state.outcome || state.delivered || now - at < cap) return "";
-  return `no answer was collected ${Math.round((now - at) / 60_000)} min after the prompt was sent (${provider} cap ${Math.round(cap / 60_000)} min)`;
+  const watched = at === undefined ? 0 : now - at - (state.postsendSlackMs || 0);
+  if (cap === undefined || at === undefined || !state.started || state.outcome || state.delivered || watched < cap) return "";
+  return `no answer was collected ${Math.round(watched / 60_000)} min after the prompt was sent (${provider} cap ${Math.round(cap / 60_000)} min)`;
+}
+function creditPostsendGap(state, now = Date.now()) {
+  if (sentAt(state) === undefined) return;
+  const gap = now - (state.lastPollAt ?? now);
+  if (gap > POSTSEND_GAP_MS) state.postsendSlackMs = (state.postsendSlackMs || 0) + gap - POSTSEND_GAP_MS;
+  state.lastPollAt = now;
 }
 
 /** Why the worker ends a leg that never sent ("" while it may wait): PRESEND_WATCHDOG_MS after its
@@ -753,12 +765,12 @@ function presendWatchdog(state, now = Date.now(), unreachable = "") {
 /** A stalled leg's tab, asked once read-only: {reply} when its page answered for this job, else
  * {unreachable} naming why it could not ("discarded" and "gone" are left to the poll's own wake and
  * rebinding paths, which are bounded). */
-async function probeStalledLeg(job, provider, state) {
+async function probeStalledLeg(job, provider, state, askFrozen = false) {
   let tab;
   try { tab = await chrome.tabs.get(state.tabId); } catch { return {unreachable: "gone"}; }
   if (!allowedTab(tab, provider)) return {unreachable: "gone"};
   if (tab.discarded === true || tab.status === "unloaded") return {unreachable: "discarded"};
-  if (tab.frozen === true) return {unreachable: "tab frozen"};
+  if (tab.frozen === true && !askFrozen) return {unreachable: "tab frozen"};
   if (tab.status && tab.status !== "complete") return {unreachable: "tab still loading"};
   try {
     const reply = await askPage(state.tabId, {type: "ashlar-harvest", jobId: job.jobId, provider, runId: state.runId}, contentFiles(provider));
@@ -2218,7 +2230,18 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     await saveJobs(jobs);
     return;
   }
-  const late = postsendWatchdog(state, provider);
+  creditPostsendGap(state);
+  let late = postsendWatchdog(state, provider);
+  // Like the pre-send watchdog: one read-only ask of the page before the leg is ended, so an answer
+  // that finished just now (or a verdict such as logged out) goes to the ordinary harvest below.
+  if (late) {
+    const probe = await probeStalledLeg(job, provider, state, true);
+    if (probe.reply) {
+      ingestPageProgress(state, probe.reply);
+      const verdict = !isBusyResult(probe.reply) && (probe.reply.ok || (probe.reply.code && probe.reply.code !== "idle"));
+      if (verdict) late = "";
+    }
+  }
   if (late) {
     state.outcome = failure("response_timeout", late);
     workerStep(job, provider, "postsend_watchdog");

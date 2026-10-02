@@ -795,3 +795,10 @@ test('grok pre-send: a layer that will not close blocks the send and is captured
   });
   assert.deepEqual(out, {closed: false, blocking: true, snap: true});
 });
+
+test('grok pre-send: a stale aria-hidden on <main> with no open layer does not block the send', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async () => { document.getElementById('m').setAttribute('aria-hidden', 'true');
+    return {blocking: grokBlockingLayer(), closed: await closeGrokLayers(300)}; });
+  assert.deepEqual(out, {blocking: false, closed: true});
+});

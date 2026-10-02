@@ -362,12 +362,11 @@ function openRadixTrigger(el) {
   if (el.getAttribute("aria-expanded") !== "true") el.click();
 }
 
-/** A layer that blocks the page: the content behind it is aria-hidden (Radix modal menus and
- * dialogs), or a menu/dialog is open. */
+/** A layer that blocks the page: a visible menu, dialog or popover. An aria-hidden <main> alone is not
+ * one (a stale attribute left after a layer unmounted would otherwise block every send). */
 function grokBlockingLayer() {
-  const main = document.querySelector("main");
-  if (main?.getAttribute("aria-hidden") === "true") return true;
-  return [...document.querySelectorAll("[role='dialog'], [role='alertdialog'], [role='menu']")].some(el => elVisible(el));
+  return [...document.querySelectorAll("[role='dialog'], [role='alertdialog'], [role='menu'], [data-radix-popper-content-wrapper]")]
+    .some(el => (typeof elVisible === "function" ? elVisible(el) : true) || el.matches("[data-radix-popper-content-wrapper]") && el.childElementCount > 0);
 }
 
 /** Close any open menu or dialog with Escape, sent where Radix listens (the focused element and the
@@ -375,6 +374,7 @@ function grokBlockingLayer() {
 async function closeGrokLayers(ms = 3000) {
   const end = Date.now() + ms;
   while (grokBlockingLayer() && Date.now() < end) {
+    globalThis.throwIfStopped?.(); // a stopped or taken-over run never sends keys into the user's page
     const key = {key: "Escape", code: "Escape", bubbles: true, cancelable: true};
     const targets = [document.activeElement, ...document.querySelectorAll("[role='menu'], [role='dialog'], [role='alertdialog']"), document];
     for (const t of targets) { try { t?.dispatchEvent(new KeyboardEvent("keydown", key)); } catch { /* next */ } }

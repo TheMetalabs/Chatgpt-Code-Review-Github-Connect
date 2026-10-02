@@ -273,3 +273,16 @@ test('Grok keeps a gap between its own dispatches', async()=>{
  await ticks(b,3);
  assert.ok(runs.includes('grok'));
 });
+
+test('a leg silent past its pre-send deadline does not hold other sends', async()=>{
+ const runs=[];
+ const stale={started:true,runId:'r0',tabId:5,runDispatchedAt:Date.now()-16*60_000};
+ const reg={Z:{jobId:'Z',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:stale}},
+  A:{jobId:'A',origin:'http://bridge',leaseId:'l',providers:['grok'],states:{grok:{}}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:reg,serialSends:true,grokPacing:{gapMs:0}}),
+  tabs:new Map([[5,{id:5,url:'https://chatgpt.com/?temporary-chat=true',status:'complete'}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);return {ok:false,code:'busy'};}});
+ await ticks(b,3);
+ assert.ok(runs.includes('grok'),`grok dispatched: ${runs}`);
+});

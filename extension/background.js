@@ -661,8 +661,13 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
 const GROK_DISPATCH_GAP_MS = 75_000;
 const SENT_STAGES = ["send_attempted", "send_unconfirmed", "prompt_submitted", "submission_persisted", "waiting_for_response",
   "generating", "json_observed", "response_completed_json_invalid", "response_collected"];
-function legSending(state) {
+function legSending(state, now = Date.now()) {
   if (!state?.started || state.outcome || state.delivered) return false;
+  // Past its own pre-send deadline a page can never send (composer.js presendDeadlinePassed): a leg
+  // whose page stopped reporting holds no one up beyond it.
+  const dispatchedAt = Number.isFinite(state.runDispatchedAt) ? state.runDispatchedAt
+    : (state.workerEvents || []).find(e => e?.stage === "run_dispatched")?.at;
+  if (Number.isFinite(dispatchedAt) && now - dispatchedAt >= PAGE_PRESEND_MS) return false;
   const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
   return !events.some(e => SENT_STAGES.includes(e.stage));
 }

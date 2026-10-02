@@ -90,6 +90,16 @@ test('worker/HTTP: malformed original repaired once, committed as ChatGPT, safel
  assert.equal(f.worker.calls.filter(x=>x.action==='repair-commit').length,1);
  assert.equal(f.worker.messages.some(m=>m.type==='ashlar-run'&&!m.resume),false);
 });
+test('worker/HTTP: terminal repair failure salvages the original and clears generation',async t=>{
+ const f=await workerFixture(t);await f.cycle();await eventually(()=>f.app.localRequests.length===1,'worker did not start repair');
+ f.app.localResponses[0].end(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({repair_failed:true})}}]}));
+ await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'terminal repair failure did not salvage the original');
+ const job=f.app.harbor.getHarbor().jobs.find(j=>j.id===f.job.jobId);
+ assert.equal(job.status,'posted');
+ assert.equal(job.generating?.chatgpt,false,'terminal repair must clear provider generation');
+ assert.equal(f.worker.calls.some(x=>x.action==='repair-commit'),false,'a failed repair cannot be committed');
+ assert.match(f.app.reviews[0].body,/not valid review JSON/i,'the original is preserved in raw_review');
+});
 test('worker/HTTP: disabled fallback salvages the reply into a posted review, without repair or failure',async t=>{
  const f=await workerFixture(t,{enabled:false});
  await eventually(async()=>{await f.cycle();return f.app.reviews.length===1;},'disabled fallback did not salvage the reply into a review');

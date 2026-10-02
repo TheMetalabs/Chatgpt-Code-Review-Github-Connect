@@ -2869,6 +2869,22 @@ async function repairProvider(job, provider, jobs) {
     workerStep(job,provider,`repair_${status.status}`);
     await saveJobs(jobs);
     if(status.status==="accepted")return acceptRepairReceipt(job,provider,jobs,status);
+    if (["needs_attention","interrupted","disabled","superseded"].includes(status.status)) {
+      // A terminal formatter result is not a reason to keep the provider generating forever. The
+      // original completed answer is still the only trustworthy evidence, so deliver the same
+      // canonical raw_review salvage used by the stalled sweep and let the bridge close this leg.
+      if (!state.outcome) {
+        const salvage=await readRepairSource(job,provider);
+        if (salvage?.text) {
+          state.outcome={ok:true,raw:salvageReviewEnvelope(salvage.text),originalText:salvage.text,salvaged:true};
+          delete state.formatError;
+          workerStep(job,provider,"salvaged_no_repair");
+          await saveJobs(jobs);
+        }
+      }
+      if (state.outcome) await deliverOutcome(job,provider,jobs);
+      return;
+    }
     if (["running","ready"].includes(status.status)) {
       const current=job.localJsonRepairEnabled ? await readRepairSource(job,provider,false) : null;
       if (current && (current.sourceHash!==attempt.sourceHash || current.responseId!==attempt.responseId)) {

@@ -663,8 +663,9 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
  * "grokPacing" {gapMs}, default GROK_DISPATCH_GAP_MS); ChatGPT's gap is set at admission.
  * "serialSends": false turns the one-send-at-a-time rule off. */
 const GROK_DISPATCH_GAP_MS = 75_000;
-const SENT_STAGES = ["send_attempted", "send_unconfirmed", "prompt_submitted", "submission_persisted", "waiting_for_response",
+const SUBMITTED_STAGES = ["prompt_submitted", "submission_persisted", "waiting_for_response",
   "generating", "json_observed", "response_completed_json_invalid", "response_collected"];
+const SENT_STAGES = ["send_attempted", "send_unconfirmed", ...SUBMITTED_STAGES];
 function legSending(state, now = Date.now(), allocating = false) {
   if (!state || state.outcome || state.delivered) return false;
   // Opening a tab: a leg whose tab exists but has not been dispatched yet (loading, queued) is about to
@@ -683,7 +684,7 @@ function legSending(state, now = Date.now(), allocating = false) {
     : (state.workerEvents || []).find(e => e?.stage === "run_dispatched")?.at;
   if (!Number.isFinite(dispatchedAt) || now - dispatchedAt >= PAGE_PRESEND_MS) return false;
   const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
-  return !events.some(e => SENT_STAGES.includes(e.stage));
+  return !events.some(e => SUBMITTED_STAGES.includes(e.stage));
 }
 async function dispatchBlocked(job, provider, jobs, allocating = false) {
   const {serialSends = true} = await chrome.storage.local.get(["serialSends"]);

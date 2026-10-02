@@ -1184,10 +1184,20 @@ async function clickSend(findSend, findComposer, expectedText) {
       if (!blockCleared && typeof clearSendBlock === "function" && await clearSendBlock()) {
         blockCleared = true;
         step("age_confirmed");
-        const settle = Date.now() + 4000;
-        while (Date.now() < settle && !submissionConfirmed(record)) await sleep(250);
-        if (!submissionConfirmed(record) && userTurns().length === record.baseline &&
-            normalizePrompt(readComposer(findComposer())) === record.expected) {
+        // The re-click is for a draft that stayed put with nothing happening: it needs the draft present,
+        // no sent turn and no stop button for 4 s in a row, inside an 8 s window. Any sign of a
+        // submission in flight (a turn, a stop button) keeps the wait instead: never a second send.
+        const windowEnd = Date.now() + 8000;
+        let quietSince = null, resend = false;
+        while (Date.now() < windowEnd) {
+          if (submissionConfirmed(record)) break;
+          const idle = userTurns().length === record.baseline && !(typeof stopButtonVisible === "function" && stopButtonVisible()) &&
+            normalizePrompt(readComposer(findComposer())) === record.expected;
+          quietSince = idle ? quietSince ?? Date.now() : null;
+          if (quietSince && Date.now() - quietSince >= 4000) { resend = true; break; }
+          await sleep(250);
+        }
+        if (resend) {
           record.phase = "prepared";
           delete record.attemptedAt;
           saveSubmission(record);

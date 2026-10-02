@@ -820,7 +820,7 @@ test('grok age verification that cannot be answered ends the run at once with wh
     return {code: err?.code, message: err?.message, ms: Date.now() - t0, year: document.querySelector('[aria-label="출생 연도"]').value};
   }, AGE_DIALOG_NO_BUTTON);
   assert.equal(out.code, 'age_verification', JSON.stringify(out));
-  assert.match(out.message, /verify the account's age.*nothing was sent/);
+  assert.match(out.message, /verify the account's age.*could not be confirmed/);
   assert.ok(out.ms < 5000, `at once, not after 60 s: ${out.ms} ms`);
   assert.equal(out.year, '', 'no confirm button: nothing is filled');
 });

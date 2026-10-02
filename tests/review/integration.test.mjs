@@ -286,3 +286,18 @@ test('a leg silent past its pre-send deadline does not hold other sends', async(
  await ticks(b,3);
  assert.ok(runs.includes('grok'),`grok dispatched: ${runs}`);
 });
+
+test('a leg waiting behind another send opens no tab until it may send', async()=>{
+ const runs=[];let chatgptDone=false;
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt','grok'],states:{chatgpt:{},grok:{}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job},serialSends:true,grokPacing:{gapMs:0},chatgptPacing:{maxInFlight:9,gapMs:0}}),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);
+   return chatgptDone&&msg.provider==='chatgpt'&&msg.type!=='ashlar-run'?{ok:false,code:'error',error:'ended'}:{ok:false,code:'busy'};}});
+ await ticks(b,4);
+ const creates=()=>b.effects.filter(e=>e.effect==='create').length;
+ assert.equal(creates(),1,'only the ChatGPT tab while ChatGPT is sending');
+ chatgptDone=true;await ticks(b,4);
+ assert.ok(runs.includes('grok'));
+ assert.equal(creates(),2,'the Grok tab opens once it may send');
+});

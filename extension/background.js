@@ -2195,6 +2195,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       await saveJobs(jobs);
       return;
     }
+    // No tab is opened while another leg is sending: a tab waiting minutes behind it, hidden, is the
+    // one Chrome freezes (and no watchdog can date a leg that was never dispatched).
+    if (await dispatchBlocked(job, provider, jobs)) return;
     await allocateProviderTab(job, provider, jobs);
     if (!state.tabId) return;
   }
@@ -2287,7 +2290,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       const replyWindow = pageWindow();
       if (replyWindow < MIN_DISPATCH_WINDOW_MS) return;
       if (await dispatchBlocked(job, provider, jobs)) return; // asked again next tick
-      state.runDispatchedAt ??= Date.now();
+      // Until a page accepts the run, each attempt carries a fresh deadline: a leg that waited behind
+      // other sends (dispatchBlocked) must not inherit a deadline from an attempt that never ran.
+      if (!state.started) state.runDispatchedAt = Date.now();
       result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS,
         presendDeadline: state.runDispatchedAt + PAGE_PRESEND_MS}, contentFiles(provider));
       // A page that refused the new run bound nothing: the run was never started.

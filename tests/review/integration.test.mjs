@@ -231,3 +231,16 @@ test('presend watchdog: a leg an older worker dispatched (no runDispatchedAt) is
  await ticks(b,2);
  assert.match(b.calls.find(c=>c.action==='failure'&&c.jobId==='A')?.error||'',/^presend_stalled: the tab was frozen in "send_waiting" for 180 min after dispatch/);
 });
+
+test('a Grok age-verification failure pauses grok legs like a logout, with a message saying what to finish', async()=>{
+ const offers=[{jobId:'A',provider:'grok',providers:['grok'],prompt:'p'},{jobId:'B',provider:'grok',providers:['grok'],prompt:'p'}];
+ const api=async(_p,body)=>body?.action==='take'?{ok:true,job:offers.shift()??null}:{ok:true,prompt:'p'};
+ const b=background({api,handler:(_id,msg)=>msg.type==='ashlar-run'?{ok:false,code:'busy'}:
+  {ok:false,code:'age_verification',error:"Grok asks to verify the account's age (a birth-year dialog); complete it once in the Grok tab, then retry (nothing was sent)"}});
+ for(let i=0;i<6 && !b.calls.some(c=>c.action==='failure'&&c.jobId==='B');i++){await b.tick();await flush();}
+ const a=b.calls.find(c=>c.action==='failure'&&c.jobId==='A');
+ assert.match(a?.error||'',/^age_verification: Grok asks to verify the account's age/);
+ assert.ok(b.local.state.loginPause?.grok>Date.now(),'grok paused');
+ const fb=b.calls.find(c=>c.action==='failure'&&c.jobId==='B');
+ if(fb)assert.match(fb.error,/^logged_out: grok is paused: it reported logged out or asked to verify the account's age/);
+});

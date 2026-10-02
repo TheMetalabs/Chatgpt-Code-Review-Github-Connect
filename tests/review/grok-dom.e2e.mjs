@@ -802,3 +802,24 @@ test('grok pre-send: a stale aria-hidden on <main> with no open layer does not b
     return {blocking: grokBlockingLayer(), closed: await closeGrokLayers(300)}; });
   assert.deepEqual(out, {blocking: false, closed: true});
 });
+
+// Live 2026-10-02 (aicc #639, 1.1.62): right after Send, Grok opened its age-verification dialog (captured
+// with the layer snapshot: role=dialog data-analytics-name="age_verification", "나이를 확인해 주세요",
+// a YYYY input and 계속하기), consumed the prompt and sent nothing; the run waited 60 s (send_unconfirmed).
+const AGE_DIALOG = `<div role="dialog" data-state="open" data-analytics-name="age_verification" style="width:320px;height:160px"><h2>나이를 확인해 주세요</h2><p>태어난 연도를 선택하세요.</p><input inputmode="numeric" maxlength="4" placeholder="YYYY" aria-label="출생 연도" value=""><button type="button"><span>계속하기</span></button></div>`;
+test('grok age verification after Send ends the run at once with what to do, and the birth year is never filled', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async dialog => {
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'attempted', expected: 'review prompt', baseline: 0, attemptedAt: Date.now(), attachments: []}));
+    document.body.insertAdjacentHTML('beforeend', dialog);
+    const t0 = Date.now();
+    let err;
+    try { await clickSend(sendButton, composer, 'review prompt'); } catch (e) { err = e; }
+    return {code: err?.code, message: err?.message, ms: Date.now() - t0, year: document.querySelector('[aria-label="출생 연도"]').value};
+  }, AGE_DIALOG);
+  assert.equal(out.code, 'age_verification', JSON.stringify(out));
+  assert.match(out.message, /verify the account's age.*nothing was sent/);
+  assert.ok(out.ms < 5000, `at once, not after 60 s: ${out.ms} ms`);
+  assert.equal(out.year, '', 'the birth year is the account owner\'s to give');
+});

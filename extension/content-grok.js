@@ -154,6 +154,23 @@ async function startFresh(deadline) {
   return waitUntilComposer(end, throwIfLoggedOut);
 }
 
+/** Why Grok did not take a send, read from the page (null when nothing says so). Live 2026-10-02
+ * (aicc #639, 1.1.62): right after Send, Grok opened its age-verification dialog
+ * (role=dialog, data-analytics-name="age_verification": "나이를 확인해 주세요 · 태어난 연도를 선택하세요"),
+ * consumed the prompt and sent nothing; the run waited 60 s as send_unconfirmed. A birth year is the
+ * account owner's to give: the run never fills it, it ends saying what to do. */
+function sendBlockedError() {
+  // Every matching dialog is checked: a stale hidden one listed first never masks the open one.
+  const shown = [...document.querySelectorAll("[role='dialog']")].some(el =>
+    (el.getAttribute("data-analytics-name") === "age_verification" ||
+      /나이를 확인|verify your age|태어난 연도|year of birth|birth year/i.test(el.textContent || "")) &&
+    (typeof elVisible !== "function" || elVisible(el) || el.getAttribute("data-state") === "open"));
+  if (!shown) return null;
+  const e = new Error("Grok asks to verify the account's age (a birth-year dialog); complete it once in the Grok tab, then retry (nothing was sent)");
+  e.code = "age_verification";
+  return e;
+}
+
 async function runPrompt(prompt, reasoning, resume = false) {
   // A restarted worker must observe the existing request, never submit it again.
   if (resume) {
@@ -168,6 +185,8 @@ async function runPrompt(prompt, reasoning, resume = false) {
   await dismissOverlays();
   // Never click Send under an open menu or dialog (live 2026-10-02: two legs clicked Send with the page
   // aria-hidden behind a layer, and nothing was sent): closed first, or the run ends saying so.
+  const ageGate = sendBlockedError();
+  if (ageGate) throw ageGate;
   if (!await closeGrokLayers()) {
     if (typeof savePresendStallHtml === "function") savePresendStallHtml("grok_layer_open");
     throw presendStalled("grok_layer_open");

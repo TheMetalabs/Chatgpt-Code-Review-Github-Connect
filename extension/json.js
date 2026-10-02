@@ -338,6 +338,7 @@ function harvestJson(opts) {
 function recordReviewStep(stage) {
   const state = globalThis.__ashlarRunnerState;
   if (!state?.jobId || !state.runId) return;
+  if (typeof saveStageHtml === "function") saveStageHtml(stage); // the page at this stage (diagnostic)
   const key = `ashlar:steps:${state.jobId}:${state.runId}`;
   if (!state.steps) {
     try { state.steps = JSON.parse(sessionStorage.getItem(key) || "null"); } catch { /* local journal unavailable */ }

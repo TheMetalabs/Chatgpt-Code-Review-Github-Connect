@@ -906,6 +906,40 @@ function step(stage) {
   if (typeof recordReviewStep === "function") recordReviewStep(stage);
 }
 
+/** Diagnostic: the real page at each stage of a run, in chrome.storage.local "stageHtml" (last
+ * STAGE_HTML_MAX), so a provider's live DOM can be read step by step the way ChatGPT's was (Grok
+ * 2026-10-02: every leg failed after Send and only a 5 s / 60 s snapshot existed). Once per stage per
+ * run; after Send, also at 1, 3, 5, 15, 30 and 60 s. "stageHtmlProbe": "grok" (default), "all" or
+ * "off". Never affects the run. */
+function saveStageHtml(stage) {
+  const STAGE_HTML_MAX = 24; // a function-local constant: content scripts are re-injected
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    const state = globalThis.__ashlarRunnerState;
+    if (!local || !state?.jobId || typeof snapshotHtml !== "function") return;
+    const seen = state.stageHtmlSeen ||= {};
+    const key = `${state.runId}:${stage}`;
+    if (seen[key]) return;
+    seen[key] = true;
+    const grok = /(^|\.)grok\.com$/.test(globalThis.location?.hostname || "");
+    const save = label => {
+      const record = {job: state.jobId, run: state.runId, provider: state.provider, stage: label, at: Date.now(),
+        url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: snapshotHtml(60_000)};
+      globalThis.__ashlarStageHtmlWrites = (globalThis.__ashlarStageHtmlWrites || Promise.resolve()).then(async () => {
+        const got = await local.get(["stageHtmlProbe", "stageHtml"]);
+        const mode = got?.stageHtmlProbe || "grok";
+        if (mode === "off" || (mode === "grok" && !grok)) return;
+        const list = Array.isArray(got?.stageHtml) ? got.stageHtml : [];
+        await local.set({stageHtml: [...list, record].slice(-STAGE_HTML_MAX)});
+      }).catch(() => {});
+    };
+    save(stage);
+    if (stage === "send_attempted") {
+      for (const s of [1, 3, 5, 15, 30, 60]) setTimeout(() => save(`after_send_${s}s`), s * 1000);
+    }
+  } catch { /* diagnostics never affect the run */ }
+}
+
 function actionableSend(button) {
   if (!(button instanceof HTMLElement) || !button.isConnected || button.hidden ||
       button.disabled || button.getAttribute("aria-disabled") === "true") return false;

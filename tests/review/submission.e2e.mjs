@@ -79,6 +79,27 @@ test('submission: send-wait probe records control state without prompt text',asy
  assert.equal('prompt' in probe,false);
 });
 
+test('submission: actionable Send records the other click gates when the draft differs',async t=>{
+ const page=await fixture(t);
+ await page.evaluate(()=>{
+   window.composer=()=>document.querySelector('textarea');
+   document.querySelector('textarea').value='different draft';
+   window.probeStore={};
+   chrome.storage={local:{get:async()=>probeStore,set:async value=>Object.assign(probeStore,value)}};
+ });
+ await start(page);await page.clock.runFor(6000);
+ const probes=await page.evaluate(()=>probeStore.sendWaitProbes);
+ const latest=probes.at(-1);
+ assert.equal(latest.candidates.some(candidate=>candidate.actionable),true);
+ assert.deepEqual({draftedMatches:latest.draftedMatches,otherTurn:latest.otherTurn,stopVisible:latest.stopVisible},
+   {draftedMatches:false,otherTurn:false,stopVisible:false});
+ assert.equal(latest.expectedLength,'owned review prompt'.length);
+ assert.equal(latest.draftLength,'different draft'.length);
+ assert.equal(typeof latest.draftHead,'string');
+ assert.equal(JSON.stringify(latest).includes('different draft'),false);
+ assert.equal(await page.evaluate(()=>clicks),0);
+});
+
 test('submission: a prepared journal resumes after reload, an attempted journal never clicks again',async t=>{
  const page=await fixture(t,{disabled:true});await start(page);await page.clock.runFor(500);
  const stored=await page.evaluate(()=>sessionStorage.getItem(submissionKey()));

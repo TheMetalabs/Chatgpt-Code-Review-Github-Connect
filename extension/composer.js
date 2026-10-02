@@ -988,8 +988,7 @@ function sendControlProbe() {
     for (const button of root.querySelectorAll(selector)) {
       if (!(button instanceof HTMLElement) || seen.has(button)) continue;
       seen.add(button);
-      candidates.push({selector, label: button.getAttribute("aria-label") || "",
-        testId: button.getAttribute("data-testid") || "", disabled: button.disabled === true,
+      candidates.push({selector, disabled: button.disabled === true,
         ariaDisabled: button.getAttribute("aria-disabled"), dataDisabled: button.getAttribute("data-disabled"),
         dataState: button.getAttribute("data-state"), pointerEvents: getComputedStyle(button).pointerEvents,
         rendered: renderedControl(button), actionable: actionableSend(button)});
@@ -998,7 +997,7 @@ function sendControlProbe() {
   return {editor: Boolean(editor), form: Boolean(form), candidates: candidates.slice(0, 16)};
 }
 
-function saveSendWaitProbe(form, attachments = []) {
+function saveSendWaitProbe(form, submission, {editor, button, otherTurn, draftedMatches, stopVisible}) {
   try {
     const local = globalThis.chrome?.storage?.local, state = globalThis.__ashlarRunnerState;
     if (!local?.get || !local?.set || !state?.jobId || !state.runId) return;
@@ -1006,9 +1005,13 @@ function saveSendWaitProbe(form, attachments = []) {
     if (state.sendWaitProbeAt && now - state.sendWaitProbeAt < 5000) return;
     state.sendWaitProbeAt = now;
     const probe = sendControlProbe();
+    const draft = readComposer(editor), attachments = submission.attachments || [];
     const record = {job: state.jobId, run: state.runId, provider: state.provider, at: now, ...probe,
       attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
-      attachmentsReady: attachmentsReady(form, attachments)};
+      attachmentsReady: attachmentsReady(form, attachments), selectedActionable: actionableSend(button),
+      otherTurn, draftedMatches, stopVisible, expectedLength: submission.expected.length,
+      draftLength: draft.length, expectedHead: sendProbeHash(submission.expected.slice(0, 40)),
+      draftHead: sendProbeHash(draft.slice(0, 40))};
     globalThis.__ashlarSendWaitProbeWrites = (globalThis.__ashlarSendWaitProbeWrites || Promise.resolve()).then(async () => {
       const stored = (await local.get(["sendWaitProbes"]))?.sendWaitProbes;
       await local.set({sendWaitProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-20)});
@@ -1281,7 +1284,6 @@ async function clickSend(findSend, findComposer, expectedText) {
       }
       const uploadBusy = !attachmentsReady(form, record.attachments || []);
       step(uploadBusy ? "attachments_waiting" : "send_waiting");
-      if (!uploadBusy) saveSendWaitProbe(form, record.attachments || []);
       uploadWaitSince = uploadBusy ? uploadWaitSince ?? Date.now() : null;
       if (uploadBusy && Date.now() - uploadWaitSince >= UPLOAD_MS) throw uploadWaitExpired(form, record.attachments || [], UPLOAD_MS);
       if (typeof throwIfLoggedOut === "function") throwIfLoggedOut();
@@ -1294,11 +1296,13 @@ async function clickSend(findSend, findComposer, expectedText) {
       }
       const otherTurn = userTurns().length !== record.baseline;
       const drafted = normalizePrompt(readComposer(editor)) === record.expected;
+      const stopVisible = typeof stopButtonVisible === "function" && stopButtonVisible();
       // A fix draft that is the prompt only once whitespace is collapsed (or a fix journal with no
       // lossless form to check it against) is never sent.
       if (fix && drafted && !composerHoldsFix(editor, record.exact)) throw fixPromptAltered();
+      if (!uploadBusy) saveSendWaitProbe(form, record, {editor, button, otherTurn, draftedMatches: drafted, stopVisible});
       if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
-          !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
+          !stopVisible) {
         // Past the worker's deadline for this send the worker may have ended the leg (a tab frozen
         // in any pre-send stage, background.js presendWatchdog): never send then.
         if (presendDeadlinePassed()) {

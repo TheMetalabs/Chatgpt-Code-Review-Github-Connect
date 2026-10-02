@@ -363,15 +363,19 @@ function reviewProgress() {
 function boundReviewResponse(submission) {
   const messages = conversationTurnEls();
   const users = messages.filter(node => turnRole(node) === "user");
-  let user;
+  const runnerState = globalThis.__ashlarRunnerState;
+  let user, identityMatched = false;
   if (submission.messageId) {
     const matches = users.filter(node => turnMessageId(node) === submission.messageId);
-    if (matches.length === 1) user = matches[0];
-    // Grok can re-key a user bubble while preserving transcript order. Fall back only to the
-    // journaled position; the exact prompt check below and the later-user followup fence still
-    // have to pass, so a newer user turn can never inherit this run.
-    else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline)
-      user = users[submission.submittedUsers - 1];
+    if (matches.length === 1) { user = matches[0]; identityMatched = true; }
+    // Grok can re-key a user bubble while preserving transcript order. Position fallback is safe
+    // only when this live page previously confirmed that exact node; a removed turn and a later
+    // user prompt at the same position must remain unbound.
+    else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
+      const candidate = users[submission.submittedUsers - 1];
+      if (runnerState?.confirmedSubmission?.record === submission && runnerState.boundUserNode === candidate &&
+          (!submission.conversation || fixConversationHolds(submission))) user = candidate;
+    }
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
     user = users[submission.submittedUsers - 1];
   }
@@ -382,6 +386,7 @@ function boundReviewResponse(submission) {
   if (!user || !submission.expected || !(typeof reviewTurnHolds === "function" ? reviewTurnHolds(shown, submission.expected) : normalizePrompt(shown).includes(submission.expected))) {
     return {root: null, followup: false, identified: false};
   }
+  if (identityMatched && runnerState?.confirmedSubmission?.record === submission) runnerState.boundUserNode = user;
   // Some renderers assign message IDs after mounting the text. Pin that identity
   // when it appears rather than staying on the weaker positional fallback. A journal
   // that carries its conversation (a fix's or a review's, recorded at send or pinned
@@ -687,6 +692,25 @@ function saveResponseWaitHtml(bound) {
 
 /** Collection needs two identical stable observations (`key`). On the second one the runner
  * records the answer and, for an identified response, its native completion proof. */
+async function persistCollectedResult(runner, raw, text) {
+  // A frozen page may finish its collector while the worker cannot receive the reply. Keep the
+  // exact bound result in the extension session store so the worker can ingest it on its next poke.
+  // The worker validates every identity field before accepting this receipt and removes it only
+  // after the durable job save, so a duplicate delivery cannot create a second completion.
+  if (!runner?.jobId || !runner.runId || !runner.provider || typeof raw !== "string" || !raw.trim()) return;
+  const storage = globalThis.chrome?.storage?.session;
+  if (!storage?.set) return;
+  const key = `ashlar:result:${runner.jobId}:${runner.provider}:${runner.runId}`;
+  const completion = runner.nativeCompletion;
+  try {
+    const record = {jobId: runner.jobId, provider: runner.provider, runId: runner.runId,
+      raw, responseText: typeof text === "string" ? text : "", at: Date.now()};
+    if (completion && typeof completion.responseId === "string" && typeof completion.context === "string")
+      record.completion = {responseId: completion.responseId, context: completion.context};
+    await storage.set({[key]: record});
+  } catch { /* session storage is a recovery hint; the live reply remains authoritative */ }
+}
+
 function settleStableAnswer(stability, key, poll, {text, raw}) {
   stability.hits = stability.stable === key ? stability.hits + 1 : 1;
   stability.stable = key;
@@ -700,6 +724,7 @@ function settleStableAnswer(stability, key, poll, {text, raw}) {
       jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
       responseId:bound.responseId,context:reviewPageContext(),text,raw,
     });
+    runner.persistedResult = persistCollectedResult(runner, raw, text);
   }
   recordReviewStep("response_collected");
   return true;
@@ -759,7 +784,10 @@ async function waitUntilReviewOrQuota(name) {
     expireGeneratingLease(lease, name, poll, text);
     expireResponseWait(wait, name, poll);
     if (done && json) {
-      if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) return json;
+      if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) {
+        if (runner?.persistedResult) await runner.persistedResult;
+        return json;
+      }
     } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
   }
@@ -1686,6 +1714,7 @@ function installReviewRunner(name, run) {
     state.sourceTrackingOwner = undefined;
     state.repairProbeTracker = undefined;
     state.repairReceipt = undefined;
+    state.boundUserNode = undefined;
     state.observation = undefined;
     state.completedSource = undefined;
     state.completionTracking = undefined;

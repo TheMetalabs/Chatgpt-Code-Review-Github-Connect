@@ -29,6 +29,10 @@ const OWNED_PREFIX = "ashlar:tab:";
 // tab's page when the page lost its binding (rebindDispatchedPage), never any other tab.
 const DISPATCH_PREFIX = "ashlar:dispatched:";
 const dispatchKey = (jobId, provider) => `${DISPATCH_PREFIX}${jobId}:${provider}`;
+// A page writes a completed JSON result here before returning from its collector. This receipt
+// bridges a frozen-tab gap where tabs.sendMessage cannot deliver the normal harvest reply.
+const PAGE_RESULT_PREFIX = "ashlar:result:";
+const pageResultKey = (jobId, provider, runId) => `${PAGE_RESULT_PREFIX}${jobId}:${provider}:${runId || "legacy"}`;
 // A fix run whose tab the worker preserved without the page's own release (it never answered):
 // the inventory treats that page's binding as released, so it is never an orphan holding capacity,
 // and completes the release handshake as soon as the page can answer (see completePreservedRelease).
@@ -2198,6 +2202,36 @@ async function takenBeforeSend(job, provider, jobs, cause) {
   await saveJobs(jobs);
 }
 
+/** Read a result persisted by a page whose normal runtime reply was lost while its tab froze. */
+async function persistedPageResult(job, provider) {
+  const state = job.states[provider];
+  if (!state?.runId) return undefined;
+  const key = pageResultKey(job.jobId, provider, state.runId);
+  const record = (await chrome.storage.session.get([key]))[key];
+  if (!record || record.jobId !== job.jobId || record.provider !== provider || record.runId !== state.runId ||
+      typeof record.raw !== "string" || !record.raw.trim()) return undefined;
+  return {ok:true, jobId:job.jobId, provider, runId:state.runId, raw:record.raw,
+    responseText:typeof record.responseText === "string" ? record.responseText : "",
+    completion:record.completion && typeof record.completion.responseId === "string" && typeof record.completion.context === "string"
+      ? {responseId:record.completion.responseId, context:record.completion.context} : undefined,
+    persistedKey:key};
+}
+
+async function ingestPersistedPageResult(job, provider, jobs, persisted) {
+  const state = job.states[provider];
+  state.started = true;
+  delete state.connectionError;
+  delete state.timeoutReceiptChecked;
+  state.outcome = {ok:true, raw:persisted.raw, originalText:persisted.responseText,
+    completion:persisted.completion};
+  workerStep(job, provider, "response_collected");
+  await clearLoginProbe(provider, job);
+  // Remove only after the same save that makes the result durable; a failed save leaves the receipt
+  // available for the next worker wakeup.
+  await saveJobs(jobs);
+  await chrome.storage.session.remove([persisted.persistedKey]);
+}
+
 /** A leg's poll, one operation in the tab queue (allocation, dispatch, harvest and their records). */
 function pollProvider(job, provider, jobs, observeOnly = false) {
   return tabOp("poll", () => pollProviderBody(job, provider, jobs, observeOnly));
@@ -2206,7 +2240,19 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   // Nothing for a job that retired (or was reset) while this operation waited in the queue.
   if (jobs[job.jobId] !== job) return;
   const state = job.states[provider];
-  if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
+  if (state.delivered || sourceArchiveDurable(state)) return;
+  // A timeout can be saved in the same tick that the page finishes its storage receipt. Read the
+  // identity-bound receipt before honoring any prior non-success outcome, then keep the receipt as
+  // the single source of truth for this run.
+  const persisted = await persistedPageResult(job, provider);
+  if (persisted) {
+    await ingestPersistedPageResult(job, provider, jobs, persisted);
+    return;
+  }
+  if (state.outcome) return;
+  // A content page may have persisted a complete response immediately before its tab froze. Read
+  // this receipt before watchdogs or tab lookups; the receipt is bound to this run and removes only
+  // after the durable job save, so a duplicate delivery cannot create a second completion.
   // First of all, before any tab lookup (discarded, loading or missing tabs return early below): the
   // worker's own bound on a leg that never sent. The tab is left to the cleanup policy, and the page
   // never sends after its deadline (PAGE_PRESEND_MS, carried in the run message).
@@ -2225,6 +2271,8 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     else stalled = presendWatchdog(state, Date.now(), probe.unreachable);
   }
   if (stalled) {
+    const lateReceipt = await persistedPageResult(job, provider);
+    if (lateReceipt) { await ingestPersistedPageResult(job, provider, jobs, lateReceipt); return; }
     state.outcome = failure("presend_stalled", stalled);
     workerStep(job, provider, "presend_watchdog");
     await saveJobs(jobs);
@@ -2243,6 +2291,8 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     }
   }
   if (late) {
+    const lateReceipt = await persistedPageResult(job, provider);
+    if (lateReceipt) { await ingestPersistedPageResult(job, provider, jobs, lateReceipt); return; }
     state.outcome = failure("response_timeout", late);
     workerStep(job, provider, "postsend_watchdog");
     await saveJobs(jobs);
@@ -2494,6 +2544,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     return;
   }
   await saveJobs(jobs);
+  // A normal live harvest can win the race with a receipt written by an older page instance;
+  // remove that exact run's receipt after the same durable save to keep retries idempotent.
+  await chrome.storage.session.remove([pageResultKey(job.jobId, provider, state.runId)]);
   if (state.outcome.code === "quota") await markQuota(provider);
   // An account gate the page cannot pass (logged out; Grok's age verification) pauses the provider:
   // every queued leg would end the same way until the user finishes it in the tab.
@@ -2502,6 +2555,13 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
 
 async function deliverOutcome(job, provider, jobs, signal) {
   const state = job.states[provider], out = state.outcome;
+  // Give a response timeout one worker tick for a page receipt whose storage write raced the watchdog.
+  // pollProviderBody checks this receipt before the next delivery; other failures remain immediate.
+  if (out?.code === "response_timeout" && !state.timeoutReceiptChecked) {
+    state.timeoutReceiptChecked = true;
+    await saveJobs(jobs);
+    return;
+  }
   // A durable archive normally settles via the repair-commit path, so it is not re-delivered here —
   // EXCEPT a no-repair salvage outcome, whose only delivery path is this complete request.
   if (!out || state.delivered || (sourceArchiveDurable(state) && !out.salvaged)) return;

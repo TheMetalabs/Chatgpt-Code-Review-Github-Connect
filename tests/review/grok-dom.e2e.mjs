@@ -728,6 +728,8 @@ test('Grok binds the sent turn by position when its DOM user id is re-keyed', as
   const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div><div data-testid="assistant-message" id="response-answer-A" role="article"><p>answer</p></div><button aria-label="Copy response">copy</button></main>${COMPOSER}`);
   const out = await page.evaluate(() => {
     const submission = {phase:'sent', expected:'review', baseline:0, submittedUsers:1, messageId:'user-A'};
+    globalThis.__ashlarRunnerState = {confirmedSubmission:{record:submission}};
+    boundReviewResponse(submission);
     document.querySelector('[data-testid="user-message"]').id = 'response-user-B';
     const bound = boundReviewResponse(submission);
     document.querySelector('main').insertAdjacentHTML('beforeend', '<div data-testid="user-message" id="response-user-C" role="article">followup</div><div data-testid="assistant-message" id="response-answer-C" role="article">later answer</div>');

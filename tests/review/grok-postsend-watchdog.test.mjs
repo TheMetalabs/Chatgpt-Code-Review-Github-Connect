@@ -89,3 +89,42 @@ test('time the worker was away is not counted against the cap',async()=>{
  await ticks(watched);
  assert.match(failure(watched)?.error||'',/^response_timeout/,'ordinary poll cadence is not a gap');
 });
+
+test('a frozen Grok page result persisted after response_collected is ingested without a page reply', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['fixture']});
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:grokLeg(10)}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'original'}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome?.raw, raw);
+ assert.equal((await b.session.get([key]))[key], undefined);
+ assert.equal(b.calls.some(call => call.action === 'complete' && call.results?.some(result => result.provider === 'grok')), true);
+});
+
+test('a receipt written after the timeout save replaces that timeout on the next tick', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['late receipt']});
+ const b = rig(grokLeg(31), {frozen:true, handler:()=>{throw new Error('frozen page cannot answer');}});
+ await b.tick();
+ assert.equal(b.local.state.pendingReviewJobs.A.states.grok.outcome?.code, 'response_timeout');
+ await b.session.set({'ashlar:result:A:grok:run-A': {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'late'}});
+ await b.tick();
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome?.raw, raw);
+ assert.equal(b.calls.some(call => call.action === 'complete' && call.results?.some(result => result.provider === 'grok')), true);
+});
+
+test('a receipt for another run is ignored after a timeout', async () => {
+ const b = rig(grokLeg(31), {frozen:true, handler:()=>{throw new Error('frozen page cannot answer');}});
+ await b.tick();
+ await b.session.set({'ashlar:result:A:grok:run-A': {jobId:'A',provider:'grok',runId:'run-other',raw:'wrong'}});
+ await b.tick();
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome?.code, 'response_timeout');
+ assert.equal(state.outcome?.raw, undefined);
+});

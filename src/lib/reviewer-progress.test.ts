@@ -228,7 +228,7 @@ describe("buildReviewerLanes", () => {
     assert.equal(lanes[0].answered, false);
     assert.equal(lanes[0].findingCount, undefined);
     assert.match(lanes[0].detail, /raw evidence/i);
-    assert.equal(lanes[0].jsonChars > 0, true);
+    assert.ok((lanes[0].jsonChars ?? 0) > 0);
   });
 
   it("keeps an old client's undelivered flag pending without claiming prompt submission", () => {

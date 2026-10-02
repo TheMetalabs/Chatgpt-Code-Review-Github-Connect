@@ -699,14 +699,18 @@ async function persistCollectedResult(runner, raw, text, ownership) {
   // exact bound result in the extension session store so the worker can ingest it on its next poke.
   // The worker validates every identity field before accepting this receipt and removes it only
   // after the durable job save, so a duplicate delivery cannot create a second completion.
-  if (!runner?.jobId || !runner.runId || !runner.provider || typeof raw !== "string" || !raw.trim()) return;
+  if (!runner?.jobId || !runner.runId || !runner.provider) return;
+  let storedRaw;
+  try { storedRaw = typeof raw === "string" ? raw : JSON.stringify(raw); }
+  catch { return; }
+  if (typeof storedRaw !== "string" || !storedRaw.trim()) return;
   const storage = globalThis.chrome?.storage?.session;
   if (!storage?.set) return;
   const key = `ashlar:result:${runner.jobId}:${runner.provider}:${runner.runId}`;
   const completion = runner.nativeCompletion;
   try {
     const record = {jobId: runner.jobId, provider: runner.provider, runId: runner.runId,
-      raw, responseText: typeof text === "string" ? text : "", at: Date.now()};
+      raw: storedRaw, responseText: typeof text === "string" ? text : "", at: Date.now()};
     if (runner.kind === "fix") record.ownership = ownership;
     if (completion && typeof completion.responseId === "string" && typeof completion.context === "string")
       record.completion = {responseId: completion.responseId, context: completion.context};

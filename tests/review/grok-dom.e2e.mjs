@@ -776,6 +776,18 @@ test('a fix receipt records the positive ownership proof', async t => {
  assert.equal(receipt.ownership, 'owned');
 });
 
+test('a review receipt serializes the parsed JSON for recovery', async t => {
+ const page = await openGrok(t, `<main></main>${COMPOSER}`);
+ const receipt = await page.evaluate(async () => {
+   const stored = {};
+   const review = {findings: [], merge_recommendation: 'APPROVE'};
+   chrome.storage = {session: {set: async value => Object.assign(stored, value)}};
+   await persistCollectedResult({jobId:'review-A', runId:'run-A', provider:'grok', kind:'review'}, review, JSON.stringify(review));
+   return stored['ashlar:result:review-A:grok:run-A'];
+ });
+ assert.equal(receipt?.raw, JSON.stringify({findings: [], merge_recommendation: 'APPROVE'}));
+});
+
 test('Grok idle completion uses the polled submission, not stale persisted stream evidence', async t => {
   const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A">review</div><div data-testid="assistant-message" id="response-answer-A">answer text</div></main>${COMPOSER}`);
   const out = await page.evaluate(async () => {

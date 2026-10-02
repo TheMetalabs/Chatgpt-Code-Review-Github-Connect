@@ -26,7 +26,10 @@ function visible(el) {
 function readComposer(el) {
   if (!el) return "";
   if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value || "";
-  return el.innerText || el.textContent || "";
+  // ProseMirror renders one paragraph per source line. `innerText` inserts an extra
+  // separator around empty paragraphs, so a prompt can differ by one character even
+  // though the editor holds the exact text. Reconstruct text from the DOM instead.
+  return losslessText(el) || el.innerText || el.textContent || "";
 }
 
 /** An element's text for a LOSSLESS comparison (a fix prompt): a textarea's value; in a rich editor

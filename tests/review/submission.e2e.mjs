@@ -79,6 +79,23 @@ test('submission: send-wait probe records control state without prompt text',asy
  assert.equal('prompt' in probe,false);
 });
 
+test('submission: ProseMirror paragraphs read back as the original review prompt',async t=>{
+ const page=await fixture(t);
+ const prompt='first paragraph\n\nsecond paragraph\nthird paragraph';
+ await page.evaluate(prompt=>{
+  const old=document.querySelector('textarea');
+  const editor=document.createElement('div');editor.id='prompt-textarea';editor.contentEditable='true';editor.className='ProseMirror';editor.style.whiteSpace='pre-wrap';
+  for(const line of prompt.split('\n')){const p=document.createElement('p');if(line)p.textContent=line;else{const br=document.createElement('br');br.className='ProseMirror-trailingBreak';p.append(br);}editor.append(p);}
+  // A browser's rich-editor innerText can contain an extra rendered separator while
+  // the paragraph text nodes still hold the original prompt.
+  Object.defineProperty(editor,'innerText',{configurable:true,get:()=>prompt+'X'});
+  old.replaceWith(editor);window.composer=()=>editor;
+ },prompt);
+ const got=await page.evaluate(()=>({normalized:normalizePrompt(readComposer(composer())),inner:normalizePrompt(composer().innerText)}));
+ assert.equal(got.normalized,'first paragraph second paragraph third paragraph');
+ assert.equal(got.inner,'first paragraph second paragraph third paragraphX');
+});
+
 test('submission: actionable Send records the other click gates when the draft differs',async t=>{
  const page=await fixture(t);
  await page.evaluate(()=>{

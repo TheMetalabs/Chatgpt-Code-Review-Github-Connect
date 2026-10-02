@@ -189,10 +189,11 @@ test('the ChatGPT submission log records each admission (kind, temporary chat) a
 });
 
 // Live aicc #539/#602 (2026-10-01/02): legs sat in send_waiting 57-70+ min holding a ChatGPT slot; Chrome
-// had frozen their background tabs and the poll skipped them as frozen. The worker ends a leg whose tab is
-// still frozen 17 min after dispatch with no send seen (the page's own send deadline is 15 min).
-for(const [name,{ago,sent,frozen=true}] of [['frozen 18 min after dispatch: ended',{ago:18}],['frozen 12 min after dispatch: still waits',{ago:12}],
- ['not frozen 18 min after dispatch: the page answers for itself',{ago:18,frozen:false}],['frozen 18 min, but it sent: not a pre-send stall',{ago:18,sent:true}]]){
+// had frozen their background tabs and the poll skipped them as frozen. The worker ends a leg with no send
+// seen 17 min after dispatch whatever the tab's frozen flag says (live 1.1.62: 80+ min, not flagged frozen; the page's own send deadline is 15 min).
+for(const [name,{ago,sent,frozen=true}] of [['frozen 18 min after dispatch: its grace period still runs',{ago:18}],['frozen 12 min after dispatch: still waits',{ago:12}],
+ ['frozen 28 min after dispatch: ended, without claiming nothing was sent',{ago:28}],
+ ['not flagged frozen, 18 min after dispatch: ended (its page answered, no send)',{ago:18,frozen:false}],['frozen 28 min, but it sent: not a pre-send stall',{ago:28,sent:true}]]){
  test(`presend watchdog: ${name}`,async()=>{
   const at=Date.now()-ago*60_000;
   const pageEvents=[{source:'page',sequence:1,at:at+1000,stage:'prompt_prepared'},{source:'page',sequence:2,at:at+2000,stage:'send_waiting'},
@@ -203,10 +204,44 @@ for(const [name,{ago,sent,frozen=true}] of [['frozen 18 min after dispatch: ende
    api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'busy'})});
   await ticks(b,2);
   const failed=b.calls.find(c=>c.action==='failure'&&c.jobId==='A');
-  if(ago>=17&&!sent&&frozen)assert.match(failed?.error||'',/^presend_stalled: the tab was frozen in "send_waiting" for 18 min after dispatch, before its send; nothing was sent/);
+  if(!frozen&&!sent)assert.match(failed?.error||'',/^presend_stalled: no send was seen in 18 min after dispatch \(last page step "send_waiting"\); nothing was sent/);
+  else if(frozen&&ago>=27&&!sent)assert.match(failed?.error||'',/^presend_stalled: no send was seen in 28 min after dispatch and the tab did not answer \(tab frozen\); whether the prompt was sent is unknown/);
   else assert.equal(failed,undefined,JSON.stringify(failed));
  });
 }
+
+const stalledJob=(at,extra={})=>({jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:{tabId:10,started:true,runId:'run-A',runDispatchedAt:at,
+ pageEvents:[{source:'page',sequence:1,at:at+2000,stage:'send_waiting'}],...extra}}});
+test('presend watchdog: a discarded tab is woken by the poll, not ended as "nothing was sent"',async()=>{
+ const at=Date.now()-18*60_000;
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:stalledJob(at)}}),
+  tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'unloaded',discarded:true,active:false}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'busy'})});
+ await ticks(b,2);
+ assert.equal(b.calls.find(c=>c.action==='failure'&&c.jobId==='A'),undefined);
+});
+test('presend watchdog: a page that answers with a terminal verdict is harvested (logged out pauses the provider), not overwritten',async()=>{
+ const at=Date.now()-18*60_000;
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:stalledJob(at)}}),
+  tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete',active:false,frozen:false}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'logged_out',error:'logged out'})});
+ await ticks(b,2);
+ assert.match(b.calls.find(c=>c.action==='failure'&&c.jobId==='A')?.error||'',/^logged_out: /);
+ assert.ok(b.local.state.loginPause?.chatgpt>Date.now(),'chatgpt paused');
+});
+
+test('presend watchdog: a send the worker never ingested is found by one read-only probe, and the leg is not ended',async()=>{
+ const at=Date.now()-18*60_000;
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:{tabId:10,started:true,runId:'run-A',runDispatchedAt:at,
+  pageEvents:[{source:'page',sequence:1,at:at+2000,stage:'send_waiting'}]}}};
+ const sent=[{source:'page',sequence:1,at:at+2000,stage:'send_waiting'},{source:'page',sequence:2,at:at+14*60_000,stage:'send_attempted'}];
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete',active:false,frozen:false}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>msg.type==='ashlar-harvest'?{ok:false,code:'busy',jobId:'A',provider:'chatgpt',runId:'run-A',progress:{runId:'run-A',events:sent}}:{ok:false,code:'busy'}});
+ await ticks(b,2);
+ assert.equal(b.calls.find(c=>c.action==='failure'&&c.jobId==='A'),undefined);
+});
 
 test('the run message carries the send deadline, 15 min after the first dispatch',async()=>{
  const offers=[offer('A')];const runs=[];
@@ -229,7 +264,7 @@ test('presend watchdog: a leg an older worker dispatched (no runDispatchedAt) is
   tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete',active:false,frozen:true}]]),
   api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'busy'})});
  await ticks(b,2);
- assert.match(b.calls.find(c=>c.action==='failure'&&c.jobId==='A')?.error||'',/^presend_stalled: the tab was frozen in "send_waiting" for 180 min after dispatch/);
+ assert.match(b.calls.find(c=>c.action==='failure'&&c.jobId==='A')?.error||'',/^presend_stalled: no send was seen in 180 min after dispatch/);
 });
 
 test('a Grok age-verification failure pauses grok legs like a logout, with a message saying what to finish', async()=>{
@@ -243,4 +278,83 @@ test('a Grok age-verification failure pauses grok legs like a logout, with a mes
  assert.ok(b.local.state.loginPause?.grok>Date.now(),'grok paused');
  const fb=b.calls.find(c=>c.action==='failure'&&c.jobId==='B');
  if(fb)assert.match(fb.error,/^logged_out: grok is paused: it reported logged out or asked to verify the account's age/);
+});
+
+// User decision 2026-10-02: ChatGPT and Grok must not open, compose and send in tabs at the same time.
+// A leg is dispatched only while no other leg sits between its dispatch and its send; Grok keeps a gap.
+test('sends go one at a time across providers: the Grok leg waits until the ChatGPT leg has sent', async()=>{
+ const runs=[];let chatgptDone=false;
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt','grok'],states:{chatgpt:{},grok:{}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job},serialSends:true,grokPacing:{gapMs:0},chatgptPacing:{maxInFlight:9,gapMs:0}}),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);
+   return chatgptDone&&msg.provider==='chatgpt'&&msg.type!=='ashlar-run'?{ok:false,code:'error',error:'ended'}:{ok:false,code:'busy'};}});
+ await ticks(b,4);
+ assert.deepEqual([...new Set(runs)],['chatgpt'],'only one leg dispatched while the other has not sent');
+ chatgptDone=true; // the ChatGPT leg ends (or sends): the slot is free
+ await ticks(b,4);
+ assert.ok(runs.includes('grok'),`grok dispatched once chatgpt sent: ${runs}`);
+});
+
+test('Grok keeps a gap between its own dispatches', async()=>{
+ const runs=[];
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['grok'],states:{grok:{}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job},serialSends:false,grokPacing:{gapMs:75_000},grokDispatchedAt:Date.now()-10_000}),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);return {ok:false,code:'busy'};}});
+ await ticks(b,3);
+ assert.deepEqual(runs,[],'within 75 s of the last Grok dispatch');
+ await b.local.set({grokDispatchedAt:Date.now()-80_000});
+ await ticks(b,3);
+ assert.ok(runs.includes('grok'));
+});
+
+test('a leg silent past its pre-send deadline does not hold other sends', async()=>{
+ const runs=[];
+ const stale={started:true,runId:'r0',tabId:5,runDispatchedAt:Date.now()-16*60_000};
+ const reg={Z:{jobId:'Z',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:stale}},
+  A:{jobId:'A',origin:'http://bridge',leaseId:'l',providers:['grok'],states:{grok:{}}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:reg,serialSends:true,grokPacing:{gapMs:0}}),
+  tabs:new Map([[5,{id:5,url:'https://chatgpt.com/?temporary-chat=true',status:'complete'}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);return {ok:false,code:'busy'};}});
+ await ticks(b,3);
+ assert.ok(runs.includes('grok'),`grok dispatched: ${runs}`);
+});
+
+test('a started leg with no recorded dispatch time (recovered) holds no other send', async()=>{
+ const runs=[];
+ const reg={Z:{jobId:'Z',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:{started:true,runId:'r0',tabId:5}}},
+  A:{jobId:'A',origin:'http://bridge',leaseId:'l',providers:['grok'],states:{grok:{}}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:reg,serialSends:true,grokPacing:{gapMs:0}}),
+  tabs:new Map([[5,{id:5,url:'https://chatgpt.com/?temporary-chat=true',status:'complete',frozen:true}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);return {ok:false,code:'busy'};}});
+ await ticks(b,3);
+ assert.ok(runs.includes('grok'),`grok dispatched: ${runs}`);
+});
+
+test('a sibling leg whose tab is still loading holds the allocation of the next tab', async()=>{
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt','grok'],states:{
+  chatgpt:{tabId:10,runId:'r-c',workerEvents:[{source:'worker',sequence:1,at:Date.now()-5000,stage:'tab_created'}]},grok:{}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job},serialSends:true,grokPacing:{gapMs:0},chatgptPacing:{maxInFlight:9,gapMs:0}}),
+  tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'loading',active:true}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'busy'})});
+ await ticks(b,3);
+ assert.equal(b.effects.filter(e=>e.effect==='create').length,0,'no second tab while the first one loads');
+});
+
+test('a leg waiting behind another send opens no tab until it may send', async()=>{
+ const runs=[];let chatgptDone=false;
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt','grok'],states:{chatgpt:{},grok:{}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job},serialSends:true,grokPacing:{gapMs:0},chatgptPacing:{maxInFlight:9,gapMs:0}}),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);
+   return chatgptDone&&msg.provider==='chatgpt'&&msg.type!=='ashlar-run'?{ok:false,code:'error',error:'ended'}:{ok:false,code:'busy'};}});
+ await ticks(b,4);
+ const creates=()=>b.effects.filter(e=>e.effect==='create').length;
+ assert.equal(creates(),1,'only the ChatGPT tab while ChatGPT is sending');
+ chatgptDone=true;await ticks(b,4);
+ assert.ok(runs.includes('grok'));
+ assert.equal(creates(),2,'the Grok tab opens once it may send');
 });

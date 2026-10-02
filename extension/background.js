@@ -652,29 +652,100 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
     logouts: logouts.slice(-5)};
 }
 
+/** Sends go one at a time across every provider and job (user decision 2026-10-02: ChatGPT and Grok
+ * opening and sending in tabs at once risks both sites' spam/abuse checks and Chrome throttling the
+ * hidden tab): a leg is dispatched only while no other leg is between its dispatch and its send.
+ * Generation overlaps freely. Grok also keeps a gap between its own dispatches (chrome.storage.local
+ * "grokPacing" {gapMs}, default GROK_DISPATCH_GAP_MS); ChatGPT's gap is set at admission.
+ * "serialSends": false turns the one-send-at-a-time rule off. */
+const GROK_DISPATCH_GAP_MS = 75_000;
+const SENT_STAGES = ["send_attempted", "send_unconfirmed", "prompt_submitted", "submission_persisted", "waiting_for_response",
+  "generating", "json_observed", "response_completed_json_invalid", "response_collected"];
+function legSending(state, now = Date.now(), allocating = false) {
+  if (!state || state.outcome || state.delivered) return false;
+  // Opening a tab: a leg whose tab exists but has not been dispatched yet (loading, queued) is about to
+  // send, and a sibling's hidden tab opened beside it is the one Chrome freezes. Only the allocation
+  // gate counts it (never the dispatch gate: two such legs would wait on each other); it ends with the
+  // leg's own pre-send deadline.
+  if (!state.started) {
+    if (!allocating || state.tabId === undefined) return false;
+    const created = (state.workerEvents || []).filter(e => e?.stage === "tab_created").at(-1)?.at;
+    return Number.isFinite(created) && now - created < PAGE_PRESEND_MS;
+  }
+  // Past its own pre-send deadline a page can never send (composer.js presendDeadlinePassed): a leg
+  // whose page stopped reporting holds no one up beyond it. A started leg with no recorded dispatch
+  // (recovered after a restart) cannot be dated, so it holds no one up either.
+  const dispatchedAt = Number.isFinite(state.runDispatchedAt) ? state.runDispatchedAt
+    : (state.workerEvents || []).find(e => e?.stage === "run_dispatched")?.at;
+  if (!Number.isFinite(dispatchedAt) || now - dispatchedAt >= PAGE_PRESEND_MS) return false;
+  const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
+  return !events.some(e => SENT_STAGES.includes(e.stage));
+}
+async function dispatchBlocked(job, provider, jobs, allocating = false) {
+  const {serialSends = true} = await chrome.storage.local.get(["serialSends"]);
+  for (const other of serialSends === false ? [] : Object.values(jobs)) {
+    if (other.serverStatus) continue;
+    for (const p of other.providers || []) {
+      if (other === job && p === provider) continue;
+      if (legSending(other.states?.[p], Date.now(), allocating)) return "send_in_progress";
+    }
+  }
+  if (provider === "grok") {
+    const {grokDispatchedAt = 0, grokPacing} = await chrome.storage.local.get(["grokDispatchedAt", "grokPacing"]);
+    const gap = Number.isFinite(grokPacing?.gapMs) && grokPacing.gapMs >= 0 ? grokPacing.gapMs : GROK_DISPATCH_GAP_MS;
+    const since = Date.now() - Number(grokDispatchedAt || 0);
+    if (since >= 0 && since < gap) return "grok_spacing";
+  }
+  return "";
+}
+
 /** Pre-send deadlines (live aicc #539/#602, 2026-10-01/02: legs sat in send_waiting 57-70+ min
  * holding a ChatGPT slot; Chrome had frozen their background tabs, so no page timer ran and the poll
  * skipped them as frozen). The run message carries a deadline for its send, PAGE_PRESEND_MS after
  * dispatch: past it the page never clicks Send (composer.js presendDeadlinePassed), whatever stage it
- * slept in. The worker ends a leg whose tab Chrome still reports frozen PRESEND_WATCHDOG_MS after
- * dispatch with no send seen: strictly after that deadline, so a page that wakes later cannot send. */
+ * slept in. The worker ends a leg with no send seen PRESEND_WATCHDOG_MS after
+ * dispatch: strictly after that deadline, so a page that wakes later cannot send. */
 // Above the sum of the page's own pre-send bounds (overlays 1 + composer 3 + reasoning 1 + upload 3 +
 // send 3 = 11 min), so a slow but healthy run is never fenced at its click.
 const PAGE_PRESEND_MS = 15 * 60_000;
 const PRESEND_WATCHDOG_MS = 17 * 60_000;
+const PRESEND_UNREACHABLE_GRACE_MS = 10 * 60_000;
 
-/** Why the worker ends a leg whose frozen tab never sent ("" while it may wait). */
-function presendWatchdog(state, tab, now = Date.now()) {
+/** Why the worker ends a leg that never sent ("" while it may wait): PRESEND_WATCHDOG_MS after its
+ * dispatch no send event is seen. Not conditioned on the tab's frozen flag (live 2026-10-02, 1.1.62:
+ * two ChatGPT legs sat in send_waiting 80+ min with their tab not reported frozen; Chrome also
+ * discards, throttles or detaches tabs without that flag). Past the page's own deadline
+ * (PAGE_PRESEND_MS) a page can no longer send, so ending the leg cannot race a send. */
+function presendWatchdog(state, now = Date.now(), unreachable = "") {
   // A leg dispatched by an older worker has no runDispatchedAt: its recorded run_dispatched step dates
   // it (live 2026-10-02: two such legs, frozen for 3-7 h, held both ChatGPT slots when 1.1.61 arrived).
   const dispatchedAt = Number.isFinite(state.runDispatchedAt) ? state.runDispatchedAt
     : (state.workerEvents || []).find(e => e?.stage === "run_dispatched")?.at;
-  if (tab?.frozen !== true || !Number.isFinite(dispatchedAt)) return "";
+  if (!state.started || state.outcome || state.delivered || !Number.isFinite(dispatchedAt)) return "";
   const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
-  if (events.some(e => ["send_attempted", "prompt_submitted", "send_unconfirmed", "submission_persisted"].includes(e.stage))) return "";
-  if (now - dispatchedAt < PRESEND_WATCHDOG_MS) return "";
+  if (events.some(e => SENT_STAGES.includes(e.stage))) return "";
+  // A tab that cannot answer (frozen, still loading) may have sent after all: it gets a grace period
+  // beyond the watchdog, and its message does not claim that nothing was sent.
+  if (now - dispatchedAt < PRESEND_WATCHDOG_MS + (unreachable ? PRESEND_UNREACHABLE_GRACE_MS : 0)) return "";
+  const mins = Math.round((now - dispatchedAt) / 60_000);
+  if (unreachable) return `no send was seen in ${mins} min after dispatch and the tab did not answer (${unreachable}); whether the prompt was sent is unknown`;
   const last = events.at(-1)?.stage || "no page step";
-  return `the tab was frozen in "${last}" for ${Math.round((now - dispatchedAt) / 60_000)} min after dispatch, before its send; nothing was sent`;
+  return `no send was seen in ${mins} min after dispatch (last page step "${last}"); nothing was sent`;
+}
+/** A stalled leg's tab, asked once read-only: {reply} when its page answered for this job, else
+ * {unreachable} naming why it could not ("discarded" and "gone" are left to the poll's own wake and
+ * rebinding paths, which are bounded). */
+async function probeStalledLeg(job, provider, state) {
+  let tab;
+  try { tab = await chrome.tabs.get(state.tabId); } catch { return {unreachable: "gone"}; }
+  if (!allowedTab(tab, provider)) return {unreachable: "gone"};
+  if (tab.discarded === true || tab.status === "unloaded") return {unreachable: "discarded"};
+  if (tab.frozen === true) return {unreachable: "tab frozen"};
+  if (tab.status && tab.status !== "complete") return {unreachable: "tab still loading"};
+  try {
+    const reply = await askPage(state.tabId, {type: "ashlar-harvest", jobId: job.jobId, provider, runId: state.runId}, contentFiles(provider));
+    return matchesJob(reply, job, provider) ? {reply} : {unreachable: "page not bound"};
+  } catch { return {unreachable: "page did not answer"}; }
 }
 
 /** A provider answered a job admitted after its logout: the login is back, and admission leaves
@@ -809,7 +880,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.63";
+const WORKER_BUILD = "1.1.65";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2092,6 +2163,29 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (jobs[job.jobId] !== job) return;
   const state = job.states[provider];
   if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
+  // First of all, before any tab lookup (discarded, loading or missing tabs return early below): the
+  // worker's own bound on a leg that never sent. The tab is left to the cleanup policy, and the page
+  // never sends after its deadline (PAGE_PRESEND_MS, carried in the run message).
+  let stalled = presendWatchdog(state);
+  // A send the worker never ingested (the tab froze right after the click) must not read as "nothing
+  // was sent": a reachable tab is asked once, read-only, and its progress taken before the leg is ended.
+  if (stalled) {
+    const probe = await probeStalledLeg(job, provider, state);
+    if (probe.reply) {
+      ingestPageProgress(state, probe.reply);
+      // A page that answered with a verdict of its own (logged out, quota, age check, a collected
+      // answer) goes to the ordinary harvest below, which records it and pauses the provider.
+      const verdict = !isBusyResult(probe.reply) && (probe.reply.ok || (probe.reply.code && probe.reply.code !== "idle"));
+      stalled = verdict ? "" : presendWatchdog(state);
+    } else if (["gone", "discarded"].includes(probe.unreachable)) stalled = "";
+    else stalled = presendWatchdog(state, Date.now(), probe.unreachable);
+  }
+  if (stalled) {
+    state.outcome = failure("presend_stalled", stalled);
+    workerStep(job, provider, "presend_watchdog");
+    await saveJobs(jobs);
+    return;
+  }
   await applyPendingReplace(state);
   if (!state.runId) state.runId = crypto.randomUUID();
   // Memory is not a receipt: a previous write may have failed while leaving the
@@ -2158,6 +2252,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       await saveJobs(jobs);
       return;
     }
+    // No tab is opened while another leg is sending: a tab waiting minutes behind it, hidden, is the
+    // one Chrome freezes (and no watchdog can date a leg that was never dispatched).
+    if (await dispatchBlocked(job, provider, jobs, true)) return;
     await allocateProviderTab(job, provider, jobs);
     if (!state.tabId) return;
   }
@@ -2205,16 +2302,6 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     return wakeOrFailDiscardedTab(job, provider, jobs, tab);
   }
   if (tab.status && tab.status !== "complete") return;
-  const stalled = presendWatchdog(state, tab);
-  if (stalled) {
-    // The worker's own bound on a frozen page that never sent: the leg ends and its slot is free;
-    // the tab is left to the cleanup policy, and the page never sends after its deadline
-    // (PAGE_PRESEND_MS, carried in the run message).
-    state.outcome = failure("presend_stalled", stalled);
-    workerStep(job, provider, "presend_watchdog");
-    await saveJobs(jobs);
-    return;
-  }
   // A page loaded again after a discard is not yet proof that the run goes on: the time limit holds
   // until a reply proves it (discardedRunProven, below).
   if (!allowedTab(tab, provider)) {
@@ -2247,14 +2334,18 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       // askPage gives up on it, and the next tick asks again). A copy that reaches an unbound page
       // after `until`, computed from the reply window this send has, starts nothing there (X4, #85):
       // a page starts a run only while the worker that sent it still waits for the reply.
+      if (await dispatchBlocked(job, provider, jobs)) return; // asked again next tick (storage reads: before the window is taken)
       const replyWindow = pageWindow();
       if (replyWindow < MIN_DISPATCH_WINDOW_MS) return;
-      state.runDispatchedAt ??= Date.now();
+      // Until a page accepts the run, each attempt carries a fresh deadline: a leg that waited behind
+      // other sends (dispatchBlocked) must not inherit a deadline from an attempt that never ran.
+      if (!state.started) state.runDispatchedAt = Date.now();
       result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS,
         presendDeadline: state.runDispatchedAt + PAGE_PRESEND_MS}, contentFiles(provider));
       // A page that refused the new run bound nothing: the run was never started.
       if (!refusedRun(result, job, provider)) {
         dispatched = true;
+        if (provider === "grok") await chrome.storage.local.set({grokDispatchedAt: Date.now()});
         state.started = true;
         workerStep(job,provider,"run_dispatched");
         state.dispatchReply = replyShape(result, job, state);

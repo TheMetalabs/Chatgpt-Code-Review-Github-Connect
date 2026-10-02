@@ -807,7 +807,8 @@ test('grok pre-send: a stale aria-hidden on <main> with no open layer does not b
 // with the layer snapshot: role=dialog data-analytics-name="age_verification", "나이를 확인해 주세요",
 // a YYYY input and 계속하기), consumed the prompt and sent nothing; the run waited 60 s (send_unconfirmed).
 const AGE_DIALOG = `<div role="dialog" data-state="open" data-analytics-name="age_verification" style="width:320px;height:160px"><h2>나이를 확인해 주세요</h2><p>태어난 연도를 선택하세요.</p><input inputmode="numeric" maxlength="4" placeholder="YYYY" aria-label="출생 연도" value=""><button type="button"><span>계속하기</span></button></div>`;
-test('grok age verification after Send ends the run at once with what to do, and the birth year is never filled', async t => {
+const AGE_DIALOG_NO_BUTTON = AGE_DIALOG.replace(/<button.*<\/button>/, '');
+test('grok age verification that cannot be answered ends the run at once with what to do, and nothing is filled', async t => {
   const page = await radixPage(t);
   const out = await page.evaluate(async dialog => {
     globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
@@ -817,9 +818,73 @@ test('grok age verification after Send ends the run at once with what to do, and
     let err;
     try { await clickSend(sendButton, composer, 'review prompt'); } catch (e) { err = e; }
     return {code: err?.code, message: err?.message, ms: Date.now() - t0, year: document.querySelector('[aria-label="출생 연도"]').value};
-  }, AGE_DIALOG);
+  }, AGE_DIALOG_NO_BUTTON);
   assert.equal(out.code, 'age_verification', JSON.stringify(out));
-  assert.match(out.message, /verify the account's age.*nothing was sent/);
+  assert.match(out.message, /verify the account's age.*could not be confirmed/);
   assert.ok(out.ms < 5000, `at once, not after 60 s: ${out.ms} ms`);
-  assert.equal(out.year, '', 'the birth year is the account owner\'s to give');
+  assert.equal(out.year, '', 'no confirm button: nothing is filled');
+});
+
+// 2026-10-02, the owner's instruction: the dialog is answered with the registered year (2000) and its
+// confirm button, nothing else; then the consumed prompt is looked for and Send is clicked again.
+test('grok age verification is answered with 2000 and 계속하기, and a prompt left in the composer is sent again', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async dialog => {
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify({phase: 'attempted', expected: 'review prompt', baseline: 0, attemptedAt: Date.now(), attachments: []}));
+    document.querySelector('textarea').value = 'review prompt';
+    document.body.insertAdjacentHTML('beforeend', dialog);
+    const dlg = document.querySelector('[role="dialog"]'), year = dlg.querySelector('input');
+    window.answered = null; window.sends = 0;
+    dlg.querySelector('button').addEventListener('click', () => { window.answered = year.value; dlg.remove(); });
+    document.querySelector('[data-testid="chat-submit"]').addEventListener('click', e => { e.preventDefault(); window.sends++; });
+    const steps = []; const orig = globalThis.step; globalThis.step = name => { steps.push(name); return orig(name); };
+    clickSend(sendButton, composer, 'review prompt').catch(() => {});
+    const end = Date.now() + 15000;
+    while (window.sends < 1 && Date.now() < end) await new Promise(r => setTimeout(r, 100));
+    return {answered: window.answered, sends: window.sends, dialog: !!document.querySelector('[role="dialog"]'), confirmed: steps.includes('age_confirmed')};
+  }, AGE_DIALOG);
+  assert.deepEqual(out, {answered: '2000', sends: 1, dialog: false, confirmed: true});
+});
+
+test('grok age dialog: only the year input and its own confirm button are touched', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async dialog => {
+    document.body.insertAdjacentHTML('beforeend', dialog + '<button id="other">계속하기</button>');
+    let other = 0; document.getElementById('other').addEventListener('click', () => other++);
+    const before = confirmAgeDialog();
+    const dlg = document.querySelector('[role="dialog"]');
+    dlg.querySelector('button').addEventListener('click', () => dlg.remove());
+    return {ok: await before, other, none: await confirmAgeDialog()};
+  }, AGE_DIALOG);
+  assert.deepEqual(out, {ok: true, other: 0, none: false});
+});
+
+// The text fallback only detects an age-like dialog: a year is typed only where Grok marks the dialog as
+// the age check or the field itself is shaped like a year; any other dialog's input stays untouched.
+test('grok age dialog: a text-matched dialog with an unrelated input gets no year', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async () => {
+    document.body.insertAdjacentHTML('beforeend', '<div role="dialog" data-state="open" style="width:300px;height:120px"><p>Tell us your birth year for the survey</p><input aria-label="free text" value=""><button type="button">확인</button></div>');
+    let clicks = 0; document.querySelector('[role="dialog"] button').addEventListener('click', () => clicks++);
+    const ok = await confirmAgeDialog();
+    return {ok, value: document.querySelector('[aria-label="free text"]').value, clicks, stillAge: !!ageDialog()};
+  });
+  assert.deepEqual(out, {ok: false, value: '', clicks: 0, stillAge: true});
+});
+
+// Grok 2026-10-02: the live page is read step by step (as ChatGPT's was). Each stage of a Grok run keeps
+// one snapshot of <main> plus its open layers in chrome.storage.local "stageHtml" (bounded).
+test('each stage of a Grok run keeps one HTML snapshot with its open layers', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async () => {
+    const local = new Map(); window.chrome.storage = {local: {get: async keys => Object.fromEntries([].concat(keys).filter(k => local.has(k)).map(k => [k, local.get(k)])), set: async o => { for (const [k, v] of Object.entries(o)) local.set(k, v); }}};
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    document.body.insertAdjacentHTML('beforeend', '<div role="dialog" data-state="open" style="width:100px;height:50px">age</div>');
+    step('prompt_prepared'); step('prompt_prepared'); step('send_waiting');
+    await globalThis.__ashlarStageHtmlWrites;
+    const list = local.get('stageHtml') || [];
+    return {stages: list.map(e => e.stage), layer: list[0]?.html.includes('role="dialog"')};
+  });
+  assert.deepEqual(out, {stages: ['prompt_prepared', 'send_waiting'], layer: true});
 });

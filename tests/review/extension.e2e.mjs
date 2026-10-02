@@ -101,7 +101,7 @@ test('MV3 E2E: long queue → restart → final JSON ACK → close chat tab → 
  context.on('requestfailed',request=>diagnostics.push(['requestfailed',request.url(),request.failure()?.errorText]));
  // The launch-level local proxy also intercepts the first extension-created tab request.
  // Explicit loopback bypass keeps bridge RPCs out of the external-destination proxy.
- await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0}}),app.origin);
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0},grokPacing:{gapMs:0},serialSends:false}),app.origin);
  const delivered=app.mention();assert.equal(delivered.queued,true);
  await eventually(()=>app.localRequests.length===1,'local generation not started');
  await worker.evaluate(()=>tick());
@@ -205,7 +205,7 @@ test('MV3 parallel E2E: A pending → B admitted → worker restart → B posts/
  if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
  let worker=await extensionWorker(context,manager);
  await manager.close();
- await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0},maxReviewTabs:2}),app.origin);
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0},grokPacing:{gapMs:0},serialSends:false,maxReviewTabs:2}),app.origin);
  const request=pr=>app.harbor.ingestGitHubWebhook({hmacOk:true,deliveryId:'mv3-parallel-'+pr,event:'issue_comment',payload:{
    action:'created',installation:{id:1},repository:{full_name:'fixture/fixture'},sender:{login:'author'},
    issue:{number:pr,pull_request:{},title:'parallel '+pr},comment:{id:pr,body:'@ashlar-bot review'}}});
@@ -255,7 +255,7 @@ test('MV3 fix E2E: a fix prompt is answered by its fenced JSON in a chat tab; a 
  if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
  const worker=await extensionWorker(context,manager);
  await manager.close();
- await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0}}),app.origin);
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0},grokPacing:{gapMs:0},serialSends:false}),app.origin);
  const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
  const userText=p=>p.evaluate(()=>document.querySelector('[data-message-author-role="user"]')?.textContent||'');
  const request=(pr,prompt)=>app.bridge.requestBridgeFix({owner:'fixture',repo:'fixture',pr,provider:'chatgpt',prompt});
@@ -337,7 +337,7 @@ test('MV3 fix E2E (#93): the fix source is uploaded byte-exact as its hashed att
  if(!await developerMode.evaluate(el=>Boolean(el.checked)))await developerMode.click();
  const worker=await extensionWorker(context,manager);
  await manager.close();
- await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0}}),app.origin);
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0},grokPacing:{gapMs:0},serialSends:false}),app.origin);
  const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
  const source='Fix F1.\nFILE "src/a.py"\nCONTENT "def f(x):\\n\\tif x:\\n\\t\\treturn \\"a  b\\"\\n"\n\n\n    pass  # two  spaces';
  const settings={...DEFAULT_SETTINGS,fixAgent:{...DEFAULT_SETTINGS.fixAgent,enabled:true,provider:'chatgpt',delivery:'script-apply',mode:'suggest'}};
@@ -404,7 +404,7 @@ async function gatedExtension(t,app,html) {
  const worker=await extensionWorker(context,manager);
  await manager.close();
  await worker.evaluate(()=>{globalThis.__realTick=tick;tick=async()=>{};});
- await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0},maxReviewTabs:4}),app.origin);
+ await worker.evaluate(origin=>chrome.storage.local.set({origin,token:'fixture-token',enabled:true,chatgptPacing:{maxInFlight:99,gapMs:0},grokPacing:{gapMs:0},serialSends:false,maxReviewTabs:4}),app.origin);
  const chatPages=()=>context.pages().filter(p=>!p.isClosed()&&p.url().startsWith('https://chatgpt.com/'));
  return {context,worker,chatPages,tick:()=>worker.evaluate(()=>__realTick())};
 }

@@ -906,6 +906,40 @@ function step(stage) {
   if (typeof recordReviewStep === "function") recordReviewStep(stage);
 }
 
+/** Diagnostic: the real page at each stage of a run, in chrome.storage.local "stageHtml" (last
+ * STAGE_HTML_MAX), so a provider's live DOM can be read step by step the way ChatGPT's was (Grok
+ * 2026-10-02: every leg failed after Send and only a 5 s / 60 s snapshot existed). Once per stage per
+ * run; after Send, also at 1, 3, 5, 15, 30 and 60 s. "stageHtmlProbe": "grok" (default), "all" or
+ * "off". Never affects the run. */
+function saveStageHtml(stage) {
+  const STAGE_HTML_MAX = 24; // a function-local constant: content scripts are re-injected
+  try {
+    const local = globalThis.chrome?.storage?.local;
+    const state = globalThis.__ashlarRunnerState;
+    if (!local || !state?.jobId || typeof snapshotHtml !== "function") return;
+    const seen = state.stageHtmlSeen ||= {};
+    const key = `${state.runId}:${stage}`;
+    if (seen[key]) return;
+    seen[key] = true;
+    const grok = /(^|\.)grok\.com$/.test(globalThis.location?.hostname || "");
+    const save = label => {
+      const record = {job: state.jobId, run: state.runId, provider: state.provider, stage: label, at: Date.now(),
+        url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: snapshotHtml(60_000)};
+      globalThis.__ashlarStageHtmlWrites = (globalThis.__ashlarStageHtmlWrites || Promise.resolve()).then(async () => {
+        const got = await local.get(["stageHtmlProbe", "stageHtml"]);
+        const mode = got?.stageHtmlProbe || "grok";
+        if (mode === "off" || (mode === "grok" && !grok)) return;
+        const list = Array.isArray(got?.stageHtml) ? got.stageHtml : [];
+        await local.set({stageHtml: [...list, record].slice(-STAGE_HTML_MAX)});
+      }).catch(() => {});
+    };
+    save(stage);
+    if (stage === "send_attempted") {
+      for (const s of [1, 3, 5, 15, 30, 60]) setTimeout(() => save(`after_send_${s}s`), s * 1000);
+    }
+  } catch { /* diagnostics never affect the run */ }
+}
+
 function actionableSend(button) {
   if (!(button instanceof HTMLElement) || !button.isConnected || button.hidden ||
       button.disabled || button.getAttribute("aria-disabled") === "true") return false;
@@ -1132,7 +1166,7 @@ async function clickSend(findSend, findComposer, expectedText) {
   // ChatGPT ended the session, until their tabs were gone). A logged-out page ends it at once as
   // logged_out.
   const SEND_WAIT_MS = 3 * 60 * 1000;
-  let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null;
+  let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null, blockCleared = false;
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
     // After the confirmation check, so an accepted send is still journaled as sent; before any
@@ -1145,6 +1179,32 @@ async function clickSend(findSend, findComposer, expectedText) {
       // Delivery is ambiguous. Never automatically replay a possibly accepted prompt.
       // A page that says why the send did not go through (sendBlockedError, a site's own detector:
       // Grok's age-verification dialog) ends the run at once with that reason, not after CONFIRM_MS.
+      // A dialog the site can answer (clearSendBlock) is answered once; the prompt it consumed is then
+      // looked for, and only a draft that is back in the composer with no sent turn is clicked again.
+      if (!blockCleared && typeof clearSendBlock === "function" && await clearSendBlock()) {
+        blockCleared = true;
+        step("age_confirmed");
+        // The re-click is for a draft that stayed put with nothing happening: it needs the draft present,
+        // no sent turn and no stop button for 4 s in a row, inside an 8 s window. Any sign of a
+        // submission in flight (a turn, a stop button) keeps the wait instead: never a second send.
+        const windowEnd = Date.now() + 8000;
+        let quietSince = null, resend = false;
+        while (Date.now() < windowEnd) {
+          if (submissionConfirmed(record)) break;
+          const idle = userTurns().length === record.baseline && !(typeof stopButtonVisible === "function" && stopButtonVisible()) &&
+            normalizePrompt(readComposer(findComposer())) === record.expected;
+          quietSince = idle ? quietSince ?? Date.now() : null;
+          if (quietSince && Date.now() - quietSince >= 4000) { resend = true; break; }
+          await sleep(250);
+        }
+        if (resend) {
+          record.phase = "prepared";
+          delete record.attemptedAt;
+          saveSubmission(record);
+          attemptSeen = null;
+        }
+        continue;
+      }
       const blocked = typeof sendBlockedError === "function" ? sendBlockedError() : null;
       if (blocked) throw blocked;
       step("send_unconfirmed");

@@ -68,6 +68,17 @@ test('submission: hidden matching controls are skipped in favor of the visible o
  assert.equal(await page.evaluate(()=>findEligibleSendButton(['[data-testid="send-button"]','#composer-submit-button']).id),'composer-submit-button');
 });
 
+test('submission: send-wait probe records control state without prompt text',async t=>{
+ const page=await fixture(t);
+ await page.evaluate(()=>{window.composer=()=>document.querySelector('textarea');});
+ const probe=await page.evaluate(()=>sendControlProbe());
+ assert.equal(probe.editor,true);
+ assert.equal(probe.form,true);
+ assert.equal(probe.candidates.some(candidate=>candidate.actionable),true);
+ assert.equal('text' in probe,false);
+ assert.equal('prompt' in probe,false);
+});
+
 test('submission: a prepared journal resumes after reload, an attempted journal never clicks again',async t=>{
  const page=await fixture(t,{disabled:true});await start(page);await page.clock.runFor(500);
  const stored=await page.evaluate(()=>sessionStorage.getItem(submissionKey()));

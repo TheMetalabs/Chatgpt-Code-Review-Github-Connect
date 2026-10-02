@@ -973,6 +973,49 @@ function enabledLooking(button) {
   return getComputedStyle(button).pointerEvents !== "none";
 }
 
+function sendControlSelectors() {
+  return ["#composer-submit-button", '[data-testid="send-button"]', 'button[aria-label*="Send"]',
+    'button[aria-label*="보내"]', 'button[aria-label*="전송"]', 'button[type="submit"]'];
+}
+
+/** Send-wait diagnostics contain control state only, never the prompt or rendered message text. */
+function sendControlProbe() {
+  const editor = typeof composer === "function" ? composer() : null;
+  const form = editor?.closest("form") || null;
+  const root = form || document;
+  const seen = new Set(), candidates = [];
+  for (const selector of sendControlSelectors()) {
+    for (const button of root.querySelectorAll(selector)) {
+      if (!(button instanceof HTMLElement) || seen.has(button)) continue;
+      seen.add(button);
+      candidates.push({selector, label: button.getAttribute("aria-label") || "",
+        testId: button.getAttribute("data-testid") || "", disabled: button.disabled === true,
+        ariaDisabled: button.getAttribute("aria-disabled"), dataDisabled: button.getAttribute("data-disabled"),
+        dataState: button.getAttribute("data-state"), pointerEvents: getComputedStyle(button).pointerEvents,
+        rendered: renderedControl(button), actionable: actionableSend(button)});
+    }
+  }
+  return {editor: Boolean(editor), form: Boolean(form), candidates: candidates.slice(0, 16)};
+}
+
+function saveSendWaitProbe(form, attachments = []) {
+  try {
+    const local = globalThis.chrome?.storage?.local, state = globalThis.__ashlarRunnerState;
+    if (!local?.get || !local?.set || !state?.jobId || !state.runId) return;
+    const now = Date.now();
+    if (state.sendWaitProbeAt && now - state.sendWaitProbeAt < 5000) return;
+    state.sendWaitProbeAt = now;
+    const probe = sendControlProbe();
+    const record = {job: state.jobId, run: state.runId, provider: state.provider, at: now, ...probe,
+      attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+      attachmentsReady: attachmentsReady(form, attachments)};
+    globalThis.__ashlarSendWaitProbeWrites = (globalThis.__ashlarSendWaitProbeWrites || Promise.resolve()).then(async () => {
+      const stored = (await local.get(["sendWaitProbes"]))?.sendWaitProbes;
+      await local.set({sendWaitProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-20)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect submission */ }
+}
+
 /** The first actionable Send, by selector priority. Every match of a selector is tried (a stray or
  * leftover node may come first in DOM order). A selector that rendered a Send but no actionable one
  * ends the search: a looser selector must not find some other button to click while the real Send
@@ -1238,6 +1281,7 @@ async function clickSend(findSend, findComposer, expectedText) {
       }
       const uploadBusy = !attachmentsReady(form, record.attachments || []);
       step(uploadBusy ? "attachments_waiting" : "send_waiting");
+      if (!uploadBusy) saveSendWaitProbe(form, record.attachments || []);
       uploadWaitSince = uploadBusy ? uploadWaitSince ?? Date.now() : null;
       if (uploadBusy && Date.now() - uploadWaitSince >= UPLOAD_MS) throw uploadWaitExpired(form, record.attachments || [], UPLOAD_MS);
       if (typeof throwIfLoggedOut === "function") throwIfLoggedOut();

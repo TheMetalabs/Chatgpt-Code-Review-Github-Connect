@@ -14,7 +14,7 @@ function composer() {
 }
 
 function sendButton() {
-  return findEligibleSendButton(["#composer-submit-button", '[data-testid="send-button"]', 'button[aria-label*="Send"]', 'button[aria-label*="보내"]', 'button[aria-label*="전송"]', 'button[type="submit"]']);
+  return findEligibleSendButton(sendControlSelectors());
 }
 
 /** A logged-out chatgpt.com landing (its header / sidebar / banner offer Log in and Sign up, its

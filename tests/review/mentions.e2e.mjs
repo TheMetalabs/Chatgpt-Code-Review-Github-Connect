@@ -405,7 +405,7 @@ test('a closed or merged PR cancels its live jobs and frees them; other PRs are 
   const closed=await deliver(app,'pull_request',pr('closed','',{}),'delivery-closed');
   assert.equal(closed.status,202);
   const after=app.harbor.getHarbor().jobs.find(j=>j.id===job.id);
-  assert.deepEqual([after.status,after.skipReason],['cancelled','cancelled: pull request closed']);
+  assert.deepEqual([after.status,after.skipReason],['cancelled','pull request closed']);
   assert.deepEqual(JSON.parse(JSON.stringify(after.generating)),{chatgpt:false,local:false},'an ended job generates nothing');
   // A closed event for another PR leaves this PR's new job alone; a stale close (before the job) too.
   const again=await deliver(app,'issue_comment',{...comment(),comment:{id:43,body:'@ashlar-bot review'}},'delivery-again');
@@ -413,4 +413,7 @@ test('a closed or merged PR cancels its live jobs and frees them; other PRs are 
   await deliver(app,'pull_request',{...pr('closed'),pull_request:{...pr('closed').pull_request,number:9999,merged:true}},'delivery-other');
   await deliver(app,'pull_request',{...pr('closed'),pull_request:{...pr('closed').pull_request,closed_at:new Date(second.createdAt-60_000).toISOString()}},'delivery-stale');
   assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===second.id).status,'awaiting_chat','another PR\'s close and a stale close cancel nothing');
+  // closed_at has whole-second resolution: a job created in the second just before the close precedes it.
+  await deliver(app,'pull_request',{...pr('closed'),pull_request:{...pr('closed').pull_request,closed_at:new Date(second.createdAt-500).toISOString()}},'delivery-same-second');
+  assert.equal(app.harbor.getHarbor().jobs.find(j=>j.id===second.id).status,'cancelled','a close within the same second still cancels it');
 });

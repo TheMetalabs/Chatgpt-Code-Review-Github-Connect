@@ -2038,12 +2038,13 @@ export function ingestGitHubWebhook(opts: {
   if (parsed.kind === "closed") {
     const why = `pull request ${parsed.merged ? "merged" : "closed"}`;
     // A job created after the close (a redelivered or late "closed" behind a "reopened") is the
-    // reopened PR's: kept.
+    // reopened PR's: kept. closed_at has whole-second resolution, so one created within that second
+    // may still precede the close.
     const live = state.jobs.filter((j) => j.owner === parsed.owner && j.repo === parsed.repo && j.pr === parsed.pr && isLive(j.status) &&
-      !(parsed.closedAt !== undefined && j.createdAt > parsed.closedAt));
+      !(parsed.closedAt !== undefined && j.createdAt > parsed.closedAt + 1000));
     for (const j of live) {
       cancelLocalJsonRepairs("superseded", j.id);
-      transitionJob(j.id, (cur) => (isLive(cur.status) ? { ...cur, status: "cancelled", skipReason: `cancelled: ${why}`, updatedAt: Date.now() } : cur));
+      transitionJob(j.id, (cur) => (isLive(cur.status) ? { ...cur, status: "cancelled", skipReason: why, updatedAt: Date.now() } : cur));
     }
     const ev: WebhookLog = {
       id: nid("ev"),

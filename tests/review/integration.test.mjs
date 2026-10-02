@@ -296,6 +296,35 @@ test('sends go one at a time across providers: the Grok leg waits until the Chat
  assert.ok(runs.includes('grok'),`grok dispatched once chatgpt sent: ${runs}`);
 });
 
+test('an ambiguous ChatGPT send keeps the cross-job gate until submission is confirmed', async()=>{
+ for (const stage of ['send_attempted','send_unconfirmed']) {
+  const runs=[];
+  const at=Date.now()-5000;
+  const reg={A:{jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:{tabId:10,started:true,runId:'run-A',runDispatchedAt:at,
+    pageEvents:[{source:'page',sequence:1,at,stage}]}}},B:{jobId:'B',origin:'http://bridge',leaseId:'l',providers:['grok'],states:{grok:{}}}};
+  const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:reg,serialSends:true,grokPacing:{gapMs:0}}),
+   tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete'}]]),
+   api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+   handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);return {ok:false,code:'busy'};}});
+  await ticks(b,3);
+  assert.deepEqual(runs,[],`${stage} must not dispatch Grok`);
+  assert.equal(b.effects.some(effect=>effect.effect==='create'),false,`${stage} must not allocate Grok`);
+ }
+});
+
+test('a confirmed ChatGPT submission lets a sibling Grok job dispatch before the answer', async()=>{
+ const runs=[];
+ const at=Date.now()-5000;
+ const reg={A:{jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:{tabId:10,started:true,runId:'run-A',runDispatchedAt:at,
+   pageEvents:[{source:'page',sequence:1,at,stage:'prompt_submitted'}]}}},B:{jobId:'B',origin:'http://bridge',leaseId:'l',providers:['grok'],states:{grok:{}}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:reg,serialSends:true,grokPacing:{gapMs:0}}),
+  tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete'}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push({provider:msg.provider,tabId:_id});return {ok:false,code:'busy'};}});
+ await ticks(b,3);
+ assert.deepEqual(runs,[{provider:'grok',tabId:101}]);
+});
+
 test('Grok keeps a gap between its own dispatches', async()=>{
  const runs=[];
  const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['grok'],states:{grok:{}}};

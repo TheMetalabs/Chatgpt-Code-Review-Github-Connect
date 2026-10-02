@@ -68,6 +68,76 @@ test('submission: hidden matching controls are skipped in favor of the visible o
  assert.equal(await page.evaluate(()=>findEligibleSendButton(['[data-testid="send-button"]','#composer-submit-button']).id),'composer-submit-button');
 });
 
+test('submission: send-wait probe records control state without prompt text',async t=>{
+ const page=await fixture(t);
+ await page.evaluate(()=>{window.composer=()=>document.querySelector('textarea');});
+ const probe=await page.evaluate(()=>sendControlProbe());
+ assert.equal(probe.editor,true);
+ assert.equal(probe.form,true);
+ assert.equal(probe.candidates.some(candidate=>candidate.actionable),true);
+ assert.equal('text' in probe,false);
+ assert.equal('prompt' in probe,false);
+});
+
+test('submission: ProseMirror paragraphs read back as the original review prompt',async t=>{
+ const page=await fixture(t);
+ const prompt='first paragraph\n\nsecond paragraph\nthird paragraph';
+ await page.evaluate(prompt=>{
+  const old=document.querySelector('textarea');
+  const editor=document.createElement('div');editor.id='prompt-textarea';editor.contentEditable='true';editor.className='ProseMirror';editor.style.whiteSpace='pre-wrap';
+  for(const line of prompt.split('\n')){const p=document.createElement('p');if(line)p.textContent=line;else{const br=document.createElement('br');br.className='ProseMirror-trailingBreak';p.append(br);}editor.append(p);}
+  // A browser's rich-editor innerText can contain an extra rendered separator while
+  // the paragraph text nodes still hold the original prompt.
+  Object.defineProperty(editor,'innerText',{configurable:true,get:()=>prompt+'X'});
+  old.replaceWith(editor);window.composer=()=>editor;
+ },prompt);
+ const got=await page.evaluate(()=>({normalized:normalizePrompt(readComposer(composer())),inner:normalizePrompt(composer().innerText)}));
+ assert.equal(got.normalized,'first paragraph second paragraph third paragraph');
+ assert.equal(got.inner,'first paragraph second paragraph third paragraphX');
+ await page.evaluate(prompt=>{window.result={pending:true};clickSend(()=>document.querySelector('#composer-submit-button'),composer,prompt)
+  .then(()=>window.result={submitted:true},e=>window.result={error:e.message});},prompt);
+ await page.clock.runFor(500);
+ assert.equal(await page.evaluate(()=>clicks),1,'the rich-editor prompt passes the Send gate');
+ assert.deepEqual(await page.evaluate(()=>result),{pending:true});
+});
+
+test('submission: actionable Send records the other click gates when the draft differs',async t=>{
+ const page=await fixture(t);
+ await page.evaluate(()=>{
+   window.composer=()=>document.querySelector('textarea');
+   document.querySelector('textarea').value='different draft';
+   window.probeStore={};
+   chrome.storage={local:{get:async()=>probeStore,set:async value=>Object.assign(probeStore,value)}};
+ });
+ await start(page);await page.clock.runFor(6000);
+ const probes=await page.evaluate(()=>probeStore.sendWaitProbes);
+ const latest=probes.at(-1);
+ assert.equal(latest.candidates.some(candidate=>candidate.actionable),true);
+ assert.deepEqual({draftedMatches:latest.draftedMatches,otherTurn:latest.otherTurn,stopVisible:latest.stopVisible},
+   {draftedMatches:false,otherTurn:false,stopVisible:false});
+ assert.equal(latest.expectedLength,'owned review prompt'.length);
+ assert.equal(latest.draftLength,'different draft'.length);
+ assert.equal(typeof latest.draftHead,'string');
+ assert.equal(JSON.stringify(latest).includes('different draft'),false);
+ assert.equal((await page.evaluate(()=>result)).error,'the composer draft changed before Send; nothing was sent');
+ assert.equal(await page.evaluate(()=>clicks),0);
+});
+
+test('submission: a visible Stop lets a converging draft wait before takeover',async t=>{
+ const page=await fixture(t);
+ await page.evaluate(()=>{
+   document.querySelector('textarea').value='different draft';
+   document.querySelector('form').insertAdjacentHTML('afterbegin','<button data-testid="stop-button" style="width:40px;height:20px">Stop</button>');
+   window.stopButtonVisible=()=>Boolean(document.querySelector('[data-testid="stop-button"]'));
+ });
+ await start(page);await page.clock.runFor(500);
+ assert.equal((await page.evaluate(()=>result)).pending,true);
+ assert.equal(await page.evaluate(()=>clicks),0);
+ await page.locator('[data-testid="stop-button"]').evaluate(el=>el.remove());await page.clock.runFor(500);
+ assert.equal((await page.evaluate(()=>result)).error,'the composer draft changed before Send; nothing was sent');
+ assert.equal(await page.evaluate(()=>clicks),0);
+});
+
 test('submission: a prepared journal resumes after reload, an attempted journal never clicks again',async t=>{
  const page=await fixture(t,{disabled:true});await start(page);await page.clock.runFor(500);
  const stored=await page.evaluate(()=>sessionStorage.getItem(submissionKey()));

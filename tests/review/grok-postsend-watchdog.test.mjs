@@ -89,3 +89,195 @@ test('time the worker was away is not counted against the cap',async()=>{
  await ticks(watched);
  assert.match(failure(watched)?.error||'',/^response_timeout/,'ordinary poll cadence is not a gap');
 });
+
+test('a frozen Grok page result persisted after response_collected is ingested without a page reply', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['fixture']});
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:grokLeg(10)}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'original'}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome?.raw, raw);
+ assert.equal((await b.session.get([key]))[key], undefined);
+ assert.equal(b.calls.some(call => call.action === 'complete' && call.results?.some(result => result.provider === 'grok')), true);
+});
+
+test('a closed tab wins over a persisted receipt', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['closed']});
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:grokLeg(10)}}),
+  session: storage({[`ashlar:closed:A:grok:run-A`]: true, [key]: {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'closed'}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('closed page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const failure = b.calls.find(call => call.action === 'failure');
+ assert.match(failure?.error || '', /^tab_closed:/);
+ assert.equal(b.calls.some(call => call.action === 'complete'), false);
+ assert.equal((await b.session.get([key]))[key], undefined);
+});
+
+test('a late close marker preserves a durably harvested success', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['harvested']});
+ const job = grokLeg(10);
+ job.states.grok.outcome = {ok:true,raw,responseText:'harvested'};
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({
+   'ashlar:closed:A:grok:run-A': true,
+   'ashlar:result:A:grok:run-A': {jobId:'A',provider:'grok',runId:'run-A',raw:'late',responseText:'late'},
+  }),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('closed page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const complete = b.calls.find(call => call.action === 'complete');
+ assert.equal(complete?.raw, raw);
+ assert.equal(b.calls.some(call => call.action === 'failure'), false);
+ assert.equal(complete?.results?.some(result => result.provider === 'grok'), true);
+ assert.equal((await b.session.get(['ashlar:result:A:grok:run-A']))['ashlar:result:A:grok:run-A'], undefined);
+});
+
+test('a closed receipt is retained until its terminal outcome is persisted', async () => {
+ const key = 'ashlar:result:A:grok:run-A';
+ const job = grokLeg(10), jobs = {A:job};
+ const b = background({session:storage({'ashlar:closed:A:grok:run-A':true,
+  [key]:{jobId:'A',provider:'grok',runId:'run-A',raw:'receipt'}})});
+ const set = b.local.set;
+ b.local.set = async values => {if (values.pendingReviewJobs) throw new Error('storage unavailable');return set(values);};
+ await assert.rejects(b.context.settleClosedTab(job,'grok',jobs), /storage unavailable/);
+ assert.equal((await b.session.get([key]))[key].raw,'receipt');
+ b.local.set = set;
+ await b.context.settleClosedTab(job,'grok',jobs);
+ assert.equal(b.local.state.pendingReviewJobs.A.states.grok.outcome?.code,'tab_closed');
+ assert.equal((await b.session.get([key]))[key],undefined);
+});
+
+test('a fix receipt without owned proof is ignored', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['fix']});
+ const key = 'ashlar:result:A:grok:run-A';
+ const job = grokLeg(31); job.kind = 'fix';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'fix',ownership:'takenOver'}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ assert.equal((await b.session.get([key]))[key].ownership, 'takenOver');
+ assert.equal(b.calls.some(call => call.action === 'complete'), false);
+});
+
+test('a receipt written after the timeout save replaces that timeout on the next tick', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['late receipt']});
+ const b = rig(grokLeg(31), {frozen:true, handler:()=>{throw new Error('frozen page cannot answer');}});
+ await b.tick();
+ assert.equal(b.local.state.pendingReviewJobs.A.states.grok.outcome?.code, 'response_timeout');
+ await b.session.set({'ashlar:result:A:grok:run-A': {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'late',at:Date.now()}});
+ await b.tick();
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome?.raw, raw);
+ assert.equal(b.calls.some(call => call.action === 'complete' && call.results?.some(result => result.provider === 'grok')), true);
+});
+
+test('a stale receipt cannot overwrite an already durable success', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['durable']});
+ const job = grokLeg(10);
+ job.states.grok.outcome = {ok:true,raw,responseText:'durable'};
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw:'stale',responseText:'stale',at:Date.now()-MIN}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome.raw, raw);
+ assert.equal(b.calls.some(call => call.action === 'failure'), false);
+ assert.equal((await b.session.get([key]))[key], undefined);
+});
+
+test('a receipt older than response_collected cannot replace a timeout outcome', async () => {
+ const job = grokLeg(10);
+ const collectedAt = Date.now();
+ job.states.grok.outcome = {ok:false,code:'response_timeout',error:'old timeout'};
+ job.states.grok.workerEvents = [{source:'worker',sequence:1,stage:'response_collected',at:collectedAt}];
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw:'stale',responseText:'stale',at:collectedAt-1}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome.code, 'response_timeout');
+ assert.equal(state.outcome.raw, undefined);
+ assert.equal((await b.session.get([key]))[key], undefined);
+});
+
+test('a receipt stamped at response_collected replaces the timeout outcome', async () => {
+ const job = grokLeg(10);
+ const collectedAt = Date.now();
+ job.states.grok.outcome = {ok:false,code:'response_timeout',error:'old timeout'};
+ job.states.grok.workerEvents = [{source:'worker',sequence:1,stage:'response_collected',at:collectedAt}];
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw:'fresh',responseText:'fresh',at:collectedAt}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome.raw, 'fresh');
+ assert.equal(state.outcome.code, undefined);
+});
+
+test('the postsend watchdog rejects a receipt older than the final response probe', async () => {
+ const job = grokLeg(31);
+ const key = 'ashlar:result:A:grok:run-A';
+ const collectedAt = Date.now();
+ const progress = [...job.states.grok.pageEvents, {source:'page',sequence:4,stage:'response_collected',at:collectedAt}];
+ const session = storage();
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}), session,
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:false}]]),
+  handler: (_id,msg) => {
+   if (msg.type === 'ashlar-harvest') {
+    session.set({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw:'stale',responseText:'stale',at:collectedAt-1}});
+    return {ok:false,code:'busy',jobId:'A',provider:'grok',runId:'run-A',progress:{runId:'run-A',events:progress}};
+   }
+   return {ok:false,code:'busy'};
+  },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b, 2);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome?.code, 'response_timeout');
+ assert.equal(state.outcome?.raw, undefined);
+ assert.equal((await b.session.get([key]))[key], undefined);
+});
+
+test('a receipt for another run is ignored after a timeout', async () => {
+ const b = rig(grokLeg(31), {frozen:true, handler:()=>{throw new Error('frozen page cannot answer');}});
+ await b.tick();
+ await b.session.set({'ashlar:result:A:grok:run-A': {jobId:'A',provider:'grok',runId:'run-other',raw:'wrong'}});
+ await b.tick();
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome?.code, 'response_timeout');
+ assert.equal(state.outcome?.raw, undefined);
+});

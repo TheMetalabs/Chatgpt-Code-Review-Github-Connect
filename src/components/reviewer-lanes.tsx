@@ -9,7 +9,7 @@ function LaneIcon({ state }: { state: ReviewerLane["state"] }) {
   if (state === "answered") return <Check className={cn(cls, "text-ok")} strokeWidth={1.8} />;
   if (state === "generating") return <LoaderCircle className={cn(cls, "animate-spin text-accent")} strokeWidth={1.8} />;
   if (state === "waiting") return <LoaderCircle className={cn(cls, "text-warn")} strokeWidth={1.8} />;
-  if (state === "skipped" || state === "empty") return <Unplug className={cn(cls, "text-danger")} strokeWidth={1.8} />;
+  if (state === "skipped" || state === "empty" || state === "raw") return <Unplug className={cn(cls, "text-danger")} strokeWidth={1.8} />;
   return <CircleDashed className={cn(cls, "text-fg-subtle")} strokeWidth={1.8} />;
 }
 

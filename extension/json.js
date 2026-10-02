@@ -335,7 +335,7 @@ function harvestJson(opts) {
 }
 
 /** Metadata only. The browser journal survives reload; raw text is not a step log. */
-function recordReviewStep(stage) {
+function recordReviewStep(stage, at = Date.now()) {
   const state = globalThis.__ashlarRunnerState;
   if (!state?.jobId || !state.runId) return;
   if (typeof saveStageHtml === "function") saveStageHtml(stage); // the page at this stage (diagnostic)
@@ -345,7 +345,7 @@ function recordReviewStep(stage) {
     if (!state.steps || !Array.isArray(state.steps.events)) state.steps = {sequence: 0, events: []};
   }
   if (state.steps.events.at(-1)?.stage === stage) return;
-  const event = {source: "page", sequence: ++state.steps.sequence, stage, at: Date.now()};
+  const event = {source: "page", sequence: ++state.steps.sequence, stage, at: Number.isFinite(at) ? at : Date.now()};
   state.steps.events = [...state.steps.events, event].slice(-128);
   try { sessionStorage.setItem(key, JSON.stringify(state.steps)); } catch { state.steps.persistenceError = true; }
 }
@@ -363,12 +363,23 @@ function reviewProgress() {
 function boundReviewResponse(submission) {
   const messages = conversationTurnEls();
   const users = messages.filter(node => turnRole(node) === "user");
-  let user;
+  const runnerState = globalThis.__ashlarRunnerState;
+  const pinnedPage = typeof submission.conversation === "string" && /^https?:\/\//i.test(submission.conversation);
+  let user, identityMatched = false;
   if (submission.messageId) {
     const matches = users.filter(node => turnMessageId(node) === submission.messageId);
-    if (matches.length === 1) user = matches[0];
+    if (matches.length === 1) { user = matches[0]; identityMatched = true; }
+    // Grok can re-key or replace a user bubble while preserving transcript order. An unpinned review
+    // still needs the exact node confirmed by this page; a pinned review can use its position after a
+    // DOM replacement while the page identity and prompt still hold. The later-user fence below keeps
+    // a shifted follow-up from inheriting the run.
+    else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
+      const candidate = users[submission.submittedUsers - 1];
+      const confirmed = runnerState?.confirmedSubmission?.record === submission;
+      if (confirmed && (runnerState.boundUserNode === candidate || (pinnedPage && fixConversationHolds(submission)))) user = candidate;
+    }
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
-    user = users[submission.submittedUsers - 1];
+    if (!pinnedPage || fixConversationHolds(submission)) user = users[submission.submittedUsers - 1];
   }
   // The containment rule the send was confirmed by (composer.js reviewTurnHolds): a rendered turn
   // restyles Markdown in the prompt (`code` spans shown as <code>), and a stricter rule here left a
@@ -377,6 +388,7 @@ function boundReviewResponse(submission) {
   if (!user || !submission.expected || !(typeof reviewTurnHolds === "function" ? reviewTurnHolds(shown, submission.expected) : normalizePrompt(shown).includes(submission.expected))) {
     return {root: null, followup: false, identified: false};
   }
+  if (identityMatched && runnerState?.confirmedSubmission?.record === submission) runnerState.boundUserNode = user;
   // Some renderers assign message IDs after mounting the text. Pin that identity
   // when it appears rather than staying on the weaker positional fallback. A journal
   // that carries its conversation (a fix's or a review's, recorded at send or pinned
@@ -681,12 +693,37 @@ function saveResponseWaitHtml(bound) {
 }
 
 /** Collection needs two identical stable observations (`key`). On the second one the runner
- * records the answer and, for an identified response, its native completion proof. */
-function settleStableAnswer(stability, key, poll, {text, raw}) {
+ * records the answer and, when available, its native completion proof. */
+async function persistCollectedResult(runner, raw, text, ownership, at = Date.now()) {
+  // A frozen page may finish its collector while the worker cannot receive the reply. Keep the
+  // exact bound result in the extension session store so the worker can ingest it on its next poke.
+  // The worker validates every identity field before accepting this receipt and removes it only
+  // after the durable job save, so a duplicate delivery cannot create a second completion.
+  if (!runner?.jobId || !runner.runId || !runner.provider) return;
+  let storedRaw;
+  try { storedRaw = typeof raw === "string" ? raw : JSON.stringify(raw); }
+  catch { return; }
+  if (typeof storedRaw !== "string" || !storedRaw.trim()) return;
+  const storage = globalThis.chrome?.storage?.session;
+  if (!storage?.set) return;
+  const key = `ashlar:result:${runner.jobId}:${runner.provider}:${runner.runId}`;
+  const completion = runner.nativeCompletion;
+  try {
+    const record = {jobId: runner.jobId, provider: runner.provider, runId: runner.runId,
+      raw: storedRaw, responseText: typeof text === "string" ? text : "", at: Number.isFinite(at) ? at : Date.now()};
+    if (runner.kind === "fix") record.ownership = ownership;
+    if (completion && typeof completion.responseId === "string" && typeof completion.context === "string")
+      record.completion = {responseId: completion.responseId, context: completion.context};
+    await storage.set({[key]: record});
+  } catch { /* session storage is a recovery hint; the live reply remains authoritative */ }
+}
+
+async function settleStableAnswer(stability, key, poll, {text, raw, ownership}) {
   stability.hits = stability.stable === key ? stability.hits + 1 : 1;
   stability.stable = key;
   if (stability.hits < 2) return false;
   const {runner, bound} = poll;
+  const collectedAt = Date.now();
   if (runner) {
     runner.responseText = text;
     // The regeneration pager as it was when the answer was collected (tabOwnership: "regenerated").
@@ -695,8 +732,10 @@ function settleStableAnswer(stability, key, poll, {text, raw}) {
       jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
       responseId:bound.responseId,context:reviewPageContext(),text,raw,
     });
+    runner.persistedResult = persistCollectedResult(runner, raw, text, ownership, collectedAt);
+    await runner.persistedResult;
   }
-  recordReviewStep("response_collected");
+  recordReviewStep("response_collected", collectedAt);
   return true;
 }
 
@@ -754,7 +793,9 @@ async function waitUntilReviewOrQuota(name) {
     expireGeneratingLease(lease, name, poll, text);
     expireResponseWait(wait, name, poll);
     if (done && json) {
-      if (settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) return json;
+      if (await settleStableAnswer(stability, JSON.stringify([json, text]), poll, {text, raw: json})) {
+        return json;
+      }
     } else { stability.hits = 0; stability.stable = ""; }
     await (typeof waitForPageChange === "function" ? waitForPageChange(800) : sleep(800));
   }
@@ -1236,7 +1277,7 @@ async function waitUntilFixOrQuota(name) {
     if (answered) {
       // Its ID (its message node when it has none): the only response a later poll may collect.
       stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
-      if (settleStableAnswer(stability, text, poll, {text, raw: text})) {
+      if (await settleStableAnswer(stability, text, poll, {text, raw: text, ownership: proof.ownership})) {
         saveFixHarvestProbe({at: Date.now(), jobId: runner?.jobId, runId: runner?.runId, blocks: harvest.blocks || 0,
           totalChars: harvest.totalChars || 0, answerChars: text.length, collapsed: Boolean(harvest.collapsed), expanded: stability.expanded,
           unfenced: Boolean(harvest.unfenced), fileLinks: harvest.fileLinks || 0, canvas: Boolean(harvest.canvas), textChars: harvest.textChars || 0});
@@ -1681,6 +1722,7 @@ function installReviewRunner(name, run) {
     state.sourceTrackingOwner = undefined;
     state.repairProbeTracker = undefined;
     state.repairReceipt = undefined;
+    state.boundUserNode = undefined;
     state.observation = undefined;
     state.completedSource = undefined;
     state.completionTracking = undefined;

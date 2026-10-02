@@ -29,6 +29,10 @@ const OWNED_PREFIX = "ashlar:tab:";
 // tab's page when the page lost its binding (rebindDispatchedPage), never any other tab.
 const DISPATCH_PREFIX = "ashlar:dispatched:";
 const dispatchKey = (jobId, provider) => `${DISPATCH_PREFIX}${jobId}:${provider}`;
+// A page writes a completed JSON result here before returning from its collector. This receipt
+// bridges a frozen-tab gap where tabs.sendMessage cannot deliver the normal harvest reply.
+const PAGE_RESULT_PREFIX = "ashlar:result:";
+const pageResultKey = (jobId, provider, runId) => `${PAGE_RESULT_PREFIX}${jobId}:${provider}:${runId || "legacy"}`;
 // A fix run whose tab the worker preserved without the page's own release (it never answered):
 // the inventory treats that page's binding as released, so it is never an orphan holding capacity,
 // and completes the release handshake as soon as the page can answer (see completePreservedRelease).
@@ -659,8 +663,9 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
  * "grokPacing" {gapMs}, default GROK_DISPATCH_GAP_MS); ChatGPT's gap is set at admission.
  * "serialSends": false turns the one-send-at-a-time rule off. */
 const GROK_DISPATCH_GAP_MS = 75_000;
-const SENT_STAGES = ["send_attempted", "send_unconfirmed", "prompt_submitted", "submission_persisted", "waiting_for_response",
+const SUBMITTED_STAGES = ["prompt_submitted", "submission_persisted", "waiting_for_response",
   "generating", "json_observed", "response_completed_json_invalid", "response_collected"];
+const SENT_STAGES = ["send_attempted", "send_unconfirmed", ...SUBMITTED_STAGES];
 function legSending(state, now = Date.now(), allocating = false) {
   if (!state || state.outcome || state.delivered) return false;
   // Opening a tab: a leg whose tab exists but has not been dispatched yet (loading, queued) is about to
@@ -679,7 +684,7 @@ function legSending(state, now = Date.now(), allocating = false) {
     : (state.workerEvents || []).find(e => e?.stage === "run_dispatched")?.at;
   if (!Number.isFinite(dispatchedAt) || now - dispatchedAt >= PAGE_PRESEND_MS) return false;
   const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
-  return !events.some(e => SENT_STAGES.includes(e.stage));
+  return !events.some(e => SUBMITTED_STAGES.includes(e.stage));
 }
 async function dispatchBlocked(job, provider, jobs, allocating = false) {
   const {serialSends = true} = await chrome.storage.local.get(["serialSends"]);
@@ -910,7 +915,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.67";
+const WORKER_BUILD = "1.1.69";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -970,6 +975,10 @@ function generatingFor(job) {
 
 function failure(code, error) {
   return { ok: false, code, error };
+}
+
+function unrecoverableRepairFailure() {
+  return {...failure("json_invalid", "the review answer could not be recovered after repair failed"), sourceUnavailable: true};
 }
 
 function tabMessage(job, provider, type) {
@@ -2198,6 +2207,64 @@ async function takenBeforeSend(job, provider, jobs, cause) {
   await saveJobs(jobs);
 }
 
+/** Read a result persisted by a page whose normal runtime reply was lost while its tab froze. */
+async function persistedPageResult(job, provider) {
+  const state = job.states[provider];
+  if (!state?.runId) return undefined;
+  const key = pageResultKey(job.jobId, provider, state.runId);
+  const record = (await chrome.storage.session.get([key]))[key];
+  if (!record || record.jobId !== job.jobId || record.provider !== provider || record.runId !== state.runId ||
+      typeof record.raw !== "string" || !record.raw.trim() || (job.kind === "fix" && record.ownership !== "owned")) return undefined;
+  return {ok:true, jobId:job.jobId, provider, runId:state.runId, raw:record.raw,
+    responseText:typeof record.responseText === "string" ? record.responseText : "",
+    at:typeof record.at === "number" && Number.isFinite(record.at) ? record.at : 0,
+    completion:record.completion && typeof record.completion.responseId === "string" && typeof record.completion.context === "string"
+      ? {responseId:record.completion.responseId, context:record.completion.context} : undefined,
+    persistedKey:key};
+}
+
+function persistedResultMayReplace(state, persisted) {
+  const code = state.outcome?.code;
+  if (state.outcome && !["response_timeout", "presend_stalled"].includes(code)) return false;
+  const collectedAt = [...(state.workerEvents || []), ...(state.pageEvents || [])]
+    .filter(event => event?.stage === "response_collected" && Number.isFinite(event.at))
+    .reduce((latest, event) => Math.max(latest, event.at), 0);
+  return !Number.isFinite(collectedAt) || persisted.at >= collectedAt;
+}
+
+async function discardPersistedPageResult(jobs, persisted) {
+  // Keep the receipt until the state save succeeds, even when it is stale and cannot replace the outcome.
+  await saveJobs(jobs);
+  await chrome.storage.session.remove([persisted.persistedKey]);
+}
+
+async function settleClosedTab(job, provider, jobs) {
+  const key = closedKey(job, provider);
+  if (!(await chrome.storage.session.get([key]))[key]) return false;
+  const state = job.states[provider];
+  if (!state.outcome) {
+    state.outcome = failure("tab_closed", "review tab was explicitly closed");
+  }
+  await saveJobs(jobs);
+  await chrome.storage.session.remove([pageResultKey(job.jobId, provider, state.runId)]);
+  return true;
+}
+
+async function ingestPersistedPageResult(job, provider, jobs, persisted) {
+  const state = job.states[provider];
+  state.started = true;
+  delete state.connectionError;
+  delete state.timeoutReceiptChecked;
+  state.outcome = {ok:true, raw:persisted.raw, originalText:persisted.responseText,
+    completion:persisted.completion};
+  workerStep(job, provider, "response_collected");
+  await clearLoginProbe(provider, job);
+  // Remove only after the same save that makes the result durable; a failed save leaves the receipt
+  // available for the next worker wakeup.
+  await saveJobs(jobs);
+  await chrome.storage.session.remove([persisted.persistedKey]);
+}
+
 /** A leg's poll, one operation in the tab queue (allocation, dispatch, harvest and their records). */
 function pollProvider(job, provider, jobs, observeOnly = false) {
   return tabOp("poll", () => pollProviderBody(job, provider, jobs, observeOnly));
@@ -2206,7 +2273,21 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   // Nothing for a job that retired (or was reset) while this operation waited in the queue.
   if (jobs[job.jobId] !== job) return;
   const state = job.states[provider];
-  if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
+  if (state.delivered || sourceArchiveDurable(state)) return;
+  if (await settleClosedTab(job, provider, jobs)) return;
+  // A timeout can be saved in the same tick that the page finishes its storage receipt. Read the
+  // identity-bound receipt before honoring any prior non-success outcome, then keep the receipt as
+  // the single source of truth for this run.
+  const persisted = await persistedPageResult(job, provider);
+  if (persisted) {
+    if (persistedResultMayReplace(state, persisted)) await ingestPersistedPageResult(job, provider, jobs, persisted);
+    else await discardPersistedPageResult(jobs, persisted);
+    return;
+  }
+  if (state.outcome) return;
+  // A content page may have persisted a complete response immediately before its tab froze. Read
+  // this receipt before watchdogs or tab lookups; the receipt is bound to this run and removes only
+  // after the durable job save, so a duplicate delivery cannot create a second completion.
   // First of all, before any tab lookup (discarded, loading or missing tabs return early below): the
   // worker's own bound on a leg that never sent. The tab is left to the cleanup policy, and the page
   // never sends after its deadline (PAGE_PRESEND_MS, carried in the run message).
@@ -2225,6 +2306,13 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     else stalled = presendWatchdog(state, Date.now(), probe.unreachable);
   }
   if (stalled) {
+    if (await settleClosedTab(job, provider, jobs)) return;
+    const lateReceipt = await persistedPageResult(job, provider);
+    if (lateReceipt) {
+      if (persistedResultMayReplace(state, lateReceipt)) await ingestPersistedPageResult(job, provider, jobs, lateReceipt);
+      else await discardPersistedPageResult(jobs, lateReceipt);
+      if (state.outcome) return;
+    }
     state.outcome = failure("presend_stalled", stalled);
     workerStep(job, provider, "presend_watchdog");
     await saveJobs(jobs);
@@ -2243,6 +2331,13 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     }
   }
   if (late) {
+    if (await settleClosedTab(job, provider, jobs)) return;
+    const lateReceipt = await persistedPageResult(job, provider);
+    if (lateReceipt) {
+      if (persistedResultMayReplace(state, lateReceipt)) await ingestPersistedPageResult(job, provider, jobs, lateReceipt);
+      else await discardPersistedPageResult(jobs, lateReceipt);
+      if (state.outcome) return;
+    }
     state.outcome = failure("response_timeout", late);
     workerStep(job, provider, "postsend_watchdog");
     await saveJobs(jobs);
@@ -2494,6 +2589,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     return;
   }
   await saveJobs(jobs);
+  // A normal live harvest can win the race with a receipt written by an older page instance;
+  // remove that exact run's receipt after the same durable save to keep retries idempotent.
+  await chrome.storage.session.remove([pageResultKey(job.jobId, provider, state.runId)]);
   if (state.outcome.code === "quota") await markQuota(provider);
   // An account gate the page cannot pass (logged out; Grok's age verification) pauses the provider:
   // every queued leg would end the same way until the user finishes it in the tab.
@@ -2502,9 +2600,16 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
 
 async function deliverOutcome(job, provider, jobs, signal) {
   const state = job.states[provider], out = state.outcome;
+  // Give a response timeout one worker tick for a page receipt whose storage write raced the watchdog.
+  // pollProviderBody checks this receipt before the next delivery; other failures remain immediate.
+  if (out?.code === "response_timeout" && !state.timeoutReceiptChecked) {
+    state.timeoutReceiptChecked = true;
+    await saveJobs(jobs);
+    return;
+  }
   // A durable archive normally settles via the repair-commit path, so it is not re-delivered here —
   // EXCEPT a no-repair salvage outcome, whose only delivery path is this complete request.
-  if (!out || state.delivered || (sourceArchiveDurable(state) && !out.salvaged)) return;
+  if (!out || state.delivered || (sourceArchiveDurable(state) && !out.salvaged && !out.sourceUnavailable)) return;
   // A failed outbox write can also leave an outcome in the shared cache. Retry
   // that save before sending it; only the server ACK permits subsequent cleanup.
   workerStep(job, provider, "delivery_pending");
@@ -2768,6 +2873,34 @@ async function repairProvider(job, provider, jobs) {
     workerStep(job,provider,`repair_${status.status}`);
     await saveJobs(jobs);
     if(status.status==="accepted")return acceptRepairReceipt(job,provider,jobs,status);
+    if (["needs_attention","interrupted","disabled","superseded"].includes(status.status)) {
+      // A terminal formatter result is not a reason to keep the provider generating forever. The
+      // original completed answer is still the only trustworthy evidence, so deliver the same
+      // canonical raw_review salvage used by the stalled sweep and let the bridge close this leg.
+      if (!state.outcome) {
+        const observed=await readRepairSource(job,provider);
+        if (observed && (observed.sourceHash!==attempt.sourceHash || observed.responseId!==attempt.responseId)) {
+          // A newer answer superseded this terminal attempt. Drop only the obsolete identity; the
+          // normal path below will start a fresh repair for the new source.
+          state.repairAttempt=undefined;attempt=undefined;await saveJobs(jobs);
+        } else {
+          const salvage=observed || (typeof attempt.text==="string" ? {text:attempt.text,sourceHash:attempt.sourceHash,responseId:attempt.responseId} : null);
+          if (salvage?.text) {
+            state.outcome={ok:true,raw:salvageReviewEnvelope(salvage.text),originalText:salvage.text,salvaged:true};
+            delete state.formatError;
+            workerStep(job,provider,"salvaged_no_repair");
+            await saveJobs(jobs);
+          } else {
+            state.outcome=unrecoverableRepairFailure();
+            delete state.formatError;
+            workerStep(job,provider,"repair_source_unavailable");
+            await saveJobs(jobs);
+          }
+        }
+      }
+      if (state.outcome) await deliverOutcome(job,provider,jobs);
+      if (state.outcome || attempt) return;
+    }
     if (["running","ready"].includes(status.status)) {
       const current=job.localJsonRepairEnabled ? await readRepairSource(job,provider,false) : null;
       if (current && (current.sourceHash!==attempt.sourceHash || current.responseId!==attempt.responseId)) {
@@ -2889,6 +3022,7 @@ async function settleStalledJob(job, jobs, signal) {
       // accepted is a resumable SUCCESS (the commit landed; acceptRepairReceipt records the receipt on
       // the next tick even if the worker stopped before it did). Salvaging it would collide with the
       // server's already-stored repaired leg (lease_conflict) and clear the lease. Exempt it too.
+      if (!state.repairAttempt) continue;
       if (["prepared", "running", "ready", "accepted"].includes(state.repairAttempt?.status)) continue;
       if (!state.outcome) {
         const salvage = localArchivedSource(state); // local archived copy — no fetch, no page, no hang
@@ -2898,9 +3032,13 @@ async function settleStalledJob(job, jobs, signal) {
           state.outcome = { ok: true, raw: salvageReviewEnvelope(salvage.text), originalText: salvage.text, salvaged: true };
           delete state.formatError;
           workerStep(job, provider, "salvaged_no_repair");
+        } else {
+          state.outcome = unrecoverableRepairFailure();
+          delete state.formatError;
+          workerStep(job, provider, "repair_source_unavailable");
         }
       }
-      continue; // salvaged (delivered in the post-loop) or nothing local to salvage — never fabricate a failure
+      continue; // salvage or an explicit source-unavailable failure is delivered in the post-loop
     }
     // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
     // stalled one — providerTabGone reports it "gone", but touching it would misreport a reviewer that

@@ -26,7 +26,10 @@ function visible(el) {
 function readComposer(el) {
   if (!el) return "";
   if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value || "";
-  return el.innerText || el.textContent || "";
+  // ProseMirror renders one paragraph per source line. `innerText` inserts an extra
+  // separator around empty paragraphs, so a prompt can differ by one character even
+  // though the editor holds the exact text. Reconstruct text from the DOM instead.
+  return losslessText(el) || el.innerText || el.textContent || "";
 }
 
 /** An element's text for a LOSSLESS comparison (a fix prompt): a textarea's value; in a rich editor
@@ -973,6 +976,52 @@ function enabledLooking(button) {
   return getComputedStyle(button).pointerEvents !== "none";
 }
 
+function sendControlSelectors() {
+  return ["#composer-submit-button", '[data-testid="send-button"]', 'button[aria-label*="Send"]',
+    'button[aria-label*="보내"]', 'button[aria-label*="전송"]', 'button[type="submit"]'];
+}
+
+/** Send-wait diagnostics contain control state only, never the prompt or rendered message text. */
+function sendControlProbe() {
+  const editor = typeof composer === "function" ? composer() : null;
+  const form = editor?.closest("form") || null;
+  const root = form || document;
+  const seen = new Set(), candidates = [];
+  for (const selector of sendControlSelectors()) {
+    for (const button of root.querySelectorAll(selector)) {
+      if (!(button instanceof HTMLElement) || seen.has(button)) continue;
+      seen.add(button);
+      candidates.push({selector, disabled: button.disabled === true,
+        ariaDisabled: button.getAttribute("aria-disabled"), dataDisabled: button.getAttribute("data-disabled"),
+        dataState: button.getAttribute("data-state"), pointerEvents: getComputedStyle(button).pointerEvents,
+        rendered: renderedControl(button), actionable: actionableSend(button)});
+    }
+  }
+  return {editor: Boolean(editor), form: Boolean(form), candidates: candidates.slice(0, 16)};
+}
+
+function saveSendWaitProbe(form, submission, {editor, button, otherTurn, draftedMatches, stopVisible}) {
+  try {
+    const local = globalThis.chrome?.storage?.local, state = globalThis.__ashlarRunnerState;
+    if (!local?.get || !local?.set || !state?.jobId || !state.runId) return;
+    const now = Date.now();
+    if (state.sendWaitProbeAt && now - state.sendWaitProbeAt < 5000) return;
+    state.sendWaitProbeAt = now;
+    const probe = sendControlProbe();
+    const draft = readComposer(editor), attachments = submission.attachments || [];
+    const record = {job: state.jobId, run: state.runId, provider: state.provider, at: now, ...probe,
+      attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+      attachmentsReady: attachmentsReady(form, attachments), selectedActionable: actionableSend(button),
+      otherTurn, draftedMatches, stopVisible, expectedLength: submission.expected.length,
+      draftLength: draft.length, expectedHead: sendProbeHash(submission.expected.slice(0, 40)),
+      draftHead: sendProbeHash(draft.slice(0, 40))};
+    globalThis.__ashlarSendWaitProbeWrites = (globalThis.__ashlarSendWaitProbeWrites || Promise.resolve()).then(async () => {
+      const stored = (await local.get(["sendWaitProbes"]))?.sendWaitProbes;
+      await local.set({sendWaitProbes: [...(Array.isArray(stored) ? stored : []), record].slice(-20)});
+    }).catch(() => {});
+  } catch { /* diagnostics never affect submission */ }
+}
+
 /** The first actionable Send, by selector priority. Every match of a selector is tried (a stray or
  * leftover node may come first in DOM order). A selector that rendered a Send but no actionable one
  * ends the search: a looser selector must not find some other button to click while the real Send
@@ -1250,11 +1299,14 @@ async function clickSend(findSend, findComposer, expectedText) {
       }
       const otherTurn = userTurns().length !== record.baseline;
       const drafted = normalizePrompt(readComposer(editor)) === record.expected;
+      const stopVisible = typeof stopButtonVisible === "function" && stopButtonVisible();
       // A fix draft that is the prompt only once whitespace is collapsed (or a fix journal with no
       // lossless form to check it against) is never sent.
       if (fix && drafted && !composerHoldsFix(editor, record.exact)) throw fixPromptAltered();
+      if (!uploadBusy) saveSendWaitProbe(form, record, {editor, button, otherTurn, draftedMatches: drafted, stopVisible});
+      if (!uploadBusy && !otherTurn && actionableSend(button) && !stopVisible && !drafted) throw draftChangedBeforeSend();
       if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
-          !(typeof stopButtonVisible === "function" && stopButtonVisible())) {
+          !stopVisible) {
         // Past the worker's deadline for this send the worker may have ended the leg (a tab frozen
         // in any pre-send stage, background.js presendWatchdog): never send then.
         if (presendDeadlinePassed()) {
@@ -1346,6 +1398,13 @@ function presendStalled(stage) {
   e.code = "presend_stalled";
   e.stage = stage;
   return e;
+}
+
+function draftChangedBeforeSend() {
+  const error = new Error("the composer draft changed before Send; nothing was sent");
+  error.code = "taken_over";
+  error.takeoverCause = "draft";
+  return error;
 }
 
 /** `work(deadline)` bounded by `ms`: past it the run fails as presend_stalled(stage), or, with

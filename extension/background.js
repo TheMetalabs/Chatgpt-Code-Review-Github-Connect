@@ -652,6 +652,38 @@ function chatgptLogSummary(log, now = Date.now(), logoutTimes) {
     logouts: logouts.slice(-5)};
 }
 
+/** Sends go one at a time across every provider and job (user decision 2026-10-02: ChatGPT and Grok
+ * opening and sending in tabs at once risks both sites' spam/abuse checks and Chrome throttling the
+ * hidden tab): a leg is dispatched only while no other leg is between its dispatch and its send.
+ * Generation overlaps freely. Grok also keeps a gap between its own dispatches (chrome.storage.local
+ * "grokPacing" {gapMs}, default GROK_DISPATCH_GAP_MS); ChatGPT's gap is set at admission.
+ * "serialSends": false turns the one-send-at-a-time rule off. */
+const GROK_DISPATCH_GAP_MS = 75_000;
+const SENT_STAGES = ["send_attempted", "send_unconfirmed", "prompt_submitted", "submission_persisted", "waiting_for_response",
+  "generating", "json_observed", "response_completed_json_invalid", "response_collected"];
+function legSending(state) {
+  if (!state?.started || state.outcome || state.delivered) return false;
+  const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
+  return !events.some(e => SENT_STAGES.includes(e.stage));
+}
+async function dispatchBlocked(job, provider, jobs) {
+  const {serialSends = true} = await chrome.storage.local.get(["serialSends"]);
+  for (const other of serialSends === false ? [] : Object.values(jobs)) {
+    if (other.serverStatus) continue;
+    for (const p of other.providers || []) {
+      if (other === job && p === provider) continue;
+      if (legSending(other.states?.[p])) return "send_in_progress";
+    }
+  }
+  if (provider === "grok") {
+    const {grokDispatchedAt = 0, grokPacing} = await chrome.storage.local.get(["grokDispatchedAt", "grokPacing"]);
+    const gap = Number.isFinite(grokPacing?.gapMs) && grokPacing.gapMs >= 0 ? grokPacing.gapMs : GROK_DISPATCH_GAP_MS;
+    const since = Date.now() - Number(grokDispatchedAt || 0);
+    if (since >= 0 && since < gap) return "grok_spacing";
+  }
+  return "";
+}
+
 /** Pre-send deadlines (live aicc #539/#602, 2026-10-01/02: legs sat in send_waiting 57-70+ min
  * holding a ChatGPT slot; Chrome had frozen their background tabs, so no page timer ran and the poll
  * skipped them as frozen). The run message carries a deadline for its send, PAGE_PRESEND_MS after
@@ -2249,12 +2281,14 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       // a page starts a run only while the worker that sent it still waits for the reply.
       const replyWindow = pageWindow();
       if (replyWindow < MIN_DISPATCH_WINDOW_MS) return;
+      if (await dispatchBlocked(job, provider, jobs)) return; // asked again next tick
       state.runDispatchedAt ??= Date.now();
       result = await askPage(state.tabId, {...run, until: Date.now() + replyWindow - RUN_UNTIL_SLACK_MS,
         presendDeadline: state.runDispatchedAt + PAGE_PRESEND_MS}, contentFiles(provider));
       // A page that refused the new run bound nothing: the run was never started.
       if (!refusedRun(result, job, provider)) {
         dispatched = true;
+        if (provider === "grok") await chrome.storage.local.set({grokDispatchedAt: Date.now()});
         state.started = true;
         workerStep(job,provider,"run_dispatched");
         state.dispatchReply = replyShape(result, job, state);

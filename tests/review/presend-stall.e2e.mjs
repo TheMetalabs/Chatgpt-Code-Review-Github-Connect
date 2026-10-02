@@ -170,3 +170,41 @@ test(`a logged-out landing (${name}) fails as logged_out within seconds; nothing
  assert.equal((await tab.send('ashlar-harvest')).code,'logged_out','the worker harvests the failure');
  assert.equal(await tab.local('presendStallHtml'),undefined,'a logged-out page is not a stall');
 });
+
+// Live aicc #620 (1.1.67): a ChatGPT leg sat in send_waiting for 17 min on a page the worker could
+// reach, until the worker's watchdog ended it. The in-page bound only fired for an unclickable Send;
+// any other blocker (a changed draft, a Stop button, a user turn) waited without end and left no clue.
+test('a Stop button keeps the send waiting: it fails as presend_stalled at 3 min naming the blocker, with a snapshot',async t=>{
+ const tab=await chatTab(t);
+ await tab.page.evaluate(stopButton=>document.body.insertAdjacentHTML('beforeend',stopButton),stopButton);
+ await tab.start();
+ await tab.page.clock.runFor(2*MIN);
+ assert.equal((await tab.runner()).running,true,'still inside the send bound at 2 min');
+ await tab.page.clock.runFor(MIN+10_000);
+ const out=await tab.runner();t.diagnostic(JSON.stringify([out,await tab.steps()]));
+ assert.equal(out.running,false);assert.equal(out.code,'presend_stalled');
+ assert.match(out.error,/"send_waiting".*\(Stop button shown\)/);
+ assert.equal((await tab.view()).sendClicks,0,'nothing was sent');
+ const [snap]=await tab.local('presendStallHtml');
+ assert.equal(snap.stage,'send_waiting');assert.match(snap.blockers,/Stop button shown/);
+});
+
+test('a draft the page changed after it was typed fails as presend_stalled naming where it differs',async t=>{
+ const tab=await chatTab(t);
+ // Send stays disabled while the draft is typed; once it is typed the page rewrites it and enables Send:
+ // a clickable Send with a draft that is no longer the prompt (the case the Send-only bound missed).
+ await tab.page.evaluate(()=>{
+  const el=document.getElementById('prompt-textarea'),send=document.getElementById('composer-submit-button');
+  send.disabled=true;
+  const timer=setInterval(()=>{if(!el.textContent.includes('Return'))return;clearInterval(timer);el.textContent=el.textContent.replace('Return','Retur');send.disabled=false;},100);
+ });
+ await tab.start();
+ await tab.page.clock.runFor(5*MIN);
+ const out=await tab.runner();t.diagnostic(JSON.stringify([out,await tab.steps(),await tab.view()]));
+ assert.equal(out.code,'presend_stalled');
+ assert.match(out.error,/\(draft differs \(\d+ chars typed, \d+ expected, first difference at \d+\)\)/);
+ assert.equal((await tab.view()).sendClicks,0);
+ const [snap]=await tab.local('presendStallHtml');
+ assert.equal(snap.draft.firstDifference,PROMPT.indexOf('Return')+5);
+ assert.match(snap.draft.typedNear,/Retur /);assert.match(snap.draft.expectedNear,/Return /);
+});

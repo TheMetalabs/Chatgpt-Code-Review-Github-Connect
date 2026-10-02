@@ -23,6 +23,7 @@ export const PROGRESS_LABELS = {
     presend_stalled: "A pre-send stage stalled past its bound · nothing was sent; run failed",
     age_confirmed: "Grok asked to verify the account's age · answered with the owner's registered year",
     presend_watchdog: "No send was seen within the watchdog's bound · the worker ended the leg (its failure message says whether the tab answered, or whether a send is unknown)",
+    postsend_watchdog: "No answer was collected within the post-send bound · the worker ended the leg (its failure message gives the minutes since the send)",
     logged_out: "ChatGPT is logged out in this Chrome profile · nothing was sent; log in and retry",
     attachments_waiting: "Prompt entered · waiting for named attachments to finish uploading",
     attachments_staged_via_a: "Attachments staged · the composer's file input took them (strategy a)",

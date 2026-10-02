@@ -710,6 +710,36 @@ async function dispatchBlocked(job, provider, jobs, allocating = false) {
 const PAGE_PRESEND_MS = 15 * 60_000;
 const PRESEND_WATCHDOG_MS = 17 * 60_000;
 const PRESEND_UNREACHABLE_GRACE_MS = 10 * 60_000;
+/** Post-send bounds. A sent leg had none in the worker: the page's own timers (json.js expireResponseWait,
+ * 35 min) cannot run in a tab Chrome froze, the poll skipped frozen tabs, and the page credits poll gaps
+ * back to its wait, so a hidden Grok tab that froze after its send sat in waiting_for_response for 40-73
+ * min (aicc jobs 629, 648, 649, 657, 662, 663, 1.1.62). POSTSEND_CAP_MS ends a leg with no collected
+ * answer that long after its send, per provider (ChatGPT keeps the page's bound: a long Pro answer is
+ * legitimate there); FROZEN_POKE_MS lets one read-only poll through a frozen sent tab, which thaws it. */
+const POSTSEND_CAP_MS = {grok: 30 * 60_000};
+const FROZEN_POKE_MS = 3 * 60_000;
+// Poll gaps beyond this (the machine slept, Chrome was closed) are time nobody watched the leg; they are
+// credited back to its cap like the page credits its own wait (json.js), so an answer that finished
+// while the worker was away is harvested rather than cut off. Above FROZEN_POKE_MS so a frozen tab's
+// poke cadence never counts as a gap.
+const POSTSEND_GAP_MS = 4 * 60_000;
+function sentAt(state) {
+  const times = (Array.isArray(state.pageEvents) ? state.pageEvents : []).filter(e => SENT_STAGES.includes(e.stage)).map(e => e.at);
+  return times.length ? Math.min(...times) : undefined;
+}
+/** Why the worker ends a sent leg that has no answer ("" while it may wait). */
+function postsendWatchdog(state, provider, now = Date.now()) {
+  const cap = POSTSEND_CAP_MS[provider], at = sentAt(state);
+  const watched = at === undefined ? 0 : now - at - (state.postsendSlackMs || 0);
+  if (cap === undefined || at === undefined || !state.started || state.outcome || state.delivered || watched < cap) return "";
+  return `no answer was collected ${Math.round(watched / 60_000)} min after the prompt was sent (${provider} cap ${Math.round(cap / 60_000)} min)`;
+}
+function creditPostsendGap(state, now = Date.now()) {
+  if (sentAt(state) === undefined) return;
+  const gap = now - (state.lastPollAt ?? now);
+  if (gap > POSTSEND_GAP_MS) state.postsendSlackMs = (state.postsendSlackMs || 0) + gap - POSTSEND_GAP_MS;
+  state.lastPollAt = now;
+}
 
 /** Why the worker ends a leg that never sent ("" while it may wait): PRESEND_WATCHDOG_MS after its
  * dispatch no send event is seen. Not conditioned on the tab's frozen flag (live 2026-10-02, 1.1.62:
@@ -735,12 +765,12 @@ function presendWatchdog(state, now = Date.now(), unreachable = "") {
 /** A stalled leg's tab, asked once read-only: {reply} when its page answered for this job, else
  * {unreachable} naming why it could not ("discarded" and "gone" are left to the poll's own wake and
  * rebinding paths, which are bounded). */
-async function probeStalledLeg(job, provider, state) {
+async function probeStalledLeg(job, provider, state, askFrozen = false) {
   let tab;
   try { tab = await chrome.tabs.get(state.tabId); } catch { return {unreachable: "gone"}; }
   if (!allowedTab(tab, provider)) return {unreachable: "gone"};
   if (tab.discarded === true || tab.status === "unloaded") return {unreachable: "discarded"};
-  if (tab.frozen === true) return {unreachable: "tab frozen"};
+  if (tab.frozen === true && !askFrozen) return {unreachable: "tab frozen"};
   if (tab.status && tab.status !== "complete") return {unreachable: "tab still loading"};
   try {
     const reply = await askPage(state.tabId, {type: "ashlar-harvest", jobId: job.jobId, provider, runId: state.runId}, contentFiles(provider));
@@ -880,7 +910,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.65";
+const WORKER_BUILD = "1.1.67";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2046,6 +2076,20 @@ async function refreshJobHeartbeat(job, jobs, signal) {
     return false; // Not equivalent to cancellation, receipt, or permission to close.
   }
   delete job.serverStatus;
+  // Legs the server ended while the job goes on (a stalled Grok past its cap, a reviewer turned off):
+  // their runs stop and their tabs release like a cancelled job's. A leg with an outcome of its own
+  // (a collected answer, a failure) still delivers it.
+  const ended = (Array.isArray(result.endedProviders) ? result.endedProviders : [])
+    .filter(provider => job.states[provider] && !job.states[provider].outcome && !job.states[provider].delivered);
+  // One `abandon` operation, like a cancelled job's (abandonJobLegs): after a poll that may be between
+  // its run message and saving `started`, so the release that follows sees what it dispatched.
+  if (ended.length) await tabOp("abandon", async () => {
+    if (jobs[job.jobId] !== job) return;
+    const open = ended.filter(provider => !job.states[provider].outcome && !job.states[provider].delivered);
+    abandonLegs(job, open, "ended");
+    for (const provider of open) workerStep(job, provider, "cancelled");
+    await saveJobs(jobs);
+  });
   if (result.accepted === false || !job.leaseId) {
     const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()}, job.origin, signal);
     job.leaseId = claim.leaseId;
@@ -2186,6 +2230,24 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     await saveJobs(jobs);
     return;
   }
+  creditPostsendGap(state);
+  let late = postsendWatchdog(state, provider);
+  // Like the pre-send watchdog: one read-only ask of the page before the leg is ended, so an answer
+  // that finished just now (or a verdict such as logged out) goes to the ordinary harvest below.
+  if (late) {
+    const probe = await probeStalledLeg(job, provider, state, true);
+    if (probe.reply) {
+      ingestPageProgress(state, probe.reply);
+      const verdict = !isBusyResult(probe.reply) && (probe.reply.ok || (probe.reply.code && probe.reply.code !== "idle"));
+      if (verdict) late = "";
+    }
+  }
+  if (late) {
+    state.outcome = failure("response_timeout", late);
+    workerStep(job, provider, "postsend_watchdog");
+    await saveJobs(jobs);
+    return;
+  }
   await applyPendingReplace(state);
   if (!state.runId) state.runId = crypto.randomUUID();
   // Memory is not a receipt: a previous write may have failed while leaving the
@@ -2311,7 +2373,13 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   }
   // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws: a message
   // would only wait out askPage. Polled again next tick.
-  if (tab.frozen === true) return;
+  let frozenPoke = false;
+  if (tab.frozen === true) {
+    if (sentAt(state) === undefined || Date.now() - (state.frozenPokeAt || 0) < FROZEN_POKE_MS) return;
+    state.frozenPokeAt = Date.now();
+    frozenPoke = true;
+    await saveJobs(jobs);
+  }
   // A new ChatGPT prompt goes only into the new chat its tab was opened on (X2, #85): the tab is
   // active, so the user may have opened one of their own conversations in it before this dispatch.
   // Nothing is sent there (the page checks again: json.js freshPageLeft). Unless its page is already
@@ -2365,6 +2433,8 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       }
     }
   } catch (e) {
+    // A frozen tab that does not answer its poke is what it was before: not a lost binding.
+    if (frozenPoke) return;
     // A messaging outage is not a model failure or a global admission lock.
     state.connectionError = String(e.message || e).slice(0, 240);
     workerStep(job,provider,"disconnected");

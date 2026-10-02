@@ -23,7 +23,7 @@ export function settingsHarness(initial = {}) {
       return next;
     },
     publicSettings, publicJobs: j => j, publicReviews: r => r,
-    githubStatus: () => ({}), getBridgePublic: () => ({}), historyHealth: () => ({ok: true}), reviewHistory: () => ({health: () => ({ok: true})}),
+    githubStatus: () => ({}), getBridgePublic: () => ({}), endDisabledChatLegs() {}, historyHealth: () => ({ok: true}), reviewHistory: () => ({health: () => ({ok: true})}),
     normalizeChatgptReasoning, normalizeGrokReasoning,
   });
   const post = body => Route.server.handlers.POST({request: new Request('http://ashlar.test/api/harbor', {

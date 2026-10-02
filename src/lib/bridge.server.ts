@@ -8,7 +8,7 @@ import {sanitizeProgressEvents} from "./review-progress";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { getHarbor, patchHarborJob, submitHarborChat, type ChatLeg } from "./harbor.server";
 import type { Job, ReviewProvider, ProviderError } from "./types";
-import { BINDING_LOST_MS, BRIDGE_CLAIM_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, fixKnob, isChatProvider, providersFromSettings } from "./types";
+import { BINDING_LOST_MS, BRIDGE_CLAIM_MS, CHAT_LEG_STALL_MS, BRIDGE_CONNECTED_MS, claimedReviewerNote, fixKnob, isChatProvider, providersFromSettings } from "./types";
 import { llmWorkAllowed } from "./ops-comment";
 import { fallbackWaivesChat } from "./local-fallback";
 import { extractChatJson, salvageReviewJson } from "./extract-chat-json";
@@ -363,36 +363,96 @@ function bindingLostExpired(job: Job, provider: ReviewProvider, now: number): bo
   return since !== undefined && now - since >= BINDING_LOST_MS && job.providerErrors?.[provider]?.code === "disconnected";
 }
 
-/** Settle every leg whose original binding stayed unavailable past BINDING_LOST_MS as a provider
- * failure, so its job ends instead of waiting unboundedly: the worker's heartbeats keep the claim
- * fresh (never re-offered) and `disconnected` is not terminal. Runs on each heartbeat and on each
- * take, so a worker that stopped heartbeating is bounded too. */
+/** Stages after the send: the leg is waiting on the provider's answer, nothing local left to do. */
+const POST_SEND_STAGES: ReadonlySet<string> = new Set(["prompt_submitted", "waiting_for_response", "generating", "waiting_for_json", "json_observed", "legacy_observation"]);
+
+const STALL_OUTAGE_MS = 5 * 60_000;
+
+/** The leg reported a post-send stage and no newer stage for its provider's CHAT_LEG_STALL_MS, from a
+ * worker that has been heard from lately: a worker silent for longer than STALL_OUTAGE_MS (asleep,
+ * Chrome closed) says nothing about the leg, and its first heartbeat back restarts the clock
+ * (refreshBridgeClaim), so neither the take path nor a heartbeat fails a leg on time nobody watched. */
+function legStallExpired(job: Job, provider: ReviewProvider, now: number): boolean {
+  const cap = CHAT_LEG_STALL_MS[provider], progress = job.providerProgress?.[provider];
+  if (job.bridgeClaimedAt !== undefined && now - job.bridgeClaimedAt > STALL_OUTAGE_MS) return false;
+  return cap !== undefined && progress !== undefined && POST_SEND_STAGES.has(progress.stage) && now - progress.receivedAt >= cap;
+}
+
+/** End chat legs as provider failures in one patch, so the job stops waiting on them and the next
+ * heartbeat tells the worker (bridgeJobState.endedProviders). A leg with a stored result is untouched. */
+function settleChatLegs(jobId: string, legs: readonly {provider: ReviewProvider; code: ProviderError["code"]; message: string}[]) {
+  const now = Date.now();
+  patchHarborJob(jobId, current => {
+    const next = {...current, generating: {...current.generating}, providerErrors: {...current.providerErrors},
+      bindingLostAt: {...current.bindingLostAt}, assumptions: [...(current.assumptions ?? [])], updatedAt: now};
+    for (const {provider, code, message} of legs) {
+      if (current.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim())) continue;
+      next.generating[provider] = false;
+      next.providerErrors[provider] = {code, message};
+      delete next.bindingLostAt[provider];
+      next.assumptions = [...next.assumptions.filter(note => !note.startsWith(`Skipped ${provider}:`)), `Skipped ${provider}: ${message}`];
+    }
+    return next;
+  });
+  for (const {provider} of legs) cancelLocalJsonRepairs("superseded", jobId, provider);
+}
+
+/** Settle every leg that can no longer finish on its own as a provider failure, so its job ends
+ * instead of waiting unboundedly: a leg whose original binding stayed unavailable past
+ * BINDING_LOST_MS (the worker's heartbeats keep the claim fresh, so it is never re-offered, and
+ * `disconnected` is not terminal), and a leg that sat past CHAT_LEG_STALL_MS after its send. Runs on
+ * each heartbeat and on each take, so a worker that stopped heartbeating is bounded too. */
 function settleLostBindings(jobs: readonly Job[]) {
   const now = Date.now();
   for (const job of [...jobs]) {
     if (job.status !== "awaiting_chat") continue;
-    const lost = pendingChatProviders(job).filter(provider => bindingLostExpired(job, provider, now));
-    if (!lost.length) continue;
-    const message = `original job binding unavailable for ${Math.round(BINDING_LOST_MS / 60_000)} min with no bound run reported`;
+    const legs = pendingChatProviders(job).flatMap(provider =>
+      bindingLostExpired(job, provider, now)
+        ? [{provider, code: "error" as const, message: `original job binding unavailable for ${Math.round(BINDING_LOST_MS / 60_000)} min with no bound run reported`}]
+        : legStallExpired(job, provider, now)
+          ? [{provider, code: "error" as const, message: `no progress for ${Math.round(CHAT_LEG_STALL_MS[provider]! / 60_000)} min after the prompt was sent (last stage: ${job.providerProgress![provider]!.stage})`}]
+          : []);
+    if (legs.length) settleChatLegs(job.id, legs);
+  }
+}
+
+/** A reviewer turned off in settings: its unfinished legs on live jobs end, and the job then reads as
+ * one created with that reviewer off (jobs pin their provider list, so the switch alone never reached
+ * a job already waiting on it). The provider leaves the pinned lists instead of becoming a "Skipped"
+ * failure, so a clean verdict from the others still publishes clean. Only when no other reviewer
+ * would remain does the leg end as a failure, which is what that job is. */
+export function endDisabledChatLegs(providers: readonly ReviewProvider[]) {
+  for (const job of [...getHarbor().jobs]) {
+    if (job.status !== "awaiting_chat") continue;
+    const ended = pendingChatProviders(job).filter(provider => providers.includes(provider));
+    if (!ended.length) continue;
+    const list = job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? [];
+    if (!list.some(provider => !ended.includes(provider))) {
+      settleChatLegs(job.id, ended.map(provider => ({provider, code: "cancelled" as const, message: `${provider} was turned off in settings`})));
+      continue;
+    }
     patchHarborJob(job.id, current => {
-      const next = {...current, generating: {...current.generating}, providerErrors: {...current.providerErrors},
-        bindingLostAt: {...current.bindingLostAt}, assumptions: [...(current.assumptions ?? [])], updatedAt: now};
-      for (const provider of lost) {
-        next.generating[provider] = false;
-        next.providerErrors[provider] = {code: "error", message};
-        delete next.bindingLostAt[provider];
-        next.assumptions = [...next.assumptions.filter(note => !note.startsWith(`Skipped ${provider}:`)), `Skipped ${provider}: ${message}`];
-      }
-      return next;
+      const keep = (all?: ReviewProvider[]) => all?.filter(provider => !ended.includes(provider));
+      return {...current, reviewProviders: keep(current.reviewProviders), fpProviders: keep(current.fpProviders),
+        generating: {...current.generating, ...Object.fromEntries(ended.map(provider => [provider, false]))},
+        endedLegs: [...new Set([...(current.endedLegs ?? []), ...ended])], updatedAt: Date.now()};
     });
-    for (const provider of lost) cancelLocalJsonRepairs("superseded", job.id, provider);
+    for (const provider of ended) cancelLocalJsonRepairs("superseded", job.id, provider);
   }
 }
 
 export function bridgeJobState(jobId: string) {
   if (isFixItemId(jobId)) return fixes().state(jobId);
   const job = getHarbor().jobs.find(j => j.id === jobId);
-  return {active: job?.status === "awaiting_chat", status: job?.status ?? "missing"};
+  // Legs the server ended (stall cap, reviewer turned off) while the job goes on for the others:
+  // the worker stops them and releases their tabs (background.js refreshJobHeartbeat).
+  const failed = job?.status === "awaiting_chat"
+    ? (job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? []).filter(isChatProvider).filter(provider =>
+        job.providerErrors?.[provider] && job.providerErrors[provider]!.code !== "disconnected" &&
+        !job.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim()))
+    : [];
+  const endedProviders = [...new Set([...failed, ...(job?.status === "awaiting_chat" ? job.endedLegs ?? [] : [])])];
+  return {active: job?.status === "awaiting_chat", status: job?.status ?? "missing", endedProviders};
 }
 
 /** A review job this Chrome profile may take now (nextBridgeJob's filter; takeFix orders by it). */
@@ -566,8 +626,11 @@ export function recordBridgeProgress(jobId: string, leaseId: string | undefined,
     reviewHistory().recordJob(job);
     reviewHistory().recordProgress(jobId,provider,report.runId,events);
     const latest=events.reduce((a,b)=>b.at>=a.at?b:a);
-    if(!next[provider] || latest.at>=next[provider]!.observedAt)next[provider]={runId:report.runId,stage:latest.stage,
-      observedAt:latest.at,receivedAt:Date.now(),extensionVersion:typeof report.extensionVersion==="string"?report.extensionVersion.slice(0,40):undefined};
+    // receivedAt dates the newest EVENT, not the heartbeat that repeats it: the worker re-sends its whole
+    // journal every ping, and the stall cap (legStallExpired) counts from the last new step.
+    const previous = next[provider], unchanged = previous?.stage === latest.stage && previous.observedAt === latest.at;
+    if(!previous || latest.at>=previous.observedAt)next[provider]={runId:report.runId,stage:latest.stage,
+      observedAt:latest.at,receivedAt:unchanged ? previous.receivedAt : Date.now(),extensionVersion:typeof report.extensionVersion==="string"?report.extensionVersion.slice(0,40):undefined};
   }
   patchHarborJob(jobId,current=>({...current,providerProgress:next}));
   return true;
@@ -590,6 +653,7 @@ export function refreshBridgeClaim(
   if (!job || job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return false;
   // Before the patch: the ping speaks for its owner whatever the patch or its history write does.
   noteLeaseOwner(job, leaseId);
+  const silentFor = Date.now() - (job.bridgeClaimedAt ?? Date.now());
   patchHarborJob(jobId, current => {
     const nextGenerating = {...current.generating};
     const nextErrors = {...current.providerErrors};
@@ -611,7 +675,11 @@ export function refreshBridgeClaim(
       // A bare false flag says nothing about completion. Final JSON is stored by complete;
       // terminal failures require their explicit provider-specific outcome.
     }
-    return {...current, bridgeClaimedAt: Date.now(), generating: nextGenerating, providerErrors: nextErrors, bindingLostAt: lostAt, updatedAt: Date.now()};
+    // No worker spoke for this job for a while (the machine slept, the extension reloaded): the stall
+    // clock restarts, so a leg whose page finished meanwhile is harvested, not ended on stale time.
+    const progress = silentFor > STALL_OUTAGE_MS && current.providerProgress
+      ? Object.fromEntries(Object.entries(current.providerProgress).map(([p, v]) => [p, {...v, receivedAt: Date.now()}])) : current.providerProgress;
+    return {...current, bridgeClaimedAt: Date.now(), generating: nextGenerating, providerErrors: nextErrors, bindingLostAt: lostAt, providerProgress: progress, updatedAt: Date.now()};
   });
   settleLostBindings(getHarbor().jobs.filter(job => job.id === jobId));
   meta.lastJobId = jobId;
@@ -675,6 +743,9 @@ export function failBridgeProvider(jobId: string, provider: ReviewProvider, erro
   if (!job || job.status !== "awaiting_chat") return true;
   if (!llmWorkAllowed(job) || !ownsLease(job, leaseId)) return false;
   if (job.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim())) return true;
+  // A leg the server ended (reviewer turned off) is acknowledged and dropped: a refusal would make the
+  // worker retry it on every tick and keep its tab held.
+  if (job.endedLegs?.includes(provider)) return true;
   const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? [];
   if (!enabled.includes(provider)) return false;
   const prefix = error.split(":", 1)[0];
@@ -752,6 +823,7 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
   if (job.status !== "awaiting_chat" || !ownsLease(job, leaseId)) return {ok: false, error: "job is not claimed by this worker", code: "lease_conflict"};
   const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(getHarbor().settings);
   const accepted: ChatLeg[] = [];
+  const ended = incoming.filter(leg => job.endedLegs?.includes(leg.provider));
   for (const leg of incoming) {
     if (!isChatProvider(leg.provider) || !enabled.includes(leg.provider)) continue;
     try {
@@ -762,6 +834,8 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
     if (!parsed) return {ok: false, error: "completed response is not review JSON"};
     accepted.push({...leg, raw: parsed});
   }
+  // Only legs the server already ended: acknowledged, not stored (see failBridgeProvider).
+  if (!accepted.length && ended.length === incoming.length && ended.length) return {ok: true};
   if (!accepted.length) return {ok: false, error: "no enabled reviewer result"};
   patchHarborJob(jobId, current => {
     const storedLegs = [...(current.storedLegs ?? [])];

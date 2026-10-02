@@ -745,3 +745,53 @@ test('Grok idle completion uses the polled submission, not stale persisted strea
   });
   assert.deepEqual(out, {staleDone: false, activeDone: true, wrongPrompt: false, missingKey: false, actionDone: true});
 });
+
+// Live 2026-10-02 (aicc #619/#620, 1.1.61): both Grok legs spent exactly 60 s in reasoning_selecting and
+// skipped it (the pill still read 빠른), then clicked Send with <main> aria-hidden behind an open layer and
+// nothing was sent (send_unconfirmed). Grok's model pill is a Radix trigger: it opens on pointerdown, so a
+// bare click() never opened the menu. A Radix menu hides <main> while open and closes on Escape.
+const RADIX = `<main id="m"><p>home</p></main><form data-composer="true">${'${'}grokList([])}
+  <div data-query-bar-mode-select="true"><button id="model-select-trigger" aria-label="모델 선택" aria-haspopup="menu" aria-expanded="false" style="width:88px;height:32px"><span>빠른</span></button></div>
+  <textarea aria-label="Ask Grok anything" style="width:320px;height:48px"></textarea>
+  <button type="submit" data-testid="chat-submit" aria-label="제출" style="width:64px;height:32px">제출</button></form>`;
+async function radixPage(t, {items = ['빠른', '전문가'], stuck = false} = {}) {
+  const page = await openGrok(t, RADIX.replace("${grokList([])}", grokList([])));
+  await page.evaluate(({items, stuck}) => {
+    const pill = document.getElementById('model-select-trigger'), main = document.getElementById('m');
+    const close = () => { document.getElementById('menu')?.remove(); main.removeAttribute('aria-hidden'); pill.setAttribute('aria-expanded', 'false'); };
+    window.opens = 0;
+    pill.addEventListener('pointerdown', () => {
+      window.opens++;
+      main.setAttribute('aria-hidden', 'true'); pill.setAttribute('aria-expanded', 'true');
+      document.body.insertAdjacentHTML('beforeend', `<div data-radix-popper-content-wrapper><div role="menu" id="menu" style="width:160px;height:80px">${items.map(i => `<div role="menuitem" style="width:150px;height:24px">${i}</div>`).join('')}</div></div>`);
+      for (const el of document.querySelectorAll('[role="menuitem"]')) el.addEventListener('click', () => { pill.querySelector('span').textContent = el.textContent; close(); });
+    });
+    if (!stuck) document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+  }, {items, stuck});
+  return page;
+}
+
+test('grok model pill (Radix): opened by pointerdown, Expert selected, and the menu is closed afterwards', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async () => ({r: await selectReasoning('grok', 'heavy', Date.now() + 5000), pill: grokPill().textContent.trim(),
+    hidden: document.getElementById('m').getAttribute('aria-hidden'), blocking: grokBlockingLayer(), opens: window.opens}));
+  assert.deepEqual(out, {r: 'selected', pill: '전문가', hidden: null, blocking: false, opens: 1}, JSON.stringify(out));
+});
+
+test('grok model pill (Radix): no matching item is skipped quickly and leaves no menu open', async t => {
+  const page = await radixPage(t, {items: ['빠른']});
+  const out = await page.evaluate(async () => { const t0 = Date.now(); const r = await selectReasoning('grok', 'expert', Date.now() + 20_000);
+    return {r, ms: Date.now() - t0, blocking: grokBlockingLayer()}; });
+  assert.equal(out.r, 'skipped'); assert.equal(out.blocking, false);
+  assert.ok(out.ms < 5000, `skipped without waiting out the deadline: ${out.ms} ms`);
+});
+
+test('grok pre-send: a layer that will not close blocks the send and is captured in the snapshot', async t => {
+  const page = await radixPage(t, {stuck: true});
+  const out = await page.evaluate(async () => {
+    document.getElementById('model-select-trigger').dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+    const closed = await closeGrokLayers(800);
+    return {closed, blocking: grokBlockingLayer(), snap: snapshotHtml().includes('role="menu"')};
+  });
+  assert.deepEqual(out, {closed: false, blocking: true, snap: true});
+});

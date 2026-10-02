@@ -166,6 +166,12 @@ async function runPrompt(prompt, reasoning, resume = false) {
   step("attachments_preparing");
   const submittedText = await fillComposer(el, prompt);
   await dismissOverlays();
+  // Never click Send under an open menu or dialog (live 2026-10-02: two legs clicked Send with the page
+  // aria-hidden behind a layer, and nothing was sent): closed first, or the run ends saying so.
+  if (!await closeGrokLayers()) {
+    if (typeof savePresendStallHtml === "function") savePresendStallHtml("grok_layer_open");
+    throw presendStalled("grok_layer_open");
+  }
   await clickSend(sendButton, composer, submittedText);
   return waitUntilReviewOrQuota("Grok");
 }

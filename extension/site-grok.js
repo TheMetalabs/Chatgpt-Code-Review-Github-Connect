@@ -324,10 +324,9 @@ globalThis.selectReasoning = async function(provider, level, deadline = Date.now
   const pill = grokPill();
   if (!pill) return "skipped";
   if (grokLevelHit(want, pillText(pill))) return "current";
-  const escape = () => document.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", bubbles: true}));
   globalThis.throwIfStopped?.();
   if (Date.now() >= deadline) return "skipped";
-  pill.click();
+  openRadixTrigger(pill);
   let items = [];
   for (;;) {
     await (typeof waitForPageChange === "function" ? waitForPageChange(400) : sleep(400));
@@ -335,10 +334,10 @@ globalThis.selectReasoning = async function(provider, level, deadline = Date.now
     items = reasoningMenuItems();
     if (items.length || Date.now() >= deadline) break;
   }
-  if (Date.now() >= deadline && !items.length) { escape(); return "skipped"; }
+  if (Date.now() >= deadline && !items.length) { await closeGrokLayers(); return "skipped"; }
   await sleep(400);
   globalThis.throwIfStopped?.();
-  if (Date.now() >= deadline) { escape(); return "skipped"; }
+  if (Date.now() >= deadline) { await closeGrokLayers(); return "skipped"; }
   items = reasoningMenuItems();
   const pickable = n => n instanceof HTMLElement && !n.disabled && n.getAttribute("aria-disabled") !== "true" &&
     (n.getAttribute("data-disabled") === null || n.getAttribute("data-disabled") === "false");
@@ -347,9 +346,39 @@ globalThis.selectReasoning = async function(provider, level, deadline = Date.now
     if (el instanceof HTMLElement) {
       el.click();
       await sleep(400);
+      await closeGrokLayers();
       return "selected";
     }
   }
-  escape();
+  await closeGrokLayers();
   return "skipped";
 };
+
+/** Open a Radix trigger the way a pointer does: Radix menus open on pointerdown, so a bare click()
+ * left the model menu shut and the selection waited out its 60 s (live Grok legs, 2026-10-02). */
+function openRadixTrigger(el) {
+  const at = {bubbles: true, cancelable: true, button: 0, pointerType: "mouse", isPrimary: true};
+  try { el.dispatchEvent(new PointerEvent("pointerdown", at)); } catch { /* older engines: click below */ }
+  if (el.getAttribute("aria-expanded") !== "true") el.click();
+}
+
+/** A layer that blocks the page: the content behind it is aria-hidden (Radix modal menus and
+ * dialogs), or a menu/dialog is open. */
+function grokBlockingLayer() {
+  const main = document.querySelector("main");
+  if (main?.getAttribute("aria-hidden") === "true") return true;
+  return [...document.querySelectorAll("[role='dialog'], [role='alertdialog'], [role='menu']")].some(el => elVisible(el));
+}
+
+/** Close any open menu or dialog with Escape, sent where Radix listens (the focused element and the
+ * layer itself, then the document); true once nothing blocks the page. */
+async function closeGrokLayers(ms = 3000) {
+  const end = Date.now() + ms;
+  while (grokBlockingLayer() && Date.now() < end) {
+    const key = {key: "Escape", code: "Escape", bubbles: true, cancelable: true};
+    const targets = [document.activeElement, ...document.querySelectorAll("[role='menu'], [role='dialog'], [role='alertdialog']"), document];
+    for (const t of targets) { try { t?.dispatchEvent(new KeyboardEvent("keydown", key)); } catch { /* next */ } }
+    await sleep(300);
+  }
+  return !grokBlockingLayer();
+}

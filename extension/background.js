@@ -718,6 +718,16 @@ function presendWatchdog(state, now = Date.now()) {
   return `no send was seen in ${Math.round((now - dispatchedAt) / 60_000)} min after dispatch (last page step "${last}"); nothing was sent`;
 }
 
+/** One read-only look at a stalled leg's page (null when its tab cannot answer). */
+async function probeStalledLeg(job, provider, state) {
+  try {
+    const tab = await chrome.tabs.get(state.tabId);
+    if (!allowedTab(tab, provider) || tab.discarded === true || tab.frozen === true || (tab.status && tab.status !== "complete")) return null;
+    const reply = await askPage(state.tabId, {type: "ashlar-harvest", jobId: job.jobId, provider, runId: state.runId}, contentFiles(provider));
+    return matchesJob(reply, job, provider) ? reply : null;
+  } catch { return null; }
+}
+
 /** A provider answered a job admitted after its logout: the login is back, and admission leaves
  * probe mode. A job sent before the logout proves nothing about the session now. */
 async function clearLoginProbe(provider, job) {
@@ -2136,7 +2146,13 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   // First of all, before any tab lookup (discarded, loading or missing tabs return early below): the
   // worker's own bound on a leg that never sent. The tab is left to the cleanup policy, and the page
   // never sends after its deadline (PAGE_PRESEND_MS, carried in the run message).
-  const stalled = presendWatchdog(state);
+  let stalled = presendWatchdog(state);
+  // A send the worker never ingested (the tab froze right after the click) must not read as "nothing
+  // was sent": a reachable tab is asked once, read-only, and its progress taken before the leg is ended.
+  if (stalled) {
+    const fresh = await probeStalledLeg(job, provider, state);
+    if (fresh) { ingestPageProgress(state, fresh); stalled = presendWatchdog(state); }
+  }
   if (stalled) {
     state.outcome = failure("presend_stalled", stalled);
     workerStep(job, provider, "presend_watchdog");

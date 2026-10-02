@@ -208,6 +208,19 @@ for(const [name,{ago,sent,frozen=true}] of [['frozen 18 min after dispatch: ende
  });
 }
 
+test('presend watchdog: a send the worker never ingested is found by one read-only probe, and the leg is not ended',async()=>{
+ const at=Date.now()-18*60_000;
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt'],states:{chatgpt:{tabId:10,started:true,runId:'run-A',runDispatchedAt:at,
+  pageEvents:[{source:'page',sequence:1,at:at+2000,stage:'send_waiting'}]}}};
+ const sent=[{source:'page',sequence:1,at:at+2000,stage:'send_waiting'},{source:'page',sequence:2,at:at+14*60_000,stage:'send_attempted'}];
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete',active:false,frozen:false}]]),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>msg.type==='ashlar-harvest'?{ok:false,code:'busy',jobId:'A',provider:'chatgpt',runId:'run-A',progress:{runId:'run-A',events:sent}}:{ok:false,code:'busy'}});
+ await ticks(b,2);
+ assert.equal(b.calls.find(c=>c.action==='failure'&&c.jobId==='A'),undefined);
+});
+
 test('the run message carries the send deadline, 15 min after the first dispatch',async()=>{
  const offers=[offer('A')];const runs=[];
  const api=async(_p,body)=>body?.action==='take'?{ok:true,job:offers.shift()??null}:{ok:true,prompt:'p'};

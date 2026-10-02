@@ -144,7 +144,7 @@ test('grok reasoning controls do not finish a turn before the final answer mount
   const page = await openGrok(t, `<main>
     <div data-testid="user-message" id="response-user-A" role="article">review</div>
     <div id="answer"><div data-testid="assistant-message" id="response-answer-A" role="article">
-      <p>Analyzing the changed files</p><p>Analyzing persisted state</p>
+      <p>Analyzing the changed files</p><p>Analyzing persisted state</p><p>Thought for 4s</p>
     </div><button aria-label="Copy response" style="width:64px;height:32px">copy</button></div>
   </main>${COMPOSER}`);
   const out = await page.evaluate(answer => {

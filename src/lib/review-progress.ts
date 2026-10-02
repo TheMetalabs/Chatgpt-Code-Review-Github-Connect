@@ -10,6 +10,7 @@ export const PROGRESS_LABELS = {
     repair_superseded: "Local repair superseded · no candidate applied",
     repair_interrupted: "Local repair outcome unknown after restart · no automatic replay",
     repair_needs_attention: "Local JSON repair needs attention · inspect original and candidate",
+    repair_source_unavailable: "Local JSON repair could not recover the original response · terminal failure",
     tab_created: "Review tab created",
     run_dispatched: "Page runner acknowledged · submission not yet confirmed",
     run_rebound: "Page lost its binding · re-bound in the dispatched tab to observe (never resent)",

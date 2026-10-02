@@ -503,6 +503,19 @@ test('a salvaged leg a server still sends back for repair ends as a failure, nev
   assert.equal(b.calls.filter((c) => c.action === 'complete').length, 1, 'the envelope is sent once, not in a loop');
 });
 
+test('clearStuckJobs({includeStalled}) settles a terminal repair whose archived source is unavailable', async () => {
+  const job = makeJob('A', { tabId: 10, serverStatus: 'awaiting_chat', lastEventAt: STALE });
+  job.states.chatgpt.sourceCapture = { archiveDurable: true, sourceHash: 'h', responseId: 'r', id: 'cap' };
+  job.states.chatgpt.repairAttempt = { id: 'ra', status: 'needs_attention', sourceHash: 'h', responseId: 'r' };
+  const b = harness([job]);
+  const res = await b.context.clearStuckJobs({ includeStalled: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.cleared, 1, 'an unrecoverable terminal repair is retired after its failure is acknowledged');
+  const failure = b.calls.find((call) => call.action === 'failure');
+  assert.match(failure?.error ?? '', /could not be recovered after repair failed/i);
+  assert.equal(Object.keys(b.local.state.pendingReviewJobs ?? {}).length, 0, 'the job does not loop forever');
+});
+
 test('clearStuckJobs({includeStalled}) leaves a durable-source leg with an ACTIVE repair alone', async () => {
   // While a repair is running/committable the durable leg belongs to the repair pipeline — never salvage
   // or fail it, or a live repair would be cancelled.

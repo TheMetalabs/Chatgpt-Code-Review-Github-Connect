@@ -977,6 +977,10 @@ function failure(code, error) {
   return { ok: false, code, error };
 }
 
+function unrecoverableRepairFailure() {
+  return {...failure("json_invalid", "the review answer could not be recovered after repair failed"), sourceUnavailable: true};
+}
+
 function tabMessage(job, provider, type) {
   const message = {type, jobId: job.jobId, provider, runId: job.states[provider].runId};
   // Only review-loop fix items carry their kind; review messages stay exactly as before.
@@ -2605,7 +2609,7 @@ async function deliverOutcome(job, provider, jobs, signal) {
   }
   // A durable archive normally settles via the repair-commit path, so it is not re-delivered here —
   // EXCEPT a no-repair salvage outcome, whose only delivery path is this complete request.
-  if (!out || state.delivered || (sourceArchiveDurable(state) && !out.salvaged)) return;
+  if (!out || state.delivered || (sourceArchiveDurable(state) && !out.salvaged && !out.sourceUnavailable)) return;
   // A failed outbox write can also leave an outcome in the shared cache. Retry
   // that save before sending it; only the server ACK permits subsequent cleanup.
   workerStep(job, provider, "delivery_pending");
@@ -2886,6 +2890,11 @@ async function repairProvider(job, provider, jobs) {
             delete state.formatError;
             workerStep(job,provider,"salvaged_no_repair");
             await saveJobs(jobs);
+          } else {
+            state.outcome=unrecoverableRepairFailure();
+            delete state.formatError;
+            workerStep(job,provider,"repair_source_unavailable");
+            await saveJobs(jobs);
           }
         }
       }
@@ -3013,6 +3022,7 @@ async function settleStalledJob(job, jobs, signal) {
       // accepted is a resumable SUCCESS (the commit landed; acceptRepairReceipt records the receipt on
       // the next tick even if the worker stopped before it did). Salvaging it would collide with the
       // server's already-stored repaired leg (lease_conflict) and clear the lease. Exempt it too.
+      if (!state.repairAttempt) continue;
       if (["prepared", "running", "ready", "accepted"].includes(state.repairAttempt?.status)) continue;
       if (!state.outcome) {
         const salvage = localArchivedSource(state); // local archived copy — no fetch, no page, no hang
@@ -3022,9 +3032,13 @@ async function settleStalledJob(job, jobs, signal) {
           state.outcome = { ok: true, raw: salvageReviewEnvelope(salvage.text), originalText: salvage.text, salvaged: true };
           delete state.formatError;
           workerStep(job, provider, "salvaged_no_repair");
+        } else {
+          state.outcome = unrecoverableRepairFailure();
+          delete state.formatError;
+          workerStep(job, provider, "repair_source_unavailable");
         }
       }
-      continue; // salvaged (delivered in the post-loop) or nothing local to salvage — never fabricate a failure
+      continue; // salvage or an explicit source-unavailable failure is delivered in the post-loop
     }
     // A leg that never started and never owned a tab is a sibling still WAITING for capacity, not a
     // stalled one — providerTabGone reports it "gone", but touching it would misreport a reviewer that

@@ -2209,12 +2209,23 @@ async function persistedPageResult(job, provider) {
   const key = pageResultKey(job.jobId, provider, state.runId);
   const record = (await chrome.storage.session.get([key]))[key];
   if (!record || record.jobId !== job.jobId || record.provider !== provider || record.runId !== state.runId ||
-      typeof record.raw !== "string" || !record.raw.trim()) return undefined;
+      typeof record.raw !== "string" || !record.raw.trim() || (job.kind === "fix" && record.ownership !== "owned")) return undefined;
   return {ok:true, jobId:job.jobId, provider, runId:state.runId, raw:record.raw,
     responseText:typeof record.responseText === "string" ? record.responseText : "",
     completion:record.completion && typeof record.completion.responseId === "string" && typeof record.completion.context === "string"
       ? {responseId:record.completion.responseId, context:record.completion.context} : undefined,
     persistedKey:key};
+}
+
+async function settleClosedTab(job, provider, jobs) {
+  const key = closedKey(job, provider);
+  if (!(await chrome.storage.session.get([key]))[key]) return false;
+  const state = job.states[provider];
+  if (state.outcome?.code !== "tab_closed") {
+    state.outcome = failure("tab_closed", "review tab was explicitly closed");
+    await saveJobs(jobs);
+  }
+  return true;
 }
 
 async function ingestPersistedPageResult(job, provider, jobs, persisted) {
@@ -2241,6 +2252,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (jobs[job.jobId] !== job) return;
   const state = job.states[provider];
   if (state.delivered || sourceArchiveDurable(state)) return;
+  if (await settleClosedTab(job, provider, jobs)) return;
   // A timeout can be saved in the same tick that the page finishes its storage receipt. Read the
   // identity-bound receipt before honoring any prior non-success outcome, then keep the receipt as
   // the single source of truth for this run.
@@ -2271,6 +2283,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     else stalled = presendWatchdog(state, Date.now(), probe.unreachable);
   }
   if (stalled) {
+    if (await settleClosedTab(job, provider, jobs)) return;
     const lateReceipt = await persistedPageResult(job, provider);
     if (lateReceipt) { await ingestPersistedPageResult(job, provider, jobs, lateReceipt); return; }
     state.outcome = failure("presend_stalled", stalled);
@@ -2291,6 +2304,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     }
   }
   if (late) {
+    if (await settleClosedTab(job, provider, jobs)) return;
     const lateReceipt = await persistedPageResult(job, provider);
     if (lateReceipt) { await ingestPersistedPageResult(job, provider, jobs, lateReceipt); return; }
     state.outcome = failure("response_timeout", late);

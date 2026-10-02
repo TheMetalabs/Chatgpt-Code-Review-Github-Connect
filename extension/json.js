@@ -368,16 +368,13 @@ function boundReviewResponse(submission) {
   if (submission.messageId) {
     const matches = users.filter(node => turnMessageId(node) === submission.messageId);
     if (matches.length === 1) { user = matches[0]; identityMatched = true; }
-    // Grok can re-key a user bubble while preserving transcript order. Position fallback is safe
-    // only when this live page previously confirmed that exact node; a removed turn and a later
-    // user prompt at the same position must remain unbound.
-    else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
-      const candidate = users[submission.submittedUsers - 1];
-      if (runnerState?.confirmedSubmission?.record === submission && runnerState.boundUserNode === candidate &&
-          (!submission.conversation || fixConversationHolds(submission))) user = candidate;
-    }
+    // Grok can re-key or replace a user bubble while preserving transcript order. Position fallback
+    // is safe only on the recorded conversation; the prompt check below and later-user fence keep a
+    // removed turn or a later user prompt from inheriting this run.
+    else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline &&
+        (!submission.conversation || fixConversationHolds(submission))) user = users[submission.submittedUsers - 1];
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
-    user = users[submission.submittedUsers - 1];
+    if (!submission.conversation || fixConversationHolds(submission)) user = users[submission.submittedUsers - 1];
   }
   // The containment rule the send was confirmed by (composer.js reviewTurnHolds): a rendered turn
   // restyles Markdown in the prompt (`code` spans shown as <code>), and a stricter rule here left a
@@ -692,7 +689,7 @@ function saveResponseWaitHtml(bound) {
 
 /** Collection needs two identical stable observations (`key`). On the second one the runner
  * records the answer and, for an identified response, its native completion proof. */
-async function persistCollectedResult(runner, raw, text) {
+async function persistCollectedResult(runner, raw, text, ownership) {
   // A frozen page may finish its collector while the worker cannot receive the reply. Keep the
   // exact bound result in the extension session store so the worker can ingest it on its next poke.
   // The worker validates every identity field before accepting this receipt and removes it only
@@ -705,13 +702,14 @@ async function persistCollectedResult(runner, raw, text) {
   try {
     const record = {jobId: runner.jobId, provider: runner.provider, runId: runner.runId,
       raw, responseText: typeof text === "string" ? text : "", at: Date.now()};
+    if (runner.kind === "fix") record.ownership = ownership;
     if (completion && typeof completion.responseId === "string" && typeof completion.context === "string")
       record.completion = {responseId: completion.responseId, context: completion.context};
     await storage.set({[key]: record});
   } catch { /* session storage is a recovery hint; the live reply remains authoritative */ }
 }
 
-function settleStableAnswer(stability, key, poll, {text, raw}) {
+function settleStableAnswer(stability, key, poll, {text, raw, ownership}) {
   stability.hits = stability.stable === key ? stability.hits + 1 : 1;
   stability.stable = key;
   if (stability.hits < 2) return false;
@@ -724,7 +722,7 @@ function settleStableAnswer(stability, key, poll, {text, raw}) {
       jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
       responseId:bound.responseId,context:reviewPageContext(),text,raw,
     });
-    runner.persistedResult = persistCollectedResult(runner, raw, text);
+    runner.persistedResult = persistCollectedResult(runner, raw, text, ownership);
   }
   recordReviewStep("response_collected");
   return true;
@@ -1269,7 +1267,8 @@ async function waitUntilFixOrQuota(name) {
     if (answered) {
       // Its ID (its message node when it has none): the only response a later poll may collect.
       stability.pinned ||= {responseId: bound.responseId || "", message: bound.message};
-      if (settleStableAnswer(stability, text, poll, {text, raw: text})) {
+      if (settleStableAnswer(stability, text, poll, {text, raw: text, ownership: proof.ownership})) {
+        if (runner?.persistedResult) await runner.persistedResult;
         saveFixHarvestProbe({at: Date.now(), jobId: runner?.jobId, runId: runner?.runId, blocks: harvest.blocks || 0,
           totalChars: harvest.totalChars || 0, answerChars: text.length, collapsed: Boolean(harvest.collapsed), expanded: stability.expanded,
           unfenced: Boolean(harvest.unfenced), fileLinks: harvest.fileLinks || 0, canvas: Boolean(harvest.canvas), textChars: harvest.textChars || 0});

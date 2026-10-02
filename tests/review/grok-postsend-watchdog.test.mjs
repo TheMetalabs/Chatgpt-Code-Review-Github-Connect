@@ -107,6 +107,38 @@ test('a frozen Grok page result persisted after response_collected is ingested w
  assert.equal(b.calls.some(call => call.action === 'complete' && call.results?.some(result => result.provider === 'grok')), true);
 });
 
+test('a closed tab wins over a persisted receipt', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['closed']});
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:grokLeg(10)}}),
+  session: storage({[`ashlar:closed:A:grok:run-A`]: true, [key]: {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'closed'}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('closed page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const failure = b.calls.find(call => call.action === 'failure');
+ assert.match(failure?.error || '', /^tab_closed:/);
+ assert.equal(b.calls.some(call => call.action === 'complete'), false);
+});
+
+test('a fix receipt without owned proof is ignored', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['fix']});
+ const key = 'ashlar:result:A:grok:run-A';
+ const job = grokLeg(31); job.kind = 'fix';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw,responseText:'fix',ownership:'takenOver'}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ assert.equal((await b.session.get([key]))[key].ownership, 'takenOver');
+ assert.equal(b.calls.some(call => call.action === 'complete'), false);
+});
+
 test('a receipt written after the timeout save replaces that timeout on the next tick', async () => {
  const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['late receipt']});
  const b = rig(grokLeg(31), {frozen:true, handler:()=>{throw new Error('frozen page cannot answer');}});

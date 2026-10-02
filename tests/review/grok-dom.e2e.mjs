@@ -739,6 +739,43 @@ test('Grok binds the sent turn by position when its DOM user id is re-keyed', as
   assert.deepEqual(out, {identified:true, followup:false, responseId:'answer-A', userId:'answer-A', guardedFollowup:true, guardedResponseId:'answer-A'});
 });
 
+test('Grok binds a replaced user node when the pinned conversation and prompt still hold', async t => {
+ const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A" role="article">review</div><div data-testid="assistant-message" id="response-answer-A" role="article"><p>answer</p></div><button aria-label="Copy response">copy</button></main>${COMPOSER}`, 'https://grok.com/c/pinned');
+ const out = await page.evaluate(() => {
+   const submission = {phase:'sent', expected:'review', baseline:0, submittedUsers:1, messageId:'user-A', conversation:location.href};
+   globalThis.__ashlarRunnerState = {confirmedSubmission:{record:submission}};
+   boundReviewResponse(submission);
+   const old = document.querySelector('[data-testid="user-message"]');
+   const replacement = document.createElement('div');
+   replacement.dataset.testid = 'user-message'; replacement.setAttribute('role', 'article'); replacement.textContent = 'review';
+   old.replaceWith(replacement);
+   const bound = boundReviewResponse(submission);
+   return {identified:bound.identified, responseId:bound.responseId || '', followup:bound.followup};
+ });
+ assert.deepEqual(out, {identified:true, responseId:'answer-A', followup:false});
+});
+
+test('Grok rejects positional fallback after a pinned conversation changes', async t => {
+ const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-B" role="article">review</div><div data-testid="assistant-message" id="response-answer-B" role="article"><p>answer</p></div><button aria-label="Copy response">copy</button></main>${COMPOSER}`, 'https://grok.com/c/other');
+ const out = await page.evaluate(() => {
+   const submission = {phase:'sent', expected:'review', baseline:0, submittedUsers:1, messageId:'user-A', conversation:'https://grok.com/c/pinned'};
+   globalThis.__ashlarRunnerState = {confirmedSubmission:{record:submission}};
+   return boundReviewResponse(submission);
+ });
+ assert.deepEqual({identified:out.identified, responseId:out.responseId || ''}, {identified:false, responseId:''});
+});
+
+test('a fix receipt records the positive ownership proof', async t => {
+ const page = await openGrok(t, `<main></main>${COMPOSER}`);
+ const receipt = await page.evaluate(async () => {
+   const stored = {};
+   chrome.storage = {session: {set: async value => Object.assign(stored, value)}};
+   await persistCollectedResult({jobId:'fix-A', runId:'run-A', provider:'grok', kind:'fix'}, 'answer', 'answer', 'owned');
+   return stored['ashlar:result:fix-A:grok:run-A'];
+ });
+ assert.equal(receipt.ownership, 'owned');
+});
+
 test('Grok idle completion uses the polled submission, not stale persisted stream evidence', async t => {
   const page = await openGrok(t, `<main><div data-testid="user-message" id="response-user-A">review</div><div data-testid="assistant-message" id="response-answer-A">answer text</div></main>${COMPOSER}`);
   const out = await page.evaluate(async () => {

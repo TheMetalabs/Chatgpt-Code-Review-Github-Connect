@@ -823,3 +823,19 @@ test('grok age verification after Send ends the run at once with what to do, and
   assert.ok(out.ms < 5000, `at once, not after 60 s: ${out.ms} ms`);
   assert.equal(out.year, '', 'the birth year is the account owner\'s to give');
 });
+
+// Grok 2026-10-02: the live page is read step by step (as ChatGPT's was). Each stage of a Grok run keeps
+// one snapshot of <main> plus its open layers in chrome.storage.local "stageHtml" (bounded).
+test('each stage of a Grok run keeps one HTML snapshot with its open layers', async t => {
+  const page = await radixPage(t);
+  const out = await page.evaluate(async () => {
+    const local = new Map(); window.chrome.storage = {local: {get: async keys => Object.fromEntries([].concat(keys).filter(k => local.has(k)).map(k => [k, local.get(k)])), set: async o => { for (const [k, v] of Object.entries(o)) local.set(k, v); }}};
+    globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok'};
+    document.body.insertAdjacentHTML('beforeend', '<div role="dialog" data-state="open" style="width:100px;height:50px">age</div>');
+    step('prompt_prepared'); step('prompt_prepared'); step('send_waiting');
+    await globalThis.__ashlarStageHtmlWrites;
+    const list = local.get('stageHtml') || [];
+    return {stages: list.map(e => e.stage), layer: list[0]?.html.includes('role="dialog"')};
+  });
+  assert.deepEqual(out, {stages: ['prompt_prepared', 'send_waiting'], layer: true});
+});

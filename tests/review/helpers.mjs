@@ -54,6 +54,8 @@ export function background({ local = storage({ origin: 'http://bridge', token: '
   // ChatGPT pacing (background.js chatgptPace) is off unless a test sets it: most tests admit several
   // jobs within milliseconds to exercise parallelism, capacity and recovery.
   if (local.state && local.state.chatgptPacing === undefined) local.state.chatgptPacing = { maxInFlight: 99, gapMs: 0 };
+  if (local.state && local.state.grokPacing === undefined) local.state.grokPacing = { gapMs: 0 };
+  if (local.state && local.state.serialSends === undefined) local.state.serialSends = false;
   const messages = [], calls = [], closedTabs = []; const removed = [], replaced = [];
   let nextTab = Math.max(100, ...tabs.keys());
   const chrome = {

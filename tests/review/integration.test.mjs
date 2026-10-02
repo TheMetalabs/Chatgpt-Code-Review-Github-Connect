@@ -244,3 +244,32 @@ test('a Grok age-verification failure pauses grok legs like a logout, with a mes
  const fb=b.calls.find(c=>c.action==='failure'&&c.jobId==='B');
  if(fb)assert.match(fb.error,/^logged_out: grok is paused: it reported logged out or asked to verify the account's age/);
 });
+
+// User decision 2026-10-02: ChatGPT and Grok must not open, compose and send in tabs at the same time.
+// A leg is dispatched only while no other leg sits between its dispatch and its send; Grok keeps a gap.
+test('sends go one at a time across providers: the Grok leg waits until the ChatGPT leg has sent', async()=>{
+ const runs=[];let chatgptDone=false;
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['chatgpt','grok'],states:{chatgpt:{},grok:{}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job},serialSends:true,grokPacing:{gapMs:0},chatgptPacing:{maxInFlight:9,gapMs:0}}),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);
+   return chatgptDone&&msg.provider==='chatgpt'&&msg.type!=='ashlar-run'?{ok:false,code:'error',error:'ended'}:{ok:false,code:'busy'};}});
+ await ticks(b,4);
+ assert.deepEqual([...new Set(runs)],['chatgpt'],'only one leg dispatched while the other has not sent');
+ chatgptDone=true; // the ChatGPT leg ends (or sends): the slot is free
+ await ticks(b,4);
+ assert.ok(runs.includes('grok'),`grok dispatched once chatgpt sent: ${runs}`);
+});
+
+test('Grok keeps a gap between its own dispatches', async()=>{
+ const runs=[];
+ const job={jobId:'A',origin:'http://bridge',leaseId:'l',providers:['grok'],states:{grok:{}}};
+ const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job},serialSends:false,grokPacing:{gapMs:75_000},grokDispatchedAt:Date.now()-10_000}),
+  api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+  handler:(_id,msg)=>{if(msg.type==='ashlar-run')runs.push(msg.provider);return {ok:false,code:'busy'};}});
+ await ticks(b,3);
+ assert.deepEqual(runs,[],'within 75 s of the last Grok dispatch');
+ await b.local.set({grokDispatchedAt:Date.now()-80_000});
+ await ticks(b,3);
+ assert.ok(runs.includes('grok'));
+});

@@ -693,25 +693,29 @@ async function dispatchBlocked(job, provider, jobs) {
  * holding a ChatGPT slot; Chrome had frozen their background tabs, so no page timer ran and the poll
  * skipped them as frozen). The run message carries a deadline for its send, PAGE_PRESEND_MS after
  * dispatch: past it the page never clicks Send (composer.js presendDeadlinePassed), whatever stage it
- * slept in. The worker ends a leg whose tab Chrome still reports frozen PRESEND_WATCHDOG_MS after
- * dispatch with no send seen: strictly after that deadline, so a page that wakes later cannot send. */
+ * slept in. The worker ends a leg with no send seen PRESEND_WATCHDOG_MS after
+ * dispatch: strictly after that deadline, so a page that wakes later cannot send. */
 // Above the sum of the page's own pre-send bounds (overlays 1 + composer 3 + reasoning 1 + upload 3 +
 // send 3 = 11 min), so a slow but healthy run is never fenced at its click.
 const PAGE_PRESEND_MS = 15 * 60_000;
 const PRESEND_WATCHDOG_MS = 17 * 60_000;
 
-/** Why the worker ends a leg whose frozen tab never sent ("" while it may wait). */
-function presendWatchdog(state, tab, now = Date.now()) {
+/** Why the worker ends a leg that never sent ("" while it may wait): PRESEND_WATCHDOG_MS after its
+ * dispatch no send event is seen. Not conditioned on the tab's frozen flag (live 2026-10-02, 1.1.62:
+ * two ChatGPT legs sat in send_waiting 80+ min with their tab not reported frozen; Chrome also
+ * discards, throttles or detaches tabs without that flag). Past the page's own deadline
+ * (PAGE_PRESEND_MS) a page can no longer send, so ending the leg cannot race a send. */
+function presendWatchdog(state, now = Date.now()) {
   // A leg dispatched by an older worker has no runDispatchedAt: its recorded run_dispatched step dates
   // it (live 2026-10-02: two such legs, frozen for 3-7 h, held both ChatGPT slots when 1.1.61 arrived).
   const dispatchedAt = Number.isFinite(state.runDispatchedAt) ? state.runDispatchedAt
     : (state.workerEvents || []).find(e => e?.stage === "run_dispatched")?.at;
-  if (tab?.frozen !== true || !Number.isFinite(dispatchedAt)) return "";
+  if (!state.started || state.outcome || state.delivered || !Number.isFinite(dispatchedAt)) return "";
   const events = Array.isArray(state.pageEvents) ? state.pageEvents : [];
-  if (events.some(e => ["send_attempted", "prompt_submitted", "send_unconfirmed", "submission_persisted"].includes(e.stage))) return "";
+  if (events.some(e => SENT_STAGES.includes(e.stage))) return "";
   if (now - dispatchedAt < PRESEND_WATCHDOG_MS) return "";
   const last = events.at(-1)?.stage || "no page step";
-  return `the tab was frozen in "${last}" for ${Math.round((now - dispatchedAt) / 60_000)} min after dispatch, before its send; nothing was sent`;
+  return `no send was seen in ${Math.round((now - dispatchedAt) / 60_000)} min after dispatch (last page step "${last}"); nothing was sent`;
 }
 
 /** A provider answered a job admitted after its logout: the login is back, and admission leaves
@@ -2129,6 +2133,16 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   if (jobs[job.jobId] !== job) return;
   const state = job.states[provider];
   if (state.outcome || state.delivered || sourceArchiveDurable(state)) return;
+  // First of all, before any tab lookup (discarded, loading or missing tabs return early below): the
+  // worker's own bound on a leg that never sent. The tab is left to the cleanup policy, and the page
+  // never sends after its deadline (PAGE_PRESEND_MS, carried in the run message).
+  const stalled = presendWatchdog(state);
+  if (stalled) {
+    state.outcome = failure("presend_stalled", stalled);
+    workerStep(job, provider, "presend_watchdog");
+    await saveJobs(jobs);
+    return;
+  }
   await applyPendingReplace(state);
   if (!state.runId) state.runId = crypto.randomUUID();
   // Memory is not a receipt: a previous write may have failed while leaving the
@@ -2245,16 +2259,6 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     return wakeOrFailDiscardedTab(job, provider, jobs, tab);
   }
   if (tab.status && tab.status !== "complete") return;
-  const stalled = presendWatchdog(state, tab);
-  if (stalled) {
-    // The worker's own bound on a frozen page that never sent: the leg ends and its slot is free;
-    // the tab is left to the cleanup policy, and the page never sends after its deadline
-    // (PAGE_PRESEND_MS, carried in the run message).
-    state.outcome = failure("presend_stalled", stalled);
-    workerStep(job, provider, "presend_watchdog");
-    await saveJobs(jobs);
-    return;
-  }
   // A page loaded again after a discard is not yet proof that the run goes on: the time limit holds
   // until a reply proves it (discardedRunProven, below).
   if (!allowedTab(tab, provider)) {

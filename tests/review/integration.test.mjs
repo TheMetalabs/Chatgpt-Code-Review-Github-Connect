@@ -189,10 +189,10 @@ test('the ChatGPT submission log records each admission (kind, temporary chat) a
 });
 
 // Live aicc #539/#602 (2026-10-01/02): legs sat in send_waiting 57-70+ min holding a ChatGPT slot; Chrome
-// had frozen their background tabs and the poll skipped them as frozen. The worker ends a leg whose tab is
-// still frozen 17 min after dispatch with no send seen (the page's own send deadline is 15 min).
+// had frozen their background tabs and the poll skipped them as frozen. The worker ends a leg with no send
+// seen 17 min after dispatch whatever the tab's frozen flag says (live 1.1.62: 80+ min, not flagged frozen; the page's own send deadline is 15 min).
 for(const [name,{ago,sent,frozen=true}] of [['frozen 18 min after dispatch: ended',{ago:18}],['frozen 12 min after dispatch: still waits',{ago:12}],
- ['not frozen 18 min after dispatch: the page answers for itself',{ago:18,frozen:false}],['frozen 18 min, but it sent: not a pre-send stall',{ago:18,sent:true}]]){
+ ['not flagged frozen, 18 min after dispatch: ended too',{ago:18,frozen:false}],['frozen 18 min, but it sent: not a pre-send stall',{ago:18,sent:true}]]){
  test(`presend watchdog: ${name}`,async()=>{
   const at=Date.now()-ago*60_000;
   const pageEvents=[{source:'page',sequence:1,at:at+1000,stage:'prompt_prepared'},{source:'page',sequence:2,at:at+2000,stage:'send_waiting'},
@@ -203,7 +203,7 @@ for(const [name,{ago,sent,frozen=true}] of [['frozen 18 min after dispatch: ende
    api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'busy'})});
   await ticks(b,2);
   const failed=b.calls.find(c=>c.action==='failure'&&c.jobId==='A');
-  if(ago>=17&&!sent&&frozen)assert.match(failed?.error||'',/^presend_stalled: the tab was frozen in "send_waiting" for 18 min after dispatch, before its send; nothing was sent/);
+  if(ago>=17&&!sent)assert.match(failed?.error||'',/^presend_stalled: no send was seen in 18 min after dispatch \(last page step "send_waiting"\); nothing was sent/);
   else assert.equal(failed,undefined,JSON.stringify(failed));
  });
 }
@@ -229,7 +229,7 @@ test('presend watchdog: a leg an older worker dispatched (no runDispatchedAt) is
   tabs:new Map([[10,{id:10,url:'https://chatgpt.com/?temporary-chat=true',status:'complete',active:false,frozen:true}]]),
   api:async()=>({ok:true,active:true,accepted:true,status:'awaiting_chat'}),handler:()=>({ok:false,code:'busy'})});
  await ticks(b,2);
- assert.match(b.calls.find(c=>c.action==='failure'&&c.jobId==='A')?.error||'',/^presend_stalled: the tab was frozen in "send_waiting" for 180 min after dispatch/);
+ assert.match(b.calls.find(c=>c.action==='failure'&&c.jobId==='A')?.error||'',/^presend_stalled: no send was seen in 180 min after dispatch/);
 });
 
 test('a Grok age-verification failure pauses grok legs like a logout, with a message saying what to finish', async()=>{

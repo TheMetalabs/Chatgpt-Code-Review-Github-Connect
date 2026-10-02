@@ -710,6 +710,24 @@ async function dispatchBlocked(job, provider, jobs, allocating = false) {
 const PAGE_PRESEND_MS = 15 * 60_000;
 const PRESEND_WATCHDOG_MS = 17 * 60_000;
 const PRESEND_UNREACHABLE_GRACE_MS = 10 * 60_000;
+/** Post-send bounds. A sent leg had none in the worker: the page's own timers (json.js expireResponseWait,
+ * 35 min) cannot run in a tab Chrome froze, the poll skipped frozen tabs, and the page credits poll gaps
+ * back to its wait, so a hidden Grok tab that froze after its send sat in waiting_for_response for 40-73
+ * min (aicc jobs 629, 648, 649, 657, 662, 663, 1.1.62). POSTSEND_CAP_MS ends a leg with no collected
+ * answer that long after its send, per provider (ChatGPT keeps the page's bound: a long Pro answer is
+ * legitimate there); FROZEN_POKE_MS lets one read-only poll through a frozen sent tab, which thaws it. */
+const POSTSEND_CAP_MS = {grok: 30 * 60_000};
+const FROZEN_POKE_MS = 3 * 60_000;
+function sentAt(state) {
+  const times = (Array.isArray(state.pageEvents) ? state.pageEvents : []).filter(e => SENT_STAGES.includes(e.stage)).map(e => e.at);
+  return times.length ? Math.min(...times) : undefined;
+}
+/** Why the worker ends a sent leg that has no answer ("" while it may wait). */
+function postsendWatchdog(state, provider, now = Date.now()) {
+  const cap = POSTSEND_CAP_MS[provider], at = sentAt(state);
+  if (cap === undefined || at === undefined || !state.started || state.outcome || state.delivered || now - at < cap) return "";
+  return `no answer was collected ${Math.round((now - at) / 60_000)} min after the prompt was sent (${provider} cap ${Math.round(cap / 60_000)} min)`;
+}
 
 /** Why the worker ends a leg that never sent ("" while it may wait): PRESEND_WATCHDOG_MS after its
  * dispatch no send event is seen. Not conditioned on the tab's frozen flag (live 2026-10-02, 1.1.62:
@@ -880,7 +898,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.66";
+const WORKER_BUILD = "1.1.67";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2196,6 +2214,13 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     await saveJobs(jobs);
     return;
   }
+  const late = postsendWatchdog(state, provider);
+  if (late) {
+    state.outcome = failure("response_timeout", late);
+    workerStep(job, provider, "postsend_watchdog");
+    await saveJobs(jobs);
+    return;
+  }
   await applyPendingReplace(state);
   if (!state.runId) state.runId = crypto.randomUUID();
   // Memory is not a receipt: a previous write may have failed while leaving the
@@ -2321,7 +2346,11 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   }
   // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws: a message
   // would only wait out askPage. Polled again next tick.
-  if (tab.frozen === true) return;
+  if (tab.frozen === true) {
+    if (sentAt(state) === undefined || Date.now() - (state.frozenPokeAt || 0) < FROZEN_POKE_MS) return;
+    state.frozenPokeAt = Date.now();
+    await saveJobs(jobs);
+  }
   // A new ChatGPT prompt goes only into the new chat its tab was opened on (X2, #85): the tab is
   // active, so the user may have opened one of their own conversations in it before this dispatch.
   // Nothing is sent there (the page checks again: json.js freshPageLeft). Unless its page is already

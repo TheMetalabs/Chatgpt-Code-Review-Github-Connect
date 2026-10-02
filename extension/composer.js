@@ -909,10 +909,12 @@ function step(stage) {
 /** Diagnostic: the real page at each stage of a run, in chrome.storage.local "stageHtml" (last
  * STAGE_HTML_MAX), so a provider's live DOM can be read step by step the way ChatGPT's was (Grok
  * 2026-10-02: every leg failed after Send and only a 5 s / 60 s snapshot existed). Once per stage per
- * run; after Send, also at 1, 3, 5, 15, 30 and 60 s. "stageHtmlProbe": "grok" (default), "all" or
+ * run; after Send, also at 1, 3, 5, 15, 30 and 60 s and at 3, 10 and 25 min (the stalled Grok legs sat
+ * in waiting_for_response for 40-73 min with no page evidence at all); every record carries the tab's
+ * visibility and its freeze/resume history. "stageHtmlProbe": "grok" (default), "all" or
  * "off". Never affects the run. */
 function saveStageHtml(stage) {
-  const STAGE_HTML_MAX = 24; // a function-local constant: content scripts are re-injected
+  const STAGE_HTML_MAX = 30; // a function-local constant: content scripts are re-injected
   try {
     const local = globalThis.chrome?.storage?.local;
     const state = globalThis.__ashlarRunnerState;
@@ -924,6 +926,7 @@ function saveStageHtml(stage) {
     const grok = /(^|\.)grok\.com$/.test(globalThis.location?.hostname || "");
     const save = label => {
       const record = {job: state.jobId, run: state.runId, provider: state.provider, stage: label, at: Date.now(),
+        visibility: String(globalThis.document?.visibilityState || ""), lifecycle: [...(state.pageLifecycle || [])],
         url: String(globalThis.location?.href || "").split(/[?#]/)[0], html: snapshotHtml(60_000)};
       globalThis.__ashlarStageHtmlWrites = (globalThis.__ashlarStageHtmlWrites || Promise.resolve()).then(async () => {
         const got = await local.get(["stageHtmlProbe", "stageHtml"]);
@@ -933,9 +936,16 @@ function saveStageHtml(stage) {
         await local.set({stageHtml: [...list, record].slice(-STAGE_HTML_MAX)});
       }).catch(() => {});
     };
+    if (!state.pageLifecycle) {
+      state.pageLifecycle = [];
+      for (const event of ["freeze", "resume"]) globalThis.document?.addEventListener?.(event, () => {
+        state.pageLifecycle.push({event, at: Date.now()});
+        state.pageLifecycle.splice(0, Math.max(0, state.pageLifecycle.length - 20));
+      });
+    }
     save(stage);
     if (stage === "send_attempted") {
-      for (const s of [1, 3, 5, 15, 30, 60]) setTimeout(() => save(`after_send_${s}s`), s * 1000);
+      for (const s of [1, 3, 5, 15, 30, 60, 180, 600, 1500]) setTimeout(() => save(`after_send_${s}s`), s * 1000);
     }
   } catch { /* diagnostics never affect the run */ }
 }

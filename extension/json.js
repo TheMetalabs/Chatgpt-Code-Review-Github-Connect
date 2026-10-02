@@ -364,17 +364,22 @@ function boundReviewResponse(submission) {
   const messages = conversationTurnEls();
   const users = messages.filter(node => turnRole(node) === "user");
   const runnerState = globalThis.__ashlarRunnerState;
+  const pinnedPage = typeof submission.conversation === "string" && /^https?:\/\//i.test(submission.conversation);
   let user, identityMatched = false;
   if (submission.messageId) {
     const matches = users.filter(node => turnMessageId(node) === submission.messageId);
     if (matches.length === 1) { user = matches[0]; identityMatched = true; }
-    // Grok can re-key or replace a user bubble while preserving transcript order. Position fallback
-    // is safe only on the recorded conversation; the prompt check below and later-user fence keep a
-    // removed turn or a later user prompt from inheriting this run.
-    else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline &&
-        (!submission.conversation || fixConversationHolds(submission))) user = users[submission.submittedUsers - 1];
+    // Grok can re-key or replace a user bubble while preserving transcript order. An unpinned review
+    // still needs the exact node confirmed by this page; a pinned review can use its position after a
+    // DOM replacement while the page identity and prompt still hold. The later-user fence below keeps
+    // a shifted follow-up from inheriting the run.
+    else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
+      const candidate = users[submission.submittedUsers - 1];
+      const confirmed = runnerState?.confirmedSubmission?.record === submission;
+      if (confirmed && (runnerState.boundUserNode === candidate || (pinnedPage && fixConversationHolds(submission)))) user = candidate;
+    }
   } else if (Number.isSafeInteger(submission.submittedUsers) && submission.submittedUsers > submission.baseline) {
-    if (!submission.conversation || fixConversationHolds(submission)) user = users[submission.submittedUsers - 1];
+    if (!pinnedPage || fixConversationHolds(submission)) user = users[submission.submittedUsers - 1];
   }
   // The containment rule the send was confirmed by (composer.js reviewTurnHolds): a rendered turn
   // restyles Markdown in the prompt (`code` spans shown as <code>), and a stricter rule here left a

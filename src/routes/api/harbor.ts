@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { getBridgePublic, bridgeTokenOk } from "@/lib/bridge.server";
+import { getBridgePublic, bridgeTokenOk, setBridgeDrain, MAX_DRAIN_MINUTES } from "@/lib/bridge.server";
 import { buildChatPrompt } from "@/lib/chat-prompt";
 import {
   cancelHarborJob,
@@ -103,6 +103,17 @@ export const Route = createFileRoute("/api/harbor")({
             }
           }
           return Response.json({ ok: true, settings: publicSettings(getHarbor().settings), github: githubStatus(), bridge: getBridgePublic() });
+        }
+        if (body.action === "bridge-drain") {
+          if (!sameOrigin(request)) {
+            return Response.json({ ok: false, error: "bad origin" }, { status: 401 });
+          }
+          const minutes = (body as { minutes?: unknown }).minutes;
+          if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes < 0 || minutes > MAX_DRAIN_MINUTES) {
+            return Response.json({ ok: false, error: `minutes must be 0..${MAX_DRAIN_MINUTES}` }, { status: 400 });
+          }
+          setBridgeDrain(minutes);
+          return Response.json({ ok: true, bridge: getBridgePublic() });
         }
         if (body.action === "github" || body.action === "github-clear") {
           if (!sameOrigin(request)) {

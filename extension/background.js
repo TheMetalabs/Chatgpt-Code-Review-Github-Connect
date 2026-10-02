@@ -2221,10 +2221,11 @@ async function settleClosedTab(job, provider, jobs) {
   const key = closedKey(job, provider);
   if (!(await chrome.storage.session.get([key]))[key]) return false;
   const state = job.states[provider];
-  if (state.outcome?.code !== "tab_closed") {
+  if (!state.outcome) {
     state.outcome = failure("tab_closed", "review tab was explicitly closed");
-    await saveJobs(jobs);
   }
+  await saveJobs(jobs);
+  await chrome.storage.session.remove([pageResultKey(job.jobId, provider, state.runId)]);
   return true;
 }
 

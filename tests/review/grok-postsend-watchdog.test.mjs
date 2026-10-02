@@ -121,6 +121,44 @@ test('a closed tab wins over a persisted receipt', async () => {
  const failure = b.calls.find(call => call.action === 'failure');
  assert.match(failure?.error || '', /^tab_closed:/);
  assert.equal(b.calls.some(call => call.action === 'complete'), false);
+ assert.equal((await b.session.get([key]))[key], undefined);
+});
+
+test('a late close marker preserves a durably harvested success', async () => {
+ const raw = JSON.stringify({findings:[],merge_recommendation:'COMMENT',investigated_safe:['harvested']});
+ const job = grokLeg(10);
+ job.states.grok.outcome = {ok:true,raw,responseText:'harvested'};
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({
+   'ashlar:closed:A:grok:run-A': true,
+   'ashlar:result:A:grok:run-A': {jobId:'A',provider:'grok',runId:'run-A',raw:'late',responseText:'late'},
+  }),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('closed page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const complete = b.calls.find(call => call.action === 'complete');
+ assert.equal(complete?.raw, raw);
+ assert.equal(b.calls.some(call => call.action === 'failure'), false);
+ assert.equal(complete?.results?.some(result => result.provider === 'grok'), true);
+ assert.equal((await b.session.get(['ashlar:result:A:grok:run-A']))['ashlar:result:A:grok:run-A'], undefined);
+});
+
+test('a closed receipt is retained until its terminal outcome is persisted', async () => {
+ const key = 'ashlar:result:A:grok:run-A';
+ const job = grokLeg(10), jobs = {A:job};
+ const b = background({session:storage({'ashlar:closed:A:grok:run-A':true,
+  [key]:{jobId:'A',provider:'grok',runId:'run-A',raw:'receipt'}})});
+ const set = b.local.set;
+ b.local.set = async values => {if (values.pendingReviewJobs) throw new Error('storage unavailable');return set(values);};
+ await assert.rejects(b.context.settleClosedTab(job,'grok',jobs), /storage unavailable/);
+ assert.equal((await b.session.get([key]))[key].raw,'receipt');
+ b.local.set = set;
+ await b.context.settleClosedTab(job,'grok',jobs);
+ assert.equal(b.local.state.pendingReviewJobs.A.states.grok.outcome?.code,'tab_closed');
+ assert.equal((await b.session.get([key]))[key],undefined);
 });
 
 test('a fix receipt without owned proof is ignored', async () => {

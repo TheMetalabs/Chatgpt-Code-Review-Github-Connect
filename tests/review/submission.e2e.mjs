@@ -97,6 +97,7 @@ test('submission: actionable Send records the other click gates when the draft d
  assert.equal(latest.draftLength,'different draft'.length);
  assert.equal(typeof latest.draftHead,'string');
  assert.equal(JSON.stringify(latest).includes('different draft'),false);
+ assert.equal((await page.evaluate(()=>result)).error,'the composer draft changed before Send; nothing was sent');
  assert.equal(await page.evaluate(()=>clicks),0);
 });
 

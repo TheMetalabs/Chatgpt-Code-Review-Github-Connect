@@ -1301,6 +1301,7 @@ async function clickSend(findSend, findComposer, expectedText) {
       // lossless form to check it against) is never sent.
       if (fix && drafted && !composerHoldsFix(editor, record.exact)) throw fixPromptAltered();
       if (!uploadBusy) saveSendWaitProbe(form, record, {editor, button, otherTurn, draftedMatches: drafted, stopVisible});
+      if (!uploadBusy && !otherTurn && actionableSend(button) && !drafted) throw draftChangedBeforeSend();
       if (!uploadBusy && !otherTurn && drafted && actionableSend(button) &&
           !stopVisible) {
         // Past the worker's deadline for this send the worker may have ended the leg (a tab frozen
@@ -1394,6 +1395,13 @@ function presendStalled(stage) {
   e.code = "presend_stalled";
   e.stage = stage;
   return e;
+}
+
+function draftChangedBeforeSend() {
+  const error = new Error("the composer draft changed before Send; nothing was sent");
+  error.code = "taken_over";
+  error.takeoverCause = "draft";
+  return error;
 }
 
 /** `work(deadline)` bounded by `ms`: past it the run fails as presend_stalled(stage), or, with

@@ -809,7 +809,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.62";
+const WORKER_BUILD = "1.1.63";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -2153,7 +2153,8 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     }
     // Paused after a page reported this provider logged out: fail the leg at once, no tab.
     if (!providerOpen(await loginPauseMap(), provider)) {
-      state.outcome = failure("logged_out", provider === "chatgpt" ? LOGGED_OUT_ERROR : `${provider} is logged out in this Chrome profile; log in and retry`);
+      state.outcome = failure("logged_out", provider === "chatgpt" ? LOGGED_OUT_ERROR :
+        `${provider} is paused: it reported logged out or asked to verify the account's age; finish that in the ${provider} tab and retry`);
       await saveJobs(jobs);
       return;
     }
@@ -2333,7 +2334,9 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   }
   await saveJobs(jobs);
   if (state.outcome.code === "quota") await markQuota(provider);
-  if (state.outcome.code === "logged_out") await markLoggedOut(provider);
+  // An account gate the page cannot pass (logged out; Grok's age verification) pauses the provider:
+  // every queued leg would end the same way until the user finishes it in the tab.
+  if (state.outcome.code === "logged_out" || state.outcome.code === "age_verification") await markLoggedOut(provider);
 }
 
 async function deliverOutcome(job, provider, jobs, signal) {

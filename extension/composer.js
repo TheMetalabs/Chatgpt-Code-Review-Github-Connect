@@ -1143,6 +1143,10 @@ async function clickSend(findSend, findComposer, expectedText) {
     }
     if (record.phase === "attempted") {
       // Delivery is ambiguous. Never automatically replay a possibly accepted prompt.
+      // A page that says why the send did not go through (sendBlockedError, a site's own detector:
+      // Grok's age-verification dialog) ends the run at once with that reason, not after CONFIRM_MS.
+      const blocked = typeof sendBlockedError === "function" ? sendBlockedError() : null;
+      if (blocked) throw blocked;
       step("send_unconfirmed");
       attemptSeen ??= Number.isSafeInteger(record.attemptedAt) ? record.attemptedAt : Date.now();
       if (Date.now() - attemptSeen >= CONFIRM_MS) {

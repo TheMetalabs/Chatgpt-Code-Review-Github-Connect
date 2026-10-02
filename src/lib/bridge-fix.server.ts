@@ -214,8 +214,10 @@ export interface FixItem {
   /** Process-wide creation order shared with review jobs (creation-seq.ts): breaks a createdAt tie. */
   createdSeq: number;
   deadlineAt: number;
-  /** Time left on the deadline when a take drain froze it (hold); present only while held. */
+  /** Time left on the deadline when a take drain froze it (hold), and the window end it counts from.
+   * Valid only while heldUntil is in the future: after the window the deadline is real again. */
   heldMs?: number;
+  heldUntil?: number;
   state: FixItemState;
   leaseId?: string;
   clientId?: string;
@@ -359,24 +361,30 @@ export function createFixRegistry(deps: FixRegistryDeps) {
   }
 
   /** A take drain freezes the clock of every item that has not started a run: nothing can take it
-   * until `until`, so its remaining time is counted from there (a re-hold moves it with the window).
-   * Without this a drain longer than the item's timeout cancels fixes that never had a chance. */
+   * until `until`, so its remaining time is counted from there (a re-hold, longer or shorter, moves it
+   * with the window). Without this a drain longer than the item's timeout cancels fixes that never
+   * had a chance. An item already past its deadline is expired first, never revived. */
   function hold(until: number) {
+    prune();
     const now = deps.now();
     for (const item of items.values()) {
       if (!live(item) || item.runId) continue;
-      item.heldMs ??= Math.max(0, item.deadlineAt - now);
-      rearm(item, Math.max(item.deadlineAt, until + item.heldMs));
+      if (item.heldMs === undefined || (item.heldUntil ?? 0) <= now) item.heldMs = Math.max(0, item.deadlineAt - now);
+      item.heldUntil = until;
+      rearm(item, until + item.heldMs);
     }
   }
 
-  /** The drain ended before its window: items resume with the time they had left. */
+  /** The drain ended before its window: items resume with the time they had left. A hold whose window
+   * already passed is spent (the deadline is real) and only forgotten. */
   function unhold() {
+    prune();
     const now = deps.now();
     for (const item of items.values()) {
       if (item.heldMs === undefined) continue;
-      if (live(item) && !item.runId) rearm(item, now + item.heldMs);
+      if (live(item) && !item.runId && (item.heldUntil ?? 0) > now) rearm(item, now + item.heldMs);
       item.heldMs = undefined;
+      item.heldUntil = undefined;
     }
   }
 
@@ -434,7 +442,7 @@ export function createFixRegistry(deps: FixRegistryDeps) {
       createdAt: now,
       createdSeq: nextCreationSeq(),
       deadlineAt: (held ? holdUntil : now) + timeoutMs,
-      ...(held ? { heldMs: timeoutMs } : {}),
+      ...(held ? { heldMs: timeoutMs, heldUntil: holdUntil } : {}),
       state: "queued",
     };
     items.set(item.id, item);

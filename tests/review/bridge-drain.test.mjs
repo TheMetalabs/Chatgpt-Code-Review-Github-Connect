@@ -92,3 +92,32 @@ test('rotating the bridge token keeps the drain window', () => {
   h.bridge.rotateBridgeToken();
   assert.equal(h.bridge.getBridgePublic().drainUntil, until);
 });
+
+test('a hold that already ran out is spent: ending or renewing the drain later does not hand back elapsed time', () => {
+  const {h, clock} = clocked();
+  quiet(h.bridge.requestBridgeFix(FIX));
+  clock.now += 25 * 60_000; // 5 minutes left
+  const until = h.bridge.setBridgeDrain(10);
+  clock.now = until + 60_000; // window over; the deadline is real: 5 minutes - 1 left
+  h.bridge.setBridgeDrain(0);
+  assert.equal(h.bridge.getBridgePublic().fixItems[0].deadlineInSec, 4 * 60);
+  const again = h.bridge.setBridgeDrain(10);
+  assert.equal(h.bridge.getBridgePublic().fixItems[0].deadlineInSec, Math.round((again + 4 * 60_000 - clock.now) / 1000), 'a new drain re-measures what is left');
+});
+
+test('a shorter re-drain pulls the deadline in with the window', () => {
+  const {h, clock} = clocked();
+  quiet(h.bridge.requestBridgeFix(FIX));
+  h.bridge.setBridgeDrain(90);
+  const until = h.bridge.setBridgeDrain(10);
+  assert.equal(h.bridge.getBridgePublic().fixItems[0].deadlineInSec, Math.round((until + 30 * 60_000 - clock.now) / 1000));
+});
+
+test('a drain does not revive a fix already past its deadline', () => {
+  const {h, clock} = clocked();
+  const answer = h.bridge.requestBridgeFix(FIX);
+  const rejected = assert.rejects(answer, /timed out/);
+  clock.now += 31 * 60_000;
+  h.bridge.setBridgeDrain(60);
+  return rejected;
+});

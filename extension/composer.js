@@ -1166,7 +1166,7 @@ async function clickSend(findSend, findComposer, expectedText) {
   // ChatGPT ended the session, until their tabs were gone). A logged-out page ends it at once as
   // logged_out.
   const SEND_WAIT_MS = 3 * 60 * 1000;
-  let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null;
+  let attemptSeen = null, uploadWaitSince = null, sendWaitSince = null, blockCleared = false;
   for (;;) {
     if (record.phase === "sent" || submissionConfirmed(record)) return;
     // After the confirmation check, so an accepted send is still journaled as sent; before any
@@ -1179,6 +1179,22 @@ async function clickSend(findSend, findComposer, expectedText) {
       // Delivery is ambiguous. Never automatically replay a possibly accepted prompt.
       // A page that says why the send did not go through (sendBlockedError, a site's own detector:
       // Grok's age-verification dialog) ends the run at once with that reason, not after CONFIRM_MS.
+      // A dialog the site can answer (clearSendBlock) is answered once; the prompt it consumed is then
+      // looked for, and only a draft that is back in the composer with no sent turn is clicked again.
+      if (!blockCleared && typeof clearSendBlock === "function" && await clearSendBlock()) {
+        blockCleared = true;
+        step("age_confirmed");
+        const settle = Date.now() + 4000;
+        while (Date.now() < settle && !submissionConfirmed(record)) await sleep(250);
+        if (!submissionConfirmed(record) && userTurns().length === record.baseline &&
+            normalizePrompt(readComposer(findComposer())) === record.expected) {
+          record.phase = "prepared";
+          delete record.attemptedAt;
+          saveSubmission(record);
+          attemptSeen = null;
+        }
+        continue;
+      }
       const blocked = typeof sendBlockedError === "function" ? sendBlockedError() : null;
       if (blocked) throw blocked;
       step("send_unconfirmed");

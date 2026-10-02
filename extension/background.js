@@ -2069,11 +2069,15 @@ async function refreshJobHeartbeat(job, jobs, signal) {
   // (a collected answer, a failure) still delivers it.
   const ended = (Array.isArray(result.endedProviders) ? result.endedProviders : [])
     .filter(provider => job.states[provider] && !job.states[provider].outcome && !job.states[provider].delivered);
-  if (ended.length) {
-    abandonLegs(job, ended, "ended");
-    for (const provider of ended) workerStep(job, provider, "cancelled");
+  // One `abandon` operation, like a cancelled job's (abandonJobLegs): after a poll that may be between
+  // its run message and saving `started`, so the release that follows sees what it dispatched.
+  if (ended.length) await tabOp("abandon", async () => {
+    if (jobs[job.jobId] !== job) return;
+    const open = ended.filter(provider => !job.states[provider].outcome && !job.states[provider].delivered);
+    abandonLegs(job, open, "ended");
+    for (const provider of open) workerStep(job, provider, "cancelled");
     await saveJobs(jobs);
-  }
+  });
   if (result.accepted === false || !job.leaseId) {
     const claim = await api("/api/bridge", {action: "claim", jobId: job.jobId, clientId: await clientId()}, job.origin, signal);
     job.leaseId = claim.leaseId;
@@ -2346,9 +2350,11 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   }
   // A frozen tab (energy saver, a collapsed tab group) runs no handler until it thaws: a message
   // would only wait out askPage. Polled again next tick.
+  let frozenPoke = false;
   if (tab.frozen === true) {
     if (sentAt(state) === undefined || Date.now() - (state.frozenPokeAt || 0) < FROZEN_POKE_MS) return;
     state.frozenPokeAt = Date.now();
+    frozenPoke = true;
     await saveJobs(jobs);
   }
   // A new ChatGPT prompt goes only into the new chat its tab was opened on (X2, #85): the tab is
@@ -2404,6 +2410,8 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       }
     }
   } catch (e) {
+    // A frozen tab that does not answer its poke is what it was before: not a lost binding.
+    if (frozenPoke) return;
     // A messaging outage is not a model failure or a global admission lock.
     state.connectionError = String(e.message || e).slice(0, 240);
     workerStep(job,provider,"disconnected");

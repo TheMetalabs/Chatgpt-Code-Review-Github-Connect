@@ -17,6 +17,13 @@ function clocked(jobs) {
   const h = bridgeHarness(jobs, {Date: FakeDate});
   h.clock = clock;
   h.advance = ms => { clock.t += ms; };
+  // Time passing under a live worker: a heartbeat every 2 min, as the real worker pings.
+  h.wait = (ms, offer, generating = {chatgpt: true, grok: true}) => {
+    for (let left = ms; left > 0; left -= 2 * MIN) {
+      h.advance(Math.min(left, 2 * MIN));
+      h.bridge.refreshBridgeClaim('R', generating, undefined, offer.leaseId);
+    }
+  };
   h.progress = (id, provider, stage) => {
     h.state.jobs = h.state.jobs.map(j => j.id === id ? {...j, providerProgress: {...j.providerProgress,
       [provider]: {runId: `run-${provider}`, stage, observedAt: clock.t, receivedAt: clock.t}}} : j);
@@ -34,12 +41,10 @@ test('a grok leg stuck in waiting_for_response ends at the cap and the ChatGPT r
   const h = clocked([both()]);
   const offer = h.bridge.takeNextBridgeJob('chrome-1');
   h.progress('R', 'grok', 'waiting_for_response');
-  h.advance(45 * MIN - 1);
-  h.bridge.refreshBridgeClaim('R', {chatgpt: true, grok: true}, undefined, offer.leaseId);
+  h.wait(45 * MIN - 1, offer);
   assert.equal(row(h, 'R').providerErrors?.grok, undefined, 'still waiting just inside the cap');
   assert.deepEqual([...h.bridge.bridgeJobState('R').endedProviders], []);
-  h.advance(2);
-  h.bridge.refreshBridgeClaim('R', {chatgpt: true, grok: true}, undefined, offer.leaseId);
+  h.wait(2, offer);
   const settled = row(h, 'R');
   assert.equal(settled.providerErrors.grok.code, 'error');
   assert.match(settled.providerErrors.grok.message, /no progress for 45 min .*waiting_for_response/);
@@ -55,10 +60,9 @@ test('a newer stage restarts the clock', () => {
   const h = clocked([both()]);
   const offer = h.bridge.takeNextBridgeJob('chrome-1');
   h.progress('R', 'grok', 'waiting_for_response');
-  h.advance(40 * MIN);
+  h.wait(40 * MIN, offer);
   h.progress('R', 'grok', 'generating');
-  h.advance(40 * MIN);
-  h.bridge.refreshBridgeClaim('R', {chatgpt: true, grok: true}, undefined, offer.leaseId);
+  h.wait(40 * MIN, offer);
   assert.equal(row(h, 'R').providerErrors?.grok, undefined);
 });
 
@@ -111,4 +115,33 @@ test('endedProviders is empty for a transient disconnect and for a job that left
   assert.deepEqual([...h.bridge.bridgeJobState('R').endedProviders], []);
   h.state.jobs = h.state.jobs.map(j => ({...j, status: 'posted', providerErrors: {grok: {code: 'error', message: 'x'}}}));
   assert.deepEqual([...h.bridge.bridgeJobState('R').endedProviders], []);
+});
+
+// Review of #159: the worker re-sends its whole step journal on every heartbeat; the cap counts from the
+// newest step, never from the latest repeat of it.
+test('heartbeats that repeat the same step do not restart the clock', () => {
+  const h = clocked([both()]);
+  const offer = h.bridge.takeNextBridgeJob('chrome-1');
+  const report = {grok: {runId: 'run-grok', events: [{source: 'page', sequence: 1, stage: 'waiting_for_response', at: h.clock.t}]}};
+  for (let i = 0; i < 21; i++) {
+    h.bridge.recordBridgeProgress('R', offer.leaseId, report);
+    h.wait(2 * MIN, offer);
+  }
+  assert.equal(row(h, 'R').providerErrors?.grok, undefined, '42 min in, still waiting');
+  h.bridge.recordBridgeProgress('R', offer.leaseId, report);
+  h.wait(4 * MIN, offer);
+  assert.equal(row(h, 'R').providerErrors?.grok?.code, 'error', 'ended 45 min after the step although the worker kept pinging');
+});
+
+test('a worker that was away for more than 5 min restarts the stall clock instead of failing the leg on stale time', () => {
+  const h = clocked([both()]);
+  const offer = h.bridge.takeNextBridgeJob('chrome-1');
+  h.progress('R', 'grok', 'waiting_for_response');
+  h.advance(50 * MIN); // the machine slept
+  h.bridge.refreshBridgeClaim('R', {chatgpt: true, grok: true}, undefined, offer.leaseId);
+  assert.equal(row(h, 'R').providerErrors?.grok, undefined, 'the first heartbeat after the outage does not end the leg');
+  h.wait(44 * MIN, offer);
+  assert.equal(row(h, 'R').providerErrors?.grok, undefined);
+  h.wait(2 * MIN, offer);
+  assert.equal(row(h, 'R').providerErrors?.grok?.code, 'error', 'but a leg still silent 45 min later does end');
 });

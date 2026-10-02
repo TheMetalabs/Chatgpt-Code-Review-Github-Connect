@@ -47,3 +47,18 @@ test('a frozen sent tab is polled once every 3 min, which wakes its page; an uns
  await ticks(c);
  assert.deepEqual(c.messages.filter(m=>m.type==='ashlar-harvest'),[],'a leg that has not sent is left to the pre-send watchdog');
 });
+test('a frozen tab that does not answer its poke is not reported as a lost binding',async()=>{
+ const b=rig(grokLeg(10),{frozen:true,handler:()=>{throw new Error('no receiver');}});
+ await ticks(b);
+ assert.equal(b.local.state.pendingReviewJobs.A.states.grok.connectionError,undefined);
+ assert.equal(b.local.state.pendingReviewJobs.A.states.grok.workerEvents?.some(e=>e.stage==='disconnected')??false,false);
+});
+test('legs the server ended are abandoned inside the tab queue, and only if still open',async()=>{
+ const job=grokLeg(10);
+ const b=rig(job,{handler:()=>({ok:false,code:'busy'})});
+ b.context.api=async(_p,body)=>body?.action==='ping'?{ok:true,active:true,accepted:true,status:'awaiting_chat',endedProviders:['grok']}:{ok:true};
+ await ticks(b);
+ const state=b.local.state.pendingReviewJobs.A?.states.grok;
+ assert.ok(state?.abandoned===true&&state.abandonedAs==='ended',JSON.stringify(state));
+ assert.equal(b.queue.overlapped,false);
+});

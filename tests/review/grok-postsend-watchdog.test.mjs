@@ -228,6 +228,25 @@ test('a receipt older than response_collected cannot replace a timeout outcome',
  assert.equal((await b.session.get([key]))[key], undefined);
 });
 
+test('a receipt stamped at response_collected replaces the timeout outcome', async () => {
+ const job = grokLeg(10);
+ const collectedAt = Date.now();
+ job.states.grok.outcome = {ok:false,code:'response_timeout',error:'old timeout'};
+ job.states.grok.workerEvents = [{source:'worker',sequence:1,stage:'response_collected',at:collectedAt}];
+ const key = 'ashlar:result:A:grok:run-A';
+ const b = background({
+  local: storage({origin:'http://bridge',token:'token',pendingReviewJobs:{A:job}}),
+  session: storage({[key]: {jobId:'A',provider:'grok',runId:'run-A',raw:'fresh',responseText:'fresh',at:collectedAt}}),
+  tabs: new Map([[10,{id:10,url:GROK,status:'complete',active:false,frozen:true}]]),
+  handler: () => { throw new Error('frozen page cannot answer'); },
+  api: async () => ({ok:true,active:true,accepted:true,status:'awaiting_chat'}),
+ });
+ await ticks(b);
+ const state = b.local.state.pendingReviewJobs.A.states.grok;
+ assert.equal(state.outcome.raw, 'fresh');
+ assert.equal(state.outcome.code, undefined);
+});
+
 test('the postsend watchdog rejects a receipt older than the final response probe', async () => {
  const job = grokLeg(31);
  const key = 'ashlar:result:A:grok:run-A';

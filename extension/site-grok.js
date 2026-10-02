@@ -287,7 +287,7 @@ function grokReplyDoneVisible(root) {
   // "Analyzing …" lines and the elapsed-time label must keep polling for the late answer.
   const reasoningLines = text.split(/\r?\n/).map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
   const isReasoningLine = line => /^(?:analyzing\b|thinking\b|reasoning\b|분석 중\b|생각 중\b|추론 중\b|thought\s+for\s+\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|mins?|minutes?)\b)/i.test(line);
-  if (reasoningLines.length && reasoningLines.every(isReasoningLine)) return false;
+  if (reasoningLines.length > 1 && reasoningLines.every(isReasoningLine)) return false;
   if (!text) return false;
   const action = /^(?:copy response|copy|like|dislike|more actions|응답 복사|복사|좋아요|싫어요|더 보기|더보기|신고)$/i;
   for (const el of root.querySelectorAll("button, [role='button']")) {

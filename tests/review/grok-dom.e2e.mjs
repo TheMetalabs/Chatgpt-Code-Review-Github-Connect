@@ -155,7 +155,17 @@ test('grok reasoning controls do not finish a turn before the final answer mount
     document.querySelector('[data-testid="assistant-message"]').insertAdjacentHTML('beforeend', `<p>${answer}</p>`);
     return {before, after: replyDoneVisible()};
   }, ANSWER);
-  assert.deepEqual(out, {before: false, after: true});
+ assert.deepEqual(out, {before: false, after: true});
+});
+
+test('grok accepts a finished one-line answer that starts with Analyzing', async t => {
+ const page = await openGrok(t, `<main>
+   <div data-testid="user-message" id="response-user-A" role="article">review</div>
+   <div id="answer"><div data-testid="assistant-message" id="response-answer-A" role="article">
+     <p>Analyzing the patch for a lost receipt.</p>
+   </div><button aria-label="Copy response" style="width:64px;height:32px">copy</button></div>
+ </main>${COMPOSER}`);
+ assert.equal(await page.evaluate(() => replyDoneVisible()), true);
 });
 
 test('grok answer actions never finish an answer while the composer shows a stream (a regenerate under the old Copy)', async t => {

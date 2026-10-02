@@ -123,6 +123,21 @@ test('submission: actionable Send records the other click gates when the draft d
  assert.equal(await page.evaluate(()=>clicks),0);
 });
 
+test('submission: a visible Stop lets a converging draft wait before takeover',async t=>{
+ const page=await fixture(t);
+ await page.evaluate(()=>{
+   document.querySelector('textarea').value='different draft';
+   document.querySelector('form').insertAdjacentHTML('afterbegin','<button data-testid="stop-button" style="width:40px;height:20px">Stop</button>');
+   window.stopButtonVisible=()=>Boolean(document.querySelector('[data-testid="stop-button"]'));
+ });
+ await start(page);await page.clock.runFor(500);
+ assert.equal((await page.evaluate(()=>result)).pending,true);
+ assert.equal(await page.evaluate(()=>clicks),0);
+ await page.locator('[data-testid="stop-button"]').evaluate(el=>el.remove());await page.clock.runFor(500);
+ assert.equal((await page.evaluate(()=>result)).error,'the composer draft changed before Send; nothing was sent');
+ assert.equal(await page.evaluate(()=>clicks),0);
+});
+
 test('submission: a prepared journal resumes after reload, an attempted journal never clicks again',async t=>{
  const page=await fixture(t,{disabled:true});await start(page);await page.clock.runFor(500);
  const stored=await page.evaluate(()=>sessionStorage.getItem(submissionKey()));

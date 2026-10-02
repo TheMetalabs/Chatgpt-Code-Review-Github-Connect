@@ -335,7 +335,7 @@ function harvestJson(opts) {
 }
 
 /** Metadata only. The browser journal survives reload; raw text is not a step log. */
-function recordReviewStep(stage) {
+function recordReviewStep(stage, at = Date.now()) {
   const state = globalThis.__ashlarRunnerState;
   if (!state?.jobId || !state.runId) return;
   if (typeof saveStageHtml === "function") saveStageHtml(stage); // the page at this stage (diagnostic)
@@ -345,7 +345,7 @@ function recordReviewStep(stage) {
     if (!state.steps || !Array.isArray(state.steps.events)) state.steps = {sequence: 0, events: []};
   }
   if (state.steps.events.at(-1)?.stage === stage) return;
-  const event = {source: "page", sequence: ++state.steps.sequence, stage, at: Date.now()};
+  const event = {source: "page", sequence: ++state.steps.sequence, stage, at: Number.isFinite(at) ? at : Date.now()};
   state.steps.events = [...state.steps.events, event].slice(-128);
   try { sessionStorage.setItem(key, JSON.stringify(state.steps)); } catch { state.steps.persistenceError = true; }
 }
@@ -694,7 +694,7 @@ function saveResponseWaitHtml(bound) {
 
 /** Collection needs two identical stable observations (`key`). On the second one the runner
  * records the answer and, when available, its native completion proof. */
-async function persistCollectedResult(runner, raw, text, ownership) {
+async function persistCollectedResult(runner, raw, text, ownership, at = Date.now()) {
   // A frozen page may finish its collector while the worker cannot receive the reply. Keep the
   // exact bound result in the extension session store so the worker can ingest it on its next poke.
   // The worker validates every identity field before accepting this receipt and removes it only
@@ -710,7 +710,7 @@ async function persistCollectedResult(runner, raw, text, ownership) {
   const completion = runner.nativeCompletion;
   try {
     const record = {jobId: runner.jobId, provider: runner.provider, runId: runner.runId,
-      raw: storedRaw, responseText: typeof text === "string" ? text : "", at: Date.now()};
+      raw: storedRaw, responseText: typeof text === "string" ? text : "", at: Number.isFinite(at) ? at : Date.now()};
     if (runner.kind === "fix") record.ownership = ownership;
     if (completion && typeof completion.responseId === "string" && typeof completion.context === "string")
       record.completion = {responseId: completion.responseId, context: completion.context};
@@ -723,6 +723,7 @@ async function settleStableAnswer(stability, key, poll, {text, raw, ownership}) 
   stability.stable = key;
   if (stability.hits < 2) return false;
   const {runner, bound} = poll;
+  const collectedAt = Date.now();
   if (runner) {
     runner.responseText = text;
     // The regeneration pager as it was when the answer was collected (tabOwnership: "regenerated").
@@ -731,10 +732,10 @@ async function settleStableAnswer(stability, key, poll, {text, raw, ownership}) 
       jobId:runner.jobId,provider:runner.provider,runId:runner.runId,
       responseId:bound.responseId,context:reviewPageContext(),text,raw,
     });
-    runner.persistedResult = persistCollectedResult(runner, raw, text, ownership);
+    runner.persistedResult = persistCollectedResult(runner, raw, text, ownership, collectedAt);
     await runner.persistedResult;
   }
-  recordReviewStep("response_collected");
+  recordReviewStep("response_collected", collectedAt);
   return true;
 }
 

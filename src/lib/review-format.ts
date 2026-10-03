@@ -73,7 +73,7 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs">>;
+type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs" | "canonicalProvider" | "auxiliaryProviderFailures">>;
 
 /** Everything a body helper reads, computed once so every kind renders the same fields the same way. */
 type SummaryParts = {

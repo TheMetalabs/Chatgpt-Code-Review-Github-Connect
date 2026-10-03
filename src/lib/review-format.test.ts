@@ -56,6 +56,24 @@ describe("review-format", () => {
     assert.match(body, /not valid review JSON/i);
   });
 
+  it("keeps a canonical clean verdict clean when an auxiliary chat reviewer is unparseable", () => {
+    const body = reviewSummaryBody(
+      {
+        headSha: "abc1234ffff",
+        reviewProviders: ["chatgpt", "grok"],
+        canonicalProvider: "chatgpt",
+        auxiliaryProviderFailures: { grok: "unparseable" },
+        assumptions: [],
+        coverage: [{ file: "src/a.ts", status: "cleared", reason: "canonical" }],
+      },
+      [],
+      "ashlar-bot",
+    );
+    assert.match(body, new RegExp(`^${CLEAN_REVIEW_BODY.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`));
+    assert.match(body, /ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0/);
+    assert.doesNotMatch(body, /raw:start|unparseable|No complete review from grok/);
+  });
+
   it("delimits the salvaged block and redacts it from the public snapshot (keeps it in the posted body)", () => {
     const body = reviewSummaryBody(
       { headSha: "abc1234ffff", reviewProviders: ["chatgpt"], assumptions: [], coverage: [], rawReview: "SECRET private source: const key = process.env.SECRET;" },

@@ -273,6 +273,33 @@ function currentAssistantRoot() {
   return grokAnswerRoot(last);
 }
 
+/** A visible Copy action can arrive before Grok finishes a structured answer. Keep polling when
+ * the response starts as JSON but ends inside a string/container; once the stream is gone, the
+ * visible action lets the normal repair lane harvest the incomplete reply for salvage. */
+function grokStructuredReplyIncomplete(text) {
+  let candidate = String(text || "").trim();
+  candidate = candidate.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  if (!candidate.startsWith("{") && !candidate.startsWith("[")) return false;
+  const stack = [];
+  let quoted = false, escaped = false;
+  for (const char of candidate) {
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') { quoted = true; continue; }
+    if (char === "{" || char === "[") stack.push(char);
+    else if (char === "}" || char === "]") {
+      const open = stack.at(-1);
+      if ((char === "}" && open !== "{") || (char === "]" && open !== "[")) return true;
+      stack.pop();
+    }
+  }
+  return quoted || stack.length > 0;
+}
+
 /** Never while the composer shows a stream. Then answer actions, or, once this submission's poll
  * recorded a stream, the composer idle again with text in the bubble. A page opened after completion
  * still finishes from the action row, with no stream mark. */
@@ -285,6 +312,7 @@ function grokReplyDoneVisible(root) {
   // Grok can expose copy/feedback controls for a collapsed reasoning turn before it has mounted
   // the final answer. Those controls are not completion evidence: a transcript containing only
   // "Analyzing …" lines and the elapsed-time label must keep polling for the late answer.
+  const incomplete = grokStructuredReplyIncomplete(text);
   const reasoningLines = text.split(/\r?\n/).map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
   const isReasoningLine = line => /^(?:analyzing\b|thinking\b|reasoning\b|분석 중\b|생각 중\b|추론 중\b|thought\s+for\s+\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|mins?|minutes?)\b)/i.test(line);
   if (reasoningLines.length > 1 && reasoningLines.every(isReasoningLine)) return false;
@@ -296,6 +324,10 @@ function grokReplyDoneVisible(root) {
     if (!label || label.length > 48 || !action.test(label) || !elVisible(el)) continue;
     return true;
   }
+  // Once the stream and stop control are gone, a visible action is enough to hand malformed or
+  // truncated JSON to the existing repair lane. Without an action, keep waiting for a complete
+  // structured answer before using the idle-composer fallback below.
+  if (incomplete) return false;
   if (text.length < 2 || !grokSawCurrentStream(root)) return false;
   const form = document.querySelector("form[data-composer]");
   if (!form) return false;

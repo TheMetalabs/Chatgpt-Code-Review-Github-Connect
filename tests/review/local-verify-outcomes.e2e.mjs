@@ -363,6 +363,30 @@ test('verify-clean outcome: clean ChatGPT beside a gate-rejected Grok is evidenc
   assert.equal(job().localVerifyStartedAt,undefined,'local stays held');
 });
 
+// A prose-only secondary chat leg has no gated findings to hide. Keep the canonical ChatGPT verdict
+// and expose Grok's failure in the ops state instead of poisoning the public review with raw=1.
+test('verify-clean outcome: clean ChatGPT beside auxiliary Grok prose keeps the canonical clean verdict',async t=>{
+  const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const out=await app.mention('matrix-auxiliary-grok-prose');
+  const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+  const grok=salvageReviewJson('Analyzing the diff\n\nFinalizing the review');
+  await app.harbor.submitHarborChat(out.jobId,cleanJson,[{provider:'chatgpt',raw:cleanJson},{provider:'grok',raw:grok}]);
+  await eventually(()=>app.localRequests.length===1,'canonical clean did not start local verification');
+  app.localResponses[0].end(envelope(cleanJson));
+  await eventually(()=>app.reviews.length===1,'the canonical review was not posted');
+  const body=app.reviews[0].body;
+  assert.equal(body.split('\n')[0],CLEAN_REVIEW_BODY,'canonical ChatGPT clean remains the public verdict');
+  assert.match(body,/ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0/);
+  assert.doesNotMatch(body,/ashlar-raw:start|Analyzing the diff|raw=1/);
+  assert.deepEqual([...(job().incompleteProviders??[])],[],'auxiliary prose is not a blocking incomplete provider');
+  assert.deepEqual({...job().rawCauses??{}},{},'auxiliary prose is not copied into the public raw cause');
+  assert.deepEqual({...job().auxiliaryProviderFailures},{grok:'unparseable'});
+  assert.equal(job().canonicalProvider,'chatgpt');
+  assert.match(app.ops.at(-1)??'',/Canonical ChatGPT verdict retained; auxiliary reviewer failure: Grok \(unparseable\)/);
+});
+
 // chat clean with a skipped chat peer (grok quota) × local: the round is incomplete whatever local
 // did, so the note alone tells an agreeing verification from a failed one; raw evidence still wins.
 const SKIPPED_PEER={
@@ -435,9 +459,8 @@ test('verify-clean outcome: a late chat finding during the verification round is
 });
 
 // The same late Grok run, but its reply is not a verdict (the bridge salvages it, or the gate rejects
-// it beside clean ChatGPT) while local verification fails with no reply at all: the raw block holds
-// only Grok's reply, so it is plain raw evidence. The header, the note and the loop handoff never
-// credit that reply to local verification, and the note still says local did not complete.
+// it beside clean ChatGPT) while local verification fails: Grok's prose salvage is auxiliary
+// evidence and stays out of the public verdict; local's own failure remains blocking evidence.
 const LATE_GROK={
   malformed:{reply:JSON.stringify({findings:[{...partial,title:'GROK-RAW duplicate write'}],merge_recommendation:'REQUEST_CHANGES'}),cause:'unparseable'},
   rejected:{reply:'{"findings":"GROK-RAW not a list"}',cause:'unparseable'},
@@ -461,28 +484,39 @@ for(const [name,grok] of Object.entries(LATE_GROK)){
     await eventually(()=>app.reviews.length===1,'the review was not posted');
     const body=app.reviews[0].body;
     const raw=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
-    assert.ok(raw.includes('GROK-RAW'),'grok\'s reply is the raw block');
-    assert.doesNotMatch(raw,/LOCAL-RAW|model crashed/,'local wrote nothing into it');
-    assert.deepEqual({...job().rawCauses},{grok:grok.cause});
+    if(grok.cause==='unparseable'){
+      assert.doesNotMatch(raw,/GROK-RAW/,'auxiliary Grok prose is not copied into the public raw block');
+      assert.equal(raw,'','no blocking raw reply was returned by the failed local verification');
+      assert.deepEqual({...job().rawCauses??{}},{});
+      assert.deepEqual({...job().auxiliaryProviderFailures},{grok:'unparseable'});
+    }else{
+      assert.match(raw,/GROK-RAW/,'a schema-rejected Grok reply remains blocking evidence');
+      assert.doesNotMatch(raw,/LOCAL-RAW|model crashed/);
+      assert.deepEqual({...job().rawCauses},{grok:grok.cause});
+    }
     assert.equal(job().localVerified,false);
-    assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MR,'raw evidence, never CONVERGED');
+    if(grok.cause==='unparseable'){
+      assert.equal(body.split('\n')[0],UNVERIFIED_CLEAN_REVIEW_BODY,'the canonical verdict is explicitly unverified');
+      assert.match(body,/ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1/);
+    }else{
+      assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MR,'schema-rejected evidence remains non-clean');
+    }
     assert.equal(converged(body),false);
-    assert.doesNotMatch(body,/Local verification reply posted verbatim/,'the header never calls grok\'s reply local verification\'s');
-    assert.match(body,/\*\*⚠️ Review posted verbatim — /);
+    if(grok.cause==='unparseable') assert.doesNotMatch(body,/Local verification reply posted verbatim|ashlar-raw:start/);
     const note=job().localVerifyNote;
-    assert.match(note,/^chatgpt found nothing; local verification did not complete \(local LLM HTTP 500[^)]*\); grok's reply could not be used as a review and is posted verbatim below\. Not a clean pass\.$/);
-    assert.doesNotMatch(note,/local verification's reply/);
+    if(grok.cause==='unparseable') assert.match(note,/^chatgpt found nothing; local verification did not complete \(local LLM HTTP 500[^)]*\), so this is chatgpt's unverified clean result\.$/);
+    else assert.match(note,/grok's reply could not be used as a review and is posted verbatim below/);
     assert.ok(body.includes(`\n${note}\n`),'the body carries the note');
     const handoff=notCleanDetail(job(),postedOutcome(job(),0));
-    assert.doesNotMatch(handoff,/local verification's reply/,'nor does the loop handoff');
-    assert.match(handoff,/^posted verbatim: /);
+    if(grok.cause==='unparseable'){
+      assert.doesNotMatch(handoff,/posted verbatim/,'no raw evidence was posted');
+      assert.match(handoff,/local verification did not complete/);
+    }else assert.match(handoff,/^posted verbatim:/);
   });
 }
 
-// The raw block is held under GitHub's body limit per reply, never by cutting the concatenation: a
-// late Grok reply longer than the whole limit, ahead of local verification's in the block, used to
-// take all of it, and the body still said local's reply was posted verbatim. The outcome, header, note
-// and handoff describe the block as posted.
+// The public raw block is held under GitHub's body limit per blocking reply. A late auxiliary Grok
+// reply longer than the whole limit is retained in history/ops, while local evidence remains public.
 const LONG_GROK=`P1 a.ts:1 GROK-RAW ${'g'.repeat(70_000)} GROK-END`;
 const TRUNCATED_LOCAL={
   // local's reply is short: it keeps its whole reply, so the block is local verification's reply
@@ -508,28 +542,21 @@ for(const [name,local] of Object.entries(TRUNCATED_LOCAL)){
     await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(envelope(local.reply));return app.reviews.length===1;},'the review was not posted');
     const body=app.reviews[0].body;
     const raw=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
-    assert.match(raw,/\*\*Grok:\*\*\n\nDetected severity markers: P1\.\n\nP1 a\.ts:1 GROK-RAW g+\n\n…\(Grok reply truncated to fit GitHub's review body limit/,'grok\'s reply keeps its start and its own marker');
-    assert.doesNotMatch(raw,/GROK-END/);
-    assert.ok(raw.includes('LOCAL-RAW'),'local verification\'s reply is in the block, never crowded out');
-    assert.equal(raw.includes(local.reply),local.localInFull,'local\'s reply is whole iff it fits its share');
-    assert.deepEqual([...(job().rawTruncated??[])],local.localInFull?['grok']:['grok','local']);
+    assert.doesNotMatch(raw,/GROK-RAW|GROK-END/,'auxiliary Grok prose is not posted');
+    assert.ok(raw.includes('LOCAL-RAW'),'local verification\'s reply remains in the block');
+    assert.equal(raw.includes(local.reply),true,'the blocking local reply remains whole after auxiliary Grok is removed');
+    assert.deepEqual({...job().auxiliaryProviderFailures},{grok:'unparseable'});
     // where each reply ends in the block, so a body cut further names exactly whose
     const legs=job().rawLegs??[];
-    assert.deepEqual([...legs.map(l=>l.provider)],['grok','local']);
-    assert.equal(legs[1].end,job().rawReview.length);
-    assert.match(job().rawReview.slice(0,legs[0].end),/…\(Grok reply truncated[^)]*\)$/);
-    assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],local.marker);
+    assert.deepEqual([...legs.map(l=>l.provider)],['local']);
+    assert.equal(legs[0].end,job().rawReview.length);
+    assert.match(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1] ?? "",/raw=1/);
     assert.equal(converged(body),false);
     const handoff=notCleanDetail(job(),postedOutcome(job(),0));
-    if(local.localInFull){
-      assert.match(body,/Local verification reply posted verbatim — it could not be used as a review\./);
-      assert.match(job().localVerifyNote,/local verification's reply could not be used as a review \([^)]*\); it is posted verbatim below\./);
-    }else{
-      assert.doesNotMatch(body,/Local verification reply posted verbatim/,'a cut reply is never called local verification\'s verbatim reply');
-      assert.match(body,/\*\*⚠️ Review posted verbatim — Grok: the reply was not valid review JSON \(truncated below[^)]*\); Local LLM: the reply was not valid review JSON \(truncated below to fit GitHub's review body limit, full original in review history\)\.\*\*/);
-      assert.equal(job().localVerifyNote,"chatgpt found nothing; local verification's reply could not be used as a review (not review JSON); grok's reply could not be used as a review either; posted below (grok + local verification truncated to fit GitHub's review body limit, full originals in review history). Not a clean pass.");
-      assert.match(handoff,/^posted verbatim: Grok: [^;]*truncated below[^;]*; Local LLM: [^(]*\(truncated below/,'the loop handoff names the cut too');
-    }
+    assert.doesNotMatch(body,/Grok:/,'the auxiliary provider is not named in the public raw block');
+    assert.match(body,/Local verification reply posted verbatim — it could not be used as a review\./);
+    assert.match(job().localVerifyNote,/local verification's reply could not be used as a review \([^)]*\); it is posted verbatim below\./);
+    assert.match(handoff,/posted verbatim/,'the loop handoff keeps the blocking raw state');
     assert.ok(body.includes(`\n${job().localVerifyNote}\n`),'the body carries the note');
   });
 }

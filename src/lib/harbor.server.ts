@@ -39,7 +39,7 @@ import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./revie
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
-import type { BotSettings, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
+import type { AuxiliaryProviderFailure, BotSettings, Job, PostedReview, RawCause, ReviewProvider, SamplePr, Trigger, WebhookLog } from "./types";
 import {
   ashlarBotLogin,
   continueLoopOnPush,
@@ -498,6 +498,8 @@ async function upsertOpsComment(token: string, jobId: string, phase: OpsPhase, n
     providers: job.reviewProviders?.length ? job.reviewProviders : providersFromSettings(state.settings),
     role: job.localReviewRole,
     localFallback: Boolean(job.localFallbackAt),
+    canonicalProvider: job.canonicalProvider,
+    auxiliaryProviderFailures: job.auxiliaryProviderFailures,
     notes: [`Job: ${job.id}`, ...notes],
   });
   // One write at a time per job, in call order: a slow "running" write can no longer land after the
@@ -1370,39 +1372,68 @@ export async function submitHarborChat(
     if (verdict) complete.add(leg.provider);
     if (gate.rawReview && cause) rawCauses[leg.provider] = cause;
   }
-  // Every reviewer that returned a payload but no complete verdict, a rejected one included.
-  const incompleteProviders = [...new Set(payloads.map((l) => l.provider))].filter((p) => !complete.has(p));
+  // The first active chat reviewer is the canonical verdict. A failed secondary chat leg is
+  // evidence for ops, but cannot turn a complete canonical verdict into a raw/non-clean review.
+  // Local remains blocking: in verify-clean it is the explicit verification gate, and in race it
+  // is an ordinary reviewer whose findings must not be hidden.
+  const canonicalProvider = providers.find(isChatProvider) ?? providers[0];
+  const auxiliaryProviderFailures: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>> = {};
+  const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(canonicalProvider && provider !== canonicalProvider && isChatProvider(provider));
+  const payloadProviders = [...new Set(payloads.map((l) => l.provider))];
+  const incompletePayloadProviders = payloadProviders.filter((p) => !complete.has(p));
+  for (const provider of incompletePayloadProviders) {
+    // A prose salvage carries no gated findings and can be reported out-of-band. Schema-rejected
+    // replies may hide a real finding, so they remain blocking evidence until a human/repair path
+    // resolves them. Skipped providers likewise stay blocking and retain the existing contract.
+    if (isAuxiliaryChat(provider) && rawCauses[provider] === "unparseable") auxiliaryProviderFailures[provider] = "unparseable";
+  }
+  const auxiliaryProviders = new Set(Object.keys(auxiliaryProviderFailures) as ReviewProvider[]);
+  const incompleteProviders = incompletePayloadProviders.filter((p) => !auxiliaryProviders.has(p));
+  const blockingSkipped = skipped.filter((p) => !auxiliaryProviders.has(p));
+  const blockingInvalid = invalid.filter((row) => {
+    const provider = (Object.keys(auxiliaryProviderFailures) as ReviewProvider[]).find((p) => row.startsWith(`${p}:`));
+    return !provider;
+  });
+  const blockingUnusableNotes = unusableNotes.filter((row) => {
+    const provider = (Object.keys(auxiliaryProviderFailures) as ReviewProvider[]).find((p) => row.startsWith(`${p}:`));
+    return !provider;
+  });
+  const canonicalByProvider = new Map([...byProvider].filter(([provider]) => !auxiliaryProviders.has(provider)));
+  const canonicalGates = [...canonicalByProvider.values()];
+  const rawCausesForBody = Object.fromEntries(
+    Object.entries(rawCauses).filter(([provider]) => !auxiliaryProviders.has(provider as ReviewProvider)),
+  ) as Partial<Record<ReviewProvider, RawCause>>;
 
-  if (!gates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
+  if (!canonicalGates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
     // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
     if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
     releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned no valid JSON; local runs as the fallback.", incoming, { validatorGeneration });
     return { ok: true };
   }
-  if (!gates.length) {
+  if (!canonicalGates.length) {
     if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
     transitionJob(jobId, (j) => {
       if (!ownsValidatorGeneration(j, validatorGeneration)) return j;
       return {
         ...j,
         status: "skipped",
-        skipReason: invalid.join("; ") || "no valid review JSON",
-        githubError: invalid.join("; ") || "no valid review JSON",
+        skipReason: blockingInvalid.join("; ") || "no valid review JSON",
+        githubError: blockingInvalid.join("; ") || "no valid review JSON",
         plan: "Did not post — no reviewer returned valid JSON.",
         updatedAt: Date.now(),
       };
     });
-    return { ok: false, error: invalid.join("; ") || "no valid review JSON" };
+    return { ok: false, error: blockingInvalid.join("; ") || "no valid review JSON" };
   }
 
   const merged = schemaMergeProviderGates(
-    [...byProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
+    [...canonicalByProvider.entries()].map(([provider, gate]) => ({ provider, gate })),
     state.settings,
   );
   // Union model coverage across providers (a file is not_cleared if any provider says so).
   // Coverage + droppedCount never affect the verdict — recorded for the ops comment only.
   const coverageByFile = new Map<string, { file: string; status: "cleared" | "not_cleared"; reason: string }>();
-  for (const g of gates) {
+  for (const g of canonicalGates) {
     for (const c of g.coverage ?? []) {
       const prev = coverageByFile.get(c.file);
       if (!prev || (prev.status === "cleared" && c.status === "not_cleared")) coverageByFile.set(c.file, c);
@@ -1411,7 +1442,7 @@ export async function submitHarborChat(
   // Verbatim reply(ies) from any leg whose JSON could not be parsed — surfaced in the review body so
   // the fixing agent can act instead of the job pending forever. Every leg's salvaged reply is
   // combined, a verifier's included: no review is silently discarded.
-  const salvaged = salvagedReview([...byProvider].map(([provider, g]) => ({ provider, rawReview: g.rawReview })), MAX_RAW_REVIEW_BODY);
+  const salvaged = salvagedReview([...canonicalByProvider].map(([provider, g]) => ({ provider, rawReview: g.rawReview })), MAX_RAW_REVIEW_BODY);
   const rawReview = salvaged?.text;
   // The legs the block holds only in part: the outcome, header and note describe the block as posted.
   const rawTruncated = salvaged?.truncated.length ? salvaged.truncated : undefined;
@@ -1422,16 +1453,25 @@ export async function submitHarborChat(
   const verifying = Boolean(job.localVerifyStartedAt) && !job.localFallbackAt;
   const localVerified = verifying ? structured.includes("local") : undefined;
   const nextAssumptions = [
-    skipped.length ? skippedNote(skipped) : "",
-    ...invalid,
-    ...unusableNotes,
+    blockingSkipped.length ? skippedNote(blockingSkipped) : "",
+    ...blockingInvalid,
+    ...blockingUnusableNotes,
     ...merged.assumptions,
   ].filter(Boolean);
   // merged.findings is already publish-gated (gateLiveSubmission applies the poster's partition with
   // the same settings), so this count is the one the posted body renders.
   // Skipped reviewers come from provider state (`skipped`), never from the merged assumptions, which
   // also carry the reviewers' own free-form text.
-  const outcome = reviewOutcome({ ...job, rawReview, rawCauses, rawTruncated, localVerified, assumptions: nextAssumptions, skippedProviders: skipped, incompleteProviders }, merged.findings.length);
+  const outcome = reviewOutcome({
+    ...job,
+    rawReview,
+    rawCauses: rawCausesForBody,
+    rawTruncated,
+    localVerified,
+    assumptions: nextAssumptions,
+    skippedProviders: blockingSkipped,
+    incompleteProviders,
+  }, merged.findings.length);
   // Credit only the chat reviewers that produced the clean structured result (pinned when the
   // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
   const cleanChat = job.localVerifyChat ?? structured.filter(isChatProvider);
@@ -1451,8 +1491,8 @@ export async function submitHarborChat(
     merged.findings.length === 0 &&
     Boolean(rawReview) &&
     !structured.some(isChatProvider) &&
-    Object.entries(rawCauses).some(([p]) => isChatProvider(p as ReviewProvider)) &&
-    Object.entries(rawCauses).filter(([p]) => isChatProvider(p as ReviewProvider)).every(([, c]) => c === "unparseable");
+    Object.entries(rawCausesForBody).some(([p]) => isChatProvider(p as ReviewProvider)) &&
+    Object.entries(rawCausesForBody).filter(([p]) => isChatProvider(p as ReviewProvider)).every(([, c]) => c === "unparseable");
   if (
     chatSalvageOnly &&
     releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })
@@ -1471,11 +1511,11 @@ export async function submitHarborChat(
   const localError =
     localUnusable ||
     (job.assumptions ?? []).find((a) => /^Skipped local/i.test(a))?.replace(/^Skipped local\s*\(?/i, "").replace(/\)$/, "") ||
-    invalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
-    (byProvider.get("local")?.rawReview ? "not review JSON" : undefined);
+    blockingInvalid.find((s) => s.startsWith("local:"))?.slice("local:".length).trim() ||
+    (canonicalByProvider.get("local")?.rawReview ? "not review JSON" : undefined);
   // Each merged reviewer's accepted finding count: the note credits findings to the leg that reported them.
-  const findingsBy: Partial<Record<ReviewProvider, number>> = Object.fromEntries([...byProvider].map(([p, g]) => [p, g.findings.length]));
-  const rawBy = [...byProvider].filter(([, g]) => g.rawReview).map(([p]) => p);
+  const findingsBy: Partial<Record<ReviewProvider, number>> = Object.fromEntries([...canonicalByProvider].map(([p, g]) => [p, g.findings.length]));
+  const rawBy = [...canonicalByProvider].filter(([, g]) => g.rawReview).map(([p]) => p);
   const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified, rawBy, rawTruncated });
   if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
   let stamped = false;
@@ -1489,16 +1529,18 @@ export async function submitHarborChat(
       mergeRecommendation: merged.mergeRecommendation,
       highestRisk: merged.highestRisk,
       rawReview,
-      rawCauses: rawReview ? rawCauses : undefined,
+      rawCauses: rawReview ? rawCausesForBody : undefined,
       rawTruncated,
       rawLegs,
       investigatedSafe: merged.investigatedSafe,
       assumptions: nextAssumptions,
-      skippedProviders: skipped,
+      skippedProviders: blockingSkipped,
       incompleteProviders,
+      canonicalProvider,
+      auxiliaryProviderFailures: Object.keys(auxiliaryProviderFailures).length ? auxiliaryProviderFailures : undefined,
       coverage: [...coverageByFile.values()],
-      droppedCount: gates.reduce((n, g) => n + g.dropped.length, 0),
-      plan: `Schema-merged ${[...byProvider.keys()].join(" + ")}.`,
+      droppedCount: canonicalGates.reduce((n, g) => n + g.dropped.length, 0),
+      plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}.`,
       localVerifyNote: localVerifyNote || undefined,
       localVerified,
       updatedAt: Date.now(),

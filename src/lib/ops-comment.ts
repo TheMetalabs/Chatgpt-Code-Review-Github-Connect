@@ -1,4 +1,4 @@
-import { describeEnabledReviewers, type Job, type LocalReviewRole, type ReviewProvider, type Trigger } from "./types.ts";
+import { describeEnabledReviewers, PROVIDER_LABEL, type AuxiliaryProviderFailure, type Job, type LocalReviewRole, type ReviewProvider, type Trigger } from "./types.ts";
 
 export type OpsPhase = "running" | "blocked" | "posted" | "skipped" | "failed";
 
@@ -10,6 +10,8 @@ export type OpsCommentInput = {
   /** The job released local as the chat-down fallback (Job.localFallbackAt): it reads "local runs as
    * the fallback" whatever the role, never that it verifies a clean result. */
   localFallback?: boolean;
+  canonicalProvider?: ReviewProvider;
+  auxiliaryProviderFailures?: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>>;
   notes: string[];
 };
 
@@ -38,7 +40,13 @@ export function buildOpsComment(input: OpsCommentInput): string {
           : input.phase === "failed"
             ? "failed"
             : "running";
-  const notes = input.notes.map((n) => n.replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8);
+  const auxiliary = Object.entries(input.auxiliaryProviderFailures ?? {})
+    .filter((row): row is [ReviewProvider, AuxiliaryProviderFailure] => Object.hasOwn(PROVIDER_LABEL, row[0]))
+    .map(([provider, reason]) => `${PROVIDER_LABEL[provider]} (${reason})`);
+  const providerNote = auxiliary.length
+    ? `Canonical ${PROVIDER_LABEL[input.canonicalProvider ?? input.providers.find((p) => p !== "local") ?? input.providers[0] ?? "chatgpt"]} verdict retained; auxiliary reviewer failure: ${auxiliary.join(", ")}.`
+    : "";
+  const notes = [providerNote, ...input.notes].map((n) => n.replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8);
   const noteLines = notes.length ? notes.map((n) => `- ${n}`).join("\n") : "- No blockers. Failures are skipped; remaining reviewers continue.";
   return `${OPS_COMMENT_MARK}
 

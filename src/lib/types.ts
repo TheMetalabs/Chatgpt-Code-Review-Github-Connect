@@ -175,6 +175,10 @@ export interface Job {
    * by that merge. Their replies post as evidence; none of them may leave the result clean
    * (review-outcome.ts). */
   incompleteProviders?: ReviewProvider[];
+  /** The canonical provider whose structured verdict/coverage is retained for this merge. */
+  canonicalProvider?: ReviewProvider;
+  /** Auxiliary chat reviewers that failed without blocking a complete canonical verdict. */
+  auxiliaryProviderFailures?: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>>;
   fpProviders?: ReviewProvider[];
   chatFpRound?: boolean;
   fpPending?: {
@@ -524,6 +528,7 @@ export type LocalReviewRole = "race" | "verify-clean";
  * findings past its row cap aside unread; `not-a-verdict` — a released held local reply the gate
  * could not use in full (docs/local-verify-clean.md §1). */
 export type RawCause = "unparseable" | "unread-rows" | "not-a-verdict";
+export type AuxiliaryProviderFailure = RawCause | "skipped";
 
 /** One salvaged leg's place in Job.rawReview: its piece ends at `end` (exclusive). */
 export type RawLeg = { provider: ReviewProvider; end: number };

@@ -77,6 +77,24 @@ describe("reviewPostedNotes", () => {
     assert.deepEqual(reviewPostedNotes({ headSha: "abcdef012345" }, 0), ["Reviewed abcdef0"]);
   });
 
+  it("reports an auxiliary reviewer failure while retaining the canonical provider", () => {
+    const body = buildOpsComment({
+      phase: "posted",
+      providers: ["chatgpt", "grok"],
+      canonicalProvider: "chatgpt",
+      auxiliaryProviderFailures: { grok: "unparseable" },
+      notes: ["Review posted."],
+    });
+    assert.match(body, /Canonical ChatGPT verdict retained; auxiliary reviewer failure: Grok \(unparseable\)/);
+    const notes = reviewPostedNotes(
+      {
+        headSha: "abcdef012345",
+      },
+      0,
+    );
+    assert.deepEqual(notes, ["Reviewed abcdef0"]);
+  });
+
   // #77 job 989: the merge gate (cc_merge.py COVERAGE_RE) saw ~7 of 42 not_cleared files and a cut
   // last name («packag») because every note was cut to 200 chars.
   it("keeps a 42-file not_cleared line whole and still caps every other note", () => {

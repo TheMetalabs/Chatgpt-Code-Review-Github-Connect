@@ -1376,21 +1376,19 @@ export async function submitHarborChat(
   // evidence for ops, but cannot turn a complete canonical verdict into a raw/non-clean review.
   // Local remains blocking: in verify-clean it is the explicit verification gate, and in race it
   // is an ordinary reviewer whose findings must not be hidden.
-  const canonicalProvider = providers.find(isChatProvider) ?? providers[0];
+  // The first enabled chat leg is the canonical verdict. Local-only jobs have no canonical chat
+  // provider; an auxiliary chat must never become canonical merely because ChatGPT did not answer.
+  const canonicalProvider = providers.find(isChatProvider);
   const auxiliaryProviderFailures: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>> = {};
   const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(canonicalProvider && provider !== canonicalProvider && isChatProvider(provider));
   const payloadProviders = [...new Set(payloads.map((l) => l.provider))];
-  const payloadByProvider = new Map(payloads.map((leg) => [leg.provider, leg]));
   const incompletePayloadProviders = payloadProviders.filter((p) => !complete.has(p));
   for (const provider of incompletePayloadProviders) {
-    // A prose salvage carries no gated findings and can be reported out-of-band. Schema-rejected
-    // replies may hide a real finding, so they remain blocking evidence until a human/repair path
-    // resolves them. Skipped providers likewise stay blocking and retain the existing contract.
-    if (
-      isAuxiliaryChat(provider) &&
-      rawCauses[provider] === "unparseable" &&
-      !rawEvidenceHasFinding(payloadByProvider.get(provider)?.raw ?? "")
-    ) {
+    // An auxiliary reply that never became review JSON is out-of-band evidence. A malformed text
+    // fragment can contain severity-looking prose (or a partial finding object); that marker is not
+    // a gated finding and must not poison a complete canonical verdict. Valid structured findings
+    // remain in `byProvider` and are merged below.
+    if (isAuxiliaryChat(provider) && rawCauses[provider] === "unparseable") {
       auxiliaryProviderFailures[provider] = "unparseable";
     }
   }
@@ -1406,6 +1404,12 @@ export async function submitHarborChat(
     return !provider;
   });
   const canonicalByProvider = new Map([...byProvider].filter(([provider]) => !auxiliaryProviders.has(provider)));
+  // Keep valid auxiliary findings visible, but a clean auxiliary result cannot stand in for an
+  // unanswered canonical chat leg. This stamp makes the published outcome incomplete (and keeps
+  // CONVERGED false) until the canonical provider has answered for this exact job/head.
+  if (canonicalProvider && !complete.has(canonicalProvider) && !incompleteProviders.includes(canonicalProvider)) {
+    incompleteProviders.push(canonicalProvider);
+  }
   const canonicalGates = [...canonicalByProvider.values()];
   const rawCausesForBody = Object.fromEntries(
     Object.entries(rawCauses).filter(([provider]) => !auxiliaryProviders.has(provider as ReviewProvider)),
@@ -1563,15 +1567,6 @@ export async function submitHarborChat(
   if (!stamped) return { ok: false, error: "stale validator" };
   await finishJob(jobId, sample, token);
   return finishResult(jobId);
-}
-
-/** A malformed auxiliary reply is safe to report out-of-band only when it is plainly prose. A
- * severity marker or a finding-shaped object may contain a real finding, so it stays blocking
- * evidence even when the review envelope itself cannot be parsed. */
-function rawEvidenceHasFinding(raw: string): boolean {
-  const text = String(raw || "").replace(/\\"/g, '"');
-  if (/\bP[0-2]\b/.test(text)) return true;
-  return /["']findings["']\s*:\s*\[\s*\{/.test(text);
 }
 
 /** Gate one reviewer leg and decide its complete-verdict state (docs/local-verify-clean.md §1). Every

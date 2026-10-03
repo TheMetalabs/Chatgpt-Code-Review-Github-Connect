@@ -1398,8 +1398,8 @@ export async function submitHarborChat(
     const provider = (Object.keys(auxiliaryProviderFailures) as ReviewProvider[]).find((p) => row.startsWith(`${p}:`));
     return !provider;
   });
-  const canonicalGates = gates.filter((gate) => !auxiliaryProviders.has(gate.provider));
   const canonicalByProvider = new Map([...byProvider].filter(([provider]) => !auxiliaryProviders.has(provider)));
+  const canonicalGates = [...canonicalByProvider.values()];
   const rawCausesForBody = Object.fromEntries(
     Object.entries(rawCauses).filter(([provider]) => !auxiliaryProviders.has(provider as ReviewProvider)),
   ) as Partial<Record<ReviewProvider, RawCause>>;

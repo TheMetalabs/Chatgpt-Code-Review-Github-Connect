@@ -317,6 +317,10 @@ function grokReplyDoneVisible(root) {
   const isReasoningLine = line => /^(?:analyzing\b|thinking\b|reasoning\b|분석 중\b|생각 중\b|추론 중\b|thought\s+for\s+\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|mins?|minutes?)\b)/i.test(line);
   if (reasoningLines.length > 1 && reasoningLines.every(isReasoningLine)) return false;
   if (!text) return false;
+  // Copy/feedback controls can mount before a streamed JSON answer is complete. An incomplete
+  // reply is eligible for repair only after this submission recorded its own stream and the
+  // stream controls disappeared; a pre-stream Copy must keep polling for the final answer.
+  if (incomplete && !grokSawCurrentStream(root)) return false;
   const action = /^(?:copy response|copy|like|dislike|more actions|응답 복사|복사|좋아요|싫어요|더 보기|더보기|신고)$/i;
   for (const el of root.querySelectorAll("button, [role='button']")) {
     if (el.closest("pre, code, .chat-code-block")) continue;

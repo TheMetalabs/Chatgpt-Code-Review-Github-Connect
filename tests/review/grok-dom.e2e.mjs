@@ -186,14 +186,18 @@ test('grok sends an unclosed string to repair after the stream ends, but waits w
      <button aria-label="Copy response" style="width:64px;height:32px">copy</button></div>
  </main>${COMPOSER}`);
  const out = await page.evaluate((strip) => {
+   const record = {phase: 'sent', expected: 'review', baseline: 0, submittedUsers: 1, messageId: 'user-A'};
+   globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok', confirmedSubmission: {key: 'ashlar:submission:job:run', record}};
+   sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify(record));
    const before = replyDoneVisible();
    document.querySelector('form').insertAdjacentHTML('afterbegin', strip);
    const streaming = replyDoneVisible();
+   noteSawStream(record, {stop: true, streaming: true});
    document.getElementById('grok-strip').remove();
    const after = replyDoneVisible();
    return {before, streaming, after};
  }, grokStrip());
- assert.deepEqual(out, {before: true, streaming: false, after: true});
+ assert.deepEqual(out, {before: false, streaming: false, after: true});
 });
 
 test('grok accepts a finished one-line answer that starts with Analyzing', async t => {

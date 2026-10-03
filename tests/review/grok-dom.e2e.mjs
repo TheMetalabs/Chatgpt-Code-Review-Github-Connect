@@ -158,6 +158,18 @@ test('grok reasoning controls do not finish a turn before the final answer mount
  assert.deepEqual(out, {before: false, after: true});
 });
 
+test('grok keeps polling a reasoning transcript whose elapsed label has an action row', async t => {
+  const page = await openGrok(t, `<main>
+    <div data-testid="user-message" id="response-user-A" role="article">review</div>
+    <div id="answer"><div data-testid="assistant-message" id="response-answer-A" role="article">
+      <p>Analyzing the changed files</p><p>Analyzing persisted state</p><p>Worked for 6m 10s</p>
+      <button aria-label="Copy response" style="width:64px;height:32px">copy</button>
+    </div></div>
+  </main>${COMPOSER}`);
+  const observed = await page.evaluate(() => ({done: replyDoneVisible(), text: currentAssistantRoot()?.innerText}));
+  assert.deepEqual(observed, {done: false, text: 'Analyzing the changed files\n\nAnalyzing persisted state\n\nWorked for 6m 10s\n\ncopy'});
+});
+
 test('grok keeps polling a truncated structured answer despite Copy', async t => {
  const partial = '{\"merge_recommendation\":\"REQUEST_CHANGES\",\"findings\":[{\"severity\":\"P1\"';
  const page = await openGrok(t, `<main>

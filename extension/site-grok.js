@@ -300,6 +300,17 @@ function grokStructuredReplyIncomplete(text) {
   return quoted || stack.length > 0;
 }
 
+/** Grok can expose the reasoning transcript's action row before mounting the final answer. The
+ * transcript is not review evidence when every line is a progress marker or the elapsed-time label
+ * that follows it (for example `6m 10s동안 작업함`). Keep observing that turn until a substantive
+ * answer appears; a single final answer that happens to start with "Analyzing" remains valid. */
+function grokReasoningOnly(lines) {
+  if (lines.length < 2) return false;
+  const elapsed = line => /^(?:\d+\s*m(?:in(?:ute)?s?)?\s+\d+\s*s(?:ec(?:ond)?s?)?\s*(?:동안\s*작업함|worked\s+for)|worked\s+for\s+\d+\s*m(?:in(?:ute)?s?)?\s+\d+\s*s(?:ec(?:ond)?s?)?)$/i.test(line);
+  const reasoning = line => /^(?:analyzing|thinking|reasoning|분석 중|생각 중|추론 중|thought\s+for\b)/i.test(line);
+  return lines.some(elapsed) && lines.every(line => elapsed(line) || reasoning(line));
+}
+
 /** Never while the composer shows a stream. Then answer actions, or, once this submission's poll
  * recorded a stream, the composer idle again with text in the bubble. A page opened after completion
  * still finishes from the action row, with no stream mark. */
@@ -313,15 +324,15 @@ function grokReplyDoneVisible(root) {
   // the final answer. Those controls are not completion evidence: a transcript containing only
   // "Analyzing …" lines and the elapsed-time label must keep polling for the late answer.
   const incomplete = grokStructuredReplyIncomplete(text);
-  const reasoningLines = text.split(/\r?\n/).map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const action = /^(?:copy response|copy|like|dislike|more actions|응답 복사|복사|좋아요|싫어요|더 보기|더보기|신고)$/i;
+  const reasoningLines = text.split(/\r?\n/).map(line => line.replace(/\s+/g, " ").trim()).filter(line => line && !action.test(line));
   const isReasoningLine = line => /^(?:analyzing\b|thinking\b|reasoning\b|분석 중\b|생각 중\b|추론 중\b|thought\s+for\s+\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|mins?|minutes?)\b)/i.test(line);
-  if (reasoningLines.length > 1 && reasoningLines.every(isReasoningLine)) return false;
+  if (grokReasoningOnly(reasoningLines) || (reasoningLines.length > 1 && reasoningLines.every(isReasoningLine))) return false;
   if (!text) return false;
   // Copy/feedback controls can mount before a streamed JSON answer is complete. An incomplete
   // reply is eligible for repair only after this submission recorded its own stream and the
   // stream controls disappeared; a pre-stream Copy must keep polling for the final answer.
   if (incomplete && !grokSawCurrentStream(root)) return false;
-  const action = /^(?:copy response|copy|like|dislike|more actions|응답 복사|복사|좋아요|싫어요|더 보기|더보기|신고)$/i;
   for (const el of root.querySelectorAll("button, [role='button']")) {
     if (el.closest("pre, code, .chat-code-block")) continue;
     const label = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();

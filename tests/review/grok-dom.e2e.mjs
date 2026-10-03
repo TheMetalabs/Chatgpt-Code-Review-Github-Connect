@@ -158,6 +158,24 @@ test('grok reasoning controls do not finish a turn before the final answer mount
  assert.deepEqual(out, {before: false, after: true});
 });
 
+test('grok keeps polling a truncated structured answer despite Copy', async t => {
+ const partial = '{\"merge_recommendation\":\"REQUEST_CHANGES\",\"findings\":[{\"severity\":\"P1\"';
+ const page = await openGrok(t, `<main>
+   <div data-testid="user-message" id="response-user-A" role="article">review</div>
+   <div id="answer"><div data-testid="assistant-message" id="response-answer-A" role="article"><p>${partial}</p></div>
+     <button aria-label="Copy response" style="width:64px;height:32px">copy</button></div>
+ </main>${COMPOSER}`);
+ const out = await page.evaluate(({partial, answer}) => {
+   const record = {phase: 'sent', expected: 'review', baseline: 0, submittedUsers: 1, messageId: 'user-A', sawStream: true, sawStreamKey: 'user-A'};
+   globalThis.__ashlarRunnerState = {jobId: 'job', runId: 'run', provider: 'grok', confirmedSubmission: {key: 'ashlar:submission:job:run', record}};
+   sessionStorage.setItem('ashlar:submission:job:run', JSON.stringify(record));
+   const before = replyDoneVisible();
+   document.querySelector('[data-testid="assistant-message"] p').textContent = answer;
+   return {before, after: replyDoneVisible()};
+ }, {partial, answer: partial + ']}' });
+ assert.deepEqual(out, {before: false, after: true});
+});
+
 test('grok accepts a finished one-line answer that starts with Analyzing', async t => {
  const page = await openGrok(t, `<main>
    <div data-testid="user-message" id="response-user-A" role="article">review</div>

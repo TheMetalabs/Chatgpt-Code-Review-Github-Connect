@@ -1380,12 +1380,19 @@ export async function submitHarborChat(
   const auxiliaryProviderFailures: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>> = {};
   const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(canonicalProvider && provider !== canonicalProvider && isChatProvider(provider));
   const payloadProviders = [...new Set(payloads.map((l) => l.provider))];
+  const payloadByProvider = new Map(payloads.map((leg) => [leg.provider, leg]));
   const incompletePayloadProviders = payloadProviders.filter((p) => !complete.has(p));
   for (const provider of incompletePayloadProviders) {
     // A prose salvage carries no gated findings and can be reported out-of-band. Schema-rejected
     // replies may hide a real finding, so they remain blocking evidence until a human/repair path
     // resolves them. Skipped providers likewise stay blocking and retain the existing contract.
-    if (isAuxiliaryChat(provider) && rawCauses[provider] === "unparseable") auxiliaryProviderFailures[provider] = "unparseable";
+    if (
+      isAuxiliaryChat(provider) &&
+      rawCauses[provider] === "unparseable" &&
+      !rawEvidenceHasFinding(payloadByProvider.get(provider)?.raw ?? "")
+    ) {
+      auxiliaryProviderFailures[provider] = "unparseable";
+    }
   }
   const auxiliaryProviders = new Set(Object.keys(auxiliaryProviderFailures) as ReviewProvider[]);
   const incompleteProviders = incompletePayloadProviders.filter((p) => !auxiliaryProviders.has(p));
@@ -1403,10 +1410,16 @@ export async function submitHarborChat(
   const rawCausesForBody = Object.fromEntries(
     Object.entries(rawCauses).filter(([provider]) => !auxiliaryProviders.has(provider as ReviewProvider)),
   ) as Partial<Record<ReviewProvider, RawCause>>;
+  const auxiliaryFailures = Object.keys(auxiliaryProviderFailures).length ? auxiliaryProviderFailures : undefined;
 
   if (!canonicalGates.length && releaseLocalAsFallback({ role, providers, localReleased, chatRacing: false, usableChat: false })) {
     // verify-clean, chat returned no valid JSON: local runs as today's fallback instead of a skip.
     if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
+    if (auxiliaryFailures) {
+      transitionJob(jobId, (j) => ownsValidatorGeneration(j, validatorGeneration)
+        ? { ...j, auxiliaryProviderFailures: auxiliaryFailures, updatedAt: Date.now() }
+        : j);
+    }
     releaseHeldLocal(jobId, token, { kind: "fallback" }, "Chat reviewers returned no valid JSON; local runs as the fallback.", incoming, { validatorGeneration });
     return { ok: true };
   }
@@ -1420,6 +1433,7 @@ export async function submitHarborChat(
         skipReason: blockingInvalid.join("; ") || "no valid review JSON",
         githubError: blockingInvalid.join("; ") || "no valid review JSON",
         plan: "Did not post — no reviewer returned valid JSON.",
+        auxiliaryProviderFailures: auxiliaryFailures,
         updatedAt: Date.now(),
       };
     });
@@ -1537,7 +1551,7 @@ export async function submitHarborChat(
       skippedProviders: blockingSkipped,
       incompleteProviders,
       canonicalProvider,
-      auxiliaryProviderFailures: Object.keys(auxiliaryProviderFailures).length ? auxiliaryProviderFailures : undefined,
+      auxiliaryProviderFailures: auxiliaryFailures,
       coverage: [...coverageByFile.values()],
       droppedCount: canonicalGates.reduce((n, g) => n + g.dropped.length, 0),
       plan: `Schema-merged ${[...canonicalByProvider.keys()].join(" + ")}${auxiliaryProviders.size ? `; auxiliary failures: ${[...auxiliaryProviders].join(" + ")}` : ""}.`,
@@ -1549,6 +1563,15 @@ export async function submitHarborChat(
   if (!stamped) return { ok: false, error: "stale validator" };
   await finishJob(jobId, sample, token);
   return finishResult(jobId);
+}
+
+/** A malformed auxiliary reply is safe to report out-of-band only when it is plainly prose. A
+ * severity marker or a finding-shaped object may contain a real finding, so it stays blocking
+ * evidence even when the review envelope itself cannot be parsed. */
+function rawEvidenceHasFinding(raw: string): boolean {
+  const text = String(raw || "").replace(/\\"/g, '"');
+  if (/\bP[0-2]\b/.test(text)) return true;
+  return /["']findings["']\s*:\s*\[\s*\{/.test(text);
 }
 
 /** Gate one reviewer leg and decide its complete-verdict state (docs/local-verify-clean.md §1). Every

@@ -481,10 +481,10 @@ test('verify-clean outcome: a late chat finding during the verification round is
 });
 
 // The same late Grok run, but its reply is not a verdict (the bridge salvages it, or the gate rejects
-// it beside clean ChatGPT) while local verification fails. Plain prose is auxiliary; a malformed
-// payload carrying a severity marker remains blocking evidence. Local's own failure remains blocking.
+// it beside clean ChatGPT) while local verification fails. Every malformed auxiliary reply is
+// out-of-band evidence, even when its text contains severity markers. Local's own failure remains blocking.
 const LATE_GROK={
-  malformed:{reply:JSON.stringify({findings:[{...partial,title:'GROK-RAW duplicate write'}],merge_recommendation:'REQUEST_CHANGES'}),cause:'unparseable',blocking:true},
+  malformed:{reply:JSON.stringify({findings:[{...partial,title:'GROK-RAW duplicate write'}],merge_recommendation:'REQUEST_CHANGES'}),cause:'unparseable'},
   rejected:{reply:'{"findings":"GROK-RAW not a list"}',cause:'unparseable'},
   emptyWithoutSafe:{reply:'{"findings":[],"merge_recommendation":"APPROVE","highest_risk":"GROK-RAW instant"}',cause:'not-a-verdict'},
 };
@@ -506,7 +506,7 @@ for(const [name,grok] of Object.entries(LATE_GROK)){
     await eventually(()=>app.reviews.length===1,'the review was not posted');
     const body=app.reviews[0].body;
     const raw=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
-    if(grok.cause==='unparseable'&&!grok.blocking){
+    if(grok.cause==='unparseable'){
       assert.doesNotMatch(raw,/GROK-RAW/,'auxiliary Grok prose is not copied into the public raw block');
       assert.equal(raw,'','no blocking raw reply was returned by the failed local verification');
       assert.deepEqual({...job().rawCauses??{}},{});
@@ -517,34 +517,32 @@ for(const [name,grok] of Object.entries(LATE_GROK)){
       assert.deepEqual({...job().rawCauses},{grok:grok.cause});
     }
     assert.equal(job().localVerified,false);
-    if(grok.cause==='unparseable'&&!grok.blocking){
+    if(grok.cause==='unparseable'){
       assert.equal(body.split('\n')[0],UNVERIFIED_CLEAN_REVIEW_BODY,'the canonical verdict is explicitly unverified');
       assert.match(body,/ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1/);
     }else{
       assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MR,'schema-rejected evidence remains non-clean');
     }
     assert.equal(converged(body),false);
-    if(grok.cause==='unparseable'&&!grok.blocking) assert.doesNotMatch(body,/Local verification reply posted verbatim|ashlar-raw:start/);
+    if(grok.cause==='unparseable') assert.doesNotMatch(body,/Local verification reply posted verbatim|ashlar-raw:start/);
     const note=job().localVerifyNote;
-    if(grok.cause==='unparseable'&&!grok.blocking) assert.match(note,/^chatgpt found nothing; local verification did not complete \(local LLM HTTP 500[^)]*\), so this is chatgpt's unverified clean result\.$/);
+    if(grok.cause==='unparseable') assert.match(note,/^chatgpt found nothing; local verification did not complete \(local LLM HTTP 500[^)]*\), so this is chatgpt's unverified clean result\.$/);
     else assert.match(note,/grok's reply could not be used as a review and is posted verbatim below/);
     assert.ok(body.includes(`\n${note}\n`),'the body carries the note');
     const handoff=notCleanDetail(job(),postedOutcome(job(),0));
-    if(grok.cause==='unparseable'&&!grok.blocking){
+    if(grok.cause==='unparseable'){
       assert.doesNotMatch(handoff,/posted verbatim/,'no raw evidence was posted');
       assert.match(handoff,/local verification did not complete/);
     }else assert.match(handoff,/^posted verbatim:/);
   });
 }
 
-// The public raw block is held under GitHub's body limit per blocking reply. A late auxiliary Grok
-// reply longer than the whole limit is retained in history/ops, while local evidence remains public.
+// A late auxiliary Grok reply longer than the whole limit is retained in history/ops, while local
+// evidence remains public. Auxiliary malformed raw is never allowed to crowd out local evidence.
 const LONG_GROK=`P1 a.ts:1 GROK-RAW ${'g'.repeat(70_000)} GROK-END`;
 const TRUNCATED_LOCAL={
-  // local's reply is short: it keeps its whole reply, so the block is local verification's reply
-  short:{reply:LOCAL_RAW,marker:MRU,localInFull:true},
-  // local's reply is long too: both are cut to equal shares, so the block holds neither in full
-  long:{reply:`${LOCAL_RAW} ${'l'.repeat(40_000)} LOCAL-END`,marker:MR,localInFull:false},
+  short:{reply:LOCAL_RAW},
+  long:{reply:`${LOCAL_RAW} ${'l'.repeat(40_000)} LOCAL-END`},
 };
 for(const [name,local] of Object.entries(TRUNCATED_LOCAL)){
   test(`verify-clean outcome: a late grok reply over the body limit never crowds out a ${name} local verification reply, and the body says what it holds`,async t=>{
@@ -564,21 +562,21 @@ for(const [name,local] of Object.entries(TRUNCATED_LOCAL)){
     await eventually(()=>{while(answered<app.localResponses.length)app.localResponses[answered++].end(envelope(local.reply));return app.reviews.length===1;},'the review was not posted');
     const body=app.reviews[0].body;
     const raw=body.slice(body.indexOf(REVIEW_RAW_START),body.indexOf(REVIEW_RAW_END));
-    assert.match(raw,/GROK-RAW|GROK-END/,'an auxiliary Grok reply carrying a severity marker remains blocking evidence');
+    assert.doesNotMatch(raw,/GROK-RAW|GROK-END/,'malformed auxiliary raw is out-of-band evidence');
     assert.ok(raw.includes('LOCAL-RAW'),'local verification\'s reply remains in the block');
-    assert.equal(raw.includes(local.reply),name==='short','the short local reply remains whole while the long pair shares the body limit');
-    assert.deepEqual({...job().auxiliaryProviderFailures},{},'actionable auxiliary evidence is not demoted');
+    assert.equal(raw.includes(local.reply),true,'the local reply remains whole when auxiliary raw is demoted');
+    assert.deepEqual({...job().auxiliaryProviderFailures},{grok:'unparseable'},'malformed auxiliary evidence is demoted');
     // where each reply ends in the block, so a body cut further names exactly whose
     const legs=job().rawLegs??[];
-    assert.deepEqual([...legs.map(l=>l.provider)],['grok','local']);
+    assert.deepEqual([...legs.map(l=>l.provider)],['local']);
     assert.equal(legs.at(-1).end,job().rawReview.length);
     assert.match(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1] ?? "",/raw=1/);
     assert.equal(converged(body),false);
     const handoff=notCleanDetail(job(),postedOutcome(job(),0));
-    assert.match(body,/Grok:/,'the actionable auxiliary provider is named in the public raw block');
+    assert.doesNotMatch(body,/Grok:/,'the auxiliary failure stays out of the public raw block');
     assert.match(body,/local verification's reply could not be used as a review/);
     assert.match(job().localVerifyNote,/local verification's reply could not be used as a review \([^)]*\)/);
-    assert.match(handoff,/posted verbatim/,'the loop handoff keeps the blocking raw state');
+    assert.match(handoff,/posted verbatim/,'the local verification evidence remains blocking');
     assert.ok(body.includes(`\n${job().localVerifyNote}\n`),'the body carries the note');
   });
 }

@@ -50,6 +50,34 @@ test('canonical ChatGPT clean stays clean beside malformed auxiliary Grok raw', 
   assert.deepEqual(job.rawCauses ?? {}, {});
 });
 
+test('bridge-salvaged schema-rejected auxiliary Grok stays blocking evidence', async (t) => {
+  const app = await appFixture({reviewLocal: false, reviewGrok: true});
+  t.after(() => app.close());
+  const out = await app.mention('auxiliary-schema-rejected-raw');
+  await eventually(() => app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId)?.status === 'awaiting_chat', 'snapshot not ready');
+  app.bridge.bridgeHeartbeat();
+  const take = app.bridge.takeNextBridgeJob('auxiliary-schema-rejected-client');
+  assert.equal(take?.jobId, out.jobId, 'bridge claims the review');
+  const rejected = JSON.stringify({
+    findings: 'GROK-RAW P1 a.ts:1 duplicate write',
+    merge_recommendation: 'REQUEST_CHANGES',
+  });
+  const result = await app.bridge.completeBridgeJob(
+    out.jobId,
+    clean,
+    [{provider: 'chatgpt', raw: clean}, {provider: 'grok', raw: rejected}],
+    take.leaseId,
+  );
+  assert.equal(result.ok, true);
+  const body = await posted(app, out);
+  const job = app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId);
+  assert.equal(body.includes(REVIEW_RAW_START), true, 'schema-rejected auxiliary reply remains evidence');
+  assert.match(body, /GROK-RAW P1 a\.ts:1 duplicate write/);
+  assert.deepEqual({...job.rawCauses}, {grok: 'not-a-verdict'});
+  assert.deepEqual(job.auxiliaryProviderFailures ?? {}, {});
+  assert.equal(job.localVerifyStartedAt, undefined);
+});
+
 test('valid auxiliary Grok findings remain visible beside a canonical ChatGPT clean', async (t) => {
   const app = await appFixture({reviewLocal: false, reviewGrok: true});
   t.after(() => app.close());

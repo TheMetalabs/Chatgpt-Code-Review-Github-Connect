@@ -57,6 +57,7 @@ import {
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { validatedSettingsPatch } from "./settings-rules";
 import { redactSalvagedReviewBody } from "./review-format";
+import { inspectReviewFormat } from "./review-json-repair";
 import {
   BRIDGE_CLAIM_MS,
   BRIDGE_CONNECTED_MS,
@@ -1587,7 +1588,21 @@ function gateLeg(
 ): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause } {
   const parsed = parseChatSubmission(leg.raw);
   const gate = gateLiveSubmission(parsed, sample, state.settings);
-  if (gate.ok && gate.rawReview) return { gate, verdict: false, cause: "unparseable" };
+  if (gate.ok && gate.rawReview) {
+    // The bridge wraps schema-rejected chat JSON in a raw_review envelope when repair is off. The
+    // envelope itself is parseable, but the original reply is still a rejected reviewer verdict:
+    // keep it as blocking evidence so an auxiliary P1 cannot disappear and start verification.
+    const original = leg.originalText?.trim();
+    if (original && !inspectReviewFormat(original, "review").ok) {
+      const source = parseChatSubmission(original);
+      if (source) {
+        const evidence = verdictEvidence(source, { ...leg, raw: original });
+        const evidenceGate = gateLiveSubmission(evidence, sample, state.settings);
+        return { gate: evidenceGate, verdict: false, unusable: "reply failed the review schema", cause: "not-a-verdict" };
+      }
+    }
+    return { gate, verdict: false, cause: "unparseable" };
+  }
   const unusable = incompleteVerdict(gate, leg);
   if (!unusable) return { gate, verdict: gate.ok };
   if (!gate.ok && !rejectedEvidence) return { gate, verdict: false };

@@ -57,6 +57,7 @@ import {
 import { loadBotSettings, saveBotSettings, sanitizeBotSettings } from "./settings.server";
 import { validatedSettingsPatch } from "./settings-rules";
 import { redactSalvagedReviewBody } from "./review-format";
+import { inspectReviewFormat } from "./review-json-repair";
 import {
   BRIDGE_CLAIM_MS,
   BRIDGE_CONNECTED_MS,
@@ -1357,10 +1358,19 @@ export async function submitHarborChat(
   // A released held local leg's rejected reply is always evidence (docs §1). Any other leg the gate
   // rejected becomes evidence once another leg passed (the merge posts, so its reply is never dropped);
   // when none did, it stays rejected, so chat with nothing usable still releases the fallback or skips.
-  const first = payloads.map((leg) => ({ leg, ...gateLeg(leg, sample, heldLocal && leg.provider === "local") }));
+  const configuredCanonicalProvider = providers.find(isChatProvider);
+  const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(configuredCanonicalProvider && provider !== configuredCanonicalProvider && isChatProvider(provider));
+  const preserveSchemaRejectedEvidence = (leg: ChatLeg) =>
+    !job.localVerifyStartedAt && !job.localFallbackAt && isAuxiliaryChat(leg.provider);
+  const first = payloads.map((leg) => ({
+    leg,
+    ...gateLeg(leg, sample, heldLocal && leg.provider === "local", preserveSchemaRejectedEvidence(leg)),
+  }));
   const posts = first.some((g) => g.gate.ok);
   for (const g of first) {
-    const { leg, gate, verdict, unusable, cause } = !g.gate.ok && posts ? { leg: g.leg, ...gateLeg(g.leg, sample, true) } : g;
+    const { leg, gate, verdict, unusable, cause } = !g.gate.ok && posts
+      ? { leg: g.leg, ...gateLeg(g.leg, sample, true, preserveSchemaRejectedEvidence(g.leg)) }
+      : g;
     if (unusable) unusableNotes.push(`${leg.provider}: ${unusable} (reply posted verbatim)`);
     if (unusable && leg.provider === "local") localUnusable = unusable;
     if (!gate.ok) {
@@ -1379,7 +1389,6 @@ export async function submitHarborChat(
   // The first enabled chat leg is normally canonical. If it is explicitly unavailable (the worker
   // recorded a skip or logged_out) and another chat leg produced a complete verdict, that verdict
   // becomes canonical for this head. A malformed/incomplete leg is never an eligible fallback.
-  const configuredCanonicalProvider = providers.find(isChatProvider);
   const completeChatProvider = providers.find((provider) => isChatProvider(provider) && complete.has(provider));
   const canonicalTransportFailure = configuredCanonicalProvider
     ? job.providerErrors?.[configuredCanonicalProvider]?.code
@@ -1399,7 +1408,6 @@ export async function submitHarborChat(
     ? completeChatProvider
     : configuredCanonicalProvider;
   const auxiliaryProviderFailures: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>> = {};
-  const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(canonicalProvider && provider !== canonicalProvider && isChatProvider(provider));
   const payloadProviders = [...new Set(payloads.map((l) => l.provider))];
   const incompletePayloadProviders = payloadProviders.filter((p) => !complete.has(p));
   for (const provider of incompletePayloadProviders) {
@@ -1610,10 +1618,25 @@ function gateLeg(
   leg: ChatLeg,
   sample: SamplePr,
   rejectedEvidence: boolean,
+  preserveSchemaRejectedEvidence = false,
 ): { gate: ReturnType<typeof gateLiveSubmission>; verdict: boolean; unusable?: string; cause?: RawCause } {
   const parsed = parseChatSubmission(leg.raw);
   const gate = gateLiveSubmission(parsed, sample, state.settings);
-  if (gate.ok && gate.rawReview) return { gate, verdict: false, cause: "unparseable" };
+  if (gate.ok && gate.rawReview) {
+    // The bridge wraps schema-rejected chat JSON in a raw_review envelope when repair is off. The
+    // envelope itself is parseable, but the original reply is still a rejected reviewer verdict:
+    // keep it as blocking evidence so an auxiliary P1 cannot disappear and start verification.
+    const original = leg.originalText?.trim();
+    if (preserveSchemaRejectedEvidence && original && !inspectReviewFormat(original, "review").ok) {
+      const source = parseChatSubmission(original);
+      if (source) {
+        const evidence = verdictEvidence(source, { ...leg, raw: original });
+        const evidenceGate = gateLiveSubmission(evidence, sample, state.settings);
+        return { gate: evidenceGate, verdict: false, unusable: "reply failed the review schema", cause: "not-a-verdict" };
+      }
+    }
+    return { gate, verdict: false, cause: "unparseable" };
+  }
   const unusable = incompleteVerdict(gate, leg);
   if (!unusable) return { gate, verdict: gate.ok };
   if (!gate.ok && !rejectedEvidence) return { gate, verdict: false };

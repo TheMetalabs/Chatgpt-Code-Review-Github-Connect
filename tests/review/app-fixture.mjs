@@ -7,6 +7,8 @@ import {stripTypeScriptTypes} from 'node:module';
 import {createServer} from 'node:http';
 import {root,types} from './load-source.mjs';
 export async function appFixture(options={}, githubOptions={}) {
+ if(!process.execArgv.includes('--experimental-vm-modules'))
+   throw new Error('appFixture requires --experimental-vm-modules (prevents leaked server handles on module-link failure)');
  const ops=[],reviews=[],localResponses=[],localRequests=[];
  const githubCalls={head:0,snapshot:0,reactions:[],timeline:[]};
  let route,webhookRoute,historyRoute;

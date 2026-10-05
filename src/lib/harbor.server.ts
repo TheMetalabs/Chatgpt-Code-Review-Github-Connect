@@ -1376,9 +1376,28 @@ export async function submitHarborChat(
   // evidence for ops, but cannot turn a complete canonical verdict into a raw/non-clean review.
   // Local remains blocking: in verify-clean it is the explicit verification gate, and in race it
   // is an ordinary reviewer whose findings must not be hidden.
-  // The first enabled chat leg is the canonical verdict. Local-only jobs have no canonical chat
-  // provider; an auxiliary chat must never become canonical merely because ChatGPT did not answer.
-  const canonicalProvider = providers.find(isChatProvider);
+  // The first enabled chat leg is normally canonical. If it is explicitly unavailable (the worker
+  // recorded a skip or logged_out) and another chat leg produced a complete verdict, that verdict
+  // becomes canonical for this head. A malformed/incomplete leg is never an eligible fallback.
+  const configuredCanonicalProvider = providers.find(isChatProvider);
+  const completeChatProvider = providers.find((provider) => isChatProvider(provider) && complete.has(provider));
+  const canonicalTransportFailure = configuredCanonicalProvider
+    ? job.providerErrors?.[configuredCanonicalProvider]?.code
+    : undefined;
+  const verifierCanRecoverTransport = Boolean(
+    completeChatProvider && providers.includes("local") && job.localReviewRole === "verify-clean" && canonicalTransportFailure,
+  );
+  const skippedWithoutTransportFailure = Boolean(
+    configuredCanonicalProvider && skipped.includes(configuredCanonicalProvider) && !canonicalTransportFailure,
+  );
+  const canonicalUnavailable = configuredCanonicalProvider
+    ? skippedWithoutTransportFailure ||
+      job.providerErrors?.[configuredCanonicalProvider]?.code === "logged_out" || verifierCanRecoverTransport
+    : false;
+  const canonicalProvider = configuredCanonicalProvider && completeChatProvider &&
+    configuredCanonicalProvider !== completeChatProvider && canonicalUnavailable
+    ? completeChatProvider
+    : configuredCanonicalProvider;
   const auxiliaryProviderFailures: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>> = {};
   const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(canonicalProvider && provider !== canonicalProvider && isChatProvider(provider));
   const payloadProviders = [...new Set(payloads.map((l) => l.provider))];
@@ -1394,7 +1413,14 @@ export async function submitHarborChat(
   }
   const auxiliaryProviders = new Set(Object.keys(auxiliaryProviderFailures) as ReviewProvider[]);
   const incompleteProviders = incompletePayloadProviders.filter((p) => !auxiliaryProviders.has(p));
-  const blockingSkipped = skipped.filter((p) => !auxiliaryProviders.has(p));
+  // A valid fallback chat verdict discharges only the configured canonical leg's absence. A
+  // missing secondary leg remains visible as incomplete, preserving the existing dual-review gate.
+  const dischargedCanonicalSkip = Boolean(
+    configuredCanonicalProvider && canonicalProvider && configuredCanonicalProvider !== canonicalProvider,
+  );
+  const blockingSkipped = skipped.filter((p) =>
+    !auxiliaryProviders.has(p) && !(dischargedCanonicalSkip && p === configuredCanonicalProvider),
+  );
   const blockingInvalid = invalid.filter((row) => {
     const provider = (Object.keys(auxiliaryProviderFailures) as ReviewProvider[]).find((p) => row.startsWith(`${p}:`));
     return !provider;
@@ -1404,9 +1430,9 @@ export async function submitHarborChat(
     return !provider;
   });
   const canonicalByProvider = new Map([...byProvider].filter(([provider]) => !auxiliaryProviders.has(provider)));
-  // Keep valid auxiliary findings visible, but a clean auxiliary result cannot stand in for an
-  // unanswered canonical chat leg. This stamp makes the published outcome incomplete (and keeps
-  // CONVERGED false) until the canonical provider has answered for this exact job/head.
+  // Keep valid auxiliary findings visible. An explicitly unavailable canonical leg is discharged
+  // above only when another chat leg supplied a complete verdict; unresolved canonical absence
+  // still stamps incomplete and can never produce a converged result.
   if (canonicalProvider && !complete.has(canonicalProvider) && !incompleteProviders.includes(canonicalProvider)) {
     incompleteProviders.push(canonicalProvider);
   }

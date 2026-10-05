@@ -101,8 +101,11 @@ Rules the table encodes:
 - A malformed **auxiliary chat** reply is recorded in review history and stamped as an
   `auxiliaryProviderFailure`, but its salvage text is out-of-band evidence and does not enter the
   public raw block. Severity-looking fragments inside malformed text are not gated findings. A
-  valid auxiliary JSON reply still contributes its gated findings to the schema merge. The canonical
-  chat provider must answer before a zero-finding result can be clean or CONVERGED.
+  valid auxiliary JSON reply still contributes its gated findings to the schema merge. If the
+  configured canonical chat provider is explicitly skipped or logged out, a complete structured
+  verdict from the other chat provider may become canonical for that head; raw, incomplete, or
+  invalid replies never qualify, and a missing secondary provider remains incomplete. A transport
+  failure may use that fallback only in `verify-clean`, where the local Cloud Verify leg must run.
 - Unread rows are one case of that rule: a chat or local leg, on race or verify-clean, whose reply
   has findings past the gate's `GATED_FINDINGS_CAP` rows (`overflow`, never inspected) is gated as
   evidence (`gateUnreadRows`), with `<provider>: N finding(s) past the gate's row cap were not

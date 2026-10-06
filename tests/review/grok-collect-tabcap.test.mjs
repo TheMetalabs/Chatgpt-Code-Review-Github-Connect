@@ -17,6 +17,17 @@ function harvest(c) {
 function stages(c) {
   return (c.context.__ashlarRunnerState?.steps?.events || []).map(e => e.stage);
 }
+/** The job is deleted after close; snapshot workerEvents from the durable save that recorded them. */
+function watchWorkerStages(b, jobId, provider) {
+  const stages = [];
+  const set = b.local.set;
+  b.local.set = async values => {
+    const events = values.pendingReviewJobs?.[jobId]?.states?.[provider]?.workerEvents;
+    if (Array.isArray(events)) stages.push(...events.map(e => e.stage));
+    return set(values);
+  };
+  return stages;
+}
 
 test('harvest collects a completed Grok answer while page timers never fire (throttled background tab)', async () => {
   const c = content('grok');
@@ -33,7 +44,7 @@ test('harvest collects a completed Grok answer while page timers never fire (thr
   const second = harvest(c);
   assert.equal(second?.ok, true, JSON.stringify(second));
   assert.equal(second.raw, raw);
-  assert.ok(stages(c).includes('response_collected'), JSON.stringify(stages(c)));
+  assert.equal(stages(c).includes('response_collected'), true, JSON.stringify(stages(c)));
   assert.equal(harvest(c)?.raw, raw, 'later harvests keep the collected result');
 });
 
@@ -64,13 +75,13 @@ test('worker harvest of a completed inactive Grok tab posts the answer and close
       : {ok: true, raw},
     api: async () => ({ok: true, active: true, accepted: true, status: 'awaiting_chat'}),
   });
+  const workerStages = watchWorkerStages(b, 'A', 'grok');
   await b.tick();
   const complete = b.calls.find(c => c.action === 'complete' && c.jobId === 'A');
   assert.equal(complete?.raw, raw);
-  assert.ok(b.local.state.pendingReviewJobs.A?.states.grok.workerEvents?.some(e => e.stage === 'response_collected')
-    || complete, 'collected via the existing bridge complete path');
+  assert.equal(workerStages.includes('response_collected'), true, 'harvest recorded response_collected in workerEvents');
   assert.deepEqual(b.closedTabs, [10]);
-  assert.ok(b.tabs.has(99), 'a grok.com tab Ashlar does not manage stays open');
+  assert.equal(b.tabs.has(99), true, 'a grok.com tab Ashlar does not manage stays open');
 });
 
 test('a Grok POSTSEND_CAP timeout closes the managed tab when the page is still Ashlar-owned', async () => {
@@ -93,10 +104,13 @@ test('a Grok POSTSEND_CAP timeout closes the managed tab when the page is still 
       : {ok: false, code: 'busy'},
     api: async () => ({ok: true, active: true, accepted: true, status: 'awaiting_chat'}),
   });
+  const workerStages = watchWorkerStages(b, 'A', 'grok');
   await b.tick(); await flush(); await b.tick();
-  assert.match(b.calls.find(c => c.action === 'failure' && c.jobId === 'A')?.error || '', /response_timeout/);
+  const failure = b.calls.find(c => c.action === 'failure' && c.jobId === 'A');
+  assert.match(failure?.error || '', /response_timeout/);
+  assert.equal(workerStages.includes('postsend_watchdog'), true, 'timeout recorded postsend_watchdog in workerEvents');
   assert.deepEqual(b.closedTabs, [10]);
-  assert.ok(b.tabs.has(99));
+  assert.equal(b.tabs.has(99), true, 'personal Grok tab stays open after the cap');
 });
 
 test('Grok tab cap queues extra jobs; completing one opens the next; personal tabs are ignored', async () => {
@@ -130,7 +144,7 @@ test('Grok tab cap queues extra jobs; completing one opens the next; personal ta
   assert.equal(await b.context.grokTabsOpen(b.local.state.pendingReviewJobs), 2);
   assert.equal(b.local.state.pendingReviewJobs.C.states.grok.tabId, undefined, 'C queued behind the cap');
   assert.equal(b.local.state.pendingReviewJobs.D.states.grok.tabId, undefined, 'D queued behind the cap');
-  assert.ok(b.tabs.has(99));
+  assert.equal(b.tabs.has(99), true, 'personal tab ignored by the cap');
   assert.equal([...b.tabs.keys()].filter(id => id !== 99).length, 2, 'no extra Grok tab opened');
   done.add('A');
   for (let i = 0; i < 8; i++) {
@@ -138,10 +152,10 @@ test('Grok tab cap queues extra jobs; completing one opens the next; personal ta
     await flush();
     if (Number.isInteger(b.local.state.pendingReviewJobs.C?.states.grok.tabId)) break;
   }
-  assert.ok(b.closedTabs.includes(10), 'completed Grok tab closed');
-  assert.ok(b.local.state.pendingReviewJobs.C.states.grok.tabId, 'queued C opened after A released a slot');
+  assert.equal(b.closedTabs.includes(10), true, 'completed Grok tab closed');
+  assert.equal(Number.isInteger(b.local.state.pendingReviewJobs.C.states.grok.tabId), true, 'queued C opened after A released a slot');
   assert.equal(b.local.state.pendingReviewJobs.D.states.grok.tabId, undefined, 'D still queued at cap 2');
-  assert.ok(b.tabs.has(99), 'personal Grok tab never closed');
+  assert.equal(b.tabs.has(99), true, 'personal Grok tab never closed');
 });
 
 test('grokTabLimit defaults to 3 and honors maxGrokTabs (1–8)', () => {

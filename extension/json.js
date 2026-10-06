@@ -787,12 +787,13 @@ function pinReviewConversationFromPoll(poll) {
 }
 
 /** Harvest (unlike the page loop's unbound fallback) only counts a completed snapshot when the
- * sent journal still binds this conversation: sent, identified, not a follow-up, and samePage
- * when a conversation was recorded at send or pinned. */
+ * sent journal is conversation-bound on this page: sent, identified, not a follow-up, not
+ * repurposed, and samePage against the conversation recorded at send or pinned. A missing
+ * conversation is not bound — pinReviewConversationFromPoll must have established one. */
 function reviewAnswerBoundHere(poll) {
-  const {bound, submission} = poll;
-  return submission?.phase === "sent" && bound?.identified && !bound.followup &&
-    (!submission.conversation || fixConversationHolds(submission));
+  const {bound, submission, runner} = poll;
+  return !runner?.tabRepurposed && submission?.phase === "sent" && bound?.identified && !bound.followup &&
+    Boolean(submission.conversation) && fixConversationHolds(submission);
 }
 
 function wakeCollector(state) {
@@ -835,7 +836,7 @@ function harvestRunningAnswer(state) {
         const persist = runner?.persistedResult;
         return persist ? Promise.resolve(persist).then(() => result, () => result) : result;
       }
-    } else { stability.hits = 0; stability.stable = ""; }
+    }
     wakeCollector(state);
     return null;
   } catch { wakeCollector(state); return null; }

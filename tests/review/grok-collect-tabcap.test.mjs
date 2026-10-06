@@ -108,6 +108,34 @@ test('harvest of a bound sent submission replies raw after persistedResult resol
   assert.equal(c.context.__ashlarRunnerState.persistedResult !== undefined, true);
 });
 
+test('a harvest success is not overwritten when the throttled collector then throws', async () => {
+  let rejectRun;
+  const c = content('grok');
+  c.context.stopButtonVisible = () => false;
+  c.context.replyDoneVisible = () => true;
+  c.context.responseStreaming = () => false;
+  c.context.sleep = () => new Promise(() => {});
+  c.context.waitForPageChange = () => new Promise(() => {});
+  c.context.runPrompt = () => new Promise((_, reject) => { rejectRun = reject; });
+  assert.equal(c.message({type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider: 'grok', prompt: 'review'})?.code, 'busy');
+  await flush();
+  sentBound(c);
+  let releasePersist;
+  c.context.chrome.storage = {session: {set: () => new Promise(resolve => { releasePersist = resolve; })}};
+  assert.equal((await harvest(c))?.code, 'busy', 'first completed snapshot is not yet stable');
+  const settling = harvest(c);
+  assert.equal(c.context.__ashlarRunnerState.result?.ok, true, 'latched before the persist reply');
+  rejectRun(Object.assign(new Error('response wait expired'), {code: 'response_timeout'}));
+  await flush();
+  releasePersist();
+  const first = await settling;
+  assert.equal(first?.ok, true, JSON.stringify(first));
+  assert.equal(first.raw, raw);
+  assert.equal(c.context.__ashlarRunnerState.result?.ok, true);
+  assert.equal(c.context.__ashlarRunnerState.result.raw, raw);
+  assert.equal((await harvest(c))?.raw, raw);
+});
+
 test('worker harvest of a completed inactive Grok tab posts the answer and closes the managed tab', async () => {
   const job = grokJob('A', 10);
   const tabs = new Map([
@@ -117,13 +145,16 @@ test('worker harvest of a completed inactive Grok tab posts the answer and close
   const b = background({
     local: storage({origin: 'http://bridge', token: 'token', pendingReviewJobs: {A: job}}),
     tabs,
-    handler: (_id, msg) => msg.type === 'ashlar-can-close'
-      ? {ok: true, canClose: true, ownership: 'owned', url: GROK, conversation: GROK}
-      : {ok: true, raw},
+    handler: (_id, msg) => {
+      if (msg.type === 'ashlar-can-close') return {ok: true, canClose: true, ownership: 'owned', url: GROK, conversation: GROK};
+      if (msg.type === 'ashlar-harvest') return {ok: true, raw};
+      return {ok: false, code: 'busy'};
+    },
     api: async () => ({ok: true, active: true, accepted: true, status: 'awaiting_chat'}),
   });
   const workerStages = watchWorkerStages(b, 'A', 'grok');
   await b.tick();
+  assert.equal(b.messages.some(m => m.id === 10 && m.type === 'ashlar-harvest'), true, 'the worker asked the tab to harvest');
   const complete = b.calls.find(c => c.action === 'complete' && c.jobId === 'A');
   assert.equal(complete?.raw, raw);
   assert.equal(workerStages.includes('response_collected'), true, 'harvest recorded response_collected in workerEvents');

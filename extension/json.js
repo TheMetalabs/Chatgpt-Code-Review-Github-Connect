@@ -795,15 +795,20 @@ function reviewAnswerBoundHere(poll) {
     (!submission.conversation || fixConversationHolds(submission));
 }
 
+function wakeCollector(state) {
+  try { state?.wakeCollector?.(); } catch { /* the in-memory wait still holds */ }
+}
+
 /** Worker-driven collection: observe the bound answer now and, on two identical completed
- * snapshots, settle it. Page timers may never resume in a hidden Grok tab. */
+ * snapshots, settle it. Page timers may never resume in a hidden Grok tab. Latch the answer
+ * before waking the collector: a resumed waitForPageChange can throw, and run().catch must not
+ * overwrite a harvest that already succeeded. */
 function harvestRunningAnswer(state) {
-  try { state.wakeCollector?.(); } catch { /* the in-memory wait still holds */ }
   if (state.kind === "fix") return null;
   if (collectedReviewRaw(state)) return state.result;
   let poll;
   try { poll = snapshotBoundResponse(); }
-  catch { return null; }
+  catch { wakeCollector(state); return null; }
   try {
     pinReviewConversationFromPoll(poll);
     const {runner, bound, stop, streaming, done} = poll;
@@ -825,13 +830,15 @@ function harvestRunningAnswer(state) {
         let ownership;
         try { ownership = tabOwnership(runner)?.ownership; } catch { ownership = undefined; }
         const result = applyCollectedAnswer(runner, poll, {text, raw: json, ownership});
-        if (!result?.ok) return null;
+        if (!result?.ok) { wakeCollector(state); return null; }
+        wakeCollector(state);
         const persist = runner?.persistedResult;
         return persist ? Promise.resolve(persist).then(() => result, () => result) : result;
       }
     } else { stability.hits = 0; stability.stable = ""; }
+    wakeCollector(state);
     return null;
-  } catch { return null; }
+  } catch { wakeCollector(state); return null; }
 }
 
 async function waitUntilReviewOrQuota(name) {
@@ -1844,9 +1851,16 @@ function installReviewRunner(name, run) {
       .then(raw => {
         if (sourceReceiptFor(state)) return; // Captured original is not parsed JSON.
         state.finishedContext = state.repairedContext || state.nativeCompletion?.context || reviewPageContext();
+        // A worker harvest can latch the answer while this loop is still parked in waitForPageChange.
+        if (collectedReviewRaw(state)) return;
         state.result = { ok: true, raw, responseText: state.responseText, completion:nativeCleanupProof(state) };
       })
       .catch(e => {
+        // Harvest already posted the answer: a later quota/timeout/DOM throw must not replace it.
+        if (collectedReviewRaw(state)) {
+          state.finishedContext ||= state.nativeCompletion?.context || reviewPageContext();
+          return;
+        }
         // A new run whose tab stopped being its fresh page before the send (throwIfStopped).
         const takenOver = e?.code === "taken_over";
         // Positive evidence, permanent (tabOwnership): a run that ended before its Send wrote no

@@ -34,7 +34,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
+import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, skippedProvider, stillRacing, verdictEvidence } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
@@ -1358,8 +1358,8 @@ export async function submitHarborChat(
   // A released held local leg's rejected reply is always evidence (docs §1). Any other leg the gate
   // rejected becomes evidence once another leg passed (the merge posts, so its reply is never dropped);
   // when none did, it stays rejected, so chat with nothing usable still releases the fallback or skips.
-  const canonicalProvider = providers.find(isChatProvider);
-  const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(canonicalProvider && provider !== canonicalProvider && isChatProvider(provider));
+  const configuredCanonicalProvider = providers.find(isChatProvider);
+  const isAuxiliaryChat = (provider: ReviewProvider) => Boolean(configuredCanonicalProvider && provider !== configuredCanonicalProvider && isChatProvider(provider));
   const preserveSchemaRejectedEvidence = (leg: ChatLeg) =>
     !job.localVerifyStartedAt && !job.localFallbackAt && isAuxiliaryChat(leg.provider);
   const first = payloads.map((leg) => ({
@@ -1386,8 +1386,49 @@ export async function submitHarborChat(
   // evidence for ops, but cannot turn a complete canonical verdict into a raw/non-clean review.
   // Local remains blocking: in verify-clean it is the explicit verification gate, and in race it
   // is an ordinary reviewer whose findings must not be hidden.
-  // The first enabled chat leg is the canonical verdict. Local-only jobs have no canonical chat
-  // provider; an auxiliary chat must never become canonical merely because ChatGPT did not answer.
+  // The first enabled chat leg is normally canonical. Promote only when the worker recorded an
+  // explicit skip/logged_out (not payload absence) and another chat leg produced a complete verdict.
+  // A malformed/incomplete leg is never an eligible fallback. A transport failure may promote only
+  // in verify-clean after the local verifier returned a structured clean result. While that local
+  // leg has not finished, withhold the incomplete stamp so a complete fallback chat verdict can
+  // start Cloud Verify. After a non-clean or failed local result, stamp the configured canonical
+  // provider incomplete and never promote.
+  const completeChatProvider = providers.find((provider) => isChatProvider(provider) && complete.has(provider));
+  const canonicalErrorCode = configuredCanonicalProvider
+    ? job.providerErrors?.[configuredCanonicalProvider]?.code
+    : undefined;
+  const canonicalExplicitSkip = canonicalErrorCode === "quota" || canonicalErrorCode === "empty"
+    || canonicalErrorCode === "tab_closed" || canonicalErrorCode === "cancelled"
+    || canonicalErrorCode === "logged_out";
+  const canonicalTransportFailure = canonicalErrorCode === "disconnected" || canonicalErrorCode === "error";
+  const localCleanVerdict = complete.has("local") && (byProvider.get("local")?.findings.length ?? 0) === 0;
+  // Chat `disconnected` is a transient bridge wait; a local verifier error of any code (including
+  // disconnected) is a finished Cloud Verify leg. Withhold the incomplete stamp only while that
+  // leg is still in flight: no payload, no skip note, and no providerErrors.local entry.
+  const localVerifierSettled = payloads.some((l) => l.provider === "local")
+    || skippedProvider(job.assumptions, "local")
+    || Boolean(job.providerErrors?.local);
+  const verifierCanRecoverTransport = Boolean(
+    completeChatProvider &&
+    providers.includes("local") &&
+    job.localReviewRole === "verify-clean" &&
+    canonicalTransportFailure &&
+    job.localVerifyStartedAt &&
+    localCleanVerdict,
+  );
+  const pendingTransportRecovery = Boolean(
+    completeChatProvider &&
+    providers.includes("local") &&
+    job.localReviewRole === "verify-clean" &&
+    canonicalTransportFailure &&
+    !verifierCanRecoverTransport &&
+    !localVerifierSettled,
+  );
+  const canonicalUnavailable = Boolean(configuredCanonicalProvider && (canonicalExplicitSkip || verifierCanRecoverTransport));
+  const canonicalProvider = configuredCanonicalProvider && completeChatProvider &&
+    configuredCanonicalProvider !== completeChatProvider && canonicalUnavailable
+    ? completeChatProvider
+    : configuredCanonicalProvider;
   const auxiliaryProviderFailures: Partial<Record<ReviewProvider, AuxiliaryProviderFailure>> = {};
   const payloadProviders = [...new Set(payloads.map((l) => l.provider))];
   const incompletePayloadProviders = payloadProviders.filter((p) => !complete.has(p));
@@ -1402,7 +1443,14 @@ export async function submitHarborChat(
   }
   const auxiliaryProviders = new Set(Object.keys(auxiliaryProviderFailures) as ReviewProvider[]);
   const incompleteProviders = incompletePayloadProviders.filter((p) => !auxiliaryProviders.has(p));
-  const blockingSkipped = skipped.filter((p) => !auxiliaryProviders.has(p));
+  // A valid fallback chat verdict discharges only the configured canonical leg's absence. A
+  // missing secondary leg remains visible as incomplete, preserving the existing dual-review gate.
+  const dischargedCanonicalSkip = Boolean(
+    configuredCanonicalProvider && canonicalProvider && configuredCanonicalProvider !== canonicalProvider,
+  );
+  const blockingSkipped = skipped.filter((p) =>
+    !auxiliaryProviders.has(p) && !(dischargedCanonicalSkip && p === configuredCanonicalProvider),
+  );
   const blockingInvalid = invalid.filter((row) => {
     const provider = (Object.keys(auxiliaryProviderFailures) as ReviewProvider[]).find((p) => row.startsWith(`${p}:`));
     return !provider;
@@ -1412,10 +1460,15 @@ export async function submitHarborChat(
     return !provider;
   });
   const canonicalByProvider = new Map([...byProvider].filter(([provider]) => !auxiliaryProviders.has(provider)));
-  // Keep valid auxiliary findings visible, but a clean auxiliary result cannot stand in for an
-  // unanswered canonical chat leg. This stamp makes the published outcome incomplete (and keeps
-  // CONVERGED false) until the canonical provider has answered for this exact job/head.
-  if (canonicalProvider && !complete.has(canonicalProvider) && !incompleteProviders.includes(canonicalProvider)) {
+  // Keep valid auxiliary findings visible. An explicitly unavailable canonical leg is discharged
+  // above only when another chat leg supplied a complete verdict; unresolved canonical absence
+  // still stamps incomplete and can never produce a converged result.
+  if (
+    canonicalProvider &&
+    !complete.has(canonicalProvider) &&
+    !incompleteProviders.includes(canonicalProvider) &&
+    !pendingTransportRecovery
+  ) {
     incompleteProviders.push(canonicalProvider);
   }
   const canonicalGates = [...canonicalByProvider.values()];

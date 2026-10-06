@@ -114,17 +114,37 @@ test('logged-out canonical ChatGPT can be replaced by a clean structured Grok re
   assert.equal(job.canonicalProvider, 'grok');
 });
 
-test('a skipped canonical ChatGPT can be replaced by a clean structured Grok reply', async (t) => {
+test('a worker-skipped canonical ChatGPT can be replaced by a clean structured Grok reply', async (t) => {
   const app = await appFixture({reviewLocal: false, reviewGrok: true});
   t.after(() => app.close());
   const out = await app.mention('auxiliary-missing-canonical');
   await eventually(() => app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId)?.status === 'awaiting_chat', 'snapshot not ready');
+  app.bridge.bridgeHeartbeat();
+  const take = app.bridge.takeNextBridgeJob('matrix-client');
+  assert.equal(take?.jobId, out.jobId, 'the bridge claims the job');
+  assert.equal(app.bridge.failBridgeProvider(out.jobId, 'chatgpt', 'quota: usage limit reached', take.leaseId), true);
   await app.harbor.submitHarborChat(out.jobId, clean, [{provider: 'grok', raw: clean}], {force: true});
   const body = await posted(app, out);
   const job = app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId);
   assert.equal(body.split('\n')[0], CLEAN_REVIEW_BODY);
   assert.equal(job.canonicalProvider, 'grok');
   assert.equal(job.skippedProviders?.length ?? 0, 0);
+});
+
+test('a missing canonical ChatGPT payload without a worker skip stays incomplete', async (t) => {
+  const app = await appFixture({reviewLocal: false, reviewGrok: true});
+  t.after(() => app.close());
+  const out = await app.mention('auxiliary-missing-canonical');
+  await eventually(() => app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId)?.status === 'awaiting_chat', 'snapshot not ready');
+  await app.harbor.submitHarborChat(out.jobId, clean, [{provider: 'grok', raw: clean}], {force: true});
+  const job = app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId);
+  assert.equal(job.status, 'posted');
+  assert.match(app.reviews[0].body, /ashlar-outcome incomplete/);
+  assert.ok(
+    job.incompleteProviders?.includes('chatgpt') || job.skippedProviders?.includes('chatgpt'),
+    'ChatGPT stays blocking when it sent no payload and has no skip/logged_out record',
+  );
+  assert.equal(job.canonicalProvider, 'chatgpt');
 });
 
 test('logged-out ChatGPT does not make malformed Grok evidence clean', async (t) => {
@@ -159,22 +179,70 @@ test('a ChatGPT transport failure stays incomplete in race mode', async (t) => {
   assert.ok(job.incompleteProviders?.includes('chatgpt'));
 });
 
-test('a valid Grok clean can recover a ChatGPT transport failure only through local verification', async (t) => {
-  const app = await appFixture({reviewLocal: true, reviewGrok: true, localReviewRole: 'verify-clean'});
-  t.after(() => app.close());
-  app.env.ASHLAR_LOCAL_LLM_STREAM = 'false';
+async function submitGrokAfterChatgptFail(app, error) {
   const out = await app.mention('auxiliary-missing-canonical');
   const job = () => app.harbor.getHarbor().jobs.find((j) => j.id === out.jobId);
   await eventually(() => job()?.status === 'awaiting_chat', 'snapshot not ready');
   app.bridge.bridgeHeartbeat();
   const take = app.bridge.takeNextBridgeJob('matrix-client');
   assert.equal(take?.jobId, out.jobId, 'the bridge claims the job');
-  assert.equal(app.bridge.failBridgeProvider(out.jobId, 'chatgpt', 'disconnected: worker unavailable', take.leaseId), true);
+  assert.equal(app.bridge.failBridgeProvider(out.jobId, 'chatgpt', error, take.leaseId), true);
   await app.harbor.submitHarborChat(out.jobId, clean, [{provider: 'grok', raw: clean}], {force: true});
+  return {out, job};
+}
+
+test('a valid Grok clean can recover a ChatGPT transport failure only through local verification', async (t) => {
+  const app = await appFixture({reviewLocal: true, reviewGrok: true, localReviewRole: 'verify-clean'});
+  t.after(() => app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM = 'false';
+  const {out, job} = await submitGrokAfterChatgptFail(app, 'disconnected: worker unavailable');
   await eventually(() => app.localRequests.length === 1, 'Cloud Verify did not start');
+  assert.equal(app.reviews.length, 0, 'no review until local verification finishes');
+  assert.notEqual(job().canonicalProvider, 'grok', 'canonical stays ChatGPT until local confirms');
+  assert.ok(job().providerErrors?.chatgpt, 'ChatGPT remains a recorded blocking failure');
   app.localResponses[0].end(JSON.stringify({choices: [{message: {content: clean}}]}));
   await posted(app, out);
   assert.equal(job().canonicalProvider, 'grok');
   assert.equal(job().incompleteProviders?.length ?? 0, 0);
+  assert.equal(job().skippedProviders?.length ?? 0, 0);
   assert.equal(job().localVerified, true);
+});
+
+test('a verify-clean transport fallback does not promote Grok when local returns a finding', async (t) => {
+  const app = await appFixture({reviewLocal: true, reviewGrok: true, localReviewRole: 'verify-clean'});
+  t.after(() => app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM = 'false';
+  const {out, job} = await submitGrokAfterChatgptFail(app, 'disconnected: worker unavailable');
+  await eventually(() => app.localRequests.length === 1, 'Cloud Verify did not start');
+  assert.equal(app.reviews.length, 0);
+  app.localResponses[0].end(JSON.stringify({choices: [{message: {content: grokFinding}}]}));
+  await posted(app, out);
+  assert.ok(
+    !(job().canonicalProvider === 'grok' && !(job().incompleteProviders?.length)),
+    'local findings must not leave canonical Grok with empty incompleteProviders',
+  );
+  assert.ok(
+    job().canonicalProvider === 'chatgpt' || job().incompleteProviders?.includes('chatgpt') || job().skippedProviders?.includes('chatgpt'),
+    'ChatGPT stays blocking when local does not confirm a clean fallback',
+  );
+});
+
+test('a verify-clean transport fallback does not promote Grok when local errors', async (t) => {
+  const app = await appFixture({reviewLocal: true, reviewGrok: true, localReviewRole: 'verify-clean'});
+  t.after(() => app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM = 'false';
+  const {job} = await submitGrokAfterChatgptFail(app, 'disconnected: worker unavailable');
+  await eventually(() => app.localRequests.length === 1, 'Cloud Verify did not start');
+  assert.equal(app.reviews.length, 0);
+  app.localResponses[0].writeHead(500, {'content-type': 'application/json'});
+  app.localResponses[0].end('{"error":"model crashed"}');
+  await eventually(() => ['posted', 'skipped'].includes(job()?.status), 'job never finished after local error');
+  assert.ok(
+    !(job().canonicalProvider === 'grok' && !(job().incompleteProviders?.length)),
+    'a local error must not leave canonical Grok with empty incompleteProviders',
+  );
+  assert.ok(
+    job().canonicalProvider === 'chatgpt' || job().incompleteProviders?.includes('chatgpt') || job().skippedProviders?.includes('chatgpt'),
+    'ChatGPT stays blocking when local verification fails',
+  );
 });

@@ -1386,23 +1386,35 @@ export async function submitHarborChat(
   // evidence for ops, but cannot turn a complete canonical verdict into a raw/non-clean review.
   // Local remains blocking: in verify-clean it is the explicit verification gate, and in race it
   // is an ordinary reviewer whose findings must not be hidden.
-  // The first enabled chat leg is normally canonical. If it is explicitly unavailable (the worker
-  // recorded a skip or logged_out) and another chat leg produced a complete verdict, that verdict
-  // becomes canonical for this head. A malformed/incomplete leg is never an eligible fallback.
+  // The first enabled chat leg is normally canonical. Promote only when the worker recorded an
+  // explicit skip/logged_out (not payload absence) and another chat leg produced a complete verdict.
+  // A malformed/incomplete leg is never an eligible fallback. A transport failure may promote only
+  // in verify-clean after the local verifier returned a structured clean result.
   const completeChatProvider = providers.find((provider) => isChatProvider(provider) && complete.has(provider));
-  const canonicalTransportFailure = configuredCanonicalProvider
+  const canonicalErrorCode = configuredCanonicalProvider
     ? job.providerErrors?.[configuredCanonicalProvider]?.code
     : undefined;
+  const canonicalExplicitSkip = canonicalErrorCode === "quota" || canonicalErrorCode === "empty"
+    || canonicalErrorCode === "tab_closed" || canonicalErrorCode === "cancelled"
+    || canonicalErrorCode === "logged_out";
+  const canonicalTransportFailure = canonicalErrorCode === "disconnected" || canonicalErrorCode === "error";
+  const localCleanVerdict = complete.has("local") && (byProvider.get("local")?.findings.length ?? 0) === 0;
   const verifierCanRecoverTransport = Boolean(
-    completeChatProvider && providers.includes("local") && job.localReviewRole === "verify-clean" && canonicalTransportFailure,
+    completeChatProvider &&
+    providers.includes("local") &&
+    job.localReviewRole === "verify-clean" &&
+    canonicalTransportFailure &&
+    job.localVerifyStartedAt &&
+    localCleanVerdict,
   );
-  const skippedWithoutTransportFailure = Boolean(
-    configuredCanonicalProvider && skipped.includes(configuredCanonicalProvider) && !canonicalTransportFailure,
+  const pendingTransportRecovery = Boolean(
+    completeChatProvider &&
+    providers.includes("local") &&
+    job.localReviewRole === "verify-clean" &&
+    canonicalTransportFailure &&
+    !verifierCanRecoverTransport,
   );
-  const canonicalUnavailable = configuredCanonicalProvider
-    ? skippedWithoutTransportFailure ||
-      job.providerErrors?.[configuredCanonicalProvider]?.code === "logged_out" || verifierCanRecoverTransport
-    : false;
+  const canonicalUnavailable = Boolean(configuredCanonicalProvider && (canonicalExplicitSkip || verifierCanRecoverTransport));
   const canonicalProvider = configuredCanonicalProvider && completeChatProvider &&
     configuredCanonicalProvider !== completeChatProvider && canonicalUnavailable
     ? completeChatProvider
@@ -1441,7 +1453,12 @@ export async function submitHarborChat(
   // Keep valid auxiliary findings visible. An explicitly unavailable canonical leg is discharged
   // above only when another chat leg supplied a complete verdict; unresolved canonical absence
   // still stamps incomplete and can never produce a converged result.
-  if (canonicalProvider && !complete.has(canonicalProvider) && !incompleteProviders.includes(canonicalProvider)) {
+  if (
+    canonicalProvider &&
+    !complete.has(canonicalProvider) &&
+    !incompleteProviders.includes(canonicalProvider) &&
+    !pendingTransportRecovery
+  ) {
     incompleteProviders.push(canonicalProvider);
   }
   const canonicalGates = [...canonicalByProvider.values()];

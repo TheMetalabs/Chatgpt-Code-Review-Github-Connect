@@ -1402,9 +1402,12 @@ export async function submitHarborChat(
     || canonicalErrorCode === "logged_out";
   const canonicalTransportFailure = canonicalErrorCode === "disconnected" || canonicalErrorCode === "error";
   const localCleanVerdict = complete.has("local") && (byProvider.get("local")?.findings.length ?? 0) === 0;
+  // Chat `disconnected` is a transient bridge wait; a local verifier error of any code (including
+  // disconnected) is a finished Cloud Verify leg. Withhold the incomplete stamp only while that
+  // leg is still in flight: no payload, no skip note, and no providerErrors.local entry.
   const localVerifierSettled = payloads.some((l) => l.provider === "local")
     || skippedProvider(job.assumptions, "local")
-    || Boolean(job.providerErrors?.local && job.providerErrors.local.code !== "disconnected");
+    || Boolean(job.providerErrors?.local);
   const verifierCanRecoverTransport = Boolean(
     completeChatProvider &&
     providers.includes("local") &&

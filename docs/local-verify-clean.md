@@ -108,9 +108,10 @@ Rules the table encodes:
   and a missing secondary provider remains incomplete. A transport failure (`disconnected` /
   `error`) may use that fallback only in `verify-clean` after the local Cloud Verify leg has
   returned a structured clean result; until then the canonical skip stays blocking. If Cloud
-  Verify returns findings or fails, the configured canonical provider is stamped incomplete
-  (and stays in `skippedProviders` when it sent no payload) and is never discharged. Promotion
-  happens only on a structured clean local result.
+  Verify returns findings or fails (any local `providerErrors` code, including `disconnected`),
+  the configured canonical provider is stamped incomplete (and stays in `skippedProviders` when
+  it sent no payload) and is never discharged. Promotion happens only on a structured clean
+  local result.
 - Unread rows are one case of that rule: a chat or local leg, on race or verify-clean, whose reply
   has findings past the gate's `GATED_FINDINGS_CAP` rows (`overflow`, never inspected) is gated as
   evidence (`gateUnreadRows`), with `<provider>: N finding(s) past the gate's row cap were not

@@ -248,3 +248,26 @@ test('a verify-clean transport fallback does not promote Grok when local errors'
   await eventually(() => ['posted', 'skipped'].includes(job()?.status), 'job never finished after local error');
   assertBlockedTransportFallback(job(), app.reviews[0]?.body, {incompleteBody: true});
 });
+
+test('a verify-clean transport fallback stamps ChatGPT incomplete when local disconnects', async (t) => {
+  const app = await appFixture({reviewLocal: true, reviewGrok: true, localReviewRole: 'verify-clean'});
+  t.after(() => app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM = 'false';
+  const {out, job} = await submitGrokAfterChatgptFail(app, 'disconnected: worker unavailable');
+  await eventually(() => app.localRequests.length === 1, 'Cloud Verify did not start');
+  assert.equal(app.reviews.length, 0);
+  app.harbor.patchHarborJob(out.jobId, (j) => ({
+    ...j,
+    generating: {...j.generating, local: false},
+    providerErrors: {
+      ...j.providerErrors,
+      local: {code: 'disconnected', message: 'local verifier disconnected'},
+    },
+  }));
+  await app.harbor.submitHarborChat(out.jobId, clean, [{provider: 'grok', raw: clean}], {force: true});
+  await eventually(() => ['posted', 'skipped'].includes(job()?.status), 'job never finished after local disconnect');
+  assert.equal(job().providerErrors?.local?.code, 'disconnected');
+  assert.equal(job().canonicalProvider, 'chatgpt');
+  assertBlockedTransportFallback(job(), app.reviews[0]?.body, {incompleteBody: true});
+  try { app.localResponses[0].destroy(); } catch { /* in-flight Cloud Verify request is abandoned */ }
+});

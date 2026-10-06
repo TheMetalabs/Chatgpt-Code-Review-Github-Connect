@@ -48,7 +48,12 @@ export function content(provider = 'chatgpt', persisted = new Map()) {
   const stamp = msg => (msg?.type === 'ashlar-run'
     ? {...('allocationUrl' in msg ? {} : {allocationUrl: allocationUrl(provider)}), ...('until' in msg ? {} : {until: vm.runInContext('Date.now()', context) + 10_000}), ...msg}
     : msg);
-  return { context, listeners, message(msg) { let reply; listeners[0](stamp(msg), {}, r => { reply = r; }); return reply; } };
+  return { context, listeners, message(msg) {
+    let reply, answered = false, pending;
+    const keep = listeners[0](stamp(msg), {}, r => { reply = r; answered = true; pending?.(r); });
+    if (keep === true && !answered) return new Promise(resolve => { pending = resolve; });
+    return reply;
+  } };
 }
 export function background({ local = storage({ origin: 'http://bridge', token: 'token' }), session = storage(), handler, tabs = new Map(), api } = {}) {
   // ChatGPT pacing (background.js chatgptPace) is off unless a test sets it: most tests admit several

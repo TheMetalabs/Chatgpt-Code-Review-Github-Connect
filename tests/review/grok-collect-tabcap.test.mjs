@@ -17,6 +17,27 @@ function harvest(c) {
 function stages(c) {
   return (c.context.__ashlarRunnerState?.steps?.events || []).map(e => e.stage);
 }
+function sentBound(c, {conversation, href, followup = false, responseId = 'answer-A'} = {}) {
+  if (href) c.context.location = {href};
+  const page = c.context.location.href;
+  c.context.savedSubmission = () => ({
+    phase: 'sent', expected: 'review', conversation: conversation === undefined ? page : conversation,
+    messageId: 'user-A', baseline: 0, submittedUsers: 1,
+  });
+  c.context.boundReviewResponse = () => ({identified: true, followup, root: {}, responseId, message: {}});
+}
+async function throttledGrok() {
+  const c = content('grok');
+  c.context.stopButtonVisible = () => false;
+  c.context.replyDoneVisible = () => true;
+  c.context.responseStreaming = () => false;
+  c.context.sleep = () => new Promise(() => {});
+  c.context.waitForPageChange = () => new Promise(() => {});
+  c.context.runPrompt = () => new Promise(() => {});
+  assert.equal(c.message({type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider: 'grok', prompt: 'review'})?.code, 'busy');
+  await flush();
+  return c;
+}
 /** The job is deleted after close; snapshot workerEvents from the durable save that recorded them. */
 function watchWorkerStages(b, jobId, provider) {
   const stages = [];
@@ -30,22 +51,15 @@ function watchWorkerStages(b, jobId, provider) {
 }
 
 test('harvest collects a completed Grok answer while page timers never fire (throttled background tab)', async () => {
-  const c = content('grok');
-  c.context.stopButtonVisible = () => false;
-  c.context.replyDoneVisible = () => true;
-  c.context.responseStreaming = () => false;
-  c.context.sleep = () => new Promise(() => {});
-  c.context.waitForPageChange = () => new Promise(() => {});
-  c.context.runPrompt = () => new Promise(() => {});
-  assert.equal(c.message({type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider: 'grok', prompt: 'review'})?.code, 'busy');
-  await flush();
+  const c = await throttledGrok();
+  sentBound(c);
   assert.equal(c.context.__ashlarRunnerState.running, true);
-  assert.equal(harvest(c)?.code, 'busy', 'first completed snapshot is not yet stable');
-  const second = harvest(c);
+  assert.equal((await harvest(c))?.code, 'busy', 'first completed snapshot is not yet stable');
+  const second = await harvest(c);
   assert.equal(second?.ok, true, JSON.stringify(second));
   assert.equal(second.raw, raw);
   assert.equal(stages(c).includes('response_collected'), true, JSON.stringify(stages(c)));
-  assert.equal(harvest(c)?.raw, raw, 'later harvests keep the collected result');
+  assert.equal((await harvest(c))?.raw, raw, 'later harvests keep the collected result');
 });
 
 test('harvest does not collect while Grok is still generating in a throttled tab', async () => {
@@ -53,12 +67,45 @@ test('harvest does not collect while Grok is still generating in a throttled tab
   c.context.stopButtonVisible = () => true;
   c.context.replyDoneVisible = () => false;
   c.context.runPrompt = () => new Promise(() => {});
+  sentBound(c);
   c.message({type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider: 'grok', prompt: 'review'});
   await flush();
-  assert.equal(harvest(c)?.code, 'busy');
-  assert.equal(harvest(c)?.code, 'busy');
+  assert.equal((await harvest(c))?.code, 'busy');
+  assert.equal((await harvest(c))?.code, 'busy');
   assert.notEqual(c.context.__ashlarRunnerState.result?.ok, true);
   assert.equal(stages(c).includes('response_collected'), false);
+});
+
+test('harvest replies busy when reply-done is visible but no sent submission is bound', async () => {
+  const c = await throttledGrok();
+  assert.equal((await harvest(c))?.code, 'busy');
+  assert.equal((await harvest(c))?.code, 'busy');
+  assert.notEqual(c.context.__ashlarRunnerState.result?.ok, true);
+  assert.equal(c.context.__ashlarRunnerState.result?.ok, undefined);
+});
+
+test('harvest does not settle two stable snapshots from a different conversation than the run', async () => {
+  const c = await throttledGrok();
+  sentBound(c, {conversation: 'https://grok.com/c/run', href: 'https://grok.com/c/other'});
+  assert.equal((await harvest(c))?.code, 'busy');
+  assert.equal((await harvest(c))?.code, 'busy');
+  assert.notEqual(c.context.__ashlarRunnerState.result?.ok, true);
+});
+
+test('harvest of a bound sent submission replies raw after persistedResult resolves', async () => {
+  const c = await throttledGrok();
+  sentBound(c);
+  let persistResolved = false;
+  c.context.chrome.storage = {session: {set: async () => {
+    await new Promise(resolve => setImmediate(resolve));
+    persistResolved = true;
+  }}};
+  assert.equal((await harvest(c))?.code, 'busy', 'first completed snapshot is not yet stable');
+  const second = await harvest(c);
+  assert.equal(persistResolved, true, 'persistedResult resolved before the harvest reply');
+  assert.equal(second?.ok, true, JSON.stringify(second));
+  assert.equal(second.raw, raw);
+  assert.equal(c.context.__ashlarRunnerState.persistedResult !== undefined, true);
 });
 
 test('worker harvest of a completed inactive Grok tab posts the answer and closes the managed tab', async () => {

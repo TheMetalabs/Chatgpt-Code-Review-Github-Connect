@@ -8,11 +8,21 @@ function waitForPageChange(ms = 800) {
   if (typeof MutationObserver !== "function") return sleep(ms);
   return new Promise(resolve => {
     let timer;
-    const finish = () => { observer.disconnect(); clearTimeout(timer); document.removeEventListener("visibilitychange", finish); resolve(); };
+    const runner = globalThis.__ashlarRunnerState;
+    const finish = () => {
+      observer.disconnect();
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", finish);
+      if (runner?.wakeCollector === finish) runner.wakeCollector = undefined;
+      resolve();
+    };
     const observer = new MutationObserver(finish);
     observer.observe(document.documentElement, {subtree: true, childList: true, characterData: true,
       attributes: true, attributeFilter: ["data-message-id", "data-chatgpt-search-message-ids", "disabled", "aria-disabled", "aria-busy", "data-state", "data-streaming-response-status", "style", "class"]});
     document.addEventListener("visibilitychange", finish, {once: true});
+    // The worker's harvest message (unthrottled) wakes this wait: a hidden tab's setTimeout may
+    // never fire after the last mutation, which left Grok answers uncollected (POSTSEND_CAP).
+    if (runner) runner.wakeCollector = finish;
     timer = setTimeout(finish, ms);
   });
 }

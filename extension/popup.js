@@ -1,6 +1,7 @@
 const originEl = document.getElementById("origin");
 const tokenEl = document.getElementById("token");
 const maxTabsEl = document.getElementById("maxReviewTabs");
+const maxGrokTabsEl = document.getElementById("maxGrokTabs");
 const enabledEl = document.getElementById("enabled");
 const statusEl = document.getElementById("status");
 const connectionEl = document.getElementById("connection");
@@ -70,11 +71,12 @@ Archived sources awaiting processing: ${work.sourceCaptured || 0}.` : "\nCapacit
 }
 
 (async () => {
-  const s = await chrome.storage.local.get(["origin", "token", "enabled", "lastJobId", "lastError", "maxReviewTabs", "extensionUpdaterPort"]);
+  const s = await chrome.storage.local.get(["origin", "token", "enabled", "lastJobId", "lastError", "maxReviewTabs", "maxGrokTabs", "extensionUpdaterPort"]);
   originEl.value = s.origin || "";
   tokenEl.value = s.token || "";
   enabledEl.checked = s.enabled !== false;
   maxTabsEl.value = Number.isInteger(s.maxReviewTabs) && s.maxReviewTabs > 0 ? Math.min(s.maxReviewTabs,16) : 4;
+  if (maxGrokTabsEl) maxGrokTabsEl.value = Number.isInteger(s.maxGrokTabs) && s.maxGrokTabs > 0 ? Math.min(s.maxGrokTabs,8) : 3;
   updaterPortEl.value = Number.isInteger(s.extensionUpdaterPort) && s.extensionUpdaterPort > 0 ? s.extensionUpdaterPort : 17373;
   if (s.lastError) statusEl.textContent = `Previous work error (not a model completion status): ${s.lastError}`;
   else if (s.lastJobId) statusEl.textContent = `Last job: ${s.lastJobId}`;
@@ -272,9 +274,13 @@ document.getElementById("save").addEventListener("click", async () => {
   const token = tokenEl.value.trim();
   const enabled = enabledEl.checked;
   const maxReviewTabs = Number(maxTabsEl.value);
+  const maxGrokTabs = maxGrokTabsEl ? Number(maxGrokTabsEl.value) : 3;
   const extensionUpdaterPort = Number(updaterPortEl.value);
   if (!Number.isInteger(maxReviewTabs) || maxReviewTabs < 1 || maxReviewTabs > 16) {
     statusEl.textContent = "Review tab limit must be a whole number from 1 to 16."; return;
+  }
+  if (!Number.isInteger(maxGrokTabs) || maxGrokTabs < 1 || maxGrokTabs > 8) {
+    statusEl.textContent = "Grok tab limit must be a whole number from 1 to 8."; return;
   }
   if (!Number.isInteger(extensionUpdaterPort) || extensionUpdaterPort < 1 || extensionUpdaterPort > 65535) {
     statusEl.textContent = "Updater port must be a whole number from 1 to 65535."; return;
@@ -288,6 +294,6 @@ document.getElementById("save").addEventListener("click", async () => {
       return;
     }
   } else { statusEl.textContent = "Enter an http:// or https:// Ashlar origin"; return; }
-  await chrome.storage.local.set({ origin, token, enabled, maxReviewTabs, extensionUpdaterPort });
+  await chrome.storage.local.set({ origin, token, enabled, maxReviewTabs, maxGrokTabs, extensionUpdaterPort });
   await requestPoll();
 });

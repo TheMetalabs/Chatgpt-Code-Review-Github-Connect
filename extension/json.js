@@ -718,12 +718,14 @@ async function persistCollectedResult(runner, raw, text, ownership, at = Date.no
   } catch { /* session storage is a recovery hint; the live reply remains authoritative */ }
 }
 
-async function settleStableAnswer(stability, key, poll, {text, raw, ownership}) {
-  stability.hits = stability.stable === key ? stability.hits + 1 : 1;
-  stability.stable = key;
-  if (stability.hits < 2) return false;
-  const {runner, bound} = poll;
-  const collectedAt = Date.now();
+function collectedReviewRaw(runner) {
+  const raw = runner?.result?.ok ? runner.result.raw : undefined;
+  return typeof raw === "string" && raw.trim() ? raw : "";
+}
+
+function applyCollectedAnswer(runner, poll, {text, raw, ownership}, collectedAt = Date.now()) {
+  if (collectedReviewRaw(runner)) return runner.result;
+  const bound = poll?.bound;
   if (runner) {
     runner.responseText = text;
     // The regeneration pager as it was when the answer was collected (tabOwnership: "regenerated").
@@ -733,10 +735,115 @@ async function settleStableAnswer(stability, key, poll, {text, raw, ownership}) 
       responseId:bound.responseId,context:reviewPageContext(),text,raw,
     });
     runner.persistedResult = persistCollectedResult(runner, raw, text, ownership, collectedAt);
-    await runner.persistedResult;
+    runner.result = {ok: true, raw, responseText: typeof text === "string" ? text : "",
+      completion: nativeCleanupProof(runner)};
   }
   recordReviewStep("response_collected", collectedAt);
+  return runner?.result || {ok: true, raw, responseText: typeof text === "string" ? text : ""};
+}
+
+async function settleStableAnswer(stability, key, poll, {text, raw, ownership}) {
+  stability.hits = stability.stable === key ? stability.hits + 1 : 1;
+  stability.stable = key;
+  if (stability.hits < 2) return false;
+  applyCollectedAnswer(poll.runner, poll, {text, raw, ownership});
+  if (poll.runner?.persistedResult) await poll.runner.persistedResult;
   return true;
+}
+
+/** Sync counterpart of pollBoundResponse for the worker's harvest: chrome.tabs.sendMessage still
+ * runs in a throttled background tab whose page timers do not. */
+function snapshotBoundResponse() {
+  const runner = globalThis.__ashlarRunnerState;
+  let submission = null;
+  try {
+    if (runner?.confirmedSubmission?.key === (typeof submissionKey === "function" ? submissionKey() : ""))
+      submission = runner.confirmedSubmission.record;
+    else if (typeof savedSubmission === "function") submission = savedSubmission();
+  } catch { submission = null; }
+  const bound = submission?.phase === "sent" && typeof boundReviewResponse === "function"
+    ? boundReviewResponse(submission) : undefined;
+  if (bound?.identified && runner) runner.boundObserved = true;
+  const stop = bound && !bound.root ? false : bound?.followup ? stopButtonVisible(bound.root) : stopButtonVisible();
+  const streaming = typeof responseStreaming === "function" && globalThis.document ? responseStreaming(bound?.root) : false;
+  const done = chatGenerationFinished({stopVisible: stop || streaming, replyActionsVisible: replyDoneVisible(bound?.root)});
+  const poll = {runner, bound, stop, streaming, done, submission};
+  if (typeof noteSawStream === "function") noteSawStream(submission, poll);
+  return poll;
+}
+
+function collectorStability(runner) {
+  return runner ? (runner.collectStability ||= {stable: "", hits: 0}) : {stable: "", hits: 0};
+}
+
+function harvestStability(runner) {
+  return runner ? (runner.harvestStability ||= {stable: "", hits: 0}) : {stable: "", hits: 0};
+}
+
+/** Pin a new-chat review's conversation on a collector poll (waitUntilReviewOrQuota). A harvest
+ * uses the same rule so a worker poke cannot settle on a page the loop would not pin. */
+function pinReviewConversationFromPoll(poll) {
+  const {runner, bound, done, submission} = poll;
+  if (bound?.identified && !runner?.tabRepurposed && submission && !submission.conversation &&
+      journaledTurnIntegrity(submission, userTurnEls()) === "exact") {
+    if (newChatPin(runner, done, Boolean(bound.root))) pinNewChatReview(submission);
+  }
+}
+
+/** Harvest (unlike the page loop's unbound fallback) only counts a completed snapshot when the
+ * sent journal is conversation-bound on this page: sent, identified, not a follow-up, not
+ * repurposed, and samePage against the conversation recorded at send or pinned. A missing
+ * conversation is not bound — pinReviewConversationFromPoll must have established one. */
+function reviewAnswerBoundHere(poll) {
+  const {bound, submission, runner} = poll;
+  return !runner?.tabRepurposed && submission?.phase === "sent" && bound?.identified && !bound.followup &&
+    Boolean(submission.conversation) && fixConversationHolds(submission);
+}
+
+function wakeCollector(state) {
+  try { state?.wakeCollector?.(); } catch { /* the in-memory wait still holds */ }
+}
+
+/** Worker-driven collection: observe the bound answer now and, on two identical completed
+ * snapshots, settle it. Page timers may never resume in a hidden Grok tab. Latch the answer
+ * before waking the collector: a resumed waitForPageChange can throw, and run().catch must not
+ * overwrite a harvest that already succeeded. */
+function harvestRunningAnswer(state) {
+  if (state.kind === "fix") return null;
+  if (collectedReviewRaw(state)) return state.result;
+  let poll;
+  try { poll = snapshotBoundResponse(); }
+  catch { wakeCollector(state); return null; }
+  try {
+    pinReviewConversationFromPoll(poll);
+    const {runner, bound, stop, streaming, done} = poll;
+    const text = typeof assistantCorpus === "function" ? assistantCorpus(bound?.root).join("\n\n") : "";
+    const json = done ? harvestJson({allowThin: true, root: bound?.root}) : null;
+    if (runner) trackCompletedSource(runner, bound, done, text);
+    if (runner?.running) runner.observation = {
+      state: !done ? "generating_or_queued" : json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response",
+      text: text.slice(0, 128_000), totalChars: text.length, truncated: text.length > 128_000,
+    };
+    recordReviewStep(!done ? (stop || streaming ? "generating" : "waiting_for_response") :
+      json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response");
+    const stability = harvestStability(runner);
+    if (done && json && reviewAnswerBoundHere(poll) && bound.responseId) {
+      const key = JSON.stringify([json, text]);
+      stability.hits = stability.stable === key ? stability.hits + 1 : 1;
+      stability.stable = key;
+      if (stability.hits >= 2) {
+        let ownership;
+        try { ownership = tabOwnership(runner)?.ownership; } catch { ownership = undefined; }
+        const result = applyCollectedAnswer(runner, poll, {text, raw: json, ownership});
+        if (!result?.ok) { wakeCollector(state); return null; }
+        wakeCollector(state);
+        const persist = runner?.persistedResult;
+        return persist ? Promise.resolve(persist).then(() => result, () => result) : result;
+      }
+    }
+    wakeCollector(state);
+    return null;
+  } catch { wakeCollector(state); return null; }
 }
 
 async function waitUntilReviewOrQuota(name) {
@@ -745,7 +852,7 @@ async function waitUntilReviewOrQuota(name) {
   const owner = globalThis.__ashlarRunnerState;
   // Stamp the executing loop, never installReviewRunner's listener replacement.
   if (owner) owner.sourceTrackingOwner = {jobId: owner.jobId, runId: owner.runId, provider: owner.provider};
-  const stability = {stable: "", hits: 0};
+  const stability = collectorStability(owner);
   const lease = {state: "", chars: 0, at: 0, polled: 0};
   const wait = {at: 0, polled: 0, answered: false};
   // No poll-count failure. Before the answer mounts the wait is bounded from the send
@@ -761,8 +868,10 @@ async function waitUntilReviewOrQuota(name) {
       recordReviewStep("repair_accepted");
       return globalThis.__ashlarRunnerState.repairedResult;
     }
+    // A harvest the worker drove while this loop slept (throttled background tab) already settled.
+    if (collectedReviewRaw(owner)) return owner.result.raw;
     const poll = await pollBoundResponse();
-    const {runner, bound, stop, streaming, done, submission} = poll;
+    const {runner, bound, stop, streaming, done} = poll;
     // Like a fix run, a review is bound to a conversation: a later page in another conversation is
     // the user's (tab release). A review sent on a conversation page recorded it at its send
     // (composer.js submissionConfirmed). A review sent on a new chat (namesNoConversation: ChatGPT's
@@ -775,10 +884,7 @@ async function waitUntilReviewOrQuota(name) {
     // send produced (the user may have moved in-page while the old DOM was still rendered, Ashlar
     // 4101062732): no pin, and the release verdict keeps the tab. On the new chat itself it pins
     // once its answer is complete (the page it was collected on).
-    if (bound?.identified && !runner?.tabRepurposed && !submission.conversation &&
-        journaledTurnIntegrity(submission, userTurnEls()) === "exact") {
-      if (newChatPin(runner, done, Boolean(bound.root))) pinNewChatReview(submission);
-    }
+    pinReviewConversationFromPoll(poll);
     const text = assistantCorpus(bound?.root).join("\n\n");
     const json = done ? harvestJson({allowThin: true, root: bound?.root}) : null;
     if (runner) trackCompletedSource(runner, bound, done, text);
@@ -1669,7 +1775,24 @@ function installReviewRunner(name, run) {
     if (repaired) { reply(repaired); return; }
     if (sourceReceiptFor(state)) {reply({ok:false,code:"captured",observation:{state:"source_archived"}});return;}
     if (state.result) { reply(fixAnswerReply(state, msg, state.result, busy)); return; }
-    if (state.running) { reply(busy()); return; }
+    if (state.running) {
+      // The collector loop may be asleep in a throttled hidden tab (no mutations, no timer).
+      // Harvest still runs: sendMessage is not a page timer. Observe the DOM now and settle.
+      if (msg.type === "ashlar-harvest") {
+        let collected;
+        try { collected = harvestRunningAnswer(state); }
+        catch { reply(busy()); return; }
+        if (collected && typeof collected.then === "function") {
+          collected.then(result => {
+            try { reply(result ? fixAnswerReply(state, msg, result, busy) : busy()); }
+            catch { try { reply(busy()); } catch { /* the worker will poke again */ } }
+          }, () => { try { reply(busy()); } catch { /* the worker will poke again */ } });
+          return true;
+        }
+        if (collected) { reply(fixAnswerReply(state, msg, collected, busy)); return; }
+      }
+      reply(busy()); return;
+    }
     if (msg.type === "ashlar-harvest") {
       reply({ ok: false, code: "idle", error: "no active review in this page" });
       return;
@@ -1733,9 +1856,16 @@ function installReviewRunner(name, run) {
       .then(raw => {
         if (sourceReceiptFor(state)) return; // Captured original is not parsed JSON.
         state.finishedContext = state.repairedContext || state.nativeCompletion?.context || reviewPageContext();
+        // A worker harvest can latch the answer while this loop is still parked in waitForPageChange.
+        if (collectedReviewRaw(state)) return;
         state.result = { ok: true, raw, responseText: state.responseText, completion:nativeCleanupProof(state) };
       })
       .catch(e => {
+        // Harvest already posted the answer: a later quota/timeout/DOM throw must not replace it.
+        if (collectedReviewRaw(state)) {
+          state.finishedContext ||= state.nativeCompletion?.context || reviewPageContext();
+          return;
+        }
         // A new run whose tab stopped being its fresh page before the send (throwIfStopped).
         const takenOver = e?.code === "taken_over";
         // Positive evidence, permanent (tabOwnership): a run that ended before its Send wrote no

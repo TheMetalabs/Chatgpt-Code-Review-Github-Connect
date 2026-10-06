@@ -50,6 +50,10 @@ const preservedKey = (jobId, provider, runId) => `${PRESERVED_PREFIX}${jobId}:${
 const FIX_DELIVERIES_KEY = "ashlar:fixDeliveries";
 const FIX_DELIVERY_RETAIN_MS = 7 * 60 * 60 * 1000;
 const DEFAULT_MAX_REVIEW_TABS = 4;
+/** Simultaneous Grok tabs Ashlar may keep open (hidden Grok tabs freeze their collectors). Extra
+ * Grok legs wait for a slot instead of opening another tab. chrome.storage.local "maxGrokTabs" (1–8)
+ * overrides the default; personal grok.com tabs are never counted or closed. */
+const DEFAULT_MAX_GROK_TABS = 3;
 const HEARTBEAT_MS = 10_000;
 const HEALTH_KEY = "bridgeHealth";
 const WORKER_STATUS_KEY = "bridgeWorkerStatus";
@@ -915,7 +919,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.70";
+const WORKER_BUILD = "1.1.71";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -1381,6 +1385,31 @@ async function reconcileFixDeliveries(jobs) {
   return proven;
 }
 
+function grokTabLimit(setting) {
+  return Number.isInteger(setting) && setting > 0 ? Math.min(setting, 8) : DEFAULT_MAX_GROK_TABS;
+}
+
+/** Ashlar-managed Grok tabs only (a job's grok.tabId / allocating). The user's own grok.com tabs
+ * are never counted: they are not in the job registry. */
+async function grokTabsOpen(jobs) {
+  const tabs = await chrome.tabs.query({});
+  const live = new Map(tabs.map(tab => [tab.id, tab]));
+  let n = 0;
+  for (const job of Object.values(jobs)) {
+    const state = job.states?.grok;
+    if (!state || state.cleanupDone) continue;
+    if (state.allocating) { n++; continue; }
+    const tab = live.get(state.tabId);
+    if (tab && allowedTab(tab, "grok")) n++;
+  }
+  return n;
+}
+
+async function grokTabAvailable(jobs) {
+  const setting = (await chrome.storage.local.get(["maxGrokTabs"])).maxGrokTabs;
+  return (await grokTabsOpen(jobs)) < grokTabLimit(setting);
+}
+
 /** Open the leg's tab, inside its poll operation: the capacity check, the intent, the create and
  * the records run with no other tab operation in between (the tab queue), so two allocations never
  * both pass one capacity check. The tab's evidence is written before the leg names it (CE-2):
@@ -1390,6 +1419,7 @@ async function reconcileFixDeliveries(jobs) {
 async function allocateProviderTab(job, provider, jobs) {
   const state = job.states[provider];
   if (state.tabId || state.allocating || await maintenanceHeld() || !await tabCapacityAvailable(jobs)) return;
+  if (provider === "grok" && !await grokTabAvailable(jobs)) return;
   state.allocating = true;
   try { await saveJobs(jobs); }
   catch (error) { delete state.allocating; throw error; } // No create was attempted.

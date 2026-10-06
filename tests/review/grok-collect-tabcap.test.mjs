@@ -103,23 +103,26 @@ test('harvest does not settle a new-chat answer the collector refused to pin', a
   }
 });
 
-test('a generating harvest poke does not clear collector stability hits', async () => {
+test('a generating harvest poke does not clear collector or harvest stability hits', async () => {
   const c = await throttledGrok();
   sentBound(c);
   const json = c.context.harvestJson({allowThin: true});
   const text = c.context.assistantCorpus().join('\n\n');
   const key = JSON.stringify([json, text]);
   c.context.__ashlarRunnerState.collectStability = {stable: key, hits: 1};
+  c.context.__ashlarRunnerState.harvestStability = {stable: key, hits: 1};
   c.context.stopButtonVisible = () => true;
   c.context.replyDoneVisible = () => false;
   assert.equal((await harvest(c))?.code, 'busy');
-  assert.equal(c.context.__ashlarRunnerState.collectStability.hits, 1, 'stop poke must not clear hits');
-  assert.equal(c.context.__ashlarRunnerState.collectStability.stable, key);
+  assert.equal(c.context.__ashlarRunnerState.collectStability.hits, 1, 'stop poke must not clear collector hits');
+  assert.equal(c.context.__ashlarRunnerState.harvestStability.hits, 1, 'stop poke must not clear harvest hits');
+  assert.equal(c.context.__ashlarRunnerState.harvestStability.stable, key);
   c.context.stopButtonVisible = () => false;
   c.context.replyDoneVisible = () => true;
   const settled = await harvest(c);
   assert.equal(settled?.ok, true, JSON.stringify(settled));
   assert.equal(settled.raw, raw);
+  assert.equal(c.context.__ashlarRunnerState.collectStability.hits, 1, 'harvest settle must not consume collector hits');
 });
 
 test('harvest of a bound sent submission replies raw after persistedResult resolves', async () => {

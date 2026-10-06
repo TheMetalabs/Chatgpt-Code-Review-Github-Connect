@@ -776,6 +776,10 @@ function collectorStability(runner) {
   return runner ? (runner.collectStability ||= {stable: "", hits: 0}) : {stable: "", hits: 0};
 }
 
+function harvestStability(runner) {
+  return runner ? (runner.harvestStability ||= {stable: "", hits: 0}) : {stable: "", hits: 0};
+}
+
 /** Pin a new-chat review's conversation on a collector poll (waitUntilReviewOrQuota). A harvest
  * uses the same rule so a worker poke cannot settle on a page the loop would not pin. */
 function pinReviewConversationFromPoll(poll) {
@@ -822,7 +826,7 @@ function harvestRunningAnswer(state) {
     };
     recordReviewStep(!done ? (stop || streaming ? "generating" : "waiting_for_response") :
       json ? "json_observed" : text.trim() ? "response_completed_json_invalid" : "waiting_for_response");
-    const stability = collectorStability(runner);
+    const stability = harvestStability(runner);
     if (done && json && reviewAnswerBoundHere(poll) && bound.responseId) {
       const key = JSON.stringify([json, text]);
       stability.hits = stability.stable === key ? stability.hits + 1 : 1;

@@ -34,7 +34,7 @@ import {
   type LiveGateResult,
 } from "./poster";
 import { sleep } from "./utils";
-import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, stillRacing, verdictEvidence } from "./local-fallback";
+import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, skippedProvider, stillRacing, verdictEvidence } from "./local-fallback";
 import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
@@ -1389,7 +1389,10 @@ export async function submitHarborChat(
   // The first enabled chat leg is normally canonical. Promote only when the worker recorded an
   // explicit skip/logged_out (not payload absence) and another chat leg produced a complete verdict.
   // A malformed/incomplete leg is never an eligible fallback. A transport failure may promote only
-  // in verify-clean after the local verifier returned a structured clean result.
+  // in verify-clean after the local verifier returned a structured clean result. While that local
+  // leg has not finished, withhold the incomplete stamp so a complete fallback chat verdict can
+  // start Cloud Verify. After a non-clean or failed local result, stamp the configured canonical
+  // provider incomplete and never promote.
   const completeChatProvider = providers.find((provider) => isChatProvider(provider) && complete.has(provider));
   const canonicalErrorCode = configuredCanonicalProvider
     ? job.providerErrors?.[configuredCanonicalProvider]?.code
@@ -1399,6 +1402,9 @@ export async function submitHarborChat(
     || canonicalErrorCode === "logged_out";
   const canonicalTransportFailure = canonicalErrorCode === "disconnected" || canonicalErrorCode === "error";
   const localCleanVerdict = complete.has("local") && (byProvider.get("local")?.findings.length ?? 0) === 0;
+  const localVerifierSettled = payloads.some((l) => l.provider === "local")
+    || skippedProvider(job.assumptions, "local")
+    || Boolean(job.providerErrors?.local && job.providerErrors.local.code !== "disconnected");
   const verifierCanRecoverTransport = Boolean(
     completeChatProvider &&
     providers.includes("local") &&
@@ -1412,7 +1418,8 @@ export async function submitHarborChat(
     providers.includes("local") &&
     job.localReviewRole === "verify-clean" &&
     canonicalTransportFailure &&
-    !verifierCanRecoverTransport,
+    !verifierCanRecoverTransport &&
+    !localVerifierSettled,
   );
   const canonicalUnavailable = Boolean(configuredCanonicalProvider && (canonicalExplicitSkip || verifierCanRecoverTransport));
   const canonicalProvider = configuredCanonicalProvider && completeChatProvider &&

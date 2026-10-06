@@ -208,6 +208,21 @@ test('a valid Grok clean can recover a ChatGPT transport failure only through lo
   assert.equal(job().localVerified, true);
 });
 
+function assertBlockedTransportFallback(job, body, {incompleteBody}) {
+  assert.ok(['posted', 'skipped'].includes(job.status), `job status ${job.status}`);
+  assert.equal(isZeroFindings(body, {authoredByBot: true}), false);
+  assert.ok(
+    job.incompleteProviders?.includes('chatgpt'),
+    `ChatGPT must be stamped incomplete after verify-clean local settles; incomplete=${JSON.stringify(job.incompleteProviders)} skipped=${JSON.stringify(job.skippedProviders)} canonical=${job.canonicalProvider}`,
+  );
+  assert.ok(
+    job.incompleteProviders?.includes('chatgpt') || job.skippedProviders?.includes('chatgpt'),
+    'ChatGPT stays blocking when local does not confirm a clean fallback',
+  );
+  assert.notEqual(job.canonicalProvider, 'grok', 'do not promote Grok after a non-clean or failed local result');
+  if (incompleteBody) assert.match(body, /ashlar-outcome incomplete/);
+}
+
 test('a verify-clean transport fallback does not promote Grok when local returns a finding', async (t) => {
   const app = await appFixture({reviewLocal: true, reviewGrok: true, localReviewRole: 'verify-clean'});
   t.after(() => app.close());
@@ -216,15 +231,9 @@ test('a verify-clean transport fallback does not promote Grok when local returns
   await eventually(() => app.localRequests.length === 1, 'Cloud Verify did not start');
   assert.equal(app.reviews.length, 0);
   app.localResponses[0].end(JSON.stringify({choices: [{message: {content: grokFinding}}]}));
-  await posted(app, out);
-  assert.ok(
-    !(job().canonicalProvider === 'grok' && !(job().incompleteProviders?.length)),
-    'local findings must not leave canonical Grok with empty incompleteProviders',
-  );
-  assert.ok(
-    job().canonicalProvider === 'chatgpt' || job().incompleteProviders?.includes('chatgpt') || job().skippedProviders?.includes('chatgpt'),
-    'ChatGPT stays blocking when local does not confirm a clean fallback',
-  );
+  const body = await posted(app, out);
+  assertBlockedTransportFallback(job(), body, {incompleteBody: false});
+  assert.equal(app.reviews[0].comments.some((comment) => comment.body.includes('Auxiliary finding')), true);
 });
 
 test('a verify-clean transport fallback does not promote Grok when local errors', async (t) => {
@@ -237,12 +246,5 @@ test('a verify-clean transport fallback does not promote Grok when local errors'
   app.localResponses[0].writeHead(500, {'content-type': 'application/json'});
   app.localResponses[0].end('{"error":"model crashed"}');
   await eventually(() => ['posted', 'skipped'].includes(job()?.status), 'job never finished after local error');
-  assert.ok(
-    !(job().canonicalProvider === 'grok' && !(job().incompleteProviders?.length)),
-    'a local error must not leave canonical Grok with empty incompleteProviders',
-  );
-  assert.ok(
-    job().canonicalProvider === 'chatgpt' || job().incompleteProviders?.includes('chatgpt') || job().skippedProviders?.includes('chatgpt'),
-    'ChatGPT stays blocking when local verification fails',
-  );
+  assertBlockedTransportFallback(job(), app.reviews[0]?.body, {incompleteBody: true});
 });

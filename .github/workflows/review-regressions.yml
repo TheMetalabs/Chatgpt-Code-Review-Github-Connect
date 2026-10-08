@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   review-lifecycle:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
         with:
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -29,9 +29,9 @@ jobs:
         # package.json is the e2e file registry (scripts/e2e-registration.test.mjs).
         run: npm run test:e2e
   verify:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
         with:
           persist-credentials: false
       - name: Archive exact source revision for reproduction
@@ -56,11 +56,11 @@ jobs:
       - run: npm run build:dev
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
   review-browser:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Fixture execution is bounded; production queue/generation is not.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
         with:
           persist-credentials: false
       - uses: actions/setup-node@v4

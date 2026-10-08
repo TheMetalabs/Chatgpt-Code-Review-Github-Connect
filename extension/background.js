@@ -3223,14 +3223,15 @@ function sweepOnce({includeStalled, staleMs = STALL_MS}) {
   sweepFlight = flight;
   return flight;
 }
-/** Ashlar's temporary-chat tabs of finished jobs (live P0 2026-09-27: 85 tabs left open, 126 of 131
- * reviews kept as "navigated"). The user never uses temporary chats in this Chrome (user decision via
- * the coordinator, 2026-09-27), so #82's "a touched tab is the user's" does not hold for them: a
- * temporary-chat tab Ashlar opened (its page reports an Ashlar binding, or a preserved record names
- * it) whose job is no longer in the worker registry is closed TEMP_TAB_CLOSE_AFTER_MS after it was
- * first seen finished, and while more than TEMP_TAB_CAP temporary-chat tabs are open the oldest
- * finished ones are closed first. A tab of a job in progress, a tab the worker still tracks, and any
- * non-temporary conversation are never touched. */
+/** Ashlar leftover review tabs of finished jobs (live P0 2026-09-27: 85 ChatGPT tabs left open,
+ * 126 of 131 reviews kept as "navigated"). ChatGPT temporary chats are that class by URL (the user
+ * never uses them in this Chrome). Grok review tabs are the same class by ownership: Ashlar opens
+ * private grok.com chats, and Grok assigning /c/<id> is not the user's conversation. A tab Ashlar
+ * opened (its page reports an Ashlar binding, a preserved record names it, or this session's owned
+ * record names it) whose job is no longer in the worker registry is closed TEMP_TAB_CLOSE_AFTER_MS
+ * after it was first seen finished, and while more than TEMP_TAB_CAP leftover review tabs are open
+ * the oldest finished ones are closed first. A tab of a job in progress, a tab the worker still
+ * tracks, a personal grok.com tab, and any non-temporary ChatGPT conversation are never touched. */
 const TEMP_TAB_CLOSE_AFTER_MS = 10 * 60_000;
 const TEMP_TAB_CAP = 8;
 const FINISHED_SEEN_KEY = "ashlar:tempTabFinishedSeen";
@@ -3245,47 +3246,71 @@ function temporaryChatTab(url) {
   return samePage(url, providerUrl("chatgpt")) && String(url).includes("temporary-chat=true") || temporaryChatConversation(url);
 }
 
+/** The provider whose leftover-review reclaim may consider `tab`, or undefined. ChatGPT only by its
+ * temporary-chat URL; Grok by grok.com (ownership is proven later, so a personal grok.com tab is
+ * listed here and then skipped). */
+function reclaimProvider(tab) {
+  if (allowedTab(tab, "chatgpt") && temporaryChatTab(tab.url)) return "chatgpt";
+  if (allowedTab(tab, "grok")) return "grok";
+}
+
+/** Job id stored in a preserved-run key (`ashlar:preserved:<jobId>:<provider>:<runId>`). */
+function preservedRecordJobId(key) {
+  const rest = key.startsWith(PRESERVED_PREFIX) ? key.slice(PRESERVED_PREFIX.length) : "";
+  const match = rest.match(/^(.*):(chatgpt|grok):/);
+  return match ? match[1] : "";
+}
+
 async function reclaimPreservedBody(force) {
   const cfg = await settings();
   const counts = {closed: 0, kept: 0, open: 0};
   if (!cfg.enabled || !cfg.origin) return {ok: false, error: "the worker is not configured", ...counts};
   const registry = await workerJobs(cfg.origin);
   const tracked = new Set(Object.values(registry).flatMap(job => job.providers.map(p => job.states[p]?.tabId)).filter(Number.isInteger));
-  const temp = (await chrome.tabs.query({})).filter(tab => allowedTab(tab, "chatgpt") && temporaryChatTab(tab.url));
-  counts.open = temp.length;
+  const tabs = await chrome.tabs.query({});
+  const candidates = tabs.filter(tab => reclaimProvider(tab));
+  const chatgptTemp = candidates.filter(tab => reclaimProvider(tab) === "chatgpt").length;
   const session = await chrome.storage.session.get(null);
-  const recorded = new Map(Object.entries(session).filter(([key, v]) => key.startsWith(PRESERVED_PREFIX) && Number.isInteger(v?.tabId)).map(([key, v]) => [v.tabId, {key, at: v.at}]));
+  const recorded = new Map(Object.entries(session).filter(([key, v]) => key.startsWith(PRESERVED_PREFIX) && Number.isInteger(v?.tabId))
+    .map(([key, v]) => [v.tabId, {key, at: v.at, jobId: preservedRecordJobId(key)}]));
+  const owned = new Map(Object.entries(session).filter(([key, v]) => key.startsWith(OWNED_PREFIX) && v?.replacedBy === undefined && typeof v?.jobId === "string")
+    .map(([key, v]) => [Number(key.slice(OWNED_PREFIX.length)), v]).filter(([id]) => Number.isInteger(id)));
   const seen = session[FINISHED_SEEN_KEY] && typeof session[FINISHED_SEEN_KEY] === "object" ? {...session[FINISHED_SEEN_KEY]} : {};
   const now = Date.now(), finished = [];
-  for (const tab of temp) {
-    if (tracked.has(tab.id)) continue;
+  let grokNamed = 0;
+  for (const tab of candidates) {
+    const provider = reclaimProvider(tab);
+    if (tracked.has(tab.id)) { if (provider === "grok") grokNamed++; continue; }
     let status = null;
-    if (probeable(tab) === "chatgpt") {
-      try { status = await tabOp("reclaim-status", () => askPage(tab.id, {type: "ashlar-tab-status"}, contentFiles("chatgpt"))); } catch { status = null; }
+    if (probeable(tab) === provider) {
+      try { status = await tabOp("reclaim-status", () => askPage(tab.id, {type: "ashlar-tab-status"}, contentFiles(provider))); } catch { status = null; }
     }
-    const jobId = typeof status?.jobId === "string" ? status.jobId : "";
-    if (jobId && registry[jobId]) continue; // its job is in progress
-    if (!jobId && !recorded.has(tab.id)) continue; // not a tab Ashlar can name as its own
-    const since = Number.isFinite(recorded.get(tab.id)?.at) ? recorded.get(tab.id).at : (seen[tab.id] ??= now);
-    finished.push({tab, since});
+    const named = recorded.get(tab.id) || (owned.has(tab.id) ? {jobId: owned.get(tab.id).jobId, key: OWNED_PREFIX + tab.id} : null);
+    const jobId = (typeof status?.jobId === "string" && status.jobId) || named?.jobId || "";
+    if (jobId && registry[jobId]) { if (provider === "grok") grokNamed++; continue; } // its job is in progress
+    if (!jobId) continue; // not a tab Ashlar can name as its own
+    if (provider === "grok") grokNamed++;
+    const since = Number.isFinite(named?.at) ? named.at : (seen[tab.id] ??= now);
+    finished.push({tab, since, provider, record: named});
   }
   for (const id of Object.keys(seen)) if (!finished.some(f => String(f.tab.id) === id)) delete seen[id];
   finished.sort((a, b) => a.since - b.since);
-  let open = temp.length;
-  for (const {tab, since} of finished) {
+  let open = chatgptTemp + grokNamed;
+  counts.open = open;
+  for (const {tab, since, provider, record} of finished) {
     const due = force || now - since >= TEMP_TAB_CLOSE_AFTER_MS || open > TEMP_TAB_CAP;
     if (!due) { counts.kept += 1; continue; }
     const closed = await tabOp("reclaim", async () => {
       const current = await chrome.tabs.get(tab.id).catch(() => null);
-      if (!current || !temporaryChatTab(current.url) || current.pendingUrl) return false;
+      if (!current || current.pendingUrl || reclaimProvider(current) !== provider) return false;
       await chrome.tabs.remove(tab.id);
       return true;
     }).catch(() => false);
     if (!closed) { counts.kept += 1; continue; }
     counts.closed += 1; open -= 1; delete seen[tab.id];
-    const record = recorded.get(tab.id);
-    if (record) await chrome.storage.session.remove(record.key);
+    if (record?.key) await chrome.storage.session.remove(record.key);
   }
+  counts.open = open;
   await chrome.storage.session.set({[FINISHED_SEEN_KEY]: seen});
   return {ok: true, ...counts, open};
 }

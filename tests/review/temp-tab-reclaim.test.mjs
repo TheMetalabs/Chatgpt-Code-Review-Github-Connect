@@ -13,7 +13,7 @@ const TEMP='https://chatgpt.com/c/6ab8?temporary-chat=true',BARE='https://chatgp
 const GROK='https://grok.com/c/review-A',GROK_HOME='https://grok.com/',GROK_PERSONAL='https://grok.com/c/personal';
 const MIN=60_000;
 function providerOf(url){return String(url||'').includes('grok.com')?'grok':'chatgpt';}
-function worker({tabs,bindings={},registry={},records={},seen,silent=new Set()}){
+function worker({tabs,bindings={},registry={},records={},seen,silent=new Set(),closeVerdicts={}}){
  const session=storage({...records,...(seen?{'ashlar:tempTabFinishedSeen':seen}:{})});
  const b=background({local:storage({origin:'http://bridge',token:'token',pendingReviewJobs:registry}),session,
   tabs:new Map(tabs.map(t=>[t.id,{status:'complete',...t}])),api:async()=>({ok:true})});
@@ -21,6 +21,7 @@ function worker({tabs,bindings={},registry={},records={},seen,silent=new Set()})
  b.chrome.tabs.sendMessage=(id,msg,callback)=>{
   if(silent.has(id)){callback();return;}
   const url=b.tabs.get(id)?.url||'';
+  if(msg.type==='ashlar-can-close'){callback(closeVerdicts[id]);return;}
   callback(msg.type==='ashlar-tab-status'
    ?{ok:true,ownershipProtocol:1,provider:providerOf(url),jobId:bindings[id]||'',runId:bindings[id]?'run-A':'',released:true,url}:undefined);
  };
@@ -103,4 +104,20 @@ test('after a worker restart, an owned Grok tab whose job is gone is closed; a p
  await b.context.reclaimPreservedTabs({force:true});
  assert.deepEqual(b.closedTabs,[10],'the owned leftover closes once its job is gone');
  assert.equal(b.tabs.has(99),true,'a grok.com tab with no Ashlar record stays open');
+});
+
+test('a Grok tab the user took over (draft / follow-up) is kept; a navigated leftover still closes',async()=>{
+ const record={'ashlar:preserved:job-A:grok:run-A':{tabId:10,at:Date.now()-20*MIN}};
+ const draft=worker({tabs:[{id:10,url:GROK}],records:record,
+  closeVerdicts:{10:{ok:true,ownership:'takenOver',cause:'draft',canClose:false}}});
+ await draft.b.context.reclaimPreservedTabs({force:true});
+ assert.deepEqual(draft.b.closedTabs,[],'a draft in the leftover Grok tab is the user\'s');
+ const follow=worker({tabs:[{id:10,url:GROK}],records:{'ashlar:preserved:job-A:grok:run-A':{tabId:10,at:Date.now()-20*MIN}},
+  closeVerdicts:{10:{ok:true,ownership:'takenOver',cause:'user_turn',canClose:false}}});
+ await follow.b.context.reclaimPreservedTabs({force:true});
+ assert.deepEqual(follow.b.closedTabs,[]);
+ const moved=worker({tabs:[{id:10,url:GROK}],records:{'ashlar:preserved:job-A:grok:run-A':{tabId:10,at:Date.now()-20*MIN}},
+  closeVerdicts:{10:{ok:true,ownership:'unknown',identity:'changed',cause:'navigated'}}});
+ await moved.b.context.reclaimPreservedTabs({force:true});
+ assert.deepEqual(moved.b.closedTabs,[10],'Grok assigning /c/<id> is still reclaimed');
 });

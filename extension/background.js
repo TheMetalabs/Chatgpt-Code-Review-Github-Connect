@@ -3254,11 +3254,27 @@ function reclaimProvider(tab) {
   if (allowedTab(tab, "grok")) return "grok";
 }
 
-/** Job id stored in a preserved-run key (`ashlar:preserved:<jobId>:<provider>:<runId>`). */
-function preservedRecordJobId(key) {
+/** Job/run ids stored in a preserved-run key (`ashlar:preserved:<jobId>:<provider>:<runId>`). */
+function preservedRecordIds(key) {
   const rest = key.startsWith(PRESERVED_PREFIX) ? key.slice(PRESERVED_PREFIX.length) : "";
-  const match = rest.match(/^(.*):(chatgpt|grok):/);
-  return match ? match[1] : "";
+  const match = rest.match(/^(.*):(chatgpt|grok):(.*)$/);
+  return match ? {jobId: match[1], runId: match[3]} : {};
+}
+
+/** User evidence on a leftover Grok tab (draft, follow-up, edit, regenerate): keep it. ChatGPT
+ * temporary chats still close without this check (the user never uses them). A Grok page that
+ * cannot answer is not this: frozen leftovers still close. `navigated` is Grok assigning /c/<id>
+ * as often as a user move, and is the leftover class this sweep exists to close. */
+async function grokReclaimHeldByUser(tabId, jobId, runId) {
+  if (!jobId || !runId) return false;
+  let result;
+  try {
+    result = await askPage(tabId, {type: "ashlar-can-close", jobId, provider: "grok", runId, allocationUrl: providerUrl("grok")}, contentFiles("grok"));
+  } catch { return false; }
+  if (result?.code === "job_mismatch") return true;
+  const cause = result?.cause;
+  if (["draft", "user_turn", "edited", "regenerated"].includes(cause)) return true;
+  return result?.ownership === "takenOver" && cause !== "navigated";
 }
 
 async function reclaimPreservedBody(force) {
@@ -3272,7 +3288,7 @@ async function reclaimPreservedBody(force) {
   const chatgptTemp = candidates.filter(tab => reclaimProvider(tab) === "chatgpt").length;
   const session = await chrome.storage.session.get(null);
   const recorded = new Map(Object.entries(session).filter(([key, v]) => key.startsWith(PRESERVED_PREFIX) && Number.isInteger(v?.tabId))
-    .map(([key, v]) => [v.tabId, {key, at: v.at, jobId: preservedRecordJobId(key)}]));
+    .map(([key, v]) => [v.tabId, {key, at: v.at, ...preservedRecordIds(key)}]));
   const owned = new Map(Object.entries(session).filter(([key, v]) => key.startsWith(OWNED_PREFIX) && v?.replacedBy === undefined && typeof v?.jobId === "string")
     .map(([key, v]) => [Number(key.slice(OWNED_PREFIX.length)), v]).filter(([id]) => Number.isInteger(id)));
   const seen = session[FINISHED_SEEN_KEY] && typeof session[FINISHED_SEEN_KEY] === "object" ? {...session[FINISHED_SEEN_KEY]} : {};
@@ -3285,24 +3301,26 @@ async function reclaimPreservedBody(force) {
     if (probeable(tab) === provider) {
       try { status = await tabOp("reclaim-status", () => askPage(tab.id, {type: "ashlar-tab-status"}, contentFiles(provider))); } catch { status = null; }
     }
-    const named = recorded.get(tab.id) || (owned.has(tab.id) ? {jobId: owned.get(tab.id).jobId, key: OWNED_PREFIX + tab.id} : null);
+    const named = recorded.get(tab.id) || (owned.has(tab.id) ? {jobId: owned.get(tab.id).jobId, runId: owned.get(tab.id).runId, key: OWNED_PREFIX + tab.id} : null);
     const jobId = (typeof status?.jobId === "string" && status.jobId) || named?.jobId || "";
+    const runId = (typeof status?.runId === "string" && status.runId) || named?.runId || "";
     if (jobId && registry[jobId]) { if (provider === "grok") grokNamed++; continue; } // its job is in progress
     if (!jobId) continue; // not a tab Ashlar can name as its own
     if (provider === "grok") grokNamed++;
     const since = Number.isFinite(named?.at) ? named.at : (seen[tab.id] ??= now);
-    finished.push({tab, since, provider, record: named});
+    finished.push({tab, since, provider, record: named, jobId, runId});
   }
   for (const id of Object.keys(seen)) if (!finished.some(f => String(f.tab.id) === id)) delete seen[id];
   finished.sort((a, b) => a.since - b.since);
   let open = chatgptTemp + grokNamed;
   counts.open = open;
-  for (const {tab, since, provider, record} of finished) {
+  for (const {tab, since, provider, record, jobId, runId} of finished) {
     const due = force || now - since >= TEMP_TAB_CLOSE_AFTER_MS || open > TEMP_TAB_CAP;
     if (!due) { counts.kept += 1; continue; }
     const closed = await tabOp("reclaim", async () => {
       const current = await chrome.tabs.get(tab.id).catch(() => null);
       if (!current || current.pendingUrl || reclaimProvider(current) !== provider) return false;
+      if (provider === "grok" && await grokReclaimHeldByUser(current.id, jobId, runId)) return false;
       await chrome.tabs.remove(tab.id);
       return true;
     }).catch(() => false);

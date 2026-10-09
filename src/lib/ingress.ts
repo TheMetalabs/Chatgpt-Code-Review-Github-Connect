@@ -1,5 +1,5 @@
 import { llmWorkAllowed } from "./ops-comment.ts";
-import { isBotMention } from "./poster.ts";
+import { isBotMention, isExplicitReviewCommand } from "./poster.ts";
 import { stripLoopDirectives } from "./review-loop.ts";
 import { SAMPLE_PRS } from "./samples.ts";
 import type { BotSettings, ForkStatus, Job, Trigger, WebhookLog } from "./types.ts";
@@ -63,7 +63,12 @@ export function reviewSkipReason(opts: {
   // An INDEPENDENT mention is one that survives after the loop-directive spans are removed:
   // `@ashlar-bot review-loop stop` has none (the mention is part of the directive), while
   // `@ashlar-bot review … /review-loop stop` still has the explicit `@ashlar-bot review`.
-  const independentMention = isBotMention(stripLoopDirectives(opts.thread?.userText), opts.settings);
+  const strippedUserText = stripLoopDirectives(opts.thread?.userText);
+  // Issue comments are lane control traffic: only a standalone command may admit a
+  // review. PR bodies and inline follow-ups retain their historical mention semantics.
+  const independentMention = opts.thread?.kind === "mention"
+    ? isExplicitReviewCommand(strippedUserText, opts.settings)
+    : isBotMention(strippedUserText, opts.settings);
   // A stop directive is control-only unless the body ALSO carries an independent mention,
   // which must still queue its own review.
   if (mentionTrigger && loop?.kind === "stop" && !independentMention)

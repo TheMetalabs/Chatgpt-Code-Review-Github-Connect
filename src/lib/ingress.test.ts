@@ -265,6 +265,21 @@ describe("decideIngress", () => {
     if (d.ok) assert.ok(d.job, "explicit mention still queues despite the trailing stop literal");
   });
 
+  it("does not admit a GO/status comment that merely mentions a future /review", () => {
+    const d = decideIngress({
+      ...base,
+      sample: SAMPLE_PRS["pay-412"],
+      trigger: "issue_comment.mention",
+      thread: {
+        kind: "mention",
+        commentId: 1,
+        userText: "Rebase current main, run pre_review_gate, then one plain /review only after green.",
+      },
+    });
+    assert.equal(d.ok, true);
+    if (d.ok) assert.equal(d.skip, "not a mention");
+  });
+
   it("does not run a review for a review-loop stop directive", () => {
     const d = decideIngress({
       ...base,

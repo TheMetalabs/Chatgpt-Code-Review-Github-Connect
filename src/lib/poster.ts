@@ -14,6 +14,20 @@ export function isBotMention(text: string | undefined, settings: BotSettings): b
   return tokens.some((t) => mentionTokenHit(hay, t.toLowerCase()));
 }
 
+/**
+ * A plain review request is a command, not a substring mention.  Lane GO/status
+ * comments routinely explain that a future `/review` is required; treating that
+ * prose as a command admits Ashlar before the lane pre-gate has run.
+ */
+export function isExplicitReviewCommand(text: string | undefined, settings: BotSettings): boolean {
+  const value = text?.trim().replace(/\s+/g, " ").toLowerCase();
+  if (!value) return false;
+  if (value === "/review") return true;
+  // Keep the configured bot mention compatible with existing operators; the
+  // ambiguity that caused stale admissions was the slash command embedded in prose.
+  return mentionTokenHit(value, `@${settings.username.toLowerCase()}`);
+}
+
 function mentionTokenHit(hay: string, token: string): boolean {
   if (!token) return false;
   let from = 0;

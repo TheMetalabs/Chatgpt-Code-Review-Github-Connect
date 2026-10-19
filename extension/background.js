@@ -54,6 +54,33 @@ const DEFAULT_MAX_REVIEW_TABS = 4;
  * Grok legs wait for a slot instead of opening another tab. chrome.storage.local "maxGrokTabs" (1–8)
  * overrides the default; personal grok.com tabs are never counted or closed. */
 const DEFAULT_MAX_GROK_TABS = 3;
+// Durable ownership of the Grok tabs this worker opened (storage.local, so it outlives a service-worker
+// stop, an extension reload and the registry's retirement of the job, unlike the session records that
+// finishTabCleanup drops): {<tabId>: {tabId, jobId, runId, createdAt, endedAt?, how?, cause?, closeAttempts?}}.
+// The stale sweep (sweepGrokTabs) closes what it names once the leg ended or its job vanished. Tab ids
+// are unique only within one browser session, so the ledger is cleared when the browser starts.
+const TAB_LEDGER_KEY = "ashlar:tabLedger";
+// Tab lifecycle events (metadata only): a local ring for the popup/debugging, and a bounded outbox the
+// next bridge ping uploads, so the server log shows what happened to a tab (it logged nothing before).
+const TAB_LOG_KEY = "ashlar:tabLog";
+const TAB_STATS_KEY = "ashlar:tabStats";
+const TAB_LOG_MAX = 60;
+const TAB_OUTBOX_MAX = 24;
+// An ended Ashlar Grok tab (preserved because its page could not prove a close) is reclaimed after this.
+const GROK_FINISHED_GRACE_MS = 5 * 60_000;
+// An owned tab no live leg names and that never ended (its job vanished: reset, lost registry, a
+// replaced allocation) is reclaimed after this: above the longest leg bound (POSTSEND_CAP_MS 30 min).
+const GROK_ORPHAN_GRACE_MS = 45 * 60_000;
+// An owned idle Grok home page (no run on it) is reclaimed after this.
+const GROK_HOME_GRACE_MS = 10 * 60_000;
+// A persisted `allocating` flag older than this no longer holds a slot: a create takes milliseconds
+// inside one tab operation, so a flag this old was left by a worker that stopped mid-create.
+const ALLOCATING_STALE_MS = 5 * 60_000;
+// A leg that never obtained a tab (capacity, the Grok cap, pacing) for this long fails instead of
+// holding its job claimed forever (heartbeats refresh the claim whether or not any tab ever opens).
+const ALLOCATION_WAIT_MS = 60 * 60_000;
+// Preserve causes that mean the tab is the user's now: dropped from the ledger, never swept.
+const USER_HELD_CAUSES = ["user_turn", "edited", "draft", "regenerated", "other_binding"];
 const HEARTBEAT_MS = 10_000;
 const HEALTH_KEY = "bridgeHealth";
 const WORKER_STATUS_KEY = "bridgeWorkerStatus";
@@ -235,6 +262,11 @@ async function moveReplacedTab(addedTabId, removedTabId) {
     if (key.startsWith(PRESERVED_PREFIX) && value?.tabId === removedTabId) records[key] = {...value, tabId: addedTabId};
   }
   if (Object.keys(records).length) await chrome.storage.session.set(records);
+  await updateTabLedger(ledger => {
+    if (!ledger[removedTabId]) return;
+    ledger[addedTabId] = {...ledger[removedTabId], tabId: addedTabId};
+    delete ledger[removedTabId];
+  });
   if (Object.values(await fixDeliveries()).some(record => record.tabId === removedTabId)) {
     await updateFixDeliveries(all => { for (const record of Object.values(all)) if (record.tabId === removedTabId) record.tabId = addedTabId; });
   }
@@ -392,15 +424,18 @@ function probeBridge() {
       const local = (await chrome.storage.local.get([WORKER_STATUS_KEY]))[WORKER_STATUS_KEY];
       // Never forward local blockers, raw observations, prompts, token or URLs.
       const capacity = local?.origin === cfg.origin ? local.capacity : undefined;
+      const outbox = await pendingTabEvents();
       const workerStatus = capacity ? {
         checkedAt: local.checkedAt, admissionPhase: local.admissionPhase,
         activeJobs: local.activeJobs, pendingCleanup: local.pendingCleanup,
         sourceCaptured: local.sourceCaptured, waitingForJson: local.waitingForJson,
         // Counts and times only (chatgptLogSummary): no job ids, prompts or URLs.
         ...(local.chatgptLog ? {chatgptLog: local.chatgptLog} : {}),
+        ...(local.tabs ? {tabs: local.tabs} : {}),
         capacity: Object.fromEntries(["limit","used","managedTabs","reserved","restorationReserved","providerTabs","unverifiedTabs","orphanTabs","unknownReserved"].map(key=>[key,capacity[key]])),
       } : undefined;
-      const result = await api("/api/bridge", {action: "ping", extensionVersion, workerStatus}, cfg.origin);
+      const result = await api("/api/bridge", {action: "ping", extensionVersion, workerStatus, ...(outbox.events.length ? {tabEvents: outbox.events} : {})}, cfg.origin);
+      await acknowledgeTabEvents(outbox.through);
       const bridge = result.bridge || {};
       // Persist an allowlist, not the whole response (which can contain private prompts).
       await chrome.storage.local.set({[HEALTH_KEY]: {
@@ -452,6 +487,8 @@ async function recordWorkerStatus(jobs, origin, admissionPhase) {
       admissionPhase: admission?.phase || "not_checked",
       admissionCheckedAt: admission?.checkedAt,
       chatgptLog: await chrome.storage.local.get([CHATGPT_LOG_KEY, "chatgptLogouts"]).then(got => chatgptLogSummary(got[CHATGPT_LOG_KEY], Date.now(), got.chatgptLogouts)),
+      // Counts and ages only: what the ledger holds and what the stale sweep has done.
+      tabs: await chrome.storage.local.get([TAB_LEDGER_KEY, TAB_STATS_KEY]).then(got => tabLedgerSummary(got[TAB_LEDGER_KEY] || {}, got[TAB_STATS_KEY]), () => undefined),
       sourceCaptured: relevant.reduce((n,job)=>n+job.providers.filter(p=>sourceArchiveDurable(job.states[p]) && !job.states[p].delivered).length,0),
       activeJobs: relevant.filter(activelyReviewing).length,
       recoveringJobs: relevant.filter(job => !activelyReviewing(job)).length,
@@ -919,7 +956,7 @@ async function recordBindingProbe(job, provider, result) {
 
 /** This script's own build. It must equal extension/manifest.json's version (a test pins it); a
  * mismatch means Chrome runs a cached older worker against newer files on disk. */
-const WORKER_BUILD = "1.1.71";
+const WORKER_BUILD = "1.1.72";
 function staleWorker() {
   const onDisk = chrome.runtime.getManifest?.().version;
   return Boolean(onDisk) && onDisk !== WORKER_BUILD;
@@ -1169,7 +1206,7 @@ async function tabCapacityReport(jobs, reservePending = false) {
     const tab=live.get(state.tabId);
     // An allocated-but-not-dispatched tab is still owned even before page binding.
     if(tab && allowedTab(tab,provider) && (!state.started || !knownTabOwner(tab))){ids.add(tab.id);continue;}
-    if(state.allocating)allocating++;
+    if(allocatingActive(state))allocating++;
     else if(state.started || job.resumeProviders?.includes(provider))restoring[provider]++;
     else if(reservePending && !state.tabId && !state.delivered && !state.outcome && !job.serverStatus && !job.recoveryError)reserved++;
   }
@@ -1398,7 +1435,7 @@ async function grokTabsOpen(jobs) {
   for (const job of Object.values(jobs)) {
     const state = job.states?.grok;
     if (!state || state.cleanupDone) continue;
-    if (state.allocating) { n++; continue; }
+    if (allocatingActive(state)) { n++; continue; }
     const tab = live.get(state.tabId);
     if (tab && allowedTab(tab, "grok")) n++;
   }
@@ -1408,6 +1445,209 @@ async function grokTabsOpen(jobs) {
 async function grokTabAvailable(jobs) {
   const setting = (await chrome.storage.local.get(["maxGrokTabs"])).maxGrokTabs;
   return (await grokTabsOpen(jobs)) < grokTabLimit(setting);
+}
+
+/** Whether a leg's `allocating` intent still holds a slot. The flag is written before chrome.tabs.create
+ * and cleared inside the same tab operation, so one older than ALLOCATING_STALE_MS was left by a worker
+ * that stopped mid-create: it must not consume a tab or Grok slot forever (#167 review P2). A flag with
+ * no stamp (written by an older worker) counts until the leg's next poll stamps it (pollProviderBody). */
+function allocatingActive(state) {
+  return Boolean(state?.allocating) && (!Number.isFinite(state.allocatingAt) || Date.now() - state.allocatingAt < ALLOCATING_STALE_MS);
+}
+
+// ---- Tab lifecycle log: what happened to each tab Ashlar opened, kept locally and uploaded on pings ----
+/** One lifecycle event (ids, tab id, cause and counts only: never prompts, answers, URLs or tokens). */
+function tabLog(event, fields = {}) {
+  const clean = Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 160) : value]));
+  return writeInOrder(async () => {
+    const stored = (await chrome.storage.local.get([TAB_LOG_KEY]))[TAB_LOG_KEY];
+    const log = stored && Array.isArray(stored.events) ? stored : {seq: 0, uploaded: 0, events: []};
+    log.seq += 1;
+    log.events = [...log.events, {seq: log.seq, at: Date.now(), event, ...clean}].slice(-TAB_LOG_MAX);
+    await chrome.storage.local.set({[TAB_LOG_KEY]: log});
+  }).catch(() => {});
+}
+/** Events the server has not seen yet (at most TAB_OUTBOX_MAX, oldest first) and the sequence to
+ * acknowledge once a ping carrying them succeeded. */
+async function pendingTabEvents() {
+  const stored = (await chrome.storage.local.get([TAB_LOG_KEY]))[TAB_LOG_KEY];
+  if (!stored || !Array.isArray(stored.events)) return {events: [], through: 0};
+  const events = stored.events.filter(event => event.seq > (stored.uploaded || 0)).slice(0, TAB_OUTBOX_MAX);
+  return {events, through: events.at(-1)?.seq || 0};
+}
+function acknowledgeTabEvents(through) {
+  if (!through) return Promise.resolve();
+  return writeInOrder(async () => {
+    const stored = (await chrome.storage.local.get([TAB_LOG_KEY]))[TAB_LOG_KEY];
+    if (stored && Array.isArray(stored.events) && through > (stored.uploaded || 0)) await chrome.storage.local.set({[TAB_LOG_KEY]: {...stored, uploaded: through}});
+  }).catch(() => {});
+}
+function bumpTabStats(change) {
+  return writeInOrder(async () => {
+    const stats = (await chrome.storage.local.get([TAB_STATS_KEY]))[TAB_STATS_KEY] || {};
+    change(stats);
+    await chrome.storage.local.set({[TAB_STATS_KEY]: stats});
+  }).catch(() => {});
+}
+
+// ---- The ownership ledger (see TAB_LEDGER_KEY) ----
+function clearTabLedger() {
+  return updateTabLedger(ledger => { for (const key of Object.keys(ledger)) delete ledger[key]; }).catch(() => {});
+}
+async function readTabLedger() {
+  const stored = (await chrome.storage.local.get([TAB_LEDGER_KEY]))[TAB_LEDGER_KEY];
+  return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+}
+function updateTabLedger(change) {
+  return writeInOrder(async () => {
+    const ledger = await readTabLedger(), before = JSON.stringify(ledger);
+    const result = change(ledger);
+    if (JSON.stringify(ledger) !== before) await chrome.storage.local.set({[TAB_LEDGER_KEY]: ledger});
+    return result;
+  });
+}
+/** A Grok tab this worker just opened (or adopted by proof): owned from now on, whatever happens to
+ * the job. A ChatGPT tab is not recorded: its leftover reclaim is by URL (reclaimPreservedTabs). */
+async function ledgerRecordTab(job, provider, tabId) {
+  if (provider !== "grok" || !Number.isInteger(tabId)) return;
+  const runId = job.states[provider].runId;
+  await updateTabLedger(ledger => {
+    ledger[tabId] = ledger[tabId]?.jobId === job.jobId ? {...ledger[tabId], runId: runId || ledger[tabId].runId} :
+      {tabId, jobId: job.jobId, runId, createdAt: Date.now()};
+  });
+}
+/** A leg's cleanup ended. A tab the worker closed (or found gone) leaves the ledger; a Grok tab the
+ * worker kept open stays in it, stamped `endedAt`, for the stale sweep, unless its cause says the user
+ * has it now (USER_HELD_CAUSES). An entry is created here when none exists (a tab adopted by recovery,
+ * or opened before the ledger), so every Grok tab that reaches a terminal state is named. */
+async function ledgerEndLeg(job, provider, state, preserved, cause) {
+  if (provider !== "grok" || !Number.isInteger(state.tabId)) return;
+  const keep = preserved && !USER_HELD_CAUSES.includes(cause);
+  await updateTabLedger(ledger => {
+    if (!keep) { delete ledger[state.tabId]; return; }
+    ledger[state.tabId] = {...(ledger[state.tabId] || {tabId: state.tabId, jobId: job.jobId, runId: state.runId, createdAt: Date.now()}),
+      endedAt: Date.now(), how: "preserved", cause};
+  });
+}
+/** A Grok tab at the site root (the page every Ashlar tab opens on): no conversation on it. */
+function grokHomeUrl(url) {
+  try { return new URL(url).pathname.replace(/\/+$/, "") === ""; } catch { return false; }
+}
+function tabLedgerSummary(ledger, stats = {}) {
+  const now = Date.now(), entries = Object.values(ledger);
+  const ended = entries.filter(entry => Number.isFinite(entry.endedAt));
+  return {ledgerOwned: entries.length, ledgerEnded: ended.length,
+    oldestEndedAgeMs: ended.length ? Math.max(0, now - Math.min(...ended.map(entry => entry.endedAt))) : 0,
+    sweepClosed: stats.closed || 0, sweepFailed: stats.failed || 0, sweepReleased: stats.released || 0, lastSweepAt: stats.lastSweepAt || 0};
+}
+
+/** Whether the user holds an Ashlar-owned Grok tab (a draft, a follow-up, an edit, a regenerate, or a
+ * binding of another job): then it is released from the ledger, never closed. A page that cannot
+ * answer holds nothing against the close; an unbound conversation page is closed (see below). An unbound idle home page (a tab opened for a run that
+ * never sent) answers job_mismatch to can-close: the undispatched release then says whether it is
+ * still blank (Ashlar's) or carries the user's turn or draft. */
+async function grokLedgerTabHeld(tab, entry) {
+  const {jobId, runId} = entry;
+  if (!jobId || !runId) return false;
+  const files = contentFiles("grok"), allocationUrl = providerUrl("grok");
+  let result;
+  try { result = await askPage(tab.id, {type: "ashlar-can-close", jobId, provider: "grok", runId, allocationUrl}, files); } catch { return false; }
+  if (result?.code === "job_mismatch") {
+    if (!grokHomeUrl(tab.url)) {
+      // A conversation page: job_mismatch means either another job's binding (not Ashlar's: released) or
+      // NO binding at all (a reloaded or re-injected page of the tab the ledger proves Ashlar opened,
+      // with nothing the user did on record: closed, or it would leak for good). The read-only status
+      // tells them apart; an answer that cannot be had is retried by the next sweep, never dropped.
+      const status = await askPage(tab.id, {type: "ashlar-tab-status"}, files);
+      if (status?.ownershipProtocol !== 1) throw new Error("the tab's binding could not be read");
+      return typeof status.jobId === "string" && status.jobId !== "" && status.jobId !== jobId;
+    }
+    let blank;
+    try { blank = await askPage(tab.id, {type: "ashlar-fix-cancel", jobId, provider: "grok", runId, undispatched: true, allocationUrl}, files); } catch { return false; }
+    return !(blank?.ok === true && blank.ownership === "owned");
+  }
+  const cause = result?.cause;
+  if (["draft", "user_turn", "edited", "regenerated"].includes(cause)) return true;
+  return result?.ownership === "takenOver" && cause !== "navigated";
+}
+
+/** The stale sweep: closes Grok tabs this worker opened (the ledger) that no live leg works on: a
+ * leg that ended with the tab kept (GROK_FINISHED_GRACE_MS after it ended), an idle home page
+ * (GROK_HOME_GRACE_MS), and a tab whose job vanished (GROK_ORPHAN_GRACE_MS). It never touches a tab
+ * the ledger does not name (the user's own grok.com tabs), the tab the user is looking at, or one
+ * the page says the user took over. A tab that is gone, or that left grok.com, drops out of the ledger.
+ * A failed close is logged and the entry stays, so the next sweep retries it. */
+let grokSweepFlight = null;
+function sweepGrokTabs(options = {}) {
+  grokSweepFlight ||= sweepGrokBody(options).finally(() => { grokSweepFlight = null; });
+  return grokSweepFlight;
+}
+async function sweepGrokBody({force = false} = {}) {
+  const cfg = await settings();
+  const counts = {closed: 0, kept: 0, released: 0, gone: 0, failed: 0};
+  if (!cfg.enabled || !cfg.origin) return {ok: false, error: "the worker is not configured", ...counts};
+  if (await maintenanceHeld()) return {ok: false, error: "extension maintenance is active", ...counts};
+  const ledger = await writeInOrder(readTabLedger); // after a browser-start clear that is still queued
+  const registry = await workerJobs(cfg.origin);
+  const liveLegTabs = () => new Set(Object.values(registry).map(job => job.states?.grok).filter(state => state && !state.cleanupDone &&
+    Number.isInteger(state.tabId)).map(state => liveTabId(state.tabId)));
+  const tabs = new Map((await chrome.tabs.query({})).map(tab => [tab.id, tab]));
+  const now = Date.now(), drop = new Set(), patch = {}, due = [];
+  for (const [key, entry] of Object.entries(ledger)) {
+    const tab = tabs.get(Number(key));
+    if (!tab) { drop.add(key); counts.gone++; continue; }
+    if (!allowedTab(tab, "grok")) { drop.add(key); counts.released++; void tabLog("tab_left_grok", {provider: "grok", jobId: entry.jobId, tabId: tab.id}); continue; }
+    if (tab.pendingUrl || liveLegTabs().has(tab.id)) { counts.kept++; continue; }
+    const ended = Number.isFinite(entry.endedAt);
+    const since = ended ? entry.endedAt : entry.createdAt;
+    const grace = ended ? GROK_FINISHED_GRACE_MS : grokHomeUrl(tab.url) ? GROK_HOME_GRACE_MS : GROK_ORPHAN_GRACE_MS;
+    // `force` (an explicit reclaim) skips only the age grace: the tab the user is looking at, and one the
+    // user opened after Ashlar finished, are protected whatever asked.
+    if (tab.active === true || (!force && now - since < grace)) { counts.kept++; continue; }
+    if (ended && Number.isFinite(tab.lastAccessed) && tab.lastAccessed > entry.endedAt + 60_000) {
+      drop.add(key); counts.released++; // the user opened it after Ashlar was done with it: theirs now
+      void tabLog("tab_released_user_opened", {provider: "grok", jobId: entry.jobId, tabId: tab.id});
+      continue;
+    }
+    due.push({key, entry, reason: ended ? "finished" : grokHomeUrl(tab.url) ? "idle_home" : "orphaned", ageMs: now - since});
+  }
+  for (const {key, entry, reason, ageMs} of due) {
+    const id = Number(key);
+    let verdict, error;
+    try {
+      verdict = await tabOp("grok-sweep", async () => {
+        let current;
+        try { current = await chrome.tabs.get(id); } catch { return "gone"; }
+        if (current.pendingUrl || !allowedTab(current, "grok")) return "released";
+        if (liveLegTabs().has(id) || current.active === true) return "live";
+        const answerable = (!current.status || current.status === "complete") && current.discarded !== true && current.frozen !== true;
+        if (answerable && await grokLedgerTabHeld(current, entry)) return "released";
+        await chrome.tabs.remove(id);
+        return "closed";
+      });
+    } catch (e) { verdict = "failed"; error = String(e?.message || e).slice(0, 160); }
+    if (verdict === "closed") { drop.add(key); counts.closed++; void tabLog("tab_closed_by_sweep", {provider: "grok", jobId: entry.jobId, tabId: id, reason, ageMs}); }
+    else if (verdict === "gone") { drop.add(key); counts.gone++; }
+    else if (verdict === "released") { drop.add(key); counts.released++; void tabLog("tab_released_user_held", {provider: "grok", jobId: entry.jobId, tabId: id, reason}); }
+    else if (verdict === "live") counts.kept++;
+    else {
+      counts.failed++;
+      patch[key] = {closeAttempts: (entry.closeAttempts || 0) + 1, lastCloseError: error || "close did not complete", lastCloseAt: Date.now()};
+      void tabLog("tab_close_failed", {provider: "grok", jobId: entry.jobId, tabId: id, reason, attempts: patch[key].closeAttempts, error: patch[key].lastCloseError});
+    }
+  }
+  await updateTabLedger(current => {
+    for (const key of drop) delete current[key];
+    for (const [key, change] of Object.entries(patch)) if (current[key]) Object.assign(current[key], change);
+  });
+  await bumpTabStats(stats => {
+    stats.lastSweepAt = Date.now();
+    stats.closed = (stats.closed || 0) + counts.closed;
+    stats.failed = (stats.failed || 0) + counts.failed;
+    stats.released = (stats.released || 0) + counts.released;
+  });
+  return {ok: true, ...counts, open: Object.keys(ledger).length - drop.size};
 }
 
 /** Open the leg's tab, inside its poll operation: the capacity check, the intent, the create and
@@ -1421,13 +1661,17 @@ async function allocateProviderTab(job, provider, jobs) {
   if (state.tabId || state.allocating || await maintenanceHeld() || !await tabCapacityAvailable(jobs)) return;
   if (provider === "grok" && !await grokTabAvailable(jobs)) return;
   state.allocating = true;
+  state.allocatingAt = Date.now();
   try { await saveJobs(jobs); }
-  catch (error) { delete state.allocating; throw error; } // No create was attempted.
+  catch (error) { delete state.allocating; delete state.allocatingAt; throw error; } // No create was attempted.
   try { await beginFixDelivery(job, provider); }
-  catch (error) { delete state.allocating; await saveJobs(jobs).catch(() => {}); throw error; } // No create was attempted.
+  catch (error) { delete state.allocating; delete state.allocatingAt; await saveJobs(jobs).catch(() => {}); throw error; } // No create was attempted.
   let created;
   try {
     created = await chrome.tabs.create({url: providerUrl(provider, job.reasoning?.[provider]), active: true});
+    // Durable ownership first: a worker stopped right after the create still names the tab (ledger).
+    await ledgerRecordTab(job, provider, created.id).catch(error => { void tabLog("ledger_write_failed", {provider, jobId: job.jobId, tabId: created.id, error: String(error?.message || error)}); });
+    void tabLog("tab_created", {provider, jobId: job.jobId, runId: state.runId, tabId: created.id});
     await rememberOwnedTab(job, provider, false, created.id);
     // The delivery record says `created` only now that the tab exists and carries its owned record.
     // A failed promotion is not fatal: that owned record proves the tab (reconcileFixDeliveries).
@@ -1437,10 +1681,11 @@ async function allocateProviderTab(job, provider, jobs) {
     state.tabId = created.id;
     workerStep(job,provider,"tab_created");
     delete state.allocating;
+    delete state.allocatingAt;
     await saveJobs(jobs); // Durable binding before any prompt dispatch.
   } catch (error) {
     if (!created) {
-      delete state.allocating; await saveJobs(jobs);
+      delete state.allocating; delete state.allocatingAt; await saveJobs(jobs);
       await forgetFixDelivery(job).catch(() => {}); // the create failed: no tab holds this delivery
     } else if (!state.tabId) {
       // The tab exists but a write after the create failed: the leg names it (in memory; the intent
@@ -1488,7 +1733,14 @@ async function finishTabCleanup(job, provider, jobs, reason, cause) {
     state.preserveCause = preserveCauses().includes(cause) ? cause : "unknown";
     workerStep(job, provider, `preserve_${state.preserveCause}`);
   }
+  const preservedTab = Boolean(reason?.includes("preserved")), endStage = preservedTab ? "tab_preserved" : state.closeIssued === true ? "tab_closed" : "tab_lost";
   if (legHadTab(state)) workerStep(job,provider,reason?.includes("preserved") ? "tab_preserved" : state.closeIssued === true ? "tab_closed" : "tab_lost");
+  if (legHadTab(state)) {
+    // Durable ownership (a kept Grok tab stays named for the stale sweep) and a lifecycle event.
+    await ledgerEndLeg(job, provider, state, preservedTab, state.preserveCause).catch(error => { void tabLog("ledger_write_failed", {provider, jobId: job.jobId, tabId: state.tabId, error: String(error?.message || error)}); });
+    void tabLog(endStage, {provider, jobId: job.jobId, runId: state.runId, tabId: state.tabId, cause: preservedTab ? state.preserveCause : undefined,
+      outcome: state.outcome?.ok === true ? "collected" : state.outcome?.code || (state.abandoned ? state.abandonedAs || "abandoned" : undefined), note: reason});
+  }
   if (reason) state.cleanupNote = reason;
   delete state.cleanupError;
   delete state.cleanupWaitReason;
@@ -1561,11 +1813,19 @@ async function cleanupProviderBody(job, provider, jobs) {
       await saveJobs(jobs);
     }
     if (!allowedTab(tab, provider)) return finishTabCleanup(job, provider, jobs, "user navigated away; tab preserved", "navigated");
-    return forceCloseFixTab(job, provider, jobs, tab);
+    // A failed remove (the user is dragging the tab, a write before it failed) rejects to the lane
+    // (advanceJob records lastError); the leg stays delivered and uncleaned, so the next tick retries.
+    return forceCloseFixTab(job, provider, jobs, tab).catch(error => { logCleanupFailure(job, provider, state, error); throw error; });
   } catch (e) {
     state.cleanupError = String(e.message || e).slice(0, 240);
     await saveJobs(jobs);
+    logCleanupFailure(job, provider, state, e);
   }
+}
+/** A close or cleanup step that failed is retried by the next tick; logged so it is never silent. */
+function logCleanupFailure(job, provider, state, error) {
+  state.cleanupFailures = (state.cleanupFailures || 0) + 1;
+  void tabLog("cleanup_failed", {provider, jobId: job.jobId, tabId: state.tabId, attempts: state.cleanupFailures, error: String(error?.message || error)});
 }
 
 /** The one managed close, for a tab whose page just proved it may close (forceCloseFixTab): the
@@ -1577,8 +1837,15 @@ async function cleanupProviderBody(job, provider, jobs) {
 async function closeProvenTab(job, provider, jobs, tabId, proven, reason) {
   const current = await chrome.tabs.get(tabId);
   const holds = typeof proven === "function" ? proven : url => url === proven;
-  if (current.pendingUrl || !holds(current.url) || current.status === "loading") return false;
   const state = job.states[provider];
+  if (current.pendingUrl || !holds(current.url) || current.status === "loading") {
+    // Asked again next tick; said once, so a tab that never settles is visible in the log.
+    if (!state.closeDeferredLogged) {
+      state.closeDeferredLogged = true;
+      void tabLog("close_deferred", {provider, jobId: job.jobId, tabId, why: current.pendingUrl ? "navigating" : current.status === "loading" ? "loading" : "moved"});
+    }
+    return false;
+  }
   state.closeRequested = true;
   // The worker's own close (a sweep also sets closeRequested, to accept an absence it confirmed).
   state.closeIssued = true;
@@ -2380,6 +2647,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   // or use a newly allocated binding, including findOriginalTab's harvest probes.
   await saveJobs(jobs);
   if (state.allocating && !state.tabId) {
+    state.allocatingAt ??= Date.now();
     // Creation may have succeeded before a worker restart. Recover a recorded owner;
     // if none can be established, keep the intent instead of opening another tab.
     const session = await chrome.storage.session.get(null);
@@ -2390,6 +2658,13 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     else {
       const original = await findOriginalTab(job, provider);
       if (original) { state.tabId = original.id; state.started = true; }
+    }
+    // The durable ledger names a Grok tab created for this run even when the session records are gone
+    // (an extension reload) and the page cannot answer (frozen, discarded): adopted, never duplicated.
+    if (!state.tabId && provider === "grok") {
+      const entry = Object.values(await readTabLedger()).find(item => item.jobId === job.jobId && item.runId === state.runId && !Number.isFinite(item.endedAt));
+      const tab = entry ? await chrome.tabs.get(entry.tabId).catch(() => null) : null;
+      if (tab && allowedTab(tab, "grok")) state.tabId = tab.id;
     }
     // A fix allocation is validated against its delivery record and the tab inventory (the record
     // can say `created` before state.tabId was durably saved): see fixAllocationEvidence.
@@ -2411,9 +2686,20 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
       await forgetFixDelivery(job);
       if (state.outcome) return;
     } else if (!state.tabId) {
-      state.connectionError = "tab creation outcome unknown; original allocation preserved";
+      state.allocatingAt ??= Date.now();
+      if (allocatingActive(state)) {
+        state.connectionError = "tab creation outcome unknown; original allocation preserved";
+        await saveJobs(jobs);
+        return;
+      }
+      // Nothing proves a tab after ALLOCATING_STALE_MS: the worker stopped before its create returned
+      // (or the tab is gone). The intent no longer holds a slot; the allocation below opens one tab.
+      // No prompt was dispatched (state.started is false), so nothing is sent twice.
+      delete state.allocating;
+      delete state.allocatingAt;
+      delete state.connectionError;
       await saveJobs(jobs);
-      return;
+      void tabLog("allocating_reclaimed", {provider, jobId: job.jobId, runId: state.runId});
     } else {
       delete state.allocating;
       await saveJobs(jobs);
@@ -2426,6 +2712,17 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
   }
   if (!state.tabId) {
     if (observeOnly) return;
+    // A leg that has waited this long for a tab slot never will (a re-claim and every heartbeat only
+    // refresh the job's claim, they open nothing): ended, so its job settles instead of idling claimed.
+    state.slotWaitSince ??= Date.now();
+    if (Date.now() - state.slotWaitSince >= ALLOCATION_WAIT_MS) {
+      delete state.slotWaitSince;
+      state.outcome = failure("tab_capacity", `no tab slot became free for ${ALLOCATION_WAIT_MS / 60_000} minutes (tab capacity, the ${provider} tab cap or send pacing); nothing was sent`);
+      workerStep(job, provider, "allocation_timeout");
+      await saveJobs(jobs);
+      void tabLog("allocation_timeout", {provider, jobId: job.jobId});
+      return;
+    }
     const quota = await quotaMap();
     if (!providerOpen(quota, provider)) {
       state.outcome = failure("quota", "usage limit — waiting for reset");
@@ -2444,6 +2741,7 @@ async function pollProviderBody(job, provider, jobs, observeOnly) {
     if (await dispatchBlocked(job, provider, jobs, true)) return;
     await allocateProviderTab(job, provider, jobs);
     if (!state.tabId) return;
+    delete state.slotWaitSince;
   }
   if ((await chrome.storage.session.get([closedKey(job, provider)]))[closedKey(job, provider)]) {
     state.outcome = failure("tab_closed", "review tab was explicitly closed");
@@ -3672,7 +3970,10 @@ function loop() {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ashlar-poll") { void heartbeatTick(); void tick(); void autoSweepStuckJobs(); void reclaimPreservedTabs().catch(() => {}); }
+  if (alarm.name === "ashlar-poll") {
+    void heartbeatTick(); void tick(); void autoSweepStuckJobs(); void reclaimPreservedTabs().catch(() => {});
+    void sweepGrokTabs().catch(error => void tabLog("sweep_failed", {error: String(error?.message || error)}));
+  }
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "ashlar-poll-now") {
@@ -3685,7 +3986,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message?.type === "ashlar-reclaim-preserved") {
-    reclaimPreservedTabs({force: true}).then(sendResponse, error => sendResponse({ok: false, error: String(error?.message || error)}));
+    Promise.all([reclaimPreservedTabs({force: true}), sweepGrokTabs({force: true}).catch(error => ({ok: false, error: String(error?.message || error)}))])
+      .then(([reclaimed, grok]) => sendResponse({...reclaimed, closed: (reclaimed.closed || 0) + (grok.closed || 0), grokSweep: grok}),
+        error => sendResponse({ok: false, error: String(error?.message || error)}));
     return true;
   }
   if (message?.type === "ashlar-hard-reset") {
@@ -3715,6 +4018,9 @@ chrome.tabs.onRemoved.addListener((id, info) => rememberClosedTab(id, info));
 chrome.tabs.onReplaced.addListener((added, removed) => rekeyReplacedTab(added, removed));
 chrome.runtime.onInstalled.addListener(loop);
 chrome.runtime.onStartup.addListener(loop);
+// A new browser session renumbers tabs: an old id may name the user's tab now, so nothing is owned.
+// (An extension reload or a service-worker restart fires neither event: the ledger survives those.)
+chrome.runtime.onStartup.addListener(() => void clearTabLedger());
 void clearCommittedMaintenanceOnWorkerStart();
 loop();
 setInterval(() => void tick(), POLL_MS);

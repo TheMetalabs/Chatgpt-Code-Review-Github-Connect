@@ -129,6 +129,19 @@ code, so a future skill or change can find the rule instead of re-learning it.
   the worker registry, and the oldest finished ones first while more than 8 Ashlar temporary tabs are
   open. A job in progress, a tab with no Ashlar binding and any non-temporary conversation are never
   touched. Run it at once with the extension message `ashlar-reclaim-preserved`.
+- **Grok review tabs are owned durably (1.1.72).** #169's reclaim names a leftover Grok tab only through
+  its live page or session records, and a tab the worker kept (the page could not prove the close: Grok
+  moved it to `/c/<id>` unpinned, or Chrome froze/discarded it) lost every session record when its leg
+  retired, so 34 of 35 tabs piled up on the Studio. The worker now writes `ashlar:tabLedger`
+  (storage.local, cleared on browser start) when it opens a Grok tab; `sweepGrokTabs` (every minute,
+  and with `ashlar-reclaim-preserved`) closes ledger tabs no live leg works on: 5 min after a kept
+  tab's leg ended, 10 min for an idle home page, 45 min for a tab whose job vanished. Never closed: tabs
+  the ledger does not name, the active tab, a tab the page says the user took over (draft, follow-up,
+  edit, regenerate). A stale `allocating` flag (older than 5 min) no longer holds a slot, and a leg
+  without a tab slot for 60 min fails instead of idling claimed. Tab events (`tab_created`,
+  `tab_closed`, `tab_preserved`, `tab_closed_by_sweep`, `tab_close_failed`, `cleanup_failed`,
+  `allocating_reclaimed`, ...) ride the bridge ping into the server log as `[ashlar] tab-event ...`
+  lines, and the worker status carries the ledger counts (`tabs`).
 
 ### Deploys
 

@@ -14,6 +14,7 @@ export const PROGRESS_LABELS = {
     tab_created: "Review tab created",
     run_dispatched: "Page runner acknowledged · submission not yet confirmed",
     run_rebound: "Page lost its binding · re-bound in the dispatched tab to observe (never resent)",
+    allocation_timeout: "No tab slot became free for 60 minutes (tab capacity, the Grok tab cap or send pacing) · the leg was ended; nothing was sent",
     binding_lost: "Page binding stayed unavailable for 10 minutes · leg failed; nothing was resent",
     taken_before_send: "Tab taken over before the prompt was sent (it left its new chat, or the user wrote there) · nothing was sent; tab kept",
     overlays_dismissing: "Prompt not sent · dismissing page dialogs",

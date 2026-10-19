@@ -742,10 +742,17 @@ export function failBridgeProvider(jobId: string, provider: ReviewProvider, erro
   const job = getHarbor().jobs.find(j => j.id === jobId);
   if (!job || job.status !== "awaiting_chat") return true;
   if (!llmWorkAllowed(job) || !ownsLease(job, leaseId)) return false;
-  if (job.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim())) return true;
-  // A leg the server ended (reviewer turned off) is acknowledged and dropped: a refusal would make the
-  // worker retry it on every tick and keep its tab held.
-  if (job.endedLegs?.includes(provider)) return true;
+  // A leg that already holds a stored answer, or that the server ended (reviewer turned off), is
+  // acknowledged and dropped: a refusal would make the worker retry it on every tick and keep its tab
+  // held. Its tab is gone or released now (this is the worker's explicit terminal report), so the
+  // generating flag a heartbeat set must not outlive it (a stuck `generating` also read as a
+  // submission in flight and held back the profile's next job).
+  if (job.storedLegs?.some(leg => leg.provider === provider && leg.raw.trim()) || job.endedLegs?.includes(provider)) {
+    if (job.generating?.[provider] === true) {
+      patchHarborJob(jobId, current => ({...current, generating: {...current.generating, [provider]: false}, updatedAt: Date.now()}));
+    }
+    return true;
+  }
   const enabled = job.fpProviders?.length ? job.fpProviders : job.reviewProviders ?? [];
   if (!enabled.includes(provider)) return false;
   const prefix = error.split(":", 1)[0];

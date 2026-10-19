@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { bridgePromptText } from "@/lib/chat-prompt";
+import { logTabEvents } from "@/lib/tab-events";
 import type { ProviderError, ReviewProvider } from "@/lib/types";
 import {
   recoverBridgeJob,
@@ -94,6 +95,7 @@ export const Route = createFileRoute("/api/bridge")({
           clientId?: string;
           bindings?: unknown;
           workerStatus?: unknown;
+          tabEvents?: unknown;
           extensionVersion?: unknown;
           attachmentProtocol?: number;
           fixProtocol?: number;
@@ -125,6 +127,7 @@ export const Route = createFileRoute("/api/bridge")({
           return Response.json({ ok: false, error: "bad token" }, { status: 401, headers });
         }
         bridgeHeartbeat(body.workerStatus, body.extensionVersion);
+        if (body.tabEvents !== undefined) logTabEvents(body.tabEvents);
         // Owner liveness from the authenticated request itself, before any action patches the job or
         // writes history (either can fail without the owner having gone anywhere).
         noteBridgeRequest(body);

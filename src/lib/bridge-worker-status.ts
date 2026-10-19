@@ -19,7 +19,21 @@ export type WorkerStatus = {
   };
   /** The ChatGPT submission log's summary (background.js chatgptLogSummary). */
   chatgptLog?: ChatgptLog;
+  /** Grok tabs the worker owns and what its stale sweep did (background.js tabLedgerSummary). */
+  tabs?: TabLedgerSummary;
 };
+export type TabLedgerSummary = {
+  ledgerOwned: number; ledgerEnded: number; oldestEndedAgeMs: number;
+  sweepClosed: number; sweepFailed: number; sweepReleased: number; lastSweepAt: number;
+};
+function tabLedgerSummary(value: unknown): TabLedgerSummary | undefined {
+  const row = object(value);
+  if (!row) return;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1e13 ? v : undefined);
+  const keys = ["ledgerOwned", "ledgerEnded", "oldestEndedAgeMs", "sweepClosed", "sweepFailed", "sweepReleased", "lastSweepAt"] as const;
+  if (keys.some((key) => n(row[key]) === undefined)) return;
+  return Object.fromEntries(keys.map((key) => [key, n(row[key])])) as TabLedgerSummary;
+}
 export type ChatgptLog = {
   hourly: {hour: string; review: number; fix: number}[];
   sinceLogout: {from: number; review: number; fix: number};
@@ -61,7 +75,8 @@ export function sanitizeWorkerStatus(value: unknown, version: unknown, receivedA
     capacity: {limit, used, managedTabs: capacity.managedTabs as number, reserved: capacity.reserved as number,
       restorationReserved: capacity.restorationReserved as number, providerTabs: capacity.providerTabs as number,
       unverifiedTabs: capacity.unverifiedTabs as number, orphanTabs: count(capacity.orphanTabs) ?? 0, unknownReserved: count(capacity.unknownReserved) ?? 0},
-    ...(chatgptLog(row.chatgptLog) ? {chatgptLog: chatgptLog(row.chatgptLog)} : {})};
+    ...(chatgptLog(row.chatgptLog) ? {chatgptLog: chatgptLog(row.chatgptLog)} : {}),
+    ...(tabLedgerSummary(row.tabs) ? {tabs: tabLedgerSummary(row.tabs)} : {})};
 }
 export function workerStatusLabel(status: WorkerStatus | undefined, fresh: boolean): string {
   if (!status) return "Heartbeat only · admission state not reported";

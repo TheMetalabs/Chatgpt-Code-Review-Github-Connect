@@ -4,6 +4,8 @@
 export type TabEvent = {seq: number; at: number; event: string; fields: Record<string, string | number>};
 
 const MAX_EVENTS = 32;
+// The largest time a Date can hold; anything beyond would make toISOString throw and break the ping.
+const MAX_TIME = 8.64e15;
 const FIELDS = ["provider", "jobId", "runId", "tabId", "cause", "outcome", "reason", "why", "attempts", "ageMs", "error", "note"] as const;
 
 function text(value: string): string {
@@ -25,7 +27,7 @@ export function sanitizeTabEvents(value: unknown): TabEvent[] {
     }
     out.push({
       seq: typeof row.seq === "number" && Number.isSafeInteger(row.seq) ? row.seq : 0,
-      at: typeof row.at === "number" && Number.isFinite(row.at) ? row.at : 0,
+      at: typeof row.at === "number" && Number.isFinite(row.at) && row.at >= 0 && row.at <= MAX_TIME ? row.at : 0,
       event: row.event,
       fields,
     });

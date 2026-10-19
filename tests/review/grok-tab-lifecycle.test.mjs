@@ -209,6 +209,35 @@ test('duplicate idle Ashlar Grok home tabs are closed past the grace; the user\'
   assert.deepEqual([...b.tabs.keys()].sort(), [4, 5, 6], 'live leg, a fresh home, and the user\'s own home tab remain');
 });
 
+test('an ended Grok tab on /c/<id> whose page carries no binding is closed past the grace, not dropped; another job\'s binding is released', async () => {
+  const now = Date.now();
+  const tabs = new Map([[1, {id: 1, url: CONV, status: 'complete'}], [2, {id: 2, url: CONV + '2', status: 'complete'}], [3, {id: 3, url: CONV + '3', status: 'complete'}]]);
+  const bound = {1: '', 2: 'other-job'};
+  const b = rig({tabs, ledger: {
+    1: entry(1, {endedAt: now - 30 * MIN, how: 'preserved', cause: 'navigated'}),
+    2: entry(2, {endedAt: now - 30 * MIN, how: 'preserved', cause: 'navigated'}),
+    3: entry(3, {endedAt: now - 30 * MIN, how: 'preserved', cause: 'navigated'}),
+  }, handler: (id, msg) => {
+    if (msg.type === 'ashlar-can-close') return {ok: false, code: 'job_mismatch'};
+    if (msg.type === 'ashlar-tab-status') return id === 3 ? {ok: false} : {ok: true, ownershipProtocol: 1, jobId: bound[id], runId: '', provider: 'grok', released: false, url: tabs.get(id).url};
+    return {ok: false, code: 'busy'};
+  }});
+  const result = await b.context.sweepGrokTabs();
+  assert.deepEqual(b.closedTabs, [1], JSON.stringify(result));
+  assert.equal(b.tabs.has(2), true, 'another job\'s binding is not Ashlar\'s');
+  assert.equal(b.local.state[LEDGER][2], undefined);
+  assert.equal(b.tabs.has(3), true, 'a binding that cannot be read is retried, not closed');
+  assert.equal(b.local.state[LEDGER][3].closeAttempts, 1, 'and stays in the ledger');
+  assert.equal(result.failed, 1);
+  // The invariants hold for an unbound page too: the active tab is kept, a tab the user opened after endedAt is released.
+  const c = rig({tabs: new Map([[1, {id: 1, url: CONV, status: 'complete', active: true}], [2, {id: 2, url: CONV + '2', status: 'complete', lastAccessed: now}]]),
+    handler: (id, msg) => msg.type === 'ashlar-can-close' ? {ok: false, code: 'job_mismatch'} : {ok: true, ownershipProtocol: 1, jobId: '', runId: '', provider: 'grok'},
+    ledger: {1: entry(1, {endedAt: now - 30 * MIN}), 2: entry(2, {endedAt: now - 30 * MIN})}});
+  await c.context.sweepGrokTabs({force: true});
+  assert.deepEqual(c.closedTabs, []);
+  assert.equal(c.local.state[LEDGER][1] !== undefined && c.local.state[LEDGER][2] === undefined, true);
+});
+
 test('an idle home tab the user typed into is released, not closed', async () => {
   const tabs = new Map([[1, {id: 1, url: GROK, status: 'complete'}]]);
   const b = rig({tabs, ledger: {1: entry(1, {createdAt: Date.now() - 30 * MIN})},
@@ -398,6 +427,10 @@ test('server: tab events are sanitized and logged as one line each; the worker-s
   assert.equal(lines.join('').includes('SECRET'), false);
   assert.equal(lines[1].includes('\n'), false);
   assert.equal(sanitizeTabEvents('nope').length, 0);
+  const wild = [1e300, -1, 8.64e15 + 1].map(at => ({event: 'tab_created', at}));
+  assert.doesNotThrow(() => logTabEvents(wild, () => {}), 'an out-of-range time never throws');
+  assert.equal(JSON.stringify(sanitizeTabEvents(wild).map(e => e.at)), '[0,0,0]');
+  assert.equal(sanitizeTabEvents([{event: 'tab_created', at: 8.64e15}])[0].at, 8.64e15);
   assert.equal(sanitizeTabEvents(Array.from({length: 100}, () => ({event: 'tab_created'}))).length, 32);
   const {sanitizeWorkerStatus} = loadTs('src/lib/bridge-worker-status.ts');
   const base = {checkedAt: 10, admissionPhase: 'idle', capacity: {limit: 4, used: 1, managedTabs: 1, reserved: 0, restorationReserved: 0, providerTabs: 3, unverifiedTabs: 0}};

@@ -1544,7 +1544,7 @@ function tabLedgerSummary(ledger, stats = {}) {
 
 /** Whether the user holds an Ashlar-owned Grok tab (a draft, a follow-up, an edit, a regenerate, or a
  * binding of another job): then it is released from the ledger, never closed. A page that cannot
- * answer holds nothing against the close. An unbound idle home page (a tab opened for a run that
+ * answer holds nothing against the close; an unbound conversation page is closed (see below). An unbound idle home page (a tab opened for a run that
  * never sent) answers job_mismatch to can-close: the undispatched release then says whether it is
  * still blank (Ashlar's) or carries the user's turn or draft. */
 async function grokLedgerTabHeld(tab, entry) {
@@ -1554,7 +1554,15 @@ async function grokLedgerTabHeld(tab, entry) {
   let result;
   try { result = await askPage(tab.id, {type: "ashlar-can-close", jobId, provider: "grok", runId, allocationUrl}, files); } catch { return false; }
   if (result?.code === "job_mismatch") {
-    if (!grokHomeUrl(tab.url)) return true;
+    if (!grokHomeUrl(tab.url)) {
+      // A conversation page: job_mismatch means either another job's binding (not Ashlar's: released) or
+      // NO binding at all (a reloaded or re-injected page of the tab the ledger proves Ashlar opened,
+      // with nothing the user did on record: closed, or it would leak for good). The read-only status
+      // tells them apart; an answer that cannot be had is retried by the next sweep, never dropped.
+      const status = await askPage(tab.id, {type: "ashlar-tab-status"}, files);
+      if (status?.ownershipProtocol !== 1) throw new Error("the tab's binding could not be read");
+      return typeof status.jobId === "string" && status.jobId !== "" && status.jobId !== jobId;
+    }
     let blank;
     try { blank = await askPage(tab.id, {type: "ashlar-fix-cancel", jobId, provider: "grok", runId, undispatched: true, allocationUrl}, files); } catch { return false; }
     return !(blank?.ok === true && blank.ownership === "owned");

@@ -1594,8 +1594,10 @@ async function sweepGrokBody({force = false} = {}) {
     const ended = Number.isFinite(entry.endedAt);
     const since = ended ? entry.endedAt : entry.createdAt;
     const grace = ended ? GROK_FINISHED_GRACE_MS : grokHomeUrl(tab.url) ? GROK_HOME_GRACE_MS : GROK_ORPHAN_GRACE_MS;
-    if (!force && (now - since < grace || tab.active === true)) { counts.kept++; continue; }
-    if (!force && ended && Number.isFinite(tab.lastAccessed) && tab.lastAccessed > entry.endedAt + 60_000) {
+    // `force` (an explicit reclaim) skips only the age grace: the tab the user is looking at, and one the
+    // user opened after Ashlar finished, are protected whatever asked.
+    if (tab.active === true || (!force && now - since < grace)) { counts.kept++; continue; }
+    if (ended && Number.isFinite(tab.lastAccessed) && tab.lastAccessed > entry.endedAt + 60_000) {
       drop.add(key); counts.released++; // the user opened it after Ashlar was done with it: theirs now
       void tabLog("tab_released_user_opened", {provider: "grok", jobId: entry.jobId, tabId: tab.id});
       continue;
@@ -1610,7 +1612,7 @@ async function sweepGrokBody({force = false} = {}) {
         let current;
         try { current = await chrome.tabs.get(id); } catch { return "gone"; }
         if (current.pendingUrl || !allowedTab(current, "grok")) return "released";
-        if (liveLegTabs().has(id)) return "live";
+        if (liveLegTabs().has(id) || current.active === true) return "live";
         const answerable = (!current.status || current.status === "complete") && current.discarded !== true && current.frozen !== true;
         if (answerable && await grokLedgerTabHeld(current, entry)) return "released";
         await chrome.tabs.remove(id);

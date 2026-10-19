@@ -148,6 +148,26 @@ test('stale sweep reclaims orphaned and completed Ashlar Grok tabs past their gr
   assert.deepEqual(Object.keys(b.local.state[LEDGER]).map(Number).sort((x, y) => x - y), [3, 4, 5, 6]);
 });
 
+test('a forced reclaim skips the age grace but never closes the active tab or one the user opened after Ashlar finished', async () => {
+  const now = Date.now();
+  const tabs = new Map([
+    [1, {id: 1, url: CONV, status: 'complete', active: true}],                       // the user is viewing it
+    [2, {id: 2, url: CONV + '2', status: 'complete', lastAccessed: now}],             // opened after the leg ended
+    [3, {id: 3, url: CONV + '3', status: 'complete'}],                                // young: force skips the grace
+  ]);
+  const b = rig({tabs, handler: unpinned, ledger: {
+    1: entry(1, {endedAt: now - 30 * MIN, how: 'preserved', cause: 'navigated'}),
+    2: entry(2, {endedAt: now - 30 * MIN, how: 'preserved', cause: 'navigated'}),
+    3: entry(3, {endedAt: now - 10_000, how: 'preserved', cause: 'navigated'}),
+  }});
+  const result = await b.context.sweepGrokTabs({force: true});
+  assert.deepEqual(b.closedTabs, [3], JSON.stringify(result));
+  assert.equal(b.tabs.has(1), true, 'the active tab stays open');
+  assert.equal(b.local.state[LEDGER][1].endedAt > 0, true, 'and stays owned');
+  assert.equal(b.tabs.has(2), true);
+  assert.equal(b.local.state[LEDGER][2], undefined, 'a tab the user opened is released, never closed');
+});
+
 test('the sweep releases a tab the user took over instead of closing it', async () => {
   const tabs = new Map([[1, {id: 1, url: CONV, status: 'complete'}]]);
   const b = rig({tabs, handler: (_id, msg) => msg.type === 'ashlar-can-close' ? {ok: true, ownership: 'takenOver', cause: 'draft'} : {ok: false},

@@ -1,4 +1,5 @@
 import type { Finding, Job, RawLeg, ReviewProvider, Severity } from "./types.ts";
+import { PROVIDER_LABEL } from "./types.ts";
 import { OUTCOME_SHAPE, RAW_TRUNCATED_TEXT, auxiliaryFailed, postedOutcome, rawCauseText, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
 import { neutralizeMarkers, rawBodyText } from "./review-raw-text.ts";
 import { INCOMPLETE_OUTCOME_MARKER } from "./review-loop.ts";
@@ -27,12 +28,15 @@ const MAX_REVIEW_BODY = 65_000; // under GitHub's 65,535-char review-body limit,
  * The real wrapper is emitted last (after any structured findings), so anchor on the LAST start
  * marker — a finding rendered earlier cannot forge a decoy pair that hides the genuine block. */
 export function redactSalvagedReviewBody(body: string): string {
-  const s = String(body || "");
-  const start = s.lastIndexOf(REVIEW_RAW_START);
-  if (start < 0) return s;
-  const endMark = s.indexOf(REVIEW_RAW_END, start);
-  const end = endMark < 0 ? s.length : endMark + REVIEW_RAW_END.length;
-  return `${s.slice(0, start)}_(verbatim salvaged review redacted from the public snapshot; posted to the PR)_${s.slice(end)}`;
+  let s = String(body || "");
+  // Every block, last first: a body can carry a salvaged block and a coverage-evidence block
+  // (coverageCutBlock). Model text inside a body is marker-neutralized, so no start marker is forged.
+  for (let start = s.lastIndexOf(REVIEW_RAW_START); start >= 0; start = start > 0 ? s.lastIndexOf(REVIEW_RAW_START, start - 1) : -1) {
+    const endMark = s.indexOf(REVIEW_RAW_END, start);
+    const end = endMark < 0 ? s.length : endMark + REVIEW_RAW_END.length;
+    s = `${s.slice(0, start)}_(verbatim salvaged review redacted from the public snapshot; posted to the PR)_${s.slice(end)}`;
+  }
+  return s;
 }
 
 /** Keep the rendered body under GitHub's limit, preserving the trailing terminal marker
@@ -73,7 +77,7 @@ function countBySeverity(findings: Finding[]): Record<Severity, number> {
   return n;
 }
 
-type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs" | "canonicalProvider" | "auxiliaryProviderFailures">>;
+type SummaryJob = OutcomeJob & Pick<Job, "headSha" | "coverage"> & Partial<Pick<Job, "localVerifyNote" | "rawCauses" | "rawLegs" | "canonicalProvider" | "auxiliaryProviderFailures" | "coverageCutProviders" | "coverageCutReview">>;
 
 /** Everything a body helper reads, computed once so every kind renders the same fields the same way. */
 type SummaryParts = {
@@ -87,6 +91,10 @@ type SummaryParts = {
   raw: string;
   /** Why the raw block is posted (rawCauseText): fixed text from the merge's stamped causes. */
   rawWhy: string;
+  /** Reviewers whose complete, empty verdict was cut off in its coverage list (Job.coverageCutProviders). */
+  coverageCut: ReviewProvider[];
+  /** Their replies verbatim, rendered like the raw block (markers neutralized, clean sentinel reworded). */
+  coverageCutText: string;
 };
 
 export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username: string, unanchored: Finding[] = []): string {
@@ -101,6 +109,8 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     // sized the block by (salvagedReview).
     raw: rawBodyText((job.rawReview ?? "").trim()),
     rawWhy: rawCauseText(job.rawCauses, job.rawTruncated),
+    coverageCut: (job.coverageCutProviders ?? []).filter((p) => Object.hasOwn(PROVIDER_LABEL, p)),
+    coverageCutText: rawBodyText((job.coverageCutReview ?? "").trim()),
   };
   switch (outcome) {
     case "findings":
@@ -111,7 +121,7 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     case "clean":
     case "verified-clean":
     case "unverified-clean":
-      return cleanBody(job, parts);
+      return capReviewBody(cleanBody(job, parts));
     case "incomplete":
       return capReviewBody(incompleteBody(parts));
     default: {
@@ -170,8 +180,10 @@ function renderedLegEnds(job: SummaryJob): RawLeg[] {
 
 /** The trailing findings marker (the loop's CONVERGED side). An incomplete review carries none: it
  * ends with its own INCOMPLETE_OUTCOME_MARKER instead (incompleteBody), never an ashlar-findings one. */
-export function findingsMarker(outcome: PostedOutcome, findings: Finding[], unanchored: Finding[]): string {
-  const flag = OUTCOME_SHAPE[outcome].unverified ? " unverified=1" : "";
+export function findingsMarker(outcome: PostedOutcome, findings: Finding[], unanchored: Finding[], coverageIncomplete = false): string {
+  // coverage=incomplete: a reviewer's complete verdict was cut off in its coverage list (coverageCutBlock).
+  // It does not change the count or CONVERGED (isConvergedFindings reads raw=1 / unverified=1 only).
+  const flag = `${OUTCOME_SHAPE[outcome].unverified ? " unverified=1" : ""}${coverageIncomplete ? " coverage=incomplete" : ""}`;
   if (outcome === "incomplete") return "";
   // total=0: raw evidence is not a structured finding count. Consumers must read raw=1 (and
   // unverified=1) rather than treating total as a resolved findings workflow. isConvergedFindings
@@ -202,9 +214,21 @@ function rawBlock(p: SummaryParts): string {
 function rawOnlyBody(p: SummaryParts): string {
   const skipNote = p.skipped.length ? `\n${p.skipped.map((s) => `- ${s}`).join("\n")}\n` : "";
   return `${REVIEW_SUMMARY_MARK}
-${p.noteLine}${rawBlock(p)}${skipNote}
+${p.noteLine}${rawBlock(p)}${skipNote}${coverageCutBlock(p)}
 **Reviewed commit:** \`${p.sha}\`
-${findingsMarker(p.outcome, [], [])}`;
+${findingsMarker(p.outcome, [], [], p.coverageCut.length > 0)}`;
+}
+
+/** A reviewer whose reply was cut off after its complete verdict (findings closed and empty, no
+ * REQUEST_CHANGES): its verdict counts, so it found no major issue, but the files its coverage list had
+ * not reached are not cleared. Its reply follows verbatim, as evidence. Fixed text plus the neutralized reply. */
+function coverageCutBlock(p: SummaryParts): string {
+  if (!p.coverageCut.length) return "";
+  const who = p.coverageCut.map((provider) => PROVIDER_LABEL[provider]).join(" + ");
+  const reply = p.coverageCutText
+    ? ` Its reply is posted verbatim below:\n\n${REVIEW_RAW_START}\n${p.coverageCutText}\n${REVIEW_RAW_END}\n`
+    : " Its reply is retained in review history.\n";
+  return `\n**Coverage incomplete** — ${who}'s reply was cut off after its verdict: its findings list arrived complete and empty, but its coverage list did not finish, so the files it had not reached are not cleared.${reply}`;
 }
 
 function incompleteBody(p: SummaryParts): string {
@@ -225,7 +249,8 @@ function cleanBody(job: SummaryJob, p: SummaryParts): string {
   const cov = job.coverage ?? [];
   const clearedCount = cov.filter((c) => c.status === "cleared").length;
   const notCleared = cov.filter((c) => c.status === "not_cleared").map((c) => c.file);
-  return `${first}\n\nReviewed commit: \`${p.sha}\`\n${p.noteLine}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"} -->\n${findingsMarker(p.outcome, [], [])}`;
+  const cut = p.coverageCut.length > 0;
+  return `${first}\n\nReviewed commit: \`${p.sha}\`\n${p.noteLine}${coverageCutBlock(p)}<!-- ashlar-coverage cleared=${clearedCount}/${cov.length} not_cleared=${notCleared.join(",") || "none"}${cut ? ` incomplete=${p.coverageCut.join(",")}` : ""} -->\n${findingsMarker(p.outcome, [], [], cut)}`;
 }
 
 function unanchoredBlock(unanchored: Finding[]): string {
@@ -281,7 +306,7 @@ Here are some automated review suggestions for this pull request.
 
 ${reviewersLine(job)}
 ${p.noteLine}${p.skipped.length ? p.skipped.map((s) => `- ${s}`).join("\n") : ""}
-${unanchoredBlock(unanchored)}${rawBlock(p)}
+${unanchoredBlock(unanchored)}${rawBlock(p)}${coverageCutBlock(p)}
 <details>
 <summary>ℹ️ About Ashlar</summary>
 
@@ -290,6 +315,6 @@ Inline comments use P0 / P1 / P2 badges. Failures in one reviewer are skipped; r
 </details>
 
 — ${neutralizeMarkers(username)}
-${findingsMarker(p.outcome, findings, unanchored)}
+${findingsMarker(p.outcome, findings, unanchored, p.coverageCut.length > 0)}
 `;
 }

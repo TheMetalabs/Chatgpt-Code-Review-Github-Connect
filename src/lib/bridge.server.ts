@@ -797,16 +797,23 @@ export async function completeBridgeJob(jobId: string, raw: string, legs?: ChatL
   // catches schema-invalid (not only syntactically broken) replies so none is silently dropped.
   // A salvaged leg (the extension's repair is over, live aicc #457) is posted like repair-off: its
   // raw_review envelope as sent, anything else salvaged here, never left for a repair.
-  const canonicalLegRaw = (text: string): string => {
+  const canonicalLegRaw = (text: string, originalText?: string): string => {
     // A reply cut off after its verdict and findings is recovered (truncated: true), never salvaged raw.
     const parsed = extractChatJsonRecovering(text);
     if (repairAvailable && !salvaged) return parsed ?? text; // route 422s schema errors for a real repair
     if (parsed && inspectReviewFormat(parsed, "review").ok) return parsed;
-    return salvaged && parsed && isSalvageEnvelope(parsed) ? parsed : salvageReviewJson(text);
+    if (salvaged && parsed && isSalvageEnvelope(parsed)) {
+      // The worker gave up on the page text: this server's reader (format-only normalization, the same
+      // rules as the extension's, possibly newer than the worker's copy) reads it once more before the
+      // reply posts verbatim. Only a schema-valid review replaces the envelope.
+      const reread = originalText?.trim() ? extractChatJsonRecovering(originalText) : null;
+      return reread && inspectReviewFormat(reread, "review").ok ? reread : parsed;
+    }
+    return salvageReviewJson(text);
   };
   const incoming = (legs?.length ? legs : raw.trim() ? [{provider: "chatgpt" as const, raw}] : [])
     .map(leg => {
-      const canonical = canonicalLegRaw(leg.raw);
+      const canonical = canonicalLegRaw(leg.raw, leg.originalText);
       // Keep the exact model prose for the archive even if the client omitted originalText and we
       // transformed raw (extract/salvage), so the async recordResponse cannot later overwrite the
       // first archive entry with an empty original.

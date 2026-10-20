@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {content} from './helpers.mjs';
 import {appFixture, eventually} from './app-fixture.mjs';
-import {classifyReviewText, extractChatJsonRecovering, extractChatJsonParts, normalizeReviewFormat} from '../../src/lib/extract-chat-json.ts';
+import {classifyReviewText, extractChatJsonRecovering, extractChatJsonParts, normalizeReviewFormat, truncatedReviewField} from '../../src/lib/extract-chat-json.ts';
 import {inspectReviewFormat} from '../../src/lib/review-json-repair.ts';
 import {isZeroFindings, isConvergedFindings, notCleanOutcomeOf} from '../../src/lib/review-loop.ts';
 import {CLEAN_REVIEW_BODY, REVIEW_RAW_START, REVIEW_RAW_END, redactSalvagedReviewBody} from '../../src/lib/review-format.ts';
@@ -40,8 +40,9 @@ function readLeg(text) {
   if (!converted) return {converted, structured: false, status: classifyReviewText(text).status};
   const review = JSON.parse(json);
   const cutEmpty = review.truncated === true && !review.findings.length;
-  const structured = !cutEmpty || (review.merge_recommendation !== 'REQUEST_CHANGES' && safeListed(review));
-  return {converted, structured, review, cutEmpty};
+  const cutIn = review.truncated === true ? truncatedReviewField(text) : null;
+  const structured = !cutEmpty || (review.merge_recommendation !== 'REQUEST_CHANGES' && safeListed(review) && cutIn === 'coverage');
+  return {converted, structured, review, cutEmpty, cutIn};
 }
 
 function rates(rows) {
@@ -235,6 +236,33 @@ test('a cut-off reply with no finding but REQUEST_CHANGES is never clean: it pos
   assert.notEqual(body.split('\n')[0], CLEAN_REVIEW_BODY);
   assert.equal(isZeroFindings(body, {authoredByBot: true}), false);
   assert.equal(notCleanOutcomeOf(body), 'raw');
+  assert.equal(job.coverageCutProviders, undefined);
+});
+
+test('the clean-verdict exception needs the cut proven inside coverage: truncated:true alone is not enough (#173 P1)', async t => {
+  // Every recovered cut-off leg in both corpora stopped in coverage.
+  for (const c of after.filter(c => c.review?.truncated === true)) assert.equal(c.cutIn, 'coverage', c.name);
+  const head = '{"merge_recommendation": "COMMENT", "findings": [], "investigated_safe": ["a.ts: constant change only"]';
+  // Reached coverage: cut inside an entry, after one whole entry, before any entry, or right after it closed.
+  assert.equal(truncatedReviewField(`${head}, "coverage": [{"file": "a.ts", "status": "cleared", "reason": "re`), 'coverage');
+  assert.equal(truncatedReviewField(`${head}, "coverage": [{"file": "a.ts", "status": "cleared", "reason": "read"}, {"file": "b`), 'coverage');
+  assert.equal(truncatedReviewField(`${head}, "coverage": [`), 'coverage');
+  assert.equal(truncatedReviewField(`${head}, "coverage": [{"file": "a.ts", "status": "cleared", "reason": "read"}]`), 'coverage');
+  // Cut before coverage began: in another field, in a half-written key, or across fields.
+  const inAssumptions = `${head}, "assumptions": ["the cache is warm", "the queue is dra`;
+  assert.equal(truncatedReviewField(inAssumptions), 'assumptions');
+  assert.equal(truncatedReviewField(`${head}, "assum`), 'unknown');
+  // A root string value cannot be cut on: the cut falls before it, so that field is lost with coverage.
+  assert.equal(truncatedReviewField(`${head}, "highest_risk": "none", "coverage": [{"file": "a.ts"`), 'unknown');
+  // A whole field before coverage (an array a cut can end on) arrived intact: only coverage was lost.
+  assert.equal(truncatedReviewField(`${head}, "assumptions": [], "coverage": [{"file": "a.ts", "status": "cleared", "reason": "read"}, {"f`), 'coverage');
+  assert.equal(truncatedReviewField('{"merge_recommendation": "COMMENT", "findings": []}'), null, 'a complete reply was not cut');
+  // It still recovers (the verdict arrived), but never reads clean: it posts raw, coverage not credited.
+  const recovered = JSON.parse(extractChatJsonRecovering(inAssumptions));
+  assert.deepEqual([recovered.truncated, recovered.findings.length, recovered.merge_recommendation], [true, 0, 'COMMENT']);
+  const {body, job} = await bridgeRound(t, 'cut-not-coverage', [{provider: 'chatgpt', raw: inAssumptions, originalText: inAssumptions}], {grok: false});
+  assert.notEqual(body.split('\n')[0], CLEAN_REVIEW_BODY);
+  assert.equal(isZeroFindings(body, {authoredByBot: true}), false);
   assert.equal(job.coverageCutProviders, undefined);
 });
 

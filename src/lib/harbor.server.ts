@@ -17,6 +17,7 @@ import { acceptedDeliveryIds, decideIngress, reviewSkipReason, type IngressTarge
 import { parseGitHubPayload } from "./github-payload";
 import { createIssueComment, createPullReview, fetchPullHead, fetchPullSnapshot, formatGithubError, getFile, githubReady, installationToken, listReviewComments, reactOnDelivery, updateIssueComment, type GithubReaction } from "./github.server";
 import { buildChatPrompt, parseChatSubmission, splitChatAttachments } from "./chat-prompt";
+import { truncatedReviewField } from "./extract-chat-json";
 import { selectPriorThreads, type PriorThread } from "./prior-threads";
 import { rankChangedFile } from "./review-budget";
 import { runLocalLlm, type LocalLegResult } from "./local-llm.server";
@@ -1678,10 +1679,14 @@ function gateLeg(
     // reply posts verbatim beside it with coverage marked incomplete. It must still pass the gate as it is
     // (an Instant-tier empty reply without investigated_safe stays rejected). A reply cut before or inside
     // its findings never reaches here: it does not recover, so it stays raw / incomplete (#1091).
-    if (parsed.merge_recommendation !== "REQUEST_CHANGES" && Array.isArray(parsed.findings)) {
+    // `truncated: true` alone does not say WHERE the reply stopped: the cut must be proven to sit in its
+    // coverage list (truncatedReviewField over the reply's own text, every field before coverage whole). A
+    // reply cut in investigated_safe, assumptions, a later field, or a half-written key stays incomplete.
+    const cutText = leg.originalText?.trim() || leg.raw;
+    if (parsed.merge_recommendation !== "REQUEST_CHANGES" && Array.isArray(parsed.findings) && truncatedReviewField(cutText) === "coverage") {
       const gate = gateLiveSubmission(parsed, sample, state.settings);
       if (gate.ok && !gate.rawReview && !gate.findings.length && !gate.malformed && !gate.overflow) {
-        return { gate, verdict: true, coverageCut: leg.originalText?.trim() || leg.raw };
+        return { gate, verdict: true, coverageCut: cutText };
       }
     }
     // Otherwise never a clean result and never an Instant-tier skip: the reviewer's own text posts as evidence.

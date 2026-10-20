@@ -123,13 +123,19 @@ export function lastReviewStart(text: string): number {
   return last;
 }
 
-type ReviewScan = { complete: boolean; inString: boolean; findingsEnd: number; coverageObjectAt: number; rootEnd: number; cuts: { end: number; closers: string }[] };
+/** A clean cut: where the slice may end (`end`) and the closers that finish it there. `key` is the root
+ * key whose array the cut sits in (a cut inside a root-level array: `closers` is "]}"), "" at the root. */
+type ReviewCut = { end: number; closers: string; key: string };
+type ReviewScan = { complete: boolean; inString: boolean; findingsEnd: number; coverageObjectAt: number; rootEnd: number; cuts: ReviewCut[]; rootKeys: { key: string; at: number }[] };
 
 /** One forward pass over a review slice: whether its root closed, where the top-level `findings` array
  * ended (-1: it did not), and every place it could be cut cleanly with the closers that would finish it. */
 function scanReview(s: string): ReviewScan {
   const stack: string[] = [];
-  const cuts: { end: number; closers: string }[] = [];
+  const cuts: ReviewCut[] = [];
+  // Every key of the ROOT object, in order, with where its name starts: what a cut drops is read from it.
+  const rootKeys: { key: string; at: number }[] = [];
+  let rootKey = "";
   let inStr = false, esc = false, strStart = -1;
   let findingsEnd = -1, afterFindingsKey = false, findingsActive = false, rootClosed = false, coverageObjectAt = -1, rootEnd = -1;
   for (let i = 0; i < s.length; i += 1) {
@@ -146,6 +152,8 @@ function scanReview(s: string): ReviewScan {
             let key = "";
             try { key = JSON.parse(s.slice(strStart, i + 1)) as string; } catch { key = ""; }
             afterFindingsKey = key === "findings";
+            rootKey = key;
+            rootKeys.push({ key, at: strStart });
             // The ROOT object's `coverage` whose value is an object, not an array (a missing `[`).
             let k = j + 1;
             while (k < s.length && /\s/.test(s[k])) k += 1;
@@ -169,11 +177,11 @@ function scanReview(s: string): ReviewScan {
       // inside `[`). A delimiter deeper than that closes the INNER part of an element that is still open
       // (a nested object or array of a half-written coverage entry): cutting there would keep a partial entry.
       if (stack.length === 1 || (stack.length === 2 && stack[1] === "[")) {
-        cuts.push({ end: i + 1, closers: [...stack].reverse().map((open) => (open === "{" ? "}" : "]")).join("") });
+        cuts.push({ end: i + 1, closers: [...stack].reverse().map((open) => (open === "{" ? "}" : "]")).join(""), key: stack.length === 2 ? rootKey : "" });
       }
     }
   }
-  return { complete: rootClosed && !inStr, inString: inStr, findingsEnd, coverageObjectAt, rootEnd, cuts };
+  return { complete: rootClosed && !inStr, inString: inStr, findingsEnd, coverageObjectAt, rootEnd, cuts, rootKeys };
 }
 
 /** A review whose text stopped before it finished, recovered ONLY when everything the verdict rests on
@@ -183,6 +191,20 @@ function scanReview(s: string): ReviewScan {
  * `findings`, or one that never reached `merge_recommendation`, is not recovered (null): a dropped
  * finding is worse than a missing one. A missing `[` after `"coverage":` (Grok's page text) is supplied. */
 export function recoverTruncatedReviewJson(text: string): string | null {
+  return recoverTruncatedReview(text)?.json ?? null;
+}
+
+/** The ROOT field a cut-off reply stopped in, read structurally from the same cut recoverTruncatedReviewJson
+ * keeps (never from the recovered JSON, which no longer shows where it ended): "coverage" only when every
+ * field before `coverage` arrived whole and nothing but coverage entries was lost; another key when the
+ * lost text belongs to that field; "unknown" when the lost text is not a whole key (a half-written name) or
+ * spans more than one field. null when the text is not a recoverable cut-off review. The gate's clean
+ * verdict for a reply cut in coverage only (harbor gateLeg) rests on this, not on `truncated: true`. */
+export function truncatedReviewField(text: string): string | null {
+  return recoverTruncatedReview(text)?.field ?? null;
+}
+
+function recoverTruncatedReview(text: string): { json: string; field: string } | null {
   const s = String(text || "");
   const start = lastReviewStart(s);
   if (start < 0) return null;
@@ -203,7 +225,7 @@ export function recoverTruncatedReviewJson(text: string): string | null {
 }
 
 /** recoverTruncatedReviewJson's cut search over one reading of the slice. */
-function recoverFromCuts(slice: string, scan: ReviewScan): string | null {
+function recoverFromCuts(slice: string, scan: ReviewScan): { json: string; field: string } | null {
   if (scan.complete || scan.findingsEnd < 0) return null;
   for (let n = scan.cuts.length - 1, tried = 0; n >= 0 && tried < 400; n -= 1, tried += 1) {
     const cut = scan.cuts[n];
@@ -212,11 +234,32 @@ function recoverFromCuts(slice: string, scan: ReviewScan): string | null {
     for (const body of [candidate, repairJsonEscapes(candidate)]) {
       try {
         const parsed = JSON.parse(body) as Record<string, unknown>;
-        if (Array.isArray(parsed.findings) && typeof parsed.merge_recommendation === "string") return JSON.stringify({ ...parsed, truncated: true });
+        if (Array.isArray(parsed.findings) && typeof parsed.merge_recommendation === "string") {
+          return { json: JSON.stringify({ ...parsed, truncated: true }), field: cutField(slice, scan, cut) };
+        }
       } catch { /* try the escape-repaired form, then an earlier cut */ }
     }
   }
   return null;
+}
+
+/** Which root field the text dropped at `cut` belongs to (truncatedReviewField). */
+function cutField(slice: string, scan: ReviewScan, cut: ReviewCut): string {
+  const lost = new Set(scan.rootKeys.filter((k) => k.at >= cut.end).map((k) => k.key));
+  if (cut.key) lost.add(cut.key);
+  if (lost.size > 1) return "unknown";
+  if (lost.size === 1) {
+    // A whole key after the cut: the dropped text must be that field alone (only `,` / space before its name).
+    const [key] = lost;
+    if (!cut.key) {
+      const first = scan.rootKeys.find((k) => k.at >= cut.end);
+      if (!first || !/^[\s,]*$/.test(slice.slice(cut.end, first.at))) return "unknown";
+    }
+    return key;
+  }
+  // Nothing but separators after a whole root value: the reply ended right after that field.
+  if (!/^[\s,]*$/.test(slice.slice(cut.end))) return "unknown";
+  return [...scan.rootKeys].reverse().find((k) => k.at < cut.end)?.key ?? "unknown";
 }
 
 /** Format-only normalization of a review object's text (`slice` starts at its opening brace), for a reply

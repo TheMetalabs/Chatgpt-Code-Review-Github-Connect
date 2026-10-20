@@ -265,9 +265,13 @@ function cleanTurnText(el) {
  * text has stood still this long with the stream gone: a hidden or throttled tab can show identical
  * partial text on two polls while Grok is still writing, and a leg ended there posts a cut-off reply. */
 function grokIncompleteSettleMs() { return 45_000; } // a function: this file is re-injected (no top-level const)
-function grokIncompleteSettled(text) {
+function grokIncompleteSettled(text, bubble) {
+  // Scoped to the run and this response: another run, another answer in the tab, or changed text starts over.
+  const run = globalThis.__ashlarRunnerState;
+  const turns = [...document.querySelectorAll("[data-testid='assistant-message']")];
+  const scope = `${run?.jobId || ""}:${run?.runId || ""}:${turnMessageId(bubble) || turns.indexOf(bubble)}`;
   const seen = globalThis.__ashlarGrokIncomplete;
-  if (!seen || seen.text !== text) { globalThis.__ashlarGrokIncomplete = {text, since: Date.now()}; return false; }
+  if (!seen || seen.scope !== scope || seen.text !== text) { globalThis.__ashlarGrokIncomplete = {scope, text, since: Date.now()}; return false; }
   return Date.now() - seen.since >= grokIncompleteSettleMs();
 }
 
@@ -360,7 +364,7 @@ function grokReplyDoneVisible(root) {
   // reply is eligible for repair only after this submission recorded its own stream and the
   // stream controls disappeared; a pre-stream Copy must keep polling for the final answer.
   if (incomplete && !grokSawCurrentStream(root)) return false;
-  if (incomplete && !grokIncompleteSettled(text)) return false;
+  if (incomplete && !grokIncompleteSettled(text, bubble)) return false;
   for (const el of root.querySelectorAll("button, [role='button']")) {
     if (el.closest("pre, code, .chat-code-block")) continue;
     const label = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();

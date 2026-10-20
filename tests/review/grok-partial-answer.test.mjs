@@ -69,7 +69,7 @@ function writingPage({rendered = 'Review PR #1\n\n\u2022 item one', input = fals
   c.context.composerDraftText = () => '';
   c.context.composerStagedFiles = () => [];
   c.context.regeneratedAfterCompletion = () => false;
-  if (input) c.context.noteUserInput({isTrusted: true});
+  if (input) c.context.noteUserInput({isTrusted: true, type: 'keydown', key: 'a', target: {closest: () => ({getAttribute: () => '', textContent: ''})}});
   return c;
 }
 const harvest = c => c.message({type: 'ashlar-harvest', jobId: 'A', runId: 'run-A', provider: 'grok'});

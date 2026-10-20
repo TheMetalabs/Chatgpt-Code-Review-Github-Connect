@@ -1636,29 +1636,58 @@ function persistTakeover(state) {
  * that neither Ashlar's automation nor Grok's own rendering can produce. Ashlar's clicks and key events
  * are synthetic (dispatchEvent / element.click(): isTrusted false), and a page script cannot create a
  * trusted event; a locked screen sends none. A rendered turn that differs from Ashlar's prompt (Grok
- * re-renders a sent prompt as Markdown after the answer completes) is an edit only when this saw
- * input. Kept in sessionStorage too (a reload keeps the evidence); never read as permission to close. */
-function noteUserInput(event) {
-  if (!event || event.isTrusted !== true) return false;
-  globalThis.__ashlarUserInputAt = Date.now();
-  try { sessionStorage.setItem("ashlar:userinput", String(globalThis.__ashlarUserInputAt)); } catch { /* in-memory only */ }
+ * re-renders a sent prompt as Markdown after the answer completes) is an edit only when this saw input.
+ * Scoped to the run: only input that could change the conversation counts (typing, pasting or dropping
+ * into an editable area, or pressing an edit / regenerate control), it is stored per (job, run) so a
+ * reload keeps it and another run in the tab never inherits it, and it counts only after the run's send
+ * was confirmed (the journal's `sentAt`: Ashlar's own writing is over). Never read as permission to close. */
+function userInputCounts(event) {
+  const target = event?.target;
+  const type = String(event?.type || "");
+  const editable = el => Boolean(el?.closest?.('textarea, input, [contenteditable]:not([contenteditable="false"]), form[data-composer], [data-testid="chat-input"]'));
+  if (type === "keydown") return !["Shift", "Control", "Alt", "Meta", "Tab", "CapsLock", "Escape"].includes(event?.key) && editable(target);
+  if (type === "paste" || type === "drop" || type === "beforeinput") return editable(target);
+  const control = target?.closest?.('button, [role="button"], a');
+  const label = `${control?.getAttribute?.("aria-label") || ""} ${control?.getAttribute?.("title") || ""} ${control?.textContent || ""}`;
+  return editable(target) || /\b(edit|regenerate|retry|try again|rewrite|redo)\b|수정|재생성|다시 생성|다시 시도/i.test(label);
+}
+function userInputKey(state) {
+  return state?.jobId && state.runId ? `ashlar:userinput:${state.jobId}:${state.runId}` : "";
+}
+function noteUserInput(event, now = Date.now()) {
+  if (!event || event.isTrusted !== true || !userInputCounts(event)) return false;
+  const state = globalThis.__ashlarRunnerState, key = userInputKey(state);
+  if (!key) return false; // no run is bound to this page: nothing of a run's to take over
+  state.userInputAt = now;
+  try { sessionStorage.setItem(key, String(now)); } catch { /* in-memory only */ }
   return true;
 }
+/** Whether trusted input reached this run's conversation after its send was confirmed. A journal with no
+ * `sentAt` (written before it existed) counts any input the run recorded. */
+function userInputAfterSend(state) {
+  let at = state?.userInputAt;
+  if (!Number.isFinite(at)) {
+    try { const stored = sessionStorage.getItem(userInputKey(state)); at = stored ? Number(stored) : NaN; } catch { at = NaN; }
+  }
+  if (!Number.isFinite(at)) return false;
+  let sentAt;
+  try { sentAt = Number((state.confirmedSubmission?.record || savedSubmission())?.sentAt); } catch { sentAt = NaN; }
+  return Number.isFinite(sentAt) ? at > sentAt : true;
+}
 function userInputSeen() {
-  if (Number.isFinite(globalThis.__ashlarUserInputAt)) return true;
-  try { return Number.isFinite(Number(sessionStorage.getItem("ashlar:userinput"))) && Boolean(sessionStorage.getItem("ashlar:userinput")); } catch { return false; }
+  return userInputAfterSend(globalThis.__ashlarRunnerState);
 }
 function installUserInputWitness() {
   if (globalThis.__ashlarInputWitness || typeof globalThis.document?.addEventListener !== "function") return;
   globalThis.__ashlarInputWitness = true;
   for (const type of ["keydown", "pointerdown", "mousedown", "touchstart", "paste", "drop"]) {
-    try { globalThis.document.addEventListener(type, noteUserInput, {capture: true, passive: true}); } catch { /* the page keeps its DOM-only verdicts */ }
+    try { globalThis.document.addEventListener(type, event => noteUserInput(event), {capture: true, passive: true}); } catch { /* the page keeps its DOM-only verdicts */ }
   }
 }
 /** Whether the rendered sent turn's difference from Ashlar's prompt is Grok's rendering, not the user: a
- * Grok review (a fix and ChatGPT keep the DOM-only verdict) with no trusted input seen on the page. */
+ * Grok review (a fix and ChatGPT keep the DOM-only verdict) with no trusted input after the send. */
 function turnDiffersByRender(state, fix) {
-  return !fix && state.provider === "grok" && !userInputSeen();
+  return !fix && state.provider === "grok" && !userInputAfterSend(state);
 }
 
 function releaseManagedSlot(state) {

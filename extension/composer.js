@@ -1104,6 +1104,8 @@ function submissionConfirmed(record) {
     reviewTurnHolds(messagePromptText(turn), record.expected));
   if (!record.expected || !match) return false;
   record.phase = "sent";
+  // When Ashlar's own writing ended: trusted user input counts as a takeover only after this (json.js userInputAfterSend).
+  if (!Number.isFinite(record.sentAt)) record.sentAt = Date.now();
   record.submittedUsers = turns.indexOf(match) + 1;
   record.messageId = turnMessageId(match);
   // A run's conversation is a fact of THIS moment: recorded once, here, and never later (every

@@ -146,8 +146,10 @@ code, so a future skill or change can find the rule instead of re-learning it.
   Grok re-renders a sent prompt (Markdown) once its answer completes, so all 5 Grok legs of the
   2026-10-20 locked-screen run ended `tab_preserved cause=edited` and 1.1.72 released them from the
   ledger as the user's. On a Grok review the page now counts a rendered-text difference as an edit only
-  after TRUSTED input (`isTrusted` keydown/pointerdown/mousedown/touchstart/paste/drop, persisted in
-  sessionStorage); Ashlar's synthetic clicks and Grok's rendering produce none. The can-close reply
+  after TRUSTED input that could change the conversation (`isTrusted` typing/paste/drop into an editable
+  area, or a press on an edit/regenerate control) made after the run's send was confirmed
+  (`sentAt` in the journal), kept per job and run in sessionStorage; Ashlar's synthetic clicks, bare
+  pointer events and Grok's rendering produce none. The can-close reply
   carries `userInput` and `renderDiffers` (history/log event `turn_render_differs`). A preserved
   `edited`/`regenerated` leg whose page reports `userInput:false` stays in the ledger and is swept.
   ChatGPT and fix runs keep the DOM-only verdict.

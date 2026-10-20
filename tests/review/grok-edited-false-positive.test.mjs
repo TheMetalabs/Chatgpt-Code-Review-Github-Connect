@@ -20,8 +20,11 @@ const settled = async b => { await b.context.writeInOrder(async () => {}); await
 async function ticks(b, n = 2) { for (let i = 0; i < n; i++) { await b.tick(); await flush(); } await settled(b); }
 
 // ---- the page: the sent turn renders differently from the prompt; nothing else is on the page ----
-function page(provider, {rendered = 'Review PR #1\n\n\u2022 item one\n\u2022 item two', conversation = provider === 'grok' ? CONV : 'https://chatgpt.com/c/abc'} = {}) {
-  const c = content(provider);
+// A trusted keystroke into the composer / an editable area (what a user editing or following up produces).
+const editable = {closest: () => ({getAttribute: () => '', textContent: ''})};
+const typing = (extra = {}) => ({isTrusted: true, type: 'keydown', key: 'a', target: editable, ...extra});
+function page(provider, {persisted, rendered = 'Review PR #1\n\n\u2022 item one\n\u2022 item two', conversation = provider === 'grok' ? CONV : 'https://chatgpt.com/c/abc'} = {}) {
+  const c = content(provider, persisted);
   c.context.stopButtonVisible = () => false;
   c.context.runPrompt = () => new Promise(() => {});
   c.message({type: 'ashlar-run', jobId: 'A', runId: 'run-A', provider, prompt: 'review'}); // starts on the fresh new chat
@@ -54,7 +57,7 @@ test('Grok re-rendering Ashlar\'s own sent prompt, with no user input, is not an
 test('the same Grok page with TRUSTED user input after the send is a real takeover: edited, preserved', async () => {
   const c = page('grok');
   await flush();
-  assert.equal(c.context.noteUserInput({isTrusted: true, type: 'keydown'}), true);
+  assert.equal(c.context.noteUserInput(typing()), true);
   const reply = await canClose(c);
   assert.equal(reply.ownership, 'takenOver', JSON.stringify(reply));
   assert.equal(reply.cause, 'edited');
@@ -69,21 +72,64 @@ test('synthetic events (Ashlar\'s own clicks and key presses, a page script) are
   c.context.document = {addEventListener: (type, fn) => { listeners[type] = fn; }};
   c.context.installUserInputWitness();
   for (const type of ['keydown', 'pointerdown', 'mousedown', 'touchstart', 'paste', 'drop']) assert.equal(typeof listeners[type], 'function', type);
-  for (const type of Object.keys(listeners)) listeners[type]({isTrusted: false, type}); // dispatchEvent(new PointerEvent(...)), el.click()
+  for (const type of Object.keys(listeners)) listeners[type]({isTrusted: false, type, key: 'a', target: editable}); // dispatchEvent(new PointerEvent(...)), el.click()
   assert.equal(c.context.userInputSeen(), false);
   assert.equal((await canClose(c)).ownership, 'owned');
-  listeners.pointerdown({isTrusted: true, type: 'pointerdown'}); // the user's own pointer
+  listeners.keydown(typing()); // the user's own key in the composer
   assert.equal(c.context.userInputSeen(), true);
   assert.equal((await canClose(c)).ownership, 'takenOver');
 });
 
+test('only input that can change the conversation counts: bare pointer events, modifier keys and keys outside an editor do not', async () => {
+  const c = page('grok');
+  await flush();
+  const body = {closest: () => null}; // nothing editable, no control under the pointer
+  const control = label => ({closest: sel => (sel.startsWith('button') ? {getAttribute: name => (name === 'aria-label' ? label : ''), textContent: ''} : null)});
+  for (const event of [
+    {isTrusted: true, type: 'pointerdown', target: body}, {isTrusted: true, type: 'mousedown', target: body}, {isTrusted: true, type: 'touchstart', target: body},
+    {isTrusted: true, type: 'keydown', key: 'a', target: body}, {isTrusted: true, type: 'keydown', key: 'Shift', target: editable},
+    {isTrusted: true, type: 'pointerdown', target: control('Copy response')}, {isTrusted: true, type: 'pointerdown', target: control('Like')},
+  ]) assert.equal(c.context.noteUserInput(event), false, JSON.stringify([event.type, event.key]));
+  assert.equal(c.context.userInputSeen(), false);
+  assert.equal((await canClose(c)).ownership, 'owned');
+  assert.equal(c.context.noteUserInput({isTrusted: true, type: 'pointerdown', target: control('Regenerate response')}), true, 'a regenerate control');
+  assert.equal(c.context.noteUserInput({isTrusted: true, type: 'pointerdown', target: control('Edit message')}), true, 'an edit control');
+  assert.equal(c.context.noteUserInput({isTrusted: true, type: 'paste', target: editable}), true, 'a paste into an editor');
+});
+
+test('input is scoped to the run and to after its send was confirmed', async () => {
+  const c = page('grok');
+  await flush();
+  const record = c.context.savedSubmission();
+  const sentAt = Date.now();
+  record.sentAt = sentAt;
+  assert.equal(c.context.noteUserInput(typing(), sentAt - 5_000), true, 'recorded, but it was before Ashlar finished writing');
+  assert.equal(c.context.userInputSeen(), false, 'input before the send is not a takeover of the sent conversation');
+  assert.equal((await canClose(c)).ownership, 'owned');
+  c.context.noteUserInput(typing(), sentAt + 5_000);
+  assert.equal(c.context.userInputSeen(), true, 'after the send it is');
+  // Another run in the same tab never inherits it (the evidence is keyed by job and run).
+  const persisted = new Map();
+  const first = page('grok', {persisted});
+  await flush();
+  first.context.noteUserInput(typing());
+  assert.deepEqual([...persisted.keys()].filter(key => key.startsWith('ashlar:userinput')), ['ashlar:userinput:A:run-A']);
+  assert.equal(first.context.userInputAfterSend({jobId: 'A', runId: 'run-A'}), true);
+  assert.equal(first.context.userInputAfterSend({jobId: 'B', runId: 'run-B'}), false, 'run B has none of run A\'s input');
+  assert.equal(first.context.userInputAfterSend({jobId: 'A', runId: 'run-other'}), false, 'nor does another run of the same job');
+  // Nothing is recorded while no run is bound to the page.
+  assert.equal(content('grok').context.noteUserInput(typing()), false);
+});
+
 test('the evidence survives a page reload (sessionStorage), so a real edit is not forgotten', async () => {
   const persisted = new Map();
-  const first = content('grok', persisted);
-  first.context.noteUserInput({isTrusted: true});
-  const second = content('grok', persisted);
+  const first = page('grok', {persisted});
+  await flush();
+  first.context.noteUserInput(typing());
+  const second = page('grok', {persisted}); // the reloaded document binds the same run again
+  await flush();
   assert.equal(second.context.userInputSeen(), true);
-  assert.equal(content('grok').context.userInputSeen(), false, 'a tab with no input has none');
+  assert.equal(page('grok').context.userInputSeen(), false, 'a tab with no input has none');
 });
 
 test('ChatGPT path unchanged: the same rendered difference is still an edit by DOM alone', async () => {

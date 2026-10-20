@@ -194,6 +194,16 @@ export function recoverTruncatedReviewJson(text: string): string | null {
     slice = `${slice.slice(0, scan.coverageObjectAt)}[${slice.slice(scan.coverageObjectAt)}`;
     scan = scanReview(slice);
   }
+  const recovered = recoverFromCuts(slice, scan);
+  if (recovered || scan.complete) return recovered;
+  // Read once more with the reply's format normalized (normalizeReviewFormat: bare inner quotes escaped,
+  // a missing findings `[` supplied): the same rule applies, the verdict and every finding must be whole.
+  const normalized = normalizeReviewFormat(slice);
+  return normalized === slice ? null : recoverFromCuts(normalized, scanReview(normalized));
+}
+
+/** recoverTruncatedReviewJson's cut search over one reading of the slice. */
+function recoverFromCuts(slice: string, scan: ReviewScan): string | null {
   if (scan.complete || scan.findingsEnd < 0) return null;
   for (let n = scan.cuts.length - 1, tried = 0; n >= 0 && tried < 400; n -= 1, tried += 1) {
     const cut = scan.cuts[n];
@@ -209,6 +219,106 @@ export function recoverTruncatedReviewJson(text: string): string | null {
   return null;
 }
 
+/** Format-only normalization of a review object's text (`slice` starts at its opening brace), for a reply
+ * the strict parse and the escape repair could not read. It never changes what the reply says: every
+ * character the model wrote is kept, in order. Only the JSON syntax around it is supplied:
+ *  - a quote inside a string that cannot be the string's end (live 2026-10: Grok wrote shell and UI text
+ *    such as `"This AI's style..."` / `[ -f "$f" ]` with bare quotes) is escaped. A quote ends its string
+ *    only where JSON can continue: a key's quote before `:`, a value's before `}` or before `,` and the next
+ *    key's quote, an array item's before `]` or before `,` and the next item, or at the end of the text;
+ *  - an invalid escape keeps its backslash (doubled) and a raw control character is escaped (repairJsonEscapes);
+ *  - a missing `[` after the root's `"findings":` (the value opens with `{`) is supplied.
+ * The text after the root object closes is not part of it and is left out. The result may still be
+ * unclosed (a reply cut off mid-answer): recoverTruncatedReviewJson reads that. Mirrors extension/json.js. */
+export function normalizeReviewFormat(slice: string): string {
+  return normalizeReviewFormatSpan(slice).text;
+}
+
+/** normalizeReviewFormat, and where in `slice` the root object closed (its length when it did not). */
+function normalizeReviewFormatSpan(slice: string): { text: string; end: number } {
+  const s = String(slice || "");
+  const SHORT: Record<string, string> = { "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t" };
+  type Frame = { open: "{" | "["; expectKey: boolean; key: string };
+  const stack: Frame[] = [];
+  let out = "";
+  let role: "key" | "value" | "item" | "" = "";
+  let inStr = false, strOut = "";
+  const nextNonWs = (from: number) => { let j = from; while (j < s.length && /\s/.test(s[j])) j += 1; return j; };
+  const ends = (i: number): boolean => {
+    const j = nextNonWs(i + 1);
+    if (j >= s.length) return true;
+    const n = s[j];
+    if (role === "key") return n === ":";
+    const after = nextNonWs(j + 1);
+    if (role === "value") return n === "}" || (n === "," && (after >= s.length || s[after] === '"'));
+    if (role === "item") return n === "]" || (n === "," && (after >= s.length || '"{[-0123456789tfn'.includes(s[after])));
+    return true;
+  };
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s[i];
+    if (inStr) {
+      if (c === "\\") {
+        const n = s[i + 1];
+        if (n !== undefined && '"\\/bfnrt'.includes(n)) { strOut += c + n; i += 1; continue; }
+        if (n === "u" && /^[0-9a-fA-F]{4}$/.test(s.slice(i + 2, i + 6))) { strOut += s.slice(i, i + 6); i += 5; continue; }
+        if (n === undefined) continue; // a reply cut right after a backslash: the escape never arrived
+        strOut += "\\\\";
+        continue;
+      }
+      if (c === '"') {
+        if (!ends(i)) { strOut += '\\"'; continue; }
+        inStr = false;
+        out += strOut + c;
+        const top = stack[stack.length - 1];
+        if (role === "key" && top) { try { top.key = JSON.parse(strOut + c) as string; } catch { top.key = ""; } }
+        strOut = "";
+        continue;
+      }
+      if (c < " ") { strOut += SHORT[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`; continue; }
+      strOut += c;
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (c === '"') {
+      inStr = true;
+      strOut = c;
+      role = !top ? "" : top.open === "[" ? "item" : top.expectKey ? "key" : "value";
+      continue;
+    }
+    if (c === ":" && top?.open === "{") {
+      top.expectKey = false;
+      out += c;
+      // The root's findings written as bare objects: supply the array's `[`.
+      const j = nextNonWs(i + 1);
+      if (stack.length === 1 && top.key === "findings" && s[j] === "{") { out += s.slice(i + 1, j) + "["; stack.push({ open: "[", expectKey: false, key: "" }); i = j - 1; }
+      continue;
+    }
+    if (c === "," && top?.open === "{") { top.expectKey = true; out += c; continue; }
+    if (c === "{" || c === "[") { stack.push({ open: c, expectKey: c === "{", key: "" }); out += c; continue; }
+    if (c === "}" || c === "]") {
+      stack.pop();
+      out += c;
+      if (!stack.length) return { text: out, end: i + 1 };
+      continue;
+    }
+    out += c;
+  }
+  return { text: inStr ? out + strOut : out, end: s.length };
+}
+
+/** The last review object in `text` read again after normalizeReviewFormat, when it then closes and is a
+ * review: with where it starts in `text` and where the root closes there (end exclusive). */
+export function formatRepairedReviewRange(text: string): JsonObjectSlice | null {
+  const s = String(text || "");
+  const start = lastReviewStart(s);
+  if (start < 0) return null;
+  const normalized = normalizeReviewFormatSpan(s.slice(start));
+  let value: unknown;
+  try { value = JSON.parse(normalized.text); } catch { return null; }
+  if (!isReviewObject(value)) return null;
+  return { json: normalized.text, start, end: start + normalized.end };
+}
+
 export type ReviewTextStatus = "complete" | "recovered-truncated" | "truncated" | "invalid" | "none";
 export type ReviewTextClass = { status: ReviewTextStatus; json?: string };
 
@@ -220,6 +330,8 @@ export type ReviewTextClass = { status: ReviewTextStatus; json?: string };
 export function classifyReviewText(text: string): ReviewTextClass {
   const strict = lastReviewJson(text);
   if (strict) return { status: "complete", json: strict };
+  const formatted = formatRepairedReviewRange(text);
+  if (formatted) return { status: "complete", json: formatted.json };
   const recovered = recoverTruncatedReviewJson(text);
   if (recovered) return { status: "recovered-truncated", json: recovered };
   const start = lastReviewStart(text);
@@ -255,11 +367,11 @@ export function extractChatJsonRange(text: string): JsonObjectSlice | null {
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
   const plain = lastJsonObjectRange(s, isReviewObject, true);
   if (plain) return plain;
-  // Only a transcript that yields nothing as written is read again without citation markers.
+  // Only a transcript that yields nothing as written is read again without citation markers, and only
+  // then with its format normalized (formatRepairedReviewRange: syntax supplied, nothing reworded).
   const cleaned = withoutCitationMarkers(s);
-  if (!cleaned) return null;
-  const fromCleaned = lastJsonObjectRange(cleaned, isReviewObject, true);
-  if (!fromCleaned) return null;
+  const fromCleaned = cleaned ? lastJsonObjectRange(cleaned, isReviewObject, true) : null;
+  if (!fromCleaned) return formatRepairedReviewRange(s);
   const idx = s.lastIndexOf(fromCleaned.json);
   if (idx < 0) return { json: fromCleaned.json, start: -1, end: -1 };
   return { json: fromCleaned.json, start: idx, end: idx + fromCleaned.json.length };
@@ -285,9 +397,15 @@ export function extractChatJsonParts(text: string): { json: string; residual: st
   // Scan the entire transcript from the end; an earlier fenced example is not the final answer.
   const plain = tryParts(s);
   if (plain) return plain;
-  // Only a transcript that yields nothing as written is read again without citation markers.
+  // Only a transcript that yields nothing as written is read again without citation markers, then with
+  // its format normalized (the text around the object stays residual, as written).
   const cleaned = withoutCitationMarkers(s);
-  return cleaned ? tryParts(cleaned) : null;
+  const fromCleaned = cleaned ? tryParts(cleaned) : null;
+  if (fromCleaned) return fromCleaned;
+  const span = formatRepairedReviewRange(s);
+  if (!span) return null;
+  const around = unwrapFence(s.slice(0, span.start), s.slice(span.end));
+  return { json: span.json, residual: `${around.before}\n${around.after}`.trim() };
 }
 
 /** Remove the complete code fence directly around the accepted object, and nothing else: an opening

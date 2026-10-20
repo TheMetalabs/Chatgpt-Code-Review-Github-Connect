@@ -159,6 +159,15 @@ function recoverTruncatedReviewJson(text) {
     slice = `${slice.slice(0, scan.coverageObjectAt)}[${slice.slice(scan.coverageObjectAt)}`;
     scan = scanReview(slice);
   }
+  const recovered = recoverFromCuts(slice, scan);
+  if (recovered || scan.complete) return recovered;
+  // Once more with the reply's format normalized (normalizeReviewFormat); the same rule applies.
+  const normalized = normalizeReviewFormat(slice);
+  return normalized === slice ? null : recoverFromCuts(normalized, scanReview(normalized));
+}
+
+/** recoverTruncatedReviewJson's cut search over one reading of the slice. */
+function recoverFromCuts(slice, scan) {
   if (scan.complete || scan.findingsEnd < 0) return null;
   for (let n = scan.cuts.length - 1, tried = 0; n >= 0 && tried < 400; n -= 1, tried += 1) {
     const cut = scan.cuts[n];
@@ -174,12 +183,100 @@ function recoverTruncatedReviewJson(text) {
   return null;
 }
 
+/** Format-only normalization of a review object's text (`slice` starts at its brace): every character the
+ * model wrote is kept, in order; only JSON syntax is supplied. A bare quote that cannot end its string is
+ * escaped (a key's quote ends before `:`, a value's before `}` or `,` + the next key, an item's before `]`
+ * or `,` + the next item, or at the end of the text), an invalid escape keeps its backslash, a raw control
+ * character is escaped, a missing `[` after the root's "findings": is supplied, and text after the root
+ * closes is left out. Mirrors src/lib/extract-chat-json.ts normalizeReviewFormat. */
+function normalizeReviewFormat(slice) {
+  return normalizeReviewFormatSpan(slice).text;
+}
+
+function normalizeReviewFormatSpan(slice) {
+  const s = String(slice || "");
+  const SHORT = {"\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"};
+  const stack = [];
+  let out = "", role = "", inStr = false, strOut = "";
+  const nextNonWs = from => { let j = from; while (j < s.length && /\s/.test(s[j])) j += 1; return j; };
+  const ends = i => {
+    const j = nextNonWs(i + 1);
+    if (j >= s.length) return true;
+    const n = s[j];
+    if (role === "key") return n === ":";
+    const after = nextNonWs(j + 1);
+    if (role === "value") return n === "}" || (n === "," && (after >= s.length || s[after] === '"'));
+    if (role === "item") return n === "]" || (n === "," && (after >= s.length || '"{[-0123456789tfn'.includes(s[after])));
+    return true;
+  };
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s[i];
+    if (inStr) {
+      if (c === "\\") {
+        const n = s[i + 1];
+        if (n !== undefined && '"\\/bfnrt'.includes(n)) { strOut += c + n; i += 1; continue; }
+        if (n === "u" && /^[0-9a-fA-F]{4}$/.test(s.slice(i + 2, i + 6))) { strOut += s.slice(i, i + 6); i += 5; continue; }
+        if (n === undefined) continue; // a reply cut right after a backslash: the escape never arrived
+        strOut += "\\\\";
+        continue;
+      }
+      if (c === '"') {
+        if (!ends(i)) { strOut += '\\"'; continue; }
+        inStr = false;
+        out += strOut + c;
+        const top = stack[stack.length - 1];
+        if (role === "key" && top) { try { top.key = JSON.parse(strOut + c); } catch { top.key = ""; } }
+        strOut = "";
+        continue;
+      }
+      if (c < " ") { strOut += SHORT[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`; continue; }
+      strOut += c;
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (c === '"') {
+      inStr = true;
+      strOut = c;
+      role = !top ? "" : top.open === "[" ? "item" : top.expectKey ? "key" : "value";
+      continue;
+    }
+    if (c === ":" && top?.open === "{") {
+      top.expectKey = false;
+      out += c;
+      const j = nextNonWs(i + 1);
+      if (stack.length === 1 && top.key === "findings" && s[j] === "{") { out += s.slice(i + 1, j) + "["; stack.push({open: "[", expectKey: false, key: ""}); i = j - 1; }
+      continue;
+    }
+    if (c === "," && top?.open === "{") { top.expectKey = true; out += c; continue; }
+    if (c === "{" || c === "[") { stack.push({open: c, expectKey: c === "{", key: ""}); out += c; continue; }
+    if (c === "}" || c === "]") {
+      stack.pop();
+      out += c;
+      if (!stack.length) return {text: out, end: i + 1};
+      continue;
+    }
+    out += c;
+  }
+  return {text: inStr ? out + strOut : out, end: s.length};
+}
+
+/** The last review object read again after normalizeReviewFormat, when it then closes and is a review. */
+function formatRepairedReviewJson(text) {
+  const s = String(text || "");
+  const start = lastReviewStart(s);
+  if (start < 0) return null;
+  const normalized = normalizeReviewFormatSpan(s.slice(start)).text;
+  try { return isReviewObject(JSON.parse(normalized)) ? normalized : null; } catch { return null; }
+}
+
 /** What a captured reply is, never a silent null: "complete", "recovered-truncated" (json carries
  * `truncated: true`), "truncated" (cut off before its findings finished), "invalid" (closed, unparseable)
  * or "none". */
 function classifyReviewText(text) {
   const strict = lastReviewJson(text);
   if (strict) return {status: "complete", json: strict};
+  const formatted = formatRepairedReviewJson(text);
+  if (formatted) return {status: "complete", json: formatted};
   const recovered = recoverTruncatedReviewJson(text);
   if (recovered) return {status: "recovered-truncated", json: recovered};
   const start = lastReviewStart(text);
@@ -207,8 +304,10 @@ function extractChatJson(text) {
   // The last complete object wins, not an older fenced example. Only a text that yields nothing as
   // written is read again without the chat's citation markers.
   const plain = lastReviewJson(s);
-  if (plain || s.search(chatCitationMarker()) < 0) return plain;
-  return lastReviewJson(s.replace(chatCitationMarker(), ""));
+  if (plain) return plain;
+  // Then once more with its format normalized (formatRepairedReviewJson: syntax supplied, nothing reworded).
+  const cleaned = s.search(chatCitationMarker()) < 0 ? null : lastReviewJson(s.replace(chatCitationMarker(), ""));
+  return cleaned ?? formatRepairedReviewJson(s);
 }
 
 /** Whether `node` itself is hidden from the reader: the ONE visibility rule every harvest shares

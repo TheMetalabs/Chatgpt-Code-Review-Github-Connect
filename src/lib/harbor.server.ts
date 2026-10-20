@@ -35,7 +35,7 @@ import {
 } from "./poster";
 import { sleep } from "./utils";
 import { canReleaseHeldLocal, chatStalled, fallbackWaivesChat, gateUnreadRows, failedLocalSalvage, heldLocalReleased, incompleteVerdict, localExecutionPrompt, localReplies, localVerifies, ownsValidatorGeneration, racingProviders, releaseLocalAsFallback, releaseLocalPrompt, shouldStartLocalLeg, skippedProvider, stillRacing, verdictEvidence } from "./local-fallback";
-import { outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
+import { auxiliaryFailed, outcomeNote, reviewOutcome, salvagedReview, skippedNote } from "./review-outcome";
 import { nextCreationSeq } from "./creation-seq";
 import { createDeliveryClaims } from "./loop-control-claims";
 import { buildReviewerLanes, emptyReviewSkip, localLegNote } from "./reviewer-progress";
@@ -1560,6 +1560,7 @@ export async function submitHarborChat(
     assumptions: nextAssumptions,
     skippedProviders: blockingSkipped,
     incompleteProviders,
+    auxiliaryProviderFailures: auxiliaryFailures,
   }, merged.findings.length);
   // Credit only the chat reviewers that produced the clean structured result (pinned when the
   // verification round starts): a skipped or failed chat reviewer found nothing only by absence.
@@ -1605,7 +1606,7 @@ export async function submitHarborChat(
   // Each merged reviewer's accepted finding count: the note credits findings to the leg that reported them.
   const findingsBy: Partial<Record<ReviewProvider, number>> = Object.fromEntries([...canonicalByProvider].map(([p, g]) => [p, g.findings.length]));
   const rawBy = [...canonicalByProvider].filter(([, g]) => g.rawReview).map(([p]) => p);
-  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified, rawBy, rawTruncated });
+  const localVerifyNote = outcomeNote(outcome, { chat: cleanChat, verifying, findings: merged.findings.length, findingsBy, localError, localVerified, rawBy, rawTruncated, auxiliary: auxiliaryFailed({ auxiliaryProviderFailures: auxiliaryFailures }) });
   if (!stillOwnsValidator()) return { ok: false, error: "stale validator" };
   let stamped = false;
   transitionJob(jobId, (j) => {

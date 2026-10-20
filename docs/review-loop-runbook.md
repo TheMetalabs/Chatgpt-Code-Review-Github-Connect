@@ -175,8 +175,11 @@ code, so a future skill or change can find the rule instead of re-learning it.
   recovers the same way for salvaged or late text. A truncated leg with findings is a verdict (they
   merge); one without is evidence, never clean (`RawCause` `truncated`). A malformed auxiliary leg
   beside a CLEAN canonical verdict is no longer dropped (aicc-center#1091): its reply posts verbatim
-  and the review is not "no major issues". `repairJsonEscapes` escapes every control character
-  U+0000-U+001F.
+  and the review is not "no major issues". Inside a verify-clean round the malformed auxiliary reply's
+  TEXT stays out of the posted body, but it is never clean credit: the round posts `incomplete` (no
+  "no major issues", no `total=0` marker, note "<provider> returned no usable review") whatever local
+  verification said, and a recovered truncated auxiliary leg's findings merge and block clean exactly as
+  elsewhere. `repairJsonEscapes` escapes every control character U+0000-U+001F.
 
 ### Deploys
 

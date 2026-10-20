@@ -4,6 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
+import fs from 'node:fs';
 import {appFixture,eventually} from './app-fixture.mjs';
 import {isZeroFindings} from '../../src/lib/review-loop.ts';
 import {CLEAN_REVIEW_BODY,REVIEW_RAW_END,REVIEW_RAW_START,REVIEW_SUMMARY_MARK,UNVERIFIED_CLEAN_REVIEW_BODY} from '../../src/lib/review-format.ts';
@@ -363,9 +364,10 @@ test('verify-clean outcome: clean ChatGPT beside a gate-rejected Grok is evidenc
   assert.equal(job().localVerifyStartedAt,undefined,'local stays held');
 });
 
-// A prose-only secondary chat leg has no gated findings to hide. Keep the canonical ChatGPT verdict
-// and expose Grok's failure in the ops state instead of poisoning the public review with raw=1.
-test('verify-clean outcome: clean ChatGPT beside auxiliary Grok prose keeps the canonical clean verdict',async t=>{
+// A prose-only secondary chat leg has no gated findings to keep out of the public review: its TEXT stays
+// out of the body and in the ops state. But Grok gave no verdict, so the round gets no clean credit
+// (aicc-center#1091, PR #172): incomplete, not "no major issues", whatever local verification said.
+test('verify-clean outcome: clean ChatGPT beside auxiliary Grok prose keeps the prose out of the body but is never clean',async t=>{
   const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
   app.env.ASHLAR_LOCAL_LLM_STREAM='false';
   const out=await app.mention('matrix-auxiliary-grok-prose');
@@ -381,13 +383,17 @@ test('verify-clean outcome: clean ChatGPT beside auxiliary Grok prose keeps the 
   app.localResponses[0].end(envelope(cleanJson));
   await eventually(()=>app.reviews.length===1,'the canonical review was not posted');
   const body=app.reviews[0].body;
-  assert.equal(body.split('\n')[0],CLEAN_REVIEW_BODY,'canonical ChatGPT clean remains the public verdict');
-  assert.match(body,/ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0/);
-  assert.doesNotMatch(body,/ashlar-raw:start|Analyzing the diff|raw=1/);
+  assert.equal(body.split('\n')[0],SUMMARY,'no clean first line: Grok gave no verdict');
+  assert.equal(body.split('\n').at(-1),'<!-- ashlar-outcome incomplete -->');
+  assert.equal(converged(body),false);
+  assert.doesNotMatch(body,/didn't find any major issues|no major issues/i);
+  assert.match(body,/- No complete review from grok \(its reply was not usable and is kept out of this review\)/);
+  assert.doesNotMatch(body,/ashlar-raw:start|Analyzing the diff|raw=1/,'the prose itself stays out of the public body');
   assert.deepEqual([...(job().incompleteProviders??[])],[],'auxiliary prose is not a blocking incomplete provider');
   assert.deepEqual({...job().rawCauses??{}},{},'auxiliary prose is not copied into the public raw cause');
   assert.deepEqual({...job().auxiliaryProviderFailures},{grok:'unparseable'});
   assert.equal(job().canonicalProvider,'chatgpt');
+  assert.match(job().localVerifyNote,/chatgpt found nothing; local verification agreed; grok returned no usable review, so this is not a clean pass\./);
   assert.match(app.ops.at(-1)??'',/Canonical ChatGPT verdict retained; auxiliary reviewer failure: Grok \(unparseable\)/);
 });
 
@@ -518,21 +524,27 @@ for(const [name,grok] of Object.entries(LATE_GROK)){
     }
     assert.equal(job().localVerified,false);
     if(grok.cause==='unparseable'){
-      assert.equal(body.split('\n')[0],UNVERIFIED_CLEAN_REVIEW_BODY,'the canonical verdict is explicitly unverified');
-      assert.match(body,/ashlar-findings total=0 inline=0 body=0 p0=0 p1=0 p2=0 unverified=1/);
+      // Clean credit (aicc-center#1091, PR #172): a reviewer that returned no usable review is not "found
+      // nothing", so the round is incomplete: no "no major issues" wording, no total=0 marker, whatever
+      // local's own verification did. Grok's TEXT still stays out of the body.
+      assert.equal(body.split('\n')[0],SUMMARY,'no clean first line');
+      assert.equal(body.split('\n').at(-1),'<!-- ashlar-outcome incomplete -->','the INCOMPLETE marker');
+      assert.equal(body.includes('<!-- ashlar-findings'),false);
+      assert.doesNotMatch(body,/didn't find any major issues|no major issues/i);
+      assert.match(body,/- No complete review from grok \(its reply was not usable and is kept out of this review\)/);
     }else{
       assert.equal(/<!--\s*ashlar-findings\s+([^>]*?)\s*-->\s*$/.exec(body)?.[1],MR,'schema-rejected evidence remains non-clean');
     }
     assert.equal(converged(body),false);
     if(grok.cause==='unparseable') assert.doesNotMatch(body,/Local verification reply posted verbatim|ashlar-raw:start/);
     const note=job().localVerifyNote;
-    if(grok.cause==='unparseable') assert.match(note,/^chatgpt found nothing; local verification did not complete \(local LLM HTTP 500[^)]*\), so this is chatgpt's unverified clean result\.$/);
+    if(grok.cause==='unparseable') assert.match(note,/^chatgpt found nothing; local verification did not complete \(local LLM HTTP 500[^)]*\); grok returned no usable review, so this is not a clean pass\.$/);
     else assert.match(note,/grok's reply could not be used as a review and is posted verbatim below/);
     assert.ok(body.includes(`\n${note}\n`),'the body carries the note');
     const handoff=notCleanDetail(job(),postedOutcome(job(),0));
     if(grok.cause==='unparseable'){
       assert.doesNotMatch(handoff,/posted verbatim/,'no raw evidence was posted');
-      assert.match(handoff,/local verification did not complete/);
+      assert.match(handoff,/a reviewer returned no usable review/);
     }else assert.match(handoff,/^posted verbatim:/);
   });
 }
@@ -679,5 +691,69 @@ for(const role of ['race','verify-clean'])for(const [defect,{label,raw,repair,ca
     assert.equal(job().rawCauses?.chatgpt,cause,'converted at the gate, not salvaged by the bridge');
     assert.doesNotMatch(body,/CAPTURE-PROSE|Thought for 12s/,'the page capture is not posted');
     assert.ok(app.history.getJob(out.jobId,true).responses.chatgpt.original.includes('CAPTURE-PROSE'),'review history keeps the capture');
+  });
+}
+
+// aicc-center#1091 inside a verify-clean round (PR #172). Grok's REAL answer for that PR (job-mvgezanw-981:
+// REQUEST_CHANGES, one P1, cut off inside `coverage`; its finding re-pointed at the fixture PR's changed
+// file) beside a clean ChatGPT. Outside verify-clean this is covered in raw-capture-cases.test.mjs.
+const realGrok=()=>{
+  const bundle=JSON.parse(fs.readFileSync(new URL('./fixtures/raw-capture-20261020/cases.bundle.json',import.meta.url),'utf8'));
+  const {text}=bundle['job-mvgezanw-981.json'];
+  const file=/"file"\s*:\s*"([^"]+)"/.exec(text.slice(text.search(/"findings"\s*:\s*\[/)))[1];
+  return text.split(file).join('a.ts');
+};
+
+test('verify-clean #1091: a recovered truncated Grok leg\'s P1 merges and blocks clean, with no verification round',async t=>{
+  const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
+  app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+  const out=await app.mention('matrix-1091-recovered');
+  const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+  await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+  app.bridge.bridgeHeartbeat();
+  const take=app.bridge.takeNextBridgeJob('matrix-client');
+  assert.equal(take?.jobId,out.jobId,'the bridge claims the job');
+  const grok=realGrok();
+  const legs=[{provider:'chatgpt',raw:cleanJson},{provider:'grok',raw:grok,originalText:grok}];
+  assert.equal((await app.bridge.completeBridgeJob(out.jobId,cleanJson,legs,take.leaseId)).ok,true);
+  await eventually(()=>app.reviews.length===1,'the review was not posted');
+  const body=app.reviews[0].body;
+  assert.equal(app.localRequests.length,0,'findings post without a verification round');
+  assert.notEqual(body.split('\n')[0],CLEAN_REVIEW_BODY);
+  assert.equal(converged(body),false);
+  assert.doesNotMatch(body,/didn't find any major issues|no major issues/i);
+  assert.match(body,/ashlar-findings total=1 inline=\d+ body=\d+ p0=0 p1=1 p2=0/,'the P1 is a finding of the posted review');
+  assert.match(job().plan??'',/cut off after its findings/);
+  assert.deepEqual({...(job().auxiliaryProviderFailures??{})},{});
+});
+
+for(const verdict of ['agrees','fails']){
+  test(`verify-clean #1091: an unrecoverable Grok leg (cut inside findings) beside a clean ChatGPT is never clean credit, local verification ${verdict}`,async t=>{
+    const app=await appFixture({localReviewRole:'verify-clean',localJsonRepairEnabled:false,reviewGrok:true});t.after(()=>app.close());
+    app.env.ASHLAR_LOCAL_LLM_STREAM='false';
+    const out=await app.mention(`matrix-1091-unrecoverable-${verdict}`);
+    const job=()=>app.harbor.getHarbor().jobs.find(j=>j.id===out.jobId);
+    await eventually(()=>job()?.status==='awaiting_chat','snapshot not ready');
+    app.bridge.bridgeHeartbeat();
+    const take=app.bridge.takeNextBridgeJob('matrix-client');
+    assert.equal(take?.jobId,out.jobId,'the bridge claims the job');
+    const full=realGrok();
+    const cut=full.slice(0,/"findings"\s*:\s*\[/.exec(full).index+700);
+    // The worker's own delivery of a reply nothing could read (its repair is over): raw text, flagged salvaged.
+    const legs=[{provider:'chatgpt',raw:cleanJson},{provider:'grok',raw:cut,originalText:cut}];
+    assert.equal((await app.bridge.completeBridgeJob(out.jobId,cleanJson,legs,take.leaseId,true)).ok,true);
+    await eventually(()=>app.localRequests.length===1,'clean chatgpt did not start the verification round');
+    if(verdict==='agrees')app.localResponses[0].end(envelope(cleanJson));else fail500(app.localResponses[0]);
+    await eventually(()=>app.reviews.length===1,'the review was not posted');
+    const body=app.reviews[0].body;
+    assert.equal(body.split('\n')[0],SUMMARY,'no clean first line');
+    assert.equal(body.split('\n').at(-1),'<!-- ashlar-outcome incomplete -->','round marked incomplete');
+    assert.equal(converged(body),false);
+    assert.doesNotMatch(body,/didn't find any major issues|no major issues|verified/i);
+    assert.match(body,/- No complete review from grok/);
+    assert.equal(body.includes(REVIEW_RAW_START),false,'Grok\'s text stays out of the body');
+    assert.deepEqual({...job().auxiliaryProviderFailures},{grok:'unparseable'});
+    assert.equal(postedOutcome(job(),0),'incomplete');
+    assert.match(job().localVerifyNote,/grok returned no usable review, so this is not a clean pass\./);
   });
 }

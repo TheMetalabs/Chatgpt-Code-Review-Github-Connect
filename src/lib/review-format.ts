@@ -1,5 +1,5 @@
 import type { Finding, Job, RawLeg, ReviewProvider, Severity } from "./types.ts";
-import { OUTCOME_SHAPE, RAW_TRUNCATED_TEXT, postedOutcome, rawCauseText, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
+import { OUTCOME_SHAPE, RAW_TRUNCATED_TEXT, auxiliaryFailed, postedOutcome, rawCauseText, skippedNotes, type OutcomeJob, type PostedOutcome } from "./review-outcome.ts";
 import { neutralizeMarkers, rawBodyText } from "./review-raw-text.ts";
 import { INCOMPLETE_OUTCOME_MARKER } from "./review-loop.ts";
 
@@ -96,7 +96,7 @@ export function reviewSummaryBody(job: SummaryJob, findings: Finding[], username
     sha: job.headSha.slice(0, 7),
     noteLine: job.localVerifyNote ? `\n${neutralizeMarkers(job.localVerifyNote)}\n` : "",
     skipped: skippedNotes(job).slice(0, 4).map(neutralizeMarkers),
-    incomplete: Boolean(job.incompleteProviders?.length),
+    incomplete: Boolean(job.incompleteProviders?.length) || auxiliaryFailed(job).length > 0,
     // The clean-pass sentinel reworded and markers neutralized (rawBodyText): the length the merge
     // sized the block by (salvagedReview).
     raw: rawBodyText((job.rawReview ?? "").trim()),

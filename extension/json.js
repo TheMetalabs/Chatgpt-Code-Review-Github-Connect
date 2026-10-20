@@ -1504,7 +1504,10 @@ function tabOwnership(state, allocationUrl, fix = false, secured = false) {
   // send-time record and its pin need an exact turn, a fix's collector ends on any other, and an
   // unpinned turn that merely contains the prompt may be the user's edit around it (Ashlar
   // 4101062732). Any other text is an edit.
-  if (!promptIs(turn, submission.expected)) return takeOver("edited");
+  if (!promptIs(turn, submission.expected)) {
+    if (!turnDiffersByRender(state, fix)) return takeOver("edited");
+    state.turnRenderDiffers = true; // diagnostic: Grok shows the sent prompt differently, with no user input
+  }
   // A fix turn is also held to its prompt's lossless form (#77, fixTurnExact): a fix prompt inlines
   // source whose whitespace is content, so a turn whose whitespace alone changed is an edit too.
   if (fix && typeof submission.exact === "string" && typeof fixPromptForm === "function" && !fixTurnExact(turn, submission.exact, submission.attachments)) {
@@ -1588,6 +1591,35 @@ function persistTakeover(state) {
   try { sessionStorage.setItem(`ashlar:takenover:${state.jobId}:${state.runId}`, state.takeoverCause || "user_turn"); } catch { /* in-memory only */ }
 }
 
+/** Trusted user input on this page: the one evidence a user edit, regenerate or follow-up needs and
+ * that neither Ashlar's automation nor Grok's own rendering can produce. Ashlar's clicks and key events
+ * are synthetic (dispatchEvent / element.click(): isTrusted false), and a page script cannot create a
+ * trusted event; a locked screen sends none. A rendered turn that differs from Ashlar's prompt (Grok
+ * re-renders a sent prompt as Markdown after the answer completes) is an edit only when this saw
+ * input. Kept in sessionStorage too (a reload keeps the evidence); never read as permission to close. */
+function noteUserInput(event) {
+  if (!event || event.isTrusted !== true) return false;
+  globalThis.__ashlarUserInputAt = Date.now();
+  try { sessionStorage.setItem("ashlar:userinput", String(globalThis.__ashlarUserInputAt)); } catch { /* in-memory only */ }
+  return true;
+}
+function userInputSeen() {
+  if (Number.isFinite(globalThis.__ashlarUserInputAt)) return true;
+  try { return Number.isFinite(Number(sessionStorage.getItem("ashlar:userinput"))) && Boolean(sessionStorage.getItem("ashlar:userinput")); } catch { return false; }
+}
+function installUserInputWitness() {
+  if (globalThis.__ashlarInputWitness || typeof globalThis.document?.addEventListener !== "function") return;
+  globalThis.__ashlarInputWitness = true;
+  for (const type of ["keydown", "pointerdown", "mousedown", "touchstart", "paste", "drop"]) {
+    try { globalThis.document.addEventListener(type, noteUserInput, {capture: true, passive: true}); } catch { /* the page keeps its DOM-only verdicts */ }
+  }
+}
+/** Whether the rendered sent turn's difference from Ashlar's prompt is Grok's rendering, not the user: a
+ * Grok review (a fix and ChatGPT keep the DOM-only verdict) with no trusted input seen on the page. */
+function turnDiffersByRender(state, fix) {
+  return !fix && state.provider === "grok" && !userInputSeen();
+}
+
 function releaseManagedSlot(state) {
   state.slotReleased = true;
   try { sessionStorage.setItem(`ashlar:released:${state.jobId}:${state.runId}`, "true"); } catch { /* Only causes conservative recount on reload. */ }
@@ -1613,6 +1645,7 @@ function installReviewRunner(name, run) {
   if (state.listener && state.protocol === "observed-submission-v8") return;
   if (state.listener) chrome.runtime.onMessage.removeListener(state.listener);
   state.protocol = "observed-submission-v8";
+  installUserInputWitness();
   const busy = () => ({ ok: false, code: "busy", retry: true, error: "generation pending", observation: state.observation,
     observing: state.boundObserved === true });
   state.listener = (msg, _sender, reply) => {
@@ -1766,6 +1799,7 @@ function installReviewRunner(name, run) {
         typeof stopButtonVisible === "function" && stopButtonVisible();
       if (permanent || stalled || msg.preserve === true) releaseManagedSlot(state);
       reply({ok:true,releaseProtocol:1,blank:false,unsent:false,...verdict,owned:owned && !stalled,canClose:owned && !stalled,
+        userInput:userInputSeen(),renderDiffers:Boolean(state.turnRenderDiffers),
         reason:stalled ? "stalled" : owned ? "complete" : permanent ? "repurposed" : "pending",
         running:Boolean(state.running),hasResult:Boolean(state.result || repairedCollectionResult(state) || sourceReceiptFor(state)),
         stopped:Boolean(state.runStopped),url:globalThis.location?.href || ""});

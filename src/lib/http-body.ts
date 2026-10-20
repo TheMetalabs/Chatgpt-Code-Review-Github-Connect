@@ -1,13 +1,22 @@
-export const MAX_WEBHOOK_BODY = 65_536;
+/** Hard cap on a webhook request body, for memory safety. GitHub caps a delivery at 25 MB, but a
+ * real PR event is far smaller: PR, issue and comment bodies are each capped by GitHub at 65,536
+ * characters (≤ ~256 KB of UTF-8 even for all-Hangul text). 5 MiB leaves an order of magnitude of
+ * headroom over the largest realistic event while bounding what one request can buffer. The old
+ * 64 KiB cap silently dropped every event of a PR whose description alone was 85 KB (#107). */
+export const MAX_WEBHOOK_BODY = 5 * 1024 * 1024;
 
-export type CappedBody = { ok: true; body: string } | { ok: false; reason: "payload too large" };
+export type CappedBody =
+  | { ok: true; body: string }
+  /** bytes: the declared Content-Length, or how many bytes had arrived when the cap was crossed. */
+  | { ok: false; reason: "payload too large"; bytes: number };
 
 export async function readBodyCapped(request: Request, max = MAX_WEBHOOK_BODY): Promise<CappedBody> {
   const raw = request.headers.get("content-length");
   if (raw != null && raw !== "") {
     const declared = Number(raw);
     if (Number.isFinite(declared) && declared > max) {
-      return { ok: false, reason: "payload too large" };
+      await request.body?.cancel().catch(() => {});
+      return { ok: false, reason: "payload too large", bytes: declared };
     }
   }
 
@@ -23,7 +32,7 @@ export async function readBodyCapped(request: Request, max = MAX_WEBHOOK_BODY): 
     total += value.byteLength;
     if (total > max) {
       await reader.cancel();
-      return { ok: false, reason: "payload too large" };
+      return { ok: false, reason: "payload too large", bytes: total };
     }
     chunks.push(value);
   }

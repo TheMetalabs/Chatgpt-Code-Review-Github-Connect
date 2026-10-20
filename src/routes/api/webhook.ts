@@ -1,7 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { verifyHub256 } from "@/lib/hmac";
-import { readBodyCapped } from "@/lib/http-body";
-import { ingestGitHubWebhook } from "@/lib/harbor.server";
+import { MAX_WEBHOOK_BODY, readBodyCapped } from "@/lib/http-body";
+import { ingestGitHubWebhook, recordOversizedWebhook } from "@/lib/harbor.server";
+import { compactWebhookPayload } from "@/lib/webhook-compact";
 import { githubWebhookSecret } from "@/lib/github.server";
 
 export const Route = createFileRoute("/api/webhook")({
@@ -15,7 +16,21 @@ export const Route = createFileRoute("/api/webhook")({
         }
         const read = await readBodyCapped(request);
         if (!read.ok) {
-          return Response.json({ accepted: false, reason: read.reason }, { status: 413 });
+          // Over the hard cap: the signature cannot be checked without the whole body, so the
+          // delivery is refused — but recorded and logged, never dropped silently.
+          const targetType = request.headers.get("x-github-hook-installation-target-type");
+          const targetId = request.headers.get("x-github-hook-installation-target-id");
+          const ev = recordOversizedWebhook({
+            deliveryId: request.headers.get("x-github-delivery") ?? "",
+            event: request.headers.get("x-github-event") ?? "",
+            bytes: read.bytes,
+            max: MAX_WEBHOOK_BODY,
+            target: targetType && targetId ? `${targetType} ${targetId}` : undefined,
+          });
+          return Response.json(
+            { accepted: false, reason: read.reason, bytes: read.bytes, max: MAX_WEBHOOK_BODY, delivery: ev.deliveryId, event: ev.event },
+            { status: 413 },
+          );
         }
         const body = read.body;
         const sig = request.headers.get("x-hub-signature-256");
@@ -44,12 +59,15 @@ export const Route = createFileRoute("/api/webhook")({
           );
         }
 
-        let payload: unknown = {};
+        let parsedBody: unknown = {};
         try {
-          payload = body ? JSON.parse(body) : {};
+          parsedBody = body ? JSON.parse(body) : {};
         } catch {
           return Response.json({ accepted: false, reason: "malformed json" }, { status: 400 });
         }
+        // Only after the HMAC check on the exact raw body: bound free text (a huge PR description
+        // embedded in every comment event) before anything is parsed, stored or prompted.
+        const { payload, truncated } = compactWebhookPayload(event, parsedBody);
 
         const result = ingestGitHubWebhook({
           hmacOk: true,
@@ -70,6 +88,7 @@ export const Route = createFileRoute("/api/webhook")({
             ingressMs,
             delivery,
             event,
+            ...(truncated.length ? { truncated } : {}),
           },
           { status: result.httpStatus },
         );

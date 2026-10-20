@@ -6,7 +6,9 @@ import {appFixture,eventually} from './app-fixture.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;before(async()=>browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']}));after(async()=>browser?.close());
 const valid=JSON.stringify({findings:[],investigated_safe:['a.ts checked "literal"'],merge_recommendation:'COMMENT'});
-const invalid=valid.replace(/\\"/g,'"');
+// Lost quote escapes (format-only normalization reads those since 1.1.75) AND a missing comma between keys,
+// which it never supplies: a reply only the JSON repair can read.
+const invalid=valid.replace(/\\"/g,'"').replace('],"investigated_safe"','] "investigated_safe"');
 async function makePage(t,jobId,{text=invalid,runId='run-A',start=true}={}){
  const context=await browser.newContext();t.after(()=>context.close());await context.route('**/*',route=>route.abort());const page=await context.newPage();
  await page.setContent('<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">owned prompt</div></section><section id="answer" data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"></div></div><button aria-label="Copy response" data-testid="copy-turn-action-button">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div><button data-testid="send-button" aria-label="Send prompt" disabled>Send</button></form>');

@@ -83,7 +83,18 @@ test('content: even a renderer-split fence is decided by completion controls, ne
   const page=await pageFor(t,user+turn(`${codeBlock}<p></p>${codeBlock}`));
   await setCode(page,raw.slice(0,cut),0);await page.locator('section[data-turn="assistant"] .markdown p').evaluate((el,v)=>el.textContent=v,paragraph);await setCode(page,raw.slice(raw.lastIndexOf('```')+3),1);
   await collect(page);await page.clock.runFor(2400);const s=await snap(page);t.diagnostic(JSON.stringify(s));
-  assert.equal(s.stages.at(-1),'response_completed_json_invalid');assert.equal(s.received,null);
+  // Decided, never left generating. Since 1.1.75 the prose's dropped escapes are supplied again
+  // (normalizeReviewFormat: a bare quote escaped, an invalid escape keeps its backslash), so the split
+  // answer is collected: the verdict, every finding's anchor and title and the coverage as written. (The
+  // string that held the fence reads as the page rendered it: the fence markers consumed by the renderer,
+  // its code-block label in their place. The extension reads the page; it does not reword it.)
+  assert.equal(s.stages.at(-1),'response_collected');
+  const got=JSON.parse(s.received.raw),want=JSON.parse(raw);
+  const anchor=f=>({severity:f.severity,file:f.file,line:f.line,side:f.side,title:f.title,root_cause:f.root_cause});
+  assert.equal(got.merge_recommendation,want.merge_recommendation);
+  assert.deepEqual(got.findings.map(anchor),want.findings.map(anchor));
+  assert.deepEqual(got.findings.map(f=>f.evidence),want.findings.map(f=>f.evidence),'quotes and backslashes in code evidence read back exactly');
+  assert.deepEqual(got.coverage,want.coverage);
 });
 test('content: an over-long (600k) answer has no length cap in the collector',async t=>{
   const raw=review77({padTo:600_000}),page=await pageFor(t,user+turn(codeBlock));await setCode(page,raw);await collect(page);

@@ -8,7 +8,9 @@ import {appFixture,eventually} from './app-fixture.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 let browser;before(async()=>browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH||undefined,args:['--no-sandbox']}));after(async()=>browser?.close());
 const raw=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "condition"'],merge_recommendation:'COMMENT'});
-const original=raw.replace(/\\"/g,'"');
+// Lost quote escapes (format-only normalization reads those since 1.1.75) AND a missing comma between keys,
+// which it never supplies: a reply only the JSON repair can read.
+const original=raw.replace(/\\"/g,'"').replace('],"investigated_safe"','] "investigated_safe"');
 async function pageFixture(t,{jobId='A',text=original,streaming=false,manual=false,lateId=false,legacy=false}={}) {
  const context=await browser.newContext();t.after(()=>context.close());await context.route('**/*',r=>r.abort());const page=await context.newPage();
  await page.setContent('<main><section data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="user-A">owned review prompt</div></section><section id="answer" data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="response-A"><div class="markdown"></div></div><button data-testid="copy-turn-action-button" aria-label="Copy response">Copy</button></section></main><form><div id="prompt-textarea" contenteditable="true" style="width:300px;height:60px"></div><button data-testid="send-button" aria-label="Send prompt" disabled>Send</button></form>');
@@ -118,7 +120,7 @@ test('worker/HTTP: current valid JSON wins over a pending repair without a dupli
 
 test('worker/HTTP: a new completed original supersedes an old pending formatter, without rerunning ChatGPT',async t=>{
  const f=await workerFixture(t);await f.cycle();await eventually(()=>f.app.localRequests.length===1,'initial repair not started');
- const next=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "new condition"'],merge_recommendation:'COMMENT'}).replace(/\\"/g,'"');
+ const next=JSON.stringify({findings:[],investigated_safe:['a.ts: checked "new condition"'],merge_recommendation:'COMMENT'}).replace(/\\"/g,'"').replace('],"investigated_safe"','] "investigated_safe"');
  await f.page.locator('.markdown').evaluate((el,text)=>el.textContent=text,next);await f.page.clock.runFor(2400);
  await eventually(async()=>{await f.cycle();return f.app.localRequests.length===2;},'new completed source stayed blocked behind obsolete inference');
  assert.equal(JSON.parse(f.app.localRequests[1].messages[1].content).original,next);
